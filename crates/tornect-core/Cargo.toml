@@ -1,0 +1,37 @@
+[package]
+name = "tornect-core"
+description = "Tornect identities, keys, configuration, keystore and telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+directories.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+data-encoding.workspace = true
+zeroize.workspace = true
+getrandom.workspace = true
+subtle.workspace = true
+hex.workspace = true
+fs-err.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true
