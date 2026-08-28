@@ -1,0 +1,20 @@
+[package]
+name = "tornect-audio"
+description = "Tornect audio: system-audio capture, Opus encode/decode, playback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+tornect-core.workspace = true
+
+[features]
+default = []
+# Playback/capture via cpal (Linux needs libasound2-dev; CI-verified)
+cpal = []
+
+[lints]
+workspace = true

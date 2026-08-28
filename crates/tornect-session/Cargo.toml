@@ -1,0 +1,22 @@
+[package]
+name = "tornect-session"
+description = "Tornect session orchestration: host and client state machines wiring signaling, connectivity and media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+tornect-core.workspace = true
+tornect-signal.workspace = true
+tornect-net.workspace = true
+tornect-proto.workspace = true
+tornect-capture.workspace = true
+tornect-codec.workspace = true
+tornect-audio.workspace = true
+tornect-input.workspace = true
+
+[lints]
+workspace = true

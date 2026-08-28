@@ -1,0 +1,4 @@
+msrv = "1.90"
+# Media hot paths pass a lot of small structs by value on purpose.
+trivial-copy-size-limit = 32
+too-many-arguments-threshold = 8

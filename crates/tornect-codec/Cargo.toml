@@ -1,0 +1,20 @@
+[package]
+name = "tornect-codec"
+description = "Tornect video codecs: Encoder/Decoder traits with FFmpeg hardware backends and an always-available software fallback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+tornect-core.workspace = true
+
+[features]
+default = []
+# FFmpeg libavcodec hw contexts (NVENC/AMF/QSV/VAAPI/VideoToolbox); needs libav* dev headers + libclang (CI-verified)
+ffmpeg = []
+
+[lints]
+workspace = true
