@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Tornect pre-commit gate (docs/PLAN.md §D.1 rule 3 / §D.2).
+# Enable once per clone:  git config core.hooksPath .githooks
+# Escape hatch for WIP commits on a branch:  TORNECT_SKIP_HOOKS=1 git commit ...
+set -euo pipefail
+
+if [[ "${TORNECT_SKIP_HOOKS:-0}" == "1" ]]; then
+  echo "pre-commit: skipped (TORNECT_SKIP_HOOKS=1)"
+  exit 0
+fi
+
+# Only run the Rust gate when Rust sources or manifests are staged.
+if git diff --cached --name-only --diff-filter=ACMR | grep -Eq '\.(rs|toml)$'; then
+  echo "pre-commit: cargo fmt --check"
+  cargo fmt --all -- --check
+  echo "pre-commit: cargo clippy --workspace --all-targets -- -D warnings"
+  cargo clippy --workspace --all-targets -- -D warnings
+fi
+
+# Never commit local Tornect state or secrets.
+if git diff --cached --name-only | grep -Eq '(^|/)(\.tornect-home/|.*\.seed$|.*\.key$|.*\.expanded_secret_key$)'; then
+  echo "pre-commit: refusing to commit key material or local state" >&2
+  exit 1
+fi

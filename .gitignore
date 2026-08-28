@@ -1,0 +1,31 @@
+# Rust build output
+/target/
+**/target/
+/dist/
+
+# Local state used when running Tornect from the source tree
+/.tornect-home/
+/tests/netem/out/
+*.log
+*.jsonl
+
+# Fuzzing artifacts
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/**/*.tmp
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Patches / merges
+*.orig
+*.rej
+
+# Crate probes and scratch
+/tmp/

@@ -1,0 +1,15 @@
+[package]
+name = "tornect-net"
+description = "Tornect connectivity: candidate gathering, UPnP/NAT-PMP/PCP, STUN, hole punching, key-pinned QUIC, Tor-tunnel fallback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+tornect-core.workspace = true
+
+[lints]
+workspace = true

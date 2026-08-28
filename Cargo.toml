@@ -1,0 +1,95 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/tornect-core",
+  "crates/tornect-signal",
+  "crates/tornect-net",
+  "crates/tornect-proto",
+  "crates/tornect-capture",
+  "crates/tornect-codec",
+  "crates/tornect-audio",
+  "crates/tornect-input",
+  "crates/tornect-session",
+  "apps/tornect",
+  "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Mxrider420z/Tornect"
+homepage = "https://github.com/Mxrider420z/Tornect"
+authors = ["Tornect contributors"]
+publish = false
+
+# Every external dependency is pinned here and justified in docs/DEPENDENCIES.md.
+[workspace.dependencies]
+tornect-core = { path = "crates/tornect-core" }
+tornect-signal = { path = "crates/tornect-signal" }
+tornect-net = { path = "crates/tornect-net" }
+tornect-proto = { path = "crates/tornect-proto" }
+tornect-capture = { path = "crates/tornect-capture" }
+tornect-codec = { path = "crates/tornect-codec" }
+tornect-audio = { path = "crates/tornect-audio" }
+tornect-input = { path = "crates/tornect-input" }
+tornect-session = { path = "crates/tornect-session" }
+
+anyhow = "1.0.104"
+thiserror = "2.0.20"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.4"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2.5"
+directories = "6.0.0"
+ed25519-dalek = { version = "3.0.0", features = ["zeroize"] }
+sha2 = "0.11.0"
+sha3 = "0.11"
+hmac = "0.13.0"
+hkdf = "0.13.0"
+data-encoding = "2.11.1"
+zeroize = { version = "1.9.0", features = ["derive"] }
+getrandom = { version = "0.4.3", features = ["std", "sys_rng"] }
+subtle = "2.6.1"
+hex = "0.4.3"
+fs-err = "3.3.1"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+time = { version = "0.3.55", features = ["formatting", "parsing", "macros", "serde"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
+bytes = "1.12.1"
+parking_lot = "0.12.5"
+tempfile = "3.27.0"
+proptest = "1.11.0"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+rust_2018_idioms = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
+[profile.dev]
+opt-level = 1
+
+# Crypto, codecs and Tor are unusably slow unoptimized; optimize dependencies even in dev.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+[profile.dist]
+inherits = "release"
+lto = "fat"
+strip = "symbols"
