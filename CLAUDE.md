@@ -28,6 +28,7 @@ xtask                       cargo xtask verify | lint-all | dist | ffmpeg-fetch 
 tests/integration           loopback e2e, signaling-over-localhost-tor mocks, unattended adversarial suite (§B.8.15)   (M1)
 tests/netem                 scripted latency/loss/jitter harness (linux netns; runs in CI)
 docs/PLAN.md                the plan (verbatim copy of TORNECT_PLAN.md at repo root)
+docs/UI_PLAN.md             the UI plan (verbatim copy of TORNECT_UI_PLAN.md; Iced shell + egui HUD, U0–U5 — reconciled in PLAN.md Part G)
 docs/DEPENDENCIES.md        dependency → version → why → build requirements → verified-on
 docs/VERIFICATION.md        acceptance ledger: VERIFIED / CI / NEEDS-DEVICE(os) / OPEN
 docs/research/*.md          sourced API notes the implementers code from

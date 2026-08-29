@@ -15,6 +15,8 @@ pub mod keystore;
 pub mod paths;
 pub mod session_log;
 pub mod telemetry;
+pub mod trusted;
+pub mod unattended;
 
 pub use config::Config;
 pub use error::{CoreError, Result};

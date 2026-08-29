@@ -88,15 +88,22 @@ fn lint_all(root: &Path) -> anyhow::Result<()> {
 }
 
 /// `TORNECT_PLAN.md` (repo root) and `docs/PLAN.md` must stay byte-identical
-/// (docs/notes/decisions.md M0-8).
+/// (docs/notes/decisions.md M0-8); the same rule covers the UI plan
+/// (`TORNECT_UI_PLAN.md` == `docs/UI_PLAN.md`, Part G of the plan).
 fn plan_sync(root: &Path) -> anyhow::Result<()> {
-    println!("==> plan sync (TORNECT_PLAN.md == docs/PLAN.md)");
-    let a = std::fs::read(root.join("TORNECT_PLAN.md")).context("reading TORNECT_PLAN.md")?;
-    let b = std::fs::read(root.join("docs").join("PLAN.md")).context("reading docs/PLAN.md")?;
-    if a != b {
-        bail!("TORNECT_PLAN.md and docs/PLAN.md differ; copy the edited one over the other");
+    for (top, doc) in [
+        ("TORNECT_PLAN.md", "PLAN.md"),
+        ("TORNECT_UI_PLAN.md", "UI_PLAN.md"),
+    ] {
+        println!("==> plan sync ({top} == docs/{doc})");
+        let a = std::fs::read(root.join(top)).with_context(|| format!("reading {top}"))?;
+        let b = std::fs::read(root.join("docs").join(doc))
+            .with_context(|| format!("reading docs/{doc}"))?;
+        if a != b {
+            bail!("{top} and docs/{doc} differ; copy the edited one over the other");
+        }
+        println!("    ok");
     }
-    println!("    ok");
     Ok(())
 }
 
