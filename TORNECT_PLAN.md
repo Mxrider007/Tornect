@@ -13,7 +13,7 @@
 Claude Code MUST re-verify exact crate/SDK versions against crates.io and vendor docs
 before pinning dependencies (see the `research-verifier` agent in §D.3).
 
-Revision: 2026-08-28 r4 — §B.8 Unattended access (second review pass) and cross-references.
+Revision: 2026-08-29 r5 — Part G execution status added; Part F decisions recorded (r4: §B.8 Unattended access, second review pass).
 
 ---
 
@@ -1685,12 +1685,52 @@ tag."* — `/milestone <n>` (created in M0) expands to exactly this.
 ## Part F — Open product decisions (answer before/at M0)
 
 1. License — recommend **GPLv3** (ecosystem-compatible with Sunshine; protects
-   against proprietary forks). Confirm.
+   against proprietary forks). **Decided (2026-08-28, M0-1): GPL-3.0-or-later.**
 2. Primary dev OS for M3–M5 (whatever your daily machine + GPU is — say it and the
    plan adapts; Wayland machine recommended since it's the trickiest stack).
+   **Decided (2026-08-28, M0-2): Linux/Wayland — GNOME on Ubuntu 26.04 (the build VM,
+   VMware virtual GPU: no hardware encoder, so hw-codec gates are `NEEDS-DEVICE(gpu)`).**
 3. Unattended access in v1 (M8) or push to post-v1? **Decided (2026-08-28): v1,
    opt-in per device, per §B.8** — protocol M1, session gating M4, platform M6, UI M8.
 4. Minimum supported targets: Windows 10 20H1+ (WGC needs it) / macOS 13+
-   (ScreenCaptureKit maturity) / xdg-desktop-portal ≥ 1.17 distros. Confirm.
+   (ScreenCaptureKit maturity) / xdg-desktop-portal ≥ 1.17 distros. **Decided
+   (2026-08-28, M0-4): confirmed; GNOME ≥ 45 added by §B.8.1 for the RemoteDesktop v2 portal.**
 5. Name/branding check: "Tornect" — quick trademark/collision search before public
    release (research-verifier task in M8).
+
+---
+
+## Part G — Execution status (kept current at every session hand-off)
+
+Last update: **2026-08-29**. Repository: https://github.com/Mxrider420z/Tornect (private,
+branch `main`). Per-milestone detail lives in `docs/notes/m<N>-state.md`; every acceptance
+check with its real status is in `docs/VERIFICATION.md`; every deviation from this plan is a
+numbered row in `docs/notes/decisions.md`.
+
+| Milestone | Status | Evidence / where |
+|---|---|---|
+| M0 Bootstrap | **Done**, tag `m0` (commit `5c7a52d`) | Workspace, `tornect-core` (onion-v3 `TornectId` proven against real addresses, identities, 0600 keystore, config, paths, tracing, `sessions.log`), CLI `id/rotate-id/paths/config/doctor`, `xtask verify`, Claude Code kit, GPLv3, README. CI file written but not yet pushed (see pending actions). |
+| Research | **Done** (commit `36a5b0f`) | `docs/research/{arti,quic,crypto,nat,wayland,codecs,ui,ci,media-proto}.md` + `SUMMARY.md` audit — verified against crates.io, crate sources and live probes; all pins in `Cargo.toml` come from these. |
+| Plan §B.8 | **Done** (r4, commit `c515f0d`) | Unattended access specified end-to-end; two medium text findings still to apply (listed in `docs/notes/m1-state.md`). |
+| M1 Signaling over Tor | **In progress — track 1 of 4 done** (commit `0e568d8`) | Arti embedded (`tornect-signal::tor`), `tornect host` / `tornect ping` verified live over Tor: onion service published from the M0 seed (same ID after restart), pings 0.5–1.1 s RTT, PoW-aware admission with backpressure, 43 signal + 26 core tests. Remaining: CBOR envelope + pairing/SAS + attended FSM, OPAQUE unattended FSM, CLI/IPC/`tornect-platform` scaffold, adversarial suite, live pair/connect verification, tag `m1`. Workflow script prepared: `docs/notes/m1-phase2-plan.md`. |
+| M2–M8 | Not started | Research decisions already made for M2 (raw-public-key TLS, punch outside QUIC, `grease_quic_bit(false)`, `stun` 0.17 / `crab_nat` / `igd-next`), M3 (`openh264` software path; hw codecs `NEEDS-DEVICE(gpu)`; VM-scoped acceptance to define), M5 (`opus` 0.4, in-band FEC off), UI (manual winit loop, no eframe; wgpu 30 / winit 0.30 / egui 0.36). |
+
+**Verified-on-hardware honesty.** Everything above was run on one Ubuntu 26.04 VM (GNOME/
+Wayland, no GPU encoder, no sudo, no second machine). Windows/macOS are `cargo check`-ed via
+installed targets only; "two machines on different NATs" (M1 accept) is `NEEDS-DEVICE`.
+
+**Pending actions for the owner.** (1) `gh auth refresh -h github.com -s workflow`, then commit
+and push `.github/workflows/ci.yml` (kept local because the token lacks the `workflow` scope).
+(2) Copy `.claude/settings.recommended.json` to `.claude/settings.json` after review (the harness
+refuses to let the model install its own permission/hook config). (3) Optional: a second
+machine for the M1/M2 two-NAT acceptance rows.
+
+**Plan amendments queued for r6** (from `docs/research/SUMMARY.md`): §A.2 FFmpeg versions
+(ubuntu-latest ships 6.1; crate supports 6.1–9.0); §A.4 "Linux host must be unlocked (GNOME
+closes portal sessions on lock)"; §B.2 punch mechanics (probes outside QUIC, single dial, role
+tie-break) and `quic_spki` instead of `quic_server_cert_fp`; §B.4 Opus in-band FEC off + datagram
+payload = live `max_datagram_size()` (1162 B at 1200 MTU) with a 12-byte header; §B.5 Wayland
+restore token on `SelectDevices`, `openh264` as the always-on software codec (no x264-first,
+no rav1e/svt-av1/dav1d in v1); §B.6 TLS raw public keys (RFC 7250) rather than X.509; D9 `opus`
+crate; D10 own winit loop instead of eframe; D13 `keyring-core`; M2 `stun` crate (not
+`stun-client`); M3 VM-scoped acceptance + `NEEDS-DEVICE(gpu)` rows.
