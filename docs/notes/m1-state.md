@@ -23,18 +23,19 @@ platform scaffold) are specified and scripted but not started. `m1` is **not** t
 - Plan r4 (`TORNECT_PLAN.md` == `docs/PLAN.md`, 1696 lines) with §B.8 Unattended access.
 - Research notes `docs/research/*.md` + `SUMMARY.md` (audit) — code from these, not memory.
 
-## Open findings to apply at the start of the next session (plan text, medium)
+## Open findings (plan text, medium) — **applied in plan r6 (2026-08-29), tightened by the r6 review pass**
 
-1. §B.8.2 T12 / §B.8.5.1 / §B.8.5.3: decay bookkeeping is wall-clock based, so a forward
-   clock jump at runtime would decay counters; fix = `Instant` twins for runtime decay, cap
-   steps at load, reword T12 honestly, add a U-row.
-2. §B.8.9 `GrantState::Suspended{reason}`: a *local* suspend (CLI/IPC/UI) has no reason
-   variant; add `Local{by: Actor}`, state that a remote `unlock` never clears it, extend A15.
+1. [applied r6] §B.8.2 T12 / §B.8.5.1 / §B.8.5.3: decay bookkeeping is wall-clock based, so a forward
+   clock jump at runtime would decay counters; fix = monotonic twins for runtime decay (`Clock`
+   trait, `credit` rule, monotone `last_seen`), cap steps at load, reword T12 honestly, U1–U7 clock cases.
+2. [applied r6] §B.8.9 `GrantState::Suspended{reason}`: a *local* suspend (CLI/IPC/UI) has no reason
+   variant; add `Local{by: Actor}`, state that a remote `unlock` never clears it, extend A15
+   (+ §B.8.7.3 *Suspend*/*Resume*, §B.8.7.4 `IpcOp` annotations, `UnattendedSuspended{reason, by?}`).
 
 Plus the plan amendments the research audit lists (`docs/research/SUMMARY.md` "Cross-cutting"):
 §A.2 FFmpeg version, §A.4 GNOME lock-screen constraint, §B.2 punch mechanics + `quic_spki`,
 §B.4 Opus FEC / MTU / header sizes, §B.5 Wayland token placement + codec fallbacks, §B.6 RPK,
-D9 `opus`, D10 no eframe, D13 `keyring-core`, M2 `stun` crate — bump to r6 when applied.
+D9 `opus`, D10 no eframe, D13 `keyring-core`, M2 `stun` crate — applied in r6 (Part G lists them).
 
 ## Next: M1 phase 2 (script ready)
 
@@ -45,7 +46,7 @@ Before launching:
    (tracks A and B both touch core; pre-creating the module lines avoids a lost update).
 2. Bump `rust-version = "1.95"` in `Cargo.toml` + `clippy.toml msrv`, add `rust-toolchain.toml`
    (`channel = "1.96.0"`, components rustfmt + clippy) — arti-client needs 1.91, egui 0.36 needs 1.95.
-3. Apply the two open plan findings above (or hand them to the plan-fix step).
+3. The two plan findings above are applied (r6); read plan §B.8.5.1/§B.8.5.3 (`Clock` trait, `credit`) before track A.
 Tracks (each implement → security + correctness review → fix): A core store/limiter/guard/log
 chain (§B.8.5/6.2/9/13), B envelope/transcript/pairing/SAS/attended FSM (§B.3, §B.8.4), then
 C OPAQUE unattended FSM (§B.8.4–6), then D CLI + IPC + `tornect-platform` scaffold (§B.8.7.4),
