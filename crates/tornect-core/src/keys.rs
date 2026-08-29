@@ -43,6 +43,10 @@ impl HostIdentity {
     }
 
     /// The secret seed (for the keystore). Zeroized on drop.
+    ///
+    /// `to_bytes()` hands the 32 bytes over by value, so a copy lives on the
+    /// stack until it is moved into the `Zeroizing`; accepted, like the other
+    /// by-value copies dalek's API forces (the key itself zeroizes on drop).
     #[must_use]
     pub fn seed(&self) -> Seed {
         Zeroizing::new(self.key.to_bytes())

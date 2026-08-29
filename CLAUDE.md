@@ -13,17 +13,20 @@ rules; when in doubt, open the plan section cited.
 
 ```
 Cargo.toml                  workspace: pins + lints for every crate (docs/DEPENDENCIES.md explains each)
-crates/tornect-core         ids (onion v3), ed25519 identities, file keystore, config, paths, tracing, sessions.log
-crates/tornect-signal       Arti onion service + CBOR envelope protocol + pairing/SAS + unattended PAKE   (M1)
+crates/tornect-core         ids (onion v3), ed25519 identities, file keystore, config, paths, tracing, sessions.log; encrypted unattended grant store + MutationGuard/ReAuth entry point + ReadinessSnapshot (§B.8.9, §B.8.6.2, §B.8.14) + the IPC message types/CBOR codec (unattended::ipc, no I/O; §B.8.7.4)
+crates/tornect-signal       Arti onion service + CBOR envelope protocol + pairing/SAS + unattended PAKE auth + attempt limiter + the HELLO…ACCEPT host FSM behind BlockWindow/LocalAllow traits (§B.8.4–B.8.5, §B.8.14)   (M1)
 crates/tornect-net          candidates, UPnP/NAT-PMP/PCP, STUN, hole punch, key-pinned quinn, Tor tunnel  (M2)
 crates/tornect-proto        media wire format, packetizer, FEC, jitter buffer, pacer, ABR, stats            (M3)
 crates/tornect-capture      VideoCaptureSource + pipewire | wgc | sckit backends + synthetic source         (M3/M6)
 crates/tornect-codec        Encoder/Decoder + ffmpeg hw backends + software fallback                        (M3)
 crates/tornect-audio        capture, Opus, playback                                                          (M5)
 crates/tornect-input        16-byte input events, client capture, host inject backends                      (M5)
-crates/tornect-session      host/client state machines gluing everything                                    (M4)
-apps/tornect                CLI now; eframe app + stream window later                                       (M4/M8)
+crates/tornect-platform     OS session services (§B.8.8): presence, lock, keep-awake, autostart, OS re-auth backends, hotkeys, readiness, owner-only IPC endpoint   (M1 scaffold / M6)
+crates/tornect-session      host/client state machines gluing everything; unattended: the UI-backed BlockWindow/LocalAllow impls + Candidates onward (§B.8.14)   (M4)
+apps/tornect                CLI now; eframe app + stream window later; host-role IPC server loop dispatching to the MutationGuard (§B.8.7.4)   (M4/M8)
 xtask                       cargo xtask verify | lint-all | dist | ffmpeg-fetch | soak
+tests/integration           loopback e2e, signaling-over-localhost-tor mocks, unattended adversarial suite (§B.8.15)   (M1)
+tests/netem                 scripted latency/loss/jitter harness (linux netns; runs in CI)
 docs/PLAN.md                the plan (verbatim copy of TORNECT_PLAN.md at repo root)
 docs/DEPENDENCIES.md        dependency → version → why → build requirements → verified-on
 docs/VERIFICATION.md        acceptance ledger: VERIFIED / CI / NEEDS-DEVICE(os) / OPEN
@@ -33,8 +36,9 @@ docs/notes/m<N>-state.md    per-milestone hand-off notes (write before /clear)
 .githooks/pre-commit        fmt + clippy gate (enable: git config core.hooksPath .githooks)
 ```
 
-Dependency direction: `core → {signal, net, proto, capture, codec, audio, input} → session → app`.
-Never upward. Only `tornect-signal` imports Arti; only `tornect-net` touches sockets/quinn.
+Dependency direction: `core → {signal, net, proto, capture, codec, audio, input, platform} → session → app`.
+Never upward. Only `tornect-signal` imports Arti; only `tornect-net` touches sockets/quinn;
+`tornect-platform` implements traits that `tornect-core::unattended` defines (`ReAuth`, `Presence`), never the reverse.
 
 ## Commands
 
@@ -43,7 +47,10 @@ cargo xtask verify                 # fmt --check, clippy -D warnings (all target
 cargo xtask lint-all               # fmt + clippy only
 cargo run -p tornect -- id         # M0 acceptance: prints this machine's Tornect ID (56-char .onion)
 cargo run -p tornect -- doctor     # environment report
-TORNECT_HOME=/tmp/h1 cargo run -p tornect -- id    # isolated instance (use two for host+client on one box)
+TORNECT_HOME=$PWD/target/tornect-test/h1 cargo run -p tornect -- host          # M1: publish onion service, answer pings
+TORNECT_HOME=$PWD/target/tornect-test/h2 cargo run -p tornect -- ping <id> --count 5   # M1: second isolated instance
+cargo test -p tornect-signal --test live -- --ignored --nocapture              # M1: host+client roundtrip over live Tor
+cargo +nightly fuzz run framing -- -max_total_time=600                          # M1: 10-min fuzz of the frame parser (fuzz/ is outside the workspace)
 cargo check --target x86_64-pc-windows-msvc -p tornect-core   # cross-check (targets installed on the dev VM)
 cargo check --target aarch64-apple-darwin -p tornect-core
 ```
@@ -80,7 +87,11 @@ FFmpeg (libav*), PipeWire, ALSA, libei, libclang-dev, GTK. Consequences:
 - The pure-Rust stack (Arti, quinn, ashpd, reis, egui/wgpu, the `openh264` software codec
   built from source with `cc`) builds and runs here — that is the default feature set.
 - No root ⇒ no netns/tc netem locally; `tests/netem/run.sh` runs in CI.
-- Outbound Tor works from this VM (directory authorities reachable); M1 can be verified live.
+- Outbound Tor works from this VM (directory authorities reachable); M1 can be verified live
+  (cold bootstrap ≈ 10 s, onion service reachable ≈ 70 s after launch, ping RTT ≈ 0.5–1 s).
+- `/tmp` is a small quota-limited tmpfs: build with `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp`
+  (otherwise `cc` fails on zstd with "Disk quota exceeded") and keep Tor state under
+  `target/tornect-test/<name>`, never `/tmp`.
 - The GitHub remote uses HTTPS with the `gh` credential helper (`gh auth setup-git`).
 
 ## Coding conventions
@@ -93,7 +104,8 @@ FFmpeg (libav*), PipeWire, ALSA, libei, libclang-dev, GTK. Consequences:
   for logs, `#![warn(missing_docs)]` on `tornect-core` (extend as crates mature). Binaries: `anyhow`.
 - Secrets: `zeroize` on drop, redacted `Debug` impls, never in logs or error strings.
 - Tests live next to the code; property tests with `proptest` for anything parsed from the wire;
-  fuzz targets (`cargo-fuzz`, nightly) for envelope parsing, datagram reassembly, input decode, auth messages.
+  fuzz targets (`cargo-fuzz`, nightly) for envelope parsing, datagram reassembly, input decode, auth messages,
+  the unattended store + limiter loaders, IPC messages (§D.5).
 - Wire formats: CBOR (`docs/PLAN.md` §B.3) for control, hand-packed fixed headers (§B.4) for media
   datagrams and input events. Every format has round-trip tests.
 - Timestamps on every media frame; every pipeline stage reports into stats (§B.7 instrumentation).
@@ -101,12 +113,14 @@ FFmpeg (libav*), PipeWire, ALSA, libei, libclang-dev, GTK. Consequences:
 
 ## Security invariants (docs/PLAN.md §B.6, §B.8 — requirements, not options)
 
-- Consent popup always precedes capture; capture starts only after SESSION_ACCEPT.
+- Consent popup precedes capture for attended sessions; an unattended session needs the §B.8 two
+  factors and block window instead; capture starts only after SESSION_ACCEPT.
 - Persistent "screen is being shared" indicator + tray state + one-click kill, always — including
   unattended sessions. Panic key (default Ctrl+Alt+End) always works host-side.
 - Unattended access: opt-in **per device**, granted only locally on the host, requires prior SAS
   pairing, authenticated with an augmented PAKE (OPAQUE, Argon2id KSF) bound to the signed
-  transcript and `session_token`; there is no password-less auto-accept. Lockouts persist.
+  transcript; `session_token` is derived from the PAKE session key; there is no password-less
+  auto-accept. Lockouts persist.
 - All pairing/session/auth events appended to `sessions.log`. No telemetry. Crash dumps opt-in.
 - QUIC TLS 1.3 with both certificates pinned to the peers' Tornect keys; no CAs.
 

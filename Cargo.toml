@@ -13,6 +13,9 @@ members = [
   "apps/tornect",
   "xtask",
 ]
+# cargo-fuzz targets (nightly, libfuzzer) build with their own lock file:
+# `cargo +nightly fuzz run <target>` from the repo root.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -63,6 +66,54 @@ bytes = "1.12.1"
 parking_lot = "0.12.5"
 tempfile = "3.27.0"
 proptest = "1.11.0"
+
+# Milestone 1 — Arti (Tor) embedding. Every tor-* crate must share one exact
+# version (docs/research/arti.md §1); never enable arti-client `full`,
+# `experimental`, `native-tls` or `static` (§2). rustls stays on the `ring`
+# provider, shared with quinn (docs/research/quic.md §1.2–§2).
+arti-client = { version = "=0.45.0", default-features = false, features = [
+  "tokio", "rustls", "compression", "flowctl-cc", "static-sqlite",
+  "onion-service-service", "onion-service-client", "vanguards",
+] }
+tor-hsservice = "=0.45.0"
+tor-hscrypto = "=0.45.0"
+tor-cell = "=0.45.0"
+tor-proto = "=0.45.0"
+# `state-dir` (experimental marker, already compiled in via tor-hsservice) gives
+# `StateDirectory::acquire_instance` + `InstanceStateHandle::purge`: taking the
+# lock a running service holds, then deleting its `hss/<nickname>/` state and
+# lock file when an identity is rotated (decision M1-6).
+tor-persist = { version = "=0.45.0", features = ["state-dir"] }
+tor-llcrypto = "=0.45.0"
+tor-keymgr = { version = "=0.45.0", features = ["keymgr"] }
+tor-rtcompat = { version = "=0.45.0", features = ["tokio", "rustls"] }
+safelog = "0.9"
+rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
+futures = "0.3.34"
+
+# Milestone 1 — signaling protocol, pairing, unattended access (docs/PLAN.md §B.3,
+# §B.8; pins per docs/research/crypto.md §0/§8 and docs/research/SUMMARY.md §1.2).
+# CBOR: minicbor with derive (integer keys, unknown keys skipped — schema-evolvable);
+# signatures cover the exact wire bytes, so no canonical encoding is needed.
+minicbor = { version = "=2.3.0", features = ["std", "derive"] }
+# AEAD for the encrypted unattended store (XChaCha20-Poly1305, RustCrypto 2026 line).
+chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
+# OPAQUE-3DH (ristretto255 / SHA-512 / Argon2id KSF). Still on the old crypto stack
+# (rand 0.8, digest 0.10, argon2 0.5): the KE hash must be `sha2_010::Sha512`, the KSF
+# type `opaque_ke::argon2::Argon2`, and RNGs go through a rand_core-0.6 adapter.
+opaque-ke = { version = "=4.0.1", default-features = false, features = ["argon2", "ristretto255", "serde"] }
+sha2_010 = { package = "sha2", version = "0.10" }
+rand_core_06 = { package = "rand_core", version = "0.6" }
+rand = "=0.10.2"
+rand_core = "=0.10.1"
+# Password policy (§B.8.7.2): NFC normalization + zxcvbn scoring on the client/CLI side.
+unicode-normalization = "=0.1.25"
+zxcvbn = "=3.1.1"
+# OS keychain for K_master (§B.8.9), behind the `keyring` feature; file keystore is the fallback.
+keyring-core = "=1.0.0"
+linux-keyutils-keyring-store = "=1.0.0"
+# Fuzzing helpers (fuzz/ crate is workspace-excluded; `arbitrary` derives shared with it).
+arbitrary = { version = "=1.4.2", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
