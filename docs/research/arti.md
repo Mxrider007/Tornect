@@ -714,8 +714,15 @@ descriptor upload to ≥1 HsDir on each of 2 rings before `State::Running`.
    don't unify by hand; use `tor_llcrypto::rng::CautiousRng` / `rand 0.10` for arti
    calls and `rand_core 0.6`-compatible RNGs for `ed25519-dalek`.
 7. **fs-mistrust** rejects group/world-writable state/keystore dirs (and parents);
-   create dirs with 0700 on unix; on Windows it checks ACLs. Test suites should set
-   `dangerously_trust_everyone()` or `ARTI_FS_DISABLE_PERMISSION_CHECKS=true`.
+   create dirs with 0700 on unix. **On Windows it checks nothing about permissions or
+   owners** — `check_permissions` is `#[cfg(target_family = "unix")]` only
+   (`fs-mistrust-0.15.1/src/imp.rs` 138–174) and the README states "On Windows, we
+   accept all file permissions and owners" (README.md 218); only path types (dir vs
+   file, symlinks) are checked there. So the Windows state dir is protected exactly as
+   well as `%LOCALAPPDATA%` is (per-user profile ACL) and no more — corrected
+   2026-08-29 from the crate source (this note first claimed an ACL check). Test
+   suites can set `dangerously_trust_everyone()` or
+   `FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=true` (`src/disable.rs` 27).
 8. **Do not fork** after creating the runtime (README). `std::process::Command` is OK.
 9. `num_intro_points` must be **3..=20** (validate()).
 10. `RunningOnionService` drop = stop publishing; existing circuits stay open. Keep
@@ -725,7 +732,16 @@ descriptor upload to ≥1 HsDir on each of 2 rings before `State::Running`.
 12. `handle_rend_requests` swallows accept errors with a `warn_report!` — add your
     own filter/metrics before it if you need rejection accounting.
 13. Only accept `BEGIN` and only check the port — anything else makes the service
-    fingerprintable (req.rs 257–260, 273–278).
+    fingerprintable (req.rs 257–260, 273–278). For a request that is *not* `BEGIN`
+    on a served port, Arti's own reverse proxy destroys the rendezvous circuit:
+    `tor-hsrproxy-0.45.0/src/proxy.rs` 225 (non-`BEGIN`) and 236 (`resolve_port_for_begin`
+    → `unwrap_or(ProxyAction::DestroyCircuit)`), executed at 248–250 via
+    `StreamRequest::shutdown_circuit()` (req.rs 286–291: `on_tunnel.terminate()`).
+    Sending `END(DONE)` and keeping the circuit is therefore distinguishable, and
+    rejected streams do not count toward `max_concurrent_streams_per_circuit`.
+    Dropping the stream returned by `RendRequest::accept` also closes the circuit —
+    it owns the rendezvous tunnel (req.rs 233–241). Verified 2026-08-28 from the
+    crate tarballs (`static.crates.io`).
 14. Default state/cache dirs are `~/.local/share/arti`, `~/.cache/arti` shared with
     the system `arti` — always override.
 15. `cache_dir` may be wiped at any time; `state_dir` must persist (guards, IPTs,

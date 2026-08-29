@@ -1,5 +1,6 @@
-# cargo-deny configuration (run: cargo deny check). Tornect is GPL-3.0-or-later;
-# every dependency license below is GPLv3-compatible.
+# cargo-deny configuration (run: cargo deny check --workspace). Tornect is
+# GPL-3.0-or-later; every dependency license below is GPLv3-compatible.
+# Delta vs the M0 draft per docs/research/ci.md §7.3 / docs/research/SUMMARY.md §1.9.
 
 [graph]
 all-features = false
@@ -14,7 +15,13 @@ targets = [
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+  # rsa 0.9 Marvin timing side channel: reached only through Arti's ssh-key fork used to
+  # parse keystore files (never for RSA operations on network input). Tracked upstream.
+  { id = "RUSTSEC-2023-0071", reason = "transitive via ssh-key-fork-arti (Arti keystore parsing); no RSA crypto used by Tornect" },
+  # `paste` is unmaintained; pulled transitively by dependencies at build time only.
+  { id = "RUSTSEC-2024-0436", reason = "proc-macro helper used at build time by transitive dependencies; no runtime exposure" },
+]
 
 [licenses]
 version = 2
@@ -32,11 +39,13 @@ allow = [
   "BSL-1.0",
   "CC0-1.0",
   "0BSD",
+  "Unlicense",
   "OpenSSL",
   "CDLA-Permissive-2.0",
   "LGPL-2.1",
   "LGPL-2.1-or-later",
-  "LGPL-3.0",
+  "LGPL-3.0-only",
+  "LGPL-3.0-or-later",
   "GPL-3.0",
   "GPL-3.0-or-later",
 ]
@@ -45,6 +54,9 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# The workspace's own crates are `path` dependencies without a version (they are
+# `publish = false`); cargo-deny 0.20 otherwise reports each as a wildcard.
+allow-wildcard-paths = true
 highlight = "all"
 
 [sources]
