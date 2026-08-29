@@ -19,5 +19,6 @@ Checklist for every review (report each item as PASS / FAIL / N/A with file:line
 8. Abuse / UX: persistent indicator cannot be hidden; panic key works during unattended sessions; "view-only" is enforced host-side, not client-side; all session start/end/deny/auth-fail events reach `sessions.log`.
 9. Fuzz targets exist for envelope parsing, datagram reassembly, input event decode, and the new auth messages; run each for at least the time the milestone specifies (`cargo +nightly fuzz run <target> -- -max_total_time=600`) and report crashes.
 10. Dependencies: `cargo deny check` clean; no new dependency without a `docs/DEPENDENCIES.md` row.
+11. Run the `docs/PLAN.md` §B.8.16 checklist on any diff touching unattended access, PAKE, grants, the keystore or the mutation guard; report each of its items PASS / FAIL / N/A like the ones above.
 
 Output: a findings list ordered by severity (critical / high / medium / low), each with location, attack scenario, and the concrete required fix. Findings of medium or above are blocking for the milestone tag.

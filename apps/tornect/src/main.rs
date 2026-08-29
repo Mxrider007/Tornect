@@ -1,10 +1,13 @@
 //! `tornect` command-line entry point.
 //!
-//! Milestone 0 ships the identity/config commands; `host`, `connect`, `demo` and
-//! the graphical app arrive with later milestones (`docs/PLAN.md` Part C).
+//! Milestone 0 ships the identity/config commands; Milestone 1 adds `host` and
+//! `ping` over the live Tor network; `connect`, `demo` and the graphical app
+//! arrive with later milestones (`docs/PLAN.md` Part C).
 
 #![forbid(unsafe_code)]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
+
+mod tor_cmd;
 
 use std::path::PathBuf;
 
@@ -58,6 +61,37 @@ enum Command {
     },
     /// Report the environment (OS, session type, directories, identities).
     Doctor,
+    /// Publish this machine's Tornect ID as a Tor onion service and answer pings.
+    ///
+    /// Prints `Tornect ID: <onion>` as soon as the service is launched and
+    /// `REACHABLE` once the address is published on the Tor network. Ctrl-C stops.
+    Host {
+        /// Exit after the first ping has been answered (scripted verification).
+        #[arg(long)]
+        once: bool,
+        /// Force proof-of-work introduction defense on (default: config `tor.pow_defense`).
+        #[arg(long, conflicts_with = "no_pow")]
+        pow: bool,
+        /// Force proof-of-work introduction defense off.
+        #[arg(long, conflicts_with = "pow")]
+        no_pow: bool,
+    },
+    /// Connect to a host by Tornect ID over Tor and measure round-trip times.
+    ///
+    /// Uses this instance's own Tor state; run it under a different TORNECT_HOME
+    /// than the host when both live on one machine.
+    Ping {
+        /// The host's Tornect ID (56-character onion address, with or without `.onion`).
+        onion: String,
+        /// Number of pings to send (a host answers at most 100 per session).
+        #[arg(
+            long,
+            default_value_t = 3,
+            value_parser = clap::value_parser!(u32)
+                .range(1..=i64::from(tornect_signal::ping::MAX_PINGS_PER_SESSION))
+        )]
+        count: u32,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -98,6 +132,15 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Config { action } => cmd_config(&paths, action),
         Command::Doctor => cmd_doctor(&paths),
+        Command::Host { once, pow, no_pow } => {
+            let pow = match (pow, no_pow) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
+            tor_cmd::host(&paths, once, pow)
+        }
+        Command::Ping { onion, count } => tor_cmd::ping(&paths, &onion, count),
     }
 }
 
@@ -148,6 +191,34 @@ fn cmd_rotate_id(paths: &Paths, yes: bool) -> anyhow::Result<()> {
         std::process::exit(2);
     }
     let store = open_store(paths)?;
+    // Arti's keystore holds its own copy of the identity key, keys derived from
+    // it and the service's intro-point state (tornect-signal `tor::identity`);
+    // an invalidated identity must not stay recoverable there. Done before the
+    // new seed is written, so a failure leaves the old identity whole instead of
+    // half rotated.
+    use tornect_core::SecretStore as _;
+    if store.contains(keystore::HOST_IDENTITY_SEED)? {
+        let (old, _) = load_or_create_host_identity(&store)?;
+        let forgotten = tornect_signal::forget_identity(paths, &old.id()).with_context(|| {
+            format!(
+                "removing the old Tornect ID {} from the Tor keystore and state",
+                old.id()
+            )
+        })?;
+        if forgotten == tornect_signal::ForgottenIdentity::default() {
+            eprintln!("the old ID had no Tor keys or service state on this machine");
+        } else {
+            eprintln!(
+                "removed the old ID's Tor keys and service state ({} key(s){})",
+                forgotten.keys_removed,
+                if forgotten.state_removed {
+                    ", intro-point state"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
     let host = keystore::rotate_host_identity(&store)?;
     let log = tornect_core::session_log::SessionLog::new(paths.sessions_log());
     log.append(&tornect_core::session_log::SessionRecord::now(
