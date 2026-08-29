@@ -1,0 +1,6 @@
+# Pinned toolchain (docs/notes/m1-state.md): arti-client 0.45 needs 1.91, egui 0.36 needs 1.95.
+# Fuzzing uses `cargo +nightly fuzz` explicitly (fuzz/ is outside the workspace).
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
