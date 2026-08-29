@@ -13,7 +13,7 @@
 Claude Code MUST re-verify exact crate/SDK versions against crates.io and vendor docs
 before pinning dependencies (see the `research-verifier` agent in §D.3).
 
-Revision: 2026-08-29 r5 — Part G execution status added; Part F decisions recorded (r4: §B.8 Unattended access, second review pass).
+Revision: 2026-08-29 r6 — sections touched: §A.2, §A.4, §B.1, §B.2, §B.4, §B.5, §B.6, §B.8.1–2 (T1/T2/T12, B.8.2.1), §B.8.4.1–2/4.5–4.6, §B.8.5.1/5.3, §B.8.6.2–3, §B.8.7.3–5, §B.8.8, §B.8.9, §B.8.10, §B.8.12–17, Part C M1–M4/M6–M8, D.1, D.3, D.4, D5/D6/D9/D10/D12/D13, Part E, Part F.6, Part G — itemised there (runtime-monotonic decay/clock rules; the local *Suspend* reason `Suspended{Local{by}}`; UI plan adopted; research-audit amendments; the r6 review passes). r5: Part G execution status added; Part F decisions recorded (r4: §B.8 Unattended access, second review pass).
 
 ---
 
@@ -53,11 +53,15 @@ vanguards) we should enable.
 
 **NAT traversal.** The industry has converged on *coordinated UDP hole punching with
 a fallback relay*, increasingly expressed **inside QUIC** rather than as a separate
-ICE layer: IETF `draft-seemann-quic-nat-traversal`, implemented in production by
-**iroh 1.0 (June 2026)** — a Rust library that dials peers by ed25519 public key,
-hole-punches QUIC via a NAT-traversal extension, and falls back to relays; iroh's
-docs explicitly note the transport wire can be swapped (they name Tor as an option).
-iroh validates our exact architecture: *public-key dialing + punched QUIC*. We differ
+ICE layer: IETF `draft-seemann-quic-nat-traversal` (an expired individual draft — -02,
+2024-03-03, never adopted by the QUIC WG, no probe-pacing text; upstream `quinn` implements
+none of it, so Tornect punches *outside* QUIC and hands the validated socket to quinn, §B.2;
+docs/research/nat.md §4, quic.md §0), implemented as a variant by
+**iroh** (via its `noq` fork; iroh 1.1.0, quic.md §10) — a Rust library that dials peers by
+ed25519 public key, hole-punches QUIC via a NAT-traversal extension it "does not expect to
+follow exactly" (nat.md §4), and falls back to relays; the earlier claims of a June 2026 "iroh 1.0"
+and of docs that let the transport wire be swapped (naming Tor) are unsourced (SUMMARY.md §3 #26)
+and carry no weight here. iroh validates our exact architecture: *public-key dialing + punched QUIC*. We differ
 in one deliberate way: our rendezvous/coordination channel is a Tor onion circuit
 instead of iroh's relay servers, so there is no third-party coordination plane.
 str0m (sans-IO Rust WebRTC, production-proven as an SFU, P2P/ICE less battle-tested)
@@ -103,11 +107,22 @@ media, streams for control, partial reliability) in a small custom protocol over
 Practical codec ladder: negotiate **AV1 > HEVC > H.264** by mutual capability;
 low-latency tuning everywhere (CBR-ish rate control, zero B-frames, infinite GOP +
 **intra-refresh** instead of periodic IDR spikes, ≤1 frame lookahead).
-FFmpeg ≥ 7.x (`libavcodec`) exposes every encoder above through one API with
+FFmpeg (`libavcodec`) exposes every encoder above through one API with
 hw-frames zero-copy (`d3d11va` → NVENC/AMF/QSV on Windows, `vaapi` + `cuda` on
 Linux, `videotoolbox` on macOS) — that uniformity is why it's our v1 encode/decode
 layer, with per-vendor native SDK backends as a v2 optimization behind the same
-trait.
+trait. Versions (r6): the bindings are `ffmpeg-next`/`ffmpeg-sys-next` **9.0.0**, which
+build against any FFmpeg **6.1–9.0** (bindgen from the installed headers; upstream CI matrix
+6.1/7.0/7.1/8.0/8.1/9.0); `ubuntu-latest` (24.04) ships **6.1**, Ubuntu 26.04 and this dev VM
+**8.0.1**; FFmpeg 9.0 (Aug 2026) broke ABI across all seven libraries. We target the **8.x
+API**, gate 8-only symbols on the `ffmpeg_8_0` cfg the build script emits (for its own crate — `tornect-codec/build.rs`
+re-derives it from the `DEP_FFMPEG_*` variables `ffmpeg-sys-next` exports, codecs.md §10 item 13: `tornect-codec` lists
+`ffmpeg-sys-next` directly — Cargo passes `DEP_FFMPEG_*` only to immediate dependents — and emits
+`cargo:rustc-cfg=feature="ffmpeg_8_0"` plus the matching `cargo:rustc-check-cfg`, without which `-D warnings` trips
+`unexpected_cfgs`), run the media CI job
+on `[ubuntu-24.04 (6.1), ubuntu-26.04 (8.0.1, continue-on-error while preview)]`, and ship
+FFmpeg with releases (M8) rather than depend on the distro's major (docs/research/codecs.md
+§2.1, ci.md §3).
 
 **Reference quality bar:** Sunshine+Moonlight (GPL, 40k+ ★, the de-facto standard
 self-hosted stack in 2026) achieves single-digit-ms added latency on LAN and 4K60
@@ -122,15 +137,15 @@ deleting their setup pain (pairing PINs on a web UI, port forwarding, VPNs).
 | D2 | Tor integration | **Embed `arti-client`** with `onion-service-service` + `onion-service-client` | In-process, no daemon to ship/manage; per-app state dir; stable since Arti 2.0 | Bundling C tor + control port (fragile, heavyweight) |
 | D3 | Identity | **Onion v3 address = host identity**; separate per-device ed25519 keys for client devices, pinned at pairing | Self-authenticating, zero-infrastructure, human-shareable (56 chars, QR) | Custom PKI (needs infrastructure); iroh EndpointIds (ties identity to iroh) |
 | D4 | Signaling | Length-prefixed **CBOR** messages over an onion stream (versioned envelope) | Tor circuit is already E2E-encrypted+authenticated to the onion key; CBOR = compact, schema-evolvable, great serde support | JSON (fine, fatter); protobuf (codegen friction for little gain here) |
-| D5 | Media transport | **QUIC via `quinn`**: unreliable **datagrams** for A/V, reliable streams for control/input/clipboard/files; TLS 1.3 with both ends pinning the peer's Tornect keys (no CA) | One connection, E2E-encrypted, congestion-controlled, punchable; matches iroh/MoQ direction | str0m WebRTC (keep as documented plan-B; needed only for future browser client); raw UDP + custom crypto (reinventing TLS) |
-| D6 | NAT traversal | ICE-style candidate gathering (host addrs + **UPnP/NAT-PMP/PCP** port mapping + server-reflexive via a **user-editable public STUN list**), exchange over Tor, simultaneous-open punch, then QUIC | Maximizes direct-connect rate with zero owned infra; STUN is stateless free public infrastructure and is *optional* | Own STUN/TURN (violates "no servers"); iroh as connectivity backend (excellent, but pulls in n0's relay/discovery plane by default — keep as an optional feature-flagged backend for de-risking) |
+| D5 | Media transport | **QUIC via `quinn`**: unreliable **datagrams** for A/V, reliable streams for control/input/clipboard/files; TLS 1.3 with both ends pinning the peer's Tornect keys (no CA; RFC 7250 raw public keys, §B.6) | One connection, E2E-encrypted, congestion-controlled, punchable; matches iroh/MoQ direction | str0m WebRTC (keep as documented plan-B; needed only for future browser client); raw UDP + custom crypto (reinventing TLS) |
+| D6 | NAT traversal | ICE-style candidate gathering (host addrs + **UPnP/NAT-PMP/PCP** port mapping + server-reflexive via a **user-editable public STUN list**), exchange over Tor, simultaneous-open punch (STUN-style probes outside QUIC on the media socket, §B.2), then QUIC | Maximizes direct-connect rate with zero owned infra; STUN is stateless free public infrastructure and is *optional* | Own STUN/TURN (violates "no servers"); iroh as connectivity backend (excellent, but pulls in n0's relay/discovery plane by default — keep as an optional feature-flagged backend for de-risking) |
 | D7 | Fallback path | **Stream over the Tor circuit itself** (TCP-like onion stream): capped preset ~1–6 Mbit/s, H.264, aggressive downscale, "relayed via Tor" badge | Guarantees Tornect *always* connects — the killer differentiator; also doubles as "paranoid mode" (peers never learn each other's IP) | TURN (needs servers); giving up (Moonlight's answer) |
 | D8 | Video pipeline | Capture→encode zero-copy on GPU per §A.2; **FFmpeg hw contexts** as the unified codec layer v1; decode→render via **wgpu** (Vulkan/Metal/D3D12) with NV12/P010 shaders | One codec API across 4 vendor stacks; wgpu = one renderer for all OSes | GStreamer (capable, but heavy runtime dependency + plugin hell for end-users); per-vendor SDKs first (do later as optimization) |
-| D9 | Audio | **Opus** 48 kHz, 5–10 ms frames, in QUIC datagrams; WASAPI loopback / ScreenCaptureKit audio / PipeWire capture | The only sane real-time audio codec; `libopus` via `audiopus`/`opus` crate | — |
-| D10 | UI toolkit | **egui/eframe** for control UI + consent popups + tray (`tray-icon`, `rfd`); streaming window = `winit` + wgpu surface with egui overlay | Pure Rust, tiny, one toolkit everywhere incl. the GPU-rendered stream window; fastest path for Claude Code to iterate | Tauri 2 (nicer chrome, but webview + IPC between UI and stream window adds friction); Qt/Slint (C++/licensing or smaller ecosystem) |
+| D9 | Audio | **Opus** 48 kHz, 10 ms frames (`Application::LowDelay`, in-band FEC off, previous-frame redundancy — §B.4), in QUIC datagrams; WASAPI loopback / ScreenCaptureKit audio / PipeWire capture | The only sane real-time audio codec; `libopus` 1.6.1 bundled by the **`opus` crate** (`=0.4.0` → `opusic-sys`, built with cmake, no pkg-config/bindgen), round-trip verified on the dev VM (docs/research/codecs.md §5) | `audiopus`/`audiopus_sys` (stale since 2021) |
+| D10 | UI toolkit | **App shell: Iced 0.14** per `docs/UI_PLAN.md` (adopted 2026-08-29, Part G; `research-verifier` pins `iced` and the other UI crates at the first UI milestone — nothing UI-related is pinned yet); **stream surface: a manual `winit` 0.30 event loop** (`ApplicationHandler`) driving `egui-winit` + `egui-wgpu` (egui 0.36, wgpu 30) — the video as a full-rect wgpu pass, the HUD in egui on top — **no `eframe`**; consent popups, tray (`tray-icon`) and dialogs (`rfd`) hang off the shell; the **egui-everywhere fallback** (the same `egui-winit`/`egui-wgpu` crates under the manual loop, also for the shell) remains the risk floor | Pure Rust. winit allows one event loop per process, `eframe` exposes no raw winit events, and `egui-winit` drops physical keys it cannot map (PrintScreen, NumLock, media keys…) while a remote-desktop client must forward every scancode — owning the loop avoids an M5 rewrite (docs/research/ui.md §4; the §5.3 skeleton compiled on the dev VM). Per `docs/UI_PLAN.md` §2 — its own table, not a research note of this plan — Iced is the only shell framework proven in production on Wayland at scale (COSMIC) and 0.14 adds headless testing + hot reload; the version, the headless-testing/hot-reload features and the COSMIC claim are verified by `research-verifier` before the first UI milestone, and nothing is pinned yet. Process model (one winit loop per process): the app process owns `tornect-session` (both roles), the Iced shell **and** the stream surface on its single manual winit loop — Iced driven as an `iced_winit` program on that loop (iced's `integration` path; `research-verifier` confirms it for 0.14 at `u1`, the egui fallback needs no such step) — so decoded frames never cross a process boundary (D8, UI plan R1/R5); the host indicator is a separate process of the same binary (`main.rs` role dispatch) with its own loop, reaching the host role over the §B.8.7.4 IPC endpoint for End/panic, so it survives shell hangs (UI plan §3/§6.3) | `eframe` (rejected for the reasons left); Tauri 2 (nicer chrome, but webview + IPC between UI and stream window adds friction); Qt/Slint (C++/licensing or smaller ecosystem) |
 | D11 | Input model | Client captures via winit raw events (+ gamepad via `gilrs`); host injects via SendInput / CGEvent / RemoteDesktop-portal-libei (`reis`) | Per §A.2 — the sanctioned path on each OS | uinput on Linux (root, bypasses lockscreen isolation — rejected) |
-| D12 | Serialization on the wire (media) | Hand-rolled fixed headers (bitfields) for datagram payloads; CBOR for control | Datagram headers are hot-path; 12–20 bytes/packet matters at 100k pps | — |
-| D13 | Config/state | `~/.config/tornect` (XDG) / `%APPDATA%\Tornect` / `~/Library/Application Support/Tornect`; TOML config; keys in OS keychain where available (`keyring` crate), file-based with 0600 otherwise | Boring and correct | — |
+| D12 | Serialization on the wire (media) | Hand-rolled fixed headers (bitfields) for datagram payloads; CBOR for control | Datagram headers are hot-path; the 12-byte header of §B.4 matters at 100k pps | — |
+| D13 | Config/state | `~/.config/tornect` (XDG) / `%APPDATA%\Tornect` / `~/Library/Application Support/Tornect`; TOML config; keys in OS keychain where available (**`keyring-core` 1.0.0** + per-OS stores — Linux: `zbus-secret-service-keyring-store` (`rt-tokio-crypto-rust`) first, `linux-keyutils-keyring-store` (session keyring, lost at logout) as the fallback before the file keystore; `apple-native-keyring-store` (`keychain`); `windows-native-keyring-store`; never `keyring::Entry`, whose v1 shim force-installs the Secret Service store — docs/research/ui.md §5.9), file-based with 0600 otherwise (the M0 file keystore stays the fallback) | Boring and correct | — |
 
 ### A.4 Honest constraints & how we message them
 
@@ -147,6 +162,15 @@ deleting their setup pain (pairing PINs on a web UI, port forwarding, VPNs).
 5. **CGNAT + symmetric NAT both sides**: punch success will fail for some pairs
    (industry direct-connect rates are roughly 80–90 %); those users live on the Tor
    fallback until we ship optional user-hosted relay ("bring your own relay") in v2.
+6. **A Linux (GNOME) host must be unlocked.** When the screen locks, gnome-shell
+   inhibits mutter remote access: every portal ScreenCast/RemoteDesktop session is
+   terminated and `CreateSession` is refused ("Session creation inhibited") until
+   someone unlocks locally — restore tokens do not help, so remote unlock through the
+   portal path is impossible by design. Tornect treats the closed session as a
+   recoverable *Locked* state (`HOST_NOT_READY{locked}` / `BYE{HOST_LOCKED}`, §B.8.8)
+   and says so in the client copy ("Host is offline, asleep, or locked — Tornect cannot
+   wake or unlock it"); KDE/wlroots lock behaviour is unverified (`NEEDS-DEVICE`).
+   (docs/research/wayland.md §7)
 
 ---
 
@@ -158,7 +182,7 @@ Single binary, two roles (any machine can be host, client, or both):
 
 ```
 ┌────────────────────────────── tornect (app) ──────────────────────────────┐
-│  egui UI: onboarding · ID card/QR · consent popup · session HUD · tray    │
+│  UI (Iced shell + egui HUD, D10): onboarding · ID/QR · consent · tray     │
 ├───────────────────────────────────────────────────────────────────────────┤
 │ session (orchestrator)                                                    │
 │  ┌─────────────┐  ┌──────────────┐  ┌───────────────────────────────────┐ │
@@ -194,9 +218,11 @@ tornect/
 │   │                           #   jitter buffer, pacer, ABR controller, stats
 │   ├── tornect-capture/        # trait VideoCaptureSource + wgc/ sckit/ pipewire/ backends
 │   ├── tornect-codec/          # trait Encoder/Decoder + ffmpeg-hw backend (nvenc/amf/
-│   │                           #   qsv/vaapi/videotoolbox/software x264|dav1d fallback)
+│   │                           #   qsv/vaapi/videotoolbox; libx264 when the system FFmpeg
+│   │                           #   has it) + the always-compiled openh264 software fallback
 │   ├── tornect-audio/          # capture (wasapi/sckit/pipewire), opus enc/dec, playback (cpal)
 │   ├── tornect-input/          # client-side event mapping; host-side inject backends
+│   ├── tornect-ui-kit/         # design tokens/themes/widgets/l10n (docs/UI_PLAN.md §4); created at `u1`, Part F.6
 │   ├── tornect-platform/       # OS session services (§B.8.8): presence, lock state, keep-awake,
 │   │                           #   autostart, OS re-auth, hotkeys, readiness probes, owner-only
 │   │                           #   local IPC endpoint + peer check only (not a network socket;
@@ -204,7 +230,8 @@ tornect/
 │   └── tornect-session/        # host & client state machines wiring everything; unattended: the
 │                               #   UI-backed BlockWindow/LocalAllow impls + Candidates onward (§B.8.14)
 ├── apps/
-│   └── tornect/                # eframe app (tray, popups, settings, stream window); host-role IPC
+│   └── tornect/                # app: Iced shell (tray, popups, settings) + winit/wgpu/egui
+│                               #   stream window on one loop, indicator as a separate process (D10); host-role IPC
 │                               #   dispatch loop (decodes with the core codec, dispatches to the
 │                               #   MutationGuard, §B.8.7.4)
 ├── xtask/                      # cargo xtask: dist, packaging, ffmpeg fetch, lint-all
@@ -245,16 +272,24 @@ HELLO_ACK{v chosen, host_nonce} ──►                                   (sig
    └─ unattended branch (§B.8.4), no popup: AUTH_CHALLENGE{ke2} ──►  ◄── AUTH_RESPONSE{ke3}
       pinned device key + per-grant password (OPAQUE) replace the click; block window
       with [Block] on the host; indicator + log unchanged
-SESSION_ACCEPT{caps chosen, session_token | token_confirm, quic_server_cert_fp, session_type, mode}
+SESSION_ACCEPT{caps chosen, session_token | token_confirm, quic_spki, session_type, mode}
 ◄── CANDIDATES{[]}  ──── both sides gather in parallel ────  CANDIDATES{[]} ──►
         host: local addrs, UPnP/NAT-PMP mapped, STUN reflexive (if enabled)
-punch: paced bidirectional QUIC Initial+padding to all candidate pairs (trickle ok)
-════════════ direct QUIC established (TLS1.3, both certs pinned) ═════════════
+punch: STUN-style probes *outside QUIC*, both sides at once on the shared media socket
+       (ICE pacing: one probe per Ta = 50 ms, RTO ≥ 500 ms doubling; the checklist is pruned to ≈ 20 pairs by the
+       RFC 8445 §6.1.2.3 pair-priority ordering — ICE's 100 default is far above what 4 s at Ta = 50 ms can sweep
+       with ~3 retransmits, nat.md §5.3 — and ≤ 8 pairs are in flight at once; trickle ok);
+       the first pair validated in both directions is nominated, then exactly one QUIC dial:
+       the side with the numerically lower device public key is the QUIC client
+       (`connect_with`, per-peer pin) and the other only accepts — no concurrent Initials,
+       no duplicate connections (docs/research/nat.md §5, quic.md §5, §12.14; one-socket demux
+       needs `EndpointConfig::grease_quic_bit(false)` on both ends, RFC 9443)
+═══════ direct QUIC established (TLS 1.3 raw public keys, both SPKIs pinned) ════════
         first frame on ctrl, both directions: BIND{mac} over the TLS exporter keyed by session_token
         (§B.8.4.3); nothing else is accepted, and capture never starts, before a valid BIND
         └─ if no pair succeeds within 4 s: TOR_FALLBACK{} → open second onion
            stream and carry the same QUIC connection (and thus the BIND check)
-           over a length-framed tunnel
+           over a length-framed tunnel (transport choice pending §B.8.17 item 7, decided at M2)
 media flows (datagrams) + control/input (streams); Tor circuit kept as low-rate
 heartbeat + renegotiation channel; teardown on BYE or circuit loss
 ```
@@ -316,13 +351,20 @@ never in datagrams: input loss is unacceptable), `clip` (clipboard), `file`
 Datagrams (unreliable) — video & audio:
 
 ```
-VideoDatagram {
+VideoDatagram {                 // 12-byte header, hand-packed (D12)
   u8  flags        // keyframe, fec, last_fragment, codec_bits
+  u8  stream_id    // stream + codec id (rounds the header to 12 B)
   u16 frame_id     // wrapping
   u16 frag_idx / frag_count
   u32 rtp_ts       // 90 kHz
-  ... payload (fits datagram MTU ~1200 B)
+  ... payload      // with RaptorQ: 4-byte PayloadId, then one symbol
 }
+whole datagram ≤ the live `Connection::max_datagram_size()` — 1162 B at the 1200 B
+initial MTU (1414 B once DPLPMTUD reaches the 1452 B upper bound; back to 1162 after a
+black hole), re-read on every frame packetize, never hard-coded. RaptorQ symbol =
+round_down(max_datagram_size − 12 − 4, 8) = 1144 B @1200 / 1392 B @1452; the per-frame
+symbol size travels in the frame's first datagram (or is derived from frame_len/frag_count
+— layout fixed at M3). (docs/research/media-proto.md §2.2–§2.3, §14; quic.md §7)
 ```
 
 - **Fragmentation**: encoder output split to ≤ datagram size; reassembly window of
@@ -338,9 +380,17 @@ VideoDatagram {
   loss on `stats`; controller targets 85 % of estimated capacity, min 500 kbit/s,
   max user cap; drives encoder rate control per-frame; resolution/fps ladder shifts
   when bitrate floor is hit (e.g. 4K→1440p→1080p→720p before dropping below 30 fps).
-- **Audio**: Opus 48 kHz, 10 ms frames, FEC-in-band (Opus LBRR) + one datagram
-  redundancy at loss; independent tiny jitter buffer; A/V sync via shared rtp_ts
-  and a small (<60 ms) lip-sync window — video never blocks audio.
+- **Audio**: Opus 48 kHz, `Application::LowDelay` (CELT-only, 2.5 ms lookahead), 10 ms
+  frames (480 samples ⇒ rtp_ts += 480), 128 kbit/s default (64–256 user range),
+  complexity 8; **in-band FEC off** (`set_inband_fec(false)`, `set_packet_loss_perc(0)`:
+  Opus LBRR exists only in SILK/hybrid modes and never fires in `RESTRICTED_LOWDELAY`/CELT,
+  so it would buy nothing for desktop audio); loss protection = the previous Opus frame
+  piggy-backed in every datagram (`{hdr 12 B, ts48k u32, seq u16, cur_frame, prev_frame}`:
+  two consecutive losses to lose a frame, +1× audio bitrate, zero added latency) + PLC on
+  holes, RaptorQ over 4 frames only at loss > 5 %; independent tiny jitter buffer (2 frames);
+  A/V sync via shared rtp_ts and a small (<60 ms) lip-sync window — video never blocks
+  audio (docs/research/media-proto.md §5.2, §5.6, §7.3; SUMMARY.md §2.9, which resolves codecs.md §5.3 —
+  it recommends keeping in-band FEC on — against media-proto.md §5.2/§5.6).
 - Everything already E2E-encrypted by QUIC TLS; no extra SRTP layer.
 
 ### B.5 Media pipeline (`tornect-capture` / `tornect-codec` / render)
@@ -362,20 +412,39 @@ ts, dirty_rects?, cursor}`):
 - `sckit` (macOS): `SCStream` display filter, IOSurface frames, `SCContentFilter`
   per-display; queue depth 2; capture-includes-cursor toggle; audio via
   `SCStreamConfiguration.capturesAudio`.
-- `pw` (Linux/Wayland): `ashpd` ScreenCast portal (persist_mode=ExplicitlyRevoked +
-  restore token stored per monitor selection) → PipeWire stream negotiated for
+- `pw` (Linux/Wayland): **one `ashpd` RemoteDesktop portal session** for capture and
+  input (`RemoteDesktop::create_session` → `select_devices` → `Screencast::select_sources`
+  on the *same* session → `RemoteDesktop::start`; then `open_pipe_wire_remote` +
+  `connect_to_eis`; portal RemoteDesktop v2 / GNOME ≥ 45). `persist_mode=ExplicitlyRevoked`
+  and the restore token go **only on `SelectDevicesOptions`** — the portal spec forbids the
+  ScreenCast `SelectSources` persistence options on a RemoteDesktop session; the single-use
+  token returned by `Start` is stored per monitor selection and replaced on every use
+  (docs/research/wayland.md §2.4–§2.5) → PipeWire stream negotiated for
   DMA-BUF with modifier list from the encoder device; SHM fallback; cursor mode
   "metadata" preferred (send position separately; render client-side) with
-  "embedded" fallback.
+  "embedded" fallback. The lock screen closes the session (§A.4 item 6).
 - `x11` backend explicitly out of v1 scope (document; Wayland-first per product).
 
 Encoder selection at runtime: probe in order [platform-native pref list per vendor
 from §A.2], score by (codec ≥ requested, 4:4:4 support, 10-bit support, measured
 encode ms on a 3-frame warmup), pick best; expose override in settings. Software
-fallback: `x264` (ultrafast+zerolatency) and `svt-av1` p12 for potato-mode, `dav1d`
-/ `openh264`-free decode via FFmpeg on the client when no hw decode.
+fallback: **`openh264`** (`=0.9.8`, `source` feature — Cisco's source compiled by `cc`, C++
+fallback when `nasm` is absent) is the always-compiled H.264 path, **both directions, all
+OSes**, and the only real-time video codec this dev VM can build and run (rav1e builds but is not
+real-time, codecs.md §4.2; FFmpeg does not build here at all, codecs.md §0; 4:2:0 only; measured here 23.4 ms/frame
+encode, 5.4 ms decode at 1080p without asm — CI installs `nasm` for ~3×; CI additionally
+exercises FFmpeg's software paths — libx264, the native h264/hevc decoders, `libdav1d` — through
+`libavcodec-dev`, but no hardware backend: codecs.md §2.1–§2.2, ci.md §3). libx264 (`ultrafast+zerolatency`, 4:4:4 text mode; GPL, compatible with our
+GPL-3.0-or-later) is used only opportunistically through FFmpeg when the system build has
+it — never x264-first. **No `rav1e`/`svt-av1` "potato mode" and no `dav1d` crate in v1**:
+rav1e measured 0.65 s/frame at 1080p on this VM; AV1 is hardware-only (NVENC Ada+, VAAPI
+Arc/RDNA3+, AMF) and is decoded through FFmpeg (`av1` hwaccel or `libdav1d`); a software AV1
+path, if ever, is FFmpeg `libsvtav1`. Patent posture (source build vs Cisco's blob via
+`libloading`) is an M8 legal decision. (docs/research/codecs.md §0, §3, §4.2–§4.3, §11.1;
+SUMMARY.md §1.5)
 
-Client render: `winit` window → decode (FFmpeg hwaccel: D3D11VA/VideoToolbox/VAAPI
+Client render: `winit` window → decode (FFmpeg hwaccel: D3D11VA/VideoToolbox/VAAPI; software:
+`openh264` for H.264 always, FFmpeg `av1`/`libdav1d` for AV1 where the `ffmpeg` feature is built
 → map to wgpu texture when same-API, else NV12/P010 CPU upload path first, zero-copy
 interop as M7 optimization) → wgpu YUV→RGB(A)/tonemap shader → present with
 mailbox/immediate mode; frame pacing: present-on-arrival with optional vsync-aligned
@@ -398,10 +467,19 @@ scancode for games, keysym for typing (per-app heuristic toggle in HUD).
 - **Pairing** = mutual key pinning gated by human consent + 6-digit SAS derived from
   the signed transcript (blocks a MITM who somehow proxied the onion rendezvous —
   belt-and-suspenders; Tor already authenticates the service side).
-- **Session transport**: QUIC TLS 1.3, self-signed certs whose SPKI must match the
-  pinned device keys, plus the `BIND` exchange (§B.8.4.3: an HMAC over the TLS exporter
-  keyed by `session_token`, sent first on `ctrl` by both sides; nothing else is accepted
-  before it verifies). No CAs, no clock-dependent validity.
+- **Session transport**: QUIC TLS 1.3 with **raw public keys (RFC 7250) — no X.509 at
+  all**: each side presents its Ed25519 SubjectPublicKeyInfo (44-byte DER) as its
+  "certificate" (`AlwaysResolves{Server,Client}RawPublicKeys`), and the custom mutual
+  verifiers (`requires_raw_public_keys()`, Ed25519 only) constant-time-compare the presented
+  SPKI with the pinned device keys; `SESSION_ACCEPT.quic_spki` carries the host's SPKI
+  regardless of which side becomes the QUIC client (§B.2 tie-break) and must equal the
+  pairing pin — it never replaces it; the self-signed X.509 path (`rcgen`) stays documented,
+  not compiled (docs/research/quic.md §3.3, verified over quinn) — plus the `BIND` exchange
+  (§B.8.4.3: an HMAC over the TLS exporter keyed by `session_token`, sent first on `ctrl` by
+  both sides, labelled by Tornect role — "client" = the device that dialed the onion service, "server" =
+  the host — never by QUIC handshake role, which the §B.2 tie-break may swap; nothing else is accepted
+  before it verifies). No CAs, no certificate parser in
+  the security boundary, no clock-dependent validity.
 - **Consent & abuse resistance** (non-negotiable product rules): capture starts only
   after explicit accept — or, for an unattended session, after the two-factor
   authentication and block window of §B.8; persistent visible indicator + tray while
@@ -463,7 +541,7 @@ in-HUD latency overlay (like Moonlight's) + `tracing` spans.
 | Grant password | Chosen per grant at enable time, typed on the host once (host runs both OPAQUE roles in-process, then zeroizes it) and on the client at login. Never transmitted at login; with suite 1 never stored on the host (the SPAKE2 fallback suite stores a wrapped password-equivalent, B.8.4.7). Blast radius of a leaked password = one device. |
 | `ServerSetup` | Host-wide OPAQUE secret (OPRF seed + static AKE key), created lazily — together with `K_master` and the store — at the first unattended enable, inside the re-auth flow where the keychain is interactive (never at host start, B.8.9); kept across off/on cycles; wiped only by *Rotate ID*. |
 | Block window | Fixed per-grant delay (0–30 s, disclosed only in the signed `SESSION_ACCEPT`, never before F2) before `SESSION_ACCEPT` during which a local Tornect window with one button, **Block**, is shown. Elapsing is not consent; it is a veto opportunity. Constant duration regardless of idle state. |
-| Hard lock | Grant refuses all challenges until unlocked locally (re-auth) or by an admin request from another *My machines* Control grant (B.8.6.2). Unlock resets `FailState` (a remote `unlock(pk)` also clears `Suspended{Admin}`); `Suspended{LocalBlock\|Panic}` needs a local *Resume* with re-auth (B.8.6.3). |
+| Hard lock | Grant refuses all challenges until unlocked locally (re-auth) or by an admin request from another *My machines* Control grant (B.8.6.2). Unlock resets `FailState` (a remote `unlock(pk)` also clears `Suspended{Admin}`); `Suspended{LocalBlock\|Panic\|Local}` needs a local *Resume* with re-auth (B.8.6.3). |
 | Admin request | Post-PAKE, reduce-only (plus *unlock*) command from a granted device in `Active` state; its scope depends on the requester's grant (B.8.4.1); never starts media. |
 
 **Scope (v1):** hosts inside a logged-in, unlocked desktop session on Windows, macOS, GNOME ≥ 45
@@ -489,8 +567,8 @@ and log bound an *honest* or *stolen* device, not a hostile controller who is al
 
 | # | Attacker holds | Can | Cannot | Controls |
 |---|---|---|---|---|
-| T1 | Stolen client, password not remembered | Pass HELLO/SESSION_REQUEST; learn that a grant exists for *this* device (not its block window or ask policy — signed into `SESSION_ACCEPT` only, after F2); per local unlock ≤ 60 guesses plus ≈ 52/year of decay, at ≤ 24/day in steady state (≈ 33 on the first day when `hard_lock_after = 0`) and ≤ 20 consecutive (B.8.2.1, B.8.5) | Log in; attack offline (no record on the device; KE2 tests exactly one guess) | Lockout ladder, hard lock, notifications, log, revoke; owner's other *My machines* Control devices can `revoke` via admin request |
-| T2 | Stolen client, password remembered, device unlockable | Full impersonation of that grant until revoked; if the grant is a *My machines* Control grant: deny-direction admin requests against the owner's other grants (`suspend`/`revoke`/`revoke_all`/`master_off`/`end_session` — a DoS countered only by the stop code or the local UI) and `unlock` of them (lets a thief who also holds another of the owner's devices keep guessing at ladder rate) | Through Tornect's own surfaces: widen its grant, create grants, change settings without OS re-auth; clear a local Block/panic suspension remotely; suppress the indicator, the per-start notification or the log line of its own sessions for an owner who looks (a Control grant additionally inherits T9's endpoint-level powers) | "Remember" off by default; keychain use requires OS user presence where the platform offers it; one session per grant; per-start notification; remote `revoke`/`master_off` from another *My machines* Control device; emergency stop code; view-only default for helpers (no cross-grant admin scope) |
+| T1 | Stolen client, password not remembered | Pass HELLO/SESSION_REQUEST; learn that a grant exists for *this* device (not its block window or ask policy — signed into `SESSION_ACCEPT` only, after F2); per local unlock ≤ 60 guesses plus ≈ 52/year of decay at most (B.8.5.1), at ≤ 24/day in steady state (≈ 33 on the first day when `hard_lock_after = 0`) and ≤ 20 consecutive (B.8.2.1, B.8.5) | Log in; attack offline (no record on the device; KE2 tests exactly one guess) | Lockout ladder, hard lock, notifications, log, revoke; owner's other *My machines* Control devices can `revoke` via admin request |
+| T2 | Stolen client, password remembered, device unlockable | Full impersonation of that grant until revoked; if the grant is a *My machines* Control grant: deny-direction admin requests against the owner's other grants (`suspend`/`revoke`/`revoke_all`/`master_off`/`end_session` — a DoS countered only by the stop code or the local UI) and `unlock` of them (lets a thief who also holds another of the owner's devices keep guessing at ladder rate) | Through Tornect's own surfaces: widen its grant, create grants, change settings without OS re-auth; clear a local Block/panic/local suspension (`Suspended{LocalBlock\|Panic\|Local}`) remotely; suppress the indicator, the per-start notification or the log line of its own sessions for an owner who looks (a Control grant additionally inherits T9's endpoint-level powers) | "Remember" off by default; keychain use requires OS user presence where the platform offers it; one session per grant; per-start notification; remote `revoke`/`master_off` from another *My machines* Control device; emergency stop code; view-only default for helpers (no cross-grant admin scope) |
 | T3a | Copy of the state dir, `K_master` in an unlocked-only OS keychain (Windows DPAPI, macOS Keychain, Secret Service) | Read pairing metadata and the session log — `trusted-devices.toml`, `hosts.toml` and `sessions.log` are plaintext (pinned labels, device and grant ids, session times, transport kinds; no secrets); file sizes/mtimes | Read records/`ServerSetup`; impersonate the host | AEAD store under `K_unatt`; those files stay readable by design (the log must remain inspectable) and are named in the SECURITY.md threat model (M8) |
 | T3b | Copy of the state dir on a **file-keystore host** (headless Linux, no Secret Service) or a home-dir backup/sync + cracked OS login password | = T4 | — | Stated honestly in readiness ("weaker keystore"); zxcvbn ≥ 4 or generated passphrase enforced; expiry capped at 90 d; TPM-sealed keystore is post-v1 |
 | T4 | State dir + `K_master` | Offline dictionary attack per record at Argon2id cost (B.8.2.2); impersonate the host | Log in without cracking (OPAQUE record ≠ password-equivalent) | Argon2id 64 MiB/t=3, strength policy, distinct passwords per host |
@@ -501,7 +579,7 @@ and log bound an *honest* or *stolen* device, not a hostile controller who is al
 | T9 | Malicious or compromised **granted Control** device | Everything the OS user can: read keys, start scripts, edit files, delete logs — including reading `K_master` from the user keychain (readable without presence, which is what autostart requires) and therefore rewriting the store, the generation anchor and the log chain, then restarting the host; on a Windows host started from the opt-in elevated autostart task (B.8.7.5) every Control session is additionally an administrator session | Use Tornect's *own* surfaces (UI, IPC, CLI) to create/widen/unlock grants or rebind the panic key without the OS credential: there, mutations need OS re-auth and no active session, and popups are never shown during a remote session. Re-auth and the mutation guard raise the bar for misuse through those surfaces and make changes visible (banner, notifications); they do not stop an endpoint-level rewrite, which is endpoint compromise — out of scope per §B.6 and the reason presets default helpers to view-only | Least-privilege presets (view-only default for helpers — the real control), block window, panic key, remote revoke; the log chain detects tampering only by parties without `K_master` (macOS Keychain code-signing ACLs partially mitigate; presence-gated policy signing is backlog, B.8.9) |
 | T10 | Coercion / support scam | Talk the owner through pairing + granting | Do it remotely, silently or instantly (12 h cooling-off for helpers; re-auth; scam step in the wizard) | B.8.7.1 |
 | T11 | Lockout-as-DoS | Burn the grant of a key it holds (incl. a cloned key) | Lock other grants (counters per grant; global limits only answer `UA_BUSY`, and uncharged `HelloVerified` streams never occupy them, B.8.5.2) | Remote unlock via another *My machines* Control device; `fail_summary` in `SESSION_ACCEPT` |
-| T12 | Clock manipulation (local or NTP) | Shorten a *persisted* lock by a forward wall-clock jump across a host restart (which a pre-authentication attacker cannot force; a live Control session (T9) can, and is bounded by the count-based budgets) | Shorten a running lock (`Instant`-based) or shorten any lock by rollback; revive expired grants or schedules (rollback ⇒ fail closed); exceed the hard-lock budget (count-based budgets are unaffected) | B.8.5.3 |
+| T12 | Clock manipulation (local or NTP) | By a forward wall-clock jump **across a store load** (a host restart or a keystore recovery, B.8.5.1 — which a pre-authentication attacker cannot force; a live Control session (T9) can): shorten a *persisted* lock and decay the *persisted* counters — `consecutive` by one per 24 h of jump (uncapped), `since_unlock` by at most one step per load (B.8.5.1; a keychain that locks on sleep — a macOS option — makes each wake a load: still ≤ 1 lifetime step, and the consecutive steps follow the real elapsed time unless the wall clock was also stepped); a jump beyond Tor's directory tolerance also takes the host offline | Shorten a running lock or decay a counter **at runtime** (both monotonic-clock based — a runtime NTP step is deferred, not ignored: invisible to the running limiter until the next load, where a forward step is bounded as on the left and a backward step is detected because `last_seen` is monotone, B.8.5.3); shorten any lock by rollback; revive expired grants or schedules (rollback ⇒ fail closed at load *and* at every runtime schedule/expiry check, B.8.5.3); re-open a hard-locked grant by decay (decay never clears `hard_locked`); exceed the hard-lock budget without loads (the per-load lifetime-decay cap bounds the rest) | B.8.5.1, B.8.5.3 |
 
 **B.8.2.1 Online economics (host-enforced).** Per grant, consecutive failures: 20 challenges
 take 10 h 53 min 40 s at the earliest (table B.8.5.1), then hard lock; the lifetime budget (60
@@ -511,8 +589,8 @@ then an attacker gets at most 60 guesses per local unlock. Until that budget is 
 alone (60 min per failure from n ≥ 10) caps the steady state at 24 guesses/day/grant — for an
 attacker without owner-driven resets and with an honest clock; a cloned key that watches the owner
 log in gets 2 free + a few cheap guesses per owner login, bounded by the lifetime budget and the
-notifications. Net, **per local unlock: ≤ 60 failures plus ≈ 52/year of decay, at ≤ 24/day in
-steady state (≈ 33 on the first day when `hard_lock_after = 0`: 10 inside 53 min 40 s, then one per
+notifications. Net, **per local unlock: ≤ 60 failures plus ≈ 52/year of decay at most (a host that is off for more than two
+weeks forfeits the excess — one step per load, B.8.5.1), at ≤ 24/day in steady state (≈ 33 on the first day when `hard_lock_after = 0`: 10 inside 53 min 40 s, then one per
 hour) and ≤ 20 consecutive (10 h 53 min 40 s to reach the 20th)**; only if hard locks were cleared
 indefinitely would the ladder rate alone govern — a uniform 10 k-word list would then need ≈ 208
 days expected (417 max), 1 M words ≈ 57 years expected — and every failure from the second onward
@@ -560,11 +638,12 @@ AUTH_CHALLENGE   (host)             { suite: u8, ke2: Option<bytes[320]> /* iff 
 AUTH_RESPONSE    (client)           { ke3: Option<bytes[64]> /* iff suite = 1 */, pA: Option<bytes[32]>, cA: Option<bytes[32]> /* iff suite = 2 */ }
 SESSION_ACCEPT   (host, signed)    += { session_type: u8 /* 0 attended, 1 unattended */, mode: u8,
                                         transport_policy: u8 /* 0 any, 1 tor_only, 2 lan_only */,
+                                        quic_spki: bytes[44] /* the host's Ed25519 SubjectPublicKeyInfo DER (§B.2, §B.6) — must equal the pinned pairing key, constant-time compare (B.8.4.2, B.8.16); exact length asserted by F1 */,
                                         session_token: Option<bytes[32]> /* attended only; MUST be absent when session_type = 1 */,
                                         token_confirm: Option<bytes[32]> /* unattended only */,
                                         block_window_s: u8, ask_before_start: bool /* grant policy, disclosed only here (signed), after F2 */,
                                         ends_at: Option<u64>, fail_summary: Option<{ since_success: u32, last_fail_at: Option<u64> /* Some whenever since_success > 0 */ }> /* the snapshot returned by settle(ok) with this stream's own charge excluded; None when since_success == 0 (B.8.5.1) */ }
-SESSION_REJECT   (host)             { reason: u16, cause: Option<u8> /* HOST_NOT_READY: 1 capture_permission · 2 input_permission · 3 locked · 4 other_user_active */,
+SESSION_REJECT   (host)             { reason: u16, cause: Option<u8> /* HOST_NOT_READY: 1 capture_permission · 2 input_permission · 3 locked · 4 other_user_active · SUSPENDED: 1 local (LocalBlock · Panic · Local) · 2 admin — the holder of that device's key learns which of its own suspensions applies, consistent with UA3; drives the B.8.10 copy */,
                                         retry_after_s: Option<u32> /* LOCKED_OUT, COOLDOWN; never SUSPENDED (no timer: cleared only per B.8.6.3) */, next_open_in_s: Option<u32>, detail: Option<tstr ≤ 120> }
 ADMIN_RESULT     (host, signed)     { ok: bool, detail: Option<tstr ≤ 120> }
 AdminCmd = { op: u8 /* 1 revoke(pk) · 2 revoke_all · 3 master_off · 4 unlock(pk) · 5 suspend(pk) · 6 end_session */, device_pk: Option<bytes[32]> }
@@ -591,8 +670,11 @@ privacy mode (Paranoid ⇒ `tor_only`, LAN-only ⇒ `lan_only`, else `any`), `en
 state `Active`; every other grant (helpers, view-only) may only `end_session` (its own session)
 and `revoke` (its own pk). Out-of-scope ops ⇒ `ADMIN_RESULT{ok: false}`, no state change, logged
 (`AdminRequest`, refused). `unlock(pk)` resets the target's `FailState` and clears
-`Suspended{Admin}` (set by a remote `suspend(pk)`); it never clears `Suspended{LocalBlock|Panic}`,
-which needs a local *Resume* with re-auth (B.8.6.3).
+`Suspended{Admin}` (set by a remote `suspend(pk)`); it never clears `Suspended{LocalBlock|Panic|Local}`,
+which needs a local *Resume* with re-auth (B.8.6.3). `suspend(pk)` moves an `Active` grant to
+`Suspended{Admin}` and leaves an already suspended grant untouched — the local reasons outrank `Admin`
+(`ADMIN_RESULT{ok: true}`, `AdminRequest` logged, state unchanged; B.8.6.3), so a `suspend(pk)` followed by an
+`unlock(pk)` can never clear a local Block, panic or local suspension.
 
 **B.8.4.2 Sequence (happy path; Tor RTT 0.4–1.5 s per arrow pair).**
 ```
@@ -603,9 +685,9 @@ HELLO{v_max, client_nonce, device_pk, name, feats, sig} ────────
 ◄──────────────────────────── HELLO_ACK{v, host_nonce, feats, sig}  (signed with the onion identity key; client verifies vs dialed address)
 SESSION_REQUEST{caps, unattended:{suite, ke1, want_mode, intent}, sig} ►  verify sig over th (fresh: covers host_nonce) — F1
                                                                     grant lookup: none/disabled/expired/master-off ⇒ REJECT{NOT_GRANTED}
-                                                                    suite unsupported by this build or ≠ grant.suite ⇒ REJECT{UNSUPPORTED_SUITE}; now < active_from ⇒ REJECT{NOT_YET_ACTIVE, next_open_in_s}
+                                                                    suite unsupported by this build or ≠ grant.suite ⇒ REJECT{UNSUPPORTED_SUITE}; now < active_from (or a clock rollback, now < last_seen: next_open_in_s = last_seen − now, B.8.5.3) ⇒ REJECT{NOT_YET_ACTIVE, next_open_in_s}
                                                                        (both pre-PAKE, uncharged; evaluated after the grant lookup and before the suspension/lock/budget checks)
-                                                                    suspended (LocalBlock · Panic · Admin) ⇒ REJECT{SUSPENDED}   (no timer; cleared per B.8.6.3)
+                                                                    suspended (LocalBlock · Panic · Admin · Local) ⇒ REJECT{SUSPENDED}   (no timer; cleared per B.8.6.3)
                                                                     locked ⇒ REJECT{LOCKED_OUT|HARD_LOCKED, retry_after_s}
                                                                     in-flight/global budget ⇒ REJECT{UA_BUSY 0x0013}   (in flight = charged AwaitKe3 streams only, B.8.5.2; none of these run a PAKE)
                                                                     limiter.charge(grant) → fsync (write-ahead; error ⇒ no KE2)
@@ -620,10 +702,10 @@ AUTH_RESPONSE{ke3} ────────────────────�
                                                                                    (schedule · readiness · transport · busy · concurrency gates skipped)
                                                                     session_token = HKDF(session_key, th); [ask_before_start ⇒ Allow/Deny popup, 60 s ⇒ REJECT{DENIED}];
                                                                     block window (Tornect window + chime)
-◄── SESSION_ACCEPT{caps, session_type:1, mode, transport_policy, token_confirm, block_window_s, ask_before_start, ends_at, fail_summary, sig}
-verify sig; token_confirm == own derivation (ct); session_type matches request; grant policy read from here only       host: sessions.log start; indicator ON
+◄── SESSION_ACCEPT{caps, quic_spki, session_type:1, mode, transport_policy, token_confirm, block_window_s, ask_before_start, ends_at, fail_summary, sig}
+verify sig; token_confirm == own derivation (ct); quic_spki == pinned host key (ct, §B.6); session_type matches request; grant policy read from here only       host: sessions.log start; indicator ON
 CANDIDATES … punch … QUIC (exporter check on the derived token) … media — unchanged from §B.2 (tor_only: no CANDIDATES, immediate TOR_FALLBACK);
-  the Tor fallback tunnels the same QUIC connection, so the exporter/token check applies unchanged on both transports
+  the Tor fallback tunnels the same QUIC connection, so the exporter/token check applies unchanged on both transports (transport choice pending §B.8.17 item 7, decided at M2)
 ```
 Capture and injection start only after the block window elapses without Block. Local candidate
 gathering (UPnP/PCP, STUN) may start during the window; the `CANDIDATES` exchange and punching
@@ -654,6 +736,9 @@ token_confirm = HMAC-SHA256(confirm_key, "tornect/v1/unattended/confirm\0" || th
 proof_fp      = HKDF-SHA256(session_key, salt = "tornect/v1/unattended/proof-fp", info = "")[0..8]   // ConsentProof only
 QUIC binding  = BIND exchange (§B.6; same code path as attended): immediately after the QUIC handshake each side sends on ctrl
                 BIND { mac = HMAC-SHA256(exporter("EXPORTER-tornect/v1/session-binding", context = session_token, 32), "client" | "server") }
+                "client" = the device that dialed the onion service, "server" = the host — Tornect roles, fixed by signaling, independent of
+                which side becomes the QUIC client under the §B.2 tie-break (the exporter is certificate-type independent, RFC 8446 §7.5;
+                quic.md §6 verified it over raw public keys); the golden vector of B.8.14 M1 fixes both MACs
                 (a differing exporter context never fails the handshake by itself); the peer verifies constant-time and closes with an
                 error code on mismatch; no other stream or datagram is accepted, and capture/injection never starts, before a valid BIND is received
 ```
@@ -714,7 +799,7 @@ supports); host picks `v ≤ v_max` in `HELLO_ACK` and both sides use it from `H
 
 | Host state | Event | Action → next |
 |---|---|---|
-| `HelloVerified` | `SESSION_REQUEST{unattended}` with valid sig | gate, in this order (all pre-PAKE, uncharged): grant lookup (`NOT_GRANTED`) · suite unsupported by this build or ≠ `grant.suite` ⇒ `UNSUPPORTED_SUITE` · `now < active_from` ⇒ `NOT_YET_ACTIVE{next_open_in_s}` · state: suspended ⇒ `SUSPENDED` · lock · budget ⇒ reject+close (no PAKE), or charge → `ServerLogin::start` → `AUTH_CHALLENGE` → `AwaitKe3` (30 s) |
+| `HelloVerified` | `SESSION_REQUEST{unattended}` with valid sig | gate, in this order (all pre-PAKE, uncharged): grant lookup (`NOT_GRANTED`) · suite unsupported by this build or ≠ `grant.suite` ⇒ `UNSUPPORTED_SUITE` · `now < active_from` — or a clock rollback, `now < last_seen` (B.8.5.3) — ⇒ `NOT_YET_ACTIVE{next_open_in_s}` · state: suspended ⇒ `SUSPENDED` · lock · budget ⇒ reject+close (no PAKE), or charge → `ServerLogin::start` → `AUTH_CHALLENGE` → `AwaitKe3` (30 s) |
 | `HelloVerified` | `SESSION_REQUEST{unattended}` with valid sig while the same pk has a charged `AwaitKe3` handshake in flight | pre-emption requires freshness: this stream's own signed `SESSION_REQUEST` (verified under the new `host_nonce`, F1) cancels the stale handshake (already charged; settled as fail; closed with `PREEMPTED`, B.8.4.6) and this stream continues through the gate above. A bare verified `HELLO` never cancels anything (`HELLO` is replayable by design — its signature covers only `th_0` and a client-chosen nonce): the in-flight handshake stands and times out in ≤ 30 s anyway. If the older stream's charge is still being persisted (between F1 and KE2 written) the newer stream is answered pre-PAKE `UA_BUSY` instead. A *live session* (or a still-orphaned accept) from this pk ⇒ decided post-F2 (the older session gets `BYE{REPLACED}`, B.8.6.4; intent = session only — an admin stream never replaces a live session) |
 | `AwaitKe3` | `AUTH_RESPONSE` valid | `settle(ok)`; `PolicyReceipt`; intent admin ⇒ scope check → `ADMIN_RESULT` → `Closing`; else post-F2 reject, or `ask_before_start` ⇒ `AwaitLocalAllow`, else block window → `Accepting` |
 | `AwaitKe3` | invalid KE3 / timeout / circuit loss / `BYE` / any `ERROR`-class violation (`E_BAD_STATE`/`E_BAD_MSG_ID`/`E_BAD_LEN`) / cancelled by a newer stream | `settle(fail)` → `AUTH_FAILED` (if the stream is alive; a stream cancelled by a newer one is closed with `PREEMPTED` `0x002A` instead — transport-class on the client, never a password failure, B.8.4.6) → `Closing`; notify + log |
@@ -729,8 +814,8 @@ NOT_GRANTED` (no grant · disabled · expired · master off · paused · keystor
 B.8.9 — deliberately merged), `0x0011 LOCKED_OUT` (`retry_after_s`, rounded **up** to the next
 10 s — the ladder, not the display, is the control), `0x0012 HARD_LOCKED`, `0x0013 UA_BUSY`
 (in-flight/global budget, B.8.5.2 — distinct from the attended `0x0003 BUSY`),
-`0x0014 UNSUPPORTED_SUITE`, `0x0015 NOT_YET_ACTIVE` (cooling-off; `next_open_in_s`), `0x0016
-SUSPENDED` (`Suspended{LocalBlock|Panic|Admin}`; no `retry_after_s` — cleared only per B.8.6.3, so
+`0x0014 UNSUPPORTED_SUITE`, `0x0015 NOT_YET_ACTIVE` (cooling-off; `next_open_in_s` — also the answer of a rollback-closed grant, with `next_open_in_s = last_seen − now`, B.8.5.3), `0x0016
+SUSPENDED` (`Suspended{LocalBlock|Panic|Admin|Local}`; `cause` 1 local · 2 admin, B.8.4.1; no `retry_after_s` — cleared only per B.8.6.3, so
 no PAKE runs for a suspended grant). PAKE
 failure: `0x0020 AUTH_FAILED` (bad KE3 — the password was *not* proven). Cancellation: `0x002A
 PREEMPTED` (a charged `AwaitKe3` stream cancelled by a newer verified `SESSION_REQUEST` from the
@@ -793,7 +878,9 @@ Tor hiccups is not hard-locked next time), `last_used` set;
 `settle(fail)`, timeout, circuit
 loss, `BYE` or cancellation by a newer stream ⇒ `pending = false`, counters kept (the charge
 already stands), log/notify; on store load `pending == true` ⇒ treated as settled-fail. Success
-is the only reset of the consecutive counter and reverts only its own charge.
+is the only reset of the consecutive counter and reverts only its own charge. Decay never clears
+`hard_locked`: only a local unlock or `admin unlock(pk)` does — a hard-locked grant stays refused
+whatever its counters decay to.
 
 | n (consecutive) | Lock after the n-th challenge | Earliest n-th challenge | n | Lock | Earliest |
 |---|---|---|---|---|---|
@@ -812,12 +899,44 @@ attempts (an owner's Tor hiccups do not accumulate for months). **Lifetime budge
 logins never lock); it is never reset by success, decays by one per 7 days without failures
 (bounded extra ≈ 52 guesses/year for a grant that lives for years) and 60 ⇒ hard lock (defeats
 reset-on-success farming by a cloned key). Both are count-based. **Decay bookkeeping:**
-`FailState.decay_anchor` (consecutive, period 24 h; set to now at every charge and every
-`settle(fail)`) and `FailState.lifetime_decay_anchor` (`since_unlock`, period 7 d; set to now at
+`FailState.decay_anchor` (consecutive, period 24 h; set to `now` at every charge and every
+`settle(fail)`) and `FailState.lifetime_decay_anchor` (`since_unlock`, period 7 d; set to `now` at
 every `settle(fail)`) — two anchors, because advancing one anchor by 24 h steps would starve the
-7-day decay; each is also set whenever a decay step is applied to its counter. Decay is applied on
-load and before each charge: `steps = (now − anchor) / period`, subtract `steps` (saturating at
-0), advance the anchor by `steps × period`; a rollback (`now < anchor`) applies no decay (B.8.5.3).
+7-day decay; each is also advanced (by whole periods: `anchor := anchor + steps × period`, unclamped)
+whenever a decay step is applied to its counter, and every `:= now` anchor write is clamped monotone
+(`max(stored, now)`, B.8.5.3). On load the `pending` charge is settled first (as fail: anchors `:=
+max(stored, now)`, `credit := 0`), then decay is applied — a crash-abandoned attempt restarts both decay
+periods, conservative; decay is also applied before each charge. A **load** is a successful
+`UnattendedStore` decode by the host — exactly at host start and at the `keystore_locked` → readable
+transition of B.8.9 (a keystore lock/unlock cycle is therefore one load, like a restart); the 10-min
+readiness re-run never re-decodes a store that is loaded — between loads the in-memory limiter is
+authoritative; the offline CLI (B.8.6.2) never applies or persists decay — the only `FailState` write
+it performs is the reset of a local *Unlock* (anchors `:= max(stored, now)`, counters 0, `hard_locked`
+cleared). **On load** — the only wall-clock evaluation of decay: `steps = (now − anchor) / period`,
+subtract `steps` (saturating at 0), advance the anchor by `steps × period`; the lifetime counter
+takes **at most one step per load** (`since_unlock −= min(steps, 1)` while its anchor still
+advances by the full `steps × period`: the extra steps are forfeited, never deferred, the residual
+is preserved and every anchor moves by whole periods only — so a forward jump across a load, T12,
+buys at most one lifetime guess per load); an anchor in the future (`now < anchor`) yields `steps = 0`
+and keeps the anchor — a saturating rule of the formula, not a second rollback test: the rollback test
+is `now < last_seen` alone (B.8.5.3), which subsumes it because `last_seen` is raised to both anchors at
+every store write.
+**At runtime** the limiter never reads the wall clock for decay: each anchor carries its own (twin,
+`credit`) pair — a monotonic twin (`Clock::mono`, B.8.5.3), set at load together with `credit = (now −
+anchor) mod period` (the residual carried toward the first runtime step; `credit = 0` after a rollback
+at load); before each charge `steps = (credit + twin.elapsed()) / period`, applied in full to both
+counters — the `min(steps, 1)` cap is a load-time rule only, because only the wall clock can be forged —
+and an applied step advances the persisted anchor by `steps × period`, sets `credit := credit +
+twin.elapsed() − steps × period` (the new residual) and resets the twin; whenever an anchor is set to
+`now` (charge, `settle(fail)`, the `pending` settlement at load) `credit := 0` and the twin is reset.
+Invariant: `credit + twin.elapsed()` ≤ the wall-clock time since the persisted anchor, with equality
+whenever no backward step intervened since that anchor was written (after a rollback at load, or a
+`:= now` write clamped to a larger stored value, the deficit only defers decay — conservative), so the
+runtime step is the load-time formula evaluated on the monotonic clock (without the lifetime cap) and
+the on-disk state stays consistent. A
+runtime NTP step therefore neither decays a counter nor shortens a lock; a suspend (the monotonic
+clock pauses, B.8.5.3) lengthens a running lock and defers runtime decay — conservative, reconciled
+at the next load.
 
 **B.8.5.2 Global limits (never a lock, never touch attended sessions):** *in flight* = charged
 `AwaitKe3` streams only; `HelloVerified` streams (uncharged) never count toward the per-pk,
@@ -832,15 +951,33 @@ global breaker: two burned devices must never block a third device's login.
 
 **B.8.5.3 Persistence and clocks.** `FailState` lives in the encrypted store, written before
 each response (single writer, `spawn_blocking`; these writes bump only the in-file generation,
-never the keychain anchor — B.8.9). In-process timers use `Instant`; on disk the
-store keeps `lock_remaining_s` + `flushed_at`; on load `locked_until = now + max(0,
-lock_remaining_s − max(0, now − flushed_at))`. If `now < last_seen` (rollback) locks are re-armed
-in full, schedule/expiry fail closed until the clock passes `last_seen`, and `clock_anomaly` is
-logged. A forward jump cannot shorten a running lock (`Instant`-based); it shortens a persisted
-lock only across a host restart, which a pre-authentication attacker cannot force (a live Control
-session, T9, can — and is bounded by the count-based budgets); count-based budgets are
-unaffected. A missing or
-undecodable store ⇒ unattended off + notification (never "counters start at zero").
+never the keychain anchor — B.8.9). **Clocks:** `AttemptLimiter`, the decay twins and the
+schedule/`active_from`/`expires_at` checks are generic over a `Clock` trait defined in
+`tornect-core::unattended` (`wall() -> u64` unix seconds, `mono() -> Duration`, `Instant`-like;
+B.8.14) — production uses the OS clocks (`SystemTime` + `std::time::Instant`; `Instant` does not
+advance across a suspend on Linux/macOS, accepted as conservative per B.8.5.1 — a suspend-aware
+clock from `tornect-platform` is an M6 option), U1–U7 a scripted `FakeClock` that steps each
+independently, and the F3 fuzz loaders take the same trait. In-process timers use `mono()`; on disk
+the store keeps `lock_remaining_s` + `flushed_at`; on load `locked_until = now + max(0,
+lock_remaining_s − max(0, now − flushed_at))`. **Monotone wall-clock fields:** `last_seen_unix`
+is monotone in memory and on disk (`last_seen := max(last_seen, now, decay_anchor,
+lifetime_decay_anchor)` at every store write, so `now < last_seen` subsumes an anchor in the future),
+and every persisted wall-clock field (`decay_anchor`, `lifetime_decay_anchor`, `flushed_at`) never
+decreases: the `:= now` writes (charge, `settle(fail)`, the `pending` settlement at load, `flushed_at`,
+`last_seen`) are clamped to `max(stored, now)`; a decay step writes `anchor + steps × period` unclamped
+— ≥ stored by construction, and allowed to exceed the wall clock after a backward step, which the load
+rule "anchor in the future ⇒ `steps = 0`" (B.8.5.1) already tolerates — so a backward step at runtime
+can never be laundered into a forward jump at the next load. **Rollback** — `now < last_seen` — is
+checked at every wall-clock evaluation, not only at load: at load, locks are re-armed in full and decay
+is skipped; at load *and* at every runtime schedule/`active_from`/`expires_at` check the grant fails
+closed until the clock passes `last_seen` — a rollback-closed grant is answered at the `active_from`
+gate of B.8.4.5, pre-PAKE and uncharged, with `NOT_YET_ACTIVE{next_open_in_s = last_seen − now}`
+(copy in B.8.10); `ClockAnomaly` is logged (rate-aggregated). A forward jump cannot shorten a running lock
+(monotonic-clock based); it shortens a persisted lock only across a load (host restart or keystore
+recovery, B.8.5.1), which a pre-authentication attacker cannot force (a live Control session, T9,
+can); the count-based budgets are touched only through the per-load lifetime-decay cap of B.8.5.1
+(≤ 1 step per load) and the 24 h consecutive decay. A missing or undecodable store ⇒ unattended off +
+notification (never "counters start at zero").
 
 #### B.8.6 Grants, mutations, presence, sessions
 
@@ -870,9 +1007,9 @@ B.8.14 — in the host process; UI, IPC and CLI all pass through it).**
 
 | Class | Operations | Allowed when | Requires |
 |---|---|---|---|
-| Deny-direction | master off, pause (12 h / until 08:00 / until re-enabled), revoke, revoke-all, disable (`Active` → `Disabled{by: Ui\|Cli}`, B.8.6.1), suspend, end session, emergency stop | always — during remote sessions, from tray, CLI, panic key, admin request or stop code | nothing |
-| Access-increasing | master on, create grant, enable grant (`Disabled` → `Active`, B.8.6.1), set/change password, unlock/unsuspend, extend expiry, widen schedule, mode → Control, lower block window, disable "Ask before starting", change notification/panic-key/keep-awake/autostart settings (autostart via `tornect service install\|uninstall` = `IpcOp::ServiceInstall\|ServiceUninstall`, B.8.7.4), backup import, backup export (it writes `K_master` + `ServerSetup` + every auth record, B.8.9; `BackupExported{by, path}` logged, banner raised) | no remote session active for ≥ 60 s | **OS re-authentication** (B.8.8 table) in a fresh dialog per operation (a two-message IPC registration is one operation: re-auth at `RegStart`, `reg_txn` at `RegFinish`, B.8.7.4) |
-| Remote admin (B.8.4.1) | from a *My machines* Control grant: revoke(pk), revoke_all, master_off, suspend(pk), end_session, unlock(pk) — the only remote path that clears a lockout; from any other grant: end_session (own session) and revoke (own pk) only | after F1 + F2 from a grant in `Active` state (`Suspended`/hard-locked grants cannot; `NOT_YET_ACTIVE` still applies); schedule, readiness, transport, busy and concurrency gates are skipped, so it works even while another session is live | the requester's own two factors; out-of-scope ops ⇒ `ADMIN_RESULT{ok: false}`; logged with the requester's device; unlock resets `FailState` and clears `Suspended{Admin}`, never `Suspended{LocalBlock\|Panic}` |
+| Deny-direction | master off, pause (12 h / until 08:00 / until re-enabled), revoke, revoke-all, disable (`Active` → `Disabled{by: Ui\|Cli}`, B.8.6.1), suspend (`Active`\|`Suspended{Admin}` → `Suspended{Local{by: Ui\|Cli}}`; no-op on `LocalBlock`/`Panic`, B.8.6.3), end session, emergency stop | always — during remote sessions, from tray, CLI, panic key, admin request or stop code | nothing |
+| Access-increasing | master on, create grant, enable grant (`Disabled` → `Active`, B.8.6.1), set/change password, unlock, resume (clears any `Suspended{…}`, B.8.6.3), extend expiry, widen schedule, mode → Control, lower block window, disable "Ask before starting", identity-key view/backup (S8 *Identity* of `docs/UI_PLAN.md` — the onion identity key leaves the keystore only behind re-auth), change notification/panic-key/keep-awake/autostart settings (autostart via `tornect service install\|uninstall` = `IpcOp::ServiceInstall\|ServiceUninstall`, B.8.7.4), backup import, backup export (it writes `K_master` + `ServerSetup` + every auth record, B.8.9; `BackupExported{by, path}` logged, banner raised) | no remote session active for ≥ 60 s | **OS re-authentication** (B.8.8 table) in a fresh dialog per operation (a two-message IPC registration is one operation: re-auth at `RegStart`, `reg_txn` at `RegFinish`, B.8.7.4) |
+| Remote admin (B.8.4.1) | from a *My machines* Control grant: revoke(pk), revoke_all, master_off, suspend(pk), end_session, unlock(pk) — the only remote path that clears a lockout; from any other grant: end_session (own session) and revoke (own pk) only | after F1 + F2 from a grant in `Active` state (`Suspended`/hard-locked grants cannot; `NOT_YET_ACTIVE` still applies); schedule, readiness, transport, busy and concurrency gates are skipped, so it works even while another session is live | the requester's own two factors; out-of-scope ops ⇒ `ADMIN_RESULT{ok: false}`; logged with the requester's device; unlock resets `FailState` and clears `Suspended{Admin}`, never `Suspended{LocalBlock\|Panic\|Local}` |
 
 The CLI never edits files while the host runs: it talks to the host over the local IPC
 endpoint (B.8.7.4) and runs the OPAQUE client role itself for registration, so the password
@@ -891,8 +1028,15 @@ close/dismiss, re-asserted every 500 ms, on every captured monitor, lasting exac
 `BLOCKED_BY_LOCAL_USER` and grant `Suspended{LocalBlock}` until a local *Resume* (re-auth; a
 remote `unlock` never clears it) — no whack-a-mole. Clearing rules: `Suspended{Admin}` (set by a
 remote `suspend(pk)`) is cleared by a local *Resume* (re-auth) or by a remote `unlock(pk)` from a
-*My machines* Control grant; `Suspended{LocalBlock|Panic}` only by a local *Resume*. A suspended
-grant is refused pre-PAKE (`SUSPENDED`, B.8.4.6). Presence detection (physical input only —
+*My machines* Control grant; `Suspended{LocalBlock|Panic|Local}` only by a local *Resume*. A local
+*Suspend* (manager button, `tornect unattended suspend`, `IpcOp::Suspend` — deny-direction, no
+re-auth) sets `Suspended{Local{by: Ui|Cli}}` and, like a Block, is never cleared remotely. Precedence:
+the local reasons (`LocalBlock` · `Panic` · `Local`) outrank `Admin` — a remote `suspend(pk)` against an
+already suspended grant changes nothing (`ADMIN_RESULT{ok: true}`, `AdminRequest` logged, state
+untouched); a local *Suspend* on `Suspended{Admin}` replaces the reason with `Local{by}` (the grant can
+then no longer be resumed remotely) and is a no-op on `LocalBlock`/`Panic`; *Disable* is allowed from any
+`Suspended` state (deny-direction) and a later *Enable* (re-auth, B.8.6.1) returns the grant to `Active`.
+A suspended grant is refused pre-PAKE (`SUSPENDED`, B.8.4.6). Presence detection (physical input only —
 Tornect subtracts its own injections: `LLKHF_INJECTED`, macOS event-source PID, Wayland injection
 timestamps ± 250 ms) drives only the "While you were away" card and the optional
 `require_absent` reject; unknown ⇒ present. "Ask before starting" (default on for *Helping
@@ -927,7 +1071,7 @@ up.") + this OS's limits (B.8.8); ② pick a paired device with ≥ 1 attended s
 in-process; ⑤ options: mode, schedule (host-local weekly windows; wrap past midnight; DST gap ⇒
 inside if either side is, overlap ⇒ first occurrence; TZ snapshot, warned on change), expiry,
 block window, `hard_lock_after` (0 = consecutive hard lock off — warned: guessing is then bounded
-only by the lifetime budget — ≤ 60 failures per local unlock plus ≈ 52/year of decay, at ≤ 24/day in
+only by the lifetime budget — ≤ 60 failures per local unlock plus ≈ 52/year of decay at most (B.8.5.1), at ≤ 24/day in
 steady state, ≈ 33 on the first day — and the notifications, B.8.2.1), "Ask before starting", `require_absent`, `require_tor_only`,
 keep-awake (host-wide, B.8.7.5),
 lock-on-disconnect (refused with *Headless box*; warned on Windows/GNOME), "Prevent idle lock
@@ -952,13 +1096,15 @@ runs of whitespace/hyphens between passphrase words normalized to one space on b
 name, "tornect"}, **≥ 4 when the host keystore is file-based** (where expiry is also capped at
 90 d and "never" refused, B.8.6.1); distinct passwords per host
 recommended in copy. Change = new registration for that grant (re-auth). All intermediates in
-`Zeroizing`; egui fields cleared incl. undo state; no clipboard copy of password fields.
+`Zeroizing`; UI password fields cleared incl. undo state (Iced and egui widgets alike); no clipboard copy of password fields.
 
 **B.8.7.3 Manager, notifications, indicator.** Main-screen badge "N devices can connect
 without asking". Per grant: pinned label (never the HELLO name; NFKC, bidi/control characters
 stripped, ≤ 64 chars, duplicates get a fingerprint suffix), fingerprint, created-by, last used,
 state (Active / Not yet active / Disabled{by} / Suspended{reason} / Locked{until} / Hard-locked / Expired),
-`failures_since_unlock`, *Unlock* (re-auth), *Change password*, *Disable* (`Active` →
+`failures_since_unlock`, *Unlock* (re-auth), *Change password*, *Suspend* (`Active`|`Suspended{Admin}` →
+`Suspended{Local{by: Ui}}`, deny-direction, no re-auth; no-op on `LocalBlock`/`Panic`, B.8.6.3) and *Resume* (re-auth; clears any
+`Suspended{…}`, B.8.6.3), *Disable* (`Active` →
 `Disabled{by: Ui}`, no re-auth; the matching *Enable* needs re-auth, B.8.6.1), *Revoke unattended*, *Remove
 device*; header: master toggle, *Pause*, *Revoke all*. Notifications are in-app windows
 mirrored to OS toasts (never toasts alone — DND/Focus hide them; GNOME has no tray without an
@@ -980,7 +1126,8 @@ status|on|off|pause|grant <device> [--preset …] [--waive-attended-check]|enabl
 <device>|readiness|log`, `tornect service install|uninstall|status`, `tornect panic`, `tornect
 backup export|import` (`--waive-attended-check` maps to `GrantOptions.waive_attended_precondition`,
 warned and logged; `backup export` is access-increasing, B.8.6.2; `disable` is deny-direction,
-`IpcOp::Disable`; `service install|uninstall` = `IpcOp::ServiceInstall|ServiceUninstall` through
+`IpcOp::Disable`; `suspend` is deny-direction, `IpcOp::Suspend` (→ `Suspended{Local{by: Cli}}`, B.8.6.3);
+`resume` is access-increasing, `IpcOp::Resume` (re-auth, B.8.6.2); `service install|uninstall` = `IpcOp::ServiceInstall|ServiceUninstall` through
 the guard — an autostart change is access-increasing, B.8.6.2, and with no host running the CLI
 runs the guard offline like any other mutation); passwords via TTY prompt, never argv. **IPC:** `<state_dir>/ipc.sock`
 (0600, `SO_PEERCRED` check) / `\\.\pipe\tornect-<hash(state_dir)>` (owner-only DACL,
@@ -1004,7 +1151,9 @@ uid, else the connection is dropped before any frame is read.
 ```
 IpcRequest  { id: u64, op: IpcOp }
 IpcResponse { id: u64, ok: bool, code: u16 /* 0 = ok; else an E_* code of B.8.4.1 or a mutation-guard code G_* (0x01xx, below) */, detail: Option<tstr>, payload: Option<bytes> /* CBOR, per op below; ≤ 60 KiB */ }
-IpcOp = Status | On | Off | Pause { until: u64 } | Revoke { device: DeviceId } | RevokeAll | Unlock { device } | Suspend { device } | Resume { device }
+IpcOp = Status | On | Off | Pause { until: u64 } | Revoke { device: DeviceId } | RevokeAll | Unlock { device }
+      | Suspend { device } /* Active|Suspended{Admin} → Suspended{Local{by: Cli}} (by: Ui when the manager calls the guard directly; no-op on LocalBlock/Panic, B.8.6.3); deny-direction: no re-auth, a live session of that grant gets BYE{SUSPENDED}; UnattendedSuspended{reason: Local, by} logged (B.8.6.3) */
+      | Resume { device } /* clears any Suspended{…}; access-increasing: re-auth, no remote session ≥ 60 s (B.8.6.2); UnattendedResumed{by} logged */
       | Enable { device } /* Disabled → Active; access-increasing (B.8.6.2) */
       | Disable { device } /* Active → Disabled{by: Ui|Cli}; deny-direction: no re-auth, a live session of that grant gets BYE{REVOKED}; GrantDisabled{by} logged (B.8.6.1) */
       | ServiceInstall { elevated: bool /* Windows opt-in elevated task, B.8.7.5 */ } | ServiceUninstall /* tornect service install|uninstall: an autostart change is access-increasing (B.8.6.2) — re-auth, no remote session ≥ 60 s; no store write; AutostartChanged{by} logged */
@@ -1051,7 +1200,9 @@ ES_SYSTEM_REQUIRED)`, `IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUser
 (does not survive lid close), Inhibit portal `Suspend` (logind `Inhibit("sleep")` fallback). On
 resume (`PBT_APMRESUMEAUTOMATIC` / `NSWorkspace.didWakeNotification` / logind
 `PrepareForSleep(false)`) the host checks `OnionServiceStatus` and, if not reachable within 60 s,
-drops and re-launches the `RunningOnionService`. Lock-on-disconnect (default off) fires only on
+drops and re-launches the `RunningOnionService`. The limiter is not reconciled on resume: the
+monotonic clock did not advance during the suspend, so running locks are lengthened and runtime
+decay deferred — conservative, reconciled at the next load (B.8.5.1, B.8.5.3). Lock-on-disconnect (default off) fires only on
 session teardown (BYE, panic, QUIC close after the reconnect window), never on transient circuit
 loss. Client copy: "Host is offline, asleep, or locked — Tornect cannot wake or unlock it."
 
@@ -1061,7 +1212,7 @@ loss. Client copy: "Host is offline, asleep, or locked — Tornect cannot wake o
 |---|---|---|---|---|
 | Windows, session unlocked | WGC ✅ | SendInput ✅ (UIPI: not into elevated windows/UAC unless the host runs from the opt-in elevated task of B.8.7.5, which makes every remote Control session an administrator session; secure-desktop switch detected via `OpenInputDesktop` ⇒ `ctrl` notice) | n/a | — |
 | Windows, locked (Winlogon secure desktop) / logged out | ❌ | ❌ | **No** — needs a SYSTEM service + secure-desktop agent (v2; Ctrl+Alt+Del also needs the SendSAS policy) | `WTSRegisterSessionNotification` ⇒ `HOST_NOT_READY{locked}` / `BYE{HOST_LOCKED}` |
-| GNOME ≥ 45, unlocked, ScreenCast + RemoteDesktop restore tokens valid | PipeWire ✅ | libei ✅ | n/a | `wayland.md` §2.4; both tokens checked by readiness; portal `Start` budget 5 s then `Request.Close()` so no dialog blocks an empty room |
+| GNOME ≥ 45, unlocked, RemoteDesktop restore token valid (one combined session, §B.5) | PipeWire ✅ | libei ✅ | n/a | `wayland.md` §2.4–§2.5; the token checked by readiness; portal `Start` budget 5 s then `Request.Close()` so no dialog blocks an empty room |
 | GNOME, locked | ❌ (mutter inhibits remote access: sessions closed, `CreateSession` refused) | ❌ | **No** by design | `wayland.md` §7 (sourced); backends treat `Closed` as recoverable *Locked* |
 | KDE Plasma 6 | portal ✅ | ConnectToEIS ✅ | NEEDS-DEVICE(kde) | lock policy and RemoteDesktop token persistence unverified |
 | wlroots/Hyprland | ScreenCast only | no RemoteDesktop portal | — | out of v1 (view-only at best) |
@@ -1089,7 +1240,9 @@ persistent and unlockable at autostart, else the existing `FileSecretStore` (060
 "weaker keystore" badge; the host never blocks on a keyring prompt (a host that never enabled
 unattended has no `K_master` and nothing to read): `K_master` unreadable at
 start or at the 10-min readiness re-run ⇒ readiness state `keystore_locked` ⇒ unattended off
-(pre-PAKE `NOT_GRANTED`) + the sticky badge, re-checked every 10 min. `K_unatt = HKDF-SHA256(ikm
+(pre-PAKE `NOT_GRANTED`) + the sticky badge, re-checked every 10 min; the re-run only probes
+readability — a store already loaded is never re-decoded (the loaded limiter stays authoritative), and
+the `keystore_locked` → readable transition is the one recovery load (B.8.5.1). `K_unatt = HKDF-SHA256(ikm
 = K_master, salt = "tornect/v1/keystore", info = "unattended-store", 32)`. Anti-rollback anchor:
 the keystore entry `unattended-master.key` holds `K_master[32] || u64be store_generation`. Store
 writes fall into exactly two classes. **(a) Runtime-state writes** — `FailState` (charge/settle,
@@ -1149,7 +1302,7 @@ pub struct UnattendedStore {                       // everything policy-relevant
     pub stop_token: Option<[u8; 32]>,              // SHA-256("tornect/v1/stop\0" || host_onion_pk || stop_code), B.8.7.4 — never the code
     pub default_hard_lock_after: u32 /* wizard default, 20 */, pub keep_awake: bool /* host-wide, B.8.7.5 */, pub prevent_idle_lock: bool, pub notify: bool,
     pub grants: Vec<UnattendedGrant>, pub tombstones: Vec<(DeviceId, u64)>,   // revocations survive imports (merged); against a restored file the anchor rule, not this list, is the guarantee (B.8.9)
-    pub log_chain_head: [u8; 32], pub last_seen_unix: u64,
+    pub log_chain_head: [u8; 32], pub last_seen_unix: u64,   // monotone: max(stored, now) at every write (B.8.5.3)
     pub pending_anchor: u64,                       // generation of the last policy write; the keychain anchor is raised to it at that write or, if the keychain was unwritable then, at the next start/mutation (B.8.9)
     pub machine_id_hash: Option<[u8; 32]>,         // SHA-256("tornect/v1/machine-id\0" || OS machine id); mismatch at load ⇒ every grant Disabled{by: Restore} (B.8.12); None = id unavailable, check skipped
 }
@@ -1163,10 +1316,10 @@ pub struct UnattendedGrant {
     pub expires_at: Option<u64>, pub auto_renew: bool, pub max_session_secs: Option<u32>, pub reconnect_cooldown_s: u32,
     pub block_window_s: u8, pub ask_before_start: bool, pub require_absent: bool, pub require_tor_only: bool, pub lock_on_disconnect: bool,
     pub hard_lock_after: u32,                      // 20; 10 for Helping someone / Headless box; 0 = no consecutive hard lock (warned; the lifetime budget still applies)
-    pub state: GrantState /* Active | Suspended { reason: LocalBlock | Panic | Admin, since: u64 } | Disabled { since: u64, by: Actor /* Import (backup import) | Restore (machine-id mismatch at load, B.8.12) | Ui | Cli (local Disable, B.8.6.1) */ } */,   // Expired / NotYetActive derived; Disabled ⇒ pre-PAKE NOT_GRANTED, leaves only via `enable` (B.8.6.1); clearing rules B.8.6.3
+    pub state: GrantState /* Active | Suspended { reason: LocalBlock | Panic | Admin | Local { by: Actor /* Ui | Cli: a local Suspend, B.8.6.3 */ }, since: u64 } | Disabled { since: u64, by: Actor /* Import (backup import) | Restore (machine-id mismatch at load, B.8.12) | Ui | Cli (local Disable, B.8.6.1) */ } */,   // Expired / NotYetActive derived; Disabled ⇒ pre-PAKE NOT_GRANTED, leaves only via `enable` (B.8.6.1); clearing rules B.8.6.3
     pub last_used: Option<LastUsed /* { at, transport: TransportKind, duration_secs } */>,
     pub fail: FailState /* { consecutive: u32, since_unlock: u32, pending: bool /* charged, not yet settled */, last_fail_at: Option<u64>, lock_remaining_s: u32, flushed_at: u64, hard_locked: bool,
-                            decay_anchor: u64 /* consecutive, 24 h */, lifetime_decay_anchor: u64 /* since_unlock, 7 d */ /* B.8.5.1 decay bookkeeping */ } */,
+                            decay_anchor: u64 /* consecutive, 24 h */, lifetime_decay_anchor: u64 /* since_unlock, 7 d */ /* B.8.5.1 decay bookkeeping; anchors and flushed_at never decrease — `:= now` writes clamped to max(stored, now), decay advances by whole periods, B.8.5.3 */ } */,
 }
 ```
 Client side (`hosts.toml` at `Paths::hosts_file()`, M1, + keychain): per host `{ remember,
@@ -1206,7 +1359,8 @@ streaming. Every reject
 code of B.8.4.6 has plain copy, e.g. "locked until the owner unlocks it at *Host* — or from
 another of your devices", "suspended at *Host* until the owner resumes it there" (`SUSPENDED`;
 for an admin suspension also "— or from another of your devices"), "outside allowed hours (next
-Mon 09:00 host time)", "*Host* is
+Mon 09:00 host time)", "*Host*'s clock was set back — try again in N" (`NOT_YET_ACTIVE` from a
+rollback, B.8.5.3), "*Host* is
 offline, asleep or locked", and on a `server_s_pk` pin change "*Host*'s unattended setup was
 re-created since you last connected — if that wasn't you, revoke devices there" (blocks until
 confirmed). HUD badge "Unattended · Control/View"; `fail_summary` surfaces as "3 failed attempts
@@ -1233,7 +1387,7 @@ session at host*) live in the host card and use `intent = admin`; the cross-gran
 |---|---|
 | Forgot password | Local only (re-auth): *Change password* on that grant = new registration; no remote reset exists. Clients with a stale keychain entry see "wrong password" and re-enter. |
 | Lost/stolen client device | Host: *Remove device* (unpair + revoke + client-auth key + tombstone). Away: `admin revoke(pk)` / `master_off` from another *My machines* Control device (any other grant can only revoke itself), or the emergency stop code from any device (the wizard recommends a second granted device or the code card for single-device owners). |
-| Locked out legitimately | Wait the ladder; local *Unlock* (re-auth); or `admin unlock(pk)` from another *My machines* Control device (resets `FailState` and clears an admin suspension — a Block/panic suspension needs a local *Resume*). |
+| Locked out legitimately | Wait the ladder; local *Unlock* (re-auth); or `admin unlock(pk)` from another *My machines* Control device (resets `FailState` and clears an admin suspension — a Block/panic/local suspension needs a local *Resume*). |
 | Host reinstall / migration / state-dir restore / older store generation | Detection is the `machine_id_hash` of B.8.9 (`/etc/machine-id` · `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` · `IOPlatformUUID`): a mismatch at load — the state dir was moved to another machine, or the OS was reinstalled and regenerated its id — ⇒ every grant **disabled** (`GrantState::Disabled{by: Restore}`) + notification, re-enabled one by one (*enable*, re-auth, B.8.6.2); a hygiene measure, not a security control (a `K_master` holder rewrites the field, T4/T9). A same-machine snapshot restore is byte-indistinguishable from a normal start and is governed by the anchor rule alone: a store older than the last policy write (a rolled-back generation), a missing `K_master` or an anchor without a store file ⇒ fail closed + notification "unattended store was replaced — re-enable to continue"; a store at or above the anchor loads as-is (runtime-state rollback only, B.8.9). Grants are recreated locally. |
 | Rotate ID | Everything unattended wiped (B.8.9); re-pair, re-enable. |
 
@@ -1246,7 +1400,7 @@ pairing label**). Shipped (`tornect-core::session_log`): `UnattendedLockout` →
 per-attempt post-PAKE lines. New
 `SessionEvent` variants: `UnattendedRejected` (the pre-PAKE reject line, rate-aggregated: one line
 per reason per device per 60 s with `count`), `UnattendedChallengeIssued`,
-`UnattendedUnlock`, `UnattendedSuspended`, `UnattendedResumed`,
+`UnattendedUnlock`, `UnattendedSuspended{reason: LocalBlock|Panic|Admin|Local, by?: Actor /* Local only */}`, `UnattendedResumed`,
 `UnattendedBlockedByLocalUser`, `GrantCreated|Changed|Enabled|Disabled|Revoked|Expired|Pruned`
 (`GrantDisabled{by}` is the per-grant *Disable* of B.8.6.1; master off stays `UnattendedDisabled`),
 `AutostartChanged` (`by`, B.8.7.4),
@@ -1280,11 +1434,11 @@ the stop code, IPs beyond `transport`.
 | MS | Crate(s) | Work | Accept |
 |---|---|---|---|
 | M1 | `tornect-core` | `UnattendedStore`/`Grant`/`FailState` + AEAD codec + generation anchor + migrations; `K_master`/`K_unatt`; `keyring-core` backend behind a feature with file fallback; `SessionEvent` variants, hash chain, rotation; `Paths::unattended_store()`; fix the `trusted_devices_file` doc (pairings there, grants in the store); `unattended::{GrantStore, MutationGuard}` with the `ReAuth` and `RemoteSessionActivity` traits **defined here** (`MutationGuard::new(store, reauth: Arc<dyn ReAuth>, activity: Arc<dyn RemoteSessionActivity>)`, *Ownership* below — `tornect-platform` depends on core, so core cannot import them from platform; B.8.6.2 — the single entry point for UI, IPC and CLI); `ReadinessSnapshot`/`Probe` types with the all-unknown M1 stub (field list in the Rust block below); the `Presence` trait (M1 stub: `Unknown` ⇒ present; OS impls in `tornect-platform` at M6); `unattended::ipc` — the B.8.7.4 IPC message types + CBOR codec, no I/O (fuzz target F4); client-side `hosts.toml` per-host record `{remember, server_s_pk_pin, suite, ua_worked_before}` + `Paths::hosts_file()` (`server_s_pk` pin set at the first `SESSION_ACCEPT`, checked in `ClientLogin::finish`; the keychain-remembered password stays M8) | round-trip, tamper, rollback and permission tests; guard refuses without re-auth / during a remote session (A8 store/IPC parts); pin change ⇒ client abort (A16); `cargo check` on all targets |
-| M1 | `tornect-signal`, `apps/tornect` (CLI), `tornect-platform` (scaffold only) | `research-verifier` note (`docs/research/crypto.md` §8 re-pin, suite decision, sizes, Argon2 timing, GPU figure, circuit-teardown API); envelope `sig`; kinds/bodies; strict-alternation transcript; `HELLO_ACK`; signed `SESSION_REQUEST`; one envelope/transcript golden vector (B.8.4.3) committed; `OpaqueAuthenticator` (+ `Spake2Authenticator` under `pake-fallback`); `AttemptLimiter` with persistence (charge/settle/pending, B.8.5.1); `ConsentProof`/`PolicyReceipt` (private constructors) and `SessionAccept::build(ConsentProof, …)` as the **only** constructor; admin intent + scope; `tornect unattended` CLI (`apps/tornect`) + the host-role IPC dispatch loop over the B.8.7.4 message set (types + codec in `tornect-core::unattended::ipc`, *Ownership* below); M1 scaffolds `tornect-platform` with two modules only — `ipc` (Unix socket / named pipe per B.8.7.4) and `reauth`, the OS implementation of the `tornect-core::unattended::ReAuth` trait (M1: PAM/polkit on the Linux dev machine plus a debug-build-only `TORNECT_DEV_REAUTH=allow` escape, refused in release builds; M6: the Windows/macOS backends of the B.8.8 table); the B.8.4.5 host FSM (`HelloVerified` … `Accepting`/`Closing`) behind the injected `BlockWindow`/`LocalAllow` traits with headless defaults (see *Ownership* below); `fuzz/` targets F1–F4 added to the existing workspace-excluded fuzz crate + `tests/integration` workspace member; property + adversarial suite | headless unattended handshake ending in `SESSION_ACCEPT` over the localhost-Tor mock and between two machines; U1–U7, P1–P4, F1–F4 green; adversarial A1–A6, A8 (store/IPC parts), A13, A14, A15, A16, A17 and the signaling half of A7 green; I1, I8, I10, I11 (signaling half), I12 green; fuzz 10 min clean; counters survive `kill -9` |
-| M2 | `tornect-net` | the `BIND` exchange of B.8.4.3 (first frame on `ctrl` both ways: HMAC over the TLS exporter keyed by `session_token`; constant-time verify, close on mismatch; no other stream/datagram accepted before it) consumes the derived token; `transport_policy` honoured by candidate gathering; the Tor fallback tunnels the *same* QUIC connection, so the `BIND` check applies unchanged on both transports | token mismatch ⇒ `BIND` fails and the connection is closed before any media, on the direct path and over the Tor tunnel alike (I7 sub-case); `tor_only` sends zero candidates; I7 green |
-| M4 | `tornect-session`, app (minimal) | UI-backed `BlockWindow`/`LocalAllow` implementations for the `tornect-signal` FSM (incl. the `AwaitLocalAllow` popup) and the host FSM from the `Candidates` state on; block window (CLI/egui minimal) + Block; indicator copy; `sessions.log` events; session-end semantics (revoke/off/expiry/schedule/lock); one-session rules (`BYE{REPLACED}`); `Presence` (the `tornect-core::unattended` trait, M1 stub) wired into the away card and `require_absent` | WAN, nobody present, block window 0/3 s ⇒ first frame ≤ 8 s p50 / 12 s p95 from Connect; Block ends the session before the first frame; A7 (live-session replacement), A8 (post-session timing), A10, A12 green; I3–I5, I11 (live kill) green |
+| M1 | `tornect-signal`, `apps/tornect` (CLI), `tornect-platform` (scaffold only) | `research-verifier` note (`docs/research/crypto.md` §8 re-pin, suite decision, sizes, Argon2 timing, GPU figure, circuit-teardown API); envelope `sig`; kinds/bodies; strict-alternation transcript; `HELLO_ACK`; signed `SESSION_REQUEST`; one envelope/transcript golden vector (B.8.4.3) committed; `OpaqueAuthenticator` (+ `Spake2Authenticator` under `pake-fallback`); `AttemptLimiter` with persistence (charge/settle/pending, B.8.5.1), generic over the `tornect-core::unattended::Clock` trait (`wall()`/`mono()`, B.8.5.3; production = OS clocks, tests = a scripted `FakeClock`, the F3 loaders take the same trait); `ConsentProof`/`PolicyReceipt` (private constructors) and `SessionAccept::build(ConsentProof, …)` as the **only** constructor; admin intent + scope; `tornect unattended` CLI (`apps/tornect`) + the host-role IPC dispatch loop over the B.8.7.4 message set (types + codec in `tornect-core::unattended::ipc`, *Ownership* below); M1 scaffolds `tornect-platform` with two modules only — `ipc` (Unix socket / named pipe per B.8.7.4) and `reauth`, the OS implementation of the `tornect-core::unattended::ReAuth` trait (M1: PAM/polkit on the Linux dev machine plus a debug-build-only `TORNECT_DEV_REAUTH=allow` escape, refused in release builds; M6: the Windows/macOS backends of the B.8.8 table); the B.8.4.5 host FSM (`HelloVerified` … `Accepting`/`Closing`) behind the injected `BlockWindow`/`LocalAllow` traits with headless defaults (see *Ownership* below); `fuzz/` targets F1–F4 added to the existing workspace-excluded fuzz crate + `tests/integration` workspace member; property + adversarial suite | headless unattended handshake ending in `SESSION_ACCEPT` over the localhost-Tor mock and between two machines; U1–U7, P1–P4, F1–F4 green; adversarial A1–A6, A8 (store/IPC parts), A13, A14, A15, A16, A17 and the signaling half of A7 green; I1, I8, I10, I11 (signaling half), I12 green; fuzz 10 min clean; counters survive `kill -9` |
+| M2 | `tornect-net` | the `BIND` exchange of B.8.4.3 (first frame on `ctrl` both ways: HMAC over the TLS exporter keyed by `session_token`, labelled by Tornect role — dialer = "client", host = "server" — not by QUIC role; constant-time verify, close on mismatch; no other stream/datagram accepted before it) consumes the derived token; `transport_policy` honoured by candidate gathering; the Tor fallback tunnels the *same* QUIC connection, so the `BIND` check applies unchanged on both transports (transport choice pending §B.8.17 item 7, decided at M2) | token mismatch ⇒ `BIND` fails and the connection is closed before any media, on the direct path and over the Tor tunnel alike (I7 sub-case); `tor_only` sends zero candidates; I7 green |
+| M4 | `tornect-session`, app (minimal) | UI-backed `BlockWindow`/`LocalAllow` implementations for the `tornect-signal` FSM (incl. the `AwaitLocalAllow` popup) and the host FSM from the `Candidates` state on; block window (CLI / the minimal shell of Part C M4) + Block; indicator copy; `sessions.log` events; session-end semantics (revoke/off/expiry/schedule/lock); one-session rules (`BYE{REPLACED}`); `Presence` (the `tornect-core::unattended` trait, M1 stub) wired into the away card and `require_absent` | WAN, nobody present, block window 0/3 s ⇒ first frame ≤ 8 s p50 / 12 s p95 from Connect; Block ends the session before the first frame; A7 (live-session replacement), A8 (post-session timing), A10, A12 green; I3–I5, I11 (live kill) green |
 | M5 | `tornect-input`, `tornect-session` | view-only enforced at the inject and stream layers (`input`/`clip`/`file` refused); panic-key semantics (end + suspend; double-press ⇒ master off) via physical events | a view-only session injects zero events, clip/file streams refused; panic ⇒ session gone < 100 ms, grant suspended; A11, I2 green |
-| M6 | **`tornect-platform`** (OS backends; crate scaffolded in M1) | presence (the `tornect-core::unattended::Presence` impls), lock state/lock, idle-lock probe, keep-awake/idle inhibit, autostart installers, wake hooks, OS re-auth backends of the B.8.8 table, global hotkey (incl. GlobalShortcuts portal), capture-excluded windows, IPC endpoint per OS, readiness probes; B.8.8 rows → `PLATFORM_MATRIX.md` (columns: OS/compositor, ScreenCast token, RemoteDesktop token, lock-screen capture, lock-screen input, presence source, lock mechanism, re-auth mechanism, hotkey) | reboot with auto-login configured ⇒ dialog-free unattended session ≤ 3 min per OS (NEEDS-DEVICE recipes); readiness rows truthful; A9 (platform half: injected input ignored, panic fires, indicator re-asserted), I6, I9 green |
+| M6 | **`tornect-platform`** (OS backends; crate scaffolded in M1) | presence (the `tornect-core::unattended::Presence` impls), lock state/lock, idle-lock probe, keep-awake/idle inhibit, autostart installers, wake hooks, OS re-auth backends of the B.8.8 table, global hotkey (incl. GlobalShortcuts portal), capture-excluded windows, IPC endpoint per OS, readiness probes; B.8.8 rows → `PLATFORM_MATRIX.md` (columns: OS/compositor, portal restore token (RemoteDesktop session, §B.5), lock-screen capture, lock-screen input, presence source, lock mechanism, re-auth mechanism, hotkey) | reboot with auto-login configured ⇒ dialog-free unattended session ≤ 3 min per OS (NEEDS-DEVICE recipes); readiness rows truthful; A9 (platform half: injected input ignored, panic fires, indicator re-asserted), I6, I9 green |
 | M7 | `tests/`, qa | limiter under 1 k scripted attempts; lockout persistence; descriptor re-publish after a simulated Arti restart (CI); 24 h soak with 6 sleep/wake cycles as `NEEDS-DEVICE(<os>)` via `xtask soak --unattended` | soak report committed |
 | M8 | `apps/tornect`, docs | enable flow, manager, notifications/banners, client prompt + keychain + admin actions, log viewer filters, backup export/import, SECURITY.md threat model (this section), README "honest limits" | a non-developer enables unattended and connects from a second machine in < 5 min following README; B.8.16 checklist green; A9 (UI half: popups suppressed, in-app banner survives DND) green |
 
@@ -1327,6 +1481,7 @@ impl MutationGuard { pub fn new(store: GrantStore, reauth: Arc<dyn ReAuth>, acti
 // GrantOptions type (tornect-core::unattended::ipc, B.8.7.4); widening inside `options` is access-increasing (B.8.6.2)
 pub enum PresenceState { Present, Absent { since: Instant }, Unknown /* treated as present */ }
 pub trait Presence: Send + Sync { fn state(&self) -> PresenceState; }   // B.8.6.3, physical input only; M1 stub returns Unknown; OS impls in tornect-platform (M6)
+pub trait Clock: Send + Sync { fn wall(&self) -> u64; fn mono(&self) -> Duration; }   // B.8.5.3: unix seconds + an Instant-like monotonic reading; production SystemClock (SystemTime + Instant), tests FakeClock; consumed by AttemptLimiter, the decay twins and the schedule/expiry checks
 pub enum Probe { Ok, Warn(String), Fail(String), Unknown }
 pub struct ReadinessSnapshot { capture: Probe, input: Probe, autostart: Probe, auto_login: Probe, keystore: Probe, os_password: Probe, idle_lock: Probe, lock_state: Probe,
                                console_owner: Probe, tor_self_connect: Probe, panic_key: Probe, consent_indicator: Probe /* indicator + tray row of B.8.7.1 ⑥ */ }   // one field per B.8.7.1 ⑥ row; M1 stub: all Unknown
@@ -1355,9 +1510,9 @@ impl SessionAccept { pub fn build(proof: ConsentProof, caps: ChosenCaps /* negot
 
 | ID | Type | Scenario | Expected | MS |
 |---|---|---|---|---|
-| U1–U7 | unit | ladder incl. decay + lifetime budget; schedule (DST gap/overlap, wrap, TZ change); password policy (NFC, whitespace, score, file keystore ⇒ 4); store codec/migration/generation (incl. revoke → restore the pre-revoke store file → load fails closed with `StoreLoadFailed`, while a restored file that differs only in `FailState` loads: runtime-state rollback, B.8.9); clock rollback + forward jump; transcript/signature/HKDF golden vectors; limiter charge/settle: 60 consecutive successful logins ⇒ no lock and `since_unlock` stays 0, abandon after KE2 + `kill -9` ⇒ `since_unlock` persisted as 1 (`pending` settled as fail on load); a success on the charge that armed the hard lock (20th consecutive / 60th since unlock) clears `hard_locked` and returns `since_success = 19` (the own charge excluded) / `since_unlock` back at 59; a success with zero prior failures returns `fail_summary = None`; decay anchors advance by whole periods only | exact per spec | M1 |
+| U1–U7 | unit | ladder incl. decay + lifetime budget; schedule (DST gap/overlap, wrap, TZ change); password policy (NFC, whitespace, score, file keystore ⇒ 4); store codec/migration/generation (incl. revoke → restore the pre-revoke store file → load fails closed with `StoreLoadFailed`, while a restored file that differs only in `FailState` loads: runtime-state rollback, B.8.9); clock rollback + forward jump, driven through the `FakeClock` of B.8.5.3 (a runtime forward jump or a suspend — wall clock advanced, monotonic clock untouched, indistinguishable to the process — decays nothing and shortens no lock, and the next load reconciles it; across a load it shortens only the persisted lock and decays `consecutive` by one per 24 h of jump (uncapped) and `since_unlock` by ≤ 1 step, the extra lifetime steps forfeited; a rollback at load re-arms locks in full, applies no decay and fails schedule/expiry closed; a rollback at runtime — wall clock stepped back, monotonic untouched — fails every schedule/`active_from`/`expires_at` check closed until the clock passes `last_seen` (pre-PAKE `NOT_YET_ACTIVE{next_open_in_s = last_seen − now}`, `ClockAnomaly` logged), and nothing written after it can shorten a lock or decay a counter at the next load because `last_seen`, the anchors and `flushed_at` are written monotone; decay never clears `hard_locked`); transcript/signature/HKDF golden vectors; limiter charge/settle: 60 consecutive successful logins ⇒ no lock and `since_unlock` stays 0, abandon after KE2 + `kill -9` ⇒ `since_unlock` persisted as 1 (`pending` settled as fail on load, before decay: `consecutive = 3` with `pending` set and a 2-day gap ⇒ the settlement moves both anchors to `now` first, so `consecutive` stays 3 and no step is applied); a success on the charge that armed the hard lock (20th consecutive / 60th since unlock) clears `hard_locked` and returns `since_success = 19` (the own charge excluded) / `since_unlock` back at 59; a success with zero prior failures returns `fail_summary = None`; decay anchors advance by whole periods only, at load and at runtime alike; 21 d of uptime without failures then a charge ⇒ `since_unlock` −3 and the lifetime anchor +21 d (the `min(steps, 1)` cap is load-time only); `credit + twin.elapsed()` ≤ the wall-clock time since the persisted anchor, with equality whenever no backward step intervened since that anchor was written (the deficit only defers decay) | exact per spec | M1 |
 | P1–P4 | property | random interleavings incl. PING at every position ⇒ identical `th` on both sides or clean `E_BAD_STATE` (no additional charge: an existing `AwaitKe3` charge stands and is settled as fail); per-direction `msg_id`; any single-byte mutation before `SESSION_ACCEPT` ⇒ abort; unknown CBOR keys round-trip | no panic; ≤ 1 charge per stream | M1 |
-| F1–F4 | fuzz | `HELLO`/`HELLO_ACK`/`SESSION_REQUEST.unattended`/`AUTH_*`/`ADMIN_RESULT` bodies into both FSMs; KE1/KE2/KE3 deserializers; store + limiter loaders; IPC messages | no panic/UB, bounded time and allocation | M1 |
+| F1–F4 | fuzz | `HELLO`/`HELLO_ACK`/`SESSION_REQUEST.unattended`/`AUTH_*`/`ADMIN_RESULT` bodies into both FSMs; KE1/KE2/KE3 deserializers; store + limiter loaders (through the `Clock` trait of B.8.5.3, with fuzzed clock readings); IPC messages | no panic/UB, bounded time and allocation | M1 |
 | I1–I12 | integration (Tor mock + netem) | happy path (suite 1; suite 2 in fallback builds); view-only stream refusal; block elapsed / Block; schedule-end `BYE` with warning; `max_session_secs` + cooldown (`COOLDOWN{retry_after_s}`); lock-on-disconnect only on teardown (link flap ⇒ no lock); `tor_only`/`lan_only` (incl. a token mismatch over the Tor tunnel ⇒ QUIC handshake fails); restricted discovery on/off; `HOST_NOT_READY` when a token is revoked mid-run; canary fails at readiness ⇒ file keystore + badge, keyring locked at runtime ⇒ `NOT_GRANTED` + badge; admin `end_session`/`revoke` from a second device; orphaned accept pre-empted only by a post-F2 success from that pk (a bare `HELLO` does not) | as specified | M1: I1, I8, I10, I11 (signaling), I12 · M2: I7 · M4: I3–I5, I11 (live kill) · M5: I2 · M6: I6, I9 |
 | A1 | adversarial | right password, unpaired key | PAIR path, byte-identical, no `AUTH_CHALLENGE` | M1 |
 | A2 | adversarial | paired; no / expired / disabled grant | `NOT_GRANTED`, zero OPRF evaluations (counter assert) | M1 |
@@ -1373,18 +1528,18 @@ impl SessionAccept { pub fn build(proof: ConsentProof, caps: ChosenCaps /* negot
 | A12 | adversarial | revoke / off / expiry / schedule end / lock during a live session | `BYE` + QUIC closed ≤ 1 s; logged | M4 |
 | A13 | adversarial | HELLO with random / correct `stop_token` from an unpaired peer; a stop token captured by a phishing host (computed with the phisher's pk) replayed at the real host; fallback build: phishing host, malformed salt/`pB`, `pA` replay | random: byte-identical PAIR path; correct: master off + revoke-all + kill + log; phishing-host token useless at the real host (pk-bound, no state change); one online guess per stream, `E_BAD_LEN`, MAC failure | M1 |
 | A14 | adversarial | grep: no password/KE/`session_key`/`export_key` bytes in logs, TOML, IPC traces, core dumps (zeroize-on-drop tests) | clean | M1 (re-run at every milestone) |
-| A15 | adversarial | `unlock(pk)` / `revoke_all` / `master_off` / `suspend(other)` from a view-only or *Helping someone* grant; `unlock(pk)` of a grant in `Suspended{LocalBlock}` from a *My machines* Control grant; `unlock(pk)` of a grant in `Suspended{Admin}` from a *My machines* Control grant | `ADMIN_RESULT{ok: false}`, no state change, logged (`AdminRequest`, refused); second case: `FailState` reset but the grant stays `Suspended{LocalBlock}` (its next `SESSION_REQUEST` gets pre-PAKE `SUSPENDED`) — remote unlock never clears a local Block; third case: `FailState` reset and the grant returns to `Active` | M1 |
+| A15 | adversarial | `unlock(pk)` / `revoke_all` / `master_off` / `suspend(other)` from a view-only or *Helping someone* grant; `unlock(pk)` of a grant in `Suspended{LocalBlock}` from a *My machines* Control grant; `unlock(pk)` of a grant in `Suspended{Admin}` from a *My machines* Control grant; `unlock(pk)` of a grant in `Suspended{Local{by: Cli}}` (set by `tornect unattended suspend`) from a *My machines* Control grant; `suspend(pk)` then `unlock(pk)` against a grant in `Suspended{LocalBlock}`, both from a *My machines* Control grant | `ADMIN_RESULT{ok: false}`, no state change, logged (`AdminRequest`, refused); second case: `FailState` reset but the grant stays `Suspended{LocalBlock}` (its next `SESSION_REQUEST` gets pre-PAKE `SUSPENDED`) — remote unlock never clears a local Block; third case: `FailState` reset and the grant returns to `Active`; fourth case: as the second — `FailState` reset, the grant stays `Suspended{Local}` until a local *Resume*; fifth case: the state stays `Suspended{LocalBlock}` throughout — the `suspend(pk)` changes nothing (`ADMIN_RESULT{ok: true}`, logged) and the `unlock(pk)` resets `FailState` only (B.8.6.3 precedence) | M1 |
 | A16 | adversarial | host `ServerSetup` recreated (Rotate ID + re-pair, or a replaced store) after the client pinned `server_s_pk` | client aborts before KE3 with the "unattended identity of this host changed" message (nothing password-derived emitted beyond KE1); re-pair / re-register clears the pin | M1 |
 | A17 | adversarial | 50 bare `HELLO`s from random keys held open (no `SESSION_REQUEST`), then a granted device logs in | the granted device still receives `AUTH_CHALLENGE`: uncharged `HelloVerified` streams never occupy the per-pk, host-wide or per-minute budgets (B.8.5.2) | M1 |
 
 #### B.8.16 Security-reviewer checklist additions (§D.3)
 
 - `SessionAccept::build(ConsentProof, …)` is the only constructor; `PolicyReceipt` is minted only after `ServerLogin::finish`.
-- Charge (`pending = true`) + fsync precede KE2; no KE2 while locked/suspended/expired/disabled; success is the only consecutive reset and reverts only its own charge; the lifetime budget is never reset by success (7-day decay only); `pending` at load ⇒ settled-fail; unattended rejects never feed the temp-ban; global limits never lock; no global breaker.
+- Charge (`pending = true`) + fsync precede KE2; no KE2 while locked/suspended/expired/disabled; success is the only consecutive reset and reverts only its own charge; the lifetime budget is never reset by success (7-day decay only, ≤ 1 step per load; for decay and locks the wall clock is read only at load — runtime wall-clock reads are limited to monotone stamping (`:= now` clamped to `max(stored, now)`) and the schedule/`active_from`/`expires_at` gates, which fail closed on rollback; runtime decay uses the twins/`credit` of B.8.5.1, locks use `mono()` deadlines, both through the `Clock` trait; `last_seen` and every persisted clock field never decrease (`:= now` writes clamped, decay advances anchors by whole periods), and a rollback fails schedule/expiry closed at runtime as well as at load; decay never clears `hard_locked`); `pending` at load ⇒ settled-fail; unattended rejects never feed the temp-ban; global limits never lock; no global breaker.
 - Host derives `credential_identifier`, `context`, `identifiers` from the signature-verified pk; `context` includes `th_after(SESSION_REQUEST)`, suite, intent; both host OPAQUE calls pass `ServerLoginParameters`; `ksf` never `None`; sizes 96/320/64 asserted.
-- Client: fresh `ClientLogin::start` per stream; `HELLO_ACK` verified against the dialed address; `server_s_pk` pinned (`hosts.toml`, checked in `ClientLogin::finish`); the suite is a build-time constant, never taken from `HELLO_ACK.feats` when suite 1 is compiled in; `export_key` dropped/zeroized in the same scope as `finish`, never persisted or logged; aborts on `session_type` mismatch, `AUTH_CHALLENGE.suite ≠ requested`, `session_token` present for unattended, `token_confirm` mismatch (constant time); grant policy (`block_window_s`, `ask_before_start`) is read only from the signed `SESSION_ACCEPT`, never from `AUTH_CHALLENGE`; never auto-retries (nor with another suite).
+- Client: fresh `ClientLogin::start` per stream; `HELLO_ACK` verified against the dialed address; `server_s_pk` pinned (`hosts.toml`, checked in `ClientLogin::finish`); the suite is a build-time constant, never taken from `HELLO_ACK.feats` when suite 1 is compiled in; `export_key` dropped/zeroized in the same scope as `finish`, never persisted or logged; aborts on `session_type` mismatch, `AUTH_CHALLENGE.suite ≠ requested`, `session_token` present for unattended, `token_confirm` mismatch (constant time), `quic_spki` ≠ the pinned host SPKI (constant time, §B.6); grant policy (`block_window_s`, `ask_before_start`) is read only from the signed `SESSION_ACCEPT`, never from `AUTH_CHALLENGE`; never auto-retries (nor with another suite).
 - Strict-alternation window enforced (`PING` during auth ⇒ `E_BAD_STATE`, no additional charge — an `AwaitKe3` charge is settled as fail); a bare `HELLO` never cancels an in-flight `AwaitKe3` handshake — only a verified `SESSION_REQUEST` from the same pk does (B.8.4.5); `HelloVerified` streams never count as in flight (B.8.5.2); `th` hashes exact wire bytes; signatures cover envelope fields, never re-serialized CBOR; every `HELLO` signature is verified against the `HELLO`'s own pk (proof of possession) and, when pinned, the pk must equal the pinned key — a bad signature is `E_BAD_SIG` for pinned and unpinned peers alike, byte-identical; `HELLO_ACK.feats` is host-wide.
-- One mutation guard consulted by UI, IPC, CLI and startup reload; re-auth is a fresh OS dialog per operation; deny-direction paths need nothing and kill sessions ≤ 1 s; popups suppressed during remote sessions; policy never read from `config.toml`; admin scope (B.8.4.1) enforced from the requester's grant, and a remote `unlock` clears `Suspended{Admin}` but never `Suspended{LocalBlock|Panic}`; backup export is access-increasing; `RegFinish` needs the live `reg_txn` from a re-authenticated `RegStart`.
+- One mutation guard consulted by UI, IPC, CLI and startup reload; re-auth is a fresh OS dialog per operation; deny-direction paths need nothing and kill sessions ≤ 1 s; popups suppressed during remote sessions; policy never read from `config.toml`; admin scope (B.8.4.1) enforced from the requester's grant, and a remote `unlock` clears `Suspended{Admin}` but never `Suspended{LocalBlock|Panic|Local}`; backup export is access-increasing; `RegFinish` needs the live `reg_txn` from a re-authenticated `RegStart`.
 - Store: AEAD with header AAD, generation anchor (bumped by every policy write — access-increasing and deny-direction alike, revocations included — never by runtime-state writes; an owed bump is carried as `pending_anchor` while the keychain is unwritable; store ≥ anchor accepted, older ⇒ fail closed, so a pre-revocation store never loads), `machine_id_hash` mismatch ⇒ grants `Disabled{by: Restore}`, fail closed on every load error — a guarantee against parties without `K_master` (T9 is out of scope), atomic writes, single writer, 0600/ACL, tombstones merged on import, `Zeroizing` buffers.
 - Indicator/panic/block window: physical-input-only detection, re-assertion, un-closable, DND-independent in-app surface; view-only refuses `input`/`clip`/`file` at the QUIC layer; the mode clamp is monotone toward view-only (`SessionMode::most_restrictive`).
 - Logs: pinned label only, rate-aggregated rejects, hash chain + tag with the head in the store (append + fsync before the head write; tagged lines beyond the head accepted and the head advanced, B.8.13), no secrets; client log present. Emergency stop: only the pk-bound `stop_token` is stored and compared (constant time), single-use. Restricted discovery: client-generated keys, pairing-mode window logged, caveats shown.
@@ -1398,6 +1553,7 @@ impl SessionAccept { pub fn build(proof: ConsentProof, caps: ChosenCaps /* negot
 4. Argon2id 64 MiB on future mobile clients ⇒ new suite id with re-registration, not a negotiation; decide when a mobile client exists.
 5. Keychain user-presence gating (Touch ID / Windows Hello) for the remembered password — v1 where `keyring-core` stores expose it cheaply, else post-v1; headless Linux re-auth without a polkit agent (PAM vs a weaker Tornect-only passphrase) decided at M6.
 6. v2 service-mode scoping per OS, and whether lock-on-disconnect should default on wherever the M6 matrix proves remote unlock.
+7. Tor fallback transport: the same QUIC connection over a length-framed onion-stream tunnel (uniform `BIND`/exporter check — §B.2, B.8.4.2, Part C M2) vs. the session protocol directly over the onion stream (quic.md §0/§9: double congestion control, wasted 1200 B Initial padding and DPLPMTUD probes, extra handshake RTTs over 0.5–1.5 s circuits) — decide at M2 with a measured onion-stream throughput; if direct, define the `BIND` equivalent over the onion stream (e.g. an HMAC over `th` + `session_token`, both directions, before any media) so the token check stays uniform. Also a Part E row.
 
 ---
 
@@ -1418,7 +1574,7 @@ ID on all 3 OSes (CI).
 **M1 — Signaling over Tor (the moment Tornect becomes real)**
 Embed Arti; host publishes onion service (persistent key, state dir); client
 connects by onion addr; full HELLO/PAIR/SESSION envelope state machines with
-property tests; CLI consent prompt (y/n + SAS display) before egui exists;
+property tests; CLI consent prompt (y/n + SAS display) before the UI shell exists (`u1`, Part F.6);
 PoW DoS defense + rate limits on. Unattended protocol per §B.8.4–B.8.5 and §B.8.9:
 `HELLO_ACK`, signed `SESSION_REQUEST`, `AUTH_CHALLENGE`/`AUTH_RESPONSE`/`ADMIN_RESULT`,
 OPAQUE suite (`opaque-ke` 4.0.1; suite decision by `research-verifier`, SPAKE2 fallback
@@ -1441,13 +1597,20 @@ machines with no prompt on the host, and the §B.8.15 rows owned by M1 are green
 U1–U7, P1–P4, F1–F4; integration I1, I8, I10, I11 signaling half, I12).
 
 **M2 — Direct connectivity (hole punch + QUIC)**
-Candidate gathering (if-addrs, `igd-next` UPnP + NAT-PMP/PCP, `stun-client` against
-configurable list); CANDIDATES over Tor; paced simultaneous-open punch; quinn
-endpoint with pinned-key TLS verifier + the `session_token` `BIND` exchange (first frame on
-`ctrl` both ways, an HMAC over the TLS exporter; nothing else accepted before it verifies — the
+Candidate gathering (`if-addrs`, `igd-next` UPnP + `crab_nat` PCP/NAT-PMP, the **`stun`**
+crate (webrtc-rs 0.17, used sans-IO on the media socket — never its `Client`; not
+`stun-client`) against the configurable list; default-gateway/client-IP discovery for `crab_nat`
+decided at M2 start — `netdev` vs ~100 lines of per-OS code, SUMMARY.md §1.4); CANDIDATES over Tor; paced simultaneous-open
+punch per §B.2 (STUN-style probes outside QUIC, ICE pacing, one `connect_with` dial by the
+lower-pubkey side, `grease_quic_bit(false)` + a demux unit test); quinn endpoint with the
+RFC 7250 raw-public-key mutual verifiers pinning both SPKIs (§B.6) + the `session_token`
+`BIND` exchange (first frame on
+`ctrl` both ways, an HMAC over the TLS exporter labelled by Tornect role — dialer = "client", host =
+"server", independent of the QUIC-role tie-break; nothing else accepted before it verifies — the
 PAKE-derived token of unattended sessions feeds the same check, §B.8.4.3); `transport_policy`
 (`tor_only`/`lan_only`, §B.8.6.4) honoured by candidate gathering; Tor-tunnel
-fallback transport implementing the same `SessionTransport` trait; connection
+fallback transport implementing the same `SessionTransport` trait (transport choice pending §B.8.17
+item 7, decided at M2); connection
 health/migration (Wi-Fi→ethernet). ✅ Accept: matrix test — LAN, one-sided NAT,
 double NAT (netem/netns harness simulating port-restricted + symmetric) — direct
 established where theoretically possible, Tor fallback engages within 4 s otherwise;
@@ -1457,15 +1620,37 @@ media (on the direct path and over the Tor tunnel alike — the tunnel carries t
 connection) and `tor_only` sends zero candidates.
 
 **M3 — Video pipeline, single platform (pick the OS Claude Code is running on)**
-Capture backend for dev OS; FFmpeg hw encode+decode wrappers with runtime probe;
-packetizer/FEC/jitter/pacer from §B.4; wgpu render window; loopback demo
-(`tornect demo --loopback`) capture→encode→(in-proc channel)→decode→render.
-✅ Accept: 1080p60 loopback ≥ 30 min, added latency ≤ 35 ms p95 (HUD overlay
-numbers), zero validation errors, CPU < 15 % with hw codec.
+Capture backend for dev OS (+ a synthetic source — the `pipewire` crate needs headers this
+VM lacks, so the PipeWire backend builds only in CI); `openh264` software encode+decode
+(always compiled); FFmpeg hw encode+decode wrappers with runtime probe behind the `ffmpeg`
+feature (compiled and smoke-tested in the Linux CI media job — a `vaapi`/`cuda` device
+create that returns `ENOENT`/`ENOSYS` still validates linking and struct layouts);
+packetizer/FEC/jitter/pacer from §B.4; wgpu render window (lavapipe on the VM); loopback
+demo (`tornect demo --loopback`) capture→encode→(in-proc channel)→decode→render.
+✅ Accept — **VM-scoped** (this dev machine and the Linux CI runner have no GPU encoder;
+`openh264` measured 23.4 ms/frame encode + 5.4 ms decode at 1080p here, above the 16.7 ms
+60 fps budget): synthetic source → `openh264` → in-proc → `openh264` → wgpu, loopback ≥ 30 min at
+**720p60 with added latency ≤ 35 ms p95**, and at **1080p30 with added latency ≤ 50 ms p95** (the
+§B.7 hard cap — openh264's 23.4 + 5.4 ms already consume most of the 35 ms target at 1080p) plus
+codec-excluded pipeline latency (capture → packetize → jitter → present, encode/decode subtracted)
+≤ 9 ms p95 — the §B.7 stage sum capture ≤ 4 + packetize ≤ 2 + render ≤ 3, measured with the synthetic
+source (≈ 0 ms capture) and the jitter buffer pinned to 0 frames on loopback; ≤ 6 ms is the stretch figure
+(HUD overlay numbers), zero validation errors, the `--headless-stats` output of both
+runs — total and codec-excluded p95 — pasted into `docs/VERIFICATION.md`.
+✅ Accept — **`NEEDS-DEVICE(gpu)`** rows in `docs/VERIFICATION.md`, each with an exact
+recipe: 1080p60 loopback ≥ 30 min, added latency ≤ 35 ms p95, CPU < 15 % with a hardware
+codec; and a **`NEEDS-DEVICE(linux)`** row — the PipeWire capture backend end-to-end on a
+GNOME ≥ 45 desktop with `libpipewire-0.3-dev` (recipe: `-p tornect-capture --features pipewire`,
+a RemoteDesktop portal session, 30-min loopback) — it needs a Linux desktop, not a GPU: this VM
+lacks the headers and CI lacks a portal session. (docs/research/SUMMARY.md §0.3, §4 M3;
+codecs.md §3.2, §11.3)
 
 **M4 — End-to-end streaming (M1+M2+M3 glued by `tornect-session`)**
 Host & client session state machines; ctrl stream (IDR request, bitrate hint);
-minimal egui: ID card + connect field + consent popup + stream window. Unattended
+UI: the `u1` shell of Part F.6 (ID card + connect field + consent/pairing popups, already
+delivered — D10: Iced, or the egui fallback) wired to the M3 stream window end-to-end — `u2` = U2 of
+`docs/UI_PLAN.md` §11 (S3 connecting stages, HUD v1 + latency overlay, disconnect/reconnect UX), tagged
+at the M4 Accept (Part F.6). Unattended
 gating in the host FSM (`ConsentProof::Unattended`, §B.8.14), block window with
 [Block], indicator copy, `sessions.log` events, session-end semantics
 (revoke/off/expiry/schedule/lock, §B.8.6.4), one-session rules, the core `Presence` stub wired in.
@@ -1495,11 +1680,14 @@ local IPC endpoint). ✅ Accept: full 3×3 host↔client
 matrix streams with input+audio; CI builds artifacts for all OSes; a
 `PLATFORM_MATRIX.md` records tested GPU/driver/compositor combos plus the unattended
 rows of §B.8.8; reboot with auto-login configured ⇒ dialog-free unattended session
-≤ 3 min per OS (`NEEDS-DEVICE` recipes); readiness rows truthful.
+≤ 3 min per OS (`NEEDS-DEVICE` recipes); readiness rows truthful. `u3` = U3 of `docs/UI_PLAN.md`
+§11 (settings, devices, permission walkthroughs, notifications + indicator on all three platforms, tray)
+follows M6 serially, before M7 (Part F.6).
 
 **M7 — Resilience & performance hardening**
 ABR controller tuned on netem profiles (3 canned: "fiber", "flaky wifi", "hotel");
-FEC adaptivity; Tor-fallback UX (badge, quality preset); zero-copy decode-render
+FEC adaptivity; Tor-fallback UX (badge, quality preset — `u4` = U4 of `docs/UI_PLAN.md` §11, tagged at
+the M7 Accept, Part F.6); zero-copy decode-render
 interop; multi-monitor select/switch; HDR (HEVC Main10/AV1-10) behind flag;
 unattended limiter/lockout under 1 k scripted attempts and lockout persistence (CI),
 descriptor re-publish after a simulated Arti restart (CI), 24 h unattended soak with
@@ -1508,7 +1696,7 @@ sleep/wake cycles as `NEEDS-DEVICE(<os>)` (§B.8.14).
 30-min soak at 5 % loss without session drop; perf report committed.
 
 **M8 — Product polish & ship v0.1**
-Full egui app: onboarding (permissions walkthroughs per OS), settings, trusted
+Full app shell per D10 (U5 of `docs/UI_PLAN.md` §11 = `u5`, tagged at the M8 Accept, Part F.6): onboarding (permissions walkthroughs per OS), settings, trusted
 devices manager, session log viewer, unattended-access UI per §B.8.7/§B.8.10 (enable
 flow with readiness and scam step, grants manager, notifications/banners, client
 prompt + keychain + admin actions, `tornect service` docs, backup export/import),
@@ -1541,7 +1729,8 @@ carries the always-in-context rules; this section carries the process.
 ### D.1 Ground rules for the build
 
 1. **Milestones are sacred.** One milestone per Claude Code "epic"; never start
-   M(n+1) with M(n) red. Tag `m0`…`m8` on completion.
+   M(n+1) with M(n) red. Tag `m0`…`m8` — and `u1`…`u5` for the UI milestones of
+   `docs/UI_PLAN.md` §11 (Part F.6) — on completion.
 2. **Plan mode first** for every milestone: read this plan's relevant sections,
    produce a task DAG, identify what can run in parallel, get user sign-off.
 3. **Verify like a hostile QA.** Every task ends with: `cargo fmt --check`,
@@ -1587,7 +1776,7 @@ docs/VERIFICATION.md             # NEEDS-DEVICE ledger + soak/netem results
 | `net-engineer` | most capable | tornect-signal, tornect-net: Arti, punching, quinn, fallback | full |
 | `media-engineer` | most capable | tornect-capture/codec/audio/proto: per-OS capture, FFmpeg hw, FEC/ABR | full |
 | `platform-{windows,macos,wayland}` | capable | The three M6 parallel tracks; each owns its capture+input+audio backend end-to-end | full, own worktree |
-| `ui-engineer` | capable | eframe app, popups, tray, onboarding, HUD | full |
+| `ui-engineer` | capable | Iced shell + manual-winit stream window (D10), popups, tray, onboarding, HUD | full |
 | `security-reviewer` | most capable | Adversarial review at each milestone close: §B.6 checklist, unsafe-block audit, fuzz targets, "how would I abuse this popup flow?"; the §B.8.16 checklist on any diff touching unattended access, PAKE, grants, the keystore or the mutation guard | read-only + test-run |
 | `qa-engineer` | capable | Integration/netem harnesses, soak scripts, PLATFORM_MATRIX.md, keeps §B.7 gates executable | full |
 
@@ -1618,7 +1807,8 @@ this machine, DEPENDENCIES.md updated if deps changed.
 
 ### D.4 Orchestration patterns (when to parallelize)
 
-- **Serial** (main session, agents as consultants): M0–M4 — the layers stack.
+- **Serial** (main session, agents as consultants): M0–M1, `u1`, M2–M4 — the layers stack;
+  `u2`/`u4`/`u5` are interleaved inside M4/M7/M8 and `u3` runs serially after M6 (Part F.6).
 - **Parallel worktrees**: M6 — `platform-windows|macos|wayland` implement against
   the frozen traits from M3–M5 simultaneously; `architect` freezes trait signatures
   first; merge order: wayland (dev machine verifiable) → windows → macos.
@@ -1681,6 +1871,7 @@ tag."* — `/milestone <n>` (created in M0) expands to exactly this.
 | Scope creep (it's a fun project) | H×M | Post-v1 backlog exists precisely to say "later"; milestones gate features |
 | Abuse of remote-access software | L×H | §B.6 consent architecture: no silent sessions, persistent indicator, panic key, local session log — these are requirements, not options |
 | Unattended-access abuse or lockout DoS (stolen/cloned device keys, coached relatives, a hostile Control session, the owner locking themselves out, keychain unusable at autostart, lock-screen dead ends) | M×H | §B.8: two factors + per-grant OPAQUE; count-based ladder with lifetime budget, per-grant scope, no global breaker; remote revoke/unlock from another *My machines* Control device + emergency stop code; OS re-authentication for every access-increasing change through Tornect's own surfaces (endpoint-level rewrites by a Control session are out of scope, T9); file-keystore fallback with a stricter password policy; honest per-OS readiness (§B.8.8); the adversarial A-suite is cumulative — each milestone's rows are listed in §B.8.14 and gate it |
+| Tor fallback transport contradicts the research: §B.2/§B.8.4.2/M2 tunnel the same QUIC connection through the onion stream for a uniform `BIND` check, while quic.md §0/§9 argues for the session protocol directly over the onion stream (double congestion control, wasted Initial padding/DPLPMTUD probes, extra handshake RTTs) | M×M | §B.8.17 item 7: decide at M2 with a measured onion-stream throughput; if direct, a `BIND` equivalent over the onion stream (HMAC over `th` + `session_token`) keeps the token check uniform; the M2 accept row for the Tor tunnel is then re-worded, not dropped |
 
 ## Part F — Open product decisions (answer before/at M0)
 
@@ -1697,6 +1888,15 @@ tag."* — `/milestone <n>` (created in M0) expands to exactly this.
    (2026-08-28, M0-4): confirmed; GNOME ≥ 45 added by §B.8.1 for the RemoteDesktop v2 portal.**
 5. Name/branding check: "Tornect" — quick trademark/collision search before public
    release (research-verifier task in M8).
+6. UI-foundation milestone placement (Part G, UI plan adopted). **Decided (2026-08-29, r6
+   review): `u1` = U0 + U1 of `docs/UI_PLAN.md` §11, executed right after M1 and before M2 —
+   serially (D.1 rule 1, D.4), never interleaved; Accept = the U0 and U1 rows, the two-machine
+   pairing part `NEEDS-DEVICE`; tags `u1`…`u5` (D.1); M2 starts only after `u1` is green; `u2` = U2 inside
+   the M4 epic (tag `u2` before `m4`), `u3` = U3 serial after M6 (tag `u3` before M7 starts), `u4` = U4
+   inside M7 (tag `u4` before `m7`), `u5` = U5 inside M8 (tag `u5` before `m8`) — a UI tag hosted by an M
+   epic is cut at that milestone's Accept, and every UI tag counts as red for D.1 rule 1;
+   `research-verifier` pins `iced`, `tray-icon`, `notify-rust`, `fluent` and the AccessKit
+   integrations first.** The owner may swap `u1` and M2 by amending this item.
 
 ---
 
@@ -1711,9 +1911,9 @@ numbered row in `docs/notes/decisions.md`.
 |---|---|---|
 | M0 Bootstrap | **Done**, tag `m0` (commit `5c7a52d`) | Workspace, `tornect-core` (onion-v3 `TornectId` proven against real addresses, identities, 0600 keystore, config, paths, tracing, `sessions.log`), CLI `id/rotate-id/paths/config/doctor`, `xtask verify`, Claude Code kit, GPLv3, README. CI file written but not yet pushed (see pending actions). |
 | Research | **Done** (commit `36a5b0f`) | `docs/research/{arti,quic,crypto,nat,wayland,codecs,ui,ci,media-proto}.md` + `SUMMARY.md` audit — verified against crates.io, crate sources and live probes; all pins in `Cargo.toml` come from these. |
-| Plan §B.8 | **Done** (r4, commit `c515f0d`) | Unattended access specified end-to-end; two medium text findings still to apply (listed in `docs/notes/m1-state.md`). |
+| Plan §B.8 | **Done** (r4 → r6) | Unattended access specified end-to-end (r4, commit `c515f0d`); the two r5 findings of `docs/notes/m1-state.md` (runtime decay monotonicity; local Suspend reason `Suspended{Local{by}}`) applied in r6 and tightened by the r6 review pass (`credit`/`Clock` rules, monotone `last_seen`, Suspend/Resume surfaces) — ticked off in that note. |
 | M1 Signaling over Tor | **In progress — track 1 of 4 done** (commit `0e568d8`) | Arti embedded (`tornect-signal::tor`), `tornect host` / `tornect ping` verified live over Tor: onion service published from the M0 seed (same ID after restart), pings 0.5–1.1 s RTT, PoW-aware admission with backpressure, 43 signal + 26 core tests. Remaining: CBOR envelope + pairing/SAS + attended FSM, OPAQUE unattended FSM, CLI/IPC/`tornect-platform` scaffold, adversarial suite, live pair/connect verification, tag `m1`. Workflow script prepared: `docs/notes/m1-phase2-plan.md`. |
-| M2–M8 | Not started | Research decisions already made for M2 (raw-public-key TLS, punch outside QUIC, `grease_quic_bit(false)`, `stun` 0.17 / `crab_nat` / `igd-next`), M3 (`openh264` software path; hw codecs `NEEDS-DEVICE(gpu)`; VM-scoped acceptance to define), M5 (`opus` 0.4, in-band FEC off), UI (manual winit loop, no eframe; wgpu 30 / winit 0.30 / egui 0.36). |
+| M2–M8 | Not started | Research decisions already made for M2 (raw-public-key TLS, punch outside QUIC, `grease_quic_bit(false)`, `stun` 0.17 / `crab_nat` / `igd-next`), M3 (`openh264` software path; hw codecs `NEEDS-DEVICE(gpu)`; VM-scoped acceptance defined in Part C M3, r6), M5 (`opus` 0.4, in-band FEC off), UI (Iced shell + manual winit loop, no eframe, process model per D10; wgpu 30 / winit 0.30 / egui 0.36; `u1` placement per Part F.6). |
 
 **Verified-on-hardware honesty.** Everything above was run on one Ubuntu 26.04 VM (GNOME/
 Wayland, no GPU encoder, no sudo, no second machine). Windows/macOS are `cargo check`-ed via
@@ -1725,12 +1925,121 @@ and push `.github/workflows/ci.yml` (kept local because the token lacks the `wor
 refuses to let the model install its own permission/hook config). (3) Optional: a second
 machine for the M1/M2 two-NAT acceptance rows.
 
-**Plan amendments queued for r6** (from `docs/research/SUMMARY.md`): §A.2 FFmpeg versions
-(ubuntu-latest ships 6.1; crate supports 6.1–9.0); §A.4 "Linux host must be unlocked (GNOME
-closes portal sessions on lock)"; §B.2 punch mechanics (probes outside QUIC, single dial, role
-tie-break) and `quic_spki` instead of `quic_server_cert_fp`; §B.4 Opus in-band FEC off + datagram
-payload = live `max_datagram_size()` (1162 B at 1200 MTU) with a 12-byte header; §B.5 Wayland
-restore token on `SelectDevices`, `openh264` as the always-on software codec (no x264-first,
-no rav1e/svt-av1/dav1d in v1); §B.6 TLS raw public keys (RFC 7250) rather than X.509; D9 `opus`
-crate; D10 own winit loop instead of eframe; D13 `keyring-core`; M2 `stun` crate (not
-`stun-client`); M3 VM-scoped acceptance + `NEEDS-DEVICE(gpu)` rows.
+**UI plan (adopted 2026-08-29).** `docs/UI_PLAN.md` (byte-identical to `TORNECT_UI_PLAN.md` at the
+repo root; `cargo xtask verify` compares them) refines D10: an Iced 0.14 shell, the winit/wgpu/egui
+stream surface, a separate always-on-top indicator window, `tornect-ui-kit` design tokens, a
+preview/snapshot harness and a `ux-reviewer` agent. This plan stays authoritative; reconciliation:
+(1) its schedule (U0 with M0, U1 with M1) is **not** retrofitted — M0 is closed and M1 keeps the
+CLI consent prompt of Part C; U0 + U1 form the first UI milestone `u1`, scheduled right after M1 and
+before M2 (Part F.6 — serial per D.1/D.4, never interleaved), with `research-verifier` pinning `iced`,
+`tray-icon`, `notify-rust`, `fluent` and the AccessKit integrations first (nothing UI-related is
+pinned yet); U2–U5 keep their hosting milestones as `u2` (inside M4), `u3` (serial after M6), `u4` (inside
+M7) and `u5` (inside M8), Part F.6; (2) its consent dialog's "Always allow this device" checkbox (§6.1) and the
+"Always allow / Ask / View-only / Unattended" device badge (S2) contradict §B.2/§B.6/§B.8 (no "always
+allow"; the only popup-less path is an unattended grant; no persistent per-device attended policy —
+view-only exists per session and as a grant mode) and are replaced by the §B.2 link "Set up
+unattended access…" and the §B.8.7 manager; S8's "per-device trust level" (the same persistent attended
+policy) is replaced by the grant's mode in the §B.8.7 manager; the Wayland indicator contract is the
+compositor's screencast icon + focused window + chime + the in-app surface (B.8.8, B.8.7.3) — the tray is
+an enhancement, GNOME has none without an extension, so §6.3/§12's "our tray red state carries the
+guarantee" does not hold; the S4 pairing variant of §6.2 resolves `PAIR_ACCEPT` on its own click and the
+session dialog follows `SESSION_REQUEST` (§B.2, B.8.4.5 strict alternation — the requested mode is unknown
+at PAIR time), never one click for both; the §8 degraded banner shows no [Retry direct] when
+`SESSION_ACCEPT.transport_policy = tor_only` (Paranoid / `require_tor_only`, B.8.6.4) — the copy says
+"Relayed by policy"; its auto-deny countdown is kept but its duration and
+answer follow the master where fixed (60 s ⇒ `DENIED` for the ask-before-start popup of B.8.4.5 —
+the client's fixed 110 s budget assumes it; an attended popup timeout answers `POPUP_TIMEOUT`,
+B.8.4.6); its consent invariant (§6.1 "capture starts only after an affirmative click", §10 item 4)
+reads in this plan: attended = click, unattended = F1 + F2 and the block window elapsed without
+Block (B.8.1 — elapsing is a veto opportunity, not consent); its §6.1 words "never on timeout" do not
+hold for the block window (elapsing without Block starts capture, B.8.4.5), and §10 item 4 gains the
+unattended twin: `Blocked` ⇒ never `StartCapture`, `Elapsed` ⇒ `StartCapture` only through
+`ConsentProof::Unattended` (B.8.14); the §B.8.6.3 Block window (one button,
+no close, re-asserted every 500 ms, every captured monitor), the `AwaitLocalAllow` Allow/Deny popup,
+the "**Unattended** · <label> · Control · [End]" indicator variant and the in-app notification
+windows of §B.8.7.3 are added to its screen inventory at M4/M5 (before U5), and its indicator (§6.3)
+inherits un-closable / re-asserted / on every captured monitor; its "instant-apply" settings (S8)
+never apply to the access-increasing operations of §B.8.6.2 (panic key, launch at login =
+`tornect service install`, keep-awake/notification settings, the identity-key view/backup of S8
+*Identity* and the unattended `backup export` — both listed in B.8.6.2 — per-device grant
+policy — OS re-auth, no remote session ≥ 60 s); its S3 wait stage shows the dialed address or the
+paired label, never a host-sent name, until `PAIR_ACCEPT` (B.8.4.1: `HELLO_ACK` carries no
+`host_name`); its OS toasts / portal notifications mirror, never replace, the in-app window
+(§B.8.7.3, A9 — DND/Focus hide toasts); (3) the egui-everywhere fallback remains the risk floor;
+(4) errata for the UI plan's next revision (the UI plan itself is not edited): §11 U3 "S6 devices
+management" (S6 is the stream window; devices live in S2/S8), S8 "strength meter, argon2" (the meter
+is zxcvbn, B.8.7.2; Argon2id is the OPAQUE KSF), S2 "Accept incoming requests" must not be confused
+with the unattended master toggle of B.8.7.3, §6.3's "Indicator process outlives shell crashes
+(separate task; watchdog)" is the separate *process* of D10's process model (§3 already says a dedicated
+window), `crates/tornect-ui-kit` enters §B.1 (listed there as created at `u1`) and the CLAUDE.md map at
+`u1`, and the UI plan's `apps/tornect/src/platform/` is tray/notification/deep-link glue only — autostart,
+hotkeys and the IPC endpoint stay in `tornect-platform` (B.8.14). Verified pins for every UI crate — and `research-verifier` confirmation of
+the §2 claims the adoption rests on (Iced 0.14's release and its headless-testing/hot-reload
+features, COSMIC as the production Wayland proof, the `iced_winit` integration path of D10; the UI
+plan's table cites no sources) — are a precondition of that milestone.
+
+**Plan amendments applied in r6** (2026-08-29, from `docs/research/SUMMARY.md` "Cross-cutting";
+one line per item, section touched first):
+- §A.2 — FFmpeg versions: bindings 9.0.0 build against FFmpeg 6.1–9.0; `ubuntu-latest` ships 6.1,
+  the VM 8.0.1; target the 8.x API, gate on `ffmpeg_8_0`, two-image media CI matrix (codecs.md §2.1,
+  ci.md §3). Also `draft-seemann-quic-nat-traversal` recorded as an expired individual draft (nat.md §4).
+- §A.4 — new item 6 "A Linux (GNOME) host must be unlocked": the lock screen terminates every portal
+  session and refuses new ones; recoverable *Locked* state per §B.8.8 (wayland.md §7).
+- §B.2 — punch mechanics: STUN-style probes outside QUIC, ICE pacing (Ta 50 ms, RTO ≥ 500 ms), one
+  `connect_with` dial by the lower-device-pubkey side, `grease_quic_bit(false)`; `quic_server_cert_fp`
+  → `quic_spki` (also added to §B.8.4.2's SESSION_ACCEPT line); the transport line reads "TLS 1.3 raw
+  public keys, both SPKIs pinned" (nat.md §5, quic.md §5, §12.14). D6 cross-references it.
+- §B.4 — 12-byte header (`stream_id` added), whole datagram ≤ live `max_datagram_size()` (1162 B @1200,
+  1414 B @1452), RaptorQ symbol 1144/1392 B; Opus `LowDelay`, in-band FEC off, previous-frame
+  redundancy + PLC (media-proto.md §2, §5.6, §7.3; SUMMARY.md §2.9 resolving codecs.md §5.3 vs media-proto.md §5.2). D12 now says "12-byte header".
+- §B.5 — `pw` backend = one RemoteDesktop session, persistence/restore token only on
+  `SelectDevicesOptions` (wayland.md §2.4–§2.5); `openh264` is the always-on software codec, libx264
+  only opportunistically via FFmpeg, no rav1e/svt-av1/dav1d in v1 (codecs.md §3, §4); client software
+  decode stated. §B.1 tree comment updated to match.
+- §B.6 — session transport = TLS raw public keys (RFC 7250): 44-byte Ed25519 SPKI pinned by custom
+  mutual verifiers, X.509/`rcgen` documented-not-compiled (quic.md §3.3). D5 cross-references it.
+- D9 — `opus` crate `=0.4.0` (bundled libopus 1.6.1), `audiopus` rejected (codecs.md §5).
+- D10 — app shell Iced 0.14 per `docs/UI_PLAN.md` (pins pending at the first UI milestone); stream
+  surface = manual winit loop, no `eframe`; egui-everywhere fallback kept (ui.md §4). §B.1 box/tree,
+  the `apps/tornect` comment, the `ui-engineer` row of the §D.3 table and the framework lines of
+  `.claude/agents/ui-engineer.md` updated to match (the charter's full rewrite is `u1` work).
+- D13 — `keyring-core` + per-OS stores, never `keyring::Entry`; file keystore fallback kept (ui.md §5.9).
+- Part C M2 — `stun` crate (webrtc-rs, sans-IO; not `stun-client`), `crab_nat`, punch per §B.2,
+  raw-public-key verifiers.
+- Part C M3 — VM-scoped acceptance (synthetic → `openh264` → wgpu at 1080p30/720p60) + `NEEDS-DEVICE(gpu)`
+  rows for 1080p60 / hw codec / CPU < 15 % and a `NEEDS-DEVICE(linux)` row for the PipeWire backend
+  (SUMMARY.md §0.3, §4 M3; codecs.md §3.2).
+
+**Review pass on r6** (2026-08-29, applied in place, no revision bump): §B.8.5.1/§B.8.5.3 — `credit`
+update rule, one definition of *load*, lifetime cap = `min(steps, 1)` with the anchor advanced by whole
+periods (no "set to now"), decay never clears `hard_locked`, `Clock` trait (`wall()`/`mono()`,
+`FakeClock` for U1–U7/F3), monotone `last_seen`/anchors/`flushed_at`, rollback checked at runtime,
+suspend accepted as conservative (B.8.7.5); T12/T2/U1–U7/B.8.16 aligned; §B.8.7.3 *Suspend*/*Resume*,
+§B.8.7.4 `IpcOp` annotations, `UnattendedSuspended{reason, by?}`, `SESSION_REJECT.cause` for
+`SUSPENDED`; `quic_spki` check in B.8.4.2/B.8.16; §B.4 citation → SUMMARY.md §2.9; §B.5 CI wording;
+§A.2 `DEP_FFMPEG_*`; Part C M3 gates (720p60 ≤ 35 ms, 1080p30 ≤ 50 ms + codec-excluded ≤ 9 ms, 6 ms stretch,
+PipeWire under `NEEDS-DEVICE(linux)`), M1/M4/M8 shell wording; D10 Iced caveat + process model; Part F.6,
+D.1/D.4 `u1`; §B.8.17 item 7 + Part E row; this paragraph and the §B.8 status row.
+
+Seen while applying r6 and settled by the review pass: quic.md §0/§9 argues for running the session
+protocol directly over the onion stream instead of tunnelling the same QUIC connection through Tor,
+which §B.2, §B.8.4.2, the §B.8.14 M2 row and Part C M2 currently require for the uniform `BIND` check —
+now §B.8.17 item 7 and a Part E row, decided at M2; Part C M4/M8 no longer say "minimal egui"/"full egui
+app" (shell per D10, `u1` per Part F.6). Also settled: §B.8.8's former "both tokens" wording (a separate
+ScreenCast restore token next to the RemoteDesktop one) is corrected to the single RemoteDesktop token of
+§B.5 — an unattended host always needs input, so it always holds exactly one; SUMMARY.md §4 M3.11 asks a
+different question (whether a capture-only ScreenCast token could be reused for the combined session at
+M5), which Part C M3 resolves by starting with the combined RemoteDesktop session.
+
+**Second review pass on r6** (2026-08-29, applied in place, no revision bump): `BIND` labels are Tornect
+roles (§B.8.4.3, §B.6, §B.8.14 M2, Part C M2); §B.2 checklist ≈ 20 pairs / ≤ 8 in flight; §B.5 "only
+real-time video codec"; §A.2 `ffmpeg_8_0` check-cfg + direct `ffmpeg-sys-next` dependency, iroh claim
+re-sourced; D13 store order + `keychain` feature; `quic_spki: bytes[44]`; M2 gateway discovery; the
+Tor-tunnel pointer to §B.8.17 item 7 at §B.2/§B.8.4.2/§B.8.14; §B.8.5.1/5.3 — clamped `:= now` writes vs
+unclamped whole-period advances, `pending` settled before decay at load, the lifetime cap load-time only,
+the `credit` invariant as ≤, one definition of *load* vs the readiness re-run, offline *Unlock*, `last_seen`
+raised to the anchors, rollback ⇒ `NOT_YET_ACTIVE{last_seen − now}` (B.8.4.2/4.5/4.6, B.8.10); suspension
+precedence (B.8.6.3, B.8.4.1, B.8.6.2, B.8.7.3/7.4, A15); B.8.8 single restore token + M6 columns; M3
+codec-excluded gate ≤ 9 ms (6 ms stretch); `u2`…`u5` placement (F.6, D.4, Part C M4/M6/M7/M8, Part G);
+UI-plan reconciliation items (S8 trust level, Wayland tray, S4 pairing click, "never on timeout", [Retry
+direct], `tornect-ui-kit`, `apps/tornect/src/platform/`); T12 keychain-on-sleep; B.8.2.1 "two weeks".
