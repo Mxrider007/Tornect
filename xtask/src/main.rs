@@ -1,6 +1,7 @@
 //! `cargo xtask <command>` — repository automation (`docs/PLAN.md` §D.5).
 //!
-//! * `verify`      — fmt check, clippy `-D warnings` on all targets, tests, doc tests
+//! * `verify`      — plan sync, forbidden-dependency check, fmt check, clippy
+//!   `-D warnings` on all targets, tests, docs
 //! * `lint-all`    — fmt check + clippy only
 //! * `dist`        — release build into `dist/` (packaging grows in M8)
 //! * `ffmpeg-fetch`— placeholder until the FFmpeg backend lands (M3)
@@ -99,9 +100,48 @@ fn plan_sync(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Crates that must never enter the dependency graph: a second rustls crypto
+/// provider (`ring` is the only one, decision M1-3 and docs/research/quic.md
+/// §1.3 — with two compiled in rustls refuses to pick one, and a dependency
+/// installing its own would silently replace ours) and OpenSSL (the build must
+/// need only a C compiler, docs/research/arti.md §4).
+const FORBIDDEN_DEPS: [&str; 3] = ["aws-lc-rs", "aws-lc-sys", "openssl-sys"];
+
+/// `cargo tree --workspace -i <crate>` exits non-zero with "did not match any
+/// packages" exactly when the crate is absent from the resolved graph.
+fn forbidden_deps(root: &Path) -> anyhow::Result<()> {
+    println!(
+        "==> forbidden dependencies absent ({})",
+        FORBIDDEN_DEPS.join(", ")
+    );
+    for dep in FORBIDDEN_DEPS {
+        let output = cargo()
+            .args(["tree", "--workspace", "-i", dep])
+            .current_dir(root)
+            .output()
+            .with_context(|| format!("spawning `cargo tree -i {dep}`"))?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() {
+            bail!(
+                "`{dep}` is in the dependency graph:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        if !stderr.contains("did not match any packages") {
+            bail!(
+                "`cargo tree -i {dep}` failed with {}:\n{stderr}",
+                output.status
+            );
+        }
+    }
+    println!("    ok");
+    Ok(())
+}
+
 fn verify(root: &Path, extra: &[String]) -> anyhow::Result<()> {
     let no_tests = extra.iter().any(|a| a == "--no-tests");
     plan_sync(root)?;
+    forbidden_deps(root)?;
     lint_all(root)?;
     if !no_tests {
         let mut test = cargo();

@@ -8,8 +8,40 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = ["tor-pow"]
+# Proof-of-work introduction defense (docs/PLAN.md §B.3). Pure Rust (equix/hashx),
+# marked experimental at the arti-client level, hence pinned to =0.45.0
+# (docs/research/arti.md §10). Both roles need it: a client without it cannot
+# solve a busy host's puzzles.
+tor-pow = ["arti-client/hs-pow-full", "tor-hsservice/hs-pow-full"]
+
 [dependencies]
 tornect-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+futures.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+
+# The only place in the workspace that may import Arti (CLAUDE.md).
+arti-client.workspace = true
+tor-hsservice.workspace = true
+tor-hscrypto.workspace = true
+tor-cell.workspace = true
+tor-proto.workspace = true
+tor-persist.workspace = true
+tor-llcrypto.workspace = true
+tor-keymgr.workspace = true
+tor-rtcompat.workspace = true
+safelog.workspace = true
+rustls.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+anyhow.workspace = true
 
 [lints]
 workspace = true

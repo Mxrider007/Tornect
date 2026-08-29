@@ -4,6 +4,12 @@
 //! its own `0600` file inside a `0700` directory (`docs/PLAN.md` §A.3 D13). An OS
 //! keychain backend (via the `keyring` crate) is planned behind a feature flag and
 //! will implement the same trait.
+//!
+//! This store is not the only copy of the host seed: publishing the onion service
+//! installs the expanded key into Arti's own keystore under the Tornect state
+//! directory (`tornect-signal`, decision M1-1), so "Rotate ID" must remove that
+//! copy too — `tornect_signal::forget_identity`, which `tornect rotate-id` calls
+//! before [`rotate_host_identity`].
 
 use std::path::{Path, PathBuf};
 
@@ -167,7 +173,8 @@ pub fn load_or_create_device_identity(store: &dyn SecretStore) -> Result<(Device
 /// Replace the host identity with a fresh one ("Rotate ID", `docs/PLAN.md` §B.6).
 ///
 /// Callers must also drop all pairings and unattended grants — they are bound to
-/// the old ID by design.
+/// the old ID by design — and remove Arti's copy of the old key first
+/// (`tornect_signal::forget_identity`; see the module docs).
 pub fn rotate_host_identity(store: &dyn SecretStore) -> Result<HostIdentity> {
     let host = HostIdentity::generate()?;
     store.put(HOST_IDENTITY_SEED, host.seed().as_slice())?;

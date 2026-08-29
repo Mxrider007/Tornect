@@ -1,0 +1,28 @@
+[package]
+name = "tornect-fuzz"
+version = "0.0.0"
+description = "cargo-fuzz targets for Tornect's wire parsers (docs/PLAN.md §D.5)"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+# `tor-pow` (equix/hashx JIT) is irrelevant to the parsers and slow to build.
+tornect-signal = { path = "../crates/tornect-signal", default-features = false }
+tokio = { version = "1.53.1", features = ["rt", "io-util"] }
+
+# Length-prefixed frames (`tornect_signal::framing::read_frame`), the first
+# wire-parsed input of the signaling crate. The CBOR envelope target extends it.
+[[bin]]
+name = "framing"
+path = "fuzz_targets/framing.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
