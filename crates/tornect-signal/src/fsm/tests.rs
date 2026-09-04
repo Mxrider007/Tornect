@@ -279,6 +279,125 @@ async fn pair_request_with_an_unopened_sas_commitment_is_refused() {
     );
 }
 
+/// §B.8 end-to-end: a real `connect(Intent::Unattended)` against a real host
+/// running the real `UnattendedAuth` hook — no stubbed exchange anywhere. This
+/// is the M1 acceptance shape of B.8.14 ("headless unattended handshake ending
+/// in SESSION_ACCEPT"), minus the Tor transport.
+#[tokio::test]
+async fn unattended_session_end_to_end_over_a_duplex_pipe() {
+    use std::sync::Arc as StdArc;
+
+    use tornect_core::keystore::FileSecretStore;
+    use tornect_core::paths::Paths;
+    use tornect_core::session_log::{Actor, SessionLog};
+    use tornect_core::unattended::clock::SystemClock;
+    use tornect_core::unattended::grant::Preset;
+    use tornect_core::unattended::guard::{
+        AllowAllPaired, AllowAllReAuth, MutationGuard, NoSessionActivity,
+    };
+    use tornect_core::unattended::ipc::GrantOptions;
+    use tornect_core::unattended::limiter::{AttemptLimiter, HostTransport};
+    use tornect_core::unattended::schedule::FixedOffset;
+    use tornect_core::unattended::store::GrantStore;
+
+    use crate::auth;
+    use crate::fsm::client::UnattendedIntent;
+    use crate::unattended::{OpaqueServerSetupSource, UnattendedAuth};
+
+    const PW: &str = "quiet verdant otter lantern zephyr";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let host = host_side(tmp.path(), HOST_SEED);
+    let client = client_side(tmp.path(), host.identity.id(), CLIENT_SEED);
+    let device = client.identity.id();
+    let host_onion_pk = *host.identity.id().public_key_bytes();
+
+    // Already paired both ways (a grant exists only for a SAS-paired device,
+    // §B.8 hard rule 2); the pairing exchange itself is covered elsewhere.
+    host.trusted.pin(device, "Laptop of Ana").unwrap();
+    client
+        .known
+        .pin(host.identity.id(), "Desk of Bob", host_device_pk())
+        .unwrap();
+
+    // A host-side store with one grant for this device.
+    let paths = Paths::from_home(tmp.path().join("host-home"));
+    std::fs::create_dir_all(paths.keys_dir()).unwrap();
+    let secrets = StdArc::new(FileSecretStore::open(paths.keys_dir()).unwrap());
+    let store = GrantStore::open(
+        &paths,
+        secrets,
+        StdArc::new(SystemClock::default()),
+        SessionLog::new(paths.sessions_log()),
+    )
+    .unwrap();
+    let guard = MutationGuard::new(
+        store,
+        StdArc::new(AllowAllReAuth::default()),
+        StdArc::new(NoSessionActivity),
+    )
+    .with_paired_devices(StdArc::new(AllowAllPaired))
+    .with_server_setup_source(StdArc::new(OpaqueServerSetupSource));
+    guard.master_on(Actor::Cli, &host_onion_pk).unwrap();
+    guard
+        .create_grant(
+            Actor::Cli,
+            &device,
+            Preset::HeadlessBox,
+            &GrantOptions::default(),
+            &[0u8; 192],
+        )
+        .unwrap();
+    let setup_bytes = guard.store().server_setup().unwrap();
+    let setup = auth::parse_server_setup(&setup_bytes).unwrap();
+    let record = auth::register_locally(
+        &setup,
+        PW,
+        device.public_key_bytes(),
+        auth::identifiers(device.public_key_bytes(), &host_onion_pk),
+    )
+    .unwrap();
+    guard.set_password(Actor::Cli, &device, &record).unwrap();
+
+    let mut host = host;
+    host.deps.unattended = Arc::new(UnattendedAuth::new(
+        AttemptLimiter::new(guard.store().clone()),
+        Arc::new(FixedOffset::utc()),
+        HostTransport::default(),
+    ));
+
+    let (a, b) = pipe();
+    let host_task = spawn_host(a, &host);
+    let outcome = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        Intent::Unattended(UnattendedIntent {
+            password: zeroize::Zeroizing::new(PW.to_owned()),
+            want_mode: messages::mode::CONTROL,
+        }),
+    )
+    .await
+    .expect("unattended connect");
+
+    let session = match outcome {
+        ClientOutcome::Session(s) => s,
+        other => panic!("expected a session, got {other:?}"),
+    };
+
+    // The host reached Established with the *same* derived token, and no popup
+    // ran on either side (that is the whole point of an unattended session).
+    drop(session);
+    match host_task.await.unwrap() {
+        Ok(HostOutcome::Session { token, .. }) => {
+            assert_eq!(token.session_id().len(), 16, "a derived token was minted");
+        }
+        other => panic!("host outcome: {other:?}"),
+    }
+    assert_eq!(host.consent.sas_shown().len(), 0, "no pairing popup ran");
+}
+
 /// Run the host in a task; returns its outcome once the stream ends.
 fn spawn_host(
     stream: DuplexStream,
