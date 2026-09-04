@@ -327,10 +327,22 @@ side sends first on `ctrl`, keyed by the QUIC TLS exporter over `session_token`,
 and ADMIN_RESULT carry ed25519 signatures over the transcript hash (envelope-level,
 §B.8.4.3) so device keys are bound to the channel (defense-in-depth on top of Tor's
 own crypto; and it is what makes the SAS code sound: `SAS = u32::from_be_bytes(HKDF-SHA256(ikm =
-th_after(PAIR_REQUEST), salt = "tornect/v1/sas", info = "sas-v1")[0..4]) % 1_000_000`, rendered as two
-zero-padded three-digit groups — `481 923` — and computable by both sides as soon as `PAIR_REQUEST`
-is sent / received, because `th_after(PAIR_REQUEST)` already commits to the dialed onion pk, the client
-device pk, both nonces and both signatures; decision M1-8). `AUTH_CHALLENGE` and
+th_after(HELLO_ACK) || sas_nonce, salt = "tornect/v1/sas", info = "sas-v1")[0..4]) % 1_000_000`, rendered
+as two zero-padded three-digit groups — `481 923` — and computable by both sides as soon as
+`PAIR_REQUEST` is sent / received, because `th_after(HELLO_ACK)` already commits to the dialed onion pk,
+the client device pk, both nonces and both signatures; decision M1-8, revised r7. **The SAS input is
+commit-then-reveal and carries no attacker-chosen bytes.** `HELLO` (signed) publishes
+`sas_commit = SHA-256("tornect/v1/sas-commit\0" || sas_nonce)`; `PAIR_REQUEST` reveals `sas_nonce`;
+the host recomputes the commitment and closes with `E_BAD_LEN` on a mismatch, before any pairing popup.
+Both properties are load-bearing and neither is sufficient alone. Deriving from `th_after(PAIR_REQUEST)`
+instead — the r6 construction — is **broken**: a proxying MITM grinds `host_nonce` toward the client and
+the unsigned `PAIR_REQUEST` (whose `client_auth_pk` the host discards, and whose unknown CBOR keys the
+decoder ignores) toward the host, so ~2^10 candidates per side meet on the 20-bit code by the birthday
+bound and both screens show the same digits in wall-clock milliseconds — well inside the 20 s
+`HELLO_ACK` timeout. Committing the nonce removes the client-side grind, because the MITM must fix its
+`host_nonce` before it learns `sas_nonce`; keeping the SAS input free of `PAIR_REQUEST` bytes removes
+the host-side grind. Signing `PAIR_REQUEST` would **not** be sufficient on its own — the MITM holds its
+own device key and re-signs each candidate). `AUTH_CHALLENGE` and
 `AUTH_RESPONSE` exist only between `SESSION_REQUEST{unattended}` and
 `SESSION_ACCEPT`/`SESSION_REJECT` — as does `ADMIN_RESULT`, which terminates an
 admin-intent exchange in place of `SESSION_ACCEPT`/`SESSION_REJECT` — inside the strictly
@@ -631,7 +643,7 @@ Bodies are CBOR maps; receivers ignore unknown keys; missing optional keys take 
 defaults. `Kind` gains `HELLO_ACK | AUTH_CHALLENGE | AUTH_RESPONSE | ADMIN_RESULT`.
 
 ```
-HELLO            (client, signed)  += { v_max: u8, client_nonce: bytes[32], feats: [tstr] /* "ua1" | "ua2": the PAKE suites this build supports (a build-time constant, B.8.4.2) */, stop_token: Option<bytes[32]> /* SHA-256("tornect/v1/stop\0" || dialed_host_onion_pk || stop_code), never the code (B.8.7.4) */ }
+HELLO            (client, signed)  += { v_max: u8, client_nonce: bytes[32], sas_commit: bytes[32] /* SHA-256("tornect/v1/sas-commit\0" || sas_nonce); the nonce itself is withheld until PAIR_REQUEST (§B.3) */, feats: [tstr] /* "ua1" | "ua2": the PAKE suites this build supports (a build-time constant, B.8.4.2) */, stop_token: Option<bytes[32]> /* SHA-256("tornect/v1/stop\0" || dialed_host_onion_pk || stop_code), never the code (B.8.7.4) */ }
 HELLO_ACK        (host, signed)     { v: u8 /* chosen */, host_nonce: bytes[32], feats: [tstr] /* host-wide, independent of the peer (T5); no host_name — unauthenticated fingerprinting surface before F1; the client shows the paired label instead */ }
 PAIR_ACCEPT      (host)            += { host_name: tstr }   /* unpaired peers learn the name here, after consent, never before */
 SESSION_REQUEST  (client, signed)  += { unattended: Option<{ suite: u8 /* 1 = OPAQUE-3DH-r255-SHA512-Argon2id(64MiB,3,1) · 2 = SPAKE2 fallback (B.8.4.7) */,
@@ -684,7 +696,7 @@ which needs a local *Resume* with re-auth (B.8.6.3). `suspend(pk)` moves an `Act
 ```
 Client                                                             Host
 prompt password (or keychain) → ClientLogin::start(pw) → ke1
-HELLO{v_max, client_nonce, device_pk, name, feats, sig} ────────►  verify sig vs HELLO's own pk (proof of possession) and, if pinned, pk == pinned key;
+HELLO{v_max, client_nonce, sas_commit, device_pk, name, feats, sig} ─►  verify sig vs HELLO's own pk (proof of possession) and, if pinned, pk == pinned key;
                                                                     bad sig ⇒ E_BAD_SIG for pinned and unpinned alike; unpaired ⇒ §B.2 PAIR path, unchanged
 ◄──────────────────────────── HELLO_ACK{v, host_nonce, feats, sig}  (signed with the onion identity key; client verifies vs dialed address)
 SESSION_REQUEST{caps, unattended:{suite, ke1, want_mode, intent}, sig} ►  verify sig over th (fresh: covers host_nonce) — F1

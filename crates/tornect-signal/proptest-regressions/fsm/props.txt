@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 9d3087acb42b5711d6b3ce278fed5525167c14670de60f8515763aaba5fe101b # shrinks to which = 1, index = Index(658812288346769701), flip = 20
+cc c1e59626a987db3ba7cbac25d1de4d9cc31da4b366c0d10d0514ddeb514ddef7 # shrinks to paired = false, at = 2, delta = -1
+cc 1241e3758d15a0d48298e4e14b08c3e081f58eebb2c40e6e76879a766d3a753c # shrinks to paired = false, ping_at = 2, nonce = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 28, 75, 232, 226, 54, 190, 11, 250, 11, 195, 255, 253, 19, 255, 11, 32, 29, 119, 114, 19], name = "f  vw b se c    f "
