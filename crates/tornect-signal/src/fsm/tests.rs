@@ -126,6 +126,17 @@ struct RawClient {
     identity: DeviceIdentity,
 }
 
+/// SAS nonce the raw test client commits to in `HELLO` and reveals in `PAIR_REQUEST`.
+const RAW_SAS_NONCE: [u8; 32] = [0x44; 32];
+
+/// A `PAIR_REQUEST` opening the commitment the raw client published.
+fn raw_pair_request() -> PairRequest {
+    PairRequest {
+        sas_nonce: RAW_SAS_NONCE,
+        ..PairRequest::default()
+    }
+}
+
 impl RawClient {
     fn new(stream: DuplexStream, host: &HostIdentity, seed: [u8; 32]) -> Self {
         Self {
@@ -138,6 +149,7 @@ impl RawClient {
         Hello {
             v_max: 1,
             client_nonce: [0x33; 32],
+            sas_commit: crate::pairing::sas_commit(&RAW_SAS_NONCE),
             device_pk: HostSigner::public_key(&self.identity),
             name: "raw".into(),
             feats: vec![],
@@ -179,6 +191,92 @@ impl RawClient {
             .await
             .unwrap()
     }
+}
+
+/// §B.3: the SAS is derived from `th_after(HELLO_ACK)` and the committed nonce, never
+/// from `th_after(PAIR_REQUEST)`. `PAIR_REQUEST` is unsigned, its `client_auth_pk` is
+/// discarded by the host and `decode_body` ignores unknown keys, so anything derived
+/// from its bytes is grindable: a proxying MITM meets a 20-bit code in ~2^10 tries per
+/// side and shows both users the same digits. Filler must not move the code.
+#[tokio::test]
+async fn pair_request_filler_cannot_move_the_sas() {
+    async fn sas_with(filler: Option<[u8; 32]>) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut host = host_side(tmp.path(), HOST_SEED);
+        // Script host_nonce so th_after(HELLO_ACK) — the other SAS input — is identical
+        // across runs and `client_auth_pk` is the only thing that varies.
+        host.deps.random = Arc::new(ScriptedRandom::new(vec![vec![0x44]]));
+        host.consent
+            .push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+        let (a, b) = pipe();
+        let host_task = spawn_host(a, &host);
+        let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+        raw.hello_ack().await;
+        raw.chan
+            .send(
+                &PairRequest {
+                    client_auth_pk: filler,
+                    sas_nonce: RAW_SAS_NONCE,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let accept = raw.recv().await.unwrap();
+        assert_eq!(accept.env.kind, Kind::PairAccept);
+        drop(raw);
+        let _ = host_task.await;
+        let shown = host.consent.sas_shown();
+        assert_eq!(shown.len(), 1);
+        shown[0].clone()
+    }
+
+    let plain = sas_with(None).await;
+    // 32 bytes of attacker-chosen material the host parses and throws away.
+    let filled = sas_with(Some([0xAB; 32])).await;
+    let other = sas_with(Some([0xCD; 32])).await;
+    assert_eq!(plain, filled, "client_auth_pk moved the SAS");
+    assert_eq!(plain, other, "client_auth_pk moved the SAS");
+}
+
+/// §B.3: the revealed `sas_nonce` must open `HELLO.sas_commit`. Without this the peer
+/// could pick its SAS contribution after seeing ours, which is what makes the code
+/// grindable; the host must close instead of showing a popup.
+#[tokio::test]
+async fn pair_request_with_an_unopened_sas_commitment_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = host_side(tmp.path(), HOST_SEED);
+    host.consent
+        .push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+    let (a, b) = pipe();
+    let host_task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    raw.chan
+        .send(
+            &PairRequest {
+                client_auth_pk: None,
+                // Not the nonce committed to in HELLO.
+                sas_nonce: [0x01; 32],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let rx = raw.recv().await.unwrap();
+    assert_eq!(
+        rx.env.kind,
+        Kind::Error,
+        "expected ERROR, got {:?}",
+        rx.env.kind
+    );
+    drop(raw);
+    let _ = host_task.await;
+    assert_eq!(
+        host.consent.sas_shown().len(),
+        0,
+        "no pairing popup may run on an unopened commitment"
+    );
 }
 
 /// Run the host in a task; returns its outcome once the stream ends.
@@ -556,7 +654,7 @@ async fn unpaired_peer_takes_the_pair_path_regardless_of_stop_token() {
             ack.env.kind,
             ack.env.body.clone(),
         ));
-        raw.chan.send(&PairRequest::default(), None).await.unwrap();
+        raw.chan.send(&raw_pair_request(), None).await.unwrap();
         let rej = raw.recv().await.unwrap();
         frames.push((
             rej.env.v,
@@ -751,6 +849,7 @@ async fn protocol_violations_get_the_documented_codes() {
         feats: vec![],
         stop_token: None,
         pairing_state: 0,
+        sas_commit: crate::pairing::sas_commit(&RAW_SAS_NONCE),
     };
     let signed = |v: u8, msg_id: u64, kind: Kind, body: Vec<u8>| {
         let mut env = Envelope::new(v, msg_id, kind, body);
@@ -891,12 +990,7 @@ async fn protocol_violations_get_the_documented_codes() {
         raw.send_hello(None).await;
         let _ack = raw.recv().await.unwrap();
         let mut stream = raw.chan.into_stream();
-        let env = Envelope::new(
-            1,
-            5,
-            Kind::PairRequest,
-            encode_body(&PairRequest::default()),
-        );
+        let env = Envelope::new(1, 5, Kind::PairRequest, encode_body(&raw_pair_request()));
         write_frame(&mut stream, &env.encode()).await.unwrap();
         let err = task.await.unwrap().unwrap_err();
         assert_eq!(err.violation_code(), Some(codes::E_BAD_MSG_ID), "{err}");
@@ -909,12 +1003,7 @@ async fn protocol_violations_get_the_documented_codes() {
         raw.send_hello(None).await;
         let _ack = raw.recv().await.unwrap();
         let mut stream = raw.chan.into_stream();
-        let env = Envelope::new(
-            2,
-            2,
-            Kind::PairRequest,
-            encode_body(&PairRequest::default()),
-        );
+        let env = Envelope::new(2, 2, Kind::PairRequest, encode_body(&raw_pair_request()));
         write_frame(&mut stream, &env.encode()).await.unwrap();
         let err = task.await.unwrap().unwrap_err();
         assert_eq!(err.violation_code(), Some(codes::E_VERSION), "{err}");
@@ -2083,7 +2172,7 @@ async fn busy_rejects_are_charged_by_the_pairing_limiter() {
         let ack = raw.recv().await.unwrap();
         raw.chan.absorb(&ack);
         raw.chan.set_version(1);
-        raw.chan.send(&PairRequest::default(), None).await.unwrap();
+        raw.chan.send(&raw_pair_request(), None).await.unwrap();
         let rej = raw.recv().await.unwrap();
         assert_eq!(rej.env.kind, Kind::PairReject);
         let body: messages::PairReject = decode_body(&rej.env.body).unwrap();
@@ -2213,7 +2302,7 @@ async fn session_end_is_logged_whichever_way_the_established_phase_ends() {
         raw.chan.absorb(&accept);
         let outcome = match way {
             Way::IllegalKind => {
-                raw.chan.send(&PairRequest::default(), None).await.unwrap();
+                raw.chan.send(&raw_pair_request(), None).await.unwrap();
                 task.await.unwrap()
             }
             Way::BadMsgId => {

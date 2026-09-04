@@ -420,9 +420,15 @@ where
     // HELLO.
     let mut client_nonce = [0u8; 32];
     deps.random.fill(&mut client_nonce)?;
+    // The SAS nonce is committed to in HELLO and revealed in PAIR_REQUEST (§B.3),
+    // so a proxying MITM must fix its own host_nonce before it can learn the value
+    // the code depends on.
+    let mut sas_nonce = [0u8; 32];
+    deps.random.fill(&mut sas_nonce)?;
     let hello = Hello {
         v_max: cfg.v_max.max(tornect_core::PROTOCOL_VERSION),
         client_nonce,
+        sas_commit: crate::pairing::sas_commit(&sas_nonce),
         device_pk: HostSigner::public_key(identity),
         name: normalize_label(&cfg.name),
         feats: clamp_feats(&cfg.feats),
@@ -448,6 +454,8 @@ where
     }
     chan.absorb(&rx);
     chan.set_version(ack.v);
+    // th_after(HELLO_ACK): the SAS input, taken before PAIR_REQUEST is absorbed.
+    let th_hello_ack = chan.th();
 
     // PAIR path. A host that already trusts this device expects
     // `SESSION_REQUEST` next (§B.2, §B.8.4.5), so pairing is attempted only
@@ -456,7 +464,8 @@ where
     let mut paired_now = false;
     let (host_label, host_device_pk) = match known {
         None => {
-            let (name, host_device_pk) = pair(&mut chan, cfg, deps).await?;
+            let (name, host_device_pk) =
+                pair(&mut chan, cfg, deps, &th_hello_ack, &sas_nonce).await?;
             paired_now = true;
             if intent == Intent::PairOnly {
                 chan.bye(messages::bye::USER).await?;
@@ -542,12 +551,21 @@ async fn pair<S>(
     chan: &mut Channel<S>,
     cfg: &ClientConfig,
     deps: &ClientDeps,
+    th_hello_ack: &[u8; 32],
+    sas_nonce: &[u8; 32],
 ) -> Result<(String, [u8; 32]), HandshakeError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    chan.send(&PairRequest::default(), None).await?;
-    let sas = Sas::derive(&chan.th()).render();
+    chan.send(
+        &PairRequest {
+            sas_nonce: *sas_nonce,
+            ..PairRequest::default()
+        },
+        None,
+    )
+    .await?;
+    let sas = Sas::derive(th_hello_ack, sas_nonce).render();
     deps.ui.show_sas(&cfg.host, &sas).await;
     let rx = chan
         .recv_expect(

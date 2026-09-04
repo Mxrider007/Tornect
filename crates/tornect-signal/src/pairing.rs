@@ -40,16 +40,39 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub const SAS_SALT: &[u8] = b"tornect/v1/sas";
 /// HKDF info of the SAS derivation.
 pub const SAS_INFO: &[u8] = b"sas-v1";
+/// Domain separator of the `HELLO.sas_commit` commitment (§B.3).
+pub const SAS_COMMIT_DOMAIN: &[u8] = b"tornect/v1/sas-commit\0";
+
+/// The commitment a client publishes in `HELLO` for the SAS nonce it reveals in
+/// `PAIR_REQUEST` (§B.3).
+#[must_use]
+pub fn sas_commit(sas_nonce: &[u8; 32]) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut h = Sha256::new();
+    h.update(SAS_COMMIT_DOMAIN);
+    h.update(sas_nonce);
+    h.finalize().into()
+}
 
 /// A six-digit short authentication string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Sas(u32);
 
 impl Sas {
-    /// Derive the code from `th_after(PAIR_REQUEST)`.
+    /// Derive the code from `th_after(HELLO_ACK)` and the revealed SAS nonce (§B.3).
+    ///
+    /// Both inputs are fixed-length and neither is attacker-malleable at the moment
+    /// the peer must choose its own contribution: `th_after(HELLO_ACK)` covers only
+    /// signed frames, and `sas_nonce` is pinned by the `HELLO.sas_commit` commitment.
+    /// Deliberately **not** `th_after(PAIR_REQUEST)`: `PAIR_REQUEST` is unsigned, its
+    /// `client_auth_pk` is discarded by the host, and `decode_body` ignores unknown
+    /// map keys — together that is unlimited grinding material against a 20-bit code.
     #[must_use]
-    pub fn derive(th_after_pair_request: &[u8; 32]) -> Self {
-        let hk = Hkdf::<Sha256>::new(Some(SAS_SALT), th_after_pair_request);
+    pub fn derive(th_after_hello_ack: &[u8; 32], sas_nonce: &[u8; 32]) -> Self {
+        let mut ikm = [0u8; 64];
+        ikm[..32].copy_from_slice(th_after_hello_ack);
+        ikm[32..].copy_from_slice(sas_nonce);
+        let hk = Hkdf::<Sha256>::new(Some(SAS_SALT), &ikm);
         let mut okm = [0u8; 4];
         // 4 bytes ≤ 255 × 32, so `expand` cannot fail.
         let _ = hk.expand(SAS_INFO, &mut okm);
@@ -706,18 +729,23 @@ mod tests {
 
     #[test]
     fn sas_is_six_digits_zero_padded_and_deterministic() {
-        let a = Sas::derive(&[1u8; 32]);
-        let b = Sas::derive(&[1u8; 32]);
+        let a = Sas::derive(&[1u8; 32], &[9u8; 32]);
+        let b = Sas::derive(&[1u8; 32], &[9u8; 32]);
         assert_eq!(a, b);
         assert!(a.value() < 1_000_000);
         assert_eq!(a.render().len(), 7);
         assert_eq!(&a.render()[3..4], " ");
-        assert_ne!(a, Sas::derive(&[2u8; 32]));
+        assert_ne!(a, Sas::derive(&[2u8; 32], &[9u8; 32]));
+        // the revealed nonce is an independent input
+        assert_ne!(a, Sas::derive(&[1u8; 32], &[8u8; 32]));
         assert_eq!(Sas(7).render(), "000 007");
         assert_eq!(Sas(481_923).render(), "481 923");
         assert_eq!(Sas(999_999).to_string(), "999 999");
-        // Manual derivation.
-        let hk = Hkdf::<Sha256>::new(Some(b"tornect/v1/sas"), &[1u8; 32]);
+        // Manual derivation over the two-part ikm of §B.3.
+        let mut ikm = [0u8; 64];
+        ikm[..32].copy_from_slice(&[1u8; 32]);
+        ikm[32..].copy_from_slice(&[9u8; 32]);
+        let hk = Hkdf::<Sha256>::new(Some(b"tornect/v1/sas"), &ikm);
         let mut okm = [0u8; 4];
         hk.expand(b"sas-v1", &mut okm).unwrap();
         assert_eq!(a.value(), u32::from_be_bytes(okm) % 1_000_000);

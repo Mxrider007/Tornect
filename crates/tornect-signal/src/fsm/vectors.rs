@@ -24,6 +24,8 @@ pub const CLIENT_SEED: [u8; 32] = [0x22; 32];
 pub const HOST_DEVICE_SEED: [u8; 32] = [0xB0; 32];
 /// `HELLO.client_nonce`, and (its first 8 bytes) the client's `PING` nonce.
 pub const CLIENT_NONCE: [u8; 32] = [0x33; 32];
+/// The client's scripted SAS nonce: committed in `HELLO`, revealed in `PAIR_REQUEST` (§B.3).
+pub const CLIENT_SAS_NONCE: [u8; 32] = [0x5a; 32];
 /// `HELLO_ACK.host_nonce`.
 pub const HOST_NONCE: [u8; 32] = [0x44; 32];
 /// The attended `session_token`.
@@ -98,8 +100,12 @@ pub fn host_random() -> Arc<ScriptedRandom> {
     ]))
 }
 
-/// The client's scripted randomness: `CLIENT_NONCE` for every fill.
+/// The client's scripted randomness: `CLIENT_NONCE` first (the `HELLO` nonce), then
+/// `CLIENT_SAS_NONCE` for every later fill (the SAS nonce of §B.3).
 #[must_use]
 pub fn client_random() -> Arc<ScriptedRandom> {
-    Arc::new(ScriptedRandom::new(vec![CLIENT_NONCE.to_vec()]))
+    Arc::new(ScriptedRandom::new(vec![
+        CLIENT_NONCE.to_vec(),
+        CLIENT_SAS_NONCE.to_vec(),
+    ]))
 }
