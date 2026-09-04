@@ -19,8 +19,8 @@ use tornect_core::trusted::TrustedDevices;
 use super::harness::{self, Role, Scenario};
 use super::host::{HostDeps, HostOutcome, serve_host};
 use super::vectors::{
-    self, CLIENT_NONCE, SESSION_TOKEN, client_config, client_identity, host_config, host_device_pk,
-    host_identity, host_random,
+    self, CLIENT_NONCE, CLIENT_SAS_NONCE, SESSION_TOKEN, client_config, client_identity,
+    host_config, host_device_pk, host_identity, host_random,
 };
 use super::*;
 use crate::envelope::Kind;
@@ -51,38 +51,23 @@ const EXPECTED_PAIRED: &[(&str, &str)] = &[
     ),
     (
         "frame_1_hello",
-        concat!(
-            "000000a8850101015860a6000101582033333333333333333333333333333333",
-            "33333333333333333333333333333333025820a09aa5f47a6759802ff955f8dc",
-            "2d2a14a5c99d23be97f864127ff9383455a4f0036d676f6c64656e2d636c6965",
-            "6e74048163756131060158408c042e6af9dec69da1574ad709fa6f80355c796b",
-            "fd54454ab0dada974ac968e4d36a8e98fc339d8ee4b5525bab3411c70b696fe9",
-            "1c83add63c30163952308407",
-        ),
+        "000000cb850101015883a700010158203333333333333333333333333333333333333333333333333333333333333333025820a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0036d676f6c64656e2d636c69656e740481637561310601075820296dd693a5985d2ea73a29506b6b3f658da4caccfa74604caf02547dceddf53258409a560771005f1bee0218f1d0d632f8ba396101d425f841b2a97c8559f30c11ab607971bc741b6fb739ba7e458a90aba9c64b21f45a1d7aec18e86118981b800d",
     ),
     (
         "digest_1",
-        "42cdaa1c8f0d516921d909220ae83fd0ce893aa130dd3836c94e65aceda82290",
+        "ad9b9ba0dbe8c54c9a74e3c3f9a17957ed03419af043c302e795f6a86dd28e90",
     ),
     (
         "sig_1",
-        concat!(
-            "8c042e6af9dec69da1574ad709fa6f80355c796bfd54454ab0dada974ac968e4",
-            "d36a8e98fc339d8ee4b5525bab3411c70b696fe91c83add63c30163952308407",
-        ),
+        "9a560771005f1bee0218f1d0d632f8ba396101d425f841b2a97c8559f30c11ab607971bc741b6fb739ba7e458a90aba9c64b21f45a1d7aec18e86118981b800d",
     ),
     (
         "th_1",
-        "12e5f2ef93eddf1fa66d21bfd57a7a5d7ab440393afa15c985f0a96638c98443",
+        "8caef2e1a45b6709a11e6b77e30f1e76181b523d18456f0e7f86079e737dc5cd",
     ),
     (
         "frame_2_hello_ack",
-        concat!(
-            "0000007485010102582ca3000101582044444444444444444444444444444444",
-            "4444444444444444444444444444444402816375613158409a2a86ae7b26c080",
-            "d2e1ed51c5b29bb29947423548503fba15cb25e261fa792da5df9b8d10d19993",
-            "a3d5c6f2a7055bb836101a40f7acca5c67bf590298143108",
-        ),
+        "0000007485010102582ca30001015820444444444444444444444444444444444444444444444444444444444444444402816375613158403f7334b1e851f3782f9567761a590fb72de251ff49100e5006d4797b5e27b930b34d7ccb68b3ed876ebd566c88dc1e5343f91b22e08311dd2a7ab1b537348300",
     ),
     (
         "digest_2",
@@ -90,23 +75,15 @@ const EXPECTED_PAIRED: &[(&str, &str)] = &[
     ),
     (
         "sig_2",
-        concat!(
-            "9a2a86ae7b26c080d2e1ed51c5b29bb29947423548503fba15cb25e261fa792d",
-            "a5df9b8d10d19993a3d5c6f2a7055bb836101a40f7acca5c67bf590298143108",
-        ),
+        "3f7334b1e851f3782f9567761a590fb72de251ff49100e5006d4797b5e27b930b34d7ccb68b3ed876ebd566c88dc1e5343f91b22e08311dd2a7ab1b537348300",
     ),
     (
         "th_2",
-        "da523df7c6b7a4dda138c3ac970db657faaa5c721c46acca6cd8f89f095a0a1a",
+        "7220217c64f3ab99ecb74bd0b4b71c0fab91af0a48728595c15cca04e533bb5b",
     ),
     (
         "frame_3_session_request",
-        concat!(
-            "0000005d8501020656a100a400816468323634018219078019043802f4030158",
-            "40d364bf0d9390181088f3118379c2f10f45a4eae1d718792fa32d58decbb24c",
-            "d4d624c5dea3283b343d06c2d55718c9af5dc4968ab20d41afac42398f59ae1f",
-            "01",
-        ),
+        "0000005d8501020656a100a400816468323634018219078019043802f403015840942dc211f5c87a941a3858e11fee803327a871a9feddaf412770f99b7f53642b31617fa524dd46a56406e4a96c741136dd85527cac873297da66f1c360607806",
     ),
     (
         "digest_3",
@@ -114,25 +91,15 @@ const EXPECTED_PAIRED: &[(&str, &str)] = &[
     ),
     (
         "sig_3",
-        concat!(
-            "d364bf0d9390181088f3118379c2f10f45a4eae1d718792fa32d58decbb24cd4",
-            "d624c5dea3283b343d06c2d55718c9af5dc4968ab20d41afac42398f59ae1f01",
-        ),
+        "942dc211f5c87a941a3858e11fee803327a871a9feddaf412770f99b7f53642b31617fa524dd46a56406e4a96c741136dd85527cac873297da66f1c360607806",
     ),
     (
         "th_3",
-        "061d9ee332db832e7c3cd44061ff8ccd32dc4fe32aecb9db9c9a918fe89ea4f5",
+        "25be6b10f9d169246d4ca80492836e7e9312b8d8bc05d44f7d67bb38ab70ae1c",
     ),
     (
         "frame_4_session_accept",
-        concat!(
-            "000000ba850102075872a800a400816468323634018219078019043802f40301",
-            "01582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9",
-            "ab54bff00de3433af7d687d9e71ad50200030004000558205555555555555555",
-            "555555555555555555555555555555555555555555555555070008f45840b014",
-            "e4385e8e1d29f061df4534b376fe387bfd21a4abc3a76b4431c74c2b397944f6",
-            "a50c88776119257381646ea3c21e6c8972139a2d75f2a27d737ee05b710e",
-        ),
+        "000000ba850102075872a800a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50200030004000558205555555555555555555555555555555555555555555555555555555555555555070008f45840397ca281efacd130ce458ed6aa24dd882ffcc938ed6362ba6a4118da04a0e7e6f6fd6eb15a2f01b55ce94cdc58d93fd364ba640e40edfbeb21717392548e6807",
     ),
     (
         "digest_4",
@@ -140,14 +107,11 @@ const EXPECTED_PAIRED: &[(&str, &str)] = &[
     ),
     (
         "sig_4",
-        concat!(
-            "b014e4385e8e1d29f061df4534b376fe387bfd21a4abc3a76b4431c74c2b3979",
-            "44f6a50c88776119257381646ea3c21e6c8972139a2d75f2a27d737ee05b710e",
-        ),
+        "397ca281efacd130ce458ed6aa24dd882ffcc938ed6362ba6a4118da04a0e7e6f6fd6eb15a2f01b55ce94cdc58d93fd364ba640e40edfbeb21717392548e6807",
     ),
     (
         "th_4",
-        "cdf97099e56630861eb9ad965457f52a55f3347146036f7065c5eb1582bcf198",
+        "c83e71f2449432f86fb11be72ced679d40e664a4c7ba0694f0eb7a43f2ab939e",
     ),
 ];
 
@@ -171,38 +135,23 @@ const EXPECTED_UNPAIRED: &[(&str, &str)] = &[
     ),
     (
         "frame_1_hello",
-        concat!(
-            "000000a8850101015860a6000101582033333333333333333333333333333333",
-            "33333333333333333333333333333333025820a09aa5f47a6759802ff955f8dc",
-            "2d2a14a5c99d23be97f864127ff9383455a4f0036d676f6c64656e2d636c6965",
-            "6e740481637561310600584042d7cda78c6f698bbf5a05efc6ffe70ea52bdcfc",
-            "bfe0e4833f593c70c5872164bc462976c4b47316747def7db5af0a8621d2d89e",
-            "16680feb0868acee49ddc204",
-        ),
+        "000000cb850101015883a700010158203333333333333333333333333333333333333333333333333333333333333333025820a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0036d676f6c64656e2d636c69656e740481637561310600075820296dd693a5985d2ea73a29506b6b3f658da4caccfa74604caf02547dceddf5325840d18a011e6924117a2728b05350d177c1bbad77be981915d421575faa3434ecbf1dc7d813fa11f8a8c32409a52ba6c7b11df4a129256de03af2b251759f712b05",
     ),
     (
         "digest_1",
-        "960ddd5ea25c79e093ca5f3e3c02087a3698efe8d01921ff24409b12eb292a3e",
+        "eb5f68ec4282fd463274a9e2f63e9e9150b323c36f63017874e488616dd2456e",
     ),
     (
         "sig_1",
-        concat!(
-            "42d7cda78c6f698bbf5a05efc6ffe70ea52bdcfcbfe0e4833f593c70c5872164",
-            "bc462976c4b47316747def7db5af0a8621d2d89e16680feb0868acee49ddc204",
-        ),
+        "d18a011e6924117a2728b05350d177c1bbad77be981915d421575faa3434ecbf1dc7d813fa11f8a8c32409a52ba6c7b11df4a129256de03af2b251759f712b05",
     ),
     (
         "th_1",
-        "2787876076e98f3310e83d47ee51f97fc9e87ad5a5c5a01d110bb7c765921f75",
+        "eae40e02559900e8190d041d768764f1eb98b21d98bec1cf96f9c1434cbcb9df",
     ),
     (
         "frame_2_hello_ack",
-        concat!(
-            "0000007485010102582ca3000101582044444444444444444444444444444444",
-            "444444444444444444444444444444440281637561315840c088df14d82c56ce",
-            "3bb87b7b86a22b6b77bb68435985fb9025d6fea3952c0ac4f948c1e790bdd66a",
-            "cd3d6ab57e3804d02a695b4cd235af6ee5773f9d2dc7b205",
-        ),
+        "0000007485010102582ca3000101582044444444444444444444444444444444444444444444444444444444444444440281637561315840354e204f34b22e188d185dd3f87a7453b68fe5416b2b227b648963c6d0ce8f9c0b8b44a1f9744cf26627780e78e27a89f80732340209aaf6249853b53681470c",
     ),
     (
         "digest_2",
@@ -210,40 +159,32 @@ const EXPECTED_UNPAIRED: &[(&str, &str)] = &[
     ),
     (
         "sig_2",
-        concat!(
-            "c088df14d82c56ce3bb87b7b86a22b6b77bb68435985fb9025d6fea3952c0ac4",
-            "f948c1e790bdd66acd3d6ab57e3804d02a695b4cd235af6ee5773f9d2dc7b205",
-        ),
+        "354e204f34b22e188d185dd3f87a7453b68fe5416b2b227b648963c6d0ce8f9c0b8b44a1f9744cf26627780e78e27a89f80732340209aaf6249853b53681470c",
     ),
     (
         "th_2",
-        "10003074c3f7123641e262760a4d180681c7b523c82864b7936ad9a46c112d38",
+        "2e2bfdeac4e42898cd34dea06ae17f40bfb2a46dde03995f5f7b15163907b58c",
     ),
-    ("frame_3_pair_request", "000000078501020341a0f6"),
+    (
+        "frame_3_pair_request",
+        "0000002b850102035824a10158205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5af6",
+    ),
     (
         "th_3",
-        "8604d6b450520a47672097a318dbb6e55d8f722c96eb0da89268a7d3be108345",
+        "e5421e5600db4a2936282ba13f56173262422de23d915ef73bb13e62ad820d9b",
     ),
-    ("sas", "346 695"),
+    ("sas", "317 525"),
     (
         "frame_4_pair_accept",
-        concat!(
-            "00000038850102045831a2005820705fbac01f5519899f437bc42e40255ae9ab",
-            "54bff00de3433af7d687d9e71ad5016b676f6c64656e2d686f7374f6",
-        ),
+        "00000038850102045831a2005820705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad5016b676f6c64656e2d686f7374f6",
     ),
     (
         "th_4",
-        "5d1b5be7cf280525cbf191ee38b9babe97425238c6f82d466b9b999c903ca7b2",
+        "93c6db94378b836b83e5d1ec64f4208da3f967e4b4dd3c6ae13554d52dcbe618",
     ),
     (
         "frame_5_session_request",
-        concat!(
-            "0000005d8501030656a100a400816468323634018219078019043802f4030158",
-            "40121252a6f442839d47ca2f8464987d7e299e3c05b5a4e44f7ae700817ae9fe",
-            "75a769649cae364c53761106f959d4e4a620e084d4ac82900b246507874df2a7",
-            "01",
-        ),
+        "0000005d8501030656a100a400816468323634018219078019043802f403015840c094dd6bf87bf5e2ecb26a5913d35623f4ecd659752db9e4d8e7103f14f78d7c8f5fba882b6bded4c07ac1b40236699d5cc4022c543da66a7bbf556fa8bc2404",
     ),
     (
         "digest_5",
@@ -251,25 +192,15 @@ const EXPECTED_UNPAIRED: &[(&str, &str)] = &[
     ),
     (
         "sig_5",
-        concat!(
-            "121252a6f442839d47ca2f8464987d7e299e3c05b5a4e44f7ae700817ae9fe75",
-            "a769649cae364c53761106f959d4e4a620e084d4ac82900b246507874df2a701",
-        ),
+        "c094dd6bf87bf5e2ecb26a5913d35623f4ecd659752db9e4d8e7103f14f78d7c8f5fba882b6bded4c07ac1b40236699d5cc4022c543da66a7bbf556fa8bc2404",
     ),
     (
         "th_5",
-        "f93a2f68627c084bc74d309177b7f44b93c42ef821da4887184e2a1c16016da4",
+        "4a16ef2cc358b92cac4b51fe6feac2804baabe878a980eea015d44c3b3889a30",
     ),
     (
         "frame_6_session_accept",
-        concat!(
-            "000000ba850103075872a800a400816468323634018219078019043802f40301",
-            "01582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9",
-            "ab54bff00de3433af7d687d9e71ad50200030004000558205555555555555555",
-            "555555555555555555555555555555555555555555555555070008f45840d802",
-            "8e6a60a247a0bbd327c577d5b253cfea085c951e689ffe04f3b4e0967d0e168b",
-            "afd4c68353d66eb0e80242af45f009bcb60200df0f6413f3cf784483e609",
-        ),
+        "000000ba850103075872a800a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50200030004000558205555555555555555555555555555555555555555555555555555555555555555070008f45840c91992d9b94120de1c2e9270bb57c86f3abbd4fa8b58b2af683b463cf052191b1123c0eef5bea7b5f20c071f3273abba3177b12ac361f5f4f0a7cb0ebe6a6709",
     ),
     (
         "digest_6",
@@ -277,14 +208,11 @@ const EXPECTED_UNPAIRED: &[(&str, &str)] = &[
     ),
     (
         "sig_6",
-        concat!(
-            "d8028e6a60a247a0bbd327c577d5b253cfea085c951e689ffe04f3b4e0967d0e",
-            "168bafd4c68353d66eb0e80242af45f009bcb60200df0f6413f3cf784483e609",
-        ),
+        "c91992d9b94120de1c2e9270bb57c86f3abbd4fa8b58b2af683b463cf052191b1123c0eef5bea7b5f20c071f3273abba3177b12ac361f5f4f0a7cb0ebe6a6709",
     ),
     (
         "th_6",
-        "90a4f894ca33c22793b1f2bd6b92ff29fa18c153b849abf5f0873fd6474a0556",
+        "a28dfc92fa3b1645a1e6afc3b9f3a3db7609efe59ca1dab6eac3b48f6b8ce94d",
     ),
 ];
 
@@ -299,6 +227,7 @@ fn client_hello(paired: bool) -> Hello {
         feats: cfg.feats,
         stop_token: None,
         pairing_state: u8::from(paired),
+        sas_commit: crate::pairing::sas_commit(&CLIENT_SAS_NONCE),
     }
 }
 
@@ -373,6 +302,8 @@ pub(super) async fn compute(paired: bool) -> Vec<(&'static str, String)> {
     assert_eq!(ack.env.kind, Kind::HelloAck);
     chan.absorb(&ack);
     chan.set_version(1);
+    // th_after(HELLO_ACK) — the SAS input of §B.3.
+    let th_hello_ack = chan.th();
     record(
         &mut out,
         &["frame_2_hello_ack", "digest_2", "sig_2", "th_2"],
@@ -381,14 +312,26 @@ pub(super) async fn compute(paired: bool) -> Vec<(&'static str, String)> {
     );
     let mut i = 2;
     if !paired {
-        let pair_request = chan.send(&PairRequest::default(), None).await.unwrap();
+        let pair_request = chan
+            .send(
+                &PairRequest {
+                    sas_nonce: CLIENT_SAS_NONCE,
+                    ..PairRequest::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
         record(
             &mut out,
             &["frame_3_pair_request", "", "", "th_3"],
             &pair_request,
             chan.th(),
         );
-        out.push(("sas", Sas::derive(&chan.th()).render()));
+        out.push((
+            "sas",
+            Sas::derive(&th_hello_ack, &CLIENT_SAS_NONCE).render(),
+        ));
         let pair_accept = chan
             .recv(Duration::from_secs(5), "pair accept")
             .await

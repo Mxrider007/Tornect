@@ -445,6 +445,14 @@ pub struct Hello {
     #[n(6)]
     #[cbor(default)]
     pub pairing_state: u8,
+    /// key 7 — `SHA-256("tornect/v1/sas-commit\0" || sas_nonce)`, the SAS commitment
+    /// of §B.3. The nonce itself is withheld until `PAIR_REQUEST`, so a proxying MITM
+    /// must fix its `host_nonce` before it can learn the value the SAS depends on.
+    /// Covered by the `HELLO` signature.
+    #[n(7)]
+    #[cbor(with = "minicbor::bytes")]
+    #[cbor(default)]
+    pub sas_commit: [u8; 32],
 }
 
 impl Body for Hello {
@@ -488,6 +496,13 @@ pub struct PairRequest {
     #[n(0)]
     #[cbor(with = "minicbor::bytes")]
     pub client_auth_pk: Option<[u8; 32]>,
+    /// key 1 — the SAS nonce committed to in `HELLO.sas_commit` (§B.3). The host
+    /// recomputes the commitment and closes on a mismatch, so this value is fixed
+    /// before either side has seen the peer's contribution.
+    #[n(1)]
+    #[cbor(with = "minicbor::bytes")]
+    #[cbor(default)]
+    pub sas_nonce: [u8; 32],
 }
 
 impl Body for PairRequest {
@@ -1261,6 +1276,7 @@ mod tests {
             feats: vec!["ua1".to_owned()],
             stop_token: None,
             pairing_state: 0,
+            sas_commit: [3u8; 32],
         }
     }
 
@@ -1304,6 +1320,7 @@ mod tests {
         roundtrip(&PairRequest::default());
         roundtrip(&PairRequest {
             client_auth_pk: Some([4u8; 32]),
+            sas_nonce: [5u8; 32],
         });
         roundtrip(&PairAccept {
             host_device_pk: [7u8; 32],
@@ -1988,7 +2005,7 @@ mod tests {
             stop in proptest::option::of(any::<[u8; 32]>()),
             state in any::<u8>(),
         ) {
-            let h = Hello { v_max: 1, client_nonce: nonce, device_pk: [0; 32], name, feats, stop_token: stop, pairing_state: state };
+            let h = Hello { v_max: 1, client_nonce: nonce, device_pk: [0; 32], name, feats, stop_token: stop, pairing_state: state, sas_commit: [7u8; 32] };
             let back: Hello = decode_body(&encode_body(&h)).unwrap();
             prop_assert_eq!(back, h);
         }

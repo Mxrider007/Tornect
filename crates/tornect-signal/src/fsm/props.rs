@@ -88,6 +88,17 @@ fn spawn(
     tokio::spawn(async move { serve_host(stream, &cfg, &deps).await })
 }
 
+/// SAS nonce these properties commit to in `HELLO` and reveal in `PAIR_REQUEST`.
+const PROPS_SAS_NONCE: [u8; 32] = [0x66; 32];
+
+/// A `PAIR_REQUEST` opening the commitment [`hello_body`] publishes.
+fn props_pair_request() -> PairRequest {
+    PairRequest {
+        sas_nonce: PROPS_SAS_NONCE,
+        ..PairRequest::default()
+    }
+}
+
 fn hello_body(identity: &DeviceIdentity, nonce: [u8; 32], name: &str) -> Vec<u8> {
     encode_body(&Hello {
         v_max: 1,
@@ -97,6 +108,7 @@ fn hello_body(identity: &DeviceIdentity, nonce: [u8; 32], name: &str) -> Vec<u8>
         feats: vec!["ua1".into()],
         stop_token: None,
         pairing_state: 0,
+        sas_commit: crate::pairing::sas_commit(&PROPS_SAS_NONCE),
     })
 }
 
@@ -145,7 +157,7 @@ async fn drive(
         }
         let body = match kind {
             Kind::Hello => hello_body(identity, nonce, name),
-            Kind::PairRequest => encode_body(&PairRequest::default()),
+            Kind::PairRequest => encode_body(&props_pair_request()),
             _ => request_body(),
         };
         let signer: Option<&dyn HostSigner> = if kind.is_signed() {
@@ -219,7 +231,7 @@ async fn record_client_frames(
     chan.absorb(&ack);
     chan.set_version(1);
     if !paired {
-        let request = chan.send(&PairRequest::default(), None).await.unwrap();
+        let request = chan.send(&props_pair_request(), None).await.unwrap();
         frames.push(request.to_vec());
         let accept = chan
             .recv(Duration::from_secs(5), "pair accept")
@@ -449,7 +461,7 @@ proptest! {
             for (i, kind) in steps.iter().enumerate() {
                 let body = match kind {
                     Kind::Hello => hello_body(&identity, [7u8; 32], "x"),
-                    Kind::PairRequest => encode_body(&PairRequest::default()),
+                    Kind::PairRequest => encode_body(&props_pair_request()),
                     _ => request_body(),
                 };
                 if i == at {

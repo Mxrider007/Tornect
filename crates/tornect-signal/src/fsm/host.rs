@@ -472,6 +472,8 @@ where
     };
     chan.set_version(version);
     chan.send(&ack, Some(&*deps.signer)).await?;
+    // th_after(HELLO_ACK): the SAS input (§B.3), taken before PAIR_REQUEST is absorbed.
+    let th_hello_ack = chan.th();
 
     // AwaitSessionRequest (60 s from HELLO_ACK). An unpaired peer must pair
     // first; a pinned device may also re-pair through the same popup, keeping
@@ -499,6 +501,10 @@ where
                 &declared_name,
                 pinned.as_deref(),
                 &rx,
+                SasBinding {
+                    th_hello_ack: &th_hello_ack,
+                    commit: &hello.sas_commit,
+                },
             )
             .await?
             {
@@ -729,6 +735,14 @@ where
 /// trusted key asking to pair again (decision M1-32): the popup is told, and
 /// a Deny does not count toward the temp-ban — `HELLO` is replayable, so the
 /// request is no evidence that the trusted device itself sent it.
+/// The two SAS inputs of §B.3: the transcript hash after `HELLO_ACK` and the
+/// commitment the signed `HELLO` published for the nonce `PAIR_REQUEST` reveals.
+#[derive(Clone, Copy)]
+struct SasBinding<'a> {
+    th_hello_ack: &'a [u8; 32],
+    commit: &'a [u8; 32],
+}
+
 async fn pair<S>(
     chan: &mut Channel<S>,
     cfg: &HostConfig,
@@ -737,13 +751,20 @@ async fn pair<S>(
     declared_name: &str,
     pinned: Option<&str>,
     rx: &Received,
+    sas: SasBinding<'_>,
 ) -> Result<Result<String, u16>, HandshakeError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let _request: PairRequest = chan.body(rx).await?;
+    let request: PairRequest = chan.body(rx).await?;
+    // The revealed nonce must open the commitment carried by the signed HELLO
+    // (§B.3). Without this check the peer could choose its SAS contribution after
+    // seeing ours, which makes a 20-bit code grindable to a collision.
+    if crate::pairing::sas_commit(&request.sas_nonce) != *sas.commit {
+        return Err(chan.fail(codes::E_BAD_LEN, "sas_commit").await);
+    }
     chan.absorb(rx);
-    let sas = crate::pairing::Sas::derive(&chan.th());
+    let sas = crate::pairing::Sas::derive(sas.th_hello_ack, &request.sas_nonce);
 
     let refuse = |reason: u16| -> Result<Result<String, u16>, HandshakeError> {
         deps.audit.record(AuditEvent::PairRejected {
