@@ -1,0 +1,323 @@
+//! [`ReadinessSnapshot`] / [`Probe`] (`docs/PLAN.md` §B.8.7.1 ⑥, §B.8.14): one probe
+//! per readiness row, an all-`Unknown` M1 stub (the `tornect-platform` probes fill it
+//! from M6), the post-F2 `HOST_NOT_READY` gate rule and the IPC form — a CBOR map keyed
+//! by field **name** whose decoder ignores unknown keys, so M6 may add probes without an
+//! IPC schema bump.
+
+use minicbor::decode::Decoder;
+use minicbor::encode::{Encoder, Write};
+
+/// One readiness row.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Probe {
+    /// Green.
+    Ok,
+    /// Yellow: badge only.
+    Warn(String),
+    /// Red: badge, and — on the gating rows — `HOST_NOT_READY`.
+    Fail(String),
+    /// Not probed (M1): never blocks, badge only.
+    #[default]
+    Unknown,
+}
+
+impl Probe {
+    fn kind(&self) -> u8 {
+        match self {
+            Self::Ok => 0,
+            Self::Warn(_) => 1,
+            Self::Fail(_) => 2,
+            Self::Unknown => 3,
+        }
+    }
+
+    fn message(&self) -> Option<&str> {
+        match self {
+            Self::Warn(m) | Self::Fail(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Whether this row raises the badge.
+    #[must_use]
+    pub fn raises_badge(&self) -> bool {
+        !matches!(self, Self::Ok)
+    }
+}
+
+impl<C> minicbor::Encode<C> for Probe {
+    fn encode<W: Write>(
+        &self,
+        e: &mut Encoder<W>,
+        _: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        e.array(2)?.u8(self.kind())?;
+        match self.message() {
+            Some(m) => e.str(m)?,
+            None => e.null()?,
+        };
+        Ok(())
+    }
+}
+
+impl<'b, C> minicbor::Decode<'b, C> for Probe {
+    fn decode(d: &mut Decoder<'b>, _: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let p = d.position();
+        let n = d.array()?;
+        if n != Some(2) {
+            return Err(minicbor::decode::Error::message("probe must be a 2-array").at(p));
+        }
+        let kind = d.u8()?;
+        let msg: Option<String> = if d.datatype()? == minicbor::data::Type::Null {
+            d.skip()?;
+            None
+        } else {
+            let s = d.str()?;
+            Some(s.chars().take(MAX_PROBE_MESSAGE).collect())
+        };
+        Ok(match kind {
+            0 => Self::Ok,
+            1 => Self::Warn(msg.unwrap_or_default()),
+            2 => Self::Fail(msg.unwrap_or_default()),
+            _ => Self::Unknown,
+        })
+    }
+}
+
+/// Probe messages are truncated to this many characters on decode.
+pub const MAX_PROBE_MESSAGE: usize = 256;
+
+/// The readiness rows of §B.8.7.1 ⑥.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReadinessSnapshot {
+    /// Capture permission / restore token.
+    pub capture: Probe,
+    /// Input permission / restore token.
+    pub input: Probe,
+    /// Autostart registered.
+    pub autostart: Probe,
+    /// Auto-login state (never configured by Tornect).
+    pub auto_login: Probe,
+    /// Keystore persistent and unlockable at autostart (canary).
+    pub keystore: Probe,
+    /// Empty OS account password detected.
+    pub os_password: Probe,
+    /// Idle-lock policy.
+    pub idle_lock: Probe,
+    /// Current lock state.
+    pub lock_state: Probe,
+    /// Console ownership.
+    pub console_owner: Probe,
+    /// Tor self-connect.
+    pub tor_self_connect: Probe,
+    /// Panic key bound.
+    pub panic_key: Probe,
+    /// Indicator + tray row.
+    pub consent_indicator: Probe,
+}
+
+/// Field names in wire order (also the CBOR map keys).
+pub const FIELD_NAMES: [&str; 12] = [
+    "capture",
+    "input",
+    "autostart",
+    "auto_login",
+    "keystore",
+    "os_password",
+    "idle_lock",
+    "lock_state",
+    "console_owner",
+    "tor_self_connect",
+    "panic_key",
+    "consent_indicator",
+];
+
+impl ReadinessSnapshot {
+    /// The M1 stub: every row `Unknown` (never blocks, badge only).
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self::default()
+    }
+
+    /// The rows in wire order.
+    #[must_use]
+    pub fn fields(&self) -> [(&'static str, &Probe); 12] {
+        [
+            ("capture", &self.capture),
+            ("input", &self.input),
+            ("autostart", &self.autostart),
+            ("auto_login", &self.auto_login),
+            ("keystore", &self.keystore),
+            ("os_password", &self.os_password),
+            ("idle_lock", &self.idle_lock),
+            ("lock_state", &self.lock_state),
+            ("console_owner", &self.console_owner),
+            ("tor_self_connect", &self.tor_self_connect),
+            ("panic_key", &self.panic_key),
+            ("consent_indicator", &self.consent_indicator),
+        ]
+    }
+
+    fn field_mut(&mut self, name: &str) -> Option<&mut Probe> {
+        Some(match name {
+            "capture" => &mut self.capture,
+            "input" => &mut self.input,
+            "autostart" => &mut self.autostart,
+            "auto_login" => &mut self.auto_login,
+            "keystore" => &mut self.keystore,
+            "os_password" => &mut self.os_password,
+            "idle_lock" => &mut self.idle_lock,
+            "lock_state" => &mut self.lock_state,
+            "console_owner" => &mut self.console_owner,
+            "tor_self_connect" => &mut self.tor_self_connect,
+            "panic_key" => &mut self.panic_key,
+            "consent_indicator" => &mut self.consent_indicator,
+            _ => return None,
+        })
+    }
+
+    /// The post-F2 gate rule (§B.8.14): `Unknown` never blocks; `Fail` on `capture` /
+    /// `input` / `lock_state` / `console_owner` ⇒ `HOST_NOT_READY` with cause 1 / 2 / 3 /
+    /// 4; every other row raises the badge only.
+    #[must_use]
+    pub fn host_not_ready_cause(&self) -> Option<u8> {
+        [
+            (&self.capture, 1u8),
+            (&self.input, 2),
+            (&self.lock_state, 3),
+            (&self.console_owner, 4),
+        ]
+        .into_iter()
+        .find(|(p, _)| matches!(p, Probe::Fail(_)))
+        .map(|(_, c)| c)
+    }
+
+    /// Whether any row raises the sticky badge.
+    #[must_use]
+    pub fn badge(&self) -> bool {
+        self.fields().iter().any(|(_, p)| p.raises_badge())
+    }
+}
+
+impl<C> minicbor::Encode<C> for ReadinessSnapshot {
+    fn encode<W: Write>(
+        &self,
+        e: &mut Encoder<W>,
+        ctx: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        e.map(12)?;
+        for (name, probe) in self.fields() {
+            e.str(name)?;
+            probe.encode(e, ctx)?;
+        }
+        Ok(())
+    }
+}
+
+impl<'b, C> minicbor::Decode<'b, C> for ReadinessSnapshot {
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let mut out = Self::default();
+        let n = d.map()?;
+        let mut seen = 0u64;
+        loop {
+            match n {
+                Some(n) if seen >= n => break,
+                None if d.datatype()? == minicbor::data::Type::Break => {
+                    d.skip()?;
+                    break;
+                }
+                _ => {}
+            }
+            seen += 1;
+            let key = d.str()?;
+            match out.field_mut(key) {
+                Some(slot) => *slot = Probe::decode(d, ctx)?,
+                None => d.skip()?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stub_is_all_unknown_and_never_blocks() {
+        let s = ReadinessSnapshot::unknown();
+        assert!(s.fields().iter().all(|(_, p)| **p == Probe::Unknown));
+        assert_eq!(s.host_not_ready_cause(), None);
+        assert!(s.badge());
+    }
+
+    #[test]
+    fn gate_rule_causes_in_order() {
+        let mut s = ReadinessSnapshot::unknown();
+        s.autostart = Probe::Fail("no".into());
+        assert_eq!(s.host_not_ready_cause(), None, "non-gating rows badge only");
+        s.console_owner = Probe::Fail("other user".into());
+        assert_eq!(s.host_not_ready_cause(), Some(4));
+        s.lock_state = Probe::Fail("locked".into());
+        assert_eq!(s.host_not_ready_cause(), Some(3));
+        s.input = Probe::Warn("meh".into());
+        assert_eq!(s.host_not_ready_cause(), Some(3));
+        s.input = Probe::Fail("no".into());
+        assert_eq!(s.host_not_ready_cause(), Some(2));
+        s.capture = Probe::Fail("no".into());
+        assert_eq!(s.host_not_ready_cause(), Some(1));
+        let mut ok = ReadinessSnapshot::unknown();
+        for (name, _) in ok.clone().fields() {
+            *ok.field_mut(name).unwrap() = Probe::Ok;
+        }
+        assert!(!ok.badge());
+    }
+
+    #[test]
+    fn cbor_is_keyed_by_field_name_and_ignores_unknown_keys() {
+        let mut s = ReadinessSnapshot::unknown();
+        s.capture = Probe::Ok;
+        s.input = Probe::Fail("portal denied".into());
+        s.keystore = Probe::Warn("file keystore".into());
+        let bytes = minicbor::to_vec(&s).unwrap();
+        assert!(
+            bytes.windows(7).any(|w| w == b"capture"),
+            "map keys are the field names"
+        );
+        let back: ReadinessSnapshot = minicbor::decode(&bytes).unwrap();
+        assert_eq!(back, s);
+
+        // a future probe and an unknown kind are tolerated
+        let mut e = Encoder::new(Vec::new());
+        e.map(3)
+            .unwrap()
+            .str("future_probe")
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .u8(9)
+            .unwrap()
+            .null()
+            .unwrap()
+            .str("capture")
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .u8(7)
+            .unwrap()
+            .str("??")
+            .unwrap()
+            .str("extra")
+            .unwrap()
+            .u64(5)
+            .unwrap();
+        let back: ReadinessSnapshot = minicbor::decode(&e.into_writer()).unwrap();
+        assert_eq!(back.capture, Probe::Unknown);
+        assert_eq!(back.input, Probe::Unknown);
+        // a message is bounded on decode
+        let long = Probe::Fail("x".repeat(1000));
+        let bytes = minicbor::to_vec(&long).unwrap();
+        let back: Probe = minicbor::decode(&bytes).unwrap();
+        assert_eq!(back, Probe::Fail("x".repeat(MAX_PROBE_MESSAGE)));
+    }
+}

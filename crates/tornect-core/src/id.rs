@@ -300,6 +300,50 @@ impl<'de> Deserialize<'de> for DeviceId {
     }
 }
 
+/// CBOR form of a [`DeviceId`]: a 32-byte string (`docs/PLAN.md` §B.3, §B.8.9).
+impl<C> minicbor::Encode<C> for DeviceId {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut minicbor::Encoder<W>,
+        _: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        e.bytes(&self.pk)?.ok()
+    }
+}
+
+impl<'b, C> minicbor::Decode<'b, C> for DeviceId {
+    fn decode(d: &mut minicbor::Decoder<'b>, _: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let p = d.position();
+        let b = d.bytes()?;
+        let pk: [u8; 32] = b
+            .try_into()
+            .map_err(|_| minicbor::decode::Error::message("device id must be 32 bytes").at(p))?;
+        Ok(Self { pk })
+    }
+}
+
+/// CBOR form of a [`TornectId`]: the raw 32-byte public key.
+impl<C> minicbor::Encode<C> for TornectId {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut minicbor::Encoder<W>,
+        _: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        e.bytes(&self.pk)?.ok()
+    }
+}
+
+impl<'b, C> minicbor::Decode<'b, C> for TornectId {
+    fn decode(d: &mut minicbor::Decoder<'b>, _: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let p = d.position();
+        let b = d.bytes()?;
+        let pk: [u8; 32] = b
+            .try_into()
+            .map_err(|_| minicbor::decode::Error::message("tornect id must be 32 bytes").at(p))?;
+        Ok(Self { pk })
+    }
+}
+
 fn strip_suffix_ignore_case<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
     if s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix) {
         Some(&s[..s.len() - suffix.len()])
@@ -392,6 +436,23 @@ mod tests {
         assert_eq!(fp.len(), 19);
         assert_eq!(fp.matches('-').count(), 3);
         assert_eq!(format!("{dev:?}"), format!("DeviceId({fp})"));
+    }
+
+    #[test]
+    fn cbor_forms_are_32_byte_strings() {
+        let dev = DeviceId::from_bytes([5u8; 32]);
+        let bytes = minicbor::to_vec(dev).unwrap();
+        assert_eq!(bytes.len(), 34, "bstr header (2) + 32 bytes");
+        assert_eq!(bytes[0], 0x58);
+        assert_eq!(minicbor::decode::<DeviceId>(&bytes).unwrap(), dev);
+        assert!(minicbor::decode::<DeviceId>(&bytes[..20]).is_err());
+        let id = TornectId::from_bytes([6u8; 32]);
+        assert_eq!(
+            minicbor::decode::<TornectId>(&minicbor::to_vec(id).unwrap()).unwrap(),
+            id
+        );
+        let short = minicbor::to_vec(minicbor::bytes::ByteVec::from(vec![1u8; 31])).unwrap();
+        assert!(minicbor::decode::<TornectId>(&short).is_err());
     }
 
     proptest! {

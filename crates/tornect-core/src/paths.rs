@@ -1,6 +1,6 @@
 //! Where Tornect keeps its files (`docs/PLAN.md` §A.3 D13).
 //!
-//! | OS | config | state (keys, Arti state, grants) | cache | logs |
+//! | OS | config | state (keys, Arti state, pairings, unattended store) | cache | logs |
 //! |---|---|---|---|---|
 //! | Linux/BSD | `~/.config/tornect` | `~/.local/share/tornect` | `~/.cache/tornect` | `~/.local/share/tornect/logs` |
 //! | macOS | `~/Library/Application Support/Tornect` | same | `~/Library/Caches/Tornect` | `~/Library/Logs/Tornect` |
@@ -24,7 +24,7 @@ pub const HOME_ENV: &str = "TORNECT_HOME";
 pub struct Paths {
     /// Configuration (`config.toml`).
     pub config_dir: PathBuf,
-    /// Persistent state: keystore, Arti state, trusted devices, grants.
+    /// Persistent state: keystore, Arti state, trusted devices, the unattended store.
     pub state_dir: PathBuf,
     /// Disposable cache (Tor directory cache).
     pub cache_dir: PathBuf,
@@ -116,10 +116,31 @@ impl Paths {
         self.cache_dir.join("arti")
     }
 
-    /// Trusted devices and unattended grants (`docs/PLAN.md` §B.6, §B.8).
+    /// SAS-paired devices — pairings only (`docs/PLAN.md` §B.6, §B.8.9). Unattended
+    /// grants live in the encrypted store ([`Paths::unattended_store`]), never here.
     #[must_use]
     pub fn trusted_devices_file(&self) -> PathBuf {
         self.state_dir.join("trusted-devices.toml")
+    }
+
+    /// The encrypted unattended store `unattended.bin` (`docs/PLAN.md` §B.8.9).
+    #[must_use]
+    pub fn unattended_store(&self) -> PathBuf {
+        self.state_dir.join("unattended.bin")
+    }
+
+    /// Advisory lock taken by whoever writes the unattended store — the running host
+    /// or the offline CLI, never both (`docs/PLAN.md` §B.8.6.2, §B.8.7.4).
+    #[must_use]
+    pub fn unattended_lock(&self) -> PathBuf {
+        self.state_dir.join("unattended.lock")
+    }
+
+    /// Client-side per-host records `hosts.toml` (`docs/PLAN.md` §B.8.9: `remember`,
+    /// `server_s_pk_pin`, `suite`, `ua_worked_before`).
+    #[must_use]
+    pub fn hosts_file(&self) -> PathBuf {
+        self.state_dir.join("hosts.toml")
     }
 
     /// Append-only local audit log of session events.
@@ -166,6 +187,18 @@ mod tests {
             PathBuf::from("/tmp/tornect-test/config.toml")
         );
         assert_eq!(p.keys_dir(), PathBuf::from("/tmp/tornect-test/state/keys"));
+        assert_eq!(
+            p.unattended_store(),
+            PathBuf::from("/tmp/tornect-test/state/unattended.bin")
+        );
+        assert_eq!(
+            p.unattended_lock(),
+            PathBuf::from("/tmp/tornect-test/state/unattended.lock")
+        );
+        assert_eq!(
+            p.hosts_file(),
+            PathBuf::from("/tmp/tornect-test/state/hosts.toml")
+        );
         assert_eq!(
             p.sessions_log(),
             PathBuf::from("/tmp/tornect-test/logs/sessions.log")

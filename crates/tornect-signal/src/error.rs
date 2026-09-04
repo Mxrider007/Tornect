@@ -89,6 +89,10 @@ pub enum SignalError {
     #[error("protocol error: {0}")]
     Protocol(String),
 
+    /// The envelope handshake failed (`crate::fsm`).
+    #[error(transparent)]
+    Handshake(#[from] crate::fsm::HandshakeError),
+
     /// Error from `tornect-core` (keystore, paths, ids).
     #[error(transparent)]
     Core(#[from] tornect_core::CoreError),

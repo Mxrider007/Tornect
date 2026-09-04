@@ -13,13 +13,44 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.13"
 # `tor-pow` (equix/hashx JIT) is irrelevant to the parsers and slow to build.
 tornect-signal = { path = "../crates/tornect-signal", default-features = false }
-tokio = { version = "1.53.1", features = ["rt", "io-util"] }
+tornect-core = { path = "../crates/tornect-core" }
+tokio = { version = "1.53.1", features = ["rt", "io-util", "test-util", "time"] }
+# Structure-aware inputs for the F3 store / limiter loaders (pinned in the workspace table too).
+arbitrary = "=1.4.2"
+minicbor = "=2.3.0"
+zeroize = "1.9.0"
 
 # Length-prefixed frames (`tornect_signal::framing::read_frame`), the first
 # wire-parsed input of the signaling crate. The CBOR envelope target extends it.
 [[bin]]
 name = "framing"
 path = "fuzz_targets/framing.rs"
+test = false
+doc = false
+bench = false
+
+# F1 (docs/PLAN.md §B.8.15): the CBOR envelope, every message body and both
+# handshake FSMs fed with arbitrary frames.
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+# F3 (docs/PLAN.md §B.8.15): the unattended store + limiter loaders through the `Clock`
+# trait with fuzzed wall / monotonic readings (tornect-core, no networking).
+[[bin]]
+name = "store"
+path = "fuzz_targets/store.rs"
+test = false
+doc = false
+bench = false
+
+# F4 (docs/PLAN.md §B.8.7.4): the IPC message codec of `tornect-core::unattended::ipc`.
+[[bin]]
+name = "ipc"
+path = "fuzz_targets/ipc.rs"
 test = false
 doc = false
 bench = false

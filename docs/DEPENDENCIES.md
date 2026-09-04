@@ -69,11 +69,38 @@ with "Disk quota exceeded" while compiling zstd (`docs/notes/m1-track1-evidence.
 `arti_client::config` re-exports (the M1 track-1 tree declared it unused; removed
 2026-08-28).
 
+## Milestone 1 (tornect-signal: envelope protocol, pairing, trusted stores)
+
+| Crate | Version | Features | Why | Build requirements | Verified | Source |
+|---|---|---|---|---|---|---|
+| `minicbor` (+ `minicbor-derive` 0.19.5, transitive) | =2.3.0 | `std`, `derive` | The §B.3 envelope (`Encoder`/`Decoder` by hand: definite five-item array, `bytes` bodies, `null`/64-byte `sig`) and every §B.8.4.1 body as `#[cbor(map)]` structs with `#[n(k)]` integer keys: unknown keys are skipped on decode, missing `Option`s default to `None` (`minicbor-derive` docs items 2–3), `#[cbor(with = "minicbor::bytes")]` decodes `[u8; N]` with an exact-length check (`bytes.rs` 191–200 `ByteArray::decode`) and `Option<[u8; N]>` as `null`/bytes (467–495). Signatures cover the raw body bytes, so no canonical encoding is needed (decision M1-7). License: **BlueOak-1.0.0** (both crates; permissive, notice-preserving, GPL-3.0-or-later compatible) — allowed in `deny.toml` `[licenses].allow` with a comment naming them (review finding, 2026-08-29). | none | 2026-08-29 mx-vm | crate source `minicbor-2.3.0/src/{decode/decoder.rs,bytes.rs}`, `minicbor-derive-0.19.5/src/lib.rs` |
+| `unicode-normalization` | =0.1.25 | — | NFKC-normalizes a peer-declared name before it is pinned as a label (`pairing::normalize_label`; the stripping/bounding half lives in `tornect-core::trusted::sanitize_label`, which has no such dependency). | none | 2026-08-29 mx-vm | crate source `src/lib.rs` (`UnicodeNormalization::nfkc`) |
+| `hkdf` / `hmac` / `sha2` / `subtle` / `ed25519-dalek` | as M0 | — | SAS derivation (`Hkdf<Sha256>`, salt `tornect/v1/sas`, info `sas-v1`), transcript hashes and digests, `verify_strict` on every peer signature, constant-time `quic_spki` compare (`ConstantTimeEq` on slices). | none | 2026-08-29 mx-vm | `docs/research/crypto.md` §4, §6, §10 |
+| `tokio` (dev) | as M0 | + `test-util` | `tokio::time::pause` / `start_paused` drive every §B.8.4.5 timer in the FSM tests without waiting. | none | 2026-08-29 mx-vm | tokio docs (`time::pause`) |
+
+## Milestone 1 (tornect-core: unattended store, limiter, guard, IPC types)
+
+The `minicbor` and `unicode-normalization` rows above also cover `tornect-core`: the
+encrypted store and the IPC message set are `#[cbor(map)]` structs with integer keys
+(`grant.rs`, `ipc.rs`; a `zbytes` helper decodes byte strings straight into
+`Zeroizing<Vec<u8>>`), the password policy uses `nfc()` and `grant::sanitize_label` `nfkc()`.
+`hmac`/`hkdf` 0.13 (M0 rows) derive `K_unatt`/`K_log` and tag the log chain;
+`parking_lot` (M0 row) is the store mutex.
+
+| Crate | Version | Features | Why | Build requirements | Verified | Source |
+|---|---|---|---|---|---|---|
+| `chacha20poly1305` (+ `aead` 0.6.1, `chacha20` 0.10.2, `poly1305` 0.9.1 transitive) | =0.11.0 | `zeroize`; defaults `alloc` + `getrandom` | XChaCha20-Poly1305 AEAD of `unattended.bin` (§B.8.9): `XChaCha20Poly1305::new(&Key)`, `aead::Aead::{encrypt, decrypt}` with `Payload { msg, aad }` (the 37-byte header is the AAD), `XNonce = Array<u8, U24>` built with `From<[u8; 24]>` (`Array::from_slice` is deprecated on the hybrid-array line). U4 flips every byte of a sealed file and asserts `BadTag`. | none | 2026-08-29 mx-vm | crate source `chacha20poly1305-0.11.0/src/lib.rs` 33–140, `aead-0.6.1/src/lib.rs` 131–215, 421–433 |
+| `zxcvbn` | =3.1.1 | default (`builder`) | Password strength (§B.8.7.2): `zxcvbn(pw, &[&str]) -> Entropy`, `Entropy::score() -> Score` (`u8::from`, 0–4), `feedback().warning()` for the refusal text. Pulls `fancy-regex` 0.18 and `derive_builder` 0.20; `web-sys` is a wasm-only dependency, not compiled here. | none | 2026-08-29 mx-vm | crate source `zxcvbn-3.1.1/src/lib.rs` 86–149, `scoring.rs` 11–48, `feedback.rs` 137–155 |
+| `keyring-core` | =1.0.0 | — (optional; `tornect-core/keyring`) | Keychain abstraction for `K_master` (§B.8.9, `ui.md` §5.9 — never `keyring::Entry`): `CredentialStore::build(service, user, None) -> Entry`, `Entry::{get_secret, set_secret, delete_credential}`, `Error::{NoEntry, NoStorageAccess, …}` (non-exhaustive); `mock::Store::new()` for tests. | none | 2026-08-29 mx-vm | crate source `keyring-core-1.0.0/src/{lib.rs 120–210, api.rs, error.rs, mock.rs 197–215}` |
+| `linux-keyutils-keyring-store` (+ `linux-keyutils` 0.2.5) | =1.0.0 | — (optional; Linux only; `tornect-core/keyring`) | The kernel keyutils credential store: `Store::new() -> Result<Arc<Store>>`, descriptions `keyring:<service>@<user>`, `CredentialPersistence::UntilReboot` (in-memory: it can never satisfy the §B.8.9 canary, so it is **test / CI only** — `KeyringSecretStore::new` refuses every store that is not `UntilDelete` (r7 review), `new_volatile()` / `linux_keyutils()` exist for the round-trip test; the file store is the fallback until the M6 backends land). The mx-vm kernel keyring round-trip passed (`--ignored` test `linux_keyutils_roundtrip`). | none | 2026-08-29 mx-vm | crate source `linux-keyutils-keyring-store-1.0.0/src/{lib.rs, store.rs 33–70, cred.rs}` |
+
 ## Fuzzing (`fuzz/`, excluded from the workspace, nightly only)
 
 | Crate | Version | Features | Why | Build requirements | Verified | Source |
 |---|---|---|---|---|---|---|
 | `libfuzzer-sys` | 0.4.13 | — | `fuzz_target!` for `cargo +nightly fuzz run framing` (`docs/PLAN.md` §D.5: fuzz every wire parser). `fuzz/Cargo.toml` builds `tornect-signal` with `default-features = false` (no `tor-pow` JIT) and has its own lock file. | nightly toolchain (`-Zsanitizer`), C++ compiler for libFuzzer | 2026-08-28 mx-vm | crates.io (`max_version` 0.4.13) |
+| `tornect-core` (path), `tokio` `test-util` + `time` | — | — | The `envelope` target (F1, §B.8.15) builds fixed host/device identities and in-memory trusted/known-host stores, re-signs fuzzed frames over the running transcript, and runs both FSMs on a paused-time runtime so every §B.8.4.5 timer fires at once when the input ends. | nightly toolchain | 2026-08-29 mx-vm | `fuzz/fuzz_targets/envelope.rs` |
+| `arbitrary` | =1.4.2 | — | The F3 target (`fuzz/fuzz_targets/store.rs`, §B.8.15) builds `UnattendedStore` / `FailState` values and `(wall, mono)` clock readings from the fuzzer's bytes with `Unstructured::{arbitrary, int_in_range, ratio}` (`src/unstructured.rs` 86–604 in the crate source); no derive — core types keep no `Arbitrary` impls, the target assembles them field by field. Pinned in the workspace table too (`arbitrary = "=1.4.2"`, unused there until a crate derives it); `minicbor` and `zeroize` in `fuzz/Cargo.toml` reuse the workspace pins. MIT OR Apache-2.0. | nightly (with the fuzz crate) | 2026-08-29 mx-vm | crate source `~/.cargo/registry/src/*/arbitrary-1.4.2/src/unstructured.rs`; `fuzz/Cargo.lock` checksum `c3d036a3…8bf1` |
 
 ## Milestone 2+ (verified pins land here as each milestone starts)
 

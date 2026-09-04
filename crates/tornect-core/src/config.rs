@@ -359,6 +359,24 @@ future_key = "ignored"
         assert_eq!(cfg.security.panic_key, "Ctrl+Alt+End");
     }
 
+    /// A8 (§B.8.15): policy never lives in `config.toml` — an `[unattended]` table is
+    /// ignored, not honoured (§B.8.6.2 UA7).
+    #[test]
+    fn a8_config_ignores_an_unattended_table() {
+        let text = r#"
+[unattended]
+enabled = true
+grants = ["everyone"]
+
+[security]
+panic_key = "Ctrl+Alt+End"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg, Config::default());
+        let dumped = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!dumped.contains("unattended"));
+    }
+
     #[test]
     fn load_or_init_creates_file_then_reads_it() {
         let dir = tempfile::tempdir().unwrap();

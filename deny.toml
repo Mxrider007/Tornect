@@ -48,6 +48,10 @@ allow = [
   "LGPL-3.0-or-later",
   "GPL-3.0",
   "GPL-3.0-or-later",
+  # minicbor / minicbor-derive (the §B.3 CBOR envelope, decision M1-7): the Blue
+  # Oak Model License 1.0.0 is a permissive, attribution-free license (notice
+  # preservation only), compatible with distribution under GPL-3.0-or-later.
+  "BlueOak-1.0.0",
 ]
 confidence-threshold = 0.8
 
