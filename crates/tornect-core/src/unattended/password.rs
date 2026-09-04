@@ -261,20 +261,28 @@ mod tests {
         assert!(c.score >= 3);
         let c4 = check(strong, &["mx-vm"], true).unwrap();
         assert_eq!(c4.score, 4);
-        // a score-3 password passes with a keychain but not with the file keystore
-        let mid = "Tr0ub4dor&3x!";
-        if let Ok(c) = check(mid, &[], false)
-            && c.score == 3
-        {
-            assert!(matches!(
-                check(mid, &[], true),
-                Err(PolicyError::TooWeak {
-                    score: 3,
-                    required: 4,
-                    ..
-                })
-            ));
-        }
+        // A score-3 password is accepted with a keychain but refused on a file
+        // keystore — the one behaviour the §B.8.7.2 file-keystore clause adds.
+        // Search a fixed list rather than hard-coding one string: a zxcvbn bump
+        // that moves a band boundary must fail here loudly, not silently drop
+        // this coverage (the previous `if let ... && c.score == 3` guard was
+        // dead, because "Tr0ub4dor&3x!" scores 4).
+        let mid = ["amber9-thicket", "quill-8-marrow", "dusk7-pebble"]
+            .into_iter()
+            .find(|pw| matches!(check(pw, &[], false), Ok(c) if c.score == 3))
+            .expect(
+                "no candidate scores 3 under this zxcvbn version: the \
+                 file-keystore escalation of §B.8.7.2 would go untested \
+                 — add a score-3 candidate to this list",
+            );
+        assert!(matches!(
+            check(mid, &[], true),
+            Err(PolicyError::TooWeak {
+                score: 3,
+                required: 4,
+                ..
+            })
+        ));
         assert_eq!(required_score(true), 4);
         assert_eq!(required_score(false), 3);
     }
