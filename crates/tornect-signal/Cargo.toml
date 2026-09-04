@@ -30,6 +30,11 @@ hmac.workspace = true
 hkdf.workspace = true
 subtle.workspace = true
 getrandom.workspace = true
+# Unattended PAKE (§B.8.4.4, docs/research/crypto.md §8). opaque-ke is on the old
+# RustCrypto stack: its KE hash must be a digest-0.10 type (`sha2_010::Sha512`, not
+# the workspace `sha2` 0.11) and its RNGs are rand 0.8 — see `auth::OpaqueRng`.
+opaque-ke.workspace = true
+sha2_010.workspace = true
 hex.workspace = true
 ed25519-dalek.workspace = true
 minicbor.workspace = true
