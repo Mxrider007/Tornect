@@ -854,6 +854,47 @@ fn u4_tampered_file_newer_schema_missing_key_and_anchor_without_file_fail_closed
     assert!(store.grant(&d).is_some());
 }
 
+/// §B.8.13 + §B.8.9: `K_master` provably exists while the keychain is locked, so no line
+/// written in that window may be untagged — an untagged line after the key epoch and past
+/// `log_chain_head` makes `verify_chain` report `Broken` forever, a standing tamper badge
+/// on a host where nothing was tampered with. The lines are buffered and flushed tagged by
+/// the `keystore_locked -> readable` recovery load.
+#[test]
+fn a6_log_chain_stays_valid_across_a_keystore_locked_window_and_its_recovery_load() {
+    let env = Env::new();
+    let store = env.open();
+    let d = dev(1);
+    let g = enable(&env, &store, d, Preset::MyMachines);
+    drop((g, store));
+
+    // Autostart with the collection still locked: fail closed, unattended off.
+    *env.secrets.get_fails.lock() = true;
+    let store = env.open();
+    assert!(matches!(
+        store.status(),
+        StoreStatus::FailedClosed(StoreLoadError::KeystoreLocked(_))
+    ));
+
+    // The host keeps running attended-only and keeps logging.
+    for i in 0..3u64 {
+        let rec = SessionRecord::at(1_800_000_000 + i, SessionEvent::SessionStarted);
+        store.log_event(&rec).unwrap();
+    }
+
+    // The user unlocks; the 10-min readiness re-run performs the recovery load.
+    *env.secrets.get_fails.lock() = false;
+    assert_eq!(store.retry_load(), StoreStatus::Loaded);
+
+    // The §B.8.13 startup verifier must still accept the chain.
+    let report = store.verify_log().unwrap();
+    assert_eq!(
+        report.status,
+        ChainStatus::Valid,
+        "log chain broken by the locked window: {:?}",
+        report.status
+    );
+}
+
 #[test]
 fn u4_machine_id_mismatch_disables_every_grant_by_restore() {
     let mut env = Env::new();
