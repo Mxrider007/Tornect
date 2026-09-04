@@ -140,6 +140,8 @@ pub struct UnattendedContext<'a> {
     pub th_after_request: [u8; 32],
     /// The host onion public key.
     pub host_pk: [u8; 32],
+    /// The host's advertised caps, to intersect with the client's (§B.2).
+    pub host_caps: &'a Caps,
     /// The channel for `AUTH_CHALLENGE` / `AUTH_RESPONSE`.
     pub exchange: &'a mut dyn AuthExchange,
     /// The block window of §B.8.4.5 `Accepting` (`HostDeps::block_window`).
@@ -565,6 +567,7 @@ where
                 request: &request,
                 th_after_request,
                 host_pk,
+                host_caps: &cfg.caps,
                 exchange: &mut chan,
                 block_window: &*deps.block_window,
                 local_allow: &*deps.local_allow,
