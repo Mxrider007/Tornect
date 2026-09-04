@@ -143,7 +143,19 @@ pub(crate) struct State {
     expired_seen: u64,
     last_anomaly_log: Option<Duration>,
     anomaly_pending: u32,
+    /// Records produced while the status is `FailedClosed(KeystoreLocked)`, i.e. while
+    /// `K_master` provably exists but is unreadable. Appending them untagged would put
+    /// untagged lines after the key epoch and past `log_chain_head`, which
+    /// `verify_chain` reports as `Broken` forever (§B.8.13). They are held here and
+    /// appended *tagged* by the `keystore_locked -> readable` recovery load (§B.8.9).
+    pending_log: Vec<SessionRecord>,
+    /// Records dropped after `pending_log` hit `MAX_PENDING_LOG`; reported on flush so
+    /// the gap is visible in the log rather than silent.
+    pending_log_dropped: u32,
 }
+
+/// Cap on `State::pending_log`: a locked keychain must not grow memory without bound.
+const MAX_PENDING_LOG: usize = 256;
 
 struct Inner {
     store_path: PathBuf,
@@ -283,6 +295,8 @@ impl GrantStore {
                 expired_seen: 0,
                 last_anomaly_log: None,
                 anomaly_pending: 0,
+                pending_log: Vec::new(),
+                pending_log_dropped: 0,
             }),
         };
         let this = Self {
@@ -525,6 +539,52 @@ impl GrantStore {
         Ok(Some((master, generation, store)))
     }
 
+    /// True while `K_master` exists but cannot be read, so no tag can be computed.
+    fn log_key_unavailable(st: &State) -> bool {
+        matches!(
+            st.status,
+            StoreStatus::FailedClosed(StoreLoadError::KeystoreLocked(_))
+        )
+    }
+
+    /// Append `rec`, or buffer it when the keystore is locked (§B.8.13: an untagged
+    /// line after the key epoch breaks the chain permanently). `AttendedOnly` still
+    /// appends untagged — that is the case the epoch legitimately covers.
+    fn append_or_buffer(&self, st: &mut State, rec: &SessionRecord) -> Result<(), StoreError> {
+        if Self::log_key_unavailable(st) {
+            if st.pending_log.len() < MAX_PENDING_LOG {
+                st.pending_log.push(rec.clone());
+            } else {
+                st.pending_log_dropped = st.pending_log_dropped.saturating_add(1);
+            }
+            return Ok(());
+        }
+        self.inner.log.append(rec)?;
+        Ok(())
+    }
+
+    /// Append everything buffered during the locked window, now that `K_log` is
+    /// installed and every line can carry a tag.
+    fn flush_pending_log_locked(&self, st: &mut State) {
+        if st.pending_log.is_empty() && st.pending_log_dropped == 0 {
+            return;
+        }
+        let dropped = std::mem::take(&mut st.pending_log_dropped);
+        for rec in std::mem::take(&mut st.pending_log) {
+            if let Err(e) = self.inner.log.append(&rec) {
+                tracing::error!(error = %e, "could not flush a buffered log record");
+            }
+        }
+        if dropped > 0 {
+            let rec = SessionRecord::at(st.wall_hwm, SessionEvent::StoreLoadFailed).detail(
+                format!("{dropped} log records dropped while the keystore was locked"),
+            );
+            if let Err(e) = self.inner.log.append(&rec) {
+                tracing::error!(error = %e, "could not log the buffered-record overflow");
+            }
+        }
+    }
+
     fn load_locked(&self, st: &mut State) {
         let (now, _) = self.wall_locked(st);
         let mono = self.inner.clock.mono();
@@ -538,6 +598,10 @@ impl GrantStore {
             }
             Ok(Some((master, generation, mut store))) => {
                 self.inner.log.set_log_key(Some(master.k_log()));
+                // The keystore_locked -> readable recovery load (§B.8.9): everything
+                // buffered while the key was unreadable is appended tagged, before any
+                // record this load produces, preserving log order.
+                self.flush_pending_log_locked(st);
                 st.k_unatt = Some(master.k_unatt());
                 st.master = Some(master);
                 st.generation = generation;
@@ -650,10 +714,12 @@ impl GrantStore {
                 }
                 let rec =
                     SessionRecord::at(now, SessionEvent::StoreLoadFailed).detail(e.to_string());
-                if let Err(le) = self.inner.log.append(&rec) {
+                // Set the status first: `append_or_buffer` keys off it, and this record
+                // is itself part of the locked window when `e` is `KeystoreLocked`.
+                st.status = StoreStatus::FailedClosed(e);
+                if let Err(le) = self.append_or_buffer(st, &rec) {
                     tracing::error!(error = %le, "could not log StoreLoadFailed");
                 }
-                st.status = StoreStatus::FailedClosed(e);
                 st.store = None;
                 st.k_unatt = None;
                 st.runtime.clear();
@@ -829,7 +895,7 @@ impl GrantStore {
             }
             Ok(())
         } else {
-            self.inner.log.append(record)?;
+            self.append_or_buffer(&mut st, record)?;
             Ok(())
         }
     }
@@ -1227,7 +1293,7 @@ impl GrantStore {
             }
             Ok(())
         } else {
-            self.inner.log.append(&rec)?;
+            self.append_or_buffer(st, &rec)?;
             Ok(())
         }
     }
