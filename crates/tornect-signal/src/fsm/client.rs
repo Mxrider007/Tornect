@@ -11,6 +11,7 @@
 //! ```
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,9 +19,12 @@ use ed25519_dalek::VerifyingKey;
 use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Instant;
+use tornect_core::unattended::hosts::PinCheck;
 use tornect_core::{DeviceIdentity, TornectId};
+use zeroize::Zeroizing;
 
 use super::{Channel, HandshakeError, OsRandom, Randomness, Received, SessionToken, timeouts};
+use crate::auth;
 use crate::consent::{TransportPolicy, mode_from_code};
 use crate::envelope::{Kind, codes};
 use crate::messages::{
@@ -64,13 +68,58 @@ impl ClientConfig {
 }
 
 /// What to do once `HELLO_ACK` verified.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
     /// Pair if the host is unknown (an already known host is reported as
     /// paired without a new exchange), then `BYE{USER}`.
     PairOnly,
     /// Pair if the host is unknown, then request an attended session.
     Session,
+    /// Request an **unattended** session (§B.8): no popup on the host, the grant
+    /// password proven with the PAKE instead. Pairing must already have happened
+    /// (a grant exists only for a SAS-paired device, §B.8 hard rule 2).
+    Unattended(UnattendedIntent),
+}
+
+/// What an unattended client needs beyond the attended path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UnattendedIntent {
+    /// The grant password. Never logged, never persisted by this crate.
+    pub password: Zeroizing<String>,
+    /// A [`messages::mode`] value; the host clamps it toward view-only.
+    pub want_mode: u8,
+}
+
+impl fmt::Debug for UnattendedIntent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnattendedIntent")
+            .field("password", &"<redacted>")
+            .field("want_mode", &self.want_mode)
+            .finish()
+    }
+}
+
+/// The client's TOFU pin for the host's OPAQUE static key (`hosts.toml`, §B.8.9).
+///
+/// A pin change means the host's unattended setup was replaced — or someone is
+/// impersonating it — and MUST abort before KE3 is sent (A16).
+pub trait ServerKeyPin: Send + Sync {
+    /// Check `server_s_pk` against the stored pin.
+    fn check(&self, host: &TornectId, server_s_pk: &[u8; 32]) -> PinCheck;
+    /// Record the key after a successful `SESSION_ACCEPT` (first use).
+    fn record(&self, host: &TornectId, server_s_pk: &[u8; 32]);
+}
+
+/// Headless default: trust on first use, remember nothing. Test-and-CLI-shim
+/// only — a real client passes a `hosts.toml`-backed implementation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoServerKeyPin;
+
+impl ServerKeyPin for NoServerKeyPin {
+    fn check(&self, _: &TornectId, _: &[u8; 32]) -> PinCheck {
+        PinCheck::NoPin
+    }
+    fn record(&self, _: &TornectId, _: &[u8; 32]) {}
 }
 
 /// The client's pairing UI: shows the SAS while the host user compares, then
@@ -158,6 +207,8 @@ pub struct ClientDeps {
     pub ui: Arc<dyn ClientPairingUi>,
     /// Nonces.
     pub random: Arc<dyn Randomness>,
+    /// The `hosts.toml` TOFU pin for the host's OPAQUE static key (§B.8.9).
+    pub server_key_pin: Arc<dyn ServerKeyPin>,
 }
 
 impl ClientDeps {
@@ -168,6 +219,7 @@ impl ClientDeps {
             known_hosts,
             ui: Arc::new(NoPairingUi),
             random: Arc::new(OsRandom),
+            server_key_pin: Arc::new(NoServerKeyPin),
         }
     }
 }
@@ -480,6 +532,23 @@ where
         Some(k) => (k.label, k.host_device_pk),
     };
 
+    // §B.8: the unattended branch has its own request, its own AUTH exchange and
+    // its own accept checks; everything before this point (HELLO, HELLO_ACK,
+    // pairing) is shared.
+    if let Intent::Unattended(ua) = &intent {
+        return unattended_session(
+            chan,
+            cfg,
+            identity,
+            deps,
+            ua,
+            host_pk,
+            host_label,
+            host_device_pk,
+        )
+        .await;
+    }
+
     // SESSION_REQUEST (attended).
     let request = SessionRequest {
         caps: cfg.caps.clone(),
@@ -599,4 +668,165 @@ where
         .pin(cfg.host, &host_name, accept.host_device_pk)?;
     tracing::info!(host = %cfg.host, %host_name, "host paired");
     Ok((host_name, accept.host_device_pk))
+}
+
+/// The `SESSION_REQUEST{unattended}` … `SESSION_ACCEPT` exchange of §B.8.4.2.
+///
+/// Runs after `HELLO` / `HELLO_ACK` (and pairing, if the host was unknown), so
+/// `chan` is already at `th_after(HELLO_ACK)` or later and the host key is
+/// verified. Strict alternation applies throughout (§B.8.4.5): the only frames
+/// this side may see are `AUTH_CHALLENGE`, then `SESSION_ACCEPT` / `SESSION_REJECT`.
+#[allow(clippy::too_many_arguments)]
+async fn unattended_session<S>(
+    mut chan: Channel<S>,
+    cfg: &ClientConfig,
+    identity: &DeviceIdentity,
+    deps: &ClientDeps,
+    ua: &UnattendedIntent,
+    host_pk: VerifyingKey,
+    host_label: String,
+    host_device_pk: [u8; 32],
+) -> Result<ClientOutcome<S>, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let host_onion_pk = cfg.host.public_key_bytes();
+    let device_pk = HostSigner::public_key(identity);
+
+    // A fresh ClientLogin per stream: the OPRF blind must never be reused.
+    let (login, ke1) = auth::ClientLogin::start(&ua.password)
+        .map_err(|_| HandshakeError::Aborted("PAKE start failed"))?;
+
+    let request = SessionRequest {
+        caps: cfg.caps.clone(),
+        unattended: Some(messages::UnattendedRequest {
+            suite: auth::SUITE_OPAQUE,
+            ke1: Some(ke1),
+            want_mode: ua.want_mode,
+            intent: messages::intent::SESSION,
+            admin: None,
+        }),
+    };
+    chan.send(&request, Some(identity)).await?;
+    // `context` is bound to the *signed* SESSION_REQUEST (§B.8.4.3).
+    let th_after_request = chan.th();
+
+    // AUTH_CHALLENGE (30 s). A pre-PAKE refusal arrives as SESSION_REJECT here.
+    let rx = chan
+        .recv_expect(
+            timeouts::AUTH_CHALLENGE,
+            "AUTH_CHALLENGE",
+            &[Kind::AuthChallenge, Kind::SessionReject],
+        )
+        .await?;
+    if rx.env.kind == Kind::SessionReject {
+        let reject: SessionReject = chan.body(&rx).await?;
+        chan.absorb(&rx);
+        chan.close().await;
+        return Err(HandshakeError::SessionRejected {
+            reject: Box::new(reject),
+        });
+    }
+    let challenge: messages::AuthChallenge = chan.body(&rx).await?;
+    chan.absorb(&rx);
+    if challenge.suite != auth::SUITE_OPAQUE {
+        return Err(chan.fail(codes::E_BAD_LEN, "suite").await);
+    }
+    let Some(ke2) = challenge.ke2 else {
+        return Err(chan.fail(codes::E_BAD_LEN, "ke2").await);
+    };
+
+    let ctx = auth::context(
+        &th_after_request,
+        auth::SUITE_OPAQUE,
+        messages::intent::SESSION,
+    );
+    let ids = auth::identifiers(&device_pk, host_onion_pk);
+    let out = login
+        .finish(&ua.password, &ke2, &ctx, ids)
+        .map_err(|_| HandshakeError::Aborted("unattended authentication failed"))?;
+
+    // §B.8.9 / A16: a changed `server_s_pk` means the host's unattended setup was
+    // replaced — abort *before* KE3, so a wrong host never sees the proof.
+    match deps.server_key_pin.check(&cfg.host, &out.server_s_pk) {
+        PinCheck::Mismatch => {
+            chan.close().await;
+            return Err(HandshakeError::Aborted(
+                "the host's unattended setup changed: pin mismatch",
+            ));
+        }
+        PinCheck::Match | PinCheck::NoPin => {}
+    }
+
+    chan.send(
+        &messages::AuthResponse {
+            ke3: Some(out.ke3),
+            pa: None,
+            ca: None,
+        },
+        None,
+    )
+    .await?;
+    let th_after_response = chan.th();
+
+    // SESSION_ACCEPT within the fixed 110 s budget (§B.8.4.5): grant policy is
+    // not disclosed before it, so the wait is deliberately uninformative.
+    let rx = chan
+        .recv_expect(
+            timeouts::SESSION_ACCEPT,
+            "SESSION_ACCEPT",
+            &[Kind::SessionAccept, Kind::SessionReject],
+        )
+        .await?;
+    if rx.env.kind == Kind::SessionReject {
+        let reject: SessionReject = chan.body(&rx).await?;
+        chan.absorb(&rx);
+        chan.close().await;
+        return Err(HandshakeError::SessionRejected {
+            reject: Box::new(reject),
+        });
+    }
+    let accept: SessionAccept = chan.body(&rx).await?;
+    if verify_envelope(&host_pk, &chan.th(), &rx.env).is_err() {
+        return Err(chan.fail(codes::E_BAD_SIG, "signature").await);
+    }
+    chan.absorb(&rx);
+
+    if accept.session_type() != messages::session_type::UNATTENDED {
+        return Err(chan.fail(codes::E_BAD_STATE, "session_type").await);
+    }
+    // The mirror of the attended rule: the token is *derived*, never sent, and
+    // the host proves it holds the same one with `token_confirm` (§B.8.4.3).
+    let (None, Some(confirm)) = (accept.session_token(), accept.token_confirm()) else {
+        return Err(chan.fail(codes::E_BAD_LEN, "token_confirm").await);
+    };
+    let ck = auth::confirm_key(&out.session_key, &th_after_response);
+    let expected = auth::token_confirm(&ck, &th_after_response);
+    if !bool::from(expected.ct_eq(confirm)) {
+        return Err(chan.fail(codes::E_BAD_SIG, "token_confirm").await);
+    }
+    let token = SessionToken::new(*auth::session_token(&out.session_key, &th_after_response));
+
+    let expected_spki = ed25519_spki(&host_device_pk);
+    if !bool::from(accept.quic_spki()[..].ct_eq(&expected_spki[..])) {
+        return Err(chan.fail(codes::E_BAD_SIG, "quic_spki").await);
+    }
+    if mode_from_code(accept.mode()).is_none()
+        || TransportPolicy::from_code(accept.transport_policy()).is_none()
+    {
+        return Err(chan.fail(codes::E_BAD_LEN, "mode").await);
+    }
+
+    // Only now, with the host's proof verified, is the key worth remembering.
+    deps.server_key_pin.record(&cfg.host, &out.server_s_pk);
+    deps.known_hosts.touch(&cfg.host);
+    tracing::info!(host = %cfg.host, session = %token.session_id(), "unattended session accepted");
+    Ok(ClientOutcome::Session(Box::new(ClientSession {
+        chan,
+        accept,
+        token,
+        host_label,
+        random: Arc::clone(&deps.random),
+        pending: VecDeque::new(),
+    })))
 }
