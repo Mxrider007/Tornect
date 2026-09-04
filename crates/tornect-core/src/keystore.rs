@@ -23,6 +23,33 @@ pub const HOST_IDENTITY_SEED: &str = "host-identity.ed25519-seed";
 /// Keystore entry holding this machine's client-device identity seed.
 pub const DEVICE_IDENTITY_SEED: &str = "device-identity.ed25519-seed";
 
+/// Which backend holds the secrets (`docs/PLAN.md` §B.8.9; `StatusReport.keystore_kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeystoreKind {
+    /// An OS keychain (`keyring-core` backend).
+    OsKeychain,
+    /// The `0600` file store — the "weaker keystore" of §B.8.9 (expiry capped at 90 d,
+    /// zxcvbn ≥ 4 required).
+    File,
+}
+
+impl KeystoreKind {
+    /// Wire byte of `StatusReport.keystore_kind` (`0` os_keychain · `1` file).
+    #[must_use]
+    pub fn wire(self) -> u8 {
+        match self {
+            Self::OsKeychain => 0,
+            Self::File => 1,
+        }
+    }
+
+    /// Whether this is the file store.
+    #[must_use]
+    pub fn is_file(self) -> bool {
+        self == Self::File
+    }
+}
+
 /// A place to keep small secrets by name.
 pub trait SecretStore: Send + Sync {
     /// Fetch a secret, or `None` if absent.
@@ -34,6 +61,10 @@ pub trait SecretStore: Send + Sync {
     /// Whether a secret exists.
     fn contains(&self, name: &str) -> Result<bool> {
         Ok(self.get(name)?.is_some())
+    }
+    /// Which backend this is (readiness and `StatusReport.keystore_kind`).
+    fn kind(&self) -> KeystoreKind {
+        KeystoreKind::File
     }
 }
 

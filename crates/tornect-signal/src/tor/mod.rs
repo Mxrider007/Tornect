@@ -23,6 +23,10 @@ pub use config::{
     POW_REND_QUEUE_DEPTH, pow_supported,
 };
 pub use crypto_provider::install_crypto_provider;
+/// RFC 8032 seed expansion, shared with the envelope signature test that proves
+/// Arti's expanded key signs exactly like ed25519-dalek from the seed (M1-11).
+#[cfg(test)]
+pub(crate) use identity::expand_seed as identity_expand_seed;
 pub use identity::{ForgottenIdentity, forget_identity, onion_address_for};
 pub use listener::{
     ACCEPT_QUEUE_LEN, ACCEPT_TIMEOUT, Admission, CIRCUIT_IDLE_TIMEOUT, MAX_CONCURRENT_HANDSHAKES,
