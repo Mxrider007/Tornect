@@ -55,11 +55,9 @@ runs **after M1, before M2**; the UI plan's "Always allow" checkbox/badge is rej
 
 ## Open / next (in order)
 
-1. **The third review round of tracks A and B never ran** — the workflow's confirmation pass
-   died on a model usage limit after the round-2 fixes were applied. Those fixes are green
-   but unreviewed. Re-run a review-only pass over `crates/tornect-core/src/unattended/**` and
-   `crates/tornect-signal/src/{envelope,messages,transcript,pairing,consent,fsm}` before the
-   milestone security review (or fold it into that review).
+1. ~~The third review round of tracks A and B~~ — **done 2026-09-04** (commits `5391f76`,
+   `7762849`, `3ee4943`). See *Round 3* below. It does **not** replace the milestone
+   `security-reviewer` close, which still has to run over the finished M1.
 2. **Track C — the unattended branch** (`tornect-signal::auth`): OPAQUE-3DH authenticator
    (`opaque-ke` 4.0.1 per `docs/research/crypto.md` §8), the key schedule of §B.8.4.3,
    the host `AwaitKe3` FSM branch wired to `AttemptLimiter` + `MutationGuard`, the client
@@ -85,6 +83,38 @@ word list is vendored), `mlock`/`VirtualLock` memory hygiene (M6), the keyring c
 persistent OS backends (M6 — the M1 `keyring` feature is test/CI-only), the §B.8.5.2 host-wide
 budgets (owned by the signal FSM, land with track C), and grant preconditions reading
 unauthenticated inputs (`SessionLogHistory` / `FilePairedDevices`).
+
+## Round 3 (2026-09-04)
+
+Twelve hostile reviewers over the ~20 k unreviewed lines of tracks A and B, each finding then
+attacked by three perspective-diverse refuters (correctness / security / spec) with
+majority-refute killing it: **38 raw findings → 3 confirmed, 35 refuted.** Full report,
+including the refuted set so a later pass does not re-litigate it, in
+`kore_project_V3/agents/security/reports/2026-09-04_tornect_m1_round3_review.md`.
+
+- **HIGH — the SAS was grindable (`3ee4943`, decision M1-37, supersedes M1-8).** The r6 input
+  `th_after(PAIR_REQUEST)` is attacker-malleable on *both* sides after the peer's contribution
+  is visible, against a ~2^20 code: a MITM grinds `host_nonce` toward the client and the
+  unsigned `PAIR_REQUEST` toward the host (`client_auth_pk` is parsed and discarded but still
+  absorbed; unknown CBOR keys are ignored by design). Reproduced: ~1500 candidates per side,
+  collision at 323, both screens `034 057`, ~60 ms of signing — inside the 20 s `HELLO_ACK`
+  timeout. §B.3 amended to commit-then-reveal (`HELLO.sas_commit`, `PAIR_REQUEST.sas_nonce`,
+  `SAS = HKDF(th_after(HELLO_ACK) || sas_nonce)`); both golden vectors and the envelope fuzz
+  seeds regenerated; `client_random()` scripts a second value. Note for r7: this **partly
+  answers M1-31** — signing `PAIR_REQUEST` alone would not have fixed it, since the attacker
+  re-signs each candidate with its own key.
+- **MEDIUM — a locked keystore permanently broke the log chain (`5391f76`).** Untagged lines
+  written while `K_master` exists but is unreadable land after the key epoch and past
+  `log_chain_head`, so `verify_chain` returns `Broken` forever after the recovery load: a
+  standing tamper badge with nothing tampered, clearable only by `reset_store`. Now buffered
+  and flushed tagged.
+- **LOW — the file-keystore password escalation was never tested (`7762849`).** Its only
+  discriminating assertion sat in a dead branch, while `VERIFICATION.md` recorded U3 as
+  VERIFIED on the strength of it; a mutation deleting the escalation left the suite green.
+
+Both fixes are pinned by regressions that fail against the pre-fix code (verified by
+mutation / by reverting the single file). Gate after the round: `cargo xtask verify` green,
+**271 tests** (153 core + 118 signal).
 
 ## Gotchas (dev VM mx-vm)
 
