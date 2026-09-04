@@ -1,70 +1,105 @@
-# M1 state — signaling over Tor (hand-off, 2026-08-29)
+# M1 state — signaling over Tor (hand-off, 2026-09-04)
 
-Milestone 1 is **partially done**: track 1 (Arti embedding) is implemented, reviewed and
-verified live; tracks 2–4 (envelope protocol + pairing/SAS, unattended OPAQUE FSM, CLI/IPC/
-platform scaffold) are specified and scripted but not started. `m1` is **not** tagged.
+Milestone 1 is **about half done**: track 1 (Arti embedding) and phase-2 part 1 (tracks A + B:
+the unattended storage/limiter/guard/IPC types in `tornect-core`, and the CBOR envelope,
+transcript, pairing/SAS and attended FSM in `tornect-signal`) are implemented, reviewed twice
+and green. The unattended PAKE branch (track C), the CLI/IPC/`tornect-platform` surface
+(track D), the adversarial + fuzz sweep (track E), the milestone security review and the live
+verification are **not started**. `m1` is **not** tagged.
 
-## Done (commit `0e568d8`, plan `c515f0d`)
+## Done
 
-- `tornect-signal::tor`: `TorNode` (rustls/ring provider install, unbootstrapped create +
-  bootstrap progress watch, `publish`, `connect` with fresh isolation group, `SignalError`
-  mapping from `ErrorKind`), `OnionListener` (accepts only `BEGIN` on `SIGNALING_PORT = 4000`,
-  32-handshake / 64-circuit budgets; **backpressure** into Arti's effort-ordered PoW queue when
-  PoW is on, drain-and-drop when off — decision M1-4), `OnionStream` (tokio AsyncRead/Write),
-  identity derivation seed → RFC 8032 expanded key → `HsIdKeypair` installed via `tor-keymgr`
-  (decision M1-1; nickname `tornect-<first 8 chars>`; rotate-id purges `hss/<nick>` — M1-6),
-  `framing` (u32-BE, 64 KiB), interim `ping` protocol, `tests/live.rs` (`--ignored`).
-- CLI: `tornect host [--once] [--pow|--no-pow]`, `tornect ping <onion> [--count N]`.
-- Gates: `cargo xtask verify` (plan sync, forbidden deps aws-lc/openssl, fmt, clippy, tests,
-  docs) green; 26 core + 43 signal tests; `fuzz/` crate (workspace-excluded) with a framing target.
-- Live evidence (`docs/notes/m1-track1-evidence.md`): cold bootstrap 10–20 s; onion reachable
-  73 s (first run) … up to ~5 min under HSDir upload timeouts; ping RTT 0.5–1.1 s; identical
-  ID after SIGINT + restart; warm bootstrap ≈ 1 s.
-- Plan r4 (`TORNECT_PLAN.md` == `docs/PLAN.md`, 1696 lines) with §B.8 Unattended access.
-- Research notes `docs/research/*.md` + `SUMMARY.md` (audit) — code from these, not memory.
+**Track 1 — Arti (commit `0e568d8`).** `tornect-signal::tor`: `TorNode`, `OnionListener`
+(PoW-aware admission with backpressure, handshake/circuit budgets), `OnionStream`, identity
+derivation seed → Arti keystore so `tornect id` == the published address, `framing`, the interim
+`ping` protocol, `tests/live.rs`. CLI `tornect host` / `tornect ping`. Verified live over Tor
+twice (evidence: `docs/notes/m1-track1-evidence.md`).
 
-## Open findings (plan text, medium) — **applied in plan r6 (2026-08-29), tightened by the r6 review pass**
+**Toolchain + plan (commits `d90e795`, `879f461`).** `rust-toolchain.toml` pins 1.96.0
+(rustfmt, clippy, the two cross targets); `rust-version`/`clippy.toml msrv` 1.95. Plan
+**r6**: the two r5 findings applied (monotonic decay/clock with a `Clock` trait; local
+`Suspended{Local{by}}`), the research-audit amendments applied (§A.2, §A.4, §B.2 punch +
+`quic_spki`, §B.4, §B.5, §B.6 raw public keys, D5/D6/D9/D10/D12/D13, Part C M2/M3), and the
+user's `TORNECT_UI_PLAN.md` adopted as `docs/UI_PLAN.md` (byte-identical, gated by
+`xtask verify`) and reconciled in Part G + Part F.6 — UI milestone `u1` (= UI plan U0 + U1)
+runs **after M1, before M2**; the UI plan's "Always allow" checkbox/badge is rejected per
+§B.2/§B.8. Two adversarial review passes were applied to r6 in place.
 
-1. [applied r6] §B.8.2 T12 / §B.8.5.1 / §B.8.5.3: decay bookkeeping is wall-clock based, so a forward
-   clock jump at runtime would decay counters; fix = monotonic twins for runtime decay (`Clock`
-   trait, `credit` rule, monotone `last_seen`), cap steps at load, reword T12 honestly, U1–U7 clock cases.
-2. [applied r6] §B.8.9 `GrantState::Suspended{reason}`: a *local* suspend (CLI/IPC/UI) has no reason
-   variant; add `Local{by: Actor}`, state that a remote `unlock` never clears it, extend A15
-   (+ §B.8.7.3 *Suspend*/*Resume*, §B.8.7.4 `IpcOp` annotations, `UnattendedSuspended{reason, by?}`).
+**Phase-2 part 1 (commit `cd878f3`, ~3 200 changed lines + ~21 000 new lines incl. tests).**
 
-Plus the plan amendments the research audit lists (`docs/research/SUMMARY.md` "Cross-cutting"):
-§A.2 FFmpeg version, §A.4 GNOME lock-screen constraint, §B.2 punch mechanics + `quic_spki`,
-§B.4 Opus FEC / MTU / header sizes, §B.5 Wayland token placement + codec fallbacks, §B.6 RPK,
-D9 `opus`, D10 no eframe, D13 `keyring-core`, M2 `stun` crate — applied in r6 (Part G lists them).
+- `tornect-core::unattended::{store, grant, schedule, codec, limiter, clock, guard, readiness,
+  ipc, password, hosts, keyring}` — `UnattendedStore`/`UnattendedGrant`/`FailState` per §B.8.9,
+  XChaCha20-Poly1305 store with the generation anchor + `pending_anchor`, fail-closed load
+  rules, machine-id check, `GrantStore` with an advisory lock, `hosts.toml` (`server_s_pk`
+  pin); `Clock`/`FakeClock` + `AttemptLimiter` (`charge`/`settle`/`gate`/`post_f2`) with the
+  r6 decay semantics; `MutationGuard` as the single enforcement point with `ReAuth`,
+  `RemoteSessionActivity`, `Presence`, `AttendedHistory` defined here, all three mutation
+  classes and the `reg_txn` flow (`G_NO_TXN`); `ReadinessSnapshot`/`Probe` (all-Unknown M1
+  stub); the §B.8.7.4 IPC types + CBOR codec; `session_log` §B.8.13 events + hash chain +
+  rotation + startup verifier; the §B.8.7.2 password policy.
+- `tornect-signal::{envelope, messages, transcript, pairing, consent, fsm}` — the §B.3
+  positional CBOR envelope with the `E_*` rules, every message body (including the
+  `AUTH_*`/`ADMIN_RESULT` types the next track fills with behaviour), the §B.8.4.3 transcript
+  and domain-separated Ed25519 signatures with two committed golden vectors, pairing +
+  `tornect-core::trusted` (`TrustedDevices`/`KnownHosts`, token bucket, temp-ban) and the SAS
+  definition (now normative in plan §B.3, decision M1-8), and the attended host/client state
+  machines over any `AsyncRead + AsyncWrite` with strict alternation, every §B.8.4.5 timeout
+  and the `Consent`/`ClientPairingUi`/`StopTokenCheck`/`UnattendedHook`/`BlockWindow`/
+  `LocalAllow` seams. `SessionAccept::build(ConsentProof, caps)` is the only constructor.
+- Fuzz: `fuzz/fuzz_targets/{envelope, store, ipc}.rs` (F1, F3, F4) next to `framing`, with
+  minimized corpora committed.
+- Gate: `cargo xtask verify` green — fmt, clippy `-D warnings` (all targets), **152
+  `tornect-core` + 116 `tornect-signal` tests**, docs; `cargo deny check` green after
+  allowing `BlueOak-1.0.0` (minicbor). Decisions `M1-7 … M1-36`; ~62 VERIFIED rows in
+  `docs/VERIFICATION.md`.
 
-## Next: M1 phase 2 (script ready)
+## Open / next (in order)
 
-Workflow script: `~/.claude/projects/-home-mx-Tornect/<session>/workflows/scripts/tornect-m1-phase2.js`
-(copy of the design lives in this note's sibling `m1-phase2-plan.md` if the session dir is gone).
-Before launching:
-1. Add `pub mod unattended;` and `pub mod trusted;` stubs to `crates/tornect-core/src/lib.rs`
-   (tracks A and B both touch core; pre-creating the module lines avoids a lost update).
-2. Bump `rust-version = "1.95"` in `Cargo.toml` + `clippy.toml msrv`, add `rust-toolchain.toml`
-   (`channel = "1.96.0"`, components rustfmt + clippy) — arti-client needs 1.91, egui 0.36 needs 1.95.
-3. The two plan findings above are applied (r6); read plan §B.8.5.1/§B.8.5.3 (`Clock` trait, `credit`) before track A.
-Tracks (each implement → security + correctness review → fix): A core store/limiter/guard/log
-chain (§B.8.5/6.2/9/13), B envelope/transcript/pairing/SAS/attended FSM (§B.3, §B.8.4), then
-C OPAQUE unattended FSM (§B.8.4–6), then D CLI + IPC + `tornect-platform` scaffold (§B.8.7.4),
-then E adversarial/fuzz sweep (§B.8.15 M1 rows), security review, live verification
-(pair + attended + unattended over real Tor with two `TORNECT_HOME` instances), then tag `m1`.
+1. **The third review round of tracks A and B never ran** — the workflow's confirmation pass
+   died on a model usage limit after the round-2 fixes were applied. Those fixes are green
+   but unreviewed. Re-run a review-only pass over `crates/tornect-core/src/unattended/**` and
+   `crates/tornect-signal/src/{envelope,messages,transcript,pairing,consent,fsm}` before the
+   milestone security review (or fold it into that review).
+2. **Track C — the unattended branch** (`tornect-signal::auth`): OPAQUE-3DH authenticator
+   (`opaque-ke` 4.0.1 per `docs/research/crypto.md` §8), the key schedule of §B.8.4.3,
+   the host `AwaitKe3` FSM branch wired to `AttemptLimiter` + `MutationGuard`, the client
+   branch with the `server_s_pk` TOFU pin, admin intent + scope, the stop token.
+3. **Track D — CLI/IPC/platform**: `tornect pair|connect|unattended …|panic|devices`, the
+   host-role IPC dispatch loop, and the `tornect-platform` scaffold (`ipc`, `reauth`).
+4. **Track E — adversarial + fuzz sweep**, then the `security-reviewer` milestone close, then
+   **live verification** (pair + attended + unattended over real Tor with two `TORNECT_HOME`
+   instances), then tag `m1`.
+
+Cross-track notes left by the tracks: the CLI track must send `TOR_FALLBACK{}` after the accept
+(or set `orphan_timeout = None`) and use `fsm::HostAudit::new(Arc<SessionLog>)` as
+`HostDeps::audit`; `apps/tornect`'s `rotate-id` appends its own `HostIdRotated` and must stop
+once it is wired to the guard.
+
+**Deferred to plan r7** (decisions M1-31/M1-32 carry the options): whether `PAIR_REQUEST` /
+`PAIR_ACCEPT` should be signed (§B.3 lists `PAIR_ACCEPT` unsigned, so a pairing-only exchange has
+no signed frame), and whether `quic_spki` should bind the pairing-pinned `host_device_pk` rather
+than the onion identity key (M1 implements the onion key; §B.6 says it must equal the pairing pin).
+
+**OPEN rows in `docs/VERIFICATION.md`** worth knowing: the EFF passphrase generator (M8 — no
+word list is vendored), `mlock`/`VirtualLock` memory hygiene (M6), the keyring canary and the
+persistent OS backends (M6 — the M1 `keyring` feature is test/CI-only), the §B.8.5.2 host-wide
+budgets (owned by the signal FSM, land with track C), and grant preconditions reading
+unauthenticated inputs (`SessionLogHistory` / `FilePairedDevices`).
 
 ## Gotchas (dev VM mx-vm)
 
 - Build with `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp`; `/tmp` is a 3.7 GiB quota tmpfs
   (zstd-sys fails there); Tor state under `target/tornect-test/<name>`, never `/tmp`.
-- A full `cargo run -p tornect` rebuild of the Arti graph takes ~2–3 min; the pre-commit hook
-  runs clippy (≈ 35 s warm).
-- Arti's `status_events()` is eventually consistent: clients connect while the host still
-  reports `Bootstrapping`; `REACHABLE` may take minutes (HSDir upload timeouts). Tor transients
-  happen — the CLI retries; scripted verification should retry `ping` up to 3×.
-- PoW manager threads cannot observe runtime shutdown; `shutdown_runtime` mutes that one tokio
-  message (documented in listener.rs; worth reporting upstream).
+- A cold Arti rebuild is 2–5 min; the pre-commit hook runs fmt + clippy
+  (`TORNECT_SKIP_HOOKS=1` for docs-only commits).
+- If a worktree ever shares `target/`, `target/debug/xtask` embeds *that* worktree's root and
+  `cargo xtask verify` will silently verify the wrong tree — `touch xtask/src/main.rs` first,
+  or give the worktree its own `CARGO_TARGET_DIR`.
+- Arti's status stream is eventually consistent: clients connect while the host still reports
+  `Bootstrapping`; `REACHABLE` can take minutes; retry `tornect ping` up to 3× on transients.
+- Parallel tracks must not share files: pre-create module stubs and give each track an explicit
+  ownership list; shared docs (`DEPENDENCIES.md`, `VERIFICATION.md`, `decisions.md`) get
+  small targeted insertions only, re-read immediately before each edit.
 - `.github/workflows/ci.yml` is written but excluded (`.git/info/exclude`) until the `gh` token
-  has the `workflow` scope: `gh auth refresh -h github.com -s workflow`, then
-  `git add -f .github/workflows/ci.yml && git commit -m "ci: add GitHub Actions workflow" && git push`.
-- `.claude/settings.json` must be created by the user from `.claude/settings.recommended.json`.
+  has the `workflow` scope; `.claude/settings.json` must be created by the user from
+  `.claude/settings.recommended.json`.
