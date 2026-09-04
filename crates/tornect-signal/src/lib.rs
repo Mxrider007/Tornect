@@ -39,6 +39,7 @@ pub mod pairing;
 pub mod ping;
 pub mod tor;
 pub mod transcript;
+pub mod unattended;
 
 pub use envelope::{Envelope, Kind};
 pub use error::SignalError;
