@@ -58,10 +58,13 @@ runs **after M1, before M2**; the UI plan's "Always allow" checkbox/badge is rej
 1. ~~The third review round of tracks A and B~~ — **done 2026-09-04** (commits `5391f76`,
    `7762849`, `3ee4943`). See *Round 3* below. It does **not** replace the milestone
    `security-reviewer` close, which still has to run over the finished M1.
-2. **Track C — the unattended branch** (`tornect-signal::auth`): OPAQUE-3DH authenticator
-   (`opaque-ke` 4.0.1 per `docs/research/crypto.md` §8), the key schedule of §B.8.4.3,
-   the host `AwaitKe3` FSM branch wired to `AttemptLimiter` + `MutationGuard`, the client
-   branch with the `server_s_pk` TOFU pin, admin intent + scope, the stop token.
+2. ~~Track C — the unattended branch~~ — **done 2026-09-04** (`08d391a`, `324b4d4`,
+   `fc48e24`). See *Track C* below. Two pieces of its B.8.14 row are **not** done and
+   are carried into track D: **admin intent + scope** (the branch reaches `ADMIN_RESULT`
+   but answers `ok: false, "not implemented at M1"` — the scope rules of §B.8.4.1,
+   `unlock(pk)` / `suspend(pk ≠ self)` / `revoke(pk ≠ self)` / `revoke_all`, are
+   unimplemented) and the **stop token** (`HELLO.stop_token` is observed by the existing
+   seam but nothing in the unattended path consults it yet).
 3. **Track D — CLI/IPC/platform**: `tornect pair|connect|unattended …|panic|devices`, the
    host-role IPC dispatch loop, and the `tornect-platform` scaffold (`ipc`, `reauth`).
 4. **Track E — adversarial + fuzz sweep**, then the `security-reviewer` milestone close, then
@@ -83,6 +86,47 @@ word list is vendored), `mlock`/`VirtualLock` memory hygiene (M6), the keyring c
 persistent OS backends (M6 — the M1 `keyring` feature is test/CI-only), the §B.8.5.2 host-wide
 budgets (owned by the signal FSM, land with track C), and grant preconditions reading
 unauthenticated inputs (`SessionLogHistory` / `FilePairedDevices`).
+
+## Track C — the unattended branch (2026-09-04)
+
+Three commits, each gated:
+
+- **`08d391a` — the crypto core (`tornect-signal::auth`).** OPAQUE-3DH over ristretto255
+  with Argon2id (64 MiB / t=3 / p=1) and the whole §B.8.4.3 schedule (`context`,
+  `identifiers`, `session_token`, `confirm_key`, `token_confirm`, `proof_fp`). No wire and
+  no store dependencies: `HostLogin` / `ClientLogin` are pure state machines over the byte
+  strings `AUTH_CHALLENGE` / `AUTH_RESPONSE` already carried. Both `crypto.md` traps are
+  handled explicitly — the KE hash is `sha2_010::Sha512` (digest 0.10, not the workspace
+  sha2 0.11) and the KSF is named through `opaque_ke::argon2` (0.5, not the workspace 0.6);
+  `OpaqueRng` feeds `getrandom` to opaque-ke's rand-0.8 API instead of vendoring a second
+  `rand`. Nine tests, including one that is functional rather than declarative: a record
+  registered under the suite KSF **cannot** be opened by a login that omits it, so a silent
+  regression to the crate's 19 MiB / t=2 default cannot pass.
+- **`324b4d4` — the host branch (`tornect-signal::unattended`).** `UnattendedAuth` is the
+  real `UnattendedHook`, replacing the `NOT_GRANTED` stub with the full §B.8.4.5 path. The
+  charge is write-ahead and fsynced before KE2 is written, and every exit path settles it;
+  a transport failure settles as the matching `FailKind` and returns the `HandshakeError`
+  unchanged so `serve_host` reports the documented code. The §B.8.5.2 budgets are held by
+  an `InFlight` guard that releases on drop. `OpaqueServerSetupSource` fills the
+  `ServerSetupSource` seam core declares but cannot implement.
+- **`fc48e24` — the client branch + end-to-end.** `Intent::Unattended` drives the exchange;
+  the accept checks mirror the attended ones (session type 1, `session_token` absent,
+  `token_confirm` present and verified in constant time). The `hosts.toml` TOFU pin enters
+  as a `ServerKeyPin` seam; a mismatch aborts **before** KE3 (A16) and the key is recorded
+  only after the host's `token_confirm` verified.
+
+`fsm::tests::unattended_session_end_to_end_over_a_duplex_pipe` is a real `connect()`
+against a real `serve_host` running the real hook — no stub at any layer — reaching
+`SESSION_ACCEPT` with a derived token and zero popups. That is the B.8.14 M1 acceptance
+shape minus the Tor transport; live verification over Tor stays in track E.
+
+Gate after track C: `cargo xtask verify` green, **286 tests**.
+
+**Harness notes for whoever writes the next tests.** A grant needs the master switch on
+(`MutationGuard::master_on`, off by default — §B.8 opt-in) and a preset that waives the
+"prior attended session" precondition (`Preset::HeadlessBox`); the OPAQUE registration must
+run against the `ServerSetup` the store ends up holding, so bootstrap the store first and
+read `server_setup()` back rather than generating one locally.
 
 ## Round 3 (2026-09-04)
 
