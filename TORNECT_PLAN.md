@@ -326,7 +326,11 @@ side sends first on `ctrl`, keyed by the QUIC TLS exporter over `session_token`,
 (§B.8.4.3). Signing: client HELLO and SESSION_REQUEST, host HELLO_ACK, SESSION_ACCEPT
 and ADMIN_RESULT carry ed25519 signatures over the transcript hash (envelope-level,
 §B.8.4.3) so device keys are bound to the channel (defense-in-depth on top of Tor's
-own crypto; and it is what makes the SAS code sound). `AUTH_CHALLENGE` and
+own crypto; and it is what makes the SAS code sound: `SAS = u32::from_be_bytes(HKDF-SHA256(ikm =
+th_after(PAIR_REQUEST), salt = "tornect/v1/sas", info = "sas-v1")[0..4]) % 1_000_000`, rendered as two
+zero-padded three-digit groups — `481 923` — and computable by both sides as soon as `PAIR_REQUEST`
+is sent / received, because `th_after(PAIR_REQUEST)` already commits to the dialed onion pk, the client
+device pk, both nonces and both signatures; decision M1-8). `AUTH_CHALLENGE` and
 `AUTH_RESPONSE` exist only between `SESSION_REQUEST{unattended}` and
 `SESSION_ACCEPT`/`SESSION_REJECT` — as does `ADMIN_RESULT`, which terminates an
 admin-intent exchange in place of `SESSION_ACCEPT`/`SESSION_REJECT` — inside the strictly

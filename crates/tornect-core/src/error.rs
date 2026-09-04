@@ -55,6 +55,29 @@ pub enum CoreError {
     /// The session log could not be written or read.
     #[error("session log error: {0}")]
     SessionLog(String),
+
+    /// The unattended store could not be encoded or sealed (§B.8.9).
+    #[error("unattended store error: {0}")]
+    Store(String),
+
+    /// The OS keychain backend refused or failed (`keyring` feature).
+    #[error("keychain error: {0}")]
+    Keychain(String),
+
+    /// The keychain entry exists but cannot be read right now (locked collection,
+    /// expired kernel keyring); readiness reports `keystore_locked` (§B.8.9).
+    #[error("keychain locked: {0}")]
+    KeychainLocked(String),
+
+    /// A `hosts.toml` file is not valid for [`crate::unattended::hosts::HostsFile`].
+    #[error("cannot parse {path}: {source}")]
+    HostsParse {
+        /// The file that failed to parse.
+        path: PathBuf,
+        /// Underlying TOML error.
+        #[source]
+        source: toml::de::Error,
+    },
 }
 
 /// Result alias for this crate.

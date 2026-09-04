@@ -24,6 +24,16 @@ tokio.workspace = true
 futures.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
+# Reserved for the unattended track's `token_confirm` HMAC (§B.8.4.3); hkdf
+# already pulls it in, so it costs nothing until then.
+hmac.workspace = true
+hkdf.workspace = true
+subtle.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+ed25519-dalek.workspace = true
+minicbor.workspace = true
+unicode-normalization.workspace = true
 
 # The only place in the workspace that may import Arti (CLAUDE.md).
 arti-client.workspace = true
@@ -42,6 +52,8 @@ rustls.workspace = true
 tempfile.workspace = true
 proptest.workspace = true
 anyhow.workspace = true
+# `tokio::time::pause` / `start_paused` for the timeout tests (§B.8.4.5 timers).
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -1,12 +1,19 @@
 [package]
 name = "tornect-core"
-description = "Tornect identities, keys, configuration, keystore and telemetry"
+description = "Tornect identities, keys, configuration, keystore, unattended-access store and telemetry"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+
+[features]
+default = []
+# `K_master` in the OS keychain through `keyring-core` (docs/PLAN.md §B.8.9): the
+# Linux kernel keyutils store is the only M1 backend; the file keystore stays the
+# fallback and the readiness canary decides at runtime.
+keyring = ["dep:keyring-core", "dep:linux-keyutils-keyring-store"]
 
 [dependencies]
 anyhow.workspace = true
@@ -21,6 +28,8 @@ directories.workspace = true
 ed25519-dalek.workspace = true
 sha2.workspace = true
 sha3.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
 data-encoding.workspace = true
 zeroize.workspace = true
 getrandom.workspace = true
@@ -28,6 +37,17 @@ subtle.workspace = true
 hex.workspace = true
 fs-err.workspace = true
 time.workspace = true
+parking_lot.workspace = true
+# Unattended-access store and IPC message codec (docs/PLAN.md §B.8.9, §B.8.7.4).
+minicbor.workspace = true
+chacha20poly1305.workspace = true
+# Password policy (§B.8.7.2).
+unicode-normalization.workspace = true
+zxcvbn.workspace = true
+keyring-core = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-keyutils-keyring-store = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -8,6 +8,7 @@
 use std::io::ErrorKind;
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use zeroize::Zeroizing;
 
 /// Largest payload accepted or produced (64 KiB).
 pub const MAX_FRAME_LEN: usize = 65_536;
@@ -91,7 +92,9 @@ where
     Ok(Some(payload))
 }
 
-/// Write one frame (header + payload in a single write) and flush.
+/// Write one frame (header + payload in a single write) and flush. The
+/// staging buffer is zeroized afterwards: a `SESSION_ACCEPT` payload carries
+/// the attended session token.
 pub async fn write_frame<W>(writer: &mut W, payload: &[u8]) -> Result<(), FrameError>
 where
     W: AsyncWrite + Unpin,
@@ -103,7 +106,7 @@ where
             len: payload.len(),
             max: MAX_FRAME_LEN,
         })?;
-    let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
+    let mut buf = Zeroizing::new(Vec::with_capacity(HEADER_LEN + payload.len()));
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(payload);
     writer.write_all(&buf).await?;
