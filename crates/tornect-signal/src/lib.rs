@@ -28,6 +28,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod auth;
 pub mod consent;
 pub mod envelope;
 pub mod error;
