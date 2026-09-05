@@ -10,6 +10,7 @@ members = [
   "crates/tornect-audio",
   "crates/tornect-input",
   "crates/tornect-session",
+  "crates/tornect-platform",
   "apps/tornect",
   "xtask",
 ]
@@ -38,6 +39,7 @@ tornect-codec = { path = "crates/tornect-codec" }
 tornect-audio = { path = "crates/tornect-audio" }
 tornect-input = { path = "crates/tornect-input" }
 tornect-session = { path = "crates/tornect-session" }
+tornect-platform = { path = "crates/tornect-platform" }
 
 anyhow = "1.0.104"
 thiserror = "2.0.20"
@@ -112,6 +114,14 @@ zxcvbn = "=3.1.1"
 # OS keychain for K_master (§B.8.9), behind the `keyring` feature; file keystore is the fallback.
 keyring-core = "=1.0.0"
 linux-keyutils-keyring-store = "=1.0.0"
+# Milestone 1 — Linux OS re-authentication (§B.8.6.2, §B.8.8, §B.8.14). Pure-Rust
+# D-Bus client for polkit's `CheckAuthorization`: no libdbus, and no PAM headers
+# because polkit runs the PAM conversation out of process in its setuid
+# `polkit-agent-helper-1`. `async-io` off so the process keeps one runtime;
+# `blocking-api` off because `zbus::blocking` would spin up a second private
+# tokio runtime. Linux-only; `tornect-platform` gates it per target.
+zbus = { version = "=5.19.0", default-features = false, features = ["tokio"] }
+
 # Fuzzing helpers (fuzz/ crate is workspace-excluded; `arbitrary` derives shared with it).
 arbitrary = { version = "=1.4.2", features = ["derive"] }
 

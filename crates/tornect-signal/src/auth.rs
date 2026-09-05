@@ -394,9 +394,116 @@ impl ClientLogin {
 
 // ----------------------------------------------------------------- registration
 
+/// The client half of an OPAQUE registration, split across the two IPC round
+/// trips of §B.8.7.4.
+///
+/// The password never crosses the IPC socket — only `reg_request`,
+/// `reg_response` and `upload` do — so the party that knows it (the CLI, or the
+/// UI's enable flow) has to hold state between `RegStart` and `RegFinish`. This
+/// is that state.
+///
+/// It is deliberately not `Clone` and not `Debug`-printable: a duplicated
+/// registration state is a duplicated OPRF blind.
+pub struct PasswordRegistration {
+    state: ClientRegistration<TornectOpaque>,
+}
+
+impl PasswordRegistration {
+    /// Begin: produce the `RegistrationRequest` bytes for `RegStart`.
+    pub fn start(password: &str) -> Result<(Self, [u8; sizes::REG_REQUEST]), AuthError> {
+        let start = ClientRegistration::<TornectOpaque>::start(&mut OpaqueRng, password.as_bytes())
+            .map_err(|_| AuthError::Protocol)?;
+        let request = start
+            .message
+            .serialize()
+            .as_slice()
+            .try_into()
+            .map_err(|_| AuthError::Protocol)?;
+        Ok((Self { state: start.state }, request))
+    }
+
+    /// Finish against the host's `RegistrationResponse`, producing the
+    /// `RegistrationUpload` bytes for `RegFinish`.
+    ///
+    /// `ids` must be the same `Identifiers` the login will use, and the KSF must
+    /// be the suite's — both are inputs to the record, so a mismatch here shows
+    /// up much later as an unexplained authentication failure.
+    pub fn finish(
+        self,
+        password: &str,
+        reg_response: &[u8; sizes::REG_RESPONSE],
+        ids: Identifiers<'_>,
+    ) -> Result<[u8; sizes::RECORD], AuthError> {
+        let mut finish = self
+            .state
+            .finish(
+                &mut OpaqueRng,
+                password.as_bytes(),
+                RegistrationResponse::deserialize(reg_response).map_err(|_| AuthError::Protocol)?,
+                ClientRegistrationFinishParameters::new(ids, Some(&ksf())),
+            )
+            .map_err(|_| AuthError::Protocol)?;
+        let upload = finish
+            .message
+            .serialize()
+            .as_slice()
+            .try_into()
+            .map_err(|_| AuthError::Protocol);
+        // `*FinishResult` is `derive_where(Clone)` only — not `ZeroizeOnDrop`
+        // (docs/research/crypto.md; the track C review). Wipe explicitly.
+        wipe(finish.export_key.as_mut_slice());
+        upload
+    }
+}
+
+/// The host half of a split registration: answer a `RegistrationRequest`.
+///
+/// `credential_identifier` is the client's device public key (§B.8.4.3), the
+/// same value the login uses.
+pub fn registration_response(
+    setup: &ServerSetup<TornectOpaque>,
+    reg_request: &[u8; sizes::REG_REQUEST],
+    credential_identifier: &[u8],
+) -> Result<[u8; sizes::REG_RESPONSE], AuthError> {
+    let server = ServerRegistration::<TornectOpaque>::start(
+        setup,
+        RegistrationRequest::deserialize(reg_request).map_err(|_| AuthError::Protocol)?,
+        credential_identifier,
+    )
+    .map_err(|_| AuthError::Protocol)?;
+    server
+        .message
+        .serialize()
+        .as_slice()
+        .try_into()
+        .map_err(|_| AuthError::Protocol)
+}
+
+/// Turn a `RegistrationUpload` into the stored `ServerRegistration` record.
+///
+/// These are the same 192 bytes — `ServerRegistration::finish` wraps the upload
+/// rather than transforming it — which is why the mutation guard can store an
+/// upload straight from `RegFinish` as a record. That identity is load-bearing
+/// and is pinned by `an_upload_is_the_stored_record`, because if it ever stopped
+/// holding, grants created over IPC would store an unusable record and fail only
+/// at the next login.
+pub fn record_from_upload(upload: &[u8; sizes::RECORD]) -> Result<[u8; sizes::RECORD], AuthError> {
+    let record = ServerRegistration::<TornectOpaque>::finish(
+        RegistrationUpload::deserialize(upload).map_err(|_| AuthError::Protocol)?,
+    );
+    record
+        .serialize()
+        .as_slice()
+        .try_into()
+        .map_err(|_| AuthError::Protocol)
+}
+
 /// Run the whole OPAQUE registration in-process, both roles (§B.8.4.4 "enable
-/// flow"): the host is the only party involved, because a grant password is set
-/// locally on the host by the owner, never over the wire.
+/// flow"): used where one process holds both the password and the store — the
+/// UI enable flow and the tests.
+///
+/// Composed from the two halves above so there is exactly one implementation of
+/// each and the in-process path cannot drift from the IPC one.
 ///
 /// Returns the serialized `ServerRegistration` record to store under the grant.
 pub fn register_locally(
@@ -405,40 +512,10 @@ pub fn register_locally(
     credential_identifier: &[u8],
     ids: Identifiers<'_>,
 ) -> Result<[u8; sizes::RECORD], AuthError> {
-    let pw = password.as_bytes();
-    let start = ClientRegistration::<TornectOpaque>::start(&mut OpaqueRng, pw)
-        .map_err(|_| AuthError::Protocol)?;
-    let server = ServerRegistration::<TornectOpaque>::start(
-        setup,
-        RegistrationRequest::deserialize(start.message.serialize().as_slice())
-            .map_err(|_| AuthError::Protocol)?,
-        credential_identifier,
-    )
-    .map_err(|_| AuthError::Protocol)?;
-    let mut finish = start
-        .state
-        .finish(
-            &mut OpaqueRng,
-            pw,
-            RegistrationResponse::deserialize(server.message.serialize().as_slice())
-                .map_err(|_| AuthError::Protocol)?,
-            ClientRegistrationFinishParameters::new(ids, Some(&ksf())),
-        )
-        .map_err(|_| AuthError::Protocol)?;
-    let record = ServerRegistration::<TornectOpaque>::finish(
-        RegistrationUpload::deserialize(finish.message.serialize().as_slice())
-            .map_err(|_| AuthError::Protocol)?,
-    );
-    let out = record
-        .serialize()
-        .as_slice()
-        .try_into()
-        .map_err(|_| AuthError::Protocol);
-    // Registration runs in the *host* process, which owns the grant store: an
-    // un-wiped `export_key` here would sit in the same address space as every
-    // grant (§B.8.4.4 "f.export_key, states, pw zeroized here").
-    wipe(finish.export_key.as_mut_slice());
-    out
+    let (client, request) = PasswordRegistration::start(password)?;
+    let response = registration_response(setup, &request, credential_identifier)?;
+    let upload = client.finish(password, &response, ids)?;
+    record_from_upload(&upload)
 }
 
 /// Create the host-wide `ServerSetup` (once per host, stored in the AEAD store).
