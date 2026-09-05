@@ -14,11 +14,12 @@
 //! reach the onion service.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
-use std::sync::Mutex;
+use tokio::sync::Notify;
 use tornect_core::id::DeviceId;
 use tornect_core::session_log::SessionMode;
 use tornect_core::unattended::grant::{AuthRecord, GrantId};
@@ -52,11 +53,25 @@ mod budget {
     pub const HARD_LOCK_QUIET_S: u64 = 60;
 }
 
+/// One device's in-flight `AwaitKe3` handshake, as the budget table sees it.
+#[derive(Debug)]
+struct Slot {
+    /// Fired when a newer, freshly signed `SESSION_REQUEST` pre-empts this
+    /// handshake (§B.8.4.5).
+    cancel: Arc<Notify>,
+    /// Set once the charge is on disk and KE2 is about to go out. Until then the
+    /// stream is "between F1 and KE2 written" and a newer one is answered
+    /// `UA_BUSY` instead of pre-empting it (§B.8.4.5).
+    charged: Arc<AtomicBool>,
+    /// When the slot was taken.
+    since: Instant,
+}
+
 /// The host-wide budget counters of §B.8.5.2.
 #[derive(Debug, Default)]
 struct Budgets {
     /// Devices with a charged `AwaitKe3` handshake in flight (≤ 1 per pk).
-    in_flight: HashMap<DeviceId, Instant>,
+    in_flight: HashMap<DeviceId, Slot>,
     /// `AUTH_CHALLENGE` timestamps inside the trailing minute.
     challenges: Vec<Instant>,
     /// Last time a hard-locked pk was answered at all.
@@ -68,22 +83,58 @@ impl Budgets {
     fn expire(&mut self, now: Instant) {
         self.challenges
             .retain(|t| now.duration_since(*t) < Duration::from_secs(60));
+        // Safety net, not the primary release path: `InFlight::drop` clears a slot
+        // as soon as its handler leaves `AwaitKe3`. If a handler is ever lost
+        // (a detached task that panics), a stale entry would otherwise pin that
+        // device out for good. `AwaitKe3` is 30 s, so anything twice that old is
+        // certainly dead.
+        self.in_flight
+            .retain(|_, slot| now.duration_since(slot.since) < STALE_SLOT);
         self.hard_locked_answered
             .retain(|_, t| now.duration_since(*t) < Duration::from_secs(budget::HARD_LOCK_QUIET_S));
     }
 }
 
+/// An in-flight entry older than this is treated as leaked (`AwaitKe3` is 30 s).
+const STALE_SLOT: Duration = Duration::from_secs(60);
+
 /// A charged in-flight slot; releases itself on drop so every early return,
 /// `?` and panic unwinds the host-wide counter (§B.8.5.2).
+///
+/// Held only for the `AwaitKe3` phase: §B.8.5.2 counts "charged `AwaitKe3`
+/// streams only", so the caller drops it right after `settle`. A session sitting
+/// in its `ask_before_start` popup or block window must not occupy one of the
+/// four host-wide slots.
 struct InFlight {
     device: DeviceId,
     budgets: Arc<Mutex<Budgets>>,
+    cancel: Arc<Notify>,
+    charged: Arc<AtomicBool>,
+}
+
+impl InFlight {
+    /// The charge is on disk; from here a newer request may pre-empt this stream.
+    fn mark_charged(&self) {
+        self.charged.store(true, Ordering::SeqCst);
+    }
+
+    /// Resolves when a newer, freshly signed `SESSION_REQUEST` pre-empts us.
+    async fn cancelled(&self) {
+        self.cancel.notified().await;
+    }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
         if let Ok(mut b) = self.budgets.lock() {
-            b.in_flight.remove(&self.device);
+            // Only clear the entry if it is still ours: a pre-empting stream has
+            // already installed its own.
+            if b.in_flight
+                .get(&self.device)
+                .is_some_and(|s| Arc::ptr_eq(&s.cancel, &self.cancel))
+            {
+                b.in_flight.remove(&self.device);
+            }
         }
     }
 }
@@ -149,17 +200,38 @@ impl UnattendedAuth {
             b.hard_locked_answered.insert(*device, now);
             return Admit::Busy; // caller replaces this with HARD_LOCKED
         }
-        if b.in_flight.contains_key(device)
-            || b.in_flight.len() >= budget::MAX_IN_FLIGHT
+        // §B.8.4.5: a newer stream carrying its own signature-verified
+        // `SESSION_REQUEST` (F1 under the new `host_nonce`) cancels a stale
+        // charged handshake from the same pk rather than being turned away —
+        // otherwise a client whose circuit died is locked out for the full 30 s
+        // `AwaitKe3` timeout. Only while the older charge is still being
+        // persisted is the newer one answered `UA_BUSY`.
+        if let Some(existing) = b.in_flight.get(device) {
+            if !existing.charged.load(Ordering::SeqCst) {
+                return Admit::Busy;
+            }
+            existing.cancel.notify_waiters();
+        } else if b.in_flight.len() >= budget::MAX_IN_FLIGHT
             || b.challenges.len() >= budget::MAX_PER_MINUTE
         {
             return Admit::Busy;
         }
-        b.in_flight.insert(*device, now);
+        let cancel = Arc::new(Notify::new());
+        let charged = Arc::new(AtomicBool::new(false));
+        b.in_flight.insert(
+            *device,
+            Slot {
+                cancel: Arc::clone(&cancel),
+                charged: Arc::clone(&charged),
+                since: now,
+            },
+        );
         b.challenges.push(now);
         Admit::Ok(InFlight {
             device: *device,
             budgets: Arc::clone(&self.budgets),
+            cancel,
+            charged,
         })
     }
 
@@ -268,7 +340,7 @@ impl UnattendedAuth {
         };
 
         // ---- host-wide budgets (§B.8.5.2) ----
-        let _slot = match self.admit(&device, false) {
+        let slot = match self.admit(&device, false) {
             Admit::Ok(slot) => slot,
             Admit::Busy | Admit::Silent => {
                 return Ok(UnattendedVerdict::Reject(SessionReject::new(
@@ -331,6 +403,9 @@ impl UnattendedAuth {
             }
         };
         debug_assert_eq!(charged.grant_id, gate.grant_id);
+        // The charge is on disk: from here a newer verified `SESSION_REQUEST`
+        // from this pk pre-empts us rather than being answered `UA_BUSY`.
+        slot.mark_charged();
 
         let (host_login, ke2) =
             match auth::HostLogin::start(&setup, &stored, ke1, &device_pk, &ctx_bytes, ids) {
@@ -345,23 +420,35 @@ impl UnattendedAuth {
             };
 
         // ---- AwaitKe3 (30 s, charged) ----
-        let (response, th_after_response) = match ctx
-            .exchange
-            .challenge(AuthChallenge {
-                suite: req.suite,
-                ke2: Some(ke2),
-                salt: None,
-                pb: None,
-            })
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                // Settle first, then hand the transport error back unchanged so
-                // `serve_host` reports the code §B.8.4.5 documents.
-                let _ = self.limiter.settle(&device, Settle::Fail(fail_kind(&e)));
-                return Err(e);
+        // Raced against pre-emption: a newer verified `SESSION_REQUEST` from this
+        // pk cancels this handshake, which is settled as a failure and closed with
+        // `PREEMPTED` — transport-class for the client, never a password failure,
+        // so the remembered password is not marked stale (§B.8.4.6).
+        let exchange = ctx.exchange.challenge(AuthChallenge {
+            suite: req.suite,
+            ke2: Some(ke2),
+            salt: None,
+            pb: None,
+        });
+        let (response, th_after_response) = tokio::select! {
+            biased;
+            () = slot.cancelled() => {
+                let _ = self
+                    .limiter
+                    .settle(&device, Settle::Fail(FailKind::Preempted));
+                return Ok(UnattendedVerdict::Reject(SessionReject::new(
+                    reject::PREEMPTED,
+                )));
             }
+            r = exchange => match r {
+                Ok(v) => v,
+                Err(e) => {
+                    // Settle first, then hand the transport error back unchanged so
+                    // `serve_host` reports the code §B.8.4.5 documents.
+                    let _ = self.limiter.settle(&device, Settle::Fail(fail_kind(&e)));
+                    return Err(e);
+                }
+            },
         };
 
         let Some(ke3) = response.ke3.as_ref() else {
@@ -383,6 +470,10 @@ impl UnattendedAuth {
 
         // ---- F2 reached: settle, then the post-PAKE policy checks ----
         let fail_summary = self.limiter.settle(&device, Settle::Ok).unwrap_or(None);
+        // §B.8.5.2 counts charged `AwaitKe3` streams only: release the host-wide
+        // slot now, so the popup and block window below do not occupy one of the
+        // four for up to another 90 s.
+        drop(slot);
 
         let post = match self
             .limiter
@@ -761,6 +852,98 @@ mod tests {
             panic!("expected Reject");
         };
         assert_eq!(r.reason, reject::BLOCKED_BY_LOCAL_USER);
+    }
+
+    /// §B.8.4.5: a newer, freshly signed `SESSION_REQUEST` from the same pk
+    /// **cancels** a stale charged handshake instead of being turned away. Without
+    /// this a client whose circuit died is locked out for the full 30 s AwaitKe3
+    /// timeout, and `PREEMPTED` (0x002A) would never be emitted at all.
+    #[tokio::test]
+    async fn a_newer_request_preempts_a_stale_charged_handshake() {
+        let env = env(PW);
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+
+        /// Signals when it reaches AwaitKe3, then blocks until released.
+        struct Stalled {
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+        impl crate::fsm::AuthExchange for Stalled {
+            fn challenge<'a>(
+                &'a mut self,
+                _: AuthChallenge,
+            ) -> BoxFuture<'a, Result<(AuthResponse, [u8; 32]), HandshakeError>> {
+                Box::pin(async move {
+                    self.entered.notify_waiters();
+                    // Bounded, so that a build without pre-emption fails this test
+                    // cleanly (Timeout != PREEMPTED) instead of hanging forever.
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(2), self.release.notified()).await;
+                    Err(HandshakeError::Timeout("AUTH_RESPONSE"))
+                })
+            }
+        }
+
+        let caps = Caps::default();
+        let (state, ke1) = auth::ClientLogin::start(PW).unwrap();
+        drop(state);
+        let req = request(auth::SUITE_OPAQUE, Some(ke1));
+
+        // Stream 1 reaches AwaitKe3 and stalls there, holding a charged slot.
+        let wait_entered = entered.notified();
+        let first = async {
+            let mut ex = Stalled {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            };
+            env.auth
+                .handle(UnattendedContext {
+                    device: env.device,
+                    label: "Laptop",
+                    request: &req,
+                    th_after_request: TH_REQ,
+                    host_pk: HOST_PK,
+                    host_caps: &caps,
+                    exchange: &mut ex,
+                    block_window: &TimerOnlyWindow,
+                    local_allow: &DenyAll,
+                })
+                .await
+        };
+
+        let (verdict, ()) = tokio::join!(first, async {
+            // Once stream 1 is charged and waiting, stream 2 arrives.
+            wait_entered.await;
+            let (_, second) = run(&env, PW, &TimerOnlyWindow, &DenyAll).await;
+            let _ = second;
+        });
+
+        let UnattendedVerdict::Reject(r) = verdict.unwrap() else {
+            panic!("the stale handshake should have been pre-empted, not accepted");
+        };
+        assert_eq!(
+            r.reason,
+            reject::PREEMPTED,
+            "a newer verified SESSION_REQUEST must cancel the stale one"
+        );
+        release.notify_waiters();
+    }
+
+    /// §B.8.5.2 counts "charged `AwaitKe3` streams only". If the slot were held
+    /// for the whole handler — through the popup and block window — four accepted
+    /// sessions would exhaust the host-wide budget and a fifth login would be
+    /// `UA_BUSY` although nothing is in `AwaitKe3`.
+    #[tokio::test]
+    async fn the_in_flight_slot_is_released_once_the_pake_is_settled() {
+        let env = env(PW);
+        for i in 0..(budget::MAX_IN_FLIGHT + 2) {
+            let (verdict, _) = run(&env, PW, &TimerOnlyWindow, &DenyAll).await;
+            assert!(
+                matches!(verdict.unwrap(), UnattendedVerdict::Accept { .. }),
+                "session {i} was refused: the host-wide slot leaked"
+            );
+        }
     }
 
     /// An unknown device never reaches the PAKE: `NOT_GRANTED`, uncharged.
