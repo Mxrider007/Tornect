@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+
+<!--
+  Tornect: OS re-authentication for access-increasing operations
+  (docs/PLAN.md §B.8.6.2, §B.8.7.4, §B.8.8).
+
+  Install to /usr/share/polkit-1/actions/org.tornect.policy (root-owned; there
+  is no user-writable action directory) and restart polkit:
+
+      sudo install -m 0644 packaging/polkit/org.tornect.policy \
+           /usr/share/polkit-1/actions/org.tornect.policy
+      sudo systemctl restart polkit
+
+  Until it is installed, `tornect` refuses every access-increasing operation
+  with "polkit action ... is not registered" — fail-closed and loud, never a
+  silent pass.
+
+  READ BEFORE EDITING: every action below uses `auth_self`, NOT
+  `auth_self_keep`. §B.8.6.2 requires a *fresh dialog per operation*, and
+  `auth_self_keep` retains the authorization for several minutes, so one dialog
+  would cover a run of later operations. The ALWAYS_CHECK flag the client passes
+  does not override that — upstream's source shows it guards only the root
+  bypass — so this file is the only thing holding that guarantee up. Changing
+  `auth_self` to `auth_self_keep` silently weakens Tornect's security model.
+
+  One action per operation class rather than per operation: an unprivileged
+  caller may not pass a `details` map to CheckAuthorization (polkit refuses the
+  whole call), so the operation name cannot reach the dialog as data. The
+  message below is the only thing the user sees.
+-->
+<policyconfig>
+
+  <vendor>Tornect</vendor>
+  <vendor_url>https://github.com/Mxrider420z/Tornect</vendor_url>
+
+  <action id="org.tornect.grant">
+    <description>Allow a device to connect without asking</description>
+    <description xml:lang="en_GB">Allow a device to connect without asking</description>
+    <message>Authentication is required to let a device connect to this computer without asking, or to change the password that protects it.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.tornect.enable">
+    <description>Re-enable unattended access</description>
+    <message>Authentication is required to re-enable unattended access that was turned off, suspended or locked.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.tornect.autostart">
+    <description>Change whether Tornect starts at login</description>
+    <message>Authentication is required to change whether Tornect starts automatically when you log in.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.tornect.export">
+    <description>Export Tornect secrets</description>
+    <message>Authentication is required to export Tornect's keys or unattended-access backup from this computer.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.tornect.settings">
+    <description>Change Tornect security settings</description>
+    <message>Authentication is required to change Tornect's security settings, such as the panic key or a device's access policy.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+
+</policyconfig>

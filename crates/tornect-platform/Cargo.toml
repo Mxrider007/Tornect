@@ -1,0 +1,33 @@
+[package]
+name = "tornect-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "OS session services for Tornect: the owner-only IPC endpoint and OS re-authentication (docs/PLAN.md §B.8.7.4, §B.8.8)."
+
+[lints]
+workspace = true
+
+[dependencies]
+tornect-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+sha2.workspace = true
+data-encoding.workspace = true
+fs-err.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
