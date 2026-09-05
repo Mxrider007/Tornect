@@ -8,6 +8,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 mod tor_cmd;
+mod unattended;
 
 use std::path::PathBuf;
 
@@ -76,6 +77,30 @@ enum Command {
         #[arg(long, conflicts_with = "pow")]
         no_pow: bool,
     },
+    /// Manage unattended access: which devices may connect without asking.
+    Unattended {
+        #[command(subcommand)]
+        action: unattended::UnattendedCmd,
+    },
+    /// List the devices this host has paired with.
+    Devices {
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// End every session now and, on a second press within 2 s, turn unattended
+    /// access off host-wide (§B.8.7.4).
+    Panic,
+    /// Register or remove Tornect's start-at-login entry.
+    Service {
+        #[command(subcommand)]
+        action: unattended::ServiceCmd,
+    },
+    /// Export or import the unattended-access backup.
+    Backup {
+        #[command(subcommand)]
+        action: unattended::BackupCmd,
+    },
     /// Connect to a host by Tornect ID over Tor and measure round-trip times.
     ///
     /// Uses this instance's own Tor state; run it under a different TORNECT_HOME
@@ -141,6 +166,11 @@ fn main() -> anyhow::Result<()> {
             tor_cmd::host(&paths, once, pow)
         }
         Command::Ping { onion, count } => tor_cmd::ping(&paths, &onion, count),
+        Command::Unattended { action } => unattended::unattended(&paths, action),
+        Command::Devices { json } => unattended::devices(&paths, json),
+        Command::Panic => unattended::panic_now(&paths),
+        Command::Service { action } => unattended::service(&paths, action),
+        Command::Backup { action } => unattended::backup(&paths, action),
     }
 }
 

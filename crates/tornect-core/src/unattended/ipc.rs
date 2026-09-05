@@ -944,6 +944,28 @@ pub struct PolicyInputsPayload {
     pub min_score: u8,
 }
 
+/// `On` payload: the emergency stop card of §B.8.7.4, shown once and never stored.
+///
+/// It travels as a payload rather than in `IpcResponse.detail` because `detail`
+/// is a human-readable string that ends up in error messages and logs; a
+/// 16-byte secret must not. `Debug` redacts it for the same reason.
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct MasterOnPayload {
+    /// The stop code, shown once at enable time (§B.8.7.4).
+    #[n(0)]
+    #[cbor(with = "minicbor::bytes")]
+    pub stop_code: [u8; 16],
+}
+
+impl fmt::Debug for MasterOnPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MasterOnPayload")
+            .field("stop_code", &format_args!("<redacted>"))
+            .finish()
+    }
+}
+
 /// `RegStart` payload. `Debug` redacts both members (A14: no KE bytes or capabilities
 /// in traces).
 #[derive(Clone, PartialEq, Eq, Encode, Decode)]

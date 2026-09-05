@@ -121,6 +121,11 @@ linux-keyutils-keyring-store = "=1.0.0"
 # `blocking-api` off because `zbus::blocking` would spin up a second private
 # tokio runtime. Linux-only; `tornect-platform` gates it per target.
 zbus = { version = "=5.19.0", default-features = false, features = ["tokio"] }
+# Echo-off password prompt for `tornect unattended grant|set-password`
+# (§B.8.7.4: "passwords via TTY prompt, never argv"). Already in the tree as a
+# transitive dependency at this exact version; taking it as a direct one adds no
+# new crate and keeps `apps/tornect` free of `libc` and of `unsafe`.
+rustix = { version = "=1.1.4", default-features = false, features = ["std", "termios", "stdio"] }
 
 # Fuzzing helpers (fuzz/ crate is workspace-excluded; `arbitrary` derives shared with it).
 arbitrary = { version = "=1.4.2", features = ["derive"] }
