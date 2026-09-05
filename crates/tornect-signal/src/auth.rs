@@ -23,7 +23,7 @@ use opaque_ke::{
     ServerLoginParameters, ServerRegistration, ServerSetup,
 };
 use sha2::Sha256;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 /// Wire sizes of the suite-1 messages (`crypto.md` §8.3–8.4; the
 /// [`crate::messages`] bodies are fixed-size arrays of exactly these lengths).
@@ -77,6 +77,15 @@ fn ksf() -> opaque_ke::argon2::Argon2<'static> {
     let params = Params::new(KSF_PARAMS.0, KSF_PARAMS.1, KSF_PARAMS.2, None)
         .expect("suite KSF parameters are constants");
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
+/// Wipe key material `opaque-ke` hands back by value.
+///
+/// The `*FinishResult` types are `derive_where(Clone)` only — unlike the state
+/// types they are **not** `ZeroizeOnDrop` — so their `session_key` / `export_key`
+/// survive the drop unless wiped explicitly (§B.8.16, A14).
+fn wipe(bytes: &mut [u8]) {
+    bytes.zeroize();
 }
 
 /// An `opaque-ke` (rand 0.8) RNG over the OS entropy source.
@@ -276,7 +285,7 @@ impl HostLogin {
     ) -> Result<Zeroizing<Vec<u8>>, AuthError> {
         let finalization =
             CredentialFinalization::deserialize(ke3).map_err(|_| AuthError::BadMessage)?;
-        let result = self
+        let mut result = self
             .state
             .finish(
                 finalization,
@@ -286,7 +295,12 @@ impl HostLogin {
                 },
             )
             .map_err(|_| AuthError::Rejected)?;
-        Ok(Zeroizing::new(result.session_key.to_vec()))
+        // `ServerLoginFinishResult` is `derive_where(Clone)` only — unlike the
+        // state types it is **not** `ZeroizeOnDrop`, so its `session_key` would
+        // otherwise be left in the frame verbatim (§B.8.16, A14).
+        let session_key = Zeroizing::new(result.session_key.to_vec());
+        wipe(result.session_key.as_mut_slice());
+        Ok(session_key)
     }
 }
 
@@ -330,10 +344,14 @@ impl ClientLogin {
 
     /// Consume KE2 and produce KE3 plus the derived material.
     ///
-    /// `export_key` is intentionally **not** returned: it is password-derived
-    /// and identical across logins, so it is dropped and zeroized inside this
-    /// call and never persisted or logged (A14). The keychain-remembered
-    /// password is M8 work and does not go through here.
+    /// `export_key` is intentionally **not** returned: it is password-derived and
+    /// identical across logins, so it is wiped inside this call and never
+    /// persisted or logged (A14). The wipe is explicit because
+    /// `ClientLoginFinishResult` is `derive_where(Clone)` only — unlike
+    /// `ClientLogin`/`ServerLogin`, it is **not** `ZeroizeOnDrop`, so dropping it
+    /// leaves 64 bytes of `export_key` and a second copy of the raw `session_key`
+    /// in the frame. The keychain-remembered password is M8 work and does not go
+    /// through here.
     pub fn finish(
         self,
         password: &str,
@@ -342,7 +360,7 @@ impl ClientLogin {
         ids: Identifiers<'_>,
     ) -> Result<ClientLoginOutput, AuthError> {
         let response = CredentialResponse::deserialize(ke2).map_err(|_| AuthError::BadMessage)?;
-        let finished = self
+        let mut finished = self
             .state
             .finish(
                 &mut OpaqueRng,
@@ -363,11 +381,14 @@ impl ClientLogin {
             .as_slice()
             .try_into()
             .map_err(|_| AuthError::Protocol)?;
-        Ok(ClientLoginOutput {
+        let out = ClientLoginOutput {
             ke3,
             session_key: Zeroizing::new(finished.session_key.to_vec()),
             server_s_pk,
-        })
+        };
+        wipe(finished.export_key.as_mut_slice());
+        wipe(finished.session_key.as_mut_slice());
+        Ok(out)
     }
 }
 
@@ -394,7 +415,7 @@ pub fn register_locally(
         credential_identifier,
     )
     .map_err(|_| AuthError::Protocol)?;
-    let finish = start
+    let mut finish = start
         .state
         .finish(
             &mut OpaqueRng,
@@ -408,11 +429,16 @@ pub fn register_locally(
         RegistrationUpload::deserialize(finish.message.serialize().as_slice())
             .map_err(|_| AuthError::Protocol)?,
     );
-    record
+    let out = record
         .serialize()
         .as_slice()
         .try_into()
-        .map_err(|_| AuthError::Protocol)
+        .map_err(|_| AuthError::Protocol);
+    // Registration runs in the *host* process, which owns the grant store: an
+    // un-wiped `export_key` here would sit in the same address space as every
+    // grant (§B.8.4.4 "f.export_key, states, pw zeroized here").
+    wipe(finish.export_key.as_mut_slice());
+    out
 }
 
 /// Create the host-wide `ServerSetup` (once per host, stored in the AEAD store).
@@ -630,6 +656,44 @@ mod tests {
         assert_ne!(confirm_key(&key, &[0x55; 32]).as_ref(), ck.as_ref());
         assert_ne!(token_confirm(&ck, &[0x55; 32]), tc);
         assert_ne!(proof_fp(&other_key), fp);
+    }
+
+    /// A14 / §B.8.16: the material `opaque-ke` returns by value is wiped rather
+    /// than merely dropped.
+    ///
+    /// Honest limit: once `ClientLogin::finish` returns, its stack frame is gone
+    /// and no safe-Rust test can inspect it, so this covers the wipe primitive and
+    /// the observable contract — that `ClientLoginOutput` carries no `export_key`
+    /// at all. The call sites are checked by review, not by this test.
+    #[test]
+    fn key_material_is_wiped_not_just_dropped() {
+        let mut buf = [0xAAu8; 64];
+        wipe(&mut buf);
+        assert_eq!(buf, [0u8; 64], "wipe left key material behind");
+
+        // The output type must not carry `export_key` out of the call at all:
+        // it is password-derived and identical across logins (A14).
+        let f = fixture();
+        let ctx = context(&TH_REQ, SUITE_OPAQUE, INTENT_SESSION);
+        let ids = identifiers(&CLIENT_PK, &HOST_PK);
+        let (client, ke1) = ClientLogin::start(PW).unwrap();
+        let (_host, ke2) = HostLogin::start(
+            &f.setup,
+            &parse_record(&f.record).unwrap(),
+            &ke1,
+            &CLIENT_PK,
+            &ctx,
+            ids,
+        )
+        .unwrap();
+        let out = client.finish(PW, &ke2, &ctx, ids).unwrap();
+        // Field list is the contract: ke3, session_key, server_s_pk — no export_key.
+        let ClientLoginOutput {
+            ke3: _,
+            session_key,
+            server_s_pk: _,
+        } = out;
+        assert_eq!(session_key.len(), sizes::KEY);
     }
 
     #[test]

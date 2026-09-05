@@ -742,9 +742,17 @@ where
         messages::intent::SESSION,
     );
     let ids = auth::identifiers(&device_pk, host_onion_pk);
-    let out = login
-        .finish(&ua.password, &ke2, &ctx, ids)
-        .map_err(|_| HandshakeError::Aborted("unattended authentication failed"))?;
+    let out = match login.finish(&ua.password, &ke2, &ctx, ids) {
+        Ok(out) => out,
+        Err(_) => {
+            // §B.8.4.2: the server MAC failed — either the password is wrong or
+            // this is not the host we think it is. Say so and hang up rather
+            // than dropping the stream: the host is waiting out its 30 s
+            // `AwaitKe3` timer otherwise, holding a charged in-flight slot.
+            chan.bye(messages::bye::CLIENT_AUTH_ABORT).await?;
+            return Err(HandshakeError::Aborted("unattended authentication failed"));
+        }
+    };
 
     // §B.8.9 / A16: a changed `server_s_pk` means the host's unattended setup was
     // replaced — abort *before* KE3, so a wrong host never sees the proof.
