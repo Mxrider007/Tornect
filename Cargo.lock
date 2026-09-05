@@ -5640,11 +5640,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "data-encoding",
+ "ed25519-dalek 3.0.0",
+ "rustix",
  "serde_json",
+ "tempfile",
  "tokio",
  "tornect-core",
+ "tornect-platform",
  "tornect-signal",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

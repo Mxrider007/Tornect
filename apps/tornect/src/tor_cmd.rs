@@ -70,6 +70,28 @@ async fn run_host(
     identity: &HostIdentity,
     once: bool,
 ) -> anyhow::Result<()> {
+    // The §B.8.7.4 control channel, bound **before** Tor. A running host owns the
+    // endpoint and the store's advisory lock, so `tornect unattended …` in
+    // another terminal routes here instead of opening the store itself — and
+    // bringing it up first means that works during the slow part, which is
+    // exactly when someone wants to ask what the host is doing. Failing to bind
+    // is not fatal to hosting: an unreachable control channel is worth a loud
+    // warning, not a refusal to answer peers already dialling this address.
+    let ipc = match crate::unattended::host_context(paths) {
+        Ok(ctx) => {
+            let owned = paths.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = crate::unattended::serve(Arc::new(ctx), &owned).await {
+                    tracing::warn!(error = %e, "IPC endpoint stopped");
+                }
+            }))
+        }
+        Err(e) => {
+            eprintln!("warning: unattended control channel unavailable: {e}");
+            None
+        }
+    };
+
     eprintln!("bootstrapping Tor (~30 s cold, a few seconds with a warm cache)...");
     let node = TorNode::start(paths, cfg)
         .await
@@ -114,6 +136,9 @@ async fn run_host(
             result = &mut ctrl_c => {
                 result.context("waiting for Ctrl-C")?;
                 eprintln!("Ctrl-C: shutting down");
+                if let Some(ipc) = &ipc {
+                    ipc.abort();
+                }
                 break;
             }
             stream = listener.accept() => {
