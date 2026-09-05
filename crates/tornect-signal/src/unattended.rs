@@ -23,6 +23,7 @@ use tokio::sync::Notify;
 use tornect_core::id::DeviceId;
 use tornect_core::session_log::SessionMode;
 use tornect_core::unattended::grant::{AuthRecord, GrantId};
+use tornect_core::unattended::guard::{AdminEffect, AdminOp, AdminOutcome, MutationGuard};
 use tornect_core::unattended::limiter::{
     AttemptLimiter, FailKind, HostTransport, LimiterError, PostF2Reject, Reject, Settle,
 };
@@ -34,8 +35,10 @@ use crate::consent::{
     BlockOutcome, ChosenCaps, ConsentProof, DerivedToken, PolicyReceipt, TransportPolicy,
 };
 use crate::fsm::HandshakeError;
-use crate::fsm::host::{UnattendedContext, UnattendedHook, UnattendedVerdict};
-use crate::messages::{self, AuthChallenge, SessionReject, intent, mode, reject};
+use crate::fsm::host::{
+    KillSwitch, StopTokenCheck, UnattendedContext, UnattendedHook, UnattendedVerdict,
+};
+use crate::messages::{self, AuthChallenge, SessionReject, bye, intent, mode, reject};
 
 /// Suites this build speaks (§B.8.4.2). Suite 2 (SPAKE2) is specified but not
 /// compiled in at M1, so a request for it is `UNSUPPORTED_SUITE`.
@@ -150,6 +153,150 @@ enum Admit {
     Silent,
 }
 
+/// Executes a remote `AdminCmd` (§B.8.4.1) on behalf of an authenticated
+/// requester.
+///
+/// The scope matrix itself lives in [`MutationGuard::admin`] — it is a store
+/// mutation and belongs with the other ones, next to the log lines it writes.
+/// This trait exists so the signalling layer can be exercised without a real
+/// store, and so that a host wired without an authority **refuses** admin
+/// commands rather than silently pretending to have run them.
+pub trait AdminAuthority: Send + Sync {
+    /// Run `op` for `requester`, or refuse it.
+    fn execute(&self, requester: &DeviceId, op: AdminOp) -> AdminOutcome;
+}
+
+/// The default: this host executes no remote admin commands.
+///
+/// Answering `ok: false` is the honest response — the requester proved its
+/// password and is entitled to know its command did not run.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RefuseAdmin;
+
+impl AdminAuthority for RefuseAdmin {
+    fn execute(&self, _requester: &DeviceId, _op: AdminOp) -> AdminOutcome {
+        AdminOutcome {
+            ok: false,
+            detail: Some("remote administration is not enabled on this host".to_owned()),
+            effect: AdminEffect::None,
+        }
+    }
+}
+
+/// The real authority: the host's [`MutationGuard`].
+///
+/// Note what is deliberately *not* here: no re-auth. §B.8.6.2's re-auth rule
+/// gates operations performed **at the host**, where a human is present to
+/// answer the dialog. A remote admin command has already proven the second
+/// factor by completing the PAKE, and there is by definition nobody at the
+/// host to type a password — requiring one would make `revoke_all` and
+/// `master_off` unusable in exactly the emergency they exist for. The guard's
+/// `admin()` path encodes that distinction; it is not an omission.
+#[derive(Clone)]
+pub struct GuardAdmin {
+    guard: Arc<MutationGuard>,
+}
+
+impl GuardAdmin {
+    /// Wrap the host's guard.
+    #[must_use]
+    pub fn new(guard: Arc<MutationGuard>) -> Self {
+        Self { guard }
+    }
+}
+
+impl std::fmt::Debug for GuardAdmin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuardAdmin").finish_non_exhaustive()
+    }
+}
+
+impl AdminAuthority for GuardAdmin {
+    fn execute(&self, requester: &DeviceId, op: AdminOp) -> AdminOutcome {
+        match self.guard.admin(requester, op) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // A store-level failure (locked keystore, store lock held, I/O)
+                // is not a scope refusal. It is reported as a plain failure with
+                // the guard's own code so the client can tell "you may not" from
+                // "the host could not"; the guard has already logged it.
+                tracing::warn!(peer = %requester, op = op.name(), error = %e, "admin command failed");
+                AdminOutcome {
+                    ok: false,
+                    detail: Some(format!(
+                        "host could not apply the command (0x{:04x})",
+                        e.code()
+                    )),
+                    effect: AdminEffect::None,
+                }
+            }
+        }
+    }
+}
+
+/// The §B.8.7.4 emergency stop: the [`StopTokenCheck`] that acts.
+///
+/// A peer presenting the stop token in `HELLO` — paired or not, and **before**
+/// any pairing decision — turns unattended access off host-wide, revokes every
+/// grant, kills live sessions and clears the token so the code is single-use.
+/// The comparison is constant time and the FSM never branches on the result, so
+/// the unpaired path stays byte-identical whether a code is enabled or not
+/// (A13).
+///
+/// Phishing is covered by the pk binding, not by this code path: the token a
+/// client computes is `SHA-256(.. || dialed_host_onion_pk || stop_code)`, so a
+/// code presented to a scam host yields a value useless at the real one
+/// (§B.8.7.4).
+#[derive(Clone)]
+pub struct EmergencyStop {
+    guard: Arc<MutationGuard>,
+    kill: KillSwitch,
+}
+
+impl EmergencyStop {
+    /// Wire the stop code to the host's guard and kill switch.
+    #[must_use]
+    pub fn new(guard: Arc<MutationGuard>, kill: KillSwitch) -> Self {
+        Self { guard, kill }
+    }
+}
+
+impl std::fmt::Debug for EmergencyStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmergencyStop").finish_non_exhaustive()
+    }
+}
+
+impl StopTokenCheck for EmergencyStop {
+    fn observe<'a>(&'a self, token: &'a [u8; 32]) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            // Constant-time inside the store, and `false` for a host with no
+            // code enabled without a separate branch.
+            if !self.guard.store().stop_token_matches(token) {
+                return;
+            }
+            match self.guard.emergency_stop() {
+                Ok(revoked) => {
+                    // The one place in the codebase where a `warn!` is the
+                    // correct level for a *successful* operation: this is the
+                    // user's panic handle and it destroys every grant.
+                    tracing::warn!(
+                        revoked,
+                        "emergency stop code accepted: unattended access off, all grants revoked"
+                    );
+                    self.kill.kill(bye::EMERGENCY_STOP);
+                }
+                Err(e) => {
+                    // Fail loudly and leave the token in place: a stop that did
+                    // not happen must not look like one that did, and the code
+                    // must stay usable for the retry.
+                    tracing::error!(error = %e, "emergency stop code accepted but NOT applied");
+                }
+            }
+        })
+    }
+}
+
 /// The real §B.8 hook.
 pub struct UnattendedAuth {
     limiter: AttemptLimiter,
@@ -158,6 +305,8 @@ pub struct UnattendedAuth {
     host_transport: HostTransport,
     /// M1: the all-unknown stub (§B.8.14). M6 fills this from `tornect-platform`.
     readiness: ReadinessSnapshot,
+    /// Executes `intent = admin` requests (§B.8.4.1). Refuses by default.
+    admin: Arc<dyn AdminAuthority>,
 }
 
 impl UnattendedAuth {
@@ -174,6 +323,7 @@ impl UnattendedAuth {
             tz,
             host_transport,
             readiness: ReadinessSnapshot::unknown(),
+            admin: Arc::new(RefuseAdmin),
         }
     }
 
@@ -181,6 +331,15 @@ impl UnattendedAuth {
     #[must_use]
     pub fn with_readiness(mut self, readiness: ReadinessSnapshot) -> Self {
         self.readiness = readiness;
+        self
+    }
+
+    /// Wire remote administration (§B.8.4.1) to an authority — normally
+    /// [`GuardAdmin`] over the host's `MutationGuard`. Without this call the
+    /// host refuses every admin command.
+    #[must_use]
+    pub fn with_admin_authority(mut self, admin: Arc<dyn AdminAuthority>) -> Self {
+        self.admin = admin;
         self
     }
 
@@ -475,6 +634,21 @@ impl UnattendedAuth {
         // four for up to another 90 s.
         drop(slot);
 
+        // ---- admin intent terminates here, in place of SESSION_ACCEPT ----
+        // This branch sits *before* `post_f2`, not after. §B.8.4.2 is explicit
+        // that for an admin request the schedule, readiness, transport, busy and
+        // concurrency gates are skipped — and those are exactly what `post_f2`
+        // applies. Running them first would refuse `revoke`, `revoke_all`,
+        // `master_off` and `end_session` whenever the grant's schedule window
+        // happened to be shut or its reconnect cooldown was running, which is
+        // the precise opposite of what those commands are for. Requester
+        // eligibility is not skipped: `MutationGuard::admin` re-checks the
+        // grant's state, expiry, `active_from`, hard lock and the clock
+        // rollback rule before it touches anything.
+        if req.intent == intent::ADMIN {
+            return Ok(self.run_admin(&device, req.admin.as_ref()));
+        }
+
         let post = match self
             .limiter
             .post_f2(&device, &*self.tz, self.host_transport)
@@ -482,18 +656,6 @@ impl UnattendedAuth {
             Ok(ok) => ok,
             Err(r) => return Ok(UnattendedVerdict::Reject(post_f2_reject(r))),
         };
-
-        // ---- admin intent terminates here, in place of SESSION_ACCEPT ----
-        if req.intent == intent::ADMIN {
-            let detail = req
-                .admin
-                .as_ref()
-                .map(|_| "not implemented at M1".to_owned());
-            return Ok(UnattendedVerdict::Admin(messages::AdminResult {
-                ok: false,
-                detail,
-            }));
-        }
 
         if let Some(rej) = self.readiness_reject() {
             return Ok(UnattendedVerdict::Reject(rej));
@@ -560,6 +722,53 @@ impl UnattendedAuth {
             },
             caps: ChosenCaps::negotiate(ctx.host_caps, &ctx.request.caps),
         })
+    }
+}
+
+impl UnattendedAuth {
+    /// The `intent = admin` branch (§B.8.4.1), reached only after F2.
+    fn run_admin(&self, device: &DeviceId, cmd: Option<&messages::AdminCmd>) -> UnattendedVerdict {
+        /// One shape for every refusal so a client cannot tell "unknown op" from
+        /// "out of scope" by the message shape alone; the guard logs the real
+        /// reason host-side.
+        fn refused(detail: &str) -> UnattendedVerdict {
+            UnattendedVerdict::Admin {
+                result: messages::AdminResult {
+                    ok: false,
+                    detail: Some(detail.to_owned()),
+                },
+                effect: AdminEffect::None,
+            }
+        }
+
+        // `admin` is required iff `intent = 1`, and `SessionRequest`'s decoder
+        // already answers `E_BAD_LEN` for the three other combinations — so
+        // `None` is unreachable from the wire. Refused rather than unwrapped:
+        // a caller building the type directly must not get a panic.
+        let Some(cmd) = cmd else {
+            return refused("admin command missing");
+        };
+        // An unknown op, or a `device_pk` present for an op that takes none (or
+        // absent for one that needs it). Not an `ERROR`: the frame decoded
+        // cleanly, so this is a command the host will not run, reported the way
+        // every other such command is.
+        let Some(op) = AdminOp::from_wire(cmd.op, cmd.device_pk) else {
+            return refused("unknown admin command");
+        };
+        let outcome = self.admin.execute(device, op);
+        tracing::info!(
+            peer = %device,
+            op = op.name(),
+            ok = outcome.ok,
+            "admin command"
+        );
+        UnattendedVerdict::Admin {
+            result: messages::AdminResult {
+                ok: outcome.ok,
+                detail: outcome.detail,
+            },
+            effect: outcome.effect,
+        }
     }
 }
 
@@ -674,12 +883,33 @@ mod tests {
 
     struct Env {
         _tmp: tempfile::TempDir,
-        guard: MutationGuard,
+        guard: Arc<MutationGuard>,
         device: DeviceId,
         auth: UnattendedAuth,
+        /// The §B.8.7.4 emergency stop code, shown once at enable time.
+        stop_code: [u8; tornect_core::unattended::guard::STOP_CODE_LEN],
     }
 
     fn env(password: &str) -> Env {
+        env_with(password, Preset::HeadlessBox, &GrantOptions::default())
+    }
+
+    /// An env whose grant carries admin scope (§B.8.4.1: `MyMachines` +
+    /// `Control` + `Active`). `MyMachines` does not waive the "prior attended
+    /// session" precondition, which no in-process test can satisfy, so the
+    /// `--waive-attended-check` option does it explicitly.
+    fn env_admin(password: &str) -> Env {
+        env_with(
+            password,
+            Preset::MyMachines,
+            &GrantOptions {
+                waive_attended_precondition: true,
+                ..GrantOptions::default()
+            },
+        )
+    }
+
+    fn env_with(password: &str, preset: Preset, options: &GrantOptions) -> Env {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(tmp.path());
         std::fs::create_dir_all(paths.keys_dir()).unwrap();
@@ -698,7 +928,10 @@ mod tests {
 
         let device = DeviceId::from_bytes([0x11; 32]);
         // §B.8: the master switch is opt-in and off until the owner enables it.
-        guard.master_on(Actor::Cli, &HOST_PK).expect("master_on");
+        let stop_code = *guard
+            .master_on(Actor::Cli, &HOST_PK)
+            .expect("master_on")
+            .stop_code;
         // Bootstrap happens inside create_grant; the setup must exist first, so
         // register against the setup the store ends up holding.
         // `HeadlessBox` waives the §B.8.6 "prior attended session" precondition,
@@ -706,13 +939,7 @@ mod tests {
         // one below; this first call exists to bootstrap the store (and with it the
         // `ServerSetup` the registration must run against).
         guard
-            .create_grant(
-                Actor::Cli,
-                &device,
-                Preset::HeadlessBox,
-                &GrantOptions::default(),
-                &[0u8; 192],
-            )
+            .create_grant(Actor::Cli, &device, preset, options, &[0u8; 192])
             .expect("create_grant");
         let setup_bytes = guard.store().server_setup().expect("bootstrapped");
         let setup = auth::parse_server_setup(&setup_bytes).unwrap();
@@ -727,6 +954,7 @@ mod tests {
             .set_password(Actor::Cli, &device, &record)
             .expect("set_password");
 
+        let guard = Arc::new(guard);
         let limiter = AttemptLimiter::new(guard.store().clone());
         let auth = UnattendedAuth::new(
             limiter,
@@ -738,6 +966,7 @@ mod tests {
             guard,
             device,
             auth,
+            stop_code,
         }
     }
 
@@ -790,6 +1019,314 @@ mod tests {
             .await;
         let k = client_key.lock().unwrap().clone();
         (verdict, k)
+    }
+
+    // ---------------------------------------------------------------------
+    // Remote administration (§B.8.4.1)
+    // ---------------------------------------------------------------------
+
+    /// Drive a real OPAQUE login carrying `intent = admin`.
+    ///
+    /// The intent is part of the PAKE `context` (§B.8.4.3), so both sides must
+    /// agree on it before a single byte is exchanged — an admin result cannot
+    /// be obtained by flipping the intent byte after the fact.
+    async fn run_admin_req(
+        env: &Env,
+        password: &str,
+        op: u8,
+        device_pk: Option<[u8; 32]>,
+    ) -> UnattendedVerdict {
+        let dev_pk = *env.device.public_key_bytes();
+        let ctx_bytes = auth::context(&TH_REQ, auth::SUITE_OPAQUE, intent::ADMIN);
+        let (state, ke1) = auth::ClientLogin::start(password).unwrap();
+        let mut exchange = RealClient {
+            password: password.to_owned(),
+            th_after_response: [0x44; 32],
+            client_key: Arc::new(Mutex::new(None)),
+            state: Some(state),
+            ctx: ctx_bytes,
+            device_pk: dev_pk,
+        };
+        let req = SessionRequest {
+            caps: Caps::default(),
+            unattended: Some(UnattendedRequest {
+                suite: auth::SUITE_OPAQUE,
+                ke1: Some(ke1),
+                want_mode: mode::CONTROL,
+                intent: intent::ADMIN,
+                admin: Some(messages::AdminCmd { op, device_pk }),
+            }),
+        };
+        let caps = Caps::default();
+        let block = TimerOnlyWindow;
+        let allow = DenyAll;
+        env.auth
+            .handle(UnattendedContext {
+                device: env.device,
+                label: "Laptop",
+                request: &req,
+                th_after_request: TH_REQ,
+                host_pk: HOST_PK,
+                host_caps: &caps,
+                exchange: &mut exchange,
+                block_window: &block,
+                local_allow: &allow,
+            })
+            .await
+            .expect("admin exchange completes")
+    }
+
+    /// The master switch as the store sees it now.
+    fn store_enabled(env: &Env) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        env.guard.store().enabled_at(now)
+    }
+
+    /// A weekly window that is **closed right now**, whenever "now" is.
+    ///
+    /// The guard rejects an empty day mask, so the window runs on all seven days
+    /// and is placed in whichever half of the day the current minute is not in.
+    /// Openness then depends only on the minute of day, which makes the test
+    /// deterministic instead of passing or failing by the hour it runs at.
+    fn closed_window() -> tornect_core::unattended::grant::Window {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let minute_of_day = (now % 86_400) / 60;
+        let (start_min, end_min) = if minute_of_day < 720 {
+            (800, 900)
+        } else {
+            (100, 200)
+        };
+        tornect_core::unattended::grant::Window {
+            days: 0x7F,
+            start_min,
+            end_min,
+            tz: "UTC".to_owned(),
+        }
+    }
+
+    fn admin_parts(v: UnattendedVerdict) -> (bool, AdminEffect) {
+        match v {
+            UnattendedVerdict::Admin { result, effect } => (result.ok, effect),
+            UnattendedVerdict::Reject(r) => {
+                panic!("expected ADMIN_RESULT, got reject {}", r.reason)
+            }
+            UnattendedVerdict::Accept { .. } => panic!("expected ADMIN_RESULT, got SESSION_ACCEPT"),
+        }
+    }
+
+    /// The default hook has no authority wired: it refuses rather than
+    /// pretending to have run the command.
+    #[tokio::test]
+    async fn admin_is_refused_when_no_authority_is_wired() {
+        let env = env_admin(PW);
+        let (ok, effect) = admin_parts(run_admin_req(&env, PW, 2 /* revoke_all */, None).await);
+        assert!(!ok);
+        assert_eq!(effect, AdminEffect::None);
+        assert!(
+            env.guard.store().grant(&env.device).is_some(),
+            "nothing revoked"
+        );
+    }
+
+    /// An in-scope command runs and the store really changed.
+    #[tokio::test]
+    async fn an_in_scope_admin_command_executes() {
+        let mut env = env_admin(PW);
+        env.auth = env
+            .auth
+            .with_admin_authority(Arc::new(GuardAdmin::new(Arc::clone(&env.guard))));
+
+        assert!(store_enabled(&env));
+        let (ok, effect) = admin_parts(run_admin_req(&env, PW, 3 /* master_off */, None).await);
+        assert!(ok, "master_off is in scope for a MyMachines/Control grant");
+        assert_eq!(effect, AdminEffect::MasterOff);
+        assert!(!store_enabled(&env), "master switch really went off");
+    }
+
+    /// A grant without admin scope may only end its own session and revoke its
+    /// own key. `HeadlessBox` is not `MyMachines`, so `revoke_all` is refused —
+    /// and nothing changes.
+    #[tokio::test]
+    async fn an_out_of_scope_admin_command_is_refused_and_changes_nothing() {
+        let mut env = env(PW);
+        env.auth = env
+            .auth
+            .with_admin_authority(Arc::new(GuardAdmin::new(Arc::clone(&env.guard))));
+
+        let (ok, effect) = admin_parts(run_admin_req(&env, PW, 2 /* revoke_all */, None).await);
+        assert!(!ok, "revoke_all needs the MyMachines preset");
+        assert_eq!(effect, AdminEffect::None);
+        assert!(store_enabled(&env));
+        assert!(env.guard.store().grant(&env.device).is_some());
+    }
+
+    /// An op byte this build does not know, and a `device_pk` supplied for an op
+    /// that takes none, are both refused in an `ADMIN_RESULT` — the frame
+    /// decoded, so this is a command the host will not run, not a protocol
+    /// violation.
+    #[tokio::test]
+    async fn a_malformed_admin_command_is_refused() {
+        let mut env = env_admin(PW);
+        env.auth = env
+            .auth
+            .with_admin_authority(Arc::new(GuardAdmin::new(Arc::clone(&env.guard))));
+
+        let (ok, _) = admin_parts(run_admin_req(&env, PW, 99, None).await);
+        assert!(!ok, "unknown op");
+        // `master_off` (3) takes no device_pk.
+        let (ok, _) = admin_parts(run_admin_req(&env, PW, 3, Some([0x77; 32])).await);
+        assert!(!ok, "superfluous device_pk");
+        assert!(store_enabled(&env), "neither one ran");
+    }
+
+    /// **Regression (§B.8.4.2).** The schedule, readiness, transport, busy and
+    /// concurrency gates are *skipped* for an admin request. Before the fix the
+    /// admin branch sat after `post_f2`, so a grant whose schedule window was
+    /// shut answered `SESSION_REJECT{OUTSIDE_SCHEDULE}` instead of running the
+    /// command — refusing `revoke_all` and `master_off` in exactly the
+    /// emergency they exist for.
+    ///
+    /// Fails against the pre-fix ordering: `admin_parts` panics on the reject.
+    #[tokio::test]
+    async fn admin_runs_even_when_the_schedule_window_is_shut() {
+        let mut env = env_admin(PW);
+        // Closed now, deterministically (see `closed_window`).
+        env.guard
+            .set_options(
+                Actor::Cli,
+                &env.device,
+                &GrantOptions {
+                    schedule: Some(vec![closed_window()]),
+                    ..GrantOptions::default()
+                },
+            )
+            .expect("set_options");
+
+        env.auth = env
+            .auth
+            .with_admin_authority(Arc::new(GuardAdmin::new(Arc::clone(&env.guard))));
+
+        let (ok, effect) = admin_parts(run_admin_req(&env, PW, 3 /* master_off */, None).await);
+        assert!(ok, "an admin command is not gated by the schedule window");
+        assert_eq!(effect, AdminEffect::MasterOff);
+        assert!(!store_enabled(&env));
+    }
+
+    /// The same grant, same closed window, ordinary session intent: still
+    /// refused. The fix above must not have opened the session path.
+    #[tokio::test]
+    async fn a_session_is_still_refused_outside_the_schedule_window() {
+        let env = env_admin(PW);
+        env.guard
+            .set_options(
+                Actor::Cli,
+                &env.device,
+                &GrantOptions {
+                    schedule: Some(vec![closed_window()]),
+                    ..GrantOptions::default()
+                },
+            )
+            .expect("set_options");
+
+        let (verdict, _) = run(&env, PW, &TimerOnlyWindow, &DenyAll).await;
+        match verdict.expect("exchange completes") {
+            UnattendedVerdict::Reject(r) => {
+                assert_eq!(r.reason, reject::OUTSIDE_SCHEDULE);
+            }
+            _ => panic!("a session outside the schedule window must be refused"),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Emergency stop (§B.8.7.4)
+    // ---------------------------------------------------------------------
+
+    /// The stop code presented in `HELLO` turns unattended access off, revokes
+    /// every grant, fires the kill switch and — because the code is single-use —
+    /// clears the stored token so the same card cannot be replayed.
+    #[tokio::test]
+    async fn the_stop_code_disables_everything_and_is_single_use() {
+        let env = env(PW);
+        let kill = KillSwitch::new();
+        let stop = EmergencyStop::new(Arc::clone(&env.guard), kill.clone());
+        let token = tornect_core::unattended::guard::stop_token(&HOST_PK, &env.stop_code);
+
+        assert!(store_enabled(&env));
+        assert!(env.guard.store().grant(&env.device).is_some());
+
+        stop.observe(&token).await;
+
+        assert!(!store_enabled(&env), "master switch off");
+        assert!(
+            env.guard.store().grant(&env.device).is_none(),
+            "grants revoked"
+        );
+        assert_eq!(kill.fired(), Some(bye::EMERGENCY_STOP));
+
+        // Single use: the token was cleared, so a replay of the same card is
+        // now indistinguishable from any other unknown value.
+        let kill2 = KillSwitch::new();
+        let stop2 = EmergencyStop::new(Arc::clone(&env.guard), kill2.clone());
+        stop2.observe(&token).await;
+        assert_eq!(kill2.fired(), None, "the code is single-use");
+    }
+
+    /// A token that is not this host's does nothing at all — including the
+    /// token a *different* host's pk would produce from the same code, which is
+    /// the phishing case §B.8.7.4 relies on the pk binding for.
+    #[tokio::test]
+    async fn a_foreign_stop_token_does_nothing() {
+        let env = env(PW);
+        let kill = KillSwitch::new();
+        let stop = EmergencyStop::new(Arc::clone(&env.guard), kill.clone());
+
+        // Right code, wrong host: what a client would compute after dialling a
+        // scam onion address.
+        let other_host = [0x99; 32];
+        let foreign = tornect_core::unattended::guard::stop_token(&other_host, &env.stop_code);
+        stop.observe(&foreign).await;
+        // And an unrelated value.
+        stop.observe(&[0x00; 32]).await;
+
+        assert!(store_enabled(&env), "still on");
+        assert!(
+            env.guard.store().grant(&env.device).is_some(),
+            "grant intact"
+        );
+        assert_eq!(kill.fired(), None);
+    }
+
+    /// A host with no stop code enabled ignores every token, including the
+    /// all-zero one that a naive constant-time compare against an absent value
+    /// would accept.
+    #[tokio::test]
+    async fn a_host_without_a_stop_code_ignores_every_token() {
+        let env = env(PW);
+        // `emergency_stop` is the one path that clears the token; use it to
+        // reach the "no code enabled" state, then re-enable the grant store's
+        // master switch would re-issue one — so assert on the cleared state.
+        let kill = KillSwitch::new();
+        let stop = EmergencyStop::new(Arc::clone(&env.guard), kill.clone());
+        env.guard.emergency_stop().expect("clear the token");
+
+        let kill2 = KillSwitch::new();
+        let stop2 = EmergencyStop::new(Arc::clone(&env.guard), kill2.clone());
+        stop2.observe(&[0x00; 32]).await;
+        stop2
+            .observe(&tornect_core::unattended::guard::stop_token(
+                &HOST_PK,
+                &env.stop_code,
+            ))
+            .await;
+        assert_eq!(kill2.fired(), None);
+        let _ = stop;
+        let _ = kill;
     }
 
     /// The happy path: a granted, paired device with the right password reaches
