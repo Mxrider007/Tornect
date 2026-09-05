@@ -120,7 +120,26 @@ against a real `serve_host` running the real hook — no stub at any layer — r
 `SESSION_ACCEPT` with a derived token and zero popups. That is the B.8.14 M1 acceptance
 shape minus the Tor transport; live verification over Tor stays in track E.
 
-Gate after track C: `cargo xtask verify` green, **286 tests**.
+**Track C review (2026-09-04, `3d468f1`).** Six hostile reviewers over the new code, each
+finding attacked by three refuters: **26 raw findings → 3 confirmed, 23 refuted**; full report
+in `kore_project_V3/agents/security/reports/2026-09-04_tornect_track_c_review.md`. All three
+fixed:
+
+- **MEDIUM — `export_key` / `session_key` dropped, not zeroized.** `opaque-ke`'s `*FinishResult`
+  types are `derive_where(Clone)` only; unlike the state types they are **not** `ZeroizeOnDrop`.
+  The doc comment claimed otherwise, which is worse than saying nothing. All four sites now wipe
+  explicitly. The §B.8.15 A14 core-dump sweep is still OPEN.
+- **MEDIUM — pre-emption unimplemented.** §B.8.4.5 makes cancellation the rule and `UA_BUSY` the
+  narrow case; only the narrow case existed, so `PREEMPTED` was emitted nowhere and a client whose
+  circuit died was locked out for the full 30 s `AwaitKe3` timeout. Also: the in-flight slot was
+  held for the whole handler although §B.8.5.2 counts `AwaitKe3` only, so four accepted sessions
+  in their block windows could `UA_BUSY` a fifth device.
+- **LOW — no `BYE{CLIENT_AUTH_ABORT}`** from the client on a failed server MAC (§B.8.4.2).
+
+The §B.8.5.2 budgets had **no test at all** before this; two were added, both verified to fail
+against the pre-fix code.
+
+Gate after track C and its review: `cargo xtask verify` green, **289 tests**.
 
 **Harness notes for whoever writes the next tests.** A grant needs the master switch on
 (`MutationGuard::master_on`, off by default — §B.8 opt-in) and a preset that waives the
