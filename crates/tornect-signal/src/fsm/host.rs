@@ -23,6 +23,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tornect_core::DeviceId;
 use tornect_core::session_log::SessionMode;
+use tornect_core::unattended::guard::AdminEffect;
 use zeroize::Zeroizing;
 
 use super::{
@@ -163,8 +164,17 @@ pub enum UnattendedVerdict {
         /// The negotiated caps.
         caps: ChosenCaps,
     },
-    /// Send a signed `ADMIN_RESULT` and close.
-    Admin(AdminResult),
+    /// Send a signed `ADMIN_RESULT` and close, then apply `effect` to live
+    /// sessions.
+    Admin {
+        /// The result to sign and send.
+        result: AdminResult,
+        /// What the command did, for the caller to apply to live sessions
+        /// (§B.8.4.1). Separated from `result` because the wire answer and the
+        /// local side effect have different audiences: the client is told
+        /// whether its command ran, the host is told what to tear down.
+        effect: AdminEffect,
+    },
 }
 
 /// The §B.8 seam: fills the `HelloVerified → SESSION_REQUEST{unattended}`
@@ -246,6 +256,30 @@ impl KillSwitch {
                 std::future::pending::<()>().await;
             }
         }
+    }
+}
+
+/// Apply the side effect of a remote admin command to live sessions (§B.8.4.1).
+///
+/// **M1 scope, stated plainly.** [`KillSwitch`] is host-wide: it carries one
+/// `BYE` reason to every stream sharing these deps and cannot address a single
+/// device. The two host-wide effects are therefore applied exactly; the two
+/// per-device ones are not, and are not pretended to be. That gap is real but
+/// bounded — the store mutation has already happened, so the revoked or
+/// suspended device's *next* handshake fails its grant lookup, and at M1 no
+/// media session exists to tear down (`tornect-session` owns live sessions from
+/// M4, §B.8.14). The M4 row is where a per-device kill belongs; wiring a
+/// host-wide kill to a per-device effect here would end innocent sessions to
+/// look complete.
+fn apply_admin_effect(deps: &HostDeps, effect: &AdminEffect) {
+    match effect {
+        AdminEffect::MasterOff => deps.kill.kill(messages::bye::MASTER_OFF),
+        AdminEffect::RevokedAll(_) => deps.kill.kill(messages::bye::REVOKED),
+        // Per-device, and the requester's own stream is already closed above.
+        AdminEffect::Revoked(_) | AdminEffect::Suspended(_) | AdminEffect::EndSession => {}
+        // Access-restoring: nothing to tear down.
+        AdminEffect::Unlocked(_) => {}
+        AdminEffect::None => {}
     }
 }
 
@@ -594,10 +628,16 @@ where
                     reason,
                 });
             }
-            UnattendedVerdict::Admin(result) => {
+            UnattendedVerdict::Admin { result, effect } => {
                 let ok = result.ok;
+                // The answer goes out before the effect is applied. A
+                // `master_off` or `revoke_all` fires the kill switch, and the
+                // requester's own stream is one of the streams it would tear
+                // down — sending first is what lets the device that asked for
+                // the emergency stop actually see it succeed.
                 chan.send(&result, Some(&*deps.signer)).await?;
                 chan.close().await;
+                apply_admin_effect(deps, &effect);
                 return Ok(HostOutcome::Admin { device, ok });
             }
             UnattendedVerdict::Accept { proof, caps } => (proof, caps),
