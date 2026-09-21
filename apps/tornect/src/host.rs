@@ -5,8 +5,12 @@
 //! [`wire`] builds everything a stream is served with. The kill switch and the
 //! live-session tracker are shared with the IPC context, so a `tornect panic`
 //! (or `unattended off`) reaches every handshake and session this host serves,
-//! and the guard refuses access-increasing changes while one is live.
+//! and the guard refuses access-increasing changes while one is live. Each
+//! session's screen goes out on the media port through `tornect-session`'s
+//! [`MediaHost`], which the same sink feeds.
 
+use std::fmt;
+use std::io::Write as _;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -16,6 +20,9 @@ use tornect_core::session_log::{SessionLog, SessionMode};
 use tornect_core::unattended::limiter::{AttemptLimiter, HostTransport};
 use tornect_core::unattended::schedule::FixedOffset;
 use tornect_core::{Config, HostIdentity, Paths};
+use tornect_session::{
+    CaptureStarted, MediaEnd, MediaHost, MediaObserver, MediaOutcome, MediaReport,
+};
 use tornect_signal::consent::TransportPolicy;
 use tornect_signal::dispatch::{FIRST_FRAME_DEADLINE, FirstFrame, first_frame};
 use tornect_signal::envelope::codes;
@@ -49,13 +56,15 @@ pub struct HostWiring {
 }
 
 /// Wire the host FSM for `paths`: `consent` answers the popups, `identity`
-/// signs, `device_pk` is the host's device key (its QUIC identity, §B.6).
+/// signs, `device_pk` is the host's device key (its QUIC identity, §B.6), and
+/// `media` serves the sessions' screens.
 pub fn wire(
     paths: &Paths,
     cfg: &Config,
     identity: Arc<HostIdentity>,
     device_pk: [u8; 32],
     consent: Arc<dyn Consent>,
+    media: Arc<MediaHost>,
 ) -> anyhow::Result<HostWiring> {
     let kill = KillSwitch::new();
     let live = Arc::new(LiveSessions::new());
@@ -87,6 +96,7 @@ pub fn wire(
     deps.audit = audit.clone();
     deps.sessions = Arc::new(CliSessions {
         live: Arc::clone(&live),
+        media,
     });
     deps.activity = live.clone();
     deps.kill = kill.clone();
@@ -124,18 +134,19 @@ pub fn wire(
     })
 }
 
-/// The CLI's [`SessionSink`]: records each session in the tracker, and says on
-/// the terminal when one starts and ends — the M1 stand-in for the §B.6
-/// sharing indicator (nothing is captured yet).
+/// The CLI's [`SessionSink`]: records each session in the tracker, hands it to
+/// the media layer, and says on the terminal when one starts and ends.
 struct CliSessions {
     live: Arc<LiveSessions>,
+    media: Arc<MediaHost>,
 }
 
 impl SessionSink for CliSessions {
     fn on_start(&self, session: &LiveSession<'_>) {
         self.live.on_start(session);
-        println!("SESSION LIVE {}", session.session_id);
-        eprintln!(
+        self.media.on_start(session);
+        say(format_args!("SESSION LIVE {}", session.session_id));
+        note(format_args!(
             "session with \"{}\" is live ({}{}); `tornect panic` ends it",
             session.label,
             mode_name(session.mode),
@@ -144,17 +155,99 @@ impl SessionSink for CliSessions {
             } else {
                 ""
             },
-        );
+        ));
     }
 
     fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
+        // Media first: that is what stops capture.
+        self.media.on_end(session_id, end);
         self.live.on_end(session_id, end);
-        println!("SESSION ENDED {session_id}");
-        eprintln!(
+        say(format_args!("SESSION ENDED {session_id}"));
+        note(format_args!(
             "session ended: {}",
             end.map_or_else(|| "protocol error".to_owned(), describe_end)
-        );
+        ));
     }
+}
+
+/// The §B.6 sharing indicator, as a terminal can show it: a line when a
+/// session's screen starts going out, and one when capture has stopped.
+pub struct CliMedia;
+
+impl MediaObserver for CliMedia {
+    fn capture_started(&self, s: &CaptureStarted<'_>) {
+        say(format_args!("SHARING {}", s.session_id));
+        let input = match (s.mode, s.input) {
+            (SessionMode::ViewOnly, _) => "view-only",
+            (_, true) => "their input is injected",
+            (_, false) => "their input goes nowhere here",
+        };
+        note(format_args!(
+            "sharing this screen with \"{}\" ({} {}x{}; {input}); `tornect panic` stops it",
+            s.label, s.source, s.width, s.height
+        ));
+    }
+
+    fn capture_stopped(&self, session_id: &str, report: &MediaReport, end: &MediaEnd) {
+        say(format_args!("SHARING STOPPED {session_id}"));
+        note(format_args!(
+            "screen sharing stopped ({}): {} pictures, {} KiB sent",
+            describe_media_end(*end),
+            report.frames_sent,
+            report.bytes_sent / 1024
+        ));
+    }
+}
+
+fn describe_media_end(end: MediaEnd) -> String {
+    match end {
+        MediaEnd::SessionOver(reason) => format!("session over, {}", media_reason(reason)),
+        MediaEnd::ViewerLeft => "the viewer left".to_owned(),
+        MediaEnd::Protocol => "the viewer broke the media protocol".to_owned(),
+        MediaEnd::Pipeline(reason) => media_reason(reason).to_owned(),
+        MediaEnd::Io => "the connection to the viewer failed".to_owned(),
+    }
+}
+
+/// A `tornect_proto::reason` for people.
+pub fn media_reason(reason: u16) -> &'static str {
+    use tornect_proto::reason as r;
+    match reason {
+        r::BAD_BIND => "the session did not match",
+        r::CAPTURE_FAILED => "screen capture failed",
+        r::ENDED_BY_HOST => "ended by the host",
+        r::ENDED_BY_VIEWER => "ended by the viewer",
+        r::SESSION_OVER => "the session ended",
+        r::PROTOCOL => "protocol error",
+        r::ENCODER_FAILED => "the video encoder failed",
+        _ => "unknown reason",
+    }
+}
+
+/// One line for a media stream that never got as far as sharing (the observer
+/// reports the ones that did).
+pub fn describe_media(outcome: &MediaOutcome) -> Option<String> {
+    Some(match outcome {
+        MediaOutcome::Busy => "media stream closed: too many are waiting to bind".to_owned(),
+        MediaOutcome::NotBound => "media stream closed: it did not prove a live session".to_owned(),
+        MediaOutcome::NotStarted(end) => {
+            format!("screen sharing did not start: {}", describe_media_end(*end))
+        }
+        MediaOutcome::Served { .. } => return None,
+    })
+}
+
+/// A line on stdout that cannot panic. `println!` panics when stdout is a
+/// closed pipe, and a panic inside a [`SessionSink`] call would skip the
+/// `on_end` that releases the session and stops capture (SLICE-B1 B1-4).
+fn say(line: fmt::Arguments<'_>) {
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}").and_then(|()| out.flush());
+}
+
+/// [`say`] for stderr.
+fn note(line: fmt::Arguments<'_>) {
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
 }
 
 fn mode_name(mode: SessionMode) -> &'static str {
@@ -314,6 +407,16 @@ mod tests {
         }
     }
 
+    fn media() -> Arc<MediaHost> {
+        Arc::new(MediaHost::new(
+            Arc::new(tornect_session::SystemBackend::new(
+                tornect_session::Source::TestCard,
+            )),
+            Arc::new(tornect_session::NoObserver),
+            tornect_session::MediaLimits::default(),
+        ))
+    }
+
     fn client(env: &Env) -> (DeviceIdentity, ClientConfig, ClientDeps) {
         let known = Arc::new(
             KnownHostStore::open(env.paths.state_dir.join("client-known-hosts.toml")).unwrap(),
@@ -338,6 +441,7 @@ mod tests {
             Arc::clone(&env.identity),
             [9; 32],
             Arc::new(ScriptedConsent::new()),
+            media(),
         )
         .unwrap();
         let ctx = wiring
@@ -370,6 +474,7 @@ mod tests {
             Arc::clone(&env.identity),
             HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32])),
             consent,
+            media(),
         )
         .unwrap();
         let ctx = wiring.ctx.as_ref().unwrap();
@@ -439,6 +544,7 @@ mod tests {
             Arc::clone(&env.identity),
             [9; 32],
             consent.clone(),
+            media(),
         )
         .unwrap();
         let (mut client_end, host_end) = duplex(1024);

@@ -80,7 +80,8 @@ enum Command {
     /// Report the environment (OS, session type, directories, identities).
     Doctor,
     /// Publish this machine's Tornect ID as a Tor onion service; answer pings,
-    /// and pairing and session requests (asked on this terminal).
+    /// and pairing and session requests (asked on this terminal); share the
+    /// screen with each accepted session.
     ///
     /// Prints `Tornect ID: <onion>` as soon as the service is launched and
     /// `REACHABLE` once the address is published on the Tor network. Ctrl-C stops
@@ -95,6 +96,11 @@ enum Command {
         /// Force proof-of-work introduction defense off.
         #[arg(long, conflicts_with = "pow")]
         no_pow: bool,
+        /// What a session shares: `desktop` (X11 on an X11 session, GDI on
+        /// Windows; Wayland capture is not built yet) or `test-card` (a
+        /// synthetic picture; the viewer's input goes nowhere).
+        #[arg(long, value_enum, default_value_t = CaptureArg::Desktop)]
+        capture: CaptureArg,
     },
     /// Manage unattended access: which devices may connect without asking.
     Unattended {
@@ -141,8 +147,10 @@ enum Command {
     },
     /// Connect to a host by Tornect ID over Tor: pair with it if it is new
     /// (both screens show a code to compare), then ask for a session its user
-    /// must accept, and keep that session alive until Ctrl-C.
+    /// must accept, receive the shared screen, and keep the session alive until
+    /// Ctrl-C.
     ///
+    /// There is no viewer window yet: the pictures are decoded and counted.
     /// Uses this instance's own Tor state; run it under a different TORNECT_HOME
     /// than the host when both live on one machine.
     Connect {
@@ -157,7 +165,28 @@ enum Command {
         /// End the session after this many pings instead of at Ctrl-C.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         pings: Option<u32>,
+        /// Keep only the signaling session: open no media stream.
+        #[arg(long)]
+        no_video: bool,
     },
+}
+
+/// `tornect host --capture`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CaptureArg {
+    /// The desktop, with this OS's capture backend.
+    Desktop,
+    /// A synthetic test card.
+    TestCard,
+}
+
+impl From<CaptureArg> for tornect_session::Source {
+    fn from(arg: CaptureArg) -> Self {
+        match arg {
+            CaptureArg::Desktop => Self::Desktop,
+            CaptureArg::TestCard => Self::TestCard,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -198,13 +227,18 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Config { action } => cmd_config(&paths, action),
         Command::Doctor => cmd_doctor(&paths),
-        Command::Host { once, pow, no_pow } => {
+        Command::Host {
+            once,
+            pow,
+            no_pow,
+            capture,
+        } => {
             let pow = match (pow, no_pow) {
                 (true, _) => Some(true),
                 (_, true) => Some(false),
                 _ => None,
             };
-            tor_cmd::host(&paths, once, pow, cli.bridges)
+            tor_cmd::host(&paths, once, pow, cli.bridges, capture.into())
         }
         Command::TorCheck => tor_cmd::tor_check(&paths, cli.bridges),
         Command::Ping { onion, count } => tor_cmd::ping(&paths, &onion, count, cli.bridges),
@@ -213,6 +247,7 @@ fn main() -> anyhow::Result<()> {
             pair_only,
             forget,
             pings,
+            no_video,
         } => tor_cmd::connect(
             &paths,
             &onion,
@@ -220,6 +255,7 @@ fn main() -> anyhow::Result<()> {
                 pair_only,
                 forget,
                 pings,
+                video: !no_video,
             },
             cli.bridges,
         ),

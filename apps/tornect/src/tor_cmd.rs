@@ -1,6 +1,7 @@
-//! `tornect host`, `tornect ping` and `tornect connect`: signaling over the
-//! live Tor network. The host answers the pairing-free ping protocol and the
-//! handshake FSM on one port, routed by the first frame (decision M1-42).
+//! `tornect host`, `tornect ping` and `tornect connect` over the live Tor
+//! network. The host answers the pairing-free ping protocol and the handshake
+//! FSM on one port, routed by the first frame (decision M1-42), and shares the
+//! screen of each accepted session on the media port (decision M1-39).
 
 use std::pin::pin;
 use std::sync::Arc;
@@ -9,13 +10,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
-use tokio::sync::{Semaphore, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
+use tornect_capture::TestCard;
+use tornect_codec::DecodedFrame;
 use tornect_core::config::BridgeMode;
 use tornect_core::keystore::{
     FileSecretStore, load_or_create_device_identity, load_or_create_host_identity,
 };
+use tornect_core::session_log::SessionMode;
 use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
+use tornect_session::{
+    Binding, FrameSink, MediaHost, MediaLimits, MediaViewer, Source, SystemBackend, ViewerEnd,
+    ViewerStats,
+};
 use tornect_signal::framing::FrameError;
 use tornect_signal::fsm::client::{
     self, ClientConfig, ClientDeps, ClientOutcome, ClientSession, Intent, NoServerKeyPin,
@@ -27,11 +35,11 @@ use tornect_signal::pairing::{AutoDeny, Consent, KnownHostStore};
 use tornect_signal::ping::NONCE_LEN;
 use tornect_signal::tor::Admission;
 use tornect_signal::{
-    HostSigner, Ladder, LadderEvent, OnionStatus, SignalError, TorNode, install_crypto_provider,
-    ping, shutdown_runtime,
+    HostSigner, Isolation, Ladder, LadderEvent, MEDIA_PORT, OnionStatus, SIGNALING_PORT,
+    SignalError, TorNode, install_crypto_provider, ping, shutdown_runtime,
 };
 
-use crate::host::{HostWiring, Served};
+use crate::host::{CliMedia, HostWiring, Served};
 use crate::prompt::{CliConsent, CliPairingUi, Prompter};
 
 /// Per-ping reply deadline once the stream is open.
@@ -51,6 +59,18 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 /// 90 s idle timeout, and often enough to notice a host `BYE` within seconds.
 const SESSION_PING_EVERY: Duration = Duration::from_secs(10);
 
+/// How long `tornect connect` waits for the host to answer its media bind: the
+/// host's own first-picture deadline (10 s) plus a Tor round trip or two.
+const MEDIA_BIND_WAIT: Duration = Duration::from_secs(30);
+
+/// When the host closes the media stream, how long `tornect connect` waits for
+/// the host's `BYE` on the signaling stream, so the end is reported as the
+/// host's rather than as the client's own.
+const BYE_GRACE: Duration = Duration::from_secs(5);
+
+/// How often `tornect connect` reports the pictures it receives.
+const VIDEO_NOTE_EVERY: Duration = Duration::from_secs(5);
+
 fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -58,12 +78,13 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
         .context("creating the tokio runtime")
 }
 
-/// `tornect host [--once] [--pow|--no-pow]`
+/// `tornect host [--once] [--pow|--no-pow] [--capture …]`
 pub fn host(
     paths: &Paths,
     once: bool,
     pow: Option<bool>,
     bridges: Option<BridgeMode>,
+    source: Source,
 ) -> anyhow::Result<()> {
     install_crypto_provider();
     paths.ensure().context("creating Tornect directories")?;
@@ -91,7 +112,29 @@ pub fn host(
         Arc::new(identity),
         HostSigner::public_key(&device),
         once,
+        source,
     ))
+}
+
+/// What `tornect host` says it will share, before any session asks.
+fn describe_source(source: Source) -> String {
+    match source {
+        Source::TestCard => {
+            "sharing: a synthetic test card (no desktop; viewers' input goes nowhere)".to_owned()
+        }
+        Source::Desktop if wayland_without_capture() => {
+            "sharing: nothing yet. This is a Wayland session and Wayland capture is not built \
+             yet, so sessions connect but no picture can be shared; `--capture test-card` \
+             shares a test card instead"
+                .to_owned()
+        }
+        Source::Desktop => "sharing: this desktop".to_owned(),
+    }
+}
+
+fn wayland_without_capture() -> bool {
+    cfg!(target_os = "linux")
+        && std::env::var("XDG_SESSION_TYPE").is_ok_and(|session| session == "wayland")
 }
 
 /// `tornect tor-check [--bridges …]`: reach the Tor network the way `host` and
@@ -176,6 +219,7 @@ async fn run_host(
     identity: Arc<HostIdentity>,
     device_pk: [u8; 32],
     once: bool,
+    source: Source,
 ) -> anyhow::Result<()> {
     let consent: Arc<dyn Consent> = match Prompter::stdin() {
         Some(prompter) => Arc::new(CliConsent::new(prompter)),
@@ -187,13 +231,29 @@ async fn run_host(
             Arc::new(AutoDeny)
         }
     };
+    let media = Arc::new(MediaHost::new(
+        Arc::new(SystemBackend::new(source)),
+        Arc::new(CliMedia),
+        MediaLimits::default(),
+    ));
     let HostWiring {
         cfg: host_cfg,
         deps,
         ctx,
         live,
         audit,
-    } = crate::host::wire(paths, cfg, Arc::clone(&identity), device_pk, consent)?;
+    } = crate::host::wire(
+        paths,
+        cfg,
+        Arc::clone(&identity),
+        device_pk,
+        consent,
+        Arc::clone(&media),
+    )?;
+    // A kill ends every session's media at once, without waiting for the FSM's
+    // `BYE` to a peer that may not be reading (SLICE-B1 B1-2).
+    let kill_watch = media.watch_kill(deps.kill.clone());
+    eprintln!("{}", describe_source(source));
 
     // The §B.8.7.4 control channel, bound **before** Tor. A running host owns the
     // endpoint and the store's advisory lock, so `tornect unattended …` in
@@ -256,6 +316,8 @@ async fn run_host(
     let (served_tx, mut served_rx) = watch::channel(0u64);
     let slots = Arc::new(Semaphore::new(MAX_SIGNALING_STREAMS));
     let serving = Arc::new((host_cfg, deps.clone()));
+    // Media streams: each bounds itself (bind deadline, unbound cap, session end).
+    let mut media_streams = JoinSet::new();
     let mut ctrl_c = pin!(tokio::signal::ctrl_c());
     loop {
         tokio::select! {
@@ -269,9 +331,19 @@ async fn run_host(
                     eprintln!("listener closed");
                     break;
                 };
-                // The media port (decision M1-39) belongs to the session layer,
-                // which does not exist yet: close such streams unanswered.
-                if stream.port() != tornect_signal::SIGNALING_PORT {
+                while media_streams.try_join_next().is_some() {}
+                if stream.port() == MEDIA_PORT {
+                    let media = Arc::clone(&media);
+                    media_streams.spawn(async move {
+                        let outcome = media.serve(stream).await;
+                        if let Some(line) = crate::host::describe_media(&outcome) {
+                            eprintln!("{line}");
+                        }
+                    });
+                    continue;
+                }
+                // The listener admits no other port; this only keeps that true here.
+                if stream.port() != SIGNALING_PORT {
                     continue;
                 }
                 // Dropping the stream closes it; the peer sees EOF.
@@ -306,16 +378,24 @@ async fn run_host(
         }
     }
 
-    // End every handshake and session with a `BYE`, and give the streams a
-    // moment to send it before Tor goes away under them.
+    // End every handshake and session with a `BYE` (and every media stream with
+    // a `Close`), and give the streams a moment to send it before Tor goes away
+    // under them.
     deps.kill.kill(bye::USER);
     let grace = tokio::time::Instant::now() + SHUTDOWN_GRACE;
-    while deps.stats.streams.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < grace {
+    loop {
+        while media_streams.try_join_next().is_some() {}
+        let busy = deps.stats.streams.load(Ordering::SeqCst) > 0 || !media_streams.is_empty();
+        if !busy || tokio::time::Instant::now() >= grace {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     if live.count() > 0 {
         eprintln!("{} session(s) did not close in time", live.count());
     }
+    media_streams.abort_all();
+    kill_watch.abort();
     if let Some(ipc) = &ipc {
         ipc.abort();
     }
@@ -394,6 +474,8 @@ pub struct ConnectOpts {
     /// End the session after this many pings (scripted checks); `None` keeps
     /// it alive until Ctrl-C.
     pub pings: Option<u32>,
+    /// Open the session's media stream and receive the shared screen.
+    pub video: bool,
 }
 
 /// `tornect connect <onion> [--pair-only] [--forget] [--pings N]`
@@ -449,7 +531,13 @@ async fn connect_session(
 ) -> anyhow::Result<()> {
     eprintln!("connecting to {id} (rendezvous usually takes 5-30 s, up to 60 s)...");
     let started = Instant::now();
-    let stream = node.connect(&id).await.map_err(explain)?;
+    // One isolation group for the session: the media stream opened later rides
+    // the signaling stream's rendezvous circuit (decision M1-39).
+    let isolation = Isolation::new();
+    let stream = node
+        .connect_on(&id, SIGNALING_PORT, &isolation)
+        .await
+        .map_err(explain)?;
     eprintln!("connected in {:.1} s", started.elapsed().as_secs_f64());
 
     let pairing = known.get(&id).is_none();
@@ -484,7 +572,7 @@ async fn connect_session(
         ClientOutcome::Session(session) => session,
     };
     let mode = match tornect_signal::consent::mode_from_code(session.accept().mode()) {
-        Some(tornect_core::session_log::SessionMode::ViewOnly) => "view-only",
+        Some(SessionMode::ViewOnly) => "view-only",
         _ => "control",
     };
     println!(
@@ -503,13 +591,17 @@ async fn connect_session(
         SESSION_PING_EVERY.as_secs()
     );
 
-    let end = keep_alive(
-        &mut session,
-        opts.pings,
-        SESSION_PING_EVERY,
-        tokio::signal::ctrl_c(),
-    )
-    .await?;
+    let end = if opts.video {
+        watch(node, &id, &isolation, &mut session, opts.pings).await?
+    } else {
+        keep_alive(
+            &mut session,
+            opts.pings,
+            SESSION_PING_EVERY,
+            tokio::signal::ctrl_c(),
+        )
+        .await?
+    };
     match end {
         End::You => {
             if let Err(e) = session.bye(bye::USER).await {
@@ -521,6 +613,13 @@ async fn connect_session(
         End::Lost(e) => {
             println!("SESSION ENDED (connection lost)");
             return Err(explain_handshake(e));
+        }
+        End::NoPicture(e) => {
+            if let Err(e) = session.bye(bye::USER).await {
+                tracing::debug!(error = %e, "sending BYE");
+            }
+            println!("SESSION ENDED (no picture)");
+            return Err(e);
         }
     }
     Ok(())
@@ -535,6 +634,180 @@ enum End {
     Host(u16),
     /// The session broke.
     Lost(HandshakeError),
+    /// The media stream could not be opened or bound, or it broke.
+    NoPicture(anyhow::Error),
+}
+
+/// Open the session's media stream beside the signaling stream and receive
+/// the screen, while the signaling stream keeps the session alive. Whichever
+/// side ends first ends the other.
+async fn watch<S>(
+    node: &TorNode,
+    id: &TornectId,
+    isolation: &Isolation,
+    session: &mut ClientSession<S>,
+    pings: Option<u32>,
+) -> anyhow::Result<End>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let binding = Binding::new(session.session_token(), &session.th());
+    let opened = async {
+        let stream = node
+            .connect_on(id, MEDIA_PORT, isolation)
+            .await
+            .map_err(explain)?;
+        MediaViewer::bind(stream, &binding, MEDIA_BIND_WAIT)
+            .await
+            .map_err(|e| anyhow::Error::new(e).context("binding the media stream"))
+    };
+    let viewer = match opened.await {
+        Ok(viewer) => viewer,
+        Err(e) => {
+            println!("MEDIA FAILED: {e:#}");
+            return Ok(End::NoPicture(e));
+        }
+    };
+    let bound = *viewer.bound();
+    println!(
+        "MEDIA BOUND {}x{} ({})",
+        bound.width,
+        bound.height,
+        match bound.mode {
+            SessionMode::ViewOnly => "view-only",
+            _ => "control",
+        }
+    );
+
+    let mut pictures = CliPictures::new();
+    let mut stats = ViewerStats::default();
+    let (media_done, media_ended) = oneshot::channel::<bool>();
+    let (stop_media, media_stop) = oneshot::channel::<()>();
+    let viewing = async {
+        let stop = async {
+            let _ = media_stop.await;
+        };
+        let viewed = viewer.run(&mut pictures, &mut stats, stop).await;
+        let by_host = matches!(viewed, Ok(ViewerEnd::Host(_) | ViewerEnd::Closed));
+        let _ = media_done.send(by_host);
+        viewed
+    };
+    let signaling = async {
+        let stop = async {
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => result,
+                by_host = media_ended => {
+                    // The host closed the media stream: its `BYE` is usually on
+                    // the way, and the end should be reported as the host's.
+                    if by_host.unwrap_or(false) {
+                        tokio::time::sleep(BYE_GRACE).await;
+                    }
+                    Ok(())
+                }
+            }
+        };
+        let end = keep_alive(session, pings, SESSION_PING_EVERY, stop).await;
+        let _ = stop_media.send(());
+        end
+    };
+    let (viewed, end) = tokio::join!(viewing, signaling);
+
+    pictures.report(&stats);
+    match &viewed {
+        Ok(ViewerEnd::Host(reason)) => println!(
+            "MEDIA ENDED by the host ({})",
+            crate::host::media_reason(*reason)
+        ),
+        Ok(ViewerEnd::Closed) => println!("MEDIA ENDED (the host closed the stream)"),
+        Ok(ViewerEnd::Stopped) => println!("MEDIA ENDED (by you)"),
+        Err(e) => println!("MEDIA FAILED: {e}"),
+    }
+    let end = end?;
+    Ok(match (viewed, end) {
+        // The picture failed first; the session ended because of it.
+        (Err(e), End::You) => End::NoPicture(anyhow::Error::new(e)),
+        (_, end) => end,
+    })
+}
+
+/// The CLI's stand-in for a viewer window: counts what it decodes, says so every
+/// few seconds, and checks the test card's frame index when there is one.
+struct CliPictures {
+    started: Instant,
+    last_note: Instant,
+    decoded: u64,
+    size: Option<(u32, u32)>,
+    /// The first and last test-card index, while every picture has carried the
+    /// next one.
+    card: Option<(u32, u32)>,
+    card_in_order: bool,
+}
+
+impl CliPictures {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last_note: now,
+            decoded: 0,
+            size: None,
+            card: None,
+            card_in_order: true,
+        }
+    }
+
+    fn fps(&self) -> f64 {
+        self.decoded as f64 / self.started.elapsed().as_secs_f64().max(0.001)
+    }
+
+    fn report(&self, stats: &ViewerStats) {
+        let secs = self.started.elapsed().as_secs_f64().max(0.001);
+        let (w, h) = self.size.unwrap_or_default();
+        println!(
+            "MEDIA {} pictures={} units={} keyframes={} errors={} size={w}x{h} fps={:.1} kbps={:.0}",
+            if self.decoded > 0 { "OK" } else { "EMPTY" },
+            self.decoded,
+            stats.access_units,
+            stats.keyframes,
+            stats.decode_errors,
+            self.fps(),
+            stats.bytes as f64 * 8.0 / 1000.0 / secs,
+        );
+        // Only a test card carries an index in every picture, in order.
+        if let Some((first, last)) = self.card.filter(|_| self.card_in_order && self.decoded > 1) {
+            println!("MEDIA CARD first={first} last={last} in-order");
+        }
+    }
+}
+
+impl FrameSink for CliPictures {
+    fn picture(&mut self, _seq: u32, frame: &DecodedFrame) {
+        self.decoded += 1;
+        // Sized from the picture itself, never from `BindOk` (SLICE-A2 A2-4).
+        self.size = Some((frame.width, frame.height));
+        // RGBA keeps green at offset 1, as the BGRx the card is drawn in does.
+        let index = TestCard::read_index(&frame.rgba, frame.width, frame.height);
+        self.card = match (self.card, index) {
+            (None, Some(index)) if self.decoded == 1 => Some((index, index)),
+            (Some((first, last)), Some(index)) if index == last.wrapping_add(1) => {
+                Some((first, index))
+            }
+            (card, _) => {
+                self.card_in_order = false;
+                card
+            }
+        };
+        if self.last_note.elapsed() >= VIDEO_NOTE_EVERY {
+            eprintln!(
+                "video: {} pictures, {:.1} fps, {}x{}",
+                self.decoded,
+                self.fps(),
+                frame.width,
+                frame.height
+            );
+            self.last_note = Instant::now();
+        }
+    }
 }
 
 /// Keep `session` alive with a `PING` every `every` (the first at once) until
