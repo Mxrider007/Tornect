@@ -4,9 +4,13 @@
 
 [graph]
 all-features = false
+# The OS-keychain backend is optional but ships (SLICE-A3 F3).
+features = ["tornect-core/keyring"]
 targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",
+  # The Windows build that ships (decision M3-1); msvc stays for CI.
+  "x86_64-pc-windows-gnullvm",
   "x86_64-pc-windows-msvc",
   "aarch64-apple-darwin",
   "x86_64-apple-darwin",
@@ -16,9 +20,12 @@ targets = [
 version = 2
 yanked = "deny"
 ignore = [
-  # rsa 0.9 Marvin timing side channel: reached only through Arti's ssh-key fork used to
-  # parse keystore files (never for RSA operations on network input). Tracked upstream.
-  { id = "RUSTSEC-2023-0071", reason = "transitive via ssh-key-fork-arti (Arti keystore parsing); no RSA crypto used by Tornect" },
+  # rsa 0.9 Marvin timing side channel. rsa is a direct dependency of tor-llcrypto and
+  # tor-key-forge, and Arti does verify RSA signatures on network input (authority certs,
+  # consensus, router descriptors). Marvin needs the victim to perform RSA *private-key*
+  # operations, which Tornect's client and onion-service roles never do. No fixed version
+  # exists; re-check whenever Arti changes how it uses RSA (SLICE-A3 A1).
+  { id = "RUSTSEC-2023-0071", reason = "direct dep of tor-llcrypto/tor-key-forge; Tornect only verifies RSA signatures (public key), never performs the private-key operations Marvin needs" },
   # `paste` is unmaintained; pulled transitively by dependencies at build time only.
   { id = "RUSTSEC-2024-0436", reason = "proc-macro helper used at build time by transitive dependencies; no runtime exposure" },
 ]
