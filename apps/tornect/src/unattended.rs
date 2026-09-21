@@ -23,7 +23,7 @@ use tornect_core::id::DeviceId;
 use tornect_core::session_log::{Actor, SessionLog};
 use tornect_core::unattended::grant::Preset;
 use tornect_core::unattended::guard::{
-    ExternalOp, GuardError, MutationGuard, NoSessionActivity, SuspendOutcome,
+    ExternalOp, GuardError, MutationGuard, NoSessionActivity, RemoteSessionActivity, SuspendOutcome,
 };
 use tornect_core::unattended::ipc::{
     GrantOptions, IpcOp, IpcRequest, IpcResponse, LogPage, MasterOnPayload, PolicyInputsPayload,
@@ -206,17 +206,18 @@ pub fn dispatch(ctx: &HostContext, req: IpcRequest) -> IpcResponse {
         IpcOp::Panic => {
             // §B.8.7.4: the panic key "ends any session and, if it was
             // unattended, suspends that grant". Ending sessions is what the
-            // kill switch does; suspending the grant behind a *live* session
-            // needs to know which grant that is, and `tornect-session` owns
-            // live sessions from M4. So M1 ends what it can reach and says so
-            // rather than suspending an arbitrary grant.
+            // kill switch does: `tornect host` arms every stream with this
+            // switch, so this ends every handshake and session it serves.
+            // Suspending the grant behind an unattended session is the M4 half
+            // (`tornect-session` owns live sessions); M1 ends what it can reach
+            // and says so rather than suspending an arbitrary grant.
             match &ctx.kill {
                 Some(k) => {
                     k.kill(tornect_signal::messages::bye::PANIC);
                     let mut r = IpcResponse::ok(id);
                     r.detail = Some(
-                        "handshakes ended; suspending the grant behind a live media session \
-                         lands at M4 (docs/PLAN.md §B.8.14)"
+                        "every handshake and session was ended; suspending the grant behind \
+                         an unattended session lands at M4 (docs/PLAN.md §B.8.14)"
                             .to_owned(),
                     );
                     r
@@ -224,9 +225,7 @@ pub fn dispatch(ctx: &HostContext, req: IpcRequest) -> IpcResponse {
                 None => IpcResponse::fail(
                     id,
                     codes::G_PRECONDITION,
-                    "this process serves no handshakes, so there is nothing to end \
-                     (the host FSM is not wired into `tornect host` yet — docs/PLAN.md \
-                     §B.8.14 M1)",
+                    "no host is running here, so there is no session to end",
                 ),
             }
         }
@@ -564,13 +563,20 @@ fn reauth_backend() -> Arc<dyn tornect_core::unattended::guard::ReAuth> {
 
 /// The context a running `tornect host` serves its control channel with.
 ///
-/// The same guard and the same [`dispatch`] as the offline route, deliberately;
-/// what differs is the store's load (§B.8.5.1): the host's load settles pending
-/// charges, applies decay and re-arms locks, which only the host may do. It
-/// gains `kill` — and with it a working `Panic` — when the host FSM is wired
-/// into `tornect host` (§B.8.14 M1, outstanding).
-pub fn host_context(paths: &Paths) -> anyhow::Result<HostContext> {
-    context(paths, LoadMode::Host)
+/// The same guard and the same [`dispatch`] as the offline route, deliberately.
+/// Three things differ:
+/// - The store's load (§B.8.5.1): the host's load settles pending charges,
+///   applies decay and re-arms locks, which only the host may do.
+/// - `kill` is the switch the host FSM arms every stream with, so `Panic`,
+///   `Off`, `Pause` and `RevokeAll` end live sessions.
+/// - The guard sees `activity`, the host's live-session tracker, so it refuses
+///   access-increasing changes while a remote session is live (§B.8.6.2).
+pub fn host_context(
+    paths: &Paths,
+    activity: Arc<dyn RemoteSessionActivity>,
+    kill: tornect_signal::fsm::host::KillSwitch,
+) -> anyhow::Result<HostContext> {
+    context(paths, LoadMode::Host, activity, Some(kill))
 }
 
 /// The offline CLI's context (no host running).
@@ -581,17 +587,22 @@ pub fn host_context(paths: &Paths) -> anyhow::Result<HostContext> {
 /// cannot force. Loading as the host here made every `tornect unattended
 /// status` a load that settled, decayed and rewrote the store (track D S5).
 fn offline_context(paths: &Paths) -> anyhow::Result<HostContext> {
-    context(paths, LoadMode::Offline)
+    context(paths, LoadMode::Offline, Arc::new(NoSessionActivity), None)
 }
 
-/// Build a context: the guard plus the live-session seams there is nothing to
-/// fill yet.
+/// Build a context: the guard, told about live sessions by `activity`, and the
+/// kill switch that ends them (`None` on the offline route, which has none).
 ///
 /// Note the side effect: this creates the host identity if none exists, because
 /// `master_on` needs the onion key to compute the stop token. `tornect id` does
 /// the same and says so; here it happens on the first `tornect unattended`
 /// command of any kind, including a read-only one.
-fn context(paths: &Paths, mode: LoadMode) -> anyhow::Result<HostContext> {
+fn context(
+    paths: &Paths,
+    mode: LoadMode,
+    activity: Arc<dyn RemoteSessionActivity>,
+    kill: Option<tornect_signal::fsm::host::KillSwitch>,
+) -> anyhow::Result<HostContext> {
     use tornect_core::keystore::{FileSecretStore, load_or_create_host_identity};
     use tornect_core::unattended::clock::SystemClock;
     use tornect_core::unattended::guard::{FilePairedDevices, SessionLogHistory};
@@ -606,7 +617,7 @@ fn context(paths: &Paths, mode: LoadMode) -> anyhow::Result<HostContext> {
         LoadMode::Host => GrantStore::open(paths, secrets_dyn, clock, log.clone())?,
         LoadMode::Offline => GrantStore::open_offline(paths, secrets_dyn, clock, log.clone())?,
     };
-    let guard = MutationGuard::new(store, reauth_backend(), Arc::new(NoSessionActivity))
+    let guard = MutationGuard::new(store, reauth_backend(), activity)
         .with_paired_devices(Arc::new(FilePairedDevices::new(
             paths.trusted_devices_file(),
         )))
@@ -620,7 +631,7 @@ fn context(paths: &Paths, mode: LoadMode) -> anyhow::Result<HostContext> {
         host_onion_pk: *host.id().public_key_bytes(),
         readiness: ReadinessSnapshot::unknown(),
         user_inputs,
-        kill: None,
+        kill,
         log,
     })
 }
@@ -1516,18 +1527,29 @@ mod tests {
     /// Track D S5: the offline route loads the store as the offline CLI
     /// (§B.8.5.1: no settlement, no decay, nothing written at load), and only the
     /// host route loads it as the host. The load rules themselves are pinned in
-    /// `tornect-core`; this pins which route gets which.
-    #[test]
-    fn only_the_host_route_loads_the_store_as_the_host() {
+    /// `tornect-core`; this pins which route gets which. Only the host route
+    /// has a kill switch, and its `Panic` fires the switch it was given — the
+    /// one `tornect host` arms every stream with.
+    #[tokio::test]
+    async fn only_the_host_route_loads_the_store_as_the_host() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(tmp.path());
         {
             let offline = offline_context(&paths).unwrap();
             assert_eq!(offline.guard.store().mode(), LoadMode::Offline);
+            assert!(
+                offline.kill.is_none(),
+                "the offline route has no session to end"
+            );
         }
         // Dropping the offline context released the store lock.
-        let host = host_context(&paths).unwrap();
+        let kill = tornect_signal::fsm::host::KillSwitch::new();
+        let host = host_context(&paths, Arc::new(NoSessionActivity), kill.clone()).unwrap();
         assert_eq!(host.guard.store().mode(), LoadMode::Host);
+        let mut armed = kill.arm();
+        assert!(go(&host, IpcOp::Panic).ok);
+        let fired = tokio::time::timeout(std::time::Duration::from_secs(1), armed.killed()).await;
+        assert_eq!(fired.ok(), Some(tornect_signal::messages::bye::PANIC));
     }
 
     fn enabled(ctx: &HostContext) -> bool {

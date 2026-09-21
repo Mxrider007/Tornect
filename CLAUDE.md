@@ -48,8 +48,10 @@ cargo xtask verify                 # fmt --check, clippy -D warnings (all target
 cargo xtask lint-all               # fmt + clippy only
 cargo run -p tornect -- id         # M0 acceptance: prints this machine's Tornect ID (56-char .onion)
 cargo run -p tornect -- doctor     # environment report
-TORNECT_HOME=$PWD/target/tornect-test/h1 cargo run -p tornect -- host          # M1: publish onion service, answer pings
-TORNECT_HOME=$PWD/target/tornect-test/h2 cargo run -p tornect -- ping <id> --count 5   # M1: second isolated instance
+TORNECT_HOME=$PWD/target/tornect-test/h1 cargo run -p tornect -- host          # M1: publish onion service; answer pings, pairing and sessions (asked on this terminal)
+TORNECT_HOME=$PWD/target/tornect-test/h2 cargo run -p tornect -- ping <id> --count 5   # M1: second isolated instance, pairing-free liveness check
+TORNECT_HOME=$PWD/target/tornect-test/h2 cargo run -p tornect -- connect <id>          # M1: pair (compare the code) → host accepts → session kept alive; --pings N, --pair-only, --forget
+TORNECT_HOME=$PWD/target/tornect-test/h1 cargo run -p tornect -- panic                 # ends every session the running host serves
 cargo test -p tornect-signal --test live -- --ignored --nocapture              # M1: host+client roundtrip over live Tor
 cargo +nightly fuzz run framing -- -max_total_time=600                          # M1: 10-min fuzz of the frame parser (fuzz/ is outside the workspace)
 cargo check --target x86_64-pc-windows-msvc -p tornect-core   # cross-check (targets installed on the dev VM)

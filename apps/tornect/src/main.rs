@@ -1,7 +1,7 @@
 //! `tornect` command-line entry point.
 //!
-//! Milestone 0 ships the identity/config commands; Milestone 1 adds `host` and
-//! `ping` over the live Tor network; `connect`, `demo` and the graphical app
+//! Milestone 0 ships the identity/config commands; Milestone 1 adds `host`,
+//! `ping` and `connect` over the live Tor network; `demo` and the graphical app
 //! arrive with later milestones (`docs/PLAN.md` Part C).
 
 #![forbid(unsafe_code)]
@@ -16,6 +16,8 @@ compile_error!(
      or add `-C target-feature=+crt-static` to it"
 );
 
+mod host;
+mod prompt;
 mod tor_cmd;
 mod unattended;
 
@@ -77,12 +79,14 @@ enum Command {
     },
     /// Report the environment (OS, session type, directories, identities).
     Doctor,
-    /// Publish this machine's Tornect ID as a Tor onion service and answer pings.
+    /// Publish this machine's Tornect ID as a Tor onion service; answer pings,
+    /// and pairing and session requests (asked on this terminal).
     ///
     /// Prints `Tornect ID: <onion>` as soon as the service is launched and
-    /// `REACHABLE` once the address is published on the Tor network. Ctrl-C stops.
+    /// `REACHABLE` once the address is published on the Tor network. Ctrl-C stops
+    /// hosting and ends every session.
     Host {
-        /// Exit after the first ping has been answered (scripted verification).
+        /// Exit after the first answered ping or finished session (scripted verification).
         #[arg(long)]
         once: bool,
         /// Force proof-of-work introduction defense on (default: config `tor.pow_defense`).
@@ -135,6 +139,25 @@ enum Command {
         )]
         count: u32,
     },
+    /// Connect to a host by Tornect ID over Tor: pair with it if it is new
+    /// (both screens show a code to compare), then ask for a session its user
+    /// must accept, and keep that session alive until Ctrl-C.
+    ///
+    /// Uses this instance's own Tor state; run it under a different TORNECT_HOME
+    /// than the host when both live on one machine.
+    Connect {
+        /// The host's Tornect ID (56-character onion address, with or without `.onion`).
+        onion: String,
+        /// Pair with the host (if it is new) and stop there.
+        #[arg(long)]
+        pair_only: bool,
+        /// Forget this host first, so the connection pairs again.
+        #[arg(long)]
+        forget: bool,
+        /// End the session after this many pings instead of at Ctrl-C.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        pings: Option<u32>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -185,6 +208,21 @@ fn main() -> anyhow::Result<()> {
         }
         Command::TorCheck => tor_cmd::tor_check(&paths, cli.bridges),
         Command::Ping { onion, count } => tor_cmd::ping(&paths, &onion, count, cli.bridges),
+        Command::Connect {
+            onion,
+            pair_only,
+            forget,
+            pings,
+        } => tor_cmd::connect(
+            &paths,
+            &onion,
+            tor_cmd::ConnectOpts {
+                pair_only,
+                forget,
+                pings,
+            },
+            cli.bridges,
+        ),
         Command::Unattended { action } => unattended::unattended(&paths, action),
         Command::Devices { json } => unattended::devices(&paths, json),
         Command::Panic => unattended::panic_now(&paths),
