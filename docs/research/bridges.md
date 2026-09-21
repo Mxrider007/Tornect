@@ -60,9 +60,13 @@ against the `pt_config.json` inside the GPG-verified tor-expert-bundle 15.0.23: 
 2 Snowflake lines (domain-fronted broker `https://1098762253.rsc.cdn77.org/`, fronts
 `app.datapacket.com,www.datapacket.com`, 8 STUN servers, `utls-imitate=hellorandomizedalpn`;
 387 bytes of arguments, under Arti's 510-byte SOCKS limit). They are public — a censor can list
-them — so `tor.bridge_lines` (private bridges from https://bridges.torproject.org) are tried
-first on their rung. `webtunnel` lines are accepted there too (lyrebird serves them); there are
-no built-in webtunnel bridges.
+them — so `tor.bridge_lines` (private bridges from https://bridges.torproject.org) **replace**
+the built-ins of their transport (decision M1-40). An earlier version tried them first and kept the
+built-ins behind them. Arti's guard selection then still contacted public bridges beside the
+private one: descriptor fetches go to the first two guards, directory fetches spread over three,
+and confirmed guards from earlier runs lead. A censor listing the public bridges could therefore find
+the private one by correlation (SLICE-A1 A1-1). `webtunnel` lines are accepted on the obfs4 rung too
+(lyrebird serves them); there are no built-in webtunnel bridges.
 
 ## 5. The PT binary: lyrebird (obfs4 **and** Snowflake)
 

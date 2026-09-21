@@ -3,9 +3,16 @@
 Tornect reaches Tor through bridges when direct Tor is blocked (decision M1-38,
 `docs/research/bridges.md`). One helper binary serves both bridge types it uses — **obfs4** and
 **Snowflake** — and webtunnel: **lyrebird**, taken unmodified from the Tor Project's signed
-tor-expert-bundle. It is not committed to git; `cargo xtask pt-fetch` downloads it, checks the
-pinned SHA-256 below, and extracts it to `target/pt/<os>/`, from where `cargo xtask dist` bundles
-it next to the Tornect executable.
+tor-expert-bundle. It is not committed to git. **Today** it is fetched and verified by hand with the
+recipe below and extracted to `target/pt/<os>/`; `cargo xtask pt-fetch` (download + the checks
+below) and `dist` bundling it next to the executable are still to be written (hand-off, packaging
+step).
+
+**Enforced at run time** (decision M1-40): Tornect hashes the `lyrebird` it is about to launch and
+refuses one that does not match the member SHA-256 below, compiled into
+`crates/tornect-signal/src/tor/bridges.rs` (`LYREBIRD_SHA256`). It looks next to the executable (or
+in its `pt/` directory), then in `$TORNECT_PT_DIR`; never on `PATH`, never at a relative path. Only
+an explicit `tor.pt_path` may run another build, and that is logged.
 
 | field | value |
 |---|---|
@@ -49,5 +56,7 @@ are compatible with Tornect's GPL-3.0-or-later.
 
 ## Updating
 
-Bump `V` and re-run the recipe; replace every hash in the table and in `xtask`'s pin list; diff the
+Bump `V` and re-run the recipe; replace every hash in the table and `LYREBIRD_SHA256` in
+`crates/tornect-signal/src/tor/bridges.rs` (a release whose bundled binary does not match it refuses
+to run it); diff the
 bundle's `pt_config.json` bridge lines against `BUILTIN_OBFS4` / `BUILTIN_SNOWFLAKE`.

@@ -92,7 +92,7 @@ pub fn tor_check(paths: &Paths, bridges: Option<BridgeMode>) -> anyhow::Result<(
 pub(crate) async fn start_tor(paths: &Paths, cfg: &Config) -> anyhow::Result<TorNode> {
     let ladder = Ladder::from_config(paths, &cfg.tor);
     for line in &ladder.rejected_lines {
-        eprintln!("tor: ignoring bridge line {line}");
+        eprintln!("tor: ignoring {line}");
     }
     let mut last_pct = u32::MAX;
     let node = TorNode::start_auto(paths, cfg, &ladder, |event| match event {
@@ -170,6 +170,15 @@ async fn run_host(
 
     eprintln!("bootstrapping Tor (~30 s cold, a few seconds with a warm cache)...");
     let node = start_tor(paths, cfg).await?;
+    if node.rung() == tornect_signal::tor::Rung::Snowflake {
+        // SLICE-A1 A1-7, kept as a warning rather than a refusal: in a censored
+        // network where obfs4 is blocked too, Snowflake is the only way to host.
+        eprintln!(
+            "warning: hosting over Snowflake. The volunteer proxies that relay this machine's \
+             Tor traffic can see its IP address, and anyone who knows this Tornect ID can send \
+             it traffic. Private obfs4 bridges (tor.bridge_lines) avoid that."
+        );
+    }
 
     let pow = match (cfg.tor.pow_defense, tornect_signal::tor::pow_supported()) {
         (true, true) => "on",
