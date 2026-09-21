@@ -1,34 +1,55 @@
-//! `tornect host` and `tornect ping`: Milestone 1 track 1 — signaling over the
-//! live Tor network with the interim ping protocol.
+//! `tornect host`, `tornect ping` and `tornect connect`: signaling over the
+//! live Tor network. The host answers the pairing-free ping protocol and the
+//! handshake FSM on one port, routed by the first frame (decision M1-42).
 
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tornect_core::config::BridgeMode;
-use tornect_core::keystore::{FileSecretStore, load_or_create_host_identity};
-use tornect_core::{Config, HostIdentity, Paths, TornectId};
+use tornect_core::keystore::{
+    FileSecretStore, load_or_create_device_identity, load_or_create_host_identity,
+};
+use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
 use tornect_signal::framing::FrameError;
+use tornect_signal::fsm::client::{
+    self, ClientConfig, ClientDeps, ClientOutcome, ClientSession, Intent, NoServerKeyPin,
+    SessionEvent,
+};
+use tornect_signal::fsm::{HandshakeError, OsRandom};
+use tornect_signal::messages::{bye, pair_reject, reject};
+use tornect_signal::pairing::{AutoDeny, Consent, KnownHostStore};
 use tornect_signal::ping::NONCE_LEN;
 use tornect_signal::tor::Admission;
 use tornect_signal::{
-    Ladder, LadderEvent, OnionStatus, SignalError, TorNode, install_crypto_provider, ping,
-    shutdown_runtime,
+    HostSigner, Ladder, LadderEvent, OnionStatus, SignalError, TorNode, install_crypto_provider,
+    ping, shutdown_runtime,
 };
+
+use crate::host::{HostWiring, Served};
+use crate::prompt::{CliConsent, CliPairingUi, Prompter};
 
 /// Per-ping reply deadline once the stream is open.
 const PING_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Ping sessions served at once. Every stream the listener hands out comes
-/// from an unauthenticated peer, and each session costs a task for up to
-/// `ping::SESSION_TIMEOUT`; one per live rendezvous circuit
-/// (`tornect_signal::tor::MAX_LIVE_CIRCUITS`) is what honest use needs, so
-/// streams beyond that are closed immediately.
-const MAX_PING_SESSIONS: usize = tornect_signal::tor::MAX_LIVE_CIRCUITS;
+/// Signaling streams served at once. Every stream the listener hands out comes
+/// from an unauthenticated peer and costs a task until its protocol lets go of
+/// it (bounded: `ping::SESSION_TIMEOUT`, the FSM's timers); one per live
+/// rendezvous circuit (`tornect_signal::tor::MAX_LIVE_CIRCUITS`) is what honest
+/// use needs, so streams beyond that are closed immediately.
+const MAX_SIGNALING_STREAMS: usize = tornect_signal::tor::MAX_LIVE_CIRCUITS;
+
+/// How long `tornect host` waits, after Ctrl-C, for its streams to send `BYE`.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
+/// How often `tornect connect` pings a live session: well inside the host's
+/// 90 s idle timeout, and often enough to notice a host `BYE` within seconds.
+const SESSION_PING_EVERY: Duration = Duration::from_secs(10);
 
 fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
@@ -54,6 +75,9 @@ pub fn host(
             paths.keys_dir().display()
         );
     }
+    // The host's device key: what a client pins at pairing and the QUIC
+    // identity it presents (§B.6, decision M1-31).
+    let (device, _) = load_or_create_device_identity(&store)?;
     let mut cfg = Config::load(&paths.config_file())?;
     if let Some(pow) = pow {
         cfg.tor.pow_defense = pow;
@@ -61,7 +85,13 @@ pub fn host(
     if let Some(mode) = bridges {
         cfg.tor.bridges = mode;
     }
-    block_on(run_host(paths, &cfg, &identity, once))
+    block_on(run_host(
+        paths,
+        &cfg,
+        Arc::new(identity),
+        HostSigner::public_key(&device),
+        once,
+    ))
 }
 
 /// `tornect tor-check [--bridges …]`: reach the Tor network the way `host` and
@@ -143,30 +173,42 @@ fn block_on<F: Future<Output = anyhow::Result<()>>>(fut: F) -> anyhow::Result<()
 async fn run_host(
     paths: &Paths,
     cfg: &Config,
-    identity: &HostIdentity,
+    identity: Arc<HostIdentity>,
+    device_pk: [u8; 32],
     once: bool,
 ) -> anyhow::Result<()> {
+    let consent: Arc<dyn Consent> = match Prompter::stdin() {
+        Some(prompter) => Arc::new(CliConsent::new(prompter)),
+        None => {
+            eprintln!(
+                "warning: stdin is not a terminal, so every pairing and session request is \
+                 refused (run `tornect host` in a terminal to answer them); pings are answered"
+            );
+            Arc::new(AutoDeny)
+        }
+    };
+    let HostWiring {
+        cfg: host_cfg,
+        deps,
+        ctx,
+        live,
+        audit,
+    } = crate::host::wire(paths, cfg, Arc::clone(&identity), device_pk, consent)?;
+
     // The §B.8.7.4 control channel, bound **before** Tor. A running host owns the
     // endpoint and the store's advisory lock, so `tornect unattended …` in
     // another terminal routes here instead of opening the store itself — and
     // bringing it up first means that works during the slow part, which is
-    // exactly when someone wants to ask what the host is doing. Failing to bind
-    // is not fatal to hosting: an unreachable control channel is worth a loud
-    // warning, not a refusal to answer peers already dialling this address.
-    let ipc = match crate::unattended::host_context(paths) {
-        Ok(ctx) => {
-            let owned = paths.clone();
-            Some(tokio::spawn(async move {
-                if let Err(e) = crate::unattended::serve(Arc::new(ctx), &owned).await {
-                    tracing::warn!(error = %e, "IPC endpoint stopped");
-                }
-            }))
-        }
-        Err(e) => {
-            eprintln!("warning: unattended control channel unavailable: {e}");
-            None
-        }
-    };
+    // exactly when someone wants to ask what the host is doing. It shares the
+    // FSM's kill switch, so `tornect panic` ends this host's sessions.
+    let ipc = ctx.map(|ctx| {
+        let owned = paths.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::unattended::serve(Arc::new(ctx), &owned).await {
+                tracing::warn!(error = %e, "IPC endpoint stopped");
+            }
+        })
+    });
 
     eprintln!("bootstrapping Tor (~30 s cold, a few seconds with a warm cache)...");
     let node = start_tor(paths, cfg).await?;
@@ -193,7 +235,7 @@ async fn run_host(
          typically ~10 s past bootstrap, up to 2 min on a cold start)..."
     );
     let mut listener = node
-        .publish(identity)
+        .publish(&identity)
         .await
         .map_err(explain)
         .context("publishing the onion service")?;
@@ -210,61 +252,74 @@ async fn run_host(
     );
     let status = spawn_status_reporter(listener.status());
 
-    let (answered_tx, mut answered_rx) = watch::channel(0u64);
-    let sessions = Arc::new(Semaphore::new(MAX_PING_SESSIONS));
+    // Answered pings and finished sessions, for `--once`.
+    let (served_tx, mut served_rx) = watch::channel(0u64);
+    let slots = Arc::new(Semaphore::new(MAX_SIGNALING_STREAMS));
+    let serving = Arc::new((host_cfg, deps.clone()));
     let mut ctrl_c = pin!(tokio::signal::ctrl_c());
     loop {
         tokio::select! {
             result = &mut ctrl_c => {
                 result.context("waiting for Ctrl-C")?;
                 eprintln!("Ctrl-C: shutting down");
-                if let Some(ipc) = &ipc {
-                    ipc.abort();
-                }
                 break;
             }
             stream = listener.accept() => {
-                let Some(mut stream) = stream else {
+                let Some(stream) = stream else {
                     eprintln!("listener closed");
                     break;
                 };
-                // The media port (decision M1-39) is served by the session
-                // host, not by this ping loop: close such streams unanswered.
+                // The media port (decision M1-39) belongs to the session layer,
+                // which does not exist yet: close such streams unanswered.
                 if stream.port() != tornect_signal::SIGNALING_PORT {
                     continue;
                 }
                 // Dropping the stream closes it; the peer sees EOF.
-                let Ok(session) = Arc::clone(&sessions).try_acquire_owned() else {
+                let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
                     eprintln!(
-                        "client connected over Tor but {MAX_PING_SESSIONS} sessions are \
+                        "client connected over Tor but {MAX_SIGNALING_STREAMS} streams are \
                          already being served; closing it"
                     );
                     continue;
                 };
-                eprintln!("client connected over Tor");
-                let answered = answered_tx.clone();
+                let serving = Arc::clone(&serving);
+                let served = served_tx.clone();
                 tokio::spawn(async move {
-                    let _session = session;
-                    let outcome = ping::serve(&mut stream, |n| {
+                    let _slot = slot;
+                    let (cfg, deps) = &*serving;
+                    let outcome = crate::host::serve_signaling(stream, cfg, deps, |n| {
                         println!("answered ping #{n}");
-                        answered.send_modify(|total| *total += 1);
+                        served.send_modify(|total| *total += 1);
                     })
                     .await;
-                    match outcome {
-                        Ok(n) => eprintln!("client disconnected after {n} ping(s)"),
-                        Err(e) => eprintln!("ping session ended: {e}"),
+                    if outcome == Served::Session {
+                        served.send_modify(|total| *total += 1);
                     }
                 });
             }
-            changed = answered_rx.changed(), if once => {
-                if changed.is_err() || *answered_rx.borrow() >= 1 {
-                    eprintln!("first ping answered; exiting (--once)");
+            changed = served_rx.changed(), if once => {
+                if changed.is_err() || *served_rx.borrow() >= 1 {
+                    eprintln!("first ping answered or session finished; exiting (--once)");
                     break;
                 }
             }
         }
     }
 
+    // End every handshake and session with a `BYE`, and give the streams a
+    // moment to send it before Tor goes away under them.
+    deps.kill.kill(bye::USER);
+    let grace = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+    while deps.stats.streams.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < grace {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if live.count() > 0 {
+        eprintln!("{} session(s) did not close in time", live.count());
+    }
+    if let Some(ipc) = &ipc {
+        ipc.abort();
+    }
+    audit.flush();
     status.abort();
     drop(listener);
     node.shutdown().await;
@@ -326,6 +381,226 @@ async fn run_ping(paths: &Paths, cfg: &Config, id: TornectId, count: u32) -> any
     drop(stream);
     node.shutdown().await;
     Ok(())
+}
+
+/// What `tornect connect` should do beyond the handshake.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConnectOpts {
+    /// Pair (if the host is new) and stop there.
+    pub pair_only: bool,
+    /// Forget the host first, so this connection pairs again (a host that
+    /// lost its trusted-devices file answers the old pairing `E_BAD_STATE`).
+    pub forget: bool,
+    /// End the session after this many pings (scripted checks); `None` keeps
+    /// it alive until Ctrl-C.
+    pub pings: Option<u32>,
+}
+
+/// `tornect connect <onion> [--pair-only] [--forget] [--pings N]`
+pub fn connect(
+    paths: &Paths,
+    onion: &str,
+    opts: ConnectOpts,
+    bridges: Option<BridgeMode>,
+) -> anyhow::Result<()> {
+    install_crypto_provider();
+    let id: TornectId = onion
+        .parse()
+        .map_err(|e| anyhow::anyhow!("{onion:?} is not a Tornect ID: {e}"))?;
+    let mut cfg = Config::load(&paths.config_file())?;
+    if let Some(mode) = bridges {
+        cfg.tor.bridges = mode;
+    }
+    paths.ensure().context("creating Tornect directories")?;
+    let store = FileSecretStore::open(paths.keys_dir()).context("opening keystore")?;
+    let (device, _) = load_or_create_device_identity(&store)?;
+    let known = Arc::new(
+        KnownHostStore::open(tornect_core::trusted::known_hosts_file(paths))
+            .context("opening known-hosts.toml")?,
+    );
+    if opts.forget && known.remove(&id)? {
+        eprintln!("forgot {id}; this connection pairs again");
+    }
+    block_on(run_connect(paths, &cfg, id, &device, known, opts))
+}
+
+async fn run_connect(
+    paths: &Paths,
+    cfg: &Config,
+    id: TornectId,
+    device: &DeviceIdentity,
+    known: Arc<KnownHostStore>,
+    opts: ConnectOpts,
+) -> anyhow::Result<()> {
+    eprintln!("bootstrapping Tor (~30 s cold, a few seconds with a warm cache)...");
+    let node = start_tor(paths, cfg).await?;
+    let result = connect_session(&node, cfg, id, device, known, opts).await;
+    node.shutdown().await;
+    result
+}
+
+async fn connect_session(
+    node: &TorNode,
+    cfg: &Config,
+    id: TornectId,
+    device: &DeviceIdentity,
+    known: Arc<KnownHostStore>,
+    opts: ConnectOpts,
+) -> anyhow::Result<()> {
+    eprintln!("connecting to {id} (rendezvous usually takes 5-30 s, up to 60 s)...");
+    let started = Instant::now();
+    let stream = node.connect(&id).await.map_err(explain)?;
+    eprintln!("connected in {:.1} s", started.elapsed().as_secs_f64());
+
+    let pairing = known.get(&id).is_none();
+    let ccfg = ClientConfig::new(id, cfg.general.device_name.clone());
+    let deps = ClientDeps {
+        known_hosts: known,
+        ui: Arc::new(CliPairingUi::new(Prompter::stdin())),
+        random: Arc::new(OsRandom),
+        // Consulted only by unattended sessions, which this command does not request.
+        server_key_pin: Arc::new(NoServerKeyPin),
+    };
+    let intent = if opts.pair_only {
+        Intent::PairOnly
+    } else {
+        Intent::Session
+    };
+    match (pairing, opts.pair_only) {
+        (true, _) => eprintln!("new host: pairing first (the host's user compares a code)..."),
+        (false, true) => {}
+        (false, false) => {
+            eprintln!("asking for a session; the host's user has to accept it (up to 110 s)...");
+        }
+    }
+    let outcome = client::connect(stream, &ccfg, device, &deps, intent)
+        .await
+        .map_err(explain_handshake)?;
+    let mut session = match outcome {
+        ClientOutcome::Paired { host_name } => {
+            println!("PAIRED with \"{host_name}\"");
+            return Ok(());
+        }
+        ClientOutcome::Session(session) => session,
+    };
+    let mode = match tornect_signal::consent::mode_from_code(session.accept().mode()) {
+        Some(tornect_core::session_log::SessionMode::ViewOnly) => "view-only",
+        _ => "control",
+    };
+    println!(
+        "SESSION LIVE {} with \"{}\" ({mode})",
+        session.session_token().session_id(),
+        session.host_label()
+    );
+    // M1 has no direct path: the Tor circuit is the transport, and saying so
+    // stops the host's 15 s orphan timer (§B.8.4.5).
+    session
+        .send_tor_fallback()
+        .await
+        .map_err(explain_handshake)?;
+    eprintln!(
+        "the session stays alive with a ping every {} s; Ctrl-C ends it",
+        SESSION_PING_EVERY.as_secs()
+    );
+
+    let end = keep_alive(
+        &mut session,
+        opts.pings,
+        SESSION_PING_EVERY,
+        tokio::signal::ctrl_c(),
+    )
+    .await?;
+    match end {
+        End::You => {
+            if let Err(e) = session.bye(bye::USER).await {
+                tracing::debug!(error = %e, "sending BYE");
+            }
+            println!("SESSION ENDED (by you)");
+        }
+        End::Host(reason) => println!("SESSION ENDED by the host ({})", bye::name(reason)),
+        End::Lost(e) => {
+            println!("SESSION ENDED (connection lost)");
+            return Err(explain_handshake(e));
+        }
+    }
+    Ok(())
+}
+
+/// How a live session ended, seen from the client.
+#[derive(Debug)]
+enum End {
+    /// This side ended it (Ctrl-C, or `--pings` reached).
+    You,
+    /// The host sent `BYE{reason}`.
+    Host(u16),
+    /// The session broke.
+    Lost(HandshakeError),
+}
+
+/// Keep `session` alive with a `PING` every `every` (the first at once) until
+/// `stop` resolves, `pings` pings have been answered, or the host ends it.
+///
+/// Between pings it waits on the stream, not on a timer, so a host `BYE` is
+/// reported the moment it arrives. Over Tor the host's circuit is often gone
+/// by the next ping, whose write would then fail first and turn a deliberate
+/// end (`tornect panic`) into "connection lost". Cutting that wait short
+/// cannot drop part of a frame: after the accept the host sends nothing
+/// unprompted except `BYE`, which ends the session anyway.
+async fn keep_alive<S, F>(
+    session: &mut ClientSession<S>,
+    pings: Option<u32>,
+    every: Duration,
+    stop: F,
+) -> anyhow::Result<End>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    F: Future<Output = std::io::Result<()>>,
+{
+    let mut stop = pin!(stop);
+    let mut sent = 0u32;
+    Ok(loop {
+        if pings.is_some_and(|max| sent >= max) {
+            break End::You;
+        }
+        let wait = if sent == 0 { Duration::ZERO } else { every };
+        let event = tokio::select! {
+            result = &mut stop => {
+                result.context("waiting for Ctrl-C")?;
+                break End::You;
+            }
+            event = session.next_event(wait) => event,
+        };
+        match event {
+            // Nothing from the host in `wait`: time for the next ping.
+            Err(HandshakeError::Timeout(_)) => {}
+            Ok(Some(SessionEvent::Bye { reason, .. })) => break End::Host(reason),
+            Ok(Some(SessionEvent::Error { code, detail })) => {
+                break End::Lost(HandshakeError::PeerError { code, detail });
+            }
+            // The M2 frames: nothing uses them before M2.
+            Ok(Some(_)) => continue,
+            Ok(None) => break End::Lost(HandshakeError::Closed),
+            Err(e) => break End::Lost(e),
+        }
+        let pinged = tokio::select! {
+            result = &mut stop => {
+                result.context("waiting for Ctrl-C")?;
+                break End::You;
+            }
+            rtt = session.ping() => rtt,
+        };
+        match pinged {
+            Ok(rtt) => {
+                sent += 1;
+                println!(
+                    "session ping {sent}: rtt {:.1} ms",
+                    rtt.as_secs_f64() * 1000.0
+                );
+            }
+            Err(HandshakeError::PeerBye { reason, .. }) => break End::Host(reason),
+            Err(e) => break End::Lost(e),
+        }
+    })
 }
 
 /// Nonces only need to be unique per stream; wall-clock nanoseconds mixed with
@@ -410,5 +685,118 @@ fn explain(err: SignalError) -> anyhow::Error {
         anyhow::Error::new(err)
     } else {
         anyhow::Error::new(err).context(hint)
+    }
+}
+
+/// Turn a [`HandshakeError`] into a user-facing message with a next step.
+fn explain_handshake(err: HandshakeError) -> anyhow::Error {
+    let hint: std::borrow::Cow<'static, str> = match &err {
+        HandshakeError::PairRejected { reason, .. } => match *reason {
+            pair_reject::DENIED => "The host's user refused the pairing.".into(),
+            pair_reject::TIMEOUT => {
+                "Nobody answered the pairing request on the host in time.".into()
+            }
+            pair_reject::BUSY => "The host is in a session; try again when it has ended.".into(),
+            pair_reject::BANNED | pair_reject::RATE_LIMITED | pair_reject::IN_FLIGHT => {
+                "Too many pairing attempts; wait a few minutes and try again.".into()
+            }
+            _ => "".into(),
+        },
+        HandshakeError::SessionRejected { reject } => match reject.reason {
+            reject::DENIED => "The host's user refused the session.".into(),
+            reject::POPUP_TIMEOUT => "Nobody answered on the host in time.".into(),
+            reject::BUSY => {
+                "The host is busy (in a session, or asked too often); try again later.".into()
+            }
+            _ => "".into(),
+        },
+        HandshakeError::PairingLost => {
+            "Pair again with `tornect connect <id> --forget` (the host's user compares a code)."
+                .into()
+        }
+        HandshakeError::Aborted(_) => "Nothing was pinned; run the command again to retry.".into(),
+        HandshakeError::Timeout(_) => {
+            "The host did not answer in time (its user may not have responded).".into()
+        }
+        _ => "".into(),
+    };
+    if hint.is_empty() {
+        anyhow::Error::new(err)
+    } else {
+        anyhow::Error::new(err).context(hint)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::duplex;
+    use tornect_core::trusted::{KnownHosts, TrustedDevices};
+    use tornect_signal::fsm::client::ScriptedClientUi;
+    use tornect_signal::fsm::host::{HostConfig, HostDeps, serve_host};
+    use tornect_signal::pairing::{
+        PairDecision, PairScript, ScriptedConsent, SessionDecision, SessionScript,
+        TrustedDeviceStore,
+    };
+
+    use super::*;
+
+    /// A host that ends the session between two pings (`tornect panic`) must be
+    /// reported as the host's `BYE`, not as a lost connection. Live over Tor the
+    /// host's circuit was already gone by the next ping, and the client printed
+    /// "connection lost" for a session the host had deliberately ended.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_bye_between_pings_is_reported_as_the_hosts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = Arc::new(HostIdentity::from_seed(&[0x11; 32]));
+        let trusted = Arc::new(TrustedDeviceStore::with(
+            tmp.path().join("trusted-devices.toml"),
+            TrustedDevices::default(),
+        ));
+        let consent = Arc::new(ScriptedConsent::new());
+        consent.push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+        consent.push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+        let mut deps = HostDeps::headless(identity.clone(), trusted);
+        deps.consent = consent;
+        let kill = deps.kill.clone();
+        let cfg = HostConfig::new("Desk", [9; 32]);
+        let (client_end, host_end) = duplex(64 * 1024);
+        let host_task = tokio::spawn(async move { serve_host(host_end, &cfg, &deps).await });
+
+        let known = Arc::new(KnownHostStore::with(
+            tmp.path().join("known-hosts.toml"),
+            KnownHosts::default(),
+        ));
+        let mut client_deps = ClientDeps::headless(known);
+        client_deps.ui = Arc::new(ScriptedClientUi::new(true));
+        let device = DeviceIdentity::from_seed(&[0x22; 32]);
+        let ccfg = ClientConfig::new(identity.id(), "Laptop");
+        let mut session =
+            match client::connect(client_end, &ccfg, &device, &client_deps, Intent::Session)
+                .await
+                .unwrap()
+            {
+                ClientOutcome::Session(s) => s,
+                other => panic!("expected a session, got {other:?}"),
+            };
+        session.send_tor_fallback().await.unwrap();
+
+        // The host's user presses the panic key 5 s into the 10 s gap between pings.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            kill.kill(bye::PANIC);
+        });
+        let end = keep_alive(
+            &mut session,
+            None,
+            Duration::from_secs(10),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(end, End::Host(reason) if reason == bye::PANIC),
+            "{end:?}"
+        );
+        host_task.await.unwrap().unwrap();
     }
 }
