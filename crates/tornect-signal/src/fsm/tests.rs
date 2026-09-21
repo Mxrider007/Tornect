@@ -1955,10 +1955,12 @@ fn audit_events_land_in_the_session_log_without_secrets_or_declared_names() {
     assert_eq!(records[4].detail.as_deref(), Some("pairing"));
     assert_eq!(records[4].during_remote_session, Some(true));
     assert_eq!(records[4].peer_name, None);
-    // No token bytes — not even a prefix — reach the file.
+    // No token bytes — not even a prefix — reach the file. Four token bytes
+    // (`abababab`), not two: the `prev` chain hashes are random hex, and one of
+    // four hashes held "abab" by chance about once in 270 runs.
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(!text.contains("Chosen by the peer"), "{text}");
-    assert!(!text.contains("abab"), "{text}");
+    assert!(!text.contains("abababab"), "{text}");
     assert!(text.contains(&session_id), "{text}");
     assert_eq!(session_id.len(), 16);
     NoAudit.record(AuditEvent::PairAccepted {
