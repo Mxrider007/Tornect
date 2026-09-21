@@ -120,6 +120,17 @@ encrypted store and the IPC message set are `#[cbor(map)]` structs with integer 
 | `tornect-core` (path), `tokio` `test-util` + `time` | — | — | The `envelope` target (F1, §B.8.15) builds fixed host/device identities and in-memory trusted/known-host stores, re-signs fuzzed frames over the running transcript, and runs both FSMs on a paused-time runtime so every §B.8.4.5 timer fires at once when the input ends. | nightly toolchain | 2026-08-29 mx-vm | `fuzz/fuzz_targets/envelope.rs` |
 | `arbitrary` | =1.4.2 | — | The F3 target (`fuzz/fuzz_targets/store.rs`, §B.8.15) builds `UnattendedStore` / `FailState` values and `(wall, mono)` clock readings from the fuzzer's bytes with `Unstructured::{arbitrary, int_in_range, ratio}` (`src/unstructured.rs` 86–604 in the crate source); no derive — core types keep no `Arbitrary` impls, the target assembles them field by field. Pinned in the workspace table too (`arbitrary = "=1.4.2"`, unused there until a crate derives it); `minicbor` and `zeroize` in `fuzz/Cargo.toml` reuse the workspace pins. MIT OR Apache-2.0. | nightly (with the fuzz crate) | 2026-08-29 mx-vm | crate source `~/.cargo/registry/src/*/arbitrary-1.4.2/src/unstructured.rs`; `fuzz/Cargo.lock` checksum `c3d036a3…8bf1` |
 
+## Vertical slice (M1-39 / M3-1; pins verified 2026-09-21, `docs/research/slice.md`)
+
+| Crate | Version | Features | Why | Build requirements | Verified | Source |
+|---|---|---|---|---|---|---|
+| `hmac` / `sha2` / `subtle` (existing pins) | 0.13.0 / 0.11.0 / 2.6.1 | — | `tornect-proto` bind MAC + constant-time check | none | 2026-09-21 (tests) | — |
+| `openh264` | =0.9.8 | `source` | Software H.264 encode/decode, always compiled (M0-5); BT.601 converters | C++ compiler (`cc`); nasm optional; on gnullvm `CXXSTDLIB=c++` + `+crt-static` | 2026-09-21 mx-vm: Linux tests + Windows gnullvm link | slice.md §1, §3 |
+| `x11rb` | =0.13.2 | `xtest`, `xfixes` | X11 capture (GetImage) and XTEST injection, X11 sessions only | none (pure-Rust connection) | 2026-09-21 build | slice.md §5 |
+| `windows-sys` | =0.61.2 | `Win32_Foundation`, `Win32_Graphics_Gdi`, `Win32_UI_WindowsAndMessaging`, `Win32_UI_Input_KeyboardAndMouse`, `Win32_UI_HiDpi` | GDI capture, `SendInput`, DPI awareness | none (raw-dylib) | 2026-09-21 gnullvm check | slice.md §6 |
+| `winit` / `egui` / `egui-winit` / `egui-wgpu` / `wgpu` / `pollster` | =0.30.13 / =0.36.2 ×3 / =30.0.1 / =1.0.1 | see `Cargo.toml` (egui-wgpu **no defaults**) | The stream/UI surface (D10 fallback) | dlopen wayland/vulkan/EGL at runtime; no headers | pinned; build next session | slice.md §2 |
+| `ashpd` / `libloading` | =0.13.13 / =0.8.9 | `tokio, screencast, remote_desktop` / — | RemoteDesktop + ScreenCast portal; dlopen PipeWire | none | pinned; build next session | slice.md §4 |
+
 ## Milestone 2+ (verified pins land here as each milestone starts)
 
 See `docs/research/*.md` for the sourced API notes; the consolidated pin table is

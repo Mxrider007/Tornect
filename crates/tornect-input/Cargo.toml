@@ -1,6 +1,6 @@
 [package]
 name = "tornect-input"
-description = "Tornect input: client-side event capture/mapping and host-side injection backends (SendInput, CGEvent, libei)"
+description = "Tornect input: the 16-byte event, the USB HID key table, and host-side injection (XTEST, SendInput; portal in tornect-capture)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,16 +9,14 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-tornect-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
 
-[features]
-default = []
-# Linux/Wayland: RemoteDesktop portal + libei via reis
-libei = []
-# Windows: SendInput
-sendinput = []
-# macOS: CGEvent posting
-cgevent = []
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [lints]
 workspace = true

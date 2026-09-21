@@ -3,4 +3,4 @@
 [toolchain]
 channel = "1.96.0"
 components = ["rustfmt", "clippy"]
-targets = ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
+targets = ["x86_64-pc-windows-msvc", "x86_64-pc-windows-gnullvm", "aarch64-apple-darwin"]
