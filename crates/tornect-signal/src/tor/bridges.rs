@@ -31,12 +31,42 @@ pub const LYREBIRD: &str = if cfg!(windows) {
     "lyrebird"
 };
 
+/// SHA-256 of the `lyrebird` this build runs: lyrebird 0.8.1 from the
+/// GPG-verified tor-expert-bundle 15.0.23 (`packaging/pt/SOURCES.md`, decision
+/// M1-38). A bundled or `$TORNECT_PT_DIR` binary that does not match is refused,
+/// so a planted or swapped file is never launched; only an explicit
+/// `tor.pt_path` may run another build, and that is logged.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub const LYREBIRD_SHA256: Option<&str> =
+    Some("ee13ec155cf9b131a3e1b87bd6d697a10c42d04f2eaaeab6b1590c9971d41421");
+/// See the Linux x86_64 definition.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub const LYREBIRD_SHA256: Option<&str> =
+    Some("6e218e85f9a7ae2481f5402ded822471a9a9d0c7e66b05db3842b93fa5c1f02e");
+/// No `lyrebird` is pinned for this platform; only an explicit `tor.pt_path` runs one.
+#[cfg(not(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+)))]
+pub const LYREBIRD_SHA256: Option<&str> = None;
+
+/// Where a `lyrebird` binary came from, which decides what a hash mismatch means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtSource {
+    /// `tor.pt_path`: the owner chose this binary, so another build may run (logged).
+    Configured,
+    /// Next to the executable, or in its `pt/` directory: what a release ships.
+    Bundled,
+    /// `$TORNECT_PT_DIR`: the developer override.
+    DevOverride,
+}
+
 /// Tor Browser's built-in obfs4 bridges, verbatim from tor-browser-build
 /// `projects/tor-expert-bundle/pt_config.json` at tag `tbb-15.0.23-build1`
 /// (Tor Browser 15.0.23), cross-checked byte for byte against the
 /// `pt_config.json` inside the GPG-verified tor-expert-bundle 15.0.23.
 /// They are public, so censors can list them; private bridges go in
-/// `tor.bridge_lines` and are tried first.
+/// `tor.bridge_lines` and replace these (see [`Ladder`]).
 pub const BUILTIN_OBFS4: &[&str] = &[
     "obfs4 37.218.245.14:38224 D9A82D2F9C2F65A18407B1D2B764F130847F8B5D cert=bjRaMrr1BRiAW8IE9U5z27fQaYgOhX1UCmOpg2pFpoMvo6ZgQMzLsaTzzQNTlm7hNcb+Sg iat-mode=0",
     "obfs4 209.148.46.65:443 74FAD13168806246602538555B5521A0383A1875 cert=ssH+9rP8dG2NLDN2XuFw63hIO/9MNNinLmxQDpVa+7kTOa9/m+tGWT1SmSYpQ9uTBGa6Hw iat-mode=0",
@@ -197,9 +227,11 @@ impl Transport {
         }
         let mut protocols: Vec<&str> = Vec::new();
         for line in &self.bridges {
-            let bridge: BridgeConfigBuilder = line
-                .parse()
-                .map_err(|e| SignalError::Config(format!("bad bridge line: {e}")))?;
+            // Arti's parse error quotes the offending token, which can be part of a
+            // private bridge; `Ladder` has already dropped lines that do not parse.
+            let bridge: BridgeConfigBuilder = line.parse().map_err(|_| {
+                SignalError::Config("a bridge line could not be parsed (not shown)".to_owned())
+            })?;
             builder.bridges().bridges().push(bridge);
             if let Some(protocol) = transport_of(line)
                 && !protocols.contains(&protocol)
@@ -251,6 +283,9 @@ pub struct Ladder {
     /// Timeout for a ladder of one rung (`tor.bootstrap_timeout_secs`), which
     /// has nowhere to fall back to and so is not cut short by the stall timer.
     single_rung_timeout: Duration,
+    /// Whether the rung that works is remembered: only in `auto` mode. A forced
+    /// run (`--bridges off tor-check`) must not rewrite what `auto` starts from.
+    learns: bool,
 }
 
 impl Ladder {
@@ -273,72 +308,93 @@ impl Ladder {
         Self::build(paths, tor, mode, find_lyrebird(tor.pt_path.as_deref()))
     }
 
-    fn build(paths: &Paths, tor: &Tor, mode: BridgeMode, lyrebird: Option<PathBuf>) -> Self {
+    fn build(
+        paths: &Paths,
+        tor: &Tor,
+        mode: BridgeMode,
+        lyrebird: std::result::Result<PathBuf, String>,
+    ) -> Self {
         let mut rejected_lines = Vec::new();
         let mut user_obfs4 = Vec::new();
         let mut user_snowflake = Vec::new();
-        for line in tor
-            .bridge_lines
-            .iter()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-        {
-            match transport_of(line) {
-                Some("snowflake") => user_snowflake.push(line.to_owned()),
-                Some(_) => user_obfs4.push(line.to_owned()),
-                None => rejected_lines.push(format!(
-                    "{}: not an obfs4, webtunnel or snowflake bridge line",
-                    redact_line(line)
-                )),
+        // Set even when every line of the transport is dropped: the owner asked
+        // for private bridges there, so its public built-ins must not stand in.
+        let (mut private_obfs4, mut private_snowflake) = (false, false);
+        for (i, line) in tor.bridge_lines.iter().map(|l| l.trim()).enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let n = i + 1;
+            // Lines are named by their position only: a private bridge is useful
+            // only while the censor does not know it, and for a vanilla line the
+            // first token *is* its address (SLICE-A1 A1-5).
+            let Some(kind) = transport_of(line) else {
+                rejected_lines.push(format!(
+                    "bridge line {n}: not an obfs4, webtunnel or snowflake bridge line"
+                ));
+                continue;
+            };
+            if kind == "snowflake" {
+                private_snowflake = true;
+            } else {
+                private_obfs4 = true;
+            }
+            // Parsed here rather than first in `Transport::apply`, so a bad line
+            // costs only itself, not its whole rung (SLICE-A1 A1-6).
+            let parses = line
+                .parse::<BridgeConfigBuilder>()
+                .ok()
+                .and_then(|b| b.build().ok())
+                .is_some();
+            if !parses {
+                rejected_lines.push(format!("bridge line {n} ({kind}): could not be parsed"));
+                continue;
+            }
+            if kind == "snowflake" {
+                user_snowflake.push(line.to_owned());
+            } else {
+                user_obfs4.push(line.to_owned());
             }
         }
         let order: Vec<Rung> = match mode {
             BridgeMode::Off => vec![Rung::Direct],
             BridgeMode::Obfs4 => vec![Rung::Obfs4],
             BridgeMode::Snowflake => vec![Rung::Snowflake],
-            BridgeMode::Auto => {
-                let mut order = Rung::ALL.to_vec();
-                if let Some(last) = last_good(paths) {
-                    order.retain(|r| *r != last);
-                    order.insert(0, last);
-                }
-                order
-            }
+            BridgeMode::Auto => auto_order(private_obfs4 || private_snowflake, last_good(paths)),
         };
         let mut rungs = Vec::new();
         let mut skipped = Vec::new();
         for rung in order {
-            if rung.needs_pt() && lyrebird.is_none() {
+            let pt = match (&lyrebird, rung.needs_pt()) {
+                (_, false) => None,
+                (Ok(path), true) => Some(path.clone()),
+                (Err(reason), true) => {
+                    skipped.push((rung, reason.clone()));
+                    continue;
+                }
+            };
+            // Private lines *replace* the public built-ins of their transport, as
+            // in Tor Browser. Mixed, Arti contacts the public bridges too, and a
+            // censor that lists them can find the private one by correlation
+            // (SLICE-A1 A1-1).
+            let bridges: Vec<String> = match rung {
+                Rung::Direct => Vec::new(),
+                Rung::Obfs4 if private_obfs4 => user_obfs4.clone(),
+                Rung::Obfs4 => BUILTIN_OBFS4.iter().map(|l| (*l).to_owned()).collect(),
+                Rung::Snowflake if private_snowflake => user_snowflake.clone(),
+                Rung::Snowflake => BUILTIN_SNOWFLAKE.iter().map(|l| (*l).to_owned()).collect(),
+            };
+            if rung != Rung::Direct && bridges.is_empty() {
                 skipped.push((
                     rung,
-                    format!(
-                        "`{LYREBIRD}` not found (set tor.pt_path or {PT_DIR_ENV}, or put it \
-                         next to the tornect executable)"
-                    ),
+                    "none of the configured private bridge lines could be used".to_owned(),
                 ));
                 continue;
             }
-            let bridges = match rung {
-                Rung::Direct => Vec::new(),
-                Rung::Obfs4 => user_obfs4
-                    .iter()
-                    .cloned()
-                    .chain(BUILTIN_OBFS4.iter().map(|l| (*l).to_owned()))
-                    .collect(),
-                Rung::Snowflake => user_snowflake
-                    .iter()
-                    .cloned()
-                    .chain(BUILTIN_SNOWFLAKE.iter().map(|l| (*l).to_owned()))
-                    .collect(),
-            };
             rungs.push(Transport {
                 rung,
                 bridges,
-                lyrebird: if rung.needs_pt() {
-                    lyrebird.clone()
-                } else {
-                    None
-                },
+                lyrebird: pt,
             });
         }
         Self {
@@ -346,7 +402,14 @@ impl Ladder {
             skipped,
             rejected_lines,
             single_rung_timeout: Duration::from_secs(u64::from(tor.bootstrap_timeout_secs)),
+            learns: mode == BridgeMode::Auto,
         }
+    }
+
+    /// Whether the rung that works should be remembered (`auto` mode only).
+    #[must_use]
+    pub fn learns(&self) -> bool {
+        self.learns
     }
 
     /// The time limits for `rung` in this ladder.
@@ -363,41 +426,159 @@ impl Ladder {
     }
 }
 
-/// Keep a user's private bridge address out of logs and error strings: a
-/// private bridge is only useful while the censor does not know it.
-fn redact_line(line: &str) -> String {
-    let first = line.split_whitespace().next().unwrap_or("");
-    let first: String = first.chars().take(16).collect();
-    format!("{first:?} line")
+/// The `auto` order (decision M1-38, amended after SLICE-A1 A1-2): direct Tor,
+/// obfs4, Snowflake — except that
+/// - with private bridge lines configured, direct Tor is not tried at all: the
+///   owner has said Tor is blocked here, and a direct attempt would show the
+///   network Tor handshakes from this address;
+/// - the rung that worked last goes first, and once a bridge was needed, direct
+///   Tor goes last, so a newly blocked bridge falls back to the other bridge
+///   before revealing Tor use.
+fn auto_order(private_lines: bool, last: Option<Rung>) -> Vec<Rung> {
+    let mut order: Vec<Rung> = Rung::ALL
+        .iter()
+        .copied()
+        .filter(|r| !(private_lines && *r == Rung::Direct))
+        .collect();
+    if let Some(last) = last
+        && order.contains(&last)
+    {
+        order.retain(|r| *r != last);
+        order.insert(0, last);
+        if last != Rung::Direct
+            && let Some(i) = order.iter().position(|r| *r == Rung::Direct)
+        {
+            let direct = order.remove(i);
+            order.push(direct);
+        }
+    }
+    order
 }
 
-/// Find the `lyrebird` binary: `explicit` if given (and nothing else), else
-/// `$TORNECT_PT_DIR`, then next to the executable or in its `pt/` directory,
-/// then `PATH`.
-#[must_use]
-pub fn find_lyrebird(explicit: Option<&Path>) -> Option<PathBuf> {
-    if let Some(path) = explicit {
-        return path.is_file().then(|| path.to_path_buf());
-    }
-    let mut candidates = Vec::new();
-    if let Some(dir) = std::env::var_os(PT_DIR_ENV).filter(|d| !d.is_empty()) {
-        candidates.push(PathBuf::from(dir).join(LYREBIRD));
-    }
-    if let Some(dir) = std::env::current_exe()
+/// Find and check the `lyrebird` binary (decision M1-38; SLICE-A1 A1-3/A1-4).
+///
+/// `tor.pt_path` if set (and nothing else); otherwise the copy bundled next to
+/// the executable or in its `pt/` directory; otherwise `$TORNECT_PT_DIR`. Never
+/// `PATH`, and never a relative path: either would let the current directory or
+/// any user-writable `PATH` entry choose what runs. A bundled or override binary
+/// must match [`LYREBIRD_SHA256`] and, on Unix, must not be writable by group or
+/// others. `Err` carries the reason the bridged rungs are unavailable.
+pub fn find_lyrebird(explicit: Option<&Path>) -> std::result::Result<PathBuf, String> {
+    let env_dir = std::env::var_os(PT_DIR_ENV)
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from);
+    let exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-    {
-        candidates.push(dir.join(LYREBIRD));
-        candidates.push(dir.join("pt").join(LYREBIRD));
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    find_lyrebird_in(
+        explicit,
+        exe_dir.as_deref(),
+        env_dir.as_deref(),
+        LYREBIRD_SHA256,
+    )
+}
+
+fn find_lyrebird_in(
+    explicit: Option<&Path>,
+    exe_dir: Option<&Path>,
+    env_dir: Option<&Path>,
+    pin: Option<&str>,
+) -> std::result::Result<PathBuf, String> {
+    let (path, source) = match explicit {
+        Some(path) => {
+            if !path.is_absolute() {
+                return Err(format!(
+                    "tor.pt_path must be an absolute path to `{LYREBIRD}`"
+                ));
+            }
+            if !path.is_file() {
+                return Err(format!("tor.pt_path names no `{LYREBIRD}` file"));
+            }
+            (path.to_path_buf(), PtSource::Configured)
+        }
+        None => {
+            let mut candidates: Vec<(PathBuf, PtSource)> = Vec::new();
+            if let Some(dir) = exe_dir {
+                candidates.push((dir.join(LYREBIRD), PtSource::Bundled));
+                candidates.push((dir.join("pt").join(LYREBIRD), PtSource::Bundled));
+            }
+            if let Some(dir) = env_dir {
+                candidates.push((dir.join(LYREBIRD), PtSource::DevOverride));
+            }
+            candidates
+                .into_iter()
+                .filter(|(p, _)| p.is_absolute())
+                .find(|(p, _)| p.is_file())
+                .ok_or_else(|| {
+                    format!(
+                        "`{LYREBIRD}` not found (put it next to the tornect executable, or set \
+                         tor.pt_path; developers: {PT_DIR_ENV})"
+                    )
+                })?
+        }
+    };
+    check_lyrebird(&path, source, pin)?;
+    Ok(path)
+}
+
+/// The integrity checks of [`find_lyrebird`].
+fn check_lyrebird(
+    path: &Path,
+    source: PtSource,
+    pin: Option<&str>,
+) -> std::result::Result<(), String> {
+    #[cfg(unix)]
+    if source != PtSource::Configured {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path)
+            .map_err(|e| format!("cannot inspect `{LYREBIRD}`: {e}"))?
+            .permissions()
+            .mode();
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "`{LYREBIRD}` at {} is writable by other users; refusing to run it",
+                path.display()
+            ));
+        }
     }
-    if let Some(found) = candidates.into_iter().find(|p| p.is_file()) {
-        return Some(found);
+    let digest = sha256_file(path).map_err(|e| format!("cannot read `{LYREBIRD}`: {e}"))?;
+    match (pin, source) {
+        (Some(pin), _) if digest == pin => Ok(()),
+        (_, PtSource::Configured) => {
+            tracing::warn!(
+                path = %path.display(),
+                sha256 = %digest,
+                "tor.pt_path names a lyrebird this build does not pin; running it because \
+                 it was configured explicitly"
+            );
+            Ok(())
+        }
+        (Some(_), _) => Err(format!(
+            "`{LYREBIRD}` at {} is not the pinned lyrebird 0.8.1 (SHA-256 mismatch); \
+             refusing to run it",
+            path.display()
+        )),
+        (None, _) => Err(format!(
+            "this build pins no `{LYREBIRD}` for this platform; set tor.pt_path to use one"
+        )),
     }
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(LYREBIRD))
-            .find(|p| p.is_file())
-    })
+}
+
+/// Lowercase hex SHA-256 of a file.
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// The rung that last reached `ready_for_traffic`, if one was recorded.
@@ -430,11 +611,24 @@ mod tests {
         (tmp, paths)
     }
 
+    /// A stand-in binary, owner-only, with known contents.
     fn fake_lyrebird(dir: &Path) -> PathBuf {
         let path = dir.join(LYREBIRD);
-        std::fs::write(&path, b"").unwrap();
+        std::fs::write(&path, b"not really lyrebird").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         path
     }
+
+    fn pin_of(path: &Path) -> String {
+        sha256_file(path).unwrap()
+    }
+
+    const PRIVATE_OBFS4: &str =
+        "obfs4 198.51.100.7:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=AAAA iat-mode=0";
 
     #[test]
     fn every_builtin_line_parses_as_an_arti_bridge() {
@@ -460,7 +654,7 @@ mod tests {
     fn auto_ladder_is_direct_then_obfs4_then_snowflake() {
         let (tmp, paths) = paths();
         let lyrebird = fake_lyrebird(tmp.path());
-        let ladder = Ladder::build(&paths, &Tor::default(), BridgeMode::Auto, Some(lyrebird));
+        let ladder = Ladder::build(&paths, &Tor::default(), BridgeMode::Auto, Ok(lyrebird));
         let order: Vec<Rung> = ladder.rungs.iter().map(|t| t.rung).collect();
         assert_eq!(order, vec![Rung::Direct, Rung::Obfs4, Rung::Snowflake]);
         assert!(ladder.skipped.is_empty());
@@ -468,33 +662,57 @@ mod tests {
         assert_eq!(ladder.rungs[2].bridges.len(), BUILTIN_SNOWFLAKE.len());
         // A multi-rung ladder uses the per-rung policy, stall timer included.
         assert_eq!(ladder.policy(Rung::Direct), Rung::Direct.policy());
+        assert!(ladder.learns());
     }
 
+    /// SLICE-A1 A1-2: the rung that worked goes first, and once a bridge was
+    /// needed, direct Tor goes last rather than second.
     #[test]
-    fn the_last_rung_that_worked_goes_first() {
+    fn the_last_rung_that_worked_goes_first_and_direct_goes_last() {
         let (tmp, paths) = paths();
         let lyrebird = fake_lyrebird(tmp.path());
         remember(&paths, Rung::Snowflake);
         assert_eq!(last_good(&paths), Some(Rung::Snowflake));
-        let ladder = Ladder::build(&paths, &Tor::default(), BridgeMode::Auto, Some(lyrebird));
+        let ladder = Ladder::build(&paths, &Tor::default(), BridgeMode::Auto, Ok(lyrebird));
         let order: Vec<Rung> = ladder.rungs.iter().map(|t| t.rung).collect();
-        assert_eq!(order, vec![Rung::Snowflake, Rung::Direct, Rung::Obfs4]);
+        assert_eq!(order, vec![Rung::Snowflake, Rung::Obfs4, Rung::Direct]);
+    }
+
+    /// SLICE-A1 A1-2: the `auto` order rules in one place.
+    #[test]
+    fn auto_order_rules() {
+        use Rung::{Direct as D, Obfs4 as O, Snowflake as S};
+        assert_eq!(auto_order(false, None), vec![D, O, S]);
+        assert_eq!(auto_order(false, Some(D)), vec![D, O, S]);
+        assert_eq!(auto_order(false, Some(O)), vec![O, S, D]);
+        // Private lines: the owner said Tor is blocked, so no direct probe at all.
+        assert_eq!(auto_order(true, None), vec![O, S]);
+        assert_eq!(auto_order(true, Some(D)), vec![O, S]);
+        assert_eq!(auto_order(true, Some(S)), vec![S, O]);
     }
 
     #[test]
     fn without_lyrebird_only_direct_remains_and_the_gap_is_reported() {
         let (_tmp, paths) = paths();
-        let ladder = Ladder::build(&paths, &Tor::default(), BridgeMode::Auto, None);
+        let ladder = Ladder::build(
+            &paths,
+            &Tor::default(),
+            BridgeMode::Auto,
+            Err("`lyrebird` not found".to_owned()),
+        );
         assert_eq!(ladder.rungs.len(), 1);
         assert_eq!(ladder.rungs[0].rung, Rung::Direct);
         let skipped: Vec<Rung> = ladder.skipped.iter().map(|(r, _)| *r).collect();
         assert_eq!(skipped, vec![Rung::Obfs4, Rung::Snowflake]);
+        assert!(ladder.skipped[0].1.contains("not found"));
         // One rung left: nowhere to fall back to, so no stall cut-off.
         assert_eq!(ladder.policy(Rung::Direct).stall, None);
     }
 
+    /// Forced modes have one rung and, SLICE-A1 A1-2, never rewrite the rung
+    /// `auto` starts from.
     #[test]
-    fn forced_modes_have_one_rung() {
+    fn forced_modes_have_one_rung_and_do_not_learn() {
         let (tmp, paths) = paths();
         let lyrebird = fake_lyrebird(tmp.path());
         for (mode, rung) in [
@@ -502,45 +720,131 @@ mod tests {
             (BridgeMode::Obfs4, Rung::Obfs4),
             (BridgeMode::Snowflake, Rung::Snowflake),
         ] {
-            let ladder = Ladder::build(&paths, &Tor::default(), mode, Some(lyrebird.clone()));
+            let ladder = Ladder::build(&paths, &Tor::default(), mode, Ok(lyrebird.clone()));
             assert_eq!(ladder.rungs.len(), 1, "{mode:?}");
             assert_eq!(ladder.rungs[0].rung, rung);
             let policy = ladder.policy(rung);
             assert_eq!(policy.stall, None);
             assert_eq!(policy.cap, Duration::from_secs(180));
+            assert!(!ladder.learns(), "{mode:?}");
         }
     }
 
+    /// SLICE-A1 A1-1: private lines *replace* the built-ins of their transport
+    /// (and only of their transport), and a line that is not a bridge line is
+    /// named by its position, never by its content (A1-5).
     #[test]
-    fn user_lines_go_first_on_their_rung_and_junk_is_rejected_without_leaking_it() {
+    fn private_lines_replace_the_builtins_of_their_transport() {
         let (tmp, paths) = paths();
         let lyrebird = fake_lyrebird(tmp.path());
-        let private =
-            "obfs4 198.51.100.7:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=AAAA iat-mode=0";
         let tor = Tor {
             bridge_lines: vec![
-                private.to_owned(),
-                "Bridge snowflake 192.0.2.9:80 0123456789ABCDEF0123456789ABCDEF01234567".to_owned(),
+                PRIVATE_OBFS4.to_owned(),
                 "meek_lite 192.0.2.20:80 url=https://example.invalid".to_owned(),
                 "   ".to_owned(),
+                "198.51.100.9:443 4352E58420E68F5E40BF7C74FADDCCD9D1349413".to_owned(),
             ],
             ..Tor::default()
         };
-        let ladder = Ladder::build(&paths, &tor, BridgeMode::Auto, Some(lyrebird));
-        assert_eq!(ladder.rungs[1].bridges[0], private);
-        assert_eq!(ladder.rungs[1].bridges.len(), BUILTIN_OBFS4.len() + 1);
-        assert!(ladder.rungs[2].bridges[0].starts_with("Bridge snowflake"));
-        assert_eq!(ladder.rejected_lines.len(), 1);
-        assert!(!ladder.rejected_lines[0].contains("192.0.2.20"));
+        let ladder = Ladder::build(&paths, &tor, BridgeMode::Auto, Ok(lyrebird));
+        let order: Vec<Rung> = ladder.rungs.iter().map(|t| t.rung).collect();
+        assert_eq!(order, vec![Rung::Obfs4, Rung::Snowflake], "no direct probe");
+        assert_eq!(ladder.rungs[0].bridges, vec![PRIVATE_OBFS4.to_owned()]);
+        assert_eq!(ladder.rungs[1].bridges.len(), BUILTIN_SNOWFLAKE.len());
+        assert_eq!(ladder.rejected_lines.len(), 2);
+        for line in &ladder.rejected_lines {
+            assert!(
+                !line.contains("192.0.2.20") && !line.contains("198.51"),
+                "{line}"
+            );
+        }
+        assert!(ladder.rejected_lines[1].starts_with("bridge line 4:"));
     }
 
+    /// SLICE-A1 A1-6: a line that does not parse costs only itself and is not
+    /// quoted; if it was the only private line of its transport, that rung is
+    /// skipped rather than silently falling back to the public built-ins.
     #[test]
-    fn explicit_pt_path_is_used_alone() {
+    fn an_unparsable_private_line_is_dropped_without_quoting_it() {
+        let (tmp, paths) = paths();
+        let lyrebird = fake_lyrebird(tmp.path());
+        let secretish = "obfs4 198.51.100.7:443 NOTAFINGERPRINT cert=SECRETCERT iat-mode=0";
+        let tor = Tor {
+            bridge_lines: vec![secretish.to_owned()],
+            ..Tor::default()
+        };
+        let ladder = Ladder::build(&paths, &tor, BridgeMode::Auto, Ok(lyrebird));
+        assert_eq!(ladder.rejected_lines.len(), 1);
+        let msg = &ladder.rejected_lines[0];
+        assert!(msg.contains("could not be parsed"), "{msg}");
+        assert!(
+            !msg.contains("SECRETCERT") && !msg.contains("198.51"),
+            "{msg}"
+        );
+        let order: Vec<Rung> = ladder.rungs.iter().map(|t| t.rung).collect();
+        assert_eq!(order, vec![Rung::Snowflake]);
+        assert!(ladder.skipped.iter().any(|(r, _)| *r == Rung::Obfs4));
+    }
+
+    /// SLICE-A1 A1-3: a bundled binary runs only if it matches the pin, and is
+    /// preferred over the developer override.
+    #[test]
+    fn a_bundled_lyrebird_runs_only_if_it_matches_the_pin() {
+        let exe = tempfile::tempdir().unwrap();
+        let dev = tempfile::tempdir().unwrap();
+        let bundled = fake_lyrebird(exe.path());
+        fake_lyrebird(dev.path());
+        let pin = pin_of(&bundled);
+        assert_eq!(
+            find_lyrebird_in(None, Some(exe.path()), Some(dev.path()), Some(&pin)),
+            Ok(bundled.clone())
+        );
+        let wrong = "0".repeat(64);
+        let err = find_lyrebird_in(None, Some(exe.path()), None, Some(&wrong)).unwrap_err();
+        assert!(err.contains("not the pinned lyrebird"), "{err}");
+        let err = find_lyrebird_in(None, Some(exe.path()), None, None).unwrap_err();
+        assert!(err.contains("pins no"), "{err}");
+    }
+
+    /// SLICE-A1 A1-4: relative candidates are never used — they would resolve
+    /// against whatever directory Tornect was started from.
+    #[test]
+    fn relative_lyrebird_paths_are_never_used() {
+        let err = find_lyrebird_in(Some(Path::new("lyrebird")), None, None, None).unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+        let err = find_lyrebird_in(None, None, Some(Path::new("relative/dir")), None).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    /// SLICE-A1 A1-3: a binary other users can modify is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_lyrebird_writable_by_others_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let exe = tempfile::tempdir().unwrap();
+        let bundled = fake_lyrebird(exe.path());
+        let pin = pin_of(&bundled);
+        std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let err = find_lyrebird_in(None, Some(exe.path()), None, Some(&pin)).unwrap_err();
+        assert!(err.contains("writable by other users"), "{err}");
+    }
+
+    /// An explicit `tor.pt_path` is used alone, and may run a build this
+    /// binary does not pin (the owner chose it; the mismatch is logged).
+    #[test]
+    fn explicit_pt_path_is_used_alone_and_may_be_unpinned() {
         let tmp = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
         let present = fake_lyrebird(tmp.path());
-        assert_eq!(find_lyrebird(Some(&present)), Some(present.clone()));
+        let bundled = fake_lyrebird(exe.path());
+        let wrong = "0".repeat(64);
+        assert_eq!(
+            find_lyrebird_in(Some(&present), Some(exe.path()), None, Some(&wrong)),
+            Ok(present.clone())
+        );
+        assert_ne!(present, bundled);
         let missing = tmp.path().join("nope").join(LYREBIRD);
-        assert_eq!(find_lyrebird(Some(&missing)), None);
+        assert!(find_lyrebird_in(Some(&missing), Some(exe.path()), None, None).is_err());
     }
 
     #[test]
