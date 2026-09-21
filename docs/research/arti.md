@@ -113,7 +113,8 @@ explicitly plus `rustls`.
 | `experimental` | everything experimental incl. `smol` | — | never |
 | `static` / `static-native-tls` | force native-tls | — | never |
 | `accel-openssl`, `accel-sha1-asm` | OpenSSL / asm SHA1 | nonadditive | no |
-| `ctor-keystore`, `ephemeral-keystore`, `onion-service-cli-extra`, `hss-negotiate-extensions`, `hsc-negotiate-extensions`, `counter-galois-onion`, `geoip`, `dirfilter`, `bridge-client`, `pt-client`, `rpc` | — | not needed | no |
+| `ctor-keystore`, `ephemeral-keystore`, `onion-service-cli-extra`, `hss-negotiate-extensions`, `hsc-negotiate-extensions`, `counter-galois-onion`, `geoip`, `dirfilter`, `rpc` | — | not needed | no |
+| `pt-client` (implies `bridge-client`) | `tor-ptmgr`, `tor-guardmgr/bridge-client`, `tor-chanmgr/pt-client`, … | stable (not experimental) | **on since 2026-09-21** — obfs4 / Snowflake bridges, decision M1-38, `docs/research/bridges.md` |
 | `memquota` | `[]` | deprecated no-op (README 320) | omit |
 
 `__is_experimental` / `__is_nonadditive` are pure marker features (no source code

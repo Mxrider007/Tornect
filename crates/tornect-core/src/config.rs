@@ -6,7 +6,7 @@
 //! indicator, session logging of consent decisions) is deliberately *not*
 //! configurable here.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +77,33 @@ pub struct Tor {
     pub restricted_discovery: bool,
     /// Give up bootstrapping after this long.
     pub bootstrap_timeout_secs: u32,
+    /// How to reach the Tor network when a direct connection is blocked
+    /// (decision M1-38): `auto` tries direct Tor, then obfs4 bridges, then
+    /// Snowflake, starting from whichever worked last time.
+    pub bridges: BridgeMode,
+    /// Extra bridge lines (`obfs4 IP:PORT FINGERPRINT cert=… iat-mode=0`,
+    /// `snowflake …`), tried before the built-in bridges of the same transport.
+    /// Private bridges from <https://bridges.torproject.org> survive censors
+    /// that block the public built-in list.
+    pub bridge_lines: Vec<String>,
+    /// The `lyrebird` pluggable-transport binary. Unset: `$TORNECT_PT_DIR`,
+    /// then next to the executable (or in its `pt/` directory), then `PATH`.
+    pub pt_path: Option<PathBuf>,
+}
+
+/// How the Tor client reaches the network (`[tor] bridges = "…"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BridgeMode {
+    /// Direct Tor first; if it is blocked, obfs4 bridges, then Snowflake.
+    #[default]
+    Auto,
+    /// Direct Tor only (never use bridges).
+    Off,
+    /// obfs4 bridges only.
+    Obfs4,
+    /// Snowflake only.
+    Snowflake,
 }
 
 /// Video codec identifiers, in negotiation order.
@@ -183,6 +210,9 @@ impl Default for Tor {
             pow_defense: true,
             restricted_discovery: false,
             bootstrap_timeout_secs: 180,
+            bridges: BridgeMode::Auto,
+            bridge_lines: Vec::new(),
+            pt_path: None,
         }
     }
 }

@@ -116,6 +116,13 @@ impl Paths {
         self.cache_dir.join("arti")
     }
 
+    /// The Tor transport that last bootstrapped (`direct`, `obfs4` or
+    /// `snowflake`), tried first on the next start (decision M1-38).
+    #[must_use]
+    pub fn tor_transport_file(&self) -> PathBuf {
+        self.state_dir.join("tor-transport")
+    }
+
     /// SAS-paired devices — pairings only (`docs/PLAN.md` §B.6, §B.8.9). Unattended
     /// grants live in the encrypted store ([`Paths::unattended_store`]), never here.
     #[must_use]

@@ -46,8 +46,9 @@ pub use error::SignalError;
 pub use fsm::HandshakeError;
 pub use pairing::{Consent, Sas};
 pub use tor::{
-    BootstrapProgress, ForgottenIdentity, OnionListener, OnionStatus, OnionStream, SIGNALING_PORT,
-    TorNode, forget_identity, install_crypto_provider, shutdown_runtime,
+    BootstrapProgress, ForgottenIdentity, Isolation, Ladder, LadderEvent, MEDIA_PORT,
+    OnionListener, OnionStatus, OnionStream, Rung, SIGNALING_PORT, TorNode, forget_identity,
+    install_crypto_provider, shutdown_runtime,
 };
 pub use tornect_core::PROTOCOL_VERSION;
 pub use transcript::{HostSigner, Transcript};

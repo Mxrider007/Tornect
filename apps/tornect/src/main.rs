@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
+use tornect_core::config::BridgeMode;
 use tornect_core::keystore::{
     self, FileSecretStore, load_or_create_device_identity, load_or_create_host_identity,
 };
@@ -34,6 +35,11 @@ struct Cli {
     /// Emit JSON log lines on stderr.
     #[arg(long, global = true)]
     json_logs: bool,
+
+    /// How to reach Tor: `auto` (direct, then obfs4 bridges, then Snowflake),
+    /// `off` (direct only), `obfs4` or `snowflake`. Default: config `tor.bridges`.
+    #[arg(long, global = true, value_name = "MODE", value_parser = parse_bridge_mode)]
+    bridges: Option<BridgeMode>,
 
     #[command(subcommand)]
     command: Command,
@@ -101,6 +107,9 @@ enum Command {
         #[command(subcommand)]
         action: unattended::BackupCmd,
     },
+    /// Reach the Tor network (direct, obfs4 bridges or Snowflake, per `--bridges`)
+    /// and report which transport worked.
+    TorCheck,
     /// Connect to a host by Tornect ID over Tor and measure round-trip times.
     ///
     /// Uses this instance's own Tor state; run it under a different TORNECT_HOME
@@ -163,14 +172,25 @@ fn main() -> anyhow::Result<()> {
                 (_, true) => Some(false),
                 _ => None,
             };
-            tor_cmd::host(&paths, once, pow)
+            tor_cmd::host(&paths, once, pow, cli.bridges)
         }
-        Command::Ping { onion, count } => tor_cmd::ping(&paths, &onion, count),
+        Command::TorCheck => tor_cmd::tor_check(&paths, cli.bridges),
+        Command::Ping { onion, count } => tor_cmd::ping(&paths, &onion, count, cli.bridges),
         Command::Unattended { action } => unattended::unattended(&paths, action),
         Command::Devices { json } => unattended::devices(&paths, json),
         Command::Panic => unattended::panic_now(&paths),
         Command::Service { action } => unattended::service(&paths, action),
         Command::Backup { action } => unattended::backup(&paths, action),
+    }
+}
+
+fn parse_bridge_mode(s: &str) -> Result<BridgeMode, String> {
+    match s {
+        "auto" => Ok(BridgeMode::Auto),
+        "off" | "direct" => Ok(BridgeMode::Off),
+        "obfs4" => Ok(BridgeMode::Obfs4),
+        "snowflake" => Ok(BridgeMode::Snowflake),
+        other => Err(format!("{other:?}: expected auto, off, obfs4 or snowflake")),
     }
 }
 
@@ -330,6 +350,18 @@ fn cmd_doctor(paths: &Paths) -> anyhow::Result<()> {
         ),
         Err(e) => println!("config: {} [ERROR: {e}]", cfg_path.display()),
     }
+    let tor = Config::load(&cfg_path).map(|c| c.tor).unwrap_or_default();
+    let lyrebird = tornect_signal::tor::find_lyrebird(tor.pt_path.as_deref());
+    println!(
+        "tor: bridges={:?} last-worked={} lyrebird={} extra-bridge-lines={}",
+        tor.bridges,
+        tornect_signal::tor::last_good(paths).map_or("none".to_owned(), |r| r.to_string()),
+        lyrebird.as_ref().map_or_else(
+            || "NOT FOUND (obfs4/Snowflake unavailable; see tor.pt_path)".to_owned(),
+            |p| p.display().to_string()
+        ),
+        tor.bridge_lines.len()
+    );
     let store = FileSecretStore::open(paths.keys_dir())?;
     use tornect_core::SecretStore as _;
     let has_host = store.contains(keystore::HOST_IDENTITY_SEED)?;

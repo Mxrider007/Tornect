@@ -52,7 +52,7 @@ with "Disk quota exceeded" while compiling zstd (`docs/notes/m1-track1-evidence.
 
 | Crate | Version | Features | Why | Build requirements | Verified | Source |
 |---|---|---|---|---|---|---|
-| `arti-client` | =0.45.0 | `default-features = false`; `tokio`, `rustls`, `compression`, `flowctl-cc`, `static-sqlite`, `onion-service-service`, `onion-service-client`, `vanguards` (+ `hs-pow-full` via `tor-pow`) | The Tor client: `TorClient`, bootstrap status, `launch_onion_service`, `connect_with_prefs`, `StreamPrefs`, `ErrorKind`. `rustls` instead of the default `native-tls` avoids OpenSSL; `static-sqlite` avoids `libsqlite3-dev`. | C compiler (bundled sqlite/zstd/xz) | 2026-08-28 mx-vm, live network | `docs/research/arti.md` §0–§2, §7, §9; crates.io |
+| `arti-client` | =0.45.0 | `default-features = false`; `tokio`, `rustls`, `compression`, `flowctl-cc`, `static-sqlite`, `onion-service-service`, `onion-service-client`, `vanguards`, `pt-client` (2026-09-21, M1-38: implies `bridge-client`, adds `tor-ptmgr` =0.45.0 MIT/Apache-2.0) (+ `hs-pow-full` via `tor-pow`) | The Tor client: `TorClient`, bootstrap status, `launch_onion_service`, `connect_with_prefs`, `StreamPrefs`, `ErrorKind`. `rustls` instead of the default `native-tls` avoids OpenSSL; `static-sqlite` avoids `libsqlite3-dev`. | C compiler (bundled sqlite/zstd/xz) | 2026-08-28 mx-vm, live network | `docs/research/arti.md` §0–§2, §7, §9; crates.io |
 | `tor-hsservice` | =0.45.0 | — (+ `hs-pow-full` via `tor-pow`) | Onion-service types: `RendRequest`/`StreamRequest`, `RunningOnionService`, `OnionServiceStatus`, `HsNickname`, `HsIdKeypairSpecifier`, `TokenBucketConfig`. | none | 2026-08-28 | arti.md §8, `tor-hsservice-0.45.0/src/{lib,req,status,config,keys}.rs` |
 | `tor-hscrypto` | =0.45.0 | — | `HsId`, `HsIdKey`, `HsIdKeypair` (identity ↔ address). | none | 2026-08-28 | arti.md §8.2; `tor-hscrypto-0.45.0/src/pk.rs` |
 | `tor-llcrypto` | =0.45.0 | — | `ed25519::ExpandedKeypair::from_secret_key_bytes` — the expanded-key form Arti stores (decision M1-1). | none | 2026-08-28 | `tor-llcrypto-0.45.0/src/pk/ed25519.rs` 206–235 |
@@ -105,6 +105,12 @@ encrypted store and the IPC message set are `#[cbor(map)]` structs with integer 
 **No `libc` / `nix` / `rustix` pin for the IPC peer check.** `tokio::net::UnixStream::peer_cred() -> io::Result<UCred>` is already available under the `net` feature this workspace pins (tokio 1.53.1 `stream.rs:966`, `cfg(all(unix, feature = "net"))`); `uid()`/`gid()` are `u32` on every Unix, `pid()` is `Option<i32>` and is used for diagnostics only. `tornect-platform` compares the peer's uid against the owner of the socket file it created, so it needs no `getuid()` call and stays `#![forbid(unsafe_code)]`.
 
 **polkit subject kind.** `system-bus-name` with the connection's own unique name, **not** `unix-process` (deprecated upstream for the PID/start-time race behind CVE-2017-7572) and **not** `unix-session` (crashed polkitd 127 on this machine twice, `status=6/ABRT`, from two different clients).
+
+## Bundled binaries (not crates)
+
+| Binary | Version | Source | Why | Verified |
+|---|---|---|---|---|
+| `lyrebird` / `lyrebird.exe` | 0.8.1 (Tor Browser 15.0.23 tor-expert-bundle) | archive.torproject.org, GPG-verified (Tor Browser Developers `EF6E 286D DA85 EA2A 4BA7 DE68 4E2C 6E87 9329 8290`), SHA-256 pinned in `packaging/pt/SOURCES.md` | The managed pluggable transport for obfs4 **and** Snowflake bridges (M1-38); run by Arti's `tor-ptmgr`, never linked | 2026-09-21 mx-vm: signatures good, hashes match, `lyrebird -version` = 0.8.1, live obfs4 + Snowflake bootstraps (`docs/research/bridges.md` §8) |
 
 ## Fuzzing (`fuzz/`, excluded from the workspace, nightly only)
 
