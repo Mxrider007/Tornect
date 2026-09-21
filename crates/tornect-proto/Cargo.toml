@@ -1,6 +1,6 @@
 [package]
 name = "tornect-proto"
-description = "Tornect media wire protocol: packetizer, FEC, jitter buffer, pacer, ABR controller, stats"
+description = "Tornect media wire protocol: the Tor media stream framing and bind (slice), later packetizer, FEC, jitter buffer, pacer, ABR"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,14 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-tornect-core.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 
 [lints]
 workspace = true

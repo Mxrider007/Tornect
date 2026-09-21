@@ -3,3 +3,14 @@ xtask = "run --quiet --package xtask --"
 
 [target.'cfg(all())']
 rustflags = []
+
+# Windows cross-build from Linux with llvm-mingw (docs/research/slice.md §2):
+# the target's default linker `x86_64-w64-mingw32-clang` and the `cc` C/C++
+# compilers must be on PATH (`cargo xtask dist --windows` adds them). `+crt-static`
+# links libc++ and libunwind statically, so no DLLs travel with tornect.exe.
+[target.x86_64-pc-windows-gnullvm]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+# `cc` asks for libstdc++ on every non-MSVC target; llvm-mingw ships libc++.
+CXXSTDLIB_x86_64_pc_windows_gnullvm = "c++"

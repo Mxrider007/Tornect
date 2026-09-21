@@ -132,6 +132,29 @@ locally, so those backends are compiled and tested by the Linux CI job instead.
 | Windows named-pipe endpoint | OPEN | M6 (§B.8.14 "IPC endpoint per OS"). `Endpoint::bind` returns `Unsupported` on Windows; the owner-only DACL, `PIPE_REJECT_REMOTE_CLIENTS` and client-SID check need a Win32 binding that cannot be verified here. |
 | `tornect panic` ends live sessions | OPEN | Needs `serve_host` wired into `tornect host` (not done) and, for the grant suspension, M4's live-session ownership. The op reports this rather than claiming success. |
 
+## Censorship circumvention — bridge ladder (decision M1-38)
+
+| Check | Status | Evidence / notes |
+|---|---|---|
+| Direct Tor bootstrap via the ladder (`tornect --bridges off tor-check`) | VERIFIED | 2026-09-21 mx-vm, fresh `TORNECT_HOME`, cold cache: `TOR OK via direct in 14.3 s` |
+| obfs4 bridges (7 built-in lines, lyrebird 0.8.1) | VERIFIED | 2026-09-21 mx-vm: `TOR OK via obfs4 in 78.2 s` (some built-in bridges timed out first) |
+| Snowflake (2 built-in lines, lyrebird 0.8.1) | VERIFIED | 2026-09-21 mx-vm: `TOR OK via snowflake in 16.2 s`; `guards.json` = 2 bridge guards, 0 default; `pt_state/lyrebird` created |
+| Automatic fallback direct → obfs4 → Snowflake under real censorship | NEEDS-DEVICE(censored network) | Recipe: on a network that blocks Tor relays (or with the relay IPs firewalled), `TORNECT_PT_DIR=<dir with lyrebird> tornect tor-check`; expect `direct Tor did not work: no bootstrap progress for 40 s`, then obfs4, then Snowflake, and `state/tor-transport` = the rung that worked. Ladder order, stall/cap policy and last-good ordering are unit-tested (`tor::bridges::tests`) |
+| Onion-service **hosting** over bridges | OPEN | code path supports it (bridge = first hop of every circuit); run `tornect --bridges snowflake host` + `ping` from a second instance |
+| lyrebird provenance (GPG + SHA-256) | VERIFIED | 2026-09-21: Tor Browser Developers key `EF6E286D…93298290`, 3 good signatures, hashes pinned in `packaging/pt/SOURCES.md` |
+| Windows: lyrebird.exe spawned by a console-subsystem tornect.exe shows no extra window | NEEDS-DEVICE(windows) | Recipe: `tornect.exe --bridges obfs4 tor-check` from a console; expect no new console window (research bridges.md §6) |
+
+## Vertical slice — media crates (decisions M1-39, M3-1)
+
+| Check | Status | Evidence / notes |
+|---|---|---|
+| `tornect-proto` Tor media framing + bind MAC | VERIFIED | 5 unit tests: round trip of every message, clean-EOF, oversize/empty refusal before allocation, malformed bodies, MAC binds token and transcript |
+| `tornect-input` 16-byte event, key table, `Tracked` release-all | VERIFIED | 7 unit tests incl. hostile bytes rejected and held keys released on drop; key table spot-checked against Chromium rows |
+| `tornect-codec` OpenH264 encode → decode (Linux) | VERIFIED | 3 unit tests: geometry + colour order, odd sizes cropped, forced IDR |
+| Windows cross-build (`x86_64-pc-windows-gnullvm`, llvm-mingw 20260908) of `tornect-codec` (OpenH264 C++), `tornect-input` (SendInput), `tornect-proto` | VERIFIED (build only) | 2026-09-21: `cargo build --target x86_64-pc-windows-gnullvm -p tornect-codec` links; the other two `cargo check` clean. Runtime on Windows: NEEDS-DEVICE(windows) |
+| XTEST injection on an X11 session | NEEDS-DEVICE(linux-x11) | mx-vm runs Wayland; recipe lands with the session host (next session) |
+| SendInput injection on Windows | NEEDS-DEVICE(windows) | recipe lands with the session host (next session) |
+
 ## Netem / soak harness
 
 | Profile | Status | Evidence / notes |

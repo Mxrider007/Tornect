@@ -280,6 +280,34 @@ Both fixes are pinned by regressions that fail against the pre-fix code (verifie
 mutation / by reverting the single file). Gate after the round: `cargo xtask verify` green,
 **271 tests** (153 core + 118 signal).
 
+## Session 2026-09-21 — bridges, track D review, vertical-slice crates
+
+**Operator direction:** finish the app — functional on Linux and Windows, Tor with automatic
+obfs4 bridges when Tor is blocked and Snowflake when obfs4 fails, Windows cross-compile.
+Scope ruling: **vertical slice first** (M1-39, M3-1; `docs/notes/CONTINUATION.md`).
+
+Done:
+- **Track D review re-run** (first thing, frozen worktree `/home/mx/tornect-review-trackd` @
+  `7697823`): 105/105 agents completed, 33 raw → 12 survivors → 8 distinct; S1 (HIGH, IPC
+  30 s answer timeout vs 120 s polkit dialog ⇒ `unattended on` commits after the CLI reported
+  failure, stop code lost) verified by hand. **Unfixed** — first item next session.
+  Report: `kore_project_V3/agents/security/reports/2026-09-21_tornect_track_d_review.md`.
+- **Bridge ladder (M1-38)**, commit `213e7d9`: `tor::bridges` (Rung, Ladder, Transport,
+  built-in bridge lines, lyrebird discovery, last-good memory), `TorNode::start_auto` (fresh
+  client per rung on its own runtime, `ready_for_traffic` only, stall/cap policy),
+  `tornect tor-check`, `--bridges`, doctor line. Live: direct 14.3 s / obfs4 78.2 s /
+  Snowflake 16.2 s. lyrebird 0.8.1 from the GPG-verified tor-expert-bundle 15.0.23.
+- **Media port (M1-39):** listener accepts BEGIN on 4000 and 4001; `OnionStream::port()`;
+  `TorNode::connect_on` + `Isolation` (same rendezvous circuit).
+- **Slice crates:** `tornect-proto` (Tor media framing + bind MAC, 5 tests), `tornect-input`
+  (16-byte event, Chromium-derived USB key table, `Tracked`, XTEST, SendInput; 7 tests),
+  `tornect-codec` (OpenH264, 3 tests).
+- **Windows cross-build:** llvm-mingw 20260908 + `x86_64-pc-windows-gnullvm`, `+crt-static`,
+  `CXXSTDLIB=c++`; OpenH264's C++ links for Windows.
+
+Not done: capture, session layer, GUI, `serve_host` in `tornect host`, the whole-app Windows
+build, packaging — the app is not yet functional end to end.
+
 ## Gotchas (dev VM mx-vm)
 
 - Build with `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp`; `/tmp` is a 3.7 GiB quota tmpfs
