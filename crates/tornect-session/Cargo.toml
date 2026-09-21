@@ -17,6 +17,14 @@ tornect-capture.workspace = true
 tornect-codec.workspace = true
 tornect-audio.workspace = true
 tornect-input.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# `start_paused` for the bind-deadline tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
