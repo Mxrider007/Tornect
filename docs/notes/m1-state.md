@@ -6,12 +6,13 @@ implemented and green at 320 tests. Track E (the adversarial + fuzz sweep), the 
 `security-reviewer` close and the live verification over real Tor are **not done**, and `m1` is
 **not** tagged.
 
-**The largest remaining gap, which earlier hand-offs did not name:** `serve_host` — the §B.8.4.5
-host FSM that tracks A, B and C built — **is not wired into `tornect host`**, which still serves
-only the interim ping protocol of track 1. Every unattended test to date drives the FSM
-in process. Until the CLI hosts it, the §B.8.14 M1 acceptance ("headless unattended handshake
-ending in `SESSION_ACCEPT` … between two machines") cannot be demonstrated end to end over Tor,
-however green the in-process suite is. Seam list in *Still open* below.
+**Update 2026-09-21 (fourth session): `serve_host` is wired into `tornect host`** (decision
+M1-42; see *Session 2026-09-21 (4)* below). The host answers the handshake FSM and the
+pairing-free ping on one port, `tornect connect` drives the attended path, and `tornect panic`
+ends live sessions. What still stands between here and the §B.8.14 M1 acceptance ("headless
+unattended handshake ending in `SESSION_ACCEPT` … between two machines"): the client side of an
+**unattended** connection has no CLI yet (`Intent::Unattended` is reachable only from tests),
+and there is no second machine.
 
 ## Done
 
@@ -74,8 +75,11 @@ runs **after M1, before M2**; the UI plan's "Always allow" checkbox/badge is rej
 3. ~~Track D — CLI/IPC/platform~~ — **done 2026-09-05** (`fbc7a31`, `be58ea6`, `48ca97e`).
    See *Track D* below. Admin intent + scope and the stop token, carried in from track C, are
    both delivered.
-4. **Wire `serve_host` into `tornect host`** — not previously listed, and now the critical path
-   to the M1 acceptance. The seams to fill: `HostDeps::unattended` = `UnattendedAuth` (with
+4. ~~Wire `serve_host` into `tornect host`~~ — **done 2026-09-21, fourth session** (decision
+   M1-42). Every seam below is filled, `HostDeps::sessions`/`activity` come from one
+   `LiveSessions` tracker that also feeds the guard, and `tornect connect` sends
+   `TOR_FALLBACK{}` after the accept. `rotate-id`'s own `HostIdRotated` append is still open.
+   The seams as they were listed: `HostDeps::unattended` = `UnattendedAuth` (with
    `.with_admin_authority(GuardAdmin)`), `HostDeps::stop_token` = `EmergencyStop`,
    `HostDeps::audit` = `fsm::HostAudit::new(Arc<SessionLog>)`, `HostDeps::trusted` = the real
    `TrustedDeviceStore`, `HostDeps::consent` = a CLI prompt, and `HostDeps::kill` shared with
@@ -383,6 +387,62 @@ Resumed at `51458f7`. Two commits, **not pushed**; gate green at **370 tests**.
 - Lints that bit new code: `collapsible_if` (use an edition-2024 let-chain) and
   `type_complexity` (a 5-tuple in a test recorder → named struct). Both surfaced only at the
   gate's clippy step, after a `cargo check` had been clean.
+
+## Session 2026-09-21 (4) — `serve_host` in `tornect host`, `tornect connect`
+
+Resumed at `84f00f9`. The three commits of session 3 were pushed at the start, after the gate
+re-ran green (370 tests). The operator answered the blocking question: **"Keep ping, add
+connect"** (decision M1-42).
+
+- **`tornect_signal::dispatch`.** The host routes each signaling stream by its first frame:
+  exactly `TORNECT-PING/1 ‖ nonce` goes to the ping protocol, anything else to the FSM. The
+  first frame is read whole, under the FSM's `HELLO` deadline (30 s, statically equal to the
+  ping protocol's frame deadline) and its 8 KiB handshake cap, then replayed (`Replay<S>`,
+  zeroized once consumed — a `HELLO` can carry the stop token). The FSM therefore answers every
+  first frame byte for byte as before, and no peer holds a stream longer than the FSM allows.
+- **`LiveSessions`** (`fsm::host`). Fed by `SessionSink`, it answers both `SessionActivity`
+  (the FSM's `BUSY`) and the guard's `RemoteSessionActivity` (no access-increasing change during
+  a session or its 60 s cool-down), so the two cannot disagree. **One live session at a time**:
+  while one runs, every pairing and session request is `BUSY` (§B.8.16).
+- **`apps/tornect/src/host.rs`** — `wire()` fills every seam of the old seam list:
+  - the trusted-device store;
+  - terminal consent;
+  - `EmergencyStop` and `UnattendedAuth` + `GuardAdmin` over the host's guard, with a `UTC`
+    zone snapshot (no path in this build creates a grant schedule; decision M1-15);
+  - `HostAudit` on **the grant store's own `sessions.log` handle** — the log is a keyed hash
+    chain whose lock lives in the handle, so a second handle could fork it;
+  - **one `KillSwitch` and one `LiveSessions` shared with the IPC context**, so `tornect panic`
+    and `unattended off/pause/revoke-all` end live sessions and the guard sees them.
+
+  If the unattended store cannot open, the host still serves attended sessions and refuses
+  unattended ones.
+- **`apps/tornect/src/prompt.rs`.** The host's popups and the client's SAS confirmation are
+  terminal questions, answered only on a TTY: with stdin not a terminal, the host denies
+  everything and the client confirms nothing. One stdin reader thread starts at the first
+  question, so a backgrounded host that only answers pings never touches the terminal.
+  Questions queue, and lines typed before a question is shown are discarded.
+- **`tornect connect <id> [--pair-only] [--forget] [--pings N]`.** It pairs (the user compares
+  the code, 50 s), asks for a session, sends `TOR_FALLBACK`, then keeps the session alive with a
+  `PING` every 10 s. Between pings it waits on the stream, so a host `BYE` is reported at once.
+- **Tests: 370 → 388**, `cargo xtask verify` green. Failing-first was proven three times:
+  - an unshared kill switch fails the Panic test (`Timeout("session frame")`);
+  - a guard told that no session runs lets `On` through to the polkit dialog;
+  - the old keep-alive loop reports a host panic as `Lost(BrokenPipe)`.
+- **Live over Tor on mx-vm: PASS 8/8** (`docs/notes/m1-serve-host-evidence.md`): ping, the same
+  code on both screens (a re-pair via `--forget`), a control session, a view-only session with
+  no second pairing, `unattended on` refused mid-session, `tornect panic` ending the session on
+  both ends in 0.6 s, and a clean Ctrl-C. Runs 1–3 are recorded too. Run 3 found the one real
+  bug of the session (a panicked session reported as "connection lost"), fixed before run 4.
+
+**Not done, and honestly so:**
+- **No unattended client CLI.** `Intent::Unattended` is reachable only from tests, so the
+  §B.8.14 M1 acceptance (headless unattended handshake between two machines) still cannot be
+  shown end to end.
+- **The kill switch is host-wide** (M1 scope): `unattended off`, `pause` and `revoke-all` also
+  end *attended* sessions.
+- The panic key does not suspend the grant behind an unattended session (M4).
+- No capture, session layer or GUI; no Windows whole-app build; `m1` untagged; CI has never run.
+- `rotate-id`'s own `HostIdRotated` append is still open.
 
 ## Gotchas (dev VM mx-vm)
 
