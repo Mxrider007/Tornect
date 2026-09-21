@@ -456,8 +456,59 @@ connect"** (decision M1-42).
 - No session layer or GUI; no Windows whole-app build; `m1` untagged; CI has never run.
 - `rotate-id`'s own `HostIdRotated` append is still open.
 
+## Session 2026-09-21 (5) — the session layer: media over Tor
+
+**Commits** (gate green at **424 tests**, cargo-deny ok):
+- `be28c64` `feat(proto)`: the 64-byte client frame cap; `BindOk` documented as a hint.
+- `bc85abe` `feat(session)`: `MediaHost` + `MediaViewer`, decision M1-43.
+- `fd672b7` `feat(tornect)`: `tornect host --capture`, the media stream in `tornect connect`.
+- `764f74f` `fix(signal)`: the M1-44 review fixes.
+- `7d3668a` `fix(tornect)`: the media-end wording.
+
+**What exists now.**
+- `tornect-session` serves the Tor media stream of M1-39.
+  - **Bind:** fixed size, 10 s, at most 8 waiting, single use.
+  - **Capture:** only after the bind, one picture per credit from an 8-unit / 512 KiB ack window.
+  - **Input:** view-only gets no injector; control goes through `Tracked` and a 250/s bucket.
+  - **Kill:** a watcher ends all media on any kill.
+- `tornect host --capture desktop|test-card` shares X11 on an X11 session or GDI on Windows. On
+  this Wayland VM it can share only the test card.
+- `tornect connect` opens the media stream on the signaling circuit, decodes and acknowledges.
+  It prints `MEDIA BOUND`, a progress line every 5 s, and `MEDIA OK|EMPTY`. A test card is checked
+  frame by frame (`MEDIA CARD first=… last=… in-order`). `--no-video` keeps the old
+  signaling-only session.
+- **Verified live over real Tor** (two homes, `docs/notes/m1-media-evidence.md`):
+  - 146 of 146 card pictures arrived in order with 0 decode errors, at 1280×720 and 6.3 fps;
+  - the media stream opened about 1 s after the accept;
+  - `tornect panic` ended media and session on both ends.
+
+**Review of `efe75fa..510b6cb`** (KORE A′: 3 read-only threat modelers; the synthesis is at
+`/home/mx/kore_project_V3/agents/security/reports/2026-09-21_tornect_slice_b_review.md`).
+- Totals: 0 critical, 0 high, 4 medium; 106 candidates refuted.
+- Fixed failing-first (M1-44): B1-2 ⊕ B2-1, B1-3 ⊕ B2-5, B1-1 and B1-4. B3-12 (a doc fix) too.
+- **Open, the one medium left: B2-2.** A host whose store was locked at start has no control
+  channel, and a Windows host never has one.
+- The low findings are listed there with next steps. B2-7 (`yes` grants control) and B3-7 (an X11
+  `u32` overflow) are one-line fixes.
+
+**Not done, and honestly so:**
+- **The frame rate over Tor is 6–7 fps.** The 8-unit window caps it at this RTT (M1-43 notes
+  ~20 units for 15 fps), and it has not been tuned.
+- **No Wayland capture** (next item). No GUI. No whole-app Windows build. No second machine.
+- The live driver's final check failed on client wording only; that is fixed but not re-run live.
+- Input over the media stream is wired host-side, but no client sends any yet (that is the GUI).
+- `m1` is untagged, and CI has never run.
+
 ## Gotchas (dev VM mx-vm)
 
+- **`cargo xtask verify` and plain `cargo` rebuild each other's Tor stack.** `cargo xtask` runs
+  through `cargo run`, which puts `CARGO_PKG_NAME`, `CARGO_MANIFEST_DIR` and the other `CARGO_PKG_*`
+  variables into xtask's environment. `ring`'s build script watches exactly those
+  (`rerun-if-env-changed`). So every switch between the gate and a plain `cargo` command (or the
+  pre-commit hook) re-runs `ring` and rebuilds everything above it: several minutes for tests, and
+  about 30 s for clippy. Fix (next session): have xtask `env_remove` those variables from the cargo
+  commands it spawns. This is also the likely real cause of the old "`cargo test -p` re-unifies
+  features" note.
 - Build with `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp`; `/tmp` is a 3.7 GiB quota tmpfs
   (zstd-sys fails there); Tor state under `target/tornect-test/<name>`, never `/tmp`.
 - A cold Arti rebuild is 2–5 min; the pre-commit hook runs fmt + clippy

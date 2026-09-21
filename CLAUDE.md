@@ -22,7 +22,7 @@ crates/tornect-codec        Encoder/Decoder + ffmpeg hw backends + software fall
 crates/tornect-audio        capture, Opus, playback                                                          (M5)
 crates/tornect-input        16-byte input events, client capture, host inject backends                      (M5)
 crates/tornect-platform     OS session services (§B.8.8): presence, lock, keep-awake, autostart, OS re-auth backends, hotkeys, readiness, owner-only IPC endpoint   (M1 scaffold / M6)
-crates/tornect-session      host/client state machines gluing everything; unattended: the UI-backed BlockWindow/LocalAllow impls + Candidates onward (§B.8.14)   (M4)
+crates/tornect-session      the Tor media session (MediaHost/MediaViewer, decision M1-43; the slice); later the host/client state machines, the UI-backed BlockWindow/LocalAllow impls + Candidates onward (§B.8.14)   (M4)
 apps/tornect                CLI now; eframe app + stream window later; host-role IPC server loop dispatching to the MutationGuard (§B.8.7.4)   (M4/M8)
 xtask                       cargo xtask verify | lint-all | dist | ffmpeg-fetch | soak
 tests/integration           loopback e2e, signaling-over-localhost-tor mocks, unattended adversarial suite (§B.8.15)   (M1)
@@ -50,7 +50,8 @@ cargo run -p tornect -- id         # M0 acceptance: prints this machine's Tornec
 cargo run -p tornect -- doctor     # environment report
 TORNECT_HOME=$PWD/target/tornect-test/h1 cargo run -p tornect -- host          # M1: publish onion service; answer pings, pairing and sessions (asked on this terminal)
 TORNECT_HOME=$PWD/target/tornect-test/h2 cargo run -p tornect -- ping <id> --count 5   # M1: second isolated instance, pairing-free liveness check
-TORNECT_HOME=$PWD/target/tornect-test/h2 cargo run -p tornect -- connect <id>          # M1: pair (compare the code) → host accepts → session kept alive; --pings N, --pair-only, --forget
+TORNECT_HOME=$PWD/target/tornect-test/h1 cargo run -p tornect -- host --capture test-card   # slice: share the synthetic test card (this VM's Wayland desktop has no capture backend yet)
+TORNECT_HOME=$PWD/target/tornect-test/h2 cargo run -p tornect -- connect <id>          # M1: pair (compare the code) → host accepts → session + media stream (MEDIA lines); --pings N, --pair-only, --forget, --no-video
 TORNECT_HOME=$PWD/target/tornect-test/h1 cargo run -p tornect -- panic                 # ends every session the running host serves
 cargo test -p tornect-signal --test live -- --ignored --nocapture              # M1: host+client roundtrip over live Tor
 cargo +nightly fuzz run framing -- -max_total_time=600                          # M1: 10-min fuzz of the frame parser (fuzz/ is outside the workspace)
