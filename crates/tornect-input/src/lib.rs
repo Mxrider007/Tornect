@@ -34,6 +34,17 @@ use std::collections::BTreeSet;
 /// Wheel units per notch (Windows `WHEEL_DELTA`).
 pub const WHEEL_NOTCH: i32 = 120;
 
+/// Keys no injector passes on (USB usages, [`keymap`]): they power off, suspend
+/// or wake the host, or eject its media. That ends the session and needs
+/// someone at the machine to recover, and it has no remote-control use
+/// (SLICE-A2 A2-5). [`Tracked`], which wraps every injector, refuses them.
+pub const SYSTEM_KEYS: &[u32] = &[
+    0x01_0082, // Sleep
+    0x01_0083, // WakeUp
+    0x07_0066, // Power
+    0x0c_00b8, // Eject
+];
+
 /// A pointer button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Button {
@@ -120,6 +131,9 @@ pub enum InputError {
     /// The platform refused or failed the injection.
     #[error("input injection failed: {0}")]
     Inject(String),
+    /// A key the host never injects ([`SYSTEM_KEYS`]).
+    #[error("key usage 0x{0:06x} is a system power key and is not injected")]
+    Refused(u32),
 }
 
 impl InputEvent {
@@ -149,6 +163,11 @@ impl InputEvent {
             return Err(InputError::Malformed("reserved bits set"));
         }
         let pressed = flags & 1 == 1;
+        // Only buttons and keys have a pressed state; a set bit elsewhere is as
+        // malformed as a set reserved bit (SLICE-A2 A2-8).
+        if pressed && !matches!(bytes[0], 2 | 4) {
+            return Err(InputError::Malformed("pressed bit on a kind without one"));
+        }
         let code = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         let a = i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         let b = i32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
@@ -234,6 +253,9 @@ impl<S: InputSink> InputSink for Tracked<S> {
             InputEvent::ReleaseAll => {
                 self.release_all();
                 return Ok(());
+            }
+            InputEvent::Key { usb, .. } if SYSTEM_KEYS.contains(&usb) => {
+                return Err(InputError::Refused(usb));
             }
             InputEvent::Key { usb, pressed } => {
                 // A release for a key the host never saw pressed is dropped:
@@ -338,6 +360,37 @@ mod tests {
         ] {
             assert_eq!(InputEvent::decode(&ev.encode()).unwrap(), ev);
         }
+    }
+
+    /// SLICE-A2 A2-5: power, sleep, wake and eject never reach an injector, and
+    /// are never tracked as held.
+    #[test]
+    fn system_power_keys_are_refused() {
+        for &usb in SYSTEM_KEYS {
+            assert!(keymap::by_usb(usb).is_some(), "0x{usb:06x} is in the table");
+            let mut sink = Tracked::new(Recorder(Vec::new()));
+            let err = sink
+                .inject(&InputEvent::Key { usb, pressed: true })
+                .unwrap_err();
+            assert!(matches!(err, InputError::Refused(u) if u == usb), "{err}");
+            assert!(sink.inner.0.is_empty(), "nothing reached the injector");
+            assert!(sink.keys.is_empty());
+        }
+    }
+
+    /// SLICE-A2 A2-8: the pressed bit is rejected on kinds that have no pressed
+    /// state, like a set reserved bit.
+    #[test]
+    fn a_pressed_bit_on_a_move_is_malformed() {
+        let mut bytes = InputEvent::PointerMove { x: 1, y: 2 }.encode();
+        bytes[1] = 1;
+        assert!(matches!(
+            InputEvent::decode(&bytes),
+            Err(InputError::Malformed(_))
+        ));
+        let mut bytes = InputEvent::ReleaseAll.encode();
+        bytes[1] = 1;
+        assert!(InputEvent::decode(&bytes).is_err());
     }
 
     #[test]
