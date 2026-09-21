@@ -1,4 +1,4 @@
-# Tornect — continuation report (2026-09-21, second session close)
+# Tornect — continuation report (2026-09-21, third session close)
 
 Paste the block under **HAND-OFF** into a new session.
 
@@ -7,7 +7,8 @@ Paste the block under **HAND-OFF** into a new session.
 ## HAND-OFF
 
 Continue building Tornect from `/home/mx/Tornect` (private repo
-https://github.com/Mxrider420z/Tornect, branch `main`, pushed at `81da800`, clean).
+https://github.com/Mxrider420z/Tornect, branch `main`, **committed at `34f4723`, NOT yet
+pushed** — `51458f7` is what the remote has).
 
 The operator's goal for this run:
 - **A functional app on Linux and Windows.** The operator will test with one Linux and one
@@ -24,105 +25,105 @@ untagged until their full acceptance runs.
 Read in this order before doing anything:
 1. `CLAUDE.md`
 2. this file
-3. `docs/notes/m1-state.md` (§ *Session 2026-09-21 (2)*)
+3. `docs/notes/m1-state.md` (§ *Session 2026-09-21 (3)*)
 4. `docs/research/slice.md`
 5. `docs/notes/decisions.md` M1-38 … M1-41 and M3-1
 6. the slice review
    `/home/mx/kore_project_V3/agents/security/reports/2026-09-21_tornect_slice_review.md`
 
-Then run `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp cargo xtask verify`. Expect **368 tests**
+Then run `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp cargo xtask verify`. Expect **370 tests**
 and `cargo deny check (offline; advisory DB 2026-08-29)` ok.
 
-### STATE (2026-09-21, second session)
+### ⚠ START HERE: one operator decision is blocking the critical path
 
-Pushed commits this session:
+`serve_host` is **still not wired into `tornect host`** — not for lack of the seams, which are
+now in place, but because wiring it changes what the signaling port speaks and the operator was
+asked to choose and ended the session first. **Get this answer, then the wiring is
+straightforward.**
+
+The FSM requires pairing (SAS on both ends) before a session, so today's zero-setup
+`tornect ping` liveness check cannot survive unchanged. The options put to the operator:
+
+| # | Option | What it means |
+|---|---|---|
+| 1 | **Keep ping, add `tornect connect`** (recommended) | The host answers both, dispatching on the first frame — ping frames start with the magic `TORNECT-PING/1`, FSM frames are CBOR envelopes, so the dispatch is ~10 lines. `tornect ping <id>` keeps working with no pairing, so on the two-machine test a Tor problem can be told apart from a pairing problem. A new `tornect connect <id>` drives the real FSM: pair → SAS → host consent → session `PING`s. `CLAUDE.md`'s command list and the M1 acceptance recipe stay intact. |
+| 2 | FSM only, migrate `tornect ping` | The signaling port speaks only the handshake FSM; `tornect ping` becomes an FSM client and needs pairing plus a consent prompt on the host. Smaller surface, and it retires the interim protocol the way `ping.rs`'s own doc intends — but the zero-setup reachability check is gone and `docs/VERIFICATION.md` rows churn mid-slice. |
+| 3 | FSM only, drop `tornect ping` | Replace it outright with `tornect connect`. Cleanest end state, most doc churn now, no simple liveness check while capture/session/GUI are missing. |
+
+**Why 1 is recommended:** the app is still not functional end to end, so the operator's next
+real activity is a two-machine bring-up. A liveness check that does not need pairing is the
+cheapest way to isolate "is Tor reachable?" from "is pairing working?", and option 1 keeps it
+for ~10 lines that are deleted later.
+
+### STATE (2026-09-21, third session)
+
+Pushed commits: none this session. **Local commits ahead of `origin/main`:**
 
 | Commit | What |
 |---|---|
-| `5523fcc` | the 8 track D fixes |
-| `c868e71` | proto/input hardening |
-| `38c8de5` | bridge ladder hardening + lyrebird pin |
-| `110b774` | cargo-deny in the gate |
-| `81da800` | a flaky test fixed |
+| `94dfe64` | `fix(signal)`: the kill switch is per-session and no longer latches |
+| `34f4723` | `feat(signal)`: the `SessionSink` seam on the host FSM |
 
-1. **Track D: CLOSED.** All 8 distinct survivors of the 105-agent review are fixed. Each was
-   re-verified against the code first, and the tests for S1, S2 and S3 fail on the old code.
-   - **IPC endpoint:**
-     - The CLI waits `RESPONSE_TIMEOUT` = 150 s, compile-time asserted to outlast the 120 s
-       polkit dialog.
-     - If an `On` answer cannot be delivered, the host turns access back off and clears the
-       unseen stop token (`MutationGuard::master_off_undelivered_stop_code`).
-     - Connections are served concurrently (≤ 16).
-     - `PolkitReAuth` holds one dialog at a time and refuses a second at once.
-   - **Admin path:**
-     - The kill effect fires even when `ADMIN_RESULT` cannot be written.
-     - Post-commit log lines are best-effort.
-     - A failed commit logs `AdminRequest{ok:false}`.
-   - **Offline CLI:** it loads the store with `GrantStore::open_offline`.
-   - **polkit:** `allow_any`/`allow_inactive` = `auth_self`, so a text agent works over SSH;
-     `is_challenge` is reported as "no authentication agent".
-   - **Password and stop-code handling:**
-     - The password is read unbuffered straight off the TTY fd into a pre-sized buffer that is
-       wiped on drop; an over-long line is drained.
-     - The stop code is written raw to fd 1.
-     - `MasterOnPayload` and `RegStartPayload` are `ZeroizeOnDrop`.
-   - **Password policy:** zxcvbn gets device/grant labels and the host name; whitespace warnings
-     need a y/N; `--waive-attended-check` warns.
-   - **Hand-checked:** a PTY-driven `on → grant → status`, and `tornect host` + IPC
-     `status/pause/off`.
-2. **Slice-range review (`7697823..efe75fa`): done.** It ran as A′: 3 read-only KORE Security
-   sub-agents. The ≈ 100-agent refuted review was not approved at that size. The result was
-   0 critical and 0 high. Fixed:
-   - **M1-40 (`38c8de5`):**
-     - Private `tor.bridge_lines` **replace** the built-ins of their transport.
-     - `auto` skips direct Tor when private lines exist, and puts direct last once a bridge
-       worked.
-     - Forced `--bridges` runs do not learn the last-good rung.
-     - lyrebird comes from next to the exe, then `$TORNECT_PT_DIR`, never `PATH`, absolute
-       paths only. It must match `LYREBIRD_SHA256` (lyrebird 0.8.1), and group- or
-       world-writable binaries are refused. Only an explicit `tor.pt_path` may run another build.
-     - Bridge lines are reported by position only.
-     - The host warns when it is reachable only over Snowflake.
-     - Peer IDs are logged in their short form.
-     - A Windows GNU build without `+crt-static` fails to compile.
-     - Live checks: the obfs4 rung was ready in 47.6 s with the pinned binary, and a tampered
-       copy was refused.
-   - **M1-41 (`c868e71`):** `Bind.mac` is keyed by `HKDF-SHA256(session_token,
-     "tornect/v1/tor-media-bind-key")`, pinned by an independently computed test vector.
-     `SYSTEM_KEYS` (Power, Sleep, WakeUp, Eject) are refused by `Tracked`, and the input decoder
-     is stricter.
-   - **`110b774`:**
-     - `xtask verify` runs `cargo deny --offline check` (binary under
-       `target/tools/cargo-deny-0.20.2-x86_64-unknown-linux-musl/`) and prints the DB date. It
-       says SKIPPED if the tool is absent.
-     - `deny.toml` covers the gnullvm target and the `keyring` feature.
-     - The `rsa` ignore reason is corrected.
-     - Forbidden deps are checked with `--target all`.
-     - `dist` builds with `--locked`.
-3. **Unchanged from the previous hand-off:**
-   - Bridges live-verified (direct 14.3 s, obfs4 78.2 s, Snowflake 16.2 s cold).
-   - The media port 4001 and `connect_on`.
-   - The `tornect-proto`, `tornect-input` and `tornect-codec` crates.
-   - The Windows cross-build route: llvm-mingw 20260908, `x86_64-pc-windows-gnullvm`,
-     OpenH264's C++ links.
+1. **`KillSwitch` latch: FIXED (`94dfe64`).** This was the blocker the previous hand-off put
+   ahead of `serve_host`.
+   - It held one `watch<Option<u16>>` for the host's lifetime, so the first kill left
+     `Some(reason)` in the channel for good. `established()` polls it first in a biased
+     `select!`, so **every session accepted after a master-off, revoke-all, panic key or
+     emergency stop was sent `BYE` and closed on entry** — one kill disabled hosting until the
+     process restarted.
+   - The switch now carries a **generation counter** beside the reason. A stream snapshots it
+     in `serve_host` **at accept time** (`KillSwitch::arm`) and its `KillGuard` fires only for a
+     kill with a newer generation.
+   - Arming at accept rather than in `established()` is deliberate: a kill fired *during* a
+     handshake still ends that session, so the panic key stays effective against a session that
+     has not reached `Established` yet.
+   - Refusing *new* access after a master-off or emergency stop remains the grant store's job
+     (the master switch and revoked grants make `UnattendedAuth` reject; attended sessions still
+     need the consent popup), so dropping the latch does **not** widen what the host accepts.
+   - `fired()` still reports the most recent reason for status and tests.
+   - Failing-first verified: on the old code the regression test fails with
+     `host answers ping, not BYE on entry: Frame(Io(Kind(BrokenPipe)))`.
+2. **`SessionSink` seam: ADDED (`34f4723`).** `HostDeps` gained `sessions: Arc<dyn SessionSink>`.
+   - `on_start(&LiveSession)` fires once `SESSION_ACCEPT` is sent and `th_final` is fixed — the
+     first point §B.6 allows capture to begin. It carries device, label, session id, **session
+     token** (what the media layer derives the `Bind` key from, M1-41), `th_final`, mode and
+     `unattended`.
+   - `on_end(session_id, Option<&SessionEnd>)` fires as soon as `established` returns and
+     **before the error is propagated**, so a session ending in a protocol error still releases
+     what the sink acquired. **Every `on_start` is followed by exactly one `on_end`** — a sink
+     may treat the pair as acquire/release for capture.
+   - `NoSessionSink` is the default, so M1 behaviour is unchanged: nothing runs a session yet.
+   - The test asserts the pairing and that the sink gets the same `th_final` **and session
+     token the client holds** (both verified equal across the two sides).
+3. **Unchanged from the previous hand-off:** track D closed (`5523fcc`); the slice review
+   (`7697823..efe75fa`, A′, 0 critical / 0 high) and its fixes `38c8de5`, `c868e71`, `110b774`,
+   `81da800`; bridges live-verified (direct 14.3 s, obfs4 78.2 s, Snowflake 16.2 s cold); media
+   port 4001 and `connect_on`; the `tornect-proto` / `tornect-input` / `tornect-codec` crates;
+   the Windows cross-build route (llvm-mingw 20260908, `x86_64-pc-windows-gnullvm`, OpenH264's
+   C++ links).
 
 ### NEXT, in order
 
-1. **Wire `serve_host` into `tornect host`.** This has been the critical path since 2026-09-05.
-   - Seams to fill:
-     - `HostDeps::unattended` = `UnattendedAuth` + `GuardAdmin`
-     - `stop_token` = `EmergencyStop`
-     - `audit` = `HostAudit`
-     - `trusted` = the real store
-     - `consent` = a CLI/GUI prompt
-     - `kill` shared with the IPC `HostContext`
-   - Add a new `SessionSink` seam, called right after `SESSION_ACCEPT` (session id, token,
-     `th_final`, mode, label) and at session end.
-   - **Fix `KillSwitch` first:** it latches, so after one kill every later session is ended. Make
-     it per-session or resettable.
-   - The client side: `connect` → `send_tor_fallback` →
-     `connect_on(MEDIA_PORT, same Isolation)` → `Bind`, then keep signaling alive with `PING`s
-     (host idle timeout 90 s).
+1. **Answer the decision above, then wire `serve_host` into `tornect host`.** Everything else
+   is ready for it. The accept loop is `run_host` in `apps/tornect/src/tor_cmd.rs` (it currently
+   calls `ping::serve` on `SIGNALING_PORT`). Seams and where the real implementations live:
+   - `signer` = the `HostIdentity` (`impl HostSigner for HostIdentity`, `transcript.rs:127`)
+   - `trusted` = the real `TrustedDeviceStore`
+   - `consent` = a CLI prompt — `Consent::pairing` (peer + SAS → Allow/label/Deny) and
+     `Consent::session` (peer + summary → Allow once / view-only / Deny), `pairing.rs:167`
+   - `stop_token` = `EmergencyStop::new(guard, kill)`
+   - `unattended` = `UnattendedAuth::new(limiter, tz, host_transport)` `.with_admin(GuardAdmin::new(guard))`
+   - `audit` = `HostAudit::new(log)`
+   - `sessions` = the new `SessionSink`
+   - `activity` = whether a session is live (drive it from the sink; it gates the BUSY rejects)
+   - `kill` = **shared with the IPC `HostContext`** — `host_context()` in
+     `apps/tornect/src/unattended.rs:572`, whose own doc says it "gains `kill` — and with it a
+     working `Panic` — when the host FSM is wired into `tornect host`". **Until this is done the
+     panic key and IPC `Panic` still do nothing to live sessions.**
+   - Note `HostDeps` has **no struct literals** outside its own definition; everything goes
+     through `HostDeps::headless(...)` and then assigns fields, so adding seams is cheap.
+   - Client side: `connect` → `send_tor_fallback` → `connect_on(MEDIA_PORT, same Isolation)` →
+     `Bind`, then keep signaling alive with `PING`s (host idle timeout 90 s).
 2. **`tornect-capture`:**
    - a `VideoSource` trait (blocking `next_frame`, tight BGRx), plus a synthetic test card;
    - X11: GetImage + XFIXES cursor;
@@ -139,6 +140,8 @@ Pushed commits this session:
    - the viewer sizes from `DecodedFrame`, never from `BindOk`;
    - release-all at session end;
    - `KeyframeRequest` on a decode error.
+   - `SessionSink::on_start` / `on_end` is the seam this hangs off; the acquire/release pairing
+     is guaranteed, so capture start/stop can be tied to it directly.
 4. **GUI:** a manual winit loop + egui (`slice.md` §2), containing:
    - the ID and Tor status;
    - a connect field;
@@ -159,9 +162,9 @@ Pushed commits this session:
      `lyrebird.txt`, `THIRD_PARTY_NOTICES.md` and a README.
    - Pin toolchain hashes, and set `LZMA_API_STATIC=1` (SLICE-A3 F7).
 7. **Security review of the slice diff.** Launch it as soon as the diff is frozen, and **ask the
-   operator whether to run it at full size**: the refuted review is about 100 agents; this session
-   ran A′ because that size was not approved. Then hand the operator the two packages with a test
-   recipe.
+   operator whether to run it at full size**: the refuted review is about 100 agents; the last
+   one ran as A′ because that size was not approved. Then hand the operator the two packages
+   with a test recipe.
 
 ### STILL OPEN / UNTESTED (do not mark these done)
 
@@ -187,23 +190,30 @@ Pushed commits this session:
   - F9/F10: read the Arti 0.46.0 and rustls 0.23.44/45 notes before tagging.
 - **S9 residual:** zxcvbn still scores "Laptop-of-Ana tornect 2026" at 4, even with the label.
 - **No capture, no session, no GUI yet: the app is not functional end to end.**
+- **The panic key and IPC `Panic` still do not end live sessions** — they will once `kill` is
+  shared with `host_context` in step 1. The latch fix removed the bug that made a *second*
+  session impossible after one kill; it did not by itself connect the kill to the host.
 
-### GOTCHAS (new this session)
+### GOTCHAS
 
 - **The gate now runs cargo-deny.** If `target/` is ever cleaned, `target/tools/` goes with it,
   and the step then says SKIPPED; restore the prebuilt binary (cargo-deny 0.20.2 musl).
+- **Gate failures surface late and in order:** plan-sync → forbidden deps → cargo-deny → fmt →
+  clippy → test → doc. This session lost two full runs to a `fmt` break and a `clippy` break
+  that a `cargo check` had not shown. Run `cargo fmt --all` and
+  `cargo clippy -p <crate> --all-targets -- -D warnings` before the gate.
+  - Two clippy lints hit new code here: `collapsible_if` (use a let-chain — edition 2024) and
+    `type_complexity` (a 5-tuple in a test recorder; use a named struct).
 - **Disk:**
-  - The root disk was at 88–92 %. `target/debug/deps` is 36 G, and about 22 G of it had not been
-    read in 3+ days (stale feature and toolchain variants).
+  - The root disk is at 89 % with ~12 G free. `target/debug/deps` holds ~22 G of stale
+    artifacts.
   - Deleting artifacts by atime is **unsafe**: a missing proc-macro or low-level artifact makes
     cargo rebuild everything above it.
-  - `~/.cache/tornect-probe*` (4.3 G of M0 probe target dirs) was deleted this session.
-- **Per-package test runs rebuild.** `cargo test -p <crate>` can rebuild the tokio/rustls/Arti
-  stack under a different feature unification (5–6 min); prefer `--workspace` or the gate.
-- **Two gate failures that surfaced late:**
-  - rustdoc fails on a public doc linking to a `pub` item of a private module unless it is
-    re-exported (`tor::bridges::LYREBIRD_SHA256`).
-  - The audit-log test used to flake on a 2-byte token match against random hash hex (fixed).
+- **Per-package test runs rebuild.** `cargo test -p <crate>` rebuilds the tokio/rustls/Arti
+  stack under a different feature unification (~2 min here); prefer `--workspace` or the gate.
+- **`.githooks` is active** (`core.hooksPath`), so every commit runs fmt + clippy (~30 s).
+- rustdoc fails on a public doc linking to a `pub` item of a private module unless it is
+  re-exported (`tor::bridges::LYREBIRD_SHA256`).
 
 ### PENDING USER ACTIONS
 
@@ -214,8 +224,13 @@ These are unchanged:
 - Arrange a second machine.
 - Install the polkit policy.
 
-New: decide whether `tornect host` should *refuse* Snowflake rather than warn (A1-7). Snowflake
-volunteer proxies learn the host's IP, but refusing it breaks hosting where obfs4 is blocked.
+Carried: decide whether `tornect host` should *refuse* Snowflake rather than warn (A1-7).
+Snowflake volunteer proxies learn the host's IP, but refusing it breaks hosting where obfs4 is
+blocked.
+
+**New and blocking:** the ping-vs-FSM decision at the top of this file.
+
+**Also new:** these two commits are **not pushed**. `git push` when you want them on the remote.
 
 Work autonomously per the CLAUDE.md ground rules. Commits carry **no AI references**. End the
 session with this same kind of report plus memory, Part G and `docs/notes/m1-state.md` updates.
@@ -224,23 +239,21 @@ session with this same kind of report plus memory, Part G and `docs/notes/m1-sta
 
 ## What this session did
 
-- Resumed at `efe75fa`.
-- Ran the slice-range review first, as 3 read-only sub-agents on a frozen worktree, while fixing
-  the track D findings in the main tree.
-- Closed all 8 track D findings with failing-first regression tests, and checked them by hand
-  under a real PTY and over the IPC socket.
-- Synthesized the review and fixed its actionable findings:
-  - private bridges replace the built-ins;
-  - lyrebird is pinned and never taken from `PATH`;
-  - the media bind key is HKDF-derived;
-  - system power keys are refused;
-  - cargo-deny is in the gate.
-- Verified the obfs4 rung live with the pinned binary.
+- Resumed at `51458f7` with the KORE V3 MODE B bootstrap; structure verified by check
+  (PASS, 0 defects, 34/34 definition checksums identical), registry empty.
+- Fixed the `KillSwitch` latch — the item the previous hand-off named as the prerequisite for
+  `serve_host` — and proved the regression test fails on the old code before fixing it.
+- Added the `SessionSink` seam so `serve_host` has somewhere to hand a live session, with the
+  acquire/release guarantee the capture layer needs.
+- Ran the full gate to green three times (370 tests, cargo-deny ok).
+- Stopped at the ping-vs-FSM decision rather than guessing, because it changes the operator's
+  own two-machine test recipe.
 
 **Honest limits:**
-- The app is **not yet functional end to end**: there is no capture, session layer or GUI, and
-  `serve_host` is still not wired into `tornect host`.
-- The whole Windows binary has not been built.
-- `m1` is not tagged.
-- CI has still never run.
-- The slice review was the light A′ variant, without the adversarial refutation pass.
+- **`serve_host` is still not wired into `tornect host`.** That remains the critical path, and
+  it is now blocked only on the decision above.
+- The app is **not yet functional end to end**: no capture, no session layer, no GUI.
+- The whole Windows binary has not been built. `m1` is not tagged. CI has still never run.
+- Nothing was pushed this session.
+- No live-Tor run was performed this session; the changes are covered by the FSM's in-process
+  duplex tests, not by a new over-Tor exercise.

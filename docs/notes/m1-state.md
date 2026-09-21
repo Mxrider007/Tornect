@@ -352,7 +352,37 @@ Requirements the session layer inherits from the review (SLICE-A2 / A1 G3):
 - no unbound 4001 stream may keep a circuit alive.
 
 Also latent: `KillSwitch` latches — nothing resets it after one kill. It must become per-session,
-or be reset, when `serve_host` is wired.
+or be reset, when `serve_host` is wired. — **FIXED 2026-09-21 in `94dfe64`; see the session
+below.**
+
+## Session 2026-09-21 (3) — kill switch unlatched, SessionSink seam
+
+Resumed at `51458f7`. Two commits, **not pushed**; gate green at **370 tests**.
+
+- **`94dfe64` `fix(signal)`: the kill switch is per-session.** `KillSwitch` held one
+  `watch<Option<u16>>` for the host's lifetime, so the first kill latched `Some(reason)`
+  for good; `established()` polls it first in a biased `select!`, so every session accepted
+  after a master-off / revoke-all / panic / emergency stop was `BYE`d on entry — one kill
+  disabled hosting until the process restarted. It now carries a **generation counter**;
+  `serve_host` calls `KillSwitch::arm()` **at accept time** and the returned `KillGuard` fires
+  only for a kill with a newer generation. Arming at accept (not in `established()`) keeps a
+  kill fired *during* a handshake effective, so the panic key still reaches a session that has
+  not got to `Established`. Refusing *new* access after a master-off stays the grant store's
+  job, so dropping the latch does not widen what is accepted. Failing-first proven: the
+  regression test fails on the old code with `Frame(Io(Kind(BrokenPipe)))`.
+- **`34f4723` `feat(signal)`: the `SessionSink` seam.** `HostDeps.sessions: Arc<dyn SessionSink>`.
+  `on_start(&LiveSession)` after `SESSION_ACCEPT` and `th_final` (device, label, session id,
+  **session token** — the M1-41 `Bind` key input — `th_final`, mode, `unattended`);
+  `on_end(session_id, Option<&SessionEnd>)` as soon as `established` returns and **before the
+  error propagates**. Exactly one `on_end` per `on_start`, so capture can hang off the pair as
+  acquire/release. `NoSessionSink` is the default — M1 behaviour unchanged.
+- **`serve_host` is still NOT wired into `tornect host`**, blocked on one operator decision:
+  the FSM needs pairing, so the zero-setup `tornect ping` liveness check cannot survive
+  unchanged. The options and the recommendation are at the top of `docs/notes/CONTINUATION.md`.
+  Until the wiring lands, the panic key and IPC `Panic` still do not end live sessions.
+- Lints that bit new code: `collapsible_if` (use an edition-2024 let-chain) and
+  `type_complexity` (a 5-tuple in a test recorder → named struct). Both surfaced only at the
+  gate's clippy step, after a `cargo check` had been clean.
 
 ## Gotchas (dev VM mx-vm)
 
