@@ -23,7 +23,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tornect_core::DeviceId;
 use tornect_core::session_log::SessionMode;
-use tornect_core::unattended::guard::AdminEffect;
+use tornect_core::unattended::guard::{AdminEffect, RemoteSessionActivity};
 use zeroize::Zeroizing;
 
 use super::{
@@ -414,6 +414,99 @@ pub struct NoSessionSink;
 impl SessionSink for NoSessionSink {
     fn on_start(&self, _: &LiveSession<'_>) {}
     fn on_end(&self, _: &str, _: Option<&SessionEnd>) {}
+}
+
+/// The sessions live on this host. The [`SessionSink`] calls feed it, and it
+/// answers two questions: [`SessionActivity`] for the FSM, which rejects popups
+/// `BUSY` while a session is live (§B.8.16), and
+/// [`RemoteSessionActivity`] for the `MutationGuard`, which refuses
+/// access-increasing changes during a remote session and for a minute after
+/// (§B.8.6.2).
+///
+/// Serving all three roles from one instance means the popups the FSM
+/// suppresses, the changes the guard refuses and the sessions the sink was told
+/// about can never disagree. The layer that runs sessions (the CLI now,
+/// `tornect-session` from M4) forwards its own `on_start` / `on_end` here.
+#[derive(Debug, Default)]
+pub struct LiveSessions {
+    state: std::sync::Mutex<LiveState>,
+}
+
+#[derive(Debug, Default)]
+struct LiveState {
+    live: Vec<LiveEntry>,
+    last_ended: Option<std::time::Instant>,
+}
+
+/// One live session, as [`LiveSessions::snapshot`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveEntry {
+    /// [`SessionToken::session_id`].
+    pub session_id: String,
+    /// The peer.
+    pub device: DeviceId,
+    /// Its pinned label.
+    pub label: String,
+    /// Control or view-only.
+    pub mode: SessionMode,
+    /// Whether it is an unattended session.
+    pub unattended: bool,
+}
+
+impl LiveSessions {
+    /// No session live, none ever ended.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The sessions live right now, oldest first.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<LiveEntry> {
+        crate::pairing::lock(&self.state).live.clone()
+    }
+
+    /// How many sessions are live.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        crate::pairing::lock(&self.state).live.len()
+    }
+}
+
+impl SessionSink for LiveSessions {
+    fn on_start(&self, session: &LiveSession<'_>) {
+        crate::pairing::lock(&self.state).live.push(LiveEntry {
+            session_id: session.session_id.to_owned(),
+            device: session.device,
+            label: session.label.to_owned(),
+            mode: session.mode,
+            unattended: session.unattended,
+        });
+    }
+
+    fn on_end(&self, session_id: &str, _: Option<&SessionEnd>) {
+        let mut state = crate::pairing::lock(&self.state);
+        state.live.retain(|s| s.session_id != session_id);
+        // Set even for an id this tracker never saw: a later end only lengthens
+        // the guard's cool-down, which errs on the refusing side.
+        state.last_ended = Some(std::time::Instant::now());
+    }
+}
+
+impl SessionActivity for LiveSessions {
+    fn session_live(&self) -> bool {
+        !crate::pairing::lock(&self.state).live.is_empty()
+    }
+}
+
+impl RemoteSessionActivity for LiveSessions {
+    fn last_session_ended_at(&self) -> Option<std::time::Instant> {
+        crate::pairing::lock(&self.state).last_ended
+    }
+
+    fn session_live(&self) -> bool {
+        !crate::pairing::lock(&self.state).live.is_empty()
+    }
 }
 
 /// Everything the host FSM is injected with.

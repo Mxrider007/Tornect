@@ -3,9 +3,12 @@
 //! Client → host: one frame `"TORNECT-PING/1" ‖ nonce[8]`.
 //! Host → client: one frame `"TORNECT-PONG/1" ‖ nonce[8]` echoing the nonce.
 //!
-//! This exists only to prove the Tor path end to end; the CBOR envelope
-//! `PING`/`PONG` kinds (`docs/PLAN.md` §B.3) replace it once the envelope track
-//! lands. Frames come from [`crate::framing`].
+//! It proves the Tor path end to end without pairing. `tornect host` answers
+//! it beside the handshake FSM on the same port, routed by the first frame
+//! ([`crate::dispatch`], decision M1-42), so a two-machine bring-up can tell
+//! "is Tor reachable?" apart from "is pairing working?"; the CBOR envelope
+//! `PING`/`PONG` kinds (`docs/PLAN.md` §B.3) serve established sessions.
+//! Frames come from [`crate::framing`].
 
 use std::io::ErrorKind;
 use std::time::Duration;
@@ -48,6 +51,13 @@ pub const MAX_PINGS_PER_SESSION: u32 = 100;
 
 const MAGIC_LEN: usize = PING_MAGIC.len();
 const MSG_LEN: usize = MAGIC_LEN + NONCE_LEN;
+
+/// Whether a frame payload is a ping request: exactly the magic and a nonce.
+/// [`crate::dispatch`] routes a signaling stream on its first frame with this.
+#[must_use]
+pub fn is_ping(payload: &[u8]) -> bool {
+    payload.len() == MSG_LEN && payload[..MAGIC_LEN] == PING_MAGIC[..]
+}
 
 /// Bounds on one [`serve`] session; see [`ServeLimits::default`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,7 +174,7 @@ where
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => return Err(expired("waiting for the next ping")),
         };
-        if frame.len() != MSG_LEN || frame[..MAGIC_LEN] != PING_MAGIC[..] {
+        if !is_ping(&frame) {
             return Err(SignalError::Protocol(
                 "unexpected frame from client (not a TORNECT-PING/1 frame)".to_owned(),
             ));

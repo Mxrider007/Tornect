@@ -18,8 +18,9 @@ use super::client::{
     ClientConfig, ClientDeps, ClientOutcome, Intent, ScriptedClientUi, SessionEvent, connect,
 };
 use super::host::{
-    HostConfig, HostDeps, HostOutcome, KillSwitch, LiveSession, SessionActivity, SessionEnd,
-    SessionSink, StopTokenCheck, UnattendedContext, UnattendedHook, UnattendedVerdict, serve_host,
+    HostConfig, HostDeps, HostOutcome, KillSwitch, LiveSession, LiveSessions, SessionActivity,
+    SessionEnd, SessionSink, StopTokenCheck, UnattendedContext, UnattendedHook, UnattendedVerdict,
+    serve_host,
 };
 use super::vectors::host_device_pk;
 use super::*;
@@ -517,6 +518,93 @@ async fn pairing_then_attended_session_ping_bye() {
         HostOutcome::Session { paired_now, .. } => assert!(!paired_now),
         other => panic!("unexpected outcome {other:?}"),
     }
+}
+
+/// One [`LiveSessions`] drives the FSM's `BUSY` answers and the guard's view
+/// of a remote session. While a session runs, a second device's pairing popup
+/// is suppressed and both views say "live"; once it ends, the guard's view
+/// knows when, and the next device gets its popup.
+#[tokio::test]
+async fn the_live_session_tracker_drives_busy_and_the_guard_view() {
+    use tornect_core::unattended::guard::RemoteSessionActivity;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_b = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let live = Arc::new(LiveSessions::new());
+    host.deps.sessions = live.clone();
+    host.deps.activity = live.clone();
+    host.consent
+        .push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+    host.consent
+        .push_session(SessionScript::Decide(SessionDecision::AllowOnceViewOnly));
+    let a = client_side(tmp.path(), host.identity.id(), CLIENT_SEED);
+    let b = client_side(tmp_b.path(), host.identity.id(), [0x33; 32]);
+
+    let (x, y) = pipe();
+    let host_task = spawn_host(x, &host);
+    let mut session = match connect(y, &a.cfg, &a.identity, &a.deps, Intent::Session)
+        .await
+        .unwrap()
+    {
+        ClientOutcome::Session(s) => s,
+        other => panic!("expected a session, got {other:?}"),
+    };
+    // The host answers PINGs only once `on_start` has run.
+    session.ping().await.unwrap();
+    let snapshot = live.snapshot();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].session_id, session.session_token().session_id());
+    assert_eq!(snapshot[0].device, a.identity.id());
+    assert_eq!(snapshot[0].label, "Laptop of Ana");
+    assert_eq!(snapshot[0].mode, SessionMode::ViewOnly);
+    assert!(!snapshot[0].unattended);
+    assert!(SessionActivity::session_live(&*live));
+    assert!(RemoteSessionActivity::session_live(&*live));
+    assert!(live.last_session_ended_at().is_none());
+
+    // A second device asks to pair while the session is live: BUSY, no popup.
+    let (x, y) = pipe();
+    let busy_task = spawn_host(x, &host);
+    let err = connect(y, &b.cfg, &b.identity, &b.deps, Intent::Session)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HandshakeError::PairRejected { reason, .. } if reason == pair_reject::BUSY),
+        "{err}"
+    );
+    assert!(matches!(
+        busy_task.await.unwrap().unwrap(),
+        HostOutcome::PairRejected { reason, .. } if reason == pair_reject::BUSY
+    ));
+    assert_eq!(
+        host.consent.sas_shown().len(),
+        1,
+        "no popup during a session"
+    );
+
+    // The session ends: nothing is live, and the guard's cool-down has a start.
+    session.bye(bye::USER).await.unwrap();
+    host_task.await.unwrap().unwrap();
+    assert_eq!(live.count(), 0);
+    assert!(!SessionActivity::session_live(&*live));
+    assert!(!RemoteSessionActivity::session_live(&*live));
+    assert!(live.last_session_ended_at().is_some());
+
+    // The second device now gets its popup (and a Deny).
+    host.consent
+        .push_pairing(PairScript::Decide(PairDecision::Reject));
+    let (x, y) = pipe();
+    let denied_task = spawn_host(x, &host);
+    let err = connect(y, &b.cfg, &b.identity, &b.deps, Intent::Session)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HandshakeError::PairRejected { reason, .. } if reason == pair_reject::DENIED),
+        "{err}"
+    );
+    denied_task.await.unwrap().unwrap();
+    assert_eq!(host.consent.sas_shown().len(), 2, "the popup is back");
 }
 
 #[tokio::test]
