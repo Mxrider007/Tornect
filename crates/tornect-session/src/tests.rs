@@ -1,0 +1,852 @@
+//! The media layer end to end over in-process pipes: the requirements of
+//! SLICE-A2 A2-3/A2-4/A2-6 and SLICE-A1 G3, each pinned by a test, and one
+//! run through the real handshake FSM.
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, duplex};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tornect_capture::{CaptureError, Frame, TestCard, VideoSource};
+use tornect_codec::{DecodedFrame, EncoderSettings, H264Encoder};
+use tornect_core::session_log::SessionMode;
+use tornect_core::{DeviceId, DeviceIdentity, HostIdentity};
+use tornect_input::{InputError, InputEvent, InputSink};
+use tornect_proto::{Msg, codec, read_msg, reason, video_flags, write_msg};
+use tornect_signal::consent::SessionToken;
+use tornect_signal::fsm::client::{
+    self, ClientConfig, ClientDeps, ClientOutcome, Intent, ScriptedClientUi, SessionEvent,
+};
+use tornect_signal::fsm::host::{
+    HostConfig, HostDeps, LiveSession, SessionEnd, SessionSink, serve_host,
+};
+use tornect_signal::messages::bye;
+use tornect_signal::pairing::{
+    KnownHostStore, PairDecision, PairScript, ScriptedConsent, SessionDecision, SessionScript,
+    TrustedDeviceStore,
+};
+
+use crate::viewer::BoundStream;
+use crate::*;
+
+const WAIT: Duration = Duration::from_secs(10);
+const KEY_A: u32 = 0x07_0004;
+
+/// A test card that says when it was closed.
+struct Card {
+    inner: TestCard,
+    closed: Arc<AtomicBool>,
+}
+
+impl VideoSource for Card {
+    fn name(&self) -> &'static str {
+        "card"
+    }
+
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+        self.inner.next_frame(timeout)
+    }
+}
+
+impl Drop for Card {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Records what is injected.
+#[derive(Clone, Default)]
+struct Recorder(Arc<Mutex<Vec<InputEvent>>>);
+
+impl Recorder {
+    fn events(&self) -> Vec<InputEvent> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl InputSink for Recorder {
+    fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+        self.0.lock().unwrap().push(*event);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct TestBackend {
+    fail: bool,
+    closed: Arc<AtomicBool>,
+    sources: AtomicUsize,
+    injectors: AtomicUsize,
+    recorder: Recorder,
+}
+
+impl MediaBackend for TestBackend {
+    fn open_source(&self) -> Result<Box<dyn VideoSource>, CaptureError> {
+        self.sources.fetch_add(1, Ordering::SeqCst);
+        if self.fail {
+            return Err(CaptureError::Unavailable("no screen here".into()));
+        }
+        Ok(Box::new(Card {
+            // Faster than the encoder's 15 fps, so the encoder sets the pace.
+            inner: TestCard::new(256, 96, 60),
+            closed: Arc::clone(&self.closed),
+        }))
+    }
+
+    fn open_injector(&self) -> Option<Box<dyn InputSink>> {
+        self.injectors.fetch_add(1, Ordering::SeqCst);
+        Some(Box::new(self.recorder.clone()))
+    }
+}
+
+#[derive(Default)]
+struct Seen(Mutex<Vec<String>>);
+
+impl Seen {
+    fn lines(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl MediaObserver for Seen {
+    fn capture_started(&self, s: &CaptureStarted<'_>) {
+        self.0.lock().unwrap().push(format!(
+            "started {} {}x{} {:?} input={}",
+            s.source, s.width, s.height, s.mode, s.input
+        ));
+    }
+
+    fn capture_stopped(&self, _: &str, _: &MediaReport, end: &MediaEnd) {
+        self.0.lock().unwrap().push(format!("stopped {end:?}"));
+    }
+}
+
+struct Rig {
+    host: Arc<MediaHost>,
+    backend: Arc<TestBackend>,
+    seen: Arc<Seen>,
+}
+
+fn rig(limits: MediaLimits) -> Rig {
+    rig_with(TestBackend::default(), limits)
+}
+
+fn rig_with(backend: TestBackend, limits: MediaLimits) -> Rig {
+    let backend = Arc::new(backend);
+    let seen = Arc::new(Seen::default());
+    Rig {
+        host: Arc::new(MediaHost::new(backend.clone(), seen.clone(), limits)),
+        backend,
+        seen,
+    }
+}
+
+/// Register a session as the FSM does, and return what its viewer binds with.
+fn start(host: &MediaHost, seed: u8, mode: SessionMode) -> (String, Binding) {
+    let token = SessionToken::new([seed; 32]);
+    let th_final = [!seed; 32];
+    let session_id = token.session_id();
+    host.on_start(&LiveSession {
+        device: DeviceId::from_bytes([seed; 32]),
+        label: "Laptop",
+        session_id: &session_id,
+        token: &token,
+        th_final,
+        mode,
+        unattended: false,
+    });
+    (session_id, Binding::new(&token, &th_final))
+}
+
+/// A media stream to `host`, served on its own task.
+fn connect(host: &Arc<MediaHost>) -> (DuplexStream, JoinHandle<MediaOutcome>) {
+    let (client, server) = duplex(1 << 20);
+    let host = Arc::clone(host);
+    (
+        client,
+        tokio::spawn(async move { host.serve(server).await }),
+    )
+}
+
+/// Bind by hand and return `BindOk`'s mode byte.
+async fn bind_raw(client: &mut DuplexStream, binding: &Binding) -> u8 {
+    write_msg(client, &binding.msg()).await.unwrap();
+    match read_msg(client).await.unwrap() {
+        Some(Msg::BindOk { mode, .. }) => mode,
+        other => panic!("expected BindOk, got {other:?}"),
+    }
+}
+
+/// The next `Video` frame's `(seq, flags)`, skipping anything else.
+async fn next_video(client: &mut DuplexStream) -> (u32, u8) {
+    loop {
+        match tokio::time::timeout(WAIT, read_msg(client))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Some(Msg::Video { seq, flags, .. }) => return (seq, flags),
+            Some(_) => {}
+            None => panic!("stream closed"),
+        }
+    }
+}
+
+/// Read until `Close` (its reason) or the end of the stream (`None`).
+async fn until_close(client: &mut DuplexStream) -> Option<u16> {
+    loop {
+        match tokio::time::timeout(WAIT, read_msg(client))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Some(Msg::Close { reason }) => return Some(reason),
+            Some(_) => {}
+            None => return None,
+        }
+    }
+}
+
+/// A round trip: once the `Pong` is back, the host has handled everything
+/// sent before the `Ping`.
+async fn sync(client: &mut DuplexStream, nonce: u64) {
+    write_msg(client, &Msg::Ping { nonce }).await.unwrap();
+    loop {
+        match tokio::time::timeout(WAIT, read_msg(client))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Some(Msg::Pong { nonce: n }) if n == nonce => return,
+            Some(_) => {}
+            None => panic!("stream closed"),
+        }
+    }
+}
+
+/// Collects the card indices of what it decodes; says when it has `want`.
+#[derive(Default)]
+struct Pictures {
+    indices: Vec<u32>,
+    sizes: Vec<(u32, u32)>,
+    want: usize,
+    done: Option<oneshot::Sender<()>>,
+}
+
+impl Pictures {
+    fn wanting(want: usize) -> (Self, oneshot::Receiver<()>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            Self {
+                want,
+                done: Some(tx),
+                ..Self::default()
+            },
+            rx,
+        )
+    }
+}
+
+impl FrameSink for Pictures {
+    fn picture(&mut self, _seq: u32, frame: &DecodedFrame) {
+        self.sizes.push((frame.width, frame.height));
+        // RGBA keeps green at offset 1, as BGRx does.
+        if let Some(index) = TestCard::read_index(&frame.rgba, frame.width, frame.height) {
+            self.indices.push(index);
+        }
+        if self.indices.len() >= self.want
+            && let Some(done) = self.done.take()
+        {
+            let _ = done.send(());
+        }
+    }
+}
+
+/// The card goes out in order and comes back decoded, every picture, sized
+/// from the pictures themselves; capture stops when the viewer leaves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_test_card_reaches_the_viewer_in_order() {
+    let rig = rig(MediaLimits::default());
+    let (_, binding) = start(&rig.host, 1, SessionMode::Control);
+    let (client, served) = connect(&rig.host);
+    let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
+    assert_eq!(
+        *viewer.bound(),
+        BoundStream {
+            width: 256,
+            height: 96,
+            mode: SessionMode::Control
+        }
+    );
+    let (mut pictures, done) = Pictures::wanting(10);
+    let mut stats = ViewerStats::default();
+    let end = viewer
+        .run(&mut pictures, &mut stats, async {
+            let _ = done.await;
+        })
+        .await
+        .unwrap();
+    assert_eq!(end, ViewerEnd::Stopped);
+
+    assert!(pictures.indices.len() >= 10, "{:?}", pictures.indices);
+    assert_eq!(
+        pictures.indices[0], 0,
+        "the first picture is the first captured"
+    );
+    for pair in pictures.indices.windows(2) {
+        assert_eq!(
+            pair[1],
+            pair[0] + 1,
+            "in order, none lost: {:?}",
+            pictures.indices
+        );
+    }
+    assert!(pictures.sizes.iter().all(|&size| size == (256, 96)));
+    assert_eq!(stats.decode_errors, 0);
+    assert!(stats.keyframes >= 1, "the stream starts with an IDR");
+
+    let MediaOutcome::Served { report, end, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!(end, MediaEnd::ViewerLeft);
+    assert!(report.frames_sent >= 10);
+    assert!(rig.backend.closed.load(Ordering::SeqCst), "capture stopped");
+    assert_eq!(
+        rig.seen.lines(),
+        [
+            "started card 256x96 Control input=true",
+            "stopped ViewerLeft"
+        ]
+    );
+}
+
+/// SLICE-A2 A2-3: a view-only session has no injector, so its input is dropped
+/// before anything decodes it. Bytes no decoder would accept break nothing,
+/// which is the proof that none was decoded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_only_input_is_never_decoded_or_injected() {
+    let rig = rig(MediaLimits::default());
+    let (_, binding) = start(&rig.host, 2, SessionMode::ViewOnly);
+    let (mut client, served) = connect(&rig.host);
+    assert_eq!(
+        bind_raw(&mut client, &binding).await,
+        1,
+        "BindOk says view-only"
+    );
+    let key = InputEvent::Key {
+        usb: KEY_A,
+        pressed: true,
+    };
+    for i in 0..40 {
+        let bytes = if i % 2 == 0 { key.encode() } else { [0xff; 16] };
+        write_msg(&mut client, &Msg::Input(bytes)).await.unwrap();
+    }
+    write_msg(
+        &mut client,
+        &Msg::Close {
+            reason: reason::ENDED_BY_VIEWER,
+        },
+    )
+    .await
+    .unwrap();
+
+    let MediaOutcome::Served { report, end, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!(
+        end,
+        MediaEnd::ViewerLeft,
+        "no protocol error: nothing was decoded"
+    );
+    assert_eq!((report.input_injected, report.input_dropped), (0, 40));
+    assert_eq!(
+        rig.backend.injectors.load(Ordering::SeqCst),
+        0,
+        "no injector was opened"
+    );
+    assert!(rig.backend.recorder.events().is_empty());
+    assert_eq!(
+        rig.seen.lines()[0],
+        "started card 256x96 ViewOnly input=false"
+    );
+}
+
+/// SLICE-A2 A2-3 and the hand-off's release rule: control input is rate
+/// capped, and a key still held when the panic key ends the session is
+/// released on the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_input_is_capped_and_released_when_the_session_is_killed() {
+    // A bucket of five that never refills: exactly five events get through.
+    let rig = rig(MediaLimits {
+        input_rate: 0,
+        input_burst: 5,
+        ..MediaLimits::default()
+    });
+    let (session_id, binding) = start(&rig.host, 3, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    assert_eq!(
+        bind_raw(&mut client, &binding).await,
+        0,
+        "BindOk says control"
+    );
+    let press = InputEvent::Key {
+        usb: KEY_A,
+        pressed: true,
+    };
+    write_msg(&mut client, &Msg::Input(press.encode()))
+        .await
+        .unwrap();
+    for i in 0..20u16 {
+        let moved = InputEvent::PointerMove { x: i, y: i };
+        write_msg(&mut client, &Msg::Input(moved.encode()))
+            .await
+            .unwrap();
+    }
+    sync(&mut client, 7).await;
+
+    // The FSM's end of a killed session.
+    rig.host
+        .on_end(&session_id, Some(&SessionEnd::Killed(bye::PANIC)));
+    assert_eq!(until_close(&mut client).await, Some(reason::ENDED_BY_HOST));
+
+    let MediaOutcome::Served { report, end, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!(end, MediaEnd::SessionOver(reason::ENDED_BY_HOST));
+    assert_eq!((report.input_injected, report.input_dropped), (5, 16));
+    let events = rig.backend.recorder.events();
+    assert_eq!(events.len(), 6, "{events:?}");
+    assert_eq!(events[0], press);
+    assert_eq!(
+        events[5],
+        InputEvent::Key {
+            usb: KEY_A,
+            pressed: false
+        },
+        "the held key is released when the session ends"
+    );
+    assert!(rig.backend.closed.load(Ordering::SeqCst), "capture stopped");
+    assert_eq!(rig.host.live(), 0);
+}
+
+/// SLICE-B1 B1-2: a kill stops capture at once, before the FSM has finished its
+/// `BYE` (here, before `on_end` is called at all), and a killed session that
+/// has not bound its media yet cannot bind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_stops_capture_without_waiting_for_the_fsm() {
+    let rig = rig(MediaLimits::default());
+    let kill = tornect_signal::fsm::host::KillSwitch::new();
+    let watcher = rig.host.watch_kill(kill.clone());
+    let (_, streaming) = start(&rig.host, 12, SessionMode::Control);
+    let (_, unbound) = start(&rig.host, 13, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &streaming).await;
+    next_video(&mut client).await;
+
+    kill.kill(bye::PANIC);
+    assert_eq!(until_close(&mut client).await, Some(reason::ENDED_BY_HOST));
+    assert!(matches!(
+        served.await.unwrap(),
+        MediaOutcome::Served {
+            end: MediaEnd::SessionOver(r),
+            ..
+        } if r == reason::ENDED_BY_HOST
+    ));
+    assert!(rig.backend.closed.load(Ordering::SeqCst), "capture stopped");
+    assert_eq!(
+        rig.host.live(),
+        2,
+        "the FSM has not ended either session yet"
+    );
+
+    let (late, served) = connect(&rig.host);
+    let refused = MediaViewer::bind(late, &unbound, WAIT).await.unwrap_err();
+    assert!(matches!(refused, ViewerError::Refused(r) if r == reason::BAD_BIND));
+    assert_eq!(served.await.unwrap(), MediaOutcome::NotBound);
+    watcher.abort();
+}
+
+/// SLICE-A1 G3 / A2-3: one media stream per session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bind_is_single_use() {
+    let rig = rig(MediaLimits::default());
+    let (_, binding) = start(&rig.host, 4, SessionMode::Control);
+    let (first, first_served) = connect(&rig.host);
+    let viewer = MediaViewer::bind(first, &binding, WAIT).await.unwrap();
+
+    let (second, second_served) = connect(&rig.host);
+    let refused = MediaViewer::bind(second, &binding, WAIT).await.unwrap_err();
+    assert!(
+        matches!(refused, ViewerError::Refused(r) if r == reason::BAD_BIND),
+        "{refused:?}"
+    );
+    assert_eq!(second_served.await.unwrap(), MediaOutcome::NotBound);
+    assert_eq!(rig.backend.sources.load(Ordering::SeqCst), 1, "one capture");
+
+    drop(viewer);
+    assert!(matches!(
+        first_served.await.unwrap(),
+        MediaOutcome::Served {
+            end: MediaEnd::ViewerLeft,
+            ..
+        }
+    ));
+}
+
+/// A wrong MAC binds nothing, and it does not burn the session for the real
+/// viewer either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wrong_mac_neither_binds_nor_locks_the_viewer_out() {
+    let rig = rig(MediaLimits::default());
+    let (_, binding) = start(&rig.host, 5, SessionMode::Control);
+    // Same token (so the same session id), another transcript: another MAC.
+    let forged = Binding::new(&SessionToken::new([5; 32]), &[0; 32]);
+    assert_eq!(forged.session_id(), binding.session_id());
+
+    let (client, served) = connect(&rig.host);
+    let refused = MediaViewer::bind(client, &forged, WAIT).await.unwrap_err();
+    assert!(matches!(refused, ViewerError::Refused(r) if r == reason::BAD_BIND));
+    assert_eq!(served.await.unwrap(), MediaOutcome::NotBound);
+    assert_eq!(
+        rig.backend.sources.load(Ordering::SeqCst),
+        0,
+        "nothing captured"
+    );
+
+    let (client, served) = connect(&rig.host);
+    let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
+    drop(viewer);
+    assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
+}
+
+/// SLICE-A1 G3: a stream that never binds is dropped at the deadline, and a
+/// `Bind` for a session that never starts is refused then; nothing is captured.
+#[tokio::test(start_paused = true)]
+async fn unbound_streams_end_at_the_bind_deadline() {
+    let rig = rig(MediaLimits::default());
+    let deadline = MediaLimits::default().bind_deadline;
+
+    let (mut silent, served) = connect(&rig.host);
+    let t0 = tokio::time::Instant::now();
+    assert_eq!(served.await.unwrap(), MediaOutcome::NotBound);
+    assert!(t0.elapsed() >= deadline);
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        silent.read(&mut byte).await.unwrap(),
+        0,
+        "closed, unanswered"
+    );
+
+    let ghost = Binding::new(&SessionToken::new([6; 32]), &[6; 32]);
+    let (mut client, served) = connect(&rig.host);
+    write_msg(&mut client, &ghost.msg()).await.unwrap();
+    let t0 = tokio::time::Instant::now();
+    assert_eq!(served.await.unwrap(), MediaOutcome::NotBound);
+    assert!(t0.elapsed() >= deadline - Duration::from_millis(1));
+    assert_eq!(
+        read_msg(&mut client).await.unwrap(),
+        Some(Msg::BindRefused {
+            reason: reason::BAD_BIND
+        })
+    );
+    assert_eq!(rig.backend.sources.load(Ordering::SeqCst), 0);
+}
+
+/// Unbound streams are capped too: one beyond the cap is closed unread.
+#[tokio::test(start_paused = true)]
+async fn waiting_streams_beyond_the_cap_are_closed_unread() {
+    let rig = rig(MediaLimits {
+        max_unbound: 2,
+        ..MediaLimits::default()
+    });
+    let (_a, a) = connect(&rig.host);
+    let (_b, b) = connect(&rig.host);
+    tokio::task::yield_now().await;
+    let (_c, c) = connect(&rig.host);
+    assert_eq!(c.await.unwrap(), MediaOutcome::Busy);
+    assert_eq!(a.await.unwrap(), MediaOutcome::NotBound);
+    assert_eq!(b.await.unwrap(), MediaOutcome::NotBound);
+}
+
+/// The FSM registers a session just after sending `SESSION_ACCEPT`; a viewer
+/// that binds in between waits instead of being refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bind_that_beats_the_registration_waits_for_it() {
+    let rig = rig(MediaLimits::default());
+    let token = SessionToken::new([7; 32]);
+    let th_final = [8; 32];
+    let binding = Binding::new(&token, &th_final);
+    let (client, served) = connect(&rig.host);
+    let bind = tokio::spawn(async move { MediaViewer::bind(client, &binding, WAIT).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!bind.is_finished(), "no answer before the session exists");
+
+    let session_id = token.session_id();
+    rig.host.on_start(&LiveSession {
+        device: DeviceId::from_bytes([7; 32]),
+        label: "Laptop",
+        session_id: &session_id,
+        token: &token,
+        th_final,
+        mode: SessionMode::Control,
+        unattended: false,
+    });
+    let viewer = bind.await.unwrap().unwrap();
+    drop(viewer);
+    assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
+}
+
+/// SLICE-A2 A2-6: the host sends at most the window's worth of video before
+/// the viewer acknowledges, and one more per acknowledged unit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unacknowledged_video_stops_at_the_window() {
+    let rig = rig(MediaLimits {
+        window_frames: 3,
+        ..MediaLimits::default()
+    });
+    let (_, binding) = start(&rig.host, 9, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    for want in 0..3 {
+        assert_eq!(next_video(&mut client).await.0, want);
+    }
+    // At 15 fps, an unbounded host would send ~7 more in half a second.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), read_msg(&mut client))
+            .await
+            .is_err(),
+        "nothing beyond the window"
+    );
+    write_msg(&mut client, &Msg::VideoAck { seq: 0 })
+        .await
+        .unwrap();
+    assert_eq!(next_video(&mut client).await.0, 3, "one ack, one more");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), read_msg(&mut client))
+            .await
+            .is_err()
+    );
+    drop(client);
+    assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
+}
+
+/// A `KeyframeRequest` forces an IDR soon after, and a second one within the
+/// interval is counted but forces nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_keyframe_request_forces_an_idr_at_a_bounded_rate() {
+    let rig = rig(MediaLimits::default());
+    let (_, binding) = start(&rig.host, 10, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    for _ in 0..3 {
+        let (seq, _) = next_video(&mut client).await;
+        write_msg(&mut client, &Msg::VideoAck { seq })
+            .await
+            .unwrap();
+    }
+    write_msg(&mut client, &Msg::KeyframeRequest).await.unwrap();
+    write_msg(&mut client, &Msg::KeyframeRequest).await.unwrap();
+    let mut idr = false;
+    // One picture may already be in the encoder when the request lands.
+    for _ in 0..3 {
+        let (seq, flags) = next_video(&mut client).await;
+        write_msg(&mut client, &Msg::VideoAck { seq })
+            .await
+            .unwrap();
+        if flags & video_flags::KEYFRAME != 0 {
+            idr = true;
+            break;
+        }
+    }
+    assert!(idr, "no IDR after a KeyframeRequest");
+    drop(client);
+    let MediaOutcome::Served { report, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!((report.keyframe_requests, report.keyframes_forced), (2, 1));
+}
+
+/// The first frame is read at a `Bind`'s size: a peer announcing 8 MiB gets a
+/// refusal, not an allocation.
+#[tokio::test]
+async fn a_first_frame_that_is_not_a_bind_is_refused_unread() {
+    let rig = rig(MediaLimits::default());
+    let (mut client, served) = connect(&rig.host);
+    client.write_all(&(8u32 << 20).to_be_bytes()).await.unwrap();
+    assert_eq!(served.await.unwrap(), MediaOutcome::NotBound);
+    assert_eq!(
+        read_msg(&mut client).await.unwrap(),
+        Some(Msg::BindRefused {
+            reason: reason::PROTOCOL
+        })
+    );
+}
+
+/// Capture that cannot start refuses the bind, says why, and starts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capture_that_cannot_start_refuses_the_bind() {
+    let rig = rig_with(
+        TestBackend {
+            fail: true,
+            ..TestBackend::default()
+        },
+        MediaLimits::default(),
+    );
+    let (_, binding) = start(&rig.host, 11, SessionMode::Control);
+    let (client, served) = connect(&rig.host);
+    let refused = MediaViewer::bind(client, &binding, WAIT).await.unwrap_err();
+    assert!(
+        matches!(refused, ViewerError::Refused(r) if r == reason::CAPTURE_FAILED),
+        "{refused:?}"
+    );
+    assert_eq!(
+        served.await.unwrap(),
+        MediaOutcome::NotStarted(MediaEnd::Pipeline(reason::CAPTURE_FAILED))
+    );
+    assert!(
+        rig.seen.lines().is_empty(),
+        "no sharing indicator for nothing shared"
+    );
+}
+
+/// SLICE-A2 A2-4 and the decode-error rule, from the viewer's side: an access
+/// unit that does not decode asks for a keyframe and is still acknowledged.
+#[tokio::test]
+async fn an_undecodable_unit_asks_for_a_keyframe_and_is_still_acknowledged() {
+    let mut encoder = H264Encoder::new(EncoderSettings::default()).unwrap();
+    let _idr = encoder
+        .encode(&TestCard::render(256, 96, 0), 256, 96)
+        .unwrap();
+    let p_frame = encoder
+        .encode(&TestCard::render(256, 96, 1), 256, 96)
+        .unwrap();
+    assert!(!p_frame.keyframe);
+
+    let (client, mut host) = duplex(1 << 20);
+    let fake_host = tokio::spawn(async move {
+        assert!(matches!(
+            read_msg(&mut host).await.unwrap(),
+            Some(Msg::Bind { .. })
+        ));
+        let bind_ok = Msg::BindOk {
+            width: 256,
+            height: 96,
+            codec: codec::H264,
+            mode: 0,
+        };
+        write_msg(&mut host, &bind_ok).await.unwrap();
+        // The P-frame alone: the viewer has no parameter sets to decode it with.
+        let video = Msg::Video {
+            seq: 0,
+            flags: 0,
+            ts_ms: 0,
+            data: p_frame.data,
+        };
+        write_msg(&mut host, &video).await.unwrap();
+        let answers = [
+            read_msg(&mut host).await.unwrap(),
+            read_msg(&mut host).await.unwrap(),
+        ];
+        let close = Msg::Close {
+            reason: reason::ENDED_BY_HOST,
+        };
+        write_msg(&mut host, &close).await.unwrap();
+        answers
+    });
+
+    let binding = Binding::new(&SessionToken::new([1; 32]), &[2; 32]);
+    let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
+    let (mut pictures, _) = Pictures::wanting(usize::MAX);
+    let mut stats = ViewerStats::default();
+    let end = viewer
+        .run(&mut pictures, &mut stats, std::future::pending())
+        .await
+        .unwrap();
+    assert_eq!(end, ViewerEnd::Host(reason::ENDED_BY_HOST));
+    assert_eq!(
+        fake_host.await.unwrap(),
+        [Some(Msg::KeyframeRequest), Some(Msg::VideoAck { seq: 0 })]
+    );
+    assert_eq!(
+        (stats.decoded, stats.decode_errors, stats.keyframe_requests),
+        (0, 1, 1)
+    );
+}
+
+/// Through the real handshake: the FSM's `on_start` registers the session, the
+/// client binds with the handshake's own token and transcript, the card
+/// streams, and the panic key stops capture and ends both streams.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accepted_session_streams_until_the_panic_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let identity = Arc::new(HostIdentity::from_seed(&[0x11; 32]));
+    let trusted = Arc::new(TrustedDeviceStore::with(
+        tmp.path().join("trusted-devices.toml"),
+        tornect_core::trusted::TrustedDevices::default(),
+    ));
+    let consent = Arc::new(ScriptedConsent::new());
+    consent.push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+    consent.push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+    let rig = rig(MediaLimits::default());
+    let mut deps = HostDeps::headless(identity.clone(), trusted);
+    deps.consent = consent;
+    deps.sessions = rig.host.clone();
+    let kill = deps.kill.clone();
+    let cfg = HostConfig::new("Desk", [9; 32]);
+    let (client_end, host_end) = duplex(64 * 1024);
+    let fsm = tokio::spawn(async move { serve_host(host_end, &cfg, &deps).await });
+
+    let known = Arc::new(KnownHostStore::with(
+        tmp.path().join("known-hosts.toml"),
+        tornect_core::trusted::KnownHosts::default(),
+    ));
+    let mut client_deps = ClientDeps::headless(known);
+    client_deps.ui = Arc::new(ScriptedClientUi::new(true));
+    let device = DeviceIdentity::from_seed(&[0x22; 32]);
+    let ccfg = ClientConfig::new(identity.id(), "Laptop");
+    let ClientOutcome::Session(mut session) =
+        client::connect(client_end, &ccfg, &device, &client_deps, Intent::Session)
+            .await
+            .unwrap()
+    else {
+        panic!("no session");
+    };
+    session.send_tor_fallback().await.unwrap();
+
+    let binding = Binding::new(session.session_token(), &session.th());
+    let (media, served) = connect(&rig.host);
+    let viewer = MediaViewer::bind(media, &binding, WAIT).await.unwrap();
+    let (mut pictures, enough) = Pictures::wanting(3);
+    let panic_key = tokio::spawn(async move {
+        let _ = enough.await;
+        kill.kill(bye::PANIC);
+    });
+    let mut stats = ViewerStats::default();
+    let end = viewer
+        .run(&mut pictures, &mut stats, std::future::pending())
+        .await
+        .unwrap();
+    panic_key.await.unwrap();
+    assert_eq!(end, ViewerEnd::Host(reason::ENDED_BY_HOST));
+    assert!(pictures.indices.len() >= 3);
+
+    let MediaOutcome::Served { end, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!(end, MediaEnd::SessionOver(reason::ENDED_BY_HOST));
+    assert!(
+        rig.backend.closed.load(Ordering::SeqCst),
+        "the panic key stopped capture"
+    );
+    assert_eq!(
+        session.next_event(WAIT).await.unwrap(),
+        Some(SessionEvent::Bye {
+            reason: bye::PANIC,
+            detail: None
+        })
+    );
+    fsm.await.unwrap().unwrap();
+    assert_eq!(rig.host.live(), 0);
+}

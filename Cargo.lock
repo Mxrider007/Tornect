@@ -5849,6 +5849,9 @@ dependencies = [
 name = "tornect-session"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
  "tornect-audio",
  "tornect-capture",
  "tornect-codec",
@@ -5857,6 +5860,7 @@ dependencies = [
  "tornect-net",
  "tornect-proto",
  "tornect-signal",
+ "tracing",
 ]
 
 [[package]]
