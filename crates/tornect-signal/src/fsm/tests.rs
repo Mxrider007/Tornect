@@ -3524,3 +3524,319 @@ async fn unattended_context_carries_the_block_window_and_local_allow_seams() {
         }
     ));
 }
+
+/// A session popup held open until the test answers it (Allow once), saying
+/// when it opened.
+struct HeldPopup {
+    opened: Arc<tokio::sync::Notify>,
+    answer: Arc<tokio::sync::Notify>,
+}
+
+impl crate::pairing::Consent for HeldPopup {
+    fn pairing<'a>(
+        &'a self,
+        _: &'a crate::pairing::PairingPeer,
+        _: &'a str,
+    ) -> BoxFuture<'a, PairDecision> {
+        Box::pin(async { PairDecision::Reject })
+    }
+
+    fn session<'a>(
+        &'a self,
+        _: &'a crate::pairing::TrustedPeer,
+        _: &'a crate::pairing::SessionRequestSummary,
+    ) -> BoxFuture<'a, SessionDecision> {
+        Box::pin(async move {
+            self.opened.notify_one();
+            self.answer.notified().await;
+            SessionDecision::AllowOnce
+        })
+    }
+}
+
+/// Counts `on_start` calls in front of a tracker.
+#[derive(Default)]
+struct CountingSink {
+    starts: std::sync::atomic::AtomicUsize,
+    live: Arc<LiveSessions>,
+}
+
+impl SessionSink for CountingSink {
+    fn on_start(&self, session: &LiveSession<'_>) {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        self.live.on_start(session);
+    }
+
+    fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
+        self.live.on_end(session_id, end);
+    }
+}
+
+/// A host whose paired client is `CLIENT_SEED`, with the popup held open by a
+/// [`HeldPopup`] and a counting sink that is also its activity source.
+fn held_popup_host(
+    tmp: &std::path::Path,
+) -> (
+    HostSide,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+    Arc<CountingSink>,
+) {
+    let mut host = host_side(tmp, HOST_SEED);
+    let (opened, answer) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    host.deps.consent = Arc::new(HeldPopup {
+        opened: opened.clone(),
+        answer: answer.clone(),
+    });
+    let sink = Arc::new(CountingSink::default());
+    host.deps.sessions = sink.clone();
+    host.deps.activity = sink.live.clone();
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+    (host, opened, answer, sink)
+}
+
+/// SLICE-B1 B1-3 / SLICE-B2 B2-5 (a): a panic pressed while the session popup
+/// is open refuses the session, even when the owner then clicks Allow. The host
+/// used to send `SESSION_ACCEPT`, log the start and call `on_start` (where
+/// capture begins) before it noticed the kill.
+#[tokio::test]
+async fn a_kill_while_the_popup_is_open_refuses_the_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, opened, answer, sink) = held_popup_host(tmp.path());
+    let kill = KillSwitch::new();
+    host.deps.kill = kill.clone();
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    let asked = tokio::spawn(async move { raw.request_session().await });
+
+    opened.notified().await;
+    kill.kill(bye::PANIC);
+    answer.notify_one();
+    assert_eq!(asked.await.unwrap().env.kind, Kind::SessionReject);
+    match task.await.unwrap().unwrap() {
+        HostOutcome::SessionRejected { reason, .. } => assert_eq!(reason, reject::DENIED),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0, "no on_start");
+}
+
+/// SLICE-B2 B2-5 (b): a session that went live while this popup was open blocks
+/// the accept: one remote session at a time (§B.8.6.4).
+#[tokio::test]
+async fn a_session_that_went_live_during_the_popup_blocks_the_accept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, opened, answer, sink) = held_popup_host(tmp.path());
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    let asked = tokio::spawn(async move { raw.request_session().await });
+
+    opened.notified().await;
+    let other = SessionToken::new([7; 32]);
+    let other_id = other.session_id();
+    sink.live.on_start(&LiveSession {
+        device: DeviceId::from_bytes([7; 32]),
+        label: "Other",
+        session_id: &other_id,
+        token: &other,
+        th_final: [0; 32],
+        mode: SessionMode::Control,
+        unattended: false,
+    });
+    answer.notify_one();
+    assert_eq!(asked.await.unwrap().env.kind, Kind::SessionReject);
+    match task.await.unwrap().unwrap() {
+        HostOutcome::SessionRejected { reason, .. } => assert_eq!(reason, reject::BUSY),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0, "no second on_start");
+    assert_eq!(sink.live.count(), 1);
+}
+
+/// An unattended hook that accepts every request, as a correct password would.
+struct AcceptAll;
+
+impl UnattendedHook for AcceptAll {
+    fn handle<'a>(
+        &'a self,
+        ctx: UnattendedContext<'a>,
+    ) -> BoxFuture<'a, Result<UnattendedVerdict, HandshakeError>> {
+        Box::pin(async move {
+            let policy = PolicyReceipt::mint(
+                [9u8; 8],
+                SessionMode::Control,
+                TransportPolicy::Any,
+                None,
+                0,
+                false,
+                ReadinessSnapshot::default(),
+                None,
+            );
+            Ok(UnattendedVerdict::Accept {
+                proof: ConsentProof::Unattended {
+                    grant: [9u8; 8],
+                    proof_fp: [0u8; 8],
+                    policy,
+                    block: WindowPassed::Skipped,
+                    token: DerivedToken::new([0xA5; 32], [0x5A; 32]),
+                },
+                caps: ChosenCaps::negotiate(&Caps::default(), &ctx.request.caps),
+            })
+        })
+    }
+}
+
+/// SLICE-B1 B1-1: an unattended request that got through its PAKE while another
+/// session is live is refused `SESSION_ACTIVE` (§B.8.4.6 `0x0026`), with no
+/// second session and no `on_start`. Only attended and pairing requests were
+/// answered `BUSY` before.
+#[tokio::test]
+async fn an_unattended_request_while_a_session_is_live_is_session_active() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    host.deps.unattended = Arc::new(AcceptAll);
+    let sink = Arc::new(CountingSink::default());
+    host.deps.sessions = sink.clone();
+    host.deps.activity = sink.live.clone();
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+    let other = SessionToken::new([7; 32]);
+    let other_id = other.session_id();
+    sink.live.on_start(&LiveSession {
+        device: DeviceId::from_bytes([7; 32]),
+        label: "Helper",
+        session_id: &other_id,
+        token: &other,
+        th_final: [0; 32],
+        mode: SessionMode::ViewOnly,
+        unattended: false,
+    });
+
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = raw_unattended_request(&host, CLIENT_SEED, b).await;
+    let rx = raw.recv().await.unwrap();
+    assert_eq!(rx.env.kind, Kind::SessionReject);
+    let refused: messages::SessionReject = decode_body(&rx.env.body).unwrap();
+    assert_eq!(refused.reason, reject::SESSION_ACTIVE);
+    match task.await.unwrap().unwrap() {
+        HostOutcome::SessionRejected { reason, .. } => {
+            assert_eq!(reason, reject::SESSION_ACTIVE);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(sink.live.count(), 1);
+}
+
+/// SLICE-B1 B1-2 / SLICE-B2 B2-1: a kill ends the session at once even while
+/// the host is stuck writing to a peer that stopped reading. The sink and the
+/// log hear of it first, as `Killed` rather than `io`, and the goodbye is tried
+/// after, bounded. Over a 256-byte pipe the unread `PONG`s back up the way
+/// withheld Tor credit does; the host used to wait in that write for good.
+#[tokio::test(start_paused = true)]
+async fn a_kill_ends_the_session_while_a_write_to_the_peer_is_stuck() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    host.cfg.orphan_timeout = None;
+    let kill = KillSwitch::new();
+    host.deps.kill = kill.clone();
+    let live = Arc::new(LiveSessions::new());
+    host.deps.sessions = live.clone();
+    host.deps.activity = live.clone();
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+    host.consent
+        .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+
+    let (a, b) = duplex(256);
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+    // `PING`s whose `PONG`s are never read: about a dozen fill the host's side.
+    for nonce in 0..20u64 {
+        raw.chan.send(&Ping { nonce }, None).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(live.count(), 1, "live, with its host stuck in a write");
+
+    kill.kill(bye::PANIC);
+    let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the kill must not wait for the peer")
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            HostOutcome::Session {
+                end: SessionEnd::Killed(bye::PANIC),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(live.count(), 0);
+    let ended = audit.0.lock().unwrap().iter().find_map(|e| match e {
+        AuditEvent::SessionEnded { detail, .. } => Some(detail.clone()),
+        _ => None,
+    });
+    assert_eq!(ended.as_deref(), Some("Killed(8)"));
+    drop(raw);
+}
+
+/// SLICE-B1 B1-4: a sink that panics inside `on_start` still gets its `on_end`,
+/// and the end is logged: no tracker entry outlives the task that served it.
+#[tokio::test]
+async fn a_sink_that_panics_still_releases_the_session() {
+    struct Panicking(Arc<LiveSessions>);
+    impl SessionSink for Panicking {
+        fn on_start(&self, session: &LiveSession<'_>) {
+            self.0.on_start(session);
+            panic!("the sink failed");
+        }
+
+        fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
+            self.0.on_end(session_id, end);
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let live = Arc::new(LiveSessions::new());
+    host.deps.sessions = Arc::new(Panicking(live.clone()));
+    host.deps.activity = live.clone();
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+    host.consent
+        .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+    assert!(task.await.unwrap_err().is_panic());
+    assert_eq!(live.count(), 0, "released despite the panic");
+    let ended = audit.0.lock().unwrap().iter().find_map(|e| match e {
+        AuditEvent::SessionEnded { detail, .. } => Some(detail.clone()),
+        _ => None,
+    });
+    assert_eq!(ended.as_deref(), Some("aborted"));
+}
