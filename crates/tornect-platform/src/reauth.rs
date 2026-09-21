@@ -122,6 +122,49 @@ pub struct PolkitReAuth {
     action_prefix: String,
     /// How long a dialog may stay open before it is cancelled.
     timeout: std::time::Duration,
+    /// Held while a dialog is open; clones share it. One dialog at a time, and
+    /// never a queue: an op queued behind a dialog that may stay up for
+    /// [`Self::DIALOG_TIMEOUT`] would outlive the CLI's wait for its answer and
+    /// run after the CLI had reported it failed (track D S1/S6). A second
+    /// access-increasing op while one dialog is open is refused at once.
+    dialog: std::sync::Arc<std::sync::Mutex<()>>,
+}
+
+/// `(bba{ss})` — polkit's `CheckAuthorization` answer.
+#[cfg(target_os = "linux")]
+#[derive(Debug, serde::Deserialize, zbus::zvariant::Type)]
+struct AuthorizationResult {
+    is_authorized: bool,
+    is_challenge: bool,
+    details: std::collections::HashMap<String, String>,
+}
+
+/// What an answer means for the operator.
+///
+/// `is_challenge` without `is_authorized`, when the call allowed interaction,
+/// is polkit saying "a password would do, but nothing could ask for one": no
+/// authentication agent serves the subject — an SSH session without
+/// `pkttyagent`, or a host started outside any session. Reporting that as
+/// `Denied` told the operator their password was wrong when no dialog was ever
+/// shown (track D S7).
+#[cfg(target_os = "linux")]
+fn verdict(action_id: &str, result: &AuthorizationResult) -> Result<(), ReAuthError> {
+    if result.is_authorized {
+        return Ok(());
+    }
+    if result.is_challenge {
+        return Err(ReAuthError::Unavailable(format!(
+            "polkit could not show an authentication dialog for `{action_id}`: no \
+             authentication agent is available to the Tornect host (a desktop session \
+             provides one; over SSH, run `pkttyagent` for the host process)"
+        )));
+    }
+    tracing::info!(
+        action_id,
+        dismissed = result.details.contains_key("polkit.dismissed"),
+        "re-authentication was not granted"
+    );
+    Err(ReAuthError::Denied)
 }
 
 #[cfg(target_os = "linux")]
@@ -148,6 +191,7 @@ impl PolkitReAuth {
         Self {
             action_prefix: Self::DEFAULT_PREFIX.to_owned(),
             timeout: Self::DIALOG_TIMEOUT,
+            dialog: std::sync::Arc::default(),
         }
     }
 
@@ -213,15 +257,6 @@ impl PolkitReAuth {
         struct Subject<'a> {
             kind: &'a str,
             details: HashMap<&'a str, Value<'a>>,
-        }
-
-        /// `(bba{ss})` — the polkit answer.
-        #[derive(serde::Deserialize, zbus::zvariant::Type)]
-        struct AuthorizationResult {
-            is_authorized: bool,
-            is_challenge: bool,
-            #[allow(dead_code)]
-            details: HashMap<String, String>,
         }
 
         let conn = zbus::Connection::system()
@@ -306,23 +341,25 @@ impl PolkitReAuth {
             .body()
             .deserialize()
             .map_err(|e| ReAuthError::Failed(format!("unexpected polkit reply: {e}")))?;
-
-        if result.is_authorized {
-            Ok(())
-        } else {
-            tracing::info!(
-                action_id,
-                is_challenge = result.is_challenge,
-                "re-authentication was not granted"
-            );
-            Err(ReAuthError::Denied)
-        }
+        verdict(action_id, &result)
     }
 }
 
 #[cfg(target_os = "linux")]
 impl ReAuth for PolkitReAuth {
     fn reauthenticate(&self, op: &str) -> Result<(), ReAuthError> {
+        let _open = match self.dialog.try_lock() {
+            Ok(held) => held,
+            // A panic mid-dialog poisons the lock; the dialog is over either way.
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(ReAuthError::Unavailable(
+                    "another Tornect re-authentication dialog is already open; answer or \
+                     cancel it, then retry"
+                        .to_owned(),
+                ));
+            }
+        };
         let action_id = self.action_for(op);
         // The trait contract is a *blocking* call, run on `spawn_blocking`.
         // A blocking-pool thread belongs to the runtime but is not "entered",
@@ -412,6 +449,51 @@ mod tests {
             "org.tornect.grant",
             "an unknown operation must get the strongest wording, not the mildest"
         );
+    }
+
+    /// Track D S7: polkit's three "not authorized" shapes map to what actually
+    /// happened, so an operator is never told their password was wrong when no
+    /// dialog could be shown.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_polkit_answer_maps_to_what_happened() {
+        let answer = |is_authorized, is_challenge, dismissed: bool| AuthorizationResult {
+            is_authorized,
+            is_challenge,
+            details: if dismissed {
+                [("polkit.dismissed".to_owned(), "true".to_owned())].into()
+            } else {
+                std::collections::HashMap::new()
+            },
+        };
+        assert!(verdict("org.tornect.grant", &answer(true, false, false)).is_ok());
+        match verdict("org.tornect.grant", &answer(false, true, false)) {
+            Err(ReAuthError::Unavailable(m)) => assert!(m.contains("authentication agent"), "{m}"),
+            other => panic!("no agent must read as Unavailable, got {other:?}"),
+        }
+        assert!(matches!(
+            verdict("org.tornect.grant", &answer(false, false, true)),
+            Err(ReAuthError::Denied)
+        ));
+        assert!(matches!(
+            verdict("org.tornect.grant", &answer(false, false, false)),
+            Err(ReAuthError::Denied)
+        ));
+    }
+
+    /// Track D S1/S6: a second access-increasing op while a dialog is open is
+    /// refused at once — never queued behind a dialog that may outlive the CLI's
+    /// wait — and it never reaches D-Bus.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_second_dialog_is_refused_while_one_is_open() {
+        let p = PolkitReAuth::new();
+        let clone = p.clone();
+        let _open = p.dialog.lock().unwrap();
+        match clone.reauthenticate("enable") {
+            Err(ReAuthError::Unavailable(m)) => assert!(m.contains("already open"), "{m}"),
+            other => panic!("expected an immediate refusal, got {other:?}"),
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -793,6 +793,24 @@ impl MutationGuard {
         Ok(())
     }
 
+    /// The answer to a `master_on` never reached the CLI — it was killed, or hung up,
+    /// while the re-authentication dialog was open — so the one-time stop code exists
+    /// nowhere (§B.8.7.4). Unattended access must not stay on under a stop card nobody
+    /// holds: turn it back off and clear the token. Deny-direction, so no dialog;
+    /// logged as `UnattendedDisabled` with the reason (track D S1).
+    pub fn master_off_undelivered_stop_code(&self, by: Actor) -> Result<(), GuardError> {
+        self.require_loaded("master_off", Some(by), None)?;
+        let rec = SessionRecord::at(self.now(), SessionEvent::UnattendedDisabled)
+            .by(by)
+            .reason("stop code not delivered");
+        self.store.mutate(WriteClass::Policy, Some(&rec), |s, _| {
+            s.enabled = false;
+            s.stop_token = None;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// Pause until `until` (unix seconds; 12 h / until 08:00 / until re-enabled). Live
     /// sessions get `BYE{PAUSED}`. Starting or extending a pause is deny-direction;
     /// ending a running pause early — an `until` before its end, or not in the future —
@@ -1609,7 +1627,28 @@ impl MutationGuard {
     /// `end_session` (own) and `revoke` (own pk); `unlock(pk)`, `suspend(pk ≠ self)`,
     /// `revoke(pk ≠ self)`, `revoke_all` and `master_off` need a *My machines* Control
     /// grant in `Active` state. Out of scope ⇒ `ok: false`, no state change, logged.
+    ///
+    /// `Err` always means the command took no effect: every write that follows a
+    /// committed mutation is best-effort, so a committed deny-direction command is
+    /// never reported as failed, and never loses the effect that ends live sessions.
+    /// A failure is logged as an `AdminRequest{ok: false}` line (best-effort too: the
+    /// store that just failed may refuse that write as well).
     pub fn admin(&self, requester: &DeviceId, op: AdminOp) -> Result<AdminOutcome, GuardError> {
+        self.admin_inner(requester, op).inspect_err(|e| {
+            let rec = SessionRecord::at(self.now(), SessionEvent::AdminRequest)
+                .device(*requester)
+                .op(op.name())
+                .ok(false)
+                .unattended(true)
+                .code(e.code())
+                .detail("host could not apply the command");
+            if let Err(le) = self.store.log_event(&rec) {
+                tracing::warn!(error = %le, "could not log the failed AdminRequest");
+            }
+        })
+    }
+
+    fn admin_inner(&self, requester: &DeviceId, op: AdminOp) -> Result<AdminOutcome, GuardError> {
         self.require_loaded("admin", None, Some(requester))?;
         let now = self.now();
         // the rollback rule of every wall-clock evaluation (§B.8.5.3): the requester's
@@ -1657,16 +1696,27 @@ impl MutationGuard {
         };
         // The per-event lines of §B.8.13 (`GrantRevoked`, `UnattendedDisabled`) are
         // written next to the `AdminRequest` line, so a viewer filtering on them sees
-        // remote revocations and a remote master off too.
+        // remote revocations and a remote master off too. They are best-effort: each
+        // follows a mutation that has already committed together with its own
+        // `AdminRequest` line, and failing the command over a missing second line
+        // would report a committed deny-direction change as not done *and* drop the
+        // effect that ends live sessions.
         let by_admin = |ev: SessionEvent| {
             SessionRecord::at(now, ev)
                 .unattended(true)
                 .reason("admin")
                 .detail(format!("by admin {requester}"))
         };
+        let after_commit = |rec: &SessionRecord| {
+            if let Err(e) = self.store.log_event(rec) {
+                tracing::warn!(error = %e, op = op.name(), "could not log after a committed admin command");
+            }
+        };
         let effect = match op {
+            // Ending one's own session changes no state; the log line is the record,
+            // and ending a session must not hang on it either.
             AdminOp::EndSession => {
-                self.store.log_event(&base(true))?;
+                after_commit(&base(true));
                 AdminEffect::EndSession
             }
             AdminOp::Revoke(d) => match self
@@ -1674,11 +1724,11 @@ impl MutationGuard {
                 .remove_grant(&d, &base(true).detail(format!("target {d}")))
             {
                 Ok(removed) => {
-                    self.store.log_event(
+                    after_commit(
                         &by_admin(SessionEvent::GrantRevoked)
                             .device(d)
                             .grant(&removed.id),
-                    )?;
+                    );
                     AdminEffect::Revoked(d)
                 }
                 Err(StoreError::NoGrant) => {
@@ -1688,10 +1738,10 @@ impl MutationGuard {
             },
             AdminOp::RevokeAll => {
                 let n = self.store.remove_all_grants(&base(true))?;
-                self.store.log_event(
+                after_commit(
                     &by_admin(SessionEvent::GrantRevoked)
                         .detail(format!("revoke all ({n}) by admin {requester}")),
-                )?;
+                );
                 AdminEffect::RevokedAll(n)
             }
             AdminOp::MasterOff => {
@@ -1700,8 +1750,7 @@ impl MutationGuard {
                         s.enabled = false;
                         Ok(())
                     })?;
-                self.store
-                    .log_event(&by_admin(SessionEvent::UnattendedDisabled))?;
+                after_commit(&by_admin(SessionEvent::UnattendedDisabled));
                 AdminEffect::MasterOff
             }
             AdminOp::Unlock(d) => {

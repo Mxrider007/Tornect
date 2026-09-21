@@ -97,9 +97,13 @@ fn is_separator(c: char) -> bool {
 /// leading and trailing runs are kept untouched (never trimmed).
 #[must_use]
 pub fn normalize(pw: &str) -> Zeroizing<String> {
-    let nfc: Zeroizing<String> = Zeroizing::new(pw.nfc().collect());
-    // Every intermediate is zeroized on drop (§B.8.7.2, A14).
-    let chars: Zeroizing<Vec<char>> = Zeroizing::new(nfc.chars().collect());
+    // Every intermediate is zeroized on drop (§B.8.7.2, A14), and each is sized
+    // before it is filled: a buffer that grows leaves its outgrown copies in freed
+    // memory, unwiped. NFC grows a string by at most 3× (Unicode's stability bound).
+    let mut nfc = Zeroizing::new(String::with_capacity(pw.len().saturating_mul(3)));
+    nfc.extend(pw.nfc());
+    let mut chars: Zeroizing<Vec<char>> = Zeroizing::new(Vec::with_capacity(nfc.len()));
+    chars.extend(nfc.chars());
     let first_word = chars.iter().position(|c| !is_separator(*c));
     let last_word = chars.iter().rposition(|c| !is_separator(*c));
     let mut out = Zeroizing::new(String::with_capacity(nfc.len()));

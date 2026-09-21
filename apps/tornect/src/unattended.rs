@@ -30,8 +30,9 @@ use tornect_core::unattended::ipc::{
     RegStartPayload, codes, encode_payload,
 };
 use tornect_core::unattended::readiness::ReadinessSnapshot;
-use tornect_core::unattended::store::GrantStore;
+use tornect_core::unattended::store::{GrantStore, LoadMode};
 use tornect_core::{Config, Paths};
+use tornect_platform::ipc::Reply;
 
 /// Everything the dispatch needs, whichever route reached it.
 pub struct HostContext {
@@ -317,6 +318,43 @@ pub fn dispatch(ctx: &HostContext, req: IpcRequest) -> IpcResponse {
     }
 }
 
+/// [`dispatch`], plus what to undo if the answer never reaches the CLI.
+///
+/// Only `On` needs an undo. Its answer carries the one-time emergency stop code
+/// (§B.8.7.4), which exists nowhere else; if the CLI was killed or hung up while
+/// the re-authentication dialog was open, access would otherwise stay on under
+/// a stop card nobody holds (track D S1). Every other op's effect is what the
+/// owner asked for and answered the dialog for, seen or not.
+fn reply(ctx: &Arc<HostContext>, req: IpcRequest) -> Reply {
+    let is_on = matches!(req.op, IpcOp::On);
+    let response = dispatch(ctx, req);
+    let on_undelivered: Option<Box<dyn FnOnce() + Send>> = if is_on && response.ok {
+        let ctx = Arc::clone(ctx);
+        Some(Box::new(move || {
+            match ctx.guard.master_off_undelivered_stop_code(Actor::Cli) {
+                Ok(()) => tracing::warn!(
+                    "the new emergency stop code never reached the CLI; unattended access \
+                     was turned back off"
+                ),
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "the new emergency stop code never reached the CLI, and turning \
+                     unattended access back off FAILED"
+                ),
+            }
+            if let Some(k) = &ctx.kill {
+                k.kill(tornect_signal::messages::bye::MASTER_OFF);
+            }
+        }))
+    } else {
+        None
+    };
+    Reply {
+        response,
+        on_undelivered,
+    }
+}
+
 /// Serve the endpoint for the host role until the task is dropped.
 pub async fn serve(ctx: Arc<HostContext>, paths: &Paths) -> anyhow::Result<()> {
     let endpoint = tornect_platform::ipc::Endpoint::bind(&paths.state_dir)
@@ -324,12 +362,12 @@ pub async fn serve(ctx: Arc<HostContext>, paths: &Paths) -> anyhow::Result<()> {
         .context("binding the IPC endpoint")?;
     tracing::info!(path = %endpoint.path().display(), "IPC endpoint listening");
     endpoint
-        .serve(|req| {
+        .serve(move |req| {
             let ctx = Arc::clone(&ctx);
             async move {
                 // Guard calls are blocking (fsync, and the re-auth dialog):
                 // off the reactor they go.
-                tokio::task::spawn_blocking(move || dispatch(&ctx, req))
+                tokio::task::spawn_blocking(move || reply(&ctx, req))
                     .await
                     .unwrap_or_else(|e| {
                         IpcResponse::fail(
@@ -337,6 +375,7 @@ pub async fn serve(ctx: Arc<HostContext>, paths: &Paths) -> anyhow::Result<()> {
                             codes::G_PRECONDITION,
                             format!("dispatch panicked: {e}"),
                         )
+                        .into()
                     })
             }
         })
@@ -525,22 +564,34 @@ fn reauth_backend() -> Arc<dyn tornect_core::unattended::guard::ReAuth> {
 
 /// The context a running `tornect host` serves its control channel with.
 ///
-/// Identical to the offline one today, and deliberately so: the same
-/// [`dispatch`] runs behind both routes. It gains `kill` — and with it a working
-/// `Panic` — when the host FSM is wired into `tornect host` (§B.8.14 M1,
-/// outstanding).
+/// The same guard and the same [`dispatch`] as the offline route, deliberately;
+/// what differs is the store's load (§B.8.5.1): the host's load settles pending
+/// charges, applies decay and re-arms locks, which only the host may do. It
+/// gains `kill` — and with it a working `Panic` — when the host FSM is wired
+/// into `tornect host` (§B.8.14 M1, outstanding).
 pub fn host_context(paths: &Paths) -> anyhow::Result<HostContext> {
-    offline_context(paths)
+    context(paths, LoadMode::Host)
 }
 
-/// Build the offline context: the same guard the host would hold, minus the
-/// live-session seams there is nothing to fill.
+/// The offline CLI's context (no host running).
+///
+/// §B.8.5.1: "the offline CLI never applies or persists decay — the only
+/// FailState write it performs is the reset of a local Unlock", and a *load*
+/// is a host start or a keystore recovery, which a pre-authentication attacker
+/// cannot force. Loading as the host here made every `tornect unattended
+/// status` a load that settled, decayed and rewrote the store (track D S5).
+fn offline_context(paths: &Paths) -> anyhow::Result<HostContext> {
+    context(paths, LoadMode::Offline)
+}
+
+/// Build a context: the guard plus the live-session seams there is nothing to
+/// fill yet.
 ///
 /// Note the side effect: this creates the host identity if none exists, because
 /// `master_on` needs the onion key to compute the stop token. `tornect id` does
 /// the same and says so; here it happens on the first `tornect unattended`
 /// command of any kind, including a read-only one.
-fn offline_context(paths: &Paths) -> anyhow::Result<HostContext> {
+fn context(paths: &Paths, mode: LoadMode) -> anyhow::Result<HostContext> {
     use tornect_core::keystore::{FileSecretStore, load_or_create_host_identity};
     use tornect_core::unattended::clock::SystemClock;
     use tornect_core::unattended::guard::{FilePairedDevices, SessionLogHistory};
@@ -549,12 +600,12 @@ fn offline_context(paths: &Paths) -> anyhow::Result<HostContext> {
     let secrets = Arc::new(FileSecretStore::open(paths.keys_dir())?);
     let (host, _) = load_or_create_host_identity(&*secrets)?;
     let log = SessionLog::new(paths.sessions_log());
-    let store = GrantStore::open(
-        paths,
-        Arc::clone(&secrets) as Arc<dyn tornect_core::SecretStore>,
-        Arc::new(SystemClock::default()),
-        log.clone(),
-    )?;
+    let secrets_dyn = Arc::clone(&secrets) as Arc<dyn tornect_core::SecretStore>;
+    let clock = Arc::new(SystemClock::default());
+    let store = match mode {
+        LoadMode::Host => GrantStore::open(paths, secrets_dyn, clock, log.clone())?,
+        LoadMode::Offline => GrantStore::open_offline(paths, secrets_dyn, clock, log.clone())?,
+    };
     let guard = MutationGuard::new(store, reauth_backend(), Arc::new(NoSessionActivity))
         .with_paired_devices(Arc::new(FilePairedDevices::new(
             paths.trusted_devices_file(),
@@ -563,26 +614,54 @@ fn offline_context(paths: &Paths) -> anyhow::Result<HostContext> {
         .with_server_setup_source(Arc::new(
             tornect_signal::unattended::OpaqueServerSetupSource,
         ));
+    let user_inputs = policy_user_inputs(paths, &host.id().onion_address(), &guard);
     Ok(HostContext {
         guard: Arc::new(guard),
         host_onion_pk: *host.id().public_key_bytes(),
         readiness: ReadinessSnapshot::unknown(),
-        user_inputs: policy_user_inputs(paths, &host.id().onion_address()),
+        user_inputs,
         kill: None,
         log,
     })
 }
 
-/// The §B.8.7.2 `zxcvbn` inputs: things an attacker would guess first.
-fn policy_user_inputs(paths: &Paths, onion: &str) -> Vec<String> {
+/// The §B.8.7.2 `zxcvbn` inputs — {host name, device labels, onion address, OS
+/// user name, "tornect"} — the things an attacker would guess first.
+///
+/// The labels are every paired device's and every grant's: a password built
+/// around "Laptop-of-Ana" must score as the guessable thing it is (track D S9).
+/// Every source is best-effort; a missing one only means fewer inputs.
+fn policy_user_inputs(paths: &Paths, onion: &str, guard: &MutationGuard) -> Vec<String> {
     let mut inputs = vec!["tornect".to_owned(), onion.to_owned()];
     if let Ok(cfg) = Config::load(&paths.config_file()) {
         inputs.push(cfg.general.device_name);
     }
+    if let Some(host) = os_host_name() {
+        inputs.push(host);
+    }
     if let Ok(user) = std::env::var("USER").or_else(|_| std::env::var("USERNAME")) {
         inputs.push(user);
     }
+    if let Ok(trusted) =
+        tornect_signal::pairing::TrustedDeviceStore::open(paths.trusted_devices_file())
+    {
+        inputs.extend(trusted.snapshot().devices.into_iter().map(|d| d.label));
+    }
+    inputs.extend(guard.store().grants().into_iter().map(|g| g.label));
+    inputs.sort();
+    inputs.dedup();
     inputs
+}
+
+/// The machine's host name, if the OS will say.
+fn os_host_name() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    let name = std::fs::read_to_string("/proc/sys/kernel/hostname").ok();
+    #[cfg(not(target_os = "linux"))]
+    let name = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok();
+    name.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty())
 }
 
 /// Pick the route: talk to a running host, or run the guard here.
@@ -671,6 +750,80 @@ async fn resolve_device(paths: &Paths, route: &Route, arg: &str) -> anyhow::Resu
     }
 }
 
+/// Bytes one terminal line may take: [`MAX_CHARS`] characters of up to four
+/// UTF-8 bytes each, plus the line ending.
+///
+/// [`MAX_CHARS`]: tornect_core::unattended::password::MAX_CHARS
+const LINE_CAP: usize = tornect_core::unattended::password::MAX_CHARS * 4 + 2;
+
+/// Read one line from the terminal **straight off the file descriptor**, into a
+/// buffer sized once, up front, and wiped on drop (§B.8.7.2 "all intermediates in
+/// Zeroizing").
+///
+/// Not `std::io::stdin().read_line`: `Stdin` keeps a process-global 8 KiB buffer
+/// that is never wiped, and a `String` grown by `read_line` leaves every outgrown
+/// copy of the password in freed heap memory (track D S8/S12). A line longer than
+/// the buffer is drained to its end and refused: left in the terminal, its tail
+/// would be read by the shell as a command once Tornect exits. One byte per
+/// `read`, so nothing past the newline is ever consumed, whatever the descriptor
+/// (a line is at most a few hundred bytes).
+#[cfg(unix)]
+fn read_line_unbuffered(fd: &impl rustix::fd::AsFd) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    use zeroize::Zeroize as _;
+
+    /// One byte, retrying an interrupted read; `None` at end of input.
+    fn read_byte(fd: &impl rustix::fd::AsFd, byte: &mut [u8; 1]) -> anyhow::Result<Option<u8>> {
+        loop {
+            match rustix::io::read(fd, &mut byte[..]) {
+                Ok(0) => return Ok(None),
+                Ok(_) => return Ok(Some(byte[0])),
+                Err(rustix::io::Errno::INTR) => {}
+                Err(e) => return Err(std::io::Error::from(e).into()),
+            }
+        }
+    }
+
+    let mut buf = zeroize::Zeroizing::new(vec![0u8; LINE_CAP]);
+    let mut byte = zeroize::Zeroizing::new([0u8; 1]);
+    let mut len = 0;
+    let line_len = loop {
+        let Some(b) = read_byte(fd, &mut byte)? else {
+            // End of input without a newline: the line is what was typed.
+            break len;
+        };
+        if b == b'\n' {
+            break len;
+        }
+        if len == buf.len() {
+            while let Some(b) = read_byte(fd, &mut byte)? {
+                if b == b'\n' {
+                    break;
+                }
+            }
+            anyhow::bail!(
+                "that line is longer than any password Tornect accepts ({} characters at most)",
+                tornect_core::unattended::password::MAX_CHARS
+            );
+        }
+        buf[len] = b;
+        len += 1;
+    };
+    let mut line_end = line_len;
+    if line_end > 0 && buf[line_end - 1] == b'\r' {
+        line_end -= 1;
+    }
+    buf[line_end..].zeroize();
+    let mut bytes = std::mem::take(&mut *buf);
+    bytes.truncate(line_end);
+    match String::from_utf8(bytes) {
+        Ok(line) => Ok(zeroize::Zeroizing::new(line)),
+        Err(e) => {
+            e.into_bytes().zeroize();
+            anyhow::bail!("the terminal input is not valid UTF-8")
+        }
+    }
+}
+
 /// Read a password from the controlling terminal with echo off (§B.8.7.4:
 /// "passwords via TTY prompt, never argv").
 ///
@@ -679,7 +832,7 @@ async fn resolve_device(paths: &Paths, route: &Route, arg: &str) -> anyhow::Resu
 /// to someone.
 #[cfg(unix)]
 fn read_password(prompt: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
-    use std::io::{BufRead as _, Write as _};
+    use std::io::Write as _;
 
     use rustix::termios::{self, OptionalActions};
 
@@ -698,24 +851,51 @@ fn read_password(prompt: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
     quiet.local_modes -= termios::LocalModes::ECHO;
     termios::tcsetattr(&stdin, OptionalActions::Flush, &quiet)?;
 
-    let mut line = zeroize::Zeroizing::new(String::new());
-    let read = stdin.lock().read_line(&mut line);
+    let read = read_line_unbuffered(&stdin);
 
     // Restore before looking at the result.
     let restored = termios::tcsetattr(&stdin, OptionalActions::Flush, &original);
     eprintln!();
     restored?;
-    read?;
-
-    while line.ends_with('\n') || line.ends_with('\r') {
-        line.pop();
-    }
-    Ok(line)
+    read
 }
 
 #[cfg(not(unix))]
 fn read_password(_prompt: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
     anyhow::bail!("the password prompt is implemented for Unix at M1 (docs/PLAN.md §B.8.14 M6)")
+}
+
+/// Ask a yes/no question on the terminal (echo on); anything but `y`/`yes` is no.
+#[cfg(unix)]
+fn confirm(question: &str) -> anyhow::Result<bool> {
+    use std::io::Write as _;
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
+    let answer = read_line_unbuffered(&std::io::stdin())?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+#[cfg(not(unix))]
+fn confirm(_question: &str) -> anyhow::Result<bool> {
+    Ok(false)
+}
+
+/// What the owner is told about a [`PolicyWarning`] (§B.8.7.2: whitespace is
+/// kept, never trimmed, so it is warned about instead).
+///
+/// [`PolicyWarning`]: tornect_core::unattended::password::PolicyWarning
+fn policy_warning_text(w: tornect_core::unattended::password::PolicyWarning) -> &'static str {
+    use tornect_core::unattended::password::PolicyWarning;
+    match w {
+        PolicyWarning::LeadingWhitespace => {
+            "it starts with a space; that space is part of the password and must be typed \
+             every time"
+        }
+        PolicyWarning::TrailingWhitespace => {
+            "it ends with a space; that space is part of the password and must be typed \
+             every time"
+        }
+    }
 }
 
 /// Prompt twice and check §B.8.7.2 locally, as the spec requires: the host
@@ -734,7 +914,19 @@ fn prompt_new_password(
         let pw = read_password("New unattended password: ")?;
         let normalized = tornect_core::unattended::password::normalize(&pw);
         match tornect_core::unattended::password::check(&normalized, &refs, file_keystore) {
-            Ok(_) => {}
+            Ok(checked) => {
+                if !checked.warnings.is_empty() {
+                    for w in &checked.warnings {
+                        eprintln!("  note: {}", policy_warning_text(*w));
+                    }
+                    if !confirm("Use this password anyway?")? {
+                        if attempt == 3 {
+                            anyhow::bail!("no password chosen after 3 attempts");
+                        }
+                        continue;
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("  {e}");
                 if attempt == 3 {
@@ -772,14 +964,20 @@ pub async fn run_unattended(paths: &Paths, cmd: UnattendedCmd) -> anyhow::Result
             print_status(&report, json)
         }
         UnattendedCmd::On => {
-            let resp = send(paths, &route, IpcOp::On).await?;
+            let mut resp = send(paths, &route, IpcOp::On).await?;
             require_ok(&resp)?;
             let payload = resp.payload.as_deref().context("On returned no payload")?;
-            let card: MasterOnPayload = tornect_core::unattended::ipc::decode_payload(payload)?;
+            let card: Result<MasterOnPayload, _> =
+                tornect_core::unattended::ipc::decode_payload(payload);
+            // The payload is the stop code itself (§B.8.7.2, A14).
+            if let Some(p) = resp.payload.as_mut() {
+                zeroize::Zeroize::zeroize(p);
+            }
+            let card = card?;
             println!("Unattended access is ON.");
             println!();
             println!("  EMERGENCY STOP CODE");
-            println!("  {}", format_stop_code(&card.stop_code));
+            print_secret_line(&format_stop_code(&card.stop_code))?;
             println!();
             println!("  Write this down and keep it away from this computer. Presenting it from");
             println!("  any device turns unattended access off, revokes every grant and ends any");
@@ -805,6 +1003,13 @@ pub async fn run_unattended(paths: &Paths, cmd: UnattendedCmd) -> anyhow::Result
             preset,
             waive_attended_check,
         } => {
+            if waive_attended_check {
+                // §B.8.7.4: the waiver is "warned and logged"; the guard logs it.
+                eprintln!(
+                    "warning: --waive-attended-check skips the rule that this device must \
+                     first have had an attended session you watched. The waiver is logged."
+                );
+            }
             let device = resolve_device(paths, &route, &device).await?;
             register(
                 paths,
@@ -937,7 +1142,14 @@ async fn register(
         .payload
         .as_deref()
         .context("RegStart returned no payload")?;
-    let started: RegStartPayload = tornect_core::unattended::ipc::decode_payload(payload)?;
+    let started: anyhow::Result<RegStartPayload> =
+        tornect_core::unattended::ipc::decode_payload(payload).map_err(Into::into);
+    // `reg_txn` is the 120 s capability that lets a `RegFinish` land.
+    let mut resp = resp;
+    if let Some(p) = resp.payload.as_mut() {
+        zeroize::Zeroize::zeroize(p);
+    }
+    let started = started?;
 
     // The identifiers must match the ones the login will use (§B.8.4.3), so the
     // host's onion key is part of the record.
@@ -984,13 +1196,49 @@ fn host_onion_pk(paths: &Paths) -> anyhow::Result<[u8; 32]> {
 }
 
 /// `xxxx-xxxx-xxxx-xxxx …` — grouped so it can be read aloud and written down.
-fn format_stop_code(code: &[u8; 16]) -> String {
-    let hex = data_encoding::HEXLOWER.encode(code);
-    hex.as_bytes()
-        .chunks(4)
-        .map(|c| String::from_utf8_lossy(c).into_owned())
-        .collect::<Vec<_>>()
-        .join("-")
+/// Built in one buffer sized up front and wiped on drop: no intermediate copy of
+/// the code is left behind (§B.8.7.2, A14).
+fn format_stop_code(code: &[u8; 16]) -> zeroize::Zeroizing<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = zeroize::Zeroizing::new(String::with_capacity(48));
+    for (i, b) in code.iter().enumerate() {
+        if i > 0 && i % 2 == 0 {
+            out.push('-');
+        }
+        out.push(char::from(HEX[usize::from(b >> 4)]));
+        out.push(char::from(HEX[usize::from(b & 0x0f)]));
+    }
+    out
+}
+
+/// Print `  <secret>\n` straight to the stdout descriptor: `std`'s stdout buffer
+/// is process-global and never wiped (track D S12).
+fn print_secret_line(secret: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let mut line = zeroize::Zeroizing::new(String::with_capacity(secret.len() + 3));
+    line.push_str("  ");
+    line.push_str(secret);
+    line.push('\n');
+    std::io::stdout().flush()?;
+    #[cfg(unix)]
+    {
+        let stdout = std::io::stdout();
+        let mut rest = line.as_bytes();
+        while !rest.is_empty() {
+            match rustix::io::write(&stdout, rest) {
+                Ok(n) => rest = &rest[n..],
+                Err(rustix::io::Errno::INTR) => {}
+                Err(e) => return Err(std::io::Error::from(e).into()),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let mut out = std::io::stdout();
+        out.write_all(line.as_bytes())?;
+        out.flush()?;
+    }
+    Ok(())
 }
 
 fn print_status(
@@ -1263,6 +1511,179 @@ mod tests {
 
     fn go(ctx: &HostContext, op: IpcOp) -> IpcResponse {
         dispatch(ctx, IpcRequest { id: 1, op })
+    }
+
+    /// Track D S5: the offline route loads the store as the offline CLI
+    /// (§B.8.5.1: no settlement, no decay, nothing written at load), and only the
+    /// host route loads it as the host. The load rules themselves are pinned in
+    /// `tornect-core`; this pins which route gets which.
+    #[test]
+    fn only_the_host_route_loads_the_store_as_the_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        {
+            let offline = offline_context(&paths).unwrap();
+            assert_eq!(offline.guard.store().mode(), LoadMode::Offline);
+        }
+        // Dropping the offline context released the store lock.
+        let host = host_context(&paths).unwrap();
+        assert_eq!(host.guard.store().mode(), LoadMode::Host);
+    }
+
+    fn enabled(ctx: &HostContext) -> bool {
+        let resp = go(ctx, IpcOp::Status);
+        let report: StatusReport = decode_payload(resp.payload.as_deref().unwrap()).unwrap();
+        report.enabled
+    }
+
+    /// Track D S1, host side: when `On`'s answer cannot be delivered, its undo
+    /// turns unattended access back off and retires the stop code nobody saw.
+    #[test]
+    fn an_undelivered_stop_code_turns_unattended_access_back_off() {
+        let Env { _tmp, ctx } = env(true);
+        let ctx = Arc::new(ctx);
+        let Reply {
+            response,
+            on_undelivered,
+        } = reply(
+            &ctx,
+            IpcRequest {
+                id: 1,
+                op: IpcOp::On,
+            },
+        );
+        assert!(response.ok, "{:?}", response.detail);
+        assert!(enabled(&ctx));
+        let card: MasterOnPayload = decode_payload(response.payload.as_deref().unwrap()).unwrap();
+
+        on_undelivered.expect("`On` carries an undo")();
+
+        assert!(
+            !enabled(&ctx),
+            "access must not stay on under an unseen stop code"
+        );
+        let token = tornect_core::unattended::guard::stop_token(&HOST_PK, &card.stop_code);
+        assert!(
+            !ctx.guard.store().stop_token_matches(&token),
+            "the undelivered code is retired"
+        );
+        let logged = ctx.log.read_all().unwrap().into_iter().any(|r| {
+            r.event == tornect_core::session_log::SessionEvent::UnattendedDisabled
+                && r.reason.as_deref() == Some("stop code not delivered")
+        });
+        assert!(logged, "the reason is in sessions.log");
+    }
+
+    /// Track D S9/S11: the `zxcvbn` inputs carry the labels of paired devices, so
+    /// a password built around a device's name scores as guessable.
+    #[test]
+    fn policy_inputs_include_paired_device_labels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        tornect_signal::pairing::TrustedDeviceStore::open(paths.trusted_devices_file())
+            .unwrap()
+            .pin(DeviceId::from_bytes([7u8; 32]), "Laptop-of-Ana")
+            .unwrap();
+        let ctx = offline_context(&paths).unwrap();
+        assert!(
+            ctx.user_inputs.iter().any(|i| i == "Laptop-of-Ana"),
+            "{:?}",
+            ctx.user_inputs
+        );
+        assert!(ctx.user_inputs.iter().any(|i| i == "tornect"));
+    }
+
+    /// Track D S9/S11: whitespace the policy keeps is explained, not dropped.
+    #[test]
+    fn whitespace_warnings_are_explained() {
+        use tornect_core::unattended::password::{PolicyWarning, check};
+        let checked = check(" quiet verdant otter lantern zephyr ", &[], false).unwrap();
+        assert_eq!(
+            checked.warnings,
+            vec![
+                PolicyWarning::LeadingWhitespace,
+                PolicyWarning::TrailingWhitespace
+            ]
+        );
+        for w in checked.warnings {
+            assert!(policy_warning_text(w).contains("space"));
+        }
+    }
+
+    /// Track D S8/S12: the unbuffered reader returns one line without its ending,
+    /// and leaves the next line where it was.
+    #[cfg(unix)]
+    #[test]
+    fn the_unbuffered_reader_takes_exactly_one_line() {
+        use std::io::Write as _;
+        let (mut tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
+        tx.write_all(b"quiet verdant otter\r\nnext\n").unwrap();
+        // Both lines are already buffered in the socket; the reader must take
+        // the first and leave the second where it was.
+        let first = read_line_unbuffered(&rx).unwrap();
+        assert_eq!(first.as_str(), "quiet verdant otter");
+        assert_eq!(read_line_unbuffered(&rx).unwrap().as_str(), "next");
+    }
+
+    /// Track D S8/S12: an over-long line is refused *and drained*: its tail must
+    /// not be left for the shell to read as a command after Tornect exits.
+    #[cfg(unix)]
+    #[test]
+    fn an_over_long_line_is_refused_and_drained() {
+        use std::io::Write as _;
+        let (mut tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut long = vec![b'x'; LINE_CAP + 300];
+        long.push(b'\n');
+        tx.write_all(&long).unwrap();
+        tx.write_all(b"after\n").unwrap();
+        drop(tx);
+        let err = read_line_unbuffered(&rx).unwrap_err();
+        assert!(err.to_string().contains("longer than"), "{err}");
+        assert_eq!(read_line_unbuffered(&rx).unwrap().as_str(), "after");
+    }
+
+    /// Track D S12: the stop code is grouped as before, from one wiped buffer.
+    #[test]
+    fn the_stop_code_prints_in_groups_of_four() {
+        let code: [u8; 16] = core::array::from_fn(|i| u8::try_from(i * 17).unwrap());
+        assert_eq!(
+            format_stop_code(&code).as_str(),
+            "0011-2233-4455-6677-8899-aabb-ccdd-eeff"
+        );
+    }
+
+    /// Only `On` carries an undo; a refused `On` needs none.
+    #[test]
+    fn only_a_successful_on_carries_an_undo() {
+        let Env {
+            _tmp: _allow_home,
+            ctx,
+        } = env(true);
+        let allow = Arc::new(ctx);
+        for op in [IpcOp::Status, IpcOp::Off, IpcOp::PolicyInputs] {
+            let name = op.name();
+            assert!(
+                reply(&allow, IpcRequest { id: 1, op })
+                    .on_undelivered
+                    .is_none(),
+                "{name}"
+            );
+        }
+        let Env {
+            _tmp: _deny_home,
+            ctx,
+        } = env(false);
+        let deny = Arc::new(ctx);
+        let r = reply(
+            &deny,
+            IpcRequest {
+                id: 1,
+                op: IpcOp::On,
+            },
+        );
+        assert!(!r.response.ok);
+        assert!(r.on_undelivered.is_none());
     }
 
     /// `Status` works before anything is enabled, and reports the truth.
