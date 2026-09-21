@@ -166,6 +166,11 @@ struct Inner {
     machine_id: Option<Vec<u8>>,
     _lock: std::fs::File,
     state: Mutex<State>,
+    /// Test-only fault injection: fail the next write of this class. `Runtime` fails
+    /// exactly the log line a `log_event` writes *after* a committed mutation;
+    /// `Policy` fails the commit itself (track D S3/S10).
+    #[cfg(test)]
+    fail_next_write: Mutex<Option<WriteClass>>,
 }
 
 /// Single-writer handle to the unattended store; clones share one state.
@@ -298,6 +303,8 @@ impl GrantStore {
                 pending_log: Vec::new(),
                 pending_log_dropped: 0,
             }),
+            #[cfg(test)]
+            fail_next_write: Mutex::new(None),
         };
         let this = Self {
             inner: Arc::new(inner),
@@ -313,6 +320,12 @@ impl GrantStore {
     #[must_use]
     pub fn status(&self) -> StoreStatus {
         self.inner.state.lock().status.clone()
+    }
+
+    /// Test-only: make the next write of `class` fail (see `Inner::fail_next_write`).
+    #[cfg(test)]
+    pub(crate) fn fail_next_write(&self, class: WriteClass) {
+        *self.inner.fail_next_write.lock() = Some(class);
     }
 
     /// How this handle loaded the store.
@@ -776,6 +789,14 @@ impl GrantStore {
     /// Encrypt and atomically replace the store file; raise the anchor for policy writes
     /// (or when a bump is owed). On failure the in-memory generation is unchanged.
     pub(crate) fn write_locked(&self, st: &mut State, class: WriteClass) -> Result<(), StoreError> {
+        #[cfg(test)]
+        {
+            let mut fail = self.inner.fail_next_write.lock();
+            if *fail == Some(class) {
+                *fail = None;
+                return Err(StoreError::Invalid("injected write failure".into()));
+            }
+        }
         let (now, hwm) = self.wall_locked(st);
         let mono = self.inner.clock.mono();
         let new_generation = st.generation.saturating_add(1);

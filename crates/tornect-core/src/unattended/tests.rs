@@ -2073,6 +2073,65 @@ fn admin_env() -> (Env, GrantStore, MutationGuard, DeviceId, DeviceId, DeviceId)
     (env, store, guard, admin, target, helper)
 }
 
+/// Run one in-scope admin command whose only failing write is the per-event log
+/// line that follows its committed mutation (ENOSPC right after the store write, a
+/// log that just became unwritable).
+fn admin_with_a_failing_log_line(
+    op_for: impl Fn(DeviceId) -> AdminOp,
+) -> (super::guard::AdminOutcome, Env, GrantStore, DeviceId) {
+    let (env, store, guard, admin, target, _) = admin_env();
+    store.fail_next_write(WriteClass::Runtime);
+    let out = guard
+        .admin(&admin, op_for(target))
+        .expect("a committed admin command must not be reported as failed");
+    (out, env, store, target)
+}
+
+/// Track D S3/S10: `master_off`, `revoke_all` and `revoke` stay successes — with the
+/// effect that ends live sessions — when only the log line written after the commit
+/// fails. Before the fix each returned `Err`, which the host answered as
+/// `ADMIN_RESULT{ok: false}` with `AdminEffect::None`, leaving live sessions running
+/// against a store that had already turned access off.
+#[test]
+fn a15_a_failed_log_line_after_the_commit_keeps_the_command_and_its_effect() {
+    let (out, env, store, _) = admin_with_a_failing_log_line(|_| AdminOp::MasterOff);
+    assert!(out.ok);
+    assert_eq!(out.effect, AdminEffect::MasterOff);
+    assert!(
+        !store.enabled_at(env.clock.wall()),
+        "the store change stands"
+    );
+
+    let (out, _env, store, _) = admin_with_a_failing_log_line(|_| AdminOp::RevokeAll);
+    assert!(out.ok);
+    assert_eq!(out.effect, AdminEffect::RevokedAll(3));
+    assert!(store.grants().is_empty());
+
+    let (out, _env, store, target) = admin_with_a_failing_log_line(AdminOp::Revoke);
+    assert!(out.ok);
+    assert_eq!(out.effect, AdminEffect::Revoked(target));
+    assert!(store.grant(&target).is_none());
+}
+
+/// A command that did *not* commit is still an `Err` — nothing changed, so there is
+/// no effect to lose — and it leaves an `AdminRequest{ok: false}` line. (The comment
+/// in `GuardAdmin` used to say the guard had logged these; it had not.)
+#[test]
+fn a15_an_admin_command_that_fails_to_commit_is_an_error_and_is_logged() {
+    let (env, store, guard, admin, _, _) = admin_env();
+    let failed_lines = |env: &Env| {
+        env.log_events()
+            .into_iter()
+            .filter(|r| r.event == SessionEvent::AdminRequest && r.ok == Some(false))
+            .count()
+    };
+    let before = failed_lines(&env);
+    store.fail_next_write(WriteClass::Policy);
+    assert!(guard.admin(&admin, AdminOp::MasterOff).is_err());
+    assert!(store.enabled_at(env.clock.wall()), "nothing committed");
+    assert_eq!(failed_lines(&env), before + 1);
+}
+
 #[test]
 fn a15_out_of_scope_admin_requests_are_refused_without_state_change() {
     let (env, store, guard, admin, target, helper) = admin_env();

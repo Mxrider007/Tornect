@@ -219,7 +219,10 @@ impl AdminAuthority for GuardAdmin {
                 // A store-level failure (locked keystore, store lock held, I/O)
                 // is not a scope refusal. It is reported as a plain failure with
                 // the guard's own code so the client can tell "you may not" from
-                // "the host could not"; the guard has already logged it.
+                // "the host could not". `Err` means the command took no effect —
+                // `MutationGuard::admin` treats every write after a commit as
+                // best-effort — so `AdminEffect::None` is the truth, not a loss;
+                // the guard logs the attempt as a failed `AdminRequest`.
                 tracing::warn!(peer = %requester, op = op.name(), error = %e, "admin command failed");
                 AdminOutcome {
                     ok: false,

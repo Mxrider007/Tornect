@@ -26,6 +26,13 @@
   bypass — so this file is the only thing holding that guarantee up. Changing
   `auth_self` to `auth_self_keep` silently weakens Tornect's security model.
 
+  All three defaults are `auth_self`, including `allow_any` and
+  `allow_inactive`: §B.8.8 names a text agent over SSH, and a host started as a
+  user service runs outside any logind session. With `no` there, polkit refused
+  both without asking anyone, and the operator was told the password was wrong
+  (track D S7). `auth_self` still demands the account password every time; it
+  never grants anything on its own. Never use `yes` or a `*_keep` value here.
+
   One action per operation class rather than per operation: an unprivileged
   caller may not pass a `details` map to CheckAuthorization (polkit refuses the
   whole call), so the operation name cannot reach the dialog as data. The
@@ -41,8 +48,8 @@
     <description xml:lang="en_GB">Allow a device to connect without asking</description>
     <message>Authentication is required to let a device connect to this computer without asking, or to change the password that protects it.</message>
     <defaults>
-      <allow_any>no</allow_any>
-      <allow_inactive>no</allow_inactive>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
       <allow_active>auth_self</allow_active>
     </defaults>
   </action>
@@ -51,8 +58,8 @@
     <description>Re-enable unattended access</description>
     <message>Authentication is required to re-enable unattended access that was turned off, suspended or locked.</message>
     <defaults>
-      <allow_any>no</allow_any>
-      <allow_inactive>no</allow_inactive>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
       <allow_active>auth_self</allow_active>
     </defaults>
   </action>
@@ -61,8 +68,8 @@
     <description>Change whether Tornect starts at login</description>
     <message>Authentication is required to change whether Tornect starts automatically when you log in.</message>
     <defaults>
-      <allow_any>no</allow_any>
-      <allow_inactive>no</allow_inactive>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
       <allow_active>auth_self</allow_active>
     </defaults>
   </action>
@@ -71,8 +78,8 @@
     <description>Export Tornect secrets</description>
     <message>Authentication is required to export Tornect's keys or unattended-access backup from this computer.</message>
     <defaults>
-      <allow_any>no</allow_any>
-      <allow_inactive>no</allow_inactive>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
       <allow_active>auth_self</allow_active>
     </defaults>
   </action>
@@ -81,8 +88,8 @@
     <description>Change Tornect security settings</description>
     <message>Authentication is required to change Tornect's security settings, such as the panic key or a device's access policy.</message>
     <defaults>
-      <allow_any>no</allow_any>
-      <allow_inactive>no</allow_inactive>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
       <allow_active>auth_self</allow_active>
     </defaults>
   </action>
