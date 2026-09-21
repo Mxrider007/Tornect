@@ -1,4 +1,4 @@
-# Tornect — continuation report (2026-09-04, session close)
+# Tornect — continuation report (2026-09-05, session close)
 
 Paste the block under **HAND-OFF** into a new session.
 
@@ -7,145 +7,185 @@ Paste the block under **HAND-OFF** into a new session.
 ## HAND-OFF
 
 Continue building Tornect from `/home/mx/Tornect` (private repo
-https://github.com/Mxrider420z/Tornect, branch `main`, at `7630135`, tree clean,
-**remote in sync — pushed 2026-09-04**).
+https://github.com/Mxrider420z/Tornect, branch `main`, tree clean, pushed).
 
 Read in this order before doing anything: `CLAUDE.md`, `docs/notes/m1-state.md`,
-`docs/PLAN.md` Part G, then `docs/PLAN.md` §B.3 and §B.8 (revision r6 + amendment
-M1-37 — normative). Then run
+`docs/PLAN.md` Part G, then §B.8.4.1, §B.8.4.2 and §B.8.7.4 (normative for the
+work in flight). Then run
 `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp cargo xtask verify` to confirm green
-(expect **289 tests**: 153 core + 136 signal).
+(expect **320 tests**: 153 core + 145 signal + 12 platform + 10 app).
 
-### STATE (2026-09-04)
+### STATE (2026-09-05)
 
 Commits this session, all pushed:
-`5391f76` (log chain) → `7762849` (password test) → `3ee4943` (SAS fix) →
-`43de8e0` (round-3 docs) → `08d391a` (OPAQUE core) → `324b4d4` (host branch) →
-`fc48e24` (client branch + e2e) → `ba3cd7c` (track C docs) → `3d468f1` (track C
-review fixes) → `7630135` (track C review docs).
+`fbc7a31` (admin intent + emergency stop + the B.8.4.2 ordering fix) →
+`be58ea6` (tornect-platform: IPC endpoint + polkit reauth; OPAQUE registration
+split) → `48ca97e` (the unattended CLI + host-role IPC dispatch) → `ee20242`
+(docs) → the plan resync.
 
-- M0 done, tagged `m0`. **M1 ≈ two-thirds done, not tagged.**
-- **M1 track 1** (`0e568d8`): Arti embedded, `tornect host` / `tornect ping` verified
-  live over Tor.
-- **M1 phase-2 part 1** (`cd878f3`): `tornect-core::unattended` + `tornect-signal`
-  envelope/transcript/pairing/attended FSM.
-- **Round-3 review of tracks A + B — done.** 12 hostile reviewers, 3 refuters per
-  finding, 126 agents: **38 raw → 3 confirmed**, all fixed:
-  - **HIGH, the SAS was grindable** (`3ee4943`, decision **M1-37**, supersedes M1-8).
-    The r6 input `th_after(PAIR_REQUEST)` is attacker-malleable on both sides against a
-    ~2^20 code. Reproduced: ~1500 candidates per side, collision at 323, both screens
-    `034 057`, inside the 20 s `HELLO_ACK` timeout. §B.3 amended to commit-then-reveal
-    (`HELLO.sas_commit`, `PAIR_REQUEST.sas_nonce`,
-    `SAS = HKDF(th_after(HELLO_ACK) || sas_nonce)`). Both golden vectors and the
-    envelope fuzz seeds regenerated; `client_random()` scripts a second value.
-    **This partly answers M1-31**: signing `PAIR_REQUEST` alone would not have fixed
-    it — the attacker re-signs each candidate with its own key.
-  - MEDIUM: a `keystore_locked` window permanently broke the §B.8.13 log chain.
-  - LOW: the file-keystore password escalation was never tested while VERIFICATION.md
-    recorded U3 as VERIFIED.
-- **Track C — done** (`08d391a`, `324b4d4`, `fc48e24`) and **reviewed** (`3d468f1`).
-  OPAQUE-3DH authenticator + the §B.8.4.3 key schedule; the host `UnattendedHook` with
-  the full §B.8.4.5 ordering, the write-ahead charge and the §B.8.5.2 budgets; the
-  client branch with the `server_s_pk` TOFU pin. `fsm::tests::
-  unattended_session_end_to_end_over_a_duplex_pipe` is a real `connect()` against a
-  real `serve_host` running the real hook — no stub at any layer — reaching
-  `SESSION_ACCEPT` with a derived token and zero popups (the B.8.14 M1 acceptance
-  shape minus Tor).
-  Its review (84 agents, **26 raw → 3 confirmed**) found and fixed: `export_key` /
-  `session_key` dropped without zeroizing (opaque-ke's `*FinishResult` types are
-  `derive_where(Clone)` only, **not** `ZeroizeOnDrop` — the doc comment claimed
-  otherwise); pre-emption unimplemented, so `PREEMPTED` was emitted nowhere and the
-  in-flight slot was held past `AwaitKe3`; and a missing `BYE{CLIENT_AUTH_ABORT}`.
+- M0 done, tagged `m0`. **M1 is most of the way done and NOT tagged.**
+- Tracks 1, A, B, C were done in earlier sessions. **Track D is done this
+  session** — see `docs/notes/m1-state.md` § *Track D*.
+
+**What track D delivered.** Admin intent + scope (the §B.8.4.1 matrix was
+already in `MutationGuard::admin`; this wired it through a new `AdminAuthority`
+seam, with `RefuseAdmin` as the default so an unwired host refuses rather than
+pretending). The §B.8.7.4 emergency stop (`EmergencyStop` implementing
+`StopTokenCheck`: constant-time match → master off + revoke-all +
+`BYE{EMERGENCY_STOP}` + token cleared, so the card is single-use; a failed apply
+leaves the token in place). `crates/tornect-platform`, which did not exist:
+`ipc` (owner-only Unix endpoint; `SO_PEERCRED` compared against the uid owning
+the socket file this process created, which needs no `libc` and keeps the crate
+`forbid(unsafe_code)`) and `reauth` (polkit over the system D-Bus). The
+`tornect unattended|devices|panic|service|backup` CLI and the host-role dispatch
+loop, with **one dispatch behind both routes** — over the socket when a host is
+running, in-process against the same guard when not.
+
+**One real defect found and fixed.** The admin branch ran *after* `post_f2`, so
+§B.8.4.2's "schedule · readiness · transport · busy · concurrency gates skipped
+for an admin request" did not hold: a grant whose schedule window was shut, or
+whose reconnect cooldown was running, answered
+`SESSION_REJECT{OUTSIDE_SCHEDULE}` instead of executing — and the commands
+affected are `revoke`, `revoke_all`, `master_off`, `end_session`, the ones
+reached for in an emergency. `admin_runs_even_when_the_schedule_window_is_shut`
+fails against the pre-fix ordering (verified by reverting the branch: reject 33).
+
+**Research that corrected the plan.** PAM was never the blocker: polkit runs the
+PAM conversation itself, out of process, in setuid `polkit-agent-helper-1`, so a
+direct PAM backend is redundant *and* unbuildable here. §B.8.8, §B.8.14's M1 row
+and the Ownership paragraph were amended. Also: an unprivileged caller may not
+pass a `details` map to `CheckAuthorization` at all (polkit refuses the whole
+call), so the operation name cannot reach the dialog as data — hence five action
+ids by operation class; `unix-session` crashes polkitd 127 (reproduced twice)
+and `unix-process` carries the CVE-2017-7572 race, so the subject is
+`system-bus-name`; "a fresh dialog per operation" rests on `auth_self` in the
+shipped policy file, not on the client's `ALWAYS_CHECK` flag. Full record:
+`kore_project_V3/agents/devops/reports/sub/2026-09-04_SUB_RESEARCH_VERIFIER_reauth_ipc.md`,
+synthesised in `agents/devops/reports/dependency_status.md`.
 
 ### NEXT, in order
 
-1. **Track D — CLI / IPC / platform.** `tornect pair|connect|unattended …|panic|devices`,
-   the host-role IPC dispatch loop over the §B.8.7.4 message set, and the
-   `tornect-platform` scaffold (`ipc`, `reauth`). **Carried in from track C** (its
-   B.8.14 row, not delivered): **admin intent + scope** — the branch reaches
-   `ADMIN_RESULT` but answers `ok: false, "not implemented at M1"`; the §B.8.4.1 scope
-   rules (`unlock(pk)`, `suspend(pk ≠ self)`, `revoke(pk ≠ self)`, `revoke_all`) are
-   unwritten — and the **stop token**, which `HELLO.stop_token` observes but the
-   unattended path never consults.
-   Cross-track notes still standing: the CLI must send `TOR_FALLBACK{}` after the
-   accept (or set `orphan_timeout = None`) and use
-   `fsm::HostAudit::new(Arc<SessionLog>)` as `HostDeps::audit`; `rotate-id`'s own
-   `HostIdRotated` append must stop once wired to the guard. Also wire
-   `ServerKeyPin` to a real `hosts.toml` (the headless default trusts on first use and
-   remembers nothing) and `OpaqueServerSetupSource` into the guard.
-2. **Track E — adversarial + fuzz sweep** → `security-reviewer` milestone close →
-   **live verification** (pair + attended + unattended over real Tor, two
-   `TORNECT_HOME` instances) → tag `m1`.
-3. Then **u1** (UI plan U0+U1), then M2.
+1. **Wire `serve_host` into `tornect host`.** This is the critical path and
+   earlier hand-offs did not name it: `tornect host` still serves only the
+   interim ping protocol of track 1, so the §B.8.14 M1 acceptance ("headless
+   unattended handshake ending in `SESSION_ACCEPT` … between two machines")
+   cannot be demonstrated over Tor however green the in-process suite is. Seams
+   to fill: `HostDeps::unattended` = `UnattendedAuth::new(..)
+   .with_admin_authority(Arc::new(GuardAdmin::new(guard)))`,
+   `HostDeps::stop_token` = `EmergencyStop::new(guard, kill)`,
+   `HostDeps::audit` = `fsm::HostAudit::new(Arc<SessionLog>)`,
+   `HostDeps::trusted` = the real `TrustedDeviceStore`, `HostDeps::consent` = a
+   CLI prompt, and **`HostDeps::kill` shared with the IPC `HostContext`** so
+   `tornect panic` and a remote `master_off` reach live handshakes (today
+   `HostContext.kill` is `None` and both say so honestly). Also: send
+   `TOR_FALLBACK{}` after the accept or set `orphan_timeout = None`; stop
+   `rotate-id` appending its own `HostIdRotated` once it goes through the guard;
+   wire `ServerKeyPin` to the real `hosts.toml` on the client side.
+2. **`tests/integration`** — listed as an M1 workspace member in both
+   `CLAUDE.md` and the §B.8.14 M1 row, and it does not exist. The §B.8.15
+   adversarial rows currently live inside the crates' own test modules.
+3. **Track E** — the adversarial + fuzz sweep, then the `security-reviewer`
+   milestone close, then **live verification** (pair + attended + unattended
+   over real Tor, two `TORNECT_HOME` instances), then tag `m1`.
+4. Then **u1** (UI plan U0+U1), then M2.
+
+### THE TRACK D REVIEW HAS NOT RUN — DO IT FIRST
+
+A six-dimension hostile review of `5ea5b22..HEAD` (3 725 added lines) was
+launched and **every agent died on a usage limit before doing any work**. The
+workflow returned `raw: 0, confirmed: []`. **That is not a clean bill of
+health — it is no review at all.** The script is preserved and re-runnable:
+
+```
+Workflow({scriptPath: '<scratchpad>/review_run.js', args: {range: '5ea5b22..HEAD'}})
+```
+
+Its six dimensions are admin scope, the emergency stop, the IPC endpoint, the
+polkit backend, the OPAQUE registration split, and secrets/spec conformance,
+each finding attacked by three perspective-diverse refuters. Re-run it against
+the range that includes whatever lands next. Budget ~1.5–2 h; concurrency on
+this box is 2.
 
 ### STILL OPEN / UNTESTED (do not mark these done)
 
-- The §B.8.15 **A14 core-dump sweep** is OPEN. The new wipe test covers the primitive
-  and the observable contract only — once `finish()` returns its frame is gone and no
-  safe-Rust test can inspect it. Marked partial in VERIFICATION.md deliberately.
-- §B.8.5.2's **per-minute and host-wide caps have no dedicated test**; only the per-pk
-  slot lifetime and pre-emption do.
-- Deferred to plan **r7** (decisions M1-31 / M1-32): whether `PAIR_REQUEST` /
-  `PAIR_ACCEPT` are signed (M1-37 answers half of this), and whether `quic_spki` binds
-  the pairing-pinned `host_device_pk` instead of the onion identity key.
-- OPEN rows worth knowing: EFF passphrase word list (M8), `mlock`/`VirtualLock` (M6),
-  keyring canary + persistent OS backends (M6), grant preconditions reading
-  unauthenticated inputs.
+- Everything the previous hand-off listed is still open: the §B.8.15 **A14
+  core-dump sweep**, §B.8.5.2's **per-minute and host-wide caps**, plan **r7**
+  (decisions M1-31 / M1-32), the EFF word list (M8), `mlock`/`VirtualLock` (M6),
+  the keyring canary (M6).
+- **Three new NEEDS-DEVICE / OPEN rows** in `docs/VERIFICATION.md`: the IPC
+  foreign-uid rejection has no second account on this machine to test with; the
+  polkit *grant* path needs the policy file installed once as root
+  (`sudo install -m 0644 packaging/polkit/org.tornect.policy
+  /usr/share/polkit-1/actions/ && sudo systemctl restart polkit`, then
+  `cargo test -p tornect-platform -- --ignored live_polkit`); `tornect panic`
+  cannot end sessions until item 1 above is done.
+- Autostart install/uninstall (M6) and backup export/import (M8) authorise
+  through the guard and log, then report that nothing was applied.
+- The Windows named-pipe endpoint returns `Unsupported`: §B.8.7.4's owner-only
+  DACL, `PIPE_REJECT_REMOTE_CLIENTS` and client-SID check need a Win32 binding
+  that cannot be verified here, and §B.8.14 puts it at M6.
+
+### TWO JUDGEMENT CALLS, EASILY REVERSED
+
+Both were made without a spec instruction and flagged to the operator:
+
+1. **Five polkit action ids by operation class** (grant / enable / autostart /
+   export / settings) rather than one fixed message or ~15 ids. One file plus
+   one match arm to change.
+2. **The emergency stop card travels in a new `MasterOnPayload`**, not in
+   `IpcResponse.detail` — `detail` is a human-readable string that reaches logs
+   and error messages, and this is a 16-byte secret. Schema-additive.
 
 ### GOTCHAS
 
-- Always `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp` (`/tmp` is a 3.7 GiB quota tmpfs);
-  Tor state under `target/tornect-test/`, never `/tmp`. Docs-only commits:
-  `TORNECT_SKIP_HOOKS=1`.
-- **Disk:** the tree hit 47 G on a 99 G root at 97% full this session and was cleaned to
-  19 G. Safe to delete: `target/debug/incremental`, `fuzz/target`, `target/<track>` dirs,
-  `target/doc`, cross-compile dirs, stale `*.log`. **Keep** `target/debug/deps` (18 G —
-  else a cold Arti rebuild) and `target/tornect-test/` (10 real Ed25519 seeds + a live
-  onion service).
-- **Workflow concurrency is 2**, not "as many as you launch" — `mx-vm` has 4 vCPU. A
-  126-agent review took 4h26m, an 84-agent one 2h50m. Launch them in the background,
-  never near the end of a session; a usage-limit death loses the whole run.
-- If a worktree ever shares `target/`, `target/debug/xtask` embeds *that* worktree's
-  root and `cargo xtask verify` silently verifies the wrong tree — `touch
-  xtask/src/main.rs` first, or give it its own `CARGO_TARGET_DIR`.
-- **Test-harness facts** (cost time to rediscover): a grant needs
-  `MutationGuard::master_on` (the switch is off by default, §B.8 opt-in) and
-  `Preset::HeadlessBox` (the one preset that waives the "prior attended session"
-  precondition); the OPAQUE registration must run against the `ServerSetup` the store
-  ends up holding, so bootstrap first and read `server_setup()` back.
-- Piping cargo through `grep`/`tail` masks its exit code — the pipeline's status is the
-  last command's. Redirect to a file and check `$?`.
+Everything in the previous hand-off still applies. Additions:
+
+- **`docs/PLAN.md` and `TORNECT_PLAN.md` must stay byte-identical** —
+  `cargo xtask verify` compares them. Editing only one fails the gate; this
+  session hit it.
+- The workspace lints deny `print_stderr` **in tests too**; a test that prints
+  diagnostics needs `#[allow(clippy::print_stderr)]` on the module.
+- `cargo doc` runs with `-D warnings`, so an intra-doc link to an item that is
+  not in scope at that path (inside a `mod imp`, or a renamed function) fails
+  the gate after everything else has passed. Cheap to check early:
+  `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
+- Changing the workspace `Cargo.toml` forces a full rebuild of the Arti tree —
+  about 15 minutes here. Batch dependency changes.
+- Disk: cleaned `target/debug/incremental` (9.9 G) and `target/doc` mid-session;
+  ended at 82 % with 18 G free.
 
 ### PENDING USER ACTIONS
 
-1. `gh auth refresh -h github.com -s workflow`, then
-   `git add -f .github/workflows/ci.yml && git commit -m "ci: add GitHub Actions workflow" && git push`
-   (token lacks the `workflow` scope; file excluded via `.git/info/exclude`).
-   **CI has still never run.**
-2. Copy `.claude/settings.recommended.json` to `.claude/settings.json` after review.
-3. Decide whether to commit the **`framing` fuzz corpus**: `framing` is a live fuzz
-   target but its corpus exists only in the gitignored `target/fuzz-corpus/framing`,
-   one `cargo clean` from gone. It belongs in `fuzz/corpus/framing/`.
-4. A second machine would clear the "two machines on different NATs" NEEDS-DEVICE rows.
+Unchanged from the previous hand-off (CI has still never run; `.claude/settings.json`;
+the `framing` fuzz corpus; a second machine), plus:
 
-Work autonomously per the CLAUDE.md ground rules (verify like hostile QA, never start
-M(n+1) with M(n) red, `security-reviewer` at milestone close). Commits carry **no AI
-references**. End the session with this same kind of report plus memory, Part G and
-`docs/notes/m1-state.md` updates.
+5. `sudo install -m 0644 packaging/polkit/org.tornect.policy
+   /usr/share/polkit-1/actions/org.tornect.policy && sudo systemctl restart polkit`
+   — until then every access-increasing operation refuses with "polkit action …
+   is not registered", which is fail-closed and loud but not usable. The
+   debug-build escape `TORNECT_DEV_REAUTH=allow` is the development workaround.
+
+Work autonomously per the CLAUDE.md ground rules (verify like hostile QA, never
+start M(n+1) with M(n) red, `security-reviewer` at milestone close). Commits
+carry **no AI references**. End the session with this same kind of report plus
+memory, Part G and `docs/notes/m1-state.md` updates.
 
 ---
 
 ## What this session did
 
-Cleaned the tree from 47 G to 19 G (the disk was at 97%, one build from failing); ran a
-12-dimension hostile review of the unreviewed tracks A/B and fixed all three survivors,
-including a HIGH protocol flaw that made the pairing SAS provide no MITM protection at
-all — reproduced, then fixed with a normative §B.3 amendment; built track C end to end
-(OPAQUE-3DH core, host branch, client branch, headless end-to-end session); reviewed it
-and fixed all three survivors there too. Gate green at 289 tests throughout; 10 commits
-pushed.
+Finished track D. Found and fixed one real protocol defect (the admin-intent
+ordering against §B.8.4.2) with a mutation-verified regression. Created
+`crates/tornect-platform` with an owner-only IPC endpoint and a polkit re-auth
+backend proven against live polkitd 127, not mocked. Split the OPAQUE
+registration so the password stays on the CLI side. Built the whole
+`tornect unattended` surface with one dispatch behind both the socket and
+offline routes, and exercised it by hand — including a pty-driven `grant` that
+refused a weak password twice and then created a real grant whose stored record
+a real `HostLogin` can open. Corrected the plan's "PAM/polkit" wording and added
+18 verification rows, three of them deliberately not VERIFIED.
 
-**Honest limits:** `m1` is not tagged; track D and track E are untouched; admin intent
-+ scope and the stop token from track C's own B.8.14 row are stubbed, not done; live
-verification over real Tor has not run since track 1; the A14 core-dump sweep and the
-§B.8.5.2 rate caps remain untested; and CI has still never run on GitHub.
+**Honest limits:** `m1` is not tagged; **the track D review never ran** (usage
+limit, zero agents completed); `serve_host` is still not wired into
+`tornect host`, so no unattended session has ever crossed real Tor;
+`tests/integration` does not exist; track E is untouched; CI has still never run.
