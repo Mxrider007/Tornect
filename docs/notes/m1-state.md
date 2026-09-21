@@ -1,11 +1,17 @@
 # M1 state — signaling over Tor (hand-off, 2026-09-04)
 
-Milestone 1 is **about half done**: track 1 (Arti embedding) and phase-2 part 1 (tracks A + B:
-the unattended storage/limiter/guard/IPC types in `tornect-core`, and the CBOR envelope,
-transcript, pairing/SAS and attended FSM in `tornect-signal`) are implemented, reviewed twice
-and green. The unattended PAKE branch (track C), the CLI/IPC/`tornect-platform` surface
-(track D), the adversarial + fuzz sweep (track E), the milestone security review and the live
-verification are **not started**. `m1` is **not** tagged.
+Milestone 1 is **most of the way done**: track 1 (Arti embedding), phase-2 part 1 (tracks A + B),
+track C (the unattended PAKE branch) and now track D (CLI / IPC / `tornect-platform`) are
+implemented and green at 320 tests. Track E (the adversarial + fuzz sweep), the milestone
+`security-reviewer` close and the live verification over real Tor are **not done**, and `m1` is
+**not** tagged.
+
+**The largest remaining gap, which earlier hand-offs did not name:** `serve_host` — the §B.8.4.5
+host FSM that tracks A, B and C built — **is not wired into `tornect host`**, which still serves
+only the interim ping protocol of track 1. Every unattended test to date drives the FSM
+in process. Until the CLI hosts it, the §B.8.14 M1 acceptance ("headless unattended handshake
+ending in `SESSION_ACCEPT` … between two machines") cannot be demonstrated end to end over Tor,
+however green the in-process suite is. Seam list in *Still open* below.
 
 ## Done
 
@@ -65,9 +71,18 @@ runs **after M1, before M2**; the UI plan's "Always allow" checkbox/badge is rej
    `unlock(pk)` / `suspend(pk ≠ self)` / `revoke(pk ≠ self)` / `revoke_all`, are
    unimplemented) and the **stop token** (`HELLO.stop_token` is observed by the existing
    seam but nothing in the unattended path consults it yet).
-3. **Track D — CLI/IPC/platform**: `tornect pair|connect|unattended …|panic|devices`, the
-   host-role IPC dispatch loop, and the `tornect-platform` scaffold (`ipc`, `reauth`).
-4. **Track E — adversarial + fuzz sweep**, then the `security-reviewer` milestone close, then
+3. ~~Track D — CLI/IPC/platform~~ — **done 2026-09-05** (`fbc7a31`, `be58ea6`, `48ca97e`).
+   See *Track D* below. Admin intent + scope and the stop token, carried in from track C, are
+   both delivered.
+4. **Wire `serve_host` into `tornect host`** — not previously listed, and now the critical path
+   to the M1 acceptance. The seams to fill: `HostDeps::unattended` = `UnattendedAuth` (with
+   `.with_admin_authority(GuardAdmin)`), `HostDeps::stop_token` = `EmergencyStop`,
+   `HostDeps::audit` = `fsm::HostAudit::new(Arc<SessionLog>)`, `HostDeps::trusted` = the real
+   `TrustedDeviceStore`, `HostDeps::consent` = a CLI prompt, and `HostDeps::kill` shared with
+   the IPC context so `tornect panic` and a remote `master_off` reach live handshakes. The CLI
+   must also send `TOR_FALLBACK{}` after the accept or set `orphan_timeout = None`, and
+   `rotate-id`'s own `HostIdRotated` append must stop once it goes through the guard.
+5. **Track E — adversarial + fuzz sweep**, then the `security-reviewer` milestone close, then
    **live verification** (pair + attended + unattended over real Tor with two `TORNECT_HOME`
    instances), then tag `m1`.
 
@@ -146,6 +161,92 @@ Gate after track C and its review: `cargo xtask verify` green, **289 tests**.
 "prior attended session" precondition (`Preset::HeadlessBox`); the OPAQUE registration must
 run against the `ServerSetup` the store ends up holding, so bootstrap the store first and
 read `server_setup()` back rather than generating one locally.
+
+## Track D — CLI / IPC / platform (2026-09-05)
+
+Track D was framed by the previous hand-off as "wiring plus a new crate". Reading the
+tree first changed the estimate in both directions: the §B.8.4.1 **scope matrix was
+already implemented** in `MutationGuard::admin`, `AdminOp::from_wire`, `AdminEffect` and
+`guard::{stop_token, emergency_stop}` — so admin intent and the stop token were seams to
+fill, not logic to write — but `crates/tornect-platform` **did not exist at all**, and
+`serve_host` **is still not wired into `tornect host`** (see *Still open* below).
+
+**`fbc7a31` — admin intent, the emergency stop, and an ordering fix.**
+
+- `AdminAuthority` is the seam; `GuardAdmin` wraps `MutationGuard::admin`; `RefuseAdmin`
+  is the default, so a host wired without an authority refuses rather than pretending to
+  have run the command. `UnattendedVerdict::Admin` now carries the resulting
+  `AdminEffect`, applied by `serve_host` because that is where the kill switch lives.
+  The two host-wide effects (`master_off`, `revoke_all`) fire it; the two per-device ones
+  cannot with an M1 host-wide switch and are documented as an M4 gap rather than
+  approximated — the store mutation has already happened, so the revoked device's *next*
+  handshake fails its grant lookup regardless.
+- `EmergencyStop` implements `StopTokenCheck`: a constant-time match turns the master
+  switch off, revokes every grant, fires `BYE{EMERGENCY_STOP}` and clears the stored
+  token, so the printed card is single-use. A failed apply leaves the token in place —
+  a stop that did not happen must not look like one that did.
+- **Ordering defect fixed.** The admin branch sat *after* `post_f2`, so §B.8.4.2's
+  "schedule · readiness · transport · busy · concurrency gates skipped" for an admin
+  request did not hold: a grant whose schedule window was shut, or whose reconnect
+  cooldown was running, answered `SESSION_REJECT{OUTSIDE_SCHEDULE}` instead of executing.
+  The commands affected are `revoke`, `revoke_all`, `master_off` and `end_session` — the
+  deny-direction ones a user reaches for in an emergency. Requester eligibility is
+  unchanged; `MutationGuard::admin` still re-checks state, expiry, `active_from`, the
+  hard lock and the clock-rollback rule. `admin_runs_even_when_the_schedule_window_is_shut`
+  fails against the pre-fix ordering (verified by reverting the branch: reject 33).
+
+**`crates/tornect-platform` — the M1 scaffold (§B.8.14: two modules, no more).**
+
+- `ipc` — the owner-only endpoint. `<state_dir>/ipc.sock` at 0600 inside an already-0700
+  directory, and the decisive check: the peer's `SO_PEERCRED` uid must equal the uid that
+  owns the socket file *this process created*. Comparing against the socket's own owner
+  rather than a `getuid()` call keeps the crate on `#![forbid(unsafe_code)]` with no
+  `libc`/`nix`/`rustix` pin — `tokio::net::UnixStream::peer_cred()` is already available
+  under the `net` feature. A stale socket left by a crashed host is replaced only after a
+  connect attempt proves nothing is listening; a live one refuses with `AlreadyRunning`.
+  Connections are served one at a time, deliberately: every op behind the handler is a
+  guard call against a store with a single advisory lock. Framing is the §B.3 shape,
+  implemented locally because the crate direction forbids depending on `tornect-signal`
+  and `tornect-core` carries no async runtime.
+  Windows is a compile-checked scaffold that returns `Unsupported`: §B.8.7.4's owner-only
+  DACL, `PIPE_REJECT_REMOTE_CLIENTS` and client-SID check need a Win32 binding that
+  cannot be verified here, and §B.8.14 schedules "IPC endpoint per OS" at M6 anyway. A
+  pipe without the DACL would be worse than none, because it would look like it worked.
+- `reauth` — `PolkitReAuth` over the system D-Bus, plus the debug-build-only
+  `TORNECT_DEV_REAUTH=allow` escape and a `RefuseReAuth` default. Verified against live
+  polkitd 127 on this machine, including the unregistered-action path.
+
+**Research that changed the design** (full record:
+`kore_project_V3/agents/devops/reports/sub/2026-09-04_SUB_RESEARCH_VERIFIER_reauth_ipc.md`,
+synthesised in `agents/devops/reports/dependency_status.md`):
+
+1. **PAM was never the blocker.** This machine has no `libpam` headers and no sudo, which
+   looked fatal to §B.8.14's "PAM/polkit on the Linux dev machine". polkit *runs* the PAM
+   conversation itself, out of process, in setuid `polkit-agent-helper-1` (journal:
+   `pam_unix(polkit-1:auth): conversation failed`). A direct PAM backend is redundant and
+   unbuildable here. **§B.8.14's M1 row and §B.8.8's "PAM fallback for headless" want a
+   footnote saying so.**
+2. **`op` cannot reach the dialog.** An unprivileged caller may not pass a `details` map —
+   polkit refuses the whole call. This contradicts `guard.rs`'s "a fresh dialog per
+   operation (`op` names it)". Resolved with **five action ids by operation class**;
+   `every_guard_operation_maps_to_a_registered_action` pins every `op` string the guard
+   emits to one of the five the policy file declares, and an unknown op deliberately
+   lands on the strongest wording.
+3. **"Fresh dialog per operation" rests on the policy file**, not the client:
+   `ALWAYS_CHECK` does not bypass a retained authorization. `packaging/polkit/org.tornect.policy`
+   uses `auth_self` and carries a **READ BEFORE EDITING** comment, because changing it to
+   `auth_self_keep` would weaken the model with no code change and no failing test.
+4. **An unregistered action is `Unavailable`, never `Denied`** — telling an operator
+   "wrong password" when the real problem is a missing policy file sends them chasing the
+   wrong thing. Pinned by a test that needs neither polkit nor a human.
+5. **`unix-session` crashes polkitd 127** (reproduced twice) and `unix-process` carries
+   the CVE-2017-7572 race. The subject is `system-bus-name`.
+
+**Honest limit, in the module's own docs:** polkit cannot defend against same-uid code
+execution — anyone running as this user can ptrace the process or run their own build
+against the same state dir. What it buys is proof a human is at the host, which is exactly
+the §B.8 adversary: a remote peer with a device key and the grant password and no way to
+answer a dialog.
 
 ## Round 3 (2026-09-04)
 
