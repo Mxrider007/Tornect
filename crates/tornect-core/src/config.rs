@@ -79,15 +79,20 @@ pub struct Tor {
     pub bootstrap_timeout_secs: u32,
     /// How to reach the Tor network when a direct connection is blocked
     /// (decision M1-38): `auto` tries direct Tor, then obfs4 bridges, then
-    /// Snowflake, starting from whichever worked last time.
+    /// Snowflake, starting from whichever worked last time. Once a bridge was
+    /// needed, direct Tor is tried last; with `bridge_lines` set it is not tried.
     pub bridges: BridgeMode,
-    /// Extra bridge lines (`obfs4 IP:PORT FINGERPRINT cert=… iat-mode=0`,
-    /// `snowflake …`), tried before the built-in bridges of the same transport.
-    /// Private bridges from <https://bridges.torproject.org> survive censors
-    /// that block the public built-in list.
+    /// Private bridge lines (`obfs4 IP:PORT FINGERPRINT cert=… iat-mode=0`,
+    /// `webtunnel …`, `snowflake …`) from <https://bridges.torproject.org>.
+    /// They **replace** the public built-in bridges of their transport, as in
+    /// Tor Browser: mixing them would let a censor that lists the public ones
+    /// find the private one by correlation. Lines that do not parse are skipped
+    /// and reported by position only, never by content.
     pub bridge_lines: Vec<String>,
-    /// The `lyrebird` pluggable-transport binary. Unset: `$TORNECT_PT_DIR`,
-    /// then next to the executable (or in its `pt/` directory), then `PATH`.
+    /// The `lyrebird` pluggable-transport binary, as an absolute path; it may be
+    /// a build this release does not pin (logged). Unset: the copy bundled next
+    /// to the executable (or in its `pt/` directory), else `$TORNECT_PT_DIR`,
+    /// and it must match the pinned SHA-256. `PATH` is never searched.
     pub pt_path: Option<PathBuf>,
 }
 

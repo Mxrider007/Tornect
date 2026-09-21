@@ -225,7 +225,9 @@ impl TorNode {
             match Self::try_rung(paths, config, transport, ladder.policy(rung), &mut on_event).await
             {
                 Ok(node) => {
-                    bridges::remember(paths, rung);
+                    if ladder.learns() {
+                        bridges::remember(paths, rung);
+                    }
                     on_event(&LadderEvent::Ready { rung });
                     tracing::info!(%rung, "connected to the Tor network");
                     return Ok(node);
@@ -574,7 +576,8 @@ impl TorNode {
         prefs.connect_to_onion_services(BoolOrAuto::Explicit(true));
         prefs.set_isolation(isolation.0);
         let address = id.onion_address();
-        tracing::info!(host = %id, port, "connecting to host over Tor");
+        // The short form: logs end up in bug reports (SLICE-A1 A1-9).
+        tracing::info!(host = %id.short(), port, "connecting to host over Tor");
         let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
         let mut vanguard_grace: Option<tokio::time::Instant> = None;
         let stream = loop {
@@ -599,7 +602,7 @@ impl TorNode {
                 Err(_) => return Err(SignalError::Timeout("connecting to the host over Tor")),
             }
         };
-        tracing::info!(host = %id, port, "onion stream open");
+        tracing::info!(host = %id.short(), port, "onion stream open");
         Ok(OnionStream::new(stream, port))
     }
 

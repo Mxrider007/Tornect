@@ -7,6 +7,15 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+// `+crt-static` comes from `.cargo/config.toml`, and a `RUSTFLAGS` variable
+// silently replaces it; a dynamically linked `tornect.exe` would then load
+// libc++/libunwind through the DLL search order (SLICE-A1 A1-10).
+#[cfg(all(windows, target_env = "gnu", not(target_feature = "crt-static")))]
+compile_error!(
+    "the Windows build must link the C runtime statically: build without RUSTFLAGS, \
+     or add `-C target-feature=+crt-static` to it"
+);
+
 mod tor_cmd;
 mod unattended;
 
@@ -356,10 +365,10 @@ fn cmd_doctor(paths: &Paths) -> anyhow::Result<()> {
         "tor: bridges={:?} last-worked={} lyrebird={} extra-bridge-lines={}",
         tor.bridges,
         tornect_signal::tor::last_good(paths).map_or("none".to_owned(), |r| r.to_string()),
-        lyrebird.as_ref().map_or_else(
-            || "NOT FOUND (obfs4/Snowflake unavailable; see tor.pt_path)".to_owned(),
-            |p| p.display().to_string()
-        ),
+        match &lyrebird {
+            Ok(p) => p.display().to_string(),
+            Err(why) => format!("UNAVAILABLE ({why}; obfs4/Snowflake cannot run)"),
+        },
         tor.bridge_lines.len()
     );
     let store = FileSecretStore::open(paths.keys_dir())?;
