@@ -1722,6 +1722,76 @@ async fn established_session_ends_on_kill_switch_and_idle() {
     drop(session);
 }
 
+/// A kill fired for an earlier session must not latch onto the next one. The
+/// switch still reports `fired()`, but a session accepted afterwards is armed
+/// against the newer generation and stays live — the host answers its `PING`
+/// instead of sending `BYE` on entry — while a kill fired *during* the live
+/// session still tears it down. Regression: the old `watch<Option<u16>>`
+/// returned the latched reason to every later session, ending it immediately.
+#[tokio::test(start_paused = true)]
+async fn a_prior_kill_does_not_latch_onto_a_later_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    host.cfg.orphan_timeout = None;
+    host.cfg.idle_timeout = Duration::from_secs(30);
+    let kill = KillSwitch::new();
+    host.deps.kill = kill.clone();
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+
+    // A kill fired before this stream is even accepted (a master-off left over
+    // from an earlier session). It stays observable through `fired()`…
+    kill.kill(bye::MASTER_OFF);
+    assert_eq!(kill.fired(), Some(bye::MASTER_OFF));
+
+    let client = client_side(tmp.path(), host.identity.id(), CLIENT_SEED);
+    client
+        .known
+        .pin(host.identity.id(), "Desk of Bob", host_device_pk())
+        .unwrap();
+    host.consent
+        .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut session = match connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        Intent::Session,
+    )
+    .await
+    .unwrap()
+    {
+        ClientOutcome::Session(s) => s,
+        ClientOutcome::Paired { .. } => panic!(),
+    };
+
+    // …but the later session is not killed on entry: the host answers the ping.
+    // On the latched code this returned `Err(PeerBye { MASTER_OFF })`.
+    session
+        .ping()
+        .await
+        .expect("host answers ping, not BYE on entry");
+
+    // A kill fired now, during the live session, still ends it: host-wide
+    // teardown of live sessions is intact.
+    kill.kill(bye::PANIC);
+    match task.await.unwrap().unwrap() {
+        HostOutcome::Session { end, .. } => assert_eq!(end, SessionEnd::Killed(bye::PANIC)),
+        other => panic!("{other:?}"),
+    }
+    let event = session.next_event(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        event,
+        Some(SessionEvent::Bye {
+            reason: bye::PANIC,
+            detail: None
+        })
+    );
+}
+
 #[tokio::test]
 async fn candidates_reach_the_sink_and_busy_hosts_reject() {
     #[derive(Default)]

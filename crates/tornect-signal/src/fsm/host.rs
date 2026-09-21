@@ -211,12 +211,33 @@ impl UnattendedHook for NotGranted {
     }
 }
 
-/// One-click kill for established sessions: `kill(reason)` makes every
-/// stream watching this switch send `BYE{reason}` and close.
+/// One-click kill for established sessions: [`kill`](Self::kill) makes every
+/// session that was live when it fired send `BYE{reason}` and close.
+///
+/// **Host-wide (M1 scope, §B.8.4.1).** It carries one reason to every stream
+/// sharing these deps and cannot address a single device.
+///
+/// **It does not latch.** A session snapshots the kill generation when it
+/// [`arm`](Self::arm)s (at accept time); its [`KillGuard`] fires only for a
+/// `kill` with a newer generation — one that happened after it armed. A reason
+/// left behind by an earlier session therefore never ends a session accepted
+/// later, so a host that was master-off or paused and is turned back on serves
+/// new sessions without the switch having to be reset. [`fired`](Self::fired)
+/// still reports the most recent reason, for status and tests.
 #[derive(Debug, Clone)]
 pub struct KillSwitch {
-    tx: Arc<watch::Sender<Option<u16>>>,
-    rx: watch::Receiver<Option<u16>>,
+    tx: Arc<watch::Sender<KillState>>,
+}
+
+/// The watched state behind a [`KillSwitch`].
+#[derive(Debug, Clone, Copy, Default)]
+struct KillState {
+    /// Bumped by every [`KillSwitch::kill`]. A [`KillGuard`] compares this to
+    /// the value it captured at arm time, so it reacts only to a kill fired
+    /// after the session began — never to a stale latched reason.
+    generation: u64,
+    /// The reason the most recent kill fired with (for [`KillSwitch::fired`]).
+    reason: Option<u16>,
 }
 
 impl Default for KillSwitch {
@@ -229,28 +250,59 @@ impl KillSwitch {
     /// A switch that has not fired.
     #[must_use]
     pub fn new() -> Self {
-        let (tx, rx) = watch::channel(None);
-        Self {
-            tx: Arc::new(tx),
-            rx,
-        }
+        let (tx, _rx) = watch::channel(KillState::default());
+        Self { tx: Arc::new(tx) }
     }
 
-    /// Fire with a [`messages::bye`] reason.
+    /// Fire with a [`messages::bye`] reason. Ends every currently-armed
+    /// session; a session armed after this call is unaffected.
     pub fn kill(&self, reason: u16) {
-        self.tx.send_replace(Some(reason));
+        self.tx.send_modify(|state| {
+            // Wrapping is unreachable in practice (2^64 kills); it only keeps
+            // the "changed since I armed" comparison (`generation != base`)
+            // exact rather than risking a debug overflow panic.
+            state.generation = state.generation.wrapping_add(1);
+            state.reason = Some(reason);
+        });
     }
 
-    /// The reason it fired with, if it did.
+    /// The reason the switch most recently fired with, if it ever has.
     #[must_use]
     pub fn fired(&self) -> Option<u16> {
-        *self.rx.borrow()
+        self.tx.borrow().reason
     }
 
-    async fn wait(&mut self) -> u16 {
+    /// Snapshot the switch for one session. The returned [`KillGuard`] fires
+    /// only for a [`kill`](Self::kill) after this call, so a reason latched by
+    /// an earlier session never ends this one.
+    #[must_use]
+    pub fn arm(&self) -> KillGuard {
+        let rx = self.tx.subscribe();
+        let base = rx.borrow().generation;
+        KillGuard { rx, base }
+    }
+}
+
+/// One session's view of a [`KillSwitch`], from [`KillSwitch::arm`].
+#[derive(Debug)]
+pub struct KillGuard {
+    rx: watch::Receiver<KillState>,
+    base: u64,
+}
+
+impl KillGuard {
+    /// Resolve with the `BYE` reason once the switch fires after this guard was
+    /// armed. Otherwise never resolves — including for a kill that predates the
+    /// guard — so it composes in the session `select!` beside the peer's frames.
+    pub async fn killed(&mut self) -> u16 {
         loop {
-            if let Some(reason) = *self.rx.borrow_and_update() {
-                return reason;
+            {
+                let state = self.rx.borrow_and_update();
+                if state.generation != self.base
+                    && let Some(reason) = state.reason
+                {
+                    return reason;
+                }
             }
             if self.rx.changed().await.is_err() {
                 std::future::pending::<()>().await;
@@ -467,6 +519,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let _streams = Counted::new(&deps.stats.streams);
+    // Armed at accept, before the handshake: a kill fired at any point from here
+    // to session end ends this stream, while one fired earlier (a master-off or
+    // panic left over from a previous session) does not — the switch no longer
+    // latches onto sessions accepted after it fired.
+    let mut kill = deps.kill.arm();
     let host_pk = deps.signer.public_key();
     let mut chan = Channel::new(stream, &host_pk);
 
@@ -718,7 +775,7 @@ where
     let th_final = chan.th();
     let end = {
         let _established = Counted::new(&deps.stats.established);
-        established(&mut chan, cfg, deps).await
+        established(&mut chan, cfg, deps, &mut kill).await
     };
     // Logged before any error propagates: a peer that hangs up mid-frame or
     // sends an illegal kind must not erase its own session-end line (§B.6,
@@ -930,11 +987,11 @@ async fn established<S>(
     chan: &mut Channel<S>,
     cfg: &HostConfig,
     deps: &HostDeps,
+    kill: &mut KillGuard,
 ) -> Result<SessionEnd, HandshakeError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let mut kill = deps.kill.clone();
     // `checked_add`: a configured timeout near `Duration::MAX` means "never",
     // never a panic.
     let orphan_at = cfg
@@ -951,7 +1008,7 @@ where
         let wait = deadline.map_or(Duration::MAX, |d| d.saturating_duration_since(now));
         let received = tokio::select! {
             biased;
-            reason = kill.wait() => {
+            reason = kill.killed() => {
                 chan.bye(reason).await?;
                 return Ok(SessionEnd::Killed(reason));
             }
