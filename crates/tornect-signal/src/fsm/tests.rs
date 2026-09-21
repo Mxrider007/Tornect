@@ -2143,6 +2143,61 @@ async fn unattended_accept_reports_the_derived_session_token() {
     assert_eq!(host.consent.session_popups(), 0, "no popup for unattended");
 }
 
+/// §B.8.4.1 / §B.8.6.1: a remote `master_off` whose requester vanished before
+/// `ADMIN_RESULT` could be written still fires the kill switch. The store change
+/// commits before the verdict exists, so the effect on the *other* live sessions
+/// must not hang on whether the requester's circuit survived (track D S2).
+#[tokio::test]
+async fn an_admin_effect_fires_even_when_its_answer_cannot_be_sent() {
+    struct AdminAfterHangup {
+        hung_up: Arc<tokio::sync::Notify>,
+    }
+    impl UnattendedHook for AdminAfterHangup {
+        fn handle<'a>(
+            &'a self,
+            _: UnattendedContext<'a>,
+        ) -> BoxFuture<'a, Result<UnattendedVerdict, HandshakeError>> {
+            Box::pin(async move {
+                self.hung_up.notified().await;
+                Ok(UnattendedVerdict::Admin {
+                    result: messages::AdminResult {
+                        ok: true,
+                        detail: None,
+                    },
+                    effect: tornect_core::unattended::guard::AdminEffect::MasterOff,
+                })
+            })
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let hung_up = Arc::new(tokio::sync::Notify::new());
+    host.deps.unattended = Arc::new(AdminAfterHangup {
+        hung_up: Arc::clone(&hung_up),
+    });
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let raw = raw_unattended_request(&host, CLIENT_SEED, b).await;
+    // The requester's stream is gone before the verdict is answered.
+    drop(raw);
+    hung_up.notify_one();
+
+    let outcome = task.await.unwrap();
+    assert!(
+        outcome.is_err(),
+        "the failed send is still reported: {outcome:?}"
+    );
+    assert_eq!(
+        host.deps.kill.fired(),
+        Some(bye::MASTER_OFF),
+        "a committed master_off must end live sessions whether or not its answer arrived"
+    );
+}
+
 /// The unattended seam hands `HandshakeError`s from the AUTH exchange back
 /// unchanged; a reject decided after the stream died in a violation is
 /// logged but not sent (§B.8.4.5 `AwaitKe3` row).

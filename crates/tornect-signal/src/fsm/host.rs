@@ -635,9 +635,17 @@ where
                 // requester's own stream is one of the streams it would tear
                 // down — sending first is what lets the device that asked for
                 // the emergency stop actually see it succeed.
-                chan.send(&result, Some(&*deps.signer)).await?;
+                //
+                // The effect never *depends* on the send, though: the store
+                // change has already committed, so a requester whose circuit
+                // dropped while it waited (common over Tor, likelier still in
+                // an emergency) must not leave the other live sessions running
+                // against a store that says access is off. The send error is
+                // reported only after the effect has fired.
+                let sent = chan.send(&result, Some(&*deps.signer)).await;
                 chan.close().await;
                 apply_admin_effect(deps, &effect);
+                sent?;
                 return Ok(HostOutcome::Admin { device, ok });
             }
             UnattendedVerdict::Accept { proof, caps } => (proof, caps),

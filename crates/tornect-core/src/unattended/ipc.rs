@@ -948,8 +948,9 @@ pub struct PolicyInputsPayload {
 ///
 /// It travels as a payload rather than in `IpcResponse.detail` because `detail`
 /// is a human-readable string that ends up in error messages and logs; a
-/// 16-byte secret must not. `Debug` redacts it for the same reason.
-#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+/// 16-byte secret must not. `Debug` redacts it for the same reason, and it is
+/// wiped on drop (§B.8.7.2, A14).
+#[derive(Clone, PartialEq, Eq, Encode, Decode, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 #[cbor(map)]
 pub struct MasterOnPayload {
     /// The stop code, shown once at enable time (§B.8.7.4).
@@ -967,8 +968,8 @@ impl fmt::Debug for MasterOnPayload {
 }
 
 /// `RegStart` payload. `Debug` redacts both members (A14: no KE bytes or capabilities
-/// in traces).
-#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+/// in traces), and both are wiped on drop.
+#[derive(Clone, PartialEq, Eq, Encode, Decode, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 #[cbor(map)]
 pub struct RegStartPayload {
     /// `RegistrationResponse::serialize()` (64 bytes).

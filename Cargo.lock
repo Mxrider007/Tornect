@@ -5826,6 +5826,7 @@ dependencies = [
  "tornect-core",
  "tracing",
  "zbus",
+ "zeroize",
 ]
 
 [[package]]
