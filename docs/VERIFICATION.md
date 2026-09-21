@@ -142,6 +142,7 @@ locally, so those backends are compiled and tested by the Linux CI job instead.
 | Automatic fallback direct → obfs4 → Snowflake under real censorship | NEEDS-DEVICE(censored network) | Recipe: on a network that blocks Tor relays (or with the relay IPs firewalled), `TORNECT_PT_DIR=<dir with lyrebird> tornect tor-check`; expect `direct Tor did not work: no bootstrap progress for 40 s`, then obfs4, then Snowflake, and `state/tor-transport` = the rung that worked. Ladder order, stall/cap policy and last-good ordering are unit-tested (`tor::bridges::tests`) |
 | Onion-service **hosting** over bridges | OPEN | code path supports it (bridge = first hop of every circuit); run `tornect --bridges snowflake host` + `ping` from a second instance |
 | lyrebird provenance (GPG + SHA-256) | VERIFIED | 2026-09-21: Tor Browser Developers key `EF6E286D…93298290`, 3 good signatures, hashes pinned in `packaging/pt/SOURCES.md` |
+| lyrebird pin enforced at run time (M1-40) | VERIFIED | 2026-09-21 mx-vm: `tornect doctor` accepts the pinned `target/pt/linux-x86_64/…/lyrebird` from `TORNECT_PT_DIR`, reports it missing when unset (no `PATH` lookup), and refuses a copy with one extra byte (`not the pinned lyrebird 0.8.1 (SHA-256 mismatch)`); `tornect --bridges obfs4 tor-check` through the pinned binary: `TOR OK via obfs4 in 47.6 s`. Relative paths, group-writable binaries and the private-lines-replace-built-ins rule are unit-tested (`tor::bridges::tests`) |
 | Windows: lyrebird.exe spawned by a console-subsystem tornect.exe shows no extra window | NEEDS-DEVICE(windows) | Recipe: `tornect.exe --bridges obfs4 tor-check` from a console; expect no new console window (research bridges.md §6) |
 
 ## Vertical slice — media crates (decisions M1-39, M3-1)
@@ -160,3 +161,13 @@ locally, so those backends are compiled and tested by the Linux CI job instead.
 | Profile | Status | Evidence / notes |
 |---|---|---|
 | `tests/netem/run.sh lan` | OPEN | needs root for netns (not available on mx-vm); Linux CI job |
+
+## Track D fixes and the slice review (2026-09-21, second session)
+
+| Check | Status | Evidence |
+|---|---|---|
+| IPC answer outlives the re-auth dialog; undelivered `On` is undone; deny-direction ops do not queue behind a dialog | VERIFIED | Unit tests under virtual time and real Unix sockets (`tornect-platform` `ipc::tests`, `apps/tornect` `unattended::tests`); `tornect host` + `unattended status/pause/off` over the real socket on mx-vm |
+| Password prompt reads unbuffered, never echoes, drains an over-long line | VERIFIED | 2026-09-21 mx-vm, pty-driven `tornect unattended on` → `grant <paired device>` (policy error re-prompt, whitespace note + y/N, repeat) → `status`; unit tests over a socket pair |
+| polkit over SSH with `pkttyagent` (policy `allow_any = auth_self`) | NEEDS-DEVICE(linux + ssh + root to install the policy) | Recipe: install `packaging/polkit/org.tornect.policy`, SSH in, start `pkttyagent --process <tornect host pid>`, run `tornect unattended grant <device>`; expect a text password prompt. With no agent, expect "no authentication agent", not "wrong password" (unit-tested mapping) |
+| `cargo deny check` in the gate | VERIFIED | `cargo xtask verify` runs `cargo-deny 0.20.2 --offline check` against the advisory DB of 2026-08-29: `advisories ok, bans ok, licenses ok, sources ok`, with the gnullvm target and the `keyring` feature in the graph |
+
