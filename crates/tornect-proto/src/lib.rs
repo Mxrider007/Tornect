@@ -37,6 +37,7 @@ use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::Sha256;
 use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use zeroize::Zeroizing;
 
 /// Largest frame accepted (type byte + body): 8 MiB fits a 4K keyframe at a
 /// generous bitrate; anything larger is a protocol error, not a bigger buffer.
@@ -235,6 +236,9 @@ impl Msg {
                 ty::CLOSE
             }
         };
+        // Every body this crate builds is far below `MAX_FRAME`; a larger one is
+        // a caller bug, caught here rather than written with a wrong prefix.
+        debug_assert!(body.len() < MAX_FRAME, "media frame body over MAX_FRAME");
         let len = u32::try_from(body.len() + 1).unwrap_or(u32::MAX);
         let mut out = Vec::with_capacity(5 + body.len());
         out.extend_from_slice(&len.to_be_bytes());
@@ -366,11 +370,28 @@ pub async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &Msg) -> Result<()
     Ok(())
 }
 
-/// `HMAC-SHA256(session_token, BIND_LABEL ‖ th_final)` — proves the media
-/// stream belongs to the handshake that produced `th_final`.
+/// HKDF-SHA256 `info` that derives the bind key from the session token.
+pub const BIND_KEY_INFO: &[u8] = b"tornect/v1/tor-media-bind-key";
+
+/// The key the bind MAC is computed under: `HKDF-SHA256(ikm = session_token,
+/// info = BIND_KEY_INFO)`, never the token itself. The token is also the QUIC
+/// `BIND` exporter context (§B.6) and the seed of the session id, and
+/// `tornect-signal`'s key schedule keeps it out of every HMAC key for exactly
+/// that reason (decision M1-39, amended after SLICE-A2 A2-2).
+fn bind_key(session_token: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    hkdf::Hkdf::<Sha256>::new(None, session_token)
+        .expand(BIND_KEY_INFO, key.as_mut_slice())
+        .unwrap_or_else(|_| unreachable!("32 bytes is a valid HKDF-SHA256 output length"));
+    key
+}
+
+/// `HMAC-SHA256(bind_key(session_token), BIND_LABEL ‖ th_final)` — proves the
+/// media stream belongs to the handshake that produced `th_final`.
 #[must_use]
 pub fn bind_mac(session_token: &[u8; 32], th_final: &[u8; 32]) -> [u8; 32] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(session_token)
+    let key = bind_key(session_token);
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_slice())
         .unwrap_or_else(|_| unreachable!("HMAC-SHA256 takes a key of any length"));
     mac.update(BIND_LABEL);
     mac.update(th_final);
@@ -386,6 +407,27 @@ pub fn bind_mac_ok(session_token: &[u8; 32], th_final: &[u8; 32], received: &[u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SLICE-A2 A2-2: the bind MAC is keyed by an HKDF subkey of the token, not
+    /// the token. The expected value was computed independently (Python
+    /// `hmac`/`hashlib`: RFC 5869 HKDF with an empty salt, then HMAC-SHA256).
+    #[test]
+    fn the_bind_mac_is_keyed_by_a_derived_subkey() {
+        let (token, th) = ([0x11; 32], [0x22; 32]);
+        let mac = bind_mac(&token, &th);
+        let expected: [u8; 32] = [
+            0x09, 0x3a, 0x5e, 0x67, 0xc5, 0x93, 0xe4, 0x62, 0x27, 0xdf, 0x8c, 0x0a, 0xbc, 0xa4,
+            0x1a, 0x3c, 0x23, 0xe2, 0x73, 0x2a, 0x6e, 0x6b, 0xf4, 0xed, 0xf5, 0xe4, 0xa7, 0xb7,
+            0xc4, 0x63, 0x5f, 0x57,
+        ];
+        assert_eq!(mac, expected);
+        // Not the old construction, `HMAC(token, BIND_LABEL ‖ th_final)`.
+        let mut old = Hmac::<Sha256>::new_from_slice(&token).unwrap();
+        old.update(BIND_LABEL);
+        old.update(&th);
+        assert_ne!(mac, <[u8; 32]>::from(old.finalize().into_bytes()));
+        assert!(bind_mac_ok(&token, &th, &mac));
+    }
 
     fn samples() -> Vec<Msg> {
         vec![
