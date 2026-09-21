@@ -1,6 +1,6 @@
 [package]
 name = "tornect-capture"
-description = "Tornect screen capture: VideoCaptureSource trait with Windows.Graphics.Capture, ScreenCaptureKit and PipeWire backends"
+description = "Tornect screen capture: the VideoSource trait, a synthetic test card, and the X11, GDI (and later PipeWire, WGC, ScreenCaptureKit) backends"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,13 @@ publish.workspace = true
 
 [dependencies]
 tornect-core.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [features]
 default = []
