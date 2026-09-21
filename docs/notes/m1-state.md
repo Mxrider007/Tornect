@@ -308,6 +308,52 @@ Done:
 Not done: capture, session layer, GUI, `serve_host` in `tornect host`, the whole-app Windows
 build, packaging — the app is not yet functional end to end.
 
+## Session 2026-09-21 (2) — track D fixed, slice-range review, hardening
+
+Commits, all pushed: `5523fcc` (track D), `c868e71` (proto/input), `38c8de5` (bridge ladder +
+lyrebird pin), `110b774` (cargo-deny in the gate), `81da800` (a flaky test). The gate is green at
+**368 tests**, and `cargo deny --offline check` now runs inside `cargo xtask verify`.
+
+- **Track D: all 8 distinct survivors fixed** (`5523fcc`). Each was re-verified against the
+  code first. S1, S2 and S3/S10 have regression tests that fail on the old code.
+  - S1/S4 (HIGH): the CLI waits `RESPONSE_TIMEOUT` = 150 s, and an undelivered `On` turns
+    access back off and clears the token.
+  - S6: the endpoint serves connections concurrently; at most one polkit dialog is open.
+  - S2: the admin effect fires even if the answer cannot be sent.
+  - S3/S10: post-commit log lines are best-effort.
+  - S5: the offline CLI uses `LoadMode::Offline`.
+  - S7: the polkit policy uses `auth_self` everywhere, and `is_challenge` is reported as
+    "no authentication agent".
+  - S8/S12: the password is read unbuffered, and secret buffers are wiped.
+  - S9/S11: device labels are passed to zxcvbn, and warnings are shown.
+
+  Checked under a real PTY (`on` → `grant` → `status`) and over the host IPC socket.
+  **Residual:** zxcvbn still scores "Laptop-of-Ana tornect 2026" at 4, even with the label.
+- **Review of `7697823..efe75fa`** (A′: 3 read-only sub-agents; no ≈ 100-agent refuted
+  review, because it was not approved at that size): 0 critical, 0 high. The fixes:
+  - M1-40: private bridge lines replace the built-ins; `auto` does not probe direct Tor when
+    private lines are set, and direct goes last after a bridge was needed.
+  - lyrebird is SHA-256-pinned and never taken from `PATH`. Checked live: obfs4 was ready in
+    47.6 s, and a tampered copy was refused.
+  - M1-41: the media bind key is HKDF-derived.
+  - Power, Sleep, WakeUp and Eject are refused by the injector.
+  - cargo-deny runs in `verify`, and `deny.toml` covers gnullvm.
+
+  Report: `kore_project_V3/agents/security/reports/2026-09-21_tornect_slice_review.md`.
+- **Not done:** everything after `serve_host` (below). The app is still **not functional end
+  to end**.
+
+Requirements the session layer inherits from the review (SLICE-A2 / A1 G3):
+- the view-only gate before any `Input` decode;
+- single-use `Bind`, with a deadline for it;
+- one media stream per session;
+- an input rate cap and a bounded video ack window;
+- the viewer sizes frames from `DecodedFrame`, never from `BindOk`;
+- no unbound 4001 stream may keep a circuit alive.
+
+Also latent: `KillSwitch` latches — nothing resets it after one kill. It must become per-session,
+or be reset, when `serve_host` is wired.
+
 ## Gotchas (dev VM mx-vm)
 
 - Build with `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp`; `/tmp` is a 3.7 GiB quota tmpfs
