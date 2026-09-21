@@ -424,7 +424,7 @@ connect"** (decision M1-42).
 - **`tornect connect <id> [--pair-only] [--forget] [--pings N]`.** It pairs (the user compares
   the code, 50 s), asks for a session, sends `TOR_FALLBACK`, then keeps the session alive with a
   `PING` every 10 s. Between pings it waits on the stream, so a host `BYE` is reported at once.
-- **Tests: 370 → 388**, `cargo xtask verify` green. Failing-first was proven three times:
+- **Tests: 370 → 388** for the wiring (capture then added 9 more on Linux), `cargo xtask verify` green. Failing-first was proven three times:
   - an unshared kill switch fails the Panic test (`Timeout("session frame")`);
   - a guard told that no session runs lets `On` through to the polkit dialog;
   - the old keep-alive loop reports a host panic as `Lost(BrokenPipe)`.
@@ -434,14 +434,26 @@ connect"** (decision M1-42).
   both ends in 0.6 s, and a clean Ctrl-C. Runs 1–3 are recorded too. Run 3 found the one real
   bug of the session (a panicked session reported as "connection lost"), fixed before run 4.
 
+- **`tornect-capture` begun (vertical slice, not M1).** The `VideoSource` trait (a pull with a
+  timeout; tight BGRx `Frame`s), a synthetic `TestCard` that writes its frame index into a
+  32-block strip (large enough to survive H.264, so a viewer can check order and loss), the X11
+  backend (`GetImage` + the XFIXES cursor, refused unless `XDG_SESSION_TYPE=x11`; verified under
+  `xvfb-run`) and the GDI backend (every GDI object lives inside one `next_frame`; per-monitor-v2
+  DPI awareness set once; lint-clean for gnullvm, runtime `NEEDS-DEVICE(windows)` with a
+  cross-built test recipe in `docs/VERIFICATION.md`). On rootless Xwayland, `GetImage` on the
+  root answers `BadMatch`.
+
 **Not done, and honestly so:**
+- **No Wayland capture.** The RemoteDesktop portal + PipeWire backend, which a GNOME or KDE Linux
+  host needs, is not written. It adds `ashpd` and `libloading` to the lockfile (expect a full
+  Arti rebuild), and the portal dialog needs a human click.
 - **No unattended client CLI.** `Intent::Unattended` is reachable only from tests, so the
   §B.8.14 M1 acceptance (headless unattended handshake between two machines) still cannot be
   shown end to end.
 - **The kill switch is host-wide** (M1 scope): `unattended off`, `pause` and `revoke-all` also
   end *attended* sessions.
 - The panic key does not suspend the grant behind an unattended session (M4).
-- No capture, session layer or GUI; no Windows whole-app build; `m1` untagged; CI has never run.
+- No session layer or GUI; no Windows whole-app build; `m1` untagged; CI has never run.
 - `rotate-id`'s own `HostIdRotated` append is still open.
 
 ## Gotchas (dev VM mx-vm)
