@@ -133,6 +133,28 @@ rustix = { version = "=1.1.4", default-features = false, features = ["std", "ter
 # Fuzzing helpers (fuzz/ crate is workspace-excluded; `arbitrary` derives shared with it).
 arbitrary = { version = "=1.4.2", features = ["derive"] }
 
+# Vertical slice (operator ruling 2026-09-21; decisions M1-39 and M3-1): pins
+# verified by research_verifier against crates.io and the crate sources
+# (docs/research/slice.md). UI = the D10 egui-everywhere fallback: a manual
+# winit loop driving egui-winit + egui-wgpu, never eframe (physical scancodes).
+winit = "=0.30.13"
+egui = "=0.36.2"
+egui-winit = { version = "=0.36.2", default-features = false, features = ["clipboard", "wayland", "x11"] }
+# `default-features = false`: the defaults turn on every wgpu backend + webgl.
+egui-wgpu = { version = "=0.36.2", default-features = false, features = ["winit", "wayland", "x11"] }
+# Backends are added per target in the member crate (Linux vulkan+gles, Windows dx12).
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "wgsl", "parking_lot"] }
+pollster = "=1.0.1"
+# Cisco OpenH264 built from source with `cc` (C++; nasm optional, no cmake) — M0-5.
+openh264 = { version = "=0.9.8", default-features = false, features = ["source"] }
+# Linux host: RemoteDesktop/ScreenCast portals (pure Rust over zbus/tokio),
+# PipeWire through dlopen (no headers on the dev VM), X11 fallback.
+ashpd = { version = "=0.13.13", default-features = false, features = ["tokio", "screencast", "remote_desktop"] }
+libloading = "=0.8.9"
+x11rb = { version = "=0.13.2", default-features = false, features = ["xtest", "xfixes"] }
+# Windows host: GDI capture + SendInput (plain Win32, no COM).
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi"] }
+
 [workspace.lints.rust]
 unsafe_code = "warn"
 rust_2018_idioms = "warn"
