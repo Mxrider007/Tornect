@@ -713,16 +713,22 @@ where
     let (viewed, end) = tokio::join!(viewing, signaling);
 
     pictures.report(&stats);
-    match &viewed {
-        Ok(ViewerEnd::Host(reason)) => println!(
+    let end = end?;
+    // The viewer stops when the session ends, whoever ended it: the host's
+    // `BYE` often arrives before its media `Close` (live run, 2026-09-21).
+    match (&viewed, &end) {
+        (Ok(ViewerEnd::Host(reason)), _) => println!(
             "MEDIA ENDED by the host ({})",
             crate::host::media_reason(*reason)
         ),
-        Ok(ViewerEnd::Closed) => println!("MEDIA ENDED (the host closed the stream)"),
-        Ok(ViewerEnd::Stopped) => println!("MEDIA ENDED (by you)"),
-        Err(e) => println!("MEDIA FAILED: {e}"),
+        (Ok(ViewerEnd::Closed), _) => println!("MEDIA ENDED (the host closed the stream)"),
+        (Ok(ViewerEnd::Stopped), End::Host(_)) => {
+            println!("MEDIA ENDED by the host (the session ended)");
+        }
+        (Ok(ViewerEnd::Stopped), End::Lost(_)) => println!("MEDIA ENDED (the session was lost)"),
+        (Ok(ViewerEnd::Stopped), _) => println!("MEDIA ENDED (by you)"),
+        (Err(e), _) => println!("MEDIA FAILED: {e}"),
     }
-    let end = end?;
     Ok(match (viewed, end) {
         // The picture failed first; the session ended because of it.
         (Err(e), End::You) => End::NoPicture(anyhow::Error::new(e)),
