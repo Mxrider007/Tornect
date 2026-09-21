@@ -73,9 +73,12 @@ proptest = "1.11.0"
 # version (docs/research/arti.md §1); never enable arti-client `full`,
 # `experimental`, `native-tls` or `static` (§2). rustls stays on the `ring`
 # provider, shared with quinn (docs/research/quic.md §1.2–§2).
+# `pt-client` (implies `bridge-client`; adds tor-ptmgr 0.45.0, not experimental):
+# obfs4 and Snowflake bridges through the bundled `lyrebird`, decision M1-38
+# (docs/research/bridges.md §1.2).
 arti-client = { version = "=0.45.0", default-features = false, features = [
   "tokio", "rustls", "compression", "flowctl-cc", "static-sqlite",
-  "onion-service-service", "onion-service-client", "vanguards",
+  "onion-service-service", "onion-service-client", "vanguards", "pt-client",
 ] }
 tor-hsservice = "=0.45.0"
 tor-hscrypto = "=0.45.0"

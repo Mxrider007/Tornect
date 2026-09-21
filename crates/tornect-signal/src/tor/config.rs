@@ -12,6 +12,7 @@ use tornect_core::Paths;
 use tornect_core::config::Tor;
 use tornect_core::keystore::create_private_dir;
 
+use super::bridges::Transport;
 use crate::error::{Result, SignalError};
 
 /// Timeout for opening a stream to an onion service. The first connect to a host
@@ -45,12 +46,13 @@ pub const MAX_STREAMS_PER_CIRCUIT: u32 = 4;
 pub const POW_REND_QUEUE_DEPTH: usize = 1024;
 
 /// Build the client configuration: Tornect-owned state and cache directories,
-/// keystore explicitly on, `.onion` targets allowed, long connect timeout.
+/// keystore explicitly on, `.onion` targets allowed, long connect timeout, and
+/// `transport` (direct, or bridges through `lyrebird`, decision M1-38).
 ///
 /// Every directory is created `0700` before Arti sees it: `fs-mistrust` refuses
 /// group- or world-writable state and keystore directories, and a plain
 /// `create_dir_all` would apply the umask.
-pub(crate) fn tor_client_config(paths: &Paths) -> Result<TorClientConfig> {
+pub(crate) fn tor_client_config(paths: &Paths, transport: &Transport) -> Result<TorClientConfig> {
     paths.ensure()?;
     let state_dir = paths.arti_state_dir();
     let cache_dir = paths.arti_cache_dir();
@@ -64,6 +66,7 @@ pub(crate) fn tor_client_config(paths: &Paths) -> Result<TorClientConfig> {
         .enabled(BoolOrAuto::Explicit(true));
     builder.address_filter().allow_onion_addrs(true);
     builder.stream_timeouts().connect_timeout(CONNECT_TIMEOUT);
+    transport.apply(&mut builder)?;
     builder
         .build()
         .map_err(|e| SignalError::Config(e.to_string()))
@@ -125,7 +128,7 @@ mod tests {
     fn client_config_builds_and_creates_private_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(tmp.path().join("home"));
-        let cfg = tor_client_config(&paths).unwrap();
+        let cfg = tor_client_config(&paths, &Transport::direct()).unwrap();
         assert!(paths.arti_state_dir().is_dir());
         assert!(paths.arti_cache_dir().is_dir());
         // Keystore location is derived from the state dir by Arti; it must be enabled.
@@ -139,7 +142,7 @@ mod tests {
             }
         }
         // Building twice over the same directories is fine (restart path).
-        tor_client_config(&paths).unwrap();
+        tor_client_config(&paths, &Transport::direct()).unwrap();
     }
 
     #[test]
