@@ -19,8 +19,9 @@
 //!   `BlockWindow` / `LocalAllow` seams.
 //! * [`fsm`] — the host and client handshake state machines over any tokio
 //!   stream ([`fsm::host::serve_host`], [`fsm::client::connect`]).
-//! * [`ping`] — the interim liveness protocol behind `tornect ping`; the CLI
-//!   track replaces it with the envelope `PING` / `PONG`.
+//! * [`ping`] — the pairing-free liveness protocol behind `tornect ping`, and
+//!   [`dispatch`] — which routes a signaling stream to it or to the FSM by its
+//!   first frame (decision M1-42).
 //!
 //! Call [`install_crypto_provider`] once at process start, before the first
 //! [`TorNode`] (and before any QUIC endpoint in later milestones).
@@ -30,6 +31,7 @@
 
 pub mod auth;
 pub mod consent;
+pub mod dispatch;
 pub mod envelope;
 pub mod error;
 pub mod framing;
