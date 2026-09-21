@@ -368,6 +368,54 @@ impl Drop for Counted<'_> {
     }
 }
 
+/// Where [`serve_host`] hands an established session to the layer that runs it
+/// (`tornect-session` from M4; until then the CLI's own sink).
+///
+/// [`on_start`](SessionSink::on_start) is called once `SESSION_ACCEPT` is sent
+/// and `th_final` is fixed — the first point §B.6 allows capture to begin — and
+/// [`on_end`](SessionSink::on_end) once the session is over, however it ended,
+/// including a protocol error and the kill switch. Every `on_start` is followed
+/// by exactly one `on_end`, so a sink may treat the pair as acquire/release.
+///
+/// Both run on the stream's own task, between the accept and the first frame,
+/// so neither may block.
+pub trait SessionSink: Send + Sync {
+    /// The session is live.
+    fn on_start(&self, session: &LiveSession<'_>);
+    /// The session is over. `end` is `None` when it ended in a protocol error.
+    fn on_end(&self, session_id: &str, end: Option<&SessionEnd>);
+}
+
+/// What [`SessionSink::on_start`] is told about a live session.
+pub struct LiveSession<'a> {
+    /// The peer.
+    pub device: DeviceId,
+    /// The pinned label.
+    pub label: &'a str,
+    /// [`SessionToken::session_id`]: the one-way id `sessions.log` uses.
+    pub session_id: &'a str,
+    /// The session token. The media layer derives the `Bind` key from it
+    /// (`HKDF-SHA256(session_token, "tornect/v1/tor-media-bind-key")`, decision
+    /// M1-41); the token itself never goes on the wire.
+    pub token: &'a SessionToken,
+    /// `th` at the end of the handshake, equal on both sides.
+    pub th_final: [u8; 32],
+    /// Control or view-only; input is dropped host-side in
+    /// [`SessionMode::ViewOnly`].
+    pub mode: SessionMode,
+    /// Whether this was an unattended session (§B.8).
+    pub unattended: bool,
+}
+
+/// Runs no session: the accept is the end of the story (M1 default, tests).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoSessionSink;
+
+impl SessionSink for NoSessionSink {
+    fn on_start(&self, _: &LiveSession<'_>) {}
+    fn on_end(&self, _: &str, _: Option<&SessionEnd>) {}
+}
+
 /// Everything the host FSM is injected with.
 #[derive(Clone)]
 pub struct HostDeps {
@@ -398,6 +446,8 @@ pub struct HostDeps {
     pub audit: Arc<dyn HandshakeAudit>,
     /// Post-accept frames for M2.
     pub candidates: Arc<dyn CandidateSink>,
+    /// The layer that runs an established session (M4 `tornect-session`).
+    pub sessions: Arc<dyn SessionSink>,
     /// Nonces and tokens.
     pub random: Arc<dyn Randomness>,
     /// Counters.
@@ -408,8 +458,9 @@ pub struct HostDeps {
 
 impl HostDeps {
     /// Headless defaults: `AutoDeny`, no stop token, `NotGranted`, no live
-    /// session, no audit, candidates ignored, OS randomness, default limits,
-    /// a timer-only block window and `AlwaysDeny` for `ask_before_start`.
+    /// session, no audit, candidates ignored, no session sink, OS randomness,
+    /// default limits, a timer-only block window and `AlwaysDeny` for
+    /// `ask_before_start`.
     #[must_use]
     pub fn headless(signer: Arc<dyn HostSigner>, trusted: Arc<TrustedDeviceStore>) -> Self {
         Self {
@@ -425,6 +476,7 @@ impl HostDeps {
             activity: Arc::new(NoSession),
             audit: Arc::new(NoAudit),
             candidates: Arc::new(IgnoreCandidates),
+            sessions: Arc::new(NoSessionSink),
             random: Arc::new(OsRandom),
             stats: Arc::new(HandshakeStats::default()),
             kill: KillSwitch::new(),
@@ -773,10 +825,23 @@ where
     tracing::info!(peer = %device, %label, session = %session_id, "session accepted");
 
     let th_final = chan.th();
+    deps.sessions.on_start(&LiveSession {
+        device,
+        label: &label,
+        session_id: &session_id,
+        token: &token,
+        th_final,
+        mode,
+        unattended,
+    });
     let end = {
         let _established = Counted::new(&deps.stats.established);
         established(&mut chan, cfg, deps, &mut kill).await
     };
+    // Paired with the `on_start` above and taken before the `?` below, so a
+    // session that ended in a protocol error still releases whatever the sink
+    // acquired — capture above all.
+    deps.sessions.on_end(&session_id, end.as_ref().ok());
     // Logged before any error propagates: a peer that hangs up mid-frame or
     // sends an illegal kind must not erase its own session-end line (§B.6,
     // §B.8.16 "every session start/end reaches sessions.log").

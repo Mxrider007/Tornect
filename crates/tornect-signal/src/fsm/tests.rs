@@ -11,15 +11,15 @@ use tornect_core::trusted::{KnownHosts, TrustedDevices};
 use tornect_core::{DeviceId, DeviceIdentity, HostIdentity, TornectId};
 use zeroize::Zeroizing;
 
-use tornect_core::session_log::{SessionEvent as LogEvent, SessionLog};
+use tornect_core::session_log::{SessionEvent as LogEvent, SessionLog, SessionMode};
 use tornect_core::unattended::ReadinessSnapshot;
 
 use super::client::{
     ClientConfig, ClientDeps, ClientOutcome, Intent, ScriptedClientUi, SessionEvent, connect,
 };
 use super::host::{
-    HostConfig, HostDeps, HostOutcome, KillSwitch, SessionActivity, SessionEnd, StopTokenCheck,
-    UnattendedContext, UnattendedHook, UnattendedVerdict, serve_host,
+    HostConfig, HostDeps, HostOutcome, KillSwitch, LiveSession, SessionActivity, SessionEnd,
+    SessionSink, StopTokenCheck, UnattendedContext, UnattendedHook, UnattendedVerdict, serve_host,
 };
 use super::vectors::host_device_pk;
 use super::*;
@@ -1790,6 +1790,103 @@ async fn a_prior_kill_does_not_latch_onto_a_later_session() {
             detail: None
         })
     );
+}
+
+/// The session sink is handed the live session exactly once — with the
+/// transcript hash and the token both sides agree on — and released exactly
+/// once when it ends, including when the kill switch ends it. `on_end` is what
+/// stops capture, so it has to run on every way out of `Established`.
+#[tokio::test(start_paused = true)]
+async fn the_session_sink_sees_one_start_and_one_end() {
+    struct Started {
+        session_id: String,
+        th_final: [u8; 32],
+        mode: SessionMode,
+        unattended: bool,
+        token: SessionToken,
+    }
+    #[derive(Default)]
+    struct Recorder {
+        started: Mutex<Vec<Started>>,
+        ended: Mutex<Vec<(String, Option<SessionEnd>)>>,
+    }
+    impl SessionSink for Recorder {
+        fn on_start(&self, s: &LiveSession<'_>) {
+            self.started.lock().unwrap().push(Started {
+                session_id: s.session_id.to_owned(),
+                th_final: s.th_final,
+                mode: s.mode,
+                unattended: s.unattended,
+                token: s.token.clone(),
+            });
+        }
+        fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
+            self.ended
+                .lock()
+                .unwrap()
+                .push((session_id.to_owned(), end.cloned()));
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    host.cfg.orphan_timeout = None;
+    host.cfg.idle_timeout = Duration::from_secs(30);
+    let sink = Arc::new(Recorder::default());
+    host.deps.sessions = sink.clone();
+    let kill = KillSwitch::new();
+    host.deps.kill = kill.clone();
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+    host.consent
+        .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+    let client = client_side(tmp.path(), host.identity.id(), CLIENT_SEED);
+    client
+        .known
+        .pin(host.identity.id(), "Desk of Bob", host_device_pk())
+        .unwrap();
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut session = match connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        Intent::Session,
+    )
+    .await
+    .unwrap()
+    {
+        ClientOutcome::Session(s) => s,
+        ClientOutcome::Paired { .. } => panic!(),
+    };
+
+    // Started before the first frame of the session is served.
+    session.ping().await.unwrap();
+    let session_id = {
+        let started = sink.started.lock().unwrap();
+        assert_eq!(started.len(), 1, "exactly one start");
+        let s = &started[0];
+        assert_eq!(s.th_final, session.th(), "both sides agree on th_final");
+        assert_eq!(&s.token, session.session_token(), "the media key matches");
+        assert_eq!(s.mode, SessionMode::Control);
+        assert!(!s.unattended, "this one was attended");
+        assert!(!s.session_id.is_empty());
+        s.session_id.clone()
+    };
+    assert!(sink.ended.lock().unwrap().is_empty(), "not ended yet");
+
+    kill.kill(bye::PANIC);
+    match task.await.unwrap().unwrap() {
+        HostOutcome::Session { end, .. } => assert_eq!(end, SessionEnd::Killed(bye::PANIC)),
+        other => panic!("{other:?}"),
+    }
+    let ended = sink.ended.lock().unwrap();
+    assert_eq!(ended.len(), 1, "exactly one end");
+    assert_eq!(ended[0].0, session_id, "same session");
+    assert_eq!(ended[0].1, Some(SessionEnd::Killed(bye::PANIC)));
+    assert_eq!(sink.started.lock().unwrap().len(), 1, "started only once");
 }
 
 #[tokio::test]
