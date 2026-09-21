@@ -309,6 +309,56 @@ impl KillGuard {
             }
         }
     }
+
+    /// Whether the switch has fired since this guard was armed, without waiting.
+    #[must_use]
+    pub fn fired(&self) -> bool {
+        self.rx.borrow().generation != self.base
+    }
+}
+
+/// How long the host tries to say goodbye (`BYE`, or the close after the
+/// peer's own) once a session is over. The session ends before this is
+/// attempted, so a peer that stopped reading delays nothing but its own
+/// goodbye (§B.8.6.1 "BYE ≤ 1 s").
+const GOODBYE: Duration = Duration::from_secs(1);
+
+/// What is left to write when [`established`] returns: the session is already
+/// over, and this goes out only after the sink and the log have been told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Goodbye {
+    /// Send `BYE{reason}` and close.
+    Bye(u16),
+    /// Close the stream (the peer said goodbye first).
+    Close,
+    /// Nothing: the stream may hold a cut-short frame.
+    Nothing,
+}
+
+/// Calls `on_end` and logs the end if the session task unwinds or is dropped
+/// between `on_start` and the ordinary `on_end`: a sink that panicked, or a
+/// cancelled task, must not leave the session marked live, holding `BUSY`
+/// answers and the guard's refusals for good (SLICE-B1 B1-4).
+struct EndGuard<'a> {
+    deps: &'a HostDeps,
+    device: DeviceId,
+    label: &'a str,
+    session_id: &'a str,
+    armed: bool,
+}
+
+impl Drop for EndGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.deps.sessions.on_end(self.session_id, None);
+            self.deps.audit.record(AuditEvent::SessionEnded {
+                device: self.device,
+                label: self.label.to_owned(),
+                session_id: self.session_id.to_owned(),
+                detail: "aborted".to_owned(),
+            });
+        }
+    }
 }
 
 /// Apply the side effect of a remote admin command to live sessions (§B.8.4.1).
@@ -900,6 +950,29 @@ where
         (proof, ChosenCaps::negotiate(&cfg.caps, &request.caps))
     };
 
+    // The owner may have pressed the panic key, or another session may have
+    // gone live, while the popup, the PAKE or the block window was open. Either
+    // way this is no longer a session to accept: a kill is refused as the Deny
+    // or the Block it stands for, and a live session as the busy answer of the
+    // path (SLICE-B1 B1-1/B1-3, SLICE-B2 B2-5). Checked last, right here, so
+    // nothing that waited can slip past it.
+    if kill.fired() {
+        let reason = if unattended {
+            messages::reject::BLOCKED_BY_LOCAL_USER
+        } else {
+            messages::reject::DENIED
+        };
+        return reject_session(&mut chan, deps, &peer, reason).await;
+    }
+    if deps.activity.session_live() {
+        let reason = if unattended {
+            messages::reject::SESSION_ACTIVE
+        } else {
+            messages::reject::BUSY
+        };
+        return reject_session(&mut chan, deps, &peer, reason).await;
+    }
+
     // Accept → Established. `build` is the only source of the session token:
     // the accept body carries `session_token` for attended sessions and only
     // `token_confirm` for unattended ones (§B.8.4.3), never the BIND key.
@@ -918,6 +991,14 @@ where
     tracing::info!(peer = %device, %label, session = %session_id, "session accepted");
 
     let th_final = chan.th();
+    // Armed before `on_start`, so even a sink that panics inside it is released.
+    let mut end_guard = EndGuard {
+        deps,
+        device,
+        label: &label,
+        session_id: &session_id,
+        armed: true,
+    };
     deps.sessions.on_start(&LiveSession {
         device,
         label: &label,
@@ -927,13 +1008,21 @@ where
         mode,
         unattended,
     });
-    let end = {
+    let ended = {
         let _established = Counted::new(&deps.stats.established);
         established(&mut chan, cfg, deps, &mut kill).await
     };
-    // Paired with the `on_start` above and taken before the `?` below, so a
-    // session that ended in a protocol error still releases whatever the sink
-    // acquired — capture above all.
+    let (end, goodbye) = match ended {
+        Ok((end, goodbye)) => (Ok(end), goodbye),
+        Err(e) => (Err(e), Goodbye::Nothing),
+    };
+    end_guard.armed = false;
+    drop(end_guard);
+    // The session is over the moment it is decided. The sink hears first, since
+    // it is what stops capture, then the log, and only then is anything written
+    // to the peer: a peer that stopped reading must not hold the end back
+    // (SLICE-B1 B1-2, SLICE-B2 B2-1). Taken before the `?` below, so a session
+    // that ended in a protocol error still releases what the sink acquired.
     deps.sessions.on_end(&session_id, end.as_ref().ok());
     // Logged before any error propagates: a peer that hangs up mid-frame or
     // sends an illegal kind must not erase its own session-end line (§B.6,
@@ -947,6 +1036,16 @@ where
             Err(err) => end_detail(err),
         },
     });
+    // Best effort, bounded: the peer may never take it.
+    match goodbye {
+        Goodbye::Bye(reason) => {
+            let _ = tokio::time::timeout(GOODBYE, chan.bye(reason)).await;
+        }
+        Goodbye::Close => {
+            let _ = tokio::time::timeout(GOODBYE, chan.close()).await;
+        }
+        Goodbye::Nothing => {}
+    }
     let end = end?;
     Ok(HostOutcome::Session {
         device,
@@ -1140,13 +1239,15 @@ where
 }
 
 /// `Established`: answer `PING`, hand M2 frames to the sink, end on `BYE`,
-/// the kill switch, the orphan timer or the idle timer.
+/// the kill switch, the orphan timer or the idle timer. It returns as soon as
+/// the session is over, with what is still to be written: the caller releases
+/// the session first and says goodbye after.
 async fn established<S>(
     chan: &mut Channel<S>,
     cfg: &HostConfig,
     deps: &HostDeps,
     kill: &mut KillGuard,
-) -> Result<SessionEnd, HandshakeError>
+) -> Result<(SessionEnd, Goodbye), HandshakeError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -1167,28 +1268,41 @@ where
         let received = tokio::select! {
             biased;
             reason = kill.killed() => {
-                chan.bye(reason).await?;
-                return Ok(SessionEnd::Killed(reason));
+                return Ok((SessionEnd::Killed(reason), Goodbye::Bye(reason)));
             }
             rx = chan.recv(wait, "frame") => rx,
         };
         let rx: Received = match received {
             Ok(Some(rx)) => rx,
-            Ok(None) => return Ok(SessionEnd::PeerClosed),
+            Ok(None) => return Ok((SessionEnd::PeerClosed, Goodbye::Nothing)),
             Err(HandshakeError::Timeout(_)) => {
-                chan.bye(messages::bye::ORPHANED).await?;
-                return Ok(if orphan_first {
+                let end = if orphan_first {
                     SessionEnd::Orphaned
                 } else {
                     SessionEnd::Idle
-                });
+                };
+                return Ok((end, Goodbye::Bye(messages::bye::ORPHANED)));
             }
             Err(e) => return Err(e),
         };
         match rx.env.kind {
             Kind::Ping => {
                 let ping: Ping = chan.body(&rx).await?;
-                chan.send(&Pong { nonce: ping.nonce }, None).await?;
+                // A peer that stops reading stalls this write for as long as
+                // it withholds credit; the kill must not wait behind it
+                // (SLICE-B2 B2-1). The write goes first, so one that can
+                // finish does; a kill that cuts one short leaves a torn frame,
+                // after which nothing more is written.
+                let pong = Pong { nonce: ping.nonce };
+                tokio::select! {
+                    biased;
+                    sent = chan.send(&pong, None) => {
+                        sent?;
+                    }
+                    reason = kill.killed() => {
+                        return Ok((SessionEnd::Killed(reason), Goodbye::Nothing));
+                    }
+                }
             }
             Kind::Candidates => {
                 let c: messages::Candidates = chan.body(&rx).await?;
@@ -1207,13 +1321,11 @@ where
             }
             Kind::Bye => {
                 let reason = decode_reason::<Bye>(&rx, |b| b.reason);
-                chan.close().await;
-                return Ok(SessionEnd::PeerBye(reason));
+                return Ok((SessionEnd::PeerBye(reason), Goodbye::Close));
             }
             Kind::Error => {
                 let code = decode_reason::<messages::Error>(&rx, |e| e.code);
-                chan.close().await;
-                return Ok(SessionEnd::PeerError(code));
+                return Ok((SessionEnd::PeerError(code), Goodbye::Close));
             }
             _ => return Err(chan.fail(codes::E_BAD_STATE, "kind").await),
         }
