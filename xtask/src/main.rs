@@ -1,7 +1,7 @@
 //! `cargo xtask <command>` — repository automation (`docs/PLAN.md` §D.5).
 //!
-//! * `verify`      — plan sync, forbidden-dependency check, fmt check, clippy
-//!   `-D warnings` on all targets, tests, docs
+//! * `verify`      — plan sync, forbidden-dependency check, `cargo deny` (offline),
+//!   fmt check, clippy `-D warnings` on all targets, tests, docs
 //! * `lint-all`    — fmt check + clippy only
 //! * `dist`        — release build into `dist/` (packaging grows in M8)
 //! * `ffmpeg-fetch`— placeholder until the FFmpeg backend lands (M3)
@@ -114,8 +114,9 @@ fn plan_sync(root: &Path) -> anyhow::Result<()> {
 /// need only a C compiler, docs/research/arti.md §4).
 const FORBIDDEN_DEPS: [&str; 3] = ["aws-lc-rs", "aws-lc-sys", "openssl-sys"];
 
-/// `cargo tree --workspace -i <crate>` exits non-zero with "did not match any
-/// packages" exactly when the crate is absent from the resolved graph.
+/// `cargo tree --workspace --target all -i <crate>` exits non-zero with "did not
+/// match any packages" exactly when the crate is absent from the resolved graph
+/// of **every** target: a Windows-only path to OpenSSL counts too (SLICE-A3 F8).
 fn forbidden_deps(root: &Path) -> anyhow::Result<()> {
     println!(
         "==> forbidden dependencies absent ({})",
@@ -123,7 +124,7 @@ fn forbidden_deps(root: &Path) -> anyhow::Result<()> {
     );
     for dep in FORBIDDEN_DEPS {
         let output = cargo()
-            .args(["tree", "--workspace", "-i", dep])
+            .args(["tree", "--workspace", "--target", "all", "-i", dep])
             .current_dir(root)
             .output()
             .with_context(|| format!("spawning `cargo tree -i {dep}`"))?;
@@ -145,10 +146,74 @@ fn forbidden_deps(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `cargo-deny`: on `PATH`, or the prebuilt copy under `target/tools/`.
+fn find_cargo_deny(root: &Path) -> Option<PathBuf> {
+    let bin = format!("cargo-deny{}", std::env::consts::EXE_SUFFIX);
+    let tools = std::fs::read_dir(root.join("target").join("tools")).ok();
+    let bundled = tools.into_iter().flatten().flatten().find_map(|entry| {
+        let candidate = entry.path().join(&bin);
+        candidate.is_file().then_some(candidate)
+    });
+    bundled.or_else(|| {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .filter(|dir| dir.is_absolute())
+                .map(|dir| dir.join(&bin))
+                .find(|p| p.is_file())
+        })
+    })
+}
+
+/// The newest advisory database `cargo-deny` has fetched, as `(dir, date)`.
+fn advisory_db_date() -> Option<String> {
+    let home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))?;
+    let dbs = std::fs::read_dir(home.join("advisory-dbs")).ok()?;
+    dbs.flatten()
+        .filter(|e| e.path().join(".git").exists())
+        .filter_map(|e| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(e.path())
+                .args(["log", "-1", "--format=%cd", "--date=short"])
+                .output()
+                .ok()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        })
+        .max()
+}
+
+/// `cargo deny check` (advisories, bans, licenses, sources), **offline**
+/// against the advisory database already on disk, so the gate needs no network
+/// and says how old that database is (SLICE-A3 F2). Without `cargo-deny` the
+/// step reports SKIPPED; it never counts as a pass.
+fn deny(root: &Path) -> anyhow::Result<bool> {
+    let Some(bin) = find_cargo_deny(root) else {
+        println!("==> cargo deny check (offline)");
+        println!(
+            "    SKIPPED: cargo-deny not found (PATH or target/tools/); advisories and licences are UNCHECKED"
+        );
+        return Ok(false);
+    };
+    let db = advisory_db_date().unwrap_or_else(|| "unknown date".to_owned());
+    let mut cmd = Command::new(&bin);
+    cmd.args(["--offline", "check"]);
+    run(
+        root,
+        &format!("cargo deny check (offline; advisory DB {db})"),
+        cmd,
+    )?;
+    Ok(true)
+}
+
 fn verify(root: &Path, extra: &[String]) -> anyhow::Result<()> {
     let no_tests = extra.iter().any(|a| a == "--no-tests");
     plan_sync(root)?;
     forbidden_deps(root)?;
+    let denied = deny(root)?;
     lint_all(root)?;
     if !no_tests {
         let mut test = cargo();
@@ -164,14 +229,23 @@ fn verify(root: &Path, extra: &[String]) -> anyhow::Result<()> {
             doc,
         )?;
     }
-    println!("verify: all gates green");
+    if denied {
+        println!("verify: all gates green");
+    } else {
+        println!("verify: all gates green EXCEPT cargo deny, which did not run");
+    }
     Ok(())
 }
 
 fn dist(root: &Path) -> anyhow::Result<()> {
     let mut build = cargo();
-    build.args(["build", "--profile", "dist", "-p", "tornect"]);
-    run(root, "cargo build --profile dist -p tornect", build)?;
+    // `--locked`: a release is built from exactly the reviewed `Cargo.lock`.
+    build.args(["build", "--locked", "--profile", "dist", "-p", "tornect"]);
+    run(
+        root,
+        "cargo build --locked --profile dist -p tornect",
+        build,
+    )?;
 
     let bin = format!("tornect{}", std::env::consts::EXE_SUFFIX);
     let src = root.join("target").join("dist").join(&bin);
