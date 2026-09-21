@@ -25,10 +25,11 @@
 //! ```
 //!
 //! **Binding.** The first frame on a media stream must be `Bind`, carrying
-//! `HMAC-SHA256(session_token, "tornect/v1/tor-media-bind\0" ‖ th_final)`
-//! ([`bind_mac`]); the host answers only after checking it in constant time
-//! against a session it accepted on the signaling stream. Nothing is captured
-//! before that (§B.6).
+//! `HMAC-SHA256(k_bind, "tornect/v1/tor-media-bind\0" ‖ th_final)` with
+//! `k_bind = HKDF-SHA256(session_token, "tornect/v1/tor-media-bind-key")`
+//! ([`bind_mac`], decision M1-41); the host answers only after checking it in
+//! constant time against a session it accepted on the signaling stream.
+//! Nothing is captured before that (§B.6).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -42,6 +43,12 @@ use zeroize::Zeroizing;
 /// Largest frame accepted (type byte + body): 8 MiB fits a 4K keyframe at a
 /// generous bitrate; anything larger is a protocol error, not a bigger buffer.
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
+
+/// Largest frame a client sends (`Bind`, 49 bytes, is its biggest message).
+/// The host reads the client's direction with this cap ([`read_msg_max`]), so
+/// a client can make it allocate a few bytes per frame, never [`MAX_FRAME`]
+/// (SLICE-A2 A2-6).
+pub const MAX_CLIENT_FRAME: usize = 64;
 
 /// Domain separator of the media-stream bind MAC.
 pub const BIND_LABEL: &[u8] = b"tornect/v1/tor-media-bind\0";
@@ -104,10 +111,14 @@ pub enum Msg {
         mac: [u8; 32],
     },
     /// The host accepted the bind; video follows.
+    ///
+    /// `width` × `height` describe the first picture only. The resolution may
+    /// change at any access unit, so a viewer sizes each picture from what it
+    /// decodes, never from these fields (SLICE-A2 A2-4).
     BindOk {
-        /// Encoded picture width.
+        /// Width of the first encoded picture (a hint).
         width: u32,
-        /// Encoded picture height.
+        /// Height of the first encoded picture (a hint).
         height: u32,
         /// A [`codec`] value.
         codec: u8,
@@ -348,6 +359,15 @@ fn be_u64(b: &[u8]) -> u64 {
 
 /// Read one message; `Ok(None)` on a clean end of stream between frames.
 pub async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Msg>, ProtoError> {
+    read_msg_max(r, MAX_FRAME).await
+}
+
+/// [`read_msg`], refusing any frame longer than `max` (clamped to
+/// [`MAX_FRAME`]) before allocating for it.
+pub async fn read_msg_max<R: AsyncRead + Unpin>(
+    r: &mut R,
+    max: usize,
+) -> Result<Option<Msg>, ProtoError> {
     let mut len = [0u8; 4];
     match r.read_exact(&mut len).await {
         Ok(_) => {}
@@ -355,7 +375,7 @@ pub async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Msg>, Pr
         Err(e) => return Err(e.into()),
     }
     let len = u32::from_be_bytes(len) as usize;
-    if len == 0 || len > MAX_FRAME {
+    if len == 0 || len > max.min(MAX_FRAME) {
         return Err(ProtoError::Size(len));
     }
     let mut frame = vec![0u8; len];
@@ -500,6 +520,44 @@ mod tests {
         let (mut a, mut b) = tokio::io::duplex(64);
         a.write_all(&0u32.to_be_bytes()).await.unwrap();
         assert!(matches!(read_msg(&mut b).await, Err(ProtoError::Size(0))));
+    }
+
+    /// Every message a client sends fits [`MAX_CLIENT_FRAME`], and a longer
+    /// frame is refused at its length prefix.
+    #[tokio::test]
+    async fn the_client_cap_fits_every_client_message_and_refuses_more() {
+        let client_msgs = [
+            Msg::Bind {
+                session_id: "0123456789abcdef".into(),
+                mac: [7; 32],
+            },
+            Msg::VideoAck { seq: u32::MAX },
+            Msg::Input([0xff; 16]),
+            Msg::KeyframeRequest,
+            Msg::Ping { nonce: u64::MAX },
+            Msg::Pong { nonce: 1 },
+            Msg::Close {
+                reason: reason::ENDED_BY_VIEWER,
+            },
+        ];
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        for msg in &client_msgs {
+            assert!(msg.encode().len() - 4 <= MAX_CLIENT_FRAME, "{msg:?}");
+            write_msg(&mut a, msg).await.unwrap();
+        }
+        for msg in client_msgs {
+            assert_eq!(
+                read_msg_max(&mut b, MAX_CLIENT_FRAME).await.unwrap(),
+                Some(msg)
+            );
+        }
+        a.write_all(&(MAX_CLIENT_FRAME as u32 + 1).to_be_bytes())
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_msg_max(&mut b, MAX_CLIENT_FRAME).await,
+            Err(ProtoError::Size(n)) if n == MAX_CLIENT_FRAME + 1
+        ));
     }
 
     #[test]
