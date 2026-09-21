@@ -34,6 +34,7 @@ use tor_persist::state_dir::{InstanceIdentity as _, InstanceStateHandle, StateDi
 use tornect_core::{HostIdentity, Paths, TornectId};
 use zeroize::Zeroizing;
 
+use super::bridges::Transport;
 use super::config::tor_client_config;
 use crate::error::{Result, SignalError};
 
@@ -197,7 +198,8 @@ pub struct ForgottenIdentity {
 /// service is still running (its state directory is locked); stop hosting
 /// first. Finding nothing is not an error, so the call is idempotent.
 pub fn forget_identity(paths: &Paths, id: &TornectId) -> Result<ForgottenIdentity> {
-    let tor_config = tor_client_config(paths)?;
+    // Only the keystore and state locations matter here, so the transport is moot.
+    let tor_config = tor_client_config(paths, &Transport::direct())?;
     forget_identity_in(&tor_config, &paths.arti_state_dir(), id)
 }
 

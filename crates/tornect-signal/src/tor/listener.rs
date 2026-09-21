@@ -158,7 +158,7 @@ use tor_hsservice::{RendRequest, RunningOnionService, StreamRequest};
 use tor_proto::stream::IncomingStreamRequest;
 use tornect_core::TornectId;
 
-use super::SIGNALING_PORT;
+use super::{MEDIA_PORT, SIGNALING_PORT};
 
 /// Rendezvous handshakes completed at once; what a request that finds them all
 /// busy meets is the [`Admission`] policy. The permit is released as soon as
@@ -684,23 +684,29 @@ impl Drop for StreamGuard {
     }
 }
 
-/// Accept `BEGIN` on [`SIGNALING_PORT`]; anything else destroys the circuit.
+/// Accept `BEGIN` on [`SIGNALING_PORT`] or [`MEDIA_PORT`]; anything else
+/// destroys the circuit.
 async fn handle_stream_request(
     request: StreamRequest,
     incoming: &mpsc::Sender<OnionStream>,
     live: &Arc<watch::Sender<usize>>,
 ) -> StreamOutcome {
-    let wanted = matches!(
-        request.request(),
-        IncomingStreamRequest::Begin(begin) if begin.port() == SIGNALING_PORT
-    );
-    if !wanted {
-        tracing::debug!("stream request is not BEGIN on the signaling port; destroying circuit");
-        if let Err(e) = request.shutdown_circuit() {
-            tracing::debug!(error = %e, "destroying circuit failed");
+    let port = match request.request() {
+        IncomingStreamRequest::Begin(begin)
+            if begin.port() == SIGNALING_PORT || begin.port() == MEDIA_PORT =>
+        {
+            begin.port()
         }
-        return StreamOutcome::Rejected;
-    }
+        _ => {
+            tracing::debug!(
+                "stream request is not BEGIN on the signaling or media port; destroying circuit"
+            );
+            if let Err(e) = request.shutdown_circuit() {
+                tracing::debug!(error = %e, "destroying circuit failed");
+            }
+            return StreamOutcome::Rejected;
+        }
+    };
     // Refuse before accepting when nobody can take the stream: the peer then
     // sees END(DONE), as from Arti's reverse proxy with an unreachable target,
     // rather than CONNECTED followed by END(MISC). `try_send` below still
@@ -727,7 +733,7 @@ async fn handle_stream_request(
     let accepted = tokio::time::timeout(ACCEPT_TIMEOUT, request.accept(Connected::new_empty()));
     match accepted.await {
         Ok(Ok(stream)) => {
-            let stream = OnionStream::served(stream, StreamGuard::new(live));
+            let stream = OnionStream::served(stream, StreamGuard::new(live), port);
             match incoming.try_send(stream) {
                 Ok(()) => StreamOutcome::Accepted,
                 Err(_) => {
@@ -808,25 +814,35 @@ pub struct OnionStream {
     _guard: Option<StreamGuard>,
     /// The write deadline.
     stall: StallTimer,
+    /// The virtual port: [`SIGNALING_PORT`] or [`MEDIA_PORT`].
+    port: u16,
 }
 
 impl OnionStream {
-    /// A client-side stream (`TorNode::connect`).
-    pub(crate) fn new(inner: DataStream) -> Self {
-        Self::with_guard(inner, None)
+    /// A client-side stream (`TorNode::connect`) to `port`.
+    pub(crate) fn new(inner: DataStream, port: u16) -> Self {
+        Self::with_guard(inner, None, port)
     }
 
     /// A host-side stream: `guard` ties it to its circuit's idle deadline.
-    fn served(inner: DataStream, guard: StreamGuard) -> Self {
-        Self::with_guard(inner, Some(guard))
+    fn served(inner: DataStream, guard: StreamGuard, port: u16) -> Self {
+        Self::with_guard(inner, Some(guard), port)
     }
 
-    fn with_guard(inner: DataStream, guard: Option<StreamGuard>) -> Self {
+    fn with_guard(inner: DataStream, guard: Option<StreamGuard>, port: u16) -> Self {
         Self {
             inner,
             _guard: guard,
             stall: StallTimer::new(STREAM_WRITE_TIMEOUT),
+            port,
         }
+    }
+
+    /// The virtual port this stream was opened on: [`SIGNALING_PORT`] for the
+    /// envelope protocol, [`MEDIA_PORT`] for a session's Tor media stream.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     fn bound<T>(&mut self, cx: &mut Context<'_>, poll: Poll<io::Result<T>>) -> Poll<io::Result<T>> {

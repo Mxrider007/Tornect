@@ -10,6 +10,7 @@
 //! `std`/`tokio` types and this crate's own structs. Arti's errors are mapped to
 //! [`SignalError`] by the crate-private `map_arti_error` using their `ErrorKind`.
 
+mod bridges;
 mod config;
 mod crypto_provider;
 mod identity;
@@ -18,6 +19,10 @@ mod node;
 
 use arti_client::{ErrorKind, HasKind as _};
 
+pub use bridges::{
+    BUILTIN_OBFS4, BUILTIN_SNOWFLAKE, LYREBIRD, Ladder, PT_DIR_ENV, Rung, RungPolicy, Transport,
+    find_lyrebird, last_good,
+};
 pub use config::{
     CONNECT_TIMEOUT, INTRO_RATE_LIMIT, MAX_STREAMS_PER_CIRCUIT, NUM_INTRO_POINTS,
     POW_REND_QUEUE_DEPTH, pow_supported,
@@ -33,16 +38,24 @@ pub use listener::{
     MAX_LIVE_CIRCUITS, OnionListener, OnionStatus, OnionStream, RENDEZVOUS_TIMEOUT,
     RendezvousLimits, STREAM_WRITE_TIMEOUT,
 };
-pub use node::{BootstrapProgress, TorNode, shutdown_runtime};
+pub use node::{BootstrapProgress, Isolation, LadderEvent, TorNode, shutdown_runtime};
 
 use crate::error::{SignalError, error_chain};
 
 /// Virtual port inside the onion service that carries Tornect signaling
-/// (decision M1-2). Only `BEGIN` requests for this port are accepted; any other
-/// request destroys its rendezvous circuit, exactly as Arti's own reverse proxy
-/// does for an unmatched port, so the service is neither fingerprintable by
-/// port probing nor cheaply port-scannable (docs/research/arti.md §13.13).
+/// (decision M1-2). Only `BEGIN` requests for this port and [`MEDIA_PORT`] are
+/// accepted; any other request destroys its rendezvous circuit, exactly as
+/// Arti's own reverse proxy does for an unmatched port, so the service is
+/// neither fingerprintable by port probing nor cheaply port-scannable
+/// (docs/research/arti.md §13.13).
 pub const SIGNALING_PORT: u16 = 4000;
+
+/// Virtual port of a session's Tor media stream (decision M1-39): the second
+/// stream on the signaling stream's rendezvous circuit, opened after
+/// `SESSION_ACCEPT` + `TOR_FALLBACK`. Nothing is served on it until the peer
+/// proves the session token (`tornect-proto` `Bind`); the envelope protocol
+/// stays on [`SIGNALING_PORT`], where the kill switch and `BYE` still apply.
+pub const MEDIA_PORT: u16 = 4001;
 
 /// Translate an Arti error into the Tornect error vocabulary using its `ErrorKind`
 /// (docs/research/arti.md §9).

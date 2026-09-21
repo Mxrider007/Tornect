@@ -9,13 +9,15 @@ use anyhow::Context as _;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
+use tornect_core::config::BridgeMode;
 use tornect_core::keystore::{FileSecretStore, load_or_create_host_identity};
 use tornect_core::{Config, HostIdentity, Paths, TornectId};
 use tornect_signal::framing::FrameError;
 use tornect_signal::ping::NONCE_LEN;
 use tornect_signal::tor::Admission;
 use tornect_signal::{
-    OnionStatus, SignalError, TorNode, install_crypto_provider, ping, shutdown_runtime,
+    Ladder, LadderEvent, OnionStatus, SignalError, TorNode, install_crypto_provider, ping,
+    shutdown_runtime,
 };
 
 /// Per-ping reply deadline once the stream is open.
@@ -36,7 +38,12 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 }
 
 /// `tornect host [--once] [--pow|--no-pow]`
-pub fn host(paths: &Paths, once: bool, pow: Option<bool>) -> anyhow::Result<()> {
+pub fn host(
+    paths: &Paths,
+    once: bool,
+    pow: Option<bool>,
+    bridges: Option<BridgeMode>,
+) -> anyhow::Result<()> {
     install_crypto_provider();
     paths.ensure().context("creating Tornect directories")?;
     let store = FileSecretStore::open(paths.keys_dir()).context("opening keystore")?;
@@ -51,7 +58,76 @@ pub fn host(paths: &Paths, once: bool, pow: Option<bool>) -> anyhow::Result<()> 
     if let Some(pow) = pow {
         cfg.tor.pow_defense = pow;
     }
+    if let Some(mode) = bridges {
+        cfg.tor.bridges = mode;
+    }
     block_on(run_host(paths, &cfg, &identity, once))
+}
+
+/// `tornect tor-check [--bridges …]`: reach the Tor network the way `host` and
+/// `ping` would, report which transport worked, and exit.
+pub fn tor_check(paths: &Paths, bridges: Option<BridgeMode>) -> anyhow::Result<()> {
+    install_crypto_provider();
+    paths.ensure().context("creating Tornect directories")?;
+    let mut cfg = Config::load(&paths.config_file())?;
+    if let Some(mode) = bridges {
+        cfg.tor.bridges = mode;
+    }
+    block_on(async {
+        let started = Instant::now();
+        let node = start_tor(paths, &cfg).await?;
+        println!(
+            "TOR OK via {} in {:.1} s",
+            node.rung(),
+            started.elapsed().as_secs_f64()
+        );
+        node.shutdown().await;
+        Ok(())
+    })
+}
+
+/// Reach the Tor network through the bridge ladder (decision M1-38), printing
+/// each step: direct Tor, then obfs4 bridges, then Snowflake, starting from the
+/// transport that worked last time (`tor.bridges` in config.toml).
+pub(crate) async fn start_tor(paths: &Paths, cfg: &Config) -> anyhow::Result<TorNode> {
+    let ladder = Ladder::from_config(paths, &cfg.tor);
+    for line in &ladder.rejected_lines {
+        eprintln!("tor: ignoring bridge line {line}");
+    }
+    let mut last_pct = u32::MAX;
+    let node = TorNode::start_auto(paths, cfg, &ladder, |event| match event {
+        LadderEvent::Skipped { rung, reason } => {
+            eprintln!("tor: {} unavailable: {reason}", rung.describe());
+        }
+        LadderEvent::Trying { rung, attempt, of } => {
+            last_pct = u32::MAX;
+            eprintln!(
+                "tor: connecting via {} ({attempt}/{of})...",
+                rung.describe()
+            );
+        }
+        LadderEvent::Progress {
+            fraction, blocked, ..
+        } => {
+            let pct = (fraction * 100.0).round() as u32;
+            if pct != last_pct || blocked.is_some() {
+                match blocked {
+                    Some(why) => eprintln!("tor: bootstrap {pct:3}% - stuck: {why}"),
+                    None => eprintln!("tor: bootstrap {pct:3}%"),
+                }
+                last_pct = pct;
+            }
+        }
+        LadderEvent::Failed { rung, reason } => {
+            eprintln!("tor: {} did not work: {reason}", rung.describe());
+        }
+        LadderEvent::Ready { rung } => eprintln!("tor: ready (via {})", rung.describe()),
+        _ => {}
+    })
+    .await
+    .map_err(explain)
+    .context("reaching the Tor network")?;
+    Ok(node)
 }
 
 /// Run `fut` on a fresh multi-thread runtime, then tear the runtime down the way
@@ -93,10 +169,7 @@ async fn run_host(
     };
 
     eprintln!("bootstrapping Tor (~30 s cold, a few seconds with a warm cache)...");
-    let node = TorNode::start(paths, cfg)
-        .await
-        .context("starting the embedded Tor client")?;
-    let progress = spawn_progress_reporter(&node);
+    let node = start_tor(paths, cfg).await?;
 
     let pow = match (cfg.tor.pow_defense, tornect_signal::tor::pow_supported()) {
         (true, true) => "on",
@@ -146,6 +219,11 @@ async fn run_host(
                     eprintln!("listener closed");
                     break;
                 };
+                // The media port (decision M1-39) is served by the session
+                // host, not by this ping loop: close such streams unanswered.
+                if stream.port() != tornect_signal::SIGNALING_PORT {
+                    continue;
+                }
                 // Dropping the stream closes it; the peer sees EOF.
                 let Ok(session) = Arc::clone(&sessions).try_acquire_owned() else {
                     eprintln!(
@@ -179,34 +257,32 @@ async fn run_host(
     }
 
     status.abort();
-    progress.abort();
     drop(listener);
     node.shutdown().await;
     Ok(())
 }
 
 /// `tornect ping <onion> [--count N]`
-pub fn ping(paths: &Paths, onion: &str, count: u32) -> anyhow::Result<()> {
+pub fn ping(
+    paths: &Paths,
+    onion: &str,
+    count: u32,
+    bridges: Option<BridgeMode>,
+) -> anyhow::Result<()> {
     install_crypto_provider();
     let id: TornectId = onion
         .parse()
         .map_err(|e| anyhow::anyhow!("{onion:?} is not a Tornect ID: {e}"))?;
-    let cfg = Config::load(&paths.config_file())?;
+    let mut cfg = Config::load(&paths.config_file())?;
+    if let Some(mode) = bridges {
+        cfg.tor.bridges = mode;
+    }
     block_on(run_ping(paths, &cfg, id, count))
 }
 
 async fn run_ping(paths: &Paths, cfg: &Config, id: TornectId, count: u32) -> anyhow::Result<()> {
     eprintln!("bootstrapping Tor (~30 s cold, a few seconds with a warm cache)...");
-    let node = TorNode::start(paths, cfg)
-        .await
-        .context("starting the embedded Tor client")?;
-    let progress = spawn_progress_reporter(&node);
-    node.wait_ready(Duration::from_secs(u64::from(
-        cfg.tor.bootstrap_timeout_secs,
-    )))
-    .await
-    .map_err(explain)?;
-    progress.abort();
+    let node = start_tor(paths, cfg).await?;
 
     eprintln!("connecting to {id} (rendezvous usually takes 5-30 s, up to 60 s)...");
     let started = Instant::now();
@@ -253,33 +329,6 @@ fn nonce(seq: u32) -> [u8; NONCE_LEN] {
     ((nanos as u64) ^ (u64::from(seq) << 48)).to_be_bytes()
 }
 
-fn spawn_progress_reporter(node: &TorNode) -> JoinHandle<()> {
-    let mut rx = node.bootstrap_progress();
-    tokio::spawn(async move {
-        let mut last_pct = u32::MAX;
-        let mut last_blocked: Option<String> = None;
-        loop {
-            let p = rx.borrow_and_update().clone();
-            let pct = (p.fraction * 100.0).round() as u32;
-            if pct != last_pct || p.blocked != last_blocked {
-                match &p.blocked {
-                    Some(why) => eprintln!("tor: bootstrap {pct:3}% - stuck: {why}"),
-                    None => eprintln!("tor: bootstrap {pct:3}%"),
-                }
-                last_pct = pct;
-                last_blocked.clone_from(&p.blocked);
-            }
-            if p.ready {
-                eprintln!("tor: ready");
-                break;
-            }
-            if rx.changed().await.is_err() {
-                break;
-            }
-        }
-    })
-}
-
 fn spawn_status_reporter(mut rx: watch::Receiver<OnionStatus>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut announced = false;
@@ -323,8 +372,11 @@ fn explain(err: SignalError) -> anyhow::Error {
             "Tor did not answer in time. Check the network on both ends and retry."
         }
         SignalError::Bootstrap(_) => {
-            "Tor could not bootstrap. Check the network connection; a full disk also \
-             shows up this way (the Tor cache lives under `tornect paths`)."
+            "Tor could not be reached directly, through obfs4 bridges or through Snowflake. \
+             Check the network connection (a full disk also shows up this way: the Tor \
+             cache lives under `tornect paths`). Where Tor is censored, get private bridges \
+             from https://bridges.torproject.org and add them to `tor.bridge_lines` in \
+             config.toml; `tornect doctor` shows whether the `lyrebird` bridge helper was found."
         }
         SignalError::Config(_) => {
             "Check `tornect config show`: a security setting this build cannot honour \
