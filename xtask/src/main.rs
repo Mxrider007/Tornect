@@ -48,8 +48,40 @@ fn workspace_root() -> anyhow::Result<PathBuf> {
         .context("xtask must live one level below the workspace root")
 }
 
+/// The variables `cargo run` gives this binary (the Cargo book, "Environment
+/// variables Cargo sets for crates"). They must not reach the cargo commands the
+/// gate spawns: cargo fingerprints a build script against the value in *its own*
+/// environment, and `ring`'s build script asks for `rerun-if-env-changed` on
+/// `CARGO_PKG_NAME` and `CARGO_PKG_VERSION_*`. With them inherited, every switch
+/// between `cargo xtask` and a plain `cargo` (or the pre-commit hook) re-ran that
+/// build script and rebuilt everything above it, the whole Tor stack included.
+///
+/// The prefix is `CARGO_PKG_`, never `CARGO_`: user settings such as
+/// `CARGO_BUILD_JOBS`, `CARGO_HOME`, `CARGO_TARGET_DIR` and `CARGO_INCREMENTAL`
+/// must pass through untouched.
+fn set_by_cargo_run(name: &str) -> bool {
+    name.starts_with("CARGO_PKG_")
+        || matches!(
+            name,
+            "CARGO"
+                | "CARGO_MANIFEST_DIR"
+                | "CARGO_MANIFEST_PATH"
+                | "CARGO_CRATE_NAME"
+                | "CARGO_BIN_NAME"
+                | "CARGO_PRIMARY_PACKAGE"
+                | "CARGO_TARGET_TMPDIR"
+                | "CARGO_RUSTC_CURRENT_DIR"
+        )
+}
+
 fn cargo() -> Command {
-    Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()))
+    let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()));
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(set_by_cargo_run) {
+            cmd.env_remove(&name);
+        }
+    }
+    cmd
 }
 
 fn run(root: &Path, label: &str, mut cmd: Command) -> anyhow::Result<()> {
@@ -265,4 +297,51 @@ fn dist(root: &Path) -> anyhow::Result<()> {
         "dist: installers (MSI/winget, notarized .dmg, AppImage/Flatpak) are M8 work — see docs/PLAN.md."
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `cargo test` hands this binary the same variables `cargo run` hands the gate.
+    #[test]
+    fn a_spawned_cargo_does_not_inherit_what_cargo_run_set() {
+        let cmd = cargo();
+        let removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .filter_map(|(name, _)| name.to_str().map(str::to_owned))
+            .collect();
+        for name in [
+            "CARGO_PKG_NAME",
+            "CARGO_PKG_VERSION_MAJOR",
+            "CARGO_MANIFEST_DIR",
+        ] {
+            assert!(
+                std::env::var_os(name).is_some(),
+                "{name} is unset: run this test through cargo"
+            );
+            assert!(
+                removed.iter().any(|n| n == name),
+                "{name} leaks into the spawned cargo"
+            );
+        }
+    }
+
+    /// Whatever the fix removes, a developer's own cargo settings must survive it.
+    #[test]
+    fn user_settings_still_reach_the_spawned_cargo() {
+        for name in [
+            "CARGO_BUILD_JOBS",
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "CARGO_INCREMENTAL",
+            "CARGO_NET_OFFLINE",
+        ] {
+            assert!(
+                !set_by_cargo_run(name),
+                "{name} is a user setting, not cargo's"
+            );
+        }
+    }
 }
