@@ -143,6 +143,14 @@ impl Paths {
         self.state_dir.join("unattended.lock")
     }
 
+    /// Held by a running `tornect host` for its whole life, so every other
+    /// command can tell that a host is alive here, including one with no control
+    /// channel to answer it (Windows until M6, or a failed bind).
+    #[must_use]
+    pub fn host_lock(&self) -> PathBuf {
+        self.state_dir.join("host.lock")
+    }
+
     /// Client-side per-host records `hosts.toml` (`docs/PLAN.md` §B.8.9: `remember`,
     /// `server_s_pk_pin`, `suite`, `ua_worked_before`).
     #[must_use]
@@ -201,6 +209,10 @@ mod tests {
         assert_eq!(
             p.unattended_lock(),
             PathBuf::from("/tmp/tornect-test/state/unattended.lock")
+        );
+        assert_eq!(
+            p.host_lock(),
+            PathBuf::from("/tmp/tornect-test/state/host.lock")
         );
         assert_eq!(
             p.hosts_file(),
