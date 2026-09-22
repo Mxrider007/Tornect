@@ -554,20 +554,64 @@ async fn unbound_streams_end_at_the_bind_deadline() {
     assert_eq!(rig.backend.sources.load(Ordering::SeqCst), 0);
 }
 
-/// Unbound streams are capped too: one beyond the cap is closed unread.
+/// Binds waiting for a session nobody has registered are capped: one beyond
+/// the cap is refused at once, without waiting out the deadline.
 #[tokio::test(start_paused = true)]
-async fn waiting_streams_beyond_the_cap_are_closed_unread() {
+async fn waiting_binds_beyond_the_cap_are_refused_at_once() {
     let rig = rig(MediaLimits {
-        max_unbound: 2,
+        max_waiting: 2,
         ..MediaLimits::default()
     });
-    let (_a, a) = connect(&rig.host);
-    let (_b, b) = connect(&rig.host);
+    let ghost = |seed| Binding::new(&SessionToken::new([seed; 32]), &[seed; 32]);
+    let (mut a, a_served) = connect(&rig.host);
+    write_msg(&mut a, &ghost(1).msg()).await.unwrap();
+    let (mut b, b_served) = connect(&rig.host);
+    write_msg(&mut b, &ghost(2).msg()).await.unwrap();
     tokio::task::yield_now().await;
-    let (_c, c) = connect(&rig.host);
-    assert_eq!(c.await.unwrap(), MediaOutcome::Busy);
-    assert_eq!(a.await.unwrap(), MediaOutcome::NotBound);
-    assert_eq!(b.await.unwrap(), MediaOutcome::NotBound);
+    let (mut c, c_served) = connect(&rig.host);
+    write_msg(&mut c, &ghost(3).msg()).await.unwrap();
+    let t0 = tokio::time::Instant::now();
+    assert_eq!(c_served.await.unwrap(), MediaOutcome::Busy);
+    assert_eq!(t0.elapsed(), Duration::ZERO);
+    assert_eq!(
+        read_msg(&mut c).await.unwrap(),
+        Some(Msg::BindRefused {
+            reason: reason::BAD_BIND
+        })
+    );
+    assert_eq!(a_served.await.unwrap(), MediaOutcome::NotBound);
+    assert_eq!(b_served.await.unwrap(), MediaOutcome::NotBound);
+}
+
+/// SLICE-C1 C1-1: streams that squat the waiting slots, idle or bound to a
+/// session nobody registered, do not keep a live session's viewer from
+/// binding. Before, every stream took a slot before a byte was read, so eight
+/// idle streams from anyone with the Tornect ID denied every session its
+/// picture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn squatting_streams_do_not_starve_a_live_sessions_bind() {
+    let rig = rig(MediaLimits::default());
+    let mut squatters = Vec::new();
+    for i in 0..MediaLimits::default().max_waiting as u8 {
+        let (mut stream, served) = connect(&rig.host);
+        // Half say nothing; half bind a session that never registers.
+        if i % 2 == 1 {
+            let ghost = Binding::new(&SessionToken::new([0x60 + i; 32]), &[0x61; 32]);
+            write_msg(&mut stream, &ghost.msg()).await.unwrap();
+        }
+        squatters.push((stream, served));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (_, binding) = start(&rig.host, 9, SessionMode::ViewOnly);
+    let (stream, served) = connect(&rig.host);
+    let viewer = MediaViewer::bind(stream, &binding, WAIT)
+        .await
+        .expect("the live session's viewer binds");
+    drop(viewer);
+    assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
+    for (_, served) in squatters {
+        served.abort();
+    }
 }
 
 /// The FSM registers a session just after sending `SESSION_ACCEPT`; a viewer
