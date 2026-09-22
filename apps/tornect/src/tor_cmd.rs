@@ -39,7 +39,7 @@ use tornect_signal::{
     SignalError, TorNode, install_crypto_provider, ping, shutdown_runtime,
 };
 
-use crate::host::{CliMedia, HostWiring, Served};
+use crate::host::{CliMedia, ControlChannel, HostLock, HostWiring, Served};
 use crate::prompt::{CliConsent, CliPairingUi, Prompter};
 
 /// Per-ping reply deadline once the stream is open.
@@ -88,6 +88,9 @@ pub fn host(
 ) -> anyhow::Result<()> {
     install_crypto_provider();
     paths.ensure().context("creating Tornect directories")?;
+    // Held until this host exits: it tells every other command that a host is
+    // alive here, even one with no control channel (SLICE-B2 B2-2).
+    let _host_lock = HostLock::acquire(paths)?;
     let store = FileSecretStore::open(paths.keys_dir()).context("opening keystore")?;
     let (identity, created) = load_or_create_host_identity(&store)?;
     if created {
@@ -231,9 +234,10 @@ async fn run_host(
             Arc::new(AutoDeny)
         }
     };
+    let control = ControlChannel::default();
     let media = Arc::new(MediaHost::new(
         Arc::new(SystemBackend::new(source)),
-        Arc::new(CliMedia),
+        Arc::new(CliMedia::new(control.clone())),
         MediaLimits::default(),
     ));
     let HostWiring {
@@ -249,6 +253,7 @@ async fn run_host(
         device_pk,
         consent,
         Arc::clone(&media),
+        control.clone(),
     )?;
     // A kill ends every session's media at once, without waiting for the FSM's
     // `BYE` to a peer that may not be reading (SLICE-B1 B1-2).
@@ -260,15 +265,9 @@ async fn run_host(
     // another terminal routes here instead of opening the store itself — and
     // bringing it up first means that works during the slow part, which is
     // exactly when someone wants to ask what the host is doing. It shares the
-    // FSM's kill switch, so `tornect panic` ends this host's sessions.
-    let ipc = ctx.map(|ctx| {
-        let owned = paths.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::unattended::serve(Arc::new(ctx), &owned).await {
-                tracing::warn!(error = %e, "IPC endpoint stopped");
-            }
-        })
-    });
+    // FSM's kill switch, so `tornect panic` ends this host's sessions, with or
+    // without a store (SLICE-B2 B2-2).
+    let ipc = crate::host::start_control_channel(paths, ctx, deps.kill.clone(), control).await?;
 
     eprintln!("bootstrapping Tor (~30 s cold, a few seconds with a warm cache)...");
     let node = start_tor(paths, cfg).await?;

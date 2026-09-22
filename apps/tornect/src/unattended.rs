@@ -32,7 +32,8 @@ use tornect_core::unattended::ipc::{
 use tornect_core::unattended::readiness::ReadinessSnapshot;
 use tornect_core::unattended::store::{GrantStore, LoadMode};
 use tornect_core::{Config, Paths};
-use tornect_platform::ipc::Reply;
+use tornect_platform::ipc::{Endpoint, Reply};
+use tornect_signal::fsm::host::KillSwitch;
 
 /// Everything the dispatch needs, whichever route reached it.
 pub struct HostContext {
@@ -45,7 +46,7 @@ pub struct HostContext {
     /// `zxcvbn` inputs for `PolicyInputs` (§B.8.7.2).
     pub user_inputs: Vec<String>,
     /// Ends live handshakes. `None` on the offline route — there are none.
-    pub kill: Option<tornect_signal::fsm::host::KillSwitch>,
+    pub kill: Option<KillSwitch>,
     /// `sessions.log`, for `Log`.
     pub log: SessionLog,
 }
@@ -354,11 +355,9 @@ fn reply(ctx: &Arc<HostContext>, req: IpcRequest) -> Reply {
     }
 }
 
-/// Serve the endpoint for the host role until the task is dropped.
-pub async fn serve(ctx: Arc<HostContext>, paths: &Paths) -> anyhow::Result<()> {
-    let endpoint = tornect_platform::ipc::Endpoint::bind(&paths.state_dir)
-        .await
-        .context("binding the IPC endpoint")?;
+/// Serve the host role's control channel on `endpoint` until the task is
+/// dropped.
+pub async fn serve(ctx: Arc<HostContext>, endpoint: &Endpoint) -> anyhow::Result<()> {
     tracing::info!(path = %endpoint.path().display(), "IPC endpoint listening");
     endpoint
         .serve(move |req| {
@@ -380,6 +379,47 @@ pub async fn serve(ctx: Arc<HostContext>, paths: &Paths) -> anyhow::Result<()> {
         })
         .await
         .context("serving IPC")
+}
+
+/// [`serve`] for a host whose unattended store did not open (`why`): `tornect
+/// panic` still ends every session, through `kill`, and every other request is
+/// refused with the reason (SLICE-B2 B2-2).
+pub async fn serve_without_store(
+    kill: KillSwitch,
+    why: String,
+    endpoint: &Endpoint,
+) -> anyhow::Result<()> {
+    tracing::info!(path = %endpoint.path().display(), "IPC endpoint listening (panic only)");
+    let why: Arc<str> = why.into();
+    endpoint
+        .serve(move |req| {
+            let (kill, why) = (kill.clone(), Arc::clone(&why));
+            async move { dispatch_without_store(&kill, &why, req) }
+        })
+        .await
+        .context("serving IPC")
+}
+
+/// [`dispatch`] for a host with no store. Such a host serves no unattended
+/// session, so there is no grant to suspend behind one.
+fn dispatch_without_store(kill: &KillSwitch, why: &str, req: IpcRequest) -> IpcResponse {
+    match req.op {
+        IpcOp::Panic => {
+            kill.kill(tornect_signal::messages::bye::PANIC);
+            let mut r = IpcResponse::ok(req.id);
+            r.detail = Some("every handshake and session was ended".to_owned());
+            r
+        }
+        _ => IpcResponse::fail(
+            req.id,
+            codes::G_PRECONDITION,
+            format!(
+                "this host started without its unattended store ({why}), so it answers only \
+                 `tornect panic`; stop it (Ctrl-C in its terminal) and start it again to use \
+                 this command"
+            ),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -521,9 +561,10 @@ pub enum BackupCmd {
 /// How a CLI command reaches [`dispatch`].
 ///
 /// §B.8.7.4: "with no host running the CLI runs the guard offline like any
-/// other mutation". The store's advisory lock is what makes the two mutually
-/// exclusive — a running host holds it, so the offline route can only ever be
-/// taken when there is genuinely no host to talk to.
+/// other mutation". A running host holds the host lock for its whole life, so
+/// the offline route is taken only when there is genuinely no host — not merely
+/// none that answers (SLICE-B2 B2-2) — and the store's advisory lock keeps the
+/// two from writing the store at once.
 enum Route {
     /// A host is listening; send the request to it.
     Host,
@@ -574,7 +615,7 @@ fn reauth_backend() -> Arc<dyn tornect_core::unattended::guard::ReAuth> {
 pub fn host_context(
     paths: &Paths,
     activity: Arc<dyn RemoteSessionActivity>,
-    kill: tornect_signal::fsm::host::KillSwitch,
+    kill: KillSwitch,
 ) -> anyhow::Result<HostContext> {
     context(paths, LoadMode::Host, activity, Some(kill))
 }
@@ -601,7 +642,7 @@ fn context(
     paths: &Paths,
     mode: LoadMode,
     activity: Arc<dyn RemoteSessionActivity>,
-    kill: Option<tornect_signal::fsm::host::KillSwitch>,
+    kill: Option<KillSwitch>,
 ) -> anyhow::Result<HostContext> {
     use tornect_core::keystore::{FileSecretStore, load_or_create_host_identity};
     use tornect_core::unattended::clock::SystemClock;
@@ -675,13 +716,52 @@ fn os_host_name() -> Option<String> {
     name.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty())
 }
 
-/// Pick the route: talk to a running host, or run the guard here.
-async fn route(paths: &Paths) -> anyhow::Result<Route> {
+/// What serves this state directory.
+enum Probe {
+    /// A host that answers on its control channel.
+    Host,
+    /// A host holds the host lock but nothing answers: Windows until M6, or a
+    /// failed bind. The holder, for messages.
+    Unreachable(String),
+    /// No host.
+    NoHost,
+}
+
+async fn probe(paths: &Paths) -> Probe {
     if tornect_platform::ipc::is_running(&paths.state_dir).await {
-        Ok(Route::Host)
+        Probe::Host
+    } else if let Some(holder) = crate::host::HostLock::holder(paths) {
+        Probe::Unreachable(holder)
     } else {
-        Ok(Route::Offline(Box::new(offline_context(paths)?)))
+        Probe::NoHost
     }
+}
+
+/// Pick the route: talk to a running host, or run the guard here — but never
+/// beside a host that does not answer. The offline guard cannot see that
+/// host's live sessions, so it would widen access under one (SLICE-B2 B2-2).
+async fn route(paths: &Paths) -> anyhow::Result<Route> {
+    match probe(paths).await {
+        Probe::Host => Ok(Route::Host),
+        Probe::Unreachable(holder) => anyhow::bail!(
+            "{}; stop it (Ctrl-C in its terminal) and run this again",
+            unreachable_host(paths, &holder)
+        ),
+        Probe::NoHost => Ok(Route::Offline(Box::new(offline_context(paths)?))),
+    }
+}
+
+/// "A host runs here, but nothing answers for it."
+fn unreachable_host(paths: &Paths, holder: &str) -> String {
+    format!(
+        "a Tornect host is running for {} ({holder}), but it has no control channel{}",
+        paths.state_dir.display(),
+        if cfg!(windows) {
+            " (the Windows one lands at M6)"
+        } else {
+            ""
+        }
+    )
 }
 
 /// Send one op down whichever route is available.
@@ -1423,8 +1503,18 @@ pub fn devices(paths: &Paths, json: bool) -> anyhow::Result<()> {
 /// `tornect panic`
 pub fn panic_now(paths: &Paths) -> anyhow::Result<()> {
     runtime()?.block_on(async move {
-        let route = route(paths).await?;
-        let resp = send(paths, &route, IpcOp::Panic).await?;
+        match probe(paths).await {
+            Probe::Host => {}
+            Probe::Unreachable(holder) => anyhow::bail!(
+                "{}; press Ctrl-C in its terminal to end its sessions",
+                unreachable_host(paths, &holder)
+            ),
+            Probe::NoHost => anyhow::bail!(
+                "no Tornect host is running for {}, so there is no session to end",
+                paths.state_dir.display()
+            ),
+        }
+        let resp = send(paths, &Route::Host, IpcOp::Panic).await?;
         // A panic that could not run must be loud, not swallowed.
         require_ok(&resp)?;
         match resp.detail {
@@ -1543,13 +1633,36 @@ mod tests {
             );
         }
         // Dropping the offline context released the store lock.
-        let kill = tornect_signal::fsm::host::KillSwitch::new();
+        let kill = KillSwitch::new();
         let host = host_context(&paths, Arc::new(NoSessionActivity), kill.clone()).unwrap();
         assert_eq!(host.guard.store().mode(), LoadMode::Host);
         let mut armed = kill.arm();
         assert!(go(&host, IpcOp::Panic).ok);
         let fired = tokio::time::timeout(std::time::Duration::from_secs(1), armed.killed()).await;
         assert_eq!(fired.ok(), Some(tornect_signal::messages::bye::PANIC));
+    }
+
+    /// SLICE-B2 B2-2: no command runs the guard offline beside a live host that
+    /// does not answer (Windows until M6, or a failed bind). That guard cannot
+    /// see the host's sessions: before, `unattended on` went through it and
+    /// skipped the §B.8.6.2 live-session gate.
+    #[tokio::test]
+    async fn no_command_runs_offline_beside_a_host_that_does_not_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let host = crate::host::HostLock::acquire(&paths).unwrap();
+        let refused = match route(&paths).await {
+            Ok(Route::Offline(_)) => panic!("took the offline route beside a live host"),
+            Ok(Route::Host) => panic!("nothing is listening"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            refused.contains("a Tornect host is running for"),
+            "{refused}"
+        );
+        drop(host);
+        assert!(matches!(route(&paths).await, Ok(Route::Offline(_))));
     }
 
     fn enabled(ctx: &HostContext) -> bool {
