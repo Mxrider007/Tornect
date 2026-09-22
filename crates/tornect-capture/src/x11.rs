@@ -36,6 +36,30 @@ fn failed(e: impl std::fmt::Display) -> CaptureError {
     CaptureError::Failed(e.to_string())
 }
 
+/// A root window no desktop has. 2^27 pixels is 512 MiB of BGRx; eight 4K
+/// screens side by side are half that. The cap keeps the byte count clear of
+/// `usize` overflow on a 32-bit target, and keeps a server that answers
+/// `GetGeometry` with nonsense from being asked for an enormous `GetImage`.
+const MAX_PIXELS: usize = 1 << 27;
+
+/// Bytes a `width`×`height` BGRx picture occupies — in `usize`, checked, and
+/// refused rather than wrapped. The old check multiplied in `u32`: a server
+/// answering `GetGeometry` with 32768×32768 made the product exactly 2^32, so it
+/// wrapped to **0** and an empty `GetImage` reply passed for a one-gigapixel
+/// picture (SLICE-B3 B3-7).
+fn frame_bytes(width: u32, height: u32) -> Result<usize, CaptureError> {
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .filter(|&px| px > 0 && px <= MAX_PIXELS)
+        .ok_or_else(|| {
+            failed(format!(
+                "root window geometry {width}x{height} is out of range"
+            ))
+        })?;
+    // `MAX_PIXELS * 4` fits a 32-bit `usize`, so this cannot overflow.
+    Ok(pixels * 4)
+}
+
 fn unavailable(e: impl std::fmt::Display) -> CaptureError {
     CaptureError::Unavailable(e.to_string())
 }
@@ -107,6 +131,10 @@ impl X11Capture {
             .reply()
             .map_err(failed)?;
         let (w, h) = (geometry.width, geometry.height);
+        let (width, height) = (u32::from(w), u32::from(h));
+        // Checked before the request: `GetImage` of a geometry no desktop has
+        // would have the server build a reply that size (SLICE-B3 B3-7).
+        let expected = frame_bytes(width, height)?;
         let image = self
             .conn
             .get_image(ImageFormat::Z_PIXMAP, self.root, 0, 0, w, h, !0)
@@ -114,9 +142,8 @@ impl X11Capture {
             .reply()
             .map_err(failed)?;
         let captured_at = Instant::now();
-        let (width, height) = (u32::from(w), u32::from(h));
         let mut bgrx = image.data;
-        if bgrx.len() != (width * height * 4) as usize {
+        if bgrx.len() != expected {
             return Err(failed(format!(
                 "GetImage returned {} bytes for {width}x{height}",
                 bgrx.len()
@@ -162,6 +189,24 @@ impl VideoSource for X11Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The server answers `GetGeometry`, so the geometry is its number, not ours,
+    /// and it also chooses how many bytes `GetImage` returns. In `u32`,
+    /// 32768×32768×4 is exactly 2^32 and wraps to 0: the old check then accepted
+    /// an **empty** reply as a one-gigapixel picture, which the cursor blend
+    /// indexes past the end of (SLICE-B3 B3-7). In a debug build the same
+    /// multiplication panics instead; only a release build wraps silently.
+    #[test]
+    fn a_geometry_no_desktop_has_is_refused_rather_than_wrapped() {
+        assert_eq!(32_768u32.wrapping_mul(32_768).wrapping_mul(4), 0);
+        assert!(frame_bytes(32_768, 32_768).is_err());
+        assert!(frame_bytes(65_535, 65_535).is_err());
+        assert!(frame_bytes(0, 1080).is_err());
+        assert!(frame_bytes(1920, 0).is_err());
+        assert_eq!(frame_bytes(1920, 1080).unwrap(), 1920 * 1080 * 4);
+        // Eight 4K screens side by side still pass.
+        assert_eq!(frame_bytes(30_720, 2160).unwrap(), 30_720 * 2160 * 4);
+    }
 
     #[test]
     fn only_an_x11_session_is_grabbed() {
