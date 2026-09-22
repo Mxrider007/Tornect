@@ -93,7 +93,10 @@ impl Default for MediaLimits {
             bind_deadline: Duration::from_secs(10),
             max_waiting: 8,
             first_frame_deadline: Duration::from_secs(10),
-            window_frames: 8,
+            // At 8, a Tor round trip of 1.0–1.3 s held the test card to 6.3 fps
+            // (live run, 2026-09-21); 15 fps needs about 20 in flight. The byte
+            // cap still bounds what can queue.
+            window_frames: 20,
             window_bytes: 512 * 1024,
             input_rate: 250,
             input_burst: 500,
