@@ -1,4 +1,4 @@
-# Tornect — continuation report (2026-09-22, sixth session close)
+# Tornect — continuation report (2026-09-22, seventh session close)
 
 Paste the block under **HAND-OFF** into a new session.
 
@@ -27,16 +27,33 @@ QUIC hole punching is deferred; m2–m6 stay untagged until their full acceptanc
 Read in this order before doing anything:
 1. `CLAUDE.md`
 2. this file
-3. `docs/notes/m1-state.md` (§ *Session 2026-09-22 (6)* and § *Session 2026-09-21 (5)*)
-4. `docs/notes/decisions.md` M1-43 (the session layer), M1-44 (the review fixes) and M1-45 (the
-   xtask environment fix, B2-7, B3-7)
+3. `docs/notes/m1-state.md` (§ *Session 2026-09-22 (7)*, *(6)* and *2026-09-21 (5)*)
+4. `docs/notes/decisions.md` M1-43 (the session layer), M1-44 (the review fixes), M1-45 (the
+   xtask environment fix, B2-7, B3-7), M1-46 (B2-2) and M1-47 (the slice-C fixes, the 20-unit
+   window)
 5. `docs/notes/m1-media-evidence.md`: how the live media check runs (driver in its appendix)
 6. `docs/research/slice.md` §4, for Wayland capture
-7. the review synthesis:
-   `/home/mx/kore_project_V3/agents/security/reports/2026-09-21_tornect_slice_b_review.md`
+7. the review syntheses:
+   `/home/mx/kore_project_V3/agents/security/reports/2026-09-22_tornect_slice_c_review.md` (the
+   latest: open findings and their dispositions) and `…/2026-09-21_tornect_slice_b_review.md`
 
-Then run `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp cargo xtask verify`. Expect **428 tests**
+Then run `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp cargo xtask verify`. Expect **437 tests**
 and `cargo deny check (offline; advisory DB 2026-08-29)` ok.
+
+### STATE (2026-09-22, seventh session)
+
+**Gate: green at 437 tests**, cargo-deny ok. `main` = `origin/main` at this hand-off's commit.
+
+- **The slice-C review ran** (it had died on the weekly limit the session before): 0 critical,
+  0 high, 2 medium, 6 low, 13 info. Both mediums are fixed.
+- **B2-2 is fixed** (M1-46). A host keeps a kill path with no store and with no control channel,
+  and the terminal only ever names a kill path that works. On Windows that path is Ctrl-C until
+  the M6 named pipe.
+- **C1-1** (a squatter could deny every session its picture), **C2-1** (a flooding host swallowed
+  Ctrl-C in `tornect connect`) and **B2-8** (an unbounded `bye`) are fixed, all failing-first (M1-47).
+- **The ack window is 20 units**; over Tor the test card went from 6.3 to **13.2 and 13.0 fps** in two live
+  runs. Run 2 passed all 10 live checks. `bye` now waits for the host to close: run 1 had lost the
+  client's `BYE` to its own immediate Tor shutdown.
 
 ### STATE (2026-09-22, sixth session)
 
@@ -113,26 +130,7 @@ Commits this session, all pushed:
 
 ### NEXT, in order
 
-0. **Re-launch the review of `510b6cb..5f1ae84`** (after 2026-09-24 17:00 -03; ask the operator
-   whether the week's budget carries it — A' is ≈ 1.3 M tokens, the refuted variant ≈ 5 M). The
-   frozen worktree is still there; the three scopes are written up and need no re-scoping. If the
-   range has moved on by then, freeze the new head and say so in the report.
-0b. **The last quick win, B2-8:** bound the client's `bye` after Ctrl-C (≈ 2 s) and schedule pings
-   from a deadline (`apps/tornect/src/tor_cmd.rs`: the two `session.bye(...)` calls in
-   `run_connect`, and `keep_alive`'s `session.ping()`, which is not bounded either). A
-   failing-first test needs a host that keeps the stream open and stops answering; the crate's
-   tests drive a real `serve_host` over a duplex, which always reads, so budget one scaffold —
-   `tornect-signal`'s `a_kill_ends_the_session_while_a_write_to_the_peer_is_stuck` uses a
-   256-byte duplex for the same purpose and is the model to copy.
-1. **B2-2 (MEDIUM) — before the operator's test.** A host whose store could not open (usually
-   locked by another Tornect command at start) runs with **no control channel**: `tornect panic`
-   says "no host is running here". On **Windows** the IPC endpoint is still a scaffold, so
-   `tornect panic` can never reach a Windows host.
-   - Always bind the IPC endpoint, serving `Panic` and `Status` from the kill switch and tracker
-     even without a store; or refuse to start while the store is `Locked`.
-   - Drop "`tornect panic` ends it" when there is no channel.
-   - At least make Ctrl-C and the terminal the stated kill path on Windows.
-2. **Wayland capture: RemoteDesktop portal + PipeWire via dlopen** (`docs/research/slice.md` §4).
+1. **Wayland capture: RemoteDesktop portal + PipeWire via dlopen** (`docs/research/slice.md` §4).
    - It adds `ashpd` and `libloading` to the lockfile. Expect one full Arti rebuild, and batch any
      other dependency change into the same edit.
    - Implement it as a `VideoSource` plus an `InputSink` (`notify_*`, evdev codes; **never
@@ -140,34 +138,44 @@ Commits this session, all pushed:
    - The struct mirrors and the 232-byte EnumFormat pod are in the sub-report named at the top of
      `slice.md`.
    - Frames come only on damage (the source returns `Ok(None)`), and buffers must always be
-     requeued.
+     requeued. Map input over the **encoded** region from the start (SLICE-C1 C1-2).
    - The runtime check needs a click on the portal dialog: run it at the VM's console, or mark it
      `NEEDS-DEVICE`.
-3. **Frame-rate tuning.** Raise `MediaLimits::window_frames` from 8 to about 20 (the byte cap
-   stays) and re-run the live media check. Expect about 15 fps at a 1.2 s RTT.
-4. **GUI**: a manual winit loop + egui (`slice.md` §2).
+2. **The review's open lows, by value** (claims until checked; details in the slice-C synthesis):
+   - **C3-1:** the one-session gate is check-then-act across the `SESSION_ACCEPT` write. Reserve
+     the slot atomically in `LiveSessions`.
+   - **C1-2 interim:** refuse an injector when the source is larger than the encoder's
+     3840×2160.
+   - **C1-3:** release held keys when the viewer goes quiet (≈ 3 s).
+   - **C3-2:** race the `fail()` writes in `established()` against the kill.
+   - **C3-3:** refuse a `DISPLAY` with a host part.
+   - **C2-2 (b):** a stalled viewer write delays the stop.
+3. **GUI**: a manual winit loop + egui (`slice.md` §2).
    - The ID and Tor status; a connect field; the client SAS confirm; the host consent popup;
      a persistent "screen is being shared with X" banner with Stop.
    - The viewer draws `DecodedFrame`s through the `FrameSink` seam and sends input as `Msg::Input`
-     (keys by physical scancode).
+     (keys by physical scancode). Gate input on `ClientSession::accept().mode()`, never on
+     `BindOk.mode` (SLICE-C2 C2-6).
    - It replaces `apps/tornect/src/prompt.rs` behind the `Consent` / `ClientPairingUi` seams.
      Withdraw open popups on a kill or a session start (the B1-3/B2-5 residual).
-5. **Windows build of the whole app.** First fix `tornect-core`'s 88 gnullvm-only
-   `clippy::result_large_err`. Arti's ring, bundled SQLite and zstd on gnullvm are untested. The
-   Windows paths of `tornect-session`'s `backend.rs` (GDI, `SendInput`) are compiled only by
-   inspection so far.
-6. **`xtask pt-fetch` and `xtask dist`** (`packaging/pt/SOURCES.md`; `LZMA_API_STATIC=1`;
+4. **Windows build of the whole app.** First fix `tornect-core`'s 88 gnullvm-only
+   `clippy::result_large_err`. Apply A3-F4's `CXXFLAGS` (stack protector) for OpenH264: the decoder
+   is now in every client (SLICE-C2 C2-3). Arti's ring, bundled SQLite and zstd on gnullvm are
+   untested; the Windows paths of `backend.rs` (GDI, `SendInput`) are compiled only by inspection.
+5. **`xtask pt-fetch` and `xtask dist`** (`packaging/pt/SOURCES.md`; `LZMA_API_STATIC=1`;
    pin the toolchain hashes).
-7. **Security review of everything after `510b6cb`.** Freeze the range on a worktree and launch it
-   first. **Ask the operator what size to run** (≈ 100 agents for the refuted variant).
-8. The operator's two-machine test (recipe in `docs/VERIFICATION.md`).
+6. **Security review of everything after `5f1ae84`.** Freeze the range on a worktree and launch it
+   first. **Ask the operator what size to run, and whether the week's budget carries it.**
+7. The operator's two-machine test (recipe in `docs/VERIFICATION.md`).
 
 M1, outside the slice: an **unattended client CLI** (`tornect connect --unattended`: a password
 prompt and a `hosts.toml`-backed `ServerKeyPin`). The §B.8.14 M1 acceptance needs it.
 
 ### STILL OPEN / UNTESTED (do not mark these done)
 
-- **Open review findings** (synthesis §5). The lows:
+- **Open slice-C findings** (`2026-09-22_tornect_slice_c_review.md` §3): the lows C1-2, C1-3,
+  C2-2 (b), C3-1, C3-2 and C3-3 (NEXT item 2), and the infos C1-4, C1-7, C2-3 to C2-7, C3-5, C3-7.
+- **Open slice-B findings** (synthesis §5). The lows:
   - B1-5: a remote `master_off` waits on its own answer.
   - B1-6: the lyrebird pin is check-then-exec.
   - B1-7: private bridge edge cases.
@@ -183,7 +191,8 @@ prompt and a `hosts.toml`-backed `ServerKeyPin`). The §B.8.14 M1 acceptance nee
   - B3-8: forbidden deps are checked on default features only.
   - B3-6 is an operator decision (see pending actions).
 - **Contracts for later milestones:** `ends_at` enforcement, per-device kills, same-device session
-  replacement, input mapped over the encoded region (B3-19), and a `u2`-era popup withdrawal.
+  replacement, input mapped over the encoded region (B3-19, now live as SLICE-C1 C1-2), and a
+  `u2`-era popup withdrawal.
 - **Carried from earlier hand-offs:**
   - the §B.8.15 A14 core-dump sweep;
   - the §B.8.5.2 per-minute and host-wide caps;
@@ -250,26 +259,36 @@ session with this same kind of report plus memory, Part G and `docs/notes/m1-sta
 
 ---
 
-## What this session did
+## What this session did (seventh, 2026-09-22)
 
-- Resumed at `510b6cb` with the KORE V3 MODE B bootstrap. The structure was verified by check
-  (PASS, 34/34). The operator answered four questions:
-  - resume with the session layer first (MODE C);
-  - run the review with 3 threat modelers;
-  - settle the four carried KORE governance items;
-  - push once the gate is green.
-- Launched the review first, on a frozen worktree. Meanwhile, built `tornect-session` and wired
-  it into the CLI; the gate went green at 419.
-- **Verified media end to end over real Tor** with the test card.
-- Synthesized the review (the Security parent), verified the medium findings by hand and fixed
-  them failing-first; the gate went green at 424. All six commits are pushed.
-- No VM restart happened during this session; the one the close message mentions was at about
-  17:00, before it.
+- Resumed at `68f690e` with the KORE V3 MODE B bootstrap. The structure check passed 34/34. The
+  operator answered three questions:
+  - resume in MODE C;
+  - launch the review now (the week had room);
+  - push once green.
+- **The slice-C review ran first** (three threat modelers on the frozen worktree, ≈ 21 min each)
+  and completed. Its synthesis is in KORE: 2 medium, 6 low, 13 info.
+- Fixed failing-first, one commit each:
+  - B2-2 (`94255c2`);
+  - C1-1 (`326fd72`);
+  - C2-1 with B2-8 (`65463d6`);
+  - C1-5, C1-6 and C3-4 (`2ee219c`);
+  - the 20-unit window (`7317e0d`, measured live);
+  - the lost `BYE` the live run exposed (`c641ae6`).
+- The gate went from 428 to **437**. A flaky test (`a_bind_is_single_use`) was found and fixed on
+  the way.
+- **Live over Tor:**
+  - 13.2 and 13.0 fps, 0 errors, the card in order;
+  - run 2 passed all 10 checks;
+  - the documented driver could never say PASS (11 results asked for, 10 checks), now fixed.
 
 **Honest limits:**
-- The app is **not functional end to end** for the operator: no Wayland capture (this VM's
-  desktop), no GUI, no Windows build of the whole app, no second machine. Nothing ran on Windows.
-- Media over Tor runs at 6–7 fps, window-bound and untuned.
-- The media driver has not been re-run with the wording fix.
-- B2-2 (MEDIUM) is open.
+- The app is **not functional end to end** for the operator: no Wayland capture on this VM, no
+  GUI, and no Windows build of the whole app. Nothing ran on Windows.
+- On Windows, `tornect panic` cannot reach a host until M6. The host names Ctrl-C instead. That
+  Windows path is compiled by inspection only (NEEDS-DEVICE).
+- C2-1's fix was proven on a transport that is always ready. No flood from a hostile host has
+  been run live.
+- The fixed ping deadline has no failing-first test.
+- Everything after `5f1ae84` is unreviewed by a hostile review, including this session's fixes.
 - `m1` is not tagged, and CI has never run.
