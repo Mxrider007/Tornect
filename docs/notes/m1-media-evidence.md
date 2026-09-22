@@ -124,6 +124,18 @@ SHARING STOPPED e2641a86775d873b
 screen sharing stopped (session over, ended by the host): 38 pictures, 5 KiB sent
 ```
 
+## Re-run, 2026-09-22 (seventh session): a 20-unit window
+
+Same driver, same homes, the tree at `2ee219c` plus the window change.
+- **Run 1:** session 1 gave 309/309 pictures, 0 errors, the card in order (0–308), **13.2 fps**.
+  The client then shut Tor down right after its `BYE`, and the host logged the end as `io`: the
+  flushed `BYE` never left. The driver stopped there, waiting for "the client left (USER)".
+- **Run 2:** 296 pictures, **13.0 fps**, and **all 10 checks true**, including `tornect panic`
+  ending media and session and a clean host exit. The driver said FAIL only because it asked for
+  11 results from its 10 checks, fixed below.
+- **Fix for run 1** (`c641ae6`): `ClientSession::bye` waits for the host to close (it closes once
+  it has read the `BYE`) before closing, within 3 s.
+
 ## Appendix: the driver (Python 3, standard library only)
 
 Run from the repository root after `cargo build --workspace --bins`:
@@ -327,6 +339,6 @@ finally:
             if not p.exited():
                 os.kill(p.pid, signal.SIGKILL)
     stamp(f'RESULTS {results}')
-    ok = results and all(results.values()) and len(results) == 11
+    ok = results and all(results.values()) and len(results) == 10
     stamp('MEDIA LIVE CHECK ' + ('PASS' if ok else 'FAIL'))
 ```

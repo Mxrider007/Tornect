@@ -524,6 +524,51 @@ Record: `/home/mx/kore_project_V3/agents/security/reports/2026-09-22_tornect_sli
 `serve_host` over a duplex, which always reads), B2-2, Wayland capture, the frame-rate tuning and
 the live re-run.
 
+## Session 2026-09-22 (7) — the slice-C review ran; B2-2, two review mediums and B2-8 fixed
+
+**Gate: green at 437 tests** (428 at the start), cargo-deny ok, 22–66 s. Everything is pushed.
+
+- **The review of `510b6cb..5f1ae84` ran** (three read-only threat modelers on the frozen
+  worktree, ≈ 0.91 M tokens, ≈ 21 min each): 0 critical, 0 high, 2 medium, 6 low, 13 info, 90
+  candidates refuted. Synthesis and dispositions:
+  `/home/mx/kore_project_V3/agents/security/reports/2026-09-22_tornect_slice_c_review.md`.
+- **B2-2 (M1-46, `94255c2`).** `tornect host` holds `state/host.lock`. Its control channel is up
+  even without a store, and then serves `tornect panic` only. No command runs offline beside a host
+  that does not answer. The kill path the terminal names is always one that works. The real binary
+  was checked in three situations: store locked at start, socket path unbindable, and normal.
+- **C1-1 (M1-47, `326fd72`).** Reading a media `Bind` takes no slot, so squatting streams can no
+  longer deny every session its picture.
+- **C2-1 + B2-8 (M1-47, `65463d6`).**
+  - Ctrl-C in `tornect connect` is heard on its own task, and a second press quits at once.
+  - The viewer yields after every message.
+  - `bye` gives up after 2 s, and pings run to a fixed deadline.
+- **C1-5, C1-6, C3-4 (`2ee219c`).** The `i32::MIN` wheel delta is refused; `watch_kill` arms
+  before it sweeps; `tornect panic` names its home.
+- **Frame rate (M1-47, `7317e0d`).** `MediaLimits::window_frames` goes from 8 to 20. Over Tor that
+  gave **13.2 and 13.0 fps** in two live runs, against 6.3 at 8, with 0 errors and the card in
+  order.
+- **The client's `BYE` could be lost (`c641ae6`).** In live run 1 the client shut Tor down right
+  after a flushed `BYE`, and the host logged the end as `io`. `bye` now waits for the host's close,
+  within 3 s.
+- **Live media check, run 2: all 10 checks pass**, including `tornect panic` ending media and
+  session and a clean host exit. The documented driver asked for 11 results from its 10 checks, so
+  it could never say PASS; fixed.
+- **A flake, fixed:** `a_bind_is_single_use` failed 2/25 under load. A vanished viewer can show
+  up as a broken pipe on a frame write before the reader sees EOF, and the test now accepts
+  either.
+
+**Still open from the review (claims):**
+- **Lows:**
+  - C1-2: clicks are mapped over the whole desktop while the viewer sees a crop (B3-19 now live).
+  - C1-3: a vanished viewer's held key stays down for up to 90 s.
+  - C2-2 (b): a stalled viewer write delays the stop.
+  - C3-1: the one-session gate is check-then-act across the accept write.
+  - C3-2: `fail()` writes in `established()` are not raced against the kill.
+  - C3-3: `$DISPLAY` can name a forwarded or remote X server.
+- **Infos:** C1-4, C1-7, C2-3 to C2-7, C3-5, C3-7.
+
+**Unreviewed by a hostile review:** everything after `5f1ae84`, including this session's fixes.
+
 ## Gotchas (dev VM mx-vm)
 
 - **The gate/plain-`cargo` rebuild ping-pong is fixed** (M1-45, 2026-09-22). `cargo xtask` runs
