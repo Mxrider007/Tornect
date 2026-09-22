@@ -295,13 +295,16 @@ impl MediaHost {
         tokio::spawn(async move {
             loop {
                 guard.killed().await;
+                // Armed before the sweep, so a kill during it fires again
+                // instead of being folded into this one (SLICE-C1 C1-6).
+                let next = kill.arm();
                 let Some(host) = host.upgrade() else {
                     return;
                 };
                 for session in host.lock().values() {
                     session.end.send_replace(Some(reason::ENDED_BY_HOST));
                 }
-                guard = kill.arm();
+                guard = next;
             }
         })
     }
