@@ -499,16 +499,39 @@ connect"** (decision M1-42).
 - Input over the media stream is wired host-side, but no client sends any yet (that is the GUI).
 - `m1` is untagged, and CI has never run.
 
+## Session 2026-09-22 (6) — the gate stops fighting cargo; two quick wins; a review that did not run
+
+**The review of `510b6cb..5f1ae84` did NOT run.** Three read-only threat modelers were launched
+first, on a frozen worktree at `5f1ae84`, and all three died within ~15 minutes on the account's
+**weekly** usage limit, with no report written. That whole range — the `tornect-session` crate,
+the CLI media path and the M1-44 fixes — is **unreviewed**. The frozen worktree
+`/home/mx/tornect-review-slice-c` is kept for the re-launch; the limit resets 2026-09-24 17:00 -03.
+Record: `/home/mx/kore_project_V3/agents/security/reports/2026-09-22_tornect_slice_c_review_NOT_RUN.md`.
+
+**What landed** (decision M1-45; gate green at **428 tests**, cargo-deny ok):
+- **The xtask environment fix.** `cargo()` removes the variables `cargo run` gave xtask before
+  spawning cargo, so the gate, plain `cargo` and the pre-commit hook share fingerprints again:
+  0.6 s and 0.3 s with nothing rebuilt, where the same switch used to cost 33 s and a `ring`
+  rebuild. Two tests, one of which fails on the old `cargo()`. The whole gate is now 41 s.
+  - One-time cost, already paid here: the first test-profile build after the fix rebuilt the Tor
+    stack once, because those fingerprints had been recorded under the old environment.
+- **B2-7:** `y`/`yes` at the session question no longer grants control (only `a`/`allow`, `v`/`view`).
+- **B3-7:** the X11 grab sizes its buffer with checked `usize` arithmetic under a 2^27-pixel cap,
+  before `GetImage`. The old `u32` product wrapped to **0** at 32768×32768, so an empty reply
+  would have passed for a one-gigapixel picture; a debug build panicked on it instead.
+
+**Not done:** B2-8 (it needs a silent-but-open host in the harness; today's app tests drive a real
+`serve_host` over a duplex, which always reads), B2-2, Wayland capture, the frame-rate tuning and
+the live re-run.
+
 ## Gotchas (dev VM mx-vm)
 
-- **`cargo xtask verify` and plain `cargo` rebuild each other's Tor stack.** `cargo xtask` runs
-  through `cargo run`, which puts `CARGO_PKG_NAME`, `CARGO_MANIFEST_DIR` and the other `CARGO_PKG_*`
-  variables into xtask's environment. `ring`'s build script watches exactly those
-  (`rerun-if-env-changed`). So every switch between the gate and a plain `cargo` command (or the
-  pre-commit hook) re-runs `ring` and rebuilds everything above it: several minutes for tests, and
-  about 30 s for clippy. Fix (next session): have xtask `env_remove` those variables from the cargo
-  commands it spawns. This is also the likely real cause of the old "`cargo test -p` re-unifies
-  features" note.
+- **The gate/plain-`cargo` rebuild ping-pong is fixed** (M1-45, 2026-09-22). `cargo xtask` runs
+  through `cargo run`, which put `CARGO_PKG_NAME`, `CARGO_MANIFEST_DIR` and the rest into xtask's
+  environment; `ring`'s build script watches exactly those (`rerun-if-env-changed`), so every
+  switch between the gate and a plain `cargo` (or the pre-commit hook) re-ran `ring` and rebuilt
+  everything above it. `xtask`'s `cargo()` now strips them — **if it ever comes back, look there
+  first.** This was also the real cause of the old "`cargo test -p` re-unifies features" note.
 - Build with `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp`; `/tmp` is a 3.7 GiB quota tmpfs
   (zstd-sys fails there); Tor state under `target/tornect-test/<name>`, never `/tmp`.
 - A cold Arti rebuild is 2–5 min; the pre-commit hook runs fmt + clippy
