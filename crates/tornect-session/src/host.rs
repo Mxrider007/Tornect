@@ -8,7 +8,12 @@
 //!    so an unbound peer holds nothing for long and costs the host 49 bytes.
 //!    The session must be live and not yet bound, and the MAC must verify
 //!    under that session's token and `th_final` (`tornect_proto::bind_mac_ok`,
-//!    constant time).
+//!    constant time). Reading a `Bind` takes no slot: a live session's viewer
+//!    is claimed as soon as its `Bind` arrives, and only a `Bind` for a session
+//!    not registered yet waits, [`MediaLimits::max_waiting`] at a time. Streams
+//!    that squat the slots therefore cannot starve a real viewer (SLICE-C1
+//!    C1-1); how many streams are open at once is the caller's bound (the
+//!    listener's: 4 per circuit).
 //! 2. **Capture.** Only now is the source opened (§B.6). A capture thread makes
 //!    one picture per credit, and credits come from the ack window, so nothing
 //!    is captured that could not be sent.
@@ -58,13 +63,14 @@ const BIND_LEN: usize = 1 + SESSION_ID_LEN + 32;
 /// The host's bounds on media streams.
 #[derive(Debug, Clone, Copy)]
 pub struct MediaLimits {
-    /// How long a new media stream has to deliver its `Bind`. An unbound
-    /// stream holds its rendezvous circuit open, so it must not linger
-    /// (SLICE-A1 G3).
+    /// How long a new media stream has to deliver its `Bind` and find its
+    /// session. An unbound stream holds its rendezvous circuit open, so it
+    /// must not linger (SLICE-A1 G3).
     pub bind_deadline: Duration,
-    /// Media streams waiting for their `Bind` at once. A stream beyond that is
-    /// closed unread.
-    pub max_unbound: usize,
+    /// `Bind`s waiting at once for a session the FSM has not registered yet
+    /// (it registers just after `SESSION_ACCEPT`, and a fast viewer can beat
+    /// it). One beyond that is refused at once.
+    pub max_waiting: usize,
     /// How long capture may take, after the bind, to deliver its first picture.
     pub first_frame_deadline: Duration,
     /// Access units in flight before the host waits for a `VideoAck`.
@@ -85,7 +91,7 @@ impl Default for MediaLimits {
     fn default() -> Self {
         Self {
             bind_deadline: Duration::from_secs(10),
-            max_unbound: 8,
+            max_waiting: 8,
             first_frame_deadline: Duration::from_secs(10),
             window_frames: 8,
             window_bytes: 512 * 1024,
@@ -185,7 +191,8 @@ pub enum MediaEnd {
 /// How [`MediaHost::serve`] ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaOutcome {
-    /// Closed unread: [`MediaLimits::max_unbound`] streams were already waiting.
+    /// Refused at once: its session is not registered, and
+    /// [`MediaLimits::max_waiting`] binds were already waiting for theirs.
     Busy,
     /// No valid `Bind` in time. A `BindRefused` was sent if a frame arrived.
     NotBound,
@@ -235,7 +242,7 @@ enum Lookup {
 pub struct MediaHost {
     sessions: Mutex<HashMap<String, Registered>>,
     registered: Notify,
-    unbound: Arc<Semaphore>,
+    waiting: Arc<Semaphore>,
     backend: Arc<dyn MediaBackend>,
     observer: Arc<dyn MediaObserver>,
     limits: MediaLimits,
@@ -261,7 +268,7 @@ impl MediaHost {
         Self {
             sessions: Mutex::new(HashMap::new()),
             registered: Notify::new(),
-            unbound: Arc::new(Semaphore::new(limits.max_unbound.max(1))),
+            waiting: Arc::new(Semaphore::new(limits.max_waiting.max(1))),
             backend,
             observer,
             limits,
@@ -308,13 +315,6 @@ impl MediaHost {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let Ok(unbound) = Arc::clone(&self.unbound).try_acquire_owned() else {
-            tracing::warn!(
-                max = self.limits.max_unbound,
-                "media stream closed unread: too many are waiting for their bind"
-            );
-            return MediaOutcome::Busy;
-        };
         let (mut rd, mut wr) = tokio::io::split(stream);
         let deadline = tokio::time::Instant::now() + self.limits.bind_deadline;
         let (session_id, mac) = match tokio::time::timeout_at(deadline, read_bind(&mut rd)).await {
@@ -333,14 +333,32 @@ impl MediaHost {
                 return MediaOutcome::NotBound;
             }
         };
-        let Ok(Some(claimed)) =
-            tokio::time::timeout_at(deadline, self.claim(&session_id, &mac)).await
-        else {
+        let claimed = match self.try_claim(&session_id, &mac) {
+            Lookup::Bound(claimed) => Some(claimed),
+            Lookup::Refused => None,
+            // Its session may simply not be registered yet. Only `max_waiting`
+            // binds wait for that at once, and the slot is let go before any
+            // refusal is written.
+            Lookup::Unknown => {
+                let Ok(_waiting) = Arc::clone(&self.waiting).try_acquire_owned() else {
+                    tracing::warn!(
+                        max = self.limits.max_waiting,
+                        "media bind refused: too many are waiting for their session"
+                    );
+                    refuse(&mut wr, reason::BAD_BIND).await;
+                    return MediaOutcome::Busy;
+                };
+                tokio::time::timeout_at(deadline, self.claim(&session_id, &mac))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        };
+        let Some(claimed) = claimed else {
             tracing::info!(session = %session_id, "media bind refused");
             refuse(&mut wr, reason::BAD_BIND).await;
             return MediaOutcome::NotBound;
         };
-        drop(unbound);
         self.run(session_id, claimed, rd, wr).await
     }
 

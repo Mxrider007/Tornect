@@ -420,7 +420,9 @@ pub fn media_reason(reason: u16) -> &'static str {
 /// reports the ones that did).
 pub fn describe_media(outcome: &MediaOutcome) -> Option<String> {
     Some(match outcome {
-        MediaOutcome::Busy => "media stream closed: too many are waiting to bind".to_owned(),
+        MediaOutcome::Busy => {
+            "media bind refused: too many are waiting for their session".to_owned()
+        }
         MediaOutcome::NotBound => "media stream closed: it did not prove a live session".to_owned(),
         MediaOutcome::NotStarted(end) => {
             format!("screen sharing did not start: {}", describe_media_end(*end))

@@ -19,7 +19,7 @@
 //!
 //! | Requirement | Where it is met |
 //! |---|---|
-//! | a `Bind` deadline; no unbound stream holds a circuit open | [`MediaLimits::bind_deadline`], [`MediaLimits::max_unbound`] |
+//! | a `Bind` deadline; no unbound stream holds a circuit open for long | [`MediaLimits::bind_deadline`], [`MediaLimits::max_waiting`] |
 //! | a single-use `Bind`: one media stream per session | [`MediaHost`]'s registry |
 //! | view-only input is never decoded or injected | a view-only session has no injector |
 //! | an input rate cap | [`flow::TokenBucket`] |
