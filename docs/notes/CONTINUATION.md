@@ -1,4 +1,4 @@
-# Tornect — continuation report (2026-09-21, fifth session close)
+# Tornect — continuation report (2026-09-22, sixth session close)
 
 Paste the block under **HAND-OFF** into a new session.
 
@@ -27,15 +27,42 @@ QUIC hole punching is deferred; m2–m6 stay untagged until their full acceptanc
 Read in this order before doing anything:
 1. `CLAUDE.md`
 2. this file
-3. `docs/notes/m1-state.md` (§ *Session 2026-09-21 (5)*)
-4. `docs/notes/decisions.md` M1-43 (the session layer) and M1-44 (the review fixes)
+3. `docs/notes/m1-state.md` (§ *Session 2026-09-22 (6)* and § *Session 2026-09-21 (5)*)
+4. `docs/notes/decisions.md` M1-43 (the session layer), M1-44 (the review fixes) and M1-45 (the
+   xtask environment fix, B2-7, B3-7)
 5. `docs/notes/m1-media-evidence.md`: how the live media check runs (driver in its appendix)
 6. `docs/research/slice.md` §4, for Wayland capture
 7. the review synthesis:
    `/home/mx/kore_project_V3/agents/security/reports/2026-09-21_tornect_slice_b_review.md`
 
-Then run `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp cargo xtask verify`. Expect **424 tests**
+Then run `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp cargo xtask verify`. Expect **428 tests**
 and `cargo deny check (offline; advisory DB 2026-08-29)` ok.
+
+### STATE (2026-09-22, sixth session)
+
+**Gate: green at 428 tests**, cargo-deny ok. `main` = `origin/main` at this hand-off's commit.
+
+**This session (decision M1-45):**
+- **The gate no longer fights plain `cargo`.** `xtask`'s `cargo()` removes the variables
+  `cargo run` gave it (`CARGO_PKG_*`, `CARGO`, `CARGO_MANIFEST_DIR`/`_PATH`, `CARGO_CRATE_NAME`,
+  `CARGO_BIN_NAME`, `CARGO_PRIMARY_PACKAGE`, `CARGO_TARGET_TMPDIR`, `CARGO_RUSTC_CURRENT_DIR`) and
+  keeps user settings. `ring`'s build script watches those, so every switch between the gate and a
+  plain `cargo` or the hook used to rebuild the Tor stack. Measured after: 0.6 s and 0.3 s with
+  nothing rebuilt (before: 33 s and a `ring` + `rustls` rebuild). The whole gate now takes 41 s.
+- **B2-7:** the host's session question accepts only `a`/`allow` and `v`/`view`. `y`/`yes` — the
+  reflex answer to the pairing question — no longer grants control.
+- **B3-7:** the X11 grab computes its buffer size with `checked_mul` in `usize` under a
+  2^27-pixel cap, before `GetImage`. In `u32` the product wrapped to 0 at 32768×32768, so an empty
+  reply passed for a one-gigapixel picture.
+- Each fix has a test that fails on the old code.
+
+**THE REVIEW OF `510b6cb..5f1ae84` DID NOT RUN.** Three read-only threat modelers were launched
+first, on the frozen worktree `/home/mx/tornect-review-slice-c` @ `5f1ae84`, and all three died on
+the account's **weekly** usage limit within ~15 minutes, with no report written. The session
+layer, the CLI media path and the M1-44 fixes have had only inline and self review. The worktree
+is kept, clean and detached, for the re-launch; the limit resets **2026-09-24 17:00 -03**. Scopes
+and focus questions: `/home/mx/kore_project_V3/agents/agentcheck/reports/activation_plan.md`;
+record: `.../agents/security/reports/2026-09-22_tornect_slice_c_review_NOT_RUN.md`.
 
 ### STATE (2026-09-21, fifth session)
 
@@ -86,16 +113,17 @@ Commits this session, all pushed:
 
 ### NEXT, in order
 
-0. **Quick wins, each with a failing-first test:**
-   - **B2-7:** `y`/`yes` at the session question grants *control*. Accept only `a`/`allow` and
-     `v`/`view` (`apps/tornect/src/prompt.rs`).
-   - **B3-7:** the X11 size check is computed in `u32`. Use `checked_mul` in `usize`, and cap the
-     geometry before `GetImage` (`crates/tornect-capture/src/{x11,cursor}.rs`).
-   - **B2-8:** bound the client's `bye` after Ctrl-C (≈ 2 s), and schedule pings from a deadline.
-   - **xtask:** `env_remove` the `CARGO_PKG_*` / `CARGO_MANIFEST_*` / `CARGO_CRATE_NAME` /
-     `CARGO_BIN_NAME` variables from the cargo commands `verify` spawns. Today the gate and plain
-     `cargo` (and the git hook) rebuild each other's whole Tor stack, because `ring`'s build
-     script watches those variables.
+0. **Re-launch the review of `510b6cb..5f1ae84`** (after 2026-09-24 17:00 -03; ask the operator
+   whether the week's budget carries it — A' is ≈ 1.3 M tokens, the refuted variant ≈ 5 M). The
+   frozen worktree is still there; the three scopes are written up and need no re-scoping. If the
+   range has moved on by then, freeze the new head and say so in the report.
+0b. **The last quick win, B2-8:** bound the client's `bye` after Ctrl-C (≈ 2 s) and schedule pings
+   from a deadline (`apps/tornect/src/tor_cmd.rs`: the two `session.bye(...)` calls in
+   `run_connect`, and `keep_alive`'s `session.ping()`, which is not bounded either). A
+   failing-first test needs a host that keeps the stream open and stops answering; the crate's
+   tests drive a real `serve_host` over a duplex, which always reads, so budget one scaffold —
+   `tornect-signal`'s `a_kill_ends_the_session_while_a_write_to_the_peer_is_stuck` uses a
+   256-byte duplex for the same purpose and is the model to copy.
 1. **B2-2 (MEDIUM) — before the operator's test.** A host whose store could not open (usually
    locked by another Tornect command at start) runs with **no control channel**: `tornect panic`
    says "no host is running here". On **Windows** the IPC endpoint is still a scaffold, so
