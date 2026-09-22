@@ -191,7 +191,9 @@ fn parse_pairing(answer: &str) -> PairDecision {
 
 fn parse_session(answer: &str) -> SessionDecision {
     match answer.trim().to_ascii_lowercase().as_str() {
-        "a" | "allow" | "y" | "yes" => SessionDecision::AllowOnce,
+        // Not `y`/`yes`: that is the reflex answer to the pairing question, and
+        // here it would hand over the keyboard and mouse (SLICE-B2 B2-7).
+        "a" | "allow" => SessionDecision::AllowOnce,
         "v" | "view" | "view-only" => SessionDecision::AllowOnceViewOnly,
         _ => SessionDecision::Deny,
     }
@@ -283,6 +285,16 @@ mod tests {
         assert_eq!(parse_session(" VIEW "), SessionDecision::AllowOnceViewOnly);
         for no in ["", "d", "deny", "no", "always"] {
             assert_eq!(parse_session(no), SessionDecision::Deny, "{no:?}");
+        }
+    }
+
+    /// The session question offers `a` and `v`. `y`/`yes` is the reflex answer to
+    /// a different question — the pairing one, two prompts earlier — and it must
+    /// never hand over the keyboard and mouse (SLICE-B2 B2-7).
+    #[test]
+    fn a_reflex_yes_does_not_grant_control() {
+        for yes in ["y", "yes", "Y", "YES", " yes "] {
+            assert_eq!(parse_session(yes), SessionDecision::Deny, "{yes:?}");
         }
     }
 
