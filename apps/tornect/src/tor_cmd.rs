@@ -590,15 +590,23 @@ async fn connect_session(
         SESSION_PING_EVERY.as_secs()
     );
 
+    let interrupts = Interrupts::listen();
     let end = if opts.video {
-        watch(node, &id, &isolation, &mut session, opts.pings).await?
-    } else {
-        keep_alive(
+        watch(
+            node,
+            &id,
+            &isolation,
             &mut session,
             opts.pings,
-            SESSION_PING_EVERY,
-            tokio::signal::ctrl_c(),
+            &interrupts.pressed,
         )
+        .await?
+    } else {
+        let stop = pressed(interrupts.pressed.clone());
+        keep_alive(&mut session, opts.pings, SESSION_PING_EVERY, async {
+            stop.await;
+            Ok(())
+        })
         .await?
     };
     match end {
@@ -624,6 +632,46 @@ async fn connect_session(
     Ok(())
 }
 
+/// Ctrl-C for a live session, heard on a task of its own so that nothing the
+/// session does can starve it (SLICE-C2 C2-1). The first press asks the
+/// session to end; a second quits at once, without waiting for the host.
+struct Interrupts {
+    /// Becomes `true` at the first Ctrl-C.
+    pressed: watch::Receiver<bool>,
+    task: JoinHandle<()>,
+}
+
+impl Interrupts {
+    fn listen() -> Self {
+        let (tx, pressed) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            eprintln!("Ctrl-C: ending the session (press it again to quit at once)");
+            let _ = tx.send(true);
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!("second Ctrl-C: quitting without waiting for the host");
+                std::process::exit(130);
+            }
+        });
+        Self { pressed, task }
+    }
+}
+
+impl Drop for Interrupts {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Resolves at the first Ctrl-C, and never if the listener is gone.
+async fn pressed(mut rx: watch::Receiver<bool>) {
+    if rx.wait_for(|pressed| *pressed).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// How a live session ended, seen from the client.
 #[derive(Debug)]
 enum End {
@@ -646,6 +694,7 @@ async fn watch<S>(
     isolation: &Isolation,
     session: &mut ClientSession<S>,
     pings: Option<u32>,
+    interrupted: &watch::Receiver<bool>,
 ) -> anyhow::Result<End>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -683,8 +732,13 @@ where
     let (media_done, media_ended) = oneshot::channel::<bool>();
     let (stop_media, media_stop) = oneshot::channel::<()>();
     let viewing = async {
+        // Ctrl-C reaches the viewer directly, not through the signaling
+        // branch, which a flooding host could starve (SLICE-C2 C2-1).
         let stop = async {
-            let _ = media_stop.await;
+            tokio::select! {
+                _ = media_stop => {}
+                () = pressed(interrupted.clone()) => {}
+            }
         };
         let viewed = viewer.run(&mut pictures, &mut stats, stop).await;
         let by_host = matches!(viewed, Ok(ViewerEnd::Host(_) | ViewerEnd::Closed));
@@ -694,12 +748,16 @@ where
     let signaling = async {
         let stop = async {
             tokio::select! {
-                result = tokio::signal::ctrl_c() => result,
+                () = pressed(interrupted.clone()) => Ok(()),
                 by_host = media_ended => {
                     // The host closed the media stream: its `BYE` is usually on
                     // the way, and the end should be reported as the host's.
+                    // Ctrl-C still cuts the wait short (SLICE-C2 C2-2).
                     if by_host.unwrap_or(false) {
-                        tokio::time::sleep(BYE_GRACE).await;
+                        tokio::select! {
+                            () = tokio::time::sleep(BYE_GRACE) => {}
+                            () = pressed(interrupted.clone()) => {}
+                        }
                     }
                     Ok(())
                 }
@@ -817,6 +875,8 @@ impl FrameSink for CliPictures {
 
 /// Keep `session` alive with a `PING` every `every` (the first at once) until
 /// `stop` resolves, `pings` pings have been answered, or the host ends it.
+/// Pings run to a deadline that frames from the host do not move, so a host
+/// that keeps sending cannot keep `--pings N` from ending (SLICE-B2 B2-8).
 ///
 /// Between pings it waits on the stream, not on a timer, so a host `BYE` is
 /// reported the moment it arrives. Over Tor the host's circuit is often gone
@@ -836,29 +896,33 @@ where
 {
     let mut stop = pin!(stop);
     let mut sent = 0u32;
+    let mut next_ping = tokio::time::Instant::now();
     Ok(loop {
         if pings.is_some_and(|max| sent >= max) {
             break End::You;
         }
-        let wait = if sent == 0 { Duration::ZERO } else { every };
-        let event = tokio::select! {
-            result = &mut stop => {
-                result.context("waiting for Ctrl-C")?;
-                break End::You;
+        let wait = next_ping.saturating_duration_since(tokio::time::Instant::now());
+        if !wait.is_zero() {
+            let event = tokio::select! {
+                result = &mut stop => {
+                    result.context("waiting for Ctrl-C")?;
+                    break End::You;
+                }
+                event = session.next_event(wait) => event,
+            };
+            match event {
+                // Nothing from the host in `wait`: time for the next ping.
+                Err(HandshakeError::Timeout(_)) => {}
+                Ok(Some(SessionEvent::Bye { reason, .. })) => break End::Host(reason),
+                Ok(Some(SessionEvent::Error { code, detail })) => {
+                    break End::Lost(HandshakeError::PeerError { code, detail });
+                }
+                // The M2 frames: nothing uses them before M2, and they do not
+                // move the next ping.
+                Ok(Some(_)) => continue,
+                Ok(None) => break End::Lost(HandshakeError::Closed),
+                Err(e) => break End::Lost(e),
             }
-            event = session.next_event(wait) => event,
-        };
-        match event {
-            // Nothing from the host in `wait`: time for the next ping.
-            Err(HandshakeError::Timeout(_)) => {}
-            Ok(Some(SessionEvent::Bye { reason, .. })) => break End::Host(reason),
-            Ok(Some(SessionEvent::Error { code, detail })) => {
-                break End::Lost(HandshakeError::PeerError { code, detail });
-            }
-            // The M2 frames: nothing uses them before M2.
-            Ok(Some(_)) => continue,
-            Ok(None) => break End::Lost(HandshakeError::Closed),
-            Err(e) => break End::Lost(e),
         }
         let pinged = tokio::select! {
             result = &mut stop => {
@@ -867,6 +931,7 @@ where
             }
             rtt = session.ping() => rtt,
         };
+        next_ping = tokio::time::Instant::now() + every;
         match pinged {
             Ok(rtt) => {
                 sent += 1;
@@ -1007,10 +1072,13 @@ fn explain_handshake(err: HandshakeError) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::duplex;
+    use std::sync::atomic::AtomicBool;
+    use std::task::{Context, Poll};
+
+    use tokio::io::{DuplexStream, ReadBuf, duplex};
     use tornect_core::trusted::{KnownHosts, TrustedDevices};
     use tornect_signal::fsm::client::ScriptedClientUi;
-    use tornect_signal::fsm::host::{HostConfig, HostDeps, serve_host};
+    use tornect_signal::fsm::host::{HostConfig, HostDeps, KillSwitch, serve_host};
     use tornect_signal::pairing::{
         PairDecision, PairScript, ScriptedConsent, SessionDecision, SessionScript,
         TrustedDeviceStore,
@@ -1018,12 +1086,66 @@ mod tests {
 
     use super::*;
 
-    /// A host that ends the session between two pings (`tornect panic`) must be
-    /// reported as the host's `BYE`, not as a lost connection. Live over Tor the
-    /// host's circuit was already gone by the next ping, and the client printed
-    /// "connection lost" for a session the host had deliberately ended.
-    #[tokio::test(start_paused = true)]
-    async fn a_host_bye_between_pings_is_reported_as_the_hosts() {
+    /// The client's end of the signaling stream, whose writes can be frozen,
+    /// as a host that grants no Tor flow-control credit freezes them.
+    struct Freezable {
+        inner: DuplexStream,
+        frozen: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for Freezable {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Freezable {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.frozen.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.frozen.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.frozen.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A live session with a real host FSM behind a duplex.
+    struct Live {
+        _tmp: tempfile::TempDir,
+        session: ClientSession<Freezable>,
+        frozen: Arc<AtomicBool>,
+        kill: KillSwitch,
+        host: JoinHandle<Result<tornect_signal::fsm::host::HostOutcome, HandshakeError>>,
+    }
+
+    async fn live() -> Live {
         let tmp = tempfile::tempdir().unwrap();
         let identity = Arc::new(HostIdentity::from_seed(&[0x11; 32]));
         let trusted = Arc::new(TrustedDeviceStore::with(
@@ -1038,7 +1160,7 @@ mod tests {
         let kill = deps.kill.clone();
         let cfg = HostConfig::new("Desk", [9; 32]);
         let (client_end, host_end) = duplex(64 * 1024);
-        let host_task = tokio::spawn(async move { serve_host(host_end, &cfg, &deps).await });
+        let host = tokio::spawn(async move { serve_host(host_end, &cfg, &deps).await });
 
         let known = Arc::new(KnownHostStore::with(
             tmp.path().join("known-hosts.toml"),
@@ -1048,15 +1170,41 @@ mod tests {
         client_deps.ui = Arc::new(ScriptedClientUi::new(true));
         let device = DeviceIdentity::from_seed(&[0x22; 32]);
         let ccfg = ClientConfig::new(identity.id(), "Laptop");
+        let frozen = Arc::new(AtomicBool::new(false));
+        let stream = Freezable {
+            inner: client_end,
+            frozen: Arc::clone(&frozen),
+        };
         let mut session =
-            match client::connect(client_end, &ccfg, &device, &client_deps, Intent::Session)
+            match client::connect(stream, &ccfg, &device, &client_deps, Intent::Session)
                 .await
                 .unwrap()
             {
-                ClientOutcome::Session(s) => s,
+                ClientOutcome::Session(s) => *s,
                 other => panic!("expected a session, got {other:?}"),
             };
         session.send_tor_fallback().await.unwrap();
+        Live {
+            _tmp: tmp,
+            session,
+            frozen,
+            kill,
+            host,
+        }
+    }
+
+    /// A host that ends the session between two pings (`tornect panic`) must be
+    /// reported as the host's `BYE`, not as a lost connection. Live over Tor the
+    /// host's circuit was already gone by the next ping, and the client printed
+    /// "connection lost" for a session the host had deliberately ended.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_bye_between_pings_is_reported_as_the_hosts() {
+        let Live {
+            mut session,
+            kill,
+            host,
+            ..
+        } = live().await;
 
         // The host's user presses the panic key 5 s into the 10 s gap between pings.
         tokio::spawn(async move {
@@ -1075,6 +1223,22 @@ mod tests {
             matches!(end, End::Host(reason) if reason == bye::PANIC),
             "{end:?}"
         );
-        host_task.await.unwrap().unwrap();
+        host.await.unwrap().unwrap();
+    }
+
+    /// SLICE-B2 B2-8 and C2-2: leaving never waits on a host that stops
+    /// reading. Before, `bye` had no deadline, so a Ctrl-C (or a failed
+    /// picture) ended in a hang that no further Ctrl-C could break.
+    #[tokio::test(start_paused = true)]
+    async fn leaving_does_not_wait_on_a_host_that_stops_reading() {
+        let Live {
+            session, frozen, ..
+        } = live().await;
+        frozen.store(true, Ordering::SeqCst);
+        let left = tokio::time::timeout(Duration::from_secs(60), session.bye(bye::USER)).await;
+        assert!(
+            matches!(left, Ok(Err(HandshakeError::Timeout(_)))),
+            "{left:?}"
+        );
     }
 }

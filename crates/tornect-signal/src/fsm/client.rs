@@ -387,9 +387,12 @@ where
         Ok(Some(event))
     }
 
-    /// Send `BYE{reason}` and close.
+    /// Send `BYE{reason}` and close, giving up after [`timeouts::BYE`]: a host
+    /// that stops reading must not keep the client from leaving (SLICE-B2 B2-8).
     pub async fn bye(mut self, reason: u16) -> Result<(), HandshakeError> {
-        self.chan.bye(reason).await
+        tokio::time::timeout(timeouts::BYE, self.chan.bye(reason))
+            .await
+            .unwrap_or(Err(HandshakeError::Timeout("BYE")))
     }
 
     /// Take the stream back for the session layer.
