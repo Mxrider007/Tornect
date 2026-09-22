@@ -1241,4 +1241,27 @@ mod tests {
             "{left:?}"
         );
     }
+
+    /// Leaving waits until the host has read the `BYE` and closed. Over Tor a
+    /// flushed `BYE` was lost when the client shut its node down straight
+    /// after, and the host logged the session's end as an I/O error (live run,
+    /// 2026-09-22).
+    #[tokio::test(start_paused = true)]
+    async fn leaving_waits_until_the_host_has_read_the_bye() {
+        use tornect_signal::fsm::host::{HostOutcome, SessionEnd};
+        let Live { session, host, .. } = live().await;
+        session.bye(bye::USER).await.unwrap();
+        assert!(host.is_finished(), "the host had not read the BYE yet");
+        let outcome = host.await.unwrap().unwrap();
+        assert!(
+            matches!(
+                outcome,
+                HostOutcome::Session {
+                    end: SessionEnd::PeerBye(reason),
+                    ..
+                } if reason == bye::USER
+            ),
+            "{outcome:?}"
+        );
+    }
 }

@@ -387,12 +387,31 @@ where
         Ok(Some(event))
     }
 
-    /// Send `BYE{reason}` and close, giving up after [`timeouts::BYE`]: a host
-    /// that stops reading must not keep the client from leaving (SLICE-B2 B2-8).
+    /// Send `BYE{reason}`, wait for the host to close, and close, all within
+    /// [`timeouts::BYE`]: a host that stops reading must not keep the client
+    /// from leaving (SLICE-B2 B2-8).
+    ///
+    /// The host closes only once it has read the `BYE`, and that close is the
+    /// only sign the `BYE` arrived. Over Tor a flushed `BYE` was lost when the
+    /// client shut its node down straight after, and the host logged the
+    /// session's end as an I/O error (live run, 2026-09-22).
     pub async fn bye(mut self, reason: u16) -> Result<(), HandshakeError> {
-        tokio::time::timeout(timeouts::BYE, self.chan.bye(reason))
-            .await
-            .unwrap_or(Err(HandshakeError::Timeout("BYE")))
+        let deadline = Instant::now() + timeouts::BYE;
+        let left = move || deadline.saturating_duration_since(Instant::now());
+        tokio::time::timeout(timeouts::BYE, async {
+            let bye = messages::Bye {
+                reason,
+                detail: None,
+            };
+            self.chan.send(&bye, None).await?;
+            // Anything the host still sends is moot; its close, an error or
+            // the deadline ends the wait.
+            while let Ok(Some(_)) = self.chan.recv(left(), "the host's close").await {}
+            self.chan.close().await;
+            Ok(())
+        })
+        .await
+        .unwrap_or(Err(HandshakeError::Timeout("BYE")))
     }
 
     /// Take the stream back for the session layer.
