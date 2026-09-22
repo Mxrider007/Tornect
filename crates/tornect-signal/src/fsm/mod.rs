@@ -68,6 +68,9 @@ pub mod timeouts {
     /// Host: an established stream with no frame at all (the client keeps the
     /// circuit alive with `PING`s, §B.2 "low-rate heartbeat").
     pub const ESTABLISHED_IDLE: Duration = Duration::from_secs(90);
+    /// Client: sending `BYE` and closing. A host that stops reading must not
+    /// keep the client from leaving (SLICE-B2 B2-8).
+    pub const BYE: Duration = Duration::from_secs(2);
 }
 
 /// Largest frame accepted before the handshake window closes: a `HELLO`
