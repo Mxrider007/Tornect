@@ -486,10 +486,12 @@ async fn a_bind_is_single_use() {
     assert_eq!(rig.backend.sources.load(Ordering::SeqCst), 1, "one capture");
 
     drop(viewer);
+    // The host sees the viewer go either at its read (EOF) or at a frame write
+    // already in flight (a broken pipe), depending on timing under load.
     assert!(matches!(
         first_served.await.unwrap(),
         MediaOutcome::Served {
-            end: MediaEnd::ViewerLeft,
+            end: MediaEnd::ViewerLeft | MediaEnd::Io,
             ..
         }
     ));
@@ -893,4 +895,127 @@ async fn an_accepted_session_streams_until_the_panic_key() {
     );
     fsm.await.unwrap().unwrap();
     assert_eq!(rig.host.live(), 0);
+}
+
+/// A host that never stops sending: `BindOk`, then the same `Video` unit for
+/// ever, always ready, as bytes already buffered in Arti would be. Writes
+/// always succeed at once.
+struct Flood {
+    head: Vec<u8>,
+    unit: Vec<u8>,
+    pos: usize,
+}
+
+impl Flood {
+    async fn new() -> Self {
+        let mut head = Vec::new();
+        write_msg(
+            &mut head,
+            &Msg::BindOk {
+                width: 1280,
+                height: 720,
+                codec: codec::H264,
+                mode: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let mut unit = Vec::new();
+        let video = Msg::Video {
+            seq: 0,
+            flags: 0,
+            ts_ms: 0,
+            data: vec![0, 0, 0, 1, 0x41, 0x9a],
+        };
+        write_msg(&mut unit, &video).await.unwrap();
+        Self { head, unit, pos: 0 }
+    }
+}
+
+impl tokio::io::AsyncRead for Flood {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        while buf.remaining() > 0 {
+            let (src, pos) = if self.pos < self.head.len() {
+                (&self.head, self.pos)
+            } else {
+                let at = (self.pos - self.head.len()) % self.unit.len();
+                (&self.unit, at)
+            };
+            let n = (src.len() - pos).min(buf.remaining());
+            buf.put_slice(&src[pos..pos + n]);
+            self.pos += n;
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncWrite for Flood {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+struct NoPictures;
+
+impl FrameSink for NoPictures {
+    fn picture(&mut self, _: u32, _: &DecodedFrame) {}
+}
+
+/// SLICE-C2 C2-1: a host that sends as fast as the stream allows must not
+/// starve what the viewer is joined with — in `tornect connect`, the
+/// signaling keep-alive and its Ctrl-C. Before, `run` never returned `Pending`
+/// while units kept coming, so the other branch of a `join!` never ran again.
+#[test]
+fn a_flooding_host_does_not_starve_what_the_viewer_is_joined_with() {
+    let (done, finished) = std::sync::mpsc::channel();
+    // On its own thread: on the old code this spins for good.
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let ended = rt.block_on(async {
+            let binding = Binding::new(&SessionToken::new([5; 32]), &[5; 32]);
+            let viewer = MediaViewer::bind(Flood::new().await, &binding, WAIT)
+                .await
+                .unwrap();
+            let (stop_tx, stop_rx) = oneshot::channel::<()>();
+            let (mut sink, mut stats) = (NoPictures, ViewerStats::default());
+            let stop = async {
+                let _ = stop_rx.await;
+            };
+            let (ended, ()) = tokio::join!(viewer.run(&mut sink, &mut stats, stop), async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = stop_tx.send(());
+            });
+            ended
+        });
+        let _ = done.send(format!("{ended:?}"));
+    });
+    let ended = finished
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the viewer never let the other branch run");
+    assert_eq!(ended, "Ok(Stopped)");
 }

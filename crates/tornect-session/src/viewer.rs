@@ -206,7 +206,10 @@ where
     /// Decode and acknowledge until the host closes the stream, or until `stop`
     /// resolves (then `Close{ENDED_BY_VIEWER}` is sent). Every access unit is
     /// acknowledged once handled, decoded or not; that is the host's flow
-    /// control. A decode error asks for a keyframe. Decoding runs on this task.
+    /// control. A decode error asks for a keyframe. Decoding runs on this task,
+    /// which yields after every message: a host that sends as fast as the
+    /// stream allows must not starve what the caller joins this with, such as
+    /// its signaling keep-alive (SLICE-C2 C2-1).
     pub async fn run<F>(
         mut self,
         sink: &mut dyn FrameSink,
@@ -262,6 +265,7 @@ where
                 Some(other) => return Err(ViewerError::Unexpected(kind(&other))),
                 None => return Ok(ViewerEnd::Closed),
             }
+            tokio::task::yield_now().await;
         }
     }
 }
