@@ -1517,9 +1517,12 @@ pub fn panic_now(paths: &Paths) -> anyhow::Result<()> {
         let resp = send(paths, &Route::Host, IpcOp::Panic).await?;
         // A panic that could not run must be loud, not swallowed.
         require_ok(&resp)?;
+        // Only this state directory's host: another home's is not reached
+        // (SLICE-C3 C3-4).
+        let home = paths.state_dir.display();
         match resp.detail {
-            Some(d) => println!("Sessions ended. {d}"),
-            None => println!("Sessions ended."),
+            Some(d) => println!("Sessions ended on the host for {home}. {d}"),
+            None => println!("Sessions ended on the host for {home}."),
         }
         Ok(())
     })

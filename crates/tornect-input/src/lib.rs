@@ -182,8 +182,9 @@ impl InputEvent {
                 .ok_or(InputError::Malformed("unknown button")),
             3 => {
                 // Far beyond any real device; bounds the injector's loop.
-                const MAX: i32 = 100 * WHEEL_NOTCH;
-                if a.abs() > MAX || b.abs() > MAX {
+                // `unsigned_abs`, because `i32::MIN.abs()` overflows (SLICE-C1 C1-5).
+                const MAX: u32 = 100 * WHEEL_NOTCH.unsigned_abs();
+                if a.unsigned_abs() > MAX || b.unsigned_abs() > MAX {
                     return Err(InputError::Malformed("wheel delta out of range"));
                 }
                 Ok(Self::Wheel { dx: a, dy: b })
@@ -452,6 +453,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(t.inner.0.len(), 4);
+    }
+
+    /// SLICE-C1 C1-5: `i32::MIN` has no absolute value in `i32`. The old range
+    /// check overflowed on it: a panic in a debug build, and in a release
+    /// build a delta that passed the check.
+    #[test]
+    fn the_most_negative_wheel_delta_is_refused() {
+        for (dx, dy) in [(i32::MIN, 0), (0, i32::MIN)] {
+            let wheel = InputEvent::Wheel { dx, dy }.encode();
+            assert!(
+                matches!(InputEvent::decode(&wheel), Err(InputError::Malformed(_))),
+                "{dx} {dy}"
+            );
+        }
     }
 
     #[test]
