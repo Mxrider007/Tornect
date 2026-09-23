@@ -4,8 +4,10 @@
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadHalf, WriteHalf};
+use tokio::sync::mpsc;
 use tornect_codec::{DecodedFrame, H264Decoder};
 use tornect_core::session_log::SessionMode;
+use tornect_input::InputEvent;
 use tornect_proto::{Msg, ProtoError, bind_mac, codec, read_msg, reason, video_flags, write_msg};
 use tornect_signal::consent::{SessionToken, mode_from_code};
 
@@ -98,6 +100,8 @@ pub struct ViewerStats {
     pub decode_errors: u64,
     /// `KeyframeRequest`s sent.
     pub keyframe_requests: u64,
+    /// `Input` frames sent.
+    pub input_sent: u64,
 }
 
 /// How a bound media stream ended, seen from the viewer.
@@ -226,6 +230,28 @@ where
     where
         F: Future<Output = ()>,
     {
+        self.run_with_input(sink, stats, None, stop).await
+    }
+
+    /// [`run`](Self::run), also sending each event `input` yields to the host
+    /// as an `Input` frame (its 16-byte form), ahead of reading the next
+    /// picture, until the channel closes.
+    ///
+    /// Whether a session has an input channel at all is the caller's decision,
+    /// and it must be taken from the mode of the signed `SESSION_ACCEPT`
+    /// (`ClientSession::accept().mode()`), never from the `BindOk` of this
+    /// stream (SLICE-C2 C2-6): a view-only session passes `None` and sends no
+    /// input. The host drops a view-only session's input undecoded anyway.
+    pub async fn run_with_input<F>(
+        self,
+        sink: &mut dyn FrameSink,
+        stats: &mut ViewerStats,
+        mut input: Option<mpsc::Receiver<InputEvent>>,
+        stop: F,
+    ) -> Result<ViewerEnd, ViewerError>
+    where
+        F: Future<Output = ()>,
+    {
         tokio::pin!(stop);
         let Self {
             rd,
@@ -243,6 +269,22 @@ where
             let msg = tokio::select! {
                 biased;
                 () = &mut stop => None,
+                // Before the read: a host that keeps pictures coming must not
+                // hold the viewer's input back.
+                event = next_input(&mut input) => {
+                    let Some(event) = event else {
+                        // The caller dropped its sender: no more input.
+                        input = None;
+                        continue;
+                    };
+                    let frame = Msg::Input(event.encode());
+                    if !write_unless_stopped(&mut wr, &frame, stop.as_mut()).await? {
+                        return Ok(ViewerEnd::Stopped);
+                    }
+                    stats.input_sent += 1;
+                    next_ping = tokio::time::Instant::now() + PING_EVERY;
+                    continue;
+                }
                 (rd, msg) = &mut read => {
                     read.set(read_owned(rd));
                     Some(msg?)
@@ -311,6 +353,14 @@ where
             }
             tokio::task::yield_now().await;
         }
+    }
+}
+
+/// The next event from `input`; `None` once it is closed; never without one.
+async fn next_input(input: &mut Option<mpsc::Receiver<InputEvent>>) -> Option<InputEvent> {
+    match input {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 

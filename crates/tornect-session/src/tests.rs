@@ -550,6 +550,100 @@ async fn a_viewer_with_nothing_to_say_pings_the_host() {
     let _ = bound.await;
 }
 
+/// Bind a viewer over a pipe to a scripted host and run it with `input`;
+/// returns the host's end, past `BindOk`.
+async fn run_viewer_with(
+    input: Option<tokio::sync::mpsc::Receiver<InputEvent>>,
+) -> (
+    DuplexStream,
+    JoinHandle<(Result<ViewerEnd, ViewerError>, ViewerStats)>,
+) {
+    let binding = Binding::new(&SessionToken::new([8; 32]), &[8; 32]);
+    let (client, mut host) = duplex(1 << 16);
+    let viewer = tokio::spawn(async move {
+        let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
+        let (mut sink, mut stats) = (NoPictures, ViewerStats::default());
+        let end = viewer
+            .run_with_input(&mut sink, &mut stats, input, std::future::pending())
+            .await;
+        (end, stats)
+    });
+    assert!(matches!(
+        read_msg(&mut host).await.unwrap(),
+        Some(Msg::Bind { .. })
+    ));
+    let bind_ok = Msg::BindOk {
+        width: 1280,
+        height: 720,
+        codec: codec::H264,
+        mode: 0,
+    };
+    write_msg(&mut host, &bind_ok).await.unwrap();
+    (host, viewer)
+}
+
+/// The viewer's half of input over the media stream: each event handed to a
+/// control session's viewer goes to the host as one `Input` frame carrying the
+/// 16-byte event, in order, and nothing else is sent in its place.
+#[tokio::test(start_paused = true)]
+async fn a_viewer_sends_each_input_event_as_one_16_byte_frame() {
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let (mut host, viewer) = run_viewer_with(Some(rx)).await;
+    let events = [
+        InputEvent::PointerMove { x: 100, y: 65_000 },
+        InputEvent::PointerButton {
+            button: tornect_input::Button::Left,
+            pressed: true,
+        },
+        InputEvent::Key {
+            usb: KEY_A,
+            pressed: true,
+        },
+        InputEvent::Key {
+            usb: KEY_A,
+            pressed: false,
+        },
+        InputEvent::Wheel { dx: 0, dy: -120 },
+        InputEvent::ReleaseAll,
+    ];
+    for event in events {
+        tx.send(event).await.unwrap();
+    }
+    for event in events {
+        // The raw frame: a length of 17 (the type byte and 16 bytes of event).
+        let mut len = [0u8; 4];
+        host.read_exact(&mut len).await.unwrap();
+        assert_eq!(u32::from_be_bytes(len), 17);
+        let mut frame = [0u8; 17];
+        host.read_exact(&mut frame).await.unwrap();
+        let Msg::Input(bytes) = Msg::decode(&frame).unwrap() else {
+            panic!("not an Input frame: {frame:?}");
+        };
+        assert_eq!(InputEvent::decode(&bytes).unwrap(), event);
+    }
+    drop(tx);
+    drop(host);
+    let (_, stats) = viewer.await.unwrap();
+    assert_eq!(stats.input_sent, events.len() as u64);
+}
+
+/// A viewer run without an input channel (a view-only session, gated on the
+/// signed `SESSION_ACCEPT` by the caller) sends no `Input` frame at all: only
+/// its keep-alive pings.
+#[tokio::test(start_paused = true)]
+async fn a_viewer_without_an_input_channel_sends_no_input() {
+    let (mut host, viewer) = run_viewer_with(None).await;
+    for _ in 0..3 {
+        let msg = tokio::time::timeout(Duration::from_secs(5), read_msg(&mut host))
+            .await
+            .expect("the viewer said nothing for 5 s");
+        assert!(matches!(msg, Ok(Some(Msg::Ping { .. }))), "{msg:?}");
+    }
+    drop(host);
+    let (_, stats) = viewer.await.unwrap();
+    assert_eq!(stats.input_sent, 0);
+}
+
 /// Addendum Q3: a session that ends while its source is still opening (on
 /// Wayland, while the desktop's dialog is up) ends the open too. Before, the
 /// open ran on, detached, for the rest of its 30 s, and a dialog answered then
