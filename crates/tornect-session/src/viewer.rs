@@ -16,6 +16,10 @@ use crate::flow::KeyframeLimiter;
 const KEYFRAME_REQUEST_EVERY: Duration = Duration::from_millis(500);
 /// Bound on the `Close` written to a host that may not be reading.
 const LAST_WRITE: Duration = Duration::from_secs(5);
+/// A viewer that has written nothing for this long pings the host, so that its
+/// silence means it is gone: the host lets go of held keys after a few seconds
+/// of it (`MediaLimits::viewer_quiet`, SLICE-C1 C1-3).
+const PING_EVERY: Duration = Duration::from_secs(1);
 
 /// What proves a media stream belongs to a session: the session id and the
 /// bind MAC (decisions M1-39, M1-41). Both come from the handshake; the token
@@ -210,9 +214,11 @@ where
     /// which yields after every message: a host that sends as fast as the
     /// stream allows must not starve what the caller joins this with, such as
     /// its signaling keep-alive (SLICE-C2 C2-1). Every write races `stop`, so a
-    /// host that stalls one cannot hold a stop back (SLICE-C2 C2-2 (b)).
+    /// host that stalls one cannot hold a stop back (SLICE-C2 C2-2 (b)). With
+    /// nothing written for a second it pings, so that its silence tells the
+    /// host it is gone (SLICE-C1 C1-3).
     pub async fn run<F>(
-        mut self,
+        self,
         sink: &mut dyn FrameSink,
         stats: &mut ViewerStats,
         stop: F,
@@ -221,18 +227,42 @@ where
         F: Future<Output = ()>,
     {
         tokio::pin!(stop);
+        let Self {
+            rd,
+            mut wr,
+            mut decoder,
+            mut keyframes,
+            ..
+        } = self;
+        // The read owns the reader, so it stays pending across rounds that the
+        // ping timer wins, and a frame is never cut short.
+        let mut read = Box::pin(read_owned(rd));
+        let mut next_ping = tokio::time::Instant::now() + PING_EVERY;
+        let mut nonce = 0u64;
         loop {
             let msg = tokio::select! {
                 biased;
                 () = &mut stop => None,
-                msg = read_msg(&mut self.rd) => Some(msg?),
+                (rd, msg) = &mut read => {
+                    read.set(read_owned(rd));
+                    Some(msg?)
+                }
+                () = tokio::time::sleep_until(next_ping) => {
+                    nonce = nonce.wrapping_add(1);
+                    let ping = Msg::Ping { nonce };
+                    if !write_unless_stopped(&mut wr, &ping, stop.as_mut()).await? {
+                        return Ok(ViewerEnd::Stopped);
+                    }
+                    next_ping = tokio::time::Instant::now() + PING_EVERY;
+                    continue;
+                }
             };
             let Some(msg) = msg else {
                 let close = Msg::Close {
                     reason: reason::ENDED_BY_VIEWER,
                 };
-                let _ = tokio::time::timeout(LAST_WRITE, write_msg(&mut self.wr, &close)).await;
-                let _ = tokio::time::timeout(LAST_WRITE, self.wr.shutdown()).await;
+                let _ = tokio::time::timeout(LAST_WRITE, write_msg(&mut wr, &close)).await;
+                let _ = tokio::time::timeout(LAST_WRITE, wr.shutdown()).await;
                 return Ok(ViewerEnd::Stopped);
             };
             match msg {
@@ -242,7 +272,7 @@ where
                     stats.access_units += 1;
                     stats.bytes += data.len() as u64;
                     stats.keyframes += u64::from(flags & video_flags::KEYFRAME != 0);
-                    match self.decoder.decode(&data) {
+                    match decoder.decode(&data) {
                         Ok(Some(frame)) => {
                             stats.decoded += 1;
                             sink.picture(seq, &frame);
@@ -252,25 +282,27 @@ where
                         Err(e) => {
                             stats.decode_errors += 1;
                             tracing::debug!(error = %e, seq, "access unit did not decode");
-                            if self.keyframes.allow(Instant::now()) {
+                            if keyframes.allow(Instant::now()) {
                                 stats.keyframe_requests += 1;
                                 let ask = Msg::KeyframeRequest;
-                                if !write_unless_stopped(&mut self.wr, &ask, stop.as_mut()).await? {
+                                if !write_unless_stopped(&mut wr, &ask, stop.as_mut()).await? {
                                     return Ok(ViewerEnd::Stopped);
                                 }
                             }
                         }
                     }
                     let ack = Msg::VideoAck { seq };
-                    if !write_unless_stopped(&mut self.wr, &ack, stop.as_mut()).await? {
+                    if !write_unless_stopped(&mut wr, &ack, stop.as_mut()).await? {
                         return Ok(ViewerEnd::Stopped);
                     }
+                    next_ping = tokio::time::Instant::now() + PING_EVERY;
                 }
                 Some(Msg::Ping { nonce }) => {
                     let pong = Msg::Pong { nonce };
-                    if !write_unless_stopped(&mut self.wr, &pong, stop.as_mut()).await? {
+                    if !write_unless_stopped(&mut wr, &pong, stop.as_mut()).await? {
                         return Ok(ViewerEnd::Stopped);
                     }
+                    next_ping = tokio::time::Instant::now() + PING_EVERY;
                 }
                 Some(Msg::Pong { .. }) => {}
                 Some(Msg::Close { reason }) => return Ok(ViewerEnd::Host(reason)),
@@ -280,6 +312,15 @@ where
             tokio::task::yield_now().await;
         }
     }
+}
+
+/// Read one message and hand the reader back.
+async fn read_owned<R>(mut rd: R) -> (R, Result<Option<Msg>, ProtoError>)
+where
+    R: AsyncRead + Unpin,
+{
+    let msg = read_msg(&mut rd).await;
+    (rd, msg)
 }
 
 /// Write `msg`, unless `stop` resolves first: `Ok(false)` when it did. A write
