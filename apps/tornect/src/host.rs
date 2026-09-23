@@ -870,6 +870,30 @@ mod tests {
         assert_eq!(control.kill_path(), "Ctrl-C in this terminal");
     }
 
+    /// SLICE-D R7: a host whose control channel cannot bind names Ctrl-C, never
+    /// `tornect panic`, as the way to end its sessions.
+    #[tokio::test]
+    async fn a_host_whose_control_channel_cannot_bind_names_ctrl_c() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        let mut paths = Paths::from_home(tmp.path());
+        // Nothing can be created under a regular file, so the bind fails.
+        paths.state_dir = file.join("state");
+        let control = ControlChannel::default();
+        let served = start_control_channel(
+            &paths,
+            Err("no store".to_owned()),
+            KillSwitch::new(),
+            control.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(served.is_none(), "a channel was bound under a file");
+        assert!(!control.is_up());
+        assert_eq!(control.kill_path(), "Ctrl-C in this terminal");
+    }
+
     /// One host per state directory, and every other command can see it: the
     /// lock names its holder while the host runs and is gone when it ends.
     #[test]
