@@ -342,7 +342,10 @@ async fn run_host(
     let (served_tx, mut served_rx) = watch::channel(0u64);
     let slots = Arc::new(Semaphore::new(MAX_SIGNALING_STREAMS));
     let serving = Arc::new((host_cfg, deps.clone()));
-    // Media streams: each bounds itself (bind deadline, unbound cap, session end).
+    // Media streams: each bounds itself (the bind deadline, the cap on binds
+    // waiting for an unregistered session, the session's end). Streams still
+    // reading their `Bind` hold no slot (SLICE-C1 C1-1); the listener's cap of 4
+    // streams per circuit and 64 circuits is what bounds them.
     let mut media_streams = JoinSet::new();
     let mut ctrl_c = pin!(tokio::signal::ctrl_c());
     loop {
