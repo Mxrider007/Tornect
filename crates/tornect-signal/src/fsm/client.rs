@@ -34,6 +34,20 @@ use crate::messages::{
 use crate::pairing::{BoxFuture, KnownHostStore, Sas, lock, normalize_label};
 use crate::transcript::{HostSigner, verify_envelope};
 
+/// The time left until `deadline` (`None` is no deadline), or `Timeout(what)`
+/// once it has passed. Checked before every read, so a peer whose frames are
+/// always ready cannot keep a wait going past its deadline either.
+fn time_left(deadline: Option<Instant>, what: &'static str) -> Result<Duration, HandshakeError> {
+    let Some(deadline) = deadline else {
+        return Ok(Duration::MAX);
+    };
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(HandshakeError::Timeout(what));
+    }
+    Ok(left)
+}
+
 /// What the client sends in `HELLO` and `SESSION_REQUEST`.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -284,9 +298,7 @@ where
         self.chan.send(&Ping { nonce }, None).await?;
         let deadline = start.checked_add(timeouts::PONG);
         loop {
-            let wait = deadline.map_or(Duration::MAX, |d| {
-                d.saturating_duration_since(Instant::now())
-            });
+            let wait = time_left(deadline, "PONG")?;
             let Some(rx) = self.chan.recv(wait, "PONG").await? else {
                 return Err(HandshakeError::Closed);
             };
@@ -330,15 +342,21 @@ where
     /// `ERROR`, or one of the M2 frames), after anything queued by
     /// [`ClientSession::ping`]; a `PING` from the host is answered in place
     /// and not reported. `Ok(None)` when the host closed the stream.
+    ///
+    /// `timeout` is one deadline for the whole call: the host's `PING`s,
+    /// answered on the way, do not move it (SLICE-D D2), so a host that keeps
+    /// pinging cannot keep the caller waiting.
     pub async fn next_event(
         &mut self,
         timeout: Duration,
     ) -> Result<Option<SessionEvent>, HandshakeError> {
+        let deadline = Instant::now().checked_add(timeout);
         loop {
             if let Some(event) = self.pending.pop_front() {
                 return Ok(Some(event));
             }
-            let Some(rx) = self.chan.recv(timeout, "session frame").await? else {
+            let wait = time_left(deadline, "session frame")?;
+            let Some(rx) = self.chan.recv(wait, "session frame").await? else {
                 return Ok(None);
             };
             if let Some(event) = self.classify(&rx).await? {

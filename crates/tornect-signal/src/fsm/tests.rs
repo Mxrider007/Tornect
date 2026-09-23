@@ -3121,6 +3121,75 @@ async fn client_ping_answers_a_host_ping_and_queues_m2_frames() {
     }
 }
 
+/// SLICE-D D2 (the `PING` half of SLICE-B2 B2-8): a host `PING` is answered
+/// inside `next_event` without moving its deadline. A host that pings every
+/// 5 s must not keep a 10 s wait, and with it `tornect connect --pings N`,
+/// from ever ending.
+#[tokio::test(start_paused = true)]
+async fn host_pings_do_not_move_the_next_event_deadline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = HostIdentity::from_seed(&HOST_SEED);
+    let real_pk = HostSigner::public_key(&real);
+    let client = client_side(tmp.path(), real.id(), CLIENT_SEED);
+    client
+        .known
+        .pin(real.id(), "Desk of Bob", host_device_pk())
+        .unwrap();
+    let (a, b) = pipe();
+    let signer = HostIdentity::from_seed(&HOST_SEED);
+    let host = tokio::spawn(async move {
+        let mut h = RawHost::new(a, &real_pk);
+        h.take_hello().await;
+        h.ack(&signer).await;
+        h.take(Kind::SessionRequest).await;
+        h.chan.send(&genuine_accept(), Some(&signer)).await.unwrap();
+        // A PING every 5 s, until the client goes; count the answers.
+        let mut answered = 0u32;
+        for nonce in 0u64.. {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if h.chan.send(&Ping { nonce }, None).await.is_err() {
+                break;
+            }
+            match h.chan.recv(Duration::from_secs(5), "pong").await {
+                Ok(Some(rx)) if rx.env.kind == Kind::Pong => answered += 1,
+                _ => break,
+            }
+        }
+        answered
+    });
+    let mut session = match connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        Intent::Session,
+    )
+    .await
+    .unwrap()
+    {
+        ClientOutcome::Session(s) => s,
+        ClientOutcome::Paired { .. } => panic!("expected a session"),
+    };
+    let start = tokio::time::Instant::now();
+    let waited = tokio::time::timeout(
+        Duration::from_secs(60),
+        session.next_event(Duration::from_secs(10)),
+    )
+    .await;
+    let result =
+        waited.expect("next_event(10 s) was still waiting at 60 s: every host PING restarted it");
+    assert!(
+        matches!(result, Err(HandshakeError::Timeout(_))),
+        "{result:?}"
+    );
+    assert_eq!(start.elapsed(), Duration::from_secs(10));
+    drop(session);
+    assert!(
+        host.await.unwrap() >= 1,
+        "the host's PINGs were answered in place"
+    );
+}
+
 /// The attended session popup has the pairing popup's budget: one popup in
 /// flight per paired device (`SESSION_REJECT{BUSY}` for a second stream while
 /// it is open, no second popup), another device still gets its own popup,
