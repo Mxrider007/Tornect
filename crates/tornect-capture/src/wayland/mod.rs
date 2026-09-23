@@ -598,11 +598,12 @@ mod tests {
     /// the desktop's console, with its session environment:
     ///
     /// ```text
-    /// TORNECT_HOME=$PWD/target/tornect-test/wl-host \
-    ///   cargo test -p tornect-capture --lib -- --ignored --nocapture wayland::tests::live
+    /// TORNECT_HOME=$PWD/target/tornect-test/s61-host \
+    ///   cargo test --workspace -- --ignored --nocapture wayland::tests::live
     /// ```
     ///
-    /// With `TORNECT_HOME` set, the restore token is kept in that home's state
+    /// `--workspace` on purpose: `-p` or `--lib` select other dev-dependencies,
+    /// which re-unify features and rebuild the Tor stack. With `TORNECT_HOME` set, the restore token is kept in that home's state
     /// directory, so a `tornect host` on the same home needs no second dialog.
     #[test]
     #[ignore = "opens a real portal session: the desktop shows a dialog someone must answer"]
