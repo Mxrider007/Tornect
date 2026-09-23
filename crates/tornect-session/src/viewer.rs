@@ -209,7 +209,8 @@ where
     /// control. A decode error asks for a keyframe. Decoding runs on this task,
     /// which yields after every message: a host that sends as fast as the
     /// stream allows must not starve what the caller joins this with, such as
-    /// its signaling keep-alive (SLICE-C2 C2-1).
+    /// its signaling keep-alive (SLICE-C2 C2-1). Every write races `stop`, so a
+    /// host that stalls one cannot hold a stop back (SLICE-C2 C2-2 (b)).
     pub async fn run<F>(
         mut self,
         sink: &mut dyn FrameSink,
@@ -253,13 +254,24 @@ where
                             tracing::debug!(error = %e, seq, "access unit did not decode");
                             if self.keyframes.allow(Instant::now()) {
                                 stats.keyframe_requests += 1;
-                                write_msg(&mut self.wr, &Msg::KeyframeRequest).await?;
+                                let ask = Msg::KeyframeRequest;
+                                if !write_unless_stopped(&mut self.wr, &ask, stop.as_mut()).await? {
+                                    return Ok(ViewerEnd::Stopped);
+                                }
                             }
                         }
                     }
-                    write_msg(&mut self.wr, &Msg::VideoAck { seq }).await?;
+                    let ack = Msg::VideoAck { seq };
+                    if !write_unless_stopped(&mut self.wr, &ack, stop.as_mut()).await? {
+                        return Ok(ViewerEnd::Stopped);
+                    }
                 }
-                Some(Msg::Ping { nonce }) => write_msg(&mut self.wr, &Msg::Pong { nonce }).await?,
+                Some(Msg::Ping { nonce }) => {
+                    let pong = Msg::Pong { nonce };
+                    if !write_unless_stopped(&mut self.wr, &pong, stop.as_mut()).await? {
+                        return Ok(ViewerEnd::Stopped);
+                    }
+                }
                 Some(Msg::Pong { .. }) => {}
                 Some(Msg::Close { reason }) => return Ok(ViewerEnd::Host(reason)),
                 Some(other) => return Err(ViewerError::Unexpected(kind(&other))),
@@ -267,6 +279,29 @@ where
             }
             tokio::task::yield_now().await;
         }
+    }
+}
+
+/// Write `msg`, unless `stop` resolves first: `Ok(false)` when it did. A write
+/// that can finish goes first. One that `stop` cuts short may leave part of a
+/// frame on the stream, so the caller writes nothing more, not even its
+/// `Close`: a host that stalled the write would stall that too.
+async fn write_unless_stopped<W, F>(
+    wr: &mut W,
+    msg: &Msg,
+    stop: std::pin::Pin<&mut F>,
+) -> Result<bool, ViewerError>
+where
+    W: AsyncWrite + Unpin,
+    F: Future<Output = ()>,
+{
+    tokio::select! {
+        biased;
+        written = write_msg(wr, msg) => {
+            written?;
+            Ok(true)
+        }
+        () = stop => Ok(false),
     }
 }
 
