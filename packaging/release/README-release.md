@@ -57,7 +57,10 @@ Tor is connected, which takes from a few seconds to a few minutes. To reach the
 other machine, paste its Tornect ID and press Connect. The first time, both
 screens show the same code: compare them (by phone, say), then press "Yes, the
 codes match" on the side that connects and "The codes match: pair" on the side
-that shares. The sharing side then asks "Allow control", "View only" or "Deny".
+that shares. The sharing side then asks "Deny", "View only" or "Allow control".
+Only a mouse click answers "Allow control", "View only" and the two "codes
+match" buttons, and only once the question has been on screen for a second:
+keys typed for another program never answer it. Deny also works from the keyboard.
 The picture opens in its own window; "End the session" or closing that window
 ends it. While your screen is shared, a banner and a small "Tornect: sharing"
 window show it, each with **Stop**. `./tornect gui --no-host` only connects to
