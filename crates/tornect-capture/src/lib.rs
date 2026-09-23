@@ -1,8 +1,8 @@
 //! Tornect screen capture (`docs/PLAN.md` §B.5): the [`VideoSource`] trait, a
 //! synthetic test card that runs anywhere, and the vertical slice's backends
-//! (decision M3-1, `docs/research/slice.md` §4–§6): `x11` on an X11 session
-//! and `gdi` on Windows, each compiled only on its OS. The Wayland backend
-//! (RemoteDesktop portal + PipeWire) comes next.
+//! (decision M3-1, `docs/research/slice.md` §4–§6), each compiled only on its
+//! OS: `wayland` (the RemoteDesktop portal and PipeWire, input included) on a
+//! Wayland session, `x11` on an X11 session, and `gdi` on Windows.
 //!
 //! Every source hands out tightly packed BGRx pictures, the format
 //! `tornect-codec` encodes without a conversion. `unsafe` is allowed only at
@@ -19,6 +19,9 @@ mod cursor;
 #[cfg(windows)]
 pub mod gdi;
 pub mod synthetic;
+// The PipeWire structures are mirrored for LP64 only.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+pub mod wayland;
 #[cfg(target_os = "linux")]
 pub mod x11;
 
@@ -66,7 +69,7 @@ pub enum CaptureError {
 /// frames only on damage) answers `Ok(None)` when nothing new arrived within
 /// `timeout`; a polling source (X11, GDI) grabs the screen on every call.
 pub trait VideoSource: Send {
-    /// A short name for logs (`"synthetic"`, `"x11"`, `"gdi"`).
+    /// A short name for logs (`"synthetic"`, `"x11"`, `"wayland"`, `"gdi"`).
     fn name(&self) -> &'static str;
 
     /// The next picture, waiting at most `timeout`.
