@@ -31,6 +31,9 @@ use super::view::{self, Action, Form};
 
 /// How long closing the window waits for the goodbyes before it quits anyway.
 const QUIT_WAIT: Duration = Duration::from_secs(10);
+/// How often an owed `ReleaseAll` is tried again while the input queue is
+/// full (`StreamLink::settle`).
+const OWED_RETRY: Duration = Duration::from_millis(50);
 
 /// What the tokio side sends the event loop.
 #[derive(Debug, Clone, Copy)]
@@ -682,6 +685,11 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if flushed {
             self.send_input();
+        }
+        // A release that found the input queue full is owed as a
+        // `ReleaseAll` until the queue has room (SLICE-E E1-6).
+        if self.stream.is_some() && self.link.settle() {
+            earliest(now + OWED_RETRY);
         }
         for surface in [
             self.main.as_mut(),

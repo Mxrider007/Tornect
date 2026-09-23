@@ -13,7 +13,7 @@ use tornect_capture::{CaptureError, Frame, TestCard, VideoSource};
 use tornect_codec::{DecodedFrame, EncoderSettings, H264Encoder};
 use tornect_core::session_log::SessionMode;
 use tornect_core::{DeviceId, DeviceIdentity, HostIdentity};
-use tornect_input::{InputError, InputEvent, InputSink};
+use tornect_input::{Button, InputError, InputEvent, InputSink};
 use tornect_proto::{Msg, codec, read_msg, reason, video_flags, write_msg};
 use tornect_signal::consent::SessionToken;
 use tornect_signal::fsm::client::{
@@ -466,6 +466,69 @@ async fn control_input_is_capped_and_released_when_the_session_is_killed() {
     assert_eq!(rig.host.live(), 0);
 }
 
+/// SLICE-E E1-6: a release is never lost to the input budget. A burst of 600
+/// inputs, more than the bucket holds, ends in a button-up and a key-up: the
+/// moves past the budget are dropped, and both releases reach the injector
+/// while the session goes on. Before, they were dropped too, and the key and
+/// the button stayed down until the session ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn releases_are_never_dropped_by_the_input_budget() {
+    // A bucket of 500 that never refills.
+    let rig = rig(MediaLimits {
+        input_rate: 0,
+        input_burst: 500,
+        ..MediaLimits::default()
+    });
+    let (session_id, binding) = start(&rig.host, 5, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    let key = |pressed| InputEvent::Key {
+        usb: KEY_A,
+        pressed,
+    };
+    let button = |pressed| InputEvent::PointerButton {
+        button: Button::Left,
+        pressed,
+    };
+    let mut burst = vec![key(true), button(true)];
+    burst.extend((0..596u16).map(|i| InputEvent::PointerMove { x: i, y: i }));
+    burst.extend([button(false), key(false)]);
+    assert_eq!(burst.len(), 600);
+    for event in &burst {
+        write_msg(&mut client, &Msg::Input(event.encode()))
+            .await
+            .unwrap();
+    }
+    sync(&mut client, 9).await;
+
+    let events = rig.backend.recorder.events();
+    assert_eq!(
+        events.len(),
+        502,
+        "500 within the budget, then the releases"
+    );
+    assert_eq!(&events[..2], &[key(true), button(true)]);
+    assert_eq!(
+        &events[500..],
+        &[button(false), key(false)],
+        "the releases got through while the session goes on"
+    );
+    assert!(!served.is_finished());
+
+    rig.host
+        .on_end(&session_id, Some(&SessionEnd::Killed(bye::PANIC)));
+    assert_eq!(until_close(&mut client).await, Some(reason::ENDED_BY_HOST));
+    let MediaOutcome::Served { report, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!((report.input_injected, report.input_dropped), (502, 98));
+    assert_eq!(
+        rig.backend.recorder.events().len(),
+        502,
+        "nothing was left held for the end to release"
+    );
+}
+
 /// SLICE-C1 C1-3: a key held by a control viewer that goes quiet is released
 /// while the session goes on. Its network may be gone without a word, and X11
 /// repeats a held key until the session ends at the 90 s idle timeout; before,
@@ -592,7 +655,7 @@ async fn a_viewer_sends_each_input_event_as_one_16_byte_frame() {
     let events = [
         InputEvent::PointerMove { x: 100, y: 65_000 },
         InputEvent::PointerButton {
-            button: tornect_input::Button::Left,
+            button: Button::Left,
             pressed: true,
         },
         InputEvent::Key {
