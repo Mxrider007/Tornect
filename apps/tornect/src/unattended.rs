@@ -23,7 +23,7 @@ use tornect_core::id::DeviceId;
 use tornect_core::session_log::{Actor, SessionLog};
 use tornect_core::unattended::grant::Preset;
 use tornect_core::unattended::guard::{
-    ExternalOp, GuardError, MutationGuard, NoSessionActivity, RemoteSessionActivity, SuspendOutcome,
+    ExternalOp, GuardError, MutationGuard, RemoteSessionActivity, SuspendOutcome,
 };
 use tornect_core::unattended::ipc::{
     GrantOptions, IpcOp, IpcRequest, IpcResponse, LogPage, MasterOnPayload, PolicyInputsPayload,
@@ -564,7 +564,9 @@ pub enum BackupCmd {
 /// other mutation". A running host holds the host lock for its whole life, so
 /// the offline route is taken only when there is genuinely no host — not merely
 /// none that answers (SLICE-B2 B2-2) — and the store's advisory lock keeps the
-/// two from writing the store at once.
+/// two from writing the store at once. The route is picked once, when the
+/// command starts: a host that starts later is seen only by the offline
+/// guard's session checks, which count its lock as a live session (SLICE-D D1).
 enum Route {
     /// A host is listening; send the request to it.
     Host,
@@ -628,7 +630,36 @@ pub fn host_context(
 /// cannot force. Loading as the host here made every `tornect unattended
 /// status` a load that settled, decayed and rewrote the store (track D S5).
 fn offline_context(paths: &Paths) -> anyhow::Result<HostContext> {
-    context(paths, LoadMode::Offline, Arc::new(NoSessionActivity), None)
+    context(paths, LoadMode::Offline, offline_activity(paths), None)
+}
+
+/// What the offline guard asks about remote sessions: the host lock.
+fn offline_activity(paths: &Paths) -> Arc<dyn RemoteSessionActivity> {
+    Arc::new(HostLockActivity {
+        paths: paths.clone(),
+    })
+}
+
+/// The offline route's view of remote sessions (SLICE-D D1).
+///
+/// The route is picked once, when the command starts, but the command can wait
+/// for minutes at a password prompt or in the re-auth dialog, and a
+/// `tornect host` started meanwhile runs store-less beside it (M1-46). That
+/// host's sessions are invisible here, so while any host holds the host lock
+/// a session counts as live: the guard's checks before and after re-auth, and
+/// last thing before the write, then refuse with `G_REMOTE_SESSION_ACTIVE`.
+struct HostLockActivity {
+    paths: Paths,
+}
+
+impl RemoteSessionActivity for HostLockActivity {
+    fn last_session_ended_at(&self) -> Option<std::time::Instant> {
+        None
+    }
+
+    fn session_live(&self) -> bool {
+        crate::host::HostLock::holder(&self.paths).is_some()
+    }
 }
 
 /// Build a context: the guard, told about live sessions by `activity`, and the
@@ -775,7 +806,20 @@ async fn send(paths: &Paths, route: &Route, op: IpcOp) -> anyhow::Result<IpcResp
         Route::Offline(ctx) => {
             // The guard blocks (fsync, and the re-auth dialog).
             let ctx = ctx.as_ref();
-            Ok(tokio::task::block_in_place(|| dispatch(ctx, req)))
+            let resp = tokio::task::block_in_place(|| dispatch(ctx, req));
+            // A host that started while this command ran is what the guard's
+            // session check saw (SLICE-D D1); say so, not "a remote session".
+            if resp.code == codes::G_REMOTE_SESSION_ACTIVE
+                && let Some(holder) = crate::host::HostLock::holder(paths)
+            {
+                anyhow::bail!(
+                    "a Tornect host started for {} ({holder}) while this command ran, and \
+                     this command cannot see that host's sessions, so nothing was changed; \
+                     run it again and it goes through the host",
+                    paths.state_dir.display()
+                );
+            }
+            Ok(resp)
         }
     }
 }
@@ -1563,7 +1607,9 @@ pub fn backup(paths: &Paths, cmd: BackupCmd) -> anyhow::Result<()> {
 mod tests {
     use tornect_core::keystore::FileSecretStore;
     use tornect_core::unattended::clock::SystemClock;
-    use tornect_core::unattended::guard::{AllowAllPaired, AllowAllReAuth, DenyAllReAuth};
+    use tornect_core::unattended::guard::{
+        AllowAllPaired, AllowAllReAuth, DenyAllReAuth, NoSessionActivity,
+    };
     use tornect_core::unattended::ipc::{StatusReport, decode_payload};
 
     use super::*;
@@ -1578,7 +1624,25 @@ mod tests {
     /// A context wired like the offline CLI, but with re-authentication
     /// scripted rather than asking a human.
     fn env(reauth_allows: bool) -> Env {
-        let tmp = tempfile::tempdir().unwrap();
+        let reauth: Arc<dyn tornect_core::unattended::guard::ReAuth> = if reauth_allows {
+            Arc::new(AllowAllReAuth::default())
+        } else {
+            Arc::new(DenyAllReAuth)
+        };
+        env_with(
+            tempfile::tempdir().unwrap(),
+            reauth,
+            Arc::new(NoSessionActivity),
+        )
+    }
+
+    /// [`env`] in `tmp`, with the given re-authentication and the given view
+    /// of remote sessions.
+    fn env_with(
+        tmp: tempfile::TempDir,
+        reauth: Arc<dyn tornect_core::unattended::guard::ReAuth>,
+        activity: Arc<dyn RemoteSessionActivity>,
+    ) -> Env {
         let paths = Paths::from_home(tmp.path());
         paths.ensure().unwrap();
         let secrets = Arc::new(FileSecretStore::open(paths.keys_dir()).unwrap());
@@ -1590,12 +1654,7 @@ mod tests {
             log.clone(),
         )
         .unwrap();
-        let reauth: Arc<dyn tornect_core::unattended::guard::ReAuth> = if reauth_allows {
-            Arc::new(AllowAllReAuth::default())
-        } else {
-            Arc::new(DenyAllReAuth)
-        };
-        let guard = MutationGuard::new(store, reauth, Arc::new(NoSessionActivity))
+        let guard = MutationGuard::new(store, reauth, activity)
             .with_paired_devices(Arc::new(AllowAllPaired))
             .with_server_setup_source(Arc::new(
                 tornect_signal::unattended::OpaqueServerSetupSource,
@@ -1666,6 +1725,121 @@ mod tests {
         );
         drop(host);
         assert!(matches!(route(&paths).await, Ok(Route::Offline(_))));
+    }
+
+    /// A re-auth dialog during which a `tornect host` starts: the host takes
+    /// its lock on dialog number `on_call`, and the dialog then allows.
+    struct HostStartsDuringDialog {
+        paths: Paths,
+        on_call: usize,
+        calls: std::sync::atomic::AtomicUsize,
+        host: std::sync::Mutex<Option<crate::host::HostLock>>,
+    }
+
+    impl HostStartsDuringDialog {
+        fn new(paths: &Paths, on_call: usize) -> Self {
+            Self {
+                paths: paths.clone(),
+                on_call,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                host: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    impl tornect_core::unattended::guard::ReAuth for HostStartsDuringDialog {
+        fn reauthenticate(
+            &self,
+            _op: &str,
+        ) -> Result<(), tornect_core::unattended::guard::ReAuthError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == self.on_call {
+                let lock = crate::host::HostLock::acquire(&self.paths).unwrap();
+                *self.host.lock().unwrap() = Some(lock);
+            }
+            Ok(())
+        }
+    }
+
+    /// SLICE-D D1: a command routed offline before any host ran keeps its
+    /// offline guard for its whole run. A host that starts while `On`'s
+    /// re-auth dialog is open must stop it: before, the guard asked
+    /// `NoSessionActivity` and `On` handed out a stop code beside the host's
+    /// live sessions.
+    #[test]
+    fn a_host_that_starts_during_the_dialog_stops_an_offline_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        let reauth = Arc::new(HostStartsDuringDialog::new(&paths, 0));
+        let env = env_with(tmp, reauth, offline_activity(&paths));
+        let resp = go(&env.ctx, IpcOp::On);
+        assert!(
+            !resp.ok,
+            "On went through beside a host that started during its dialog"
+        );
+        assert_eq!(
+            resp.code,
+            codes::G_REMOTE_SESSION_ACTIVE,
+            "{:?}",
+            resp.detail
+        );
+        assert!(resp.payload.is_none(), "no stop code");
+        assert!(!enabled(&env.ctx));
+    }
+
+    /// SLICE-D D1, registration: a host that starts between `RegStart` and
+    /// `RegFinish` (while the user finishes the exchange) stops the grant at
+    /// `RegFinish`'s last check before the write.
+    #[test]
+    fn a_host_that_starts_before_reg_finish_stops_an_offline_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        let env = env_with(
+            tmp,
+            Arc::new(AllowAllReAuth::default()),
+            offline_activity(&paths),
+        );
+        assert!(go(&env.ctx, IpcOp::On).ok);
+        let device = DeviceId::from_bytes(
+            *ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        );
+        let password = "quiet verdant otter lantern zephyr";
+        let (client, reg_request) =
+            tornect_signal::auth::PasswordRegistration::start(password).unwrap();
+        let resp = go(
+            &env.ctx,
+            IpcOp::RegStart {
+                device,
+                reg_request,
+            },
+        );
+        assert!(resp.ok, "{:?}", resp.detail);
+        let started: RegStartPayload = decode_payload(resp.payload.as_deref().unwrap()).unwrap();
+
+        let host = crate::host::HostLock::acquire(&paths).unwrap();
+        let ids = tornect_signal::auth::identifiers(device.public_key_bytes(), &HOST_PK);
+        let upload = client.finish(password, &started.reg_response, ids).unwrap();
+        let resp = go(
+            &env.ctx,
+            IpcOp::RegFinish {
+                device,
+                reg_txn: started.reg_txn,
+                upload,
+                preset: Preset::HeadlessBox.wire(),
+                options: GrantOptions::default(),
+            },
+        );
+        assert!(!resp.ok, "the grant was written beside a host");
+        assert_eq!(
+            resp.code,
+            codes::G_REMOTE_SESSION_ACTIVE,
+            "{:?}",
+            resp.detail
+        );
+        assert!(env.ctx.guard.store().grant(&device).is_none());
+        drop(host);
     }
 
     fn enabled(ctx: &HostContext) -> bool {
