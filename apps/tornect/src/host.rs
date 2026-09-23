@@ -391,7 +391,7 @@ impl MediaObserver for CliMedia {
     }
 }
 
-fn describe_media_end(end: MediaEnd) -> String {
+pub(crate) fn describe_media_end(end: MediaEnd) -> String {
     match end {
         MediaEnd::SessionOver(reason) => format!("session over, {}", media_reason(reason)),
         MediaEnd::ViewerLeft => "the viewer left".to_owned(),
@@ -434,13 +434,13 @@ pub fn describe_media(outcome: &MediaOutcome) -> Option<String> {
 /// A line on stdout that cannot panic. `println!` panics when stdout is a
 /// closed pipe, and a panic inside a [`SessionSink`] call would skip the
 /// `on_end` that releases the session and stops capture (SLICE-B1 B1-4).
-fn say(line: fmt::Arguments<'_>) {
+pub(crate) fn say(line: fmt::Arguments<'_>) {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{line}").and_then(|()| out.flush());
 }
 
 /// [`say`] for stderr.
-fn note(line: fmt::Arguments<'_>) {
+pub(crate) fn note(line: fmt::Arguments<'_>) {
     let _ = writeln!(std::io::stderr().lock(), "{line}");
 }
 
@@ -451,7 +451,7 @@ fn mode_name(mode: SessionMode) -> &'static str {
     }
 }
 
-fn describe_end(end: &SessionEnd) -> String {
+pub(crate) fn describe_end(end: &SessionEnd) -> String {
     match end {
         SessionEnd::PeerBye(reason) => format!("the client left ({})", bye::name(*reason)),
         SessionEnd::PeerError(code) => {

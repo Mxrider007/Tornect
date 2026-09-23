@@ -1,8 +1,10 @@
-//! `tornect` command-line entry point.
+//! `tornect` entry point: the desktop window with no subcommand (or `tornect
+//! gui`), and the command line.
 //!
 //! Milestone 0 ships the identity/config commands; Milestone 1 adds `host`,
-//! `ping` and `connect` over the live Tor network; `demo` and the graphical app
-//! arrive with later milestones (`docs/PLAN.md` Part C).
+//! `ping` and `connect` over the live Tor network; the vertical slice adds the
+//! window (`ui`, decision D10's egui-everywhere fallback); `demo` arrives with
+//! later milestones (`docs/PLAN.md` Part C).
 
 #![forbid(unsafe_code)]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -19,6 +21,7 @@ compile_error!(
 mod host;
 mod prompt;
 mod tor_cmd;
+mod ui;
 mod unattended;
 
 use std::path::PathBuf;
@@ -52,12 +55,28 @@ struct Cli {
     #[arg(long, global = true, value_name = "MODE", value_parser = parse_bridge_mode)]
     bridges: Option<BridgeMode>,
 
+    /// Without a subcommand, the window opens (`tornect gui`).
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Open the Tornect window (the default): this machine's ID and Tor status,
+    /// connect to another computer, and answer pairing and session requests in
+    /// popups, with a banner and Stop while the screen is shared.
+    Gui {
+        /// What a session shares: `desktop` or `test-card` (see `host`).
+        #[arg(long, value_enum, default_value_t = CaptureArg::Desktop)]
+        capture: CaptureArg,
+        /// Only connect to others: publish no ID and answer no requests.
+        #[arg(long)]
+        no_host: bool,
+        /// Show every screen from synthetic state and start nothing (no Tor,
+        /// no hosting): for checking the window itself.
+        #[arg(long, hide = true)]
+        preview: bool,
+    },
     /// Show this machine's Tornect ID (its onion v3 address), creating it on first run.
     Id {
         /// Print machine-readable JSON.
@@ -217,7 +236,31 @@ fn main() -> anyhow::Result<()> {
         None => Paths::discover()?,
     };
 
-    match cli.command {
+    let Some(command) = cli.command else {
+        return ui::run(
+            &paths,
+            ui::GuiOpts {
+                source: tornect_session::Source::Desktop,
+                host: true,
+                bridges: cli.bridges,
+                preview: false,
+            },
+        );
+    };
+    match command {
+        Command::Gui {
+            capture,
+            no_host,
+            preview,
+        } => ui::run(
+            &paths,
+            ui::GuiOpts {
+                source: capture.into(),
+                host: !no_host,
+                bridges: cli.bridges,
+                preview,
+            },
+        ),
         Command::Id { json } => cmd_id(&paths, json),
         Command::RotateId { yes } => cmd_rotate_id(&paths, yes),
         Command::Paths => {

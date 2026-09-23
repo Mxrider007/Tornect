@@ -1,0 +1,747 @@
+//! The tokio side of the window: Tor, hosting (the handshake FSM with the
+//! window's consent seams, the media host, the control channel) and viewing
+//! (the client handshake and the media viewer), reporting into the model and
+//! taking the window's [`Command`]s. It reuses what `tornect host` and
+//! `tornect connect` run, so both paths share their fixes.
+
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::task::{JoinHandle, JoinSet};
+use tornect_core::session_log::SessionMode;
+use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
+use tornect_input::InputEvent;
+use tornect_session::{
+    CaptureStarted, MediaEnd, MediaHost, MediaLimits, MediaObserver, MediaReport, Source,
+    SystemBackend,
+};
+use tornect_signal::fsm::client::{
+    self, ClientConfig, ClientDeps, ClientOutcome, Intent, NoServerKeyPin,
+};
+use tornect_signal::fsm::host::{
+    HostConfig, HostDeps, LiveSession, LiveSessions, SessionActivity as _, SessionEnd, SessionSink,
+};
+use tornect_signal::fsm::{HostAudit, OsRandom};
+use tornect_signal::messages::bye;
+use tornect_signal::pairing::{AutoDeny, KnownHostStore};
+use tornect_signal::tor::{Ladder, LadderEvent, OnionListener};
+use tornect_signal::{Isolation, MEDIA_PORT, SIGNALING_PORT, TorNode};
+
+use super::consent::{GuiConsent, GuiPairingUi, Popups, Withdraw};
+use super::model::{CaptureNote, ClientStage, Hosting, Shared, Sharing, TorState, Viewing, Wake};
+use super::stream::{FrameSlot, SlotSink};
+use crate::host::{ControlChannel, HostLock, HostWiring, describe_end, describe_media, note, say};
+use crate::tor_cmd::{End, explain, explain_handshake};
+
+/// Input events queued for the media stream; one beyond that is dropped (the
+/// host's own budget is 250/s with a burst of 500).
+const INPUT_QUEUE: usize = 256;
+/// How long the owner has to answer the desktop's dialog at the setup step:
+/// they are at the desk, having just clicked.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+const GRANT_WAIT: Duration = Duration::from_secs(120);
+/// How long shutting down waits for the streams' goodbyes.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
+/// What the window asks the tokio side to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    /// View the host with this ID.
+    Connect(TornectId),
+    /// End the session being viewed.
+    EndViewing,
+    /// End the session this screen is shared with (a host-wide kill).
+    StopSharing,
+    /// The first-run desktop grant.
+    Grant,
+    /// Forget the desktop's remembered grant.
+    Revoke,
+    /// Shut down.
+    Quit,
+}
+
+/// What the viewer and the stream window share: the newest picture, and while
+/// a control session runs, the way to the host for input.
+#[derive(Debug, Default)]
+pub struct StreamLink {
+    /// The newest picture.
+    pub slot: Arc<FrameSlot>,
+    input: Mutex<Option<mpsc::Sender<InputEvent>>>,
+}
+
+impl StreamLink {
+    fn set_input(&self, input: Option<mpsc::Sender<InputEvent>>) {
+        *self.input.lock().unwrap_or_else(PoisonError::into_inner) = input;
+    }
+
+    /// Queue `event` for the host; `false` when there is no control session
+    /// or the queue is full (never blocks the UI thread).
+    pub fn send(&self, event: InputEvent) -> bool {
+        self.input
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|tx| tx.try_send(event).is_ok())
+    }
+}
+
+/// Everything the tokio side starts from.
+pub struct Backend {
+    /// This instance's directories.
+    pub paths: Paths,
+    /// Its configuration (with the command line's overrides).
+    pub cfg: Config,
+    /// The model.
+    pub shared: Arc<Shared>,
+    /// The popups.
+    pub popups: Arc<Popups>,
+    /// The stream window's link.
+    pub link: Arc<StreamLink>,
+    /// What a shared session shows.
+    pub source: Source,
+    /// Whether to publish this ID and answer requests.
+    pub host: bool,
+    /// The host identity (the onion service key).
+    pub identity: Arc<HostIdentity>,
+    /// The device identity (what hosts pin when this machine connects).
+    pub device: Arc<DeviceIdentity>,
+    /// The device key's public half.
+    pub device_pk: [u8; 32],
+}
+
+/// The host role, once wired.
+struct Hosted {
+    serving: Arc<(HostConfig, HostDeps)>,
+    media: Arc<MediaHost>,
+    live: Arc<LiveSessions>,
+    audit: Arc<HostAudit>,
+    ipc: Option<JoinHandle<()>>,
+    kill_watch: JoinHandle<()>,
+    _lock: HostLock,
+}
+
+/// The window's [`SessionSink`]: the tracker, the media layer, then the
+/// sharing indicator, and a bump of the counter that withdraws open popups.
+struct GuiSessions {
+    live: Arc<LiveSessions>,
+    media: Arc<MediaHost>,
+    shared: Arc<Shared>,
+    started: watch::Sender<u64>,
+}
+
+impl SessionSink for GuiSessions {
+    fn on_start(&self, session: &LiveSession<'_>) {
+        self.live.on_start(session);
+        self.media.on_start(session);
+        self.started.send_modify(|n| *n = n.wrapping_add(1));
+        let control = session.mode == SessionMode::Control;
+        let sharing = Sharing {
+            session_id: session.session_id.to_owned(),
+            label: session.label.to_owned(),
+            control,
+            since: Instant::now(),
+            capture: None,
+        };
+        self.shared.update(|m| {
+            m.note(format!(
+                "session with \"{}\" started ({})",
+                session.label,
+                if control { "control" } else { "view only" }
+            ));
+            m.sharing = Some(sharing);
+        });
+        self.shared.wake(Wake::Attention);
+        say(format_args!("SESSION LIVE {}", session.session_id));
+    }
+
+    fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
+        // Media first: that is what stops capture.
+        self.media.on_end(session_id, end);
+        self.live.on_end(session_id, end);
+        let why = end.map_or_else(|| "protocol error".to_owned(), describe_end);
+        self.shared.update(|m| {
+            if m.sharing
+                .as_ref()
+                .is_some_and(|s| s.session_id == session_id)
+            {
+                m.sharing = None;
+            }
+            m.note(format!("session ended: {why}"));
+        });
+        say(format_args!("SESSION ENDED {session_id}"));
+        note(format_args!("session ended: {why}"));
+    }
+}
+
+/// The window's [`MediaObserver`]: what capture does, on the banner and on
+/// stdout (the evidence lines `tornect host` prints too).
+struct GuiMedia {
+    shared: Arc<Shared>,
+}
+
+impl MediaObserver for GuiMedia {
+    fn capture_started(&self, s: &CaptureStarted<'_>) {
+        let capture = CaptureNote {
+            source: s.source,
+            width: s.width,
+            height: s.height,
+            input: s.input,
+        };
+        self.shared.update(|m| {
+            if let Some(sharing) = &mut m.sharing
+                && sharing.session_id == s.session_id
+            {
+                sharing.capture = Some(capture);
+            }
+        });
+        say(format_args!("SHARING {}", s.session_id));
+        note(format_args!(
+            "sharing this screen with \"{}\" ({} {}x{}; input {})",
+            s.label,
+            s.source,
+            s.width,
+            s.height,
+            if s.input { "injected" } else { "not injected" }
+        ));
+    }
+
+    fn capture_stopped(&self, session_id: &str, report: &MediaReport, end: &MediaEnd) {
+        say(format_args!("SHARING STOPPED {session_id}"));
+        let line = format!(
+            "screen sharing stopped ({}): {} pictures, {} KiB sent; input {} injected, {} dropped",
+            crate::host::describe_media_end(*end),
+            report.frames_sent,
+            report.bytes_sent / 1024,
+            report.input_injected,
+            report.input_dropped
+        );
+        note(format_args!("{line}"));
+        self.shared.update(|m| m.note(line));
+    }
+}
+
+/// Wire the host role: the FSM with the window's consent, the media host, and
+/// the control channel (bound before Tor, as `tornect host` does).
+async fn host_role(b: &Backend) -> Result<Hosted, String> {
+    let lock = HostLock::acquire(&b.paths).map_err(|e| format!("{e:#}"))?;
+    let control = ControlChannel::default();
+    let media = Arc::new(MediaHost::new(
+        Arc::new(SystemBackend::new(b.source).with_restore_token(b.paths.portal_restore_token())),
+        Arc::new(GuiMedia {
+            shared: Arc::clone(&b.shared),
+        }),
+        MediaLimits::default(),
+    ));
+    let HostWiring {
+        cfg,
+        mut deps,
+        ctx,
+        live,
+        audit,
+    } = crate::host::wire(
+        &b.paths,
+        &b.cfg,
+        Arc::clone(&b.identity),
+        b.device_pk,
+        Arc::new(AutoDeny),
+        Arc::clone(&media),
+        control.clone(),
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let (started_tx, started) = watch::channel(0u64);
+    let activity = Arc::clone(&live);
+    deps.consent = Arc::new(GuiConsent::new(
+        Arc::clone(&b.popups),
+        Withdraw {
+            kill: deps.kill.clone(),
+            started,
+            live: Arc::new(move || activity.session_live()),
+        },
+    ));
+    deps.sessions = Arc::new(GuiSessions {
+        live: Arc::clone(&live),
+        media: Arc::clone(&media),
+        shared: Arc::clone(&b.shared),
+        started: started_tx,
+    });
+    let kill_watch = media.watch_kill(deps.kill.clone());
+    let ipc = crate::host::start_control_channel(&b.paths, ctx, deps.kill.clone(), control)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(Hosted {
+        serving: Arc::new((cfg, deps)),
+        media,
+        live,
+        audit,
+        ipc,
+        kill_watch,
+        _lock: lock,
+    })
+}
+
+/// Reach the Tor network through the bridge ladder (decision M1-38),
+/// showing each step in the window.
+async fn start_tor(paths: Paths, cfg: Config, shared: Arc<Shared>) -> anyhow::Result<TorNode> {
+    let ladder = Ladder::from_config(&paths, &cfg.tor);
+    for line in &ladder.rejected_lines {
+        shared.update(|m| m.note(format!("tor: ignoring {line}")));
+    }
+    let events = Arc::clone(&shared);
+    TorNode::start_auto(&paths, &cfg, &ladder, move |event| {
+        let state = match event {
+            LadderEvent::Trying { rung, attempt, of } => TorState::Trying {
+                via: rung.describe(),
+                attempt: *attempt,
+                of: *of,
+            },
+            LadderEvent::Progress {
+                rung,
+                fraction,
+                blocked,
+            } => TorState::Progress {
+                via: rung.describe(),
+                pct: (fraction * 100.0).round() as u32,
+                blocked: blocked.clone(),
+            },
+            LadderEvent::Ready { rung } => TorState::Ready {
+                via: rung.describe(),
+            },
+            LadderEvent::Skipped { rung, reason } => {
+                let line = format!("tor: {} unavailable: {reason}", rung.describe());
+                events.update(|m| m.note(line));
+                return;
+            }
+            LadderEvent::Failed { rung, reason } => {
+                let line = format!("tor: {} did not work: {reason}", rung.describe());
+                events.update(|m| m.note(line));
+                return;
+            }
+            _ => return,
+        };
+        events.update(|m| m.tor = state);
+    })
+    .await
+    .map_err(explain)
+}
+
+/// Keep the hosting line current with the onion service's reachability.
+fn watch_reachability(listener: &OnionListener, shared: Arc<Shared>) -> JoinHandle<()> {
+    let mut rx = listener.status();
+    tokio::spawn(async move {
+        let mut announced = false;
+        loop {
+            let s = rx.borrow_and_update().clone();
+            if s.reachable && !announced {
+                say(format_args!("REACHABLE"));
+                announced = true;
+            }
+            shared.update(|m| {
+                m.hosting = Hosting::Published {
+                    reachable: s.reachable,
+                    state: s.state,
+                    problem: s.problem,
+                };
+            });
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+/// The first-run grant's desktop check: only a Wayland desktop this machine
+/// shares has one.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn grant(token: std::path::PathBuf) -> Result<(bool, bool), String> {
+    let options = tornect_capture::wayland::WaylandOptions {
+        dialog_wait: GRANT_WAIT,
+        ..tornect_capture::wayland::WaylandOptions::new(Some(token))
+    };
+    tornect_capture::wayland::grant(&options)
+        .map(|g| (g.input, g.remembered))
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+fn grant(_: std::path::PathBuf) -> Result<(bool, bool), String> {
+    Err("this desktop needs no grant".to_owned())
+}
+
+/// Run until [`Command::Quit`], then shut down and mark the model closed.
+pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
+    let b = Arc::new(b);
+    let hosted = if b.host {
+        match host_role(&b).await {
+            Ok(hosted) => Some(hosted),
+            Err(why) => {
+                b.shared.update(|m| m.hosting = Hosting::Off(why));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Tor starts on a task of its own and is never cancelled: the ladder owns
+    // runtimes that must not be dropped inside this one.
+    let mut tor_start = Some(tokio::spawn(start_tor(
+        b.paths.clone(),
+        b.cfg.clone(),
+        Arc::clone(&b.shared),
+    )));
+    let mut node: Option<Arc<TorNode>> = None;
+    let mut listener: Option<OnionListener> = None;
+    let mut status: Option<JoinHandle<()>> = None;
+    let mut publish: Option<JoinHandle<anyhow::Result<OnionListener>>> = None;
+    let mut viewing: Option<(watch::Sender<bool>, JoinHandle<()>)> = None;
+    let mut granting: Option<JoinHandle<Result<(bool, bool), String>>> = None;
+    let slots = Arc::new(Semaphore::new(tornect_signal::tor::MAX_LIVE_CIRCUITS));
+    let mut media_streams = JoinSet::new();
+
+    loop {
+        tokio::select! {
+            started = async { tor_start.as_mut().expect("guarded").await }, if tor_start.is_some() => {
+                tor_start = None;
+                match started {
+                    Ok(Ok(started)) => {
+                        let started = Arc::new(started);
+                        if hosted.is_some() {
+                            b.shared.update(|m| m.hosting = Hosting::Publishing);
+                            let (n, identity) = (Arc::clone(&started), Arc::clone(&b.identity));
+                            publish = Some(tokio::spawn(async move {
+                                n.publish(&identity).await.map_err(explain)
+                            }));
+                        }
+                        node = Some(started);
+                    }
+                    Ok(Err(e)) => {
+                        let why = format!("{e:#}");
+                        b.shared.update(|m| {
+                            m.tor = TorState::Failed(why.clone());
+                            if hosted.is_some() {
+                                m.hosting = Hosting::Off("Tor is not reachable".to_owned());
+                            }
+                        });
+                    }
+                    Err(e) => b.shared.update(|m| m.tor = TorState::Failed(e.to_string())),
+                }
+            }
+            published = async { publish.as_mut().expect("guarded").await }, if publish.is_some() => {
+                publish = None;
+                match published {
+                    Ok(Ok(l)) => {
+                        say(format_args!("Tornect ID: {}", l.onion_address()));
+                        status = Some(watch_reachability(&l, Arc::clone(&b.shared)));
+                        listener = Some(l);
+                    }
+                    Ok(Err(e)) => {
+                        let why = format!("publishing failed: {e:#}");
+                        b.shared.update(|m| m.hosting = Hosting::Off(why));
+                    }
+                    Err(e) => b.shared.update(|m| m.hosting = Hosting::Off(e.to_string())),
+                }
+            }
+            stream = async { listener.as_mut().expect("guarded").accept().await }, if listener.is_some() => {
+                let (Some(stream), Some(hosted)) = (stream, &hosted) else {
+                    listener = None;
+                    b.shared.update(|m| m.hosting = Hosting::Off("the listener closed".to_owned()));
+                    continue;
+                };
+                while media_streams.try_join_next().is_some() {}
+                if stream.port() == MEDIA_PORT {
+                    let media = Arc::clone(&hosted.media);
+                    media_streams.spawn(async move {
+                        let outcome = media.serve(stream).await;
+                        if let Some(line) = describe_media(&outcome) {
+                            note(format_args!("{line}"));
+                        }
+                    });
+                    continue;
+                }
+                if stream.port() != SIGNALING_PORT {
+                    continue;
+                }
+                let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+                    continue;
+                };
+                let serving = Arc::clone(&hosted.serving);
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    let (cfg, deps) = &*serving;
+                    crate::host::serve_signaling(stream, cfg, deps, |_| {}).await;
+                });
+            }
+            granted = async { granting.as_mut().expect("guarded").await }, if granting.is_some() => {
+                granting = None;
+                let outcome = granted.unwrap_or_else(|e| Err(e.to_string()));
+                let token = b.paths.portal_restore_token();
+                b.shared.update(|m| {
+                    let Some(setup) = &mut m.setup else { return };
+                    setup.busy = false;
+                    setup.granted = token.exists();
+                    setup.note = Some(match outcome {
+                        Ok((true, true)) => "Granted: the screen, the keyboard and the mouse, remembered until revoked.".to_owned(),
+                        Ok((false, true)) => "Granted for the screen only: \"Allow Remote Interaction\" was off, so viewers cannot control this desktop. Grant again to change it.".to_owned(),
+                        Ok((_, false)) => "The desktop shared the screen but kept no grant, so it will ask again at each session.".to_owned(),
+                        Err(why) => format!("Not granted: {why}"),
+                    });
+                });
+            }
+            command = commands.recv() => {
+                let Some(command) = command else { break };
+                match command {
+                    Command::Quit => break,
+                    Command::Connect(id) => {
+                        let Some(node) = node.clone() else {
+                            b.shared.update(|m| m.client = ClientStage::Ended("Tor is not connected yet.".to_owned()));
+                            continue;
+                        };
+                        if viewing.as_ref().is_some_and(|(_, task)| !task.is_finished()) {
+                            continue;
+                        }
+                        let (stop_tx, stop) = watch::channel(false);
+                        let task = tokio::spawn(view_session(Arc::clone(&b), node, id, stop));
+                        viewing = Some((stop_tx, task));
+                    }
+                    Command::EndViewing => {
+                        if let Some((stop, _)) = &viewing {
+                            let _ = stop.send(true);
+                        }
+                    }
+                    Command::StopSharing => {
+                        if let Some(hosted) = &hosted {
+                            hosted.serving.1.kill.kill(bye::USER);
+                            b.shared.update(|m| m.note("you stopped sharing"));
+                        }
+                    }
+                    Command::Grant => {
+                        let sharing = b.shared.read(|m| m.sharing.is_some());
+                        if granting.is_none() && !sharing && b.shared.read(|m| m.setup.is_some()) {
+                            b.shared.update(|m| {
+                                if let Some(setup) = &mut m.setup {
+                                    setup.busy = true;
+                                    setup.note = None;
+                                }
+                            });
+                            let token = b.paths.portal_restore_token();
+                            granting = Some(tokio::task::spawn_blocking(move || grant(token)));
+                        }
+                    }
+                    Command::Revoke => {
+                        let token = b.paths.portal_restore_token();
+                        let removed = match std::fs::remove_file(&token) {
+                            Ok(()) => Ok(()),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                            Err(e) => Err(e),
+                        };
+                        b.shared.update(|m| {
+                            if let Some(setup) = &mut m.setup {
+                                setup.granted = token.exists();
+                                setup.note = Some(match &removed {
+                                    Ok(()) => "Revoked: the desktop asks again at the next session.".to_owned(),
+                                    Err(e) => format!("Could not delete the grant file: {e}"),
+                                });
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Shutting down: the viewed session says goodbye, every hosted session
+    // gets its `BYE` and every media stream its `Close`, then Tor goes.
+    if let Some((stop, task)) = viewing.take() {
+        let _ = stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(6), task).await;
+    }
+    if let Some(hosted) = &hosted {
+        hosted.serving.1.kill.kill(bye::USER);
+        let grace = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        loop {
+            while media_streams.try_join_next().is_some() {}
+            let busy = hosted.serving.1.stats.streams.load(Ordering::SeqCst) > 0
+                || !media_streams.is_empty();
+            if !busy || tokio::time::Instant::now() >= grace {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if hosted.live.count() > 0 {
+            note(format_args!(
+                "{} session(s) did not close in time",
+                hosted.live.count()
+            ));
+        }
+        media_streams.abort_all();
+        hosted.kill_watch.abort();
+        if let Some(ipc) = &hosted.ipc {
+            ipc.abort();
+        }
+        hosted.audit.flush();
+    }
+    if let Some(status) = status {
+        status.abort();
+    }
+    drop(listener);
+    if let Some(node) = node
+        && let Ok(node) = Arc::try_unwrap(node)
+    {
+        node.shutdown().await;
+    }
+    b.shared.update(|m| m.closed = true);
+}
+
+/// Resolves when the user ends the session (`stop` turns `true`).
+async fn stopped(stop: &watch::Receiver<bool>) {
+    let mut stop = stop.clone();
+    if stop.wait_for(|stopped| *stopped).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// `work`, unless the user ends the session first (`None`). Only for the
+/// steps before a session exists: once one does, `tor_cmd::watch` ends it with
+/// its goodbye.
+async fn unless_stopped<F: Future>(work: F, stop: &watch::Receiver<bool>) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        () = stopped(stop) => None,
+        done = work => Some(done),
+    }
+}
+
+/// View `id`: pair if it is new, ask for a session, then show its screen and
+/// send input if the host allowed control. Ends when the user stops or either
+/// side goes away; the window learns how it ended.
+async fn view_session(
+    b: Arc<Backend>,
+    node: Arc<TorNode>,
+    id: TornectId,
+    stop: watch::Receiver<bool>,
+) {
+    let ended = viewed(&b, &node, id, &stop).await;
+    b.link.set_input(None);
+    let message = match ended {
+        Ok(message) => message,
+        Err(e) => format!("{e:#}"),
+    };
+    say(format_args!("VIEWER: {message}"));
+    b.shared.update(|m| {
+        m.client = ClientStage::Ended(message.clone());
+        m.note(message);
+    });
+}
+
+async fn viewed(
+    b: &Backend,
+    node: &TorNode,
+    id: TornectId,
+    stop: &watch::Receiver<bool>,
+) -> anyhow::Result<String> {
+    b.shared.update(|m| {
+        m.client = ClientStage::Reaching {
+            id: id.display_groups(),
+        };
+    });
+    // One isolation group: the media stream rides the signaling circuit.
+    let isolation = Isolation::new();
+    let Some(stream) = unless_stopped(node.connect_on(&id, SIGNALING_PORT, &isolation), stop).await
+    else {
+        return Ok("Cancelled.".to_owned());
+    };
+    let stream = stream.map_err(explain)?;
+    let known = Arc::new(KnownHostStore::open(
+        tornect_core::trusted::known_hosts_file(&b.paths),
+    )?);
+    if known.get(&id).is_some() {
+        b.shared.update(|m| m.client = ClientStage::Asking);
+    }
+    let ccfg = ClientConfig::new(id, b.cfg.general.device_name.clone());
+    let deps = ClientDeps {
+        known_hosts: known,
+        ui: Arc::new(GuiPairingUi::new(Arc::clone(&b.popups))),
+        random: Arc::new(OsRandom),
+        // Consulted only by unattended sessions, which the window does not ask for.
+        server_key_pin: Arc::new(NoServerKeyPin),
+    };
+    let Some(outcome) = unless_stopped(
+        client::connect(stream, &ccfg, &b.device, &deps, Intent::Session),
+        stop,
+    )
+    .await
+    else {
+        return Ok("Cancelled before the session started.".to_owned());
+    };
+    let outcome = outcome.map_err(explain_handshake)?;
+    let ClientOutcome::Session(mut session) = outcome else {
+        anyhow::bail!("paired, but no session came of it");
+    };
+    // The input gate: the signed SESSION_ACCEPT's mode, never the media
+    // stream's BindOk (SLICE-C2 C2-6).
+    let control = matches!(
+        tornect_signal::consent::mode_from_code(session.accept().mode()),
+        Some(SessionMode::Control)
+    );
+    let host = session.host_label().to_owned();
+    say(format_args!(
+        "SESSION LIVE {} with \"{host}\" ({})",
+        session.session_token().session_id(),
+        if control { "control" } else { "view-only" }
+    ));
+    b.shared.update(|m| {
+        m.client = ClientStage::Live(Viewing {
+            host: host.clone(),
+            control,
+            since: Instant::now(),
+            pictures: 0,
+            size: (0, 0),
+        });
+    });
+    // Tor is the transport in the slice; saying so stops the host's orphan timer.
+    session
+        .send_tor_fallback()
+        .await
+        .map_err(explain_handshake)?;
+    let input = control.then(|| {
+        let (tx, rx) = mpsc::channel(INPUT_QUEUE);
+        b.link.set_input(Some(tx));
+        rx
+    });
+    let mut sink = SlotSink::new(Arc::clone(&b.link.slot), Arc::clone(&b.shared));
+    let end = crate::tor_cmd::watch(
+        node,
+        &id,
+        &isolation,
+        &mut session,
+        None,
+        stop,
+        input,
+        Some(&mut sink),
+    )
+    .await;
+    b.link.set_input(None);
+    Ok(match end? {
+        End::You => {
+            if let Err(e) = session.bye(bye::USER).await {
+                tracing::debug!(error = %e, "sending BYE");
+            }
+            format!("Session with \"{host}\" ended (by you).")
+        }
+        End::Host(reason) => {
+            format!("\"{host}\" ended the session ({}).", bye::name(reason))
+        }
+        End::Lost(e) => format!(
+            "The session with \"{host}\" was lost: {:#}",
+            explain_handshake(e)
+        ),
+        End::NoPicture(e) => {
+            if let Err(e) = session.bye(bye::USER).await {
+                tracing::debug!(error = %e, "sending BYE");
+            }
+            format!("No picture from \"{host}\": {e:#}")
+        }
+    })
+}

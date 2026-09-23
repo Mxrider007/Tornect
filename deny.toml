@@ -28,6 +28,12 @@ ignore = [
   { id = "RUSTSEC-2023-0071", reason = "direct dep of tor-llcrypto/tor-key-forge; Tornect only verifies RSA signatures (public key), never performs the private-key operations Marvin needs" },
   # `paste` is unmaintained; pulled transitively by dependencies at build time only.
   { id = "RUSTSEC-2024-0436", reason = "proc-macro helper used at build time by transitive dependencies; no runtime exposure" },
+  # `ttf-parser` is unmaintained, with no fixed version. The window pulls it only
+  # through winit's GNOME client-side decorations (`wayland-csd-adwaita`, the
+  # slice.md §0 pin: sctk-adwaita -> ab_glyph -> owned_ttf_parser), which draw
+  # the title bar's text from a local system font. No peer-supplied data reaches
+  # it; egui's own text uses skrifa. Dropping it means `wayland-csd-adwaita-notitle`.
+  { id = "RUSTSEC-2026-0192", reason = "reached only by winit's GNOME title-bar drawing of a local system font; no peer input" },
 ]
 
 [licenses]
@@ -61,6 +67,13 @@ allow = [
   "BlueOak-1.0.0",
 ]
 confidence-threshold = 0.8
+# egui's bundled fonts (`epaint_default_fonts`: Ubuntu-Light, Hack, Noto Emoji,
+# emoji-icon-font), compiled into the window as data. OFL-1.1 (OSI, FSF free)
+# and the Ubuntu Font Licence 1.0 (free; redistribution with software allowed)
+# cover those font files only, not Tornect's code.
+exceptions = [
+  { allow = ["OFL-1.1", "Ubuntu-font-1.0"], crate = "epaint_default_fonts" },
+]
 
 [bans]
 multiple-versions = "warn"
