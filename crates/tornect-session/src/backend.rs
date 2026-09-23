@@ -123,10 +123,11 @@ impl SystemBackend {
         match desktop_for(session.as_deref()) {
             Desktop::Wayland => self.wayland_injector(),
             // XTEST reaches only X11 clients under Xwayland, so input is
-            // injected only where capture shows the X11 desktop.
+            // injected only where capture shows the X11 desktop, and over the
+            // part of it the encoder sends (SLICE-C1 C1-2).
             Desktop::X11 if session.as_deref() == Some("x11") => {
                 match tornect_input::x11::XTestSink::connect() {
-                    Ok(sink) => Some(Box::new(sink)),
+                    Ok(sink) => Some(Box::new(sink.over(tornect_codec::encoded_size))),
                     Err(e) => {
                         tracing::warn!(error = %e, "XTEST is unavailable: the viewer's input is dropped");
                         None
@@ -190,8 +191,11 @@ impl SystemBackend {
         Ok(Box::new(tornect_capture::gdi::GdiCapture::open()?))
     }
 
+    /// Over the part of the virtual desktop the encoder sends (SLICE-C1 C1-2).
     fn desktop_injector(&self) -> Option<Box<dyn InputSink>> {
-        Some(Box::new(tornect_input::windows::SendInputSink::new()))
+        Some(Box::new(
+            tornect_input::windows::SendInputSink::new().over(tornect_codec::encoded_size),
+        ))
     }
 }
 

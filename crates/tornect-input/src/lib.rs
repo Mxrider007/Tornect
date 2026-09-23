@@ -313,6 +313,29 @@ impl WheelAccumulator {
     }
 }
 
+/// The part of a `width`×`height` screen the viewer sees, as the size of its
+/// top-left corner: the encoder's crop (`tornect_codec::encoded_size`), which
+/// the session layer passes in, since this crate does not see the codec.
+pub type Region = fn(u32, u32) -> (u32, u32);
+
+/// The whole screen: the [`Region`] of a picture that is not cropped.
+#[must_use]
+pub fn whole(width: u32, height: u32) -> (u32, u32) {
+    (width, height)
+}
+
+/// The pixel of a `size` screen that a position normalized over its visible
+/// `region` points at, so that the viewer's pointer covers what it sees and not
+/// a desktop wider than the encoder sends (SLICE-C1 C1-2).
+#[must_use]
+pub fn place(x: u16, y: u16, size: (u32, u32), region: Region) -> (u32, u32) {
+    let (width, height) = region(size.0, size.1);
+    (
+        denormalize(x, width.min(size.0)),
+        denormalize(y, height.min(size.1)),
+    )
+}
+
 /// Map a normalized `0..=65535` coordinate onto `0..size` pixels.
 #[must_use]
 pub fn denormalize(v: u16, size: u32) -> u32 {
@@ -477,6 +500,23 @@ mod tests {
         assert_eq!(acc.add(-250, 0), (-2, 0));
         assert_eq!(acc.add(-10, 0), (0, 0));
         assert_eq!(acc.add(-100, 0), (-1, 0));
+    }
+
+    #[test]
+    fn a_position_over_the_visible_region_lands_inside_it() {
+        let crop = |w: u32, h: u32| ((w & !1).min(3840), (h & !1).min(2160));
+        // Two 4K screens side by side: the viewer sees the left 3840x2160.
+        assert_eq!(place(65535, 65535, (7680, 2160), crop), (3839, 2159));
+        assert_eq!(place(0, 0, (7680, 2160), crop), (0, 0));
+        assert_eq!(place(32768, 0, (7680, 2160), crop), (1920, 0));
+        // An odd screen loses its last column and row, as the encoder does.
+        assert_eq!(place(65535, 65535, (1921, 1081), crop), (1919, 1079));
+        assert_eq!(place(65535, 65535, (1920, 1080), whole), (1919, 1079));
+        // A region larger than the screen is the screen.
+        assert_eq!(
+            place(65535, 65535, (800, 600), |_, _| (4000, 4000)),
+            (799, 599)
+        );
     }
 
     #[test]
