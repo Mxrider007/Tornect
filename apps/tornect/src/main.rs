@@ -407,11 +407,9 @@ fn cmd_doctor(paths: &Paths) -> anyhow::Result<()> {
         let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into());
         let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".into());
         println!("session: {session} ({desktop})");
-        if session != "wayland" {
-            println!(
-                "  note: Tornect v1 targets Wayland (X11 capture is out of scope, docs/PLAN.md §B.5)"
-            );
-        }
+    }
+    for line in tor_cmd::capture_lines(paths, &tornect_session::DesktopBackend::detect()) {
+        println!("{line}");
     }
     println!("directories:");
     for (name, dir) in paths.all() {

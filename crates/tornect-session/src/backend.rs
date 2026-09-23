@@ -225,6 +225,77 @@ fn session_type() -> Option<String> {
     std::env::var("XDG_SESSION_TYPE").ok()
 }
 
+/// The backend `Source::Desktop` would capture and inject with on this
+/// machine, found without opening anything: what `tornect doctor` reports and
+/// the host's banner says (SLICE-C3 C3-5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesktopBackend {
+    /// The RemoteDesktop portal and PipeWire.
+    Wayland,
+    /// The X11 grab and XTEST, on this machine's own display.
+    X11,
+    /// GDI and `SendInput`.
+    Gdi,
+    /// No desktop can be shared here, and why.
+    Unavailable(String),
+}
+
+impl DesktopBackend {
+    /// This machine's.
+    #[must_use]
+    pub fn detect() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            linux_backend(
+                session_type().as_deref(),
+                std::env::var("DISPLAY").ok().as_deref(),
+            )
+        }
+        #[cfg(windows)]
+        {
+            Self::Gdi
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            Self::Unavailable("this build has no screen capture for this OS yet".to_owned())
+        }
+    }
+
+    /// Its short name: `wayland`, `x11`, `gdi` or `none`.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Wayland => "wayland",
+            Self::X11 => "x11",
+            Self::Gdi => "gdi",
+            Self::Unavailable(_) => "none",
+        }
+    }
+}
+
+/// The same choices [`SystemBackend`] makes when it opens the desktop, and the
+/// same refusals, as a verdict.
+#[cfg(target_os = "linux")]
+fn linux_backend(session_type: Option<&str>, display: Option<&str>) -> DesktopBackend {
+    match desktop_for(session_type) {
+        Desktop::Wayland if cfg!(target_pointer_width = "64") => DesktopBackend::Wayland,
+        Desktop::Wayland => {
+            DesktopBackend::Unavailable("Wayland capture is built for 64-bit Linux only".to_owned())
+        }
+        Desktop::X11 if session_type != Some("x11") => DesktopBackend::Unavailable(format!(
+            "not a Wayland or X11 session (XDG_SESSION_TYPE={})",
+            session_type.unwrap_or("unset")
+        )),
+        Desktop::X11 if !tornect_capture::x11::display_is_local(display) => {
+            DesktopBackend::Unavailable(format!(
+                "DISPLAY={} is not this machine's own display",
+                display.unwrap_or("unset")
+            ))
+        }
+        Desktop::X11 => DesktopBackend::X11,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -252,6 +323,31 @@ mod tests {
         assert_eq!(desktop_for(Some("wayland")), Desktop::Wayland);
         for other in [Some("x11"), Some("tty"), Some(""), None] {
             assert_eq!(desktop_for(other), Desktop::X11, "{other:?}");
+        }
+    }
+
+    /// SLICE-C3 C3-5: what `doctor` and the banner name is what opening the
+    /// desktop would do, refusals included.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn the_desktop_backend_is_named_as_opening_it_would_go() {
+        assert_eq!(
+            linux_backend(Some("wayland"), Some(":0")),
+            DesktopBackend::Wayland
+        );
+        assert_eq!(linux_backend(Some("x11"), Some(":0")), DesktopBackend::X11);
+        for (session, display) in [
+            (Some("x11"), Some("localhost:10.0")),
+            (Some("x11"), None),
+            (Some("tty"), Some(":0")),
+            (None, Some(":0")),
+        ] {
+            let backend = linux_backend(session, display);
+            assert!(
+                matches!(&backend, DesktopBackend::Unavailable(why) if !why.is_empty()),
+                "{session:?} {display:?}: {backend:?}"
+            );
+            assert_eq!(backend.name(), "none");
         }
     }
 
