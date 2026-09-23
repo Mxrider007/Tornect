@@ -69,6 +69,30 @@ fn grab_shows_the_desktop(session_type: Option<&str>) -> bool {
     session_type == Some("x11")
 }
 
+/// Whether `display` (the value of `$DISPLAY`) names an X server on this
+/// machine, the one whose desktop "this desktop" means: `:N[.S]`, `unix:N`,
+/// `unix/:N` or a socket path. A host part is another machine's screen (SSH
+/// X forwarding sets `localhost:10.0`) or one reached over TCP, which must
+/// never be shared or driven as this desktop (SLICE-C3 C3-3).
+#[must_use]
+pub fn display_is_local(display: Option<&str>) -> bool {
+    let Some(display) = display else {
+        return false;
+    };
+    // A socket path, as launchd sets it (`/private/tmp/…/org.xquartz:0`).
+    if display.starts_with('/') {
+        return true;
+    }
+    let Some((host, number)) = display.rsplit_once(':') else {
+        return false;
+    };
+    let host = host.strip_prefix("unix/").unwrap_or(host);
+    let display_number = number.split('.').next().unwrap_or_default();
+    (host.is_empty() || host == "unix")
+        && !display_number.is_empty()
+        && display_number.bytes().all(|b| b.is_ascii_digit())
+}
+
 impl X11Capture {
     /// Connect to `$DISPLAY` and check that its root window is the one layout
     /// this reads without conversion: TrueColor, 32 bits per pixel, blue in the
@@ -79,6 +103,14 @@ impl X11Capture {
             return Err(unavailable(format!(
                 "not an X11 session (XDG_SESSION_TYPE={}): an X11 grab would show only X11 windows",
                 session.as_deref().unwrap_or("unset")
+            )));
+        }
+        let display = std::env::var("DISPLAY").ok();
+        if !display_is_local(display.as_deref()) {
+            return Err(unavailable(format!(
+                "DISPLAY={} is not this machine's own display (a host part means SSH X \
+                 forwarding or TCP): only the desktop Tornect runs on is shared",
+                display.as_deref().unwrap_or("unset")
             )));
         }
         Self::connect()
@@ -206,6 +238,40 @@ mod tests {
         assert_eq!(frame_bytes(1920, 1080).unwrap(), 1920 * 1080 * 4);
         // Eight 4K screens side by side still pass.
         assert_eq!(frame_bytes(30_720, 2160).unwrap(), 30_720 * 2160 * 4);
+    }
+
+    /// SLICE-C3 C3-3: a `DISPLAY` with a host part is another machine's screen
+    /// (SSH X forwarding sets `localhost:10.0`) or one reached over TCP, and is
+    /// never shared or driven as this desktop.
+    #[test]
+    fn only_this_machines_own_display_is_the_desktop() {
+        for local in [
+            ":0",
+            ":1",
+            ":0.0",
+            ":12.1",
+            "unix:0",
+            "unix/:0",
+            "/private/tmp/launchd-1/org.x:0",
+        ] {
+            assert!(display_is_local(Some(local)), "{local}");
+        }
+        for remote in [
+            "localhost:10.0",
+            "127.0.0.1:0",
+            "desk.example:0",
+            "tcp/localhost:0",
+            "tcp/:0",
+            "[::1]:0",
+            "host::0",
+            "",
+            ":",
+            ":x",
+            "0",
+        ] {
+            assert!(!display_is_local(Some(remote)), "{remote}");
+        }
+        assert!(!display_is_local(None));
     }
 
     #[test]
