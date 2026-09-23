@@ -50,7 +50,7 @@ cargo run -p tornect -- id         # M0 acceptance: prints this machine's Tornec
 cargo run -p tornect -- doctor     # environment report
 TORNECT_HOME=$PWD/target/tornect-test/h1 cargo run -p tornect -- host          # M1: publish onion service; answer pings, pairing and sessions (asked on this terminal)
 TORNECT_HOME=$PWD/target/tornect-test/h2 cargo run -p tornect -- ping <id> --count 5   # M1: second isolated instance, pairing-free liveness check
-TORNECT_HOME=$PWD/target/tornect-test/h1 cargo run -p tornect -- host --capture test-card   # slice: share the synthetic test card (this VM's Wayland desktop has no capture backend yet)
+TORNECT_HOME=$PWD/target/tornect-test/h1 cargo run -p tornect -- host --capture test-card   # slice: share the synthetic test card (`--capture desktop` shares this VM's Wayland desktop through the portal; the desktop asks once)
 TORNECT_HOME=$PWD/target/tornect-test/h2 cargo run -p tornect -- connect <id>          # M1: pair (compare the code) → host accepts → session + media stream (MEDIA lines); --pings N, --pair-only, --forget, --no-video
 TORNECT_HOME=$PWD/target/tornect-test/h1 cargo run -p tornect -- panic                 # ends every session the running host serves
 cargo test -p tornect-signal --test live -- --ignored --nocapture              # M1: host+client roundtrip over live Tor

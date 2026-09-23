@@ -125,17 +125,17 @@ fn describe_source(source: Source) -> String {
         Source::TestCard => {
             "sharing: a synthetic test card (no desktop; viewers' input goes nowhere)".to_owned()
         }
-        Source::Desktop if wayland_without_capture() => {
-            "sharing: nothing yet. This is a Wayland session and Wayland capture is not built \
-             yet, so sessions connect but no picture can be shared; `--capture test-card` \
-             shares a test card instead"
+        Source::Desktop if wayland_session() => {
+            "sharing: this desktop, through the desktop's screen-sharing portal. When a viewer's \
+             picture starts, the desktop asks whether to share the screen and allow remote \
+             control, unless it was allowed before and remembered"
                 .to_owned()
         }
         Source::Desktop => "sharing: this desktop".to_owned(),
     }
 }
 
-fn wayland_without_capture() -> bool {
+fn wayland_session() -> bool {
     cfg!(target_os = "linux")
         && std::env::var("XDG_SESSION_TYPE").is_ok_and(|session| session == "wayland")
 }
@@ -236,7 +236,7 @@ async fn run_host(
     };
     let control = ControlChannel::default();
     let media = Arc::new(MediaHost::new(
-        Arc::new(SystemBackend::new(source)),
+        Arc::new(SystemBackend::new(source).with_restore_token(paths.portal_restore_token())),
         Arc::new(CliMedia::new(control.clone())),
         MediaLimits::default(),
     ));
