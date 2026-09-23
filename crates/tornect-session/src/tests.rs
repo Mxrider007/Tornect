@@ -431,6 +431,90 @@ async fn control_input_is_capped_and_released_when_the_session_is_killed() {
     assert_eq!(rig.host.live(), 0);
 }
 
+/// SLICE-C1 C1-3: a key held by a control viewer that goes quiet is released
+/// while the session goes on. Its network may be gone without a word, and X11
+/// repeats a held key until the session ends at the 90 s idle timeout; before,
+/// only the end of the session released it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_held_by_a_viewer_that_goes_quiet_is_released() {
+    let rig = rig(MediaLimits {
+        viewer_quiet: Duration::from_millis(300),
+        ..MediaLimits::default()
+    });
+    let (session_id, binding) = start(&rig.host, 4, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    let press = InputEvent::Key {
+        usb: KEY_A,
+        pressed: true,
+    };
+    let release = InputEvent::Key {
+        usb: KEY_A,
+        pressed: false,
+    };
+    write_msg(&mut client, &Msg::Input(press.encode()))
+        .await
+        .unwrap();
+    // Nothing more from the viewer: no ack, no input, no ping.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !rig.backend.recorder.events().contains(&release) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the held key was never released: {:?}",
+            rig.backend.recorder.events()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!served.is_finished(), "released, and the session goes on");
+    assert_eq!(rig.backend.recorder.events(), [press, release]);
+
+    // A viewer that speaks again is injected again.
+    write_msg(&mut client, &Msg::Input(press.encode()))
+        .await
+        .unwrap();
+    sync(&mut client, 1).await;
+    assert_eq!(rig.backend.recorder.events(), [press, release, press]);
+    rig.host
+        .on_end(&session_id, Some(&SessionEnd::Killed(bye::PANIC)));
+    assert_eq!(until_close(&mut client).await, Some(reason::ENDED_BY_HOST));
+    assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
+}
+
+/// SLICE-C1 C1-3: a viewer with nothing else to say pings, so that the host can
+/// tell a quiet viewer from a gone one, also when the host's screen is still
+/// and no picture needs acknowledging.
+#[tokio::test(start_paused = true)]
+async fn a_viewer_with_nothing_to_say_pings_the_host() {
+    let binding = Binding::new(&SessionToken::new([6; 32]), &[6; 32]);
+    let (client, mut host) = duplex(1 << 16);
+    let bound = tokio::spawn(async move {
+        let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
+        let (mut sink, mut stats) = (NoPictures, ViewerStats::default());
+        viewer
+            .run(&mut sink, &mut stats, std::future::pending())
+            .await
+    });
+    assert!(matches!(
+        read_msg(&mut host).await.unwrap(),
+        Some(Msg::Bind { .. })
+    ));
+    let bind_ok = Msg::BindOk {
+        width: 1280,
+        height: 720,
+        codec: codec::H264,
+        mode: 0,
+    };
+    write_msg(&mut host, &bind_ok).await.unwrap();
+    let start = tokio::time::Instant::now();
+    let first = tokio::time::timeout(Duration::from_secs(5), read_msg(&mut host))
+        .await
+        .expect("the viewer said nothing for 5 s");
+    assert!(matches!(first, Ok(Some(Msg::Ping { .. }))), "{first:?}");
+    assert!(start.elapsed() <= Duration::from_secs(1));
+    drop(host);
+    let _ = bound.await;
+}
+
 /// SLICE-B1 B1-2: a kill stops capture at once, before the FSM has finished its
 /// `BYE` (here, before `on_end` is called at all), and a killed session that
 /// has not bound its media yet cannot bind it.
