@@ -124,8 +124,16 @@ impl SystemBackend {
             Desktop::Wayland => self.wayland_injector(),
             // XTEST reaches only X11 clients under Xwayland, so input is
             // injected only where capture shows the X11 desktop, and over the
-            // part of it the encoder sends (SLICE-C1 C1-2).
+            // part of it the encoder sends (SLICE-C1 C1-2); never into another
+            // machine's display (SLICE-C3 C3-3).
             Desktop::X11 if session.as_deref() == Some("x11") => {
+                let display = std::env::var("DISPLAY").ok();
+                if !tornect_capture::x11::display_is_local(display.as_deref()) {
+                    tracing::warn!(
+                        "DISPLAY is not this machine's own display: the viewer's input is dropped"
+                    );
+                    return None;
+                }
                 match tornect_input::x11::XTestSink::connect() {
                     Ok(sink) => Some(Box::new(sink.over(tornect_codec::encoded_size))),
                     Err(e) => {
