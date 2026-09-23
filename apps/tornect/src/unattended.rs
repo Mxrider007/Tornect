@@ -598,7 +598,11 @@ fn reauth_backend() -> Arc<dyn tornect_core::unattended::guard::ReAuth> {
     {
         Arc::new(tornect_platform::reauth::PolkitReAuth::new())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        Arc::new(tornect_platform::reauth::WindowsReAuth::new())
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         Arc::new(tornect_platform::reauth::RefuseReAuth)
     }
