@@ -241,11 +241,18 @@ impl App {
         let _ = self.commands.send(command);
     }
 
+    /// Close the stream window, and forget a picture it never drew, so that
+    /// the next session's window cannot show it (SLICE-E E1-3).
+    fn close_stream(&mut self) {
+        self.stream = None;
+        self.link.slot.clear();
+    }
+
     fn quit(&mut self, el: &ActiveEventLoop) {
         if self.quit_at.is_none() {
             self.quit_at = Some(Instant::now());
             self.command(Command::Quit);
-            self.stream = None;
+            self.close_stream();
             self.shared
                 .update(|m| m.note("closing: ending sessions and leaving Tor…"));
         }
@@ -262,7 +269,7 @@ impl App {
         });
         match live {
             None => {
-                self.stream = None;
+                self.close_stream();
                 self.stream_dismissed = false;
             }
             Some(_) if self.stream.is_some() || self.stream_dismissed || self.quit_at.is_some() => {
@@ -509,7 +516,7 @@ impl App {
             WindowEvent::CloseRequested => {
                 // Closing the window ends the session, with its goodbye.
                 self.command(Command::EndViewing);
-                self.stream = None;
+                self.close_stream();
                 self.stream_dismissed = true;
                 return;
             }
