@@ -22,15 +22,19 @@
 //! other.
 
 use std::fmt;
+#[cfg(unix)]
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(unix)]
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tornect_core::unattended::ipc::{IpcRequest, IpcResponse, MAX_FRAME};
+#[cfg(unix)]
 use tornect_core::unattended::ipc::{
-    IpcRequest, IpcResponse, MAX_FRAME, decode_request, decode_response, encode_request,
-    encode_response,
+    decode_request, decode_response, encode_request, encode_response,
 };
+#[cfg(unix)]
 use zeroize::Zeroizing;
 
 /// File name of the Unix endpoint inside the state directory.
@@ -158,11 +162,12 @@ pub fn pipe_name(state_dir: &Path) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// framing
+// framing (Unix only until the Windows named pipe lands at M6)
 // ---------------------------------------------------------------------------
 
 /// One frame. Wiped on drop: frames carry `On`'s stop code and the
 /// registration's OPAQUE messages (§B.8.7.2, A14).
+#[cfg(unix)]
 async fn read_frame<R: AsyncRead + Unpin>(
     r: &mut R,
 ) -> Result<Option<Zeroizing<Vec<u8>>>, IpcError> {
@@ -197,6 +202,7 @@ async fn read_frame<R: AsyncRead + Unpin>(
     Ok(Some(buf))
 }
 
+#[cfg(unix)]
 async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> Result<(), IpcError> {
     let len = payload.len();
     if len > MAX_FRAME {
@@ -209,6 +215,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> Result
     Ok(())
 }
 
+#[cfg(unix)]
 async fn with_idle_timeout<T>(
     fut: impl Future<Output = Result<T, IpcError>>,
 ) -> Result<T, IpcError> {
