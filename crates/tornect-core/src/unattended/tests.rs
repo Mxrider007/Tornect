@@ -2006,7 +2006,10 @@ fn a14_debug_output_redacts_secrets_and_the_disk_never_holds_plaintext() {
     assert!(!dbg_store.contains(&upload_hex));
     assert!(!dbg_store.contains("171, 171"));
     let dbg_grant = format!("{:?}", store.grant(&d).unwrap());
-    assert!(!dbg_grant.contains("171"));
+    // The record's bytes (0xAB = 171), in list or hex form; not a bare "171", which the
+    // grant's random id, printed in hex, holds in about 1 run in 300.
+    assert!(!dbg_grant.contains("171, 171"));
+    assert!(!dbg_grant.contains(&upload_hex));
     assert!(dbg_grant.contains("<192 bytes>"));
     assert!(!format!("{store:?}").contains(&setup_hex));
     assert!(!format!("{guard:?}").contains(&setup_hex));
