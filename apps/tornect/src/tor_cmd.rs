@@ -22,8 +22,8 @@ use tornect_core::session_log::SessionMode;
 use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
 use tornect_proto::ProtoError;
 use tornect_session::{
-    Binding, FrameSink, MediaHost, MediaLimits, MediaViewer, Source, SystemBackend, ViewerEnd,
-    ViewerError, ViewerStats,
+    Binding, DesktopBackend, FrameSink, MediaHost, MediaLimits, MediaViewer, Source, SystemBackend,
+    ViewerEnd, ViewerError, ViewerStats,
 };
 use tornect_signal::framing::FrameError;
 use tornect_signal::fsm::client::{
@@ -120,25 +120,40 @@ pub fn host(
     ))
 }
 
-/// What `tornect host` says it will share, before any session asks.
-fn describe_source(source: Source) -> String {
-    match source {
-        Source::TestCard => {
+/// What `tornect host` says it will share, before any session asks: only a
+/// desktop that `desktop` can capture is "this desktop" (SLICE-C3 C3-5).
+fn describe_source(source: Source, desktop: &DesktopBackend) -> String {
+    match (source, desktop) {
+        (Source::TestCard, _) => {
             "sharing: a synthetic test card (no desktop; viewers' input goes nowhere)".to_owned()
         }
-        Source::Desktop if wayland_session() => {
+        (Source::Desktop, DesktopBackend::Wayland) => {
             "sharing: this desktop, through the desktop's screen-sharing portal. When a viewer's \
              picture starts, the desktop asks whether to share the screen and allow remote \
              control, unless it was allowed before and remembered"
                 .to_owned()
         }
-        Source::Desktop => "sharing: this desktop".to_owned(),
+        (Source::Desktop, DesktopBackend::X11) => "sharing: this desktop (X11)".to_owned(),
+        (Source::Desktop, DesktopBackend::Gdi) => "sharing: this desktop".to_owned(),
+        (Source::Desktop, DesktopBackend::Unavailable(why)) => format!(
+            "sharing: nothing: this desktop cannot be captured here ({why}), so a viewer gets \
+             no picture; `--capture test-card` shares a synthetic card instead"
+        ),
     }
 }
 
-fn wayland_session() -> bool {
-    cfg!(target_os = "linux")
-        && std::env::var("XDG_SESSION_TYPE").is_ok_and(|session| session == "wayland")
+/// `tornect doctor`'s lines about capture: the backend a host would share its
+/// desktop with here (SLICE-C3 C3-5).
+pub(crate) fn capture_lines(_paths: &Paths, desktop: &DesktopBackend) -> Vec<String> {
+    let lines = vec![match desktop {
+        DesktopBackend::Wayland => {
+            "capture: wayland (the RemoteDesktop portal and PipeWire)".to_owned()
+        }
+        DesktopBackend::X11 => "capture: x11 (the X11 grab and XTEST)".to_owned(),
+        DesktopBackend::Gdi => "capture: gdi (GDI and SendInput)".to_owned(),
+        DesktopBackend::Unavailable(why) => format!("capture: none ({why})"),
+    }];
+    lines
 }
 
 /// `tornect tor-check [--bridges …]`: reach the Tor network the way `host` and
@@ -259,7 +274,7 @@ async fn run_host(
     // A kill ends every session's media at once, without waiting for the FSM's
     // `BYE` to a peer that may not be reading (SLICE-B1 B1-2).
     let kill_watch = media.watch_kill(deps.kill.clone());
-    eprintln!("{}", describe_source(source));
+    eprintln!("{}", describe_source(source, &DesktopBackend::detect()));
 
     // The §B.8.7.4 control channel, bound **before** Tor. A running host owns the
     // endpoint and the store's advisory lock, so `tornect unattended …` in
@@ -1377,6 +1392,37 @@ mod tests {
             "{end:?}"
         );
         host.await.unwrap().unwrap();
+    }
+
+    /// SLICE-C3 C3-5: the banner says "this desktop" only where a desktop can
+    /// be captured, and otherwise says that nothing will be, and why.
+    #[test]
+    fn the_banner_names_only_a_desktop_that_can_be_shared() {
+        let why = "not a Wayland or X11 session (XDG_SESSION_TYPE=tty)";
+        let refused = describe_source(
+            Source::Desktop,
+            &DesktopBackend::Unavailable(why.to_owned()),
+        );
+        assert!(refused.starts_with("sharing: nothing"), "{refused}");
+        assert!(refused.contains(why), "{refused}");
+        assert!(describe_source(Source::Desktop, &DesktopBackend::X11).contains("X11"));
+        assert!(describe_source(Source::Desktop, &DesktopBackend::Wayland).contains("portal"));
+        let card = describe_source(Source::TestCard, &DesktopBackend::Unavailable(why.into()));
+        assert!(card.contains("test card"), "{card}");
+    }
+
+    /// SLICE-C3 C3-5: `doctor` names the backend truthfully.
+    #[test]
+    fn doctor_names_the_capture_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        let wayland = capture_lines(&paths, &DesktopBackend::Wayland).join("\n");
+        assert!(wayland.contains("capture: wayland"), "{wayland}");
+        let x11 = capture_lines(&paths, &DesktopBackend::X11).join("\n");
+        assert!(x11.contains("capture: x11"), "{x11}");
+        assert!(!x11.contains("out of scope"), "{x11}");
+        let none = capture_lines(&paths, &DesktopBackend::Unavailable("no seat".into())).join("\n");
+        assert!(none.contains("capture: none (no seat)"), "{none}");
     }
 
     /// SLICE-B2 B2-8 and C2-2: leaving never waits on a host that stops
