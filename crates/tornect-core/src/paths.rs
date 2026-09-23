@@ -158,6 +158,15 @@ impl Paths {
         self.state_dir.join("hosts.toml")
     }
 
+    /// The restore token of the Wayland screen-sharing portal (RemoteDesktop,
+    /// persisted "until revoked"). With it, a later session shares the screen
+    /// and takes input without the desktop asking again, so it is a 0600 file
+    /// here and never logged; deleting it makes the desktop ask again.
+    #[must_use]
+    pub fn portal_restore_token(&self) -> PathBuf {
+        self.state_dir.join("portal-restore-token")
+    }
+
     /// Append-only local audit log of session events.
     #[must_use]
     pub fn sessions_log(&self) -> PathBuf {
@@ -221,6 +230,10 @@ mod tests {
         assert_eq!(
             p.sessions_log(),
             PathBuf::from("/tmp/tornect-test/logs/sessions.log")
+        );
+        assert_eq!(
+            p.portal_restore_token(),
+            PathBuf::from("/tmp/tornect-test/state/portal-restore-token")
         );
         assert_eq!(
             p.arti_cache_dir(),
