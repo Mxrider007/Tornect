@@ -121,6 +121,11 @@ pub trait MediaBackend: Send + Sync {
     /// `None` when this host cannot inject there (the viewer's input is then
     /// dropped). A view-only session never calls this.
     fn open_injector(&self) -> Option<Box<dyn InputSink>>;
+
+    /// The source just opened is for a view-only session: let go of anything
+    /// kept for building its injector, so that no path can reach the desktop's
+    /// input for it. The default keeps nothing.
+    fn view_only(&self) {}
 }
 
 /// Where the host reports capture starting and stopping. This is the source
@@ -450,6 +455,12 @@ impl MediaHost {
                 return not_started(&mut wr, MediaEnd::Pipeline(reason::CAPTURE_FAILED)).await;
             }
         };
+        // A view-only session never asks for an injector (below); the backend
+        // also lets go of what one could be built from, as soon as the source
+        // that came with it is open.
+        if !matches!(mode, SessionMode::Control) {
+            self.backend.view_only();
+        }
         let source_name = source.name();
         let mut pipeline = Pipeline::start(source, self.limits.encoder, self.limits.window_frames);
         pipeline.credit();
