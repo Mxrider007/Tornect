@@ -1,9 +1,11 @@
 //! The manual winit loop (`docs/research/slice.md` §2, decision D10): one
-//! event loop on the main thread and two kinds of window, each an egui context
-//! with its own egui-winit state and egui-wgpu painter. The stream window's
-//! painter runs on the main window's wgpu device. Never eframe: the stream
-//! window reads `WindowEvent::KeyboardInput` itself, before egui, which drops
-//! the keys it has no name for.
+//! event loop on the main thread and three kinds of window, each an egui
+//! context with its own egui-winit state and egui-wgpu painter: the main
+//! window, the stream window of a viewed session, and the sharing indicator
+//! (`indicator`) while this screen is shared. The other two paint on the main
+//! window's wgpu device. Never eframe: the stream window reads
+//! `WindowEvent::KeyboardInput` itself, before egui, which drops the keys it
+//! has no name for.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -21,6 +23,7 @@ use winit::window::{UserAttentionType, Window, WindowAttributes, WindowId};
 
 use super::backend::{Command, StreamLink};
 use super::consent::Popups;
+use super::indicator::{self, Change, Indicator};
 use super::keys;
 use super::model::{ClientStage, Shared, Wake};
 use super::stream::{Forwarder, Picture, PictureRect, VideoTexture, button};
@@ -136,7 +139,8 @@ struct StreamView {
 }
 
 /// The application: the main window, the stream window while a session is
-/// viewed, and the channels to the tokio side.
+/// viewed, the indicator window while this screen is shared, and the channels
+/// to the tokio side.
 pub struct App {
     shared: Arc<Shared>,
     popups: Arc<Popups>,
@@ -144,6 +148,10 @@ pub struct App {
     commands: mpsc::UnboundedSender<Command>,
     main: Option<Surface>,
     stream: Option<StreamView>,
+    /// The indicator window, while this screen is shared.
+    indicator: Option<Surface>,
+    /// Whether the indicator should be up, and what it shows.
+    shown: Indicator,
     /// The user closed the stream window of the session still in the model.
     stream_dismissed: bool,
     form: Form,
@@ -175,6 +183,8 @@ impl App {
             commands,
             main: None,
             stream: None,
+            indicator: None,
+            shown: Indicator::default(),
             stream_dismissed: false,
             form: Form::default(),
             quit_at: None,
@@ -217,22 +227,7 @@ impl App {
             Some(_) if self.stream.is_some() || self.stream_dismissed || self.quit_at.is_some() => {
             }
             Some((host, control)) => {
-                // The same wgpu device as the main window.
-                let setup = self
-                    .main
-                    .as_ref()
-                    .and_then(|m| m.painter.render_state())
-                    .map_or_else(
-                        || WgpuSetup::from_display_handle(el.owned_display_handle()),
-                        |rs| {
-                            WgpuSetup::Existing(WgpuSetupExisting {
-                                instance: rs.instance.clone(),
-                                adapter: rs.adapter.clone(),
-                                device: rs.device.clone(),
-                                queue: rs.queue.clone(),
-                            })
-                        },
-                    );
+                let setup = self.main_device(el);
                 // The title is the host's pinned label, never its onion
                 // address (UI_PLAN §8: privacy on screen shares).
                 let mut attrs = Window::default_attributes()
@@ -261,6 +256,97 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// The main window's wgpu device, for another window to paint on.
+    fn main_device(&self, el: &ActiveEventLoop) -> WgpuSetup {
+        self.main
+            .as_ref()
+            .and_then(|m| m.painter.render_state())
+            .map_or_else(
+                || WgpuSetup::from_display_handle(el.owned_display_handle()),
+                |rs| {
+                    WgpuSetup::Existing(WgpuSetupExisting {
+                        instance: rs.instance.clone(),
+                        adapter: rs.adapter.clone(),
+                        device: rs.device.clone(),
+                        queue: rs.queue.clone(),
+                    })
+                },
+            )
+    }
+
+    /// Open the indicator window at the first shared session, redraw it on a
+    /// change, close it at the last end.
+    fn sync_indicator(&mut self, el: &ActiveEventLoop) {
+        let sharing = self.shared.read(|m| m.sharing.clone());
+        match self.shown.sync(&sharing) {
+            Change::Keep => {}
+            Change::Open => {
+                let rows = self.shown.rows();
+                // Top-right of the primary monitor where the desktop has one
+                // and lets a client place its window (not Wayland).
+                let position = el
+                    .primary_monitor()
+                    .or_else(|| el.available_monitors().next())
+                    .map(|m| {
+                        indicator::top_right(
+                            m.position(),
+                            m.size(),
+                            m.scale_factor(),
+                            indicator::size(rows),
+                        )
+                    });
+                let setup = self.main_device(el);
+                match Surface::new(el, indicator::attributes(rows, position), setup) {
+                    Ok(surface) => self.indicator = Some(surface),
+                    Err(e) => {
+                        // The banner in the main window still shows the
+                        // session; the next session tries again.
+                        let line = format!("the sharing indicator did not open: {e:#}");
+                        tracing::warn!("{line}");
+                        self.shared.update(|m| m.note(line));
+                    }
+                }
+            }
+            Change::Redraw => {
+                if let Some(surface) = &self.indicator {
+                    let _ = surface
+                        .window
+                        .request_inner_size(indicator::size(self.shown.rows()));
+                    surface.window.request_redraw();
+                }
+            }
+            Change::Close => self.indicator = None,
+        }
+    }
+
+    fn draw_indicator(&mut self) {
+        let Some(surface) = &mut self.indicator else {
+            return;
+        };
+        let sharing = self.shared.read(|m| m.sharing.clone());
+        let mut actions = Vec::new();
+        surface.paint(|ui| view::indicator(ui, &sharing, Instant::now(), &mut actions));
+        for action in actions {
+            self.act(action, None);
+        }
+    }
+
+    fn indicator_event(&mut self, event: &WindowEvent) {
+        let Some(surface) = &mut self.indicator else {
+            return;
+        };
+        match event {
+            // It stays up while the screen is shared (§B.6 "always"): Stop
+            // ends the sharing, and the window goes with it.
+            WindowEvent::CloseRequested => {
+                tracing::debug!("the sharing indicator stays up while this screen is shared");
+            }
+            WindowEvent::RedrawRequested => self.draw_indicator(),
+            WindowEvent::Resized(size) => surface.resized(size.width, size.height),
+            _ => surface.on_event(event),
         }
     }
 
@@ -318,6 +404,13 @@ impl App {
         match action {
             Action::Connect(id) => self.command(Command::Connect(id)),
             Action::StopSharing => self.command(Command::StopSharing),
+            Action::MoveIndicator => {
+                if let Some(surface) = &self.indicator
+                    && let Err(e) = surface.window.drag_window()
+                {
+                    tracing::debug!(error = %e, "moving the sharing indicator");
+                }
+            }
             Action::EndViewing => self.command(Command::EndViewing),
             Action::Grant => self.command(Command::Grant),
             Action::Revoke => self.command(Command::Revoke),
@@ -438,7 +531,10 @@ impl ApplicationHandler<UserEvent> for App {
             attrs,
             WgpuSetup::from_display_handle(el.owned_display_handle()),
         ) {
-            Ok(surface) => self.main = Some(surface),
+            Ok(surface) => {
+                self.main = Some(surface);
+                self.sync_indicator(el);
+            }
             Err(e) => {
                 self.error = Some(e.context("opening the Tornect window"));
                 // Nothing can be shown: shut the tokio side down and leave.
@@ -461,6 +557,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.quit(el);
                 }
                 self.sync_stream(el);
+                self.sync_indicator(el);
                 if let Some(main) = &self.main {
                     if why == Wake::Attention {
                         // A popup or a session: in front of the user, as far
@@ -475,6 +572,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(view) = &self.stream {
                     view.surface.window.request_redraw();
                 }
+                if let Some(surface) = &self.indicator {
+                    surface.window.request_redraw();
+                }
             }
         }
     }
@@ -486,6 +586,10 @@ impl ApplicationHandler<UserEvent> for App {
             .is_some_and(|v| v.surface.window.id() == id)
         {
             self.stream_event(event);
+            return;
+        }
+        if self.indicator.as_ref().is_some_and(|s| s.window.id() == id) {
+            self.indicator_event(&event);
             return;
         }
         let Some(main) = &mut self.main else { return };
@@ -534,6 +638,7 @@ impl ApplicationHandler<UserEvent> for App {
         for surface in [
             self.main.as_mut(),
             self.stream.as_mut().map(|v| &mut v.surface),
+            self.indicator.as_mut(),
         ]
         .into_iter()
         .flatten()
@@ -551,5 +656,29 @@ impl ApplicationHandler<UserEvent> for App {
             Some(at) => ControlFlow::WaitUntil(at),
             None => ControlFlow::Wait,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    use super::super::model::Model;
+    use super::*;
+
+    /// The indicator's Stop asks the tokio side to stop sharing, as the
+    /// banner's does, and nothing else; moving it with no window up does
+    /// nothing.
+    #[test]
+    fn the_indicators_stop_asks_to_stop_sharing() {
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let popups = Popups::new(Arc::clone(&shared));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(shared, popups, Arc::new(StreamLink::default()), tx);
+        app.act(Action::StopSharing, None);
+        assert_eq!(rx.try_recv(), Ok(Command::StopSharing));
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        app.act(Action::MoveIndicator, None);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 }
