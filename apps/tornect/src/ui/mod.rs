@@ -145,6 +145,9 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
     ));
 
     let mut app = App::new(shared, popups, link, commands);
+    if !opts.host {
+        app.title = "Tornect (connect only)";
+    }
     let ran = event_loop.run_app(&mut app);
     // Arti's final state flush happens as its runtime shuts down.
     shutdown_runtime(runtime);

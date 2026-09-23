@@ -151,6 +151,9 @@ pub struct App {
     /// Where the stream window opens (the preview puts it beside the main
     /// window; otherwise the desktop places it).
     pub stream_at: Option<(i32, i32)>,
+    /// The main window's title: a connect-only instance says so, so that two
+    /// instances on one desktop can be told apart.
+    pub title: &'static str,
     /// Why the window could not run.
     pub error: Option<anyhow::Error>,
 }
@@ -176,6 +179,7 @@ impl App {
             form: Form::default(),
             quit_at: None,
             stream_at: None,
+            title: "Tornect",
             error: None,
         }
     }
@@ -427,7 +431,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("Tornect")
+            .with_title(self.title)
             .with_inner_size(LogicalSize::new(560.0, 720.0));
         match Surface::new(
             el,
