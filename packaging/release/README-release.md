@@ -1,0 +1,144 @@
+# Tornect: a pre-release build (the vertical slice)
+
+Tornect shares one computer's screen with another over Tor. A computer's
+Tornect ID is its Tor onion address, so it needs no server, no account and no
+port forwarding. This is a **pre-release** for testing between two machines
+you control, one Linux and one Windows. No one has audited it: do not rely on it
+to protect anything yet. It collects no telemetry.
+
+## What is in this zip
+
+| File | What it is |
+|---|---|
+| `tornect` (`tornect.exe` on Windows) | the program: the window, and the command line |
+| `pt/lyrebird` (`pt/lyrebird.exe`) | lyrebird 0.8.1, the Tor Project's pluggable transport for obfs4 and Snowflake bridges, unmodified from Tor Browser 15.0.23 |
+| `pt/lyrebird.txt` | lyrebird's licences |
+| `LICENSE` | Tornect's licence, GPL-3.0-or-later |
+| `THIRD_PARTY_NOTICES.md` | what else Tornect contains, and under which licences |
+| `BUILD-INFO.txt` | the commit, toolchain and flags of this build, and each file's SHA-256 |
+
+Keep `pt/` next to the program. Tornect needs lyrebird only when Tor is blocked
+where you are, and it runs the copy in `pt/` only if its SHA-256 is the one
+compiled into Tornect.
+
+## Check the download first
+
+The release page lists each zip's SHA-256 in `SHA256SUMS`. With the zip and
+`SHA256SUMS` in one folder:
+
+    sha256sum --ignore-missing -c SHA256SUMS                  (Linux)
+    Get-FileHash .\tornect-<version>-windows-x86_64.zip       (Windows PowerShell)
+
+`sha256sum` must print `OK`; on Windows, compare the hash it prints with the
+line in `SHA256SUMS`. Neither the zips nor the programs are signed.
+
+## Linux
+
+You need x86_64 Linux with **glibc 2.43 or newer** (`ldd --version` shows yours;
+Ubuntu 26.04 and Fedora 44 have it, Ubuntu 24.04 and Debian 13 do not: there
+this build stops at once with "version `GLIBC_2.43' not found"; `BUILD-INFO.txt`
+names the exact versions). The window needs a Vulkan or OpenGL driver. To share this desktop
+you need either a Wayland session with xdg-desktop-portal 1.17 or newer and
+PipeWire (GNOME is the tested one), or an X11 session.
+
+    unzip tornect-<version>-linux-x86_64.zip
+    cd tornect-<version>-linux-x86_64
+    ./tornect doctor
+
+`tornect doctor` reports the session type, how this desktop would be shared,
+Tornect's directories, and on the `tor:` line the lyrebird it found: that must
+be `…/pt/lyrebird`. If the line says `UNAVAILABLE`, see the reason it gives. A
+tool that did not keep the file modes needs `chmod 755 tornect pt/lyrebird`,
+and Tornect refuses a lyrebird that other users can write to.
+
+**The window:** `./tornect` with nothing after it. It shows this machine's
+Tornect ID (give it to the other person over a channel you trust) and whether
+Tor is connected, which takes from a few seconds to a few minutes. To reach the
+other machine, paste its Tornect ID and press Connect. The first time, both
+screens show the same code: compare them (by phone, say), then press "Yes, the
+codes match" on the side that connects and "The codes match: pair" on the side
+that shares. The sharing side then asks "Allow control", "View only" or "Deny".
+The picture opens in its own window; "End the session" or closing that window
+ends it. While your screen is shared, a banner and a small "Tornect: sharing"
+window show it, each with **Stop**. `./tornect gui --no-host` only connects to
+others, publishing no ID and answering no one.
+
+**The command line** does the same, one role per terminal:
+
+    ./tornect host              # share this desktop; answer pairing and session questions here
+    ./tornect connect <ID>      # connect to a host; compare the code, then wait for its answer
+    ./tornect ping <ID>         # is that host reachable over Tor? (no pairing needed)
+    ./tornect panic             # end every session the running host serves
+
+`tornect host` prints `Tornect ID: …` at once and `REACHABLE` once the address
+is published, typically one to a few minutes later. For a new device it shows
+the code and asks you to type `yes` if it matches the other screen; for each
+session it asks for `a` (allow control) or `v` (view only). Anything else, or no
+answer within 60 s, refuses.
+`tornect connect` shows no picture (use the window for that): it pairs, asks for
+the session and reports what it receives until Ctrl-C. `--capture test-card`
+(for `host` and `gui`) shares a synthetic picture instead of the desktop.
+`./tornect --help` lists everything, including `--bridges`, `tor-check`,
+`devices` and `paths`.
+
+**Sharing a Wayland desktop: the grant.** On Wayland, the desktop, not
+Tornect, decides what may be shared. The first time, GNOME shows its
+screen-sharing dialog: pick the screen and turn on **Allow Remote Interaction**
+(it starts off; without it the other side can watch but not use the mouse and
+keyboard), then Share. Tornect keeps the grant, so later sessions start without
+the dialog. Do it ahead, in the window's "Screen sharing on this desktop" card
+(**Grant screen sharing**); otherwise the dialog appears when a viewer's picture
+starts, and someone at this screen must answer it within 30 s. `tornect doctor`
+names the file that holds the grant; **Revoke** in the window, or deleting that
+file, takes it back.
+
+## Windows
+
+You need Windows 10 (version 20H1 or later) or 11, 64-bit. Right-click the zip,
+Extract All, and keep `pt\` beside `tornect.exe`. Windows may warn that the
+program is not recognised: it is not code-signed.
+
+Double-clicking `tornect.exe` opens the window **and a console window**:
+`tornect.exe` is a console program. Closing that console, or pressing Ctrl-C in
+it, should close Tornect at once (not yet tried on Windows); close the main
+window instead to leave with a goodbye to the other side. The window works as on
+Linux above; Windows asks for no grant.
+
+From a console in the folder (`cmd` or PowerShell):
+
+    .\tornect.exe doctor
+    .\tornect.exe host
+    .\tornect.exe connect <ID>
+
+**Ending sessions on Windows: Ctrl-C.** `tornect panic` cannot reach a running
+Windows host yet (its control channel is still to come) and says so. To end
+every session at once, press **Ctrl-C in the console where `tornect.exe host`
+runs**, or press Stop on the banner or the "Tornect: sharing" window when you
+use the window.
+
+## Where Tornect keeps its state
+
+`tornect paths` prints the directories: the keys of this machine's Tornect ID,
+the paired devices, `config.toml` and `sessions.log` (every pairing and session,
+kept on this machine). `--home <dir>` (or `TORNECT_HOME`) puts all of it
+elsewhere, so two copies can run side by side on one machine.
+
+## Known limitations of this build
+
+- Tested on one Linux machine (GNOME on Wayland) only. **Nothing has run on a
+  real Windows machine yet**: only under Wine, which is not Windows. The window
+  has not yet been used by a person for a whole session between two machines.
+- Everything travels over Tor: pictures are slow (a few frames per second for a
+  large desktop), and a connection takes from seconds to minutes to set up.
+- On GNOME, the "Tornect: sharing" window cannot stay above other windows
+  (Wayland does not let it); GNOME shows its own screen-sharing icon.
+- The zips and the programs are not signed.
+
+## Licences and source
+
+Tornect is free software under the GNU General Public License, version 3 or
+later (`LICENSE`); `BUILD-INFO.txt` names the commit this build came from.
+lyrebird is BSD-2-Clause and contains GPL-3.0-or-later code; its source is the
+tag `lyrebird-0.8.1` at
+https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird
+(`THIRD_PARTY_NOTICES.md`).
