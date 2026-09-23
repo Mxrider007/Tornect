@@ -39,7 +39,7 @@ pub mod flow;
 pub mod host;
 pub mod viewer;
 
-pub use backend::{Source, SystemBackend};
+pub use backend::{DesktopBackend, Source, SystemBackend};
 pub use host::{
     CaptureStarted, MediaBackend, MediaEnd, MediaHost, MediaLimits, MediaObserver, MediaOutcome,
     MediaReport, NoObserver,
