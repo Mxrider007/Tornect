@@ -83,6 +83,9 @@ pub struct MediaLimits {
     pub input_burst: u32,
     /// Least time between two keyframes forced by `KeyframeRequest`.
     pub keyframe_interval: Duration,
+    /// How long a control viewer may say nothing (no input, ack or ping)
+    /// before the keys and buttons it holds are released (SLICE-C1 C1-3).
+    pub viewer_quiet: Duration,
     /// The encoder. Its frame rate also paces capture.
     pub encoder: EncoderSettings,
 }
@@ -101,6 +104,8 @@ impl Default for MediaLimits {
             input_rate: 250,
             input_burst: 500,
             keyframe_interval: Duration::from_secs(1),
+            // The viewer pings every second when it has nothing else to say.
+            viewer_quiet: Duration::from_secs(3),
             encoder: EncoderSettings::default(),
         }
     }
@@ -517,6 +522,10 @@ impl MediaHost {
         let mut seq: u32 = 0;
         let mut pending = Some(first);
         let mut torn = false;
+        // When the viewer last said anything, and whether what it holds has
+        // been let go since (SLICE-C1 C1-3).
+        let mut heard = tokio::time::Instant::now();
+        let mut released = false;
 
         let ended = loop {
             if let Some(frame) = pending.take() {
@@ -549,14 +558,31 @@ impl MediaHost {
                 }
             }
 
+            let quiet_at = heard + self.limits.viewer_quiet;
+            let watch_quiet = injector.is_some() && !released;
             let event = tokio::select! {
                 biased;
                 _ = end.changed() => Event::Ended,
                 msg = inbound.recv() => Event::Client(msg),
                 frame = pipeline.next() => Event::Frame(frame),
+                () = tokio::time::sleep_until(quiet_at), if watch_quiet => Event::Quiet,
             };
+            if let Event::Client(Some(Ok(_))) = event {
+                heard = tokio::time::Instant::now();
+                released = false;
+            }
             match event {
                 Event::Ended => break MediaEnd::SessionOver(end_reason(&end)),
+                // A viewer that pings when it has nothing else to say has gone
+                // quiet: it may be gone, and a key it holds would repeat on the
+                // host until the session's idle timeout (SLICE-C1 C1-3).
+                Event::Quiet => {
+                    if let Some(sink) = injector.as_mut() {
+                        sink.release_all();
+                    }
+                    released = true;
+                    tracing::debug!(session = %session_id, "viewer quiet: released what it held");
+                }
                 Event::Frame(Some(Ok(frame))) => pending = Some(frame),
                 Event::Frame(Some(Err(e))) => {
                     tracing::warn!(error = %e, session = %session_id, "screen capture stopped");
@@ -786,6 +812,8 @@ enum Event {
     Ended,
     Client(Option<Result<Msg, ProtoError>>),
     Frame(Option<Result<Encoded, PipelineError>>),
+    /// The viewer has said nothing for [`MediaLimits::viewer_quiet`].
+    Quiet,
 }
 
 /// `Tracked` wants a sized sink.
