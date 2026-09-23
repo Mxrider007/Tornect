@@ -609,10 +609,11 @@ mod tests {
     fn live_portal_session_shares_the_screen_and_takes_the_pointer() {
         let token = std::env::var_os(tornect_core::paths::HOME_ENV)
             .map(|home| tornect_core::Paths::from_home(PathBuf::from(home)).portal_restore_token());
-        eprintln!("restore token file: {token:?}");
+        let had_token = token.as_ref().is_some_and(|t| t.exists());
+        eprintln!("restore token file: {token:?} (present before: {had_token})");
         let options = WaylandOptions {
             dialog_wait: Duration::from_secs(180),
-            ..WaylandOptions::new(token)
+            ..WaylandOptions::new(token.clone())
         };
         let started = std::time::Instant::now();
         let (mut source, input) = WaylandSource::open(&options).expect("the portal session starts");
@@ -620,15 +621,25 @@ mod tests {
             "session started in {:.1} s: {source:?} {input:?}",
             started.elapsed().as_secs_f64()
         );
-        let first =
-            next(&mut source, Duration::from_secs(10)).expect("a first picture within 10 s");
-        eprintln!(
-            "first picture {}x{} ({} bytes)",
-            first.width,
-            first.height,
-            first.bgrx.len()
-        );
-        assert_eq!(first.bgrx.len(), (first.width * first.height * 4) as usize);
+        let kept = token.as_ref().is_some_and(|t| t.exists());
+        eprintln!("restore token kept after the start: {kept}");
+        // The host's first-picture deadline is 10 s, and nothing moves here:
+        // the compositor must send a first picture of a still screen by itself.
+        let asked = std::time::Instant::now();
+        let first = next(&mut source, Duration::from_secs(10));
+        match &first {
+            Some(frame) => {
+                eprintln!(
+                    "first picture after {:.2} s, unprompted: {}x{} ({} bytes)",
+                    asked.elapsed().as_secs_f64(),
+                    frame.width,
+                    frame.height,
+                    frame.bgrx.len()
+                );
+                assert_eq!(frame.bgrx.len(), (frame.width * frame.height * 4) as usize);
+            }
+            None => eprintln!("NO first picture within 10 s of a still screen"),
+        }
         // Pictures only on damage: count what arrives in 5 s untouched.
         let quiet = count(&mut source, Duration::from_secs(5));
         eprintln!("pictures in 5 s with nothing moved: {quiet}");
@@ -680,7 +691,12 @@ mod tests {
         );
         drop(injector);
         drop(source);
-        eprintln!("LIVE PORTAL CHECK moves_with_a_picture={moved}/5 drag_pictures={pictures}");
+        eprintln!(
+            "LIVE PORTAL CHECK first_picture={} moves_with_a_picture={moved}/5 \
+             drag_pictures={pictures} token_kept={kept}",
+            first.is_some()
+        );
+        assert!(first.is_some(), "no first picture of a still screen");
         assert!(moved >= 4, "pointer moves produced pictures {moved}/5");
     }
 
