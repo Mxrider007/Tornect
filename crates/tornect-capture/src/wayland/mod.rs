@@ -49,6 +49,10 @@ pub struct WaylandOptions {
     pub dialog_wait: Duration,
     /// The D-Bus the portal is reached on.
     pub bus: Bus,
+    /// Turns `true` when the session the source is for ends before the open
+    /// does: the portal session is closed, which takes its dialog down, and no
+    /// restore token is kept for it.
+    pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl WaylandOptions {
@@ -60,6 +64,7 @@ impl WaylandOptions {
             restore_token,
             dialog_wait: DIALOG_WAIT,
             bus: Bus::Session,
+            cancel: None,
         }
     }
 }
@@ -95,6 +100,7 @@ impl WaylandSource {
             bus: options.bus.clone(),
             token_file: options.restore_token.clone(),
             dialog_wait: options.dialog_wait,
+            cancel: options.cancel.clone(),
         })?;
         let portal = Arc::new(portal);
         let capture = PwCapture::connect(opened.fd, opened.node_id)?;

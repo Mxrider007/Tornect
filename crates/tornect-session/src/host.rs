@@ -126,6 +126,13 @@ pub trait MediaBackend: Send + Sync {
     /// kept for building its injector, so that no path can reach the desktop's
     /// input for it. The default keeps nothing.
     fn view_only(&self) {}
+
+    /// The session ended while [`open_source`](Self::open_source) was still
+    /// running on its blocking thread: end that open early, if it can be. The
+    /// Wayland open waits on the desktop's dialog, which must not stay up, nor
+    /// leave a remembered grant, for a session that is over. The default
+    /// cannot.
+    fn cancel_open(&self) {}
 }
 
 /// Where the host reports capture starting and stopping. This is the source
@@ -444,7 +451,10 @@ impl MediaHost {
             opened = tokio::task::spawn_blocking(move || backend.open_source()) => Some(opened),
         };
         let source = match opened {
-            None => return not_started(&mut wr, MediaEnd::SessionOver(end_reason(&end))).await,
+            None => {
+                self.backend.cancel_open();
+                return not_started(&mut wr, MediaEnd::SessionOver(end_reason(&end))).await;
+            }
             Some(Ok(Ok(source))) => source,
             Some(Ok(Err(e))) => {
                 tracing::warn!(error = %e, session = %session_id, "screen capture could not start");
