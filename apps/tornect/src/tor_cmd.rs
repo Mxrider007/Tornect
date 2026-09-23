@@ -20,9 +20,10 @@ use tornect_core::keystore::{
 };
 use tornect_core::session_log::SessionMode;
 use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
+use tornect_proto::ProtoError;
 use tornect_session::{
     Binding, FrameSink, MediaHost, MediaLimits, MediaViewer, Source, SystemBackend, ViewerEnd,
-    ViewerStats,
+    ViewerError, ViewerStats,
 };
 use tornect_signal::framing::FrameError;
 use tornect_signal::fsm::client::{
@@ -729,6 +730,39 @@ where
 
     let mut pictures = CliPictures::new();
     let mut stats = ViewerStats::default();
+    let (viewed, end) = view(
+        viewer,
+        session,
+        pings,
+        interrupted,
+        &mut pictures,
+        &mut stats,
+    )
+    .await;
+    pictures.report(&stats);
+    let end = end?;
+    println!("{}", media_end(&viewed, &end));
+    Ok(match (viewed, end) {
+        // The picture failed first; the session ended because of it.
+        (Err(e), End::You) => End::NoPicture(anyhow::Error::new(e)),
+        (_, end) => end,
+    })
+}
+
+/// Receive the screen on a bound `viewer` while `session` keeps the session
+/// alive; whichever side ends first ends the other. Returns how each ended.
+async fn view<M, S>(
+    viewer: MediaViewer<M>,
+    session: &mut ClientSession<S>,
+    pings: Option<u32>,
+    interrupted: &watch::Receiver<bool>,
+    pictures: &mut dyn FrameSink,
+    stats: &mut ViewerStats,
+) -> (Result<ViewerEnd, ViewerError>, anyhow::Result<End>)
+where
+    M: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let (media_done, media_ended) = oneshot::channel::<bool>();
     let (stop_media, media_stop) = oneshot::channel::<()>();
     let viewing = async {
@@ -740,9 +774,8 @@ where
                 () = pressed(interrupted.clone()) => {}
             }
         };
-        let viewed = viewer.run(&mut pictures, &mut stats, stop).await;
-        let by_host = matches!(viewed, Ok(ViewerEnd::Host(_) | ViewerEnd::Closed));
-        let _ = media_done.send(by_host);
+        let viewed = viewer.run(pictures, stats, stop).await;
+        let _ = media_done.send(host_may_have_ended(&viewed));
         viewed
     };
     let signaling = async {
@@ -750,9 +783,10 @@ where
             tokio::select! {
                 () = pressed(interrupted.clone()) => Ok(()),
                 by_host = media_ended => {
-                    // The host closed the media stream: its `BYE` is usually on
-                    // the way, and the end should be reported as the host's.
-                    // Ctrl-C still cuts the wait short (SLICE-C2 C2-2).
+                    // The host closed the media stream, or its circuit went:
+                    // its `BYE` is usually on the way, and the end should be
+                    // reported as the host's. Ctrl-C still cuts the wait short
+                    // (SLICE-C2 C2-2).
                     if by_host.unwrap_or(false) {
                         tokio::select! {
                             () = tokio::time::sleep(BYE_GRACE) => {}
@@ -767,30 +801,40 @@ where
         let _ = stop_media.send(());
         end
     };
-    let (viewed, end) = tokio::join!(viewing, signaling);
+    tokio::join!(viewing, signaling)
+}
 
-    pictures.report(&stats);
-    let end = end?;
+/// Whether the media stream ended in a way the host's own end of the session
+/// explains: its `Close`, its end of stream, or its circuit closing under the
+/// stream. Then the host's `BYE` is worth waiting a moment for.
+fn host_may_have_ended(viewed: &Result<ViewerEnd, ViewerError>) -> bool {
+    matches!(
+        viewed,
+        Ok(ViewerEnd::Host(_) | ViewerEnd::Closed) | Err(ViewerError::Proto(ProtoError::Io(_)))
+    )
+}
+
+/// The line that says how the media stream ended.
+fn media_end(viewed: &Result<ViewerEnd, ViewerError>, end: &End) -> String {
     // The viewer stops when the session ends, whoever ended it: the host's
     // `BYE` often arrives before its media `Close` (live run, 2026-09-21).
-    match (&viewed, &end) {
-        (Ok(ViewerEnd::Host(reason)), _) => println!(
+    // And a host that ends the session can lose its media circuit before its
+    // `Close` goes out, when tearing capture down takes a moment (the Wayland
+    // portal, live run, 2026-09-22): a stream that broke under a session the
+    // host ended ended with it.
+    match (viewed, end) {
+        (Ok(ViewerEnd::Host(reason)), _) => format!(
             "MEDIA ENDED by the host ({})",
             crate::host::media_reason(*reason)
         ),
-        (Ok(ViewerEnd::Closed), _) => println!("MEDIA ENDED (the host closed the stream)"),
-        (Ok(ViewerEnd::Stopped), End::Host(_)) => {
-            println!("MEDIA ENDED by the host (the session ended)");
+        (Ok(ViewerEnd::Closed), _) => "MEDIA ENDED (the host closed the stream)".to_owned(),
+        (Ok(ViewerEnd::Stopped) | Err(ViewerError::Proto(ProtoError::Io(_))), End::Host(_)) => {
+            "MEDIA ENDED by the host (the session ended)".to_owned()
         }
-        (Ok(ViewerEnd::Stopped), End::Lost(_)) => println!("MEDIA ENDED (the session was lost)"),
-        (Ok(ViewerEnd::Stopped), _) => println!("MEDIA ENDED (by you)"),
-        (Err(e), _) => println!("MEDIA FAILED: {e}"),
+        (Ok(ViewerEnd::Stopped), End::Lost(_)) => "MEDIA ENDED (the session was lost)".to_owned(),
+        (Ok(ViewerEnd::Stopped), _) => "MEDIA ENDED (by you)".to_owned(),
+        (Err(e), _) => format!("MEDIA FAILED: {e}"),
     }
-    Ok(match (viewed, end) {
-        // The picture failed first; the session ended because of it.
-        (Err(e), End::You) => End::NoPicture(anyhow::Error::new(e)),
-        (_, end) => end,
-    })
 }
 
 /// The CLI's stand-in for a viewer window: counts what it decodes, says so every
@@ -1222,6 +1266,112 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(
+            matches!(end, End::Host(reason) if reason == bye::PANIC),
+            "{end:?}"
+        );
+        host.await.unwrap().unwrap();
+    }
+
+    /// A live session's media stream, whose host end took the `Bind` and
+    /// answered `BindOk`; when the host drops its end, reads fail the way a
+    /// Tor circuit that closes fails them, not as a clean end of stream.
+    struct Collapsing(DuplexStream);
+
+    impl AsyncRead for Collapsing {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            match std::pin::Pin::new(&mut self.0).poll_read(cx, buf) {
+                Poll::Ready(Ok(())) if buf.filled().len() == before => Poll::Ready(Err(
+                    std::io::Error::new(std::io::ErrorKind::ConnectionReset, "Circuit closed"),
+                )),
+                other => other,
+            }
+        }
+    }
+
+    impl AsyncWrite for Collapsing {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    /// Phase B wording race (live run, 2026-09-22): the host ends the session,
+    /// and its media circuit closes before its closing message arrives. The
+    /// client said "MEDIA FAILED: media stream I/O: Circuit closed" for a
+    /// session the host had ended on purpose (`tornect panic`).
+    #[tokio::test(start_paused = true)]
+    async fn a_host_end_whose_media_circuit_closes_first_is_the_hosts() {
+        use tornect_proto::{Msg, codec, read_msg, write_msg};
+        let Live {
+            mut session,
+            kill,
+            host,
+            ..
+        } = live().await;
+        let binding = Binding::new(session.session_token(), &session.th());
+        let (client_media, mut host_media) = duplex(1 << 16);
+        let media_host = tokio::spawn(async move {
+            let bind = read_msg(&mut host_media).await.unwrap();
+            assert!(matches!(bind, Some(Msg::Bind { .. })), "{bind:?}");
+            let ok = Msg::BindOk {
+                width: 640,
+                height: 360,
+                codec: codec::H264,
+                mode: 1,
+            };
+            write_msg(&mut host_media, &ok).await.unwrap();
+            host_media
+        });
+        let viewer = MediaViewer::bind(Collapsing(client_media), &binding, MEDIA_BIND_WAIT)
+            .await
+            .unwrap();
+        let host_media = media_host.await.unwrap();
+        // The host ends the session: its media circuit goes first, its BYE
+        // comes a moment later.
+        tokio::spawn(async move {
+            drop(host_media);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            kill.kill(bye::PANIC);
+        });
+        let (_ctrl_c, interrupted) = watch::channel(false);
+        let (mut pictures, mut stats) = (CliPictures::new(), ViewerStats::default());
+        let (viewed, end) = view(
+            viewer,
+            &mut session,
+            None,
+            &interrupted,
+            &mut pictures,
+            &mut stats,
+        )
+        .await;
+        let end = end.unwrap();
+        assert_eq!(
+            media_end(&viewed, &end),
+            "MEDIA ENDED by the host (the session ended)"
+        );
         assert!(
             matches!(end, End::Host(reason) if reason == bye::PANIC),
             "{end:?}"
