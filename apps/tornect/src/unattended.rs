@@ -889,6 +889,7 @@ async fn resolve_device(paths: &Paths, route: &Route, arg: &str) -> anyhow::Resu
 /// UTF-8 bytes each, plus the line ending.
 ///
 /// [`MAX_CHARS`]: tornect_core::unattended::password::MAX_CHARS
+#[cfg(unix)]
 const LINE_CAP: usize = tornect_core::unattended::password::MAX_CHARS * 4 + 2;
 
 /// Read one line from the terminal **straight off the file descriptor**, into a

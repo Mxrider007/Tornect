@@ -78,7 +78,7 @@ impl HostsFile {
         };
         toml::from_str(&text).map_err(|source| CoreError::HostsParse {
             path: path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })
     }
 
