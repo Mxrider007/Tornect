@@ -17,7 +17,7 @@ crates/tornect-core         ids (onion v3), ed25519 identities, file keystore, c
 crates/tornect-signal       Arti onion service + CBOR envelope protocol + pairing/SAS + unattended PAKE auth + attempt limiter + the HELLO…ACCEPT host FSM behind BlockWindow/LocalAllow traits (§B.8.4–B.8.5, §B.8.14)   (M1)
 crates/tornect-net          candidates, UPnP/NAT-PMP/PCP, STUN, hole punch, key-pinned quinn, Tor tunnel  (M2)
 crates/tornect-proto        media wire format, packetizer, FEC, jitter buffer, pacer, ABR, stats            (M3)
-crates/tornect-capture      VideoCaptureSource + pipewire | wgc | sckit backends + synthetic source         (M3/M6)
+crates/tornect-capture      VideoSource + wayland (portal + PipeWire via dlopen) | x11 | gdi backends + test card; later wgc | sckit   (M3/M6)
 crates/tornect-codec        Encoder/Decoder + ffmpeg hw backends + software fallback                        (M3)
 crates/tornect-audio        capture, Opus, playback                                                          (M5)
 crates/tornect-input        16-byte input events, client capture, host inject backends                      (M5)
@@ -86,8 +86,10 @@ Ubuntu 26.04 LTS, GNOME on **Wayland** (`XDG_SESSION_TYPE=wayland`), VMware virt
 stable 1.96, gcc/g++ 15, cmake, pkg-config, **no nasm, no sudo**. Missing dev headers:
 FFmpeg (libav*), PipeWire, ALSA, libei, libclang-dev, GTK. Consequences:
 
-- FFmpeg / PipeWire / cpal / tray backends live behind cargo features and are compiled +
-  tested in the **Linux CI job** (which apt-installs everything). Locally they are `NEEDS-DEVICE`.
+- FFmpeg / cpal / tray backends live behind cargo features and are compiled + tested in the
+  **Linux CI job** (which apt-installs everything). Locally they are `NEEDS-DEVICE`. PipeWire needs
+  no headers: `tornect-capture` `dlopen`s `libpipewire-0.3.so.0` at run time (decision M1-48), so
+  the Wayland backend builds, is tested and was verified live here.
 - The pure-Rust stack (Arti, quinn, ashpd, reis, egui/wgpu, the `openh264` software codec
   built from source with `cc`) builds and runs here — that is the default feature set.
 - No root ⇒ no netns/tc netem locally; `tests/netem/run.sh` runs in CI.

@@ -534,14 +534,16 @@ the live re-run.
   `/home/mx/kore_project_V3/agents/security/reports/2026-09-22_tornect_slice_c_review.md`.
 - **B2-2 (M1-46, `94255c2`).** `tornect host` holds `state/host.lock`. Its control channel is up
   even without a store, and then serves `tornect panic` only. No command runs offline beside a host
-  that does not answer. The kill path the terminal names is always one that works. The real binary
+  that does not answer (one already running offline when the host started still could, until
+  `d60df98` in session 8). The kill path the terminal names is always one that works. The real binary
   was checked in three situations: store locked at start, socket path unbindable, and normal.
 - **C1-1 (M1-47, `326fd72`).** Reading a media `Bind` takes no slot, so squatting streams can no
   longer deny every session its picture.
 - **C2-1 + B2-8 (M1-47, `65463d6`).**
   - Ctrl-C in `tornect connect` is heard on its own task, and a second press quits at once.
   - The viewer yields after every message.
-  - `bye` gives up after 2 s, and pings run to a fixed deadline.
+  - `bye` gives up after 3 s (`timeouts::BYE`), and pings run to a fixed deadline (for M2 frames;
+    host `PING`s still restarted the wait until `820c839` in session 8).
 - **C1-5, C1-6, C3-4 (`2ee219c`).** The `i32::MIN` wheel delta is refused; `watch_kill` arms
   before it sweeps; `tornect panic` names its home.
 - **Frame rate (M1-47, `7317e0d`).** `MediaLimits::window_frames` goes from 8 to 20. Over Tor that
@@ -557,7 +559,7 @@ the live re-run.
   up as a broken pipe on a frame write before the reader sees EOF, and the test now accepts
   either.
 
-**Still open from the review (claims):**
+**Still open from the review (claims; the lows were all fixed in session 8, M1-49):**
 - **Lows:**
   - C1-2: clicks are mapped over the whole desktop while the viewer sees a crop (B3-19 now live).
   - C1-3: a vanished viewer's held key stays down for up to 90 s.
@@ -565,9 +567,92 @@ the live re-run.
   - C3-1: the one-session gate is check-then-act across the accept write.
   - C3-2: `fail()` writes in `established()` are not raced against the kill.
   - C3-3: `$DISPLAY` can name a forwarded or remote X server.
-- **Infos:** C1-4, C1-7, C2-3 to C2-7, C3-5, C3-7.
+- **Infos:** C1-4, C1-5 (b) (the input bucket counts frames, not OS events), C1-7, C2-3 to C2-7,
+  C3-5, C3-7.
 
-**Unreviewed by a hostile review:** everything after `5f1ae84`, including this session's fixes.
+**Unreviewed by a hostile review:** everything after `5f1ae84`, including this session's fixes
+(the range `5f1ae84..5ba8f11` was reviewed in session 8: slice D).
+
+## Session 2026-09-22 (8) — Wayland capture live; the slice-D review; the slice-C lows and the slice-D fixes
+
+**Gate: green at 480 passed, 0 failed, 4 ignored** (437 at the start, 458 after the Wayland
+backend), cargo-deny ok. `5ba8f11..1e6966c` is pushed; `1e6966c..ad55279` and this hand-off were
+local when it was written, for push 2.
+
+- **Wayland capture and input (M1-48; `4451d14`, `6bf62c9`, `95a08a5`, `4c603a5`).**
+  - `tornect-capture`'s `wayland` module: one RemoteDesktop portal session with ScreenCast
+    sources, on a thread with its own runtime and zbus connection; PipeWire over `dlopen` with
+    LP64 mirrors and the 232-byte EnumFormat pod; frames copied on damage (`Ok(None)` otherwise);
+    input through the portal's `Notify*` calls, never `connect_to_eis`; the pointer mapped over the
+    encoded region.
+  - The restore token is kept in `<state>/portal-restore-token` (0600, never logged), so the
+    desktop asks once. Deleting the file revokes the grant.
+  - `tornect host --capture desktop` shares the Wayland desktop through the session layer.
+  - No full Arti rebuild: the lock gained only `ashpd` and `libloading`. Tests 437 → 458.
+- **Verified live on mx-vm** (rows in `docs/VERIFICATION.md`):
+  - **At the console**, portal check run 2: 3538×1919 at scale 1; a first picture of a still
+    screen after 0.31 s, unprompted; five pointer moves, each followed by a new picture; 19 fps
+    while dragging; the token kept. Run 1 was answered with the dialog's "Allow Remote
+    Interaction" switch left off (it starts off), and the injector was refused as designed.
+  - **Over real Tor**, two homes, the token restoring the session with no dialog: 3538×1918,
+    0 errors, 2.7–3.1 fps at 6.8 MP. Capture alone reached 19 fps, so the software encoder is the
+    likely limit, and downscaling before the encode is the lever. Run 2 passed all 10 checks;
+    `tornect panic` closed PipeWire 62–100 ms and the portal session 90–172 ms after the kill.
+    Run 1 labelled the media end `MEDIA FAILED: … Circuit closed` (fixed below; OPEN until a
+    live run).
+  - **No input crossed Tor**: `tornect connect` sends none, and no key was injected live at all.
+- **The slice-D review of `5f1ae84..5ba8f11` ran in full** (62/62 agents, 8 finder
+  dimensions and 3 refuters per raw finding, 47.8 min): 18 raw → 8 survived →
+  **5 distinct defects, all LOW, no BLOCK**; 10 refuted. D1 was raised at MEDIUM and taken at LOW
+  by the parent; **the operator ruled LOW**. D4 and D5 were ledger and plan drift, fixed by this
+  hand-off. Its §10 addendum on the Wayland policy: keep the persisted grant, under three
+  conditions (M1-48), and do not grow the waits. Synthesis:
+  `/home/mx/kore_project_V3/agents/security/reports/2026-09-22_tornect_slice_d_review.md`.
+- **Fixed, each code fix failing-first (M1-49; 21 commits `820c839` … `ad55279`; tests 458 → 480):**
+  - D2 (`820c839`): host `PING`s no longer restart `next_event`'s wait.
+  - D1 (`d60df98`): an offline command refuses its write once a host has started beside it.
+  - D3 (`0fcb48b`): the C1-1 test holds every waiting slot.
+  - C3-1 (`963f487`): the one-session slot is reserved in the same step as its check.
+  - C3-2 (`d64bc87`): a violation ends the session before its `ERROR` is written.
+  - C2-2 (b) (`5e323c1`): the viewer's writes race its stop.
+  - C1-3 (`af7d956`): held keys are released after 3 s of silence, and **the viewer pings once a
+    second when idle**.
+  - C1-2 (`3b90cd2`): X11 and `SendInput` map the pointer over the encoded region (a mapping, not
+    a refusal).
+  - C3-3 (`2ac8ffd`): a `DISPLAY` with a host part is refused.
+  - C3-5 (`f769365`): doctor and the banner name the capture backend truthfully.
+  - The media-end wording (`33ad8c9`, client side).
+  - The §10 hardening: a pending portal open ends with its session (`82d1692`); a view-only
+    session drops its input handle (`ea9db5d`); doctor names the grant file and how to revoke it
+    (`73b87cb`); the token's path is out of log lines (`f9e96f5`).
+  - The zbus warning filter (`3ad3473`); the R9, R5 ≡ R8 and R7 test tightenings (`1790746`,
+    `9d6b4b2`, `6c0646b`); the O2 comment (`4009dbc`); R2: **the first Ctrl-C ends a pending
+    media open** (`ad55279`).
+- **Windows:** `cargo check --target x86_64-pc-windows-gnullvm -p tornect-session -p
+  tornect-capture` is clean, 0 warnings (6 min; the first gnullvm check of the Arti stack here).
+- **Operator rulings:** D1 is LOW; the store-less host keeps M1-46, and §B.8.6.2 now carries the
+  note that such a host must be stopped (Ctrl-C or panic) before deny-direction commands run.
+
+**Still open:**
+- **C1-5 (b)** (INFO, on no list until now): the input bucket charges one token per frame, not per
+  OS event; one wheel frame can make up to 400 XTest requests.
+- Slice-C infos: C1-4 (X11 and `SendInput`; the Wayland injector bounds its own calls), C1-7,
+  C2-3 to C2-7, C3-7.
+- Left from the fixes: item 9's extras (an `SSH_CONNECTION` warning; the resolved display in the
+  banner); gnullvm clippy on `tornect-session`; R7's other half (a control task that ends or is
+  aborted leaves `control` up; only at shutdown today).
+- OPEN: the media-end row until one live panic run; keys over Tor (the GUI); the first-run dialog
+  during a remote session; C2-1 under a real flood; `SendInput` at run time (NEEDS-DEVICE).
+- UNVERIFIED: GNOME dismissing the dialog on `Session.Close`; C1-3 at run time (XTest
+  autorepeat, Arti's dead-circuit detection); `SystemBackend::view_only` (read, not tested); the
+  first picture of a fully static screen; the runtime default of "Remember This Selection"; how a
+  non-Flatpak token binds to the app id; whether zbus logs message bodies at trace level; O1 (a
+  store-less host's untagged `sessions.log` lines) and the cross-process log race.
+- Before unattended connects on Wayland: the §B.8.8 5 s dialog budget, no dialog without a valid
+  token, and (M4) the block window and indicator.
+
+**Unreviewed by a hostile review:** everything after `5ba8f11`, including `pipewire.rs`'s unsafe
+FFI, the portal and token handling, the idle ping and this session's fixes.
 
 ## Gotchas (dev VM mx-vm)
 
@@ -576,7 +661,11 @@ the live re-run.
   environment; `ring`'s build script watches exactly those (`rerun-if-env-changed`), so every
   switch between the gate and a plain `cargo` (or the pre-commit hook) re-ran `ring` and rebuilt
   everything above it. `xtask`'s `cargo()` now strips them — **if it ever comes back, look there
-  first.** This was also the real cause of the old "`cargo test -p` re-unifies features" note.
+  first.** It was not the whole story, though: `cargo test -p <crate>` and
+  `cargo test --workspace --lib` still select a different dev-dependency set, which re-unifies
+  features and rebuilds the Tor stack (session 8: 1.8 GB of `deps` before it was stopped). Run
+  filtered tests as `cargo test --workspace -- <filter>`, and ignored ones as
+  `cargo test --workspace -- --ignored <filter>`.
 - Build with `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp`; `/tmp` is a 3.7 GiB quota tmpfs
   (zstd-sys fails there); Tor state under `target/tornect-test/<name>`, never `/tmp`.
 - A cold Arti rebuild is 2–5 min; the pre-commit hook runs fmt + clippy
@@ -592,3 +681,12 @@ the live re-run.
 - `.github/workflows/ci.yml` is written but excluded (`.git/info/exclude`) until the `gh` token
   has the `workflow` scope; `.claude/settings.json` must be created by the user from
   `.claude/settings.recommended.json`.
+- The GNOME portal dialog's "Allow Remote Interaction" switch starts **off**: whoever answers it
+  must turn it on, or the host shares the screen and injects nothing. The kept token
+  (`<state>/portal-restore-token`) spares later dialogs; delete it to revoke the grant. The portal
+  needs the console session's environment (`XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`,
+  `DBUS_SESSION_BUS_ADDRESS`, `XDG_SESSION_TYPE=wayland`).
+- Never run an injection test against `DISPLAY=:0` here (the live Xwayland): the X11 input test
+  runs only with `XDG_SESSION_TYPE=x11`, under Xvfb.
+- Disk: 93 % at session 8's end. `target/debug/incremental` is safe to delete and regrows
+  (4.7–4.8 G each time); never prune `target/debug/deps` by atime.
