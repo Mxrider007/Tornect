@@ -876,13 +876,16 @@ impl FrameSink for CliPictures {
 /// Keep `session` alive with a `PING` every `every` (the first at once) until
 /// `stop` resolves, `pings` pings have been answered, or the host ends it.
 /// Pings run to a deadline that frames from the host do not move, so a host
-/// that keeps sending cannot keep `--pings N` from ending (SLICE-B2 B2-8).
+/// that keeps sending cannot keep `--pings N` from ending (SLICE-B2 B2-8):
+/// M2 frames come back here and wait for the same `next_ping`, and a host
+/// `PING` is answered inside `next_event`, whose one deadline it does not move
+/// either (SLICE-D D2).
 ///
 /// Between pings it waits on the stream, not on a timer, so a host `BYE` is
 /// reported the moment it arrives. Over Tor the host's circuit is often gone
 /// by the next ping, whose write would then fail first and turn a deliberate
 /// end (`tornect panic`) into "connection lost". Cutting that wait short
-/// cannot drop part of a frame: after the accept the host sends nothing
+/// cannot drop part of a frame: after the accept an honest host sends nothing
 /// unprompted except `BYE`, which ends the session anyway.
 async fn keep_alive<S, F>(
     session: &mut ClientSession<S>,
