@@ -13,8 +13,12 @@ use tracing_subscriber::{
 use crate::error::Result;
 
 /// Default filter when neither `TORNECT_LOG` nor `RUST_LOG` is set.
+///
+/// `zbus::proxy=error`: zbus warns five times at every Wayland portal start
+/// that it could not cache the properties of the portal's request objects,
+/// which is harmless and lands on the host's consent terminal.
 pub const DEFAULT_FILTER: &str = "info,tornect=debug,tornect_core=debug,tornect_signal=debug,\
-tornect_net=debug,tornect_proto=debug,tornect_session=debug,arti=warn,tor=warn";
+tornect_net=debug,tornect_proto=debug,tornect_session=debug,arti=warn,tor=warn,zbus::proxy=error";
 
 /// Logging options.
 #[derive(Debug, Clone, Default)]
@@ -103,5 +107,42 @@ mod tests {
         let _g2 = init(LogOptions::default()).unwrap();
         tracing::info!("hello from the telemetry test");
         assert!(dir.path().join("logs").is_dir());
+    }
+
+    /// The Wayland portal's zbus proxies print "Failed to populate properties
+    /// cache via GetAll" (zbus 5.19, `src/proxy/mod.rs`, the only `warn!` of
+    /// target `zbus::proxy`) five times at every portal start, onto the host's
+    /// consent terminal. The default filter drops that target's warnings and
+    /// keeps every other zbus warning, and our own debug lines.
+    #[test]
+    fn the_default_filter_drops_only_the_zbus_proxy_cache_warning() {
+        use std::sync::{Arc, Mutex};
+
+        struct Seen(Arc<Mutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Seen {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let target = event.metadata().target().to_owned();
+                self.0.lock().unwrap().push(target);
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new(DEFAULT_FILTER))
+            .with(Seen(Arc::clone(&seen)));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "zbus::proxy", "Failed to populate properties cache via GetAll");
+            tracing::warn!(target: "zbus::connection", "a connection warning");
+            tracing::debug!(target: "tornect_session::host", "ours");
+        });
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["zbus::connection", "tornect_session::host"]
+        );
     }
 }
