@@ -96,9 +96,10 @@ enum Command {
         /// Force proof-of-work introduction defense off.
         #[arg(long, conflicts_with = "pow")]
         no_pow: bool,
-        /// What a session shares: `desktop` (X11 on an X11 session, GDI on
-        /// Windows; Wayland capture is not built yet) or `test-card` (a
-        /// synthetic picture; the viewer's input goes nowhere).
+        /// What a session shares: `desktop` (the RemoteDesktop portal and
+        /// PipeWire on a Wayland session, X11 on an X11 session, GDI on
+        /// Windows) or `test-card` (a synthetic picture; the viewer's input
+        /// goes nowhere).
         #[arg(long, value_enum, default_value_t = CaptureArg::Desktop)]
         capture: CaptureArg,
     },
