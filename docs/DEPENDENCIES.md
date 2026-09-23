@@ -49,6 +49,9 @@ cmake, bindgen or libclang: verified by `cargo tree -i aws-lc-sys` and
 `cargo tree -i openssl-sys` both reporting "did not match any packages". On the dev
 VM set `TMPDIR` to a directory outside the quota-limited `/tmp` tmpfs or `cc` dies
 with "Disk quota exceeded" while compiling zstd (`docs/notes/m1-track1-evidence.md`).
+For Windows (`x86_64-pc-windows-gnullvm`) they build with llvm-mingw's clang, with
+`-fstack-protector-strong`, and link statically into `tornect.exe` (2026-09-23;
+`docs/VERIFICATION.md`, *The Windows build of the whole app*).
 
 | Crate | Version | Features | Why | Build requirements | Verified | Source |
 |---|---|---|---|---|---|---|
@@ -120,12 +123,19 @@ encrypted store and the IPC message set are `#[cbor(map)]` structs with integer 
 | `tornect-core` (path), `tokio` `test-util` + `time` | — | — | The `envelope` target (F1, §B.8.15) builds fixed host/device identities and in-memory trusted/known-host stores, re-signs fuzzed frames over the running transcript, and runs both FSMs on a paused-time runtime so every §B.8.4.5 timer fires at once when the input ends. | nightly toolchain | 2026-08-29 mx-vm | `fuzz/fuzz_targets/envelope.rs` |
 | `arbitrary` | =1.4.2 | — | The F3 target (`fuzz/fuzz_targets/store.rs`, §B.8.15) builds `UnattendedStore` / `FailState` values and `(wall, mono)` clock readings from the fuzzer's bytes with `Unstructured::{arbitrary, int_in_range, ratio}` (`src/unstructured.rs` 86–604 in the crate source); no derive — core types keep no `Arbitrary` impls, the target assembles them field by field. Pinned in the workspace table too (`arbitrary = "=1.4.2"`, unused there until a crate derives it); `minicbor` and `zeroize` in `fuzz/Cargo.toml` reuse the workspace pins. MIT OR Apache-2.0. | nightly (with the fuzz crate) | 2026-08-29 mx-vm | crate source `~/.cargo/registry/src/*/arbitrary-1.4.2/src/unstructured.rs`; `fuzz/Cargo.lock` checksum `c3d036a3…8bf1` |
 
+## Windows cross-build toolchain (not crates)
+
+| Tool | Version | Source | Why | Configuration | Verified |
+|---|---|---|---|---|---|
+| llvm-mingw | 20260908 (clang 23.1.1, UCRT; the `ubuntu-22.04-x86_64` build) | github.com/mstorsjo/llvm-mingw release asset, sha256 `2258c745e3155870c80793f3e8c80b28fbde11b9ff73c4c78783635b3440b092` (`docs/research/slice.md` §1) | C/C++ compiler and linker (lld) for `x86_64-pc-windows-gnullvm`: OpenH264, ring, the bundled SQLite, zstd, liblzma. Its libc++ (with libc++abi), libunwind and mingw-w64 CRT, including the stack-protector runtime in `libmingwex`, are linked statically, so it is part of the Windows TCB (A3-F7 (c)) | its `bin` on `PATH`; `.cargo/config.toml`: `+crt-static`, `-l:libc++.a`, an empty `CXXSTDLIB_x86_64_pc_windows_gnullvm`, `CFLAGS_`/`CXXFLAGS_x86_64_pc_windows_gnullvm = "-fstack-protector-strong"` | 2026-09-23 mx-vm: the whole app and the 13 test binaries build and link; `tornect.exe` imports only Windows DLLs |
+| nasm | 3.01 (Ubuntu `3.01-1`, installed on mx-vm 2026-09-23) | Ubuntu archive | Optional. When `nasm` is on `PATH`, `openh264-sys2` assembles OpenH264's x86 SIMD kernels (19 objects) and builds the C++ with `-DX86_ASM`; without it the build falls back to C++ silently (A3-F7 (a)), so two machines can link different code. The kernels have no stack protector | none; the build does not pin it | 2026-09-23 mx-vm: the Linux and the gnullvm builds both include the kernels |
+
 ## Vertical slice (M1-39 / M3-1; pins verified 2026-09-21, `docs/research/slice.md`)
 
 | Crate | Version | Features | Why | Build requirements | Verified | Source |
 |---|---|---|---|---|---|---|
 | `hmac` / `sha2` / `subtle` (existing pins) | 0.13.0 / 0.11.0 / 2.6.1 | — | `tornect-proto` bind MAC + constant-time check | none | 2026-09-21 (tests) | — |
-| `openh264` | =0.9.8 | `source` | Software H.264 encode/decode, always compiled (M0-5); BT.601 converters | C++ compiler (`cc`); nasm optional; on gnullvm `CXXSTDLIB=c++` + `+crt-static` | 2026-09-21 mx-vm: Linux tests + Windows gnullvm link | slice.md §1, §3 |
+| `openh264` | =0.9.8 | `source` | Software H.264 encode/decode, always compiled (M0-5); BT.601 converters | C++ compiler (`cc`); nasm optional (see the toolchain table); on gnullvm llvm-mingw's clang++ with `-fstack-protector-strong`, an empty `CXXSTDLIB` and `-l:libc++.a` (static libc++; `.cargo/config.toml`) | 2026-09-21 mx-vm: Linux tests + Windows gnullvm link; 2026-09-23: linked into `tornect.exe` for gnullvm, its 3 tests pass there under Wine | slice.md §1, §3 |
 | `x11rb` | =0.13.2 | `xtest`, `xfixes` | X11 capture (GetImage) and XTEST injection, X11 sessions only | none (pure-Rust connection) | 2026-09-21 build | slice.md §5 |
 | `windows-sys` | =0.61.2 | `Win32_Foundation`, `Win32_Graphics_Gdi`, `Win32_UI_WindowsAndMessaging`, `Win32_UI_Input_KeyboardAndMouse`, `Win32_UI_HiDpi` | GDI capture, `SendInput`, DPI awareness | none (raw-dylib) | 2026-09-21 gnullvm check | slice.md §6 |
 | `winit` | =0.30.13 | defaults: `rwh_06`, `x11`, `wayland`, `wayland-dlopen`, `wayland-csd-adwaita` (CSD is required on GNOME) | The window's event loop, driven by hand (`apps/tornect/src/ui/app.rs`, D10: never eframe), so the stream window reads `WindowEvent::KeyboardInput` before egui and takes each key's platform scancode from `platform::scancode::PhysicalKeyExtScancode::to_scancode` (Linux: evdev, the X11/Wayland keycode − 8; Windows: Set-1 with E0 in the high byte; `ui/keys.rs`). Its GNOME title bar pulls `ttf-parser` (unmaintained, RUSTSEC-2026-0192, ignored in `deny.toml` with the reason: local system fonts only). Apache-2.0 | none at build time: libwayland, libxkbcommon, Xlib/XCB are `dlopen`ed | 2026-09-23 mx-vm: builds; the window ran under Xvfb (X11) in `tornect gui --preview`; `winit_physical_keys_map_through_their_scancode` on Linux | `winit-0.30.13/src/platform/scancode.rs`, `src/platform_impl/linux/common/xkb/keymap.rs` 290, `src/platform_impl/windows/keyboard.rs` 904; slice.md §2 |
