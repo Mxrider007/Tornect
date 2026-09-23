@@ -7,7 +7,9 @@ use x11rb::protocol::xproto;
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
-use crate::{Button, InputError, InputEvent, InputSink, WheelAccumulator, denormalize, keymap};
+use crate::{
+    Button, InputError, InputEvent, InputSink, Region, WheelAccumulator, keymap, place, whole,
+};
 
 /// Injects into the X display named by `$DISPLAY`.
 pub struct XTestSink {
@@ -15,6 +17,7 @@ pub struct XTestSink {
     root: xproto::Window,
     width: u32,
     height: u32,
+    region: Region,
     wheel: WheelAccumulator,
 }
 
@@ -45,8 +48,17 @@ impl XTestSink {
             root,
             width,
             height,
+            region: whole,
             wheel: WheelAccumulator::default(),
         })
+    }
+
+    /// Map the viewer's pointer over `region` of the root, the part of the
+    /// screen the viewer sees (SLICE-C1 C1-2). The default is the whole root.
+    #[must_use]
+    pub fn over(mut self, region: Region) -> Self {
+        self.region = region;
+        self
     }
 
     fn fake(&self, kind: u8, detail: u8, x: i16, y: i16) -> Result<(), InputError> {
@@ -69,8 +81,9 @@ impl InputSink for XTestSink {
     fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
         match *event {
             InputEvent::PointerMove { x, y } => {
-                let px = i16::try_from(denormalize(x, self.width)).unwrap_or(i16::MAX);
-                let py = i16::try_from(denormalize(y, self.height)).unwrap_or(i16::MAX);
+                let (px, py) = place(x, y, (self.width, self.height), self.region);
+                let px = i16::try_from(px).unwrap_or(i16::MAX);
+                let py = i16::try_from(py).unwrap_or(i16::MAX);
                 self.fake(xproto::MOTION_NOTIFY_EVENT, 0, px, py)?;
             }
             InputEvent::PointerButton { button, pressed } => {
@@ -113,5 +126,43 @@ impl InputSink for XTestSink {
         }
         self.conn.flush().map_err(err)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+
+    use super::*;
+
+    /// SLICE-C1 C1-2: the viewer's pointer covers the part of the screen it
+    /// sees, the top-left crop the encoder sends, and not the whole root. Runs
+    /// only on an X11 session, so never against a live Xwayland desktop:
+    /// `xvfb-run -a -s "-screen 0 1280x720x24" env XDG_SESSION_TYPE=x11 cargo
+    /// test --workspace -- x11::tests`.
+    #[test]
+    fn the_pointer_spans_the_region_the_viewer_sees() {
+        if std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("x11") {
+            return;
+        }
+        let crop = |w: u32, h: u32| (w.min(1000), h.min(600));
+        let mut sink = XTestSink::connect()
+            .expect("an X11 session has XTEST")
+            .over(crop);
+        let (width, height) = (sink.width, sink.height);
+        assert!(
+            width > 1000 && height > 600,
+            "needs a screen above 1000x600"
+        );
+        for (x, y, want) in [
+            (65535, 65535, (999, 599)),
+            (0, 0, (0, 0)),
+            (32768, 32768, (500, 300)),
+        ] {
+            sink.inject(&InputEvent::PointerMove { x, y }).unwrap();
+            let at = sink.conn.query_pointer(sink.root).unwrap().reply().unwrap();
+            let got = (u32::from(at.root_x as u16), u32::from(at.root_y as u16));
+            assert_eq!(got, want, "({x}, {y}) on a {width}x{height} root");
+        }
     }
 }
