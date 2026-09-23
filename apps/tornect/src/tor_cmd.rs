@@ -143,9 +143,11 @@ fn describe_source(source: Source, desktop: &DesktopBackend) -> String {
 }
 
 /// `tornect doctor`'s lines about capture: the backend a host would share its
-/// desktop with here (SLICE-C3 C3-5).
-pub(crate) fn capture_lines(_paths: &Paths, desktop: &DesktopBackend) -> Vec<String> {
-    let lines = vec![match desktop {
+/// desktop with here (SLICE-C3 C3-5), and on Wayland the file that holds the
+/// desktop's remembered grant, whose deletion revokes it. The path is printed
+/// for the owner and never logged.
+pub(crate) fn capture_lines(paths: &Paths, desktop: &DesktopBackend) -> Vec<String> {
+    let mut lines = vec![match desktop {
         DesktopBackend::Wayland => {
             "capture: wayland (the RemoteDesktop portal and PipeWire)".to_owned()
         }
@@ -153,6 +155,15 @@ pub(crate) fn capture_lines(_paths: &Paths, desktop: &DesktopBackend) -> Vec<Str
         DesktopBackend::Gdi => "capture: gdi (GDI and SendInput)".to_owned(),
         DesktopBackend::Unavailable(why) => format!("capture: none ({why})"),
     }];
+    if *desktop == DesktopBackend::Wayland {
+        let token = paths.portal_restore_token();
+        lines.push(format!(
+            "  desktop grant: {} [{}]; delete it to revoke the remembered grant, and the \
+             desktop asks again at the next session",
+            token.display(),
+            if token.exists() { "present" } else { "absent" }
+        ));
+    }
     lines
 }
 
@@ -1411,13 +1422,23 @@ mod tests {
         assert!(card.contains("test card"), "{card}");
     }
 
-    /// SLICE-C3 C3-5: `doctor` names the backend truthfully.
+    /// SLICE-C3 C3-5 and the Wayland grant's revocation: `doctor` names the
+    /// backend truthfully, and on Wayland the file whose deletion revokes the
+    /// desktop's remembered grant.
     #[test]
-    fn doctor_names_the_capture_backend() {
+    fn doctor_names_the_capture_backend_and_how_to_revoke_the_grant() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(tmp.path());
+        let token = paths.portal_restore_token().display().to_string();
         let wayland = capture_lines(&paths, &DesktopBackend::Wayland).join("\n");
         assert!(wayland.contains("capture: wayland"), "{wayland}");
+        assert!(wayland.contains(&token), "{wayland}");
+        assert!(wayland.contains("absent"), "{wayland}");
+        assert!(wayland.contains("delete"), "{wayland}");
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::write(paths.portal_restore_token(), "t").unwrap();
+        let kept = capture_lines(&paths, &DesktopBackend::Wayland).join("\n");
+        assert!(kept.contains("present"), "{kept}");
         let x11 = capture_lines(&paths, &DesktopBackend::X11).join("\n");
         assert!(x11.contains("capture: x11"), "{x11}");
         assert!(!x11.contains("out of scope"), "{x11}");
