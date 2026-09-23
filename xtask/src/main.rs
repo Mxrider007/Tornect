@@ -312,6 +312,15 @@ mod tests {
             .filter(|(_, value)| value.is_none())
             .filter_map(|(name, _)| name.to_str().map(str::to_owned))
             .collect();
+        // Nothing else goes: a filter widened to every `CARGO_` name would
+        // take the developer's own settings with it, such as the
+        // `CARGO_BUILD_JOBS` every build on the dev VM sets (SLICE-D R5/R8).
+        for name in &removed {
+            assert!(
+                set_by_cargo_run(name),
+                "{name} is removed, but `cargo run` did not set it"
+            );
+        }
         for name in [
             "CARGO_PKG_NAME",
             "CARGO_PKG_VERSION_MAJOR",
