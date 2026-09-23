@@ -333,6 +333,32 @@ mod tests {
         }
     }
 
+    /// SLICE-E E1-2: a crafted 64-character label can neither push the mode
+    /// or the clock out of the line nor stand in for them: the line says the
+    /// headline, the mode and the clock first, and the label, shortened,
+    /// last.
+    #[test]
+    fn a_long_label_cannot_hide_or_imitate_the_mode_and_the_clock() {
+        let ctx = egui::Context::default();
+        let crafted: String = format!("Ana\" · view only · 00:04 {}", "x".repeat(64))
+            .chars()
+            .take(64)
+            .collect();
+        let mut a = captured(session("aa", &crafted, true), true);
+        a.since = Instant::now() - Duration::from_secs(65);
+        let (drawn, _) = texts(&ctx, window_input(), std::slice::from_ref(&a));
+        let (line, rect) = drawn
+            .iter()
+            .find(|(t, _)| t.starts_with("SHARING"))
+            .expect("the session's line");
+        assert!(
+            line.starts_with("SHARING · control · 01:05 · \"Ana"),
+            "{line}"
+        );
+        assert!(!line.contains(&crafted), "shortened: {line}");
+        assert!(rect.max.x <= size(1).width as f32, "{rect:?}");
+    }
+
     /// The window shows who, which mode and the clock, and follows a mode
     /// change; its Stop is the banner's Stop (`StopSharing`, the host-wide
     /// kill), never the end of the session this machine views.

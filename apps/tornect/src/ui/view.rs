@@ -37,6 +37,22 @@ const ARM_AFTER: Duration = Duration::from_secs(1);
 /// still count as not moved: layout rounding, not a move.
 const MOVE_TOLERANCE: f32 = 1.0;
 
+/// How many characters of a viewer's label the banner and the indicator
+/// show: a pinned label of up to 64 characters must not push Stop, the mode
+/// or the clock out of sight, nor pass for them (SLICE-E E1-2). The banner's
+/// tooltip has the whole label.
+const LABEL_SHOWN: usize = 24;
+
+/// `label`, cut to [`LABEL_SHOWN`] characters with an ellipsis.
+fn shown(label: &str) -> String {
+    if label.chars().count() <= LABEL_SHOWN {
+        return label.to_owned();
+    }
+    let mut out: String = label.chars().take(LABEL_SHOWN - 1).collect();
+    out.push('…');
+    out
+}
+
 /// What the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -216,31 +232,41 @@ fn question(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 /// §6.3: "Sharing with `name` · 12:41 · End", for as long as a session runs.
+/// Laid out from the right: Stop, then the clock, then the line, which says
+/// what the viewer may do before it names the viewer and is cut to the room
+/// left, so that no label can push Stop out of the window or pass for the
+/// mode (SLICE-E E1-2).
 fn sharing_banner(ui: &mut egui::Ui, sharing: &Sharing, now: Instant, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
-        let mode = if sharing.control {
-            "can see and control this screen"
-        } else {
-            "can see this screen (view only)"
-        };
-        ui.label(
-            RichText::new(format!(
-                "{}  \"{}\" {mode}",
-                headline(sharing),
-                sharing.label
-            ))
-            .strong()
-            .color(Color32::WHITE),
-        );
-        ui.label(
-            RichText::new(clock(sharing.since, now))
-                .monospace()
-                .color(Color32::WHITE),
-        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button(RichText::new("Stop sharing").strong()).clicked() {
                 actions.push(Action::StopSharing);
             }
+            ui.label(
+                RichText::new(clock(sharing.since, now))
+                    .monospace()
+                    .color(Color32::WHITE),
+            );
+            let mode = if sharing.control {
+                "sees and controls this screen"
+            } else {
+                "sees this screen (view only)"
+            };
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "{} · {mode} · \"{}\"",
+                            headline(sharing),
+                            shown(&sharing.label)
+                        ))
+                        .strong()
+                        .color(Color32::WHITE),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(format!("\"{}\"", sharing.label));
+            });
         });
     });
     if sharing.capture.is_none() {
@@ -315,13 +341,16 @@ pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: 
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                     for s in sharing {
                         let mode = if s.control { "control" } else { "view only" };
+                        // The label last, and shortened: it can neither push
+                        // the mode or the clock out nor pass for them
+                        // (SLICE-E E1-2).
                         ui.add(
                             egui::Label::new(
                                 RichText::new(format!(
-                                    "{}  \"{}\" · {mode} · {}",
+                                    "{} · {mode} · {} · \"{}\"",
                                     headline(s),
-                                    s.label,
-                                    clock(s.since, now)
+                                    clock(s.since, now),
+                                    shown(&s.label)
                                 ))
                                 .strong()
                                 .color(Color32::WHITE),
@@ -633,7 +662,13 @@ fn host_popup(
                 "The other device shows a code too. Pair only if the numbers match on both \
                      screens; if they differ, refuse: something between you changed them.",
             );
-            let label = form.labels.entry(popup.id).or_default();
+            // It starts with the declared name (a re-pair: the pinned label,
+            // which the store keeps), so the owner sees what an accept
+            // without typing pins (SLICE-E E1-2).
+            let label = form
+                .labels
+                .entry(popup.id)
+                .or_insert_with(|| pinned.as_ref().unwrap_or(name).clone());
             ui.horizontal(|ui| {
                 ui.label("Name it (optional):");
                 ui.text_edit_singleline(label);
@@ -933,6 +968,28 @@ mod tests {
             )
         }
 
+        /// The rectangle (x0, y0, x1, y1) of the widget labelled `label` in
+        /// the last pass.
+        fn bounds(&self, label: &str) -> (f64, f64, f64, f64) {
+            let b = self
+                .nodes
+                .iter()
+                .find(|n| n.label() == Some(label))
+                .and_then(egui::accesskit::Node::bounds)
+                .unwrap_or_else(|| panic!("no \"{label}\" on screen"));
+            (b.x0, b.y0, b.x1, b.y1)
+        }
+
+        /// The text of the label node whose text starts with `start`.
+        fn text(&self, start: &str) -> String {
+            self.nodes
+                .iter()
+                .filter_map(|n| n.value())
+                .find(|v| v.starts_with(start))
+                .unwrap_or_else(|| panic!("no text starting with \"{start}\""))
+                .to_owned()
+        }
+
         /// Whether the button labelled `label` was disabled in the last pass.
         fn disabled(&self, label: &str) -> bool {
             self.nodes
@@ -1178,6 +1235,74 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A label of the most characters a pinned label may have, crafted to
+    /// look like the indicator's own words (SLICE-E E1-2).
+    fn crafted_label() -> String {
+        let label: String = format!("Ana\" · view only · 00:04 {}", "x".repeat(64))
+            .chars()
+            .take(tornect_core::trusted::MAX_LABEL_CHARS)
+            .collect();
+        assert_eq!(label.chars().count(), 64);
+        label
+    }
+
+    /// SLICE-E E1-2: a 64-character label never pushes the banner's Stop out
+    /// of the 560-point window, and the banner says what the viewer may do
+    /// before it names the viewer.
+    #[test]
+    fn a_long_label_keeps_the_banners_stop_in_the_window() {
+        let t0 = Instant::now();
+        let model = Model {
+            sharing: vec![Sharing {
+                session_id: "0011".to_owned(),
+                label: crafted_label(),
+                control: true,
+                unattended: false,
+                since: t0,
+                capture: None,
+            }],
+            ..with_popups(Vec::new())
+        };
+        let window = Harness::new(model, t0);
+        let (x0, _, x1, _) = window.bounds("Stop sharing");
+        assert!(x0 >= 0.0 && x1 <= 560.0, "Stop at {x0}..{x1}");
+        let line = window.text("SHARING");
+        assert!(
+            line.starts_with("SHARING · sees and controls this screen · \"Ana"),
+            "{line}"
+        );
+        assert!(!line.contains(&crafted_label()), "shortened: {line}");
+    }
+
+    /// SLICE-E E1-2: the pairing card's name field starts with the name the
+    /// device declared (a re-pair: the label it is pinned under), so the
+    /// owner sees what an accept without typing pins.
+    #[test]
+    fn the_name_field_starts_with_the_declared_name() {
+        for (pinned, expected) in [(None, "Phone"), (Some("Old laptop"), "Old laptop")] {
+            let t0 = Instant::now();
+            let mut popup = pairing_popup(3, t0);
+            if let PopupKind::Pairing { pinned: p, .. } = &mut popup.kind {
+                *p = pinned.map(str::to_owned);
+            }
+            let mut window = Harness::new(with_popups(vec![popup]), t0);
+            window.pass(t0 + Duration::from_millis(1500), Vec::new());
+            let pair = window.button("The codes match: pair");
+            let actions = window.click(t0 + Duration::from_millis(1600), pair);
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [Action::Pair {
+                        id: 3,
+                        decision: PairDecision::Accept { label: Some(l) },
+                        ..
+                    }] if l == expected
+                ),
+                "{actions:?}"
+            );
         }
     }
 
