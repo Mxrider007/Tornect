@@ -1,7 +1,8 @@
 //! `cargo xtask <command>` — repository automation (`docs/PLAN.md` §D.5).
 //!
-//! * `verify`      — plan sync, forbidden-dependency check, `cargo deny` (offline),
-//!   fmt check, clippy `-D warnings` on all targets, tests, docs
+//! * `verify`      — plan sync, forbidden-dependency check, `cargo deny` (offline;
+//!   the gate fails without it), fmt check, clippy `-D warnings` on all targets,
+//!   tests, docs
 //! * `lint-all`    — fmt check + clippy only
 //! * `pt-fetch`    — lyrebird from the Tor Project archive, checked against
 //!   `packaging/pt/SOURCES.md`, into `target/pt/<os>/`
@@ -189,15 +190,22 @@ fn forbidden_deps(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `cargo-deny`: on `PATH`, or the prebuilt copy under `target/tools/`.
+/// `cargo-deny`: the prebuilt copy under `target/tools/<dir>/`, else on `PATH`.
 fn find_cargo_deny(root: &Path) -> Option<PathBuf> {
+    find_cargo_deny_in(
+        &root.join("target").join("tools"),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+fn find_cargo_deny_in(tools: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
     let bin = format!("cargo-deny{}", std::env::consts::EXE_SUFFIX);
-    let tools = std::fs::read_dir(root.join("target").join("tools")).ok();
+    let tools = std::fs::read_dir(tools).ok();
     let bundled = tools.into_iter().flatten().flatten().find_map(|entry| {
         let candidate = entry.path().join(&bin);
         candidate.is_file().then_some(candidate)
     });
-    bundled.or_else(|| std::env::var_os("PATH").and_then(|path| search_path(&path, &bin)))
+    bundled.or_else(|| path.and_then(|path| search_path(path, &bin)))
 }
 
 /// An executable named `bin` in an absolute `PATH` directory; a relative entry
@@ -239,14 +247,15 @@ fn advisory_db_date() -> Option<String> {
 /// `cargo deny check` (advisories, bans, licenses, sources), **offline**
 /// against the advisory database already on disk, so the gate needs no network
 /// and says how old that database is (SLICE-A3 F2). Without `cargo-deny` the
-/// step reports SKIPPED; it never counts as a pass.
-fn deny(root: &Path) -> anyhow::Result<bool> {
-    let Some(bin) = find_cargo_deny(root) else {
-        println!("==> cargo deny check (offline)");
-        println!(
-            "    SKIPPED: cargo-deny not found (PATH or target/tools/); advisories and licences are UNCHECKED"
-        );
-        return Ok(false);
+/// gate fails (decision B3-6): a gate that could not check advisories and
+/// licences is not green.
+fn deny(root: &Path) -> anyhow::Result<()> {
+    let bin = match require_cargo_deny(find_cargo_deny(root)) {
+        Ok(bin) => bin,
+        Err(e) => {
+            println!("==> cargo deny check (offline)");
+            return Err(e);
+        }
     };
     let db = advisory_db_date().unwrap_or_else(|| "unknown date".to_owned());
     let mut cmd = Command::new(&bin);
@@ -255,15 +264,24 @@ fn deny(root: &Path) -> anyhow::Result<bool> {
         root,
         &format!("cargo deny check (offline; advisory DB {db})"),
         cmd,
-    )?;
-    Ok(true)
+    )
+}
+
+fn require_cargo_deny(found: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    found.context(
+        "cargo-deny not found, neither under target/tools/<dir>/ nor on PATH. The gate fails \
+         without it (decision B3-6): advisories, bans, licences and sources would go unchecked. \
+         Install the pinned 0.20.2: unpack the x86_64-unknown-linux-musl archive of \
+         https://github.com/EmbarkStudios/cargo-deny/releases/tag/0.20.2 into target/tools/, \
+         or `cargo install --locked cargo-deny@0.20.2`",
+    )
 }
 
 fn verify(root: &Path, extra: &[String]) -> anyhow::Result<()> {
     let no_tests = extra.iter().any(|a| a == "--no-tests");
     plan_sync(root)?;
     forbidden_deps(root)?;
-    let denied = deny(root)?;
+    deny(root)?;
     lint_all(root)?;
     if !no_tests {
         let mut test = cargo();
@@ -279,11 +297,7 @@ fn verify(root: &Path, extra: &[String]) -> anyhow::Result<()> {
             doc,
         )?;
     }
-    if denied {
-        println!("verify: all gates green");
-    } else {
-        println!("verify: all gates green EXCEPT cargo deny, which did not run");
-    }
+    println!("verify: all gates green");
     Ok(())
 }
 
@@ -323,6 +337,42 @@ mod tests {
                 "{name} leaks into the spawned cargo"
             );
         }
+    }
+
+    /// B3-6: with no `cargo-deny` under `target/tools/` or on `PATH`, the gate
+    /// step is an error, never a skip.
+    #[test]
+    fn a_missing_cargo_deny_fails_the_gate() {
+        let dir = std::env::temp_dir().join(format!("xtask-deny-{}", std::process::id()));
+        let tools = dir.join("tools");
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(tools.join("cargo-deny-0.20.2-x86_64-unknown-linux-musl")).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let path = std::env::join_paths([&bin_dir]).unwrap();
+
+        let found = find_cargo_deny_in(&tools, Some(&path));
+        assert_eq!(found, None);
+        let err = require_cargo_deny(found).unwrap_err().to_string();
+        assert!(err.contains("cargo-deny not found"), "{err}");
+        assert!(err.contains("B3-6"), "{err}");
+
+        // The pinned copy under target/tools/<dir>/ is found, before PATH.
+        let bin = format!("cargo-deny{}", std::env::consts::EXE_SUFFIX);
+        let pinned = tools
+            .join("cargo-deny-0.20.2-x86_64-unknown-linux-musl")
+            .join(&bin);
+        std::fs::write(&pinned, b"").unwrap();
+        std::fs::write(bin_dir.join(&bin), b"").unwrap();
+        assert_eq!(
+            require_cargo_deny(find_cargo_deny_in(&tools, Some(&path))).unwrap(),
+            pinned
+        );
+        std::fs::remove_file(&pinned).unwrap();
+        assert_eq!(
+            find_cargo_deny_in(&tools, Some(&path)),
+            Some(bin_dir.join(&bin))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Whatever the fix removes, a developer's own cargo settings must survive it.
