@@ -1006,6 +1006,87 @@ impl FrameSink for NoPictures {
     fn picture(&mut self, _: u32, _: &DecodedFrame) {}
 }
 
+/// A [`Flood`] that takes the first `writes` writes (the `Bind`), and then no
+/// more, as a host that stops granting Tor credit.
+struct StallsWrites {
+    flood: Flood,
+    writes: usize,
+    stalled: bool,
+}
+
+impl tokio::io::AsyncRead for StallsWrites {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.flood).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for StallsWrites {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.writes == 0 {
+            self.stalled = true;
+            return std::task::Poll::Pending;
+        }
+        self.writes -= 1;
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.stalled {
+            return std::task::Poll::Pending;
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.stalled {
+            return std::task::Poll::Pending;
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// SLICE-C2 C2-2 (b): a stop is heard while a write to the host is stalled.
+/// The acks, keyframe requests and pongs were written outside the race with
+/// `stop`, so a host that stopped granting credit held a Ctrl-C back for as
+/// long as the stall timer allows, 30 s, per write.
+#[tokio::test(start_paused = true)]
+async fn a_stop_is_heard_while_a_write_to_the_host_is_stalled() {
+    let binding = Binding::new(&SessionToken::new([5; 32]), &[5; 32]);
+    let stream = StallsWrites {
+        flood: Flood::new().await,
+        writes: 1,
+        stalled: false,
+    };
+    let viewer = MediaViewer::bind(stream, &binding, WAIT).await.unwrap();
+    let (mut sink, mut stats) = (NoPictures, ViewerStats::default());
+    let stop = tokio::time::sleep(Duration::from_secs(1));
+    let ended = tokio::time::timeout(
+        Duration::from_secs(60),
+        viewer.run(&mut sink, &mut stats, stop),
+    )
+    .await
+    .expect("the stop waited behind a stalled write");
+    assert!(matches!(ended, Ok(ViewerEnd::Stopped)), "{ended:?}");
+    assert!(
+        stats.access_units >= 1,
+        "it read a unit and stalled on its ack"
+    );
+}
+
 /// SLICE-C2 C2-1: a host that sends as fast as the stream allows must not
 /// starve what the viewer is joined with — in `tornect connect`, the
 /// signaling keep-alive and its Ctrl-C. Before, `run` never returned `Pending`
