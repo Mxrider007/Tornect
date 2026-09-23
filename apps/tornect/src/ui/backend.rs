@@ -21,7 +21,8 @@ use tornect_signal::fsm::client::{
     self, ClientConfig, ClientDeps, ClientOutcome, Intent, NoServerKeyPin,
 };
 use tornect_signal::fsm::host::{
-    HostConfig, HostDeps, LiveSession, LiveSessions, SessionActivity as _, SessionEnd, SessionSink,
+    HostConfig, HostDeps, KillSwitch, LiveSession, LiveSessions, SessionActivity as _, SessionEnd,
+    SessionSink,
 };
 use tornect_signal::fsm::{HostAudit, OsRandom};
 use tornect_signal::messages::bye;
@@ -150,7 +151,7 @@ impl SessionSink for GuiSessions {
                 session.label,
                 if control { "control" } else { "view only" }
             ));
-            m.sharing = Some(sharing);
+            m.sharing.push(sharing);
         });
         self.shared.wake(Wake::Attention);
         say(format_args!("SESSION LIVE {}", session.session_id));
@@ -162,12 +163,7 @@ impl SessionSink for GuiSessions {
         self.live.on_end(session_id, end);
         let why = end.map_or_else(|| "protocol error".to_owned(), describe_end);
         self.shared.update(|m| {
-            if m.sharing
-                .as_ref()
-                .is_some_and(|s| s.session_id == session_id)
-            {
-                m.sharing = None;
-            }
+            m.sharing.retain(|s| s.session_id != session_id);
             m.note(format!("session ended: {why}"));
         });
         say(format_args!("SESSION ENDED {session_id}"));
@@ -190,9 +186,7 @@ impl MediaObserver for GuiMedia {
             input: s.input,
         };
         self.shared.update(|m| {
-            if let Some(sharing) = &mut m.sharing
-                && sharing.session_id == s.session_id
-            {
+            if let Some(sharing) = m.sharing.iter_mut().find(|x| x.session_id == s.session_id) {
                 sharing.capture = Some(capture);
             }
         });
@@ -512,12 +506,11 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                     }
                     Command::StopSharing => {
                         if let Some(hosted) = &hosted {
-                            hosted.serving.1.kill.kill(bye::USER);
-                            b.shared.update(|m| m.note("you stopped sharing"));
+                            stop_sharing(&hosted.serving.1.kill, &b.shared);
                         }
                     }
                     Command::Grant => {
-                        let sharing = b.shared.read(|m| m.sharing.is_some());
+                        let sharing = b.shared.read(|m| !m.sharing.is_empty());
                         if granting.is_none() && !sharing && b.shared.read(|m| m.setup.is_some()) {
                             b.shared.update(|m| {
                                 if let Some(setup) = &mut m.setup {
@@ -592,6 +585,15 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
         node.shutdown().await;
     }
     b.shared.update(|m| m.closed = true);
+}
+
+/// The Stop of the banner and of the indicator window: the host-wide kill with
+/// `BYE{USER}`, which ends every session this screen is shared with (the host
+/// serves one at a time) and refuses any popup still open, and never the
+/// session this machine views.
+fn stop_sharing(kill: &KillSwitch, shared: &Shared) {
+    kill.kill(bye::USER);
+    shared.update(|m| m.note("you stopped sharing"));
 }
 
 /// Resolves when the user ends the session (`stop` turns `true`).
@@ -744,4 +746,147 @@ async fn viewed(
             format!("No picture from \"{host}\": {e:#}")
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use tornect_signal::HostSigner;
+    use tornect_signal::fsm::client::{ScriptedClientUi, SessionEvent, connect};
+    use tornect_signal::pairing::{PairDecision, SessionDecision};
+
+    use super::super::indicator::{Change, Indicator};
+    use super::super::model::{Model, PopupKind};
+    use super::*;
+
+    /// Through the real handshake: an allowed session shows on the indicator,
+    /// and its Stop (the host-wide kill, `Command::StopSharing`) ends that
+    /// session with `BYE{USER}`, after which the indicator closes; the
+    /// session this machine views is not touched.
+    #[tokio::test]
+    async fn the_indicators_stop_ends_the_shared_session_and_it_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        // This machine also views another host; Stop must leave that alone.
+        shared.update(|m| {
+            m.client = ClientStage::Live(Viewing {
+                host: "Office PC".to_owned(),
+                control: true,
+                since: Instant::now(),
+                pictures: 0,
+                size: (0, 0),
+            });
+        });
+        let popups = Popups::new(Arc::clone(&shared));
+        let identity = Arc::new(HostIdentity::from_seed(&[0x11; 32]));
+        let media = Arc::new(MediaHost::new(
+            Arc::new(SystemBackend::new(Source::TestCard)),
+            Arc::new(GuiMedia {
+                shared: Arc::clone(&shared),
+            }),
+            MediaLimits::default(),
+        ));
+        let mut wiring = crate::host::wire(
+            &paths,
+            &Config::default(),
+            Arc::clone(&identity),
+            HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32])),
+            Arc::new(AutoDeny),
+            Arc::clone(&media),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        let (started_tx, started) = watch::channel(0u64);
+        let activity = Arc::clone(&wiring.live);
+        wiring.deps.consent = Arc::new(GuiConsent::new(
+            Arc::clone(&popups),
+            Withdraw {
+                kill: wiring.deps.kill.clone(),
+                started,
+                live: Arc::new(move || activity.session_live()),
+            },
+        ));
+        wiring.deps.sessions = Arc::new(GuiSessions {
+            live: Arc::clone(&wiring.live),
+            media,
+            shared: Arc::clone(&shared),
+            started: started_tx,
+        });
+        let kill = wiring.deps.kill.clone();
+        let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+        let (client_end, host_end) = tokio::io::duplex(64 * 1024);
+        let host = tokio::spawn(async move {
+            crate::host::serve_signaling(host_end, &cfg, &deps, |_| {}).await;
+        });
+
+        // The window's user: the codes match, and the session may control.
+        let answering = {
+            let popups = Arc::clone(&popups);
+            tokio::spawn(async move {
+                for _ in 0..2000 {
+                    let open = popups.shared().read(|m| m.popups.clone());
+                    if let Some(p) = open.first() {
+                        match p.kind {
+                            PopupKind::Pairing { .. } => {
+                                popups.answer_pairing(p.id, PairDecision::Accept { label: None });
+                            }
+                            PopupKind::Session { .. } => {
+                                popups.answer_session(p.id, SessionDecision::AllowOnce);
+                                return;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                panic!("no session popup");
+            })
+        };
+        let known = Arc::new(
+            KnownHostStore::open(paths.state_dir.join("client-known-hosts.toml")).unwrap(),
+        );
+        let mut cdeps = ClientDeps::headless(known);
+        cdeps.ui = Arc::new(ScriptedClientUi::new(true));
+        let device = DeviceIdentity::from_seed(&[0x22; 32]);
+        let ccfg = ClientConfig::new(identity.id(), "Laptop");
+        let outcome = connect(client_end, &ccfg, &device, &cdeps, Intent::Session).await;
+        answering.await.unwrap();
+        let Ok(ClientOutcome::Session(mut session)) = outcome else {
+            panic!("no session: {outcome:?}");
+        };
+        session.send_tor_fallback().await.unwrap();
+
+        // Live: the indicator opens and shows the session.
+        let sharing = shared.read(|m| m.sharing.clone());
+        assert_eq!(sharing.len(), 1);
+        assert_eq!(sharing[0].label, "Laptop");
+        assert!(sharing[0].control);
+        let mut indicator = Indicator::default();
+        assert_eq!(indicator.sync(&sharing), Change::Open);
+
+        // Stop, as `Command::StopSharing` runs it.
+        stop_sharing(&kill, &shared);
+        match session.next_event(Duration::from_secs(10)).await {
+            Ok(Some(SessionEvent::Bye { reason, .. })) => assert_eq!(reason, bye::USER),
+            other => panic!("expected BYE{{USER}}, got {other:?}"),
+        }
+        let mut closed = false;
+        for _ in 0..2000 {
+            let sharing = shared.read(|m| m.sharing.clone());
+            if indicator.sync(&sharing) == Change::Close {
+                closed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(closed, "the indicator closed at the session's end");
+        assert!(
+            shared.read(|m| matches!(m.client, ClientStage::Live(_))),
+            "the viewed session is not the one Stop ends"
+        );
+        tokio::time::timeout(Duration::from_secs(10), host)
+            .await
+            .expect("the host's stream task ended")
+            .unwrap();
+    }
 }

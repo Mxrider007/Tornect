@@ -86,8 +86,11 @@ pub struct Model {
     pub popups: Vec<Popup>,
     /// The client's "did the host show this code?" question.
     pub confirm: Option<Confirm>,
-    /// The session this machine's screen is shared with.
-    pub sharing: Option<Sharing>,
+    /// The sessions this machine's screen is shared with, oldest first. The
+    /// host serves one at a time, but a list keeps every live one on the
+    /// indicator should two ever overlap (one's end reported after the next
+    /// one's start).
+    pub sharing: Vec<Sharing>,
     /// The session this machine is viewing.
     pub client: ClientStage,
     /// The last few things that happened, newest last.
@@ -231,8 +234,9 @@ pub struct Confirm {
     pub deadline: Instant,
 }
 
-/// The session this machine's screen is shared with: the persistent sharing
-/// indicator (`docs/UI_PLAN.md` §6.3).
+/// A session this machine's screen is shared with: what the persistent
+/// sharing indicator shows (`docs/UI_PLAN.md` §6.3), in the main window's
+/// banner and in its own window (`indicator`).
 #[derive(Debug, Clone)]
 pub struct Sharing {
     /// `sessions.log`'s session id.
