@@ -31,8 +31,12 @@ const SAS_SIZE: f32 = 44.0;
 pub enum Action {
     /// Connect to this Tornect ID.
     Connect(TornectId),
-    /// End the session this screen is shared with (the kill).
+    /// End the session this screen is shared with (the kill), from the banner
+    /// or the indicator window.
     StopSharing,
+    /// Start moving the indicator window with the pointer (it has no title
+    /// bar).
+    MoveIndicator,
     /// End the session this machine views.
     EndViewing,
     /// Open the desktop's screen-sharing dialog now (the first-run grant).
@@ -90,14 +94,18 @@ pub fn main_window(
     now: Instant,
     actions: &mut Vec<Action>,
 ) {
-    if let Some(sharing) = &model.sharing {
+    if !model.sharing.is_empty() {
         egui::Panel::top("sharing")
             .frame(
                 egui::Frame::new()
                     .fill(palette::SHARING)
                     .inner_margin(egui::Margin::symmetric(12, 8)),
             )
-            .show(ui, |ui| sharing_banner(ui, sharing, now, actions));
+            .show(ui, |ui| {
+                for sharing in &model.sharing {
+                    sharing_banner(ui, sharing, now, actions);
+                }
+            });
     }
     // A label typed into a question that is gone goes with it.
     form.labels
@@ -116,7 +124,7 @@ pub fn main_window(
         });
     });
     // Countdowns and the banner's clock move once a second.
-    if !model.popups.is_empty() || model.confirm.is_some() || model.sharing.is_some() {
+    if !model.popups.is_empty() || model.confirm.is_some() || !model.sharing.is_empty() {
         ui.ctx().request_repaint_after(Duration::from_millis(500));
     }
 }
@@ -165,20 +173,89 @@ fn sharing_banner(ui: &mut egui::Ui, sharing: &Sharing, now: Instant, actions: &
         );
     }
     if let Some(capture) = &sharing.capture {
-        let input = match (sharing.control, capture.input) {
-            (false, _) => "their input is ignored",
-            (true, true) => "their keyboard and mouse act on this desktop",
-            (true, false) => "their input reaches nothing here",
-        };
         ui.label(
             RichText::new(format!(
-                "{} {}×{} · {input}",
-                capture.source, capture.width, capture.height
+                "{} {}×{} · {}",
+                capture.source,
+                capture.width,
+                capture.height,
+                input_effect(sharing.control, capture.input)
             ))
             .small()
             .color(Color32::WHITE),
         );
     }
+}
+
+/// What the viewer's input does here: the session's mode, and once capture
+/// started, whether input is injected at all.
+fn input_effect(control: bool, injected: bool) -> &'static str {
+    match (control, injected) {
+        (false, _) => "their input is ignored",
+        (true, true) => "their keyboard and mouse act on this desktop",
+        (true, false) => "their input reaches nothing here",
+    }
+}
+
+/// The indicator window (§6.3, `indicator`): for every session this screen
+/// is shared with, who, which mode and the clock; and Stop, which ends sharing
+/// exactly as the banner's Stop does. A press anywhere else moves the window.
+pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: &mut Vec<Action>) {
+    // Text is not selectable here: a press on it moves the window instead.
+    ui.style_mut().interaction.selectable_labels = false;
+    egui::CentralPanel::no_frame()
+        .frame(
+            egui::Frame::new()
+                .fill(palette::SHARING)
+                .inner_margin(egui::Margin::symmetric(10, 8)),
+        )
+        .show(ui, |ui| {
+            // Click-and-drag, not drag alone: a drag-only area would start
+            // moving at the press, even a press on Stop, and the desktop's
+            // move would then swallow Stop's release.
+            let grab = ui.interact(
+                ui.max_rect(),
+                egui::Id::new("indicator-move"),
+                egui::Sense::click_and_drag(),
+            );
+            if grab.drag_started() {
+                actions.push(Action::MoveIndicator);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(RichText::new("Stop").strong()).clicked() {
+                    actions.push(Action::StopSharing);
+                }
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    for s in sharing {
+                        let mode = if s.control { "control" } else { "view only" };
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "SHARING  \"{}\" · {mode} · {}",
+                                    s.label,
+                                    clock(s.since, now)
+                                ))
+                                .strong()
+                                .color(Color32::WHITE),
+                            )
+                            .truncate(),
+                        );
+                        let detail = s
+                            .capture
+                            .as_ref()
+                            .map_or("starting: no picture has gone out yet", |c| {
+                                input_effect(s.control, c.input)
+                            });
+                        ui.add(
+                            egui::Label::new(RichText::new(detail).small().color(Color32::WHITE))
+                                .truncate(),
+                        );
+                    }
+                });
+            });
+        });
+    // The clock moves once a second.
+    ui.ctx().request_repaint_after(Duration::from_millis(500));
 }
 
 fn home(ui: &mut egui::Ui, model: &Model, form: &mut Form, actions: &mut Vec<Action>) {
@@ -206,7 +283,7 @@ fn home(ui: &mut egui::Ui, model: &Model, form: &mut Form, actions: &mut Vec<Act
 
     if let Some(setup) = &model.setup {
         ui.add_space(10.0);
-        setup_card(ui, setup, model.sharing.is_some(), actions);
+        setup_card(ui, setup, !model.sharing.is_empty(), actions);
     }
 
     ui.add_space(12.0);
@@ -751,7 +828,7 @@ mod tests {
             sas: "654 321".to_owned(),
             deadline: now + Duration::from_secs(50),
         });
-        model.sharing = Some(Sharing {
+        model.sharing = vec![Sharing {
             session_id: "0011".to_owned(),
             label: "Laptop".to_owned(),
             control: true,
@@ -762,7 +839,7 @@ mod tests {
                 height: 1080,
                 input: false,
             }),
-        });
+        }];
         for stage in [
             ClientStage::Reaching {
                 id: "abcd".to_owned(),

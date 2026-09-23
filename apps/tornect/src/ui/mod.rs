@@ -8,7 +8,9 @@
 //! G): the home screen with this machine's ID, the Tor status and the transport
 //! in use, a connect field; the host's pairing and session popups and the
 //! client's code comparison (`consent`, replacing the terminal's `prompt`);
-//! the persistent sharing banner with Stop; the stream window, which draws the
+//! the persistent sharing banner with Stop, and the same in a small
+//! always-on-top window of its own for as long as the screen is shared
+//! (`indicator`); the stream window, which draws the
 //! host's screen and sends input by physical scancode in a control session
 //! (`stream`, `keys`); and on a Wayland desktop the first-run screen-sharing
 //! grant (the operator's decision of 2026-09-23).
@@ -16,6 +18,7 @@
 mod app;
 mod backend;
 mod consent;
+mod indicator;
 mod keys;
 mod model;
 mod preview;

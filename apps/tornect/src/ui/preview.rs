@@ -61,7 +61,7 @@ pub fn fill(shared: &Shared, token_file: &Path) {
             sas: "305 116".to_owned(),
             deadline: now + Duration::from_secs(50),
         });
-        m.sharing = Some(Sharing {
+        m.sharing = vec![Sharing {
             session_id: "0123456789abcdef".to_owned(),
             label: "Laptop".to_owned(),
             control: true,
@@ -72,7 +72,7 @@ pub fn fill(shared: &Shared, token_file: &Path) {
                 height: 1080,
                 input: true,
             }),
-        });
+        }];
         m.client = ClientStage::Live(Viewing {
             host: "Office PC".to_owned(),
             control: true,
