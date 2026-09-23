@@ -415,4 +415,72 @@ mod tests {
             SystemBackend::new(Source::Desktop).with_restore_token(PathBuf::from("unused"));
         assert!(backend.wayland_injector().is_none());
     }
+
+    /// SLICE-C3 C3-3 at its call sites: on an X11 session whose `DISPLAY` has
+    /// a host part, the desktop backend neither captures nor injects, and
+    /// never connects to that display. A child run of this test gets that
+    /// environment; here a listener plays the other machine's X server, and
+    /// nothing may reach it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn another_machines_display_is_neither_captured_nor_driven() {
+        const CHILD: &str = "TORNECT_TEST_REMOTE_DISPLAY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let backend = SystemBackend::new(Source::Desktop);
+            let refused = backend
+                .open_source()
+                .err()
+                .expect("captured another machine's display");
+            assert!(
+                refused
+                    .to_string()
+                    .contains("is not this machine's own display"),
+                "{refused}"
+            );
+            assert!(backend.open_injector().is_none());
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // X display N is TCP port 6000 + N.
+        let number = listener.local_addr().unwrap().port().checked_sub(6000);
+        let display = format!("127.0.0.1:{}", number.expect("a port above 6000"));
+        let exe = std::env::current_exe().unwrap();
+        let child = std::thread::spawn(move || {
+            std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "backend::tests::another_machines_display_is_neither_captured_nor_driven",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("XDG_SESSION_TYPE", "x11")
+                .env("DISPLAY", display)
+                .output()
+                .unwrap()
+        });
+        // A connection is dropped at once, so a child that connects cannot hang.
+        let mut reached = 0;
+        loop {
+            let finished = child.is_finished();
+            while listener.accept().is_ok() {
+                reached += 1;
+            }
+            if finished {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let out = child.join().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            reached, 0,
+            "the backend connected to another machine's display"
+        );
+        assert!(
+            out.status.success() && said.contains("1 passed"),
+            "the child run: {said}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
