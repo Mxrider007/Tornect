@@ -46,6 +46,16 @@ impl FrameSlot {
         slot.fresh = true;
     }
 
+    /// Forget a picture not drawn yet (the buffer stays for the next one): a
+    /// new session starts here, and a closed window's last picture must never
+    /// reach the next session's window (SLICE-E E1-3).
+    pub fn clear(&self) {
+        self.picture
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .fresh = false;
+    }
+
     /// Swap the fresh picture into `into` (whose buffer the slot keeps for the
     /// next one); `false`, and `into` untouched, when nothing new came.
     pub fn take(&self, into: &mut Picture) -> bool {
@@ -69,9 +79,12 @@ pub struct SlotSink {
 }
 
 impl SlotSink {
-    /// Feed `slot`, and count in `shared`.
+    /// Feed `slot`, and count in `shared`. A sink starts a viewed session:
+    /// the slot is emptied first, so a picture the previous session left in
+    /// it is never shown (SLICE-E E1-3).
     #[must_use]
     pub fn new(slot: Arc<FrameSlot>, shared: Arc<Shared>) -> Self {
+        slot.clear();
         Self {
             slot,
             shared,
@@ -474,9 +487,12 @@ impl Forwarder {
     }
 
     /// A physical key, as its USB usage, went down or up. Keys go out whether
-    /// or not the pointer is on the picture: the window has the keyboard.
+    /// or not the pointer is on the picture: the window has the keyboard. A
+    /// press before the first picture is drawn is dropped: it would land on a
+    /// screen the viewer has not seen (SLICE-E E1-4). A release always goes
+    /// out; the host drops one for a key it never saw pressed.
     pub fn key(&mut self, usb: u32, pressed: bool) {
-        if !self.open {
+        if !self.open || (pressed && self.picture.is_none()) {
             return;
         }
         self.flush_pending();
@@ -694,6 +710,39 @@ mod tests {
         f.key(0x07_0004, true);
         f.focus_lost();
         assert_eq!(f.drain(), vec![key_a(true), InputEvent::ReleaseAll]);
+    }
+
+    /// SLICE-E E1-4: keys typed while the window still waits for the first
+    /// picture are not sent: they would land on a screen the viewer has not
+    /// seen. Once a picture is drawn they are; a key-up always goes out (the
+    /// host drops one for a key it never saw pressed).
+    #[test]
+    fn keys_wait_for_the_first_picture() {
+        let mut f = Forwarder::new(true);
+        f.key(0x07_0004, true);
+        f.key(0x07_0005, true);
+        assert!(f.drain().is_empty(), "nothing before the first picture");
+        f.set_picture(Some(RECT));
+        f.key(0x07_0004, false);
+        f.key(0x07_0004, true);
+        assert_eq!(f.drain(), vec![key_a(false), key_a(true)]);
+    }
+
+    /// SLICE-E E1-3: a picture of the previous session that reached the slot
+    /// after its window closed is never shown: a new session's sink starts
+    /// from an empty slot.
+    #[test]
+    fn a_new_session_never_shows_the_last_ones_picture() {
+        let slot = Arc::new(FrameSlot::default());
+        slot.put(&DecodedFrame {
+            width: 1,
+            height: 1,
+            rgba: vec![9, 9, 9, 255],
+        });
+        let shared = Shared::new(super::super::model::Model::default(), Arc::new(|_| {}));
+        let _sink = SlotSink::new(Arc::clone(&slot), shared);
+        let mut mine = Picture::default();
+        assert!(!slot.take(&mut mine), "the old picture was handed over");
     }
 
     /// The picture keeps its aspect inside the window, centred.
