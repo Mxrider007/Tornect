@@ -7,13 +7,22 @@ rustflags = []
 # Windows cross-build from Linux with llvm-mingw (docs/research/slice.md §1):
 # the target's default linker `x86_64-w64-mingw32-clang` and the `cc` C/C++
 # compilers must be on PATH (`cargo xtask dist --windows` adds them). `+crt-static`
-# links libc++ and libunwind statically, so no DLLs travel with tornect.exe.
+# links libunwind statically, and `-l:libc++.a` links libc++ statically (llvm-mingw's
+# `libc++.a` includes libc++abi; see `CXXSTDLIB_…` below), so tornect.exe imports only
+# DLLs that Windows 10 ships (the UCRT's `api-ms-win-crt-*` included) and no DLL
+# travels with it. lld resolves archives whatever their place on the command line.
 [target.x86_64-pc-windows-gnullvm]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-l:libc++.a"]
 
 [env]
-# `cc` asks for libstdc++ on every non-MSVC target; llvm-mingw ships libc++.
-CXXSTDLIB_x86_64_pc_windows_gnullvm = "c++"
+# `cc` asks for libstdc++ on every non-MSVC target; llvm-mingw ships libc++. Empty:
+# `cc` asks for no C++ library, and the rustflags above link `libc++.a`. `c++` is a
+# dylib request, which lld answered with `libc++.dll.a`, so tornect.exe needed
+# llvm-mingw's `libc++.dll` beside it (seen 2026-09-23); rustc refuses
+# `static:-bundle=c++` because OpenH264's build script prints it four times (once per
+# `compile()`), and a bundled `static=c++` would need llvm-mingw's library directory,
+# which is per machine, on rustc's search path.
+CXXSTDLIB_x86_64_pc_windows_gnullvm = ""
 # Stack protector for every C and C++ object `cc` builds for Windows (A3-F4):
 # OpenH264 (its build script adds `-fstack-protector-all` except on Windows GNU
 # targets, gnullvm included), ring, the bundled SQLite, zstd and liblzma.
