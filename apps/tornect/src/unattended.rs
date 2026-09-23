@@ -1842,6 +1842,39 @@ mod tests {
         drop(host);
     }
 
+    /// SLICE-D D1, as the CLI runs it: `route()` picks the offline route while
+    /// no host runs, a host then takes its lock, and `On` down that route is
+    /// refused with `G_REMOTE_SESSION_ACTIVE` and blamed on the host. The two
+    /// tests above build their guard from `offline_activity` themselves, so
+    /// only this one sees what `offline_context` wires in.
+    #[test]
+    fn the_offline_route_counts_a_host_that_started_as_a_live_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        let rt = runtime().unwrap();
+        let picked = rt.block_on(route(&paths)).unwrap();
+        let Route::Offline(ctx) = &picked else {
+            panic!("no host runs yet, so the route is offline");
+        };
+        let host = crate::host::HostLock::acquire(&paths).unwrap();
+        let resp = go(ctx, IpcOp::On);
+        assert!(!resp.ok, "On went through beside a host that started");
+        assert_eq!(
+            resp.code,
+            codes::G_REMOTE_SESSION_ACTIVE,
+            "{:?}",
+            resp.detail
+        );
+        assert!(resp.payload.is_none(), "no stop code");
+        assert!(!enabled(ctx));
+        let said = rt
+            .block_on(send(&paths, &picked, IpcOp::On))
+            .unwrap_err()
+            .to_string();
+        assert!(said.contains("while this command ran"), "{said}");
+        drop(host);
+    }
+
     fn enabled(ctx: &HostContext) -> bool {
         let resp = go(ctx, IpcOp::Status);
         let report: StatusReport = decode_payload(resp.payload.as_deref().unwrap()).unwrap();
