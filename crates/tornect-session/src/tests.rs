@@ -80,6 +80,9 @@ struct TestBackend {
     sources: AtomicUsize,
     injectors: AtomicUsize,
     recorder: Recorder,
+    /// What an injector is built from, kept when a source opens, as the
+    /// Wayland backend keeps its portal session's input handle.
+    input: Mutex<Option<Recorder>>,
 }
 
 impl MediaBackend for TestBackend {
@@ -88,6 +91,7 @@ impl MediaBackend for TestBackend {
         if self.fail {
             return Err(CaptureError::Unavailable("no screen here".into()));
         }
+        *self.input.lock().unwrap() = Some(self.recorder.clone());
         Ok(Box::new(Card {
             // Faster than the encoder's 15 fps, so the encoder sets the pace.
             inner: TestCard::new(256, 96, 60),
@@ -96,8 +100,13 @@ impl MediaBackend for TestBackend {
     }
 
     fn open_injector(&self) -> Option<Box<dyn InputSink>> {
+        let input = self.input.lock().unwrap().take()?;
         self.injectors.fetch_add(1, Ordering::SeqCst);
-        Some(Box::new(self.recorder.clone()))
+        Some(Box::new(input))
+    }
+
+    fn view_only(&self) {
+        self.input.lock().unwrap().take();
     }
 }
 
@@ -370,6 +379,13 @@ async fn view_only_input_is_never_decoded_or_injected() {
     assert_eq!(
         rig.seen.lines()[0],
         "started card 256x96 ViewOnly input=false"
+    );
+    // Nothing kept from the view-only session's source can build an injector
+    // (the Wayland portal session carries the input grant): defence in depth
+    // behind "a view-only session never asks for one".
+    assert!(
+        rig.backend.open_injector().is_none(),
+        "the view-only session's input handle was kept"
     );
 }
 
