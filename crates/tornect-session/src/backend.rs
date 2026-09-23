@@ -87,6 +87,17 @@ impl MediaBackend for SystemBackend {
             Source::Desktop => self.desktop_injector(),
         }
     }
+
+    /// Drops the Wayland portal session's input handle: the session still
+    /// holds the desktop's keyboard-and-pointer grant, and nothing may build
+    /// an injector into it for a view-only viewer.
+    fn view_only(&self) {
+        #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+        self.wayland_input
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
 }
 
 /// The desktop backend a Linux session of this type gets.
