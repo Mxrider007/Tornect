@@ -142,6 +142,7 @@ impl SessionSink for GuiSessions {
             session_id: session.session_id.to_owned(),
             label: session.label.to_owned(),
             control,
+            unattended: session.unattended,
             since: Instant::now(),
             capture: None,
         };
@@ -861,6 +862,7 @@ mod tests {
         assert_eq!(sharing.len(), 1);
         assert_eq!(sharing[0].label, "Laptop");
         assert!(sharing[0].control);
+        assert!(!sharing[0].unattended, "allowed at a popup");
         let mut indicator = Indicator::default();
         assert_eq!(indicator.sync(&sharing), Change::Open);
 

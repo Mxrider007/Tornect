@@ -150,9 +150,13 @@ fn sharing_banner(ui: &mut egui::Ui, sharing: &Sharing, now: Instant, actions: &
             "can see this screen (view only)"
         };
         ui.label(
-            RichText::new(format!("SHARING  \"{}\" {mode}", sharing.label))
-                .strong()
-                .color(Color32::WHITE),
+            RichText::new(format!(
+                "{}  \"{}\" {mode}",
+                headline(sharing),
+                sharing.label
+            ))
+            .strong()
+            .color(Color32::WHITE),
         );
         ui.label(
             RichText::new(clock(sharing.since, now))
@@ -184,6 +188,15 @@ fn sharing_banner(ui: &mut egui::Ui, sharing: &Sharing, now: Instant, actions: &
             .small()
             .color(Color32::WHITE),
         );
+    }
+}
+
+/// The indicator's first word: an unattended session says so (§B.8.7.3).
+fn headline(sharing: &Sharing) -> &'static str {
+    if sharing.unattended {
+        "UNATTENDED"
+    } else {
+        "SHARING"
     }
 }
 
@@ -231,7 +244,8 @@ pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: 
                         ui.add(
                             egui::Label::new(
                                 RichText::new(format!(
-                                    "SHARING  \"{}\" · {mode} · {}",
+                                    "{}  \"{}\" · {mode} · {}",
+                                    headline(s),
                                     s.label,
                                     clock(s.since, now)
                                 ))
@@ -832,6 +846,7 @@ mod tests {
             session_id: "0011".to_owned(),
             label: "Laptop".to_owned(),
             control: true,
+            unattended: true,
             since: now,
             capture: Some(CaptureNote {
                 source: "wayland",

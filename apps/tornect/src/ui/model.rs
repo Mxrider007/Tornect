@@ -245,6 +245,9 @@ pub struct Sharing {
     pub label: String,
     /// Control, or view-only.
     pub control: bool,
+    /// Started on an unattended grant, with no popup (§B.8): the indicator
+    /// says so (§B.8.7.3: "Unattended · `name` · Control · End").
+    pub unattended: bool,
     /// When the session started.
     pub since: Instant,
     /// What capture reported once the first picture went out.

@@ -50,6 +50,7 @@ struct Shown {
     session_id: String,
     label: String,
     control: bool,
+    unattended: bool,
     /// Whether the viewer's input is injected, once capture has started.
     injected: Option<bool>,
 }
@@ -60,6 +61,7 @@ impl Shown {
             session_id: s.session_id.clone(),
             label: s.label.clone(),
             control: s.control,
+            unattended: s.unattended,
             injected: s.capture.as_ref().map(|c| c.input),
         }
     }
@@ -174,6 +176,7 @@ mod tests {
             session_id: id.to_owned(),
             label: label.to_owned(),
             control,
+            unattended: false,
             since: Instant::now(),
             capture: None,
         }
@@ -358,6 +361,7 @@ mod tests {
         let (drawn, _) = texts(&ctx, window_input(), std::slice::from_ref(&b));
         let all: Vec<&str> = drawn.iter().map(|(t, _)| t.as_str()).collect();
         assert!(all.iter().any(|t| t.contains("view only")), "{all:?}");
+        assert!(!all.iter().any(|t| t.contains("UNATTENDED")), "{all:?}");
         assert!(
             all.iter().any(|t| t.contains("input is ignored")),
             "{all:?}"
@@ -393,6 +397,22 @@ mod tests {
         );
         let (_, released) = texts(&ctx, click(false), std::slice::from_ref(&b));
         assert_eq!(released, vec![Action::StopSharing]);
+    }
+
+    /// An unattended session says so (§B.8.7.3: "Unattended · `name` ·
+    /// Control · End").
+    #[test]
+    fn an_unattended_session_says_so() {
+        let ctx = egui::Context::default();
+        let mut a = captured(session("aa", "Laptop", true), true);
+        a.unattended = true;
+        let (drawn, _) = texts(&ctx, window_input(), std::slice::from_ref(&a));
+        assert!(
+            drawn.iter().any(|(t, _)| t.starts_with("UNATTENDED")
+                && t.contains("\"Laptop\"")
+                && t.contains("control")),
+            "{drawn:?}"
+        );
     }
 
     /// A press and a drag anywhere but on Stop moves the window (it has no

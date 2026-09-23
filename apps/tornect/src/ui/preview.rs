@@ -65,6 +65,7 @@ pub fn fill(shared: &Shared, token_file: &Path) {
             session_id: "0123456789abcdef".to_owned(),
             label: "Laptop".to_owned(),
             control: true,
+            unattended: false,
             since: now,
             capture: Some(CaptureNote {
                 source: "wayland",
