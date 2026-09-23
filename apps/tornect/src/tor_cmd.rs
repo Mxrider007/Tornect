@@ -1455,10 +1455,17 @@ mod tests {
             session, frozen, ..
         } = live().await;
         frozen.store(true, Ordering::SeqCst);
+        let started = tokio::time::Instant::now();
         let left = tokio::time::timeout(Duration::from_secs(60), session.bye(bye::USER)).await;
         assert!(
             matches!(left, Ok(Err(HandshakeError::Timeout(_)))),
             "{left:?}"
+        );
+        // Exactly the bound, not merely under the envelope (SLICE-D R9).
+        assert_eq!(
+            started.elapsed(),
+            tornect_signal::fsm::timeouts::BYE,
+            "bye gave up after something other than timeouts::BYE"
         );
     }
 
