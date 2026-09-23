@@ -1,8 +1,8 @@
-//! The Win32 calls behind [`crate::autostart`] (and, later in this file, the
-//! re-authentication prompt of [`crate::reauth`]). Every `unsafe` block is a
-//! plain FFI call whose preconditions are stated next to it; the logic that
-//! decides what to do with the answers lives in the cross-platform modules,
-//! where it is tested on every OS.
+//! The Win32 calls behind [`crate::autostart`] (the task's paths, SID and UAC
+//! prompt) and [`crate::reauth`] (the secure credential prompt and
+//! `LogonUserW`). Every `unsafe` block is a plain FFI call whose preconditions
+//! are stated next to it; the logic that decides what to do with the answers
+//! lives in the cross-platform modules, where it is tested on every OS.
 #![allow(unsafe_code)]
 
 use std::ffi::{OsStr, OsString, c_void};
@@ -11,12 +11,21 @@ use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_CANCELLED, GetLastError, HANDLE, HLOCAL, LocalFree,
+    CloseHandle, ERROR_CANCELLED, ERROR_LOGON_FAILURE, GetLastError, HANDLE, HLOCAL, LocalFree,
+    NO_ERROR,
 };
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+use windows_sys::Win32::Security::Credentials::{
+    CRED_MAX_CREDENTIAL_BLOB_SIZE, CRED_PACK_PROTECTED_CREDENTIALS, CREDUI_INFOW,
+    CREDUI_MAX_DOMAIN_TARGET_LENGTH, CREDUI_MAX_USERNAME_LENGTH, CREDUIWIN_SECURE_PROMPT,
+    CredUIPromptForWindowsCredentialsW, CredUnPackAuthenticationBufferW,
+};
+use windows_sys::Win32::Security::{
+    EqualSid, GetTokenInformation, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, LogonUserW,
+    TOKEN_QUERY, TOKEN_USER, TokenUser,
+};
 use windows_sys::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{
@@ -226,5 +235,182 @@ impl TempFile {
 impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Re-authentication: the secure credential prompt, then LogonUserW
+// ---------------------------------------------------------------------------
+
+use zeroize::{Zeroize as _, Zeroizing};
+
+use crate::reauth::{
+    CredentialPrompt, LogonCheck, LogonOutcome, PromptOutcome, PromptedCredential,
+};
+
+/// `CREDUI_MAX_PASSWORD_LENGTH` of `wincred.h` (not in `windows-sys`).
+const MAX_PASSWORD_CHARS: usize = (CRED_MAX_CREDENTIAL_BLOB_SIZE / 2) as usize;
+
+/// The prompt's output buffer: wiped, then freed with `CoTaskMemFree`.
+struct CredBlob {
+    ptr: *mut c_void,
+    len: u32,
+}
+
+impl Drop for CredBlob {
+    fn drop(&mut self) {
+        if self.ptr.is_null() {
+            return;
+        }
+        // SAFETY: `ptr` is the buffer `CredUIPromptForWindowsCredentialsW`
+        // allocated with `CoTaskMemAlloc`, `len` bytes long, owned here alone.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.cast::<u8>(), self.len as usize) }
+            .zeroize();
+        // SAFETY: as above; freed exactly once.
+        unsafe { CoTaskMemFree(self.ptr) };
+    }
+}
+
+/// The UTF-16 before the first NUL.
+fn until_nul(buf: &[u16]) -> &[u16] {
+    &buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())]
+}
+
+/// `CredUIPromptForWindowsCredentialsW` with `CREDUIWIN_SECURE_PROMPT`: the
+/// dialog runs on the secure desktop, like the UAC prompt.
+pub(crate) struct SecurePrompt;
+
+impl CredentialPrompt for SecurePrompt {
+    fn prompt(&self, purpose: &str) -> PromptOutcome {
+        let caption = wide("Tornect");
+        let message = wide(format!("Tornect needs your Windows password to {purpose}."));
+        let info = CREDUI_INFOW {
+            cbSize: u32::try_from(size_of::<CREDUI_INFOW>()).unwrap_or(0),
+            hwndParent: null_mut(),
+            pszMessageText: message.as_ptr(),
+            pszCaptionText: caption.as_ptr(),
+            hbmBanner: null_mut(),
+        };
+        let mut package = 0u32;
+        let mut out: *mut c_void = null_mut();
+        let mut out_len = 0u32;
+        let mut save = 0;
+        // SAFETY: `info` and its strings outlive the call; no input buffer;
+        // every out-pointer is a live local. The call blocks until the user
+        // answers; on success `out` is a `CoTaskMemAlloc` buffer of `out_len`
+        // bytes that `CredBlob` wipes and frees.
+        let rc = unsafe {
+            CredUIPromptForWindowsCredentialsW(
+                &info,
+                0,
+                &mut package,
+                null(),
+                0,
+                &mut out,
+                &mut out_len,
+                &mut save,
+                CREDUIWIN_SECURE_PROMPT,
+            )
+        };
+        let blob = CredBlob {
+            ptr: out,
+            len: out_len,
+        };
+        if rc == ERROR_CANCELLED {
+            return PromptOutcome::Cancelled;
+        }
+        if rc != NO_ERROR || blob.ptr.is_null() {
+            return PromptOutcome::Failed(format!(
+                "the Windows credential prompt failed: error {rc}"
+            ));
+        }
+        // Protected (encrypted) first, as the secure prompt returns it; then
+        // plain, for a provider that returned it unprotected.
+        let mut last = 0;
+        for flags in [CRED_PACK_PROTECTED_CREDENTIALS, 0] {
+            let mut user = vec![0u16; CREDUI_MAX_USERNAME_LENGTH as usize + 1];
+            let mut domain = vec![0u16; CREDUI_MAX_DOMAIN_TARGET_LENGTH as usize + 1];
+            let mut password = Zeroizing::new(vec![0u16; MAX_PASSWORD_CHARS + 1]);
+            let mut user_len = u32::try_from(user.len()).unwrap_or(0);
+            let mut domain_len = u32::try_from(domain.len()).unwrap_or(0);
+            let mut password_len = u32::try_from(password.len()).unwrap_or(0);
+            // SAFETY: `blob` is the prompt's buffer (above); each output buffer
+            // is writable for the length passed with it, in characters.
+            let ok = unsafe {
+                CredUnPackAuthenticationBufferW(
+                    flags,
+                    blob.ptr,
+                    blob.len,
+                    user.as_mut_ptr(),
+                    &mut user_len,
+                    domain.as_mut_ptr(),
+                    &mut domain_len,
+                    password.as_mut_ptr(),
+                    &mut password_len,
+                )
+            };
+            if ok != 0 {
+                return PromptOutcome::Entered(PromptedCredential::new(
+                    String::from_utf16_lossy(until_nul(&user)),
+                    String::from_utf16_lossy(until_nul(&domain)),
+                    password,
+                ));
+            }
+            // SAFETY: plain call.
+            last = unsafe { GetLastError() };
+        }
+        PromptOutcome::Failed(format!(
+            "reading the Windows credential prompt's answer failed: error {last}"
+        ))
+    }
+}
+
+/// `LogonUserW(LOGON32_LOGON_INTERACTIVE)`, then the logon token's user SID
+/// compared with this process's.
+pub(crate) struct LogonUserCheck;
+
+impl LogonCheck for LogonUserCheck {
+    fn verify(&self, credential: &PromptedCredential) -> LogonOutcome {
+        let (user, domain) = crate::reauth::logon_names(credential.user(), credential.domain());
+        let user = wide(user);
+        let domain = domain.map(wide);
+        let mut token: HANDLE = null_mut();
+        // SAFETY: every string is NUL-terminated and outlives the call (the
+        // password's buffer is the credential's, NUL-terminated by
+        // `PromptedCredential::new`); `token` receives a handle on success.
+        let ok = unsafe {
+            LogonUserW(
+                user.as_ptr(),
+                domain.as_ref().map_or(null(), |d| d.as_ptr()),
+                credential.password_wide().as_ptr(),
+                LOGON32_LOGON_INTERACTIVE,
+                LOGON32_PROVIDER_DEFAULT,
+                &mut token,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: plain call.
+            let err = unsafe { GetLastError() };
+            return if err == ERROR_LOGON_FAILURE {
+                LogonOutcome::Rejected
+            } else {
+                LogonOutcome::Failed(format!("LogonUserW failed: error {err}"))
+            };
+        }
+        let token = OwnedHandle(token);
+        let theirs = match token_user(token.0) {
+            Ok(t) => t,
+            Err(e) => return LogonOutcome::Failed(format!("reading the logon's user: {e}")),
+        };
+        let ours = match process_token().and_then(|t| token_user(t.0)) {
+            Ok(t) => t,
+            Err(e) => return LogonOutcome::Failed(format!("reading this process's user: {e}")),
+        };
+        // SAFETY: both SIDs point into buffers alive for this call.
+        if unsafe { EqualSid(sid_of(&theirs), sid_of(&ours)) } != 0 {
+            LogonOutcome::CurrentUser
+        } else {
+            LogonOutcome::OtherUser
+        }
     }
 }

@@ -93,6 +93,264 @@ impl ReAuth for DevReAuth {
 }
 
 // ---------------------------------------------------------------------------
+// Windows: the secure credential prompt, verified with LogonUserW
+// ---------------------------------------------------------------------------
+
+/// What the Windows dialog says the password is for, per operation class —
+/// the same five classes as the polkit actions, so both OSes tell the user
+/// the same thing.
+#[must_use]
+pub fn purpose_of(op: &str) -> &'static str {
+    match op {
+        "create_grant" | "set_password" | "reg_start" => {
+            "give a device unattended access to this computer, or change its password"
+        }
+        "master_on" | "enable" | "resume" | "unlock" => {
+            "turn unattended access back on for this computer"
+        }
+        "service_install" | "service_uninstall" => "change what starts when you log in",
+        "backup_export" | "backup_import" | "identity_view" => "export or import Tornect's secrets",
+        "set_settings" | "set_options" | "settings_change" => "change a Tornect security setting",
+        // The strongest wording for an operation this build does not know.
+        _ => "give a device unattended access to this computer, or change its password",
+    }
+}
+
+/// A credential typed into the Windows prompt.
+///
+/// The password is kept as the NUL-terminated UTF-16 that `LogonUserW` takes,
+/// in a buffer wiped on drop; `Debug` never prints it, and neither the user
+/// name nor the password is ever logged.
+pub struct PromptedCredential {
+    user: String,
+    domain: String,
+    password: zeroize::Zeroizing<Vec<u16>>,
+}
+
+impl PromptedCredential {
+    /// A credential from the prompt's answer. `password` must hold a NUL; a
+    /// missing one is appended.
+    #[must_use]
+    pub fn new(user: String, domain: String, mut password: zeroize::Zeroizing<Vec<u16>>) -> Self {
+        if !password.contains(&0) {
+            password.push(0);
+        }
+        Self {
+            user,
+            domain,
+            password,
+        }
+    }
+
+    /// The user name as typed (`DOMAIN\user`, `user@domain` or `user`).
+    #[must_use]
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    /// The domain the prompt returned separately, often empty.
+    #[must_use]
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    /// The password, NUL-terminated UTF-16.
+    #[must_use]
+    pub fn password_wide(&self) -> &[u16] {
+        &self.password
+    }
+}
+
+impl std::fmt::Debug for PromptedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PromptedCredential")
+            .field("user", &"<redacted>")
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// `LogonUserW`'s account and domain for a typed name: a separate domain
+/// wins; `DOMAIN\user` splits; a UPN (`user@domain`) goes whole with no domain
+/// (`LogonUserW` requires that); a bare name is looked up in the local
+/// account database (`.`).
+#[must_use]
+pub fn logon_names(user: &str, domain: &str) -> (String, Option<String>) {
+    if !domain.is_empty() {
+        return (user.to_owned(), Some(domain.to_owned()));
+    }
+    if let Some((dom, name)) = user.split_once('\\') {
+        return (name.to_owned(), Some(dom.to_owned()));
+    }
+    if user.contains('@') {
+        return (user.to_owned(), None);
+    }
+    (user.to_owned(), Some(".".to_owned()))
+}
+
+/// What the credential prompt returned.
+#[derive(Debug)]
+pub enum PromptOutcome {
+    /// The user typed a credential.
+    Entered(PromptedCredential),
+    /// The user dismissed the dialog.
+    Cancelled,
+    /// The dialog could not be shown or read (an error code, never a name).
+    Failed(String),
+}
+
+/// What checking a credential with the OS said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogonOutcome {
+    /// A logon succeeded and its token belongs to the user running Tornect.
+    CurrentUser,
+    /// A logon succeeded for **another** account.
+    OtherUser,
+    /// The OS refused the credential (wrong password, unknown account).
+    Rejected,
+    /// The check itself failed (an error code, never a name).
+    Failed(String),
+}
+
+/// Shows the credential dialog (the seam: the Windows implementation calls
+/// `CredUIPromptForWindowsCredentialsW` with `CREDUIWIN_SECURE_PROMPT`; tests
+/// script it on any OS).
+pub trait CredentialPrompt: Send + Sync {
+    /// Ask for the password, saying what it is for.
+    fn prompt(&self, purpose: &str) -> PromptOutcome;
+}
+
+/// Checks a credential (the seam: the Windows implementation calls
+/// `LogonUserW(LOGON32_LOGON_INTERACTIVE)` and compares the token's user SID
+/// with this process's).
+pub trait LogonCheck: Send + Sync {
+    /// Whether `credential` logs on as the user running Tornect.
+    fn verify(&self, credential: &PromptedCredential) -> LogonOutcome;
+}
+
+/// The Windows backend of §B.8.8: the credential dialog on the secure desktop
+/// (`CREDUIWIN_SECURE_PROMPT`, where no other program — and no remote viewer —
+/// can read or drive it), then `LogonUserW` to verify what was typed.
+///
+/// Success only for a verified logon **as the user running Tornect**: a
+/// cancelled dialog, a refused password, another account's valid password or
+/// any error refuses. The typed password lives in a wiped buffer for the few
+/// calls that need it; only the outcome kind is logged.
+///
+/// Limits, stated plainly: a Windows Hello PIN or fingerprint is not a password
+/// `LogonUserW` can check, so the user must pick the password option in the
+/// dialog (NEEDS-DEVICE); an account with an empty password cannot be verified
+/// at all (`LogonUserW` refuses a blank password for an interactive logon by
+/// default), so such a host cannot make access-increasing changes — fail
+/// closed. As on every OS, this proves a human at the host knows the OS
+/// credential; it does not stop code already running as this user.
+pub struct WindowsReAuth {
+    prompt: Box<dyn CredentialPrompt>,
+    logon: Box<dyn LogonCheck>,
+    /// One dialog at a time, never a queue (as the polkit backend's: track D
+    /// S1/S6).
+    dialog: std::sync::Arc<std::sync::Mutex<()>>,
+}
+
+impl std::fmt::Debug for WindowsReAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowsReAuth").finish_non_exhaustive()
+    }
+}
+
+impl WindowsReAuth {
+    /// The OS dialog and `LogonUserW`.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_backends(
+            Box::new(crate::win::SecurePrompt),
+            Box::new(crate::win::LogonUserCheck),
+        )
+    }
+
+    /// The flow over any prompt and logon check (tests on every OS).
+    #[must_use]
+    pub fn with_backends(prompt: Box<dyn CredentialPrompt>, logon: Box<dyn LogonCheck>) -> Self {
+        Self {
+            prompt,
+            logon,
+            dialog: std::sync::Arc::default(),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Default for WindowsReAuth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReAuth for WindowsReAuth {
+    fn reauthenticate(&self, op: &str) -> Result<(), ReAuthError> {
+        let _open = match self.dialog.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(ReAuthError::Unavailable(
+                    "another Tornect re-authentication dialog is already open; answer or \
+                     cancel it, then retry"
+                        .to_owned(),
+                ));
+            }
+        };
+        let verdict = match self.prompt.prompt(purpose_of(op)) {
+            PromptOutcome::Cancelled => {
+                tracing::info!(
+                    op,
+                    outcome = "cancelled",
+                    "re-authentication was not granted"
+                );
+                return Err(ReAuthError::Denied);
+            }
+            PromptOutcome::Failed(why) => {
+                tracing::warn!(
+                    op,
+                    outcome = "prompt_failed",
+                    "re-authentication unavailable"
+                );
+                return Err(ReAuthError::Unavailable(why));
+            }
+            // The credential is dropped, and its password wiped, at the end
+            // of this arm.
+            PromptOutcome::Entered(credential) => self.logon.verify(&credential),
+        };
+        match verdict {
+            LogonOutcome::CurrentUser => {
+                tracing::info!(op, outcome = "verified", "re-authenticated");
+                Ok(())
+            }
+            LogonOutcome::OtherUser => {
+                tracing::info!(
+                    op,
+                    outcome = "other_user",
+                    "re-authentication was not granted"
+                );
+                Err(ReAuthError::Denied)
+            }
+            LogonOutcome::Rejected => {
+                tracing::info!(
+                    op,
+                    outcome = "rejected",
+                    "re-authentication was not granted"
+                );
+                Err(ReAuthError::Denied)
+            }
+            LogonOutcome::Failed(why) => {
+                tracing::warn!(op, outcome = "logon_failed", "re-authentication failed");
+                Err(ReAuthError::Failed(why))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Linux: polkit
 // ---------------------------------------------------------------------------
 
@@ -596,5 +854,203 @@ mod tests {
             assert!(matches!(result, Err(ReAuthError::Unavailable(_))));
             assert_eq!(dev.calls(), 0);
         }
+    }
+
+    // ------------------------------------------------------------- Windows flow
+
+    /// A scripted prompt: returns `answer` once, counting calls.
+    struct FakePrompt {
+        answer: std::sync::Mutex<Option<PromptOutcome>>,
+        purpose: std::sync::Mutex<Option<String>>,
+    }
+
+    impl FakePrompt {
+        fn new(answer: PromptOutcome) -> Self {
+            Self {
+                answer: std::sync::Mutex::new(Some(answer)),
+                purpose: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    impl CredentialPrompt for std::sync::Arc<FakePrompt> {
+        fn prompt(&self, purpose: &str) -> PromptOutcome {
+            *self.purpose.lock().unwrap() = Some(purpose.to_owned());
+            self.answer
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(PromptOutcome::Cancelled)
+        }
+    }
+
+    /// A scripted logon: answers `CurrentUser` only for the right user and
+    /// password, `OtherUser` for the other account's right password.
+    #[derive(Default)]
+    struct FakeLogon {
+        calls: AtomicUsize,
+    }
+
+    impl LogonCheck for std::sync::Arc<FakeLogon> {
+        fn verify(&self, c: &PromptedCredential) -> LogonOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let password = String::from_utf16_lossy(
+                &c.password_wide()[..c.password_wide().iter().position(|&u| u == 0).unwrap()],
+            );
+            match (logon_names(c.user(), c.domain()), password.as_str()) {
+                ((user, Some(dom)), "right") if user == "ana" && dom == "PC" => {
+                    LogonOutcome::CurrentUser
+                }
+                ((user, _), "theirs") if user == "bruno" => LogonOutcome::OtherUser,
+                _ => LogonOutcome::Rejected,
+            }
+        }
+    }
+
+    fn typed(user: &str, password: &str) -> PromptOutcome {
+        PromptOutcome::Entered(PromptedCredential::new(
+            user.to_owned(),
+            String::new(),
+            zeroize::Zeroizing::new(password.encode_utf16().collect()),
+        ))
+    }
+
+    fn windows(
+        answer: PromptOutcome,
+    ) -> (
+        WindowsReAuth,
+        std::sync::Arc<FakePrompt>,
+        std::sync::Arc<FakeLogon>,
+    ) {
+        let prompt = std::sync::Arc::new(FakePrompt::new(answer));
+        let logon = std::sync::Arc::new(FakeLogon::default());
+        let reauth = WindowsReAuth::with_backends(
+            Box::new(std::sync::Arc::clone(&prompt)),
+            Box::new(std::sync::Arc::clone(&logon)),
+        );
+        (reauth, prompt, logon)
+    }
+
+    /// The Windows flow, on any OS: only a verified logon as the current user
+    /// allows; cancel, a wrong password, another account and a broken prompt
+    /// all refuse.
+    #[test]
+    fn the_windows_flow_allows_only_the_current_user() {
+        let (r, prompt, logon) = windows(typed("PC\\ana", "right"));
+        assert!(r.reauthenticate("service_install").is_ok());
+        assert_eq!(logon.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            prompt.purpose.lock().unwrap().as_deref(),
+            Some("change what starts when you log in")
+        );
+
+        let (r, _, logon) = windows(PromptOutcome::Cancelled);
+        assert!(matches!(
+            r.reauthenticate("service_install"),
+            Err(ReAuthError::Denied)
+        ));
+        assert_eq!(logon.calls.load(Ordering::SeqCst), 0, "nothing to check");
+
+        let (r, _, _) = windows(typed("PC\\ana", "wrong"));
+        assert!(matches!(
+            r.reauthenticate("enable"),
+            Err(ReAuthError::Denied)
+        ));
+
+        let (r, _, _) = windows(typed("PC\\bruno", "theirs"));
+        assert!(
+            matches!(r.reauthenticate("enable"), Err(ReAuthError::Denied)),
+            "another account's valid password must not authorise this user's change"
+        );
+
+        let (r, _, logon) = windows(PromptOutcome::Failed("error 1004".to_owned()));
+        assert!(matches!(
+            r.reauthenticate("enable"),
+            Err(ReAuthError::Unavailable(_))
+        ));
+        assert_eq!(logon.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A second access-increasing op while the dialog is open is refused at
+    /// once and never reaches the prompt.
+    #[test]
+    fn a_second_windows_dialog_is_refused_while_one_is_open() {
+        let (r, prompt, _) = windows(typed("PC\\ana", "right"));
+        let _open = r.dialog.lock().unwrap();
+        match r.reauthenticate("enable") {
+            Err(ReAuthError::Unavailable(m)) => assert!(m.contains("already open"), "{m}"),
+            other => panic!("expected an immediate refusal, got {other:?}"),
+        }
+        assert!(
+            prompt.purpose.lock().unwrap().is_none(),
+            "no dialog was shown"
+        );
+    }
+
+    #[test]
+    fn typed_names_map_to_logon_names() {
+        for ((user, domain), want) in [
+            (("PC\\ana", ""), ("ana", Some("PC"))),
+            (("ana", "PC"), ("ana", Some("PC"))),
+            (("ana@example.org", ""), ("ana@example.org", None)),
+            (
+                ("MicrosoftAccount\\ana@example.org", ""),
+                ("ana@example.org", Some("MicrosoftAccount")),
+            ),
+            (("ana", ""), ("ana", Some("."))),
+        ] {
+            let (u, d) = logon_names(user, domain);
+            assert_eq!((u.as_str(), d.as_deref()), want, "{user:?} {domain:?}");
+        }
+    }
+
+    /// Every operation the guard names gets wording, the autostart ones say
+    /// what they change, and an unknown one gets the strongest wording.
+    #[test]
+    fn every_guard_operation_has_dialog_wording() {
+        for op in [
+            "create_grant",
+            "set_password",
+            "reg_start",
+            "master_on",
+            "enable",
+            "resume",
+            "unlock",
+            "set_settings",
+            "set_options",
+            "service_install",
+            "service_uninstall",
+            "backup_export",
+            "backup_import",
+            "identity_view",
+            "settings_change",
+        ] {
+            assert!(!purpose_of(op).is_empty(), "{op}");
+        }
+        assert_eq!(
+            purpose_of("service_uninstall"),
+            "change what starts when you log in"
+        );
+        assert_eq!(
+            purpose_of("some_future_operation"),
+            purpose_of("create_grant")
+        );
+    }
+
+    /// The password never reaches `Debug`, and it is NUL-terminated for
+    /// `LogonUserW` however the prompt returned it.
+    #[test]
+    fn a_prompted_credential_redacts_and_terminates_its_password() {
+        let c = PromptedCredential::new(
+            "PC\\ana".to_owned(),
+            String::new(),
+            zeroize::Zeroizing::new("hunter2".encode_utf16().collect()),
+        );
+        let shown = format!("{c:?}");
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("ana"),
+            "{shown}"
+        );
+        assert_eq!(c.password_wide().last(), Some(&0));
     }
 }
