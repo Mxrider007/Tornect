@@ -78,8 +78,10 @@ pub struct MediaLimits {
     /// Bytes in flight before the host waits for a `VideoAck`.
     pub window_bytes: usize,
     /// Input events a control viewer may inject per second, on average.
+    /// Releases (key-up, button-up, `ReleaseAll`) do not count and are never
+    /// dropped (SLICE-E E1-6).
     pub input_rate: u32,
-    /// Input events a control viewer may inject at once.
+    /// Input events a control viewer may inject at once (releases aside).
     pub input_burst: u32,
     /// Least time between two keyframes forced by `KeyframeRequest`.
     pub keyframe_interval: Duration,
@@ -632,13 +634,18 @@ impl MediaHost {
                             report.input_dropped += 1;
                             continue;
                         };
-                        if !inputs.take(Instant::now()) {
-                            report.input_dropped += 1;
-                            continue;
-                        }
                         let Ok(event) = InputEvent::decode(&bytes) else {
                             break MediaEnd::Protocol;
                         };
+                        // A release never spends the budget, so it is never
+                        // dropped: a lost key-up would leave the key down on
+                        // this desktop (SLICE-E E1-6). `Tracked` injects one
+                        // only for what it holds, so a flood of them injects
+                        // nothing.
+                        if !event.is_release() && !inputs.take(Instant::now()) {
+                            report.input_dropped += 1;
+                            continue;
+                        }
                         match sink.inject(&event) {
                             Ok(()) => report.input_injected += 1,
                             Err(e) => {
