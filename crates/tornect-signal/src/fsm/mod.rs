@@ -822,10 +822,7 @@ where
     pub async fn body<B: Body>(&mut self, rx: &Received) -> Result<B, HandshakeError> {
         match decode_body::<B>(&rx.env.body) {
             Ok(b) => Ok(b),
-            Err(BodyError::Malformed { .. }) => Err(self.fail(codes::E_BAD_LEN, "body").await),
-            Err(BodyError::TooLong { .. }) => Err(self.fail(codes::E_BAD_LEN, "bound").await),
-            Err(BodyError::Inconsistent { .. }) => Err(self.fail(codes::E_BAD_LEN, "field").await),
-            Err(BodyError::ForbiddenChar { .. }) => Err(self.fail(codes::E_BAD_LEN, "text").await),
+            Err(e) => Err(self.fail(codes::E_BAD_LEN, body_fault(&e)).await),
         }
     }
 
@@ -866,6 +863,27 @@ where
     pub async fn close(&mut self) {
         self.closing = true;
         let _ = self.stream.shutdown().await;
+    }
+}
+
+/// Decode and validate a received body without answering: the error is the
+/// `E_BAD_LEN` violation [`Channel::body`] would send. For a caller that must
+/// record the end before it writes to the peer (SLICE-C3 C3-2), and then sends
+/// the `ERROR` with [`Channel::fail`].
+pub(crate) fn checked_body<B: Body>(rx: &Received) -> Result<B, HandshakeError> {
+    decode_body::<B>(&rx.env.body).map_err(|e| HandshakeError::Violation {
+        code: codes::E_BAD_LEN,
+        what: body_fault(&e),
+    })
+}
+
+/// Which body check failed, as `Violation::what`.
+fn body_fault(e: &BodyError) -> &'static str {
+    match e {
+        BodyError::Malformed { .. } => "body",
+        BodyError::TooLong { .. } => "bound",
+        BodyError::Inconsistent { .. } => "field",
+        BodyError::ForbiddenChar { .. } => "text",
     }
 }
 
