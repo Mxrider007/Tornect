@@ -670,7 +670,8 @@ fn settle_token(
 // With it, a later session starts without the dialog until the user revokes
 // the permission. It grants the screen and input to whoever presents it, so it
 // is kept like a key: a 0600 file in the private state directory, never
-// logged. Each token is good for one start, and every start returns the next.
+// logged, and neither is its path (`tornect doctor` names it to the owner).
+// Each token is good for one start, and every start returns the next.
 
 fn valid_token(token: &str) -> bool {
     !token.is_empty() && token.len() <= MAX_TOKEN && token.bytes().all(|b| b.is_ascii_graphic())
@@ -683,13 +684,13 @@ pub(crate) fn read_token(file: &Path) -> Option<String> {
     match std::fs::File::open(file) {
         Ok(f) => {
             if let Err(e) = f.take(MAX_TOKEN as u64 + 2).read_to_string(&mut text) {
-                tracing::warn!(error = %e, file = %file.display(), "the portal restore token is unreadable; the desktop will ask again");
+                tracing::warn!(error = %e, "the portal restore token is unreadable; the desktop will ask again");
                 return None;
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            tracing::warn!(error = %e, file = %file.display(), "cannot open the portal restore token; the desktop will ask again");
+            tracing::warn!(error = %e, "cannot open the portal restore token; the desktop will ask again");
             return None;
         }
     }
@@ -697,7 +698,7 @@ pub(crate) fn read_token(file: &Path) -> Option<String> {
     if valid_token(token) {
         Some(token.to_owned())
     } else {
-        tracing::warn!(file = %file.display(), "the portal restore token is malformed; ignored");
+        tracing::warn!("the portal restore token is malformed; ignored");
         None
     }
 }
@@ -725,7 +726,7 @@ pub(crate) fn forget_token(file: &Path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            tracing::warn!(error = %e, file = %file.display(), "cannot remove a spent portal restore token")
+            tracing::warn!(error = %e, "cannot remove a spent portal restore token")
         }
     }
 }
@@ -863,6 +864,66 @@ mod tests {
         assert_eq!(answered, Dialog::Answered(7));
         let timed_out = dialog(std::future::pending::<()>(), Duration::from_secs(2), None).await;
         assert_eq!(timed_out, Dialog::TimedOut);
+    }
+
+    /// Records every event's fields as text.
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    struct Text<'a>(&'a mut String);
+
+    impl tracing::field::Visit for Text<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={value:?} ", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for Recorder {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = String::new();
+            event.record(&mut Text(&mut line));
+            self.0.lock().unwrap().push(line);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The restore token's file stays out of every log line (the slice-D
+    /// review's addendum): a log can travel where the state directory does not,
+    /// and the path says where the bearer grant lies.
+    #[test]
+    fn no_log_line_names_the_restore_token_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = dir.path().join("portal-restore-token");
+        let unreadable = dir.path().join("a-directory");
+        std::fs::write(&malformed, "two words").unwrap();
+        std::fs::create_dir(&unreadable).unwrap();
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Recorder(Arc::clone(&lines)), || {
+            assert_eq!(read_token(&malformed), None);
+            assert_eq!(read_token(&unreadable), None);
+            forget_token(&unreadable);
+        });
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        let root = dir.path().display().to_string();
+        for line in lines.iter() {
+            assert!(!line.contains(&root), "{line}");
+        }
     }
 
     /// A call queued after the session is over is refused, not lost silently.
