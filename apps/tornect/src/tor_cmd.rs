@@ -739,9 +739,13 @@ where
             .await
             .map_err(|e| anyhow::Error::new(e).context("binding the media stream"))
     };
-    let viewer = match opened.await {
-        Ok(viewer) => viewer,
-        Err(e) => {
+    let viewer = match unless_interrupted(opened, interrupted).await {
+        None => {
+            println!("MEDIA ENDED (by you, before the first picture)");
+            return Ok(End::You);
+        }
+        Some(Ok(viewer)) => viewer,
+        Some(Err(e)) => {
             println!("MEDIA FAILED: {e:#}");
             return Ok(End::NoPicture(e));
         }
@@ -776,6 +780,20 @@ where
         (Err(e), End::You) => End::NoPicture(anyhow::Error::new(e)),
         (_, end) => end,
     })
+}
+
+/// `work`, unless the first Ctrl-C comes first (`None`): opening and binding
+/// the media stream can take a minute and a half over Tor, and a Ctrl-C then
+/// ends the session at once, not after the open (SLICE-D R2).
+async fn unless_interrupted<F: Future>(
+    work: F,
+    interrupted: &watch::Receiver<bool>,
+) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        () = pressed(interrupted.clone()) => None,
+        done = work => Some(done),
+    }
 }
 
 /// Receive the screen on a bound `viewer` while `session` keeps the session
@@ -1447,6 +1465,30 @@ mod tests {
         assert!(!x11.contains("out of scope"), "{x11}");
         let none = capture_lines(&paths, &DesktopBackend::Unavailable("no seat".into())).join("\n");
         assert!(none.contains("capture: none (no seat)"), "{none}");
+    }
+
+    /// SLICE-D R2: the first Ctrl-C while the media stream opens and binds
+    /// (up to a minute and a half over Tor) ends the wait at once. Before, it
+    /// was heard and printed, but acted on only once the open had finished.
+    #[tokio::test(start_paused = true)]
+    async fn a_ctrl_c_while_the_media_stream_opens_ends_the_wait() {
+        let (ctrl_c, interrupted) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let press = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            ctrl_c.send_replace(true);
+        };
+        let (opened, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                unless_interrupted(std::future::pending::<()>(), &interrupted),
+            ),
+            press
+        );
+        assert_eq!(opened, Ok(None), "the open outlived the Ctrl-C");
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        let (_quiet, untouched) = watch::channel(false);
+        assert_eq!(unless_interrupted(async { 5 }, &untouched).await, Some(5));
     }
 
     /// SLICE-B2 B2-8 and C2-2: leaving never waits on a host that stops
