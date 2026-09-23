@@ -26,6 +26,17 @@ mod palette {
 /// The SAS display size (§7: "SAS display 44 mono").
 const SAS_SIZE: f32 = 44.0;
 
+/// How long a card's accept buttons stay disabled after the card appears and
+/// after it moves (a card above it came or went, the window scrolled or was
+/// resized): a click aimed at the program underneath must not land on an
+/// accept that just appeared under the pointer (SLICE-E E1-1). Browsers wait
+/// about as long before a permission prompt's buttons work.
+const ARM_AFTER: Duration = Duration::from_secs(1);
+
+/// How far (in points) a card's answer row may shift between two passes and
+/// still count as not moved: layout rounding, not a move.
+const MOVE_TOLERANCE: f32 = 1.0;
+
 /// What the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -49,6 +60,9 @@ pub enum Action {
         id: u64,
         /// The answer.
         decision: PairDecision,
+        /// Given by a primary click of the pointer, not by Space or Enter;
+        /// always so for an accept (decision M1-50).
+        pointer: bool,
     },
     /// The host user's answer to a session popup.
     Session {
@@ -56,6 +70,9 @@ pub enum Action {
         id: u64,
         /// The answer.
         decision: SessionDecision,
+        /// Given by a primary click of the pointer, not by Space or Enter;
+        /// always so for an accept (decision M1-50).
+        pointer: bool,
     },
     /// The client user's answer to the code question.
     Confirm {
@@ -63,18 +80,70 @@ pub enum Action {
         id: u64,
         /// The codes matched.
         matched: bool,
+        /// Given by a primary click of the pointer, not by Space or Enter;
+        /// always so for an accept (decision M1-50).
+        pointer: bool,
     },
     /// Copy this machine's ID.
     CopyId,
 }
 
-/// What the user is typing.
+/// What the user is typing, and what the window remembers of its cards.
 #[derive(Debug, Default)]
 pub struct Form {
     /// The connect field.
     pub connect_to: String,
     /// The label typed into each pairing popup.
     pub labels: HashMap<u64, String>,
+    /// Each open card's answer row, by popup or question id.
+    cards: HashMap<u64, Card>,
+}
+
+/// A card's answer row as the window remembers it from pass to pass.
+#[derive(Debug, Clone, Copy)]
+struct Card {
+    /// Since when the row has been where it is.
+    since: Instant,
+    /// Where the row starts, in window points.
+    at: egui::Pos2,
+}
+
+/// Remember where the answer row of card `id` starts (the cursor of `ui`),
+/// and say whether its accepts may answer now: once the row has been still
+/// for [`ARM_AFTER`].
+fn arm(ui: &egui::Ui, cards: &mut HashMap<u64, Card>, id: u64, now: Instant) -> bool {
+    let at = ui.cursor().min;
+    let card = cards.entry(id).or_insert(Card { since: now, at });
+    if card.at.distance(at) > MOVE_TOLERANCE {
+        card.since = now;
+        card.at = at;
+    }
+    let still = now.saturating_duration_since(card.since);
+    if still < ARM_AFTER {
+        ui.ctx().request_repaint_after(ARM_AFTER - still);
+        return false;
+    }
+    true
+}
+
+/// An accept button (Allow control, View only, pair, the codes match),
+/// answered only by a primary click of the pointer (SLICE-E E1-1, decision
+/// M1-50): disabled until the card is `armed`, and never in the Tab order
+/// (`Sense::CLICK`, not focusable), so Space or Enter, typed for another
+/// program, never answers it. `true` when it was clicked.
+fn accept(ui: &mut egui::Ui, text: RichText, armed: bool) -> bool {
+    ui.add_enabled(armed, egui::Button::new(text).sense(egui::Sense::CLICK))
+        .clicked_by(egui::PointerButton::Primary)
+}
+
+/// A refusal button (Deny, Refuse, No): first in its row, reachable by Tab
+/// at once, answered by the pointer or the keyboard. `Some(pointer)` when it
+/// answered.
+fn refuse(ui: &mut egui::Ui, text: &str) -> Option<bool> {
+    let response = ui.button(text);
+    response
+        .clicked()
+        .then(|| response.clicked_by(egui::PointerButton::Primary))
 }
 
 fn countdown(deadline: Instant, now: Instant) -> u64 {
@@ -107,9 +176,14 @@ pub fn main_window(
                 }
             });
     }
-    // A label typed into a question that is gone goes with it.
+    // A label typed into a question that is gone goes with it, and so does
+    // what the window remembered of its card.
     form.labels
         .retain(|id, _| model.popups.iter().any(|p| p.id == *id));
+    form.cards.retain(|id, _| {
+        model.popups.iter().any(|p| p.id == *id)
+            || model.confirm.as_ref().is_some_and(|c| c.id == *id)
+    });
     egui::CentralPanel::default().show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             // Open questions come first, one card each, so none hides
@@ -118,7 +192,7 @@ pub fn main_window(
                 question(ui, |ui| host_popup(ui, popup, form, now, actions));
             }
             if let Some(confirm) = &model.confirm {
-                question(ui, |ui| confirm_popup(ui, confirm, now, actions));
+                question(ui, |ui| confirm_popup(ui, confirm, form, now, actions));
             }
             home(ui, model, form, actions);
         });
@@ -564,23 +638,23 @@ fn host_popup(
                 ui.label("Name it (optional):");
                 ui.text_edit_singleline(label);
             });
+            let armed = arm(ui, &mut form.cards, popup.id, now);
             ui.horizontal(|ui| {
-                if ui
-                    .button(RichText::new("The codes match: pair").strong())
-                    .clicked()
-                {
+                if let Some(pointer) = refuse(ui, "Refuse") {
+                    actions.push(Action::Pair {
+                        id: popup.id,
+                        decision: PairDecision::Reject,
+                        pointer,
+                    });
+                }
+                if accept(ui, RichText::new("The codes match: pair").strong(), armed) {
                     let label = label.trim();
                     actions.push(Action::Pair {
                         id: popup.id,
                         decision: PairDecision::Accept {
                             label: (!label.is_empty()).then(|| label.to_owned()),
                         },
-                    });
-                }
-                if ui.button("Refuse").clicked() {
-                    actions.push(Action::Pair {
-                        id: popup.id,
-                        decision: PairDecision::Reject,
+                        pointer: true,
                     });
                 }
             });
@@ -607,23 +681,27 @@ fn host_popup(
                      only shows the screen and nothing else. Either way it lasts for this \
                      session only, and \"Stop sharing\" ends it.",
             );
+            let armed = arm(ui, &mut form.cards, popup.id, now);
             ui.horizontal(|ui| {
-                if ui.button(RichText::new("Allow control").strong()).clicked() {
-                    actions.push(Action::Session {
-                        id: popup.id,
-                        decision: SessionDecision::AllowOnce,
-                    });
-                }
-                if ui.button("View only").clicked() {
-                    actions.push(Action::Session {
-                        id: popup.id,
-                        decision: SessionDecision::AllowOnceViewOnly,
-                    });
-                }
-                if ui.button("Deny").clicked() {
+                if let Some(pointer) = refuse(ui, "Deny") {
                     actions.push(Action::Session {
                         id: popup.id,
                         decision: SessionDecision::Deny,
+                        pointer,
+                    });
+                }
+                if accept(ui, RichText::new("View only"), armed) {
+                    actions.push(Action::Session {
+                        id: popup.id,
+                        decision: SessionDecision::AllowOnceViewOnly,
+                        pointer: true,
+                    });
+                }
+                if accept(ui, RichText::new("Allow control").strong(), armed) {
+                    actions.push(Action::Session {
+                        id: popup.id,
+                        decision: SessionDecision::AllowOnce,
+                        pointer: true,
                     });
                 }
             });
@@ -636,7 +714,13 @@ fn host_popup(
     });
 }
 
-fn confirm_popup(ui: &mut egui::Ui, confirm: &Confirm, now: Instant, actions: &mut Vec<Action>) {
+fn confirm_popup(
+    ui: &mut egui::Ui,
+    confirm: &Confirm,
+    form: &mut Form,
+    now: Instant,
+    actions: &mut Vec<Action>,
+) {
     ui.label(
         RichText::new("Compare the code")
             .heading()
@@ -653,20 +737,20 @@ fn confirm_popup(ui: &mut egui::Ui, confirm: &Confirm, now: Instant, actions: &m
                 .size(SAS_SIZE)
                 .color(palette::ACCENT),
         );
+        let armed = arm(ui, &mut form.cards, confirm.id, now);
         ui.horizontal(|ui| {
-            if ui
-                .button(RichText::new("Yes, the codes match").strong())
-                .clicked()
-            {
-                actions.push(Action::Confirm {
-                    id: confirm.id,
-                    matched: true,
-                });
-            }
-            if ui.button("No").clicked() {
+            if let Some(pointer) = refuse(ui, "No") {
                 actions.push(Action::Confirm {
                     id: confirm.id,
                     matched: false,
+                    pointer,
+                });
+            }
+            if accept(ui, RichText::new("Yes, the codes match").strong(), armed) {
+                actions.push(Action::Confirm {
+                    id: confirm.id,
+                    matched: true,
+                    pointer: true,
                 });
             }
         });
@@ -780,6 +864,355 @@ mod tests {
             .drop_without_applying_deltas();
         }
         actions
+    }
+
+    /// The main window at its default size (560 × 720), driven one pass at
+    /// a time with the clock and the events a test gives, as the event loop
+    /// drives it. Buttons are found by their labels in the accessibility
+    /// tree, where egui records every widget's rectangle.
+    struct Harness {
+        ctx: egui::Context,
+        model: Model,
+        form: Form,
+        start: Instant,
+        nodes: Vec<egui::accesskit::Node>,
+    }
+
+    impl Harness {
+        fn new(model: Model, start: Instant) -> Self {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut harness = Self {
+                ctx,
+                model,
+                form: Form::default(),
+                start,
+                nodes: Vec::new(),
+            };
+            // Two passes: egui lays out on the first.
+            for _ in 0..2 {
+                harness.pass(start, Vec::new());
+            }
+            harness
+        }
+
+        /// One pass at `now` with `events`: what the user asked for.
+        fn pass(&mut self, now: Instant, events: Vec<egui::Event>) -> Vec<Action> {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(560.0, 720.0),
+                )),
+                time: Some(now.duration_since(self.start).as_secs_f64()),
+                events,
+                ..egui::RawInput::default()
+            };
+            let mut actions = Vec::new();
+            let (model, form) = (&self.model, &mut self.form);
+            let out = self.ctx.run_ui(raw, |ui| {
+                main_window(ui, model, form, now, &mut actions);
+            });
+            if let Some(update) = &out.platform_output.accesskit_update {
+                self.nodes = update.nodes.iter().map(|(_, n)| n.clone()).collect();
+            }
+            out.drop_without_applying_deltas();
+            actions
+        }
+
+        /// The centre of the button labelled `label` in the last pass.
+        fn button(&self, label: &str) -> egui::Pos2 {
+            let bounds = self
+                .nodes
+                .iter()
+                .find(|n| n.label() == Some(label))
+                .and_then(egui::accesskit::Node::bounds)
+                .unwrap_or_else(|| panic!("no button \"{label}\" on screen"));
+            egui::pos2(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            )
+        }
+
+        /// Whether the button labelled `label` was disabled in the last pass.
+        fn disabled(&self, label: &str) -> bool {
+            self.nodes
+                .iter()
+                .find(|n| n.label() == Some(label))
+                .unwrap_or_else(|| panic!("no button \"{label}\" on screen"))
+                .is_disabled()
+        }
+
+        /// `key` pressed and released in one pass.
+        fn key(&mut self, now: Instant, key: egui::Key) -> Vec<Action> {
+            let event = |pressed| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            self.pass(now, vec![event(true), event(false)])
+        }
+
+        /// A primary click at `at`: the pointer moves there and presses in
+        /// one pass, and releases 50 ms later in the next.
+        fn click(&mut self, now: Instant, at: egui::Pos2) -> Vec<Action> {
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let mut actions = self.pass(now, vec![egui::Event::PointerMoved(at), button(true)]);
+            actions.extend(self.pass(now + Duration::from_millis(50), vec![button(false)]));
+            actions
+        }
+    }
+
+    fn session_popup(id: u64, now: Instant) -> Popup {
+        Popup {
+            id,
+            kind: PopupKind::Session {
+                label: "Laptop".to_owned(),
+                fingerprint: "ab:cd".to_owned(),
+            },
+            deadline: now + Duration::from_secs(60),
+        }
+    }
+
+    fn pairing_popup(id: u64, now: Instant) -> Popup {
+        Popup {
+            id,
+            kind: PopupKind::Pairing {
+                name: "Phone".to_owned(),
+                fingerprint: "ef:01".to_owned(),
+                sas: "123 456".to_owned(),
+                pinned: None,
+            },
+            deadline: now + Duration::from_secs(60),
+        }
+    }
+
+    fn with_popups(popups: Vec<Popup>) -> Model {
+        Model {
+            id: Some("abcd efgh".to_owned()),
+            popups,
+            ..Model::default()
+        }
+    }
+
+    fn allowed(actions: &[Action]) -> bool {
+        actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::Session {
+                    decision: SessionDecision::AllowOnce | SessionDecision::AllowOnceViewOnly,
+                    ..
+                }
+            )
+        })
+    }
+
+    /// SLICE-E E1-1: keys typed for another program must not answer a card
+    /// that appeared under them. Before the owner has clicked in the window,
+    /// no run of Tabs followed by Space or Enter allows a session, however
+    /// long the card has been up.
+    #[test]
+    fn keys_alone_never_allow_a_session() {
+        for confirm in [egui::Key::Space, egui::Key::Enter] {
+            for tabs in 1..=5 {
+                let t0 = Instant::now();
+                let mut window = Harness::new(with_popups(vec![session_popup(7, t0)]), t0);
+                let later = t0 + Duration::from_secs(5);
+                let mut actions = Vec::new();
+                for _ in 0..tabs {
+                    actions.extend(window.key(later, egui::Key::Tab));
+                }
+                actions.extend(window.key(later, confirm));
+                assert!(
+                    !allowed(&actions),
+                    "{tabs} Tab(s) then {confirm:?} allowed a session: {actions:?}"
+                );
+            }
+        }
+    }
+
+    /// The pairing card: Tab reaches the name field, and no further Tab
+    /// followed by Space or Enter pairs.
+    #[test]
+    fn keys_alone_never_pair() {
+        for confirm in [egui::Key::Space, egui::Key::Enter] {
+            for tabs in 1..=5 {
+                let t0 = Instant::now();
+                let mut window = Harness::new(with_popups(vec![pairing_popup(3, t0)]), t0);
+                let later = t0 + Duration::from_secs(5);
+                let mut actions = Vec::new();
+                for _ in 0..tabs {
+                    actions.extend(window.key(later, egui::Key::Tab));
+                }
+                actions.extend(window.key(later, confirm));
+                assert!(
+                    !actions.iter().any(|a| matches!(
+                        a,
+                        Action::Pair {
+                            decision: PairDecision::Accept { .. },
+                            ..
+                        }
+                    )),
+                    "{tabs} Tab(s) then {confirm:?} paired: {actions:?}"
+                );
+            }
+        }
+    }
+
+    /// The client's code question: keys alone never say the codes match.
+    #[test]
+    fn keys_alone_never_confirm_the_codes() {
+        for confirm_key in [egui::Key::Space, egui::Key::Enter] {
+            for tabs in 1..=5 {
+                let t0 = Instant::now();
+                let model = Model {
+                    confirm: Some(Confirm {
+                        id: 4,
+                        host_name: "Desk".to_owned(),
+                        sas: "654 321".to_owned(),
+                        deadline: t0 + Duration::from_secs(50),
+                    }),
+                    ..with_popups(Vec::new())
+                };
+                let mut window = Harness::new(model, t0);
+                let later = t0 + Duration::from_secs(5);
+                let mut actions = Vec::new();
+                for _ in 0..tabs {
+                    actions.extend(window.key(later, egui::Key::Tab));
+                }
+                actions.extend(window.key(later, confirm_key));
+                assert!(
+                    !actions
+                        .iter()
+                        .any(|a| matches!(a, Action::Confirm { matched: true, .. })),
+                    "{tabs} Tab(s) then {confirm_key:?} confirmed: {actions:?}"
+                );
+            }
+        }
+    }
+
+    /// Deny is the first stop of the keyboard in a session card, and it
+    /// answers at once: refusing never waits.
+    #[test]
+    fn deny_is_the_first_key_stop_and_answers_at_once() {
+        let t0 = Instant::now();
+        let mut window = Harness::new(with_popups(vec![session_popup(7, t0)]), t0);
+        window.key(t0, egui::Key::Tab);
+        let actions = window.key(t0, egui::Key::Space);
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::Session {
+                    id: 7,
+                    decision: SessionDecision::Deny,
+                    ..
+                }]
+            ),
+            "{actions:?}"
+        );
+    }
+
+    /// A click aimed at the program underneath can land on a card that just
+    /// appeared: in the card's first second a click on "Allow control" does
+    /// nothing; once the card has been still for a second, it allows.
+    #[test]
+    fn a_click_in_the_cards_first_second_does_nothing() {
+        let t0 = Instant::now();
+        let mut window = Harness::new(with_popups(vec![session_popup(7, t0)]), t0);
+        assert!(window.disabled("Allow control") && window.disabled("View only"));
+        assert!(!window.disabled("Deny"), "refusing never waits");
+        let allow = window.button("Allow control");
+        let early = window.click(t0 + Duration::from_millis(300), allow);
+        assert!(early.is_empty(), "answered in the first second: {early:?}");
+
+        window.pass(t0 + Duration::from_millis(1500), Vec::new());
+        assert!(!window.disabled("Allow control"));
+        assert_eq!(window.button("Allow control"), allow, "it did not move");
+        let late = window.click(t0 + Duration::from_millis(1600), allow);
+        assert_eq!(
+            late,
+            vec![Action::Session {
+                id: 7,
+                decision: SessionDecision::AllowOnce,
+                pointer: true,
+            }]
+        );
+    }
+
+    /// Decision M1-50 ("pointer-only Allow"): even after the owner has
+    /// clicked in the window, Tab never reaches an accept and Space or Enter
+    /// never answers one; Deny stays on the keyboard.
+    #[test]
+    fn even_after_a_click_in_the_window_keys_never_allow() {
+        for confirm in [egui::Key::Space, egui::Key::Enter] {
+            for tabs in 1..=5 {
+                let t0 = Instant::now();
+                let mut window = Harness::new(with_popups(vec![session_popup(7, t0)]), t0);
+                let later = t0 + Duration::from_secs(2);
+                // The window's lower right corner: no button there.
+                assert!(window.click(later, egui::pos2(550.0, 710.0)).is_empty());
+                let later = later + Duration::from_millis(100);
+                let mut actions = Vec::new();
+                for _ in 0..tabs {
+                    actions.extend(window.key(later, egui::Key::Tab));
+                }
+                actions.extend(window.key(later, confirm));
+                assert!(
+                    !allowed(&actions),
+                    "{tabs} Tab(s) then {confirm:?} allowed a session: {actions:?}"
+                );
+                if tabs == 1 {
+                    assert_eq!(
+                        actions,
+                        vec![Action::Session {
+                            id: 7,
+                            decision: SessionDecision::Deny,
+                            pointer: false,
+                        }]
+                    );
+                }
+            }
+        }
+    }
+
+    /// A card that moves (one above it answered, withdrawn or timed out)
+    /// waits another second before a click on it counts.
+    #[test]
+    fn a_card_that_moves_waits_another_second() {
+        let t0 = Instant::now();
+        let mut window = Harness::new(
+            with_popups(vec![pairing_popup(1, t0), session_popup(2, t0)]),
+            t0,
+        );
+        let moved_at = t0 + Duration::from_secs(3);
+        window.pass(moved_at, Vec::new());
+        let before = window.button("Allow control");
+        window.model.popups.remove(0);
+        window.pass(moved_at, Vec::new());
+        let allow = window.button("Allow control");
+        assert!(allow.y < before.y, "the session card moved up");
+
+        let early = window.click(moved_at + Duration::from_millis(300), allow);
+        assert!(early.is_empty(), "answered right after moving: {early:?}");
+        window.pass(moved_at + Duration::from_millis(1500), Vec::new());
+        let late = window.click(moved_at + Duration::from_millis(1600), allow);
+        assert!(
+            matches!(
+                late.as_slice(),
+                [Action::Session {
+                    id: 2,
+                    decision: SessionDecision::AllowOnce,
+                    ..
+                }]
+            ),
+            "{late:?}"
+        );
     }
 
     /// Every screen state draws without a panic (no GPU needed): home in each
