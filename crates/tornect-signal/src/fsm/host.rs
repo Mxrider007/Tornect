@@ -115,8 +115,42 @@ impl StopTokenCheck for NoStopToken {
 /// Whether a remote session is live right now (popups are suppressed while
 /// one is, §B.8.16 ⇒ `PAIR_REJECT{BUSY}` / `SESSION_REJECT{BUSY}`).
 pub trait SessionActivity: Send + Sync {
-    /// `true` while a remote session is live on this host.
+    /// `true` while a remote session is live on this host, or reserved by
+    /// [`try_reserve`](Self::try_reserve).
     fn session_live(&self) -> bool;
+
+    /// The one-session gate (§B.8.6.4): `false` while a session is live or
+    /// reserved; otherwise reserve one and `true`. The reservation counts as
+    /// live until [`release`](Self::release), and the host releases it only
+    /// once the session is registered through [`SessionSink::on_start`], or
+    /// never started.
+    ///
+    /// A source that can see sessions start concurrently must check and
+    /// reserve in one step (SLICE-C3 C3-1): the accept write between the check
+    /// and `on_start` can take up to 30 s. The default, which cannot, is for
+    /// sources that are constant.
+    fn try_reserve(&self) -> bool {
+        !self.session_live()
+    }
+
+    /// Let go of a reservation [`try_reserve`](Self::try_reserve) took.
+    fn release(&self) {}
+}
+
+/// A session slot reserved by [`SessionActivity::try_reserve`]; dropping it
+/// releases the slot, however the accept ends (a failed write, a cancelled task).
+struct Reserved<'a>(&'a dyn SessionActivity);
+
+impl<'a> Reserved<'a> {
+    fn take(activity: &'a dyn SessionActivity) -> Option<Self> {
+        activity.try_reserve().then_some(Self(activity))
+    }
+}
+
+impl Drop for Reserved<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 /// No session is ever live (offline CLI, tests).
@@ -485,7 +519,15 @@ pub struct LiveSessions {
 #[derive(Debug, Default)]
 struct LiveState {
     live: Vec<LiveEntry>,
+    /// Accepts between the one-session gate and `on_start` (SLICE-C3 C3-1).
+    reserved: usize,
     last_ended: Option<std::time::Instant>,
+}
+
+impl LiveState {
+    fn busy(&self) -> bool {
+        !self.live.is_empty() || self.reserved > 0
+    }
 }
 
 /// One live session, as [`LiveSessions::snapshot`] reports it.
@@ -545,7 +587,21 @@ impl SessionSink for LiveSessions {
 
 impl SessionActivity for LiveSessions {
     fn session_live(&self) -> bool {
-        !crate::pairing::lock(&self.state).live.is_empty()
+        crate::pairing::lock(&self.state).busy()
+    }
+
+    fn try_reserve(&self) -> bool {
+        let mut state = crate::pairing::lock(&self.state);
+        if state.busy() {
+            return false;
+        }
+        state.reserved += 1;
+        true
+    }
+
+    fn release(&self) {
+        let mut state = crate::pairing::lock(&self.state);
+        state.reserved = state.reserved.saturating_sub(1);
     }
 }
 
@@ -554,8 +610,9 @@ impl RemoteSessionActivity for LiveSessions {
         crate::pairing::lock(&self.state).last_ended
     }
 
+    /// A session being accepted counts: the guard errs on the refusing side.
     fn session_live(&self) -> bool {
-        !crate::pairing::lock(&self.state).live.is_empty()
+        crate::pairing::lock(&self.state).busy()
     }
 }
 
@@ -964,14 +1021,17 @@ where
         };
         return reject_session(&mut chan, deps, &peer, reason).await;
     }
-    if deps.activity.session_live() {
+    // Checked and reserved in one step: a second session that gets here while
+    // this accept is still being written sees the reservation, not an empty
+    // host (SLICE-C3 C3-1). It gives way to the live entry after `on_start`.
+    let Some(reserved) = Reserved::take(&*deps.activity) else {
         let reason = if unattended {
             messages::reject::SESSION_ACTIVE
         } else {
             messages::reject::BUSY
         };
         return reject_session(&mut chan, deps, &peer, reason).await;
-    }
+    };
 
     // Accept → Established. `build` is the only source of the session token:
     // the accept body carries `session_token` for attended sessions and only
@@ -1008,6 +1068,7 @@ where
         mode,
         unattended,
     });
+    drop(reserved);
     let ended = {
         let _established = Counted::new(&deps.stats.established);
         established(&mut chan, cfg, deps, &mut kill).await

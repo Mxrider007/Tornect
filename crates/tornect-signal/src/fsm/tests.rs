@@ -3730,6 +3730,112 @@ async fn a_session_that_went_live_during_the_popup_blocks_the_accept() {
     assert_eq!(sink.live.count(), 1);
 }
 
+/// SLICE-C3 C3-1: two accepts racing let one session go live (§B.8.6.4). The
+/// first accept's write is stuck, as when its peer withholds Tor credit; a
+/// second paired device that asks meanwhile found nothing live, since the
+/// first registers only after its write, and both went live. The gate now
+/// reserves the slot in the same step as its check.
+#[tokio::test(start_paused = true)]
+async fn two_accepts_racing_let_only_one_session_go_live() {
+    const OTHER_SEED: [u8; 32] = [0x23; 32];
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let sink = Arc::new(CountingSink::default());
+    host.deps.sessions = sink.clone();
+    host.deps.activity = sink.live.clone();
+    for (seed, label) in [(CLIENT_SEED, "First"), (OTHER_SEED, "Second")] {
+        host.trusted
+            .pin(DeviceIdentity::from_seed(&seed).id(), label)
+            .unwrap();
+        host.consent
+            .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+    }
+
+    // The first: its SESSION_ACCEPT goes into a 64-byte pipe nobody reads.
+    let (a, b) = duplex(64);
+    let first = spawn_host(a, &host);
+    let mut stuck = RawClient::new(b, &host.identity, CLIENT_SEED);
+    stuck.hello_ack().await;
+    let request = SessionRequest {
+        caps: Caps::default(),
+        unattended: None,
+    };
+    stuck
+        .chan
+        .send(&request, Some(&stuck.identity))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(host.consent.session_popups(), 1);
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0, "stuck in its accept");
+
+    // The second asks while the first accept is still being written.
+    let (a, b) = pipe();
+    let second = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, OTHER_SEED);
+    raw.hello_ack().await;
+    let answer = raw.request_session().await;
+    assert_eq!(
+        answer.env.kind,
+        Kind::SessionReject,
+        "a second session went live beside the first"
+    );
+    match second.await.unwrap().unwrap() {
+        HostOutcome::SessionRejected { reason, .. } => assert_eq!(reason, reject::BUSY),
+        other => panic!("{other:?}"),
+    }
+
+    // The first goes live once its accept is read.
+    assert_eq!(stuck.recv().await.unwrap().env.kind, Kind::SessionAccept);
+    stuck.chan.send(&Ping { nonce: 1 }, None).await.unwrap();
+    assert_eq!(stuck.recv().await.unwrap().env.kind, Kind::Pong);
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(sink.live.count(), 1);
+    drop(stuck);
+    first.await.unwrap().unwrap();
+    assert_eq!(sink.live.count(), 0);
+    assert!(!SessionActivity::session_live(&*sink.live));
+}
+
+/// SLICE-C3 C3-1: the reservation is let go however the accept ends. A host
+/// task dropped in the middle of its accept write leaves no session behind
+/// that would answer every later request `BUSY`.
+#[tokio::test(start_paused = true)]
+async fn an_accept_that_never_completes_lets_go_of_its_reservation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let sink = Arc::new(CountingSink::default());
+    host.deps.sessions = sink.clone();
+    host.deps.activity = sink.live.clone();
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "First")
+        .unwrap();
+    host.consent
+        .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+    let (a, b) = duplex(64);
+    let task = spawn_host(a, &host);
+    let mut stuck = RawClient::new(b, &host.identity, CLIENT_SEED);
+    stuck.hello_ack().await;
+    let request = SessionRequest {
+        caps: Caps::default(),
+        unattended: None,
+    };
+    stuck
+        .chan
+        .send(&request, Some(&stuck.identity))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        SessionActivity::session_live(&*sink.live),
+        "reserved while its accept is written"
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(!SessionActivity::session_live(&*sink.live));
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0);
+}
+
 /// An unattended hook that accepts every request, as a correct password would.
 struct AcceptAll;
 
