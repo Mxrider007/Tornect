@@ -39,6 +39,44 @@ pub enum UserEvent {
     Wake(Wake),
 }
 
+/// The window calls a question or a session start makes: a seam, so a test
+/// can record them. There is deliberately no `focus_window` here.
+trait Attention {
+    fn is_minimized(&self) -> Option<bool>;
+    fn set_minimized(&self, minimized: bool);
+    fn request_user_attention(&self, kind: Option<UserAttentionType>);
+}
+
+impl Attention for Window {
+    fn is_minimized(&self) -> Option<bool> {
+        Window::is_minimized(self)
+    }
+
+    fn set_minimized(&self, minimized: bool) {
+        Window::set_minimized(self, minimized);
+    }
+
+    fn request_user_attention(&self, kind: Option<UserAttentionType>) {
+        Window::request_user_attention(self, kind);
+    }
+}
+
+/// A question opened or a session started: ask for the user's attention (a
+/// flashing taskbar button, an urgency hint, GNOME's "is ready" notice) and
+/// bring a minimized window back, but never take the keyboard focus
+/// (`docs/UI_PLAN.md` §6.1: "dialog takes focus only on user click";
+/// SLICE-E E1-1: on Windows `focus_window` forces the window to the
+/// foreground, and keys typed for another program then answer the card).
+/// X11's un-minimize is itself an activation request (`_NET_ACTIVE_WINDOW`),
+/// so only a window known to be minimized gets it; Wayland cannot tell
+/// (`None`) and cannot un-minimize.
+fn ask_attention(window: &impl Attention) {
+    if window.is_minimized() == Some(true) {
+        window.set_minimized(false);
+    }
+    window.request_user_attention(Some(UserAttentionType::Critical));
+}
+
 /// One window with its egui context, input state and painter.
 struct Surface {
     window: Arc<Window>,
@@ -414,14 +452,29 @@ impl App {
             Action::EndViewing => self.command(Command::EndViewing),
             Action::Grant => self.command(Command::Grant),
             Action::Revoke => self.command(Command::Revoke),
-            Action::Pair { id, decision } => {
+            Action::Pair {
+                id,
+                decision,
+                pointer,
+            } => {
+                tracing::debug!(id, ?decision, pointer, "pairing question answered");
                 self.popups.answer_pairing(id, decision);
                 self.form.labels.remove(&id);
             }
-            Action::Session { id, decision } => {
+            Action::Session {
+                id,
+                decision,
+                pointer,
+            } => {
+                tracing::debug!(id, ?decision, pointer, "session question answered");
                 self.popups.answer_session(id, decision);
             }
-            Action::Confirm { id, matched } => {
+            Action::Confirm {
+                id,
+                matched,
+                pointer,
+            } => {
+                tracing::debug!(id, matched, pointer, "code question answered");
                 self.popups.answer_confirm(id, matched);
             }
             Action::CopyId => {
@@ -560,12 +613,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.sync_indicator(el);
                 if let Some(main) = &self.main {
                     if why == Wake::Attention {
-                        // A popup or a session: in front of the user, as far
-                        // as the desktop allows (GNOME may only flag it).
-                        main.window.set_minimized(false);
-                        main.window.focus_window();
-                        main.window
-                            .request_user_attention(Some(UserAttentionType::Critical));
+                        ask_attention(&*main.window);
                     }
                     main.window.request_redraw();
                 }
@@ -661,10 +709,67 @@ impl ApplicationHandler<UserEvent> for App {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use tokio::sync::mpsc::error::TryRecvError;
 
     use super::super::model::Model;
     use super::*;
+
+    /// A window call, as the recorder saw it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Call {
+        SetMinimized(bool),
+        Attention(Option<UserAttentionType>),
+    }
+
+    /// Records the calls instead of making them, for a window whose
+    /// minimized state is `minimized`.
+    struct Recorder {
+        minimized: Option<bool>,
+        calls: RefCell<Vec<Call>>,
+    }
+
+    impl Attention for Recorder {
+        fn is_minimized(&self) -> Option<bool> {
+            self.minimized
+        }
+
+        fn set_minimized(&self, minimized: bool) {
+            self.calls.borrow_mut().push(Call::SetMinimized(minimized));
+        }
+
+        fn request_user_attention(&self, kind: Option<UserAttentionType>) {
+            self.calls.borrow_mut().push(Call::Attention(kind));
+        }
+    }
+
+    /// SLICE-E E1-1: a question or a session start asks for the user's
+    /// attention and never takes the keyboard focus (on Windows,
+    /// `focus_window` forced the window to the foreground, and the keys typed
+    /// for another program then landed on the card). Only a window known to
+    /// be minimized is brought back: on X11 that request is an activation
+    /// too.
+    #[test]
+    fn the_wake_asks_for_attention_without_taking_the_focus() {
+        let attention = Call::Attention(Some(UserAttentionType::Critical));
+        for (minimized, expected) in [
+            (Some(true), vec![Call::SetMinimized(false), attention]),
+            (Some(false), vec![attention]),
+            (None, vec![attention]),
+        ] {
+            let window = Recorder {
+                minimized,
+                calls: RefCell::default(),
+            };
+            ask_attention(&window);
+            assert_eq!(
+                window.calls.into_inner(),
+                expected,
+                "minimized: {minimized:?}"
+            );
+        }
+    }
 
     /// The indicator's Stop asks the tokio side to stop sharing, as the
     /// banner's does, and nothing else; moving it with no window up does
