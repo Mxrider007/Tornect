@@ -123,6 +123,53 @@ impl WaylandSource {
     }
 }
 
+/// What [`grant`] got from the desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Granted {
+    /// Keyboard and pointer were granted too (the dialog's remote-interaction
+    /// switch was on). Without them a session shares the screen and injects
+    /// nothing.
+    pub input: bool,
+    /// The desktop returned a restore token, and it is kept in the options'
+    /// file: later sessions start without the dialog.
+    pub remembered: bool,
+}
+
+/// The first-run setup step (the operator's decision of 2026-09-23): ask the
+/// desktop now, with its owner at the desk, for the grant a shared session
+/// needs, keep the restore token it returns, and close the session at once.
+///
+/// It opens the same portal session a shared session does (keyboard, pointer
+/// and one monitor, persisted until revoked), so the token restores exactly
+/// what a session asks for, and a later session never shows the dialog inside
+/// a viewer's wait. Deleting the token file revokes the grant, as before.
+/// Blocks until the dialog is answered or `options.dialog_wait` runs out.
+/// Nothing is shown when PipeWire cannot be loaded, since no session could
+/// use the grant.
+pub fn grant(options: &WaylandOptions) -> Result<Granted, CaptureError> {
+    pipewire::api()?;
+    let (portal, opened) = Portal::open(Setup {
+        bus: options.bus.clone(),
+        token_file: options.restore_token.clone(),
+        dialog_wait: options.dialog_wait,
+        cancel: options.cancel.clone(),
+    })?;
+    let input = opened.input;
+    // The PipeWire remote goes first, then the session: no picture is taken.
+    drop(opened);
+    drop(portal);
+    let remembered = options
+        .restore_token
+        .as_deref()
+        .is_some_and(|file| portal::read_token(file).is_some());
+    tracing::info!(
+        input,
+        remembered,
+        "the desktop's screen-sharing grant was asked for ahead of any session"
+    );
+    Ok(Granted { input, remembered })
+}
+
 impl VideoSource for WaylandSource {
     fn name(&self) -> &'static str {
         "wayland"
