@@ -5,13 +5,15 @@
 //! * `lint-all`    — fmt check + clippy only
 //! * `pt-fetch`    — lyrebird from the Tor Project archive, checked against
 //!   `packaging/pt/SOURCES.md`, into `target/pt/<os>/`
-//! * `dist`        — release build into `dist/` (packaging grows in M8)
+//! * `dist`        — the release zips for Linux and Windows, with `SHA256SUMS`,
+//!   in `target/dist/` (`docs/RELEASING.md`; installers are M8 work)
 //! * `ffmpeg-fetch`— placeholder until the FFmpeg backend lands (M3)
 //! * `soak`        — placeholder until the loopback demo lands (M3)
 
 #![forbid(unsafe_code)]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod dist;
 mod pt;
 mod sha256;
 
@@ -29,7 +31,7 @@ fn main() -> anyhow::Result<()> {
         Some("verify") => verify(&root, &args[1..]),
         Some("lint-all") => lint_all(&root),
         Some("pt-fetch") => pt::pt_fetch(&root, &args[1..]),
-        Some("dist") => dist(&root),
+        Some("dist") => dist::dist(&root, &args[1..]),
         Some("ffmpeg-fetch") => {
             println!("ffmpeg-fetch: the FFmpeg backend is scheduled for M3; nothing to do yet.");
             Ok(())
@@ -42,7 +44,7 @@ fn main() -> anyhow::Result<()> {
             eprintln!(
                 "usage: cargo xtask <verify [--no-tests] | lint-all \
                  | pt-fetch [--linux] [--windows] [--offline] \
-                 | dist | ffmpeg-fetch | soak>"
+                 | dist [--linux] [--windows] [--allow-dirty] | ffmpeg-fetch | soak>"
             );
             std::process::exit(2);
         }
@@ -282,36 +284,6 @@ fn verify(root: &Path, extra: &[String]) -> anyhow::Result<()> {
     } else {
         println!("verify: all gates green EXCEPT cargo deny, which did not run");
     }
-    Ok(())
-}
-
-fn dist(root: &Path) -> anyhow::Result<()> {
-    let mut build = cargo();
-    // `--locked`: a release is built from exactly the reviewed `Cargo.lock`.
-    build.args(["build", "--locked", "--profile", "dist", "-p", "tornect"]);
-    run(
-        root,
-        "cargo build --locked --profile dist -p tornect",
-        build,
-    )?;
-
-    let bin = format!("tornect{}", std::env::consts::EXE_SUFFIX);
-    let src = root.join("target").join("dist").join(&bin);
-    let out_dir = root.join("dist");
-    std::fs::create_dir_all(&out_dir)?;
-    let dst = out_dir.join(format!(
-        "tornect-{}-{}-{}{}",
-        env!("CARGO_PKG_VERSION"),
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        std::env::consts::EXE_SUFFIX
-    ));
-    std::fs::copy(&src, &dst)
-        .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
-    println!("dist: wrote {}", dst.display());
-    println!(
-        "dist: installers (MSI/winget, notarized .dmg, AppImage/Flatpak) are M8 work — see docs/PLAN.md."
-    );
     Ok(())
 }
 

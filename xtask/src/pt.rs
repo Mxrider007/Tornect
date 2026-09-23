@@ -72,6 +72,11 @@ impl Bundle {
     fn url(&self) -> String {
         format!("{ARCHIVE}/{TOR_BROWSER}/{}", self.tarball())
     }
+
+    /// `lyrebird` or `lyrebird.exe`.
+    pub fn file_name(&self) -> &'static str {
+        self.member.rsplit('/').next().unwrap_or(self.member)
+    }
 }
 
 /// What one run checked, and where it put the two files.
