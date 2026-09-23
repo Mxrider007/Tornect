@@ -116,6 +116,35 @@ every session at once, press **Ctrl-C in the console where `tornect.exe host`
 runs**, or press Stop on the banner or the "Tornect: sharing" window when you
 use the window.
 
+## Start at logon
+
+`tornect service install` registers **`tornect host`** (this executable, the
+command-line host) to start after you log in; `tornect service status` shows
+what is registered; `tornect service uninstall` removes it. Installing and
+removing ask for your OS password (the change widens access) and are refused
+while a remote session is live or ended less than a minute ago. Nothing starts
+before a login: Tornect never turns on automatic login, so after a reboot the
+computer stays unreachable until someone logs in.
+
+- **Linux:** a systemd user unit, `~/.config/systemd/user/tornect-host.service`,
+  started with your graphical session. Started this way the host has no
+  terminal, so it refuses every attended pairing or session request; it serves
+  pings and unattended sessions. `systemctl --user stop tornect-host` ends it
+  gracefully. The password dialog is polkit's `org.tornect.autostart` action,
+  so `packaging/polkit/org.tornect.policy` must be installed. Remove it with
+  `tornect service uninstall` (or `systemctl --user disable tornect-host` and
+  deleting the file).
+- **Windows:** a Task Scheduler task `\Tornect` that runs `tornect.exe host` in a
+  console window when you log on; that window is the host (Ctrl-C in it ends
+  every session). The password dialog is Windows' secure credential prompt:
+  choose your password, not a PIN. Keep `tornect.exe` in a folder only you can
+  change. `--elevated` (administrators only, `tornect.exe` under
+  `C:\Program Files`) registers it to run elevated, after a UAC prompt: then
+  **every remote Control session is an administrator session**. A `--home` or
+  `TORNECT_HOME` directory is refused on Windows. Stop a running host (Ctrl-C in
+  its window) before `tornect service uninstall`; `schtasks /Delete /TN Tornect
+  /F` also removes it. Not yet tried on Windows.
+
 ## Where Tornect keeps its state
 
 `tornect paths` prints the directories: the keys of this machine's Tornect ID,
