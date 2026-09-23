@@ -113,7 +113,7 @@ encrypted store and the IPC message set are `#[cbor(map)]` structs with integer 
 
 | Binary | Version | Source | Why | Verified |
 |---|---|---|---|---|
-| `lyrebird` / `lyrebird.exe` | 0.8.1 (Tor Browser 15.0.23 tor-expert-bundle) | archive.torproject.org, GPG-verified (Tor Browser Developers `EF6E 286D DA85 EA2A 4BA7 DE68 4E2C 6E87 9329 8290`), SHA-256 pinned in `packaging/pt/SOURCES.md` | The managed pluggable transport for obfs4 **and** Snowflake bridges (M1-38); run by Arti's `tor-ptmgr`, never linked | 2026-09-21 mx-vm: signatures good, hashes match, `lyrebird -version` = 0.8.1, live obfs4 + Snowflake bootstraps (`docs/research/bridges.md` §8) |
+| `lyrebird` / `lyrebird.exe` | 0.8.1 (Tor Browser 15.0.23 tor-expert-bundle) | archive.torproject.org, GPG-verified (Tor Browser Developers `EF6E 286D DA85 EA2A 4BA7 DE68 4E2C 6E87 9329 8290`), SHA-256 pinned in `packaging/pt/SOURCES.md` | The managed pluggable transport for obfs4 **and** Snowflake bridges (M1-38); run by Arti's `tor-ptmgr`, never linked | 2026-09-21 mx-vm: signatures good, hashes match, `lyrebird -version` = 0.8.1, live obfs4 + Snowflake bootstraps (`docs/research/bridges.md` §8). 2026-09-23: `cargo xtask pt-fetch` downloaded both tarballs again (byte-identical to the 2026-09-21 copies); good signatures by subkey `CAAE408A…` (it expires 2026-10-26), members and `docs/lyrebird.txt` match the pins; `cargo xtask dist` ships them as `pt/lyrebird[.exe]` and `pt/lyrebird.txt` |
 
 ## Fuzzing (`fuzz/`, excluded from the workspace, nightly only)
 
@@ -127,8 +127,22 @@ encrypted store and the IPC message set are `#[cbor(map)]` structs with integer 
 
 | Tool | Version | Source | Why | Configuration | Verified |
 |---|---|---|---|---|---|
-| llvm-mingw | 20260908 (clang 23.1.1, UCRT; the `ubuntu-22.04-x86_64` build) | github.com/mstorsjo/llvm-mingw release asset, sha256 `2258c745e3155870c80793f3e8c80b28fbde11b9ff73c4c78783635b3440b092` (`docs/research/slice.md` §1) | C/C++ compiler and linker (lld) for `x86_64-pc-windows-gnullvm`: OpenH264, ring, the bundled SQLite, zstd, liblzma. Its libc++ (with libc++abi), libunwind and mingw-w64 CRT, including the stack-protector runtime in `libmingwex`, are linked statically, so it is part of the Windows TCB (A3-F7 (c)) | its `bin` on `PATH`; `.cargo/config.toml`: `+crt-static`, `-l:libc++.a`, an empty `CXXSTDLIB_x86_64_pc_windows_gnullvm`, `CFLAGS_`/`CXXFLAGS_x86_64_pc_windows_gnullvm = "-fstack-protector-strong"` | 2026-09-23 mx-vm: the whole app and the 13 test binaries build and link; `tornect.exe` imports only Windows DLLs |
-| nasm | 3.01 (Ubuntu `3.01-1`, installed on mx-vm 2026-09-23) | Ubuntu archive | Optional. When `nasm` is on `PATH`, `openh264-sys2` assembles OpenH264's x86 SIMD kernels (19 objects) and builds the C++ with `-DX86_ASM`; without it the build falls back to C++ silently (A3-F7 (a)), so two machines can link different code. The kernels have no stack protector | none; the build does not pin it | 2026-09-23 mx-vm: the Linux and the gnullvm builds both include the kernels |
+| llvm-mingw | 20260908 (clang 23.1.1, UCRT; the `ubuntu-22.04-x86_64` build) | github.com/mstorsjo/llvm-mingw release asset, sha256 `2258c745e3155870c80793f3e8c80b28fbde11b9ff73c4c78783635b3440b092` (`docs/research/slice.md` §1) | C/C++ compiler and linker (lld) for `x86_64-pc-windows-gnullvm`: OpenH264, ring, the bundled SQLite, zstd, liblzma. Its libc++ (with libc++abi), libunwind and mingw-w64 CRT, including the stack-protector runtime in `libmingwex`, are linked statically, so it is part of the Windows TCB (A3-F7 (c)) | its `bin` on `PATH`; `.cargo/config.toml`: `+crt-static`, `-l:libc++.a`, an empty `CXXSTDLIB_x86_64_pc_windows_gnullvm`, `CFLAGS_`/`CXXFLAGS_x86_64_pc_windows_gnullvm = "-fstack-protector-strong"`. `cargo xtask dist` finds it through `$LLVM_MINGW` or `~/.local/opt/<release>`, refuses a clang other than `clang version 23.1.1 (… 6dfe1677…)`, links with `-Wl,--no-insert-timestamp`, strips with its `llvm-strip`, and records the SHA-256 of `crt2.o`, `libc++.a`, `libmingw32.a`, `libmingwex.a` and `libunwind.a` in each Windows zip's `BUILD-INFO.txt` | 2026-09-23 mx-vm: the whole app and the 13 test binaries build and link; `tornect.exe` imports only Windows DLLs |
+| nasm | 3.01 (Ubuntu `3.01-1`, installed on mx-vm 2026-09-23) | Ubuntu archive | Optional. When `nasm` is on `PATH`, `openh264-sys2` assembles OpenH264's x86 SIMD kernels (19 objects) and builds the C++ with `-DX86_ASM`; without it the build falls back to C++ silently (A3-F7 (a)), so two machines can link different code. The kernels have no stack protector | none for a plain build, which does not pin it; `cargo xtask dist` refuses to run without nasm, so every release carries the kernels, and records `nasm -v` in each zip's `BUILD-INFO.txt` (no version is enforced) | 2026-09-23 mx-vm: the Linux and the gnullvm builds both include the kernels |
+
+## Release tooling (`cargo xtask pt-fetch`, `cargo xtask dist`; not crates)
+
+`xtask` depends on `anyhow` alone. Both commands run on a Linux x86_64 host and use these programs
+(`docs/RELEASING.md`, `packaging/pt/SOURCES.md`):
+
+| Tool | Version on mx-vm | Used by | For | Required |
+|---|---|---|---|---|
+| SHA-256 in `xtask/src/sha256.rs` | — | both | every pin check and `SHA256SUMS`. FIPS 180-4 written out, so that the release tooling adds no crate to `Cargo.lock`; its tests pin it to the FIPS 180-2 known answers and to digests at the padding boundaries, and the real 22–32 MB tarballs hash to the pins | — |
+| curl | 8.18.0 | pt-fetch | downloads from archive.torproject.org: `--disable` first (no `~/.curlrc`), curl's default user agent, https only (also on redirects), at most 100 MiB | only when the cache lacks a matching file |
+| GNU tar | 1.35 | pt-fetch | extracts exactly the two members | yes |
+| GnuPG `gpg`, `gpgv` | 2.4.8 | pt-fetch (and dist through it) | the detached signature, checked against `packaging/pt/tor-browser-developers.asc` alone in an empty home directory | no: without them the run says "signature NOT CHECKED" and the SHA-256 pins stand alone; `docs/RELEASING.md` requires a checked signature for a release |
+| Info-ZIP `zip`, `unzip` | 3.0, 6.00 | dist | `zip -X -D -9` under `TZ=UTC` (no owner ids, no extra times, no directory entries); `unzip -t` and `unzip -Z1` check each zip | yes |
+| GNU binutils `strip`, `readelf`, `objdump` | 2.46 | dist | strips the Linux executable's debug info; reads its `NEEDED` libraries and newest `GLIBC_`/`GLIBCXX_` versions, and the Windows executable's DLL imports and PE timestamp | yes |
 
 ## Vertical slice (M1-39 / M3-1; pins verified 2026-09-21, `docs/research/slice.md`)
 
