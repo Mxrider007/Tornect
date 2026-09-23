@@ -3,10 +3,9 @@
 Tornect reaches Tor through bridges when direct Tor is blocked (decision M1-38,
 `docs/research/bridges.md`). One helper binary serves both bridge types it uses — **obfs4** and
 **Snowflake** — and webtunnel: **lyrebird**, taken unmodified from the Tor Project's signed
-tor-expert-bundle. It is not committed to git. **Today** it is fetched and verified by hand with the
-recipe below and extracted to `target/pt/<os>/`; `cargo xtask pt-fetch` (download + the checks
-below) and `dist` bundling it next to the executable are still to be written (hand-off, packaging
-step).
+tor-expert-bundle. It is not committed to git. `cargo xtask pt-fetch` downloads it and runs the
+checks below (section *`cargo xtask pt-fetch`*); `cargo xtask dist` runs the same checks and ships
+it as `pt/lyrebird[.exe]` in each release zip (`docs/RELEASING.md`).
 
 **Enforced at run time** (decision M1-40): Tornect hashes the `lyrebird` it is about to launch and
 refuses one that does not match the member SHA-256 below, compiled into
@@ -23,8 +22,8 @@ an explicit `tor.pt_path` may run another build, and that is logged.
 | windows sha256 | `231dad6b9cb401a54c260db7046965ef04e4f72ff071b140d423fb5da281ab1e` |
 | member (linux) | `tor/pluggable_transports/lyrebird` — sha256 `ee13ec155cf9b131a3e1b87bd6d697a10c42d04f2eaaeab6b1590c9971d41421` |
 | member (windows) | `tor/pluggable_transports/lyrebird.exe` — sha256 `6e218e85f9a7ae2481f5402ded822471a9a9d0c7e66b05db3842b93fa5c1f02e` |
-| licence notice | `docs/lyrebird.txt` from the same tarball (shipped alongside the binary) |
-| signing key | Tor Browser Developers, primary `EF6E 286D DA85 EA2A 4BA7 DE68 4E2C 6E87 9329 8290` |
+| licence notice | `docs/lyrebird.txt` from the same tarball (shipped alongside the binary as `pt/lyrebird.txt`; the same file in both tarballs) — sha256 `2331e6517a15ce87e2a1d2838c314ca1b8f3c7a347ac28d370a7fccdb5964f40` |
+| signing key | Tor Browser Developers, primary `EF6E 286D DA85 EA2A 4BA7 DE68 4E2C 6E87 9329 8290`; the key is `packaging/pt/tor-browser-developers.asc` (from the WKD on 2026-09-21, `--export-options export-minimal`) |
 
 ## How the pins were established (2026-09-21, mx-vm)
 
@@ -46,6 +45,33 @@ Result: three good signatures from the key above, both tarball hashes `OK` again
 list, and the pins in the table. The 7 obfs4 + 2 Snowflake bridge lines inside the bundle's
 `pt_config.json` are byte-identical to `tornect-signal`'s `BUILTIN_OBFS4` / `BUILTIN_SNOWFLAKE`.
 
+## `cargo xtask pt-fetch`
+
+`cargo xtask pt-fetch [--linux] [--windows] [--offline]` (both platforms by default) repeats the
+recipe below for one Tor Browser version, with every value above compiled into `xtask/src/pt.rs`:
+
+1. It refuses to start unless its pins equal `LYREBIRD_SHA256` in
+   `crates/tornect-signal/src/tor/bridges.rs` and the rows of this table (a gate test checks the
+   same).
+2. The tarball comes from `target/pt-fetch/15.0.23/` when its SHA-256 is the pin; otherwise it is
+   downloaded with `curl --disable` (curl's default user agent, no `~/.curlrc`, https only) to a
+   `.part` file and renamed into place only when it matches. A cached copy that does not match is
+   deleted and fetched again.
+3. The detached signature (`.asc`) is checked with the key file above alone: `gpg --dearmor`, then
+   `gpgv --status-fd` in an empty home directory. Accepted: gpgv's success, a `VALIDSIG` whose
+   primary key is `EF6E…8290`, and `GOODSIG`, or `EXPKEYSIG` for a signature made while the signing
+   subkey was valid. `BADSIG`, `ERRSIG`, `NO_PUBKEY`, `REVKEYSIG` and `EXPSIG` refuse. Without `gpg`
+   and `gpgv` on `PATH` the run prints "signature NOT CHECKED" and relies on the SHA-256 pins.
+4. `tar` extracts only the two members into a scratch directory; each must match its pin, and the
+   copy placed under `target/pt/<os>/` (at the member's path in the tarball, mode 0755 or 0644) is
+   hashed again before it is renamed into place.
+
+Any mismatch stops the run before anything is installed. The subkey that signed 15.0.23
+(`CAAE 408A EBE2 288E 96FC 5D5E 1574 32CF 78A6 5729`) expires on 2026-10-26; from then gpgv says
+`EXPKEYSIG` and pt-fetch says so. The key file also holds a newer signing subkey, `022D A248 432D
+2A0E 0F54 E65E 316C 1FAC D62D 07D9` (created 2026-08-11, valid to 2028-11-28). Refresh the key file
+from the WKD whenever `V` changes.
+
 ## Licences
 
 lyrebird is BSD-2-Clause and includes GPL-3.0-or-later code (`meeklite/transport.go`), so a
@@ -56,7 +82,8 @@ are compatible with Tornect's GPL-3.0-or-later.
 
 ## Updating
 
-Bump `V` and re-run the recipe; replace every hash in the table and `LYREBIRD_SHA256` in
-`crates/tornect-signal/src/tor/bridges.rs` (a release whose bundled binary does not match it refuses
-to run it); diff the
-bundle's `pt_config.json` bridge lines against `BUILTIN_OBFS4` / `BUILTIN_SNOWFLAKE`.
+Bump `V` and re-run the recipe; replace every hash in the table, the pins in `xtask/src/pt.rs`
+and `LYREBIRD_SHA256` in `crates/tornect-signal/src/tor/bridges.rs` together (a release whose
+bundled binary does not match it refuses to run it; `cargo xtask pt-fetch` refuses to run while
+they differ); re-export the key file; diff the bundle's `pt_config.json` bridge lines against
+`BUILTIN_OBFS4` / `BUILTIN_SNOWFLAKE`.

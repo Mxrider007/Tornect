@@ -3,6 +3,8 @@
 //! * `verify`      — plan sync, forbidden-dependency check, `cargo deny` (offline),
 //!   fmt check, clippy `-D warnings` on all targets, tests, docs
 //! * `lint-all`    — fmt check + clippy only
+//! * `pt-fetch`    — lyrebird from the Tor Project archive, checked against
+//!   `packaging/pt/SOURCES.md`, into `target/pt/<os>/`
 //! * `dist`        — release build into `dist/` (packaging grows in M8)
 //! * `ffmpeg-fetch`— placeholder until the FFmpeg backend lands (M3)
 //! * `soak`        — placeholder until the loopback demo lands (M3)
@@ -10,6 +12,10 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod pt;
+mod sha256;
+
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -22,6 +28,7 @@ fn main() -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         Some("verify") => verify(&root, &args[1..]),
         Some("lint-all") => lint_all(&root),
+        Some("pt-fetch") => pt::pt_fetch(&root, &args[1..]),
         Some("dist") => dist(&root),
         Some("ffmpeg-fetch") => {
             println!("ffmpeg-fetch: the FFmpeg backend is scheduled for M3; nothing to do yet.");
@@ -33,7 +40,9 @@ fn main() -> anyhow::Result<()> {
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <verify [--no-tests] | lint-all | dist | ffmpeg-fetch | soak>"
+                "usage: cargo xtask <verify [--no-tests] | lint-all \
+                 | pt-fetch [--linux] [--windows] [--offline] \
+                 | dist | ffmpeg-fetch | soak>"
             );
             std::process::exit(2);
         }
@@ -186,14 +195,21 @@ fn find_cargo_deny(root: &Path) -> Option<PathBuf> {
         let candidate = entry.path().join(&bin);
         candidate.is_file().then_some(candidate)
     });
-    bundled.or_else(|| {
-        std::env::var_os("PATH").and_then(|path| {
-            std::env::split_paths(&path)
-                .filter(|dir| dir.is_absolute())
-                .map(|dir| dir.join(&bin))
-                .find(|p| p.is_file())
-        })
-    })
+    bundled.or_else(|| std::env::var_os("PATH").and_then(|path| search_path(&path, &bin)))
+}
+
+/// An executable named `bin` in an absolute `PATH` directory; a relative entry
+/// would let the current directory choose what runs.
+pub(crate) fn find_on_path(bin: &str) -> Option<PathBuf> {
+    let bin = format!("{bin}{}", std::env::consts::EXE_SUFFIX);
+    std::env::var_os("PATH").and_then(|path| search_path(&path, &bin))
+}
+
+fn search_path(path: &OsStr, file: &str) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(file))
+        .find(|p| p.is_file())
 }
 
 /// The newest advisory database `cargo-deny` has fetched, as `(dir, date)`.
