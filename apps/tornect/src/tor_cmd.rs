@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
-use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tornect_capture::TestCard;
 use tornect_codec::DecodedFrame;
@@ -20,6 +20,7 @@ use tornect_core::keystore::{
 };
 use tornect_core::session_log::SessionMode;
 use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
+use tornect_input::InputEvent;
 use tornect_proto::ProtoError;
 use tornect_session::{
     Binding, DesktopBackend, FrameSink, MediaHost, MediaLimits, MediaViewer, Source, SystemBackend,
@@ -629,6 +630,8 @@ async fn connect_session(
             &mut session,
             opts.pings,
             &interrupts.pressed,
+            None,
+            None,
         )
         .await?
     } else {
@@ -704,7 +707,7 @@ async fn pressed(mut rx: watch::Receiver<bool>) {
 
 /// How a live session ended, seen from the client.
 #[derive(Debug)]
-enum End {
+pub(crate) enum End {
     /// This side ended it (Ctrl-C, or `--pings` reached).
     You,
     /// The host sent `BYE{reason}`.
@@ -717,14 +720,21 @@ enum End {
 
 /// Open the session's media stream beside the signaling stream and receive
 /// the screen, while the signaling stream keeps the session alive. Whichever
-/// side ends first ends the other.
-async fn watch<S>(
+/// side ends first ends the other. `interrupted` turning `true` is the user's
+/// own end (Ctrl-C, or the window's Stop). Every picture also goes to
+/// `forward` (the window's), and each event from `input` goes to the host:
+/// the caller passes one only for a control session, by the signed
+/// `SESSION_ACCEPT`'s mode (SLICE-C2 C2-6).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn watch<S>(
     node: &TorNode,
     id: &TornectId,
     isolation: &Isolation,
     session: &mut ClientSession<S>,
     pings: Option<u32>,
     interrupted: &watch::Receiver<bool>,
+    input: Option<mpsc::Receiver<InputEvent>>,
+    forward: Option<&mut dyn FrameSink>,
 ) -> anyhow::Result<End>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -761,7 +771,7 @@ where
         }
     );
 
-    let mut pictures = CliPictures::new();
+    let mut pictures = CliPictures::new(forward);
     let mut stats = ViewerStats::default();
     let (viewed, end) = view(
         viewer,
@@ -770,6 +780,7 @@ where
         interrupted,
         &mut pictures,
         &mut stats,
+        input,
     )
     .await;
     pictures.report(&stats);
@@ -805,6 +816,7 @@ async fn view<M, S>(
     interrupted: &watch::Receiver<bool>,
     pictures: &mut dyn FrameSink,
     stats: &mut ViewerStats,
+    input: Option<mpsc::Receiver<InputEvent>>,
 ) -> (Result<ViewerEnd, ViewerError>, anyhow::Result<End>)
 where
     M: AsyncRead + AsyncWrite + Unpin + Send,
@@ -821,7 +833,7 @@ where
                 () = pressed(interrupted.clone()) => {}
             }
         };
-        let viewed = viewer.run(pictures, stats, stop).await;
+        let viewed = viewer.run_with_input(pictures, stats, input, stop).await;
         let _ = media_done.send(host_may_have_ended(&viewed));
         viewed
     };
@@ -885,8 +897,10 @@ fn media_end(viewed: &Result<ViewerEnd, ViewerError>, end: &End) -> String {
 }
 
 /// The CLI's stand-in for a viewer window: counts what it decodes, says so every
-/// few seconds, and checks the test card's frame index when there is one.
-struct CliPictures {
+/// few seconds, and checks the test card's frame index when there is one. The
+/// window, when there is one, gets every picture too (`forward`).
+struct CliPictures<'a> {
+    forward: Option<&'a mut dyn FrameSink>,
     started: Instant,
     last_note: Instant,
     decoded: u64,
@@ -897,10 +911,11 @@ struct CliPictures {
     card_in_order: bool,
 }
 
-impl CliPictures {
-    fn new() -> Self {
+impl<'a> CliPictures<'a> {
+    fn new(forward: Option<&'a mut dyn FrameSink>) -> Self {
         let now = Instant::now();
         Self {
+            forward,
             started: now,
             last_note: now,
             decoded: 0,
@@ -931,11 +946,17 @@ impl CliPictures {
         if let Some((first, last)) = self.card.filter(|_| self.card_in_order && self.decoded > 1) {
             println!("MEDIA CARD first={first} last={last} in-order");
         }
+        if stats.input_sent > 0 {
+            println!("MEDIA INPUT sent={}", stats.input_sent);
+        }
     }
 }
 
-impl FrameSink for CliPictures {
-    fn picture(&mut self, _seq: u32, frame: &DecodedFrame) {
+impl FrameSink for CliPictures<'_> {
+    fn picture(&mut self, seq: u32, frame: &DecodedFrame) {
+        if let Some(forward) = self.forward.as_deref_mut() {
+            forward.picture(seq, frame);
+        }
         self.decoded += 1;
         // Sized from the picture itself, never from `BindOk` (SLICE-A2 A2-4).
         self.size = Some((frame.width, frame.height));
@@ -1079,7 +1100,7 @@ fn spawn_status_reporter(mut rx: watch::Receiver<OnionStatus>) -> JoinHandle<()>
 }
 
 /// Turn a [`SignalError`] into a user-facing message with a next step.
-fn explain(err: SignalError) -> anyhow::Error {
+pub(crate) fn explain(err: SignalError) -> anyhow::Error {
     let hint = match &err {
         SignalError::HostOffline => {
             "The host is offline or has not finished publishing its Tornect ID. \
@@ -1126,7 +1147,7 @@ fn explain(err: SignalError) -> anyhow::Error {
 }
 
 /// Turn a [`HandshakeError`] into a user-facing message with a next step.
-fn explain_handshake(err: HandshakeError) -> anyhow::Error {
+pub(crate) fn explain_handshake(err: HandshakeError) -> anyhow::Error {
     let hint: std::borrow::Cow<'static, str> = match &err {
         HandshakeError::PairRejected { reason, .. } => match *reason {
             pair_reject::DENIED => "The host's user refused the pairing.".into(),
@@ -1404,7 +1425,7 @@ mod tests {
             kill.kill(bye::PANIC);
         });
         let (_ctrl_c, interrupted) = watch::channel(false);
-        let (mut pictures, mut stats) = (CliPictures::new(), ViewerStats::default());
+        let (mut pictures, mut stats) = (CliPictures::new(None), ViewerStats::default());
         let (viewed, end) = view(
             viewer,
             &mut session,
@@ -1412,6 +1433,7 @@ mod tests {
             &interrupted,
             &mut pictures,
             &mut stats,
+            None,
         )
         .await;
         let end = end.unwrap();

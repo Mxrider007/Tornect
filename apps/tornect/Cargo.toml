@@ -20,6 +20,7 @@ tornect-session.workspace = true
 tornect-proto.workspace = true
 tornect-capture.workspace = true
 tornect-codec.workspace = true
+tornect-input.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
@@ -27,9 +28,24 @@ tracing.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
 data-encoding.workspace = true
+# The GUI (`tornect` with no subcommand; docs/research/slice.md §2, D10's
+# egui-everywhere fallback): a manual winit loop driving egui-winit + egui-wgpu.
+winit.workspace = true
+egui.workspace = true
+egui-winit.workspace = true
+egui-wgpu.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
+
+# wgpu backends per target (a target with no backend panics in `Instance::new`).
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { workspace = true, features = ["vulkan", "gles"] }
+
+[target.'cfg(windows)'.dependencies]
+wgpu = { workspace = true, features = ["dx12"] }
 
 [dev-dependencies]
 tempfile.workspace = true
