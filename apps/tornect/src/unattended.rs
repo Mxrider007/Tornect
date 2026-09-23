@@ -32,6 +32,7 @@ use tornect_core::unattended::ipc::{
 use tornect_core::unattended::readiness::ReadinessSnapshot;
 use tornect_core::unattended::store::{GrantStore, LoadMode};
 use tornect_core::{Config, Paths};
+use tornect_platform::autostart::{self, Autostart, AutostartState, LaunchSpec};
 use tornect_platform::ipc::{Endpoint, Reply};
 use tornect_signal::fsm::host::KillSwitch;
 
@@ -41,8 +42,12 @@ pub struct HostContext {
     pub guard: Arc<MutationGuard>,
     /// This host's onion identity key, for `master_on`'s stop token.
     pub host_onion_pk: [u8; 32],
-    /// M1: the all-unknown stub (§B.8.14); M6 fills it from the platform probes.
+    /// The readiness rows no platform probe fills yet: all `Unknown` (§B.8.14).
+    /// [`HostContext::readiness_now`] adds the rows that are probed.
     pub readiness: ReadinessSnapshot,
+    /// Start at login (§B.8.7.5): `tornect service install|uninstall|status`
+    /// and the readiness row `autostart`.
+    pub autostart: Arc<dyn Autostart>,
     /// `zxcvbn` inputs for `PolicyInputs` (§B.8.7.2).
     pub user_inputs: Vec<String>,
     /// Ends live handshakes. `None` on the offline route — there are none.
@@ -52,6 +57,16 @@ pub struct HostContext {
 }
 
 impl HostContext {
+    /// The readiness report as of now: the static rows plus the probed ones
+    /// (`autostart`, read from the OS on every request, so an install or a
+    /// removal made outside Tornect shows at once).
+    #[must_use]
+    pub fn readiness_now(&self) -> ReadinessSnapshot {
+        let mut snap = self.readiness.clone();
+        snap.autostart = autostart::readiness_probe(&self.autostart.status());
+        snap
+    }
+
     /// The §B.8.7.2 minimum `zxcvbn` score: 4 on a file-keystore host, 3 otherwise.
     #[must_use]
     pub fn min_score(&self) -> u8 {
@@ -61,6 +76,102 @@ impl HostContext {
         } else {
             3
         }
+    }
+}
+
+/// `tornect service install` (`install = Some(elevated)`) or `uninstall`
+/// (`None`): §B.8.7.4's `ServiceInstall`/`ServiceUninstall`.
+///
+/// Order: the backend's preflight first (no dialog for a change that can never
+/// be made), then the guard — no remote session for 60 s, a fresh OS
+/// re-authentication, the session check again, and the `AutostartChanged{by}`
+/// line written *before* the effect, so no change can happen unlogged — then
+/// the OS registration. A registration that then fails is answered as a
+/// failure and logged as one (`ok: false`), next to the authorised line. No
+/// store write (§B.8.7.4).
+fn service_change(ctx: &HostContext, id: u64, by: Actor, install: Option<bool>) -> IpcResponse {
+    let (op, what) = match install {
+        Some(elevated) => (ExternalOp::ServiceInstall { elevated }, "install"),
+        None => (ExternalOp::ServiceUninstall, "uninstall"),
+    };
+    match install {
+        Some(elevated) => {
+            if let Err(e) = ctx.autostart.preflight(elevated) {
+                return IpcResponse::fail(id, codes::G_PRECONDITION, e.to_string());
+            }
+        }
+        // Removing nothing changes nothing: no dialog, no log line.
+        None => match ctx.autostart.status() {
+            Ok(AutostartState::Absent) => {
+                let mut r = IpcResponse::ok(id);
+                r.detail = Some(describe_autostart(&*ctx.autostart, &AutostartState::Absent));
+                return r;
+            }
+            Ok(AutostartState::Unavailable(why)) => {
+                return IpcResponse::fail(
+                    id,
+                    codes::G_PRECONDITION,
+                    format!("start at login is unavailable here: {why}"),
+                );
+            }
+            Ok(AutostartState::Registered(_)) | Err(_) => {}
+        },
+    }
+    if let Err(ref e) = ctx.guard.authorize(by, &op) {
+        return guard_fail(id, e);
+    }
+    let done = match install {
+        Some(elevated) => ctx.autostart.install(elevated),
+        None => ctx.autostart.uninstall(),
+    };
+    match done {
+        Ok(state) => {
+            let mut r = IpcResponse::ok(id);
+            r.detail = Some(describe_autostart(&*ctx.autostart, &state));
+            r
+        }
+        Err(e) => {
+            let rec = tornect_core::session_log::SessionRecord::at(
+                wall_now(),
+                tornect_core::session_log::SessionEvent::AutostartChanged,
+            )
+            .by(by)
+            .detail(format!("{what} failed"))
+            .ok(false)
+            .reason(e.to_string());
+            if let Err(log_err) = ctx.guard.store().log_event(&rec) {
+                tracing::warn!(error = %log_err, "could not log the failed autostart change");
+            }
+            IpcResponse::fail(id, codes::G_PRECONDITION, e.to_string())
+        }
+    }
+}
+
+/// One line for the operator: what is registered now, and what it runs.
+fn describe_autostart(backend: &dyn Autostart, state: &AutostartState) -> String {
+    match state {
+        AutostartState::Registered(r) => {
+            let runs = r
+                .command
+                .as_deref()
+                .map(|c| format!(", running {c}"))
+                .unwrap_or_default();
+            let when = if r.enabled {
+                "starts at your next login".to_owned()
+            } else {
+                format!(
+                    "is registered but will not start ({})",
+                    r.note.as_deref().unwrap_or("disabled")
+                )
+            };
+            let elevated = if r.elevated { " ELEVATED" } else { "" };
+            format!("{}{elevated} {when}{runs}", backend.describe())
+        }
+        AutostartState::Absent => format!(
+            "nothing starts at login ({} is not registered)",
+            backend.describe()
+        ),
+        AutostartState::Unavailable(why) => format!("start at login is unavailable here: {why}"),
     }
 }
 
@@ -87,7 +198,7 @@ pub fn dispatch(ctx: &HostContext, req: IpcRequest) -> IpcResponse {
 
     match req.op {
         IpcOp::Status => {
-            let report = guard.store().status_report(ctx.readiness.clone());
+            let report = guard.store().status_report(ctx.readiness_now());
             match encode_payload(&report) {
                 Ok(p) => IpcResponse::ok_with(id, p),
                 Err(e) => IpcResponse::fail(id, e.code(), e.to_string()),
@@ -155,33 +266,10 @@ pub fn dispatch(ctx: &HostContext, req: IpcRequest) -> IpcResponse {
         IpcOp::Enable { device } => unit!(guard.enable(by, &device)),
         IpcOp::Disable { device } => unit!(guard.disable(by, &device)),
 
-        IpcOp::ServiceInstall { elevated } => {
-            // The guard performs the re-auth and the log line; the *effect* —
-            // writing a systemd user unit / Task Scheduler entry / LaunchAgent —
-            // is `tornect-platform` work scheduled at M6 (§B.8.14 "autostart
-            // installers"). Authorising and then reporting honestly beats
-            // returning `ok` for something that did not happen.
-            match guard.authorize(by, &ExternalOp::ServiceInstall { elevated }) {
-                Ok(()) => IpcResponse::fail(
-                    id,
-                    codes::G_PRECONDITION,
-                    "autostart installation lands at M6 (docs/PLAN.md §B.8.14); \
-                     the change was authorised and logged but not applied",
-                ),
-                Err(ref e) => guard_fail(id, e),
-            }
-        }
-        IpcOp::ServiceUninstall => match guard.authorize(by, &ExternalOp::ServiceUninstall) {
-            Ok(()) => IpcResponse::fail(
-                id,
-                codes::G_PRECONDITION,
-                "autostart removal lands at M6 (docs/PLAN.md §B.8.14); \
-                 the change was authorised and logged but not applied",
-            ),
-            Err(ref e) => guard_fail(id, e),
-        },
+        IpcOp::ServiceInstall { elevated } => service_change(ctx, id, by, Some(elevated)),
+        IpcOp::ServiceUninstall => service_change(ctx, id, by, None),
 
-        IpcOp::Readiness => match encode_payload(&ctx.readiness) {
+        IpcOp::Readiness => match encode_payload(&ctx.readiness_now()) {
             Ok(p) => IpcResponse::ok_with(id, p),
             Err(e) => IpcResponse::fail(id, e.code(), e.to_string()),
         },
@@ -706,10 +794,48 @@ fn context(
         guard: Arc::new(guard),
         host_onion_pk: *host.id().public_key_bytes(),
         readiness: ReadinessSnapshot::unknown(),
+        autostart: autostart_backend(paths),
         user_inputs,
         kill,
         log,
     })
+}
+
+/// What a start-at-login registration for this home runs: this executable's
+/// `host` command, with `--home` when the home is not the platform default.
+///
+/// The executable is the running one (`current_exe`, symlinks resolved on
+/// Linux), so whichever `tornect` registers is what starts; a binary deleted
+/// or replaced since it started is refused rather than registered by a stale
+/// path. A custom home is made absolute: the unit or task starts in another
+/// directory.
+fn launch_spec(paths: &Paths) -> anyhow::Result<LaunchSpec> {
+    let exe = std::env::current_exe().context("finding this executable")?;
+    anyhow::ensure!(
+        exe.is_file(),
+        "{} no longer exists (was it rebuilt or replaced while running?); run          `tornect service install` from the installed binary",
+        exe.display()
+    );
+    let home = if Paths::platform().ok().as_ref() == Some(paths) {
+        None
+    } else if *paths == Paths::from_home(&paths.config_dir) {
+        Some(
+            std::fs::canonicalize(&paths.config_dir)
+                .with_context(|| format!("resolving {}", paths.config_dir.display()))?,
+        )
+    } else {
+        anyhow::bail!("these Tornect directories are neither the default nor one --home root");
+    };
+    Ok(LaunchSpec { exe, home })
+}
+
+/// The start-at-login backend for this home, or one that says why there is
+/// none.
+fn autostart_backend(paths: &Paths) -> Arc<dyn Autostart> {
+    match launch_spec(paths) {
+        Ok(spec) => autostart::for_this_os(spec),
+        Err(e) => Arc::new(autostart::NoAutostart(format!("{e:#}"))),
+    }
 }
 
 /// The §B.8.7.2 `zxcvbn` inputs — {host name, device labels, onion address, OS
@@ -1453,7 +1579,10 @@ fn print_status(
 
 fn print_readiness(snap: &ReadinessSnapshot) {
     use tornect_core::unattended::readiness::Probe;
-    println!("Readiness (M1: every probe reads Unknown until the platform backends land at M6)");
+    println!(
+        "Readiness (`autostart` is probed; the other rows read Unknown until their platform \
+         probes land at M6)"
+    );
     for (name, probe) in snap.fields() {
         let text = match probe {
             Probe::Ok => "ok".to_owned(),
@@ -1577,23 +1706,57 @@ pub fn panic_now(paths: &Paths) -> anyhow::Result<()> {
     })
 }
 
+/// What every start-at-login message ends with (§B.8.7.5): Tornect never
+/// configures auto-login, so the host starts only once someone logs in.
+const AFTER_LOGIN_ONLY: &str = "The host starts only after you log in: Tornect never turns on \
+     automatic login, so after a reboot this computer stays unreachable until someone logs in.";
+
 /// `tornect service install|uninstall|status`
+///
+/// `install` and `uninstall` change what starts at login, which is
+/// access-increasing (§B.8.6.2): they go through the running host, or the
+/// guard offline, like every other mutation, and the host or this command
+/// asks for the OS password. `status` only reads the registration, here.
 pub fn service(paths: &Paths, cmd: ServiceCmd) -> anyhow::Result<()> {
+    let op = match cmd {
+        ServiceCmd::Install { elevated } => IpcOp::ServiceInstall { elevated },
+        ServiceCmd::Uninstall => IpcOp::ServiceUninstall,
+        ServiceCmd::Status => return service_status(paths),
+    };
+    let installing = matches!(op, IpcOp::ServiceInstall { .. });
     runtime()?.block_on(async move {
         let route = route(paths).await?;
-        let op = match cmd {
-            ServiceCmd::Install { elevated } => IpcOp::ServiceInstall { elevated },
-            ServiceCmd::Uninstall => IpcOp::ServiceUninstall,
-            ServiceCmd::Status => {
-                println!(
-                    "Autostart registration is reported by the platform backends, which land at \
-                     M6 (docs/PLAN.md §B.8.14)."
-                );
-                return Ok(());
-            }
-        };
-        require_ok(&send(paths, &route, op).await?)
+        let resp = send(paths, &route, op).await?;
+        require_ok(&resp)?;
+        if let Some(d) = &resp.detail {
+            println!("{d}.");
+        }
+        if installing {
+            println!("{AFTER_LOGIN_ONLY}");
+        }
+        Ok(())
     })
+}
+
+/// `tornect service status`: the registration as the OS reports it, and the
+/// readiness row it produces.
+fn service_status(paths: &Paths) -> anyhow::Result<()> {
+    use tornect_core::unattended::readiness::Probe;
+    let backend = autostart_backend(paths);
+    let status = backend.status();
+    match &status {
+        Ok(state) => println!("{}.", describe_autostart(&*backend, state)),
+        Err(e) => println!("Could not read {}: {e}", backend.describe()),
+    }
+    let row = match autostart::readiness_probe(&status) {
+        Probe::Ok => "ok".to_owned(),
+        Probe::Warn(m) => format!("warn: {m}"),
+        Probe::Fail(m) => format!("FAIL: {m}"),
+        Probe::Unknown => "unknown".to_owned(),
+    };
+    println!("Readiness row `autostart`: {row}");
+    println!("{AFTER_LOGIN_ONLY}");
+    Ok(())
 }
 
 /// `tornect backup export|import`
@@ -1624,6 +1787,78 @@ mod tests {
     struct Env {
         _tmp: tempfile::TempDir,
         ctx: HostContext,
+        autostart: Arc<FakeAutostart>,
+    }
+
+    /// A start-at-login backend that records what it was asked and answers
+    /// as scripted.
+    #[derive(Default)]
+    struct FakeAutostart {
+        installs: std::sync::Mutex<Vec<bool>>,
+        uninstalls: std::sync::atomic::AtomicUsize,
+        state: std::sync::Mutex<Option<AutostartState>>,
+        /// `Some`: `preflight` refuses with this reason.
+        refuse: Option<String>,
+        /// `Some`: `install`/`uninstall` fail with this reason after preflight.
+        fail: Option<String>,
+    }
+
+    impl FakeAutostart {
+        fn installs(&self) -> Vec<bool> {
+            self.installs.lock().unwrap().clone()
+        }
+
+        fn uninstalls(&self) -> usize {
+            self.uninstalls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Autostart for FakeAutostart {
+        fn preflight(&self, _elevated: bool) -> Result<(), autostart::AutostartError> {
+            match &self.refuse {
+                Some(why) => Err(autostart::AutostartError::Unavailable(why.clone())),
+                None => Ok(()),
+            }
+        }
+
+        fn install(&self, elevated: bool) -> Result<AutostartState, autostart::AutostartError> {
+            self.preflight(elevated)?;
+            self.installs.lock().unwrap().push(elevated);
+            if let Some(why) = &self.fail {
+                return Err(autostart::AutostartError::Failed(why.clone()));
+            }
+            let state = AutostartState::Registered(autostart::Registration {
+                enabled: true,
+                elevated,
+                command: Some("\"/opt/tornect\" \"host\"".to_owned()),
+                note: None,
+            });
+            *self.state.lock().unwrap() = Some(state.clone());
+            Ok(state)
+        }
+
+        fn uninstall(&self) -> Result<AutostartState, autostart::AutostartError> {
+            self.uninstalls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(why) = &self.fail {
+                return Err(autostart::AutostartError::Failed(why.clone()));
+            }
+            *self.state.lock().unwrap() = None;
+            Ok(AutostartState::Absent)
+        }
+
+        fn status(&self) -> Result<AutostartState, autostart::AutostartError> {
+            Ok(self
+                .state
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(AutostartState::Absent))
+        }
+
+        fn describe(&self) -> String {
+            "the test's start-at-login backend".to_owned()
+        }
     }
 
     /// A context wired like the offline CLI, but with re-authentication
@@ -1648,6 +1883,17 @@ mod tests {
         reauth: Arc<dyn tornect_core::unattended::guard::ReAuth>,
         activity: Arc<dyn RemoteSessionActivity>,
     ) -> Env {
+        env_with_autostart(tmp, reauth, activity, FakeAutostart::default())
+    }
+
+    /// [`env_with`] with a scripted start-at-login backend.
+    fn env_with_autostart(
+        tmp: tempfile::TempDir,
+        reauth: Arc<dyn tornect_core::unattended::guard::ReAuth>,
+        activity: Arc<dyn RemoteSessionActivity>,
+        autostart: FakeAutostart,
+    ) -> Env {
+        let autostart = Arc::new(autostart);
         let paths = Paths::from_home(tmp.path());
         paths.ensure().unwrap();
         let secrets = Arc::new(FileSecretStore::open(paths.keys_dir()).unwrap());
@@ -1670,10 +1916,12 @@ mod tests {
                 guard: Arc::new(guard),
                 host_onion_pk: HOST_PK,
                 readiness: ReadinessSnapshot::unknown(),
+                autostart: Arc::clone(&autostart) as Arc<dyn Autostart>,
                 user_inputs: vec!["tornect".to_owned()],
                 kill: None,
                 log,
             },
+            autostart,
         }
     }
 
@@ -1890,7 +2138,7 @@ mod tests {
     /// turns unattended access back off and retires the stop code nobody saw.
     #[test]
     fn an_undelivered_stop_code_turns_unattended_access_back_off() {
-        let Env { _tmp, ctx } = env(true);
+        let Env { _tmp, ctx, .. } = env(true);
         let ctx = Arc::new(ctx);
         let Reply {
             response,
@@ -2009,6 +2257,7 @@ mod tests {
         let Env {
             _tmp: _allow_home,
             ctx,
+            ..
         } = env(true);
         let allow = Arc::new(ctx);
         for op in [IpcOp::Status, IpcOp::Off, IpcOp::PolicyInputs] {
@@ -2023,6 +2272,7 @@ mod tests {
         let Env {
             _tmp: _deny_home,
             ctx,
+            ..
         } = env(false);
         let deny = Arc::new(ctx);
         let r = reply(
@@ -2094,6 +2344,7 @@ mod tests {
             guard: Arc::new(deny),
             host_onion_pk: HOST_PK,
             readiness: ReadinessSnapshot::unknown(),
+            autostart: Arc::new(autostart::NoAutostart("test".to_owned())),
             user_inputs: Vec::new(),
             kill: None,
             log: allow.ctx.log.clone(),
@@ -2122,9 +2373,10 @@ mod tests {
     fn deferred_operations_say_so_rather_than_faking_success() {
         let env = env(true);
         for op in [
-            IpcOp::ServiceInstall { elevated: false },
-            IpcOp::ServiceUninstall,
             IpcOp::BackupExport {
+                path: "/tmp/x".to_owned(),
+            },
+            IpcOp::BackupImport {
                 path: "/tmp/x".to_owned(),
             },
         ] {
@@ -2251,5 +2503,260 @@ mod tests {
             out.session_key.as_slice(),
             "both sides must derive the same key from a grant created over IPC"
         );
+    }
+
+    // ------------------------------------------------------ start at login
+
+    /// The `AutostartChanged` lines in `sessions.log`, as (by, detail, ok).
+    fn autostart_lines(ctx: &HostContext) -> Vec<(Option<Actor>, Option<String>, Option<bool>)> {
+        ctx.log
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event == tornect_core::session_log::SessionEvent::AutostartChanged)
+            .map(|r| (r.by, r.detail, r.ok))
+            .collect()
+    }
+
+    fn refused_lines(ctx: &HostContext, op: &str) -> usize {
+        ctx.log
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|r| {
+                r.event == tornect_core::session_log::SessionEvent::GrantMutationRefused
+                    && r.op.as_deref() == Some(op)
+            })
+            .count()
+    }
+
+    /// §B.8.6.2: changing what starts at login is access-increasing. Without
+    /// re-authentication nothing is registered, and the refusal is logged.
+    #[test]
+    fn service_install_is_refused_without_reauth() {
+        let env = env(false);
+        // Something to remove, so `uninstall` has a change to refuse.
+        *env.autostart.state.lock().unwrap() =
+            Some(AutostartState::Registered(autostart::Registration {
+                enabled: true,
+                ..autostart::Registration::default()
+            }));
+        for (op, name) in [
+            (IpcOp::ServiceInstall { elevated: false }, "service_install"),
+            (IpcOp::ServiceInstall { elevated: true }, "service_install"),
+            (IpcOp::ServiceUninstall, "service_uninstall"),
+        ] {
+            let resp = go(&env.ctx, op);
+            assert!(!resp.ok, "{name} went through without re-authentication");
+            assert_eq!(resp.code, codes::G_REAUTH_FAILED, "{:?}", resp.detail);
+        }
+        assert!(
+            env.autostart.installs().is_empty(),
+            "nothing was registered"
+        );
+        assert_eq!(env.autostart.uninstalls(), 0, "nothing was removed");
+        assert!(autostart_lines(&env.ctx).is_empty());
+        assert_eq!(refused_lines(&env.ctx, "service_install"), 2);
+        assert_eq!(refused_lines(&env.ctx, "service_uninstall"), 1);
+    }
+
+    /// With re-authentication the backend runs, the change is logged as
+    /// `AutostartChanged{by: cli}` (§B.8.7.4), and the answer says what now
+    /// starts at login.
+    #[test]
+    fn service_install_and_uninstall_run_and_are_logged_with_reauth() {
+        let env = env(true);
+        let resp = go(&env.ctx, IpcOp::ServiceInstall { elevated: false });
+        assert!(resp.ok, "{:?}", resp.detail);
+        assert_eq!(env.autostart.installs(), vec![false]);
+        let said = resp.detail.unwrap_or_default();
+        assert!(said.contains("/opt/tornect"), "{said}");
+
+        let resp = go(&env.ctx, IpcOp::ServiceInstall { elevated: true });
+        assert!(resp.ok, "{:?}", resp.detail);
+        assert_eq!(env.autostart.installs(), vec![false, true]);
+
+        let resp = go(&env.ctx, IpcOp::ServiceUninstall);
+        assert!(resp.ok, "{:?}", resp.detail);
+        assert_eq!(env.autostart.uninstalls(), 1);
+
+        let lines = autostart_lines(&env.ctx);
+        let details: Vec<&str> = lines
+            .iter()
+            .map(|(_, d, _)| d.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            details,
+            ["install", "install (elevated)", "uninstall"],
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|(by, _, _)| *by == Some(Actor::Cli)),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|(_, _, ok)| *ok != Some(false)),
+            "{lines:?}"
+        );
+    }
+
+    /// Removing a registration that does not exist changes nothing, so it
+    /// needs no dialog and writes no log line.
+    #[test]
+    fn uninstalling_nothing_needs_no_dialog() {
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let env = env_with_autostart(
+            tempfile::tempdir().unwrap(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(NoSessionActivity),
+            FakeAutostart::default(),
+        );
+        let resp = go(&env.ctx, IpcOp::ServiceUninstall);
+        assert!(resp.ok, "{:?}", resp.detail);
+        assert!(
+            resp.detail
+                .unwrap_or_default()
+                .contains("nothing starts at login")
+        );
+        assert!(reauth.calls().is_empty());
+        assert_eq!(env.autostart.uninstalls(), 0);
+        assert!(autostart_lines(&env.ctx).is_empty());
+    }
+
+    /// SLICE-D D1 still holds for autostart: a host that starts while the
+    /// offline command's dialog is open stops the change.
+    #[test]
+    fn a_host_that_starts_during_the_dialog_stops_an_offline_service_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        let reauth = Arc::new(HostStartsDuringDialog::new(&paths, 0));
+        let env = env_with_autostart(
+            tmp,
+            reauth,
+            offline_activity(&paths),
+            FakeAutostart::default(),
+        );
+        let resp = go(&env.ctx, IpcOp::ServiceInstall { elevated: false });
+        assert!(
+            !resp.ok,
+            "registered beside a host that started during the dialog"
+        );
+        assert_eq!(
+            resp.code,
+            codes::G_REMOTE_SESSION_ACTIVE,
+            "{:?}",
+            resp.detail
+        );
+        assert!(env.autostart.installs().is_empty());
+        assert!(autostart_lines(&env.ctx).is_empty());
+    }
+
+    /// As the CLI runs it: the offline route picked before a host took its
+    /// lock refuses the install and blames the host.
+    #[test]
+    fn the_offline_route_refuses_service_install_beside_a_host_that_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        let rt = runtime().unwrap();
+        let picked = rt.block_on(route(&paths)).unwrap();
+        assert!(matches!(picked, Route::Offline(_)));
+        let host = crate::host::HostLock::acquire(&paths).unwrap();
+        let said = rt
+            .block_on(send(
+                &paths,
+                &picked,
+                IpcOp::ServiceInstall { elevated: false },
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(said.contains("while this command ran"), "{said}");
+        drop(host);
+    }
+
+    /// A change that can never be made is refused before the dialog: nobody
+    /// types a password for it, and nothing is logged as changed.
+    #[test]
+    fn an_impossible_install_is_refused_before_the_dialog() {
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let env = env_with_autostart(
+            tempfile::tempdir().unwrap(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(NoSessionActivity),
+            FakeAutostart {
+                refuse: Some("no systemd user manager answers".to_owned()),
+                ..FakeAutostart::default()
+            },
+        );
+        let resp = go(&env.ctx, IpcOp::ServiceInstall { elevated: false });
+        assert!(!resp.ok);
+        assert_eq!(resp.code, codes::G_PRECONDITION, "{:?}", resp.detail);
+        assert!(
+            resp.detail
+                .unwrap_or_default()
+                .contains("no systemd user manager")
+        );
+        assert!(
+            reauth.calls().is_empty(),
+            "no dialog for an impossible change"
+        );
+        assert!(autostart_lines(&env.ctx).is_empty());
+    }
+
+    /// When the OS refuses after the dialog, the answer says so and the log
+    /// records the failed change next to the authorised one.
+    #[test]
+    fn a_failed_install_is_reported_and_logged() {
+        let env = env_with_autostart(
+            tempfile::tempdir().unwrap(),
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            FakeAutostart {
+                fail: Some("schtasks.exe failed: ERROR: Access is denied.".to_owned()),
+                ..FakeAutostart::default()
+            },
+        );
+        let resp = go(&env.ctx, IpcOp::ServiceInstall { elevated: false });
+        assert!(!resp.ok, "a failed registration must not report success");
+        assert_eq!(resp.code, codes::G_PRECONDITION, "{:?}", resp.detail);
+        assert!(resp.detail.unwrap_or_default().contains("Access is denied"));
+        let lines = autostart_lines(&env.ctx);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[1].2, Some(false), "the failure is logged: {lines:?}");
+    }
+
+    /// The readiness row `autostart` is the backend's answer, on `Readiness`
+    /// and inside `Status`, read at request time.
+    #[test]
+    fn the_readiness_autostart_row_follows_the_backend() {
+        use tornect_core::unattended::readiness::Probe;
+        let env = env(true);
+        let read = |ctx: &HostContext| {
+            let resp = go(ctx, IpcOp::Readiness);
+            let snap: ReadinessSnapshot = decode_payload(resp.payload.as_deref().unwrap()).unwrap();
+            snap.autostart
+        };
+        assert!(matches!(read(&env.ctx), Probe::Warn(m) if m.contains("not registered")));
+        assert!(go(&env.ctx, IpcOp::ServiceInstall { elevated: false }).ok);
+        assert_eq!(read(&env.ctx), Probe::Ok);
+        let resp = go(&env.ctx, IpcOp::Status);
+        let report: StatusReport = decode_payload(resp.payload.as_deref().unwrap()).unwrap();
+        assert_eq!(report.readiness.autostart, Probe::Ok);
+        assert!(go(&env.ctx, IpcOp::ServiceInstall { elevated: true }).ok);
+        assert!(matches!(read(&env.ctx), Probe::Warn(m) if m.contains("administrator session")));
+    }
+
+    /// The registration runs this executable's host for this home: the default
+    /// home needs no `--home`, a `--home` root is passed absolute.
+    #[test]
+    fn the_launch_spec_names_this_executable_and_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let custom = Paths::from_home(tmp.path());
+        custom.ensure().unwrap();
+        let spec = launch_spec(&custom).unwrap();
+        assert_eq!(spec.exe, std::env::current_exe().unwrap());
+        assert_eq!(spec.home, Some(std::fs::canonicalize(tmp.path()).unwrap()));
+        if let Ok(default) = Paths::platform() {
+            assert_eq!(launch_spec(&default).unwrap().home, None);
+        }
     }
 }
