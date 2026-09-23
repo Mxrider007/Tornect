@@ -83,6 +83,10 @@ struct TestBackend {
     /// What an injector is built from, kept when a source opens, as the
     /// Wayland backend keeps its portal session's input handle.
     input: Mutex<Option<Recorder>>,
+    /// Opening waits, as the desktop's dialog does, until `cancel_open` or
+    /// 10 s.
+    open_waits: bool,
+    cancelled: (Mutex<bool>, std::sync::Condvar),
 }
 
 impl MediaBackend for TestBackend {
@@ -90,6 +94,15 @@ impl MediaBackend for TestBackend {
         self.sources.fetch_add(1, Ordering::SeqCst);
         if self.fail {
             return Err(CaptureError::Unavailable("no screen here".into()));
+        }
+        if self.open_waits {
+            let (flag, changed) = &self.cancelled;
+            let (cancelled, _) = changed
+                .wait_timeout_while(flag.lock().unwrap(), Duration::from_secs(10), |c| !*c)
+                .unwrap();
+            if *cancelled {
+                return Err(CaptureError::Unavailable("the session ended".into()));
+            }
         }
         *self.input.lock().unwrap() = Some(self.recorder.clone());
         Ok(Box::new(Card {
@@ -107,6 +120,12 @@ impl MediaBackend for TestBackend {
 
     fn view_only(&self) {
         self.input.lock().unwrap().take();
+    }
+
+    fn cancel_open(&self) {
+        let (flag, changed) = &self.cancelled;
+        *flag.lock().unwrap() = true;
+        changed.notify_all();
     }
 }
 
@@ -529,6 +548,38 @@ async fn a_viewer_with_nothing_to_say_pings_the_host() {
     assert!(start.elapsed() <= Duration::from_secs(1));
     drop(host);
     let _ = bound.await;
+}
+
+/// Addendum Q3: a session that ends while its source is still opening (on
+/// Wayland, while the desktop's dialog is up) ends the open too. Before, the
+/// open ran on, detached, for the rest of its 30 s, and a dialog answered then
+/// left a remembered grant that no session had asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_that_ends_while_its_source_opens_ends_the_open() {
+    let backend = TestBackend {
+        open_waits: true,
+        ..TestBackend::default()
+    };
+    let rig = rig_with(backend, MediaLimits::default());
+    let (session_id, binding) = start(&rig.host, 5, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    write_msg(&mut client, &binding.msg()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while rig.backend.sources.load(Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "no open started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    rig.host
+        .on_end(&session_id, Some(&SessionEnd::Killed(bye::PANIC)));
+    let outcome = tokio::time::timeout(WAIT, served).await.unwrap().unwrap();
+    assert!(
+        matches!(outcome, MediaOutcome::NotStarted(_)),
+        "{outcome:?}"
+    );
+    assert!(
+        *rig.backend.cancelled.0.lock().unwrap(),
+        "the open was left to run out its time"
+    );
 }
 
 /// SLICE-B1 B1-2: a kill stops capture at once, before the FSM has finished its

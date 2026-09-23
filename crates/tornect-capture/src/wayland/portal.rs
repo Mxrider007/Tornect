@@ -34,7 +34,7 @@ use ashpd::desktop::{CreateSessionOptions, PersistMode, ResponseError, Session};
 use ashpd::enumflags2::BitFlags;
 use ashpd::zbus;
 use futures::StreamExt as _;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tornect_input::InputError;
 
 use super::pipewire::PW_ID_ANY;
@@ -72,6 +72,8 @@ pub(crate) struct Setup {
     pub(crate) token_file: Option<PathBuf>,
     /// How long the user has to answer the dialog.
     pub(crate) dialog_wait: Duration,
+    /// Turns `true` when the session this is for is over before it started.
+    pub(crate) cancel: Option<watch::Receiver<bool>>,
 }
 
 /// A started session, as the capture side needs it.
@@ -529,23 +531,28 @@ async fn negotiate(
         restore = token.is_some(),
         "asking the desktop to share the screen and take input (a dialog unless it was allowed before)"
     );
-    let started = match tokio::time::timeout(
-        setup.dialog_wait,
+    let answer = dialog(
         remote.start(session, None, StartOptions::default()),
+        setup.dialog_wait,
+        setup.cancel.as_ref(),
     )
-    .await
-    {
-        Ok(Ok(answer)) => answer.response(),
-        Ok(Err(e)) => Err(e),
-        Err(_) => {
+    .await;
+    let started = match answer {
+        Dialog::Answered(Ok(answer)) => answer.response(),
+        Dialog::Answered(Err(e)) => Err(e),
+        Dialog::TimedOut | Dialog::Cancelled => {
             // A token is spent once used, whatever the outcome.
             if let Some(file) = token_file {
                 forget_token(file);
             }
-            return Err(unavailable(format!(
-                "nobody answered the screen-sharing dialog within {} s",
-                setup.dialog_wait.as_secs()
-            )));
+            return Err(unavailable(if matches!(answer, Dialog::Cancelled) {
+                "the session ended while the screen-sharing dialog was open".to_owned()
+            } else {
+                format!(
+                    "nobody answered the screen-sharing dialog within {} s",
+                    setup.dialog_wait.as_secs()
+                )
+            }));
         }
     };
     let started = match started {
@@ -564,8 +571,10 @@ async fn negotiate(
             });
         }
     };
-    if let Some(file) = token_file {
-        remember_token(file, started.restore_token());
+    if !settle_token(token_file, started.restore_token(), setup.cancel.as_ref()) {
+        return Err(unavailable(
+            "the session ended while the screen-sharing dialog was open",
+        ));
     }
     let stream = choose_stream(
         started
@@ -594,6 +603,66 @@ async fn negotiate(
         input,
         fd,
     })
+}
+
+/// How the wait for the desktop's dialog ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Dialog<T> {
+    /// The portal answered.
+    Answered(T),
+    /// Nobody answered in time.
+    TimedOut,
+    /// The session this was for ended first.
+    Cancelled,
+}
+
+/// Wait up to `wait` for the dialog's `answer`, unless `cancel` turns `true`
+/// first: then the caller closes the portal session, which takes the dialog
+/// down (the slice-D review's addendum, Q3).
+async fn dialog<F: Future>(
+    answer: F,
+    wait: Duration,
+    cancel: Option<&watch::Receiver<bool>>,
+) -> Dialog<F::Output> {
+    tokio::select! {
+        biased;
+        () = cancelled(cancel) => Dialog::Cancelled,
+        answer = tokio::time::timeout(wait, answer) => match answer {
+            Ok(answer) => Dialog::Answered(answer),
+            Err(_) => Dialog::TimedOut,
+        },
+    }
+}
+
+/// Resolves once `cancel` is `true`; never without one, or once its sender is
+/// gone without cancelling.
+async fn cancelled(cancel: Option<&watch::Receiver<bool>>) {
+    let Some(cancel) = cancel else {
+        return std::future::pending().await;
+    };
+    let mut cancel = cancel.clone();
+    if cancel.wait_for(|cancelled| *cancelled).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Keep the token a started session returned, for the next one; `false`, and
+/// nothing kept, when the session this was for is already over. The token the
+/// start was given is spent either way.
+fn settle_token(
+    file: Option<&Path>,
+    token: Option<&str>,
+    cancel: Option<&watch::Receiver<bool>>,
+) -> bool {
+    let wanted = !cancel.is_some_and(|cancel| *cancel.borrow());
+    if let Some(file) = file {
+        if wanted {
+            remember_token(file, token);
+        } else {
+            forget_token(file);
+        }
+    }
+    wanted
 }
 
 // ---- The restore token -------------------------------------------------------
@@ -709,6 +778,7 @@ mod tests {
             bus: Bus::Address("unix:path=/nonexistent/tornect-test/bus".to_owned()),
             token_file: None,
             dialog_wait: Duration::from_secs(1),
+            cancel: None,
         };
         match Portal::open(setup) {
             Err(CaptureError::Unavailable(why)) => assert!(why.contains("D-Bus"), "{why}"),
@@ -756,6 +826,43 @@ mod tests {
         forget_token(&file);
         forget_token(&file);
         assert!(!file.exists());
+    }
+
+    /// Addendum Q3: a session that ends while the desktop's dialog is open
+    /// ends the wait at once (the caller then closes the portal session, which
+    /// takes the dialog down), and a grant answered after that end is not kept:
+    /// no restore token is left that no session asked for.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_that_ends_during_the_dialog_keeps_no_grant() {
+        let (end, cancel) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let wait = dialog(
+            std::future::pending::<()>(),
+            Duration::from_secs(30),
+            Some(&cancel),
+        );
+        let ended = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            end.send_replace(true);
+        };
+        let (outcome, ()) = tokio::join!(wait, ended);
+        assert_eq!(outcome, Dialog::Cancelled);
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("portal-restore-token");
+        std::fs::write(&file, "spent-token").unwrap();
+        assert!(!settle_token(Some(&file), Some("new-token"), Some(&cancel)));
+        assert!(!file.exists(), "a grant nobody asked for was kept");
+
+        // A session that is still wanted keeps the new token.
+        let (_live, wanted) = watch::channel(false);
+        assert!(settle_token(Some(&file), Some("new-token"), Some(&wanted)));
+        assert_eq!(read_token(&file).as_deref(), Some("new-token"));
+        let answered = dialog(async { 7 }, Duration::from_secs(30), Some(&wanted)).await;
+        assert_eq!(answered, Dialog::Answered(7));
+        let timed_out = dialog(std::future::pending::<()>(), Duration::from_secs(2), None).await;
+        assert_eq!(timed_out, Dialog::TimedOut);
     }
 
     /// A call queued after the session is over is refused, not lost silently.

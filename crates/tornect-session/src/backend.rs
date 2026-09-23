@@ -44,6 +44,10 @@ pub struct SystemBackend {
     /// weakly, so it keeps nothing open once capture stops.
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     wayland_input: Mutex<Option<tornect_capture::wayland::WaylandInput>>,
+    /// Ends the Wayland open in flight: set while `open_source` waits on the
+    /// portal (and its dialog), taken by `cancel_open`.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    opening: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
 }
 
 impl SystemBackend {
@@ -56,6 +60,8 @@ impl SystemBackend {
             restore_token: None,
             #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
             wayland_input: Mutex::new(None),
+            #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+            opening: Mutex::new(None),
         }
     }
 
@@ -97,6 +103,21 @@ impl MediaBackend for SystemBackend {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+    }
+
+    /// Ends a Wayland open that waits on the desktop's dialog: the portal
+    /// session is closed, which takes the dialog down, and no restore token
+    /// is kept for a session that is over.
+    fn cancel_open(&self) {
+        #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+        if let Some(cancel) = self
+            .opening
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            cancel.send_replace(true);
+        }
     }
 }
 
@@ -164,8 +185,16 @@ impl SystemBackend {
     /// token still holds.
     fn wayland_source(&self) -> Result<Box<dyn VideoSource>, CaptureError> {
         use tornect_capture::wayland::{WaylandOptions, WaylandSource};
-        let options = WaylandOptions::new(self.restore_token.clone());
-        let (source, input) = WaylandSource::open(&options)?;
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        *self.opening.lock().unwrap_or_else(PoisonError::into_inner) = Some(cancel);
+        let mut options = WaylandOptions::new(self.restore_token.clone());
+        options.cancel = Some(cancelled);
+        let opened = WaylandSource::open(&options);
+        self.opening
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let (source, input) = opened?;
         *self
             .wayland_input
             .lock()
