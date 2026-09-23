@@ -472,10 +472,14 @@ fn hosting_line(ui: &mut egui::Ui, hosting: &Hosting) {
                 .to_owned(),
             palette::MUTED,
         ),
+        // True in every state (SLICE-E E1-5): a device granted unattended
+        // access starts a session without asking (PLAN §B.8).
         Hosting::Published {
             reachable: true, ..
         } => (
-            "Incoming requests: reachable; you are asked before anyone sees this screen".to_owned(),
+            "Incoming requests: reachable; paired devices ask before they see this screen, \
+             unless you granted one unattended access"
+                .to_owned(),
             palette::OK,
         ),
         Hosting::Published {
@@ -1304,6 +1308,30 @@ mod tests {
                 "{actions:?}"
             );
         }
+    }
+
+    /// SLICE-E E1-5: the home screen's promise holds in every state: a paired
+    /// device granted unattended access can start a session without asking
+    /// (PLAN §B.8), so "you are asked before anyone sees this screen" was
+    /// false while one exists.
+    #[test]
+    fn the_hosting_line_promises_only_what_is_true() {
+        let t0 = Instant::now();
+        let model = Model {
+            hosting: Hosting::Published {
+                reachable: true,
+                state: "running".to_owned(),
+                problem: None,
+            },
+            ..with_popups(Vec::new())
+        };
+        let window = Harness::new(model, t0);
+        let line = window.text("Incoming requests");
+        assert!(!line.contains("you are asked before anyone sees"), "{line}");
+        assert!(
+            line.contains("unless you granted one unattended access"),
+            "{line}"
+        );
     }
 
     /// A card that moves (one above it answered, withdrawn or timed out)
