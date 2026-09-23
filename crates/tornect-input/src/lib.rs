@@ -137,6 +137,20 @@ pub enum InputError {
 }
 
 impl InputEvent {
+    /// Whether this lets go of something held: a key-up, a button-up or
+    /// [`InputEvent::ReleaseAll`]. Such an event must never be dropped on the
+    /// way (a queue or a budget), or the key stays down on the host (SLICE-E
+    /// E1-6); [`Tracked`] injects one only for what it holds.
+    #[must_use]
+    pub fn is_release(&self) -> bool {
+        matches!(
+            self,
+            Self::Key { pressed: false, .. }
+                | Self::PointerButton { pressed: false, .. }
+                | Self::ReleaseAll
+        )
+    }
+
     /// Encode to the 16-byte wire form.
     #[must_use]
     pub fn encode(&self) -> [u8; 16] {
@@ -481,6 +495,36 @@ mod tests {
     /// SLICE-C1 C1-5: `i32::MIN` has no absolute value in `i32`. The old range
     /// check overflowed on it: a panic in a debug build, and in a release
     /// build a delta that passed the check.
+    /// SLICE-E E1-6: what may never be dropped on the way to the host.
+    #[test]
+    fn releases_are_key_ups_button_ups_and_release_all() {
+        let releases = [
+            InputEvent::Key {
+                usb: 0x07_0004,
+                pressed: false,
+            },
+            InputEvent::PointerButton {
+                button: Button::Right,
+                pressed: false,
+            },
+            InputEvent::ReleaseAll,
+        ];
+        let others = [
+            InputEvent::Key {
+                usb: 0x07_0004,
+                pressed: true,
+            },
+            InputEvent::PointerButton {
+                button: Button::Right,
+                pressed: true,
+            },
+            InputEvent::PointerMove { x: 1, y: 2 },
+            InputEvent::Wheel { dx: 0, dy: 120 },
+        ];
+        assert!(releases.iter().all(InputEvent::is_release));
+        assert!(!others.iter().any(InputEvent::is_release));
+    }
+
     #[test]
     fn the_most_negative_wheel_delta_is_refused() {
         for (dx, dy) in [(i32::MIN, 0), (0, i32::MIN)] {

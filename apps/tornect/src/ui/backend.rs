@@ -69,22 +69,63 @@ pub enum Command {
 pub struct StreamLink {
     /// The newest picture.
     pub slot: Arc<FrameSlot>,
-    input: Mutex<Option<mpsc::Sender<InputEvent>>>,
+    input: Mutex<Input>,
+}
+
+/// The way to the host for input, while a control session runs.
+#[derive(Debug, Default)]
+struct Input {
+    tx: Option<mpsc::Sender<InputEvent>>,
+    /// A release (a key-up, a button-up or `ReleaseAll`) found the queue full:
+    /// a `ReleaseAll` goes out before anything else once there is room, so no
+    /// key or button stays down on the host (SLICE-E E1-6).
+    owed: bool,
 }
 
 impl StreamLink {
-    fn set_input(&self, input: Option<mpsc::Sender<InputEvent>>) {
-        *self.input.lock().unwrap_or_else(PoisonError::into_inner) = input;
+    fn set_input(&self, tx: Option<mpsc::Sender<InputEvent>>) {
+        *self.input.lock().unwrap_or_else(PoisonError::into_inner) = Input { tx, owed: false };
     }
 
     /// Queue `event` for the host; `false` when there is no control session
-    /// or the queue is full (never blocks the UI thread).
+    /// or the queue is full (never blocks the UI thread). A release that finds
+    /// the queue full is not lost: a `ReleaseAll` is owed, and goes out first
+    /// here or at [`StreamLink::settle`] once there is room.
     pub fn send(&self, event: InputEvent) -> bool {
-        self.input
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|tx| tx.try_send(event).is_ok())
+        let mut guard = self.input.lock().unwrap_or_else(PoisonError::into_inner);
+        let input = &mut *guard;
+        let Some(tx) = &input.tx else {
+            return false;
+        };
+        if input.owed {
+            if tx.try_send(InputEvent::ReleaseAll).is_err() {
+                return false;
+            }
+            input.owed = false;
+        }
+        match tx.try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                input.owed |= event.is_release();
+                false
+            }
+            // The session is over; its end releases everything on the host.
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    /// Send an owed `ReleaseAll` if the queue has room now; whether one is
+    /// still owed (the window then tries again soon).
+    pub fn settle(&self) -> bool {
+        let mut guard = self.input.lock().unwrap_or_else(PoisonError::into_inner);
+        let input = &mut *guard;
+        if input.owed
+            && let Some(tx) = &input.tx
+            && tx.try_send(InputEvent::ReleaseAll).is_ok()
+        {
+            input.owed = false;
+        }
+        input.owed
     }
 }
 
@@ -758,6 +799,63 @@ mod tests {
     use super::super::indicator::{Change, Indicator};
     use super::super::model::{Model, PopupKind};
     use super::*;
+
+    /// SLICE-E E1-6: a release that finds the input queue full (a Tor stall
+    /// with the pointer moving) is not lost: once there is room, a
+    /// `ReleaseAll` goes out before anything else, so no key or button stays
+    /// down on the host.
+    #[test]
+    fn a_release_that_finds_the_queue_full_goes_out_as_release_all() {
+        let link = StreamLink::default();
+        let (tx, mut rx) = mpsc::channel(INPUT_QUEUE);
+        link.set_input(Some(tx));
+        for i in 0..INPUT_QUEUE {
+            assert!(link.send(InputEvent::PointerMove {
+                x: u16::try_from(i).unwrap(),
+                y: 0
+            }));
+        }
+        let key_up = InputEvent::Key {
+            usb: 0x07_0004,
+            pressed: false,
+        };
+        assert!(!link.send(key_up), "the queue is full");
+        // The stall ends: the viewer task drains the queue.
+        while rx.try_recv().is_ok() {}
+        let moved = InputEvent::PointerMove { x: 7, y: 7 };
+        assert!(link.send(moved));
+        assert_eq!(
+            rx.try_recv(),
+            Ok(InputEvent::ReleaseAll),
+            "the lost key-up is made good first"
+        );
+        assert_eq!(rx.try_recv(), Ok(moved));
+        assert!(rx.try_recv().is_err());
+
+        // With nothing more to send, the window's idle loop settles it.
+        for _ in 0..INPUT_QUEUE {
+            assert!(link.send(moved));
+        }
+        let button_up = InputEvent::PointerButton {
+            button: tornect_input::Button::Left,
+            pressed: false,
+        };
+        assert!(!link.send(button_up));
+        assert!(link.settle(), "still owed while the queue is full");
+        while rx.try_recv().is_ok() {}
+        assert!(!link.settle(), "sent once there is room");
+        assert_eq!(rx.try_recv(), Ok(InputEvent::ReleaseAll));
+        assert!(rx.try_recv().is_err());
+
+        // A move that finds the queue full owes nothing.
+        for _ in 0..INPUT_QUEUE {
+            assert!(link.send(moved));
+        }
+        assert!(!link.send(moved));
+        while rx.try_recv().is_ok() {}
+        assert!(!link.settle());
+        assert!(rx.try_recv().is_err());
+    }
 
     /// Through the real handshake: an allowed session shows on the indicator,
     /// and its Stop (the host-wide kill, `Command::StopSharing`) ends that
