@@ -590,20 +590,43 @@ async fn waiting_binds_beyond_the_cap_are_refused_at_once() {
 /// binding. Before, every stream took a slot before a byte was read, so eight
 /// idle streams from anyone with the Tornect ID denied every session its
 /// picture.
+///
+/// Every slot is held by a ghost bind, and the set is shown to be full, so a
+/// live session's bind that took a slot would be refused (SLICE-D D3: with
+/// half the slots held, that regression passed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn squatting_streams_do_not_starve_a_live_sessions_bind() {
     let rig = rig(MediaLimits::default());
     let mut squatters = Vec::new();
+    // Every waiting slot: a bind for a session that never registers.
     for i in 0..MediaLimits::default().max_waiting as u8 {
         let (mut stream, served) = connect(&rig.host);
-        // Half say nothing; half bind a session that never registers.
-        if i % 2 == 1 {
-            let ghost = Binding::new(&SessionToken::new([0x60 + i; 32]), &[0x61; 32]);
-            write_msg(&mut stream, &ghost.msg()).await.unwrap();
-        }
+        let ghost = Binding::new(&SessionToken::new([0x60 + i; 32]), &[0x61; 32]);
+        write_msg(&mut stream, &ghost.msg()).await.unwrap();
         squatters.push((stream, served));
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // And idle streams on top, which say nothing.
+    for _ in 0..4 {
+        squatters.push(connect(&rig.host));
+    }
+    // The waiting set is full once one more ghost is refused at once. The
+    // squatters' binds are read on other tasks, so ask until it is; an extra
+    // ghost that got a slot meanwhile is one more squatter.
+    let mut full = false;
+    for seed in 0x20..0x40u8 {
+        let (mut extra, mut extra_served) = connect(&rig.host);
+        let ghost = Binding::new(&SessionToken::new([seed; 32]), &[0x61; 32]);
+        write_msg(&mut extra, &ghost.msg()).await.unwrap();
+        match tokio::time::timeout(Duration::from_millis(200), &mut extra_served).await {
+            Ok(outcome) => {
+                assert_eq!(outcome.unwrap(), MediaOutcome::Busy);
+                full = true;
+                break;
+            }
+            Err(_) => squatters.push((extra, extra_served)),
+        }
+    }
+    assert!(full, "the waiting set never filled");
     let (_, binding) = start(&rig.host, 9, SessionMode::ViewOnly);
     let (stream, served) = connect(&rig.host);
     let viewer = MediaViewer::bind(stream, &binding, WAIT)
