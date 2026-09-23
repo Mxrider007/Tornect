@@ -34,12 +34,12 @@ line in `SHA256SUMS`. Neither the zips nor the programs are signed.
 
 ## Linux
 
-You need x86_64 Linux with **glibc 2.43 or newer** (`ldd --version` shows yours;
-Ubuntu 26.04 and Fedora 44 have it, Ubuntu 24.04 and Debian 13 do not: there
-this build stops at once with "version `GLIBC_2.43' not found"; `BUILD-INFO.txt`
-names the exact versions). The window needs a Vulkan or OpenGL driver. To share this desktop
-you need either a Wayland session with xdg-desktop-portal 1.17 or newer and
-PipeWire (GNOME is the tested one), or an X11 session.
+You need x86_64 Linux with **glibc 2.43 or newer**: `ldd --version` shows
+yours. Ubuntu 26.04 has it; Ubuntu 24.04 and Debian 13 do not, and there this
+build stops at once with "version `GLIBC_2.43' not found" (`BUILD-INFO.txt`
+names the exact versions). The window needs a Vulkan or OpenGL driver. To
+share this desktop you need either a Wayland session with xdg-desktop-portal
+1.17 or newer and PipeWire (GNOME is the tested one), or an X11 session.
 
     unzip tornect-<version>-linux-x86_64.zip
     cd tornect-<version>-linux-x86_64
