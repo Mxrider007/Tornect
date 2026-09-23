@@ -1,9 +1,11 @@
 //! Windows host injection through `SendInput` (media report §6.4).
 //!
-//! Positions arrive normalized over the shared picture, which the GDI capture
-//! takes from the whole virtual desktop — the same space
-//! `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK` addresses — so they pass
-//! through unchanged. Keys are injected by scancode (`KEYEVENTF_SCANCODE`),
+//! Positions arrive normalized over the shared picture. The GDI capture takes
+//! it from the whole virtual desktop, the space
+//! `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK` addresses, but the encoder
+//! sends only its top-left crop (at most 3840×2160), so a position is mapped
+//! over that crop first ([`SendInputSink::over`], SLICE-C1 C1-2). Keys are
+//! injected by scancode (`KEYEVENTF_SCANCODE`),
 //! independent of the host's keyboard layout, except Pause and NumLock, whose
 //! scancodes are irregular and go by virtual-key code.
 //!
@@ -20,7 +22,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput,
 };
 
-use crate::{Button, InputError, InputEvent, InputSink, keymap};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+};
+
+use crate::{Button, InputError, InputEvent, InputSink, Region, keymap, normalize, place, whole};
 
 /// `VK_PAUSE` / `VK_NUMLOCK` (irregular scancodes, injected by VK).
 const VK_PAUSE: u16 = 0x13;
@@ -30,14 +36,52 @@ const XBUTTON1: i32 = 1;
 const XBUTTON2: i32 = 2;
 
 /// Injects into the interactive desktop of this user session.
-#[derive(Debug, Default)]
-pub struct SendInputSink;
+#[derive(Debug)]
+pub struct SendInputSink {
+    region: Region,
+}
+
+impl Default for SendInputSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl SendInputSink {
-    /// A new injector (stateless).
+    /// A new injector, mapping the pointer over the whole virtual desktop.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self { region: whole }
+    }
+
+    /// Map the viewer's pointer over `region` of the virtual desktop, the part
+    /// the viewer sees (SLICE-C1 C1-2).
+    #[must_use]
+    pub fn over(mut self, region: Region) -> Self {
+        self.region = region;
+        self
+    }
+
+    /// `(x, y)`, normalized over the region the viewer sees, as the absolute
+    /// coordinates `MOUSEEVENTF_VIRTUALDESK` takes, normalized over the whole
+    /// virtual desktop. Its size is read at every move, so a display change
+    /// keeps the mapping true.
+    fn absolute(&self, x: u16, y: u16) -> (i32, i32) {
+        // SAFETY: `GetSystemMetrics` has no preconditions and only reads.
+        let (w, h) = unsafe {
+            (
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
+        };
+        let (Ok(w), Ok(h)) = (u32::try_from(w), u32::try_from(h)) else {
+            return (i32::from(x), i32::from(y));
+        };
+        let (px, py) = place(x, y, (w, h), self.region);
+        (
+            i32::from(normalize(f64::from(px), f64::from(w))),
+            i32::from(normalize(f64::from(py), f64::from(h))),
+        )
     }
 }
 
@@ -91,12 +135,15 @@ fn send(inputs: &[INPUT]) -> Result<(), InputError> {
 impl InputSink for SendInputSink {
     fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
         match *event {
-            InputEvent::PointerMove { x, y } => send(&[mouse(
-                i32::from(x),
-                i32::from(y),
-                0,
-                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-            )]),
+            InputEvent::PointerMove { x, y } => {
+                let (ax, ay) = self.absolute(x, y);
+                send(&[mouse(
+                    ax,
+                    ay,
+                    0,
+                    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                )])
+            }
             InputEvent::PointerButton { button, pressed } => {
                 let (flags, data) = match (button, pressed) {
                     (Button::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
