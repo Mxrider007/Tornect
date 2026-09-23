@@ -29,7 +29,7 @@ use zeroize::Zeroizing;
 use super::{
     AuditEvent, AuthExchange, CandidateSink, Channel, HandshakeAudit, HandshakeError,
     IgnoreCandidates, NoAudit, OsRandom, Randomness, Received, SessionToken, SuppressedPopup,
-    timeouts,
+    checked_body, timeouts,
 };
 use crate::consent::{
     AcceptHostInfo, AlwaysDeny, BlockWindow, ChosenCaps, ConsentProof, FreshToken, LocalAllow,
@@ -363,6 +363,14 @@ const GOODBYE: Duration = Duration::from_secs(1);
 enum Goodbye {
     /// Send `BYE{reason}` and close.
     Bye(u16),
+    /// Send `ERROR{code}` and close, unless the channel already did: the
+    /// session ended in a protocol violation (SLICE-C3 C3-2).
+    Error {
+        /// The `ERROR` code.
+        code: u16,
+        /// Which check failed.
+        what: &'static str,
+    },
     /// Close the stream (the peer said goodbye first).
     Close,
     /// Nothing: the stream may hold a cut-short frame.
@@ -1075,6 +1083,12 @@ where
     };
     let (end, goodbye) = match ended {
         Ok((end, goodbye)) => (Ok(end), goodbye),
+        // Its `ERROR` goes out as the goodbye, after the end is recorded: a
+        // peer that stops reading must not hold the end back (SLICE-C3 C3-2).
+        Err(HandshakeError::Violation { code, what }) => (
+            Err(HandshakeError::Violation { code, what }),
+            Goodbye::Error { code, what },
+        ),
         Err(e) => (Err(e), Goodbye::Nothing),
     };
     end_guard.armed = false;
@@ -1101,6 +1115,9 @@ where
     match goodbye {
         Goodbye::Bye(reason) => {
             let _ = tokio::time::timeout(GOODBYE, chan.bye(reason)).await;
+        }
+        Goodbye::Error { code, what } => {
+            let _ = tokio::time::timeout(GOODBYE, chan.fail(code, what)).await;
         }
         Goodbye::Close => {
             let _ = tokio::time::timeout(GOODBYE, chan.close()).await;
@@ -1302,7 +1319,10 @@ where
 /// `Established`: answer `PING`, hand M2 frames to the sink, end on `BYE`,
 /// the kill switch, the orphan timer or the idle timer. It returns as soon as
 /// the session is over, with what is still to be written: the caller releases
-/// the session first and says goodbye after.
+/// the session first and says goodbye after. A violation found here (a body
+/// that does not decode, a kind out of place) is returned unanswered, and its
+/// `ERROR` is that goodbye (SLICE-C3 C3-2); only `recv`'s own checks answer in
+/// place, inside the `select!` that the kill can win.
 async fn established<S>(
     chan: &mut Channel<S>,
     cfg: &HostConfig,
@@ -1348,7 +1368,7 @@ where
         };
         match rx.env.kind {
             Kind::Ping => {
-                let ping: Ping = chan.body(&rx).await?;
+                let ping: Ping = checked_body(&rx)?;
                 // A peer that stops reading stalls this write for as long as
                 // it withholds credit; the kill must not wait behind it
                 // (SLICE-B2 B2-1). The write goes first, so one that can
@@ -1366,17 +1386,17 @@ where
                 }
             }
             Kind::Candidates => {
-                let c: messages::Candidates = chan.body(&rx).await?;
+                let c: messages::Candidates = checked_body(&rx)?;
                 have_path = true;
                 deps.candidates.on_candidates(c);
             }
             Kind::CandidatesDone => {
-                let _: messages::CandidatesDone = chan.body(&rx).await?;
+                let _: messages::CandidatesDone = checked_body(&rx)?;
                 have_path = true;
                 deps.candidates.on_candidates_done();
             }
             Kind::TorFallback => {
-                let _: messages::TorFallback = chan.body(&rx).await?;
+                let _: messages::TorFallback = checked_body(&rx)?;
                 have_path = true;
                 deps.candidates.on_tor_fallback();
             }
@@ -1388,7 +1408,12 @@ where
                 let code = decode_reason::<messages::Error>(&rx, |e| e.code);
                 return Ok((SessionEnd::PeerError(code), Goodbye::Close));
             }
-            _ => return Err(chan.fail(codes::E_BAD_STATE, "kind").await),
+            _ => {
+                return Err(HandshakeError::Violation {
+                    code: codes::E_BAD_STATE,
+                    what: "kind",
+                });
+            }
         }
     }
 }

@@ -3973,6 +3973,132 @@ async fn a_kill_ends_the_session_while_a_write_to_the_peer_is_stuck() {
     drop(raw);
 }
 
+/// The host's end of a pipe whose writes can be frozen, as a peer that
+/// withholds Tor credit freezes them; reads go on.
+struct FrozenWrites {
+    inner: DuplexStream,
+    frozen: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AsyncRead for FrozenWrites {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for FrozenWrites {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.frozen.load(Ordering::SeqCst) {
+            return std::task::Poll::Pending;
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.frozen.load(Ordering::SeqCst) {
+            return std::task::Poll::Pending;
+        }
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.frozen.load(Ordering::SeqCst) {
+            return std::task::Poll::Pending;
+        }
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// SLICE-C3 C3-2: a violation inside a live session (an out-of-place kind, a
+/// malformed body) ends the session at once, even when its `ERROR` cannot be
+/// written; the `ERROR` is only the goodbye, bounded like a `BYE`. The host
+/// used to write it and close first, unraced, so a peer that withheld credit
+/// kept the session live, capture running and a kill unheard for up to a
+/// minute, and a kill was then logged as the violation.
+#[tokio::test(start_paused = true)]
+async fn a_violation_ends_the_session_before_its_error_is_written() {
+    for malformed_body in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut host = host_side(tmp.path(), HOST_SEED);
+        host.cfg.orphan_timeout = None;
+        let kill = KillSwitch::new();
+        host.deps.kill = kill.clone();
+        let live = Arc::new(LiveSessions::new());
+        host.deps.sessions = live.clone();
+        host.deps.activity = live.clone();
+        let audit = Arc::new(RecordingAudit::default());
+        host.deps.audit = audit.clone();
+        host.trusted
+            .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+            .unwrap();
+        host.consent
+            .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+
+        let (a, b) = pipe();
+        let frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream = FrozenWrites {
+            inner: a,
+            frozen: frozen.clone(),
+        };
+        let (cfg, deps) = (host.cfg.clone(), host.deps.clone());
+        let task = tokio::spawn(async move { serve_host(stream, &cfg, &deps).await });
+        let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+        raw.hello_ack().await;
+        assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(live.count(), 1);
+
+        frozen.store(true, Ordering::SeqCst);
+        let msg_id = raw.chan.next_tx_id();
+        let mut client = raw.chan.into_stream();
+        let (kind, body, code) = if malformed_body {
+            (Kind::Ping, vec![0xff], codes::E_BAD_LEN)
+        } else {
+            (
+                Kind::PairRequest,
+                encode_body(&raw_pair_request()),
+                codes::E_BAD_STATE,
+            )
+        };
+        let env = Envelope::new(1, msg_id, kind, body);
+        write_frame(&mut client, &env.encode()).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            live.count(),
+            0,
+            "the session ends at the violation, not once its ERROR is written \
+             (malformed body: {malformed_body})"
+        );
+
+        kill.kill(bye::PANIC);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the host must not wait for the peer")
+            .unwrap();
+        assert_eq!(outcome.unwrap_err().violation_code(), Some(code));
+        let ended = audit.0.lock().unwrap().iter().find_map(|e| match e {
+            AuditEvent::SessionEnded { detail, .. } => Some(detail.clone()),
+            _ => None,
+        });
+        assert_eq!(ended.as_deref(), Some(codes::name(code)));
+        drop(client);
+    }
+}
+
 /// SLICE-B1 B1-4: a sink that panics inside `on_start` still gets its `on_end`,
 /// and the end is logged: no tracker entry outlives the task that served it.
 #[tokio::test]
