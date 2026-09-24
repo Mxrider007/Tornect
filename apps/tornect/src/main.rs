@@ -232,7 +232,11 @@ fn main() -> anyhow::Result<()> {
     })?;
 
     let paths = match &cli.home {
-        Some(dir) => Paths::from_home(dir),
+        Some(dir) => {
+            #[cfg(windows)]
+            windows_home_allowed(dir)?;
+            Paths::from_home(dir)
+        }
         None => Paths::discover()?,
     };
 
@@ -309,6 +313,22 @@ fn main() -> anyhow::Result<()> {
         Command::Service { action } => unattended::service(&paths, action),
         Command::Backup { action } => unattended::backup(&paths, action),
     }
+}
+
+/// Review finding E2-2: on Windows, Tornect's directories get no private
+/// permissions of their own yet, so a `--home` or `TORNECT_HOME` is taken only
+/// inside the user's profile folder, as the OS names it
+/// (`tornect_platform::autostart::windows_home_ok`, the start-at-login task's
+/// rule).
+#[cfg(windows)]
+fn windows_home_allowed(dir: &std::path::Path) -> anyhow::Result<()> {
+    let home = std::path::absolute(dir).with_context(|| format!("resolving {}", dir.display()))?;
+    let home = home
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("{} is not valid Unicode", home.display()))?;
+    let profile = tornect_platform::user_profile().ok();
+    let profile = profile.as_deref().and_then(std::path::Path::to_str);
+    tornect_platform::autostart::windows_home_ok(home, profile).map_err(anyhow::Error::msg)
 }
 
 fn parse_bridge_mode(s: &str) -> Result<BridgeMode, String> {
