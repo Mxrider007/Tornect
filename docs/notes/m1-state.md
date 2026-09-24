@@ -680,13 +680,13 @@ ignored test is the systemd round trip.
 - **Start at login (M1-53; `66c2442`, `b4e8dd4`, `176e9de`).** `tornect service install`, `uninstall` and `status`:
   a systemd user unit or a Task Scheduler task from XML, through the guard with OS re-authentication (polkit;
   CredUI's secure prompt and `LogonUserW` on Windows).
-- **The slice-E review** of `73e9314..3ca4094` (three threat modelers, no refuter pass): 1 Medium, 11 Low, 6 Info
+- **The slice-E review** of `73e9314..3ca4094` (a threat-model review without a refuter pass): 1 Medium, 11 Low, 6 Info
   plus P-1, no BLOCK. Fixed: **E1-1 ≡ E2-1** (the Medium: keys typed for another program answered a card) by the
   operator's "pointer-only Allow" (`746a628`), E1-6 (`9ca0496`), E1-4 and E1-3 (`a4d5f72`), E1-2 (`f9a1a3e`), E1-5's
   sentence (`7e9f2cc`), E2-3 (`a69a7d2`), E2-2's interim rule (`cfa7237`), E2-4 and P-2 (`82a618c`; PARTIAL without
   the linker flag), E2-7 (`4e6a42f`, its flaky test fixed in `081cc08` and `94d68a6`). E3-1 and E3-3 are met by
   `dist` and the gate.
-- **The slice-F review** of `3ca4094..176e9de` (two threat modelers): 2 Medium, 4 Low, 6 Info plus P-1 and P-2, no
+- **The slice-F review** of `3ca4094..176e9de` (the same form): 2 Medium, 4 Low, 6 Info plus P-1 and P-2, no
   BLOCK. Fixed: **F2-1** (the Linux start-at-login host answers pings only, `2b5c4c8`), **F1-1** (a failed task query
   is never "not registered", `5227322`), F1-3 (`a93aeb2`), F2-2 with F1-4 and F2-6's characters (`8df9123`), F2-3
   (`6c9e512`), F2-4 (`61f2e40`, and the manual removal step `d2be07e`), F1-2 and F1-5 (`2171aed`), default 3 and N-2 in
@@ -757,8 +757,8 @@ ignored test is the systemd round trip.
   --home %USERPROFILE%\<dir> id & echo exit !ERRORLEVEL!'` (`%ERRORLEVEL%` would be read before the
   command runs).
 - A console check with the operator needs presence first: one visible action on the VM's screen,
-  watched for within a few minutes (the first-run grant counts). A chat answer does not prove it, and
-  three attempts ended with nobody at the screen.
+  watched for within a few minutes (the first-run grant counts). A remote answer does not prove presence at
+  the VM screen, and three attempts ended with nobody at it.
 - A cold Arti rebuild is 2–5 min; the pre-commit hook runs fmt + clippy
   (`TORNECT_SKIP_HOOKS=1` for docs-only commits).
 - If a worktree ever shares `target/`, `target/debug/xtask` embeds *that* worktree's root and
