@@ -7,10 +7,11 @@
 //!
 //! Per platform: lyrebird through `pt-fetch`'s checks; `cargo build --locked
 //! --release` into `target/dist/cargo/`; checks on the executable (its dynamic
-//! libraries or DLLs); the debug info stripped; a staging tree in
-//! `target/dist/stage/`, where no file may hold the build machine's home path;
-//! then `target/dist/tornect-<version>-<os>-x86_64.zip`. Last, `SHA256SUMS`
-//! over this run's zips.
+//! libraries or DLLs); the debug info stripped; the third-party licence file
+//! (`licences.rs`); a staging tree in `target/dist/stage/`, where no file may
+//! hold the build machine's home path; then
+//! `target/dist/tornect-<version>-<os>-x86_64.zip`. Last, `SHA256SUMS` over this
+//! run's zips.
 //!
 //! Every file in a zip carries the commit's time and fixed modes, in a fixed
 //! order, without owner ids, so the zip depends on its files alone.
@@ -23,7 +24,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, bail, ensure};
 
-use crate::{pt, sha256};
+use crate::{licences, pt, sha256};
 
 /// Everything dist writes lives under this directory of the workspace.
 const OUT: &str = "target/dist";
@@ -208,6 +209,8 @@ impl Git {
 struct Tools {
     /// `rustc -vV`, every line.
     rustc: String,
+    /// `rustc --print sysroot`: the standard library's notices are under it.
+    sysroot: PathBuf,
     cargo: String,
     nasm: String,
     zip: String,
@@ -230,6 +233,11 @@ struct LlvmMingw {
 impl Tools {
     fn probe(root: &Path, platforms: &[Platform]) -> anyhow::Result<Self> {
         let rustc = capture(Command::new("rustc").arg("-vV").current_dir(root))?;
+        let sysroot = PathBuf::from(capture(
+            Command::new("rustc")
+                .args(["--print", "sysroot"])
+                .current_dir(root),
+        )?);
         let cargo = capture(crate::cargo().arg("-V").current_dir(root))?;
         let nasm = capture(Command::new("nasm").arg("-v")).context(
             "dist needs nasm: without it `openh264-sys2` builds OpenH264 without its assembly \
@@ -264,6 +272,7 @@ impl Tools {
             .map(|h| format!("{}/", h.trim_end_matches('/')));
         Ok(Self {
             rustc,
+            sysroot,
             cargo,
             nasm,
             zip,
@@ -390,14 +399,9 @@ fn package(
         );
     }
 
-    let mut files = vec![
-        platform.exe.to_owned(),
-        lyrebird,
-        "pt/lyrebird.txt".to_owned(),
-        "LICENSE".to_owned(),
-        "THIRD_PARTY_NOTICES.md".to_owned(),
-        "README-release.md".to_owned(),
-    ];
+    let licences = write_licences(root, platform, version, tools, &lyrebird, &dir)?;
+
+    let mut files = zip_files(platform);
     let mut hashes = Vec::new();
     for file in &files {
         hashes.push((file.clone(), sha256::file_hex(&dir.join(file))?));
@@ -409,6 +413,7 @@ fn package(
         git,
         tools,
         checks,
+        licences: &licences,
         flags: &flags_for_the_record(platform),
         strip: &strip_tool,
         facts: &facts,
@@ -441,6 +446,76 @@ fn package(
     let zip = out.join(format!("{stem}.zip"));
     make_zip(&stage, &stem, &files, &zip)?;
     Ok(zip)
+}
+
+/// The files a zip holds besides BUILD-INFO.txt, which lists their hashes.
+fn zip_files(platform: Platform) -> Vec<String> {
+    vec![
+        platform.exe.to_owned(),
+        format!("pt/{}", platform.bundle.file_name()),
+        "pt/lyrebird.txt".to_owned(),
+        "LICENSE".to_owned(),
+        "THIRD_PARTY_NOTICES.md".to_owned(),
+        licences::FILE.to_owned(),
+        "README-release.md".to_owned(),
+    ]
+}
+
+/// THIRD_PARTY_LICENSES.txt for the platform, into the staging tree; what it
+/// covers, for BUILD-INFO.txt.
+fn write_licences(
+    root: &Path,
+    platform: Platform,
+    version: &str,
+    tools: &Tools,
+    lyrebird: &str,
+    dir: &Path,
+) -> anyhow::Result<String> {
+    let rustc = tools.rustc.lines().next().unwrap_or("rustc").trim();
+    let mingw = if platform.is_windows() {
+        Some(
+            tools
+                .mingw
+                .as_ref()
+                .context("llvm-mingw was probed for a Windows build")?
+                .root
+                .as_path(),
+        )
+    } else {
+        None
+    };
+    let toolchain = licences::Toolchain {
+        rustc,
+        sysroot: &tools.sysroot,
+        mingw,
+    };
+    let collected = licences::collect(root, platform.triple, Some(&toolchain))?;
+    let text = licences::render(
+        &collected,
+        &licences::Heading {
+            version,
+            title: platform.title,
+            triple: platform.triple,
+            exe: platform.exe,
+            lyrebird,
+        },
+    );
+    let path = dir.join(licences::FILE);
+    fs::write(&path, &text).with_context(|| format!("writing {}", path.display()))?;
+    pt::set_mode(&path, 0o644)?;
+    let linked = collected
+        .entries
+        .iter()
+        .filter(|e| e.package.linked)
+        .count();
+    Ok(format!(
+        "{} crates ({linked} linked, {} only for the build), {} other parts, {} texts, {} bytes",
+        collected.entries.len(),
+        collected.entries.len() - linked,
+        collected.items(),
+        collected.texts(),
+        text.len()
+    ))
 }
 
 /// `cargo build --locked --release` for the platform, into `target/dist/cargo/`.
@@ -731,6 +806,8 @@ struct BuildInfo<'a> {
     git: &'a Git,
     tools: &'a Tools,
     checks: &'a Checks<'a>,
+    /// What THIRD_PARTY_LICENSES.txt covers.
+    licences: &'a str,
     flags: &'a str,
     strip: &'a str,
     facts: &'a Facts,
@@ -840,6 +917,8 @@ fn build_info(b: &BuildInfo<'_>) -> anyhow::Result<String> {
     for line in &b.facts.lines {
         let _ = writeln!(s, "  {line}");
     }
+    let _ = writeln!(s, "\nLicences");
+    let _ = writeln!(s, "  {}  {}", licences::FILE, b.licences);
     let _ = writeln!(s, "\nlyrebird (pt/)");
     let _ = writeln!(
         s,
@@ -978,6 +1057,27 @@ mod tests {
         assert_eq!(find(b"abc", b""), None);
     }
 
+    /// RELEASING.md item 7: each zip carries the generated licence texts
+    /// beside Tornect's own licence and notices.
+    #[test]
+    fn each_zip_carries_the_third_party_licences() {
+        for platform in [LINUX, WINDOWS] {
+            let files = zip_files(platform);
+            for needed in [
+                licences::FILE,
+                "LICENSE",
+                "THIRD_PARTY_NOTICES.md",
+                "pt/lyrebird.txt",
+            ] {
+                assert!(
+                    files.iter().any(|f| f == needed),
+                    "{}: {needed} is not in the zip",
+                    platform.name
+                );
+            }
+        }
+    }
+
     /// The README a zip carries says how to run what the zip holds.
     #[test]
     fn the_release_readme_names_what_the_zip_holds() {
@@ -991,6 +1091,7 @@ mod tests {
             "tornect connect",
             "pt/lyrebird",
             "BUILD-INFO.txt",
+            "THIRD_PARTY_LICENSES.txt",
             "SHA256SUMS",
             "Allow Remote Interaction",
             "Ctrl-C",

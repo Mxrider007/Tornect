@@ -14,8 +14,9 @@ to protect anything yet. It collects no telemetry.
 | `pt/lyrebird` (`pt/lyrebird.exe`) | lyrebird 0.8.1, the Tor Project's pluggable transport for obfs4 and Snowflake bridges, unmodified from Tor Browser 15.0.23 |
 | `pt/lyrebird.txt` | lyrebird's licences |
 | `LICENSE` | Tornect's licence, GPL-3.0-or-later |
-| `THIRD_PARTY_NOTICES.md` | what else Tornect contains, and under which licences |
-| `BUILD-INFO.txt` | the commit, toolchain and flags of this build, and each file's SHA-256 |
+| `THIRD_PARTY_NOTICES.md` | what else Tornect's own source contains, and under which licences |
+| `THIRD_PARTY_LICENSES.txt` | every third-party part built into the program (each crate with its version and licence, the C libraries, the fonts, the Rust standard library) and their licence texts |
+| `BUILD-INFO.txt` | the commit, toolchain and flags of this build, the advisory database it was checked against, and each file's SHA-256 |
 
 Keep `pt/` next to the program. Tornect needs lyrebird only when Tor is blocked
 where you are, and it runs the copy in `pt/` only if its SHA-256 is the one
@@ -192,7 +193,9 @@ own, and anywhere else other accounts on the PC could read and change its keys.
 
 Tornect is free software under the GNU General Public License, version 3 or
 later (`LICENSE`); `BUILD-INFO.txt` names the commit this build came from.
-lyrebird is BSD-2-Clause and contains GPL-3.0-or-later code; its source is the
-tag `lyrebird-0.8.1` at
+The program also contains other people's code under their own licences:
+`THIRD_PARTY_LICENSES.txt` names every part, with its version and licence, and
+holds their licence texts. lyrebird is BSD-2-Clause and contains
+GPL-3.0-or-later code; its source is the tag `lyrebird-0.8.1` at
 https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird
 (`THIRD_PARTY_NOTICES.md`).
