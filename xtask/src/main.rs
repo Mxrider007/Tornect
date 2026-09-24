@@ -355,6 +355,59 @@ fn parse_db_head(line: &str) -> Option<AdvisoryDb> {
     })
 }
 
+/// An advisory that `deny.toml` tells cargo-deny to ignore, with its reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Ignored {
+    pub(crate) id: String,
+    pub(crate) reason: String,
+}
+
+/// The `[advisories] ignore` entries of `deny.toml`, each written as
+/// `{ id = "…", reason = "…" }` on one line: BUILD-INFO.txt and the release
+/// notes say what the advisory check let through, and why (review note I-3).
+/// An entry without a reason is an error.
+pub(crate) fn ignored_advisories(deny_toml: &str) -> anyhow::Result<Vec<Ignored>> {
+    let mut in_advisories = false;
+    let mut in_ignore = false;
+    let mut ignored = Vec::new();
+    for line in deny_toml.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if in_ignore {
+            if line.starts_with(']') {
+                in_ignore = false;
+                continue;
+            }
+            let id = quoted_field(line, "id")
+                .with_context(|| format!("deny.toml: an ignore entry without an id: `{line}`"))?;
+            let reason = quoted_field(line, "reason")
+                .filter(|r| !r.trim().is_empty())
+                .with_context(|| format!("deny.toml ignores {id} without a reason"))?;
+            ignored.push(Ignored { id, reason });
+        } else if line.starts_with('[') {
+            in_advisories = line == "[advisories]";
+        } else if in_advisories && line.starts_with("ignore") {
+            let rest = line.split_once('[').map(|(_, r)| r.trim()).unwrap_or("");
+            match rest {
+                "" => in_ignore = true,
+                "]" => {}
+                _ => bail!("deny.toml: write each ignore entry on a line of its own"),
+            }
+        }
+    }
+    ensure!(!in_ignore, "deny.toml: the `ignore` list does not end");
+    Ok(ignored)
+}
+
+/// `key = "value"` in a one-line inline table.
+fn quoted_field(line: &str, key: &str) -> Option<String> {
+    let pattern = format!("{key} = \"");
+    let start = line.find(&pattern)? + pattern.len();
+    let len = line[start..].find('"')?;
+    Some(line[start..start + len].to_owned())
+}
+
 /// What a passed `cargo deny check` ran with.
 pub(crate) struct Deny {
     /// `cargo-deny --version`.
@@ -582,6 +635,44 @@ mod tests {
                 "deny.toml sets `{line}`: teach xtask's advisory_db() to follow it first"
             );
         }
+    }
+
+    /// I-3: the ignores are read with their reasons, and one without a reason
+    /// is refused.
+    #[test]
+    fn deny_toml_ignores_are_read_with_their_reasons() {
+        let deny = std::fs::read_to_string(workspace_root().unwrap().join("deny.toml")).unwrap();
+        let ignored = ignored_advisories(&deny).unwrap();
+        let ids: Vec<&str> = ignored.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "RUSTSEC-2023-0071",
+                "RUSTSEC-2024-0436",
+                "RUSTSEC-2026-0192"
+            ]
+        );
+        assert!(ignored.iter().all(|i| i.reason.len() > 20), "{ignored:?}");
+
+        let sample = "[advisories]\nversion = 2\nignore = [\n  # why\n  { id = \"RUSTSEC-1\", \
+                      reason = \"a, b; c\" },\n]\n[licenses]\nignore = [\n  \"x\",\n]\n";
+        assert_eq!(
+            ignored_advisories(sample).unwrap(),
+            [Ignored {
+                id: "RUSTSEC-1".to_owned(),
+                reason: "a, b; c".to_owned()
+            }]
+        );
+        let bare = "[advisories]\nignore = [\n  \"RUSTSEC-2\",\n]\n";
+        assert!(ignored_advisories(bare).is_err());
+        let no_reason = "[advisories]\nignore = [\n  { id = \"RUSTSEC-3\" },\n]\n";
+        let err = ignored_advisories(no_reason).unwrap_err().to_string();
+        assert!(err.contains("RUSTSEC-3 without a reason"), "{err}");
+        assert!(
+            ignored_advisories("[advisories]\nignore = []\n")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Whatever the fix removes, a developer's own cargo settings must survive it.
