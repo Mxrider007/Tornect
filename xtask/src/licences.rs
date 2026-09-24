@@ -1001,7 +1001,9 @@ mod tests {
         }
     }
 
-    /// Each canonical text is the one `SOURCES.md` records, byte for byte.
+    /// Each canonical text is the one `SOURCES.md` records, byte for byte as
+    /// committed (LF line ends: a Windows checkout may turn them into CRLF, and
+    /// the Windows CI job runs these tests on a tag).
     #[test]
     fn the_canonical_texts_match_their_sources_md_rows() {
         let root = crate::workspace_root().unwrap();
@@ -1014,7 +1016,9 @@ mod tests {
             if name == "SOURCES.md" {
                 continue;
             }
-            let hash = crate::sha256::file_hex(&path).unwrap();
+            let bytes = fs::read(&path).unwrap();
+            let committed = String::from_utf8(bytes).unwrap().replace("\r\n", "\n");
+            let hash = crate::sha256::hex_digest(committed.as_bytes());
             let row = sources
                 .lines()
                 .find(|l| l.starts_with(&format!("| `{name}` |")))
