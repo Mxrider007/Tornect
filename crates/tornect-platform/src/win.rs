@@ -225,8 +225,8 @@ pub(crate) fn process_token() -> std::io::Result<OwnedHandle> {
 }
 
 /// Whether this account is an administrator, counting the filtered token an
-/// administrator's programs get under UAC (the operator's ruling of 2026-09-24:
-/// `--elevated` is refused to a standard account).
+/// administrator's programs get under UAC (slice-F review §3.2, decided
+/// 2026-09-24: `--elevated` is refused to a standard account).
 ///
 /// `CheckTokenMembership` against the well-known Administrators SID
 /// (`WinBuiltinAdministratorsSid`; domain and nested memberships reach it

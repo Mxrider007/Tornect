@@ -130,6 +130,10 @@ pub trait Autostart: Send + Sync {
 
     /// The mechanism, for messages ("systemd user unit tornect-host.service").
     fn describe(&self) -> String;
+
+    /// How to remove the registration by hand, for a message ("remove it
+    /// …"): what the user can do when Tornect refuses to.
+    fn manual_removal(&self) -> String;
 }
 
 /// The readiness row of §B.8.7.1 ⑥ for a [`Autostart::status`] answer.
@@ -220,6 +224,10 @@ impl Autostart for NoAutostart {
 
     fn describe(&self) -> String {
         "no start-at-login mechanism".to_owned()
+    }
+
+    fn manual_removal(&self) -> String {
+        "there is no start-at-login registration to remove here".to_owned()
     }
 }
 
@@ -821,6 +829,14 @@ impl Autostart for SystemdUserUnit {
     fn describe(&self) -> String {
         format!("systemd user unit {}", self.unit_path().display())
     }
+
+    fn manual_removal(&self) -> String {
+        format!(
+            "remove it by hand with `systemctl --user disable --now {}`, then delete {}",
+            self.unit_name,
+            self.unit_path().display()
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1224,16 +1240,16 @@ pub fn classify_task_query(
     }
 }
 
-/// Why a standard account may not register the elevated task (the operator's
-/// ruling of 2026-09-24).
+/// Why a standard account may not register the elevated task (decided
+/// 2026-09-24, slice-F review §3.2).
 pub const ELEVATED_NEEDS_ADMINISTRATOR: &str = "`--elevated` needs an administrator account, and \
      this is a standard account: approved with another account's password, the elevated task \
      would belong to that account, and you could neither read nor remove it; run `tornect \
      service install` without `--elevated`";
 
 /// Whether this account may register the elevated task: an administrator
-/// only, its filtered (not elevated) token included (the operator's ruling of
-/// 2026-09-24). A standard account would need another account's password at
+/// only, its filtered (not elevated) token included (decided 2026-09-24,
+/// slice-F review §3.2). A standard account would need another account's password at
 /// the UAC prompt, which makes that account the task's owner: the task could
 /// then neither be read nor removed by the account it runs for. A check that
 /// fails refuses.
@@ -1686,6 +1702,10 @@ impl Autostart for TaskScheduler {
     fn describe(&self) -> String {
         format!("Task Scheduler task \\{TASK_NAME}")
     }
+
+    fn manual_removal(&self) -> String {
+        MANUAL_TASK_DELETE.to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -1776,6 +1796,23 @@ mod tests {
         // manager starts in.
         assert!(systemd_unit_text(&spec("tornect", None)).is_err());
         assert!(systemd_unit_text(&spec("/usr/bin/tornect", Some("rel/home"))).is_err());
+    }
+
+    /// What a refusal tells the user to do by hand (F2-4's side effect):
+    /// the unit's name for `systemctl` and the file to delete.
+    #[test]
+    fn the_manual_removal_names_the_unit_and_its_file() {
+        let unit = SystemdUserUnit::for_config_home(
+            Path::new("/home/u/.config"),
+            UNIT_NAME,
+            spec("/usr/bin/tornect", None),
+        );
+        assert_eq!(
+            unit.manual_removal(),
+            "remove it by hand with `systemctl --user disable --now tornect-host.service`, then \
+             delete /home/u/.config/systemd/user/tornect-host.service"
+        );
+        assert!(MANUAL_TASK_DELETE.contains("schtasks /Delete /TN Tornect /F"));
     }
 
     #[test]
@@ -2570,8 +2607,8 @@ mod tests {
         );
     }
 
-    /// The operator's ruling of 2026-09-24: a standard account never gets the
-    /// elevated task. Approved with an administrator's password over its
+    /// Slice-F review §3.2, decided 2026-09-24: a standard account never gets
+    /// the elevated task. Approved with an administrator's password over its
     /// shoulder, the task would be the administrator's, and the standard
     /// account could neither read nor remove it. The refusal comes before any
     /// UAC prompt.
