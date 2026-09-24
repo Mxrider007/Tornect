@@ -949,8 +949,9 @@ fn checked_sid(sid: &str) -> Result<&str, AutostartError> {
 /// (by SID), so a standard account should register it without elevation
 /// (NEEDS-DEVICE); `RunLevel` is `LeastPrivilege` (`/RL LIMITED`) or, for
 /// `--elevated`, `HighestAvailable` (`/RL HIGHEST`); there is no time limit,
-/// the battery conditions are off, a second instance is not started, and the
-/// priority is normal (the default, 7, is below normal).
+/// the battery conditions are off, a second instance is not started, the
+/// priority is normal (the default, 7, is below normal), and only the plain
+/// task may be started on demand (slice-F F1-5).
 ///
 /// The task runs `tornect host` in a console window: that window is the host's
 /// visible sign and its Ctrl-C kill path (§B.6), so it is not hidden.
@@ -974,6 +975,10 @@ pub fn task_xml(
     } else {
         "LeastPrivilege"
     };
+    // Slice-F F1-5: nothing may start the elevated host on demand (`schtasks
+    // /Run`), should the task's security descriptor let this user's filtered
+    // token run it; only the logon trigger does.
+    let on_demand = !elevated;
     let mut xml = String::new();
     // `write!` into a String cannot fail.
     let _ = write!(
@@ -1007,7 +1012,7 @@ pub fn task_xml(
       <StopOnIdleEnd>false</StopOnIdleEnd>\r\n\
       <RestartOnIdle>false</RestartOnIdle>\r\n\
     </IdleSettings>\r\n\
-    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n\
+    <AllowStartOnDemand>{on_demand}</AllowStartOnDemand>\r\n\
     <Enabled>true</Enabled>\r\n\
     <Hidden>false</Hidden>\r\n\
     <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n\
@@ -1169,6 +1174,9 @@ pub trait TaskScheduling {
     /// Whether this account is an administrator (a filtered administrator
     /// token counts).
     fn administrator(&self) -> std::io::Result<bool>;
+    /// Whether `principal`, a task's `<UserId>` as the Task Scheduler prints
+    /// it (a SID or an account name), is this account.
+    fn is_this_account(&self, principal: &str) -> bool;
 }
 
 /// The manual step for a task Tornect could not remove or cannot see.
@@ -1242,6 +1250,96 @@ pub fn elevated_task_account_ok(ts: &dyn TaskScheduling) -> Result<(), Autostart
     }
 }
 
+/// Who a task definition runs as, at which run level, and what: the fields
+/// [`task_install`] compares after registering (slice-F F1-2).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TaskFacts {
+    /// The principal's `<UserId>`: a SID, or an account name.
+    pub principal: Option<String>,
+    /// The principal's `<RunLevel>`; absent means `LeastPrivilege`.
+    pub run_level: Option<String>,
+    /// The action's `<Command>`, unescaped.
+    pub command: Option<String>,
+    /// The action's `<Arguments>`, unescaped.
+    pub arguments: Option<String>,
+}
+
+/// The [`TaskFacts`] of a task definition.
+#[must_use]
+pub fn task_facts(xml: &str) -> TaskFacts {
+    let principal = element(xml, "Principals").and_then(|p| element(p, "Principal"));
+    let exec = element(xml, "Exec");
+    let text = |v: Option<&str>| v.map(|v| xml_unescape(v.trim())).filter(|v| !v.is_empty());
+    TaskFacts {
+        principal: text(principal.and_then(|p| element(p, "UserId"))),
+        run_level: text(principal.and_then(|p| element(p, "RunLevel"))),
+        command: text(exec.and_then(|e| element(e, "Command"))),
+        arguments: text(exec.and_then(|e| element(e, "Arguments"))),
+    }
+}
+
+/// Whether the task the Task Scheduler holds (`registered`) is the one
+/// Tornect wrote (`written`): it runs as this account (`is_this_account`,
+/// which also takes the name form the scheduler may print), at the same run
+/// level, the same command (case-folded: a Windows path) and the same
+/// arguments. `Err` says what differs (slice-F F1-2: the definition file sat
+/// on disk between Tornect writing it and `schtasks` reading it).
+pub fn registered_matches(
+    written: &TaskFacts,
+    registered: &TaskFacts,
+    is_this_account: &dyn Fn(&str) -> bool,
+) -> Result<(), String> {
+    let level = |f: &TaskFacts| {
+        f.run_level
+            .clone()
+            .unwrap_or_else(|| "LeastPrivilege".into())
+    };
+    let mut differs = Vec::new();
+    match registered.principal.as_deref() {
+        Some(p) if is_this_account(p) => {}
+        Some(p) => differs.push(format!("it runs as {p}, not as you")),
+        None => differs.push("it names no account to run as".to_owned()),
+    }
+    if level(written) != level(registered) {
+        differs.push(format!(
+            "its run level is {}, not {}",
+            level(registered),
+            level(written)
+        ));
+    }
+    let same_command = match (&written.command, &registered.command) {
+        (Some(w), Some(r)) => w.eq_ignore_ascii_case(r),
+        _ => false,
+    };
+    if !same_command || written.arguments != registered.arguments {
+        differs.push(format!(
+            "it runs {} {}",
+            registered.command.as_deref().unwrap_or("nothing"),
+            registered.arguments.as_deref().unwrap_or("")
+        ));
+    }
+    if differs.is_empty() {
+        Ok(())
+    } else {
+        Err(differs.join("; "))
+    }
+}
+
+/// Remove a task that is not the one written, elevated when needed, and say
+/// what happened.
+fn remove_mismatched(ts: &dyn TaskScheduling, what: &str, elevated: bool) -> AutostartError {
+    match ts.change(&SchtasksCall::Delete, elevated) {
+        Ok(()) => AutostartError::Failed(format!(
+            "the task registered is not the one Tornect wrote ({what}), so it was removed; \
+             run `tornect service install` again"
+        )),
+        Err(e) => AutostartError::Failed(format!(
+            "the task registered is not the one Tornect wrote ({what}), and removing it failed \
+             ({e}); {MANUAL_TASK_DELETE}"
+        )),
+    }
+}
+
 /// [`Autostart::status`] of the Task Scheduler backend.
 pub fn task_status(ts: &dyn TaskScheduling) -> Result<AutostartState, AutostartError> {
     let query = ts.query()?;
@@ -1249,7 +1347,10 @@ pub fn task_status(ts: &dyn TaskScheduling) -> Result<AutostartState, AutostartE
 }
 
 /// [`Autostart::install`] of the Task Scheduler backend, once the task
-/// definition is written to `xml_path`.
+/// definition `written` is on disk at `xml_path`. What the Task Scheduler
+/// then holds is read back and compared with `written`
+/// ([`registered_matches`]); a task that differs is removed and the install
+/// fails (slice-F F1-2).
 ///
 /// After a registration `schtasks` reported done, the answer is never
 /// "nothing starts at login": a task this account cannot read back (an
@@ -1259,25 +1360,40 @@ pub fn task_status(ts: &dyn TaskScheduling) -> Result<AutostartState, AutostartE
 pub fn task_install(
     ts: &dyn TaskScheduling,
     xml_path: &str,
+    written: &str,
     elevated: bool,
 ) -> Result<AutostartState, AutostartError> {
     if elevated {
         elevated_task_account_ok(ts)?;
     }
     ts.change(&SchtasksCall::Create(xml_path), elevated)?;
-    let why = match task_status(ts) {
-        Ok(AutostartState::Registered(r)) if !r.unreadable => {
-            return Ok(AutostartState::Registered(r));
-        }
-        Ok(AutostartState::Unavailable(why)) => return Err(AutostartError::Unavailable(why)),
-        Ok(_) => String::new(),
+    let why = match ts.query() {
+        Ok(query) => match classify_task_query(&query, &ts.task_file()) {
+            Ok(AutostartState::Registered(r)) if !r.unreadable => {
+                let is_this_account = |p: &str| ts.is_this_account(p);
+                if let Err(what) = registered_matches(
+                    &task_facts(written),
+                    &task_facts(&query.text),
+                    &is_this_account,
+                ) {
+                    return Err(remove_mismatched(ts, &what, elevated || r.elevated));
+                }
+                return Ok(AutostartState::Registered(r));
+            }
+            Ok(AutostartState::Unavailable(why)) => return Err(AutostartError::Unavailable(why)),
+            Ok(_) => String::new(),
+            Err(e) => format!(" ({e})"),
+        },
         Err(e) => format!(" ({e})"),
     };
     Ok(AutostartState::Registered(Registration {
         enabled: true,
         elevated,
         command: None,
-        note: Some(format!("registered; this account cannot read it back{why}")),
+        note: Some(format!(
+            "registered; this account cannot read it back, so it was not compared with what \
+             Tornect wrote{why}"
+        )),
         unreadable: true,
     }))
 }
@@ -1445,6 +1561,15 @@ impl TaskScheduling for TaskScheduler {
         crate::win::is_administrator()
     }
 
+    fn is_this_account(&self, principal: &str) -> bool {
+        let Ok(ours) = crate::win::current_user_sid() else {
+            return false;
+        };
+        principal.trim().eq_ignore_ascii_case(&ours)
+            || crate::win::sid_of_account_name(principal.trim())
+                .is_ok_and(|theirs| theirs.eq_ignore_ascii_case(&ours))
+    }
+
     fn change(&self, call: &SchtasksCall<'_>, elevated: bool) -> Result<(), AutostartError> {
         if elevated {
             let line = windows_command_line(&schtasks_args(call));
@@ -1490,13 +1615,27 @@ impl Autostart for TaskScheduler {
     fn install(&self, elevated: bool) -> Result<AutostartState, AutostartError> {
         self.preflight(elevated)?;
         let xml = self.xml(elevated)?;
-        let file =
-            crate::win::TempFile::write("tornect-autostart", ".xml", &task_xml_file_bytes(&xml))
-                .map_err(|e| AutostartError::Failed(format!("writing the task definition: {e}")))?;
+        // Slice-F F1-2: in this user's own local application data folder,
+        // from the OS, never `%TEMP%`, which the environment can point at a
+        // folder other accounts can write.
+        let dir = crate::win::known_folder(crate::win::KnownFolder::LocalAppData)
+            .map_err(|e| {
+                AutostartError::Failed(format!("finding your local application data folder: {e}"))
+            })?
+            .join("Tornect");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| AutostartError::Failed(format!("creating {}: {e}", dir.display())))?;
+        let file = crate::win::TempFile::write(
+            &dir,
+            "tornect-autostart",
+            ".xml",
+            &task_xml_file_bytes(&xml),
+        )
+        .map_err(|e| AutostartError::Failed(format!("writing the task definition: {e}")))?;
         let path = file.path().to_str().ok_or_else(|| {
-            AutostartError::Failed("the temporary directory's path is not valid Unicode".to_owned())
+            AutostartError::Failed("the task definition's path is not valid Unicode".to_owned())
         })?;
-        let state = task_install(self, path, elevated);
+        let state = task_install(self, path, &xml, elevated);
         drop(file);
         state
     }
@@ -1741,6 +1880,26 @@ mod tests {
         let bytes = task_xml_file_bytes(&xml);
         assert_eq!(&bytes[..4], &[0xFF, 0xFE, b'<', 0]);
         assert_eq!(decode_console_output(&bytes), xml);
+    }
+
+    /// Slice-F F1-5: the elevated task cannot be started on demand, so a
+    /// program running as the user cannot start the elevated host whenever
+    /// it likes (should the task's security descriptor let the filtered token
+    /// run it at all: NEEDS-DEVICE); the plain task still can.
+    #[test]
+    fn only_the_plain_task_starts_on_demand() {
+        let exe = spec("C:\\Program Files\\Tornect\\tornect.exe", None);
+        let plain = task_xml(&exe, SID, false).unwrap();
+        assert!(
+            plain.contains("<AllowStartOnDemand>true</AllowStartOnDemand>"),
+            "{plain}"
+        );
+        let elevated = task_xml(&exe, SID, true).unwrap();
+        assert!(
+            elevated.contains("<AllowStartOnDemand>false</AllowStartOnDemand>")
+                && !elevated.contains("<AllowStartOnDemand>true"),
+            "the elevated task starts on demand:\n{elevated}"
+        );
     }
 
     #[test]
@@ -2039,7 +2198,20 @@ mod tests {
     struct FakeTask {
         readable: bool,
         elevated: bool,
+        /// What differs from the definition `task_install` wrote.
+        swap: Option<Swap>,
     }
+
+    /// One field of a registered task that is not what was written.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Swap {
+        Command,
+        Principal,
+        RunLevel,
+    }
+
+    /// The executable the fake's tasks run.
+    const FAKE_EXE: &str = "C:\\t\\tornect.exe";
 
     impl FakeTasks {
         fn with(task: FakeTask) -> Self {
@@ -2058,7 +2230,23 @@ mod tests {
         fn query(&self) -> Result<TaskQuery, AutostartError> {
             Ok(match *self.task.lock().unwrap() {
                 Some(t) if t.readable => TaskQuery {
-                    text: task_xml(&spec("C:\\t\\tornect.exe", None), SID, t.elevated).unwrap(),
+                    text: task_xml(
+                        &spec(
+                            if t.swap == Some(Swap::Command) {
+                                "C:\\Users\\Public\\evil.exe"
+                            } else {
+                                FAKE_EXE
+                            },
+                            None,
+                        ),
+                        if t.swap == Some(Swap::Principal) {
+                            "S-1-5-18"
+                        } else {
+                            SID
+                        },
+                        t.elevated,
+                    )
+                    .unwrap(),
                     success: true,
                     message: String::new(),
                 },
@@ -2086,6 +2274,10 @@ mod tests {
             Ok(!self.standard_account)
         }
 
+        fn is_this_account(&self, principal: &str) -> bool {
+            principal.eq_ignore_ascii_case(SID)
+        }
+
         fn change(&self, call: &SchtasksCall<'_>, elevated: bool) -> Result<(), AutostartError> {
             self.calls
                 .lock()
@@ -2110,6 +2302,122 @@ mod tests {
         }
     }
 
+    /// The definition `task_install` wrote for the fake's executable.
+    fn written(elevated: bool) -> String {
+        task_xml(&spec(FAKE_EXE, None), SID, elevated).unwrap()
+    }
+
+    /// Slice-F F1-2: what was registered is read back and compared with what
+    /// was written (the principal, the run level, the command); a task that
+    /// differs is removed, through the UAC prompt when it or the install was
+    /// elevated, and the install fails.
+    #[test]
+    fn a_task_registered_other_than_written_is_removed() {
+        for swap in [Swap::Command, Swap::Principal, Swap::RunLevel] {
+            for elevated in [false, true] {
+                // What the Task Scheduler holds after the `/Create`.
+                let registered_elevated = if swap == Swap::RunLevel {
+                    !elevated
+                } else {
+                    elevated
+                };
+                let tasks = FakeTasks {
+                    creates: Some(FakeTask {
+                        readable: true,
+                        elevated: registered_elevated,
+                        swap: Some(swap),
+                    }),
+                    ..FakeTasks::default()
+                };
+                match task_install(&tasks, "C:\\x\\task.xml", &written(elevated), elevated) {
+                    Err(AutostartError::Failed(m)) => {
+                        assert!(m.contains("not the one Tornect wrote"), "{swap:?}: {m}");
+                    }
+                    other => panic!("{swap:?} (elevated: {elevated}) was kept: {other:?}"),
+                }
+                assert_eq!(
+                    tasks.calls().last(),
+                    Some(&("Delete".to_owned(), elevated || registered_elevated)),
+                    "{swap:?} (elevated: {elevated})"
+                );
+                assert!(
+                    tasks.task.lock().unwrap().is_none(),
+                    "{swap:?} (elevated: {elevated}): still registered"
+                );
+            }
+        }
+    }
+
+    /// Slice-F F1-2, the compare itself: a swapped command or arguments, a
+    /// swapped principal, or `LeastPrivilege` against `HighestAvailable` is a
+    /// mismatch; the principal may come back as a name that is this account.
+    #[test]
+    fn registered_matches_finds_every_swap() {
+        let plain = task_facts(&written(false));
+        assert_eq!(plain.principal.as_deref(), Some(SID));
+        assert_eq!(plain.run_level.as_deref(), Some("LeastPrivilege"));
+        assert_eq!(plain.command.as_deref(), Some("\"C:\\t\\tornect.exe\""));
+        assert_eq!(plain.arguments.as_deref(), Some("host"));
+        let me = |p: &str| p.eq_ignore_ascii_case(SID) || p.eq_ignore_ascii_case("PC\\me");
+        assert_eq!(registered_matches(&plain, &plain, &me), Ok(()));
+        let as_name = TaskFacts {
+            principal: Some("pc\\ME".to_owned()),
+            command: Some("\"c:\\T\\TORNECT.exe\"".to_owned()),
+            ..plain.clone()
+        };
+        assert_eq!(registered_matches(&plain, &as_name, &me), Ok(()));
+        // A run level the scheduler leaves out is its default.
+        let default_level = TaskFacts {
+            run_level: None,
+            ..plain.clone()
+        };
+        assert_eq!(registered_matches(&plain, &default_level, &me), Ok(()));
+        for (what, swapped) in [
+            (
+                "command",
+                TaskFacts {
+                    command: Some("\"C:\\Users\\Public\\evil.exe\"".to_owned()),
+                    ..plain.clone()
+                },
+            ),
+            (
+                "arguments",
+                TaskFacts {
+                    arguments: Some("host --capture test-card".to_owned()),
+                    ..plain.clone()
+                },
+            ),
+            (
+                "principal",
+                TaskFacts {
+                    principal: Some("S-1-5-18".to_owned()),
+                    ..plain.clone()
+                },
+            ),
+            (
+                "no principal",
+                TaskFacts {
+                    principal: None,
+                    ..plain.clone()
+                },
+            ),
+            (
+                "run level",
+                TaskFacts {
+                    run_level: Some("HighestAvailable".to_owned()),
+                    ..plain.clone()
+                },
+            ),
+        ] {
+            assert!(
+                registered_matches(&plain, &swapped, &me).is_err(),
+                "{what} swapped, and it matched"
+            );
+        }
+        let elevated = task_facts(&written(true));
+        assert!(registered_matches(&elevated, &plain, &me).is_err());
+    }
+
     /// Slice-F F1-1: an elevated or unreadable task is removed through the
     /// UAC prompt, never by the plain delete, and "removed" means the definite
     /// not-found test says so.
@@ -2119,10 +2427,12 @@ mod tests {
             FakeTask {
                 readable: true,
                 elevated: true,
+                swap: None,
             },
             FakeTask {
                 readable: false,
                 elevated: false,
+                swap: None,
             },
         ] {
             let tasks = FakeTasks::with(task);
@@ -2137,6 +2447,7 @@ mod tests {
         let tasks = FakeTasks::with(FakeTask {
             readable: true,
             elevated: false,
+            swap: None,
         });
         assert_eq!(task_uninstall(&tasks).unwrap(), AutostartState::Absent);
         assert_eq!(tasks.calls(), vec![("Delete".to_owned(), false)]);
@@ -2154,10 +2465,12 @@ mod tests {
             FakeTask {
                 readable: true,
                 elevated: false,
+                swap: None,
             },
             FakeTask {
                 readable: false,
                 elevated: false,
+                swap: None,
             },
         ] {
             let tasks = FakeTasks {
@@ -2181,10 +2494,11 @@ mod tests {
             creates: Some(FakeTask {
                 readable: false,
                 elevated: true,
+                swap: None,
             }),
             ..FakeTasks::default()
         };
-        match task_install(&tasks, "C:\\x\\task.xml", true) {
+        match task_install(&tasks, "C:\\x\\task.xml", &written(true), true) {
             Ok(AutostartState::Registered(r)) => {
                 assert!(r.unreadable && r.elevated, "{r:?}");
                 assert!(
@@ -2215,10 +2529,11 @@ mod tests {
             creates: Some(FakeTask {
                 readable: false,
                 elevated: true,
+                swap: None,
             }),
             ..FakeTasks::default()
         };
-        match task_install(&tasks, "C:\\x\\task.xml", true) {
+        match task_install(&tasks, "C:\\x\\task.xml", &written(true), true) {
             Err(AutostartError::Unavailable(m)) => {
                 assert!(m.contains("needs an administrator account"), "{m}");
             }
@@ -2263,6 +2578,9 @@ mod tests {
             fn administrator(&self) -> std::io::Result<bool> {
                 Err(std::io::Error::other("access denied"))
             }
+            fn is_this_account(&self, _: &str) -> bool {
+                unreachable!()
+            }
         }
         assert!(matches!(
             elevated_task_account_ok(&Broken),
@@ -2274,11 +2592,12 @@ mod tests {
             creates: Some(FakeTask {
                 readable: true,
                 elevated: false,
+                swap: None,
             }),
             ..FakeTasks::default()
         };
         assert!(matches!(
-            task_install(&standard, "C:\\x\\task.xml", false),
+            task_install(&standard, "C:\\x\\task.xml", &written(false), false),
             Ok(AutostartState::Registered(_))
         ));
         assert_eq!(
