@@ -150,6 +150,18 @@ fn service_change(ctx: &HostContext, id: u64, by: Actor, install: Option<bool>) 
 /// One line for the operator: what is registered now, and what it runs.
 fn describe_autostart(backend: &dyn Autostart, state: &AutostartState) -> String {
     match state {
+        // Slice-F F1-1: registered, but whether it starts, and how, is unknown.
+        AutostartState::Registered(r) if r.unreadable => format!(
+            "{}: {}; {}",
+            backend.describe(),
+            r.note.as_deref().unwrap_or("this account cannot read it"),
+            match (r.enabled, r.elevated) {
+                // What `install` just registered: known, though not read back.
+                (true, true) => "it starts the host ELEVATED at your next login",
+                (true, false) => "it starts at your next login",
+                (false, _) => "it may start the host ELEVATED",
+            }
+        ),
         AutostartState::Registered(r) => {
             let runs = r
                 .command
@@ -905,8 +917,17 @@ async fn route(paths: &Paths) -> anyhow::Result<Route> {
     match probe(paths).await {
         Probe::Host => Ok(Route::Host),
         Probe::Unreachable(holder) => anyhow::bail!(
-            "{}; stop it (Ctrl-C in its terminal) and run this again",
-            unreachable_host(paths, &holder)
+            "{}; {}, then run this again",
+            unreachable_host(paths, &holder),
+            if cfg!(windows) {
+                // The orchestrator's default 2 (slice F): every Windows change
+                // runs with no host running, the start-at-login one included.
+                "if it is the start-at-login host, it runs in its own console window: press \
+                 Ctrl-C in that window (or in the terminal of a host you started)"
+            } else {
+                "stop it (Ctrl-C in its terminal, or `systemctl --user stop tornect-host` for \
+                 the start-at-login host)"
+            }
         ),
         Probe::NoHost => Ok(Route::Offline(Box::new(offline_context(paths)?))),
     }
@@ -918,7 +939,7 @@ fn unreachable_host(paths: &Paths, holder: &str) -> String {
         "a Tornect host is running for {} ({holder}), but it has no control channel{}",
         paths.state_dir.display(),
         if cfg!(windows) {
-            " (the Windows one lands at M6)"
+            " (on Windows no command can reach a running host until M6)"
         } else {
             ""
         }
@@ -1814,6 +1835,8 @@ mod tests {
         refuse: Option<String>,
         /// `Some`: `install`/`uninstall` fail with this reason after preflight.
         fail: Option<String>,
+        /// `Some`: `status` fails with this reason.
+        unreadable_status: Option<String>,
     }
 
     impl FakeAutostart {
@@ -1845,6 +1868,7 @@ mod tests {
                 elevated,
                 command: Some("\"/opt/tornect\" \"host\"".to_owned()),
                 note: None,
+                unreadable: false,
             });
             *self.state.lock().unwrap() = Some(state.clone());
             Ok(state)
@@ -1861,6 +1885,9 @@ mod tests {
         }
 
         fn status(&self) -> Result<AutostartState, autostart::AutostartError> {
+            if let Some(why) = &self.unreadable_status {
+                return Err(autostart::AutostartError::Failed(why.clone()));
+            }
             Ok(self
                 .state
                 .lock()
@@ -2651,6 +2678,46 @@ mod tests {
         assert!(reauth.calls().is_empty());
         assert_eq!(env.autostart.uninstalls(), 0);
         assert!(autostart_lines(&env.ctx).is_empty());
+    }
+
+    /// Slice-F F1-1, a regression guard: a registration whose state cannot be
+    /// read, or that exists but this account cannot read, is not "nothing to
+    /// remove": `uninstall` re-authenticates, is logged, and reaches the
+    /// backend (which decides how to delete and whether it is gone).
+    #[test]
+    fn uninstalling_an_unreadable_registration_goes_through_the_guard() {
+        for fake in [
+            FakeAutostart {
+                unreadable_status: Some("could not read the start-at-login task".to_owned()),
+                ..FakeAutostart::default()
+            },
+            FakeAutostart {
+                state: std::sync::Mutex::new(Some(AutostartState::Registered(
+                    autostart::Registration {
+                        note: Some("a task \\Tornect exists that this account cannot read".into()),
+                        unreadable: true,
+                        ..autostart::Registration::default()
+                    },
+                ))),
+                ..FakeAutostart::default()
+            },
+        ] {
+            let reauth = Arc::new(AllowAllReAuth::default());
+            let env = env_with_autostart(
+                tempfile::tempdir().unwrap(),
+                Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+                Arc::new(NoSessionActivity),
+                fake,
+            );
+            let resp = go(&env.ctx, IpcOp::ServiceUninstall);
+            assert!(resp.ok, "{:?}", resp.detail);
+            assert_eq!(reauth.calls(), vec!["service_uninstall".to_owned()]);
+            assert_eq!(env.autostart.uninstalls(), 1);
+            assert_eq!(
+                autostart_lines(&env.ctx),
+                vec![(Some(Actor::Cli), Some("uninstall".to_owned()), None)]
+            );
+        }
     }
 
     /// SLICE-D D1 still holds for autostart: a host that starts while the

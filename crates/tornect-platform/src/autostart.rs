@@ -85,8 +85,13 @@ pub struct Registration {
     pub elevated: bool,
     /// The registered command line, as the mechanism stores it.
     pub command: Option<String>,
-    /// Why a registration is not enabled, in the mechanism's words.
+    /// Why a registration is not enabled, in the mechanism's words; for an
+    /// [`Self::unreadable`] one, what is known about it.
     pub note: Option<String>,
+    /// Known to exist but not readable by this account (a Windows task
+    /// registered from an administrator prompt): whether it is enabled or
+    /// elevated is unknown, so it is treated as possibly elevated.
+    pub unreadable: bool,
 }
 
 /// Why a registration change did not happen.
@@ -136,6 +141,13 @@ pub trait Autostart: Send + Sync {
 #[must_use]
 pub fn readiness_probe(status: &Result<AutostartState, AutostartError>) -> Probe {
     match status {
+        // Slice-F F1-1: whether it is elevated is unknown, so it is warned as
+        // if it were.
+        Ok(AutostartState::Registered(r)) if r.unreadable => Probe::Warn(format!(
+            "{}: it may start the host ELEVATED at login, and then every remote Control \
+             session is an administrator session",
+            r.note.as_deref().unwrap_or(UNREADABLE_TASK)
+        )),
         Ok(AutostartState::Registered(r)) if r.enabled && r.elevated => Probe::Warn(
             "the host starts ELEVATED at login: every remote Control session is an \
              administrator session"
@@ -885,14 +897,173 @@ fn element<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     None
 }
 
-/// What `schtasks /Query /TN Tornect /XML` printed, as a state. `success` is
-/// the exit status: `schtasks` fails when the task does not exist (its message
-/// is localized, so the status is what is read).
-#[must_use]
-pub fn parse_task_query(output: &str, success: bool) -> AutostartState {
-    if !success || element(output, "Task").is_none() {
-        return AutostartState::Absent;
+/// What the file the Task Scheduler keeps a root-folder task in
+/// (`<system directory>\Tasks\Tornect`) says about the task: the definite
+/// not-found test of slice-F F1-1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskFile {
+    /// `NotFound`: there is no task by that name.
+    Missing,
+    /// It exists: read, or refused (`PermissionDenied` proves it is there).
+    Present,
+    /// Any other answer: nothing is known.
+    Unknown(String),
+}
+
+impl TaskFile {
+    /// Classify a lookup of the file (`symlink_metadata`).
+    #[must_use]
+    pub fn from_lookup(lookup: std::io::Result<()>) -> Self {
+        match lookup {
+            Ok(()) => Self::Present,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::Missing,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Self::Present,
+            Err(e) => Self::Unknown(e.to_string()),
+        }
     }
+}
+
+/// What `schtasks /Query /TN Tornect /XML` answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskQuery {
+    /// Its stdout, decoded.
+    pub text: String,
+    /// Its exit status.
+    pub success: bool,
+    /// Its first line that says something (stderr first), for messages.
+    pub message: String,
+}
+
+/// The Task Scheduler as the Windows backend drives it. A seam, so that what
+/// the backend decides is tested on every OS.
+pub trait TaskScheduling {
+    /// `schtasks /Query /TN Tornect /XML`.
+    fn query(&self) -> Result<TaskQuery, AutostartError>;
+    /// The definite not-found test.
+    fn task_file(&self) -> TaskFile;
+    /// `call`, through the UAC prompt when `elevated`.
+    fn change(&self, call: &SchtasksCall<'_>, elevated: bool) -> Result<(), AutostartError>;
+}
+
+/// The manual step for a task Tornect could not remove or cannot see.
+pub const MANUAL_TASK_DELETE: &str =
+    "remove it in an administrator console with `schtasks /Delete /TN Tornect /F`";
+
+/// What is said of a task that exists but this account cannot read.
+const UNREADABLE_TASK: &str = "a task \\Tornect exists that this account cannot read (installed \
+     from an administrator prompt?)";
+
+/// A query's answer and the file test, as a state (slice-F F1-1).
+///
+/// A failed query never means "not registered" by itself: `schtasks` fails
+/// the same way for a task this account may not read (one registered from an
+/// administrator prompt) as for a missing one, and its message is localized.
+/// `Absent` needs the definite not-found of [`TaskFile::Missing`] as well. A
+/// task whose file exists but whose definition cannot be read is an
+/// [`Registration::unreadable`] registration; anything else is an error.
+pub fn classify_task_query(
+    query: &TaskQuery,
+    file: &TaskFile,
+) -> Result<AutostartState, AutostartError> {
+    if query.success {
+        return parse_task_definition(&query.text)
+            .map(AutostartState::Registered)
+            .ok_or_else(|| {
+                AutostartError::Failed(format!(
+                    "could not read the start-at-login task: schtasks.exe printed no task \
+                     definition ({})",
+                    query.text.lines().next().unwrap_or("no output").trim()
+                ))
+            });
+    }
+    match file {
+        TaskFile::Missing => Ok(AutostartState::Absent),
+        TaskFile::Present => Ok(AutostartState::Registered(Registration {
+            note: Some(UNREADABLE_TASK.to_owned()),
+            unreadable: true,
+            ..Registration::default()
+        })),
+        TaskFile::Unknown(why) => Err(AutostartError::Failed(format!(
+            "could not read the start-at-login task: {}; and its file: {why}",
+            query.message
+        ))),
+    }
+}
+
+/// [`Autostart::status`] of the Task Scheduler backend.
+pub fn task_status(ts: &dyn TaskScheduling) -> Result<AutostartState, AutostartError> {
+    let query = ts.query()?;
+    classify_task_query(&query, &ts.task_file())
+}
+
+/// [`Autostart::install`] of the Task Scheduler backend, once the task
+/// definition is written to `xml_path`.
+///
+/// After a registration `schtasks` reported done, the answer is never
+/// "nothing starts at login": a task this account cannot read back (an
+/// administrator's token registered it) is reported as registered and
+/// unreadable (slice-F F1-1).
+pub fn task_install(
+    ts: &dyn TaskScheduling,
+    xml_path: &str,
+    elevated: bool,
+) -> Result<AutostartState, AutostartError> {
+    ts.change(&SchtasksCall::Create(xml_path), elevated)?;
+    let why = match task_status(ts) {
+        Ok(AutostartState::Registered(r)) if !r.unreadable => {
+            return Ok(AutostartState::Registered(r));
+        }
+        Ok(AutostartState::Unavailable(why)) => return Err(AutostartError::Unavailable(why)),
+        Ok(_) => String::new(),
+        Err(e) => format!(" ({e})"),
+    };
+    Ok(AutostartState::Registered(Registration {
+        enabled: true,
+        elevated,
+        command: None,
+        note: Some(format!("registered; this account cannot read it back{why}")),
+        unreadable: true,
+    }))
+}
+
+/// [`Autostart::uninstall`] of the Task Scheduler backend (slice-F F1-1).
+///
+/// An elevated or unreadable task is deleted through the UAC prompt: the
+/// plain delete cannot remove an administrator's task. The removal is then
+/// confirmed with the definite not-found test, and only that is reported as
+/// removed; anything else fails with the manual step. A cancelled prompt
+/// stays [`AutostartError::Cancelled`].
+pub fn task_uninstall(ts: &dyn TaskScheduling) -> Result<AutostartState, AutostartError> {
+    let manual = |e: AutostartError| match e {
+        AutostartError::Failed(m) => AutostartError::Failed(format!("{m}; {MANUAL_TASK_DELETE}")),
+        other => other,
+    };
+    let elevated = match task_status(ts).map_err(manual)? {
+        AutostartState::Absent => return Ok(AutostartState::Absent),
+        AutostartState::Unavailable(why) => return Err(AutostartError::Unavailable(why)),
+        AutostartState::Registered(r) => r.elevated || r.unreadable,
+    };
+    ts.change(&SchtasksCall::Delete, elevated).map_err(manual)?;
+    match task_status(ts) {
+        Ok(AutostartState::Absent) => Ok(AutostartState::Absent),
+        Ok(AutostartState::Registered(_)) => Err(AutostartError::Failed(format!(
+            "the task \\{TASK_NAME} is still registered after the delete; {MANUAL_TASK_DELETE}"
+        ))),
+        Ok(AutostartState::Unavailable(why)) => Err(AutostartError::Failed(format!(
+            "could not confirm that the task \\{TASK_NAME} is gone ({why}); \
+             {MANUAL_TASK_DELETE}"
+        ))),
+        Err(e) => Err(AutostartError::Failed(format!(
+            "could not confirm that the task \\{TASK_NAME} is gone ({e}); {MANUAL_TASK_DELETE}"
+        ))),
+    }
+}
+
+/// The task definition `schtasks /Query /TN Tornect /XML` printed, as a
+/// registration; `None` when the output holds no `<Task>`.
+#[must_use]
+pub fn parse_task_definition(output: &str) -> Option<Registration> {
+    element(output, "Task")?;
     let is_true = |v: Option<&str>| !matches!(v.map(str::trim), Some("false"));
     let settings = element(output, "Settings").unwrap_or("");
     let trigger = element(output, "LogonTrigger");
@@ -917,11 +1088,12 @@ pub fn parse_task_query(output: &str, success: bool) -> AutostartState {
     } else {
         None
     };
-    AutostartState::Registered(Registration {
+    Some(Registration {
         enabled: note.is_none(),
         elevated,
         command,
         note,
+        unreadable: false,
     })
 }
 
@@ -949,6 +1121,8 @@ pub fn elevated_location_ok(exe: &str, program_files: &[String]) -> bool {
 #[derive(Debug, Clone)]
 pub struct TaskScheduler {
     schtasks: PathBuf,
+    /// Where the Task Scheduler keeps the task's definition.
+    task_file: PathBuf,
     spec: LaunchSpec,
 }
 
@@ -960,6 +1134,7 @@ impl TaskScheduler {
             .map_err(|e| AutostartError::Unavailable(format!("no system directory: {e}")))?;
         Ok(Self {
             schtasks: system.join("schtasks.exe"),
+            task_file: system.join("Tasks").join(TASK_NAME),
             spec,
         })
     }
@@ -999,8 +1174,23 @@ impl TaskScheduler {
                 AutostartError::Failed(format!("running {}: {e}", self.schtasks.display()))
             })
     }
+}
 
-    /// `call`, through the UAC prompt when `elevated`.
+#[cfg(windows)]
+impl TaskScheduling for TaskScheduler {
+    fn query(&self) -> Result<TaskQuery, AutostartError> {
+        let out = self.run(&SchtasksCall::Query)?;
+        Ok(TaskQuery {
+            text: decode_console_output(&out.stdout),
+            success: out.status.success(),
+            message: first_line(&out),
+        })
+    }
+
+    fn task_file(&self) -> TaskFile {
+        TaskFile::from_lookup(std::fs::symlink_metadata(&self.task_file).map(drop))
+    }
+
     fn change(&self, call: &SchtasksCall<'_>, elevated: bool) -> Result<(), AutostartError> {
         if elevated {
             let line = windows_command_line(&schtasks_args(call));
@@ -1047,21 +1237,13 @@ impl Autostart for TaskScheduler {
         let path = file.path().to_str().ok_or_else(|| {
             AutostartError::Failed("the temporary directory's path is not valid Unicode".to_owned())
         })?;
-        self.change(&SchtasksCall::Create(path), elevated)?;
+        let state = task_install(self, path, elevated);
         drop(file);
-        self.status()
+        state
     }
 
     fn uninstall(&self) -> Result<AutostartState, AutostartError> {
-        let elevated = match self.status()? {
-            AutostartState::Absent => return Ok(AutostartState::Absent),
-            AutostartState::Unavailable(why) => return Err(AutostartError::Unavailable(why)),
-            AutostartState::Registered(r) => r.elevated,
-        };
-        // A task registered elevated belongs to the administrators; removing
-        // it takes the same UAC prompt.
-        self.change(&SchtasksCall::Delete, elevated)?;
-        self.status()
+        task_uninstall(self)
     }
 
     fn status(&self) -> Result<AutostartState, AutostartError> {
@@ -1071,11 +1253,7 @@ impl Autostart for TaskScheduler {
                 self.schtasks.display()
             )));
         }
-        let out = self.run(&SchtasksCall::Query)?;
-        Ok(parse_task_query(
-            &decode_console_output(&out.stdout),
-            out.status.success(),
-        ))
+        task_status(self)
     }
 
     fn describe(&self) -> String {
@@ -1232,6 +1410,19 @@ mod tests {
 
     const SID: &str = "S-1-5-21-1004336348-1177238915-682003330-1001";
 
+    /// A `/Query` that succeeded with `text`, classified.
+    fn queried(text: &str) -> AutostartState {
+        classify_task_query(
+            &TaskQuery {
+                text: text.to_owned(),
+                success: true,
+                message: String::new(),
+            },
+            &TaskFile::Present,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn the_task_xml_names_this_user_and_the_run_level() {
         let xml = task_xml(
@@ -1269,7 +1460,7 @@ mod tests {
         .unwrap();
         assert!(elevated.contains("<RunLevel>HighestAvailable</RunLevel>"));
         // What the definition says is what the status parser reads back.
-        match parse_task_query(&xml, true) {
+        match queried(&xml) {
             AutostartState::Registered(r) => {
                 assert!(r.enabled && !r.elevated);
                 assert_eq!(
@@ -1280,7 +1471,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(matches!(
-            parse_task_query(&elevated, true),
+            queried(&elevated),
             AutostartState::Registered(Registration {
                 elevated: true,
                 enabled: true,
@@ -1389,24 +1580,22 @@ mod tests {
         // Present.
         let present = exported("true", "true", "LeastPrivilege");
         assert_eq!(
-            parse_task_query(&present, true),
+            queried(&present),
             AutostartState::Registered(Registration {
                 enabled: true,
                 elevated: false,
                 command: Some("\"C:\\Program Files\\Tornect\\tornect.exe\" host".to_owned()),
                 note: None,
+                unreadable: false,
             })
         );
         // The same bytes as UTF-16LE with a BOM decode to the same answer.
         let utf16 = task_xml_file_bytes(&present);
-        assert_eq!(
-            parse_task_query(&decode_console_output(&utf16), true),
-            parse_task_query(&present, true)
-        );
+        assert_eq!(queried(&decode_console_output(&utf16)), queried(&present));
         // Elevated.
         let elevated = exported("true", "true", "HighestAvailable");
         assert!(matches!(
-            parse_task_query(&elevated, true),
+            queried(&elevated),
             AutostartState::Registered(Registration {
                 enabled: true,
                 elevated: true,
@@ -1424,7 +1613,7 @@ mod tests {
                 "logon trigger is disabled",
             ),
         ] {
-            match parse_task_query(&xml, true) {
+            match queried(&xml) {
                 AutostartState::Registered(r) => {
                     assert!(!r.enabled);
                     assert!(r.note.unwrap().contains(why));
@@ -1433,15 +1622,282 @@ mod tests {
             }
         }
         // Absent: schtasks fails ("ERROR: The system cannot find the file
-        // specified." in English; localized elsewhere, so the status decides).
+        // specified." in English; localized elsewhere, so the status and the
+        // task's file decide, slice-F F1-1).
+        let failed = TaskQuery {
+            text: String::new(),
+            success: false,
+            message: "ERROR: The system cannot find the file specified.".to_owned(),
+        };
         assert_eq!(
-            parse_task_query(
-                "ERROR: The system cannot find the file specified.\r\n",
-                false
-            ),
+            classify_task_query(&failed, &TaskFile::Missing).unwrap(),
             AutostartState::Absent
         );
-        assert_eq!(parse_task_query("", true), AutostartState::Absent);
+        assert_eq!(parse_task_definition(""), None);
+    }
+
+    /// Slice-F F1-1: a failed `/Query` is `Absent` only when the task's file
+    /// is definitely not there. Before, every failure read as "not registered"
+    /// ("ERROR: Access is denied." included), so `uninstall` could report a
+    /// removal and leave an elevated task in place.
+    #[test]
+    fn a_failed_query_is_absent_only_beside_a_definite_not_found() {
+        let failed = TaskQuery {
+            text: String::new(),
+            success: false,
+            message: "ERROR: Access is denied.".to_owned(),
+        };
+        let ok = TaskQuery {
+            text: task_xml(&spec("C:\\t\\tornect.exe", None), SID, false).unwrap(),
+            success: true,
+            message: String::new(),
+        };
+        let garbled = TaskQuery {
+            text: "INFO: something else".to_owned(),
+            success: true,
+            message: String::new(),
+        };
+        let files = [
+            TaskFile::Missing,
+            TaskFile::Present,
+            TaskFile::Unknown("The network path was not found.".to_owned()),
+        ];
+        match classify_task_query(&failed, &TaskFile::Present) {
+            Ok(AutostartState::Registered(r)) => {
+                assert!(r.unreadable, "{r:?}");
+                assert!(
+                    r.note.as_deref().unwrap_or("").contains("cannot read"),
+                    "{r:?}"
+                );
+            }
+            other => panic!("a task that exists but cannot be read: {other:?}"),
+        }
+        for file in &files {
+            // A readable definition is what it says, whatever the file test.
+            assert!(
+                matches!(
+                    classify_task_query(&ok, file),
+                    Ok(AutostartState::Registered(Registration {
+                        unreadable: false,
+                        ..
+                    }))
+                ),
+                "{file:?}"
+            );
+            // A success without a definition is not an answer.
+            assert!(
+                classify_task_query(&garbled, file).is_err(),
+                "garbled output with {file:?}"
+            );
+        }
+        assert_eq!(
+            classify_task_query(&failed, &TaskFile::Missing).unwrap(),
+            AutostartState::Absent
+        );
+        match classify_task_query(&failed, &files[2]) {
+            Err(AutostartError::Failed(m)) => {
+                assert!(m.contains("could not read the start-at-login task"), "{m}");
+            }
+            other => panic!("nothing known must be an error: {other:?}"),
+        }
+        // The file test itself: `PermissionDenied` still proves the file.
+        let kind = |k| TaskFile::from_lookup(Err(std::io::Error::from(k)));
+        assert_eq!(TaskFile::from_lookup(Ok(())), TaskFile::Present);
+        assert_eq!(kind(std::io::ErrorKind::NotFound), TaskFile::Missing);
+        assert_eq!(
+            kind(std::io::ErrorKind::PermissionDenied),
+            TaskFile::Present
+        );
+        assert!(matches!(
+            kind(std::io::ErrorKind::InvalidInput),
+            TaskFile::Unknown(_)
+        ));
+        // An unreadable task raises the elevated warning.
+        let Probe::Warn(m) = readiness_probe(&classify_task_query(&failed, &TaskFile::Present))
+        else {
+            panic!("an unreadable task must warn")
+        };
+        assert!(
+            m.contains("ELEVATED") && m.contains("administrator session"),
+            "{m}"
+        );
+    }
+
+    /// A Task Scheduler as the backend sees it: one task, which exists or
+    /// not, is readable by this account or not, and is elevated or not.
+    #[derive(Default)]
+    struct FakeTasks {
+        task: std::sync::Mutex<Option<FakeTask>>,
+        /// What the next `/Create` registers.
+        creates: Option<FakeTask>,
+        /// `/Delete` answers success but leaves the task.
+        delete_is_a_no_op: bool,
+        /// Every change: (the call, through UAC).
+        calls: std::sync::Mutex<Vec<(String, bool)>>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct FakeTask {
+        readable: bool,
+        elevated: bool,
+    }
+
+    impl FakeTasks {
+        fn with(task: FakeTask) -> Self {
+            Self {
+                task: std::sync::Mutex::new(Some(task)),
+                ..Self::default()
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, bool)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl TaskScheduling for FakeTasks {
+        fn query(&self) -> Result<TaskQuery, AutostartError> {
+            Ok(match *self.task.lock().unwrap() {
+                Some(t) if t.readable => TaskQuery {
+                    text: task_xml(&spec("C:\\t\\tornect.exe", None), SID, t.elevated).unwrap(),
+                    success: true,
+                    message: String::new(),
+                },
+                Some(_) => TaskQuery {
+                    text: String::new(),
+                    success: false,
+                    message: "ERROR: Access is denied.".to_owned(),
+                },
+                None => TaskQuery {
+                    text: String::new(),
+                    success: false,
+                    message: "ERROR: The system cannot find the file specified.".to_owned(),
+                },
+            })
+        }
+
+        fn task_file(&self) -> TaskFile {
+            match *self.task.lock().unwrap() {
+                Some(_) => TaskFile::Present,
+                None => TaskFile::Missing,
+            }
+        }
+
+        fn change(&self, call: &SchtasksCall<'_>, elevated: bool) -> Result<(), AutostartError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((format!("{call:?}"), elevated));
+            let mut task = self.task.lock().unwrap();
+            match call {
+                SchtasksCall::Create(_) => *task = self.creates,
+                SchtasksCall::Delete => match *task {
+                    // What a standard token gets for an administrator's task.
+                    Some(t) if (t.elevated || !t.readable) && !elevated => {
+                        return Err(AutostartError::Failed(
+                            "schtasks.exe failed: ERROR: Access is denied.".to_owned(),
+                        ));
+                    }
+                    Some(_) if self.delete_is_a_no_op => {}
+                    _ => *task = None,
+                },
+                SchtasksCall::Query => {}
+            }
+            Ok(())
+        }
+    }
+
+    /// Slice-F F1-1: an elevated or unreadable task is removed through the
+    /// UAC prompt, never by the plain delete, and "removed" means the definite
+    /// not-found test says so.
+    #[test]
+    fn an_elevated_or_unreadable_task_is_removed_through_the_uac_prompt() {
+        for task in [
+            FakeTask {
+                readable: true,
+                elevated: true,
+            },
+            FakeTask {
+                readable: false,
+                elevated: false,
+            },
+        ] {
+            let tasks = FakeTasks::with(task);
+            assert_eq!(
+                task_uninstall(&tasks).unwrap(),
+                AutostartState::Absent,
+                "{task:?}"
+            );
+            assert_eq!(tasks.calls(), vec![("Delete".to_owned(), true)], "{task:?}");
+        }
+        // This user's own task: the plain delete.
+        let tasks = FakeTasks::with(FakeTask {
+            readable: true,
+            elevated: false,
+        });
+        assert_eq!(task_uninstall(&tasks).unwrap(), AutostartState::Absent);
+        assert_eq!(tasks.calls(), vec![("Delete".to_owned(), false)]);
+        // Nothing there: nothing to do.
+        let tasks = FakeTasks::default();
+        assert_eq!(task_uninstall(&tasks).unwrap(), AutostartState::Absent);
+        assert!(tasks.calls().is_empty());
+    }
+
+    /// Slice-F F1-1: a delete that leaves the task is a failure that names
+    /// the manual step, never a removal.
+    #[test]
+    fn a_delete_that_leaves_the_task_is_a_failure() {
+        for task in [
+            FakeTask {
+                readable: true,
+                elevated: false,
+            },
+            FakeTask {
+                readable: false,
+                elevated: false,
+            },
+        ] {
+            let tasks = FakeTasks {
+                delete_is_a_no_op: true,
+                ..FakeTasks::with(task)
+            };
+            match task_uninstall(&tasks) {
+                Err(AutostartError::Failed(m)) => {
+                    assert!(m.contains("schtasks /Delete /TN Tornect /F"), "{m}");
+                }
+                other => panic!("{task:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// Slice-F F1-1: a task this account registered but cannot read back is
+    /// reported as registered, never as "nothing starts at login".
+    #[test]
+    fn an_install_that_cannot_read_the_task_back_says_so() {
+        let tasks = FakeTasks {
+            creates: Some(FakeTask {
+                readable: false,
+                elevated: true,
+            }),
+            ..FakeTasks::default()
+        };
+        match task_install(&tasks, "C:\\x\\task.xml", true) {
+            Ok(AutostartState::Registered(r)) => {
+                assert!(r.unreadable && r.elevated, "{r:?}");
+                assert!(
+                    r.note
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("cannot read it back"),
+                    "{r:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            tasks.calls(),
+            vec![("Create(\"C:\\\\x\\\\task.xml\")".to_owned(), true)]
+        );
     }
 
     #[test]
@@ -1477,6 +1933,7 @@ mod tests {
                 elevated,
                 command: None,
                 note: (!enabled).then(|| "systemd reports it `disabled`".to_owned()),
+                unreadable: false,
             }))
         };
         assert_eq!(readiness_probe(&reg(true, false)), Probe::Ok);
