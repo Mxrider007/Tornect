@@ -367,7 +367,7 @@ impl ReAuth for WindowsReAuth {
 /// while doing so. A direct PAM backend would duplicate that, would need
 /// `libpam` headers this dev machine does not have and cannot install, and
 /// would have to be setuid or run as root to be useful. Verified on
-/// 2026-09-04 against polkitd 127 on mx-vm; full record in the research note
+/// 2026-09-04 against polkitd 127 on the build VM; full record in the research note
 /// referenced from `docs/DEPENDENCIES.md`.
 ///
 /// **What this buys, precisely.** It proves a human is at the host and knows
