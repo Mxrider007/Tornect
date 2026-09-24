@@ -128,10 +128,7 @@ pub fn dist(root: &Path, args: &[String]) -> anyhow::Result<()> {
     // E3-3: the advisory check this build rests on, run here against the
     // database on disk; BUILD-INFO.txt names that database's commit and date.
     let deny = crate::deny(root)?;
-    let db = deny.db.clone().context(
-        "cargo deny found no advisory database under $CARGO_HOME/advisory-dbs/: run `cargo \
-         deny fetch` first (it needs the network)",
-    )?;
+    let db = deny.db.clone();
     let checks = Checks {
         deny: &deny.version,
         db: &db,

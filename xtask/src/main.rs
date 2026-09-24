@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use anyhow::{Context as _, bail};
+use anyhow::{Context as _, bail, ensure};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -236,8 +236,8 @@ pub(crate) fn cargo_home() -> Option<PathBuf> {
         })
 }
 
-/// The advisory database `cargo deny` checks against offline: the newest of
-/// the copies it fetched into `$CARGO_HOME/advisory-dbs/`. The gate and
+/// The advisory database `cargo deny` checks against offline: the copy of
+/// RustSec's database it fetched into `$CARGO_HOME/advisory-dbs/`. The gate and
 /// BUILD-INFO.txt name its commit and date, so every check says how old its
 /// knowledge was (review finding E3-3).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,23 +258,89 @@ impl std::fmt::Display for AdvisoryDb {
     }
 }
 
-fn advisory_db() -> Option<AdvisoryDb> {
-    let dbs = std::fs::read_dir(cargo_home()?.join("advisory-dbs")).ok()?;
-    dbs.flatten()
-        .filter(|e| e.path().join(".git").exists())
-        .filter_map(|e| {
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(e.path())
-                .args(["log", "-1", "--format=%H %ct"])
-                .output()
-                .ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            parse_db_head(&String::from_utf8_lossy(&out.stdout))
-        })
-        .max_by_key(|db| db.epoch)
+/// The database cargo-deny fetches when `deny.toml` names none (its default
+/// `db-urls`); a gate test holds `deny.toml` to that.
+const RUSTSEC_DB_URL: &str = "https://github.com/RustSec/advisory-db";
+
+fn advisory_db() -> anyhow::Result<AdvisoryDb> {
+    let home = cargo_home().context("neither CARGO_HOME nor HOME is set")?;
+    let copy = rustsec_copy(&home.join("advisory-dbs"))?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&copy)
+        .args(["log", "-1", "--format=%H %ct"])
+        .output()
+        .with_context(|| format!("running git log in {}", copy.display()))?;
+    ensure!(
+        out.status.success(),
+        "`git log` failed in {}: {}",
+        copy.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    parse_db_head(&String::from_utf8_lossy(&out.stdout))
+        .with_context(|| format!("reading the commit of {}", copy.display()))
+}
+
+/// The one copy under `dbs` that cargo-deny checks against: with `deny.toml`
+/// naming no `db-path` or `db-urls`, cargo-deny reads its copy of RustSec's
+/// database there. With more than one copy, the gate and dist could not tell
+/// which one it read, so they refuse (review finding L-2); a single copy of
+/// another database is refused too.
+fn rustsec_copy(dbs: &Path) -> anyhow::Result<PathBuf> {
+    let mut copies: Vec<PathBuf> = std::fs::read_dir(dbs)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join(".git").is_dir())
+        .collect();
+    copies.sort();
+    match copies.as_slice() {
+        [] => bail!(
+            "no advisory database under {}: run `cargo deny fetch` (it needs the network)",
+            dbs.display()
+        ),
+        [copy] => {
+            let origin = git_origin(copy)?;
+            ensure!(
+                origin.trim_end_matches('/').trim_end_matches(".git") == RUSTSEC_DB_URL,
+                "{} is a copy of {origin}, not of {RUSTSEC_DB_URL}: delete it and run `cargo \
+                 deny fetch`",
+                copy.display()
+            );
+            Ok(copy.clone())
+        }
+        many => bail!(
+            "{} advisory database copies under {} ({}): cargo deny checks one of them and the gate \
+             could not say which (review finding L-2). Delete all but RustSec's, or all of them \
+             and run `cargo deny fetch`",
+            many.len(),
+            dbs.display(),
+            many.iter()
+                .filter_map(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The `origin` URL in a copy's `.git/config`.
+fn git_origin(copy: &Path) -> anyhow::Result<String> {
+    let config = std::fs::read_to_string(copy.join(".git").join("config"))
+        .with_context(|| format!("reading {}/.git/config", copy.display()))?;
+    let mut in_origin = false;
+    for line in config.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_origin = line == "[remote \"origin\"]";
+        } else if in_origin
+            && let Some(url) = line.strip_prefix("url")
+            && let Some(url) = url.trim_start().strip_prefix('=')
+        {
+            return Ok(url.trim().to_owned());
+        }
+    }
+    bail!("{}/.git/config names no origin", copy.display())
 }
 
 /// `git log -1 --format='%H %ct'` of a database copy.
@@ -293,7 +359,7 @@ fn parse_db_head(line: &str) -> Option<AdvisoryDb> {
 pub(crate) struct Deny {
     /// `cargo-deny --version`.
     pub(crate) version: String,
-    pub(crate) db: Option<AdvisoryDb>,
+    pub(crate) db: AdvisoryDb,
 }
 
 /// `cargo deny check` (advisories, bans, licenses, sources), **offline**
@@ -314,15 +380,18 @@ pub(crate) fn deny(root: &Path) -> anyhow::Result<Deny> {
         .output()
         .with_context(|| format!("running {} --version", bin.display()))?;
     let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
-    let db = advisory_db();
-    let label = match &db {
-        Some(db) => format!(
-            "advisory DB {} of {} UTC",
-            &db.commit[..12],
-            dist::utc(db.epoch)
-        ),
-        None => "no advisory DB found".to_owned(),
+    let db = match advisory_db() {
+        Ok(db) => db,
+        Err(e) => {
+            println!("==> cargo deny check (offline)");
+            return Err(e);
+        }
     };
+    let label = format!(
+        "advisory DB {} of {} UTC",
+        &db.commit[..12],
+        dist::utc(db.epoch)
+    );
     let mut cmd = Command::new(&bin);
     cmd.args(["--offline", "check"]);
     run(root, &format!("cargo deny check (offline; {label})"), cmd)?;
@@ -456,6 +525,63 @@ mod tests {
         assert_eq!(parse_db_head("1931a14 1790198453"), None);
         assert_eq!(parse_db_head(&format!("{commit} yesterday")), None);
         assert_eq!(parse_db_head(""), None);
+    }
+
+    /// L-2: the gate names exactly the copy cargo-deny checks, and refuses
+    /// when it cannot tell which one that is.
+    #[test]
+    fn only_a_single_rustsec_copy_is_named() {
+        let dbs = std::env::temp_dir().join(format!("xtask-dbs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dbs);
+        std::fs::create_dir_all(&dbs).unwrap();
+        let copy = |name: &str, url: &str| {
+            let git = dbs.join(name).join(".git");
+            std::fs::create_dir_all(&git).unwrap();
+            std::fs::write(
+                git.join("config"),
+                format!(
+                    "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = {url}\n\tfetch = x\n"
+                ),
+            )
+            .unwrap();
+        };
+        let err = rustsec_copy(&dbs).unwrap_err().to_string();
+        assert!(err.contains("no advisory database"), "{err}");
+
+        copy("advisory-db-3157b0e258782691", RUSTSEC_DB_URL);
+        assert_eq!(
+            rustsec_copy(&dbs).unwrap(),
+            dbs.join("advisory-db-3157b0e258782691")
+        );
+
+        copy(
+            "advisory-db-0123456789abcdef",
+            "https://example.invalid/mirror/advisory-db",
+        );
+        let err = rustsec_copy(&dbs).unwrap_err().to_string();
+        assert!(err.contains("2 advisory database copies"), "{err}");
+        assert!(err.contains("advisory-db-0123456789abcdef"), "{err}");
+
+        std::fs::remove_dir_all(dbs.join("advisory-db-3157b0e258782691")).unwrap();
+        let err = rustsec_copy(&dbs).unwrap_err().to_string();
+        assert!(
+            err.contains("not of https://github.com/RustSec/advisory-db"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dbs).unwrap();
+    }
+
+    /// L-2: cargo-deny reads the copy the gate names only while `deny.toml`
+    /// leaves the database's place and URL to cargo-deny's defaults.
+    #[test]
+    fn deny_toml_keeps_the_default_advisory_database() {
+        let deny = std::fs::read_to_string(workspace_root().unwrap().join("deny.toml")).unwrap();
+        for line in deny.lines().map(str::trim) {
+            assert!(
+                !line.starts_with("db-path") && !line.starts_with("db-urls"),
+                "deny.toml sets `{line}`: teach xtask's advisory_db() to follow it first"
+            );
+        }
     }
 
     /// Whatever the fix removes, a developer's own cargo settings must survive it.

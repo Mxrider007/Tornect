@@ -9,7 +9,9 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
 1. `main` is clean and `cargo xtask verify` is green on it. The gate fails without cargo-deny
    (decision B3-6), so "green" includes advisories, bans, licences and sources. The advisory check
    runs offline against the RustSec database on disk, so fetch that database first (step 1); the
-   gate names its commit and date (review finding E3-3).
+   gate names its commit and date (review finding E3-3). The gate and `dist` refuse when
+   `$CARGO_HOME/advisory-dbs/` holds more than one database copy, or one that is not RustSec's,
+   since they could not say which one cargo-deny read (review finding L-2).
 2. Nothing the release claims is red. A `-slice.N` tag claims the vertical slice only; the `m<N>`
    milestone tags keep their own rule (CLAUDE.md, ground rule 1).
 3. `docs/VERIFICATION.md` says, per platform, what was verified live and what is still
