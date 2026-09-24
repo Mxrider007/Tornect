@@ -26,7 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context as _, bail, ensure};
 
@@ -36,6 +36,10 @@ pub const FILE: &str = "THIRD_PARTY_LICENSES.txt";
 /// Canonical licence texts, `<SPDX id>.txt`, for packages that publish no
 /// licence file of their own.
 pub const CANONICAL: &str = "packaging/licenses";
+
+/// No licence text is anywhere near this (the largest in the graph is under
+/// 100 kB; the standard library's notices are 0.4 MB); a larger file is refused.
+const MAX_TEXT: u64 = 1024 * 1024;
 
 /// A file at the root of a package whose upper-cased name begins with one of
 /// these is one of its licence files.
@@ -254,20 +258,39 @@ fn source_dir(registry: &[PathBuf], package: &Package) -> anyhow::Result<PathBuf
         })
 }
 
-/// A package's own licence files, relative to its source directory.
+/// A package's own licence files, relative to its source directory. A
+/// symbolic link among them, or a `license-file` outside the package, is an
+/// error, never followed (review finding L-1: a crafted package must not copy
+/// another file of the build machine into the public zip).
 fn own_files(dir: &Path) -> anyhow::Result<Vec<String>> {
     let mut files = BTreeSet::new();
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let upper = name.to_ascii_uppercase();
-        let path = entry.path();
-        if path.is_file() && LICENCE_FILE_PREFIXES.iter().any(|p| upper.starts_with(p)) {
+        let is_text = LICENCE_FILE_PREFIXES.iter().any(|p| upper.starts_with(p));
+        let is_folder = matches!(upper.as_str(), "LICENSES" | "LICENCES");
+        if !is_text && !is_folder {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        ensure!(
+            !kind.is_symlink(),
+            "{} is a symbolic link; a package's licence files must be its own regular files",
+            entry.path().display()
+        );
+        if kind.is_file() && is_text {
             files.insert(name);
-        } else if path.is_dir() && matches!(upper.as_str(), "LICENSES" | "LICENCES") {
-            for inner in fs::read_dir(&path)? {
+        } else if kind.is_dir() && is_folder {
+            for inner in fs::read_dir(entry.path())? {
                 let inner = inner?;
-                if inner.path().is_file() {
+                let inner_kind = inner.file_type()?;
+                ensure!(
+                    !inner_kind.is_symlink(),
+                    "{} is a symbolic link; a package's licence files must be its own regular files",
+                    inner.path().display()
+                );
+                if inner_kind.is_file() {
                     files.insert(format!("{name}/{}", inner.file_name().to_string_lossy()));
                 }
             }
@@ -277,11 +300,67 @@ fn own_files(dir: &Path) -> anyhow::Result<Vec<String>> {
         .with_context(|| format!("reading {}", dir.join("Cargo.toml").display()))?;
     if let Some(declared) = package_field(&manifest, "license-file") {
         let declared = declared.trim_start_matches("./").to_owned();
-        if dir.join(&declared).is_file() {
-            files.insert(declared);
-        }
+        crate_file(dir, &declared)?;
+        files.insert(declared);
     }
     Ok(files.into_iter().collect())
+}
+
+/// `rel` inside the package directory `dir`, checked: a relative path without
+/// `..`, no symbolic link on the way, a regular file of at most [`MAX_TEXT`]
+/// bytes, and, resolved, still inside `dir` (L-1).
+fn crate_file(dir: &Path, rel: &str) -> anyhow::Result<PathBuf> {
+    let relative = Path::new(rel);
+    ensure!(
+        !rel.is_empty()
+            && relative
+                .components()
+                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir)),
+        "{}: the licence file `{rel}` is not a path inside the package",
+        dir.display()
+    );
+    let mut path = dir.to_path_buf();
+    for component in relative.components() {
+        if let Component::Normal(part) = component {
+            path.push(part);
+            let meta = fs::symlink_metadata(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            ensure!(
+                !meta.file_type().is_symlink(),
+                "{} is a symbolic link; a package's licence files must be its own regular files",
+                path.display()
+            );
+        }
+    }
+    let meta = fs::symlink_metadata(&path)?;
+    ensure!(meta.is_file(), "{} is not a regular file", path.display());
+    ensure!(
+        meta.len() <= MAX_TEXT,
+        "{} has {} bytes, more than a licence text can have ({MAX_TEXT})",
+        path.display(),
+        meta.len()
+    );
+    let inside = fs::canonicalize(dir)?;
+    let resolved = fs::canonicalize(&path)?;
+    ensure!(
+        resolved.starts_with(&inside),
+        "{} leaves its package directory",
+        path.display()
+    );
+    Ok(path)
+}
+
+/// The licence files a package publishes, read: `(file, text)`, empty ones
+/// left out.
+fn package_texts(dir: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let mut texts = Vec::new();
+    for file in own_files(dir)? {
+        let body = read_text(&crate_file(dir, &file)?)?;
+        if !body.is_empty() {
+            texts.push((file, body));
+        }
+    }
+    Ok(texts)
 }
 
 /// A string field of a manifest's `[package]` table, as cargo writes it
@@ -327,18 +406,35 @@ fn authors(manifest: &str) -> Option<String> {
     (!names.is_empty()).then(|| names.join(", "))
 }
 
-/// A licence text as one line ending: LF, no trailing blanks, no BOM.
+/// A licence text as one line ending: LF, no trailing blanks, no BOM, and no
+/// control character but the tab (so that no text carries terminal escapes
+/// into a file that people `cat`; the form feeds between pages go too).
 fn normalise(raw: &[u8]) -> String {
     let text = String::from_utf8_lossy(raw);
-    let text = text.trim_start_matches('\u{feff}');
+    let text: String = text
+        .trim_start_matches('\u{feff}')
+        .chars()
+        .filter(|&c| matches!(c, '\n' | '\t') || !c.is_control())
+        .collect();
     let lines: Vec<&str> = text
         .split('\n')
-        .map(|l| l.trim_end_matches(['\r', ' ', '\t']))
+        .map(|l| l.trim_end_matches([' ', '\t']))
         .collect();
     lines.join("\n").trim_matches('\n').to_owned()
 }
 
+/// A text of at most [`MAX_TEXT`] bytes. Crate files go through
+/// [`crate_file`] first; the rest come from Tornect's source and the pinned
+/// toolchains.
 fn read_text(path: &Path) -> anyhow::Result<String> {
+    let len = fs::metadata(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .len();
+    ensure!(
+        len <= MAX_TEXT,
+        "{} has {len} bytes, more than a licence text can have ({MAX_TEXT})",
+        path.display()
+    );
     let raw = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     Ok(normalise(&raw))
 }
@@ -502,7 +598,7 @@ pub fn collect(
         for file in bundled.files {
             numbers.push(texts.add(
                 format!("{file} of {} {}", package.name, package.version),
-                read_text(&dir.join(file))?,
+                read_text(&crate_file(&dir, file)?)?,
             ));
         }
         items.push(Item {
@@ -514,16 +610,12 @@ pub fn collect(
     let mut entries = Vec::new();
     for package in packages {
         let dir = source_dir(&registry, &package)?;
-        let own = own_files(&dir)?;
         let mut numbers = Vec::new();
-        for file in &own {
-            let body = read_text(&dir.join(file))?;
-            if !body.is_empty() {
-                numbers.push(texts.add(
-                    format!("{file} of {} {}", package.name, package.version),
-                    body,
-                ));
-            }
+        for (file, body) in package_texts(&dir)? {
+            numbers.push(texts.add(
+                format!("{file} of {} {}", package.name, package.version),
+                body,
+            ));
         }
         let canonical = numbers.is_empty();
         let mut authors_line = None;
@@ -916,6 +1008,69 @@ mod tests {
         );
         assert_eq!(texts.add("c".into(), normalise(b"Other")), 2);
         assert_eq!(texts.list[0].shared, 2);
+    }
+
+    /// Review finding L-1: a crafted package cannot copy another file of the
+    /// build machine into the public zip, neither through a symbolic link nor
+    /// through a `license-file` that is absolute or climbs out with `..`; a
+    /// text over the size cap is refused too, and control characters (terminal
+    /// escapes) never reach the file.
+    #[cfg(unix)]
+    #[test]
+    fn a_package_brings_only_its_own_regular_licence_files() {
+        let base = std::env::temp_dir().join(format!("xtask-licences-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let secret = base.join("secret.txt");
+        fs::write(&secret, "a file of the build machine").unwrap();
+        let package = |name: &str, manifest_extra: &str| -> PathBuf {
+            let dir = base.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\n{manifest_extra}"),
+            )
+            .unwrap();
+            dir
+        };
+
+        let good = package("good", "");
+        fs::write(good.join("LICENSE-MIT"), "MIT, Copyright \x1b[31mA\x1b[0m").unwrap();
+        assert_eq!(
+            package_texts(&good).unwrap(),
+            [(
+                "LICENSE-MIT".to_owned(),
+                "MIT, Copyright [31mA[0m".to_owned()
+            )]
+        );
+
+        let linked = package("linked", "");
+        std::os::unix::fs::symlink(&secret, linked.join("LICENSE")).unwrap();
+        let linked_dir = package("linked-dir", "");
+        std::os::unix::fs::symlink(&base, linked_dir.join("LICENSES")).unwrap();
+        let absolute = package(
+            "absolute",
+            &format!("license-file = \"{}\"\n", secret.display()),
+        );
+        let climbing = package("climbing", "license-file = \"../secret.txt\"\n");
+        let huge = package("huge", "");
+        fs::write(huge.join("LICENSE"), vec![b'a'; 1024 * 1024 + 1]).unwrap();
+        for (dir, why) in [
+            (&linked, "is a symbolic link"),
+            (&linked_dir, "is a symbolic link"),
+            (&absolute, "is not a path inside the package"),
+            (&climbing, "is not a path inside the package"),
+            (&huge, "more than a licence text can have"),
+        ] {
+            let got = package_texts(dir);
+            let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+            let err = match got {
+                Ok(texts) => panic!("{name}: {texts:?} was accepted"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains(why), "{name}: {err}");
+        }
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
