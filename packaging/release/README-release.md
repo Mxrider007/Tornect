@@ -127,7 +127,10 @@ what is registered; `tornect service uninstall` removes it. Installing and
 removing ask for your OS password (the change widens access) and are refused
 while a remote session is live or ended less than a minute ago. Nothing starts
 before a login: Tornect never turns on automatic login, so after a reboot the
-computer stays unreachable until someone logs in.
+computer stays unreachable until someone logs in. Run `service install` from a
+folder only you can change, and not from a folder you shared with other
+accounts, even inside your home or user folder: the check reads owners,
+permission bits and folder names, not access lists.
 
 - **Linux:** a systemd user unit, `~/.config/systemd/user/tornect-host.service`,
   started with your graphical session. Started this way the host answers pings
@@ -145,7 +148,11 @@ computer stays unreachable until someone logs in.
 - **Windows:** a Task Scheduler task `\Tornect` that runs `tornect.exe host` in a
   console window when you log on; that window is the host (Ctrl-C in it ends
   every session). The password dialog is Windows' secure credential prompt:
-  choose your password, not a PIN. `service install` refuses a `tornect.exe`
+  choose your password, not a PIN. An account that signs in only with Windows
+  Hello (a PIN, a face or a fingerprint) or a passwordless Microsoft account
+  has no password to type there, so it cannot make any change that widens
+  access (`service install` and `uninstall`, `unattended on`, `grant`): Tornect
+  refuses them. `service install` refuses a `tornect.exe`
   outside your user folder or `C:\Program Files`, where another account could
   replace it. `--elevated` (an administrator account only, `tornect.exe` under
   `C:\Program Files`) registers it to run elevated, after a UAC prompt: then
