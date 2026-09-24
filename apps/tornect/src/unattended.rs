@@ -1711,6 +1711,13 @@ pub fn panic_now(paths: &Paths) -> anyhow::Result<()> {
 const AFTER_LOGIN_ONLY: &str = "The host starts only after you log in: Tornect never turns on \
      automatic login, so after a reboot this computer stays unreachable until someone logs in.";
 
+/// What the Linux start-at-login host serves (slice-F F2-1): the systemd user
+/// unit gives it no terminal and it has no window, so it can show no session
+/// (`crate::host::HostWiring::without_unattended`). Windows' task runs it in a
+/// console window, which is its terminal.
+const LOGIN_HOST_PINGS_ONLY: &str = "Started at login, the host answers pings only and refuses \
+     every session, because it has no window or terminal to show one.";
+
 /// `tornect service install|uninstall|status`
 ///
 /// `install` and `uninstall` change what starts at login, which is
@@ -1732,6 +1739,9 @@ pub fn service(paths: &Paths, cmd: ServiceCmd) -> anyhow::Result<()> {
             println!("{d}.");
         }
         if installing {
+            if cfg!(target_os = "linux") {
+                println!("{LOGIN_HOST_PINGS_ONLY}");
+            }
             println!("{AFTER_LOGIN_ONLY}");
         }
         Ok(())
@@ -1755,6 +1765,9 @@ fn service_status(paths: &Paths) -> anyhow::Result<()> {
         Probe::Unknown => "unknown".to_owned(),
     };
     println!("Readiness row `autostart`: {row}");
+    if cfg!(target_os = "linux") {
+        println!("{LOGIN_HOST_PINGS_ONLY}");
+    }
     println!("{AFTER_LOGIN_ONLY}");
     Ok(())
 }
@@ -1927,6 +1940,23 @@ mod tests {
 
     fn go(ctx: &HostContext, op: IpcOp) -> IpcResponse {
         dispatch(ctx, IpcRequest { id: 1, op })
+    }
+
+    /// Slice-F F2-1: what `service install` says on Linux about the host it
+    /// registers is what the release README says.
+    #[test]
+    fn the_login_host_line_is_the_readmes() {
+        let readme = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/release/README-release.md"
+        ))
+        .unwrap();
+        let readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+        let said = LOGIN_HOST_PINGS_ONLY
+            .strip_prefix("Started at login, ")
+            .and_then(|s| s.strip_suffix('.'))
+            .unwrap();
+        assert!(readme.contains(said), "the README does not say: {said}");
     }
 
     /// Track D S5: the offline route loads the store as the offline CLI

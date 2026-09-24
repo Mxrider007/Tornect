@@ -37,14 +37,15 @@ use tornect_signal::dispatch::{FIRST_FRAME_DEADLINE, FirstFrame, first_frame};
 use tornect_signal::envelope::codes;
 use tornect_signal::fsm::HostAudit;
 use tornect_signal::fsm::host::{
-    HostConfig, HostDeps, HostOutcome, KillSwitch, LiveSession, LiveSessions, SessionEnd,
-    SessionSink, serve_host,
+    HostConfig, HostDeps, HostOutcome, KillSwitch, LiveSession, LiveSessions, NotGranted,
+    SessionEnd, SessionSink, serve_host,
 };
 use tornect_signal::messages::{self, bye, pair_reject, reject};
-use tornect_signal::pairing::{Consent, TrustedDeviceStore};
+use tornect_signal::pairing::{AutoDeny, Consent, TrustedDeviceStore};
 use tornect_signal::ping::{self, ServeLimits};
 use tornect_signal::unattended::{EmergencyStop, GuardAdmin, UnattendedAuth};
 
+use crate::prompt::{CliConsent, Prompter};
 use crate::unattended::HostContext;
 
 /// How long `tornect host` waits for [`HostLock`] before deciding that another
@@ -310,6 +311,65 @@ pub fn wire(
     })
 }
 
+impl HostWiring {
+    /// This wiring for a host that has nothing to show a session on: no
+    /// terminal and no window. It offers no unattended suite and answers every
+    /// unattended request `NOT_GRANTED` before any password exchange, remote
+    /// admin requests included, because §B.6's indicator must be visible for
+    /// every session and nobody could see one here (slice-F F2-1; decision
+    /// M1-48 (8)). What only takes access away stays: the control channel
+    /// (`tornect panic`, `unattended off`, `service uninstall`), the kill switch
+    /// and the emergency stop code.
+    #[must_use]
+    pub fn without_unattended(mut self) -> Self {
+        self.cfg.feats.clear();
+        self.deps.unattended = Arc::new(NotGranted);
+        self
+    }
+}
+
+/// What `tornect host` says at start when stdin is not a terminal (the systemd
+/// user unit of `tornect service install`, a pipe, a script).
+pub(crate) const NO_TERMINAL_LINE: &str = "warning: stdin is not a terminal, so this host answers \
+     pings only: every pairing, session and unattended request is refused, because nothing here \
+     can ask you or show you a session (run `tornect host` in a terminal to answer them)";
+
+/// Wire `tornect host`, the command-line host, whose terminal (`prompter`)
+/// answers the popups and shows every session. With no terminal (`None`)
+/// nothing can ask or show, so the host answers pings only
+/// ([`HostWiring::without_unattended`]).
+pub fn wire_cli(
+    paths: &Paths,
+    cfg: &Config,
+    identity: Arc<HostIdentity>,
+    device_pk: [u8; 32],
+    prompter: Option<Arc<Prompter>>,
+    media: Arc<MediaHost>,
+    control: ControlChannel,
+) -> anyhow::Result<HostWiring> {
+    match prompter {
+        Some(prompter) => wire(
+            paths,
+            cfg,
+            identity,
+            device_pk,
+            Arc::new(CliConsent::new(prompter)),
+            media,
+            control,
+        ),
+        None => Ok(wire(
+            paths,
+            cfg,
+            identity,
+            device_pk,
+            Arc::new(AutoDeny),
+            media,
+            control,
+        )?
+        .without_unattended()),
+    }
+}
+
 /// The CLI's [`SessionSink`]: records each session in the tracker, hands it to
 /// the media layer, and says on the terminal when one starts and ends.
 struct CliSessions {
@@ -572,6 +632,7 @@ mod tests {
 
     use tokio::io::duplex;
     use tornect_core::DeviceIdentity;
+    use tornect_core::id::DeviceId;
     use tornect_core::unattended::guard::RemoteSessionActivity;
     use tornect_core::unattended::ipc::{IpcOp, IpcRequest, codes as codes_ipc};
     use tornect_signal::HostSigner;
@@ -650,6 +711,197 @@ mod tests {
             vec![messages::feats::UA1.to_owned()],
             "a host with a store offers the unattended suite"
         );
+    }
+
+    /// Slice-F F2-1 (§B.6): a host with no terminal (the systemd user unit of
+    /// `tornect service install`) has nothing to show a session on, so it does
+    /// not offer the unattended suite. Its control channel keeps the store, so
+    /// `tornect panic`, `unattended off` and `service uninstall` still reach it.
+    /// A host with a terminal still offers the suite.
+    #[test]
+    fn a_host_with_no_terminal_offers_no_unattended_suite() {
+        let env = env();
+        let headless = wire_cli(
+            &env.paths,
+            &Config::default(),
+            Arc::clone(&env.identity),
+            [9; 32],
+            None,
+            media(),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        assert!(
+            headless.cfg.feats.is_empty(),
+            "a host with no terminal offers {:?}",
+            headless.cfg.feats
+        );
+        let ctx = headless
+            .ctx
+            .as_ref()
+            .expect("the control channel keeps its store");
+        assert!(ctx.kill.is_some(), "`tornect panic` still ends sessions");
+        drop(headless);
+
+        let (prompter, _typed) = Prompter::scripted();
+        let terminal = wire_cli(
+            &env.paths,
+            &Config::default(),
+            Arc::clone(&env.identity),
+            [9; 32],
+            Some(prompter),
+            media(),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        assert_eq!(terminal.cfg.feats, vec![messages::feats::UA1.to_owned()]);
+    }
+
+    /// Give `device` an unattended grant with `password` in `env`'s store, the
+    /// way the CLI does after re-authentication, and turn unattended access on.
+    /// Returns the emergency stop code.
+    fn grant_unattended(env: &Env, device: &DeviceId, password: &str) -> [u8; 16] {
+        use tornect_core::keystore::FileSecretStore;
+        use tornect_core::session_log::Actor;
+        use tornect_core::unattended::clock::SystemClock;
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{
+            AllowAllPaired, AllowAllReAuth, MutationGuard, NoSessionActivity,
+        };
+        use tornect_core::unattended::ipc::GrantOptions;
+        use tornect_core::unattended::store::GrantStore;
+
+        let host_onion_pk = *env.identity.id().public_key_bytes();
+        let secrets = Arc::new(FileSecretStore::open(env.paths.keys_dir()).unwrap());
+        let store = GrantStore::open(
+            &env.paths,
+            secrets,
+            Arc::new(SystemClock::default()),
+            SessionLog::new(env.paths.sessions_log()),
+        )
+        .unwrap();
+        let guard = MutationGuard::new(
+            store,
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+        )
+        .with_paired_devices(Arc::new(AllowAllPaired))
+        .with_server_setup_source(Arc::new(
+            tornect_signal::unattended::OpaqueServerSetupSource,
+        ));
+        let on = guard.master_on(Actor::Cli, &host_onion_pk).unwrap();
+        guard
+            .create_grant(
+                Actor::Cli,
+                device,
+                Preset::HeadlessBox,
+                &GrantOptions::default(),
+                &[0u8; 192],
+            )
+            .unwrap();
+        let setup =
+            tornect_signal::auth::parse_server_setup(&guard.store().server_setup().unwrap())
+                .unwrap();
+        let record = tornect_signal::auth::register_locally(
+            &setup,
+            password,
+            device.public_key_bytes(),
+            tornect_signal::auth::identifiers(device.public_key_bytes(), &host_onion_pk),
+        )
+        .unwrap();
+        guard.set_password(Actor::Cli, device, &record).unwrap();
+        *on.stop_code
+    }
+
+    /// Slice-F F2-1 (§B.6, decision M1-48 (8)): an unattended request to a host
+    /// with no terminal is refused `NOT_GRANTED`, while the window host's
+    /// wiring serves the same grant. The stop code, deny-direction, still
+    /// works on the host with no terminal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_host_that_can_show_a_session_serves_an_unattended_one() {
+        use tornect_core::unattended::guard::stop_token;
+        use tornect_signal::fsm::HandshakeError;
+        use tornect_signal::fsm::client::UnattendedIntent;
+
+        const PASSWORD: &str = "quiet verdant otter lantern zephyr";
+        let env = env();
+        let host_device_pk = HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32]));
+        let (identity, mut ccfg, cdeps) = client(&env);
+        let device = identity.id();
+        TrustedDeviceStore::open(env.paths.trusted_devices_file())
+            .unwrap()
+            .pin(device, "Laptop")
+            .unwrap();
+        cdeps
+            .known_hosts
+            .pin(env.identity.id(), "Desk", host_device_pk)
+            .unwrap();
+        let stop_code = grant_unattended(&env, &device, PASSWORD);
+        let unattended = || {
+            Intent::Unattended(UnattendedIntent {
+                password: zeroize::Zeroizing::new(PASSWORD.to_owned()),
+                want_mode: messages::mode::CONTROL,
+            })
+        };
+
+        // The window host (the GUI's wiring) serves the grant.
+        {
+            let wiring = wire(
+                &env.paths,
+                &Config::default(),
+                Arc::clone(&env.identity),
+                host_device_pk,
+                Arc::new(ScriptedConsent::new()),
+                media(),
+                ControlChannel::default(),
+            )
+            .unwrap();
+            assert_eq!(wiring.cfg.feats, vec![messages::feats::UA1.to_owned()]);
+            let (client_end, host_end) = duplex(64 * 1024);
+            let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+            let host_task =
+                tokio::spawn(async move { serve_signaling(host_end, &cfg, &deps, |_| {}).await });
+            match connect(client_end, &ccfg, &identity, &cdeps, unattended()).await {
+                Ok(ClientOutcome::Session(session)) => drop(session),
+                other => panic!("the window host refused its grant: {other:?}"),
+            }
+            assert_eq!(host_task.await.unwrap(), Served::Session);
+        }
+
+        // The host with no terminal refuses it, before any password exchange.
+        let headless = wire_cli(
+            &env.paths,
+            &Config::default(),
+            Arc::clone(&env.identity),
+            host_device_pk,
+            None,
+            media(),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        let serve = |host_end| {
+            let (cfg, deps) = (headless.cfg.clone(), headless.deps.clone());
+            tokio::spawn(async move { serve_signaling(host_end, &cfg, &deps, |_| {}).await })
+        };
+        let (client_end, host_end) = duplex(64 * 1024);
+        let host_task = serve(host_end);
+        match connect(client_end, &ccfg, &identity, &cdeps, unattended()).await {
+            Err(HandshakeError::SessionRejected { reject: why }) => {
+                assert_eq!(why.reason, reject::NOT_GRANTED);
+            }
+            other => panic!("a host with no terminal answered {other:?}"),
+        }
+        assert_eq!(host_task.await.unwrap(), Served::Handshake);
+        assert_eq!(headless.live.count(), 0);
+
+        // The stop code still ends unattended access there.
+        ccfg.stop_token = Some(stop_token(env.identity.id().public_key_bytes(), &stop_code));
+        let (client_end, host_end) = duplex(64 * 1024);
+        let host_task = serve(host_end);
+        let _ = connect(client_end, &ccfg, &identity, &cdeps, Intent::PairOnly).await;
+        let _ = host_task.await.unwrap();
+        let store = headless.ctx.as_ref().unwrap().guard.store();
+        assert!(store.grants().is_empty(), "the stop code revoked nothing");
     }
 
     /// The whole reason for the wiring. `tornect panic` (IPC `Panic`) ends a

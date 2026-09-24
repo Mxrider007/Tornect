@@ -130,10 +130,9 @@ before a login: Tornect never turns on automatic login, so after a reboot the
 computer stays unreachable until someone logs in.
 
 - **Linux:** a systemd user unit, `~/.config/systemd/user/tornect-host.service`,
-  started with your graphical session. Started this way the host has no
-  terminal, so it refuses every attended pairing or session request; it serves
-  pings and unattended sessions. `systemctl --user stop tornect-host` ends it
-  gracefully. The password dialog is polkit's `org.tornect.autostart` action,
+  started with your graphical session. Started this way the host answers pings
+  only and refuses every session, because it has no window or terminal to show
+  one. `systemctl --user stop tornect-host` ends it gracefully. The password dialog is polkit's `org.tornect.autostart` action,
   so `packaging/polkit/org.tornect.policy` must be installed. Remove it with
   `tornect service uninstall` (or `systemctl --user disable tornect-host` and
   deleting the file).
