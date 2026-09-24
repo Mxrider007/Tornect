@@ -74,12 +74,24 @@ impl Attention for Window {
 /// foreground, and keys typed for another program then answer the card).
 /// X11's un-minimize is itself an activation request (`_NET_ACTIVE_WINDOW`),
 /// so only a window known to be minimized gets it; Wayland cannot tell
-/// (`None`) and cannot un-minimize.
-fn ask_attention(window: &impl Attention) {
-    if window.is_minimized() == Some(true) {
+/// (`None`) and cannot un-minimize. `true` when the window was brought back,
+/// so its cards arm again (review N-1).
+fn ask_attention(window: &impl Attention) -> bool {
+    let restore = window.is_minimized() == Some(true);
+    if restore {
         window.set_minimized(false);
     }
     window.request_user_attention(Some(UserAttentionType::Critical));
+    restore
+}
+
+/// A window event after which the main window is back in view (focused, or
+/// no longer hidden): its cards arm again (review N-1).
+fn comes_back(event: &WindowEvent) -> bool {
+    matches!(
+        event,
+        WindowEvent::Focused(true) | WindowEvent::Occluded(false)
+    )
 }
 
 /// DX12's options for every wgpu instance this app creates: the FXC shader
@@ -641,8 +653,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.sync_stream(el);
                 self.sync_indicator(el);
                 if let Some(main) = &self.main {
-                    if why == Wake::Attention {
-                        ask_attention(&*main.window);
+                    if why == Wake::Attention && ask_attention(&*main.window) {
+                        self.form.window_came_back();
                     }
                     main.window.request_redraw();
                 }
@@ -672,6 +684,10 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(main) = &mut self.main else { return };
         if main.window.id() != id {
             return;
+        }
+        if comes_back(&event) {
+            self.form.window_came_back();
+            main.window.request_redraw();
         }
         match &event {
             WindowEvent::CloseRequested => self.quit(el),
@@ -831,13 +847,25 @@ mod tests {
                 minimized,
                 calls: RefCell::default(),
             };
-            ask_attention(&window);
+            // Review N-1: only a window brought back re-arms its cards.
+            assert_eq!(ask_attention(&window), minimized == Some(true));
             assert_eq!(
                 window.calls.into_inner(),
                 expected,
                 "minimized: {minimized:?}"
             );
         }
+    }
+
+    /// Review N-1: the main window is back in view when it gets the focus or
+    /// stops being hidden; its cards then arm again.
+    #[test]
+    fn focus_and_unhiding_bring_the_window_back() {
+        assert!(comes_back(&WindowEvent::Focused(true)));
+        assert!(comes_back(&WindowEvent::Occluded(false)));
+        assert!(!comes_back(&WindowEvent::Focused(false)));
+        assert!(!comes_back(&WindowEvent::Occluded(true)));
+        assert!(!comes_back(&WindowEvent::RedrawRequested));
     }
 
     /// The indicator's Stop asks the tokio side to stop sharing, as the

@@ -115,6 +115,17 @@ pub struct Form {
     cards: HashMap<u64, Card>,
 }
 
+impl Form {
+    /// The window came back into view: restored from the taskbar, brought
+    /// back by a newer card's attention request, or focused (review N-1).
+    /// Every card's arming second starts again: a card armed before the
+    /// window was minimized must not be live under a pointer aimed at the
+    /// program the window now covers.
+    pub fn window_came_back(&mut self) {
+        self.cards.clear();
+    }
+}
+
 /// A card's answer row as the window remembers it from pass to pass.
 #[derive(Debug, Clone, Copy)]
 struct Card {
@@ -1196,6 +1207,39 @@ mod tests {
         assert!(!window.disabled("Allow control"));
         assert_eq!(window.button("Allow control"), allow, "it did not move");
         let late = window.click(t0 + Duration::from_millis(1600), allow);
+        assert_eq!(
+            late,
+            vec![Action::Session {
+                id: 7,
+                decision: SessionDecision::AllowOnce,
+                pointer: true,
+            }]
+        );
+    }
+
+    /// Review N-1: a card armed before the window was minimized is not live
+    /// the moment the window comes back (a newer card's attention request
+    /// restores it under the pointer, or it gets the focus): its arming
+    /// second starts again, so a click meant for another program 300 ms
+    /// later answers nothing.
+    #[test]
+    fn a_window_that_comes_back_arms_its_cards_again() {
+        let t0 = Instant::now();
+        let mut window = Harness::new(with_popups(vec![session_popup(7, t0)]), t0);
+        window.pass(t0 + Duration::from_millis(1500), Vec::new());
+        assert!(!window.disabled("Allow control"), "armed after a second");
+        let allow = window.button("Allow control");
+        // Minimized unanswered; twenty seconds later the window comes back.
+        let back = t0 + Duration::from_secs(20);
+        window.form.window_came_back();
+        window.pass(back, Vec::new());
+        let early = window.click(back + Duration::from_millis(300), allow);
+        assert!(
+            early.is_empty(),
+            "the old card answered 300 ms after the window came back: {early:?}"
+        );
+        window.pass(back + Duration::from_millis(1500), Vec::new());
+        let late = window.click(back + Duration::from_millis(1600), allow);
         assert_eq!(
             late,
             vec![Action::Session {
