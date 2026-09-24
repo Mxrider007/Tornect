@@ -132,7 +132,9 @@ computer stays unreachable until someone logs in.
 - **Linux:** a systemd user unit, `~/.config/systemd/user/tornect-host.service`,
   started with your graphical session. Started this way the host answers pings
   only and refuses every session, because it has no window or terminal to show
-  one. `systemctl --user stop tornect-host` ends it gracefully. Keep `tornect`
+  one. `systemctl --user stop tornect-host` ends it gracefully. `service
+  install` is refused while a Tornect host runs for this home: stop it first,
+  so that what is registered is the `tornect` you run. Keep `tornect`
   in a folder only you (or root) can change: `service install` refuses a
   `tornect` another account could replace (under `/tmp` or a shared folder, or
   owned by another account) and a path with `$`, quotes or backslashes. The
