@@ -54,8 +54,27 @@ Cisco OpenH264 2.6.0 and its Rust bindings are BSD-2-Clause
 Cisco's MPEG LA patent coverage applies only to Cisco's own binary module
 (see `docs/research/slice.md` §3; the plan defers the decision to M8).
 
-## Rust crates
+## equix and hashx (LGPL-3.0-only)
+
+`equix` and `hashx`, which Arti uses for the proof of work of onion services, are
+under the GNU Lesser General Public License 3.0 and are linked into the
+executable statically. Tornect's complete source is free software under the
+GPL-3.0-or-later, so the executable can be rebuilt from the commit that each
+zip's `BUILD-INFO.txt` names with changed versions of those crates
+(`docs/RELEASING.md`, *Reproducing a build*). Their licence text is in each zip's
+`THIRD_PARTY_LICENSES.txt`, and the GPL it builds on is `LICENSE`.
+
+## Rust crates, and everything else built into the program
 
 Every other dependency is a Rust crate listed in `Cargo.lock`, pinned and
 justified in `docs/DEPENDENCIES.md`; `cargo deny check licenses` (`deny.toml`)
 keeps them within the allowed licences.
+
+Each release zip carries `THIRD_PARTY_LICENSES.txt`, which `cargo xtask dist`
+generates for its platform (`xtask/src/licences.rs`, `docs/RELEASING.md`): every
+crate the executable is built from, with its version and licence expression,
+and the licence texts those crates publish (or, for the few that publish none,
+the canonical texts in `packaging/licenses/`); the C code built in from inside
+crates (OpenH264, ring's fiat-crypto, Zstandard, liblzma, SQLite), egui's
+fonts, the Rust standard library's notices, and for Windows the statically
+linked llvm-mingw runtime (libc++, libunwind, compiler-rt, mingw-w64's).
