@@ -646,6 +646,13 @@ impl ApplicationHandler<UserEvent> for App {
                     view.surface.window.request_redraw();
                 }
             }
+            Wake::Quit => {
+                tracing::info!("asked to quit by a signal: ending every session");
+                self.quit(el);
+                if let Some(main) = &self.main {
+                    main.window.request_redraw();
+                }
+            }
             Wake::Model | Wake::Attention => {
                 if self.quit_at.is_some() {
                     self.quit(el);

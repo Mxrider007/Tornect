@@ -41,7 +41,37 @@ use winit::event_loop::EventLoop;
 use self::app::{App, UserEvent};
 use self::backend::{Backend, StreamLink};
 use self::consent::Popups;
-use self::model::{Hosting, Model, Setup, Shared, Waker};
+use self::model::{Hosting, Model, Setup, Shared, Wake, Waker};
+
+/// The next request to end this process: SIGINT or SIGTERM on Unix (Ctrl-C
+/// in the terminal that started it, `kill`, `systemctl stop`), Ctrl-C or
+/// Ctrl-Break on Windows. Once listened for, these no longer end the process
+/// by themselves; the window's close path does.
+async fn quit_requested() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let mut ctrl_break = tokio::signal::windows::ctrl_break()?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = ctrl_break.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::future::pending().await
+    }
+}
 
 /// How the window runs.
 #[derive(Debug, Clone, Copy)]
@@ -82,6 +112,7 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
             .unwrap_or_else(PoisonError::into_inner)
             .send_event(UserEvent::Wake(why));
     });
+    let quit_wake = Arc::clone(&wake);
 
     // The first-run grant is a step only where a session would open the
     // desktop's portal: a Wayland desktop this machine shares.
@@ -131,6 +162,20 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
         ran.context("the window's event loop failed")?;
         return app.error.take().map_or(Ok(()), Err);
     }
+    // A signal ends the window's sessions as its close button does, instead
+    // of killing the process with a session live (which left the viewer's
+    // held keys down and `sessions.log` without an end record).
+    runtime.spawn(async move {
+        loop {
+            match quit_requested().await {
+                Ok(()) => quit_wake(Wake::Quit),
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot listen for quit signals");
+                    return;
+                }
+            }
+        }
+    });
     runtime.spawn(backend::run(
         Backend {
             paths: paths.clone(),
@@ -158,5 +203,29 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
     match app.error.take() {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A SIGTERM (what `kill` and a desktop's logout send) no longer ends the
+    /// window's process abruptly: it is a quit request, which the window turns
+    /// into its close path (every session ended with a goodbye). The process
+    /// survives the signal, so this test can send it to itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_terminate_signal_is_a_quit_request() {
+        let waiting = tokio::spawn(super::quit_requested());
+        // Let the listener register before the signal is sent.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // kill(2), not a `kill` process: a fork would hold a copy of the
+        // other tests' store locks until it execs.
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::TERM)
+            .unwrap();
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("SIGTERM was not seen as a quit request")
+            .unwrap();
+        assert!(asked.is_ok(), "{asked:?}");
     }
 }

@@ -51,5 +51,11 @@ wgpu = { workspace = true, features = ["dx12"] }
 tempfile.workspace = true
 ed25519-dalek.workspace = true
 
+# The SIGTERM test signals its own process with kill(2): spawning `kill` would
+# fork, and a forked child holds a copy of every open file, the other tests'
+# store locks included, until it execs.
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true, features = ["process"] }
+
 [lints]
 workspace = true
