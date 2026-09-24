@@ -66,7 +66,7 @@ FAIL: connect2 exited (0) before /MEDIA ENDED by the host/
 ```text
 2026-09-21T22:24:14.617094Z  INFO tornect_signal::tor::node: onion stream open host=xzcxheyl port=4000
 connected in 7.7 s
-SESSION LIVE faca85e8e409a90c with "mx-VMware-Virtual-Platform" (control)
+SESSION LIVE faca85e8e409a90c with "build-vm" (control)
 2026-09-21T22:24:17.042396Z  INFO tornect_signal::tor::node: connecting to host over Tor host=xzcxheyl port=4001
 2026-09-21T22:24:18.089151Z  INFO tornect_signal::tor::node: onion stream open host=xzcxheyl port=4001
 MEDIA BOUND 1280x720 (control)
@@ -87,7 +87,7 @@ SESSION ENDED (by you)
 
 ```text
 connected in 9.2 s
-SESSION LIVE e2641a86775d873b with "mx-VMware-Virtual-Platform" (view-only)
+SESSION LIVE e2641a86775d873b with "build-vm" (view-only)
 MEDIA BOUND 1280x720 (view-only)
 session ping 1: rtt 1108.6 ms
 video: 35 pictures, 6.9 fps, 1280x720
@@ -102,22 +102,22 @@ SESSION ENDED by the host (PANIC)
 ```text
 sharing: a synthetic test card (no desktop; viewers' input goes nowhere)
 Tornect ID: xzcxheylg6paxjxiropaw2jk7uuw2vcebtrvwbthtrlbqrf6qzn6puad.onion
-SESSION REQUEST from "mx-VMware-Virtual-Platform" (fingerprint b1e1-7c80-7022-9ddd)
+SESSION REQUEST from "build-vm" (fingerprint b1e1-7c80-7022-9ddd)
 SESSION LIVE faca85e8e409a90c
-session with "mx-VMware-Virtual-Platform" is live (control); `tornect panic` ends it
+session with "build-vm" is live (control); `tornect panic` ends it
 [OpenH264] this = 0x0x785c7c000cc0, Warning:bEnableFrameSkip = 0,bitrate can't be controlled for RC_QUALITY_MODE,RC_BITRATE_MODE and RC_TIMESTAMP_MODE without enabling skip frame.
 SHARING faca85e8e409a90c
-sharing this screen with "mx-VMware-Virtual-Platform" (synthetic 1280x720; their input goes nowhere here); `tornect panic` stops it
+sharing this screen with "build-vm" (synthetic 1280x720; their input goes nowhere here); `tornect panic` stops it
 SHARING STOPPED faca85e8e409a90c
 screen sharing stopped (the viewer left): 153 pictures, 9 KiB sent
 SESSION ENDED faca85e8e409a90c
 session ended: the client left (USER)
-SESSION REQUEST from "mx-VMware-Virtual-Platform" (fingerprint b1e1-7c80-7022-9ddd)
+SESSION REQUEST from "build-vm" (fingerprint b1e1-7c80-7022-9ddd)
 SESSION LIVE e2641a86775d873b
-session with "mx-VMware-Virtual-Platform" is live (view-only); `tornect panic` ends it
+session with "build-vm" is live (view-only); `tornect panic` ends it
 [OpenH264] this = 0x0x785c7c3856b0, Warning:bEnableFrameSkip = 0,bitrate can't be controlled for RC_QUALITY_MODE,RC_BITRATE_MODE and RC_TIMESTAMP_MODE without enabling skip frame.
 SHARING e2641a86775d873b
-sharing this screen with "mx-VMware-Virtual-Platform" (synthetic 1280x720; view-only); `tornect panic` stops it
+sharing this screen with "build-vm" (synthetic 1280x720; view-only); `tornect panic` stops it
 SESSION ENDED e2641a86775d873b
 session ended: ended here (PANIC)
 SHARING STOPPED e2641a86775d873b

@@ -40,7 +40,7 @@ Binary: `target/debug/tornect` built from the working tree that became the
 forgot xzcxheylg6paxjxiropaw2jk7uuw2vcebtrvwbthtrlbqrf6qzn6puad.onion; this connection pairs again
 PAIRING: the host now shows a code. It must be exactly 919 121.
 Did it show 919 121? Type `yes` only if the codes matched (50 s):
-SESSION LIVE a72997036d6c27cb with "mx-VMware-Virtual-Platform" (control)
+SESSION LIVE a72997036d6c27cb with "build-vm" (control)
 session ping 1: rtt 1044.8 ms
 session ping 2: rtt 710.5 ms
 session ping 3: rtt 642.3 ms
@@ -50,7 +50,7 @@ SESSION ENDED (by you)
 ## Run 4 — client, second connect (`connect <id>`, ended by `tornect panic`)
 
 ```text
-SESSION LIVE c7557e511c6b8d2d with "mx-VMware-Virtual-Platform" (view-only)
+SESSION LIVE c7557e511c6b8d2d with "build-vm" (view-only)
 session ping 1: rtt 1099.4 ms
 SESSION ENDED by the host (PANIC)
 ```
@@ -59,17 +59,17 @@ SESSION ENDED by the host (PANIC)
 
 ```text
 Tornect ID: xzcxheylg6paxjxiropaw2jk7uuw2vcebtrvwbthtrlbqrf6qzn6puad.onion
-PAIRING REQUEST: a device ALREADY PAIRED as "mx-VMware-Virtual-Platform" asks to pair again (refusing does not unpair it)
+PAIRING REQUEST: a device ALREADY PAIRED as "build-vm" asks to pair again (refusing does not unpair it)
   code: 919 121   <- must match the code on that device
-2026-09-21T17:51:42.347610Z  INFO tornect_signal::fsm::host: device paired peer=imzrkzvbol4rkr62fr7e7epnp64fhenawtsmef45f4nsjmseitxa label=mx-VMware-Virtual-Platform
-SESSION REQUEST from "mx-VMware-Virtual-Platform" (fingerprint b1e1-7c80-7022-9ddd)
+2026-09-21T17:51:42.347610Z  INFO tornect_signal::fsm::host: device paired peer=imzrkzvbol4rkr62fr7e7epnp64fhenawtsmef45f4nsjmseitxa label=build-vm
+SESSION REQUEST from "build-vm" (fingerprint b1e1-7c80-7022-9ddd)
 SESSION LIVE a72997036d6c27cb
-session with "mx-VMware-Virtual-Platform" is live (control); `tornect panic` ends it
+session with "build-vm" is live (control); `tornect panic` ends it
 SESSION ENDED a72997036d6c27cb
 session ended: the client left (USER)
-SESSION REQUEST from "mx-VMware-Virtual-Platform" (fingerprint b1e1-7c80-7022-9ddd)
+SESSION REQUEST from "build-vm" (fingerprint b1e1-7c80-7022-9ddd)
 SESSION LIVE c7557e511c6b8d2d
-session with "mx-VMware-Virtual-Platform" is live (view-only); `tornect panic` ends it
+session with "build-vm" is live (view-only); `tornect panic` ends it
 SESSION ENDED c7557e511c6b8d2d
 session ended: ended here (PANIC)
 Ctrl-C: shutting down
