@@ -752,6 +752,23 @@ impl MutationGuard {
         })
     }
 
+    /// `G_KEYSTORE_LOCKED` (logged, buffered) while the store failed closed on an
+    /// unreadable keystore: every line would then be buffered, not written (F2-4).
+    fn log_key_readable(&self, op: &str, by: Actor) -> Result<(), GuardError> {
+        match self.store.status() {
+            StoreStatus::FailedClosed(StoreLoadError::KeystoreLocked(m)) => Err(self.refuse(
+                op,
+                Some(by),
+                None,
+                GuardError::KeystoreLocked(format!(
+                    "{m}; this change could not be written to sessions.log now, so it waits \
+                     until the keystore can be read"
+                )),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     fn require_loaded(
         &self,
         op: &str,
@@ -1323,8 +1340,25 @@ impl MutationGuard {
     /// Authorize an access-increasing operation whose effect lives outside the store
     /// (autostart, backup, identity view, settings). Logs `AutostartChanged` /
     /// `BackupExported`; the caller performs the effect after `Ok`.
+    ///
+    /// Slice-F F2-4: while `K_master` exists but cannot be read, a line cannot be
+    /// tagged and the store only buffers it (§B.8.13), so a change authorised then
+    /// could leave no trace in `sessions.log`. An operation that must be logged is
+    /// refused with `G_KEYSTORE_LOCKED`, before the dialog and again before its line.
     pub fn authorize(&self, by: Actor, op: &ExternalOp) -> Result<(), GuardError> {
+        let logged = matches!(
+            op,
+            ExternalOp::ServiceInstall { .. }
+                | ExternalOp::ServiceUninstall
+                | ExternalOp::BackupExport { .. }
+        );
+        if logged {
+            self.log_key_readable(op.name(), by)?;
+        }
         self.access_increasing(op.name(), by, None)?;
+        if logged {
+            self.log_key_readable(op.name(), by)?;
+        }
         let now = self.now();
         let rec = match op {
             ExternalOp::ServiceInstall { elevated } => Some(
