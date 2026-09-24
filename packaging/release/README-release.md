@@ -157,7 +157,10 @@ computer stays unreachable until someone logs in.
 `tornect paths` prints the directories: the keys of this machine's Tornect ID,
 the paired devices, `config.toml` and `sessions.log` (every pairing and session,
 kept on this machine). `--home <dir>` (or `TORNECT_HOME`) puts all of it
-elsewhere, so two copies can run side by side on one machine.
+elsewhere, so two copies can run side by side on one machine. On Windows that
+directory must be inside your user folder (`C:\Users\<you>`), and Tornect
+refuses one elsewhere: it does not yet give its directories permissions of their
+own, and anywhere else other accounts on the PC could read and change its keys.
 
 ## Known limitations of this build
 

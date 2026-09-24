@@ -827,11 +827,50 @@ impl Autostart for SystemdUserUnit {
 // Windows: a Task Scheduler at-logon task
 // ---------------------------------------------------------------------------
 
-/// Why a custom home is refused on Windows (review finding SLICE-E2 E2-2).
-pub const WINDOWS_CUSTOM_HOME_REFUSAL: &str = "on Windows, start at login serves the default \
-     Tornect directories only: a `--home` or `TORNECT_HOME` directory gets no private \
-     permissions there yet, so another local account could change what would run at every \
-     login (review finding E2-2); run `tornect service install` without it";
+/// The one Windows rule for a custom home (review finding SLICE-E2 E2-2), as
+/// a literal both refusals below are built from.
+macro_rules! windows_home_rule {
+    () => {
+        "on Windows, Tornect gives a `--home` or `TORNECT_HOME` directory no private \
+         permissions of its own yet, so it takes one only inside your user folder, whose \
+         permissions keep other accounts out, and start at login serves the default Tornect \
+         directories only (review finding E2-2)"
+    };
+}
+
+/// The Windows rule for a `--home` or `TORNECT_HOME` directory (review
+/// finding SLICE-E2 E2-2): inside the user's profile folder only, and never
+/// for the start-at-login task.
+pub const WINDOWS_HOME_RULE: &str = windows_home_rule!();
+
+/// Why the start-at-login task refuses a custom home on Windows: the rule of
+/// [`WINDOWS_HOME_RULE`], word for word.
+pub const WINDOWS_CUSTOM_HOME_REFUSAL: &str = concat!(
+    windows_home_rule!(),
+    "; run `tornect service install` without it"
+);
+
+/// Whether Tornect may keep its state in `home` on Windows (review finding
+/// E2-2): only inside `profile`, the user's profile folder as the OS names it
+/// (`FOLDERID_Profile`), or in it. A profile the OS does not name is not
+/// guessed. `home` must be absolute; `..` and verbatim (`\\?\`) paths are
+/// refused rather than resolved.
+pub fn windows_home_ok(home: &str, profile: Option<&str>) -> Result<(), String> {
+    if let Some(profile) = profile.filter(|p| !p.is_empty()) {
+        let bare = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+        if bare(home) == bare(profile) || location_under(home, &[profile.to_owned()]) {
+            return Ok(());
+        }
+        return Err(format!(
+            "{home} is not inside your user folder ({profile}): {WINDOWS_HOME_RULE}; use a \
+             directory inside your user folder, or none"
+        ));
+    }
+    Err(format!(
+        "{home} cannot be checked, because Windows did not name your user folder: \
+         {WINDOWS_HOME_RULE}"
+    ))
+}
 
 /// XML-escape text for an element body.
 fn xml_escape(s: &str) -> String {
@@ -1706,6 +1745,44 @@ mod tests {
             Err(AutostartError::Unavailable(m)) => assert!(m.contains("E2-2"), "{m}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Review finding E2-2: on Windows, Tornect's own directories get no
+    /// private permissions yet, so a `--home` or `TORNECT_HOME` is taken only
+    /// inside the user's profile folder, whose permissions keep other accounts
+    /// out; the refusal is the start-at-login task's rule and text.
+    #[test]
+    fn a_windows_home_is_taken_only_inside_the_profile() {
+        let profile = Some("C:\\Users\\me");
+        for home in [
+            "C:\\Users\\me\\tornect-h1",
+            "c:\\users\\ME\\AppData\\Local\\t",
+            "C:\\Users\\me",
+            "C:\\Users\\me\\",
+        ] {
+            assert_eq!(windows_home_ok(home, profile), Ok(()), "{home}");
+        }
+        for home in [
+            "C:\\tornect-home",
+            "C:\\Users\\Public\\tornect",
+            "C:\\Users\\meX\\t",
+            "C:\\Users\\me\\..\\other\\t",
+            "D:\\shared\\t",
+            "\\\\server\\share\\t",
+            "\\\\?\\C:\\Users\\me\\t",
+        ] {
+            match windows_home_ok(home, profile) {
+                Err(m) => {
+                    assert!(m.contains(home), "{m}");
+                    assert!(m.contains(WINDOWS_HOME_RULE), "{m}");
+                }
+                Ok(()) => panic!("{home} must be refused"),
+            }
+        }
+        // A profile the OS would not name: refused, never guessed.
+        assert!(windows_home_ok("C:\\Users\\me\\t", None).is_err());
+        // One rule: the task's refusal says the same.
+        assert!(WINDOWS_CUSTOM_HOME_REFUSAL.contains(WINDOWS_HOME_RULE));
     }
 
     #[test]

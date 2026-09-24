@@ -32,3 +32,11 @@ pub mod ipc;
 pub mod reauth;
 #[cfg(windows)]
 mod win;
+
+/// This user's profile folder (`FOLDERID_Profile`, `C:\Users\<name>`), from
+/// the OS rather than from the environment, which whoever starts Tornect
+/// controls (review findings E2-2 and F1-4).
+#[cfg(windows)]
+pub fn user_profile() -> std::io::Result<std::path::PathBuf> {
+    win::known_folder(win::KnownFolder::Profile)
+}
