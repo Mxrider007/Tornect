@@ -2733,10 +2733,17 @@ mod tests {
     /// Slice-F F2-4's side effect: while the keystore cannot be read, `service
     /// uninstall` is refused as well (its line could only be buffered), and
     /// the refusal says how to remove the registration by hand.
+    ///
+    /// The unreadable keystore is a real key file set to mode 000, which does
+    /// not stop root: run as root (a container build, say), this test checks
+    /// nothing and returns at once (review P2-I3).
     #[cfg(unix)]
     #[test]
     fn an_uninstall_the_keystore_refuses_names_the_manual_removal() {
         use std::os::unix::fs::PermissionsExt as _;
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
         let registered = || FakeAutostart {
             state: std::sync::Mutex::new(Some(AutostartState::Registered(
                 autostart::Registration {
