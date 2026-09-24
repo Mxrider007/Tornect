@@ -21,9 +21,9 @@ use super::grant::{
 };
 use super::grant::{LIFETIME_BUDGET, TransportConflict};
 use super::guard::{
-    AdminEffect, AdminOp, AllowAllPaired, AllowAllReAuth, DenyAllReAuth, GuardError, MutationGuard,
-    NoSessionActivity, RandomServerSetupSource, ReAuth, ReAuthError, ScriptedActivity,
-    SuspendOutcome, stop_token,
+    AdminEffect, AdminOp, AllowAllPaired, AllowAllReAuth, DenyAllReAuth, ExternalOp, GuardError,
+    MutationGuard, NoSessionActivity, RandomServerSetupSource, ReAuth, ReAuthError,
+    ScriptedActivity, SuspendOutcome, stop_token,
 };
 use super::ipc::{GrantOptions, codes};
 use super::limiter::{
@@ -895,6 +895,51 @@ fn a6_log_chain_stays_valid_across_a_keystore_locked_window_and_its_recovery_loa
     );
 }
 
+/// Slice-F F2-4: while `K_master` exists but cannot be read, a line cannot
+/// be tagged and is only buffered (lost if the process ends first), so a
+/// start-at-login change or a backup export could leave no trace in
+/// `sessions.log`. `authorize` refuses the operations it must log, before the
+/// dialog.
+#[test]
+fn f2_4_logged_external_changes_wait_for_a_readable_log_key() {
+    let env = Env::new();
+    let store = env.open();
+    let g = enable(&env, &store, dev(1), Preset::MyMachines);
+    drop((g, store));
+    *env.secrets.get_fails.lock() = true;
+    let store = env.open();
+    assert!(matches!(
+        store.status(),
+        StoreStatus::FailedClosed(StoreLoadError::KeystoreLocked(_))
+    ));
+    let reauth = Arc::new(AllowAllReAuth::default());
+    let guard = MutationGuard::new(
+        store.clone(),
+        Arc::clone(&reauth) as Arc<dyn ReAuth>,
+        Arc::new(NoSessionActivity),
+    );
+    for op in [
+        ExternalOp::ServiceInstall { elevated: false },
+        ExternalOp::ServiceInstall { elevated: true },
+        ExternalOp::ServiceUninstall,
+        ExternalOp::BackupExport {
+            path: "/tmp/backup.bin".to_owned(),
+        },
+    ] {
+        match guard.authorize(Actor::Cli, &op) {
+            Err(e) => assert_eq!(e.code(), codes::G_KEYSTORE_LOCKED, "{op:?}: {e}"),
+            Ok(()) => panic!("{op:?} authorised while its log line could only be buffered"),
+        }
+    }
+    assert!(reauth.calls().is_empty(), "a dialog: {:?}", reauth.calls());
+    // Once the keystore reads again, the same change goes through.
+    *env.secrets.get_fails.lock() = false;
+    assert_eq!(store.retry_load(), StoreStatus::Loaded);
+    guard
+        .authorize(Actor::Cli, &ExternalOp::ServiceUninstall)
+        .unwrap();
+}
+
 #[test]
 fn u4_machine_id_mismatch_disables_every_grant_by_restore() {
     let mut env = Env::new();
@@ -1327,21 +1372,15 @@ fn a8_guard_refuses_access_increasing_ops_without_reauth() {
         codes::G_REAUTH_FAILED
     );
     assert_eq!(
-        deny.authorize(
-            Actor::Cli,
-            &super::guard::ExternalOp::ServiceInstall { elevated: false }
-        )
-        .unwrap_err()
-        .code(),
+        deny.authorize(Actor::Cli, &ExternalOp::ServiceInstall { elevated: false })
+            .unwrap_err()
+            .code(),
         codes::G_REAUTH_FAILED
     );
     assert_eq!(
-        deny.authorize(
-            Actor::Cli,
-            &super::guard::ExternalOp::BackupExport { path: "/x".into() }
-        )
-        .unwrap_err()
-        .code(),
+        deny.authorize(Actor::Cli, &ExternalOp::BackupExport { path: "/x".into() })
+            .unwrap_err()
+            .code(),
         codes::G_REAUTH_FAILED
     );
     // widening needs re-auth, narrowing does not
@@ -1733,10 +1772,7 @@ fn a8_guard_refuses_during_and_within_60s_after_a_remote_session() {
     );
     assert_eq!(
         guard
-            .authorize(
-                Actor::Ui,
-                &super::guard::ExternalOp::BackupExport { path: "/b".into() }
-            )
+            .authorize(Actor::Ui, &ExternalOp::BackupExport { path: "/b".into() })
             .unwrap_err()
             .code(),
         codes::G_REMOTE_SESSION_ACTIVE
@@ -3070,10 +3106,7 @@ fn a8_access_increasing_rechecks_the_remote_session_after_the_dialog() {
         },
     ));
     assert!(store.read(|s| s.notify).unwrap());
-    check(guard.authorize(
-        Actor::Ui,
-        &super::guard::ExternalOp::BackupExport { path: "/b".into() },
-    ));
+    check(guard.authorize(Actor::Ui, &ExternalOp::BackupExport { path: "/b".into() }));
     assert!(!env.has_event(SessionEvent::BackupExported));
     assert_eq!(
         *reauth.calls.lock(),
