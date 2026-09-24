@@ -23,14 +23,15 @@ crates/tornect-audio        capture, Opus, playback                             
 crates/tornect-input        16-byte input events, client capture, host inject backends                      (M5)
 crates/tornect-platform     OS session services (§B.8.8): presence, lock, keep-awake, autostart, OS re-auth backends, hotkeys, readiness, owner-only IPC endpoint   (M1 scaffold / M6)
 crates/tornect-session      the Tor media session (MediaHost/MediaViewer, decision M1-43; the slice); later the host/client state machines, the UI-backed BlockWindow/LocalAllow impls + Candidates onward (§B.8.14)   (M4)
-apps/tornect                CLI now; eframe app + stream window later; host-role IPC server loop dispatching to the MutationGuard (§B.8.7.4)   (M4/M8)
-xtask                       cargo xtask verify | lint-all | dist | ffmpeg-fetch | soak
+apps/tornect                CLI + the egui window (src/ui/: manual winit loop, egui-winit + egui-wgpu, no eframe; decision M1-50) + host-role IPC server loop dispatching to the MutationGuard (§B.8.7.4); the Iced shell later   (M4/M8)
+xtask                       cargo xtask verify | lint-all | pt-fetch | dist | ffmpeg-fetch | soak
 tests/integration           loopback e2e, signaling-over-localhost-tor mocks, unattended adversarial suite (§B.8.15)   (M1)
 tests/netem                 scripted latency/loss/jitter harness (linux netns; runs in CI)
 docs/PLAN.md                the plan (verbatim copy of TORNECT_PLAN.md at repo root)
 docs/UI_PLAN.md             the UI plan (verbatim copy of TORNECT_UI_PLAN.md; Iced shell + egui HUD, U0–U5 — reconciled in PLAN.md Part G)
 docs/DEPENDENCIES.md        dependency → version → why → build requirements → verified-on
 docs/VERIFICATION.md        acceptance ledger: VERIFIED / CI / NEEDS-DEVICE(os) / OPEN
+docs/RELEASING.md           how a slice pre-release is made: advisory fetch, gate, `cargo xtask dist`, checks, tag, notes (packaging/release/)
 docs/research/*.md          sourced API notes the implementers code from
 docs/notes/m<N>-state.md    per-milestone hand-off notes (write before /clear)
 .claude/agents/*.md         subagent roster (§D.3); .claude/commands/{milestone,verify,research}.md
@@ -48,6 +49,9 @@ cargo xtask verify                 # fmt --check, clippy -D warnings (all target
 cargo xtask lint-all               # fmt + clippy only
 cargo run -p tornect -- id         # M0 acceptance: prints this machine's Tornect ID (56-char .onion)
 cargo run -p tornect -- doctor     # environment report
+TORNECT_HOME=$PWD/target/tornect-test/g1 cargo run -p tornect   # the window (no subcommand = `gui`); `gui --no-host` only connects, `gui --capture test-card` shares the test card
+cargo xtask pt-fetch               # lyrebird for both OSes, pinned and signature-checked (packaging/pt/SOURCES.md)
+cargo xtask dist                   # both release zips + SHA256SUMS in target/dist/ (fetches lyrebird itself); the process: docs/RELEASING.md
 TORNECT_HOME=$PWD/target/tornect-test/h1 cargo run -p tornect -- host          # M1: publish onion service; answer pings, pairing and sessions (asked on this terminal)
 TORNECT_HOME=$PWD/target/tornect-test/h2 cargo run -p tornect -- ping <id> --count 5   # M1: second isolated instance, pairing-free liveness check
 TORNECT_HOME=$PWD/target/tornect-test/h1 cargo run -p tornect -- host --capture test-card   # slice: share the synthetic test card (`--capture desktop` shares this VM's Wayland desktop through the portal; the desktop asks once)
@@ -83,7 +87,8 @@ Accept demo → VERIFICATION.md → security review → `docs/notes/m<n>-state.m
 
 Ubuntu 26.04 LTS, GNOME on **Wayland** (`XDG_SESSION_TYPE=wayland`), VMware virtual GPU
 (no hardware encoder; lavapipe Vulkan + Mesa GL available for wgpu), 4 vCPU, 7 GiB, Rust
-stable 1.96, gcc/g++ 15, cmake, pkg-config, **no nasm, no sudo**. Missing dev headers:
+stable 1.96, gcc/g++ 15, cmake, pkg-config, nasm 3.01, llvm-mingw 20260908 (the Windows
+cross-build) and Wine 10.0, **no sudo**. Missing dev headers:
 FFmpeg (libav*), PipeWire, ALSA, libei, libclang-dev, GTK. Consequences:
 
 - FFmpeg / cpal / tray backends live behind cargo features and are compiled + tested in the
@@ -95,9 +100,11 @@ FFmpeg (libav*), PipeWire, ALSA, libei, libclang-dev, GTK. Consequences:
 - No root ⇒ no netns/tc netem locally; `tests/netem/run.sh` runs in CI.
 - Outbound Tor works from this VM (directory authorities reachable); M1 can be verified live
   (cold bootstrap ≈ 10 s, onion service reachable ≈ 70 s after launch, ping RTT ≈ 0.5–1 s).
-- `/tmp` is a small quota-limited tmpfs: build with `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp`
-  (otherwise `cc` fails on zstd with "Disk quota exceeded") and keep Tor state under
-  `target/tornect-test/<name>`, never `/tmp`.
+- `/tmp` is a small quota-limited tmpfs: build with `TMPDIR=$PWD/target/tmp` (otherwise `cc`
+  fails on zstd with "Disk quota exceeded") and keep Tor state under `target/tornect-test/<name>`,
+  never `/tmp`. systemd-oomd kills the terminal's whole process group under memory pressure, so
+  run every heavy cargo command in its own scope with 2 jobs:
+  `systemd-run --user --scope --quiet -- env CARGO_BUILD_JOBS=2 TMPDIR=$PWD/target/tmp cargo …`.
 - The GitHub remote uses HTTPS with the `gh` credential helper (`gh auth setup-git`).
 
 ## Coding conventions
