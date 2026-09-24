@@ -813,7 +813,7 @@ where
     let declared_name = normalize_label(&hello.name);
     let pinned = deps.trusted.get(&device).map(|rec| rec.label);
     let hello_verified = Counted::new(&deps.stats.hello_verified);
-    tracing::debug!(peer = %device, paired = pinned.is_some(), "HELLO verified");
+    tracing::debug!(peer = ?device, paired = pinned.is_some(), "HELLO verified");
 
     // HelloVerified → HELLO_ACK.
     let mut host_nonce = [0u8; 32];
@@ -975,7 +975,7 @@ where
         let _slot = match deps.session_policy.admit(*device.public_key_bytes()) {
             Ok(guard) => guard,
             Err(refusal) => {
-                tracing::debug!(peer = %device, ?refusal, "session popup refused by the limiter");
+                tracing::debug!(peer = ?device, ?refusal, "session popup refused by the limiter");
                 return reject_session(&mut chan, deps, &peer, messages::reject::BUSY).await;
             }
         };
@@ -1056,7 +1056,7 @@ where
         mode,
         unattended,
     });
-    tracing::info!(peer = %device, %label, session = %session_id, "session accepted");
+    tracing::info!(peer = ?device, %label, session = %session_id, "session accepted");
 
     let th_final = chan.th();
     // Armed before `on_start`, so even a sink that panics inside it is released.
@@ -1218,7 +1218,7 @@ where
         Ok(Err(reason))
     };
     if let Some(until) = deps.trusted.banned_until(device) {
-        tracing::info!(peer = %device, until, "pairing refused: temp-banned");
+        tracing::info!(peer = ?device, until, "pairing refused: temp-banned");
         send_pair_reject(chan, messages::pair_reject::BANNED).await?;
         return refuse(messages::pair_reject::BANNED);
     }
@@ -1272,7 +1272,7 @@ where
                     .trusted
                     .record_reject(*device, &deps.policy.limits().ban)?;
                 if let Some(until) = until {
-                    tracing::info!(peer = %device, until, "peer temp-banned after repeated rejects");
+                    tracing::info!(peer = ?device, until, "peer temp-banned after repeated rejects");
                 }
             }
             send_pair_reject(chan, messages::pair_reject::DENIED).await?;
@@ -1294,7 +1294,7 @@ where
                 device: *device,
                 label: pinned.clone(),
             });
-            tracing::info!(peer = %device, label = %pinned, "device paired");
+            tracing::info!(peer = ?device, label = %pinned, "device paired");
             Ok(Ok(pinned))
         }
     }

@@ -643,7 +643,7 @@ where
         return Err(chan.fail(codes::E_BAD_LEN, "mode").await);
     }
     deps.known_hosts.touch(&cfg.host);
-    tracing::info!(host = %cfg.host, session = %token.session_id(), "session accepted");
+    tracing::info!(host = %cfg.host.short(), session = %token.session_id(), "session accepted");
     Ok(ClientOutcome::Session(Box::new(ClientSession {
         chan,
         accept,
@@ -706,7 +706,7 @@ where
     }
     deps.known_hosts
         .pin(cfg.host, &host_name, accept.host_device_pk)?;
-    tracing::info!(host = %cfg.host, %host_name, "host paired");
+    tracing::info!(host = %cfg.host.short(), %host_name, "host paired");
     Ok((host_name, accept.host_device_pk))
 }
 
@@ -868,7 +868,7 @@ where
     // Only now, with the host's proof verified, is the key worth remembering.
     deps.server_key_pin.record(&cfg.host, &out.server_s_pk);
     deps.known_hosts.touch(&cfg.host);
-    tracing::info!(host = %cfg.host, session = %token.session_id(), "unattended session accepted");
+    tracing::info!(host = %cfg.host.short(), session = %token.session_id(), "unattended session accepted");
     Ok(ClientOutcome::Session(Box::new(ClientSession {
         chan,
         accept,

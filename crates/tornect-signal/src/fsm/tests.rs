@@ -520,6 +520,90 @@ async fn pairing_then_attended_session_ping_bye() {
     }
 }
 
+/// Every log line written while the test runs, as text.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl LogCapture {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+/// SLICE-E E2-7: the lines a pairing and a session write, at every level,
+/// name the peer by a short form (the host by the first eight characters of
+/// its address, a device by its fingerprint), never by the full ID: the
+/// console of `tornect.exe` shows them, and people share screenshots of it.
+#[tokio::test]
+async fn the_logs_name_peers_by_short_forms_only() {
+    let capture = LogCapture::default();
+    let writer = capture.clone();
+    let _logs = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let host = host_side(tmp.path(), HOST_SEED);
+    host.consent
+        .push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+    host.consent
+        .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+    let client = client_side(tmp.path(), host.identity.id(), CLIENT_SEED);
+    let (a, b) = pipe();
+    let host_task = spawn_host(a, &host);
+    let session = match connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        Intent::Session,
+    )
+    .await
+    .unwrap()
+    {
+        ClientOutcome::Session(s) => s,
+        ClientOutcome::Paired { .. } => panic!("expected a session"),
+    };
+    session.bye(bye::USER).await.unwrap();
+    let _ = host_task.await.unwrap().unwrap();
+
+    let logs = capture.text();
+    for needle in ["device paired", "host paired", "session accepted"] {
+        assert!(logs.contains(needle), "no `{needle}` line:\n{logs}");
+    }
+    let host_id = host.identity.id();
+    let device = client.identity.id();
+    for (what, full) in [
+        ("the host's address", host_id.onion_address()),
+        (
+            "the host's address",
+            host_id.onion_address().replace(".onion", ""),
+        ),
+        ("the device ID", device.to_string()),
+    ] {
+        assert!(
+            !logs.contains(&full),
+            "{what} appears in full in the logs:\n{logs}"
+        );
+    }
+    assert!(logs.contains(&host_id.short()), "{logs}");
+    assert!(logs.contains(&device.fingerprint()), "{logs}");
+}
+
 /// One [`LiveSessions`] drives the FSM's `BUSY` answers and the guard's view
 /// of a remote session. While a session runs, a second device's pairing popup
 /// is suppressed and both views say "live"; once it ends, the guard's view

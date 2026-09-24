@@ -7479,6 +7479,7 @@ dependencies = [
  "tor-rtcompat",
  "tornect-core",
  "tracing",
+ "tracing-subscriber",
  "unicode-normalization",
  "zeroize",
 ]
