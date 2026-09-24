@@ -79,7 +79,7 @@ Accept demo → VERIFICATION.md → security review → `docs/notes/m<n>-state.m
    `docs: …`, `chore(ci): …`); every commit compiles; parallel tracks use
    `git worktree add ../tornect-<track> m<N>-<track>`.
 
-## Dev machine facts (mx-vm)
+## Dev machine facts (the build VM)
 
 Ubuntu 26.04 LTS, GNOME on **Wayland** (`XDG_SESSION_TYPE=wayland`), VMware virtual GPU
 (no hardware encoder; lavapipe Vulkan + Mesa GL available for wgpu), 4 vCPU, 7 GiB, Rust

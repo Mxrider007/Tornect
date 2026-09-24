@@ -1,6 +1,6 @@
 # `serve_host` in `tornect host` — live evidence (2026-09-21, fourth session)
 
-Decision M1-42. mx-vm (Ubuntu 26.04, GNOME/Wayland), real Tor over the direct rung, two
+Decision M1-42. The build VM (Ubuntu 26.04, GNOME/Wayland), real Tor over the direct rung, two
 instances on one machine under separate homes: `target/tornect-test/s61-host` and
 `target/tornect-test/s61-client`. Both CLIs ran under pseudo-terminals driven by the script in
 the appendix, which answers a pairing `yes` **only after comparing the code each side printed**.
