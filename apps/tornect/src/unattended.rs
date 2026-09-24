@@ -96,6 +96,13 @@ fn service_change(ctx: &HostContext, id: u64, by: Actor, install: Option<bool>) 
     };
     match install {
         Some(elevated) => {
+            // Slice-F F2-3: a running host's backend was built when the host
+            // started, from its own executable, so through it `install` would
+            // register that binary (or a path deleted since), not the
+            // `tornect` the user ran. Refused before the dialog.
+            if ctx.kill.is_some() {
+                return IpcResponse::fail(id, codes::G_PRECONDITION, HOST_ROUTE_INSTALL);
+            }
             if let Err(e) = ctx.autostart.preflight(elevated) {
                 return IpcResponse::fail(id, codes::G_PRECONDITION, e.to_string());
             }
@@ -127,7 +134,11 @@ fn service_change(ctx: &HostContext, id: u64, by: Actor, install: Option<bool>) 
     match done {
         Ok(state) => {
             let mut r = IpcResponse::ok(id);
-            r.detail = Some(describe_autostart(&*ctx.autostart, &state));
+            let mut said = describe_autostart(&*ctx.autostart, &state);
+            if install.is_none() && ctx.kill.is_some() {
+                said.push_str(HOST_KEEPS_RUNNING);
+            }
+            r.detail = Some(said);
             r
         }
         Err(e) => {
@@ -146,6 +157,16 @@ fn service_change(ctx: &HostContext, id: u64, by: Actor, install: Option<bool>) 
         }
     }
 }
+
+/// Why a running host refuses `service install` (slice-F F2-3; default 2's
+/// rule applied to install). Only Linux has a host route today.
+const HOST_ROUTE_INSTALL: &str = "a Tornect host is running; stop it (`systemctl --user stop \
+     tornect-host`, or Ctrl-C in its terminal) and run `tornect service install` again: it \
+     registers the tornect you run";
+
+/// What `service uninstall` through a running host adds (slice-F F2-3).
+const HOST_KEEPS_RUNNING: &str = "; the running host keeps running until you stop it \
+     (`systemctl --user stop tornect-host`, or Ctrl-C in its terminal)";
 
 /// One line for the operator: what is registered now, and what it runs.
 fn describe_autostart(backend: &dyn Autostart, state: &AutostartState) -> String {
@@ -2647,6 +2668,48 @@ mod tests {
         assert_eq!(refused_lines(&env.ctx, "service_install"), 1);
         assert_eq!(refused_lines(&env.ctx, "service_install_elevated"), 1);
         assert_eq!(refused_lines(&env.ctx, "service_uninstall"), 1);
+    }
+
+    /// Slice-F F2-3: through a running host, `service install` registered
+    /// the host's own executable, fixed when that host started, not the
+    /// `tornect` the user ran. The host route refuses it before the dialog;
+    /// `uninstall` still goes through the host, whose answer says that the
+    /// host keeps running.
+    #[test]
+    fn a_running_host_refuses_service_install_but_uninstalls() {
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let mut env = env_with_autostart(
+            tempfile::tempdir().unwrap(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(NoSessionActivity),
+            FakeAutostart::default(),
+        );
+        env.ctx.kill = Some(KillSwitch::new());
+        for elevated in [false, true] {
+            let resp = go(&env.ctx, IpcOp::ServiceInstall { elevated });
+            assert!(!resp.ok, "the host route installed (elevated: {elevated})");
+            assert_eq!(resp.code, codes::G_PRECONDITION, "{:?}", resp.detail);
+            let said = resp.detail.unwrap_or_default();
+            assert!(said.contains("registers the tornect you run"), "{said}");
+            assert!(
+                said.contains("systemctl --user stop tornect-host"),
+                "{said}"
+            );
+        }
+        assert!(env.autostart.installs().is_empty(), "the backend ran");
+        assert!(reauth.calls().is_empty(), "a dialog: {:?}", reauth.calls());
+        assert!(autostart_lines(&env.ctx).is_empty());
+
+        *env.autostart.state.lock().unwrap() =
+            Some(AutostartState::Registered(autostart::Registration {
+                enabled: true,
+                ..autostart::Registration::default()
+            }));
+        let resp = go(&env.ctx, IpcOp::ServiceUninstall);
+        assert!(resp.ok, "{:?}", resp.detail);
+        assert_eq!(env.autostart.uninstalls(), 1);
+        let said = resp.detail.unwrap_or_default();
+        assert!(said.contains("keeps running until you stop it"), "{said}");
     }
 
     /// With re-authentication the backend runs, the change is logged as
