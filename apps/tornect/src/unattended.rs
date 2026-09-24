@@ -1739,6 +1739,11 @@ const AFTER_LOGIN_ONLY: &str = "The host starts only after you log in: Tornect n
 const LOGIN_HOST_PINGS_ONLY: &str = "Started at login, the host answers pings only and refuses \
      every session, because it has no window or terminal to show one.";
 
+/// §B.8.7.5's opt-in copy for the elevated task, said before its dialog and
+/// again once it is registered (slice-F F1-3).
+const ELEVATED_SENTENCE: &str = "Running the host elevated makes every remote Control session an \
+     administrator session.";
+
 /// `tornect service install|uninstall|status`
 ///
 /// `install` and `uninstall` change what starts at login, which is
@@ -1752,12 +1757,19 @@ pub fn service(paths: &Paths, cmd: ServiceCmd) -> anyhow::Result<()> {
         ServiceCmd::Status => return service_status(paths),
     };
     let installing = matches!(op, IpcOp::ServiceInstall { .. });
+    let elevated = matches!(op, IpcOp::ServiceInstall { elevated: true });
+    if elevated {
+        println!("{ELEVATED_SENTENCE}");
+    }
     runtime()?.block_on(async move {
         let route = route(paths).await?;
         let resp = send(paths, &route, op).await?;
         require_ok(&resp)?;
         if let Some(d) = &resp.detail {
             println!("{d}.");
+        }
+        if elevated {
+            println!("{ELEVATED_SENTENCE}");
         }
         if installing {
             if cfg!(target_os = "linux") {
@@ -1967,6 +1979,17 @@ mod tests {
 
     fn go(ctx: &HostContext, op: IpcOp) -> IpcResponse {
         dispatch(ctx, IpcRequest { id: 1, op })
+    }
+
+    /// Slice-F F1-3: `service install --elevated` says §B.8.7.5's sentence,
+    /// word for word.
+    #[test]
+    fn the_elevated_install_says_what_it_means() {
+        assert_eq!(
+            ELEVATED_SENTENCE,
+            "Running the host elevated makes every remote Control session an administrator \
+             session."
+        );
     }
 
     /// Slice-F F2-1: what `service install` says on Linux about the host it
@@ -2600,7 +2623,10 @@ mod tests {
             }));
         for (op, name) in [
             (IpcOp::ServiceInstall { elevated: false }, "service_install"),
-            (IpcOp::ServiceInstall { elevated: true }, "service_install"),
+            (
+                IpcOp::ServiceInstall { elevated: true },
+                "service_install_elevated",
+            ),
             (IpcOp::ServiceUninstall, "service_uninstall"),
         ] {
             let resp = go(&env.ctx, op);
@@ -2613,7 +2639,10 @@ mod tests {
         );
         assert_eq!(env.autostart.uninstalls(), 0, "nothing was removed");
         assert!(autostart_lines(&env.ctx).is_empty());
-        assert_eq!(refused_lines(&env.ctx, "service_install"), 2);
+        // Slice-F F1-3: the elevated install is its own operation, so its
+        // dialog can say what it means.
+        assert_eq!(refused_lines(&env.ctx, "service_install"), 1);
+        assert_eq!(refused_lines(&env.ctx, "service_install_elevated"), 1);
         assert_eq!(refused_lines(&env.ctx, "service_uninstall"), 1);
     }
 

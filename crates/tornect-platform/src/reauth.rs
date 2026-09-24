@@ -109,6 +109,11 @@ pub fn purpose_of(op: &str) -> &'static str {
             "turn unattended access back on for this computer"
         }
         "service_install" | "service_uninstall" => "change what starts when you log in",
+        // §B.8.7.5's copy, at the moment of consent (slice-F F1-3).
+        "service_install_elevated" => {
+            "start the Tornect host ELEVATED at every login. Running the host elevated makes every \
+             remote Control session an administrator session"
+        }
         "backup_export" | "backup_import" | "identity_view" => "export or import Tornect's secrets",
         "set_settings" | "set_options" | "settings_change" => "change a Tornect security setting",
         // The strongest wording for an operation this build does not know.
@@ -487,7 +492,7 @@ impl PolkitReAuth {
             // Re-opens access that was closed.
             "master_on" | "enable" | "resume" | "unlock" => "enable",
             // Changes what runs at login.
-            "service_install" | "service_uninstall" => "autostart",
+            "service_install" | "service_install_elevated" | "service_uninstall" => "autostart",
             // Moves secrets out of the store.
             "backup_export" | "backup_import" | "identity_view" => "export",
             // Policy and settings.
@@ -690,6 +695,7 @@ mod tests {
             "set_settings",
             "set_options",
             "service_install",
+            "service_install_elevated",
             "service_uninstall",
             "backup_export",
             "backup_import",
@@ -706,6 +712,11 @@ mod tests {
             p.action_for("some_future_operation"),
             "org.tornect.grant",
             "an unknown operation must get the strongest wording, not the mildest"
+        );
+        // Slice-F F1-3: the elevated install is an autostart change.
+        assert_eq!(
+            p.action_for("service_install_elevated"),
+            "org.tornect.autostart"
         );
     }
 
@@ -1019,6 +1030,7 @@ mod tests {
             "set_settings",
             "set_options",
             "service_install",
+            "service_install_elevated",
             "service_uninstall",
             "backup_export",
             "backup_import",
@@ -1027,6 +1039,14 @@ mod tests {
         ] {
             assert!(!purpose_of(op).is_empty(), "{op}");
         }
+        // Slice-F F1-3: the dialog of the elevated install says what it means
+        // (§B.8.7.5's copy), and no other dialog says it.
+        let elevated = purpose_of("service_install_elevated");
+        assert!(
+            elevated.contains("ELEVATED") && elevated.contains("administrator session"),
+            "{elevated}"
+        );
+        assert!(!purpose_of("service_install").contains("administrator"));
         assert_eq!(
             purpose_of("service_uninstall"),
             "change what starts when you log in"
