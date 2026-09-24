@@ -1281,6 +1281,29 @@ pub struct TaskFacts {
     /// How many actions `<Actions>` holds, of any kind (review N-3: the
     /// fields above are the first `<Exec>`'s).
     pub actions: usize,
+    /// The definition holds only elements and text after one XML declaration
+    /// at its start (review P2-I2): no comment, CDATA section, DOCTYPE or
+    /// other processing instruction, which the element count and `element`
+    /// read wrong when one holds `>`.
+    pub only_elements: bool,
+}
+
+/// Whether `xml` holds only elements and text after one XML declaration at
+/// its start (`<?xml` then white space, no `<` or `>`, then `?>`; what
+/// `schtasks /Query /XML` prints first).
+fn only_elements(xml: &str) -> bool {
+    let body = xml.trim_start();
+    let body = match body.strip_prefix("<?xml") {
+        Some(rest) if rest.starts_with(|c: char| c.is_ascii_whitespace()) => {
+            match rest.find("?>") {
+                Some(end) if !rest[..end].contains(['<', '>']) => &rest[end + 2..],
+                _ => return false,
+            }
+        }
+        Some(_) => return false,
+        None => body,
+    };
+    !body.contains("<!") && !body.contains("<?")
 }
 
 /// The number of elements directly inside `body`, an element's content.
@@ -1317,11 +1340,13 @@ pub fn task_facts(xml: &str) -> TaskFacts {
         command: text(exec.and_then(|e| element(e, "Command"))),
         arguments: text(exec.and_then(|e| element(e, "Arguments"))),
         actions: element(xml, "Actions").map_or(0, child_elements),
+        only_elements: only_elements(xml),
     }
 }
 
 /// Whether the task the Task Scheduler holds (`registered`) is the one
-/// Tornect wrote (`written`): exactly one action in each (review N-3: a
+/// Tornect wrote (`written`): only elements and text after the XML
+/// declaration (review P2-I2), exactly one action in each (review N-3: a
 /// second one would run too), run as this account (`is_this_account`, which
 /// also takes the name form the scheduler may print), at the same run level,
 /// the same command (case-folded: a Windows path) and the same arguments. `Err` says what differs (slice-F F1-2: the definition file sat
@@ -1337,6 +1362,13 @@ pub fn registered_matches(
             .unwrap_or_else(|| "LeastPrivilege".into())
     };
     let mut differs = Vec::new();
+    if !written.only_elements || !registered.only_elements {
+        differs.push(
+            "it holds a comment, CDATA section or processing instruction, which could hide \
+             markup"
+                .to_owned(),
+        );
+    }
     if written.actions != 1 || registered.actions != 1 {
         differs.push(format!("it holds {} actions, not one", registered.actions));
     }
@@ -2411,6 +2443,48 @@ mod tests {
                     "{swap:?} (elevated: {elevated}): still registered"
                 );
             }
+        }
+    }
+
+    /// Review P2-I2: a comment or CDATA section that holds `>` ends early for
+    /// the element count and opens a phantom element, which hides a second
+    /// action; a definition that holds one, a DOCTYPE, or a processing
+    /// instruction after its one XML declaration is not the one written. The
+    /// declaration the fixture (and `schtasks /Query /XML`) starts with is
+    /// accepted.
+    #[test]
+    fn markup_that_could_hide_an_action_is_not_the_one_written() {
+        let plain = written(false);
+        assert!(
+            plain.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n<Task "),
+            "{plain}"
+        );
+        let me = |p: &str| p.eq_ignore_ascii_case(SID);
+        assert_eq!(
+            registered_matches(&task_facts(&plain), &task_facts(&plain), &me),
+            Ok(())
+        );
+        let second = "<Exec><Command>C:\\Users\\Public\\evil.exe</Command></Exec>";
+        for hide in [
+            "<WorkingDirectory><![CDATA[ > <x> ]]></WorkingDirectory>",
+            "<!-- > <x> -->",
+            "<?tornect > <x> ?>",
+        ] {
+            let two = plain
+                .replace("</Arguments>", &format!("</Arguments>{hide}"))
+                .replace("</Exec>", &format!("</Exec>{second}"));
+            assert!(
+                registered_matches(&task_facts(&plain), &task_facts(&two), &me).is_err(),
+                "{hide} hid a second action"
+            );
+        }
+        for extra in ["<!DOCTYPE Task>", "<?xml-stylesheet href=\"x\"?>"] {
+            let marked = plain.replace("\r\n<Task ", &format!("\r\n{extra}<Task "));
+            assert_ne!(marked, plain);
+            assert!(
+                registered_matches(&task_facts(&plain), &task_facts(&marked), &me).is_err(),
+                "{extra} was taken"
+            );
         }
     }
 
