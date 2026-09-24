@@ -64,7 +64,9 @@ keys typed for another program never answer it. Deny also works from the keyboar
 The picture opens in its own window; "End the session" or closing that window
 ends it. While your screen is shared, a banner and a small "Tornect: sharing"
 window show it, each with **Stop**. `./tornect gui --no-host` only connects to
-others, publishing no ID and answering no one.
+others, publishing no ID and answering no one. Ctrl-C in the terminal that
+started the window, or a `kill`, closes it the same way, ending every session
+with a goodbye.
 
 **The command line** does the same, one role per terminal:
 
@@ -102,10 +104,11 @@ Extract All, and keep `pt\` beside `tornect.exe`. Windows may warn that the
 program is not recognised: it is not code-signed.
 
 Double-clicking `tornect.exe` opens the window **and a console window**:
-`tornect.exe` is a console program. Closing that console, or pressing Ctrl-C in
-it, should close Tornect at once (not yet tried on Windows); close the main
-window instead to leave with a goodbye to the other side. The window works as on
-Linux above; Windows asks for no grant.
+`tornect.exe` is a console program. Ctrl-C (or Ctrl-Break) in that console
+closes Tornect as the main window's close button does, ending every session with
+a goodbye to the other side; closing the console window itself ends Tornect at
+once, without it (neither yet tried on Windows). The window works as on Linux
+above; Windows asks for no grant.
 
 From a console in the folder (`cmd` or PowerShell):
 
