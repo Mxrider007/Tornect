@@ -33,6 +33,15 @@ pub mod reauth;
 #[cfg(windows)]
 mod win;
 
+/// Restrict this process's run-time DLL loads that name no folder to the
+/// Windows system directory (review finding E2-4), so none searches the
+/// current directory, `PATH` or the executable's folder. `main` calls it
+/// first.
+#[cfg(windows)]
+pub fn restrict_dll_search() -> std::io::Result<()> {
+    win::restrict_dll_search()
+}
+
 /// This user's profile folder (`FOLDERID_Profile`, `C:\Users\<name>`), from
 /// the OS rather than from the environment, which whoever starts Tornect
 /// controls (review findings E2-2 and F1-4).

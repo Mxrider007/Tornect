@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use egui::ViewportId;
 use egui_wgpu::winit::Painter;
-use egui_wgpu::{RendererOptions, WgpuConfiguration, WgpuSetup, WgpuSetupExisting};
+use egui_wgpu::{
+    RendererOptions, WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew, WgpuSetupExisting,
+};
 use tokio::sync::mpsc;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -78,6 +80,27 @@ fn ask_attention(window: &impl Attention) {
         window.set_minimized(false);
     }
     window.request_user_attention(Some(UserAttentionType::Critical));
+}
+
+/// DX12's options for every wgpu instance this app creates: the FXC shader
+/// compiler (`d3dcompiler_47.dll`, part of Windows 10 and later), never DXC,
+/// whose `dxcompiler.dll` is not part of Windows and which wgpu's default
+/// (`Auto`) loads by name (review finding E2-4); and nothing from the
+/// `WGPU_DX12_*` variables, the Agility SDK's DLL path among them. Only the
+/// Windows build has a DX12 backend; elsewhere the options are unused.
+fn dx12_options() -> wgpu::Dx12BackendOptions {
+    wgpu::Dx12BackendOptions {
+        shader_compiler: wgpu::Dx12Compiler::Fxc,
+        ..wgpu::Dx12BackendOptions::default()
+    }
+}
+
+/// A new wgpu instance, adapter and device for a window, with
+/// [`dx12_options`].
+fn new_device(display: impl egui_wgpu::EguiDisplayHandle) -> WgpuSetup {
+    let mut setup = WgpuSetupCreateNew::from_display_handle(display);
+    setup.instance_descriptor.backend_options.dx12 = dx12_options();
+    WgpuSetup::CreateNew(setup)
 }
 
 /// One window with its egui context, input state and painter.
@@ -313,7 +336,7 @@ impl App {
             .as_ref()
             .and_then(|m| m.painter.render_state())
             .map_or_else(
-                || WgpuSetup::from_display_handle(el.owned_display_handle()),
+                || new_device(el.owned_display_handle()),
                 |rs| {
                     WgpuSetup::Existing(WgpuSetupExisting {
                         instance: rs.instance.clone(),
@@ -589,11 +612,7 @@ impl ApplicationHandler<UserEvent> for App {
         let attrs = Window::default_attributes()
             .with_title(self.title)
             .with_inner_size(LogicalSize::new(560.0, 720.0));
-        match Surface::new(
-            el,
-            attrs,
-            WgpuSetup::from_display_handle(el.owned_display_handle()),
-        ) {
+        match Surface::new(el, attrs, new_device(el.owned_display_handle())) {
             Ok(surface) => {
                 self.main = Some(surface);
                 self.sync_indicator(el);
@@ -730,6 +749,41 @@ mod tests {
 
     use super::super::model::Model;
     use super::*;
+
+    /// Review finding E2-4: DX12 compiles shaders with FXC, whatever the
+    /// environment says, so wgpu never looks for `dxcompiler.dll` by name, and
+    /// no Agility SDK DLL path comes from `WGPU_DX12_AGILITY_SDK_PATH`.
+    #[test]
+    fn the_gpu_never_loads_a_shader_compiler_by_name() {
+        let dx12 = dx12_options();
+        assert!(
+            matches!(dx12.shader_compiler, wgpu::Dx12Compiler::Fxc),
+            "{:?}",
+            dx12.shader_compiler
+        );
+        assert!(dx12.agility_sdk.is_none(), "{:?}", dx12.agility_sdk);
+        /// A display that has no handle: `new_device` only stores it.
+        #[derive(Debug, Clone)]
+        struct NoDisplay;
+        impl wgpu::rwh::HasDisplayHandle for NoDisplay {
+            fn display_handle(
+                &self,
+            ) -> Result<wgpu::rwh::DisplayHandle<'_>, wgpu::rwh::HandleError> {
+                Err(wgpu::rwh::HandleError::Unavailable)
+            }
+        }
+        let WgpuSetup::CreateNew(setup) = new_device(NoDisplay) else {
+            panic!("a window gets a new device");
+        };
+        assert!(matches!(
+            setup
+                .instance_descriptor
+                .backend_options
+                .dx12
+                .shader_compiler,
+            wgpu::Dx12Compiler::Fxc
+        ));
+    }
 
     /// A window call, as the recorder saw it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
