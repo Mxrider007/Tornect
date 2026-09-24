@@ -713,11 +713,24 @@ pub(crate) fn remember_token(file: &Path, token: Option<&str>) {
         && !dir.exists()
         && let Err(e) = tornect_core::keystore::create_private_dir(dir)
     {
-        tracing::warn!(error = %e, "cannot keep the portal restore token; the desktop will ask again");
+        cannot_keep(&e);
         return;
     }
     if let Err(e) = tornect_core::keystore::write_private_file(file, token.as_bytes()) {
-        tracing::warn!(error = %e, "cannot keep the portal restore token; the desktop will ask again");
+        cannot_keep(&e);
+    }
+}
+
+/// Say that the token could not be kept, with the error's kind and never its
+/// text: the keystore's errors come from fs-err, which puts the file's path in
+/// the text (slice-G G1-2).
+fn cannot_keep(e: &tornect_core::CoreError) {
+    match e {
+        tornect_core::CoreError::Io(io) => tracing::warn!(
+            kind = ?io.kind(),
+            "cannot keep the portal restore token; the desktop will ask again"
+        ),
+        _ => tracing::warn!("cannot keep the portal restore token; the desktop will ask again"),
     }
 }
 
@@ -904,7 +917,8 @@ mod tests {
 
     /// The restore token's file stays out of every log line (the slice-D
     /// review's addendum): a log can travel where the state directory does not,
-    /// and the path says where the bearer grant lies.
+    /// and the path says where the bearer grant lies. That includes a token
+    /// that cannot be written, whose error names the file (slice-G G1-2).
     #[test]
     fn no_log_line_names_the_restore_token_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -917,9 +931,16 @@ mod tests {
             assert_eq!(read_token(&malformed), None);
             assert_eq!(read_token(&unreadable), None);
             forget_token(&unreadable);
+            // The file is a directory: it cannot be opened for writing.
+            remember_token(&unreadable, Some("a-token"));
+            // Its directory would lie under a regular file: it cannot be made.
+            remember_token(
+                &malformed.join("sub").join("portal-restore-token"),
+                Some("a-token"),
+            );
         });
         let lines = lines.lock().unwrap();
-        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines.len(), 5, "{lines:?}");
         let root = dir.path().display().to_string();
         for line in lines.iter() {
             assert!(!line.contains(&root), "{line}");
