@@ -633,7 +633,10 @@ impl From<PresetArg> for Preset {
 pub enum ServiceCmd {
     /// Register Tornect to start at login.
     Install {
-        /// Windows only: an elevated task (§B.8.7.5 — opt-in, admin sessions).
+        /// Windows only, and an administrator account only: an elevated task
+        /// (§B.8.7.5, opt-in). Every remote Control session is then an
+        /// administrator session. A standard account is refused: approved
+        /// with another account's password, the task would be that account's.
         #[arg(long)]
         elevated: bool,
     },
