@@ -1146,6 +1146,39 @@ mod tests {
         assert_eq!(control.kill_path(), "Ctrl-C in this terminal");
     }
 
+    /// What a host killed mid-run leaves behind (a crash, SIGKILL, or the
+    /// window before it handled SIGTERM): `state/host.lock` with a dead pid
+    /// and `state/ipc.sock` with nobody listening. Neither blocks the next
+    /// host: the lock is the OS's and died with its process, and a socket that
+    /// refuses connections is replaced.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn what_a_killed_host_leaves_behind_never_blocks_the_next() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        std::fs::write(paths.host_lock(), b"4242").unwrap();
+        let socket = paths.state_dir.join("ipc.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        assert!(socket.exists(), "the dead host's socket stays on disk");
+        assert_eq!(HostLock::holder(&paths), None, "no live holder");
+        let _lock = HostLock::acquire(&paths).expect("the lock is free");
+        let control = ControlChannel::default();
+        let served = start_control_channel(
+            &paths,
+            Err("no store in this test".to_owned()),
+            KillSwitch::new(),
+            control.clone(),
+        )
+        .await
+        .expect("a stale socket is replaced");
+        assert!(served.is_some() && control.is_up());
+        assert!(tornect_platform::ipc::is_running(&paths.state_dir).await);
+        if let Some(task) = served {
+            task.abort();
+        }
+    }
+
     /// One host per state directory, and every other command can see it: the
     /// lock names its holder while the host runs and is gone when it ends.
     #[test]
