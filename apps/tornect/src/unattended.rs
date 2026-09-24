@@ -125,6 +125,20 @@ fn service_change(ctx: &HostContext, id: u64, by: Actor, install: Option<bool>) 
         },
     }
     if let Err(ref e) = ctx.guard.authorize(by, &op) {
+        // Slice-F F2-4: while the keystore cannot be read, a removal is refused
+        // too (its line could only be buffered). Say first how to do it by
+        // hand: the detail is cut at `MAX_STRING` characters.
+        if install.is_none() && matches!(e, GuardError::KeystoreLocked(_)) {
+            return IpcResponse::fail(
+                id,
+                e.code(),
+                format!(
+                    "the keystore cannot be read, so this removal could not be logged and was \
+                     refused; {} ({e})",
+                    ctx.autostart.manual_removal()
+                ),
+            );
+        }
         return guard_fail(id, e);
     }
     let done = match install {
@@ -944,8 +958,8 @@ async fn route(paths: &Paths) -> anyhow::Result<Route> {
             "{}; {}, then run this again",
             unreachable_host(paths, &holder),
             if cfg!(windows) {
-                // The orchestrator's default 2 (slice F): every Windows change
-                // runs with no host running, the start-at-login one included.
+                // Default 2 (slice F): every Windows change runs with no host
+                // running, the start-at-login one included.
                 "if it is the start-at-login host, it runs in its own console window: press \
                  Ctrl-C in that window (or in the terminal of a host you started)"
             } else {
@@ -1935,6 +1949,10 @@ mod tests {
         fn describe(&self) -> String {
             "the test's start-at-login backend".to_owned()
         }
+
+        fn manual_removal(&self) -> String {
+            "remove it by hand as the test says".to_owned()
+        }
     }
 
     /// A context wired like the offline CLI, but with re-authentication
@@ -2710,6 +2728,56 @@ mod tests {
         assert_eq!(env.autostart.uninstalls(), 1);
         let said = resp.detail.unwrap_or_default();
         assert!(said.contains("keeps running until you stop it"), "{said}");
+    }
+
+    /// Slice-F F2-4's side effect: while the keystore cannot be read, `service
+    /// uninstall` is refused as well (its line could only be buffered), and
+    /// the refusal says how to remove the registration by hand.
+    #[cfg(unix)]
+    #[test]
+    fn an_uninstall_the_keystore_refuses_names_the_manual_removal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let registered = || FakeAutostart {
+            state: std::sync::Mutex::new(Some(AutostartState::Registered(
+                autostart::Registration {
+                    enabled: true,
+                    ..autostart::Registration::default()
+                },
+            ))),
+            ..FakeAutostart::default()
+        };
+        // Unattended access turned on once: the master key exists.
+        let env = env_with_autostart(
+            tempfile::tempdir().unwrap(),
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            registered(),
+        );
+        assert!(go(&env.ctx, IpcOp::On).ok);
+        let Env { _tmp: tmp, ctx, .. } = env;
+        drop(ctx);
+        // Now the keystore cannot be read.
+        let key = Paths::from_home(tmp.path()).keys_dir().join(format!(
+            "{}.secret",
+            tornect_core::unattended::codec::MASTER_KEY_ENTRY
+        ));
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let env = env_with_autostart(
+            tmp,
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            registered(),
+        );
+        let resp = go(&env.ctx, IpcOp::ServiceUninstall);
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!resp.ok, "removed while the keystore was unreadable");
+        assert_eq!(resp.code, codes::G_KEYSTORE_LOCKED, "{:?}", resp.detail);
+        let said = resp.detail.unwrap_or_default();
+        assert!(
+            said.contains("remove it by hand as the test says"),
+            "{said}"
+        );
+        assert_eq!(env.autostart.uninstalls(), 0);
     }
 
     /// With re-authentication the backend runs, the change is logged as
