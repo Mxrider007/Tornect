@@ -1,24 +1,25 @@
 //! The Win32 calls behind [`crate::autostart`] (the task's paths, SID and UAC
-//! prompt) and [`crate::reauth`] (the secure credential prompt and
-//! `LogonUserW`). Every `unsafe` block is a plain FFI call whose preconditions
-//! are stated next to it; the logic that decides what to do with the answers
-//! lives in the cross-platform modules, where it is tested on every OS.
+//! prompt), [`crate::reauth`] (the secure credential prompt and `LogonUserW`)
+//! and the process-wide DLL search restriction. Every `unsafe` block is a
+//! plain FFI call whose preconditions are stated next to it; the logic that
+//! decides what to do with the answers lives in the cross-platform modules,
+//! where it is tested on every OS.
 #![allow(unsafe_code)]
 
-use std::ffi::{OsStr, OsString, c_void};
+use std::ffi::{CStr, OsStr, OsString, c_void};
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_CANCELLED, ERROR_LOGON_FAILURE, GetLastError, HANDLE, HLOCAL, LocalFree,
-    NO_ERROR,
+    CloseHandle, ERROR_CANCELLED, ERROR_LOGON_FAILURE, FreeLibrary, GetLastError, HANDLE, HLOCAL,
+    HMODULE, LocalFree, NO_ERROR,
 };
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::Credentials::{
-    CRED_MAX_CREDENTIAL_BLOB_SIZE, CRED_PACK_PROTECTED_CREDENTIALS, CREDUI_INFOW,
-    CREDUI_MAX_DOMAIN_TARGET_LENGTH, CREDUI_MAX_USERNAME_LENGTH, CREDUIWIN_SECURE_PROMPT,
-    CredUIPromptForWindowsCredentialsW, CredUnPackAuthenticationBufferW,
+    CRED_MAX_CREDENTIAL_BLOB_SIZE, CRED_PACK_FLAGS, CRED_PACK_PROTECTED_CREDENTIALS, CREDUI_INFOW,
+    CREDUI_MAX_DOMAIN_TARGET_LENGTH, CREDUI_MAX_USERNAME_LENGTH, CREDUIWIN_FLAGS,
+    CREDUIWIN_SECURE_PROMPT,
 };
 use windows_sys::Win32::Security::{
     EqualSid, GetTokenInformation, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, LogonUserW,
@@ -26,6 +27,9 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW, SetDefaultDllDirectories,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{
@@ -36,10 +40,69 @@ use windows_sys::Win32::UI::Shell::{
     SHELLEXECUTEINFOW, SHGetKnownFolderPath, ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+use windows_sys::core::{BOOL, PWSTR};
 
 /// `s` as a NUL-terminated UTF-16 string.
 pub(crate) fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// Restrict every run-time DLL load of this process that names no folder to
+/// the system directory: `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`
+/// (review finding E2-4). Such a load then never searches the executable's
+/// folder, the current directory or `PATH`. Load-time imports are resolved
+/// before `main` and are not affected (see `CredUi`).
+pub(crate) fn restrict_dll_search() -> std::io::Result<()> {
+    // SAFETY: plain call with one of the documented flag values.
+    if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// A DLL loaded at run time from the system directory, freed on drop.
+struct SystemModule {
+    handle: HMODULE,
+    name: &'static str,
+}
+
+impl SystemModule {
+    /// `name` from the system directory only: `LOAD_LIBRARY_SEARCH_SYSTEM32`
+    /// covers the DLL's own dependencies too, and never searches the
+    /// executable's folder, the current directory or `PATH` (review note P-2).
+    fn load(name: &'static str) -> std::io::Result<Self> {
+        let file = wide(name);
+        // SAFETY: `file` is NUL-terminated and outlives the call; the reserved
+        // file handle is null, as the API requires.
+        let handle =
+            unsafe { LoadLibraryExW(file.as_ptr(), null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { handle, name })
+    }
+
+    /// The address of the export `symbol`.
+    fn export(&self, symbol: &CStr) -> std::io::Result<unsafe extern "system" fn() -> isize> {
+        // SAFETY: `self.handle` is a module loaded by `load` and freed only on
+        // drop; `symbol` is NUL-terminated and outlives the call.
+        unsafe { GetProcAddress(self.handle, symbol.as_ptr().cast()) }.ok_or_else(|| {
+            std::io::Error::other(format!(
+                "{} has no export {}: {}",
+                self.name,
+                symbol.to_string_lossy(),
+                std::io::Error::last_os_error()
+            ))
+        })
+    }
+}
+
+impl Drop for SystemModule {
+    fn drop(&mut self) {
+        // SAFETY: the module was loaded by `load` and is freed exactly once,
+        // here; its owner drops it after its last call into it.
+        unsafe { FreeLibrary(self.handle) };
+    }
 }
 
 /// A handle closed on drop.
@@ -291,6 +354,66 @@ use crate::reauth::{
 /// `CREDUI_MAX_PASSWORD_LENGTH` of `wincred.h` (not in `windows-sys`).
 const MAX_PASSWORD_CHARS: usize = (CRED_MAX_CREDENTIAL_BLOB_SIZE / 2) as usize;
 
+/// `CredUIPromptForWindowsCredentialsW`, as `credui.dll` exports it
+/// (`wincred.h`; the declaration windows-sys generates for it).
+type CredUiPromptFn = unsafe extern "system" fn(
+    *const CREDUI_INFOW,
+    u32,
+    *mut u32,
+    *const c_void,
+    u32,
+    *mut *mut c_void,
+    *mut u32,
+    *mut BOOL,
+    CREDUIWIN_FLAGS,
+) -> u32;
+
+/// `CredUnPackAuthenticationBufferW`, as `credui.dll` exports it.
+type CredUnpackFn = unsafe extern "system" fn(
+    CRED_PACK_FLAGS,
+    *const c_void,
+    u32,
+    PWSTR,
+    *mut u32,
+    PWSTR,
+    *mut u32,
+    PWSTR,
+    *mut u32,
+) -> BOOL;
+
+/// CredUI's two entry points, from `credui.dll` loaded out of the system
+/// directory for one prompt (review note P-2). As a load-time import the
+/// loader resolved `credui.dll`, which is not a KnownDLL, from the
+/// executable's folder first, before `main` could restrict anything, and it
+/// was loaded into every `tornect.exe`, the start-at-login host included.
+struct CredUi {
+    prompt: CredUiPromptFn,
+    unpack: CredUnpackFn,
+    /// Freed last, when the prompt is done with the entry points above.
+    _module: SystemModule,
+}
+
+impl CredUi {
+    fn load() -> std::io::Result<Self> {
+        let module = SystemModule::load("credui.dll")?;
+        let prompt = module.export(c"CredUIPromptForWindowsCredentialsW")?;
+        let unpack = module.export(c"CredUnPackAuthenticationBufferW")?;
+        // SAFETY: the two exports have exactly these signatures (`wincred.h`),
+        // and a function pointer becomes a function pointer of the same size.
+        let (prompt, unpack) = unsafe {
+            (
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, CredUiPromptFn>(prompt),
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, CredUnpackFn>(unpack),
+            )
+        };
+        Ok(Self {
+            prompt,
+            unpack,
+            _module: module,
+        })
+    }
+}
+
 /// The prompt's output buffer: wiped, then freed with `CoTaskMemFree`.
 struct CredBlob {
     ptr: *mut c_void,
@@ -322,6 +445,15 @@ pub(crate) struct SecurePrompt;
 
 impl CredentialPrompt for SecurePrompt {
     fn prompt(&self, purpose: &str) -> PromptOutcome {
+        let credui = match CredUi::load() {
+            Ok(c) => c,
+            Err(e) => {
+                return PromptOutcome::Failed(format!(
+                    "loading the Windows credential prompt (credui.dll from the system \
+                     directory): {e}"
+                ));
+            }
+        };
         let caption = wide("Tornect");
         let message = wide(format!("Tornect needs your Windows password to {purpose}."));
         let info = CREDUI_INFOW {
@@ -340,7 +472,7 @@ impl CredentialPrompt for SecurePrompt {
         // answers; on success `out` is a `CoTaskMemAlloc` buffer of `out_len`
         // bytes that `CredBlob` wipes and frees.
         let rc = unsafe {
-            CredUIPromptForWindowsCredentialsW(
+            (credui.prompt)(
                 &info,
                 0,
                 &mut package,
@@ -377,7 +509,7 @@ impl CredentialPrompt for SecurePrompt {
             // SAFETY: `blob` is the prompt's buffer (above); each output buffer
             // is writable for the length passed with it, in characters.
             let ok = unsafe {
-                CredUnPackAuthenticationBufferW(
+                (credui.unpack)(
                     flags,
                     blob.ptr,
                     blob.len,

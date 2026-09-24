@@ -224,6 +224,12 @@ enum ConfigAction {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Review finding E2-4: before anything can load a DLL by name, run-time
+    // loads are restricted to the system directory (never the current
+    // directory, `PATH` or this executable's folder).
+    #[cfg(windows)]
+    tornect_platform::restrict_dll_search()
+        .context("restricting where Windows may load DLLs from")?;
     let cli = Cli::parse();
     let _log_guard = telemetry::init(LogOptions {
         filter: cli.log.clone(),
