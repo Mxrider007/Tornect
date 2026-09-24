@@ -592,6 +592,8 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
     if let Some(hosted) = &hosted {
         let grace = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         loop {
+            // A session that goes live during the grace ends too (P2-I4).
+            hosted.serving.1.kill.kill(bye::USER);
             while media_streams.try_join_next().is_some() {}
             let busy = hosted.serving.1.stats.streams.load(Ordering::SeqCst) > 0
                 || !media_streams.is_empty();
@@ -628,23 +630,44 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
 /// How long the viewed session's goodbye may take when the window closes.
 const VIEWER_GOODBYE: Duration = Duration::from_secs(6);
 
+/// How often the shutdown fires the host-wide kill again while it waits.
+const REKILL_EVERY: Duration = Duration::from_millis(100);
+
 /// The sessions' end when the window closes (its close button, Ctrl-C or
 /// SIGTERM): first every hosted session gets its `BYE` through the host-wide
 /// kill, so this screen stops being shared at once; then the viewed session
 /// says goodbye, which Tor may stall for up to [`VIEWER_GOODBYE`]. In the
 /// other order a remote controller kept this desktop for those seconds
 /// (review N-4).
+///
+/// A kill ends only the sessions armed before it, and a session can still go
+/// live after the first one: a stream accepted just before the close whose
+/// peer has unattended rights, or whose consent is clicked while the window
+/// closes. So the kill fires again every [`REKILL_EVERY`] while the goodbye
+/// waits, and once more at the end (review P2-I4); the caller does the same
+/// through its grace period.
 async fn end_sessions(
     viewing: Option<(watch::Sender<bool>, JoinHandle<()>)>,
     hosted_kill: Option<&KillSwitch>,
 ) {
-    if let Some(kill) = hosted_kill {
-        kill.kill(bye::USER);
-    }
+    let kill = || {
+        if let Some(kill) = hosted_kill {
+            kill.kill(bye::USER);
+        }
+    };
+    kill();
     if let Some((stop, task)) = viewing {
         let _ = stop.send(true);
-        let _ = tokio::time::timeout(VIEWER_GOODBYE, task).await;
+        let goodbye = tokio::time::timeout(VIEWER_GOODBYE, task);
+        tokio::pin!(goodbye);
+        loop {
+            tokio::select! {
+                _ = &mut goodbye => break,
+                () = tokio::time::sleep(REKILL_EVERY) => kill(),
+            }
+        }
     }
+    kill();
 }
 
 /// The Stop of the banner and of the indicator window: the host-wide kill with
@@ -839,6 +862,32 @@ mod tests {
             fired,
             Some(bye::USER),
             "the hosted session was still shared while the viewed goodbye waited"
+        );
+        assert!(waiting, "the viewed session got no time for its goodbye");
+    }
+
+    /// Review P2-I4: a session that goes live while the viewed session's
+    /// goodbye stalls (it armed after the shutdown kill: a peer with
+    /// unattended rights, or a consent clicked while the window closes) is
+    /// ended too, while the goodbye still waits.
+    #[tokio::test]
+    async fn a_session_that_goes_live_during_the_goodbye_is_ended_too() {
+        let kill = KillSwitch::new();
+        let (stop, _stopped) = watch::channel(false);
+        let stalled = tokio::spawn(std::future::pending::<()>());
+        let hosted = kill.clone();
+        let ending =
+            tokio::spawn(async move { end_sessions(Some((stop, stalled)), Some(&hosted)).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // A session accepted now, after the shutdown kill.
+        let mut late = kill.arm();
+        let ended = tokio::time::timeout(Duration::from_secs(1), late.killed()).await;
+        let waiting = !ending.is_finished();
+        ending.abort();
+        assert_eq!(
+            ended.ok(),
+            Some(bye::USER),
+            "a session that went live during the goodbye stayed live"
         );
         assert!(waiting, "the viewed session got no time for its goodbye");
     }

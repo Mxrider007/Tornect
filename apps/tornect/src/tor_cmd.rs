@@ -408,6 +408,9 @@ async fn run_host(
     deps.kill.kill(bye::USER);
     let grace = tokio::time::Instant::now() + SHUTDOWN_GRACE;
     loop {
+        // A kill ends only the sessions armed before it: one that goes live
+        // during the grace (a consent answered just now) ends too (P2-I4).
+        deps.kill.kill(bye::USER);
         while media_streams.try_join_next().is_some() {}
         let busy = deps.stats.streams.load(Ordering::SeqCst) > 0 || !media_streams.is_empty();
         if !busy || tokio::time::Instant::now() >= grace {
