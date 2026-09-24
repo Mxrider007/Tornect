@@ -57,6 +57,8 @@ rustls.workspace = true
 tempfile.workspace = true
 proptest.workspace = true
 anyhow.workspace = true
+# SLICE-E E2-7: a test reads the log lines the FSMs write.
+tracing-subscriber.workspace = true
 # `tokio::time::pause` / `start_paused` for the timeout tests (§B.8.4.5 timers).
 tokio = { workspace = true, features = ["test-util"] }
 

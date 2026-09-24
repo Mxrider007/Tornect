@@ -223,7 +223,7 @@ impl AdminAuthority for GuardAdmin {
                 // `MutationGuard::admin` treats every write after a commit as
                 // best-effort — so `AdminEffect::None` is the truth, not a loss;
                 // the guard logs the attempt as a failed `AdminRequest`.
-                tracing::warn!(peer = %requester, op = op.name(), error = %e, "admin command failed");
+                tracing::warn!(peer = ?requester, op = op.name(), error = %e, "admin command failed");
                 AdminOutcome {
                     ok: false,
                     detail: Some(format!(
@@ -574,7 +574,7 @@ impl UnattendedAuth {
                 Ok(v) => v,
                 Err(e) => {
                     let _ = self.limiter.settle(&device, Settle::Fail(FailKind::BadKe3));
-                    tracing::warn!(peer = %device, error = %e, "ServerLogin::start failed");
+                    tracing::warn!(peer = ?device, error = %e, "ServerLogin::start failed");
                     return Ok(UnattendedVerdict::Reject(SessionReject::new(
                         reject::AUTH_FAILED,
                     )));
@@ -760,7 +760,7 @@ impl UnattendedAuth {
         };
         let outcome = self.admin.execute(device, op);
         tracing::info!(
-            peer = %device,
+            peer = ?device,
             op = op.name(),
             ok = outcome.ok,
             "admin command"
