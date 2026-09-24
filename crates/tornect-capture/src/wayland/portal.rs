@@ -336,27 +336,59 @@ fn run(
             close(&session).await;
             return;
         }
-        loop {
-            let call = tokio::select! {
-                call = calls.recv() => call,
-                () = ended(&mut closed) => {
-                    over.store(true, Ordering::SeqCst);
-                    tracing::info!("the desktop ended the screen-sharing session");
-                    return;
-                }
-            };
-            let Some(call) = call else { break };
-            match tokio::time::timeout(INPUT_WAIT, notify(&remote, &session, node_id, call)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::debug!(error = %e, kind = call.kind(), "the portal refused an input event");
-                }
-                Err(_) => tracing::debug!(kind = call.kind(), "an input event timed out at the portal"),
-            }
-        }
+        let (remote, session) = (&remote, &session);
+        let passed = pass_on(&mut calls, &mut closed, move |call| {
+            notify(remote, session, node_id, call)
+        })
+        .await;
         over.store(true, Ordering::SeqCst);
-        close(&session).await;
+        if passed == PassedOn::DesktopEnded {
+            tracing::info!("the desktop ended the screen-sharing session");
+            return;
+        }
+        close(session).await;
     });
+}
+
+/// How [`pass_on`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PassedOn {
+    /// Every handle is gone and the queue is empty: the caller closes the
+    /// session.
+    HandlesGone,
+    /// The desktop ended the session itself.
+    DesktopEnded,
+}
+
+/// Pass the queued input calls on to `notify`, each bounded by
+/// [`INPUT_WAIT`], until every handle is gone or the desktop ends the
+/// session (`closed`).
+pub(super) async fn pass_on<S, F, Fut>(
+    calls: &mut mpsc::Receiver<Call>,
+    closed: &mut Option<S>,
+    mut notify: F,
+) -> PassedOn
+where
+    S: futures::Stream + Unpin,
+    F: FnMut(Call) -> Fut,
+    Fut: Future<Output = Result<(), ashpd::Error>>,
+{
+    loop {
+        let call = tokio::select! {
+            call = calls.recv() => call,
+            () = ended(closed) => return PassedOn::DesktopEnded,
+        };
+        let Some(call) = call else {
+            return PassedOn::HandlesGone;
+        };
+        match tokio::time::timeout(INPUT_WAIT, notify(call)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, kind = call.kind(), "the portal refused an input event");
+            }
+            Err(_) => tracing::debug!(kind = call.kind(), "an input event timed out at the portal"),
+        }
+    }
 }
 
 /// Resolves when the session's `Closed` signal arrives (or its stream ends).
