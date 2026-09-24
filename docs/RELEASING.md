@@ -39,7 +39,9 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
    nasm, `zip`/`unzip`, binutils (`strip`, `readelf`, `objdump`), `gpg` + `gpgv`, cargo-deny with
    the fetched advisory database, the pinned toolchain's `rust-docs` component (the standard
    library's notices), and `curl` and the network the first time (the tor-expert-bundles). First it
-   runs the gate's `cargo deny --offline check` and refuses to go on without an advisory database.
+   runs the gate's `cargo deny --offline check` and refuses to go on without an advisory database,
+   or with one more than 7 days old (review note I-2; `--allow-old-advisory-db` overrides that,
+   and the release notes must then say so); it prints the database's age.
    Per platform it:
    - fetches or re-checks lyrebird (`cargo xtask pt-fetch`, `packaging/pt/SOURCES.md`);
    - runs `cargo build --locked --release --target <triple> -p tornect` into `target/dist/cargo/`

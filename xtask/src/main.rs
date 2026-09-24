@@ -47,7 +47,8 @@ fn main() -> anyhow::Result<()> {
             eprintln!(
                 "usage: cargo xtask <verify [--no-tests] | lint-all \
                  | pt-fetch [--linux] [--windows] [--offline] \
-                 | dist [--linux] [--windows] [--allow-dirty] | ffmpeg-fetch | soak>"
+                 | dist [--linux] [--windows] [--allow-dirty] [--allow-old-advisory-db] \
+                 | ffmpeg-fetch | soak>"
             );
             std::process::exit(2);
         }

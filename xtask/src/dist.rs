@@ -94,14 +94,17 @@ impl Platform {
 
 pub fn dist(root: &Path, args: &[String]) -> anyhow::Result<()> {
     let mut allow_dirty = false;
+    let mut allow_old_db = false;
     let mut platforms = Vec::new();
     for arg in args {
         match arg.as_str() {
             "--linux" => platforms.push(LINUX),
             "--windows" => platforms.push(WINDOWS),
             "--allow-dirty" => allow_dirty = true,
+            "--allow-old-advisory-db" => allow_old_db = true,
             other => bail!(
-                "dist: unknown argument `{other}` (expected --linux, --windows or --allow-dirty)"
+                "dist: unknown argument `{other}` (expected --linux, --windows, --allow-dirty or \
+                 --allow-old-advisory-db)"
             ),
         }
     }
@@ -129,6 +132,20 @@ pub fn dist(root: &Path, args: &[String]) -> anyhow::Result<()> {
     // database on disk; BUILD-INFO.txt names that database's commit and date.
     let deny = crate::deny(root)?;
     let db = deny.db.clone();
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .context("the clock is before 1970")?
+        .as_secs();
+    let age = db_age_days(db.epoch, now, allow_old_db)?;
+    println!(
+        "dist: the advisory database {} is {age} days old (dist's limit: {MAX_DB_AGE_DAYS}{})",
+        &db.commit[..12],
+        if age > MAX_DB_AGE_DAYS {
+            "; WARNING: over it, allowed by --allow-old-advisory-db"
+        } else {
+            ""
+        }
+    );
     let deny_toml = fs::read_to_string(root.join("deny.toml")).context("reading deny.toml")?;
     let ignored = crate::ignored_advisories(&deny_toml)?;
     let checks = Checks {
@@ -176,6 +193,24 @@ struct Checks<'a> {
     db: &'a crate::AdvisoryDb,
     /// The advisories `deny.toml` ignores, which the check let through.
     ignored: &'a [crate::Ignored],
+}
+
+/// The oldest advisory database dist builds with, in whole days (review note
+/// I-2); `--allow-old-advisory-db` overrides it, which the release notes must
+/// then say.
+const MAX_DB_AGE_DAYS: u64 = 7;
+
+/// The database's age at `now`, in whole days; above [`MAX_DB_AGE_DAYS`] an
+/// error unless `allow_old`.
+fn db_age_days(db_epoch: u64, now: u64, allow_old: bool) -> anyhow::Result<u64> {
+    let days = now.saturating_sub(db_epoch) / 86_400;
+    ensure!(
+        days <= MAX_DB_AGE_DAYS || allow_old,
+        "the advisory database is {days} days old, more than dist builds with \
+         ({MAX_DB_AGE_DAYS}; review note I-2): run `cargo deny fetch` and the gate again, or pass \
+         --allow-old-advisory-db and say so in the release notes"
+    );
+    Ok(days)
 }
 
 /// BUILD-INFO.txt's "Checked before the build" lines: the check, its
@@ -1030,6 +1065,23 @@ mod tests {
         );
         assert!(advisory_line(&db, db.epoch).ends_with(", 0 days before the source commit"));
         assert!(advisory_line(&db, db.epoch - 1).ends_with(", after the source commit"));
+    }
+
+    /// I-2: dist refuses an advisory database more than a week old unless told
+    /// otherwise, and a clock behind the database counts as age 0.
+    #[test]
+    fn an_old_advisory_database_is_refused_unless_allowed() {
+        let db = 1_790_198_453;
+        let day = 86_400;
+        assert_eq!(db_age_days(db, db + 3 * day, false).unwrap(), 3);
+        assert_eq!(db_age_days(db, db + 7 * day + day - 1, false).unwrap(), 7);
+        let err = db_age_days(db, db + 8 * day, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("8 days old"), "{err}");
+        assert!(err.contains("--allow-old-advisory-db"), "{err}");
+        assert_eq!(db_age_days(db, db + 40 * day, true).unwrap(), 40);
+        assert_eq!(db_age_days(db, db - day, false).unwrap(), 0);
     }
 
     /// I-3: BUILD-INFO.txt names each advisory that deny.toml ignores, with
