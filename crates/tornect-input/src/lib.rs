@@ -225,10 +225,16 @@ pub trait InputSink: Send {
 /// Wraps an injector and remembers what is held down, so that
 /// [`InputEvent::ReleaseAll`], a repeated press, and dropping the wrapper
 /// (session end, panic key) never leave a key or button stuck on the host.
+///
+/// A release the injector refuses (the Wayland portal's queue can be full) is
+/// owed, not forgotten: it is sent again before the next event and by every
+/// release of everything, until the injector takes it (slice-G G1-3).
 pub struct Tracked<S: InputSink> {
     inner: S,
     keys: BTreeSet<u32>,
     buttons: BTreeSet<Button>,
+    owed_keys: BTreeSet<u32>,
+    owed_buttons: BTreeSet<Button>,
 }
 
 impl<S: InputSink> Tracked<S> {
@@ -238,32 +244,62 @@ impl<S: InputSink> Tracked<S> {
             inner,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
+            owed_keys: BTreeSet::new(),
+            owed_buttons: BTreeSet::new(),
         }
     }
 
-    /// Release every key and button still held.
+    /// Release every key and button still held, and every release still owed.
     pub fn release_all(&mut self) {
+        self.settle();
         for usb in std::mem::take(&mut self.keys) {
-            if let Err(e) = self.inner.inject(&InputEvent::Key {
-                usb,
-                pressed: false,
-            }) {
-                tracing::debug!(error = %e, "releasing a held key failed");
-            }
+            let _ = self.release_key(usb);
         }
         for button in std::mem::take(&mut self.buttons) {
-            if let Err(e) = self.inner.inject(&InputEvent::PointerButton {
-                button,
-                pressed: false,
-            }) {
-                tracing::debug!(error = %e, "releasing a held button failed");
-            }
+            let _ = self.release_button(button);
         }
+    }
+
+    /// Send the releases still owed; one refused again stays owed.
+    fn settle(&mut self) {
+        for usb in std::mem::take(&mut self.owed_keys) {
+            let _ = self.release_key(usb);
+        }
+        for button in std::mem::take(&mut self.owed_buttons) {
+            let _ = self.release_button(button);
+        }
+    }
+
+    /// Let go of `usb`, no longer held; owed if the injector refuses.
+    fn release_key(&mut self, usb: u32) -> Result<(), InputError> {
+        let released = self.inner.inject(&InputEvent::Key {
+            usb,
+            pressed: false,
+        });
+        if let Err(e) = &released {
+            tracing::debug!(error = %e, "releasing a key failed; it is sent again later");
+            self.owed_keys.insert(usb);
+        }
+        released
+    }
+
+    /// Let go of `button`, no longer held; owed if the injector refuses.
+    fn release_button(&mut self, button: Button) -> Result<(), InputError> {
+        let released = self.inner.inject(&InputEvent::PointerButton {
+            button,
+            pressed: false,
+        });
+        if let Err(e) = &released {
+            tracing::debug!(error = %e, "releasing a button failed; it is sent again later");
+            self.owed_buttons.insert(button);
+        }
+        released
     }
 }
 
 impl<S: InputSink> InputSink for Tracked<S> {
     fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+        self.settle();
         match *event {
             InputEvent::ReleaseAll => {
                 self.release_all();
@@ -272,27 +308,39 @@ impl<S: InputSink> InputSink for Tracked<S> {
             InputEvent::Key { usb, .. } if SYSTEM_KEYS.contains(&usb) => {
                 return Err(InputError::Refused(usb));
             }
-            InputEvent::Key { usb, pressed } => {
-                // A release for a key the host never saw pressed is dropped:
-                // some compositors reject it ("Invalid key event").
-                let changed = if pressed {
-                    self.keys.insert(usb)
-                } else {
-                    self.keys.remove(&usb)
-                };
-                if !changed && !pressed {
-                    return Ok(());
-                }
+            // Held again: its next release, not the one owed, lets it go.
+            InputEvent::Key { usb, pressed: true } => {
+                self.owed_keys.remove(&usb);
+                self.keys.insert(usb);
             }
-            InputEvent::PointerButton { button, pressed } => {
-                let changed = if pressed {
-                    self.buttons.insert(button)
+            // A release for a key the host never saw pressed is dropped: some
+            // compositors reject it ("Invalid key event").
+            InputEvent::Key {
+                usb,
+                pressed: false,
+            } => {
+                return if self.keys.remove(&usb) {
+                    self.release_key(usb)
                 } else {
-                    self.buttons.remove(&button)
+                    Ok(())
                 };
-                if !changed && !pressed {
-                    return Ok(());
-                }
+            }
+            InputEvent::PointerButton {
+                button,
+                pressed: true,
+            } => {
+                self.owed_buttons.remove(&button);
+                self.buttons.insert(button);
+            }
+            InputEvent::PointerButton {
+                button,
+                pressed: false,
+            } => {
+                return if self.buttons.remove(&button) {
+                    self.release_button(button)
+                } else {
+                    Ok(())
+                };
             }
             InputEvent::PointerMove { .. } | InputEvent::Wheel { .. } => {}
         }
@@ -490,6 +538,63 @@ mod tests {
         })
         .unwrap();
         assert_eq!(t.inner.0.len(), 4);
+    }
+
+    /// Refuses the first release it is given, as the Wayland portal's full
+    /// queue does, and records everything else.
+    #[derive(Default)]
+    struct RefusesOneRelease {
+        seen: Vec<InputEvent>,
+        refused: bool,
+    }
+
+    impl InputSink for RefusesOneRelease {
+        fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+            if !self.refused && event.is_release() {
+                self.refused = true;
+                return Err(InputError::Inject("the queue is full".to_owned()));
+            }
+            self.seen.push(*event);
+            Ok(())
+        }
+    }
+
+    /// Slice-G G1-3: a release the injector refused is sent again, by the next
+    /// `ReleaseAll` (the quiet release and the session's end take that path
+    /// too) and before the next event. Before, `Tracked` had already struck
+    /// the key from what is held, so nothing ever let it go.
+    #[test]
+    fn a_release_the_sink_refused_is_sent_again() {
+        let key = |pressed| InputEvent::Key {
+            usb: 0x07_0004,
+            pressed,
+        };
+        let button = |pressed| InputEvent::PointerButton {
+            button: Button::Left,
+            pressed,
+        };
+        let moved = InputEvent::PointerMove { x: 1, y: 2 };
+
+        let mut t = Tracked::new(RefusesOneRelease::default());
+        t.inject(&key(true)).unwrap();
+        t.inject(&button(true)).unwrap();
+        assert!(t.inject(&key(false)).is_err());
+        t.inject(&InputEvent::ReleaseAll).unwrap();
+        assert_eq!(
+            t.inner.seen,
+            [key(true), button(true), key(false), button(false)]
+        );
+
+        for (press, release) in [(key(true), key(false)), (button(true), button(false))] {
+            let mut t = Tracked::new(RefusesOneRelease::default());
+            t.inject(&press).unwrap();
+            assert!(t.inject(&release).is_err());
+            t.inject(&moved).unwrap();
+            assert_eq!(t.inner.seen, [press, release, moved], "{release:?}");
+            // Nothing is owed or held any more.
+            t.release_all();
+            assert_eq!(t.inner.seen.len(), 3);
+        }
     }
 
     /// SLICE-C1 C1-5: `i32::MIN` has no absolute value in `i32`. The old range
