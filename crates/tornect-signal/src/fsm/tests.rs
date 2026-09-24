@@ -554,8 +554,14 @@ impl tracing_subscriber::fmt::MakeWriter<'_> for ThreadCapture {
     type Writer = LogCapture;
 
     fn make_writer(&self) -> LogCapture {
-        // The filter lets events through only on a capturing thread.
-        CAPTURING.with(|c| c.borrow().clone().unwrap_or_default())
+        // The filter lets events through only on a capturing thread. `try_with`:
+        // an event from a thread-local destructor, after `CAPTURING` is gone,
+        // must not panic (and abort the test binary).
+        CAPTURING
+            .try_with(|c| c.borrow().clone())
+            .ok()
+            .flatten()
+            .unwrap_or_default()
     }
 }
 
@@ -566,7 +572,7 @@ struct Capturing {
 
 impl Drop for Capturing {
     fn drop(&mut self) {
-        CAPTURING.with(|c| c.borrow_mut().take());
+        let _ = CAPTURING.try_with(|c| c.borrow_mut().take());
     }
 }
 
@@ -592,10 +598,17 @@ fn capture_logs() -> Capturing {
             .with_ansi(false)
             .with_writer(ThreadCapture)
             .with_filter(tracing_subscriber::filter::DynFilterFn::new(|_, _| {
-                CAPTURING.with(|c| c.borrow().is_some())
+                CAPTURING
+                    .try_with(|c| c.borrow().is_some())
+                    .unwrap_or(false)
             }));
         tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
             .expect("this test binary sets no other global subscriber");
+        // `set_global_default` recomputes the call sites before it stores the
+        // global (tracing-core `dispatcher.rs`, `set_global_default`): a call
+        // site another thread first reached in between was cached "never".
+        // Now that the global is stored, recompute them again (review P2-I1).
+        tracing::callsite::rebuild_interest_cache();
     });
     let lines = LogCapture::default();
     CAPTURING.with(|c| *c.borrow_mut() = Some(lines.clone()));
