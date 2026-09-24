@@ -502,7 +502,9 @@ pub enum ExternalOp {
 impl ExternalOp {
     fn name(&self) -> &'static str {
         match self {
-            Self::ServiceInstall { .. } => "service_install",
+            // Its own name, so the dialog can say what it means (slice-F F1-3).
+            Self::ServiceInstall { elevated: true } => "service_install_elevated",
+            Self::ServiceInstall { elevated: false } => "service_install",
             Self::ServiceUninstall => "service_uninstall",
             Self::BackupExport { .. } => "backup_export",
             Self::BackupImport { .. } => "backup_import",
