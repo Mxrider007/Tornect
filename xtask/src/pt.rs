@@ -617,6 +617,9 @@ mod tests {
         dir
     }
 
+    /// Only `fake_pins` calls it, and that exists only where `tar` makes the
+    /// fake bundles; anywhere else (the gnullvm lint) it would be dead code.
+    #[cfg(unix)]
     fn leak(s: String) -> &'static str {
         Box::leak(s.into_boxed_str())
     }
