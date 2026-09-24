@@ -129,9 +129,12 @@ pub fn dist(root: &Path, args: &[String]) -> anyhow::Result<()> {
     // database on disk; BUILD-INFO.txt names that database's commit and date.
     let deny = crate::deny(root)?;
     let db = deny.db.clone();
+    let deny_toml = fs::read_to_string(root.join("deny.toml")).context("reading deny.toml")?;
+    let ignored = crate::ignored_advisories(&deny_toml)?;
     let checks = Checks {
         deny: &deny.version,
         db: &db,
+        ignored: &ignored,
     };
     let tools = Tools::probe(root, &platforms)?;
     let out = root.join(OUT);
@@ -157,6 +160,12 @@ pub fn dist(root: &Path, args: &[String]) -> anyhow::Result<()> {
         "    advisory check (for the release notes): {}",
         advisory_line(&db, git.epoch)
     );
+    for i in &ignored {
+        println!(
+            "    ignored by deny.toml (for the release notes): {}: {}",
+            i.id, i.reason
+        );
+    }
     Ok(())
 }
 
@@ -165,6 +174,25 @@ struct Checks<'a> {
     /// `cargo-deny --version`.
     deny: &'a str,
     db: &'a crate::AdvisoryDb,
+    /// The advisories `deny.toml` ignores, which the check let through.
+    ignored: &'a [crate::Ignored],
+}
+
+/// BUILD-INFO.txt's "Checked before the build" lines: the check, its
+/// database, and each advisory `deny.toml` ignores with its reason (I-3).
+fn check_lines(checks: &Checks<'_>, commit_epoch: u64) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "cargo deny    {}, `--offline check`: advisories, bans, licences and sources ok",
+            checks.deny
+        ),
+        format!("advisories    {}", advisory_line(checks.db, commit_epoch)),
+    ];
+    for (n, i) in checks.ignored.iter().enumerate() {
+        let label = if n == 0 { "ignored" } else { "" };
+        lines.push(format!("{label:<14}{}: {}", i.id, i.reason));
+    }
+    lines
 }
 
 /// The advisory database and its age against the source commit, which
@@ -838,16 +866,10 @@ fn build_info(b: &BuildInfo<'_>) -> anyhow::Result<String> {
         utc(b.git.epoch)
     );
     let _ = writeln!(s, "Checked before the build");
-    let _ = writeln!(
-        s,
-        "  cargo deny    {}, `--offline check`: advisories, bans, licences and sources ok",
-        b.checks.deny
-    );
-    let _ = writeln!(
-        s,
-        "  advisories    {}\n",
-        advisory_line(b.checks.db, b.git.epoch)
-    );
+    for line in check_lines(b.checks, b.git.epoch) {
+        let _ = writeln!(s, "  {line}");
+    }
+    s.push('\n');
     let _ = writeln!(s, "Build");
     let _ = writeln!(
         s,
@@ -1008,6 +1030,36 @@ mod tests {
         );
         assert!(advisory_line(&db, db.epoch).ends_with(", 0 days before the source commit"));
         assert!(advisory_line(&db, db.epoch - 1).ends_with(", after the source commit"));
+    }
+
+    /// I-3: BUILD-INFO.txt names each advisory that deny.toml ignores, with
+    /// its reason.
+    #[test]
+    fn build_info_names_every_ignored_advisory_with_its_reason() {
+        let root = crate::workspace_root().unwrap();
+        let deny = fs::read_to_string(root.join("deny.toml")).unwrap();
+        let ignored = crate::ignored_advisories(&deny).unwrap();
+        let db = crate::AdvisoryDb {
+            commit: "1931a145168d457fd79b321277b25b0e51777157".to_owned(),
+            epoch: 1_790_198_453,
+        };
+        let checks = Checks {
+            deny: "cargo-deny 0.20.2",
+            db: &db,
+            ignored: &ignored,
+        };
+        let lines = check_lines(&checks, db.epoch).join("\n");
+        for i in &ignored {
+            assert!(
+                lines.contains(&format!("{}: {}", i.id, i.reason)),
+                "BUILD-INFO.txt lacks {}:\n{lines}",
+                i.id
+            );
+        }
+        assert!(
+            lines.contains("\nignored       RUSTSEC-2023-0071: "),
+            "{lines}"
+        );
     }
 
     /// cargo joins these after `.cargo/config.toml`'s; a `RUSTFLAGS` variable
