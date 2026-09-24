@@ -67,7 +67,7 @@ Tornect homes on that machine talked to each other over the real Tor network; no
 ## Requirements
 
 - **Linux:** x86_64 with **glibc 2.43 or newer** (`ldd --version`): Ubuntu 26.04 has it; Ubuntu 24.04 and
-  Debian 13 do not, and there the program stops at once with "version `GLIBC_2.43' not found". The window needs
+  Debian 13 do not, and there the program stops at once with `version 'GLIBC_2.43' not found`. The window needs
   a Vulkan or OpenGL driver. To share the desktop: a Wayland session with xdg-desktop-portal 1.17 or newer and
   PipeWire (GNOME is the tested one), or an X11 session.
 - **Windows:** Windows 10 (20H1 or later) or 11, 64-bit (x64).
@@ -143,8 +143,9 @@ By the identifiers of the security reviews that found them.
   back; it shows on the primary monitor only, while the whole desktop is shared.
 - **E2-6:** closing the console window, logging off or shutting down ends Tornect at once: keys the viewer held
   may stay pressed, and `sessions.log` gets no end record. Use Stop, the window's close button, or Ctrl-C.
-- **E2-8:** do not run `tornect.exe` as administrator: a viewer with control could then drive elevated windows,
-  and nothing on screen says so.
+- **E2-8:** an elevated `tornect.exe` (run as administrator, or the `--elevated` task) lets a viewer with
+  control drive elevated windows, and nothing on screen says so: do not run it as administrator unless you
+  mean that.
 - **F1-5:** with `service install --elevated`, anything that runs as you can make the elevated host run a
   program of its choice through `config.toml` (`tor.pt_path`). Use `--elevated` only where that is acceptable;
   UAC is not a security boundary. (The elevated task cannot be started on demand.)
