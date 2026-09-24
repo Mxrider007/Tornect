@@ -30,7 +30,7 @@
   so the loopback demo and CI run everywhere; FFmpeg stays the hardware layer behind `--features ffmpeg`.
 - `.claude/settings.json` cannot be authored by the model → recommended template committed instead.
 
-## Dev-machine constraints (mx-vm)
+## Dev-machine constraints (the build VM)
 
 No sudo ⇒ no FFmpeg/PipeWire/ALSA/libclang headers, no nasm, no netns. Pure-Rust +
 vendored-C stack builds; heavy backends verified in Linux CI. Tor reachable.

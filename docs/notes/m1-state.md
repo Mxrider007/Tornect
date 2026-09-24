@@ -428,7 +428,7 @@ connect"** (decision M1-42).
   - an unshared kill switch fails the Panic test (`Timeout("session frame")`);
   - a guard told that no session runs lets `On` through to the polkit dialog;
   - the old keep-alive loop reports a host panic as `Lost(BrokenPipe)`.
-- **Live over Tor on mx-vm: PASS 8/8** (`docs/notes/m1-serve-host-evidence.md`): ping, the same
+- **Live over Tor on the build VM: PASS 8/8** (`docs/notes/m1-serve-host-evidence.md`): ping, the same
   code on both screens (a re-pair via `--forget`), a control session, a view-only session with
   no second pairing, `unattended on` refused mid-session, `tornect panic` ending the session on
   both ends in 0.6 s, and a clean Ctrl-C. Runs 1–3 are recorded too. Run 3 found the one real
@@ -589,7 +589,7 @@ local when it was written, for push 2.
     desktop asks once. Deleting the file revokes the grant.
   - `tornect host --capture desktop` shares the Wayland desktop through the session layer.
   - No full Arti rebuild: the lock gained only `ashpd` and `libloading`. Tests 437 → 458.
-- **Verified live on mx-vm** (rows in `docs/VERIFICATION.md`):
+- **Verified live on the build VM** (rows in `docs/VERIFICATION.md`):
   - **At the console**, portal check run 2: 3538×1919 at scale 1; a first picture of a still
     screen after 0.31 s, unprompted; five pointer moves, each followed by a new picture; 19 fps
     while dragging; the token kept. Run 1 was answered with the dialog's "Allow Remote
@@ -654,7 +654,7 @@ local when it was written, for push 2.
 **Unreviewed by a hostile review:** everything after `5ba8f11`, including `pipewire.rs`'s unsafe
 FFI, the portal and token handling, the idle ping and this session's fixes.
 
-## Gotchas (dev VM mx-vm)
+## Gotchas (the build VM)
 
 - **The gate/plain-`cargo` rebuild ping-pong is fixed** (M1-45, 2026-09-22). `cargo xtask` runs
   through `cargo run`, which put `CARGO_PKG_NAME`, `CARGO_MANIFEST_DIR` and the rest into xtask's

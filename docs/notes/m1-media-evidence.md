@@ -1,6 +1,6 @@
 # The Tor media path, live: `tornect host --capture test-card` ↔ `tornect connect` (2026-09-21, fifth session)
 
-**What ran.** Two instances on mx-vm, each with its own `TORNECT_HOME` (`target/tornect-test/s61-host`,
+**What ran.** Two instances on the build VM, each with its own `TORNECT_HOME` (`target/tornect-test/s61-host`,
 `s61-client`) and its own PTY, over the real Tor network (direct Tor, no bridges needed). Binary: the
 tree at `fd672b7` (`tornect-session`, decision M1-43). The driver is the appendix: it pairs with the SAS
 compared by the driver, runs a control session with media for three pings, then a view-only session

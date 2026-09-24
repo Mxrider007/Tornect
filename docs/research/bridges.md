@@ -1,7 +1,7 @@
 # Research: reaching Tor where it is blocked (obfs4 → Snowflake)
 
 **Status:** verified 2026-09-21 (research_verifier sub-agent against the local Arti 0.45.0
-sources, tor-browser-build and the Tor Browser 15.0.23 release; live runs on mx-vm).
+sources, tor-browser-build and the Tor Browser 15.0.23 release; live runs on the build VM).
 Full report with every citation and verbatim evidence files:
 `/home/mx/kore_project_V3/agents/devops/reports/sub/2026-09-21_SUB_RESEARCH_VERIFIER_tor_bridges.md`
 (+ `…/2026-09-21_tor_bridges_evidence/`). Decision: `docs/notes/decisions.md` M1-38.
@@ -11,7 +11,7 @@ Code: `crates/tornect-signal/src/tor/bridges.rs`, `TorNode::start_auto`.
 
 - **Cargo:** add `pt-client` to `arti-client` (`arti-client-0.45.0/Cargo.toml:197-202`); it
   implies `bridge-client` (`:59-62`) and pulls `tor-ptmgr` 0.45.0 (MIT OR Apache-2.0). Nothing in
-  the chain is experimental. Built on mx-vm 2026-09-21 (partial Arti rebuild, 3 min 31 s).
+  the chain is experimental. Built on the build VM 2026-09-21 (partial Arti rebuild, 3 min 31 s).
 - **Bridges** from bridge-line strings: `let b: BridgeConfigBuilder = line.parse()?;
   builder.bridges().bridges().push(b);` (`tor-guardmgr` `bridge/config.rs:376-421`; a leading
   `Bridge ` word is accepted). The built-in `meek_lite` line has no fingerprint → rejected by
@@ -78,7 +78,7 @@ obfs4, Snowflake and webtunnel.
   `https://archive.torproject.org/tor-package-archive/torbrowser/15.0.23/tor-expert-bundle-{linux,windows}-x86_64-15.0.23.tar.gz`
   (+ `.asc`; `sha256sums-signed-build.txt` + `.asc`).
 - Signing key: Tor Browser Developers, primary **EF6E 286D DA85 EA2A 4BA7 DE68 4E2C 6E87 9329
-  8290** (signing subkey `CAAE408A…` expires 2026-10-26 — pin the primary). Verified on mx-vm
+  8290** (signing subkey `CAAE408A…` expires 2026-10-26 — pin the primary). Verified on the build VM
   2026-09-21: `gpgv` "Good signature" on both tarballs and the sums file; sums match.
 - Pins (`packaging/pt/SOURCES.md`): linux tarball
   `08d49de27f542b8f73e2014e064d8320562b5d20019c03d4725c5a5249d97985`, windows tarball
@@ -107,7 +107,7 @@ obfs4, Snowflake and webtunnel.
   circuit, onion-service circuits included); no open Arti issue found. Verified live for the
   client side on 2026-09-21; the host side over bridges is part of the live session test.
 
-## 8. Live results (mx-vm, 2026-09-21, fresh `TORNECT_HOME` each, cold cache)
+## 8. Live results (the build VM, 2026-09-21, fresh `TORNECT_HOME` each, cold cache)
 
 | rung (forced with `--bridges`) | result | time |
 |---|---|---|

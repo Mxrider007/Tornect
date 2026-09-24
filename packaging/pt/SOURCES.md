@@ -25,7 +25,7 @@ an explicit `tor.pt_path` may run another build, and that is logged.
 | licence notice | `docs/lyrebird.txt` from the same tarball (shipped alongside the binary as `pt/lyrebird.txt`; the same file in both tarballs) — sha256 `2331e6517a15ce87e2a1d2838c314ca1b8f3c7a347ac28d370a7fccdb5964f40` |
 | signing key | Tor Browser Developers, primary `EF6E 286D DA85 EA2A 4BA7 DE68 4E2C 6E87 9329 8290`; the key is `packaging/pt/tor-browser-developers.asc` (from the WKD on 2026-09-21, `--export-options export-minimal`) |
 
-## How the pins were established (2026-09-21, mx-vm)
+## How the pins were established (2026-09-21, the build VM)
 
 ```bash
 V=15.0.23; B=https://archive.torproject.org/tor-package-archive/torbrowser/$V

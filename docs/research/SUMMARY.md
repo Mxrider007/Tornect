@@ -9,7 +9,7 @@ Inputs read in full: `TORNECT_PLAN.md` (== `docs/PLAN.md`, byte-identical) and t
 Two things were re-verified against sources here rather than trusted: the quinn QUIC-bit
 greasing default (`~/.cargo/registry/src/*/quinn-proto-0.11.17`) and the locked crate versions.
 
-Dev machine: `mx-vm`, Ubuntu 26.04, Rust 1.96.0, gcc/g++/cmake/pkg-config present, **no sudo,
+Dev machine: the build VM, Ubuntu 26.04, Rust 1.96.0, gcc/g++/cmake/pkg-config present, **no sudo,
 no nasm, no libclang-dev, no libav*/pipewire/alsa/gtk/udev/xkbcommon dev headers**, no GPU
 encoder (VMware; lavapipe Vulkan only), `/tmp` is a 3.7 GiB quota-limited tmpfs.
 
@@ -64,7 +64,7 @@ encoder (VMware; lavapipe Vulkan only), `/tmp` is a 3.7 GiB quota-limited tmpfs.
 
 ## 1. Consolidated crate table
 
-Legend — **VM**: builds on mx-vm (verified by a probe or the workspace) · **CI**: needs apt
+Legend — **VM**: builds on the build VM (verified by a probe or the workspace) · **CI**: needs apt
 packages or an OS runner · **x-check**: only `cargo check --target` here (Windows/macOS code)
 · **pin**: exact `=` pin recommended (plan §D.1 rule 4; `Cargo.lock` pins everything anyway,
 `=` protects `cargo update`). "Decision" is the single consolidated choice where notes or the
@@ -442,7 +442,7 @@ load-bearing for product copy):
 
 ### M3 — `tornect-proto`, `tornect-capture`, `tornect-codec`, stream window
 
-1. **VM-scoped acceptance** (§0.3): define what "M3 green on mx-vm" means (e.g. synthetic
+1. **VM-scoped acceptance** (§0.3): define what "M3 green on the build VM" means (e.g. synthetic
    source → openh264 → in-proc → openh264 → wgpu at 1080p30 or 720p60, latency ≤ 35 ms p95)
    and mark 1080p60/hw-codec/CPU<15 % as `NEEDS-DEVICE(gpu)`. The Linux CI runner has no
    GPU either, so the hw path stays `NEEDS-DEVICE` until a real box is available.

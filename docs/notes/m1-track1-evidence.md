@@ -1,6 +1,6 @@
 # M1 track 1 evidence — `tornect host` / `tornect ping` over the live Tor network
 
-Machine: `mx-vm` (Ubuntu 26.04, 4 vCPU, 7 GiB, VMware NAT, Rust 1.96), 2026-08-28.
+Machine: the build VM (Ubuntu 26.04, 4 vCPU, 7 GiB, VMware NAT, Rust 1.96), 2026-08-28.
 Debug build (`opt-level = 1`, dependencies `opt-level = 3`), `tor-pow` feature on
 (default). All timestamps UTC. Raw logs were written to
 `target/tornect-test/{host,host2,ping,ping2}.log` (git-ignored); the excerpts below are
