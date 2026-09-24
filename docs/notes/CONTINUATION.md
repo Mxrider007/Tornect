@@ -78,8 +78,9 @@ and the two live Tor tests.
 1. **The GUI console check, behind a presence gate.**
    - Presence first: ask the operator for one visible action on the VM's screen and watch for its effect
      within about 5 minutes. The cleanest one is the first step itself: **Grant screen sharing** in the Wayland
-     host's window writes `<home>/state/portal-restore-token`. A chat answer does not prove presence; three
-     attempts ended with nobody at the screen. Run the check early in a session, while the operator is typing.
+     host's window writes `<home>/state/portal-restore-token`. A remote answer does not prove presence at the VM
+     screen; three attempts ended with nobody at the screen. Run the check early in a session, while the operator is
+     available.
    - Rebuild first (`cargo build -p tornect` in a scope, about 2–3 min): the relaunch kit
      (`target/tornect-test/phase_b3/relaunch.sh`) runs the `8df9123` build, which predates the signal handling,
      N-1, N-4, P2-I4 and T-1. No other build beside the check.
@@ -101,8 +102,8 @@ and the two live Tor tests.
    2.43 or newer): the `serve_host` table's Linux ↔ Windows row, *The Windows zip on a Windows machine*, the 13
    test binaries, and the Windows recipes of the slice-E and slice-F rows (E1-1, N-1, E2-2, E2-4, `--elevated`,
    F1-1, F1-2, F1-5).
-3. **The dependent-load flag** (M1-51), which needs the operator's own yes: the permission system refused an edit
-   of `.cargo/config.toml` made without the operator's own consent. With the yes: add
+3. **The dependent-load flag** (M1-51), which needs the operator's own yes: the edit of `.cargo/config.toml` waits
+   for the operator's explicit approval. With the yes: add
    `"-C", "link-arg=-Wl,--dependent-load-flag=0x800"` to `[target.x86_64-pc-windows-gnullvm] rustflags`; then
    `llvm-readobj --coff-load-config tornect.exe` must show `DependentLoadFlags: 0x800` and `--coff-imports` only
    System32 DLLs and `api-ms-win-*` sets; the Wine smoke test (`docs/RELEASING.md` step 4); then the E2-4 row of
@@ -129,8 +130,8 @@ and the two live Tor tests.
    §10, M1-48): the §B.8.8 budget (a 5 s dialog, and no dialog at all without a valid token: `HOST_NOT_READY`),
    and at M4 the block window and the indicator closing their gaps.
 8. **A hostile review of `5ba8f11..73e9314`** (the Wayland backend, `pipewire.rs`'s unsafe FFI, the portal and
-   token handling, the idle ping, the slice-D fixes). Freeze the range on a worktree and launch it first; ask the
-   operator what size to run and whether the week's budget carries it.
+   token handling, the idle ping, the slice-D fixes). Freeze the range on a worktree and start the review first; ask
+   the operator what size to run, and when.
 9. **M5 items:** a ScreenCast-only portal session for view-only sessions (ruled for M5), and downscaling before
    the encode for large desktops.
 
@@ -209,8 +210,8 @@ and the two live Tor tests.
   `framing` fuzz corpus; a second machine; keep or remove the frozen review worktree; optionally `systemctl
   disable --now systemd-oomd` (sudo).
 - Already ruled, not to be asked again (M1-54): B3-6 (the gate fails without cargo-deny), A1-7 (Snowflake
-  hosting warns), the first-run grant as a setup step, ScreenCast-only sessions at M5, the worktree kept, the 13
-  early commits keep their trailer lines, glibc 2.43, the licence texts, the advisory refresh, E2-4 and E2-2 fixed
+  hosting warns), the first-run grant as a setup step, ScreenCast-only sessions at M5, the worktree kept, the pushed
+  history not rewritten, glibc 2.43, the licence texts, the advisory refresh, E2-4 and E2-2 fixed
   now, the pointer-only accepts, pings only when headless, the three defaults, the `--elevated` refusal.
 
 Work autonomously per the CLAUDE.md ground rules. End the session with this same kind of report, plus Part G
