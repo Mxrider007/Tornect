@@ -766,10 +766,7 @@ async fn viewed(
     };
     // The input gate: the signed SESSION_ACCEPT's mode, never the media
     // stream's BindOk (SLICE-C2 C2-6).
-    let control = matches!(
-        tornect_signal::consent::mode_from_code(session.accept().mode()),
-        Some(SessionMode::Control)
-    );
+    let control = sends_input(session.accept().mode());
     let host = session.host_label().to_owned();
     say(format_args!(
         "SESSION LIVE {} with \"{host}\" ({})",
@@ -829,6 +826,16 @@ async fn viewed(
             format!("No picture from \"{host}\": {e:#}")
         }
     })
+}
+
+/// Whether the viewer sends input, from the `mode` of the host's signed
+/// SESSION_ACCEPT: only a control grant does. A view-only grant never does,
+/// nor does a mode this build does not know.
+fn sends_input(mode: u8) -> bool {
+    matches!(
+        tornect_signal::consent::mode_from_code(mode),
+        Some(SessionMode::Control)
+    )
 }
 
 #[cfg(test)]
@@ -947,6 +954,32 @@ mod tests {
         while rx.try_recv().is_ok() {}
         assert!(!link.settle());
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Release verification T-1: the window's first input gate, the mode of
+    /// the host's signed SESSION_ACCEPT. Only a control grant sends input; a
+    /// view-only grant never does, nor does a code this build does not know.
+    #[test]
+    fn only_a_control_grant_sends_input() {
+        use tornect_signal::consent::mode_code;
+
+        // Every mode a host can grant; a new one fails to compile here until
+        // it is decided.
+        for mode in [SessionMode::Control, SessionMode::ViewOnly] {
+            let control = match mode {
+                SessionMode::Control => true,
+                SessionMode::ViewOnly => false,
+            };
+            assert_eq!(sends_input(mode_code(mode)), control, "{mode:?}");
+        }
+        // Every wire value: the control code is the only one that sends input.
+        for code in 0..=u8::MAX {
+            assert_eq!(
+                sends_input(code),
+                code == mode_code(SessionMode::Control),
+                "mode code {code}"
+            );
+        }
     }
 
     /// Through the real handshake: an allowed session shows on the indicator,
