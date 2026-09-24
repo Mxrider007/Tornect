@@ -61,8 +61,9 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
      `target/dist/tornect-<version>-<os>-x86_64.zip`, tested with `unzip -t`;
    - last, `target/dist/SHA256SUMS` over the zips of this run.
 3. Check: `cd target/dist && sha256sum -c SHA256SUMS`; read both `BUILD-INFO.txt` (the
-   `advisories` line names the database the release was checked against, and its age) and the
-   first lines of both `THIRD_PARTY_LICENSES.txt`. dist's last line repeats the database for the
+   `advisories` line names the database the release was checked against, and its age; the
+   `ignored` lines name each advisory `deny.toml` ignores, with its reason) and the first lines of
+   both `THIRD_PARTY_LICENSES.txt`. dist's last lines repeat the database and the ignores for the
    release notes.
 4. Smoke tests, each in a fresh `--home` (under `target/tornect-test/` on Linux; under Wine, see
    below):
