@@ -586,14 +586,10 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
         }
     }
 
-    // Shutting down: the viewed session says goodbye, every hosted session
-    // gets its `BYE` and every media stream its `Close`, then Tor goes.
-    if let Some((stop, task)) = viewing.take() {
-        let _ = stop.send(true);
-        let _ = tokio::time::timeout(Duration::from_secs(6), task).await;
-    }
+    // Shutting down: the sessions end (`end_sessions`), every media stream
+    // gets its `Close`, then Tor goes.
+    end_sessions(viewing.take(), hosted.as_ref().map(|h| &h.serving.1.kill)).await;
     if let Some(hosted) = &hosted {
-        hosted.serving.1.kill.kill(bye::USER);
         let grace = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         loop {
             while media_streams.try_join_next().is_some() {}
@@ -627,6 +623,28 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
         node.shutdown().await;
     }
     b.shared.update(|m| m.closed = true);
+}
+
+/// How long the viewed session's goodbye may take when the window closes.
+const VIEWER_GOODBYE: Duration = Duration::from_secs(6);
+
+/// The sessions' end when the window closes (its close button, Ctrl-C or
+/// SIGTERM): first every hosted session gets its `BYE` through the host-wide
+/// kill, so this screen stops being shared at once; then the viewed session
+/// says goodbye, which Tor may stall for up to [`VIEWER_GOODBYE`]. In the
+/// other order a remote controller kept this desktop for those seconds
+/// (review N-4).
+async fn end_sessions(
+    viewing: Option<(watch::Sender<bool>, JoinHandle<()>)>,
+    hosted_kill: Option<&KillSwitch>,
+) {
+    if let Some(kill) = hosted_kill {
+        kill.kill(bye::USER);
+    }
+    if let Some((stop, task)) = viewing {
+        let _ = stop.send(true);
+        let _ = tokio::time::timeout(VIEWER_GOODBYE, task).await;
+    }
 }
 
 /// The Stop of the banner and of the indicator window: the host-wide kill with
@@ -799,6 +817,31 @@ mod tests {
     use super::super::indicator::{Change, Indicator};
     use super::super::model::{Model, PopupKind};
     use super::*;
+
+    /// Review N-4: closing a window that both views another host and shares
+    /// this screen (the close button, Ctrl-C or SIGTERM) ends the hosted
+    /// session at once, however long Tor stalls the viewed session's goodbye;
+    /// the viewed session still gets its goodbye time.
+    #[tokio::test]
+    async fn closing_ends_the_hosted_session_before_the_viewed_goodbye() {
+        let kill = KillSwitch::new();
+        let (stop, _stopped) = watch::channel(false);
+        // A viewed session whose goodbye never gets through.
+        let stalled = tokio::spawn(std::future::pending::<()>());
+        let hosted = kill.clone();
+        let ending =
+            tokio::spawn(async move { end_sessions(Some((stop, stalled)), Some(&hosted)).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let fired = kill.fired();
+        let waiting = !ending.is_finished();
+        ending.abort();
+        assert_eq!(
+            fired,
+            Some(bye::USER),
+            "the hosted session was still shared while the viewed goodbye waited"
+        );
+        assert!(waiting, "the viewed session got no time for its goodbye");
+    }
 
     /// SLICE-E E1-6: a release that finds the input queue full (a Tor stall
     /// with the pointer moving) is not lost: once there is room, a
