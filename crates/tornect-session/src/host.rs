@@ -117,7 +117,17 @@ impl Default for MediaLimits {
 /// after a verified `Bind`, which is how capture follows the accept (§B.6).
 pub trait MediaBackend: Send + Sync {
     /// Open the picture source. It may block: it runs on a blocking thread.
-    fn open_source(&self) -> Result<Box<dyn VideoSource>, CaptureError>;
+    ///
+    /// `cancel` turns `true` when the session ends, or its stream is dropped,
+    /// before the open is done. The Wayland open waits on the desktop's
+    /// dialog, which must not stay up, nor leave a remembered grant, for a
+    /// session that is over: it ends its wait then. The value latches, and it
+    /// can be `true` before this is even called (slice-G G1-1). A source that
+    /// does not wait ignores it.
+    fn open_source(
+        &self,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Box<dyn VideoSource>, CaptureError>;
 
     /// The injector for a control session, acting on what the source shows;
     /// `None` when this host cannot inject there (the viewer's input is then
@@ -128,13 +138,6 @@ pub trait MediaBackend: Send + Sync {
     /// kept for building its injector, so that no path can reach the desktop's
     /// input for it. The default keeps nothing.
     fn view_only(&self) {}
-
-    /// The session ended while [`open_source`](Self::open_source) was still
-    /// running on its blocking thread: end that open early, if it can be. The
-    /// Wayland open waits on the desktop's dialog, which must not stay up, nor
-    /// leave a remembered grant, for a session that is over. The default
-    /// cannot.
-    fn cancel_open(&self) {}
 }
 
 /// Where the host reports capture starting and stopping. This is the source
@@ -446,15 +449,23 @@ impl MediaHost {
         } = claimed;
 
         // Capture starts here, after a verified bind (§B.6, decision M1-39).
+        // The open's cancel is made before the open, and belongs to it alone:
+        // an end that comes before the blocking thread has even started still
+        // reaches it (slice-G G1-1).
+        let (cancel, cancelled) = watch::channel(false);
+        let ends_the_open = EndsTheOpen(cancel);
         let backend = Arc::clone(&self.backend);
         let opened = tokio::select! {
             biased;
             _ = end.changed() => None,
-            opened = tokio::task::spawn_blocking(move || backend.open_source()) => Some(opened),
+            opened = tokio::task::spawn_blocking(move || backend.open_source(cancelled)) => {
+                Some(opened)
+            }
         };
+        // The session is over, or the open is done and nothing waits on it.
+        drop(ends_the_open);
         let source = match opened {
             None => {
-                self.backend.cancel_open();
                 return not_started(&mut wr, MediaEnd::SessionOver(end_reason(&end))).await;
             }
             Some(Ok(Ok(source))) => source,
@@ -780,6 +791,18 @@ async fn not_started<W: AsyncWrite + Unpin>(wr: &mut W, end: MediaEnd) -> MediaO
     };
     refuse(wr, reason).await;
     MediaOutcome::NotStarted(end)
+}
+
+/// Ends a source's open when dropped: when its session ends first, and when
+/// the stream's task is dropped mid-open (a host that stops), so that no
+/// dialog stays up and no grant is kept for a stream that is gone. Once the
+/// open is done nothing reads it, so it is dropped then too.
+struct EndsTheOpen(watch::Sender<bool>);
+
+impl Drop for EndsTheOpen {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
 }
 
 /// The `Close` reason for a session that ended: what `on_end` set, or

@@ -83,26 +83,38 @@ struct TestBackend {
     /// What an injector is built from, kept when a source opens, as the
     /// Wayland backend keeps its portal session's input handle.
     input: Mutex<Option<Recorder>>,
-    /// Opening waits, as the desktop's dialog does, until `cancel_open` or
-    /// 10 s.
+    /// Opening waits, as the desktop's dialog does, until its cancel turns
+    /// `true` or 10 s.
     open_waits: bool,
-    cancelled: (Mutex<bool>, std::sync::Condvar),
+    /// An open ended because its cancel turned `true`.
+    cancelled: AtomicBool,
+}
+
+/// The desktop's dialog: up until `cancel` turns `true` (then `true`), or for
+/// [`WAIT`].
+fn dialog(cancel: &tokio::sync::watch::Receiver<bool>) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < WAIT {
+        if *cancel.borrow() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
 }
 
 impl MediaBackend for TestBackend {
-    fn open_source(&self) -> Result<Box<dyn VideoSource>, CaptureError> {
+    fn open_source(
+        &self,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Box<dyn VideoSource>, CaptureError> {
         self.sources.fetch_add(1, Ordering::SeqCst);
         if self.fail {
             return Err(CaptureError::Unavailable("no screen here".into()));
         }
-        if self.open_waits {
-            let (flag, changed) = &self.cancelled;
-            let (cancelled, _) = changed
-                .wait_timeout_while(flag.lock().unwrap(), Duration::from_secs(10), |c| !*c)
-                .unwrap();
-            if *cancelled {
-                return Err(CaptureError::Unavailable("the session ended".into()));
-            }
+        if self.open_waits && dialog(&cancel) {
+            self.cancelled.store(true, Ordering::SeqCst);
+            return Err(CaptureError::Unavailable("the session ended".into()));
         }
         *self.input.lock().unwrap() = Some(self.recorder.clone());
         Ok(Box::new(Card {
@@ -120,12 +132,6 @@ impl MediaBackend for TestBackend {
 
     fn view_only(&self) {
         self.input.lock().unwrap().take();
-    }
-
-    fn cancel_open(&self) {
-        let (flag, changed) = &self.cancelled;
-        *flag.lock().unwrap() = true;
-        changed.notify_all();
     }
 }
 
@@ -733,10 +739,133 @@ async fn a_session_that_ends_while_its_source_opens_ends_the_open() {
         matches!(outcome, MediaOutcome::NotStarted(_)),
         "{outcome:?}"
     );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while !rig.backend.cancelled.load(Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the open was left to run out its time"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Opens as `SystemBackend` does on Wayland, behind a gate that stands for the
+/// blocking pool's delay before the open's first line. (At `312748e` it made
+/// its cancel only past the gate, in an `opening` slot that `cancel_open`
+/// took, as `SystemBackend` did; that shape failed both tests below.)
+#[derive(Default)]
+struct GatedOpen {
+    entered: AtomicBool,
+    gate: (Mutex<bool>, std::sync::Condvar),
+    /// Whether the open's wait ended cancelled, and how long it took.
+    ended: Mutex<Option<(bool, Duration)>>,
+}
+
+impl GatedOpen {
+    fn open_gate(&self) {
+        let (open, opened) = &self.gate;
+        *open.lock().unwrap() = true;
+        opened.notify_all();
+    }
+}
+
+impl MediaBackend for GatedOpen {
+    fn open_source(
+        &self,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Box<dyn VideoSource>, CaptureError> {
+        self.entered.store(true, Ordering::SeqCst);
+        let (open, opened) = &self.gate;
+        drop(
+            opened
+                .wait_while(open.lock().unwrap(), |open| !*open)
+                .unwrap(),
+        );
+        let started = std::time::Instant::now();
+        let cancelled = dialog(&cancel);
+        *self.ended.lock().unwrap() = Some((cancelled, started.elapsed()));
+        Err(CaptureError::Unavailable("the session ended".into()))
+    }
+
+    fn open_injector(&self) -> Option<Box<dyn InputSink>> {
+        None
+    }
+}
+
+/// A media host over a [`GatedOpen`], with a control session bound and its
+/// open entered (and held at the gate).
+async fn open_held_at_the_gate(
+    seed: u8,
+) -> (
+    Arc<GatedOpen>,
+    Arc<MediaHost>,
+    String,
+    DuplexStream,
+    JoinHandle<MediaOutcome>,
+) {
+    let backend = Arc::new(GatedOpen::default());
+    let host = Arc::new(MediaHost::new(
+        backend.clone(),
+        Arc::new(Seen::default()),
+        MediaLimits::default(),
+    ));
+    let (session_id, binding) = start(&host, seed, SessionMode::Control);
+    let (mut client, served) = connect(&host);
+    write_msg(&mut client, &binding.msg()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !backend.entered.load(Ordering::SeqCst) {
+        assert!(tokio::time::Instant::now() < deadline, "no open started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (backend, host, session_id, client, served)
+}
+
+/// Open the gate, and say whether the open's dialog ended cancelled within 1 s.
+async fn let_the_open_on(backend: &GatedOpen) {
+    backend.open_gate();
+    let deadline = tokio::time::Instant::now() + WAIT + Duration::from_secs(2);
+    let (cancelled, took) = loop {
+        if let Some(ended) = *backend.ended.lock().unwrap() {
+            break ended;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the open never ended"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     assert!(
-        *rig.backend.cancelled.0.lock().unwrap(),
-        "the open was left to run out its time"
+        cancelled && took < Duration::from_secs(1),
+        "the open ran on for {took:?} (cancelled: {cancelled})"
     );
+}
+
+/// Slice-G G1-1: a session that ends before its blocking open is under way
+/// still ends that open. The end used to reach only a cancel the open had
+/// already stored, so an end in between was lost: the desktop's dialog stayed
+/// up for its 30 s, and an Allow kept a grant that no session had asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_that_ends_before_its_open_starts_still_ends_it() {
+    let (backend, host, session_id, _client, served) = open_held_at_the_gate(14).await;
+    host.on_end(&session_id, Some(&SessionEnd::Killed(bye::PANIC)));
+    let outcome = tokio::time::timeout(WAIT, served).await.unwrap().unwrap();
+    assert!(
+        matches!(outcome, MediaOutcome::NotStarted(_)),
+        "{outcome:?}"
+    );
+    // Only now does the open reach the point where it can be cancelled.
+    let_the_open_on(&backend).await;
+}
+
+/// A stream whose task is dropped while its source opens (a host that stops
+/// drops its media streams' tasks) ends the open too: the desktop's dialog
+/// does not stay up, and no grant is kept, for a host that stopped sharing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_dropped_while_its_source_opens_ends_the_open() {
+    let (backend, _host, _, _client, served) = open_held_at_the_gate(15).await;
+    served.abort();
+    assert!(served.await.unwrap_err().is_cancelled());
+    let_the_open_on(&backend).await;
 }
 
 /// SLICE-B1 B1-2: a kill stops capture at once, before the FSM has finished its
