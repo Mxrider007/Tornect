@@ -22,8 +22,10 @@ use windows_sys::Win32::Security::Credentials::{
     CREDUIWIN_SECURE_PROMPT,
 };
 use windows_sys::Win32::Security::{
-    EqualSid, GetTokenInformation, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, LogonUserW,
-    TOKEN_QUERY, TOKEN_USER, TokenUser,
+    CheckTokenMembership, CreateWellKnownSid, EqualSid, GetTokenInformation,
+    LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, LogonUserW, SECURITY_MAX_SID_SIZE,
+    TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN, TOKEN_QUERY, TOKEN_USER, TokenElevationType,
+    TokenElevationTypeLimited, TokenLinkedToken, TokenUser, WinBuiltinAdministratorsSid,
 };
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoTaskMemFree, CoUninitialize,
@@ -216,6 +218,95 @@ pub(crate) fn process_token() -> std::io::Result<OwnedHandle> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(OwnedHandle(token))
+}
+
+/// Whether this account is an administrator, counting the filtered token an
+/// administrator's programs get under UAC (the operator's ruling of 2026-09-24:
+/// `--elevated` is refused to a standard account).
+///
+/// `CheckTokenMembership` against the well-known Administrators SID
+/// (`WinBuiltinAdministratorsSid`; domain and nested memberships reach it
+/// through the token's groups) answers the question, but in a filtered token
+/// that group is deny-only, so it would say no for every administrator not
+/// running elevated. `TokenElevationType` tells the cases apart: `Limited` is
+/// the filtered half of a split token, whose linked token is the full one, and
+/// that one is asked; `Full` (running elevated) and `Default` (a standard
+/// account, or any account with UAC off) ask the process token itself. The
+/// elevation type alone would not do: `Default` is both a standard account
+/// and an administrator with UAC off, and `Limited` also covers the filtered
+/// tokens of groups such as Backup Operators, who are not administrators.
+pub(crate) fn is_administrator() -> std::io::Result<bool> {
+    let token = process_token()?;
+    let mut kind: TOKEN_ELEVATION_TYPE = 0;
+    let mut len = 0u32;
+    // SAFETY: `kind` is writable for the size passed; `len` receives the
+    // size written.
+    let ok = unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenElevationType,
+            (&raw mut kind).cast(),
+            u32::try_from(size_of::<TOKEN_ELEVATION_TYPE>()).unwrap_or(0),
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let linked = if kind == TokenElevationTypeLimited {
+        let mut info = TOKEN_LINKED_TOKEN {
+            LinkedToken: null_mut(),
+        };
+        // SAFETY: as above, for a `TOKEN_LINKED_TOKEN`; on success its handle
+        // is open and owned here (closed by `OwnedHandle`).
+        let ok = unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenLinkedToken,
+                (&raw mut info).cast(),
+                u32::try_from(size_of::<TOKEN_LINKED_TOKEN>()).unwrap_or(0),
+                &mut len,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Some(OwnedHandle(info.LinkedToken))
+    } else {
+        None
+    };
+    // A SID's sub-authorities are `u32`s: keep the buffer aligned for them.
+    let mut sid = [0u32; (SECURITY_MAX_SID_SIZE as usize).div_ceil(4)];
+    let mut sid_len = SECURITY_MAX_SID_SIZE;
+    // SAFETY: `sid` is writable for `sid_len` bytes, the largest a SID takes;
+    // a builtin alias needs no domain SID.
+    let ok = unsafe {
+        CreateWellKnownSid(
+            WinBuiltinAdministratorsSid,
+            null_mut(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_len,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut member: BOOL = 0;
+    // SAFETY: the token is the linked one (an identification-level
+    // impersonation token, which the call accepts) or null (the calling
+    // thread's token, duplicated for the call); `sid` holds the SID written
+    // above; `member` is a live local.
+    let ok = unsafe {
+        CheckTokenMembership(
+            linked.as_ref().map_or(null_mut(), |t| t.0),
+            sid.as_mut_ptr().cast(),
+            &mut member,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(member != 0)
 }
 
 /// This process's user, as a string SID (`S-1-5-21-…`).

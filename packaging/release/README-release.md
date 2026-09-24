@@ -145,9 +145,12 @@ computer stays unreachable until someone logs in.
   every session). The password dialog is Windows' secure credential prompt:
   choose your password, not a PIN. `service install` refuses a `tornect.exe`
   outside your user folder or `C:\Program Files`, where another account could
-  replace it. `--elevated` (administrators only, `tornect.exe` under
+  replace it. `--elevated` (an administrator account only, `tornect.exe` under
   `C:\Program Files`) registers it to run elevated, after a UAC prompt: then
-  **every remote Control session is an administrator session**. A `--home` or
+  **every remote Control session is an administrator session**. A standard
+  account is refused `--elevated`: approved with an administrator's password,
+  the task would be the administrator's, and you could neither read nor remove
+  it. A `--home` or
   `TORNECT_HOME` directory is refused on Windows. Stop a running host (Ctrl-C in
   its window) before `tornect service uninstall`; `schtasks /Delete /TN Tornect
   /F` also removes it. Not yet tried on Windows.

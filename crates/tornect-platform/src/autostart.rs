@@ -1166,6 +1166,9 @@ pub trait TaskScheduling {
     fn task_file(&self) -> TaskFile;
     /// `call`, through the UAC prompt when `elevated`.
     fn change(&self, call: &SchtasksCall<'_>, elevated: bool) -> Result<(), AutostartError>;
+    /// Whether this account is an administrator (a filtered administrator
+    /// token counts).
+    fn administrator(&self) -> std::io::Result<bool>;
 }
 
 /// The manual step for a task Tornect could not remove or cannot see.
@@ -1213,6 +1216,32 @@ pub fn classify_task_query(
     }
 }
 
+/// Why a standard account may not register the elevated task (the operator's
+/// ruling of 2026-09-24).
+pub const ELEVATED_NEEDS_ADMINISTRATOR: &str = "`--elevated` needs an administrator account, and \
+     this is a standard account: approved with another account's password, the elevated task \
+     would belong to that account, and you could neither read nor remove it; run `tornect \
+     service install` without `--elevated`";
+
+/// Whether this account may register the elevated task: an administrator
+/// only, its filtered (not elevated) token included (the operator's ruling of
+/// 2026-09-24). A standard account would need another account's password at
+/// the UAC prompt, which makes that account the task's owner: the task could
+/// then neither be read nor removed by the account it runs for. A check that
+/// fails refuses.
+pub fn elevated_task_account_ok(ts: &dyn TaskScheduling) -> Result<(), AutostartError> {
+    match ts.administrator() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AutostartError::Unavailable(
+            ELEVATED_NEEDS_ADMINISTRATOR.to_owned(),
+        )),
+        Err(e) => Err(AutostartError::Unavailable(format!(
+            "could not tell whether this account is an administrator ({e}), and `--elevated` \
+             needs one"
+        ))),
+    }
+}
+
 /// [`Autostart::status`] of the Task Scheduler backend.
 pub fn task_status(ts: &dyn TaskScheduling) -> Result<AutostartState, AutostartError> {
     let query = ts.query()?;
@@ -1225,12 +1254,16 @@ pub fn task_status(ts: &dyn TaskScheduling) -> Result<AutostartState, AutostartE
 /// After a registration `schtasks` reported done, the answer is never
 /// "nothing starts at login": a task this account cannot read back (an
 /// administrator's token registered it) is reported as registered and
-/// unreadable (slice-F F1-1).
+/// unreadable (slice-F F1-1). The elevated task is refused to a standard
+/// account before any UAC prompt ([`elevated_task_account_ok`]).
 pub fn task_install(
     ts: &dyn TaskScheduling,
     xml_path: &str,
     elevated: bool,
 ) -> Result<AutostartState, AutostartError> {
+    if elevated {
+        elevated_task_account_ok(ts)?;
+    }
     ts.change(&SchtasksCall::Create(xml_path), elevated)?;
     let why = match task_status(ts) {
         Ok(AutostartState::Registered(r)) if !r.unreadable => {
@@ -1408,6 +1441,10 @@ impl TaskScheduling for TaskScheduler {
         TaskFile::from_lookup(std::fs::symlink_metadata(&self.task_file).map(drop))
     }
 
+    fn administrator(&self) -> std::io::Result<bool> {
+        crate::win::is_administrator()
+    }
+
     fn change(&self, call: &SchtasksCall<'_>, elevated: bool) -> Result<(), AutostartError> {
         if elevated {
             let line = windows_command_line(&schtasks_args(call));
@@ -1441,6 +1478,11 @@ impl Autostart for TaskScheduler {
                 "{} is missing",
                 self.schtasks.display()
             )));
+        }
+        // Before the password dialog: a standard account never gets the
+        // elevated task, whatever it would type.
+        if elevated {
+            elevated_task_account_ok(self)?;
         }
         self.xml(elevated).map(drop)
     }
@@ -1987,6 +2029,8 @@ mod tests {
         creates: Option<FakeTask>,
         /// `/Delete` answers success but leaves the task.
         delete_is_a_no_op: bool,
+        /// This account is a standard one (default: an administrator).
+        standard_account: bool,
         /// Every change: (the call, through UAC).
         calls: std::sync::Mutex<Vec<(String, bool)>>,
     }
@@ -2036,6 +2080,10 @@ mod tests {
                 Some(_) => TaskFile::Present,
                 None => TaskFile::Missing,
             }
+        }
+
+        fn administrator(&self) -> std::io::Result<bool> {
+            Ok(!self.standard_account)
         }
 
         fn change(&self, call: &SchtasksCall<'_>, elevated: bool) -> Result<(), AutostartError> {
@@ -2152,6 +2200,90 @@ mod tests {
         assert_eq!(
             tasks.calls(),
             vec![("Create(\"C:\\\\x\\\\task.xml\")".to_owned(), true)]
+        );
+    }
+
+    /// The operator's ruling of 2026-09-24: a standard account never gets the
+    /// elevated task. Approved with an administrator's password over its
+    /// shoulder, the task would be the administrator's, and the standard
+    /// account could neither read nor remove it. The refusal comes before any
+    /// UAC prompt.
+    #[test]
+    fn a_standard_account_never_gets_the_elevated_task() {
+        let tasks = FakeTasks {
+            standard_account: true,
+            creates: Some(FakeTask {
+                readable: false,
+                elevated: true,
+            }),
+            ..FakeTasks::default()
+        };
+        match task_install(&tasks, "C:\\x\\task.xml", true) {
+            Err(AutostartError::Unavailable(m)) => {
+                assert!(m.contains("needs an administrator account"), "{m}");
+            }
+            other => panic!("a standard account's --elevated went on: {other:?}"),
+        }
+        assert!(
+            tasks.calls().is_empty(),
+            "no UAC prompt for a standard account: {:?}",
+            tasks.calls()
+        );
+    }
+
+    /// The account check itself: an administrator (its filtered token
+    /// included, which the Windows check counts) passes; a standard account
+    /// and a check that fails are refused; the non-elevated task needs none.
+    #[test]
+    fn only_an_administrator_account_passes_the_elevated_check() {
+        let admin = FakeTasks::default();
+        assert!(elevated_task_account_ok(&admin).is_ok());
+        let standard = FakeTasks {
+            standard_account: true,
+            ..FakeTasks::default()
+        };
+        match elevated_task_account_ok(&standard) {
+            Err(AutostartError::Unavailable(m)) => {
+                assert_eq!(m, ELEVATED_NEEDS_ADMINISTRATOR);
+                assert!(m.contains("without `--elevated`"), "{m}");
+            }
+            other => panic!("{other:?}"),
+        }
+        struct Broken;
+        impl TaskScheduling for Broken {
+            fn query(&self) -> Result<TaskQuery, AutostartError> {
+                unreachable!()
+            }
+            fn task_file(&self) -> TaskFile {
+                unreachable!()
+            }
+            fn change(&self, _: &SchtasksCall<'_>, _: bool) -> Result<(), AutostartError> {
+                unreachable!()
+            }
+            fn administrator(&self) -> std::io::Result<bool> {
+                Err(std::io::Error::other("access denied"))
+            }
+        }
+        assert!(matches!(
+            elevated_task_account_ok(&Broken),
+            Err(AutostartError::Unavailable(m)) if m.contains("access denied")
+        ));
+        // The plain task: a standard account registers its own, no check.
+        let standard = FakeTasks {
+            standard_account: true,
+            creates: Some(FakeTask {
+                readable: true,
+                elevated: false,
+            }),
+            ..FakeTasks::default()
+        };
+        assert!(matches!(
+            task_install(&standard, "C:\\x\\task.xml", false),
+            Ok(AutostartState::Registered(_))
+        ));
+        assert_eq!(
+            standard.calls(),
+            vec![("Create(\"C:\\\\x\\\\task.xml\")".to_owned(), false)]
         );
     }
 
