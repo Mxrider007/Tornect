@@ -2,6 +2,9 @@
 //! (`docs/RELEASING.md`), on a Linux x86_64 host; Windows is cross-built with
 //! llvm-mingw (`docs/research/slice.md` §1).
 //!
+//! First the gate's `cargo deny --offline check`, whose advisory database
+//! (commit and date) each BUILD-INFO.txt names (review finding E3-3).
+//!
 //! Per platform: lyrebird through `pt-fetch`'s checks; `cargo build --locked
 //! --release` into `target/dist/cargo/`; checks on the executable (its dynamic
 //! libraries or DLLs); the debug info stripped; a staging tree in
@@ -121,12 +124,25 @@ pub fn dist(root: &Path, args: &[String]) -> anyhow::Result<()> {
              release"
         );
     }
+    // E3-3: the advisory check this build rests on, run here against the
+    // database on disk; BUILD-INFO.txt names that database's commit and date.
+    let deny = crate::deny(root)?;
+    let db = deny.db.clone().context(
+        "cargo deny found no advisory database under $CARGO_HOME/advisory-dbs/: run `cargo \
+         deny fetch` first (it needs the network)",
+    )?;
+    let checks = Checks {
+        deny: &deny.version,
+        db: &db,
+    };
     let tools = Tools::probe(root, &platforms)?;
     let out = root.join(OUT);
     fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
     let mut zips = Vec::new();
     for platform in platforms {
-        zips.push(package(root, &out, platform, version, &git, &tools)?);
+        zips.push(package(
+            root, &out, platform, version, &git, &tools, &checks,
+        )?);
     }
     let sums = write_sums(&out, &zips)?;
     println!("dist: done");
@@ -139,7 +155,31 @@ pub fn dist(root: &Path, args: &[String]) -> anyhow::Result<()> {
         );
     }
     println!("    {}", sums.display());
+    println!(
+        "    advisory check (for the release notes): {}",
+        advisory_line(&db, git.epoch)
+    );
     Ok(())
+}
+
+/// What `dist` checked before building, for BUILD-INFO.txt.
+struct Checks<'a> {
+    /// `cargo-deny --version`.
+    deny: &'a str,
+    db: &'a crate::AdvisoryDb,
+}
+
+/// The advisory database and its age against the source commit, which
+/// BUILD-INFO.txt can state without the build's own date (E3-3).
+fn advisory_line(db: &crate::AdvisoryDb, commit_epoch: u64) -> String {
+    let age = match commit_epoch.checked_sub(db.epoch) {
+        Some(secs) => match secs / 86_400 {
+            1 => "1 day before the source commit".to_owned(),
+            days => format!("{days} days before the source commit"),
+        },
+        None => "after the source commit".to_owned(),
+    };
+    format!("{db}, {age}")
 }
 
 struct Git {
@@ -295,6 +335,7 @@ fn package(
     version: &str,
     git: &Git,
     tools: &Tools,
+    checks: &Checks<'_>,
 ) -> anyhow::Result<PathBuf> {
     println!("==> dist {} ({})", platform.name, platform.triple);
     let fetched = pt::fetch(root, platform.bundle, false)?;
@@ -367,6 +408,7 @@ fn package(
         platform,
         git,
         tools,
+        checks,
         flags: &flags_for_the_record(platform),
         strip: &strip_tool,
         facts: &facts,
@@ -688,6 +730,7 @@ struct BuildInfo<'a> {
     platform: Platform,
     git: &'a Git,
     tools: &'a Tools,
+    checks: &'a Checks<'a>,
     flags: &'a str,
     strip: &'a str,
     facts: &'a Facts,
@@ -719,6 +762,17 @@ fn build_info(b: &BuildInfo<'_>) -> anyhow::Result<String> {
         "  commit time   {} ({} UTC); every file in the zip carries it\n",
         b.git.epoch,
         utc(b.git.epoch)
+    );
+    let _ = writeln!(s, "Checked before the build");
+    let _ = writeln!(
+        s,
+        "  cargo deny    {}, `--offline check`: advisories, bans, licences and sources ok",
+        b.checks.deny
+    );
+    let _ = writeln!(
+        s,
+        "  advisories    {}\n",
+        advisory_line(b.checks.db, b.git.epoch)
     );
     let _ = writeln!(s, "Build");
     let _ = writeln!(
@@ -804,7 +858,7 @@ fn build_info(b: &BuildInfo<'_>) -> anyhow::Result<String> {
 }
 
 /// `YYYY-MM-DD HH:MM:SS` for seconds since the epoch (UTC).
-fn utc(epoch: u64) -> String {
+pub(crate) fn utc(epoch: u64) -> String {
     let days = epoch / 86_400;
     let secs = epoch % 86_400;
     // Howard Hinnant's civil_from_days, for days since 1970-01-01.
@@ -857,6 +911,27 @@ mod tests {
         assert_eq!(utc(951_782_400), "2000-02-29 00:00:00");
         assert_eq!(utc(1_790_193_600), "2026-09-23 20:00:00");
         assert_eq!(utc(4_107_542_399), "2100-02-28 23:59:59");
+    }
+
+    /// E3-3: BUILD-INFO.txt says which advisory database the check used and
+    /// how much older than the source it is.
+    #[test]
+    fn the_advisory_line_names_the_database_and_its_age() {
+        let db = crate::AdvisoryDb {
+            commit: "1931a145168d457fd79b321277b25b0e51777157".to_owned(),
+            epoch: 1_790_198_453,
+        };
+        let line = advisory_line(&db, 1_790_198_453 + 3 * 86_400 + 5);
+        assert_eq!(
+            line,
+            "RustSec advisory-db 1931a145168d457fd79b321277b25b0e51777157, committed \
+             2026-09-23 21:20:53 UTC, 3 days before the source commit"
+        );
+        assert!(
+            advisory_line(&db, db.epoch + 86_400).ends_with(", 1 day before the source commit")
+        );
+        assert!(advisory_line(&db, db.epoch).ends_with(", 0 days before the source commit"));
+        assert!(advisory_line(&db, db.epoch - 1).ends_with(", after the source commit"));
     }
 
     /// cargo joins these after `.cargo/config.toml`'s; a `RUSTFLAGS` variable

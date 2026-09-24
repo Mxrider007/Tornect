@@ -222,34 +222,84 @@ fn search_path(path: &OsStr, file: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// The newest advisory database `cargo-deny` has fetched, as `(dir, date)`.
-fn advisory_db_date() -> Option<String> {
-    let home = std::env::var_os("CARGO_HOME")
+/// `$CARGO_HOME`, else `.cargo` in the home directory (`HOME`, or
+/// `USERPROFILE` on Windows).
+pub(crate) fn cargo_home() -> Option<PathBuf> {
+    std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))?;
-    let dbs = std::fs::read_dir(home.join("advisory-dbs")).ok()?;
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| PathBuf::from(home).join(".cargo"))
+        })
+}
+
+/// The advisory database `cargo deny` checks against offline: the newest of
+/// the copies it fetched into `$CARGO_HOME/advisory-dbs/`. The gate and
+/// BUILD-INFO.txt name its commit and date, so every check says how old its
+/// knowledge was (review finding E3-3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdvisoryDb {
+    pub(crate) commit: String,
+    /// Its commit time, seconds since the epoch.
+    pub(crate) epoch: u64,
+}
+
+impl std::fmt::Display for AdvisoryDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RustSec advisory-db {}, committed {} UTC",
+            self.commit,
+            dist::utc(self.epoch)
+        )
+    }
+}
+
+fn advisory_db() -> Option<AdvisoryDb> {
+    let dbs = std::fs::read_dir(cargo_home()?.join("advisory-dbs")).ok()?;
     dbs.flatten()
         .filter(|e| e.path().join(".git").exists())
         .filter_map(|e| {
             let out = Command::new("git")
                 .arg("-C")
                 .arg(e.path())
-                .args(["log", "-1", "--format=%cd", "--date=short"])
+                .args(["log", "-1", "--format=%H %ct"])
                 .output()
                 .ok()?;
-            out.status
-                .success()
-                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            if !out.status.success() {
+                return None;
+            }
+            parse_db_head(&String::from_utf8_lossy(&out.stdout))
         })
-        .max()
+        .max_by_key(|db| db.epoch)
+}
+
+/// `git log -1 --format='%H %ct'` of a database copy.
+fn parse_db_head(line: &str) -> Option<AdvisoryDb> {
+    let (commit, epoch) = line.trim().split_once(' ')?;
+    if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(AdvisoryDb {
+        commit: commit.to_owned(),
+        epoch: epoch.parse().ok()?,
+    })
+}
+
+/// What a passed `cargo deny check` ran with.
+pub(crate) struct Deny {
+    /// `cargo-deny --version`.
+    pub(crate) version: String,
+    pub(crate) db: Option<AdvisoryDb>,
 }
 
 /// `cargo deny check` (advisories, bans, licenses, sources), **offline**
 /// against the advisory database already on disk, so the gate needs no network
-/// and says how old that database is (SLICE-A3 F2). Without `cargo-deny` the
-/// gate fails (decision B3-6): a gate that could not check advisories and
+/// and says which database it used (SLICE-A3 F2, E3-3). Without `cargo-deny`
+/// the gate fails (decision B3-6): a gate that could not check advisories and
 /// licences is not green.
-fn deny(root: &Path) -> anyhow::Result<()> {
+pub(crate) fn deny(root: &Path) -> anyhow::Result<Deny> {
     let bin = match require_cargo_deny(find_cargo_deny(root)) {
         Ok(bin) => bin,
         Err(e) => {
@@ -257,14 +307,24 @@ fn deny(root: &Path) -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    let db = advisory_db_date().unwrap_or_else(|| "unknown date".to_owned());
+    let version = Command::new(&bin)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("running {} --version", bin.display()))?;
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
+    let db = advisory_db();
+    let label = match &db {
+        Some(db) => format!(
+            "advisory DB {} of {} UTC",
+            &db.commit[..12],
+            dist::utc(db.epoch)
+        ),
+        None => "no advisory DB found".to_owned(),
+    };
     let mut cmd = Command::new(&bin);
     cmd.args(["--offline", "check"]);
-    run(
-        root,
-        &format!("cargo deny check (offline; advisory DB {db})"),
-        cmd,
-    )
+    run(root, &format!("cargo deny check (offline; {label})"), cmd)?;
+    Ok(Deny { version, db })
 }
 
 fn require_cargo_deny(found: Option<PathBuf>) -> anyhow::Result<PathBuf> {
@@ -373,6 +433,27 @@ mod tests {
             Some(bin_dir.join(&bin))
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// E3-3: the database's commit and date come from its `git log` line.
+    #[test]
+    fn the_advisory_database_is_named_by_commit_and_date() {
+        let commit = "1931a145168d457fd79b321277b25b0e51777157";
+        let db = parse_db_head(&format!("{commit} 1790198453\n")).unwrap();
+        assert_eq!(
+            db,
+            AdvisoryDb {
+                commit: commit.to_owned(),
+                epoch: 1_790_198_453
+            }
+        );
+        assert_eq!(
+            db.to_string(),
+            format!("RustSec advisory-db {commit}, committed 2026-09-23 21:20:53 UTC")
+        );
+        assert_eq!(parse_db_head("1931a14 1790198453"), None);
+        assert_eq!(parse_db_head(&format!("{commit} yesterday")), None);
+        assert_eq!(parse_db_head(""), None);
     }
 
     /// Whatever the fix removes, a developer's own cargo settings must survive it.
