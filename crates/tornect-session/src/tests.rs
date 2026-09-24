@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, duplex};
+use tokio::io::{
+    AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, ReadHalf, SimplexStream, WriteHalf,
+    duplex, simplex,
+};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tornect_capture::{CaptureError, Frame, TestCard, VideoSource};
@@ -204,8 +207,28 @@ fn connect(host: &Arc<MediaHost>) -> (DuplexStream, JoinHandle<MediaOutcome>) {
     )
 }
 
+/// The viewer's end of [`connect_narrow`].
+type NarrowPipe = tokio::io::Join<ReadHalf<SimplexStream>, WriteHalf<SimplexStream>>;
+
+/// [`connect`] over a pipe that holds only 16 bytes toward the viewer and
+/// 64 KiB toward the host: once the viewer stops reading, the host's next
+/// `Video` write waits for good (a pipe has no stall timer), while what the
+/// viewer writes never waits.
+fn connect_narrow(host: &Arc<MediaHost>) -> (NarrowPipe, JoinHandle<MediaOutcome>) {
+    let (viewer_rd, host_wr) = simplex(16);
+    let (host_rd, viewer_wr) = simplex(64 * 1024);
+    let host = Arc::clone(host);
+    (
+        tokio::io::join(viewer_rd, viewer_wr),
+        tokio::spawn(async move { host.serve(tokio::io::join(host_rd, host_wr)).await }),
+    )
+}
+
 /// Bind by hand and return `BindOk`'s mode byte.
-async fn bind_raw(client: &mut DuplexStream, binding: &Binding) -> u8 {
+async fn bind_raw<S>(client: &mut S, binding: &Binding) -> u8
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     write_msg(client, &binding.msg()).await.unwrap();
     match read_msg(client).await.unwrap() {
         Some(Msg::BindOk { mode, .. }) => mode,
@@ -582,6 +605,140 @@ async fn a_key_held_by_a_viewer_that_goes_quiet_is_released() {
         .on_end(&session_id, Some(&SessionEnd::Killed(bye::PANIC)));
     assert_eq!(until_close(&mut client).await, Some(reason::ENDED_BY_HOST));
     assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
+}
+
+/// A control session over a [`connect_narrow`] pipe, with an ack window that
+/// never fills, whose viewer pressed `KEY_A` and then stopped reading: from
+/// then on the host's picture write waits for good.
+async fn press_then_stop_reading(
+    seed: u8,
+    viewer_quiet: Duration,
+) -> (Rig, String, NarrowPipe, JoinHandle<MediaOutcome>) {
+    let rig = rig(MediaLimits {
+        viewer_quiet,
+        window_frames: 10_000,
+        window_bytes: 1 << 30,
+        ..MediaLimits::default()
+    });
+    let (session_id, binding) = start(&rig.host, seed, SessionMode::Control);
+    let (mut client, served) = connect_narrow(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    let press = InputEvent::Key {
+        usb: KEY_A,
+        pressed: true,
+    };
+    write_msg(&mut client, &Msg::Input(press.encode()))
+        .await
+        .unwrap();
+    while !rig.backend.recorder.events().contains(&press) {
+        tokio::time::timeout(WAIT, read_msg(&mut client))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    (rig, session_id, client, served)
+}
+
+/// Slice-G G2-1: the quiet release also comes while the host is stuck writing
+/// a picture. A viewer that vanishes without a word stops taking pictures, and
+/// the host's write then waits on Tor's flow control until the 30 s stall; the
+/// quiet release waited behind it, so a key the viewer held repeated for up to
+/// 30 s instead of 3 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_held_by_a_viewer_that_vanishes_mid_picture_is_released() {
+    let (rig, session_id, _client, served) =
+        press_then_stop_reading(16, Duration::from_millis(500)).await;
+    let release = InputEvent::Key {
+        usb: KEY_A,
+        pressed: false,
+    };
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !rig.backend.recorder.events().contains(&release) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the held key was never released: {:?}",
+            rig.backend.recorder.events()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!served.is_finished(), "released, and the session goes on");
+    assert_eq!(rig.backend.recorder.events().len(), 2);
+    // The end is still heard while the write waits.
+    rig.host
+        .on_end(&session_id, Some(&SessionEnd::Killed(bye::PANIC)));
+    let outcome = tokio::time::timeout(WAIT, served).await.unwrap().unwrap();
+    assert!(
+        matches!(
+            outcome,
+            MediaOutcome::Served {
+                end: MediaEnd::SessionOver(_),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// The other side of G2-1: a viewer that is still heard while the host's
+/// write waits keeps what it holds. Its frames wait in the queue behind the
+/// write, and count as heard when the reader reads them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_viewer_heard_while_a_picture_write_waits_keeps_its_key() {
+    let (rig, session_id, mut client, served) =
+        press_then_stop_reading(17, Duration::from_millis(300)).await;
+    // 1.5 s of a ping every 100 ms, five times the quiet time.
+    for nonce in 0..15 {
+        write_msg(&mut client, &Msg::Ping { nonce }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        rig.backend.recorder.events().len(),
+        1,
+        "released a viewer that was heard"
+    );
+    assert!(!served.is_finished());
+    rig.host
+        .on_end(&session_id, Some(&SessionEnd::Killed(bye::PANIC)));
+    tokio::time::timeout(WAIT, served).await.unwrap().unwrap();
+}
+
+/// G2-1, a burst: while the host's write waits, a viewer whose frames fill
+/// the queue (the reader then waits on the loop, and cannot hear it any more)
+/// counts as heard for one more quiet period after its last frame read, and
+/// no longer. A busy viewer is not let go of at the first deadline, and one
+/// that vanished right after a burst cannot hold its keys until the write
+/// ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_viewer_whose_frames_fill_the_queue_is_let_go_one_quiet_period_later() {
+    let quiet = Duration::from_secs(2);
+    let (rig, session_id, mut client, served) = press_then_stop_reading(18, quiet).await;
+    // 64 fill the queue, the reader holds one more, the rest wait in the pipe.
+    for nonce in 0..80 {
+        write_msg(&mut client, &Msg::Ping { nonce }).await.unwrap();
+    }
+    let burst = tokio::time::Instant::now();
+    tokio::time::sleep(quiet + quiet / 2).await;
+    assert_eq!(
+        rig.backend.recorder.events().len(),
+        1,
+        "let go of at the first deadline, while its frames filled the queue"
+    );
+    let release = InputEvent::Key {
+        usb: KEY_A,
+        pressed: false,
+    };
+    while !rig.backend.recorder.events().contains(&release) {
+        assert!(
+            burst.elapsed() < WAIT,
+            "never let go of: {:?}",
+            rig.backend.recorder.events()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!served.is_finished(), "released, and the session goes on");
+    rig.host
+        .on_end(&session_id, Some(&SessionEnd::Killed(bye::PANIC)));
+    tokio::time::timeout(WAIT, served).await.unwrap().unwrap();
 }
 
 /// SLICE-C1 C1-3: a viewer with nothing else to say pings, so that the host can

@@ -86,7 +86,9 @@ pub struct MediaLimits {
     /// Least time between two keyframes forced by `KeyframeRequest`.
     pub keyframe_interval: Duration,
     /// How long a control viewer may say nothing (no input, ack or ping)
-    /// before the keys and buttons it holds are released (SLICE-C1 C1-3).
+    /// before the keys and buttons it holds are released (SLICE-C1 C1-3),
+    /// counted from the last frame read, also while a write to the viewer
+    /// waits (slice-G G2-1).
     pub viewer_quiet: Duration,
     /// The encoder. Its frame rate also paces capture.
     pub encoder: EncoderSettings,
@@ -518,7 +520,7 @@ impl MediaHost {
             codec: codec::H264,
             mode: mode_code(mode),
         };
-        if let Err(stop) = send(&mut wr, &bind_ok, &mut end).await {
+        if let Err(stop) = send(&mut wr, &bind_ok, &mut end, None).await {
             pipeline.stop().await;
             return MediaOutcome::NotStarted(stop.end);
         }
@@ -546,7 +548,8 @@ impl MediaHost {
         });
 
         let (inbound_tx, mut inbound) = mpsc::channel(INBOUND_DEPTH);
-        let reader = tokio::spawn(read_client(rd, inbound_tx));
+        let (heard_tx, heard) = watch::channel(tokio::time::Instant::now());
+        let reader = tokio::spawn(read_client(rd, inbound_tx, heard_tx));
         let epoch = Instant::now();
         let mut report = MediaReport::default();
         let mut window = AckWindow::new(self.limits.window_frames, self.limits.window_bytes);
@@ -556,10 +559,7 @@ impl MediaHost {
         let mut seq: u32 = 0;
         let mut pending = Some(first);
         let mut torn = false;
-        // When the viewer last said anything, and whether what it holds has
-        // been let go since (SLICE-C1 C1-3).
-        let mut heard = tokio::time::Instant::now();
-        let mut released = false;
+        let mut quiet = Quiet::new(self.limits.viewer_quiet, heard);
 
         let ended = loop {
             if let Some(frame) = pending.take() {
@@ -578,7 +578,12 @@ impl MediaHost {
                         .as_millis() as u32,
                     data: frame.data,
                 };
-                if let Err(stop) = send(&mut wr, &msg, &mut end).await {
+                let held = Held {
+                    quiet: &mut quiet,
+                    injector: injector.as_mut(),
+                    inbound: &inbound,
+                };
+                if let Err(stop) = send(&mut wr, &msg, &mut end, Some(held)).await {
                     torn = stop.torn;
                     break stop.end;
                 }
@@ -592,30 +597,29 @@ impl MediaHost {
                 }
             }
 
-            let quiet_at = heard + self.limits.viewer_quiet;
-            let watch_quiet = injector.is_some() && !released;
+            let quiet_at = quiet.deadline(injector.is_some());
             let event = tokio::select! {
                 biased;
                 _ = end.changed() => Event::Ended,
                 msg = inbound.recv() => Event::Client(msg),
                 frame = pipeline.next() => Event::Frame(frame),
-                () = tokio::time::sleep_until(quiet_at), if watch_quiet => Event::Quiet,
+                () = tokio::time::sleep_until(quiet_at.unwrap_or_else(tokio::time::Instant::now)),
+                    if quiet_at.is_some() => Event::Quiet,
             };
-            if let Event::Client(Some(Ok(_))) = event {
-                heard = tokio::time::Instant::now();
-                released = false;
-            }
             match event {
                 Event::Ended => break MediaEnd::SessionOver(end_reason(&end)),
                 // A viewer that pings when it has nothing else to say has gone
                 // quiet: it may be gone, and a key it holds would repeat on the
                 // host until the session's idle timeout (SLICE-C1 C1-3).
                 Event::Quiet => {
-                    if let Some(sink) = injector.as_mut() {
-                        sink.release_all();
+                    let mut held = Held {
+                        quiet: &mut quiet,
+                        injector: injector.as_mut(),
+                        inbound: &inbound,
+                    };
+                    if held.lapse() {
+                        tracing::debug!(session = %session_id, "viewer quiet: released what it held");
                     }
-                    released = true;
-                    tracing::debug!(session = %session_id, "viewer quiet: released what it held");
                 }
                 Event::Frame(Some(Ok(frame))) => pending = Some(frame),
                 Event::Frame(Some(Err(e))) => {
@@ -673,11 +677,18 @@ impl MediaHost {
                         }
                     }
                     Msg::Ping { nonce } => {
-                        if pings.take(Instant::now())
-                            && let Err(stop) = send(&mut wr, &Msg::Pong { nonce }, &mut end).await
-                        {
-                            torn = stop.torn;
-                            break stop.end;
+                        if pings.take(Instant::now()) {
+                            let held = Held {
+                                quiet: &mut quiet,
+                                injector: injector.as_mut(),
+                                inbound: &inbound,
+                            };
+                            if let Err(stop) =
+                                send(&mut wr, &Msg::Pong { nonce }, &mut end, Some(held)).await
+                            {
+                                torn = stop.torn;
+                                break stop.end;
+                            }
                         }
                     }
                     Msg::Pong { .. } => {}
@@ -762,11 +773,20 @@ async fn read_bind<R: AsyncRead + Unpin>(r: &mut R) -> Result<(String, [u8; 32])
 }
 
 /// Read the client's frames into `tx` until it closes the stream or breaks
-/// the protocol. Every client message is small, hence the cap.
-async fn read_client<R: AsyncRead + Unpin>(mut rd: R, tx: mpsc::Sender<Result<Msg, ProtoError>>) {
+/// the protocol, stamping `heard` as each one is read and before it is
+/// queued, so that a frame the loop takes is always one the stamp has seen.
+/// Every client message is small, hence the cap.
+async fn read_client<R: AsyncRead + Unpin>(
+    mut rd: R,
+    tx: mpsc::Sender<Result<Msg, ProtoError>>,
+    heard: watch::Sender<tokio::time::Instant>,
+) {
     loop {
         let msg = match read_msg_max(&mut rd, MAX_CLIENT_FRAME).await {
-            Ok(Some(msg)) => Ok(msg),
+            Ok(Some(msg)) => {
+                heard.send_replace(tokio::time::Instant::now());
+                Ok(msg)
+            }
             Ok(None) => return,
             Err(e) => Err(e),
         };
@@ -819,11 +839,15 @@ struct Stop {
 
 /// Write `msg` unless the session ends first. A write can stall for as long as
 /// the viewer withholds Tor flow-control credit, and a session end must not
-/// wait for that: capture stops as soon as the session does.
+/// wait for that: capture stops as soon as the session does. With `held`, the
+/// quiet release keeps its deadline while the write waits, since a viewer that
+/// vanished is what stalls it, and the key it holds must not repeat until the
+/// stall ends the stream (slice-G G2-1).
 async fn send<W: AsyncWrite + Unpin>(
     wr: &mut W,
     msg: &Msg,
     end: &mut watch::Receiver<Option<u16>>,
+    mut held: Option<Held<'_>>,
 ) -> Result<(), Stop> {
     if end.has_changed().unwrap_or(true) {
         return Err(Stop {
@@ -832,11 +856,24 @@ async fn send<W: AsyncWrite + Unpin>(
         });
     }
     // The write is polled first, so a write that can complete does; only one
-    // stalled on flow control is cut short.
-    let written = tokio::select! {
-        biased;
-        written = write_msg(wr, msg) => Some(written),
-        _ = end.changed() => None,
+    // stalled on flow control is cut short, and only by the session's end: the
+    // quiet release lets go of the viewer's keys and the write goes on.
+    let write = write_msg(wr, msg);
+    tokio::pin!(write);
+    let written = loop {
+        let quiet_at = held.as_mut().and_then(|held| held.deadline());
+        tokio::select! {
+            biased;
+            written = &mut write => break Some(written),
+            _ = end.changed() => break None,
+            () = tokio::time::sleep_until(quiet_at.unwrap_or_else(tokio::time::Instant::now)),
+                if quiet_at.is_some() =>
+            {
+                if held.as_mut().is_some_and(|held| held.lapse()) {
+                    tracing::debug!("viewer quiet while a write waits: released what it held");
+                }
+            }
+        }
     };
     match written {
         Some(Ok(())) => Ok(()),
@@ -865,6 +902,100 @@ enum Event {
     Frame(Option<Result<Encoded, PipelineError>>),
     /// The viewer has said nothing for [`MediaLimits::viewer_quiet`].
     Quiet,
+}
+
+/// The quiet release's clock (SLICE-C1 C1-3). The viewer counts as heard when
+/// the reader reads one of its frames, not when the loop takes it: the loop
+/// can be stuck writing a picture or a `Pong`, and frames that wait in the
+/// queue behind that write were heard all the same (slice-G G2-1).
+struct Quiet {
+    after: Duration,
+    /// The reader's stamp: when it last read a frame.
+    heard: watch::Receiver<tokio::time::Instant>,
+    /// The stamp last taken in.
+    seen: tokio::time::Instant,
+    /// When to let go, unless the viewer is heard first.
+    at: tokio::time::Instant,
+    /// Let go of since the viewer was last heard: nothing to watch until it
+    /// is heard again.
+    released: bool,
+}
+
+impl Quiet {
+    fn new(after: Duration, heard: watch::Receiver<tokio::time::Instant>) -> Self {
+        let seen = *heard.borrow();
+        Self {
+            after,
+            heard,
+            seen,
+            at: seen + after,
+            released: false,
+        }
+    }
+
+    /// Take in the reader's stamp: a viewer heard since gets a new deadline,
+    /// and what it holds is watched again.
+    fn refresh(&mut self) {
+        let stamp = *self.heard.borrow();
+        if stamp != self.seen {
+            self.seen = stamp;
+            self.at = stamp + self.after;
+            self.released = false;
+        }
+    }
+
+    /// When to let go of what a control viewer holds; `None` when there is
+    /// nothing to watch (no injector, or let go of already).
+    fn deadline(&mut self, control: bool) -> Option<tokio::time::Instant> {
+        self.refresh();
+        (control && !self.released).then_some(self.at)
+    }
+
+    /// The deadline came: whether to let go now; not if the viewer was heard
+    /// meanwhile. While its frames fill the queue, the reader waits on the
+    /// loop and cannot hear anything newer: a viewer that busy counts as heard
+    /// for one more quiet period after its last frame read, and no longer, so
+    /// a viewer that vanished right after a burst is still let go of.
+    fn due(&mut self, queue_full: bool) -> bool {
+        self.refresh();
+        let now = tokio::time::Instant::now();
+        if self.released || now < self.at {
+            return false;
+        }
+        let busy_until = self.seen + self.after.saturating_mul(2);
+        if queue_full && now < busy_until {
+            self.at = busy_until;
+            return false;
+        }
+        self.released = true;
+        true
+    }
+}
+
+/// What the quiet release needs, lent to [`send`] while a write waits.
+struct Held<'a> {
+    quiet: &'a mut Quiet,
+    injector: Option<&'a mut Tracked<Boxed>>,
+    inbound: &'a mpsc::Receiver<Result<Msg, ProtoError>>,
+}
+
+impl Held<'_> {
+    fn deadline(&mut self) -> Option<tokio::time::Instant> {
+        self.quiet.deadline(self.injector.is_some())
+    }
+
+    /// The deadline came: let go of what the viewer holds, if it is due.
+    /// Whether it let go.
+    fn lapse(&mut self) -> bool {
+        let Some(sink) = self.injector.as_deref_mut() else {
+            return false;
+        };
+        if !self.quiet.due(self.inbound.capacity() == 0) {
+            return false;
+        }
+        sink.release_all();
+        true
+    }
 }
 
 /// `Tracked` wants a sized sink.
