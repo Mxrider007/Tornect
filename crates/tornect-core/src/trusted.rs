@@ -250,7 +250,7 @@ impl TrustedDevices {
         match fs_err::read_to_string(path) {
             Ok(text) => toml::from_str(&text).map_err(|source| CoreError::ConfigParse {
                 path: path.to_owned(),
-                source: Box::new(source),
+                source: Box::new(crate::error::TomlError::new(&text, &source)),
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
@@ -390,7 +390,7 @@ impl KnownHosts {
         match fs_err::read_to_string(path) {
             Ok(text) => toml::from_str(&text).map_err(|source| CoreError::ConfigParse {
                 path: path.to_owned(),
-                source: Box::new(source),
+                source: Box::new(crate::error::TomlError::new(&text, &source)),
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
