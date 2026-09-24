@@ -280,7 +280,7 @@ impl Config {
         };
         let cfg: Self = toml::from_str(&text).map_err(|source| CoreError::ConfigParse {
             path: path.to_path_buf(),
-            source: Box::new(source),
+            source: Box::new(crate::error::TomlError::new(&text, &source)),
         })?;
         cfg.validate()?;
         Ok(cfg)
