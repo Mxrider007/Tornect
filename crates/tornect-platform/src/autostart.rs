@@ -259,6 +259,189 @@ pub fn decode_console_output(bytes: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Where the executable may live (slice-F F2-2, default 1, F1-4, F2-6)
+// ---------------------------------------------------------------------------
+
+/// What the location check needs to know of one path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathFacts {
+    /// Owner.
+    pub uid: u32,
+    /// Group.
+    pub gid: u32,
+    /// Permission bits (`st_mode`).
+    pub mode: u32,
+    /// A symbolic link rather than what it points to.
+    pub symlink: bool,
+}
+
+/// Whether the start-at-login unit may run `exe` on a Unix: nobody but this
+/// user (`uid`, primary group `gid`) or root can replace it, and systemd
+/// takes its path as written (slice-F F2-2, the Linux side of default 1, and
+/// F2-6's characters).
+///
+/// The executable and every directory above it must be owned by root or this
+/// user, writable by no other account (a sticky `/tmp`, `/var/tmp` or
+/// `/dev/shm` is refused too: another account can re-create a removed entry
+/// there), and group-writable only for this user's primary group (a
+/// user-private group under umask 002). No component may be a symbolic link:
+/// the registered path is the real one (`current_exe` resolves them). `$`,
+/// quotes and backslashes are refused in the program path, which systemd does
+/// not take as written there.
+pub fn unix_exe_location_ok(
+    exe: &Path,
+    uid: u32,
+    gid: u32,
+    stat: &dyn Fn(&Path) -> std::io::Result<PathFacts>,
+) -> Result<(), AutostartError> {
+    let refuse = |why: String| {
+        Err(AutostartError::Unavailable(format!(
+            "{why}, so another account could change what runs at every login; keep `tornect` in \
+             a folder only you (or root) can change, such as ~/.local/bin, and run `tornect \
+             service install` from there"
+        )))
+    };
+    if let Some(c) = exe
+        .to_string_lossy()
+        .chars()
+        .find(|c| matches!(c, '$' | '"' | '\'' | '\\'))
+    {
+        return Err(AutostartError::Unavailable(format!(
+            "{} contains {c:?}, which a systemd unit does not take as written in the program's \
+             path; move `tornect` to a folder whose path has no `$`, quotes or backslashes",
+            exe.display()
+        )));
+    }
+    if !exe.is_absolute() {
+        return Err(AutostartError::Unquotable(format!(
+            "{} is not an absolute path",
+            exe.display()
+        )));
+    }
+    for path in exe.ancestors() {
+        let f = match stat(path) {
+            Ok(f) => f,
+            Err(e) => {
+                return refuse(format!(
+                    "could not check who can change {}: {e}",
+                    path.display()
+                ));
+            }
+        };
+        if f.symlink {
+            return refuse(format!(
+                "{} is a symbolic link, whose target is not what was checked",
+                path.display()
+            ));
+        }
+        if f.uid != 0 && f.uid != uid {
+            return refuse(format!(
+                "{} belongs to another account (uid {})",
+                path.display(),
+                f.uid
+            ));
+        }
+        if f.mode & 0o002 != 0 {
+            return refuse(format!(
+                "{} can be changed by every account on this computer",
+                path.display()
+            ));
+        }
+        if f.mode & 0o020 != 0 && f.gid != gid {
+            return refuse(format!(
+                "{} can be changed by the members of group {}",
+                path.display(),
+                f.gid
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The real user and group ids in `/proc/self/status`.
+#[must_use]
+pub fn parse_status_ids(status: &str) -> Option<(u32, u32)> {
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+    };
+    Some((field("Uid:")?, field("Gid:")?))
+}
+
+/// [`unix_exe_location_ok`] for this process's user, against the real file
+/// system.
+fn this_users_exe_location_ok(exe: &Path) -> Result<(), AutostartError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let status = std::fs::read_to_string("/proc/self/status").map_err(|e| {
+            AutostartError::Unavailable(format!("could not read who this process runs as: {e}"))
+        })?;
+        let (uid, gid) = parse_status_ids(&status).ok_or_else(|| {
+            AutostartError::Unavailable("/proc/self/status names no user or group".to_owned())
+        })?;
+        let stat = |p: &Path| {
+            std::fs::symlink_metadata(p).map(|m| PathFacts {
+                uid: m.uid(),
+                gid: m.gid(),
+                mode: m.mode(),
+                symlink: m.file_type().is_symlink(),
+            })
+        };
+        unix_exe_location_ok(exe, uid, gid, &stat)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = exe;
+        Err(AutostartError::Unavailable(
+            "a systemd user unit is registered on Linux only".to_owned(),
+        ))
+    }
+}
+
+/// Whether the Windows task may run `exe` (default 1, slice F): the
+/// non-elevated task only from under the user's profile or Program Files, the
+/// elevated one only from under Program Files. Other accounts cannot change
+/// either folder; a folder under `C:\` inherits "Authenticated Users: Modify"
+/// (review finding E2-2), so a `tornect.exe` there could be replaced by
+/// another account and would run at every login. The folders come from the OS
+/// (`SHGetKnownFolderPath`), not from the environment (F1-4); a folder the OS
+/// does not name is not guessed.
+pub fn windows_exe_location_ok(
+    exe: &str,
+    elevated: bool,
+    profile: Option<&str>,
+    program_files: Option<&str>,
+) -> Result<(), AutostartError> {
+    let program_files: Vec<String> = program_files.map(str::to_owned).into_iter().collect();
+    if elevated {
+        if location_under(exe, &program_files) {
+            return Ok(());
+        }
+        return Err(AutostartError::Unavailable(format!(
+            "the elevated task runs only a tornect.exe under Program Files, which only \
+             administrators can change; {exe} is elsewhere, so another account could replace \
+             what would run elevated"
+        )));
+    }
+    let mut allowed = program_files;
+    allowed.extend(profile.map(str::to_owned));
+    if location_under(exe, &allowed) {
+        return Ok(());
+    }
+    Err(AutostartError::Unavailable(format!(
+        "the start-at-login task runs only a tornect.exe under your user folder{} or Program \
+         Files, which other accounts cannot change; {exe} is elsewhere, so another account could \
+         replace what would run at every login; move the Tornect folder there and run \
+         `tornect service install` from it",
+        profile.map(|p| format!(" ({p})")).unwrap_or_default()
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // Linux: a systemd user unit
 // ---------------------------------------------------------------------------
 
@@ -563,7 +746,8 @@ impl Autostart for SystemdUserUnit {
             ));
         }
         self.systemctl_bin()?;
-        systemd_unit_text(&self.spec).map(drop)
+        systemd_unit_text(&self.spec)?;
+        this_users_exe_location_ok(&self.spec.exe)
     }
 
     fn install(&self, elevated: bool) -> Result<AutostartState, AutostartError> {
@@ -1097,16 +1281,13 @@ pub fn parse_task_definition(output: &str) -> Option<Registration> {
     })
 }
 
-/// Whether the elevated task may run `exe`: only from under Program Files,
-/// which only administrators can write. An elevated task that runs a file
-/// another account can replace is a privilege escalation for that account
-/// (the directory ACL of review finding E2-2 applies to the executable's own
-/// folder: one under `C:\` inherits "Authenticated Users: Modify").
+/// Whether the Windows path `exe` lies under one of `folders`: a case-folded
+/// prefix test with a separator appended, `..` refused.
 #[must_use]
-pub fn elevated_location_ok(exe: &str, program_files: &[String]) -> bool {
+pub fn location_under(exe: &str, folders: &[String]) -> bool {
     let norm = |s: &str| s.replace('/', "\\").to_lowercase();
     let exe = norm(exe);
-    program_files.iter().filter(|p| !p.is_empty()).any(|dir| {
+    folders.iter().filter(|p| !p.is_empty()).any(|dir| {
         let mut dir = norm(dir);
         if !dir.ends_with('\\') {
             dir.push('\\');
@@ -1148,20 +1329,17 @@ impl TaskScheduler {
     fn xml(&self, elevated: bool) -> Result<String, AutostartError> {
         let sid = crate::win::current_user_sid()
             .map_err(|e| AutostartError::Failed(format!("reading this user's SID: {e}")))?;
-        if elevated {
-            let program_files: Vec<String> = ["ProgramFiles", "ProgramW6432"]
-                .iter()
-                .filter_map(|v| std::env::var(v).ok())
-                .collect();
-            if !elevated_location_ok(self.exe_str()?, &program_files) {
-                return Err(AutostartError::Unavailable(format!(
-                    "the elevated task runs only a tornect.exe under Program Files, which only \
-                     administrators can change; {} is elsewhere, so another account could \
-                     replace what would run elevated",
-                    self.spec.exe.display()
-                )));
-            }
-        }
+        let folder = |id| {
+            crate::win::known_folder(id)
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_owned))
+        };
+        windows_exe_location_ok(
+            self.exe_str()?,
+            elevated,
+            folder(crate::win::KnownFolder::Profile).as_deref(),
+            folder(crate::win::KnownFolder::ProgramFiles).as_deref(),
+        )?;
         task_xml(&self.spec, &sid, elevated)
     }
 
@@ -1900,14 +2078,142 @@ mod tests {
         );
     }
 
+    /// A file system for the location check: path → (owner, group, mode,
+    /// symlink).
+    fn facts(
+        table: &[(&str, u32, u32, u32, bool)],
+    ) -> impl Fn(&Path) -> std::io::Result<PathFacts> + use<> {
+        let map: std::collections::HashMap<PathBuf, PathFacts> = table
+            .iter()
+            .map(|&(p, uid, gid, mode, symlink)| {
+                (
+                    PathBuf::from(p),
+                    PathFacts {
+                        uid,
+                        gid,
+                        mode,
+                        symlink,
+                    },
+                )
+            })
+            .collect();
+        move |p: &Path| {
+            map.get(p)
+                .copied()
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+        }
+    }
+
+    /// Slice-F F2-2 (the Linux side of default 1, and F2-6's characters): the
+    /// unit runs only an executable that nobody but this user or root can
+    /// replace, on a path systemd takes as written. Before, `preflight`
+    /// accepted every one of these.
+    #[test]
+    fn only_an_executable_nobody_else_can_replace_starts_at_login() {
+        const U: u32 = 1000;
+        const G: u32 = 1000;
+        let fs = facts(&[
+            ("/", 0, 0, 0o40755, false),
+            ("/home", 0, 0, 0o40755, false),
+            ("/home/u", U, G, 0o40750, false),
+            ("/home/u/.local", U, G, 0o40755, false),
+            ("/home/u/.local/bin", U, G, 0o40755, false),
+            ("/home/u/.local/bin/tornect", U, G, 0o100755, false),
+            // A user-private group under umask 002.
+            ("/home/u/apps", U, G, 0o40775, false),
+            ("/home/u/apps/tornect", U, G, 0o100775, false),
+            ("/home/u/theirs", U, G, 0o40755, false),
+            ("/home/u/theirs/tornect", 1001, 1001, 0o100755, false),
+            ("/home/u/link", U, G, 0o120777, true),
+            ("/home/u/link/tornect", U, G, 0o100755, false),
+            ("/tmp", 0, 0, 0o41777, false),
+            ("/tmp/t", U, G, 0o40755, false),
+            ("/tmp/t/tornect", U, G, 0o100755, false),
+            ("/opt", 0, 0, 0o40755, false),
+            ("/opt/shared", 0, 50, 0o42775, false),
+            ("/opt/shared/tornect", U, G, 0o100755, false),
+            ("/usr", 0, 0, 0o40755, false),
+            ("/usr/bin", 0, 0, 0o40755, false),
+            ("/usr/bin/tornect", 0, 0, 0o100755, false),
+            ("/home/u/a$b", U, G, 0o40755, false),
+            ("/home/u/a$b/tornect", U, G, 0o100755, false),
+            ("/home/u/a\"b", U, G, 0o40755, false),
+            ("/home/u/a\"b/tornect", U, G, 0o100755, false),
+            ("/home/u/a'b", U, G, 0o40755, false),
+            ("/home/u/a'b/tornect", U, G, 0o100755, false),
+            ("/home/u/a\\b", U, G, 0o40755, false),
+            ("/home/u/a\\b/tornect", U, G, 0o100755, false),
+        ]);
+        let check = |p: &str| unix_exe_location_ok(Path::new(p), U, G, &fs);
+        for ok in [
+            "/home/u/.local/bin/tornect",
+            "/home/u/apps/tornect",
+            "/usr/bin/tornect",
+        ] {
+            assert!(check(ok).is_ok(), "{ok}: {:?}", check(ok));
+        }
+        for (bad, why) in [
+            ("/tmp/t/tornect", "every account"),
+            ("/opt/shared/tornect", "group"),
+            ("/home/u/theirs/tornect", "another account"),
+            ("/home/u/link/tornect", "symbolic link"),
+            ("/home/u/a$b/tornect", "$"),
+            ("/home/u/a\"b/tornect", "\""),
+            ("/home/u/a'b/tornect", "'"),
+            ("/home/u/a\\b/tornect", "\\"),
+            ("/nowhere/tornect", "could not check"),
+        ] {
+            match check(bad) {
+                Err(AutostartError::Unavailable(m)) => assert!(m.contains(why), "{bad}: {m}"),
+                other => panic!("{bad} must be refused: {other:?}"),
+            }
+        }
+    }
+
+    /// The ids the Linux check compares with are the real ones.
+    #[test]
+    fn the_real_ids_are_read_from_the_status_file() {
+        let status = "Name:\ttornect\nUid:\t1000\t1001\t1000\t1000\nGid:\t100\t0\t100\t100\n";
+        assert_eq!(parse_status_ids(status), Some((1000, 100)));
+        assert_eq!(parse_status_ids("Name:\tx\n"), None);
+    }
+
+    /// Default 1 (slice F): the non-elevated task runs a `tornect.exe` under
+    /// the user's profile or Program Files only; the elevated one under
+    /// Program Files only (F1-4: both folders come from the OS, not the
+    /// environment, in the backend).
+    #[test]
+    fn the_windows_task_runs_only_from_the_profile_or_program_files() {
+        let (profile, pf) = (Some("C:\\Users\\me"), Some("C:\\Program Files"));
+        let check = |exe: &str, elevated| windows_exe_location_ok(exe, elevated, profile, pf);
+        assert!(check("C:\\Users\\me\\Apps\\tornect.exe", false).is_ok());
+        assert!(check("c:\\users\\ME\\apps\\TORNECT.exe", false).is_ok());
+        assert!(check("C:\\Program Files\\Tornect\\tornect.exe", false).is_ok());
+        assert!(check("C:\\Program Files\\Tornect\\tornect.exe", true).is_ok());
+        for (exe, elevated) in [
+            ("C:\\Tools\\tornect.exe", false),
+            ("C:\\Users\\meX\\tornect.exe", false),
+            ("C:\\Users\\me\\..\\other\\tornect.exe", false),
+            ("D:\\tornect.exe", false),
+            ("C:\\Users\\me\\Apps\\tornect.exe", true),
+        ] {
+            assert!(
+                matches!(check(exe, elevated), Err(AutostartError::Unavailable(_))),
+                "{exe} (elevated: {elevated}) must be refused"
+            );
+        }
+        // Folders the OS would not name: refused, never guessed.
+        assert!(windows_exe_location_ok("C:\\Users\\me\\t.exe", false, None, None).is_err());
+    }
+
     #[test]
     fn the_elevated_task_runs_only_from_program_files() {
         let pf = vec!["C:\\Program Files".to_owned(), String::new()];
-        assert!(elevated_location_ok(
+        assert!(location_under(
             "C:\\Program Files\\Tornect\\tornect.exe",
             &pf
         ));
-        assert!(elevated_location_ok(
+        assert!(location_under(
             "c:\\program files\\tornect\\TORNECT.EXE",
             &pf
         ));
@@ -1918,9 +2224,9 @@ mod tests {
             "C:\\Users\\ana\\Downloads\\tornect.exe",
             "C:\\Program Files\\..\\tornect\\tornect.exe",
         ] {
-            assert!(!elevated_location_ok(bad, &pf), "{bad}");
+            assert!(!location_under(bad, &pf), "{bad}");
         }
-        assert!(!elevated_location_ok("C:\\Program Files\\t.exe", &[]));
+        assert!(!location_under("C:\\Program Files\\t.exe", &[]));
     }
 
     /// The readiness row for every answer (§B.8.7.1 ⑥): `Ok` only for an
@@ -2008,8 +2314,8 @@ mod tests {
     /// `XDG_CONFIG_HOME` the backend would read) and a unique unit name, so the
     /// real `tornect-host.service` is never touched. `enable` links the file
     /// into `~/.config/systemd/user` and `disable` removes both links; nothing
-    /// is started, and nothing stays enabled. The "executable" is
-    /// `/usr/bin/true`.
+    /// is started, and nothing stays enabled. The "executable" is the real
+    /// path of `/usr/bin/true`.
     ///
     /// ```text
     /// cargo test --workspace -- --ignored --nocapture live_systemd_round_trip
@@ -2026,10 +2332,14 @@ mod tests {
             "tornect-host-selftest-{}.service",
             data_encoding::HEXLOWER.encode(&nonce)
         );
+        // The real path: the unit runs no path through a symbolic link, and
+        // `/usr/bin/true` is one on some distributions.
+        let exe = std::fs::canonicalize("/usr/bin/true").unwrap();
+        let exe = exe.to_str().unwrap();
         let unit = SystemdUserUnit::for_config_home(
             tmp.path(),
             &name,
-            spec("/usr/bin/true", Some("/srv/tornect test home")),
+            spec(exe, Some("/srv/tornect test home")),
         );
         let before = unit.status().unwrap();
         eprintln!("before:    {before:?}");
@@ -2060,8 +2370,10 @@ mod tests {
         };
         assert!(reg.enabled && !reg.elevated);
         assert_eq!(
-            reg.command.as_deref(),
-            Some("\"/usr/bin/true\" \"--home\" \"/srv/tornect test home\" \"host\"")
+            reg.command,
+            Some(format!(
+                "\"{exe}\" \"--home\" \"/srv/tornect test home\" \"host\""
+            ))
         );
         assert!(linked, "enable must add the WantedBy link");
         assert_eq!(removed.unwrap(), AutostartState::Absent);

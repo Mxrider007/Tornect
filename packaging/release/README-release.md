@@ -132,15 +132,20 @@ computer stays unreachable until someone logs in.
 - **Linux:** a systemd user unit, `~/.config/systemd/user/tornect-host.service`,
   started with your graphical session. Started this way the host answers pings
   only and refuses every session, because it has no window or terminal to show
-  one. `systemctl --user stop tornect-host` ends it gracefully. The password dialog is polkit's `org.tornect.autostart` action,
+  one. `systemctl --user stop tornect-host` ends it gracefully. Keep `tornect`
+  in a folder only you (or root) can change: `service install` refuses a
+  `tornect` another account could replace (under `/tmp` or a shared folder, or
+  owned by another account) and a path with `$`, quotes or backslashes. The
+  password dialog is polkit's `org.tornect.autostart` action,
   so `packaging/polkit/org.tornect.policy` must be installed. Remove it with
   `tornect service uninstall` (or `systemctl --user disable tornect-host` and
   deleting the file).
 - **Windows:** a Task Scheduler task `\Tornect` that runs `tornect.exe host` in a
   console window when you log on; that window is the host (Ctrl-C in it ends
   every session). The password dialog is Windows' secure credential prompt:
-  choose your password, not a PIN. Keep `tornect.exe` in a folder only you can
-  change. `--elevated` (administrators only, `tornect.exe` under
+  choose your password, not a PIN. `service install` refuses a `tornect.exe`
+  outside your user folder or `C:\Program Files`, where another account could
+  replace it. `--elevated` (administrators only, `tornect.exe` under
   `C:\Program Files`) registers it to run elevated, after a UAC prompt: then
   **every remote Control session is an administrator session**. A `--home` or
   `TORNECT_HOME` directory is refused on Windows. Stop a running host (Ctrl-C in
