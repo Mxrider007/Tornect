@@ -109,7 +109,7 @@ zip has no owner ids, and the paths of the build machine are remapped, so the zi
 its files. BUILD-INFO.txt also names the advisory database the check used: with another database on
 disk, that line, and so the zip's bytes, differ, and nothing else does.
 
-Checked on mx-vm on 2026-09-23 (`docs/VERIFICATION.md`, *The zips reproduce*): two builds from scratch
+Checked on the build VM on 2026-09-23 (`docs/VERIFICATION.md`, *The zips reproduce*): two builds from scratch
 at one commit gave bit-identical executables and byte-identical zips. No second machine has tried.
 The Linux C compiler, nasm, binutils, glibc and Info-ZIP are the build host's own, so use the same
 distribution release (Ubuntu 26.04 so far) with the versions `BUILD-INFO.txt` records.
