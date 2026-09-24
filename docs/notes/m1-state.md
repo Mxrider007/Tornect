@@ -654,6 +654,83 @@ local when it was written, for push 2.
 **Unreviewed by a hostile review:** everything after `5ba8f11`, including `pipewire.rs`'s unsafe
 FFI, the portal and token handling, the idle ping and this session's fixes.
 
+## Sessions 2026-09-23/24 — the window, the indicator, the Windows build, packaging, start at login; three reviews and their fixes; the pre-release prepared
+
+**Gate: green at 634 passed, 0 failed, 5 ignored** at `681bc51` (480 at `ad55279`), cargo-deny ok against the
+RustSec database `1931a145168d` of 2026-09-23. `origin/main` is `8df9123`; everything after it (`cfa7237` …
+`681bc51` and the documentation commits of 2026-09-24) was local when this was written. **Not tagged.** The fifth
+ignored test is the systemd round trip.
+
+- **The window (M1-50; `d6ef5ba`, `ba811fc`, `c7129be`, `981f556`).** `tornect` with no subcommand opens a manual
+  winit loop driving egui-winit and egui-wgpu: the home screen, inline pairing and session cards, the client's
+  code card, the stream window with input by physical scancode (sent only for a control grant), the sharing
+  banner, the first-run Wayland grant as a setup step, and a hidden `--preview`. `--no-host` makes a
+  connect-only window.
+- **The sharing indicator (M1-50; `9eb9e54`, `93a5d56`).** An always-on-top, undecorated window "Tornect:
+  sharing" that opens without the focus, in the same process as the window; one row per shared session, with
+  Stop. Its line puts the label last (E1-2), which departs from §B.8.7.3's word order.
+- **The Windows build (M1-51; `cb46b4d`, `7bbb51c`, `b7ef5a9`, `fa92538`, `c3cc2e8`).** `result_large_err` fixed
+  by boxing the TOML error; every C and C++ object built with the stack protector; libc++ linked statically, so
+  `tornect.exe` imports only DLLs Windows ships (the first link needed `libc++.dll`); the 13 test binaries build.
+  The `a14` flake (about 1 run in 300) fixed. Under Wine 10.0: `--version`, `id`, `doctor` and four test
+  binaries pass.
+- **pt-fetch, dist and B3-6 (M1-52; `95c96d7`, `acbc75d`, `bc4793e`, `3ca4094`).** lyrebird fetched, pinned and
+  signature-checked; both zips from one clean commit, reproducible on this machine (two builds from scratch,
+  bit-identical executables); the gate fails without cargo-deny. The Linux executable needs glibc 2.43 or newer.
+- **Start at login (M1-53; `66c2442`, `b4e8dd4`, `176e9de`).** `tornect service install`, `uninstall` and `status`:
+  a systemd user unit or a Task Scheduler task from XML, through the guard with OS re-authentication (polkit;
+  CredUI's secure prompt and `LogonUserW` on Windows).
+- **The slice-E review** of `73e9314..3ca4094` (three threat modelers, no refuter pass): 1 Medium, 11 Low, 6 Info
+  plus P-1, no BLOCK. Fixed: **E1-1 ≡ E2-1** (the Medium: keys typed for another program answered a card) by the
+  operator's "pointer-only Allow" (`746a628`), E1-6 (`9ca0496`), E1-4 and E1-3 (`a4d5f72`), E1-2 (`f9a1a3e`), E1-5's
+  sentence (`7e9f2cc`), E2-3 (`a69a7d2`), E2-2's interim rule (`cfa7237`), E2-4 and P-2 (`82a618c`; PARTIAL without
+  the linker flag), E2-7 (`4e6a42f`, its flaky test fixed in `081cc08` and `94d68a6`). E3-1 and E3-3 are met by
+  `dist` and the gate.
+- **The slice-F review** of `3ca4094..176e9de` (two threat modelers): 2 Medium, 4 Low, 6 Info plus P-1 and P-2, no
+  BLOCK. Fixed: **F2-1** (the Linux start-at-login host answers pings only, `2b5c4c8`), **F1-1** (a failed task query
+  is never "not registered", `5227322`), F1-3 (`a93aeb2`), F2-2 with F1-4 and F2-6's characters (`8df9123`), F2-3
+  (`6c9e512`), F2-4 (`61f2e40`, and the manual removal step `d2be07e`), F1-2 and F1-5 (`2171aed`), default 3 and N-2 in
+  the README (`44944b7`), and the operator's `--elevated` refusal for a standard account (`c127a60`).
+- **The fix-closure check** (phase 2a at `8df9123`: 13 of 13 claims closed, new N-1 LOW and N-2 INFO; phase 2b at
+  `025da8c`: 9 of 11, E2-4 PARTIAL, new N-3 INFO and N-4 LOW) and **the release-preparation review** (phase 2c, four
+  parts up to `b6897b7`: L-1, L-2 and Infos), no BLOCK anywhere. Fixed: N-1 (`2587bbe`), N-3 (`6a0eedb`), N-4
+  (`8836cd8`), L-1 (`e24b6a0`), L-2 (`c6aed2f`), I-2 (`9628054`), I-3 (`42e12a7`), P2-I1 (`94d68a6`), P2-I2
+  (`3cee64a`), P2-I3 (`b6897b7`), P2-I4 (`2cf4b04`), the build VM's host name out of the code (`4c66c47`) and the docs
+  (`c4e3cf7` and the documentation commits of 2026-09-24). P3-I1 … P3-I3 are disclosed, not fixed.
+- **The release preparation (M1-52).** `cargo deny fetch` (2026-09-24 03:01) moved the RustSec database from
+  2026-08-29 to 2026-09-23, and the gate then failed on **RUSTSEC-2026-0285** (rustls 0.23.43): rustls 0.23.45
+  (`1298bc6`). The database is named in the gate and in `BUILD-INFO.txt` (`0b020b9`, with its ignores `42e12a7` and
+  the 7-day limit `9628054`); `THIRD_PARTY_LICENSES.txt` goes into each zip (`427499a`, `1150702`); `pt.rs:620`
+  (`7aa8522`); `docs/RELEASING.md` (`8d05ae7`). A dist check run at `427499a` built both zips and passed the smoke
+  tests (Wine with the home inside the profile); its zips were deleted.
+- **Release verification at `b6897b7`:** the gate three times (633 / 0 / 5), the `tornect-signal` binary 40 of 40,
+  Xvfb 59 passed, five failing-first spot checks, gnullvm clippy clean. **T-1** (LOW, test strength: the
+  view-only mapping was pinned by no test) is fixed in `681bc51` (634 / 0 / 5).
+- **Live on the build VM, 2026-09-24:** start at login with the debug build's re-auth escape (install; `systemctl
+  --user start` as the login stand-in, whose journal shows the pings-only line; F2-3's refusal through the live
+  control channel; a graceful stop; uninstall; nothing left enabled). The Windows release executable under Wine:
+  33 imports and no `credui.dll`, `--version`, `id`, `doctor`, the E2-2 refusals.
+- **The console check of the window over real Tor was NOT PERFORMED three times:** 2026-09-23 02:27–02:50 (at
+  `981f556`) and 22:53–23:38 (at `a69a7d2`), 2026-09-24 01:14–01:20 (at `8df9123`, behind a 5-minute presence
+  gate). Each time the windows were up and both hosts `REACHABLE`, and nobody was at the VM screen. Its polkit part
+  was never reached.
+- **Operator rulings:** decision M1-54 (each with its date).
+
+**Still open:**
+- The console check (the window over real Tor with a person at the screen, keys over Tor, the polkit path live).
+- E2-4's load-time residual: the linker's dependent-load flag waits for the operator (M1-51).
+- Everything at run time on Windows (NEEDS-DEVICE), and the Linux ↔ Windows session.
+- Carried to M6 or later: E2-2's DACL, E2-5, E2-6, E2-8, E3-2, E3-4 (before 2026-10-26), E3-5, slice-E P-1
+  (CFG/CET), F1-6, F2-5, F2-6's readiness, slice-F P-1, F1-2's residuals, N-2, N-3's extras (the trigger's
+  `<UserId>`; only a SID or a qualified name as the principal), P3-I1 … P3-I3; the §B.8.7.3 indicator extras and
+  the E1-5 badge; the unattended client CLI; the withdrawn-card questions (a withdrawn pairing card counts toward
+  the temp-ban; a withdrawn session card answers `DENIED`, not `BUSY`); a held key on a Windows host types once
+  (no key repeats are forwarded).
+- Cosmetic: a long IPC refusal is cut at 256 characters mid-word; the pings-only host still prints its "sharing:
+  this desktop …" line.
+- **Unreviewed by a hostile review:** `5ba8f11..73e9314` (the Wayland backend, `pipewire.rs`'s unsafe FFI, the
+  portal and token handling, the idle ping, the slice-D fixes), and everything after `b6897b7`.
+
 ## Gotchas (the build VM)
 
 - **The gate/plain-`cargo` rebuild ping-pong is fixed** (M1-45, 2026-09-22). `cargo xtask` runs
@@ -666,8 +743,22 @@ FFI, the portal and token handling, the idle ping and this session's fixes.
   features and rebuilds the Tor stack (session 8: 1.8 GB of `deps` before it was stopped). Run
   filtered tests as `cargo test --workspace -- <filter>`, and ignored ones as
   `cargo test --workspace -- --ignored <filter>`.
-- Build with `CARGO_BUILD_JOBS=3 TMPDIR=$PWD/target/tmp`; `/tmp` is a 3.7 GiB quota tmpfs
-  (zstd-sys fails there); Tor state under `target/tornect-test/<name>`, never `/tmp`.
+- Build with `TMPDIR=$PWD/target/tmp`; `/tmp` is a 3.7 GiB quota tmpfs (zstd-sys fails there);
+  Tor state under `target/tornect-test/<name>`, never `/tmp`. **systemd-oomd kills the terminal's whole
+  process group under memory pressure** (twice on 2026-09-23): run every heavy cargo command in its
+  own scope, `systemd-run --user --scope --quiet -- env CARGO_BUILD_JOBS=2 TMPDIR=$PWD/target/tmp cargo …`.
+- The gate's advisory check is offline: fetch the RustSec database first
+  (`target/tools/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny fetch`, network). The gate and
+  `dist` refuse two database copies (L-2), and `dist` one older than 7 days.
+- For the Windows target, lint with `--workspace` (`-p tornect --all-targets` alone fails: `start_paused`
+  needs tokio's `test-util`, which only the workspace build unifies), with llvm-mingw's `bin` on `PATH`.
+  nasm 3.01 is installed since 2026-09-23, so OpenH264's x86 assembly is built on both targets.
+- Under Wine a `--home` must lie inside the Wine user's profile (E2-2): `wine cmd /v:on /c 'tornect.exe
+  --home %USERPROFILE%\<dir> id & echo exit !ERRORLEVEL!'` (`%ERRORLEVEL%` would be read before the
+  command runs).
+- A console check with the operator needs presence first: one visible action on the VM's screen,
+  watched for within a few minutes (the first-run grant counts). A chat answer does not prove it, and
+  three attempts ended with nobody at the screen.
 - A cold Arti rebuild is 2–5 min; the pre-commit hook runs fmt + clippy
   (`TORNECT_SKIP_HOOKS=1` for docs-only commits).
 - If a worktree ever shares `target/`, `target/debug/xtask` embeds *that* worktree's root and
@@ -688,5 +779,6 @@ FFI, the portal and token handling, the idle ping and this session's fixes.
   `DBUS_SESSION_BUS_ADDRESS`, `XDG_SESSION_TYPE=wayland`).
 - Never run an injection test against `DISPLAY=:0` here (the live Xwayland): the X11 input test
   runs only with `XDG_SESSION_TYPE=x11`, under Xvfb.
-- Disk: 93 % at session 8's end. `target/debug/incremental` is safe to delete and regrows
-  (4.7–4.8 G each time); never prune `target/debug/deps` by atime.
+- Disk: 89 % (11 G free) on 2026-09-24. `target/debug/incremental` is safe to delete and regrows
+  (3–9 G each time); `target/dist/cargo` (dist's build cache, 5.6 G) makes the next dist take seconds and
+  is safe to delete; never prune `target/debug/deps` by atime.
