@@ -257,13 +257,17 @@ mod tests {
         ));
         // the host name is a user input and counts against the password
         assert!(matches!(
-            check("mx-vm-tornect-host-2026", &["mx-vm-tornect-host"], false),
+            check(
+                "build-vm-tornect-host-2026",
+                &["build-vm-tornect-host"],
+                false
+            ),
             Err(PolicyError::TooWeak { .. })
         ));
         let strong = "quiet verdant otter lantern zephyr";
-        let c = check(strong, &["mx-vm"], false).unwrap();
+        let c = check(strong, &["build-vm"], false).unwrap();
         assert!(c.score >= 3);
-        let c4 = check(strong, &["mx-vm"], true).unwrap();
+        let c4 = check(strong, &["build-vm"], true).unwrap();
         assert_eq!(c4.score, 4);
         // A score-3 password is accepted with a keychain but refused on a file
         // keystore — the one behaviour the §B.8.7.2 file-keystore clause adds.
