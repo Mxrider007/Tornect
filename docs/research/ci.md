@@ -8,7 +8,7 @@ Every claim cites a URL, a `gh api` call, or a path under `/tmp/crates-src/<crat
 Repo facts: `Mxrider420z/Tornect` is **private** (`gh api repos/Mxrider420z/Tornect` →
 `private=true`), default branch `main`.
 
-## 0. What was actually verified on this VM (mx-vm, Rust 1.96.0 stable)
+## 0. What was actually verified on this VM (the build VM, Rust 1.96.0 stable)
 
 | Probe | Where | Result |
 |---|---|---|
