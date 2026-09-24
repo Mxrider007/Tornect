@@ -16,6 +16,10 @@ pub enum Wake {
     Frame,
     /// A popup opened or a session started: raise the main window.
     Attention,
+    /// The process was asked to end (SIGINT or SIGTERM; Ctrl-C or Ctrl-Break
+    /// on Windows): close as the window's close button does, ending every
+    /// session with a goodbye.
+    Quit,
 }
 
 /// Wakes the UI thread (a winit event-loop proxy); a no-op in tests.
