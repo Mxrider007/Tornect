@@ -23,9 +23,10 @@ use windows_sys::Win32::Security::Credentials::{
 };
 use windows_sys::Win32::Security::{
     CheckTokenMembership, CreateWellKnownSid, EqualSid, GetTokenInformation,
-    LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, LogonUserW, SECURITY_MAX_SID_SIZE,
-    TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN, TOKEN_QUERY, TOKEN_USER, TokenElevationType,
-    TokenElevationTypeLimited, TokenLinkedToken, TokenUser, WinBuiltinAdministratorsSid,
+    LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, LogonUserW, LookupAccountNameW,
+    SECURITY_MAX_SID_SIZE, SID_NAME_USE, TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN, TOKEN_QUERY,
+    TOKEN_USER, TokenElevationType, TokenElevationTypeLimited, TokenLinkedToken, TokenUser,
+    WinBuiltinAdministratorsSid,
 };
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoTaskMemFree, CoUninitialize,
@@ -38,8 +39,8 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::{
-    FOLDERID_Profile, FOLDERID_ProgramFiles, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
-    SHELLEXECUTEINFOW, SHGetKnownFolderPath, ShellExecuteExW,
+    FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_ProgramFiles, SEE_MASK_NOASYNC,
+    SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, SHGetKnownFolderPath, ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use windows_sys::core::{BOOL, PWSTR};
@@ -147,6 +148,8 @@ pub(crate) enum KnownFolder {
     Profile,
     /// `FOLDERID_ProgramFiles`: `C:\Program Files` for this 64-bit program.
     ProgramFiles,
+    /// `FOLDERID_LocalAppData`: `C:\Users\<name>\AppData\Local`.
+    LocalAppData,
 }
 
 /// A known folder of this user, from the OS (`SHGetKnownFolderPath`) rather
@@ -156,6 +159,7 @@ pub(crate) fn known_folder(which: KnownFolder) -> std::io::Result<PathBuf> {
     let id = match which {
         KnownFolder::Profile => &FOLDERID_Profile,
         KnownFolder::ProgramFiles => &FOLDERID_ProgramFiles,
+        KnownFolder::LocalAppData => &FOLDERID_LocalAppData,
     };
     let mut path: *mut u16 = null_mut();
     // SAFETY: `id` points to a constant GUID; no flags; a null token means
@@ -313,10 +317,62 @@ pub(crate) fn is_administrator() -> std::io::Result<bool> {
 pub(crate) fn current_user_sid() -> std::io::Result<String> {
     let token = process_token()?;
     let user = token_user(token.0)?;
+    sid_string(sid_of(&user))
+}
+
+/// The string SID of the account `name` as `LookupAccountNameW` resolves it
+/// (`DOMAIN\user` and the other forms it takes), for a task's principal that
+/// the Task Scheduler prints as a name.
+pub(crate) fn sid_of_account_name(name: &str) -> std::io::Result<String> {
+    let name = wide(name);
+    let mut sid_len = 0u32;
+    let mut domain_len = 0u32;
+    let mut kind: SID_NAME_USE = 0;
+    // SAFETY: a size query: null buffers with zero lengths; the sizes needed
+    // are written to `sid_len` and `domain_len`; `name` is NUL-terminated.
+    unsafe {
+        LookupAccountNameW(
+            null(),
+            name.as_ptr(),
+            null_mut(),
+            &mut sid_len,
+            null_mut(),
+            &mut domain_len,
+            &mut kind,
+        )
+    };
+    if sid_len == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // A SID's sub-authorities are `u32`s: keep the buffer aligned for them.
+    let mut sid = vec![0u32; (sid_len as usize).div_ceil(4)];
+    let mut domain = vec![0u16; domain_len as usize + 1];
+    let mut domain_len = u32::try_from(domain.len()).unwrap_or(0);
+    // SAFETY: `sid` is writable for at least `sid_len` bytes and `domain` for
+    // `domain_len` characters; `name` is NUL-terminated; all outlive the call.
+    let ok = unsafe {
+        LookupAccountNameW(
+            null(),
+            name.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut kind,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    sid_string(sid.as_mut_ptr().cast())
+}
+
+/// `sid` as a string (`S-1-…`).
+fn sid_string(sid: *mut c_void) -> std::io::Result<String> {
     let mut text: *mut u16 = null_mut();
-    // SAFETY: the SID points into `user`, alive for this call; on success
-    // `text` is a NUL-terminated string allocated with `LocalAlloc`.
-    let ok = unsafe { ConvertSidToStringSidW(sid_of(&user), &mut text) };
+    // SAFETY: the caller's `sid` is a valid SID alive for this call; on
+    // success `text` is a NUL-terminated string allocated with `LocalAlloc`.
+    let ok = unsafe { ConvertSidToStringSidW(sid, &mut text) };
     if ok == 0 || text.is_null() {
         return Err(std::io::Error::last_os_error());
     }
@@ -396,17 +452,22 @@ pub(crate) fn run_elevated(exe: &Path, params: &str) -> Result<u32, ElevateError
     Ok(code)
 }
 
-/// A file in this user's temporary directory, created new under a random name
+/// A file created new under a random name in a directory the caller names,
 /// and deleted on drop.
 pub(crate) struct TempFile(PathBuf);
 
 impl TempFile {
-    /// Write `bytes` to a new `<prefix>-<random><suffix>`.
-    pub(crate) fn write(prefix: &str, suffix: &str, bytes: &[u8]) -> std::io::Result<Self> {
+    /// Write `bytes` to a new `<dir>\<prefix>-<random><suffix>`.
+    pub(crate) fn write(
+        dir: &Path,
+        prefix: &str,
+        suffix: &str,
+        bytes: &[u8],
+    ) -> std::io::Result<Self> {
         use std::io::Write as _;
         let mut nonce = [0u8; 8];
         getrandom::fill(&mut nonce).map_err(std::io::Error::other)?;
-        let path = std::env::temp_dir().join(format!(
+        let path = dir.join(format!(
             "{prefix}-{}{suffix}",
             data_encoding::HEXLOWER.encode(&nonce)
         ));
