@@ -1262,6 +1262,31 @@ pub struct TaskFacts {
     pub command: Option<String>,
     /// The action's `<Arguments>`, unescaped.
     pub arguments: Option<String>,
+    /// How many actions `<Actions>` holds, of any kind (review N-3: the
+    /// fields above are the first `<Exec>`'s).
+    pub actions: usize,
+}
+
+/// The number of elements directly inside `body`, an element's content.
+fn child_elements(body: &str) -> usize {
+    let (mut depth, mut count, mut rest) = (0usize, 0usize, body);
+    while let Some(open) = rest.find('<') {
+        rest = &rest[open + 1..];
+        let end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..end];
+        if tag.starts_with('/') {
+            depth = depth.saturating_sub(1);
+        } else if !tag.starts_with('!') && !tag.starts_with('?') {
+            if depth == 0 {
+                count += 1;
+            }
+            if !tag.ends_with('/') {
+                depth += 1;
+            }
+        }
+        rest = &rest[end..];
+    }
+    count
 }
 
 /// The [`TaskFacts`] of a task definition.
@@ -1275,14 +1300,15 @@ pub fn task_facts(xml: &str) -> TaskFacts {
         run_level: text(principal.and_then(|p| element(p, "RunLevel"))),
         command: text(exec.and_then(|e| element(e, "Command"))),
         arguments: text(exec.and_then(|e| element(e, "Arguments"))),
+        actions: element(xml, "Actions").map_or(0, child_elements),
     }
 }
 
 /// Whether the task the Task Scheduler holds (`registered`) is the one
-/// Tornect wrote (`written`): it runs as this account (`is_this_account`,
-/// which also takes the name form the scheduler may print), at the same run
-/// level, the same command (case-folded: a Windows path) and the same
-/// arguments. `Err` says what differs (slice-F F1-2: the definition file sat
+/// Tornect wrote (`written`): exactly one action in each (review N-3: a
+/// second one would run too), run as this account (`is_this_account`, which
+/// also takes the name form the scheduler may print), at the same run level,
+/// the same command (case-folded: a Windows path) and the same arguments. `Err` says what differs (slice-F F1-2: the definition file sat
 /// on disk between Tornect writing it and `schtasks` reading it).
 pub fn registered_matches(
     written: &TaskFacts,
@@ -1295,6 +1321,9 @@ pub fn registered_matches(
             .unwrap_or_else(|| "LeastPrivilege".into())
     };
     let mut differs = Vec::new();
+    if written.actions != 1 || registered.actions != 1 {
+        differs.push(format!("it holds {} actions, not one", registered.actions));
+    }
     match registered.principal.as_deref() {
         Some(p) if is_this_account(p) => {}
         Some(p) => differs.push(format!("it runs as {p}, not as you")),
@@ -2346,6 +2375,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Review N-3: a registered definition that holds a second action after
+    /// Tornect's (another `<Exec>`, or a `<ComHandler>`) would run it too at
+    /// every logon; it is not the one written.
+    #[test]
+    fn a_task_with_a_second_action_is_not_the_one_written() {
+        let plain = written(false);
+        let me = |p: &str| p.eq_ignore_ascii_case(SID);
+        for extra in [
+            "<Exec><Command>C:\\Users\\Public\\evil.exe</Command></Exec>",
+            "<ComHandler><ClassId>{00000000-0000-0000-0000-000000000000}</ClassId></ComHandler>",
+        ] {
+            let two = plain.replace("</Exec>", &format!("</Exec>{extra}"));
+            assert_ne!(two, plain);
+            assert!(
+                registered_matches(&task_facts(&plain), &task_facts(&two), &me).is_err(),
+                "a task that also runs {extra} matched"
+            );
+        }
+        assert_eq!(
+            registered_matches(&task_facts(&plain), &task_facts(&plain), &me),
+            Ok(())
+        );
     }
 
     /// Slice-F F1-2, the compare itself: a swapped command or arguments, a
