@@ -6,8 +6,9 @@
 //! * `lint-all`    — fmt check + clippy only
 //! * `pt-fetch`    — lyrebird from the Tor Project archive, checked against
 //!   `packaging/pt/SOURCES.md`, into `target/pt/<os>/`
-//! * `dist`        — the release zips for Linux and Windows, with `SHA256SUMS`,
-//!   in `target/dist/` (`docs/RELEASING.md`; installers are M8 work)
+//! * `dist`        — the release zips for Linux and Windows, with their
+//!   third-party licence texts, and `SHA256SUMS`, in `target/dist/`
+//!   (`docs/RELEASING.md`; installers are M8 work)
 //! * `ffmpeg-fetch`— placeholder until the FFmpeg backend lands (M3)
 //! * `soak`        — placeholder until the loopback demo lands (M3)
 
@@ -15,6 +16,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 mod dist;
+mod licences;
 mod pt;
 mod sha256;
 
