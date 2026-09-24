@@ -541,21 +541,88 @@ impl LogCapture {
     }
 }
 
+thread_local! {
+    /// Where this thread's log lines go while it captures them.
+    static CAPTURING: std::cell::RefCell<Option<LogCapture>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The capturing subscriber's writer: this thread's capture.
+struct ThreadCapture;
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for ThreadCapture {
+    type Writer = LogCapture;
+
+    fn make_writer(&self) -> LogCapture {
+        // The filter lets events through only on a capturing thread.
+        CAPTURING.with(|c| c.borrow().clone().unwrap_or_default())
+    }
+}
+
+/// This thread's log lines, at every level, until dropped.
+struct Capturing {
+    lines: LogCapture,
+}
+
+impl Drop for Capturing {
+    fn drop(&mut self) {
+        CAPTURING.with(|c| c.borrow_mut().take());
+    }
+}
+
+/// Capture this thread's log lines at every level.
+///
+/// Not with a thread-local subscriber (`set_default`), which made
+/// `the_logs_name_peers_by_short_forms_only` fail about one full run in five:
+/// tracing caches each call site's interest for the whole process when the
+/// site is first reached, and while only one dispatcher is registered it asks
+/// the *reaching thread's* default (tracing-core 0.1.36, `callsite.rs`,
+/// `Rebuilder::JustOne`). When another test's thread, which has no subscriber,
+/// reached `session accepted` first, the site was cached as "never" and this
+/// thread's line was never written. One process-wide subscriber instead,
+/// installed once for this test binary, answers "sometimes" for every call
+/// site (`DynFilterFn`, whose answer is never cached) and writes an event only
+/// on a thread that is capturing.
+fn capture_logs() -> Capturing {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(ThreadCapture)
+            .with_filter(tracing_subscriber::filter::DynFilterFn::new(|_, _| {
+                CAPTURING.with(|c| c.borrow().is_some())
+            }));
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
+            .expect("this test binary sets no other global subscriber");
+    });
+    let lines = LogCapture::default();
+    CAPTURING.with(|c| *c.borrow_mut() = Some(lines.clone()));
+    Capturing { lines }
+}
+
+/// Why the capture above used to miss lines: a call site that another
+/// thread reaches first must still be captured on this one.
+#[test]
+fn a_call_site_first_reached_on_another_thread_is_still_captured() {
+    fn probe() {
+        tracing::info!("the probe's line");
+    }
+    let capture = capture_logs();
+    std::thread::spawn(probe).join().unwrap();
+    probe();
+    let logs = capture.lines.text();
+    assert!(logs.contains("the probe's line"), "not captured: {logs:?}");
+}
+
 /// SLICE-E E2-7: the lines a pairing and a session write, at every level,
 /// name the peer by a short form (the host by the first eight characters of
 /// its address, a device by its fingerprint), never by the full ID: the
 /// console of `tornect.exe` shows them, and people share screenshots of it.
 #[tokio::test]
 async fn the_logs_name_peers_by_short_forms_only() {
-    let capture = LogCapture::default();
-    let writer = capture.clone();
-    let _logs = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish(),
-    );
+    let capture = capture_logs();
     let tmp = tempfile::tempdir().unwrap();
     let host = host_side(tmp.path(), HOST_SEED);
     host.consent
@@ -581,7 +648,7 @@ async fn the_logs_name_peers_by_short_forms_only() {
     session.bye(bye::USER).await.unwrap();
     let _ = host_task.await.unwrap().unwrap();
 
-    let logs = capture.text();
+    let logs = capture.lines.text();
     for needle in ["device paired", "host paired", "session accepted"] {
         assert!(logs.contains(needle), "no `{needle}` line:\n{logs}");
     }
