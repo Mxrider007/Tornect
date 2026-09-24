@@ -11,8 +11,16 @@ rustflags = []
 # `libc++.a` includes libc++abi; see `CXXSTDLIB_…` below), so tornect.exe imports only
 # DLLs that Windows 10 ships (the UCRT's `api-ms-win-crt-*` included) and no DLL
 # travels with it. lld resolves archives whatever their place on the command line.
+# `--dependent-load-flag=0x800` (LOAD_LIBRARY_SEARCH_SYSTEM32) sets the image's
+# DependentLoadFlags, so the loader resolves tornect.exe's load-time imports that are not
+# KnownDLLs (bcrypt, bcryptprimitives, dwmapi, dxgi, pdh, powrprof, uxtheme) from System32
+# only, never from the exe's own folder (E2-4's load-time residual).
 [target.x86_64-pc-windows-gnullvm]
-rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-l:libc++.a"]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-l:libc++.a",
+    "-C", "link-arg=-Wl,--dependent-load-flag=0x800",
+]
 
 [env]
 # `cc` asks for libstdc++ on every non-MSVC target; llvm-mingw ships libc++. Empty:
