@@ -33,7 +33,7 @@ use tornect_signal::fsm::client::{
 };
 use tornect_signal::fsm::{HandshakeError, OsRandom};
 use tornect_signal::messages::{bye, pair_reject, reject};
-use tornect_signal::pairing::{AutoDeny, Consent, KnownHostStore};
+use tornect_signal::pairing::KnownHostStore;
 use tornect_signal::ping::NONCE_LEN;
 use tornect_signal::tor::Admission;
 use tornect_signal::{
@@ -42,7 +42,7 @@ use tornect_signal::{
 };
 
 use crate::host::{CliMedia, ControlChannel, HostLock, HostWiring, Served};
-use crate::prompt::{CliConsent, CliPairingUi, Prompter};
+use crate::prompt::{CliPairingUi, Prompter};
 
 /// Per-ping reply deadline once the stream is open.
 const PING_TIMEOUT: Duration = Duration::from_secs(30);
@@ -252,16 +252,10 @@ async fn run_host(
     once: bool,
     source: Source,
 ) -> anyhow::Result<()> {
-    let consent: Arc<dyn Consent> = match Prompter::stdin() {
-        Some(prompter) => Arc::new(CliConsent::new(prompter)),
-        None => {
-            eprintln!(
-                "warning: stdin is not a terminal, so every pairing and session request is \
-                 refused (run `tornect host` in a terminal to answer them); pings are answered"
-            );
-            Arc::new(AutoDeny)
-        }
-    };
+    let prompter = Prompter::stdin();
+    if prompter.is_none() {
+        eprintln!("{}", crate::host::NO_TERMINAL_LINE);
+    }
     let control = ControlChannel::default();
     let media = Arc::new(MediaHost::new(
         Arc::new(SystemBackend::new(source).with_restore_token(paths.portal_restore_token())),
@@ -274,12 +268,12 @@ async fn run_host(
         ctx,
         live,
         audit,
-    } = crate::host::wire(
+    } = crate::host::wire_cli(
         paths,
         cfg,
         Arc::clone(&identity),
         device_pk,
-        consent,
+        prompter,
         Arc::clone(&media),
         control.clone(),
     )?;

@@ -908,6 +908,8 @@ mod tests {
     fn the_release_readme_names_what_the_zip_holds() {
         let root = crate::workspace_root().unwrap();
         let readme = fs::read_to_string(root.join(README)).unwrap();
+        // Sentences wrap in the file; compare with every run of white space as one space.
+        let readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
         for needle in [
             "tornect doctor",
             "tornect host",
@@ -917,6 +919,9 @@ mod tests {
             "SHA256SUMS",
             "Allow Remote Interaction",
             "Ctrl-C",
+            // Slice-F F2-1: what the Linux start-at-login host does.
+            "the host answers pings only and refuses every session, because it has no window \
+             or terminal to show one",
         ] {
             assert!(
                 readme.contains(needle),

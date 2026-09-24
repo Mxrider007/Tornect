@@ -100,7 +100,7 @@ impl Prompter {
 
     /// A prompter fed by the returned sender instead of stdin.
     #[cfg(test)]
-    fn scripted() -> (Arc<Self>, mpsc::Sender<String>) {
+    pub(crate) fn scripted() -> (Arc<Self>, mpsc::Sender<String>) {
         let (tx, rx) = mpsc::channel(16);
         let prompter = Arc::new(Self {
             lines: Mutex::new(Some(rx)),
