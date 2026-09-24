@@ -7,6 +7,7 @@ use std::path::PathBuf;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 use std::sync::{Mutex, PoisonError};
 
+use tokio::sync::watch;
 use tornect_capture::{CaptureError, TestCard, VideoSource};
 use tornect_input::InputSink;
 
@@ -44,10 +45,6 @@ pub struct SystemBackend {
     /// weakly, so it keeps nothing open once capture stops.
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     wayland_input: Mutex<Option<tornect_capture::wayland::WaylandInput>>,
-    /// Ends the Wayland open in flight: set while `open_source` waits on the
-    /// portal (and its dialog), taken by `cancel_open`.
-    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-    opening: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
 }
 
 impl SystemBackend {
@@ -60,8 +57,6 @@ impl SystemBackend {
             restore_token: None,
             #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
             wayland_input: Mutex::new(None),
-            #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-            opening: Mutex::new(None),
         }
     }
 
@@ -77,13 +72,19 @@ impl SystemBackend {
 }
 
 impl MediaBackend for SystemBackend {
-    fn open_source(&self) -> Result<Box<dyn VideoSource>, CaptureError> {
+    /// On Wayland `cancel` ends the wait on the desktop's dialog: the portal
+    /// session is closed, which takes the dialog down, and no restore token is
+    /// kept for a session that is over. The other sources do not wait.
+    fn open_source(
+        &self,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Box<dyn VideoSource>, CaptureError> {
         match self.source {
             Source::TestCard => {
                 let (width, height, fps) = CARD;
                 Ok(Box::new(TestCard::new(width, height, fps)))
             }
-            Source::Desktop => self.desktop_source(),
+            Source::Desktop => self.desktop_source(cancel),
         }
     }
 
@@ -103,21 +104,6 @@ impl MediaBackend for SystemBackend {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-    }
-
-    /// Ends a Wayland open that waits on the desktop's dialog: the portal
-    /// session is closed, which takes the dialog down, and no restore token
-    /// is kept for a session that is over.
-    fn cancel_open(&self) {
-        #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-        if let Some(cancel) = self
-            .opening
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            cancel.send_replace(true);
-        }
     }
 }
 
@@ -143,9 +129,12 @@ fn desktop_for(session_type: Option<&str>) -> Desktop {
 
 #[cfg(target_os = "linux")]
 impl SystemBackend {
-    fn desktop_source(&self) -> Result<Box<dyn VideoSource>, CaptureError> {
+    fn desktop_source(
+        &self,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Box<dyn VideoSource>, CaptureError> {
         match desktop_for(session_type().as_deref()) {
-            Desktop::Wayland => self.wayland_source(),
+            Desktop::Wayland => self.wayland_source(cancel),
             Desktop::X11 => Ok(Box::new(tornect_capture::x11::X11Capture::open()?)),
         }
     }
@@ -182,19 +171,15 @@ impl SystemBackend {
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 impl SystemBackend {
     /// Opens the portal session: the desktop's dialog, unless the restore
-    /// token still holds.
-    fn wayland_source(&self) -> Result<Box<dyn VideoSource>, CaptureError> {
+    /// token still holds, until `cancel` turns `true`.
+    fn wayland_source(
+        &self,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Box<dyn VideoSource>, CaptureError> {
         use tornect_capture::wayland::{WaylandOptions, WaylandSource};
-        let (cancel, cancelled) = tokio::sync::watch::channel(false);
-        *self.opening.lock().unwrap_or_else(PoisonError::into_inner) = Some(cancel);
         let mut options = WaylandOptions::new(self.restore_token.clone());
-        options.cancel = Some(cancelled);
-        let opened = WaylandSource::open(&options);
-        self.opening
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        let (source, input) = opened?;
+        options.cancel = Some(cancel);
+        let (source, input) = WaylandSource::open(&options)?;
         *self
             .wayland_input
             .lock()
@@ -222,7 +207,10 @@ impl SystemBackend {
 
 #[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
 impl SystemBackend {
-    fn wayland_source(&self) -> Result<Box<dyn VideoSource>, CaptureError> {
+    fn wayland_source(
+        &self,
+        _cancel: watch::Receiver<bool>,
+    ) -> Result<Box<dyn VideoSource>, CaptureError> {
         Err(CaptureError::Unavailable(
             "Wayland capture is built for 64-bit Linux only".to_owned(),
         ))
@@ -235,7 +223,10 @@ impl SystemBackend {
 
 #[cfg(windows)]
 impl SystemBackend {
-    fn desktop_source(&self) -> Result<Box<dyn VideoSource>, CaptureError> {
+    fn desktop_source(
+        &self,
+        _cancel: watch::Receiver<bool>,
+    ) -> Result<Box<dyn VideoSource>, CaptureError> {
         Ok(Box::new(tornect_capture::gdi::GdiCapture::open()?))
     }
 
@@ -249,7 +240,10 @@ impl SystemBackend {
 
 #[cfg(not(any(target_os = "linux", windows)))]
 impl SystemBackend {
-    fn desktop_source(&self) -> Result<Box<dyn VideoSource>, CaptureError> {
+    fn desktop_source(
+        &self,
+        _cancel: watch::Receiver<bool>,
+    ) -> Result<Box<dyn VideoSource>, CaptureError> {
         Err(CaptureError::Unavailable(
             "this build has no screen capture for this OS yet".to_owned(),
         ))
@@ -347,7 +341,7 @@ mod tests {
     #[test]
     fn the_test_card_shares_a_card_and_injects_nothing() {
         let backend = SystemBackend::new(Source::TestCard);
-        let mut source = backend.open_source().unwrap();
+        let mut source = backend.open_source(watch::channel(false).1).unwrap();
         assert_eq!(source.name(), "synthetic");
         let frame = source.next_frame(Duration::from_secs(1)).unwrap().unwrap();
         assert_eq!((frame.width, frame.height), (CARD.0, CARD.1));
@@ -400,7 +394,7 @@ mod tests {
         if desktop_for(session_type().as_deref()) == Desktop::Wayland {
             return;
         }
-        match SystemBackend::new(Source::Desktop).open_source() {
+        match SystemBackend::new(Source::Desktop).open_source(watch::channel(false).1) {
             Ok(source) => assert_eq!(source.name(), "x11"),
             Err(CaptureError::Unavailable(why)) => assert!(!why.is_empty()),
             Err(e) => panic!("{e}"),
@@ -428,7 +422,7 @@ mod tests {
         if std::env::var_os(CHILD).is_some() {
             let backend = SystemBackend::new(Source::Desktop);
             let refused = backend
-                .open_source()
+                .open_source(watch::channel(false).1)
                 .err()
                 .expect("captured another machine's display");
             assert!(
