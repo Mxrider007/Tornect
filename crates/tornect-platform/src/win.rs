@@ -32,7 +32,8 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::{
-    SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    FOLDERID_Profile, FOLDERID_ProgramFiles, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
+    SHELLEXECUTEINFOW, SHGetKnownFolderPath, ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
@@ -72,6 +73,45 @@ pub(crate) fn system_directory() -> std::io::Result<PathBuf> {
         }
         buf.resize(n, 0);
     }
+}
+
+/// The folders Tornect asks the OS for.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum KnownFolder {
+    /// `FOLDERID_Profile`: `C:\Users\<name>`.
+    Profile,
+    /// `FOLDERID_ProgramFiles`: `C:\Program Files` for this 64-bit program.
+    ProgramFiles,
+}
+
+/// A known folder of this user, from the OS (`SHGetKnownFolderPath`) rather
+/// than from the environment, which whoever starts Tornect controls (review
+/// finding F1-4).
+pub(crate) fn known_folder(which: KnownFolder) -> std::io::Result<PathBuf> {
+    let id = match which {
+        KnownFolder::Profile => &FOLDERID_Profile,
+        KnownFolder::ProgramFiles => &FOLDERID_ProgramFiles,
+    };
+    let mut path: *mut u16 = null_mut();
+    // SAFETY: `id` points to a constant GUID; no flags; a null token means
+    // this process's user; `path` receives a `CoTaskMemAlloc` string, or
+    // null.
+    let hr = unsafe { SHGetKnownFolderPath(id, 0, null_mut(), &mut path) };
+    let found = if hr >= 0 && !path.is_null() {
+        // SAFETY: on success `path` is NUL-terminated; count up to the NUL.
+        let len = (0..).take_while(|&i| unsafe { *path.add(i) } != 0).count();
+        // SAFETY: `len` units precede the NUL, all initialized.
+        let units = unsafe { std::slice::from_raw_parts(path, len) };
+        Ok(PathBuf::from(OsString::from_wide(units)))
+    } else {
+        Err(std::io::Error::other(format!(
+            "SHGetKnownFolderPath failed: HRESULT {hr:#010x}"
+        )))
+    };
+    // SAFETY: the API requires the string freed even when it fails; null is
+    // accepted; freed exactly once, after its last use above.
+    unsafe { CoTaskMemFree(path.cast()) };
+    found
 }
 
 /// The `TOKEN_USER` of `token`, in a buffer the caller keeps alive while it
