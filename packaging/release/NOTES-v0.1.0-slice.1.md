@@ -56,9 +56,14 @@ Tornect homes on that machine talked to each other over the real Tor network; no
 
 - **The window over real Tor with a person at the screen.** The console check (grant screen sharing, connect,
   compare the code, allow control, pointer and keys in the viewer, Stop; then view only; then a keyboard answer
-  that must end denied) was **NOT PERFORMED three times** (2026-09-23 02:27 and 22:53, 2026-09-24 01:14): each
-  time the windows were up and both hosts reachable over Tor, and nobody was at the VM's screen. No input has
-  crossed Tor in a live run, and no key has been injected live.
+  that must end denied) was **NOT PERFORMED four times** (2026-09-23 02:27 and 22:53, 2026-09-24 01:14 and
+  16:12): each time the windows were up and the hosts reachable over Tor, and no step was taken at the VM's
+  screen. The fifth attempt (2026-09-24, 19:39–20:07) verified the first-run grant live (19:44:08), and the
+  pairing crossed Tor (the host accepted at 19:43:57), but the client's 50 s code check ran out unanswered
+  (19:44:47), so the client pinned nothing; fixed since (`a98733c`, `54dbe3b`): the window's code check now stays
+  up for up to 10 minutes. Everything after the pairing (control, pointer and keys, Stop, view only, the keyboard
+  answer) is **NOT PERFORMED**, paused pending a re-run. No input has crossed Tor in a live run, and no key has
+  been injected live.
 - **The polkit path live:** `service install`, `unattended on` and `grant` through polkit's password dialog.
 - **Anything on a real Windows machine**, and any session between a Linux and a Windows machine.
 - A real X11 desktop, a real login starting the unit, and the bridge fallback on a network that really blocks
