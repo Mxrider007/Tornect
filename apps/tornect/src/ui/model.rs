@@ -234,6 +234,9 @@ pub struct Confirm {
     pub host_name: String,
     /// The code this screen showed.
     pub sas: String,
+    /// Until when the host waits for the session request that follows a
+    /// "the codes match"; a later one still pairs this computer.
+    pub host_waits_until: Instant,
     /// When the question gives up (and refuses).
     pub deadline: Instant,
 }

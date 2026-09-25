@@ -804,14 +804,22 @@ fn confirm_popup(
                 });
             }
         });
-        ui.label(
-            RichText::new(format!(
-                "Refused automatically in {} s",
+        // The host waits for the session only so long; the question itself
+        // stays up much longer, so that it cannot run out unseen, and a late
+        // yes still pairs this computer.
+        let note = if now < confirm.host_waits_until {
+            format!(
+                "Answer within {} s and the session request follows.",
+                countdown(confirm.host_waits_until, now)
+            )
+        } else {
+            format!(
+                "The host has stopped waiting for the session. Yes still pairs this computer; \
+                 then press Connect again to ask for a session. Refused automatically in {} s.",
                 countdown(confirm.deadline, now)
-            ))
-            .small()
-            .color(palette::MUTED),
-        );
+            )
+        };
+        ui.label(RichText::new(note).small().color(palette::MUTED));
     });
 }
 
@@ -1148,7 +1156,8 @@ mod tests {
                         id: 4,
                         host_name: "Desk".to_owned(),
                         sas: "654 321".to_owned(),
-                        deadline: t0 + Duration::from_secs(50),
+                        host_waits_until: t0 + Duration::from_secs(50),
+                        deadline: t0 + Duration::from_secs(600),
                     }),
                     ..with_popups(Vec::new())
                 };
@@ -1167,6 +1176,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The code card outlives the host's wait so that it cannot run out
+    /// unseen: until then it says how long the session request still waits,
+    /// after it that a yes still pairs this computer, and a click on the
+    /// accept still answers it.
+    #[test]
+    fn the_code_card_says_a_late_yes_still_pairs() {
+        let t0 = Instant::now();
+        let model = Model {
+            confirm: Some(Confirm {
+                id: 5,
+                host_name: "Desk".to_owned(),
+                sas: "654 321".to_owned(),
+                host_waits_until: t0 + Duration::from_secs(50),
+                deadline: t0 + Duration::from_secs(600),
+            }),
+            ..with_popups(Vec::new())
+        };
+        let mut window = Harness::new(model, t0);
+        let note = window.text("Answer within");
+        assert!(note.contains("50 s"), "{note}");
+        let late = t0 + Duration::from_secs(60);
+        window.pass(late, Vec::new());
+        let note = window.text("The host has stopped waiting for the session.");
+        assert!(note.contains("Yes still pairs this computer"), "{note}");
+        assert!(note.contains("in 540 s"), "{note}");
+        let yes = window.button("Yes, the codes match");
+        let actions = window.click(late, yes);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Confirm {
+                    id: 5,
+                    matched: true,
+                    ..
+                }
+            )),
+            "{actions:?}"
+        );
     }
 
     /// Deny is the first stop of the keyboard in a session card, and it
@@ -1470,7 +1519,8 @@ mod tests {
             id: 3,
             host_name: "Desk".to_owned(),
             sas: "654 321".to_owned(),
-            deadline: now + Duration::from_secs(50),
+            host_waits_until: now + Duration::from_secs(50),
+            deadline: now + Duration::from_secs(600),
         });
         model.sharing = vec![Sharing {
             session_id: "0011".to_owned(),
