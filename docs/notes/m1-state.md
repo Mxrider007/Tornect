@@ -616,18 +616,18 @@ local when it was written, for push 2.
   - C3-2 (`d64bc87`): a violation ends the session before its `ERROR` is written.
   - C2-2 (b) (`5e323c1`): the viewer's writes race its stop.
   - C1-3 (`af7d956`): held keys are released after 3 s of silence, and **the viewer pings once a
-    second when idle**; not while a picture or `Pong` write was stuck, until `04fd0c6` (slice-G
+    second when idle**; not while a picture or `Pong` write was stuck, until `0189554` (slice-G
     G2-1).
   - C1-2 (`3b90cd2`): X11 and `SendInput` map the pointer over the encoded region (a mapping, not
-    a refusal); the X11 half used the root size read at connect (slice-G G2-2), fixed in `9604760`.
+    a refusal); the X11 half used the root size read at connect (slice-G G2-2), fixed in `e08e819`.
   - C3-3 (`2ac8ffd`): a `DISPLAY` with a host part is refused.
   - C3-5 (`f769365`): doctor and the banner name the capture backend truthfully.
   - The media-end wording (`33ad8c9`, client side).
   - The §10 hardening: a pending portal open ends with its session (`82d1692`; an end that came
-    before the open had stored its cancel was lost until `c285e98`, slice-G G1-1); a view-only
+    before the open had stored its cancel was lost until `af1ec8e`, slice-G G1-1); a view-only
     session drops its input handle (`ea9db5d`); doctor names the grant file and how to revoke it
     (`73b87cb`); the token's path is out of log lines (`f9e96f5`; `remember_token`'s failures still
-    named it until `08295b6`, slice-G G1-2).
+    named it until `b116d43`, slice-G G1-2).
   - The zbus warning filter (`3ad3473`); the R9, R5 ≡ R8 and R7 test tightenings (`1790746`,
     `9d6b4b2`, `6c0646b`); the O2 comment (`4009dbc`); R2: **the first Ctrl-C ends a pending
     media open** (`ad55279`).
@@ -661,9 +661,9 @@ slice-G review of 2026-09-24 covered `5ba8f11..73e9314`; its outcome is in the l
 
 ## Sessions 2026-09-23/24 — the window, the indicator, the Windows build, packaging, start at login; three reviews and their fixes; the pre-release prepared
 
-**Gate: green at 634 passed, 0 failed, 5 ignored** at `681bc51` (480 at `ad55279`), cargo-deny ok against the
+**Gate: green at 634 passed, 0 failed, 5 ignored** at `ede20d0` (480 at `ad55279`), cargo-deny ok against the
 RustSec database `1931a145168d` of 2026-09-23. `origin/main` is `8df9123`; everything after it (`cfa7237` …
-`681bc51` and the documentation commits of 2026-09-24) was local when this was written. **Not tagged.** The fifth
+`ede20d0` and the documentation commits of 2026-09-24) was local when this was written. **Not tagged.** The fifth
 ignored test is the systemd round trip.
 
 - **The window (M1-50; `d6ef5ba`, `ba811fc`, `c7129be`, `981f556`).** `tornect` with no subcommand opens a manual
@@ -688,29 +688,29 @@ ignored test is the systemd round trip.
 - **The slice-E review** of `73e9314..3ca4094` (a threat-model review without a refuter pass): 1 Medium, 11 Low, 6 Info
   plus P-1, no BLOCK. Fixed: **E1-1 ≡ E2-1** (the Medium: keys typed for another program answered a card) by the
   operator's "pointer-only Allow" (`746a628`), E1-6 (`9ca0496`), E1-4 and E1-3 (`a4d5f72`), E1-2 (`f9a1a3e`), E1-5's
-  sentence (`7e9f2cc`), E2-3 (`a69a7d2`), E2-2's interim rule (`cfa7237`), E2-4 and P-2 (`82a618c`; PARTIAL without
-  the linker flag), E2-7 (`4e6a42f`, its flaky test fixed in `081cc08` and `94d68a6`). E3-1 and E3-3 are met by
+  sentence (`7e9f2cc`), E2-3 (`a69a7d2`), E2-2's interim rule (`cfa7237`), E2-4 and P-2 (`c2ecce4`; PARTIAL without
+  the linker flag), E2-7 (`2a4f5be`, its flaky test fixed in `f84d75a` and `be9d323`). E3-1 and E3-3 are met by
   `dist` and the gate.
 - **The slice-F review** of `3ca4094..176e9de` (the same form): 2 Medium, 4 Low, 6 Info plus P-1 and P-2, no
   BLOCK. Fixed: **F2-1** (the Linux start-at-login host answers pings only, `2b5c4c8`), **F1-1** (a failed task query
   is never "not registered", `5227322`), F1-3 (`a93aeb2`), F2-2 with F1-4 and F2-6's characters (`8df9123`), F2-3
-  (`6c9e512`), F2-4 (`61f2e40`, and the manual removal step `d2be07e`), F1-2 and F1-5 (`2171aed`), default 3 and N-2 in
-  the README (`44944b7`), and the operator's `--elevated` refusal for a standard account (`c127a60`).
+  (`81ff761`), F2-4 (`b0c548a`, and the manual removal step `f49cc29`), F1-2 and F1-5 (`dadd93a`), default 3 and N-2 in
+  the README (`7e760a9`), and the operator's `--elevated` refusal for a standard account (`2eedac1`).
 - **The fix-closure check** (phase 2a at `8df9123`: 13 of 13 claims closed, new N-1 LOW and N-2 INFO; phase 2b at
-  `025da8c`: 9 of 11, E2-4 PARTIAL, new N-3 INFO and N-4 LOW) and **the release-preparation review** (phase 2c, four
-  parts up to `b6897b7`: L-1, L-2 and Infos), no BLOCK anywhere. Fixed: N-1 (`2587bbe`), N-3 (`6a0eedb`), N-4
-  (`8836cd8`), L-1 (`e24b6a0`), L-2 (`c6aed2f`), I-2 (`9628054`), I-3 (`42e12a7`), P2-I1 (`94d68a6`), P2-I2
-  (`3cee64a`), P2-I3 (`b6897b7`), P2-I4 (`2cf4b04`), the build VM's host name out of the code (`4c66c47`) and the docs
-  (`c4e3cf7` and the documentation commits of 2026-09-24). P3-I1 … P3-I3 are disclosed, not fixed.
+  `a2bfb7a`: 9 of 11, E2-4 PARTIAL, new N-3 INFO and N-4 LOW) and **the release-preparation review** (phase 2c, four
+  parts up to `e0b7ae4`: L-1, L-2 and Infos), no BLOCK anywhere. Fixed: N-1 (`3ed9515`), N-3 (`a27d831`), N-4
+  (`30f510e`), L-1 (`dd76a67`), L-2 (`a35fea7`), I-2 (`5b698e4`), I-3 (`1004ade`), P2-I1 (`be9d323`), P2-I2
+  (`b027aaa`), P2-I3 (`e0b7ae4`), P2-I4 (`1051f92`), the build VM's host name out of the code (`6e35547`) and the docs
+  (`294448d` and the documentation commits of 2026-09-24). P3-I1 … P3-I3 are disclosed, not fixed.
 - **The release preparation (M1-52).** `cargo deny fetch` (2026-09-24 03:01) moved the RustSec database from
   2026-08-29 to 2026-09-23, and the gate then failed on **RUSTSEC-2026-0285** (rustls 0.23.43): rustls 0.23.45
-  (`1298bc6`). The database is named in the gate and in `BUILD-INFO.txt` (`0b020b9`, with its ignores `42e12a7` and
-  the 7-day limit `9628054`); `THIRD_PARTY_LICENSES.txt` goes into each zip (`427499a`, `1150702`); `pt.rs:620`
-  (`7aa8522`); `docs/RELEASING.md` (`8d05ae7`). A dist check run at `427499a` built both zips and passed the smoke
+  (`b580203`). The database is named in the gate and in `BUILD-INFO.txt` (`b9b59e5`, with its ignores `1004ade` and
+  the 7-day limit `5b698e4`); `THIRD_PARTY_LICENSES.txt` goes into each zip (`7f47bc0`, `964200d`); `pt.rs:620`
+  (`b5f93f5`); `docs/RELEASING.md` (`41183de`). A dist check run at `7f47bc0` built both zips and passed the smoke
   tests (Wine with the home inside the profile); its zips were deleted.
-- **Release verification at `b6897b7`:** the gate three times (633 / 0 / 5), the `tornect-signal` binary 40 of 40,
+- **Release verification at `e0b7ae4`:** the gate three times (633 / 0 / 5), the `tornect-signal` binary 40 of 40,
   Xvfb 59 passed, five failing-first spot checks, gnullvm clippy clean. **T-1** (LOW, test strength: the
-  view-only mapping was pinned by no test) is fixed in `681bc51` (634 / 0 / 5).
+  view-only mapping was pinned by no test) is fixed in `ede20d0` (634 / 0 / 5).
 - **Live on the build VM, 2026-09-24:** start at login with the debug build's re-auth escape (install; `systemctl
   --user start` as the login stand-in, whose journal shows the pings-only line; F2-3's refusal through the live
   control channel; a graceful stop; uninstall; nothing left enabled). The Windows release executable under Wine:
@@ -723,7 +723,7 @@ ignored test is the systemd round trip.
 
 **Still open:**
 - The console check (the window over real Tor with a person at the screen, keys over Tor, the polkit path live).
-- E2-4's load-time residual: the linker's dependent-load flag is set in `312748e`; the final `dist` checks
+- E2-4's load-time residual: the linker's dependent-load flag is set in `c514fdc`; the final `dist` checks
   `DependentLoadFlags: 0x800` on the release exe; the loader's effect NEEDS-DEVICE(windows).
 - Everything at run time on Windows (NEEDS-DEVICE), and the Linux ↔ Windows session.
 - Carried to M6 or later: E2-2's DACL, E2-5, E2-6, E2-8, E3-2, E3-4 (before 2026-10-26), E3-5, slice-E P-1
@@ -736,20 +736,20 @@ ignored test is the systemd round trip.
   this desktop …" line.
 - **Reviewed 2026-09-24, slice G** (`5ba8f11..73e9314`: the Wayland backend, `pipewire.rs`'s unsafe FFI, the
   portal and token handling, the idle ping, the slice-D fixes; two threat modelers and the Security parent, no
-  refuter pass): 0 Critical, 0 High, 0 Medium, **six Lows, all fixed**: G1-2 `08295b6`, G1-1 `c285e98`, G1-3
-  `4448c58` (test `c02ae7a`), G2-1 `04fd0c6`, G1-4 `9d9442e` + `04ae195`, G2-2 `9604760`; one Info, G2-3 (the 3 s
+  refuter pass): 0 Critical, 0 High, 0 Medium, **six Lows, all fixed**: G1-2 `b116d43`, G1-1 `af1ec8e`, G1-3
+  `a5564e2` (test `b6c41b6`), G2-1 `0189554`, G1-4 `5ca1be9` + `235eff5`, G2-2 `e08e819`; one Info, G2-3 (the 3 s
   quiet release can let go of a live viewer's drag in a Tor stall; disclosed in the notes). The closure check's
   round 1 verified G1-2, G1-1 and G1-3 closed and filed an Info (its N-2, the order of owed releases: fixed in
-  `72d9a76`). Round 2 (no BLOCK, nothing above Low open) verified G2-1, G1-4 and G2-2 closed in code (G2-2's live
-  RandR change NEEDS-DEVICE(x11)), found `9d9442e` and `c02ae7a` sound, and found the two fixes from the fifth
-  console check sound on the security side: the code card that outlives the host's wait (`a98733c`, decision M1-55)
-  and the host's `PairedOnly` on a timeout after its accept (`54dbe3b`, `fsm/host.rs:883-889`, an outcome label
-  only). Its one Info, R2-I1 (a late yes read "Paired" whatever the error), is fixed in `8ee5afc`.
+  `3c0969e`). Round 2 (no BLOCK, nothing above Low open) verified G2-1, G1-4 and G2-2 closed in code (G2-2's live
+  RandR change NEEDS-DEVICE(x11)), found `5ca1be9` and `b6c41b6` sound, and found the two fixes from the fifth
+  console check sound on the security side: the code card that outlives the host's wait (`f8bc454`, decision M1-55)
+  and the host's `PairedOnly` on a timeout after its accept (`a30d02a`, `fsm/host.rs:883-889`, an outcome label
+  only). Its one Info, R2-I1 (a late yes read "Paired" whatever the error), is fixed in `0d4b884`.
 - The slice-G live and device items: G2-1 over real Tor (a vanished viewer's held key, timed), the quiet release
   and G1-4's releases through the Wayland portal, whether GNOME lets go of a RemoteDesktop session's held keys and
   dismisses its dialog on `Session.Close`, `Closed` on "Stop sharing" and screen lock, G2-2 with a real RandR change
   (NEEDS-DEVICE(x11)), and how often onion circuits stall for 3 s or more (G2-3).
-- **Round 3** (no BLOCK, nothing above Low open): `8ee5afc` VERIFIED CLOSED; the documentation after `b6897b7` read
+- **Round 3** (no BLOCK, nothing above Low open): `0d4b884` VERIFIED CLOSED; the documentation after `e0b7ae4` read
   for its security statements, none false.
 
 ## Gotchas (the build VM)

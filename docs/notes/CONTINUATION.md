@@ -8,7 +8,7 @@ Paste the block under **HAND-OFF** into a new session.
 
 Continue building Tornect from this repository (branch `main`; the remote `origin` is the private GitHub
 repository). **Push state when this was written:** `origin/main` = `8df9123`; the 33 commits `cfa7237` …
-`681bc51` and the documentation commits of 2026-09-24 (this file's among them) were local, due for a push
+`ede20d0` and the documentation commits of 2026-09-24 (this file's among them) were local, due for a push
 **without a tag**. Check `git status -sb` and `git log --oneline origin/main..` first.
 
 The operator's goal for this run:
@@ -45,7 +45,7 @@ days old).
 
 ### STATE (2026-09-24)
 
-**Gate: green at 634 passed, 0 failed, 5 ignored** at `681bc51`, cargo-deny ok. The 5 ignored tests need a
+**Gate: green at 634 passed, 0 failed, 5 ignored** at `ede20d0`, cargo-deny ok. The 5 ignored tests need a
 person, the network or the user's systemd: the live portal check, the polkit round trip, the systemd round trip
 and the two live Tor tests.
 
@@ -64,10 +64,10 @@ and the two live Tor tests.
   Scheduler task from XML); the Linux start-at-login host answers pings only; the operator's three defaults and
   the `--elevated` refusal for standard accounts.
 - **Reviews:** slice E (`73e9314..3ca4094`), slice F (`3ca4094..176e9de`), the fix-closure check and the
-  release-preparation review, up to `b6897b7`: no Critical or High, every Medium fixed. **Unreviewed:**
-  `5ba8f11..73e9314` (the Wayland backend with `pipewire.rs`'s unsafe FFI), and everything after `b6897b7`
-  (`681bc51`, a test, and the documentation).
-- **Release verification** at `b6897b7`: all PASS; its one finding, T-1, is fixed in `681bc51`.
+  release-preparation review, up to `e0b7ae4`: no Critical or High, every Medium fixed. **Unreviewed:**
+  `5ba8f11..73e9314` (the Wayland backend with `pipewire.rs`'s unsafe FFI), and everything after `e0b7ae4`
+  (`ede20d0`, a test, and the documentation).
+- **Release verification** at `e0b7ae4`: all PASS; its one finding, T-1, is fixed in `ede20d0`.
 - **Not verified, honestly:** the window over real Tor with a person at the screen (**NOT PERFORMED three
   times**: 2026-09-23 02:27 and 22:53, 2026-09-24 01:14, each time the windows up, both hosts `REACHABLE`,
   nobody at the VM screen); keys over Tor, and any input over Tor in a live run; the polkit path live; anything on
@@ -228,11 +228,11 @@ and `docs/notes/m1-state.md` updates.
   two Mediums fixed (`2b5c4c8`, `5227322`) with F1-3 and F2-2 (`a93aeb2`, `8df9123`). Push 5: `origin/main` =
   `8df9123`.
 - **2026-09-24:** the third console attempt (01:14, NOT PERFORMED, behind a presence gate); the fix-closure check
-  (phase 2a: 13 of 13 closed); the remaining fixes (`cfa7237` … `025da8c`: E2-2, E2-4, the `--elevated` refusal,
+  (phase 2a: 13 of 13 closed); the remaining fixes (`cfa7237` … `a2bfb7a`: E2-2, E2-4, the `--elevated` refusal,
   F2-3, F2-4, F1-2, F1-5, default 3, N-1, E2-7, the window's signals); phase 2b; the release preparation
-  (`1298bc6` … `8d05ae7`: RUSTSEC-2026-0285, the advisory database in the gate and `BUILD-INFO.txt`, the licence
-  texts); phase 2c and its fixes (`081cc08` … `b6897b7`: N-3, N-4, L-1, L-2, I-2, I-3, P2-I1 … P2-I4, the host name
-  out of the code); the release verification and T-1 (`681bc51`); these documentation commits (decisions M1-50 …
+  (`b580203` … `41183de`: RUSTSEC-2026-0285, the advisory database in the gate and `BUILD-INFO.txt`, the licence
+  texts); phase 2c and its fixes (`f84d75a` … `e0b7ae4`: N-3, N-4, L-1, L-2, I-2, I-3, P2-I1 … P2-I4, the host name
+  out of the code); the release verification and T-1 (`ede20d0`); these documentation commits (decisions M1-50 …
   M1-54, Part G, the ledger, the release notes, `CLAUDE.md`, the host name out of every doc).
 
 **Honest limits:**
