@@ -262,8 +262,9 @@ impl WaylandInput {
 ///
 /// It never blocks: each event is queued for the portal's own thread, which
 /// makes the D-Bus calls in order. Wrap it in `tornect_input::Tracked`, which
-/// releases held keys and buttons when the session ends; closing the portal
-/// session afterwards releases anything the compositor still holds.
+/// releases held keys and buttons when the session ends. When the last handle
+/// goes, the thread drops what is still queued and lets go of what its own
+/// calls hold down, since a stalled portal can refuse those releases.
 pub struct WaylandInjector {
     portal: Arc<Portal>,
     shared: Arc<Shared>,
@@ -643,6 +644,78 @@ mod tests {
         drop(injector);
         drop(portal);
         assert!(refused(&weak).contains("ended"));
+    }
+
+    /// Slice-G G1-4: a kill during a portal stall lets go of what the portal
+    /// session holds, and makes nothing the viewer queued. The injector's own
+    /// releases (`Tracked`'s drop) find the queue full then, so the thread
+    /// lets go of what its own calls pressed. Before, it made every queued call
+    /// (up to 1024, at up to 1 s each) before it closed the session, and the
+    /// refused key-up was never made at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_kill_in_a_stall_still_lets_go_of_what_the_portal_holds() {
+        use super::portal::{PassedOn, pass_on};
+
+        let (portal, mut calls) = Portal::detached(2);
+        let closing = portal.closing();
+        let portal = Arc::new(portal);
+        let shared = Arc::new(Shared::new());
+        shared.set_format(Ok(Some(pipewire::VideoFormat {
+            pixel: pipewire::PixelFormat::Bgrx,
+            width: 1280,
+            height: 800,
+        })));
+        let mut viewer = tornect_input::Tracked::new(
+            input(&portal, &shared, Some((1280, 800)), true)
+                .injector(encoded)
+                .unwrap(),
+        );
+        let key = |pressed| Call::Key { code: 30, pressed };
+        viewer
+            .inject(&InputEvent::Key {
+                usb: 0x07_0004,
+                pressed: true,
+            })
+            .unwrap();
+        viewer
+            .inject(&InputEvent::PointerMove { x: 0, y: 0 })
+            .unwrap();
+        // The portal thread: it makes the key-down, then stalls on the move.
+        let made = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let thread = tokio::spawn({
+            let made = Arc::clone(&made);
+            async move {
+                let mut closed = None::<futures::stream::Pending<()>>;
+                pass_on(&mut calls, &closing, &mut closed, move |call| {
+                    made.lock().unwrap().push(call);
+                    let stalls = matches!(call, Call::Motion { .. });
+                    async move {
+                        if stalls {
+                            std::future::pending::<()>().await;
+                        }
+                        Ok::<(), ashpd::Error>(())
+                    }
+                })
+                .await
+            }
+        });
+        while made.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        // The queue fills up behind the stalled call.
+        while viewer
+            .inject(&InputEvent::PointerMove { x: 65535, y: 65535 })
+            .is_ok()
+        {}
+        // The kill: the viewer's key-up finds the queue full, and the last
+        // handle goes with the source.
+        drop(viewer);
+        drop(portal);
+        assert_eq!(thread.await.unwrap(), PassedOn::HandlesGone);
+        assert_eq!(
+            *made.lock().unwrap(),
+            [key(true), Call::Motion { x: 0.0, y: 0.0 }, key(false)]
+        );
     }
 
     /// The live check (`docs/VERIFICATION.md`): a real RemoteDesktop session on
