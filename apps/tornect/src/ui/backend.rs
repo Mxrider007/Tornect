@@ -843,7 +843,18 @@ fn not_started(err: HandshakeError, check: Option<CodeCheck>) -> anyhow::Error {
             "Not paired: nobody answered the code question. Press Connect again to pair; the \
              host's user sees the request again, with a new code."
         }
-        Some(CodeCheck::MatchedLate) if !matches!(err, HandshakeError::SessionRejected { .. }) => {
+        // Only when the host has gone: any other error (a known-hosts file
+        // that could not be written, a violation or a timeout from a host
+        // still there) keeps its own words.
+        Some(CodeCheck::MatchedLate)
+            if matches!(
+                err,
+                HandshakeError::Closed
+                    | HandshakeError::Io(_)
+                    | HandshakeError::Frame(_)
+                    | HandshakeError::PeerBye { .. }
+            ) =>
+        {
             "Paired: this computer now knows the host, but the host had stopped waiting for the \
              session by then. Press Connect again to ask for a session."
         }
@@ -953,6 +964,44 @@ mod tests {
             assert!(said.contains("Connect again"), "{answer:?}: {said}");
             assert!(!said.contains("command"), "{answer:?}: {said}");
             assert_eq!(is_pinned, pinned, "{answer:?}: {said}");
+        }
+    }
+
+    /// Slice-G closure R2-I1: after a late "the codes match", only an end
+    /// that says the host went away (the stream closed, an I/O or framing
+    /// failure, the host's goodbye) is worded "Paired". Any other error keeps
+    /// its own words: a known-hosts file that could not be written pinned
+    /// nothing, and a violation or a timeout came from a host still there.
+    #[test]
+    fn only_the_host_going_away_after_a_late_yes_reads_as_paired() {
+        use tornect_signal::envelope::codes;
+        use tornect_signal::framing::FrameError;
+
+        let late = Some(CodeCheck::MatchedLate);
+        for gone in [
+            HandshakeError::Closed,
+            HandshakeError::Io(std::io::ErrorKind::BrokenPipe.into()),
+            HandshakeError::Frame(FrameError::Truncated),
+            HandshakeError::PeerBye {
+                reason: bye::USER,
+                detail: None,
+            },
+        ] {
+            let said = format!("{:#}", not_started(gone, late));
+            assert!(said.starts_with("Paired:"), "{said}");
+        }
+        for other in [
+            HandshakeError::Store(tornect_core::CoreError::Io(
+                std::io::ErrorKind::PermissionDenied.into(),
+            )),
+            HandshakeError::Violation {
+                code: codes::E_BAD_SIG,
+                what: "signature",
+            },
+            HandshakeError::Timeout("SESSION_ACCEPT"),
+        ] {
+            let said = format!("{:#}", not_started(other, late));
+            assert!(!said.contains("Paired"), "{said}");
         }
     }
 
