@@ -63,6 +63,13 @@ Tornect homes on that machine talked to each other over the real Tor network; no
 - **Anything on a real Windows machine**, and any session between a Linux and a Windows machine.
 - A real X11 desktop, a real login starting the unit, and the bridge fallback on a network that really blocks
   Tor.
+- **The input fixes of the slice-G review on a live desktop:** a vanished viewer's held key let go of over real
+  Tor while a picture is being sent (G2-1), and through the Wayland portal; a Stop or `tornect panic` while the
+  portal is slow to take input (G1-4); whether GNOME lets go of the keys a closed remote-desktop session held and
+  takes its dialog down when the session closes; GNOME's "Stop sharing" and the screen lock ending the session;
+  where a click lands after a display scale change; clicks after a screen-size change on a real X11 desktop
+  (G2-2).
+- How often onion circuits stall for 3 s or more (G2-3).
 
 ## Requirements
 
@@ -131,12 +138,14 @@ the "Tornect: sharing" window when you use the window.
 By the identifiers of the security reviews that found them.
 
 **Windows**
-- **E2-4, the DLL search:** `tornect.exe` restricts the DLLs it loads while it runs to Windows' system folder,
-  but seven DLLs it imports at start (bcrypt, bcryptprimitives, dwmapi, dxgi, pdh, powrprof, uxtheme) are looked
-  up in its own folder first. **Keep `tornect.exe` in the folder the zip unpacks to, never in a folder other
-  accounts can write to** (a shared Downloads folder, say), and never copy it alone into Downloads or onto the
-  Desktop.
-  <!-- If the linker's dependent-load flag lands before the tag, replace this item with the result of its check. -->
+- **E2-4, the DLL search:** `tornect.exe` restricts the DLLs it loads while it runs to Windows' system folder.
+  The seven DLLs it imports at start (bcrypt, bcryptprimitives, dwmapi, dxgi, pdh, powrprof, uxtheme) are marked
+  in the executable to be taken from the system folder too (the linker's dependent-load flag), but whether
+  Windows honours that mark has not been checked on a Windows machine. Until it is, **keep `tornect.exe` in the
+  folder the zip unpacks to, never in a folder other accounts can write to** (a shared Downloads folder, say),
+  and never copy it alone into Downloads or onto the Desktop.
+  <!-- The final dist run checks DependentLoadFlags: 0x800 on the release exe (llvm-readobj --coff-load-config).
+       If it does not show, say instead that these seven DLLs are looked up in tornect.exe's own folder first. -->
 - **E2-2:** Tornect gives its directories no access list of its own on Windows yet (M6), so it takes a
   `--home` or `TORNECT_HOME` directory only inside your user folder.
 - **E2-5:** the "Tornect: sharing" window can be minimised (also by a viewer with control) and is not brought
@@ -182,6 +191,8 @@ By the identifiers of the security reviews that found them.
   accounts, even inside your home or user folder.
 - **P-1 (review of start at login):** a start-at-login or unattended change made while no host runs does not
   wait the 60 s after a session's end that a running host enforces.
+- **G2-3:** when a viewer with control says nothing for 3 s (a Tor stall counts), this computer lets go of the
+  keys and buttons it holds; a drag then ends where the pointer last was.
 - No client in this build asks for an unattended session, so an unattended grant cannot yet be used.
 - Everything travels over Tor: a few frames per second for a large desktop, and a connection takes from
   seconds to minutes to set up. Direct QUIC with hole punching comes later.
@@ -207,6 +218,10 @@ refuter pass). Every fix since was checked against the finding it claims to clos
 was reviewed, up to commit `b6897b7`. No Critical or High finding; the three Mediums (a question answered by
 keys typed for another program; a start-at-login host that served unattended sessions nobody saw; a failed task
 query read as "not registered") and RUSTSEC-2026-0285 are fixed; what is still open is listed above.
-**Not reviewed:** `5ba8f11..73e9314` (the Wayland backend, including the unsafe code that talks to PipeWire,
-the portal and grant handling, and the fixes of that session; its policy had an assessment only), and the
-commits after `b6897b7`: one test (`681bc51`) and the documentation.
+The Wayland backend (`5ba8f11..73e9314`: the unsafe code that talks to PipeWire, the portal and grant handling,
+the idle ping and the fixes of that session) was reviewed on 2026-09-24 (slice G: two threat modelers and the
+Security parent, read-only, threat modeling without a refuter pass): 0 Critical, 0 High, 0 Medium; six Lows,
+fixed in `08295b6`, `c285e98`, `4448c58`, `04fd0c6`, `9d9442e` with `04ae195`, and `9604760`; one Info (G2-3,
+above). A closure check verified the first three of those fixes closed; the other three, the order in which owed
+key releases are sent (`72d9a76`), and two fixes to the viewer's code question (`a98733c`, `54dbe3b`) are in its
+second round. **Not reviewed:** the documentation after `b6897b7`.
