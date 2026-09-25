@@ -23,7 +23,7 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
 6. The smoke tests below passed on the unpacked zips.
 7. The zips carry the licence texts and notices that the bundled dependencies require of a binary
    distribution: `LICENSE`, `THIRD_PARTY_NOTICES.md`, lyrebird's notice (`pt/lyrebird.txt`) and
-   `THIRD_PARTY_LICENSES.txt`, which `dist` generates per platform (step 2; met since `427499a`,
+   `THIRD_PARTY_LICENSES.txt`, which `dist` generates per platform (step 2; met since `7f47bc0`,
    `docs/VERIFICATION.md`, *Release tooling*).
 
 ## Steps
