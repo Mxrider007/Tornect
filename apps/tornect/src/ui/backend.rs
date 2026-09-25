@@ -24,13 +24,13 @@ use tornect_signal::fsm::host::{
     HostConfig, HostDeps, KillSwitch, LiveSession, LiveSessions, SessionActivity as _, SessionEnd,
     SessionSink,
 };
-use tornect_signal::fsm::{HostAudit, OsRandom};
+use tornect_signal::fsm::{HandshakeError, HostAudit, OsRandom};
 use tornect_signal::messages::bye;
 use tornect_signal::pairing::{AutoDeny, KnownHostStore};
 use tornect_signal::tor::{Ladder, LadderEvent, OnionListener};
 use tornect_signal::{Isolation, MEDIA_PORT, SIGNALING_PORT, TorNode};
 
-use super::consent::{GuiConsent, GuiPairingUi, Popups, Withdraw};
+use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
 use super::model::{CaptureNote, ClientStage, Hosting, Shared, Sharing, TorState, Viewing, Wake};
 use super::stream::{FrameSlot, SlotSink};
 use crate::host::{ControlChannel, HostLock, HostWiring, describe_end, describe_media, note, say};
@@ -745,9 +745,10 @@ async fn viewed(
         b.shared.update(|m| m.client = ClientStage::Asking);
     }
     let ccfg = ClientConfig::new(id, b.cfg.general.device_name.clone());
+    let pairing = Arc::new(GuiPairingUi::new(Arc::clone(&b.popups)));
     let deps = ClientDeps {
         known_hosts: known,
-        ui: Arc::new(GuiPairingUi::new(Arc::clone(&b.popups))),
+        ui: pairing.clone(),
         random: Arc::new(OsRandom),
         // Consulted only by unattended sessions, which the window does not ask for.
         server_key_pin: Arc::new(NoServerKeyPin),
@@ -760,7 +761,7 @@ async fn viewed(
     else {
         return Ok("Cancelled before the session started.".to_owned());
     };
-    let outcome = outcome.map_err(explain_handshake)?;
+    let outcome = outcome.map_err(|e| not_started(e, pairing.ended()))?;
     let ClientOutcome::Session(mut session) = outcome else {
         anyhow::bail!("paired, but no session came of it");
     };
@@ -828,6 +829,30 @@ async fn viewed(
     })
 }
 
+/// The window's words for a handshake that ended before its session. The
+/// command line's hints (`tor_cmd::explain_handshake`) name commands to run
+/// again; how the code question ended is said here in the window's terms.
+fn not_started(err: HandshakeError, check: Option<CodeCheck>) -> anyhow::Error {
+    let text = match check {
+        Some(CodeCheck::Differ) => {
+            "Not paired: you answered that the codes differ. If they really did, something \
+             between the two computers changed them, so do not pair now; if it was a slip, press \
+             Connect again and compare the new code."
+        }
+        Some(CodeCheck::Unanswered) => {
+            "Not paired: nobody answered the code question. Press Connect again to pair; the \
+             host's user sees the request again, with a new code."
+        }
+        Some(CodeCheck::MatchedLate) if !matches!(err, HandshakeError::SessionRejected { .. }) => {
+            "Paired: this computer now knows the host, but the host had stopped waiting for the \
+             session by then. Press Connect again to ask for a session."
+        }
+        _ => return explain_handshake(err),
+    };
+    tracing::debug!(error = %err, "the handshake ended before a session");
+    anyhow::Error::msg(text)
+}
+
 /// Whether the viewer sends input, from the `mode` of the host's signed
 /// SESSION_ACCEPT: only a control grant does. A view-only grant never does,
 /// nor does a mode this build does not know.
@@ -842,11 +867,94 @@ fn sends_input(mode: u8) -> bool {
 mod tests {
     use tornect_signal::HostSigner;
     use tornect_signal::fsm::client::{ScriptedClientUi, SessionEvent, connect};
-    use tornect_signal::pairing::{PairDecision, SessionDecision};
+    use tornect_signal::fsm::host::serve_host;
+    use tornect_signal::pairing::{
+        PairDecision, PairScript, ScriptedConsent, SessionDecision, TrustedDeviceStore,
+    };
 
     use super::super::indicator::{Change, Indicator};
     use super::super::model::{Model, PopupKind};
     use super::*;
+
+    /// A pairing through the window's code question, against a host whose
+    /// user accepts it. `answer` is how the window's user answers the code
+    /// card, and after how long (`None`: never). Returns what the window then
+    /// says, and whether this computer pinned the host.
+    async fn pair_in_the_window(answer: Option<(bool, Duration)>) -> (String, bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = Arc::new(HostIdentity::from_seed(&[0x11; 32]));
+        let trusted = Arc::new(TrustedDeviceStore::with(
+            tmp.path().join("trusted-devices.toml"),
+            tornect_core::trusted::TrustedDevices::default(),
+        ));
+        let consent = Arc::new(ScriptedConsent::new());
+        consent.push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+        let mut hdeps = HostDeps::headless(identity.clone(), trusted);
+        hdeps.consent = consent;
+        let hcfg = HostConfig::new("Desk", [9; 32]);
+        let (client_end, host_end) = tokio::io::duplex(64 * 1024);
+        let host = tokio::spawn(async move { serve_host(host_end, &hcfg, &hdeps).await });
+
+        let popups = Popups::new(Shared::new(Model::default(), Arc::new(|_| {})));
+        let pairing = Arc::new(GuiPairingUi::new(Arc::clone(&popups)));
+        let known = Arc::new(KnownHostStore::with(
+            tmp.path().join("known-hosts.toml"),
+            tornect_core::trusted::KnownHosts::default(),
+        ));
+        let mut cdeps = ClientDeps::headless(Arc::clone(&known));
+        cdeps.ui = pairing.clone();
+        if let Some((matched, after)) = answer {
+            let popups = Arc::clone(&popups);
+            tokio::spawn(async move {
+                let id = loop {
+                    if let Some(c) = popups.shared().read(|m| m.confirm.clone()) {
+                        break c.id;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                };
+                tokio::time::sleep(after).await;
+                popups.answer_confirm(id, matched);
+            });
+        }
+        let device = DeviceIdentity::from_seed(&[0x22; 32]);
+        let ccfg = ClientConfig::new(identity.id(), "Laptop");
+        let err = connect(client_end, &ccfg, &device, &cdeps, Intent::Session)
+            .await
+            .unwrap_err();
+        let _ = host.await;
+        let said = format!("{:#}", not_started(err, pairing.ended()));
+        (said, known.is_known(&identity.id()))
+    }
+
+    /// The live console check of 2026-09-24: the window's code question ran
+    /// out unseen after 50 s (the card never comes to the front: SLICE-E
+    /// E1-1), after the host had paired this device, and the window then said
+    /// "run the command again", a hint for the command line. The question now
+    /// stays up past the host's wait, a late "the codes match" still pairs
+    /// this computer, and every end of the question is said in the window's
+    /// terms.
+    #[tokio::test(start_paused = true)]
+    async fn an_unconfirmed_pairing_ends_in_the_windows_words() {
+        for (answer, says, pinned) in [
+            (
+                Some((false, Duration::from_secs(5))),
+                "Not paired: you answered that the codes differ",
+                false,
+            ),
+            (None, "Not paired: nobody answered the code question", false),
+            (
+                Some((true, Duration::from_secs(70))),
+                "Paired: this computer now knows the host",
+                true,
+            ),
+        ] {
+            let (said, is_pinned) = pair_in_the_window(answer).await;
+            assert!(said.starts_with(says), "{answer:?}: {said}");
+            assert!(said.contains("Connect again"), "{answer:?}: {said}");
+            assert!(!said.contains("command"), "{answer:?}: {said}");
+            assert_eq!(is_pinned, pinned, "{answer:?}: {said}");
+        }
+    }
 
     /// Review N-4: closing a window that both views another host and shares
     /// this screen (the close button, Ctrl-C or SIGTERM) ends the hosted

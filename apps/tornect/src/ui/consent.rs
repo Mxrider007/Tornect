@@ -28,10 +28,33 @@ use tornect_signal::pairing::{
 
 use super::model::{ClientStage, Confirm, Popup, PopupKind, Shared, Wake};
 
-/// How long the client's user has to say whether the codes matched: the host
-/// gives the client 60 s after `PAIR_ACCEPT` to ask for its session, and the
-/// answer still has to cross Tor (as `crate::prompt` does).
+/// How long the client's user has to say whether the codes matched for the
+/// session to follow: the host gives the client 60 s after `PAIR_ACCEPT` to
+/// ask for its session, and the answer still has to cross Tor (as
+/// `crate::prompt` does).
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(50);
+
+/// How long the code question stays up at most. It outlives the host's wait
+/// ([`CONFIRM_TIMEOUT`]) so that it cannot run out unseen: the window never
+/// takes the focus (SLICE-E E1-1), so its card can sit behind another window.
+/// The host paired this device when its user accepted, so a late "the codes
+/// match" still pairs this computer, and only the session has to be asked for
+/// again.
+pub const CONFIRM_LIMIT: Duration = Duration::from_secs(600);
+
+/// How the client's code question ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeCheck {
+    /// The codes match, answered while the host still waited.
+    Matched,
+    /// The codes match, answered after the host's wait: this computer pinned
+    /// the host, but its session request is likely too late.
+    MatchedLate,
+    /// The codes differ.
+    Differ,
+    /// Nobody answered before the question closed.
+    Unanswered,
+}
 
 /// Where an answer goes.
 enum Answer {
@@ -248,17 +271,30 @@ impl Consent for GuiConsent {
 /// The client's code comparison in the window.
 pub struct GuiPairingUi {
     popups: Arc<Popups>,
+    /// How long the host waits for the session request.
+    host_waits: Duration,
+    /// How long the question stays up.
     wait: Duration,
+    /// How the last question ended.
+    ended: Mutex<Option<CodeCheck>>,
 }
 
 impl GuiPairingUi {
-    /// Ask through `popups`, giving the user [`CONFIRM_TIMEOUT`].
+    /// Ask through `popups`, for up to [`CONFIRM_LIMIT`]; the session follows
+    /// only an answer within [`CONFIRM_TIMEOUT`].
     #[must_use]
     pub fn new(popups: Arc<Popups>) -> Self {
         Self {
             popups,
-            wait: CONFIRM_TIMEOUT,
+            host_waits: CONFIRM_TIMEOUT,
+            wait: CONFIRM_LIMIT,
+            ended: Mutex::new(None),
         }
+    }
+
+    /// How the last code question ended; `None` if none was asked.
+    pub fn ended(&self) -> Option<CodeCheck> {
+        *self.ended.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -282,16 +318,26 @@ impl ClientPairingUi for GuiPairingUi {
         Box::pin(async move {
             let (tx, rx) = oneshot::channel();
             // `host_name` comes from `PAIR_ACCEPT` through `normalize_label`.
+            let now = Instant::now();
             let confirm = Confirm {
                 id: 0,
                 host_name: host_name.to_owned(),
                 sas: sas.to_owned(),
-                deadline: Instant::now() + self.wait,
+                host_waits_until: now + self.host_waits,
+                deadline: now + self.wait,
             };
             let _on_screen = self.popups.open(Answer::Confirm(tx), |id, m| {
                 m.confirm = Some(Confirm { id, ..confirm });
             });
-            let matched = matches!(tokio::time::timeout(self.wait, rx).await, Ok(Ok(true)));
+            let asked = tokio::time::Instant::now();
+            let ended = match tokio::time::timeout(self.wait, rx).await {
+                Ok(Ok(true)) if asked.elapsed() < self.host_waits => CodeCheck::Matched,
+                Ok(Ok(true)) => CodeCheck::MatchedLate,
+                Ok(Ok(false)) => CodeCheck::Differ,
+                Ok(Err(_)) | Err(_) => CodeCheck::Unanswered,
+            };
+            *self.ended.lock().unwrap_or_else(PoisonError::into_inner) = Some(ended);
+            let matched = matches!(ended, CodeCheck::Matched | CodeCheck::MatchedLate);
             if matched {
                 // Next: the session request, which the host's user answers.
                 self.popups
@@ -593,11 +639,45 @@ mod tests {
         };
         assert!(popups.answer_confirm(id, true));
         assert!(asking.await);
+        assert_eq!(ui.ended(), Some(CodeCheck::Matched));
         assert!(popups.shared().read(|m| m.confirm.is_none()));
 
         let started = tokio::time::Instant::now();
         assert!(!ui.confirm(&host, "Desk", "111 222").await);
-        assert!(started.elapsed() >= CONFIRM_TIMEOUT);
+        assert!(started.elapsed() >= CONFIRM_LIMIT);
+        assert_eq!(ui.ended(), Some(CodeCheck::Unanswered));
+        assert!(popups.shared().read(|m| m.confirm.is_none()));
+    }
+
+    /// The live console check of 2026-09-24: the code question ran out unseen
+    /// after 50 s, the host's wait for the session, although the host had
+    /// paired the device when its user accepted. A "the codes match" given
+    /// after the host's wait is taken now (it pins the host), and said to be
+    /// late; the question itself closes only at its own limit.
+    #[tokio::test(start_paused = true)]
+    async fn the_code_question_takes_a_late_answer() {
+        let popups = popups();
+        let ui = GuiPairingUi::new(Arc::clone(&popups));
+        let host = HostIdentity::from_seed(&[1; 32]).id();
+        let asking = ui.confirm(&host, "Desk", "111 222");
+        tokio::pin!(asking);
+        let id = loop {
+            tokio::select! {
+                _ = &mut asking => panic!("answered early"),
+                () = tokio::time::sleep(Duration::from_millis(1)) => {}
+            }
+            if let Some(c) = popups.shared().read(|m| m.confirm.clone()) {
+                break c.id;
+            }
+        };
+        let late = tokio::time::sleep(CONFIRM_TIMEOUT + Duration::from_secs(5));
+        tokio::select! {
+            refused = &mut asking => panic!("the question closed at the host's wait: {refused}"),
+            () = late => {}
+        }
+        assert!(popups.answer_confirm(id, true));
+        assert!(asking.await, "a late yes was not taken");
+        assert_eq!(ui.ended(), Some(CodeCheck::MatchedLate));
         assert!(popups.shared().read(|m| m.confirm.is_none()));
     }
 }
