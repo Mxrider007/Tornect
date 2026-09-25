@@ -597,6 +597,35 @@ mod tests {
         }
     }
 
+    /// Slice-G G1-3, the direct path: the quiet release and the drop call
+    /// `release_all()` itself, not `inject(&ReleaseAll)`, so `release_all()`
+    /// sends what is owed on its own; and a release it cannot send is owed
+    /// too, and goes out before the next event.
+    #[test]
+    fn release_all_sends_what_is_owed_and_owes_what_it_cannot_send() {
+        let key = |pressed| InputEvent::Key {
+            usb: 0x07_0004,
+            pressed,
+        };
+        let moved = InputEvent::PointerMove { x: 1, y: 2 };
+
+        let mut t = Tracked::new(RefusesOneRelease::default());
+        t.inject(&key(true)).unwrap();
+        assert!(t.inject(&key(false)).is_err());
+        t.release_all();
+        assert_eq!(t.inner.seen, [key(true), key(false)], "the owed key-up");
+
+        let mut t = Tracked::new(RefusesOneRelease::default());
+        t.inject(&key(true)).unwrap();
+        t.release_all();
+        t.inject(&moved).unwrap();
+        assert_eq!(
+            t.inner.seen,
+            [key(true), key(false), moved],
+            "the key-up release_all could not send"
+        );
+    }
+
     /// SLICE-C1 C1-5: `i32::MIN` has no absolute value in `i32`. The old range
     /// check overflowed on it: a panic in a debug build, and in a release
     /// build a delta that passed the check.
