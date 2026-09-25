@@ -228,13 +228,21 @@ pub trait InputSink: Send {
 ///
 /// A release the injector refuses (the Wayland portal's queue can be full) is
 /// owed, not forgotten: it is sent again before the next event and by every
-/// release of everything, until the injector takes it (slice-G G1-3).
+/// release of everything, until the injector takes it (slice-G G1-3). Owed
+/// releases go out in the order they were refused (slice-G N-2).
 pub struct Tracked<S: InputSink> {
     inner: S,
     keys: BTreeSet<u32>,
     buttons: BTreeSet<Button>,
-    owed_keys: BTreeSet<u32>,
-    owed_buttons: BTreeSet<Button>,
+    /// Releases refused, oldest first; a key or button is owed at most once.
+    owed: Vec<Owed>,
+}
+
+/// A release still owed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owed {
+    Key(u32),
+    Button(Button),
 }
 
 impl<S: InputSink> Tracked<S> {
@@ -244,8 +252,7 @@ impl<S: InputSink> Tracked<S> {
             inner,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
-            owed_keys: BTreeSet::new(),
-            owed_buttons: BTreeSet::new(),
+            owed: Vec::new(),
         }
     }
 
@@ -260,13 +267,14 @@ impl<S: InputSink> Tracked<S> {
         }
     }
 
-    /// Send the releases still owed; one refused again stays owed.
+    /// Send the releases still owed, in the order they were refused; one
+    /// refused again stays owed, in the same order.
     fn settle(&mut self) {
-        for usb in std::mem::take(&mut self.owed_keys) {
-            let _ = self.release_key(usb);
-        }
-        for button in std::mem::take(&mut self.owed_buttons) {
-            let _ = self.release_button(button);
+        for owed in std::mem::take(&mut self.owed) {
+            let _ = match owed {
+                Owed::Key(usb) => self.release_key(usb),
+                Owed::Button(button) => self.release_button(button),
+            };
         }
     }
 
@@ -278,7 +286,7 @@ impl<S: InputSink> Tracked<S> {
         });
         if let Err(e) = &released {
             tracing::debug!(error = %e, "releasing a key failed; it is sent again later");
-            self.owed_keys.insert(usb);
+            self.owed.push(Owed::Key(usb));
         }
         released
     }
@@ -291,7 +299,7 @@ impl<S: InputSink> Tracked<S> {
         });
         if let Err(e) = &released {
             tracing::debug!(error = %e, "releasing a button failed; it is sent again later");
-            self.owed_buttons.insert(button);
+            self.owed.push(Owed::Button(button));
         }
         released
     }
@@ -310,7 +318,7 @@ impl<S: InputSink> InputSink for Tracked<S> {
             }
             // Held again: its next release, not the one owed, lets it go.
             InputEvent::Key { usb, pressed: true } => {
-                self.owed_keys.remove(&usb);
+                self.owed.retain(|owed| *owed != Owed::Key(usb));
                 self.keys.insert(usb);
             }
             // A release for a key the host never saw pressed is dropped: some
@@ -329,7 +337,7 @@ impl<S: InputSink> InputSink for Tracked<S> {
                 button,
                 pressed: true,
             } => {
-                self.owed_buttons.remove(&button);
+                self.owed.retain(|owed| *owed != Owed::Button(button));
                 self.buttons.insert(button);
             }
             InputEvent::PointerButton {
@@ -623,6 +631,54 @@ mod tests {
             t.inner.seen,
             [key(true), key(false), moved],
             "the key-up release_all could not send"
+        );
+    }
+
+    /// Refuses every event while `full`, as the portal's full queue does, and
+    /// records the rest.
+    #[derive(Default)]
+    struct Stalls {
+        seen: Vec<InputEvent>,
+        full: bool,
+    }
+
+    impl InputSink for Stalls {
+        fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+            if self.full {
+                return Err(InputError::Inject("the queue is full".to_owned()));
+            }
+            self.seen.push(*event);
+            Ok(())
+        }
+    }
+
+    /// Slice-G N-2: owed releases go out in the order they were refused. A
+    /// Ctrl-drag that ends while the portal stalls (the button up, then Ctrl
+    /// up) drops with Ctrl still down, as the viewer did it. Before, owed keys
+    /// went out before owed buttons, so the drop came without Ctrl: a move
+    /// instead of a copy.
+    #[test]
+    fn owed_releases_go_out_in_the_order_they_were_refused() {
+        let ctrl = |pressed| InputEvent::Key {
+            usb: 0x07_00e0,
+            pressed,
+        };
+        let left = |pressed| InputEvent::PointerButton {
+            button: Button::Left,
+            pressed,
+        };
+        let moved = InputEvent::PointerMove { x: 1, y: 2 };
+        let mut t = Tracked::new(Stalls::default());
+        t.inject(&ctrl(true)).unwrap();
+        t.inject(&left(true)).unwrap();
+        t.inner.full = true;
+        assert!(t.inject(&left(false)).is_err());
+        assert!(t.inject(&ctrl(false)).is_err());
+        t.inner.full = false;
+        t.inject(&moved).unwrap();
+        assert_eq!(
+            t.inner.seen,
+            [ctrl(true), left(true), left(false), ctrl(false), moved]
         );
     }
 
