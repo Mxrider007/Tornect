@@ -749,8 +749,8 @@ ignored test is the systemd round trip.
   and G1-4's releases through the Wayland portal, whether GNOME lets go of a RemoteDesktop session's held keys and
   dismisses its dialog on `Session.Close`, `Closed` on "Stop sharing" and screen lock, G2-2 with a real RandR change
   (NEEDS-DEVICE(x11)), and how often onion circuits stall for 3 s or more (G2-3).
-- **Unreviewed by a hostile review:** `8ee5afc` (R2-I1's fix) and the documentation commits after `b6897b7` (round 1
-  read `e278bfb`).
+- **Round 3** (no BLOCK, nothing above Low open): `8ee5afc` VERIFIED CLOSED; the documentation after `b6897b7` read
+  for its security statements, none false.
 
 ## Gotchas (the build VM)
 
