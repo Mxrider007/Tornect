@@ -59,7 +59,8 @@ pub fn fill(shared: &Shared, token_file: &Path) {
             id: 3,
             host_name: "Office PC".to_owned(),
             sas: "305 116".to_owned(),
-            deadline: now + Duration::from_secs(50),
+            host_waits_until: now + Duration::from_secs(50),
+            deadline: now + Duration::from_secs(600),
         });
         m.sharing = vec![Sharing {
             session_id: "0123456789abcdef".to_owned(),
