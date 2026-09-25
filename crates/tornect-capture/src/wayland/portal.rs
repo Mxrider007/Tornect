@@ -146,15 +146,52 @@ impl Call {
             Self::Key { .. } => "key",
         }
     }
+
+    /// The key or button this presses (`true`) or lets go of (`false`);
+    /// `None` for motion and scrolling.
+    fn held(&self) -> Option<(Held, bool)> {
+        match *self {
+            Self::Key { code, pressed } => Some((Held::Key(code), pressed)),
+            Self::Button { code, pressed } => Some((Held::Button(code), pressed)),
+            Self::Motion { .. } | Self::Scroll { .. } => None,
+        }
+    }
 }
 
-/// A live portal session, owned by its thread. Dropping the last handle closes
-/// the session: the desktop's sharing indicator goes away, and the compositor
-/// releases whatever the session's virtual devices still hold.
+/// A key or a button the calls can hold down, by its evdev code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Key(i32),
+    Button(i32),
+}
+
+impl Held {
+    /// The call that lets go of it.
+    fn release(self) -> Call {
+        match self {
+            Self::Key(code) => Call::Key {
+                code,
+                pressed: false,
+            },
+            Self::Button(code) => Call::Button {
+                code,
+                pressed: false,
+            },
+        }
+    }
+}
+
+/// A live portal session, owned by its thread. Dropping the last handle ends
+/// it: the thread makes no queued call any more, lets go of the keys and
+/// buttons its calls still hold down, and closes the session, which takes
+/// the desktop's sharing indicator away.
 pub(crate) struct Portal {
     calls: Option<mpsc::Sender<Call>>,
     /// Set once the session is over, whoever ended it.
     over: Arc<AtomicBool>,
+    /// Set when the last handle goes (a kill, or the session's end), before
+    /// the queue ends.
+    closing: Arc<AtomicBool>,
     /// Disconnects when the thread has finished.
     finished: Mutex<Option<Receiver<()>>>,
     thread: Option<JoinHandle<()>>,
@@ -180,6 +217,7 @@ impl Portal {
         let (calls_tx, calls_rx) = mpsc::channel(INPUT_QUEUE);
         let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel::<()>(0);
         let over = Arc::new(AtomicBool::new(false));
+        let closing = Arc::new(AtomicBool::new(false));
         // Every step on the thread is bounded, so this only guards against a
         // thread that is stuck anyway.
         let wait = setup.dialog_wait + STEP_WAIT * (STEPS + 1);
@@ -187,16 +225,18 @@ impl Portal {
             .name("tornect-portal".to_owned())
             .spawn({
                 let over = Arc::clone(&over);
+                let closing = Arc::clone(&closing);
                 move || {
                     let _finished = finished_tx;
                     let _over = SetOnDrop(Arc::clone(&over));
-                    run(&setup, &opened_tx, calls_rx, &over);
+                    run(&setup, &opened_tx, calls_rx, &over, &closing);
                 }
             })
             .map_err(|e| unavailable(format!("cannot start the portal thread: {e}")))?;
         let portal = Self {
             calls: Some(calls_tx),
             over,
+            closing,
             finished: Mutex::new(Some(finished_rx)),
             thread: Some(thread),
         };
@@ -244,6 +284,8 @@ impl Portal {
 
 impl Drop for Portal {
     fn drop(&mut self) {
+        // Marked first, so the thread sees it before the queue ends.
+        self.closing.store(true, Ordering::SeqCst);
         // The queue ends, so the thread closes the session and returns.
         drop(self.calls.take());
         let finished = self
@@ -276,10 +318,16 @@ impl Portal {
         let portal = Self {
             calls: Some(calls),
             over: Arc::new(AtomicBool::new(false)),
+            closing: Arc::new(AtomicBool::new(false)),
             finished: Mutex::new(None),
             thread: None,
         };
         (portal, rx)
+    }
+
+    /// The flag the handle's drop sets, as the thread sees it.
+    pub(crate) fn closing(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.closing)
     }
 }
 
@@ -299,6 +347,7 @@ fn run(
     opened: &SyncSender<Result<Opened, CaptureError>>,
     mut calls: mpsc::Receiver<Call>,
     over: &AtomicBool,
+    closing: &AtomicBool,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -337,7 +386,7 @@ fn run(
             return;
         }
         let (remote, session) = (&remote, &session);
-        let passed = pass_on(&mut calls, &mut closed, move |call| {
+        let passed = pass_on(&mut calls, closing, &mut closed, move |call| {
             notify(remote, session, node_id, call)
         })
         .await;
@@ -363,8 +412,15 @@ pub(super) enum PassedOn {
 /// Pass the queued input calls on to `notify`, each bounded by
 /// [`INPUT_WAIT`], until every handle is gone or the desktop ends the
 /// session (`closed`).
+///
+/// Once `closing` is set (the last handle went: a kill, or the session's
+/// end), no queued call is made any more, and when the queue ends this lets
+/// go of what its own calls still hold down (slice-G G1-4). The handle's own
+/// releases can find the queue full while the portal stalls, and whether
+/// closing the session lets go of what its devices hold is not known.
 pub(super) async fn pass_on<S, F, Fut>(
     calls: &mut mpsc::Receiver<Call>,
+    closing: &AtomicBool,
     closed: &mut Option<S>,
     mut notify: F,
 ) -> PassedOn
@@ -373,21 +429,43 @@ where
     F: FnMut(Call) -> Fut,
     Fut: Future<Output = Result<(), ashpd::Error>>,
 {
+    // What the calls made hold down, oldest press first. A call that timed
+    // out counts as made: it may have reached the desktop.
+    let mut down: Vec<Held> = Vec::new();
     loop {
         let call = tokio::select! {
             call = calls.recv() => call,
             () = ended(closed) => return PassedOn::DesktopEnded,
         };
-        let Some(call) = call else {
-            return PassedOn::HandlesGone;
-        };
-        match tokio::time::timeout(INPUT_WAIT, notify(call)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::debug!(error = %e, kind = call.kind(), "the portal refused an input event");
-            }
-            Err(_) => tracing::debug!(kind = call.kind(), "an input event timed out at the portal"),
+        let Some(call) = call else { break };
+        if closing.load(Ordering::SeqCst) {
+            continue;
         }
+        match call.held() {
+            Some((held, true)) if !down.contains(&held) => down.push(held),
+            Some((held, false)) => down.retain(|d| *d != held),
+            _ => {}
+        }
+        make(&mut notify, call).await;
+    }
+    for held in down.into_iter().rev() {
+        make(&mut notify, held.release()).await;
+    }
+    PassedOn::HandlesGone
+}
+
+/// Make one call, bounded by [`INPUT_WAIT`].
+async fn make<F, Fut>(notify: &mut F, call: Call)
+where
+    F: FnMut(Call) -> Fut,
+    Fut: Future<Output = Result<(), ashpd::Error>>,
+{
+    match tokio::time::timeout(INPUT_WAIT, notify(call)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, kind = call.kind(), "the portal refused an input event");
+        }
+        Err(_) => tracing::debug!(kind = call.kind(), "an input event timed out at the portal"),
     }
 }
 
