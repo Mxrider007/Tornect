@@ -196,8 +196,9 @@ By the identifiers of the security reviews that found them.
   accounts, even inside your home or user folder.
 - **P-1 (review of start at login):** a start-at-login or unattended change made while no host runs does not
   wait the 60 s after a session's end that a running host enforces.
-- **G2-3:** when a viewer with control says nothing for 3 s (a Tor stall counts), this computer lets go of the
-  keys and buttons it holds; a drag then ends where the pointer last was.
+- **G2-3:** when a viewer with control says nothing for 3 s (a Tor stall counts), or keeps sending for 6 s while
+  this computer cannot get a picture through to it, this computer lets go of the keys and buttons it holds; a drag
+  then ends where the pointer last was.
 - No client in this build asks for an unattended session, so an unattended grant cannot yet be used.
 - Everything travels over Tor: a few frames per second for a large desktop, and a connection takes from
   seconds to minutes to set up. Direct QUIC with hole punching comes later.
@@ -227,9 +228,10 @@ The Wayland backend (`5ba8f11..73e9314`: the unsafe code that talks to PipeWire,
 the idle ping and the fixes of that session) was reviewed on 2026-09-24 (slice G: two threat modelers and the
 Security parent, read-only, threat modeling without a refuter pass): 0 Critical, 0 High, 0 Medium; six Lows,
 fixed in `08295b6`, `c285e98`, `4448c58`, `04fd0c6`, `9d9442e` with `04ae195`, and `9604760`; one Info (G2-3,
-above). A closure check in two rounds verified all six fixes closed in code (a screen-size change on a real X11
-desktop still needs one, as "Not verified" says), found the later changes sound (the order in which owed key
-releases are sent, `72d9a76`; the viewer's code question, `a98733c`, and the host's report of a device it paired
-that then says nothing, `54dbe3b`, which only relabels an outcome), and left nothing above Low open. Its one new
-Info, a code-question message that could say "Paired" when nothing had been pinned, is fixed in `8ee5afc`.
-**Not reviewed:** that last fix and the documentation after `b6897b7`.
+above). A closure check in three rounds verified all six fixes closed in code (a screen-size change on a real
+X11 desktop still needs one, as "Not verified" says) and found the later changes sound (the viewer's code
+question, `a98733c`, and the host's report of a device it paired that then says nothing, `54dbe3b`, which only
+relabels an outcome). It filed two new Infos, both fixed: N-2, the order in which owed key releases were sent
+(`72d9a76`), and R2-I1, a code-question message that could say "Paired" when nothing had been pinned (`8ee5afc`,
+verified closed in the third round). The third round also read the documentation after `b6897b7` for its security
+statements and found none false; nothing above Low is open.
