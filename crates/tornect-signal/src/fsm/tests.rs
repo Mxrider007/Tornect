@@ -4305,3 +4305,133 @@ async fn a_sink_that_panics_still_releases_the_session() {
     });
     assert_eq!(ended.as_deref(), Some("aborted"));
 }
+
+/// Pairs up to its code check and then says nothing more, as the window's
+/// code card does while nobody looks at it: `confirm` never answers.
+struct SilentAtTheCode;
+
+impl client::ClientPairingUi for SilentAtTheCode {
+    fn show_sas<'a>(&'a self, _: &'a TornectId, _: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn confirm<'a>(&'a self, _: &'a TornectId, _: &'a str, _: &'a str) -> BoxFuture<'a, bool> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// A device the host's user paired, which then says nothing (its user has not
+/// confirmed the code yet), is reported as paired when the host stops waiting
+/// for its session request, as one that leaves is, not as a failed handshake:
+/// the host's accept pinned it. Only the reported outcome changes. A timeout
+/// before the host's accept still pins nothing and grants nothing: silence
+/// after `HELLO_ACK`, or a pairing popup nobody answers.
+#[tokio::test(start_paused = true)]
+async fn a_device_the_host_paired_that_then_says_nothing_is_reported_paired() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = host_side(tmp.path(), HOST_SEED);
+    let device = DeviceIdentity::from_seed(&CLIENT_SEED).id();
+    let nothing_granted = |host: &HostSide| {
+        assert_eq!(host.consent.session_popups(), 0, "a session popup");
+        assert_eq!(
+            host.deps.stats.accepted_total.load(Ordering::SeqCst),
+            0,
+            "a session accepted"
+        );
+    };
+
+    // Before the host's accept: HELLO, then silence.
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.send_hello(None).await;
+    let _ack = raw.recv().await.unwrap();
+    let err = task.await.unwrap().unwrap_err();
+    assert!(
+        matches!(err, HandshakeError::Timeout("PAIR_REQUEST")),
+        "{err}"
+    );
+    assert!(
+        host.trusted.get(&device).is_none(),
+        "pinned without a pairing"
+    );
+    nothing_granted(&host);
+
+    // Before the host's accept: the pairing popup is never answered.
+    host.consent.push_pairing(PairScript::Hang);
+    let mut client = client_side(tmp.path(), host.identity.id(), CLIENT_SEED);
+    client.deps.ui = Arc::new(SilentAtTheCode);
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        Intent::Session,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            HandshakeError::PairRejected {
+                reason: pair_reject::TIMEOUT,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        HostOutcome::PairRejected {
+            reason: pair_reject::TIMEOUT,
+            ..
+        }
+    ));
+    assert!(
+        host.trusted.get(&device).is_none(),
+        "pinned without an accept"
+    );
+    nothing_granted(&host);
+
+    // After the host's accept: the client never answers its code check.
+    host.consent
+        .push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let asking = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        Intent::Session,
+    );
+    tokio::pin!(asking);
+    let started = tokio::time::Instant::now();
+    let outcome = tokio::select! {
+        biased;
+        outcome = task => outcome.unwrap(),
+        ended = &mut asking => panic!("the client ended first: {ended:?}"),
+    };
+    match outcome {
+        Ok(HostOutcome::PairedOnly {
+            device: paired,
+            label,
+        }) => {
+            assert_eq!(paired, device);
+            assert_eq!(label, "Laptop of Ana");
+        }
+        other => panic!("expected PairedOnly, got {other:?}"),
+    }
+    assert!(started.elapsed() >= timeouts::SESSION_REQUEST);
+    assert!(
+        host.trusted.get(&device).is_some(),
+        "the host's accept pinned it"
+    );
+    assert!(
+        !client.known.is_known(&host.identity.id()),
+        "the client pinned nothing"
+    );
+    nothing_granted(&host);
+}
