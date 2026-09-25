@@ -616,15 +616,18 @@ local when it was written, for push 2.
   - C3-2 (`d64bc87`): a violation ends the session before its `ERROR` is written.
   - C2-2 (b) (`5e323c1`): the viewer's writes race its stop.
   - C1-3 (`af7d956`): held keys are released after 3 s of silence, and **the viewer pings once a
-    second when idle**.
+    second when idle**; not while a picture or `Pong` write was stuck, until `04fd0c6` (slice-G
+    G2-1).
   - C1-2 (`3b90cd2`): X11 and `SendInput` map the pointer over the encoded region (a mapping, not
-    a refusal).
+    a refusal); the X11 half used the root size read at connect (slice-G G2-2), fixed in `9604760`.
   - C3-3 (`2ac8ffd`): a `DISPLAY` with a host part is refused.
   - C3-5 (`f769365`): doctor and the banner name the capture backend truthfully.
   - The media-end wording (`33ad8c9`, client side).
-  - The §10 hardening: a pending portal open ends with its session (`82d1692`); a view-only
+  - The §10 hardening: a pending portal open ends with its session (`82d1692`; an end that came
+    before the open had stored its cancel was lost until `c285e98`, slice-G G1-1); a view-only
     session drops its input handle (`ea9db5d`); doctor names the grant file and how to revoke it
-    (`73b87cb`); the token's path is out of log lines (`f9e96f5`).
+    (`73b87cb`); the token's path is out of log lines (`f9e96f5`; `remember_token`'s failures still
+    named it until `08295b6`, slice-G G1-2).
   - The zbus warning filter (`3ad3473`); the R9, R5 ≡ R8 and R7 test tightenings (`1790746`,
     `9d6b4b2`, `6c0646b`); the O2 comment (`4009dbc`); R2: **the first Ctrl-C ends a pending
     media open** (`ad55279`).
@@ -652,7 +655,9 @@ local when it was written, for push 2.
   token, and (M4) the block window and indicator.
 
 **Unreviewed by a hostile review:** everything after `5ba8f11`, including `pipewire.rs`'s unsafe
-FFI, the portal and token handling, the idle ping and this session's fixes.
+FFI, the portal and token handling, the idle ping and this session's fixes. (Reviewed since: the
+slice-G review of 2026-09-24 covered `5ba8f11..73e9314`; its outcome is in the last session's
+"Still open".)
 
 ## Sessions 2026-09-23/24 — the window, the indicator, the Windows build, packaging, start at login; three reviews and their fixes; the pre-release prepared
 
@@ -718,7 +723,8 @@ ignored test is the systemd round trip.
 
 **Still open:**
 - The console check (the window over real Tor with a person at the screen, keys over Tor, the polkit path live).
-- E2-4's load-time residual: the linker's dependent-load flag waits for the operator (M1-51).
+- E2-4's load-time residual: the linker's dependent-load flag is set in `312748e`; the final `dist` checks
+  `DependentLoadFlags: 0x800` on the release exe; the loader's effect NEEDS-DEVICE(windows).
 - Everything at run time on Windows (NEEDS-DEVICE), and the Linux ↔ Windows session.
 - Carried to M6 or later: E2-2's DACL, E2-5, E2-6, E2-8, E3-2, E3-4 (before 2026-10-26), E3-5, slice-E P-1
   (CFG/CET), F1-6, F2-5, F2-6's readiness, slice-F P-1, F1-2's residuals, N-2, N-3's extras (the trigger's
@@ -728,8 +734,20 @@ ignored test is the systemd round trip.
   (no key repeats are forwarded).
 - Cosmetic: a long IPC refusal is cut at 256 characters mid-word; the pings-only host still prints its "sharing:
   this desktop …" line.
-- **Unreviewed by a hostile review:** `5ba8f11..73e9314` (the Wayland backend, `pipewire.rs`'s unsafe FFI, the
-  portal and token handling, the idle ping, the slice-D fixes), and everything after `b6897b7`.
+- **Reviewed 2026-09-24, slice G** (`5ba8f11..73e9314`: the Wayland backend, `pipewire.rs`'s unsafe FFI, the
+  portal and token handling, the idle ping, the slice-D fixes; two threat modelers and the Security parent, no
+  refuter pass): 0 Critical, 0 High, 0 Medium, **six Lows, all fixed**: G1-2 `08295b6`, G1-1 `c285e98`, G1-3
+  `4448c58` (test `c02ae7a`), G2-1 `04fd0c6`, G1-4 `9d9442e` + `04ae195`, G2-2 `9604760`; one Info, G2-3 (the 3 s
+  quiet release can let go of a live viewer's drag in a Tor stall; disclosed in the notes). The closure check's
+  round 1 verified G1-2, G1-1 and G1-3 closed and filed an Info (its N-2, the order of owed releases: fixed in
+  `72d9a76`); **round 2 is pending** for G2-1, G1-4, G2-2, that N-2, and two fixes from the fifth console check:
+  the code card that outlives the host's wait (`a98733c`) and the host's `PairedOnly` on a timeout after its accept
+  (`54dbe3b`, `fsm/host.rs:883-889`).
+- The slice-G live and device items: G2-1 over real Tor (a vanished viewer's held key, timed), the quiet release
+  and G1-4's releases through the Wayland portal, whether GNOME lets go of a RemoteDesktop session's held keys and
+  dismisses its dialog on `Session.Close`, `Closed` on "Stop sharing" and screen lock, G2-2 with a real RandR change
+  (NEEDS-DEVICE(x11)), and how often onion circuits stall for 3 s or more (G2-3).
+- **Unreviewed by a hostile review:** the documentation commits after `b6897b7` (round 1 read `e278bfb`).
 
 ## Gotchas (the build VM)
 
