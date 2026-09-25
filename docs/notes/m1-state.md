@@ -740,14 +740,17 @@ ignored test is the systemd round trip.
   `4448c58` (test `c02ae7a`), G2-1 `04fd0c6`, G1-4 `9d9442e` + `04ae195`, G2-2 `9604760`; one Info, G2-3 (the 3 s
   quiet release can let go of a live viewer's drag in a Tor stall; disclosed in the notes). The closure check's
   round 1 verified G1-2, G1-1 and G1-3 closed and filed an Info (its N-2, the order of owed releases: fixed in
-  `72d9a76`); **round 2 is pending** for G2-1, G1-4, G2-2, that N-2, and two fixes from the fifth console check:
-  the code card that outlives the host's wait (`a98733c`) and the host's `PairedOnly` on a timeout after its accept
-  (`54dbe3b`, `fsm/host.rs:883-889`).
+  `72d9a76`). Round 2 (no BLOCK, nothing above Low open) verified G2-1, G1-4 and G2-2 closed in code (G2-2's live
+  RandR change NEEDS-DEVICE(x11)), found `9d9442e` and `c02ae7a` sound, and found the two fixes from the fifth
+  console check sound on the security side: the code card that outlives the host's wait (`a98733c`, decision M1-55)
+  and the host's `PairedOnly` on a timeout after its accept (`54dbe3b`, `fsm/host.rs:883-889`, an outcome label
+  only). Its one Info, R2-I1 (a late yes read "Paired" whatever the error), is fixed in `8ee5afc`.
 - The slice-G live and device items: G2-1 over real Tor (a vanished viewer's held key, timed), the quiet release
   and G1-4's releases through the Wayland portal, whether GNOME lets go of a RemoteDesktop session's held keys and
   dismisses its dialog on `Session.Close`, `Closed` on "Stop sharing" and screen lock, G2-2 with a real RandR change
   (NEEDS-DEVICE(x11)), and how often onion circuits stall for 3 s or more (G2-3).
-- **Unreviewed by a hostile review:** the documentation commits after `b6897b7` (round 1 read `e278bfb`).
+- **Unreviewed by a hostile review:** `8ee5afc` (R2-I1's fix) and the documentation commits after `b6897b7` (round 1
+  read `e278bfb`).
 
 ## Gotchas (the build VM)
 
