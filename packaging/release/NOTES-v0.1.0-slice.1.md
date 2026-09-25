@@ -39,7 +39,7 @@ Tornect homes on that machine talked to each other over the real Tor network; no
 | Media over Tor: the test card at 1280×720 and 13 fps; the real Wayland desktop at 3538×1918 and 2.7–3.1 fps with 0 decode errors; `tornect panic` ending the media in about 100 ms | live over Tor, the command line (`tornect host --capture …`, `tornect connect`), 2026-09-22 |
 | Wayland capture and pointer injection through the desktop's RemoteDesktop portal (19 fps of capture) | live at the console, 2026-09-22 |
 | X11 capture and XTEST input | under Xvfb only, not on a real X11 desktop |
-| The window: every screen, the questions, the banner, the "Tornect: sharing" window | unit tests and preview runs under Xvfb, no network; **not used live over Tor** (below) |
+| The window: every screen, the questions, the banner, the "Tornect: sharing" window | unit tests and preview runs under Xvfb; live on 2026-09-24 (the fifth console check): a pairing crossed Tor from one window to the other and the host accepted it, and the first-run grant was verified; a session between the windows over Tor is **not yet performed** (below) |
 | Start at login: the systemd user unit, installed, started, stopped and removed; the start-at-login host answers pings only | live, 2026-09-24, with a development build's re-authentication escape: polkit's dialog was not exercised |
 | This zip, unpacked: `--version`, `id`, `doctor` (it accepts the bundled `pt/lyrebird`) | live on the build VM, by the release run (`docs/RELEASING.md` step 4) |
 
@@ -227,6 +227,9 @@ The Wayland backend (`5ba8f11..73e9314`: the unsafe code that talks to PipeWire,
 the idle ping and the fixes of that session) was reviewed on 2026-09-24 (slice G: two threat modelers and the
 Security parent, read-only, threat modeling without a refuter pass): 0 Critical, 0 High, 0 Medium; six Lows,
 fixed in `08295b6`, `c285e98`, `4448c58`, `04fd0c6`, `9d9442e` with `04ae195`, and `9604760`; one Info (G2-3,
-above). A closure check verified the first three of those fixes closed; the other three, the order in which owed
-key releases are sent (`72d9a76`), and two fixes to the viewer's code question (`a98733c`, `54dbe3b`) are in its
-second round. **Not reviewed:** the documentation after `b6897b7`.
+above). A closure check in two rounds verified all six fixes closed in code (a screen-size change on a real X11
+desktop still needs one, as "Not verified" says), found the later changes sound (the order in which owed key
+releases are sent, `72d9a76`; the viewer's code question, `a98733c`, and the host's report of a device it paired
+that then says nothing, `54dbe3b`, which only relabels an outcome), and left nothing above Low open. Its one new
+Info, a code-question message that could say "Paired" when nothing had been pinned, is fixed in `8ee5afc`.
+**Not reviewed:** that last fix and the documentation after `b6897b7`.
