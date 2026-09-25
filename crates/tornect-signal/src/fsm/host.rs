@@ -721,7 +721,8 @@ pub enum HostOutcome {
         /// A [`messages::pair_reject`] code.
         reason: u16,
     },
-    /// Paired, and the peer left without a `SESSION_REQUEST`.
+    /// Paired, and the peer left, or said nothing more within
+    /// [`timeouts::SESSION_REQUEST`], without a `SESSION_REQUEST`.
     PairedOnly {
         /// The peer.
         device: DeviceId,
@@ -875,7 +876,15 @@ where
                 .await
             {
                 Ok(rx) => rx,
-                Err(HandshakeError::Closed | HandshakeError::PeerBye { .. }) => {
+                // Paired either way: this host's accept pinned the device
+                // (above). A peer that says nothing more by the timer may
+                // still be at its code check; only the reported outcome
+                // differs from a peer that left.
+                Err(
+                    HandshakeError::Closed
+                    | HandshakeError::PeerBye { .. }
+                    | HandshakeError::Timeout(_),
+                ) => {
                     return Ok(HostOutcome::PairedOnly { device, label });
                 }
                 Err(e) => return Err(e),
