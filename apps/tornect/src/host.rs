@@ -608,7 +608,7 @@ fn describe_outcome(outcome: &HostOutcome) -> Option<String> {
             pair_reject::name(*reason)
         ),
         HostOutcome::PairedOnly { label, .. } => {
-            format!("paired with \"{label}\"; it left without asking for a session")
+            format!("paired with \"{label}\"; it asked for no session")
         }
         HostOutcome::SessionRejected { label, reason, .. } => {
             format!(
