@@ -15,9 +15,10 @@
 //!   expression names (`packaging/licenses/`, whose `SOURCES.md` says where
 //!   each text came from), with the authors its manifest names;
 //! * code compiled in under a licence of its own that is no crate's own: the C
-//!   sources and fonts inside some crates (`BUNDLED`), the Rust standard
-//!   library, and on Windows llvm-mingw's runtime; and pointers to lyrebird's
-//!   notices (`pt/lyrebird.txt`) and to Tornect's own
+//!   sources and fonts inside some crates (`BUNDLED`), the fonts and the icon
+//!   font in Tornect's own tree that the window embeds (`EMBEDDED`), the Rust
+//!   standard library, and on Windows llvm-mingw's runtime; and pointers to
+//!   lyrebird's notices (`pt/lyrebird.txt`) and to Tornect's own
 //!   (`THIRD_PARTY_NOTICES.md`).
 //!
 //! Identical texts are written once and numbered; each package's line gives
@@ -101,6 +102,34 @@ pub const BUNDLED: [Bundled; 6] = [
             "fonts/OFL.txt",
             "fonts/emoji-icon-font-mit-license.txt",
         ],
+    },
+];
+
+/// Files in Tornect's own tree that the executable embeds under a licence of
+/// their own, and the files, relative to the workspace root, that carry the
+/// licence as upstream publishes it (`packaging/licenses/SOURCES.md` gives
+/// where each came from and its SHA-256).
+pub struct Embedded {
+    pub what: &'static str,
+    pub files: &'static [&'static str],
+}
+
+pub const EMBEDDED: [Embedded; 3] = [
+    Embedded {
+        what: "Manrope, the window's text font (regular, medium, semibold and bold, from \
+               apps/tornect/assets/fonts/): SIL Open Font License 1.1",
+        files: &["apps/tornect/assets/fonts/Manrope-OFL.txt"],
+    },
+    Embedded {
+        what: "JetBrains Mono, the window's font for IDs, codes and numbers (regular, medium \
+               and semibold, from apps/tornect/assets/fonts/): SIL Open Font License 1.1",
+        files: &["apps/tornect/assets/fonts/JetBrainsMono-OFL.txt"],
+    },
+    Embedded {
+        what: "Lucide, the window's icons as a font (lucide.ttf, from \
+               apps/tornect/assets/icons/): ISC, with the icons derived from Feather under \
+               MIT",
+        files: &["apps/tornect/assets/icons/Lucide-LICENSE.txt"],
     },
 ];
 
@@ -603,6 +632,20 @@ pub fn collect(
         }
         items.push(Item {
             what: format!("{} (in {} {})", bundled.what, package.name, package.version),
+            texts: numbers,
+        });
+    }
+
+    for embedded in &EMBEDDED {
+        let mut numbers = Vec::new();
+        for file in embedded.files {
+            numbers.push(texts.add(
+                format!("{file} in Tornect's source"),
+                read_text(&root.join(file))?,
+            ));
+        }
+        items.push(Item {
+            what: embedded.what.to_owned(),
             texts: numbers,
         });
     }
@@ -1137,7 +1180,12 @@ mod tests {
                     bundled.krate
                 );
             }
-            assert_eq!(licences.items.len(), BUNDLED.len());
+            assert_eq!(licences.items.len(), BUNDLED.len() + EMBEDDED.len());
+            for embedded in &EMBEDDED {
+                for file in embedded.files {
+                    assert!(root.join(file).is_file(), "{file} is missing");
+                }
+            }
             let text = render(
                 &licences,
                 &Heading {

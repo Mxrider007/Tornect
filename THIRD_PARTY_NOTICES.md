@@ -64,6 +64,18 @@ zip's `BUILD-INFO.txt` names with changed versions of those crates
 (`docs/RELEASING.md`, *Reproducing a build*). Their licence text is in each zip's
 `THIRD_PARTY_LICENSES.txt`, and the GPL it builds on is `LICENSE`.
 
+## Fonts and icons of the window (`apps/tornect/assets/`)
+
+The window embeds these files unchanged; `packaging/licenses/SOURCES.md` gives
+where each came from and its SHA-256, and each release zip's
+`THIRD_PARTY_LICENSES.txt` carries their licence texts in full.
+
+| Files | What | Licence (the upstream file, verbatim) |
+|---|---|---|
+| `fonts/manrope-{regular,medium,semibold,bold}.ttf` | Manrope, the text font | SIL Open Font License 1.1 (`fonts/Manrope-OFL.txt`) |
+| `fonts/JetBrainsMono-{Regular,Medium,SemiBold}.ttf` | JetBrains Mono 2.304, for IDs, codes and numbers | SIL Open Font License 1.1 (`fonts/JetBrainsMono-OFL.txt`) |
+| `icons/lucide.ttf` | Lucide 1.48.0, the icons, as a font | ISC; the icons derived from Feather are MIT (`icons/Lucide-LICENSE.txt`) |
+
 ## Rust crates, and everything else built into the program
 
 Every other dependency is a Rust crate listed in `Cargo.lock`, pinned and
@@ -76,5 +88,6 @@ crate the executable is built from, with its version and licence expression,
 and the licence texts those crates publish (or, for the few that publish none,
 the canonical texts in `packaging/licenses/`); the C code built in from inside
 crates (OpenH264, ring's fiat-crypto, Zstandard, liblzma, SQLite), egui's
-fonts, the Rust standard library's notices, and for Windows the statically
-linked llvm-mingw runtime (libc++, libunwind, compiler-rt, mingw-w64's).
+fonts, the window's own fonts and icons (above), the Rust standard library's
+notices, and for Windows the statically linked llvm-mingw runtime (libc++,
+libunwind, compiler-rt, mingw-w64's).
