@@ -247,27 +247,25 @@ impl Default for Security {
     }
 }
 
-/// Best-effort machine name without spawning processes.
+/// The name peers see until the user picks one: neutral, from the operating
+/// system alone ("Linux PC", "Windows PC"), never this machine's network
+/// name, which every device it pairs with and every computer it connects to
+/// would otherwise be sent and keep. It reads nothing: no variable, no file.
+/// A config file that stores a name keeps it.
 #[must_use]
 pub fn default_device_name() -> String {
-    #[cfg(windows)]
-    if let Ok(n) = std::env::var("COMPUTERNAME")
-        && !n.trim().is_empty()
-    {
-        return n.trim().to_owned();
-    }
-    #[cfg(target_os = "linux")]
-    if let Ok(s) = std::fs::read_to_string("/etc/hostname")
-        && !s.trim().is_empty()
-    {
-        return s.trim().to_owned();
-    }
-    if let Ok(n) = std::env::var("HOSTNAME")
-        && !n.trim().is_empty()
-    {
-        return n.trim().to_owned();
-    }
-    "tornect-device".to_owned()
+    const NEUTRAL: &str = if cfg!(windows) {
+        "Windows PC"
+    } else if cfg!(target_os = "macos") {
+        "Mac"
+    } else if cfg!(target_os = "android") {
+        "Android device"
+    } else if cfg!(target_os = "linux") {
+        "Linux PC"
+    } else {
+        "Tornect device"
+    };
+    NEUTRAL.to_owned()
 }
 
 impl Config {
@@ -439,6 +437,33 @@ panic_key = "Ctrl+Alt+End"
             Config::load(&bad),
             Err(CoreError::ConfigParse { .. })
         ));
+    }
+
+    /// The name others see (accepted decision 5): a fresh config names this
+    /// computer by its operating system alone and never by its network name,
+    /// and a config file written with a name, a host name included, keeps it.
+    /// The host name here is invented; the default reads no variable and no
+    /// file, so no host name can reach it.
+    #[test]
+    fn the_default_device_name_is_neutral_and_a_stored_name_is_kept() {
+        let invented_host = "quillmere-desk-4821";
+        let neutral = if cfg!(windows) {
+            "Windows PC"
+        } else if cfg!(target_os = "linux") {
+            "Linux PC"
+        } else {
+            return;
+        };
+        assert_eq!(default_device_name(), neutral);
+        assert_eq!(Config::default().general.device_name, neutral);
+        let fresh: Config = toml::from_str("[general]\nautostart = false\n").unwrap();
+        assert_eq!(fresh.general.device_name, neutral);
+        assert!(!fresh.general.device_name.contains(invented_host));
+
+        let stored: Config =
+            toml::from_str(&format!("[general]\ndevice_name = \"{invented_host}\"\n")).unwrap();
+        stored.validate().unwrap();
+        assert_eq!(stored.general.device_name, invented_host);
     }
 
     #[test]
