@@ -28,3 +28,27 @@ BSD-2-Clause (`openh264`, `openh264-sys2`, whose OpenH264 text also comes from i
 LGPL-3.0-only (`equix`, `hashx`), MPL-2.0 (`dynasm`, `dynasmrt`), LGPL-3.0-or-later OR MPL-2.0
 (`priority-queue`), BSL-1.0 (`clipboard-win`, Windows only) and (MIT OR Apache-2.0) AND OFL-1.1 AND
 Ubuntu-font-1.0 (`epaint_default_fonts`, whose font licences also come from its `fonts/`).
+
+## Fonts and icons the window embeds
+
+The window (`apps/tornect/src/ui/`) embeds these files whole with `include_bytes!` (subsetting them is a later
+step). Each is an unchanged copy of the upstream file below, fetched anonymously on 2026-09-27. `cargo xtask dist`
+puts each licence file's text into `THIRD_PARTY_LICENSES.txt` (part 1, `EMBEDDED` in `xtask/src/licences.rs`).
+
+| File | What | Downloaded from | SHA-256 |
+|---|---|---|---|
+| `apps/tornect/assets/fonts/manrope-regular.ttf` | Manrope 400 | `https://raw.githubusercontent.com/googlefonts/manrope/468c0dbe38efa331b80bfe9448256abe27be44c3/fonts/ttf/manrope-regular.ttf` (the upstream repository Google Fonts' `ofl/manrope/METADATA.pb` names) | `d23d6eedf51dd495138aa1a83588027d4a63549cdfcc2fa5e0d8e84e09cf4cb1` |
+| `apps/tornect/assets/fonts/manrope-medium.ttf` | Manrope 500 | the same commit, `fonts/ttf/manrope-medium.ttf` | `502ee33a6e140ad6ef10ef8b762a8e5cf01f33316f318800795725f4cfd539d9` |
+| `apps/tornect/assets/fonts/manrope-semibold.ttf` | Manrope 600 | the same commit, `fonts/ttf/manrope-semibold.ttf` | `f43edb46a08e1538413ea2383ef01ed93cdab191a2c57d2489d9590985858cf7` |
+| `apps/tornect/assets/fonts/manrope-bold.ttf` | Manrope 700 | the same commit, `fonts/ttf/manrope-bold.ttf` | `484d10f0683e9e9f588de978f70cd3ad17cb3522bc0ca6efc4491c83429d323c` |
+| `apps/tornect/assets/fonts/Manrope-OFL.txt` | Manrope's licence (SIL OFL 1.1, with its copyright line) | the same commit, `OFL.txt` | `58172e0c0fac2cda8a37b348164bb55e44b0e69051e557e92b1d3f6910141f7b` |
+| `apps/tornect/assets/fonts/JetBrainsMono-Regular.ttf` | JetBrains Mono 400 | `fonts/ttf/JetBrainsMono-Regular.ttf` of `https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304/JetBrainsMono-2.304.zip` (zip SHA-256 `6f6376c6ed2960ea8a963cd7387ec9d76e3f629125bc33d1fdcd7eb7012f7bbf`) | `a0bf60ef0f83c5ed4d7a75d45838548b1f6873372dfac88f71804491898d138f` |
+| `apps/tornect/assets/fonts/JetBrainsMono-Medium.ttf` | JetBrains Mono 500 | the same zip, `fonts/ttf/JetBrainsMono-Medium.ttf` | `31c92d01a8a08528b718a43addf0ad3df0af2ca4b7b3290a452f70f358e14d3d` |
+| `apps/tornect/assets/fonts/JetBrainsMono-SemiBold.ttf` | JetBrains Mono 600 | the same zip, `fonts/ttf/JetBrainsMono-SemiBold.ttf` | `1b3bfa1ed5665a4ce3f9feb68d2d4e40e70bf8b4b7d9a3edd418f321b4e166a0` |
+| `apps/tornect/assets/fonts/JetBrainsMono-OFL.txt` | JetBrains Mono's licence (SIL OFL 1.1, with its copyright line) | the same zip, `OFL.txt` | `30f0c136e3c88e422d0791acd97238870f9054a9729bc34cf2ff0d4ed8cac4ad` |
+| `apps/tornect/assets/icons/lucide.ttf` | Lucide 1.48.0 as an icon font | `lucide-font/lucide.ttf` of `https://github.com/lucide-icons/lucide/releases/download/1.48.0/lucide-font-1.48.0.zip` (zip SHA-256 `25976e2016c1ac4cf86b1d82202cefb186ddb11d692f6d0736e9d0b01415f7c8`) | `eaf30a2a0d2ec0cfbf7ab69ed6dc6e39b7e5e2f0255c17856dcb0b73a15584bb` |
+| `apps/tornect/assets/icons/Lucide-LICENSE.txt` | Lucide's licence (ISC; the icons derived from Feather under MIT) | `https://raw.githubusercontent.com/lucide-icons/lucide/1.48.0/LICENSE` | `b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57` |
+
+The glyph table in `apps/tornect/src/ui/icons.rs` takes each icon's code point from `lucide-font/codepoints.json`
+of the same zip (SHA-256 `65faa5131cc840e8f400e7262462cff817c4741552a5c707e8a692885adc66ce`), which is not
+committed.
