@@ -1,13 +1,16 @@
-//! The address book (the redesign's §4): the computers this one connects to,
-//! with the names the user gave them, in a small private TOML file next to
-//! `known-hosts.toml`, on this computer only (`docs/PLAN.md` §B.8.9's rules
-//! for local state: `0600`, atomic replace, refused whole when it is wrong).
+//! The address book and the recent connections (the redesign's §4): the
+//! computers this one connects to, with the names the user gave them, in two
+//! small private TOML files next to `known-hosts.toml`, on this computer only
+//! (`docs/PLAN.md` §B.8.9's rules for local state: `0600`, atomic replace,
+//! refused whole when it is wrong).
 //!
-//! [`AddressBook`] at [`address_book_file`] (`address-book.toml`, schema
-//! `version = 1`) holds, per computer: the host key its saved name was given
-//! against, the saved name, the name the computer declared when last seen,
-//! the first and the last day it was seen, and a `later` table for what
-//! arrives with the spec amendment; and whether history is kept.
+//! * [`AddressBook`] at [`address_book_file`] (`address-book.toml`, schema
+//!   `version = 1`) holds, per computer: the host key its saved name was given
+//!   against, the saved name, the name the computer declared when last seen,
+//!   the first and the last day it was seen, and a `later` table for what
+//!   arrives with the spec amendment; and whether history is kept.
+//! * [`Recent`] at [`recent_file`] (`recent.toml`, `version = 1`): the recent
+//!   connections, one line per computer and day, newest first.
 //!
 //! It holds no secret: no private key, no password, no credential. A
 //! `later.credential_ref` may only name the OS keychain entry that would hold
@@ -22,7 +25,11 @@
 //! with another key it is not shown until the computer is named again. The
 //! consent questions never show it: they show the pinned label.
 //!
-//! **Days, never times** ([`Day`], UTC): all the precision history keeps.
+//! **History** keeps days, never times ([`Day`], UTC). While it is off,
+//! recording a visit changes nothing and opens no file for writing
+//! ([`Store::record_visit`]); [`Store::clear_history`] deletes the recent
+//! list, the days in the address book and the last-seen times the handshake
+//! keeps in `known-hosts.toml`. Nothing here is ever sent anywhere.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -35,7 +42,7 @@ use crate::error::{CoreError, Result};
 use crate::id::TornectId;
 use crate::keystore::{create_private_dir, write_private_file};
 use crate::paths::Paths;
-use crate::trusted;
+use crate::trusted::{self, KnownHosts};
 
 /// The schema version this build reads and writes.
 pub const VERSION: u32 = 1;
@@ -48,11 +55,20 @@ pub const MAX_WORDS_CHARS: usize = 160;
 /// (`docs/PLAN.md` §B.8.9).
 pub const CREDENTIAL_PREFIX: &str = "tornect/unattended/";
 
+/// Most recent connections kept (one per computer and day).
+pub const MAX_VISITS: usize = 200;
+
 /// Where the address book lives: `<state>/address-book.toml`, next to
 /// `known-hosts.toml`.
 #[must_use]
 pub fn address_book_file(paths: &Paths) -> PathBuf {
     paths.state_dir.join("address-book.toml")
+}
+
+/// Where the recent connections live: `<state>/recent.toml`.
+#[must_use]
+pub fn recent_file(paths: &Paths) -> PathBuf {
+    paths.state_dir.join("recent.toml")
 }
 
 /// A calendar day in UTC: all the precision the address book keeps of when
@@ -415,11 +431,82 @@ impl AddressBook {
     }
 }
 
-/// The address book on disk, and every change the window makes to it. Each
-/// change reads the file, changes one thing and writes it back.
+/// One recent connection: which computer, which day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Visit {
+    /// The computer.
+    pub id: TornectId,
+    /// The day a session with it started.
+    pub day: Day,
+}
+
+/// The recent connections (`recent.toml`): one line per computer and day,
+/// newest first, at most [`MAX_VISITS`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Recent {
+    /// The schema version, [`VERSION`].
+    pub version: u32,
+    /// The connections, newest first.
+    #[serde(default)]
+    pub visits: Vec<Visit>,
+}
+
+impl Default for Recent {
+    fn default() -> Self {
+        Self {
+            version: VERSION,
+            visits: Vec::new(),
+        }
+    }
+}
+
+impl Recent {
+    /// Load the file, or an empty list when there is none; a file that is
+    /// not what this version writes is refused whole.
+    pub fn load(path: &Path) -> Result<Self> {
+        let Some(text) = read_if_there(path)? else {
+            return Ok(Self::default());
+        };
+        let recent: Self = parse(path, &text)?;
+        if recent.version != VERSION {
+            return Err(invalid(
+                path,
+                &format!(
+                    "schema version {} (this build reads {VERSION})",
+                    recent.version
+                ),
+            ));
+        }
+        if recent.visits.len() > MAX_VISITS {
+            return Err(invalid(path, "more visits than this version keeps"));
+        }
+        Ok(recent)
+    }
+
+    /// Write the file atomically with private permissions.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        save_private_toml(path, self)
+    }
+
+    /// Add a visit to `id` on `day`: one line per computer and day, the
+    /// newest first, the oldest dropped beyond [`MAX_VISITS`].
+    pub fn add(&mut self, id: TornectId, day: Day) {
+        self.visits.retain(|v| !(v.id == id && v.day == day));
+        self.visits.insert(0, Visit { id, day });
+        self.visits.sort_by_key(|v| std::cmp::Reverse(v.day));
+        self.visits.truncate(MAX_VISITS);
+    }
+}
+
+/// The address book and the recent list on disk, and every change the window
+/// makes to them. Each change reads the file, changes one thing and writes it
+/// back.
 #[derive(Debug, Clone)]
 pub struct Store {
     book: PathBuf,
+    recent: PathBuf,
 }
 
 impl Store {
@@ -429,10 +516,11 @@ impl Store {
         Self::at(address_book_file(paths))
     }
 
-    /// A store whose address book is `book`.
+    /// A store whose address book is `book`, with `recent.toml` beside it.
     #[must_use]
     pub fn at(book: PathBuf) -> Self {
-        Self { book }
+        let recent = book.with_file_name("recent.toml");
+        Self { book, recent }
     }
 
     /// The address book's file.
@@ -441,9 +529,107 @@ impl Store {
         &self.book
     }
 
+    /// The recent list's file.
+    #[must_use]
+    pub fn recent_path(&self) -> &Path {
+        &self.recent
+    }
+
     /// The address book.
     pub fn load(&self) -> Result<AddressBook> {
         AddressBook::load(&self.book)
+    }
+
+    /// The recent connections.
+    pub fn recent(&self) -> Result<Recent> {
+        Recent::load(&self.recent)
+    }
+
+    /// Whether history is kept. An address book that cannot be read keeps
+    /// none: nothing is written until it can be.
+    #[must_use]
+    pub fn keeps_history(&self) -> bool {
+        self.load().is_ok_and(|book| book.history)
+    }
+
+    /// Turn history on or off. Turning it off keeps what was kept until it
+    /// is cleared ([`Store::clear_history`]).
+    pub fn set_history(&self, on: bool) -> Result<()> {
+        let mut book = self.load()?;
+        if book.history != on {
+            book.history = on;
+            book.save(&self.book)?;
+        }
+        Ok(())
+    }
+
+    /// A session with the computer `id` started on `day`, its host key
+    /// pinned as `pinned`, calling itself `declared`. With history on: its
+    /// entry's first and last day and declared name, and a line in the recent
+    /// list. With history off: nothing, and no file is opened for writing.
+    /// Whether anything was kept.
+    pub fn record_visit(
+        &self,
+        id: TornectId,
+        pinned: [u8; 32],
+        declared: &str,
+        day: Day,
+    ) -> Result<bool> {
+        let mut book = self.load()?;
+        if !book.history {
+            return Ok(false);
+        }
+        let entry = book.hosts.entry(id).or_default();
+        if entry.key.is_none() && entry.name.is_none() {
+            entry.key = Some(pinned);
+        }
+        if let Some(declared) = clean_name(declared) {
+            entry.declared = Some(declared);
+        }
+        entry.first_seen = Some(entry.first_seen.map_or(day, |d| d.min(day)));
+        entry.last_seen = Some(entry.last_seen.map_or(day, |d| d.max(day)));
+        book.save(&self.book)?;
+        let mut recent = self.recent()?;
+        recent.add(id, day);
+        recent.save(&self.recent)?;
+        Ok(true)
+    }
+
+    /// Clear the history, whether it is on or off: the recent list's file is
+    /// overwritten and deleted, every computer loses its first and last day
+    /// (its name and key stay), and with `known_hosts` the last-seen times the
+    /// handshake keeps in `known-hosts.toml` go back to the pairing time (the
+    /// pins stay). Older copies that the atomic writes left in freed blocks
+    /// of the file system are beyond reach here.
+    pub fn clear_history(&self, known_hosts: Option<&Path>) -> Result<()> {
+        wipe(&self.recent)?;
+        if self.book.exists() {
+            let mut book = self.load()?;
+            let mut changed = false;
+            for entry in book.hosts.values_mut() {
+                changed |= entry.first_seen.take().is_some();
+                changed |= entry.last_seen.take().is_some();
+            }
+            if changed {
+                book.save(&self.book)?;
+            }
+        }
+        if let Some(path) = known_hosts
+            && path.exists()
+        {
+            let mut hosts = KnownHosts::load(path)?;
+            let mut changed = false;
+            for host in hosts.hosts.values_mut() {
+                if host.last_seen != host.paired_at {
+                    host.last_seen = host.paired_at;
+                    changed = true;
+                }
+            }
+            if changed {
+                hosts.save(path)?;
+            }
+        }
+        Ok(())
     }
 
     /// Name the computer `id` (saving it if it is new), bound to the host key
@@ -478,15 +664,42 @@ impl Store {
         }
     }
 
-    /// Remove the computer `id` from the address book; whether it was there.
+    /// Remove the computer `id` from the address book, and its lines from
+    /// the recent list; whether it was in the address book.
     pub fn forget(&self, id: &TornectId) -> Result<bool> {
         let mut book = self.load()?;
         let removed = book.hosts.remove(id).is_some();
         if removed {
             book.save(&self.book)?;
         }
+        if self.recent.exists() {
+            let mut recent = self.recent()?;
+            let before = recent.visits.len();
+            recent.visits.retain(|v| v.id != *id);
+            if recent.visits.len() != before {
+                recent.save(&self.recent)?;
+            }
+        }
         Ok(removed)
     }
+}
+
+/// Overwrite `path` with zeros, flush that to disk and delete the file;
+/// nothing when there is no such file.
+fn wipe(path: &Path) -> Result<()> {
+    use std::io::Write as _;
+    let len = match fs_err::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    {
+        let mut file = fs_err::OpenOptions::new().write(true).open(path)?;
+        file.write_all(&vec![0; usize::try_from(len).unwrap_or(0)])?;
+        file.sync_all()?;
+    }
+    fs_err::remove_file(path)?;
+    Ok(())
 }
 
 fn read_if_there(path: &Path) -> Result<Option<String>> {
@@ -805,5 +1018,187 @@ mod tests {
             let d = Day::from_days(n);
             assert_eq!(d.to_string().parse::<Day>().unwrap(), d);
         }
+    }
+
+    /// Every file under `dir` with its bytes and modification time, and the
+    /// directory's own modification time (a file made or removed moves it).
+    type Snapshot = (
+        Vec<(PathBuf, Vec<u8>, std::time::SystemTime)>,
+        std::time::SystemTime,
+    );
+
+    fn snapshot(dir: &Path) -> Snapshot {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = std::fs::metadata(&path).unwrap();
+            files.push((
+                path.clone(),
+                std::fs::read(&path).unwrap(),
+                meta.modified().unwrap(),
+            ));
+        }
+        files.sort();
+        (files, std::fs::metadata(dir).unwrap().modified().unwrap())
+    }
+
+    /// Set `path`'s modification time to a fixed one long ago, so that any
+    /// write shows.
+    fn age(path: &Path) {
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    /// Every file under `dir`, as text.
+    fn read_all(dir: &Path) -> String {
+        snapshot(dir)
+            .0
+            .iter()
+            .map(|(_, bytes, _)| String::from_utf8_lossy(bytes).into_owned())
+            .collect()
+    }
+
+    /// With history off, a visit writes nothing: the address book and the
+    /// recent list keep their bytes and their modification times, no file
+    /// appears or goes, and the directory is not touched, for a computer in
+    /// the book as for a new one.
+    #[test]
+    fn with_history_off_a_visit_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        let store = Store::at(dir.join("address-book.toml"));
+        store.name(id(1), Some([3; 32]), "Office PC").unwrap();
+        assert!(
+            store
+                .record_visit(id(1), [3; 32], "Linux PC", day("2026-09-20"))
+                .unwrap()
+        );
+        store.set_history(false).unwrap();
+        assert!(!store.keeps_history());
+        age(store.book_path());
+        age(store.recent_path());
+        let before = snapshot(&dir);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for d in ["2026-09-27", "2026-09-28"] {
+            assert!(
+                !store
+                    .record_visit(id(1), [3; 32], "Linux PC", day(d))
+                    .unwrap()
+            );
+            assert!(!store.record_visit(id(2), [4; 32], "Tower", day(d)).unwrap());
+        }
+        assert_eq!(snapshot(&dir), before);
+        // Switched back on, the next visit is kept.
+        store.set_history(true).unwrap();
+        assert!(
+            store
+                .record_visit(id(1), [3; 32], "Linux PC", day("2026-09-29"))
+                .unwrap()
+        );
+        assert_eq!(store.recent().unwrap().visits[0].day, day("2026-09-29"));
+    }
+
+    /// With history on, a visit keeps the day and nothing finer: the entry's
+    /// first and last day and the name the computer declared (cleaned), and
+    /// one line per computer and day in the recent list, newest first, at
+    /// most `MAX_VISITS`. Forgetting a computer removes its lines.
+    #[test]
+    fn with_history_on_a_visit_keeps_the_day_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::at(tmp.path().join("address-book.toml"));
+        for (who, key, name, d) in [
+            (1, [3; 32], "Linux\u{202E} PC", "2026-09-26"),
+            (1, [3; 32], "Linux PC", "2026-09-27"),
+            (1, [3; 32], "Linux PC", "2026-09-27"),
+            (2, [4; 32], "Tower", "2026-09-27"),
+        ] {
+            assert!(store.record_visit(id(who), key, name, day(d)).unwrap());
+        }
+        let book = store.load().unwrap();
+        let entry = &book.hosts[&id(1)];
+        assert_eq!(entry.first_seen, Some(day("2026-09-26")));
+        assert_eq!(entry.last_seen, Some(day("2026-09-27")));
+        assert_eq!(entry.declared.as_deref(), Some("Linux PC"));
+        assert_eq!(entry.key, Some([3; 32]));
+        let visits = store.recent().unwrap().visits;
+        let expected =
+            [(2, "2026-09-27"), (1, "2026-09-27"), (1, "2026-09-26")].map(|(who, d)| Visit {
+                id: id(who),
+                day: day(d),
+            });
+        assert_eq!(visits, expected.to_vec());
+        assert_eq!(mode(store.recent_path()), 0o600);
+        let text = std::fs::read_to_string(store.recent_path()).unwrap();
+        assert!(text.contains("day = \"2026-09-27\""), "{text}");
+        assert!(
+            !text.contains(':') && !text.contains('T'),
+            "no time of day: {text}"
+        );
+
+        assert!(store.forget(&id(2)).unwrap());
+        assert!(store.recent().unwrap().visits.iter().all(|v| v.id != id(2)));
+
+        let mut recent = Recent::default();
+        for n in 0..(MAX_VISITS as i64 + 20) {
+            recent.add(id(5), Day::from_days(20_000 + n));
+        }
+        assert_eq!(recent.visits.len(), MAX_VISITS);
+        assert_eq!(
+            recent.visits[0].day,
+            Day::from_days(20_000 + MAX_VISITS as i64 + 19)
+        );
+    }
+
+    /// Clear removes the history and nothing else: the recent list's file is
+    /// gone, the address book keeps its computers and names without a day,
+    /// and `known-hosts.toml` keeps its pins with the last-seen time back at
+    /// the pairing time. No file holds the visits' days any more.
+    #[test]
+    fn clear_wipes_the_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        let store = Store::at(dir.join("address-book.toml"));
+        let known = dir.join("known-hosts.toml");
+        let mut hosts = KnownHosts::default();
+        hosts.pin(id(1), "Linux PC", [3; 32], 1_790_000_000);
+        hosts.touch(&id(1), 1_790_510_400);
+        hosts.save(&known).unwrap();
+        store.name(id(1), Some([3; 32]), "Office PC").unwrap();
+        for d in ["2026-09-26", "2026-09-27"] {
+            assert!(
+                store
+                    .record_visit(id(1), [3; 32], "Linux PC", day(d))
+                    .unwrap()
+            );
+        }
+        assert!(read_all(&dir).contains("2026-09-27"));
+
+        store.clear_history(Some(&known)).unwrap();
+        assert!(!store.recent_path().exists());
+        let all = read_all(&dir);
+        for gone in ["2026-09-26", "2026-09-27", "first_seen", "1790510400"] {
+            assert!(!all.contains(gone), "{gone} is still on disk: {all}");
+        }
+        let entry = store.load().unwrap().hosts[&id(1)].clone();
+        assert_eq!(entry.name.as_deref(), Some("Office PC"));
+        assert_eq!(
+            (entry.key, entry.first_seen, entry.last_seen),
+            (Some([3; 32]), None, None)
+        );
+        let pinned = KnownHosts::load(&known)
+            .unwrap()
+            .get(&id(1))
+            .unwrap()
+            .clone();
+        assert_eq!(pinned.host_device_pk, [3; 32]);
+        assert_eq!(pinned.last_seen, pinned.paired_at);
+        // Again, with nothing left to clear: fine, and nothing is created.
+        store.clear_history(Some(&known)).unwrap();
+        assert!(!store.recent_path().exists());
     }
 }
