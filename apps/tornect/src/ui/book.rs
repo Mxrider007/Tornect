@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tornect_core::address_book::{AddressBook, Day, Store};
 use tornect_core::trusted::{KnownHosts, TrustedDevices, known_hosts_file};
-use tornect_core::{DeviceId, Paths, TornectId};
+use tornect_core::words::{Known, Role};
+use tornect_core::{Paths, TornectId};
 use tornect_signal::TorNode;
 
 use super::model::{Book, Check, Computer, Device};
@@ -37,9 +38,11 @@ pub enum Change {
 
 /// Read the files of the Tornect home `paths` into what the pages show. A
 /// file that cannot be read is left alone and named in
-/// [`Book::problem`]; the history then counts as off.
+/// [`Book::problem`]; the history then counts as off. Device words come from
+/// the address book's cache or from `derived` (the keys derived already); none is
+/// derived here.
 #[must_use]
-pub fn read(paths: &Paths, today: Day) -> Book {
+pub fn read(paths: &Paths, today: Day, derived: Option<&Known>) -> Book {
     let mut problems = Vec::new();
     let store = Store::new(paths);
     let book = store.load().unwrap_or_else(|e| {
@@ -79,13 +82,25 @@ pub fn read(paths: &Paths, today: Day) -> Book {
             let name = entry
                 .and_then(|e| e.name_for(pinned_key))
                 .map(str::to_owned);
+            let key = id.public_key_bytes();
+            let seen = entry
+                .and_then(|e| e.cached_words(key, Role::Onion))
+                .or_else(|| {
+                    derived
+                        .and_then(|k| k.cached(key, Role::Onion))
+                        .map(|h| (h.words(), h.identicon()))
+                });
             Computer {
                 id,
                 name_hidden: entry.is_some_and(|e| e.name.is_some()) && name.is_none(),
                 name,
                 pinned: pin.map(|p| p.label.clone()),
                 declared: entry.and_then(|e| e.declared.clone()),
-                fingerprint: pin.map(|p| DeviceId::from_bytes(p.host_device_pk).fingerprint()),
+                words: seen.map(|(words, _)| words),
+                // Beside a name only: a paired computer's (W-B8).
+                identicon: seen
+                    .filter(|_| pin.is_some())
+                    .map(|(_, identicon)| identicon),
                 paired: pin.map(|p| Day::from_unix(p.paired_at)),
                 last_seen: entry.and_then(|e| e.last_seen),
             }
@@ -102,11 +117,15 @@ pub fn read(paths: &Paths, today: Day) -> Book {
         devices: trusted
             .devices
             .iter()
-            .map(|d| Device {
-                label: d.label.clone(),
-                fingerprint: d.device.fingerprint(),
-                paired: Day::from_unix(d.paired_at),
-                last_seen: Day::from_unix(d.last_seen),
+            .map(|d| {
+                let h = derived.and_then(|k| k.cached(d.device.public_key_bytes(), Role::Device));
+                Device {
+                    label: d.label.clone(),
+                    words: h.map(|h| h.words()),
+                    identicon: h.map(|h| h.identicon()),
+                    paired: Day::from_unix(d.paired_at),
+                    last_seen: Day::from_unix(d.last_seen),
+                }
             })
             .collect(),
         history: book.history,

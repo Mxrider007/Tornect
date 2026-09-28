@@ -17,7 +17,7 @@ use tornect_core::trusted::{KnownHosts, TrustedDevices, known_hosts_file};
 use tornect_core::words::{self, Candidate, Identicon, Known, Pacer, Role, Saved, Words};
 use tornect_core::{DeviceId, Paths, TornectId};
 
-use super::model::Recognition;
+use super::model::{MyWords, Recognition};
 
 /// This computer: the name it declares and its two keys.
 #[derive(Debug, Clone)]
@@ -57,6 +57,28 @@ impl Recognizer {
             paths: Some(paths),
             me: Some(me),
         }
+    }
+
+    /// The keys derived so far (the saved ones).
+    #[must_use]
+    pub fn known(&self) -> &Known {
+        &self.known
+    }
+
+    /// This computer's two word sets: its device key's and its address's.
+    #[must_use]
+    pub fn mine(&self) -> Option<MyWords> {
+        let me = self.me.as_ref()?;
+        Some(MyWords {
+            device: self
+                .known
+                .get(me.device.public_key_bytes(), Role::Device)
+                .words(),
+            address: self
+                .known
+                .get(me.onion.public_key_bytes(), Role::Onion)
+                .words(),
+        })
     }
 
     /// What a pairing sheet shows about `device`, which declared the name
@@ -99,6 +121,30 @@ impl Recognizer {
             identicon: Some(h.identicon()),
             looks_like: None,
         }
+    }
+
+    /// The connect field's check of `id`, an ID that is not in the address
+    /// book: the name of the saved computer it looks like, if it looks like
+    /// one — the same first or last four characters as a saved ID, or words
+    /// that meet the alarm's rules against a saved entry. Paced.
+    #[must_use]
+    pub fn connect_check(&self, id: &TornectId) -> Option<String> {
+        let base = id.base32();
+        if let Some(named) = self
+            .named()
+            .into_iter()
+            .find(|n| n.id != *id && words::ends_look_alike(&base, &n.id.base32()))
+        {
+            return Some(named.name);
+        }
+        let h = self.pacer.derive(id.public_key_bytes(), Role::Onion);
+        let candidate = Candidate {
+            words: h.words(),
+            identicon: h.identicon(),
+            declared: None,
+        };
+        let saved = self.saved();
+        words::look_alike(&candidate, &saved).map(|(at, _)| saved[at].name.clone())
     }
 
     /// Every saved entry the alarm compares with: this computer's own two
@@ -147,6 +193,32 @@ impl Recognizer {
             }
         }
         saved
+    }
+
+    /// Derive every saved key not derived yet (this computer's, the address
+    /// book's, the paired devices'), and keep the address book's words in its
+    /// entries' caches. Whether the cache file changed.
+    pub fn warm(&self) -> bool {
+        let _ = self.mine();
+        let _ = self.saved();
+        let Some(paths) = &self.paths else {
+            return false;
+        };
+        let store = Store::new(paths);
+        let Ok(book) = store.load() else {
+            return false;
+        };
+        let derived: Vec<_> = book
+            .hosts
+            .iter()
+            .filter(|(id, entry)| {
+                entry
+                    .cached_words(id.public_key_bytes(), Role::Onion)
+                    .is_none()
+            })
+            .map(|(id, _)| (*id, self.known.get(id.public_key_bytes(), Role::Onion)))
+            .collect();
+        !derived.is_empty() && store.cache_words(&derived).unwrap_or(false)
     }
 
     /// The computers of the address book and the pin store, with the name

@@ -52,6 +52,9 @@ fn shown(label: &str) -> String {
 pub enum Action {
     /// Connect to this Tornect ID.
     Connect(TornectId),
+    /// Connect to this Tornect ID although it looks like a saved one (the
+    /// second, deliberate click after the connect field's warning).
+    ConnectAnyway(TornectId),
     /// End the session this screen is shared with (the kill), from the banner
     /// or the indicator window.
     StopSharing,

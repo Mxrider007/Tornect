@@ -104,7 +104,7 @@ pub(super) fn page(ui: &mut Ui, model: &Model, form: &mut Form, actions: &mut Ve
     match form.book.tab {
         Tab::Computers => computers(ui, t, model, form, actions),
         Tab::Recent => recent(ui, t, book, actions),
-        Tab::Devices => devices(ui, t, book),
+        Tab::Devices => devices(ui, t, book, !model.sharing.is_empty()),
     }
     ui.add_space(8.0);
 }
@@ -193,7 +193,15 @@ fn computers(ui: &mut Ui, t: &Tokens, model: &Model, form: &mut Form, actions: &
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = GAP;
             ui.allocate_ui_with_layout(vec2(list_width, 0.0), Layout::top_down(Align::Min), |ui| {
-                list(ui, t, book, &shown, selected, form);
+                list(
+                    ui,
+                    t,
+                    book,
+                    &shown,
+                    selected,
+                    form,
+                    !model.sharing.is_empty(),
+                );
             });
             ui.allocate_ui_with_layout(
                 vec2(width - GAP - list_width, 0.0),
@@ -206,7 +214,15 @@ fn computers(ui: &mut Ui, t: &Tokens, model: &Model, form: &mut Form, actions: &
             );
         });
     } else {
-        list(ui, t, book, &shown, selected, form);
+        list(
+            ui,
+            t,
+            book,
+            &shown,
+            selected,
+            form,
+            !model.sharing.is_empty(),
+        );
         ui.add_space(GAP);
         if let Some(computer) = book.computer(&selected) {
             details(ui, t, model, computer, form, actions);
@@ -230,6 +246,7 @@ fn list(
     shown: &[&Computer],
     selected: TornectId,
     form: &mut Form,
+    shared: bool,
 ) {
     widgets::card_frame(t, 14, Margin::same(6)).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -248,7 +265,7 @@ fn list(
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        identicon(ui, computer, 32.0);
+                        identicon(ui, computer, 32.0, shared);
                         ui.vertical(|ui| {
                             ui.add(
                                 egui::Label::new(
@@ -294,15 +311,19 @@ fn list(
     });
 }
 
-/// The identicon of a computer: from its pinned key's fingerprint, or from
-/// its ID while it is not paired. It helps recognise one, never replaces
-/// comparing its ID.
-fn identicon(ui: &mut Ui, computer: &Computer, size: f32) {
-    let bytes = match &computer.fingerprint {
-        Some(fp) => widgets::fingerprint_bytes(fp),
-        None => computer.id.public_key_bytes().to_vec(),
-    };
-    widgets::identicon(ui, &bytes, size);
+/// The identicon of a paired computer, drawn from its ID's device words
+/// (§B.6.1): only beside its name, never beside an unpinned key (W-B8), and
+/// never while this computer is shared; elsewhere a plain tile keeps the
+/// place. It helps recognise one, never replaces comparing its ID.
+fn identicon(ui: &mut Ui, computer: &Computer, size: f32, shared: bool) {
+    match computer.identicon.filter(|_| !shared) {
+        Some(identicon) => {
+            widgets::identicon(ui, &identicon.seed(), size);
+        }
+        None => {
+            widgets::identicon(ui, &[], size);
+        }
+    }
 }
 
 /// The selected computer: who it is, Connect, Check, Copy ID, Rename and
@@ -320,7 +341,7 @@ fn details(
     widgets::card(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            identicon(ui, computer, 44.0);
+            identicon(ui, computer, 44.0, !model.sharing.is_empty());
             ui.vertical(|ui| {
                 ui.add(
                     egui::Label::new(
@@ -389,12 +410,28 @@ fn details(
                 .font(theme::font(ui.ctx(), Face::Mono, 13.0))
                 .color(t.text_primary),
         );
-        if let Some(fp) = &computer.fingerprint {
-            widgets::caps_label(ui, "Host key");
-            ui.label(
-                RichText::new(fp)
-                    .font(theme::font(ui.ctx(), Face::Mono, 13.0))
-                    .color(t.text_secondary),
+        // Its address's device words: the one short form (§B.6.1 item 6),
+        // for recognition only; none while this computer is shared (R-W2).
+        if model.sharing.is_empty() {
+            if let Some(words) = computer.words {
+                widgets::caps_label(ui, "Device words of this address");
+                ui.label(
+                    RichText::new(words.shown())
+                        .font(theme::font(ui.ctx(), Face::Regular, 13.0))
+                        .color(t.text_secondary),
+                );
+                muted(
+                    ui,
+                    t,
+                    "They help you recognise it; its own Home shows them under its ID. They do \
+                     not prove who it is, and they cannot be typed to connect.",
+                );
+            }
+        } else {
+            muted(
+                ui,
+                t,
+                "Device words are hidden while this computer is shared.",
             );
         }
         let last = computer.last_seen.map_or_else(
@@ -741,7 +778,7 @@ fn recent(ui: &mut Ui, t: &Tokens, book: &Book, actions: &mut Vec<Action>) {
 }
 
 /// The Devices tab: who can ask to connect here (read-only in this version).
-fn devices(ui: &mut Ui, t: &Tokens, book: &Book) {
+fn devices(ui: &mut Ui, t: &Tokens, book: &Book, shared: bool) {
     if book.devices.is_empty() {
         widgets::card(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -763,22 +800,24 @@ fn devices(ui: &mut Ui, t: &Tokens, book: &Book) {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        widgets::identicon(
-                            ui,
-                            &widgets::fingerprint_bytes(&device.fingerprint),
-                            32.0,
-                        );
+                        // A pinned device: its identicon beside its label;
+                        // its words labelled as such (§B.6.1), neither while
+                        // this computer is shared.
+                        let seed = device.identicon.filter(|_| !shared).map(|i| i.seed());
+                        widgets::identicon(ui, seed.as_ref().map_or(&[][..], |s| &s[..]), 32.0);
                         ui.vertical(|ui| {
                             ui.label(
                                 RichText::new(&device.label)
                                     .font(theme::font(ui.ctx(), Face::Semibold, 14.0))
                                     .color(t.text_primary),
                             );
-                            ui.label(
-                                RichText::new(&device.fingerprint)
-                                    .font(theme::font(ui.ctx(), Face::Mono, 12.0))
-                                    .color(t.text_muted),
-                            );
+                            if let Some(words) = device.words.filter(|_| !shared) {
+                                ui.label(
+                                    RichText::new(format!("device words: {}", words.shown()))
+                                        .font(theme::font(ui.ctx(), Face::Regular, 12.0))
+                                        .color(t.text_muted),
+                                );
+                            }
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(
