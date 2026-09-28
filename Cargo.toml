@@ -145,6 +145,10 @@ egui-wgpu = { version = "=0.36.2", default-features = false, features = ["winit"
 # Backends are added per target in the member crate (Linux vulkan+gles, Windows dx12).
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "wgsl", "parking_lot"] }
 pollster = "=1.0.1"
+# The QR code of this computer's Tornect ID on Home (the redesign's §4).
+# `default-features = false` drops the `image`, `svg` and `pic` renderers (the
+# window draws the modules itself), which leaves the crate no dependency at all.
+qrcode = { version = "=0.14.1", default-features = false }
 # Cisco OpenH264 built from source with `cc` (C++; nasm optional, no cmake) — M0-5.
 openh264 = { version = "=0.9.8", default-features = false, features = ["source"] }
 # Linux host: RemoteDesktop/ScreenCast portals (pure Rust over zbus/tokio),
