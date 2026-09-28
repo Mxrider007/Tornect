@@ -88,6 +88,32 @@ pub fn fill(shared: &Shared, token_file: &Path) {
     });
 }
 
+/// A window at rest, for looking at a page: Tor connected, this ID
+/// reachable, the desktop's grant not given yet, a few things that happened;
+/// no question open, no session, no stream window.
+pub fn rest(shared: &Shared, token_file: &Path) {
+    shared.update(|m| {
+        m.tor = TorState::Ready {
+            via: "obfs4 bridges",
+        };
+        m.hosting = Hosting::Published {
+            reachable: true,
+            state: "Running".to_owned(),
+            problem: None,
+        };
+        m.setup = Some(Setup {
+            token_file: token_file.to_owned(),
+            granted: false,
+            busy: false,
+            note: None,
+        });
+        m.note("preview: nothing here is real");
+        m.note("Tor: connected via obfs4 bridges");
+        m.note("this ID is published: paired devices can ask for a session");
+        m.closed = true;
+    });
+}
+
 /// Feed the stream window a moving test card at 10 pictures a second, on a
 /// thread of its own, for the life of the process.
 pub fn card(slot: Arc<FrameSlot>, shared: Arc<Shared>) {
