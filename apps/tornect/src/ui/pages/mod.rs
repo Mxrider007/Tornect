@@ -121,6 +121,8 @@ mod tests {
         form: Form,
         size: egui::Vec2,
         start: Instant,
+        /// How far the window's clock has moved past its five seconds.
+        later: Duration,
         nodes: Vec<Node>,
     }
 
@@ -137,6 +139,7 @@ mod tests {
                 form,
                 size: egui::vec2(size.0, size.1),
                 start: Instant::now(),
+                later: Duration::ZERO,
                 nodes: Vec::new(),
             };
             // The fonts are active from the second pass; a third lays out
@@ -148,7 +151,7 @@ mod tests {
         }
 
         fn pass(&mut self, events: Vec<egui::Event>) -> Vec<Action> {
-            let now = self.start + Duration::from_secs(5);
+            let now = self.start + Duration::from_secs(5) + self.later;
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
                 time: Some(5.0),
@@ -764,5 +767,202 @@ mod tests {
         assert_eq!(day_text(ago(0), None), "27 Sep 2026");
         assert_eq!(day_in_sentence(ago(1), Some(today)), "yesterday");
         assert_eq!(day_in_sentence(ago(30), Some(today)), "on 28 Aug 2026");
+    }
+
+    /// A window at rest with one host sheet of `sheet`'s kind (the preview's
+    /// invented words).
+    fn with_sheet(sheet: super::super::preview::Sheet) -> Model {
+        let mut model = at_rest();
+        super::super::preview::sheet(&mut model, sheet);
+        model
+    }
+
+    /// §B.6.1 on the sheets, in both themes, at both sizes: an unpinned key
+    /// is named by its device words, "not yet trusted · compare the code",
+    /// in their labelled slot; a pinned key by its saved name, without that
+    /// line; no hex fingerprint on any sheet (W-B7); the answers as before.
+    #[test]
+    fn the_sheets_show_words_or_the_saved_name_and_no_fingerprint() {
+        use super::super::preview::Sheet;
+        for theme in THEMES {
+            for size in [WIDE, NARROW] {
+                let case = format!("{theme:?} {size:?}");
+                let new = Window::new(with_sheet(Sheet::New), Page::Settings, theme, size);
+                assert!(
+                    has_text(
+                        &new,
+                        "device words: absurd · citizen · dinner · harvest · not yet trusted · \
+                         compare the code"
+                    ),
+                    "{case}"
+                );
+                assert!(has_text(&new, "calling itself \"Laptop\""), "{case}");
+                assert!(has_text(&new, "482 917"), "{case}: the code");
+                assert!(new.controls().iter().any(|c| c == "The codes match: pair"));
+                assert!(new.controls().iter().any(|c| c == "Refuse"));
+                let pinned = Window::new(with_sheet(Sheet::Pinned), Page::Settings, theme, size);
+                assert!(has_text(&pinned, "ALREADY PAIRED as \"Laptop\""), "{case}");
+                assert!(!has_text(&pinned, "not yet trusted"), "{case}");
+                assert!(
+                    !has_text(&pinned, "orbit"),
+                    "{case}: no words beside a name"
+                );
+                let session = Window::new(with_sheet(Sheet::Session), Page::Settings, theme, size);
+                assert!(
+                    has_text(&session, "\"Laptop\" wants to see this screen."),
+                    "{case}"
+                );
+                assert!(session.controls().iter().any(|c| c == "Deny"));
+                for window in [&new, &pinned, &session] {
+                    assert!(!has_text(window, "fingerprint"), "{case}");
+                }
+            }
+        }
+    }
+
+    /// W-B3 in the window: when the alarm fired, the sheet says so in red,
+    /// hides this computer's own code and shows no accept button; keys alone
+    /// never pair; the six digits typed into its field, then Enter, ask the
+    /// host to check them (the check itself: `recognize::tests`).
+    #[test]
+    fn a_fired_alarm_asks_for_the_typed_code_not_a_click() {
+        use super::super::preview::Sheet;
+        use tornect_signal::pairing::PairDecision;
+        for theme in THEMES {
+            let mut window = Window::new(with_sheet(Sheet::Alarm), Page::Settings, theme, WIDE);
+            assert!(has_text(
+                &window,
+                "Looks like your saved device \"Office PC\", but it is a different device"
+            ));
+            assert!(!has_text(&window, "482 917"), "its own code is hidden");
+            assert!(
+                !window
+                    .controls()
+                    .iter()
+                    .any(|c| c == "The codes match: pair")
+            );
+            for key in [
+                egui::Key::Tab,
+                egui::Key::Tab,
+                egui::Key::Enter,
+                egui::Key::Space,
+            ] {
+                let asked = window.key(key);
+                assert!(
+                    !asked.iter().any(|a| matches!(
+                        a,
+                        Action::Pair {
+                            decision: PairDecision::Accept { .. },
+                            ..
+                        } | Action::PairCode { .. }
+                    )),
+                    "{asked:?}"
+                );
+            }
+            // A fresh window for the typing (the keys above moved the focus).
+            let mut window = Window::new(with_sheet(Sheet::Alarm), Page::Settings, theme, WIDE);
+            window.later += Duration::from_secs(2);
+            window.pass(Vec::new());
+            let field = window
+                .nodes
+                .iter()
+                .filter(|n| n.role() == Role::TextInput)
+                .filter_map(Node::bounds)
+                // Below the name field.
+                .max_by(|a, b| a.y0.total_cmp(&b.y0))
+                .expect("the code field");
+            let at = egui::pos2(
+                ((field.x0 + field.x1) / 2.0) as f32,
+                ((field.y0 + field.y1) / 2.0) as f32,
+            );
+            // What typing puts in the field (as the other page tests do), a
+            // click to focus it, then Enter.
+            window.form.codes.insert(7, "482 917".to_owned());
+            window.pass(Vec::new());
+            assert!(window.click(at).is_empty(), "a click only focuses it");
+            let asked = window.key(egui::Key::Enter);
+            assert_eq!(
+                asked,
+                vec![Action::PairCode {
+                    id: 7,
+                    code: "482 917".to_owned(),
+                    label: Some("Office PC".to_owned()),
+                }],
+                "{theme:?}"
+            );
+        }
+    }
+
+    /// Home's ID card leads with the words a host's sheet shows when this
+    /// computer connects, the address's own under it, the help line; none
+    /// of them while this computer is shared (R-W2), in the address book
+    /// neither.
+    #[test]
+    fn the_id_card_shows_both_word_sets_except_while_shared() {
+        for theme in THEMES {
+            let mut model = with_book(false);
+            model.mine = super::super::preview::model(false, false).mine;
+            let window = Window::new(model.clone(), Page::Home, theme, WIDE);
+            assert!(has_text(
+                &window,
+                "When you connect to another computer, it shows: orient · walk · nice · rally"
+            ));
+            assert!(has_text(
+                &window,
+                "this address: treat · fame · transfer · pride"
+            ));
+            assert!(has_text(
+                &window,
+                "Device words help you recognise a device."
+            ));
+            assert!(has_text(&window, "not a secret or a password"));
+            let mut shared = model;
+            shared.sharing = vec![super::super::model::Sharing {
+                session_id: "00".to_owned(),
+                label: "Laptop".to_owned(),
+                control: false,
+                unattended: false,
+                since: Instant::now(),
+                capture: None,
+            }];
+            for page in [Page::Home, Page::AddressBook] {
+                let window = Window::new(shared.clone(), page, theme, WIDE);
+                for words in ["orient · walk", "treat · fame", "arctic · crisp"] {
+                    assert!(!has_text(&window, words), "{page:?}: {words}");
+                }
+                assert!(has_text(
+                    &window,
+                    "Device words are hidden while this computer is shared."
+                ));
+            }
+            let book = Window::new(with_book(false), Page::AddressBook, theme, WIDE);
+            assert!(
+                has_text(&book, "arctic · crisp · lamp · orbit"),
+                "the selected computer's words"
+            );
+            assert!(!has_text(&book, "Host key"));
+        }
+    }
+
+    /// The connect field's warning (§B.6.1 item 4): an ID that looks like a
+    /// saved one is named in red, and Connect becomes "Connect anyway", a
+    /// second, deliberate click; Enter in the field does not take it.
+    #[test]
+    fn a_look_alike_id_takes_a_second_click() {
+        let id: TornectId = TornectId::from_bytes([0x66; 32]);
+        let mut model = with_book(false);
+        model.connect_warning = Some(super::super::model::ConnectWarning {
+            id,
+            name: "Office PC".to_owned(),
+        });
+        let mut window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        window.form.connect_to = id.onion_address();
+        window.pass(Vec::new());
+        assert!(has_text(
+            &window,
+            "Looks like your saved \"Office PC\", but it is a different address."
+        ));
+        let anyway = window.center("Connect anyway");
+        assert_eq!(window.click(anyway), vec![Action::ConnectAnyway(id)]);
     }
 }
