@@ -9,22 +9,15 @@ use egui::{Color32, RichText};
 use tornect_core::TornectId;
 use tornect_signal::pairing::{PairDecision, SessionDecision};
 
-use super::model::{
-    ClientStage, Confirm, Hosting, Model, Popup, PopupKind, Setup, Sharing, TorState, Viewing,
-};
-
-/// The design system's few colours (`docs/UI_PLAN.md` §7).
-mod palette {
-    use egui::Color32;
-    pub const ACCENT: Color32 = Color32::from_rgb(0x7d, 0x5c, 0xff);
-    pub const OK: Color32 = Color32::from_rgb(0x3d, 0xdc, 0x97);
-    pub const WARN: Color32 = Color32::from_rgb(0xff, 0xb4, 0x54);
-    pub const SHARING: Color32 = Color32::from_rgb(0xff, 0x5c, 0x6c);
-    pub const MUTED: Color32 = Color32::from_rgb(0x9a, 0xa7, 0xb4);
-}
+#[cfg(test)]
+use super::model::{ClientStage, Hosting, Setup, TorState};
+use super::model::{Confirm, Model, Popup, PopupKind, Sharing, Viewing};
+use super::nav::{self, Page};
+use super::pages;
+use super::theme::{self, Face};
 
 /// The SAS display size (§7: "SAS display 44 mono").
-const SAS_SIZE: f32 = 44.0;
+pub const SAS_SIZE: f32 = 44.0;
 
 /// How long a card's accept buttons stay disabled after the card appears and
 /// after it moves (a card above it came or went, the window scrolled or was
@@ -113,6 +106,10 @@ pub struct Form {
     pub labels: HashMap<u64, String>,
     /// Each open card's answer row, by popup or question id.
     cards: HashMap<u64, Card>,
+    /// The page the window shows.
+    pub page: Page,
+    /// When Copy ID was last pressed (the button says "Copied" for a while).
+    pub copied: Option<Instant>,
 }
 
 impl Form {
@@ -182,7 +179,10 @@ fn clock(since: Instant, now: Instant) -> String {
     format!("{:02}:{:02}", secs / 60, secs % 60)
 }
 
-/// The main window: the sharing banner, the home screen, and the popups.
+/// The main window: the sharing banner, the open questions, the page and the
+/// sidebar. The keyboard reaches them in that order: the banner's Stop, the
+/// questions (a refusal first in each), the page, and last the navigation,
+/// whose room is reserved first and filled after the page.
 pub fn main_window(
     ui: &mut egui::Ui,
     model: &Model,
@@ -190,11 +190,14 @@ pub fn main_window(
     now: Instant,
     actions: &mut Vec<Action>,
 ) {
+    theme::ensure(ui.ctx());
+    let t = theme::tokens(ui.ctx());
+    let window = ui.max_rect().width();
     if !model.sharing.is_empty() {
         egui::Panel::top("sharing")
             .frame(
                 egui::Frame::new()
-                    .fill(palette::SHARING)
+                    .fill(t.sharing_fill)
                     .inner_margin(egui::Margin::symmetric(12, 8)),
             )
             .show(ui, |ui| {
@@ -211,19 +214,60 @@ pub fn main_window(
         model.popups.iter().any(|p| p.id == *id)
             || model.confirm.as_ref().is_some_and(|c| c.id == *id)
     });
-    egui::CentralPanel::default().show(ui, |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            // Open questions come first, one card each, so none hides
-            // another's buttons.
-            for popup in &model.popups {
-                question(ui, |ui| host_popup(ui, popup, form, now, actions));
-            }
-            if let Some(confirm) = &model.confirm {
-                question(ui, |ui| confirm_popup(ui, confirm, form, now, actions));
-            }
-            home(ui, model, form, actions);
+    // The sidebar's room, with nothing in it yet.
+    let side = egui::Panel::left("sidebar")
+        .exact_size(nav::width(window))
+        .resizable(false)
+        .show_separator_line(false)
+        .frame(egui::Frame::new().fill(t.bg_sidebar))
+        .show(ui, |ui| {
+            let rect = ui.max_rect();
+            ui.painter().vline(
+                rect.right() - 0.5,
+                rect.y_range(),
+                egui::Stroke::new(1.0, t.border_subtle),
+            );
+            rect
+        })
+        .inner;
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::new()
+                .fill(t.bg_app)
+                .inner_margin(egui::Margin {
+                    left: 32,
+                    right: 32,
+                    top: 26,
+                    bottom: 0,
+                }),
+        )
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    // Open questions come first, one card each, so none hides
+                    // another's buttons.
+                    for popup in &model.popups {
+                        question(ui, |ui| host_popup(ui, popup, form, now, actions));
+                    }
+                    if let Some(confirm) = &model.confirm {
+                        question(ui, |ui| confirm_popup(ui, confirm, form, now, actions));
+                    }
+                    let page = form.page;
+                    pages::draw(ui, page, model, form, now, actions);
+                });
         });
-    });
+    let mut side_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("sidebar-room")
+            .max_rect(side),
+    );
+    nav::sidebar(
+        &mut side_ui,
+        model,
+        &mut form.page,
+        window < nav::RAIL_BELOW,
+    );
     // Countdowns and the banner's clock move once a second.
     if !model.popups.is_empty() || model.confirm.is_some() || !model.sharing.is_empty() {
         ui.ctx().request_repaint_after(Duration::from_millis(500));
@@ -232,8 +276,11 @@ pub fn main_window(
 
 /// A question card: framed in the accent colour, above everything else.
 fn question(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::group(ui.style())
-        .stroke(egui::Stroke::new(2.0, palette::ACCENT))
+    let t = theme::tokens(ui.ctx());
+    egui::Frame::new()
+        .fill(t.surface_card)
+        .corner_radius(14)
+        .stroke(egui::Stroke::new(2.0, t.accent_fill))
         .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -248,15 +295,16 @@ fn question(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 /// left, so that no label can push Stop out of the window or pass for the
 /// mode (SLICE-E E1-2).
 fn sharing_banner(ui: &mut egui::Ui, sharing: &Sharing, now: Instant, actions: &mut Vec<Action>) {
+    let t = theme::tokens(ui.ctx());
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button(RichText::new("Stop sharing").strong()).clicked() {
+            if stop_button(ui, "Stop sharing").clicked() {
                 actions.push(Action::StopSharing);
             }
             ui.label(
                 RichText::new(clock(sharing.since, now))
                     .monospace()
-                    .color(Color32::WHITE),
+                    .color(t.on_sharing),
             );
             let mode = if sharing.control {
                 "sees and controls this screen"
@@ -272,7 +320,7 @@ fn sharing_banner(ui: &mut egui::Ui, sharing: &Sharing, now: Instant, actions: &
                             shown(&sharing.label)
                         ))
                         .strong()
-                        .color(Color32::WHITE),
+                        .color(t.on_sharing),
                     )
                     .truncate(),
                 )
@@ -284,7 +332,7 @@ fn sharing_banner(ui: &mut egui::Ui, sharing: &Sharing, now: Instant, actions: &
         ui.label(
             RichText::new("starting: the viewer's picture has not gone out yet")
                 .small()
-                .color(Color32::WHITE),
+                .color(t.on_sharing),
         );
     }
     if let Some(capture) = &sharing.capture {
@@ -297,9 +345,17 @@ fn sharing_banner(ui: &mut egui::Ui, sharing: &Sharing, now: Instant, actions: &
                 input_effect(sharing.control, capture.input)
             ))
             .small()
-            .color(Color32::WHITE),
+            .color(t.on_sharing),
         );
     }
+}
+
+/// Stop on the sharing red: a white button with red text, text only.
+fn stop_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let t = theme::tokens(ui.ctx());
+    ui.add(
+        egui::Button::new(RichText::new(text).strong().color(t.sharing_fill)).fill(Color32::WHITE),
+    )
 }
 
 /// The indicator's first word: an unattended session says so (§B.8.7.3).
@@ -325,12 +381,14 @@ fn input_effect(control: bool, injected: bool) -> &'static str {
 /// is shared with, who, which mode and the clock; and Stop, which ends sharing
 /// exactly as the banner's Stop does. A press anywhere else moves the window.
 pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: &mut Vec<Action>) {
+    theme::ensure(ui.ctx());
+    let t = theme::tokens(ui.ctx());
     // Text is not selectable here: a press on it moves the window instead.
     ui.style_mut().interaction.selectable_labels = false;
     egui::CentralPanel::no_frame()
         .frame(
             egui::Frame::new()
-                .fill(palette::SHARING)
+                .fill(t.sharing_fill)
                 .inner_margin(egui::Margin::symmetric(10, 8)),
         )
         .show(ui, |ui| {
@@ -346,7 +404,7 @@ pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: 
                 actions.push(Action::MoveIndicator);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(RichText::new("Stop").strong()).clicked() {
+                if stop_button(ui, "Stop").clicked() {
                     actions.push(Action::StopSharing);
                 }
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -364,7 +422,7 @@ pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: 
                                     shown(&s.label)
                                 ))
                                 .strong()
-                                .color(Color32::WHITE),
+                                .color(t.on_sharing),
                             )
                             .truncate(),
                         );
@@ -375,7 +433,7 @@ pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: 
                                 input_effect(s.control, c.input)
                             });
                         ui.add(
-                            egui::Label::new(RichText::new(detail).small().color(Color32::WHITE))
+                            egui::Label::new(RichText::new(detail).small().color(t.on_sharing))
                                 .truncate(),
                         );
                     }
@@ -386,251 +444,6 @@ pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: 
     ui.ctx().request_repaint_after(Duration::from_millis(500));
 }
 
-fn home(ui: &mut egui::Ui, model: &Model, form: &mut Form, actions: &mut Vec<Action>) {
-    ui.add_space(4.0);
-    ui.heading("Tornect");
-    ui.add_space(8.0);
-
-    ui.label(RichText::new("Your Tornect ID").color(palette::MUTED));
-    match &model.id {
-        Some(id) => {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(id).monospace().size(15.0));
-                if ui.small_button("Copy").clicked() {
-                    actions.push(Action::CopyId);
-                }
-            });
-        }
-        None => {
-            ui.label("(not created yet)");
-        }
-    }
-    ui.add_space(6.0);
-    tor_line(ui, &model.tor);
-    hosting_line(ui, &model.hosting);
-
-    if let Some(setup) = &model.setup {
-        ui.add_space(10.0);
-        setup_card(ui, setup, !model.sharing.is_empty(), actions);
-    }
-
-    ui.add_space(12.0);
-    ui.separator();
-    ui.label(RichText::new("Connect to another computer").strong());
-    let idle = matches!(model.client, ClientStage::Idle | ClientStage::Ended(_));
-    let parsed = form.connect_to.trim().parse::<TornectId>();
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut form.connect_to)
-                .hint_text("its Tornect ID (56 characters, .onion optional)")
-                .desired_width(ui.available_width() - 90.0)
-                .font(egui::TextStyle::Monospace),
-        );
-        let ready = model.tor.is_ready() && idle && parsed.is_ok();
-        if ui
-            .add_enabled(ready, egui::Button::new("Connect"))
-            .clicked()
-            && let Ok(id) = &parsed
-        {
-            actions.push(Action::Connect(*id));
-        }
-    });
-    if !form.connect_to.trim().is_empty() && parsed.is_err() {
-        ui.label(RichText::new("That is not a Tornect ID.").color(palette::WARN));
-    } else if !model.tor.is_ready() {
-        ui.label(RichText::new("Connecting waits for Tor.").color(palette::MUTED));
-    }
-    client_stage(ui, &model.client, actions);
-
-    if !model.events.is_empty() {
-        ui.add_space(12.0);
-        ui.separator();
-        ui.label(RichText::new("Recent").color(palette::MUTED));
-        for line in model.events.iter().rev() {
-            ui.label(RichText::new(line).small());
-        }
-    }
-}
-
-fn tor_line(ui: &mut egui::Ui, tor: &TorState) {
-    let (text, color) = match tor {
-        TorState::Starting => ("Tor: starting…".to_owned(), palette::MUTED),
-        TorState::Trying { via, attempt, of } => (
-            format!("Tor: connecting via {via} ({attempt}/{of})…"),
-            palette::MUTED,
-        ),
-        TorState::Progress { via, pct, blocked } => match blocked {
-            Some(why) => (
-                format!("Tor: {pct}% via {via}; stuck: {why}"),
-                palette::WARN,
-            ),
-            None => (format!("Tor: connecting via {via}, {pct}%"), palette::MUTED),
-        },
-        TorState::Ready { via } => (format!("Tor: connected via {via}"), palette::OK),
-        TorState::Failed(why) => (format!("Tor: not reachable ({why})"), palette::SHARING),
-    };
-    ui.label(RichText::new(text).color(color));
-}
-
-fn hosting_line(ui: &mut egui::Ui, hosting: &Hosting) {
-    let (text, color) = match hosting {
-        Hosting::Waiting => (
-            "Incoming requests: waiting for Tor".to_owned(),
-            palette::MUTED,
-        ),
-        Hosting::Publishing => (
-            "Incoming requests: publishing this ID (the first time can take two minutes)…"
-                .to_owned(),
-            palette::MUTED,
-        ),
-        // True in every state (SLICE-E E1-5): a device granted unattended
-        // access starts a session without asking (PLAN §B.8).
-        Hosting::Published {
-            reachable: true, ..
-        } => (
-            "Incoming requests: reachable; paired devices ask before they see this screen, \
-             unless you granted one unattended access"
-                .to_owned(),
-            palette::OK,
-        ),
-        Hosting::Published {
-            reachable: false,
-            state,
-            problem,
-        } => (
-            match problem {
-                Some(problem) => {
-                    format!("Incoming requests: not reachable yet ({state}: {problem})")
-                }
-                None => format!("Incoming requests: not reachable yet ({state})"),
-            },
-            palette::WARN,
-        ),
-        Hosting::Off(why) => (format!("Incoming requests: off ({why})"), palette::MUTED),
-    };
-    ui.label(RichText::new(text).color(color));
-}
-
-/// The first-run desktop grant (UI_PLAN §6.4's Wayland step, as the operator
-/// decided on 2026-09-23): the dialog on the owner's own desktop, now, rather
-/// than inside a viewer's wait.
-fn setup_card(ui: &mut egui::Ui, setup: &Setup, sharing: bool, actions: &mut Vec<Action>) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.label(RichText::new("Screen sharing on this desktop").strong());
-        if setup.granted {
-            ui.label(
-                RichText::new(
-                    "Granted and remembered: a session starts without the desktop's dialog.",
-                )
-                .color(palette::OK),
-            );
-        } else {
-            ui.label(
-                "Not granted yet. Grant it now, while you are here: the desktop asks once, and \
-                 later sessions never wait on its dialog. Turn on \"Allow Remote Interaction\" \
-                 in the dialog to let viewers you allow use the keyboard and mouse.",
-            );
-            ui.label(
-                RichText::new(
-                    "Without it, the desktop asks when a viewer's picture starts, and someone \
-                     here must answer within 30 s.",
-                )
-                .small()
-                .color(palette::MUTED),
-            );
-        }
-        ui.horizontal(|ui| {
-            let label = if setup.granted {
-                "Grant again"
-            } else {
-                "Grant screen sharing"
-            };
-            if ui
-                .add_enabled(!setup.busy && !sharing, egui::Button::new(label))
-                .clicked()
-            {
-                actions.push(Action::Grant);
-            }
-            if setup.granted
-                && ui
-                    .add_enabled(!setup.busy, egui::Button::new("Revoke"))
-                    .clicked()
-            {
-                actions.push(Action::Revoke);
-            }
-            if setup.busy {
-                ui.spinner();
-                ui.label("Answer the desktop's dialog…");
-            }
-        });
-        ui.label(
-            RichText::new(format!(
-                "To revoke by hand, delete {} (`tornect doctor` names it too); the desktop then \
-                 asks again at the next session.",
-                setup.token_file.display()
-            ))
-            .small()
-            .color(palette::MUTED),
-        );
-        if let Some(note) = &setup.note {
-            ui.label(RichText::new(note).small());
-        }
-    });
-}
-
-fn client_stage(ui: &mut egui::Ui, stage: &ClientStage, actions: &mut Vec<Action>) {
-    match stage {
-        ClientStage::Idle => {}
-        ClientStage::Reaching { id } => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!(
-                    "Reaching {id} over Tor (usually 5–30 s, up to a minute)…"
-                ));
-            });
-        }
-        ClientStage::Pairing { sas } => {
-            ui.label("Pairing: the host's screen now shows a code. It must be exactly");
-            ui.label(
-                RichText::new(sas)
-                    .monospace()
-                    .size(SAS_SIZE)
-                    .color(palette::ACCENT),
-            );
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Waiting for the host's user to compare it (up to 90 s)…");
-            });
-        }
-        ClientStage::Asking => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Waiting for the host's user to allow the session (up to 110 s)…");
-            });
-        }
-        ClientStage::Live(viewing) => {
-            ui.label(
-                RichText::new(format!(
-                    "Connected to \"{}\" ({}): the picture is in its own window.",
-                    viewing.host,
-                    if viewing.control {
-                        "control"
-                    } else {
-                        "view only"
-                    }
-                ))
-                .color(palette::OK),
-            );
-            if ui.button("End the session").clicked() {
-                actions.push(Action::EndViewing);
-            }
-        }
-        ClientStage::Ended(why) => {
-            ui.label(RichText::new(why).color(palette::MUTED));
-        }
-    }
-}
-
 fn host_popup(
     ui: &mut egui::Ui,
     popup: &Popup,
@@ -639,11 +452,12 @@ fn host_popup(
     actions: &mut Vec<Action>,
 ) {
     let left = countdown(popup.deadline, now);
+    let t = theme::tokens(ui.ctx());
     let title = match popup.kind {
         PopupKind::Pairing { .. } => "Pairing request",
         PopupKind::Session { .. } => "Session request",
     };
-    ui.label(RichText::new(title).heading().color(palette::ACCENT));
+    ui.label(RichText::new(title).heading().color(t.accent_text));
     ui.push_id(("popup", popup.id), |ui| match &popup.kind {
         PopupKind::Pairing {
             name,
@@ -669,9 +483,8 @@ fn host_popup(
             ui.label("Code:");
             ui.label(
                 RichText::new(sas)
-                    .monospace()
-                    .size(SAS_SIZE)
-                    .color(palette::ACCENT),
+                    .font(theme::font(ui.ctx(), Face::MonoSemibold, SAS_SIZE))
+                    .color(t.accent_text),
             );
             ui.label(
                 "The other device shows a code too. Pair only if the numbers match on both \
@@ -711,7 +524,7 @@ fn host_popup(
             ui.label(
                 RichText::new(format!("Refused automatically in {left} s"))
                     .small()
-                    .color(palette::MUTED),
+                    .color(t.text_muted),
             );
         }
         PopupKind::Session { label, fingerprint } => {
@@ -758,7 +571,7 @@ fn host_popup(
             ui.label(
                 RichText::new(format!("Denied automatically in {left} s"))
                     .small()
-                    .color(palette::MUTED),
+                    .color(t.text_muted),
             );
         }
     });
@@ -771,10 +584,11 @@ fn confirm_popup(
     now: Instant,
     actions: &mut Vec<Action>,
 ) {
+    let t = theme::tokens(ui.ctx());
     ui.label(
         RichText::new("Compare the code")
             .heading()
-            .color(palette::ACCENT),
+            .color(t.accent_text),
     );
     ui.push_id(("confirm", confirm.id), |ui| {
         ui.label(format!(
@@ -783,9 +597,8 @@ fn confirm_popup(
         ));
         ui.label(
             RichText::new(&confirm.sas)
-                .monospace()
-                .size(SAS_SIZE)
-                .color(palette::ACCENT),
+                .font(theme::font(ui.ctx(), Face::MonoSemibold, SAS_SIZE))
+                .color(t.accent_text),
         );
         let armed = arm(ui, &mut form.cards, confirm.id, now);
         ui.horizontal(|ui| {
@@ -819,7 +632,9 @@ fn confirm_popup(
                 countdown(confirm.deadline, now)
             )
         };
-        ui.label(RichText::new(note).small().color(palette::MUTED));
+        // Not selectable: a selectable label is also one accessibility node
+        // per row, and the whole note must read as one.
+        ui.add(egui::Label::new(RichText::new(note).small().color(t.text_muted)).selectable(false));
     });
 }
 
@@ -834,44 +649,52 @@ pub fn stream_window(
     now: Instant,
     actions: &mut Vec<Action>,
 ) -> Option<egui::Rect> {
-    egui::Panel::top("stream-bar").show(ui, |ui| {
-        ui.horizontal(|ui| match viewing {
-            Some(v) => {
-                ui.label(RichText::new(&v.host).strong());
-                let (mode, color) = if v.control {
-                    ("control", palette::OK)
-                } else {
-                    ("view only", palette::MUTED)
-                };
-                ui.label(RichText::new(mode).color(color));
-                ui.label(
-                    RichText::new(format!(
-                        "{} · {}×{} · {} pictures · {} inputs",
-                        clock(v.since, now),
-                        v.size.0,
-                        v.size.1,
-                        v.pictures,
-                        input_sent
-                    ))
-                    .small()
-                    .monospace(),
-                );
-                ui.label(
-                    RichText::new("Relayed via Tor: quality limited")
+    theme::ensure(ui.ctx());
+    let t = theme::tokens(ui.ctx());
+    egui::Panel::top("stream-bar")
+        .frame(
+            egui::Frame::new()
+                .fill(t.bg_sidebar)
+                .inner_margin(egui::Margin::symmetric(12, 8)),
+        )
+        .show(ui, |ui| {
+            ui.horizontal(|ui| match viewing {
+                Some(v) => {
+                    ui.label(RichText::new(&v.host).strong());
+                    let (mode, color) = if v.control {
+                        ("control", t.ok)
+                    } else {
+                        ("view only", t.text_muted)
+                    };
+                    ui.label(RichText::new(mode).color(color));
+                    ui.label(
+                        RichText::new(format!(
+                            "{} · {}×{} · {} pictures · {} inputs",
+                            clock(v.since, now),
+                            v.size.0,
+                            v.size.1,
+                            v.pictures,
+                            input_sent
+                        ))
                         .small()
-                        .color(palette::WARN),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Stop").clicked() {
-                        actions.push(Action::EndViewing);
-                    }
-                });
-            }
-            None => {
-                ui.label("The session has ended.");
-            }
+                        .monospace(),
+                    );
+                    ui.label(
+                        RichText::new("Relayed via Tor: quality limited")
+                            .small()
+                            .color(t.warn),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Stop").clicked() {
+                            actions.push(Action::EndViewing);
+                        }
+                    });
+                }
+                None => {
+                    ui.label("The session has ended.");
+                }
+            });
         });
-    });
     let mut drawn = None;
     egui::CentralPanel::no_frame()
         .frame(egui::Frame::new().fill(Color32::BLACK))
@@ -895,7 +718,7 @@ pub fn stream_window(
                 None => {
                     ui.centered_and_justified(|ui| {
                         ui.label(
-                            RichText::new("Waiting for the first picture…").color(palette::MUTED),
+                            RichText::new("Waiting for the first picture…").color(t.text_muted),
                         );
                     });
                 }

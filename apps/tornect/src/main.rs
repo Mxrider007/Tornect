@@ -76,6 +76,13 @@ enum Command {
         /// no hosting): for checking the window itself.
         #[arg(long, hide = true)]
         preview: bool,
+        /// With --preview: open on this page at rest (no question, no
+        /// session) instead of showing every screen at once.
+        #[arg(long, hide = true, value_enum, requires = "preview")]
+        page: Option<PageArg>,
+        /// With --preview: draw in this theme (dark unless given).
+        #[arg(long, hide = true, value_enum, requires = "preview")]
+        theme: Option<ThemeArg>,
     },
     /// Show this machine's Tornect ID (its onion v3 address), creating it on first run.
     Id {
@@ -191,6 +198,42 @@ enum Command {
     },
 }
 
+/// `tornect gui --preview --page`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum PageArg {
+    /// Home.
+    Home,
+    /// The address book.
+    AddressBook,
+    /// Past sessions.
+    Sessions,
+    /// Settings.
+    Settings,
+    /// The widget gallery.
+    Widgets,
+}
+
+impl From<PageArg> for ui::Page {
+    fn from(arg: PageArg) -> Self {
+        match arg {
+            PageArg::Home => Self::Home,
+            PageArg::AddressBook => Self::AddressBook,
+            PageArg::Sessions => Self::Sessions,
+            PageArg::Settings => Self::Settings,
+            PageArg::Widgets => Self::Widgets,
+        }
+    }
+}
+
+/// `tornect gui --preview --theme`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ThemeArg {
+    /// Dark (the default).
+    Dark,
+    /// Light.
+    Light,
+}
+
 /// `tornect host --capture`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum CaptureArg {
@@ -254,6 +297,8 @@ fn main() -> anyhow::Result<()> {
                 host: true,
                 bridges: cli.bridges,
                 preview: false,
+                page: None,
+                theme: egui::Theme::Dark,
             },
         );
     };
@@ -262,6 +307,8 @@ fn main() -> anyhow::Result<()> {
             capture,
             no_host,
             preview,
+            page,
+            theme,
         } => ui::run(
             &paths,
             ui::GuiOpts {
@@ -269,6 +316,11 @@ fn main() -> anyhow::Result<()> {
                 host: !no_host,
                 bridges: cli.bridges,
                 preview,
+                page: page.map(Into::into),
+                theme: match theme {
+                    Some(ThemeArg::Light) => egui::Theme::Light,
+                    Some(ThemeArg::Dark) | None => egui::Theme::Dark,
+                },
             },
         ),
         Command::Id { json } => cmd_id(&paths, json),

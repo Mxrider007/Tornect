@@ -28,6 +28,7 @@ use super::consent::Popups;
 use super::indicator::{self, Change, Indicator};
 use super::keys;
 use super::model::{ClientStage, Shared, Wake};
+use super::nav::Page;
 use super::stream::{Forwarder, Picture, PictureRect, VideoTexture, button};
 use super::view::{self, Action, Form};
 
@@ -130,9 +131,11 @@ impl Surface {
         el: &ActiveEventLoop,
         attrs: WindowAttributes,
         setup: WgpuSetup,
+        theme: egui::Theme,
     ) -> anyhow::Result<Self> {
         let window = Arc::new(el.create_window(attrs)?);
         let ctx = egui::Context::default();
+        ctx.set_theme(theme);
         let config = WgpuConfiguration {
             wgpu_setup: setup,
             ..WgpuConfiguration::default()
@@ -238,6 +241,8 @@ pub struct App {
     /// The main window's title: a connect-only instance says so, so that two
     /// instances on one desktop can be told apart.
     pub title: &'static str,
+    /// The theme every window draws with.
+    pub theme: egui::Theme,
     /// Why the window could not run.
     pub error: Option<anyhow::Error>,
 }
@@ -266,8 +271,14 @@ impl App {
             quit_at: None,
             stream_at: None,
             title: "Tornect",
+            theme: egui::Theme::Dark,
             error: None,
         }
+    }
+
+    /// Open the main window on `page`.
+    pub fn open_page(&mut self, page: Page) {
+        self.form.page = page;
     }
 
     fn command(&self, command: Command) {
@@ -319,7 +330,7 @@ impl App {
                 if let Some((x, y)) = self.stream_at {
                     attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
                 }
-                match Surface::new(el, attrs, setup) {
+                match Surface::new(el, attrs, setup, self.theme) {
                     Ok(surface) => {
                         let max = surface.painter.max_texture_side().unwrap_or(8192);
                         self.stream = Some(StreamView {
@@ -382,7 +393,7 @@ impl App {
                         )
                     });
                 let setup = self.main_device(el);
-                match Surface::new(el, indicator::attributes(rows, position), setup) {
+                match Surface::new(el, indicator::attributes(rows, position), setup, self.theme) {
                     Ok(surface) => self.indicator = Some(surface),
                     Err(e) => {
                         // The banner in the main window still shows the
@@ -623,8 +634,9 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let attrs = Window::default_attributes()
             .with_title(self.title)
-            .with_inner_size(LogicalSize::new(560.0, 720.0));
-        match Surface::new(el, attrs, new_device(el.owned_display_handle())) {
+            .with_inner_size(LogicalSize::new(1200.0, 760.0))
+            .with_min_inner_size(LogicalSize::new(960.0, 640.0));
+        match Surface::new(el, attrs, new_device(el.owned_display_handle()), self.theme) {
             Ok(surface) => {
                 self.main = Some(surface);
                 self.sync_indicator(el);
