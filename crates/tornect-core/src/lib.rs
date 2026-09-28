@@ -13,6 +13,7 @@ pub mod error;
 pub mod id;
 pub mod keys;
 pub mod keystore;
+pub mod levels;
 pub mod paths;
 pub mod session_log;
 pub mod telemetry;

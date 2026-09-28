@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::io::{AsyncWriteExt as _, DuplexStream, duplex};
+use tornect_core::levels::{Availability, Level, WindowsFacts};
 use tornect_core::trusted::{KnownHosts, TrustedDevices};
 use tornect_core::{DeviceId, DeviceIdentity, HostIdentity, TornectId};
 use zeroize::Zeroizing;
@@ -26,7 +27,7 @@ use super::vectors::host_device_pk;
 use super::*;
 use crate::consent::{
     BlockOutcome, ChosenCaps, ConsentProof, DerivedToken, PolicyReceipt, TransportPolicy,
-    WindowPassed,
+    WindowPassed, mode_code,
 };
 use crate::envelope::{Envelope, Kind, codes};
 use crate::framing::{FrameError, write_frame};
@@ -377,6 +378,7 @@ async fn unattended_session_end_to_end_over_a_duplex_pipe() {
         Intent::Unattended(UnattendedIntent {
             password: zeroize::Zeroizing::new(PW.to_owned()),
             want_mode: messages::mode::CONTROL,
+            want_elevation: tornect_core::levels::Elevation::None,
         }),
     )
     .await
@@ -874,6 +876,7 @@ async fn pair_only_then_known_host_session_and_denials() {
             want_mode: 0,
             intent: 0,
             admin: None,
+            want_elevation: None,
         }),
     };
     raw.chan.send(&request, Some(&raw.identity)).await.unwrap();
@@ -889,6 +892,112 @@ async fn pair_only_then_known_host_session_and_denials() {
         }
     ));
     assert_eq!(host.consent.session_popups(), 1, "no popup for unattended");
+}
+
+/// r7, §B.2.1 / §B.8.4.1: an attended session's level is the person's
+/// answer, and only an answer the host's availability row offers. An answer
+/// off the offer is refused as a Deny — never started lower, never higher —
+/// and the level reaches the client only through the signed accept.
+#[tokio::test]
+async fn the_level_is_the_answer_and_only_an_offered_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let client = client_side(tmp.path(), host.identity.id(), CLIENT_SEED);
+    host.consent
+        .push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+    let always_admin = Availability::of(Some(&WindowsFacts {
+        installed: true,
+        administrator: true,
+        enable_lua: Some(0),
+        ..WindowsFacts::default()
+    }));
+    let admin_prompt = Availability::of(Some(&WindowsFacts {
+        installed: true,
+        administrator: true,
+        ..WindowsFacts::default()
+    }));
+    // (row, answer) ⇒ the accepted level, or `None`: refused `DENIED`.
+    let cases = [
+        (Availability::LINUX, SessionDecision::AllowOnceAdmin, None),
+        (
+            Availability::LINUX,
+            SessionDecision::AllowOnce,
+            Some(Level::CONTROL),
+        ),
+        (
+            Availability::LINUX,
+            SessionDecision::AllowOnceViewOnly,
+            Some(Level::VIEW_ONLY),
+        ),
+        // The prompt path waits for the administrator helper: not offered.
+        (admin_prompt, SessionDecision::AllowOnceAdmin, None),
+        (
+            admin_prompt,
+            SessionDecision::AllowOnce,
+            Some(Level::CONTROL),
+        ),
+        // Control there is administrator access: plain Allow is not offered.
+        (always_admin, SessionDecision::AllowOnce, None),
+        (
+            always_admin,
+            SessionDecision::AllowOnceAdmin,
+            Some(Level::ADMIN),
+        ),
+        (
+            always_admin,
+            SessionDecision::AllowOnceViewOnly,
+            Some(Level::VIEW_ONLY),
+        ),
+    ];
+    for (levels, answer, expected) in cases {
+        host.cfg.levels = levels;
+        // A fresh popup budget per case: this is not the limiter's test.
+        host.deps.session_policy = Arc::new(PairingPolicy::new(PairingLimits::sessions()));
+        host.consent.push_session(SessionScript::Decide(answer));
+        let (a, b) = pipe();
+        let host_task = spawn_host(a, &host);
+        let outcome = connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            Intent::Session,
+        )
+        .await;
+        let case = format!("{:?} {answer:?}", levels.row);
+        match expected {
+            None => {
+                let err = outcome.map(|_| ()).unwrap_err();
+                assert!(
+                    matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == reject::DENIED),
+                    "{case}: {err}"
+                );
+                assert!(
+                    matches!(
+                        host_task.await.unwrap().unwrap(),
+                        HostOutcome::SessionRejected {
+                            reason: reject::DENIED,
+                            ..
+                        }
+                    ),
+                    "{case}"
+                );
+            }
+            Some(level) => {
+                let ClientOutcome::Session(session) = outcome.unwrap() else {
+                    panic!("{case}: no session");
+                };
+                let accept = session.accept();
+                assert_eq!(accept.mode(), mode_code(level.mode()), "{case}");
+                assert_eq!(accept.elevation(), level.elevation(), "{case}");
+                session.bye(bye::USER).await.unwrap();
+                match host_task.await.unwrap().unwrap() {
+                    HostOutcome::Session { mode, .. } => assert_eq!(mode, level.mode(), "{case}"),
+                    other => panic!("{case}: {other:?}"),
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -1471,6 +1580,7 @@ fn genuine_accept() -> messages::SessionAccept {
         ask_before_start: false,
         ends_at: None,
         fail_summary: None,
+        elevation: None,
     }
 }
 
@@ -2481,6 +2591,7 @@ async fn raw_unattended_request(
             want_mode: 0,
             intent: 0,
             admin: None,
+            want_elevation: None,
         }),
     };
     raw.chan.send(&request, Some(&raw.identity)).await.unwrap();
