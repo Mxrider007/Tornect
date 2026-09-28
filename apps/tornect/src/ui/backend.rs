@@ -26,7 +26,9 @@ use tornect_signal::fsm::host::{
 };
 use tornect_signal::fsm::{HandshakeError, HostAudit, OsRandom};
 use tornect_signal::messages::bye;
-use tornect_signal::pairing::{AutoDeny, KnownHostStore};
+use tornect_signal::pairing::AutoDeny;
+#[cfg(test)]
+use tornect_signal::pairing::KnownHostStore;
 use tornect_signal::tor::{Ladder, LadderEvent, OnionListener};
 use tornect_signal::{Isolation, MEDIA_PORT, SIGNALING_PORT, TorNode};
 
@@ -738,27 +740,33 @@ async fn viewed(
         return Ok("Cancelled.".to_owned());
     };
     let stream = stream.map_err(explain)?;
-    let known = Arc::new(KnownHostStore::open(
-        tornect_core::trusted::known_hosts_file(&b.paths),
-    )?);
-    if known.get(&id).is_some() {
+    // With history off the handshake works on a copy of the known hosts, so
+    // that its last-seen touch writes nothing (`crate::history`).
+    let pins = crate::history::Pins::open(&b.paths, id)?;
+    if pins.known() {
         b.shared.update(|m| m.client = ClientStage::Asking);
     }
     let ccfg = ClientConfig::new(id, b.cfg.general.device_name.clone());
     let pairing = Arc::new(GuiPairingUi::new(Arc::clone(&b.popups)));
     let deps = ClientDeps {
-        known_hosts: known,
+        known_hosts: pins.store(),
         ui: pairing.clone(),
         random: Arc::new(OsRandom),
         // Consulted only by unattended sessions, which the window does not ask for.
         server_key_pin: Arc::new(NoServerKeyPin),
     };
-    let Some(outcome) = unless_stopped(
+    let outcome = unless_stopped(
         client::connect(stream, &ccfg, &b.device, &deps, Intent::Session),
         stop,
     )
-    .await
-    else {
+    .await;
+    // A pin the handshake made is kept however it ended, a cancel included.
+    if let Err(e) = pins.settle() {
+        let line = format!("the pairing could not be saved: {e:#}");
+        tracing::warn!("{line}");
+        b.shared.update(|m| m.note(line));
+    }
+    let Some(outcome) = outcome else {
         return Ok("Cancelled before the session started.".to_owned());
     };
     let outcome = outcome.map_err(|e| not_started(e, pairing.ended()))?;
@@ -783,6 +791,10 @@ async fn viewed(
             size: (0, 0),
         });
     });
+    // The day of the visit, if history is kept; nothing otherwise.
+    if let Err(e) = pins.visited() {
+        tracing::warn!(error = %format!("{e:#}"), "the visit was not recorded");
+    }
     // Tor is the transport in the slice; saying so stops the host's orphan timer.
     session
         .send_tor_fallback()
