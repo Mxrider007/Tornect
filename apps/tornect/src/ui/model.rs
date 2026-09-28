@@ -7,6 +7,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
+use tornect_core::TornectId;
+use tornect_core::address_book::{Day, mixes_scripts};
+
 /// Why the UI thread is woken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wake {
@@ -99,6 +102,11 @@ pub struct Model {
     pub client: ClientStage,
     /// The last few things that happened, newest last.
     pub events: Vec<String>,
+    /// The name other devices see for this computer: sent to every device it
+    /// pairs with and every computer it connects to.
+    pub device_name: String,
+    /// The address book, the recent connections and the paired devices.
+    pub book: Book,
     /// The tokio side has finished shutting down.
     pub closed: bool,
 }
@@ -312,4 +320,126 @@ pub struct Viewing {
     pub pictures: u64,
     /// Size of the last picture.
     pub size: (u32, u32),
+}
+
+/// The address book as the pages show it: read from the files by the tokio
+/// side (`book::read`), never written by the window, which asks for every
+/// change with an [`super::view::Action`].
+#[derive(Debug, Clone, Default)]
+pub struct Book {
+    /// The computers this one connects to, the most recently seen first: the
+    /// paired ones (`known-hosts.toml`) and the saved ones
+    /// (`address-book.toml`).
+    pub computers: Vec<Computer>,
+    /// Recent connections, newest first: which computer, which day.
+    pub recent: Vec<(TornectId, Day)>,
+    /// The devices that can ask to connect here (`trusted-devices.toml`).
+    pub devices: Vec<Device>,
+    /// Whether history is kept.
+    pub history: bool,
+    /// Today (UTC), for "Today" and "Yesterday".
+    pub today: Option<Day>,
+    /// Why a file could not be read, if one could not.
+    pub problem: Option<String>,
+    /// The last reachability check of each computer (asked on a click only).
+    pub checks: Vec<(TornectId, Check)>,
+    /// What the last change did, or why it failed.
+    pub note: Option<String>,
+}
+
+impl Book {
+    /// The computer `id`, if the book has it.
+    #[must_use]
+    pub fn computer(&self, id: &TornectId) -> Option<&Computer> {
+        self.computers.iter().find(|c| c.id == *id)
+    }
+
+    /// The last check of `id`.
+    #[must_use]
+    pub fn check(&self, id: &TornectId) -> Option<&Check> {
+        self.checks
+            .iter()
+            .find(|(c, _)| c == id)
+            .map(|(_, check)| check)
+    }
+
+    /// Record a check of `id`.
+    pub fn set_check(&mut self, id: TornectId, check: Check) {
+        self.checks.retain(|(c, _)| *c != id);
+        self.checks.push((id, check));
+    }
+
+    /// What a line of the lists calls `id`.
+    #[must_use]
+    pub fn title_of(&self, id: &TornectId) -> String {
+        self.computer(id)
+            .map_or_else(|| format!("{}…", id.short()), Computer::title)
+    }
+}
+
+/// A computer this one connects to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Computer {
+    /// Its Tornect ID.
+    pub id: TornectId,
+    /// The name saved for it, when that applies to the key pinned now.
+    pub name: Option<String>,
+    /// The label pinned when it was paired: the trust anchor.
+    pub pinned: Option<String>,
+    /// The name it declared when last seen.
+    pub declared: Option<String>,
+    /// The pinned host key's fingerprint, once paired.
+    pub fingerprint: Option<String>,
+    /// The day it was paired.
+    pub paired: Option<Day>,
+    /// The last day a session with it started (history).
+    pub last_seen: Option<Day>,
+    /// A name saved for it no longer applies: its key changed since.
+    pub name_hidden: bool,
+}
+
+impl Computer {
+    /// What the lists call it: the saved name, else the pinned label, else
+    /// the start of its ID.
+    #[must_use]
+    pub fn title(&self) -> String {
+        self.name
+            .clone()
+            .or_else(|| self.pinned.clone())
+            .unwrap_or_else(|| format!("{}…", self.id.short()))
+    }
+
+    /// Whether the name shown mixes alphabets with look-alike letters (noted
+    /// beside it, never refused).
+    #[must_use]
+    pub fn looks_mixed(&self) -> bool {
+        mixes_scripts(&self.title())
+    }
+}
+
+/// A device that can ask to connect here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Device {
+    /// The label pinned when it was paired.
+    pub label: String,
+    /// Its key's fingerprint.
+    pub fingerprint: String,
+    /// The day it was paired.
+    pub paired: Day,
+    /// The day of its last session request.
+    pub last_seen: Day,
+}
+
+/// A reachability check: one pairing-free ping over Tor, asked on a click.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Check {
+    /// Waiting for the answer.
+    Asking,
+    /// It answered, after this many milliseconds (the circuit included).
+    Reachable {
+        /// Milliseconds from the click to the answer.
+        millis: u64,
+    },
+    /// It did not, and why.
+    Unreachable(String),
 }

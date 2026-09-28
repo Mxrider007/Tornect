@@ -1,6 +1,8 @@
 //! Home (the redesign's §4, as far as it works today): this computer's ID
-//! with Copy, the connect field, the Tor and hosting lines, the desktop's
-//! screen-sharing grant, the client's stage and what happened recently.
+//! with Copy and its QR code, the name others see, the connect field, the
+//! Tor and hosting lines, the desktop's screen-sharing grant, the client's
+//! stage, the saved computers, the recent connections and what happened
+//! since the window opened.
 
 use std::time::{Duration, Instant};
 
@@ -8,10 +10,12 @@ use egui::{Align, Layout, Margin, RichText, Stroke, Ui, vec2};
 use tornect_core::TornectId;
 
 use super::super::icons::{self, Icon};
-use super::super::model::{ClientStage, Hosting, Model, Setup, TorState};
+use super::super::model::{ClientStage, Computer, Hosting, Model, Setup, TorState};
+use super::super::nav::Page;
 use super::super::theme::{self, Face, Tokens};
 use super::super::view::{Action, Form, SAS_SIZE};
 use super::super::widgets::{self, Button, Kind, Tone};
+use super::{day_in_sentence, day_text};
 
 /// How long "Copied" shows after Copy ID.
 const COPIED_FOR: Duration = Duration::from_secs(2);
@@ -19,6 +23,12 @@ const COPIED_FOR: Duration = Duration::from_secs(2);
 const TWO_COLUMNS_FROM: f32 = 720.0;
 /// The space between cards.
 const GAP: f32 = 20.0;
+/// How many saved computers Home shows (the address book has them all).
+const SAVED_SHOWN: usize = 3;
+/// How many recent connections Home shows.
+const RECENT_SHOWN: usize = 4;
+/// The QR code's size.
+const QR_SIZE: f32 = 164.0;
 
 pub(super) fn home(
     ui: &mut Ui,
@@ -28,10 +38,12 @@ pub(super) fn home(
     actions: &mut Vec<Action>,
 ) {
     let t = theme::tokens(ui.ctx());
+    // SLICE-E E1-5's caveat, as the hosting line keeps it (review F-10).
     widgets::page_header(
         ui,
         "Home",
-        "Reach your computers over Tor, and let paired devices ask to see this one.",
+        "Reach your computers over Tor, and let paired devices ask to see this one (or \
+         connect without asking, if you gave one unattended access).",
     );
     ui.add_space(14.0);
 
@@ -80,6 +92,11 @@ pub(super) fn home(
         ui.add_space(GAP - 8.0);
         setup_card(ui, t, setup, !model.sharing.is_empty(), actions);
     }
+
+    ui.add_space(GAP);
+    saved(ui, t, model, form, actions);
+    ui.add_space(GAP);
+    recent(ui, t, model);
 
     if !model.events.is_empty() {
         ui.add_space(GAP);
@@ -185,6 +202,20 @@ fn id_card(
                     form.copied = Some(now);
                     ui.ctx().request_repaint_after(COPIED_FOR);
                 }
+                let qr = if form.qr {
+                    "Hide QR code"
+                } else {
+                    "Show QR code"
+                };
+                if Button::new(Kind::Secondary, qr)
+                    .icon(Icon::QrCode)
+                    .small()
+                    .enabled(model.id.is_some())
+                    .show(ui)
+                    .clicked()
+                {
+                    form.qr = !form.qr;
+                }
                 ui.add(
                     egui::Label::new(
                         RichText::new("Share it only with people you want to hear from")
@@ -194,7 +225,41 @@ fn id_card(
                     .truncate(),
                 );
             });
+            if form.qr
+                && let Some(id) = &model.id
+            {
+                ui.horizontal_top(|ui| {
+                    // The ID as another device reads it: the onion address.
+                    widgets::qr_code(ui, &format!("{}.onion", id.replace(' ', "")), QR_SIZE);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Scan it with another device to read this ID without typing \
+                                 it. It holds the ID and nothing else.",
+                            )
+                            .font(theme::font(ui.ctx(), Face::Regular, 12.0))
+                            .color(t.text_muted),
+                        )
+                        .wrap(),
+                    );
+                });
+            }
             divider(ui, t);
+            if !model.device_name.is_empty() {
+                // Decision 5: the name is sent to every device this computer
+                // pairs with and every computer it connects to.
+                status_line(
+                    ui,
+                    Icon::Monitor,
+                    (
+                        format!(
+                            "Others see this computer as \u{201c}{}\u{201d}",
+                            model.device_name
+                        ),
+                        t.text_secondary,
+                    ),
+                );
+            }
             status_line(ui, Icon::Globe, tor_line(t, &model.tor));
             status_line(ui, Icon::ShieldCheck, hosting_line(t, &model.hosting));
             needs = content_height(ui, top) + CARD_FRAME_HEIGHT;
@@ -542,4 +607,173 @@ fn client_stage(ui: &mut Ui, t: &Tokens, stage: &ClientStage, actions: &mut Vec<
             });
         }
     }
+}
+
+/// "Saved computers": the most recently seen few, each with Connect, and a
+/// way to the address book; or how a computer gets there.
+fn saved(ui: &mut Ui, t: &Tokens, model: &Model, form: &mut Form, actions: &mut Vec<Action>) {
+    let book = &model.book;
+    ui.horizontal(|ui| {
+        widgets::section_header(ui, "Saved computers");
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if Button::new(Kind::Ghost, "Open address book")
+                .icon(Icon::BookUser)
+                .small()
+                .show(ui)
+                .clicked()
+            {
+                form.page = Page::AddressBook;
+            }
+        });
+    });
+    if book.computers.is_empty() {
+        widgets::card_frame(t, 14, Margin::symmetric(20, 16)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new("No saved computers yet")
+                    .font(theme::font(ui.ctx(), Face::Semibold, 14.0))
+                    .color(t.text_primary),
+            );
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Connect to one by its ID above: the first time, both screens show a \
+                         6-digit code, and once the codes match it is saved here. The address \
+                         book can also keep an ID before the first connection.",
+                    )
+                    .font(theme::font(ui.ctx(), Face::Regular, 13.0))
+                    .color(t.text_secondary),
+                )
+                .wrap(),
+            );
+        });
+        return;
+    }
+    let idle = matches!(model.client, ClientStage::Idle | ClientStage::Ended(_));
+    let ready = model.tor.is_ready() && idle;
+    let width = ui.available_width();
+    let columns = if width >= 600.0 { SAVED_SHOWN } else { 1 };
+    let card_width = ((width - GAP * (columns - 1) as f32) / columns as f32).floor();
+    for row in book
+        .computers
+        .iter()
+        .take(SAVED_SHOWN)
+        .collect::<Vec<_>>()
+        .chunks(columns)
+    {
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = GAP;
+            for computer in row {
+                ui.allocate_ui_with_layout(
+                    vec2(card_width, 0.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        saved_card(ui, t, model, computer, ready, actions);
+                    },
+                );
+            }
+        });
+        ui.add_space(8.0);
+    }
+}
+
+/// One saved computer: its name, the start of its ID, when it was last
+/// connected, and Connect.
+fn saved_card(
+    ui: &mut Ui,
+    t: &Tokens,
+    model: &Model,
+    computer: &Computer,
+    ready: bool,
+    actions: &mut Vec<Action>,
+) {
+    widgets::card_frame(t, 14, Margin::symmetric(16, 14)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let (tile, _) = ui.allocate_exact_size(vec2(36.0, 36.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(tile, 10, theme::tint(t.accent_fill, 0.16));
+            icons::paint(ui, tile.center(), Icon::Laptop, 18.0, t.accent_text);
+            ui.vertical(|ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(computer.title())
+                            .font(theme::font(ui.ctx(), Face::Semibold, 14.0))
+                            .color(t.text_primary),
+                    )
+                    .truncate(),
+                );
+                ui.label(
+                    RichText::new(format!("{}…", computer.id.short()))
+                        .font(theme::font(ui.ctx(), Face::Mono, 12.0))
+                        .color(t.text_muted),
+                );
+            });
+        });
+        let when = match (computer.last_seen, computer.paired) {
+            (Some(day), _) => format!("Last connected {}", day_in_sentence(day, model.book.today)),
+            (None, Some(_)) => "Paired".to_owned(),
+            (None, None) => "Saved · not paired yet".to_owned(),
+        };
+        ui.label(
+            RichText::new(when)
+                .font(theme::font(ui.ctx(), Face::Regular, 12.0))
+                .color(t.text_secondary),
+        );
+        if Button::new(Kind::Secondary, "Connect")
+            .icon(Icon::ArrowRight)
+            .small()
+            .enabled(ready)
+            .show(ui)
+            .clicked()
+        {
+            actions.push(Action::Connect(computer.id));
+        }
+    });
+}
+
+/// "Recent": the last few connections from the history (days only), or
+/// that none is kept.
+fn recent(ui: &mut Ui, t: &Tokens, model: &Model) {
+    let book = &model.book;
+    ui.horizontal(|ui| {
+        widgets::section_header(ui, "Recent");
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(
+                RichText::new("Kept only on this computer")
+                    .font(theme::font(ui.ctx(), Face::Regular, 12.0))
+                    .color(t.text_muted),
+            );
+        });
+    });
+    widgets::card_frame(t, 14, Margin::symmetric(16, 10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        if book.recent.is_empty() {
+            ui.label(
+                RichText::new(if book.history {
+                    "No connections yet."
+                } else {
+                    "History is off: no list of recent connections is kept."
+                })
+                .font(theme::font(ui.ctx(), Face::Regular, 13.0))
+                .color(t.text_muted),
+            );
+            return;
+        }
+        for (id, day) in book.recent.iter().take(RECENT_SHOWN) {
+            ui.horizontal(|ui| {
+                icons::show(ui, Icon::Clock, 15.0, t.text_muted);
+                ui.label(
+                    RichText::new(day_text(*day, book.today))
+                        .font(theme::font(ui.ctx(), Face::Medium, 13.0))
+                        .color(t.text_secondary),
+                );
+                ui.label(
+                    RichText::new(format!("You connected to \"{}\"", book.title_of(id)))
+                        .font(theme::font(ui.ctx(), Face::Regular, 13.0))
+                        .color(t.text_primary),
+                );
+            });
+        }
+    });
 }

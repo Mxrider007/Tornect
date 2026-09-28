@@ -17,6 +17,7 @@
 
 mod app;
 mod backend;
+mod book;
 mod consent;
 mod icons;
 mod indicator;
@@ -95,6 +96,8 @@ pub struct GuiOpts {
     /// With `preview`: open on this page, at rest (no question, no session,
     /// no stream window), instead of showing every screen at once.
     pub page: Option<Page>,
+    /// With `preview`: an empty address book (a first run).
+    pub empty: bool,
     /// The theme the windows draw with.
     pub theme: egui::Theme,
 }
@@ -121,7 +124,7 @@ struct Real {
 fn start(paths: &Paths, opts: &GuiOpts) -> anyhow::Result<Start> {
     if opts.preview {
         return Ok(Start {
-            model: preview::model(opts.page.is_none()),
+            model: preview::model(opts.page.is_none(), opts.empty),
             real: None,
         });
     }
@@ -150,6 +153,8 @@ fn start(paths: &Paths, opts: &GuiOpts) -> anyhow::Result<Start> {
         });
     let model = Model {
         id: Some(identity.id().display_groups()),
+        device_name: cfg.general.device_name.clone(),
+        book: book::read(paths, tornect_core::address_book::Day::today()),
         hosting: if opts.host {
             Hosting::Waiting
         } else {

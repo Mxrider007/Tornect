@@ -32,8 +32,11 @@ use tornect_signal::pairing::KnownHostStore;
 use tornect_signal::tor::{Ladder, LadderEvent, OnionListener};
 use tornect_signal::{Isolation, MEDIA_PORT, SIGNALING_PORT, TorNode};
 
+use super::book::{self, Change};
 use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
-use super::model::{CaptureNote, ClientStage, Hosting, Shared, Sharing, TorState, Viewing, Wake};
+use super::model::{
+    CaptureNote, Check, ClientStage, Hosting, Shared, Sharing, TorState, Viewing, Wake,
+};
 use super::stream::{FrameSlot, SlotSink};
 use crate::host::{ControlChannel, HostLock, HostWiring, describe_end, describe_media, note, say};
 use crate::tor_cmd::{End, explain, explain_handshake};
@@ -61,6 +64,19 @@ pub enum Command {
     Grant,
     /// Forget the desktop's remembered grant.
     Revoke,
+    /// Check once whether this computer answers: one pairing-free ping over
+    /// Tor (never repeated, never in the background).
+    Ping(TornectId),
+    /// Forget this computer: its pin, its saved name, its history.
+    ForgetHost(TornectId),
+    /// Name this computer (empty: remove the saved name).
+    RenameHost(TornectId, String),
+    /// Save a computer by its ID, with a name.
+    SaveEntry(TornectId, String),
+    /// Clear the history of connections.
+    ClearHistory,
+    /// Keep a history of connections, or stop keeping one.
+    SetHistory(bool),
     /// Shut down.
     Quit,
 }
@@ -566,6 +582,29 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                             granting = Some(tokio::task::spawn_blocking(move || grant(token)));
                         }
                     }
+                    Command::Ping(id) => {
+                        let asking = b.shared.read(|m| m.book.check(&id) == Some(&Check::Asking));
+                        if asking {
+                            continue;
+                        }
+                        let Some(node) = node.clone() else {
+                            let why = Check::Unreachable("Tor is not connected yet.".to_owned());
+                            b.shared.update(|m| m.book.set_check(id, why));
+                            continue;
+                        };
+                        b.shared.update(|m| m.book.set_check(id, Check::Asking));
+                        let shared = Arc::clone(&b.shared);
+                        tokio::spawn(async move {
+                            let check = book::check(&node, id).await;
+                            shared.update(|m| m.book.set_check(id, check));
+                        });
+                    }
+                    Command::ForgetHost(id) => change_book(&b, &Change::Forget(id)),
+                    Command::RenameHost(id, name) | Command::SaveEntry(id, name) => {
+                        change_book(&b, &Change::Name(id, name));
+                    }
+                    Command::ClearHistory => change_book(&b, &Change::Clear),
+                    Command::SetHistory(on) => change_book(&b, &Change::History(on)),
                     Command::Revoke => {
                         let token = b.paths.portal_restore_token();
                         let removed = match std::fs::remove_file(&token) {
@@ -627,6 +666,26 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
         node.shutdown().await;
     }
     b.shared.update(|m| m.closed = true);
+}
+
+/// Make an address-book change the window asked for (on this side, never on
+/// the UI thread) and show the files as they are now.
+fn change_book(b: &Backend, change: &Change) {
+    let note = book::apply(&b.paths, change);
+    refresh_book(b, Some(note));
+}
+
+/// Read the address book's files into the model again, keeping the checks.
+fn refresh_book(b: &Backend, note: Option<String>) {
+    let mut fresh = book::read(&b.paths, tornect_core::address_book::Day::today());
+    b.shared.update(|m| {
+        fresh.checks = std::mem::take(&mut m.book.checks);
+        fresh
+            .checks
+            .retain(|(id, _)| fresh.computers.iter().any(|c| c.id == *id));
+        fresh.note = note;
+        m.book = fresh;
+    });
 }
 
 /// How long the viewed session's goodbye may take when the window closes.
@@ -766,6 +825,7 @@ async fn viewed(
         tracing::warn!("{line}");
         b.shared.update(|m| m.note(line));
     }
+    refresh_book(b, None);
     let Some(outcome) = outcome else {
         return Ok("Cancelled before the session started.".to_owned());
     };
@@ -792,8 +852,10 @@ async fn viewed(
         });
     });
     // The day of the visit, if history is kept; nothing otherwise.
-    if let Err(e) = pins.visited() {
-        tracing::warn!(error = %format!("{e:#}"), "the visit was not recorded");
+    match pins.visited() {
+        Ok(true) => refresh_book(b, None),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "the visit was not recorded"),
     }
     // Tor is the transport in the slice; saying so stops the host's orphan timer.
     session

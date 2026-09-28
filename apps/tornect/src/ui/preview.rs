@@ -13,12 +13,13 @@ use std::time::{Duration, Instant};
 
 use tornect_capture::{TestCard, VideoSource as _};
 use tornect_codec::DecodedFrame;
-use tornect_core::TornectId;
+use tornect_core::address_book::Day;
+use tornect_core::{DeviceId, TornectId};
 use tornect_session::FrameSink as _;
 
 use super::model::{
-    CaptureNote, ClientStage, Confirm, Hosting, Model, Popup, PopupKind, Setup, Shared, Sharing,
-    TorState, Viewing,
+    Book, CaptureNote, ClientStage, Computer, Confirm, Device, Hosting, Model, Popup, PopupKind,
+    Setup, Shared, Sharing, TorState, Viewing,
 };
 use super::stream::{FrameSlot, SlotSink};
 
@@ -33,11 +34,23 @@ pub fn synthetic_id() -> TornectId {
 }
 
 /// The preview's first model: `everything` puts one of everything on screen
-/// at once; otherwise the window is at rest, for looking at a page.
+/// at once; otherwise the window is at rest, for looking at a page. `empty`
+/// shows an address book with nothing in it (a first run).
 #[must_use]
-pub fn model(everything: bool) -> Model {
+pub fn model(everything: bool, empty: bool) -> Model {
+    let today = Day::today();
     let mut m = Model {
         id: Some(synthetic_id().display_groups()),
+        device_name: "Linux PC".to_owned(),
+        book: if empty {
+            Book {
+                history: true,
+                today: Some(today),
+                ..Book::default()
+            }
+        } else {
+            sample_book(today)
+        },
         ..Model::default()
     };
     if everything {
@@ -46,6 +59,64 @@ pub fn model(everything: bool) -> Model {
         rest(&mut m);
     }
     m
+}
+
+/// A made-up address book: invented names, and the IDs and host keys of
+/// made-up keys.
+fn sample_book(today: Day) -> Book {
+    let id = |seed: u8| TornectId::from_bytes([seed; 32]);
+    let fingerprint = |seed: u8| DeviceId::from_bytes([seed; 32]).fingerprint();
+    let ago = |days: i64| Day::from_days(today.days() - days);
+    let paired = |seed: u8, name: Option<&str>, label: &str, since: i64, last: i64| Computer {
+        id: id(seed),
+        name: name.map(str::to_owned),
+        pinned: Some(label.to_owned()),
+        declared: Some(label.to_owned()),
+        fingerprint: Some(fingerprint(seed)),
+        paired: Some(ago(since)),
+        last_seen: Some(ago(last)),
+        name_hidden: false,
+    };
+    Book {
+        computers: vec![
+            paired(0x31, Some("Office PC"), "Linux PC", 15, 0),
+            paired(0x52, None, "Home server", 25, 3),
+            paired(0x73, None, "Render box", 30, 14),
+            Computer {
+                id: id(0x94),
+                name: Some("Studio laptop".to_owned()),
+                pinned: None,
+                declared: None,
+                fingerprint: None,
+                paired: None,
+                last_seen: None,
+                name_hidden: false,
+            },
+        ],
+        recent: vec![
+            (id(0x31), ago(0)),
+            (id(0x52), ago(3)),
+            (id(0x31), ago(5)),
+            (id(0x73), ago(14)),
+        ],
+        devices: vec![
+            Device {
+                label: "Laptop".to_owned(),
+                fingerprint: fingerprint(0xa5),
+                paired: ago(4),
+                last_seen: ago(1),
+            },
+            Device {
+                label: "Tablet".to_owned(),
+                fingerprint: fingerprint(0xb6),
+                paired: ago(7),
+                last_seen: ago(4),
+            },
+        ],
+        history: true,
+        today: Some(today),
+        ..Book::default()
+    }
 }
 
 /// Put one of everything on screen.
@@ -184,6 +255,7 @@ mod tests {
             bridges: None,
             preview,
             page,
+            empty: false,
             theme: egui::Theme::Dark,
         }
     }

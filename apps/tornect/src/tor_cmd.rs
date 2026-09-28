@@ -1070,7 +1070,7 @@ where
 
 /// Nonces only need to be unique per stream; wall-clock nanoseconds mixed with
 /// the sequence number are plenty.
-fn nonce(seq: u32) -> [u8; NONCE_LEN] {
+pub(crate) fn nonce(seq: u32) -> [u8; NONCE_LEN] {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
