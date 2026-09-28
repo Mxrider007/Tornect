@@ -134,6 +134,9 @@ fn id_card(
         .stroke(Stroke::new(1.0, theme::tint(t.accent_text, 0.30)))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            // From the top: a minimum set later would count from the cursor.
+            let top = ui.cursor().top();
+            ui.set_min_height((min_height - CARD_FRAME_HEIGHT).max(0.0));
             ui.horizontal(|ui| {
                 widgets::caps_label(ui, "Your Tornect ID");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -194,10 +197,15 @@ fn id_card(
             divider(ui, t);
             status_line(ui, Icon::Globe, tor_line(t, &model.tor));
             status_line(ui, Icon::ShieldCheck, hosting_line(t, &model.hosting));
-            needs = ui.min_rect().height() + CARD_FRAME_HEIGHT;
-            ui.set_min_height((min_height - CARD_FRAME_HEIGHT).max(0.0));
+            needs = content_height(ui, top) + CARD_FRAME_HEIGHT;
         });
     needs
+}
+
+/// The height of what `ui` holds below `top`, whatever minimum it was given:
+/// the cursor stands one item spacing below the last widget.
+fn content_height(ui: &Ui, top: f32) -> f32 {
+    ui.cursor().top() - top - ui.spacing().item_spacing.y
 }
 
 /// A thin rule across the card.
@@ -250,6 +258,8 @@ fn connect_card(
     let mut needs = 0.0;
     widgets::card_frame(t, 18, Margin::symmetric(24, 20)).show(ui, |ui| {
         ui.set_width(ui.available_width());
+        let top = ui.cursor().top();
+        ui.set_min_height((min_height - CARD_FRAME_HEIGHT).max(0.0));
         widgets::section_header(ui, "Connect to a computer");
         ui.label(
             RichText::new("Its Tornect ID (56 characters; “.onion” is optional)")
@@ -307,8 +317,7 @@ fn connect_card(
                 .wrap(),
             );
         });
-        needs = ui.min_rect().height() + CARD_FRAME_HEIGHT;
-        ui.set_min_height((min_height - CARD_FRAME_HEIGHT).max(0.0));
+        needs = content_height(ui, top) + CARD_FRAME_HEIGHT;
     });
     needs
 }
