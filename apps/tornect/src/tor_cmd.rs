@@ -268,6 +268,7 @@ async fn run_host(
         ctx,
         live,
         audit,
+        pins,
     } = crate::host::wire_cli(
         paths,
         cfg,
@@ -380,6 +381,7 @@ async fn run_host(
                 };
                 let serving = Arc::clone(&serving);
                 let served = served_tx.clone();
+                let pins = Arc::clone(&pins);
                 tokio::spawn(async move {
                     let _slot = slot;
                     let (cfg, deps) = &*serving;
@@ -388,6 +390,9 @@ async fn run_host(
                         served.send_modify(|total| *total += 1);
                     })
                     .await;
+                    if let Err(e) = pins.settle() {
+                        eprintln!("warning: the paired devices could not be saved: {e:#}");
+                    }
                     if outcome == Served::Session {
                         served.send_modify(|total| *total += 1);
                     }

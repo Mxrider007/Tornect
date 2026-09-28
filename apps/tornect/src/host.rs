@@ -41,7 +41,9 @@ use tornect_signal::fsm::host::{
     SessionEnd, SessionSink, serve_host,
 };
 use tornect_signal::messages::{self, bye, pair_reject, reject};
-use tornect_signal::pairing::{AutoDeny, Consent, TrustedDeviceStore};
+#[cfg(test)]
+use tornect_signal::pairing::TrustedDeviceStore;
+use tornect_signal::pairing::{AutoDeny, Consent};
 use tornect_signal::ping::{self, ServeLimits};
 use tornect_signal::unattended::{EmergencyStop, GuardAdmin, UnattendedAuth};
 
@@ -227,6 +229,10 @@ pub struct HostWiring {
     pub live: Arc<LiveSessions>,
     /// `sessions.log` as the FSM writes it (flushed at shutdown).
     pub audit: Arc<HostAudit>,
+    /// The paired devices the FSM works on, in memory: settle them after a
+    /// stream (the session sinks settle at a session's start), so that
+    /// pairings are written and last-seen times only while history is kept.
+    pub pins: Arc<crate::history::DevicePins>,
 }
 
 /// Wire the host FSM for `paths`: `consent` answers the popups, `identity`
@@ -254,10 +260,10 @@ pub fn wire(
             Err(format!("{e:#}"))
         }
     };
-    let trusted = Arc::new(
-        TrustedDeviceStore::open(paths.trusted_devices_file())
-            .context("opening the trusted-devices store")?,
+    let pins = Arc::new(
+        crate::history::DevicePins::open(paths).context("opening the trusted-devices store")?,
     );
+    let trusted = pins.store();
     // One handle on `sessions.log` for the whole host: the log is a hash chain
     // whose lock lives in the handle, and the grant store keys it. A second
     // handle writing concurrently could fork the chain.
@@ -270,11 +276,14 @@ pub fn wire(
     let mut deps = HostDeps::headless(identity, trusted);
     deps.consent = consent;
     deps.audit = audit.clone();
-    deps.sessions = Arc::new(CliSessions {
-        live: Arc::clone(&live),
-        media,
-        control,
-    });
+    deps.sessions = Arc::new(crate::history::Settling::new(
+        CliSessions {
+            live: Arc::clone(&live),
+            media,
+            control,
+        },
+        Arc::clone(&pins),
+    ));
     deps.activity = live.clone();
     deps.kill = kill.clone();
 
@@ -308,6 +317,7 @@ pub fn wire(
         ctx,
         live,
         audit,
+        pins,
     })
 }
 
