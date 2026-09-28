@@ -311,6 +311,50 @@ mod tests {
         }
     }
 
+    /// Home's ID and connect cards share the taller one's height, and shrink
+    /// back once their content does (a long hosting line gives way to a
+    /// short one).
+    #[test]
+    fn homes_cards_shrink_back_to_their_content() {
+        let row = egui::Id::new("home-row-height");
+        let mut model = at_rest();
+        model.hosting = Hosting::Published {
+            reachable: false,
+            state: "Bootstrapping".to_owned(),
+            problem: Some("the descriptor could not be uploaded ".repeat(8)),
+        };
+        let mut window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        let tall = window.ctx.data(|d| d.get_temp::<f32>(row)).expect("stored");
+        window.model.hosting = Hosting::Waiting;
+        for _ in 0..2 {
+            assert!(window.pass(Vec::new()).is_empty());
+        }
+        let short = window.ctx.data(|d| d.get_temp::<f32>(row)).expect("stored");
+        assert!(short < tall - 20.0, "{tall} then {short}");
+    }
+
+    /// Enter in the connect field connects, as the button does.
+    #[test]
+    fn enter_in_the_connect_field_connects() {
+        let mut window = Window::new(at_rest(), Page::Home, egui::Theme::Light, WIDE);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]).verifying_key();
+        let id = TornectId::from_public_key(&key);
+        window.form.connect_to = id.to_string();
+        window.pass(Vec::new());
+        let field = window
+            .nodes
+            .iter()
+            .find(|n| n.role() == Role::TextInput)
+            .and_then(Node::bounds)
+            .expect("the connect field");
+        let at = egui::pos2(
+            ((field.x0 + field.x1) / 2.0) as f32,
+            ((field.y0 + field.y1) / 2.0) as f32,
+        );
+        assert!(window.click(at).is_empty(), "a click only focuses it");
+        assert_eq!(window.key(egui::Key::Enter), vec![Action::Connect(id)]);
+    }
+
     /// Home: Copy ID asks for the copy and says so; an ID typed into the
     /// connect field connects with Connect or Enter once Tor is ready.
     #[test]

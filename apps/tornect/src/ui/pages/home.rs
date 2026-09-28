@@ -45,23 +45,23 @@ pub(super) fn home(
     if width >= TWO_COLUMNS_FROM {
         let left = ((width - GAP) * 1.3 / 2.3).floor();
         let right = width - GAP - left;
+        // Both cards as tall as the taller one's content in the last pass.
         let heights = egui::Id::new("home-row-height");
         let min = ui.data(|d| d.get_temp::<f32>(heights)).unwrap_or(0.0);
         let mut tallest = 0.0_f32;
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = GAP;
-            let r =
-                ui.allocate_ui_with_layout(vec2(left, 0.0), Layout::top_down(Align::Min), |ui| {
-                    id_card(ui, t, model, form, now, min, actions);
-                });
-            tallest = tallest.max(r.response.rect.height());
-            let r =
-                ui.allocate_ui_with_layout(vec2(right, 0.0), Layout::top_down(Align::Min), |ui| {
-                    connect_card(ui, t, model, form, min, actions);
-                });
-            tallest = tallest.max(r.response.rect.height());
+            ui.allocate_ui_with_layout(vec2(left, 0.0), Layout::top_down(Align::Min), |ui| {
+                tallest = tallest.max(id_card(ui, t, model, form, now, min, actions));
+            });
+            ui.allocate_ui_with_layout(vec2(right, 0.0), Layout::top_down(Align::Min), |ui| {
+                tallest = tallest.max(connect_card(ui, t, model, form, min, actions));
+            });
         });
-        ui.data_mut(|d| d.insert_temp(heights, tallest));
+        if (tallest - min).abs() > 0.5 {
+            ui.data_mut(|d| d.insert_temp(heights, tallest));
+            ui.ctx().request_repaint();
+        }
     } else {
         id_card(ui, t, model, form, now, 0.0, actions);
         ui.add_space(GAP - 8.0);
@@ -113,8 +113,13 @@ pub(super) fn home(
     ui.add_space(8.0);
 }
 
+/// A hero card's frame around its content, 20 points of margin and a
+/// 1-point border above and below.
+const CARD_FRAME_HEIGHT: f32 = 42.0;
+
 /// The hero card: the ID in two lines of mono groups, Copy, and the lines
-/// that say whether it can be reached and what a paired device may do.
+/// that say whether it can be reached and what a paired device may do. At
+/// least `min_height` tall; returns the height its content needs.
 fn id_card(
     ui: &mut Ui,
     t: &Tokens,
@@ -123,12 +128,12 @@ fn id_card(
     now: Instant,
     min_height: f32,
     actions: &mut Vec<Action>,
-) {
+) -> f32 {
+    let mut needs = 0.0;
     widgets::card_frame(t, 18, Margin::symmetric(24, 20))
         .stroke(Stroke::new(1.0, theme::tint(t.accent_text, 0.30)))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.set_min_height((min_height - 42.0).max(0.0));
             ui.horizontal(|ui| {
                 widgets::caps_label(ui, "Your Tornect ID");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -189,7 +194,10 @@ fn id_card(
             divider(ui, t);
             status_line(ui, Icon::Globe, tor_line(t, &model.tor));
             status_line(ui, Icon::ShieldCheck, hosting_line(t, &model.hosting));
+            needs = ui.min_rect().height() + CARD_FRAME_HEIGHT;
+            ui.set_min_height((min_height - CARD_FRAME_HEIGHT).max(0.0));
         });
+    needs
 }
 
 /// A thin rule across the card.
@@ -229,7 +237,8 @@ fn reachability(hosting: &Hosting) -> (Tone, &'static str) {
     }
 }
 
-/// The connect card: the ID field, Connect, and what pairing looks like.
+/// The connect card: the ID field, Connect, and what pairing looks like. At
+/// least `min_height` tall; returns the height its content needs.
 fn connect_card(
     ui: &mut Ui,
     t: &Tokens,
@@ -237,10 +246,10 @@ fn connect_card(
     form: &mut Form,
     min_height: f32,
     actions: &mut Vec<Action>,
-) {
+) -> f32 {
+    let mut needs = 0.0;
     widgets::card_frame(t, 18, Margin::symmetric(24, 20)).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.set_min_height((min_height - 42.0).max(0.0));
         widgets::section_header(ui, "Connect to a computer");
         ui.label(
             RichText::new("Its Tornect ID (56 characters; “.onion” is optional)")
@@ -298,7 +307,10 @@ fn connect_card(
                 .wrap(),
             );
         });
+        needs = ui.min_rect().height() + CARD_FRAME_HEIGHT;
+        ui.set_min_height((min_height - CARD_FRAME_HEIGHT).max(0.0));
     });
+    needs
 }
 
 /// The Tor line, in words and colour.
