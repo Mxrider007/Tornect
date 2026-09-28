@@ -35,6 +35,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -296,6 +297,7 @@ impl Known {
 #[derive(Debug, Default)]
 pub struct Pacer {
     last: Mutex<Option<Instant>>,
+    runs: AtomicU64,
 }
 
 impl Pacer {
@@ -309,20 +311,63 @@ impl Pacer {
     /// never beside another run of this pacer (blocks meanwhile).
     pub fn run<T>(&self, work: impl FnOnce() -> T) -> T {
         let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(at) = *last {
-            let wait = UNKNOWN_EVERY.saturating_sub(at.elapsed());
-            if !wait.is_zero() {
-                std::thread::sleep(wait);
-            }
+        wait_after(*last);
+        *last = Some(Instant::now());
+        self.runs.fetch_add(1, Ordering::Relaxed);
+        work()
+    }
+
+    /// Run `work` as [`Self::run`] does, unless `gone` is set by the time its
+    /// turn comes: the request it was queued for was withdrawn or timed out
+    /// while it waited, so nothing is derived for a sheet that will never be
+    /// shown (`None`). Checked once the lock is held and again after the
+    /// wait, before `work` starts; a run already started finishes.
+    pub fn run_unless<T>(&self, gone: &AtomicBool, work: impl FnOnce() -> T) -> Option<T> {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        if gone.load(Ordering::Acquire) {
+            return None;
+        }
+        wait_after(*last);
+        if gone.load(Ordering::Acquire) {
+            return None;
         }
         *last = Some(Instant::now());
-        work()
+        self.runs.fetch_add(1, Ordering::Relaxed);
+        Some(work())
+    }
+
+    /// How many runs this pacer has started.
+    #[must_use]
+    pub fn runs(&self) -> u64 {
+        self.runs.load(Ordering::Relaxed)
     }
 
     /// Stretch a key nobody saved, paced (blocks).
     #[must_use]
     pub fn derive(&self, key: &[u8; 32], role: Role) -> Stretched {
         self.run(|| derive(key, role))
+    }
+
+    /// Stretch a key nobody saved, paced, unless `gone` is set before its
+    /// turn comes ([`Self::run_unless`]; blocks).
+    #[must_use]
+    pub fn derive_unless(
+        &self,
+        gone: &AtomicBool,
+        key: &[u8; 32],
+        role: Role,
+    ) -> Option<Stretched> {
+        self.run_unless(gone, || derive(key, role))
+    }
+}
+
+/// Sleep until [`UNKNOWN_EVERY`] has passed since `last` started.
+fn wait_after(last: Option<Instant>) {
+    if let Some(at) = last {
+        let wait = UNKNOWN_EVERY.saturating_sub(at.elapsed());
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
     }
 }
 
@@ -684,6 +729,43 @@ mod tests {
                 pair[1] - pair[0]
             );
         }
+    }
+
+    /// F-3: a run whose request went away while it queued derives nothing,
+    /// and a run already started is not cut short.
+    #[test]
+    fn a_pacer_skips_a_run_whose_request_is_gone() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let pacer = Arc::new(Pacer::new());
+        pacer.run(|| ());
+        assert_eq!(pacer.runs(), 1);
+        // Queued behind the first run's second, then withdrawn.
+        let gone = Arc::new(AtomicBool::new(false));
+        let ran = Arc::new(AtomicBool::new(false));
+        let queued = {
+            let (pacer, gone, ran) = (Arc::clone(&pacer), Arc::clone(&gone), Arc::clone(&ran));
+            std::thread::spawn(move || {
+                pacer.run_unless(&gone, || ran.store(true, Ordering::SeqCst))
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        gone.store(true, Ordering::Release);
+        assert_eq!(queued.join().unwrap(), None);
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a withdrawn request's derivation ran"
+        );
+        assert_eq!(pacer.runs(), 1);
+        // Already gone before it queued: nothing waits, nothing runs.
+        let started = Instant::now();
+        assert_eq!(pacer.derive_unless(&gone, &[7u8; 32], Role::Device), None);
+        assert!(started.elapsed() < UNKNOWN_EVERY);
+        // Not gone: it runs, a second after the last run that started.
+        let kept = AtomicBool::new(false);
+        assert_eq!(pacer.run_unless(&kept, || 5), Some(5));
+        assert_eq!(pacer.runs(), 2);
     }
 
     /// Cached words read back only when they are four words of the list.

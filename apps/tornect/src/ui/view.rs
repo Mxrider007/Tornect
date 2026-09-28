@@ -536,6 +536,9 @@ fn host_popup(
             name, sas, pinned, ..
         } => {
             let looks_like = seen.and_then(|s| s.looks_like.as_deref());
+            // The alarm fired, or could not compare (F-4): either way only
+            // the typed code pairs.
+            let fired = seen.is_some_and(Recognition::typed_only);
             match (pinned, seen.and_then(|s| s.identicon)) {
                 // A pinned key: its saved name, with the identicon beside it.
                 (Some(label), Some(identicon)) => {
@@ -588,9 +591,21 @@ fn host_popup(
                     )
                     .wrap(),
                 );
+            } else if fired {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "Could not compare it with your saved devices: a file of saved \
+                             entries could not be read",
+                        )
+                        .strong()
+                        .color(t.danger_text),
+                    )
+                    .wrap(),
+                );
             }
             ui.add_space(6.0);
-            if looks_like.is_none() {
+            if !fired {
                 ui.label("Code:");
                 ui.label(
                     RichText::new(sas)
@@ -623,7 +638,7 @@ fn host_popup(
             let label = label.trim().to_owned();
             let label = (!label.is_empty()).then_some(label);
             let mut typed = None;
-            if looks_like.is_some() {
+            if fired {
                 let code = form.codes.entry(popup.id).or_default();
                 ui.horizontal(|ui| {
                     ui.label("Their code:");
@@ -651,9 +666,7 @@ fn host_popup(
                 }
                 // No accept button when the alarm fired: only the typed code
                 // pairs then.
-                if looks_like.is_none()
-                    && accept(ui, RichText::new("The codes match: pair").strong(), armed)
-                {
+                if !fired && accept(ui, RichText::new("The codes match: pair").strong(), armed) {
                     actions.push(Action::Pair {
                         id: popup.id,
                         decision: PairDecision::Accept {

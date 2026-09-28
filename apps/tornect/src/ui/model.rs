@@ -115,6 +115,10 @@ pub struct Model {
     /// is not in the address book and looks like a saved one; Connect then
     /// takes a second, deliberate click.
     pub connect_warning: Option<ConnectWarning>,
+    /// The connect field could not compare this ID with every saved one: a
+    /// file holding saved entries could not be read (F-4). Connect then
+    /// takes a second, deliberate click, as for a look-alike.
+    pub connect_unchecked: Option<TornectId>,
     /// What each open host sheet shows about the key asking, by popup id:
     /// its device words, its identicon beside a saved name, the look-alike
     /// alarm (§B.6.1). Set with the popup, in the same update.
@@ -274,6 +278,19 @@ pub struct Recognition {
     /// The saved entry an unpinned key looks like: the alarm fired, and the
     /// pairing takes the code typed from the other device (W-B3).
     pub looks_like: Option<String>,
+    /// The alarm could not compare: a file holding saved entries could not
+    /// be read, and none of the entries that could be read matched. It
+    /// counts as fired (F-4): the pairing takes only the typed code.
+    pub unchecked: bool,
+}
+
+impl Recognition {
+    /// Whether the pairing takes only the code typed from the other device:
+    /// the alarm fired, or it could not compare.
+    #[must_use]
+    pub fn typed_only(&self) -> bool {
+        self.looks_like.is_some() || self.unchecked
+    }
 }
 
 /// The client's side of pairing: the host accepted; do the codes match?
