@@ -442,23 +442,28 @@ impl Entry {
 pub struct AddressBook {
     /// The schema version, [`VERSION`].
     pub version: u32,
-    /// Whether recent connections are kept (the history switch).
-    #[serde(default = "keep_history")]
+    /// Whether recent connections are kept (the history switch): off
+    /// unless switched on. A file keeps the value it holds (every save
+    /// writes the key).
+    #[serde(default = "history_by_default")]
     pub history: bool,
     /// The computers, by ID.
     #[serde(default)]
     pub hosts: BTreeMap<TornectId, Entry>,
 }
 
-fn keep_history() -> bool {
-    true
+/// History is off until it is switched on (the operator's ruling of
+/// 2026-09-28): on a new Tornect home nothing about past connections is
+/// written — no recent list, no last-connected days, no last-seen times.
+fn history_by_default() -> bool {
+    false
 }
 
 impl Default for AddressBook {
     fn default() -> Self {
         Self {
             version: VERSION,
-            history: keep_history(),
+            history: history_by_default(),
             hosts: BTreeMap::new(),
         }
     }
@@ -885,8 +890,12 @@ mod tests {
         }
     }
 
+    /// A book with history switched on, two computers, days kept.
     fn sample() -> AddressBook {
-        let mut book = AddressBook::default();
+        let mut book = AddressBook {
+            history: true,
+            ..AddressBook::default()
+        };
         book.hosts.insert(
             id(1),
             Entry {
@@ -913,7 +922,7 @@ mod tests {
 
     /// The book goes to a 0600 file and comes back as it was, with its schema
     /// version and without a temporary file left behind; a missing file is an
-    /// empty book that keeps history.
+    /// empty book that keeps no history (off until switched on).
     #[test]
     fn a_book_round_trips_through_a_private_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -922,7 +931,7 @@ mod tests {
         assert_eq!(path, paths.state_dir.join("address-book.toml"));
         let empty = AddressBook::load(&path).unwrap();
         assert_eq!(empty, AddressBook::default());
-        assert!(empty.history && empty.hosts.is_empty());
+        assert!(!empty.history && empty.hosts.is_empty());
 
         let book = sample();
         book.save(&path).unwrap();
@@ -1341,6 +1350,7 @@ mod tests {
         let dir = tmp.path().join("state");
         let store = Store::at(dir.join("address-book.toml"));
         store.name(id(1), Some([3; 32]), "Office PC").unwrap();
+        store.set_history(true).unwrap();
         assert!(
             store
                 .record_visit(id(1), [3; 32], "Linux PC", day("2026-09-20"))
@@ -1371,6 +1381,32 @@ mod tests {
         assert_eq!(store.recent().unwrap().visits[0].day, day("2026-09-29"));
     }
 
+    /// History is off until it is switched on: a new Tornect home's visit
+    /// writes no file at all, and a stored value, on or off, is kept as it
+    /// is by every later load.
+    #[test]
+    fn history_is_off_until_switched_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        let store = Store::at(dir.join("address-book.toml"));
+        assert!(!store.keeps_history());
+        assert!(
+            !store
+                .record_visit(id(1), [3; 32], "Linux PC", day("2026-09-28"))
+                .unwrap()
+        );
+        assert!(
+            !dir.exists(),
+            "a visit wrote a file with history never switched on"
+        );
+        store.set_history(true).unwrap();
+        assert!(store.keeps_history(), "a stored on stays on");
+        let text = std::fs::read_to_string(store.book_path()).unwrap();
+        assert!(text.contains("history = true"), "{text}");
+        store.set_history(false).unwrap();
+        assert!(!store.keeps_history(), "a stored off stays off");
+    }
+
     /// With history on, a visit keeps the day and nothing finer: the entry's
     /// first and last day and the name the computer declared (cleaned), and
     /// one line per computer and day in the recent list, newest first, at
@@ -1379,6 +1415,7 @@ mod tests {
     fn with_history_on_a_visit_keeps_the_day_only() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::at(tmp.path().join("address-book.toml"));
+        store.set_history(true).unwrap();
         for (who, key, name, d) in [
             (1, [3; 32], "Linux\u{202E} PC", "2026-09-26"),
             (1, [3; 32], "Linux PC", "2026-09-27"),
@@ -1437,6 +1474,7 @@ mod tests {
         hosts.touch(&id(1), 1_790_510_400);
         hosts.save(&known).unwrap();
         store.name(id(1), Some([3; 32]), "Office PC").unwrap();
+        store.set_history(true).unwrap();
         for d in ["2026-09-26", "2026-09-27"] {
             assert!(
                 store

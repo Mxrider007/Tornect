@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(entry.declared.as_deref(), Some("Desk"));
     }
 
-    /// M-UI-2 security finding F-2: with history on (the default), a
+    /// M-UI-2 security finding F-2: with history switched on, a
     /// Forget of another computer and a Clear made while a connection runs
     /// stay made: the connection writes only its own host's record, merged
     /// into the file as it is when the handshake is over.
@@ -339,6 +339,7 @@ mod tests {
     async fn a_forget_or_clear_during_a_connection_is_never_undone() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(tmp.path().join("home"));
+        Store::new(&paths).set_history(true).unwrap();
         let file = known_hosts_file(&paths);
         let identity = Arc::new(HostIdentity::from_seed(&[0x11; 32]));
         let trusted = Arc::new(TrustedDeviceStore::ephemeral(Default::default()));
@@ -372,6 +373,51 @@ mod tests {
         );
         let desk = hosts.get(&identity.id()).unwrap();
         assert!(desk.last_seen >= desk.paired_at, "this connection's time");
+    }
+
+    /// History off by default (the operator's ruling of 2026-09-28): on a
+    /// fresh Tornect home, where the switch was never touched, neither this
+    /// computer's connections nor the host's handshakes write anything about
+    /// past connections. The pins are written (trust state), at their pairing
+    /// time and with no visit; after that a connection and a session request
+    /// change no file at all.
+    #[tokio::test]
+    async fn a_fresh_home_writes_no_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        // This computer connects.
+        let paths = Paths::from_home(tmp.path().join("home"));
+        let book = Store::new(&paths);
+        assert!(!book.keeps_history(), "history is off on a fresh home");
+        let identity = Arc::new(HostIdentity::from_seed(&[0x11; 32]));
+        let trusted = Arc::new(TrustedDeviceStore::ephemeral(Default::default()));
+        assert!(
+            !connect_once(&paths, &identity, &trusted).await,
+            "a visit was kept"
+        );
+        let hosts = KnownHosts::load(&known_hosts_file(&paths)).unwrap();
+        let pinned = hosts.get(&identity.id()).expect("the pairing pins");
+        assert_eq!(pinned.last_seen, pinned.paired_at);
+        assert!(!book.recent_path().exists());
+        assert!(!book.book_path().exists(), "the address book was written");
+        age(&paths.state_dir);
+        let before = snapshot(&paths.state_dir);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!connect_once(&paths, &identity, &trusted).await);
+        assert_eq!(snapshot(&paths.state_dir), before);
+
+        // A host answers.
+        let host = Paths::from_home(tmp.path().join("host"));
+        let pins = DevicePins::open(&host).unwrap();
+        let laptop = Arc::new(KnownHostStore::ephemeral(KnownHosts::default()));
+        let accept = PairDecision::Accept { label: None };
+        assert!(host_side(&identity, &pins, 0x22, &laptop, accept).await);
+        let devices = TrustedDevices::load(&host.trusted_devices_file()).unwrap();
+        assert_eq!(devices.devices[0].last_seen, devices.devices[0].paired_at);
+        age(&host.state_dir);
+        let before = snapshot(&host.state_dir);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(host_side(&identity, &pins, 0x22, &laptop, PairDecision::Reject).await);
+        assert_eq!(snapshot(&host.state_dir), before);
     }
 
     /// A name saved for a computer before it was paired is bound to the key
