@@ -13,20 +13,17 @@
 //!   recorded.
 //! * Host side ([`DevicePins`], `trusted-devices.toml`): the handshake
 //!   touches a paired device's last-seen time on every fresh session
-//!   request. The host's handshakes always work on a copy in memory; at each
-//!   session's start and each stream's end the trust changes are written,
-//!   and the last-seen times only while history is on.
+//!   request. The host's store is shared with the file: a pairing, an
+//!   unpairing and a reject count are written the moment they happen (merged
+//!   into the file as it is then), a last-seen time only while history is on.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tornect_core::address_book::{Day, Store};
-use tornect_core::trusted::{
-    KnownHost, KnownHosts, TrustedDevice, TrustedDevices, known_hosts_file,
-};
+use tornect_core::trusted::{KnownHost, KnownHosts, known_hosts_file};
 use tornect_core::{DeviceId, Paths, TornectId};
-use tornect_signal::fsm::host::{LiveSession, SessionEnd, SessionSink};
-use tornect_signal::pairing::{KnownHostStore, TrustedDeviceStore};
+use tornect_signal::pairing::{KeepHistory, KnownHostStore, TrustedDeviceStore};
 
 /// The known hosts one connection to `host` works with.
 pub struct Pins {
@@ -121,26 +118,27 @@ impl Pins {
     }
 }
 
-/// The host's paired devices for its handshakes: a copy of
-/// `trusted-devices.toml` in memory, written back by [`DevicePins::settle`].
+/// The host's paired devices for its handshakes: `trusted-devices.toml`,
+/// shared with the rest of the app (`TrustedDeviceStore::shared`). A
+/// pairing, an unpairing and a reject count are written the moment they
+/// happen, merged into the file as it is then; a device's last-seen time
+/// only while history is on (the switch is read at each session request).
 pub struct DevicePins {
     store: Arc<TrustedDeviceStore>,
-    path: PathBuf,
-    book: Store,
-    /// The copy as it was at the last settle (or at the start).
-    base: Mutex<TrustedDevices>,
+    /// The paired devices (key and label) when the window last read them.
+    shown: Mutex<Vec<(DeviceId, String)>>,
 }
 
 impl DevicePins {
     /// The paired devices of the Tornect home `paths`.
     pub fn open(paths: &Paths) -> anyhow::Result<Self> {
-        let path = paths.trusted_devices_file();
-        let devices = TrustedDevices::load(&path)?;
+        let book = Store::new(paths);
+        let keep: KeepHistory = Arc::new(move || book.keeps_history());
+        let store = TrustedDeviceStore::shared(paths.trusted_devices_file(), keep)?;
+        let shown = Mutex::new(paired(&store));
         Ok(Self {
-            store: Arc::new(TrustedDeviceStore::ephemeral(devices.clone())),
-            path,
-            book: Store::new(paths),
-            base: Mutex::new(devices),
+            store: Arc::new(store),
+            shown,
         })
     }
 
@@ -150,102 +148,26 @@ impl DevicePins {
         Arc::clone(&self.store)
     }
 
-    /// Write what the handshakes changed since the last settle, into the
-    /// file as it is now (a device unpaired elsewhere stays unpaired): the
-    /// devices paired and unpaired here and the ban list are trust state and
-    /// always written; the devices' last-seen times only while history is
-    /// on. Nothing is written when nothing of that changed. Whether the file
-    /// was written.
-    pub fn settle(&self) -> anyhow::Result<bool> {
-        let keep = self.book.keeps_history();
-        let now = self.store.snapshot();
-        let mut base = self.base.lock().unwrap_or_else(PoisonError::into_inner);
-        let paired: Vec<&TrustedDevice> = now
-            .devices
-            .iter()
-            .filter(|d| {
-                base.get(&d.device)
-                    .is_none_or(|b| b.paired_at != d.paired_at || b.label != d.label)
-            })
-            .collect();
-        let unpaired: Vec<DeviceId> = base
-            .devices
-            .iter()
-            .filter(|b| now.get(&b.device).is_none())
-            .map(|b| b.device)
-            .collect();
-        let bans = now.bans != base.bans;
-        let seen: Vec<(DeviceId, u64)> = if keep {
-            now.devices
-                .iter()
-                .filter(|d| {
-                    base.get(&d.device)
-                        .is_some_and(|b| b.last_seen != d.last_seen)
-                })
-                .map(|d| (d.device, d.last_seen))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        if paired.is_empty() && unpaired.is_empty() && !bans && seen.is_empty() {
-            *base = now;
-            return Ok(false);
-        }
-        let mut file = TrustedDevices::load(&self.path)?;
-        for device in paired {
-            file.devices.retain(|f| f.device != device.device);
-            file.devices.push(TrustedDevice {
-                last_seen: if keep {
-                    device.last_seen
-                } else {
-                    device.paired_at
-                },
-                ..device.clone()
-            });
-        }
-        for device in &unpaired {
-            file.devices.retain(|f| f.device != *device);
-        }
-        if bans {
-            file.bans = now.bans.clone();
-        }
-        for (device, at) in seen {
-            if let Some(f) = file.devices.iter_mut().find(|f| f.device == device) {
-                f.last_seen = f.last_seen.max(at);
-            }
-        }
-        file.save(&self.path)?;
-        *base = now;
-        Ok(true)
+    /// Whether a device was paired, unpaired or relabelled since the last
+    /// call (the window reads the files again then). Writes nothing: the
+    /// store wrote each change when it happened.
+    pub fn changed(&self) -> bool {
+        let now = paired(&self.store);
+        let mut shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
+        let changed = *shown != now;
+        *shown = now;
+        changed
     }
 }
 
-/// A session sink that settles the host's paired devices when a session
-/// goes live (a pairing just made is written then, not only at the stream's
-/// end), then hands every event on to `inner`.
-pub struct Settling<S> {
-    inner: S,
-    pins: Arc<DevicePins>,
-}
-
-impl<S> Settling<S> {
-    /// `inner`, settling `pins` at each session's start.
-    pub fn new(inner: S, pins: Arc<DevicePins>) -> Self {
-        Self { inner, pins }
-    }
-}
-
-impl<S: SessionSink> SessionSink for Settling<S> {
-    fn on_start(&self, session: &LiveSession<'_>) {
-        if let Err(e) = self.pins.settle() {
-            tracing::warn!(error = %format!("{e:#}"), "the paired devices could not be saved");
-        }
-        self.inner.on_start(session);
-    }
-
-    fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
-        self.inner.on_end(session_id, end);
-    }
+/// The paired devices of `store`: key and label.
+fn paired(store: &TrustedDeviceStore) -> Vec<(DeviceId, String)> {
+    store
+        .snapshot()
+        .devices
+        .into_iter()
+        .map(|d| (d.device, d.label))
+        .collect()
 }
 
 #[cfg(test)]
@@ -253,6 +175,7 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use tornect_core::trusted::TrustedDevices;
     use tornect_core::{DeviceIdentity, HostIdentity};
     use tornect_signal::fsm::client::{
         ClientConfig, ClientDeps, ClientOutcome, Intent, ScriptedClientUi, connect,
@@ -397,8 +320,7 @@ mod tests {
     /// One connection to the host `identity`, whose handshakes use `pins`,
     /// from the device of `seed` with the known hosts `known` (in memory):
     /// pairing if the host is new to it, with the host's user answering
-    /// `pair`, then a session the user allows. The host settles when the
-    /// session is live, as its session sink does. Whether a session started.
+    /// `pair`, then a session the user allows. Whether a session started.
     async fn host_side(
         identity: &Arc<HostIdentity>,
         pins: &DevicePins,
@@ -421,7 +343,6 @@ mod tests {
         let ccfg = ClientConfig::new(identity.id(), "Laptop");
         let outcome = connect(client_end, &ccfg, &device, &cdeps, Intent::Session).await;
         let live = matches!(outcome, Ok(ClientOutcome::Session(_)));
-        pins.settle().unwrap();
         drop(outcome);
         host.abort();
         live
@@ -457,7 +378,6 @@ mod tests {
         let before = snapshot(&paths.state_dir);
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(host_side(&identity, &pins, 0x22, &laptop, PairDecision::Reject).await);
-        assert!(!pins.settle().unwrap());
         assert_eq!(snapshot(&paths.state_dir), before);
 
         // Another device's pairing is refused: its reject count is written.
@@ -466,5 +386,36 @@ mod tests {
         assert_eq!(devices.devices.len(), 1);
         assert_eq!(devices.bans.len(), 1);
         assert_eq!(devices.bans[0].reject_count, 1);
+    }
+
+    /// M-UI-2 security finding F-1: a pairing and a refused pairing's
+    /// reject count are in `trusted-devices.toml` the moment the handshake
+    /// made them, with no later settle point: a host that dies right after
+    /// them (here: the store is never dropped and nothing else runs) keeps
+    /// both. Its last-seen times still follow the switch.
+    #[tokio::test]
+    async fn a_pin_and_a_reject_count_survive_a_crash_right_after() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("host"));
+        let identity = Arc::new(HostIdentity::from_seed(&[0x11; 32]));
+        let pins = DevicePins::open(&paths).unwrap();
+        let file = paths.trusted_devices_file();
+        let laptop = Arc::new(KnownHostStore::ephemeral(KnownHosts::default()));
+        let other = Arc::new(KnownHostStore::ephemeral(KnownHosts::default()));
+
+        let accept = PairDecision::Accept { label: None };
+        assert!(host_side(&identity, &pins, 0x22, &laptop, accept).await);
+        let devices = TrustedDevices::load(&file).unwrap();
+        assert_eq!(devices.devices.len(), 1, "the pin is on disk at once");
+        assert!(pins.changed(), "the window reads the files again");
+        assert!(!pins.changed());
+
+        assert!(!host_side(&identity, &pins, 0x44, &other, PairDecision::Reject).await);
+        let devices = TrustedDevices::load(&file).unwrap();
+        assert_eq!(devices.bans.len(), 1, "the reject count is on disk at once");
+        assert_eq!(devices.bans[0].reject_count, 1);
+        assert!(!pins.changed(), "no device paired or unpaired");
+        // The crash: nothing flushes, nothing drops.
+        std::mem::forget(pins);
     }
 }
