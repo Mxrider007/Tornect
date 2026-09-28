@@ -242,17 +242,38 @@ pub fn main_window(
                 }),
         )
         .show(ui, |ui| {
+            // Open questions come first, one card each, so none hides
+            // another's buttons, in a region of their own above the page's
+            // scroll area (review F-2): a request that arrives while the page
+            // is scrolled down is in view at once. Only when the cards do not
+            // all fit does the region scroll, and then a new card is brought
+            // into view once.
+            if !model.popups.is_empty() || model.confirm.is_some() {
+                egui::ScrollArea::vertical()
+                    .id_salt("questions")
+                    .max_height(ui.available_height())
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for popup in &model.popups {
+                            let new = !form.cards.contains_key(&popup.id);
+                            let card = question(ui, |ui| host_popup(ui, popup, form, now, actions));
+                            if new {
+                                ui.scroll_to_rect(card, None);
+                            }
+                        }
+                        if let Some(confirm) = &model.confirm {
+                            let new = !form.cards.contains_key(&confirm.id);
+                            let card =
+                                question(ui, |ui| confirm_popup(ui, confirm, form, now, actions));
+                            if new {
+                                ui.scroll_to_rect(card, None);
+                            }
+                        }
+                    });
+            }
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
                 .show(ui, |ui| {
-                    // Open questions come first, one card each, so none hides
-                    // another's buttons.
-                    for popup in &model.popups {
-                        question(ui, |ui| host_popup(ui, popup, form, now, actions));
-                    }
-                    if let Some(confirm) = &model.confirm {
-                        question(ui, |ui| confirm_popup(ui, confirm, form, now, actions));
-                    }
                     let page = form.page;
                     pages::draw(ui, page, model, form, now, actions);
                 });
@@ -275,9 +296,10 @@ pub fn main_window(
 }
 
 /// A question card: framed in the accent colour, above everything else.
-fn question(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+/// Returns where it was drawn.
+fn question(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Rect {
     let t = theme::tokens(ui.ctx());
-    egui::Frame::new()
+    let card = egui::Frame::new()
         .fill(t.surface_card)
         .corner_radius(14)
         .stroke(egui::Stroke::new(2.0, t.accent_fill))
@@ -285,8 +307,11 @@ fn question(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);
-        });
+        })
+        .response
+        .rect;
     ui.add_space(8.0);
+    card
 }
 
 /// §6.3: "Sharing with `name` · 12:41 · End", for as long as a session runs.
