@@ -11,10 +11,11 @@ use tornect_signal::pairing::{PairDecision, SessionDecision};
 
 #[cfg(test)]
 use super::model::{ClientStage, Hosting, Setup, TorState};
-use super::model::{Confirm, Model, Popup, PopupKind, Sharing, Viewing};
+use super::model::{Confirm, Model, Popup, PopupKind, Recognition, Sharing, Viewing};
 use super::nav::{self, Page};
 use super::pages;
 use super::theme::{self, Face};
+use super::widgets;
 
 /// The SAS display size (§7: "SAS display 44 mono").
 pub const SAS_SIZE: f32 = 44.0;
@@ -73,6 +74,17 @@ pub enum Action {
         /// always so for an accept (decision M1-50).
         pointer: bool,
     },
+    /// The code the host user typed on a pairing sheet whose look-alike
+    /// alarm fired (§B.6.1 W-B3): the host checks it against its own code;
+    /// a match pairs, anything else refuses.
+    PairCode {
+        /// The popup.
+        id: u64,
+        /// The digits typed.
+        code: String,
+        /// The name typed for the device, if any.
+        label: Option<String>,
+    },
     /// The host user's answer to a session popup.
     Session {
         /// The popup.
@@ -118,6 +130,8 @@ pub struct Form {
     pub connect_to: String,
     /// The label typed into each pairing popup.
     pub labels: HashMap<u64, String>,
+    /// The code typed into each pairing popup whose alarm fired.
+    pub codes: HashMap<u64, String>,
     /// Each open card's answer row, by popup or question id.
     cards: HashMap<u64, Card>,
     /// The page the window shows.
@@ -274,7 +288,9 @@ pub fn main_window(
                     .show(ui, |ui| {
                         for popup in &model.popups {
                             let new = !form.cards.contains_key(&popup.id);
-                            let card = question(ui, |ui| host_popup(ui, popup, form, now, actions));
+                            let seen = model.recognition.get(&popup.id);
+                            let card =
+                                question(ui, |ui| host_popup(ui, popup, seen, form, now, actions));
                             if new {
                                 ui.scroll_to_rect(card, None);
                             }
@@ -487,9 +503,20 @@ pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: 
     ui.ctx().request_repaint_after(Duration::from_millis(500));
 }
 
+/// Whether `code` holds a whole code: six digits (a space allowed).
+fn whole_code(code: &str) -> bool {
+    code.chars().filter(char::is_ascii_digit).count() == 6
+}
+
+/// A host sheet (§B.6.1): the key asking is named by its saved name only
+/// when all 32 bytes match a pinned key, with its identicon beside it;
+/// otherwise by its device words, "not yet trusted · compare the code". When
+/// the look-alike alarm fired, the sheet says so, hides its own code, and
+/// pairs only through the code typed from the other device.
 fn host_popup(
     ui: &mut egui::Ui,
     popup: &Popup,
+    seen: Option<&Recognition>,
     form: &mut Form,
     now: Instant,
     actions: &mut Vec<Action>,
@@ -503,36 +530,82 @@ fn host_popup(
     ui.label(RichText::new(title).heading().color(t.accent_text));
     ui.push_id(("popup", popup.id), |ui| match &popup.kind {
         PopupKind::Pairing {
-            name,
-            fingerprint,
-            sas,
-            pinned,
+            name, sas, pinned, ..
         } => {
-            match pinned {
-                Some(label) => ui.label(format!(
-                    "A device ALREADY PAIRED as \"{label}\" asks to pair again. Refusing \
-                         does not unpair it."
-                )),
-                None => ui.label(format!(
-                    "A device calling itself \"{name}\" asks to pair with this computer."
-                )),
-            };
-            ui.label(
-                RichText::new(format!("device fingerprint {fingerprint}"))
-                    .small()
-                    .monospace(),
-            );
+            let looks_like = seen.and_then(|s| s.looks_like.as_deref());
+            match (pinned, seen.and_then(|s| s.identicon)) {
+                // A pinned key: its saved name, with the identicon beside it.
+                (Some(label), Some(identicon)) => {
+                    ui.horizontal_top(|ui| {
+                        widgets::identicon(ui, &identicon.seed(), 36.0);
+                        ui.add(
+                            egui::Label::new(format!(
+                                "A device ALREADY PAIRED as \"{label}\" asks to pair again. \
+                                 Refusing does not unpair it."
+                            ))
+                            .wrap(),
+                        );
+                    });
+                }
+                (Some(label), None) => {
+                    ui.label(format!(
+                        "A device ALREADY PAIRED as \"{label}\" asks to pair again. Refusing \
+                             does not unpair it."
+                    ));
+                }
+                (None, _) => {
+                    ui.label(format!(
+                        "A device calling itself \"{name}\" asks to pair with this computer."
+                    ));
+                }
+            }
+            if let (None, Some(seen)) = (pinned, seen) {
+                // The words in their labelled slot, never where a name goes.
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "device words: {} · not yet trusted · compare the code",
+                            seen.words.shown()
+                        ))
+                        .small()
+                        .color(t.text_secondary),
+                    )
+                    .wrap(),
+                );
+            }
+            if let Some(like) = looks_like {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "Looks like your saved device \"{like}\", but it is a different \
+                             device"
+                        ))
+                        .strong()
+                        .color(t.danger_text),
+                    )
+                    .wrap(),
+                );
+            }
             ui.add_space(6.0);
-            ui.label("Code:");
-            ui.label(
-                RichText::new(sas)
-                    .font(theme::font(ui.ctx(), Face::MonoSemibold, SAS_SIZE))
-                    .color(t.accent_text),
-            );
-            ui.label(
-                "The other device shows a code too. Pair only if the numbers match on both \
-                     screens; if they differ, refuse: something between you changed them.",
-            );
+            if looks_like.is_none() {
+                ui.label("Code:");
+                ui.label(
+                    RichText::new(sas)
+                        .font(theme::font(ui.ctx(), Face::MonoSemibold, SAS_SIZE))
+                        .color(t.accent_text),
+                );
+                ui.label(
+                    "The other device shows a code too. Pair only if the numbers match on both \
+                         screens; if they differ, refuse: something between you changed them.",
+                );
+            } else {
+                // This computer's code stays hidden: it is typed from the
+                // other screen, and this computer compares (W-B3).
+                ui.label(
+                    "Type the 6-digit code the other device shows. This computer checks it \
+                     against its own code; a wrong code refuses the device.",
+                );
+            }
             // It starts with the declared name (a re-pair: the pinned label,
             // which the store keeps), so the owner sees what an accept
             // without typing pins (SLICE-E E1-2).
@@ -544,6 +617,26 @@ fn host_popup(
                 ui.label("Name it (optional):");
                 ui.text_edit_singleline(label);
             });
+            let label = label.trim().to_owned();
+            let label = (!label.is_empty()).then_some(label);
+            let mut typed = None;
+            if looks_like.is_some() {
+                let code = form.codes.entry(popup.id).or_default();
+                ui.horizontal(|ui| {
+                    ui.label("Their code:");
+                    let field = ui.add(
+                        egui::TextEdit::singleline(code)
+                            .hint_text("6 digits, then Enter")
+                            .char_limit(7)
+                            .desired_width(150.0)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    code.retain(|c| c.is_ascii_digit() || c == ' ');
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        typed = Some(code.clone());
+                    }
+                });
+            }
             let armed = arm(ui, &mut form.cards, popup.id, now);
             ui.horizontal(|ui| {
                 if let Some(pointer) = refuse(ui, "Refuse") {
@@ -553,34 +646,49 @@ fn host_popup(
                         pointer,
                     });
                 }
-                if accept(ui, RichText::new("The codes match: pair").strong(), armed) {
-                    let label = label.trim();
+                // No accept button when the alarm fired: only the typed code
+                // pairs then.
+                if looks_like.is_none()
+                    && accept(ui, RichText::new("The codes match: pair").strong(), armed)
+                {
                     actions.push(Action::Pair {
                         id: popup.id,
                         decision: PairDecision::Accept {
-                            label: (!label.is_empty()).then(|| label.to_owned()),
+                            label: label.clone(),
                         },
                         pointer: true,
                     });
                 }
             });
+            if let Some(code) = typed.filter(|c| armed && whole_code(c)) {
+                actions.push(Action::PairCode {
+                    id: popup.id,
+                    code,
+                    label,
+                });
+            }
             ui.label(
                 RichText::new(format!("Refused automatically in {left} s"))
                     .small()
                     .color(t.text_muted),
             );
         }
-        PopupKind::Session { label, fingerprint } => {
-            ui.label(
-                RichText::new(format!("\"{label}\" wants to see this screen."))
-                    .strong()
-                    .size(16.0),
-            );
-            ui.label(
-                RichText::new(format!("device fingerprint {fingerprint}"))
-                    .small()
-                    .monospace(),
-            );
+        PopupKind::Session { label, .. } => {
+            let asks = RichText::new(format!("\"{label}\" wants to see this screen."))
+                .strong()
+                .size(16.0);
+            match seen.and_then(|s| s.identicon) {
+                // A paired device: its pinned label, the identicon beside it.
+                Some(identicon) => {
+                    ui.horizontal_top(|ui| {
+                        widgets::identicon(ui, &identicon.seed(), 36.0);
+                        ui.add(egui::Label::new(asks).wrap());
+                    });
+                }
+                None => {
+                    ui.label(asks);
+                }
+            }
             ui.add_space(4.0);
             ui.label(
                 "Allow control also lets it use this computer's keyboard and mouse. View \

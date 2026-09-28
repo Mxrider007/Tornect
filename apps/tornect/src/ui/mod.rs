@@ -26,6 +26,7 @@ mod model;
 mod nav;
 mod pages;
 mod preview;
+mod recognize;
 mod stream;
 mod theme;
 mod view;
@@ -238,6 +239,16 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
             }
         }
     });
+    // The device words of this home: this computer's, the saved keys', the
+    // alarm's (§B.6.1).
+    let words = Arc::new(recognize::Recognizer::new(
+        paths.clone(),
+        recognize::Me {
+            name: real.cfg.general.device_name.clone(),
+            onion: real.identity.id(),
+            device: tornect_core::DeviceId::from_bytes(real.device_pk),
+        },
+    ));
     runtime.spawn(backend::run(
         Backend {
             paths: paths.clone(),
@@ -247,6 +258,7 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
             link: Arc::clone(&link),
             source: opts.source,
             host: opts.host,
+            words,
             identity: Arc::new(real.identity),
             device: Arc::new(real.device),
             device_pk: real.device_pk,
