@@ -1,6 +1,6 @@
 //! OS session services for Tornect (`docs/PLAN.md` §B.8.8).
 //!
-//! Four modules so far:
+//! Five modules so far:
 //!
 //! - [`ipc`] — the owner-only local endpoint of §B.8.7.4 (Unix socket / Windows
 //!   named pipe) that the CLI talks to and the host serves.
@@ -13,6 +13,9 @@
 //! - [`levels`] — the availability probe of the session levels (§B.2.1): the
 //!   row of the table this computer is in (Windows: the location, the UAC
 //!   values and the token; Linux: one row).
+//! - [`polkit`] — Linux: revoke polkit's remembered approvals of this session
+//!   when a Control session starts and whenever the authority reports a
+//!   change during it (§B.2.1).
 //!
 //! Everything else in §B.8.8 — presence, lock state, keep-awake, wake hooks,
 //! global hotkeys, capture-excluded windows and the other readiness probes —
@@ -33,6 +36,7 @@
 pub mod autostart;
 pub mod ipc;
 pub mod levels;
+pub mod polkit;
 pub mod reauth;
 #[cfg(windows)]
 mod win;
