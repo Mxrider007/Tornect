@@ -138,9 +138,11 @@ pub fn is_invisible_or_control(c: char) -> bool {
         )
 }
 
-/// Make `wanted` unique among `existing` labels by suffixing the first nine
-/// characters of the device fingerprint (`" (abcd-ef01)"`), keeping the result
-/// within [`MAX_LABEL_CHARS`].
+/// Make `wanted` unique among `existing` labels by suffixing the smallest
+/// free number from 2 (`" (2)"`), keeping the result within
+/// [`MAX_LABEL_CHARS`]. A number, never a part of the key: a key-derived
+/// suffix would be a second short form beside the device words (§B.6.1
+/// item 6), and the device asking cannot choose the number.
 ///
 /// Two paired devices with the same declared name ("Laptop") would otherwise
 /// be indistinguishable in every later popup. Existing labels are compared
@@ -152,18 +154,24 @@ pub fn unique_label<'a>(
     wanted: &str,
     device: &DeviceId,
 ) -> String {
-    if !existing.into_iter().any(|l| sanitize_label(l) == wanted) {
+    let _ = device;
+    let taken: Vec<String> = existing.into_iter().map(sanitize_label).collect();
+    if !taken.iter().any(|t| t == wanted) {
         return wanted.to_owned();
     }
-    let fp = device.fingerprint();
-    let suffix = format!(" ({})", fp.get(..9).unwrap_or(&fp));
-    let keep = MAX_LABEL_CHARS.saturating_sub(suffix.chars().count());
-    let mut base: String = wanted.chars().take(keep).collect();
-    while base.ends_with(' ') {
-        base.pop();
-    }
-    base.push_str(&suffix);
-    base
+    (2u32..)
+        .map(|n| {
+            let suffix = format!(" ({n})");
+            let keep = MAX_LABEL_CHARS.saturating_sub(suffix.chars().count());
+            let mut base: String = wanted.chars().take(keep).collect();
+            while base.ends_with(' ') {
+                base.pop();
+            }
+            base.push_str(&suffix);
+            base
+        })
+        .find(|label| !taken.iter().any(|t| t == label))
+        .unwrap_or_else(|| unreachable!("more labels than numbers"))
 }
 
 /// One pinned client device.

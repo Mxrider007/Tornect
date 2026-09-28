@@ -45,6 +45,7 @@ use crate::id::TornectId;
 use crate::keystore::{create_private_dir, write_private_file};
 use crate::paths::Paths;
 use crate::trusted::{self, KnownHosts};
+use crate::words::{Identicon, Role, Stretched, Words};
 
 /// The schema version this build reads and writes.
 pub const VERSION: u32 = 1;
@@ -262,10 +263,9 @@ pub fn mixes_scripts(name: &str) -> bool {
 /// version put beside them ([`Kept`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Later {
-    /// The ID's pronounceable word form: lower-case words, one space or
-    /// hyphen between them.
+    /// The device-words cache of the computer's ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub words: Option<String>,
+    pub words: Option<WordsCache>,
     /// Keys this version does not know: kept, never read.
     #[serde(flatten)]
     pub kept: Kept,
@@ -310,17 +310,64 @@ impl Later {
 
     /// Whether the fields are what they must be.
     fn check(&self) -> std::result::Result<(), String> {
-        if let Some(words) = &self.words {
-            let shaped = words.len() <= MAX_WORDS_CHARS
-                && !words.is_empty()
-                && words
-                    .split([' ', '-'])
-                    .all(|w| !w.is_empty() && w.bytes().all(|c| c.is_ascii_lowercase()));
-            if !shaped {
-                return Err("later.words must be lower-case words".to_owned());
+        match &self.words {
+            Some(cache) if cache.read().is_none() => {
+                Err("later.words is not a device-words cache".to_owned())
             }
+            _ => Ok(()),
         }
-        Ok(())
+    }
+}
+
+/// The device-words cache of an address-book entry (§B.6.1 item 2, the
+/// privacy requirement R-W3): the words and identicon derived from `key` in
+/// `role`. A cache only: used while its role and key are the entry's own
+/// ([`Entry::cached_words`]), dropped by Forget with the entry, never
+/// exported, and never trusted to decide anything (any program of the user
+/// can edit this file). `Debug` shows none of it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WordsCache {
+    /// Whose key: `onion` (an address) or `device`.
+    pub role: String,
+    /// The key the words were derived from, in hexadecimal.
+    pub key: String,
+    /// The four words, one space apart.
+    pub words: String,
+    /// The identicon's three bytes, in hexadecimal.
+    pub identicon: String,
+}
+
+impl fmt::Debug for WordsCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WordsCache(<redacted>)")
+    }
+}
+
+impl WordsCache {
+    /// The cache of `stretched`, derived from `key` in `role`.
+    #[must_use]
+    pub fn of(key: &[u8; 32], role: Role, stretched: &Stretched) -> Self {
+        Self {
+            role: role.as_str().to_owned(),
+            key: hex::encode(key),
+            words: stretched.words().cached(),
+            identicon: hex::encode(stretched.identicon().seed()),
+        }
+    }
+
+    /// Its role, key, words and identicon, when each is well formed.
+    fn read(&self) -> Option<(Role, [u8; 32], Words, Identicon)> {
+        let role = Role::parse(&self.role)?;
+        let key: [u8; 32] = hex::decode(&self.key).ok()?.try_into().ok()?;
+        let words = Words::from_cached(&self.words)?;
+        let seed: [u8; 3] = hex::decode(&self.identicon).ok()?.try_into().ok()?;
+        (hex::encode(key) == self.key && hex::encode(seed) == self.identicon).then_some((
+            role,
+            key,
+            words,
+            Identicon::from_seed(seed),
+        ))
     }
 }
 
@@ -352,6 +399,14 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// The cached words and identicon of `key` in `role`: only when the
+    /// cache was made from exactly that key, in that role.
+    #[must_use]
+    pub fn cached_words(&self, key: &[u8; 32], role: Role) -> Option<(Words, Identicon)> {
+        let (r, k, words, identicon) = self.later.words.as_ref()?.read()?;
+        (r == role && k == *key).then_some((words, identicon))
+    }
+
     /// The saved name, if it applies to the computer as it is pinned now:
     /// the key it was given against equals `pinned` in full, or neither
     /// exists (saved before pairing, not paired yet).
@@ -683,6 +738,27 @@ impl Store {
         }
     }
 
+    /// Keep each computer's words in its entry's cache (`derived`: its ID's
+    /// key stretched in the role `onion`); a computer that has no entry gets
+    /// none. Writes only when a cache changed; whether it did.
+    pub fn cache_words(&self, derived: &[(TornectId, Stretched)]) -> Result<bool> {
+        let mut book = self.load()?;
+        let mut changed = false;
+        for (id, stretched) in derived {
+            if let Some(entry) = book.hosts.get_mut(id) {
+                let cache = WordsCache::of(id.public_key_bytes(), Role::Onion, stretched);
+                if entry.later.words.as_ref() != Some(&cache) {
+                    entry.later.words = Some(cache);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            book.save(&self.book)?;
+        }
+        Ok(changed)
+    }
+
     /// Remove the computer `id` from the address book, and its lines from
     /// the recent list; whether it was in the address book.
     pub fn forget(&self, id: &TornectId) -> Result<bool> {
@@ -798,6 +874,17 @@ mod tests {
         }
     }
 
+    /// A words cache as `Store::cache_words` writes it, for the ID
+    /// `id(seed)`, with invented words.
+    fn cache(seed: u8) -> WordsCache {
+        WordsCache {
+            role: "onion".to_owned(),
+            key: hex::encode(id(seed).public_key_bytes()),
+            words: "arctic crisp lamp orbit".to_owned(),
+            identicon: "0a0b0c".to_owned(),
+        }
+    }
+
     fn sample() -> AddressBook {
         let mut book = AddressBook::default();
         book.hosts.insert(
@@ -809,7 +896,7 @@ mod tests {
                 first_seen: Some(day("2026-09-12")),
                 last_seen: Some(day("2026-09-27")),
                 later: Later {
-                    words: Some("amber-canyon-fox".to_owned()),
+                    words: Some(cache(1)),
                     ..Later::default()
                 },
             },
@@ -896,7 +983,7 @@ mod tests {
     #[test]
     fn the_later_table_writes_only_its_own_keys() {
         let full = Later {
-            words: Some("amber-canyon-fox".to_owned()),
+            words: Some(cache(1)),
             ..Later::default()
         };
         let table: toml::Table = toml::from_str(&toml::to_string(&full).unwrap()).unwrap();
@@ -945,6 +1032,113 @@ mod tests {
         assert_eq!(later["remembered"].as_bool(), Some(true));
         assert_eq!(later["password"].as_str(), Some("hunter2"));
         assert_eq!(later["display"]["order"].as_integer(), Some(3));
+    }
+
+    /// R-W3: the words cache is used only for the key and role it was made
+    /// from, is dropped by Forget with the entry, and a cache that is not
+    /// one (not four words of the list, a key that is not 32 bytes, an
+    /// unknown role) makes the file refused like any other damage.
+    #[test]
+    fn the_words_cache_is_bound_to_its_key_and_role() {
+        use crate::words::derive;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        let store = Store::new(&paths);
+        store.name(id(1), None, "Office PC").unwrap();
+        let stretched = derive(id(1).public_key_bytes(), Role::Onion);
+        assert!(
+            store
+                .cache_words(&[(id(1), stretched), (id(2), stretched)])
+                .unwrap()
+        );
+        assert!(
+            !store.cache_words(&[(id(1), stretched)]).unwrap(),
+            "unchanged"
+        );
+        let book = store.load().unwrap();
+        assert!(!book.hosts.contains_key(&id(2)), "no entry, no cache");
+        let entry = &book.hosts[&id(1)];
+        let first = id(1);
+        let key = first.public_key_bytes();
+        assert_eq!(
+            entry.cached_words(key, Role::Onion),
+            Some((stretched.words(), stretched.identicon()))
+        );
+        assert_eq!(entry.cached_words(key, Role::Device), None, "another role");
+        assert_eq!(
+            entry.cached_words(&[9; 32], Role::Onion),
+            None,
+            "another key"
+        );
+        assert!(!format!("{entry:?}").contains(stretched.words().get()[0]));
+
+        // Forget drops it with the entry.
+        assert!(store.forget(&id(1)).unwrap());
+        let text = std::fs::read_to_string(store.book_path()).unwrap();
+        assert!(!text.contains(&stretched.words().cached()), "{text}");
+
+        // A cache that is not one is damage.
+        let onion = id(1).onion_address();
+        let good = hex::encode(key);
+        for (role, k, words, identicon) in [
+            ("host", good.as_str(), "arctic crisp lamp orbit", "0a0b0c"),
+            ("onion", "abcd", "arctic crisp lamp orbit", "0a0b0c"),
+            ("onion", good.as_str(), "arctic crisp lamp", "0a0b0c"),
+            (
+                "onion",
+                good.as_str(),
+                "arctic crisp lamp notaword",
+                "0a0b0c",
+            ),
+            ("onion", good.as_str(), "arctic crisp lamp orbit", "0a0b"),
+        ] {
+            std::fs::write(
+                store.book_path(),
+                format!(
+                    "version = 1\n[hosts.\"{onion}\".later.words]\nrole = \"{role}\"\n\
+                     key = \"{k}\"\nwords = \"{words}\"\nidenticon = \"{identicon}\"\n"
+                ),
+            )
+            .unwrap();
+            assert!(store.load().is_err(), "{role} {k} {words} {identicon}");
+        }
+    }
+
+    /// W-B1: the stores are looked up by the full key and nothing else. A
+    /// saved name follows the 32 bytes of the pinned key: a key one byte
+    /// off gets none, whatever words or identicon a planted cache gives it,
+    /// and the only lookups take a whole ID or key.
+    #[test]
+    fn names_follow_the_full_key_never_the_words() {
+        use crate::id::DeviceId;
+        use crate::trusted::{KnownHost, TrustedDevice, TrustedDevices};
+
+        // The lookups there are, by their types: whole IDs and keys only.
+        let _: for<'a, 'b> fn(&'a KnownHosts, &'b TornectId) -> Option<&'a KnownHost> =
+            KnownHosts::get;
+        let _: for<'a, 'b> fn(&'a TrustedDevices, &'b DeviceId) -> Option<&'a TrustedDevice> =
+            TrustedDevices::get;
+        let _: for<'a, 'b> fn(&'a Entry, Option<&'b [u8; 32]>) -> Option<&'a str> = Entry::name_for;
+        let _: fn(&AddressBook) -> Vec<(&TornectId, &Entry)> = AddressBook::by_last_seen;
+
+        let pinned = [3u8; 32];
+        let mut near = pinned;
+        near[31] ^= 1;
+        let mut entry = Entry {
+            key: Some(pinned),
+            name: Some("Office PC".to_owned()),
+            ..Entry::default()
+        };
+        // The cache planted with the words of the key one byte off.
+        entry.later.words = Some(WordsCache::of(
+            &near,
+            Role::Device,
+            &crate::words::derive(&near, Role::Device),
+        ));
+        assert_eq!(entry.name_for(Some(&pinned)), Some("Office PC"));
+        assert_eq!(entry.name_for(Some(&near)), None);
+        assert_eq!(entry.name_for(None), None);
     }
 
     /// Names lose control, bidi and other invisible characters, collapse
