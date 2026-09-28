@@ -426,3 +426,28 @@ The gate is green at **649 passed, 0 failed, 5 ignored** at `0d4b884` (2026-09-2
 x86_64-pc-windows-gnullvm --workspace --all-targets -- -D warnings` is clean there. The closure check's round 2 read
 `0189554..a30d02a`: no BLOCK, nothing above Low open (`/home/<login>/kore_project_V3/agents/security/reports/2026-09-24_tornect_slice_g_closure.md`,
 section "Round 2"); `0d4b884` came after it and was verified closed in round 3.
+
+## The UI foundation (M-UI-1 of the redesign; 2026-09-27)
+
+The window's design tokens, fonts, icons, widgets, sidebar and pages (`apps/tornect/src/ui/{theme,icons,widgets,nav}.rs`,
+`ui/pages/`), the neutral device-name default, and the embedded fonts' licences. Screenshots of every page in both
+themes: `target/tornect-test/ui-m1/<page>-<theme>.png` (preview under a private Xvfb, no network).
+
+| Check | Status | Evidence |
+|---|---|---|
+| Every text colour reaches WCAG AA on every surface it is drawn on, in both themes; white on the sharing red ≥ 4.5:1 | VERIFIED (unit, computed) | `ui::theme::tests::{every_text_pair_reaches_wcag_aa, contrast_matches_the_wcag_reference_points}`: primary, secondary, muted, accent, ok, warn, danger and info text on bg.app, bg.sidebar, card, raised and overlay, the selected page and the chips' tints, white on the accent and the sharing red (#D42A40, 4.99:1). It found the design's dark muted #7F8B9B at 4.19:1 on the overlay; the token is #8793A3 (4.65:1) |
+| The fonts install into every window's context and a context's first pass never names a family it lacks | VERIFIED (unit) | `ui::theme::tests::{the_fonts_install_on_the_second_pass_and_fall_back_before, both_themes_map_their_tokens}`; `ui::icons::tests::every_icon_is_in_the_font` (every code point of the glyph table is in `lucide.ttf`) |
+| The existing trust-surface tests pass unchanged with the new layout (Deny first, pointer-only accepts, the 1 s arming, the re-arm, the banner's Stop in the window, the E1-5 hosting line, the late yes) | VERIFIED (unit) | the `ui::view`, `ui::app`, `ui::consent`, `ui::indicator` and `ui::stream` tests, their source unchanged; at 560 × 720 the sidebar is the 64-point rail and is drawn after the page |
+| At full width too, a session question's Deny is the first key stop on every page | VERIFIED (unit) | `ui::pages::tests::at_full_width_deny_is_still_the_first_key_stop` (1200 × 760, all five pages) |
+| Every page draws in both themes at 1200 × 760 and 560 × 720; the sidebar lists the four pages, as a rail below 1000 points | VERIFIED (unit, no GPU) | `ui::pages::tests::{every_page_draws_in_both_themes_at_both_widths, a_click_in_the_sidebar_opens_the_page}` |
+| A page whose content comes later offers no control that does nothing | VERIFIED (unit) | `ui::pages::tests::a_later_page_offers_no_control`: on Address book, Sessions and Settings the only things to press or type into are the sidebar's pages |
+| Home copies the ID and connects with its Connect button, not before Tor is ready | VERIFIED (unit) | `ui::pages::tests::home_copies_the_id_and_connects`; Enter in the connect field connects too, untested |
+| The widgets: toggle, segmented control, disabled button, countdown ring, identicon | VERIFIED (unit) | `ui::widgets::tests::{toggles_segments_and_buttons_answer_clicks, the_ring_draws_the_share_left, the_identicon_is_mirrored_and_deterministic}` |
+| The device name defaults to "Linux PC" / "Windows PC", never the host name; a stored name is kept | VERIFIED (unit) | `config::tests::the_default_device_name_is_neutral_and_a_stored_name_is_kept`; `default_device_name` reads no variable and no file |
+| Each release zip's `THIRD_PARTY_LICENSES.txt` carries the fonts' and Lucide's licences | VERIFIED (unit) | `licences::tests::every_crate_in_both_build_graphs_maps_to_a_licence_text` (part 1 = `BUNDLED` + `EMBEDDED`, each licence file present); sources and SHA-256 in `packaging/licenses/SOURCES.md` |
+| The redesigned window draws on X11 in both themes (preview, no network) | VERIFIED 2026-09-27 under Xvfb | `tornect gui --preview --page <home, address-book, sessions, settings, widgets> --theme <dark, light>` and `--preview --theme <dark, light>` (every question and the banner) on llvmpipe (Vulkan); 12 screenshots |
+| The redesigned window on a Windows or Wayland desktop, at 125 %–200 % scale | NEEDS-DEVICE(windows), NEEDS-DEVICE(linux console) | not looked at: the preview ran on Xvfb at scale 1 only |
+| The Windows target type-checks with the new window | VERIFIED (check only) 2026-09-27 | `cargo clippy --target x86_64-pc-windows-gnullvm --workspace --all-targets -- -D warnings` with llvm-mingw 20260908 on `PATH`: rc 0, no warning, at `2b11950` |
+
+The gate (`cargo xtask verify`) is green at **663 passed, 0 failed, 5 ignored** at `2b11950` (2026-09-27), each of
+`572a3f8`, `bd0c6c7` and `6560ee5` gate-green on its own tree before it was committed (649, 650 and 658 passed).
