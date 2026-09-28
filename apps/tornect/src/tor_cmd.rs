@@ -6,7 +6,7 @@
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
@@ -31,7 +31,7 @@ use tornect_signal::fsm::client::{
     self, ClientConfig, ClientDeps, ClientOutcome, ClientSession, Intent, NoServerKeyPin,
     SessionEvent,
 };
-use tornect_signal::fsm::{HandshakeError, OsRandom};
+use tornect_signal::fsm::{HandshakeError, OsRandom, Randomness as _};
 use tornect_signal::messages::{bye, pair_reject, reject};
 use tornect_signal::pairing::KnownHostStore;
 use tornect_signal::ping::NONCE_LEN;
@@ -463,7 +463,7 @@ async fn run_ping(paths: &Paths, cfg: &Config, id: TornectId, count: u32) -> any
 
     let mut rtts_ms = Vec::with_capacity(count as usize);
     for i in 1..=count {
-        let rtt = tokio::time::timeout(PING_TIMEOUT, ping::ping(&mut stream, nonce(i)))
+        let rtt = tokio::time::timeout(PING_TIMEOUT, ping::ping(&mut stream, nonce()?))
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
@@ -1069,14 +1069,16 @@ where
     })
 }
 
-/// Nonces only need to be unique per stream; wall-clock nanoseconds mixed with
-/// the sequence number are plenty.
-pub(crate) fn nonce(seq: u32) -> [u8; NONCE_LEN] {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    ((nanos as u64) ^ (u64::from(seq) << 48)).to_be_bytes()
+/// A ping's nonce: random bytes from the OS. It only needs to be unique per
+/// stream, and it must say nothing about this computer: the wall clock it
+/// was made from before told the pinged host this computer's time (the
+/// privacy finding P-L1).
+pub(crate) fn nonce() -> anyhow::Result<[u8; NONCE_LEN]> {
+    let mut nonce = [0u8; NONCE_LEN];
+    OsRandom
+        .fill(&mut nonce)
+        .map_err(|e| anyhow::anyhow!("no random nonce for the ping: {e}"))?;
+    Ok(nonce)
 }
 
 fn spawn_status_reporter(mut rx: watch::Receiver<OnionStatus>) -> JoinHandle<()> {
