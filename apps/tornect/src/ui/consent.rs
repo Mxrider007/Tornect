@@ -26,8 +26,8 @@ use tornect_signal::pairing::{
     TrustedPeer,
 };
 
-use super::model::{ClientStage, Confirm, Popup, PopupKind, Shared, Wake};
-use super::recognize::Recognizer;
+use super::model::{ClientStage, Confirm, Popup, PopupKind, Recognition, Shared, Wake};
+use super::recognize::{GoneOnDrop, Recognizer};
 
 /// How long the client's user has to say whether the codes matched for the
 /// session to follow: the host gives the client 60 s after `PAIR_ACCEPT` to
@@ -282,27 +282,32 @@ impl Consent for GuiConsent {
             // The device words and the alarm, before the sheet is shown: the
             // FSM's limiter admitted this request; the derivation runs off
             // the network task, paced for a key nobody saved (W-B5).
+            // Set when this answer is dropped — withdrawn, timed out by the
+            // FSM, or the stream gone — so a derivation still queued on the
+            // pacer never runs for a sheet nobody will see (F-3).
+            let gone = GoneOnDrop::default();
             let seen = match &self.words {
                 None => None,
                 Some(words) => {
                     let words = Arc::clone(words);
                     let (device, name) = (peer.device, peer.name.clone());
                     let pinned = peer.pinned_label.is_some();
+                    let flag = gone.flag();
                     let derived = tokio::task::spawn_blocking(move || {
-                        words.pairing_sheet(&device, &name, pinned)
+                        words.pairing_sheet_unless(&flag, &device, &name, pinned)
                     });
                     tokio::select! {
                         biased;
                         () = &mut withdrawn => return PairDecision::Reject,
                         derived = derived => match derived {
-                            Ok(seen) => Some(seen),
+                            Ok(Some(seen)) => Some(seen),
                             // No words, no alarm verdict: refuse.
-                            Err(_) => return PairDecision::Reject,
+                            Ok(None) | Err(_) => return PairDecision::Reject,
                         },
                     }
                 }
             };
-            let typed_only = seen.as_ref().is_some_and(|s| s.looks_like.is_some());
+            let typed_only = seen.as_ref().is_some_and(Recognition::typed_only);
             let (tx, rx) = oneshot::channel();
             let kind = PopupKind::Pairing {
                 name: peer.name.clone(),

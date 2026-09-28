@@ -20,7 +20,7 @@ use tornect_signal::pairing::{
 };
 
 use crate::ui::model::Recognition;
-use crate::ui::recognize::Recognizer;
+use crate::ui::recognize::{GoneOnDrop, Recognizer};
 
 /// How long the client waits for its user to confirm a code. The host gives the
 /// client 60 s after `PAIR_ACCEPT` to send its `SESSION_REQUEST`, and the answer
@@ -151,18 +151,22 @@ impl Consent for CliConsent {
                     let words = Arc::clone(words);
                     let (device, name) = (peer.device, peer.name.clone());
                     let pinned = peer.pinned_label.is_some();
+                    // The FSM's popup timeout drops this future; a derivation
+                    // still queued then never runs (F-3).
+                    let gone = GoneOnDrop::default();
+                    let flag = gone.flag();
                     match tokio::task::spawn_blocking(move || {
-                        words.pairing_sheet(&device, &name, pinned)
+                        words.pairing_sheet_unless(&flag, &device, &name, pinned)
                     })
                     .await
                     {
-                        Ok(seen) => Some(seen),
+                        Ok(Some(seen)) => Some(seen),
                         // No words, no alarm verdict: refuse.
-                        Err(_) => return PairDecision::Reject,
+                        Ok(None) | Err(_) => return PairDecision::Reject,
                     }
                 }
             };
-            let typed = seen.as_ref().is_some_and(|s| s.looks_like.is_some());
+            let typed = seen.as_ref().is_some_and(Recognition::typed_only);
             match self
                 .prompter
                 .ask(&pairing_question(peer, sas, seen.as_ref()))
@@ -212,13 +216,20 @@ fn pairing_question(peer: &PairingPeer, sas: &str, seen: Option<&Recognition>) -
         Some(_) => String::new(),
         None => format!("  device fingerprint: {}\n", peer.fingerprint),
     };
+    let typed = "Type the 6-digit code the other device shows (`<code>`, or `<code> <name>` to \
+                 choose its label); this computer checks it against its own; anything else refuses (60 s):";
     match seen.and_then(|s| s.looks_like.as_deref()) {
         // The alarm: this computer's own code stays hidden; it is typed from
         // the other device's screen and compared here (W-B3).
         Some(like) => format!(
             "\nPAIRING REQUEST: {who}\n  LOOKS LIKE YOUR SAVED DEVICE \"{like}\", BUT IT IS A DIFFERENT \
-             DEVICE\n{short}Type the 6-digit code the other device shows (`<code>`, or `<code> <name>` to \
-             choose its label); this computer checks it against its own; anything else refuses (60 s):"
+             DEVICE\n{short}{typed}"
+        ),
+        // It could not be compared with every saved device (F-4): the same
+        // typed code, never the click accept.
+        None if seen.is_some_and(|s| s.unchecked) => format!(
+            "\nPAIRING REQUEST: {who}\n  COULD NOT COMPARE IT WITH YOUR SAVED DEVICES: A FILE OF SAVED \
+             ENTRIES COULD NOT BE READ\n{short}{typed}"
         ),
         None => format!(
             "\nPAIRING REQUEST: {who}\n{short}  code: {sas}   <- must match the code on that device\n\
@@ -438,6 +449,7 @@ mod tests {
             words: Words::from_cached("absurd citizen dinner harvest").unwrap(),
             identicon: None,
             looks_like: None,
+            unchecked: false,
         };
         let asked = pairing_question(&peer, "123 456", Some(&calm));
         assert!(
