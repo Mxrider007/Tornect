@@ -629,7 +629,7 @@ fn host_popup(
                     ui.label("Their code:");
                     let field = ui.add(
                         egui::TextEdit::singleline(code)
-                            .hint_text("6 digits, then Enter")
+                            .hint_text(RichText::new("6 digits, then Enter").monospace())
                             .char_limit(7)
                             .desired_width(150.0)
                             .font(egui::TextStyle::Monospace),
@@ -663,7 +663,10 @@ fn host_popup(
                     });
                 }
             });
-            if let Some(code) = typed.filter(|c| armed && whole_code(c)) {
+            // Six digits read off the other screen are a deliberate answer on
+            // their own: no arming second (the field's own height may change
+            // with its first digit), and nothing else pairs this sheet.
+            if let Some(code) = typed.filter(|c| whole_code(c)) {
                 actions.push(Action::PairCode {
                     id: popup.id,
                     code,
