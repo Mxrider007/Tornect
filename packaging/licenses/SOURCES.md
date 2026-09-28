@@ -52,3 +52,16 @@ puts each licence file's text into `THIRD_PARTY_LICENSES.txt` (part 1, `EMBEDDED
 The glyph table in `apps/tornect/src/ui/icons.rs` takes each icon's code point from `lucide-font/codepoints.json`
 of the same zip (SHA-256 `65faa5131cc840e8f400e7262462cff817c4741552a5c707e8a692885adc66ce`), which is not
 committed.
+
+## The word list of the device words
+
+`crates/tornect-core` embeds this file whole with `include_str!` (`src/words.rs`, `docs/PLAN.md` §B.6.1): an
+unchanged copy of the upstream file, fetched anonymously on 2026-09-28. The same SHA-256 is pinned in
+`words::WORDLIST_SHA256` and checked by `words::tests::the_list_is_bip39_english`.
+
+| File | What | Downloaded from | SHA-256 |
+|---|---|---|---|
+| `crates/tornect-core/data/bip39-english.txt` | The BIP 39 English word list (2048 words, one per line) | `https://raw.githubusercontent.com/bitcoin/bips/ce1862ac6bcffa1dd20aad858380e51e66e949ea/bip-0039/english.txt`: commit `ce1862ac6bcffa1dd20aad858380e51e66e949ea` of `bitcoin/bips` ("Added bip39 english wordlist", 2014-02-07), the only commit that touches `bip-0039/english.txt` (GitHub API, 2026-09-28); the file on `master` has the same bytes | `2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda` |
+
+The list's licence terms were not looked up (only the list itself was fetched), so it is not in `xtask`'s
+`EMBEDDED` and `THIRD_PARTY_LICENSES.txt` carries no text for it: open before the release.
