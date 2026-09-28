@@ -497,6 +497,7 @@ impl App {
     fn act(&mut self, action: Action, id: Option<&str>) {
         match action {
             Action::Connect(id) => self.command(Command::Connect(id)),
+            Action::ConnectAnyway(id) => self.command(Command::ConnectAnyway(id)),
             Action::StopSharing => self.command(Command::StopSharing),
             Action::MoveIndicator => {
                 if let Some(surface) = &self.indicator

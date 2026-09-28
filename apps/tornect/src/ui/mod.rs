@@ -25,7 +25,7 @@ mod keys;
 mod model;
 mod nav;
 mod pages;
-mod preview;
+pub(crate) mod preview;
 mod recognize;
 mod stream;
 mod theme;
@@ -99,6 +99,8 @@ pub struct GuiOpts {
     pub page: Option<Page>,
     /// With `preview`: an empty address book (a first run).
     pub empty: bool,
+    /// With `preview` and `page`: one host sheet of this kind on screen.
+    pub sheet: Option<preview::Sheet>,
     /// The theme the windows draw with.
     pub theme: egui::Theme,
 }
@@ -124,10 +126,11 @@ struct Real {
 /// so that nothing of this machine can reach its pictures.
 fn start(paths: &Paths, opts: &GuiOpts) -> anyhow::Result<Start> {
     if opts.preview {
-        return Ok(Start {
-            model: preview::model(opts.page.is_none(), opts.empty),
-            real: None,
-        });
+        let mut model = preview::model(opts.page.is_none(), opts.empty);
+        if let Some(sheet) = opts.sheet {
+            preview::sheet(&mut model, sheet);
+        }
+        return Ok(Start { model, real: None });
     }
     paths.ensure().context("creating Tornect directories")?;
     let store = FileSecretStore::open(paths.keys_dir()).context("opening keystore")?;
@@ -155,7 +158,7 @@ fn start(paths: &Paths, opts: &GuiOpts) -> anyhow::Result<Start> {
     let model = Model {
         id: Some(identity.id().display_groups()),
         device_name: cfg.general.device_name.clone(),
-        book: book::read(paths, tornect_core::address_book::Day::today()),
+        book: book::read(paths, tornect_core::address_book::Day::today(), None),
         hosting: if opts.host {
             Hosting::Waiting
         } else {

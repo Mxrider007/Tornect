@@ -54,8 +54,12 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 /// What the window asks the tokio side to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// View the host with this ID.
+    /// View the host with this ID (an ID not in the address book is checked
+    /// against the saved ones first, §B.6.1 item 4).
     Connect(TornectId),
+    /// View it although it looks like a saved one: only after the warning
+    /// for this very ID.
+    ConnectAnyway(TornectId),
     /// End the session being viewed.
     EndViewing,
     /// End the session this screen is shared with (a host-wide kill).
@@ -434,6 +438,24 @@ fn grant(_: std::path::PathBuf) -> Result<(bool, bool), String> {
 /// Run until [`Command::Quit`], then shut down and mark the model closed.
 pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
     let b = Arc::new(b);
+    // This computer's words and the saved keys' (derived once, off this
+    // task), then the address book again with its words.
+    {
+        let b = Arc::clone(&b);
+        tokio::spawn(async move {
+            let words = Arc::clone(&b.words);
+            if let Ok(mine) = tokio::task::spawn_blocking(move || {
+                let mine = words.mine();
+                words.warm();
+                mine
+            })
+            .await
+            {
+                b.shared.update(|m| m.mine = mine);
+                refresh_book(&b, None);
+            }
+        });
+    }
     let hosted = if b.host {
         match host_role(&b).await {
             Ok(hosted) => Some(hosted),
@@ -559,7 +581,7 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                 let Some(command) = command else { break };
                 match command {
                     Command::Quit => break,
-                    Command::Connect(id) => {
+                    Command::Connect(id) | Command::ConnectAnyway(id) => {
                         let Some(node) = node.clone() else {
                             b.shared.update(|m| m.client = ClientStage::Ended("Tor is not connected yet.".to_owned()));
                             continue;
@@ -567,8 +589,12 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                         if viewing.as_ref().is_some_and(|(_, task)| !task.is_finished()) {
                             continue;
                         }
+                        // The second click counts only for the ID warned about.
+                        let anyway = matches!(command, Command::ConnectAnyway(_))
+                            && b.shared.read(|m| m.connect_warning.as_ref().is_some_and(|w| w.id == id));
+                        b.shared.update(|m| m.connect_warning = None);
                         let (stop_tx, stop) = watch::channel(false);
-                        let task = tokio::spawn(view_session(Arc::clone(&b), node, id, stop));
+                        let task = tokio::spawn(view_session(Arc::clone(&b), node, id, stop, anyway));
                         viewing = Some((stop_tx, task));
                     }
                     Command::EndViewing => {
@@ -689,7 +715,11 @@ fn change_book(b: &Backend, change: &Change) {
 
 /// Read the address book's files into the model again, keeping the checks.
 fn refresh_book(b: &Backend, note: Option<String>) {
-    let mut fresh = book::read(&b.paths, tornect_core::address_book::Day::today());
+    let mut fresh = book::read(
+        &b.paths,
+        tornect_core::address_book::Day::today(),
+        Some(b.words.known()),
+    );
     b.shared.update(|m| {
         fresh.checks = std::mem::take(&mut m.book.checks);
         fresh
@@ -779,7 +809,22 @@ async fn view_session(
     node: Arc<TorNode>,
     id: TornectId,
     stop: watch::Receiver<bool>,
+    anyway: bool,
 ) {
+    // The connect field's look-alike check (§B.6.1 item 4): an ID that is not
+    // in the address book is compared with the saved ones before anything is
+    // dialled; one that looks like one waits for a second click.
+    if !anyway && !b.shared.read(|m| m.book.computer(&id).is_some()) {
+        let words = Arc::clone(&b.words);
+        let looks = tokio::task::spawn_blocking(move || words.connect_check(&id)).await;
+        if let Ok(Some(name)) = looks {
+            b.shared.update(|m| {
+                m.connect_warning = Some(super::model::ConnectWarning { id, name });
+                m.client = ClientStage::Idle;
+            });
+            return;
+        }
+    }
     let ended = viewed(&b, &node, id, &stop).await;
     b.link.set_input(None);
     let message = match ended {
