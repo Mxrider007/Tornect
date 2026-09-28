@@ -229,9 +229,9 @@ pub struct HostWiring {
     pub live: Arc<LiveSessions>,
     /// `sessions.log` as the FSM writes it (flushed at shutdown).
     pub audit: Arc<HostAudit>,
-    /// The paired devices the FSM works on, in memory: settle them after a
-    /// stream (the session sinks settle at a session's start), so that
-    /// pairings are written and last-seen times only while history is kept.
+    /// The paired devices the FSM works on: each pairing, unpairing and
+    /// reject count is written as it happens, last-seen times only while
+    /// history is kept.
     pub pins: Arc<crate::history::DevicePins>,
 }
 
@@ -276,14 +276,11 @@ pub fn wire(
     let mut deps = HostDeps::headless(identity, trusted);
     deps.consent = consent;
     deps.audit = audit.clone();
-    deps.sessions = Arc::new(crate::history::Settling::new(
-        CliSessions {
-            live: Arc::clone(&live),
-            media,
-            control,
-        },
-        Arc::clone(&pins),
-    ));
+    deps.sessions = Arc::new(CliSessions {
+        live: Arc::clone(&live),
+        media,
+        control,
+    });
     deps.activity = live.clone();
     deps.kill = kill.clone();
 

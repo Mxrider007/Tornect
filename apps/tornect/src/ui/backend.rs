@@ -316,15 +316,12 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
             live: Arc::new(move || activity.session_live()),
         },
     ));
-    deps.sessions = Arc::new(crate::history::Settling::new(
-        GuiSessions {
-            live: Arc::clone(&live),
-            media: Arc::clone(&media),
-            shared: Arc::clone(&b.shared),
-            started: started_tx,
-        },
-        Arc::clone(&pins),
-    ));
+    deps.sessions = Arc::new(GuiSessions {
+        live: Arc::clone(&live),
+        media: Arc::clone(&media),
+        shared: Arc::clone(&b.shared),
+        started: started_tx,
+    });
     let kill_watch = media.watch_kill(deps.kill.clone());
     let ipc = crate::host::start_control_channel(&b.paths, ctx, deps.kill.clone(), control)
         .await
@@ -532,14 +529,8 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                     let _slot = slot;
                     let (cfg, deps) = &*serving;
                     crate::host::serve_signaling(stream, cfg, deps, |_| {}).await;
-                    match pins.settle() {
-                        Ok(true) => refresh_book(&b, None),
-                        Ok(false) => {}
-                        Err(e) => {
-                            let line = format!("the paired devices could not be saved: {e:#}");
-                            tracing::warn!("{line}");
-                            b.shared.update(|m| m.note(line));
-                        }
+                    if pins.changed() {
+                        refresh_book(&b, None);
                     }
                 });
             }

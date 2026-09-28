@@ -515,13 +515,33 @@ impl Drop for InFlight {
     }
 }
 
-/// Persisted [`TrustedDevices`] behind a lock: every mutation is written
-/// through to `trusted-devices.toml` before it takes effect for other streams
-/// (an [`ephemeral`](Self::ephemeral) store keeps everything in memory).
-#[derive(Debug)]
+/// Whether last-seen times are kept right now: the address book's history
+/// switch, read at each use.
+pub type KeepHistory = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Persisted [`TrustedDevices`] behind a lock: every trust change (a pin, an
+/// unpairing, a reject count) is written through to `trusted-devices.toml`
+/// before it takes effect for other streams (an
+/// [`ephemeral`](Self::ephemeral) store keeps everything in memory).
+///
+/// A [`shared`](Self::shared) store (the host's handshakes) merges each
+/// change into the file as it is at that moment, so a device unpaired by
+/// another process stays unpaired, and writes a device's last-seen time only
+/// while its history switch says so (`docs/PLAN.md` §B.8.9.1: history off
+/// means no `last_seen` updates); trust changes are written either way.
 pub struct TrustedDeviceStore {
     path: Option<PathBuf>,
     inner: Mutex<TrustedDevices>,
+    history: Option<KeepHistory>,
+}
+
+impl std::fmt::Debug for TrustedDeviceStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrustedDeviceStore")
+            .field("path", &self.path)
+            .field("shared", &self.history.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl TrustedDeviceStore {
@@ -531,6 +551,19 @@ impl TrustedDeviceStore {
         Ok(Self {
             path: Some(path),
             inner: Mutex::new(inner),
+            history: None,
+        })
+    }
+
+    /// Load (or start empty) from `path`, sharing the file with the rest of
+    /// the app: each trust change is merged into the file as it is then, and
+    /// a last-seen time is written only while `keep` says history is kept.
+    pub fn shared(path: PathBuf, keep: KeepHistory) -> tornect_core::Result<Self> {
+        let inner = TrustedDevices::load(&path)?;
+        Ok(Self {
+            path: Some(path),
+            inner: Mutex::new(inner),
+            history: Some(keep),
         })
     }
 
@@ -541,6 +574,7 @@ impl TrustedDeviceStore {
         Self {
             path: Some(path),
             inner: Mutex::new(devices),
+            history: None,
         }
     }
 
@@ -551,6 +585,7 @@ impl TrustedDeviceStore {
         Self {
             path: None,
             inner: Mutex::new(devices),
+            history: None,
         }
     }
 
@@ -560,10 +595,27 @@ impl TrustedDeviceStore {
         self.path.as_deref()
     }
 
-    fn persist(&self, devices: &TrustedDevices) -> tornect_core::Result<()> {
-        match &self.path {
-            Some(path) => devices.save(path),
-            None => Ok(()),
+    /// Whether last-seen times are written: always for a store that is not
+    /// shared, else as its history switch says now.
+    fn keeps_history(&self) -> bool {
+        self.history.as_ref().is_none_or(|keep| keep())
+    }
+
+    /// Write a change through: the whole copy `devices` (a store that is not
+    /// shared), or `change` made to the file as it is now (a shared one).
+    fn persist(
+        &self,
+        devices: &TrustedDevices,
+        change: impl FnOnce(&mut TrustedDevices),
+    ) -> tornect_core::Result<()> {
+        match (&self.path, &self.history) {
+            (None, _) => Ok(()),
+            (Some(path), None) => devices.save(path),
+            (Some(path), Some(_)) => {
+                let mut file = TrustedDevices::load(path)?;
+                change(&mut file);
+                file.save(path)
+            }
         }
     }
 
@@ -583,8 +635,21 @@ impl TrustedDeviceStore {
     /// device keeps its label).
     pub fn pin(&self, device: DeviceId, label: &str) -> tornect_core::Result<String> {
         let mut t = lock(&self.inner);
-        let pinned = t.pin(device, label, trusted::unix_now()).label.clone();
-        self.persist(&t)?;
+        let now = trusted::unix_now();
+        let pinned = t.pin(device, label, now).label.clone();
+        let keep = self.keeps_history();
+        self.persist(&t, |file| {
+            if file.is_trusted(&device) {
+                // A re-pair: the pin stays as it is; only its reject history
+                // goes, and its last-seen time moves only with history on.
+                file.bans.retain(|b| b.device != device);
+                if keep {
+                    file.touch(&device, now);
+                }
+            } else {
+                file.pin(device, &pinned, now);
+            }
+        })?;
         Ok(pinned)
     }
 
@@ -592,10 +657,16 @@ impl TrustedDeviceStore {
     /// effort; a write failure is logged, not fatal — nothing
     /// security-relevant changed). Never called for a bare `HELLO`, which is
     /// replayable (§B.8.4.5).
+    ///
+    /// A shared store keeps the time in memory only while history is off.
     pub fn touch(&self, device: &DeviceId) {
         let mut t = lock(&self.inner);
-        t.touch(device, trusted::unix_now());
-        if let Err(e) = self.persist(&t) {
+        let now = trusted::unix_now();
+        t.touch(device, now);
+        if !self.keeps_history() {
+            return;
+        }
+        if let Err(e) = self.persist(&t, |file| file.touch(device, now)) {
             tracing::warn!(error = %e, "could not persist trusted-devices last_seen");
         }
     }
@@ -605,7 +676,9 @@ impl TrustedDeviceStore {
         let mut t = lock(&self.inner);
         let removed = t.remove(device);
         if removed {
-            self.persist(&t)?;
+            self.persist(&t, |file| {
+                file.remove(device);
+            })?;
         }
         Ok(removed)
     }
@@ -623,8 +696,11 @@ impl TrustedDeviceStore {
         policy: &BanPolicy,
     ) -> tornect_core::Result<Option<u64>> {
         let mut t = lock(&self.inner);
-        let until = t.record_reject(device, trusted::unix_now(), policy);
-        self.persist(&t)?;
+        let now = trusted::unix_now();
+        let until = t.record_reject(device, now, policy);
+        self.persist(&t, |file| {
+            file.record_reject(device, now, policy);
+        })?;
         Ok(until)
     }
 }
@@ -895,5 +971,59 @@ mod tests {
         let deny = AutoDeny;
         assert_eq!(deny.pairing(&peer, "x").await, PairDecision::Reject);
         assert_eq!(deny.session(&tp, &req).await, SessionDecision::Deny);
+    }
+
+    /// A shared store (the host's handshakes) writes every trust change the
+    /// moment it happens, merged into the file as it is then, and a
+    /// last-seen time only while its history switch is on.
+    #[test]
+    fn a_shared_store_writes_trust_through_and_last_seen_only_with_history() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trusted-devices.toml");
+        let load = || TrustedDevices::load(&path).unwrap();
+        let dev = |b: u8| DeviceId::from_bytes([b; 32]);
+        let mut start = TrustedDevices::default();
+        start.pin(dev(1), "Laptop", 1000);
+        start.save(&path).unwrap();
+        let history = Arc::new(AtomicBool::new(false));
+        let switch = Arc::clone(&history);
+        let store = TrustedDeviceStore::shared(
+            path.clone(),
+            Arc::new(move || switch.load(Ordering::SeqCst)),
+        )
+        .unwrap();
+
+        // History off: a session request's time stays in memory.
+        store.touch(&dev(1));
+        assert_eq!(load().get(&dev(1)).unwrap().last_seen, 1000);
+        assert!(store.get(&dev(1)).unwrap().last_seen > 1000);
+        // Trust changes are written at once all the same.
+        store.pin(dev(2), "Phone").unwrap();
+        let phone = load().get(&dev(2)).cloned().expect("the pin is on disk");
+        assert_eq!(phone.last_seen, phone.paired_at);
+        store.record_reject(dev(3), &BanPolicy::default()).unwrap();
+        assert_eq!(load().bans[0].reject_count, 1);
+        store.pin(dev(1), "Laptop").unwrap();
+        assert_eq!(load().get(&dev(1)).unwrap().last_seen, 1000, "a re-pair");
+        assert!(store.remove(&dev(2)).unwrap());
+        assert!(load().get(&dev(2)).is_none());
+
+        // History on: the time is written too.
+        history.store(true, Ordering::SeqCst);
+        store.touch(&dev(1));
+        assert!(load().get(&dev(1)).unwrap().last_seen > 1000);
+
+        // Merged into the file as it is: a device unpaired by another process
+        // stays unpaired through a touch and another device's pin.
+        let mut file = load();
+        file.remove(&dev(1));
+        file.save(&path).unwrap();
+        store.touch(&dev(1));
+        store.pin(dev(4), "Tablet").unwrap();
+        let file = load();
+        assert!(file.get(&dev(1)).is_none());
+        assert!(file.get(&dev(4)).is_some());
     }
 }
