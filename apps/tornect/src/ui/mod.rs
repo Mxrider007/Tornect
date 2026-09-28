@@ -18,13 +18,19 @@
 mod app;
 mod backend;
 mod consent;
+mod icons;
 mod indicator;
 mod keys;
 mod model;
+mod nav;
+mod pages;
 mod preview;
 mod stream;
+mod theme;
 mod view;
+mod widgets;
 
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::Context as _;
@@ -42,6 +48,7 @@ use self::app::{App, UserEvent};
 use self::backend::{Backend, StreamLink};
 use self::consent::Popups;
 use self::model::{Hosting, Model, Setup, Shared, Wake, Waker};
+pub use self::nav::Page;
 
 /// The next request to end this process: SIGINT or SIGTERM on Unix (Ctrl-C
 /// in the terminal that started it, `kill`, `systemctl stop`), Ctrl-C or
@@ -86,6 +93,11 @@ pub struct GuiOpts {
     /// stream window, and start nothing: no Tor, no hosting, no network
     /// (`docs/UI_PLAN.md` §10's preview harness, in miniature).
     pub preview: bool,
+    /// With `preview`: open on this page, at rest (no question, no session,
+    /// no stream window), instead of showing every screen at once.
+    pub page: Option<Page>,
+    /// The theme the windows draw with.
+    pub theme: egui::Theme,
 }
 
 /// Open the window and run until it is closed.
@@ -148,15 +160,27 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
         .build()
         .context("creating the tokio runtime")?;
     if opts.preview {
-        preview::fill(&shared, &paths.portal_restore_token());
-        let (slot, frames) = (Arc::clone(&link.slot), Arc::clone(&shared));
-        std::thread::Builder::new()
-            .name("tornect-preview".to_owned())
-            .spawn(move || preview::card(slot, frames))
-            .context("starting the preview's test card")?;
+        // What the setup card names: a stand-in, so that a picture of the
+        // preview shows no path of this machine.
+        let token_file = Path::new("~/.local/share/tornect/portal-restore-token");
+        match opts.page {
+            Some(_) => preview::rest(&shared, token_file),
+            None => {
+                preview::fill(&shared, token_file);
+                let (slot, frames) = (Arc::clone(&link.slot), Arc::clone(&shared));
+                std::thread::Builder::new()
+                    .name("tornect-preview".to_owned())
+                    .spawn(move || preview::card(slot, frames))
+                    .context("starting the preview's test card")?;
+            }
+        }
         drop(commands_rx);
         let mut app = App::new(shared, popups, link, commands);
-        app.stream_at = Some((600, 0));
+        app.theme = opts.theme;
+        if let Some(page) = opts.page {
+            app.open_page(page);
+        }
+        app.stream_at = Some((1210, 0));
         let ran = event_loop.run_app(&mut app);
         runtime.shutdown_background();
         ran.context("the window's event loop failed")?;
@@ -193,6 +217,7 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
     ));
 
     let mut app = App::new(shared, popups, link, commands);
+    app.theme = opts.theme;
     if !opts.host {
         app.title = "Tornect (connect only)";
     }
