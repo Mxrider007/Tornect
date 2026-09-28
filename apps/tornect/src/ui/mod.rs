@@ -30,7 +30,6 @@ mod theme;
 mod view;
 mod widgets;
 
-use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::Context as _;
@@ -39,7 +38,7 @@ use tornect_core::config::BridgeMode;
 use tornect_core::keystore::{
     FileSecretStore, load_or_create_device_identity, load_or_create_host_identity,
 };
-use tornect_core::{Config, Paths};
+use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths};
 use tornect_session::{DesktopBackend, Source};
 use tornect_signal::{HostSigner, install_crypto_provider, shutdown_runtime};
 use winit::event_loop::EventLoop;
@@ -100,9 +99,32 @@ pub struct GuiOpts {
     pub theme: egui::Theme,
 }
 
-/// Open the window and run until it is closed.
-pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
-    install_crypto_provider();
+/// What the window starts from: its first model and, for a real window (not
+/// the preview), what the tokio side needs.
+struct Start {
+    model: Model,
+    real: Option<Real>,
+}
+
+/// A real window's configuration and identities.
+struct Real {
+    cfg: Config,
+    identity: HostIdentity,
+    device: DeviceIdentity,
+    device_pk: [u8; 32],
+}
+
+/// Read (on first run: create) what the window needs. The preview branches
+/// first (review F-1): it creates no directory, opens no keystore, loads or
+/// creates no identity and reads no configuration, and it shows a made-up ID,
+/// so that nothing of this machine can reach its pictures.
+fn start(paths: &Paths, opts: &GuiOpts) -> anyhow::Result<Start> {
+    if opts.preview {
+        return Ok(Start {
+            model: preview::model(opts.page.is_none()),
+            real: None,
+        });
+    }
     paths.ensure().context("creating Tornect directories")?;
     let store = FileSecretStore::open(paths.keys_dir()).context("opening keystore")?;
     let (identity, _) = load_or_create_host_identity(&store)?;
@@ -112,20 +134,6 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
     if let Some(mode) = opts.bridges {
         cfg.tor.bridges = mode;
     }
-
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .build()
-        .context("no desktop to open a window on (for the command line, see `tornect --help`)")?;
-    let proxy = Mutex::new(event_loop.create_proxy());
-    let wake: Waker = Arc::new(move |why| {
-        // Fails only once the loop has exited, when nobody needs waking.
-        let _ = proxy
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .send_event(UserEvent::Wake(why));
-    });
-    let quit_wake = Arc::clone(&wake);
-
     // The first-run grant is a step only where a session would open the
     // desktop's portal: a Wayland desktop this machine shares.
     let setup = (opts.host
@@ -150,29 +158,50 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
         setup,
         ..Model::default()
     };
+    Ok(Start {
+        model,
+        real: Some(Real {
+            cfg,
+            identity,
+            device,
+            device_pk,
+        }),
+    })
+}
+
+/// Open the window and run until it is closed.
+pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
+    install_crypto_provider();
+    let Start { model, real } = start(paths, &opts)?;
+
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .context("no desktop to open a window on (for the command line, see `tornect --help`)")?;
+    let proxy = Mutex::new(event_loop.create_proxy());
+    let wake: Waker = Arc::new(move |why| {
+        // Fails only once the loop has exited, when nobody needs waking.
+        let _ = proxy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .send_event(UserEvent::Wake(why));
+    });
+    let quit_wake = Arc::clone(&wake);
     let shared = Shared::new(model, wake);
     let popups = Popups::new(Arc::clone(&shared));
     let link = Arc::new(StreamLink::default());
     let (commands, commands_rx) = mpsc::unbounded_channel();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("creating the tokio runtime")?;
-    if opts.preview {
-        // What the setup card names: a stand-in, so that a picture of the
-        // preview shows no path of this machine.
-        let token_file = Path::new("~/.local/share/tornect/portal-restore-token");
-        match opts.page {
-            Some(_) => preview::rest(&shared, token_file),
-            None => {
-                preview::fill(&shared, token_file);
-                let (slot, frames) = (Arc::clone(&link.slot), Arc::clone(&shared));
-                std::thread::Builder::new()
-                    .name("tornect-preview".to_owned())
-                    .spawn(move || preview::card(slot, frames))
-                    .context("starting the preview's test card")?;
-            }
+    let Some(real) = real else {
+        // The preview: nothing runs behind the window, and answers go nowhere.
+        // Its model came ready-made: one wake opens what it shows (the full
+        // preview's stream window), as the first update of a real window does.
+        shared.wake(Wake::Model);
+        if opts.page.is_none() {
+            let (slot, frames) = (Arc::clone(&link.slot), Arc::clone(&shared));
+            std::thread::Builder::new()
+                .name("tornect-preview".to_owned())
+                .spawn(move || preview::card(slot, frames))
+                .context("starting the preview's test card")?;
         }
         drop(commands_rx);
         let mut app = App::new(shared, popups, link, commands);
@@ -182,10 +211,14 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
         }
         app.stream_at = Some((1210, 0));
         let ran = event_loop.run_app(&mut app);
-        runtime.shutdown_background();
         ran.context("the window's event loop failed")?;
         return app.error.take().map_or(Ok(()), Err);
-    }
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("creating the tokio runtime")?;
     // A signal ends the window's sessions as its close button does, instead
     // of killing the process with a session live (which left the viewer's
     // held keys down and `sessions.log` without an end record).
@@ -203,15 +236,15 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
     runtime.spawn(backend::run(
         Backend {
             paths: paths.clone(),
-            cfg,
+            cfg: real.cfg,
             shared: Arc::clone(&shared),
             popups: Arc::clone(&popups),
             link: Arc::clone(&link),
             source: opts.source,
             host: opts.host,
-            identity: Arc::new(identity),
-            device: Arc::new(device),
-            device_pk,
+            identity: Arc::new(real.identity),
+            device: Arc::new(real.device),
+            device_pk: real.device_pk,
         },
         commands_rx,
     ));
