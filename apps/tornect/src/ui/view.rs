@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
 use tornect_core::TornectId;
+use tornect_core::levels::{ADMIN_LINE_NO_PROMPT, AdminPath, Answers, SENTENCE_SECURE_DESKTOP_OFF};
 use tornect_signal::pairing::{PairDecision, SessionDecision};
 
 #[cfg(test)]
 use super::model::{ClientStage, Hosting, Setup, TorState};
-use super::model::{Confirm, Model, Popup, PopupKind, Recognition, Sharing, Viewing};
+use super::model::{Confirm, Model, Popup, PopupKind, Recognition, Sharing, SheetLevels, Viewing};
 use super::nav::{self, Page};
 use super::pages;
 use super::theme::{self, Face};
@@ -55,6 +56,12 @@ pub enum Action {
     /// Connect to this Tornect ID although it looks like a saved one (the
     /// second, deliberate click after the connect field's warning).
     ConnectAnyway(TornectId),
+    /// "Allow as administrator" on session sheet `id`: its Tornect
+    /// confirmation comes next (§B.2.1: no Windows prompt follows).
+    AdminConfirm {
+        /// The popup.
+        id: u64,
+    },
     /// End the session this screen is shared with (the kill), from the banner
     /// or the indicator window.
     StopSharing,
@@ -246,8 +253,9 @@ pub fn main_window(
     form.labels
         .retain(|id, _| model.popups.iter().any(|p| p.id == *id));
     form.cards.retain(|id, _| {
-        model.popups.iter().any(|p| p.id == *id)
-            || model.confirm.as_ref().is_some_and(|c| c.id == *id)
+        model.popups.iter().any(|p| {
+            p.id == *id || (model.admin_confirm.contains(&p.id) && confirmation_card(p.id) == *id)
+        }) || model.confirm.as_ref().is_some_and(|c| c.id == *id)
     });
     // The sidebar's room, with nothing in it yet.
     let side = egui::Panel::left("sidebar")
@@ -292,8 +300,13 @@ pub fn main_window(
                         for popup in &model.popups {
                             let new = !form.cards.contains_key(&popup.id);
                             let seen = model.recognition.get(&popup.id);
+                            let sheet = Sheet {
+                                seen,
+                                levels: model.levels.get(&popup.id),
+                                confirming: model.admin_confirm.contains(&popup.id),
+                            };
                             let card =
-                                question(ui, |ui| host_popup(ui, popup, seen, form, now, actions));
+                                question(ui, |ui| host_popup(ui, popup, sheet, form, now, actions));
                             if new {
                                 ui.scroll_to_rect(card, None);
                             }
@@ -511,6 +524,22 @@ fn whole_code(code: &str) -> bool {
     code.chars().filter(char::is_ascii_digit).count() == 6
 }
 
+/// What a host sheet shows beside its popup: the key's recognition, the
+/// levels a session sheet offers, and whether its administrator
+/// confirmation is up.
+#[derive(Clone, Copy)]
+struct Sheet<'a> {
+    seen: Option<&'a Recognition>,
+    levels: Option<&'a SheetLevels>,
+    confirming: bool,
+}
+
+/// The arming card of session sheet `id`'s administrator confirmation: its
+/// own second, counted from when the confirmation appears.
+fn confirmation_card(id: u64) -> u64 {
+    id ^ (1 << 63)
+}
+
 /// A host sheet (§B.6.1): the key asking is named by its saved name only
 /// when all 32 bytes match a pinned key, with its identicon beside it;
 /// otherwise by its device words, "not yet trusted · compare the code". When
@@ -519,11 +548,12 @@ fn whole_code(code: &str) -> bool {
 fn host_popup(
     ui: &mut egui::Ui,
     popup: &Popup,
-    seen: Option<&Recognition>,
+    sheet: Sheet<'_>,
     form: &mut Form,
     now: Instant,
     actions: &mut Vec<Action>,
 ) {
+    let seen = sheet.seen;
     let left = countdown(popup.deadline, now);
     let t = theme::tokens(ui.ctx());
     let title = match popup.kind {
@@ -693,6 +723,15 @@ fn host_popup(
             );
         }
         PopupKind::Session { label, .. } => {
+            // The administrator answer's own confirmation (§B.2.1): only for
+            // a sheet that offers it.
+            let confirmable = sheet.levels.is_some_and(|l| {
+                matches!(l.answers.admin, Some(AdminPath::TornectConfirmation { .. }))
+            });
+            if sheet.confirming && confirmable {
+                admin_confirmation(ui, popup.id, label, form, now, actions, left);
+                return;
+            }
             let asks = RichText::new(format!("\"{label}\" wants to see this screen."))
                 .strong()
                 .size(16.0);
@@ -708,12 +747,28 @@ fn host_popup(
                     ui.label(asks);
                 }
             }
+            // Without levels (a sheet from before them): the three answers.
+            let answers = sheet.levels.map_or(
+                Answers {
+                    view_only: true,
+                    allow: true,
+                    admin: None,
+                },
+                |l| l.answers,
+            );
+            // Only "Allow as administrator" without a Windows prompt is drawn
+            // in this build; the prompt path waits for the helper (M-FEAT-3).
+            let admin = matches!(answers.admin, Some(AdminPath::TornectConfirmation { .. }));
             ui.add_space(4.0);
-            ui.label(
+            ui.label(if answers.allow || !admin {
                 "Allow control also lets it use this computer's keyboard and mouse. View \
                      only shows the screen and nothing else. Either way it lasts for this \
-                     session only, and \"Stop sharing\" ends it.",
-            );
+                     session only, and \"Stop sharing\" ends it."
+            } else {
+                "Allow as administrator also lets it use this computer's keyboard and mouse. \
+                     View only shows the screen and nothing else. Either way it lasts for this \
+                     session only, and \"Stop sharing\" ends it."
+            });
             let armed = arm(ui, &mut form.cards, popup.id, now);
             ui.horizontal(|ui| {
                 if let Some(pointer) = refuse(ui, "Deny") {
@@ -723,14 +778,14 @@ fn host_popup(
                         pointer,
                     });
                 }
-                if accept(ui, RichText::new("View only"), armed) {
+                if answers.view_only && accept(ui, RichText::new("View only"), armed) {
                     actions.push(Action::Session {
                         id: popup.id,
                         decision: SessionDecision::AllowOnceViewOnly,
                         pointer: true,
                     });
                 }
-                if accept(ui, RichText::new("Allow control").strong(), armed) {
+                if answers.allow && accept(ui, RichText::new("Allow control").strong(), armed) {
                     actions.push(Action::Session {
                         id: popup.id,
                         decision: SessionDecision::AllowOnce,
@@ -738,6 +793,34 @@ fn host_popup(
                     });
                 }
             });
+            // Never adjacent to Allow (§B.2.1): a row of its own, under the
+            // others; it opens the Tornect confirmation, it does not answer.
+            if admin {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if accept(
+                        ui,
+                        RichText::new("Allow as administrator").color(t.danger_text),
+                        armed,
+                    ) {
+                        actions.push(Action::AdminConfirm { id: popup.id });
+                    }
+                });
+            }
+            if let Some(levels) = sheet.levels {
+                // The sentence under the buttons: why a level is absent, or
+                // what the one offered means here.
+                for line in levels.sentence.into_iter().chain(
+                    levels
+                        .prompts_on_shared_screen
+                        .then_some(SENTENCE_SECURE_DESKTOP_OFF),
+                ) {
+                    ui.add(
+                        egui::Label::new(RichText::new(line).small().color(t.text_secondary))
+                            .wrap(),
+                    );
+                }
+            }
             ui.label(
                 RichText::new(format!("Denied automatically in {left} s"))
                     .small()
@@ -745,6 +828,56 @@ fn host_popup(
             );
         }
     });
+}
+
+/// The Tornect confirmation of "Allow as administrator" (§B.2.1), where no
+/// Windows prompt follows: the administrator line, Deny first, and the
+/// accept armed only after the confirmation has been still for its own
+/// second. Deny refuses the session.
+fn admin_confirmation(
+    ui: &mut egui::Ui,
+    id: u64,
+    label: &str,
+    form: &mut Form,
+    now: Instant,
+    actions: &mut Vec<Action>,
+    left: u64,
+) {
+    let t = theme::tokens(ui.ctx());
+    ui.label(
+        RichText::new(format!("Allow \"{label}\" as administrator?"))
+            .strong()
+            .size(16.0),
+    );
+    ui.add(egui::Label::new(ADMIN_LINE_NO_PROMPT).wrap());
+    let armed = arm(ui, &mut form.cards, confirmation_card(id), now);
+    ui.horizontal(|ui| {
+        if let Some(pointer) = refuse(ui, "Deny") {
+            actions.push(Action::Session {
+                id,
+                decision: SessionDecision::Deny,
+                pointer,
+            });
+        }
+        if accept(
+            ui,
+            RichText::new("Allow as administrator")
+                .strong()
+                .color(t.danger_text),
+            armed,
+        ) {
+            actions.push(Action::Session {
+                id,
+                decision: SessionDecision::AllowOnceAdmin,
+                pointer: true,
+            });
+        }
+    });
+    ui.label(
+        RichText::new(format!("Denied automatically in {left} s"))
+            .small()
+            .color(t.text_muted),
+    );
 }
 
 fn confirm_popup(
@@ -831,7 +964,10 @@ pub fn stream_window(
             ui.horizontal(|ui| match viewing {
                 Some(v) => {
                     ui.label(RichText::new(&v.host).strong());
-                    let (mode, color) = if v.control {
+                    // The level only from the signed accept (§B.2.1).
+                    let (mode, color) = if v.control && v.administrator {
+                        ("Control · administrator", t.danger_text)
+                    } else if v.control {
                         ("control", t.ok)
                     } else {
                         ("view only", t.text_muted)
@@ -1004,6 +1140,11 @@ mod tests {
                 .find(|v| v.starts_with(start))
                 .unwrap_or_else(|| panic!("no text starting with \"{start}\""))
                 .to_owned()
+        }
+
+        /// Whether a widget labelled `label` was on screen in the last pass.
+        fn has(&self, label: &str) -> bool {
+            self.nodes.iter().any(|n| n.label() == Some(label))
         }
 
         /// Whether the button labelled `label` was disabled in the last pass.
@@ -1539,6 +1680,7 @@ mod tests {
             ClientStage::Live(Viewing {
                 host: "Desk".to_owned(),
                 control: false,
+                administrator: false,
                 since: now,
                 pictures: 3,
                 size: (640, 480),
@@ -1564,6 +1706,7 @@ mod tests {
         let viewing = Viewing {
             host: "Desk".to_owned(),
             control: true,
+            administrator: false,
             since: Instant::now(),
             pictures: 1,
             size: (1600, 900),
@@ -1589,5 +1732,212 @@ mod tests {
         .drop_without_applying_deltas();
         assert!(drawn.is_none());
         assert!(actions.is_empty());
+    }
+    /// The levels an invented Windows host with UAC off offers (§B.2.1):
+    /// View only and "Allow as administrator", no plain Allow.
+    fn always_admin() -> SheetLevels {
+        SheetLevels::of(&tornect_core::levels::Availability::of(Some(
+            &tornect_core::levels::WindowsFacts {
+                installed: true,
+                administrator: true,
+                enable_lua: Some(0),
+                ..tornect_core::levels::WindowsFacts::default()
+            },
+        )))
+    }
+
+    /// §B.2.1: a session sheet offers the answers of its row and nothing
+    /// else — a level the host cannot deliver is absent, never greyed —
+    /// with the row's sentence under the buttons. Deny stays first.
+    #[test]
+    fn the_session_sheet_offers_only_the_levels_of_its_row() {
+        use tornect_core::levels::{
+            Availability, SENTENCE_ALWAYS_ADMINISTRATOR, SENTENCE_LINUX, WindowsFacts,
+        };
+
+        let t0 = Instant::now();
+        let sheet = |levels: SheetLevels| {
+            let mut model = with_popups(vec![session_popup(7, t0)]);
+            model.levels.insert(7, levels);
+            Harness::new(model, t0)
+        };
+        // Linux: three answers and the Linux sentence.
+        let linux = sheet(SheetLevels::of(&Availability::LINUX));
+        for label in ["Deny", "View only", "Allow control"] {
+            assert!(linux.has(label), "{label}");
+        }
+        assert!(!linux.has("Allow as administrator"));
+        assert_eq!(linux.text("On Linux, Tornect never runs"), SENTENCE_LINUX);
+        assert!(linux.bounds("Deny").0 < linux.bounds("View only").0);
+        // Installed with UAC on: the administrator answer takes Windows'
+        // prompt and the helper, which this build does not have: absent.
+        let prompt = sheet(SheetLevels::of(&Availability::of(Some(&WindowsFacts {
+            installed: true,
+            administrator: true,
+            ..WindowsFacts::default()
+        }))));
+        assert!(prompt.has("Allow control") && !prompt.has("Allow as administrator"));
+        assert!(!prompt.has("Allow as administrator…"));
+        // UAC off: control is administrator access, so no plain Allow; the
+        // administrator answer on a row of its own, under Deny's.
+        let admin = sheet(always_admin());
+        assert!(admin.has("Deny") && admin.has("View only"));
+        assert!(
+            !admin.has("Allow control"),
+            "a level it cannot give is absent"
+        );
+        assert!(
+            admin.disabled("Allow as administrator"),
+            "armed after a second"
+        );
+        let (deny, allow_admin) = (admin.bounds("Deny"), admin.bounds("Allow as administrator"));
+        assert!(allow_admin.1 >= deny.3, "{deny:?} {allow_admin:?}");
+        assert_eq!(
+            admin.text("Windows runs every program"),
+            SENTENCE_ALWAYS_ADMINISTRATOR
+        );
+        // A sheet from before the levels: the three answers, no sentence.
+        let plain = Harness::new(with_popups(vec![session_popup(7, t0)]), t0);
+        assert!(plain.has("Allow control") && !plain.has("Allow as administrator"));
+    }
+
+    /// §B.2.1 arming MUSTs: "Allow as administrator" where no Windows prompt
+    /// follows opens a Tornect confirmation — it never answers by itself —
+    /// whose Deny comes first and answers at once, and whose accept is armed
+    /// only after the confirmation has been still for its own second; a
+    /// raise or a restore re-arms it; the administrator answer is never
+    /// beside Allow.
+    #[test]
+    fn the_administrator_answer_asks_a_tornect_confirmation() {
+        let t0 = Instant::now();
+        let mut model = with_popups(vec![session_popup(7, t0)]);
+        model.levels.insert(7, always_admin());
+        let mut window = Harness::new(model, t0);
+        let early = window.click(
+            t0 + Duration::from_millis(300),
+            window.button("Allow as administrator"),
+        );
+        assert!(early.is_empty(), "{early:?}");
+        window.pass(t0 + Duration::from_millis(1500), Vec::new());
+        let at = window.button("Allow as administrator");
+        let asked = window.click(t0 + Duration::from_millis(1600), at);
+        assert_eq!(
+            asked,
+            vec![Action::AdminConfirm { id: 7 }],
+            "an answer without confirmation"
+        );
+
+        // The app puts the confirmation up in its place.
+        window.model.admin_confirm.insert(7);
+        let t1 = t0 + Duration::from_secs(2);
+        window.pass(t1, Vec::new());
+        window.pass(t1, Vec::new());
+        assert!(!window.has("View only") && !window.has("Allow control"));
+        assert!(
+            window
+                .text("They can change anything on this computer")
+                .contains("Tornect's settings and its log")
+        );
+        assert!(!window.disabled("Deny"), "Deny answers at once");
+        assert!(window.disabled("Allow as administrator"), "its own second");
+        let (deny, accept) = (
+            window.bounds("Deny"),
+            window.bounds("Allow as administrator"),
+        );
+        assert!(deny.2 <= accept.0, "Deny first: {deny:?} {accept:?}");
+        let early = window.click(
+            t1 + Duration::from_millis(300),
+            window.button("Allow as administrator"),
+        );
+        assert!(
+            early.is_empty(),
+            "answered in the confirmation's first second: {early:?}"
+        );
+        // The window came back (a raise, a restore): the second starts again.
+        window.pass(t1 + Duration::from_millis(1100), Vec::new());
+        assert!(!window.disabled("Allow as administrator"));
+        window.form.window_came_back();
+        let t2 = t1 + Duration::from_millis(1200);
+        window.pass(t2, Vec::new());
+        assert!(
+            window.disabled("Allow as administrator"),
+            "a raise re-arms it"
+        );
+        window.pass(t2 + Duration::from_millis(1100), Vec::new());
+        let late = window.click(
+            t2 + Duration::from_millis(1200),
+            window.button("Allow as administrator"),
+        );
+        assert_eq!(
+            late,
+            vec![Action::Session {
+                id: 7,
+                decision: SessionDecision::AllowOnceAdmin,
+                pointer: true,
+            }]
+        );
+        // Deny on the confirmation refuses the session.
+        let denied = window.click(t2 + Duration::from_millis(1300), window.button("Deny"));
+        assert!(
+            matches!(
+                denied.as_slice(),
+                [Action::Session {
+                    id: 7,
+                    decision: SessionDecision::Deny,
+                    ..
+                }]
+            ),
+            "{denied:?}"
+        );
+
+        // A row that offers both (the helper's, M-FEAT-3): never side by side.
+        let mut both = with_popups(vec![session_popup(8, t0)]);
+        let mut levels = always_admin();
+        levels.answers.allow = true;
+        both.levels.insert(8, levels);
+        let window = Harness::new(both, t0);
+        let (allow, admin) = (
+            window.bounds("Allow control"),
+            window.bounds("Allow as administrator"),
+        );
+        assert!(admin.1 >= allow.3, "beside Allow: {allow:?} {admin:?}");
+    }
+
+    /// The stream bar says "Control · administrator" only when the signed
+    /// accept said so (the backend's `Viewing::administrator`).
+    #[test]
+    fn the_stream_bar_names_the_signed_level() {
+        for (administrator, shown, hidden) in [
+            (true, "Control · administrator", "control"),
+            (false, "control", "Control · administrator"),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let viewing = Viewing {
+                host: "Desk".to_owned(),
+                control: true,
+                administrator,
+                since: Instant::now(),
+                pictures: 1,
+                size: (1600, 900),
+            };
+            let mut nodes = Vec::new();
+            for _ in 0..2 {
+                let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let _ =
+                        stream_window(ui, Some(&viewing), None, 0, Instant::now(), &mut Vec::new());
+                });
+                if let Some(update) = &out.platform_output.accesskit_update {
+                    nodes = update.nodes.iter().map(|(_, n)| n.clone()).collect();
+                }
+                out.drop_without_applying_deltas();
+            }
+            let texts: Vec<String> = nodes
+                .iter()
+                .filter_map(|n| n.value().map(str::to_owned))
+                .collect();
+            assert!(texts.iter().any(|t| t == shown), "{texts:?}");
+            assert!(!texts.iter().any(|t| t == hidden), "{texts:?}");
+        }
     }
 }

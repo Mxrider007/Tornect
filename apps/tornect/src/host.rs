@@ -233,6 +233,9 @@ pub struct HostWiring {
     /// reject count is written as it happens, last-seen times only while
     /// history is kept.
     pub pins: Arc<crate::history::DevicePins>,
+    /// polkit's remembered approvals, revoked while a Control session is
+    /// live (§B.2.1; Linux). The window's own session sink uses it too.
+    pub polkit: Arc<PolkitRevocation>,
 }
 
 /// Wire the host FSM for `paths`: `consent` answers the popups, `identity`
@@ -248,8 +251,20 @@ pub fn wire(
     media: Arc<MediaHost>,
     control: ControlChannel,
 ) -> anyhow::Result<HostWiring> {
+    // The session levels this computer can give (§B.2.1). A host started
+    // elevated while UAC is on opens no onion service at all.
+    let levels = tornect_platform::levels::probe();
+    if !levels.serves() {
+        anyhow::bail!(
+            "{}",
+            levels
+                .sentence
+                .unwrap_or(tornect_core::levels::SENTENCE_STARTED_ELEVATED)
+        );
+    }
     let kill = KillSwitch::new();
     let live = Arc::new(LiveSessions::new());
+    let polkit = Arc::new(PolkitRevocation::for_this_host());
     let ctx = match crate::unattended::host_context(paths, live.clone(), kill.clone()) {
         Ok(ctx) => Ok(ctx),
         Err(e) => {
@@ -278,6 +293,7 @@ pub fn wire(
     deps.audit = audit.clone();
     deps.sessions = Arc::new(CliSessions {
         live: Arc::clone(&live),
+        polkit: Arc::clone(&polkit),
         media,
         control,
     });
@@ -287,6 +303,7 @@ pub fn wire(
     let mut host_cfg = HostConfig::new(cfg.general.device_name.clone(), device_pk);
     host_cfg.transport_policy =
         TransportPolicy::from_privacy(cfg.network.paranoid, cfg.network.lan_only);
+    host_cfg.levels = levels;
 
     if let Ok(ctx) = &ctx {
         deps.stop_token = Arc::new(EmergencyStop::new(Arc::clone(&ctx.guard), kill));
@@ -315,6 +332,7 @@ pub fn wire(
         live,
         audit,
         pins,
+        polkit,
     })
 }
 
@@ -393,13 +411,111 @@ pub fn wire_cli(
 /// the media layer, and says on the terminal when one starts and ends.
 struct CliSessions {
     live: Arc<LiveSessions>,
+    polkit: Arc<PolkitRevocation>,
     media: Arc<MediaHost>,
     control: ControlChannel,
+}
+
+/// Where a [`PolkitRevocation`] finds polkit's authority.
+type AuthorityFactory = Arc<
+    dyn Fn() -> tornect_platform::polkit::BoxFuture<
+            'static,
+            Result<
+                Arc<dyn tornect_platform::polkit::TemporaryAuthority>,
+                tornect_platform::polkit::PolkitError,
+            >,
+        > + Send
+        + Sync,
+>;
+
+/// Keeps polkit's remembered approvals revoked while a Control session is
+/// live (§B.2.1, M-FEAT-2): at its start and after every change the
+/// authority reports, until it ends. It only makes the person at the
+/// computer type a password again; it is never described as enforcement.
+/// View-only sessions and systems without polkit are left alone.
+pub struct PolkitRevocation {
+    authority: Option<AuthorityFactory>,
+    live: std::sync::Mutex<std::collections::HashMap<String, JoinHandle<()>>>,
+}
+
+impl PolkitRevocation {
+    /// The system's authority on Linux; nothing elsewhere, and nothing in
+    /// this crate's tests (they must not touch the machine's polkit).
+    #[must_use]
+    pub fn for_this_host() -> Self {
+        #[cfg(all(target_os = "linux", not(test)))]
+        let authority: Option<AuthorityFactory> = Some(Arc::new(|| {
+            Box::pin(async {
+                let authority = tornect_platform::polkit::SystemAuthority::connect().await?;
+                Ok(Arc::new(authority) as Arc<dyn tornect_platform::polkit::TemporaryAuthority>)
+            })
+        }));
+        #[cfg(not(all(target_os = "linux", not(test))))]
+        let authority: Option<AuthorityFactory> = None;
+        Self::with(authority)
+    }
+
+    /// Revocation through `authority` (`None`: never).
+    #[must_use]
+    fn with(authority: Option<AuthorityFactory>) -> Self {
+        Self {
+            authority,
+            live: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// A session went live: a Control one starts the revocation.
+    pub fn on_start(&self, session: &LiveSession<'_>) {
+        let Some(authority) = self.authority.clone() else {
+            return;
+        };
+        if session.mode != SessionMode::Control {
+            return;
+        }
+        let task = tokio::spawn(async move {
+            let authority = match authority().await {
+                Ok(authority) => authority,
+                Err(e) => {
+                    tracing::warn!(error = %e, "polkit's remembered approvals could not be revoked");
+                    return;
+                }
+            };
+            let (guard, started) = tornect_platform::polkit::guard_control_session(authority).await;
+            match started {
+                tornect_platform::polkit::Started::Revoked => {
+                    tracing::info!("polkit's remembered approvals revoked for a Control session");
+                }
+                tornect_platform::polkit::Started::Failed(e) => {
+                    tracing::warn!(error = %e, "polkit's remembered approvals could not be revoked");
+                }
+            }
+            // Held until the session ends and aborts this task.
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session.session_id.to_owned(), task);
+    }
+
+    /// A session ended: its revocation stops.
+    pub fn on_end(&self, session_id: &str) {
+        let task = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        if let Some(task) = task {
+            task.abort();
+        }
+    }
 }
 
 impl SessionSink for CliSessions {
     fn on_start(&self, session: &LiveSession<'_>) {
         self.live.on_start(session);
+        self.polkit.on_start(session);
         self.media.on_start(session);
         say(format_args!("SESSION LIVE {}", session.session_id));
         note(format_args!(
@@ -419,6 +535,7 @@ impl SessionSink for CliSessions {
         // Media first: that is what stops capture.
         self.media.on_end(session_id, end);
         self.live.on_end(session_id, end);
+        self.polkit.on_end(session_id);
         say(format_args!("SESSION ENDED {session_id}"));
         note(format_args!(
             "session ended: {}",
@@ -1215,5 +1332,103 @@ mod tests {
         drop(first);
         assert_eq!(HostLock::holder(&env.paths), None);
         let _again = HostLock::acquire(&env.paths).unwrap();
+    }
+    /// §B.2.1 (Linux): a Control session revokes polkit's remembered
+    /// approvals at its start and after a change the authority reports, a
+    /// view-only one touches nothing, and the session's end stops the watch.
+    #[tokio::test]
+    async fn control_sessions_revoke_polkits_remembered_approvals() {
+        use std::sync::atomic::AtomicUsize;
+
+        use tornect_platform::polkit::{BoxFuture, PolkitError, TemporaryAuthority};
+        use tornect_signal::consent::SessionToken;
+
+        #[derive(Default)]
+        struct Fake {
+            remembered: AtomicUsize,
+            revokes: AtomicUsize,
+            tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<()>>>,
+        }
+        impl TemporaryAuthority for Fake {
+            fn revoke(&self) -> BoxFuture<'_, Result<(), PolkitError>> {
+                Box::pin(async move {
+                    self.revokes.fetch_add(1, Ordering::SeqCst);
+                    self.remembered.store(0, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+            fn remembered(&self) -> BoxFuture<'_, Result<usize, PolkitError>> {
+                Box::pin(async move { Ok(self.remembered.load(Ordering::SeqCst)) })
+            }
+            fn changes(
+                &self,
+            ) -> BoxFuture<'_, Result<tokio::sync::mpsc::Receiver<()>, PolkitError>> {
+                Box::pin(async move {
+                    let (tx, rx) = tokio::sync::mpsc::channel(4);
+                    *self.tx.lock().unwrap() = Some(tx);
+                    Ok(rx)
+                })
+            }
+        }
+        async fn settle() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let fake = Arc::new(Fake::default());
+        let factory: AuthorityFactory = {
+            let fake = Arc::clone(&fake);
+            Arc::new(move || {
+                let fake = Arc::clone(&fake);
+                Box::pin(async move { Ok(fake as Arc<dyn TemporaryAuthority>) })
+            })
+        };
+        let revocation = PolkitRevocation::with(Some(factory));
+        let token = SessionToken::new([5; 32]);
+        let session = |id: &'static str, mode| LiveSession {
+            device: DeviceIdentity::from_seed(&[9; 32]).id(),
+            label: "Laptop",
+            session_id: id,
+            token: &token,
+            th_final: [0; 32],
+            mode,
+            unattended: false,
+        };
+        revocation.on_start(&session("v1", SessionMode::ViewOnly));
+        settle().await;
+        assert_eq!(
+            fake.revokes.load(Ordering::SeqCst),
+            0,
+            "view-only touches nothing"
+        );
+        fake.remembered.store(1, Ordering::SeqCst);
+        revocation.on_start(&session("c1", SessionMode::Control));
+        settle().await;
+        assert_eq!(
+            fake.revokes.load(Ordering::SeqCst),
+            1,
+            "revoked at the start"
+        );
+        fake.remembered.store(2, Ordering::SeqCst);
+        let changed = fake.tx.lock().unwrap().clone().unwrap();
+        changed.send(()).await.unwrap();
+        settle().await;
+        assert_eq!(
+            fake.revokes.load(Ordering::SeqCst),
+            2,
+            "revoked after a change"
+        );
+        assert_eq!(fake.remembered.load(Ordering::SeqCst), 0);
+        revocation.on_end("c1");
+        settle().await;
+        fake.remembered.store(3, Ordering::SeqCst);
+        let _ = changed.send(()).await;
+        settle().await;
+        assert_eq!(
+            fake.revokes.load(Ordering::SeqCst),
+            2,
+            "watched after the end"
+        );
+        // This crate's own wiring never reaches the machine's polkit.
+        assert!(PolkitRevocation::for_this_host().authority.is_none());
     }
 }

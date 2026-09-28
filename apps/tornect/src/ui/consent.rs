@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{oneshot, watch};
 use tornect_core::TornectId;
+use tornect_core::levels::Availability;
 use tornect_signal::fsm::client::ClientPairingUi;
 use tornect_signal::fsm::host::KillSwitch;
 use tornect_signal::fsm::timeouts;
@@ -26,7 +27,9 @@ use tornect_signal::pairing::{
     TrustedPeer,
 };
 
-use super::model::{ClientStage, Confirm, Popup, PopupKind, Recognition, Shared, Wake};
+use super::model::{
+    ClientStage, Confirm, Popup, PopupKind, Recognition, Shared, SheetLevels, Wake,
+};
 use super::recognize::{GoneOnDrop, Recognizer};
 
 /// How long the client's user has to say whether the codes matched for the
@@ -190,6 +193,8 @@ impl Drop for OnScreen<'_> {
         self.popups.shared.update(|m| {
             m.popups.retain(|p| p.id != id);
             m.recognition.remove(&id);
+            m.levels.remove(&id);
+            m.admin_confirm.remove(&id);
             if m.confirm.as_ref().is_some_and(|c| c.id == id) {
                 m.confirm = None;
             }
@@ -340,6 +345,26 @@ impl Consent for GuiConsent {
         peer: &'a TrustedPeer,
         _: &'a SessionRequestSummary,
     ) -> BoxFuture<'a, SessionDecision> {
+        self.session_sheet(peer, None)
+    }
+
+    fn session_at<'a>(
+        &'a self,
+        peer: &'a TrustedPeer,
+        _: &'a SessionRequestSummary,
+        levels: &'a Availability,
+    ) -> BoxFuture<'a, SessionDecision> {
+        self.session_sheet(peer, Some(SheetLevels::of(levels)))
+    }
+}
+
+impl GuiConsent {
+    /// The session sheet of `peer`, offering `levels` (§B.2.1) when given.
+    fn session_sheet<'a>(
+        &'a self,
+        peer: &'a TrustedPeer,
+        levels: Option<SheetLevels>,
+    ) -> BoxFuture<'a, SessionDecision> {
         let withdrawn = self.withdraw.armed();
         Box::pin(async move {
             let deadline = Instant::now() + timeouts::POPUP;
@@ -366,6 +391,9 @@ impl Consent for GuiConsent {
             let _on_screen = self.popups.open(Answer::Session(tx), |id, m| {
                 if let Some(seen) = seen {
                     m.recognition.insert(id, seen);
+                }
+                if let Some(levels) = levels {
+                    m.levels.insert(id, levels);
                 }
                 m.popups.push(Popup { id, kind, deadline });
             });
@@ -789,5 +817,62 @@ mod tests {
         assert!(asking.await, "a late yes was not taken");
         assert_eq!(ui.ended(), Some(CodeCheck::MatchedLate));
         assert!(popups.shared().read(|m| m.confirm.is_none()));
+    }
+    /// §B.2.1: the FSM's `session_at` puts the sheet's levels in the model
+    /// with the popup — only what this build can deliver — and takes them
+    /// away with it; an administrator answer comes back as given.
+    #[tokio::test]
+    async fn a_session_sheet_carries_its_levels_and_drops_them() {
+        use tornect_core::levels::{AdminPath, WindowsFacts};
+
+        let popups = popups();
+        let (_tx, started) = watch::channel(0);
+        let consent = GuiConsent::new(Arc::clone(&popups), withdraw(&KillSwitch::new(), started));
+        let always_admin = Availability::of(Some(&WindowsFacts {
+            installed: true,
+            administrator: true,
+            enable_lua: Some(0),
+            ..WindowsFacts::default()
+        }));
+        let (peer, summary) = (peer(), summary());
+        let asking = consent.session_at(&peer, &summary, &always_admin);
+        tokio::pin!(asking);
+        let id = loop {
+            tokio::select! {
+                _ = &mut asking => panic!("answered before anyone did"),
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+            if let Some(p) = popups.shared().read(|m| m.popups.first().cloned()) {
+                break p.id;
+            }
+        };
+        let levels = popups
+            .shared()
+            .read(|m| m.levels.get(&id).copied())
+            .unwrap();
+        assert_eq!(levels, SheetLevels::of(&always_admin));
+        assert_eq!(
+            levels.answers.admin,
+            Some(AdminPath::TornectConfirmation {
+                needs_helper: false
+            })
+        );
+        popups.shared().update(|m| {
+            m.admin_confirm.insert(id);
+        });
+        assert!(popups.answer_session(id, SessionDecision::AllowOnceAdmin));
+        assert_eq!(asking.await, SessionDecision::AllowOnceAdmin);
+        assert!(
+            popups
+                .shared()
+                .read(|m| m.levels.is_empty() && m.admin_confirm.is_empty())
+        );
+        // The prompt path waits for the helper: absent from the model.
+        let prompt = Availability::of(Some(&WindowsFacts {
+            installed: true,
+            administrator: true,
+            ..WindowsFacts::default()
+        }));
+        assert_eq!(SheetLevels::of(&prompt).answers.admin, None);
     }
 }
