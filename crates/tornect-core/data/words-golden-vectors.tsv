@@ -1,0 +1,17 @@
+# Tornect device words: golden vectors (docs/PLAN.md §B.6.1, decision M1-63). Frozen.
+# h = Argon2id(password = key, salt = "tornect/v1/words/" || role, m = 65536 KiB, t = 1, p = 1, version 0x13, 8 bytes)
+# words = the first 44 bits of h, big-endian, as four 11-bit indices into the BIP39 English list
+# Keys are invented byte patterns, not anyone's key. Every platform must reproduce every line.
+# key (hex)	role	h (hex)	words
+0000000000000000000000000000000000000000000000000000000000000000	onion	e7ca4f9cd5466274	treat fame transfer pride
+0000000000000000000000000000000000000000000000000000000000000000	device	2f170711b5f8924d	congress return settle hip
+ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff	onion	4b67f9e863e84725	enter divert key sick
+ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff	device	2e5f4a8563192ccd	comic where pattern shiver
+000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f	onion	b972244874028b68	ride muffin bamboo trend
+000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f	device	7a555ab3527a8c15	kid print proud pilot
+a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5	onion	32e0f13038363bd9	cream always equal idea
+a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5	device	9c9ed255d8abb013	orient walk nice rally
+030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc	onion	85c193b084b1be14	magic arrive umbrella annual
+030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc	device	4c0c25efcecc5e55	equal gentle know outside
+1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100	onion	4622a130d15f3d20	economy bench equip pencil
+1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100	device	abf0f53b7678dbc8	program marble excite undo
