@@ -12,9 +12,10 @@
 //! * [`Recent`] at [`recent_file`] (`recent.toml`, `version = 1`): the recent
 //!   connections, one line per computer and day, newest first.
 //!
-//! It holds no secret: no private key, no password, no credential. A
-//! `later.credential_ref` may only name the OS keychain entry that would hold
-//! a remembered password (`tornect/unattended/<onion>`), never a password.
+//! It holds no secret and no reference to one: no private key, no password,
+//! no credential, no keychain entry name (a keychain entry's name is derived
+//! from the pinned key when it is used, never read from this file). The
+//! `later` table takes only the keys named in [`LATER_KEYS`].
 //!
 //! **Next to `known-hosts.toml`, not wrapping it.** The pin stays where the
 //! pairing code keeps it: `known-hosts.toml` is written when a computer is
@@ -50,10 +51,10 @@ pub const VERSION: u32 = 1;
 /// Most characters of the device words.
 pub const MAX_WORDS_CHARS: usize = 160;
 
-/// What a credential reference starts with: the OS keychain entry of a
-/// remembered unattended password is `tornect/unattended/<onion>`
-/// (`docs/PLAN.md` §B.8.9).
-pub const CREDENTIAL_PREFIX: &str = "tornect/unattended/";
+/// The only keys the `later` table may hold in schema version 1: fields
+/// that arrive with the spec amendment and hold no secret. Any other key
+/// (a credential, or a reference to one, among them) makes the file refused.
+pub const LATER_KEYS: [&str; 1] = ["words"];
 
 /// Most recent connections kept (one per computer and day).
 pub const MAX_VISITS: usize = 200;
@@ -254,16 +255,11 @@ pub fn mixes_scripts(name: &str) -> bool {
     false
 }
 
-/// Fields that arrive with the spec amendment. Only these two exist in
-/// schema version 1, and neither can hold a secret.
+/// Fields that arrive with the spec amendment: exactly the keys of
+/// [`LATER_KEYS`], none of which can hold a secret or point to one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Later {
-    /// Where a remembered unattended password would be kept: the name of its
-    /// OS keychain entry, `tornect/unattended/<onion>` for this computer's
-    /// ID. A reference, never the credential.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credential_ref: Option<String>,
     /// The ID's pronounceable word form: lower-case words, one space or
     /// hyphen between them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -274,16 +270,11 @@ impl Later {
     /// Nothing set.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.credential_ref.is_none() && self.words.is_none()
+        self.words.is_none()
     }
 
-    /// Whether the fields are what they must be for the computer `id`.
-    fn check(&self, id: &TornectId) -> std::result::Result<(), String> {
-        if let Some(reference) = &self.credential_ref
-            && *reference != credential_ref(id)
-        {
-            return Err("later.credential_ref must name this computer's keychain entry".to_owned());
-        }
+    /// Whether the fields are what they must be.
+    fn check(&self) -> std::result::Result<(), String> {
         if let Some(words) = &self.words {
             let shaped = words.len() <= MAX_WORDS_CHARS
                 && !words.is_empty()
@@ -296,13 +287,6 @@ impl Later {
         }
         Ok(())
     }
-}
-
-/// The keychain entry name of the computer `id`'s remembered password: the
-/// only value `later.credential_ref` may hold.
-#[must_use]
-pub fn credential_ref(id: &TornectId) -> String {
-    format!("{CREDENTIAL_PREFIX}{}", id.base32())
 }
 
 /// One computer in the address book.
@@ -345,7 +329,7 @@ impl Entry {
         }
     }
 
-    fn check(&self, id: &TornectId) -> std::result::Result<(), String> {
+    fn check(&self) -> std::result::Result<(), String> {
         for (what, text) in [("name", &self.name), ("declared", &self.declared)] {
             if let Some(text) = text
                 && clean_name(text).as_ref() != Some(text)
@@ -358,7 +342,7 @@ impl Entry {
         {
             return Err("first_seen is after last_seen".to_owned());
         }
-        self.later.check(id)
+        self.later.check()
     }
 }
 
@@ -410,7 +394,7 @@ impl AddressBook {
         }
         for (id, entry) in &book.hosts {
             entry
-                .check(id)
+                .check()
                 .map_err(|why| invalid(path, &format!("{}: {why}", id.short())))?;
         }
         Ok(book)
@@ -790,7 +774,6 @@ mod tests {
                 first_seen: Some(day("2026-09-12")),
                 last_seen: Some(day("2026-09-27")),
                 later: Later {
-                    credential_ref: Some(credential_ref(&id(1))),
                     words: Some("amber-canyon-fox".to_owned()),
                 },
             },
@@ -832,8 +815,8 @@ mod tests {
     /// A file that is not what this version writes is refused whole, never
     /// half-read: not TOML, cut short, another schema version, an unknown
     /// field (a password among them), a key that is not 32 bytes, a name
-    /// with a control character, a credential that is not a reference, a
-    /// day that does not exist.
+    /// with a control or bidi character, a keychain entry name or any other
+    /// key outside the `later` allowlist, a day that does not exist.
     #[test]
     fn a_damaged_file_is_refused_not_half_read() {
         let tmp = tempfile::tempdir().unwrap();
@@ -850,7 +833,11 @@ mod tests {
             format!("version = 1\n[hosts.\"{onion}\"]\nkey = \"abcd\"\n"),
             format!("version = 1\n[hosts.\"{onion}\"]\nname = \"a\\u0007b\"\n"),
             format!("version = 1\n[hosts.\"{onion}\"]\nname = \"evil\\u202Etxt\"\n"),
-            format!("version = 1\n[hosts.\"{onion}\".later]\ncredential_ref = \"hunter2\"\n"),
+            format!(
+                "version = 1\n[hosts.\"{onion}\".later]\ncredential_ref = \"tornect/unattended/{}\"\n",
+                id(1).base32()
+            ),
+            format!("version = 1\n[hosts.\"{onion}\".later]\nkeychain = \"hunter2\"\n"),
             format!("version = 1\n[hosts.\"{onion}\".later]\npassword = \"hunter2\"\n"),
             format!("version = 1\n[hosts.\"{onion}\".later]\nwords = \"Amber Fox!\"\n"),
             format!("version = 1\n[hosts.\"{onion}\"]\nlast_seen = \"2026-02-30\"\n"),
@@ -870,6 +857,29 @@ mod tests {
                 "{case}: {err}"
             );
             assert!(!err.to_string().contains("hunter2"), "{err}");
+        }
+    }
+
+    /// The `later` table holds exactly the allowlisted keys: a full one
+    /// writes those and no other, and no key outside the list is read.
+    #[test]
+    fn the_later_table_holds_only_its_allowlisted_keys() {
+        let full = Later {
+            words: Some("amber-canyon-fox".to_owned()),
+        };
+        let table: toml::Table = toml::from_str(&toml::to_string(&full).unwrap()).unwrap();
+        let keys: Vec<&str> = table.keys().map(String::as_str).collect();
+        assert_eq!(keys, LATER_KEYS.to_vec());
+        for key in [
+            "credential_ref",
+            "credential",
+            "password",
+            "keychain",
+            "secret",
+            "token",
+        ] {
+            let text = format!("{key} = \"x\"\n");
+            assert!(toml::from_str::<Later>(&text).is_err(), "{key} was read");
         }
     }
 
