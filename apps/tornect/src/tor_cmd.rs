@@ -269,6 +269,7 @@ async fn run_host(
         live,
         audit,
         pins: _,
+        polkit: _,
     } = crate::host::wire_cli(
         paths,
         cfg,

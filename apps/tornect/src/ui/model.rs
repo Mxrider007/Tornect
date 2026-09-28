@@ -3,13 +3,14 @@
 //! [`Model`] alone (`docs/UI_PLAN.md` §4: no screen reaches around the state to
 //! the network), which is also what the view tests build.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use tornect_core::TornectId;
 use tornect_core::address_book::{Day, mixes_scripts};
+use tornect_core::levels::{Answers, Availability};
 use tornect_core::words::{Identicon, Words};
 
 /// Why the UI thread is woken.
@@ -123,6 +124,14 @@ pub struct Model {
     /// its device words, its identicon beside a saved name, the look-alike
     /// alarm (§B.6.1). Set with the popup, in the same update.
     pub recognition: HashMap<u64, Recognition>,
+    /// What each open session sheet offers, by popup id (§B.2.1, r7): set
+    /// with the popup. A sheet with no entry offers the three answers it
+    /// always did, with no sentence under them.
+    pub levels: HashMap<u64, SheetLevels>,
+    /// The session sheets whose "Allow as administrator" was clicked: each
+    /// shows its Tornect confirmation instead (§B.2.1: no Windows prompt
+    /// follows; Deny first, armed after 1 s).
+    pub admin_confirm: HashSet<u64>,
     /// The tokio side has finished shutting down.
     pub closed: bool,
 }
@@ -268,6 +277,32 @@ pub struct ConnectWarning {
     pub name: String,
 }
 
+/// What a session sheet offers on this computer (§B.2.1, r7): the answers
+/// this build can deliver — a level it cannot deliver is absent, never a
+/// greyed button — and the sentence under the buttons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SheetLevels {
+    /// The answers besides Deny.
+    pub answers: Answers,
+    /// The one sentence under the buttons, if the row has one.
+    pub sentence: Option<&'static str>,
+    /// `PromptOnSecureDesktop` is 0: Windows' prompts show on the shared
+    /// screen, said at every level.
+    pub prompts_on_shared_screen: bool,
+}
+
+impl SheetLevels {
+    /// What a sheet offers on a host in the row `levels`.
+    #[must_use]
+    pub fn of(levels: &Availability) -> Self {
+        Self {
+            answers: levels.offered(),
+            sentence: levels.sentence,
+            prompts_on_shared_screen: levels.prompts_on_shared_screen,
+        }
+    }
+}
+
 /// What a host sheet shows about the key asking (§B.6.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recognition {
@@ -374,6 +409,9 @@ pub struct Viewing {
     pub host: String,
     /// Input goes to the host: the signed `SESSION_ACCEPT` said control.
     pub control: bool,
+    /// The signed `SESSION_ACCEPT` said administrator (§B.2.1): the bar
+    /// reads "Control · administrator". Never from anything but the accept.
+    pub administrator: bool,
     /// When the session started.
     pub since: Instant,
     /// Pictures decoded so far.

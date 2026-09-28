@@ -17,6 +17,7 @@ use egui_wgpu::{
     RendererOptions, WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew, WgpuSetupExisting,
 };
 use tokio::sync::mpsc;
+use tornect_core::levels::AdminPath;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
@@ -498,6 +499,17 @@ impl App {
         match action {
             Action::Connect(id) => self.command(Command::Connect(id)),
             Action::ConnectAnyway(id) => self.command(Command::ConnectAnyway(id)),
+            Action::AdminConfirm { id } => {
+                // Only a sheet that offers the administrator answer shows its
+                // confirmation (§B.2.1).
+                self.popups.shared().update(|m| {
+                    if m.levels.get(&id).is_some_and(|l| {
+                        matches!(l.answers.admin, Some(AdminPath::TornectConfirmation { .. }))
+                    }) {
+                        m.admin_confirm.insert(id);
+                    }
+                });
+            }
             Action::StopSharing => self.command(Command::StopSharing),
             Action::MoveIndicator => {
                 if let Some(surface) = &self.indicator

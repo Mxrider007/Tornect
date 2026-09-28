@@ -15,12 +15,13 @@ use tornect_capture::{TestCard, VideoSource as _};
 use tornect_codec::DecodedFrame;
 use tornect_core::TornectId;
 use tornect_core::address_book::Day;
+use tornect_core::levels::{Availability, WindowsFacts};
 use tornect_core::words::{Identicon, Words};
 use tornect_session::FrameSink as _;
 
 use super::model::{
     Book, CaptureNote, ClientStage, Computer, Confirm, Device, Hosting, Model, MyWords, Popup,
-    PopupKind, Recognition, Setup, Shared, Sharing, TorState, Viewing,
+    PopupKind, Recognition, Setup, Shared, Sharing, SheetLevels, TorState, Viewing,
 };
 use super::stream::{FrameSlot, SlotSink};
 
@@ -82,6 +83,14 @@ pub enum Sheet {
     Alarm,
     /// A paired device asks for a session.
     Session,
+    /// The session sheet with this computer's levels: Linux's three answers
+    /// and its sentence (§B.2.1).
+    SessionLinux,
+    /// The session sheet of a Windows host where every program runs as
+    /// administrator (UAC off): View only and "Allow as administrator".
+    SessionAdmin,
+    /// That sheet after "Allow as administrator": its Tornect confirmation.
+    AdminConfirm,
 }
 
 /// Put one host sheet of `sheet`'s kind on screen, with invented words.
@@ -120,7 +129,7 @@ pub fn sheet(m: &mut Model, sheet: Sheet) {
                 unchecked: false,
             },
         ),
-        Sheet::Session => (
+        Sheet::Session | Sheet::SessionLinux | Sheet::SessionAdmin | Sheet::AdminConfirm => (
             PopupKind::Session {
                 label: "Laptop".to_owned(),
                 fingerprint: String::new(),
@@ -139,6 +148,28 @@ pub fn sheet(m: &mut Model, sheet: Sheet) {
         deadline,
     }];
     m.recognition.insert(7, seen);
+    // Invented rows of the §B.2.1 table: nothing of this machine is read.
+    let always_admin = || {
+        Availability::of(Some(&WindowsFacts {
+            installed: true,
+            administrator: true,
+            enable_lua: Some(0),
+            ..WindowsFacts::default()
+        }))
+    };
+    match sheet {
+        Sheet::SessionLinux => {
+            m.levels.insert(7, SheetLevels::of(&Availability::LINUX));
+        }
+        Sheet::SessionAdmin => {
+            m.levels.insert(7, SheetLevels::of(&always_admin()));
+        }
+        Sheet::AdminConfirm => {
+            m.levels.insert(7, SheetLevels::of(&always_admin()));
+            m.admin_confirm.insert(7);
+        }
+        Sheet::New | Sheet::Pinned | Sheet::Alarm | Sheet::Session => {}
+    }
 }
 
 /// A made-up address book: invented names, and the IDs and host keys of
@@ -295,6 +326,7 @@ fn fill(m: &mut Model) {
     m.client = ClientStage::Live(Viewing {
         host: "Office PC".to_owned(),
         control: true,
+        administrator: false,
         since: now,
         pictures: 0,
         size: (0, 0),
