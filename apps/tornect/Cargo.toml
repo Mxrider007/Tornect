@@ -50,6 +50,8 @@ wgpu = { workspace = true, features = ["dx12"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+# A capturing subscriber: no device words in any trace (§B.6.1 W-B4).
+tracing-subscriber.workspace = true
 ed25519-dalek.workspace = true
 
 # The SIGTERM test signals its own process with kill(2): spawning `kill` would

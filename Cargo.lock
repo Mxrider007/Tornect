@@ -7311,6 +7311,7 @@ dependencies = [
  "tornect-session",
  "tornect-signal",
  "tracing",
+ "tracing-subscriber",
  "wgpu",
  "winit",
  "zeroize",
@@ -7354,6 +7355,7 @@ name = "tornect-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "argon2",
  "chacha20poly1305",
  "data-encoding",
  "directories",

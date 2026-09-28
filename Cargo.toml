@@ -107,6 +107,9 @@ chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
 # (rand 0.8, digest 0.10, argon2 0.5): the KE hash must be `sha2_010::Sha512`, the KSF
 # type `opaque_ke::argon2::Argon2`, and RNGs go through a rand_core-0.6 adapter.
 opaque-ke = { version = "=4.0.1", default-features = false, features = ["argon2", "ristretto255", "serde"] }
+# Device words (docs/PLAN.md §B.6.1, decision M1-63): Argon2id at the frozen
+# parameters, the same version and features opaque-ke already builds (no new crate).
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc"] }
 sha2_010 = { package = "sha2", version = "0.10" }
 rand_core_06 = { package = "rand_core", version = "0.6" }
 rand = "=0.10.2"
