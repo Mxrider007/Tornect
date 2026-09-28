@@ -15,7 +15,8 @@
 //! It holds no secret and no reference to one: no private key, no password,
 //! no credential, no keychain entry name (a keychain entry's name is derived
 //! from the pinned key when it is used, never read from this file). The
-//! `later` table takes only the keys named in [`LATER_KEYS`].
+//! `later` table's own keys are [`LATER_KEYS`]; any other key found there
+//! (a later version's) is kept as it is and never read (§B.8.9.1).
 //!
 //! **Next to `known-hosts.toml`, not wrapping it.** The pin stays where the
 //! pairing code keeps it: `known-hosts.toml` is written when a computer is
@@ -51,9 +52,10 @@ pub const VERSION: u32 = 1;
 /// Most characters of the device words.
 pub const MAX_WORDS_CHARS: usize = 160;
 
-/// The only keys the `later` table may hold in schema version 1: fields
-/// that arrive with the spec amendment and hold no secret. Any other key
-/// (a credential, or a reference to one, among them) makes the file refused.
+/// The keys of the `later` table this version reads and writes in schema
+/// version 1: fields that arrive with the spec amendment and hold no secret.
+/// Any other key found there is kept for forward compatibility, written back
+/// as it was, and never read (§B.8.9.1): this version writes no other key.
 pub const LATER_KEYS: [&str; 1] = ["words"];
 
 /// Most recent connections kept (one per computer and day).
@@ -255,22 +257,55 @@ pub fn mixes_scripts(name: &str) -> bool {
     false
 }
 
-/// Fields that arrive with the spec amendment: exactly the keys of
-/// [`LATER_KEYS`], none of which can hold a secret or point to one.
+/// Fields that arrive with the spec amendment: the keys of [`LATER_KEYS`],
+/// none of which can hold a secret or point to one, and whatever a later
+/// version put beside them ([`Kept`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Later {
     /// The ID's pronounceable word form: lower-case words, one space or
     /// hyphen between them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub words: Option<String>,
+    /// Keys this version does not know: kept, never read.
+    #[serde(flatten)]
+    pub kept: Kept,
+}
+
+/// The keys of a `later` table that this version does not know (a later
+/// version's, §B.8.9.1): kept so that writing the file again loses nothing,
+/// and never interpreted. `Debug` names the keys only, never a value.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Kept(BTreeMap<String, toml::Value>);
+
+// TOML values compare by value; a NaN float, the one value unequal to itself,
+// only makes two books that hold one compare unequal.
+impl Eq for Kept {}
+
+impl fmt::Debug for Kept {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
+impl Kept {
+    /// No such key.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The keys kept, in order.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
 }
 
 impl Later {
-    /// Nothing set.
+    /// Nothing set, nothing kept.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.words.is_none()
+        self.words.is_none() && self.kept.is_empty()
     }
 
     /// Whether the fields are what they must be.
@@ -775,6 +810,7 @@ mod tests {
                 last_seen: Some(day("2026-09-27")),
                 later: Later {
                     words: Some("amber-canyon-fox".to_owned()),
+                    ..Later::default()
                 },
             },
         );
@@ -815,8 +851,9 @@ mod tests {
     /// A file that is not what this version writes is refused whole, never
     /// half-read: not TOML, cut short, another schema version, an unknown
     /// field (a password among them), a key that is not 32 bytes, a name
-    /// with a control or bidi character, a keychain entry name or any other
-    /// key outside the `later` allowlist, a day that does not exist.
+    /// with a control or bidi character, words that are not words, a day that
+    /// does not exist. (Unknown keys of the `later` table are kept instead:
+    /// `unknown_later_keys_are_kept_and_never_read`.)
     #[test]
     fn a_damaged_file_is_refused_not_half_read() {
         let tmp = tempfile::tempdir().unwrap();
@@ -833,12 +870,6 @@ mod tests {
             format!("version = 1\n[hosts.\"{onion}\"]\nkey = \"abcd\"\n"),
             format!("version = 1\n[hosts.\"{onion}\"]\nname = \"a\\u0007b\"\n"),
             format!("version = 1\n[hosts.\"{onion}\"]\nname = \"evil\\u202Etxt\"\n"),
-            format!(
-                "version = 1\n[hosts.\"{onion}\".later]\ncredential_ref = \"tornect/unattended/{}\"\n",
-                id(1).base32()
-            ),
-            format!("version = 1\n[hosts.\"{onion}\".later]\nkeychain = \"hunter2\"\n"),
-            format!("version = 1\n[hosts.\"{onion}\".later]\npassword = \"hunter2\"\n"),
             format!("version = 1\n[hosts.\"{onion}\".later]\nwords = \"Amber Fox!\"\n"),
             format!("version = 1\n[hosts.\"{onion}\"]\nlast_seen = \"2026-02-30\"\n"),
             format!(
@@ -860,27 +891,60 @@ mod tests {
         }
     }
 
-    /// The `later` table holds exactly the allowlisted keys: a full one
-    /// writes those and no other, and no key outside the list is read.
+    /// The `later` table writes exactly its own keys: a full one writes
+    /// those and no other.
     #[test]
-    fn the_later_table_holds_only_its_allowlisted_keys() {
+    fn the_later_table_writes_only_its_own_keys() {
         let full = Later {
             words: Some("amber-canyon-fox".to_owned()),
+            ..Later::default()
         };
         let table: toml::Table = toml::from_str(&toml::to_string(&full).unwrap()).unwrap();
         let keys: Vec<&str> = table.keys().map(String::as_str).collect();
         assert_eq!(keys, LATER_KEYS.to_vec());
-        for key in [
-            "credential_ref",
-            "credential",
-            "password",
-            "keychain",
-            "secret",
-            "token",
-        ] {
-            let text = format!("{key} = \"x\"\n");
-            assert!(toml::from_str::<Later>(&text).is_err(), "{key} was read");
-        }
+    }
+
+    /// §B.8.9.1: keys of the `later` table this version does not know (a
+    /// later version's `remembered` flag, or anything else) are kept, never
+    /// read: the book loads, no field takes their values, `Debug` and errors
+    /// never show a value, and writing the book again keeps them as they were.
+    #[test]
+    fn unknown_later_keys_are_kept_and_never_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        let store = Store::new(&paths);
+        let onion = id(1).onion_address();
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::write(
+            store.book_path(),
+            format!(
+                "version = 1\n[hosts.\"{onion}\"]\nname = \"Office PC\"\n\
+                 [hosts.\"{onion}\".later]\nremembered = true\npassword = \"hunter2\"\n\
+                 [hosts.\"{onion}\".later.display]\norder = 3\n"
+            ),
+        )
+        .unwrap();
+        let book = store.load().unwrap();
+        let entry = &book.hosts[&id(1)];
+        assert_eq!(entry.later.words, None);
+        assert_eq!(
+            entry.later.kept.keys().collect::<Vec<_>>(),
+            ["display", "password", "remembered"]
+        );
+        let shown = format!("{book:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+
+        // A rename writes the book again: the kept keys go back as they were.
+        store.name(id(1), None, "Studio PC").unwrap();
+        let again = store.load().unwrap();
+        assert_eq!(again.hosts[&id(1)].later, entry.later);
+        assert_eq!(again.hosts[&id(1)].name.as_deref(), Some("Studio PC"));
+        let text = std::fs::read_to_string(store.book_path()).unwrap();
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        let later = &table["hosts"][onion.as_str()]["later"];
+        assert_eq!(later["remembered"].as_bool(), Some(true));
+        assert_eq!(later["password"].as_str(), Some("hunter2"));
+        assert_eq!(later["display"]["order"].as_integer(), Some(3));
     }
 
     /// Names lose control, bidi and other invisible characters, collapse
