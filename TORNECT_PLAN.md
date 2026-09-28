@@ -13,7 +13,14 @@
 Claude Code MUST re-verify exact crate/SDK versions against crates.io and vendor docs
 before pinning dependencies (see the `research-verifier` agent in §D.3).
 
-Revision: 2026-08-29 r6 — sections touched: §A.2, §A.4, §B.1, §B.2, §B.4, §B.5, §B.6, §B.8.1–2 (T1/T2/T12, B.8.2.1), §B.8.4.1–2/4.5–4.6, §B.8.5.1/5.3, §B.8.6.2–3, §B.8.7.3–5, §B.8.8, §B.8.9, §B.8.10, §B.8.12–17, Part C M1–M4/M6–M8, D.1, D.3, D.4, D5/D6/D9/D10/D12/D13, Part E, Part F.6, Part G — itemised there (runtime-monotonic decay/clock rules; the local *Suspend* reason `Suspended{Local{by}}`; UI plan adopted; research-audit amendments; the r6 review passes). r5: Part G execution status added; Part F decisions recorded (r4: §B.8 Unattended access, second review pass).
+Revision: 2026-09-27 r7 — sections touched: §A.2, D8, D10, §B.1 (new §B.1.1), §B.2 (new §B.2.1), §B.5, §B.6 (new
+§B.6.1), §B.8.1, §B.8.2 (T9), §B.8.4.1, §B.8.6.2–3, §B.8.7.1, §B.8.7.3–5, §B.8.8, §B.8.9 (new §B.8.9.1), §B.8.10,
+§B.8.13, §B.8.17, Part C (M3, the desktop release, the backlog), D.3, Part E, Part F.6–8, Part G — the desktop
+amendment for Linux and Windows (session levels and administrator access on Windows, product modes, saved devices and
+device words, the vendor codec APIs, egui everywhere, Android to the roadmap) with the internal security review's
+changes folded in; decisions M1-56 … M1-66, itemised in Part G.
+
+r6: 2026-08-29 — sections touched: §A.2, §A.4, §B.1, §B.2, §B.4, §B.5, §B.6, §B.8.1–2 (T1/T2/T12, B.8.2.1), §B.8.4.1–2/4.5–4.6, §B.8.5.1/5.3, §B.8.6.2–3, §B.8.7.3–5, §B.8.8, §B.8.9, §B.8.10, §B.8.12–17, Part C M1–M4/M6–M8, D.1, D.3, D.4, D5/D6/D9/D10/D12/D13, Part E, Part F.6, Part G — itemised there (runtime-monotonic decay/clock rules; the local *Suspend* reason `Suspended{Local{by}}`; UI plan adopted; research-audit amendments; the r6 review passes). r5: Part G execution status added; Part F decisions recorded (r4: §B.8 Unattended access, second review pass).
 
 ---
 
@@ -111,7 +118,12 @@ FFmpeg (`libavcodec`) exposes every encoder above through one API with
 hw-frames zero-copy (`d3d11va` → NVENC/AMF/QSV on Windows, `vaapi` + `cuda` on
 Linux, `videotoolbox` on macOS) — that uniformity is why it's our v1 encode/decode
 layer, with per-vendor native SDK backends as a v2 optimization behind the same
-trait. Versions (r6): the bindings are `ffmpeg-next`/`ffmpeg-sys-next` **9.0.0**, which
+trait. **r7 inverts this (D8, decision M1-56):** v1 uses the OS and vendor codec APIs directly — Media Foundation and
+NVENC on Windows, OpenH264 everywhere, VA-API designed but not shipped — and no FFmpeg, because FFmpeg does not build on
+the dev VM (codecs.md §0) and its ABI changes between majors (below), so it would have to ship with every release, while
+Media Foundation is part of Windows and the NVENC runtime comes with the driver; v1 sends H.264 Constrained Baseline
+only (§B.5), and the codec ladder above waits for a decoder-capability negotiation (roadmap M-CODEC-5). The FFmpeg facts
+below are kept as the research record. Versions (r6): the bindings are `ffmpeg-next`/`ffmpeg-sys-next` **9.0.0**, which
 build against any FFmpeg **6.1–9.0** (bindgen from the installed headers; upstream CI matrix
 6.1/7.0/7.1/8.0/8.1/9.0); `ubuntu-latest` (24.04) ships **6.1**, Ubuntu 26.04 and this dev VM
 **8.0.1**; FFmpeg 9.0 (Aug 2026) broke ABI across all seven libraries. We target the **8.x
@@ -140,9 +152,9 @@ deleting their setup pain (pairing PINs on a web UI, port forwarding, VPNs).
 | D5 | Media transport | **QUIC via `quinn`**: unreliable **datagrams** for A/V, reliable streams for control/input/clipboard/files; TLS 1.3 with both ends pinning the peer's Tornect keys (no CA; RFC 7250 raw public keys, §B.6) | One connection, E2E-encrypted, congestion-controlled, punchable; matches iroh/MoQ direction | str0m WebRTC (keep as documented plan-B; needed only for future browser client); raw UDP + custom crypto (reinventing TLS) |
 | D6 | NAT traversal | ICE-style candidate gathering (host addrs + **UPnP/NAT-PMP/PCP** port mapping + server-reflexive via a **user-editable public STUN list**), exchange over Tor, simultaneous-open punch (STUN-style probes outside QUIC on the media socket, §B.2), then QUIC | Maximizes direct-connect rate with zero owned infra; STUN is stateless free public infrastructure and is *optional* | Own STUN/TURN (violates "no servers"); iroh as connectivity backend (excellent, but pulls in n0's relay/discovery plane by default — keep as an optional feature-flagged backend for de-risking) |
 | D7 | Fallback path | **Stream over the Tor circuit itself** (TCP-like onion stream): capped preset ~1–6 Mbit/s, H.264, aggressive downscale, "relayed via Tor" badge | Guarantees Tornect *always* connects — the killer differentiator; also doubles as "paranoid mode" (peers never learn each other's IP) | TURN (needs servers); giving up (Moonlight's answer) |
-| D8 | Video pipeline | Capture→encode zero-copy on GPU per §A.2; **FFmpeg hw contexts** as the unified codec layer v1; decode→render via **wgpu** (Vulkan/Metal/D3D12) with NV12/P010 shaders | One codec API across 4 vendor stacks; wgpu = one renderer for all OSes | GStreamer (capable, but heavy runtime dependency + plugin hell for end-users); per-vendor SDKs first (do later as optimization) |
+| D8 | Video pipeline | Capture→encode zero-copy on GPU per §A.2; **the OS and vendor codec APIs directly behind `tornect-codec`'s trait** (r7, decision M1-56): Media Foundation + NVENC on Windows, **OpenH264 always**, VA-API designed behind the same trait but not shipped in v1, **no FFmpeg in v1**; one wire format, H.264 Constrained Baseline (§B.5); decode→render via **wgpu** (Vulkan/Metal/D3D12) with NV12/P010 shaders | Nothing codec-related ships (Media Foundation comes with Windows, the NVENC runtime with the driver); FFmpeg does not build on the dev VM and breaks ABI between majors (§A.2); Constrained Baseline keeps every existing viewer compatible; wgpu = one renderer for all OSes | GStreamer (capable, but heavy runtime dependency + plugin hell for end-users); FFmpeg in v1 (r6's choice: build, ABI, shipping and licence surface — r7); AMD AMF and Intel VPL directly (reached through Media Foundation on Windows; no test machine) |
 | D9 | Audio | **Opus** 48 kHz, 10 ms frames (`Application::LowDelay`, in-band FEC off, previous-frame redundancy — §B.4), in QUIC datagrams; WASAPI loopback / ScreenCaptureKit audio / PipeWire capture | The only sane real-time audio codec; `libopus` 1.6.1 bundled by the **`opus` crate** (`=0.4.0` → `opusic-sys`, built with cmake, no pkg-config/bindgen), round-trip verified on the dev VM (docs/research/codecs.md §5) | `audiopus`/`audiopus_sys` (stale since 2021) |
-| D10 | UI toolkit | **App shell: Iced 0.14** per `docs/UI_PLAN.md` (adopted 2026-08-29, Part G; `research-verifier` pins `iced` and the other UI crates at the first UI milestone — nothing UI-related is pinned yet); **stream surface: a manual `winit` 0.30 event loop** (`ApplicationHandler`) driving `egui-winit` + `egui-wgpu` (egui 0.36, wgpu 30) — the video as a full-rect wgpu pass, the HUD in egui on top — **no `eframe`**; consent popups, tray (`tray-icon`) and dialogs (`rfd`) hang off the shell; the **egui-everywhere fallback** (the same `egui-winit`/`egui-wgpu` crates under the manual loop, also for the shell) remains the risk floor | Pure Rust. winit allows one event loop per process, `eframe` exposes no raw winit events, and `egui-winit` drops physical keys it cannot map (PrintScreen, NumLock, media keys…) while a remote-desktop client must forward every scancode — owning the loop avoids an M5 rewrite (docs/research/ui.md §4; the §5.3 skeleton compiled on the dev VM). Per `docs/UI_PLAN.md` §2 — its own table, not a research note of this plan — Iced is the only shell framework proven in production on Wayland at scale (COSMIC) and 0.14 adds headless testing + hot reload; the version, the headless-testing/hot-reload features and the COSMIC claim are verified by `research-verifier` before the first UI milestone, and nothing is pinned yet. Process model (one winit loop per process): the app process owns `tornect-session` (both roles), the Iced shell **and** the stream surface on its single manual winit loop — Iced driven as an `iced_winit` program on that loop (iced's `integration` path; `research-verifier` confirms it for 0.14 at `u1`, the egui fallback needs no such step) — so decoded frames never cross a process boundary (D8, UI plan R1/R5); the host indicator is a separate process of the same binary (`main.rs` role dispatch) with its own loop, reaching the host role over the §B.8.7.4 IPC endpoint for End/panic, so it survives shell hangs (UI plan §3/§6.3) | `eframe` (rejected for the reasons left); Tauri 2 (nicer chrome, but webview + IPC between UI and stream window adds friction); Qt/Slint (C++/licensing or smaller ecosystem) |
+| D10 | UI toolkit | **egui everywhere (v1, Linux and Windows; r7, decision M1-59):** egui 0.36 through `egui-winit` + `egui-wgpu` (wgpu 30) on **one manual `winit` 0.30 event loop** (`ApplicationHandler`), **no `eframe`**, for the shell, the trust surfaces and the stream window alike — the video as a full-rect wgpu pass, the HUD in egui on top; consent sheets, the indicator and dialogs hang off the same loop; Iced is not used in v1. Process model: the app process owns `tornect-session` (both roles) and every window on its single loop, so decoded frames never cross a process boundary; the host indicator runs **in the app process** (decision M1-50; a deviation from r6's separate indicator process): a crash ends the session with the indicator (fails closed), a hang leaves the indicator visible with a dead Stop, for which `tornect panic` is the path that does not depend on the UI thread (Part E); the panic hotkey and the control channel never run on the UI thread (M-FEAT-5); a UI-thread watchdog that ends any session when the UI misses heartbeats is recommended; a separate indicator process is not a release item | Pure Rust, and what exists: the window of decision M1-50 was built this way and the UI foundation (`3aa1072`, Part G) landed the design system on it. winit allows one event loop per process, `eframe` exposes no raw winit events, and `egui-winit` drops physical keys it cannot map (PrintScreen, NumLock, media keys…) while a remote-desktop client must forward every scancode — owning the loop avoids a rewrite (docs/research/ui.md §4). An internal comparison scored the options out of 100: egui everywhere 75.6, egui on the desktop with Compose on Android 75.6, Flutter + Rust 70.8, Slint 62.2, Tauri 2 53.0, Dioxus 47.6; about 40 of the 58 UI tests are bound to egui, and a switch would cost one to two more weeks, and every trust surface would need a new internal security review. Costs kept honestly: a custom-drawn look, basic IME. `docs/UI_PLAN.md`'s Iced shell sections are superseded (the UI plan itself is not edited; Part G) | Iced 0.14 shell (r6's choice, never built; superseded by r7); `eframe` (the reasons left); Tauri 2 (webview + IPC between UI and stream window); Qt/Slint (C++/licensing or smaller ecosystem) |
 | D11 | Input model | Client captures via winit raw events (+ gamepad via `gilrs`); host injects via SendInput / CGEvent / RemoteDesktop-portal-libei (`reis`) | Per §A.2 — the sanctioned path on each OS | uinput on Linux (root, bypasses lockscreen isolation — rejected) |
 | D12 | Serialization on the wire (media) | Hand-rolled fixed headers (bitfields) for datagram payloads; CBOR for control | Datagram headers are hot-path; the 12-byte header of §B.4 matters at 100k pps | — |
 | D13 | Config/state | `~/.config/tornect` (XDG) / `%APPDATA%\Tornect` / `~/Library/Application Support/Tornect`; TOML config; keys in OS keychain where available (**`keyring-core` 1.0.0** + per-OS stores — Linux: `zbus-secret-service-keyring-store` (`rt-tokio-crypto-rust`) first, `linux-keyutils-keyring-store` (session keyring, lost at logout) as the fallback before the file keystore; `apple-native-keyring-store` (`keychain`); `windows-native-keyring-store`; never `keyring::Entry`, whose v1 shim force-installs the Secret Service store — docs/research/ui.md §5.9), file-based with 0600 otherwise (the M0 file keystore stays the fallback) | Boring and correct | — |
@@ -182,7 +194,7 @@ Single binary, two roles (any machine can be host, client, or both):
 
 ```
 ┌────────────────────────────── tornect (app) ──────────────────────────────┐
-│  UI (Iced shell + egui HUD, D10): onboarding · ID/QR · consent · tray     │
+│  UI (egui everywhere, D10): onboarding · ID/QR · consent · indicator      │
 ├───────────────────────────────────────────────────────────────────────────┤
 │ session (orchestrator)                                                    │
 │  ┌─────────────┐  ┌──────────────┐  ┌───────────────────────────────────┐ │
@@ -217,9 +229,9 @@ tornect/
 │   ├── tornect-proto/          # media wire format, packetizer/depacketizer, FEC,
 │   │                           #   jitter buffer, pacer, ABR controller, stats
 │   ├── tornect-capture/        # trait VideoCaptureSource + wgc/ sckit/ pipewire/ backends
-│   ├── tornect-codec/          # trait Encoder/Decoder + ffmpeg-hw backend (nvenc/amf/
-│   │                           #   qsv/vaapi/videotoolbox; libx264 when the system FFmpeg
-│   │                           #   has it) + the always-compiled openh264 software fallback
+│   ├── tornect-codec/          # trait Encoder/Decoder + Media Foundation and NVENC backends
+│   │                           #   (Windows, M-CODEC-2/3), VA-API designed, not shipped (Linux),
+│   │                           #   + the always-compiled openh264, both directions (D8, r7: no FFmpeg)
 │   ├── tornect-audio/          # capture (wasapi/sckit/pipewire), opus enc/dec, playback (cpal)
 │   ├── tornect-input/          # client-side event mapping; host-side inject backends
 │   ├── tornect-ui-kit/         # design tokens/themes/widgets/l10n (docs/UI_PLAN.md §4); created at `u1`, Part F.6
@@ -230,17 +242,75 @@ tornect/
 │   └── tornect-session/        # host & client state machines wiring everything; unattended: the
 │                               #   UI-backed BlockWindow/LocalAllow impls + Candidates onward (§B.8.14)
 ├── apps/
-│   └── tornect/                # app: Iced shell (tray, popups, settings) + winit/wgpu/egui
-│                               #   stream window on one loop, indicator as a separate process (D10); host-role IPC
+│   └── tornect/                # app: egui shell (pages, consent sheets, settings) + the stream
+│                               #   window on one manual winit/wgpu loop, the indicator in the same process (D10, r7); host-role IPC
 │                               #   dispatch loop (decodes with the core codec, dispatches to the
 │                               #   MutationGuard, §B.8.7.4)
-├── xtask/                      # cargo xtask: dist, packaging, ffmpeg fetch, lint-all
+├── xtask/                      # cargo xtask: dist, pt-fetch, packaging, lint-all
 ├── fuzz/                       # cargo-fuzz targets (§D.5); excluded from the workspace
 └── tests/
     ├── integration/            # loopback e2e, signaling-over-localhost-tor mocks,
     │                           #   unattended adversarial suite (§B.8.15)
     └── netem/                  # scripted latency/loss/jitter harness (linux netns)
 ```
+
+### B.1.1 Product modes (r7; decisions M1-58, M1-65; milestone M-FEAT-6)
+
+Tornect runs in one of two modes on Linux and Windows. Both keep state in the same per-user places (D13, B.8.9:
+`%LOCALAPPDATA%` / `%APPDATA%\Tornect`, the XDG directories), so switching modes keeps pairings and grants, and one host
+runs per home (`state/host.lock`, M1-46).
+
+- **Standalone.** The released executable runs from any folder and installs nothing: no Start-menu entry, no
+  administrator component. "Start Tornect when I sign in" stays available for an executable inside the user's profile
+  (M1-53 rule (i)), which makes it a per-user installation, still without administrator level. **No portable state
+  directory** beside the executable: Windows already refuses a home outside the profile (M1-53 (10)), removable media
+  usually carry no ACLs, so the owner-only guarantees of D13/B.8.9 would not hold, and the identity key would travel on
+  the stick. Attended sessions offer every level except administrator (§B.2.1); unattended grants are served while the
+  app runs, without administrator level. **No administrator access from the standalone app** (the operator's ruling of
+  2026-09-27, decision M1-65): elevating an executable in a user-writable folder lets any program of that user replace
+  it, or put a DLL beside it, before the Windows prompt appears.
+- **Installed** (planned, M-FEAT-6). Windows: `tornect install` — an access-increasing guard operation (re-auth, no
+  remote session in the last 60 s, logged; §B.8.6.2) followed by UAC — will copy the executable into Program Files (the
+  folder resolved from `FOLDERID_ProgramFiles`, never from the environment), check after the copy that the folder and
+  the executable carry no write, delete or owner-change entry for a non-administrator principal, add a Start-menu entry
+  and an Apps-and-features uninstall entry (written under HKLM in the same UAC step; its command is the quoted absolute
+  path of the installed executable with a fixed argument), and offer "Start Tornect when I sign in" (the at-logon task of
+  M1-53). `tornect uninstall` reverses all of it the same way. MSI/winget stay M8 packaging. Linux: a per-user install
+  without root — the executable in `~/.local/bin` (it passes M1-53's ownership rule), a `.desktop` entry and "Start
+  Tornect when I sign in".
+
+**What starts at sign-in will be the app, not the headless host** (decision M1-58; a deviation from M1-53's F2-1 rule,
+for the app only). The autostart will launch `tornect --background`: the window host with its window minimised (on
+GNOME Wayland a normal window where the compositor ignores the minimise request, NEEDS-DEVICE(gnome)), the consent
+sheet, the sharing banner and the always-on-top indicator. It serves attended requests (the sheet raises attention and
+mirrors an OS notification, never a toast alone, B.8.7.3) and unattended grants, under these gates (MUST): unattended
+sessions only once M-FEAT-5's block window is in and a readiness row "indicator shown" passes before the first unattended
+start after each sign-in (on Wayland, with no topmost window, the compositor's screen-sharing indicator of §B.8.8 is the
+fallback); the headless `tornect host` without a terminal stays pings-only (M1-53, the operator's ruling "Pings only
+when headless", M1-54); a second launch brings the running window forward (`IpcOp::Show`, §B.8.7.4) instead of failing
+on `host.lock`, and that only raises the window — it never answers, dismisses or re-orders a sheet, and it re-arms any
+sheet (§B.2.1). Recommended: in background mode, pairing from new devices is off by default ("Accept new devices only
+while Tornect's window is open"); requests from paired devices stay on. On Linux the app's autostart will be an XDG
+autostart entry (`~/.config/autostart/`), which inherits the graphical session's environment — a deviation from M1-53's
+"no XDG-autostart fallback", which concerned the headless host's unit; whether such an entry runs inside the logind
+session (the polkit revocation of §B.2.1 and the portal's restore token depend on it) is NEEDS-DEVICE(gnome, kde),
+checked at the build VM console. The setting's copy says that starting at sign-in means a Tor connection at every
+sign-in, visible to the local network and the provider as Tor use.
+
+**"Starts with the computer", stated plainly (v1).** Windows: Tornect starts when you sign in; with Windows automatic
+sign-in — the owner's choice, never configured by Tornect; a pre-boot disk PIN still needs a person at every boot — that
+is at boot. Before sign-in, on the lock screen and on Windows permission prompts the computer cannot be seen or
+controlled; the client says "<host> is offline, asleep, locked or signed out". Linux: Tornect starts when you sign in to
+the desktop; before sign-in nothing can be shared (no user session; the greeter runs its own), and GNOME's lock screen
+closes remote access by design (§A.4 item 6). Reaching the Windows sign-in screen, lock screen and permission prompts
+needs a SYSTEM service: roadmap M-SVC-W, after the initial release (decision M1-61, Part C). Linux before sign-in is not
+planned: a pings-only presence at boot through `loginctl enable-linger` would say only "online, nobody signed in", needs
+the identity key readable without the keyring, and keeps user processes alive after logout; sign-in-screen access is a
+root/greeter matter (D11 rejects a root host).
+
+Platform truth: the at-logon task and the Linux user unit are built (M1-53; the unit's round trip verified on the build
+VM); UAC for `tornect install`, the minimised start and `ask_attention` on Windows, XDG autostart and minimise on
+GNOME/KDE: NEEDS-DEVICE.
 
 ### B.2 Connection lifecycle (the user's flow, made precise)
 
@@ -266,13 +336,14 @@ HELLO_ACK{v chosen, host_nonce} ──►                                   (sig
    └─ else: device already trusted
 ◄── SESSION_REQUEST{caps: codecs, max_res, hdr, monitors_wanted, unattended?}  (signed)
    ┌──────────────────────────────────────┐
-   │ SESSION POPUP on host: Allow once /  │  (never skippable — no "always allow";
-   │ Allow once (view-only) / Deny        │   link "Set up unattended access…" opens
-   └──────────────────────────────────────┘   the local §B.8 enable flow)
+   │ SESSION POPUP on host (§B.2.1):      │  (never skippable — no "always allow";
+   │ Deny / View only / Allow / Allow as  │   link "Set up unattended access…" opens
+   │ administrator… (Windows, installed)  │   the local §B.8 enable flow)
+   └──────────────────────────────────────┘
    └─ unattended branch (§B.8.4), no popup: AUTH_CHALLENGE{ke2} ──►  ◄── AUTH_RESPONSE{ke3}
       pinned device key + per-grant password (OPAQUE) replace the click; block window
       with [Block] on the host; indicator + log unchanged
-SESSION_ACCEPT{caps chosen, session_token | token_confirm, quic_spki, session_type, mode}
+SESSION_ACCEPT{caps chosen, session_token | token_confirm, quic_spki, session_type, mode, elevation? (r7, §B.2.1)}
 ◄── CANDIDATES{[]}  ──── both sides gather in parallel ────  CANDIDATES{[]} ──►
         host: local addrs, UPnP/NAT-PMP mapped, STUN reflexive (if enabled)
 punch: STUN-style probes *outside QUIC*, both sides at once on the shared media socket
@@ -301,6 +372,90 @@ still gets a block window, the indicator and the log; capture begins only after
 SESSION_ACCEPT (for an unattended session it is sent only once the block window has
 elapsed without Block, §B.8.4.5); a persistent
 on-screen session indicator + tray state shows "screen is being shared" with one-click kill.
+
+### B.2.1 Session levels (r7; decisions M1-64, M1-65, M1-57; milestones M-FEAT-2, M-UI-3, M-FEAT-3)
+
+Built at `3aa1072`: the attended sheet answers Deny · View only · Allow control (`SessionDecision { AllowOnce,
+AllowOnceViewOnly, Deny }`), Deny first, every accept pointer-only and armed after the sheet has been still for 1 s
+(M1-50). The levels below are planned.
+
+The attended sheet will read "**<name> wants to connect to this computer**", where <name> is the saved name only when
+the requester's 32-byte device key equals a pinned key, and otherwise its device words, labelled as such (§B.6.1).
+Answers, in this order — Deny first in screen, Tab and screen-reader order; every accept pointer-only, armed only after
+the sheet has been still for 1 s and re-armed on return (M1-50, unchanged):
+
+| Answer | Level (mode, elevation) | Line under it |
+|---|---|---|
+| **Deny** | — | — |
+| **View only** | (view, none) | "They see this screen. They cannot type or click." |
+| **Allow** | (control, none) | Windows: "They can type and click as you. Programs running as administrator ignore their input." Linux: the Linux sentence of the table below |
+| **Allow as administrator…** (Windows, where the table below offers it) | (control, admin) | "Windows asks you to confirm next. They can change anything on this computer, including Tornect's settings and its log, and the changes stay after the session." |
+
+Four answers on Windows, three on Linux, View only kept (the operator's ruling of 2026-09-27, decision M1-64).
+`SessionDecision` gains `AllowOnceAdmin`; `SESSION_ACCEPT` gains the optional signed key `elevation` (§B.8.4.1), shown
+in the client HUD as "Control · administrator"; view-only never carries elevation. **A level the host cannot deliver is
+not shown** — no greyed button; one sentence under the buttons says why:
+
+| Host state | Buttons | Sentence |
+|---|---|---|
+| Windows, installed in Program Files, UAC on (standard or administrator account) | Deny · View only · Allow · Allow as administrator… | — |
+| Windows, standalone (run from any other folder, §B.1.1; decision M1-65) | Deny · View only · Allow | "Administrator access needs Tornect installed on this computer." |
+| Windows, UAC off (`EnableLUA` 0) or the built-in Administrator without Admin Approval Mode (`FilterAdministratorToken` 0) | Deny · View only · **Allow as administrator** (no "…"; a Tornect confirmation follows) | "Windows runs every program on this account as administrator, so control always includes administrator access." |
+| Windows, standard account where policy denies elevation (`ConsentPromptBehaviorUser` 0) | Deny · View only · Allow | "This computer's policy does not let administrator access be given here." |
+| Windows, administrator account set to elevate without prompting (`ConsentPromptBehaviorAdmin` 0) | Deny · View only · Allow · Allow as administrator (no "…"; a Tornect confirmation follows) | the administrator line without its first sentence |
+| Windows, the host itself started elevated while UAC is on | none: the host refuses to open the onion service | "Start Tornect normally; administrator access is given per session." |
+| Linux (every desktop) | Deny · View only · Allow | "On Linux, Tornect never runs as administrator. They can do what you can do without a password; when the system asks for a password, they see that window and can type into it." |
+
+When readiness reads `PromptOnSecureDesktop` 0, the sheet adds at every level: "Windows permission prompts appear on the
+shared screen here." (the remote sees them; a credential prompt shows the account name). If the Windows test shows that
+a medium-integrity `SendInput` can answer such a prompt (NEEDS-DEVICE(windows)), those machines join the UAC-off row.
+
+After **Allow as administrator…** the host asks Windows to start the administrator helper (§B.8.7.5); Windows shows its
+own prompt, on the secure desktop by default: consent for an administrator account, an administrator's user name and
+password for a standard account ("Prompt for credentials" is the default for standard users). If that prompt is
+cancelled or fails, the sheet stays open with the other answers and the line "Administrator access was not given"; the
+popup timeout keeps running (`POPUP_TIMEOUT`, B.8.4.6). The session never starts silently at a lower level after an
+administrator answer: the person at the computer answers again. Arming (MUST): where no Windows prompt follows, "Allow
+as administrator" opens a Tornect confirmation (Deny first, armed after 1 s, the administrator line); the administrator
+answer is never adjacent to Allow; the return from a Windows prompt, a window raise (`IpcOp::Show`) and a restore from
+minimised re-arm the sheet. The level is fixed at `SESSION_ACCEPT`: a helper that arrives after the 5 s budget is
+terminated, never attached, so no session rises to administrator midway. A new device still sees two sheets in sequence
+(pairing, then this one): the pairing answer pins a key and never grants a session (B.8.4.5 strict alternation); sheets
+are never shown during a live remote session (B.8.6.2). Recommended: for a device paired moments before, the
+administrator answer carries the wizard's scam line (T10), and the help text says that Tornect shows a Windows prompt
+only right after "Allow as administrator…" is clicked.
+
+**What "administrator access" is, per platform.**
+- **Windows: a per-session elevation**, answered by the person at the computer at accept time. It starts one elevated
+  input helper for that session only, while the network-facing host (Tor, CBOR, the FSM, capture) stays at the user's
+  normal (medium) integrity. It gives exactly one thing: the remote's input reaches windows of elevated programs. It
+  never reaches the secure desktop (UAC prompts, the Ctrl+Alt+Del screen, lock and sign-in screens): only a SYSTEM
+  service with a per-session process would (M-SVC-W, roadmap). Unattended sessions cannot use a prompt; their elevation
+  is authorised at setup (§B.8.7.1).
+- **Windows, "Allow" is enforced by Windows**, not by Tornect: SendInput "is subject to UIPI. Applications are permitted
+  to inject input only into applications that are at an equal or lesser integrity level", and "neither GetLastError nor
+  the return value will indicate the failure was caused by UIPI blocking" (Microsoft's SendInput documentation, read
+  2026-09-27). On a standard account that is a real boundary (an administrator's password in a prompt the remote cannot
+  reach); on an administrator account UAC is not a security boundary (UNVERIFIED citation; the release notes already say
+  so), so "Allow" stops casual administrator use, not a determined controller. Because UIPI fails silently, the client
+  will say "Some windows here run as administrator; your clicks cannot reach them in this session." On a host where an
+  admin grant exists, T9 (§B.8.2) applies.
+- **Linux: no administrator level exists to give.** The host runs as the signed-in user and never as root (D11). "Without
+  administrator access" cannot be enforced beyond the system's own password dialogs: many administrator-class actions
+  ask for no password in an active local session (polkit actions with `allow_active` `yes`, a `sudo` timestamp cached in
+  an open terminal), portal-injected input is the session's own input, and no public interface found tells a session
+  process that an authentication dialog is on screen (UNVERIFIED; NEEDS-DEVICE(gnome, kde): confirm that injected keys
+  reach the authentication dialog). What Tornect will do (M-FEAT-2): revoke the session's polkit remembered approvals when every
+  Control session starts and whenever the authority reports a change during it — "pkcheck --revoke-temp will revoke all
+  temporary authorizations for the current session" (pkcheck(1), read on the build VM); the D-Bus method it wraps is
+  UNVERIFIED by name, the "authority changed" semantics are UNVERIFIED, and "current session" depends on the process
+  context the app runs in (NEEDS-DEVICE(gnome, kde) under XDG autostart, §B.1.1). It only makes the local person type a
+  password again: the Linux help discloses it and never describes it as enforcement. Not reachable: a `sudo` credential
+  cached in an open terminal (stated in the Linux help).
+
+Platform truth: the per-session UAC helper path, the standard-account credential path (the helper then runs as the
+administrator whose password was typed, on the user's desktop), WGC/GDI capture of elevated windows at medium integrity
+and the `PromptOnSecureDesktop` 0 case: NEEDS-DEVICE(windows).
 
 ### B.3 Signaling protocol (`tornect-signal`)
 
@@ -415,7 +570,7 @@ Host per-frame path (targets in §B.7):
 
 ```
 [Compositor/OS] → capture backend → GPU texture (DMABUF | D3D11Texture2D | IOSurface)
-   → (same-GPU map, no download) → FFmpeg hw frame → encoder (NVENC/AMF/QSV/VAAPI/VT)
+   → (same-GPU map, no download) → encoder (Windows: NVENC / Media Foundation MFT; OpenH264 everywhere; r7)
    → bitstream → packetizer → FEC → pacer → quinn datagrams
 ```
 
@@ -441,28 +596,53 @@ ts, dirty_rects?, cursor}`):
   "embedded" fallback. The lock screen closes the session (§A.4 item 6).
 - `x11` backend explicitly out of v1 scope (document; Wayland-first per product).
 
-Encoder selection at runtime: probe in order [platform-native pref list per vendor
-from §A.2], score by (codec ≥ requested, 4:4:4 support, 10-bit support, measured
-encode ms on a 3-frame warmup), pick best; expose override in settings. Software
-fallback: **`openh264`** (`=0.9.8`, `source` feature — Cisco's source compiled by `cc`, C++
+**Encoders and decoders (v1; r7, decision M1-56 — replaces r6's FFmpeg route; milestones M-CODEC-1…3).** Windows:
+Media Foundation hardware encoder MFTs (vendor-neutral: NVIDIA, AMD and Intel through their drivers; to be tested on
+NVIDIA only) and **NVENC directly** (NVIDIA: `nvEncodeAPI64.dll` from the driver, loaded from System32 by absolute path,
+never from the application folder or a search path; the NVENC function table's struct versions checked against the
+driver's maximum supported version before use, else OpenH264; the header's licence is UNVERIFIED — the notice inside
+the header decides and is recorded in the third-party notices before it is vendored; nothing NVIDIA ships in the zips);
+decode through the Media Foundation H.264 decoder with D3D11/DXVA. Linux: OpenH264 both ways; VA-API (Intel iHD, AMD
+radeonsi) and NVENC over CUDA are designed behind the same trait and built in CI, **not shipped enabled** until a test
+machine exists (roadmap M-CODEC-6; the operator's ruling "Software on Linux, hardware on Windows"). Everywhere: OpenH264
+always compiled — the fallback and the reference decoder for conformance. **One wire format:** every hardware encoder is
+configured for H.264 **Constrained Baseline**, Annex-B, SPS/PPS before every IDR, no B-frames, infinite GOP with an IDR
+only on request or join (intra refresh where offered), CBR at the session bitrate — wire codec 1, which every existing
+viewer decodes; the host may fall back to OpenH264 mid-session with an IDR and the viewer never notices. No wire change;
+High profile, HEVC and AV1 wait for a decoder-capability negotiation (roadmap M-CODEC-5). Selection: probe in order
+[NVENC, MF hardware, OpenH264] on Windows, [OpenH264] on Linux; any failure falls back to OpenH264 with an IDR and is
+logged; `tornect doctor` prints one line per direction naming the GPU vendor and the encoder's friendly name, never
+serials or UUIDs. Encoder FFI stays in the host process (its input is the host's own screen), in per-backend modules
+that confine `unsafe` with `// SAFETY:` notes. Hardware codecs are NEEDS-DEVICE(windows-nvidia); AMD and Intel on
+Windows are designed through Media Foundation and untested (NEEDS-DEVICE(windows-amd), NEEDS-DEVICE(windows-intel)).
+
+**The parser gate (MUST; M-CODEC-1).** Every client enforces it on receive — a hostile host chooses what it sends: a
+pure-Rust NAL/SPS/PPS parser (`forbid(unsafe_code)`, fuzzed) checks every access unit before any hardware decoder sees
+it. It accepts NAL types 1, 5, 7 and 8 (9 if needed) and drops everything else before the decoder, SEI included;
+requires `profile_idc` 66 with `constraint_set1_flag` 1, one slice group, no redundant pictures,
+`frame_mbs_only_flag` 1, `level_idc` ≤ a fixed cap, an SPS picture size equal to the size the session announced and
+never above a fixed maximum, `max_num_ref_frames` ≤ a small cap, SPS/PPS ids in range and sane slice headers
+(`first_mb_in_slice` inside the picture, I and P slices only); and caps the bytes per access unit. A rejection or a
+decoder error requests an IDR at most N times, then ends the session — never a crash, never a retry loop. The fuzz
+corpus and the Windows hostile-corpus run exercise it. The gate applies to every later decoder too (MediaCodec,
+M-CODEC-4). An out-of-process decoder with a restricted token is on the roadmap (recommended).
+
+Software path: **`openh264`** (`=0.9.8`, `source` feature — Cisco's source compiled by `cc`, C++
 fallback when `nasm` is absent) is the always-compiled H.264 path, **both directions, all
 OSes**, and the only real-time video codec this dev VM can build and run (rav1e builds but is not
 real-time, codecs.md §4.2; FFmpeg does not build here at all, codecs.md §0; 4:2:0 only; measured here 23.4 ms/frame
 encode, 5.4 ms decode at 1080p without asm — CI installs `nasm` for ~3×; CI additionally
 exercises FFmpeg's software paths — libx264, the native h264/hevc decoders, `libdav1d` — through
-`libavcodec-dev`, but no hardware backend: codecs.md §2.1–§2.2, ci.md §3). libx264 (`ultrafast+zerolatency`, 4:4:4 text mode; GPL, compatible with our
-GPL-3.0-or-later) is used only opportunistically through FFmpeg when the system build has
-it — never x264-first. **No `rav1e`/`svt-av1` "potato mode" and no `dav1d` crate in v1**:
-rav1e measured 0.65 s/frame at 1080p on this VM; AV1 is hardware-only (NVENC Ada+, VAAPI
-Arc/RDNA3+, AMF) and is decoded through FFmpeg (`av1` hwaccel or `libdav1d`); a software AV1
-path, if ever, is FFmpeg `libsvtav1`. Patent posture (source build vs Cisco's blob via
+`libavcodec-dev`, but no hardware backend: codecs.md §2.1–§2.2, ci.md §3; an r6 job — no FFmpeg in v1 since r7). libx264 is not used in v1 (it came only through FFmpeg; r7). **No `rav1e`/`svt-av1` "potato mode" and no `dav1d` crate in v1**:
+rav1e measured 0.65 s/frame at 1080p on this VM; AV1 waits for the decoder-capability negotiation
+(roadmap M-CODEC-5, r7). Patent posture (source build vs Cisco's blob via
 `libloading`) is an M8 legal decision. (docs/research/codecs.md §0, §3, §4.2–§4.3, §11.1;
 SUMMARY.md §1.5)
 
-Client render: `winit` window → decode (FFmpeg hwaccel: D3D11VA/VideoToolbox/VAAPI; software:
-`openh264` for H.264 always, FFmpeg `av1`/`libdav1d` for AV1 where the `ffmpeg` feature is built
-→ map to wgpu texture when same-API, else NV12/P010 CPU upload path first, zero-copy
-interop as M7 optimization) → wgpu YUV→RGB(A)/tonemap shader → present with
+Client render: `winit` window → the parser gate → decode (r7 — Windows: the Media Foundation H.264 decoder with
+D3D11/DXVA; everywhere: `openh264` → map to wgpu texture when same-API, else NV12 CPU upload path first,
+zero-copy interop as M7 optimization) → wgpu YUV→RGB(A) shader (planned, M-CODEC-1; at `3aa1072` the viewer
+converts YUV→RGB on the CPU) → present with
 mailbox/immediate mode; frame pacing: present-on-arrival with optional vsync-aligned
 "smooth" mode.
 
@@ -516,6 +696,60 @@ scancode for games, keysym for typing (per-app heuristic toggle in HUD).
 - Threats explicitly *out of scope* v1: compromised endpoints, Tor global passive
   adversary deanonymization, side-channels in shared GPU environments.
 
+### B.6.1 Names people read (r7; decision M1-63; milestone M-FEAT-1)
+
+Built at `3aa1072`: the sheet shows a 16-hex device fingerprint (64 bits of SHA-256, unstretched), and the redesign's
+identicon is drawn from it. Planned:
+
+1. The **saved name** is the trust anchor and appears only when all 32 bytes of the key equal a pinned key; an alias is
+   never shown where the pinned label is the trust anchor on a consent sheet.
+2. **Device words**, for recognition only: `h = Argon2id(key32, salt = "tornect/v1/words/" || role, 8-byte output)` with
+   Argon2id version 0x13, **m = 64 MiB, t = 1, p = 1**, `role` ∈ {`onion`, `device`}; the first 44 bits of `h` as four
+   BIP39-English indices, shown `amber · crisp · lantern · orbit`; cached per entry; computed for an unknown key only for
+   the sheet on screen, off the network task, after the rate limiter admits the request, one sheet at a time and at most
+   one derivation per second per host; golden vectors for both roles are committed. **Frozen** (the operator's ruling of
+   2026-09-27): the derivation and these parameters bind every later client, Android included. The only change allowed
+   before the first release is m = 32 MiB (t = 1), and only if the phone benchmark exceeds 500 ms
+   (NEEDS-DEVICE(android)); never lower; after the release a change needs a new salt.
+3. **Strength, stated:** 44 bits, stretched; the GPU rate at these parameters is UNVERIFIED, and a full look-alike of one
+   saved device is within reach of a rented GPU fleet in hours to weeks (an estimate, UNVERIFIED). That is adequate for
+   recognition and never an authenticator: for a known key the saved name decides (the look-alike gets "not yet
+   trusted", and the closer it is, the surer the alarm fires); at first contact the 6-digit commit-reveal code decides
+   (10^-6 per attempt, rate-limited).
+4. **The look-alike alarm** (machine-run, on host sheets and on the client's connect field) fires on: the same first
+   word; ≥ 2 shared words in any position; the same identicon; a declared name confusable with a saved name (Unicode
+   skeleton); or a word equal to a word of a saved name or alias (case-folded). On the host a fired alarm turns the
+   pairing accept into typing the other device's 6 digits, checked by the host against its own code (no wire change). On
+   the client a pasted address that is not in the book but meets these thresholds against a saved entry, or shares its
+   first or last four characters with one, shows "Looks like your saved "<name>", but it is a different address", and
+   Connect then needs a second, deliberate click.
+5. **Which words a person reads:** the host's sheet names the requester's *device* key, whose words differ from its
+   onion address's words. The home card leads with "When you connect to another computer, it shows: <device words>";
+   the address's own words, if shown at all, sit under the address, labelled "this address". One set per machine is a
+   wire change (roadmap).
+6. **One short form only** (a deviation from §B.8.7.3): the 16-hex fingerprint leaves every surface; duplicate labels
+   get a numeric suffix at pin time ("Laptop (2)"); the identicon is drawn from `h` and shown **only next to a saved
+   name, never beside an unpinned key**.
+7. **Wording.** A sheet may say "<saved name> wants to connect" (exact key match only), show the words labelled "device
+   words", and say "not yet trusted · compare the code". It may not say "verified", "known", "trusted" or "your device"
+   for an unpinned key, put words in the name slot or style them as a name, call device-role words an "ID" or
+   "address", or hint that words are a password or a check. Help: "Device words help you recognise a device. They do
+   not prove who it is; the code does."
+8. **The words never authenticate:** no lookup, selection, unlock, grant, pin, auto-fill or connect by words, identicon,
+   `h` or a partial address; address-book search may match words to list entries, never act on one. Connecting stays
+   the full address, QR, link or paste.
+9. **Privacy:** the words are a stable pseudonym — never sent, never in logs, window titles, notifications, diagnostics
+   or crash reports.
+
+**M-FEAT-1 MUST** (any one failing fails the milestone's security check): W-B1 no decision (pin, grant, saved-name
+display, connect) keyed on words, identicon, `h` or a partial address; W-B2 no saved name or alias for a key that is not
+an exact 32-byte match of the pinned key; W-B3 no fired alarm reaches a pairing accept without the typed digits checked
+by the host against its own code; W-B4 no words, `h` or identicon seed on the wire, in logs, window titles,
+notifications, diagnostics or crash reports; W-B5 no Argon2id for unknown keys outside one sheet at a time and one per
+second, or before the rate limiter; W-B6 no platform whose words differ from the golden vectors, and no parameter change
+after the release without a new salt; W-B7 no second key-derived short form (hex fingerprint) on the same surface; W-B8
+no identicon beside an unpinned key.
+
 ### B.7 Latency & quality budgets (acceptance targets, 1080p60 direct path)
 
 | Stage | Target | Hard cap |
@@ -551,7 +785,7 @@ in-HUD latency overlay (like Moonlight's) + `tracing` spans.
 
 | Term | Meaning |
 |---|---|
-| Attended session | A human on the host clicks *Allow once* / *Allow once (view-only)* in the §B.2 popup. |
+| Attended session | The person at the host answers the §B.2 popup: at `3aa1072` *Allow once* / *Allow once (view-only)*; from r7 (§B.2.1) *View only*, *Allow* or — Windows, installed — *Allow as administrator…* |
 | Unattended session | Started with no click. Requires **F1** possession of a SAS-pinned device key (fresh signature in this stream) *and* **F2** knowledge of that grant's password (PAKE). Nothing else opens this path. |
 | Grant | Host-local record `{device_pk, mode, schedule, expiry, limits, auth record, fail state}` for one paired device. One grant per `device_pk`. Created/widened only locally, with OS re-authentication — by the UI or the CLI through the running host, or, with no host running, by the CLI holding the store lock and running the same `MutationGuard` + `ReAuth` code (B.8.6.2, B.8.14); unlocked locally the same way or by an admin request from a Control grant of the *My machines* preset (B.8.6.2). |
 | Grant password | Chosen per grant at enable time, typed on the host once (host runs both OPAQUE roles in-process, then zeroizes it) and on the client at login. Never transmitted at login; with suite 1 never stored on the host (the SPAKE2 fallback suite stores a wrapped password-equivalent, B.8.4.7). Blast radius of a leaked password = one device. |
@@ -563,8 +797,9 @@ in-HUD latency overlay (like Moonlight's) + `tracing` spans.
 **Scope (v1):** hosts inside a logged-in, unlocked desktop session on Windows, macOS, GNOME ≥ 45
 / KDE Plasma 6 (`wayland.md` §9.5); direct, Paranoid and LAN-only transports; control or
 view-only. **Non-goals (v1):** remote grant creation or password reset (no message exists);
-login screens, the Windows secure desktop, the GNOME lock shield, pre-boot disk unlock (v2
-"service mode", B.8.8); waking sleeping hosts (WoL backlog); multi-user hosts; mobile clients.
+login screens, the Windows secure desktop, the GNOME lock shield, pre-boot disk unlock (Windows: roadmap M-SVC-W
+after the release, B.8.8, Part C); waking sleeping hosts (WoL backlog); multi-user hosts; mobile clients (Android:
+the roadmap entry of Part C and Part F.7).
 
 | Story | Preset | Defaults | Notes |
 |---|---|---|---|
@@ -592,7 +827,7 @@ and log bound an *honest* or *stolen* device, not a hostile controller who is al
 | T6 | Recorded transcript | — | Replay (client nonce in HELLO and host nonce in HELLO_ACK make both signatures fresh from either side's view; per-stream KE1/KE2; `msg_id`); reflect (roles asymmetric) | B.8.4.3 |
 | T7 | Phishing host (user dials attacker's onion) | Receive HELLO (incl. a `stop_token` bound to its own pk, useless at the real host, B.8.7.4) and KE1 (blinded, useless) | Relay to the real host: `context`/`identifiers` embed the dialed onion pk; KE3 MAC fails; with suite 1 the client emits nothing password-derived before KE2 verifies; with suite 2 it gets one online guess per stream and no offline oracle (`pA` blinded by `x`, `cA` verifiable only for the guess embedded in `pB`) | PAKE (B.8.4.7 for the fallback suite) |
 | T8 | Downgrade | Ask for an attended session (strictly safer) | Force a weaker suite/KSF (suite fixed per grant and a build-time constant on the client — never derived from `HELLO_ACK.feats` when suite 1 is compiled in, B.8.4.2; KSF constants inside the suite; suite byte in signed transcript + context) | B.8.4.4 |
-| T9 | Malicious or compromised **granted Control** device | Everything the OS user can: read keys, start scripts, edit files, delete logs — including reading `K_master` from the user keychain (readable without presence, which is what autostart requires) and therefore rewriting the store, the generation anchor and the log chain, then restarting the host; on a Windows host started from the opt-in elevated autostart task (B.8.7.5) every Control session is additionally an administrator session | Use Tornect's *own* surfaces (UI, IPC, CLI) to create/widen/unlock grants or rebind the panic key without the OS credential: there, mutations need OS re-auth and no active session, and popups are never shown during a remote session. Re-auth and the mutation guard raise the bar for misuse through those surfaces and make changes visible (banner, notifications); they do not stop an endpoint-level rewrite, which is endpoint compromise — out of scope per §B.6 and the reason presets default helpers to view-only | Least-privilege presets (view-only default for helpers — the real control), block window, panic key, remote revoke; the log chain detects tampering only by parties without `K_master` (macOS Keychain code-signing ACLs partially mitigate; presence-gated policy signing is backlog, B.8.9) |
+| T9 | Malicious or compromised **granted Control** device | Everything the OS user can: read keys, start scripts, edit files, delete logs — including reading `K_master` from the user keychain (readable without presence, which is what autostart requires) and therefore rewriting the store, the generation anchor and the log chain, then restarting the host. On a Windows host (r7, §B.2.1, B.8.7.5): a session answered *Allow as administrator* and a Control session of an admin grant are administrator sessions; **while any admin grant exists, any program running as the user can start the administrator helper, so every Control session on that host can reach administrator windows**; on a host with no admin grant, Windows keeps other sessions out of administrator windows (UIPI) — on an administrator account that is not a security boundary. Until M-FEAT-3 replaces it, a host started from the whole-host elevated task of M1-53 makes every Control session an administrator session | Use Tornect's *own* surfaces (UI, IPC, CLI) to create/widen/unlock grants or rebind the panic key without the OS credential: there, mutations need OS re-auth and no active session, and popups are never shown during a remote session. Re-auth and the mutation guard raise the bar for misuse through those surfaces and make changes visible (banner, notifications); they do not stop an endpoint-level rewrite, which is endpoint compromise — out of scope per §B.6 and the reason presets default helpers to view-only | Least-privilege presets (view-only default for helpers — the real control), block window, panic key, remote revoke; the log chain detects tampering only by parties without `K_master` (macOS Keychain code-signing ACLs partially mitigate; presence-gated policy signing is backlog, B.8.9) |
 | T10 | Coercion / support scam | Talk the owner through pairing + granting | Do it remotely, silently or instantly (12 h cooling-off for helpers; re-auth; scam step in the wizard) | B.8.7.1 |
 | T11 | Lockout-as-DoS | Burn the grant of a key it holds (incl. a cloned key) | Lock other grants (counters per grant; global limits only answer `UA_BUSY`, and uncharged `HelloVerified` streams never occupy them, B.8.5.2) | Remote unlock via another *My machines* Control device; `fail_summary` in `SESSION_ACCEPT` |
 | T12 | Clock manipulation (local or NTP) | By a forward wall-clock jump **across a store load** (a host restart or a keystore recovery, B.8.5.1 — which a pre-authentication attacker cannot force; a live Control session (T9) can): shorten a *persisted* lock and decay the *persisted* counters — `consecutive` by one per 24 h of jump (uncapped), `since_unlock` by at most one step per load (B.8.5.1; a keychain that locks on sleep — a macOS option — makes each wake a load: still ≤ 1 lifetime step, and the consecutive steps follow the real elapsed time unless the wall clock was also stepped); a jump beyond Tor's directory tolerance also takes the host offline | Shorten a running lock or decay a counter **at runtime** (both monotonic-clock based — a runtime NTP step is deferred, not ignored: invisible to the running limiter until the next load, where a forward step is bounded as on the left and a backward step is detected because `last_seen` is monotone, B.8.5.3); shorten any lock by rollback; revive expired grants or schedules (rollback ⇒ fail closed at load *and* at every runtime schedule/expiry check, B.8.5.3); re-open a hard-locked grant by decay (decay never clears `hard_locked`); exceed the hard-lock budget without loads (the per-load lifetime-decay cap bounds the rest) | B.8.5.1, B.8.5.3 |
@@ -647,12 +882,12 @@ HELLO            (client, signed)  += { v_max: u8, client_nonce: bytes[32], sas_
 HELLO_ACK        (host, signed)     { v: u8 /* chosen */, host_nonce: bytes[32], feats: [tstr] /* host-wide, independent of the peer (T5); no host_name — unauthenticated fingerprinting surface before F1; the client shows the paired label instead */ }
 PAIR_ACCEPT      (host)            += { host_name: tstr }   /* unpaired peers learn the name here, after consent, never before */
 SESSION_REQUEST  (client, signed)  += { unattended: Option<{ suite: u8 /* 1 = OPAQUE-3DH-r255-SHA512-Argon2id(64MiB,3,1) · 2 = SPAKE2 fallback (B.8.4.7) */,
-                                        ke1: Option<bytes[96]> /* required iff suite = 1 */, want_mode: u8 /* 0 control, 1 view-only */,
+                                        ke1: Option<bytes[96]> /* required iff suite = 1 */, want_mode: u8 /* 0 control, 1 view-only */, want_elevation: Option<u8> /* r7, M-FEAT-2: 0 none · 1 admin; absent = 0 */,
                                         intent: u8 /* 0 session, 1 admin */, admin: Option<AdminCmd> /* required iff intent = 1, else E_BAD_LEN */ }> }
 AUTH_CHALLENGE   (host)             { suite: u8, ke2: Option<bytes[320]> /* iff suite = 1 */, salt: Option<bytes[16]>, pB: Option<bytes[32]> /* iff suite = 2 */ }
                                         /* no grant policy here: block_window_s / ask_before_start travel only in the signed SESSION_ACCEPT, after F2 (T1 must not learn a veto-less target) */
 AUTH_RESPONSE    (client)           { ke3: Option<bytes[64]> /* iff suite = 1 */, pA: Option<bytes[32]>, cA: Option<bytes[32]> /* iff suite = 2 */ }
-SESSION_ACCEPT   (host, signed)    += { session_type: u8 /* 0 attended, 1 unattended */, mode: u8,
+SESSION_ACCEPT   (host, signed)    += { session_type: u8 /* 0 attended, 1 unattended */, mode: u8, elevation: Option<u8> /* r7, M-FEAT-2: 0 none · 1 admin (Windows); absent = 0; never ≠ 0 with mode = 1 */,
                                         transport_policy: u8 /* 0 any, 1 tor_only, 2 lan_only */,
                                         quic_spki: bytes[44] /* the host's Ed25519 SubjectPublicKeyInfo DER (§B.2, §B.6) — must equal the pinned pairing key, constant-time compare (B.8.4.2, B.8.16); exact length asserted by F1 */,
                                         session_token: Option<bytes[32]> /* attended only; MUST be absent when session_type = 1 */,
@@ -673,12 +908,18 @@ ERROR            (either)           { code: u16 /* 0x0001 E_BAD_STATE · 0x0002 
 deserialization); a suite-specific field missing for the negotiated suite, or present for the
 other one, ⇒ `E_BAD_LEN`. `want_mode` is clamped host-side to the more restrictive of the two —
 `max(grant.mode, want_mode)` under this encoding (`SessionMode::most_restrictive(a, b)`; a view-only
-grant plus `want_mode = 0` yields view-only, never Control) — never a reject. `stop_token` (B.8.7.4)
+grant plus `want_mode = 0` yields view-only, never Control) — never a reject. `want_elevation` (r7) is clamped the
+same way, to the more restrictive of the grant's `elevation` and the request — lower is the safe direction, never a
+reject — so an owner can connect without administrator rights on an admin grant; an attended session takes its level
+from the §B.2.1 answer. The level is fixed at `SESSION_ACCEPT` and never raised during a session. An old client ignores
+`elevation` (receivers ignore unknown keys), so the host's indicator and banner, not the client HUD, are the authority
+for the person at the computer; a separate optional key, not a mode value 2, keeps mode and level independent.
+`stop_token` (B.8.7.4)
 may come from any peer; it is `SHA-256("tornect/v1/stop\0" || dialed_host_onion_pk || stop_code)`,
 never the code itself; the host compares it in constant time against the value it stored at enable
 time (computed with its own pk) and otherwise ignores the field, so the unpaired path stays
 byte-identical.
-Attended sessions: `block_window_s = 0`, `ask_before_start = false`, `transport_policy` = host
+Attended sessions: `block_window_s = 0`, `ask_before_start = false`, `elevation` from the §B.2.1 answer (r7), `transport_policy` = host
 privacy mode (Paranoid ⇒ `tor_only`, LAN-only ⇒ `lan_only`, else `any`), `ends_at = None`,
 `fail_summary = None`.
 **Admin scope:** `unlock(pk)`, `suspend(pk ≠ self)`, `revoke(pk ≠ self)`, `revoke_all` and
@@ -1024,7 +1265,7 @@ B.8.14 — in the host process; UI, IPC and CLI all pass through it).**
 | Class | Operations | Allowed when | Requires |
 |---|---|---|---|
 | Deny-direction | master off, pause (12 h / until 08:00 / until re-enabled), revoke, revoke-all, disable (`Active` → `Disabled{by: Ui\|Cli}`, B.8.6.1), suspend (`Active`\|`Suspended{Admin}` → `Suspended{Local{by: Ui\|Cli}}`; no-op on `LocalBlock`/`Panic`, B.8.6.3), end session, emergency stop | always — during remote sessions, from tray, CLI, panic key, admin request or stop code | nothing |
-| Access-increasing | master on, create grant, enable grant (`Disabled` → `Active`, B.8.6.1), set/change password, unlock, resume (clears any `Suspended{…}`, B.8.6.3), extend expiry, widen schedule, mode → Control, lower block window, disable "Ask before starting", identity-key view/backup (S8 *Identity* of `docs/UI_PLAN.md` — the onion identity key leaves the keystore only behind re-auth), change notification/panic-key/keep-awake/autostart settings (autostart via `tornect service install\|uninstall` = `IpcOp::ServiceInstall\|ServiceUninstall`, B.8.7.4), backup import, backup export (it writes `K_master` + `ServerSetup` + every auth record, B.8.9; `BackupExported{by, path}` logged, banner raised) | no remote session active for ≥ 60 s | **OS re-authentication** (B.8.8 table) in a fresh dialog per operation (a two-message IPC registration is one operation: re-auth at `RegStart`, `reg_txn` at `RegFinish`, B.8.7.4) |
+| Access-increasing | master on, create grant, enable grant (`Disabled` → `Active`, B.8.6.1), set/change password, unlock, resume (clears any `Suspended{…}`, B.8.6.3), extend expiry, widen schedule, mode → Control, an admin grant's `elevation` → administrator (r7, Windows only — elsewhere `G_UNSUPPORTED`, B.8.7.1; also UAC for the helper task, B.8.7.5), lower block window, disable "Ask before starting", identity-key view/backup (S8 *Identity* of `docs/UI_PLAN.md` — the onion identity key leaves the keystore only behind re-auth), change notification/panic-key/keep-awake/autostart settings (autostart via `tornect service install\|uninstall` = `IpcOp::ServiceInstall\|ServiceUninstall`, B.8.7.4), backup import, backup export (it writes `K_master` + `ServerSetup` + every auth record, B.8.9; `BackupExported{by, path}` logged, banner raised), `tornect install\|uninstall` (r7, §B.1.1; also UAC) | no remote session active for ≥ 60 s | **OS re-authentication** (B.8.8 table) in a fresh dialog per operation (a two-message IPC registration is one operation: re-auth at `RegStart`, `reg_txn` at `RegFinish`, B.8.7.4) |
 | Remote admin (B.8.4.1) | from a *My machines* Control grant: revoke(pk), revoke_all, master_off, suspend(pk), end_session, unlock(pk) — the only remote path that clears a lockout; from any other grant: end_session (own session) and revoke (own pk) only | after F1 + F2 from a grant in `Active` state (`Suspended`/hard-locked grants cannot; `NOT_YET_ACTIVE` still applies); schedule, readiness, transport, busy and concurrency gates are skipped, so it works even while another session is live | the requester's own two factors; out-of-scope ops ⇒ `ADMIN_RESULT{ok: false}`; logged with the requester's device; unlock resets `FailState` and clears `Suspended{Admin}`, never `Suspended{LocalBlock\|Panic\|Local}` |
 
 The CLI never edits files while the host runs: it talks to the host over the local IPC
@@ -1071,7 +1312,8 @@ timestamps ± 250 ms) drives only the "While you were away" card and the optiona
 someone*) layers the Allow/Deny popup (60 s ⇒ `DENIED`) on top of the PAKE: host state
 `AwaitLocalAllow` between F2 and the block window (B.8.4.5); the client does not learn
 `ask_before_start` (nor `block_window_s`) before the signed `SESSION_ACCEPT` and waits the fixed
-110 s maximum (B.8.4.5).
+110 s maximum (B.8.4.5). For an admin grant (r7) that popup reads "<name> wants to connect as administrator" and keeps
+Deny / Allow only: the level comes from the grant (B.8.7.1).
 
 **B.8.6.4 Sessions.** One remote session per host at a time in v1 (`SESSION_ACTIVE`
 post-F2; admin requests exempt); one live session per grant: a post-F2 success from a pk that
@@ -1106,6 +1348,19 @@ lock-on-disconnect (refused with *Headless box*; warned on Windows/GNOME), "Prev
 while unattended access is on" (default off; whether `ES_DISPLAY_REQUIRED` overrides an
 `InactivityTimeoutSecs` policy lock is NEEDS-DEVICE(windows) — the copy claims only what the
 readiness probe confirms);
+⑤a (r7; Windows only; planned, M-FEAT-5 and M-UI-5) **Administrator access** — "let <device> also use programs that
+run as administrator when it connects without asking": off in every preset; *Helping someone* refuses it; *My
+machines* and *Headless box* may turn it on (the block window and "Ask before starting" stay the owner's choice; the
+step shows the grant's block window). Its warning (the operator accepted the residual with it, decision M1-62): "An
+unattended administrator session can change anything on this computer, including Tornect's own settings and its log.
+While this is on, any device with control of this computer can reach programs that run as administrator, not only
+<device>." Authority: the guard's re-auth (the user's own password, M1-53) **and** an administrator account (M1-53's
+`--elevated` check: `TokenElevationType`, linked token, `CheckTokenMembership`) **and** UAC to register the
+administrator helper task (B.8.7.5) — two dialogs, one guard operation, logged `GrantCreated|Changed{elevation}`; a
+standard account cannot create an admin grant; admin grants exist only in the installed mode (§B.1.1). On Linux the
+step is absent (the guard answers `G_UNSUPPORTED`) and the wizard says: "On Linux, Tornect runs as you. An unattended
+session can do what you can do without a password; when the system asks for a password, they see that window and can
+type into it." Linux setup keeps `auth_self`;
 ⑥ **Readiness**: capture + input permissions/restore tokens, autostart, auto-login state (never
 configured by Tornect; the pre-boot disk-unlock trade-off stated), keystore persistent and
 unlockable at autostart (canary entry), empty OS account password (detected — red:
@@ -1113,7 +1368,7 @@ unlockable at autostart (canary entry), empty OS account password (detected — 
 cannot judge the strength of your OS password; unattended access is only as safe as it" (Tornect
 can detect only the empty case), idle-lock policy (`InactivityTimeoutSecs` /
 `askForPassword` / `lock-enabled`) + current lock state, console ownership, Tor self-connect,
-panic key bound, tray; red rows need "Enable anyway — it will not work until fixed"; ⑦ summary +
+panic key bound, tray, administrator helper registered (r7, Windows, while an admin grant exists), indicator shown (r7, §B.1.1); red rows need "Enable anyway — it will not work until fixed"; ⑦ summary +
 stop-code card. Readiness re-runs at host start and every 10 min (macOS 15+ periodic
 screen-recording re-consent, Wayland token loss) ⇒ sticky in-app badge + `HOST_NOT_READY`.
 
@@ -1124,11 +1379,11 @@ runs of whitespace/hyphens between passphrase words normalized to one space on b
 name, "tornect"}, **≥ 4 when the host keystore is file-based** (where expiry is also capped at
 90 d and "never" refused, B.8.6.1); distinct passwords per host
 recommended in copy. Change = new registration for that grant (re-auth). All intermediates in
-`Zeroizing`; UI password fields cleared incl. undo state (Iced and egui widgets alike); no clipboard copy of password fields.
+`Zeroizing`; UI password fields cleared incl. undo state (egui widgets, D10); no clipboard copy of password fields.
 
 **B.8.7.3 Manager, notifications, indicator.** Main-screen badge "N devices can connect
 without asking". Per grant: pinned label (never the HELLO name; NFKC, bidi/control characters
-stripped, ≤ 64 chars, duplicates get a fingerprint suffix), fingerprint, created-by, last used,
+stripped, ≤ 64 chars, duplicates get a numeric suffix given at pin time, e.g. "Laptop (2)" — r7, §B.6.1), device words (r7: the one short form; the 16-hex fingerprint leaves this surface, §B.6.1), created-by, last used,
 state (Active / Not yet active / Disabled{by} / Suspended{reason} / Locked{until} / Hard-locked / Expired),
 `failures_since_unlock`, *Unlock* (re-auth), *Change password*, *Suspend* (`Active`|`Suspended{Admin}` →
 `Suspended{Local{by: Ui}}`, deny-direction, no re-auth; no-op on `LocalBlock`/`Panic`, B.8.6.3) and *Resume* (re-auth; clears any
@@ -1140,7 +1395,9 @@ extension): session starting (with Block), session ended, every failure from the
 (sticky; *Unlock* routes through the manager + re-auth), not-ready, "While you were away: …"
 on the first physical input after an unacknowledged session. Indicator: OS-enforced indicators
 where they exist (macOS SCK, GNOME/KDE screencast icon) plus the §B.6 pill "**Unattended** ·
-Laptop-of-Ana · Control · [End]", re-asserted every 500 ms, un-closable, on every captured monitor.
+Laptop-of-Ana · Control · [End]", re-asserted every 500 ms, un-closable, on every captured monitor. For an
+administrator session (r7) the pill, the banner and the client HUD read "control · administrator" (M1-50's row order
+kept).
 
 **B.8.7.4 Panic key, CLI, IPC, emergency stop.** Panic (`security.panic_key`, default
 Ctrl+Alt+End) ends any session and, if it was unattended, suspends that grant; pressed **twice
@@ -1151,7 +1408,8 @@ in the wizard, readiness row "Panic key: bound / unavailable"); the indicator's 
 tray item and `tornect panic` always work; rebinding needs re-auth. **CLI:** `tornect unattended
 status|on|off|pause|grant <device> [--preset …] [--waive-attended-check]|enable <device>|disable <device>|revoke <device>|--all|unlock <device>|suspend
 <device>|resume <device>|set-password
-<device>|readiness|log`, `tornect service install|uninstall|status`, `tornect panic`, `tornect
+<device>|readiness|log`, `tornect service install|uninstall|status`, `tornect install|uninstall` (r7, §B.1.1), `tornect input-helper` (r7; internal — started only by the host, B.8.7.5),
+`tornect panic`, `tornect
 backup export|import` (`--waive-attended-check` maps to `GrantOptions.waive_attended_precondition`,
 warned and logged; `backup export` is access-increasing, B.8.6.2; `disable` is deny-direction,
 `IpcOp::Disable`; `suspend` is deny-direction, `IpcOp::Suspend` (→ `Suspended{Local{by: Cli}}`, B.8.6.3);
@@ -1159,7 +1417,7 @@ warned and logged; `backup export` is access-increasing, B.8.6.2; `disable` is d
 the guard — an autostart change is access-increasing, B.8.6.2, and with no host running the CLI
 runs the guard offline like any other mutation); passwords via TTY prompt, never argv. **IPC:** `<state_dir>/ipc.sock`
 (0600, `SO_PEERCRED` check) / `\\.\pipe\tornect-<hash(state_dir)>` (owner-only DACL,
-`PIPE_REJECT_REMOTE_CLIENTS`, server SID/PID verified), owned by `tornect-platform::ipc`; the
+`PIPE_REJECT_REMOTE_CLIENTS`, server SID/PID verified; r7: an explicit DACL, never the default descriptor, and exactly one first instance, `FILE_FLAG_FIRST_PIPE_INSTANCE` — M-FEAT-5 builds the Windows pipe), owned by `tornect-platform::ipc`; the
 host holds an advisory store lock, and `state/host.lock` for its whole life (decision M1-46: one
 host per home; a host that started without its store answers `tornect panic` only, B.8.6.2).
 **Emergency stop code:** 16 random bytes shown once at enable
@@ -1186,7 +1444,8 @@ IpcOp = Status | On | Off | Pause { until: u64 } | Revoke { device: DeviceId } |
       | Resume { device } /* clears any Suspended{…}; access-increasing: re-auth, no remote session ≥ 60 s (B.8.6.2); UnattendedResumed{by} logged */
       | Enable { device } /* Disabled → Active; access-increasing (B.8.6.2) */
       | Disable { device } /* Active → Disabled{by: Ui|Cli}; deny-direction: no re-auth, a live session of that grant gets BYE{REVOKED}; GrantDisabled{by} logged (B.8.6.1) */
-      | ServiceInstall { elevated: bool /* Windows opt-in elevated task, B.8.7.5 */ } | ServiceUninstall /* tornect service install|uninstall: an autostart change is access-increasing (B.8.6.2) — re-auth, no remote session ≥ 60 s; no store write; AutostartChanged{by} logged */
+      | ServiceInstall { elevated: bool /* at `3aa1072` the Windows whole-host elevated task (M1-53); r7: replaced by the administrator helper task, registered with the first admin grant and removed with the last (B.8.7.5) */ } | ServiceUninstall /* tornect service install|uninstall: an autostart change is access-increasing (B.8.6.2) — re-auth, no remote session ≥ 60 s; no store write; AutostartChanged{by} logged */
+      | Show /* r7 (§B.1.1): raise the running window only — never answers, dismisses or re-orders a sheet; re-arms any sheet */
       | Readiness | Log { filter: tstr, after: Option<u64> } | Panic | BackupExport { path: tstr } /* access-increasing: re-auth, no remote session ≥ 60 s, BackupExported logged */ | BackupImport { path: tstr }
       | PolicyInputs                                                          → payload = { user_inputs: [tstr], min_score: u8 }   /* B.8.7.2 inputs; the CLI runs zxcvbn locally and refuses weak passwords itself */
       | RegStart  { device, reg_request: bytes[32] }                          → payload = { reg_response: bytes[64], reg_txn: bytes[16] }   /* a CBOR map like every payload; re-auth happens here; txn single-use, ≤ 120 s, bound to device */
@@ -1196,9 +1455,11 @@ payload per op: Status → StatusReport { enabled: bool, paused_until: Option<u6
                 Readiness → ReadinessSnapshot (B.8.14) · Log → { lines: [tstr], next: Option<u64> } /* paged: ≤ 60 KiB per response, `next` is the cursor for the following Log{after} */
                 every other op → payload absent
 GrantOptions = { label, mode, schedule, expires_at, auto_renew, max_session_secs, block_window_s, ask_before_start, require_absent,
-                 require_tor_only, lock_on_disconnect, hard_lock_after, waive_attended_precondition: bool }   /* the policy subset of UnattendedGrant (B.8.9); also the argument type of MutationGuard::create_grant / set_options (B.8.14) */
+                 require_tor_only, lock_on_disconnect, hard_lock_after, waive_attended_precondition: bool,
+                 elevation /* r7: None | Admin — Windows only, access-increasing to set (B.8.7.1) */ }   /* the policy subset of UnattendedGrant (B.8.9); also the argument type of MutationGuard::create_grant / set_options (B.8.14) */
 G_* codes: 0x0100 G_REAUTH_FAILED · 0x0101 G_REMOTE_SESSION_ACTIVE · 0x0102 G_PRECONDITION · 0x0103 (reserved; was G_WEAK_PASSWORD — the host never sees the password, the CLI enforces B.8.7.2 via PolicyInputs)
            · 0x0104 G_KEYSTORE_LOCKED · 0x0105 G_STORE_LOCKED · 0x0106 G_NO_TXN (RegFinish without a live reg_txn)
+           · 0x0107 G_UNSUPPORTED (r7: an operation this platform cannot honour, e.g. an admin grant on Linux; the detail says why)
 ```
 The host performs the OS re-auth dialog itself on every access-increasing op (the CLI never
 receives or forwards a credential) and routes every op through the B.8.6.2 mutation guard;
@@ -1219,12 +1480,71 @@ the guard (widening is access-increasing); for a device without a grant it is *g
 
 **B.8.7.5 Autostart, sleep, wake.** `tornect service install` (through the guard: re-auth,
 `AutostartChanged{by}` logged, B.8.7.4) registers a user-level
-autostart (Task Scheduler "At log on"; an elevated task — needed only to inject into elevated
-windows past UIPI — is strictly **opt-in** for admins, with the wizard copy "Running the host
-elevated makes every remote Control session an administrator session" (T9, B.8.8); `SMAppService`
-/ LaunchAgent; `systemd --user` `tornect-host.service` with `WantedBy=graphical-session.target`
-or XDG autostart / Background portal for Flatpak). All start *after* login; readiness states the
-auto-login dependency. Keep-awake (host-wide, default on: active while any grant is `Active`;
+autostart (Task Scheduler "At log on"; `SMAppService` / LaunchAgent; `systemd --user` `tornect-host.service` with
+`WantedBy=graphical-session.target` or XDG autostart / Background portal for Flatpak). All start *after* login;
+readiness states the auto-login dependency. r7 (§B.1.1, decision M1-58): the autostart will start the app
+(`tornect --background`), not the headless host — on Linux through an XDG autostart entry.
+
+**The elevated task.** Built at `3aa1072` (M1-53): `service install --elevated` registers the whole host at
+`HighestAvailable` — strictly opt-in, refused to a standard account, not startable on demand (F1-5) — with the wizard
+copy "Running the host elevated makes every remote Control session an administrator session" (T9). **r7 replaces it
+with the administrator helper** (decision M1-57, the operator's ruling of 2026-09-27; M-FEAT-3): nothing network-facing
+runs elevated any more, and the elevated code shrinks to one input loop.
+
+**The administrator helper (planned, M-FEAT-3).** `tornect input-helper` is the only elevated component. Attended: the
+host starts it through `ShellExecuteEx` after *Allow as administrator…* (UAC, §B.2.1). Unattended: a task `\Tornect
+admin helper` (a per-user name) — principal = this user, `HighestAvailable`, **no trigger**, `AllowStartOnDemand`
+**true** (reversing F1-5 for this task only) — which the host starts (`IRegisteredTask::Run`) only when an admin-level
+unattended session has passed F1, F2 and the block window. If the helper is not connected within 5 s the session starts
+at `elevation = 0`, stays at 0, and both sides say "administrator access unavailable at <host>".
+- **Task lifetime (MUST):** registered with the first admin grant and deleted with the last (through UAC when needed,
+  F1-1's elevated delete), disabled while the master switch is off, never present while no active admin grant exists;
+  readiness shows "administrator helper registered".
+- **Registration (MUST):** the executable's absolute path from `FOLDERID_ProgramFiles` — never `%ProgramFiles%` or any
+  `%` variable (the Task Scheduler expands `%VAR%` in the command field and there is no escape for it; the built
+  `task_command` refuses `%`, F1-4); read back and compared after registration (principal SID, run level, command,
+  arguments, exactly one action — M1-53 (9), F1-2); the install folder and the executable carry no write, delete or
+  owner-change entry for a non-administrator principal, checked at registration and before each `Run`, and a failed
+  check refuses and logs; its own guard operation with "administrator" in the dialog (F1-3 carried).
+- **DLL loading (MUST):** every elevated component loads DLLs from System32 and its own folder only (the dependent-load
+  decision of M1-51 becomes mandatory here).
+- **Migration (MUST):** at upgrade and at `service uninstall`, an existing whole-host elevated task (M1-53) is found and
+  removed through UAC (F1-1's path). The built `--elevated` stays until the helper passes its Windows test, is removed
+  before the tag, and the two never ship together.
+- **Channel (MUST):** the host creates the pipe with an explicit DACL (the user's SID, plus Administrators for the
+  standard-account path; never the default descriptor), `nMaxInstances` 1 with `FILE_FLAG_FIRST_PIPE_INSTANCE` (a failed
+  creation means "administrator access unavailable", never "use the pipe that exists"), `PIPE_REJECT_REMOTE_CLIENTS`,
+  and an unguessable per-session name (≥ 128 random bits) handed to the helper on its command line (attended) or through
+  the task's run parameters (unattended; the `IRegisteredTask::Run` detail is UNVERIFIED). The host accepts exactly one
+  client and checks it (attended: the PID `ShellExecuteEx` returned; unattended: the registered Program Files image, an
+  elevated token, the host's session id); the helper checks the server (attended: the PID it was given; both: the
+  Program Files image, the same session). Frames are the fixed 16-byte input events, `ReleaseAll`, `Stop` and
+  `Heartbeat`; any other byte sequence ends the helper. It has no launch, file, clipboard, registry or window operation
+  and no network, reads no config and no environment-derived path, and initialises no Tor, codec or UI.
+- **Lifetime and panic (MUST):** the helper exits — after `ReleaseAll` — on pipe close, on host exit (it waits on the
+  host's process handle), on `Stop`, on a missed heartbeat (≤ 2 s) and at a hard cap (the session maximum, or 12 h). It
+  watches for the physical panic chord itself (injected events ignored; it matches only the chord and keeps no
+  keystroke) and on it sends `ReleaseAll`, stops injecting, tells the host and exits — whether the host's
+  medium-integrity low-level hook sees physical keys while an elevated window has focus is UNVERIFIED. Master off and
+  the stop code end the session through the host, which closes the pipe. A test on the operator's Windows PC with an
+  elevated window focused covers the panic key, Stop and `tornect panic`, in an attended administrator session and in
+  an admin-grant session (NEEDS-DEVICE(windows)).
+- **Residual:** whatever lets the host start the on-demand task lets every program of that user start it, and a PID or
+  image check tells which binary sits at the other end of the pipe, not who drives it; so the checks keep out other
+  users and foreign binaries, not same-user code. T9 (§B.8.2) states the consequence; the operator accepted it with the
+  wizard warning (decision M1-62). It is still narrower than the built whole-host task: no pre-authentication network
+  parsing runs elevated and no configuration steers the elevated code.
+
+**M-FEAT-3 MUST** (any one failing fails the milestone's security check): H1 the helper accepts nothing beyond the fixed
+input frames, `ReleaseAll`, `Stop` and `Heartbeat`; H2 it reads no config, environment-derived path or user-writable
+file, and loads no DLL from outside System32 and its own folder; H3 it never survives host exit, pipe close, `Stop`,
+panic or a missed heartbeat, and never attaches to a session midway; H4 the pipe never uses the default security
+descriptor, more than one instance or a predictable name; H5 every elevation level is signed in `SESSION_ACCEPT` and
+shown by the host's indicator and banner; H6 the helper task is never registered with an environment-variable path,
+outside Program Files or without the read-back; H7 the helper task is never registered while no active admin grant
+exists; H8 view-only never carries `elevation` ≠ 0.
+
+**Sleep and wake.** Keep-awake (host-wide, default on: active while any grant is `Active`;
 presets may only turn it on, never off): `SetThreadExecutionState(ES_CONTINUOUS |
 ES_SYSTEM_REQUIRED)`, `IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep)`
 (does not survive lid close), Inhibit portal `Suspend` (logind `Inhibit("sleep")` fallback). On
@@ -1240,8 +1560,8 @@ loss. Client copy: "Host is offline, asleep, or locked — Tornect cannot wake o
 
 | OS / state | Capture | Input | Remote unlock | Source / status |
 |---|---|---|---|---|
-| Windows, session unlocked | WGC ✅ | SendInput ✅ (UIPI: not into elevated windows/UAC unless the host runs from the opt-in elevated task of B.8.7.5, which makes every remote Control session an administrator session; secure-desktop switch detected via `OpenInputDesktop` ⇒ `ctrl` notice) | n/a | — |
-| Windows, locked (Winlogon secure desktop) / logged out | ❌ | ❌ | **No** — needs a SYSTEM service + secure-desktop agent (v2; Ctrl+Alt+Del also needs the SendSAS policy) | `WTSRegisterSessionNotification` ⇒ `HOST_NOT_READY{locked}` / `BYE{HOST_LOCKED}` |
+| Windows, session unlocked | WGC ✅ | SendInput ✅ (UIPI: not into elevated windows or UAC prompts, and the failure is silent — verified in the SendInput documentation; at `3aa1072` a host started from the whole-host elevated task of M1-53 makes every remote Control session an administrator session, which r7 replaces with the per-session administrator helper, §B.2.1, B.8.7.5; the secure-desktop switch **will be** detected via `OpenInputDesktop` ⇒ `ctrl` notice "The computer is showing a secure Windows screen; the person there must answer it" — planned, M-FEAT-3, not built) | n/a | — |
+| Windows, locked (Winlogon secure desktop) / logged out | ❌ | ❌ | **No** — needs a SYSTEM service + secure-desktop agent (roadmap M-SVC-W, after the release; Ctrl+Alt+Del also needs the SendSAS policy) | `WTSRegisterSessionNotification` ⇒ `HOST_NOT_READY{locked}` / `BYE{HOST_LOCKED}` |
 | GNOME ≥ 45, unlocked, RemoteDesktop restore token valid (one combined session, §B.5) | PipeWire ✅ | libei ✅ | n/a | `wayland.md` §2.4–§2.5; the token checked by readiness; portal `Start` budget 5 s then `Request.Close()` so no dialog blocks an empty room |
 | GNOME, locked | ❌ (mutter inhibits remote access: sessions closed, `CreateSession` refused) | ❌ | **No** by design | `wayland.md` §7 (sourced); backends treat `Closed` as recoverable *Locked* |
 | KDE Plasma 6 | portal ✅ | ConnectToEIS ✅ | NEEDS-DEVICE(kde) | lock policy and RemoteDesktop token persistence unverified |
@@ -1256,11 +1576,13 @@ loss. Client copy: "Host is offline, asleep, or locked — Tornect cannot wake o
 | Physical-input presence | `GetLastInputInfo` minus injected (`LLKHF_INJECTED`) | `CGEventSourceSecondsSinceLastEventType(HIDSystemState)` minus own events | `org.gnome.Mutter.IdleMonitor.GetIdletime` / `org.freedesktop.ScreenSaver.GetSessionIdleTime` (KDE); `ext-idle-notify-v1` behind `linux-wayland-idle`; logind `IdleHint` last resort |
 | Lock state / lock / console owner | `WTS_SESSION_LOCK` / `LockWorkStation()` / `WTSGetActiveConsoleSessionId` | `CGSessionCopyCurrentDictionary` (undocumented) / NEEDS-DEVICE | logind `Session.LockedHint` / `login1.Session.Lock` on `session/auto` (`org.gnome.ScreenSaver`, `org.freedesktop.ScreenSaver.Lock` fallbacks) / logind `Active` |
 | Prevent idle lock (opt-in) | `ES_DISPLAY_REQUIRED` | `PreventUserIdleDisplaySleep` | Inhibit portal `Idle` |
+| Administrator level (r7, §B.2.1) | per-session elevation through the administrator helper (installed mode only; M-FEAT-3); the secure desktop stays out of reach | — | none: the host never runs as root; polkit's remembered approvals revoked at every Control session start (`pkcheck --revoke-temp` semantics — the man page read on the build VM; the D-Bus method name UNVERIFIED; the process context under XDG autostart NEEDS-DEVICE(gnome, kde)); never described as enforcement |
 | Always-on-top block/indicator | ✅ re-asserted (exclusive fullscreen may cover it — tray + chime) | ✅ | no topmost API for clients on Wayland: compositor screencast icon + focused window + chime |
 
-**v2 backlog "service mode":** Windows SYSTEM service + secure-desktop helper (SendSAS), macOS
-LaunchDaemon + login-window agent, Linux system-session daemon (gnome-remote-desktop "system"
-mode) for lock/login-screen control. Out of v1; the wizard says so in one line.
+**Service mode (roadmap):** Windows — M-SVC-W, after the initial release (decision M1-61; Part C): a SYSTEM service
++ a per-session process + secure-desktop handling (SendSAS) for lock/login-screen control; macOS LaunchDaemon +
+login-window agent and a Linux system-session daemon (gnome-remote-desktop "system" mode) stay unplanned. Out of v1;
+the wizard says so in one line.
 
 #### B.8.9 Storage (`tornect-core`)
 
@@ -1343,6 +1665,7 @@ pub struct UnattendedGrant {
     pub preset: Preset /* MyMachines | HeadlessBox | HelpingSomeone */,   // decides the admin scope (B.8.4.1)
     pub suite: u8, pub auth: AuthRecord,           // Opaque { record: Vec<u8> /* 192 B */ } | Spake2 { salt: [u8;16], wrapped_w: Vec<u8> }
     pub mode: SessionMode, pub schedule: Option<Vec<Window /* { days: u8 bitmask, start_min: u16, end_min: u16, tz: String } */>>,
+    pub elevation: Elevation,                      // r7: None | Admin — Windows only (Linux: G_UNSUPPORTED), default None; setting Admin is access-increasing (B.8.7.1)
     pub expires_at: Option<u64>, pub auto_renew: bool, pub max_session_secs: Option<u32>, pub reconnect_cooldown_s: u32,
     pub block_window_s: u8, pub ask_before_start: bool, pub require_absent: bool, pub require_tor_only: bool, pub lock_on_disconnect: bool,
     pub hard_lock_after: u32,                      // 20; 10 for Helping someone / Headless box; 0 = no consecutive hard lock (warned; the lifetime budget still applies)
@@ -1357,7 +1680,8 @@ server_s_pk_pin, suite: Option<u8>, ua_worked_before }` (`server_s_pk_pin` is se
 `SESSION_ACCEPT` and checked in `ClientLogin::finish` on every later login, B.8.4.2/A16; `suite`
 records the build-time suite of B.8.4.2 at the first successful `SESSION_ACCEPT` — a later mismatch
 is surfaced, never negotiated, B.8.10; `ua_worked_before` ≡ `suite.is_some()`);
-the remembered password lives only in the OS keychain entry `tornect/unattended/<onion>` (use
+the remembered password lives only in the OS keychain entry `tornect/unattended/<onion>` — a name computed from the
+pinned host identity at use, never read from a file (r7, §B.8.9.1) — (use
 gated by Windows Hello / Touch ID / OS password where available; copy: "any program running as
 you can read it" on Windows/Linux), marked stale on `AUTH_FAILED` only — never on `PREEMPTED` or a
 transport error (B.8.4.6). **Rotate ID** wipes grants,
@@ -1371,6 +1695,50 @@ tombstones. Memory hygiene: `Zeroizing` decode buffers, `mlock`/
 `VirtualLock` for `K_master`/`ServerSetup`, crash-dump filter excludes store buffers, hibernation
 inhibit requested (best effort — the OS may ignore it on low battery; `K_master`/`ServerSetup`
 are mlocked and zeroized on sleep where the OS allows).
+
+**B.8.9.1 Address book and saved credentials (r7; milestones M-UI-2, M-FEAT-4).** Tornect has **no account**: the
+"local account" is an address book on this computer, never synced, never sent (§A.1; no cloud accounts, no presence
+dots). Files, all 0600 under `Paths::state_dir`, written atomically:
+- `known-hosts.toml` — **the pin store**, built (`KnownHosts`: label, `host_device_pk`, `paired_at`, `last_seen`;
+  decision M1-12), written by pairing, Forget and the handshake's `last_seen`;
+- `hosts.toml` — the unattended per-host record (above);
+- `address-book.toml` (M-UI-2) — per saved computer: the saved name (a local rename, never sent) bound to the key it was
+  given against, notes, the device-words cache and when it was added and seen; an entry without a pin is a *saved
+  address*, shown "not paired yet". Its `later` table is an **allowlist** — a `remembered` flag, the words cache,
+  display preferences — never a password, stop code, backup passphrase, token, PAKE message or key; unknown keys are
+  kept for forward compatibility but never interpreted;
+- `recent.toml` (M-UI-2) — the recent connections, with the level of each (r7), written only while history is on;
+  Clear deletes it.
+
+**Saved credentials** (M-FEAT-4): a remembered unattended password lives only in the OS keychain through `keyring-core`
+(Windows Credential Manager; Linux Secret Service, or the kernel session keyring, which forgets at sign-out — the safe
+direction); never in the file keystore, a TOML file or an export. The keychain entry name is computed from the pinned
+host identity at use (`tornect/unattended/<onion>`, B.8.9), **never read from a file**: a reference read from a file
+that any program of the user can edit could point one host's entry at another host's password. Without a usable
+keychain the "Remember" box is absent and the prompt says "This computer has no system keychain Tornect can use, so the
+password cannot be remembered." Stale only on `AUTH_FAILED` (B.8.9, unchanged). For an admin grant "Remember on this
+device" is absent unless the client's keychain use is presence-gated (Windows Hello); Linux clients (Secret Service,
+keyutils: no presence gate) never remember an admin grant's password. Test (M-FEAT-4): a known password saved through
+Remember appears in no file under the state directory. Presence gating on Windows Credential Manager and Secret
+Service on GNOME/KDE: NEEDS-DEVICE; the keyutils fallback is verified only as a documented behaviour (D13).
+
+**Trust rules:** the pinned key is the identity; a saved name or alias only on a full-key match; device words are
+recognition only (§B.6.1); an alias is never shown where the pinned label is the trust anchor on a consent sheet;
+import never creates a pin.
+
+**History off** means no `recent.toml` writes **and no `last_seen` updates**. At `3aa1072` two writers keep
+`last_seen` whatever the user chose: `KnownHosts::touch` writes it into `known-hosts.toml` at every completed handshake
+(`crates/tornect-core/src/trusted.rs`, called from `tornect-signal`'s pairing code), and the host's
+`TrustedDeviceStore::touch` writes it into `trusted-devices.toml` on every signed `SESSION_REQUEST`; the history switch
+must stop both (M-UI-2). Not history, and not switched off: the host's `sessions.log` (the §B.6 audit) and the
+client's unattended-connect line (B.8.10); the Privacy page says both are kept and never leave the computer.
+
+**Export/import** (`tornect book export|import`, beside B.8.12): names, addresses, notes and the pinned host keys as
+*expected* keys; never passwords, never this device's identity key; encrypted like the B.8.9 backup (Argon2id +
+XChaCha20-Poly1305, generated passphrase), because the list says whom you connect to. Export needs no re-auth (it
+reveals no secret, and same-user code can read the TOML files anyway) but is refused while a remote session is live or
+ended < 60 s ago, like `BackupExport`. Import never creates a pin: the new computer pairs with each host (the host pins
+device keys), and an expected key that differs at pairing raises the pin-change warning.
 
 #### B.8.10 Client-side UX
 
@@ -1398,7 +1766,10 @@ since your last login"; a client-side `sessions.log` records every unattended co
 actions (*Revoke this device*, *Turn unattended off at host*, *Unlock my other laptop*, *End the
 session at host*) live in the host card and use `intent = admin`; the cross-grant ones (*Unlock…*,
 *Turn off…*, revoking *another* device) are offered only for *My machines* Control grants
-(B.8.4.1 scope) — every other grant sees *Revoke this device* and *End the session* only.
+(B.8.4.1 scope) — every other grant sees *Revoke this device* and *End the session* only. r7: the HUD shows the
+signed level ("Control · administrator", §B.2.1); "Remember on this device" is absent without a usable keychain and,
+for an admin grant, without a presence gate (B.8.9.1); the connect field runs the look-alike check (§B.6.1); the
+client's `sessions.log` line carries `elevation`.
 
 #### B.8.11 Privacy modes and restricted discovery
 
@@ -1436,7 +1807,7 @@ per reason per device per 60 s with `count`), `UnattendedChallengeIssued`,
 `AutostartChanged` (`by`, B.8.7.4),
 `UnattendedEnabled|Disabled|Paused`, `PasswordSet`, `AdminRequest`, `EmergencyStop`, `BackupExported`,
 `PopupSuppressedRemoteSession`, `GrantMutationRefused`, `StoreLoadFailed`, `ClockAnomaly`,
-`HostNotReady`, `SessionEndingSoon`. New optional fields: `grant`, `by: Actor`, `reason`,
+`HostNotReady`, `SessionEndingSoon`, and (r7, M-FEAT-3) `AdminHelperStarted|Stopped|Failed`. New optional fields: `elevation` (r7), `grant`, `by: Actor`, `reason`,
 `failures`, `lock_secs`, `count`, `block: elapsed|blocked|skipped`, `ended_by`,
 `during_remote_session`, `prev` (SHA-256 of the previous line; for the first line of a new file
 the SHA-256 of the last line of the rotated file), `tag = HMAC-SHA256(K_log, line_without_tag)`
@@ -1582,8 +1953,9 @@ impl SessionAccept { pub fn build(proof: ConsentProof, caps: ChosenCaps /* negot
 3. Wayland: which compositors provide `ext-idle-notify-v1` and a usable GlobalShortcuts portal; fallback "present" + focused window confirmed (M6).
 4. Argon2id 64 MiB on future mobile clients ⇒ new suite id with re-registration, not a negotiation; decide when a mobile client exists.
 5. Keychain user-presence gating (Touch ID / Windows Hello) for the remembered password — v1 where `keyring-core` stores expose it cheaply, else post-v1; headless Linux re-auth without a polkit agent (PAM vs a weaker Tornect-only passphrase) decided at M6.
-6. v2 service-mode scoping per OS, and whether lock-on-disconnect should default on wherever the M6 matrix proves remote unlock.
+6. Service mode: Windows is roadmap M-SVC-W, after the initial release (decision M1-61), with its own threat model before any code — a LocalSystem service parsing network input in session 0, per-session processes through `CreateProcessAsUser`, the Winlogon desktop, `SendSAS`, keys in machine scope, OS re-auth as "an administrator of this PC", multi-user hosts, its update path; other OSes unscoped. Also whether lock-on-disconnect should default on wherever the M6 matrix proves remote unlock.
 7. Tor fallback transport: the same QUIC connection over a length-framed onion-stream tunnel (uniform `BIND`/exporter check — §B.2, B.8.4.2, Part C M2) vs. the session protocol directly over the onion stream (quic.md §0/§9: double congestion control, wasted 1200 B Initial padding and DPLPMTUD probes, extra handshake RTTs over 0.5–1.5 s circuits) — decide at M2 with a measured onion-stream throughput; if direct, define the `BIND` equivalent over the onion stream (e.g. an HMAC over `th` + `session_token`, both directions, before any media) so the token check stays uniform. Also a Part E row.
+8. The administrator helper's residual (r7): while an admin grant exists, any program running as the user can start the helper task, so every Control session on that host can reach administrator windows (T9, B.8.7.5). Accepted for v1 with the wizard warning (decision M1-62); administrator access in attended sessions only stays the alternative if the Windows tests show more.
 
 ---
 
@@ -1650,6 +2022,8 @@ media (on the direct path and over the Tor tunnel alike — the tunnel carries t
 connection) and `tor_only` sends zero candidates.
 
 **M3 — Video pipeline, single platform (pick the OS Claude Code is running on)**
+*r7:* the FFmpeg wrappers below leave v1 (D8, decision M1-56); hardware encode and decode are M-CODEC-1…3 of
+the desktop release below; the rest of M3 stands.
 Capture backend for dev OS (+ a synthetic source — the `pipewire` crate needs headers this
 VM lacks, so the PipeWire backend builds only in CI); `openh264` software encode+decode
 (always compiled); FFmpeg hw encode+decode wrappers with runtime probe behind the `ffmpeg`
@@ -1678,7 +2052,7 @@ codecs.md §3.2, §11.3)
 **M4 — End-to-end streaming (M1+M2+M3 glued by `tornect-session`)**
 Host & client session state machines; ctrl stream (IDR request, bitrate hint);
 UI: the `u1` shell of Part F.6 (ID card + connect field + consent/pairing popups, already
-delivered — D10: Iced, or the egui fallback) wired to the M3 stream window end-to-end — `u2` = U2 of
+delivered — D10: egui everywhere since r7) wired to the M3 stream window end-to-end — `u2` = U2 of
 `docs/UI_PLAN.md` §11 (S3 connecting stages, HUD v1 + latency overlay, disconnect/reconnect UX), tagged
 at the M4 Accept (Part F.6). Unattended
 gating in the host FSM (`ConsentProof::Unattended`, §B.8.14), block window with
@@ -1740,12 +2114,84 @@ matching Sunshine — decide in M0).
 machine in < 5 min following README; §B.8.16 checklist green; release artifacts on
 a tagged GitHub release.
 
-**Post-v1 backlog (tracked, not planned here):** file transfer UI · mobile clients
-(Android first; would motivate str0m/WebRTC or WebTransport revisit) · "bring your
+**The desktop release (Linux + Windows; r7).** The operator's requirements of 2026-09-27 — unattended access with
+administrator access, saved devices, a request sheet with a readable name and levels, a standalone app or an installed
+one that starts with the computer, hardware encoding and decoding — for the initial release on Linux and Windows
+(Part F.7). Efforts are days of implementation work, estimates, UNVERIFIED; "Windows PC" is the operator's Windows PC
+with an NVIDIA GPU. Every milestone keeps the existing test set green unchanged and passes `cargo xtask verify`;
+Security is mandatory for every trust surface, elevation path, credential store, parser and FFI; Privacy for the
+address book, history, the device words and logs. M-UI-1 (the foundation) is done (`3aa1072`, Part G).
+
+| # | Milestone | Scope | Tests | Effort | Mandatory checks | NEEDS-DEVICE (Windows PC unless noted) |
+|---|---|---|---|---|---|---|
+| 0 | Plan r7 | this revision (merged after M-UI-2) | `xtask verify` doc checks | 0.5–1 | Security confirms its changes are in | — |
+| 1 | **M-FEAT-1** Device words | `tornect-core::words` (Argon2id, BIP39 list, golden vectors), identicon from `h` beside saved names only, the look-alike alarm on host sheets and the client's connect field, typed-code pairing when it fires (the host checks its own digits; no wire change), one derivation per second (§B.6.1) | golden vectors; alarm thresholds; a fired alarm never reaches an accept without the digits; the rate bound; W-B1…W-B8 | 2–3 | **Security mandatory** + Privacy | optional: Argon2id timing on a phone before the freeze |
+| 2 | **M-UI-2** Home + address book (the redesign's scope, adjusted) | + `address-book.toml` with the `later` allowlist, `recent.toml`, history off stops both `last_seen` writers, words on cards, "not paired yet" entries, `tornect book export\|import` (§B.8.9.1) | round trips; Clear; history off writes nothing (incl. `known-hosts.toml` and `trusted-devices.toml`); export holds no password; import creates no pin | 3–4 | **Security mandatory** (export crypto, no password in any file, the alias rule, import creates no pin, the `later` allowlist) + Privacy | a Windows run of the pages |
+| 3 | **M-FEAT-2** Session levels | `SessionDecision::AllowOnceAdmin`; `SESSION_ACCEPT.elevation`, `want_elevation` with golden vectors; the availability probe (location, `EnableLUA`, `FilterAdministratorToken`, `ConsentPromptBehaviorUser`/`Admin`, `PromptOnSecureDesktop`); the refusal to serve when started elevated with UAC on; the Linux polkit revocation; the client HUD level (§B.2.1) | the new keys' vectors; clamp to the most restrictive; view-only never elevated; an unavailable level ⇒ no button | 2–3 | **Security mandatory** (a wire change) | registry probes; the `PromptOnSecureDesktop` 0 prompt test; the polkit revocation at the build VM console |
+| 4 | **M-UI-3** Trust surfaces + connect flow (adjusted) | + the four/three-answer sheet with the unavailable-level sentences, "wants to connect to this computer", words + alarm line, the typed-code pairing layout, the Tornect confirmation where Windows shows no prompt, the administrator answer never adjacent to Allow, re-arming after a Windows prompt, a raise or a restore | every E1-1/E1-2/N-1/M1-50 test unchanged; Deny first; accepts pointer-only, armed 1 s; an administrator answer never downgrades silently | 3–4 | **Security mandatory** (trust surfaces); copy | the sheet on Windows |
+| 5 | **M-FEAT-3** Windows administrator helper | `tornect input-helper`, its pipe protocol, the UAC launch (attended), the on-demand helper task replacing `--elevated` (decision M1-57) with its hardened registration, lifetime and migration, the helper's own panic watch and exits, the `OpenInputDesktop` secure-desktop notice (B.8.7.5, B.8.8) | fake Task Scheduler + fake pipe unit tests; the helper refuses a wrong server and exits on close, host exit, `Stop` and a missed heartbeat; H1…H8 | 4–5 | **Security mandatory** (elevation path) | all of it: UAC (administrator and standard account), UIPI with and without the helper, the on-demand task, the secure-desktop notice, the panic key with an elevated window focused |
+| 6 | **M-FEAT-4** Unattended client + saved credentials | GUI and CLI unattended connect (`Intent::Unattended`, the B.8.10 prompt), Remember in the keychain (Windows store, Secret Service, keyutils), presence gating where cheap, the admin-grant rule, the derived entry name (B.8.9.1) | never auto-retried; stale only on `AUTH_FAILED`; no password in any file | 3–4 | **Security mandatory** + Privacy | Credential Manager; Windows Hello if used |
+| 7 | **M-FEAT-5** Unattended host completeness | the block window (B.8.6.3) and "Ask before starting" with the level; the "N devices can connect without asking" badge; admin grants (field, guard, `G_UNSUPPORTED` on Linux, the wizard warning); the readiness probes the wizard needs (incl. "indicator shown", "administrator helper registered"); the Windows named-pipe control channel (the M6 item) so `tornect panic` and the CLI work; the panic hotkey (Windows low-level hook; GNOME GlobalShortcuts where available, else "not bound"), never on the UI thread | the U/A rows of §B.8.15 touched; Block ⇒ no capture; panic < 100 ms | 6–8 | **Security mandatory** | pipe, hook, readiness, a reboot + automatic sign-in + an unattended session |
+| 8 | **M-UI-4** Viewer toolbar (adjusted) | + the level chip ("Control · administrator"), the UIPI line, the secure-screen notice | view-only sends nothing; send-keys only in control; the chord sends `ReleaseAll` | 2–3 | **Security mandatory** (input gating); Privacy (screenshots) | the Ctrl+Alt+Del copy on Windows |
+| 9 | **M-FEAT-6** Product modes | `tornect install\|uninstall` (Windows: guard + UAC, Program Files, the ACL check, Start menu, uninstall entry); the Linux per-user install + `.desktop`; `--background`; the at-logon task and an XDG autostart entry start the app (decision M1-58); `IpcOp::Show`; the "indicator shown" gate (§B.1.1) | fake installers; the headless host stays pings-only; a second launch shows the first | 3–4 | **Security mandatory** (install and autostart); Privacy (the Tor-at-sign-in copy) | install, reboot, sign-in, minimised start; GNOME minimise and the XDG entry's session (build VM console) |
+| 10 | **M-UI-5** Settings + Sessions (adjusted) | + the wizard's Administrator step (Windows) with its warning, the Linux explanation, "Start Tornect when I sign in" and the install state, the history switch covering both `last_seen` writers | every access-increasing op through the guard with `FakeReAuth`; never instant-apply; zeroized fields | 6–7 | **Security mandatory** + Privacy | the wizard on Windows |
+| 11 | **M-UI-6** Polish | as the redesign | snapshot × scale | 1–2 | **Security mandatory** (confirms no trust-surface change); UX | — |
+| 12 | **M-CODEC-1** Abstraction + conformance | traits, registry, fallback, `doctor` lines, the parser gate (§B.5), the GPU YUV→RGB shader, a golden stream | unit, property, fuzz, golden CRCs | 2–3 | **Security mandatory** (parser); Architecture | — (build VM) |
+| 13 | **M-CODEC-2** Windows Media Foundation | the async hardware MFT encoder (BGRA→NV12, Constrained Baseline, CBR, forced IDR) + the MF decoder behind the gate | cross-check; conformance | 3–4 | **Security mandatory** (COM/FFI, DLL loading, hostile decode); Performance | conformance, the hostile corpus, ms/frame |
+| 14 | **M-CODEC-3** NVENC (Windows) | own bindings (struct versions checked against the driver's maximum), a D3D11 device, system-memory input first | as above | 3–4 | **Security mandatory** (driver FFI); Performance | as above; fps over Tor |
+| 15 | Release-range security pass | slices as D–G over everything above; fixes | a regression test per finding | 3–5 | **Security mandatory** | — |
+| 15a | Final Windows pass (with a standard account) | after row 15, before the tag: attended administrator on an administrator account and on a second, standard Windows account; UAC cancelled, then the sheet re-armed; unattended administrator through the task; the task removed with the last admin grant and at uninstall; the old whole-host task removed at upgrade; panic, Stop and `tornect panic` with an elevated window focused; the secure-desktop notice; `PromptOnSecureDesktop` 0; the M-UI-4/M-UI-5 surfaces and every row-15 fix | a written checklist | 0.5–1 | **Security mandatory** (its checklist) | yes |
+| 16 | Pre-tag docs pass | Part G rows; README honest limits (the plain statements of §B.1.1, B.8.8, the release's limits below); SECURITY.md (the helper, T9); the release notes and the release README, whose lines on the whole-host elevated task (incl. "cannot be started on demand") are rewritten; VERIFICATION rows; the code-signing decision (Part F.8) | `xtask verify` doc checks | 1–2 | Security reads the security statements | — |
+| 17 | Console check | the GUI over real Tor, build VM ↔ Windows PC: pairing with words, the four answers incl. UAC, an unattended administrator session, codecs, the start after a reboot | Security's written checklist | 0.5–1 (the operator present) | Security (checklist) | yes, both machines |
+| 18 | Dist + tag | `cargo xtask dist` at the tagged head; the operator's go | reproducible zips; Security reads the manifest (no NVIDIA file, licence texts present) | 0.5–1 | Security (manifest) | — |
+
+Total ≈ 49–69 days (UI 15–20, features 20–27, codecs 8–11, plan, Windows pass and release 6–11). Order: row 0 →
+M-FEAT-1 → M-UI-2/M-UI-3 (words and levels on screen) → M-FEAT-3/4/5/6 → M-UI-4/5/6, with the codec track (rows 12–14)
+beside it. The Windows PC is needed in batches: after M-FEAT-3 (elevation), after M-FEAT-5/6 (unattended, autostart),
+after M-CODEC-3 (codecs), the final pass (row 15a), then the console check.
+
+**The release's limits** (stated in the README and the release notes): every session is relayed through Tor (decision
+M1-60), and the 20-unit ack window caps any encoder at about **16 fps** at 1.2 s round trips (13.2 fps measured for the
+1280×720 test card, M1-47); hardware encoding lifts large desktops toward that cap and frees the host CPU but does not
+raise it — direct connections (M2, next after the release) do; AMD and Intel on Windows are designed through Media
+Foundation and untested (NEEDS-DEVICE(windows-amd), NEEDS-DEVICE(windows-intel)); Linux has software encoding only;
+"starts with the computer" means starts at sign-in (§B.1.1); code signing is open until the pre-tag pass (Part F.8).
+**Not in this release:** direct connections (Part C M2 — next, decision M1-60), Windows service mode (M-SVC-W, after the
+release, decision M1-61), Android (backlog).
+
+**Post-v1 backlog (tracked, not planned here):** file transfer UI · Android (entry below) · "bring your
 own relay" · per-app window streaming · virtual display driver (headless hosts) ·
 H.265 4:4:4 / AV1 SCC tuning · Wake-on-LAN via a second LAN device · iroh backend
-feature flag · MoQT alignment once RFC · unattended "service mode" (lock/login-screen
-control, §B.8.8) · TPM-sealed keystore for headless hosts (§B.8.2 T3b).
+feature flag · MoQT alignment once RFC · Windows service mode M-SVC-W (entry below) · TPM-sealed keystore for headless hosts (§B.8.2 T3b).
+
+Roadmap entries of r7:
+- **Direct connections (M2)** — next after the desktop release (decision M1-60); they expose IP addresses to the peer
+  and change the threat model, so they get their own security pass.
+- **M-SVC-W, Windows service mode** — after the initial release (decision M1-61): a LocalSystem service started at boot
+  hosts the onion service in session 0; a per-session process is launched into the active console session
+  (`WTSGetActiveConsoleSessionId`, a SYSTEM token given that session id, `CreateProcessAsUser`) and follows the input
+  desktop (Default ↔ Winlogon) for capture and input, with `SendSAS` for Ctrl+Alt+Del. That reaches the sign-in
+  screen, the lock screen and UAC prompts, and survives a reboot without automatic sign-in. Which capture API works on
+  the Winlogon desktop is UNVERIFIED. Consequences: the identity key, grants and `K_master` move from the user's DPAPI
+  scope to machine scope (a B.8.9 rewrite); OS re-auth becomes "an administrator of this PC"; multi-user hosts must be
+  decided; network parsing inside a SYSTEM process is the largest privilege Tornect would ever hold, so its own threat
+  model comes before any code (§B.8.17 item 6). Estimate 15–25 days, NEEDS-DEVICE(windows) throughout.
+- **Codecs:** M-CODEC-4 MediaCodec (with Android, behind the §B.5 parser gate); M-CODEC-5 a decoder-capability
+  negotiation for High profile, HEVC and AV1; M-CODEC-6 VA-API and NVENC over CUDA on Linux, enabled once a test machine
+  exists; an out-of-process decoder with a restricted token (recommended).
+- **One set of device words per machine** (the client proving its onion key at pairing) — a wire change (§B.6.1).
+- **Android** (decision M1-66, Part F.7) — after the desktop release. The client is feasible; the host is feasible **as
+  an attended host only**: Android 14 and later need a person at the system capture dialog for every session, so
+  unattended hosting could only be faked. First the client and a view-only host; the host on Android 14+, the client
+  on Android 12+; no pluggable transports in the first Android build; "Allow as administrator" does not exist on a
+  phone. The release signing key is generated on the build machine and handed to the operator, and its certificate
+  fingerprint is published. Backup policy: no cloud backup and no device transfer of keys or pairings, and the release
+  build is not debuggable. Device words are identifiers there too: never in notifications or the release log. The UI
+  question (egui with a thin Kotlin shell, gated by a 2–3 day spike; Compose for the Android UI only as the fallback)
+  is decided when Android starts. Carried constraints: the device-word parameters are frozen by the desktop release
+  (§B.6.1); a phone client needs a new PAKE suite id if 64 MiB Argon2id is too heavy (§B.8.17 item 4). Milestones
+  M-AND-0…8. Toolchain: JDK 17, the Android SDK, an LTS NDK, the `aarch64-linux-android` Rust target, `cargo-ndk`, and
+  Gradle with AndroidX GameActivity — pinned when M-AND-0 starts.
 
 ---
 
@@ -1804,9 +2250,9 @@ docs/VERIFICATION.md             # NEEDS-DEVICE ledger + soak/netem results
 | `architect` | most capable | Owns §B invariants; reviews designs & cross-crate APIs before implementation; plan-mode partner | read-only + web |
 | `research-verifier` | fast | Verifies versions/APIs against live docs before any dep or OS-API usage; outputs a sourced note into docs/DEPENDENCIES.md | web + read/write docs only |
 | `net-engineer` | most capable | tornect-signal, tornect-net: Arti, punching, quinn, fallback | full |
-| `media-engineer` | most capable | tornect-capture/codec/audio/proto: per-OS capture, FFmpeg hw, FEC/ABR | full |
+| `media-engineer` | most capable | tornect-capture/codec/audio/proto: per-OS capture, Media Foundation / NVENC / OpenH264 (D8, r7), FEC/ABR | full |
 | `platform-{windows,macos,wayland}` | capable | The three M6 parallel tracks; each owns its capture+input+audio backend end-to-end | full, own worktree |
-| `ui-engineer` | capable | Iced shell + manual-winit stream window (D10), popups, tray, onboarding, HUD | full |
+| `ui-engineer` | capable | egui shell + stream window on one manual winit loop (D10, r7), sheets, indicator, onboarding, HUD | full |
 | `security-reviewer` | most capable | Adversarial review at each milestone close: §B.6 checklist, unsafe-block audit, fuzz targets, "how would I abuse this popup flow?"; the §B.8.16 checklist on any diff touching unattended access, PAKE, grants, the keystore or the mutation guard | read-only + test-run |
 | `qa-engineer` | capable | Integration/netem harnesses, soak scripts, PLATFORM_MATRIX.md, keeps §B.7 gates executable | full |
 
@@ -1828,8 +2274,8 @@ Non-negotiables:
 - Low-latency encoder config always: no B-frames, intra-refresh, ≤1 lookahead, CBR.
 - Every frame carries timestamps; every stage records into the stats pipeline; the
   loopback demo's --headless-stats output is your acceptance instrument — run it.
-- FFmpeg API use must be verified against the pinned FFmpeg major version docs
-  (delegate to research-verifier when unsure).
+- Codec API use (Media Foundation, NVENC) must be verified against the vendor's
+  documentation (delegate to research-verifier when unsure).
 - unsafe only at FFI edges, each block commented with safety invariants.
 Definition of done: clippy-clean, tests green, loopback demo meets §B.7 numbers on
 this machine, DEPENDENCIES.md updated if deps changed.
@@ -1896,7 +2342,9 @@ tag."* — `/milestone <n>` (created in M0) expands to exactly this.
 | Punch success below expectations (CGNAT-heavy regions like BR mobile ISPs) | M×M | Tor fallback is first-class UX, not an error; collect (local-only) success stats; v2 BYO-relay |
 | Wayland portal/compositor variance (GNOME vs KDE vs wlroots quirks, token invalidation on session change) | H×M | `platform-wayland` maintains a compositor quirk table; SHM fallback; test on GNOME+KDE+Hyprland in M6 |
 | macOS TCC + notarization friction | M×M | Onboarding walks Screen Recording + Accessibility grants with live status checks; document notarization in xtask even before certs exist |
-| FFmpeg hw-frames interop bugs across drivers | M×H | Runtime probe with warmup scoring + per-encoder denylist config; software fallback always compiled in |
+| Hardware encoder behaviour differs per vendor and driver (r7; replaces r6's FFmpeg interop row) | M×M | The conformance harness (M-CODEC-1), a per-backend deny list, one wire format (Constrained Baseline), OpenH264 always compiled in |
+| The on-demand administrator helper task (r7): while an admin grant exists, same-user code can start it and every Control session can reach administrator windows (T9) | M×H | The task exists only while an admin grant exists; hardened registration, the helper's own panic watch and exits (B.8.7.5); the wizard warning; accepted by the operator (decision M1-62) |
+| In-process indicator (r7): a hung UI thread also hangs the indicator's Stop | L×M | A crash ends the session with the indicator (fails closed); `tornect panic` and the panic hotkey do not depend on the UI thread (M-FEAT-5); a UI-thread watchdog is recommended |
 | Latency regressions creeping in | H×M | §B.7 gates are executable (netem suite in CI-linux + headless-stats), regressions fail the build |
 | Scope creep (it's a fun project) | H×M | Post-v1 backlog exists precisely to say "later"; milestones gate features |
 | Abuse of remote-access software | L×H | §B.6 consent architecture: no silent sessions, persistent indicator, panic key, local session log — these are requirements, not options |
@@ -1926,13 +2374,24 @@ tag."* — `/milestone <n>` (created in M0) expands to exactly this.
    inside M7 (tag `u4` before `m7`), `u5` = U5 inside M8 (tag `u5` before `m8`) — a UI tag hosted by an M
    epic is cut at that milestone's Accept, and every UI tag counts as red for D.1 rule 1;
    `research-verifier` pins `iced`, `tray-icon`, `notify-rust`, `fluent` and the AccessKit
-   integrations first.** The owner may swap `u1` and M2 by amending this item.
+   integrations first.** (r7: `iced` leaves the list — egui everywhere, D10.) The owner may swap `u1` and M2 by amending this item.
+7. Platforms of the initial release. **Decided (2026-09-27, decision M1-66): Linux and Windows first; Android on the
+   roadmap** (the operator: "focus on linux and windows versions, android we can add to the roadmap"). Android, when it
+   starts (Part C backlog): an attended-only host; the client and a view-only host first; the host on Android 14+, the
+   client on Android 12+; no pluggable transports in the first Android build; the release signing key generated on the
+   build machine and handed to the operator, its certificate fingerprint published; no cloud backup and no device
+   transfer of keys or pairings, and no debuggable release build. Toolchain: JDK 17, the Android SDK, an LTS NDK, the
+   `aarch64-linux-android` Rust target, `cargo-ndk`, Gradle with AndroidX GameActivity.
+8. Code signing (Windows). **Open — the operator decides at the pre-tag pass** (Part C, the desktop release, row 16).
+   Without a code-signing certificate every Windows administrator prompt names "Unknown publisher" for `tornect.exe`,
+   which trains people to accept unknown prompts, the habit the support scam of T10 exploits. Options: obtain a
+   certificate before the tag (cost and identity checks are the operator's), or ship unsigned and say so in the README.
 
 ---
 
 ## Part G — Execution status (kept current at every session hand-off)
 
-Last update: **2026-09-24** (the sessions of 2026-09-23 and 2026-09-24). Repository: https://github.com/Mxrider420z/Tornect (private,
+Last update: **2026-09-27** (plan r7 and the UI foundation; before them the sessions of 2026-09-23 and 2026-09-24). Repository: https://github.com/Mxrider420z/Tornect (private,
 branch `main`). Per-milestone detail lives in `docs/notes/m<N>-state.md`; every acceptance
 check with its real status is in `docs/VERIFICATION.md`; every deviation from this plan is a
 numbered row in `docs/notes/decisions.md`.
@@ -1955,7 +2414,10 @@ numbered row in `docs/notes/decisions.md`.
 | The Windows build (2026-09-23/24, M1-51) | **Links and runs under Wine; never run on Windows** (`cb46b4d`, `7bbb51c`, `b7ef5a9`, `fa92538`; E2-4 `c2ecce4`) | `x86_64-pc-windows-gnullvm` with llvm-mingw 20260908: `result_large_err` fixed by boxing, every C and C++ object built with the stack protector, libc++ linked statically, so `tornect.exe` imports only DLLs Windows ships; the 13 test binaries build. DLLs loaded at run time come from the system directory only, and CredUI is loaded at run time; the linker's dependent-load flag, which would cover seven load-time imports, waits for the operator. Under Wine 10.0: `--version`, `id`, `doctor` and four test binaries pass. Every Windows run-time row of `docs/VERIFICATION.md` is NEEDS-DEVICE(windows) |
 | Start at login (2026-09-23/24, M1-53) | **Built; the slice-F review's findings fixed** (`66c2442`, `b4e8dd4`, `176e9de`; the fixes listed in M1-53) | `tornect service install`, `uninstall` and `status`: a systemd user unit on Linux, a Task Scheduler task registered from XML on Windows, each change through the guard with OS re-authentication (polkit; on Windows the secure credential prompt and `LogonUserW`). The Linux start-at-login host answers pings only (F2-1); the operator's three defaults and the refusal of `--elevated` to a standard account are in. Live on Linux with the debug build's re-authentication escape (polkit not exercised); the Windows path is unit-tested over a fake Task Scheduler and linted, and Task Scheduler, CredUI and UAC are NEEDS-DEVICE |
 | The pre-release `v0.1.0-slice.1` (2026-09-23/24, M1-52, M1-54) | **Prepared, not tagged** (tooling `95c96d7` … `3ca4094`; release preparation `b580203` … `5b698e4`; notes `a80ac5f`) | `cargo xtask pt-fetch` (lyrebird 0.8.1, pinned and signature-checked) and `cargo xtask dist` (both zips, reproducible on one machine; `BUILD-INFO.txt` names the advisory database and the ignored advisories; `THIRD_PARTY_LICENSES.txt` in each zip); the gate fails without cargo-deny (B3-6). The advisory refresh found RUSTSEC-2026-0285, fixed by rustls 0.23.45. Reviews: slice E (`73e9314..3ca4094`), slice F (`3ca4094..176e9de`), the fix-closure check and the release-preparation review, up to `e0b7ae4`: no Critical or High, every Medium fixed; `5ba8f11..73e9314` has had no hostile review. Gate 634 passed, 0 failed, 5 ignored at `ede20d0`. Waiting: the final `dist` at the head that the tag names, then the operator's go for the tag and the GitHub pre-release; the window's console check (or the operator's decision to publish with it NOT PERFORMED); the dependent-load flag (or its disclosure, which the notes already carry). Process: `docs/RELEASING.md`; notes: `packaging/release/NOTES-v0.1.0-slice.1.md` |
-| M2–M8 | Not started | Research decisions already made for M2 (raw-public-key TLS, punch outside QUIC, `grease_quic_bit(false)`, `stun` 0.17 / `crab_nat` / `igd-next`), M3 (`openh264` software path; hw codecs `NEEDS-DEVICE(gpu)`; VM-scoped acceptance defined in Part C M3, r6), M5 (`opus` 0.4, in-band FEC off), UI (Iced shell + manual winit loop, no eframe, process model per D10; wgpu 30 / winit 0.30 / egui 0.36; `u1` placement per Part F.6). |
+| The UI foundation, M-UI-1 of the redesign (2026-09-27) | **Done** (`572a3f8` … `3aa1072`) | Design tokens with dark and light themes, the embedded Manrope and JetBrains Mono fonts and a Lucide icon subset with their licences, widget helpers, the sidebar and the pages over the existing backend, and the neutral device-name default ("Linux PC" / "Windows PC", never the host name). No trust-surface behaviour changed: the existing trust-surface tests pass with their source unchanged. Checks in `docs/VERIFICATION.md` ("The UI foundation"): the gate green at 663 passed at `2b11950`; the window on a Windows or Wayland desktop at 125–200 % scale is NEEDS-DEVICE. An internal security review of the foundation found no blocking issue; two Low items are carried. |
+| Plan r7, the desktop amendment (2026-09-27) | **Specified** (this revision) | The operator's requirements for Linux and Windows: session levels with administrator access on Windows (§B.2.1); a per-session administrator helper replacing the whole-host elevated task (§B.8.7.5 — decision M1-53 amended, F1-5 reversed for the helper task only, T9's residual accepted with the wizard warning, M1-57/M1-62); product modes, with the app, not the headless host, started at sign-in (§B.1.1 — M1-53's F2-1 rule amended for the app only, M1-58); saved devices and device words (§B.6.1, §B.8.9.1; M1-63); the vendor codec APIs with the parser gate (D8, §B.5; M1-56); egui everywhere with the indicator in process (D10; M1-59); the popup answers and no administrator access from the standalone app (M1-64, M1-65); a Tor-relayed release with direct connections next and Windows service mode after it (M1-60, M1-61); Android to the roadmap (Part F.7; M1-66); the desktop release milestones (Part C). An internal security review of the draft found no blocking issue; its 5 Medium, 9 Low and 5 Info findings are folded in, six milestone rows are Security-mandatory, and a final Windows pass with a standard account precedes the tag. Code signing stays open until the pre-tag pass (Part F.8). `docs/UI_PLAN.md`'s Iced shell sections are superseded by D10 (the UI plan itself is not edited). |
+| The desktop release (Part C, r7) | **Planned**; M-UI-1 done (above); later rows record progress | M-FEAT-1…6, M-UI-2…6 and M-CODEC-1…3, then the release-range security pass, the final Windows pass with a standard account, the pre-tag docs pass, the console check, dist and the tag (Part C, the desktop release). |
+| M2–M8 | Not started | Research decisions already made for M2 (raw-public-key TLS, punch outside QUIC, `grease_quic_bit(false)`, `stun` 0.17 / `crab_nat` / `igd-next`), M3 (`openh264` software path; hw codecs `NEEDS-DEVICE(gpu)`, through Media Foundation and NVENC since r7, D8; VM-scoped acceptance defined in Part C M3, r6), M5 (`opus` 0.4, in-band FEC off), UI (egui everywhere on a manual winit loop, no eframe, the indicator in process — D10 as amended in r7; wgpu 30 / winit 0.30 / egui 0.36; `u1` placement per Part F.6). |
 
 **Verified-on-hardware honesty.** Everything above was run on one Ubuntu 26.04 VM (GNOME/
 Wayland, no GPU encoder, no sudo, no second machine). Windows is cross-built and linked, and run
