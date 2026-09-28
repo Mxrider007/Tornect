@@ -26,6 +26,7 @@ use std::time::Duration;
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 use tokio::time::Instant;
+use tornect_core::levels::{Elevation, Level};
 use tornect_core::session_log::SessionMode;
 use tornect_core::unattended::ReadinessSnapshot;
 use zeroize::Zeroizing;
@@ -161,6 +162,7 @@ impl TransportPolicy {
 pub struct PolicyReceipt {
     grant: GrantId,
     mode: SessionMode,
+    elevation: Elevation,
     transport: TransportPolicy,
     ends_at: Option<u64>,
     block_window_s: u8,
@@ -189,6 +191,7 @@ impl PolicyReceipt {
         Self {
             grant,
             mode,
+            elevation: Elevation::None,
             transport,
             ends_at,
             block_window_s,
@@ -197,6 +200,14 @@ impl PolicyReceipt {
             minted_at: Instant::now(),
             fail_summary,
         }
+    }
+
+    /// The receipt at `elevation` (the clamped level of §B.8.4.1); none
+    /// whatever is passed when the mode is view-only.
+    #[must_use]
+    pub(crate) fn with_elevation(mut self, elevation: Elevation) -> Self {
+        self.elevation = Level::new(self.mode, elevation).elevation();
+        self
     }
 
     /// The grant.
@@ -209,6 +220,13 @@ impl PolicyReceipt {
     #[must_use]
     pub fn mode(&self) -> SessionMode {
         self.mode
+    }
+
+    /// The most restrictive of the grant's elevation, `want_elevation` and
+    /// what the host delivers (§B.8.4.1); none with view-only.
+    #[must_use]
+    pub fn elevation(&self) -> Elevation {
+        self.elevation
     }
 
     /// The grant's transport policy.
@@ -404,15 +422,26 @@ pub enum PopupChoice {
     AllowOnce,
     /// Allow once, view-only.
     AllowOnceViewOnly,
+    /// Allow once, control as administrator (r7, §B.2.1): the host FSM mints
+    /// it only for an answer its availability offers.
+    AllowOnceAdmin,
 }
 
 impl PopupChoice {
     /// The session mode the choice grants.
     #[must_use]
     pub fn mode(self) -> SessionMode {
+        self.level().mode()
+    }
+
+    /// The level the choice grants: the only source of an attended
+    /// session's `SESSION_ACCEPT.elevation` (§B.8.4.1).
+    #[must_use]
+    pub fn level(self) -> Level {
         match self {
-            Self::AllowOnce => SessionMode::Control,
-            Self::AllowOnceViewOnly => SessionMode::ViewOnly,
+            Self::AllowOnce => Level::CONTROL,
+            Self::AllowOnceViewOnly => Level::VIEW_ONLY,
+            Self::AllowOnceAdmin => Level::ADMIN,
         }
     }
 }
@@ -505,6 +534,11 @@ impl SessionAccept {
     /// mode, `ends_at = None`, `fail_summary = None`, `session_token` set,
     /// `token_confirm` absent. Unattended: the receipt's policy,
     /// `token_confirm` set, `session_token` absent.
+    ///
+    /// The level (r7, §B.2.1) comes from the proof alone: the popup choice,
+    /// or the receipt's clamped level. `elevation` is written only when it
+    /// is admin, so an accept at none is byte-identical to one built before
+    /// the key existed; view-only never carries it ([`Level`]).
     #[must_use]
     pub fn build(
         proof: ConsentProof,
@@ -517,7 +551,7 @@ impl SessionAccept {
                     caps: caps.0.clone(),
                     quic_spki: host.quic_spki,
                     session_type: messages::session_type::ATTENDED,
-                    mode: mode_code(choice.mode()),
+                    mode: mode_code(choice.level().mode()),
                     transport_policy: host.transport_policy.code(),
                     session_token: Some(*token.bytes()),
                     token_confirm: None,
@@ -525,6 +559,7 @@ impl SessionAccept {
                     ask_before_start: false,
                     ends_at: None,
                     fail_summary: None,
+                    elevation: elevation_code(choice.level()),
                 },
                 SessionToken::new(*token.bytes()),
             ),
@@ -541,10 +576,19 @@ impl SessionAccept {
                     ask_before_start: policy.ask_before_start(),
                     ends_at: policy.ends_at(),
                     fail_summary: policy.fail_summary(),
+                    elevation: elevation_code(Level::new(policy.mode(), policy.elevation())),
                 },
                 SessionToken::new(*token.session_token()),
             ),
         }
+    }
+}
+
+/// `SESSION_ACCEPT.elevation` of a level: the key only for admin.
+fn elevation_code(level: Level) -> Option<u8> {
+    match level.elevation() {
+        Elevation::None => None,
+        Elevation::Admin => Some(Elevation::Admin.code()),
     }
 }
 

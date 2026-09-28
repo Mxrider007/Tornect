@@ -20,6 +20,7 @@
 
 use minicbor::{Decode, Encode};
 use subtle::{Choice, ConstantTimeEq as _};
+use tornect_core::levels::Elevation;
 use tornect_core::trusted::is_invisible_or_control;
 use zeroize::Zeroize as _;
 
@@ -66,6 +67,15 @@ pub mod mode {
     pub const CONTROL: u8 = 0;
     /// View-only.
     pub const VIEW_ONLY: u8 = 1;
+}
+
+/// The administrator level (r7, §B.2.1): `SESSION_ACCEPT.elevation`,
+/// `SESSION_REQUEST.unattended.want_elevation`. Absent on the wire = none.
+pub mod elevation {
+    /// The session acts as the signed-in user.
+    pub const NONE: u8 = 0;
+    /// Windows: input also reaches programs running as administrator.
+    pub const ADMIN: u8 = 1;
 }
 
 /// `SESSION_ACCEPT.session_type`.
@@ -652,6 +662,11 @@ pub struct UnattendedRequest {
     /// key 4 — required iff `intent = 1`.
     #[n(4)]
     pub admin: Option<AdminCmd>,
+    /// key 5 — an [`elevation`] value (r7, §B.8.4.1): absent = none; clamped
+    /// host-side to the grant's level and to what the host can deliver,
+    /// never a reject. A peer that predates it ignores it (unknown key).
+    #[n(5)]
+    pub want_elevation: Option<u8>,
 }
 
 /// `SESSION_REQUEST` (client → host, signed).
@@ -687,6 +702,15 @@ impl Body for SessionRequest {
                     kind: Self::KIND,
                     field: "unattended.want_mode",
                     detail: "0 control or 1 view-only",
+                });
+            }
+            if u.want_elevation
+                .is_some_and(|e| e != elevation::NONE && e != elevation::ADMIN)
+            {
+                return Err(BodyError::Inconsistent {
+                    kind: Self::KIND,
+                    field: "unattended.want_elevation",
+                    detail: "0 none or 1 admin",
                 });
             }
             let admin_required = u.intent == intent::ADMIN;
@@ -777,6 +801,12 @@ pub struct SessionAccept {
     /// key 10 — the limiter snapshot (unattended, `None` when nothing failed).
     #[n(10)]
     pub(crate) fail_summary: Option<FailSummary>,
+    /// key 11 — an [`elevation`] value (r7, §B.2.1): absent = none, and a
+    /// session at none never carries the key, so its bytes are the ones a
+    /// peer that predates it sends and reads. Inside the signed body like
+    /// every key; never admin unless `mode = 0` (control).
+    #[n(11)]
+    pub(crate) elevation: Option<u8>,
 }
 
 impl SessionAccept {
@@ -845,13 +875,38 @@ impl SessionAccept {
     pub fn fail_summary(&self) -> Option<FailSummary> {
         self.fail_summary
     }
+
+    /// The session's administrator level (absent = none). A decoded accept
+    /// holds only `0` or `1`, and `1` only with control ([`decode_body`]).
+    #[must_use]
+    pub fn elevation(&self) -> Elevation {
+        self.elevation
+            .and_then(Elevation::from_code)
+            .unwrap_or(Elevation::None)
+    }
 }
 
 impl Body for SessionAccept {
     const KIND: Kind = Kind::SessionAccept;
 
     fn validate(&self) -> Result<(), BodyError> {
-        self.caps.validate(Self::KIND)
+        self.caps.validate(Self::KIND)?;
+        match self.elevation {
+            None | Some(elevation::NONE) => Ok(()),
+            // View-only never carries an elevation (§B.8.4.1), and neither
+            // does a mode this build does not know.
+            Some(elevation::ADMIN) if self.mode == mode::CONTROL => Ok(()),
+            Some(elevation::ADMIN) => Err(BodyError::Inconsistent {
+                kind: Self::KIND,
+                field: "elevation",
+                detail: "admin only with mode = 0",
+            }),
+            Some(_) => Err(BodyError::Inconsistent {
+                kind: Self::KIND,
+                field: "elevation",
+                detail: "0 none or 1 admin",
+            }),
+        }
     }
 }
 
@@ -877,6 +932,7 @@ impl PartialEq for SessionAccept {
             && self.ask_before_start == other.ask_before_start
             && self.ends_at == other.ends_at
             && self.fail_summary == other.fail_summary
+            && self.elevation == other.elevation
             && bool::from(tokens)
     }
 }
@@ -897,6 +953,7 @@ impl core::fmt::Debug for SessionAccept {
             .field("ask_before_start", &self.ask_before_start)
             .field("ends_at", &self.ends_at)
             .field("fail_summary", &self.fail_summary)
+            .field("elevation", &self.elevation)
             .finish()
     }
 }
@@ -1301,6 +1358,7 @@ mod tests {
             ask_before_start: false,
             ends_at: None,
             fail_summary: None,
+            elevation: None,
         }
     }
 
@@ -1345,6 +1403,7 @@ mod tests {
                     op: admin_op::UNLOCK,
                     device_pk: Some([8u8; 32]),
                 }),
+                want_elevation: None,
             }),
         });
         roundtrip(&accept());
@@ -1677,6 +1736,7 @@ mod tests {
                 want_mode: 0,
                 intent: intent::ADMIN,
                 admin: None,
+                want_elevation: None,
             }),
         };
         assert!(matches!(
@@ -1697,6 +1757,7 @@ mod tests {
                     op: 1,
                     device_pk: None,
                 }),
+                want_elevation: None,
             }),
         };
         assert!(decode_body::<SessionRequest>(&encode_body(&admin_unexpected)).is_err());
@@ -1733,6 +1794,7 @@ mod tests {
                 want_mode: 0,
                 intent: intent::SESSION,
                 admin: None,
+                want_elevation: None,
             }),
         };
         for (suite, ke1) in [
@@ -1760,6 +1822,7 @@ mod tests {
                 want_mode: mode::CONTROL,
                 intent: intent::SESSION,
                 admin: None,
+                want_elevation: None,
             };
             f(&mut u);
             SessionRequest {
@@ -1786,6 +1849,7 @@ mod tests {
                     want_mode: mode::CONTROL,
                     intent: intent::ADMIN,
                     admin: Some(cmd),
+                    want_elevation: None,
                 }),
             }
         }
@@ -2009,5 +2073,128 @@ mod tests {
             let back: Hello = decode_body(&encode_body(&h)).unwrap();
             prop_assert_eq!(back, h);
         }
+    }
+    /// r7, §B.8.4.1: `SESSION_ACCEPT.elevation` (key 11) is 0 or 1, and 1
+    /// only with control; absent reads as none. `want_elevation` (key 5 of
+    /// the unattended map) is 0 or 1.
+    #[test]
+    fn the_elevation_keys_decode_only_in_their_domain() {
+        let with = |mode: u8, elevation: Option<u8>| {
+            let mut a = accept();
+            a.mode = mode;
+            a.elevation = elevation;
+            encode_body(&a)
+        };
+        let field_of = |bytes: &[u8]| match decode_body::<SessionAccept>(bytes) {
+            Err(BodyError::Inconsistent { field, .. }) => field,
+            other => panic!("{other:?}"),
+        };
+        for elevation in [None, Some(elevation::NONE)] {
+            for m in [mode::CONTROL, mode::VIEW_ONLY] {
+                let a: SessionAccept = decode_body(&with(m, elevation)).unwrap();
+                assert_eq!(a.elevation(), Elevation::None);
+            }
+        }
+        let admin: SessionAccept = decode_body(&with(mode::CONTROL, Some(1))).unwrap();
+        assert_eq!(admin.elevation(), Elevation::Admin);
+        // View-only never elevated, nor a mode this build does not know.
+        assert_eq!(field_of(&with(mode::VIEW_ONLY, Some(1))), "elevation");
+        assert_eq!(field_of(&with(7, Some(1))), "elevation");
+        for bad in [2u8, 3, 0x80, u8::MAX] {
+            assert_eq!(
+                field_of(&with(mode::CONTROL, Some(bad))),
+                "elevation",
+                "{bad}"
+            );
+        }
+        // A value that does not fit a u8 is not an elevation either.
+        let mut big = with(mode::CONTROL, None);
+        big[0] += 1; // one more map entry
+        big.extend_from_slice(&[0x0b, 0x19, 0x01, 0x00]); // 11: 256
+        assert!(decode_body::<SessionAccept>(&big).is_err());
+
+        let request = |want_elevation| SessionRequest {
+            caps: Caps::default(),
+            unattended: Some(UnattendedRequest {
+                suite: suite::OPAQUE,
+                ke1: Some([0u8; 96]),
+                want_mode: mode::VIEW_ONLY,
+                intent: intent::SESSION,
+                admin: None,
+                want_elevation,
+            }),
+        };
+        // Asking for admin with view-only is lowered by the host, never a reject.
+        for want in [None, Some(0), Some(1)] {
+            roundtrip(&request(want));
+        }
+        for bad in [2u8, 9, u8::MAX] {
+            assert!(
+                matches!(
+                    decode_body::<SessionRequest>(&encode_body(&request(Some(bad)))),
+                    Err(BodyError::Inconsistent {
+                        field: "unattended.want_elevation",
+                        ..
+                    })
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Backward compatibility (r7): a peer built before the keys decodes a
+    /// body that carries them — receivers ignore unknown keys — and sees
+    /// the level it always saw; a body without them reads as none here.
+    /// The "old" types are the pre-r7 maps, keys 0–10 and 0–4.
+    #[test]
+    fn a_peer_before_the_keys_ignores_them() {
+        #[derive(Debug, Decode)]
+        #[cbor(map)]
+        struct OldAccept {
+            #[n(0)]
+            caps: Caps,
+            #[n(2)]
+            session_type: u8,
+            #[n(3)]
+            mode: u8,
+            #[n(5)]
+            #[cbor(with = "minicbor::bytes")]
+            session_token: Option<[u8; 32]>,
+        }
+        #[derive(Debug, Decode)]
+        #[cbor(map)]
+        struct OldUnattended {
+            #[n(0)]
+            suite: u8,
+            #[n(2)]
+            want_mode: u8,
+            #[n(3)]
+            intent: u8,
+        }
+        let mut admin = accept();
+        admin.elevation = Some(elevation::ADMIN);
+        let old: OldAccept = minicbor::decode(&encode_body(&admin)).unwrap();
+        assert_eq!((old.session_type, old.mode), (0, mode::CONTROL));
+        assert!(old.session_token.is_some() && old.caps == admin.caps);
+        let request = UnattendedRequest {
+            suite: suite::OPAQUE,
+            ke1: Some([0u8; 96]),
+            want_mode: mode::CONTROL,
+            intent: intent::SESSION,
+            admin: None,
+            want_elevation: Some(elevation::ADMIN),
+        };
+        let old: OldUnattended = minicbor::decode(&minicbor::to_vec(&request).unwrap()).unwrap();
+        assert_eq!((old.suite, old.want_mode, old.intent), (1, 0, 0));
+        // Built at none, the accept is the pre-r7 map, key 11 absent.
+        let none = accept();
+        assert_eq!(none.elevation, None);
+        assert_eq!(
+            encode_body(&admin)[0],
+            encode_body(&none)[0] + 1,
+            "one map entry more, key 11"
+        );
+        let decoded: SessionAccept = decode_body(&encode_body(&none)).unwrap();
+        assert_eq!(decoded.elevation(), Elevation::None);
     }
 }

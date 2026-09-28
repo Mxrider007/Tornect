@@ -860,6 +860,7 @@ mod tests {
             Intent::Unattended(UnattendedIntent {
                 password: zeroize::Zeroizing::new(PASSWORD.to_owned()),
                 want_mode: messages::mode::CONTROL,
+                want_elevation: tornect_core::levels::Elevation::None,
             })
         };
 

@@ -25,6 +25,7 @@ use std::time::Duration;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use tokio::time::Instant;
+use tornect_core::levels::Availability;
 use tornect_core::trusted::{self, BanPolicy, KnownHosts, TrustedDevice, TrustedDevices};
 use tornect_core::{DeviceId, TornectId};
 use unicode_normalization::UnicodeNormalization as _;
@@ -158,6 +159,10 @@ pub enum SessionDecision {
     AllowOnce,
     /// Allow once, view-only.
     AllowOnceViewOnly,
+    /// Allow once, control as administrator (r7, §B.2.1; Windows). Taken only
+    /// where the host's [`tornect_core::levels::Availability`] offers it: the
+    /// host FSM refuses it anywhere else, never lowers it.
+    AllowOnceAdmin,
     /// Deny.
     Deny,
 }
@@ -174,6 +179,20 @@ pub trait Consent: Send + Sync {
         peer: &'a TrustedPeer,
         req: &'a SessionRequestSummary,
     ) -> BoxFuture<'a, SessionDecision>;
+
+    /// The session popup on a host in the row `levels` of the §B.2.1 table
+    /// (r7): a sheet offers the answers of `levels.offered()` and carries
+    /// `levels.sentence`. What the FSM calls. The default is [`Self::session`],
+    /// the three-answer sheet, which never answers `AllowOnceAdmin`.
+    fn session_at<'a>(
+        &'a self,
+        peer: &'a TrustedPeer,
+        req: &'a SessionRequestSummary,
+        levels: &'a Availability,
+    ) -> BoxFuture<'a, SessionDecision> {
+        let _ = levels;
+        self.session(peer, req)
+    }
 }
 
 /// Denies everything: the headless default and the safe fallback when no UI is attached.
