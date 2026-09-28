@@ -18,6 +18,7 @@ pub mod session_log;
 pub mod telemetry;
 pub mod trusted;
 pub mod unattended;
+pub mod words;
 
 pub use config::Config;
 pub use error::{CoreError, Result};
