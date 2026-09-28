@@ -355,15 +355,27 @@ pub fn wire_cli(
     control: ControlChannel,
 ) -> anyhow::Result<HostWiring> {
     match prompter {
-        Some(prompter) => wire(
-            paths,
-            cfg,
-            identity,
-            device_pk,
-            Arc::new(CliConsent::new(prompter)),
-            media,
-            control,
-        ),
+        Some(prompter) => {
+            // The terminal's pairing question shows device words and runs the
+            // look-alike alarm (§B.6.1).
+            let words = crate::ui::recognize::Recognizer::new(
+                paths.clone(),
+                crate::ui::recognize::Me {
+                    name: cfg.general.device_name.clone(),
+                    onion: identity.id(),
+                    device: tornect_core::DeviceId::from_bytes(device_pk),
+                },
+            );
+            wire(
+                paths,
+                cfg,
+                identity,
+                device_pk,
+                Arc::new(CliConsent::new(prompter).with_words(Arc::new(words))),
+                media,
+                control,
+            )
+        }
         None => Ok(wire(
             paths,
             cfg,
