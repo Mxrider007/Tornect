@@ -27,6 +27,7 @@ use tornect_signal::pairing::{
 };
 
 use super::model::{ClientStage, Confirm, Popup, PopupKind, Shared, Wake};
+use super::recognize::Recognizer;
 
 /// How long the client's user has to say whether the codes matched for the
 /// session to follow: the host gives the client 60 s after `PAIR_ACCEPT` to
@@ -58,7 +59,13 @@ pub enum CodeCheck {
 
 /// Where an answer goes.
 enum Answer {
-    Pair(oneshot::Sender<PairDecision>),
+    Pair {
+        tx: oneshot::Sender<PairDecision>,
+        /// The code this computer shows (and, when the alarm fired, hides).
+        sas: String,
+        /// The look-alike alarm fired: only the typed code pairs (W-B3).
+        typed_only: bool,
+    },
     Session(oneshot::Sender<SessionDecision>),
     Confirm(oneshot::Sender<bool>),
 }
@@ -102,9 +109,37 @@ impl Popups {
 
     /// The host user's answer to pairing popup `id`; `false` when it is no
     /// longer open.
+    ///
+    /// On a sheet whose look-alike alarm fired, an accept is a refusal: only
+    /// the code typed from the other device pairs there
+    /// ([`Popups::answer_pairing_code`]; §B.6.1 W-B3).
     pub fn answer_pairing(&self, id: u64, decision: PairDecision) -> bool {
         match self.take(id) {
-            Some(Answer::Pair(tx)) => tx.send(decision).is_ok(),
+            Some(Answer::Pair { tx, typed_only, .. }) => {
+                let decision = match decision {
+                    PairDecision::Accept { .. } if typed_only => PairDecision::Reject,
+                    other => other,
+                };
+                tx.send(decision).is_ok()
+            }
+            _ => false,
+        }
+    }
+
+    /// The code the host user typed on pairing sheet `id`, from the other
+    /// device's screen: this computer compares it with its own code. The
+    /// same six digits pair (as `label`, if one was typed); anything else
+    /// refuses, a refusal like any other (it counts toward the temp-ban).
+    pub fn answer_pairing_code(&self, id: u64, code: &str, label: Option<String>) -> bool {
+        match self.take(id) {
+            Some(Answer::Pair { tx, sas, .. }) => {
+                let decision = if same_code(code, &sas) {
+                    PairDecision::Accept { label }
+                } else {
+                    PairDecision::Reject
+                };
+                tx.send(decision).is_ok()
+            }
             _ => false,
         }
     }
@@ -154,6 +189,7 @@ impl Drop for OnScreen<'_> {
         drop(self.popups.take(id));
         self.popups.shared.update(|m| {
             m.popups.retain(|p| p.id != id);
+            m.recognition.remove(&id);
             if m.confirm.as_ref().is_some_and(|c| c.id == id) {
                 m.confirm = None;
             }
@@ -199,17 +235,41 @@ impl Withdraw {
     }
 }
 
+/// Whether `typed` is the six digits of `sas` (spaces ignored).
+fn same_code(typed: &str, sas: &str) -> bool {
+    let digits =
+        |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect::<String>() };
+    let (typed, sas) = (digits(typed), digits(sas));
+    typed.len() == 6 && typed.bytes().all(|b| b.is_ascii_digit()) && typed == sas
+}
+
 /// The host's popups in the window.
 pub struct GuiConsent {
     popups: Arc<Popups>,
     withdraw: Withdraw,
+    /// The device words and the look-alike alarm (§B.6.1); without them the
+    /// sheets show neither.
+    words: Option<Arc<Recognizer>>,
 }
 
 impl GuiConsent {
     /// Popups shown through `popups`, withdrawn on `withdraw`.
     #[must_use]
     pub fn new(popups: Arc<Popups>, withdraw: Withdraw) -> Self {
-        Self { popups, withdraw }
+        Self {
+            popups,
+            withdraw,
+            words: None,
+        }
+    }
+
+    /// The sheets show device words and run the look-alike alarm: a pairing
+    /// sheet's key is derived (paced) before the sheet is shown, off the
+    /// network task, after the pairing rate limiter admitted the request.
+    #[must_use]
+    pub fn with_words(mut self, words: Arc<Recognizer>) -> Self {
+        self.words = Some(words);
+        self
     }
 }
 
@@ -217,6 +277,32 @@ impl Consent for GuiConsent {
     fn pairing<'a>(&'a self, peer: &'a PairingPeer, sas: &'a str) -> BoxFuture<'a, PairDecision> {
         let withdrawn = self.withdraw.armed();
         Box::pin(async move {
+            let deadline = Instant::now() + timeouts::POPUP;
+            let mut withdrawn = std::pin::pin!(withdrawn);
+            // The device words and the alarm, before the sheet is shown: the
+            // FSM's limiter admitted this request; the derivation runs off
+            // the network task, paced for a key nobody saved (W-B5).
+            let seen = match &self.words {
+                None => None,
+                Some(words) => {
+                    let words = Arc::clone(words);
+                    let (device, name) = (peer.device, peer.name.clone());
+                    let pinned = peer.pinned_label.is_some();
+                    let derived = tokio::task::spawn_blocking(move || {
+                        words.pairing_sheet(&device, &name, pinned)
+                    });
+                    tokio::select! {
+                        biased;
+                        () = &mut withdrawn => return PairDecision::Reject,
+                        derived = derived => match derived {
+                            Ok(seen) => Some(seen),
+                            // No words, no alarm verdict: refuse.
+                            Err(_) => return PairDecision::Reject,
+                        },
+                    }
+                }
+            };
+            let typed_only = seen.as_ref().is_some_and(|s| s.looks_like.is_some());
             let (tx, rx) = oneshot::channel();
             let kind = PopupKind::Pairing {
                 name: peer.name.clone(),
@@ -224,12 +310,16 @@ impl Consent for GuiConsent {
                 sas: sas.to_owned(),
                 pinned: peer.pinned_label.clone(),
             };
-            let _on_screen = self.popups.open(Answer::Pair(tx), |id, m| {
-                m.popups.push(Popup {
-                    id,
-                    kind,
-                    deadline: Instant::now() + timeouts::POPUP,
-                });
+            let answer = Answer::Pair {
+                tx,
+                sas: sas.to_owned(),
+                typed_only,
+            };
+            let _on_screen = self.popups.open(answer, |id, m| {
+                if let Some(seen) = seen {
+                    m.recognition.insert(id, seen);
+                }
+                m.popups.push(Popup { id, kind, deadline });
             });
             // A withdrawal wins over an answer given at the same moment.
             tokio::select! {
@@ -247,17 +337,32 @@ impl Consent for GuiConsent {
     ) -> BoxFuture<'a, SessionDecision> {
         let withdrawn = self.withdraw.armed();
         Box::pin(async move {
+            let deadline = Instant::now() + timeouts::POPUP;
+            let mut withdrawn = std::pin::pin!(withdrawn);
+            // A paired device's identicon, beside its pinned label: a saved
+            // key, derived once.
+            let seen = match &self.words {
+                None => None,
+                Some(words) => {
+                    let (words, device) = (Arc::clone(words), peer.device);
+                    let derived = tokio::task::spawn_blocking(move || words.session_sheet(&device));
+                    tokio::select! {
+                        biased;
+                        () = &mut withdrawn => return SessionDecision::Deny,
+                        derived = derived => derived.ok(),
+                    }
+                }
+            };
             let (tx, rx) = oneshot::channel();
             let kind = PopupKind::Session {
                 label: peer.label.clone(),
                 fingerprint: peer.device.fingerprint(),
             };
             let _on_screen = self.popups.open(Answer::Session(tx), |id, m| {
-                m.popups.push(Popup {
-                    id,
-                    kind,
-                    deadline: Instant::now() + timeouts::POPUP,
-                });
+                if let Some(seen) = seen {
+                    m.recognition.insert(id, seen);
+                }
+                m.popups.push(Popup { id, kind, deadline });
             });
             tokio::select! {
                 biased;

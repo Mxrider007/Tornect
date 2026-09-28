@@ -3,12 +3,14 @@
 //! [`Model`] alone (`docs/UI_PLAN.md` §4: no screen reaches around the state to
 //! the network), which is also what the view tests build.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use tornect_core::TornectId;
 use tornect_core::address_book::{Day, mixes_scripts};
+use tornect_core::words::{Identicon, Words};
 
 /// Why the UI thread is woken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +109,10 @@ pub struct Model {
     pub device_name: String,
     /// The address book, the recent connections and the paired devices.
     pub book: Book,
+    /// What each open host sheet shows about the key asking, by popup id:
+    /// its device words, its identicon beside a saved name, the look-alike
+    /// alarm (§B.6.1). Set with the popup, in the same update.
+    pub recognition: HashMap<u64, Recognition>,
     /// The tokio side has finished shutting down.
     pub closed: bool,
 }
@@ -231,6 +237,18 @@ pub enum PopupKind {
         /// Its key's fingerprint.
         fingerprint: String,
     },
+}
+
+/// What a host sheet shows about the key asking (§B.6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recognition {
+    /// Its device words: recognition only, labelled as such.
+    pub words: Words,
+    /// Its identicon: only for a pinned key, beside its saved name (W-B8).
+    pub identicon: Option<Identicon>,
+    /// The saved entry an unpinned key looks like: the alarm fired, and the
+    /// pairing takes the code typed from the other device (W-B3).
+    pub looks_like: Option<String>,
 }
 
 /// The client's side of pairing: the host accepted; do the codes match?
