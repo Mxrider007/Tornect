@@ -182,6 +182,19 @@ fn id_card(
                     ui.label(RichText::new("(not created yet)").color(t.text_muted));
                 }
             }
+            // The address's own words sit under it, labelled "this address"
+            // (§B.6.1 item 5); none while this computer is shared (R-W2).
+            let shared = !model.sharing.is_empty();
+            if let Some(mine) = model.mine.filter(|_| !shared) {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("this address: {}", mine.address.shown()))
+                            .font(theme::font(ui.ctx(), Face::Regular, 12.0))
+                            .color(t.text_muted),
+                    )
+                    .wrap(),
+                );
+            }
             ui.horizontal(|ui| {
                 let copied = form
                     .copied
@@ -245,6 +258,43 @@ fn id_card(
                 });
             }
             divider(ui, t);
+            // The home card leads with the words a host's sheet shows when
+            // this computer connects (§B.6.1 item 5).
+            match (model.mine, shared) {
+                (Some(mine), false) => {
+                    status_line(
+                        ui,
+                        Icon::Monitor,
+                        (
+                            format!(
+                                "When you connect to another computer, it shows: {}",
+                                mine.device.shown()
+                            ),
+                            t.text_primary,
+                        ),
+                    );
+                    status_line(
+                        ui,
+                        Icon::Info,
+                        (
+                            "Device words help you recognise a device. They do not prove who it \
+                             is; the code does. They identify this computer, like its ID, and \
+                             are not a secret or a password."
+                                .to_owned(),
+                            t.text_muted,
+                        ),
+                    );
+                }
+                (Some(_), true) => status_line(
+                    ui,
+                    Icon::Info,
+                    (
+                        "Device words are hidden while this computer is shared.".to_owned(),
+                        t.text_muted,
+                    ),
+                ),
+                (None, _) => {}
+            }
             if !model.device_name.is_empty() {
                 // Decision 5: the name is sent to every device this computer
                 // pairs with and every computer it connects to.
@@ -349,16 +399,46 @@ fn connect_card(
             );
         }
         let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        // The look-alike warning for the ID in the field (§B.6.1 item 4):
+        // Connect then takes a second, deliberate click on its own button.
+        let warned = model
+            .connect_warning
+            .as_ref()
+            .filter(|w| parsed.as_ref().is_ok_and(|id| *id == w.id));
+        if let Some(warning) = warned {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "Looks like your saved \"{}\", but it is a different address.",
+                        warning.name
+                    ))
+                    .font(theme::font(ui.ctx(), Face::Semibold, 13.0))
+                    .color(t.danger_text),
+                )
+                .wrap(),
+            );
+        }
         ui.horizontal(|ui| {
-            let clicked = Button::new(Kind::Primary, "Connect")
-                .icon(Icon::ArrowRight)
-                .enabled(ready)
-                .show(ui)
-                .clicked();
-            if (clicked || (entered && ready))
-                && let Ok(id) = &parsed
-            {
-                actions.push(Action::Connect(*id));
+            if let Some(warning) = warned {
+                if Button::new(Kind::Danger, "Connect anyway")
+                    .icon(Icon::ArrowRight)
+                    .enabled(ready)
+                    .show(ui)
+                    .clicked()
+                {
+                    actions.push(Action::ConnectAnyway(warning.id));
+                }
+            } else {
+                let clicked = Button::new(Kind::Primary, "Connect")
+                    .icon(Icon::ArrowRight)
+                    .enabled(ready)
+                    .show(ui)
+                    .clicked();
+                if (clicked || (entered && ready))
+                    && let Ok(id) = &parsed
+                {
+                    actions.push(Action::Connect(*id));
+                }
             }
             if !model.tor.is_ready() {
                 ui.label(

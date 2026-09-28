@@ -13,13 +13,14 @@ use std::time::{Duration, Instant};
 
 use tornect_capture::{TestCard, VideoSource as _};
 use tornect_codec::DecodedFrame;
+use tornect_core::TornectId;
 use tornect_core::address_book::Day;
-use tornect_core::{DeviceId, TornectId};
+use tornect_core::words::{Identicon, Words};
 use tornect_session::FrameSink as _;
 
 use super::model::{
-    Book, CaptureNote, ClientStage, Computer, Confirm, Device, Hosting, Model, Popup, PopupKind,
-    Setup, Shared, Sharing, TorState, Viewing,
+    Book, CaptureNote, ClientStage, Computer, Confirm, Device, Hosting, Model, MyWords, Popup,
+    PopupKind, Recognition, Setup, Shared, Sharing, TorState, Viewing,
 };
 use super::stream::{FrameSlot, SlotSink};
 
@@ -51,6 +52,10 @@ pub fn model(everything: bool, empty: bool) -> Model {
         } else {
             sample_book(today)
         },
+        mine: Some(MyWords {
+            device: words("orient walk nice rally"),
+            address: words("treat fame transfer pride"),
+        }),
         ..Model::default()
     };
     if everything {
@@ -61,33 +66,121 @@ pub fn model(everything: bool, empty: bool) -> Model {
     m
 }
 
+/// Invented device words (four words of the list; no key behind them).
+fn words(text: &str) -> Words {
+    Words::from_cached(text).unwrap_or_else(|| unreachable!("four words of the list"))
+}
+
+/// Which host sheet `--preview --sheet` puts on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sheet {
+    /// A new device asks to pair: its words, not yet trusted.
+    New,
+    /// A paired device asks to pair again: its saved name and identicon.
+    Pinned,
+    /// A new device that looks like a saved one: the alarm, the typed code.
+    Alarm,
+    /// A paired device asks for a session.
+    Session,
+}
+
+/// Put one host sheet of `sheet`'s kind on screen, with invented words.
+pub fn sheet(m: &mut Model, sheet: Sheet) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (kind, seen) = match sheet {
+        Sheet::New | Sheet::Alarm => (
+            PopupKind::Pairing {
+                name: if sheet == Sheet::Alarm {
+                    "Office PC".to_owned()
+                } else {
+                    "Laptop".to_owned()
+                },
+                fingerprint: String::new(),
+                sas: "482 917".to_owned(),
+                pinned: None,
+            },
+            Recognition {
+                words: words("absurd citizen dinner harvest"),
+                identicon: None,
+                looks_like: (sheet == Sheet::Alarm).then(|| "Office PC".to_owned()),
+            },
+        ),
+        Sheet::Pinned => (
+            PopupKind::Pairing {
+                name: "Laptop".to_owned(),
+                fingerprint: String::new(),
+                sas: "482 917".to_owned(),
+                pinned: Some("Laptop".to_owned()),
+            },
+            Recognition {
+                words: words("orbit crisp lamp arctic"),
+                identicon: Some(Identicon::from_seed([0x5a, 0x3c, 0x02])),
+                looks_like: None,
+            },
+        ),
+        Sheet::Session => (
+            PopupKind::Session {
+                label: "Laptop".to_owned(),
+                fingerprint: String::new(),
+            },
+            Recognition {
+                words: words("orbit crisp lamp arctic"),
+                identicon: Some(Identicon::from_seed([0x5a, 0x3c, 0x02])),
+                looks_like: None,
+            },
+        ),
+    };
+    m.popups = vec![Popup {
+        id: 7,
+        kind,
+        deadline,
+    }];
+    m.recognition.insert(7, seen);
+}
+
 /// A made-up address book: invented names, and the IDs and host keys of
-/// made-up keys.
+/// made-up keys, with invented words.
 fn sample_book(today: Day) -> Book {
     let id = |seed: u8| TornectId::from_bytes([seed; 32]);
-    let fingerprint = |seed: u8| DeviceId::from_bytes([seed; 32]).fingerprint();
     let ago = |days: i64| Day::from_days(today.days() - days);
-    let paired = |seed: u8, name: Option<&str>, label: &str, since: i64, last: i64| Computer {
-        id: id(seed),
-        name: name.map(str::to_owned),
-        pinned: Some(label.to_owned()),
-        declared: Some(label.to_owned()),
-        fingerprint: Some(fingerprint(seed)),
-        paired: Some(ago(since)),
-        last_seen: Some(ago(last)),
-        name_hidden: false,
-    };
+    let paired =
+        |seed: u8, name: Option<&str>, label: &str, since: i64, last: i64, said: &str| Computer {
+            id: id(seed),
+            name: name.map(str::to_owned),
+            pinned: Some(label.to_owned()),
+            declared: Some(label.to_owned()),
+            words: Some(words(said)),
+            identicon: Some(Identicon::from_seed([seed, seed.rotate_left(3), seed])),
+            paired: Some(ago(since)),
+            last_seen: Some(ago(last)),
+            name_hidden: false,
+        };
     Book {
         computers: vec![
-            paired(0x31, Some("Office PC"), "Linux PC", 15, 0),
-            paired(0x52, None, "Home server", 25, 3),
-            paired(0x73, None, "Render box", 30, 14),
+            paired(
+                0x31,
+                Some("Office PC"),
+                "Linux PC",
+                15,
+                0,
+                "arctic crisp lamp orbit",
+            ),
+            paired(0x52, None, "Home server", 25, 3, "cream always equal idea"),
+            paired(
+                0x73,
+                None,
+                "Render box",
+                30,
+                14,
+                "magic arrive umbrella annual",
+            ),
             Computer {
                 id: id(0x94),
                 name: Some("Studio laptop".to_owned()),
                 pinned: None,
                 declared: None,
-                fingerprint: None,
+                words: Some(words("economy bench equip pencil")),
+                identicon: None,
                 paired: None,
                 last_seen: None,
                 name_hidden: false,
@@ -102,13 +195,15 @@ fn sample_book(today: Day) -> Book {
         devices: vec![
             Device {
                 label: "Laptop".to_owned(),
-                fingerprint: fingerprint(0xa5),
+                words: Some(words("orbit crisp lamp arctic")),
+                identicon: Some(Identicon::from_seed([0x5a, 0x3c, 0x02])),
                 paired: ago(4),
                 last_seen: ago(1),
             },
             Device {
                 label: "Tablet".to_owned(),
-                fingerprint: fingerprint(0xb6),
+                words: Some(words("kid print proud pilot")),
+                identicon: Some(Identicon::from_seed([0xb6, 0x21, 0x05])),
                 paired: ago(7),
                 last_seen: ago(4),
             },
@@ -141,7 +236,7 @@ fn fill(m: &mut Model) {
             id: 1,
             kind: PopupKind::Pairing {
                 name: "Laptop".to_owned(),
-                fingerprint: "3f2a 91c0 77de 0b14".to_owned(),
+                fingerprint: String::new(),
                 sas: "482 917".to_owned(),
                 pinned: None,
             },
@@ -151,11 +246,27 @@ fn fill(m: &mut Model) {
             id: 2,
             kind: PopupKind::Session {
                 label: "Laptop".to_owned(),
-                fingerprint: "3f2a 91c0 77de 0b14".to_owned(),
+                fingerprint: String::new(),
             },
             deadline: now + Duration::from_secs(60),
         },
     ];
+    m.recognition.insert(
+        1,
+        Recognition {
+            words: words("absurd citizen dinner harvest"),
+            identicon: None,
+            looks_like: None,
+        },
+    );
+    m.recognition.insert(
+        2,
+        Recognition {
+            words: words("orbit crisp lamp arctic"),
+            identicon: Some(Identicon::from_seed([0x5a, 0x3c, 0x02])),
+            looks_like: None,
+        },
+    );
     m.confirm = Some(Confirm {
         id: 3,
         host_name: "Office PC".to_owned(),
@@ -256,6 +367,7 @@ mod tests {
             preview,
             page,
             empty: false,
+            sheet: None,
             theme: egui::Theme::Dark,
         }
     }

@@ -109,6 +109,12 @@ pub struct Model {
     pub device_name: String,
     /// The address book, the recent connections and the paired devices.
     pub book: Book,
+    /// This computer's two sets of device words, once derived (§B.6.1 item 5).
+    pub mine: Option<MyWords>,
+    /// The connect field's look-alike warning (§B.6.1 item 4): the ID typed
+    /// is not in the address book and looks like a saved one; Connect then
+    /// takes a second, deliberate click.
+    pub connect_warning: Option<ConnectWarning>,
     /// What each open host sheet shows about the key asking, by popup id:
     /// its device words, its identicon beside a saved name, the look-alike
     /// alarm (§B.6.1). Set with the popup, in the same update.
@@ -237,6 +243,25 @@ pub enum PopupKind {
         /// Its key's fingerprint.
         fingerprint: String,
     },
+}
+
+/// This computer's two sets of device words (§B.6.1 item 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MyWords {
+    /// Its device key's: what another computer's sheet shows when this one
+    /// connects to it.
+    pub device: Words,
+    /// Its Tornect ID's ("this address").
+    pub address: Words,
+}
+
+/// The connect field's look-alike warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectWarning {
+    /// The ID typed, which is not in the address book.
+    pub id: TornectId,
+    /// The saved computer it looks like.
+    pub name: String,
 }
 
 /// What a host sheet shows about the key asking (§B.6.1).
@@ -406,8 +431,11 @@ pub struct Computer {
     pub pinned: Option<String>,
     /// The name it declared when last seen.
     pub declared: Option<String>,
-    /// The pinned host key's fingerprint, once paired.
-    pub fingerprint: Option<String>,
+    /// The device words of its ID, once derived (the one short form; the
+    /// fingerprint left every surface, §B.6.1 item 6).
+    pub words: Option<Words>,
+    /// Its identicon: only for a paired computer, beside its name (W-B8).
+    pub identicon: Option<Identicon>,
     /// The day it was paired.
     pub paired: Option<Day>,
     /// The last day a session with it started (history).
@@ -440,8 +468,10 @@ impl Computer {
 pub struct Device {
     /// The label pinned when it was paired.
     pub label: String,
-    /// Its key's fingerprint.
-    pub fingerprint: String,
+    /// Its device words, once derived.
+    pub words: Option<Words>,
+    /// Its identicon (a pinned key), once derived.
+    pub identicon: Option<Identicon>,
     /// The day it was paired.
     pub paired: Day,
     /// The day of its last session request.

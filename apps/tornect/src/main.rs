@@ -87,6 +87,9 @@ enum Command {
         /// With --preview: an empty address book (a first run).
         #[arg(long, hide = true, requires = "preview")]
         empty: bool,
+        /// With --preview --page: one host sheet of this kind on screen.
+        #[arg(long, hide = true, value_enum, requires = "page")]
+        sheet: Option<SheetArg>,
     },
     /// Show this machine's Tornect ID (its onion v3 address), creating it on first run.
     Id {
@@ -229,6 +232,30 @@ impl From<PageArg> for ui::Page {
     }
 }
 
+/// `tornect gui --preview --page … --sheet`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SheetArg {
+    /// A new device asks to pair.
+    New,
+    /// A paired device asks to pair again.
+    Pinned,
+    /// A new device that looks like a saved one.
+    Alarm,
+    /// A paired device asks for a session.
+    Session,
+}
+
+impl From<SheetArg> for ui::preview::Sheet {
+    fn from(arg: SheetArg) -> Self {
+        match arg {
+            SheetArg::New => Self::New,
+            SheetArg::Pinned => Self::Pinned,
+            SheetArg::Alarm => Self::Alarm,
+            SheetArg::Session => Self::Session,
+        }
+    }
+}
+
 /// `tornect gui --preview --theme`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum ThemeArg {
@@ -303,6 +330,7 @@ fn main() -> anyhow::Result<()> {
                 preview: false,
                 page: None,
                 empty: false,
+                sheet: None,
                 theme: egui::Theme::Dark,
             },
         );
@@ -315,6 +343,7 @@ fn main() -> anyhow::Result<()> {
             page,
             theme,
             empty,
+            sheet,
         } => ui::run(
             &paths,
             ui::GuiOpts {
@@ -324,6 +353,7 @@ fn main() -> anyhow::Result<()> {
                 preview,
                 page: page.map(Into::into),
                 empty,
+                sheet: sheet.map(Into::into),
                 theme: match theme {
                     Some(ThemeArg::Light) => egui::Theme::Light,
                     Some(ThemeArg::Dark) | None => egui::Theme::Dark,
