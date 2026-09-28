@@ -559,3 +559,15 @@ Windows prompt path are M-FEAT-3's. Screenshots: `target/tornect-test/feat2/`.
 The gate is green at **743 passed, 0 failed, 6 ignored** (the sixth: the live polkit test, run by hand) at `95396a3`
 (2026-09-28), each commit of M-FEAT-2 gate-green on its own tree before it was committed. The BIP39 list's licence,
 owed from M-FEAT-1, is still not looked up: this session's network was limited to the cargo registry.
+
+## History off by default (the operator's ruling of 2026-09-28)
+
+"Off by default (Recommended)" — "Nothing about past connections is written unless you switch history on in Settings;
+the first run says so in one line." The switch is the address book's `history` (M-UI-2); the first-run line on Home is
+M-UI-3's.
+
+| Check | Status | Evidence |
+|---|---|---|
+| A new Tornect home keeps no history: a visit writes no file, and a stored value (on or off) is kept by every later load | VERIFIED (unit) | `address_book::tests::history_is_off_until_switched_on`; `a_book_round_trips_through_a_private_file` (a missing file is a book with history off) |
+| On a fresh home, where the switch was never touched, neither a connection (client) nor a session request (host) writes anything about past connections: the pins are written at their pairing time, with no visit, and after that no file changes | VERIFIED (unit) | `history::tests::a_fresh_home_writes_no_history` (bytes, modification times and the directory, both sides) |
+| The switch's text when off says what switching it on keeps | VERIFIED (read) | `ui/pages/address_book.rs::recent`: "Off: nothing about past connections is written. Switched on, it keeps the day of each connection (never the time) and each computer's last-connected day, only on this computer; …" |
