@@ -84,6 +84,9 @@ enum Command {
         /// With --preview: draw in this theme (dark unless given).
         #[arg(long, hide = true, value_enum, requires = "preview")]
         theme: Option<ThemeArg>,
+        /// With --preview: an empty address book (a first run).
+        #[arg(long, hide = true, requires = "preview")]
+        empty: bool,
     },
     /// Show this machine's Tornect ID (its onion v3 address), creating it on first run.
     Id {
@@ -299,6 +302,7 @@ fn main() -> anyhow::Result<()> {
                 bridges: cli.bridges,
                 preview: false,
                 page: None,
+                empty: false,
                 theme: egui::Theme::Dark,
             },
         );
@@ -310,6 +314,7 @@ fn main() -> anyhow::Result<()> {
             preview,
             page,
             theme,
+            empty,
         } => ui::run(
             &paths,
             ui::GuiOpts {
@@ -318,6 +323,7 @@ fn main() -> anyhow::Result<()> {
                 bridges: cli.bridges,
                 preview,
                 page: page.map(Into::into),
+                empty,
                 theme: match theme {
                     Some(ThemeArg::Light) => egui::Theme::Light,
                     Some(ThemeArg::Dark) | None => egui::Theme::Dark,

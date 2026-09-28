@@ -1,17 +1,20 @@
-//! The main window's pages (the redesign's §4). In this version Home shows
-//! what works today; the Address book, Sessions and Settings, whose content
+//! The main window's pages (the redesign's §4). In this version Home and the
+//! Address book show what works today; Sessions and Settings, whose content
 //! comes in later versions, each show one plain line saying so, and never a
 //! control that does nothing. The widget gallery is reached only from the
 //! preview. Trust surfaces are not pages: the open questions are drawn above
 //! the page, the banner above everything (`view`).
 
+mod address_book;
 mod gallery;
 mod home;
 
 use std::time::Instant;
 
 use egui::{RichText, Ui};
+use tornect_core::address_book::Day;
 
+pub use self::address_book::BookForm;
 use super::model::Model;
 use super::nav::Page;
 use super::theme::{self, Face};
@@ -28,12 +31,7 @@ pub fn draw(
 ) {
     match page {
         Page::Home => home::home(ui, model, form, now, actions),
-        Page::AddressBook => later(
-            ui,
-            page,
-            "Saved computers and the devices paired with this one arrive in a later version; \
-             until then, connect by ID on Home.",
-        ),
+        Page::AddressBook => address_book::page(ui, model, form, actions),
         Page::Sessions => later(
             ui,
             page,
@@ -47,6 +45,40 @@ pub fn draw(
              the commands that change them.",
         ),
         Page::Widgets => gallery::gallery(ui),
+    }
+}
+
+/// A day as the lists say it: "Today", "Yesterday", "3 days ago" within a
+/// week, else "12 Sep 2026". Days are UTC days (history keeps no time).
+#[must_use]
+pub fn day_text(day: Day, today: Option<Day>) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    match today.map(|today| today.days() - day.days()) {
+        Some(0) => "Today".to_owned(),
+        Some(1) => "Yesterday".to_owned(),
+        Some(n @ 2..=6) => format!("{n} days ago"),
+        _ => {
+            let (y, m, d) = day.ymd();
+            let month = MONTHS
+                .get(m.saturating_sub(1) as usize)
+                .copied()
+                .unwrap_or("?");
+            format!("{d} {month} {y}")
+        }
+    }
+}
+
+/// A day inside a sentence: "today", "yesterday", "3 days ago", or "on 12
+/// Sep 2026".
+#[must_use]
+pub fn day_in_sentence(day: Day, today: Option<Day>) -> String {
+    let text = day_text(day, today);
+    match text.as_str() {
+        "Today" | "Yesterday" => text.to_lowercase(),
+        _ if text.ends_with(" ago") => text,
+        _ => format!("on {text}"),
     }
 }
 
@@ -251,7 +283,7 @@ mod tests {
     #[test]
     fn a_later_page_offers_no_control() {
         let listed: Vec<&str> = Page::LISTED.iter().map(|p| p.title()).collect();
-        for page in [Page::AddressBook, Page::Sessions, Page::Settings] {
+        for page in [Page::Sessions, Page::Settings] {
             for size in [WIDE, NARROW] {
                 let window = Window::new(at_rest(), page, egui::Theme::Dark, size);
                 for control in window.controls() {
@@ -342,7 +374,7 @@ mod tests {
                 .y0
         };
         let row_top = top(&window, "Connect to a computer") - 21.0;
-        let below = top(&window, "Recent activity");
+        let below = top(&window, "Saved computers");
         let drawn = below - row_top;
         assert!(
             (drawn - f64::from(short)).abs() < 40.0,
