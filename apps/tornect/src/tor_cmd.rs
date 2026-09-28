@@ -523,14 +523,17 @@ pub fn connect(
     paths.ensure().context("creating Tornect directories")?;
     let store = FileSecretStore::open(paths.keys_dir()).context("opening keystore")?;
     let (device, _) = load_or_create_device_identity(&store)?;
-    let known = Arc::new(
-        KnownHostStore::open(tornect_core::trusted::known_hosts_file(paths))
-            .context("opening known-hosts.toml")?,
-    );
-    if opts.forget && known.remove(&id)? {
-        eprintln!("forgot {id}; this connection pairs again");
+    if opts.forget {
+        let known = KnownHostStore::open(tornect_core::trusted::known_hosts_file(paths))
+            .context("opening known-hosts.toml")?;
+        if known.remove(&id)? {
+            eprintln!("forgot {id}; this connection pairs again");
+        }
     }
-    block_on(run_connect(paths, &cfg, id, &device, known, opts))
+    // With history off the handshake works on a copy of the known hosts, so
+    // that its last-seen touch writes nothing (`crate::history`).
+    let pins = crate::history::Pins::open(paths, id).context("opening known-hosts.toml")?;
+    block_on(run_connect(paths, &cfg, id, &device, &pins, opts))
 }
 
 async fn run_connect(
@@ -538,12 +541,12 @@ async fn run_connect(
     cfg: &Config,
     id: TornectId,
     device: &DeviceIdentity,
-    known: Arc<KnownHostStore>,
+    pins: &crate::history::Pins,
     opts: ConnectOpts,
 ) -> anyhow::Result<()> {
     eprintln!("bootstrapping Tor (~30 s cold, a few seconds with a warm cache)...");
     let node = start_tor(paths, cfg).await?;
-    let result = connect_session(&node, cfg, id, device, known, opts).await;
+    let result = connect_session(&node, cfg, id, device, pins, opts).await;
     node.shutdown().await;
     result
 }
@@ -553,7 +556,7 @@ async fn connect_session(
     cfg: &Config,
     id: TornectId,
     device: &DeviceIdentity,
-    known: Arc<KnownHostStore>,
+    pins: &crate::history::Pins,
     opts: ConnectOpts,
 ) -> anyhow::Result<()> {
     eprintln!("connecting to {id} (rendezvous usually takes 5-30 s, up to 60 s)...");
@@ -567,10 +570,10 @@ async fn connect_session(
         .map_err(explain)?;
     eprintln!("connected in {:.1} s", started.elapsed().as_secs_f64());
 
-    let pairing = known.get(&id).is_none();
+    let pairing = !pins.known();
     let ccfg = ClientConfig::new(id, cfg.general.device_name.clone());
     let deps = ClientDeps {
-        known_hosts: known,
+        known_hosts: pins.store(),
         ui: Arc::new(CliPairingUi::new(Prompter::stdin())),
         random: Arc::new(OsRandom),
         // Consulted only by unattended sessions, which this command does not request.
@@ -588,9 +591,12 @@ async fn connect_session(
             eprintln!("asking for a session; the host's user has to accept it (up to 110 s)...");
         }
     }
-    let outcome = client::connect(stream, &ccfg, device, &deps, intent)
-        .await
-        .map_err(explain_handshake)?;
+    let outcome = client::connect(stream, &ccfg, device, &deps, intent).await;
+    // A pin the handshake made is kept however it ended.
+    if let Err(e) = pins.settle() {
+        eprintln!("the pairing could not be saved: {e:#}");
+    }
+    let outcome = outcome.map_err(explain_handshake)?;
     let mut session = match outcome {
         ClientOutcome::Paired { host_name } => {
             println!("PAIRED with \"{host_name}\"");
@@ -607,6 +613,10 @@ async fn connect_session(
         session.session_token().session_id(),
         session.host_label()
     );
+    // The day of the visit, if history is kept; nothing otherwise.
+    if let Err(e) = pins.visited() {
+        tracing::warn!(error = %format!("{e:#}"), "the visit was not recorded");
+    }
     // M1 has no direct path: the Tor circuit is the transport, and saying so
     // stops the host's 15 s orphan timer (§B.8.4.5).
     session

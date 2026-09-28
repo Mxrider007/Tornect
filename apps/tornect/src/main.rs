@@ -18,6 +18,7 @@ compile_error!(
      or add `-C target-feature=+crt-static` to it"
 );
 
+mod history;
 mod host;
 mod prompt;
 mod tor_cmd;
