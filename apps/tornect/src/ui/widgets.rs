@@ -532,6 +532,53 @@ pub fn identicon(ui: &mut Ui, fingerprint: &[u8], size: f32) -> Response {
     response
 }
 
+/// The QR code of `text` (error correction M), `size` points square with a
+/// white quiet zone of four modules around it: dark modules on white in both
+/// themes, as scanners expect. Empty when `text` does not fit a QR code.
+pub fn qr_code(ui: &mut Ui, text: &str, size: f32) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Image, true, "QR code"));
+    let Some((width, dark)) = qr_modules(text) else {
+        return response;
+    };
+    let quiet = 4;
+    let cells = width + 2 * quiet;
+    let module = (size / cells as f32).floor().max(1.0);
+    let drawn = module * cells as f32;
+    let origin = rect.min + Vec2::splat(((size - drawn) / 2.0).floor());
+    let painter = ui.painter();
+    painter.rect_filled(
+        Rect::from_min_size(origin, Vec2::splat(drawn)),
+        CornerRadius::same(6),
+        Color32::WHITE,
+    );
+    for (i, _) in dark.iter().enumerate().filter(|(_, on)| **on) {
+        let (x, y) = (i % width + quiet, i / width + quiet);
+        painter.rect_filled(
+            Rect::from_min_size(
+                origin + vec2(x as f32 * module, y as f32 * module),
+                Vec2::splat(module),
+            ),
+            0,
+            Color32::BLACK,
+        );
+    }
+    response
+}
+
+/// The modules of `text`'s QR code (error correction M): its width, and row
+/// by row whether each module is dark. `None` when `text` does not fit.
+#[must_use]
+pub fn qr_modules(text: &str) -> Option<(usize, Vec<bool>)> {
+    let code = qrcode::QrCode::with_error_correction_level(text, qrcode::EcLevel::M).ok()?;
+    let dark = code
+        .to_colors()
+        .into_iter()
+        .map(|c| c == qrcode::Color::Dark)
+        .collect();
+    Some((code.width(), dark))
+}
+
 /// A page's title (26 points, bold) and the line under it.
 pub fn page_header(ui: &mut Ui, title: &str, subtitle: &str) {
     let t = theme::tokens(ui.ctx());

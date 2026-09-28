@@ -44,11 +44,29 @@ pub enum Icon {
     Moon,
     /// The light theme.
     Sun,
+    /// A QR code.
+    QrCode,
+    /// Forget, remove.
+    Trash,
+    /// Rename.
+    Pencil,
+    /// Add.
+    Plus,
+    /// Search.
+    Search,
+    /// Check whether a computer answers.
+    Activity,
+    /// A saved computer.
+    Laptop,
+    /// A recent connection.
+    Clock,
+    /// Cancel, close.
+    X,
 }
 
 /// Each icon, its name in Lucide, and its code point in the icon font (from
 /// `codepoints.json` of `lucide-font-1.48.0.zip`).
-pub const GLYPHS: [(Icon, &str, char); 16] = [
+pub const GLYPHS: [(Icon, &str, char); 25] = [
     (Icon::House, "house", '\u{e0f5}'),
     (Icon::BookUser, "book-user", '\u{e54d}'),
     (Icon::History, "history", '\u{e1f5}'),
@@ -65,6 +83,15 @@ pub const GLYPHS: [(Icon, &str, char); 16] = [
     (Icon::MousePointer, "mouse-pointer-2", '\u{e1c3}'),
     (Icon::Moon, "moon", '\u{e11e}'),
     (Icon::Sun, "sun", '\u{e178}'),
+    (Icon::QrCode, "qr-code", '\u{e1df}'),
+    (Icon::Trash, "trash-2", '\u{e18e}'),
+    (Icon::Pencil, "pencil", '\u{e1f9}'),
+    (Icon::Plus, "plus", '\u{e13d}'),
+    (Icon::Search, "search", '\u{e151}'),
+    (Icon::Activity, "activity", '\u{e038}'),
+    (Icon::Laptop, "laptop", '\u{e1cd}'),
+    (Icon::Clock, "clock", '\u{e087}'),
+    (Icon::X, "x", '\u{e1b2}'),
 ];
 
 impl Icon {

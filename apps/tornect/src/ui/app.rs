@@ -538,6 +538,17 @@ impl App {
                     main.state.set_clipboard_text(id.replace(' ', ""));
                 }
             }
+            Action::Copy(text) => {
+                if let Some(main) = &mut self.main {
+                    main.state.set_clipboard_text(text);
+                }
+            }
+            Action::Ping(id) => self.command(Command::Ping(id)),
+            Action::ForgetHost(id) => self.command(Command::ForgetHost(id)),
+            Action::RenameHost(id, name) => self.command(Command::RenameHost(id, name)),
+            Action::SaveEntry(id, name) => self.command(Command::SaveEntry(id, name)),
+            Action::ClearHistory => self.command(Command::ClearHistory),
+            Action::SetHistory(on) => self.command(Command::SetHistory(on)),
         }
     }
 

@@ -95,6 +95,20 @@ pub enum Action {
     },
     /// Copy this machine's ID.
     CopyId,
+    /// Copy this text (another computer's ID).
+    Copy(String),
+    /// Check once whether this computer answers (asked on a click only).
+    Ping(TornectId),
+    /// Forget this computer: its pin, its saved name, its history.
+    ForgetHost(TornectId),
+    /// Name this computer (empty: remove the saved name).
+    RenameHost(TornectId, String),
+    /// Save a computer by its ID, with a name.
+    SaveEntry(TornectId, String),
+    /// Clear the history of connections.
+    ClearHistory,
+    /// Keep a history of connections, or stop keeping one.
+    SetHistory(bool),
 }
 
 /// What the user is typing, and what the window remembers of its cards.
@@ -110,6 +124,10 @@ pub struct Form {
     pub page: Page,
     /// When Copy ID was last pressed (the button says "Copied" for a while).
     pub copied: Option<Instant>,
+    /// Home shows this computer's ID as a QR code.
+    pub qr: bool,
+    /// The address book page's own state.
+    pub book: pages::BookForm,
 }
 
 impl Form {
