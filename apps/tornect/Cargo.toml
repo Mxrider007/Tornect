@@ -36,6 +36,7 @@ egui-winit.workspace = true
 egui-wgpu.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
+qrcode.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
