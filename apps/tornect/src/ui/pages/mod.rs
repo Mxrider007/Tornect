@@ -331,6 +331,23 @@ mod tests {
         }
         let short = window.ctx.data(|d| d.get_temp::<f32>(row)).expect("stored");
         assert!(short < tall - 20.0, "{tall} then {short}");
+        // And the row is drawn that tall, no taller: what follows it starts
+        // one gap below the cards.
+        let top = |w: &Window, text: &str| {
+            w.nodes
+                .iter()
+                .find(|n| n.value() == Some(text))
+                .and_then(Node::bounds)
+                .unwrap_or_else(|| panic!("no \"{text}\""))
+                .y0
+        };
+        let row_top = top(&window, "Connect to a computer") - 21.0;
+        let below = top(&window, "Recent activity");
+        let drawn = below - row_top;
+        assert!(
+            (drawn - f64::from(short)).abs() < 40.0,
+            "the row is {drawn} tall, its cards need {short}"
+        );
     }
 
     /// Enter in the connect field connects, as the button does.
