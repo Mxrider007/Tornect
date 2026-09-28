@@ -22,6 +22,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tornect_core::DeviceId;
+use tornect_core::levels::{Answers, Availability};
 use tornect_core::session_log::SessionMode;
 use tornect_core::unattended::guard::{AdminEffect, RemoteSessionActivity};
 use zeroize::Zeroizing;
@@ -74,10 +75,16 @@ pub struct HostConfig {
     /// `BYE{ORPHANED}` when an established stream stays silent this long
     /// (a value near `Duration::MAX` means "never").
     pub idle_timeout: Duration,
+    /// This host's row of the §B.2.1 availability table (r7): the answers
+    /// the session sheet offers ([`Availability::offered`]). An answer
+    /// outside them is refused (`DENIED`), never lowered or raised.
+    pub levels: Availability,
 }
 
 impl HostConfig {
-    /// Defaults: no feats, empty caps, `Any` transport, the §B.8.4.5 orphan timer, 90 s idle.
+    /// Defaults: no feats, empty caps, `Any` transport, the §B.8.4.5 orphan
+    /// timer, 90 s idle, the Linux row of the availability table (no
+    /// administrator level).
     #[must_use]
     pub fn new(host_name: impl Into<String>, host_device_pk: [u8; 32]) -> Self {
         Self {
@@ -88,6 +95,7 @@ impl HostConfig {
             transport_policy: TransportPolicy::Any,
             orphan_timeout: Some(timeouts::ORPHAN),
             idle_timeout: timeouts::ESTABLISHED_IDLE,
+            levels: Availability::default(),
         }
     }
 }
@@ -1001,18 +1009,31 @@ where
         };
         let decision = {
             let _pending = Counted::new(&deps.stats.consent_pending);
-            tokio::time::timeout(timeouts::POPUP, deps.consent.session(&peer, &summary)).await
+            tokio::time::timeout(
+                timeouts::POPUP,
+                deps.consent.session_at(&peer, &summary, &cfg.levels),
+            )
+            .await
         };
+        // The level is the person's answer (§B.8.4.1), and only an answer the
+        // sheet could offer: anything else is refused as a Deny, never
+        // started at another level (§B.2.1: an administrator answer never
+        // starts a session at a lower one).
+        let offered = cfg.levels.offered();
         let choice = match decision {
             Err(_) => {
                 return reject_session(&mut chan, deps, &peer, messages::reject::POPUP_TIMEOUT)
                     .await;
             }
-            Ok(SessionDecision::Deny) => {
-                return reject_session(&mut chan, deps, &peer, messages::reject::DENIED).await;
-            }
-            Ok(SessionDecision::AllowOnce) => PopupChoice::AllowOnce,
-            Ok(SessionDecision::AllowOnceViewOnly) => PopupChoice::AllowOnceViewOnly,
+            Ok(decision) => match accepted(decision, &offered) {
+                Some(choice) => choice,
+                None => {
+                    if decision != SessionDecision::Deny {
+                        tracing::warn!(peer = ?device, ?decision, "an answer the sheet does not offer; refused");
+                    }
+                    return reject_session(&mut chan, deps, &peer, messages::reject::DENIED).await;
+                }
+            },
         };
         let mut token = Zeroizing::new([0u8; 32]);
         deps.random.fill(&mut token[..])?;
@@ -1144,6 +1165,18 @@ where
         th_final,
         end,
     })
+}
+
+/// The popup choice of an answer the sheet offered: `None` for Deny and for
+/// an answer outside `offered`, which is refused, never lowered or raised.
+fn accepted(decision: SessionDecision, offered: &Answers) -> Option<PopupChoice> {
+    let choice = match decision {
+        SessionDecision::AllowOnce => PopupChoice::AllowOnce,
+        SessionDecision::AllowOnceViewOnly => PopupChoice::AllowOnceViewOnly,
+        SessionDecision::AllowOnceAdmin => PopupChoice::AllowOnceAdmin,
+        SessionDecision::Deny => return None,
+    };
+    offered.offers(choice.level()).then_some(choice)
 }
 
 /// Fixed text for a session that ended in an error (never peer-controlled).

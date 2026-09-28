@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use tokio::io::duplex;
+use tornect_core::levels::{Availability, Elevation, WindowsFacts};
 use tornect_core::trusted::TrustedDevices;
 
 use super::harness::{self, Role, Scenario};
@@ -24,7 +25,10 @@ use super::vectors::{
 };
 use super::*;
 use crate::envelope::Kind;
-use crate::messages::{Bye, Hello, PairRequest, Ping, Pong, SessionRequest, bye};
+use crate::messages::{
+    self, Bye, Hello, PairRequest, Ping, Pong, SessionAccept, SessionRequest, UnattendedRequest,
+    bye, decode_body, encode_body,
+};
 use crate::pairing::{
     PairDecision, PairScript, Sas, ScriptedConsent, SessionDecision, SessionScript,
     TrustedDeviceStore,
@@ -112,6 +116,48 @@ const EXPECTED_PAIRED: &[(&str, &str)] = &[
     (
         "th_4",
         "c83e71f2449432f86fb11be72ced679d40e664a4c7ba0694f0eb7a43f2ab939e",
+    ),
+];
+
+/// Vector 3: the accept of vector 1 answered "Allow as administrator" on an
+/// always-administrator host (`elevation = 1`); the rows before it are
+/// vector 1's.
+const EXPECTED_ADMIN_ACCEPT: &[(&str, &str)] = &[
+    (
+        "frame_4_session_accept",
+        "000000bc850102075874a900a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50200030004000558205555555555555555555555555555555555555555555555555555555555555555070008f40b0158403e1780fc3b649494cb142fc9fe526d8f073038fe769ff0ca6788e812583e8d7fa886579125c00009015ee8e9b958310fbfbdfc46fa6f2f50c3f2184c611f8006",
+    ),
+    (
+        "digest_4",
+        "e6182a5859ce71719d9de07ab89256903a89906fd67e681aa8953e72530bb93d",
+    ),
+    (
+        "sig_4",
+        "3e1780fc3b649494cb142fc9fe526d8f073038fe769ff0ca6788e812583e8d7fa886579125c00009015ee8e9b958310fbfbdfc46fa6f2f50c3f2184c611f8006",
+    ),
+    (
+        "th_4",
+        "f3142b4f965ad0c47cc074f244efe5237a461acf080c4199850d91b69e0bc9ac",
+    ),
+];
+
+/// The unattended `SESSION_REQUEST` bodies without and with `want_elevation`.
+const EXPECTED_UNATTENDED_REQUEST: &[(&str, &str)] = &[
+    (
+        "request_body_without_want_elevation",
+        "a200a400816468323634018219078019043802f4030101a4000101586066666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666602000300",
+    ),
+    (
+        "request_digest_without_want_elevation",
+        "fa226454f87515cdd417e38f9f939ffc363efd369935426a1f190dc314872ba2",
+    ),
+    (
+        "request_body_with_want_elevation",
+        "a200a400816468323634018219078019043802f4030101a50001015860666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666020003000501",
+    ),
+    (
+        "request_digest_with_want_elevation",
+        "6a9d583d98407e7808e4962029ec1ef51c54f61ac1953d363b77c26aec347fd6",
     ),
 ];
 
@@ -240,6 +286,17 @@ fn client_request() -> SessionRequest {
 
 /// Run the exchange and return every value of the vector as `(label, hex)`.
 pub(super) async fn compute(paired: bool) -> Vec<(&'static str, String)> {
+    compute_with(paired, Availability::LINUX, SessionDecision::AllowOnce).await
+}
+
+/// [`compute`] on a host in the availability row `levels`, whose person
+/// answers `decision` (vector 3: the always-administrator row and
+/// "Allow as administrator").
+async fn compute_with(
+    paired: bool,
+    levels: Availability,
+    decision: SessionDecision,
+) -> Vec<(&'static str, String)> {
     let host = Arc::new(host_identity());
     let client = client_identity();
     let mut devices = TrustedDevices::default();
@@ -249,11 +306,12 @@ pub(super) async fn compute(paired: bool) -> Vec<(&'static str, String)> {
     let trusted = Arc::new(TrustedDeviceStore::ephemeral(devices));
     let consent = Arc::new(ScriptedConsent::new());
     consent.push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
-    consent.push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+    consent.push_session(SessionScript::Decide(decision));
     let mut deps = HostDeps::headless(host.clone(), trusted);
     deps.consent = consent;
     deps.random = host_random();
-    let cfg = host_config();
+    let mut cfg = host_config();
+    cfg.levels = levels;
 
     let (a, b) = duplex(64 * 1024);
     let task = tokio::spawn(async move { serve_host(a, &cfg, &deps).await });
@@ -410,6 +468,106 @@ async fn golden_vector_attended_exchange() {
     // Deterministic across runs.
     let again = compute(true).await;
     assert_eq!(actual, again);
+}
+
+/// Vector 3 (r7, §B.2.1): vector 1 on a host whose row offers the
+/// administrator answer (UAC off on an administrator account), answered
+/// "Allow as administrator". Frames 1–3 are vector 1's; the accept carries
+/// `elevation = 1` (key 11) inside the signed body.
+#[tokio::test]
+async fn golden_vector_administrator_accept() {
+    let always_admin = Availability::of(Some(&WindowsFacts {
+        installed: true,
+        administrator: true,
+        enable_lua: Some(0),
+        ..WindowsFacts::default()
+    }));
+    let actual = compute_with(true, always_admin, SessionDecision::AllowOnceAdmin).await;
+    // Everything up to the accept is vector 1's, byte for byte.
+    let (same, changed) = actual.split_at(EXPECTED_PAIRED.len() - 4);
+    check(same, &EXPECTED_PAIRED[..EXPECTED_PAIRED.len() - 4]);
+    check(changed, EXPECTED_ADMIN_ACCEPT);
+    assert_eq!(
+        actual,
+        compute_with(true, always_admin, SessionDecision::AllowOnceAdmin).await
+    );
+    // The accept at none (vector 1) carries no key 11; this one carries 1.
+    let none: SessionAccept =
+        decode_body(&frame_body(&compute(true).await, "frame_4_session_accept")).unwrap();
+    assert_eq!(none.elevation(), Elevation::None);
+    let admin: SessionAccept = decode_body(&frame_body(&actual, "frame_4_session_accept")).unwrap();
+    assert_eq!(admin.elevation(), Elevation::Admin);
+    assert_eq!(admin.mode(), messages::mode::CONTROL);
+    let mut without = admin.clone();
+    without.elevation = None;
+    assert_eq!(
+        encode_body(&without),
+        encode_body(&none),
+        "key 11 is the only difference"
+    );
+}
+
+/// The body of a vector frame: the envelope's `body`.
+fn frame_body(vector: &[(&str, String)], label: &str) -> Vec<u8> {
+    Envelope::decode(&frame_payload(vector, label))
+        .unwrap()
+        .body
+        .clone()
+}
+
+/// `SESSION_REQUEST.unattended.want_elevation` (key 5, r7): an unattended
+/// request's body without the key and with it at admin, the fixed `ke1`
+/// `66` × 96, and each body's digest as the second frame of a stream
+/// (`v` 1, `msg_id` 2). The key adds one map entry and changes nothing else.
+#[test]
+fn golden_vector_unattended_request_bodies() {
+    let request = |want_elevation| SessionRequest {
+        caps: client_config(host_identity().id()).caps,
+        unattended: Some(UnattendedRequest {
+            suite: messages::suite::OPAQUE,
+            ke1: Some([0x66; 96]),
+            want_mode: messages::mode::CONTROL,
+            intent: messages::intent::SESSION,
+            admin: None,
+            want_elevation,
+        }),
+    };
+    let without = encode_body(&request(None));
+    let with = encode_body(&request(Some(messages::elevation::ADMIN)));
+    let actual = vec![
+        ("request_body_without_want_elevation", hex::encode(&without)),
+        (
+            "request_digest_without_want_elevation",
+            hex::encode(digest(1, 2, Kind::SessionRequest, &without)),
+        ),
+        ("request_body_with_want_elevation", hex::encode(&with)),
+        (
+            "request_digest_with_want_elevation",
+            hex::encode(digest(1, 2, Kind::SessionRequest, &with)),
+        ),
+    ];
+    check(&actual, EXPECTED_UNATTENDED_REQUEST);
+    let decoded: SessionRequest = decode_body(&with).unwrap();
+    assert_eq!(decoded.unattended.unwrap().want_elevation, Some(1));
+    let decoded: SessionRequest = decode_body(&without).unwrap();
+    assert_eq!(decoded.unattended.unwrap().want_elevation, None);
+}
+
+/// The committed vectors from before the keys existed still decode, at
+/// none: vector 1's request (attended, no `unattended` map) and its accept
+/// (no key 11).
+#[tokio::test]
+async fn the_old_vectors_decode_at_none() {
+    let old: Vec<(&str, String)> = EXPECTED_PAIRED
+        .iter()
+        .map(|(k, v)| (*k, (*v).to_owned()))
+        .collect();
+    let request: SessionRequest =
+        decode_body(&frame_body(&old, "frame_3_session_request")).unwrap();
+    assert!(request.unattended.is_none());
+    let accept: SessionAccept = decode_body(&frame_body(&old, "frame_4_session_accept")).unwrap();
+    assert_eq!(accept.elevation(), Elevation::None);
+    assert_eq!(accept.elevation, None);
 }
 
 #[tokio::test]

@@ -19,6 +19,7 @@ use ed25519_dalek::VerifyingKey;
 use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Instant;
+use tornect_core::levels::Elevation;
 use tornect_core::unattended::hosts::PinCheck;
 use tornect_core::{DeviceIdentity, TornectId};
 use zeroize::Zeroizing;
@@ -102,6 +103,10 @@ pub struct UnattendedIntent {
     pub password: Zeroizing<String>,
     /// A [`messages::mode`] value; the host clamps it toward view-only.
     pub want_mode: u8,
+    /// The administrator level asked for (r7, §B.8.4.1), chosen at connect
+    /// time and none unless asked: sent as `want_elevation` only when it is
+    /// admin; the host clamps it to the grant's and to what it delivers.
+    pub want_elevation: Elevation,
 }
 
 impl fmt::Debug for UnattendedIntent {
@@ -109,6 +114,7 @@ impl fmt::Debug for UnattendedIntent {
         f.debug_struct("UnattendedIntent")
             .field("password", &"<redacted>")
             .field("want_mode", &self.want_mode)
+            .field("want_elevation", &self.want_elevation)
             .finish()
     }
 }
@@ -745,6 +751,8 @@ where
             want_mode: ua.want_mode,
             intent: messages::intent::SESSION,
             admin: None,
+            want_elevation: (ua.want_elevation == Elevation::Admin)
+                .then_some(Elevation::Admin.code()),
         }),
     };
     chan.send(&request, Some(identity)).await?;

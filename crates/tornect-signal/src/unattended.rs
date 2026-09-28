@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use futures::future::BoxFuture;
 use tokio::sync::Notify;
 use tornect_core::id::DeviceId;
+use tornect_core::levels::{Elevation, Level};
 use tornect_core::session_log::SessionMode;
 use tornect_core::unattended::grant::{AuthRecord, GrantId};
 use tornect_core::unattended::guard::{AdminEffect, AdminOp, AdminOutcome, MutationGuard};
@@ -702,18 +703,32 @@ impl UnattendedAuth {
         } else {
             SessionMode::Control
         };
-        let session_mode = SessionMode::most_restrictive(grant.mode, wanted);
+        // `want_elevation` the same way (r7, §B.8.4.1): the most restrictive
+        // of the grant's level, the request and what this host delivers. A
+        // grant carries no elevation before §B.8.7.1's setup exists
+        // (M-FEAT-5), so an unattended session is at none for now.
+        let want_elevation = req
+            .want_elevation
+            .and_then(Elevation::from_code)
+            .unwrap_or(Elevation::None);
+        let level =
+            Level::new(grant.mode, Elevation::None).clamp(wanted, want_elevation, Elevation::None);
+        debug_assert_eq!(
+            level.mode(),
+            SessionMode::most_restrictive(grant.mode, wanted)
+        );
 
         let policy = PolicyReceipt::mint(
             grant.id,
-            session_mode,
+            level.mode(),
             wire_transport(post.transport),
             post.ends_at,
             grant.block_window_s,
             grant.ask_before_start,
             self.readiness.clone(),
             fail_summary.map(wire_fail_summary),
-        );
+        )
+        .with_elevation(level.elevation());
 
         Ok(UnattendedVerdict::Accept {
             proof: ConsentProof::Unattended {
@@ -982,6 +997,7 @@ mod tests {
                 want_mode: mode::CONTROL,
                 intent: intent::SESSION,
                 admin: None,
+                want_elevation: None,
             }),
         }
     }
@@ -1058,6 +1074,7 @@ mod tests {
                 want_mode: mode::CONTROL,
                 intent: intent::ADMIN,
                 admin: Some(messages::AdminCmd { op, device_pk }),
+                want_elevation: None,
             }),
         };
         let caps = Caps::default();
