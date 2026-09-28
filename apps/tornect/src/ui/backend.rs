@@ -37,6 +37,7 @@ use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
 use super::model::{
     CaptureNote, Check, ClientStage, Hosting, Shared, Sharing, TorState, Viewing, Wake,
 };
+use super::recognize::Lookalike;
 use super::stream::{FrameSlot, SlotSink};
 use crate::host::{ControlChannel, HostLock, HostWiring, describe_end, describe_media, note, say};
 use crate::tor_cmd::{End, explain, explain_handshake};
@@ -591,8 +592,14 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                         }
                         // The second click counts only for the ID warned about.
                         let anyway = matches!(command, Command::ConnectAnyway(_))
-                            && b.shared.read(|m| m.connect_warning.as_ref().is_some_and(|w| w.id == id));
-                        b.shared.update(|m| m.connect_warning = None);
+                            && b.shared.read(|m| {
+                                m.connect_warning.as_ref().is_some_and(|w| w.id == id)
+                                    || m.connect_unchecked == Some(id)
+                            });
+                        b.shared.update(|m| {
+                            m.connect_warning = None;
+                            m.connect_unchecked = None;
+                        });
                         let (stop_tx, stop) = watch::channel(false);
                         let task = tokio::spawn(view_session(Arc::clone(&b), node, id, stop, anyway));
                         viewing = Some((stop_tx, task));
@@ -817,12 +824,24 @@ async fn view_session(
     if !anyway && !b.shared.read(|m| m.book.computer(&id).is_some()) {
         let words = Arc::clone(&b.words);
         let looks = tokio::task::spawn_blocking(move || words.connect_check(&id)).await;
-        if let Ok(Some(name)) = looks {
-            b.shared.update(|m| {
-                m.connect_warning = Some(super::model::ConnectWarning { id, name });
-                m.client = ClientStage::Idle;
-            });
-            return;
+        match looks {
+            Ok(Some(Lookalike::Named(name))) => {
+                b.shared.update(|m| {
+                    m.connect_warning = Some(super::model::ConnectWarning { id, name });
+                    m.client = ClientStage::Idle;
+                });
+                return;
+            }
+            // A file of saved entries could not be read: say so and wait for
+            // the same second click (F-4).
+            Ok(Some(Lookalike::Unchecked)) => {
+                b.shared.update(|m| {
+                    m.connect_unchecked = Some(id);
+                    m.client = ClientStage::Idle;
+                });
+                return;
+            }
+            Ok(None) | Err(_) => {}
         }
     }
     let ended = viewed(&b, &node, id, &stop).await;

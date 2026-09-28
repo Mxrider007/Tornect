@@ -405,6 +405,11 @@ fn connect_card(
             .connect_warning
             .as_ref()
             .filter(|w| parsed.as_ref().is_ok_and(|id| *id == w.id));
+        // Or it could not be compared with every saved ID (F-4).
+        let unchecked = model
+            .connect_unchecked
+            .filter(|u| parsed.as_ref().is_ok_and(|id| id == u));
+        let second_click = warned.map(|w| w.id).or(unchecked);
         if let Some(warning) = warned {
             ui.add(
                 egui::Label::new(
@@ -417,16 +422,28 @@ fn connect_card(
                 )
                 .wrap(),
             );
+        } else if unchecked.is_some() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Could not compare it with your saved addresses: a file of saved \
+                         entries could not be read.",
+                    )
+                    .font(theme::font(ui.ctx(), Face::Semibold, 13.0))
+                    .color(t.danger_text),
+                )
+                .wrap(),
+            );
         }
         ui.horizontal(|ui| {
-            if let Some(warning) = warned {
+            if let Some(id) = second_click {
                 if Button::new(Kind::Danger, "Connect anyway")
                     .icon(Icon::ArrowRight)
                     .enabled(ready)
                     .show(ui)
                     .clicked()
                 {
-                    actions.push(Action::ConnectAnyway(warning.id));
+                    actions.push(Action::ConnectAnyway(id));
                 }
             } else {
                 let clicked = Button::new(Kind::Primary, "Connect")

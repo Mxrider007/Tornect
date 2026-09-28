@@ -12,9 +12,13 @@
 //! memory ([`Known`]); the address book also keeps each computer's words in
 //! its entry's cache. Nothing here logs, sends or stores a word anywhere else.
 
+use std::sync::atomic::AtomicBool;
+
 use tornect_core::address_book::Store;
 use tornect_core::trusted::{KnownHosts, TrustedDevices, known_hosts_file};
-use tornect_core::words::{self, Candidate, Identicon, Known, Pacer, Role, Saved, Words};
+use tornect_core::words::{
+    self, Candidate, Identicon, Known, Pacer, Role, Saved, Stretched, Words,
+};
 use tornect_core::{DeviceId, Paths, TornectId};
 
 use super::model::{MyWords, Recognition};
@@ -86,28 +90,71 @@ impl Recognizer {
     /// pinned already (a re-pair, shown beside its pinned label); for an
     /// unpinned key, the saved entry it looks like, if it looks like one.
     /// An unpinned key is derived through the pacer.
+    #[cfg(test)]
     #[must_use]
     pub fn pairing_sheet(&self, device: &DeviceId, declared: &str, pinned: bool) -> Recognition {
         let key = device.public_key_bytes();
         if pinned {
-            let h = self.known.get(key, Role::Device);
-            return Recognition {
-                words: h.words(),
-                identicon: Some(h.identicon()),
-                looks_like: None,
-            };
+            return self.pinned_sheet(key);
         }
-        let h = self.pacer.derive(key, Role::Device);
+        self.unpinned_sheet(self.pacer.derive(key, Role::Device), declared)
+    }
+
+    /// What a pairing sheet shows about `device` (as `pairing_sheet` in the
+    /// tests), unless `gone` is set before the pacer's turn comes for an
+    /// unpinned key: the request was withdrawn or timed out while it
+    /// queued, and nothing is derived for it (`None`, F-3).
+    #[must_use]
+    pub fn pairing_sheet_unless(
+        &self,
+        gone: &AtomicBool,
+        device: &DeviceId,
+        declared: &str,
+        pinned: bool,
+    ) -> Option<Recognition> {
+        let key = device.public_key_bytes();
+        if pinned {
+            return Some(self.pinned_sheet(key));
+        }
+        let h = self.pacer.derive_unless(gone, key, Role::Device)?;
+        Some(self.unpinned_sheet(h, declared))
+    }
+
+    /// The pacer every key nobody saved is derived through.
+    #[cfg(test)]
+    #[must_use]
+    pub fn pacer(&self) -> &Pacer {
+        &self.pacer
+    }
+
+    fn pinned_sheet(&self, key: &[u8; 32]) -> Recognition {
+        let h = self.known.get(key, Role::Device);
+        Recognition {
+            words: h.words(),
+            identicon: Some(h.identicon()),
+            looks_like: None,
+            unchecked: false,
+        }
+    }
+
+    /// An unpinned key's sheet: its words, and the alarm against every saved
+    /// entry. When a file holding saved entries could not be read and none of
+    /// the entries that could be read matches, the alarm could not compare,
+    /// and it counts as fired (F-4): the sheet then takes only the typed code.
+    fn unpinned_sheet(&self, h: Stretched, declared: &str) -> Recognition {
         let candidate = Candidate {
             words: h.words(),
             identicon: h.identicon(),
             declared: Some(declared),
         };
-        let saved = self.saved();
+        let (saved, complete) = self.saved_set();
+        let looks_like =
+            words::look_alike(&candidate, &saved).map(|(at, _)| saved[at].name.clone());
         Recognition {
             words: h.words(),
             identicon: None,
-            looks_like: words::look_alike(&candidate, &saved).map(|(at, _)| saved[at].name.clone()),
+            unchecked: looks_like.is_none() && !complete,
+            looks_like,
         }
     }
 
@@ -120,6 +167,7 @@ impl Recognizer {
             words: h.words(),
             identicon: Some(h.identicon()),
             looks_like: None,
+            unchecked: false,
         }
     }
 
@@ -127,15 +175,19 @@ impl Recognizer {
     /// book: the name of the saved computer it looks like, if it looks like
     /// one — the same first or last four characters as a saved ID, or words
     /// that meet the alarm's rules against a saved entry. Paced.
+    ///
+    /// When a file holding saved entries could not be read and nothing that
+    /// could be read matches, the answer is [`Lookalike::Unchecked`]: the
+    /// field warns that it could not compare (F-4), never silently passes.
     #[must_use]
-    pub fn connect_check(&self, id: &TornectId) -> Option<String> {
+    pub fn connect_check(&self, id: &TornectId) -> Option<Lookalike> {
         let base = id.base32();
-        if let Some(named) = self
-            .named()
+        let (named, named_complete) = self.named();
+        if let Some(named) = named
             .into_iter()
             .find(|n| n.id != *id && words::ends_look_alike(&base, &n.id.base32()))
         {
-            return Some(named.name);
+            return Some(Lookalike::Named(named.name));
         }
         let h = self.pacer.derive(id.public_key_bytes(), Role::Onion);
         let candidate = Candidate {
@@ -143,8 +195,12 @@ impl Recognizer {
             identicon: h.identicon(),
             declared: None,
         };
-        let saved = self.saved();
-        words::look_alike(&candidate, &saved).map(|(at, _)| saved[at].name.clone())
+        let (saved, complete) = self.saved_set();
+        match words::look_alike(&candidate, &saved) {
+            Some((at, _)) => Some(Lookalike::Named(saved[at].name.clone())),
+            None if !(complete && named_complete) => Some(Lookalike::Unchecked),
+            None => None,
+        }
     }
 
     /// Every saved entry the alarm compares with: this computer's own two
@@ -154,6 +210,14 @@ impl Recognizer {
     /// derived once, or read from the address book's cache.
     #[must_use]
     pub fn saved(&self) -> Vec<Saved> {
+        self.saved_set().0
+    }
+
+    /// [`Self::saved`], and whether every file holding saved entries could be
+    /// read (`false`: a damaged or unreadable address book, pin store or
+    /// paired-device file left its entries out, F-4).
+    #[must_use]
+    pub fn saved_set(&self) -> (Vec<Saved>, bool) {
         let mut saved = Vec::new();
         if let Some(me) = &self.me {
             for (key, role) in [
@@ -168,7 +232,8 @@ impl Recognizer {
                 });
             }
         }
-        for named in self.named() {
+        let (named, mut complete) = self.named();
+        for named in named {
             let (words, identicon) = named.cached.unwrap_or_else(|| {
                 let h = self.known.get(named.id.public_key_bytes(), Role::Onion);
                 (h.words(), h.identicon())
@@ -180,7 +245,11 @@ impl Recognizer {
             });
         }
         if let Some(paths) = &self.paths {
-            let devices = TrustedDevices::load(&paths.trusted_devices_file()).unwrap_or_default();
+            let devices =
+                TrustedDevices::load(&paths.trusted_devices_file()).unwrap_or_else(|_| {
+                    complete = false;
+                    TrustedDevices::default()
+                });
             for device in devices.devices {
                 let h = self
                     .known
@@ -192,7 +261,7 @@ impl Recognizer {
                 });
             }
         }
-        saved
+        (saved, complete)
     }
 
     /// Derive every saved key not derived yet (this computer's, the address
@@ -222,13 +291,21 @@ impl Recognizer {
     }
 
     /// The computers of the address book and the pin store, with the name
-    /// people know each by and the address book's cached words.
-    fn named(&self) -> Vec<Named> {
+    /// people know each by and the address book's cached words; and whether
+    /// both files could be read.
+    fn named(&self) -> (Vec<Named>, bool) {
         let Some(paths) = &self.paths else {
-            return Vec::new();
+            return (Vec::new(), true);
         };
-        let book = Store::new(paths).load().unwrap_or_default();
-        let known = KnownHosts::load(&known_hosts_file(paths)).unwrap_or_default();
+        let mut complete = true;
+        let book = Store::new(paths).load().unwrap_or_else(|_| {
+            complete = false;
+            Default::default()
+        });
+        let known = KnownHosts::load(&known_hosts_file(paths)).unwrap_or_else(|_| {
+            complete = false;
+            KnownHosts::default()
+        });
         let mut ids: Vec<TornectId> = known
             .hosts
             .keys()
@@ -237,7 +314,8 @@ impl Recognizer {
             .collect();
         ids.sort_unstable();
         ids.dedup();
-        ids.into_iter()
+        let named = ids
+            .into_iter()
             .map(|id| {
                 let pin = known.get(&id);
                 let entry = book.hosts.get(&id);
@@ -252,8 +330,37 @@ impl Recognizer {
                     cached: entry.and_then(|e| e.cached_words(id.public_key_bytes(), Role::Onion)),
                 }
             })
-            .collect()
+            .collect();
+        (named, complete)
     }
+}
+
+/// A flag set when its owner is dropped: a pairing answer that is dropped
+/// before its paced derivation started cancels it (F-3).
+#[derive(Debug, Default)]
+pub(crate) struct GoneOnDrop(std::sync::Arc<AtomicBool>);
+
+impl GoneOnDrop {
+    /// The flag, for the blocking task.
+    pub(crate) fn flag(&self) -> std::sync::Arc<AtomicBool> {
+        std::sync::Arc::clone(&self.0)
+    }
+}
+
+impl Drop for GoneOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// What the connect field's check found about an ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lookalike {
+    /// It looks like this saved computer.
+    Named(String),
+    /// A file holding saved entries could not be read, so it could not be
+    /// compared with all of them (F-4).
+    Unchecked,
 }
 
 #[cfg(test)]
@@ -448,6 +555,103 @@ mod tests {
         assert_eq!(seen.looks_like, None);
         assert!(popups.answer_pairing(popup.id, PairDecision::Accept { label: None }));
         assert_eq!(asking.await, PairDecision::Accept { label: None });
+    }
+
+    /// F-3: a pairing request withdrawn or timed out while its derivation
+    /// waits on the pacer derives nothing: the queued run is dropped with
+    /// the answer, and the pacer starts no run for it.
+    #[tokio::test]
+    async fn a_withdrawn_request_derives_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, words) = home(tmp.path());
+        let words = Arc::new(words);
+        let popups = popups();
+        let consent = consent(&popups, Arc::clone(&words));
+        // The pacer has just run: the next unsaved key waits its second.
+        let _ = words.pacer().derive(&[0x90; 32], Role::Device);
+        assert_eq!(words.pacer().runs(), 1);
+        // The FSM's popup timeout, standing in for a withdrawal: the answer
+        // is dropped while its derivation is still queued.
+        let peer = peer(0x7a, "Kitchen");
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(200),
+            consent.pairing(&peer, "123 456"),
+        )
+        .await;
+        assert!(timed_out.is_err(), "answered before its derivation ran");
+        // Well past the pacer's second: the queued run saw the flag and
+        // skipped the derivation.
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert_eq!(words.pacer().runs(), 1, "a withdrawn request was derived");
+        assert!(popups.shared().read(|m| m.popups.is_empty()));
+        // The same key asked again, and not withdrawn: derived and shown.
+        let asking = consent.pairing(&peer, "123 456");
+        tokio::pin!(asking);
+        let popup = tokio::select! {
+            _ = &mut asking => panic!("answered early"),
+            popup = shown(&popups) => popup,
+        };
+        assert_eq!(words.pacer().runs(), 2);
+        assert!(popups.answer_pairing(popup.id, PairDecision::Reject));
+        assert_eq!(asking.await, PairDecision::Reject);
+    }
+
+    /// F-4: a file of saved entries that cannot be read makes the alarm say
+    /// it could not compare, never compare silently against fewer entries:
+    /// the pairing sheet takes only the typed code, and the connect field
+    /// asks for the second click.
+    #[tokio::test]
+    async fn an_unreadable_saved_file_is_could_not_compare() {
+        for damaged in ["address-book", "trusted-devices", "known-hosts"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (paths, words) = home(tmp.path());
+            assert!(words.saved_set().1, "{damaged}: an intact home");
+            let file = match damaged {
+                "address-book" => Store::new(&paths).book_path().to_path_buf(),
+                "trusted-devices" => paths.trusted_devices_file(),
+                _ => known_hosts_file(&paths),
+            };
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "this is [not toml").unwrap();
+            let (saved, complete) = words.saved_set();
+            assert!(!complete, "{damaged}: read as complete");
+            // This computer's own entries stay in the set.
+            assert!(saved.len() >= 2, "{damaged}");
+            let seen = words.pairing_sheet(&device(0x7b), "Kitchen", false);
+            assert_eq!(seen.looks_like, None, "{damaged}");
+            assert!(seen.unchecked && seen.typed_only(), "{damaged}: {seen:?}");
+            // A match among the entries that could be read still names it.
+            let like = words.pairing_sheet(&device(0x78), "linux pc", false);
+            assert_eq!(like.looks_like.as_deref(), Some("Linux PC"), "{damaged}");
+            assert!(!like.unchecked, "{damaged}");
+            let id = HostIdentity::from_seed(&[0x6c; 32]).id();
+            assert_eq!(
+                words.connect_check(&id),
+                Some(Lookalike::Unchecked),
+                "{damaged}"
+            );
+        }
+        // Through the window's consent: no click accept on such a sheet.
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, words) = home(tmp.path());
+        std::fs::write(paths.trusted_devices_file(), "[[devices]\n").unwrap();
+        let popups = popups();
+        let consent = consent(&popups, Arc::new(words));
+        let peer = peer(0x7c, "Kitchen");
+        let asking = consent.pairing(&peer, "123 456");
+        tokio::pin!(asking);
+        let popup = tokio::select! {
+            _ = &mut asking => panic!("answered early"),
+            popup = shown(&popups) => popup,
+        };
+        let seen = popups.shared().read(|m| m.recognition[&popup.id].clone());
+        assert!(seen.unchecked);
+        assert!(popups.answer_pairing(popup.id, PairDecision::Accept { label: None }));
+        assert_eq!(
+            asking.await,
+            PairDecision::Reject,
+            "a click paired an unchecked sheet"
+        );
     }
 
     /// Every trace line of this test binary from the first call on, at

@@ -103,6 +103,7 @@ pub fn sheet(m: &mut Model, sheet: Sheet) {
                 words: words("absurd citizen dinner harvest"),
                 identicon: None,
                 looks_like: (sheet == Sheet::Alarm).then(|| "Office PC".to_owned()),
+                unchecked: false,
             },
         ),
         Sheet::Pinned => (
@@ -116,6 +117,7 @@ pub fn sheet(m: &mut Model, sheet: Sheet) {
                 words: words("orbit crisp lamp arctic"),
                 identicon: Some(Identicon::from_seed([0x5a, 0x3c, 0x02])),
                 looks_like: None,
+                unchecked: false,
             },
         ),
         Sheet::Session => (
@@ -127,6 +129,7 @@ pub fn sheet(m: &mut Model, sheet: Sheet) {
                 words: words("orbit crisp lamp arctic"),
                 identicon: Some(Identicon::from_seed([0x5a, 0x3c, 0x02])),
                 looks_like: None,
+                unchecked: false,
             },
         ),
     };
@@ -257,6 +260,7 @@ fn fill(m: &mut Model) {
             words: words("absurd citizen dinner harvest"),
             identicon: None,
             looks_like: None,
+            unchecked: false,
         },
     );
     m.recognition.insert(
@@ -265,6 +269,7 @@ fn fill(m: &mut Model) {
             words: words("orbit crisp lamp arctic"),
             identicon: Some(Identicon::from_seed([0x5a, 0x3c, 0x02])),
             looks_like: None,
+            unchecked: false,
         },
     );
     m.confirm = Some(Confirm {
