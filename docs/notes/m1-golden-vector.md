@@ -1,7 +1,9 @@
 # M1 golden vectors — envelope / transcript / signatures / SAS (docs/PLAN.md §B.8.4.3)
 
 Decision M1-10. Pinned by the unit tests `fsm::golden::golden_vector_attended_exchange`
-(vector 1) and `fsm::golden::golden_vector_pairing_exchange` (vector 2) in
+(vector 1), `fsm::golden::golden_vector_pairing_exchange` (vector 2),
+`fsm::golden::golden_vector_administrator_accept` (vector 3) and
+`fsm::golden::golden_vector_unattended_request_bodies` (the `want_elevation` bodies) in
 `crates/tornect-signal/src/fsm/golden.rs`; the fixed inputs live in
 `tornect_signal::fsm::vectors`, which the F1 fuzz harness and the committed fuzz seeds
 (`fuzz/seeds/envelope/`, checked by `fsm::golden::fuzz_seeds_match_the_golden_vectors_and_reach_a_session`)
@@ -97,6 +99,48 @@ SAS = u32::from_be_bytes(HKDF-SHA256(ikm = th_after(HELLO_ACK) || sas_nonce, sal
 | 6 | `digest_6` | `e9d7bbdd0fd5bf991fff4d4a9be1d08f19b43b0c16cb2fef86ffd0b8717c2968` |
 | 6 | `sig_6` (host onion key, over `th_5`) | `c91992d9b94120de1c2e9270bb57c86f3abbd4fa8b58b2af683b463cf052191b1123c0eef5bea7b5f20c071f3273abba3177b12ac361f5f4f0a7cb0ebe6a6709` |
 | 6 | `th_6` (`th_final`, identical on both sides) | `a28dfc92fa3b1645a1e6afc3b9f3a3db7609efe59ca1dab6eac3b48f6b8ce94d` |
+
+## Vector 3 — the session levels (r7, §B.2.1, §B.8.4.1; M-FEAT-2)
+
+Vector 1 on a host whose availability row offers the administrator answer (an invented Windows host: installed,
+an administrator account, `EnableLUA` 0), answered "Allow as administrator" (`SessionDecision::AllowOnceAdmin`).
+Frames 1–3, their digests, signatures and `th_1…th_3` are vector 1's, byte for byte (the test checks them against
+vector 1's table); only the accept changes: its body gains key 11, `elevation = 1`, inside the signed body
+(`digest_4` covers it, so does `sig_4`).
+
+| # | Value | Hex |
+|---|---|---|
+| 4 | `frame_4_session_accept` (`SESSION_ACCEPT`, host, msg_id 2) | `000000bc850102075874a900a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50200030004000558205555555555555555555555555555555555555555555555555555555555555555070008f40b0158403e1780fc3b649494cb142fc9fe526d8f073038fe769ff0ca6788e812583e8d7fa886579125c00009015ee8e9b958310fbfbdfc46fa6f2f50c3f2184c611f8006` |
+| 4 | `digest_4` | `e6182a5859ce71719d9de07ab89256903a89906fd67e681aa8953e72530bb93d` |
+| 4 | `sig_4` (host onion key, over `th_3`) | `3e1780fc3b649494cb142fc9fe526d8f073038fe769ff0ca6788e812583e8d7fa886579125c00009015ee8e9b958310fbfbdfc46fa6f2f50c3f2184c611f8006` |
+| 4 | `th_4` (`th_final`) | `f3142b4f965ad0c47cc074f244efe5237a461acf080c4199850d91b69e0bc9ac` |
+
+The body reads as vector 1's with one more entry: the map header `a9` (nine entries, `a8` in vector 1) and
+`… 07 00 08 f4 0b 01`: key 7 `0`, key 8 `false`, key 11 `1`. An accept at none carries no key 11, so vectors 1 and 2
+are unchanged, and `fsm::golden::the_old_vectors_decode_at_none` decodes them with this build (elevation none; the
+attended request has no `unattended` map).
+
+**`SESSION_REQUEST.unattended.want_elevation` (key 5).** Two unattended request bodies with the vector's client caps,
+`suite` 1, the fixed `ke1` `66` × 96, `want_mode` 0, `intent` 0, and each body's digest as the second frame of a stream
+(`v` 1, `msg_id` 2, kind 6). No signature: an unattended exchange runs the PAKE, whose randomness these vectors do not
+fix; the digest is what the client's signature covers.
+
+| Value | Hex |
+|---|---|
+| body without `want_elevation` | `a200a400816468323634018219078019043802f4030101a4000101586066666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666602000300` |
+| its digest | `fa226454f87515cdd417e38f9f939ffc363efd369935426a1f190dc314872ba2` |
+| body with `want_elevation = 1` | `a200a400816468323634018219078019043802f4030101a50001015860666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666020003000501` |
+| its digest | `6a9d583d98407e7808e4962029ec1ef51c54f61ac1953d363b77c26aec347fd6` |
+
+The unattended map goes from four entries (`a4`) to five (`a5`), and `05 01` (key 5, value 1) is appended; nothing
+else moves.
+
+**Compatibility.** Bodies are CBOR maps and receivers ignore unknown keys (§B.8.4.1): a client built before r7 decodes
+vector 3's accept and never sees key 11 (the host's indicator, not that client's HUD, is then the authority for the
+person at the computer), and a host built before r7 decodes a request with key 5 as if it were absent.
+`messages::tests::a_peer_before_the_keys_ignores_them` decodes both new bodies into the pre-r7 map types. Decoding
+here refuses `elevation` or `want_elevation` other than 0 or 1, and `elevation = 1` unless `mode = 0`
+(`messages::tests::the_elevation_keys_decode_only_in_their_domain`).
 
 ## Reading the frames
 
