@@ -169,6 +169,8 @@ pub struct Backend {
     pub device: Arc<DeviceIdentity>,
     /// The device key's public half.
     pub device_pk: [u8; 32],
+    /// The device words and the look-alike alarm of this home (§B.6.1).
+    pub words: Arc<super::recognize::Recognizer>,
 }
 
 /// The host role, once wired.
@@ -308,14 +310,17 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
     .map_err(|e| format!("{e:#}"))?;
     let (started_tx, started) = watch::channel(0u64);
     let activity = Arc::clone(&live);
-    deps.consent = Arc::new(GuiConsent::new(
-        Arc::clone(&b.popups),
-        Withdraw {
-            kill: deps.kill.clone(),
-            started,
-            live: Arc::new(move || activity.session_live()),
-        },
-    ));
+    deps.consent = Arc::new(
+        GuiConsent::new(
+            Arc::clone(&b.popups),
+            Withdraw {
+                kill: deps.kill.clone(),
+                started,
+                live: Arc::new(move || activity.session_live()),
+            },
+        )
+        .with_words(Arc::clone(&b.words)),
+    );
     deps.sessions = Arc::new(GuiSessions {
         live: Arc::clone(&live),
         media: Arc::clone(&media),

@@ -516,6 +516,14 @@ impl App {
                 tracing::debug!(id, ?decision, pointer, "pairing question answered");
                 self.popups.answer_pairing(id, decision);
                 self.form.labels.remove(&id);
+                self.form.codes.remove(&id);
+            }
+            Action::PairCode { id, code, label } => {
+                // Neither the code nor the label goes to the log.
+                tracing::debug!(id, "pairing code typed");
+                self.popups.answer_pairing_code(id, &code, label);
+                self.form.labels.remove(&id);
+                self.form.codes.remove(&id);
             }
             Action::Session {
                 id,
