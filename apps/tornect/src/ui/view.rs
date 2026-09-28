@@ -1903,6 +1903,38 @@ mod tests {
         assert!(admin.1 >= allow.3, "beside Allow: {allow:?} {admin:?}");
     }
 
+    /// `PromptOnSecureDesktop` 0 (§B.2.1): the sheet says that Windows'
+    /// prompts show on the shared screen, beside the row's own sentence, and
+    /// not otherwise.
+    #[test]
+    fn prompts_on_the_shared_screen_are_said() {
+        use tornect_core::levels::{Availability, WindowsFacts};
+
+        let t0 = Instant::now();
+        for (shared, said) in [(Some(0), true), (Some(1), false), (None, false)] {
+            let mut model = with_popups(vec![session_popup(7, t0)]);
+            model.levels.insert(
+                7,
+                SheetLevels::of(&Availability::of(Some(&WindowsFacts {
+                    installed: false,
+                    prompt_on_secure_desktop: shared,
+                    ..WindowsFacts::default()
+                }))),
+            );
+            let window = Harness::new(model, t0);
+            let texts: Vec<&str> = window.nodes.iter().filter_map(|n| n.value()).collect();
+            assert_eq!(
+                texts.contains(&SENTENCE_SECURE_DESKTOP_OFF),
+                said,
+                "{shared:?}: {texts:?}"
+            );
+            assert!(
+                texts.contains(&tornect_core::levels::SENTENCE_STANDALONE),
+                "{texts:?}"
+            );
+        }
+    }
+
     /// The stream bar says "Control · administrator" only when the signed
     /// accept said so (the backend's `Viewing::administrator`).
     #[test]
