@@ -726,4 +726,33 @@ mod tests {
         assert_eq!(c.choice, 1, "the second segment");
         assert_eq!(c.pressed, 0);
     }
+
+    /// The QR code is a real one: for an onion address (62 bytes) it is a
+    /// version-4 code, 33 modules wide, with the three finder patterns in
+    /// their corners, the same for the same text; a text too long for any QR
+    /// code gives none.
+    #[test]
+    fn the_qr_code_is_a_real_one() {
+        let onion = tornect_core::TornectId::from_bytes([0; 32]).onion_address();
+        assert_eq!(onion.len(), 62);
+        let (width, dark) = qr_modules(&onion).expect("fits");
+        assert_eq!(width, 33);
+        assert_eq!(dark.len(), 33 * 33);
+        assert_eq!(qr_modules(&onion).map(|q| q.1), Some(dark.clone()));
+        let at = |x: usize, y: usize| dark[y * width + x];
+        for (ox, oy) in [(0, 0), (width - 7, 0), (0, width - 7)] {
+            for y in 0..7 {
+                for x in 0..7 {
+                    let ring = x == 0 || y == 0 || x == 6 || y == 6;
+                    let core = (2..=4).contains(&x) && (2..=4).contains(&y);
+                    assert_eq!(
+                        at(ox + x, oy + y),
+                        ring || core,
+                        "finder at {ox},{oy}: {x},{y}"
+                    );
+                }
+            }
+        }
+        assert!(qr_modules(&"x".repeat(3000)).is_none());
+    }
 }

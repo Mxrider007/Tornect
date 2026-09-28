@@ -105,10 +105,11 @@ mod tests {
     use tornect_core::TornectId;
     use tornect_signal::pairing::SessionDecision;
 
-    use super::super::model::{Hosting, Popup, PopupKind, Setup, TorState};
+    use super::super::model::{Check, Hosting, Popup, PopupKind, Setup, TorState};
     use super::super::nav;
     use super::super::theme::Tokens;
     use super::super::view::main_window;
+    use super::address_book::Tab;
     use super::*;
 
     /// The main window at `size`, in `theme`, driven one pass at a time, as
@@ -508,5 +509,260 @@ mod tests {
                 "{size:?}"
             );
         }
+    }
+
+    /// The preview's made-up address book (what the pictures show), or an
+    /// empty one (a first run), on a window at rest.
+    fn with_book(empty: bool) -> Model {
+        let mut model = at_rest();
+        model.device_name = "Linux PC".to_owned();
+        model.book = super::super::preview::model(false, empty).book;
+        model
+    }
+
+    /// The first computer of the made-up book: "Office PC", paired, seen today.
+    fn office(model: &Model) -> TornectId {
+        let computer = &model.book.computers[0];
+        assert_eq!(computer.title(), "Office PC");
+        computer.id
+    }
+
+    fn has_text(window: &Window, text: &str) -> bool {
+        window
+            .nodes
+            .iter()
+            .any(|n| n.value().is_some_and(|v| v.contains(text)))
+    }
+
+    /// Home and the address book draw empty and populated, in both themes,
+    /// at both sizes, every tab of the address book included, and ask for
+    /// nothing on their own.
+    #[test]
+    fn home_and_the_address_book_draw_empty_and_populated() {
+        for empty in [true, false] {
+            for theme in THEMES {
+                for size in [WIDE, NARROW] {
+                    let case = format!("empty {empty} {theme:?} {size:?}");
+                    let home = Window::new(with_book(empty), Page::Home, theme, size);
+                    assert!(has_text(&home, "Saved computers"), "{case}");
+                    assert_eq!(has_text(&home, "No saved computers yet"), empty, "{case}");
+                    assert!(has_text(&home, "Others see this computer as"), "{case}");
+                    let mut book = Window::new(with_book(empty), Page::AddressBook, theme, size);
+                    assert!(has_text(&book, "Address book"), "{case}");
+                    assert_eq!(has_text(&book, "No saved computers yet"), empty, "{case}");
+                    assert_eq!(
+                        book.nodes
+                            .iter()
+                            .any(|n| n.label() == Some("Check if reachable")),
+                        !empty,
+                        "{case}"
+                    );
+                    for tab in [Tab::Recent, Tab::Devices, Tab::Computers] {
+                        book.form.book.tab = tab;
+                        for _ in 0..2 {
+                            assert!(book.pass(Vec::new()).is_empty(), "{case} {tab:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// "Check if reachable" asks for one ping per click and nothing more:
+    /// while the answer is awaited the button is disabled, a click on it asks
+    /// for nothing, and passes without a click never ask (no polling, no
+    /// presence).
+    #[test]
+    fn the_check_button_sends_exactly_one_ping() {
+        let model = with_book(false);
+        let id = office(&model);
+        let mut window = Window::new(model, Page::AddressBook, egui::Theme::Dark, WIDE);
+        for _ in 0..20 {
+            assert!(
+                window.pass(Vec::new()).is_empty(),
+                "nothing is asked without a click"
+            );
+        }
+        let check = window.center("Check if reachable");
+        assert_eq!(window.click(check), vec![Action::Ping(id)]);
+        // What the tokio side answers at once: the check is running.
+        window.model.book.set_check(id, Check::Asking);
+        window.pass(Vec::new());
+        assert!(window.node("Checking…").is_disabled());
+        let checking = window.center("Checking…");
+        assert!(
+            window.click(checking).is_empty(),
+            "no second ping while one runs"
+        );
+        window
+            .model
+            .book
+            .set_check(id, Check::Reachable { millis: 6200 });
+        for _ in 0..20 {
+            assert!(
+                window.pass(Vec::new()).is_empty(),
+                "an answer asks nothing again"
+            );
+        }
+        assert!(has_text(&window, "It answered over Tor (6.2 s)"));
+    }
+
+    /// Forget asks first: the first click only shows the question, "Keep it"
+    /// takes it back, and only "Forget" forgets.
+    #[test]
+    fn forget_asks_first() {
+        let model = with_book(false);
+        let id = office(&model);
+        let mut window = Window::new(model, Page::AddressBook, egui::Theme::Light, WIDE);
+        let forget = window.center("Forget this computer");
+        assert!(window.click(forget).is_empty());
+        assert_eq!(window.form.book.forgetting, Some(id));
+        window.pass(Vec::new());
+        assert!(has_text(&window, "Forget \"Office PC\"?"));
+        let keep = window.center("Keep it");
+        assert!(window.click(keep).is_empty());
+        assert_eq!(window.form.book.forgetting, None);
+        window.pass(Vec::new());
+        let forget = window.center("Forget this computer");
+        assert!(window.click(forget).is_empty());
+        window.pass(Vec::new());
+        let sure = window.center("Forget");
+        assert_eq!(window.click(sure), vec![Action::ForgetHost(id)]);
+    }
+
+    /// Add computer takes an ID only once it is one, not this computer's
+    /// own, and saves it with the name typed.
+    #[test]
+    fn add_checks_the_id_before_saving() {
+        let mut model = with_book(false);
+        let mine = ed25519_dalek::SigningKey::from_bytes(&[6; 32]).verifying_key();
+        let own = TornectId::from_public_key(&mine).display_groups();
+        model.id = Some(own.clone());
+        let mut window = Window::new(model, Page::AddressBook, egui::Theme::Dark, NARROW);
+        let add = window.center("Add computer");
+        assert!(window.click(add).is_empty());
+        let key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]).verifying_key();
+        let valid = TornectId::from_public_key(&key);
+        for (typed, says) in [
+            ("not an id".to_owned(), Some("That is not a Tornect ID")),
+            (own.clone(), Some("That is this computer's own ID")),
+            (valid.display_groups(), None),
+        ] {
+            window.form.book.adding = Some((typed.clone(), "Desk".to_owned()));
+            window.pass(Vec::new());
+            window.pass(Vec::new());
+            match says {
+                Some(text) => {
+                    assert!(has_text(&window, text), "{typed}");
+                    assert!(window.node("Save").is_disabled(), "{typed}");
+                    let save = window.center("Save");
+                    assert!(window.click(save).is_empty(), "{typed}");
+                }
+                None => {
+                    assert!(!window.node("Save").is_disabled());
+                    let save = window.center("Save");
+                    assert_eq!(
+                        window.click(save),
+                        vec![Action::SaveEntry(valid, "Desk".to_owned())]
+                    );
+                    assert!(window.form.book.adding.is_none());
+                }
+            }
+        }
+    }
+
+    /// Rename starts from the saved name and saves what was typed.
+    #[test]
+    fn rename_saves_the_typed_name() {
+        let model = with_book(false);
+        let id = office(&model);
+        let mut window = Window::new(model, Page::AddressBook, egui::Theme::Dark, WIDE);
+        let rename = window.center("Rename");
+        assert!(window.click(rename).is_empty());
+        assert_eq!(
+            window.form.book.renaming,
+            Some((id, "Office PC".to_owned()))
+        );
+        window.form.book.renaming = Some((id, "  Desk 2 ".to_owned()));
+        window.pass(Vec::new());
+        let save = window.center("Save");
+        assert_eq!(
+            window.click(save),
+            vec![Action::RenameHost(id, "Desk 2".to_owned())]
+        );
+    }
+
+    /// The Recent tab: the switch asks to turn history off (and on), Clear
+    /// asks to clear; with history off the tab says so.
+    #[test]
+    fn the_history_switch_and_clear() {
+        let mut window = Window::new(with_book(false), Page::AddressBook, egui::Theme::Dark, WIDE);
+        window.form.book.tab = Tab::Recent;
+        window.pass(Vec::new());
+        assert!(has_text(&window, "You connected to \"Office PC\""));
+        let switch = window.center("Keep a list of recent connections");
+        assert_eq!(window.click(switch), vec![Action::SetHistory(false)]);
+        let clear = window.center("Clear history");
+        assert_eq!(window.click(clear), vec![Action::ClearHistory]);
+        window.model.book.history = false;
+        window.model.book.recent.clear();
+        window.pass(Vec::new());
+        assert!(has_text(&window, "History is off"));
+        let switch = window.center("Keep a list of recent connections");
+        assert_eq!(window.click(switch), vec![Action::SetHistory(true)]);
+    }
+
+    /// Home: the saved computers connect in one click once Tor is ready,
+    /// "Open address book" opens it, and "Show QR code" shows the ID's QR
+    /// code.
+    #[test]
+    fn home_connects_to_a_saved_computer_and_shows_the_qr_code() {
+        let model = with_book(false);
+        office(&model);
+        let mut window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(&window, "Office PC"));
+        let show = window.center("Show QR code");
+        assert!(window.click(show).is_empty());
+        assert!(window.form.qr);
+        window.pass(Vec::new());
+        assert!(window.nodes.iter().any(|n| n.label() == Some("QR code")));
+        // The saved cards' Connect: the first "Connect" is the connect card's.
+        let connects: Vec<egui::Pos2> = window
+            .nodes
+            .iter()
+            .filter(|n| n.label() == Some("Connect"))
+            .filter_map(Node::bounds)
+            .map(|b| egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
+            .collect();
+        assert_eq!(connects.len(), 4, "the connect card's and three saved ones");
+        let lowest = connects
+            .iter()
+            .copied()
+            .filter(|p| p.y < WIDE.1)
+            .max_by(|a, b| a.y.total_cmp(&b.y))
+            .expect("a saved card's Connect in view");
+        let asked = window.click(lowest);
+        assert!(
+            matches!(asked.as_slice(), [Action::Connect(_)]),
+            "{asked:?}"
+        );
+        let open = window.center("Open address book");
+        assert!(window.click(open).is_empty());
+        assert_eq!(window.form.page, Page::AddressBook);
+    }
+
+    /// Days read as people say them: today, yesterday, within a week, else a
+    /// date.
+    #[test]
+    fn days_read_as_people_say_them() {
+        let today: Day = "2026-09-27".parse().unwrap();
+        let ago = |n: i64| Day::from_days(today.days() - n);
+        assert_eq!(day_text(ago(0), Some(today)), "Today");
+        assert_eq!(day_text(ago(1), Some(today)), "Yesterday");
+        assert_eq!(day_text(ago(6), Some(today)), "6 days ago");
+        assert_eq!(day_text(ago(7), Some(today)), "20 Sep 2026");
+        assert_eq!(day_text(ago(0), None), "27 Sep 2026");
+        assert_eq!(day_in_sentence(ago(1), Some(today)), "yesterday");
+        assert_eq!(day_in_sentence(ago(30), Some(today)), "on 28 Aug 2026");
     }
 }
