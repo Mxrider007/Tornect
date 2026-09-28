@@ -201,7 +201,7 @@ where
 {
     tokio::time::timeout(
         PING_WAIT,
-        tornect_signal::ping::ping(stream, crate::tor_cmd::nonce(1)),
+        tornect_signal::ping::ping(stream, crate::tor_cmd::nonce()?),
     )
     .await
     .map_err(|_| anyhow::anyhow!("no reply within {} s", PING_WAIT.as_secs()))?
@@ -228,5 +228,37 @@ mod tests {
         let (served, answered) = answering.await.unwrap();
         assert_eq!(served.unwrap(), 1);
         assert_eq!(answered, 1);
+    }
+
+    /// Privacy finding P-L1: a ping's nonce is random bytes, never the
+    /// wall clock (which it was, in nanoseconds, and which told the pinged
+    /// host this computer's time): two nonces differ, and neither reads as a
+    /// time within a day of now, in any unit from seconds to nanoseconds.
+    #[test]
+    fn a_ping_nonce_is_random_not_the_clock() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let (a, b) = (
+            crate::tor_cmd::nonce().unwrap(),
+            crate::tor_cmd::nonce().unwrap(),
+        );
+        assert_ne!(a, b);
+        for nonce in [a, b] {
+            let n = u64::from_be_bytes(nonce);
+            // The old nonce was the nanoseconds XOR the sequence number (1 for
+            // a Check) shifted by 48 bits: undo that too.
+            for candidate in [n, n ^ (1 << 48)] {
+                let c = u128::from(candidate);
+                for (unit, day) in [
+                    (u128::from(now.as_secs()), 86_400u128),
+                    (now.as_millis(), 86_400_000),
+                    (now.as_micros(), 86_400_000_000),
+                    (now.as_nanos(), 86_400_000_000_000),
+                ] {
+                    assert!(c.abs_diff(unit) > day, "{nonce:?} reads as the time");
+                }
+            }
+        }
     }
 }
