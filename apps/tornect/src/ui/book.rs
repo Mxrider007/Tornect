@@ -128,6 +128,7 @@ pub fn apply(paths: &Paths, change: &Change) -> String {
     let known_file = known_hosts_file(paths);
     let done: anyhow::Result<String> = (|| match change {
         Change::Forget(id) => {
+            let _one = crate::history::known_hosts_lock();
             let mut known = KnownHosts::load(&known_file)?;
             let was_paired = known.remove(id);
             if was_paired {
@@ -161,6 +162,7 @@ pub fn apply(paths: &Paths, change: &Change) -> String {
             })
         }
         Change::Clear => {
+            let _one = crate::history::known_hosts_lock();
             store.clear_history(Some(&known_file))?;
             Ok("History cleared. Saved computers stay until you forget them.".to_owned())
         }

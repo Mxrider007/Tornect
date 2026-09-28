@@ -17,7 +17,7 @@
 
 mod app;
 mod backend;
-mod book;
+pub(crate) mod book;
 mod consent;
 mod icons;
 mod indicator;

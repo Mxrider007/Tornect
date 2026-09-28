@@ -7,10 +7,12 @@
 //! last seen** is history: while history is off, nothing writes it.
 //!
 //! * Client side ([`Pins`], `known-hosts.toml`): the handshake touches the
-//!   host's last-seen time on every accepted session. While history is off
-//!   it works on a copy in memory, a pin it made is written back afterwards
-//!   (its last-seen time set to the pairing time), and the visit is not
-//!   recorded.
+//!   host's last-seen time on every accepted session. It always works on a
+//!   copy in memory; afterwards a pin it made, and with history on the
+//!   host's last-seen time, are merged into the file as it is then, under
+//!   [`known_hosts_lock`] (so a Forget or a Clear made meanwhile stays made).
+//!   While history is off a new pin's last-seen time is its pairing time,
+//!   and the visit is not recorded.
 //! * Host side ([`DevicePins`], `trusted-devices.toml`): the handshake
 //!   touches a paired device's last-seen time on every fresh session
 //!   request. The host's store is shared with the file: a pairing, an
@@ -18,12 +20,23 @@
 //!   into the file as it is then), a last-seen time only while history is on.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tornect_core::address_book::{Day, Store};
 use tornect_core::trusted::{KnownHost, KnownHosts, known_hosts_file};
 use tornect_core::{DeviceId, Paths, TornectId};
 use tornect_signal::pairing::{KeepHistory, KnownHostStore, TrustedDeviceStore};
+
+/// Every read-modify-write of `known-hosts.toml` in this process (a
+/// connection's [`Pins::settle`], Forget, Clear) holds this lock, so that two
+/// of them never interleave and one never undoes the other (the M-UI-2
+/// security finding F-2).
+static KNOWN_HOSTS: Mutex<()> = Mutex::new(());
+
+/// Hold the lock on `known-hosts.toml`'s writers in this process.
+pub fn known_hosts_lock() -> MutexGuard<'static, ()> {
+    KNOWN_HOSTS.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The known hosts one connection to `host` works with.
 pub struct Pins {
@@ -32,32 +45,23 @@ pub struct Pins {
     host: TornectId,
     /// The host's record before the handshake.
     before: Option<KnownHost>,
-    /// History is kept: the store is the file itself.
-    keep: bool,
     book: Store,
 }
 
 impl Pins {
     /// The known hosts for a connection to `host` from the Tornect home
-    /// `paths`: the file itself while history is kept, a copy in memory
-    /// while it is off.
+    /// `paths`: a copy in memory, history on or off; [`Pins::settle`] writes
+    /// what the connection changed.
     pub fn open(paths: &Paths, host: TornectId) -> anyhow::Result<Self> {
         let book = Store::new(paths);
-        let keep = book.keeps_history();
         let path = known_hosts_file(paths);
         let hosts = KnownHosts::load(&path)?;
         let before = hosts.get(&host).cloned();
-        let store = if keep {
-            KnownHostStore::with(path.clone(), hosts)
-        } else {
-            KnownHostStore::ephemeral(hosts)
-        };
         Ok(Self {
-            store: Arc::new(store),
+            store: Arc::new(KnownHostStore::ephemeral(hosts)),
             path,
             host,
             before,
-            keep,
             book,
         })
     }
@@ -74,11 +78,13 @@ impl Pins {
         self.before.is_some()
     }
 
-    /// After the handshake, however it ended: a pin it made is written to
-    /// `known-hosts.toml` (with history off, from the copy in memory, its
-    /// last-seen time set back to the pairing time), and a name saved for the
-    /// host before it was paired is bound to the key. Nothing is written when
-    /// no pin was made.
+    /// After the handshake, however it ended, merged into `known-hosts.toml`
+    /// as it is now (under [`known_hosts_lock`]): a pin it made (with history
+    /// off, its last-seen time set back to the pairing time), and with
+    /// history on the host's new last-seen time, only while the host is
+    /// still in the file (a Forget made meanwhile stays made). A name saved
+    /// for the host before it was paired is bound to the key a pin made.
+    /// Nothing is written when neither changed.
     pub fn settle(&self) -> anyhow::Result<()> {
         let Some(now) = self.store.get(&self.host) else {
             return Ok(());
@@ -88,17 +94,34 @@ impl Pins {
                 || before.paired_at != now.paired_at
                 || before.label != now.label
         });
-        if !pinned {
+        let keep = self.book.keeps_history();
+        let seen = keep
+            && self
+                .before
+                .as_ref()
+                .is_some_and(|before| before.last_seen != now.last_seen);
+        if !pinned && !seen {
             return Ok(());
         }
-        if !self.keep {
+        {
+            let _one = known_hosts_lock();
             let mut hosts = KnownHosts::load(&self.path)?;
-            let mut record = now.clone();
-            record.last_seen = record.paired_at;
-            hosts.hosts.insert(self.host, record);
+            if pinned {
+                let mut record = now.clone();
+                if !keep {
+                    record.last_seen = record.paired_at;
+                }
+                hosts.hosts.insert(self.host, record);
+            } else if let Some(file) = hosts.hosts.get_mut(&self.host) {
+                file.last_seen = file.last_seen.max(now.last_seen);
+            } else {
+                return Ok(());
+            }
             hosts.save(&self.path)?;
         }
-        self.book.bind(self.host, now.host_device_pk)?;
+        if pinned {
+            self.book.bind(self.host, now.host_device_pk)?;
+        }
         Ok(())
     }
 
@@ -229,6 +252,16 @@ mod tests {
         identity: &Arc<HostIdentity>,
         trusted: &Arc<TrustedDeviceStore>,
     ) -> bool {
+        let pins = Pins::open(paths, identity.id()).unwrap();
+        connect_with(&pins, identity, trusted).await
+    }
+
+    /// [`connect_once`] with the known hosts `pins` opened before it.
+    async fn connect_with(
+        pins: &Pins,
+        identity: &Arc<HostIdentity>,
+        trusted: &Arc<TrustedDeviceStore>,
+    ) -> bool {
         let consent = Arc::new(ScriptedConsent::new());
         consent.push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
         consent.push_session(SessionScript::Decide(SessionDecision::AllowOnce));
@@ -239,7 +272,6 @@ mod tests {
         let (client_end, host_end) = tokio::io::duplex(64 * 1024);
         let host = tokio::spawn(async move { serve_host(host_end, &hcfg, &hdeps).await });
 
-        let pins = Pins::open(paths, identity.id()).unwrap();
         let mut cdeps = ClientDeps::headless(pins.store());
         cdeps.ui = Arc::new(ScriptedClientUi::new(true));
         let device = DeviceIdentity::from_seed(&[0x22; 32]);
@@ -297,6 +329,49 @@ mod tests {
         let entry = book.load().unwrap().hosts[&identity.id()].clone();
         assert_eq!(entry.last_seen, Some(Day::today()));
         assert_eq!(entry.declared.as_deref(), Some("Desk"));
+    }
+
+    /// M-UI-2 security finding F-2: with history on (the default), a
+    /// Forget of another computer and a Clear made while a connection runs
+    /// stay made: the connection writes only its own host's record, merged
+    /// into the file as it is when the handshake is over.
+    #[tokio::test]
+    async fn a_forget_or_clear_during_a_connection_is_never_undone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        let file = known_hosts_file(&paths);
+        let identity = Arc::new(HostIdentity::from_seed(&[0x11; 32]));
+        let trusted = Arc::new(TrustedDeviceStore::ephemeral(Default::default()));
+        // The host is paired by a first connection; two other computers are
+        // pinned, one of them seen after its pairing.
+        connect_once(&paths, &identity, &trusted).await;
+        let (studio, attic) = (
+            HostIdentity::from_seed(&[0x55; 32]).id(),
+            HostIdentity::from_seed(&[0x66; 32]).id(),
+        );
+        let mut hosts = KnownHosts::load(&file).unwrap();
+        hosts.pin(studio, "Studio", [5; 32], 1000);
+        hosts.pin(attic, "Attic", [6; 32], 1000);
+        hosts.touch(&attic, 2000);
+        hosts.save(&file).unwrap();
+
+        // A connection starts (its copy of the known hosts is taken), and
+        // meanwhile the window forgets one computer and clears the history.
+        let pins = Pins::open(&paths, identity.id()).unwrap();
+        let forgot = crate::ui::book::apply(&paths, &crate::ui::book::Change::Forget(studio));
+        assert!(forgot.starts_with("Forgot"), "{forgot}");
+        crate::ui::book::apply(&paths, &crate::ui::book::Change::Clear);
+        assert!(connect_with(&pins, &identity, &trusted).await);
+
+        let hosts = KnownHosts::load(&file).unwrap();
+        assert!(hosts.get(&studio).is_none(), "the Forget was undone");
+        assert_eq!(
+            hosts.get(&attic).unwrap().last_seen,
+            1000,
+            "the Clear was undone"
+        );
+        let desk = hosts.get(&identity.id()).unwrap();
+        assert!(desk.last_seen >= desk.paired_at, "this connection's time");
     }
 
     /// A name saved for a computer before it was paired is bound to the key
