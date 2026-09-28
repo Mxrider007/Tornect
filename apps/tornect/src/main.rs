@@ -243,6 +243,12 @@ enum SheetArg {
     Alarm,
     /// A paired device asks for a session.
     Session,
+    /// The session sheet with Linux's levels (§B.2.1).
+    SessionLinux,
+    /// The session sheet of an invented Windows host with UAC off.
+    SessionAdmin,
+    /// That sheet's administrator confirmation.
+    AdminConfirm,
 }
 
 impl From<SheetArg> for ui::preview::Sheet {
@@ -252,6 +258,9 @@ impl From<SheetArg> for ui::preview::Sheet {
             SheetArg::Pinned => Self::Pinned,
             SheetArg::Alarm => Self::Alarm,
             SheetArg::Session => Self::Session,
+            SheetArg::SessionLinux => Self::SessionLinux,
+            SheetArg::SessionAdmin => Self::SessionAdmin,
+            SheetArg::AdminConfirm => Self::AdminConfirm,
         }
     }
 }

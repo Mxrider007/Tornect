@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
+use tornect_core::levels::Elevation;
 use tornect_core::session_log::SessionMode;
 use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
 use tornect_input::InputEvent;
@@ -39,7 +40,9 @@ use super::model::{
 };
 use super::recognize::Lookalike;
 use super::stream::{FrameSlot, SlotSink};
-use crate::host::{ControlChannel, HostLock, HostWiring, describe_end, describe_media, note, say};
+use crate::host::{
+    ControlChannel, HostLock, HostWiring, PolkitRevocation, describe_end, describe_media, note, say,
+};
 use crate::tor_cmd::{End, explain, explain_handshake};
 
 /// Input events queued for the media stream; one beyond that is dropped (the
@@ -194,6 +197,8 @@ struct Hosted {
 /// sharing indicator, and a bump of the counter that withdraws open popups.
 struct GuiSessions {
     live: Arc<LiveSessions>,
+    /// polkit's remembered approvals, revoked during Control sessions.
+    polkit: Arc<PolkitRevocation>,
     media: Arc<MediaHost>,
     shared: Arc<Shared>,
     started: watch::Sender<u64>,
@@ -202,6 +207,7 @@ struct GuiSessions {
 impl SessionSink for GuiSessions {
     fn on_start(&self, session: &LiveSession<'_>) {
         self.live.on_start(session);
+        self.polkit.on_start(session);
         self.media.on_start(session);
         self.started.send_modify(|n| *n = n.wrapping_add(1));
         let control = session.mode == SessionMode::Control;
@@ -229,6 +235,7 @@ impl SessionSink for GuiSessions {
         // Media first: that is what stops capture.
         self.media.on_end(session_id, end);
         self.live.on_end(session_id, end);
+        self.polkit.on_end(session_id);
         let why = end.map_or_else(|| "protocol error".to_owned(), describe_end);
         self.shared.update(|m| {
             m.sharing.retain(|s| s.session_id != session_id);
@@ -303,6 +310,7 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         live,
         audit,
         pins,
+        polkit,
     } = crate::host::wire(
         &b.paths,
         &b.cfg,
@@ -328,6 +336,7 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
     );
     deps.sessions = Arc::new(GuiSessions {
         live: Arc::clone(&live),
+        polkit: Arc::clone(&polkit),
         media: Arc::clone(&media),
         shared: Arc::clone(&b.shared),
         started: started_tx,
@@ -912,16 +921,23 @@ async fn viewed(
     // The input gate: the signed SESSION_ACCEPT's mode, never the media
     // stream's BindOk (SLICE-C2 C2-6).
     let control = sends_input(session.accept().mode());
+    // The level, likewise, only from the signed accept (§B.2.1).
+    let administrator = control && session.accept().elevation() == Elevation::Admin;
     let host = session.host_label().to_owned();
     say(format_args!(
         "SESSION LIVE {} with \"{host}\" ({})",
         session.session_token().session_id(),
-        if control { "control" } else { "view-only" }
+        match (control, administrator) {
+            (true, true) => "control · administrator",
+            (true, false) => "control",
+            (false, _) => "view-only",
+        }
     ));
     b.shared.update(|m| {
         m.client = ClientStage::Live(Viewing {
             host: host.clone(),
             control,
+            administrator,
             since: Instant::now(),
             pictures: 0,
             size: (0, 0),
@@ -1304,6 +1320,7 @@ mod tests {
             m.client = ClientStage::Live(Viewing {
                 host: "Office PC".to_owned(),
                 control: true,
+                administrator: false,
                 since: Instant::now(),
                 pictures: 0,
                 size: (0, 0),
@@ -1340,6 +1357,7 @@ mod tests {
         ));
         wiring.deps.sessions = Arc::new(GuiSessions {
             live: Arc::clone(&wiring.live),
+            polkit: Arc::clone(&wiring.polkit),
             media,
             shared: Arc::clone(&shared),
             started: started_tx,
