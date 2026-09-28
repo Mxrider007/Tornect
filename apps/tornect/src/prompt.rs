@@ -19,6 +19,9 @@ use tornect_signal::pairing::{
     TrustedPeer,
 };
 
+use crate::ui::model::Recognition;
+use crate::ui::recognize::Recognizer;
+
 /// How long the client waits for its user to confirm a code. The host gives the
 /// client 60 s after `PAIR_ACCEPT` to send its `SESSION_REQUEST`, and the answer
 /// still has to cross Tor.
@@ -113,20 +116,59 @@ impl Prompter {
 /// The host's consent popups, asked on the terminal.
 pub struct CliConsent {
     prompter: Arc<Prompter>,
+    /// The device words and the look-alike alarm (§B.6.1); without them the
+    /// pairing question shows the device fingerprint as before.
+    words: Option<Arc<Recognizer>>,
 }
 
 impl CliConsent {
     /// Ask through `prompter`.
     #[must_use]
     pub fn new(prompter: Arc<Prompter>) -> Self {
-        Self { prompter }
+        Self {
+            prompter,
+            words: None,
+        }
+    }
+
+    /// The pairing question names an unpinned key by its device words and
+    /// runs the look-alike alarm; when it fires, only the code typed from
+    /// the other device pairs (§B.6.1 W-B3). The key is derived before the
+    /// question, off the network task, paced for a key nobody saved.
+    #[must_use]
+    pub fn with_words(mut self, words: Arc<Recognizer>) -> Self {
+        self.words = Some(words);
+        self
     }
 }
 
 impl Consent for CliConsent {
     fn pairing<'a>(&'a self, peer: &'a PairingPeer, sas: &'a str) -> BoxFuture<'a, PairDecision> {
         Box::pin(async move {
-            match self.prompter.ask(&pairing_question(peer, sas)).await {
+            let seen = match &self.words {
+                None => None,
+                Some(words) => {
+                    let words = Arc::clone(words);
+                    let (device, name) = (peer.device, peer.name.clone());
+                    let pinned = peer.pinned_label.is_some();
+                    match tokio::task::spawn_blocking(move || {
+                        words.pairing_sheet(&device, &name, pinned)
+                    })
+                    .await
+                    {
+                        Ok(seen) => Some(seen),
+                        // No words, no alarm verdict: refuse.
+                        Err(_) => return PairDecision::Reject,
+                    }
+                }
+            };
+            let typed = seen.as_ref().is_some_and(|s| s.looks_like.is_some());
+            match self
+                .prompter
+                .ask(&pairing_question(peer, sas, seen.as_ref()))
+                .await
+            {
+                Some(answer) if typed => parse_typed(&answer, sas),
                 Some(answer) => parse_pairing(&answer),
                 None => PairDecision::Reject,
             }
@@ -147,22 +189,67 @@ impl Consent for CliConsent {
     }
 }
 
-// Every string printed here is either computed locally (the code, the
-// fingerprint) or already sanitized (`normalize_label` drops control and
-// invisible characters from the declared name and the pinned label), so a peer
-// cannot write escape sequences to this terminal.
-fn pairing_question(peer: &PairingPeer, sas: &str) -> String {
+// Every string printed here is either computed locally (the code, the device
+// words, the fingerprint) or already sanitized (`normalize_label` drops control
+// and invisible characters from the declared name and the pinned label, and the
+// saved name the alarm names was cleaned when it was saved), so a peer cannot
+// write escape sequences to this terminal.
+fn pairing_question(peer: &PairingPeer, sas: &str, seen: Option<&Recognition>) -> String {
     let who = match &peer.pinned_label {
         Some(label) => format!(
             "a device ALREADY PAIRED as \"{label}\" asks to pair again (refusing does not unpair it)"
         ),
         None => format!("a device calling itself \"{}\" asks to pair", peer.name),
     };
-    format!(
-        "\nPAIRING REQUEST: {who}\n  device fingerprint: {}\n  code: {sas}   <- must match the code on that device\n\
-         Pair? Type `yes`, or `yes <name>` to choose its label; anything else refuses (60 s):",
-        peer.fingerprint
-    )
+    // One short form (§B.6.1 item 6): the words in their labelled slot for an
+    // unpinned key; a pinned one is named by its pinned label; the fingerprint
+    // only where no words were derived.
+    let short = match seen {
+        Some(seen) if peer.pinned_label.is_none() => format!(
+            "  device words: {} · not yet trusted · compare the code\n",
+            seen.words.shown()
+        ),
+        Some(_) => String::new(),
+        None => format!("  device fingerprint: {}\n", peer.fingerprint),
+    };
+    match seen.and_then(|s| s.looks_like.as_deref()) {
+        // The alarm: this computer's own code stays hidden; it is typed from
+        // the other device's screen and compared here (W-B3).
+        Some(like) => format!(
+            "\nPAIRING REQUEST: {who}\n  LOOKS LIKE YOUR SAVED DEVICE \"{like}\", BUT IT IS A DIFFERENT \
+             DEVICE\n{short}Type the 6-digit code the other device shows (`<code>`, or `<code> <name>` to \
+             choose its label); this computer checks it against its own; anything else refuses (60 s):"
+        ),
+        None => format!(
+            "\nPAIRING REQUEST: {who}\n{short}  code: {sas}   <- must match the code on that device\n\
+             Pair? Type `yes`, or `yes <name>` to choose its label; anything else refuses (60 s):"
+        ),
+    }
+}
+
+/// The answer to a pairing question whose look-alike alarm fired: the six
+/// digits the other device shows (spaces allowed), then optionally a label.
+/// They pair only when they are this computer's own code; `yes` and
+/// anything else refuse.
+fn parse_typed(answer: &str, sas: &str) -> PairDecision {
+    let mut code = String::new();
+    let mut words = answer.split_whitespace().peekable();
+    while let Some(word) = words.peek() {
+        if code.len() >= 6 || !word.bytes().all(|b| b.is_ascii_digit()) {
+            break;
+        }
+        code.push_str(word);
+        words.next();
+    }
+    let label = words.collect::<Vec<_>>().join(" ");
+    let own: String = sas.chars().filter(char::is_ascii_digit).collect();
+    if code.len() == 6 && code == own {
+        PairDecision::Accept {
+            label: (!label.is_empty()).then_some(label),
+        }
+    } else {
+        PairDecision::Reject
+    }
 }
 
 fn session_question(peer: &TrustedPeer) -> String {
@@ -330,6 +417,72 @@ mod tests {
         assert_eq!(first.await.as_deref(), Some("one"));
         drop(tx);
         assert_eq!(prompter.ask("second?").await, None);
+    }
+
+    /// §B.6.1 on the terminal: an unpinned key is named by its device words
+    /// (no fingerprint beside them); when the alarm fired, the question names
+    /// the saved device, hides this computer's code, and only the typed code
+    /// pairs (`yes` refuses, W-B3).
+    #[test]
+    fn the_terminal_names_a_key_by_its_words_and_takes_the_typed_code() {
+        use tornect_core::words::Words;
+
+        let device = tornect_core::DeviceIdentity::from_seed(&[8; 32]).id();
+        let peer = PairingPeer {
+            device,
+            name: "Office PC".to_owned(),
+            fingerprint: device.fingerprint(),
+            pinned_label: None,
+        };
+        let calm = Recognition {
+            words: Words::from_cached("absurd citizen dinner harvest").unwrap(),
+            identicon: None,
+            looks_like: None,
+        };
+        let asked = pairing_question(&peer, "123 456", Some(&calm));
+        assert!(
+            asked.contains(
+                "device words: absurd · citizen · dinner · harvest · not yet trusted · compare \
+                 the code"
+            ),
+            "{asked}"
+        );
+        assert!(asked.contains("code: 123 456") && !asked.contains("fingerprint"));
+        let alarm = Recognition {
+            looks_like: Some("Office PC".to_owned()),
+            ..calm
+        };
+        let asked = pairing_question(&peer, "123 456", Some(&alarm));
+        assert!(
+            asked.contains("LOOKS LIKE YOUR SAVED DEVICE \"Office PC\""),
+            "{asked}"
+        );
+        assert!(
+            !asked.contains("123 456"),
+            "this computer's code is hidden: {asked}"
+        );
+        assert_eq!(
+            parse_typed("123 456", "123 456"),
+            PairDecision::Accept { label: None }
+        );
+        assert_eq!(
+            parse_typed(" 123456  Desk 2 ", "123 456"),
+            PairDecision::Accept {
+                label: Some("Desk 2".to_owned())
+            }
+        );
+        for no in [
+            "yes",
+            "y",
+            "",
+            "654 321",
+            "12345",
+            "1234567",
+            "123 4567",
+            "yes 123456",
+        ] {
+            assert_eq!(parse_typed(no, "123 456"), PairDecision::Reject, "{no:?}");
+        }
     }
 
     /// The consent seam maps answers to decisions, and a closed terminal denies.
