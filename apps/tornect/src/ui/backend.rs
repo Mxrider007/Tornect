@@ -179,6 +179,7 @@ struct Hosted {
     audit: Arc<HostAudit>,
     ipc: Option<JoinHandle<()>>,
     kill_watch: JoinHandle<()>,
+    pins: Arc<crate::history::DevicePins>,
     _lock: HostLock,
 }
 
@@ -294,6 +295,7 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         ctx,
         live,
         audit,
+        pins,
     } = crate::host::wire(
         &b.paths,
         &b.cfg,
@@ -314,12 +316,15 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
             live: Arc::new(move || activity.session_live()),
         },
     ));
-    deps.sessions = Arc::new(GuiSessions {
-        live: Arc::clone(&live),
-        media: Arc::clone(&media),
-        shared: Arc::clone(&b.shared),
-        started: started_tx,
-    });
+    deps.sessions = Arc::new(crate::history::Settling::new(
+        GuiSessions {
+            live: Arc::clone(&live),
+            media: Arc::clone(&media),
+            shared: Arc::clone(&b.shared),
+            started: started_tx,
+        },
+        Arc::clone(&pins),
+    ));
     let kill_watch = media.watch_kill(deps.kill.clone());
     let ipc = crate::host::start_control_channel(&b.paths, ctx, deps.kill.clone(), control)
         .await
@@ -331,6 +336,7 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         audit,
         ipc,
         kill_watch,
+        pins,
         _lock: lock,
     })
 }
@@ -521,10 +527,20 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                     continue;
                 };
                 let serving = Arc::clone(&hosted.serving);
+                let (pins, b) = (Arc::clone(&hosted.pins), Arc::clone(&b));
                 tokio::spawn(async move {
                     let _slot = slot;
                     let (cfg, deps) = &*serving;
                     crate::host::serve_signaling(stream, cfg, deps, |_| {}).await;
+                    match pins.settle() {
+                        Ok(true) => refresh_book(&b, None),
+                        Ok(false) => {}
+                        Err(e) => {
+                            let line = format!("the paired devices could not be saved: {e:#}");
+                            tracing::warn!("{line}");
+                            b.shared.update(|m| m.note(line));
+                        }
+                    }
                 });
             }
             granted = async { granting.as_mut().expect("guarded").await }, if granting.is_some() => {
