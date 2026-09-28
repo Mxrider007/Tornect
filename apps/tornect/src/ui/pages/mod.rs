@@ -73,7 +73,7 @@ mod tests {
     use tornect_core::TornectId;
     use tornect_signal::pairing::SessionDecision;
 
-    use super::super::model::{Hosting, Popup, PopupKind, TorState};
+    use super::super::model::{Hosting, Popup, PopupKind, Setup, TorState};
     use super::super::nav;
     use super::super::theme::Tokens;
     use super::super::view::main_window;
@@ -399,5 +399,82 @@ mod tests {
         assert!(window.node("Connect").is_disabled());
         let connect = window.center("Connect");
         assert!(window.click(connect).is_empty());
+    }
+
+    /// Review F-2: a question that arrives while the page is scrolled to its
+    /// end is drawn in view, in its region above the page's scroll area: its
+    /// Deny and its accepts are inside the window, and Deny is still the
+    /// keyboard's first stop.
+    #[test]
+    fn a_question_arrives_in_view_on_a_scrolled_page() {
+        let mut model = at_rest();
+        model.setup = Some(Setup {
+            token_file: "~/.local/share/tornect/portal-restore-token".into(),
+            granted: false,
+            busy: false,
+            note: None,
+        });
+        for i in 0..Model::EVENTS_KEPT {
+            model.note(format!("{i}: something happened that takes two lines to say. ").repeat(3));
+        }
+        for size in [WIDE, NARROW] {
+            let mut window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, size);
+            let title = |w: &Window| {
+                w.nodes
+                    .iter()
+                    .find(|n| n.value() == Some("Home"))
+                    .and_then(Node::bounds)
+                    .expect("the page's title")
+                    .y0
+            };
+            let before = title(&window);
+            // A long scroll over the page, to its end (a touchpad's: applied
+            // at once, not smoothed over later passes).
+            let over = egui::pos2(size.0 - 80.0, size.1 / 2.0);
+            let wheel = |phase| egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -4000.0),
+                phase,
+                modifiers: egui::Modifiers::NONE,
+            };
+            window.pass(vec![
+                egui::Event::PointerMoved(over),
+                wheel(egui::TouchPhase::Start),
+                wheel(egui::TouchPhase::Move),
+            ]);
+            window.pass(Vec::new());
+            let scrolled = title(&window);
+            assert!(
+                scrolled < before - 50.0,
+                "{size:?}: the page did not scroll ({before} → {scrolled})"
+            );
+            window.model.popups = vec![Popup {
+                id: 9,
+                kind: PopupKind::Session {
+                    label: "Laptop".to_owned(),
+                    fingerprint: "ab:cd".to_owned(),
+                },
+                deadline: Instant::now() + Duration::from_secs(60),
+            }];
+            window.pass(Vec::new());
+            window.pass(Vec::new());
+            for label in ["Deny", "View only", "Allow control"] {
+                let b = window.node(label).bounds().expect("bounds");
+                assert!(
+                    b.y0 >= 0.0 && b.y1 <= f64::from(size.1) && b.x1 <= f64::from(size.0),
+                    "{size:?}: {label} at {b:?}, outside the window"
+                );
+            }
+            window.key(egui::Key::Tab);
+            assert_eq!(
+                window.key(egui::Key::Space),
+                vec![Action::Session {
+                    id: 9,
+                    decision: SessionDecision::Deny,
+                    pointer: false,
+                }],
+                "{size:?}"
+            );
+        }
     }
 }
