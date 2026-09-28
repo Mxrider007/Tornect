@@ -25,8 +25,8 @@ use windows_sys::Win32::Security::{
     CheckTokenMembership, CreateWellKnownSid, EqualSid, GetTokenInformation,
     LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, LogonUserW, LookupAccountNameW,
     SECURITY_MAX_SID_SIZE, SID_NAME_USE, TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN, TOKEN_QUERY,
-    TOKEN_USER, TokenElevationType, TokenElevationTypeLimited, TokenLinkedToken, TokenUser,
-    WinBuiltinAdministratorsSid,
+    TOKEN_USER, TokenElevationType, TokenElevationTypeFull, TokenElevationTypeLimited,
+    TokenLinkedToken, TokenUser, WinBuiltinAdministratorsSid,
 };
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoTaskMemFree, CoUninitialize,
@@ -34,6 +34,7 @@ use windows_sys::Win32::System::Com::{
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW, SetDefaultDllDirectories,
 };
+use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken, WaitForSingleObject,
@@ -311,6 +312,74 @@ pub(crate) fn is_administrator() -> std::io::Result<bool> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(member != 0)
+}
+
+/// The UAC values of the session levels (§B.2.1), read from
+/// `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System` with
+/// `RegGetValueW`, `REG_DWORD` only. A value that is absent, of another type
+/// or unreadable is `None`: Windows' default applies (NEEDS-DEVICE(windows)).
+pub(crate) struct PolicyRegistry;
+
+impl crate::levels::PolicyValues for PolicyRegistry {
+    fn dword(&self, name: &str) -> Option<u32> {
+        let key = wide(crate::levels::POLICY_KEY);
+        let value = wide(name);
+        let mut data = 0u32;
+        let mut size = u32::try_from(size_of::<u32>()).unwrap_or(4);
+        // SAFETY: both names are NUL-terminated UTF-16 buffers that outlive
+        // the call; `data` is writable for `size` bytes; no type is asked
+        // for (null), and `RRF_RT_REG_DWORD` refuses any other type.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_DWORD,
+                null_mut(),
+                (&raw mut data).cast(),
+                &mut size,
+            )
+        };
+        (status == NO_ERROR).then_some(data)
+    }
+}
+
+/// The account facts of the session levels (§B.2.1): whether the executable
+/// lies under Program Files, whether the account is an administrator (see
+/// [`is_administrator`]), whether it is the built-in Administrator (a local
+/// account SID ending in RID 500), and whether this process runs elevated
+/// (`TokenElevationTypeFull`: the full half of a split token).
+pub(crate) fn level_account() -> std::io::Result<crate::levels::Account> {
+    let token = process_token()?;
+    let mut kind: TOKEN_ELEVATION_TYPE = 0;
+    let mut len = 0u32;
+    // SAFETY: `kind` is writable for the size passed; `len` receives the
+    // size written.
+    let ok = unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenElevationType,
+            (&raw mut kind).cast(),
+            u32::try_from(size_of::<TOKEN_ELEVATION_TYPE>()).unwrap_or(0),
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let sid = current_user_sid()?;
+    let exe = std::env::current_exe()?;
+    let program_files = known_folder(KnownFolder::ProgramFiles)?;
+    let installed = match (exe.to_str(), program_files.to_str()) {
+        (Some(exe), Some(folder)) => crate::autostart::location_under(exe, &[folder.to_owned()]),
+        _ => false,
+    };
+    Ok(crate::levels::Account {
+        installed,
+        administrator: is_administrator()?,
+        builtin_administrator: sid.starts_with("S-1-5-21-") && sid.ends_with("-500"),
+        elevated: kind == TokenElevationTypeFull,
+    })
 }
 
 /// This process's user, as a string SID (`S-1-5-21-…`).

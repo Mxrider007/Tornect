@@ -1,6 +1,6 @@
 //! OS session services for Tornect (`docs/PLAN.md` §B.8.8).
 //!
-//! Three modules so far:
+//! Four modules so far:
 //!
 //! - [`ipc`] — the owner-only local endpoint of §B.8.7.4 (Unix socket / Windows
 //!   named pipe) that the CLI talks to and the host serves.
@@ -10,6 +10,9 @@
 //! - [`autostart`] — start at login (§B.8.7.5): a systemd user unit on Linux, a
 //!   Task Scheduler at-logon task on Windows, and the readiness row that
 //!   reports it.
+//! - [`levels`] — the availability probe of the session levels (§B.2.1): the
+//!   row of the table this computer is in (Windows: the location, the UAC
+//!   values and the token; Linux: one row).
 //!
 //! Everything else in §B.8.8 — presence, lock state, keep-awake, wake hooks,
 //! global hotkeys, capture-excluded windows and the other readiness probes —
@@ -29,6 +32,7 @@
 
 pub mod autostart;
 pub mod ipc;
+pub mod levels;
 pub mod reauth;
 #[cfg(windows)]
 mod win;
