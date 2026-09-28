@@ -719,8 +719,9 @@ fn recent(ui: &mut Ui, t: &Tokens, book: &Book, actions: &mut Vec<Action>) {
                 "On. The list keeps the day of each connection, never the time; it stays on this \
                  computer and is never sent anywhere."
             } else {
-                "Off. Tornect keeps no list of recent connections and no last-connected days \
-                 from now on; what was kept stays until you clear it."
+                "Off: nothing about past connections is written. Switched on, it keeps the day \
+                 of each connection (never the time) and each computer's last-connected day, \
+                 only on this computer; anything kept before stays until you clear it."
             },
         );
         ui.add_space(6.0);
