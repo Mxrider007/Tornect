@@ -349,8 +349,12 @@ impl crate::levels::PolicyValues for PolicyRegistry {
 /// [`is_administrator`]), whether it is the built-in Administrator (a local
 /// account SID ending in RID 500), and whether this process runs elevated
 /// (`TokenElevationTypeFull`: the full half of a split token).
-pub(crate) fn level_account() -> std::io::Result<crate::levels::Account> {
-    let token = process_token()?;
+pub(crate) fn level_account() -> Result<crate::levels::Account, crate::levels::Unreadable> {
+    let blind = |error| crate::levels::Unreadable {
+        elevated: None,
+        error,
+    };
+    let token = process_token().map_err(blind)?;
     let mut kind: TOKEN_ELEVATION_TYPE = 0;
     let mut len = 0u32;
     // SAFETY: `kind` is writable for the size passed; `len` receives the
@@ -365,20 +369,30 @@ pub(crate) fn level_account() -> std::io::Result<crate::levels::Account> {
         )
     };
     if ok == 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(blind(std::io::Error::last_os_error()));
     }
-    let sid = current_user_sid()?;
-    let exe = std::env::current_exe()?;
-    let program_files = known_folder(KnownFolder::ProgramFiles)?;
-    let installed = match (exe.to_str(), program_files.to_str()) {
-        (Some(exe), Some(folder)) => crate::autostart::location_under(exe, &[folder.to_owned()]),
-        _ => false,
+    let elevated = kind == TokenElevationTypeFull;
+    // From here on a failure still says whether this process runs elevated.
+    let rest = || -> std::io::Result<crate::levels::Account> {
+        let sid = current_user_sid()?;
+        let exe = std::env::current_exe()?;
+        let program_files = known_folder(KnownFolder::ProgramFiles)?;
+        let installed = match (exe.to_str(), program_files.to_str()) {
+            (Some(exe), Some(folder)) => {
+                crate::autostart::location_under(exe, &[folder.to_owned()])
+            }
+            _ => false,
+        };
+        Ok(crate::levels::Account {
+            installed,
+            administrator: is_administrator()?,
+            builtin_administrator: sid.starts_with("S-1-5-21-") && sid.ends_with("-500"),
+            elevated,
+        })
     };
-    Ok(crate::levels::Account {
-        installed,
-        administrator: is_administrator()?,
-        builtin_administrator: sid.starts_with("S-1-5-21-") && sid.ends_with("-500"),
-        elevated: kind == TokenElevationTypeFull,
+    rest().map_err(|error| crate::levels::Unreadable {
+        elevated: Some(elevated),
+        error,
     })
 }
 

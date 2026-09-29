@@ -60,19 +60,40 @@ pub fn windows_facts(values: &dyn PolicyValues, account: Account) -> WindowsFact
     }
 }
 
+/// An account read that failed: whether this process runs elevated, when
+/// that much was read, and why the rest could not be.
+#[derive(Debug)]
+pub struct Unreadable {
+    /// Whether this process runs elevated; `None` when not even that was read.
+    pub elevated: Option<bool>,
+    /// What failed.
+    pub error: std::io::Error,
+}
+
+/// The row of a Windows host from what was read of its account and the
+/// UAC `values`. A failed read never falls back to a more permissive row
+/// ([`Availability::unreadable`]): elevation unreadable refuses, elevated
+/// with UAC on keeps the started-elevated refusal, and anything else
+/// unreadable offers View only alone.
+#[must_use]
+pub fn windows_row(read: Result<Account, Unreadable>, values: &dyn PolicyValues) -> Availability {
+    match read {
+        Ok(account) => Availability::of(Some(&windows_facts(values, account))),
+        Err(Unreadable { elevated, error }) => {
+            tracing::warn!(error = %error, "reading this process's token for the session levels");
+            Availability::unreadable(elevated, &windows_facts(values, Account::default()))
+        }
+    }
+}
+
 /// This computer's row of the §B.2.1 table. On Linux (and every system but
-/// Windows) the Linux row. On Windows the registry and the token; a token
-/// that cannot be read counts as a standard, non-elevated, standalone
-/// account — the row that offers the least.
+/// Windows) the Linux row. On Windows the registry and the token
+/// ([`windows_row`]).
 #[must_use]
 pub fn probe() -> Availability {
     #[cfg(windows)]
     {
-        let account = crate::win::level_account().unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "reading this process's token for the session levels");
-            Account::default()
-        });
-        Availability::of(Some(&windows_facts(&crate::win::PolicyRegistry, account)))
+        windows_row(crate::win::level_account(), &crate::win::PolicyRegistry)
     }
     #[cfg(not(windows))]
     {
@@ -283,6 +304,55 @@ mod tests {
         assert!(shared.prompts_on_shared_screen);
         let secure = Availability::of(Some(&windows_facts(&with(&[]), ADMIN)));
         assert!(!secure.prompts_on_shared_screen);
+    }
+
+    /// An account read that failed lands on a row no more permissive than a
+    /// full read: elevation unreadable refuses; elevated with UAC on keeps
+    /// the started-elevated refusal; the rest unreadable offers View only.
+    #[test]
+    fn a_failed_account_read_offers_the_least() {
+        use tornect_core::levels::{
+            Answers, SENTENCE_ACCOUNT_UNREADABLE, SENTENCE_ELEVATION_UNREADABLE,
+        };
+        let failed = |elevated| {
+            Err(Unreadable {
+                elevated,
+                error: std::io::Error::other("access denied"),
+            })
+        };
+        let values = fake(&defaults());
+        let blind = windows_row(failed(None), &values);
+        assert!(!blind.serves());
+        assert_eq!(blind.sentence, Some(SENTENCE_ELEVATION_UNREADABLE));
+        let elevated = windows_row(failed(Some(true)), &values);
+        assert_eq!(elevated.row, HostRow::WindowsStartedElevated);
+        assert!(!elevated.serves());
+        let rest = windows_row(failed(Some(false)), &values);
+        assert!(rest.serves());
+        assert_eq!(
+            rest.offered(),
+            Answers {
+                view_only: true,
+                allow: false,
+                admin: None,
+            }
+        );
+        assert_eq!(rest.sentence, Some(SENTENCE_ACCOUNT_UNREADABLE));
+        // UAC off on an account whose rights could not be read: View only
+        // too, never control (which could be administrator access there).
+        let uac_off = fake(&[("EnableLUA", 0)]);
+        let off = windows_row(failed(Some(false)), &uac_off);
+        assert!(!off.answers.allow && off.answers.view_only);
+        // A full read still gives its row.
+        let ok = windows_row(
+            Ok(Account {
+                installed: true,
+                administrator: true,
+                ..Account::default()
+            }),
+            &values,
+        );
+        assert_eq!(ok.row, HostRow::WindowsInstalled);
     }
 
     /// Linux: the three-answer row with its sentence, whatever the account.
