@@ -545,7 +545,7 @@ fn details(
         if computer.paired.is_some() {
             ui.add_space(8.0);
             let ready = model.tor.is_ready() && idle && !model.setup_changed.contains(&id);
-            admin_row(ui, t, model, computer, ready, form, actions);
+            admin_row(ui, t, computer, ready, form, actions);
         }
     });
 }
@@ -558,7 +558,6 @@ fn details(
 fn admin_row(
     ui: &mut Ui,
     t: &Tokens,
-    model: &Model,
     computer: &Computer,
     ready: bool,
     form: &mut Form,
@@ -605,7 +604,7 @@ fn admin_row(
                     }
                     if Button::new(Kind::Danger, "Continue: the password")
                         .small()
-                        .enabled(model.tor.is_ready())
+                        .enabled(ready)
                         .show(ui)
                         .clicked()
                     {
@@ -614,6 +613,54 @@ fn admin_row(
                     }
                 });
             });
+        return;
+    }
+    if let Some((_, typed)) = form.ua.unlocking.as_mut().filter(|(c, _)| *c == id) {
+        // Unlock names the other device: its ID, as `tornect id` there shows
+        // it (this computer cannot know another computer's grants).
+        let mut done = None;
+        widgets::card_frame(t, 12, Margin::same(12))
+            .stroke(Stroke::new(1.0, theme::tint(t.danger_text, 0.5)))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(AdminAction::Unlock.confirmation(&computer.title()))
+                            .color(t.text_primary),
+                    )
+                    .wrap(),
+                );
+                let field = widgets::text_field(ui, typed, "Its device ID", true, 320.0);
+                field.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Device ID"));
+                muted(ui, t, "`tornect id` on that device shows its device ID.");
+                let device = typed.trim().parse::<tornect_core::DeviceId>().ok();
+                ui.horizontal(|ui| {
+                    if Button::new(Kind::Secondary, "Keep things as they are")
+                        .small()
+                        .show(ui)
+                        .clicked()
+                    {
+                        done = Some(None);
+                    }
+                    if Button::new(Kind::Danger, "Continue: the password")
+                        .small()
+                        .enabled(ready && device.is_some())
+                        .show(ui)
+                        .clicked()
+                        && let Some(device) = device
+                    {
+                        done = Some(Some(*device.public_key_bytes()));
+                    }
+                });
+            });
+        match done {
+            Some(Some(device)) => {
+                form.ua.unlocking = None;
+                actions.push(Action::AskUnlock(id, device));
+            }
+            Some(None) => form.ua.unlocking = None,
+            None => {}
+        }
         return;
     }
     ui.horizontal_wrapped(|ui| {
@@ -628,7 +675,17 @@ fn admin_row(
                 .clicked()
             {
                 form.ua.confirming = Some((id, action));
+                form.ua.unlocking = None;
             }
+        }
+        if computer.unattended.control
+            && Button::new(Kind::Ghost, AdminAction::Unlock.title())
+                .small()
+                .show(ui)
+                .clicked()
+        {
+            form.ua.unlocking = Some((id, String::new()));
+            form.ua.confirming = None;
         }
     });
     muted(

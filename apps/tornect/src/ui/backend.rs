@@ -89,12 +89,13 @@ pub enum Command {
     /// Keep a history of connections, or stop keeping one.
     SetHistory(bool),
     /// Open the password prompt for `id`, for a session or an admin command
-    /// (§B.8.10).
-    AskPassword(TornectId, Option<AdminAction>),
+    /// (with the other device an Unlock names) (§B.8.10).
+    AskPassword(TornectId, Option<AdminAction>, Option<[u8; 32]>),
     /// Connect to `id` without asking, as chosen in the prompt: one attempt.
     ConnectUnattended(TornectId, UaChoice),
-    /// Send one admin command to `id`, as chosen in the prompt.
-    Admin(TornectId, AdminAction, UaChoice),
+    /// Send one admin command to `id` (with the other device an Unlock
+    /// names), as chosen in the prompt.
+    Admin(TornectId, AdminAction, Option<[u8; 32]>, UaChoice),
     /// The person read that `id`'s unattended setup was re-created (A16).
     ConfirmSetupChanged(TornectId),
     /// Shut down.
@@ -794,7 +795,7 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                     }
                     Command::ClearHistory => change_book(&b, &Change::Clear),
                     Command::SetHistory(on) => change_book(&b, &Change::History(on)),
-                    Command::AskPassword(id, admin) => open_prompt(&b, id, admin),
+                    Command::AskPassword(id, admin, target) => open_prompt(&b, id, admin, target),
                     Command::ConfirmSetupChanged(id) => {
                         if let Err(e) = ua_client::renew_pin(&b.paths, &id) {
                             tracing::warn!(error = %format!("{e:#}"), "hosts.toml could not be updated");
@@ -836,13 +837,19 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                         ));
                         viewing = Some((stop_tx, task));
                     }
-                    Command::Admin(id, action, choice) => {
+                    Command::Admin(id, action, target, choice) => {
                         let Some(node) = node.clone() else {
                             b.shared.update(|m| m.note("Tor is not connected yet."));
                             continue;
                         };
                         if let Some(request) = unattended_request(&b, &id, choice) {
-                            tokio::spawn(admin_command(Arc::clone(&b), node, id, action, request));
+                            tokio::spawn(admin_command(
+                                Arc::clone(&b),
+                                node,
+                                id,
+                                (action, target),
+                                request,
+                            ));
                         }
                     }
                     Command::Revoke => {
@@ -1012,7 +1019,7 @@ async fn unless_stopped<F: Future>(work: F, stop: &watch::Receiver<bool>) -> Opt
 /// Open the password prompt for `id` (§B.8.10): what its saved record says
 /// (a remembered password, a stale one, whether the grant may carry the
 /// administrator level) and whether "Remember" can be offered here.
-fn open_prompt(b: &Backend, id: TornectId, admin: Option<AdminAction>) {
+fn open_prompt(b: &Backend, id: TornectId, admin: Option<AdminAction>, target: Option<[u8; 32]>) {
     let record = ua_client::record(&b.paths, &id);
     let saved = ua_client::system_passwords(&b.device);
     b.shared.update(|m| {
@@ -1027,6 +1034,7 @@ fn open_prompt(b: &Backend, id: TornectId, admin: Option<AdminAction>) {
             may_admin: record.administrator,
             retry_at: m.retry_at.get(&id).copied(),
             admin,
+            target,
         });
     });
 }
@@ -1063,7 +1071,7 @@ async fn admin_command(
     b: Arc<Backend>,
     node: Arc<TorNode>,
     id: TornectId,
-    action: AdminAction,
+    (action, target): (AdminAction, Option<[u8; 32]>),
     request: ua_client::Request,
 ) {
     let pins = match crate::history::Pins::open(&b.paths, id) {
@@ -1103,7 +1111,8 @@ async fn admin_command(
                 op: action.op(),
                 device_pk: match action {
                     AdminAction::RevokeThisDevice => Some(*b.device.id().public_key_bytes()),
-                    _ => None,
+                    AdminAction::Unlock => target,
+                    AdminAction::EndSession | AdminAction::TurnOff => None,
                 },
             };
             match client::admin(stream, &ccfg, &b.device, &deps, &command).await {
