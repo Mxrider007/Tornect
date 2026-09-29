@@ -93,7 +93,16 @@ pub fn windows_row(read: Result<Account, Unreadable>, values: &dyn PolicyValues)
 pub fn probe() -> Availability {
     #[cfg(windows)]
     {
-        windows_row(crate::win::level_account(), &crate::win::PolicyRegistry)
+        // A UAC value that could not be read (other than absent) is an
+        // unreadable account: never the defaults' more permissive row.
+        let read = match (crate::win::level_account(), crate::win::policy_unreadable()) {
+            (Ok(account), Some(error)) => Err(Unreadable {
+                elevated: Some(account.elevated),
+                error,
+            }),
+            (read, _) => read,
+        };
+        windows_row(read, &crate::win::PolicyRegistry)
     }
     #[cfg(not(windows))]
     {
