@@ -23,6 +23,7 @@
 
 #![warn(missing_docs)]
 
+pub mod helper;
 pub mod keymap;
 #[cfg(windows)]
 pub mod windows;
