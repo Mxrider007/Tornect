@@ -337,6 +337,36 @@ pub(crate) fn is_administrator() -> std::io::Result<bool> {
 /// or unreadable is `None`: Windows' default applies (NEEDS-DEVICE(windows)).
 pub(crate) struct PolicyRegistry;
 
+/// The first read of the five UAC values that failed for another reason
+/// than the value being absent (`ERROR_FILE_NOT_FOUND`, which takes Windows'
+/// default); `None` when every value was read or is absent (M-UI-3 review
+/// F-12: an unreadable value never falls back to UAC's defaults).
+pub(crate) fn policy_unreadable() -> Option<std::io::Error> {
+    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    let key = wide(crate::levels::POLICY_KEY);
+    for name in crate::levels::POLICY_VALUES {
+        let value = wide(name);
+        let mut data = 0u32;
+        let mut size = u32::try_from(size_of::<u32>()).unwrap_or(4);
+        // SAFETY: as in `PolicyRegistry::dword`.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_DWORD,
+                null_mut(),
+                (&raw mut data).cast(),
+                &mut size,
+            )
+        };
+        if status != NO_ERROR && status != ERROR_FILE_NOT_FOUND {
+            return Some(std::io::Error::from_raw_os_error(status as i32));
+        }
+    }
+    None
+}
+
 impl crate::levels::PolicyValues for PolicyRegistry {
     fn dword(&self, name: &str) -> Option<u32> {
         let key = wide(crate::levels::POLICY_KEY);
