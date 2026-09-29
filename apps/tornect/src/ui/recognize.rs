@@ -24,7 +24,7 @@ use tornect_core::{DeviceId, Paths, TornectId};
 use super::model::{MyWords, Recognition};
 
 /// This computer: the name it declares and its two keys.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Me {
     /// The name other devices see (`general.device_name`).
     pub name: String,
@@ -34,14 +34,27 @@ pub struct Me {
     pub device: DeviceId,
 }
 
+impl std::fmt::Debug for Me {
+    /// Neither the name nor the keys: a debug line never names this computer.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Me").finish_non_exhaustive()
+    }
+}
+
 /// The words and the alarm of one Tornect home.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Recognizer {
     known: Known,
     pacer: Pacer,
     /// Where the saved entries are read from; none: nothing is saved.
     paths: Option<Paths>,
     me: Option<Me>,
+}
+
+impl std::fmt::Debug for Recognizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recognizer").finish_non_exhaustive()
+    }
 }
 
 /// A computer the address book or the pin store names.
@@ -806,5 +819,123 @@ mod tests {
 
     fn hex_seed(seed: [u8; 3]) -> String {
         seed.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// R-3c and the default log: under the default filter (the log a user
+    /// gets without asking for more), over a first connection — the pairing
+    /// sheet with the alarm and the typed code, then the session sheet
+    /// answered View only — no line holds a saved name, a declared name, a
+    /// pinned label, an ID or its prefix, a fingerprint or any single device
+    /// word of the keys involved, and the log still says what happened.
+    #[tokio::test]
+    async fn the_default_log_names_nobody_over_a_first_connection() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = Capture(Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(
+                tornect_core::telemetry::DEFAULT_FILTER,
+            ))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .fmt_fields(tornect_core::telemetry::redacting_fields())
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone()),
+            );
+        // This test's thread only: the runtime is single-threaded.
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, words) = home(tmp.path());
+        let words = Arc::new(words);
+        let popups = popups();
+        let consent = Arc::new(consent(&popups, Arc::clone(&words)));
+        let identity = Arc::new(HostIdentity::from_seed(&[0x11; 32]));
+        let signer: Arc<HostIdentity> = Arc::clone(&identity);
+        let mut hdeps = HostDeps::headless(
+            signer,
+            Arc::new(TrustedDeviceStore::ephemeral(Default::default())),
+        );
+        hdeps.consent = consent;
+        let hcfg = HostConfig::new("Desk", [9; 32]);
+        let (client_end, host_end) = tokio::io::duplex(64 * 1024);
+        let host = tokio::spawn(async move { serve_host(host_end, &hcfg, &hdeps).await });
+        let answering = {
+            let popups = Arc::clone(&popups);
+            tokio::spawn(async move {
+                let popup = shown(&popups).await;
+                let PopupKind::Pairing { sas, .. } = popup.kind else {
+                    panic!("a pairing sheet first");
+                };
+                assert!(popups.answer_pairing_code(popup.id, &sas, Some("Front desk".to_owned())));
+                loop {
+                    let next = shown(&popups).await;
+                    if next.id != popup.id {
+                        assert!(matches!(next.kind, PopupKind::Session { .. }));
+                        return popups.answer_session(
+                            next.id,
+                            tornect_signal::pairing::SessionDecision::AllowOnceViewOnly,
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        };
+        let mut cdeps =
+            ClientDeps::headless(Arc::new(KnownHostStore::ephemeral(Default::default())));
+        cdeps.ui = Arc::new(ScriptedClientUi::new(true));
+        let asking = DeviceIdentity::from_seed(&[0x77; 32]);
+        let ccfg = ClientConfig::new(identity.id(), "Office PC");
+        let outcome = connect(client_end, &ccfg, &asking, &cdeps, Intent::Session).await;
+        assert!(answering.await.unwrap(), "both sheets were answered");
+        assert!(
+            matches!(outcome, Ok(ClientOutcome::Session(_))),
+            "{outcome:?}"
+        );
+        drop(outcome);
+        host.abort();
+
+        let text = String::from_utf8(
+            buffer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+        )
+        .unwrap();
+        for said in ["device paired", "host paired", "session accepted"] {
+            assert!(text.contains(said), "\"{said}\" not in the log:\n{text}");
+        }
+        let mut secrets: Vec<String> = ["Front desk", "Office PC", "Linux PC", "Desk"]
+            .map(str::to_owned)
+            .to_vec();
+        secrets.push(identity.id().short());
+        secrets.push(asking.id().fingerprint());
+        for key in [
+            derive(asking.id().public_key_bytes(), Role::Device),
+            derive(identity.id().public_key_bytes(), Role::Onion),
+        ] {
+            secrets.extend(key.words().get().map(str::to_owned));
+        }
+        for secret in secrets {
+            assert!(
+                !text.contains(&secret),
+                "\"{secret}\" in the default log:\n{text}"
+            );
+        }
     }
 }
