@@ -1016,6 +1016,20 @@ mod tests {
             window.click(connect),
             vec![Action::SubmitPrompt { pointer: true }]
         );
+        // egui keeps no undo copy of the password; the field's state goes
+        // with the prompt.
+        let field_id = egui::Id::new("unattended-password");
+        let state = egui::text_edit::TextEditState::load(&window.ctx, field_id)
+            .expect("the field's state while the prompt is open");
+        let undoer = state.undoer();
+        assert!(!undoer.is_in_flux(), "no copy in flux");
+        assert!(
+            format!("{undoer:?}").contains("undo count: 0"),
+            "{undoer:?}"
+        );
+        window.model.prompt = None;
+        window.pass(Vec::new());
+        assert!(egui::text_edit::TextEditState::load(&window.ctx, field_id).is_none());
         // A remembered password: Connect is live without typing, and still
         // answers the pointer only.
         model.prompt.as_mut().unwrap().remembered = true;
