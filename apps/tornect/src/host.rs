@@ -616,6 +616,30 @@ impl SessionSink for CliSessions {
             },
             self.control.kill_path(),
         ));
+        // §B.8.8: a secure Windows screen (a UAC prompt, Ctrl+Alt+Del, the
+        // lock screen) is out of the session's reach; said while it shows.
+        #[cfg(windows)]
+        if session.mode == SessionMode::Control {
+            let (live, id) = (Arc::clone(&self.live), session.session_id.to_owned());
+            tokio::spawn(async move {
+                crate::secure_screen::run(
+                    Arc::new(crate::secure_screen::WindowsDesktop),
+                    crate::secure_screen::EVERY,
+                    move || live.snapshot().iter().any(|s| s.session_id == id),
+                    |shown| {
+                        note(format_args!(
+                            "{}",
+                            if shown {
+                                crate::secure_screen::NOTICE
+                            } else {
+                                crate::secure_screen::NOTICE_GONE
+                            }
+                        ));
+                    },
+                )
+                .await;
+            });
+        }
     }
 
     fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
