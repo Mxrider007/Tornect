@@ -1,6 +1,6 @@
 //! OS session services for Tornect (`docs/PLAN.md` §B.8.8).
 //!
-//! Six modules so far:
+//! Seven modules so far:
 //!
 //! - [`ipc`] — the owner-only local endpoint of §B.8.7.4 (Unix socket / Windows
 //!   named pipe) that the CLI talks to and the host serves.
@@ -19,6 +19,9 @@
 //! - [`helper`] — Windows: the administrator helper's per-session pipe, its
 //!   launch through Windows' prompt, and the checks each end makes of the
 //!   other (§B.8.7.5; the decisions tested everywhere, the calls Windows-only).
+//! - [`helper_task`] — Windows: the on-demand administrator helper task of
+//!   unattended administrator sessions: its lifetime, registration, read-back
+//!   and ACL checks (§B.8.7.5).
 //!
 //! Everything else in §B.8.8 — presence, lock state, keep-awake, wake hooks,
 //! global hotkeys, capture-excluded windows and the other readiness probes —
@@ -38,6 +41,7 @@
 
 pub mod autostart;
 pub mod helper;
+pub mod helper_task;
 pub mod ipc;
 pub mod levels;
 pub mod polkit;
@@ -46,6 +50,8 @@ pub mod reauth;
 mod win;
 #[cfg(windows)]
 mod win_helper;
+#[cfg(windows)]
+mod win_task;
 
 /// Restrict this process's run-time DLL loads that name no folder to the
 /// Windows system directory (review finding E2-4), so none searches the

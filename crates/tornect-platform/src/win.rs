@@ -468,7 +468,7 @@ pub(crate) fn sid_of_account_name(name: &str) -> std::io::Result<String> {
 }
 
 /// `sid` as a string (`S-1-…`).
-fn sid_string(sid: *mut c_void) -> std::io::Result<String> {
+pub(crate) fn sid_string(sid: *mut c_void) -> std::io::Result<String> {
     let mut text: *mut u16 = null_mut();
     // SAFETY: the caller's `sid` is a valid SID alive for this call; on
     // success `text` is a NUL-terminated string allocated with `LocalAlloc`.
