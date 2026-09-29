@@ -233,11 +233,9 @@ impl SessionSink for GuiSessions {
         self.media.on_start(session);
         self.started.send_modify(|n| *n = n.wrapping_add(1));
         let control = session.mode == SessionMode::Control;
-        let admin = control
-            && self
-                .shared
-                .read(|m| m.admin_answers.clone())
-                .take(session.device.public_key_bytes());
+        // The level the host signed in the accept (H5): never inferred from
+        // the answer given on the sheet.
+        let admin = control && session.elevation == Elevation::Admin;
         let sharing = Sharing {
             session_id: session.session_id.to_owned(),
             label: session.label.to_owned(),
@@ -1560,6 +1558,52 @@ mod tests {
             .await
             .expect("the host's stream task ended")
             .unwrap();
+    }
+
+    /// The banner and the indicator say "as administrator" from the level
+    /// the host signed in the session's accept, as its start reports it, and
+    /// never from an answer given on a sheet (H5; M-UI-3 Security F-1).
+    #[tokio::test]
+    async fn the_banner_and_indicator_read_the_signed_level() {
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let media = Arc::new(MediaHost::new(
+            Arc::new(SystemBackend::new(Source::TestCard)),
+            Arc::new(GuiMedia {
+                shared: Arc::clone(&shared),
+            }),
+            MediaLimits::default(),
+        ));
+        let (started, _seen) = watch::channel(0u64);
+        let sessions = GuiSessions {
+            live: Arc::new(LiveSessions::new()),
+            polkit: Arc::new(PolkitRevocation::for_this_host()),
+            media,
+            shared: Arc::clone(&shared),
+            started,
+        };
+        let token = tornect_signal::consent::SessionToken::new([5; 32]);
+        for (id, elevation) in [("a1", Elevation::Admin), ("c1", Elevation::None)] {
+            sessions.on_start(&LiveSession {
+                device: DeviceIdentity::from_seed(&[9; 32]).id(),
+                label: "Laptop",
+                session_id: id,
+                token: &token,
+                th_final: [0; 32],
+                mode: SessionMode::Control,
+                elevation,
+                unattended: false,
+            });
+            assert_eq!(
+                shared.read(|m| m.admin_sessions.contains(id)),
+                elevation == Elevation::Admin,
+                "{id}"
+            );
+            sessions.on_end(id, None);
+            assert!(
+                !shared.read(|m| m.admin_sessions.contains(id)),
+                "{id} ended"
+            );
+        }
     }
 
     /// The history notice shows on the first run of a home only.

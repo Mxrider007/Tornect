@@ -32,6 +32,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Notify, Semaphore, mpsc, watch};
 use tornect_capture::{CaptureError, VideoSource};
 use tornect_codec::{EncoderSettings, H264Encoder};
+use tornect_core::levels::Elevation;
 use tornect_core::session_log::SessionMode;
 use tornect_input::{InputError, InputEvent, InputSink, Tracked};
 use tornect_proto::{
@@ -135,6 +136,20 @@ pub trait MediaBackend: Send + Sync {
     /// `None` when this host cannot inject there (the viewer's input is then
     /// dropped). A view-only session never calls this.
     fn open_injector(&self) -> Option<Box<dyn InputSink>>;
+
+    /// The injector for the control session `session_id` at the
+    /// administrator level `elevation` signed in its accept (r7, §B.2.1).
+    /// The default is [`Self::open_injector`]; the app's backend routes an
+    /// administrator session's input through its administrator helper
+    /// (§B.8.7.5).
+    fn open_session_injector(
+        &self,
+        session_id: &str,
+        elevation: Elevation,
+    ) -> Option<Box<dyn InputSink>> {
+        let _ = (session_id, elevation);
+        self.open_injector()
+    }
 
     /// The source just opened is for a view-only session: let go of anything
     /// kept for building its injector, so that no path can reach the desktop's
@@ -242,6 +257,8 @@ struct Registered {
     token: SessionToken,
     th_final: [u8; 32],
     mode: SessionMode,
+    /// The level signed in the accept.
+    elevation: Elevation,
     label: String,
     bound: bool,
     /// Set to the `Close` reason when the session ends.
@@ -251,6 +268,7 @@ struct Registered {
 /// A successful bind.
 struct Claimed {
     mode: SessionMode,
+    elevation: Elevation,
     label: String,
     end: watch::Receiver<Option<u16>>,
 }
@@ -427,6 +445,7 @@ impl MediaHost {
         session.bound = true;
         Lookup::Bound(Claimed {
             mode: session.mode,
+            elevation: session.elevation,
             label: session.label.clone(),
             end: session.end.subscribe(),
         })
@@ -446,6 +465,7 @@ impl MediaHost {
     {
         let Claimed {
             mode,
+            elevation,
             label,
             mut end,
         } = claimed;
@@ -529,7 +549,8 @@ impl MediaHost {
         // below, undecoded (SLICE-A2 A2-3).
         let injector = if matches!(mode, SessionMode::Control) {
             let backend = Arc::clone(&self.backend);
-            tokio::task::spawn_blocking(move || backend.open_injector())
+            let id = session_id.clone();
+            tokio::task::spawn_blocking(move || backend.open_session_injector(&id, elevation))
                 .await
                 .ok()
                 .flatten()
@@ -735,6 +756,7 @@ impl SessionSink for MediaHost {
                 token: session.token.clone(),
                 th_final: session.th_final,
                 mode: session.mode,
+                elevation: session.elevation,
                 label: session.label.to_owned(),
                 bound: false,
                 end,

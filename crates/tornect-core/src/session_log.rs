@@ -117,6 +117,14 @@ pub enum SessionEvent {
     HostNotReady,
     /// A session is about to end (`in_s`, `reason`).
     SessionEndingSoon,
+    /// The administrator helper of a session connected and passed its
+    /// checks (§B.8.7.5; r7, M-FEAT-3).
+    AdminHelperStarted,
+    /// The administrator helper of a session stopped (`reason`).
+    AdminHelperStopped,
+    /// The administrator helper could not be started or attached
+    /// (`reason`): the session got no administrator access.
+    AdminHelperFailed,
 }
 
 /// What the client may do.
@@ -264,6 +272,11 @@ pub struct SessionRecord {
     /// Session mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<SessionMode>,
+    /// The administrator level signed in `SESSION_ACCEPT` (r7, §B.8.13):
+    /// written only for an administrator session, so a line at none reads as
+    /// it did before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elevation: Option<crate::levels::Elevation>,
     /// Whether this was an unattended (popup-less) session.
     #[serde(default)]
     pub unattended: bool,
@@ -350,6 +363,7 @@ impl SessionRecord {
             peer_device: None,
             peer_name: None,
             mode: None,
+            elevation: None,
             unattended: false,
             transport: None,
             detail: None,
@@ -397,6 +411,14 @@ impl SessionRecord {
     #[must_use]
     pub fn mode(mut self, mode: SessionMode) -> Self {
         self.mode = Some(mode);
+        self
+    }
+
+    /// Attach the administrator level: written only when it is
+    /// [`Elevation::Admin`](crate::levels::Elevation::Admin).
+    #[must_use]
+    pub fn elevation(mut self, elevation: crate::levels::Elevation) -> Self {
+        self.elevation = (elevation != crate::levels::Elevation::None).then_some(elevation);
         self
     }
 
@@ -1295,6 +1317,38 @@ mod tests {
         assert!(all[1].unattended);
         assert!(all[0].ts.ends_with('Z'));
         assert_eq!(r2.transport, Some(TransportKind::Direct));
+    }
+
+    /// §B.8.13 (r7): a `session_started` line carries `elevation` only for an
+    /// administrator session, so a line at none is the line it always was;
+    /// the helper's three events have their names (M-UI-3 Security F-16).
+    #[test]
+    fn the_level_and_the_helper_events_reach_the_log() {
+        use crate::levels::Elevation;
+        let dev = DeviceId::from_bytes([1u8; 32]);
+        let started = |e| {
+            SessionRecord::at(1_700_000_000, SessionEvent::SessionStarted)
+                .peer(dev, "Laptop")
+                .session("abcd")
+                .mode(SessionMode::Control)
+                .elevation(e)
+        };
+        let admin = serde_json::to_string(&started(Elevation::Admin)).unwrap();
+        assert!(admin.contains(r#""elevation":"admin""#), "{admin}");
+        let none = serde_json::to_string(&started(Elevation::None)).unwrap();
+        assert!(!none.contains("elevation"), "{none}");
+        let back: SessionRecord = serde_json::from_str(&admin).unwrap();
+        assert_eq!(back.elevation, Some(Elevation::Admin));
+        let old: SessionRecord = serde_json::from_str(&none).unwrap();
+        assert_eq!(old.elevation, None);
+        for (event, name) in [
+            (SessionEvent::AdminHelperStarted, "admin_helper_started"),
+            (SessionEvent::AdminHelperStopped, "admin_helper_stopped"),
+            (SessionEvent::AdminHelperFailed, "admin_helper_failed"),
+        ] {
+            let line = serde_json::to_string(&SessionRecord::at(0, event).reason("late")).unwrap();
+            assert!(line.contains(&format!(r#""event":"{name}""#)), "{line}");
+        }
     }
 
     #[test]

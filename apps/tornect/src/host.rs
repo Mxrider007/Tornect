@@ -601,9 +601,14 @@ impl SessionSink for CliSessions {
         self.media.on_start(session);
         say(format_args!("SESSION LIVE {}", session.session_id));
         note(format_args!(
-            "session with \"{}\" is live ({}{}); {} ends it",
+            "session with \"{}\" is live ({}{}{}); {} ends it",
             session.label,
             mode_name(session.mode),
+            if session.elevation == tornect_core::levels::Elevation::Admin {
+                " as administrator"
+            } else {
+                ""
+            },
             if session.unattended {
                 ", unattended"
             } else {
@@ -1473,6 +1478,7 @@ mod tests {
             token: &token,
             th_final: [0; 32],
             mode,
+            elevation: tornect_core::levels::Elevation::None,
             unattended: false,
         };
         revocation.on_start(&session("v1", SessionMode::ViewOnly));
@@ -1601,6 +1607,7 @@ mod tests {
             token: &token,
             th_final: [0; 32],
             mode: SessionMode::Control,
+            elevation: tornect_core::levels::Elevation::None,
             unattended: false,
         });
         for _ in 0..100 {
