@@ -23,6 +23,10 @@ use tornect_core::{DeviceId, Paths, TornectId};
 
 use super::model::{MyWords, Recognition};
 
+/// How recently a device must have been paired for its session sheet to
+/// say the scam line beside the administrator answer: "moments before".
+pub const RECENTLY_PAIRED: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// This computer: the name it declares and its two keys.
 #[derive(Clone)]
 pub struct Me {
@@ -172,6 +176,20 @@ impl Recognizer {
             unchecked: looks_like.is_none() && !complete,
             looks_like,
         }
+    }
+
+    /// Whether `device` was paired here less than [`RECENTLY_PAIRED`] ago:
+    /// its session sheet then says the scam line beside the administrator
+    /// answer (§B.2.1, T10). `false` when the file cannot be read.
+    #[must_use]
+    pub fn paired_recently(&self, device: &DeviceId, now: u64) -> bool {
+        let Some(paths) = &self.paths else {
+            return false;
+        };
+        TrustedDevices::load(&paths.trusted_devices_file())
+            .ok()
+            .and_then(|devices| devices.get(device).map(|d| d.paired_at))
+            .is_some_and(|at| now.saturating_sub(at) < RECENTLY_PAIRED.as_secs())
     }
 
     /// What a session sheet shows about a paired device: its identicon,
@@ -937,5 +955,17 @@ mod tests {
                 "\"{secret}\" in the default log:\n{text}"
             );
         }
+    }
+
+    /// A device paired less than ten minutes ago counts as paired moments
+    /// before; later, or a device not paired here, does not.
+    #[test]
+    fn paired_moments_before_is_ten_minutes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, words) = home(tmp.path());
+        // "Office PC" was pinned at unix second 1000.
+        assert!(words.paired_recently(&device(0x41), 1000 + 60));
+        assert!(!words.paired_recently(&device(0x41), 1000 + 10 * 60));
+        assert!(!words.paired_recently(&device(0x77), 1000 + 60));
     }
 }

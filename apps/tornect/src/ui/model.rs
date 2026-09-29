@@ -194,6 +194,9 @@ pub struct Model {
     /// administrator helper in this build): each says so and keeps its other
     /// answers open (§B.2.1).
     pub admin_not_given: HashSet<u64>,
+    /// The session sheets of a device paired moments before: beside the
+    /// administrator answer they say the scam line (§B.2.1, T10).
+    pub paired_recently: HashSet<u64>,
     /// When the person here last allowed a session: from that click on, the
     /// screen counts as shared, before the session is live and before any
     /// picture can leave, until [`Model::ACCEPTED_HIDES_FOR`] has passed

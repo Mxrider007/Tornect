@@ -423,6 +423,7 @@ fn request_sheet(
                         levels: model.levels.get(&popup.id),
                         confirming: model.admin_confirm.contains(&popup.id),
                         admin_not_given: model.admin_not_given.contains(&popup.id),
+                        paired_recently: model.paired_recently.contains(&popup.id),
                     };
                     let card = question(ui, |ui| host_popup(ui, popup, sheet, form, now, actions));
                     newest = Some((popup.id, card));
@@ -536,6 +537,20 @@ fn answer_line(ui: &mut egui::Ui, answer: &str, line: &str) {
             );
         });
     });
+}
+
+/// The scam line beside the administrator answer of a device paired
+/// moments before (§B.2.1, the wizard's T10 step).
+pub const SCAM_LINE: &str = "This device was paired only minutes ago. Did someone call and ask \
+    you to allow this? Hang up, and deny.";
+
+fn scam_line(ui: &mut egui::Ui) {
+    let t = theme::tokens(ui.ctx());
+    ui.add(
+        egui::Label::new(RichText::new(SCAM_LINE).strong().color(t.danger_text))
+            .wrap()
+            .selectable(false),
+    );
 }
 
 /// A name a device declared, as a sheet quotes it: without quotation marks
@@ -777,6 +792,8 @@ struct Sheet<'a> {
     confirming: bool,
     /// Its "Allow as administrator…" ended without administrator access.
     admin_not_given: bool,
+    /// The device was paired moments before: the scam line (T10).
+    paired_recently: bool,
 }
 
 /// The arming card of session sheet `id`'s administrator confirmation: its
@@ -1002,6 +1019,9 @@ fn host_popup(
             });
             if sheet.confirming && confirmable {
                 admin_confirmation(ui, popup.id, label, form, now, actions, left);
+                if sheet.paired_recently {
+                    scam_line(ui);
+                }
                 return;
             }
             // A session request comes from a pinned key (all 32 bytes
@@ -1111,6 +1131,9 @@ fn host_popup(
                     }
                 });
                 answer_line(ui, text, line);
+                if sheet.paired_recently {
+                    scam_line(ui);
+                }
             }
             if let Some(levels) = sheet.levels {
                 // The sentence under the buttons: why a level is absent, or
@@ -2547,6 +2570,36 @@ mod tests {
                 "{line}"
             );
             assert_eq!(line.contains("as administrator"), admin, "{line}");
+        }
+    }
+
+    /// §B.2.1 (T10): for a device paired moments before, the administrator
+    /// answer and its confirmation carry the scam line; otherwise, and on a
+    /// sheet without the administrator answer, it is not there.
+    #[test]
+    fn a_device_paired_moments_before_gets_the_scam_line() {
+        for (recent, admin) in [(true, true), (false, true), (true, false)] {
+            let t0 = Instant::now();
+            let mut model = with_popups(vec![session_popup(7, t0)]);
+            model.levels.insert(
+                7,
+                if admin {
+                    always_admin()
+                } else {
+                    SheetLevels::of(&tornect_core::levels::Availability::LINUX)
+                },
+            );
+            if recent {
+                model.paired_recently.insert(7);
+            }
+            let mut window = Harness::new(model, t0);
+            let said = |w: &Harness| w.nodes.iter().any(|n| n.value() == Some(SCAM_LINE));
+            assert_eq!(said(&window), recent && admin, "{recent} {admin}");
+            if admin {
+                window.model.admin_confirm.insert(7);
+                window.pass(t0 + Duration::from_secs(2), Vec::new());
+                assert_eq!(said(&window), recent, "the confirmation too");
+            }
         }
     }
 }
