@@ -954,7 +954,7 @@ fn host_popup(
                 ui.add(
                     egui::Label::new(
                         RichText::new(format!(
-                            "This name cannot be saved: {why}. Type another name to pair."
+                            "This name cannot be saved: {why}. Type another name."
                         ))
                         .small()
                         .color(t.danger_text),
@@ -2760,7 +2760,7 @@ mod tests {
         assert!(
             window
                 .text("This name cannot be saved")
-                .contains("it reads like device words")
+                .contains("three of its words are device words. Type another name.")
         );
         assert!(window.disabled("The codes match: pair"));
         let pair = window.button("The codes match: pair");
