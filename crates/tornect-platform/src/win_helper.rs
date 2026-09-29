@@ -236,14 +236,7 @@ impl Drop for Descriptor {
 /// creation); remote clients refused.
 pub(crate) fn create_server(name: &str, administrators: bool) -> std::io::Result<Pipe> {
     let user = crate::win::current_user_sid()?;
-    // Protected DACL (no inherited entries): full access for the user, and
-    // for Administrators on the standard-account path; nobody else.
-    let sddl = if administrators {
-        format!("D:P(A;;GA;;;{user})(A;;GA;;;BA)")
-    } else {
-        format!("D:P(A;;GA;;;{user})")
-    };
-    let sd = Descriptor::from_sddl(&sddl)?;
+    let sd = Descriptor::from_sddl(&crate::helper::pipe_sddl(&user, administrators))?;
     let sa = SECURITY_ATTRIBUTES {
         nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
         lpSecurityDescriptor: sd.0,

@@ -35,6 +35,20 @@ pub fn pipe_name(random: &[u8; 16]) -> String {
     name
 }
 
+/// The pipe's security descriptor (H4): a protected DACL — no inherited
+/// entry — giving full access to the user `user_sid` and, on the
+/// standard-account path (the helper then runs as the administrator whose
+/// password was typed), to Administrators; nobody else, and never the
+/// default descriptor.
+#[must_use]
+pub fn pipe_sddl(user_sid: &str, administrators: bool) -> String {
+    if administrators {
+        format!("D:P(A;;GA;;;{user_sid})(A;;GA;;;BA)")
+    } else {
+        format!("D:P(A;;GA;;;{user_sid})")
+    }
+}
+
 /// A fresh, unguessable pipe name (H4).
 pub fn new_pipe_name() -> std::io::Result<String> {
     let mut random = [0u8; 16];
@@ -466,6 +480,25 @@ mod tests {
             format!("{PIPE_PREFIX}{}g", "ab".repeat(15)),
         ] {
             assert!(!valid_pipe_name(&bad), "{bad}");
+        }
+    }
+
+    /// H4: the pipe's DACL names this user, plus Administrators only on the
+    /// standard-account path; protected, so nothing is inherited.
+    #[test]
+    fn the_pipe_admits_this_user_and_on_a_standard_account_administrators() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        assert_eq!(pipe_sddl(sid, false), format!("D:P(A;;GA;;;{sid})"));
+        assert_eq!(
+            pipe_sddl(sid, true),
+            format!("D:P(A;;GA;;;{sid})(A;;GA;;;BA)")
+        );
+        for sddl in [pipe_sddl(sid, false), pipe_sddl(sid, true)] {
+            assert!(sddl.starts_with("D:P"), "protected");
+            assert!(
+                !sddl.contains(";WD)") && !sddl.contains(";AN)"),
+                "no Everyone, no anonymous"
+            );
         }
     }
 

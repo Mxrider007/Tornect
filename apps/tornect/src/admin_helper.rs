@@ -428,6 +428,18 @@ mod windows {
         let administrators = !is_administrator().map_err(|_| NotGiven::Unavailable)?;
         let pipe = Arc::new(create_pipe(&name, administrators).map_err(|_| NotGiven::NoPipe)?);
         let exe = own_image().map_err(|_| NotGiven::Unavailable)?;
+        // What Windows' prompt will run as administrator must be a file only
+        // administrators can change (the rule of the helper task, H6, kept
+        // for the attended path too).
+        {
+            use tornect_platform::helper_task;
+            let install = helper_task::this_install().map_err(|_| NotGiven::Unavailable)?;
+            let tasks = helper_task::for_this_user().map_err(|_| NotGiven::Unavailable)?;
+            helper_task::check_files(&tasks, &install).map_err(|e| {
+                tracing::warn!(error = %e, "the administrator helper's files");
+                NotGiven::Refused
+            })?;
+        }
         let args = HelperArgs {
             pipe: name,
             host_pid: own_pid(),
