@@ -233,6 +233,11 @@ impl SessionSink for GuiSessions {
         self.media.on_start(session);
         self.started.send_modify(|n| *n = n.wrapping_add(1));
         let control = session.mode == SessionMode::Control;
+        let admin = control
+            && self
+                .shared
+                .read(|m| m.admin_answers.clone())
+                .take(session.device.public_key_bytes());
         let sharing = Sharing {
             session_id: session.session_id.to_owned(),
             label: session.label.to_owned(),
@@ -247,6 +252,9 @@ impl SessionSink for GuiSessions {
                 session.label,
                 if control { "control" } else { "view only" }
             ));
+            if admin {
+                m.admin_sessions.insert(session.session_id.to_owned());
+            }
             m.sharing.push(sharing);
         });
         self.shared.wake(Wake::Attention);
@@ -261,6 +269,7 @@ impl SessionSink for GuiSessions {
         let why = end.map_or_else(|| "protocol error".to_owned(), describe_end);
         self.shared.update(|m| {
             m.sharing.retain(|s| s.session_id != session_id);
+            m.admin_sessions.remove(session_id);
             if m.sharing.is_empty() {
                 m.polkit_warning = None;
             }

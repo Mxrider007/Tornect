@@ -450,6 +450,9 @@ impl GuiConsent {
                 label: peer.label.clone(),
                 fingerprint: peer.device.fingerprint(),
             };
+            let device = *peer.device.public_key_bytes();
+            let admin = self.popups.shared().read(|m| m.admin_answers.clone());
+            admin.note(device, false);
             let _on_screen = self.popups.open(Answer::Session(tx), |id, m| {
                 if let Some(seen) = seen {
                     m.recognition.insert(id, seen);
@@ -459,11 +462,13 @@ impl GuiConsent {
                 }
                 m.popups.push(Popup { id, kind, deadline });
             });
-            tokio::select! {
+            let answer = tokio::select! {
                 biased;
                 () = withdrawn => SessionDecision::Deny,
                 answer = rx => answer.unwrap_or(SessionDecision::Deny),
-            }
+            };
+            admin.note(device, answer == SessionDecision::AllowOnceAdmin);
+            answer
         })
     }
 }
@@ -1043,6 +1048,35 @@ mod tests {
                 "{decision:?}"
             );
             assert_eq!(asking.await, decision);
+        }
+    }
+
+    /// An "Allow as administrator" answer is noted for the session it
+    /// starts, once; any other answer, a newer sheet and a stale note are not.
+    #[tokio::test]
+    async fn an_administrator_answer_is_noted_for_its_session() {
+        for (decision, noted) in [
+            (SessionDecision::AllowOnceAdmin, true),
+            (SessionDecision::AllowOnce, false),
+            (SessionDecision::Deny, false),
+        ] {
+            let popups = popups();
+            let kill = KillSwitch::new();
+            let (_started_tx, started) = watch::channel(0);
+            let consent = GuiConsent::new(Arc::clone(&popups), withdraw(&kill, started));
+            let (peer, summary) = (peer(), summary());
+            let asking = consent.session(&peer, &summary);
+            tokio::pin!(asking);
+            let open = tokio::select! {
+                _ = &mut asking => panic!("answered before anyone clicked"),
+                open = shown(&popups, 1) => open,
+            };
+            assert!(popups.answer_session(open[0].id, decision));
+            assert_eq!(asking.await, decision);
+            let device = *peer.device.public_key_bytes();
+            let admin = popups.shared().read(|m| m.admin_answers.clone());
+            assert_eq!(admin.take(&device), noted, "{decision:?}");
+            assert!(!admin.take(&device), "used up");
         }
     }
 }

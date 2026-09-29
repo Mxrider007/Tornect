@@ -2,7 +2,7 @@
 //! the user asks for comes back as [`Action`]s; nothing here touches the
 //! network, a store or a channel.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
@@ -277,7 +277,8 @@ pub fn main_window(
             )
             .show(ui, |ui| {
                 for sharing in &model.sharing {
-                    sharing_banner(ui, sharing, now, actions);
+                    let admin = model.admin_sessions.contains(&sharing.session_id);
+                    sharing_banner(ui, sharing, admin, now, actions);
                 }
                 if let Some(warning) = &model.polkit_warning {
                     ui.add(
@@ -560,7 +561,13 @@ fn question(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Rect {
 /// what the viewer may do before it names the viewer and is cut to the room
 /// left, so that no label can push Stop out of the window or pass for the
 /// mode (SLICE-E E1-2).
-fn sharing_banner(ui: &mut egui::Ui, sharing: &Sharing, now: Instant, actions: &mut Vec<Action>) {
+fn sharing_banner(
+    ui: &mut egui::Ui,
+    sharing: &Sharing,
+    admin: bool,
+    now: Instant,
+    actions: &mut Vec<Action>,
+) {
     let t = theme::tokens(ui.ctx());
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -572,10 +579,12 @@ fn sharing_banner(ui: &mut egui::Ui, sharing: &Sharing, now: Instant, actions: &
                     .monospace()
                     .color(t.on_sharing),
             );
-            let mode = if sharing.control {
-                "sees and controls this screen"
-            } else {
-                "sees this screen (view only)"
+            // The level the host signed: administrator only from an
+            // "Allow as administrator" answer (§B.2.1).
+            let mode = match (sharing.control, admin) {
+                (true, true) => "sees and controls this screen as administrator",
+                (true, false) => "sees and controls this screen",
+                (false, _) => "sees this screen (view only)",
             };
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.add(
@@ -647,7 +656,7 @@ fn input_effect(control: bool, injected: bool) -> &'static str {
 /// `indicator_pill`).
 #[cfg(test)]
 pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: &mut Vec<Action>) {
-    indicator_pill(ui, sharing, now, actions, false);
+    indicator_pill(ui, sharing, &HashSet::new(), now, actions, false);
 }
 
 /// The indicator window (§6.3, `indicator`): for every session this screen
@@ -660,6 +669,7 @@ pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: 
 pub fn indicator_pill(
     ui: &mut egui::Ui,
     sharing: &[Sharing],
+    admin: &HashSet<String>,
     now: Instant,
     actions: &mut Vec<Action>,
     rounded: bool,
@@ -722,6 +732,13 @@ pub fn indicator_pill(
                                 .map_or("starting: no picture has gone out yet", |c| {
                                     input_effect(s.control, c.input)
                                 });
+                            // The level the host signed, first on the second
+                            // line: it cannot push the mode off the first.
+                            let detail = if s.control && admin.contains(&s.session_id) {
+                                format!("as administrator · {detail}")
+                            } else {
+                                detail.to_owned()
+                            };
                             ui.add(
                                 egui::Label::new(RichText::new(detail).small().color(t.on_sharing))
                                     .truncate(),
@@ -2491,5 +2508,35 @@ mod tests {
             ),
             "{paired:?}"
         );
+    }
+
+    /// The banner says the level the host signed: "as administrator" only for
+    /// a session that an administrator answer started.
+    #[test]
+    fn the_banner_says_an_administrator_session() {
+        for admin in [false, true] {
+            let t0 = Instant::now();
+            let mut model = Model {
+                sharing: vec![Sharing {
+                    session_id: "0011".to_owned(),
+                    label: "Laptop".to_owned(),
+                    control: true,
+                    unattended: false,
+                    since: t0,
+                    capture: None,
+                }],
+                ..with_popups(Vec::new())
+            };
+            if admin {
+                model.admin_sessions.insert("0011".to_owned());
+            }
+            let window = Harness::new(model, t0);
+            let line = window.text("SHARING");
+            assert!(
+                line.starts_with("SHARING · sees and controls this screen"),
+                "{line}"
+            );
+            assert_eq!(line.contains("as administrator"), admin, "{line}");
+        }
     }
 }
