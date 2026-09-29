@@ -487,10 +487,11 @@ impl AddressBook {
                 ),
             ));
         }
-        for (id, entry) in &book.hosts {
+        // Which entry is not said: an ID prefix would reach the log.
+        for entry in book.hosts.values() {
             entry
                 .check()
-                .map_err(|why| invalid(path, &format!("{}: {why}", id.short())))?;
+                .map_err(|why| invalid(path, &format!("an entry: {why}")))?;
         }
         Ok(book)
     }
