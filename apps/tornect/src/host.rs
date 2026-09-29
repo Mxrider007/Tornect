@@ -1118,6 +1118,140 @@ mod tests {
         *on.stop_code
     }
 
+    /// §B.8.9.1: an unattended connect with "Remember on this device" keeps the
+    /// password in the keychain only (here a test keychain, under the derived
+    /// name): no file under the home holds it, nor the entry's name; hosts.toml
+    /// has the pin and the flag, and the client's log line names the pinned host.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_password_remembered_after_an_unattended_connect_is_in_no_file() {
+        use tornect_core::unattended::credentials::{Attempt, MemoryVault, SavedPasswords};
+        use tornect_signal::fsm::client::ServerKeyPin as _;
+
+        const PASSWORD: &str = "quiet verdant otter lantern zephyr";
+        let env = env();
+        let host_device_pk = HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32]));
+        let (identity, ccfg, mut cdeps) = client(&env);
+        let device = identity.id();
+        TrustedDeviceStore::open(env.paths.trusted_devices_file())
+            .unwrap()
+            .pin(device, "Laptop")
+            .unwrap();
+        cdeps
+            .known_hosts
+            .pin(env.identity.id(), "Desk", host_device_pk)
+            .unwrap();
+        grant_unattended(&env, &device, PASSWORD);
+        let pin = Arc::new(crate::ua_client::HostsPin::new(&env.paths));
+        cdeps.server_key_pin = pin.clone();
+        let wiring = wire(
+            &env.paths,
+            &Config::default(),
+            Arc::clone(&env.identity),
+            host_device_pk,
+            Arc::new(ScriptedConsent::new()),
+            media(),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        let vault = Arc::new(MemoryVault::new());
+        let saved = SavedPasswords::new(Some(vault.clone()), *device.public_key_bytes());
+        let request = crate::ua_client::Request {
+            password: zeroize::Zeroizing::new(PASSWORD.to_owned()),
+            view_only: false,
+            administrator: false,
+            remember: true,
+        };
+        let (client_end, host_end) = duplex(64 * 1024);
+        let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+        let host_task =
+            tokio::spawn(async move { serve_signaling(host_end, &cfg, &deps, |_| {}).await });
+        let session = match connect(client_end, &ccfg, &identity, &cdeps, request.intent()).await {
+            Ok(ClientOutcome::Session(session)) => session,
+            other => panic!("the window host refused its grant: {other:?}"),
+        };
+        let host = env.identity.id();
+        let remembered = crate::ua_client::settle(
+            &env.paths,
+            &saved,
+            &host,
+            Attempt::Accepted {
+                administrator: false,
+            },
+            &request,
+        )
+        .unwrap();
+        assert!(remembered);
+        let known = cdeps.known_hosts.get(&host).unwrap();
+        crate::ua_client::log_attempt(
+            &env.paths,
+            &known,
+            &crate::ua_client::Logged::Session {
+                id: &session.session_token().session_id(),
+                control: true,
+                administrator: false,
+            },
+        );
+        drop(session);
+        assert_eq!(host_task.await.unwrap(), Served::Session);
+
+        let record = crate::ua_client::record(&env.paths, &host);
+        assert!(record.remember && record.ua_worked_before && !record.stale);
+        let pinned = record.server_s_pk_pin.expect("pinned at the accept");
+        assert_eq!(
+            pin.check(&host, &pinned),
+            tornect_core::unattended::hosts::PinCheck::Match
+        );
+        let entry = saved.entry(&host);
+        assert_eq!(vault.names(), vec![entry.as_str().to_owned()]);
+        assert_eq!(
+            crate::ua_client::recall(&env.paths, &saved, &host)
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some(PASSWORD)
+        );
+        // Nothing under the home holds the password (UTF-8 or UTF-16) or the
+        // entry's name.
+        let utf16: Vec<u8> = PASSWORD.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let needles = [
+            PASSWORD.as_bytes().to_vec(),
+            utf16,
+            entry.as_str().as_bytes().to_vec(),
+        ];
+        let mut files = 0;
+        let mut dirs = vec![env._tmp.path().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for item in std::fs::read_dir(&dir).unwrap() {
+                let path = item.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                let bytes = std::fs::read(&path).unwrap();
+                files += 1;
+                for needle in &needles {
+                    assert!(
+                        !bytes.windows(needle.len()).any(|w| w == needle.as_slice()),
+                        "{} holds a secret",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert!(
+            files >= 4,
+            "hosts.toml, the pins, the log and the store were read"
+        );
+        let log = std::fs::read_to_string(env.paths.sessions_log()).unwrap();
+        let line = log
+            .lines()
+            .find(|l| l.contains(r#""event":"unattended_connect""#))
+            .expect("the client's line");
+        assert!(line.contains(r#""peer_name":"Desk""#), "{line}");
+        assert!(line.contains(r#""reason":"accepted""#), "{line}");
+        assert!(!line.contains(&host.onion_address()), "{line}");
+    }
+
     /// Slice-F F2-1 (§B.6, decision M1-48 (8)): an unattended request to a host
     /// with no terminal is refused `NOT_GRANTED`, while the window host's
     /// wiring serves the same grant. The stop code, deny-direction, still

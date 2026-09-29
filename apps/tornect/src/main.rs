@@ -29,6 +29,7 @@ mod host;
 mod prompt;
 mod secure_screen;
 mod tor_cmd;
+mod ua_client;
 mod ui;
 mod unattended;
 
@@ -223,7 +224,75 @@ enum Command {
         /// Keep only the signaling session: open no media stream.
         #[arg(long)]
         no_video: bool,
+        /// Connect without asking: this device's unattended access at the host
+        /// (a paired host whose owner gave it). The password is asked on this
+        /// terminal, never taken from the command line or the environment; one
+        /// attempt per run, never repeated. A password remembered with
+        /// --remember is used without asking.
+        #[arg(long, conflicts_with_all = ["pair_only", "forget"])]
+        unattended: bool,
+        /// With --unattended: view only this time.
+        #[arg(long, requires = "unattended")]
+        view_only: bool,
+        /// With --unattended: keep the password in this computer's keychain once
+        /// it worked. Any program running as you can read it there. Refused
+        /// without a usable keychain, and for administrator access.
+        #[arg(long, requires = "unattended")]
+        remember: bool,
+        /// With --unattended: ask for administrator access. The host gives it
+        /// only if this device's grant carries it; otherwise the session goes
+        /// on without it.
+        #[arg(long, requires = "unattended")]
+        administrator: bool,
+        /// Never accepted: a password on the command line is refused, with the
+        /// reason.
+        #[arg(long, hide = true, value_name = "PASSWORD", num_args = 0..=1)]
+        password: Option<Option<String>>,
     },
+    /// Send one admin command to a paired host on this device's unattended
+    /// access there (its password asked on this terminal; one attempt, after a
+    /// confirmation): revoke this device there, end this device's session
+    /// there, turn unattended access off there, or unlock another of your
+    /// devices there. The last two work only from a "My machines" access with
+    /// control; the host decides and answers.
+    Admin {
+        /// The host's Tornect ID (56-character onion address, with or without `.onion`).
+        onion: String,
+        /// What to do.
+        #[arg(value_enum)]
+        action: AdminArg,
+        /// With `unlock`: the device ID of the device to unlock.
+        #[arg(long, value_name = "DEVICE_ID", required_if_eq("action", "unlock"))]
+        device: Option<String>,
+        /// Never accepted: a password on the command line is refused, with the
+        /// reason.
+        #[arg(long, hide = true, value_name = "PASSWORD", num_args = 0..=1)]
+        password: Option<Option<String>>,
+    },
+}
+
+/// `tornect admin <id> <action>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum AdminArg {
+    /// Revoke this device's unattended access at the host.
+    RevokeThisDevice,
+    /// End this device's live session at the host.
+    EndSession,
+    /// Turn unattended access off at the host.
+    TurnUnattendedOff,
+    /// Reset the wrong-password lock of another of your devices at the host.
+    Unlock,
+}
+
+impl From<AdminArg> for ua_client::AdminAction {
+    fn from(arg: AdminArg) -> Self {
+        match arg {
+            AdminArg::RevokeThisDevice => Self::RevokeThisDevice,
+            AdminArg::EndSession => Self::EndSession,
+            AdminArg::TurnUnattendedOff => Self::TurnOff,
+            AdminArg::Unlock => Self::Unlock,
+        }
+    }
 }
 
 /// `tornect gui --preview --page`.
@@ -483,17 +552,45 @@ fn main() -> anyhow::Result<()> {
             forget,
             pings,
             no_video,
-        } => tor_cmd::connect(
-            &paths,
-            &onion,
-            tor_cmd::ConnectOpts {
-                pair_only,
-                forget,
-                pings,
-                video: !no_video,
-            },
-            cli.bridges,
-        ),
+            unattended,
+            view_only,
+            remember,
+            administrator,
+            password,
+        } => {
+            ua_client::refuse_password_sources(password.is_some(), std::env::vars_os())?;
+            tor_cmd::connect(
+                &paths,
+                &onion,
+                tor_cmd::ConnectOpts {
+                    pair_only,
+                    forget,
+                    pings,
+                    video: !no_video,
+                    unattended: unattended.then_some(tor_cmd::UnattendedOpts {
+                        view_only,
+                        remember,
+                        administrator,
+                    }),
+                },
+                cli.bridges,
+            )
+        }
+        Command::Admin {
+            onion,
+            action,
+            device,
+            password,
+        } => {
+            ua_client::refuse_password_sources(password.is_some(), std::env::vars_os())?;
+            tor_cmd::admin(
+                &paths,
+                &onion,
+                action.into(),
+                device.as_deref(),
+                cli.bridges,
+            )
+        }
         Command::Unattended { action } => unattended::unattended(&paths, action),
         Command::Devices { json } => unattended::devices(&paths, json),
         Command::Panic => unattended::panic_now(&paths),
@@ -604,6 +701,19 @@ fn cmd_rotate_id(paths: &Paths, yes: bool) -> anyhow::Result<()> {
         }
     }
     let host = keystore::rotate_host_identity(&store)?;
+    // The unattended passwords this computer remembers go with the old ID
+    // (§B.8.9.1): a new start keeps none of them.
+    if store.contains(keystore::DEVICE_IDENTITY_SEED)? {
+        let (device, _) = load_or_create_device_identity(&store)?;
+        let saved = ua_client::system_passwords(&device);
+        match ua_client::forget_all(paths, &saved) {
+            Ok(0) => {}
+            Ok(n) => eprintln!("deleted {n} remembered unattended password(s) from the keychain"),
+            Err(e) => {
+                eprintln!("the remembered unattended passwords could not all be deleted: {e:#}")
+            }
+        }
+    }
     let log = tornect_core::session_log::SessionLog::new(paths.sessions_log());
     log.append(&tornect_core::session_log::SessionRecord::now(
         tornect_core::session_log::SessionEvent::HostIdRotated,
@@ -725,7 +835,58 @@ fn cmd_doctor(paths: &Paths) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory as _;
+    use clap::{CommandFactory as _, Parser as _};
+
+    const ID: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwd";
+
+    /// `tornect connect --unattended`: its options need it, it never pairs,
+    /// and a `--password` is parsed only to be refused with the reason.
+    #[test]
+    fn the_unattended_connect_takes_no_password_on_the_command_line() {
+        let parse = |args: &[&str]| {
+            super::Cli::try_parse_from(["tornect", "connect", ID].iter().chain(args))
+        };
+        assert!(parse(&["--unattended", "--view-only", "--remember"]).is_ok());
+        assert!(
+            parse(&["--view-only"]).is_err(),
+            "--view-only needs --unattended"
+        );
+        assert!(parse(&["--remember"]).is_err());
+        assert!(parse(&["--administrator"]).is_err());
+        assert!(parse(&["--unattended", "--pair-only"]).is_err());
+        assert!(parse(&["--unattended", "--forget"]).is_err());
+        for args in [
+            &["--unattended", "--password", "hunter2"][..],
+            &["--unattended", "--password=hunter2"],
+            &["--unattended", "--password"],
+        ] {
+            let cli = parse(args).expect("parsed, to be refused");
+            let Some(super::Command::Connect { password, .. }) = cli.command else {
+                panic!("not connect");
+            };
+            let err =
+                super::ua_client::refuse_password_sources(password.is_some(), std::iter::empty())
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                err.contains("never takes a password on the command line"),
+                "{err}"
+            );
+            assert!(!err.contains("hunter2"));
+        }
+        let help = super::Cli::command()
+            .find_subcommand_mut("connect")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("--password"), "the refused option is hidden");
+        assert!(help.contains("--unattended"));
+        let admin =
+            |args: &[&str]| super::Cli::try_parse_from(["tornect", "admin", ID].iter().chain(args));
+        assert!(admin(&["revoke-this-device"]).is_ok());
+        assert!(admin(&["unlock"]).is_err(), "unlock names the device");
+        assert!(admin(&["end-session", "--password", "x"]).is_ok());
+    }
 
     /// U3-L3: `--help` says that no log filter writes identifiers, and
     /// which option does.
