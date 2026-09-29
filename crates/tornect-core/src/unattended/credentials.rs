@@ -493,14 +493,13 @@ mod keychain {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     mod tests {
         use super::*;
 
         /// The entry a keyutils vault builds carries the opaque name as its whole
         /// description; nothing else of the host reaches the keychain. Needs a kernel
         /// keyring: run with `--ignored`.
-        #[cfg(target_os = "linux")]
         #[test]
         #[ignore = "needs a Linux kernel keyring available to the test user"]
         fn a_keyutils_vault_keeps_a_password_under_the_opaque_name_only() {
