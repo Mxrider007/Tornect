@@ -13,7 +13,8 @@ name = "tornect"
 path = "src/main.rs"
 
 [dependencies]
-tornect-core.workspace = true
+# `keyring`: the OS keychain for remembered unattended passwords (§B.8.9.1).
+tornect-core = { workspace = true, features = ["keyring"] }
 tornect-signal.workspace = true
 tornect-platform.workspace = true
 tornect-session.workspace = true
