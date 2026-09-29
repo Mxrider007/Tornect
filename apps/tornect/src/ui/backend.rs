@@ -42,7 +42,8 @@ use super::model::{
 use super::recognize::Lookalike;
 use super::stream::{FrameSlot, SlotSink};
 use crate::host::{
-    ControlChannel, HostLock, HostWiring, PolkitRevocation, describe_end, describe_media, note, say,
+    ControlChannel, HostLock, HostWiring, PolkitRevocation, describe_end, describe_media, note,
+    say, say_evidence,
 };
 use crate::tor_cmd::{End, explain, explain_handshake};
 
@@ -625,7 +626,7 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                 publish = None;
                 match published {
                     Ok(Ok(l)) => {
-                        say(format_args!("Tornect ID: {}", l.onion_address()));
+                        say_evidence(format_args!("Tornect ID: {}", l.onion_address()), None);
                         status = Some(watch_reachability(&l, Arc::clone(&b.shared)));
                         listener = Some(l);
                     }
@@ -952,24 +953,36 @@ async fn view_session(
             Ok(None) | Err(_) => {}
         }
     }
-    let ended = viewed(&b, &node, id, &stop).await;
+    let mut live = None;
+    let ended = viewed(&b, &node, id, &stop, &mut live).await;
     b.link.set_input(None);
     let message = match ended {
         Ok(message) => message,
         Err(e) => format!("{e:#}"),
     };
-    say(format_args!("VIEWER: {message}"));
+    // The message names the host: the id of the session it ended, if one
+    // was live, without the scripts' opt-in (U3-M1).
+    match &live {
+        Some(sid) => say_evidence(
+            format_args!("VIEWER: {message}"),
+            Some(format_args!("VIEWER ENDED {sid}")),
+        ),
+        None => say_evidence(format_args!("VIEWER: {message}"), None),
+    }
     b.shared.update(|m| {
         m.client = ClientStage::Ended(message.clone());
         m.note(message);
     });
 }
 
+/// View `id` until the session ends; `live` gets the session's id once it
+/// is live.
 async fn viewed(
     b: &Backend,
     node: &TorNode,
     id: TornectId,
     stop: &watch::Receiver<bool>,
+    live: &mut Option<String>,
 ) -> anyhow::Result<String> {
     b.shared.update(|m| {
         m.client = ClientStage::Reaching {
@@ -1035,15 +1048,19 @@ async fn viewed(
     // The level, likewise, only from the signed accept (§B.2.1).
     let administrator = control && session.accept().elevation() == Elevation::Admin;
     let host = session.host_label().to_owned();
-    say(format_args!(
-        "SESSION LIVE {} with \"{host}\" ({})",
-        session.session_token().session_id(),
-        match (control, administrator) {
-            (true, true) => "control · administrator",
-            (true, false) => "control",
-            (false, _) => "view-only",
-        }
-    ));
+    let sid = session.session_token().session_id();
+    say_evidence(
+        format_args!(
+            "SESSION LIVE {sid} with \"{host}\" ({})",
+            match (control, administrator) {
+                (true, true) => "control · administrator",
+                (true, false) => "control",
+                (false, _) => "view-only",
+            }
+        ),
+        Some(format_args!("SESSION LIVE {sid}")),
+    );
+    *live = Some(sid);
     b.shared.update(|m| {
         m.client = ClientStage::Live(Viewing {
             host: host.clone(),

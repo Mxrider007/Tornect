@@ -15,7 +15,7 @@
 //! only while that channel is up ([`ControlChannel`]; SLICE-B2 B2-2).
 
 use std::fmt;
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -600,7 +600,7 @@ impl SessionSink for CliSessions {
         self.polkit.on_start(session);
         self.media.on_start(session);
         say(format_args!("SESSION LIVE {}", session.session_id));
-        note(format_args!(
+        peer_note(format_args!(
             "session with \"{}\" is live ({}{}{}); {} ends it",
             session.label,
             mode_name(session.mode),
@@ -677,7 +677,7 @@ impl MediaObserver for CliMedia {
             (_, true) => "their input is injected",
             (_, false) => "their input goes nowhere here",
         };
-        note(format_args!(
+        peer_note(format_args!(
             "sharing this screen with \"{}\" ({} {}x{}; {input}); {} stops it",
             s.label,
             s.source,
@@ -749,6 +749,64 @@ pub(crate) fn say(line: fmt::Arguments<'_>) {
 /// [`say`] for stderr.
 pub(crate) fn note(line: fmt::Arguments<'_>) {
     let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+/// Whether the live-check scripts asked for the evidence lines that name a
+/// peer or this computer (U3-M1): set once at start, from this process's own
+/// command line (`--evidence`) or environment ([`EVIDENCE_ENV`] = `1`) only.
+static EVIDENCE: AtomicBool = AtomicBool::new(false);
+
+/// The environment variable of the evidence opt-in.
+pub(crate) const EVIDENCE_ENV: &str = "TORNECT_EVIDENCE";
+
+/// Whether the evidence lines are wanted: the flag, or `1` in [`EVIDENCE_ENV`].
+fn evidence_wanted(flag: bool, env: Option<&str>) -> bool {
+    flag || env == Some("1")
+}
+
+/// Take the evidence opt-in from `--evidence` and the environment.
+pub(crate) fn opt_in_evidence(flag: bool) {
+    let env = std::env::var(EVIDENCE_ENV).ok();
+    EVIDENCE.store(evidence_wanted(flag, env.as_deref()), Ordering::Relaxed);
+}
+
+/// An evidence line on stdout (U3-M1): `full`, which names the host viewed
+/// or this computer's address, only when the live-check scripts opted in;
+/// otherwise `bare` (the session id only), or nothing without one.
+pub(crate) fn say_evidence(full: fmt::Arguments<'_>, bare: Option<fmt::Arguments<'_>>) {
+    evidence_to(
+        &mut std::io::stdout().lock(),
+        EVIDENCE.load(Ordering::Relaxed),
+        full,
+        bare,
+    );
+}
+
+fn evidence_to(
+    out: &mut dyn std::io::Write,
+    opted_in: bool,
+    full: fmt::Arguments<'_>,
+    bare: Option<fmt::Arguments<'_>>,
+) {
+    if let Some(line) = if opted_in { Some(full) } else { bare } {
+        let _ = writeln!(out, "{line}").and_then(|()| out.flush());
+    }
+}
+
+/// A note on stderr that names a peer (its label or its device's
+/// fingerprint): written only when stderr is a terminal (the rule of the
+/// terminal's questions, R-3g), else nothing, so that a journal or a log
+/// file never collects who connected (U3-M1).
+pub(crate) fn peer_note(line: fmt::Arguments<'_>) {
+    let stderr = std::io::stderr();
+    let terminal = stderr.is_terminal();
+    peer_note_to(&mut stderr.lock(), terminal, line);
+}
+
+fn peer_note_to(out: &mut dyn std::io::Write, terminal: bool, line: fmt::Arguments<'_>) {
+    if terminal {
+        let _ = writeln!(out, "{line}");
+    }
 }
 
 fn mode_name(mode: SessionMode) -> &'static str {
@@ -825,7 +883,7 @@ where
         FirstFrame::Handshake(stream) => match serve_host(stream, cfg, deps).await {
             Ok(outcome) => {
                 if let Some(line) = describe_outcome(&outcome) {
-                    eprintln!("{line}");
+                    peer_note(format_args!("{line}"));
                 }
                 if matches!(outcome, HostOutcome::Session { .. }) {
                     Served::Session
@@ -1642,5 +1700,73 @@ mod tests {
         }
         assert_eq!(*told.lock().unwrap(), vec![POLKIT_NOT_CLEARED.to_owned()]);
         revocation.on_end("c1");
+    }
+
+    /// U3-M1: the evidence lines name the host viewed or this computer's
+    /// address only on the live-check scripts' opt-in (`--evidence`, or
+    /// `TORNECT_EVIDENCE=1`); without it a line carries its session id, or
+    /// is not written. Both paths, captured.
+    #[test]
+    fn the_evidence_lines_name_nobody_without_the_opt_in() {
+        let written = |opted_in: bool| {
+            let mut out = Vec::new();
+            let sid = "5e55";
+            evidence_to(
+                &mut out,
+                opted_in,
+                format_args!("SESSION LIVE {sid} with \"Desk\" (control)"),
+                Some(format_args!("SESSION LIVE {sid}")),
+            );
+            evidence_to(
+                &mut out,
+                opted_in,
+                format_args!("VIEWER: Session with \"Desk\" ended (by you)."),
+                Some(format_args!("VIEWER ENDED {sid}")),
+            );
+            evidence_to(
+                &mut out,
+                opted_in,
+                format_args!("Tornect ID: abcdefgh.onion"),
+                None,
+            );
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(
+            written(true),
+            "SESSION LIVE 5e55 with \"Desk\" (control)\n\
+             VIEWER: Session with \"Desk\" ended (by you).\n\
+             Tornect ID: abcdefgh.onion\n"
+        );
+        assert_eq!(written(false), "SESSION LIVE 5e55\nVIEWER ENDED 5e55\n");
+        for (flag, env, wanted) in [
+            (false, None, false),
+            (false, Some("0"), false),
+            (false, Some("yes"), false),
+            (false, Some("1"), true),
+            (true, None, true),
+        ] {
+            assert_eq!(evidence_wanted(flag, env), wanted, "{flag} {env:?}");
+        }
+    }
+
+    /// U3-M1 (the R-3g rule): a note that names a peer reaches stderr only
+    /// when stderr is a terminal; a redirected stderr (the user journal, a
+    /// file) gets nothing. Both paths, captured.
+    #[test]
+    fn a_peer_note_reaches_a_terminal_only() {
+        for terminal in [true, false] {
+            let mut out = Vec::new();
+            peer_note_to(
+                &mut out,
+                terminal,
+                format_args!("paired with \"Laptop\"; it asked for no session"),
+            );
+            let expected = if terminal {
+                "paired with \"Laptop\"; it asked for no session\n"
+            } else {
+                ""
+            };
+            assert_eq!(String::from_utf8(out).unwrap(), expected, "{terminal}");
+        }
     }
 }
