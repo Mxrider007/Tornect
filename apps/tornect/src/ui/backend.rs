@@ -825,6 +825,13 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
 /// Make an address-book change the window asked for (on this side, never on
 /// the UI thread) and show the files as they are now.
 fn change_book(b: &Backend, change: &Change) {
+    // Forget takes the remembered unattended password too (§B.8.9.1).
+    if let Change::Forget(id) = change
+        && let Err(e) =
+            crate::ua_client::forget(&b.paths, &crate::ua_client::system_passwords(&b.device), id)
+    {
+        tracing::warn!(error = %format!("{e:#}"), "the remembered password was not deleted");
+    }
     let note = book::apply(&b.paths, change);
     refresh_book(b, Some(note));
 }

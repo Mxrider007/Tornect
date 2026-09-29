@@ -1155,7 +1155,7 @@ fn read_line_unbuffered(fd: &impl rustix::fd::AsFd) -> anyhow::Result<zeroize::Z
 /// left with `ECHO` off after a failed prompt is a hostile thing to hand back
 /// to someone.
 #[cfg(unix)]
-fn read_password(prompt: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
+pub(crate) fn read_password(prompt: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
     use std::io::Write as _;
 
     use rustix::termios::{self, OptionalActions};
@@ -1185,13 +1185,13 @@ fn read_password(prompt: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
 }
 
 #[cfg(not(unix))]
-fn read_password(_prompt: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
+pub(crate) fn read_password(_prompt: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
     anyhow::bail!("the password prompt is implemented for Unix at M1 (docs/PLAN.md §B.8.14 M6)")
 }
 
 /// Ask a yes/no question on the terminal (echo on); anything but `y`/`yes` is no.
 #[cfg(unix)]
-fn confirm(question: &str) -> anyhow::Result<bool> {
+pub(crate) fn confirm(question: &str) -> anyhow::Result<bool> {
     use std::io::Write as _;
     eprint!("{question} [y/N] ");
     std::io::stderr().flush()?;
@@ -1200,7 +1200,7 @@ fn confirm(question: &str) -> anyhow::Result<bool> {
 }
 
 #[cfg(not(unix))]
-fn confirm(_question: &str) -> anyhow::Result<bool> {
+pub(crate) fn confirm(_question: &str) -> anyhow::Result<bool> {
     Ok(false)
 }
 
