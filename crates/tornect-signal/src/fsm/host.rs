@@ -22,13 +22,13 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tornect_core::DeviceId;
-use tornect_core::levels::{Answers, Availability, Elevation, Level};
+use tornect_core::levels::{AdminPath, Answers, Availability, Elevation, Level};
 use tornect_core::session_log::SessionMode;
 use tornect_core::unattended::guard::{AdminEffect, RemoteSessionActivity};
 use zeroize::Zeroizing;
 
 use super::{
-    AuditEvent, AuthExchange, CandidateSink, Channel, HandshakeAudit, HandshakeError,
+    AuditEvent, AuthExchange, CandidateSink, Channel, HandshakeAudit, HandshakeError, HelperEvent,
     IgnoreCandidates, NoAudit, OsRandom, Randomness, Received, SessionToken, SuppressedPopup,
     checked_body, timeouts,
 };
@@ -511,6 +511,43 @@ pub struct LiveSession<'a> {
     pub unattended: bool,
 }
 
+/// The administrator helper of §B.8.7.5 (r7, M-FEAT-3): started for an
+/// administrator answer that needs it, between the answer and the accept.
+/// The accept carries the administrator level only for a helper connected
+/// and checked in time; a helper never attached ends (H3).
+pub trait AdminHelper: Send + Sync {
+    /// Start the helper for `peer`'s session: resolves once it is connected,
+    /// checked and ready, or with why administrator access was not given (in
+    /// fixed words). A future dropped before it resolves ends what it started.
+    fn start<'a>(
+        self: Arc<Self>,
+        peer: &'a TrustedPeer,
+    ) -> BoxFuture<'a, Result<Box<dyn AttachedHelper>, &'static str>>;
+}
+
+/// A helper connected and checked for a session not accepted yet. Dropped
+/// without [`AttachedHelper::attach`], it ends: it never attaches to a
+/// session midway (H3).
+pub trait AttachedHelper: Send {
+    /// The accept of `session_id` went out at the administrator level: from
+    /// now on the session's input goes through this helper, until it ends.
+    fn attach(self: Box<Self>, session_id: &str);
+}
+
+/// No administrator helper: every start fails (the headless default, and
+/// every system but Windows).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoAdminHelper;
+
+impl AdminHelper for NoAdminHelper {
+    fn start<'a>(
+        self: Arc<Self>,
+        _: &'a TrustedPeer,
+    ) -> BoxFuture<'a, Result<Box<dyn AttachedHelper>, &'static str>> {
+        Box::pin(async { Err("this host cannot start the administrator helper") })
+    }
+}
+
 /// Runs no session: the accept is the end of the story (M1 default, tests).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoSessionSink;
@@ -668,6 +705,9 @@ pub struct HostDeps {
     pub candidates: Arc<dyn CandidateSink>,
     /// The layer that runs an established session (M4 `tornect-session`).
     pub sessions: Arc<dyn SessionSink>,
+    /// The administrator helper (§B.8.7.5): started between an administrator
+    /// answer and its accept.
+    pub admin_helper: Arc<dyn AdminHelper>,
     /// Nonces and tokens.
     pub random: Arc<dyn Randomness>,
     /// Counters.
@@ -697,6 +737,7 @@ impl HostDeps {
             audit: Arc::new(NoAudit),
             candidates: Arc::new(IgnoreCandidates),
             sessions: Arc::new(NoSessionSink),
+            admin_helper: Arc::new(NoAdminHelper),
             random: Arc::new(OsRandom),
             stats: Arc::new(HandshakeStats::default()),
             kill: KillSwitch::new(),
@@ -929,7 +970,7 @@ where
         quic_spki: ed25519_spki(&cfg.host_device_pk),
         transport_policy: cfg.transport_policy,
     };
-    let (proof, caps) = if unattended {
+    let (proof, caps, helper) = if unattended {
         let th_after_request = chan.th();
         let verdict = deps
             .unattended
@@ -986,7 +1027,15 @@ where
                 sent?;
                 return Ok(HostOutcome::Admin { device, ok });
             }
-            UnattendedVerdict::Accept { proof, caps } => (proof, caps),
+            // An unattended administrator level needs the helper task
+            // (§B.8.7.5), which this build does not start yet (M-FEAT-5 wires
+            // admin grants): on a row that needs the helper the session starts
+            // at none and stays there, never signed at a level it cannot have.
+            UnattendedVerdict::Accept { proof, caps } => (
+                unattended_without_helper(proof, &cfg.levels.offered()),
+                caps,
+                None,
+            ),
         }
     } else {
         // AwaitConsent. The session popup has the pairing popup's budget —
@@ -1011,33 +1060,68 @@ where
         let summary = SessionRequestSummary {
             caps: request.caps.clone(),
         };
-        let decision = {
-            let _pending = Counted::new(&deps.stats.consent_pending);
-            tokio::time::timeout(
-                timeouts::POPUP,
-                deps.consent.session_at(&peer, &summary, &cfg.levels),
-            )
-            .await
-        };
         // The level is the person's answer (§B.8.4.1), and only an answer the
         // sheet could offer: anything else is refused as a Deny, never
         // started at another level (§B.2.1: an administrator answer never
         // starts a session at a lower one).
         let offered = cfg.levels.offered();
-        let choice = match decision {
-            Err(_) => {
-                return reject_session(&mut chan, deps, &peer, messages::reject::POPUP_TIMEOUT)
-                    .await;
-            }
-            Ok(decision) => match accepted(decision, &offered) {
-                Some(choice) => choice,
-                None => {
-                    if decision != SessionDecision::Deny {
-                        tracing::warn!(peer = ?device, ?decision, "an answer the sheet does not offer; refused");
-                    }
-                    return reject_session(&mut chan, deps, &peer, messages::reject::DENIED).await;
+        let deadline = Instant::now() + timeouts::POPUP;
+        let mut not_given = false;
+        let (choice, helper) = loop {
+            let asking = if not_given {
+                let left = deadline.saturating_duration_since(Instant::now());
+                deps.consent
+                    .session_again(&peer, &summary, &cfg.levels, left)
+            } else {
+                deps.consent.session_at(&peer, &summary, &cfg.levels)
+            };
+            let decision = {
+                let _pending = Counted::new(&deps.stats.consent_pending);
+                tokio::time::timeout_at(deadline, asking).await
+            };
+            let choice = match decision {
+                Err(_) => {
+                    return reject_session(&mut chan, deps, &peer, messages::reject::POPUP_TIMEOUT)
+                        .await;
                 }
-            },
+                Ok(decision) => match accepted(decision, &offered) {
+                    Some(choice) => choice,
+                    None => {
+                        if decision != SessionDecision::Deny {
+                            tracing::warn!(peer = ?device, ?decision, "an answer the sheet does not offer; refused");
+                        }
+                        return reject_session(&mut chan, deps, &peer, messages::reject::DENIED)
+                            .await;
+                    }
+                },
+            };
+            if !needs_helper(choice, &offered) {
+                break (choice, None);
+            }
+            // Between the answer and the accept (§B.8.7.5): Windows' prompt
+            // and the helper's start run here while the popup's time keeps
+            // running; a helper not ready in time is never attached.
+            let started =
+                tokio::time::timeout_at(deadline, Arc::clone(&deps.admin_helper).start(&peer))
+                    .await;
+            match started {
+                Err(_) => {
+                    return reject_session(&mut chan, deps, &peer, messages::reject::POPUP_TIMEOUT)
+                        .await;
+                }
+                Ok(Ok(helper)) => break (choice, Some(helper)),
+                Ok(Err(reason)) => {
+                    deps.audit.record(AuditEvent::AdminHelper {
+                        device,
+                        label: label.clone(),
+                        session_id: None,
+                        what: HelperEvent::Failed,
+                        reason,
+                    });
+                    // The sheet again, with the other answers.
+                    not_given = true;
+                }
+            }
         };
         let mut token = Zeroizing::new([0u8; 32]);
         deps.random.fill(&mut token[..])?;
@@ -1046,7 +1130,11 @@ where
             at: Instant::now(),
             token: FreshToken::mint(*token),
         };
-        (proof, ChosenCaps::negotiate(&cfg.caps, &request.caps))
+        (
+            proof,
+            ChosenCaps::negotiate(&cfg.caps, &request.caps),
+            helper,
+        )
     };
 
     // The owner may have pressed the panic key, or another session may have
@@ -1093,6 +1181,20 @@ where
         elevation,
         unattended,
     });
+    // The helper attaches only to the session whose accept went out at the
+    // administrator level; any other ends here, never attached (H3).
+    if let Some(helper) = helper
+        && elevation == Elevation::Admin
+    {
+        helper.attach(&session_id);
+        deps.audit.record(AuditEvent::AdminHelper {
+            device,
+            label: label.clone(),
+            session_id: Some(session_id.clone()),
+            what: HelperEvent::Started,
+            reason: "connected and checked before the accept",
+        });
+    }
     tracing::info!(peer = ?device, %label, session = %session_id, "session accepted");
 
     let th_final = chan.th();
@@ -1185,6 +1287,48 @@ fn accepted(decision: SessionDecision, offered: &Answers) -> Option<PopupChoice>
         SessionDecision::Deny => return None,
     };
     offered.offers(choice.level()).then_some(choice)
+}
+
+/// Whether the answer `choice` takes the administrator helper on a host
+/// offering `offered`: the administrator answer on a row whose host runs
+/// with a filtered token (the Windows prompt, or no prompt with the helper).
+fn needs_helper(choice: PopupChoice, offered: &Answers) -> bool {
+    matches!(choice, PopupChoice::AllowOnceAdmin)
+        && matches!(
+            offered.admin,
+            Some(AdminPath::WindowsPrompt | AdminPath::TornectConfirmation { needs_helper: true })
+        )
+}
+
+/// An unattended session's proof at the level it can have without the
+/// helper task: an administrator receipt on a row that needs the helper is
+/// lowered to none (§B.8.7.5: not connected ⇒ elevation 0, and it stays 0).
+fn unattended_without_helper(proof: ConsentProof, offered: &Answers) -> ConsentProof {
+    match proof {
+        ConsentProof::Unattended {
+            grant,
+            proof_fp,
+            policy,
+            block,
+            token,
+        } if policy.elevation() == Elevation::Admin
+            && !matches!(
+                offered.admin,
+                Some(AdminPath::TornectConfirmation {
+                    needs_helper: false
+                })
+            ) =>
+        {
+            ConsentProof::Unattended {
+                grant,
+                proof_fp,
+                policy: policy.with_elevation(Elevation::None),
+                block,
+                token,
+            }
+        }
+        other => other,
+    }
 }
 
 /// Fixed text for a session that ended in an error (never peer-controlled).

@@ -155,6 +155,13 @@ pub trait MediaBackend: Send + Sync {
     /// kept for building its injector, so that no path can reach the desktop's
     /// input for it. The default keeps nothing.
     fn view_only(&self) {}
+
+    /// The session `session_id` ended (its `on_end`): let go of anything kept
+    /// for it that its injector never took (the app's administrator helper,
+    /// §B.8.7.5). The default keeps nothing.
+    fn session_ended(&self, session_id: &str) {
+        let _ = session_id;
+    }
 }
 
 /// Where the host reports capture starting and stopping. This is the source
@@ -773,6 +780,7 @@ impl SessionSink for MediaHost {
         if let Some(session) = self.lock().remove(session_id) {
             session.end.send_replace(Some(reason));
         }
+        self.backend.session_ended(session_id);
     }
 }
 

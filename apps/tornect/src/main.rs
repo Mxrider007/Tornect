@@ -22,6 +22,7 @@ compile_error!(
      or add `-C target-feature=+crt-static` to it"
 );
 
+mod admin_helper;
 mod helper_cmd;
 mod history;
 mod host;

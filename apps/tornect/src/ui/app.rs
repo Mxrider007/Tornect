@@ -551,18 +551,29 @@ impl App {
                 });
             }
             Action::AdminPrompt { id } => {
-                // Here Windows' own prompt would start the administrator
-                // helper (§B.8.7.5, M-FEAT-3). This build has no helper, so
-                // the answer ends at once as a cancelled prompt does: the
-                // sheet says administrator access was not given, keeps its
-                // other answers, and arms them again, as on the prompt's
-                // return.
-                self.form.rearm(id);
-                self.popups.shared().update(|m| {
-                    if m.popups.iter().any(|p| p.id == id) {
-                        m.admin_not_given.insert(id);
-                    }
-                });
+                if tornect_core::levels::ADMIN_HELPER {
+                    // The answer goes to the host, which asks Windows to
+                    // start the administrator helper between the answer and
+                    // the accept (§B.8.7.5). Cancelled, failed or late, the
+                    // sheet comes back saying administrator access was not
+                    // given, with the other answers, armed anew; the window's
+                    // return from Windows' prompt re-arms it too.
+                    let _ = self.popups.answer_session(
+                        id,
+                        tornect_signal::pairing::SessionDecision::AllowOnceAdmin,
+                    );
+                } else {
+                    // No helper in this build: the answer ends at once as a
+                    // cancelled prompt does: the sheet says administrator
+                    // access was not given, keeps its other answers, and arms
+                    // them again, as on the prompt's return.
+                    self.form.rearm(id);
+                    self.popups.shared().update(|m| {
+                        if m.popups.iter().any(|p| p.id == id) {
+                            m.admin_not_given.insert(id);
+                        }
+                    });
+                }
             }
             Action::StopSharing => self.command(Command::StopSharing),
             Action::MoveIndicator => {
