@@ -239,10 +239,10 @@ enum Command {
         /// without a usable keychain, and for administrator access.
         #[arg(long, requires = "unattended")]
         remember: bool,
-        /// With --unattended: ask for administrator access. The host gives it
-        /// only if this device's grant carries it; otherwise the session goes
-        /// on without it.
-        #[arg(long, requires = "unattended")]
+        /// With --unattended: ask for administrator access (with control only).
+        /// The host gives it only if this device's grant carries it; otherwise
+        /// the session goes on without it.
+        #[arg(long, requires = "unattended", conflicts_with = "view_only")]
         administrator: bool,
         /// Never accepted: a password on the command line is refused, with the
         /// reason.
@@ -867,6 +867,10 @@ mod tests {
         assert!(parse(&["--administrator"]).is_err());
         assert!(parse(&["--unattended", "--pair-only"]).is_err());
         assert!(parse(&["--unattended", "--forget"]).is_err());
+        assert!(
+            parse(&["--unattended", "--view-only", "--administrator"]).is_err(),
+            "the level goes with control only"
+        );
         for args in [
             &["--unattended", "--password", "hunter2"][..],
             &["--unattended", "--password=hunter2"],

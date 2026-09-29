@@ -547,7 +547,9 @@ fn password_prompt(
             }
             if prompt.admin.is_none() {
                 ui.checkbox(&mut ua.view_only, "View only this time");
-                if prompt.may_admin {
+                // The level goes with control only (§B.8.4.1): view only asks
+                // for none.
+                if prompt.may_admin && !ua.view_only {
                     ui.checkbox(&mut ua.administrator, "Ask for administrator access");
                 } else {
                     ua.administrator = false;

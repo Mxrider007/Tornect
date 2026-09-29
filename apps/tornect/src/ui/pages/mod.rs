@@ -950,11 +950,22 @@ mod tests {
 
         let mut admin = model.clone();
         admin.prompt.as_mut().unwrap().may_admin = true;
-        let window = Window::new(admin, Page::Home, egui::Theme::Dark, WIDE);
+        let mut window = Window::new(admin, Page::Home, egui::Theme::Dark, WIDE);
         let controls = window.controls();
         assert!(controls.iter().any(|c| c == "Ask for administrator access"));
         assert!(!controls.iter().any(|c| c == "Remember on this device"));
         assert!(has_text(&window, ADMIN_NOT_REMEMBERED));
+        // View only asks for no level: the choice goes.
+        window.form.ua.administrator = true;
+        window.form.ua.view_only = true;
+        window.pass(Vec::new());
+        assert!(
+            !window
+                .controls()
+                .iter()
+                .any(|c| c == "Ask for administrator access")
+        );
+        assert!(!window.form.ua.administrator);
 
         let mut waiting = model;
         waiting.prompt.as_mut().unwrap().retry_at = Some(Instant::now() + Duration::from_secs(600));
