@@ -264,6 +264,10 @@ enum SheetArg {
     AdminNotGiven,
     /// An administrator account that elevates without prompting.
     SessionNoPrompt,
+    /// That row with the administrator helper, a device paired moments before.
+    NoPromptHelper,
+    /// That sheet's Tornect confirmation.
+    NoPromptConfirm,
     /// A pairing and a session question at once.
     TwoOpen,
     /// The connect stepper: reaching the computer.
@@ -296,6 +300,8 @@ impl From<SheetArg> for ui::preview::Sheet {
             SheetArg::SessionFour => Self::SessionFour,
             SheetArg::AdminNotGiven => Self::AdminNotGiven,
             SheetArg::SessionNoPrompt => Self::SessionNoPrompt,
+            SheetArg::NoPromptHelper => Self::NoPromptHelper,
+            SheetArg::NoPromptConfirm => Self::NoPromptConfirm,
             SheetArg::TwoOpen => Self::TwoOpen,
             SheetArg::StageReaching => Self::StageReaching,
             SheetArg::StagePairing => Self::StagePairing,

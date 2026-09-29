@@ -102,6 +102,12 @@ pub enum Sheet {
     /// The session sheet of an invented administrator account that
     /// elevates without prompting.
     SessionNoPrompt,
+    /// That row with the administrator helper (M-FEAT-3; the operator's
+    /// ruling of 2026-09-29): View only and "Allow as administrator", for a
+    /// device paired moments before (the scam line).
+    NoPromptHelper,
+    /// That sheet's Tornect confirmation.
+    NoPromptConfirm,
     /// A pairing and a session question open at once.
     TwoOpen,
     /// The connect stepper, reaching the computer.
@@ -223,6 +229,23 @@ pub fn sheet(m: &mut Model, sheet: Sheet) {
                 ..WindowsFacts::default()
             }));
             m.levels.insert(7, SheetLevels::of(&no_prompt));
+        }
+        Sheet::NoPromptHelper | Sheet::NoPromptConfirm => {
+            let no_prompt = Availability::of(Some(&WindowsFacts {
+                installed: true,
+                administrator: true,
+                consent_prompt_behavior_admin: Some(0),
+                ..WindowsFacts::default()
+            }));
+            // What the row offers once the helper is on.
+            let mut levels = SheetLevels::of(&no_prompt);
+            levels.answers = no_prompt.answers;
+            levels.sentence = no_prompt.sentence;
+            m.levels.insert(7, levels);
+            m.paired_recently.insert(7);
+            if sheet == Sheet::NoPromptConfirm {
+                m.admin_confirm.insert(7);
+            }
         }
         Sheet::TwoOpen => {
             m.levels.insert(7, SheetLevels::of(&Availability::LINUX));
@@ -445,6 +468,9 @@ fn fill(m: &mut Model) {
         host_waits_until: now + Duration::from_secs(50),
         deadline: now + Duration::from_secs(600),
     });
+    // The shared session runs at the administrator level the host signed:
+    // the banner and the indicator say so.
+    m.admin_sessions.insert("0123456789abcdef".to_owned());
     m.sharing = vec![Sharing {
         session_id: "0123456789abcdef".to_owned(),
         label: "Laptop".to_owned(),
