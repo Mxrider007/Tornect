@@ -1395,4 +1395,110 @@ mod tests {
         let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
         assert!(!has_text(&window, notice), "history is on");
     }
+
+    /// Every preview sheet and stage draws in both themes at both sizes
+    /// without asking for anything; on every host sheet the first answer the
+    /// keyboard reaches is a refusal (Deny or Refuse) that answers at once,
+    /// and no run of Tabs followed by Space or Enter ever gives an accept
+    /// (M1-50).
+    #[test]
+    fn every_sheet_draws_and_keys_only_refuse() {
+        use super::super::preview::Sheet;
+        use tornect_signal::pairing::PairDecision;
+        let sheets = [
+            Sheet::New,
+            Sheet::Pinned,
+            Sheet::Alarm,
+            Sheet::Session,
+            Sheet::SessionLinux,
+            Sheet::SessionAdmin,
+            Sheet::AdminConfirm,
+            Sheet::SessionWindows,
+            Sheet::SessionFour,
+            Sheet::AdminNotGiven,
+            Sheet::SessionNoPrompt,
+            Sheet::TwoOpen,
+            Sheet::StageReaching,
+            Sheet::StagePairing,
+            Sheet::StageAsking,
+            Sheet::StageLive,
+            Sheet::StageUnreachable,
+            Sheet::StageDenied,
+            Sheet::StageCodesDiffer,
+        ];
+        let accepts = |actions: &[Action]| {
+            actions.iter().any(|a| {
+                matches!(
+                    a,
+                    Action::Session {
+                        decision: SessionDecision::AllowOnce
+                            | SessionDecision::AllowOnceViewOnly
+                            | SessionDecision::AllowOnceAdmin,
+                        ..
+                    } | Action::Pair {
+                        decision: PairDecision::Accept { .. },
+                        ..
+                    } | Action::PairCode { .. }
+                        | Action::Confirm { matched: true, .. }
+                        | Action::AdminConfirm { .. }
+                        | Action::AdminPrompt { .. }
+                )
+            })
+        };
+        for sheet in sheets {
+            for theme in THEMES {
+                for size in [WIDE, NARROW] {
+                    let model = with_sheet(sheet);
+                    let hosts = !model.popups.is_empty();
+                    let mut window = Window::new(model.clone(), Page::Home, theme, size);
+                    let case = format!("{sheet:?} {theme:?} {size:?}");
+                    if hosts {
+                        // The first answer the keyboard reaches is a refusal
+                        // (a pairing sheet's name field comes before it).
+                        let mut refused = Vec::new();
+                        for tabs in 1..=3 {
+                            let mut fresh = Window::new(model.clone(), Page::Home, theme, size);
+                            for _ in 0..tabs {
+                                fresh.key(egui::Key::Tab);
+                            }
+                            refused = fresh.key(egui::Key::Space);
+                            if !refused.is_empty() {
+                                break;
+                            }
+                        }
+                        window.pass(Vec::new());
+                        assert!(
+                            matches!(
+                                refused.as_slice(),
+                                [Action::Session {
+                                    decision: SessionDecision::Deny,
+                                    pointer: false,
+                                    ..
+                                }] | [Action::Pair {
+                                    decision: PairDecision::Reject,
+                                    pointer: false,
+                                    ..
+                                }]
+                            ),
+                            "{case}: {refused:?}"
+                        );
+                    }
+                    for confirm in [egui::Key::Space, egui::Key::Enter] {
+                        for tabs in 1..=8 {
+                            let mut window = Window::new(model.clone(), Page::Home, theme, size);
+                            let mut asked = Vec::new();
+                            for _ in 0..tabs {
+                                asked.extend(window.key(egui::Key::Tab));
+                            }
+                            asked.extend(window.key(confirm));
+                            assert!(
+                                !accepts(&asked),
+                                "{case}: {tabs} Tabs, {confirm:?}: {asked:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

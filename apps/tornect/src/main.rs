@@ -249,6 +249,30 @@ enum SheetArg {
     SessionAdmin,
     /// That sheet's administrator confirmation.
     AdminConfirm,
+    /// An installed Windows host, UAC on, as this build offers it.
+    SessionWindows,
+    /// That row with the administrator helper: four answers.
+    SessionFour,
+    /// The four-answer sheet after its Windows prompt failed.
+    AdminNotGiven,
+    /// An administrator account that elevates without prompting.
+    SessionNoPrompt,
+    /// A pairing and a session question at once.
+    TwoOpen,
+    /// The connect stepper: reaching the computer.
+    StageReaching,
+    /// The connect stepper: pairing, the code question open.
+    StagePairing,
+    /// The connect stepper: waiting for approval.
+    StageAsking,
+    /// The connect stepper: connected.
+    StageLive,
+    /// The connect stepper: the computer could not be reached.
+    StageUnreachable,
+    /// The connect stepper: the person there said no.
+    StageDenied,
+    /// The connect stepper: the codes differed.
+    StageCodesDiffer,
 }
 
 impl From<SheetArg> for ui::preview::Sheet {
@@ -261,6 +285,18 @@ impl From<SheetArg> for ui::preview::Sheet {
             SheetArg::SessionLinux => Self::SessionLinux,
             SheetArg::SessionAdmin => Self::SessionAdmin,
             SheetArg::AdminConfirm => Self::AdminConfirm,
+            SheetArg::SessionWindows => Self::SessionWindows,
+            SheetArg::SessionFour => Self::SessionFour,
+            SheetArg::AdminNotGiven => Self::AdminNotGiven,
+            SheetArg::SessionNoPrompt => Self::SessionNoPrompt,
+            SheetArg::TwoOpen => Self::TwoOpen,
+            SheetArg::StageReaching => Self::StageReaching,
+            SheetArg::StagePairing => Self::StagePairing,
+            SheetArg::StageAsking => Self::StageAsking,
+            SheetArg::StageLive => Self::StageLive,
+            SheetArg::StageUnreachable => Self::StageUnreachable,
+            SheetArg::StageDenied => Self::StageDenied,
+            SheetArg::StageCodesDiffer => Self::StageCodesDiffer,
         }
     }
 }
