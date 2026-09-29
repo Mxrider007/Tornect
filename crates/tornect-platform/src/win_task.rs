@@ -1,7 +1,7 @@
 //! The Win32 side of [`crate::helper_task`] (§B.8.7.5): the helper task's
 //! registration, removal and switch through `schtasks.exe` from the system
 //! directory, elevated through the UAC prompt (F1-1's path); a file's or
-//! folder's DACL (`GetNamedSecurityInfoW` + `GetAce`); and the on-demand run
+//! folder's owner and DACL (`GetNamedSecurityInfoW` + `GetAce`); and the on-demand run
 //! with its run parameter (`ITaskService` → `ITaskFolder::GetTask` →
 //! `IRegisteredTask::Run`, the COM vtables declared here in the order of
 //! `taskschd.h`, since `windows-sys` has none). Type-checked only:
@@ -17,7 +17,8 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{HLOCAL, LocalFree, NO_ERROR, SysAllocString, SysFreeString};
 use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, PSECURITY_DESCRIPTOR,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
 };
 use windows_sys::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
@@ -25,7 +26,7 @@ use windows_sys::Win32::System::Com::{
 use windows_sys::core::GUID;
 
 use crate::autostart::AutostartError;
-use crate::helper_task::{Ace, HelperTasks};
+use crate::helper_task::{Ace, HelperTasks, Security};
 use crate::win::wide;
 
 /// The helper task through `schtasks.exe` and the Task Scheduler's COM API.
@@ -133,8 +134,10 @@ impl HelperTasks for Scheduler {
         ])
     }
 
-    fn dacl(&self, path: &str) -> Result<Vec<Ace>, AutostartError> {
-        dacl(path).map_err(|e| AutostartError::Failed(format!("reading the ACL of {path}: {e}")))
+    fn security(&self, path: &str) -> Result<Security, AutostartError> {
+        security(path).map_err(|e| {
+            AutostartError::Failed(format!("reading the owner and ACL of {path}: {e}"))
+        })
     }
 
     fn run(&self, arg: &str) -> Result<(), AutostartError> {
@@ -149,20 +152,23 @@ impl HelperTasks for Scheduler {
     }
 }
 
-/// The DACL of `path`, entry by entry. An entry of a type other than
-/// allow or deny counts as an allow of every right (so the check refuses).
-fn dacl(path: &str) -> std::io::Result<Vec<Ace>> {
+/// The owner and the DACL of `path`, entry by entry, each with its flags.
+/// An entry of a type other than allow or deny counts as an allow of every
+/// right that applies to the object itself (so the check refuses).
+fn security(path: &str) -> std::io::Result<Security> {
     let name = wide(path);
+    let mut owner: *mut c_void = null_mut();
     let mut acl: *mut ACL = null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = null_mut();
     // SAFETY: `name` is NUL-terminated; on success `sd` is a descriptor
-    // allocated with `LocalAlloc` (freed below) and `acl` points into it.
+    // allocated with `LocalAlloc` (freed below), and `owner` and `acl` point
+    // into it.
     let status = unsafe {
         GetNamedSecurityInfoW(
             name.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            null_mut(),
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
             null_mut(),
             &mut acl,
             null_mut(),
@@ -173,7 +179,9 @@ fn dacl(path: &str) -> std::io::Result<Vec<Ace>> {
         return Err(std::io::Error::from_raw_os_error(status as i32));
     }
     let mut out = Vec::new();
-    let read = if acl.is_null() {
+    let read = if owner.is_null() {
+        Err(std::io::Error::other("the file has no owner"))
+    } else if acl.is_null() {
         // A null DACL grants everyone everything.
         Err(std::io::Error::other(
             "the file has no DACL (everyone has full access)",
@@ -203,20 +211,24 @@ fn dacl(path: &str) -> std::io::Result<Vec<Ace>> {
                         sid: crate::win::sid_string(sid)?,
                         allow: header.AceType == 0,
                         mask: entry.Mask,
+                        flags: header.AceFlags,
                     });
                 }
                 _ => out.push(Ace {
                     sid: "an entry of another type".to_owned(),
                     allow: true,
                     mask: u32::MAX,
+                    flags: 0,
                 }),
             }
         }
         failed.map_or(Ok(()), Err)
     };
+    // The owner's SID points into `sd`: read it before `sd` is freed.
+    let owner = read.and_then(|()| crate::win::sid_string(owner));
     // SAFETY: allocated by `GetNamedSecurityInfoW`, freed once.
     unsafe { LocalFree(sd as HLOCAL) };
-    read.map(|()| out)
+    owner.map(|owner| Security { owner, dacl: out })
 }
 
 /// `CLSID_TaskScheduler` (taskschd.h).

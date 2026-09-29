@@ -15,10 +15,11 @@
 //! and disabled while unattended access is off (H7, [`want`]); registered
 //! only from Program Files, read back and compared (principal, run level,
 //! command, arguments, exactly one action; H6, F1-2, [`register`]); the
-//! install folder and the executable carry no write, delete or owner-change
-//! entry for anyone but SYSTEM, Administrators and TrustedInstaller, checked
-//! at registration and before each run, a failed check refusing (H6,
-//! [`admin_only`]). The Windows scheduler calls are NEEDS-DEVICE(windows);
+//! executable and every folder from its own up to Program Files are owned
+//! by SYSTEM, Administrators or TrustedInstaller and carry no write, delete
+//! or owner-change entry for anyone else, checked at registration and
+//! before each run, a failed check refusing (H6, F-1, F-2, [`admin_only`],
+//! [`guarded_paths`]). The Windows scheduler calls are NEEDS-DEVICE(windows);
 //! `IRegisteredTask::Run` with the run parameter is UNVERIFIED on a device.
 //!
 //! What this cannot keep out (§B.8.7.5 *Residual*): whatever lets the host
@@ -157,6 +158,31 @@ pub struct Ace {
     pub allow: bool,
     /// The access mask.
     pub mask: u32,
+    /// The entry's `AceFlags` ([`INHERIT_ONLY_ACE`]: for what is created
+    /// inside only).
+    pub flags: u8,
+}
+
+/// `INHERIT_ONLY_ACE`: the entry is only handed down to what is created
+/// inside; it gives nothing on the file or folder that holds it (F-1: the
+/// `CREATOR OWNER (OI)(CI)(IO)` entry of a folder under Program Files).
+pub const INHERIT_ONLY_ACE: u8 = 0x08;
+
+/// `CREATOR OWNER`: a placeholder handed down as the SID of whoever creates
+/// something inside; in an entry that applies to the object itself it can
+/// stand for nobody but its owner.
+pub const CREATOR_OWNER: &str = "S-1-3-0";
+
+/// `OWNER RIGHTS`: the object's owner, whoever that is.
+pub const OWNER_RIGHTS: &str = "S-1-3-4";
+
+/// A file's or folder's owner and DACL, as H6's check reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Security {
+    /// The owner, as a string SID: it may always rewrite the DACL.
+    pub owner: String,
+    /// The DACL, entry by entry.
+    pub dacl: Vec<Ace>,
 }
 
 /// Rights that let a principal change or replace the executable or what its
@@ -182,16 +208,34 @@ pub const TRUSTED: [&str; 3] = [
     "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
 ];
 
-/// The ACL check of H6: no allow entry gives [`WRITE_RIGHTS`] to anyone but
-/// [`TRUSTED`]. `what` names the file or folder in the refusal.
-pub fn admin_only(what: &str, dacl: &[Ace]) -> Result<(), String> {
-    for ace in dacl {
-        if ace.allow && ace.mask & WRITE_RIGHTS != 0 && !TRUSTED.contains(&ace.sid.as_str()) {
-            return Err(format!(
-                "{what} can be changed by {} (rights {:#x}), not only by administrators",
-                ace.sid, ace.mask
-            ));
+/// The ACL check of H6: the owner is one of [`TRUSTED`] (an owner may always
+/// rewrite the DACL, F-2), and no allow entry that applies to the object
+/// itself gives [`WRITE_RIGHTS`] to anyone else. An inherit-only entry gives
+/// nothing here and is skipped (F-1); an entry for [`CREATOR_OWNER`] or
+/// [`OWNER_RIGHTS`] can reach no one but the owner, already checked. `what`
+/// names the file or folder in the refusal, which says what failed.
+pub fn admin_only(what: &str, security: &Security) -> Result<(), String> {
+    if !TRUSTED.contains(&security.owner.as_str()) {
+        return Err(format!(
+            "{what} is owned by {}, not by SYSTEM, Administrators or TrustedInstaller",
+            security.owner
+        ));
+    }
+    for ace in &security.dacl {
+        let sid = ace.sid.as_str();
+        if !ace.allow
+            || ace.flags & INHERIT_ONLY_ACE != 0
+            || ace.mask & WRITE_RIGHTS == 0
+            || TRUSTED.contains(&sid)
+            || sid == CREATOR_OWNER
+            || sid == OWNER_RIGHTS
+        {
+            continue;
         }
+        return Err(format!(
+            "{what} can be changed by {sid} (rights {:#x}), not only by administrators",
+            ace.mask
+        ));
     }
     Ok(())
 }
@@ -207,8 +251,8 @@ pub trait HelperTasks {
     fn delete(&self) -> Result<(), AutostartError>;
     /// Enable or disable it.
     fn set_enabled(&self, enabled: bool) -> Result<(), AutostartError>;
-    /// The DACL of `path` (a file or folder).
-    fn dacl(&self, path: &str) -> Result<Vec<Ace>, AutostartError>;
+    /// The owner and the DACL of `path` (a file or folder).
+    fn security(&self, path: &str) -> Result<Security, AutostartError>;
     /// Start it with the run parameter `arg` (`IRegisteredTask::Run`).
     fn run(&self, arg: &str) -> Result<(), AutostartError>;
     /// Whether `principal` (a SID or a name) is this account.
@@ -228,10 +272,42 @@ pub struct Install {
     pub sid: String,
 }
 
-/// H6's ACL check of the folder and the executable.
+/// What H6's check reads: the executable, then every folder from its own up
+/// to Program Files included (whoever may rename or replace one of them may
+/// put another program where the elevated one is started, F-2). Refused:
+/// an executable outside Program Files.
+pub fn guarded_paths(install: &Install) -> Result<Vec<String>, AutostartError> {
+    let outside = || {
+        AutostartError::Unavailable(format!(
+            "the administrator helper runs only from Program Files ({}), and this Tornect is \
+             at {}",
+            install.program_files, install.exe
+        ))
+    };
+    if !location_under(&install.exe, std::slice::from_ref(&install.program_files)) {
+        return Err(outside());
+    }
+    let root = install.program_files.trim_end_matches(['\\', '/']);
+    let mut paths = vec![install.exe.clone()];
+    let mut at = install.exe.as_str();
+    while let Some(cut) = at.rfind(['\\', '/']) {
+        at = &at[..cut];
+        paths.push(at.to_owned());
+        if at.eq_ignore_ascii_case(root) {
+            return Ok(paths);
+        }
+    }
+    Err(outside())
+}
+
+/// H6's ACL check: the owner and the DACL of the executable and of every
+/// folder above it up to Program Files ([`guarded_paths`], [`admin_only`]).
+/// A refusal is [`AutostartError::Unavailable`] and says which file or
+/// folder failed and why; a security descriptor that cannot be read is
+/// [`AutostartError::Failed`]. Either refuses.
 pub fn check_files(ts: &dyn HelperTasks, install: &Install) -> Result<(), AutostartError> {
-    for path in [&install.folder, &install.exe] {
-        admin_only(path, &ts.dacl(path)?).map_err(AutostartError::Unavailable)?;
+    for path in guarded_paths(install)? {
+        admin_only(&path, &ts.security(&path)?).map_err(AutostartError::Unavailable)?;
     }
     Ok(())
 }
@@ -364,18 +440,62 @@ mod tests {
                 sid: TRUSTED[0].to_owned(),
                 allow: true,
                 mask: 0x1F_01FF,
+                flags: 0,
             },
             Ace {
                 sid: TRUSTED[1].to_owned(),
                 allow: true,
                 mask: 0x1F_01FF,
+                flags: 0,
             },
             // Users: read and execute.
             Ace {
                 sid: "S-1-5-32-545".to_owned(),
                 allow: true,
                 mask: 0x0012_00A9,
+                flags: 0,
             },
+        ]
+    }
+
+    /// An entry of a default folder under Program Files (the inherited
+    /// entries as `icacls` shows them; UNVERIFIED on a device here).
+    fn entry(sid: &str, mask: u32, flags: u8) -> Ace {
+        Ace {
+            sid: sid.to_owned(),
+            allow: true,
+            mask,
+            flags,
+        }
+    }
+
+    /// `(OI)(CI)(IO)` as `AceFlags`: object and container inherit, inherit only.
+    const OI_CI_IO: u8 = 0x01 | 0x02 | INHERIT_ONLY_ACE;
+    /// `(CI)(IO)`.
+    const CI_IO: u8 = 0x02 | INHERIT_ONLY_ACE;
+
+    /// The DACL a folder made under `C:\Program Files` by an administrator
+    /// inherits (Windows 10/11 defaults as recalled, UNVERIFIED here): full
+    /// control for TrustedInstaller, SYSTEM and Administrators, read and
+    /// execute for Users and the app-package groups, and the inherit-only
+    /// entries, `CREATOR OWNER (OI)(CI)(IO)(F)` among them.
+    fn program_files_acl() -> Vec<Ace> {
+        let (full, modify, read_execute, generic_all) =
+            (0x1F_01FF, 0x13_01BF, 0x12_00A9, 0x1000_0000);
+        vec![
+            entry(TRUSTED[2], full, 0),
+            entry(TRUSTED[2], generic_all, CI_IO),
+            entry(TRUSTED[0], modify, 0),
+            entry(TRUSTED[0], generic_all, OI_CI_IO),
+            entry(TRUSTED[1], modify, 0),
+            entry(TRUSTED[1], generic_all, OI_CI_IO),
+            entry("S-1-5-32-545", read_execute, 0),
+            entry("S-1-5-32-545", 0xA000_0000, OI_CI_IO),
+            entry(CREATOR_OWNER, generic_all, OI_CI_IO),
+            entry("S-1-15-2-1", read_execute, 0),
+            entry("S-1-15-2-1", 0xA000_0000, OI_CI_IO),
+            entry("S-1-15-2-2", read_execute, 0),
+            entry("S-1-15-2-2", 0xA000_0000, OI_CI_IO),
         ]
     }
 
@@ -385,6 +505,11 @@ mod tests {
         task: RefCell<Option<String>>,
         enabled: RefCell<bool>,
         acl: RefCell<Vec<Ace>>,
+        /// The owner and DACL of one path, in place of Administrators and
+        /// `acl`.
+        at: RefCell<Option<(String, Security)>>,
+        /// Every path whose security was read.
+        read: RefCell<Vec<String>>,
         /// What the scheduler stores instead of what was written.
         tamper: Option<fn(&str) -> String>,
         calls: RefCell<Vec<String>>,
@@ -422,8 +547,17 @@ mod tests {
             *self.enabled.borrow_mut() = enabled;
             Ok(())
         }
-        fn dacl(&self, _: &str) -> Result<Vec<Ace>, AutostartError> {
-            Ok(self.acl.borrow().clone())
+        fn security(&self, path: &str) -> Result<Security, AutostartError> {
+            self.read.borrow_mut().push(path.to_owned());
+            if let Some((at, security)) = &*self.at.borrow()
+                && at == path
+            {
+                return Ok(security.clone());
+            }
+            Ok(Security {
+                owner: TRUSTED[1].to_owned(),
+                dacl: self.acl.borrow().clone(),
+            })
         }
         fn run(&self, arg: &str) -> Result<(), AutostartError> {
             self.calls.borrow_mut().push(format!("run {arg}"));
@@ -557,6 +691,7 @@ mod tests {
                 sid: "S-1-5-11".to_owned(),
                 allow: true,
                 mask,
+                flags: 0,
             });
             assert!(register(&ts, &install()).is_err(), "{mask:#x}");
             assert!(run(&ts, &install(), &args).is_err(), "{mask:#x}");
@@ -566,11 +701,192 @@ mod tests {
             sid: "S-1-5-11".to_owned(),
             allow: false,
             mask: 0x4000_0000,
+            flags: 0,
         }];
         assert!(
-            admin_only("f", &deny).is_ok(),
+            admin_only(
+                "f",
+                &Security {
+                    owner: TRUSTED[1].to_owned(),
+                    dacl: deny.to_vec(),
+                }
+            )
+            .is_ok(),
             "a deny entry grants nothing"
         );
+    }
+
+    /// F-1: a default install passes: the inherit-only entries of a folder
+    /// under Program Files (`CREATOR OWNER (OI)(CI)(IO)` full control among
+    /// them) give nothing on the folder or the executable, and read and
+    /// execute for Users is fine; the same entry *not* inherit-only, for
+    /// anyone but the owner, refuses.
+    #[test]
+    fn an_inherit_only_entry_is_not_a_write_entry() {
+        let ts = Fake::new();
+        *ts.acl.borrow_mut() = program_files_acl();
+        check_files(&ts, &install()).unwrap();
+        register(&ts, &install()).unwrap();
+        for sid in ["S-1-5-11", "S-1-5-32-545", "S-1-1-0", "S-1-3-1"] {
+            let ts = Fake::new();
+            let mut acl = program_files_acl();
+            acl.push(entry(sid, 0x1000_0000, OI_CI_IO));
+            *ts.acl.borrow_mut() = acl;
+            check_files(&ts, &install()).unwrap_or_else(|e| panic!("{sid}: {e}"));
+        }
+        // CREATOR OWNER and OWNER RIGHTS on the object itself reach only its
+        // owner, which the check has already required to be trusted.
+        for sid in [CREATOR_OWNER, OWNER_RIGHTS] {
+            let ts = Fake::new();
+            ts.acl.borrow_mut().push(entry(sid, 0x1F_01FF, 0));
+            check_files(&ts, &install()).unwrap_or_else(|e| panic!("{sid}: {e}"));
+        }
+    }
+
+    /// F-1: a real write entry for someone else still refuses, whatever
+    /// inheritance flags it carries besides inherit-only, and the refusal
+    /// names the file, the principal and the rights.
+    #[test]
+    fn a_write_entry_for_someone_else_refuses() {
+        for flags in [0, 0x01, 0x02, 0x03, 0x10] {
+            let ts = Fake::new();
+            let mut acl = program_files_acl();
+            acl.push(entry("S-1-5-11", 0x0000_0002, flags));
+            *ts.acl.borrow_mut() = acl;
+            match check_files(&ts, &install()) {
+                Err(AutostartError::Unavailable(why)) => {
+                    assert!(
+                        why.contains(r"C:\Program Files\Tornect\tornect.exe")
+                            && why.contains("can be changed by S-1-5-11 (rights 0x2)"),
+                        "{why}"
+                    );
+                }
+                other => panic!("{flags:#x}: {other:?}"),
+            }
+            assert!(register(&ts, &install()).is_err(), "{flags:#x}");
+            assert!(ts.calls().is_empty(), "{flags:#x}: nothing registered");
+        }
+    }
+
+    /// F-2: an executable or a folder owned by anyone but SYSTEM,
+    /// Administrators or TrustedInstaller refuses (its owner could rewrite
+    /// its DACL), and the refusal says whose it is.
+    #[test]
+    fn a_wrong_owner_refuses() {
+        let args = crate::helper::HelperArgs {
+            pipe: crate::helper::pipe_name(&[9; 16]),
+            host_pid: 88,
+            hard_cap: std::time::Duration::from_secs(3600),
+        };
+        for path in [
+            r"C:\Program Files\Tornect\tornect.exe",
+            r"C:\Program Files\Tornect",
+        ] {
+            for owner in [SID, "S-1-5-32-545", "S-1-1-0", CREATOR_OWNER] {
+                let ts = Fake::new();
+                *ts.at.borrow_mut() = Some((
+                    path.to_owned(),
+                    Security {
+                        owner: owner.to_owned(),
+                        dacl: admin_acl(),
+                    },
+                ));
+                match check_files(&ts, &install()) {
+                    Err(AutostartError::Unavailable(why)) => assert_eq!(
+                        why,
+                        format!(
+                            "{path} is owned by {owner}, not by SYSTEM, Administrators or \
+                             TrustedInstaller"
+                        )
+                    ),
+                    other => panic!("{path} {owner}: {other:?}"),
+                }
+                assert!(run(&ts, &install(), &args).is_err(), "{path} {owner}");
+                assert!(ts.calls().is_empty(), "{path} {owner}: nothing run");
+            }
+        }
+        for owner in TRUSTED {
+            let ts = Fake::new();
+            *ts.at.borrow_mut() = Some((
+                r"C:\Program Files\Tornect".to_owned(),
+                Security {
+                    owner: owner.to_owned(),
+                    dacl: admin_acl(),
+                },
+            ));
+            check_files(&ts, &install()).unwrap_or_else(|e| panic!("{owner}: {e}"));
+        }
+    }
+
+    /// F-2: the folder above the install folder is read by the same rule (a
+    /// folder there that others may change lets them rename the install
+    /// folder away and put another in its place), up to Program Files and no
+    /// further; an executable outside Program Files is refused before any
+    /// read.
+    #[test]
+    fn the_parent_folder_is_checked_too() {
+        let ts = Fake::new();
+        check_files(&ts, &install()).unwrap();
+        assert_eq!(
+            *ts.read.borrow(),
+            [
+                r"C:\Program Files\Tornect\tornect.exe",
+                r"C:\Program Files\Tornect",
+                r"C:\Program Files",
+            ]
+        );
+        let deeper = Install {
+            exe: r"C:\Program Files\Vendor\Tornect\tornect.exe".to_owned(),
+            folder: r"C:\Program Files\Vendor\Tornect".to_owned(),
+            ..install()
+        };
+        assert_eq!(
+            guarded_paths(&deeper).unwrap(),
+            [
+                r"C:\Program Files\Vendor\Tornect\tornect.exe",
+                r"C:\Program Files\Vendor\Tornect",
+                r"C:\Program Files\Vendor",
+                r"C:\Program Files",
+            ]
+        );
+        for (parent, security) in [
+            (
+                r"C:\Program Files",
+                Security {
+                    owner: TRUSTED[2].to_owned(),
+                    dacl: vec![entry("S-1-5-11", 0x0000_0040, 0)],
+                },
+            ),
+            (
+                r"C:\Program Files",
+                Security {
+                    owner: SID.to_owned(),
+                    dacl: program_files_acl(),
+                },
+            ),
+        ] {
+            let ts = Fake::new();
+            *ts.at.borrow_mut() = Some((parent.to_owned(), security));
+            match check_files(&ts, &install()) {
+                Err(AutostartError::Unavailable(why)) => {
+                    assert!(why.starts_with(r"C:\Program Files "), "{why}");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(register(&ts, &install()).is_err());
+            assert!(ts.calls().is_empty(), "nothing registered");
+        }
+        let outside = Install {
+            exe: r"C:\Users\a\Tornect\tornect.exe".to_owned(),
+            folder: r"C:\Users\a\Tornect".to_owned(),
+            ..install()
+        };
+        let ts = Fake::new();
+        assert!(matches!(
+            check_files(&ts, &outside),
+            Err(AutostartError::Unavailable(_))
+        ));
+        assert!(ts.read.borrow().is_empty(), "nothing read");
     }
 
     #[test]

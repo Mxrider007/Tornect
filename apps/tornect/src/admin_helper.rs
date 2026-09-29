@@ -342,6 +342,10 @@ mod windows {
             host_pid: own_pid(),
             hard_cap: HARD_CAP,
         };
+        helper_task::check_files(&tasks, &install).map_err(|e| {
+            tracing::warn!(error = %e, "the administrator helper's files");
+            NotGiven::Files
+        })?;
         helper_task::run(&tasks, &install, &args).map_err(|e| {
             tracing::warn!(error = %e, "starting the administrator helper task");
             NotGiven::NotStarted
@@ -437,7 +441,7 @@ mod windows {
             let tasks = helper_task::for_this_user().map_err(|_| NotGiven::Unavailable)?;
             helper_task::check_files(&tasks, &install).map_err(|e| {
                 tracing::warn!(error = %e, "the administrator helper's files");
-                NotGiven::Refused
+                NotGiven::Files
             })?;
         }
         let args = HelperArgs {

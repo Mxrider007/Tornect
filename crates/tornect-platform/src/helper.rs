@@ -269,6 +269,10 @@ pub enum NotGiven {
     NoPipe,
     /// This host cannot start the helper (not installed, not Windows).
     Unavailable,
+    /// Tornect's files failed H6's check: the executable or a folder above it
+    /// up to Program Files has an owner or a writer that is not an
+    /// administrator, or could not be read (F-1, F-2).
+    Files,
 }
 
 impl NotGiven {
@@ -282,6 +286,10 @@ impl NotGiven {
             Self::Refused => "the process at the pipe was not the administrator helper",
             Self::NoPipe => "the helper's pipe could not be created",
             Self::Unavailable => "this computer cannot start the administrator helper",
+            Self::Files => {
+                "Tornect's files could be changed by someone who is not an administrator, or \
+                 could not be checked"
+            }
         }
     }
 }
@@ -704,5 +712,13 @@ mod tests {
         ] {
             assert!(!n.reason().is_empty());
         }
+    }
+
+    /// A refusal of the files says so, not that another process was at the
+    /// pipe.
+    #[test]
+    fn a_refusal_of_the_files_says_it_was_the_files() {
+        assert!(NotGiven::Files.reason().starts_with("Tornect's files"));
+        assert_ne!(NotGiven::Files.reason(), NotGiven::Refused.reason());
     }
 }
