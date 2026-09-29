@@ -96,6 +96,8 @@ fn serve(args: &HelperArgs) -> Exit {
         let mut reader = Reader(Arc::clone(&pipe));
         let spawned = std::thread::Builder::new()
             .name("helper-pipe".to_owned())
+            // An explicit size: std then never reads `RUST_MIN_STACK` (H2).
+            .stack_size(256 * 1024)
             .spawn(move || forward_frames(&mut reader, &tx));
         if spawned.is_err() {
             pipe.close();
