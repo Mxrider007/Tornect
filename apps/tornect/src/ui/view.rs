@@ -371,13 +371,16 @@ pub fn main_window(
     }
 }
 
-/// The open questions (the redesign's request sheet): a column of cards,
-/// one per question, the oldest first, at the top of the page's room, and
-/// the rest of the window below the banner dimmed and deaf to the pointer
-/// ([`scrim`]). Only when the cards do not all fit does the column scroll,
-/// and then it keeps the newest card's answers in view: when a card comes or
-/// goes, and when its room changes (a resize, the banner appearing). Returns
-/// where it was drawn.
+/// The open questions (the redesign's request sheet, §4): one question at a
+/// time, the oldest first, at the top of the page's room, under a line that
+/// says how many more are waiting, and the rest of the window below the
+/// banner dimmed and deaf to the pointer ([`scrim`]). The next question
+/// appears only once the shown one is answered, withdrawn or timed out, as
+/// a new card whose accepts wait their second ([`arm`]); the waiting line
+/// coming or going moves the card, which waits again. Only when the card
+/// does not fit does the column scroll, and then it keeps the card's answers
+/// in view: when the card changes, and when its room changes (a resize, the
+/// banner appearing). Returns where it was drawn.
 fn request_sheet(
     ui: &mut egui::Ui,
     model: &Model,
@@ -405,19 +408,37 @@ fn request_sheet(
             .animated(false)
             .show(ui, |ui| {
                 let open = model.popups.len() + usize::from(model.confirm.is_some());
-                if open > 1 {
+                let waiting = open.saturating_sub(1);
+                if waiting > 0 {
                     let t = theme::tokens(ui.ctx());
-                    ui.label(
-                        RichText::new(format!(
-                            "{open} questions are open: the oldest first, the newest last"
-                        ))
-                        .small()
-                        .color(t.on_accent)
-                        .background_color(t.accent_fill),
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(if waiting == 1 {
+                                "1 more waiting".to_owned()
+                            } else {
+                                format!("{waiting} more waiting")
+                            })
+                            .small()
+                            .color(t.on_accent)
+                            .background_color(t.accent_fill),
+                        )
+                        .selectable(false),
                     );
                 }
-                let mut newest = None;
-                for popup in &model.popups {
+                // The oldest question: the ids come from one counter, so the
+                // lowest is the oldest, host questions and this computer's
+                // code question alike.
+                let oldest = model.popups.iter().min_by_key(|popup| popup.id);
+                let confirm = model
+                    .confirm
+                    .as_ref()
+                    .filter(|confirm| oldest.is_none_or(|popup| confirm.id < popup.id));
+                let shown = if let Some(confirm) = confirm {
+                    let shared = model.screen_shared(now);
+                    let card =
+                        question(ui, |ui| confirm_popup(ui, confirm, shared, form, now, actions));
+                    Some((confirm.id, card))
+                } else if let Some(popup) = oldest {
                     let sheet = Sheet {
                         seen: model.recognition.get(&popup.id),
                         levels: model.levels.get(&popup.id),
@@ -426,16 +447,12 @@ fn request_sheet(
                         paired_recently: model.paired_recently.contains(&popup.id),
                     };
                     let card = question(ui, |ui| host_popup(ui, popup, sheet, form, now, actions));
-                    newest = Some((popup.id, card));
-                }
-                if let Some(confirm) = &model.confirm {
-                    let shared = model.screen_shared(now);
-                    let card =
-                        question(ui, |ui| confirm_popup(ui, confirm, shared, form, now, actions));
-                    newest = Some((confirm.id, card));
-                }
-                // Only when the newest card's answers are out of view.
-                if let Some((id, card)) = newest {
+                    Some((popup.id, card))
+                } else {
+                    None
+                };
+                // Only when the shown card's answers are out of view.
+                if let Some((id, card)) = shown {
                     let viewport = ui.clip_rect();
                     let tall = ui.min_rect().height().round() as i32;
                     let key = (viewport.size(), id, open, tall);
@@ -1986,22 +2003,33 @@ mod tests {
         }
     }
 
-    /// A card that moves (one above it answered, withdrawn or timed out)
-    /// waits another second before a click on it counts.
+    /// A card that moves (the waiting line above it coming as a question
+    /// arrives behind it, or going as that one is answered, withdrawn or
+    /// timed out) waits another second before a click on it counts.
     #[test]
     fn a_card_that_moves_waits_another_second() {
         let t0 = Instant::now();
-        let mut window = Harness::new(
-            with_popups(vec![pairing_popup(1, t0), session_popup(2, t0)]),
-            t0,
-        );
-        let moved_at = t0 + Duration::from_secs(3);
+        let mut window = Harness::new(with_popups(vec![session_popup(1, t0)]), t0);
+        let arrived_at = t0 + Duration::from_secs(3);
+        window.pass(arrived_at, Vec::new());
+        let alone = window.button("Allow control");
+        // A second question arrives: it waits, and its line above the card
+        // moves the card down.
+        window.model.popups.push(pairing_popup(2, t0));
+        window.pass(arrived_at, Vec::new());
+        let lower = window.button("Allow control");
+        assert!(lower.y > alone.y, "the session card moved down");
+        assert!(!window.has("Refuse"), "one question at a time");
+        let early = window.click(arrived_at + Duration::from_millis(300), lower);
+        assert!(early.is_empty(), "answered right after moving: {early:?}");
+
+        // The waiting question goes: its line goes, and the card moves up.
+        let moved_at = t0 + Duration::from_secs(6);
         window.pass(moved_at, Vec::new());
-        let before = window.button("Allow control");
-        window.model.popups.remove(0);
+        window.model.popups.remove(1);
         window.pass(moved_at, Vec::new());
         let allow = window.button("Allow control");
-        assert!(allow.y < before.y, "the session card moved up");
+        assert!(allow.y < lower.y, "the session card moved up");
 
         let early = window.click(moved_at + Duration::from_millis(300), allow);
         assert!(early.is_empty(), "answered right after moving: {early:?}");
@@ -2011,12 +2039,86 @@ mod tests {
             matches!(
                 late.as_slice(),
                 [Action::Session {
-                    id: 2,
+                    id: 1,
                     decision: SessionDecision::AllowOnce,
                     ..
                 }]
             ),
             "{late:?}"
+        );
+    }
+
+    /// The redesign §4: one question at a time, the oldest first, with how
+    /// many more are waiting; the next question appears only once the shown
+    /// one is gone, as a new card whose accepts wait their second; a click
+    /// on the shown card answers that card's question and no other.
+    #[test]
+    fn one_question_at_a_time_the_oldest_first() {
+        let t0 = Instant::now();
+        let mut model = with_popups(vec![
+            session_popup(4, t0),
+            pairing_popup(2, t0),
+            session_popup(9, t0),
+        ]);
+        model.confirm = Some(Confirm {
+            id: 7,
+            host_name: "Desk".to_owned(),
+            sas: "654 321".to_owned(),
+            host_waits_until: t0 + Duration::from_secs(50),
+            deadline: t0 + Duration::from_secs(600),
+        });
+        let mut window = Harness::new(model, t0);
+        let later = t0 + Duration::from_secs(3);
+        window.pass(later, Vec::new());
+        // The pairing question (id 2) is the oldest: it alone is shown.
+        assert!(window.text("3 more waiting").starts_with("3 more waiting"));
+        assert!(window.has("Refuse") && window.has("The codes match: pair"));
+        for other in ["Deny", "Allow control", "Yes, the codes match"] {
+            assert!(!window.has(other), "{other} of a waiting question");
+        }
+        // Answered (the popup leaves the model): the session question 4
+        // comes, in the pairing card's place, disarmed for its second.
+        window.model.popups.retain(|p| p.id != 2);
+        window.pass(later, Vec::new());
+        assert!(window.text("2 more waiting").starts_with("2 more waiting"));
+        assert!(!window.has("Refuse"));
+        assert!(
+            window.disabled("Allow control"),
+            "the new card waits its second"
+        );
+        let allow = window.button("Allow control");
+        let early = window.click(later + Duration::from_millis(300), allow);
+        assert!(early.is_empty(), "{early:?}");
+        window.pass(later + Duration::from_millis(1500), Vec::new());
+        let late = window.click(later + Duration::from_millis(1600), allow);
+        assert!(
+            matches!(
+                late.as_slice(),
+                [Action::Session {
+                    id: 4,
+                    decision: SessionDecision::AllowOnce,
+                    ..
+                }]
+            ),
+            "{late:?}"
+        );
+        // Then this computer's code question (id 7), older than session 9.
+        let at = later + Duration::from_secs(3);
+        window.model.popups.retain(|p| p.id != 4);
+        window.pass(at, Vec::new());
+        assert!(window.text("1 more waiting").starts_with("1 more waiting"));
+        assert!(window.has("Yes, the codes match") && !window.has("Deny"));
+        assert!(window.disabled("Yes, the codes match"));
+        // The last: no waiting line.
+        window.model.confirm = None;
+        window.pass(at, Vec::new());
+        assert!(window.has("Deny") && window.has("Allow control"));
+        assert!(
+            window
+                .nodes
+                .iter()
+                .all(|n| n.value().is_none_or(|v| !v.contains("more waiting"))),
+            "nothing waits"
         );
     }
 
