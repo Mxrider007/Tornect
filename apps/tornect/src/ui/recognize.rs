@@ -24,8 +24,10 @@ use tornect_core::{DeviceId, Paths, TornectId};
 use super::model::{MyWords, Recognition};
 
 /// How recently a device must have been paired for its session sheet to
-/// say the scam line beside the administrator answer: "moments before".
-pub const RECENTLY_PAIRED: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// say the scam line beside the administrator answer: "moments before",
+/// read as a day (a caller who had the pairing done may ring back hours
+/// later). The pairing time is stored as it was (`paired_at`, seconds).
+pub const RECENTLY_PAIRED: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 /// This computer: the name it declares and its two keys.
 #[derive(Clone)]
@@ -957,15 +959,17 @@ mod tests {
         }
     }
 
-    /// A device paired less than ten minutes ago counts as paired moments
-    /// before; later, or a device not paired here, does not.
+    /// A device paired less than a day ago counts as paired moments before;
+    /// a day later, or a device not paired here, does not.
     #[test]
-    fn paired_moments_before_is_ten_minutes() {
+    fn paired_moments_before_is_a_day() {
         let tmp = tempfile::tempdir().unwrap();
         let (_, words) = home(tmp.path());
         // "Office PC" was pinned at unix second 1000.
         assert!(words.paired_recently(&device(0x41), 1000 + 60));
-        assert!(!words.paired_recently(&device(0x41), 1000 + 10 * 60));
+        assert!(words.paired_recently(&device(0x41), 1000 + 10 * 60));
+        assert!(words.paired_recently(&device(0x41), 1000 + 24 * 3600 - 1));
+        assert!(!words.paired_recently(&device(0x41), 1000 + 24 * 3600));
         assert!(!words.paired_recently(&device(0x77), 1000 + 60));
     }
 }
