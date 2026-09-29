@@ -428,6 +428,19 @@ type AuthorityFactory = Arc<
         + Sync,
 >;
 
+/// `connect`, run once for the host's life: every Control session shares the
+/// first authority it connected (one system-bus connection per host, not one
+/// per session); a failed attempt is tried again by the next session.
+#[cfg(any(test, target_os = "linux"))]
+fn once_per_host(connect: AuthorityFactory) -> AuthorityFactory {
+    let cell: Arc<tokio::sync::OnceCell<Arc<dyn tornect_platform::polkit::TemporaryAuthority>>> =
+        Arc::default();
+    Arc::new(move || {
+        let (cell, connect) = (Arc::clone(&cell), Arc::clone(&connect));
+        Box::pin(async move { cell.get_or_try_init(|| connect()).await.cloned() })
+    })
+}
+
 /// Keeps polkit's remembered approvals revoked while a Control session is
 /// live (§B.2.1, M-FEAT-2): at its start and after every change the
 /// authority reports, until it ends. It only makes the person at the
@@ -444,12 +457,12 @@ impl PolkitRevocation {
     #[must_use]
     pub fn for_this_host() -> Self {
         #[cfg(all(target_os = "linux", not(test)))]
-        let authority: Option<AuthorityFactory> = Some(Arc::new(|| {
+        let authority: Option<AuthorityFactory> = Some(once_per_host(Arc::new(|| {
             Box::pin(async {
                 let authority = tornect_platform::polkit::SystemAuthority::connect().await?;
                 Ok(Arc::new(authority) as Arc<dyn tornect_platform::polkit::TemporaryAuthority>)
             })
-        }));
+        })));
         #[cfg(not(all(target_os = "linux", not(test))))]
         let authority: Option<AuthorityFactory> = None;
         Self::with(authority)
@@ -1430,5 +1443,49 @@ mod tests {
         );
         // This crate's own wiring never reaches the machine's polkit.
         assert!(PolkitRevocation::for_this_host().authority.is_none());
+    }
+
+    /// Every Control session of a host shares one authority (one bus
+    /// connection): the first that connected. A failed connection is tried
+    /// again by the next session.
+    #[tokio::test]
+    async fn the_host_connects_to_polkit_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tornect_platform::polkit::{BoxFuture, PolkitError, TemporaryAuthority};
+
+        struct Idle;
+        impl TemporaryAuthority for Idle {
+            fn revoke(&self) -> BoxFuture<'_, Result<(), PolkitError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn remembered(&self) -> BoxFuture<'_, Result<usize, PolkitError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn changes(
+                &self,
+            ) -> BoxFuture<'_, Result<tokio::sync::mpsc::Receiver<()>, PolkitError>> {
+                Box::pin(async { Ok(tokio::sync::mpsc::channel(1).1) })
+            }
+        }
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let connect: AuthorityFactory = {
+            let attempts = Arc::clone(&attempts);
+            Arc::new(move || {
+                let n = attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if n == 0 {
+                        Err(PolkitError("no bus yet".to_owned()))
+                    } else {
+                        Ok(Arc::new(Idle) as Arc<dyn TemporaryAuthority>)
+                    }
+                })
+            })
+        };
+        let shared = once_per_host(connect);
+        assert!(shared().await.is_err(), "the first attempt failed");
+        let a = shared().await.expect("the second connected");
+        let b = shared().await.expect("then shared");
+        assert!(Arc::ptr_eq(&a, &b), "one authority for every session");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "connected once");
     }
 }

@@ -316,7 +316,6 @@ impl TemporaryAuthority for SystemAuthority {
 
     fn changes(&self) -> BoxFuture<'_, Result<tokio::sync::mpsc::Receiver<()>, PolkitError>> {
         Box::pin(async move {
-            use zbus::export::futures_core::Stream;
             let rule = zbus::MatchRule::builder()
                 .msg_type(zbus::message::Type::Signal)
                 .sender(POLKIT)
@@ -325,26 +324,36 @@ impl TemporaryAuthority for SystemAuthority {
                 .and_then(|b| b.member("Changed"))
                 .map_err(|e| PolkitError(format!("match rule: {e}")))?
                 .build();
-            let mut stream = zbus::MessageStream::for_match_rule(rule, &self.conn, Some(16))
+            let stream = zbus::MessageStream::for_match_rule(rule, &self.conn, Some(16))
                 .await
                 .map_err(|e| PolkitError(format!("subscribing to Changed: {e}")))?;
             let (tx, rx) = tokio::sync::mpsc::channel(4);
-            tokio::spawn(async move {
-                loop {
-                    let next = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await;
-                    match next {
-                        Some(Ok(_)) => {
-                            // A full channel already holds a wake-up.
-                            if tx.try_send(()).is_err() && tx.is_closed() {
-                                break;
-                            }
-                        }
-                        Some(Err(_)) | None => break,
-                    }
-                }
-            });
+            tokio::spawn(forward_changes(stream, tx));
             Ok(rx)
         })
+    }
+}
+
+/// Forward one `()` per item of `stream` to `tx` until the stream ends or
+/// fails, or the receiver is dropped, whichever comes first. The receiver's
+/// end is watched beside the stream, so the task ends — and drops the
+/// stream, its match rule and its hold on the bus connection — the moment
+/// the Control session's watch goes, not at the authority's next `Changed`,
+/// which on a quiet desktop can be days away.
+#[cfg(target_os = "linux")]
+async fn forward_changes<S, T, E>(mut stream: S, tx: tokio::sync::mpsc::Sender<()>)
+where
+    S: zbus::export::futures_core::Stream<Item = Result<T, E>> + Unpin,
+{
+    loop {
+        tokio::select! {
+            () = tx.closed() => break,
+            next = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)) => match next {
+                // A full channel already holds a wake-up.
+                Some(Ok(_)) => drop(tx.try_send(())),
+                Some(Err(_)) | None => break,
+            },
+        }
     }
 }
 
@@ -453,6 +462,52 @@ mod tests {
             fake.remembered.load(Ordering::SeqCst),
             1,
             "watched after the session ended"
+        );
+    }
+
+    /// A stream of the authority's signals that never yields: the quiet
+    /// desktop. It says when it is dropped.
+    #[cfg(target_os = "linux")]
+    struct Quiet(Arc<std::sync::atomic::AtomicBool>);
+
+    #[cfg(target_os = "linux")]
+    impl zbus::export::futures_core::Stream for Quiet {
+        type Item = Result<(), PolkitError>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Quiet {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// When the Control session's watch ends, the task that forwards the
+    /// authority's signals ends too, and drops its subscription (the match
+    /// rule and the connection it holds), though no signal came.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_ended_watch_leaves_no_subscription_behind() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel(4);
+        let task = tokio::spawn(forward_changes(Quiet(Arc::clone(&dropped)), tx));
+        settle().await;
+        assert!(!task.is_finished(), "it forwards while the watch lives");
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the forwarder ended with the watch")
+            .expect("it did not panic");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "its subscription was dropped"
         );
     }
 
