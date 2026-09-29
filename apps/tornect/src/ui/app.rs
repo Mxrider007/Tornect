@@ -646,6 +646,44 @@ impl App {
             Action::SaveEntry(id, name) => self.command(Command::SaveEntry(id, name)),
             Action::ClearHistory => self.command(Command::ClearHistory),
             Action::SetHistory(on) => self.command(Command::SetHistory(on)),
+            Action::AskPassword(id) => {
+                self.form.ua.clear();
+                self.command(Command::AskPassword(id, None));
+            }
+            Action::AskAdmin(id, action) => {
+                self.form.ua.clear();
+                self.command(Command::AskPassword(id, Some(action)));
+            }
+            Action::SubmitPrompt { pointer } => {
+                // The accept answers the pointer only: no key sequence sends
+                // a password, remembered or typed (§B.8.10).
+                if !pointer {
+                    return;
+                }
+                let Some(prompt) = self.popups.shared().read(|m| m.prompt.clone()) else {
+                    self.form.ua.clear();
+                    return;
+                };
+                let ua = &mut self.form.ua;
+                let typed = std::mem::take(&mut ua.password);
+                let choice = super::backend::UaChoice {
+                    password: (!typed.is_empty()).then(|| super::backend::Secret(typed)),
+                    view_only: ua.view_only,
+                    remember: ua.remember,
+                    administrator: ua.administrator && prompt.may_admin,
+                };
+                self.form.ua.clear();
+                self.popups.shared().update(|m| m.prompt = None);
+                self.command(match prompt.admin {
+                    Some(action) => Command::Admin(prompt.id, action, choice),
+                    None => Command::ConnectUnattended(prompt.id, choice),
+                });
+            }
+            Action::ClosePrompt => {
+                self.form.ua.clear();
+                self.popups.shared().update(|m| m.prompt = None);
+            }
+            Action::ConfirmSetupChanged(id) => self.command(Command::ConfirmSetupChanged(id)),
         }
     }
 

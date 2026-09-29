@@ -263,6 +263,8 @@ mod tests {
     }
 
     const WIDE: (f32, f32) = (1200.0, 760.0);
+    /// Tall enough for the details' lowest rows.
+    const TALL: (f32, f32) = (1200.0, 1100.0);
     const NARROW: (f32, f32) = (560.0, 720.0);
     const THEMES: [egui::Theme; 2] = [egui::Theme::Dark, egui::Theme::Light];
     const PAGES: [Page; 5] = [
@@ -754,15 +756,26 @@ mod tests {
         assert!(window.form.qr);
         window.pass(Vec::new());
         assert!(window.nodes.iter().any(|n| n.label() == Some("QR code")));
-        // The saved cards' Connect: the first "Connect" is the connect card's.
+        // The saved cards' Knock (§B.8.10: Knock comes first until a
+        // connect without asking worked there); the connect card's own
+        // button stays "Connect".
         let connects: Vec<egui::Pos2> = window
             .nodes
             .iter()
-            .filter(|n| n.label() == Some("Connect"))
+            .filter(|n| n.label() == Some("Knock"))
             .filter_map(Node::bounds)
             .map(|b| egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
             .collect();
-        assert_eq!(connects.len(), 4, "the connect card's and three saved ones");
+        assert_eq!(connects.len(), 3, "the three saved ones");
+        assert_eq!(
+            window
+                .nodes
+                .iter()
+                .filter(|n| n.label() == Some("Connect"))
+                .count(),
+            1,
+            "the connect card's"
+        );
         let lowest = connects
             .iter()
             .copied()
@@ -777,6 +790,288 @@ mod tests {
         let open = window.center("Open address book");
         assert!(window.click(open).is_empty());
         assert_eq!(window.form.page, Page::AddressBook);
+    }
+
+    /// The highest node labelled `label` (the prompt sits above the page).
+    fn topmost<'a>(window: &'a Window, label: &str) -> &'a Node {
+        window
+            .nodes
+            .iter()
+            .filter(|n| n.label() == Some(label))
+            .min_by(|a, b| {
+                let y = |n: &Node| n.bounds().map_or(f64::MAX, |b| b.y0);
+                y(a).total_cmp(&y(b))
+            })
+            .unwrap_or_else(|| panic!("no \"{label}\" on screen"))
+    }
+
+    /// The labelled controls' centres, top first.
+    fn centres(window: &Window, label: &str) -> Vec<egui::Pos2> {
+        let mut at: Vec<egui::Pos2> = window
+            .nodes
+            .iter()
+            .filter(|n| n.label() == Some(label))
+            .filter_map(Node::bounds)
+            .map(|b| egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
+            .collect();
+        at.sort_by(|a, b| a.y.total_cmp(&b.y));
+        at
+    }
+
+    /// §B.8.10: a saved computer's card offers Connect (without asking, the
+    /// prompt first) as its first action once an unattended session worked
+    /// there, Knock otherwise; its admin actions each ask first, naming it,
+    /// and only then open the prompt; an unread setup change holds Connect.
+    #[test]
+    fn the_host_card_offers_connect_after_a_first_success_and_knock_otherwise() {
+        use crate::ua_client::AdminAction;
+        let mut model = with_book(false);
+        let id = office(&model);
+        model.book.computers[0].unattended.worked_before = true;
+        let mut window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
+        // The connect card's Connect and Office PC's; Knock for the others
+        // and as Office PC's second action.
+        assert_eq!(centres(&window, "Connect").len(), 2);
+        assert_eq!(centres(&window, "Knock").len(), 3);
+        let office_connect = *centres(&window, "Connect").last().unwrap();
+        assert_eq!(window.click(office_connect), vec![Action::AskPassword(id)]);
+
+        let mut window = Window::new(model.clone(), Page::AddressBook, egui::Theme::Light, TALL);
+        let revoke = window.center("Revoke this device");
+        assert!(window.click(revoke).is_empty(), "nothing is sent by itself");
+        assert_eq!(
+            window.form.ua.confirming,
+            Some((id, AdminAction::RevokeThisDevice))
+        );
+        window.pass(Vec::new());
+        assert!(has_text(&window, "Revoke this device at \"Office PC\"?"));
+        let go = window.center("Continue: the password");
+        assert_eq!(
+            window.click(go),
+            vec![Action::AskAdmin(id, AdminAction::RevokeThisDevice)]
+        );
+        // Turn unattended off is offered only after a control session there.
+        assert!(
+            !window
+                .nodes
+                .iter()
+                .any(|n| n.label() == Some("Turn unattended off there"))
+        );
+        let mut control = model.clone();
+        control.book.computers[0].unattended.control = true;
+        let window = Window::new(control, Page::AddressBook, egui::Theme::Light, TALL);
+        assert!(
+            window
+                .nodes
+                .iter()
+                .any(|n| n.label() == Some("Turn unattended off there"))
+        );
+
+        // Without a success there: Knock first, and a paired computer may
+        // still connect without asking.
+        let fresh = with_book(false);
+        let mut window = Window::new(fresh, Page::AddressBook, egui::Theme::Dark, TALL);
+        let knock = window.center("Knock");
+        assert_eq!(window.click(knock), vec![Action::Connect(id)]);
+        let ask = window.center("Connect without asking");
+        assert_eq!(window.click(ask), vec![Action::AskPassword(id)]);
+        assert!(
+            !window
+                .nodes
+                .iter()
+                .any(|n| n.label() == Some("Revoke this device"))
+        );
+
+        // An unread setup change holds Connect until confirmed.
+        let mut held = model;
+        held.setup_changed.insert(id);
+        let mut window = Window::new(held, Page::AddressBook, egui::Theme::Dark, TALL);
+        assert!(window.node("Connect").is_disabled());
+        assert!(has_text(&window, "unattended setup was re-created"));
+        let read = window.center("I read this");
+        assert_eq!(window.click(read), vec![Action::ConfirmSetupChanged(id)]);
+    }
+
+    fn prompt(id: TornectId) -> super::super::model::Prompt {
+        use tornect_core::unattended::credentials::RememberOffer;
+        super::super::model::Prompt {
+            id,
+            host: "Office PC".to_owned(),
+            keychain: Some("a test keychain"),
+            remember: (RememberOffer::Offered, RememberOffer::NotForAdministrator),
+            remembered: false,
+            stale: false,
+            may_admin: false,
+            retry_at: None,
+            admin: None,
+        }
+    }
+
+    /// §B.8.10, §B.8.9.1: the prompt is masked with a reveal toggle and
+    /// "View only this time"; "Remember on this device" is off, with its
+    /// risk copy, and absent without a keychain and for a grant that may
+    /// carry the administrator level (the sentence says why); what the
+    /// computer said about waiting shows before submitting.
+    #[test]
+    fn the_prompt_offers_remember_only_where_it_may() {
+        use tornect_core::unattended::credentials::{
+            ADMIN_NOT_REMEMBERED, NO_KEYCHAIN, RememberOffer,
+        };
+        let mut model = with_book(false);
+        let id = office(&model);
+        model.prompt = Some(prompt(id));
+        let window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
+        let controls = window.controls();
+        for want in [
+            "Password",
+            "Show",
+            "View only this time",
+            "Remember on this device",
+        ] {
+            assert!(controls.iter().any(|c| c == want), "{want}: {controls:?}");
+        }
+        assert!(!controls.iter().any(|c| c == "Ask for administrator access"));
+        assert!(has_text(&window, "any program running as you can read it"));
+        assert!(has_text(&window, "Connect to \"Office PC\" without asking"));
+        assert!(!window.form.ua.remember, "off by default");
+
+        let mut none = model.clone();
+        none.prompt.as_mut().unwrap().keychain = None;
+        none.prompt.as_mut().unwrap().remember =
+            (RememberOffer::NoKeychain, RememberOffer::NoKeychain);
+        let window = Window::new(none, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(
+            !window
+                .controls()
+                .iter()
+                .any(|c| c == "Remember on this device")
+        );
+        assert!(has_text(&window, NO_KEYCHAIN));
+
+        let mut admin = model.clone();
+        admin.prompt.as_mut().unwrap().may_admin = true;
+        let window = Window::new(admin, Page::Home, egui::Theme::Dark, WIDE);
+        let controls = window.controls();
+        assert!(controls.iter().any(|c| c == "Ask for administrator access"));
+        assert!(!controls.iter().any(|c| c == "Remember on this device"));
+        assert!(has_text(&window, ADMIN_NOT_REMEMBERED));
+
+        let mut waiting = model;
+        waiting.prompt.as_mut().unwrap().retry_at = Some(Instant::now() + Duration::from_secs(600));
+        let window = Window::new(waiting, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(&window, "asked this device to wait"));
+    }
+
+    /// §B.8.10: the prompt is never shown while this screen is shared: no
+    /// field and no name, only that it waits.
+    #[test]
+    fn the_prompt_waits_while_this_screen_is_shared() {
+        let mut model = with_book(false);
+        let id = office(&model);
+        model.prompt = Some(prompt(id));
+        model.hosted_elsewhere = true;
+        let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(&window, "The password prompt waits"));
+        assert!(!window.controls().iter().any(|c| c == "Password"));
+        assert!(!has_text(&window, "Office PC"));
+    }
+
+    /// §B.8.10: the prompt's Connect answers a click of the pointer only:
+    /// Enter and Space never send a password, typed or remembered.
+    #[test]
+    fn the_prompt_sends_on_a_click_only() {
+        let mut model = with_book(false);
+        let id = office(&model);
+        model.prompt = Some(prompt(id));
+        let mut window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
+        assert!(
+            topmost(&window, "Connect").is_disabled(),
+            "nothing typed yet"
+        );
+        window.form.ua.password = zeroize::Zeroizing::new("quiet verdant otter".to_owned());
+        window.pass(Vec::new());
+        let field = window.center("Password");
+        assert!(window.click(field).is_empty());
+        for key in [
+            egui::Key::Enter,
+            egui::Key::Space,
+            egui::Key::Tab,
+            egui::Key::Enter,
+        ] {
+            assert!(window.key(key).is_empty(), "{key:?} sent nothing");
+        }
+        let connect = centres(&window, "Connect")[0];
+        assert_eq!(
+            window.click(connect),
+            vec![Action::SubmitPrompt { pointer: true }]
+        );
+        // A remembered password: Connect is live without typing, and still
+        // answers the pointer only.
+        model.prompt.as_mut().unwrap().remembered = true;
+        let mut window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(
+            &window,
+            "The password remembered in a test keychain is used."
+        ));
+        assert!(!window.controls().iter().any(|c| c == "Password"));
+        assert!(!topmost(&window, "Connect").is_disabled());
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            assert!(window.key(key).is_empty(), "{key:?} sent nothing");
+        }
+    }
+
+    /// §B.8.10: the unattended stepper's own steps (the password, then the
+    /// computer's checks, generic, no countdown; no direct path in this
+    /// version), the badge from the signed accept, the failed attempts, and
+    /// the withheld level, naming the computer only while not shared.
+    #[test]
+    fn the_unattended_stepper_and_badge() {
+        use super::super::model::{ClientStage, Dial, UaLive, Viewing};
+        let mut model = with_book(false);
+        let id = office(&model);
+        model.dial = Dial {
+            id: Some(id),
+            since: Some(Instant::now()),
+            paired_now: false,
+            failed: None,
+            unattended: true,
+        };
+        model.client = ClientStage::Checking;
+        let window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
+        for said in [
+            "Checking the password",
+            "Someone at the computer can still block this, or must allow it",
+            "No direct path in this version: relayed through Tor",
+        ] {
+            assert!(has_text(&window, said), "{said}");
+        }
+        model.client = ClientStage::Live(Viewing {
+            host: "Office PC".to_owned(),
+            control: true,
+            administrator: false,
+            unattended: true,
+            since: Instant::now(),
+            pictures: 0,
+            size: (0, 0),
+        });
+        model.ua_live = Some(UaLive {
+            withheld: true,
+            fail_summary: Some("3 failed attempts since your last login".to_owned()),
+        });
+        let window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(&window, "Unattended · Control"));
+        assert!(has_text(&window, "3 failed attempts since your last login"));
+        assert!(has_text(
+            &window,
+            "Administrator access unavailable at \"Office PC\""
+        ));
+        model.hosted_elsewhere = true;
+        let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(
+            &window,
+            "Administrator access unavailable at the computer"
+        ));
+        assert!(!has_text(&window, "Office PC"));
     }
 
     /// Days read as people say them: today, yesterday, within a week, else a
@@ -1278,6 +1573,7 @@ mod tests {
             since: Some(Instant::now()),
             paired_now: true,
             failed,
+            unattended: false,
         };
         let steps = [
             "Reaching the computer over Tor",
@@ -1313,6 +1609,7 @@ mod tests {
             host: "Desk".to_owned(),
             control: true,
             administrator: true,
+            unattended: false,
             since: Instant::now(),
             pictures: 1,
             size: (1280, 720),
@@ -1434,6 +1731,10 @@ mod tests {
             Sheet::StageUnreachable,
             Sheet::StageDenied,
             Sheet::StageCodesDiffer,
+            Sheet::UaCard,
+            Sheet::UaPrompt,
+            Sheet::UaRefused,
+            Sheet::UaLive,
         ];
         let accepts = |actions: &[Action]| {
             actions.iter().any(|a| {
@@ -1451,6 +1752,7 @@ mod tests {
                         | Action::Confirm { matched: true, .. }
                         | Action::AdminConfirm { .. }
                         | Action::AdminPrompt { .. }
+                        | Action::SubmitPrompt { .. }
                 )
             })
         };

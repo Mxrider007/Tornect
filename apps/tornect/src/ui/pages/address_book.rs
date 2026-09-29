@@ -14,6 +14,7 @@ use super::super::theme::{self, Face, Tokens};
 use super::super::view::{Action, Form};
 use super::super::widgets::{self, Button, Kind, Tone};
 use super::{day_in_sentence, day_text};
+use crate::ua_client::AdminAction;
 
 /// The page's tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -465,15 +466,35 @@ fn details(
 
         let idle = matches!(model.client, ClientStage::Idle | ClientStage::Ended(_));
         let check = book.check(&id);
-        ui.horizontal_wrapped(|ui| {
-            if Button::new(Kind::Primary, "Connect")
-                .icon(Icon::ArrowRight)
-                .enabled(model.tor.is_ready() && idle)
+        if model.setup_changed.contains(&id) {
+            note_line(
+                ui,
+                Icon::CircleAlert,
+                &format!(
+                    "\"{}\"'s unattended setup was re-created since you last connected — if \
+                     that wasn't you, revoke devices there.",
+                    computer.title()
+                ),
+                t.warn,
+            );
+            if Button::new(Kind::Secondary, "I read this")
+                .small()
                 .show(ui)
                 .clicked()
             {
-                actions.push(Action::Connect(id));
+                actions.push(Action::ConfirmSetupChanged(id));
             }
+        }
+        ui.horizontal_wrapped(|ui| {
+            super::home::host_actions_with(
+                ui,
+                model,
+                computer,
+                model.tor.is_ready() && idle,
+                false,
+                false,
+                actions,
+            );
             let asking = check == Some(&Check::Asking);
             if Button::new(
                 Kind::Secondary,
@@ -521,7 +542,101 @@ fn details(
         ui.add_space(8.0);
         rename_row(ui, t, computer, form, actions);
         forget_row(ui, t, computer, form, actions);
+        if computer.paired.is_some() {
+            ui.add_space(8.0);
+            let ready = model.tor.is_ready() && idle && !model.setup_changed.contains(&id);
+            admin_row(ui, t, model, computer, ready, form, actions);
+        }
     });
+}
+
+/// The admin commands of this device's unattended access there (§B.8.10):
+/// Revoke this device and End the session for every grant; Turn unattended
+/// off only after a control session (the host checks the *My machines*
+/// scope, B.8.4.1). Each is one action, confirmed in words that name the
+/// computer, then the password prompt; nothing is sent by itself.
+fn admin_row(
+    ui: &mut Ui,
+    t: &Tokens,
+    model: &Model,
+    computer: &Computer,
+    ready: bool,
+    form: &mut Form,
+    actions: &mut Vec<Action>,
+) {
+    let id = computer.id;
+    widgets::caps_label(ui, "Unattended access there");
+    if !computer.unattended.worked_before {
+        // Before a first success: the way to try it (Knock stays first).
+        if Button::new(Kind::Ghost, "Connect without asking")
+            .small()
+            .enabled(ready)
+            .show(ui)
+            .clicked()
+        {
+            actions.push(Action::AskPassword(id));
+        }
+        muted(
+            ui,
+            t,
+            "Works once its owner gave this device unattended access there; the password is \
+             asked first.",
+        );
+        return;
+    }
+    if let Some((_, action)) = form.ua.confirming.filter(|(c, _)| *c == id) {
+        widgets::card_frame(t, 12, Margin::same(12))
+            .stroke(Stroke::new(1.0, theme::tint(t.danger_text, 0.5)))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(action.confirmation(&computer.title())).color(t.text_primary),
+                    )
+                    .wrap(),
+                );
+                ui.horizontal(|ui| {
+                    if Button::new(Kind::Secondary, "Keep things as they are")
+                        .small()
+                        .show(ui)
+                        .clicked()
+                    {
+                        form.ua.confirming = None;
+                    }
+                    if Button::new(Kind::Danger, "Continue: the password")
+                        .small()
+                        .enabled(model.tor.is_ready())
+                        .show(ui)
+                        .clicked()
+                    {
+                        form.ua.confirming = None;
+                        actions.push(Action::AskAdmin(id, action));
+                    }
+                });
+            });
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        let mut offered = vec![AdminAction::RevokeThisDevice, AdminAction::EndSession];
+        if computer.unattended.control {
+            offered.push(AdminAction::TurnOff);
+        }
+        for action in offered {
+            if Button::new(Kind::Ghost, action.title())
+                .small()
+                .show(ui)
+                .clicked()
+            {
+                form.ua.confirming = Some((id, action));
+            }
+        }
+    });
+    muted(
+        ui,
+        t,
+        "Each asks you first, then for the password. Turning unattended off there works only \
+         from a \"My machines\" access with control; the computer decides.",
+    );
 }
 
 /// Copy ID and Rename, or the name field while renaming.
