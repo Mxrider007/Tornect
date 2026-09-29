@@ -1147,6 +1147,158 @@ impl AdminHelper for FakeHelper {
             }
         })
     }
+
+    fn start_task<'a>(
+        self: Arc<Self>,
+        peer: &'a crate::pairing::TrustedPeer,
+    ) -> BoxFuture<'a, Result<Box<dyn AttachedHelper>, &'static str>> {
+        self.start(peer)
+    }
+}
+
+/// An unattended grant whose receipt is at the administrator level (what
+/// an admin grant of M-FEAT-5 will give).
+struct AdminGrant;
+
+impl UnattendedHook for AdminGrant {
+    fn handle<'a>(
+        &'a self,
+        ctx: UnattendedContext<'a>,
+    ) -> BoxFuture<'a, Result<UnattendedVerdict, HandshakeError>> {
+        Box::pin(async move {
+            let policy = PolicyReceipt::mint(
+                [9u8; 8],
+                SessionMode::Control,
+                TransportPolicy::Any,
+                None,
+                0,
+                false,
+                ReadinessSnapshot::default(),
+                None,
+            )
+            .with_elevation(tornect_core::levels::Elevation::Admin);
+            Ok(UnattendedVerdict::Accept {
+                proof: ConsentProof::Unattended {
+                    grant: [9u8; 8],
+                    proof_fp: [0u8; 8],
+                    policy,
+                    block: WindowPassed::Skipped,
+                    token: DerivedToken::new([0xA5; 32], [0x5A; 32]),
+                },
+                caps: ChosenCaps::negotiate(&Caps::default(), &ctx.request.caps),
+            })
+        })
+    }
+}
+
+/// One unattended session of [`AdminGrant`] against `host`: the elevation its
+/// accept signed.
+async fn unattended_admin_session(host: &HostSide) -> tornect_core::levels::Elevation {
+    let (a, b) = pipe();
+    let task = spawn_host(a, host);
+    let mut raw = raw_unattended_request(host, CLIENT_SEED, b).await;
+    // Longer than the host's own wait for the helper task.
+    let rx = raw
+        .chan
+        .recv(Duration::from_secs(30), "accept")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rx.env.kind, Kind::SessionAccept);
+    let accept: messages::SessionAccept = decode_body(&rx.env.body).unwrap();
+    raw.chan.absorb(&rx);
+    raw.chan.bye(bye::USER).await.unwrap();
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        HostOutcome::Session {
+            unattended: true,
+            ..
+        }
+    ));
+    accept.elevation()
+}
+
+/// §B.8.7.5: an unattended administrator session on a row whose host holds a
+/// filtered token starts the helper task after its checks and block window;
+/// ready ⇒ the accept carries the administrator level and the helper
+/// attaches to that session; not ready ⇒ the session starts at none and
+/// stays there, `admin_helper_failed` logged. No popup either way.
+#[tokio::test]
+async fn an_unattended_administrator_session_takes_the_helper_task_or_starts_at_none() {
+    use tornect_core::levels::Elevation;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    host.deps.unattended = Arc::new(AdminGrant);
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+    host.cfg.levels = installed_row();
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    for (script, expected) in [
+        (HelperScript::Ready, Elevation::Admin),
+        (
+            HelperScript::Fail("the helper task did not start"),
+            Elevation::None,
+        ),
+    ] {
+        let helper = Arc::new(FakeHelper::default());
+        *helper.script.lock().unwrap() = vec![script];
+        host.deps.admin_helper = helper.clone();
+        assert_eq!(unattended_admin_session(&host).await, expected);
+        assert_eq!(helper.started.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            helper.attached.lock().unwrap().len(),
+            usize::from(expected == Elevation::Admin)
+        );
+    }
+    let failed = audit.0.lock().unwrap().iter().any(|e| {
+        matches!(
+            e,
+            AuditEvent::AdminHelper {
+                what: HelperEvent::Failed,
+                ..
+            }
+        )
+    });
+    assert!(failed);
+    assert_eq!(host.consent.session_popups(), 0, "no popup for unattended");
+    // Where every program runs as administrator (UAC off), the level needs
+    // no helper: none is started.
+    host.cfg.levels = Availability::of(Some(&WindowsFacts {
+        installed: true,
+        administrator: true,
+        enable_lua: Some(0),
+        ..WindowsFacts::default()
+    }));
+    let helper = Arc::new(FakeHelper::default());
+    host.deps.admin_helper = helper.clone();
+    assert_eq!(unattended_admin_session(&host).await, Elevation::Admin);
+    assert_eq!(helper.started.load(Ordering::SeqCst), 0);
+}
+
+/// §B.8.7.5: a helper task not connected within 5 s is ended, never attached,
+/// and the unattended session starts at none.
+#[tokio::test(start_paused = true)]
+async fn a_late_helper_task_leaves_the_session_at_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    host.deps.unattended = Arc::new(AdminGrant);
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+    host.cfg.levels = installed_row();
+    let helper = Arc::new(FakeHelper::default());
+    *helper.script.lock().unwrap() = vec![HelperScript::ReadyAfter(
+        host::HELPER_TASK_BUDGET + Duration::from_secs(1),
+    )];
+    host.deps.admin_helper = helper.clone();
+    assert_eq!(
+        unattended_admin_session(&host).await,
+        tornect_core::levels::Elevation::None
+    );
+    assert!(helper.attached.lock().unwrap().is_empty(), "never attached");
+    assert_eq!(helper.ended.load(Ordering::SeqCst), 1, "ended");
 }
 
 fn installed_row() -> Availability {
