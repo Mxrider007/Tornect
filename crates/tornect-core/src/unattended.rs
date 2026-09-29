@@ -15,11 +15,13 @@
 //! | [`ipc`] | §B.8.7.4 | IPC message types, CBOR codec, `E_*` / `G_*` codes |
 //! | [`password`] | §B.8.7.2 | password policy |
 //! | [`hosts`] | §B.8.9 | client-side `hosts.toml` |
+//! | [`credentials`] | §B.8.9.1 | remembered passwords: the derived entry name, the keychain seam |
 //! | [`clock`] | §B.8.5.3 | `Clock`, `SystemClock`, `FakeClock` |
 //! | `keyring` | §B.8.9 | `K_master` in an OS keychain (`keyring` feature) |
 
 pub mod clock;
 pub mod codec;
+pub mod credentials;
 pub mod grant;
 pub mod guard;
 pub mod hosts;

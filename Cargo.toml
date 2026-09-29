@@ -120,6 +120,9 @@ zxcvbn = "=3.1.1"
 # OS keychain for K_master (§B.8.9), behind the `keyring` feature; file keystore is the fallback.
 keyring-core = "=1.0.0"
 linux-keyutils-keyring-store = "=1.0.0"
+# Remembered unattended passwords on Windows (§B.8.9.1, M-FEAT-4): Credential Manager,
+# the keyring-core family's store; `search` (and with it `regex`) off.
+windows-native-keyring-store = { version = "=1.1.0", default-features = false }
 # Milestone 1 — Linux OS re-authentication (§B.8.6.2, §B.8.8, §B.8.14). Pure-Rust
 # D-Bus client for polkit's `CheckAuthorization`: no libdbus, and no PAM headers
 # because polkit runs the PAM conversation out of process in its setuid
