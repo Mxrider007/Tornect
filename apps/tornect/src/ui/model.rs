@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tornect_core::TornectId;
 use tornect_core::address_book::{Day, mixes_scripts};
@@ -81,6 +81,46 @@ impl Shared {
     }
 }
 
+/// The devices whose last session answer was "Allow as administrator", and
+/// when: the session that answer starts runs at the administrator level
+/// (the host signs the answer's level, and refuses one its row does not
+/// offer). A note older than [`AdminAnswers::KEPT`] is stale.
+#[derive(Clone, Default)]
+pub struct AdminAnswers(Arc<Mutex<HashMap<[u8; 32], Instant>>>);
+
+impl AdminAnswers {
+    /// How long a note waits for its session to start.
+    pub const KEPT: Duration = Duration::from_secs(30);
+
+    /// Note the answer given for `device`: an administrator one, or not.
+    pub fn note(&self, device: [u8; 32], admin: bool) {
+        let mut notes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if admin {
+            notes.insert(device, Instant::now());
+        } else {
+            notes.remove(&device);
+        }
+    }
+
+    /// Whether the session of `device` starting now is the one an
+    /// administrator answer allowed; the note is used up.
+    #[must_use]
+    pub fn take(&self, device: &[u8; 32]) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(device)
+            .is_some_and(|at| at.elapsed() < Self::KEPT)
+    }
+}
+
+impl std::fmt::Debug for AdminAnswers {
+    /// No key: a debug line never names a device.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminAnswers").finish_non_exhaustive()
+    }
+}
+
 /// Everything the windows show.
 #[derive(Debug, Clone, Default)]
 pub struct Model {
@@ -96,6 +136,13 @@ pub struct Model {
     pub popups: Vec<Popup>,
     /// The client's "did the host show this code?" question.
     pub confirm: Option<Confirm>,
+    /// The shared sessions (by `sessions.log` id) that run at the
+    /// administrator level: the answer the host signed was "Allow as
+    /// administrator" (§B.2.1). The banner and the indicator say so.
+    pub admin_sessions: HashSet<String>,
+    /// The administrator answers given on this host's sheets, waiting for
+    /// the sessions they start.
+    pub admin_answers: AdminAnswers,
     /// The sessions this machine's screen is shared with, oldest first. The
     /// host serves one at a time, but a list keeps every live one on the
     /// indicator should two ever overlap (one's end reported after the next
@@ -167,7 +214,7 @@ impl Model {
     /// How long an accepted session counts as sharing before it goes live:
     /// the host sends its accept at once, and a session that has not started
     /// by then never will (the client has 15 s to go on, §B.8.4.5).
-    pub const ACCEPTED_HIDES_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+    pub const ACCEPTED_HIDES_FOR: Duration = Duration::from_secs(30);
 
     /// Whether this computer's screen may be in a picture that leaves it at
     /// `now`: a session of this window's host is live, one was just allowed,

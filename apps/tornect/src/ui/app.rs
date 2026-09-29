@@ -456,11 +456,14 @@ impl App {
         let Some(surface) = &mut self.indicator else {
             return;
         };
-        let sharing = self.shared.read(|m| m.sharing.clone());
+        let (sharing, admin) = self
+            .shared
+            .read(|m| (m.sharing.clone(), m.admin_sessions.clone()));
         let mut actions = Vec::new();
         let rounded = self.indicator_rounded;
-        surface
-            .paint(|ui| view::indicator_pill(ui, &sharing, Instant::now(), &mut actions, rounded));
+        surface.paint(|ui| {
+            view::indicator_pill(ui, &sharing, &admin, Instant::now(), &mut actions, rounded);
+        });
         for action in actions {
             self.act(action, None);
         }

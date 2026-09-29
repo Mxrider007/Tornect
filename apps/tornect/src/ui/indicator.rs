@@ -504,7 +504,12 @@ mod tests {
             .chars()
             .take(64)
             .collect();
-        for rounded in [false, true] {
+        for (rounded, admin) in [
+            (false, std::collections::HashSet::new()),
+            (true, std::collections::HashSet::new()),
+            (false, std::collections::HashSet::from(["aa".to_owned()])),
+            (true, std::collections::HashSet::from(["aa".to_owned()])),
+        ] {
             for (control, unattended, mode) in [
                 (true, false, "control"),
                 (false, false, "view only"),
@@ -522,6 +527,7 @@ mod tests {
                         view::indicator_pill(
                             ui,
                             std::slice::from_ref(&s),
+                            &admin,
                             Instant::now(),
                             &mut Vec::new(),
                             rounded,
@@ -539,6 +545,12 @@ mod tests {
                     "rounded {rounded}: \"{first}\" not drawn whole in {shown:?}"
                 );
                 assert!(!shown.iter().any(|t| t.contains(&crafted)), "{shown:?}");
+                // An administrator session says so, and only a control one.
+                assert_eq!(
+                    shown.iter().any(|t| t.starts_with("as administrator · ")),
+                    control && !admin.is_empty(),
+                    "{shown:?}"
+                );
             }
         }
     }
