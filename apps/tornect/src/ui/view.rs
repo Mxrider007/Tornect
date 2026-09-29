@@ -638,10 +638,27 @@ fn input_effect(control: bool, injected: bool) -> &'static str {
     }
 }
 
+/// The indicator window's content as a square (the tests' view of
+/// `indicator_pill`).
+#[cfg(test)]
+pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: &mut Vec<Action>) {
+    indicator_pill(ui, sharing, now, actions, false);
+}
+
 /// The indicator window (§6.3, `indicator`): for every session this screen
 /// is shared with, who, which mode and the clock; and Stop, which ends sharing
 /// exactly as the banner's Stop does. A press anywhere else moves the window.
-pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: &mut Vec<Action>) {
+/// Drawn as a pill with rounded ends when `rounded` (the window is
+/// see-through where the desktop composites it), with a white dot before
+/// the rows. The headline, the mode and the clock come first on each row and
+/// are never cut; only the label, last, is shortened.
+pub fn indicator_pill(
+    ui: &mut egui::Ui,
+    sharing: &[Sharing],
+    now: Instant,
+    actions: &mut Vec<Action>,
+    rounded: bool,
+) {
     theme::ensure(ui.ctx());
     let t = theme::tokens(ui.ctx());
     // Text is not selectable here: a press on it moves the window instead.
@@ -650,9 +667,14 @@ pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: 
         .frame(
             egui::Frame::new()
                 .fill(t.sharing_fill)
+                .corner_radius(if rounded { 20 } else { 0 })
                 .inner_margin(egui::Margin::symmetric(10, 8)),
         )
         .show(ui, |ui| {
+            // The white dot of "this screen is shared", left of the rows
+            // (painted only: a press there moves the window too).
+            let dot = egui::pos2(ui.max_rect().left() + 4.0, ui.max_rect().top() + 9.0);
+            ui.painter().circle_filled(dot, 4.0, Color32::WHITE);
             // Click-and-drag, not drag alone: a drag-only area would start
             // moving at the press, even a press on Stop, and the desktop's
             // move would then swallow Stop's release.
@@ -669,35 +691,38 @@ pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: 
                     actions.push(Action::StopSharing);
                 }
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                    for s in sharing {
-                        let mode = if s.control { "control" } else { "view only" };
-                        // The label last, and shortened: it can neither push
-                        // the mode or the clock out nor pass for them
-                        // (SLICE-E E1-2).
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!(
-                                    "{} · {mode} · {} · \"{}\"",
-                                    headline(s),
-                                    clock(s.since, now),
-                                    shown(&s.label)
-                                ))
-                                .strong()
-                                .color(t.on_sharing),
-                            )
-                            .truncate(),
-                        );
-                        let detail = s
-                            .capture
-                            .as_ref()
-                            .map_or("starting: no picture has gone out yet", |c| {
-                                input_effect(s.control, c.input)
-                            });
-                        ui.add(
-                            egui::Label::new(RichText::new(detail).small().color(t.on_sharing))
+                    ui.spacing_mut().indent = 12.0;
+                    ui.indent("rows", |ui| {
+                        for s in sharing {
+                            let mode = if s.control { "control" } else { "view only" };
+                            // The label last, and shortened: it can neither push
+                            // the mode or the clock out nor pass for them
+                            // (SLICE-E E1-2).
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!(
+                                        "{} · {mode} · {} · \"{}\"",
+                                        headline(s),
+                                        clock(s.since, now),
+                                        shown(&s.label)
+                                    ))
+                                    .strong()
+                                    .color(t.on_sharing),
+                                )
                                 .truncate(),
-                        );
-                    }
+                            );
+                            let detail = s
+                                .capture
+                                .as_ref()
+                                .map_or("starting: no picture has gone out yet", |c| {
+                                    input_effect(s.control, c.input)
+                                });
+                            ui.add(
+                                egui::Label::new(RichText::new(detail).small().color(t.on_sharing))
+                                    .truncate(),
+                            );
+                        }
+                    });
                 });
             });
         });
