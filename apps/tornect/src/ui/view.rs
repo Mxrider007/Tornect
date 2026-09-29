@@ -162,6 +162,9 @@ pub enum Action {
     /// Open the password prompt for an admin command at this computer, after
     /// its confirmation (§B.8.10).
     AskAdmin(TornectId, AdminAction),
+    /// Open the password prompt to unlock another device (this device key) at
+    /// this computer, after its confirmation.
+    AskUnlock(TornectId, [u8; 32]),
     /// The prompt's Connect (or Send), with what the form holds. Answered by
     /// a primary click of the pointer only: no key sequence submits it.
     SubmitPrompt {
@@ -193,6 +196,9 @@ pub struct UaForm {
     pub administrator: bool,
     /// The computer and the admin command whose confirmation is shown.
     pub confirming: Option<(TornectId, AdminAction)>,
+    /// The computer where another device is to be unlocked, and that
+    /// device's ID as typed so far.
+    pub unlocking: Option<(TornectId, String)>,
 }
 
 impl std::fmt::Debug for UaForm {
