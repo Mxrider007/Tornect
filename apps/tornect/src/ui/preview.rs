@@ -21,7 +21,8 @@ use tornect_session::FrameSink as _;
 
 use super::model::{
     Book, CaptureNote, ClientStage, Computer, Confirm, Device, Dial, Failure, Hosting, Model,
-    MyWords, Popup, PopupKind, Recognition, Setup, Shared, Sharing, SheetLevels, TorState, Viewing,
+    MyWords, Popup, PopupKind, Recognition, Setup, Shared, Sharing, SheetLevels, TorState,
+    UaRecord, Viewing,
 };
 use super::stream::{FrameSlot, SlotSink};
 
@@ -124,12 +125,21 @@ pub enum Sheet {
     StageDenied,
     /// The connect stepper after the codes differed.
     StageCodesDiffer,
+    /// A saved computer where connecting without asking worked: Connect
+    /// comes first on its card (§B.8.10).
+    UaCard,
+    /// The password prompt of an unattended connect, Remember offered.
+    UaPrompt,
+    /// The connect stepper after an unattended connect was refused.
+    UaRefused,
+    /// The connect stepper with an unattended session live: the badge.
+    UaLive,
 }
 
 /// Put one host sheet of `sheet`'s kind on screen, with invented words.
 pub fn sheet(m: &mut Model, sheet: Sheet) {
     let deadline = Instant::now() + Duration::from_secs(60);
-    if stage(m, sheet) {
+    if stage(m, sheet) || unattended(m, sheet) {
         return;
     }
     let (kind, seen) = match sheet {
@@ -276,6 +286,79 @@ pub fn sheet(m: &mut Model, sheet: Sheet) {
     }
 }
 
+/// The unattended client's screens for `--sheet ua-…` (§B.8.10), on the
+/// made-up book's first computer; `false` for any other sheet.
+fn unattended(m: &mut Model, sheet: Sheet) -> bool {
+    use tornect_core::unattended::credentials::RememberOffer;
+    use tornect_signal::messages::{SessionReject, reject};
+    let now = Instant::now();
+    let Some(first) = m.book.computers.first_mut() else {
+        return false;
+    };
+    let (id, host) = (first.id, first.title());
+    match sheet {
+        Sheet::UaCard => {
+            first.unattended = UaRecord {
+                worked_before: true,
+                remembered: true,
+                control: true,
+            };
+        }
+        Sheet::UaPrompt => {
+            first.unattended.worked_before = true;
+            m.prompt = Some(super::model::Prompt {
+                id,
+                host,
+                keychain: Some("the kernel keyring of this sign-in"),
+                remember: (RememberOffer::Offered, RememberOffer::NotForAdministrator),
+                remembered: false,
+                stale: false,
+                may_admin: false,
+                retry_at: None,
+                admin: None,
+            });
+        }
+        Sheet::UaRefused | Sheet::UaLive => {
+            first.unattended.worked_before = true;
+            m.dial = Dial {
+                id: Some(id),
+                since: Some(now - Duration::from_secs(34)),
+                paired_now: false,
+                failed: (sheet == Sheet::UaRefused).then_some((Failure::NotLetIn, 2)),
+                unattended: true,
+            };
+            m.client = if sheet == Sheet::UaRefused {
+                ClientStage::Ended(crate::ua_client::reject_text(
+                    &SessionReject {
+                        reason: reject::HARD_LOCKED,
+                        cause: None,
+                        retry_after_s: None,
+                        next_open_in_s: None,
+                        detail: None,
+                    },
+                    &host,
+                ))
+            } else {
+                m.ua_live = Some(super::model::UaLive {
+                    withheld: false,
+                    fail_summary: Some("3 failed attempts since your last login".to_owned()),
+                });
+                ClientStage::Live(Viewing {
+                    host,
+                    control: true,
+                    administrator: false,
+                    unattended: true,
+                    since: now,
+                    pictures: 1,
+                    size: (1920, 1080),
+                })
+            };
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// The connect stepper's stages for `--sheet stage-…`, with an invented
 /// ID; `false` for a host sheet.
 fn stage(m: &mut Model, sheet: Sheet) -> bool {
@@ -308,6 +391,7 @@ fn stage(m: &mut Model, sheet: Sheet) -> bool {
             host: "Office PC".to_owned(),
             control: true,
             administrator: true,
+            unattended: false,
             since: now,
             pictures: 1,
             size: (1920, 1080),
@@ -326,6 +410,7 @@ fn stage(m: &mut Model, sheet: Sheet) -> bool {
         since: Some(now - Duration::from_secs(21)),
         paired_now: sheet != Sheet::StageAsking,
         failed,
+        unattended: false,
     };
     true
 }
@@ -346,6 +431,7 @@ fn sample_book(today: Day) -> Book {
             paired: Some(ago(since)),
             last_seen: Some(ago(last)),
             name_hidden: false,
+            unattended: UaRecord::default(),
         };
     Book {
         computers: vec![
@@ -376,6 +462,7 @@ fn sample_book(today: Day) -> Book {
                 paired: None,
                 last_seen: None,
                 name_hidden: false,
+                unattended: UaRecord::default(),
             },
         ],
         recent: vec![
@@ -488,6 +575,7 @@ fn fill(m: &mut Model) {
         host: "Office PC".to_owned(),
         control: true,
         administrator: false,
+        unattended: false,
         since: now,
         pictures: 0,
         size: (0, 0),

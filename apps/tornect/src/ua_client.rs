@@ -537,6 +537,31 @@ pub fn settle(
     Ok(settled.remembered)
 }
 
+/// Record the signed mode of an accepted session at `host` (the host card
+/// offers the control grants' admin actions from it).
+pub fn note_mode(paths: &Paths, host: &TornectId, control: bool) -> anyhow::Result<()> {
+    let _one = hosts_lock();
+    let path = paths.hosts_file();
+    let mut file = HostsFile::load(&path)?;
+    let record = file.entry(host);
+    if record.control != control {
+        record.control = control;
+        file.save(&path)?;
+    }
+    Ok(())
+}
+
+/// The person read that `host`'s unattended setup was re-created (A16): its
+/// pin goes, and the next accept pins the new key.
+pub fn renew_pin(paths: &Paths, host: &TornectId) -> anyhow::Result<()> {
+    let _one = hosts_lock();
+    let path = paths.hosts_file();
+    let mut file = HostsFile::load(&path)?;
+    file.clear_pin(host);
+    file.save(&path)?;
+    Ok(())
+}
+
 /// The admin commands of the host card (§B.8.10) and their names in the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminAction {
@@ -551,6 +576,17 @@ pub enum AdminAction {
 }
 
 impl AdminAction {
+    /// The host card's button.
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::RevokeThisDevice => "Revoke this device",
+            Self::EndSession => "End the session there",
+            Self::TurnOff => "Turn unattended off there",
+            Self::Unlock => "Unlock another device there",
+        }
+    }
+
     /// The wire op.
     #[must_use]
     pub fn op(self) -> u8 {
