@@ -20,8 +20,8 @@ use tornect_core::words::{Identicon, Words};
 use tornect_session::FrameSink as _;
 
 use super::model::{
-    Book, CaptureNote, ClientStage, Computer, Confirm, Device, Hosting, Model, MyWords, Popup,
-    PopupKind, Recognition, Setup, Shared, Sharing, SheetLevels, TorState, Viewing,
+    Book, CaptureNote, ClientStage, Computer, Confirm, Device, Dial, Failure, Hosting, Model,
+    MyWords, Popup, PopupKind, Recognition, Setup, Shared, Sharing, SheetLevels, TorState, Viewing,
 };
 use super::stream::{FrameSlot, SlotSink};
 
@@ -91,11 +91,41 @@ pub enum Sheet {
     SessionAdmin,
     /// That sheet after "Allow as administrator": its Tornect confirmation.
     AdminConfirm,
+    /// The session sheet of an invented installed Windows host, UAC on, as
+    /// this build offers it (no administrator helper yet).
+    SessionWindows,
+    /// That row with the administrator helper (M-FEAT-3): the four answers,
+    /// "Allow as administrator…" asking Windows.
+    SessionFour,
+    /// The four-answer sheet after its Windows prompt failed.
+    AdminNotGiven,
+    /// The session sheet of an invented administrator account that
+    /// elevates without prompting.
+    SessionNoPrompt,
+    /// A pairing and a session question open at once.
+    TwoOpen,
+    /// The connect stepper, reaching the computer.
+    StageReaching,
+    /// The connect stepper, pairing (with the code question open).
+    StagePairing,
+    /// The connect stepper, waiting for approval.
+    StageAsking,
+    /// The connect stepper, connected at the administrator level.
+    StageLive,
+    /// The connect stepper after the computer could not be reached.
+    StageUnreachable,
+    /// The connect stepper after the person there said no.
+    StageDenied,
+    /// The connect stepper after the codes differed.
+    StageCodesDiffer,
 }
 
 /// Put one host sheet of `sheet`'s kind on screen, with invented words.
 pub fn sheet(m: &mut Model, sheet: Sheet) {
     let deadline = Instant::now() + Duration::from_secs(60);
+    if stage(m, sheet) {
+        return;
+    }
     let (kind, seen) = match sheet {
         Sheet::New | Sheet::Alarm => (
             PopupKind::Pairing {
@@ -129,7 +159,7 @@ pub fn sheet(m: &mut Model, sheet: Sheet) {
                 unchecked: false,
             },
         ),
-        Sheet::Session | Sheet::SessionLinux | Sheet::SessionAdmin | Sheet::AdminConfirm => (
+        _ => (
             PopupKind::Session {
                 label: "Laptop".to_owned(),
                 fingerprint: String::new(),
@@ -168,8 +198,113 @@ pub fn sheet(m: &mut Model, sheet: Sheet) {
             m.levels.insert(7, SheetLevels::of(&always_admin()));
             m.admin_confirm.insert(7);
         }
-        Sheet::New | Sheet::Pinned | Sheet::Alarm | Sheet::Session => {}
+        Sheet::SessionWindows | Sheet::SessionFour | Sheet::AdminNotGiven => {
+            let installed = Availability::of(Some(&WindowsFacts {
+                installed: true,
+                administrator: true,
+                ..WindowsFacts::default()
+            }));
+            let mut levels = SheetLevels::of(&installed);
+            if sheet != Sheet::SessionWindows {
+                // What the row offers once the helper exists (M-FEAT-3).
+                levels.answers = installed.answers;
+                levels.sentence = installed.sentence;
+            }
+            m.levels.insert(7, levels);
+            if sheet == Sheet::AdminNotGiven {
+                m.admin_not_given.insert(7);
+            }
+        }
+        Sheet::SessionNoPrompt => {
+            let no_prompt = Availability::of(Some(&WindowsFacts {
+                installed: true,
+                administrator: true,
+                consent_prompt_behavior_admin: Some(0),
+                ..WindowsFacts::default()
+            }));
+            m.levels.insert(7, SheetLevels::of(&no_prompt));
+        }
+        Sheet::TwoOpen => {
+            m.levels.insert(7, SheetLevels::of(&Availability::LINUX));
+            m.popups.insert(
+                0,
+                Popup {
+                    id: 6,
+                    kind: PopupKind::Pairing {
+                        name: "Tablet".to_owned(),
+                        fingerprint: String::new(),
+                        sas: "482 917".to_owned(),
+                        pinned: None,
+                    },
+                    deadline,
+                },
+            );
+            m.recognition.insert(
+                6,
+                Recognition {
+                    words: words("kid print proud pilot"),
+                    identicon: None,
+                    looks_like: None,
+                    unchecked: false,
+                },
+            );
+        }
+        _ => {}
     }
+}
+
+/// The connect stepper's stages for `--sheet stage-…`, with an invented
+/// ID; `false` for a host sheet.
+fn stage(m: &mut Model, sheet: Sheet) -> bool {
+    let now = Instant::now();
+    let id = TornectId::from_bytes([0x42; 32]);
+    let failed = match sheet {
+        Sheet::StageUnreachable => Some((Failure::Unreachable, 1)),
+        Sheet::StageDenied => Some((Failure::Denied, 3)),
+        Sheet::StageCodesDiffer => Some((Failure::CodesDiffer, 2)),
+        _ => None,
+    };
+    m.client = match sheet {
+        Sheet::StageReaching => ClientStage::Reaching {
+            id: id.display_groups(),
+        },
+        Sheet::StagePairing => {
+            m.confirm = Some(Confirm {
+                id: 3,
+                host_name: "Office PC".to_owned(),
+                sas: "305 116".to_owned(),
+                host_waits_until: now + Duration::from_secs(50),
+                deadline: now + Duration::from_secs(600),
+            });
+            ClientStage::Pairing {
+                sas: "305 116".to_owned(),
+            }
+        }
+        Sheet::StageAsking => ClientStage::Asking,
+        Sheet::StageLive => ClientStage::Live(Viewing {
+            host: "Office PC".to_owned(),
+            control: true,
+            administrator: true,
+            since: now,
+            pictures: 1,
+            size: (1920, 1080),
+        }),
+        Sheet::StageUnreachable => ClientStage::Ended(
+            "The host is offline or has not finished publishing its Tornect ID.".to_owned(),
+        ),
+        Sheet::StageDenied => ClientStage::Ended("The host's user refused the session.".to_owned()),
+        Sheet::StageCodesDiffer => {
+            ClientStage::Ended("Not paired: you answered that the codes differ.".to_owned())
+        }
+        _ => return false,
+    };
+    m.dial = Dial {
+        id: Some(id),
+        since: Some(now - Duration::from_secs(21)),
+        paired_now: sheet != Sheet::StageAsking,
+        failed,
+    };
+    true
 }
 
 /// A made-up address book: invented names, and the IDs and host keys of
