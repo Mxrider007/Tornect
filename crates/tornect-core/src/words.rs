@@ -511,11 +511,18 @@ fn list_skeletons() -> &'static std::collections::HashSet<String> {
     SKELETONS.get_or_init(|| wordlist().iter().map(|w| skeleton(w)).collect())
 }
 
+/// How many words of the list a label may not hold (M-UI-3 F-3): three of a
+/// device's four words already read as its words in the name slot.
+pub const LABEL_LIST_WORDS: usize = 3;
+
 /// Why `label` may not be pinned as a device's or a computer's name, if it
 /// may not (§B.6.1 item 7: a label never puts words in the name slot, and
 /// never imitates a sheet's own lines): it holds a quotation mark or a
-/// middle dot, or it reads as a set of device words — four words of the
-/// list, however they are separated or spelled with look-alike letters.
+/// middle dot, or it reads as device words — it holds
+/// [`LABEL_LIST_WORDS`] or more words of the list (case-folded, or by
+/// [`skeleton`]), however they are separated, whatever else it holds (a
+/// number after them, a word before them). A label pinned before this rule
+/// is not checked again when a sheet shows it.
 #[must_use]
 pub fn label_refusal(label: &str) -> Option<&'static str> {
     if label.contains(['"', '\u{201c}', '\u{201d}', '\u{201e}', '\u{ff02}']) {
@@ -532,7 +539,7 @@ pub fn label_refusal(label: &str) -> Option<&'static str> {
         .split(|c: char| !c.is_alphanumeric())
         .filter(|part| !part.is_empty())
         .collect();
-    if parts.len() == WORDS && parts.iter().all(|part| listed(part)) {
+    if parts.iter().filter(|part| listed(part)).count() >= LABEL_LIST_WORDS {
         return Some("it reads like device words");
     }
     None
@@ -988,6 +995,8 @@ mod tests {
             ("arctic crisp lamp orbit", "it reads like device words"),
             ("Arctic-Crisp-Lamp-Orbit", "it reads like device words"),
             ("аrctic crisp lamp orbit", "it reads like device words"),
+            ("arctic crisp lamp", "it reads like device words"),
+            ("arctic crisp lamp orbit zoo", "it reads like device words"),
             ("Ana\" · view only", "it holds a quotation mark"),
             ("Laptop \u{201c}2\u{201d}", "it holds a quotation mark"),
             ("Laptop · 2", "it holds a middle dot"),
@@ -998,11 +1007,80 @@ mod tests {
             "Laptop",
             "Office PC",
             "Family room",
-            "arctic crisp lamp",
-            "arctic crisp lamp orbit zoo",
+            "arctic crisp",
             "Laptop (2)",
         ] {
             assert_eq!(label_refusal(label), None, "{label}");
+        }
+    }
+
+    /// Every spelling of `label` a device could declare: as typed, in capitals,
+    /// and with a Cyrillic `а` and a zero standing in for letters.
+    fn spellings(label: &str) -> [String; 3] {
+        [
+            label.to_owned(),
+            label.to_uppercase(),
+            label.replacen('a', "\u{430}", 1).replacen('o', "0", 1),
+        ]
+    }
+
+    /// M-UI-3 F-3: four device words with a number after them are refused.
+    #[test]
+    fn four_words_and_a_number_are_refused() {
+        for label in spellings("arctic crisp lamp orbit 2") {
+            assert_eq!(
+                label_refusal(&label),
+                Some("it reads like device words"),
+                "{label}"
+            );
+        }
+    }
+
+    /// M-UI-3 F-3: four device words with a count in brackets after them
+    /// (the style of a second device's name) are refused.
+    #[test]
+    fn four_words_and_a_count_are_refused() {
+        for label in spellings("arctic crisp lamp orbit (2)") {
+            assert_eq!(
+                label_refusal(&label),
+                Some("it reads like device words"),
+                "{label}"
+            );
+        }
+    }
+
+    /// M-UI-3 F-3: four device words after a word of another kind are
+    /// refused.
+    #[test]
+    fn a_word_and_four_words_are_refused() {
+        for label in spellings("my arctic crisp lamp orbit") {
+            assert_eq!(
+                label_refusal(&label),
+                Some("it reads like device words"),
+                "{label}"
+            );
+        }
+    }
+
+    /// M-UI-3 F-3: three device words are refused, alone or among other
+    /// words; two pass.
+    #[test]
+    fn three_words_are_refused() {
+        for label in [
+            "arctic crisp lamp",
+            "arctic-crisp-lamp PC",
+            "PC of arctic crisp lamp",
+        ] {
+            for label in spellings(label) {
+                assert_eq!(
+                    label_refusal(&label),
+                    Some("it reads like device words"),
+                    "{label}"
+                );
+            }
+        }
+        for label in spellings("arctic crisp PC") {
+            assert_eq!(label_refusal(&label), None, "{label}");
         }
     }
 
