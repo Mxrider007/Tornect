@@ -51,8 +51,16 @@ struct Cli {
     home: Option<PathBuf>,
 
     /// Log filter, e.g. `debug` or `tornect_signal=trace` (env: TORNECT_LOG).
+    /// Under every filter the log writes no names, labels, Tornect IDs or
+    /// fingerprints; `--log-identifiers` writes them.
     #[arg(long, global = true, value_name = "FILTER")]
     log: Option<String>,
+
+    /// Write names, labels, Tornect IDs and fingerprints into the log as
+    /// they are, e.g. for a bug report you read before sending (env:
+    /// TORNECT_LOG_IDENTIFIERS=1). Without it they are redacted.
+    #[arg(long, global = true)]
+    log_identifiers: bool,
 
     /// Emit JSON log lines on stderr.
     #[arg(long, global = true)]
@@ -385,6 +393,7 @@ fn main() -> anyhow::Result<()> {
         filter: cli.log.clone(),
         file_dir: None,
         json: cli.json_logs,
+        identifiers: cli.log_identifiers,
     })?;
 
     let paths = match &cli.home {
@@ -705,4 +714,25 @@ fn cmd_doctor(paths: &Paths) -> anyhow::Result<()> {
         log.read_all()?.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory as _;
+
+    /// U3-L3: `--help` says that no log filter writes identifiers, and
+    /// which option does.
+    #[test]
+    fn the_help_says_the_log_names_nobody_without_the_opt_in() {
+        let help = super::Cli::command().render_long_help().to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for said in [
+            "Under every filter the log writes no names, labels, Tornect IDs or fingerprints; \
+             `--log-identifiers` writes them",
+            "--log-identifiers",
+            "TORNECT_LOG_IDENTIFIERS=1",
+        ] {
+            assert!(help.contains(said), "\"{said}\" missing:\n{help}");
+        }
+    }
 }
