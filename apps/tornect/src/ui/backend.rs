@@ -182,6 +182,23 @@ pub struct Backend {
     pub words: Arc<super::recognize::Recognizer>,
 }
 
+/// Whether this is the window's first run in the home `paths`: the first
+/// time, a marker is left in the state directory so that the history notice
+/// shows once. The marker says nothing about any connection. When it cannot
+/// be written the notice shows again next time.
+fn first_run(paths: &Paths) -> bool {
+    let marker = paths.state_dir.join("history-notice-shown");
+    if marker.exists() {
+        return false;
+    }
+    if let Err(e) =
+        std::fs::create_dir_all(&paths.state_dir).and_then(|()| std::fs::write(&marker, b""))
+    {
+        tracing::debug!(error = %e, "the history notice will show again");
+    }
+    true
+}
+
 /// How often a window that is not the host looks whether another Tornect
 /// process holds this home's host lock.
 const HOST_LOCK_EVERY: Duration = Duration::from_secs(2);
@@ -453,6 +470,8 @@ fn grant(_: std::path::PathBuf) -> Result<(bool, bool), String> {
 /// Run until [`Command::Quit`], then shut down and mark the model closed.
 pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
     let b = Arc::new(b);
+    let first = first_run(&b.paths);
+    b.shared.update(|m| m.history_notice = first);
     // This computer's words and the saved keys' (derived once, off this
     // task), then the address book again with its words.
     {
@@ -1520,5 +1539,15 @@ mod tests {
             .await
             .expect("the host's stream task ended")
             .unwrap();
+    }
+
+    /// The history notice shows on the first run of a home only.
+    #[test]
+    fn the_history_notice_shows_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        assert!(first_run(&paths), "the first run");
+        assert!(!first_run(&paths), "then never again");
+        assert!(!first_run(&paths));
     }
 }
