@@ -257,14 +257,20 @@ async fn run_host(
         eprintln!("{}", crate::host::NO_TERMINAL_LINE);
     }
     let control = ControlChannel::default();
+    // An administrator session's input goes through its administrator
+    // helper (§B.8.7.5), started between the answer and the accept.
+    let helpers = crate::admin_helper::AdminHelpers::new();
     let media = Arc::new(MediaHost::new(
-        Arc::new(SystemBackend::new(source).with_restore_token(paths.portal_restore_token())),
+        Arc::new(crate::admin_helper::AdminBackend::new(
+            Arc::new(SystemBackend::new(source).with_restore_token(paths.portal_restore_token())),
+            Arc::clone(&helpers),
+        )),
         Arc::new(CliMedia::new(control.clone())),
         MediaLimits::default(),
     ));
     let HostWiring {
         cfg: host_cfg,
-        deps,
+        mut deps,
         ctx,
         live,
         audit,
@@ -279,6 +285,8 @@ async fn run_host(
         Arc::clone(&media),
         control.clone(),
     )?;
+    helpers.wire(deps.kill.clone(), audit.clone(), host_cfg.levels);
+    deps.admin_helper = helpers;
     // A kill ends every session's media at once, without waiting for the FSM's
     // `BYE` to a peer that may not be reading (SLICE-B1 B1-2).
     let kill_watch = media.watch_kill(deps.kill.clone());

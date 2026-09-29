@@ -328,8 +328,16 @@ impl MediaObserver for GuiMedia {
 async fn host_role(b: &Backend) -> Result<Hosted, String> {
     let lock = HostLock::acquire(&b.paths).map_err(|e| format!("{e:#}"))?;
     let control = ControlChannel::default();
+    // An administrator session's input goes through its administrator
+    // helper (§B.8.7.5), started between the answer and the accept.
+    let helpers = crate::admin_helper::AdminHelpers::new();
     let media = Arc::new(MediaHost::new(
-        Arc::new(SystemBackend::new(b.source).with_restore_token(b.paths.portal_restore_token())),
+        Arc::new(crate::admin_helper::AdminBackend::new(
+            Arc::new(
+                SystemBackend::new(b.source).with_restore_token(b.paths.portal_restore_token()),
+            ),
+            Arc::clone(&helpers),
+        )),
         Arc::new(GuiMedia {
             shared: Arc::clone(&b.shared),
         }),
@@ -353,6 +361,8 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         control.clone(),
     )
     .map_err(|e| format!("{e:#}"))?;
+    helpers.wire(deps.kill.clone(), audit.clone(), cfg.levels);
+    deps.admin_helper = helpers;
     // The window says it, on Home and under the banner.
     let shared = Arc::clone(&b.shared);
     polkit.tell_through(Arc::new(move |line: &str| {

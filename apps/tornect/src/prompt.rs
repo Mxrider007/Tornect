@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, mpsc};
 use tornect_core::TornectId;
 use tornect_core::levels::{
     ADMIN_LINE, ADMIN_LINE_NO_PROMPT, AdminPath, Answers, Availability, LINE_VIEW_ONLY,
-    SENTENCE_SECURE_DESKTOP_OFF,
+    SENTENCE_ADMIN_NOT_GIVEN, SENTENCE_SECURE_DESKTOP_OFF,
 };
 use tornect_signal::fsm::client::ClientPairingUi;
 use tornect_signal::pairing::{
@@ -216,6 +216,25 @@ impl Consent for CliConsent {
     ) -> BoxFuture<'a, SessionDecision> {
         Box::pin(async move {
             match self.prompter.ask(&session_question_at(peer, levels)).await {
+                Some(answer) => parse_session_at(&answer, levels.offered()),
+                None => SessionDecision::Deny,
+            }
+        })
+    }
+
+    fn session_again<'a>(
+        &'a self,
+        peer: &'a TrustedPeer,
+        _: &'a SessionRequestSummary,
+        levels: &'a Availability,
+        _: Duration,
+    ) -> BoxFuture<'a, SessionDecision> {
+        Box::pin(async move {
+            let question = format!(
+                "\n{}{}",
+                SENTENCE_ADMIN_NOT_GIVEN, ": the other answers are still open.",
+            ) + &session_question_at(peer, levels);
+            match self.prompter.ask(&question).await {
                 Some(answer) => parse_session_at(&answer, levels.offered()),
                 None => SessionDecision::Deny,
             }
