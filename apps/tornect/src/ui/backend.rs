@@ -26,7 +26,7 @@ use tornect_signal::fsm::host::{
     SessionSink,
 };
 use tornect_signal::fsm::{HandshakeError, HostAudit, OsRandom};
-use tornect_signal::messages::bye;
+use tornect_signal::messages::{bye, pair_reject, reject};
 use tornect_signal::pairing::AutoDeny;
 #[cfg(test)]
 use tornect_signal::pairing::KnownHostStore;
@@ -36,7 +36,8 @@ use tornect_signal::{Isolation, MEDIA_PORT, SIGNALING_PORT, TorNode};
 use super::book::{self, Change};
 use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
 use super::model::{
-    CaptureNote, Check, ClientStage, Hosting, Shared, Sharing, TorState, Viewing, Wake,
+    CaptureNote, Check, ClientStage, Dial, Failure, Hosting, Shared, Sharing, TorState, Viewing,
+    Wake,
 };
 use super::recognize::Lookalike;
 use super::stream::{FrameSlot, SlotSink};
@@ -899,6 +900,12 @@ async fn viewed(
         m.client = ClientStage::Reaching {
             id: id.display_groups(),
         };
+        m.dial = Dial {
+            id: Some(id),
+            since: Some(Instant::now()),
+            paired_now: false,
+            failed: None,
+        };
     });
     // One isolation group: the media stream rides the signaling circuit.
     let isolation = Isolation::new();
@@ -906,6 +913,9 @@ async fn viewed(
     else {
         return Ok("Cancelled.".to_owned());
     };
+    if stream.is_err() {
+        failed(b, Failure::Unreachable);
+    }
     let stream = stream.map_err(explain)?;
     // With history off the handshake works on a copy of the known hosts, so
     // that its last-seen touch writes nothing (`crate::history`).
@@ -937,7 +947,10 @@ async fn viewed(
     let Some(outcome) = outcome else {
         return Ok("Cancelled before the session started.".to_owned());
     };
-    let outcome = outcome.map_err(|e| not_started(e, pairing.ended()))?;
+    let outcome = outcome.map_err(|e| {
+        failed(b, classify(&e, pairing.ended()));
+        not_started(e, pairing.ended())
+    })?;
     let ClientOutcome::Session(mut session) = outcome else {
         anyhow::bail!("paired, but no session came of it");
     };
@@ -1016,6 +1029,52 @@ async fn viewed(
             format!("No picture from \"{host}\": {e:#}")
         }
     })
+}
+
+/// Record why the connection ended without a session, at the step it had
+/// reached.
+fn failed(b: &Backend, why: Failure) {
+    b.shared.update(|m| {
+        let step = match m.client {
+            ClientStage::Pairing { .. } => 2,
+            ClientStage::Asking => 3,
+            ClientStage::Live(_) => 4,
+            _ if why == Failure::CodesDiffer => 2,
+            _ => 1,
+        };
+        m.dial.failed = Some((why, step));
+    });
+}
+
+/// Where a handshake that ended before its session belongs in the connect
+/// stepper's error taxonomy.
+fn classify(err: &HandshakeError, check: Option<CodeCheck>) -> Failure {
+    use tornect_signal::envelope::codes::E_VERSION;
+    match (err, check) {
+        (_, Some(CodeCheck::Differ)) => Failure::CodesDiffer,
+        (_, Some(CodeCheck::Unanswered)) => Failure::TimedOut,
+        (HandshakeError::PairRejected { reason, .. }, _) if *reason == pair_reject::DENIED => {
+            Failure::Denied
+        }
+        (HandshakeError::PairRejected { reason, .. }, _) if *reason == pair_reject::TIMEOUT => {
+            Failure::TimedOut
+        }
+        (HandshakeError::SessionRejected { reject }, _) if reject.reason == reject::DENIED => {
+            Failure::Denied
+        }
+        (HandshakeError::SessionRejected { reject }, _)
+            if reject.reason == reject::POPUP_TIMEOUT =>
+        {
+            Failure::TimedOut
+        }
+        (HandshakeError::Timeout(_), _) => Failure::TimedOut,
+        (HandshakeError::Violation { code, .. } | HandshakeError::PeerError { code, .. }, _)
+            if *code == E_VERSION =>
+        {
+            Failure::VersionMismatch
+        }
+        _ => Failure::Other,
+    }
 }
 
 /// The window's words for a handshake that ended before its session. The

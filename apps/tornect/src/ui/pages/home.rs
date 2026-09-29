@@ -47,6 +47,15 @@ pub(super) fn home(
     );
     ui.add_space(14.0);
 
+    // The connection this computer asked for comes first, while it lasts.
+    if !matches!(model.client, ClientStage::Idle) {
+        widgets::card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            connect_stepper(ui, t, model, now, model.screen_shared(now), actions);
+        });
+        ui.add_space(GAP);
+    }
+
     let pending_grant = model.setup.as_ref().filter(|s| !s.granted);
     if let Some(setup) = pending_grant {
         setup_card(ui, t, setup, !model.sharing.is_empty(), actions);
@@ -88,13 +97,6 @@ pub(super) fn home(
     }
 
     let shared = model.screen_shared(now);
-    if !matches!(model.client, ClientStage::Idle) {
-        ui.add_space(GAP - 8.0);
-        widgets::card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            client_stage(ui, t, &model.client, shared, actions);
-        });
-    }
 
     if let Some(setup) = model.setup.as_ref().filter(|s| s.granted) {
         ui.add_space(GAP - 8.0);
@@ -664,44 +666,138 @@ fn setup_card(ui: &mut Ui, t: &Tokens, setup: &Setup, sharing: bool, actions: &m
         });
 }
 
-/// Where the session this computer asked for stands.
-fn client_stage(
+/// The connect stepper (the redesign's §4): the four steps of the
+/// connection this computer asked for, with the elapsed time, the step it is
+/// on, and, when it ended without a session, why, in plain words, with Try
+/// again and Back. The compare-the-code question itself is on the request
+/// sheet; step 2 shows the code and points there. The dialed ID is shown,
+/// never a name the host sent before pairing, and nothing of it while this
+/// screen is shared.
+fn connect_stepper(
     ui: &mut Ui,
     t: &Tokens,
-    stage: &ClientStage,
+    model: &Model,
+    now: Instant,
     shared: bool,
     actions: &mut Vec<Action>,
 ) {
-    match stage {
-        ClientStage::Idle => {}
-        ClientStage::Reaching { id } => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!(
-                    "Reaching {id} over Tor (usually 5–30 s, up to a minute)…"
-                ));
+    let dial = &model.dial;
+    let stage = &model.client;
+    // The step the connection is on (1 ..= 4), and 5 once it is live.
+    let at = match stage {
+        ClientStage::Idle | ClientStage::Reaching { .. } => 1,
+        ClientStage::Pairing { .. } => 2,
+        ClientStage::Asking => 3,
+        ClientStage::Live(_) => 5,
+        ClientStage::Ended(_) => dial.failed.map_or(5, |(_, step)| step),
+    };
+    let failed = match stage {
+        ClientStage::Ended(_) => dial.failed,
+        _ => None,
+    };
+    ui.horizontal(|ui| {
+        widgets::section_header(
+            ui,
+            match stage {
+                ClientStage::Live(_) => "Connected",
+                ClientStage::Ended(_) if failed.is_none() => "The session ended",
+                ClientStage::Ended(_) => "Not connected",
+                _ => "Connecting to a computer",
+            },
+        );
+        if let (Some(since), false) = (dial.since, matches!(stage, ClientStage::Ended(_))) {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let secs = now.saturating_duration_since(since).as_secs();
+                ui.label(
+                    RichText::new(format!("{:02}:{:02}", secs / 60, secs % 60))
+                        .font(theme::font(ui.ctx(), Face::Mono, 13.0))
+                        .color(t.text_muted),
+                );
             });
         }
-        ClientStage::Pairing { sas } => {
-            ui.label("Pairing: the host's screen now shows a code. It must be exactly");
+    });
+    let dialed = match stage {
+        ClientStage::Reaching { id } => Some(id.clone()),
+        _ => dial.id.map(|id| id.display_groups()),
+    };
+    if let (Some(id), false) = (dialed, shared) {
+        ui.label(
+            RichText::new(id)
+                .font(theme::font(ui.ctx(), Face::Mono, 12.0))
+                .color(t.text_muted),
+        );
+    }
+    let steps: [(&str, &str); 4] = [
+        (
+            "Reaching the computer over Tor",
+            "Usually 5–30 s, up to a minute",
+        ),
+        (
+            "Pairing: compare the code",
+            if dial.paired_now || at == 2 {
+                "Only the first time you connect to a computer"
+            } else {
+                "Paired before: no code this time"
+            },
+        ),
+        (
+            "Waiting for approval",
+            "The person at the computer allows control or view only (up to 110 s)",
+        ),
+        (
+            "Opening the picture",
+            "Relayed through Tor: private, and slower than a direct link",
+        ),
+    ];
+    for (n, (title, note)) in (1u8..).zip(steps) {
+        let (mark, color) = if failed.is_some_and(|(_, step)| step == n) {
+            ("✕", t.danger_text)
+        } else if n < at || (n == 2 && at > 2 && !dial.paired_now) {
+            ("✓", t.ok)
+        } else if n == at && failed.is_none() {
+            ("…", t.accent_text)
+        } else {
+            ("·", t.text_muted)
+        };
+        ui.horizontal_top(|ui| {
             ui.label(
-                RichText::new(sas)
-                    .font(theme::font(ui.ctx(), Face::MonoSemibold, SAS_SIZE))
-                    .extra_letter_spacing(2.0)
-                    .color(t.accent_text),
+                RichText::new(format!("{mark} {n}"))
+                    .font(theme::font(ui.ctx(), Face::MonoSemibold, 13.0))
+                    .color(color),
             );
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Waiting for the host's user to compare it (up to 90 s)…");
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(title)
+                        .font(theme::font(ui.ctx(), Face::Semibold, 14.0))
+                        .color(t.text_primary),
+                );
+                ui.label(
+                    RichText::new(note)
+                        .font(theme::font(ui.ctx(), Face::Regular, 12.0))
+                        .color(t.text_muted),
+                );
+                if n == at && failed.is_none() {
+                    match stage {
+                        ClientStage::Pairing { sas } => {
+                            ui.label("The computer shows a code too. The question above asks whether they match:");
+                            ui.label(
+                                RichText::new(sas)
+                                    .font(theme::font(ui.ctx(), Face::MonoSemibold, SAS_SIZE))
+                                    .extra_letter_spacing(2.0)
+                                    .color(t.accent_text),
+                            );
+                        }
+                        ClientStage::Idle | ClientStage::Reaching { .. } | ClientStage::Asking => {
+                            ui.spinner();
+                        }
+                        _ => {}
+                    }
+                }
             });
-        }
-        ClientStage::Asking => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Waiting for the host's user to allow the session (up to 110 s)…");
-            });
-        }
-        ClientStage::Live(viewing) => {
+        });
+    }
+    match (stage, failed) {
+        (ClientStage::Live(viewing), _) => {
             ui.horizontal_top(|ui| {
                 let icon = if viewing.control {
                     Icon::MousePointer
@@ -709,20 +805,21 @@ fn client_stage(
                     Icon::Eye
                 };
                 icons::show(ui, icon, 16.0, t.ok);
+                // The level only from the signed accept (§B.2.1).
+                let level = match (viewing.control, viewing.administrator) {
+                    (true, true) => "Control · administrator",
+                    (true, false) => "control",
+                    (false, _) => "view only",
+                };
                 ui.add(
                     egui::Label::new(
                         RichText::new(format!(
-                            "Connected{} ({}): the picture is in its own window.",
+                            "Connected{} ({level}): the picture is in its own window.",
                             if shared {
                                 String::new()
                             } else {
                                 format!(" to \"{}\"", viewing.host)
                             },
-                            if viewing.control {
-                                "control"
-                            } else {
-                                "view only"
-                            }
                         ))
                         .color(t.ok),
                     )
@@ -736,11 +833,41 @@ fn client_stage(
                 actions.push(Action::EndViewing);
             }
         }
-        ClientStage::Ended(why) => {
-            ui.horizontal_top(|ui| {
-                icons::show(ui, Icon::Info, 16.0, t.text_muted);
-                ui.add(egui::Label::new(RichText::new(why).color(t.text_muted)).wrap());
+        (ClientStage::Ended(why), failed) => {
+            if let Some((failure, _)) = failed {
+                ui.label(
+                    RichText::new(failure.title())
+                        .font(theme::font(ui.ctx(), Face::Semibold, 15.0))
+                        .color(t.danger_text),
+                );
+                ui.add(
+                    egui::Label::new(RichText::new(failure.advice()).color(t.text_secondary))
+                        .wrap(),
+                );
+            }
+            // The stage's own words, unless they name the computer while this
+            // screen is shared.
+            if !shared {
+                ui.add(egui::Label::new(RichText::new(why).small().color(t.text_muted)).wrap());
+            }
+            ui.horizontal(|ui| {
+                if let Some(id) = dial.id.filter(|_| model.tor.is_ready())
+                    && Button::new(Kind::Primary, "Try again")
+                        .icon(Icon::ArrowRight)
+                        .show(ui)
+                        .clicked()
+                {
+                    actions.push(Action::Connect(id));
+                }
+                if Button::new(Kind::Secondary, "Back").show(ui).clicked() {
+                    actions.push(Action::DismissConnect);
+                }
             });
+        }
+        _ => {
+            if Button::new(Kind::Secondary, "Cancel").show(ui).clicked() {
+                actions.push(Action::EndViewing);
+            }
         }
     }
 }
