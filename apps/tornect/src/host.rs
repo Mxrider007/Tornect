@@ -252,8 +252,13 @@ pub fn wire(
     control: ControlChannel,
 ) -> anyhow::Result<HostWiring> {
     // The session levels this computer can give (§B.2.1). A host started
-    // elevated while UAC is on opens no onion service at all.
-    let levels = tornect_platform::levels::probe();
+    // elevated while UAC is on, or running as root on Linux (where Tornect
+    // never runs as administrator), opens no onion service at all.
+    let levels = if running_as_root() {
+        tornect_core::levels::Availability::LINUX_ROOT
+    } else {
+        tornect_platform::levels::probe()
+    };
     if !levels.serves() {
         anyhow::bail!(
             "{}",
@@ -427,6 +432,26 @@ type AuthorityFactory = Arc<
         > + Send
         + Sync,
 >;
+
+/// Whether this process runs as root on Linux: the owner of `/proc/self` is
+/// its effective user. Elsewhere, and when it cannot be read, `false`.
+fn running_as_root() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata("/proc/self").is_ok_and(|m| is_root(m.uid()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Whether `uid` is root's.
+#[cfg(any(test, target_os = "linux"))]
+fn is_root(uid: u32) -> bool {
+    uid == 0
+}
 
 /// `connect`, run once for the host's life: every Control session shares the
 /// first authority it connected (one system-bus connection per host, not one
@@ -1487,5 +1512,23 @@ mod tests {
         let b = shared().await.expect("then shared");
         assert!(Arc::ptr_eq(&a, &b), "one authority for every session");
         assert_eq!(attempts.load(Ordering::SeqCst), 2, "connected once");
+    }
+
+    /// A Linux host running as root refuses to serve before anything is
+    /// published, and says why; any other user serves.
+    #[test]
+    fn a_root_host_serves_nothing() {
+        use tornect_core::levels::{Availability, SENTENCE_LINUX_ROOT};
+        assert!(is_root(0));
+        assert!(!is_root(1000));
+        let root = Availability::LINUX_ROOT;
+        assert!(!root.serves());
+        assert_eq!(root.sentence, Some(SENTENCE_LINUX_ROOT));
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let me = std::fs::metadata("/proc/self").unwrap().uid();
+            assert_eq!(running_as_root(), me == 0);
+        }
     }
 }

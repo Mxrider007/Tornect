@@ -17,6 +17,10 @@ use super::super::view::{Action, Form, SAS_SIZE};
 use super::super::widgets::{self, Button, Kind, Tone};
 use super::{day_in_sentence, day_text};
 
+/// Home's first-run line: history is off until switched on.
+pub(super) const HISTORY_NOTICE: &str = "Nothing about past connections is written on this \
+    computer unless you switch history on (Address book, Recent).";
+
 /// How long "Copied" shows after Copy ID.
 const COPIED_FOR: Duration = Duration::from_secs(2);
 /// From this content width on, the ID and connect cards sit side by side.
@@ -46,6 +50,23 @@ pub(super) fn home(
          connect without asking, if you gave one unattended access).",
     );
     ui.add_space(14.0);
+
+    // The first run: what history keeps, said once (history is off until
+    // switched on).
+    if model.history_notice && !model.book.history {
+        ui.horizontal_top(|ui| {
+            icons::show(ui, Icon::Info, 15.0, t.info);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(HISTORY_NOTICE)
+                        .font(theme::font(ui.ctx(), Face::Regular, 13.0))
+                        .color(t.text_secondary),
+                )
+                .wrap(),
+            );
+        });
+        ui.add_space(GAP - 8.0);
+    }
 
     // The connection this computer asked for comes first, while it lasts.
     if !matches!(model.client, ClientStage::Idle) {

@@ -1375,4 +1375,24 @@ mod tests {
         assert!(!has_text(&window, "Desk"));
         assert!(has_text(&window, "(Control · administrator)"));
     }
+
+    /// The first run says once that nothing about past connections is kept
+    /// unless history is switched on; not on a later run, and not once
+    /// history is on.
+    #[test]
+    fn the_first_run_says_history_is_off() {
+        let notice = home::HISTORY_NOTICE;
+        let mut model = with_book(false);
+        model.book.history = false;
+        model.history_notice = true;
+        let window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(&window, notice));
+        model.history_notice = false;
+        let window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
+        assert!(!has_text(&window, notice), "a later run");
+        model.history_notice = true;
+        model.book.history = true;
+        let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(!has_text(&window, notice), "history is on");
+    }
 }
