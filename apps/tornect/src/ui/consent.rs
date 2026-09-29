@@ -191,10 +191,18 @@ impl Popups {
         }
     }
 
-    /// The host user's answer to session popup `id`.
+    /// The host user's answer to session popup `id`. An answer that allows
+    /// the session marks the screen as shared in the model before it goes
+    /// out, so the window hides what it hides while sharing from the click
+    /// on: before the accept is sent, and so before any picture can leave.
     pub fn answer_session(&self, id: u64, decision: SessionDecision) -> bool {
         match self.take(id) {
-            Some(Answer::Session(tx)) => tx.send(decision).is_ok(),
+            Some(Answer::Session(tx)) => {
+                if decision != SessionDecision::Deny {
+                    self.shared.update(|m| m.accepted = Some(Instant::now()));
+                }
+                tx.send(decision).is_ok()
+            }
             _ => false,
         }
     }
@@ -1000,6 +1008,40 @@ mod tests {
                 }
             ));
             assert_eq!(asking.await, expected, "{label:?}");
+        }
+    }
+
+    /// An answer that allows a session marks the screen as shared in the
+    /// model before it reaches the handshake: the host's accept, and so any
+    /// picture, can only follow it. Deny marks nothing.
+    #[tokio::test]
+    async fn an_allowed_session_counts_as_shared_before_the_accept() {
+        for (decision, marked) in [
+            (SessionDecision::AllowOnceViewOnly, true),
+            (SessionDecision::AllowOnce, true),
+            (SessionDecision::Deny, false),
+        ] {
+            let popups = popups();
+            let kill = KillSwitch::new();
+            let (_started_tx, started) = watch::channel(0);
+            let consent = GuiConsent::new(Arc::clone(&popups), withdraw(&kill, started));
+            let (peer, summary) = (peer(), summary());
+            let asking = consent.session(&peer, &summary);
+            tokio::pin!(asking);
+            let open = tokio::select! {
+                _ = &mut asking => panic!("answered before anyone clicked"),
+                open = shown(&popups, 1) => open,
+            };
+            assert!(popups.shared().read(|m| m.accepted.is_none()));
+            assert!(popups.answer_session(open[0].id, decision));
+            // The model says so already; the handshake has not had the answer
+            // yet (the future has not run since).
+            assert_eq!(
+                popups.shared().read(|m| m.screen_shared(Instant::now())),
+                marked,
+                "{decision:?}"
+            );
+            assert_eq!(asking.await, decision);
         }
     }
 }

@@ -49,7 +49,13 @@ const SIDE_BY_SIDE_FROM: f32 = 760.0;
 /// The space between cards.
 const GAP: f32 = 16.0;
 
-pub(super) fn page(ui: &mut Ui, model: &Model, form: &mut Form, actions: &mut Vec<Action>) {
+pub(super) fn page(
+    ui: &mut Ui,
+    model: &Model,
+    form: &mut Form,
+    shared: bool,
+    actions: &mut Vec<Action>,
+) {
     let t = theme::tokens(ui.ctx());
     let book = &model.book;
     widgets::page_header(
@@ -59,6 +65,22 @@ pub(super) fn page(ui: &mut Ui, model: &Model, form: &mut Form, actions: &mut Ve
          this computer.",
     );
     ui.add_space(14.0);
+    // While this screen may be in a picture that leaves it: no name, no ID,
+    // no day, no device, not even how many there are.
+    if shared {
+        super::hidden_card(
+            ui,
+            "The saved computers, the recent connections and the devices that can connect \
+             here come back when sharing ends.",
+        );
+        ui.add_space(8.0);
+        muted(
+            ui,
+            t,
+            "Device words are hidden while this computer is shared.",
+        );
+        return;
+    }
     let narrow = ui.available_width() < 600.0;
     let labels = [
         format!("Computers {}", book.computers.len()),
