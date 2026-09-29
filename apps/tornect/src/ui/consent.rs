@@ -68,6 +68,10 @@ enum Answer {
         sas: String,
         /// The look-alike alarm fired: only the typed code pairs (W-B3).
         typed_only: bool,
+        /// The name the device declared: what an accept without a label pins.
+        declared: String,
+        /// The key is pinned already (a re-pair): the store keeps its label.
+        pinned: bool,
     },
     Session(oneshot::Sender<SessionDecision>),
     Confirm(oneshot::Sender<bool>),
@@ -116,11 +120,26 @@ impl Popups {
     /// On a sheet whose look-alike alarm fired, an accept is a refusal: only
     /// the code typed from the other device pairs there
     /// ([`Popups::answer_pairing_code`]; §B.6.1 W-B3).
+    ///
+    /// An accept whose label may not be pinned (it would put device words in
+    /// the name slot, or imitate a sheet's lines: `words::label_refusal`) is a
+    /// refusal too; the sheet never offers one.
     pub fn answer_pairing(&self, id: u64, decision: PairDecision) -> bool {
         match self.take(id) {
-            Some(Answer::Pair { tx, typed_only, .. }) => {
+            Some(Answer::Pair {
+                tx,
+                typed_only,
+                declared,
+                pinned,
+                ..
+            }) => {
                 let decision = match decision {
                     PairDecision::Accept { .. } if typed_only => PairDecision::Reject,
+                    PairDecision::Accept { label }
+                        if !pinnable(label.as_deref(), &declared, pinned) =>
+                    {
+                        PairDecision::Reject
+                    }
                     other => other,
                 };
                 tx.send(decision).is_ok()
@@ -133,14 +152,39 @@ impl Popups {
     /// device's screen: this computer compares it with its own code. The
     /// same six digits pair (as `label`, if one was typed); anything else
     /// refuses, a refusal like any other (it counts toward the temp-ban).
+    ///
+    /// Only a sheet whose alarm fired takes a typed code: anywhere else this
+    /// computer's own code is on the screen, so typed digits prove nothing,
+    /// and only the armed pointer click pairs. There the code is ignored and
+    /// the sheet stays open (`false`).
     pub fn answer_pairing_code(&self, id: u64, code: &str, label: Option<String>) -> bool {
-        match self.take(id) {
-            Some(Answer::Pair { tx, sas, .. }) => {
-                let decision = if same_code(code, &sas) {
-                    PairDecision::Accept { label }
-                } else {
-                    PairDecision::Reject
-                };
+        let answer = {
+            let mut answers = self.answers.lock().unwrap_or_else(PoisonError::into_inner);
+            if !matches!(
+                answers.get(&id),
+                Some(Answer::Pair {
+                    typed_only: true,
+                    ..
+                })
+            ) {
+                return false;
+            }
+            answers.remove(&id)
+        };
+        match answer {
+            Some(Answer::Pair {
+                tx,
+                sas,
+                declared,
+                pinned,
+                ..
+            }) => {
+                let decision =
+                    if same_code(code, &sas) && pinnable(label.as_deref(), &declared, pinned) {
+                        PairDecision::Accept { label }
+                    } else {
+                        PairDecision::Reject
+                    };
                 tx.send(decision).is_ok()
             }
             _ => false,
@@ -195,6 +239,7 @@ impl Drop for OnScreen<'_> {
             m.recognition.remove(&id);
             m.levels.remove(&id);
             m.admin_confirm.remove(&id);
+            m.admin_not_given.remove(&id);
             if m.confirm.as_ref().is_some_and(|c| c.id == id) {
                 m.confirm = None;
             }
@@ -238,6 +283,13 @@ impl Withdraw {
             }
         }
     }
+}
+
+/// Whether an accept may pin its label: `label`, or without one the name
+/// the device declared. A re-pair keeps the label pinned before, so it is
+/// not checked again.
+fn pinnable(label: Option<&str>, declared: &str, pinned: bool) -> bool {
+    pinned || tornect_core::words::label_refusal(label.unwrap_or(declared)).is_none()
 }
 
 /// Whether `typed` is the six digits of `sas` (spaces ignored).
@@ -324,6 +376,8 @@ impl Consent for GuiConsent {
                 tx,
                 sas: sas.to_owned(),
                 typed_only,
+                declared: peer.name.clone(),
+                pinned: peer.pinned_label.is_some(),
             };
             let _on_screen = self.popups.open(answer, |id, m| {
                 if let Some(seen) = seen {
@@ -874,5 +928,78 @@ mod tests {
             ..WindowsFacts::default()
         }));
         assert_eq!(SheetLevels::of(&prompt).answers.admin, None);
+    }
+
+    /// Only a sheet whose look-alike alarm fired takes a typed code: on any
+    /// other, the right code pairs nothing and the question stays open for
+    /// the armed click (§B.6.1 W-B3; M1-50).
+    #[tokio::test]
+    async fn a_typed_code_pairs_only_where_the_alarm_fired() {
+        let popups = popups();
+        let kill = KillSwitch::new();
+        let (_started_tx, started) = watch::channel(0);
+        let consent = GuiConsent::new(Arc::clone(&popups), withdraw(&kill, started));
+        let peer = pairing_peer();
+        let asking = consent.pairing(&peer, "123 456");
+        tokio::pin!(asking);
+        let open = tokio::select! {
+            _ = &mut asking => panic!("answered before anyone did"),
+            open = shown(&popups, 1) => open,
+        };
+        assert!(
+            !popups.answer_pairing_code(open[0].id, "123 456", None),
+            "a typed code paired a sheet without the alarm"
+        );
+        assert_eq!(popups.shared().read(|m| m.popups.len()), 1, "still open");
+        assert!(popups.answer_pairing(
+            open[0].id,
+            PairDecision::Accept {
+                label: Some("Phone".to_owned())
+            }
+        ));
+        assert_eq!(
+            asking.await,
+            PairDecision::Accept {
+                label: Some("Phone".to_owned())
+            }
+        );
+    }
+
+    /// §B.6.1 item 7 at pin time: an accept whose name would put device
+    /// words in the name slot (the one typed, or without one the name the
+    /// device declared) is a refusal; another name pairs.
+    #[tokio::test]
+    async fn an_accept_never_pins_words_as_a_name() {
+        for (label, expected) in [
+            (None, PairDecision::Reject),
+            (Some("zone zoo yard wrist"), PairDecision::Reject),
+            (Some("Kitchen \"PC\""), PairDecision::Reject),
+            (
+                Some("Tablet"),
+                PairDecision::Accept {
+                    label: Some("Tablet".to_owned()),
+                },
+            ),
+        ] {
+            let popups = popups();
+            let kill = KillSwitch::new();
+            let (_started_tx, started) = watch::channel(0);
+            let consent = GuiConsent::new(Arc::clone(&popups), withdraw(&kill, started));
+            let mut peer = pairing_peer();
+            peer.name = "arctic crisp lamp orbit".to_owned();
+            let asking = consent.pairing(&peer, "123 456");
+            tokio::pin!(asking);
+            let open = tokio::select! {
+                _ = &mut asking => panic!("answered before anyone did"),
+                open = shown(&popups, 1) => open,
+            };
+            assert!(popups.answer_pairing(
+                open[0].id,
+                PairDecision::Accept {
+                    label: label.map(str::to_owned)
+                }
+            ));
+            assert_eq!(asking.await, expected, "{label:?}");
+        }
     }
 }

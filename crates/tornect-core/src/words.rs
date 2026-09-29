@@ -402,6 +402,9 @@ pub enum Likeness {
     DeclaredName,
     /// One of its words is a word of the saved name (case-folded).
     WordOfTheName,
+    /// The name it declared holds a word of the saved entry's words
+    /// (case-folded, or by skeleton): words put where a name goes.
+    DeclaredWords,
 }
 
 /// The key the alarm looks at: an unpinned key's words and identicon, and
@@ -425,8 +428,12 @@ impl fmt::Debug for Candidate<'_> {
 /// The look-alike alarm: the first saved entry (its index in `saved`) the
 /// unpinned key `candidate` comes close to, and why. It fires on the same
 /// first word; two or more shared words in any position; the same
-/// identicon; a declared name whose [`skeleton`] equals a saved name's; or a
-/// word equal to a word of a saved name (case-folded, or by skeleton).
+/// identicon; a declared name whose [`skeleton`] equals a saved name's; a
+/// word equal to a word of a saved name (case-folded, or by skeleton); a
+/// declared name that holds a word of a saved entry's words; or a declared
+/// name whose skeleton holds a saved name's (of three characters or more)
+/// with anything before or after it ("Office PC 2", "My Office PC"). An
+/// entry known by several names is passed once per name.
 #[must_use]
 pub fn look_alike(candidate: &Candidate<'_>, saved: &[Saved]) -> Option<(usize, Likeness)> {
     let words = candidate.words.get();
@@ -446,6 +453,16 @@ pub fn look_alike(candidate: &Candidate<'_>, saved: &[Saved]) -> Option<(usize, 
             Some(Likeness::DeclaredName)
         } else if word_of_the_name(&words, &entry.name) {
             Some(Likeness::WordOfTheName)
+        } else if candidate
+            .declared
+            .is_some_and(|d| word_of_the_name(&theirs, d))
+        {
+            Some(Likeness::DeclaredWords)
+        } else if declared
+            .as_deref()
+            .is_some_and(|d| holds_the_name(d, &skeleton(&entry.name)))
+        {
+            Some(Likeness::DeclaredName)
         } else {
             None
         };
@@ -478,6 +495,47 @@ fn word_of_the_name(words: &[&str; WORDS], name: &str) -> bool {
                 .iter()
                 .any(|w| *w == part || skeleton(w) == part_skeleton)
         })
+}
+
+/// Whether the skeleton of a declared name holds a saved name's skeleton
+/// with anything before or after it: the saved name with a number, a word or
+/// a mark added. Saved skeletons shorter than three characters never match
+/// this way (they would match too much).
+fn holds_the_name(declared: &str, saved: &str) -> bool {
+    saved.chars().count() >= 3 && declared.contains(saved)
+}
+
+/// The [`skeleton`] of every word of the list, computed once.
+fn list_skeletons() -> &'static std::collections::HashSet<String> {
+    static SKELETONS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    SKELETONS.get_or_init(|| wordlist().iter().map(|w| skeleton(w)).collect())
+}
+
+/// Why `label` may not be pinned as a device's or a computer's name, if it
+/// may not (§B.6.1 item 7: a label never puts words in the name slot, and
+/// never imitates a sheet's own lines): it holds a quotation mark or a
+/// middle dot, or it reads as a set of device words — four words of the
+/// list, however they are separated or spelled with look-alike letters.
+#[must_use]
+pub fn label_refusal(label: &str) -> Option<&'static str> {
+    if label.contains(['"', '\u{201c}', '\u{201d}', '\u{201e}', '\u{ff02}']) {
+        return Some("it holds a quotation mark");
+    }
+    if label.contains(['·', '•', '∙', '⋅', '\u{2027}', '\u{30fb}']) {
+        return Some("it holds a middle dot");
+    }
+    let list = wordlist();
+    let listed =
+        |part: &str| list.contains(&part) || list_skeletons().contains(skeleton(part).as_str());
+    let folded = label.to_lowercase();
+    let parts: Vec<&str> = folded
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() == WORDS && parts.iter().all(|part| listed(part)) {
+        return Some("it reads like device words");
+    }
+    None
 }
 
 /// Whether two Tornect IDs (base32, 56 characters) share their first or their
@@ -870,6 +928,82 @@ mod tests {
             ),
             Some((0, Likeness::WordOfTheName))
         );
+    }
+
+    /// A declared name that carries a saved entry's words, or a saved name
+    /// with something added before or after it, fires the alarm; a declared
+    /// name unlike every saved one still does not, and a saved name shorter
+    /// than three characters is not matched inside longer names.
+    #[test]
+    fn a_declared_name_cannot_carry_words_or_a_near_name() {
+        let book = [
+            saved("Office PC", "arctic crisp lamp orbit", [1, 2, 3]),
+            saved("Laptop", "zone zoo yard wrist", [9, 9, 9]),
+            saved("PC", "zebra zero yellow youth", [7, 7, 7]),
+        ];
+        let calm = words("absurd citizen dinner harvest");
+        let look = |declared: &str| {
+            look_alike(
+                &Candidate {
+                    words: calm,
+                    identicon: Identicon::from_seed([4, 5, 6]),
+                    declared: Some(declared),
+                },
+                &book,
+            )
+        };
+        for declared in ["arctic crisp lamp orbit", "Arctic·Crisp", "lamp", "Zoo"] {
+            let at = usize::from(declared.eq_ignore_ascii_case("zoo"));
+            assert_eq!(
+                look(declared),
+                Some((at, Likeness::DeclaredWords)),
+                "{declared}"
+            );
+        }
+        for declared in [
+            "Office PC 2",
+            "Office PC (2)",
+            "My Office PC",
+            "Office PC new",
+            "Office PC,",
+            "\"Office PC\"",
+        ] {
+            assert_eq!(
+                look(declared),
+                Some((0, Likeness::DeclaredName)),
+                "{declared}"
+            );
+        }
+        assert_eq!(look("Old laptop"), Some((1, Likeness::DeclaredName)));
+        for calm_name in ["Kitchen", "Office Mac", "Office", "My PC 2"] {
+            assert_eq!(look(calm_name), None, "{calm_name}");
+        }
+    }
+
+    /// A label that holds a quotation mark or a middle dot, or reads as four
+    /// words of the list, is refused at pin time; ordinary names pass.
+    #[test]
+    fn labels_that_would_put_words_in_the_name_slot_are_refused() {
+        for (label, why) in [
+            ("arctic crisp lamp orbit", "it reads like device words"),
+            ("Arctic-Crisp-Lamp-Orbit", "it reads like device words"),
+            ("аrctic crisp lamp orbit", "it reads like device words"),
+            ("Ana\" · view only", "it holds a quotation mark"),
+            ("Laptop \u{201c}2\u{201d}", "it holds a quotation mark"),
+            ("Laptop · 2", "it holds a middle dot"),
+        ] {
+            assert_eq!(label_refusal(label), Some(why), "{label}");
+        }
+        for label in [
+            "Laptop",
+            "Office PC",
+            "Family room",
+            "arctic crisp lamp",
+            "arctic crisp lamp orbit zoo",
+            "Laptop (2)",
+        ] {
+            assert_eq!(label_refusal(label), None, "{label}");
+        }
     }
 
     /// The skeleton reads look-alike letters as the letters they pass for,

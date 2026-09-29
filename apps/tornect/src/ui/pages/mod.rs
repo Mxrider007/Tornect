@@ -965,4 +965,157 @@ mod tests {
         let anyway = window.center("Connect anyway");
         assert_eq!(window.click(anyway), vec![Action::ConnectAnyway(id)]);
     }
+
+    /// The bounds of the last widget labelled `label`: on the request sheet,
+    /// the newest card's.
+    fn last_bounds(window: &Window, label: &str) -> egui::accesskit::Rect {
+        window
+            .nodes
+            .iter()
+            .filter(|n| n.label() == Some(label))
+            .filter_map(Node::bounds)
+            .next_back()
+            .unwrap_or_else(|| panic!("no \"{label}\" on screen"))
+    }
+
+    fn session_question(id: u64, label: &str) -> Popup {
+        Popup {
+            id,
+            kind: PopupKind::Session {
+                label: label.to_owned(),
+                fingerprint: "ab:cd".to_owned(),
+            },
+            deadline: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    fn pairing_question(id: u64) -> Popup {
+        Popup {
+            id,
+            kind: PopupKind::Pairing {
+                name: "Phone".to_owned(),
+                fingerprint: "ef:01".to_owned(),
+                sas: "123 456".to_owned(),
+                pinned: None,
+            },
+            deadline: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    /// The request sheet with two and three open questions, at both sizes:
+    /// the newest card's Deny and accepts are inside the sheet's room; and
+    /// when the room shrinks, they are brought back into view.
+    #[test]
+    fn the_newest_questions_answers_stay_in_view() {
+        for size in [WIDE, NARROW] {
+            for questions in [
+                vec![pairing_question(1), session_question(2, "Laptop")],
+                vec![
+                    pairing_question(1),
+                    session_question(2, "Laptop"),
+                    session_question(3, "Tablet"),
+                ],
+            ] {
+                let open = questions.len();
+                let mut model = at_rest();
+                model.popups = questions;
+                let mut window = Window::new(model, Page::Home, egui::Theme::Dark, size);
+                assert!(has_text(&window, &format!("{open} questions are open")));
+                for height in [size.1, size.1 - 220.0] {
+                    window.size.y = height;
+                    for _ in 0..3 {
+                        assert!(window.pass(Vec::new()).is_empty());
+                    }
+                    for label in ["Deny", "View only", "Allow control"] {
+                        let b = last_bounds(&window, label);
+                        assert!(
+                            b.y0 >= 0.0
+                                && b.y1 <= f64::from(height) - 16.0
+                                && b.x0 >= 0.0
+                                && b.x1 <= f64::from(size.0),
+                            "{size:?} {open} questions, {height} high: {label} at {b:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The banner stays above the request sheet's scrim, and live: its Stop
+    /// answers a click while a question is open and is the keyboard's first
+    /// stop, the question's Deny the next; the sidebar and the page under
+    /// the scrim take no click.
+    #[test]
+    fn the_banner_stays_above_the_request_sheet() {
+        let mut model = at_rest();
+        model.sharing = vec![super::super::model::Sharing {
+            session_id: "00".to_owned(),
+            label: "Laptop".to_owned(),
+            control: true,
+            unattended: false,
+            since: Instant::now(),
+            capture: None,
+        }];
+        model.popups = vec![session_question(9, "Tablet")];
+        for size in [WIDE, NARROW] {
+            let mut window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, size);
+            let settings = window.center(Page::Settings.title());
+            assert!(window.click(settings).is_empty(), "{size:?}");
+            assert_eq!(window.form.page, Page::Home, "the sidebar under the scrim");
+            let stop = window.center("Stop sharing");
+            assert_eq!(window.click(stop), vec![Action::StopSharing], "{size:?}");
+            let mut window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, size);
+            window.key(egui::Key::Tab);
+            assert_eq!(
+                window.key(egui::Key::Space),
+                vec![Action::StopSharing],
+                "{size:?}: the banner's Stop first"
+            );
+            let mut window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, size);
+            window.key(egui::Key::Tab);
+            window.key(egui::Key::Tab);
+            assert_eq!(
+                window.key(egui::Key::Space),
+                vec![Action::Session {
+                    id: 9,
+                    decision: SessionDecision::Deny,
+                    pointer: false,
+                }],
+                "{size:?}: then the sheet's Deny"
+            );
+        }
+    }
+
+    /// The code field of a sheet whose alarm fired never takes the focus by
+    /// itself: a sheet that appears while the connect field has it leaves it
+    /// there, and typing goes on into that field.
+    #[test]
+    fn a_code_field_never_takes_the_focus() {
+        use super::super::preview::Sheet;
+        let mut window = Window::new(at_rest(), Page::Home, egui::Theme::Dark, WIDE);
+        let field = window
+            .nodes
+            .iter()
+            .find(|n| n.role() == Role::TextInput)
+            .and_then(Node::bounds)
+            .expect("the connect field");
+        let at = egui::pos2(
+            ((field.x0 + field.x1) / 2.0) as f32,
+            ((field.y0 + field.y1) / 2.0) as f32,
+        );
+        assert!(window.click(at).is_empty());
+        window.pass(vec![egui::Event::Text("ab".to_owned())]);
+        assert_eq!(window.form.connect_to, "ab");
+        let alarmed = with_sheet(Sheet::Alarm);
+        window.model.popups = alarmed.popups;
+        window.model.recognition = alarmed.recognition;
+        window.later += Duration::from_secs(2);
+        for _ in 0..2 {
+            assert!(window.pass(Vec::new()).is_empty());
+        }
+        assert!(has_text(&window, "Looks like your saved device"));
+        window.pass(vec![egui::Event::Text("5".to_owned())]);
+        assert_eq!(window.form.connect_to, "ab5");
+        assert!(window.form.codes.values().all(String::is_empty));
+    }
 }
