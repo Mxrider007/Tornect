@@ -1028,16 +1028,17 @@ mod tests {
     }
 
     /// The request sheet with two and three open questions, at both sizes:
-    /// the newest card's Deny and accepts are inside the sheet's room; and
-    /// when the room shrinks, they are brought back into view.
+    /// the one card shown (the oldest: one question at a time) has its Deny
+    /// and accepts inside the sheet's room, under the waiting line; and when
+    /// the room shrinks, they are brought back into view.
     #[test]
     fn the_newest_questions_answers_stay_in_view() {
         for size in [WIDE, NARROW] {
             for questions in [
-                vec![pairing_question(1), session_question(2, "Laptop")],
+                vec![session_question(1, "Laptop"), pairing_question(2)],
                 vec![
-                    pairing_question(1),
-                    session_question(2, "Laptop"),
+                    session_question(1, "Laptop"),
+                    pairing_question(2),
                     session_question(3, "Tablet"),
                 ],
             ] {
@@ -1045,7 +1046,7 @@ mod tests {
                 let mut model = at_rest();
                 model.popups = questions;
                 let mut window = Window::new(model, Page::Home, egui::Theme::Dark, size);
-                assert!(has_text(&window, &format!("{open} questions are open")));
+                assert!(has_text(&window, &format!("{} more waiting", open - 1)));
                 for height in [size.1, size.1 - 220.0] {
                     window.size.y = height;
                     for _ in 0..3 {
