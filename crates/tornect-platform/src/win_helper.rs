@@ -511,6 +511,8 @@ pub(crate) fn when_exits(pid: u32, exited: impl FnOnce() + Send + 'static) -> st
     let process = Waited(open_process(pid, PROCESS_SYNCHRONIZE)?);
     std::thread::Builder::new()
         .name("host-exit".to_owned())
+        // An explicit size: std then never reads `RUST_MIN_STACK` (H2).
+        .stack_size(64 * 1024)
         .spawn(move || {
             let process = process;
             // SAFETY: `process` is an open handle with SYNCHRONIZE, closed
@@ -615,6 +617,8 @@ pub(crate) fn watch_panic_chord(pressed: impl FnOnce() + Send + 'static) -> std:
     let (set, hooked) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("panic-chord".to_owned())
+        // An explicit size: std then never reads `RUST_MIN_STACK` (H2).
+        .stack_size(256 * 1024)
         .spawn(move || {
             // SAFETY: the module handle of this executable; the hook
             // procedure lives in it and stays valid while it runs.
