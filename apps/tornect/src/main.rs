@@ -367,6 +367,14 @@ enum SheetArg {
     StageDenied,
     /// The connect stepper: the codes differed.
     StageCodesDiffer,
+    /// A saved computer where connecting without asking worked.
+    UaCard,
+    /// The password prompt of an unattended connect.
+    UaPrompt,
+    /// The connect stepper: an unattended connect refused.
+    UaRefused,
+    /// The connect stepper: an unattended session live.
+    UaLive,
 }
 
 impl From<SheetArg> for ui::preview::Sheet {
@@ -393,6 +401,10 @@ impl From<SheetArg> for ui::preview::Sheet {
             SheetArg::StageUnreachable => Self::StageUnreachable,
             SheetArg::StageDenied => Self::StageDenied,
             SheetArg::StageCodesDiffer => Self::StageCodesDiffer,
+            SheetArg::UaCard => Self::UaCard,
+            SheetArg::UaPrompt => Self::UaPrompt,
+            SheetArg::UaRefused => Self::UaRefused,
+            SheetArg::UaLive => Self::UaLive,
         }
     }
 }

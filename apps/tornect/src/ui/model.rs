@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 use tornect_core::TornectId;
 use tornect_core::address_book::{Day, mixes_scripts};
 use tornect_core::levels::{Answers, Availability};
+use tornect_core::unattended::credentials::RememberOffer;
+
+use crate::ua_client::AdminAction;
 use tornect_core::words::{Identicon, Words};
 
 /// Why the UI thread is woken.
@@ -164,6 +167,17 @@ pub struct Model {
     /// sharing this screen, which this window cannot see, so the window
     /// hides what it would hide while sharing.
     pub hosted_elsewhere: bool,
+    /// The password prompt of an unattended connect or admin command, open
+    /// before anything is dialed (§B.8.10).
+    pub prompt: Option<Prompt>,
+    /// The computers whose unattended setup was re-created (A16) and whose
+    /// warning the person has not confirmed yet: Connect waits for that.
+    pub setup_changed: HashSet<TornectId>,
+    /// When a computer asked this device to wait before the next password
+    /// (`LOCKED_OUT`, `COOLDOWN`): the prompt says so before submitting.
+    pub retry_at: HashMap<TornectId, Instant>,
+    /// The live unattended session's lines from its signed accept.
+    pub ua_live: Option<UaLive>,
     /// The tokio side has finished shutting down.
     pub closed: bool,
 }
@@ -460,8 +474,11 @@ pub struct Dial {
     /// It went through pairing (the code was compared).
     pub paired_now: bool,
     /// It ended without a session: why, and at which step (1 reaching,
-    /// 2 pairing, 3 waiting for approval, 4 opening the picture).
+    /// 2 pairing, 3 waiting for approval, 4 opening the picture; unattended:
+    /// 2 the password, 3 the computer's own checks).
     pub failed: Option<(Failure, u8)>,
+    /// An unattended connect: the stepper names its own steps.
+    pub unattended: bool,
 }
 
 /// Why a connection ended without a session: the connect stepper's error
@@ -478,6 +495,13 @@ pub enum Failure {
     VersionMismatch,
     /// The codes differed (or this computer's person said so).
     CodesDiffer,
+    /// Unattended: the password was not accepted.
+    WrongPassword,
+    /// Unattended: the computer did not let this device in (its reason is
+    /// the stage's own words).
+    NotLetIn,
+    /// Unattended: the computer's unattended setup was re-created (A16).
+    SetupChanged,
     /// Anything else; the stage's own words say what.
     Other,
 }
@@ -492,6 +516,9 @@ impl Failure {
             Self::TimedOut => "Nobody answered in time",
             Self::VersionMismatch => "The two computers run Tornect versions that cannot talk",
             Self::CodesDiffer => "Not paired. Nothing was saved.",
+            Self::WrongPassword => "Wrong password",
+            Self::NotLetIn => "The computer did not let this device in",
+            Self::SetupChanged => "Its unattended setup was re-created",
             Self::Other => "The connection ended",
         }
     }
@@ -516,6 +543,15 @@ impl Failure {
                 "If the codes differed, something between you may have changed them. Try again \
                  later, ideally after checking the ID with the person at that computer."
             }
+            Self::WrongPassword => {
+                "Nothing else was tried. Try again when you want to: each try counts at the \
+                 computer."
+            }
+            Self::NotLetIn => "Its reason is below. Nothing is tried again by itself.",
+            Self::SetupChanged => {
+                "If that wasn't you, revoke devices there. Connecting waits until you say you \
+                 read this."
+            }
             Self::Other => "Try again, or go back.",
         }
     }
@@ -539,6 +575,10 @@ pub enum ClientStage {
     },
     /// Waiting for the host's user to accept the session.
     Asking,
+    /// Unattended: the password is being checked, and someone at the
+    /// computer can still block the session (or must allow it); no countdown
+    /// (§B.8.10: the grant's policy is disclosed only in the signed accept).
+    Checking,
     /// The session is live; the stream window is open.
     Live(Viewing),
     /// It ended, and why.
@@ -556,6 +596,9 @@ pub struct Viewing {
     /// The signed `SESSION_ACCEPT` said administrator (§B.2.1): the bar
     /// reads "Control · administrator". Never from anything but the accept.
     pub administrator: bool,
+    /// Started on this device's unattended access (the signed accept's
+    /// session type): the bar says "Unattended · …" (§B.8.10).
+    pub unattended: bool,
     /// When the session started.
     pub since: Instant,
     /// Pictures decoded so far.
@@ -641,6 +684,67 @@ pub struct Computer {
     pub last_seen: Option<Day>,
     /// A name saved for it no longer applies: its key changed since.
     pub name_hidden: bool,
+    /// What this computer knows of its unattended access there
+    /// (`hosts.toml`): never a password.
+    pub unattended: UaRecord,
+}
+
+/// A saved computer's unattended record, as the pages show it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UaRecord {
+    /// An unattended session there worked before: Connect (without asking)
+    /// is the card's first action, Knock otherwise (§B.8.10).
+    pub worked_before: bool,
+    /// A password is remembered for it in the keychain.
+    pub remembered: bool,
+    /// The last signed accept there was control: the card offers the admin
+    /// actions that need a control grant (the host decides their scope).
+    pub control: bool,
+}
+
+/// The password prompt of an unattended connect or admin command (§B.8.10):
+/// before dialing, masked, one attempt per explicit action.
+#[derive(Clone)]
+pub struct Prompt {
+    /// The computer.
+    pub id: TornectId,
+    /// What the lists call it (hidden while this screen is shared).
+    pub host: String,
+    /// The keychain a password can be remembered in, if one is usable.
+    pub keychain: Option<&'static str>,
+    /// Whether "Remember on this device" is offered, without and with the
+    /// administrator level asked for.
+    pub remember: (RememberOffer, RememberOffer),
+    /// A password is remembered for it: used unless one is typed.
+    pub remembered: bool,
+    /// The remembered password was refused last time and deleted.
+    pub stale: bool,
+    /// The saved record says the grant may carry the administrator level:
+    /// "Ask for administrator access" is offered (else absent).
+    pub may_admin: bool,
+    /// The computer asked to wait until then before the next password.
+    pub retry_at: Option<Instant>,
+    /// An admin command instead of a session.
+    pub admin: Option<AdminAction>,
+}
+
+impl std::fmt::Debug for Prompt {
+    /// No computer and nothing of a password.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Prompt")
+            .field("remembered", &self.remembered)
+            .field("admin", &self.admin)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A live unattended session's lines from its signed accept (§B.8.10).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UaLive {
+    /// The administrator level was asked for and the accept gave none.
+    pub withheld: bool,
+    /// "3 failed attempts since your last login", if there were any.
+    pub fail_summary: Option<String>,
 }
 
 impl Computer {

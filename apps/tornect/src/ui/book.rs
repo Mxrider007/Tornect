@@ -14,7 +14,7 @@ use tornect_core::words::{Known, Role};
 use tornect_core::{Paths, TornectId};
 use tornect_signal::TorNode;
 
-use super::model::{Book, Check, Computer, Device};
+use super::model::{Book, Check, Computer, Device, UaRecord};
 use crate::tor_cmd::explain;
 
 /// How long a check waits for the computer's answer, the Tor circuit
@@ -64,6 +64,12 @@ pub fn read(paths: &Paths, today: Day, derived: Option<&Known>) -> Book {
         problems.push(format!("the paired devices: {e}"));
         TrustedDevices::default()
     });
+    // What each computer's unattended access was like (never a password).
+    let unattended = tornect_core::unattended::hosts::HostsFile::load(&paths.hosts_file())
+        .unwrap_or_else(|e| {
+            problems.push(format!("the unattended records: {e}"));
+            tornect_core::unattended::hosts::HostsFile::default()
+        });
 
     let mut ids: Vec<TornectId> = known
         .hosts
@@ -103,6 +109,15 @@ pub fn read(paths: &Paths, today: Day, derived: Option<&Known>) -> Book {
                     .map(|(_, identicon)| identicon),
                 paired: pin.map(|p| Day::from_unix(p.paired_at)),
                 last_seen: entry.and_then(|e| e.last_seen),
+                unattended: unattended
+                    .get(&id)
+                    .filter(|_| pin.is_some())
+                    .map(|r| UaRecord {
+                        worked_before: r.ua_worked_before,
+                        remembered: r.remember,
+                        control: r.control,
+                    })
+                    .unwrap_or_default(),
             }
         })
         .collect();

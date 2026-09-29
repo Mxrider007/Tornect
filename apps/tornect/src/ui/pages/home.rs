@@ -708,7 +708,7 @@ fn connect_stepper(
     // The step the connection is on (1 ..= 4), and 5 once it is live.
     let at = match stage {
         ClientStage::Idle | ClientStage::Reaching { .. } => 1,
-        ClientStage::Pairing { .. } => 2,
+        ClientStage::Pairing { .. } | ClientStage::Checking => 2,
         ClientStage::Asking => 3,
         ClientStage::Live(_) => 5,
         ClientStage::Ended(_) => dial.failed.map_or(5, |(_, step)| step),
@@ -749,7 +749,29 @@ fn connect_stepper(
                 .color(t.text_muted),
         );
     }
-    let steps: [(&str, &str); 4] = [
+    // An unattended connect's own steps (§B.8.10): the password, then the
+    // computer's checks, where someone there can still block (or must allow)
+    // — generic, with no countdown, since the grant's policy is disclosed
+    // only in the signed accept.
+    let unattended_steps: [(&str, &str); 4] = [
+        (
+            "Reaching the computer over Tor",
+            "Usually 5–30 s, up to a minute",
+        ),
+        (
+            "Checking the password",
+            "One try: nothing is tried again by itself",
+        ),
+        (
+            "Someone at the computer can still block this, or must allow it",
+            "No countdown: the computer's own settings decide",
+        ),
+        (
+            "Opening the picture",
+            "No direct path in this version: relayed through Tor",
+        ),
+    ];
+    let attended_steps: [(&str, &str); 4] = [
         (
             "Reaching the computer over Tor",
             "Usually 5–30 s, up to a minute",
@@ -771,12 +793,20 @@ fn connect_stepper(
             "Relayed through Tor: private, and slower than a direct link",
         ),
     ];
+    let steps = if dial.unattended {
+        unattended_steps
+    } else {
+        attended_steps
+    };
+    // While the password is checked the computer's own checks may already
+    // run: both steps show as under way.
+    let active = |n: u8| n == at || (dial.unattended && at == 2 && n == 3);
     for (n, (title, note)) in (1u8..).zip(steps) {
         let (mark, color) = if failed.is_some_and(|(_, step)| step == n) {
             ("✕", t.danger_text)
-        } else if n < at || (n == 2 && at > 2 && !dial.paired_now) {
+        } else if n < at || (n == 2 && at > 2 && !dial.paired_now && !dial.unattended) {
             ("✓", t.ok)
-        } else if n == at && failed.is_none() {
+        } else if active(n) && failed.is_none() {
             ("…", t.accent_text)
         } else {
             ("·", t.text_muted)
@@ -798,7 +828,7 @@ fn connect_stepper(
                         .font(theme::font(ui.ctx(), Face::Regular, 12.0))
                         .color(t.text_muted),
                 );
-                if n == at && failed.is_none() {
+                if active(n) && failed.is_none() {
                     match stage {
                         ClientStage::Pairing { sas } => {
                             ui.label("The computer shows a code too. The question above asks whether they match:");
@@ -809,7 +839,10 @@ fn connect_stepper(
                                     .color(t.accent_text),
                             );
                         }
-                        ClientStage::Idle | ClientStage::Reaching { .. } | ClientStage::Asking => {
+                        ClientStage::Idle
+                        | ClientStage::Reaching { .. }
+                        | ClientStage::Asking
+                        | ClientStage::Checking => {
                             ui.spinner();
                         }
                         _ => {}
@@ -827,11 +860,16 @@ fn connect_stepper(
                     Icon::Eye
                 };
                 icons::show(ui, icon, 16.0, t.ok);
-                // The level only from the signed accept (§B.2.1).
-                let level = match (viewing.control, viewing.administrator) {
-                    (true, true) => "Control · administrator",
-                    (true, false) => "control",
-                    (false, _) => "view only",
+                // The level only from the signed accept (§B.2.1); an
+                // unattended session's badge says so (§B.8.10).
+                let level = if viewing.unattended {
+                    crate::ua_client::badge(viewing.control, viewing.administrator)
+                } else {
+                    match (viewing.control, viewing.administrator) {
+                        (true, true) => "Control · administrator",
+                        (true, false) => "control",
+                        (false, _) => "view only",
+                    }
                 };
                 ui.add(
                     egui::Label::new(
@@ -848,6 +886,30 @@ fn connect_stepper(
                     .wrap(),
                 );
             });
+            if let Some(lines) = &model.ua_live {
+                if let Some(summary) = &lines.fail_summary {
+                    ui.label(RichText::new(summary).color(t.warn));
+                }
+                if lines.withheld {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(if shared {
+                                "Administrator access unavailable at the computer: the session \
+                                 runs without it."
+                                    .to_owned()
+                            } else {
+                                format!(
+                                    "Administrator access unavailable at \"{}\": the session \
+                                     runs without it.",
+                                    viewing.host
+                                )
+                            })
+                            .color(t.warn),
+                        )
+                        .wrap(),
+                    );
+                }
+            }
             if Button::new(Kind::Danger, "End the session")
                 .show(ui)
                 .clicked()
@@ -873,13 +935,27 @@ fn connect_stepper(
                 ui.add(egui::Label::new(RichText::new(why).small().color(t.text_muted)).wrap());
             }
             ui.horizontal(|ui| {
-                if let Some(id) = dial.id.filter(|_| model.tor.is_ready())
+                let blocked = dial.id.is_some_and(|id| model.setup_changed.contains(&id));
+                if let (Some(id), true) = (dial.id, blocked) {
+                    if Button::new(Kind::Secondary, "I read this")
+                        .show(ui)
+                        .clicked()
+                    {
+                        actions.push(Action::ConfirmSetupChanged(id));
+                    }
+                } else if let Some(id) = dial.id.filter(|_| model.tor.is_ready())
                     && Button::new(Kind::Primary, "Try again")
                         .icon(Icon::ArrowRight)
                         .show(ui)
                         .clicked()
                 {
-                    actions.push(Action::Connect(id));
+                    // One attempt per explicit action: an unattended try
+                    // again opens the prompt again.
+                    actions.push(if dial.unattended {
+                        Action::AskPassword(id)
+                    } else {
+                        Action::Connect(id)
+                    });
                 }
                 if Button::new(Kind::Secondary, "Back").show(ui).clicked() {
                     actions.push(Action::DismissConnect);
@@ -1005,16 +1081,82 @@ fn saved_card(
                 .font(theme::font(ui.ctx(), Face::Regular, 12.0))
                 .color(t.text_secondary),
         );
-        if Button::new(Kind::Secondary, "Connect")
+        ui.horizontal_wrapped(|ui| {
+            host_actions(ui, model, computer, ready, true, actions);
+        });
+    });
+}
+
+/// A saved computer's connect actions (§B.8.10): **Connect** — without
+/// asking, the password prompt first — is the first action once an
+/// unattended session there worked, **Knock** (the person there allows)
+/// otherwise; with `ask`, a paired computer's card also offers to connect
+/// without asking before that (the address book offers it lower down).
+/// Connect waits while its setup-changed warning is unread.
+pub(super) fn host_actions(
+    ui: &mut Ui,
+    model: &Model,
+    computer: &Computer,
+    ready: bool,
+    small: bool,
+    actions: &mut Vec<Action>,
+) {
+    host_actions_with(ui, model, computer, ready, small, true, actions);
+}
+
+/// [`host_actions`], saying whether to offer "Connect without asking" here.
+pub(super) fn host_actions_with(
+    ui: &mut Ui,
+    model: &Model,
+    computer: &Computer,
+    ready: bool,
+    small: bool,
+    ask: bool,
+    actions: &mut Vec<Action>,
+) {
+    let id = computer.id;
+    let paired = computer.paired.is_some();
+    let blocked = model.setup_changed.contains(&id);
+    let button = |kind, text| {
+        let b = Button::new(kind, text);
+        if small { b.small() } else { b }
+    };
+    if paired && computer.unattended.worked_before {
+        if button(Kind::Primary, "Connect")
             .icon(Icon::ArrowRight)
-            .small()
+            .enabled(ready && !blocked)
+            .show(ui)
+            .clicked()
+        {
+            actions.push(Action::AskPassword(id));
+        }
+        if button(Kind::Secondary, "Knock")
             .enabled(ready)
             .show(ui)
             .clicked()
         {
-            actions.push(Action::Connect(computer.id));
+            actions.push(Action::Connect(id));
         }
-    });
+    } else {
+        if button(Kind::Primary, "Knock")
+            .icon(Icon::ArrowRight)
+            .enabled(ready)
+            .show(ui)
+            .clicked()
+        {
+            actions.push(Action::Connect(id));
+        }
+        if ask
+            && paired
+            && Button::new(Kind::Ghost, "Connect without asking")
+                .small()
+                .enabled(ready && !blocked)
+                .show(ui)
+                .clicked()
+        {
+            actions.push(Action::AskPassword(id));
+        }
+    }
 }
 
 /// "Recent": the last few connections from the history (days only), or

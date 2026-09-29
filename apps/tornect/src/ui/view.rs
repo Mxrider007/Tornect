@@ -17,11 +17,14 @@ use tornect_signal::pairing::{PairDecision, SessionDecision};
 
 #[cfg(test)]
 use super::model::{ClientStage, Hosting, Setup, TorState};
-use super::model::{Confirm, Model, Popup, PopupKind, Recognition, Sharing, SheetLevels, Viewing};
+use super::model::{
+    Confirm, Model, Popup, PopupKind, Prompt, Recognition, Sharing, SheetLevels, Viewing,
+};
 use super::nav::{self, Page};
 use super::pages;
 use super::theme::{self, Face};
 use super::widgets;
+use crate::ua_client::AdminAction;
 
 /// The SAS display size (§7: "SAS display 44 mono").
 pub const SAS_SIZE: f32 = 44.0;
@@ -153,6 +156,58 @@ pub enum Action {
     ClearHistory,
     /// Keep a history of connections, or stop keeping one.
     SetHistory(bool),
+    /// Open the password prompt for an unattended connect to this computer
+    /// (§B.8.10): the prompt comes before anything is dialed.
+    AskPassword(TornectId),
+    /// Open the password prompt for an admin command at this computer, after
+    /// its confirmation (§B.8.10).
+    AskAdmin(TornectId, AdminAction),
+    /// The prompt's Connect (or Send), with what the form holds. Answered by
+    /// a primary click of the pointer only: no key sequence submits it.
+    SubmitPrompt {
+        /// Given by the pointer.
+        pointer: bool,
+    },
+    /// Close the prompt; what was typed is wiped.
+    ClosePrompt,
+    /// The person read that this computer's unattended setup was re-created:
+    /// connecting may go on, and the next accept pins its new key (A16).
+    ConfirmSetupChanged(TornectId),
+}
+
+/// The password prompt's fields (§B.8.10). The password is wiped when the
+/// prompt closes or is submitted.
+#[derive(Default)]
+pub struct UaForm {
+    /// The password typed.
+    pub password: zeroize::Zeroizing<String>,
+    /// Show it as typed (the reveal toggle).
+    pub reveal: bool,
+    /// Type a password although one is remembered.
+    pub typing: bool,
+    /// "View only this time".
+    pub view_only: bool,
+    /// "Remember on this device" (off by default).
+    pub remember: bool,
+    /// "Ask for administrator access".
+    pub administrator: bool,
+    /// The computer and the admin command whose confirmation is shown.
+    pub confirming: Option<(TornectId, AdminAction)>,
+}
+
+impl std::fmt::Debug for UaForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UaForm")
+            .field("typed", &!self.password.is_empty())
+            .finish_non_exhaustive()
+    }
+}
+
+impl UaForm {
+    /// Wipe what was typed and chosen.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// What the user is typing, and what the window remembers of its cards.
@@ -174,6 +229,8 @@ pub struct Form {
     pub qr: bool,
     /// The address book page's own state.
     pub book: pages::BookForm,
+    /// The password prompt's fields.
+    pub ua: UaForm,
     /// What the request sheet last kept in view: its viewport's size, its
     /// newest card, how many cards it held and how tall they were. When any
     /// of them changes the newest card's answers are brought into view again.
@@ -343,6 +400,14 @@ pub fn main_window(
                 // keeps the focus when a question appears.
                 ui.skip_ahead_auto_ids(1);
             }
+            // This computer's own password prompt, under the host's
+            // questions (they come first) and above the page.
+            if let (Some(prompt), false) = (&model.prompt, asking) {
+                password_prompt(ui, prompt, model.screen_shared(now), form, now, actions);
+                ui.add_space(12.0);
+            } else {
+                ui.skip_ahead_auto_ids(1);
+            }
             egui::ScrollArea::vertical()
                 .id_salt("page")
                 .auto_shrink(false)
@@ -369,6 +434,184 @@ pub fn main_window(
     if !model.popups.is_empty() || model.confirm.is_some() || !model.sharing.is_empty() {
         ui.ctx().request_repaint_after(Duration::from_millis(500));
     }
+}
+
+/// The password prompt of an unattended connect or admin command (§B.8.10),
+/// before dialing: masked with a reveal toggle, "View only this time",
+/// "Remember on this device" off by default with its two-part risk copy (or
+/// the sentence that says why it is absent), what the computer said about
+/// waiting, Cancel, and a Connect (Send) that answers the pointer only. While
+/// this screen is shared it shows nothing of the computer and no field.
+fn password_prompt(
+    ui: &mut egui::Ui,
+    prompt: &Prompt,
+    shared: bool,
+    form: &mut Form,
+    now: Instant,
+    actions: &mut Vec<Action>,
+) {
+    let t = theme::tokens(ui.ctx());
+    let width = ui.available_width().min(SHEET_WIDTH);
+    ui.scope(|ui| {
+        ui.set_max_width(width);
+        widgets::card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if shared {
+                ui.label(
+                    RichText::new("The password prompt waits")
+                        .font(theme::font(ui.ctx(), Face::Semibold, 16.0))
+                        .color(t.text_primary),
+                );
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "It comes back when this screen is no longer shared: a password \
+                             is never typed on a shared screen.",
+                        )
+                        .color(t.text_secondary),
+                    )
+                    .wrap(),
+                );
+                if ui.button("Cancel").clicked() {
+                    actions.push(Action::ClosePrompt);
+                }
+                return;
+            }
+            let ua = &mut form.ua;
+            let heading = match prompt.admin {
+                None => format!("Connect to \"{}\" without asking", prompt.host),
+                Some(action) => format!("{}: \"{}\"", action.title(), prompt.host),
+            };
+            ui.add(
+                egui::Label::new(
+                    RichText::new(heading)
+                        .font(theme::font(ui.ctx(), Face::Semibold, 16.0))
+                        .color(t.text_primary),
+                )
+                .wrap(),
+            );
+            if prompt.stale {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "The password remembered here was refused last time and deleted: \
+                             type it again.",
+                        )
+                        .color(t.warn),
+                    )
+                    .wrap(),
+                );
+            }
+            if let Some(at) = prompt.retry_at.filter(|at| *at > now) {
+                let secs =
+                    u32::try_from(at.saturating_duration_since(now).as_secs()).unwrap_or(u32::MAX);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "\"{}\" asked this device to wait: it takes the next password in {}.",
+                            prompt.host,
+                            crate::ua_client::wait_text(secs)
+                        ))
+                        .color(t.warn),
+                    )
+                    .wrap(),
+                );
+            }
+            let saved = prompt.remembered && !ua.typing;
+            if saved {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "The password remembered in {} is used.",
+                            prompt.keychain.unwrap_or("the keychain")
+                        ))
+                        .color(t.text_secondary),
+                    );
+                    if ui.button("Type it instead").clicked() {
+                        ua.typing = true;
+                    }
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut *ua.password)
+                            .password(!ua.reveal)
+                            .hint_text("Password")
+                            .desired_width(260.0),
+                    );
+                    field.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Password")
+                    });
+                    ui.checkbox(&mut ua.reveal, "Show");
+                });
+            }
+            if prompt.admin.is_none() {
+                ui.checkbox(&mut ua.view_only, "View only this time");
+                if prompt.may_admin {
+                    ui.checkbox(&mut ua.administrator, "Ask for administrator access");
+                } else {
+                    ua.administrator = false;
+                }
+                let offer = if ua.administrator || prompt.may_admin {
+                    prompt.remember.1
+                } else {
+                    prompt.remember.0
+                };
+                match offer.sentence() {
+                    None if !saved => {
+                        ui.checkbox(&mut ua.remember, "Remember on this device");
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "Anyone who can use this computer as you could then \
+                                     connect to \"{}\" without the password, and any program \
+                                     running as you can read it from {}.",
+                                    prompt.host,
+                                    prompt.keychain.unwrap_or("the keychain")
+                                ))
+                                .small()
+                                .color(t.text_muted),
+                            )
+                            .wrap(),
+                        );
+                    }
+                    None => ua.remember = false,
+                    Some(sentence) => {
+                        ua.remember = false;
+                        ui.add(
+                            egui::Label::new(RichText::new(sentence).small().color(t.text_muted))
+                                .wrap(),
+                        );
+                    }
+                }
+            }
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "One try: if it fails, nothing is tried again by itself. The computer \
+                         counts every wrong password.",
+                    )
+                    .small()
+                    .color(t.text_muted),
+                )
+                .wrap(),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    actions.push(Action::ClosePrompt);
+                }
+                let ready = saved || !ua.password.is_empty();
+                let label = if prompt.admin.is_some() {
+                    "Send"
+                } else {
+                    "Connect"
+                };
+                if accept(ui, RichText::new(label).strong(), ready) {
+                    actions.push(Action::SubmitPrompt { pointer: true });
+                }
+            });
+        });
+    });
 }
 
 /// The open questions (the redesign's request sheet, §4): one question at a
@@ -1347,7 +1590,8 @@ pub fn stream_window(
             ui.horizontal(|ui| match viewing {
                 Some(v) => {
                     ui.label(RichText::new(&v.host).strong());
-                    // The level only from the signed accept (§B.2.1).
+                    // The level only from the signed accept (§B.2.1); an
+                    // unattended session's badge says so (§B.8.10).
                     let (mode, color) = if v.control && v.administrator {
                         ("Control · administrator", t.danger_text)
                     } else if v.control {
@@ -1355,7 +1599,14 @@ pub fn stream_window(
                     } else {
                         ("view only", t.text_muted)
                     };
-                    ui.label(RichText::new(mode).color(color));
+                    if v.unattended {
+                        ui.label(
+                            RichText::new(crate::ua_client::badge(v.control, v.administrator))
+                                .color(color),
+                        );
+                    } else {
+                        ui.label(RichText::new(mode).color(color));
+                    }
                     ui.label(
                         RichText::new(format!(
                             "{} · {}×{} · {} pictures · {} inputs",
@@ -2208,6 +2459,7 @@ mod tests {
                 host: "Desk".to_owned(),
                 control: false,
                 administrator: false,
+                unattended: false,
                 since: now,
                 pictures: 3,
                 size: (640, 480),
@@ -2234,6 +2486,7 @@ mod tests {
             host: "Desk".to_owned(),
             control: true,
             administrator: false,
+            unattended: false,
             since: Instant::now(),
             pictures: 1,
             size: (1600, 900),
@@ -2476,6 +2729,7 @@ mod tests {
                 host: "Desk".to_owned(),
                 control: true,
                 administrator,
+                unattended: false,
                 since: Instant::now(),
                 pictures: 1,
                 size: (1600, 900),

@@ -46,6 +46,7 @@ use crate::host::{
     say, say_evidence,
 };
 use crate::tor_cmd::{End, explain, explain_handshake};
+use crate::ua_client::{self, AdminAction, Logged};
 
 /// Input events queued for the media stream; one beyond that is dropped (the
 /// host's own budget is 250/s with a burst of 500).
@@ -87,8 +88,41 @@ pub enum Command {
     ClearHistory,
     /// Keep a history of connections, or stop keeping one.
     SetHistory(bool),
+    /// Open the password prompt for `id`, for a session or an admin command
+    /// (§B.8.10).
+    AskPassword(TornectId, Option<AdminAction>),
+    /// Connect to `id` without asking, as chosen in the prompt: one attempt.
+    ConnectUnattended(TornectId, UaChoice),
+    /// Send one admin command to `id`, as chosen in the prompt.
+    Admin(TornectId, AdminAction, UaChoice),
+    /// The person read that `id`'s unattended setup was re-created (A16).
+    ConfirmSetupChanged(TornectId),
     /// Shut down.
     Quit,
+}
+
+/// A password on its way from the prompt to the attempt: wiped on drop,
+/// never printed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(pub zeroize::Zeroizing<String>);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
+/// What the person chose in the prompt (§B.8.10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UaChoice {
+    /// The password typed; `None`: the remembered one.
+    pub password: Option<Secret>,
+    /// "View only this time".
+    pub view_only: bool,
+    /// "Remember on this device" (only where offered).
+    pub remember: bool,
+    /// "Ask for administrator access" (only where offered).
+    pub administrator: bool,
 }
 
 /// What the viewer and the stream window share: the newest picture, and while
@@ -710,7 +744,8 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                             m.connect_unchecked = None;
                         });
                         let (stop_tx, stop) = watch::channel(false);
-                        let task = tokio::spawn(view_session(Arc::clone(&b), node, id, stop, anyway));
+                        let task =
+                            tokio::spawn(view_session(Arc::clone(&b), node, id, stop, anyway, None));
                         viewing = Some((stop_tx, task));
                     }
                     Command::EndViewing => {
@@ -759,6 +794,57 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                     }
                     Command::ClearHistory => change_book(&b, &Change::Clear),
                     Command::SetHistory(on) => change_book(&b, &Change::History(on)),
+                    Command::AskPassword(id, admin) => open_prompt(&b, id, admin),
+                    Command::ConfirmSetupChanged(id) => {
+                        if let Err(e) = ua_client::renew_pin(&b.paths, &id) {
+                            tracing::warn!(error = %format!("{e:#}"), "hosts.toml could not be updated");
+                        }
+                        b.shared.update(|m| {
+                            m.setup_changed.remove(&id);
+                            if m.dial.id == Some(id) && matches!(m.client, ClientStage::Ended(_)) {
+                                m.client = ClientStage::Idle;
+                                m.dial = Dial::default();
+                            }
+                        });
+                    }
+                    Command::ConnectUnattended(id, choice) => {
+                        let Some(node) = node.clone() else {
+                            b.shared.update(|m| m.client = ClientStage::Ended("Tor is not connected yet.".to_owned()));
+                            continue;
+                        };
+                        if viewing.as_ref().is_some_and(|(_, task)| !task.is_finished())
+                            || b.shared.read(|m| m.setup_changed.contains(&id))
+                        {
+                            continue;
+                        }
+                        let Some(request) = unattended_request(&b, &id, choice) else {
+                            b.shared.update(|m| {
+                                m.client = ClientStage::Ended(
+                                    "No password: none was typed and none is remembered.".to_owned(),
+                                );
+                            });
+                            continue;
+                        };
+                        let (stop_tx, stop) = watch::channel(false);
+                        let task = tokio::spawn(view_session(
+                            Arc::clone(&b),
+                            node,
+                            id,
+                            stop,
+                            true,
+                            Some(request),
+                        ));
+                        viewing = Some((stop_tx, task));
+                    }
+                    Command::Admin(id, action, choice) => {
+                        let Some(node) = node.clone() else {
+                            b.shared.update(|m| m.note("Tor is not connected yet."));
+                            continue;
+                        };
+                        if let Some(request) = unattended_request(&b, &id, choice) {
+                            tokio::spawn(admin_command(Arc::clone(&b), node, id, action, request));
+                        }
+                    }
                     Command::Revoke => {
                         let token = b.paths.portal_restore_token();
                         let removed = match std::fs::remove_file(&token) {
@@ -827,8 +913,7 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
 fn change_book(b: &Backend, change: &Change) {
     // Forget takes the remembered unattended password too (§B.8.9.1).
     if let Change::Forget(id) = change
-        && let Err(e) =
-            crate::ua_client::forget(&b.paths, &crate::ua_client::system_passwords(&b.device), id)
+        && let Err(e) = ua_client::forget(&b.paths, &ua_client::system_passwords(&b.device), id)
     {
         tracing::warn!(error = %format!("{e:#}"), "the remembered password was not deleted");
     }
@@ -924,6 +1009,159 @@ async fn unless_stopped<F: Future>(work: F, stop: &watch::Receiver<bool>) -> Opt
     }
 }
 
+/// Open the password prompt for `id` (§B.8.10): what its saved record says
+/// (a remembered password, a stale one, whether the grant may carry the
+/// administrator level) and whether "Remember" can be offered here.
+fn open_prompt(b: &Backend, id: TornectId, admin: Option<AdminAction>) {
+    let record = ua_client::record(&b.paths, &id);
+    let saved = ua_client::system_passwords(&b.device);
+    b.shared.update(|m| {
+        let host = m.book.title_of(&id);
+        m.prompt = Some(super::model::Prompt {
+            id,
+            host,
+            keychain: saved.keychain(),
+            remember: (saved.offer(false), saved.offer(true)),
+            remembered: record.remember && saved.keychain().is_some(),
+            stale: record.stale,
+            may_admin: record.administrator,
+            retry_at: m.retry_at.get(&id).copied(),
+            admin,
+        });
+    });
+}
+
+/// The attempt the prompt asked for: the password typed, else the one
+/// remembered for `id` (read from the keychain now, under its derived name).
+fn unattended_request(b: &Backend, id: &TornectId, choice: UaChoice) -> Option<ua_client::Request> {
+    let password = match choice.password {
+        Some(Secret(typed)) => typed,
+        None => {
+            let saved = ua_client::system_passwords(&b.device);
+            match ua_client::recall(&b.paths, &saved, id) {
+                Ok(Some(remembered)) => remembered,
+                Ok(None) => return None,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "the keychain could not be read");
+                    return None;
+                }
+            }
+        }
+    };
+    Some(ua_client::Request {
+        password,
+        view_only: choice.view_only,
+        administrator: choice.administrator,
+        remember: choice.remember,
+    })
+}
+
+/// One admin command at `id` (§B.8.10): dial, one attempt, the host's signed
+/// answer; the result goes to the activity lines (they name the computer, so
+/// they are hidden while this screen is shared).
+async fn admin_command(
+    b: Arc<Backend>,
+    node: Arc<TorNode>,
+    id: TornectId,
+    action: AdminAction,
+    request: ua_client::Request,
+) {
+    let pins = match crate::history::Pins::open(&b.paths, id) {
+        Ok(pins) => pins,
+        Err(e) => {
+            b.shared
+                .update(|m| m.note(format!("That did not work: {e:#}")));
+            return;
+        }
+    };
+    let Some(known) = pins.store().get(&id) else {
+        b.shared
+            .update(|m| m.note("Admin commands go only to a paired computer."));
+        return;
+    };
+    let host = known.label.clone();
+    let saved = ua_client::system_passwords(&b.device);
+    let said = match node
+        .connect_on(&id, SIGNALING_PORT, &Isolation::new())
+        .await
+    {
+        Err(_) => {
+            let ended = ua_client::unreachable(&host);
+            ua_client::log_attempt(&b.paths, &known, &Logged::Ended(&ended.reason));
+            ended.text
+        }
+        Ok(stream) => {
+            let ccfg = ClientConfig::new(id, b.cfg.general.device_name.clone());
+            let deps = ClientDeps {
+                known_hosts: pins.store(),
+                ui: Arc::new(client::NoPairingUi),
+                random: Arc::new(OsRandom),
+                server_key_pin: Arc::new(ua_client::HostsPin::new(&b.paths)),
+            };
+            let command = client::AdminIntent {
+                password: request.password.clone(),
+                op: action.op(),
+                device_pk: match action {
+                    AdminAction::RevokeThisDevice => Some(*b.device.id().public_key_bytes()),
+                    _ => None,
+                },
+            };
+            match client::admin(stream, &ccfg, &b.device, &deps, &command).await {
+                Ok(answer) => {
+                    if let Err(e) = ua_client::settle(
+                        &b.paths,
+                        &saved,
+                        &id,
+                        tornect_core::unattended::credentials::Attempt::Accepted {
+                            administrator: false,
+                        },
+                        &request,
+                    ) {
+                        tracing::warn!(error = %format!("{e:#}"), "hosts.toml could not be updated");
+                    }
+                    ua_client::log_attempt(
+                        &b.paths,
+                        &known,
+                        &Logged::Admin {
+                            op: action.name(),
+                            ok: answer.ok,
+                        },
+                    );
+                    if answer.ok && action == AdminAction::RevokeThisDevice {
+                        let _ = ua_client::forget(&b.paths, &saved, &id);
+                    }
+                    if answer.ok {
+                        format!("\"{host}\" did it: {}.", action.title().to_lowercase())
+                    } else {
+                        format!(
+                            "\"{host}\" did not do it ({}): this device's access there does not \
+                             allow it, or it could not.",
+                            action.title().to_lowercase()
+                        )
+                    }
+                }
+                Err(e) => {
+                    let ended = ua_client::ended(&e, &host);
+                    if let Err(err) =
+                        ua_client::settle(&b.paths, &saved, &id, ended.attempt, &request)
+                    {
+                        tracing::warn!(error = %format!("{err:#}"), "hosts.toml could not be updated");
+                    }
+                    ua_client::log_attempt(&b.paths, &known, &Logged::Ended(&ended.reason));
+                    if ended.blocks {
+                        b.shared.update(|m| {
+                            m.setup_changed.insert(id);
+                        });
+                    }
+                    ended.text
+                }
+            }
+        }
+    };
+    b.shared.update(|m| m.note(said));
+    refresh_book(&b, None);
+}
+
 /// View `id`: pair if it is new, ask for a session, then show its screen and
 /// send input if the host allowed control. Ends when the user stops or either
 /// side goes away; the window learns how it ended.
@@ -933,6 +1171,7 @@ async fn view_session(
     id: TornectId,
     stop: watch::Receiver<bool>,
     anyway: bool,
+    ua: Option<ua_client::Request>,
 ) {
     // The connect field's look-alike check (§B.6.1 item 4): an ID that is not
     // in the address book is compared with the saved ones before anything is
@@ -961,7 +1200,7 @@ async fn view_session(
         }
     }
     let mut live = None;
-    let ended = viewed(&b, &node, id, &stop, &mut live).await;
+    let ended = viewed(&b, &node, id, &stop, &mut live, ua).await;
     b.link.set_input(None);
     let message = match ended {
         Ok(message) => message,
@@ -978,6 +1217,7 @@ async fn view_session(
     }
     b.shared.update(|m| {
         m.client = ClientStage::Ended(message.clone());
+        m.ua_live = None;
         m.note(message);
     });
 }
@@ -990,6 +1230,7 @@ async fn viewed(
     id: TornectId,
     stop: &watch::Receiver<bool>,
     live: &mut Option<String>,
+    ua: Option<ua_client::Request>,
 ) -> anyhow::Result<String> {
     b.shared.update(|m| {
         m.client = ClientStage::Reaching {
@@ -1000,8 +1241,21 @@ async fn viewed(
             since: Some(Instant::now()),
             paired_now: false,
             failed: None,
+            unattended: ua.is_some(),
         };
+        m.ua_live = None;
     });
+    // With history off the handshake works on a copy of the known hosts, so
+    // that its last-seen touch writes nothing (`crate::history`).
+    let pins = crate::history::Pins::open(&b.paths, id)?;
+    // Unattended access is a paired computer's (§B.8 hard rule 2).
+    let known = match (&ua, pins.store().get(&id)) {
+        (Some(_), None) => {
+            failed(b, Failure::Other);
+            anyhow::bail!("This computer is not paired with it: Knock first.");
+        }
+        (_, known) => known,
+    };
     // One isolation group: the media stream rides the signaling circuit.
     let isolation = Isolation::new();
     let Some(stream) = unless_stopped(node.connect_on(&id, SIGNALING_PORT, &isolation), stop).await
@@ -1010,12 +1264,16 @@ async fn viewed(
     };
     if stream.is_err() {
         failed(b, Failure::Unreachable);
+        if let (Some(_), Some(known)) = (&ua, &known) {
+            let ended = ua_client::unreachable(&known.label);
+            ua_client::log_attempt(&b.paths, known, &Logged::Ended(&ended.reason));
+            return Err(anyhow::Error::msg(ended.text));
+        }
     }
     let stream = stream.map_err(explain)?;
-    // With history off the handshake works on a copy of the known hosts, so
-    // that its last-seen touch writes nothing (`crate::history`).
-    let pins = crate::history::Pins::open(&b.paths, id)?;
-    if pins.known() {
+    if ua.is_some() {
+        b.shared.update(|m| m.client = ClientStage::Checking);
+    } else if pins.known() {
         b.shared.update(|m| m.client = ClientStage::Asking);
     }
     let ccfg = ClientConfig::new(id, b.cfg.general.device_name.clone());
@@ -1024,11 +1282,18 @@ async fn viewed(
         known_hosts: pins.store(),
         ui: pairing.clone(),
         random: Arc::new(OsRandom),
-        // Consulted only by unattended sessions, which the window does not ask for.
-        server_key_pin: Arc::new(NoServerKeyPin),
+        // The host's OPAQUE key, pinned in hosts.toml: only unattended
+        // sessions consult it.
+        server_key_pin: match &ua {
+            Some(_) => Arc::new(ua_client::HostsPin::new(&b.paths)),
+            None => Arc::new(NoServerKeyPin),
+        },
     };
+    let intent = ua
+        .as_ref()
+        .map_or(Intent::Session, ua_client::Request::intent);
     let outcome = unless_stopped(
-        client::connect(stream, &ccfg, &b.device, &deps, Intent::Session),
+        client::connect(stream, &ccfg, &b.device, &deps, intent),
         stop,
     )
     .await;
@@ -1040,8 +1305,37 @@ async fn viewed(
     }
     refresh_book(b, None);
     let Some(outcome) = outcome else {
+        if let (Some(_), Some(known)) = (&ua, &known) {
+            ua_client::log_attempt(&b.paths, known, &Logged::Ended("cancelled"));
+        }
         return Ok("Cancelled before the session started.".to_owned());
     };
+    // One attempt, settled once: nothing is tried again (§B.8.10).
+    if let (Some(request), Some(known), Err(e)) = (&ua, &known, &outcome) {
+        let ended = ua_client::ended(e, &known.label);
+        let saved = ua_client::system_passwords(&b.device);
+        if let Err(err) = ua_client::settle(&b.paths, &saved, &id, ended.attempt, request) {
+            tracing::warn!(error = %format!("{err:#}"), "hosts.toml could not be updated");
+        }
+        ua_client::log_attempt(&b.paths, known, &Logged::Ended(&ended.reason));
+        let (why, step) = ua_failure(e, &ended);
+        b.shared.update(|m| {
+            m.dial.failed = Some((why, step));
+            if ended.blocks {
+                m.setup_changed.insert(id);
+            }
+            if let HandshakeError::SessionRejected { reject: r } = e
+                && let Some(secs) = r.retry_after_s
+            {
+                m.retry_at.insert(
+                    id,
+                    Instant::now() + Duration::from_secs(u64::from(secs.min(24 * 3600))),
+                );
+            }
+        });
+        refresh_book(b, None);
+        return Err(anyhow::Error::msg(ended.text));
+    }
     let outcome = outcome.map_err(|e| {
         failed(b, classify(&e, pairing.ended()));
         not_started(e, pairing.ended())
@@ -1058,7 +1352,12 @@ async fn viewed(
     let sid = session.session_token().session_id();
     say_evidence(
         format_args!(
-            "SESSION LIVE {sid} with \"{host}\" ({})",
+            "SESSION LIVE {sid} with \"{host}\" ({}{})",
+            if session.unattended() {
+                "unattended · "
+            } else {
+                ""
+            },
             match (control, administrator) {
                 (true, true) => "control · administrator",
                 (true, false) => "control",
@@ -1067,12 +1366,45 @@ async fn viewed(
         ),
         Some(format_args!("SESSION LIVE {sid}")),
     );
+    let unattended = session.unattended();
+    if let (Some(request), Some(known)) = (&ua, &known) {
+        let saved = ua_client::system_passwords(&b.device);
+        if let Err(e) = ua_client::settle(
+            &b.paths,
+            &saved,
+            &id,
+            tornect_core::unattended::credentials::Attempt::Accepted { administrator },
+            request,
+        ) {
+            b.shared
+                .update(|m| m.note(format!("The password could not be remembered: {e:#}")));
+        }
+        if let Err(e) = ua_client::note_mode(&b.paths, &id, control) {
+            tracing::warn!(error = %format!("{e:#}"), "hosts.toml could not be updated");
+        }
+        ua_client::log_attempt(
+            &b.paths,
+            known,
+            &Logged::Session {
+                id: &sid,
+                control,
+                administrator,
+            },
+        );
+        let lines = super::model::UaLive {
+            withheld: session.elevation_withheld(),
+            fail_summary: ua_client::fail_summary_text(session.accept().fail_summary()),
+        };
+        b.shared.update(|m| m.ua_live = Some(lines));
+        refresh_book(b, None);
+    }
     *live = Some(sid);
     b.shared.update(|m| {
         m.client = ClientStage::Live(Viewing {
             host: host.clone(),
             control,
             administrator,
+            unattended,
             since: Instant::now(),
             pictures: 0,
             size: (0, 0),
@@ -1130,12 +1462,34 @@ async fn viewed(
     })
 }
 
+/// Where an unattended attempt that got no session belongs in the stepper:
+/// the password (step 2) or the computer's own checks after it (step 3).
+fn ua_failure(err: &HandshakeError, ended: &ua_client::Ended) -> (Failure, u8) {
+    if ended.blocks {
+        return (Failure::SetupChanged, 2);
+    }
+    if ended.attempt == tornect_core::unattended::credentials::Attempt::PasswordRefused {
+        return (Failure::WrongPassword, 2);
+    }
+    match err {
+        HandshakeError::SessionRejected { reject: r } => {
+            // Codes of 0x0021 and above come after the password was proven.
+            let after = r.reason >= reject::OUTSIDE_SCHEDULE && r.reason != reject::PREEMPTED
+                || r.reason == reject::DENIED
+                || r.reason == reject::POPUP_TIMEOUT;
+            (Failure::NotLetIn, if after { 3 } else { 2 })
+        }
+        HandshakeError::Timeout(_) => (Failure::TimedOut, 3),
+        _ => (Failure::Other, 2),
+    }
+}
+
 /// Record why the connection ended without a session, at the step it had
 /// reached.
 fn failed(b: &Backend, why: Failure) {
     b.shared.update(|m| {
         let step = match m.client {
-            ClientStage::Pairing { .. } => 2,
+            ClientStage::Pairing { .. } | ClientStage::Checking => 2,
             ClientStage::Asking => 3,
             ClientStage::Live(_) => 4,
             _ if why == Failure::CodesDiffer => 2,
@@ -1502,6 +1856,7 @@ mod tests {
                 host: "Office PC".to_owned(),
                 control: true,
                 administrator: false,
+                unattended: false,
                 since: Instant::now(),
                 pictures: 0,
                 size: (0, 0),
