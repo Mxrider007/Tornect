@@ -749,9 +749,8 @@ impl Autostart for SystemdUserUnit {
     fn preflight(&self, elevated: bool) -> Result<(), AutostartError> {
         if elevated {
             return Err(AutostartError::Unavailable(
-                "`--elevated` is the Windows opt-in elevated task; a systemd user unit runs as \
-                 you"
-                .to_owned(),
+                "there is no elevated start-at-login host: a systemd user unit runs as you"
+                    .to_owned(),
             ));
         }
         self.systemctl_bin()?;
@@ -965,7 +964,8 @@ fn checked_sid(sid: &str) -> Result<&str, AutostartError> {
 /// standard account. Here the logon trigger and the principal name this user
 /// (by SID), so a standard account should register it without elevation
 /// (NEEDS-DEVICE); `RunLevel` is `LeastPrivilege` (`/RL LIMITED`) or, for
-/// `--elevated`, `HighestAvailable` (`/RL HIGHEST`); there is no time limit,
+/// the whole-host elevated task of earlier versions (refused since r7, built
+/// here only for the tests), `HighestAvailable` (`/RL HIGHEST`); there is no time limit,
 /// the battery conditions are off, a second instance is not started, the
 /// priority is normal (the default, 7, is below normal), and only the plain
 /// task may be started on demand (slice-F F1-5).
@@ -1276,10 +1276,10 @@ pub fn migrate_elevated_task(ts: &dyn TaskScheduling) -> Result<bool, AutostartE
 
 /// Why a standard account may not register the elevated task (decided
 /// 2026-09-24, slice-F review §3.2).
-pub const ELEVATED_NEEDS_ADMINISTRATOR: &str = "`--elevated` needs an administrator account, and \
-     this is a standard account: approved with another account's password, the elevated task \
+pub const ELEVATED_NEEDS_ADMINISTRATOR: &str = "an elevated task needs an administrator account, \
+     and this is a standard account: approved with another account's password, the elevated task \
      would belong to that account, and you could neither read nor remove it; run `tornect \
-     service install` without `--elevated`";
+     service install` for the normal task";
 
 /// Whether this account may register the elevated task: an administrator
 /// only, its filtered (not elevated) token included (decided 2026-09-24,
@@ -1294,8 +1294,8 @@ pub fn elevated_task_account_ok(ts: &dyn TaskScheduling) -> Result<(), Autostart
             ELEVATED_NEEDS_ADMINISTRATOR.to_owned(),
         )),
         Err(e) => Err(AutostartError::Unavailable(format!(
-            "could not tell whether this account is an administrator ({e}), and `--elevated` \
-             needs one"
+            "could not tell whether this account is an administrator ({e}), and an elevated \
+             task needs one"
         ))),
     }
 }
@@ -2797,7 +2797,7 @@ mod tests {
             Err(AutostartError::Unavailable(m)) => {
                 assert!(m.contains("needs an administrator account"), "{m}");
             }
-            other => panic!("a standard account's --elevated went on: {other:?}"),
+            other => panic!("a standard account's elevated task went on: {other:?}"),
         }
         assert!(
             tasks.calls().is_empty(),
@@ -2820,7 +2820,7 @@ mod tests {
         match elevated_task_account_ok(&standard) {
             Err(AutostartError::Unavailable(m)) => {
                 assert_eq!(m, ELEVATED_NEEDS_ADMINISTRATOR);
-                assert!(m.contains("without `--elevated`"), "{m}");
+                assert!(m.contains("for the normal task"), "{m}");
             }
             other => panic!("{other:?}"),
         }
@@ -3077,7 +3077,7 @@ mod tests {
         );
     }
 
-    /// The Linux backend refuses `--elevated` before anything is written.
+    /// The Linux backend refuses an elevated variant before anything is written.
     #[test]
     fn a_systemd_unit_has_no_elevated_variant() {
         let tmp = tempfile::tempdir().unwrap();
