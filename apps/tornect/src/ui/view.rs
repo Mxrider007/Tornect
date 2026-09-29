@@ -279,6 +279,11 @@ pub fn main_window(
                 for sharing in &model.sharing {
                     sharing_banner(ui, sharing, now, actions);
                 }
+                if let Some(warning) = &model.polkit_warning {
+                    ui.add(
+                        egui::Label::new(RichText::new(warning).small().color(t.on_sharing)).wrap(),
+                    );
+                }
             });
         below.min.y = banner.response.rect.max.y;
     }

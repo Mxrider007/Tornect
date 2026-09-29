@@ -261,6 +261,9 @@ impl SessionSink for GuiSessions {
         let why = end.map_or_else(|| "protocol error".to_owned(), describe_end);
         self.shared.update(|m| {
             m.sharing.retain(|s| s.session_id != session_id);
+            if m.sharing.is_empty() {
+                m.polkit_warning = None;
+            }
             m.note(format!("session ended: {why}"));
         });
         say(format_args!("SESSION ENDED {session_id}"));
@@ -343,6 +346,15 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         control.clone(),
     )
     .map_err(|e| format!("{e:#}"))?;
+    // The window says it, on Home and under the banner.
+    let shared = Arc::clone(&b.shared);
+    polkit.tell_through(Arc::new(move |line: &str| {
+        let line = line.to_owned();
+        shared.update(|m| {
+            m.polkit_warning = Some(line.clone());
+            m.note(line);
+        });
+    }));
     let (started_tx, started) = watch::channel(0u64);
     let activity = Arc::clone(&live);
     deps.consent = Arc::new(

@@ -114,6 +114,9 @@ pub struct Model {
     pub device_name: String,
     /// The address book, the recent connections and the paired devices.
     pub book: Book,
+    /// polkit's remembered approvals could not be cleared for the Control
+    /// session shared now, or stopped being cleared: said under the banner.
+    pub polkit_warning: Option<String>,
     /// This is the window's first run in this home: Home says once that no
     /// list of past connections is kept unless history is switched on.
     pub history_notice: bool,
