@@ -510,6 +510,20 @@ impl App {
                     }
                 });
             }
+            Action::AdminPrompt { id } => {
+                // Here Windows' own prompt would start the administrator
+                // helper (§B.8.7.5, M-FEAT-3). This build has no helper, so
+                // the answer ends at once as a cancelled prompt does: the
+                // sheet says administrator access was not given, keeps its
+                // other answers, and arms them again, as on the prompt's
+                // return.
+                self.form.rearm(id);
+                self.popups.shared().update(|m| {
+                    if m.popups.iter().any(|p| p.id == id) {
+                        m.admin_not_given.insert(id);
+                    }
+                });
+            }
             Action::StopSharing => self.command(Command::StopSharing),
             Action::MoveIndicator => {
                 if let Some(surface) = &self.indicator
@@ -526,7 +540,12 @@ impl App {
                 decision,
                 pointer,
             } => {
-                tracing::debug!(id, ?decision, pointer, "pairing question answered");
+                // Not the label typed: no name goes to the log.
+                let accepted = matches!(
+                    decision,
+                    tornect_signal::pairing::PairDecision::Accept { .. }
+                );
+                tracing::debug!(id, accepted, pointer, "pairing question answered");
                 self.popups.answer_pairing(id, decision);
                 self.form.labels.remove(&id);
                 self.form.codes.remove(&id);
