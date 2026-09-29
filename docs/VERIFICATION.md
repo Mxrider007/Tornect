@@ -521,9 +521,9 @@ and P-L1 (privacy).
 | P-L1: the ping nonce is random bytes, not the clock | VERIFIED (unit) | `book::tests::a_ping_nonce_is_random_not_the_clock` |
 | The sheets and Home's ID card draw on X11 (preview, invented words, no network) | VERIFIED 2026-09-28 under Xvfb | `tornect gui --preview --page settings --sheet <new, pinned, alarm, session> --theme <dark, light>` and `--page <home, address-book>`: 12 screenshots in `target/tornect-test/feat1/` (the preview's home directory was never created) |
 | The sheets on a Windows or Wayland desktop; the typed code with a real second device; the words read aloud between two people | NEEDS-DEVICE(windows), NEEDS-DEVICE(linux console) | not looked at |
-| The Windows target type-checks | VERIFIED (check only) 2026-09-28: rc 0, no warning, at `594bca3` | `cargo clippy --target x86_64-pc-windows-gnullvm --workspace --all-targets -- -D warnings` |
+| The Windows target type-checks | VERIFIED (check only) 2026-09-28: rc 0, no warning, at `51271d4` | `cargo clippy --target x86_64-pc-windows-gnullvm --workspace --all-targets -- -D warnings` |
 
-The gate is green at **719 passed, 0 failed, 5 ignored** at `594bca3` (2026-09-28), each commit of M-FEAT-1 gate-green on its own tree
+The gate is green at **719 passed, 0 failed, 5 ignored** at `51271d4` (2026-09-28), each commit of M-FEAT-1 gate-green on its own tree
 before it was committed.
 
 ## Session levels (M-FEAT-2; 2026-09-28)
@@ -554,9 +554,9 @@ Windows prompt path are M-FEAT-3's. Screenshots: `target/tornect-test/feat2/`.
 | Linux: polkit's remembered approvals of this session revoked when a Control session starts and after every change the authority reports; view-only sessions untouched; the watch ends with the session; a revocation's own change does not loop | VERIFIED (unit) | `polkit::tests::{revoked_at_the_start_and_after_every_change, a_failed_revocation_is_reported}` (platform, fake authority); `host::tests::control_sessions_revoke_polkits_remembered_approvals` (the app's wiring, fake authority) |
 | The D-Bus method and the live revocation on the build VM | VERIFIED 2026-09-28 (build VM, no dialog) | `busctl introspect org.freedesktop.PolicyKit1 /org/freedesktop/PolicyKit1/Authority` (polkitd 127): `RevokeTemporaryAuthorizations((sa{sv}))`, `EnumerateTemporaryAuthorizations((sa{sv}))`, signal `Changed`; `pkcheck --revoke-temp` by hand: exit 0; `polkit::tests::live_polkit_revocation` (ignored; run once by hand with `--ignored`): ok — this shell belongs to no logind session, so the user's display session was the subject, as polkit's own fallback |
 | The revocation under XDG autostart and in a desktop session with a real `auth_admin_keep` approval; injected keys reaching the authentication dialog | NEEDS-DEVICE(gnome, kde) | Recipe: in the desktop session, run an `auth_admin_keep` action (e.g. `pkexec true` where the policy keeps), then start a Control session from a second device: `pkcheck --list-temp` shows none; repeat with Tornect started by the autostart unit |
-| The Windows target type-checks | VERIFIED (check only) 2026-09-28: rc 0, no warning, at `0bef098` | `cargo clippy --target x86_64-pc-windows-gnullvm --workspace --all-targets -- -D warnings` |
+| The Windows target type-checks | VERIFIED (check only) 2026-09-28: rc 0, no warning, at `b95ef15` | `cargo clippy --target x86_64-pc-windows-gnullvm --workspace --all-targets -- -D warnings` |
 
-The gate is green at **743 passed, 0 failed, 6 ignored** (the sixth: the live polkit test, run by hand) at `95396a3`
+The gate is green at **743 passed, 0 failed, 6 ignored** (the sixth: the live polkit test, run by hand) at `fe5223b`
 (2026-09-28), each commit of M-FEAT-2 gate-green on its own tree before it was committed. The BIP39 list's licence,
 owed from M-FEAT-1, is still not looked up: this session's network was limited to the cargo registry.
 
