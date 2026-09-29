@@ -248,6 +248,7 @@ impl Drop for OnScreen<'_> {
             m.levels.remove(&id);
             m.admin_confirm.remove(&id);
             m.admin_not_given.remove(&id);
+            m.paired_recently.remove(&id);
             if m.confirm.as_ref().is_some_and(|c| c.id == id) {
                 m.confirm = None;
             }
@@ -437,13 +438,21 @@ impl GuiConsent {
                 None => None,
                 Some(words) => {
                     let (words, device) = (Arc::clone(words), peer.device);
-                    let derived = tokio::task::spawn_blocking(move || words.session_sheet(&device));
+                    let derived = tokio::task::spawn_blocking(move || {
+                        let recent =
+                            words.paired_recently(&device, tornect_core::trusted::unix_now());
+                        (words.session_sheet(&device), recent)
+                    });
                     tokio::select! {
                         biased;
                         () = &mut withdrawn => return SessionDecision::Deny,
                         derived = derived => derived.ok(),
                     }
                 }
+            };
+            let (seen, recent) = match seen {
+                Some((seen, recent)) => (Some(seen), recent),
+                None => (None, false),
             };
             let (tx, rx) = oneshot::channel();
             let kind = PopupKind::Session {
@@ -459,6 +468,9 @@ impl GuiConsent {
                 }
                 if let Some(levels) = levels {
                     m.levels.insert(id, levels);
+                }
+                if recent {
+                    m.paired_recently.insert(id);
                 }
                 m.popups.push(Popup { id, kind, deadline });
             });
