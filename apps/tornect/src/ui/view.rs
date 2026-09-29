@@ -541,8 +541,8 @@ fn answer_line(ui: &mut egui::Ui, answer: &str, line: &str) {
 
 /// The scam line beside the administrator answer of a device paired
 /// moments before (§B.2.1, the wizard's T10 step).
-pub const SCAM_LINE: &str = "This device was paired only minutes ago. Did someone call and ask \
-    you to allow this? Hang up, and deny.";
+pub const SCAM_LINE: &str = "This device was paired less than a day ago. Did someone call and \
+    ask you to allow this? Hang up, and deny.";
 
 fn scam_line(ui: &mut egui::Ui) {
     let t = theme::tokens(ui.ctx());
