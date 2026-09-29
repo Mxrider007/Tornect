@@ -607,12 +607,12 @@ shared, the default log, the titles, and the carried Security and Privacy items 
 | The sheets, the stepper and the indicator on X11 (preview, invented rows, no network) | see the screenshot row below | `tornect gui --preview --page home --sheet <…>` |
 | The sheets, the stepper, the banner and the indicator draw on X11 (preview, invented rows and names, no network, the preview's home never created) | VERIFIED 2026-09-28 under Xvfb (X11: the indicator is the square) | `tornect gui --preview --page home --sheet <session-linux, session-four, session-windows, admin-not-given, session-no-prompt, session-admin, admin-confirm, new, alarm, two-open> --theme <dark, light>`, the seven `stage-…` sheets (dark) and `tornect gui --preview` (everything: the banner above the sheet, three open questions with the newest in view, the indicator): 29 screenshots in `target/tornect-test/ui-m3/` |
 | The pill on a desktop that composites (Windows, GNOME Wayland), and the sheet and the stepper on a real desktop with a second device over Tor | NEEDS-DEVICE(windows, gnome) | Recipe: share this screen with a second device (`tornect gui`, Allow): the indicator's corners are round and see-through on Wayland and Windows, square on X11; connect from the second device to a host that refuses, times out and is off, and read the stepper's errors |
-| The Windows target type-checks | VERIFIED (check only) 2026-09-28: rc 0, no warning, at `f657ff5` | `cargo clippy --target x86_64-pc-windows-gnullvm --workspace --all-targets -- -D warnings` |
+| The Windows target type-checks | VERIFIED (check only) 2026-09-28: rc 0, no warning, at `f1bfe3e` | `cargo clippy --target x86_64-pc-windows-gnullvm --workspace --all-targets -- -D warnings` |
 
 Not done in this milestone, said here so that nobody reads it as done: one question at a time (a test would have to
 change); the client's choice of an administrator level (r7 defines no attended key, and the window has no unattended
 connect); the polkit failure's record in the session log (no event kind for it in the plan); the terminal host's own output lines, which
 still name the peer; a Windows build without a console; the scam line for a device paired moments before.
 
-The gate is green at **779 passed, 0 failed, 6 ignored** at `f657ff5` (2026-09-28), each commit of M-UI-3 gate-green
+The gate is green at **779 passed, 0 failed, 6 ignored** at `f1bfe3e` (2026-09-28), each commit of M-UI-3 gate-green
 on its own tree before it was committed.
