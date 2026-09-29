@@ -56,6 +56,15 @@ pub fn restrict_dll_search() -> std::io::Result<()> {
     win::restrict_dll_search()
 }
 
+/// Print to the console of the program that started this one, if it has one
+/// and the standard output goes nowhere yet: `tornect.exe` is a
+/// window-subsystem program, so the window starts no console, and the command
+/// line borrows its terminal's (NEEDS-DEVICE(windows)).
+#[cfg(windows)]
+pub fn attach_parent_console() {
+    win::attach_parent_console();
+}
+
 /// This user's profile folder (`FOLDERID_Profile`, `C:\Users\<name>`), from
 /// the OS rather than from the environment, which whoever starts Tornect
 /// controls (review findings E2-2 and F1-4).
