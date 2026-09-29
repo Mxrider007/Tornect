@@ -41,6 +41,12 @@ pub struct Prompter {
     source: Source,
 }
 
+/// Whether the terminal asks the questions: only when both its input and
+/// the stream the questions go to (stderr) are a terminal.
+fn asks_here(stdin_is_terminal: bool, stderr_is_terminal: bool) -> bool {
+    stdin_is_terminal && stderr_is_terminal
+}
+
 enum Source {
     Stdin,
     #[cfg(test)]
@@ -48,10 +54,16 @@ enum Source {
 }
 
 impl Prompter {
-    /// Stdin, or `None` when stdin is not a terminal.
+    /// Stdin, or `None` when stdin or stderr is not a terminal: the question
+    /// goes to stderr, and a redirected stderr is a file or a log, where the
+    /// requester's words and name must not go.
     #[must_use]
     pub fn stdin() -> Option<Arc<Self>> {
-        std::io::stdin().is_terminal().then(|| {
+        asks_here(
+            std::io::stdin().is_terminal(),
+            std::io::stderr().is_terminal(),
+        )
+        .then(|| {
             Arc::new(Self {
                 lines: Mutex::new(None),
                 source: Source::Stdin,
@@ -514,5 +526,15 @@ mod tests {
             consent.session(&peer, &summary).await,
             SessionDecision::Deny
         );
+    }
+
+    /// The terminal asks only when both stdin and stderr are a terminal:
+    /// with stderr redirected to a file or a log, nothing is asked there.
+    #[test]
+    fn the_terminal_asks_only_on_a_terminal() {
+        assert!(asks_here(true, true));
+        assert!(!asks_here(true, false), "stderr redirected");
+        assert!(!asks_here(false, true), "stdin redirected");
+        assert!(!asks_here(false, false));
     }
 }

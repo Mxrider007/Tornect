@@ -117,6 +117,9 @@ fn new_device(display: impl egui_wgpu::EguiDisplayHandle) -> WgpuSetup {
     WgpuSetup::CreateNew(setup)
 }
 
+/// The stream window's title: it names neither the host nor its address.
+pub const STREAM_TITLE: &str = "Tornect: remote screen";
+
 /// One window with its egui context, input state and painter.
 struct Surface {
     window: Arc<Window>,
@@ -311,7 +314,7 @@ impl App {
     /// Open the stream window when a session goes live, close it when it ends.
     fn sync_stream(&mut self, el: &ActiveEventLoop) {
         let live = self.shared.read(|m| match &m.client {
-            ClientStage::Live(v) => Some((v.host.clone(), v.control)),
+            ClientStage::Live(v) => Some(v.control),
             _ => None,
         });
         match live {
@@ -321,12 +324,13 @@ impl App {
             }
             Some(_) if self.stream.is_some() || self.stream_dismissed || self.quit_at.is_some() => {
             }
-            Some((host, control)) => {
+            Some(control) => {
                 let setup = self.main_device(el);
-                // The title is the host's pinned label, never its onion
-                // address (UI_PLAN §8: privacy on screen shares).
+                // A neutral title: the window manager, the taskbar, Alt+Tab
+                // and screen-share pickers read it, so it names nobody (the
+                // bar inside the window names the host).
                 let mut attrs = Window::default_attributes()
-                    .with_title(host)
+                    .with_title(STREAM_TITLE)
                     .with_inner_size(LogicalSize::new(1280.0, 760.0));
                 if let Some((x, y)) = self.stream_at {
                     attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
@@ -941,6 +945,22 @@ mod tests {
     /// The indicator's Stop asks the tokio side to stop sharing, as the
     /// banner's does, and nothing else; moving it with no window up does
     /// nothing.
+    /// The window titles, which the window manager, the taskbar, Alt+Tab,
+    /// screen-share pickers and an attention request show, name nobody: the
+    /// main window is "Tornect", the stream window "Tornect: remote screen",
+    /// the indicator "Tornect: sharing". An attention request carries no
+    /// text of its own (the main window's taskbar entry flashes).
+    #[test]
+    fn no_window_title_names_anyone() {
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let popups = Popups::new(Arc::clone(&shared));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let app = App::new(shared, popups, Arc::new(StreamLink::default()), tx);
+        assert_eq!(app.title, "Tornect");
+        assert_eq!(STREAM_TITLE, "Tornect: remote screen");
+        assert_eq!(indicator::TITLE, "Tornect: sharing");
+    }
+
     #[test]
     fn the_indicators_stop_asks_to_stop_sharing() {
         let shared = Shared::new(Model::default(), Arc::new(|_| {}));
