@@ -257,6 +257,33 @@ impl SessionSink for GuiSessions {
         });
         self.shared.wake(Wake::Attention);
         say(format_args!("SESSION LIVE {}", session.session_id));
+        // §B.8.8: a secure Windows screen (a UAC prompt, Ctrl+Alt+Del, the
+        // lock screen) is out of the session's reach; said while it shows.
+        #[cfg(windows)]
+        if control {
+            let (shared, id) = (Arc::clone(&self.shared), session.session_id.to_owned());
+            tokio::spawn(async move {
+                let live = {
+                    let shared = Arc::clone(&shared);
+                    move || shared.read(|m| m.sharing.iter().any(|s| s.session_id == id))
+                };
+                crate::secure_screen::run(
+                    Arc::new(crate::secure_screen::WindowsDesktop),
+                    crate::secure_screen::EVERY,
+                    live,
+                    move |shown| {
+                        let line = if shown {
+                            crate::secure_screen::NOTICE
+                        } else {
+                            crate::secure_screen::NOTICE_GONE
+                        };
+                        tracing::info!("{line}");
+                        shared.update(|m| m.note(line.to_owned()));
+                    },
+                )
+                .await;
+            });
+        }
     }
 
     fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {

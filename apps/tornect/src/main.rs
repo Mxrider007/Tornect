@@ -27,6 +27,7 @@ mod helper_cmd;
 mod history;
 mod host;
 mod prompt;
+mod secure_screen;
 mod tor_cmd;
 mod ui;
 mod unattended;
