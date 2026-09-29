@@ -474,7 +474,24 @@ fn once_per_host(connect: AuthorityFactory) -> AuthorityFactory {
 pub struct PolkitRevocation {
     authority: Option<AuthorityFactory>,
     live: std::sync::Mutex<std::collections::HashMap<String, JoinHandle<()>>>,
+    /// How a revocation that failed, or a watch that stopped, is told to
+    /// the person at this computer (default: the terminal).
+    tell: std::sync::Mutex<Tell>,
 }
+
+/// How [`PolkitRevocation`] tells the person at this computer.
+type Tell = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// What the person at this computer is told when polkit's remembered
+/// approvals could not be cleared for a Control session, or stopped being
+/// cleared during it (§B.2.1: best effort, disclosed, never enforcement).
+pub const POLKIT_NOT_CLEARED: &str = "Tornect could not clear this computer's remembered \
+    password approvals for this session: an approval given shortly before may still work for \
+    the person connected.";
+/// ... when the approvals were cleared at the start but changes during the
+/// session are not watched.
+pub const POLKIT_NOT_WATCHED: &str = "Tornect cleared this computer's remembered password \
+    approvals when this session started, but cannot clear the ones given during it.";
 
 impl PolkitRevocation {
     /// The system's authority on Linux; nothing elsewhere, and nothing in
@@ -499,7 +516,17 @@ impl PolkitRevocation {
         Self {
             authority,
             live: std::sync::Mutex::new(std::collections::HashMap::new()),
+            tell: std::sync::Mutex::new(Arc::new(|line: &str| note(format_args!("{line}")))),
         }
+    }
+
+    /// Tell the person at this computer through `tell` (the window's line)
+    /// instead of the terminal.
+    pub fn tell_through(&self, tell: Tell) {
+        *self
+            .tell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = tell;
     }
 
     /// A session went live: a Control one starts the revocation.
@@ -510,11 +537,18 @@ impl PolkitRevocation {
         if session.mode != SessionMode::Control {
             return;
         }
+        let tell = Arc::clone(
+            &self
+                .tell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         let task = tokio::spawn(async move {
             let authority = match authority().await {
                 Ok(authority) => authority,
                 Err(e) => {
                     tracing::warn!(error = %e, "polkit's remembered approvals could not be revoked");
+                    tell(POLKIT_NOT_CLEARED);
                     return;
                 }
             };
@@ -523,12 +557,22 @@ impl PolkitRevocation {
                 tornect_platform::polkit::Started::Revoked => {
                     tracing::info!("polkit's remembered approvals revoked for a Control session");
                 }
+                tornect_platform::polkit::Started::Unwatched(e) => {
+                    tracing::warn!(error = %e, "polkit's changes are not watched this session");
+                    tell(POLKIT_NOT_WATCHED);
+                }
                 tornect_platform::polkit::Started::Failed(e) => {
                     tracing::warn!(error = %e, "polkit's remembered approvals could not be revoked");
+                    tell(POLKIT_NOT_CLEARED);
                 }
             }
-            // Held until the session ends and aborts this task.
-            let _guard = guard;
+            // Held until the session ends and aborts this task; a watch that
+            // stops before that is said.
+            if let Some(mut guard) = guard {
+                guard.stopped().await;
+                tracing::warn!("polkit's changes stopped being watched during a Control session");
+                tell(POLKIT_NOT_WATCHED);
+            }
             std::future::pending::<()>().await;
         });
         self.live
@@ -1530,5 +1574,42 @@ mod tests {
             let me = std::fs::metadata("/proc/self").unwrap().uid();
             assert_eq!(running_as_root(), me == 0);
         }
+    }
+
+    /// A Control session whose revocation fails, or whose watch stops, is
+    /// told to the person at this computer, not only logged.
+    #[tokio::test]
+    async fn a_failed_revocation_is_told_to_the_person_here() {
+        use tornect_platform::polkit::{PolkitError, TemporaryAuthority};
+
+        let told = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let factory: AuthorityFactory = Arc::new(|| {
+            Box::pin(async {
+                Err::<Arc<dyn TemporaryAuthority>, _>(PolkitError("no bus".to_owned()))
+            })
+        });
+        let revocation = PolkitRevocation::with(Some(factory));
+        let sink = Arc::clone(&told);
+        revocation.tell_through(Arc::new(move |line: &str| {
+            sink.lock().unwrap().push(line.to_owned());
+        }));
+        let token = tornect_signal::consent::SessionToken::new([5; 32]);
+        revocation.on_start(&LiveSession {
+            device: DeviceIdentity::from_seed(&[9; 32]).id(),
+            label: "Laptop",
+            session_id: "c1",
+            token: &token,
+            th_final: [0; 32],
+            mode: SessionMode::Control,
+            unattended: false,
+        });
+        for _ in 0..100 {
+            if !told.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*told.lock().unwrap(), vec![POLKIT_NOT_CLEARED.to_owned()]);
+        revocation.on_end("c1");
     }
 }
