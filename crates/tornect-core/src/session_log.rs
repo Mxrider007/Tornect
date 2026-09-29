@@ -125,6 +125,10 @@ pub enum SessionEvent {
     /// The administrator helper could not be started or attached
     /// (`reason`): the session got no administrator access.
     AdminHelperFailed,
+    /// Client side: one unattended connect or admin command of this device
+    /// (§B.8.10): the host's pinned device and label, the outcome (`reason`),
+    /// and for a session its id, mode and `elevation`; for a command `op`, `ok`.
+    UnattendedConnect,
 }
 
 /// What the client may do.
