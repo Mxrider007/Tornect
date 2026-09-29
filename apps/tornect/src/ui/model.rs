@@ -132,6 +132,11 @@ pub struct Model {
     /// shows its Tornect confirmation instead (§B.2.1: no Windows prompt
     /// follows; Deny first, armed after 1 s).
     pub admin_confirm: HashSet<u64>,
+    /// The session sheets whose "Allow as administrator…" ended without
+    /// administrator access (Windows' prompt cancelled or failed, or no
+    /// administrator helper in this build): each says so and keeps its other
+    /// answers open (§B.2.1).
+    pub admin_not_given: HashSet<u64>,
     /// The tokio side has finished shutting down.
     pub closed: bool,
 }
@@ -279,16 +284,20 @@ pub struct ConnectWarning {
 
 /// What a session sheet offers on this computer (§B.2.1, r7): the answers
 /// this build can deliver — a level it cannot deliver is absent, never a
-/// greyed button — and the sentence under the buttons.
+/// greyed button — the line under Allow, and the sentence under the
+/// buttons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SheetLevels {
     /// The answers besides Deny.
     pub answers: Answers,
-    /// The one sentence under the buttons, if the row has one.
+    /// The one sentence under the buttons, if the row has one: the row's
+    /// own, or why its administrator answer is absent in this build.
     pub sentence: Option<&'static str>,
     /// `PromptOnSecureDesktop` is 0: Windows' prompts show on the shared
     /// screen, said at every level.
     pub prompts_on_shared_screen: bool,
+    /// The line under "Allow" on this row.
+    pub allow_line: &'static str,
 }
 
 impl SheetLevels {
@@ -297,8 +306,9 @@ impl SheetLevels {
     pub fn of(levels: &Availability) -> Self {
         Self {
             answers: levels.offered(),
-            sentence: levels.sentence,
+            sentence: levels.offered_sentence(),
             prompts_on_shared_screen: levels.prompts_on_shared_screen,
+            allow_line: levels.allow_line(),
         }
     }
 }

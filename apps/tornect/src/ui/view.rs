@@ -7,7 +7,12 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
 use tornect_core::TornectId;
-use tornect_core::levels::{ADMIN_LINE_NO_PROMPT, AdminPath, Answers, SENTENCE_SECURE_DESKTOP_OFF};
+use tornect_core::levels::{
+    ADMIN_LINE, ADMIN_LINE_NO_PROMPT, AdminPath, Answers, LINE_VIEW_ONLY, SENTENCE_ADMIN_NOT_GIVEN,
+    SENTENCE_SECURE_DESKTOP_OFF,
+};
+use tornect_core::words::{Identicon, label_refusal};
+use tornect_signal::fsm::timeouts;
 use tornect_signal::pairing::{PairDecision, SessionDecision};
 
 #[cfg(test)]
@@ -31,6 +36,15 @@ const ARM_AFTER: Duration = Duration::from_secs(1);
 /// How far (in points) a card's answer row may shift between two passes and
 /// still count as not moved: layout rounding, not a move.
 const MOVE_TOLERANCE: f32 = 1.0;
+
+/// The request sheet's widest, in points.
+const SHEET_WIDTH: f32 = 600.0;
+
+/// The countdown ring's size beside a question's headline, in points.
+const RING: f32 = 30.0;
+
+/// The line under Allow on a sheet from before the session levels.
+const ALLOW_LINE_ANY: &str = "They can type and click as you.";
 
 /// How many characters of a viewer's label the banner and the indicator
 /// show: a pinned label of up to 64 characters must not push Stop, the mode
@@ -59,6 +73,12 @@ pub enum Action {
     /// "Allow as administrator" on session sheet `id`: its Tornect
     /// confirmation comes next (§B.2.1: no Windows prompt follows).
     AdminConfirm {
+        /// The popup.
+        id: u64,
+    },
+    /// "Allow as administrator…" on session sheet `id`: Windows' own prompt
+    /// comes next, to start the administrator helper (§B.2.1, M-FEAT-3).
+    AdminPrompt {
         /// The popup.
         id: u64,
     },
@@ -152,9 +172,19 @@ pub struct Form {
     pub qr: bool,
     /// The address book page's own state.
     pub book: pages::BookForm,
+    /// What the request sheet last kept in view: its viewport's size, its
+    /// newest card, how many cards it held and how tall they were. When any
+    /// of them changes the newest card's answers are brought into view again.
+    sheet_view: Option<(egui::Vec2, u64, usize, i32)>,
 }
 
 impl Form {
+    /// Card `id` arms again, as a card that just appeared does: its answers
+    /// wait another second (the return from an administrator prompt).
+    pub fn rearm(&mut self, id: u64) {
+        self.cards.remove(&id);
+    }
+
     /// The window came back into view: restored from the taskbar, brought
     /// back by a newer card's attention request, or focused (review N-1).
     /// Every card's arming second starts again: a card armed before the
@@ -235,8 +265,9 @@ pub fn main_window(
     theme::ensure(ui.ctx());
     let t = theme::tokens(ui.ctx());
     let window = ui.max_rect().width();
+    let mut below = ui.max_rect();
     if !model.sharing.is_empty() {
-        egui::Panel::top("sharing")
+        let banner = egui::Panel::top("sharing")
             .frame(
                 egui::Frame::new()
                     .fill(t.sharing_fill)
@@ -247,10 +278,13 @@ pub fn main_window(
                     sharing_banner(ui, sharing, now, actions);
                 }
             });
+        below.min.y = banner.response.rect.max.y;
     }
     // A label typed into a question that is gone goes with it, and so does
     // what the window remembered of its card.
     form.labels
+        .retain(|id, _| model.popups.iter().any(|p| p.id == *id));
+    form.codes
         .retain(|id, _| model.popups.iter().any(|p| p.id == *id));
     form.cards.retain(|id, _| {
         model.popups.iter().any(|p| {
@@ -273,6 +307,11 @@ pub fn main_window(
             rect
         })
         .inner;
+    let asking = !model.popups.is_empty() || model.confirm.is_some();
+    if !asking {
+        form.sheet_view = None;
+    }
+    let mut sheet = None;
     egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
@@ -285,43 +324,19 @@ pub fn main_window(
                 }),
         )
         .show(ui, |ui| {
-            // Open questions come first, one card each, so none hides
-            // another's buttons, in a region of their own above the page's
-            // scroll area (review F-2): a request that arrives while the page
-            // is scrolled down is in view at once. Only when the cards do not
-            // all fit does the region scroll, and then a new card is brought
-            // into view once.
-            if !model.popups.is_empty() || model.confirm.is_some() {
-                egui::ScrollArea::vertical()
-                    .id_salt("questions")
-                    .max_height(ui.available_height())
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for popup in &model.popups {
-                            let new = !form.cards.contains_key(&popup.id);
-                            let seen = model.recognition.get(&popup.id);
-                            let sheet = Sheet {
-                                seen,
-                                levels: model.levels.get(&popup.id),
-                                confirming: model.admin_confirm.contains(&popup.id),
-                            };
-                            let card =
-                                question(ui, |ui| host_popup(ui, popup, sheet, form, now, actions));
-                            if new {
-                                ui.scroll_to_rect(card, None);
-                            }
-                        }
-                        if let Some(confirm) = &model.confirm {
-                            let new = !form.cards.contains_key(&confirm.id);
-                            let card =
-                                question(ui, |ui| confirm_popup(ui, confirm, form, now, actions));
-                            if new {
-                                ui.scroll_to_rect(card, None);
-                            }
-                        }
-                    });
+            // The open questions: the request sheet, laid out before the
+            // page, so the keyboard and a screen reader reach it first.
+            if asking {
+                sheet = Some(request_sheet(ui, model, form, now, actions));
+                ui.add_space(8.0);
+            } else {
+                // The page's widgets keep their ids whether a sheet is up or
+                // not (the sheet is one child here), so a field of the page
+                // keeps the focus when a question appears.
+                ui.skip_ahead_auto_ids(1);
             }
             egui::ScrollArea::vertical()
+                .id_salt("page")
                 .auto_shrink(false)
                 .show(ui, |ui| {
                     let page = form.page;
@@ -339,10 +354,178 @@ pub fn main_window(
         &mut form.page,
         window < nav::RAIL_BELOW,
     );
+    if let Some(sheet) = sheet {
+        scrim(ui, below, sheet);
+    }
     // Countdowns and the banner's clock move once a second.
     if !model.popups.is_empty() || model.confirm.is_some() || !model.sharing.is_empty() {
         ui.ctx().request_repaint_after(Duration::from_millis(500));
     }
+}
+
+/// The open questions (the redesign's request sheet): a column of cards,
+/// one per question, the oldest first, at the top of the page's room, and
+/// the rest of the window below the banner dimmed and deaf to the pointer
+/// ([`scrim`]). Only when the cards do not all fit does the column scroll,
+/// and then it keeps the newest card's answers in view: when a card comes or
+/// goes, and when its room changes (a resize, the banner appearing). Returns
+/// where it was drawn.
+fn request_sheet(
+    ui: &mut egui::Ui,
+    model: &Model,
+    form: &mut Form,
+    now: Instant,
+    actions: &mut Vec<Action>,
+) -> egui::Rect {
+    let width = ui.available_width().min(SHEET_WIDTH);
+    let room = egui::Rect::from_min_size(
+        egui::pos2(ui.max_rect().center().x - width / 2.0, ui.cursor().top()),
+        egui::vec2(width, ui.available_height()),
+    );
+    ui.scope_builder(egui::UiBuilder::new().max_rect(room), |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt("questions")
+            .max_height(ui.available_height())
+            .auto_shrink([false, true])
+            // A jump, not a glide: a card that moves waits its second again,
+            // and a glide would keep it moving.
+            .animated(false)
+            .show(ui, |ui| {
+                let open = model.popups.len() + usize::from(model.confirm.is_some());
+                if open > 1 {
+                    let t = theme::tokens(ui.ctx());
+                    ui.label(
+                        RichText::new(format!(
+                            "{open} questions are open: the oldest first, the newest last"
+                        ))
+                        .small()
+                        .color(t.on_accent)
+                        .background_color(t.accent_fill),
+                    );
+                }
+                let mut newest = None;
+                for popup in &model.popups {
+                    let sheet = Sheet {
+                        seen: model.recognition.get(&popup.id),
+                        levels: model.levels.get(&popup.id),
+                        confirming: model.admin_confirm.contains(&popup.id),
+                        admin_not_given: model.admin_not_given.contains(&popup.id),
+                    };
+                    let card = question(ui, |ui| host_popup(ui, popup, sheet, form, now, actions));
+                    newest = Some((popup.id, card));
+                }
+                if let Some(confirm) = &model.confirm {
+                    let card = question(ui, |ui| confirm_popup(ui, confirm, form, now, actions));
+                    newest = Some((confirm.id, card));
+                }
+                // Only when the newest card's answers are out of view.
+                if let Some((id, card)) = newest {
+                    let viewport = ui.clip_rect();
+                    let tall = ui.min_rect().height().round() as i32;
+                    let key = (viewport.size(), id, open, tall);
+                    if form.sheet_view != Some(key) {
+                        form.sheet_view = Some(key);
+                        if !viewport.expand(0.5).contains_rect(card) {
+                            ui.scroll_to_rect(card, Some(egui::Align::Max));
+                        }
+                    }
+                }
+            });
+    })
+    .response
+    .rect
+}
+
+/// The scrim of the request sheet: everything below the banner but the
+/// sheet, dimmed, in strips that take every press there and answer nothing
+/// (never focusable). The banner stays above it and live.
+fn scrim(ui: &egui::Ui, below: egui::Rect, sheet: egui::Rect) {
+    let dim = Color32::from_black_alpha(if ui.visuals().dark_mode { 150 } else { 96 });
+    let strips = [
+        egui::Rect::from_min_max(below.min, egui::pos2(below.max.x, sheet.min.y)),
+        egui::Rect::from_min_max(egui::pos2(below.min.x, sheet.max.y), below.max),
+        egui::Rect::from_min_max(
+            egui::pos2(below.min.x, sheet.min.y),
+            egui::pos2(sheet.min.x, sheet.max.y),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(sheet.max.x, sheet.min.y),
+            egui::pos2(below.max.x, sheet.max.y),
+        ),
+    ];
+    for (i, strip) in strips.into_iter().enumerate() {
+        if strip.width() <= 0.0 || strip.height() <= 0.0 {
+            continue;
+        }
+        egui::Area::new(egui::Id::new(("request-scrim", i)))
+            .order(egui::Order::Middle)
+            .fixed_pos(strip.min)
+            .show(ui.ctx(), |ui| {
+                let (rect, _) = ui.allocate_exact_size(strip.size(), egui::Sense::CLICK);
+                ui.painter().rect_filled(rect, 0, dim);
+            });
+    }
+}
+
+/// A question's first row: the identicon beside a saved name (W-B8), the
+/// headline, and the countdown ring at the right.
+fn headline_row(
+    ui: &mut egui::Ui,
+    identicon: Option<&Identicon>,
+    headline: RichText,
+    deadline: Instant,
+    now: Instant,
+) {
+    ui.horizontal_top(|ui| {
+        if let Some(identicon) = identicon {
+            widgets::identicon(ui, &identicon.seed(), 36.0);
+        }
+        let room = (ui.available_width() - RING - 8.0).max(80.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(room, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.add(egui::Label::new(headline).wrap().selectable(false));
+            },
+        );
+        ring(ui, deadline, now);
+    });
+}
+
+/// The countdown ring of a question that ends at `deadline`: the share of
+/// the popup's time left, red in its last ten seconds.
+fn ring(ui: &mut egui::Ui, deadline: Instant, now: Instant) {
+    let t = theme::tokens(ui.ctx());
+    let left = deadline.saturating_duration_since(now).as_secs_f32();
+    let color = if left <= 10.0 {
+        t.danger_text
+    } else {
+        t.accent_text
+    };
+    widgets::countdown_ring(ui, left / timeouts::POPUP.as_secs_f32(), RING, color);
+}
+
+/// The line under an answer (§B.2.1): its name, then what it does.
+fn answer_line(ui: &mut egui::Ui, answer: &str, line: &str) {
+    let t = theme::tokens(ui.ctx());
+    ui.horizontal_top(|ui| {
+        ui.label(RichText::new(answer).small().strong().color(t.text_primary));
+        ui.vertical(|ui| {
+            ui.add(
+                egui::Label::new(RichText::new(line).small().color(t.text_secondary))
+                    .wrap()
+                    .selectable(false),
+            );
+        });
+    });
+}
+
+/// A name a device declared, as a sheet quotes it: without quotation marks
+/// or middle dots, which could imitate the sheet's own lines.
+fn quoted_free(name: &str) -> String {
+    name.chars()
+        .filter(|c| !matches!(c, '"' | '\u{201c}' | '\u{201d}' | '·' | '•'))
+        .collect()
 }
 
 /// A question card: framed in the accent colour, above everything else.
@@ -353,6 +536,7 @@ fn question(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Rect {
         .fill(t.surface_card)
         .corner_radius(14)
         .stroke(egui::Stroke::new(2.0, t.accent_fill))
+        .shadow(t.popup_shadow)
         .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -532,6 +716,8 @@ struct Sheet<'a> {
     seen: Option<&'a Recognition>,
     levels: Option<&'a SheetLevels>,
     confirming: bool,
+    /// Its "Allow as administrator…" ended without administrator access.
+    admin_not_given: bool,
 }
 
 /// The arming card of session sheet `id`'s administrator confirmation: its
@@ -569,32 +755,21 @@ fn host_popup(
             // The alarm fired, or could not compare (F-4): either way only
             // the typed code pairs.
             let fired = seen.is_some_and(Recognition::typed_only);
-            match (pinned, seen.and_then(|s| s.identicon)) {
-                // A pinned key: its saved name, with the identicon beside it.
-                (Some(label), Some(identicon)) => {
-                    ui.horizontal_top(|ui| {
-                        widgets::identicon(ui, &identicon.seed(), 36.0);
-                        ui.add(
-                            egui::Label::new(format!(
-                                "A device ALREADY PAIRED as \"{label}\" asks to pair again. \
-                                 Refusing does not unpair it."
-                            ))
-                            .wrap(),
-                        );
-                    });
-                }
-                (Some(label), None) => {
-                    ui.label(format!(
-                        "A device ALREADY PAIRED as \"{label}\" asks to pair again. Refusing \
-                             does not unpair it."
-                    ));
-                }
-                (None, _) => {
-                    ui.label(format!(
-                        "A device calling itself \"{name}\" asks to pair with this computer."
-                    ));
-                }
-            }
+            // A re-pair is named by its pinned label (all 32 bytes matched),
+            // without the identicon: the request may be a replay, and the
+            // picture would lend it an assurance it does not carry. A new
+            // device by the name it declared, quoted as a suggestion.
+            let headline = match pinned {
+                Some(label) => format!(
+                    "A device ALREADY PAIRED as \"{label}\" asks to pair again. Refusing does \
+                     not unpair it."
+                ),
+                None => format!(
+                    "A device calling itself \"{}\" asks to pair with this computer.",
+                    quoted_free(name)
+                ),
+            };
+            headline_row(ui, None, RichText::new(headline), popup.deadline, now);
             if let (None, Some(seen)) = (pinned, seen) {
                 // The words in their labelled slot, never where a name goes.
                 ui.add(
@@ -637,11 +812,17 @@ fn host_popup(
             ui.add_space(6.0);
             if !fired {
                 ui.label("Code:");
-                ui.label(
-                    RichText::new(sas)
-                        .font(theme::font(ui.ctx(), Face::MonoSemibold, SAS_SIZE))
-                        .color(t.accent_text),
-                );
+                egui::Frame::new()
+                    .fill(t.surface_raised)
+                    .corner_radius(10)
+                    .inner_margin(egui::Margin::symmetric(14, 4))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(sas)
+                                .font(theme::font(ui.ctx(), Face::MonoSemibold, SAS_SIZE))
+                                .color(t.accent_text),
+                        );
+                    });
                 ui.label(
                     "The other device shows a code too. Pair only if the numbers match on both \
                          screens; if they differ, refuse: something between you changed them.",
@@ -662,11 +843,31 @@ fn host_popup(
                 .entry(popup.id)
                 .or_insert_with(|| pinned.as_ref().unwrap_or(name).clone());
             ui.horizontal(|ui| {
-                ui.label("Name it (optional):");
+                ui.label("Name it (this is what an accept saves):");
                 ui.text_edit_singleline(label);
             });
             let label = label.trim().to_owned();
             let label = (!label.is_empty()).then_some(label);
+            // What an accept pins never puts words in the name slot nor
+            // imitates a sheet's lines (§B.6.1 item 7); a re-pair keeps the
+            // label it has.
+            let refusal = pinned
+                .is_none()
+                .then(|| label_refusal(label.as_deref().unwrap_or(name)))
+                .flatten();
+            if let Some(why) = refusal {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "This name cannot be saved: {why}. Type another name to pair."
+                        ))
+                        .small()
+                        .color(t.danger_text),
+                    )
+                    .wrap()
+                    .selectable(false),
+                );
+            }
             let mut typed = None;
             if fired {
                 let code = form.codes.entry(popup.id).or_default();
@@ -696,7 +897,13 @@ fn host_popup(
                 }
                 // No accept button when the alarm fired: only the typed code
                 // pairs then.
-                if !fired && accept(ui, RichText::new("The codes match: pair").strong(), armed) {
+                if !fired
+                    && accept(
+                        ui,
+                        RichText::new("The codes match: pair").strong(),
+                        armed && refusal.is_none(),
+                    )
+                {
                     actions.push(Action::Pair {
                         id: popup.id,
                         decision: PairDecision::Accept {
@@ -709,7 +916,10 @@ fn host_popup(
             // Six digits read off the other screen are a deliberate answer on
             // their own: no arming second (the field's own height may change
             // with its first digit), and nothing else pairs this sheet.
-            if let Some(code) = typed.filter(|c| whole_code(c)) {
+            if let Some(code) = typed
+                .filter(|c| whole_code(c))
+                .filter(|_| refusal.is_none())
+            {
                 actions.push(Action::PairCode {
                     id: popup.id,
                     code,
@@ -717,9 +927,12 @@ fn host_popup(
                 });
             }
             ui.label(
-                RichText::new(format!("Refused automatically in {left} s"))
-                    .small()
-                    .color(t.text_muted),
+                RichText::new(format!(
+                    "Refused automatically in {left} s · only a mouse click or their code \
+                     can pair"
+                ))
+                .small()
+                .color(t.text_muted),
             );
         }
         PopupKind::Session { label, .. } => {
@@ -732,21 +945,26 @@ fn host_popup(
                 admin_confirmation(ui, popup.id, label, form, now, actions, left);
                 return;
             }
-            let asks = RichText::new(format!("\"{label}\" wants to see this screen."))
-                .strong()
-                .size(16.0);
-            match seen.and_then(|s| s.identicon) {
-                // A paired device: its pinned label, the identicon beside it.
-                Some(identicon) => {
-                    ui.horizontal_top(|ui| {
-                        widgets::identicon(ui, &identicon.seed(), 36.0);
-                        ui.add(egui::Label::new(asks).wrap());
-                    });
-                }
-                None => {
-                    ui.label(asks);
-                }
-            }
+            // A session request comes from a pinned key (all 32 bytes
+            // matched): its pinned label names it, the identicon beside it
+            // (W-B8).
+            headline_row(
+                ui,
+                seen.and_then(|s| s.identicon.as_ref()),
+                RichText::new(format!("\"{label}\" wants to connect to this computer"))
+                    .strong()
+                    .size(16.0),
+                popup.deadline,
+                now,
+            );
+            ui.add(
+                egui::Label::new(format!(
+                    "\"{label}\" wants to see this screen. Whatever you answer lasts for this \
+                     session only, and \"Stop sharing\" ends it."
+                ))
+                .wrap()
+                .selectable(false),
+            );
             // Without levels (a sheet from before them): the three answers.
             let answers = sheet.levels.map_or(
                 Answers {
@@ -756,19 +974,25 @@ fn host_popup(
                 },
                 |l| l.answers,
             );
-            // Only "Allow as administrator" without a Windows prompt is drawn
-            // in this build; the prompt path waits for the helper (M-FEAT-3).
-            let admin = matches!(answers.admin, Some(AdminPath::TornectConfirmation { .. }));
+            let allow_line = sheet.levels.map_or(ALLOW_LINE_ANY, |l| l.allow_line);
+            if sheet.admin_not_given {
+                // The administrator answer ended without administrator
+                // access; the other answers stay open (§B.2.1).
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "{SENTENCE_ADMIN_NOT_GIVEN}: this version of Tornect cannot start \
+                             the administrator helper, so Windows was not asked. The other \
+                             answers are still open."
+                        ))
+                        .strong()
+                        .color(t.danger_text),
+                    )
+                    .wrap()
+                    .selectable(false),
+                );
+            }
             ui.add_space(4.0);
-            ui.label(if answers.allow || !admin {
-                "Allow control also lets it use this computer's keyboard and mouse. View \
-                     only shows the screen and nothing else. Either way it lasts for this \
-                     session only, and \"Stop sharing\" ends it."
-            } else {
-                "Allow as administrator also lets it use this computer's keyboard and mouse. \
-                     View only shows the screen and nothing else. Either way it lasts for this \
-                     session only, and \"Stop sharing\" ends it."
-            });
             let armed = arm(ui, &mut form.cards, popup.id, now);
             ui.horizontal(|ui| {
                 if let Some(pointer) = refuse(ui, "Deny") {
@@ -793,38 +1017,70 @@ fn host_popup(
                     });
                 }
             });
+            // What each answer does (§B.2.1: the line under it).
+            if answers.view_only {
+                answer_line(ui, "View only", LINE_VIEW_ONLY);
+            }
+            if answers.allow {
+                answer_line(ui, "Allow control", allow_line);
+            }
             // Never adjacent to Allow (§B.2.1): a row of its own, under the
-            // others; it opens the Tornect confirmation, it does not answer.
-            if admin {
+            // others. Where no Windows prompt follows it opens the Tornect
+            // confirmation; where one does it asks Windows (the helper of
+            // M-FEAT-3), and once that failed it is gone. It never answers
+            // the sheet by itself.
+            let admin = answers
+                .admin
+                .filter(|path| !(sheet.admin_not_given && *path == AdminPath::WindowsPrompt));
+            if let Some(path) = admin {
+                let (text, line, action) = match path {
+                    AdminPath::WindowsPrompt => (
+                        "Allow as administrator…",
+                        ADMIN_LINE,
+                        Action::AdminPrompt { id: popup.id },
+                    ),
+                    AdminPath::TornectConfirmation { .. } => (
+                        "Allow as administrator",
+                        ADMIN_LINE_NO_PROMPT,
+                        Action::AdminConfirm { id: popup.id },
+                    ),
+                };
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if accept(
-                        ui,
-                        RichText::new("Allow as administrator").color(t.danger_text),
-                        armed,
-                    ) {
-                        actions.push(Action::AdminConfirm { id: popup.id });
+                    if accept(ui, RichText::new(text).color(t.danger_text), armed) {
+                        actions.push(action);
                     }
                 });
+                answer_line(ui, text, line);
             }
             if let Some(levels) = sheet.levels {
                 // The sentence under the buttons: why a level is absent, or
-                // what the one offered means here.
-                for line in levels.sentence.into_iter().chain(
-                    levels
-                        .prompts_on_shared_screen
-                        .then_some(SENTENCE_SECURE_DESKTOP_OFF),
-                ) {
+                // what the one offered means here (once: on Linux it is the
+                // line under Allow).
+                let said = |line: &&str| answers.allow && *line == levels.allow_line;
+                for line in levels
+                    .sentence
+                    .into_iter()
+                    .filter(|line| !said(line))
+                    .chain(
+                        levels
+                            .prompts_on_shared_screen
+                            .then_some(SENTENCE_SECURE_DESKTOP_OFF),
+                    )
+                {
                     ui.add(
                         egui::Label::new(RichText::new(line).small().color(t.text_secondary))
-                            .wrap(),
+                            .wrap()
+                            .selectable(false),
                     );
                 }
             }
             ui.label(
-                RichText::new(format!("Denied automatically in {left} s"))
-                    .small()
-                    .color(t.text_muted),
+                RichText::new(format!(
+                    "Denied automatically in {left} s · only a mouse click can allow"
+                ))
+                .small()
+                .color(t.text_muted),
             );
         }
     });
@@ -849,7 +1105,11 @@ fn admin_confirmation(
             .strong()
             .size(16.0),
     );
-    ui.add(egui::Label::new(ADMIN_LINE_NO_PROMPT).wrap());
+    ui.add(
+        egui::Label::new(ADMIN_LINE_NO_PROMPT)
+            .wrap()
+            .selectable(false),
+    );
     let armed = arm(ui, &mut form.cards, confirmation_card(id), now);
     ui.horizontal(|ui| {
         if let Some(pointer) = refuse(ui, "Deny") {
@@ -1971,5 +2231,233 @@ mod tests {
             assert!(texts.iter().any(|t| t == shown), "{texts:?}");
             assert!(!texts.iter().any(|t| t == hidden), "{texts:?}");
         }
+    }
+
+    /// The labels of the buttons, in the order of the accessibility tree (a
+    /// walk from its root, children in order): what a screen reader reads.
+    fn button_order(window: &mut Harness, now: Instant) -> Vec<String> {
+        use egui::accesskit::{NodeId, Role};
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(560.0, 720.0),
+            )),
+            time: Some(now.duration_since(window.start).as_secs_f64()),
+            ..egui::RawInput::default()
+        };
+        let mut actions = Vec::new();
+        let (model, form) = (&window.model, &mut window.form);
+        let out = window.ctx.run_ui(raw, |ui| {
+            main_window(ui, model, form, now, &mut actions);
+        });
+        let update = out
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("an accessibility update");
+        out.drop_without_applying_deltas();
+        let nodes: HashMap<NodeId, &egui::accesskit::Node> =
+            update.nodes.iter().map(|(id, n)| (*id, n)).collect();
+        let children: Vec<NodeId> = nodes
+            .values()
+            .flat_map(|n| n.children().iter().copied())
+            .collect();
+        let root = update.tree.as_ref().map_or_else(
+            || {
+                *nodes
+                    .keys()
+                    .find(|id| !children.contains(id))
+                    .expect("a root")
+            },
+            |tree| tree.root,
+        );
+        let mut order = Vec::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if let Some(node) = nodes.get(&id) {
+                if node.role() == Role::Button
+                    && let Some(label) = node.label()
+                {
+                    order.push(label.to_owned());
+                }
+                stack.extend(node.children().iter().rev());
+            }
+        }
+        order
+    }
+
+    /// §B.2.1 on the session sheet: "<name> wants to connect to this
+    /// computer", Deny first in the accessibility tree, and the line under
+    /// each answer the row offers: Linux's sentence once (it is the line
+    /// under Allow), Windows' Allow line, the line of an administrator
+    /// account that elevates without prompting, and why an administrator
+    /// answer this build cannot give is absent.
+    #[test]
+    fn the_session_sheet_says_what_each_answer_does() {
+        use tornect_core::levels::{
+            Availability, LINE_ALLOW_ELEVATES_WITHOUT_PROMPT, LINE_ALLOW_WINDOWS, SENTENCE_LINUX,
+            SENTENCE_NO_HELPER, WindowsFacts,
+        };
+
+        let t0 = Instant::now();
+        let sheet = |levels: Availability| {
+            let mut model = with_popups(vec![session_popup(7, t0)]);
+            model.levels.insert(7, SheetLevels::of(&levels));
+            Harness::new(model, t0)
+        };
+        let texts = |window: &Harness| -> Vec<String> {
+            window
+                .nodes
+                .iter()
+                .filter_map(|n| n.value().map(str::to_owned))
+                .collect()
+        };
+        let mut linux = sheet(Availability::LINUX);
+        let all = texts(&linux);
+        assert!(
+            all.iter()
+                .any(|t| t == "\"Laptop\" wants to connect to this computer"),
+            "{all:?}"
+        );
+        assert!(all.iter().any(|t| t == LINE_VIEW_ONLY), "{all:?}");
+        assert_eq!(
+            all.iter().filter(|t| *t == SENTENCE_LINUX).count(),
+            1,
+            "the Linux sentence once: {all:?}"
+        );
+        let order = button_order(&mut linux, t0);
+        let at = |label: &str| order.iter().position(|b| b == label);
+        assert!(at("Deny") < at("View only") && at("View only") < at("Allow control"));
+        assert_eq!(at("Deny"), Some(0), "Deny first: {order:?}");
+
+        let installed = sheet(Availability::of(Some(&WindowsFacts {
+            installed: true,
+            administrator: true,
+            ..WindowsFacts::default()
+        })));
+        let all = texts(&installed);
+        assert!(all.iter().any(|t| t == LINE_ALLOW_WINDOWS), "{all:?}");
+        if !tornect_core::levels::ADMIN_HELPER {
+            assert!(all.iter().any(|t| t == SENTENCE_NO_HELPER), "{all:?}");
+        }
+        let no_prompt = sheet(Availability::of(Some(&WindowsFacts {
+            installed: true,
+            administrator: true,
+            consent_prompt_behavior_admin: Some(0),
+            ..WindowsFacts::default()
+        })));
+        let all = texts(&no_prompt);
+        assert!(
+            all.iter().any(|t| t == LINE_ALLOW_ELEVATES_WITHOUT_PROMPT),
+            "{all:?}"
+        );
+        assert!(all.iter().any(|t| t == ADMIN_LINE_NO_PROMPT), "{all:?}");
+    }
+
+    /// §B.2.1: "Allow as administrator…" (a Windows prompt follows) sits on
+    /// a row of its own, armed like every accept, and asks for the prompt; it
+    /// never answers. Until the administrator helper exists the prompt ends
+    /// at once: the sheet says administrator access was not given, the
+    /// answer is gone, the other answers stay and wait their second again.
+    #[test]
+    fn the_prompt_path_ends_honestly_until_the_helper_exists() {
+        let t0 = Instant::now();
+        let mut model = with_popups(vec![session_popup(7, t0)]);
+        let mut levels = SheetLevels::of(&tornect_core::levels::Availability::LINUX);
+        levels.answers.admin = Some(AdminPath::WindowsPrompt);
+        model.levels.insert(7, levels);
+        let mut window = Harness::new(model, t0);
+        assert!(
+            window.disabled("Allow as administrator…"),
+            "armed after 1 s"
+        );
+        let (allow, admin) = (
+            window.bounds("Allow control"),
+            window.bounds("Allow as administrator…"),
+        );
+        assert!(
+            admin.1 >= allow.3,
+            "never beside Allow: {allow:?} {admin:?}"
+        );
+        assert!(
+            window
+                .text("Windows asks you to confirm next")
+                .starts_with(ADMIN_LINE)
+        );
+        window.pass(t0 + Duration::from_millis(1500), Vec::new());
+        let asked = window.click(
+            t0 + Duration::from_millis(1600),
+            window.button("Allow as administrator…"),
+        );
+        assert_eq!(asked, vec![Action::AdminPrompt { id: 7 }]);
+
+        // What the app does with it in this build.
+        window.form.rearm(7);
+        window.model.admin_not_given.insert(7);
+        let t1 = t0 + Duration::from_secs(2);
+        window.pass(t1, Vec::new());
+        assert!(
+            window
+                .text("Administrator access was not given")
+                .contains("other answers are still open")
+        );
+        assert!(!window.has("Allow as administrator…"));
+        assert!(window.disabled("View only") && window.disabled("Allow control"));
+        assert!(!window.disabled("Deny"));
+        window.pass(t1 + Duration::from_millis(1100), Vec::new());
+        let late = window.click(t1 + Duration::from_millis(1200), window.button("View only"));
+        assert_eq!(
+            late,
+            vec![Action::Session {
+                id: 7,
+                decision: SessionDecision::AllowOnceViewOnly,
+                pointer: true,
+            }]
+        );
+    }
+
+    /// §B.6.1 item 7 at pin time: a name that would put device words in the
+    /// name slot, or quote marks and dots that imitate a sheet's lines, is
+    /// not what an accept may save; the sheet says so and its accept stays
+    /// off until another name is typed.
+    #[test]
+    fn a_name_that_reads_like_words_is_not_saved() {
+        let t0 = Instant::now();
+        let mut popup = pairing_popup(3, t0);
+        if let PopupKind::Pairing { name, .. } = &mut popup.kind {
+            *name = "arctic crisp lamp orbit".to_owned();
+        }
+        let mut window = Harness::new(with_popups(vec![popup]), t0);
+        window.pass(t0 + Duration::from_millis(1500), Vec::new());
+        assert!(
+            window
+                .text("This name cannot be saved")
+                .contains("it reads like device words")
+        );
+        assert!(window.disabled("The codes match: pair"));
+        let pair = window.button("The codes match: pair");
+        assert!(
+            window
+                .click(t0 + Duration::from_millis(1600), pair)
+                .is_empty()
+        );
+        window.form.labels.insert(3, "Tablet".to_owned());
+        // The red line goes, the answers move up and wait their second again.
+        window.pass(t0 + Duration::from_millis(1700), Vec::new());
+        window.pass(t0 + Duration::from_millis(2800), Vec::new());
+        assert!(!window.disabled("The codes match: pair"));
+        let pair = window.button("The codes match: pair");
+        let paired = window.click(t0 + Duration::from_millis(3000), pair);
+        assert!(
+            matches!(
+                paired.as_slice(),
+                [Action::Pair {
+                    id: 3,
+                    decision: PairDecision::Accept { label: Some(l) },
+                    ..
+                }] if l == "Tablet"
+            ),
+            "{paired:?}"
+        );
     }
 }

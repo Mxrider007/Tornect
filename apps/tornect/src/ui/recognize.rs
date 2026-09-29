@@ -47,7 +47,10 @@ pub struct Recognizer {
 /// A computer the address book or the pin store names.
 struct Named {
     id: TornectId,
-    name: String,
+    /// Every name it is known by, the one lists show first: its saved name
+    /// where it applies, its pinned label, the name it last declared (the
+    /// start of its ID when it has none).
+    names: Vec<String>,
     cached: Option<(Words, Identicon)>,
 }
 
@@ -183,11 +186,11 @@ impl Recognizer {
     pub fn connect_check(&self, id: &TornectId) -> Option<Lookalike> {
         let base = id.base32();
         let (named, named_complete) = self.named();
-        if let Some(named) = named
+        if let Some(mut named) = named
             .into_iter()
             .find(|n| n.id != *id && words::ends_look_alike(&base, &n.id.base32()))
         {
-            return Some(Lookalike::Named(named.name));
+            return Some(Lookalike::Named(named.names.swap_remove(0)));
         }
         let h = self.pacer.derive(id.public_key_bytes(), Role::Onion);
         let candidate = Candidate {
@@ -205,8 +208,9 @@ impl Recognizer {
 
     /// Every saved entry the alarm compares with: this computer's own two
     /// word sets (under its own name), the computers of the address book and
-    /// the pin store (under their saved name or pinned label), and the
-    /// paired devices (under their pinned labels). Saved keys only: each is
+    /// the pin store (once under each name each is known by: its saved name,
+    /// its pinned label, the name it last declared), and the paired devices
+    /// (under their pinned labels). Saved keys only: each is
     /// derived once, or read from the address book's cache.
     #[must_use]
     pub fn saved(&self) -> Vec<Saved> {
@@ -238,11 +242,13 @@ impl Recognizer {
                 let h = self.known.get(named.id.public_key_bytes(), Role::Onion);
                 (h.words(), h.identicon())
             });
-            saved.push(Saved {
-                name: named.name,
-                words,
-                identicon,
-            });
+            for name in named.names {
+                saved.push(Saved {
+                    name,
+                    words,
+                    identicon,
+                });
+            }
         }
         if let Some(paths) = &self.paths {
             let devices =
@@ -319,14 +325,27 @@ impl Recognizer {
             .map(|id| {
                 let pin = known.get(&id);
                 let entry = book.hosts.get(&id);
-                let name = entry
-                    .and_then(|e| e.name_for(pin.map(|p| &p.host_device_pk)))
-                    .map(str::to_owned)
-                    .or_else(|| pin.map(|p| p.label.clone()))
-                    .unwrap_or_else(|| format!("{}…", id.short()));
+                let mut names: Vec<String> = Vec::new();
+                for name in [
+                    entry
+                        .and_then(|e| e.name_for(pin.map(|p| &p.host_device_pk)))
+                        .map(str::to_owned),
+                    pin.map(|p| p.label.clone()),
+                    entry.and_then(|e| e.declared.clone()),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                if names.is_empty() {
+                    names.push(format!("{}…", id.short()));
+                }
                 Named {
                     id,
-                    name,
+                    names,
                     cached: entry.and_then(|e| e.cached_words(id.public_key_bytes(), Role::Onion)),
                 }
             })
@@ -483,6 +502,27 @@ mod tests {
         assert_eq!(like.looks_like.as_deref(), Some("Office PC"));
         let me = words.pairing_sheet(&device(0x78), "linux pc", false);
         assert_eq!(me.looks_like.as_deref(), Some("Linux PC"));
+    }
+
+    /// The alarm compares a saved computer under every name it is known by:
+    /// a device declaring a computer's pinned label fires it although the
+    /// computer has a saved name of its own.
+    #[test]
+    fn every_name_of_a_saved_computer_is_compared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, words) = home(tmp.path());
+        let host = HostIdentity::from_seed(&[0x31; 32]).id();
+        let pk = *device(0x32).public_key_bytes();
+        let mut known = KnownHosts::default();
+        known.pin(host, "Front desk", pk, 1000);
+        known.save(&known_hosts_file(&paths)).unwrap();
+        Store::new(&paths).name(host, Some(pk), "Studio").unwrap();
+        let like = words.pairing_sheet(&device(0x77), "Front desk", false);
+        assert_eq!(like.looks_like.as_deref(), Some("Front desk"));
+        let alias = words.pairing_sheet(&device(0x78), "Studio", false);
+        assert_eq!(alias.looks_like.as_deref(), Some("Studio"));
+        let calm = words.pairing_sheet(&device(0x79), "Kitchen", false);
+        assert_eq!(calm.looks_like, None);
     }
 
     /// W-B3, through the window's consent: a sheet whose alarm fired pairs

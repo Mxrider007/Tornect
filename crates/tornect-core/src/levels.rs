@@ -135,6 +135,9 @@ pub enum HostRow {
     WindowsStartedElevated,
     /// Linux, every desktop.
     Linux,
+    /// Linux, the host itself running as root: it refuses to open the onion
+    /// service (Tornect never runs as administrator on Linux).
+    LinuxRoot,
 }
 
 /// How the administrator answer is given on a row.
@@ -235,6 +238,30 @@ pub const ADMIN_LINE: &str = "Windows asks you to confirm next. They can change 
 /// confirmation's line).
 pub const ADMIN_LINE_NO_PROMPT: &str = "They can change anything on this computer, including \
     Tornect's settings and its log, and the changes stay after the session.";
+/// The line under "View only" (§B.2.1).
+pub const LINE_VIEW_ONLY: &str = "They see this screen. They cannot type or click.";
+/// The line under "Allow" on Windows (§B.2.1).
+pub const LINE_ALLOW_WINDOWS: &str =
+    "They can type and click as you. Programs running as administrator ignore their input.";
+/// The line under "Allow" on an administrator account set to elevate
+/// without prompting (`ConsentPromptBehaviorAdmin` 0): any program the remote
+/// starts there can become administrator without a prompt, so plain control
+/// is administrator access in effect, and the line says so.
+pub const LINE_ALLOW_ELEVATES_WITHOUT_PROMPT: &str = "On this account, programs run as \
+    administrator without asking, so control includes administrator access.";
+/// Under the buttons where the row's administrator answer needs the
+/// administrator helper, which this build does not have ([`ADMIN_HELPER`]):
+/// the answer is absent, and this says why.
+pub const SENTENCE_NO_HELPER: &str =
+    "Administrator access is not available in this version of Tornect.";
+/// The line a session sheet shows after its administrator answer failed
+/// (Windows' prompt cancelled or failed, or no helper to start): the other
+/// answers stay open, and the popup's time keeps running (§B.2.1).
+pub const SENTENCE_ADMIN_NOT_GIVEN: &str = "Administrator access was not given";
+/// Why a Linux host started as root refuses to serve (§B.2.1: on Linux
+/// Tornect never runs as administrator).
+pub const SENTENCE_LINUX_ROOT: &str = "Start Tornect as your own user; on Linux it never runs as \
+    administrator.";
 
 /// What the Windows probe read (`tornect-platform`). A registry value that
 /// is absent is `None` and takes Windows' default (UAC's Group Policy
@@ -301,6 +328,14 @@ impl Availability {
             admin: None,
         },
         sentence: Some(SENTENCE_LINUX),
+        prompts_on_shared_screen: false,
+    };
+
+    /// A Linux host running as root: nothing to offer; it does not serve.
+    pub const LINUX_ROOT: Self = Self {
+        row: HostRow::LinuxRoot,
+        answers: Answers::NONE,
+        sentence: Some(SENTENCE_LINUX_ROOT),
         prompts_on_shared_screen: false,
     };
 
@@ -398,7 +433,41 @@ impl Availability {
     /// elevated while UAC is on (§B.2.1).
     #[must_use]
     pub fn serves(&self) -> bool {
-        self.row != HostRow::WindowsStartedElevated
+        !matches!(
+            self.row,
+            HostRow::WindowsStartedElevated | HostRow::LinuxRoot
+        )
+    }
+
+    /// Whether the row's administrator answer is left out of
+    /// [`Availability::offered`] because it needs the administrator helper
+    /// this build does not have.
+    #[must_use]
+    pub fn missing_helper(&self) -> bool {
+        self.answers.admin.is_some() && self.offered().admin.is_none()
+    }
+
+    /// The sentence under a sheet's buttons in this build: the row's own, or,
+    /// where the row has none and its administrator answer is absent for lack
+    /// of the helper, [`SENTENCE_NO_HELPER`] (a level the host cannot deliver
+    /// is absent, and one sentence says why).
+    #[must_use]
+    pub fn offered_sentence(&self) -> Option<&'static str> {
+        self.sentence
+            .or_else(|| self.missing_helper().then_some(SENTENCE_NO_HELPER))
+    }
+
+    /// The line under "Allow" on this row: the Linux sentence on Linux; on
+    /// Windows, [`LINE_ALLOW_WINDOWS`], except on an administrator account
+    /// that elevates without prompting, where control includes administrator
+    /// access ([`LINE_ALLOW_ELEVATES_WITHOUT_PROMPT`]).
+    #[must_use]
+    pub fn allow_line(&self) -> &'static str {
+        match self.row {
+            HostRow::Linux | HostRow::LinuxRoot => SENTENCE_LINUX,
+            HostRow::WindowsAdminWithoutPrompt => LINE_ALLOW_ELEVATES_WITHOUT_PROMPT,
+            _ => LINE_ALLOW_WINDOWS,
+        }
     }
 
     /// What the sheet offers in this build: the row's answers, without an
@@ -433,6 +502,44 @@ impl Default for Availability {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Linux host running as root serves nothing and says why; the lines
+    /// under the answers follow the row (§B.2.1), and where this build lacks
+    /// the helper for the row's administrator answer, one sentence says so.
+    #[test]
+    fn a_root_host_refuses_and_every_row_has_its_lines() {
+        let root = Availability::LINUX_ROOT;
+        assert!(!root.serves());
+        assert_eq!(root.offered(), Answers::NONE);
+        assert_eq!(root.offered_sentence(), Some(SENTENCE_LINUX_ROOT));
+        assert!(Availability::LINUX.serves());
+        assert_eq!(Availability::LINUX.allow_line(), SENTENCE_LINUX);
+        let installed = Availability::of(Some(&WindowsFacts {
+            installed: true,
+            administrator: true,
+            ..WindowsFacts::default()
+        }));
+        assert_eq!(installed.row, HostRow::WindowsInstalled);
+        assert_eq!(installed.allow_line(), LINE_ALLOW_WINDOWS);
+        assert_eq!(installed.missing_helper(), !ADMIN_HELPER);
+        if !ADMIN_HELPER {
+            assert_eq!(installed.offered_sentence(), Some(SENTENCE_NO_HELPER));
+        }
+        let no_prompt = Availability::of(Some(&WindowsFacts {
+            installed: true,
+            administrator: true,
+            consent_prompt_behavior_admin: Some(0),
+            ..WindowsFacts::default()
+        }));
+        assert_eq!(no_prompt.row, HostRow::WindowsAdminWithoutPrompt);
+        assert_eq!(no_prompt.allow_line(), LINE_ALLOW_ELEVATES_WITHOUT_PROMPT);
+        assert_eq!(
+            no_prompt.offered_sentence(),
+            Some(ADMIN_LINE_NO_PROMPT),
+            "the row's own sentence, never the no-helper one"
+        );
+        assert_eq!(Availability::LINUX.offered_sentence(), Some(SENTENCE_LINUX));
+    }
 
     fn facts() -> WindowsFacts {
         WindowsFacts {
