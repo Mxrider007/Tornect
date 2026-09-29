@@ -390,8 +390,13 @@ fn request_sheet(
         egui::pos2(ui.max_rect().center().x - width / 2.0, ui.cursor().top()),
         egui::vec2(width, ui.available_height()),
     );
-    ui.scope_builder(egui::UiBuilder::new().max_rect(room), |ui| {
-        egui::ScrollArea::vertical()
+    let dim = Color32::from_black_alpha(if ui.visuals().dark_mode { 150 } else { 96 });
+    // The sheet's own room is dimmed as the scrim dims the rest, under its
+    // cards: a place kept before them, filled once the room's size is known.
+    let under = ui.painter().add(egui::Shape::Noop);
+    let drawn = ui
+        .scope_builder(egui::UiBuilder::new().max_rect(room), |ui| {
+            egui::ScrollArea::vertical()
             .id_salt("questions")
             .max_height(ui.available_height())
             .auto_shrink([false, true])
@@ -439,9 +444,12 @@ fn request_sheet(
                     }
                 }
             });
-    })
-    .response
-    .rect
+        })
+        .response
+        .rect;
+    ui.painter()
+        .set(under, egui::Shape::rect_filled(drawn, 0, dim));
+    drawn
 }
 
 /// The scrim of the request sheet: everything below the banner but the
@@ -493,6 +501,8 @@ fn headline_row(
             egui::vec2(room, 0.0),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
+                // The whole room, so that the ring sits at the right edge.
+                ui.set_min_width(room);
                 ui.add(egui::Label::new(headline).wrap().selectable(false));
             },
         );
