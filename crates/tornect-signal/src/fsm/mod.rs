@@ -211,6 +211,17 @@ impl Randomness for ScriptedRandom {
     }
 }
 
+/// What happened to a session's administrator helper ([`AuditEvent::AdminHelper`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperEvent {
+    /// Connected and checked in time: the accept carries the administrator level.
+    Started,
+    /// Stopped (the session ended, the helper's panic chord, a lost pipe).
+    Stopped,
+    /// Not started or not attached: the session got no administrator access.
+    Failed,
+}
+
 /// Events the host FSM records in `sessions.log` (`docs/PLAN.md` §B.6:
 /// every pairing / session event is appended locally). `peer_name` in the
 /// log is the *pinned* label only (§B.8.13, §B.8.16): the name a not yet
@@ -261,8 +272,26 @@ pub enum AuditEvent {
         session_id: String,
         /// The mode.
         mode: SessionMode,
+        /// The administrator level signed in the accept (r7, §B.8.13).
+        elevation: tornect_core::levels::Elevation,
         /// Whether it is an unattended session.
         unattended: bool,
+    },
+    /// The administrator helper of a session (§B.8.7.5): started (connected
+    /// and checked, before the accept), stopped, or failed (the session got
+    /// no administrator access).
+    AdminHelper {
+        /// The peer.
+        device: DeviceId,
+        /// The pinned label.
+        label: String,
+        /// The session, once there is one (a helper that failed before the
+        /// accept has none).
+        session_id: Option<String>,
+        /// What happened.
+        what: HelperEvent,
+        /// Why, in fixed words (never peer-controlled).
+        reason: &'static str,
     },
     /// A session request was rejected.
     SessionDenied {
@@ -488,12 +517,34 @@ impl HandshakeAudit for HostAudit {
                 label,
                 session_id,
                 mode,
+                elevation,
                 unattended,
             } => SessionRecord::now(SessionEvent::SessionStarted)
                 .peer(device, label)
                 .session(session_id)
                 .mode(mode)
+                .elevation(elevation)
                 .unattended(unattended),
+            AuditEvent::AdminHelper {
+                device,
+                label,
+                session_id,
+                what,
+                reason,
+            } => {
+                let record = SessionRecord::now(match what {
+                    HelperEvent::Started => SessionEvent::AdminHelperStarted,
+                    HelperEvent::Stopped => SessionEvent::AdminHelperStopped,
+                    HelperEvent::Failed => SessionEvent::AdminHelperFailed,
+                })
+                .peer(device, label)
+                .elevation(tornect_core::levels::Elevation::Admin)
+                .reason(reason);
+                match session_id {
+                    Some(id) => record.session(id),
+                    None => record,
+                }
+            }
             AuditEvent::SessionDenied {
                 device,
                 reason: messages::reject::BUSY,

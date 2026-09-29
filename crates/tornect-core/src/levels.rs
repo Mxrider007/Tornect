@@ -13,8 +13,22 @@ use crate::session_log::SessionMode;
 
 /// The administrator level of a session (`SESSION_ACCEPT.elevation`,
 /// `SESSION_REQUEST.unattended.want_elevation`; absent on the wire = none).
-/// Ordered: [`Elevation::None`] is the more restrictive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+/// Ordered: [`Elevation::None`] is the more restrictive. In `sessions.log`
+/// it is the optional field `elevation` (§B.8.13), written only as `admin`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Elevation {
     /// The session acts as the signed-in user (the default).
     #[default]

@@ -192,6 +192,7 @@ fn start(host: &MediaHost, seed: u8, mode: SessionMode) -> (String, Binding) {
         token: &token,
         th_final,
         mode,
+        elevation: tornect_core::levels::Elevation::None,
         unattended: false,
     });
     (session_id, Binding::new(&token, &th_final))
@@ -1254,6 +1255,7 @@ async fn a_bind_that_beats_the_registration_waits_for_it() {
         token: &token,
         th_final,
         mode: SessionMode::Control,
+        elevation: tornect_core::levels::Elevation::None,
         unattended: false,
     });
     let viewer = bind.await.unwrap().unwrap();

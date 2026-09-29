@@ -1000,6 +1000,83 @@ async fn the_level_is_the_answer_and_only_an_offered_one() {
     }
 }
 
+/// The session's level on the host is the level the accept signed (H5; M-UI-3
+/// Security F-1, F-16): the session sink's `LiveSession` and the
+/// `session_started` audit line carry the accept's elevation, and nothing
+/// else; view-only never carries one (H8).
+#[tokio::test]
+async fn the_host_side_level_is_the_signed_one() {
+    #[derive(Default)]
+    struct Levels(Mutex<Vec<(SessionMode, tornect_core::levels::Elevation)>>);
+    impl SessionSink for Levels {
+        fn on_start(&self, s: &LiveSession<'_>) {
+            self.0.lock().unwrap().push((s.mode, s.elevation));
+        }
+        fn on_end(&self, _: &str, _: Option<&SessionEnd>) {}
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let client = client_side(tmp.path(), host.identity.id(), CLIENT_SEED);
+    host.consent
+        .push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+    let sink = Arc::new(Levels::default());
+    host.deps.sessions = sink.clone();
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    host.cfg.levels = Availability::of(Some(&WindowsFacts {
+        installed: true,
+        administrator: true,
+        enable_lua: Some(0),
+        ..WindowsFacts::default()
+    }));
+    for answer in [
+        SessionDecision::AllowOnceAdmin,
+        SessionDecision::AllowOnceViewOnly,
+    ] {
+        host.deps.session_policy = Arc::new(PairingPolicy::new(PairingLimits::sessions()));
+        host.consent.push_session(SessionScript::Decide(answer));
+        let (a, b) = pipe();
+        let host_task = spawn_host(a, &host);
+        let ClientOutcome::Session(session) = connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            Intent::Session,
+        )
+        .await
+        .unwrap() else {
+            panic!("{answer:?}: no session");
+        };
+        let signed = session.accept().elevation();
+        session.bye(bye::USER).await.unwrap();
+        host_task.await.unwrap().unwrap();
+        let (mode, elevation) = *sink.0.lock().unwrap().last().unwrap();
+        assert_eq!(elevation, signed, "{answer:?}");
+        let logged = audit
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                AuditEvent::SessionStarted { elevation, .. } => Some(*elevation),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(logged, signed, "{answer:?}");
+        match answer {
+            SessionDecision::AllowOnceAdmin => {
+                assert_eq!(signed, tornect_core::levels::Elevation::Admin);
+            }
+            _ => {
+                assert_eq!(mode, SessionMode::ViewOnly);
+                assert_eq!(signed, tornect_core::levels::Elevation::None, "H8");
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn pairing_rejects_escalate_to_a_ban_and_the_client_can_refuse() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2457,6 +2534,7 @@ fn audit_events_land_in_the_session_log_without_secrets_or_declared_names() {
         label: "n".into(),
         session_id: session_id.clone(),
         mode: SessionMode::ViewOnly,
+        elevation: tornect_core::levels::Elevation::None,
         unattended: false,
     });
     audit.record(AuditEvent::SessionEnded {
@@ -3993,6 +4071,7 @@ async fn a_session_that_went_live_during_the_popup_blocks_the_accept() {
         token: &other,
         th_final: [0; 32],
         mode: SessionMode::Control,
+        elevation: tornect_core::levels::Elevation::None,
         unattended: false,
     });
     answer.notify_one();
@@ -4168,6 +4247,7 @@ async fn an_unattended_request_while_a_session_is_live_is_session_active() {
         token: &other,
         th_final: [0; 32],
         mode: SessionMode::ViewOnly,
+        elevation: tornect_core::levels::Elevation::None,
         unattended: false,
     });
 

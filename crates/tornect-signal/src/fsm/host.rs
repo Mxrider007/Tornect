@@ -22,7 +22,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tornect_core::DeviceId;
-use tornect_core::levels::{Answers, Availability};
+use tornect_core::levels::{Answers, Availability, Elevation, Level};
 use tornect_core::session_log::SessionMode;
 use tornect_core::unattended::guard::{AdminEffect, RemoteSessionActivity};
 use zeroize::Zeroizing;
@@ -503,6 +503,10 @@ pub struct LiveSession<'a> {
     /// Control or view-only; input is dropped host-side in
     /// [`SessionMode::ViewOnly`].
     pub mode: SessionMode,
+    /// The administrator level signed in `SESSION_ACCEPT` (r7, §B.2.1): what
+    /// the host's banner and indicator say, and whether the session's input
+    /// goes through the administrator helper. View-only is always none.
+    pub elevation: Elevation,
     /// Whether this was an unattended session (§B.8).
     pub unattended: bool,
 }
@@ -1077,6 +1081,8 @@ where
     let (accept, token) = SessionAccept::build(proof, caps, &host_info);
     let session_id = token.session_id();
     let mode = mode_from_code(accept.mode()).unwrap_or(SessionMode::ViewOnly);
+    // The level the accept signs, and nothing else, is the session's level.
+    let elevation = Level::new(mode, accept.elevation()).elevation();
     chan.send(&accept, Some(&*deps.signer)).await?;
     deps.stats.accepted_total.fetch_add(1, Ordering::SeqCst);
     deps.audit.record(AuditEvent::SessionStarted {
@@ -1084,6 +1090,7 @@ where
         label: label.clone(),
         session_id: session_id.clone(),
         mode,
+        elevation,
         unattended,
     });
     tracing::info!(peer = ?device, %label, session = %session_id, "session accepted");
@@ -1104,6 +1111,7 @@ where
         token: &token,
         th_final,
         mode,
+        elevation,
         unattended,
     });
     drop(reserved);
