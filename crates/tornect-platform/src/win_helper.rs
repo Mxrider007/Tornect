@@ -79,6 +79,9 @@ unsafe impl Send for Pipe {}
 // SAFETY: as above: concurrent overlapped calls on one handle are allowed.
 unsafe impl Sync for Pipe {}
 
+/// The longest a write waits for the other end to take a frame.
+const WRITE_LIMIT: Duration = Duration::from_secs(2);
+
 /// A manual-reset event, closed on drop.
 fn event() -> std::io::Result<OwnedHandle> {
     // SAFETY: plain call: default security, manual reset, not signalled,
@@ -93,7 +96,11 @@ fn event() -> std::io::Result<OwnedHandle> {
 impl Pipe {
     /// Run one overlapped call and wait for it; `op` issues the call with
     /// the OVERLAPPED it is given and returns its BOOL.
-    fn overlapped(&self, op: impl FnOnce(*mut OVERLAPPED) -> i32) -> std::io::Result<u32> {
+    fn overlapped(
+        &self,
+        limit: Option<Duration>,
+        op: impl FnOnce(*mut OVERLAPPED) -> i32,
+    ) -> std::io::Result<u32> {
         let ev = event()?;
         // SAFETY: all-zero is a valid OVERLAPPED (offsets 0, no event).
         let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
@@ -104,6 +111,16 @@ impl Pipe {
             let err = unsafe { GetLastError() };
             if err != ERROR_IO_PENDING {
                 return Err(std::io::Error::from_raw_os_error(err as i32));
+            }
+        }
+        if let Some(limit) = limit {
+            let ms = u32::try_from(limit.as_millis()).unwrap_or(u32::MAX);
+            // SAFETY: `ev` is an open event handle.
+            if unsafe { WaitForSingleObject(ev.0, ms) } != WAIT_OBJECT_0 {
+                // Not done in time (the other end stopped reading): cancel
+                // this operation; the wait below then returns its end.
+                // SAFETY: `ov` is the pending operation's, still alive.
+                unsafe { CancelIoEx(self.handle.0, &raw const ov) };
             }
         }
         let mut n = 0u32;
@@ -123,7 +140,7 @@ impl Pipe {
         while got < frame.len() {
             let want = u32::try_from(frame.len() - got).unwrap_or(0);
             let buf = frame[got..].as_mut_ptr();
-            let read = self.overlapped(|ov| {
+            let read = self.overlapped(None, |ov| {
                 // SAFETY: `buf` is writable for `want` bytes and outlives the
                 // call and its wait (in `overlapped`).
                 unsafe { ReadFile(self.handle.0, buf, want, null_mut(), ov) }
@@ -144,7 +161,9 @@ impl Pipe {
 
     /// Write one frame whole.
     pub(crate) fn write_frame(&self, frame: &[u8; 16]) -> std::io::Result<()> {
-        let n = self.overlapped(|ov| {
+        // Bounded: a helper that stopped reading never holds a write (and
+        // with it the session's end) for more than two seconds.
+        let n = self.overlapped(Some(WRITE_LIMIT), |ov| {
             // SAFETY: `frame` is readable for 16 bytes and outlives the call
             // and its wait.
             unsafe { WriteFile(self.handle.0, frame.as_ptr(), 16, null_mut(), ov) }
