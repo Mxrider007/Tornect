@@ -523,7 +523,24 @@ pub trait AdminHelper: Send + Sync {
         self: Arc<Self>,
         peer: &'a TrustedPeer,
     ) -> BoxFuture<'a, Result<Box<dyn AttachedHelper>, &'static str>>;
+
+    /// Start the helper through the on-demand task for an unattended
+    /// administrator session that passed its checks and its block window
+    /// (§B.8.7.5): resolves as [`Self::start`] does. The host waits for it at
+    /// most [`HELPER_TASK_BUDGET`]. The default: no task.
+    fn start_task<'a>(
+        self: Arc<Self>,
+        peer: &'a TrustedPeer,
+    ) -> BoxFuture<'a, Result<Box<dyn AttachedHelper>, &'static str>> {
+        let _ = peer;
+        Box::pin(async { Err("this host has no administrator helper task") })
+    }
 }
+
+/// How long an unattended administrator session waits for its helper
+/// (§B.8.7.5: not connected within 5 s ⇒ the session starts at none and
+/// stays there).
+pub const HELPER_TASK_BUDGET: Duration = Duration::from_secs(5);
 
 /// A helper connected and checked for a session not accepted yet. Dropped
 /// without [`AttachedHelper::attach`], it ends: it never attaches to a
@@ -1027,15 +1044,39 @@ where
                 sent?;
                 return Ok(HostOutcome::Admin { device, ok });
             }
-            // An unattended administrator level needs the helper task
-            // (§B.8.7.5), which this build does not start yet (M-FEAT-5 wires
-            // admin grants): on a row that needs the helper the session starts
-            // at none and stays there, never signed at a level it cannot have.
-            UnattendedVerdict::Accept { proof, caps } => (
-                unattended_without_helper(proof, &cfg.levels.offered()),
-                caps,
-                None,
-            ),
+            // An unattended administrator level on a row whose host holds a
+            // filtered token needs the helper task (§B.8.7.5), started now,
+            // after the checks and the block window; not ready within
+            // `HELPER_TASK_BUDGET`, the session starts at none and stays
+            // there, never signed at a level it does not have.
+            UnattendedVerdict::Accept { proof, caps } => {
+                if unattended_needs_helper(&proof, &cfg.levels.offered()) {
+                    let started = tokio::time::timeout(
+                        HELPER_TASK_BUDGET,
+                        Arc::clone(&deps.admin_helper).start_task(&peer),
+                    )
+                    .await;
+                    match started {
+                        Ok(Ok(helper)) => (proof, caps, Some(helper)),
+                        failed => {
+                            let reason = match failed {
+                                Ok(Err(reason)) => reason,
+                                _ => "the administrator helper did not start in time",
+                            };
+                            deps.audit.record(AuditEvent::AdminHelper {
+                                device,
+                                label: label.clone(),
+                                session_id: None,
+                                what: HelperEvent::Failed,
+                                reason,
+                            });
+                            (without_elevation(proof), caps, None)
+                        }
+                    }
+                } else {
+                    (proof, caps, None)
+                }
+            }
         }
     } else {
         // AwaitConsent. The session popup has the pairing popup's budget —
@@ -1300,10 +1341,22 @@ fn needs_helper(choice: PopupChoice, offered: &Answers) -> bool {
         )
 }
 
-/// An unattended session's proof at the level it can have without the
-/// helper task: an administrator receipt on a row that needs the helper is
-/// lowered to none (§B.8.7.5: not connected ⇒ elevation 0, and it stays 0).
-fn unattended_without_helper(proof: ConsentProof, offered: &Answers) -> ConsentProof {
+/// Whether an unattended session's proof is at the administrator level on a
+/// row whose host holds a filtered token (every row but the ones where every
+/// program runs as administrator): its level takes the helper task.
+fn unattended_needs_helper(proof: &ConsentProof, offered: &Answers) -> bool {
+    matches!(proof, ConsentProof::Unattended { policy, .. } if policy.elevation() == Elevation::Admin)
+        && !matches!(
+            offered.admin,
+            Some(AdminPath::TornectConfirmation {
+                needs_helper: false
+            })
+        )
+}
+
+/// An unattended session's proof lowered to none (§B.8.7.5: the helper not
+/// connected ⇒ elevation 0, and it stays 0).
+fn without_elevation(proof: ConsentProof) -> ConsentProof {
     match proof {
         ConsentProof::Unattended {
             grant,
@@ -1311,22 +1364,13 @@ fn unattended_without_helper(proof: ConsentProof, offered: &Answers) -> ConsentP
             policy,
             block,
             token,
-        } if policy.elevation() == Elevation::Admin
-            && !matches!(
-                offered.admin,
-                Some(AdminPath::TornectConfirmation {
-                    needs_helper: false
-                })
-            ) =>
-        {
-            ConsentProof::Unattended {
-                grant,
-                proof_fp,
-                policy: policy.with_elevation(Elevation::None),
-                block,
-                token,
-            }
-        }
+        } => ConsentProof::Unattended {
+            grant,
+            proof_fp,
+            policy: policy.with_elevation(Elevation::None),
+            block,
+            token,
+        },
         other => other,
     }
 }

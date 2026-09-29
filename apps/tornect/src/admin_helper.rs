@@ -35,6 +35,8 @@ pub struct AdminHelpers {
     links: Mutex<HashMap<String, HelperLink>>,
     wired: Mutex<Option<Wired>>,
     launcher: Option<Arc<dyn Launcher>>,
+    /// The on-demand task of unattended administrator sessions.
+    task: Option<Arc<dyn Launcher>>,
 }
 
 /// How a helper is started for one session: Windows' prompt on Windows (the
@@ -73,20 +75,62 @@ impl AdminHelpers {
     #[must_use]
     pub fn new() -> Arc<Self> {
         #[cfg(windows)]
-        let launcher: Option<Arc<dyn Launcher>> = Some(Arc::new(windows::Prompt));
+        {
+            Self::with_task(
+                Some(Arc::new(windows::Prompt)),
+                Some(Arc::new(windows::Task)),
+            )
+        }
         #[cfg(not(windows))]
-        let launcher: Option<Arc<dyn Launcher>> = None;
-        Self::with(launcher)
+        {
+            Self::with_task(None, None)
+        }
     }
 
-    /// Helpers started by `launcher` (`None`: never).
+    /// Helpers started by `launcher` (`None`: never), and no task.
+    #[cfg(all(test, unix))]
     #[must_use]
     pub fn with(launcher: Option<Arc<dyn Launcher>>) -> Arc<Self> {
+        Self::with_task(launcher, None)
+    }
+
+    /// Helpers started by `launcher` for attended sessions and by `task` for
+    /// unattended ones (`None`: never).
+    #[must_use]
+    pub fn with_task(
+        launcher: Option<Arc<dyn Launcher>>,
+        task: Option<Arc<dyn Launcher>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             links: Mutex::new(HashMap::new()),
             wired: Mutex::new(None),
             launcher,
+            task,
         })
+    }
+
+    /// Start a helper with `launcher` for `peer`.
+    async fn started(
+        self: Arc<Self>,
+        launcher: Option<Arc<dyn Launcher>>,
+        peer: &TrustedPeer,
+    ) -> Result<Box<dyn AttachedHelper>, &'static str> {
+        let Some(launcher) = launcher else {
+            return Err(NotGiven::Unavailable.reason());
+        };
+        // A start dropped before it resolves (the popup's time, or the
+        // task's budget, ran out) drops the helper the blocking launch
+        // returns: it ends, never attached.
+        match tokio::task::spawn_blocking(move || launcher.launch()).await {
+            Ok(Ok(pending)) => Ok(Box::new(Attached {
+                helpers: self,
+                device: peer.device,
+                label: peer.label.clone(),
+                pending,
+            }) as Box<dyn AttachedHelper>),
+            Ok(Err(not_given)) => Err(not_given.reason()),
+            Err(_) => Err(NotGiven::NotStarted.reason()),
+        }
     }
 
     /// The host's kill path (which a helper's panic or loss fires), its
@@ -147,24 +191,16 @@ impl AdminHelper for AdminHelpers {
         self: Arc<Self>,
         peer: &'a TrustedPeer,
     ) -> BoxFuture<'a, Result<Box<dyn AttachedHelper>, &'static str>> {
-        Box::pin(async move {
-            let Some(launcher) = self.launcher.clone() else {
-                return Err(NotGiven::Unavailable.reason());
-            };
-            // A start dropped before it resolves (the popup's time ran out)
-            // drops the helper the blocking launch returns: it ends, never
-            // attached.
-            match tokio::task::spawn_blocking(move || launcher.launch()).await {
-                Ok(Ok(pending)) => Ok(Box::new(Attached {
-                    helpers: self,
-                    device: peer.device,
-                    label: peer.label.clone(),
-                    pending,
-                }) as Box<dyn AttachedHelper>),
-                Ok(Err(not_given)) => Err(not_given.reason()),
-                Err(_) => Err(NotGiven::NotStarted.reason()),
-            }
-        })
+        let launcher = self.launcher.clone();
+        Box::pin(self.started(launcher, peer))
+    }
+
+    fn start_task<'a>(
+        self: Arc<Self>,
+        peer: &'a TrustedPeer,
+    ) -> BoxFuture<'a, Result<Box<dyn AttachedHelper>, &'static str>> {
+        let task = self.task.clone();
+        Box::pin(self.started(task, peer))
     }
 }
 
@@ -279,6 +315,47 @@ mod windows {
             launch_attended().map(|p| Box::new(p) as Box<dyn super::Pending>)
         }
     }
+
+    /// The on-demand task `\Tornect admin helper <SID>` (unattended).
+    pub(super) struct Task;
+
+    impl super::Launcher for Task {
+        fn launch(&self) -> Result<Box<dyn super::Pending>, NotGiven> {
+            launch_task().map(|p| Box::new(p) as Box<dyn super::Pending>)
+        }
+    }
+
+    /// Start the helper through the on-demand task (blocking): the ACL
+    /// check before the run, then the client — the registered Program Files
+    /// image, elevated, in this session — and its `Ready`, within the budget.
+    fn launch_task() -> Result<Pending, NotGiven> {
+        use tornect_platform::helper_task;
+
+        let install = helper_task::this_install().map_err(|_| NotGiven::Unavailable)?;
+        let tasks = helper_task::for_this_user().map_err(|_| NotGiven::Unavailable)?;
+        let session = tornect_platform::helper::own_session().map_err(|_| NotGiven::Unavailable)?;
+        let name = new_pipe_name().map_err(|_| NotGiven::NoPipe)?;
+        // The task runs as this user: the pipe admits this user only.
+        let pipe = Arc::new(create_pipe(&name, false).map_err(|_| NotGiven::NoPipe)?);
+        let args = HelperArgs {
+            pipe: name,
+            host_pid: own_pid(),
+            hard_cap: HARD_CAP,
+        };
+        helper_task::run(&tasks, &install, &args).map_err(|e| {
+            tracing::warn!(error = %e, "starting the administrator helper task");
+            NotGiven::NotStarted
+        })?;
+        let pending = Pending {
+            pipe: Some(pipe),
+            launched: None,
+        };
+        let expect = Expect::Task {
+            image: install.exe,
+            session,
+        };
+        ready(pending, &expect)
+    }
     use tornect_platform::helper::{
         BUDGET, Expect, HelperArgs, HelperPipe, LaunchedHelper, NotGiven, accept_client,
         check_client, client_facts, create_pipe, is_administrator, launch_helper, new_pipe_name,
@@ -358,7 +435,6 @@ mod windows {
         };
         // Blocks until Windows' prompt was answered and the helper started.
         let launched = launch_helper(std::path::Path::new(&exe), &args)?;
-        let deadline = Instant::now() + BUDGET;
         let expect = Expect::Launched {
             pid: launched.pid(),
         };
@@ -366,11 +442,18 @@ mod windows {
             pipe: Some(pipe),
             launched: Some(launched),
         };
+        ready(pending, &expect)
+    }
+
+    /// Wait, within [`BUDGET`] from now, for `pending`'s one client, check it
+    /// against `expect`, and read its `Ready`; anything else ends it.
+    fn ready(pending: Pending, expect: &Expect) -> Result<Pending, NotGiven> {
+        let deadline = Instant::now() + BUDGET;
         if !accept_client(pending.pipe(), BUDGET).map_err(|_| NotGiven::Late)? {
             return Err(NotGiven::Late);
         }
         let facts = client_facts(pending.pipe()).map_err(|_| NotGiven::Refused)?;
-        check_client(&expect, &facts).map_err(|_| NotGiven::Refused)?;
+        check_client(expect, &facts).map_err(|_| NotGiven::Refused)?;
         // Its `Ready`, within what is left of the budget.
         let (tx, rx) = mpsc::channel();
         let pipe = Arc::clone(pending.pipe.as_ref().ok_or(NotGiven::Late)?);
