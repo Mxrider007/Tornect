@@ -429,7 +429,9 @@ fn request_sheet(
                     newest = Some((popup.id, card));
                 }
                 if let Some(confirm) = &model.confirm {
-                    let card = question(ui, |ui| confirm_popup(ui, confirm, form, now, actions));
+                    let shared = model.screen_shared(now);
+                    let card =
+                        question(ui, |ui| confirm_popup(ui, confirm, shared, form, now, actions));
                     newest = Some((confirm.id, card));
                 }
                 // Only when the newest card's answers are out of view.
@@ -1237,9 +1239,12 @@ fn admin_confirmation(
     );
 }
 
+/// The client's code question. While this screen may be `shared` it names
+/// no host (U3-L2), as the stepper beside it does not.
 fn confirm_popup(
     ui: &mut egui::Ui,
     confirm: &Confirm,
+    shared: bool,
     form: &mut Form,
     now: Instant,
     actions: &mut Vec<Action>,
@@ -1251,10 +1256,14 @@ fn confirm_popup(
             .color(t.accent_text),
     );
     ui.push_id(("confirm", confirm.id), |ui| {
-        ui.label(format!(
-            "The host accepted; it calls itself \"{}\". Did its screen show this code?",
-            confirm.host_name
-        ));
+        ui.label(if shared {
+            "The host accepted. Did its screen show this code?".to_owned()
+        } else {
+            format!(
+                "The host accepted; it calls itself \"{}\". Did its screen show this code?",
+                confirm.host_name
+            )
+        });
         ui.label(
             RichText::new(&confirm.sas)
                 .font(theme::font(ui.ctx(), Face::MonoSemibold, SAS_SIZE))
@@ -1916,6 +1925,65 @@ mod tests {
             line.contains("unless you granted one unattended access"),
             "{line}"
         );
+    }
+
+    /// U3-L2: while this screen may be in a picture that leaves it (a
+    /// session live, one just allowed, another process hosting this home),
+    /// the client's code question names no host; otherwise it quotes the
+    /// name the host gave.
+    #[test]
+    fn the_code_question_names_no_host_while_this_screen_is_shared() {
+        let t0 = Instant::now();
+        let mut model = with_popups(Vec::new());
+        model.confirm = Some(Confirm {
+            id: 3,
+            host_name: "Desk".to_owned(),
+            sas: "654 321".to_owned(),
+            host_waits_until: t0 + Duration::from_secs(50),
+            deadline: t0 + Duration::from_secs(600),
+        });
+        let window = Harness::new(model.clone(), t0);
+        let line = window.text("The host accepted");
+        assert!(line.contains("it calls itself \"Desk\""), "{line}");
+        let live = Model {
+            sharing: vec![Sharing {
+                session_id: "0011".to_owned(),
+                label: "Laptop".to_owned(),
+                control: true,
+                unattended: false,
+                since: t0,
+                capture: None,
+            }],
+            ..model.clone()
+        };
+        let allowed = Model {
+            accepted: Some(t0),
+            ..model.clone()
+        };
+        let elsewhere = Model {
+            hosted_elsewhere: true,
+            ..model
+        };
+        for (case, model) in [
+            ("live", live),
+            ("allowed", allowed),
+            ("elsewhere", elsewhere),
+        ] {
+            let window = Harness::new(model, t0);
+            let line = window.text("The host accepted");
+            assert_eq!(
+                line, "The host accepted. Did its screen show this code?",
+                "{case}"
+            );
+            assert!(
+                window.nodes.iter().all(|n| {
+                    n.value().is_none_or(|v| !v.contains("Desk"))
+                        && n.label().is_none_or(|l| !l.contains("Desk"))
+                }),
+                "{case}: the host's name on screen"
+            );
+            assert!(window.has("Yes, the codes match"), "{case}");
+        }
     }
 
     /// A card that moves (one above it answered, withdrawn or timed out)
