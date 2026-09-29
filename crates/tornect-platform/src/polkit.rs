@@ -64,6 +64,13 @@ impl RevokeGuard {
     pub fn is_finished(&self) -> bool {
         self.task.is_finished()
     }
+
+    /// Resolves when the watch stops before the session ends: the
+    /// authority's signals stopped (the bus connection or polkit went
+    /// away), so a later change is no longer answered.
+    pub async fn stopped(&mut self) {
+        let _ = (&mut self.task).await;
+    }
 }
 
 impl Drop for RevokeGuard {
@@ -77,6 +84,9 @@ impl Drop for RevokeGuard {
 pub enum Started {
     /// Revoked, and watching for changes.
     Revoked,
+    /// Revoked once, but the authority's changes could not be subscribed
+    /// to: nothing is revoked again during the session.
+    Unwatched(PolkitError),
     /// The authority could not be asked; nothing is watched.
     Failed(PolkitError),
 }
@@ -89,7 +99,13 @@ pub async fn guard_control_session(
 ) -> (Option<RevokeGuard>, Started) {
     let mut changes = match authority.changes().await {
         Ok(rx) => rx,
-        Err(e) => return (None, Started::Failed(e)),
+        // The revocation needs no subscription: revoke once all the same.
+        Err(e) => {
+            return match authority.revoke().await {
+                Ok(()) => (None, Started::Unwatched(e)),
+                Err(revoke) => (None, Started::Failed(revoke)),
+            };
+        }
     };
     if let Err(e) = authority.revoke().await {
         return (None, Started::Failed(e));
@@ -463,6 +479,46 @@ mod tests {
             1,
             "watched after the session ended"
         );
+    }
+
+    /// An authority whose changes cannot be subscribed to is still revoked
+    /// once, and says that nothing is watched; a watch whose signals stop
+    /// ends, and says so.
+    #[tokio::test]
+    async fn without_a_subscription_the_start_still_revokes() {
+        struct Deaf(AtomicUsize);
+        impl TemporaryAuthority for Deaf {
+            fn revoke(&self) -> BoxFuture<'_, Result<(), PolkitError>> {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+            fn remembered(&self) -> BoxFuture<'_, Result<usize, PolkitError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn changes(&self) -> BoxFuture<'_, Result<mpsc::Receiver<()>, PolkitError>> {
+                Box::pin(async { Err(PolkitError("no match rule".to_owned())) })
+            }
+        }
+        let deaf = Arc::new(Deaf(AtomicUsize::new(0)));
+        let (guard, started) = guard_control_session(deaf.clone()).await;
+        assert!(guard.is_none());
+        assert_eq!(
+            started,
+            Started::Unwatched(PolkitError("no match rule".to_owned()))
+        );
+        assert_eq!(deaf.0.load(Ordering::SeqCst), 1, "revoked once");
+
+        let fake = Arc::new(Fake::default());
+        let (guard, started) = guard_control_session(fake.clone()).await;
+        assert_eq!(started, Started::Revoked);
+        let mut guard = guard.expect("watching");
+        // The signals stop: the watch ends, and says so.
+        drop(fake.tx.lock().unwrap().take());
+        tokio::time::timeout(Duration::from_secs(5), guard.stopped())
+            .await
+            .expect("the watch said it stopped");
     }
 
     /// A stream of the authority's signals that never yields: the quiet
