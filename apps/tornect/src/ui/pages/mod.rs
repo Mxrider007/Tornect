@@ -1376,12 +1376,20 @@ mod tests {
         assert!(has_text(&window, "(Control · administrator)"));
     }
 
-    /// The first run says once that nothing about past connections is kept
-    /// unless history is switched on; not on a later run, and not once
-    /// history is on.
+    /// The first run says once that no list of the computers connected to
+    /// is kept unless history is switched on, and that pairings and the log
+    /// of sessions others start here are always kept (Privacy's wording,
+    /// the operator's ruling of 2026-09-29); not on a later run, and not
+    /// once history is on.
     #[test]
     fn the_first_run_says_history_is_off() {
         let notice = home::HISTORY_NOTICE;
+        assert_eq!(
+            notice,
+            "Tornect keeps no list of the computers you connect to unless you switch history on \
+             (Address book, Recent). Pairings, and the log of sessions others start on this \
+             computer, are always kept."
+        );
         let mut model = with_book(false);
         model.book.history = false;
         model.history_notice = true;

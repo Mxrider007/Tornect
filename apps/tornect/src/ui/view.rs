@@ -1138,8 +1138,15 @@ fn host_popup(
             if let Some(levels) = sheet.levels {
                 // The sentence under the buttons: why a level is absent, or
                 // what the one offered means here (once: on Linux it is the
-                // line under Allow).
-                let said = |line: &&str| answers.allow && *line == levels.allow_line;
+                // line under Allow; on the no-prompt row it is the line under
+                // the administrator answer).
+                let admin_line = admin.map(|path| match path {
+                    AdminPath::WindowsPrompt => ADMIN_LINE,
+                    AdminPath::TornectConfirmation { .. } => ADMIN_LINE_NO_PROMPT,
+                });
+                let said = |line: &&str| {
+                    (answers.allow && *line == levels.allow_line) || admin_line == Some(*line)
+                };
                 for line in levels
                     .sentence
                     .into_iter()
@@ -2377,8 +2384,7 @@ mod tests {
     #[test]
     fn the_session_sheet_says_what_each_answer_does() {
         use tornect_core::levels::{
-            Availability, LINE_ALLOW_ELEVATES_WITHOUT_PROMPT, LINE_ALLOW_WINDOWS, SENTENCE_LINUX,
-            SENTENCE_NO_HELPER, WindowsFacts,
+            Availability, LINE_ALLOW_WINDOWS, SENTENCE_LINUX, SENTENCE_NO_HELPER, WindowsFacts,
         };
 
         let t0 = Instant::now();
@@ -2430,10 +2436,72 @@ mod tests {
         })));
         let all = texts(&no_prompt);
         assert!(
-            all.iter().any(|t| t == LINE_ALLOW_ELEVATES_WITHOUT_PROMPT),
-            "{all:?}"
+            !all.iter().any(|t| t == LINE_ALLOW_WINDOWS),
+            "no plain Allow on the no-prompt row: {all:?}"
         );
-        assert!(all.iter().any(|t| t == ADMIN_LINE_NO_PROMPT), "{all:?}");
+        if tornect_core::levels::ADMIN_HELPER {
+            assert_eq!(
+                all.iter().filter(|t| *t == ADMIN_LINE_NO_PROMPT).count(),
+                1,
+                "the administrator line once: {all:?}"
+            );
+        } else {
+            assert!(all.iter().any(|t| t == SENTENCE_NO_HELPER), "{all:?}");
+        }
+    }
+
+    /// The no-prompt row (`ConsentPromptBehaviorAdmin` 0; the operator's
+    /// ruling of 2026-09-29) offers what the always-administrator row does:
+    /// View only and "Allow as administrator" with the Tornect confirmation,
+    /// no plain Allow, the administrator line once, and for a device paired
+    /// moments before, the scam line beside the administrator answer and on
+    /// the confirmation.
+    #[test]
+    fn the_no_prompt_row_offers_the_administrator_answer_with_its_scam_line() {
+        use tornect_core::levels::{Availability, LINE_ALLOW_WINDOWS, WindowsFacts};
+
+        let row = Availability::of(Some(&WindowsFacts {
+            installed: true,
+            administrator: true,
+            consent_prompt_behavior_admin: Some(0),
+            ..WindowsFacts::default()
+        }));
+        // What the row offers with the administrator helper.
+        let mut levels = SheetLevels::of(&row);
+        levels.answers = row.answers;
+        levels.sentence = row.sentence;
+        for recent in [true, false] {
+            let t0 = Instant::now();
+            let mut model = with_popups(vec![session_popup(7, t0)]);
+            model.levels.insert(7, levels);
+            if recent {
+                model.paired_recently.insert(7);
+            }
+            let mut window = Harness::new(model, t0);
+            let texts: Vec<String> = window
+                .nodes
+                .iter()
+                .filter_map(|n| n.value().map(str::to_owned))
+                .collect();
+            assert!(!texts.iter().any(|t| t == LINE_ALLOW_WINDOWS), "{texts:?}");
+            assert_eq!(
+                texts.iter().filter(|t| *t == ADMIN_LINE_NO_PROMPT).count(),
+                1,
+                "{texts:?}"
+            );
+            let said = |w: &Harness| w.nodes.iter().any(|n| n.value() == Some(SCAM_LINE));
+            assert_eq!(said(&window), recent, "beside the answer, {recent}");
+            let order = button_order(&mut window, t0);
+            assert!(!order.iter().any(|b| b == "Allow control"), "{order:?}");
+            assert!(
+                order.iter().any(|b| b == "Allow as administrator"),
+                "{order:?}"
+            );
+            assert_eq!(order.first().map(String::as_str), Some("Deny"), "{order:?}");
+            window.model.admin_confirm.insert(7);
+            window.pass(t0 + Duration::from_secs(2), Vec::new());
+            assert_eq!(said(&window), recent, "the confirmation too, {recent}");
+        }
     }
 
     /// §B.2.1: "Allow as administrator…" (a Windows prompt follows) sits on
