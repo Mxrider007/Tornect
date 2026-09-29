@@ -270,9 +270,9 @@ impl MediaObserver for GuiMedia {
             }
         });
         say(format_args!("SHARING {}", s.session_id));
+        // The window's stderr names nobody (the banner does, on screen).
         note(format_args!(
-            "sharing this screen with \"{}\" ({} {}x{}; input {})",
-            s.label,
+            "sharing this screen ({} {}x{}; input {})",
             s.source,
             s.width,
             s.height,

@@ -301,12 +301,19 @@ pub struct MyWords {
 }
 
 /// The connect field's look-alike warning.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConnectWarning {
     /// The ID typed, which is not in the address book.
     pub id: TornectId,
     /// The saved computer it looks like.
     pub name: String,
+}
+
+impl std::fmt::Debug for ConnectWarning {
+    /// No ID and no saved name: a debug line never names a computer.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectWarning").finish_non_exhaustive()
+    }
 }
 
 /// What a session sheet offers on this computer (§B.2.1, r7): the answers
@@ -341,7 +348,7 @@ impl SheetLevels {
 }
 
 /// What a host sheet shows about the key asking (§B.6.1).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Recognition {
     /// Its device words: recognition only, labelled as such.
     pub words: Words,
@@ -354,6 +361,16 @@ pub struct Recognition {
     /// be read, and none of the entries that could be read matched. It
     /// counts as fired (F-4): the pairing takes only the typed code.
     pub unchecked: bool,
+}
+
+impl std::fmt::Debug for Recognition {
+    /// Whether the alarm fired, never which saved entry it named.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recognition")
+            .field("alarm", &self.looks_like.is_some())
+            .field("unchecked", &self.unchecked)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Recognition {
