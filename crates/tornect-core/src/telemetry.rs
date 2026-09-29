@@ -22,10 +22,12 @@ tornect_net=debug,tornect_proto=debug,tornect_session=debug,arti=warn,tor=warn,z
 
 /// The fields whose values name a person, a device or a computer: a peer's
 /// fingerprint or key, a pinned label or declared name, a Tornect ID or its
-/// prefix, an onion address, a keystore nickname. Under the default filter
-/// the log writes `<redacted>` in their place (`docs/PLAN.md` §B.6: no
-/// identifier in logs by default); a filter set on purpose (`TORNECT_LOG`,
-/// `RUST_LOG`, `--log`) writes them as they are.
+/// prefix, an onion address, a keystore nickname. The log writes
+/// `<redacted>` in their place under every filter (`docs/PLAN.md` §B.6: no
+/// identifier in logs by default; U3-L3: a filter set for more detail,
+/// `TORNECT_LOG`, `RUST_LOG` or `--log`, keeps it); only the explicit opt-in
+/// ([`LogOptions::identifiers`], [`IDENTIFIERS_ENV`]) writes them as they
+/// are.
 pub const SENSITIVE_FIELDS: [&str; 10] = [
     "peer",
     "device",
@@ -39,8 +41,12 @@ pub const SENSITIVE_FIELDS: [&str; 10] = [
     "nickname",
 ];
 
-/// How the log writes an event's fields under the default filter: as the
-/// default formatter does, but with the value of every field of
+/// The environment variable that writes identifiers into the log when it is
+/// `1`, as `--log-identifiers` does (U3-L3).
+pub const IDENTIFIERS_ENV: &str = "TORNECT_LOG_IDENTIFIERS";
+
+/// How the log writes an event's fields without the identifier opt-in: as
+/// the default formatter does, but with the value of every field of
 /// [`SENSITIVE_FIELDS`] replaced by `<redacted>`.
 #[must_use]
 pub fn redacting_fields()
@@ -59,9 +65,9 @@ pub fn redacting_fields()
     .delimited(" ")
 }
 
-/// Whether an event may be written in full under the default filter where
-/// fields cannot be redacted (the JSON lines): not when it carries a field
-/// of [`SENSITIVE_FIELDS`] below `WARN`.
+/// Whether an event may be written in full without the identifier opt-in
+/// where fields cannot be redacted (the JSON lines): not when it carries a
+/// field of [`SENSITIVE_FIELDS`] below `WARN`.
 fn names_nobody(meta: &tracing::Metadata<'_>) -> bool {
     *meta.level() <= tracing::Level::WARN
         || !meta
@@ -79,6 +85,10 @@ pub struct LogOptions {
     pub file_dir: Option<PathBuf>,
     /// Emit JSON lines on stderr instead of human-readable text.
     pub json: bool,
+    /// Write the fields of [`SENSITIVE_FIELDS`] as they are
+    /// (`--log-identifiers`; [`IDENTIFIERS_ENV`] = `1` does the same). Off,
+    /// they are redacted whatever the filter.
+    pub identifiers: bool,
 }
 
 /// Keeps the background log writer alive; drop it at the very end of `main`.
@@ -90,33 +100,57 @@ pub struct LogGuard {
 /// Install the global subscriber. Calling it twice is harmless (the second call
 /// is a no-op that still returns a guard).
 pub fn init(opts: LogOptions) -> Result<LogGuard> {
-    let chosen = std::env::var("TORNECT_LOG")
-        .ok()
-        .or_else(|| std::env::var("RUST_LOG").ok())
+    let ansi = std::io::stderr().is_terminal();
+    let (subscriber, guard) = subscriber(
+        opts,
+        &|name| std::env::var(name).ok(),
+        std::io::stderr,
+        ansi,
+    )?;
+    // A second init (e.g. from tests) fails harmlessly.
+    let _ = subscriber.try_init();
+    Ok(guard)
+}
+
+/// What [`init`] installs, its lines written through `stderr` and the
+/// environment read through `env`: the filter (`TORNECT_LOG`, else
+/// `RUST_LOG`, else [`LogOptions::filter`], else [`DEFAULT_FILTER`]; an
+/// invalid one counts as unset) decides which events are written, never
+/// whether they name anyone: that takes [`LogOptions::identifiers`] or
+/// [`IDENTIFIERS_ENV`] = `1` (U3-L3).
+fn subscriber<W>(
+    opts: LogOptions,
+    env: &dyn Fn(&str) -> Option<String>,
+    stderr: W,
+    ansi: bool,
+) -> Result<(impl tracing::Subscriber + Send + Sync + 'static, LogGuard)>
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Clone + Send + Sync + 'static,
+{
+    let chosen = env("TORNECT_LOG")
+        .or_else(|| env("RUST_LOG"))
         .or(opts.filter)
         .filter(|f| EnvFilter::try_new(f).is_ok());
-    // Only a filter set on purpose writes names and IDs.
-    let redact = chosen.is_none();
+    let redact = !(opts.identifiers || env(IDENTIFIERS_ENV).as_deref() == Some("1"));
     let filter = chosen.map_or_else(|| EnvFilter::new(DEFAULT_FILTER), EnvFilter::new);
 
-    let ansi = std::io::stderr().is_terminal();
     let text_layer = (!opts.json && !redact).then(|| {
         tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
+            .with_writer(stderr.clone())
             .with_ansi(ansi)
             .with_target(true)
     });
     let redacted_text_layer = (!opts.json && redact).then(|| {
         tracing_subscriber::fmt::layer()
             .fmt_fields(redacting_fields())
-            .with_writer(std::io::stderr)
+            .with_writer(stderr.clone())
             .with_ansi(ansi)
             .with_target(true)
     });
     let json_layer = opts.json.then(|| {
         tracing_subscriber::fmt::layer()
             .json()
-            .with_writer(std::io::stderr)
+            .with_writer(stderr)
             .with_target(true)
             .with_filter(tracing_subscriber::filter::filter_fn(move |meta| {
                 !redact || names_nobody(meta)
@@ -142,15 +176,13 @@ pub fn init(opts: LogOptions) -> Result<LogGuard> {
         None => None,
     };
 
-    // A second init (e.g. from tests) fails harmlessly.
-    let _ = tracing_subscriber::registry()
+    let subscriber = tracing_subscriber::registry()
         .with(filter)
         .with(text_layer)
         .with(redacted_text_layer)
         .with(json_layer)
-        .with(file_layer)
-        .try_init();
-    Ok(guard)
+        .with(file_layer);
+    Ok((subscriber, guard))
 }
 
 #[cfg(test)]
@@ -164,6 +196,7 @@ mod tests {
             filter: Some("debug".to_owned()),
             file_dir: Some(dir.path().join("logs")),
             json: false,
+            identifiers: false,
         })
         .unwrap();
         let _g2 = init(LogOptions::default()).unwrap();
@@ -267,6 +300,93 @@ mod tests {
         }
         for secret in ["3f2a91c0", "Laptop", "abcdefgh", "Office PC", ".onion"] {
             assert!(!text.contains(secret), "\"{secret}\" in the log:\n{text}");
+        }
+    }
+
+    /// U3-L3: over the layers [`init`] installs, a filter chosen for more
+    /// detail (`--log`, `TORNECT_LOG`, `RUST_LOG`, even `info`) keeps the
+    /// redaction; only the identifier opt-in (`--log-identifiers`, or
+    /// `TORNECT_LOG_IDENTIFIERS=1`) writes names and addresses.
+    #[test]
+    fn a_chosen_filter_still_names_nobody() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let logged = |opts: LogOptions, env: &[(&str, &str)]| -> String {
+            let buffer = Buffer::default();
+            let writer = buffer.clone();
+            let env: Vec<(String, String)> = env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            let lookup = |name: &str| env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+            let (subscriber, _guard) =
+                subscriber(opts, &lookup, move || writer.clone(), false).unwrap();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::callsite::rebuild_interest_cache();
+                tracing::info!(target: "tornect_signal::fsm::host", peer = ?"DeviceId(3f2a91c077de0b14)", label = %"Laptop", "session accepted");
+                tracing::info!(target: "tornect_signal::tor::listener", address = %"abcdefghijklmnop.onion", "onion service stopped");
+            });
+            String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap()
+        };
+        let filter = |f: &str| LogOptions {
+            filter: Some(f.to_owned()),
+            ..LogOptions::default()
+        };
+        for (opts, env) in [
+            (filter("info"), vec![]),
+            (filter("debug"), vec![]),
+            (LogOptions::default(), vec![("TORNECT_LOG", "info")]),
+            (LogOptions::default(), vec![("RUST_LOG", "trace")]),
+            (filter("tornect_signal=trace"), vec![(IDENTIFIERS_ENV, "0")]),
+            (LogOptions::default(), vec![]),
+        ] {
+            let text = logged(opts.clone(), &env);
+            for said in [
+                "session accepted",
+                "label=<redacted>",
+                "onion service stopped",
+            ] {
+                assert!(
+                    text.contains(said),
+                    "{opts:?} {env:?}: \"{said}\" missing:\n{text}"
+                );
+            }
+            for secret in ["3f2a91c0", "Laptop", ".onion"] {
+                assert!(
+                    !text.contains(secret),
+                    "{opts:?} {env:?}: \"{secret}\" in:\n{text}"
+                );
+            }
+        }
+        for (opts, env) in [
+            (
+                LogOptions {
+                    identifiers: true,
+                    ..filter("info")
+                },
+                vec![],
+            ),
+            (LogOptions::default(), vec![(IDENTIFIERS_ENV, "1")]),
+        ] {
+            let text = logged(opts.clone(), &env);
+            for said in ["3f2a91c0", "Laptop", "abcdefghijklmnop.onion"] {
+                assert!(
+                    text.contains(said),
+                    "{opts:?} {env:?}: \"{said}\" missing:\n{text}"
+                );
+            }
         }
     }
 }
