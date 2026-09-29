@@ -225,8 +225,11 @@ impl Answers {
 }
 
 /// Whether this build has the administrator helper (§B.8.7.5): M-FEAT-3.
-/// Until it has, an administrator answer that needs it — the Windows prompt
-/// path and a filtered token without a prompt — is not offered.
+/// Without it, an administrator answer that needs it — the Windows prompt
+/// path and a filtered token without a prompt — is not offered. With it, the
+/// host starts the helper between such an answer and its accept, and the
+/// accept carries the administrator level only once the helper is connected
+/// and checked (the helper itself: `tornect input-helper`, Windows only).
 pub const ADMIN_HELPER: bool = false;
 
 /// Under the buttons: a standalone copy (§B.2.1).

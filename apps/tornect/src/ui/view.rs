@@ -1059,11 +1059,19 @@ fn host_popup(
                 // access; the other answers stay open (§B.2.1).
                 ui.add(
                     egui::Label::new(
-                        RichText::new(format!(
-                            "{SENTENCE_ADMIN_NOT_GIVEN}: this version of Tornect cannot start \
-                             the administrator helper, so Windows was not asked. The other \
-                             answers are still open."
-                        ))
+                        RichText::new(if tornect_core::levels::ADMIN_HELPER {
+                            format!(
+                                "{SENTENCE_ADMIN_NOT_GIVEN}: Windows' prompt was cancelled or \
+                                 failed, or the administrator helper did not start in time. The \
+                                 other answers are still open."
+                            )
+                        } else {
+                            format!(
+                                "{SENTENCE_ADMIN_NOT_GIVEN}: this version of Tornect cannot \
+                                 start the administrator helper, so Windows was not asked. The \
+                                 other answers are still open."
+                            )
+                        })
                         .strong()
                         .color(t.danger_text),
                     )

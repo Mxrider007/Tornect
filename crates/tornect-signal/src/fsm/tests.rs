@@ -19,9 +19,9 @@ use super::client::{
     ClientConfig, ClientDeps, ClientOutcome, Intent, ScriptedClientUi, SessionEvent, connect,
 };
 use super::host::{
-    HostConfig, HostDeps, HostOutcome, KillSwitch, LiveSession, LiveSessions, SessionActivity,
-    SessionEnd, SessionSink, StopTokenCheck, UnattendedContext, UnattendedHook, UnattendedVerdict,
-    serve_host,
+    AdminHelper, AttachedHelper, HostConfig, HostDeps, HostOutcome, KillSwitch, LiveSession,
+    LiveSessions, SessionActivity, SessionEnd, SessionSink, StopTokenCheck, UnattendedContext,
+    UnattendedHook, UnattendedVerdict, serve_host,
 };
 use super::vectors::host_device_pk;
 use super::*;
@@ -36,8 +36,8 @@ use crate::messages::{
     pair_reject, reject,
 };
 use crate::pairing::{
-    KnownHostStore, PairDecision, PairScript, PairingLimits, PairingPolicy, ScriptedConsent,
-    SessionDecision, SessionScript, TrustedDeviceStore,
+    BoxFuture, KnownHostStore, PairDecision, PairScript, PairingLimits, PairingPolicy,
+    ScriptedConsent, SessionDecision, SessionScript, TrustedDeviceStore,
 };
 use crate::transcript::{HostSigner, sign_envelope};
 
@@ -1075,6 +1075,232 @@ async fn the_host_side_level_is_the_signed_one() {
             }
         }
     }
+}
+
+/// A scripted administrator helper: what its start answers, what became of
+/// the helper it handed out.
+#[derive(Default)]
+struct FakeHelper {
+    /// How each start answers, in order (the last repeats).
+    script: Mutex<Vec<HelperScript>>,
+    started: std::sync::atomic::AtomicUsize,
+    attached: Mutex<Vec<String>>,
+    /// Helpers ended without being attached (dropped).
+    ended: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+enum HelperScript {
+    Ready,
+    Fail(&'static str),
+    /// Ready only after this long (a helper later than the popup's time).
+    ReadyAfter(Duration),
+}
+
+struct FakeAttached(Arc<FakeHelper>, bool);
+
+impl AttachedHelper for FakeAttached {
+    fn attach(mut self: Box<Self>, session_id: &str) {
+        self.1 = true;
+        self.0.attached.lock().unwrap().push(session_id.to_owned());
+    }
+}
+
+impl Drop for FakeAttached {
+    fn drop(&mut self) {
+        if !self.1 {
+            self.0.ended.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl AdminHelper for FakeHelper {
+    fn start<'a>(
+        self: Arc<Self>,
+        _: &'a crate::pairing::TrustedPeer,
+    ) -> BoxFuture<'a, Result<Box<dyn AttachedHelper>, &'static str>> {
+        Box::pin(async move {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let step = {
+                let mut script = self.script.lock().unwrap();
+                if script.len() > 1 {
+                    script.remove(0)
+                } else {
+                    script
+                        .first()
+                        .copied()
+                        .unwrap_or(HelperScript::Fail("none"))
+                }
+            };
+            // Made first, so a start dropped while it waits still ends it.
+            let helper = FakeAttached(Arc::clone(&self), false);
+            match step {
+                HelperScript::Ready => Ok(Box::new(helper) as Box<dyn AttachedHelper>),
+                HelperScript::Fail(why) => {
+                    drop(helper);
+                    Err(why)
+                }
+                HelperScript::ReadyAfter(wait) => {
+                    tokio::time::sleep(wait).await;
+                    Ok(Box::new(helper) as Box<dyn AttachedHelper>)
+                }
+            }
+        })
+    }
+}
+
+fn installed_row() -> Availability {
+    Availability::of(Some(&WindowsFacts {
+        installed: true,
+        administrator: true,
+        ..WindowsFacts::default()
+    }))
+}
+
+/// §B.2.1, §B.8.7.5 (H3, H5, H8; amendment §1.3 (i)): the helper starts
+/// between the administrator answer and the accept; the accept carries the
+/// administrator level only when it is attached, and it attaches to that
+/// session; a helper that fails leaves the sheet to be answered again (never
+/// a silent lower level); a view-only answer never starts one.
+#[tokio::test]
+async fn the_accept_carries_the_administrator_level_only_with_the_helper_attached() {
+    if !tornect_core::levels::ADMIN_HELPER {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let client = client_side(tmp.path(), host.identity.id(), CLIENT_SEED);
+    host.consent
+        .push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+    host.cfg.levels = installed_row();
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    // (script, answers in order, the accepted level, attached?)
+    let cases = [
+        (
+            vec![HelperScript::Ready],
+            vec![SessionDecision::AllowOnceAdmin],
+            Level::ADMIN,
+            true,
+        ),
+        (
+            vec![HelperScript::Fail("Windows' prompt was cancelled")],
+            vec![SessionDecision::AllowOnceAdmin, SessionDecision::AllowOnce],
+            Level::CONTROL,
+            false,
+        ),
+        (
+            vec![HelperScript::Ready],
+            vec![SessionDecision::AllowOnceViewOnly],
+            Level::VIEW_ONLY,
+            false,
+        ),
+    ];
+    for (script, answers, level, attached) in cases {
+        let helper = Arc::new(FakeHelper::default());
+        *helper.script.lock().unwrap() = script;
+        host.deps.admin_helper = helper.clone();
+        host.deps.session_policy = Arc::new(PairingPolicy::new(PairingLimits::sessions()));
+        for answer in &answers {
+            host.consent.push_session(SessionScript::Decide(*answer));
+        }
+        let asked_before = host.consent.session_popups();
+        let (a, b) = pipe();
+        let host_task = spawn_host(a, &host);
+        let ClientOutcome::Session(session) = connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            Intent::Session,
+        )
+        .await
+        .unwrap() else {
+            panic!("{level:?}: no session");
+        };
+        let accept = session.accept();
+        assert_eq!(accept.elevation(), level.elevation(), "{level:?}");
+        assert_eq!(accept.mode(), mode_code(level.mode()), "{level:?}");
+        session.bye(bye::USER).await.unwrap();
+        host_task.await.unwrap().unwrap();
+        let started = helper.started.load(Ordering::SeqCst);
+        let attached_to = helper.attached.lock().unwrap().clone();
+        assert_eq!(attached_to.len(), usize::from(attached), "{level:?}");
+        assert_eq!(
+            host.consent.session_popups() - asked_before,
+            answers.len(),
+            "{level:?}: asked once per answer"
+        );
+        match level.mode() {
+            SessionMode::ViewOnly => assert_eq!(started, 0, "view-only starts no helper"),
+            SessionMode::Control => assert_eq!(started, 1),
+        }
+        if attached {
+            let logged = audit.0.lock().unwrap().iter().any(|e| {
+                matches!(e, AuditEvent::AdminHelper { what: HelperEvent::Started, session_id: Some(id), .. } if *id == attached_to[0])
+            });
+            assert!(logged, "admin_helper_started for the session");
+        }
+    }
+    let failed = audit.0.lock().unwrap().iter().any(|e| {
+        matches!(
+            e,
+            AuditEvent::AdminHelper {
+                what: HelperEvent::Failed,
+                session_id: None,
+                ..
+            }
+        )
+    });
+    assert!(failed, "admin_helper_failed recorded");
+}
+
+/// §B.2.1 (the 5 s budget ends inside the popup's time): a helper not ready
+/// before the popup's time runs out is ended, never attached, and the
+/// session is refused `POPUP_TIMEOUT`, never started at a level.
+#[tokio::test(start_paused = true)]
+async fn a_late_helper_is_ended_and_never_attached() {
+    if !tornect_core::levels::ADMIN_HELPER {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let client = client_side(tmp.path(), host.identity.id(), CLIENT_SEED);
+    host.consent
+        .push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+    host.cfg.levels = installed_row();
+    let helper = Arc::new(FakeHelper::default());
+    *helper.script.lock().unwrap() = vec![HelperScript::ReadyAfter(
+        timeouts::POPUP + Duration::from_secs(5),
+    )];
+    host.deps.admin_helper = helper.clone();
+    host.consent
+        .push_session(SessionScript::Decide(SessionDecision::AllowOnceAdmin));
+    let (a, b) = pipe();
+    let host_task = spawn_host(a, &host);
+    let outcome = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        Intent::Session,
+    )
+    .await;
+    let err = outcome.map(|_| ()).unwrap_err();
+    assert!(
+        matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == reject::POPUP_TIMEOUT),
+        "{err}"
+    );
+    assert!(matches!(
+        host_task.await.unwrap().unwrap(),
+        HostOutcome::SessionRejected {
+            reason: reject::POPUP_TIMEOUT,
+            ..
+        }
+    ));
+    assert_eq!(helper.started.load(Ordering::SeqCst), 1);
+    assert!(helper.attached.lock().unwrap().is_empty(), "never attached");
+    assert_eq!(helper.ended.load(Ordering::SeqCst), 1, "ended");
 }
 
 #[tokio::test]

@@ -193,6 +193,24 @@ pub trait Consent: Send + Sync {
         let _ = levels;
         self.session(peer, req)
     }
+
+    /// The session popup again, after its administrator answer ended without
+    /// administrator access (§B.2.1: Windows' prompt cancelled or failed, or
+    /// the administrator helper not ready in time): the sheet says
+    /// "Administrator access was not given", keeps the other answers, and has
+    /// `left` of the popup's time. The session never starts at a lower level
+    /// by itself: the person answers again. The default asks as
+    /// [`Self::session_at`] does.
+    fn session_again<'a>(
+        &'a self,
+        peer: &'a TrustedPeer,
+        req: &'a SessionRequestSummary,
+        levels: &'a Availability,
+        left: Duration,
+    ) -> BoxFuture<'a, SessionDecision> {
+        let _ = left;
+        self.session_at(peer, req, levels)
+    }
 }
 
 /// Denies everything: the headless default and the safe fallback when no UI is attached.

@@ -408,7 +408,7 @@ impl Consent for GuiConsent {
         peer: &'a TrustedPeer,
         _: &'a SessionRequestSummary,
     ) -> BoxFuture<'a, SessionDecision> {
-        self.session_sheet(peer, None)
+        self.session_sheet(peer, None, None)
     }
 
     fn session_at<'a>(
@@ -417,20 +417,34 @@ impl Consent for GuiConsent {
         _: &'a SessionRequestSummary,
         levels: &'a Availability,
     ) -> BoxFuture<'a, SessionDecision> {
-        self.session_sheet(peer, Some(SheetLevels::of(levels)))
+        self.session_sheet(peer, Some(SheetLevels::of(levels)), None)
+    }
+
+    fn session_again<'a>(
+        &'a self,
+        peer: &'a TrustedPeer,
+        _: &'a SessionRequestSummary,
+        levels: &'a Availability,
+        left: Duration,
+    ) -> BoxFuture<'a, SessionDecision> {
+        self.session_sheet(peer, Some(SheetLevels::of(levels)), Some(left))
     }
 }
 
 impl GuiConsent {
     /// The session sheet of `peer`, offering `levels` (§B.2.1) when given.
+    /// `again`: the sheet after an administrator answer that ended without
+    /// administrator access, with what is left of the popup's time; it says
+    /// so and keeps the other answers (a new card: armed after its second).
     fn session_sheet<'a>(
         &'a self,
         peer: &'a TrustedPeer,
         levels: Option<SheetLevels>,
+        again: Option<Duration>,
     ) -> BoxFuture<'a, SessionDecision> {
         let withdrawn = self.withdraw.armed();
         Box::pin(async move {
-            let deadline = Instant::now() + timeouts::POPUP;
+            let deadline = Instant::now() + again.unwrap_or(timeouts::POPUP);
             let mut withdrawn = std::pin::pin!(withdrawn);
             // A paired device's identicon, beside its pinned label: a saved
             // key, derived once.
@@ -468,6 +482,9 @@ impl GuiConsent {
                 }
                 if recent {
                     m.paired_recently.insert(id);
+                }
+                if again.is_some() {
+                    m.admin_not_given.insert(id);
                 }
                 m.popups.push(Popup { id, kind, deadline });
             });
