@@ -537,6 +537,12 @@ impl App {
                 }
             }
             Action::EndViewing => self.command(Command::EndViewing),
+            Action::DismissConnect => self.popups.shared().update(|m| {
+                if matches!(m.client, ClientStage::Ended(_)) {
+                    m.client = ClientStage::Idle;
+                    m.dial = super::model::Dial::default();
+                }
+            }),
             Action::Grant => self.command(Command::Grant),
             Action::Revoke => self.command(Command::Revoke),
             Action::Pair {
