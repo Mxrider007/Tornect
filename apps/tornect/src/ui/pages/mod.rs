@@ -1262,4 +1262,117 @@ mod tests {
             }
         }
     }
+
+    /// The connect stepper: the four steps and the one the connection is on,
+    /// the code on step 2 while pairing, the level from the signed accept once
+    /// live, and every error of the taxonomy in plain words, with Try again
+    /// (the same ID) and Back; the dialed ID is never shown while this
+    /// screen is shared, nor a host's name.
+    #[test]
+    fn the_connect_stepper_says_where_it_is_and_why_it_stopped() {
+        use super::super::model::{ClientStage, Dial, Failure, Viewing};
+        let id = TornectId::from_bytes([0x42; 32]);
+        let dial = |failed| Dial {
+            id: Some(id),
+            since: Some(Instant::now()),
+            paired_now: true,
+            failed,
+        };
+        let steps = [
+            "Reaching the computer over Tor",
+            "Pairing: compare the code",
+            "Waiting for approval",
+            "Opening the picture",
+        ];
+        for stage in [
+            ClientStage::Reaching {
+                id: id.display_groups(),
+            },
+            ClientStage::Pairing {
+                sas: "305 116".to_owned(),
+            },
+            ClientStage::Asking,
+        ] {
+            let mut model = at_rest();
+            model.client = stage.clone();
+            model.dial = dial(None);
+            let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+            assert!(has_text(&window, "Connecting to a computer"), "{stage:?}");
+            for step in steps {
+                assert!(has_text(&window, step), "{stage:?}: {step}");
+            }
+            assert!(has_text(&window, &id.display_groups()), "{stage:?}");
+            assert!(window.node("Cancel").bounds().is_some());
+            if matches!(stage, ClientStage::Pairing { .. }) {
+                assert!(has_text(&window, "305 116"));
+            }
+        }
+        let mut live = at_rest();
+        live.client = ClientStage::Live(Viewing {
+            host: "Desk".to_owned(),
+            control: true,
+            administrator: true,
+            since: Instant::now(),
+            pictures: 1,
+            size: (1280, 720),
+        });
+        live.dial = dial(None);
+        let window = Window::new(live.clone(), Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(
+            &window,
+            "Connected to \"Desk\" (Control · administrator): the picture is in its own window."
+        ));
+        for (failure, step) in [
+            (Failure::Unreachable, 1),
+            (Failure::CodesDiffer, 2),
+            (Failure::Denied, 3),
+            (Failure::TimedOut, 3),
+            (Failure::VersionMismatch, 1),
+        ] {
+            let mut model = at_rest();
+            model.client = ClientStage::Ended("the stage's own words".to_owned());
+            model.dial = dial(Some((failure, step)));
+            let mut window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
+            assert!(has_text(&window, failure.title()), "{failure:?}");
+            assert!(has_text(&window, failure.advice()), "{failure:?}");
+            assert!(has_text(&window, "the stage's own words"), "{failure:?}");
+            let again = window.center("Try again");
+            assert_eq!(
+                window.click(again),
+                vec![Action::Connect(id)],
+                "{failure:?}"
+            );
+            let back = window.center("Back");
+            assert_eq!(
+                window.click(back),
+                vec![Action::DismissConnect],
+                "{failure:?}"
+            );
+            // Shared: neither the ID nor the stage's words (they may name
+            // the host).
+            model.sharing = vec![super::super::model::Sharing {
+                session_id: "00".to_owned(),
+                label: "Viewer".to_owned(),
+                control: false,
+                unattended: false,
+                since: Instant::now(),
+                capture: None,
+            }];
+            let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+            assert!(!has_text(&window, &id.display_groups()), "{failure:?}");
+            assert!(!has_text(&window, "the stage's own words"), "{failure:?}");
+            assert!(has_text(&window, failure.title()), "{failure:?}");
+        }
+        live.sharing = vec![super::super::model::Sharing {
+            session_id: "00".to_owned(),
+            label: "Viewer".to_owned(),
+            control: false,
+            unattended: false,
+            since: Instant::now(),
+            capture: None,
+        }];
+        let window = Window::new(live, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(!has_text(&window, "Desk"));
+        assert!(has_text(&window, "(Control · administrator)"));
+    }
 }

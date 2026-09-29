@@ -88,8 +88,10 @@ pub enum Action {
     /// Start moving the indicator window with the pointer (it has no title
     /// bar).
     MoveIndicator,
-    /// End the session this machine views.
+    /// End the session this machine views, or stop asking for one.
     EndViewing,
+    /// Put the connect stepper away after a connection that ended.
+    DismissConnect,
     /// Open the desktop's screen-sharing dialog now (the first-run grant).
     Grant,
     /// Forget the desktop's remembered grant.

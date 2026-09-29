@@ -103,6 +103,10 @@ pub struct Model {
     pub sharing: Vec<Sharing>,
     /// The session this machine is viewing.
     pub client: ClientStage,
+    /// The connection this computer last asked for: the ID dialed (for Try
+    /// again), when it started, whether it went through pairing, and how it
+    /// failed if it ended without a session.
+    pub dial: Dial,
     /// The last few things that happened, newest last.
     pub events: Vec<String>,
     /// The name other devices see for this computer: sent to every device it
@@ -429,6 +433,78 @@ pub struct CaptureNote {
     pub height: u32,
     /// Whether the viewer's input reaches this machine.
     pub input: bool,
+}
+
+/// The connection this computer last asked for, as the connect stepper
+/// shows it.
+#[derive(Debug, Clone, Default)]
+pub struct Dial {
+    /// The ID dialed.
+    pub id: Option<TornectId>,
+    /// When the connection was asked for.
+    pub since: Option<Instant>,
+    /// It went through pairing (the code was compared).
+    pub paired_now: bool,
+    /// It ended without a session: why, and at which step (1 reaching,
+    /// 2 pairing, 3 waiting for approval, 4 opening the picture).
+    pub failed: Option<(Failure, u8)>,
+}
+
+/// Why a connection ended without a session: the connect stepper's error
+/// taxonomy (the redesign's §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// Tor could not reach the computer.
+    Unreachable,
+    /// The person at the computer said no.
+    Denied,
+    /// Nobody answered in time.
+    TimedOut,
+    /// The two computers speak different protocol versions.
+    VersionMismatch,
+    /// The codes differed (or this computer's person said so).
+    CodesDiffer,
+    /// Anything else; the stage's own words say what.
+    Other,
+}
+
+impl Failure {
+    /// The error's headline.
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Unreachable => "Could not reach the computer",
+            Self::Denied => "The person at the computer said no",
+            Self::TimedOut => "Nobody answered in time",
+            Self::VersionMismatch => "The two computers run Tornect versions that cannot talk",
+            Self::CodesDiffer => "Not paired. Nothing was saved.",
+            Self::Other => "The connection ended",
+        }
+    }
+
+    /// What to do about it, in plain words.
+    #[must_use]
+    pub fn advice(self) -> &'static str {
+        match self {
+            Self::Unreachable => {
+                "It may be off, not running Tornect, or still publishing its ID; Tor itself may \
+                 be slow. Try again in a minute."
+            }
+            Self::Denied => {
+                "Nothing was shared. Ask the person at that computer before trying again."
+            }
+            Self::TimedOut => {
+                "The request waited up to its limit. Ask the person at that computer to watch \
+                 for it, then try again."
+            }
+            Self::VersionMismatch => "Update Tornect on both computers, then try again.",
+            Self::CodesDiffer => {
+                "If the codes differed, something between you may have changed them. Try again \
+                 later, ideally after checking the ID with the person at that computer."
+            }
+            Self::Other => "Try again, or go back.",
+        }
+    }
 }
 
 /// The session this machine is viewing (`docs/UI_PLAN.md` §5, S3).

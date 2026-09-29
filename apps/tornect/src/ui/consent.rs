@@ -505,6 +505,7 @@ impl ClientPairingUi for GuiPairingUi {
                 m.client = ClientStage::Pairing {
                     sas: sas.to_owned(),
                 };
+                m.dial.paired_now = true;
             });
         })
     }
