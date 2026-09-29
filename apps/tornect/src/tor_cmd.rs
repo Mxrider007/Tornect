@@ -500,6 +500,17 @@ async fn run_ping(paths: &Paths, cfg: &Config, id: TornectId, count: u32) -> any
     Ok(())
 }
 
+/// `tornect connect --unattended`: what the person chose on the command line.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnattendedOpts {
+    /// View only this time.
+    pub view_only: bool,
+    /// Keep the password in the keychain once it worked.
+    pub remember: bool,
+    /// Ask for the administrator level.
+    pub administrator: bool,
+}
+
 /// What `tornect connect` should do beyond the handshake.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConnectOpts {
@@ -513,6 +524,237 @@ pub struct ConnectOpts {
     pub pings: Option<u32>,
     /// Open the session's media stream and receive the shared screen.
     pub video: bool,
+    /// Connect without asking, on this device's unattended grant.
+    pub unattended: Option<UnattendedOpts>,
+}
+
+/// `tornect admin <id> <action>`: one admin command on this device's grant at
+/// a paired host (§B.8.4.1, B.8.10): a confirmation naming the host, the
+/// password (remembered, or asked masked on this terminal), one attempt, and
+/// the host's signed answer.
+pub fn admin(
+    paths: &Paths,
+    onion: &str,
+    action: crate::ua_client::AdminAction,
+    device_arg: Option<&str>,
+    bridges: Option<BridgeMode>,
+) -> anyhow::Result<()> {
+    use std::io::IsTerminal as _;
+
+    use crate::ua_client::{self, AdminAction, Logged};
+    install_crypto_provider();
+    let id: TornectId = onion
+        .parse()
+        .map_err(|e| anyhow::anyhow!("that is not a Tornect ID: {e}"))?;
+    let mut cfg = Config::load(&paths.config_file())?;
+    if let Some(mode) = bridges {
+        cfg.tor.bridges = mode;
+    }
+    paths.ensure().context("creating Tornect directories")?;
+    let store = FileSecretStore::open(paths.keys_dir()).context("opening keystore")?;
+    let (device, _) = load_or_create_device_identity(&store)?;
+    let target = match action {
+        AdminAction::Unlock => {
+            let other: tornect_core::DeviceId = device_arg
+                .ok_or_else(|| anyhow::anyhow!("unlock needs --device <DEVICE_ID>"))?
+                .parse()
+                .map_err(|e| anyhow::anyhow!("that is not a device ID: {e}"))?;
+            Some(*other.public_key_bytes())
+        }
+        AdminAction::RevokeThisDevice => Some(*device.id().public_key_bytes()),
+        AdminAction::EndSession | AdminAction::TurnOff => None,
+    };
+    let pins = crate::history::Pins::open(paths, id).context("opening known-hosts.toml")?;
+    let Some(known) = pins.store().get(&id) else {
+        anyhow::bail!("this computer is not paired with that host; admin commands go only to one");
+    };
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        anyhow::bail!(
+            "an admin command asks for a confirmation and its password on a terminal, and this \
+             is not one"
+        );
+    }
+    crate::host::peer_note(format_args!("{}", action.confirmation(&known.label)));
+    if !crate::unattended::confirm("Send it?")? {
+        anyhow::bail!("not sent");
+    }
+    let saved = ua_client::system_passwords(&device);
+    let password = match ua_client::recall(paths, &saved, &id)? {
+        Some(password) => password,
+        None => crate::unattended::read_password("Unattended password (not shown): ")?,
+    };
+    if password.is_empty() {
+        anyhow::bail!("no password typed; nothing was sent");
+    }
+    let request = ua_client::Request {
+        password,
+        view_only: true,
+        administrator: false,
+        remember: false,
+    };
+    block_on(async {
+        eprintln!("bootstrapping Tor (~30 s cold, a few seconds with a warm cache)...");
+        let node = start_tor(paths, &cfg).await?;
+        let result = async {
+            let stream = match node
+                .connect_on(&id, SIGNALING_PORT, &Isolation::new())
+                .await
+            {
+                Ok(stream) => stream,
+                Err(e) => {
+                    let ended = ua_client::unreachable(&known.label);
+                    ua_client::log_attempt(paths, &known, &Logged::Ended(&ended.reason));
+                    crate::host::peer_note(format_args!("{}", ended.text));
+                    return Err(explain(e));
+                }
+            };
+            let ccfg = ClientConfig::new(id, cfg.general.device_name.clone());
+            let deps = ClientDeps {
+                known_hosts: pins.store(),
+                ui: Arc::new(CliPairingUi::new(None)),
+                random: Arc::new(OsRandom),
+                server_key_pin: Arc::new(ua_client::HostsPin::new(paths)),
+            };
+            let command = client::AdminIntent {
+                password: request.password.clone(),
+                op: action.op(),
+                device_pk: target,
+            };
+            match client::admin(stream, &ccfg, &device, &deps, &command).await {
+                Ok(answer) => {
+                    if let Err(e) = ua_client::settle(
+                        paths,
+                        &saved,
+                        &id,
+                        tornect_core::unattended::credentials::Attempt::Accepted {
+                            administrator: false,
+                        },
+                        &request,
+                    ) {
+                        eprintln!("hosts.toml could not be updated: {e:#}");
+                    }
+                    ua_client::log_attempt(
+                        paths,
+                        &known,
+                        &Logged::Admin {
+                            op: action.name(),
+                            ok: answer.ok,
+                        },
+                    );
+                    // The host's own words: untrusted text, shown quoted and
+                    // escaped, on a terminal only.
+                    if let Some(detail) = &answer.detail {
+                        crate::host::peer_note(format_args!(
+                            "the host says: \"{}\"",
+                            detail.escape_debug()
+                        ));
+                    }
+                    if answer.ok {
+                        if action == AdminAction::RevokeThisDevice
+                            && let Err(e) = ua_client::forget(paths, &saved, &id)
+                        {
+                            eprintln!("the remembered password could not be deleted: {e:#}");
+                        }
+                        println!("ADMIN OK {}", action.name());
+                        Ok(())
+                    } else {
+                        anyhow::bail!(
+                            "the host did not do it ({}): this device's access there does not \
+                             allow it, or the host could not",
+                            action.name()
+                        )
+                    }
+                }
+                Err(e) => {
+                    let ended = ua_client::ended(&e, &known.label);
+                    if let Err(err) = ua_client::settle(paths, &saved, &id, ended.attempt, &request)
+                    {
+                        eprintln!("hosts.toml could not be updated: {err:#}");
+                    }
+                    ua_client::log_attempt(paths, &known, &Logged::Ended(&ended.reason));
+                    crate::host::peer_note(format_args!("{}", ended.text));
+                    anyhow::bail!("the admin command was not answered ({})", ended.reason)
+                }
+            }
+        }
+        .await;
+        node.shutdown().await;
+        result
+    })
+}
+
+/// An unattended attempt, ready before anything is dialed: the prompt ran
+/// (§B.8.10: the password comes before the connection).
+struct Prepared {
+    request: crate::ua_client::Request,
+    saved: tornect_core::unattended::credentials::SavedPasswords,
+    known: tornect_core::trusted::KnownHost,
+}
+
+/// The password prompt of `tornect connect --unattended`, before dialing: a
+/// remembered password is used as it is; otherwise one is asked, masked, and
+/// only when stdin and stderr are a terminal. `--remember` is refused where the
+/// keychain may not keep it (none usable; administrator access, DA-14).
+fn prepare_unattended(
+    paths: &Paths,
+    id: TornectId,
+    device: &DeviceIdentity,
+    pins: &crate::history::Pins,
+    ua: UnattendedOpts,
+) -> anyhow::Result<Prepared> {
+    use std::io::IsTerminal as _;
+    let Some(known) = pins.store().get(&id) else {
+        anyhow::bail!(
+            "this computer is not paired with that host: connect once without --unattended \
+             (its user compares a code), then ask its owner for unattended access"
+        );
+    };
+    let saved = crate::ua_client::system_passwords(device);
+    let record = crate::ua_client::record(paths, &id);
+    let may_admin = record.administrator || ua.administrator;
+    if ua.remember
+        && let Some(why) = saved.offer(may_admin).sentence()
+    {
+        anyhow::bail!("--remember: {why}");
+    }
+    let password = match crate::ua_client::recall(paths, &saved, &id)? {
+        Some(password) => {
+            eprintln!(
+                "using the password remembered in {}",
+                saved.keychain().unwrap_or("the keychain")
+            );
+            password
+        }
+        None => {
+            if record.stale {
+                eprintln!(
+                    "the password remembered for this host was refused last time and deleted; \
+                     type it again"
+                );
+            }
+            if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+                anyhow::bail!(
+                    "the unattended password is asked on a terminal, and this is not one: run the \
+                     command interactively (Tornect never takes a password from the command line \
+                     or the environment)"
+                );
+            }
+            crate::unattended::read_password("Unattended password (not shown): ")?
+        }
+    };
+    if password.is_empty() {
+        anyhow::bail!("no password typed; nothing was sent");
+    }
+    Ok(Prepared {
+        request: crate::ua_client::Request {
+            password,
+            view_only: ua.view_only,
+            administrator: ua.administrator,
+            remember: ua.remember,
+        },
+        saved,
+        known,
+    })
 }
 
 /// `tornect connect <onion> [--pair-only] [--forget] [--pings N]`
@@ -537,13 +779,22 @@ pub fn connect(
         let known = KnownHostStore::open(tornect_core::trusted::known_hosts_file(paths))
             .context("opening known-hosts.toml")?;
         if known.remove(&id)? {
-            eprintln!("forgot {id}; this connection pairs again");
+            crate::host::peer_note(format_args!("forgot {id}; this connection pairs again"));
+        }
+        // Its remembered unattended password goes too (§B.8.9.1).
+        let saved = crate::ua_client::system_passwords(&device);
+        if let Err(e) = crate::ua_client::forget(paths, &saved, &id) {
+            eprintln!("the remembered unattended password could not be deleted: {e:#}");
         }
     }
     // With history off the handshake works on a copy of the known hosts, so
     // that its last-seen touch writes nothing (`crate::history`).
     let pins = crate::history::Pins::open(paths, id).context("opening known-hosts.toml")?;
-    block_on(run_connect(paths, &cfg, id, &device, &pins, opts))
+    let prepared = match opts.unattended {
+        Some(ua) => Some(prepare_unattended(paths, id, &device, &pins, ua)?),
+        None => None,
+    };
+    block_on(run_connect(paths, &cfg, id, &device, &pins, opts, prepared))
 }
 
 async fn run_connect(
@@ -553,31 +804,46 @@ async fn run_connect(
     device: &DeviceIdentity,
     pins: &crate::history::Pins,
     opts: ConnectOpts,
+    prepared: Option<Prepared>,
 ) -> anyhow::Result<()> {
     eprintln!("bootstrapping Tor (~30 s cold, a few seconds with a warm cache)...");
     let node = start_tor(paths, cfg).await?;
-    let result = connect_session(&node, cfg, id, device, pins, opts).await;
+    let result = connect_session(&node, cfg, paths, id, device, pins, opts, prepared).await;
     node.shutdown().await;
     result
 }
 
+#[allow(clippy::too_many_arguments)] // the command's context, one argument each
 async fn connect_session(
     node: &TorNode,
     cfg: &Config,
+    paths: &Paths,
     id: TornectId,
     device: &DeviceIdentity,
     pins: &crate::history::Pins,
     opts: ConnectOpts,
+    prepared: Option<Prepared>,
 ) -> anyhow::Result<()> {
-    eprintln!("connecting to {id} (rendezvous usually takes 5-30 s, up to 60 s)...");
+    use crate::ua_client::{self, Logged};
+    // The ID names the host: only a terminal sees it (U3-M1).
+    crate::host::peer_note(format_args!(
+        "connecting to {id} (rendezvous usually takes 5-30 s, up to 60 s)..."
+    ));
     let started = Instant::now();
     // One isolation group for the session: the media stream opened later rides
     // the signaling stream's rendezvous circuit (decision M1-39).
     let isolation = Isolation::new();
-    let stream = node
-        .connect_on(&id, SIGNALING_PORT, &isolation)
-        .await
-        .map_err(explain)?;
+    let stream = match node.connect_on(&id, SIGNALING_PORT, &isolation).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            if let Some(p) = &prepared {
+                let ended = ua_client::unreachable(&p.known.label);
+                ua_client::log_attempt(paths, &p.known, &Logged::Ended(&ended.reason));
+                crate::host::peer_note(format_args!("{}", ended.text));
+            }
+            return Err(explain(e));
+        }
+    };
     eprintln!("connected in {:.1} s", started.elapsed().as_secs_f64());
 
     let pairing = !pins.known();
@@ -586,18 +852,27 @@ async fn connect_session(
         known_hosts: pins.store(),
         ui: Arc::new(CliPairingUi::new(Prompter::stdin())),
         random: Arc::new(OsRandom),
-        // Consulted only by unattended sessions, which this command does not request.
-        server_key_pin: Arc::new(NoServerKeyPin),
+        // The host's OPAQUE key, pinned in hosts.toml: only unattended
+        // sessions consult it.
+        server_key_pin: match &prepared {
+            Some(_) => Arc::new(ua_client::HostsPin::new(paths)),
+            None => Arc::new(NoServerKeyPin),
+        },
     };
-    let intent = if opts.pair_only {
-        Intent::PairOnly
-    } else {
-        Intent::Session
+    let intent = match (&prepared, opts.pair_only) {
+        (Some(p), _) => p.request.intent(),
+        (None, true) => Intent::PairOnly,
+        (None, false) => Intent::Session,
     };
-    match (pairing, opts.pair_only) {
-        (true, _) => eprintln!("new host: pairing first (the host's user compares a code)..."),
-        (false, true) => {}
-        (false, false) => {
+    match (pairing, opts.pair_only, &prepared) {
+        (_, _, Some(_)) => eprintln!(
+            "checking the password; someone at the host can still block this, or must allow it..."
+        ),
+        (true, _, None) => {
+            eprintln!("new host: pairing first (the host's user compares a code)...");
+        }
+        (false, true, None) => {}
+        (false, false, None) => {
             eprintln!("asking for a session; the host's user has to accept it (up to 110 s)...");
         }
     }
@@ -606,23 +881,82 @@ async fn connect_session(
     if let Err(e) = pins.settle() {
         eprintln!("the pairing could not be saved: {e:#}");
     }
+    // One attempt, settled once: a refused password is stale, an accepted one
+    // kept if asked; nothing is tried again.
+    if let (Some(p), Err(e)) = (&prepared, &outcome) {
+        let ended = ua_client::ended(e, &p.known.label);
+        if let Err(err) = ua_client::settle(paths, &p.saved, &id, ended.attempt, &p.request) {
+            eprintln!("hosts.toml could not be updated: {err:#}");
+        }
+        ua_client::log_attempt(paths, &p.known, &Logged::Ended(&ended.reason));
+        crate::host::peer_note(format_args!("{}", ended.text));
+        anyhow::bail!("the unattended connection did not start ({})", ended.reason);
+    }
     let outcome = outcome.map_err(explain_handshake)?;
     let mut session = match outcome {
         ClientOutcome::Paired { host_name } => {
-            println!("PAIRED with \"{host_name}\"");
+            crate::host::say_evidence(
+                format_args!("PAIRED with \"{host_name}\""),
+                Some(format_args!("PAIRED")),
+            );
             return Ok(());
         }
         ClientOutcome::Session(session) => session,
     };
-    let mode = match tornect_signal::consent::mode_from_code(session.accept().mode()) {
-        Some(SessionMode::ViewOnly) => "view-only",
-        _ => "control",
-    };
-    println!(
-        "SESSION LIVE {} with \"{}\" ({mode})",
-        session.session_token().session_id(),
-        session.host_label()
+    let control = matches!(
+        tornect_signal::consent::mode_from_code(session.accept().mode()),
+        Some(SessionMode::Control)
     );
+    let administrator =
+        control && session.accept().elevation() == tornect_core::levels::Elevation::Admin;
+    let mode = match (control, administrator) {
+        (true, true) => "control · administrator",
+        (true, false) => "control",
+        (false, _) => "view-only",
+    };
+    let sid = session.session_token().session_id();
+    crate::host::say_evidence(
+        format_args!(
+            "SESSION LIVE {sid} with \"{}\" ({mode})",
+            session.host_label()
+        ),
+        Some(format_args!("SESSION LIVE {sid}")),
+    );
+    if let Some(p) = &prepared {
+        match ua_client::settle(
+            paths,
+            &p.saved,
+            &id,
+            tornect_core::unattended::credentials::Attempt::Accepted { administrator },
+            &p.request,
+        ) {
+            Ok(true) if p.request.remember => eprintln!(
+                "the password is remembered in {}",
+                p.saved.keychain().unwrap_or("the keychain")
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("the password could not be remembered: {e:#}"),
+        }
+        ua_client::log_attempt(
+            paths,
+            &p.known,
+            &Logged::Session {
+                id: &sid,
+                control,
+                administrator,
+            },
+        );
+        eprintln!("{}", ua_client::badge(control, administrator));
+        if let Some(line) = ua_client::fail_summary_text(session.accept().fail_summary()) {
+            eprintln!("{line}");
+        }
+        if session.elevation_withheld() {
+            crate::host::peer_note(format_args!(
+                "administrator access unavailable at \"{}\": the session goes on without it",
+                p.known.label
+            ));
+        }
+    }
     // The day of the visit, if history is kept; nothing otherwise.
     if let Err(e) = pins.visited() {
         tracing::warn!(error = %format!("{e:#}"), "the visit was not recorded");
