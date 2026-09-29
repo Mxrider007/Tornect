@@ -37,9 +37,16 @@ mod hex32 {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostRecord {
-    /// The user chose "Remember on this device" (the password itself lives in the OS
-    /// keychain entry `tornect/unattended/<onion>`, M8).
+    /// The user chose "Remember on this device": the password itself lives only in the OS
+    /// keychain, under the entry name `credentials::EntryName::derive` computes from the
+    /// identities at use (never a name read from this file, §B.8.9.1).
     pub remember: bool,
+    /// The remembered password was refused (`AUTH_FAILED`, or this side's own check of the
+    /// host's answer) and deleted; the prompt says so until the next success.
+    pub stale: bool,
+    /// A signed accept of this host gave this device the administrator level: the prompt
+    /// offers to ask for it again, and "Remember" needs a presence-gated keychain (DA-14).
+    pub administrator: bool,
     /// `server_s_pk` of the host's OPAQUE setup, pinned at the first `SESSION_ACCEPT`.
     #[serde(with = "hex32")]
     pub server_s_pk_pin: Option<[u8; 32]>,

@@ -12,8 +12,13 @@ publish.workspace = true
 default = []
 # `K_master` in the OS keychain through `keyring-core` (docs/PLAN.md §B.8.9): the
 # Linux kernel keyutils store is the only M1 backend; the file keystore stays the
-# fallback and the readiness canary decides at runtime.
-keyring = ["dep:keyring-core", "dep:linux-keyutils-keyring-store"]
+# fallback and the readiness canary decides at runtime. Also the remembered unattended
+# passwords (§B.8.9.1): Windows Credential Manager, the Linux kernel keyrings.
+keyring = [
+    "dep:keyring-core",
+    "dep:linux-keyutils-keyring-store",
+    "dep:windows-native-keyring-store",
+]
 
 [dependencies]
 anyhow.workspace = true
@@ -50,6 +55,9 @@ keyring-core = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-keyutils-keyring-store = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
