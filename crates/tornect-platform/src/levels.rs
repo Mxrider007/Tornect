@@ -262,7 +262,7 @@ mod tests {
                 ADMIN,
                 HostRow::WindowsAdminWithoutPrompt,
                 true,
-                true,
+                false,
                 Some(AdminPath::TornectConfirmation { needs_helper: true }),
                 Some(ADMIN_LINE_NO_PROMPT),
             ),

@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tornect_core::TornectId;
 use tornect_core::levels::{
-    ADMIN_LINE_NO_PROMPT, AdminPath, Answers, Availability, LINE_VIEW_ONLY,
+    ADMIN_LINE, ADMIN_LINE_NO_PROMPT, AdminPath, Answers, Availability, LINE_VIEW_ONLY,
     SENTENCE_SECURE_DESKTOP_OFF,
 };
 use tornect_signal::fsm::client::ClientPairingUi;
@@ -238,17 +238,20 @@ fn session_question_at(peer: &TrustedPeer, levels: &Availability) -> String {
     if answers.allow {
         lines.push(format!("  `a`  allow: {}", levels.allow_line()));
     }
-    if answers.admin.is_some() {
+    let admin_line = answers.admin.map(|path| match path {
+        AdminPath::WindowsPrompt => ADMIN_LINE,
+        AdminPath::TornectConfirmation { .. } => ADMIN_LINE_NO_PROMPT,
+    });
+    if let Some(line) = admin_line {
         lines.push(format!(
-            "  `administrator`  allow as administrator (type the whole word): \
-             {ADMIN_LINE_NO_PROMPT}"
+            "  `administrator`  allow as administrator (type the whole word): {line}"
         ));
     }
-    // The row's sentence, once: on Linux it is the line under Allow.
-    if let Some(line) = levels
-        .offered_sentence()
-        .filter(|line| !(answers.allow && *line == levels.allow_line()))
-    {
+    // The row's sentence, once: on Linux it is the line under Allow, on the
+    // no-prompt row the line under the administrator answer.
+    if let Some(line) = levels.offered_sentence().filter(|line| {
+        !(answers.allow && *line == levels.allow_line()) && admin_line != Some(*line)
+    }) {
         lines.push(format!("  {line}"));
     }
     if levels.prompts_on_shared_screen {

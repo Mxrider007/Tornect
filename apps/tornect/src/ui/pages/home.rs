@@ -18,8 +18,9 @@ use super::super::widgets::{self, Button, Kind, Tone};
 use super::{day_in_sentence, day_text};
 
 /// Home's first-run line: history is off until switched on.
-pub(super) const HISTORY_NOTICE: &str = "Nothing about past connections is written on this \
-    computer unless you switch history on (Address book, Recent).";
+pub(super) const HISTORY_NOTICE: &str = "Tornect keeps no list of the computers you connect to \
+    unless you switch history on (Address book, Recent). Pairings, and the log of sessions others \
+    start on this computer, are always kept.";
 
 /// How long "Copied" shows after Copy ID.
 const COPIED_FOR: Duration = Duration::from_secs(2);
