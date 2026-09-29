@@ -47,6 +47,9 @@ pub struct HostRecord {
     /// A signed accept of this host gave this device the administrator level: the prompt
     /// offers to ask for it again, and "Remember" needs a presence-gated keychain (DA-14).
     pub administrator: bool,
+    /// The last signed accept of this host was control: the host card offers the admin
+    /// commands that need a control grant (the host decides their scope, §B.8.4.1).
+    pub control: bool,
     /// `server_s_pk` of the host's OPAQUE setup, pinned at the first `SESSION_ACCEPT`.
     #[serde(with = "hex32")]
     pub server_s_pk_pin: Option<[u8; 32]>,
