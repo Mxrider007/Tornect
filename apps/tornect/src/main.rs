@@ -66,6 +66,12 @@ struct Cli {
     #[arg(long, global = true)]
     json_logs: bool,
 
+    /// Print the lines the live-check scripts read on stdout: the name of
+    /// the host a session views and this computer's Tornect ID (env:
+    /// TORNECT_EVIDENCE=1). Without it the window prints session ids only.
+    #[arg(long, global = true)]
+    evidence: bool,
+
     /// How to reach Tor: `auto` (direct, then obfs4 bridges, then Snowflake),
     /// `off` (direct only), `obfs4` or `snowflake`. Default: config `tor.bridges`.
     #[arg(long, global = true, value_name = "MODE", value_parser = parse_bridge_mode)]
@@ -389,6 +395,7 @@ fn main() -> anyhow::Result<()> {
         tornect_platform::attach_parent_console();
     }
     let cli = Cli::parse();
+    host::opt_in_evidence(cli.evidence);
     let _log_guard = telemetry::init(LogOptions {
         filter: cli.log.clone(),
         file_dir: None,
