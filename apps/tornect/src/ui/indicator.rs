@@ -135,6 +135,14 @@ pub fn top_right(
     PhysicalPosition::new((x.round() as i32).max(origin.x), y.round() as i32)
 }
 
+/// Whether the indicator is drawn as a see-through pill: where the desktop
+/// composites transparent windows (Windows, macOS, Wayland); on X11 a
+/// compositor may be missing, so there it is a square.
+#[must_use]
+pub fn rounded_here(wayland: bool) -> bool {
+    cfg!(any(windows, target_os = "macos")) || wayland
+}
+
 /// The window as it is asked for: always on top, no decorations, a fixed
 /// small size, not activated when it opens, at `position` where the desktop
 /// allows placement.
@@ -468,5 +476,70 @@ mod tests {
             actions.extend(texts(&ctx, raw, std::slice::from_ref(&a)).1);
         }
         assert_eq!(actions, vec![Action::MoveIndicator]);
+    }
+
+    /// What a text shape shows: its rows' glyphs, the ellipsis of a cut
+    /// included, never the characters cut away.
+    fn visible(shape: &egui::Shape, into: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(t) => into.push(
+                t.galley
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.row.glyphs.iter().map(|g| g.chr))
+                    .collect(),
+            ),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| visible(s, into)),
+            _ => {}
+        }
+    }
+
+    /// The indicator never cuts the headline, the mode or the clock, whatever
+    /// the label: with a crafted label of the most characters a label may
+    /// have, as a pill and as a square, what is drawn of each row starts
+    /// with them in full, and only the label is shortened.
+    #[test]
+    fn the_indicator_never_cuts_the_mode() {
+        let crafted: String = format!("Ana\" · view only · 00:04 {}", "x".repeat(64))
+            .chars()
+            .take(64)
+            .collect();
+        for rounded in [false, true] {
+            for (control, unattended, mode) in [
+                (true, false, "control"),
+                (false, false, "view only"),
+                (true, true, "control"),
+                (false, true, "view only"),
+            ] {
+                let ctx = egui::Context::default();
+                let mut s = captured(session("aa", &crafted, control), control);
+                s.unattended = unattended;
+                s.since = Instant::now() - Duration::from_secs(65);
+                let mut shown = Vec::new();
+                for _ in 0..2 {
+                    shown.clear();
+                    let out = ctx.run_ui(window_input(), |ui| {
+                        view::indicator_pill(
+                            ui,
+                            std::slice::from_ref(&s),
+                            Instant::now(),
+                            &mut Vec::new(),
+                            rounded,
+                        );
+                    });
+                    for clipped in &out.shapes {
+                        visible(&clipped.shape, &mut shown);
+                    }
+                    out.drop_without_applying_deltas();
+                }
+                let headline = if unattended { "UNATTENDED" } else { "SHARING" };
+                let first = format!("{headline} · {mode} · 01:05 · \"");
+                assert!(
+                    shown.iter().any(|t| t.starts_with(&first)),
+                    "rounded {rounded}: \"{first}\" not drawn whole in {shown:?}"
+                );
+                assert!(!shown.iter().any(|t| t.contains(&crafted)), "{shown:?}");
+            }
+        }
     }
 }

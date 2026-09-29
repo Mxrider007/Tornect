@@ -117,6 +117,20 @@ fn new_device(display: impl egui_wgpu::EguiDisplayHandle) -> WgpuSetup {
     WgpuSetup::CreateNew(setup)
 }
 
+/// Whether the windows are Wayland's (where every window is composited).
+fn wayland(el: &ActiveEventLoop) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use winit::platform::wayland::ActiveEventLoopExtWayland as _;
+        el.is_wayland()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = el;
+        false
+    }
+}
+
 /// The stream window's title: it names neither the host nor its address.
 pub const STREAM_TITLE: &str = "Tornect: remote screen";
 
@@ -128,6 +142,9 @@ struct Surface {
     painter: Painter,
     /// When egui asked to be drawn again.
     repaint_at: Option<Instant>,
+    /// What the window is cleared to before egui paints: see-through for a
+    /// window the desktop composites transparently (the indicator's pill).
+    clear: [f32; 4],
 }
 
 impl Surface {
@@ -136,6 +153,7 @@ impl Surface {
         attrs: WindowAttributes,
         setup: WgpuSetup,
         theme: egui::Theme,
+        transparent: bool,
     ) -> anyhow::Result<Self> {
         let window = Arc::new(el.create_window(attrs)?);
         let ctx = egui::Context::default();
@@ -147,7 +165,7 @@ impl Surface {
         let mut painter = pollster::block_on(Painter::new(
             ctx.clone(),
             config,
-            false,
+            transparent,
             RendererOptions::default(),
         ));
         pollster::block_on(painter.set_window(ViewportId::ROOT, Some(Arc::clone(&window))))
@@ -167,6 +185,11 @@ impl Surface {
             state,
             painter,
             repaint_at: None,
+            clear: if transparent {
+                [0.0, 0.0, 0.0, 0.0]
+            } else {
+                [0.0, 0.0, 0.0, 1.0]
+            },
         })
     }
 
@@ -196,7 +219,7 @@ impl Surface {
         self.painter.paint_and_update_textures(
             ViewportId::ROOT,
             out.pixels_per_point,
-            [0.0, 0.0, 0.0, 1.0],
+            self.clear,
             &clipped,
             &mut textures,
             Vec::new(),
@@ -235,6 +258,8 @@ pub struct App {
     indicator: Option<Surface>,
     /// Whether the indicator should be up, and what it shows.
     shown: Indicator,
+    /// The indicator is a see-through pill (the desktop composites it).
+    indicator_rounded: bool,
     /// The user closed the stream window of the session still in the model.
     stream_dismissed: bool,
     form: Form,
@@ -270,6 +295,7 @@ impl App {
             stream: None,
             indicator: None,
             shown: Indicator::default(),
+            indicator_rounded: false,
             stream_dismissed: false,
             form: Form::default(),
             quit_at: None,
@@ -335,7 +361,7 @@ impl App {
                 if let Some((x, y)) = self.stream_at {
                     attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
                 }
-                match Surface::new(el, attrs, setup, self.theme) {
+                match Surface::new(el, attrs, setup, self.theme, false) {
                     Ok(surface) => {
                         let max = surface.painter.max_texture_side().unwrap_or(8192);
                         self.stream = Some(StreamView {
@@ -398,7 +424,12 @@ impl App {
                         )
                     });
                 let setup = self.main_device(el);
-                match Surface::new(el, indicator::attributes(rows, position), setup, self.theme) {
+                // A pill where the desktop composites transparent windows,
+                // a square elsewhere.
+                self.indicator_rounded = indicator::rounded_here(wayland(el));
+                let attrs =
+                    indicator::attributes(rows, position).with_transparent(self.indicator_rounded);
+                match Surface::new(el, attrs, setup, self.theme, self.indicator_rounded) {
                     Ok(surface) => self.indicator = Some(surface),
                     Err(e) => {
                         // The banner in the main window still shows the
@@ -427,7 +458,9 @@ impl App {
         };
         let sharing = self.shared.read(|m| m.sharing.clone());
         let mut actions = Vec::new();
-        surface.paint(|ui| view::indicator(ui, &sharing, Instant::now(), &mut actions));
+        let rounded = self.indicator_rounded;
+        surface
+            .paint(|ui| view::indicator_pill(ui, &sharing, Instant::now(), &mut actions, rounded));
         for action in actions {
             self.act(action, None);
         }
@@ -697,7 +730,13 @@ impl ApplicationHandler<UserEvent> for App {
             .with_title(self.title)
             .with_inner_size(LogicalSize::new(1200.0, 760.0))
             .with_min_inner_size(LogicalSize::new(960.0, 640.0));
-        match Surface::new(el, attrs, new_device(el.owned_display_handle()), self.theme) {
+        match Surface::new(
+            el,
+            attrs,
+            new_device(el.owned_display_handle()),
+            self.theme,
+            false,
+        ) {
             Ok(surface) => {
                 self.main = Some(surface);
                 self.sync_indicator(el);
