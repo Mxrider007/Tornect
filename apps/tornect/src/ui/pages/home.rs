@@ -67,7 +67,14 @@ pub(super) fn home(
                 tallest = tallest.max(id_card(ui, t, model, form, now, min, actions));
             });
             ui.allocate_ui_with_layout(vec2(right, 0.0), Layout::top_down(Align::Min), |ui| {
-                tallest = tallest.max(connect_card(ui, t, model, form, min, actions));
+                tallest = tallest.max(connect_card(
+                    ui,
+                    t,
+                    model,
+                    form,
+                    (min, model.screen_shared(now)),
+                    actions,
+                ));
             });
         });
         if (tallest - min).abs() > 0.5 {
@@ -77,14 +84,15 @@ pub(super) fn home(
     } else {
         id_card(ui, t, model, form, now, 0.0, actions);
         ui.add_space(GAP - 8.0);
-        connect_card(ui, t, model, form, 0.0, actions);
+        connect_card(ui, t, model, form, (0.0, model.screen_shared(now)), actions);
     }
 
+    let shared = model.screen_shared(now);
     if !matches!(model.client, ClientStage::Idle) {
         ui.add_space(GAP - 8.0);
         widgets::card(ui, |ui| {
             ui.set_width(ui.available_width());
-            client_stage(ui, t, &model.client, actions);
+            client_stage(ui, t, &model.client, shared, actions);
         });
     }
 
@@ -94,6 +102,19 @@ pub(super) fn home(
     }
 
     ui.add_space(GAP);
+    if shared {
+        // While this screen may be in a picture that leaves it (P-M2): no
+        // saved name, no ID, no day, no recent line, nothing of what
+        // happened (its lines name computers and devices).
+        widgets::section_header(ui, "Saved computers");
+        super::hidden_card(
+            ui,
+            "Saved computers, recent connections and what happened since the window opened \
+             come back when sharing ends.",
+        );
+        ui.add_space(8.0);
+        return;
+    }
     saved(ui, t, model, form, actions);
     ui.add_space(GAP);
     recent(ui, t, model);
@@ -184,7 +205,7 @@ fn id_card(
             }
             // The address's own words sit under it, labelled "this address"
             // (§B.6.1 item 5); none while this computer is shared (R-W2).
-            let shared = !model.sharing.is_empty();
+            let shared = model.screen_shared(now);
             if let Some(mine) = model.mine.filter(|_| !shared) {
                 ui.add(
                     egui::Label::new(
@@ -239,6 +260,7 @@ fn id_card(
                 );
             });
             if form.qr
+                && !shared
                 && let Some(id) = &model.id
             {
                 ui.horizontal_top(|ui| {
@@ -367,7 +389,7 @@ fn connect_card(
     t: &Tokens,
     model: &Model,
     form: &mut Form,
-    min_height: f32,
+    (min_height, shared): (f32, bool),
     actions: &mut Vec<Action>,
 ) -> f32 {
     let mut needs = 0.0;
@@ -411,14 +433,21 @@ fn connect_card(
             .filter(|u| parsed.as_ref().is_ok_and(|id| id == u));
         let second_click = warned.map(|w| w.id).or(unchecked);
         if let Some(warning) = warned {
+            // Never the saved name while this screen may be in a picture
+            // that leaves it.
+            let text = if shared {
+                "Looks like a saved computer, but it is a different address.".to_owned()
+            } else {
+                format!(
+                    "Looks like your saved \"{}\", but it is a different address.",
+                    warning.name
+                )
+            };
             ui.add(
                 egui::Label::new(
-                    RichText::new(format!(
-                        "Looks like your saved \"{}\", but it is a different address.",
-                        warning.name
-                    ))
-                    .font(theme::font(ui.ctx(), Face::Semibold, 13.0))
-                    .color(t.danger_text),
+                    RichText::new(text)
+                        .font(theme::font(ui.ctx(), Face::Semibold, 13.0))
+                        .color(t.danger_text),
                 )
                 .wrap(),
             );
@@ -636,7 +665,13 @@ fn setup_card(ui: &mut Ui, t: &Tokens, setup: &Setup, sharing: bool, actions: &m
 }
 
 /// Where the session this computer asked for stands.
-fn client_stage(ui: &mut Ui, t: &Tokens, stage: &ClientStage, actions: &mut Vec<Action>) {
+fn client_stage(
+    ui: &mut Ui,
+    t: &Tokens,
+    stage: &ClientStage,
+    shared: bool,
+    actions: &mut Vec<Action>,
+) {
     match stage {
         ClientStage::Idle => {}
         ClientStage::Reaching { id } => {
@@ -677,8 +712,12 @@ fn client_stage(ui: &mut Ui, t: &Tokens, stage: &ClientStage, actions: &mut Vec<
                 ui.add(
                     egui::Label::new(
                         RichText::new(format!(
-                            "Connected to \"{}\" ({}): the picture is in its own window.",
-                            viewing.host,
+                            "Connected{} ({}): the picture is in its own window.",
+                            if shared {
+                                String::new()
+                            } else {
+                                format!(" to \"{}\"", viewing.host)
+                            },
                             if viewing.control {
                                 "control"
                             } else {

@@ -137,6 +137,15 @@ pub struct Model {
     /// administrator helper in this build): each says so and keeps its other
     /// answers open (§B.2.1).
     pub admin_not_given: HashSet<u64>,
+    /// When the person here last allowed a session: from that click on, the
+    /// screen counts as shared, before the session is live and before any
+    /// picture can leave, until [`Model::ACCEPTED_HIDES_FOR`] has passed
+    /// without the session starting.
+    pub accepted: Option<Instant>,
+    /// Another Tornect process holds this home's host lock: it may be
+    /// sharing this screen, which this window cannot see, so the window
+    /// hides what it would hide while sharing.
+    pub hosted_elsewhere: bool,
     /// The tokio side has finished shutting down.
     pub closed: bool,
 }
@@ -144,6 +153,24 @@ pub struct Model {
 impl Model {
     /// How many [`Model::events`] are kept.
     pub const EVENTS_KEPT: usize = 6;
+
+    /// How long an accepted session counts as sharing before it goes live:
+    /// the host sends its accept at once, and a session that has not started
+    /// by then never will (the client has 15 s to go on, §B.8.4.5).
+    pub const ACCEPTED_HIDES_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Whether this computer's screen may be in a picture that leaves it at
+    /// `now`: a session of this window's host is live, one was just allowed,
+    /// or another Tornect process hosts this home. The pages then hide the
+    /// address book's names, IDs, days and devices.
+    #[must_use]
+    pub fn screen_shared(&self, now: Instant) -> bool {
+        !self.sharing.is_empty()
+            || self.hosted_elsewhere
+            || self
+                .accepted
+                .is_some_and(|at| now.saturating_duration_since(at) < Self::ACCEPTED_HIDES_FOR)
+    }
 
     /// Remember that `what` happened.
     pub fn note(&mut self, what: impl Into<String>) {
