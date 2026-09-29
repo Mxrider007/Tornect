@@ -103,6 +103,11 @@ fn service_change(ctx: &HostContext, id: u64, by: Actor, install: Option<bool>) 
             if ctx.kill.is_some() {
                 return IpcResponse::fail(id, codes::G_PRECONDITION, HOST_ROUTE_INSTALL);
             }
+            // r7: the whole-host elevated task is gone (an older command
+            // line may still ask for it), refused before any dialog.
+            if elevated {
+                return IpcResponse::fail(id, codes::G_PRECONDITION, autostart::ELEVATED_TASK_GONE);
+            }
             if let Err(e) = ctx.autostart.preflight(elevated) {
                 return IpcResponse::fail(id, codes::G_PRECONDITION, e.to_string());
             }
@@ -666,15 +671,9 @@ impl From<PresetArg> for Preset {
 /// `tornect service …` (§B.8.7.5).
 #[derive(Subcommand, Debug)]
 pub enum ServiceCmd {
-    /// Register Tornect to start at login.
-    Install {
-        /// Windows only, and an administrator account only: an elevated task
-        /// (§B.8.7.5, opt-in). Every remote Control session is then an
-        /// administrator session. A standard account is refused: approved
-        /// with another account's password, the task would be that account's.
-        #[arg(long)]
-        elevated: bool,
-    },
+    /// Register Tornect to start at login (on Windows also removing an
+    /// earlier version's elevated task, through Windows' prompt).
+    Install,
     /// Remove the autostart registration.
     Uninstall,
     /// Report whether autostart is registered.
@@ -1777,11 +1776,6 @@ const AFTER_LOGIN_ONLY: &str = "The host starts only after you log in: Tornect n
 const LOGIN_HOST_PINGS_ONLY: &str = "Started at login, the host answers pings only and refuses \
      every session, because it has no window or terminal to show one.";
 
-/// §B.8.7.5's opt-in copy for the elevated task, said before its dialog and
-/// again once it is registered (slice-F F1-3).
-const ELEVATED_SENTENCE: &str = "Running the host elevated makes every remote Control session an \
-     administrator session.";
-
 /// `tornect service install|uninstall|status`
 ///
 /// `install` and `uninstall` change what starts at login, which is
@@ -1790,24 +1784,17 @@ const ELEVATED_SENTENCE: &str = "Running the host elevated makes every remote Co
 /// asks for the OS password. `status` only reads the registration, here.
 pub fn service(paths: &Paths, cmd: ServiceCmd) -> anyhow::Result<()> {
     let op = match cmd {
-        ServiceCmd::Install { elevated } => IpcOp::ServiceInstall { elevated },
+        ServiceCmd::Install => IpcOp::ServiceInstall { elevated: false },
         ServiceCmd::Uninstall => IpcOp::ServiceUninstall,
         ServiceCmd::Status => return service_status(paths),
     };
     let installing = matches!(op, IpcOp::ServiceInstall { .. });
-    let elevated = matches!(op, IpcOp::ServiceInstall { elevated: true });
-    if elevated {
-        println!("{ELEVATED_SENTENCE}");
-    }
     runtime()?.block_on(async move {
         let route = route(paths).await?;
         let resp = send(paths, &route, op).await?;
         require_ok(&resp)?;
         if let Some(d) = &resp.detail {
             println!("{d}.");
-        }
-        if elevated {
-            println!("{ELEVATED_SENTENCE}");
         }
         if installing {
             if cfg!(target_os = "linux") {
@@ -2023,15 +2010,25 @@ mod tests {
         dispatch(ctx, IpcRequest { id: 1, op })
     }
 
-    /// Slice-F F1-3: `service install --elevated` says §B.8.7.5's sentence,
-    /// word for word.
+    /// r7 (the operator's ruling of 2026-09-28): the whole-host elevated
+    /// task is gone; a request for it (an older command line) is refused
+    /// before any dialog, saying why, and nothing is registered or logged.
     #[test]
-    fn the_elevated_install_says_what_it_means() {
-        assert_eq!(
-            ELEVATED_SENTENCE,
-            "Running the host elevated makes every remote Control session an administrator \
-             session."
+    fn the_elevated_install_is_refused_and_says_why() {
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let env = env_with_autostart(
+            tempfile::tempdir().unwrap(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(NoSessionActivity),
+            FakeAutostart::default(),
         );
+        let resp = go(&env.ctx, IpcOp::ServiceInstall { elevated: true });
+        assert!(!resp.ok);
+        assert_eq!(resp.code, codes::G_PRECONDITION);
+        assert_eq!(resp.detail.as_deref(), Some(autostart::ELEVATED_TASK_GONE));
+        assert!(env.autostart.installs().is_empty());
+        assert!(reauth.calls().is_empty(), "no dialog");
+        assert!(autostart_lines(&env.ctx).is_empty());
     }
 
     /// Slice-F F2-1: what `service install` says on Linux about the host it
@@ -2665,10 +2662,6 @@ mod tests {
             }));
         for (op, name) in [
             (IpcOp::ServiceInstall { elevated: false }, "service_install"),
-            (
-                IpcOp::ServiceInstall { elevated: true },
-                "service_install_elevated",
-            ),
             (IpcOp::ServiceUninstall, "service_uninstall"),
         ] {
             let resp = go(&env.ctx, op);
@@ -2681,10 +2674,7 @@ mod tests {
         );
         assert_eq!(env.autostart.uninstalls(), 0, "nothing was removed");
         assert!(autostart_lines(&env.ctx).is_empty());
-        // Slice-F F1-3: the elevated install is its own operation, so its
-        // dialog can say what it means.
         assert_eq!(refused_lines(&env.ctx, "service_install"), 1);
-        assert_eq!(refused_lines(&env.ctx, "service_install_elevated"), 1);
         assert_eq!(refused_lines(&env.ctx, "service_uninstall"), 1);
     }
 
@@ -2799,10 +2789,6 @@ mod tests {
         let said = resp.detail.unwrap_or_default();
         assert!(said.contains("/opt/tornect"), "{said}");
 
-        let resp = go(&env.ctx, IpcOp::ServiceInstall { elevated: true });
-        assert!(resp.ok, "{:?}", resp.detail);
-        assert_eq!(env.autostart.installs(), vec![false, true]);
-
         let resp = go(&env.ctx, IpcOp::ServiceUninstall);
         assert!(resp.ok, "{:?}", resp.detail);
         assert_eq!(env.autostart.uninstalls(), 1);
@@ -2812,11 +2798,7 @@ mod tests {
             .iter()
             .map(|(_, d, _)| d.as_deref().unwrap_or(""))
             .collect();
-        assert_eq!(
-            details,
-            ["install", "install (elevated)", "uninstall"],
-            "{lines:?}"
-        );
+        assert_eq!(details, ["install", "uninstall"], "{lines:?}");
         assert!(
             lines.iter().all(|(by, _, _)| *by == Some(Actor::Cli)),
             "{lines:?}"
@@ -3008,8 +2990,12 @@ mod tests {
         let resp = go(&env.ctx, IpcOp::Status);
         let report: StatusReport = decode_payload(resp.payload.as_deref().unwrap()).unwrap();
         assert_eq!(report.readiness.autostart, Probe::Ok);
-        assert!(go(&env.ctx, IpcOp::ServiceInstall { elevated: true }).ok);
-        assert!(matches!(read(&env.ctx), Probe::Warn(m) if m.contains("administrator session")));
+        assert!(!go(&env.ctx, IpcOp::ServiceInstall { elevated: true }).ok);
+        assert_eq!(
+            read(&env.ctx),
+            Probe::Ok,
+            "the refused elevated task changed nothing"
+        );
     }
 
     /// The registration runs this executable's host for this home: the default

@@ -154,7 +154,8 @@ pub fn readiness_probe(status: &Result<AutostartState, AutostartError>) -> Probe
         )),
         Ok(AutostartState::Registered(r)) if r.enabled && r.elevated => Probe::Warn(
             "the host starts ELEVATED at login: every remote Control session is an \
-             administrator session"
+             administrator session; this task is from an earlier version, and `tornect service \
+             install` or `uninstall` removes it"
                 .to_owned(),
         ),
         Ok(AutostartState::Registered(r)) if r.enabled => Probe::Ok,
@@ -1240,6 +1241,39 @@ pub fn classify_task_query(
     }
 }
 
+/// Why the whole-host elevated task (M1-53) is refused since r7 (§B.8.7.5,
+/// decision M1-57; the operator's ruling of 2026-09-28): administrator access
+/// is given per session by the administrator helper, and nothing
+/// network-facing runs elevated.
+pub const ELEVATED_TASK_GONE: &str = "the elevated start-at-login task is gone: administrator \
+     access is now given per session (\"Allow as administrator\"), and nothing that talks to the \
+     network runs elevated; run `tornect service install` for the normal task";
+
+/// Migration (r7, §B.8.7.5; review DA-3, DA-13): a whole-host elevated task
+/// of an earlier version (M1-53) — or one this account cannot read, which may
+/// be one — is removed through the UAC prompt (F1-1's elevated delete) and
+/// its absence confirmed. `Ok(true)`: one was removed; `Ok(false)`: there was
+/// none. A cancelled prompt or a failed removal is an error: the plain task
+/// is never registered beside it.
+pub fn migrate_elevated_task(ts: &dyn TaskScheduling) -> Result<bool, AutostartError> {
+    match task_status(ts)? {
+        AutostartState::Registered(r) if r.elevated || r.unreadable => {}
+        _ => return Ok(false),
+    }
+    ts.change(&SchtasksCall::Delete, true)?;
+    match task_status(ts) {
+        Ok(AutostartState::Absent) => Ok(true),
+        Ok(_) => Err(AutostartError::Failed(format!(
+            "the elevated task of an earlier version is still registered after the delete; \
+             {MANUAL_TASK_DELETE}"
+        ))),
+        Err(e) => Err(AutostartError::Failed(format!(
+            "could not confirm that the elevated task of an earlier version is gone ({e}); \
+             {MANUAL_TASK_DELETE}"
+        ))),
+    }
+}
+
 /// Why a standard account may not register the elevated task (decided
 /// 2026-09-24, slice-F review §3.2).
 pub const ELEVATED_NEEDS_ADMINISTRATOR: &str = "`--elevated` needs an administrator account, and \
@@ -1681,16 +1715,21 @@ impl Autostart for TaskScheduler {
                 self.schtasks.display()
             )));
         }
-        // Before the password dialog: a standard account never gets the
-        // elevated task, whatever it would type.
+        // r7: the whole-host elevated task is gone (the administrator
+        // helper replaces it), refused before any dialog.
         if elevated {
-            elevated_task_account_ok(self)?;
+            return Err(AutostartError::Unavailable(ELEVATED_TASK_GONE.to_owned()));
         }
         self.xml(elevated).map(drop)
     }
 
     fn install(&self, elevated: bool) -> Result<AutostartState, AutostartError> {
         self.preflight(elevated)?;
+        // Migration: an earlier version's elevated task goes first, through
+        // the UAC prompt; the two are never registered together.
+        if migrate_elevated_task(self)? {
+            tracing::info!("removed the elevated start-at-login task of an earlier version");
+        }
         let xml = self.xml(elevated)?;
         // Slice-F F1-2: in this user's own local application data folder,
         // from the OS, never `%TEMP%`, which the environment can point at a
@@ -2398,6 +2437,63 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// Migration (r7; DA-3, DA-13): an earlier version's elevated task, or
+    /// an unreadable one, is removed through the UAC prompt before the plain
+    /// task; a plain task stays; a refused or ineffective delete fails, so
+    /// the two are never registered together.
+    #[test]
+    fn an_earlier_elevated_task_is_removed_through_the_uac_prompt() {
+        for (task, removed) in [
+            (
+                FakeTask {
+                    readable: true,
+                    elevated: true,
+                    swap: None,
+                },
+                true,
+            ),
+            (
+                FakeTask {
+                    readable: false,
+                    elevated: false,
+                    swap: None,
+                },
+                true,
+            ),
+            (
+                FakeTask {
+                    readable: true,
+                    elevated: false,
+                    swap: None,
+                },
+                false,
+            ),
+        ] {
+            let ts = FakeTasks::with(task);
+            assert_eq!(migrate_elevated_task(&ts).unwrap(), removed, "{task:?}");
+            if removed {
+                assert_eq!(ts.calls(), vec![("Delete".to_owned(), true)], "{task:?}");
+                assert!(ts.task.lock().unwrap().is_none());
+            } else {
+                assert!(ts.calls().is_empty(), "{task:?}");
+            }
+        }
+        assert!(
+            !migrate_elevated_task(&FakeTasks::default()).unwrap(),
+            "none"
+        );
+        let stuck = FakeTasks {
+            delete_is_a_no_op: true,
+            ..FakeTasks::with(FakeTask {
+                readable: true,
+                elevated: true,
+                swap: None,
+            })
+        };
+        assert!(migrate_elevated_task(&stuck).is_err(), "still there");
+        assert!(ELEVATED_TASK_GONE.contains("per session"));
     }
 
     /// The definition `task_install` wrote for the fake's executable.
