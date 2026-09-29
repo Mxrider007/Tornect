@@ -8,6 +8,10 @@
 
 #![forbid(unsafe_code)]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
+// Windows: a window-subsystem program, so opening the window starts no
+// console (Privacy U3-M1); the command line attaches to the console it was
+// started from (`tornect_platform::attach_parent_console`).
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 // `+crt-static` comes from `.cargo/config.toml`, and a `RUSTFLAGS` variable
 // silently replaces it; a dynamically linked `tornect.exe` would then load
@@ -18,6 +22,7 @@ compile_error!(
      or add `-C target-feature=+crt-static` to it"
 );
 
+mod helper_cmd;
 mod history;
 mod host;
 mod prompt;
@@ -349,6 +354,24 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     tornect_platform::restrict_dll_search()
         .context("restricting where Windows may load DLLs from")?;
+    // The administrator helper (§B.8.7.5) runs before anything reads the
+    // environment, a config or a file (H2): not the parser (`--home` reads
+    // `TORNECT_HOME`), not the log, not the paths.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == "input-helper")
+    {
+        std::process::exit(helper_cmd::run(
+            &std::env::args_os().skip(2).collect::<Vec<_>>(),
+        ));
+    }
+    // Windows: with arguments, print to the console this was started from
+    // (a window-subsystem program has none of its own); without, the window
+    // opens and no console appears.
+    #[cfg(windows)]
+    if std::env::args_os().len() > 1 {
+        tornect_platform::attach_parent_console();
+    }
     let cli = Cli::parse();
     let _log_guard = telemetry::init(LogOptions {
         filter: cli.log.clone(),

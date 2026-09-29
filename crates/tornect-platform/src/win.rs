@@ -46,6 +46,23 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use windows_sys::core::{BOOL, PWSTR};
 
+/// Attach to the parent's console when the standard output has no handle
+/// (a window-subsystem program started from a terminal); a redirected
+/// output keeps its handle. Fails harmlessly without a parent console.
+pub(crate) fn attach_parent_console() {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+    // SAFETY: plain call.
+    let out = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if !out.is_null() && out != INVALID_HANDLE_VALUE {
+        return;
+    }
+    // SAFETY: plain call.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
 /// `s` as a NUL-terminated UTF-16 string.
 pub(crate) fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
