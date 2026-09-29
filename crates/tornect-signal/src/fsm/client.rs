@@ -34,6 +34,7 @@ use crate::messages::{
 };
 use crate::pairing::{BoxFuture, KnownHostStore, Sas, lock, normalize_label};
 use crate::transcript::{HostSigner, verify_envelope};
+use tornect_core::session_log::SessionMode;
 
 /// The time left until `deadline` (`None` is no deadline), or `Timeout(what)`
 /// once it has passed. Checked before every read, so a peer whose frames are
@@ -94,6 +95,28 @@ pub enum Intent {
     /// password proven with the PAKE instead. Pairing must already have happened
     /// (a grant exists only for a SAS-paired device, §B.8 hard rule 2).
     Unattended(UnattendedIntent),
+}
+
+/// One admin command (§B.8.4.1, B.8.10's host-card actions), sent by [`admin`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct AdminIntent {
+    /// The grant password. Never logged, never persisted by this crate.
+    pub password: Zeroizing<String>,
+    /// A [`messages::admin_op`] value.
+    pub op: u8,
+    /// The device the command names (`revoke`, `unlock`, `suspend`); `None`
+    /// for the others.
+    pub device_pk: Option<[u8; 32]>,
+}
+
+impl fmt::Debug for AdminIntent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdminIntent")
+            .field("password", &"<redacted>")
+            .field("op", &self.op)
+            .field("device", &self.device_pk.is_some())
+            .finish()
+    }
 }
 
 /// What an unattended client needs beyond the attended path.
@@ -250,6 +273,8 @@ pub struct ClientSession<S> {
     accept: SessionAccept,
     token: SessionToken,
     host_label: String,
+    /// The administrator level this side asked for (none for attended).
+    asked_elevation: Elevation,
     random: Arc<dyn Randomness>,
     /// M2 frames that arrived while [`ClientSession::ping`] waited for its
     /// `PONG`; [`ClientSession::next_event`] hands them out first.
@@ -276,6 +301,21 @@ where
     #[must_use]
     pub fn host_label(&self) -> &str {
         &self.host_label
+    }
+
+    /// Whether the session is unattended (the signed accept's `session_type`).
+    #[must_use]
+    pub fn unattended(&self) -> bool {
+        self.accept.session_type() == messages::session_type::UNATTENDED
+    }
+
+    /// The administrator level was asked for and the host's signed accept gave
+    /// none: the session goes on at the signed level, and the window says that
+    /// administrator access is unavailable at the host (M-FEAT-2 F-8). An
+    /// accept *above* the request never gets this far (`E_BAD_STATE`).
+    #[must_use]
+    pub fn elevation_withheld(&self) -> bool {
+        self.asked_elevation == Elevation::Admin && self.accept.elevation() != Elevation::Admin
     }
 
     /// The transcript hash at the end of the handshake.
@@ -482,6 +522,15 @@ pub enum ClientOutcome<S> {
     Session(Box<ClientSession<S>>),
 }
 
+/// The host's signed answer to an admin command ([`admin`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminAnswer {
+    /// Whether the host ran the command (`false`: out of the grant's scope).
+    pub ok: bool,
+    /// Untrusted free text.
+    pub detail: Option<String>,
+}
+
 impl<S> core::fmt::Debug for ClientOutcome<S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -498,14 +547,23 @@ impl<S> core::fmt::Debug for ClientOutcome<S> {
     }
 }
 
-/// Run the client side over `stream` (already connected to `cfg.host`).
-pub async fn connect<S>(
+/// The channel after `HELLO` → `HELLO_ACK` (§B.2), shared by every intent.
+struct Greeted<S> {
+    chan: Channel<S>,
+    host_pk: VerifyingKey,
+    known: Option<tornect_core::trusted::KnownHost>,
+    /// `th_after(HELLO_ACK)`: the SAS input.
+    th_hello_ack: [u8; 32],
+    sas_nonce: [u8; 32],
+}
+
+/// `HELLO` (signed) → `HELLO_ACK` (verified against the dialed address).
+async fn greet<S>(
     stream: S,
     cfg: &ClientConfig,
     identity: &DeviceIdentity,
     deps: &ClientDeps,
-    intent: Intent,
-) -> Result<ClientOutcome<S>, HandshakeError>
+) -> Result<Greeted<S>, HandshakeError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -554,6 +612,57 @@ where
     chan.set_version(ack.v);
     // th_after(HELLO_ACK): the SAS input, taken before PAIR_REQUEST is absorbed.
     let th_hello_ack = chan.th();
+    Ok(Greeted {
+        chan,
+        host_pk,
+        known,
+        th_hello_ack,
+        sas_nonce,
+    })
+}
+
+/// Send one admin command to a paired host on the grant's two factors
+/// (`intent = admin`, §B.8.4.1): one PAKE attempt, then the host's signed
+/// `ADMIN_RESULT` (or a reject), and the host closes. No session, no popup;
+/// the host decides the scope (out of scope is `ok: false`). An unknown host
+/// is refused before anything is sent: admin commands never pair.
+pub async fn admin<S>(
+    stream: S,
+    cfg: &ClientConfig,
+    identity: &DeviceIdentity,
+    deps: &ClientDeps,
+    command: &AdminIntent,
+) -> Result<AdminAnswer, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    if deps.known_hosts.get(&cfg.host).is_none() {
+        return Err(HandshakeError::Aborted(
+            "admin commands go only to a paired host",
+        ));
+    }
+    let Greeted { chan, host_pk, .. } = greet(stream, cfg, identity, deps).await?;
+    admin_command(chan, cfg, identity, deps, command, host_pk).await
+}
+
+/// Run the client side over `stream` (already connected to `cfg.host`).
+pub async fn connect<S>(
+    stream: S,
+    cfg: &ClientConfig,
+    identity: &DeviceIdentity,
+    deps: &ClientDeps,
+    intent: Intent,
+) -> Result<ClientOutcome<S>, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let Greeted {
+        mut chan,
+        host_pk,
+        known,
+        th_hello_ack,
+        sas_nonce,
+    } = greet(stream, cfg, identity, deps).await?;
 
     // PAIR path. A host that already trusts this device expects
     // `SESSION_REQUEST` next (§B.2, §B.8.4.5), so pairing is attempted only
@@ -655,6 +764,7 @@ where
         accept,
         token,
         host_label,
+        asked_elevation: Elevation::None,
         random: Arc::clone(&deps.random),
         pending: VecDeque::new(),
     })))
@@ -716,23 +826,35 @@ where
     Ok((host_name, accept.host_device_pk))
 }
 
-/// The `SESSION_REQUEST{unattended}` … `SESSION_ACCEPT` exchange of §B.8.4.2.
-///
-/// Runs after `HELLO` / `HELLO_ACK` (and pairing, if the host was unknown), so
-/// `chan` is already at `th_after(HELLO_ACK)` or later and the host key is
-/// verified. Strict alternation applies throughout (§B.8.4.5): the only frames
-/// this side may see are `AUTH_CHALLENGE`, then `SESSION_ACCEPT` / `SESSION_REJECT`.
-#[allow(clippy::too_many_arguments)]
-async fn unattended_session<S>(
-    mut chan: Channel<S>,
+/// What one `SESSION_REQUEST{unattended}` asks, besides the suite and `ke1`.
+struct Asked {
+    want_mode: u8,
+    intent: u8,
+    admin: Option<messages::AdminCmd>,
+    want_elevation: Option<u8>,
+}
+
+/// What [`authenticate`] proved: the host's answer verified under the
+/// password and the proof sent.
+struct Proven {
+    out: auth::ClientLoginOutput,
+    th_after_response: [u8; 32],
+}
+
+/// `SESSION_REQUEST{unattended}` → `AUTH_CHALLENGE` → `AUTH_RESPONSE` (§B.8.4.2):
+/// one PAKE attempt on this stream, never repeated here — a wrong password
+/// ends with [`HandshakeError::PasswordRefused`] and a changed OPAQUE key with
+/// [`HandshakeError::ServerKeyChanged`], both before any proof is sent; the
+/// suite is this build's constant, and an `AUTH_CHALLENGE` of another suite is
+/// `E_BAD_LEN`, never answered with a second one.
+async fn authenticate<S>(
+    chan: &mut Channel<S>,
     cfg: &ClientConfig,
     identity: &DeviceIdentity,
     deps: &ClientDeps,
-    ua: &UnattendedIntent,
-    host_pk: VerifyingKey,
-    host_label: String,
-    host_device_pk: [u8; 32],
-) -> Result<ClientOutcome<S>, HandshakeError>
+    password: &Zeroizing<String>,
+    asked: Asked,
+) -> Result<Proven, HandshakeError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -740,19 +862,20 @@ where
     let device_pk = HostSigner::public_key(identity);
 
     // A fresh ClientLogin per stream: the OPRF blind must never be reused.
-    let (login, ke1) = auth::ClientLogin::start(&ua.password)
+    let (login, ke1) = auth::ClientLogin::start(password)
         .map_err(|_| HandshakeError::Aborted("PAKE start failed"))?;
 
+    let intent = asked.intent;
     let request = SessionRequest {
         caps: cfg.caps.clone(),
         unattended: Some(messages::UnattendedRequest {
+            // The build-time suite (§B.8.4.2): never taken from `HELLO_ACK.feats`.
             suite: auth::SUITE_OPAQUE,
             ke1: Some(ke1),
-            want_mode: ua.want_mode,
-            intent: messages::intent::SESSION,
-            admin: None,
-            want_elevation: (ua.want_elevation == Elevation::Admin)
-                .then_some(Elevation::Admin.code()),
+            want_mode: asked.want_mode,
+            intent,
+            admin: asked.admin,
+            want_elevation: asked.want_elevation,
         }),
     };
     chan.send(&request, Some(identity)).await?;
@@ -784,13 +907,9 @@ where
         return Err(chan.fail(codes::E_BAD_LEN, "ke2").await);
     };
 
-    let ctx = auth::context(
-        &th_after_request,
-        auth::SUITE_OPAQUE,
-        messages::intent::SESSION,
-    );
+    let ctx = auth::context(&th_after_request, auth::SUITE_OPAQUE, intent);
     let ids = auth::identifiers(&device_pk, host_onion_pk);
-    let out = match login.finish(&ua.password, &ke2, &ctx, ids) {
+    let out = match login.finish(password, &ke2, &ctx, ids) {
         Ok(out) => out,
         Err(_) => {
             // §B.8.4.2: the server MAC failed — either the password is wrong or
@@ -798,7 +917,7 @@ where
             // than dropping the stream: the host is waiting out its 30 s
             // `AwaitKe3` timer otherwise, holding a charged in-flight slot.
             chan.bye(messages::bye::CLIENT_AUTH_ABORT).await?;
-            return Err(HandshakeError::Aborted("unattended authentication failed"));
+            return Err(HandshakeError::PasswordRefused);
         }
     };
 
@@ -807,9 +926,7 @@ where
     match deps.server_key_pin.check(&cfg.host, &out.server_s_pk) {
         PinCheck::Mismatch => {
             chan.close().await;
-            return Err(HandshakeError::Aborted(
-                "the host's unattended setup changed: pin mismatch",
-            ));
+            return Err(HandshakeError::ServerKeyChanged);
         }
         PinCheck::Match | PinCheck::NoPin => {}
     }
@@ -824,6 +941,109 @@ where
     )
     .await?;
     let th_after_response = chan.th();
+    Ok(Proven {
+        out,
+        th_after_response,
+    })
+}
+
+/// [`admin`] after the greeting: one command on the grant's two factors
+/// (§B.8.4.1). The host answers a signed `ADMIN_RESULT` (or a reject) and closes.
+async fn admin_command<S>(
+    mut chan: Channel<S>,
+    cfg: &ClientConfig,
+    identity: &DeviceIdentity,
+    deps: &ClientDeps,
+    admin: &AdminIntent,
+    host_pk: VerifyingKey,
+) -> Result<AdminAnswer, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    authenticate(
+        &mut chan,
+        cfg,
+        identity,
+        deps,
+        &admin.password,
+        Asked {
+            // No session follows; the most restrictive mode asks for nothing.
+            want_mode: messages::mode::VIEW_ONLY,
+            intent: messages::intent::ADMIN,
+            admin: Some(messages::AdminCmd {
+                op: admin.op,
+                device_pk: admin.device_pk,
+            }),
+            want_elevation: None,
+        },
+    )
+    .await?;
+    let rx = chan
+        .recv_expect(
+            timeouts::SESSION_ACCEPT,
+            "ADMIN_RESULT",
+            &[Kind::AdminResult, Kind::SessionReject],
+        )
+        .await?;
+    if rx.env.kind == Kind::SessionReject {
+        let reject: SessionReject = chan.body(&rx).await?;
+        chan.absorb(&rx);
+        chan.close().await;
+        return Err(HandshakeError::SessionRejected {
+            reject: Box::new(reject),
+        });
+    }
+    let result: messages::AdminResult = chan.body(&rx).await?;
+    if verify_envelope(&host_pk, &chan.th(), &rx.env).is_err() {
+        return Err(chan.fail(codes::E_BAD_SIG, "signature").await);
+    }
+    chan.absorb(&rx);
+    chan.close().await;
+    tracing::info!(host = %cfg.host.short(), op = admin.op, ok = result.ok, "admin command answered");
+    Ok(AdminAnswer {
+        ok: result.ok,
+        detail: result.detail,
+    })
+}
+
+/// The `SESSION_REQUEST{unattended}` … `SESSION_ACCEPT` exchange of §B.8.4.2.
+///
+/// Runs after `HELLO` / `HELLO_ACK` (and pairing, if the host was unknown), so
+/// `chan` is already at `th_after(HELLO_ACK)` or later and the host key is
+/// verified. Strict alternation applies throughout (§B.8.4.5): the only frames
+/// this side may see are `AUTH_CHALLENGE`, then `SESSION_ACCEPT` / `SESSION_REJECT`.
+#[allow(clippy::too_many_arguments)]
+async fn unattended_session<S>(
+    mut chan: Channel<S>,
+    cfg: &ClientConfig,
+    identity: &DeviceIdentity,
+    deps: &ClientDeps,
+    ua: &UnattendedIntent,
+    host_pk: VerifyingKey,
+    host_label: String,
+    host_device_pk: [u8; 32],
+) -> Result<ClientOutcome<S>, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let Proven {
+        out,
+        th_after_response,
+    } = authenticate(
+        &mut chan,
+        cfg,
+        identity,
+        deps,
+        &ua.password,
+        Asked {
+            want_mode: ua.want_mode,
+            intent: messages::intent::SESSION,
+            admin: None,
+            want_elevation: (ua.want_elevation == Elevation::Admin)
+                .then_some(Elevation::Admin.code()),
+        },
+    )
+    .await?;
 
     // SESSION_ACCEPT within the fixed 110 s budget (§B.8.4.5): grant policy is
     // not disclosed before it, so the wait is deliberately uninformative.
@@ -867,10 +1087,27 @@ where
     if !bool::from(accept.quic_spki()[..].ct_eq(&expected_spki[..])) {
         return Err(chan.fail(codes::E_BAD_SIG, "quic_spki").await);
     }
-    if mode_from_code(accept.mode()).is_none()
-        || TransportPolicy::from_code(accept.transport_policy()).is_none()
-    {
+    let Some(given) = mode_from_code(accept.mode()) else {
         return Err(chan.fail(codes::E_BAD_LEN, "mode").await);
+    };
+    if TransportPolicy::from_code(accept.transport_policy()).is_none() {
+        return Err(chan.fail(codes::E_BAD_LEN, "mode").await);
+    }
+    // M-FEAT-2 F-8: the host clamps toward the safe direction (§B.8.4.1), so an
+    // accept above this request — control for a view-only request, or the
+    // administrator level unasked — is a clamp bug or worse: a protocol
+    // violation, closed before anything is recorded. Below the request is the
+    // clamp working: the session goes on at the signed level.
+    let asked = mode_from_code(ua.want_mode).unwrap_or(SessionMode::ViewOnly);
+    if SessionMode::most_restrictive(asked, given) != given {
+        return Err(chan
+            .fail(codes::E_BAD_STATE, "mode above the request")
+            .await);
+    }
+    if accept.elevation() == Elevation::Admin && ua.want_elevation != Elevation::Admin {
+        return Err(chan
+            .fail(codes::E_BAD_STATE, "level above the request")
+            .await);
     }
 
     // Only now, with the host's proof verified, is the key worth remembering.
@@ -882,6 +1119,7 @@ where
         accept,
         token,
         host_label,
+        asked_elevation: ua.want_elevation,
         random: Arc::clone(&deps.random),
         pending: VecDeque::new(),
     })))
