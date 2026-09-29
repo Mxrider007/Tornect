@@ -115,12 +115,17 @@ pub struct ServerFacts {
     pub image: Option<String>,
     /// Its Windows session id, when it could be read.
     pub session: Option<u32>,
+    /// Whether its executable is the same file as the helper's own — the
+    /// volume serial number and file index of both, opened — when that
+    /// could be read (review F-10).
+    pub same_file: Option<bool>,
 }
 
 /// What the helper knows about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelperSelf {
-    /// Its own executable's full path (Windows started it from there).
+    /// Its own executable's full path, as the open file resolves it
+    /// (`GetFinalPathNameByHandleW`; review F-10).
     pub image: String,
     /// Its own Windows session id.
     pub session: u32,
@@ -147,6 +152,8 @@ pub fn check_server(
     if server.pid != host_pid {
         return Err("the pipe's server is not the process that started this helper");
     }
+    // Where this helper's image lies, as its open file resolves on Windows
+    // (review F-10: by handle, not by the path it was started with).
     if !crate::autostart::location_under(&me.image, std::slice::from_ref(&me.program_files)) {
         return Err("this helper does not run from Program Files");
     }
@@ -154,6 +161,12 @@ pub fn check_server(
         Some(image) if same_image(image, &me.image) => {}
         Some(_) => return Err("the pipe's server is another program"),
         None => return Err("the pipe's server could not be identified"),
+    }
+    // The same file on disk, compared by volume and file index (F-10).
+    match server.same_file {
+        Some(true) => {}
+        Some(false) => return Err("the pipe's server runs another copy of Tornect"),
+        None => return Err("the pipe's server's executable could not be compared"),
     }
     match server.session {
         Some(s) if s == me.session => Ok(()),
@@ -323,7 +336,7 @@ pub fn server_facts(pipe: &HelperPipe) -> std::io::Result<ServerFacts> {
 pub fn helper_self() -> std::io::Result<HelperSelf> {
     let program_files = crate::win::known_folder(crate::win::KnownFolder::ProgramFiles)?;
     Ok(HelperSelf {
-        image: crate::win_helper::own_image()?,
+        image: crate::win_helper::final_path(&crate::win_helper::own_image()?)?,
         session: crate::win_helper::own_session()?,
         program_files: program_files
             .to_str()
@@ -502,6 +515,7 @@ mod tests {
             pid: 4242,
             image: Some(r"c:\program files\tornect\TORNECT.EXE".to_owned()),
             session: Some(1),
+            same_file: Some(true),
         };
         assert_eq!(check_server(4242, &me(), &good), Ok(()));
         let cases = [
@@ -537,6 +551,22 @@ mod tests {
                     ..good.clone()
                 },
                 "session unread",
+            ),
+            (
+                4242,
+                ServerFacts {
+                    same_file: Some(false),
+                    ..good.clone()
+                },
+                "another file at the same path",
+            ),
+            (
+                4242,
+                ServerFacts {
+                    same_file: None,
+                    ..good.clone()
+                },
+                "file identity unread",
             ),
         ];
         for (pid, facts, why) in cases {

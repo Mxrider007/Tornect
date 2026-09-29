@@ -27,8 +27,10 @@ use windows_sys::Win32::Security::{
     TokenElevation,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
-    PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    GetFinalPathNameByHandleW, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
+    SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
 };
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
@@ -398,10 +400,74 @@ pub(crate) fn client_facts(pipe: &Pipe) -> std::io::Result<ClientFacts> {
 pub(crate) fn server_facts(pipe: &Pipe) -> std::io::Result<ServerFacts> {
     let pid = pipe.server_pid()?;
     let process = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION).ok();
+    let image = process.as_ref().and_then(|p| image_of(p.0).ok());
+    let same_file = image.as_deref().and_then(|theirs| {
+        let mine = own_image().ok()?;
+        Some(file_id(theirs).ok()? == file_id(&mine).ok()?)
+    });
     Ok(ServerFacts {
         pid,
-        image: process.as_ref().and_then(|p| image_of(p.0).ok()),
+        image,
         session: session_of(pid),
+        same_file,
+    })
+}
+
+/// A file opened for its attributes only (no read, write or execute
+/// access), sharing everything; closed on drop.
+fn open_attributes(path: &str) -> std::io::Result<OwnedHandle> {
+    let name = wide(path);
+    // SAFETY: `name` is NUL-terminated; no security attributes, no template.
+    let h = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            0,
+            null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE || h.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(OwnedHandle(h))
+}
+
+/// The volume serial number and file index of `path`: the file itself,
+/// whatever path reached it (review F-10).
+fn file_id(path: &str) -> std::io::Result<(u32, u64)> {
+    let file = open_attributes(path)?;
+    // SAFETY: all-zero is a valid structure to fill.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` is open; `info` is writable.
+    if unsafe { GetFileInformationByHandle(file.0, &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((
+        info.dwVolumeSerialNumber,
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
+/// `path` as its open file resolves it (`GetFinalPathNameByHandleW`, the
+/// DOS form, `\\?\` taken off): links, mount points and substituted
+/// drives followed (review F-10).
+pub(crate) fn final_path(path: &str) -> std::io::Result<String> {
+    let file = open_attributes(path)?;
+    let mut buf = vec![0u16; 32768];
+    let cap = u32::try_from(buf.len()).unwrap_or(0);
+    // SAFETY: `buf` is writable for `cap` characters; flags 0 are
+    // FILE_NAME_NORMALIZED | VOLUME_NAME_DOS.
+    let len = unsafe { GetFinalPathNameByHandleW(file.0, buf.as_mut_ptr(), cap, 0) };
+    if len == 0 || len >= cap {
+        return Err(std::io::Error::last_os_error());
+    }
+    let full = String::from_utf16_lossy(&buf[..len as usize]);
+    Ok(match full.strip_prefix(r"\\?\UNC\") {
+        Some(unc) => format!(r"\\{unc}"),
+        None => full.strip_prefix(r"\\?\").unwrap_or(&full).to_owned(),
     })
 }
 
