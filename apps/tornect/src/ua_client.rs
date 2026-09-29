@@ -393,9 +393,15 @@ pub fn ended(err: &HandshakeError, host: &str) -> Ended {
                 "above_the_request",
             )
         }
-        HandshakeError::PairingLost => plain(
+        // A host that no longer trusts this device answers its request as it
+        // answers a stranger's: `E_BAD_STATE` (it expected a pairing).
+        HandshakeError::PairingLost
+        | HandshakeError::PeerError {
+            code: codes::E_BAD_STATE,
+            ..
+        } => plain(
             Attempt::Inconclusive,
-            format!("\"{host}\" no longer knows this device: Knock to pair again."),
+            format!("\"{host}\" may no longer know this device: Knock to pair again."),
             "pairing_lost",
         ),
         HandshakeError::Timeout(_)
@@ -760,6 +766,15 @@ mod tests {
             assert_eq!(e.attempt, Attempt::Inconclusive, "{err}");
             assert!(e.text.contains("nothing is known about the password"));
         }
+        let lost = ended(
+            &HandshakeError::PeerError {
+                code: codes::E_BAD_STATE,
+                detail: None,
+            },
+            "Desk",
+        );
+        assert_eq!(lost.reason, "pairing_lost");
+        assert!(lost.text.contains("Knock to pair again"));
         let changed = ended(&HandshakeError::ServerKeyChanged, "Desk");
         assert!(changed.blocks);
         assert!(changed.text.contains("re-created since you last connected"));
