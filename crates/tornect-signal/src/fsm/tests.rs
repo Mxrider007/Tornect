@@ -5004,3 +5004,389 @@ async fn a_device_the_host_paired_that_then_says_nothing_is_reported_paired() {
     );
     nothing_granted(&host);
 }
+
+/// A host whose unattended grant for [`CLIENT_SEED`] has the password `pw`, served by
+/// the real `UnattendedAuth` hook, and a client paired with it both ways.
+fn unattended_pair(tmp: &std::path::Path, pw: &str) -> (HostSide, ClientSide) {
+    use tornect_core::keystore::FileSecretStore;
+    use tornect_core::paths::Paths;
+    use tornect_core::session_log::Actor;
+    use tornect_core::unattended::clock::SystemClock;
+    use tornect_core::unattended::grant::Preset;
+    use tornect_core::unattended::guard::{
+        AllowAllPaired, AllowAllReAuth, MutationGuard, NoSessionActivity,
+    };
+    use tornect_core::unattended::ipc::GrantOptions;
+    use tornect_core::unattended::limiter::{AttemptLimiter, HostTransport};
+    use tornect_core::unattended::schedule::FixedOffset;
+    use tornect_core::unattended::store::GrantStore;
+
+    use crate::auth;
+    use crate::unattended::{GuardAdmin, OpaqueServerSetupSource, UnattendedAuth};
+
+    let mut host = host_side(tmp, HOST_SEED);
+    let client = client_side(tmp, host.identity.id(), CLIENT_SEED);
+    let device = client.identity.id();
+    let host_onion_pk = *host.identity.id().public_key_bytes();
+    host.trusted.pin(device, "Laptop of Ana").unwrap();
+    client
+        .known
+        .pin(host.identity.id(), "Desk of Bob", host_device_pk())
+        .unwrap();
+    let paths = Paths::from_home(tmp.join("host-home"));
+    std::fs::create_dir_all(paths.keys_dir()).unwrap();
+    let secrets = Arc::new(FileSecretStore::open(paths.keys_dir()).unwrap());
+    let store = GrantStore::open(
+        &paths,
+        secrets,
+        Arc::new(SystemClock::default()),
+        SessionLog::new(paths.sessions_log()),
+    )
+    .unwrap();
+    let guard = MutationGuard::new(
+        store,
+        Arc::new(AllowAllReAuth::default()),
+        Arc::new(NoSessionActivity),
+    )
+    .with_paired_devices(Arc::new(AllowAllPaired))
+    .with_server_setup_source(Arc::new(OpaqueServerSetupSource));
+    guard.master_on(Actor::Cli, &host_onion_pk).unwrap();
+    guard
+        .create_grant(
+            Actor::Cli,
+            &device,
+            Preset::HeadlessBox,
+            &GrantOptions::default(),
+            &[0u8; 192],
+        )
+        .unwrap();
+    let setup = auth::parse_server_setup(&guard.store().server_setup().unwrap()).unwrap();
+    let record = auth::register_locally(
+        &setup,
+        pw,
+        device.public_key_bytes(),
+        auth::identifiers(device.public_key_bytes(), &host_onion_pk),
+    )
+    .unwrap();
+    guard.set_password(Actor::Cli, &device, &record).unwrap();
+    let limiter = AttemptLimiter::new(guard.store().clone());
+    host.deps.unattended = Arc::new(
+        UnattendedAuth::new(
+            limiter,
+            Arc::new(FixedOffset::utc()),
+            HostTransport::default(),
+        )
+        .with_admin_authority(Arc::new(GuardAdmin::new(Arc::new(guard)))),
+    );
+    (host, client)
+}
+
+/// The real hook, then an accept signed above what the grant and the request allow: what
+/// a host-side clamp bug would send (M-FEAT-2 F-8).
+struct Inflated {
+    inner: Arc<dyn UnattendedHook>,
+    mode: SessionMode,
+    administrator: bool,
+}
+
+impl UnattendedHook for Inflated {
+    fn handle<'a>(
+        &'a self,
+        ctx: UnattendedContext<'a>,
+    ) -> BoxFuture<'a, Result<UnattendedVerdict, HandshakeError>> {
+        Box::pin(async move {
+            Ok(match self.inner.handle(ctx).await? {
+                UnattendedVerdict::Accept {
+                    proof:
+                        ConsentProof::Unattended {
+                            grant,
+                            proof_fp,
+                            policy,
+                            block,
+                            token,
+                        },
+                    caps,
+                } => {
+                    let mut policy2 = PolicyReceipt::mint(
+                        *policy.grant(),
+                        self.mode,
+                        policy.transport(),
+                        policy.ends_at(),
+                        policy.block_window_s(),
+                        policy.ask_before_start(),
+                        policy.readiness().clone(),
+                        policy.fail_summary(),
+                    );
+                    if self.administrator {
+                        policy2 = policy2.with_elevation(tornect_core::levels::Elevation::Admin);
+                    }
+                    UnattendedVerdict::Accept {
+                        proof: ConsentProof::Unattended {
+                            grant,
+                            proof_fp,
+                            policy: policy2,
+                            block,
+                            token,
+                        },
+                        caps,
+                    }
+                }
+                other => other,
+            })
+        })
+    }
+}
+
+fn unattended_intent(pw: &str, want_mode: u8, admin: bool) -> Intent {
+    Intent::Unattended(client::UnattendedIntent {
+        password: Zeroizing::new(pw.to_owned()),
+        want_mode,
+        want_elevation: if admin {
+            tornect_core::levels::Elevation::Admin
+        } else {
+            tornect_core::levels::Elevation::None
+        },
+    })
+}
+
+/// A host where every program runs as administrator: the level needs no helper, so an
+/// administrator accept is what the policy says.
+fn always_administrator() -> Availability {
+    Availability::of(Some(&WindowsFacts {
+        installed: true,
+        administrator: true,
+        enable_lua: Some(0),
+        ..WindowsFacts::default()
+    }))
+}
+
+/// M-FEAT-2 F-8: an unattended accept above the client's own request — control for a
+/// view-only request, the administrator level unasked — is a protocol violation: the
+/// client closes with `E_BAD_STATE` and records nothing (no `server_s_pk` pin).
+#[tokio::test]
+async fn an_unattended_accept_above_the_request_is_a_violation() {
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    for (want_mode, admin_asked, given, admin_given) in [
+        (
+            messages::mode::VIEW_ONLY,
+            false,
+            SessionMode::Control,
+            false,
+        ),
+        (messages::mode::CONTROL, false, SessionMode::Control, true),
+        (messages::mode::VIEW_ONLY, true, SessionMode::Control, false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut host, client) = unattended_pair(tmp.path(), PW);
+        host.cfg.levels = always_administrator();
+        host.deps.unattended = Arc::new(Inflated {
+            inner: host.deps.unattended.clone(),
+            mode: given,
+            administrator: admin_given,
+        });
+        let pins = Arc::new(RecordingPin::default());
+        let mut deps = client.deps.clone();
+        deps.server_key_pin = pins.clone();
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let err = connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &deps,
+            unattended_intent(PW, want_mode, admin_asked),
+        )
+        .await
+        .expect_err("an accept above the request");
+        assert_eq!(
+            err.violation_code(),
+            Some(codes::E_BAD_STATE),
+            "{want_mode} {admin_asked}: {err}"
+        );
+        assert_eq!(pins.recorded.load(Ordering::SeqCst), 0, "nothing pinned");
+        let _ = task.await;
+    }
+}
+
+/// M-FEAT-2 F-8, the other direction: asked for the administrator level, signed none (the
+/// host clamps to what the grant gives): the session goes on at the signed level and says
+/// that the level was withheld; asked for none, nothing is withheld.
+#[tokio::test]
+async fn an_unattended_accept_below_the_requested_level_goes_on_at_the_signed_level() {
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    for admin_asked in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, client) = unattended_pair(tmp.path(), PW);
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let outcome = connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            unattended_intent(PW, messages::mode::CONTROL, admin_asked),
+        )
+        .await
+        .expect("an accept at or below the request");
+        let ClientOutcome::Session(session) = outcome else {
+            panic!("no session");
+        };
+        assert!(session.unattended());
+        assert_eq!(
+            session.accept().elevation(),
+            tornect_core::levels::Elevation::None
+        );
+        assert_eq!(session.elevation_withheld(), admin_asked);
+        drop(session);
+        let _ = task.await;
+    }
+}
+
+/// A wrong password ends before any proof leaves this side (`PasswordRefused`, the
+/// host told `CLIENT_AUTH_ABORT`), and the FSM tries it once: one charge at the host.
+#[tokio::test]
+async fn a_wrong_password_is_refused_once_before_any_proof() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, client) = unattended_pair(tmp.path(), "quiet verdant otter lantern zephyr");
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent("not the password at all", messages::mode::CONTROL, false),
+    )
+    .await
+    .expect_err("a wrong password");
+    assert!(matches!(err, HandshakeError::PasswordRefused), "{err}");
+    let host_end = task.await.unwrap();
+    assert!(host_end.is_err(), "the host saw the abort: {host_end:?}");
+}
+
+/// A changed `server_s_pk` (the host's unattended setup created again) ends before the
+/// proof, as its own error: the window blocks until the person confirms.
+#[tokio::test]
+async fn a_changed_opaque_key_is_its_own_error() {
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, client) = unattended_pair(tmp.path(), PW);
+    let mut deps = client.deps.clone();
+    deps.server_key_pin = Arc::new(MismatchPin);
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .expect_err("a pin mismatch");
+    assert!(matches!(err, HandshakeError::ServerKeyChanged), "{err}");
+    let _ = task.await;
+}
+
+/// `client::admin`: one command on the grant's two factors, answered by a signed
+/// `ADMIN_RESULT`; revoking itself is in every grant's scope, and afterwards the
+/// device is refused before any password exchange. An unknown host gets nothing.
+#[tokio::test]
+async fn an_admin_command_gets_the_hosts_signed_answer() {
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, client) = unattended_pair(tmp.path(), PW);
+    let command = |op, device_pk| client::AdminIntent {
+        password: Zeroizing::new(PW.to_owned()),
+        op,
+        device_pk,
+    };
+    // Nothing live to end, and no grant of that device to unlock: answered.
+    for (op, device_pk) in [
+        (messages::admin_op::END_SESSION, None),
+        (messages::admin_op::UNLOCK, Some([0x5A; 32])),
+    ] {
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        client::admin(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            &command(op, device_pk),
+        )
+        .await
+        .expect("an admin answer");
+        let _ = task.await;
+    }
+    // Revoking itself is in every grant's scope.
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let own = *client.identity.id().public_key_bytes();
+    let answer = client::admin(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        &command(messages::admin_op::REVOKE, Some(own)),
+    )
+    .await
+    .expect("an admin answer");
+    assert!(answer.ok, "{answer:?}");
+    let _ = task.await;
+    // Revoked: the next request is refused before any password exchange.
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .expect_err("revoked");
+    assert!(
+        matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == reject::NOT_GRANTED),
+        "{err}"
+    );
+    let _ = task.await;
+    // A host this device never paired with is sent nothing.
+    let stranger = client_side(&tmp.path().join("other"), host.identity.id(), [0x33; 32]);
+    let (_a, b) = pipe();
+    let err = client::admin(
+        b,
+        &stranger.cfg,
+        &stranger.identity,
+        &stranger.deps,
+        &command(messages::admin_op::END_SESSION, None),
+    )
+    .await
+    .expect_err("not paired");
+    assert!(matches!(err, HandshakeError::Aborted(_)), "{err}");
+}
+
+/// A pin that records how often it was asked to record.
+#[derive(Default)]
+struct RecordingPin {
+    recorded: std::sync::atomic::AtomicUsize,
+}
+
+impl client::ServerKeyPin for RecordingPin {
+    fn check(&self, _: &TornectId, _: &[u8; 32]) -> tornect_core::unattended::hosts::PinCheck {
+        tornect_core::unattended::hosts::PinCheck::NoPin
+    }
+    fn record(&self, _: &TornectId, _: &[u8; 32]) {
+        self.recorded.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A pin that never matches.
+struct MismatchPin;
+
+impl client::ServerKeyPin for MismatchPin {
+    fn check(&self, _: &TornectId, _: &[u8; 32]) -> tornect_core::unattended::hosts::PinCheck {
+        tornect_core::unattended::hosts::PinCheck::Mismatch
+    }
+    fn record(&self, _: &TornectId, _: &[u8; 32]) {}
+}

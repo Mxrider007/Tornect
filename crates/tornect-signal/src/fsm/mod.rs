@@ -137,6 +137,17 @@ pub enum HandshakeError {
     /// A local decision ended the exchange (SAS not confirmed, kill switch, …).
     #[error("aborted: {0}")]
     Aborted(&'static str),
+    /// Client side, unattended: the host's `AUTH_CHALLENGE` did not verify under this
+    /// password — a wrong password, or a grant registered again since — so no proof was
+    /// sent and the host was told `BYE{CLIENT_AUTH_ABORT}` (§B.8.4.2). The password was not
+    /// proven: what the host logs as a failed attempt.
+    #[error("the unattended password was not accepted")]
+    PasswordRefused,
+    /// Client side, unattended: the host's OPAQUE key differs from the one pinned at the
+    /// first accept (A16): its unattended setup was created again since, or this is not
+    /// that host. Checked before the proof, so none was sent.
+    #[error("the host's unattended setup changed since the last connection")]
+    ServerKeyChanged,
     /// Framing failure (truncated frame, oversize frame we announced, I/O).
     #[error(transparent)]
     Frame(#[from] FrameError),
