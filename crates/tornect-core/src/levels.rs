@@ -128,7 +128,11 @@ pub enum HostRow {
     /// (`ConsentPromptBehaviorUser` 0, or UAC off).
     WindowsPolicyDenies,
     /// Windows, an administrator account set to elevate without prompting
-    /// (`ConsentPromptBehaviorAdmin` 0).
+    /// (`ConsentPromptBehaviorAdmin` 0): any program there can become
+    /// administrator without a prompt, so control is administrator access in
+    /// effect, and the row offers View only and "Allow as administrator"
+    /// with the Tornect confirmation, like the UAC-off row (the operator's
+    /// ruling of 2026-09-29).
     WindowsAdminWithoutPrompt,
     /// Windows, the host itself started elevated while UAC is on: it refuses
     /// to open the onion service.
@@ -249,12 +253,6 @@ pub const LINE_VIEW_ONLY: &str = "They see this screen. They cannot type or clic
 /// The line under "Allow" on Windows (§B.2.1).
 pub const LINE_ALLOW_WINDOWS: &str =
     "They can type and click as you. Programs running as administrator ignore their input.";
-/// The line under "Allow" on an administrator account set to elevate
-/// without prompting (`ConsentPromptBehaviorAdmin` 0): any program the remote
-/// starts there can become administrator without a prompt, so plain control
-/// is administrator access in effect, and the line says so.
-pub const LINE_ALLOW_ELEVATES_WITHOUT_PROMPT: &str = "On this account, programs run as \
-    administrator without asking, so control includes administrator access.";
 /// Under the buttons where the row's administrator answer needs the
 /// administrator helper, which this build does not have ([`ADMIN_HELPER`]):
 /// the answer is absent, and this says why.
@@ -363,7 +361,10 @@ impl Availability {
     /// offers View only alone, because control there is administrator
     /// access and administrator access needs Tornect installed; standalone;
     /// a standard account whose policy denies elevation (or UAC off);
-    /// an administrator account set to elevate without prompting; installed.
+    /// an administrator account set to elevate without prompting — View
+    /// only and the administrator answer with the Tornect confirmation, no
+    /// plain Allow, because control there is administrator access in effect;
+    /// installed.
     #[must_use]
     pub fn of(windows: Option<&WindowsFacts>) -> Self {
         let Some(f) = windows else {
@@ -426,8 +427,9 @@ impl Availability {
             return row(
                 HostRow::WindowsAdminWithoutPrompt,
                 Answers {
+                    view_only: true,
+                    allow: false,
                     admin: Some(AdminPath::TornectConfirmation { needs_helper: true }),
-                    ..plain
                 },
                 ADMIN_LINE_NO_PROMPT,
             );
@@ -500,22 +502,25 @@ impl Availability {
     /// The sentence under a sheet's buttons in this build: the row's own, or,
     /// where the row has none and its administrator answer is absent for lack
     /// of the helper, [`SENTENCE_NO_HELPER`] (a level the host cannot deliver
-    /// is absent, and one sentence says why).
+    /// is absent, and one sentence says why). The no-prompt row's own
+    /// sentence is the administrator line, which describes the answer: with
+    /// the answer absent it gives way to [`SENTENCE_NO_HELPER`] too.
     #[must_use]
     pub fn offered_sentence(&self) -> Option<&'static str> {
+        if self.missing_helper() && self.row == HostRow::WindowsAdminWithoutPrompt {
+            return Some(SENTENCE_NO_HELPER);
+        }
         self.sentence
             .or_else(|| self.missing_helper().then_some(SENTENCE_NO_HELPER))
     }
 
-    /// The line under "Allow" on this row: the Linux sentence on Linux; on
-    /// Windows, [`LINE_ALLOW_WINDOWS`], except on an administrator account
-    /// that elevates without prompting, where control includes administrator
-    /// access ([`LINE_ALLOW_ELEVATES_WITHOUT_PROMPT`]).
+    /// The line under "Allow" on this row: the Linux sentence on Linux,
+    /// [`LINE_ALLOW_WINDOWS`] on Windows (the rows where control is
+    /// administrator access in effect offer no plain Allow).
     #[must_use]
     pub fn allow_line(&self) -> &'static str {
         match self.row {
             HostRow::Linux | HostRow::LinuxRoot => SENTENCE_LINUX,
-            HostRow::WindowsAdminWithoutPrompt => LINE_ALLOW_ELEVATES_WITHOUT_PROMPT,
             _ => LINE_ALLOW_WINDOWS,
         }
     }
@@ -618,11 +623,18 @@ mod tests {
             ..WindowsFacts::default()
         }));
         assert_eq!(no_prompt.row, HostRow::WindowsAdminWithoutPrompt);
-        assert_eq!(no_prompt.allow_line(), LINE_ALLOW_ELEVATES_WITHOUT_PROMPT);
+        assert!(
+            !no_prompt.offered().allow,
+            "no plain Allow on the no-prompt row"
+        );
         assert_eq!(
             no_prompt.offered_sentence(),
-            Some(ADMIN_LINE_NO_PROMPT),
-            "the row's own sentence, never the no-helper one"
+            Some(if ADMIN_HELPER {
+                ADMIN_LINE_NO_PROMPT
+            } else {
+                SENTENCE_NO_HELPER
+            }),
+            "the row's own sentence where its answer is offered, else why it is absent"
         );
         assert_eq!(Availability::LINUX.offered_sentence(), Some(SENTENCE_LINUX));
     }
@@ -769,7 +781,7 @@ mod tests {
                     ..admin
                 },
                 HostRow::WindowsAdminWithoutPrompt,
-                [true, true],
+                [true, false],
                 Some(AdminPath::TornectConfirmation { needs_helper: true }),
                 Some(ADMIN_LINE_NO_PROMPT),
             ),
@@ -831,24 +843,24 @@ mod tests {
         assert_eq!(shared.row, HostRow::WindowsInstalled);
     }
 
-    /// A level the host cannot deliver is absent: in this build (no
-    /// administrator helper) only the always-administrator row offers the
-    /// administrator answer.
+    /// A level the host cannot deliver is absent: without the administrator
+    /// helper only the always-administrator row offers the administrator
+    /// answer; with it, the installed and the no-prompt rows offer theirs.
     #[test]
     fn only_what_this_build_can_deliver_is_offered() {
-        const { assert!(!ADMIN_HELPER) };
         let admin = WindowsFacts {
             administrator: true,
             ..facts()
         };
+        let with_helper = |path| ADMIN_HELPER.then_some(path);
         for (f, offered_admin) in [
-            (admin, None),
+            (admin, with_helper(AdminPath::WindowsPrompt)),
             (
                 WindowsFacts {
                     consent_prompt_behavior_admin: Some(0),
                     ..admin
                 },
-                None,
+                with_helper(AdminPath::TornectConfirmation { needs_helper: true }),
             ),
             (
                 WindowsFacts {
@@ -866,6 +878,34 @@ mod tests {
             assert_eq!(a.offered().allow, a.answers.allow);
         }
         assert_eq!(Availability::LINUX.offered(), Availability::LINUX.answers);
+    }
+
+    /// The no-prompt row (`ConsentPromptBehaviorAdmin` 0, the operator's
+    /// ruling of 2026-09-29) gives the always-administrator set: View only
+    /// and "Allow as administrator" with the Tornect confirmation, never
+    /// plain control; its answer takes the helper, since the host's own token
+    /// is filtered there.
+    #[test]
+    fn the_no_prompt_row_is_the_always_administrator_set() {
+        let row = Availability::of(Some(&WindowsFacts {
+            administrator: true,
+            consent_prompt_behavior_admin: Some(0),
+            ..facts()
+        }));
+        assert_eq!(row.row, HostRow::WindowsAdminWithoutPrompt);
+        assert!(row.answers.offers(Level::VIEW_ONLY));
+        assert!(
+            !row.answers.offers(Level::CONTROL),
+            "control there is administrator access"
+        );
+        assert!(row.answers.offers(Level::ADMIN));
+        assert_eq!(
+            row.answers.admin,
+            Some(AdminPath::TornectConfirmation { needs_helper: true })
+        );
+        assert_eq!(row.sentence, Some(ADMIN_LINE_NO_PROMPT));
+        assert!(!row.offered().offers(Level::CONTROL));
+        assert_eq!(row.offered().offers(Level::ADMIN), ADMIN_HELPER);
     }
 
     /// The clamp: every combination of a grant's level, the request and what
