@@ -540,7 +540,7 @@ pub fn label_refusal(label: &str) -> Option<&'static str> {
         .filter(|part| !part.is_empty())
         .collect();
     if parts.iter().filter(|part| listed(part)).count() >= LABEL_LIST_WORDS {
-        return Some("it reads like device words");
+        return Some("three of its words are device words");
     }
     None
 }
@@ -992,11 +992,23 @@ mod tests {
     #[test]
     fn labels_that_would_put_words_in_the_name_slot_are_refused() {
         for (label, why) in [
-            ("arctic crisp lamp orbit", "it reads like device words"),
-            ("Arctic-Crisp-Lamp-Orbit", "it reads like device words"),
-            ("аrctic crisp lamp orbit", "it reads like device words"),
-            ("arctic crisp lamp", "it reads like device words"),
-            ("arctic crisp lamp orbit zoo", "it reads like device words"),
+            (
+                "arctic crisp lamp orbit",
+                "three of its words are device words",
+            ),
+            (
+                "Arctic-Crisp-Lamp-Orbit",
+                "three of its words are device words",
+            ),
+            (
+                "аrctic crisp lamp orbit",
+                "three of its words are device words",
+            ),
+            ("arctic crisp lamp", "three of its words are device words"),
+            (
+                "arctic crisp lamp orbit zoo",
+                "three of its words are device words",
+            ),
             ("Ana\" · view only", "it holds a quotation mark"),
             ("Laptop \u{201c}2\u{201d}", "it holds a quotation mark"),
             ("Laptop · 2", "it holds a middle dot"),
@@ -1030,7 +1042,7 @@ mod tests {
         for label in spellings("arctic crisp lamp orbit 2") {
             assert_eq!(
                 label_refusal(&label),
-                Some("it reads like device words"),
+                Some("three of its words are device words"),
                 "{label}"
             );
         }
@@ -1043,7 +1055,7 @@ mod tests {
         for label in spellings("arctic crisp lamp orbit (2)") {
             assert_eq!(
                 label_refusal(&label),
-                Some("it reads like device words"),
+                Some("three of its words are device words"),
                 "{label}"
             );
         }
@@ -1056,7 +1068,7 @@ mod tests {
         for label in spellings("my arctic crisp lamp orbit") {
             assert_eq!(
                 label_refusal(&label),
-                Some("it reads like device words"),
+                Some("three of its words are device words"),
                 "{label}"
             );
         }
@@ -1074,7 +1086,7 @@ mod tests {
             for label in spellings(label) {
                 assert_eq!(
                     label_refusal(&label),
-                    Some("it reads like device words"),
+                    Some("three of its words are device words"),
                     "{label}"
                 );
             }
