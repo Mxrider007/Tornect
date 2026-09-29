@@ -181,6 +181,10 @@ pub struct Backend {
     pub words: Arc<super::recognize::Recognizer>,
 }
 
+/// How often a window that is not the host looks whether another Tornect
+/// process holds this home's host lock.
+const HOST_LOCK_EVERY: Duration = Duration::from_secs(2);
+
 /// The host role, once wired.
 struct Hosted {
     serving: Arc<(HostConfig, HostDeps)>,
@@ -477,6 +481,25 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
     } else {
         None
     };
+    // Not the host here: another Tornect process may be, and may share this
+    // screen, which this window cannot see. While one holds the host lock,
+    // the window hides what it hides while sharing.
+    if hosted.is_none() {
+        let b = Arc::clone(&b);
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(HOST_LOCK_EVERY);
+            loop {
+                every.tick().await;
+                let paths = b.paths.clone();
+                let held = tokio::task::spawn_blocking(move || HostLock::holder(&paths).is_some())
+                    .await
+                    .unwrap_or(true);
+                if b.shared.read(|m| m.hosted_elsewhere) != held {
+                    b.shared.update(|m| m.hosted_elsewhere = held);
+                }
+            }
+        });
+    }
 
     // Tor starts on a task of its own and is never cancelled: the ladder owns
     // runtimes that must not be dropped inside this one.

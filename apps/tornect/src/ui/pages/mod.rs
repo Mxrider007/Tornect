@@ -31,7 +31,7 @@ pub fn draw(
 ) {
     match page {
         Page::Home => home::home(ui, model, form, now, actions),
-        Page::AddressBook => address_book::page(ui, model, form, actions),
+        Page::AddressBook => address_book::page(ui, model, form, model.screen_shared(now), actions),
         Page::Sessions => later(
             ui,
             page,
@@ -80,6 +80,31 @@ pub fn day_in_sentence(day: Day, today: Option<Day>) -> String {
         _ if text.ends_with(" ago") => text,
         _ => format!("on {text}"),
     }
+}
+
+/// What a page shows in place of the address book's names, IDs, days and
+/// devices while this computer's screen may be in a picture that leaves it.
+pub const HIDDEN_WHILE_SHARED: &str = "Hidden while this screen is shared";
+
+/// The placeholder card of what is hidden while this computer is shared.
+fn hidden_card(ui: &mut Ui, what: &str) {
+    let t = theme::tokens(ui.ctx());
+    super::widgets::card(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            RichText::new(HIDDEN_WHILE_SHARED)
+                .font(theme::font(ui.ctx(), Face::Semibold, 14.0))
+                .color(t.text_primary),
+        );
+        ui.add(
+            egui::Label::new(
+                RichText::new(what)
+                    .font(theme::font(ui.ctx(), Face::Regular, 13.0))
+                    .color(t.text_secondary),
+            )
+            .wrap(),
+        );
+    });
 }
 
 /// A page whose content comes in a later version: its title and one line.
@@ -1117,5 +1142,124 @@ mod tests {
         window.pass(vec![egui::Event::Text("5".to_owned())]);
         assert_eq!(window.form.connect_to, "ab5");
         assert!(window.form.codes.values().all(String::is_empty));
+    }
+
+    /// P-M2 and R-3a: while this computer's screen may be in a picture that
+    /// leaves it — a session live, one just allowed (before the accept goes
+    /// out), or another Tornect process holding the host lock — Home and
+    /// every tab of the address book (Devices included) show no saved name,
+    /// no ID prefix, no day, no recent or device line and nothing of what
+    /// happened, and say that they are hidden; the connect field's look-alike
+    /// warning names no saved computer (FW-L1).
+    #[test]
+    fn sharing_hides_the_book() {
+        let base = with_book(false);
+        let names: Vec<String> = base
+            .book
+            .computers
+            .iter()
+            .map(|c| c.title())
+            .chain(base.book.devices.iter().map(|d| d.label.clone()))
+            .collect();
+        assert!(names.len() >= 6, "{names:?}");
+        let prefixes: Vec<String> = base.book.computers.iter().map(|c| c.id.short()).collect();
+        let look_alike = TornectId::from_bytes([0x66; 32]);
+        let viewer = super::super::model::Sharing {
+            session_id: "00".to_owned(),
+            label: "Viewer".to_owned(),
+            control: false,
+            unattended: false,
+            since: Instant::now(),
+            capture: None,
+        };
+        type Set = Box<dyn Fn(&mut Model)>;
+        let states: [(&str, Set); 3] = [
+            ("live", Box::new(move |m| m.sharing = vec![viewer.clone()])),
+            ("allowed", Box::new(|m| m.accepted = Some(Instant::now()))),
+            ("elsewhere", Box::new(|m| m.hosted_elsewhere = true)),
+        ];
+        // Unshared, the same pages show what the test looks for.
+        let open = Window::new(base.clone(), Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(&open, "Office PC") && has_text(&open, "Last connected"));
+        for (case, set) in &states {
+            let mut model = base.clone();
+            set(&mut model);
+            model.connect_warning = Some(super::super::model::ConnectWarning {
+                id: look_alike,
+                name: "Office PC".to_owned(),
+            });
+            for theme in THEMES {
+                for (page, tab) in [
+                    (Page::Home, Tab::Computers),
+                    (Page::AddressBook, Tab::Computers),
+                    (Page::AddressBook, Tab::Recent),
+                    (Page::AddressBook, Tab::Devices),
+                ] {
+                    let mut window = Window::new(model.clone(), page, theme, WIDE);
+                    window.form.book.tab = tab;
+                    window.form.connect_to = look_alike.onion_address();
+                    window.pass(Vec::new());
+                    window.pass(Vec::new());
+                    let at = format!("{case} {theme:?} {page:?} {tab:?}");
+                    for name in &names {
+                        assert!(!has_text(&window, name), "{at}: {name}");
+                    }
+                    for prefix in &prefixes {
+                        assert!(!has_text(&window, prefix), "{at}: {prefix}");
+                    }
+                    for day in [
+                        "Today",
+                        "Yesterday",
+                        "days ago",
+                        "Last connected",
+                        "last request",
+                        "something happened",
+                    ] {
+                        assert!(!has_text(&window, day), "{at}: {day}");
+                    }
+                    assert!(has_text(&window, HIDDEN_WHILE_SHARED), "{at}");
+                    if page == Page::Home {
+                        assert!(
+                            has_text(
+                                &window,
+                                "Looks like a saved computer, but it is a different address."
+                            ),
+                            "{at}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// R-3b: a session sheet names the device by its pinned label and hints
+    /// at nothing else: not that a computer of the same name is saved in this
+    /// computer's address book.
+    #[test]
+    fn a_sheet_never_hints_at_the_book() {
+        let mut model = with_book(false);
+        model.popups = vec![session_question(9, "Office PC")];
+        for size in [WIDE, NARROW] {
+            let window = Window::new(model.clone(), Page::Settings, egui::Theme::Dark, size);
+            assert!(has_text(
+                &window,
+                "\"Office PC\" wants to connect to this computer"
+            ));
+            for hint in [
+                "saved",
+                "address book",
+                "Address book",
+                "Last connected",
+                "book",
+            ] {
+                let found: Vec<&str> = window
+                    .nodes
+                    .iter()
+                    .filter_map(|n| n.value())
+                    .filter(|v| v.contains(hint))
+                    .collect();
+                assert!(found.is_empty(), "{size:?}: {hint} in {found:?}");
+            }
+        }
     }
 }
