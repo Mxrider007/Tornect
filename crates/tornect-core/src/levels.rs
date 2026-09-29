@@ -138,6 +138,12 @@ pub enum HostRow {
     /// Linux, the host itself running as root: it refuses to open the onion
     /// service (Tornect never runs as administrator on Linux).
     LinuxRoot,
+    /// Windows, whether the host runs elevated could not be read: it refuses
+    /// to open the onion service, as a host started elevated does.
+    WindowsElevationUnreadable,
+    /// Windows, the account's other facts could not be read (administrator,
+    /// built-in Administrator, installed): View only alone.
+    WindowsAccountUnreadable,
 }
 
 /// How the administrator answer is given on a row.
@@ -258,6 +264,14 @@ pub const SENTENCE_NO_HELPER: &str =
 /// (Windows' prompt cancelled or failed, or no helper to start): the other
 /// answers stay open, and the popup's time keeps running (§B.2.1).
 pub const SENTENCE_ADMIN_NOT_GIVEN: &str = "Administrator access was not given";
+/// Why a Windows host that could not read whether it runs elevated refuses
+/// to serve.
+pub const SENTENCE_ELEVATION_UNREADABLE: &str = "Tornect could not read whether it runs as \
+    administrator, so it does not accept connections. Start it again normally.";
+/// Why a Windows host that could not read its account's facts offers View
+/// only.
+pub const SENTENCE_ACCOUNT_UNREADABLE: &str = "Tornect could not read this account's rights, so \
+    it offers View only.";
 /// Why a Linux host started as root refuses to serve (§B.2.1: on Linux
 /// Tornect never runs as administrator).
 pub const SENTENCE_LINUX_ROOT: &str = "Start Tornect as your own user; on Linux it never runs as \
@@ -435,8 +449,44 @@ impl Availability {
     pub fn serves(&self) -> bool {
         !matches!(
             self.row,
-            HostRow::WindowsStartedElevated | HostRow::LinuxRoot
+            HostRow::WindowsStartedElevated
+                | HostRow::LinuxRoot
+                | HostRow::WindowsElevationUnreadable
         )
+    }
+
+    /// The row of a Windows host whose account could not be read in full:
+    /// never a row more permissive than a full read could give (§B.2.1).
+    /// `elevated` is whether this process runs elevated, when that much was
+    /// read (`None`: not even that); `registry` holds the UAC values, read
+    /// apart. Elevation unreadable: refuse, as a host started elevated does.
+    /// Elevated with UAC on: that refusal. Otherwise: View only alone, and
+    /// the sentence says why.
+    #[must_use]
+    pub fn unreadable(elevated: Option<bool>, registry: &WindowsFacts) -> Self {
+        let shared = registry.prompt_on_secure_desktop == Some(0);
+        match elevated {
+            None => Self {
+                row: HostRow::WindowsElevationUnreadable,
+                answers: Answers::NONE,
+                sentence: Some(SENTENCE_ELEVATION_UNREADABLE),
+                prompts_on_shared_screen: shared,
+            },
+            Some(true) if registry.uac_on() => Self::of(Some(&WindowsFacts {
+                elevated: true,
+                ..*registry
+            })),
+            Some(_) => Self {
+                row: HostRow::WindowsAccountUnreadable,
+                answers: Answers {
+                    view_only: true,
+                    allow: false,
+                    admin: None,
+                },
+                sentence: Some(SENTENCE_ACCOUNT_UNREADABLE),
+                prompts_on_shared_screen: shared,
+            },
+        }
     }
 
     /// Whether the row's administrator answer is left out of
@@ -502,6 +552,42 @@ impl Default for Availability {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Windows account read that failed never lands on a more permissive
+    /// row: elevation unreadable refuses; elevated with UAC on keeps the
+    /// started-elevated refusal; anything else unreadable offers View only
+    /// alone and says why.
+    #[test]
+    fn an_unreadable_account_never_widens_the_offer() {
+        let registry = WindowsFacts::default();
+        let blind = Availability::unreadable(None, &registry);
+        assert!(!blind.serves());
+        assert_eq!(blind.offered(), Answers::NONE);
+        assert_eq!(blind.sentence, Some(SENTENCE_ELEVATION_UNREADABLE));
+        let elevated = Availability::unreadable(Some(true), &registry);
+        assert_eq!(elevated.row, HostRow::WindowsStartedElevated);
+        assert!(!elevated.serves());
+        for (elevated, lua) in [(false, None), (false, Some(0)), (true, Some(0))] {
+            let registry = WindowsFacts {
+                enable_lua: lua,
+                prompt_on_secure_desktop: Some(0),
+                ..WindowsFacts::default()
+            };
+            let view = Availability::unreadable(Some(elevated), &registry);
+            assert!(view.serves(), "{elevated} {lua:?}");
+            assert_eq!(
+                view.offered(),
+                Answers {
+                    view_only: true,
+                    allow: false,
+                    admin: None,
+                },
+                "{elevated} {lua:?}"
+            );
+            assert_eq!(view.sentence, Some(SENTENCE_ACCOUNT_UNREADABLE));
+            assert!(view.prompts_on_shared_screen);
+        }
+    }
 
     /// A Linux host running as root serves nothing and says why; the lines
     /// under the answers follow the row (§B.2.1), and where this build lacks
