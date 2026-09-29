@@ -114,6 +114,9 @@ pub struct Model {
     pub device_name: String,
     /// The address book, the recent connections and the paired devices.
     pub book: Book,
+    /// This is the window's first run in this home: Home says once that no
+    /// list of past connections is kept unless history is switched on.
+    pub history_notice: bool,
     /// This computer's two sets of device words, once derived (§B.6.1 item 5).
     pub mine: Option<MyWords>,
     /// The connect field's look-alike warning (§B.6.1 item 4): the ID typed

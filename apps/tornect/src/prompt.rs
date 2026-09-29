@@ -13,6 +13,10 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc};
 use tornect_core::TornectId;
+use tornect_core::levels::{
+    ADMIN_LINE_NO_PROMPT, AdminPath, Answers, Availability, LINE_VIEW_ONLY,
+    SENTENCE_SECURE_DESKTOP_OFF,
+};
 use tornect_signal::fsm::client::ClientPairingUi;
 use tornect_signal::pairing::{
     BoxFuture, Consent, PairDecision, PairingPeer, SessionDecision, SessionRequestSummary,
@@ -202,6 +206,68 @@ impl Consent for CliConsent {
                 None => SessionDecision::Deny,
             }
         })
+    }
+
+    fn session_at<'a>(
+        &'a self,
+        peer: &'a TrustedPeer,
+        _: &'a SessionRequestSummary,
+        levels: &'a Availability,
+    ) -> BoxFuture<'a, SessionDecision> {
+        Box::pin(async move {
+            match self.prompter.ask(&session_question_at(peer, levels)).await {
+                Some(answer) => parse_session_at(&answer, levels.offered()),
+                None => SessionDecision::Deny,
+            }
+        })
+    }
+}
+
+/// The session question of a host in the row `levels` (§B.2.1): only the
+/// answers the row offers in this build, what each does, and the row's
+/// sentence. The administrator answer is the whole word, typed.
+fn session_question_at(peer: &TrustedPeer, levels: &Availability) -> String {
+    let answers = levels.offered();
+    let mut lines = vec![format!(
+        "\nSESSION REQUEST: \"{}\" wants to connect to this computer",
+        peer.label
+    )];
+    if answers.view_only {
+        lines.push(format!("  `v`  view only: {LINE_VIEW_ONLY}"));
+    }
+    if answers.allow {
+        lines.push(format!("  `a`  allow: {}", levels.allow_line()));
+    }
+    if answers.admin.is_some() {
+        lines.push(format!(
+            "  `administrator`  allow as administrator (type the whole word): \
+             {ADMIN_LINE_NO_PROMPT}"
+        ));
+    }
+    // The row's sentence, once: on Linux it is the line under Allow.
+    if let Some(line) = levels
+        .offered_sentence()
+        .filter(|line| !(answers.allow && *line == levels.allow_line()))
+    {
+        lines.push(format!("  {line}"));
+    }
+    if levels.prompts_on_shared_screen {
+        lines.push(format!("  {SENTENCE_SECURE_DESKTOP_OFF}"));
+    }
+    lines.push("Anything else refuses (60 s):".to_owned());
+    lines.join("\n")
+}
+
+/// The answer to [`session_question_at`]: only an answer `offered` gives.
+fn parse_session_at(answer: &str, offered: Answers) -> SessionDecision {
+    let answer = answer.trim().to_ascii_lowercase();
+    match answer.as_str() {
+        "a" | "allow" if offered.allow => SessionDecision::AllowOnce,
+        "v" | "view" | "view-only" if offered.view_only => SessionDecision::AllowOnceViewOnly,
+        "administrator" if matches!(offered.admin, Some(AdminPath::TornectConfirmation { .. })) => {
+            SessionDecision::AllowOnceAdmin
+        }
+        _ => SessionDecision::Deny,
     }
 }
 
@@ -536,5 +602,83 @@ mod tests {
         assert!(!asks_here(true, false), "stderr redirected");
         assert!(!asks_here(false, true), "stdin redirected");
         assert!(!asks_here(false, false));
+    }
+
+    /// The terminal's session question on a host of a given row (§B.2.1):
+    /// only the row's answers and their lines, the row's sentence, and an
+    /// answer the row does not offer refuses; the administrator answer is
+    /// the whole word.
+    #[test]
+    fn the_terminal_offers_only_the_rows_answers() {
+        use tornect_core::levels::{
+            LINE_ALLOW_WINDOWS, SENTENCE_ALWAYS_ADMINISTRATOR, SENTENCE_LINUX, WindowsFacts,
+        };
+        let peer = TrustedPeer {
+            device: tornect_core::DeviceIdentity::from_seed(&[7; 32]).id(),
+            label: "Laptop".to_owned(),
+        };
+        let linux = Availability::LINUX;
+        let asked = session_question_at(&peer, &linux);
+        assert!(
+            asked.contains("\"Laptop\" wants to connect to this computer"),
+            "{asked}"
+        );
+        assert!(asked.contains(SENTENCE_LINUX) && asked.contains(LINE_VIEW_ONLY));
+        assert_eq!(asked.matches(SENTENCE_LINUX).count(), 1, "{asked}");
+        assert!(!asked.contains("administrator (type"), "{asked}");
+        assert!(!asked.contains("fingerprint"), "{asked}");
+        assert_eq!(
+            parse_session_at("a", linux.offered()),
+            SessionDecision::AllowOnce
+        );
+        assert_eq!(
+            parse_session_at("v", linux.offered()),
+            SessionDecision::AllowOnceViewOnly
+        );
+        assert_eq!(
+            parse_session_at("administrator", linux.offered()),
+            SessionDecision::Deny
+        );
+        assert_eq!(
+            parse_session_at("yes", linux.offered()),
+            SessionDecision::Deny
+        );
+        // UAC off: no plain Allow; the administrator answer, typed whole.
+        let always = Availability::of(Some(&WindowsFacts {
+            installed: true,
+            administrator: true,
+            enable_lua: Some(0),
+            ..WindowsFacts::default()
+        }));
+        let asked = session_question_at(&peer, &always);
+        assert!(!asked.contains("`a`"), "{asked}");
+        assert!(asked.contains(SENTENCE_ALWAYS_ADMINISTRATOR), "{asked}");
+        assert_eq!(
+            parse_session_at("a", always.offered()),
+            SessionDecision::Deny
+        );
+        assert_eq!(
+            parse_session_at("admin", always.offered()),
+            SessionDecision::Deny
+        );
+        assert_eq!(
+            parse_session_at("Administrator", always.offered()),
+            SessionDecision::AllowOnceAdmin
+        );
+        // Installed with UAC on: Windows' Allow line; no administrator
+        // answer in this build, and the sentence says why.
+        let installed = Availability::of(Some(&WindowsFacts {
+            installed: true,
+            administrator: true,
+            ..WindowsFacts::default()
+        }));
+        let asked = session_question_at(&peer, &installed);
+        assert!(asked.contains(LINE_ALLOW_WINDOWS), "{asked}");
+        if !tornect_core::levels::ADMIN_HELPER {
+            assert!(
+                asked.contains(tornect_core::levels::SENTENCE_NO_HELPER),
+                "{asked}"
+            );
+        }
     }
 }
