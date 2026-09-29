@@ -859,12 +859,33 @@ mod tests {
         );
         let mut control = model.clone();
         control.book.computers[0].unattended.control = true;
-        let window = Window::new(control, Page::AddressBook, egui::Theme::Light, TALL);
+        let mut window = Window::new(control, Page::AddressBook, egui::Theme::Light, TALL);
         assert!(
             window
                 .nodes
                 .iter()
                 .any(|n| n.label() == Some("Turn unattended off there"))
+        );
+        // Unlock names the other device by its ID, confirmed in words that
+        // name the computer, then the prompt.
+        let unlock = window.center("Unlock another device there");
+        assert!(window.click(unlock).is_empty());
+        window.pass(Vec::new());
+        assert!(has_text(
+            &window,
+            "Unlock your other device at \"Office PC\"?"
+        ));
+        assert!(
+            window.node("Continue: the password").is_disabled(),
+            "no device ID yet"
+        );
+        let other = tornect_core::DeviceIdentity::from_seed(&[7; 32]).id();
+        window.form.ua.unlocking = Some((id, other.to_string()));
+        window.pass(Vec::new());
+        let go = window.center("Continue: the password");
+        assert_eq!(
+            window.click(go),
+            vec![Action::AskUnlock(id, *other.public_key_bytes())]
         );
 
         // Without a success there: Knock first, and a paired computer may
@@ -904,6 +925,7 @@ mod tests {
             may_admin: false,
             retry_at: None,
             admin: None,
+            target: None,
         }
     }
 

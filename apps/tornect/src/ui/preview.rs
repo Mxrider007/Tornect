@@ -316,6 +316,7 @@ fn unattended(m: &mut Model, sheet: Sheet) -> bool {
                 may_admin: false,
                 retry_at: None,
                 admin: None,
+                target: None,
             });
         }
         Sheet::UaRefused | Sheet::UaLive => {

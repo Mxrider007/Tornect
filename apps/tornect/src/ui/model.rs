@@ -726,6 +726,8 @@ pub struct Prompt {
     pub retry_at: Option<Instant>,
     /// An admin command instead of a session.
     pub admin: Option<AdminAction>,
+    /// The other device an Unlock names (its device key).
+    pub target: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for Prompt {

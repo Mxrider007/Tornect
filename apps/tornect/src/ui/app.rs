@@ -648,11 +648,19 @@ impl App {
             Action::SetHistory(on) => self.command(Command::SetHistory(on)),
             Action::AskPassword(id) => {
                 self.form.ua.clear();
-                self.command(Command::AskPassword(id, None));
+                self.command(Command::AskPassword(id, None, None));
             }
             Action::AskAdmin(id, action) => {
                 self.form.ua.clear();
-                self.command(Command::AskPassword(id, Some(action)));
+                self.command(Command::AskPassword(id, Some(action), None));
+            }
+            Action::AskUnlock(id, device) => {
+                self.form.ua.clear();
+                self.command(Command::AskPassword(
+                    id,
+                    Some(crate::ua_client::AdminAction::Unlock),
+                    Some(device),
+                ));
             }
             Action::SubmitPrompt { pointer } => {
                 // The accept answers the pointer only: no key sequence sends
@@ -675,7 +683,7 @@ impl App {
                 self.form.ua.clear();
                 self.popups.shared().update(|m| m.prompt = None);
                 self.command(match prompt.admin {
-                    Some(action) => Command::Admin(prompt.id, action, choice),
+                    Some(action) => Command::Admin(prompt.id, action, prompt.target, choice),
                     None => Command::ConnectUnattended(prompt.id, choice),
                 });
             }
