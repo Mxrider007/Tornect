@@ -407,6 +407,11 @@ pub fn main_window(
                 ui.add_space(12.0);
             } else {
                 ui.skip_ahead_auto_ids(1);
+                if model.prompt.is_none() {
+                    ui.ctx().data_mut(|d| {
+                        d.remove::<egui::text_edit::TextEditState>(egui::Id::new(PASSWORD_FIELD));
+                    });
+                }
             }
             egui::ScrollArea::vertical()
                 .id_salt("page")
@@ -433,6 +438,19 @@ pub fn main_window(
     // Countdowns and the banner's clock move once a second.
     if !model.popups.is_empty() || model.confirm.is_some() || !model.sharing.is_empty() {
         ui.ctx().request_repaint_after(Duration::from_millis(500));
+    }
+}
+
+/// The id of the prompt's password field.
+const PASSWORD_FIELD: &str = "unattended-password";
+
+/// egui keeps undo copies of a text field's content in its memory: none are
+/// kept of a password, and the field's state goes with the prompt.
+fn forget_field_history(ctx: &egui::Context) {
+    let id = egui::Id::new(PASSWORD_FIELD);
+    if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
+        state.clear_undoer();
+        state.store(ctx, id);
     }
 }
 
@@ -535,6 +553,7 @@ fn password_prompt(
                 ui.horizontal(|ui| {
                     let field = ui.add(
                         egui::TextEdit::singleline(&mut *ua.password)
+                            .id(PASSWORD_FIELD.into())
                             .password(!ua.reveal)
                             .hint_text("Password")
                             .desired_width(260.0),
@@ -544,6 +563,7 @@ fn password_prompt(
                     });
                     ui.checkbox(&mut ua.reveal, "Show");
                 });
+                forget_field_history(ui.ctx());
             }
             if prompt.admin.is_none() {
                 ui.checkbox(&mut ua.view_only, "View only this time");
