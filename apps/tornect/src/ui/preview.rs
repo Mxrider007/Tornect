@@ -309,7 +309,8 @@ fn unattended(m: &mut Model, sheet: Sheet) -> bool {
             m.prompt = Some(super::model::Prompt {
                 id,
                 host,
-                keychain: Some("the kernel keyring of this sign-in"),
+                keychain: Some("the kernel keyring of your user account"),
+                kept: Some(tornect_core::unattended::credentials::KEYUTILS_KEPT),
                 remember: (RememberOffer::Offered, RememberOffer::NotForAdministrator),
                 remembered: false,
                 stale: false,

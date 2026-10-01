@@ -1028,6 +1028,7 @@ fn open_prompt(b: &Backend, id: TornectId, admin: Option<AdminAction>, target: O
             id,
             host,
             keychain: saved.keychain(),
+            kept: saved.kept(),
             remember: (saved.offer(false), saved.offer(true)),
             remembered: record.remember && saved.keychain().is_some(),
             stale: record.stale,

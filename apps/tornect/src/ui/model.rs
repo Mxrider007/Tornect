@@ -712,6 +712,9 @@ pub struct Prompt {
     pub host: String,
     /// The keychain a password can be remembered in, if one is usable.
     pub keychain: Option<&'static str>,
+    /// How long that keychain keeps a password, when not until it is
+    /// deleted: the risk copy says it (F4-2).
+    pub kept: Option<&'static str>,
     /// Whether "Remember on this device" is offered, without and with the
     /// administrator level asked for.
     pub remember: (RememberOffer, RememberOffer),

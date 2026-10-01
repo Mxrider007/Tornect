@@ -593,9 +593,13 @@ fn password_prompt(
                                 RichText::new(format!(
                                     "Anyone who can use this computer as you could then \
                                      connect to \"{}\" without the password, and any program \
-                                     running as you can read it from {}.",
+                                     running as you can read it from {}.{}",
                                     prompt.host,
-                                    prompt.keychain.unwrap_or("the keychain")
+                                    prompt.keychain.unwrap_or("the keychain"),
+                                    prompt
+                                        .kept
+                                        .map(|kept| format!(" {kept}"))
+                                        .unwrap_or_default()
                                 ))
                                 .small()
                                 .color(t.text_muted),
