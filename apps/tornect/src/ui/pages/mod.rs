@@ -1721,19 +1721,20 @@ mod tests {
         assert!(has_text(&window, "(Control · administrator)"));
     }
 
-    /// The first run says once that no list of the computers connected to
-    /// is kept unless history is switched on, and that pairings and the log
-    /// of sessions others start here are always kept (Privacy's wording,
-    /// the operator's ruling of 2026-09-29); not on a later run, and not
-    /// once history is on.
+    /// The first run says once that no recent list is kept unless history
+    /// is switched on, that pairings are always kept, and that the session
+    /// log records connection attempts in both directions (the operator's
+    /// rulings of 2026-09-29, F4-M1); not on a later run, and not once
+    /// history is on.
     #[test]
     fn the_first_run_says_history_is_off() {
         let notice = home::HISTORY_NOTICE;
         assert_eq!(
             notice,
-            "Tornect keeps no list of the computers you connect to unless you switch history on \
-             (Address book, Recent). Pairings, and the log of sessions others start on this \
-             computer, are always kept."
+            "Tornect keeps no list of your recent connections unless you switch history on \
+             (Address book, Recent). Pairings are always kept. The session log on this computer \
+             always records connection attempts in both directions: requests to this computer, \
+             and your unattended connections to others. It is never sent anywhere."
         );
         let mut model = with_book(false);
         model.book.history = false;
@@ -1747,6 +1748,44 @@ mod tests {
         model.book.history = true;
         let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
         assert!(!has_text(&window, notice), "history is on");
+    }
+
+    /// F4-M1: the Recent tab with history off and Forget's confirmation say
+    /// that the session log is kept either way, and Forget says what it
+    /// removes (the remembered password too) and what stays.
+    #[test]
+    fn the_history_texts_name_the_session_log() {
+        let mut model = with_book(false);
+        model.book.history = false;
+        let id = office(&model);
+        let mut window = Window::new(model, Page::AddressBook, egui::Theme::Dark, WIDE);
+        window.form.book.tab = Tab::Recent;
+        window.pass(Vec::new());
+        assert_eq!(
+            address_book::HISTORY_OFF,
+            "Off: no list of recent connections is kept. Switched on, it keeps the day of each \
+             connection (never the time) and each computer's last-connected day, only on this \
+             computer; anything kept before stays until you clear it. The switch does not cover \
+             the session log: it always records connection attempts in both directions, with \
+             their time, on this computer only."
+        );
+        assert!(has_text(&window, address_book::HISTORY_OFF));
+        window.form.book.tab = Tab::Computers;
+        window.form.book.forgetting = Some(id);
+        window.pass(Vec::new());
+        let question = address_book::forget_question("Office PC");
+        assert_eq!(
+            question,
+            "Forget \"Office PC\"? Its pairing, name, recent connections and remembered password \
+             go; the next connection compares a code again."
+        );
+        assert!(has_text(&window, &question));
+        assert_eq!(
+            address_book::FORGET_KEEPS,
+            "Its lines in the session log stay: the session log always records connection \
+             attempts in both directions."
+        );
+        assert!(has_text(&window, address_book::FORGET_KEEPS));
     }
 
     /// Every preview sheet and stage draws in both themes at both sizes
