@@ -8,9 +8,11 @@
 //! ‖ host onion key)[..16 bytes]>`. No address, name or label reaches the keychain: not in
 //! the entry's target, user, comment, label or attributes.
 //!
-//! What may be remembered: nothing without a usable keychain; nothing for a grant that may
-//! carry the administrator level unless the keychain asks the person before every read
-//! (a presence gate such as Windows Hello; no Linux store has one), DA-14. A remembered
+//! What may be remembered: nothing without a usable keychain; nothing for a grant once an
+//! accept signed it the administrator level, or while the level is asked for, unless the
+//! keychain asks the person before every read (a presence gate such as Windows Hello; no
+//! Linux store has one), DA-14. A grant that may carry the level but was used without it is
+//! not known here, since an accept says only what it gave (F4-1, open). A remembered
 //! password goes stale only when it was refused (`AUTH_FAILED`, or this side's own check of
 //! the host's answer), never on a transport error or a `PREEMPTED` (B.8.4.6).
 
@@ -32,6 +34,12 @@ const NAME_BYTES: usize = 16;
 /// The prompt's sentence when no keychain can hold a password (§B.8.9.1).
 pub const NO_KEYCHAIN: &str =
     "This computer has no system keychain Tornect can use, so the password cannot be remembered.";
+
+/// What the risk copy adds for the Linux kernel keyrings (F4-2): the key is linked into the
+/// account's persistent keyring, which outlives a sign-out until it expires a few days after
+/// its last use, or the computer restarts, and any process of the account can reach it.
+pub const KEYUTILS_KEPT: &str =
+    "It stays on this account until a restart, or for a few days after you sign out.";
 
 /// The prompt's sentence when the grant may carry the administrator level and the keychain
 /// asks nobody before a read (DA-14).
@@ -74,6 +82,11 @@ impl std::fmt::Debug for EntryName {
 pub trait PasswordVault: Send + Sync {
     /// The keychain, as the prompt names it ("Windows Credential Manager").
     fn describe(&self) -> &'static str;
+    /// How long the keychain keeps a password, as a sentence the risk copy adds, when that
+    /// is not until it is deleted (`None`).
+    fn kept(&self) -> Option<&'static str> {
+        None
+    }
     /// Whether every read asks the person first (Windows Hello, Touch ID): only such a
     /// keychain may keep the password of a grant that can carry the administrator level.
     fn presence_gated(&self) -> bool;
@@ -239,6 +252,13 @@ impl SavedPasswords {
         self.vault.as_ref().map(|v| v.describe())
     }
 
+    /// How long the keychain keeps a password, when that is not until it is deleted: the
+    /// sentence the risk copy adds ([`PasswordVault::kept`]).
+    #[must_use]
+    pub fn kept(&self) -> Option<&'static str> {
+        self.vault.as_ref().and_then(|v| v.kept())
+    }
+
     /// The entry of `host`, computed now from the identities (never read from a file).
     #[must_use]
     pub fn entry(&self, host: &TornectId) -> EntryName {
@@ -373,6 +393,25 @@ mod keychain {
         Keyutils,
     }
 
+    impl Kind {
+        /// The keychain as the prompt names it: on Linux the key is the account's, not one
+        /// sign-in's (F4-2).
+        fn describe(self) -> &'static str {
+            match self {
+                Self::Windows => "Windows Credential Manager",
+                Self::Keyutils => "the kernel keyring of your user account",
+            }
+        }
+
+        /// How long it keeps a password, when that is not until it is deleted.
+        fn kept(self) -> Option<&'static str> {
+            match self {
+                Self::Windows => None,
+                Self::Keyutils => Some(super::KEYUTILS_KEPT),
+            }
+        }
+    }
+
     /// A [`PasswordVault`] over a `keyring-core` store.
     pub struct KeychainVault {
         store: Arc<CredentialStore>,
@@ -442,10 +481,11 @@ mod keychain {
 
     impl PasswordVault for KeychainVault {
         fn describe(&self) -> &'static str {
-            match self.kind {
-                Kind::Windows => "Windows Credential Manager",
-                Kind::Keyutils => "the kernel keyring of this sign-in",
-            }
+            self.kind.describe()
+        }
+
+        fn kept(&self) -> Option<&'static str> {
+            self.kind.kept()
         }
 
         fn presence_gated(&self) -> bool {
@@ -496,6 +536,26 @@ mod keychain {
     #[cfg(all(test, target_os = "linux"))]
     mod tests {
         use super::*;
+
+        /// F4-2: the Linux keychain is named for the account, never for one sign-in, and
+        /// the risk copy says how long it keeps a password; Windows keeps it until it is
+        /// deleted, so nothing is added there.
+        #[test]
+        fn the_kernel_keyring_is_named_for_the_account_and_its_lifetime() {
+            assert_eq!(
+                Kind::Keyutils.describe(),
+                "the kernel keyring of your user account"
+            );
+            assert_eq!(
+                Kind::Keyutils.kept(),
+                Some(
+                    "It stays on this account until a restart, or for a few days after you \
+                     sign out."
+                )
+            );
+            assert_eq!(Kind::Windows.describe(), "Windows Credential Manager");
+            assert_eq!(Kind::Windows.kept(), None);
+        }
 
         /// The entry a keyutils vault builds carries the opaque name as its whole
         /// description; nothing else of the host reaches the keychain. Needs a kernel

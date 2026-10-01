@@ -919,6 +919,7 @@ mod tests {
             id,
             host: "Office PC".to_owned(),
             keychain: Some("a test keychain"),
+            kept: None,
             remember: (RememberOffer::Offered, RememberOffer::NotForAdministrator),
             remembered: false,
             stale: false,
@@ -993,6 +994,31 @@ mod tests {
         waiting.prompt.as_mut().unwrap().retry_at = Some(Instant::now() + Duration::from_secs(600));
         let window = Window::new(waiting, Page::Home, egui::Theme::Dark, WIDE);
         assert!(has_text(&window, "asked this device to wait"));
+    }
+
+    /// F4-2: the risk copy names the Linux keychain for the account and says
+    /// how long it keeps the password; a keychain that keeps it until it is
+    /// deleted adds nothing.
+    #[test]
+    fn the_risk_copy_says_how_long_the_keychain_keeps_it() {
+        use tornect_core::unattended::credentials::KEYUTILS_KEPT;
+        let mut model = with_book(false);
+        let id = office(&model);
+        let mut linux = prompt(id);
+        linux.keychain = Some("the kernel keyring of your user account");
+        linux.kept = Some(KEYUTILS_KEPT);
+        model.prompt = Some(linux);
+        let window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(
+            &window,
+            "any program running as you can read it from the kernel keyring of your user \
+             account. It stays on this account until a restart, or for a few days after you \
+             sign out."
+        ));
+        model.prompt = Some(prompt(id));
+        let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(&window, "can read it from a test keychain."));
+        assert!(!has_text(&window, "It stays on this account"));
     }
 
     /// §B.8.10: the prompt is never shown while this screen is shared: no

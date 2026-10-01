@@ -931,8 +931,12 @@ async fn connect_session(
             &p.request,
         ) {
             Ok(true) if p.request.remember => eprintln!(
-                "the password is remembered in {}",
-                p.saved.keychain().unwrap_or("the keychain")
+                "the password is remembered in {}{}",
+                p.saved.keychain().unwrap_or("the keychain"),
+                p.saved
+                    .kept()
+                    .map(|kept| format!(". {kept}"))
+                    .unwrap_or_default()
             ),
             Ok(_) => {}
             Err(e) => eprintln!("the password could not be remembered: {e:#}"),
