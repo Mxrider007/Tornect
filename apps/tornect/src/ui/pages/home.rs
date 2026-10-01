@@ -17,10 +17,13 @@ use super::super::view::{Action, Form, SAS_SIZE};
 use super::super::widgets::{self, Button, Kind, Tone};
 use super::{day_in_sentence, day_text};
 
-/// Home's first-run line: history is off until switched on.
-pub(super) const HISTORY_NOTICE: &str = "Tornect keeps no list of the computers you connect to \
-    unless you switch history on (Address book, Recent). Pairings, and the log of sessions others \
-    start on this computer, are always kept.";
+/// Home's first-run line: history is off until switched on, and the
+/// session log is kept either way (F4-M1): the host side records every
+/// request to this computer, the client side every unattended connection.
+pub(super) const HISTORY_NOTICE: &str = "Tornect keeps no list of your recent connections \
+    unless you switch history on (Address book, Recent). Pairings are always kept. The session \
+    log on this computer always records connection attempts in both directions: requests to this \
+    computer, and your unattended connections to others. It is never sent anywhere.";
 
 /// How long "Copied" shows after Copy ID.
 const COPIED_FOR: Duration = Duration::from_secs(2);

@@ -45,6 +45,29 @@ pub struct BookForm {
     pub forgetting: Option<TornectId>,
 }
 
+/// The Recent tab's line while history is off: the switch governs the
+/// recent list only; the session log records connection attempts either
+/// way (F4-M1).
+pub(super) const HISTORY_OFF: &str = "Off: no list of recent connections is kept. Switched on, \
+    it keeps the day of each connection (never the time) and each computer's last-connected day, \
+    only on this computer; anything kept before stays until you clear it. The switch does not \
+    cover the session log: it always records connection attempts in both directions, with their \
+    time, on this computer only.";
+
+/// Forget's question for the computer called `title`: what goes (its
+/// pairing, name, recent lines and remembered password). No longer than
+/// the question it replaced, so its answers stay where they were.
+pub(super) fn forget_question(title: &str) -> String {
+    format!(
+        "Forget \"{title}\"? Its pairing, name, recent connections and remembered password go; \
+         the next connection compares a code again."
+    )
+}
+
+/// Under Forget's answers: what stays (F4-M1).
+pub(super) const FORGET_KEEPS: &str = "Its lines in the session log stay: the session log always \
+    records connection attempts in both directions.";
+
 /// From this content width on, the details sit beside the list.
 const SIDE_BY_SIDE_FROM: f32 = 760.0;
 /// The space between cards.
@@ -780,12 +803,7 @@ fn forget_row(
                 ui.set_width(ui.available_width());
                 ui.add(
                     egui::Label::new(
-                        RichText::new(format!(
-                            "Forget \"{}\"? Its pairing, its saved name and its history on this \
-                             computer go; the next connection to it compares a code again.",
-                            computer.title()
-                        ))
-                        .color(t.text_primary),
+                        RichText::new(forget_question(&computer.title())).color(t.text_primary),
                     )
                     .wrap(),
                 );
@@ -808,6 +826,7 @@ fn forget_row(
                         form.book.selected = None;
                     }
                 });
+                muted(ui, t, FORGET_KEEPS);
             });
     } else if Button::new(Kind::Danger, "Forget this computer")
         .icon(Icon::Trash)
@@ -913,9 +932,7 @@ fn recent(ui: &mut Ui, t: &Tokens, book: &Book, actions: &mut Vec<Action>) {
                 "On. The list keeps the day of each connection, never the time; it stays on this \
                  computer and is never sent anywhere."
             } else {
-                "Off: nothing about past connections is written. Switched on, it keeps the day \
-                 of each connection (never the time) and each computer's last-connected day, \
-                 only on this computer; anything kept before stays until you clear it."
+                HISTORY_OFF
             },
         );
         ui.add_space(6.0);
