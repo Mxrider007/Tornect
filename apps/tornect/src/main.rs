@@ -235,8 +235,10 @@ enum Command {
         #[arg(long, requires = "unattended")]
         view_only: bool,
         /// With --unattended: keep the password in this computer's keychain once
-        /// it worked. Any program running as you can read it there. Refused
-        /// without a usable keychain, and for administrator access.
+        /// it worked. Any program running as you can read it there; on Linux
+        /// it stays on this account until a restart, or for a few days after
+        /// you sign out. Refused without a usable keychain, and for
+        /// administrator access.
         #[arg(long, requires = "unattended")]
         remember: bool,
         /// With --unattended: ask for administrator access (with control only).
