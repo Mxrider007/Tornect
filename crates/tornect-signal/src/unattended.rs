@@ -1012,6 +1012,21 @@ mod tests {
     }
 
     fn env_with(password: &str, preset: Preset, options: &GrantOptions) -> Env {
+        env_with_facts(
+            password,
+            preset,
+            options,
+            Arc::new(tornect_core::levels::FixedFacts::linux()),
+        )
+    }
+
+    /// [`env_with`] on a host whose account facts and helper task `facts` gives.
+    fn env_with_facts(
+        password: &str,
+        preset: Preset,
+        options: &GrantOptions,
+        facts: Arc<dyn FactsSource>,
+    ) -> Env {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(tmp.path());
         std::fs::create_dir_all(paths.keys_dir()).unwrap();
@@ -1062,7 +1077,7 @@ mod tests {
             limiter,
             Arc::new(tornect_core::unattended::schedule::FixedOffset::utc()),
             HostTransport::default(),
-            Arc::new(tornect_core::levels::FixedFacts::linux()),
+            facts,
         );
         Env {
             _tmp: tmp,
@@ -1469,6 +1484,65 @@ mod tests {
         let ck = client_key.expect("client finished");
         let expect = auth::session_token(&ck, &[0x44; 32]);
         assert_eq!(token.session_token(), expect.as_ref());
+    }
+
+    /// S5A-1 (decision M1-67, D10, D11): the receipt the gate mints, read before any read
+    /// after the reservation can lower it. A control grant asking for control is minted
+    /// view only where control is administrator access on this account (F-12:
+    /// `ConsentPromptBehaviorAdmin` 0, facts that could not be read) and where the marked
+    /// password meets clause (ii) (the helper task registered, or its query failing);
+    /// control on an administrator account with UAC on and no task.
+    #[tokio::test]
+    async fn the_gate_mints_view_only_where_f12_or_the_marked_rule_says_so() {
+        use tornect_core::levels::{AccountFacts, FixedFacts, HelperPresence, WindowsFacts};
+        let admin = |cpba: Option<u32>| {
+            AccountFacts::Windows(WindowsFacts {
+                installed: true,
+                administrator: true,
+                consent_prompt_behavior_admin: cpba,
+                ..WindowsFacts::default()
+            })
+        };
+        let absent = HelperPresence::Absent;
+        for (case, account, helper, expected) in [
+            ("CPBA 0", admin(Some(0)), absent, SessionMode::ViewOnly),
+            (
+                "unreadable",
+                AccountFacts::Unreadable,
+                absent,
+                SessionMode::ViewOnly,
+            ),
+            (
+                "helper task registered",
+                admin(None),
+                HelperPresence::Registered,
+                SessionMode::ViewOnly,
+            ),
+            (
+                "helper task unreadable",
+                admin(None),
+                HelperPresence::Unreadable,
+                SessionMode::ViewOnly,
+            ),
+            ("UAC on, no task", admin(None), absent, SessionMode::Control),
+        ] {
+            let env = env_with_facts(
+                PW,
+                Preset::HeadlessBox,
+                &GrantOptions::default(),
+                Arc::new(FixedFacts::new(account, helper)),
+            );
+            let (verdict, _) = run(&env, PW, &TimerOnlyWindow, &DenyAll).await;
+            let Ok(UnattendedVerdict::Accept {
+                proof: ConsentProof::Unattended { policy, .. },
+                ..
+            }) = verdict
+            else {
+                panic!("{case}: no accept");
+            };
+            assert_eq!(policy.mode(), expected, "{case}");
+            assert_eq!(policy.elevation(), Elevation::None, "{case}");
+        }
     }
 
     /// A wrong password is `AUTH_FAILED` and the charge is settled as a failure,
