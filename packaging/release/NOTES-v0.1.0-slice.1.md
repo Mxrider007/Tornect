@@ -157,12 +157,18 @@ By the identifiers of the security reviews that found them.
   back; it shows on the primary monitor only, while the whole desktop is shared.
 - **E2-6:** closing the console window, logging off or shutting down ends Tornect at once: keys the viewer held
   may stay pressed, and `sessions.log` gets no end record. Use Stop, the window's close button, or Ctrl-C.
-- **E2-8:** an elevated `tornect.exe` (run as administrator, or the `--elevated` task) lets a viewer with
-  control drive elevated windows, and nothing on screen says so: do not run it as administrator unless you
-  mean that.
-- **F1-5:** with `service install --elevated`, anything that runs as you can make the elevated host run a
-  program of its choice through `config.toml` (`tor.pt_path`). Use `--elevated` only where that is acceptable;
-  UAC is not a security boundary. (The elevated task cannot be started on demand.)
+- **E2-8:** a `tornect.exe` started as administrator while User Account Control is on refuses to accept
+  connections: start it normally, administrator access is given per session. Where User Account Control is
+  off, every program runs as administrator, so a session with control is administrator access: Tornect offers
+  it only as "Allow as administrator", after its own confirmation (a copy run from outside Program Files offers
+  View only there).
+- **F1-5:** no start-at-login task runs elevated: `service install` registers only the normal task, and first
+  removes one that an earlier version registered elevated, through Windows' prompt (a cancelled or failed
+  removal fails the install).
+- **F-13:** administrator access for a session comes from a separate helper that Windows starts with its own
+  prompt, for that session only, and this build keeps the helper switched off. On an administrator account set
+  to elevate without prompting, a session with control could make itself administrator unasked, so this build
+  shares View only there.
 - **F1-1:** `service status` and `uninstall` tell a missing start-at-login task from one this account cannot
   read by looking in the Task Scheduler's folder. That removal path is untested on a Windows machine, like all
   of Task Scheduler, the secure credential prompt and UAC. If either seems wrong, check in an administrator
@@ -170,7 +176,7 @@ By the identifiers of the security reviews that found them.
 - **F1-6:** one task name, `\Tornect`, per PC: a second Windows account cannot register its own, sees the first
   account's `\Tornect` task, and can remove it through UAC.
 - **F1-2's residuals:** after registering, Tornect reads the task back and removes it if it is not the one it
-  wrote; it cannot compare a task this account cannot read back (likely the elevated one), and the task file
+  wrote; it cannot compare a task this account cannot read back, and the task file
   (written under your local application data folder and deleted after registration) has no access list of its
   own.
 - **Default 3:** an account that signs in only with Windows Hello (a PIN, a face or a fingerprint), or a
