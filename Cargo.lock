@@ -7410,6 +7410,7 @@ name = "tornect-platform"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ashpd",
  "data-encoding",
  "fs-err",
  "getrandom 0.4.3",
