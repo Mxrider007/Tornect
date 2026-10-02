@@ -283,6 +283,9 @@ pub fn wire(
     let pins = Arc::new(
         crate::history::DevicePins::open(paths).context("opening the trusted-devices store")?,
     );
+    // The load keeps pairing times past their first day to the day in
+    // memory only; the start writes them to the file once (P-L4).
+    pins.write_back_to_the_day();
     let trusted = pins.store();
     // One handle on `sessions.log` for the whole host: the log is a hash chain
     // whose lock lives in the handle, and the grant store keys it. A second
@@ -1120,6 +1123,84 @@ mod tests {
         )
         .unwrap();
         assert_eq!(terminal.cfg.feats, vec![messages::feats::UA1.to_owned()]);
+    }
+
+    /// FR2R-L1 (P-L4, the host's file): the host's start writes
+    /// `trusted-devices.toml` back with a pairing time past its first day
+    /// kept to the day (and a last-seen time that still was that second),
+    /// with no pairing and history off; a pairing within its first day keeps
+    /// its second. A file with nothing to keep to the day is not rewritten,
+    /// and a home with no file gets none.
+    #[test]
+    fn the_hosts_start_keeps_the_pairing_time_to_the_day_on_disk() {
+        use tornect_core::trusted::{TrustedDevices, unix_now};
+
+        let start = |env: &Env| {
+            drop(
+                wire(
+                    &env.paths,
+                    &Config::default(),
+                    Arc::clone(&env.identity),
+                    [9; 32],
+                    Arc::new(ScriptedConsent::new()),
+                    media(),
+                    ControlChannel::default(),
+                )
+                .unwrap(),
+            );
+        };
+        let fresh = env();
+        start(&fresh);
+        assert!(
+            !fresh.paths.trusted_devices_file().exists(),
+            "no file: none written"
+        );
+
+        let env = env();
+        tornect_core::address_book::Store::new(&env.paths)
+            .set_history(false)
+            .unwrap();
+        let file = env.paths.trusted_devices_file();
+        let dev = |b: u8| DeviceId::from_bytes([b; 32]);
+        let now = unix_now();
+        let day = now - now % 86_400 - 2 * 86_400;
+        let (old, recent) = (day + 41_234, now - 60);
+        let mut devices = TrustedDevices::default();
+        devices.pin(dev(1), "Laptop", old);
+        devices.pin(dev(2), "Tablet", recent);
+        devices.save(&file).unwrap();
+
+        start(&env);
+        let kept = TrustedDevices::load(&file).unwrap();
+        let laptop = kept.get(&dev(1)).unwrap();
+        assert_eq!((laptop.paired_at, laptop.last_seen), (day, day));
+        let tablet = kept.get(&dev(2)).unwrap();
+        assert_eq!(
+            (tablet.paired_at, tablet.last_seen),
+            (recent, recent),
+            "its first day: the second"
+        );
+        assert!(
+            !std::fs::read_to_string(&file)
+                .unwrap()
+                .contains(&old.to_string())
+        );
+
+        let long_ago = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        start(&env);
+        assert_eq!(std::fs::read(&file).unwrap(), bytes, "nothing to keep");
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            long_ago,
+            "not rewritten"
+        );
     }
 
     /// Give `device` an unattended grant with `password` in `env`'s store, the
