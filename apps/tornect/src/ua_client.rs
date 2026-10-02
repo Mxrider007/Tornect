@@ -726,6 +726,114 @@ pub fn settle_admin(
     Ok(settled)
 }
 
+/// What one verified unattended answer was, for the notes after it (decision M1-67).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answered {
+    /// A `SESSION_ACCEPT`.
+    Session {
+        /// The level it signed.
+        elevation: tornect_core::levels::Elevation,
+        /// Its `grant_reach`, if it carried one.
+        grant_reach: Option<u8>,
+        /// Control was asked for.
+        asked_control: bool,
+        /// The signed mode is control.
+        given_control: bool,
+        /// The administrator level was asked for and not given.
+        withheld: bool,
+    },
+    /// An `ADMIN_RESULT`.
+    Admin {
+        /// Its `grant_reach`, if it carried one.
+        grant_reach: Option<u8>,
+    },
+    /// A `SESSION_ACCEPT` or `ADMIN_RESULT` this side refused (C4).
+    Refused,
+}
+
+/// The notes after an answer at `host` (decision M1-67, its client copy), each naming the
+/// host as given (quoted by the caller): about the password from the answer, whether
+/// Remember was ticked and what [`settle`] did (`None`: it failed, and its error says why);
+/// about the session whatever the settle did. `keychain` is the keychain's name.
+#[must_use]
+pub fn notes(
+    host: &str,
+    keychain: &str,
+    answered: Answered,
+    ticked: bool,
+    settled: Option<&Settled>,
+) -> Vec<String> {
+    use tornect_core::levels::Elevation;
+    use tornect_core::unattended::credentials::note;
+    let mut out = Vec::new();
+    if let Some(settled) = settled {
+        if settled.delete_failed {
+            out.push(note::failed_delete(host, keychain));
+        }
+        let (reach, grant_reach, control) = match answered {
+            Answered::Session {
+                elevation,
+                grant_reach,
+                given_control,
+                ..
+            } => (
+                Attempt::reaches(elevation, grant_reach),
+                grant_reach,
+                given_control,
+            ),
+            Answered::Admin { grant_reach } => (
+                Attempt::reaches(Elevation::None, grant_reach),
+                grant_reach,
+                false,
+            ),
+            Answered::Refused => (true, None, false),
+        };
+        if answered == Answered::Refused {
+            if settled.forgot {
+                out.push(note::refused_answer(host));
+            }
+        } else if reach {
+            match grant_reach {
+                None if settled.forgot || ticked => {
+                    out.push(note::absent_key(host, settled.forgot));
+                }
+                Some(_) if settled.forgot => out.push(note::deleted_at_reach(host, control)),
+                Some(2) if ticked => out.push(note::answer_2(host)),
+                Some(_) if ticked => out.push(note::answer_1(host)),
+                None | Some(_) => {}
+            }
+        }
+    }
+    if let Answered::Session {
+        asked_control: true,
+        given_control: false,
+        grant_reach: Some(1 | 2),
+        ..
+    } = answered
+    {
+        out.push(note::view_only(host));
+    }
+    if let Answered::Session { withheld: true, .. } = answered {
+        out.push(note::level_not_given(host));
+    }
+    out
+}
+
+/// The notes after an attempt that got no session: only a refused answer has any (C4).
+#[must_use]
+pub fn refused_notes(
+    host: &str,
+    keychain: &str,
+    attempt: Attempt,
+    settled: &Settled,
+) -> Vec<String> {
+    if attempt == Attempt::AnswerRefused {
+        notes(host, keychain, Answered::Refused, false, Some(settled))
+    } else {
+        Vec::new()
+    }
+}
+
 /// Record the signed mode of an accepted session at `host` (the host card
 /// offers the control grants' admin actions from it).
 pub fn note_mode(paths: &Paths, host: &TornectId, control: bool) -> anyhow::Result<()> {
@@ -1642,6 +1750,186 @@ mod tests {
         assert_eq!(
             record(&paths, &h),
             tornect_core::unattended::hosts::HostRecord::default()
+        );
+    }
+
+    /// The host as the notes name it.
+    const DESK: &str = "\"Desk\"";
+
+    /// A session answer for the notes: control asked and given, nothing withheld.
+    fn session(grant_reach: Option<u8>) -> Answered {
+        Answered::Session {
+            elevation: tornect_core::levels::Elevation::None,
+            grant_reach,
+            asked_control: true,
+            given_control: true,
+            withheld: false,
+        }
+    }
+
+    /// What `settle` did, for the notes.
+    fn did(forgot: bool, delete_failed: bool) -> Settled {
+        Settled {
+            forgot,
+            delete_failed,
+            ..Settled::default()
+        }
+    }
+
+    /// M1-67 copy, answer 2: Remember ticked, nothing kept, and only then the note.
+    #[test]
+    fn the_note_for_an_answer_of_2() {
+        let said = "The password was not remembered: \"Desk\" lets your access use administrator \
+                    access through Tornect.";
+        assert_eq!(
+            notes(DESK, "K", session(Some(2)), true, Some(&did(false, false))),
+            [said]
+        );
+        assert!(notes(DESK, "K", session(Some(2)), false, Some(&did(false, false))).is_empty());
+        assert!(notes(DESK, "K", session(Some(0)), true, Some(&did(false, false))).is_empty());
+    }
+
+    /// M1-67 copy, answer 1 (the host over-reports on purpose).
+    #[test]
+    fn the_note_for_an_answer_of_1() {
+        let said = "The password was not remembered: \"Desk\" says your access there can reach \
+                    administrator access through Tornect, or could not rule it out.";
+        assert_eq!(
+            notes(DESK, "K", session(Some(1)), true, Some(&did(false, false))),
+            [said]
+        );
+        assert!(notes(DESK, "K", session(Some(1)), false, Some(&did(false, false))).is_empty());
+    }
+
+    /// M1-67 copy: a remembered password deleted at 1 or 2; "Type it each time." only
+    /// when the signed mode was control, never after an admin command.
+    #[test]
+    fn the_note_for_a_password_deleted_at_reach() {
+        let deleted = "The password remembered for \"Desk\" was deleted: \"Desk\" now says your \
+                       access there can reach administrator access through Tornect, or could \
+                       not rule it out.";
+        for reach in [Some(1), Some(2)] {
+            assert_eq!(
+                notes(DESK, "K", session(reach), false, Some(&did(true, false))),
+                [format!("{deleted} Type it each time.")]
+            );
+            let view = Answered::Session {
+                elevation: tornect_core::levels::Elevation::None,
+                grant_reach: reach,
+                asked_control: false,
+                given_control: false,
+                withheld: false,
+            };
+            assert_eq!(
+                notes(DESK, "K", view, false, Some(&did(true, false))),
+                [deleted]
+            );
+            let admin = Answered::Admin { grant_reach: reach };
+            assert_eq!(
+                notes(DESK, "K", admin, false, Some(&did(true, false))),
+                [deleted]
+            );
+        }
+    }
+
+    /// M1-67 copy: control asked, the signed mode view only and `grant_reach` 1 or 2: the
+    /// view-only note; not at 0, and not without the key.
+    #[test]
+    fn the_view_only_note() {
+        let said = "\"Desk\" gave this session view only. Its owner can bring control back, for \
+                    example by giving this device a new password.";
+        let lowered = |grant_reach| Answered::Session {
+            elevation: tornect_core::levels::Elevation::None,
+            grant_reach,
+            asked_control: true,
+            given_control: false,
+            withheld: false,
+        };
+        for reach in [Some(1), Some(2)] {
+            assert_eq!(
+                notes(DESK, "K", lowered(reach), false, Some(&did(false, false))),
+                [said]
+            );
+        }
+        assert!(notes(DESK, "K", lowered(Some(0)), false, Some(&did(false, false))).is_empty());
+        assert!(notes(DESK, "K", lowered(None), false, Some(&did(false, false))).is_empty());
+    }
+
+    /// M1-67 copy: an answer without `grant_reach` (an older host): not remembered, or the
+    /// remembered one deleted; nothing to say when neither.
+    #[test]
+    fn the_note_for_an_absent_key() {
+        assert_eq!(
+            notes(DESK, "K", session(None), true, Some(&did(false, false))),
+            [
+                "\"Desk\" runs an older Tornect that does not say what your access can reach \
+              there, so the password is not remembered."
+            ]
+        );
+        assert_eq!(
+            notes(
+                DESK,
+                "K",
+                Answered::Admin { grant_reach: None },
+                false,
+                Some(&did(true, false))
+            ),
+            [
+                "\"Desk\" runs an older Tornect that does not say what your access can reach \
+              there, so the password remembered for it was deleted."
+            ]
+        );
+        assert!(notes(DESK, "K", session(None), false, Some(&did(false, false))).is_empty());
+    }
+
+    /// M1-67 copy: a refused answer that deleted a remembered password says so.
+    #[test]
+    fn the_note_for_a_refused_answer() {
+        assert_eq!(
+            notes(DESK, "K", Answered::Refused, false, Some(&did(true, false))),
+            [
+                "\"Desk\" sent an answer this device could not check; the password remembered \
+              for it was deleted."
+            ]
+        );
+        assert!(notes(DESK, "K", Answered::Refused, true, Some(&did(false, false))).is_empty());
+    }
+
+    /// M1-67 copy, C7: the keychain refused the delete.
+    #[test]
+    fn the_note_for_a_failed_delete() {
+        assert_eq!(
+            notes(
+                DESK,
+                "Windows Credential Manager",
+                session(Some(1)),
+                false,
+                Some(&did(false, true))
+            ),
+            [
+                "The password remembered for \"Desk\" could not be deleted from Windows Credential \
+              Manager. Tornect tries again when you next connect; Forget \"Desk\" also deletes \
+              it."
+            ]
+        );
+    }
+
+    /// M1-67 copy: the level asked for and not given.
+    #[test]
+    fn the_note_for_the_level_not_given() {
+        let withheld = Answered::Session {
+            elevation: tornect_core::levels::Elevation::None,
+            grant_reach: Some(0),
+            asked_control: true,
+            given_control: true,
+            withheld: true,
+        };
+        assert_eq!(
+            notes(DESK, "K", withheld, false, Some(&did(false, false))),
+            [
+                "\"Desk\" did not give administrator access to this session. The session goes on \
+              without it."
+            ]
         );
     }
 

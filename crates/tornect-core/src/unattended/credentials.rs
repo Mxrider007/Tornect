@@ -48,9 +48,109 @@ pub const KEYUTILS_KEPT: &str =
 
 /// The prompt's sentence where no password is kept: `hosts.toml` says the host's last signed
 /// answer reached administrator access, left `grant_reach` out or was refused, or the level
-/// is asked for this time (M1-67, C5).
-pub const ADMIN_NOT_REMEMBERED: &str = "A password that can give administrator access is never \
-    remembered on this computer: its keychain does not ask you before Tornect reads it.";
+/// is asked for this time (M1-67, C5). It replaces the sentence that blamed the keychain
+/// (DI-12). Like every text of decision M1-67's copy here, it names the host as `host` is
+/// given: a caller quotes a name, and a line that may not name the host passes "this host".
+#[must_use]
+pub fn reach_not_remembered(host: &str) -> String {
+    format!(
+        "A password that can reach administrator access on {host}, or that {host} did \
+         not rule out, is never remembered."
+    )
+}
+
+/// What the risk copy beside "Remember on this device" adds (M1-67): the answer still
+/// decides (C1).
+#[must_use]
+pub fn remember_unless_reach(host: &str) -> String {
+    format!(
+        "If {host} lets your access use administrator access through Tornect, the password \
+         is not remembered."
+    )
+}
+
+/// The notes after a host's answer about the password (M1-67, C2-C7), each naming the host.
+pub mod note {
+    /// The answer said 2 and Remember was ticked.
+    #[must_use]
+    pub fn answer_2(host: &str) -> String {
+        format!(
+            "The password was not remembered: {host} lets your access use administrator \
+             access through Tornect."
+        )
+    }
+
+    /// The answer said 1 and Remember was ticked (the host over-reports on purpose).
+    #[must_use]
+    pub fn answer_1(host: &str) -> String {
+        format!(
+            "The password was not remembered: {host} says your access there can reach \
+             administrator access through Tornect, or could not rule it out."
+        )
+    }
+
+    /// A remembered password deleted at an answer of 1 or 2; "Type it each time." only when
+    /// the signed mode was control.
+    #[must_use]
+    pub fn deleted_at_reach(host: &str, control: bool) -> String {
+        format!(
+            "The password remembered for {host} was deleted: {host} now says your access \
+             there can reach administrator access through Tornect, or could not rule it out.{}",
+            if control { " Type it each time." } else { "" }
+        )
+    }
+
+    /// Control asked for, the signed mode view only and `grant_reach` 1 or 2.
+    #[must_use]
+    pub fn view_only(host: &str) -> String {
+        format!(
+            "{host} gave this session view only. Its owner can bring control back, for \
+             example by giving this device a new password."
+        )
+    }
+
+    /// An unattended answer without `grant_reach` (an older host): `deleted` when a
+    /// remembered password went.
+    #[must_use]
+    pub fn absent_key(host: &str, deleted: bool) -> String {
+        format!(
+            "{host} runs an older Tornect that does not say what your access can reach \
+             there, so the {}",
+            if deleted {
+                "password remembered for it was deleted."
+            } else {
+                "password is not remembered."
+            }
+        )
+    }
+
+    /// This side refused the answer, and a remembered password went (C4).
+    #[must_use]
+    pub fn refused_answer(host: &str) -> String {
+        format!(
+            "{host} sent an answer this device could not check; the password remembered for \
+             it was deleted."
+        )
+    }
+
+    /// The keychain refused the delete (C7).
+    #[must_use]
+    pub fn failed_delete(host: &str, keychain: &str) -> String {
+        format!(
+            "The password remembered for {host} could not be deleted from {keychain}. Tornect \
+             tries again when you next connect; Forget {host} also deletes it."
+        )
+    }
+
+    /// The administrator level was asked for and not given.
+    #[must_use]
+    pub fn level_not_given(host: &str) -> String {
+        format!(
+            "{host} did not give administrator access to this session. The session goes on \
+             without it."
+        )
+    }
+}
 
 /// The keychain entry of one host's remembered password. Only [`EntryName::derive`] makes
 /// one: there is no parser, so a name can never come from a file.
@@ -195,18 +295,19 @@ pub enum RememberOffer {
     NoKeychain,
     /// The host's last signed answer reached administrator access, left `grant_reach` out
     /// or was refused (`hosts.toml`'s `reach`), or the level is asked for: no password is
-    /// kept there, whatever the keychain (C5, C12): [`ADMIN_NOT_REMEMBERED`].
+    /// kept there, whatever the keychain (C5, C12): [`reach_not_remembered`].
     NotForAdministrator,
 }
 
 impl RememberOffer {
-    /// The sentence shown in place of the box, if any.
+    /// The sentence shown in place of the box, if any, naming the host as `host` (the
+    /// caller quotes a name; a line that may not name the host says "this host").
     #[must_use]
-    pub fn sentence(self) -> Option<&'static str> {
+    pub fn sentence(self, host: &str) -> Option<String> {
         match self {
             Self::Offered => None,
-            Self::NoKeychain => Some(NO_KEYCHAIN),
-            Self::NotForAdministrator => Some(ADMIN_NOT_REMEMBERED),
+            Self::NoKeychain => Some(NO_KEYCHAIN.to_owned()),
+            Self::NotForAdministrator => Some(reach_not_remembered(host)),
         }
     }
 }
@@ -563,12 +664,12 @@ mod keychain {
     }
 
     impl Kind {
-        /// The keychain as the prompt names it: on Linux the key is the account's, not one
-        /// sign-in's (F4-2).
+        /// The keychain as the prompt names it (§B.8.9.1): on Linux the key is the
+        /// account's, not one sign-in's (F4-2).
         fn describe(self) -> &'static str {
             match self {
                 Self::Windows => "Windows Credential Manager",
-                Self::Keyutils => "the kernel keyring of your user account",
+                Self::Keyutils => "the kernel keyring of your account",
             }
         }
 
@@ -636,7 +737,8 @@ mod keychain {
             vault.usable().then_some(vault)
         }
 
-        /// The Linux kernel keyrings, if this session has one.
+        /// The Linux kernel keyrings, if this session has them and the kernel gives the
+        /// account a persistent keyring (DI-8).
         #[cfg(target_os = "linux")]
         pub fn keyutils() -> Option<Self> {
             let store = linux_keyutils_keyring_store::Store::new().ok()?;
@@ -644,8 +746,29 @@ mod keychain {
                 store,
                 kind: Kind::Keyutils,
             };
-            vault.usable().then_some(vault)
+            keeps_keyutils(vault.usable(), vault.persistent()).then_some(vault)
         }
+
+        /// Whether the account's persistent keyring is reachable from this sign-in: the
+        /// store links every key into it, and without it a key would live in this
+        /// sign-in's session keyring alone, which the prompt does not describe.
+        #[cfg(target_os = "linux")]
+        fn persistent(&self) -> bool {
+            let probe = EntryName::derive(&[0u8; 32], &[0u8; 32]);
+            self.entry(&probe).is_ok_and(|entry| {
+                entry
+                    .as_any()
+                    .downcast_ref::<linux_keyutils_keyring_store::Cred>()
+                    .is_some_and(|cred| cred.persistent.is_some())
+            })
+        }
+    }
+
+    /// A kernel-keyring vault is used only when the keyrings answer and the account has
+    /// a persistent keyring (§B.8.9.1, DI-8): without one, no Remember is offered.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn keeps_keyutils(answers: bool, persistent: bool) -> bool {
+        answers && persistent
     }
 
     impl PasswordVault for KeychainVault {
@@ -706,14 +829,14 @@ mod keychain {
     mod tests {
         use super::*;
 
-        /// F4-2: the Linux keychain is named for the account, never for one sign-in, and
-        /// the risk copy says how long it keeps a password; Windows keeps it until it is
-        /// deleted, so nothing is added there.
+        /// F4-2, §B.8.9.1: the Linux keychain is named for the account, never for one
+        /// sign-in, and the risk copy says how long it keeps a password; Windows keeps it
+        /// until it is deleted, so nothing is added there.
         #[test]
         fn the_kernel_keyring_is_named_for_the_account_and_its_lifetime() {
             assert_eq!(
                 Kind::Keyutils.describe(),
-                "the kernel keyring of your user account"
+                "the kernel keyring of your account"
             );
             assert_eq!(
                 Kind::Keyutils.kept(),
@@ -724,6 +847,19 @@ mod keychain {
             );
             assert_eq!(Kind::Windows.describe(), "Windows Credential Manager");
             assert_eq!(Kind::Windows.kept(), None);
+        }
+
+        /// DI-8: without a persistent keyring the kernel keyrings are not used, so no
+        /// Remember is offered; keyrings that do not answer are not used either.
+        #[test]
+        fn keyutils_needs_a_persistent_keyring() {
+            assert!(keeps_keyutils(true, true));
+            assert!(
+                !keeps_keyutils(true, false),
+                "no persistent keyring: no vault"
+            );
+            assert!(!keeps_keyutils(false, true));
+            assert!(!keeps_keyutils(false, false));
         }
 
         /// The entry a keyutils vault builds carries the opaque name as its whole
@@ -800,11 +936,23 @@ mod tests {
         let none = SavedPasswords::none([1; 32]);
         assert_eq!(none.offer(false), RememberOffer::NoKeychain);
         assert_eq!(none.offer(true), RememberOffer::NoKeychain);
-        assert_eq!(RememberOffer::NoKeychain.sentence(), Some(NO_KEYCHAIN));
+        assert_eq!(
+            RememberOffer::NoKeychain.sentence("\"Desk\"").as_deref(),
+            Some(NO_KEYCHAIN)
+        );
         let plain = SavedPasswords::new(Some(Arc::new(MemoryVault::new())), [1; 32]);
         assert_eq!(plain.offer(false), RememberOffer::Offered);
         assert_eq!(plain.offer(true), RememberOffer::NotForAdministrator);
-        assert_eq!(RememberOffer::Offered.sentence(), None);
+        assert_eq!(RememberOffer::Offered.sentence("\"Desk\""), None);
+        assert_eq!(
+            RememberOffer::NotForAdministrator
+                .sentence("\"Desk\"")
+                .as_deref(),
+            Some(
+                "A password that can reach administrator access on \"Desk\", or that \"Desk\" \
+                 did not rule out, is never remembered."
+            )
+        );
         let gated = SavedPasswords::new(Some(Arc::new(MemoryVault::presence_gated())), [1; 32]);
         assert_eq!(gated.offer(false), RememberOffer::Offered);
         assert_eq!(gated.offer(true), RememberOffer::NotForAdministrator);
