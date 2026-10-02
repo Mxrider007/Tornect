@@ -418,10 +418,11 @@ pub fn form(form: &mut super::view::Form, sheet: Sheet, first: Option<TornectId>
     }
 }
 
-/// A taller main window for a sheet whose card sits low on its page.
+/// A taller main window for a sheet whose card sits low on its page (Forget's
+/// confirmation: the line under its answers).
 #[must_use]
 pub fn height(sheet: Sheet) -> Option<f64> {
-    (sheet == Sheet::UaUnlock).then_some(1150.0)
+    matches!(sheet, Sheet::UaUnlock | Sheet::ForgetAsk).then_some(1150.0)
 }
 
 /// The connect stepper's stages for `--sheet stage-…`, with an invented
