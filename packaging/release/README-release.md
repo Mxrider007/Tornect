@@ -76,8 +76,9 @@ with a goodbye.
     ./tornect ping <ID>         # is that host reachable over Tor? (no pairing needed)
     ./tornect panic             # end every session the running host serves
 
-`tornect host` prints `Tornect ID: …` at once and `REACHABLE` once the address
-is published, typically one to a few minutes later. For a new device it shows
+`tornect host` prints `Tornect ID: …` at once (on a terminal, or with
+`--evidence`) and `REACHABLE` once the address is published, typically one to a
+few minutes later. For a new device it shows
 the code and asks you to type `yes` if it matches the other screen; for each
 session it asks for `a` (allow control) or `v` (view only). Anything else, or no
 answer within 60 s, refuses.
