@@ -65,3 +65,20 @@ unchanged copy of the upstream file, fetched anonymously on 2026-09-28. The same
 
 The list's licence terms were not looked up (only the list itself was fetched), so it is not in `xtask`'s
 `EMBEDDED` and `THIRD_PARTY_LICENSES.txt` carries no text for it: open before the release.
+
+## The word list of the passphrase generator
+
+`crates/tornect-core` embeds this file whole with `include_str!` (`src/unattended/password.rs`, `docs/PLAN.md`
+§B.8.7.1 ④, decision M1-19): an unchanged copy of the file EFF publishes, fetched over HTTPS on 2026-10-02, dice
+numbers included; the generator skips that column. The same SHA-256 is pinned in `password::EFF_LONG_LIST_SHA256`
+and checked by `password::tests::the_eff_list_matches_its_checksum`. Before it was used, the file was checked to
+hold 7776 lines of five dice digits (1 to 6), a tab and a word, ASCII only, with LF line ends and a final newline,
+7776 different words, and the same words in the same order as the words-only copy that the Debian package
+`python3-passlib` ships.
+
+| File | What | Downloaded from | SHA-256 |
+|---|---|---|---|
+| `crates/tornect-core/data/eff_large_wordlist.txt` | EFF's long word list for passphrases (7776 words, each after its five dice numbers and a tab; 108800 bytes) | `https://www.eff.org/files/2016/07/18/eff_large_wordlist.txt`, 2026-10-02 | `addd35536511597a02fa0a9ff1e5284677b8883b83e986e43f15a3db996b903e` |
+
+The list's licence terms were not looked up (only the list itself was fetched), so it is not in `xtask`'s
+`EMBEDDED` and `THIRD_PARTY_LICENSES.txt` carries no text for it: open before the release, as for the BIP 39 list.

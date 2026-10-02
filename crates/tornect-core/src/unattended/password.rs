@@ -44,9 +44,13 @@ pub enum PolicyError {
         /// `zxcvbn` warning text, if any.
         feedback: Option<String>,
     },
-    /// The EFF long word list is not available offline in any pinned crate (decision M1-19).
-    #[error("passphrase generation unavailable: no offline word list is compiled in")]
+    /// The compiled-in word list does not read as EFF's 7776 words (never with the pinned
+    /// file: `the_eff_list_matches_its_checksum` checks it).
+    #[error("passphrase generation unavailable: the compiled-in word list is not EFF's long list")]
     WordListUnavailable,
+    /// The operating system gave no random bytes.
+    #[error("passphrase generation failed: no random bytes from the operating system ({0})")]
+    RandomUnavailable(String),
 }
 
 /// Non-fatal notes surfaced next to the meter.
@@ -177,12 +181,72 @@ pub fn check(
     })
 }
 
-/// Five EFF-long-list words (≈ 64.6 bits). No pinned crate ships the 7776-word list
-/// offline and it is not vendored from memory (decision M1-19), so this returns
-/// [`PolicyError::WordListUnavailable`] until a verified list is added; the UI offers
-/// "use my own" with the live meter meanwhile.
+/// EFF's long word list as EFF publishes it (`data/eff_large_wordlist.txt`, an unchanged
+/// copy; `packaging/licenses/SOURCES.md`): 7776 lines of five dice digits, a tab and a
+/// word.
+const EFF_LONG_LIST: &str = include_str!("../../data/eff_large_wordlist.txt");
+
+/// SHA-256 of the embedded EFF long word list: the published file's bytes, unchanged
+/// (`packaging/licenses/SOURCES.md`; decision M1-19's later track).
+pub const EFF_LONG_LIST_SHA256: &str =
+    "addd35536511597a02fa0a9ff1e5284677b8883b83e986e43f15a3db996b903e";
+
+/// Words in EFF's long list: one per throw of five dice (6⁵).
+pub const EFF_LONG_LIST_WORDS: usize = 7776;
+
+/// Words in a generated passphrase (§B.8.7.1 ④: ≈ 64.6 bits).
+pub const PASSPHRASE_WORDS: usize = 5;
+
+/// The list's words in list order, the dice column skipped; `None` unless every line is
+/// "dice, tab, word" and there are exactly [`EFF_LONG_LIST_WORDS`] (never with the
+/// pinned file).
+fn eff_long_list() -> Option<&'static [&'static str]> {
+    static WORDS: std::sync::OnceLock<Option<Vec<&'static str>>> = std::sync::OnceLock::new();
+    WORDS
+        .get_or_init(|| {
+            let words: Option<Vec<&'static str>> = EFF_LONG_LIST
+                .lines()
+                .map(|line| line.split_once('\t').map(|(_dice, word)| word))
+                .collect();
+            words.filter(|w| w.len() == EFF_LONG_LIST_WORDS)
+        })
+        .as_deref()
+}
+
+/// A number below `n` (`n > 0`), every value equally likely: a 32-bit draw at or above
+/// the largest multiple of `n` is drawn again, so the remainder favours no value.
+fn uniform_below(n: u32) -> Result<u32, PolicyError> {
+    let zone = u32::MAX - u32::MAX % n;
+    loop {
+        let mut bytes = Zeroizing::new([0u8; 4]);
+        getrandom::fill(bytes.as_mut_slice())
+            .map_err(|e| PolicyError::RandomUnavailable(e.to_string()))?;
+        let draw = u32::from_le_bytes(*bytes);
+        if draw < zone {
+            return Ok(draw % n);
+        }
+    }
+}
+
+/// Five words of EFF's long list (≈ 64.6 bits, §B.8.7.1 ④), each drawn uniformly and
+/// independently with the operating system's random source, joined by single spaces.
+/// The words keep the list's spelling: four of them hold a hyphen, which [`normalize`]
+/// reads as a space on both sides (§B.8.7.2). Only this generator's passwords may
+/// later be registered as `generated` (decision M1-67).
 pub fn generate_passphrase() -> Result<Zeroizing<String>, PolicyError> {
-    Err(PolicyError::WordListUnavailable)
+    let words = eff_long_list().ok_or(PolicyError::WordListUnavailable)?;
+    let n = u32::try_from(words.len()).map_err(|_| PolicyError::WordListUnavailable)?;
+    // Sized before it is filled (5 words of at most 9 letters and 4 spaces): a string
+    // that grows leaves its outgrown copies in freed memory, unwiped.
+    let mut out = Zeroizing::new(String::with_capacity(PASSPHRASE_WORDS * 10));
+    for i in 0..PASSPHRASE_WORDS {
+        let index = uniform_below(n)?;
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(words[index as usize]);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -295,11 +359,85 @@ mod tests {
         assert_eq!(required_score(false), 3);
     }
 
+    /// The five dice of line `i` (0-based), as EFF numbers its lines: 11111 to 66666.
+    fn dice_of(i: usize) -> String {
+        let mut digits = [b'1'; 5];
+        let mut rest = i;
+        for d in digits.iter_mut().rev() {
+            *d = b'1' + u8::try_from(rest % 6).unwrap();
+            rest /= 6;
+        }
+        String::from_utf8(digits.to_vec()).unwrap()
+    }
+
     #[test]
-    fn u3_generate_passphrase_is_unavailable_offline() {
+    fn the_eff_list_matches_its_checksum() {
+        use sha2::{Digest as _, Sha256};
+        // The pinned bytes: EFF's published file, unchanged (packaging/licenses/SOURCES.md),
+        // as committed with LF line ends (a Windows checkout may turn them into CRLF, and
+        // the Windows CI job runs these tests).
+        let committed = EFF_LONG_LIST.replace("\r\n", "\n");
         assert_eq!(
-            generate_passphrase().unwrap_err(),
-            PolicyError::WordListUnavailable
+            hex::encode(Sha256::digest(committed.as_bytes())),
+            EFF_LONG_LIST_SHA256
         );
+        assert_eq!(committed.len(), 108_800);
+        assert!(committed.ends_with('\n') && !committed.contains('\r'));
+        // Its shape: 7776 lines "dice, tab, word", the dice 11111 to 66666 in order.
+        let lines: Vec<&str> = committed.lines().collect();
+        assert_eq!(lines.len(), EFF_LONG_LIST_WORDS);
+        for (i, line) in lines.iter().enumerate() {
+            let (dice, word) = line.split_once('\t').unwrap();
+            assert_eq!(dice, dice_of(i), "line {}", i + 1);
+            assert!(
+                (3..=9).contains(&word.len())
+                    && word.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'),
+                "line {}: {line}",
+                i + 1
+            );
+        }
+        // The parser skips the dice: the words in list order, all different.
+        let words = eff_long_list().unwrap();
+        assert_eq!(words.len(), EFF_LONG_LIST_WORDS);
+        assert_eq!(
+            (words[0], words[EFF_LONG_LIST_WORDS - 1]),
+            ("abacus", "zoom")
+        );
+        let mut unique = words.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), EFF_LONG_LIST_WORDS, "every word once");
+    }
+
+    #[test]
+    fn a_passphrase_is_five_list_words() {
+        let words = eff_long_list().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let phrase = generate_passphrase().unwrap();
+            let drawn: Vec<&str> = phrase.split(' ').collect();
+            assert_eq!(drawn.len(), PASSPHRASE_WORDS, "{}", phrase.as_str());
+            assert!(
+                drawn.iter().all(|w| words.contains(w)),
+                "{}",
+                phrase.as_str()
+            );
+            // between 19 and 49 characters: always inside the policy's 12 to 128
+            let chars = normalize(&phrase).chars().count();
+            assert!((MIN_CHARS..=MAX_CHARS).contains(&chars));
+            seen.insert(phrase.to_string());
+        }
+        // 200 draws from 7776⁵ phrases: a repeat would mean a broken random source.
+        assert_eq!(seen.len(), 200);
+        // The draw below n keeps a zone that is a multiple of n and leaves out fewer
+        // than n values, so no remainder is favoured; every value comes up.
+        let zone = u32::MAX - u32::MAX % 7776;
+        assert_eq!(zone % 7776, 0);
+        assert!(u32::MAX - zone < 7776);
+        let mut hit = [false; 6];
+        for _ in 0..600 {
+            hit[uniform_below(6).unwrap() as usize] = true;
+        }
+        assert!(hit.iter().all(|h| *h), "{hit:?}");
     }
 }
