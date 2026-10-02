@@ -169,9 +169,9 @@ impl ControlChannel {
 /// went on (SLICE-B2 B2-2). It binds before returning, so `control` is up
 /// before anything names `tornect panic`, and goes down if serving stops.
 ///
-/// A platform without an endpoint (Windows until M6) or a failed bind is not
-/// fatal: the host says that Ctrl-C ends its sessions. Another host serving
-/// this state directory is.
+/// A failed bind is not fatal, nor on Windows a pipe another process made
+/// first, which is never used (§B.8.7.4): the host says that Ctrl-C ends its
+/// sessions. Another host serving this state directory is.
 pub async fn start_control_channel(
     paths: &Paths,
     ctx: Result<HostContext, String>,
