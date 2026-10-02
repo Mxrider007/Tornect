@@ -158,7 +158,7 @@ impl TransportPolicy {
 /// The policy an unattended grant imposes on one session, minted only by
 /// the `AwaitKe3` handler after `ServerLogin::finish` (§B.8.14), carrying
 /// the readiness snapshot the `HOST_NOT_READY` gate was evaluated on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PolicyReceipt {
     grant: GrantId,
     mode: SessionMode,
@@ -172,6 +172,31 @@ pub struct PolicyReceipt {
     readiness: Box<ReadinessSnapshot>,
     minted_at: Instant,
     fail_summary: Option<FailSummary>,
+    /// SHA-256 of the stored `auth` record the PAKE ran against (decision M1-67, B step
+    /// 1): checked under the store lock after the reservation. Never logged, sent or
+    /// printed; `None` checks against nothing and is refused there.
+    auth_digest: Option<[u8; 32]>,
+    /// The `grant_reach` the read after the reservation computed, signed into the
+    /// accept (decision M1-67). Never logged.
+    grant_reach: Option<u8>,
+}
+
+/// Hand-written: the `auth` digest and `grant_reach` are left out (decision M1-67).
+impl core::fmt::Debug for PolicyReceipt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PolicyReceipt")
+            .field("grant", &self.grant)
+            .field("mode", &self.mode)
+            .field("elevation", &self.elevation)
+            .field("transport", &self.transport)
+            .field("ends_at", &self.ends_at)
+            .field("block_window_s", &self.block_window_s)
+            .field("ask_before_start", &self.ask_before_start)
+            .field("readiness", &self.readiness)
+            .field("minted_at", &self.minted_at)
+            .field("fail_summary", &self.fail_summary)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PolicyReceipt {
@@ -199,7 +224,38 @@ impl PolicyReceipt {
             readiness: Box::new(readiness),
             minted_at: Instant::now(),
             fail_summary,
+            auth_digest: None,
+            grant_reach: None,
         }
+    }
+
+    /// The receipt keeping `digest`, the SHA-256 of the stored `auth` record the PAKE
+    /// ran against (decision M1-67, B step 1).
+    #[must_use]
+    pub(crate) fn with_auth_digest(mut self, digest: [u8; 32]) -> Self {
+        self.auth_digest = Some(digest);
+        self
+    }
+
+    /// The digest [`Self::with_auth_digest`] kept.
+    #[must_use]
+    pub(crate) fn auth_digest(&self) -> Option<&[u8; 32]> {
+        self.auth_digest.as_ref()
+    }
+
+    /// The receipt carrying `grant_reach` (0, 1 or 2), as the read after the
+    /// reservation computed it (decision M1-67).
+    #[must_use]
+    pub(crate) fn with_grant_reach(mut self, grant_reach: u8) -> Self {
+        self.grant_reach = Some(grant_reach);
+        self
+    }
+
+    /// The `grant_reach` an unattended accept of this receipt signs; `None` before the
+    /// read after the reservation computed it.
+    #[must_use]
+    pub(crate) fn grant_reach(&self) -> Option<u8> {
+        self.grant_reach
     }
 
     /// The receipt at `elevation` (the clamped level of §B.8.4.1); none
@@ -773,6 +829,43 @@ mod tests {
                 .ask(&[0u8; 8], "x", Duration::from_secs(60))
                 .await
         );
+    }
+
+    /// Decision M1-67 (B step 1, A14): the receipt keeps the digest of the `auth` record
+    /// the PAKE ran against and the `grant_reach` the read after the reservation
+    /// computed; its `Debug` shows neither.
+    #[test]
+    fn the_receipt_debug_leaves_out_the_digest_and_the_reach() {
+        let receipt = PolicyReceipt::mint(
+            [9; 8],
+            SessionMode::Control,
+            TransportPolicy::Any,
+            None,
+            3,
+            false,
+            ReadinessSnapshot::default(),
+            None,
+        )
+        .with_auth_digest([0xD1; 32])
+        .with_grant_reach(2);
+        let shown = format!("{receipt:?}");
+        for hidden in ["auth_digest", "grant_reach", "209, 209"] {
+            assert!(!shown.contains(hidden), "{hidden} in {shown}");
+        }
+        assert!(shown.contains("block_window_s: 3"), "{shown}");
+        assert_eq!(receipt.auth_digest(), Some(&[0xD1; 32]));
+        assert_eq!(receipt.grant_reach(), Some(2));
+        let unset = PolicyReceipt::mint(
+            [9; 8],
+            SessionMode::Control,
+            TransportPolicy::Any,
+            None,
+            3,
+            false,
+            ReadinessSnapshot::default(),
+            None,
+        );
+        assert_eq!((unset.auth_digest(), unset.grant_reach()), (None, None));
     }
 
     #[test]

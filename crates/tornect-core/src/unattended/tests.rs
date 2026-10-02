@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 
 use crate::id::DeviceId;
 use crate::keystore::{FileSecretStore, KeystoreKind, SecretStore};
-use crate::levels::Elevation;
+use crate::levels::{AccountFacts, Elevation, HelperPresence};
 use crate::paths::Paths;
 use crate::session_log::{
     Actor, ChainStatus, SessionEvent, SessionLog, SessionMode, SessionRecord, TransportKind,
@@ -31,6 +31,7 @@ use super::limiter::{
     AttemptLimiter, FailKind, HostTransport, LimiterError, PostF2Reject, Reject, Settle,
     ladder_lock_secs, post_f2,
 };
+use super::reach::{self, ReachRead, ReachRefusal};
 use super::readiness::ReadinessSnapshot;
 use super::schedule::FixedOffset;
 use super::store::{GrantStore, LoadMode, StoreError, StoreStatus, WriteClass};
@@ -4201,4 +4202,470 @@ fn a25_o_a_store_that_adopts_a_machine_id_marks_every_grant() {
     env.machine_id = None;
     let store = env.open();
     assert!(store.grants().iter().all(|g| !g.marked()));
+}
+
+// ------------------------------------------------------------------ the read after the reservation (M1-67: B, D2, D11)
+
+/// Windows facts of an administrator account (UAC on, no trigger), with `change` applied.
+fn windows(change: impl FnOnce(&mut crate::levels::WindowsFacts)) -> AccountFacts {
+    let mut facts = crate::levels::WindowsFacts {
+        installed: true,
+        administrator: true,
+        ..crate::levels::WindowsFacts::default()
+    };
+    change(&mut facts);
+    AccountFacts::Windows(facts)
+}
+
+/// A store with P (`dev(1)`, *My machines*, control) and Q (`dev(2)`, *Headless box*).
+fn reach_env() -> (Env, GrantStore, MutationGuard) {
+    let env = Env::new();
+    let store = env.open();
+    let guard = enable(&env, &store, dev(1), Preset::MyMachines);
+    guard
+        .create_grant(
+            Actor::Ui,
+            &dev(2),
+            Preset::HeadlessBox,
+            &waived(),
+            &upload(),
+        )
+        .unwrap();
+    (env, store, guard)
+}
+
+/// Change a grant as only the guard's raise rules and a generated registration will (no
+/// path of this build sets the level or clears the mark yet).
+fn set_grant(store: &GrantStore, device: &DeviceId, change: impl FnOnce(&mut UnattendedGrant)) {
+    store
+        .mutate(WriteClass::Policy, None, |s, _| {
+            change(s.grant_mut(device).ok_or(StoreError::NoGrant)?);
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// The digest the gate's receipt keeps for `device`'s grant as stored now.
+fn digest_of(store: &GrantStore, device: &DeviceId) -> [u8; 32] {
+    reach::auth_digest(&store.grant(device).unwrap().auth)
+}
+
+/// The read for P on `account` and `helper`, with the digest of P's record as stored.
+fn read_p(
+    store: &GrantStore,
+    account: AccountFacts,
+    helper: HelperPresence,
+) -> Result<ReachRead, ReachRefusal> {
+    reach::read_after_reservation(store, &dev(1), &digest_of(store, &dev(1)), account, helper)
+}
+
+#[test]
+fn host_value_matrix() {
+    // B: `grant_reach` from clause (i) (the grant holds the level), clause (ii) (control,
+    // and some grant holds the level, the helper task counts, or control is administrator
+    // access here) and the mark (iii): 2 for (i) without (iii), else 1 for (ii) or (i)
+    // with (iii), else 0; Linux 0. The clamp's grant level is the grant's own, none while
+    // marked. The read takes nothing of the request (want_mode, want_elevation) and
+    // nothing of the helper's start, so neither can lower the value.
+    let (_env, store, _guard) = reach_env();
+    let accounts = [
+        ("Linux", AccountFacts::Linux, false),
+        ("UAC on", windows(|_| {}), false),
+        ("UAC off", windows(|f| f.enable_lua = Some(0)), true),
+        (
+            "CPBA 0, standalone",
+            windows(|f| {
+                f.consent_prompt_behavior_admin = Some(0);
+                f.installed = false;
+            }),
+            true,
+        ),
+        ("unreadable", AccountFacts::Unreadable, true),
+    ];
+    let helpers = [
+        HelperPresence::Absent,
+        HelperPresence::Registered,
+        HelperPresence::Unreadable,
+    ];
+    let mut cases = 0;
+    for (name, account, control_is_admin) in accounts {
+        for helper in helpers {
+            for mode in [SessionMode::Control, SessionMode::ViewOnly] {
+                for holds in [false, true] {
+                    for marked in [false, true] {
+                        for other_holds in [false, true] {
+                            let level = |h: bool| {
+                                if h { Elevation::Admin } else { Elevation::None }
+                            };
+                            set_grant(&store, &dev(1), |g| {
+                                g.mode = mode;
+                                g.elevation = level(holds);
+                                g.unmarked = !marked;
+                            });
+                            set_grant(&store, &dev(2), |g| g.elevation = level(other_holds));
+                            let linux = account == AccountFacts::Linux;
+                            let i = !linux && holds;
+                            let ii = !linux
+                                && mode == SessionMode::Control
+                                && (holds
+                                    || other_holds
+                                    || helper != HelperPresence::Absent
+                                    || control_is_admin);
+                            let expected = if i && !marked {
+                                2
+                            } else if ii || i {
+                                1
+                            } else {
+                                0
+                            };
+                            let case = format!(
+                                "{name} {helper:?} {mode:?} holds {holds} marked {marked} \
+                                 other {other_holds}"
+                            );
+                            let read = read_p(&store, account, helper).expect(&case);
+                            assert_eq!(read.grant_reach, expected, "{case}");
+                            assert_eq!(read.clause_ii, ii, "{case}");
+                            assert_eq!(read.grant_level, level(i && !marked), "{case}");
+                            // an answer of 0 is signed only with the password marked
+                            let now_marked = store.grant(&dev(1)).unwrap().marked();
+                            assert_eq!(now_marked, marked || expected == 0, "{case}");
+                            assert_eq!(read.marked, now_marked, "{case}");
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 240);
+}
+
+#[test]
+fn a21_values_follow_the_three_clauses() {
+    // A21: 1 in (a)-(h) for a plain control grant (marked, as every password of this
+    // build), 2 for an unmarked view-only grant at the level, 0 for a view-only grant at
+    // none, Linux always 0.
+    let none = HelperPresence::Absent;
+    let read =
+        |store: &GrantStore, account, helper| read_p(store, account, helper).unwrap().grant_reach;
+    // (a) another grant holds the level: Active, then Disabled, Suspended, expired
+    let (env, store, guard) = reach_env();
+    set_grant(&store, &dev(2), |g| g.elevation = Elevation::Admin);
+    assert_eq!(read(&store, windows(|_| {}), none), 1, "(a) active");
+    guard.disable(Actor::Ui, &dev(2)).unwrap();
+    assert_eq!(read(&store, windows(|_| {}), none), 1, "(a) disabled");
+    set_grant(&store, &dev(2), |g| {
+        g.state = GrantState::Suspended {
+            reason: SuspendReason::Admin,
+            since: T0,
+        };
+    });
+    assert_eq!(read(&store, windows(|_| {}), none), 1, "(a) suspended");
+    set_grant(&store, &dev(2), |g| {
+        g.state = GrantState::Active;
+        g.expires_at = Some(T0 - 1);
+    });
+    assert_eq!(read(&store, windows(|_| {}), none), 1, "(a) expired");
+    // a view-only grant at none in (a): 0; at the level, unmarked: 2
+    set_grant(&store, &dev(1), |g| g.mode = SessionMode::ViewOnly);
+    assert_eq!(read(&store, windows(|_| {}), none), 0, "view only at none");
+    set_grant(&store, &dev(1), |g| {
+        g.elevation = Elevation::Admin;
+        g.unmarked = true;
+    });
+    assert_eq!(
+        read(&store, windows(|_| {}), none),
+        2,
+        "view only at the level"
+    );
+    drop((guard, store, env));
+    // (b) to (h), and Linux, on a plain control grant
+    let (_env, store, guard) = reach_env();
+    for (case, account, helper) in [
+        (
+            "(b) helper task registered",
+            windows(|_| {}),
+            HelperPresence::Registered,
+        ),
+        (
+            "(b) its query failing",
+            windows(|_| {}),
+            HelperPresence::Unreadable,
+        ),
+        (
+            "(c) UAC off, installed",
+            windows(|f| f.enable_lua = Some(0)),
+            none,
+        ),
+        (
+            "(d) UAC off, standalone",
+            windows(|f| {
+                f.enable_lua = Some(0);
+                f.installed = false;
+            }),
+            none,
+        ),
+        (
+            "(e) CPBA 0, installed",
+            windows(|f| f.consent_prompt_behavior_admin = Some(0)),
+            none,
+        ),
+        (
+            "(f) CPBA 0, standalone",
+            windows(|f| {
+                f.consent_prompt_behavior_admin = Some(0);
+                f.installed = false;
+            }),
+            none,
+        ),
+        (
+            "(g) CPBA set to 0 after start",
+            windows(|f| f.consent_prompt_behavior_admin = Some(0)),
+            none,
+        ),
+        ("(h) unreadable", AccountFacts::Unreadable, none),
+    ] {
+        assert_eq!(read(&store, account, helper), 1, "{case}");
+    }
+    // (b) after the last admin grant was deleted, the task still registered
+    set_grant(&store, &dev(2), |g| g.elevation = Elevation::Admin);
+    guard.revoke(Actor::Ui, &dev(2)).unwrap();
+    assert_eq!(
+        read(&store, windows(|_| {}), HelperPresence::Registered),
+        1,
+        "(b) after the last admin grant"
+    );
+    assert_eq!(read(&store, windows(|_| {}), none), 0, "nothing reaches");
+    for helper in [HelperPresence::Registered, HelperPresence::Unreadable] {
+        assert_eq!(read(&store, AccountFacts::Linux, helper), 0, "Linux");
+    }
+}
+
+#[test]
+fn a25_a_and_b_a_marked_password_is_view_only_where_control_reaches_the_level() {
+    // A25 (a)(b): P answered 0 (marked), then another grant raised to the level or the
+    // helper task registered: P's sessions are View only and answered 1; a password that
+    // is not marked keeps control with reach 1.
+    let (_env, store, _guard) = reach_env();
+    let account = windows(|_| {});
+    set_grant(&store, &dev(1), |g| g.unmarked = true);
+    let first = read_p(&store, account, HelperPresence::Absent).unwrap();
+    assert_eq!(first.grant_reach, 0);
+    assert!(store.grant(&dev(1)).unwrap().marked(), "answered 0: marked");
+    let served = |read: ReachRead| {
+        crate::levels::served_mode(
+            crate::levels::Level::CONTROL,
+            read.marked,
+            read.clause_ii,
+            account,
+        )
+    };
+    for (case, helper, other) in [
+        (
+            "(a) another grant raised",
+            HelperPresence::Absent,
+            Elevation::Admin,
+        ),
+        (
+            "(b) the helper task registered",
+            HelperPresence::Registered,
+            Elevation::None,
+        ),
+    ] {
+        set_grant(&store, &dev(2), |g| g.elevation = other);
+        let read = read_p(&store, account, helper).unwrap();
+        assert_eq!(read.grant_reach, 1, "{case}");
+        assert_eq!(served(read), SessionMode::ViewOnly, "{case}");
+        // a new generated password clears the mark: control again, still answered 1
+        set_grant(&store, &dev(1), |g| g.unmarked = true);
+        let read = read_p(&store, account, helper).unwrap();
+        assert_eq!(read.grant_reach, 1, "{case}");
+        assert_eq!(served(read), SessionMode::Control, "{case}");
+        set_grant(&store, &dev(1), |g| g.unmarked = false);
+    }
+}
+
+#[test]
+fn a25_e_a_store_rolled_back_to_before_the_mark_fails_closed() {
+    // A25 (e): the mark is a policy write. A store file rolled back to before it fails
+    // closed once the anchor was written, and loads while the bump is owed (R12).
+    for owed in [false, true] {
+        let env = Env::new();
+        let store = env.open();
+        let guard = enable(&env, &store, dev(1), Preset::MyMachines);
+        set_grant(&store, &dev(1), |g| g.unmarked = true);
+        let before_the_mark = env.file_bytes();
+        *env.secrets.put_fails.lock() = owed;
+        let read = read_p(&store, windows(|_| {}), HelperPresence::Absent).unwrap();
+        assert_eq!(read.grant_reach, 0);
+        assert!(store.grant(&dev(1)).unwrap().marked());
+        assert_eq!(store.anchor_owed(), owed);
+        drop((guard, store));
+        *env.secrets.put_fails.lock() = false;
+        std::fs::write(env.paths.unattended_store(), &before_the_mark).unwrap();
+        let store = env.open();
+        if owed {
+            assert_eq!(store.status(), StoreStatus::Loaded, "the bump was owed");
+        } else {
+            assert!(
+                matches!(store.status(), StoreStatus::FailedClosed(_)),
+                "{:?}",
+                store.status()
+            );
+        }
+    }
+}
+
+#[test]
+fn a25_f_mark_write_failure_signs_nothing() {
+    // A25 (f) (D11): the mark cannot be written before an answer of 0: the request is
+    // refused NOT_GRANTED, nothing is signed at 0, and the password stays unmarked.
+    let (_env, store, _guard) = reach_env();
+    set_grant(&store, &dev(1), |g| g.unmarked = true);
+    store.fail_next_write(WriteClass::Policy);
+    assert_eq!(
+        read_p(&store, windows(|_| {}), HelperPresence::Absent),
+        Err(ReachRefusal::MarkNotWritten)
+    );
+    assert!(!store.grant(&dev(1)).unwrap().marked(), "nothing marked");
+    // the write working again, the same read marks and answers 0
+    let read = read_p(&store, windows(|_| {}), HelperPresence::Absent).unwrap();
+    assert_eq!(read.grant_reach, 0);
+    assert!(store.grant(&dev(1)).unwrap().marked());
+}
+
+#[test]
+fn a25_h_a_replaced_password_fails_auth_and_marks_nothing() {
+    // A25 (h), D8.4 (a built set_password between the PAKE and the reservation): the read
+    // finds another `auth` record than the one the stream proved: AUTH_FAILED, nothing
+    // marked.
+    let (_env, store, guard) = reach_env();
+    set_grant(&store, &dev(1), |g| g.unmarked = true);
+    let proven = digest_of(&store, &dev(1));
+    guard
+        .set_password(Actor::Ui, &dev(1), &[0xCD; 192])
+        .unwrap();
+    assert_eq!(
+        reach::read_after_reservation(
+            &store,
+            &dev(1),
+            &proven,
+            windows(|_| {}),
+            HelperPresence::Absent
+        ),
+        Err(ReachRefusal::AuthReplaced)
+    );
+    assert!(!store.grant(&dev(1)).unwrap().marked(), "nothing marked");
+}
+
+#[test]
+fn a25_i_a_store_of_an_older_build_reads_marked_at_none() {
+    // A25 (i): a store an M-FEAT-4 build wrote has neither key: every grant reads as
+    // marked and at none, so P is View only wherever clause (ii) holds.
+    let (_env, store, _guard) = reach_env();
+    assert!(all_marked(&store));
+    assert!(store.grants().iter().all(|g| !g.holds_level()));
+    let read = read_p(&store, windows(|_| {}), HelperPresence::Registered).unwrap();
+    assert_eq!((read.grant_reach, read.grant_level), (1, Elevation::None));
+    assert!(read.marked && read.clause_ii);
+}
+
+#[test]
+fn a25_m_a_grant_no_longer_eligible_is_refused_and_nothing_marked() {
+    // A25 (m) (B step 1): suspended, expired, hard-locked, Pruned, unattended access off
+    // or paused since the gate: NOT_GRANTED, nothing marked. A grant gone: the same.
+    type Change = Box<dyn Fn(&GrantStore, &MutationGuard)>;
+    let cases: Vec<(&str, Change)> = vec![
+        (
+            "suspended",
+            Box::new(|_, g| {
+                g.suspend(Actor::Ui, &dev(1)).unwrap();
+            }),
+        ),
+        (
+            "expired",
+            Box::new(|s, _| set_grant(s, &dev(1), |g| g.expires_at = Some(T0 - 1))),
+        ),
+        (
+            "hard-locked",
+            Box::new(|s, _| set_grant(s, &dev(1), |g| g.fail.hard_locked = true)),
+        ),
+        (
+            "Pruned",
+            Box::new(|s, _| set_grant(s, &dev(1), |g| g.auth = AuthRecord::Pruned)),
+        ),
+        ("off", Box::new(|_, g| g.master_off(Actor::Ui).unwrap())),
+        (
+            "paused",
+            Box::new(|_, g| g.pause(Actor::Ui, T0 + 12 * H).unwrap()),
+        ),
+        (
+            "gone",
+            Box::new(|_, g| g.revoke(Actor::Ui, &dev(1)).unwrap()),
+        ),
+    ];
+    for (case, change) in cases {
+        let (_env, store, guard) = reach_env();
+        set_grant(&store, &dev(1), |g| g.unmarked = true);
+        let proven = digest_of(&store, &dev(1));
+        change(&store, &guard);
+        assert_eq!(
+            reach::read_after_reservation(
+                &store,
+                &dev(1),
+                &proven,
+                windows(|_| {}),
+                HelperPresence::Absent
+            ),
+            Err(ReachRefusal::NotEligible),
+            "{case}"
+        );
+        if let Some(p) = store.grant(&dev(1)) {
+            assert!(!p.marked(), "{case}: nothing marked");
+        }
+    }
+}
+
+#[test]
+fn d8_2_a_marked_password_never_reaches_the_level() {
+    // D8.2 (D11): a grant that holds the level gets it only while its password is not
+    // marked; marked, the clamp's grant level is none and the answer 1.
+    let (_env, store, _guard) = reach_env();
+    set_grant(&store, &dev(1), |g| g.elevation = Elevation::Admin);
+    let read = read_p(&store, windows(|_| {}), HelperPresence::Absent).unwrap();
+    assert_eq!((read.grant_reach, read.grant_level), (1, Elevation::None));
+    set_grant(&store, &dev(1), |g| g.unmarked = true);
+    let read = read_p(&store, windows(|_| {}), HelperPresence::Absent).unwrap();
+    assert_eq!((read.grant_reach, read.grant_level), (2, Elevation::Admin));
+    // Linux: no level, whatever is stored
+    let read = read_p(&store, AccountFacts::Linux, HelperPresence::Absent).unwrap();
+    assert_eq!((read.grant_reach, read.grant_level), (0, Elevation::None));
+}
+
+#[test]
+fn the_read_after_the_reservation_marks_without_a_deadlock() {
+    // The mark's policy write runs under the store lock and writes no log line there:
+    // the read returns within a bounded wait, the store lock is free after it, and the
+    // §B.8.13 chain verifier passes.
+    let (_env, store, _guard) = reach_env();
+    set_grant(&store, &dev(1), |g| g.unmarked = true);
+    let digest = digest_of(&store, &dev(1));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let in_thread = store.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(reach::read_after_reservation(
+            &in_thread,
+            &dev(1),
+            &digest,
+            windows(|_| {}),
+            HelperPresence::Absent,
+        ));
+    });
+    let read = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("returned within the bound: no deadlock")
+        .unwrap();
+    assert_eq!(read.grant_reach, 0);
+    assert!(!store.lock_is_held());
+    assert_eq!(store.verify_log().unwrap().status, ChainStatus::Valid);
 }
