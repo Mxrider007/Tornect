@@ -6084,6 +6084,183 @@ async fn a_panic_during_the_reservation_hook_rejects_the_request() {
     assert_eq!(helper.ended.load(Ordering::SeqCst), 1);
 }
 
+/// A facts source whose helper task turns registered after its first read: the task
+/// registered between the gate and the session's reservation.
+struct HelperRegisteredAfterFirstRead {
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl tornect_core::levels::FactsSource for HelperRegisteredAfterFirstRead {
+    fn account(&self) -> tornect_core::levels::AccountFacts {
+        windows_facts(|_| {})
+    }
+
+    fn helper_task(&self) -> tornect_core::levels::HelperPresence {
+        if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+            tornect_core::levels::HelperPresence::Absent
+        } else {
+            tornect_core::levels::HelperPresence::Registered
+        }
+    }
+}
+
+/// M1-67 A21 (g)'s twin for the helper task (S5A-1): the task registered after the gate
+/// read its presence and before the answer. The gate mints control (an administrator
+/// account with UAC on, no task); the read after the reservation finds the task, so
+/// clause (ii) holds for the marked password and the session is view only: the hook's
+/// marked rule alone lowers it.
+#[tokio::test]
+async fn a21_g_the_helper_task_registered_after_start_lowers_the_next_answer() {
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let facts = Arc::new(HelperRegisteredAfterFirstRead {
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, client) = unattended_pair_with(tmp.path(), PW, facts.clone());
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let outcome = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .expect("an accept");
+    let ClientOutcome::Session(session) = outcome else {
+        panic!("no session");
+    };
+    assert_eq!(session.accept().mode(), messages::mode::VIEW_ONLY);
+    assert_eq!(
+        facts.reads.load(Ordering::SeqCst),
+        2,
+        "the gate's read, then this one"
+    );
+    drop(session);
+    let _ = task.await;
+}
+
+/// The receipt of a hook's proof at `level`.
+fn receipt_at(level: (SessionMode, tornect_core::levels::Elevation)) -> PolicyReceipt {
+    PolicyReceipt::mint(
+        [9u8; 8],
+        level.0,
+        TransportPolicy::Any,
+        None,
+        0,
+        false,
+        ReadinessSnapshot::default(),
+        None,
+    )
+    .with_elevation(level.1)
+}
+
+/// A hook that mints `minted` at the gate and gives back a proof at `back` after the
+/// reservation.
+struct ReservedGivesBack {
+    minted: (SessionMode, tornect_core::levels::Elevation),
+    back: (SessionMode, tornect_core::levels::Elevation),
+}
+
+impl UnattendedHook for ReservedGivesBack {
+    fn handle<'a>(
+        &'a self,
+        ctx: UnattendedContext<'a>,
+    ) -> BoxFuture<'a, Result<UnattendedVerdict, HandshakeError>> {
+        Box::pin(async move {
+            Ok(UnattendedVerdict::Accept {
+                proof: ConsentProof::Unattended {
+                    grant: [9u8; 8],
+                    proof_fp: [0u8; 8],
+                    policy: receipt_at(self.minted),
+                    block: WindowPassed::Skipped,
+                    token: DerivedToken::new([0xA5; 32], [0x5A; 32]),
+                },
+                caps: ChosenCaps::negotiate(&Caps::default(), &ctx.request.caps),
+            })
+        })
+    }
+
+    fn reserved<'a>(
+        &'a self,
+        _: &'a DeviceId,
+        proof: ConsentProof,
+    ) -> BoxFuture<'a, Result<ConsentProof, messages::SessionReject>> {
+        Box::pin(async move {
+            Ok(match proof {
+                ConsentProof::Unattended {
+                    grant,
+                    proof_fp,
+                    block,
+                    token,
+                    ..
+                } => ConsentProof::Unattended {
+                    grant,
+                    proof_fp,
+                    policy: receipt_at(self.back),
+                    block,
+                    token,
+                },
+                other => other,
+            })
+        })
+    }
+}
+
+/// M1-67 (S5A-2): the read after the reservation only lowers, and the state machine
+/// holds it to that: a proof given back above the one the gate minted, in mode or in
+/// level, is refused `NOT_GRANTED` and never signed; the reservation goes and no helper
+/// attaches.
+#[tokio::test]
+async fn a_proof_raised_after_the_reservation_is_refused() {
+    use tornect_core::levels::Elevation;
+    for (minted, back) in [
+        (
+            (SessionMode::ViewOnly, Elevation::None),
+            (SessionMode::Control, Elevation::None),
+        ),
+        (
+            (SessionMode::Control, Elevation::None),
+            (SessionMode::Control, Elevation::Admin),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut host = host_side(tmp.path(), HOST_SEED);
+        let live = Arc::new(LiveSessions::new());
+        host.deps.activity = live.clone();
+        host.deps.unattended = Arc::new(ReservedGivesBack { minted, back });
+        host.trusted
+            .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+            .unwrap();
+        host.cfg.levels = installed_row();
+        let helper = Arc::new(FakeHelper::default());
+        *helper.script.lock().unwrap() = vec![HelperScript::Ready];
+        host.deps.admin_helper = helper.clone();
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let mut raw = raw_unattended_request(&host, CLIENT_SEED, b).await;
+        let rx = raw
+            .chan
+            .recv(Duration::from_secs(30), "answer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rx.env.kind, Kind::SessionReject, "{minted:?} -> {back:?}");
+        match task.await.unwrap().unwrap() {
+            HostOutcome::SessionRejected { reason, .. } => {
+                assert_eq!(reason, reject::NOT_GRANTED, "{minted:?} -> {back:?}");
+            }
+            other => panic!("{minted:?} -> {back:?}: {other:?}"),
+        }
+        assert!(
+            !SessionActivity::session_live(&*live),
+            "the reservation went"
+        );
+        assert!(helper.attached.lock().unwrap().is_empty());
+    }
+}
+
 /// A pin that records how often it was asked to record.
 #[derive(Default)]
 struct RecordingPin {
