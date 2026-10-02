@@ -97,6 +97,11 @@ pub enum StoreError {
     /// A precondition failed.
     #[error("{0}")]
     Invalid(String),
+    /// A remote session is live or reserved at the commit of an access-increasing
+    /// change (§B.8.6.2; decision M1-67): the guard's last no-session check, made under
+    /// the store lock.
+    #[error("a remote session is live or ended less than 60 s ago")]
+    RemoteSessionActive,
     /// Core I/O or keystore failure.
     #[error(transparent)]
     Core(#[from] CoreError),
@@ -326,6 +331,12 @@ impl GrantStore {
     #[cfg(test)]
     pub(crate) fn fail_next_write(&self, class: WriteClass) {
         *self.inner.fail_next_write.lock() = Some(class);
+    }
+
+    /// Test-only: whether the store lock is held right now, by any thread (never waits).
+    #[cfg(test)]
+    pub(crate) fn lock_is_held(&self) -> bool {
+        self.inner.state.try_lock().is_none()
     }
 
     /// How this handle loaded the store.
@@ -967,13 +978,14 @@ impl GrantStore {
     // ----------------------------------------------------------------- grants
 
     /// Insert a new grant (policy write, `GrantCreated` logged), applying `also` to the
-    /// store in the same write; the grant's decay twins start now, so its runtime
-    /// bookkeeping is exact from the first charge (§B.8.5.1).
+    /// store in the same write (an error from it refuses the insert, nothing kept); the
+    /// grant's decay twins start now, so its runtime bookkeeping is exact from the first
+    /// charge (§B.8.5.1).
     pub(crate) fn insert_grant(
         &self,
         grant: UnattendedGrant,
         record: &SessionRecord,
-        also: impl FnOnce(&mut UnattendedStore),
+        also: impl FnOnce(&mut UnattendedStore) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
         let device = grant.device;
         let mut st = self.inner.state.lock();
@@ -982,7 +994,7 @@ impl GrantStore {
             if s.grant(&device).is_some() {
                 return Err(StoreError::GrantExists);
             }
-            also(s);
+            also(s)?;
             s.grants.push(grant);
             Ok(())
         })?;

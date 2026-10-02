@@ -3131,6 +3131,263 @@ fn a8_access_increasing_rechecks_the_remote_session_after_the_dialog() {
     );
 }
 
+// ------------------------------------------------------------------ the check inside the commit (M1-67: A25 (k), D8.4)
+
+/// A session reserved between an operation's last unlocked check and its commit
+/// (A25 (k)): free whenever the store lock is free, reserved while it is held, so only
+/// a check made inside the committing store operation can see it.
+struct ReservedAtTheCommit {
+    store: GrantStore,
+}
+
+impl super::guard::RemoteSessionActivity for ReservedAtTheCommit {
+    fn last_session_ended_at(&self) -> Option<Instant> {
+        None
+    }
+
+    fn session_live(&self) -> bool {
+        self.store.lock_is_held()
+    }
+}
+
+/// One access-increasing operation of A25 (k), run on its own thread.
+type GuardOp = Box<dyn FnOnce(&MutationGuard) -> Result<(), GuardError> + Send>;
+
+/// A store with two grants (`dev(1)` *My machines*, `dev(2)` *Headless box*), `dev(1)`
+/// disabled and `dev(2)` suspended, so that every one of the eight operations has
+/// something to change.
+fn commit_env() -> (Env, GrantStore) {
+    let env = Env::new();
+    let store = env.open();
+    let guard = enable(&env, &store, dev(1), Preset::MyMachines);
+    guard
+        .create_grant(
+            Actor::Ui,
+            &dev(2),
+            Preset::HeadlessBox,
+            &waived(),
+            &upload(),
+        )
+        .unwrap();
+    guard.disable(Actor::Ui, &dev(1)).unwrap();
+    assert_eq!(
+        guard.suspend(Actor::Ui, &dev(2)).unwrap(),
+        SuspendOutcome::Suspended
+    );
+    (env, store)
+}
+
+/// The eight access-increasing guard operations of A25 (k), each a change the store
+/// would accept without the session.
+fn the_eight_operations() -> Vec<(&'static str, GuardOp)> {
+    let set_password: GuardOp =
+        Box::new(|g: &MutationGuard| g.set_password(Actor::Ui, &dev(2), &[0xCD; 192]).map(|_| ()));
+    let create_grant: GuardOp = Box::new(|g: &MutationGuard| {
+        g.create_grant(
+            Actor::Ui,
+            &dev(3),
+            Preset::HeadlessBox,
+            &waived(),
+            &upload(),
+        )
+        .map(|_| ())
+    });
+    let reg_finish: GuardOp = Box::new(|g: &MutationGuard| {
+        let start = g.reg_start(Actor::Cli, &dev(2))?;
+        g.reg_finish(
+            Actor::Cli,
+            &dev(2),
+            &start.reg_txn,
+            &[0xEF; 192],
+            Preset::HeadlessBox,
+            &GrantOptions::default(),
+        )
+        .map(|_| ())
+    });
+    let set_options: GuardOp = Box::new(|g: &MutationGuard| {
+        g.set_options(
+            Actor::Ui,
+            &dev(1),
+            &GrantOptions {
+                block_window_s: Some(1),
+                ..GrantOptions::default()
+            },
+        )
+    });
+    let enable: GuardOp = Box::new(|g: &MutationGuard| g.enable(Actor::Ui, &dev(1)));
+    let resume: GuardOp = Box::new(|g: &MutationGuard| g.resume(Actor::Ui, &dev(2)));
+    let unlock: GuardOp = Box::new(|g: &MutationGuard| g.unlock(Actor::Ui, &dev(2)));
+    let set_settings: GuardOp = Box::new(|g: &MutationGuard| {
+        g.set_settings(
+            Actor::Ui,
+            super::guard::HostSettings {
+                notify: Some(false),
+                ..Default::default()
+            },
+        )
+    });
+    vec![
+        ("create_grant", create_grant),
+        ("set_password", set_password),
+        ("reg_finish", reg_finish),
+        ("set_options", set_options),
+        ("enable", enable),
+        ("resume", resume),
+        ("unlock", unlock),
+        ("set_settings", set_settings),
+    ]
+}
+
+/// What a refused commit must leave as it was: the grants, the host-wide settings and
+/// the keychain anchor (raised by every policy write, never by the refusal's line).
+fn policy_picture(env: &Env, store: &GrantStore) -> (Vec<UnattendedGrant>, [bool; 3], u64) {
+    let grants = store.read(|s| s.grants.clone()).unwrap();
+    let settings = store
+        .read(|s| [s.notify, s.keep_awake, s.prevent_idle_lock])
+        .unwrap();
+    (grants, settings, env.anchor())
+}
+
+fn refusal_lines(env: &Env) -> Vec<SessionRecord> {
+    env.log_events()
+        .into_iter()
+        .filter(|r| r.event == SessionEvent::GrantMutationRefused)
+        .collect()
+}
+
+/// Run `ops` on one thread against a guard whose activity is reserved only inside the
+/// commit; a bounded wait stands for "no deadlock". Returns each operation's result.
+fn run_reserved_at_the_commit(
+    store: &GrantStore,
+    ops: Vec<(&'static str, GuardOp)>,
+) -> Vec<(&'static str, Result<(), GuardError>)> {
+    let guard = MutationGuard::new(
+        store.clone(),
+        Arc::new(AllowAllReAuth::default()),
+        Arc::new(ReservedAtTheCommit {
+            store: store.clone(),
+        }),
+    )
+    .with_server_setup_source(Arc::new(RandomServerSetupSource))
+    .with_paired_devices(Arc::new(AllowAllPaired));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let results: Vec<_> = ops.into_iter().map(|(n, op)| (n, op(&guard))).collect();
+        let _ = tx.send(results);
+    });
+    rx.recv_timeout(Duration::from_secs(60))
+        .expect("the operations returned within the bound: no deadlock")
+}
+
+/// A25 (k) for the operation named `name`: refused with `G_REMOTE_SESSION_ACTIVE`,
+/// nothing committed, the refusal logged once, the chain verifier passes.
+fn a25_k_case(name: &str) {
+    let (env, store) = commit_env();
+    let op = the_eight_operations()
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .unwrap();
+    let before = policy_picture(&env, &store);
+    let lines_before = refusal_lines(&env).len();
+    let results = run_reserved_at_the_commit(&store, vec![op]);
+    let (_, result) = results.into_iter().next().unwrap();
+    let err = result.expect_err(name);
+    assert_eq!(err.code(), codes::G_REMOTE_SESSION_ACTIVE, "{name}: {err}");
+    assert_eq!(
+        policy_picture(&env, &store),
+        before,
+        "{name}: nothing committed"
+    );
+    let lines = refusal_lines(&env);
+    assert_eq!(
+        lines.len(),
+        lines_before + 1,
+        "{name}: logged once: {lines:#?}"
+    );
+    assert_eq!(
+        lines.last().and_then(|r| r.code),
+        Some(codes::G_REMOTE_SESSION_ACTIVE),
+        "{name}"
+    );
+    assert_eq!(
+        store.verify_log().unwrap().status,
+        ChainStatus::Valid,
+        "{name}"
+    );
+}
+
+#[test]
+fn a25_k_create_grant_with_a_session_reserved_before_its_commit_is_refused() {
+    a25_k_case("create_grant");
+}
+
+#[test]
+fn a25_k_set_password_with_a_session_reserved_before_its_commit_is_refused() {
+    a25_k_case("set_password");
+}
+
+#[test]
+fn a25_k_reg_finish_with_a_session_reserved_before_its_commit_is_refused() {
+    a25_k_case("reg_finish");
+}
+
+#[test]
+fn a25_k_set_options_with_a_session_reserved_before_its_commit_is_refused() {
+    a25_k_case("set_options");
+}
+
+#[test]
+fn a25_k_enable_with_a_session_reserved_before_its_commit_is_refused() {
+    a25_k_case("enable");
+}
+
+#[test]
+fn a25_k_resume_with_a_session_reserved_before_its_commit_is_refused() {
+    a25_k_case("resume");
+}
+
+#[test]
+fn a25_k_local_unlock_with_a_session_reserved_before_its_commit_is_refused() {
+    a25_k_case("unlock");
+}
+
+#[test]
+fn a25_k_set_settings_with_a_session_reserved_before_its_commit_is_refused() {
+    a25_k_case("set_settings");
+}
+
+#[test]
+fn d8_4_refused_once_without_a_deadlock() {
+    // D8.4 (first half): every access-increasing operation tried while a session is
+    // reserved is refused and logged once, without a deadlock, and the §B.8.13 chain
+    // verifier passes afterwards. All eight on one thread, one after the other, under
+    // one bounded wait: a refusal logged under the store lock would hang the thread.
+    let (env, store) = commit_env();
+    let before = policy_picture(&env, &store);
+    let lines_before = refusal_lines(&env).len();
+    let results = run_reserved_at_the_commit(&store, the_eight_operations());
+    assert_eq!(results.len(), 8);
+    for (name, result) in results {
+        assert_eq!(
+            result.expect_err(name).code(),
+            codes::G_REMOTE_SESSION_ACTIVE,
+            "{name}"
+        );
+    }
+    assert_eq!(policy_picture(&env, &store), before, "nothing committed");
+    let lines = refusal_lines(&env);
+    assert_eq!(lines.len(), lines_before + 8, "one line each: {lines:#?}");
+    assert!(
+        lines[lines_before..]
+            .iter()
+            .all(|r| r.code == Some(codes::G_REMOTE_SESSION_ACTIVE))
+    );
+    assert_eq!(store.verify_log().unwrap().status, ChainStatus::Valid);
+    assert!(!store.lock_is_held(), "the store lock is free afterwards");
+    // the session gone, the same change commits
+    env.guard(&store).unlock(Actor::Ui, &dev(2)).unwrap();
+}
+
 // ------------------------------------------------------------------ pairing precondition (§B.8 rule 2, §B.8.6.1, §B.8.9)
 
 #[test]
