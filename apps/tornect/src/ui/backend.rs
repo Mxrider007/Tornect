@@ -98,6 +98,9 @@ pub enum Command {
     Admin(TornectId, AdminAction, Option<[u8; 32]>, UaChoice),
     /// The person read that `id`'s unattended setup was re-created (A16).
     ConfirmSetupChanged(TornectId),
+    /// Work out the device words of a device key typed into the Unlock
+    /// confirmation (F4-4).
+    DeviceWords([u8; 32]),
     /// Shut down.
     Quit,
 }
@@ -796,6 +799,18 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                     Command::ClearHistory => change_book(&b, &Change::Clear),
                     Command::SetHistory(on) => change_book(&b, &Change::History(on)),
                     Command::AskPassword(id, admin, target) => open_prompt(&b, id, admin, target),
+                    Command::DeviceWords(key) => {
+                        // Argon2id over 64 MiB: off the command loop, paced
+                        // like every key nobody saved.
+                        let (words, shared) = (Arc::clone(&b.words), Arc::clone(&b.shared));
+                        tokio::spawn(async move {
+                            let derived =
+                                tokio::task::spawn_blocking(move || words.device_words(&key)).await;
+                            if let Ok(derived) = derived {
+                                shared.update(|m| m.unlock_words = Some((key, derived)));
+                            }
+                        });
+                    }
                     Command::ConfirmSetupChanged(id) => {
                         if let Err(e) = ua_client::renew_pin(&b.paths, &id) {
                             tracing::warn!(error = %format!("{e:#}"), "hosts.toml could not be updated");

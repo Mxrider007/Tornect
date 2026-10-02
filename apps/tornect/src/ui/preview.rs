@@ -134,12 +134,19 @@ pub enum Sheet {
     UaRefused,
     /// The connect stepper with an unattended session live: the badge.
     UaLive,
+    /// History off: Home's first-run line, and the address book's Recent
+    /// tab (F4-M1).
+    HistoryOff,
+    /// Forget's confirmation, open on the made-up book's first computer.
+    ForgetAsk,
+    /// The Unlock confirmation with the typed device's words (F4-4).
+    UaUnlock,
 }
 
 /// Put one host sheet of `sheet`'s kind on screen, with invented words.
 pub fn sheet(m: &mut Model, sheet: Sheet) {
     let deadline = Instant::now() + Duration::from_secs(60);
-    if stage(m, sheet) || unattended(m, sheet) {
+    if stage(m, sheet) || unattended(m, sheet) || book(m, sheet) {
         return;
     }
     let (kind, seen) = match sheet {
@@ -321,6 +328,17 @@ fn unattended(m: &mut Model, sheet: Sheet) -> bool {
                 target: None,
             });
         }
+        Sheet::UaUnlock => {
+            first.unattended = UaRecord {
+                worked_before: true,
+                remembered: false,
+                control: true,
+            };
+            m.unlock_words = Some((
+                *unlock_device().public_key_bytes(),
+                words("economy bench equip pencil"),
+            ));
+        }
         Sheet::UaRefused | Sheet::UaLive => {
             first.unattended.worked_before = true;
             m.dial = Dial {
@@ -360,6 +378,50 @@ fn unattended(m: &mut Model, sheet: Sheet) -> bool {
         _ => return false,
     }
     true
+}
+
+/// The address book's states for `--sheet history-off` and `forget-ask`;
+/// `false` for any other sheet.
+fn book(m: &mut Model, sheet: Sheet) -> bool {
+    match sheet {
+        Sheet::HistoryOff => {
+            m.history_notice = true;
+            m.book.history = false;
+            m.book.recent.clear();
+        }
+        Sheet::ForgetAsk => {}
+        _ => return false,
+    }
+    true
+}
+
+/// The other device an Unlock names in the preview: a made-up key.
+fn unlock_device() -> tornect_core::DeviceId {
+    tornect_core::DeviceIdentity::from_seed(&[0x5a; 32]).id()
+}
+
+/// What `--sheet` opens in the window itself (a tab, a confirmation), on the
+/// made-up book's first computer `first`.
+pub fn form(form: &mut super::view::Form, sheet: Sheet, first: Option<TornectId>) {
+    let Some(first) = first else {
+        return;
+    };
+    match sheet {
+        Sheet::HistoryOff => form.book.tab = super::pages::Tab::Recent,
+        Sheet::ForgetAsk => form.book.forgetting = Some(first),
+        Sheet::UaUnlock => {
+            let device = unlock_device();
+            form.ua.unlocking = Some((first, device.to_string()));
+            form.ua.words_asked = Some(*device.public_key_bytes());
+        }
+        _ => {}
+    }
+}
+
+/// A taller main window for a sheet whose card sits low on its page.
+#[must_use]
+pub fn height(sheet: Sheet) -> Option<f64> {
+    (sheet == Sheet::UaUnlock).then_some(1150.0)
 }
 
 /// The connect stepper's stages for `--sheet stage-…`, with an invented

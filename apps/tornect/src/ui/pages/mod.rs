@@ -14,7 +14,7 @@ use std::time::Instant;
 use egui::{RichText, Ui};
 use tornect_core::address_book::Day;
 
-pub use self::address_book::BookForm;
+pub use self::address_book::{BookForm, Tab};
 use super::model::Model;
 use super::nav::Page;
 use super::theme::{self, Face};
@@ -1037,6 +1037,36 @@ mod tests {
             "The password remembered here is no longer in a test keychain: type it."
         ));
         assert!(window.controls().iter().any(|c| c == "Password"));
+    }
+
+    /// F4-4: the Unlock card says what it does, and once the typed device ID
+    /// parses it asks once for that device's words and shows them, to compare
+    /// with that device's own Home.
+    #[test]
+    fn the_unlock_card_shows_the_typed_devices_words() {
+        let mut model = with_book(false);
+        let id = office(&model);
+        model.book.computers[0].unattended.worked_before = true;
+        model.book.computers[0].unattended.control = true;
+        let other = tornect_core::DeviceIdentity::from_seed(&[7; 32]).id();
+        let key = *other.public_key_bytes();
+        let mut window = Window::new(model, Page::AddressBook, egui::Theme::Dark, TALL);
+        window.form.ua.unlocking = Some((id, other.to_string()));
+        assert_eq!(window.pass(Vec::new()), vec![Action::DeviceWords(key)]);
+        assert!(window.pass(Vec::new()).is_empty(), "asked once");
+        assert!(has_text(&window, "Working out its device words…"));
+        assert!(has_text(
+            &window,
+            "and a suspension set from another of your devices is lifted."
+        ));
+        let words = tornect_core::words::Words::from_cached("economy bench equip pencil").unwrap();
+        window.model.unlock_words = Some((key, words));
+        window.pass(Vec::new());
+        assert!(has_text(&window, &words.shown()));
+        assert!(has_text(&window, address_book::UNLOCK_COMPARE));
+        window.model.unlock_words = Some(([1; 32], words));
+        window.pass(Vec::new());
+        assert!(!has_text(&window, &words.shown()), "another key's words");
     }
 
     /// §B.8.10: the prompt is never shown while this screen is shared: no

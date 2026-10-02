@@ -64,6 +64,11 @@ pub(super) fn forget_question(title: &str) -> String {
     )
 }
 
+/// Under the device words of the device an Unlock names (F4-4).
+pub(super) const UNLOCK_COMPARE: &str = "Compare them with the words that device's own Home \
+    shows after \"When you connect to another computer, it shows\". If they differ, you typed \
+    another device's ID: keep things as they are.";
+
 /// Under Forget's answers: what stays (F4-M1).
 pub(super) const FORGET_KEEPS: &str = "Its lines in the session log stay: the session log always \
     records connection attempts in both directions.";
@@ -568,7 +573,7 @@ fn details(
         if computer.paired.is_some() {
             ui.add_space(8.0);
             let ready = model.tor.is_ready() && idle && !model.setup_changed.contains(&id);
-            admin_row(ui, t, computer, ready, form, actions);
+            admin_row(ui, t, computer, ready, model.unlock_words, form, actions);
         }
     });
 }
@@ -583,6 +588,7 @@ fn admin_row(
     t: &Tokens,
     computer: &Computer,
     ready: bool,
+    words: Option<([u8; 32], tornect_core::words::Words)>,
     form: &mut Form,
     actions: &mut Vec<Action>,
 ) {
@@ -638,7 +644,9 @@ fn admin_row(
             });
         return;
     }
-    if let Some((_, typed)) = form.ua.unlocking.as_mut().filter(|(c, _)| *c == id) {
+    let ua = &mut form.ua;
+    if let Some((_, typed)) = ua.unlocking.as_mut().filter(|(c, _)| *c == id) {
+        let words_asked = &mut ua.words_asked;
         // Unlock names the other device: its ID, as `tornect id` there shows
         // it (this computer cannot know another computer's grants).
         let mut done = None;
@@ -657,6 +665,25 @@ fn admin_row(
                 field.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Device ID"));
                 muted(ui, t, "`tornect id` on that device shows its device ID.");
                 let device = typed.trim().parse::<tornect_core::DeviceId>().ok();
+                // The typed device's words (§B.6.1), to compare with that
+                // device's own Home before anything is sent (F4-4).
+                if let Some(key) = device.map(|d| *d.public_key_bytes()) {
+                    if words_asked.replace(key) != Some(key) {
+                        actions.push(Action::DeviceWords(key));
+                    }
+                    match words.filter(|(of, _)| *of == key) {
+                        Some((_, words)) => {
+                            widgets::caps_label(ui, "Its device words");
+                            ui.label(
+                                RichText::new(words.shown())
+                                    .font(theme::font(ui.ctx(), Face::Regular, 13.0))
+                                    .color(t.text_secondary),
+                            );
+                            muted(ui, t, UNLOCK_COMPARE);
+                        }
+                        None => muted(ui, t, "Working out its device words…"),
+                    }
+                }
                 ui.horizontal(|ui| {
                     if Button::new(Kind::Secondary, "Keep things as they are")
                         .small()

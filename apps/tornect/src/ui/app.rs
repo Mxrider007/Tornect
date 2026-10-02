@@ -272,6 +272,9 @@ pub struct App {
     pub title: &'static str,
     /// The theme every window draws with.
     pub theme: egui::Theme,
+    /// The main window's height (the preview opens a taller one for a card
+    /// low on its page).
+    pub height: f64,
     /// Why the window could not run.
     pub error: Option<anyhow::Error>,
 }
@@ -302,6 +305,7 @@ impl App {
             stream_at: None,
             title: "Tornect",
             theme: egui::Theme::Dark,
+            height: 760.0,
             error: None,
         }
     }
@@ -309,6 +313,12 @@ impl App {
     /// Open the main window on `page`.
     pub fn open_page(&mut self, page: Page) {
         self.form.page = page;
+    }
+
+    /// What the window remembers of what is typed and open (the preview
+    /// opens a card through it).
+    pub fn form_mut(&mut self) -> &mut Form {
+        &mut self.form
     }
 
     fn command(&self, command: Command) {
@@ -692,6 +702,7 @@ impl App {
                 self.popups.shared().update(|m| m.prompt = None);
             }
             Action::ConfirmSetupChanged(id) => self.command(Command::ConfirmSetupChanged(id)),
+            Action::DeviceWords(key) => self.command(Command::DeviceWords(key)),
         }
     }
 
@@ -788,7 +799,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let attrs = Window::default_attributes()
             .with_title(self.title)
-            .with_inner_size(LogicalSize::new(1200.0, 760.0))
+            .with_inner_size(LogicalSize::new(1200.0, self.height))
             .with_min_inner_size(LogicalSize::new(960.0, 640.0));
         match Surface::new(
             el,

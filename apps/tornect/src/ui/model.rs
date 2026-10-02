@@ -178,6 +178,9 @@ pub struct Model {
     pub retry_at: HashMap<TornectId, Instant>,
     /// The live unattended session's lines from its signed accept.
     pub ua_live: Option<UaLive>,
+    /// The device words of the device key typed into the Unlock
+    /// confirmation, once worked out (F4-4).
+    pub unlock_words: Option<([u8; 32], Words)>,
     /// The tokio side has finished shutting down.
     pub closed: bool,
 }
