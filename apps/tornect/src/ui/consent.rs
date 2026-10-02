@@ -1,7 +1,9 @@
 //! The window's side of the two consent seams, replacing the terminal's
 //! (`crate::prompt`) when the GUI runs: [`GuiConsent`] is the host's
-//! pairing and session popups (`docs/UI_PLAN.md` §6.1, §6.2) and
-//! [`GuiPairingUi`] the client's code comparison.
+//! pairing and session popups (`docs/UI_PLAN.md` §6.1, §6.2) and the
+//! unattended "Ask before starting" popup (§B.8.6.3), and [`GuiPairingUi`]
+//! the client's code comparison. The block window's Block answers through
+//! [`Popups`] too (`super::block`).
 //!
 //! A popup is on screen exactly as long as its question is open. It is taken
 //! down when it is answered, when the handshake stops waiting for it (the
@@ -18,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{oneshot, watch};
 use tornect_core::TornectId;
-use tornect_core::levels::Availability;
+use tornect_core::levels::{Availability, Elevation};
+use tornect_signal::consent::{GrantId, LocalAllow};
 use tornect_signal::fsm::client::ClientPairingUi;
 use tornect_signal::fsm::host::KillSwitch;
 use tornect_signal::fsm::timeouts;
@@ -28,7 +31,7 @@ use tornect_signal::pairing::{
 };
 
 use super::model::{
-    ClientStage, Confirm, Popup, PopupKind, Recognition, Shared, SheetLevels, Wake,
+    BlockRequest, ClientStage, Confirm, Popup, PopupKind, Recognition, Shared, SheetLevels, Wake,
 };
 use super::recognize::{GoneOnDrop, Recognizer};
 
@@ -75,6 +78,10 @@ enum Answer {
     },
     Session(oneshot::Sender<SessionDecision>),
     Confirm(oneshot::Sender<bool>),
+    /// "Ask before starting": `true` allows.
+    Ask(oneshot::Sender<bool>),
+    /// The block window's Block.
+    Block(oneshot::Sender<()>),
 }
 
 /// The open questions and their answer channels.
@@ -215,6 +222,39 @@ impl Popups {
         }
     }
 
+    /// The host user's answer to "Ask before starting" popup `id` (§B.8.6.3):
+    /// `true` allows the request to go on to its block window.
+    pub fn answer_ask(&self, id: u64, allow: bool) -> bool {
+        match self.take(id) {
+            Some(Answer::Ask(tx)) => tx.send(allow).is_ok(),
+            _ => false,
+        }
+    }
+
+    /// Block, in the block window of request `id` (§B.8.6.3); `false` when that
+    /// window has ended.
+    pub fn answer_block(&self, id: u64) -> bool {
+        match self.take(id) {
+            Some(Answer::Block(tx)) => tx.send(()).is_ok(),
+            _ => false,
+        }
+    }
+
+    /// Show the block window of `label`'s request until `ends_at`: the window is
+    /// up while the returned guard lives, and the receiver resolves on Block.
+    pub(super) fn open_block(
+        &self,
+        label: &str,
+        ends_at: Instant,
+    ) -> (OnScreen<'_>, oneshot::Receiver<()>) {
+        let (tx, rx) = oneshot::channel();
+        let label = label.to_owned();
+        let shown = self.open(Answer::Block(tx), |id, m| {
+            m.blocks.push(BlockRequest { id, label, ends_at });
+        });
+        (shown, rx)
+    }
+
     fn open(
         &self,
         answer: Answer,
@@ -233,7 +273,7 @@ impl Popups {
 
 /// A question on screen; dropping it takes the question down, however it
 /// ended: answered, withdrawn, timed out, or its task cancelled.
-struct OnScreen<'a> {
+pub(super) struct OnScreen<'a> {
     popups: &'a Popups,
     id: u64,
 }
@@ -249,6 +289,7 @@ impl Drop for OnScreen<'_> {
             m.admin_confirm.remove(&id);
             m.admin_not_given.remove(&id);
             m.paired_recently.remove(&id);
+            m.blocks.retain(|b| b.id != id);
             if m.confirm.as_ref().is_some_and(|c| c.id == id) {
                 m.confirm = None;
             }
@@ -428,6 +469,39 @@ impl Consent for GuiConsent {
         left: Duration,
     ) -> BoxFuture<'a, SessionDecision> {
         self.session_sheet(peer, Some(SheetLevels::of(levels)), Some(left))
+    }
+}
+
+/// "Ask before starting" (§B.8.6.3, `AwaitLocalAllow`): a sheet with Deny and
+/// Allow only, naming administrator access for an admin grant (r7); taken
+/// down, as a refusal, when `timeout` ends or it is withdrawn (a kill, or a
+/// session going live).
+impl LocalAllow for GuiConsent {
+    fn ask_at<'a>(
+        &'a self,
+        _: &'a GrantId,
+        label: &'a str,
+        level: Elevation,
+        timeout: Duration,
+    ) -> BoxFuture<'a, bool> {
+        let withdrawn = self.withdraw.armed();
+        Box::pin(async move {
+            let deadline = Instant::now() + timeout;
+            let (tx, rx) = oneshot::channel();
+            let kind = PopupKind::Ask {
+                label: label.to_owned(),
+                administrator: level == Elevation::Admin,
+            };
+            let _on_screen = self.popups.open(Answer::Ask(tx), |id, m| {
+                m.popups.push(Popup { id, kind, deadline });
+            });
+            // A withdrawal wins over an answer given at the same moment.
+            tokio::select! {
+                biased;
+                () = withdrawn => false,
+                answer = tokio::time::timeout(timeout, rx) => matches!(answer, Ok(Ok(true))),
+            }
+        })
     }
 }
 
@@ -632,6 +706,52 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         panic!("{n} popup(s) never shown");
+    }
+
+    /// §B.8.6.3, r7: "Ask before starting" is a sheet among the popups, naming
+    /// administrator access for an admin grant; Allow reaches the handshake, the
+    /// popup's time running out is a refusal, and so is a kill while it is open;
+    /// each time the sheet leaves the screen.
+    #[tokio::test(start_paused = true)]
+    async fn ask_before_starting_answers_through_the_popups() {
+        let popups = popups();
+        let kill = KillSwitch::new();
+        let (_started_tx, started) = watch::channel(0);
+        let consent = GuiConsent::new(Arc::clone(&popups), withdraw(&kill, started));
+        for (level, administrator) in [(Elevation::Admin, true), (Elevation::None, false)] {
+            let asking = consent.ask_at(&[1; 8], "Laptop", level, Duration::from_secs(60));
+            tokio::pin!(asking);
+            tokio::select! {
+                _ = &mut asking => panic!("answered before anyone clicked"),
+                open = shown(&popups, 1) => {
+                    assert_eq!(
+                        open[0].kind,
+                        PopupKind::Ask { label: "Laptop".to_owned(), administrator }
+                    );
+                    assert!(popups.answer_ask(open[0].id, true));
+                }
+            }
+            assert!(asking.await, "allowed");
+            assert!(popups.shared().read(|m| m.popups.is_empty()));
+        }
+        // Nobody answers within the popup's time: a refusal.
+        let asking = consent.ask_at(&[1; 8], "Laptop", Elevation::None, Duration::from_secs(60));
+        tokio::pin!(asking);
+        tokio::select! {
+            _ = &mut asking => panic!("answered at once"),
+            _ = shown(&popups, 1) => {}
+        }
+        assert!(!asking.await, "60 s: denied");
+        assert!(popups.shared().read(|m| m.popups.is_empty()));
+        // A kill while it is open: a refusal at once.
+        let asking = consent.ask_at(&[1; 8], "Laptop", Elevation::None, Duration::from_secs(60));
+        tokio::pin!(asking);
+        tokio::select! {
+            _ = &mut asking => panic!("answered at once"),
+            _ = shown(&popups, 1) => kill.kill(bye::PANIC),
+        }
+        assert!(!asking.await, "withdrawn: denied");
+        assert!(popups.shared().read(|m| m.popups.is_empty()));
     }
 
     /// The answer goes to the FSM, and the popup leaves the screen.

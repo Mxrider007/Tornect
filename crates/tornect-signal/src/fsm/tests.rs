@@ -6430,7 +6430,8 @@ fn unattended_pair_edited(
             HostTransport::default(),
             facts,
         )
-        .with_admin_authority(Arc::new(GuardAdmin::new(Arc::clone(&guard)))),
+        .with_admin_authority(Arc::new(GuardAdmin::new(Arc::clone(&guard))))
+        .with_block_guard(Arc::clone(&guard)),
     );
     (host, client, guard)
 }
@@ -7124,5 +7125,159 @@ async fn a_lowering_leaves_a_session_below_the_level_running() {
     match task.await.unwrap().unwrap() {
         HostOutcome::Session { end, .. } => assert_eq!(end, SessionEnd::Killed(bye::REVOKED)),
         other => panic!("{other:?}"),
+    }
+}
+
+/// §B.8.6.3, TM-20: Block ⇒ `SESSION_REJECT{BLOCKED_BY_LOCAL_USER}` before any accept, so
+/// no session starts and nothing is captured (capture begins at the sink's start), and
+/// the grant is `Suspended{LocalBlock}` until a local Resume: the next request is refused
+/// before any password exchange.
+#[tokio::test]
+async fn block_means_no_capture() {
+    use tornect_core::unattended::grant::{GrantState, SuspendReason};
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    /// The person at the host presses Block.
+    struct Blocks;
+    impl crate::consent::BlockWindow for Blocks {
+        fn run<'a>(
+            &'a self,
+            _: u8,
+            _: &'a crate::consent::GrantId,
+            _: &'a str,
+        ) -> BoxFuture<'a, BlockOutcome> {
+            Box::pin(async { BlockOutcome::Blocked })
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, guard) = unattended_pair_edited(
+        tmp.path(),
+        PW,
+        Arc::new(tornect_core::levels::FixedFacts::linux()),
+        |_| {},
+    );
+    host.deps.block_window = Arc::new(Blocks);
+    let sink = Arc::new(CountingSink::default());
+    host.deps.activity = sink.live.clone();
+    host.deps.sessions = sink.clone();
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .expect_err("blocked");
+    assert!(
+        matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == reject::BLOCKED_BY_LOCAL_USER),
+        "{err}"
+    );
+    match task.await.unwrap().unwrap() {
+        HostOutcome::SessionRejected { reason, .. } => {
+            assert_eq!(reason, reject::BLOCKED_BY_LOCAL_USER);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0, "nothing started");
+    assert!(!SessionActivity::session_live(&*sink.live));
+    let device = client.identity.id();
+    let state = guard.store().grant(&device).unwrap().state;
+    assert!(
+        matches!(
+            state,
+            GrantState::Suspended {
+                reason: SuspendReason::LocalBlock,
+                ..
+            }
+        ),
+        "{state:?}"
+    );
+    // Until a local Resume: refused before any password exchange.
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .expect_err("suspended");
+    assert!(
+        matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == reject::SUSPENDED),
+        "{err}"
+    );
+    let _ = task.await;
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0);
+}
+
+/// §B.8.6.3, r7 (TM-29): "Ask before starting" is given the grant's level, so an admin
+/// grant's popup names administrator access and a grant at none's does not; denied, the
+/// request is refused `DENIED` and nothing starts.
+#[tokio::test]
+async fn ask_before_starting_names_the_administrator_level() {
+    use tornect_core::levels::Elevation;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    /// Records what each popup was asked with, and denies.
+    #[derive(Default)]
+    struct Asked(Mutex<Vec<(String, Elevation, Duration)>>);
+    impl crate::consent::LocalAllow for Asked {
+        fn ask_at<'a>(
+            &'a self,
+            _: &'a crate::consent::GrantId,
+            label: &'a str,
+            level: Elevation,
+            timeout: Duration,
+        ) -> BoxFuture<'a, bool> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((label.to_owned(), level, timeout));
+            Box::pin(async { false })
+        }
+    }
+    for (at_the_level, level) in [(true, Elevation::Admin), (false, Elevation::None)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut host, client, _guard) = unattended_pair_edited(
+            tmp.path(),
+            PW,
+            Arc::new(tornect_core::levels::FixedFacts::linux()),
+            |g| {
+                g.ask_before_start = true;
+                if at_the_level {
+                    g.elevation = Elevation::Admin;
+                }
+            },
+        );
+        let asked = Arc::new(Asked::default());
+        host.deps.local_allow = asked.clone();
+        let sink = Arc::new(CountingSink::default());
+        host.deps.activity = sink.live.clone();
+        host.deps.sessions = sink.clone();
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let err = connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            unattended_intent(PW, messages::mode::CONTROL, at_the_level),
+        )
+        .await
+        .expect_err("denied");
+        assert!(
+            matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == reject::DENIED),
+            "{err}"
+        );
+        let _ = task.await;
+        assert_eq!(
+            *asked.0.lock().unwrap(),
+            vec![("Laptop of Ana".to_owned(), level, Duration::from_secs(60))],
+            "at the level: {at_the_level}"
+        );
+        assert_eq!(sink.starts.load(Ordering::SeqCst), 0);
     }
 }

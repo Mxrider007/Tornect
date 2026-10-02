@@ -97,6 +97,10 @@ pub struct Model {
     pub setup: Option<Setup>,
     /// The host's consent and pairing popups, oldest first.
     pub popups: Vec<Popup>,
+    /// The unattended requests in their block window (§B.8.6.3), oldest first:
+    /// each is shown in a window of its own on every monitor, with Block, until
+    /// it ends.
+    pub blocks: Vec<BlockRequest>,
     /// The client's "did the host show this code?" question.
     pub confirm: Option<Confirm>,
     /// The shared sessions (by `sessions.log` id) that run at the
@@ -323,6 +327,26 @@ pub enum PopupKind {
         /// Its key's fingerprint.
         fingerprint: String,
     },
+    /// §B.8.6.3 "Ask before starting": may this unattended request start? Deny
+    /// or Allow only: the level comes from the grant (r7).
+    Ask {
+        /// The device's pinned label.
+        label: String,
+        /// The grant holds the administrator level: the sheet says that the
+        /// device wants to connect as administrator.
+        administrator: bool,
+    },
+}
+
+/// One unattended request in its block window (§B.8.6.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockRequest {
+    /// Block names it.
+    pub id: u64,
+    /// The device's pinned label.
+    pub label: String,
+    /// When the window ends and the session starts unless blocked.
+    pub ends_at: Instant,
 }
 
 /// This computer's two sets of device words (§B.6.1 item 5).

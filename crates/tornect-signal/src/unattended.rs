@@ -392,6 +392,9 @@ pub struct UnattendedAuth {
     /// The account facts and the helper task's presence, read at each answer
     /// (decision M1-67).
     facts: Arc<dyn FactsSource>,
+    /// What a Block in the block window suspends the grant through (§B.8.6.3:
+    /// `Suspended{LocalBlock}`); without it a Block only refuses the request.
+    block_guard: Option<Arc<MutationGuard>>,
 }
 
 impl UnattendedAuth {
@@ -412,6 +415,7 @@ impl UnattendedAuth {
             readiness: ReadinessSnapshot::unknown(),
             admin: Arc::new(RefuseAdmin),
             facts,
+            block_guard: None,
         }
     }
 
@@ -429,6 +433,28 @@ impl UnattendedAuth {
     pub fn with_admin_authority(mut self, admin: Arc<dyn AdminAuthority>) -> Self {
         self.admin = admin;
         self
+    }
+
+    /// A Block in the block window suspends the grant through `guard`
+    /// (§B.8.6.3: `Suspended{LocalBlock}`, until a local *Resume*; a remote
+    /// unlock never clears it) as well as refusing the request. Without this
+    /// call a Block only refuses.
+    #[must_use]
+    pub fn with_block_guard(mut self, guard: Arc<MutationGuard>) -> Self {
+        self.block_guard = Some(guard);
+        self
+    }
+
+    /// The block window's Block (§B.8.6.3): the grant of `device` goes to
+    /// `Suspended{LocalBlock}` (logged by the guard). The request is refused
+    /// whatever this does; a store that cannot take the change is warned about.
+    fn blocked(&self, device: &DeviceId) {
+        let Some(guard) = &self.block_guard else {
+            return;
+        };
+        if let Err(e) = guard.block(device) {
+            tracing::warn!(peer = ?device, error = %e, "a Block could not suspend the grant");
+        }
     }
 
     /// §B.8.5.2, evaluated **before** the charge so a busy host never writes a
@@ -814,10 +840,17 @@ impl UnattendedAuth {
 
         // ---- ask_before_start, then the block window ----
         let label = ctx.label;
+        // The popup names the grant's level (§B.8.6.3, r7): an admin grant's
+        // says that it wants to connect as administrator.
+        let asked_level = if grant.holds_level() {
+            Elevation::Admin
+        } else {
+            Elevation::None
+        };
         if grant.ask_before_start
             && !ctx
                 .local_allow
-                .ask(&grant.id, label, Duration::from_secs(60))
+                .ask_at(&grant.id, label, asked_level, Duration::from_secs(60))
                 .await
         {
             return Ok(UnattendedVerdict::Reject(SessionReject::new(
@@ -832,6 +865,10 @@ impl UnattendedAuth {
         {
             BlockOutcome::Passed(w) => w,
             BlockOutcome::Blocked => {
+                // §B.8.6.3: Block ⇒ `BLOCKED_BY_LOCAL_USER` and the grant
+                // `Suspended{LocalBlock}` until a local Resume; nothing is
+                // captured (no accept is ever built).
+                self.blocked(&device);
                 return Ok(UnattendedVerdict::Reject(SessionReject::new(
                     reject::BLOCKED_BY_LOCAL_USER,
                 )));
@@ -1041,7 +1078,13 @@ mod tests {
     /// Denies every `ask_before_start` popup.
     struct DenyAll;
     impl crate::consent::LocalAllow for DenyAll {
-        fn ask<'a>(&'a self, _: &'a GrantId, _: &'a str, _: Duration) -> BoxFuture<'a, bool> {
+        fn ask_at<'a>(
+            &'a self,
+            _: &'a GrantId,
+            _: &'a str,
+            _: Elevation,
+            _: Duration,
+        ) -> BoxFuture<'a, bool> {
             Box::pin(async { false })
         }
     }
@@ -1215,7 +1258,8 @@ mod tests {
             Arc::new(tornect_core::unattended::schedule::FixedOffset::utc()),
             HostTransport::default(),
             facts,
-        );
+        )
+        .with_block_guard(Arc::clone(&guard));
         Env {
             _tmp: tmp,
             guard,
@@ -1758,6 +1802,60 @@ mod tests {
             panic!("expected Reject");
         };
         assert_eq!(r.reason, reject::BLOCKED_BY_LOCAL_USER);
+    }
+
+    /// §B.8.6.3: a Block also suspends the grant, `Suspended{LocalBlock}`, through the
+    /// guard (logged as the Block and the suspension), until a local Resume; a hook
+    /// built without the guard only refuses.
+    #[tokio::test]
+    async fn a_block_suspends_the_grant_through_the_guard() {
+        use tornect_core::session_log::SessionEvent;
+        use tornect_core::unattended::grant::{GrantState, SuspendReason};
+        let env = env(PW);
+        let (verdict, _) = run(&env, PW, &AlwaysBlock, &DenyAll).await;
+        let UnattendedVerdict::Reject(r) = verdict.unwrap() else {
+            panic!("expected Reject");
+        };
+        assert_eq!(r.reason, reject::BLOCKED_BY_LOCAL_USER);
+        let state = env.guard.store().grant(&env.device).unwrap().state;
+        assert!(
+            matches!(
+                state,
+                GrantState::Suspended {
+                    reason: SuspendReason::LocalBlock,
+                    ..
+                }
+            ),
+            "{state:?}"
+        );
+        let events: Vec<SessionEvent> = env
+            .guard
+            .store()
+            .log()
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert!(events.contains(&SessionEvent::UnattendedBlockedByLocalUser));
+        assert!(events.contains(&SessionEvent::UnattendedSuspended));
+        // The next request is refused before any password exchange.
+        let (verdict, _) = run(&env, PW, &TimerOnlyWindow, &DenyAll).await;
+        let UnattendedVerdict::Reject(r) = verdict.unwrap() else {
+            panic!("expected Reject");
+        };
+        assert_eq!(r.reason, reject::SUSPENDED);
+
+        // Without the guard: refused, the grant left as it was.
+        let mut bare = env_with(PW, Preset::HeadlessBox, &GrantOptions::default());
+        bare.auth.block_guard = None;
+        let (verdict, _) = run(&bare, PW, &AlwaysBlock, &DenyAll).await;
+        let UnattendedVerdict::Reject(r) = verdict.unwrap() else {
+            panic!("expected Reject");
+        };
+        assert_eq!(r.reason, reject::BLOCKED_BY_LOCAL_USER);
+        let state = bare.guard.store().grant(&bare.device).unwrap().state;
+        assert!(matches!(state, GrantState::Active), "{state:?}");
     }
 
     /// §B.8.4.5: a newer, freshly signed `SESSION_REQUEST` from the same pk

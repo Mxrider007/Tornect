@@ -1,6 +1,6 @@
 //! OS session services for Tornect (`docs/PLAN.md` §B.8.8).
 //!
-//! Seven modules so far:
+//! Eight modules so far:
 //!
 //! - [`ipc`] — the owner-only local endpoint of §B.8.7.4 (Unix socket / Windows
 //!   named pipe) that the CLI talks to and the host serves.
@@ -22,6 +22,9 @@
 //! - [`helper_task`] — Windows: the on-demand administrator helper task of
 //!   unattended administrator sessions: its lifetime, registration, read-back
 //!   and ACL checks (§B.8.7.5).
+//! - `notify` — Linux: a desktop notification with one action over the session
+//!   D-Bus, the block window's best effort where no window can stay on top
+//!   (§B.8.6.3).
 //!
 //! Everything else in §B.8.8 — presence, lock state, keep-awake, wake hooks,
 //! global hotkeys, capture-excluded windows and the other readiness probes —
@@ -44,6 +47,8 @@ pub mod helper;
 pub mod helper_task;
 pub mod ipc;
 pub mod levels;
+#[cfg(target_os = "linux")]
+pub mod notify;
 pub mod polkit;
 pub mod reauth;
 #[cfg(windows)]
