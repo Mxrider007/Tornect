@@ -365,6 +365,154 @@ impl WindowsFacts {
     }
 }
 
+/// The account's facts as read at an answer (decision M1-67): what clause (ii) of
+/// `grant_reach` and F-12 decide from, read afresh each time and never cached from start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountFacts {
+    /// Not Windows: the administrator level does not exist here (§B.2.1).
+    Linux,
+    /// Windows, read.
+    Windows(WindowsFacts),
+    /// Windows, and the token or a UAC value could not be read: control counts as
+    /// administrator access. Never replaced by the facts the probe builds for its
+    /// unreadable row, whose `administrator` is false.
+    Unreadable,
+}
+
+impl AccountFacts {
+    /// [`WindowsFacts::control_is_administrator`] of these facts, the one predicate the
+    /// installed and standalone forms share; facts that could not be read count as true.
+    #[must_use]
+    pub fn control_is_administrator(&self) -> bool {
+        match self {
+            Self::Linux => false,
+            Self::Windows(facts) => facts.control_is_administrator(),
+            Self::Unreadable => true,
+        }
+    }
+}
+
+/// The administrator helper task's presence (§B.8.7.5) as the Task Scheduler reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperPresence {
+    /// Registered.
+    Registered,
+    /// Not registered.
+    Absent,
+    /// The query failed: it counts as registered (decision M1-67).
+    Unreadable,
+}
+
+impl HelperPresence {
+    /// Whether it counts as registered: registered, or its presence could not be read.
+    #[must_use]
+    pub fn counts(self) -> bool {
+        self != Self::Absent
+    }
+}
+
+/// A source of the account facts and the administrator helper task's presence, read at
+/// each answer (decision M1-67). A core trait, as `ReAuth` is: `tornect-platform` reads
+/// the token, the registry and the Task Scheduler; [`FixedFacts`] stands in for it.
+pub trait FactsSource: Send + Sync {
+    /// The account's facts now.
+    fn account(&self) -> AccountFacts;
+    /// The helper task's presence now.
+    fn helper_task(&self) -> HelperPresence;
+}
+
+/// A [`FactsSource`] that answers what it was last given (tests, and a host whose facts
+/// are fixed): a change shows at the next read.
+#[derive(Debug)]
+pub struct FixedFacts {
+    now: std::sync::Mutex<(AccountFacts, HelperPresence)>,
+}
+
+impl FixedFacts {
+    /// `account` and `helper_task` until changed.
+    #[must_use]
+    pub fn new(account: AccountFacts, helper_task: HelperPresence) -> Self {
+        Self {
+            now: std::sync::Mutex::new((account, helper_task)),
+        }
+    }
+
+    /// A Linux host: no facts, no helper task.
+    #[must_use]
+    pub fn linux() -> Self {
+        Self::new(AccountFacts::Linux, HelperPresence::Absent)
+    }
+
+    /// The account's facts change (an owner's setting, made while the host runs).
+    pub fn set_account(&self, account: AccountFacts) {
+        self.now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0 = account;
+    }
+
+    /// The helper task's presence changes.
+    pub fn set_helper_task(&self, helper_task: HelperPresence) {
+        self.now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1 = helper_task;
+    }
+}
+
+impl FactsSource for FixedFacts {
+    fn account(&self) -> AccountFacts {
+        self.now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+    }
+
+    fn helper_task(&self) -> HelperPresence {
+        self.now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
+    }
+}
+
+/// Clause (ii) of `grant_reach` (decision M1-67, §B.8.4.1): a control grant where some
+/// grant holds the administrator level (whatever its state), the helper task counts as
+/// registered, or control is administrator access on this account (installed or
+/// standalone alike). Never on Linux.
+#[must_use]
+pub fn clause_ii(
+    mode: SessionMode,
+    some_grant_holds_level: bool,
+    account: AccountFacts,
+    helper_task: HelperPresence,
+) -> bool {
+    account != AccountFacts::Linux
+        && mode == SessionMode::Control
+        && (some_grant_holds_level || helper_task.counts() || account.control_is_administrator())
+}
+
+/// The mode an unattended session at `level` is served at (decision M1-67): control
+/// without the administrator level lowered to view only where control is administrator
+/// access on this account (F-12, D10), and control lowered where the grant's password is
+/// marked "answered 0" and clause (ii) holds (D11; a marked password is never at the
+/// level). Lowering only.
+#[must_use]
+pub fn served_mode(
+    level: Level,
+    marked: bool,
+    clause_ii: bool,
+    account: AccountFacts,
+) -> SessionMode {
+    let control = level.mode() == SessionMode::Control;
+    let f12 = control && level.elevation() == Elevation::None && account.control_is_administrator();
+    if f12 || (control && marked && clause_ii) {
+        SessionMode::ViewOnly
+    } else {
+        level.mode()
+    }
+}
+
 /// The row of the §B.2.1 table this host is in: the answers its sheet
 /// offers and the sentence under them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1186,5 +1334,68 @@ mod tests {
             }
         }
         assert!(seen[0] > 0 && seen[1] > 0, "{seen:?}");
+    }
+
+    /// Decision M1-67: clause (ii) and the served mode from the facts read at an answer.
+    /// Linux never; unreadable facts and an unreadable helper task count as true; F-12
+    /// lowers control on the always-administrator facts whatever the mark; a marked
+    /// password is served view only where clause (ii) holds; view only stays view only.
+    #[test]
+    fn clause_ii_and_the_served_mode_follow_the_facts() {
+        use SessionMode::{Control, ViewOnly};
+        let plain = AccountFacts::Windows(WindowsFacts {
+            installed: true,
+            administrator: true,
+            ..WindowsFacts::default()
+        });
+        let cpba_0 = AccountFacts::Windows(WindowsFacts {
+            administrator: true,
+            consent_prompt_behavior_admin: Some(0),
+            ..WindowsFacts::default()
+        });
+        let absent = HelperPresence::Absent;
+        assert!(!clause_ii(
+            Control,
+            true,
+            AccountFacts::Linux,
+            HelperPresence::Registered
+        ));
+        assert!(!clause_ii(Control, false, plain, absent));
+        assert!(clause_ii(Control, true, plain, absent));
+        assert!(clause_ii(Control, false, plain, HelperPresence::Registered));
+        assert!(clause_ii(Control, false, plain, HelperPresence::Unreadable));
+        assert!(clause_ii(Control, false, cpba_0, absent));
+        assert!(clause_ii(Control, false, AccountFacts::Unreadable, absent));
+        assert!(!clause_ii(ViewOnly, true, AccountFacts::Unreadable, absent));
+        assert!(AccountFacts::Unreadable.control_is_administrator());
+        assert!(!AccountFacts::Linux.control_is_administrator());
+        let control = Level::new(Control, Elevation::None);
+        let at_the_level = Level::new(Control, Elevation::Admin);
+        let view = Level::new(ViewOnly, Elevation::None);
+        // F-12, marked or not, for control without the level.
+        for marked in [false, true] {
+            assert_eq!(served_mode(control, marked, true, cpba_0), ViewOnly);
+            assert_eq!(
+                served_mode(control, marked, true, AccountFacts::Unreadable),
+                ViewOnly
+            );
+        }
+        assert_eq!(served_mode(at_the_level, false, true, cpba_0), Control);
+        // The mark where clause (ii) holds, and only there.
+        assert_eq!(served_mode(control, true, true, plain), ViewOnly);
+        assert_eq!(served_mode(control, false, true, plain), Control);
+        assert_eq!(served_mode(control, true, false, plain), Control);
+        assert_eq!(
+            served_mode(control, true, false, AccountFacts::Linux),
+            Control
+        );
+        assert_eq!(served_mode(view, false, false, plain), ViewOnly);
+        // A source answers what it was last given.
+        let source = FixedFacts::linux();
+        assert_eq!(source.account(), AccountFacts::Linux);
+        source.set_account(cpba_0);
+        source.set_helper_task(HelperPresence::Unreadable);
+        assert_eq!(source.account(), cpba_0);
+        assert_eq!(source.helper_task(), HelperPresence::Unreadable);
     }
 }

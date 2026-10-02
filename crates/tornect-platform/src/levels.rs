@@ -10,7 +10,7 @@
 //! every row is tested here over a fake registry; the real registry and
 //! token reads are NEEDS-DEVICE(windows).
 
-use tornect_core::levels::{Availability, WindowsFacts};
+use tornect_core::levels::{AccountFacts, Availability, FactsSource, HelperPresence, WindowsFacts};
 
 /// The registry key the UAC values live under.
 pub const POLICY_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
@@ -83,6 +83,58 @@ pub fn windows_row(read: Result<Account, Unreadable>, values: &dyn PolicyValues)
             tracing::warn!(error = %error, "reading this process's token for the session levels");
             Availability::unreadable(elevated, &windows_facts(values, Account::default()))
         }
+    }
+}
+
+/// The account's facts from what was read (decision M1-67, A21 (h)): the token's
+/// account and the UAC values, or [`AccountFacts::Unreadable`] when the token or any
+/// value other than an absent one could not be read. Never the facts [`windows_row`]
+/// builds for its unreadable row, whose `administrator` is false.
+#[must_use]
+pub fn facts_of(
+    read: Result<Account, Unreadable>,
+    policy_unreadable: Option<std::io::Error>,
+    values: &dyn PolicyValues,
+) -> AccountFacts {
+    match (read, policy_unreadable) {
+        (Ok(account), None) => AccountFacts::Windows(windows_facts(values, account)),
+        (Err(Unreadable { error, .. }), _) | (Ok(_), Some(error)) => {
+            tracing::warn!(error = %error, "reading this account's facts for an answer");
+            AccountFacts::Unreadable
+        }
+    }
+}
+
+/// This computer's account facts now (decision M1-67): read afresh at each answer, never
+/// cached from start. [`AccountFacts::Linux`] on every system but Windows.
+#[must_use]
+pub fn account_facts() -> AccountFacts {
+    #[cfg(windows)]
+    {
+        facts_of(
+            crate::win::level_account(),
+            crate::win::policy_unreadable(),
+            &crate::win::PolicyRegistry,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        AccountFacts::Linux
+    }
+}
+
+/// The facts and the helper task of this computer, read at each answer (decision
+/// M1-67): what a host's unattended gate decides clause (ii) and F-12 from.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LiveFacts;
+
+impl FactsSource for LiveFacts {
+    fn account(&self) -> AccountFacts {
+        account_facts()
+    }
+
+    fn helper_task(&self) -> HelperPresence {
+        crate::helper_task::presence_now()
     }
 }
 
@@ -419,5 +471,53 @@ mod tests {
         assert_eq!(a.sentence, Some(SENTENCE_LINUX));
         assert!(a.answers.view_only && a.answers.allow && a.answers.admin.is_none());
         assert_eq!(a.offered(), a.answers);
+    }
+
+    /// Decision M1-67 (A21 (h)): a token or a UAC value that cannot be read gives
+    /// "unreadable", never the facts the probe builds for its unreadable row (which say
+    /// "not an administrator", so control would not count as administrator access); what
+    /// was read gives the facts.
+    #[test]
+    fn unreadable_is_never_fed_as_default_facts() {
+        let values = fake(&[]);
+        let failed = || std::io::Error::other("access denied");
+        let account = Account {
+            administrator: true,
+            ..Account::default()
+        };
+        for read in [
+            Err(Unreadable {
+                elevated: Some(false),
+                error: failed(),
+            }),
+            Err(Unreadable {
+                elevated: None,
+                error: failed(),
+            }),
+        ] {
+            let facts = facts_of(read, None, &values);
+            assert_eq!(facts, AccountFacts::Unreadable);
+            assert!(facts.control_is_administrator());
+        }
+        assert_eq!(
+            facts_of(Ok(account), Some(failed()), &values),
+            AccountFacts::Unreadable
+        );
+        // The probe's default facts would have said the opposite.
+        assert!(!windows_facts(&values, Account::default()).control_is_administrator());
+        let read = facts_of(Ok(account), None, &values);
+        assert_eq!(read, AccountFacts::Windows(windows_facts(&values, account)));
+        assert!(!read.control_is_administrator());
+    }
+
+    /// Decision M1-67: on Linux the read gives no facts and is never "unreadable"; the
+    /// helper task is never there.
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_reads_no_facts_and_is_never_unreadable() {
+        assert_eq!(account_facts(), AccountFacts::Linux);
+        assert_eq!(LiveFacts.account(), AccountFacts::Linux);
+        assert_eq!(LiveFacts.helper_task(), HelperPresence::Absent);
+        assert!(!LiveFacts.account().control_is_administrator());
     }
 }

@@ -366,6 +366,7 @@ async fn unattended_session_end_to_end_over_a_duplex_pipe() {
         AttemptLimiter::new(guard.store().clone()),
         Arc::new(FixedOffset::utc()),
         HostTransport::default(),
+        Arc::new(tornect_core::levels::FixedFacts::linux()),
     ));
 
     let (a, b) = pipe();
@@ -5010,6 +5011,15 @@ async fn a_device_the_host_paired_that_then_says_nothing_is_reported_paired() {
 /// A host whose unattended grant for [`CLIENT_SEED`] has the password `pw`, served by
 /// the real `UnattendedAuth` hook, and a client paired with it both ways.
 fn unattended_pair(tmp: &std::path::Path, pw: &str) -> (HostSide, ClientSide) {
+    unattended_pair_with(tmp, pw, Arc::new(tornect_core::levels::FixedFacts::linux()))
+}
+
+/// [`unattended_pair`] on a host whose account facts and helper task are `facts`.
+fn unattended_pair_with(
+    tmp: &std::path::Path,
+    pw: &str,
+    facts: Arc<dyn tornect_core::levels::FactsSource>,
+) -> (HostSide, ClientSide) {
     use tornect_core::keystore::FileSecretStore;
     use tornect_core::paths::Paths;
     use tornect_core::session_log::Actor;
@@ -5077,6 +5087,7 @@ fn unattended_pair(tmp: &std::path::Path, pw: &str) -> (HostSide, ClientSide) {
             limiter,
             Arc::new(FixedOffset::utc()),
             HostTransport::default(),
+            facts,
         )
         .with_admin_authority(Arc::new(GuardAdmin::new(Arc::new(guard)))),
     );
@@ -5650,6 +5661,158 @@ async fn no_unattended_answer_carries_grant_reach_yet() {
         assert_eq!(answer.grant_reach, None, "{op}");
         let _ = task.await;
     }
+}
+
+/// Windows facts of an administrator account, with `change` applied.
+fn windows_facts(change: impl FnOnce(&mut WindowsFacts)) -> tornect_core::levels::AccountFacts {
+    let mut facts = WindowsFacts {
+        installed: true,
+        administrator: true,
+        ..WindowsFacts::default()
+    };
+    change(&mut facts);
+    tornect_core::levels::AccountFacts::Windows(facts)
+}
+
+/// The mode the real gate signs for a control request (and the level, when asked) on a
+/// host whose facts and helper task `facts` gives.
+async fn served(
+    facts: Arc<dyn tornect_core::levels::FactsSource>,
+    admin_asked: bool,
+) -> (u8, tornect_core::levels::Elevation) {
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, client) = unattended_pair_with(tmp.path(), PW, facts);
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let outcome = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, admin_asked),
+    )
+    .await
+    .expect("an accept");
+    let ClientOutcome::Session(session) = outcome else {
+        panic!("no session");
+    };
+    let signed = (session.accept().mode(), session.accept().elevation());
+    drop(session);
+    let _ = task.await;
+    signed
+}
+
+/// M1-67 A21 (c)-(h), the served mode: a control grant asking for control is served view
+/// only (F-12, and the marked rule where clause (ii) holds, every password marked so far)
+/// where UAC is off (installed or standalone), `ConsentPromptBehaviorAdmin` is 0 (installed
+/// or standalone, also set after the host started, before the answer), the facts could not
+/// be read, or the helper task is registered or cannot be queried; control otherwise, and
+/// always on Linux.
+#[tokio::test]
+async fn a21_view_only_cases_are_served_view_only() {
+    use tornect_core::levels::{AccountFacts, FixedFacts, HelperPresence};
+    let absent = HelperPresence::Absent;
+    let view = [
+        (
+            "(c) UAC off, installed",
+            windows_facts(|f| f.enable_lua = Some(0)),
+            absent,
+        ),
+        (
+            "(d) UAC off, standalone",
+            windows_facts(|f| {
+                f.enable_lua = Some(0);
+                f.installed = false;
+            }),
+            absent,
+        ),
+        (
+            "(e) CPBA 0, installed",
+            windows_facts(|f| f.consent_prompt_behavior_admin = Some(0)),
+            absent,
+        ),
+        (
+            "(f) CPBA 0, standalone",
+            windows_facts(|f| {
+                f.consent_prompt_behavior_admin = Some(0);
+                f.installed = false;
+            }),
+            absent,
+        ),
+        ("(h) unreadable", AccountFacts::Unreadable, absent),
+        (
+            "(b) helper task registered",
+            windows_facts(|_| {}),
+            HelperPresence::Registered,
+        ),
+        (
+            "(b) helper task unreadable",
+            windows_facts(|_| {}),
+            HelperPresence::Unreadable,
+        ),
+    ];
+    for (case, account, helper) in view {
+        let (mode, _) = served(Arc::new(FixedFacts::new(account, helper)), false).await;
+        assert_eq!(mode, messages::mode::VIEW_ONLY, "{case}");
+    }
+    for (case, account) in [
+        ("an administrator account, UAC on", windows_facts(|_| {})),
+        (
+            "a standard account, CPBA 0",
+            windows_facts(|f| {
+                f.administrator = false;
+                f.consent_prompt_behavior_admin = Some(0);
+            }),
+        ),
+        ("Linux", AccountFacts::Linux),
+    ] {
+        let (mode, _) = served(Arc::new(FixedFacts::new(account, absent)), false).await;
+        assert_eq!(mode, messages::mode::CONTROL, "{case}");
+    }
+    // (g) set after the host started, before an answer: the next answer reads it.
+    let facts = Arc::new(FixedFacts::new(windows_facts(|_| {}), absent));
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, client) = unattended_pair_with(tmp.path(), PW, facts.clone());
+    for (cpba, expected) in [
+        (None, messages::mode::CONTROL),
+        (Some(0), messages::mode::VIEW_ONLY),
+    ] {
+        facts.set_account(windows_facts(|f| f.consent_prompt_behavior_admin = cpba));
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let outcome = connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            unattended_intent(PW, messages::mode::CONTROL, false),
+        )
+        .await
+        .expect("an accept");
+        let ClientOutcome::Session(session) = outcome else {
+            panic!("no session");
+        };
+        assert_eq!(session.accept().mode(), expected, "(g) {cpba:?}");
+        drop(session);
+        let _ = task.await;
+    }
+}
+
+/// M1-67 A25 (n), the served mode: a request served view only by F-12 is answered view
+/// only and at no level, also when it asks for the level.
+#[tokio::test]
+async fn a25_n_view_only_by_f12_is_served_view_only() {
+    use tornect_core::levels::{FixedFacts, HelperPresence};
+    let cpba_0 = windows_facts(|f| f.consent_prompt_behavior_admin = Some(0));
+    let (mode, elevation) = served(
+        Arc::new(FixedFacts::new(cpba_0, HelperPresence::Absent)),
+        true,
+    )
+    .await;
+    assert_eq!(mode, messages::mode::VIEW_ONLY);
+    assert_eq!(elevation, tornect_core::levels::Elevation::None);
 }
 
 /// A pin that records how often it was asked to record.
