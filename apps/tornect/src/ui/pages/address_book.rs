@@ -46,13 +46,13 @@ pub struct BookForm {
 }
 
 /// The Recent tab's line while history is off: the switch governs the
-/// recent list only; the session log records connection attempts either
-/// way (F4-M1).
+/// recent list only; the session log records, either way, what the
+/// first-run line says it records (F4-M1, FR2-I1).
 pub(super) const HISTORY_OFF: &str = "Off: no list of recent connections is kept. Switched on, \
     it keeps the day of each connection (never the time) and each computer's last-connected day, \
     only on this computer; anything kept before stays until you clear it. The switch does not \
-    cover the session log: it always records connection attempts in both directions, with their \
-    time, on this computer only.";
+    cover the session log: it always records requests to this computer, and your unattended \
+    connections to others, with their time, on this computer only.";
 
 /// Forget's question for the computer called `title`: what goes (its
 /// pairing, name, recent lines and remembered password). No longer than
@@ -69,9 +69,9 @@ pub(super) const UNLOCK_COMPARE: &str = "Compare them with the words that device
     shows after \"When you connect to another computer, it shows\". If they differ, you typed \
     another device's ID: keep things as they are.";
 
-/// Under Forget's answers: what stays (F4-M1).
+/// Under Forget's answers: what stays (F4-M1, FR2-I1).
 pub(super) const FORGET_KEEPS: &str = "Its lines in the session log stay: the session log always \
-    records connection attempts in both directions.";
+    records requests to this computer, and your unattended connections to others.";
 
 /// From this content width on, the details sit beside the list.
 const SIDE_BY_SIDE_FROM: f32 = 760.0;
