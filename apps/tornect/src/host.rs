@@ -2047,6 +2047,40 @@ mod tests {
         }
     }
 
+    /// Decision M1-67 (C11): the notes after an unattended answer name the
+    /// host, so the command line writes them only to a terminal, through the
+    /// gate of its other host-naming lines.
+    #[test]
+    fn the_cli_notes_name_no_host_off_a_terminal() {
+        use tornect_core::unattended::credentials::Settled;
+        let notes = crate::ua_client::notes(
+            "\"Desk\"",
+            "a test keychain",
+            crate::ua_client::Answered::Session {
+                elevation: tornect_core::levels::Elevation::None,
+                grant_reach: Some(1),
+                asked_control: true,
+                given_control: false,
+                withheld: true,
+            },
+            true,
+            Some(&Settled {
+                forgot: true,
+                ..Settled::default()
+            }),
+        );
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        for note in &notes {
+            assert!(note.contains("\"Desk\""), "{note}");
+            let mut off = Vec::new();
+            peer_note_to(&mut off, false, format_args!("{note}"));
+            assert!(off.is_empty(), "off a terminal: {note}");
+            let mut on = Vec::new();
+            peer_note_to(&mut on, true, format_args!("{note}"));
+            assert_eq!(String::from_utf8(on).unwrap(), format!("{note}\n"));
+        }
+    }
+
     /// FX1-L1: while a session is live the terminal's note for a refused
     /// request (or any other handshake) names no other device, neither its
     /// pinned label nor its fingerprint; outside a live session it is as it

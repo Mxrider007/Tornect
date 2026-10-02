@@ -637,8 +637,16 @@ pub fn admin(
                 Ok(answer) => {
                     // An admin answer keeps no password (DA-15). Its `grant_reach` is not
                     // decoded yet: absent, so a remembered password goes (C1).
-                    if let Err(e) = ua_client::settle_admin(paths, &saved, &id, None) {
-                        eprintln!("hosts.toml could not be updated: {e:#}");
+                    let grant_reach = None;
+                    match ua_client::settle_admin(paths, &saved, &id, grant_reach) {
+                        Ok(settled) => say_notes(&ua_client::notes(
+                            &format!("\"{}\"", known.label),
+                            saved.keychain().unwrap_or("the keychain"),
+                            ua_client::Answered::Admin { grant_reach },
+                            false,
+                            Some(&settled),
+                        )),
+                        Err(e) => eprintln!("hosts.toml could not be updated: {e:#}"),
                     }
                     ua_client::log_attempt(
                         paths,
@@ -674,9 +682,14 @@ pub fn admin(
                 }
                 Err(e) => {
                     let ended = ua_client::ended(&e, &known.label);
-                    if let Err(err) = ua_client::settle(paths, &saved, &id, ended.attempt, &request)
-                    {
-                        eprintln!("hosts.toml could not be updated: {err:#}");
+                    match ua_client::settle(paths, &saved, &id, ended.attempt, &request) {
+                        Ok(settled) => say_notes(&ua_client::refused_notes(
+                            &format!("\"{}\"", known.label),
+                            saved.keychain().unwrap_or("the keychain"),
+                            ended.attempt,
+                            &settled,
+                        )),
+                        Err(err) => eprintln!("hosts.toml could not be updated: {err:#}"),
                     }
                     ua_client::log_attempt(paths, &known, &Logged::Ended(&ended.reason));
                     crate::host::peer_note(format_args!("{}", ended.text));
@@ -688,6 +701,30 @@ pub fn admin(
         node.shutdown().await;
         result
     })
+}
+
+/// The notes after an unattended answer (decision M1-67) on stderr: they name
+/// the host, so only a terminal sees them (`host::peer_note`, U3-M1); the exit
+/// status is the attempt's.
+fn say_notes(notes: &[String]) {
+    for note in notes {
+        crate::host::peer_note(format_args!("{note}"));
+    }
+}
+
+/// `--remember` is refused before dialing where no password can be kept: no
+/// usable keychain, the level asked for, or `hosts.toml` saying that the
+/// host's last answer reached administrator access, left the key out or was
+/// refused (C11). The words name no host: they are an error for the shell.
+fn remember_refused(
+    saved: &tornect_core::unattended::credentials::SavedPasswords,
+    record: &tornect_core::unattended::hosts::HostRecord,
+    administrator: bool,
+) -> Option<String> {
+    saved
+        .offer(record.reach || record.administrator || administrator)
+        .sentence("this host")
+        .map(|why| format!("--remember: {why}"))
 }
 
 /// An unattended attempt, ready before anything is dialed: the prompt ran
@@ -722,11 +759,10 @@ fn prepare_unattended(
         tracing::warn!(error = %format!("{e:#}"), "hosts.toml could not be read");
     }
     let record = crate::ua_client::record(paths, &id);
-    let may_admin = record.administrator || ua.administrator;
     if ua.remember
-        && let Some(why) = saved.offer(may_admin).sentence()
+        && let Some(why) = remember_refused(&saved, &record, ua.administrator)
     {
-        anyhow::bail!("--remember: {why}");
+        anyhow::bail!("{why}");
     }
     let password = match crate::ua_client::recall_for_use(paths, &saved, &id)? {
         crate::ua_client::Recalled::Password(password) => {
@@ -904,8 +940,14 @@ async fn connect_session(
     // kept if asked; nothing is tried again.
     if let (Some(p), Err(e)) = (&prepared, &outcome) {
         let ended = ua_client::ended(e, &p.known.label);
-        if let Err(err) = ua_client::settle(paths, &p.saved, &id, ended.attempt, &p.request) {
-            eprintln!("hosts.toml could not be updated: {err:#}");
+        match ua_client::settle(paths, &p.saved, &id, ended.attempt, &p.request) {
+            Ok(settled) => say_notes(&ua_client::refused_notes(
+                &format!("\"{}\"", p.known.label),
+                p.saved.keychain().unwrap_or("the keychain"),
+                ended.attempt,
+                &settled,
+            )),
+            Err(err) => eprintln!("hosts.toml could not be updated: {err:#}"),
         }
         ua_client::log_attempt(paths, &p.known, &Logged::Ended(&ended.reason));
         crate::host::peer_note(format_args!("{}", ended.text));
@@ -948,7 +990,15 @@ async fn connect_session(
             elevation: session.accept().elevation(),
             grant_reach: None,
         };
-        match ua_client::settle(paths, &p.saved, &id, answer, &p.request) {
+        let answered = ua_client::Answered::Session {
+            elevation: session.accept().elevation(),
+            grant_reach: None,
+            asked_control: !p.request.view_only,
+            given_control: control,
+            withheld: session.elevation_withheld(),
+        };
+        let settled = ua_client::settle(paths, &p.saved, &id, answer, &p.request);
+        match &settled {
             Ok(s) if s.remembered && p.request.remember => eprintln!(
                 "the password is remembered in {}{}",
                 p.saved.keychain().unwrap_or("the keychain"),
@@ -958,8 +1008,18 @@ async fn connect_session(
                     .unwrap_or_default()
             ),
             Ok(_) => {}
+            Err(e) if answer.deletes_first() => {
+                eprintln!("hosts.toml could not be updated: {e:#}");
+            }
             Err(e) => eprintln!("the password could not be remembered: {e:#}"),
         }
+        say_notes(&ua_client::notes(
+            &format!("\"{}\"", p.known.label),
+            p.saved.keychain().unwrap_or("the keychain"),
+            answered,
+            p.request.remember,
+            settled.as_ref().ok(),
+        ));
         ua_client::log_attempt(
             paths,
             &p.known,
@@ -972,12 +1032,6 @@ async fn connect_session(
         eprintln!("{}", ua_client::badge(control, administrator));
         if let Some(line) = ua_client::fail_summary_text(session.accept().fail_summary()) {
             eprintln!("{line}");
-        }
-        if session.elevation_withheld() {
-            crate::host::peer_note(format_args!(
-                "administrator access unavailable at \"{}\": the session goes on without it",
-                p.known.label
-            ));
         }
     }
     // The day of the visit, if history is kept; nothing otherwise.
@@ -1822,6 +1876,39 @@ mod tests {
             "{end:?}"
         );
         host.await.unwrap().unwrap();
+    }
+
+    /// C11 (decision M1-67): `--remember` is refused before dialing where
+    /// `hosts.toml` says that the host's last answer reached administrator
+    /// access, left the key out or was refused, as without a keychain and with
+    /// the level asked for; the refusal names no host. Otherwise it is not.
+    #[test]
+    fn remember_is_refused_before_dialing_where_reach_is_set() {
+        use tornect_core::unattended::credentials::{MemoryVault, NO_KEYCHAIN, SavedPasswords};
+        use tornect_core::unattended::hosts::HostRecord;
+        let saved = SavedPasswords::new(Some(Arc::new(MemoryVault::new())), [1; 32]);
+        let plain = HostRecord::default();
+        assert_eq!(remember_refused(&saved, &plain, false), None);
+        let reach = HostRecord {
+            reach: true,
+            ..HostRecord::default()
+        };
+        let why = remember_refused(&saved, &reach, false).expect("refused");
+        assert_eq!(
+            why,
+            "--remember: A password that can reach administrator access on this host, or that \
+             this host did not rule out, is never remembered."
+        );
+        assert_eq!(remember_refused(&saved, &plain, true), Some(why.clone()));
+        let administrator = HostRecord {
+            administrator: true,
+            ..HostRecord::default()
+        };
+        assert_eq!(remember_refused(&saved, &administrator, false), Some(why));
+        assert_eq!(
+            remember_refused(&SavedPasswords::none([1; 32]), &plain, false),
+            Some(format!("--remember: {NO_KEYCHAIN}"))
+        );
     }
 
     /// SLICE-C3 C3-5: the banner says "this desktop" only where a desktop can

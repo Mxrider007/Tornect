@@ -602,7 +602,8 @@ fn password_prompt(
                 } else {
                     prompt.remember.0
                 };
-                match offer.sentence() {
+                let named = format!("\"{}\"", prompt.host);
+                match offer.sentence(&named) {
                     None if !saved => {
                         ui.checkbox(&mut ua.remember, "Remember on this device");
                         ui.add(
@@ -610,13 +611,16 @@ fn password_prompt(
                                 RichText::new(format!(
                                     "Anyone who can use this computer as you could then \
                                      connect to \"{}\" without the password, and any program \
-                                     running as you can read it from {}.{}",
+                                     running as you can read it from {}.{} {}",
                                     prompt.host,
                                     prompt.keychain.unwrap_or("the keychain"),
                                     prompt
                                         .kept
                                         .map(|kept| format!(" {kept}"))
-                                        .unwrap_or_default()
+                                        .unwrap_or_default(),
+                                    tornect_core::unattended::credentials::remember_unless_reach(
+                                        &named
+                                    )
                                 ))
                                 .small()
                                 .color(t.text_muted),
