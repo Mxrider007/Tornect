@@ -1185,7 +1185,9 @@ impl UnattendedHook for AdminGrant {
                 ReadinessSnapshot::default(),
                 None,
             )
-            .with_elevation(tornect_core::levels::Elevation::Admin);
+            .with_elevation(tornect_core::levels::Elevation::Admin)
+            // An unattended accept at the level carries 2 (decision M1-67).
+            .with_grant_reach(2);
             Ok(UnattendedVerdict::Accept {
                 proof: ConsentProof::Unattended {
                     grant: [9u8; 8],
@@ -5195,7 +5197,9 @@ impl UnattendedHook for Inflated {
                         policy.fail_summary(),
                     );
                     if self.administrator {
-                        policy2 = policy2.with_elevation(tornect_core::levels::Elevation::Admin);
+                        policy2 = policy2
+                            .with_elevation(tornect_core::levels::Elevation::Admin)
+                            .with_grant_reach(2);
                     }
                     UnattendedVerdict::Accept {
                         proof: ConsentProof::Unattended {
@@ -5588,9 +5592,10 @@ fn rewrite_accept(env: &mut Envelope, change: impl FnOnce(&mut messages::Session
 
 /// M1-67 A23 on the real FSMs: an unattended accept changed after the host signed it.
 /// With `elevation = 1`, `grant_reach` absent (the key stripped), 0 or 1 is `E_BAD_LEN`,
-/// and so is a value of 3: the client decodes and validates before it verifies. The key
-/// added at 0 or 1 to an accept without `elevation` (a flip) is `E_BAD_SIG`. Each is a
-/// refused answer (the remembered password goes, not stale), and nothing is pinned.
+/// and so is a value of 3: the client decodes and validates before it verifies. On an
+/// accept without `elevation`, which this host signs at 0, the key stripped or flipped to
+/// 1 is `E_BAD_SIG`. Each is a refused answer (the remembered password goes, not stale),
+/// and nothing is pinned.
 #[tokio::test]
 async fn a23_an_accept_changed_after_signing_is_refused() {
     const PW: &str = "quiet verdant otter lantern zephyr";
@@ -5599,7 +5604,7 @@ async fn a23_an_accept_changed_after_signing_is_refused() {
         (Some(1), Some(0), codes::E_BAD_LEN),
         (Some(1), Some(1), codes::E_BAD_LEN),
         (None, Some(3), codes::E_BAD_LEN),
-        (None, Some(0), codes::E_BAD_SIG),
+        (None, None, codes::E_BAD_SIG),
         (None, Some(1), codes::E_BAD_SIG),
     ];
     for (elevation, grant_reach, code) in cases {
@@ -5675,34 +5680,17 @@ async fn a23_grant_reach_on_an_attended_accept_is_refused() {
     assert_eq!(seen.env.kind, Kind::Error);
 }
 
-/// M1-67, until hosts compute the key: a real gate's accept and real `ADMIN_RESULT`s (a
-/// command run, and one the guard refuses out of the grant's scope) reach the client
-/// without `grant_reach`, so every client keeps nothing (the release coupling, the accept
-/// half and the `ADMIN_RESULT` half). The two early refusals cannot be reached from the
-/// wire (the decoder refuses such a command first): the gate's own test covers them.
+/// M1-67, until `ADMIN_RESULT` carries the key: real `ADMIN_RESULT`s (a command run, and
+/// one the guard refuses out of the grant's scope) reach the client without
+/// `grant_reach`, so every client keeps nothing after them (the release coupling's
+/// `ADMIN_RESULT` half; the accept half is `release_coupling_*`). The two early refusals
+/// cannot be reached from the wire (the decoder refuses such a command first): the
+/// gate's own test covers them.
 #[tokio::test]
-async fn no_unattended_answer_carries_grant_reach_yet() {
+async fn no_admin_result_carries_grant_reach_yet() {
     const PW: &str = "quiet verdant otter lantern zephyr";
     let tmp = tempfile::tempdir().unwrap();
     let (host, client) = unattended_pair(tmp.path(), PW);
-    let (a, b) = pipe();
-    let task = spawn_host(a, &host);
-    let outcome = connect(
-        b,
-        &client.cfg,
-        &client.identity,
-        &client.deps,
-        unattended_intent(PW, messages::mode::CONTROL, false),
-    )
-    .await
-    .expect("an accept");
-    let ClientOutcome::Session(session) = outcome else {
-        panic!("no session");
-    };
-    assert!(session.unattended());
-    assert_eq!(session.accept().grant_reach(), None);
-    drop(session);
-    let _ = task.await;
     for op in [
         messages::admin_op::END_SESSION,
         messages::admin_op::MASTER_OFF,
@@ -6259,6 +6247,410 @@ async fn a_proof_raised_after_the_reservation_is_refused() {
         );
         assert!(helper.attached.lock().unwrap().is_empty());
     }
+}
+
+/// Change `device`'s grant as stored in `paths`' store, keeping its generation (so the
+/// anchor still matches): the level or the mark, which no guard path of this build sets
+/// yet. Only while no `GrantStore` holds the store.
+fn edit_grant_on_disk(
+    paths: &tornect_core::paths::Paths,
+    device: &DeviceId,
+    edit: impl FnOnce(&mut tornect_core::unattended::grant::UnattendedGrant),
+) {
+    use tornect_core::keystore::{FileSecretStore, SecretStore as _};
+    use tornect_core::unattended::codec::{self, MASTER_KEY_ENTRY, MasterKey};
+    let secrets = FileSecretStore::open(paths.keys_dir()).unwrap();
+    let master = MasterKey::parse(&secrets.get(MASTER_KEY_ENTRY).unwrap().unwrap()).unwrap();
+    let bytes = std::fs::read(paths.unattended_store()).unwrap();
+    let (generation, mut store) = codec::open(&master.k_unatt(), &bytes).unwrap();
+    edit(store.grant_mut(device).unwrap());
+    let sealed = codec::seal(&master.k_unatt(), generation, &store).unwrap();
+    std::fs::write(paths.unattended_store(), sealed).unwrap();
+}
+
+/// [`unattended_pair_with`] whose grant `edit` changes as stored first, and the host's
+/// guard (the window's and the command line's single enforcement point).
+fn unattended_pair_edited(
+    tmp: &std::path::Path,
+    pw: &str,
+    facts: Arc<dyn tornect_core::levels::FactsSource>,
+    edit: impl FnOnce(&mut tornect_core::unattended::grant::UnattendedGrant),
+) -> (
+    HostSide,
+    ClientSide,
+    Arc<tornect_core::unattended::guard::MutationGuard>,
+) {
+    use tornect_core::keystore::FileSecretStore;
+    use tornect_core::paths::Paths;
+    use tornect_core::session_log::Actor;
+    use tornect_core::unattended::clock::SystemClock;
+    use tornect_core::unattended::grant::Preset;
+    use tornect_core::unattended::guard::{
+        AllowAllPaired, AllowAllReAuth, MutationGuard, NoSessionActivity,
+    };
+    use tornect_core::unattended::ipc::GrantOptions;
+    use tornect_core::unattended::limiter::{AttemptLimiter, HostTransport};
+    use tornect_core::unattended::schedule::FixedOffset;
+    use tornect_core::unattended::store::GrantStore;
+
+    use crate::auth;
+    use crate::unattended::{GuardAdmin, OpaqueServerSetupSource, UnattendedAuth};
+
+    let mut host = host_side(tmp, HOST_SEED);
+    let client = client_side(tmp, host.identity.id(), CLIENT_SEED);
+    let device = client.identity.id();
+    let host_onion_pk = *host.identity.id().public_key_bytes();
+    host.trusted.pin(device, "Laptop of Ana").unwrap();
+    client
+        .known
+        .pin(host.identity.id(), "Desk of Bob", host_device_pk())
+        .unwrap();
+    let paths = Paths::from_home(tmp.join("host-home"));
+    std::fs::create_dir_all(paths.keys_dir()).unwrap();
+    let open = || {
+        let secrets = Arc::new(FileSecretStore::open(paths.keys_dir()).unwrap());
+        let store = GrantStore::open(
+            &paths,
+            secrets,
+            Arc::new(SystemClock::default()),
+            SessionLog::new(paths.sessions_log()),
+        )
+        .unwrap();
+        MutationGuard::new(
+            store,
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+        )
+        .with_paired_devices(Arc::new(AllowAllPaired))
+        .with_server_setup_source(Arc::new(OpaqueServerSetupSource))
+    };
+    let guard = open();
+    guard.master_on(Actor::Cli, &host_onion_pk).unwrap();
+    guard
+        .create_grant(
+            Actor::Cli,
+            &device,
+            Preset::HeadlessBox,
+            &GrantOptions::default(),
+            &[0u8; 192],
+        )
+        .unwrap();
+    let setup = auth::parse_server_setup(&guard.store().server_setup().unwrap()).unwrap();
+    let record = auth::register_locally(
+        &setup,
+        pw,
+        device.public_key_bytes(),
+        auth::identifiers(device.public_key_bytes(), &host_onion_pk),
+    )
+    .unwrap();
+    guard.set_password(Actor::Cli, &device, &record).unwrap();
+    drop(guard);
+    edit_grant_on_disk(&paths, &device, edit);
+    let guard = Arc::new(open());
+    let limiter = AttemptLimiter::new(guard.store().clone());
+    host.deps.unattended = Arc::new(
+        UnattendedAuth::new(
+            limiter,
+            Arc::new(FixedOffset::utc()),
+            HostTransport::default(),
+            facts,
+        )
+        .with_admin_authority(Arc::new(GuardAdmin::new(Arc::clone(&guard)))),
+    );
+    (host, client, guard)
+}
+
+/// What the accept of one unattended session signed: its mode, its level and its
+/// `grant_reach`.
+async fn signed(
+    host: &HostSide,
+    client: &ClientSide,
+    intent: Intent,
+) -> (u8, tornect_core::levels::Elevation, Option<u8>) {
+    let (a, b) = pipe();
+    let task = spawn_host(a, host);
+    let outcome = connect(b, &client.cfg, &client.identity, &client.deps, intent)
+        .await
+        .expect("an accept");
+    let ClientOutcome::Session(session) = outcome else {
+        panic!("no session");
+    };
+    let accept = session.accept();
+    let answer = (accept.mode(), accept.elevation(), accept.grant_reach());
+    drop(session);
+    let _ = task.await;
+    answer
+}
+
+/// M1-67, the release coupling (B, D1, D8.3), the accept half: every unattended accept
+/// the real gate signs carries `grant_reach` as the read after the reservation computed
+/// it, with the mark it implies: 0 on Linux, 1 where clause (ii) holds (the password
+/// marked, so view only), 2 for an unmarked grant at the level, which alone is signed the
+/// level. The value is never lowered by `want_mode` or `want_elevation`. An attended accept
+/// never carries the key. (`no_unattended_answer_carries_grant_reach_yet`'s accept half,
+/// rewritten here.)
+#[tokio::test]
+async fn release_coupling_every_unattended_accept_carries_grant_reach() {
+    use tornect_core::levels::{FixedFacts, HelperPresence};
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let control = |admin| unattended_intent(PW, messages::mode::CONTROL, admin);
+    // Linux: 0, and the grant marked by the answer
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, client, guard) =
+        unattended_pair_edited(tmp.path(), PW, Arc::new(FixedFacts::linux()), |g| {
+            g.unmarked = true
+        });
+    assert_eq!(
+        signed(&host, &client, control(false)).await,
+        (
+            messages::mode::CONTROL,
+            tornect_core::levels::Elevation::None,
+            Some(0)
+        )
+    );
+    let device = client.identity.id();
+    assert!(
+        guard.store().grant(&device).unwrap().marked(),
+        "answered 0: marked"
+    );
+    drop((host, client, guard));
+    // Windows, the helper task registered: 1, and view only for the marked password
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, client, _guard) = unattended_pair_edited(
+        tmp.path(),
+        PW,
+        Arc::new(FixedFacts::new(
+            windows_facts(|_| {}),
+            HelperPresence::Registered,
+        )),
+        |_| {},
+    );
+    assert_eq!(
+        signed(&host, &client, control(false)).await,
+        (
+            messages::mode::VIEW_ONLY,
+            tornect_core::levels::Elevation::None,
+            Some(1)
+        )
+    );
+    // Windows, every program administrator (no helper needed), an unmarked grant at the
+    // level: 2, the level signed only when asked, and 2 whatever was asked
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, _guard) = unattended_pair_edited(
+        tmp.path(),
+        PW,
+        Arc::new(FixedFacts::new(
+            windows_facts(|f| f.enable_lua = Some(0)),
+            HelperPresence::Absent,
+        )),
+        |g| {
+            g.elevation = tornect_core::levels::Elevation::Admin;
+            g.unmarked = true;
+        },
+    );
+    host.cfg.levels = always_administrator();
+    assert_eq!(
+        signed(&host, &client, control(true)).await,
+        (
+            messages::mode::CONTROL,
+            tornect_core::levels::Elevation::Admin,
+            Some(2)
+        )
+    );
+    // the level not asked: control without the level, view only on these facts (F-12)
+    assert_eq!(
+        signed(&host, &client, control(false)).await,
+        (
+            messages::mode::VIEW_ONLY,
+            tornect_core::levels::Elevation::None,
+            Some(2)
+        )
+    );
+    assert_eq!(
+        signed(
+            &host,
+            &client,
+            unattended_intent(PW, messages::mode::VIEW_ONLY, false)
+        )
+        .await,
+        (
+            messages::mode::VIEW_ONLY,
+            tornect_core::levels::Elevation::None,
+            Some(2)
+        )
+    );
+    // an attended accept: no key
+    let tmp = tempfile::tempdir().unwrap();
+    let host = host_side(tmp.path(), HOST_SEED);
+    host.consent
+        .push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+    host.consent
+        .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+    let client = client_side(tmp.path(), host.identity.id(), CLIENT_SEED);
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let outcome = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        Intent::Session,
+    )
+    .await
+    .unwrap();
+    let ClientOutcome::Session(session) = outcome else {
+        panic!("no session");
+    };
+    assert!(!session.unattended());
+    assert_eq!(session.accept().grant_reach(), None);
+    drop(session);
+    let _ = task.await;
+}
+
+/// M1-67 A25 (n), the helper half: no administrator helper starts for a session the
+/// gate's receipt already lowers, the level asked: P marked at the level (the clamp's
+/// grant level is none) and a request served View only by F-12; the same grant unmarked
+/// does start it, attaches it, and is answered 2 at the level.
+#[tokio::test]
+async fn a25_n_no_helper_starts_for_a_session_the_receipt_lowers() {
+    use tornect_core::levels::{FixedFacts, HelperPresence};
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    for (case, account, holds, unmarked, started) in [
+        ("marked at the level", windows_facts(|_| {}), true, false, 0),
+        (
+            "F-12: CPBA 0, at none",
+            windows_facts(|f| f.consent_prompt_behavior_admin = Some(0)),
+            false,
+            true,
+            0,
+        ),
+        (
+            "unmarked at the level",
+            windows_facts(|_| {}),
+            true,
+            true,
+            1,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut host, client, _guard) = unattended_pair_edited(
+            tmp.path(),
+            PW,
+            Arc::new(FixedFacts::new(account, HelperPresence::Absent)),
+            |g| {
+                if holds {
+                    g.elevation = tornect_core::levels::Elevation::Admin;
+                }
+                g.unmarked = unmarked;
+            },
+        );
+        host.cfg.levels = installed_row();
+        let helper = Arc::new(FakeHelper::default());
+        *helper.script.lock().unwrap() = vec![HelperScript::Ready];
+        host.deps.admin_helper = helper.clone();
+        let (mode, elevation, reach) = signed(
+            &host,
+            &client,
+            unattended_intent(PW, messages::mode::CONTROL, true),
+        )
+        .await;
+        assert_eq!(helper.started.load(Ordering::SeqCst), started, "{case}");
+        if started == 1 {
+            assert_eq!(
+                (mode, elevation, reach),
+                (
+                    messages::mode::CONTROL,
+                    tornect_core::levels::Elevation::Admin,
+                    Some(2)
+                ),
+                "{case}"
+            );
+            assert_eq!(helper.attached.lock().unwrap().len(), 1, "{case}");
+        } else {
+            assert_eq!(elevation, tornect_core::levels::Elevation::None, "{case}");
+        }
+    }
+}
+
+/// The block window, during which the owner gives the grant a new password.
+struct NewPasswordDuringTheWindow {
+    guard: Arc<tornect_core::unattended::guard::MutationGuard>,
+    device: DeviceId,
+    record: Vec<u8>,
+}
+
+impl crate::consent::BlockWindow for NewPasswordDuringTheWindow {
+    fn run<'a>(
+        &'a self,
+        _: u8,
+        _: &'a tornect_core::unattended::grant::GrantId,
+        _: &'a str,
+    ) -> BoxFuture<'a, BlockOutcome> {
+        Box::pin(async move {
+            self.guard
+                .set_password(
+                    tornect_core::session_log::Actor::Ui,
+                    &self.device,
+                    &self.record,
+                )
+                .unwrap();
+            BlockOutcome::Passed(WindowPassed::Elapsed)
+        })
+    }
+}
+
+/// M1-67 A25 (h), and D8.4's second half for a change that does not raise: *Change
+/// password* during P's block window, between the PAKE and the reservation. The read after
+/// the reservation finds another `auth` record than the one this stream proved:
+/// `AUTH_FAILED`, no session, and nothing marked.
+#[tokio::test]
+async fn a25_h_change_password_in_the_block_window_fails_auth() {
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, guard) = unattended_pair_edited(
+        tmp.path(),
+        PW,
+        Arc::new(tornect_core::levels::FixedFacts::linux()),
+        |g| g.unmarked = true,
+    );
+    let device = client.identity.id();
+    let host_onion_pk = *host.identity.id().public_key_bytes();
+    let setup = crate::auth::parse_server_setup(&guard.store().server_setup().unwrap()).unwrap();
+    let record = crate::auth::register_locally(
+        &setup,
+        "another long passphrase entirely",
+        device.public_key_bytes(),
+        crate::auth::identifiers(device.public_key_bytes(), &host_onion_pk),
+    )
+    .unwrap();
+    host.deps.block_window = Arc::new(NewPasswordDuringTheWindow {
+        guard: Arc::clone(&guard),
+        device,
+        record: record.to_vec(),
+    });
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == reject::AUTH_FAILED),
+        "{err:?}"
+    );
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        HostOutcome::SessionRejected { .. }
+    ));
+    assert!(
+        !guard.store().grant(&device).unwrap().marked(),
+        "nothing marked"
+    );
 }
 
 /// A pin that records how often it was asked to record.

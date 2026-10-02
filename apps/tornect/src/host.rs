@@ -1312,7 +1312,7 @@ mod tests {
     /// has the pin and the flag, and the client's log line names the pinned host.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_password_remembered_after_an_unattended_connect_is_in_no_file() {
-        use tornect_core::unattended::credentials::{Attempt, MemoryVault, SavedPasswords};
+        use tornect_core::unattended::credentials::{MemoryVault, SavedPasswords};
         use tornect_signal::fsm::client::ServerKeyPin as _;
 
         const PASSWORD: &str = "quiet verdant otter lantern zephyr";
@@ -1362,10 +1362,7 @@ mod tests {
             &env.paths,
             &saved,
             &host,
-            Attempt::Accepted {
-                elevation: tornect_core::levels::Elevation::None,
-                grant_reach: Some(0),
-            },
+            crate::ua_client::accepted(session.accept()),
             &request,
         )
         .unwrap()
@@ -1440,6 +1437,143 @@ mod tests {
         assert!(line.contains(r#""peer_name":"Desk""#), "{line}");
         assert!(line.contains(r#""reason":"accepted""#), "{line}");
         assert!(!line.contains(&host.onion_address()), "{line}");
+    }
+
+    /// Change `device`'s grant as stored in `paths`' store, keeping its generation (so the
+    /// anchor still matches): the level or the mark, which no guard path of this build
+    /// sets yet. Only while no `GrantStore` holds the store.
+    fn edit_grant_on_disk(
+        paths: &Paths,
+        device: &DeviceId,
+        edit: impl FnOnce(&mut tornect_core::unattended::grant::UnattendedGrant),
+    ) {
+        use tornect_core::keystore::{FileSecretStore, SecretStore as _};
+        use tornect_core::unattended::codec::{self, MASTER_KEY_ENTRY, MasterKey};
+        let secrets = FileSecretStore::open(paths.keys_dir()).unwrap();
+        let master = MasterKey::parse(&secrets.get(MASTER_KEY_ENTRY).unwrap().unwrap()).unwrap();
+        let bytes = std::fs::read(paths.unattended_store()).unwrap();
+        let (generation, mut store) = codec::open(&master.k_unatt(), &bytes).unwrap();
+        edit(store.grant_mut(device).unwrap());
+        let sealed = codec::seal(&master.k_unatt(), generation, &store).unwrap();
+        std::fs::write(paths.unattended_store(), sealed).unwrap();
+    }
+
+    /// M1-67 A20 through a real host: the window host on a Windows administrator
+    /// account's facts (UAC on, no helper task), a client with Remember ticked and an
+    /// entry planted for the host. The grant at the administrator level and not marked:
+    /// every answer the host signs says 2 (the level not asked, view only, the level asked
+    /// with no helper to give it), and the settle, fed from that verified frame as the
+    /// window and the command line feed it (`ua_client::accepted`), keeps nothing and has
+    /// deleted the planted entry. A grant at none on a host without admin grants: every
+    /// answer says 0, and the typed password is kept in place of the planted one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a20_real_host_frame_decides_the_keep() {
+        use tornect_core::levels::{AccountFacts, Elevation, FixedFacts, HelperPresence};
+        use tornect_core::unattended::credentials::{
+            MemoryVault, PasswordVault as _, SavedPasswords,
+        };
+
+        const PASSWORD: &str = "quiet verdant otter lantern zephyr";
+        let windows = AccountFacts::Windows(tornect_core::levels::WindowsFacts {
+            installed: true,
+            administrator: true,
+            ..tornect_core::levels::WindowsFacts::default()
+        });
+        for at_the_level in [true, false] {
+            let env = env();
+            let host_device_pk = HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32]));
+            let (identity, ccfg, mut cdeps) = client(&env);
+            let device = identity.id();
+            TrustedDeviceStore::open(env.paths.trusted_devices_file())
+                .unwrap()
+                .pin(device, "Laptop")
+                .unwrap();
+            cdeps
+                .known_hosts
+                .pin(env.identity.id(), "Desk", host_device_pk)
+                .unwrap();
+            grant_unattended(&env, &device, PASSWORD);
+            if at_the_level {
+                edit_grant_on_disk(&env.paths, &device, |g| {
+                    g.elevation = Elevation::Admin;
+                    g.unmarked = true;
+                });
+            }
+            cdeps.server_key_pin = Arc::new(crate::ua_client::HostsPin::new(&env.paths));
+            let mut wiring = wire(
+                &env.paths,
+                &Config::default(),
+                Arc::clone(&env.identity),
+                host_device_pk,
+                Arc::new(ScriptedConsent::new()),
+                media(),
+                ControlChannel::default(),
+            )
+            .unwrap();
+            let store = wiring.ctx.as_ref().unwrap().guard.store().clone();
+            wiring.deps.unattended = Arc::new(UnattendedAuth::new(
+                AttemptLimiter::new(store),
+                Arc::new(FixedOffset::utc()),
+                HostTransport::default(),
+                Arc::new(FixedFacts::new(windows, HelperPresence::Absent)),
+            ));
+            let vault = Arc::new(MemoryVault::new());
+            let saved = SavedPasswords::new(Some(vault.clone()), *device.public_key_bytes());
+            let host = env.identity.id();
+            vault.put(&saved.entry(&host), "planted").unwrap();
+            for (case, view_only, administrator) in [
+                ("the level not asked", false, false),
+                ("view only", true, false),
+                ("the level asked", false, true),
+            ] {
+                let case = format!("{case}, at the level: {at_the_level}");
+                let request = crate::ua_client::Request {
+                    password: zeroize::Zeroizing::new(PASSWORD.to_owned()),
+                    view_only,
+                    administrator,
+                    remember: true,
+                };
+                let (client_end, host_end) = duplex(64 * 1024);
+                let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+                let host_task =
+                    tokio::spawn(
+                        async move { serve_signaling(host_end, &cfg, &deps, |_| {}).await },
+                    );
+                let session =
+                    match connect(client_end, &ccfg, &identity, &cdeps, request.intent()).await {
+                        Ok(ClientOutcome::Session(session)) => session,
+                        other => panic!("{case}: {other:?}"),
+                    };
+                let signed = session.accept().grant_reach();
+                let settled = crate::ua_client::settle(
+                    &env.paths,
+                    &saved,
+                    &host,
+                    crate::ua_client::accepted(session.accept()),
+                    &request,
+                )
+                .unwrap();
+                drop(session);
+                let _ = host_task.await;
+                if at_the_level {
+                    assert_eq!(signed, Some(2), "{case}");
+                    assert!(!settled.remembered, "{case}");
+                    assert!(vault.names().is_empty(), "{case}: {:?}", vault.names());
+                } else {
+                    assert_eq!(signed, Some(0), "{case}");
+                    assert!(settled.remembered, "{case}");
+                    assert_eq!(vault.names(), vec![saved.entry(&host).as_str().to_owned()]);
+                    assert_eq!(
+                        crate::ua_client::recall(&env.paths, &saved, &host)
+                            .unwrap()
+                            .as_deref()
+                            .map(String::as_str),
+                        Some(PASSWORD),
+                        "{case}"
+                    );
+                }
+            }
+        }
     }
 
     /// Slice-F F2-1 (§B.6, decision M1-48 (8)): an unattended request to a host

@@ -21,15 +21,17 @@ use std::time::{Duration, Instant};
 use futures::future::BoxFuture;
 use tokio::sync::Notify;
 use tornect_core::id::DeviceId;
-use tornect_core::levels::{Elevation, FactsSource, Level, clause_ii, served_mode};
+use tornect_core::levels::{AccountFacts, Elevation, FactsSource, Level, clause_ii, served_mode};
 use tornect_core::session_log::SessionMode;
 use tornect_core::unattended::grant::{AuthRecord, GrantId, UnattendedGrant};
 use tornect_core::unattended::guard::{AdminEffect, AdminOp, AdminOutcome, MutationGuard};
 use tornect_core::unattended::limiter::{
     AttemptLimiter, FailKind, HostTransport, LimiterError, PostF2Reject, Reject, Settle,
 };
+use tornect_core::unattended::reach::{self, ReachRefusal};
 use tornect_core::unattended::readiness::{Probe, ReadinessSnapshot};
 use tornect_core::unattended::schedule::LocalTz;
+use tornect_core::unattended::store::GrantStore;
 
 use crate::auth;
 use crate::consent::{
@@ -484,9 +486,13 @@ impl UnattendedHook for UnattendedAuth {
         Box::pin(async move { self.run(ctx).await })
     }
 
-    /// Decision M1-67 (B, D10, D11): after the reservation, the account facts and the
-    /// helper task are read again and the session lowered where F-12 or the marked rule
-    /// says so, as at the gate: a setting changed since the gate counts. Lowering only.
+    /// Decision M1-67 (B steps 1 to 4, D2, D10, D11): after the reservation, the account
+    /// facts and the helper task are read afresh, outside the store lock; then one store
+    /// operation under the store lock checks the `auth` record this stream proved,
+    /// refuses a grant no longer eligible, reads the mark and whether some grant holds
+    /// the level, computes `grant_reach` and marks the password before an answer of 0.
+    /// The session is lowered to what that read allows (the clamp's grant level, F-12,
+    /// the marked rule), never raised, and carries the `grant_reach` it computed.
     fn reserved<'a>(
         &'a self,
         device: &'a DeviceId,
@@ -504,24 +510,35 @@ impl UnattendedHook for UnattendedAuth {
                 return Ok(proof);
             };
             let account = self.facts.account();
-            let reach_through_host = clause_ii(
-                policy.mode(),
-                some_grant_holds_level(),
+            let helper_task = self.facts.helper_task();
+            let Some(digest) = policy.auth_digest().copied() else {
+                return Err(SessionReject::new(reject::NOT_GRANTED));
+            };
+            let read = match reach::read_after_reservation(
+                self.limiter.store(),
+                device,
+                &digest,
                 account,
-                self.facts.helper_task(),
-            );
-            // A grant gone since the gate reads as marked: the safe direction.
-            let marked = self
-                .limiter
-                .store()
-                .grant(device)
-                .is_none_or(|grant| marked(&grant));
+                helper_task,
+            ) {
+                Ok(read) => read,
+                // The password was replaced since the PAKE: the client deletes it as
+                // stale, and nothing was marked.
+                Err(ReachRefusal::AuthReplaced) => {
+                    return Err(SessionReject::new(reject::AUTH_FAILED));
+                }
+                Err(ReachRefusal::NotEligible | ReachRefusal::MarkNotWritten) => {
+                    return Err(SessionReject::new(reject::NOT_GRANTED));
+                }
+            };
+            let elevation = Elevation::most_restrictive(policy.elevation(), read.grant_level);
+            let policy = policy.with_elevation(elevation);
             let level = Level::new(policy.mode(), policy.elevation());
-            let served = served_mode(level, marked, reach_through_host, account);
+            let served = served_mode(level, read.marked, read.clause_ii, account);
             Ok(ConsentProof::Unattended {
                 grant,
                 proof_fp,
-                policy: policy.lowered_to(served),
+                policy: policy.lowered_to(served).with_grant_reach(read.grant_reach),
                 block,
                 token,
             })
@@ -753,28 +770,36 @@ impl UnattendedAuth {
         } else {
             SessionMode::Control
         };
-        // `want_elevation` the same way (r7, §B.8.4.1): the most restrictive
-        // of the grant's level, the request and what this host delivers. A
-        // grant carries no elevation before §B.8.7.1's setup exists
-        // (M-FEAT-5), so an unattended session is at none for now.
+        // `want_elevation` the same way (r7, §B.8.4.1, D2): the most restrictive
+        // of the grant's level, the request and what this host delivers. The
+        // grant's level is the clone's (store key 24), none while its password is
+        // marked (D11) and where the level does not exist (Linux); what the host
+        // delivers is the state machine's to lower (the helper task, §B.8.7.5).
+        // Decision M1-67 (D10, D11): the account facts and the helper task are read
+        // now, never cached from start.
+        let account = self.facts.account();
+        let grant_level =
+            if grant.holds_level() && !marked(&grant) && account != AccountFacts::Linux {
+                Elevation::Admin
+            } else {
+                Elevation::None
+            };
         let want_elevation = req
             .want_elevation
             .and_then(Elevation::from_code)
             .unwrap_or(Elevation::None);
         let level =
-            Level::new(grant.mode, Elevation::None).clamp(wanted, want_elevation, Elevation::None);
+            Level::new(grant.mode, grant_level).clamp(wanted, want_elevation, Elevation::Admin);
         debug_assert_eq!(
             level.mode(),
             SessionMode::most_restrictive(grant.mode, wanted)
         );
-        // Decision M1-67 (D10, D11): the account facts and the helper task are read
-        // now, never cached from start, and control is lowered to view only where it
-        // is administrator access here (F-12) or where the password is marked and
-        // clause (ii) holds, before any helper starts. Lowering only.
-        let account = self.facts.account();
+        // Control is lowered to view only where it is administrator access here
+        // (F-12) or where the password is marked and clause (ii) holds, before any
+        // helper starts. Lowering only.
         let reach_through_host = clause_ii(
             grant.mode,
-            some_grant_holds_level(),
+            some_grant_holds_level(self.limiter.store()),
             account,
             self.facts.helper_task(),
         );
@@ -796,7 +821,9 @@ impl UnattendedAuth {
             self.readiness.clone(),
             fail_summary.map(wire_fail_summary),
         )
-        .with_elevation(level.elevation());
+        .with_elevation(level.elevation())
+        // The record this stream's PAKE ran against, for the read after the reservation.
+        .with_auth_digest(reach::auth_digest(&grant.auth));
 
         Ok(UnattendedVerdict::Accept {
             proof: ConsentProof::Unattended {
@@ -817,10 +844,13 @@ fn marked(grant: &UnattendedGrant) -> bool {
     grant.marked()
 }
 
-/// Whether some grant in the store holds the administrator level (clause (ii)). No grant
-/// can until the store keeps a grant's level (key 24).
-fn some_grant_holds_level() -> bool {
-    false
+/// Whether some grant in the store holds the administrator level, whatever its state
+/// (clause (ii), store key 24). The read after the reservation decides it again under the
+/// store lock.
+fn some_grant_holds_level(store: &GrantStore) -> bool {
+    store
+        .read(|s| s.grants.iter().any(UnattendedGrant::holds_level))
+        .unwrap_or(false)
 }
 
 impl UnattendedAuth {
