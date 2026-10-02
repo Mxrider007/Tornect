@@ -142,6 +142,42 @@ person at the computer), and a host built before r7 decodes a request with key 5
 here refuses `elevation` or `want_elevation` other than 0 or 1, and `elevation = 1` unless `mode = 0`
 (`messages::tests::the_elevation_keys_decode_only_in_their_domain`).
 
+## Vectors 4 to 10 — `grant_reach` (decision M1-67)
+
+The unattended answers carry the signed key `grant_reach` (§B.8.4.1): key 12 of `SESSION_ACCEPT`, key 2 of
+`ADMIN_RESULT`; 0 none, 1 reach through the host, 2 the grant holds the administrator level. Each vector is a body and
+its digest as the host's third frame of a stream (`v` 1, `msg_id` 3: `HELLO_ACK`, `AUTH_CHALLENGE`, then the answer;
+kind 7 for `SESSION_ACCEPT`, 11 for `ADMIN_RESULT`). No signature: an unattended exchange runs the PAKE, whose
+randomness these vectors do not fix; the digest is what the host's signature covers. The accepts use vector 1's
+negotiated caps and host device key, `session_type` 1, `transport_policy` 0, `token_confirm` `77` × 32 (no
+`session_token`), `block_window_s` 0 and `ask_before_start` false (`fsm::golden::golden_vector_unattended_answers_4_to_10`).
+
+| Vector | Value | Hex |
+|---|---|---|
+| 4 | `SESSION_ACCEPT`, control, `elevation` absent, `grant_reach` 0 | `a900a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50201030004000658207777777777777777777777777777777777777777777777777777777777777777070008f40c00` |
+| 4 | its digest | `da2cd532ecef91b0a851e3f036497b60c6de0dc9e8d9b1edfc9e98b940fdaba6` |
+| 5 | the same at `grant_reach` 1 | `a900a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50201030004000658207777777777777777777777777777777777777777777777777777777777777777070008f40c01` |
+| 5 | its digest | `78942f3bd5dd918d6caef0f1314c6e8005f669bdccf8ee7b6a0a3666f24154dc` |
+| 6 | control, `elevation` 1, `grant_reach` 2 | `aa00a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50201030004000658207777777777777777777777777777777777777777777777777777777777777777070008f40b010c02` |
+| 6 | its digest | `a568228f81b3ec3e1ba30689d4ef00a11eb27ac453d6c87ac6e2a1c9b45be850` |
+| 7 | view only, `grant_reach` 2 | `a900a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50201030104000658207777777777777777777777777777777777777777777777777777777777777777070008f40c02` |
+| 7 | its digest | `6420412b318e1c298a810358207e0d65f8934c19fda6af62580ded3e7059dcc6` |
+| 8 | control, `elevation` absent, `grant_reach` 2 | `a900a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50201030004000658207777777777777777777777777777777777777777777777777777777777777777070008f40c02` |
+| 8 | its digest | `28366a3c3dedc21d303ed903ad6ecf730d6c5672b520a741ae9f3d5db0b6e38f` |
+| 9 | `ADMIN_RESULT{ok: true, grant_reach: 0}` | `a200f50200` |
+| 9 | its digest | `a6e8b11651fe369fd3acb8d46c2a6cea5496da641fbb62ad9cf323a2cb8ddff5` |
+| 10 | `ADMIN_RESULT{ok: false, detail: "unknown admin command", grant_reach: 1}` | `a300f40175756e6b6e6f776e2061646d696e20636f6d6d616e640201` |
+| 10 | its digest | `16f22970a64551bd77d0b356a4a3a2cc9d6645396aa389e6e8860044c8525e37` |
+
+An accept body ends `… 07 00 08 f4 0c <reach>` (key 7 `0`, key 8 `false`, key 12), and vector 6 `… 0b 01 0c 02`
+(key 11 `1` before key 12); the map has nine entries (`a9`), ten for vector 6 (`aa`). Vectors 1 to 3 are unchanged: an
+attended accept never carries key 12, and decoding refuses one that does. Decoding also refuses a `grant_reach` above 2
+in either body, and an unattended accept that signs `elevation = 1` with `grant_reach` other than 2
+(`messages::tests::a23_grant_reach_decodes_only_in_its_domain`); a duplicated key 12 reads the last value and CBOR null
+reads as absent (`messages::tests::a23_a_duplicated_grant_reach_reads_the_last_and_null_reads_absent`). A client
+built before the key decodes these bodies and ignores key 12. The fuzz seeds below come from vectors 1 and 2 and are
+unchanged.
+
 ## Reading the frames
 
 Vector 1 `frame_1` decodes as `[1, 1, 1, body, sig]`; its body is the map

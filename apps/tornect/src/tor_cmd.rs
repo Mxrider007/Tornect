@@ -635,14 +635,15 @@ pub fn admin(
             };
             match client::admin(stream, &ccfg, &device, &deps, &command).await {
                 Ok(answer) => {
-                    // An admin answer keeps no password (DA-15). Its `grant_reach` is not
-                    // decoded yet: absent, so a remembered password goes (C1).
-                    let grant_reach = None;
-                    match ua_client::settle_admin(paths, &saved, &id, grant_reach) {
+                    // An admin answer keeps no password (DA-15); its decoded `grant_reach`
+                    // decides about a remembered one (C1, C11).
+                    match ua_client::settle_admin(paths, &saved, &id, &answer) {
                         Ok(settled) => say_notes(&ua_client::notes(
                             &format!("\"{}\"", known.label),
                             saved.keychain().unwrap_or("the keychain"),
-                            ua_client::Answered::Admin { grant_reach },
+                            ua_client::Answered::Admin {
+                                grant_reach: answer.grant_reach,
+                            },
                             false,
                             Some(&settled),
                         )),
@@ -984,15 +985,11 @@ async fn connect_session(
         Some(format_args!("SESSION LIVE {sid}")),
     );
     if let Some(p) = &prepared {
-        // C1: the verified accept alone decides, before QUIC. Its `grant_reach` is not
-        // decoded yet: absent, so nothing is kept and a remembered password goes.
-        let answer = tornect_core::unattended::credentials::Attempt::Accepted {
-            elevation: session.accept().elevation(),
-            grant_reach: None,
-        };
+        // C1: the verified accept alone decides, before QUIC, by the key decoded from it.
+        let answer = ua_client::accepted(session.accept());
         let answered = ua_client::Answered::Session {
             elevation: session.accept().elevation(),
-            grant_reach: None,
+            grant_reach: session.accept().grant_reach(),
             asked_control: !p.request.view_only,
             given_control: control,
             withheld: session.elevation_withheld(),

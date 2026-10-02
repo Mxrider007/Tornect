@@ -1207,7 +1207,19 @@ where
     // Accept → Established. `build` is the only source of the session token:
     // the accept body carries `session_token` for attended sessions and only
     // `token_confirm` for unattended ones (§B.8.4.3), never the BIND key.
-    let (accept, token) = SessionAccept::build(proof, caps, &host_info);
+    // `grant_reach` (decision M1-67): an unattended accept that signs the
+    // administrator level carries 2, as a host that can sign that level must
+    // send it, and only an unmarked grant at the level is ever signed it. Any
+    // other accept carries no key yet: its value is signed only together with
+    // the mark it implies and the read after the reservation that computes it.
+    // Absent, every client keeps nothing.
+    let grant_reach = match &proof {
+        ConsentProof::Unattended { policy, .. } if policy.elevation() == Elevation::Admin => {
+            Some(2)
+        }
+        _ => None,
+    };
+    let (accept, token) = SessionAccept::build(proof, caps, &host_info, grant_reach);
     let session_id = token.session_id();
     let mode = mode_from_code(accept.mode()).unwrap_or(SessionMode::ViewOnly);
     // The level the accept signs, and nothing else, is the session's level.

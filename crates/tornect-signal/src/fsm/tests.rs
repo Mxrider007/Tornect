@@ -2036,6 +2036,7 @@ fn genuine_accept() -> messages::SessionAccept {
         ends_at: None,
         fail_summary: None,
         elevation: None,
+        grant_reach: None,
     }
 }
 
@@ -3151,6 +3152,7 @@ async fn an_admin_effect_fires_even_when_its_answer_cannot_be_sent() {
                     result: messages::AdminResult {
                         ok: true,
                         detail: None,
+                        grant_reach: None,
                     },
                     effect: tornect_core::unattended::guard::AdminEffect::MasterOff,
                 })
@@ -5218,7 +5220,7 @@ fn tamper_relay(
     client: DuplexStream,
     host: DuplexStream,
     kind: Kind,
-    tamper: fn(&mut Envelope),
+    tamper: impl Fn(&mut Envelope) + Send + Sync + 'static,
 ) -> tokio::task::JoinHandle<()> {
     use crate::framing::{MAX_FRAME_LEN, read_frame_max};
     tokio::spawn(async move {
@@ -5498,6 +5500,156 @@ async fn an_admin_command_gets_the_hosts_signed_answer() {
     .await
     .expect_err("not paired");
     assert!(matches!(err, HandshakeError::Aborted(_)), "{err}");
+}
+
+/// The accept's body as the relay changes it: decoded, `change`d, encoded again; the
+/// signature stays the host's, over the body it signed.
+fn rewrite_accept(env: &mut Envelope, change: impl FnOnce(&mut messages::SessionAccept)) {
+    let mut accept: messages::SessionAccept =
+        decode_body(&env.body).expect("the host's accept decodes");
+    change(&mut accept);
+    env.body = encode_body(&accept);
+}
+
+/// M1-67 A23 on the real FSMs: an unattended accept changed after the host signed it.
+/// With `elevation = 1`, `grant_reach` absent (the key stripped), 0 or 1 is `E_BAD_LEN`,
+/// and so is a value of 3: the client decodes and validates before it verifies. The key
+/// added at 0 or 1 to an accept without `elevation` (a flip) is `E_BAD_SIG`. Each is a
+/// refused answer (the remembered password goes, not stale), and nothing is pinned.
+#[tokio::test]
+async fn a23_an_accept_changed_after_signing_is_refused() {
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let cases: [(Option<u8>, Option<u8>, u16); 6] = [
+        (Some(1), None, codes::E_BAD_LEN),
+        (Some(1), Some(0), codes::E_BAD_LEN),
+        (Some(1), Some(1), codes::E_BAD_LEN),
+        (None, Some(3), codes::E_BAD_LEN),
+        (None, Some(0), codes::E_BAD_SIG),
+        (None, Some(1), codes::E_BAD_SIG),
+    ];
+    for (elevation, grant_reach, code) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, client) = unattended_pair(tmp.path(), PW);
+        let pins = Arc::new(RecordingPin::default());
+        let mut deps = client.deps.clone();
+        deps.server_key_pin = pins.clone();
+        let (client_end, relay_client) = pipe();
+        let (relay_host, host_end) = pipe();
+        let task = spawn_host(host_end, &host);
+        let relay = tamper_relay(relay_client, relay_host, Kind::SessionAccept, move |env| {
+            rewrite_accept(env, |a| {
+                a.elevation = elevation;
+                a.grant_reach = grant_reach;
+            });
+        });
+        let admin_asked = elevation.is_some();
+        let err = connect(
+            client_end,
+            &client.cfg,
+            &client.identity,
+            &deps,
+            unattended_intent(PW, messages::mode::CONTROL, admin_asked),
+        )
+        .await
+        .expect_err("a changed accept");
+        let case = format!("{elevation:?} {grant_reach:?}");
+        assert_eq!(err.violation_code(), Some(code), "{case}: {err}");
+        assert!(
+            matches!(err, HandshakeError::AnswerRefused { .. }),
+            "{case}: {err}"
+        );
+        assert_eq!(pins.recorded.load(Ordering::SeqCst), 0, "{case}");
+        let _ = task.await;
+        let _ = relay.await;
+    }
+}
+
+/// M1-67 A23: `grant_reach` on an attended accept is `E_BAD_LEN`, before the signature.
+#[tokio::test]
+async fn a23_grant_reach_on_an_attended_accept_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = HostIdentity::from_seed(&HOST_SEED);
+    let real_pk = HostSigner::public_key(&real);
+    let client = client_side(tmp.path(), real.id(), CLIENT_SEED);
+    client
+        .known
+        .pin(real.id(), "Desk of Bob", host_device_pk())
+        .unwrap();
+    let (a, b) = pipe();
+    let signer = HostIdentity::from_seed(&HOST_SEED);
+    let relay = tokio::spawn(async move {
+        let mut h = RawHost::new(a, &real_pk);
+        h.take_hello().await;
+        h.ack(&signer).await;
+        h.take(Kind::SessionRequest).await;
+        let accept = accept_with(|a| a.grant_reach = Some(0));
+        h.chan.send(&accept, Some(&signer)).await.unwrap();
+        h.chan.recv(Duration::from_secs(5), "err").await
+    });
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        Intent::Session,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.violation_code(), Some(codes::E_BAD_LEN), "{err}");
+    let seen = relay.await.unwrap().unwrap().unwrap();
+    assert_eq!(seen.env.kind, Kind::Error);
+}
+
+/// M1-67, until hosts compute the key: a real gate's accept and real `ADMIN_RESULT`s (a
+/// command run, and one the guard refuses out of the grant's scope) reach the client
+/// without `grant_reach`, so every client keeps nothing (the release coupling, the accept
+/// half and the `ADMIN_RESULT` half). The two early refusals cannot be reached from the
+/// wire (the decoder refuses such a command first): the gate's own test covers them.
+#[tokio::test]
+async fn no_unattended_answer_carries_grant_reach_yet() {
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, client) = unattended_pair(tmp.path(), PW);
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let outcome = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .expect("an accept");
+    let ClientOutcome::Session(session) = outcome else {
+        panic!("no session");
+    };
+    assert!(session.unattended());
+    assert_eq!(session.accept().grant_reach(), None);
+    drop(session);
+    let _ = task.await;
+    for op in [
+        messages::admin_op::END_SESSION,
+        messages::admin_op::MASTER_OFF,
+    ] {
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let answer = client::admin(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            &client::AdminIntent {
+                password: Zeroizing::new(PW.to_owned()),
+                op,
+                device_pk: None,
+            },
+        )
+        .await
+        .expect("an admin answer");
+        assert_eq!(answer.grant_reach, None, "{op}");
+        let _ = task.await;
+    }
 }
 
 /// A pin that records how often it was asked to record.

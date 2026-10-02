@@ -523,12 +523,25 @@ pub enum ClientOutcome<S> {
 }
 
 /// The host's signed answer to an admin command ([`admin`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AdminAnswer {
     /// Whether the host ran the command (`false`: out of the grant's scope).
     pub ok: bool,
     /// Untrusted free text.
     pub detail: Option<String>,
+    /// `grant_reach` of the verified `ADMIN_RESULT` (key 2, decision M1-67); `None` when
+    /// the host left it out.
+    pub grant_reach: Option<u8>,
+}
+
+impl fmt::Debug for AdminAnswer {
+    /// `grant_reach` is never logged (C13).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdminAnswer")
+            .field("ok", &self.ok)
+            .field("detail", &self.detail)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S> core::fmt::Debug for ClientOutcome<S> {
@@ -1004,6 +1017,7 @@ where
     Ok(AdminAnswer {
         ok: result.ok,
         detail: result.detail,
+        grant_reach: result.grant_reach,
     })
 }
 
