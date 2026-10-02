@@ -830,14 +830,19 @@ fn context(
         LoadMode::Host => GrantStore::open(paths, secrets_dyn, clock, log.clone())?,
         LoadMode::Offline => GrantStore::open_offline(paths, secrets_dyn, clock, log.clone())?,
     };
-    let guard = MutationGuard::new(store, reauth_backend(), activity)
-        .with_paired_devices(Arc::new(FilePairedDevices::new(
-            paths.trusted_devices_file(),
-        )))
-        .with_attended_history(Arc::new(SessionLogHistory::new(log.clone())))
-        .with_server_setup_source(Arc::new(
-            tornect_signal::unattended::OpaqueServerSetupSource,
-        ));
+    let guard = MutationGuard::new(
+        store,
+        reauth_backend(),
+        activity,
+        Arc::new(tornect_platform::levels::LiveFacts),
+    )
+    .with_paired_devices(Arc::new(FilePairedDevices::new(
+        paths.trusted_devices_file(),
+    )))
+    .with_attended_history(Arc::new(SessionLogHistory::new(log.clone())))
+    .with_server_setup_source(Arc::new(
+        tornect_signal::unattended::OpaqueServerSetupSource,
+    ));
     let user_inputs = policy_user_inputs(paths, &host.id().onion_address(), &guard);
     Ok(HostContext {
         guard: Arc::new(guard),
@@ -1986,11 +1991,16 @@ mod tests {
             log.clone(),
         )
         .unwrap();
-        let guard = MutationGuard::new(store, reauth, activity)
-            .with_paired_devices(Arc::new(AllowAllPaired))
-            .with_server_setup_source(Arc::new(
-                tornect_signal::unattended::OpaqueServerSetupSource,
-            ));
+        let guard = MutationGuard::new(
+            store,
+            reauth,
+            activity,
+            Arc::new(tornect_core::levels::FixedFacts::linux()),
+        )
+        .with_paired_devices(Arc::new(AllowAllPaired))
+        .with_server_setup_source(Arc::new(
+            tornect_signal::unattended::OpaqueServerSetupSource,
+        ));
         Env {
             _tmp: tmp,
             ctx: HostContext {
@@ -2458,6 +2468,7 @@ mod tests {
             allow.ctx.guard.store().clone(),
             Arc::new(DenyAllReAuth),
             Arc::new(NoSessionActivity),
+            Arc::new(tornect_core::levels::FixedFacts::linux()),
         );
         let ctx = HostContext {
             guard: Arc::new(deny),

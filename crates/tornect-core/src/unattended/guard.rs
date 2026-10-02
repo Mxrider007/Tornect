@@ -26,6 +26,7 @@ use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 use crate::id::DeviceId;
+use crate::levels::FactsSource;
 use crate::session_log::{Actor, SessionEvent, SessionLog, SessionRecord};
 use crate::trusted::TrustedDevices;
 
@@ -34,7 +35,8 @@ use super::grant::{
     AuthRecord, GrantId, GrantState, Preset, SuspendReason, UnattendedGrant, sanitize_label,
 };
 use super::ipc::{GrantOptions, codes};
-use super::store::{GrantStore, StoreError, StoreStatus, WriteClass, push_tombstone};
+use super::reach::{self, ReachRefusal};
+use super::store::{GrantStore, State, StoreError, StoreStatus, WriteClass, push_tombstone};
 
 /// A remote session must have ended at least this long ago (§B.8.6.2).
 pub const REMOTE_SESSION_COOLDOWN: Duration = Duration::from_secs(60);
@@ -464,6 +466,34 @@ pub struct AdminOutcome {
     pub effect: AdminEffect,
 }
 
+/// What an admin request answers (decision M1-67, D1): its outcome and the requester's
+/// `grant_reach`, as its grant was loaded under the lock of the command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminAnswer {
+    /// The outcome (`ADMIN_RESULT.ok`, `detail`, the effect on live sessions).
+    pub outcome: AdminOutcome,
+    /// `ADMIN_RESULT.grant_reach`.
+    pub grant_reach: u8,
+}
+
+/// An admin request that [`MutationGuard::admin`] does not answer as asked.
+#[derive(Debug)]
+pub enum AdminError {
+    /// The requester's grant, re-loaded under the lock of the command, is gone, no longer
+    /// eligible, or holds another `auth` record than the stream proved: the command does
+    /// not run and no `ADMIN_RESULT` is signed (decision M1-67).
+    Refused(ReachRefusal),
+    /// The store could not apply the command: it took no effect, and an
+    /// `AdminRequest{ok: false}` line says so. The answer still carries the requester's
+    /// `grant_reach`.
+    Failed {
+        /// What failed.
+        error: GuardError,
+        /// The requester's `grant_reach`, read before the command.
+        grant_reach: u8,
+    },
+}
+
 /// Outcome of a local *Suspend*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuspendOutcome {
@@ -610,6 +640,7 @@ pub struct MutationGuard {
     history: Arc<dyn AttendedHistory>,
     paired: Arc<dyn PairedDevices>,
     setup: Arc<dyn ServerSetupSource>,
+    facts: Arc<dyn FactsSource>,
     txns: Mutex<Vec<TxnEntry>>,
 }
 
@@ -623,7 +654,9 @@ impl std::fmt::Debug for MutationGuard {
 }
 
 impl MutationGuard {
-    /// The normative constructor (§B.8.14). The attended history defaults to the
+    /// The normative constructor (§B.8.14). `facts` gives the account facts and the
+    /// administrator helper task's presence, read at each admin answer (decision M1-67;
+    /// `tornect-platform`'s `LiveFacts` on a host). The attended history defaults to the
     /// store's `sessions.log`, the pairing source to the `trusted-devices.toml` of the
     /// same state directory ([`FilePairedDevices`]), the `ServerSetup` source to
     /// [`NoServerSetupSource`].
@@ -632,6 +665,7 @@ impl MutationGuard {
         store: GrantStore,
         reauth: Arc<dyn ReAuth>,
         activity: Arc<dyn RemoteSessionActivity>,
+        facts: Arc<dyn FactsSource>,
     ) -> Self {
         let history = Arc::new(SessionLogHistory::new(store.log().clone()));
         let paired = Arc::new(FilePairedDevices::new(store.trusted_devices_path()));
@@ -642,6 +676,7 @@ impl MutationGuard {
             history,
             paired,
             setup: Arc::new(NoServerSetupSource),
+            facts,
             txns: Mutex::new(Vec::new()),
         }
     }
@@ -1718,145 +1753,264 @@ impl MutationGuard {
 
     // ------------------------------------------------------------ remote admin
 
-    /// A post-PAKE admin request from `requester` (§B.8.4.1 scope): every grant may
-    /// `end_session` (own) and `revoke` (own pk); `unlock(pk)`, `suspend(pk ≠ self)`,
-    /// `revoke(pk ≠ self)`, `revoke_all` and `master_off` need a *My machines* Control
-    /// grant in `Active` state. Out of scope ⇒ `ok: false`, no state change, logged.
+    /// A post-PAKE admin request from `requester`, whose PAKE ran against the stored `auth`
+    /// record with SHA-256 `auth_digest` (§B.8.4.1 scope; decision M1-67, B, D1).
     ///
-    /// `Err` always means the command took no effect: every write that follows a
-    /// committed mutation is best-effort, so a committed deny-direction command is
-    /// never reported as failed, and never loses the effect that ends live sessions.
-    /// A failure is logged as an `AdminRequest{ok: false}` line (best-effort too: the
-    /// store that just failed may refuse that write as well).
-    pub fn admin(&self, requester: &DeviceId, op: AdminOp) -> Result<AdminOutcome, GuardError> {
-        self.admin_inner(requester, op).inspect_err(|e| {
-            let rec = SessionRecord::at(self.now(), SessionEvent::AdminRequest)
-                .device(*requester)
-                .op(op.name())
-                .ok(false)
-                .unattended(true)
-                .code(e.code())
-                .detail("host could not apply the command");
-            if let Err(le) = self.store.log_event(&rec) {
-                tracing::warn!(error = %le, "could not log the failed AdminRequest");
-            }
-        })
+    /// The account facts and the helper task's presence are read first, outside the store
+    /// lock; then one store operation, under the lock that applies the command, re-loads
+    /// the requester's grant. Gone or no longer eligible (unattended access off or paused,
+    /// not `Active`, expired, not yet active, `Pruned`, hard-locked), or holding an `auth`
+    /// record other than the one this stream proved, it is [`AdminError::Refused`]: the
+    /// command does not run and no `ADMIN_RESULT` is signed. Otherwise every answer
+    /// carries the requester's `grant_reach` as its grant was loaded before the command.
+    ///
+    /// Scope: every grant may `end_session` (own) and `revoke` (own pk); `unlock(pk)`,
+    /// `suspend(pk ≠ self)`, `revoke(pk ≠ self)`, `revoke_all` and `master_off` need a
+    /// *My machines* Control grant in `Active` state. Out of scope ⇒ `ok: false`, no state
+    /// change.
+    ///
+    /// [`AdminError::Failed`] means the command took no effect: every write that follows
+    /// a committed mutation is best-effort, so a committed deny-direction command is never
+    /// reported as failed, and never loses the effect that ends live sessions.
+    ///
+    /// Every answer writes an `AdminRequest` line, with the command's own write (the
+    /// locked logger) or once the lock is dropped; a line that cannot be written is warned
+    /// and does not hold the answer back.
+    pub fn admin(
+        &self,
+        requester: &DeviceId,
+        auth_digest: &[u8; 32],
+        op: AdminOp,
+    ) -> Result<AdminAnswer, AdminError> {
+        self.answer_admin(requester, auth_digest, Ok(op))
     }
 
-    fn admin_inner(&self, requester: &DeviceId, op: AdminOp) -> Result<AdminOutcome, GuardError> {
-        self.require_loaded("admin", None, Some(requester))?;
-        let now = self.now();
-        // the rollback rule of every wall-clock evaluation (§B.8.5.3): the requester's
-        // `active_from` / expiry below cannot be judged on a clock behind `last_seen`
-        if now < self.store.last_seen_mark() {
+    /// An admin command refused before it reaches [`Self::admin`]: missing, or one this
+    /// build does not run (`why`; decision M1-67, D1). The requester's grant is checked as
+    /// for any command, the answer carries its `grant_reach`, and its line names op
+    /// `unknown`.
+    pub fn admin_refused_early(
+        &self,
+        requester: &DeviceId,
+        auth_digest: &[u8; 32],
+        why: &str,
+    ) -> Result<AdminAnswer, AdminError> {
+        self.answer_admin(requester, auth_digest, Err(why))
+    }
+
+    fn answer_admin(
+        &self,
+        requester: &DeviceId,
+        auth_digest: &[u8; 32],
+        op: Result<AdminOp, &str>,
+    ) -> Result<AdminAnswer, AdminError> {
+        let account = self.facts.account();
+        let helper_task = self.facts.helper_task();
+        let op_name = op.map_or("unknown", |o| o.name());
+        // Lines written once the lock is dropped (`log_event` takes the same mutex).
+        let mut after: Vec<SessionRecord> = Vec::new();
+        let refused = |why: &str| AdminOutcome {
+            ok: false,
+            detail: Some(why.to_owned()),
+            effect: AdminEffect::None,
+        };
+        let (result, grant_reach) = {
             let mut st = self.store.state();
-            self.store
-                .note_anomaly_locked(&mut st, now, self.store.clock().mono());
-            drop(st);
-            return Ok(self.admin_refused(requester, op, "clock rollback"));
-        }
-        if !self.store.enabled_at(now) {
-            return Ok(self.admin_refused(requester, op, "unattended access is off or paused"));
-        }
-        let Some(req) = self.store.grant(requester) else {
-            return Ok(self.admin_refused(requester, op, "requester has no grant"));
+            if st.status != StoreStatus::Loaded {
+                return Err(AdminError::Refused(ReachRefusal::NotEligible));
+            }
+            let (now, seen) = self.store.wall_locked(&mut st);
+            let Some(store) = st.store.as_ref() else {
+                return Err(AdminError::Refused(ReachRefusal::NotEligible));
+            };
+            let Some(req) = store.grant(requester).cloned() else {
+                return Err(AdminError::Refused(ReachRefusal::NotEligible));
+            };
+            let grant_reach = reach::grant_reach_of(store, &req, account, helper_task);
+            let enabled = store.active_at(now);
+            // The rollback rule of every wall-clock evaluation (§B.8.5.3): the requester's
+            // `active_from` / expiry cannot be judged on a clock behind `last_seen`.
+            let rollback = now < store.last_seen_unix.max(seen);
+            let base = |ok: bool| {
+                SessionRecord::at(now, SessionEvent::AdminRequest)
+                    .device(*requester)
+                    .grant(&req.id)
+                    .op(op_name)
+                    .ok(ok)
+                    .unattended(true)
+            };
+            let result = if rollback {
+                self.store
+                    .note_anomaly_locked(&mut st, now, self.store.clock().mono());
+                after.push(base(false).detail("clock rollback"));
+                Ok(refused("clock rollback"))
+            } else {
+                // The eligibility the gate applies (its own ladder lock excepted: this
+                // very stream's charge armed it), then the record this stream proved.
+                let eligible = enabled
+                    && req.state == GrantState::Active
+                    && !req.expired_at(now)
+                    && req.auth != AuthRecord::Pruned
+                    && now >= req.active_from
+                    && !req.fail.hard_locked;
+                if !eligible {
+                    return Err(AdminError::Refused(ReachRefusal::NotEligible));
+                }
+                let proven = reach::auth_digest(&req.auth);
+                if !bool::from(subtle::ConstantTimeEq::ct_eq(&proven[..], &auth_digest[..])) {
+                    return Err(AdminError::Refused(ReachRefusal::AuthReplaced));
+                }
+                match op {
+                    Err(why) => {
+                        after.push(base(false).detail(why));
+                        Ok(refused(why))
+                    }
+                    Ok(op) => {
+                        let own = |d: &DeviceId| d == requester;
+                        let in_scope = match op {
+                            AdminOp::EndSession => true,
+                            AdminOp::Revoke(d) => own(&d) || req.has_admin_scope(),
+                            AdminOp::RevokeAll | AdminOp::MasterOff | AdminOp::Unlock(_) => {
+                                req.has_admin_scope()
+                            }
+                            AdminOp::Suspend(d) => !own(&d) && req.has_admin_scope(),
+                        };
+                        if in_scope {
+                            self.admin_locked(&mut st, requester, now, op, &base, &mut after)
+                        } else {
+                            after.push(base(false).detail("out of scope for this grant"));
+                            Ok(refused("out of scope for this grant"))
+                        }
+                    }
+                }
+            };
+            (result, grant_reach)
         };
-        // the same eligibility the pre-PAKE gate applies to the requester (its own ladder
-        // lock excepted: this very stream's charge armed it)
-        if req.state != GrantState::Active
-            || req.expired_at(now)
-            || req.auth == AuthRecord::Pruned
-            || now < req.active_from
-            || req.fail.hard_locked
-        {
-            return Ok(self.admin_refused(requester, op, "requester grant not active"));
+        if let Err(e) = &result {
+            after.push(
+                SessionRecord::at(self.now(), SessionEvent::AdminRequest)
+                    .device(*requester)
+                    .op(op_name)
+                    .ok(false)
+                    .unattended(true)
+                    .code(e.code())
+                    .detail("host could not apply the command"),
+            );
         }
-        let own = |d: &DeviceId| d == requester;
-        let in_scope = match op {
-            AdminOp::EndSession => true,
-            AdminOp::Revoke(d) => own(&d) || req.has_admin_scope(),
-            AdminOp::RevokeAll | AdminOp::MasterOff | AdminOp::Unlock(_) => req.has_admin_scope(),
-            AdminOp::Suspend(d) => !own(&d) && req.has_admin_scope(),
-        };
-        if !in_scope {
-            return Ok(self.admin_refused(requester, op, "out of scope for this grant"));
+        for rec in &after {
+            if let Err(e) = self.store.log_event(rec) {
+                tracing::warn!(error = %e, op = op_name, "could not log an AdminRequest line");
+            }
         }
-        let base = |ok: bool| {
-            SessionRecord::at(now, SessionEvent::AdminRequest)
-                .device(*requester)
-                .grant(&req.id)
-                .op(op.name())
-                .ok(ok)
-                .unattended(true)
+        match result {
+            Ok(outcome) => Ok(AdminAnswer {
+                outcome,
+                grant_reach,
+            }),
+            Err(error) => Err(AdminError::Failed { error, grant_reach }),
+        }
+    }
+
+    /// Run the in-scope `op` for `requester` under the held store lock: the locked
+    /// revoke, revoke-all and master-off of decision M1-67. The `AdminRequest` line goes
+    /// with the command's own write; the per-event lines of §B.8.13 (`GrantRevoked`,
+    /// `UnattendedDisabled`, `UnattendedSuspended`), which follow a committed command and
+    /// are best-effort, are queued in `after`. An error means nothing was kept.
+    fn admin_locked(
+        &self,
+        st: &mut State,
+        requester: &DeviceId,
+        now: u64,
+        op: AdminOp,
+        base: &dyn Fn(bool) -> SessionRecord,
+        after: &mut Vec<SessionRecord>,
+    ) -> Result<AdminOutcome, GuardError> {
+        let refused = |why: &str| AdminOutcome {
+            ok: false,
+            detail: Some(why.to_owned()),
+            effect: AdminEffect::None,
         };
-        // The per-event lines of §B.8.13 (`GrantRevoked`, `UnattendedDisabled`) are
-        // written next to the `AdminRequest` line, so a viewer filtering on them sees
-        // remote revocations and a remote master off too. They are best-effort: each
-        // follows a mutation that has already committed together with its own
-        // `AdminRequest` line, and failing the command over a missing second line
-        // would report a committed deny-direction change as not done *and* drop the
-        // effect that ends live sessions.
+        // The per-event lines are written next to the `AdminRequest` line, so a viewer
+        // filtering on them sees remote revocations and a remote master off too; failing
+        // the command over a missing second line would report a committed
+        // deny-direction change as not done *and* drop the effect that ends live sessions.
         let by_admin = |ev: SessionEvent| {
             SessionRecord::at(now, ev)
                 .unattended(true)
                 .reason("admin")
                 .detail(format!("by admin {requester}"))
         };
-        let after_commit = |rec: &SessionRecord| {
-            if let Err(e) = self.store.log_event(rec) {
-                tracing::warn!(error = %e, op = op.name(), "could not log after a committed admin command");
-            }
-        };
         let effect = match op {
-            // Ending one's own session changes no state; the log line is the record,
-            // and ending a session must not hang on it either.
+            // Ending one's own session changes no state; the line is the record.
             AdminOp::EndSession => {
-                after_commit(&base(true));
+                after.push(base(true));
                 AdminEffect::EndSession
             }
-            AdminOp::Revoke(d) => match self
-                .store
-                .remove_grant(&d, &base(true).detail(format!("target {d}")))
-            {
-                Ok(removed) => {
-                    after_commit(
-                        &by_admin(SessionEvent::GrantRevoked)
-                            .device(d)
-                            .grant(&removed.id),
-                    );
-                    AdminEffect::Revoked(d)
+            AdminOp::Revoke(d) => {
+                let rec = base(true).detail(format!("target {d}"));
+                let removed =
+                    self.store
+                        .mutate_locked(st, WriteClass::Policy, Some(&rec), |s, now| {
+                            let idx = s
+                                .grants
+                                .iter()
+                                .position(|g| g.device == d)
+                                .ok_or(StoreError::NoGrant)?;
+                            let g = s.grants.remove(idx);
+                            push_tombstone(s, d, now);
+                            Ok(g.id)
+                        });
+                match removed {
+                    Ok(id) => {
+                        st.runtime.remove(&d);
+                        after.push(by_admin(SessionEvent::GrantRevoked).device(d).grant(&id));
+                        AdminEffect::Revoked(d)
+                    }
+                    Err(StoreError::NoGrant) => {
+                        after.push(base(false).detail("target has no grant"));
+                        return Ok(refused("target has no grant"));
+                    }
+                    Err(e) => return Err(e.into()),
                 }
-                Err(StoreError::NoGrant) => {
-                    return Ok(self.admin_refused(requester, op, "target has no grant"));
-                }
-                Err(e) => return Err(e.into()),
-            },
+            }
             AdminOp::RevokeAll => {
-                let n = self.store.remove_all_grants(&base(true))?;
-                after_commit(
-                    &by_admin(SessionEvent::GrantRevoked)
+                let n = self.store.mutate_locked(
+                    st,
+                    WriteClass::Policy,
+                    Some(&base(true)),
+                    |s, now| {
+                        let devices: Vec<DeviceId> = s.grants.iter().map(|g| g.device).collect();
+                        for d in &devices {
+                            push_tombstone(s, *d, now);
+                        }
+                        s.grants.clear();
+                        Ok(devices.len())
+                    },
+                )?;
+                st.runtime.clear();
+                after.push(
+                    by_admin(SessionEvent::GrantRevoked)
                         .detail(format!("revoke all ({n}) by admin {requester}")),
                 );
                 AdminEffect::RevokedAll(n)
             }
             AdminOp::MasterOff => {
                 self.store
-                    .mutate(WriteClass::Policy, Some(&base(true)), |s, _| {
+                    .mutate_locked(st, WriteClass::Policy, Some(&base(true)), |s, _| {
                         s.enabled = false;
                         Ok(())
                     })?;
-                after_commit(&by_admin(SessionEvent::UnattendedDisabled));
+                after.push(by_admin(SessionEvent::UnattendedDisabled));
                 AdminEffect::MasterOff
             }
             AdminOp::Unlock(d) => {
-                let mut st = self.store.state();
                 let before = st.store.clone();
                 let before_rt = st.runtime.get(&d).copied();
-                match self.store.reset_fail_locked(&mut st, &d) {
+                match self.store.reset_fail_locked(st, &d) {
                     Ok(()) => {}
                     Err(StoreError::NoGrant) => {
-                        drop(st);
-                        return Ok(self.admin_refused(requester, op, "target has no grant"));
+                        after.push(base(false).detail("target has no grant"));
+                        return Ok(refused("target has no grant"));
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -1874,17 +2028,17 @@ impl MutationGuard {
                 }
                 let persisted = self
                     .store
-                    .log_locked(&mut st, &base(true).detail(format!("target {d}")))
+                    .log_locked(st, &base(true).detail(format!("target {d}")))
                     .and_then(|()| {
                         self.store.log_locked(
-                            &mut st,
+                            st,
                             &SessionRecord::at(now, SessionEvent::UnattendedUnlock)
                                 .device(d)
                                 .reason("admin")
                                 .detail(format!("by {requester}")),
                         )
                     })
-                    .and_then(|()| self.store.write_locked(&mut st, WriteClass::Policy));
+                    .and_then(|()| self.store.write_locked(st, WriteClass::Policy));
                 if let Err(e) = persisted {
                     st.store = before;
                     match before_rt {
@@ -1901,34 +2055,37 @@ impl MutationGuard {
             }
             AdminOp::Suspend(d) => {
                 let rec = base(true).detail(format!("target {d}"));
-                let changed = self.store.update_grant(&d, &rec, |g, now| {
-                    Ok(match g.state {
-                        GrantState::Active => {
-                            g.state = GrantState::Suspended {
-                                reason: SuspendReason::Admin,
-                                since: now,
-                            };
-                            true
-                        }
-                        // the local reasons outrank Admin; an already suspended grant is untouched
-                        _ => false,
-                    })
-                });
+                let changed =
+                    self.store
+                        .mutate_locked(st, WriteClass::Policy, Some(&rec), |s, now| {
+                            let g = s.grant_mut(&d).ok_or(StoreError::NoGrant)?;
+                            Ok(match g.state {
+                                GrantState::Active => {
+                                    g.state = GrantState::Suspended {
+                                        reason: SuspendReason::Admin,
+                                        since: now,
+                                    };
+                                    true
+                                }
+                                // the local reasons outrank Admin; an already suspended
+                                // grant is untouched
+                                _ => false,
+                            })
+                        });
                 match changed {
                     Ok(true) => {
-                        if let Err(e) = self.store.log_event(
-                            &SessionRecord::at(now, SessionEvent::UnattendedSuspended)
+                        after.push(
+                            SessionRecord::at(now, SessionEvent::UnattendedSuspended)
                                 .device(d)
                                 .reason(SuspendReason::Admin.log_name())
                                 .detail(format!("by {requester}")),
-                        ) {
-                            tracing::warn!(error = %e, "could not log UnattendedSuspended");
-                        }
+                        );
                         AdminEffect::Suspended(d)
                     }
                     Ok(false) => AdminEffect::None,
                     Err(StoreError::NoGrant) => {
-                        return Ok(self.admin_refused(requester, op, "target has no grant"));
+                        after.push(base(false).detail("target has no grant"));
+                        return Ok(refused("target has no grant"));
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -1939,22 +2096,5 @@ impl MutationGuard {
             detail: None,
             effect,
         })
-    }
-
-    fn admin_refused(&self, requester: &DeviceId, op: AdminOp, why: &str) -> AdminOutcome {
-        let rec = SessionRecord::at(self.now(), SessionEvent::AdminRequest)
-            .device(*requester)
-            .op(op.name())
-            .ok(false)
-            .unattended(true)
-            .detail(why);
-        if let Err(e) = self.store.log_event(&rec) {
-            tracing::warn!(error = %e, "could not log the refused AdminRequest");
-        }
-        AdminOutcome {
-            ok: false,
-            detail: Some(why.to_owned()),
-            effect: AdminEffect::None,
-        }
     }
 }
