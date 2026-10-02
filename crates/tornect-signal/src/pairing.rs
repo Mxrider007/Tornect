@@ -569,7 +569,8 @@ pub type KeepHistory = Arc<dyn Fn() -> bool + Send + Sync>;
 ///
 /// A pairing time is kept to the second for its first day only
 /// ([`TrustedDevices::coarsen`], P-L4): after every load and before every
-/// save.
+/// save, and on disk at the host's start
+/// ([`write_back_to_the_day`](Self::write_back_to_the_day)).
 pub struct TrustedDeviceStore {
     path: Option<PathBuf>,
     inner: Mutex<TrustedDevices>,
@@ -636,6 +637,26 @@ impl TrustedDeviceStore {
     #[must_use]
     pub fn path(&self) -> Option<&std::path::Path> {
         self.path.as_deref()
+    }
+
+    /// Write the file back with every pairing time past its first day kept
+    /// to the day ([`TrustedDevices::coarsen`], P-L4), when that changes it.
+    /// A load keeps them to the day in memory only, and a host whose paired
+    /// devices do not change saves nothing while history is off: the host's
+    /// start calls this once. Merged into the file as it is now, under this
+    /// store's lock; a store that does not persist, or no file, writes
+    /// nothing. Whether the file was written.
+    pub fn write_back_to_the_day(&self) -> tornect_core::Result<bool> {
+        let _held = lock(&self.inner);
+        let Some(path) = &self.path else {
+            return Ok(false);
+        };
+        let mut file = TrustedDevices::load(path)?;
+        if !file.coarsen(trusted::unix_now()) {
+            return Ok(false);
+        }
+        file.save(path)?;
+        Ok(true)
     }
 
     /// Whether last-seen times are written: always for a store that is not
@@ -1148,5 +1169,43 @@ mod tests {
         let rec = saved.get(&desk).unwrap();
         assert_eq!((rec.paired_at, rec.last_seen), (day, day));
         assert!(saved.get(&attic).unwrap().paired_at > day + 86_400);
+    }
+
+    /// FR2R-L1: the write-back the host's start makes keeps an old pairing
+    /// second to its day in the file (the load itself wrote nothing), once;
+    /// a store with no file or no path writes nothing.
+    #[test]
+    fn the_write_back_keeps_the_file_to_the_day_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trusted-devices.toml");
+        let dev = DeviceId::from_bytes([1; 32]);
+        let none = TrustedDeviceStore::shared(path.clone(), Arc::new(|| false)).unwrap();
+        assert!(!none.write_back_to_the_day().unwrap());
+        assert!(!path.exists(), "no file: none written");
+        let memory = TrustedDeviceStore::ephemeral(TrustedDevices::default());
+        assert!(!memory.write_back_to_the_day().unwrap());
+
+        let now = trusted::unix_now();
+        let day = now - now % 86_400 - 2 * 86_400;
+        let mut start = TrustedDevices::default();
+        start.pin(dev, "Laptop", day + 41_234);
+        for shared in [false, true] {
+            start.save(&path).unwrap();
+            let store = if shared {
+                TrustedDeviceStore::shared(path.clone(), Arc::new(|| false))
+            } else {
+                TrustedDeviceStore::open(path.clone())
+            }
+            .unwrap();
+            assert_eq!(TrustedDevices::load(&path).unwrap(), start);
+            assert!(store.write_back_to_the_day().unwrap(), "{shared}");
+            let kept = TrustedDevices::load(&path).unwrap();
+            assert_eq!(
+                kept.get(&dev).map(|d| (d.paired_at, d.last_seen)),
+                Some((day, day)),
+                "{shared}"
+            );
+            assert!(!store.write_back_to_the_day().unwrap(), "{shared}: once");
+        }
     }
 }

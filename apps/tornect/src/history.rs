@@ -21,9 +21,10 @@
 //!
 //! On both sides a pairing time is kept to the second for its first day only,
 //! then to its UTC day (P-L4): the host's store does it after every load and
-//! before every save; on this side [`coarsen_pins`] does it when the window
-//! starts and when a connection starts, and [`Pins::settle`] for the record it
-//! writes.
+//! before every save, and the host's start writes it to the file
+//! ([`DevicePins::write_back_to_the_day`]); on this side [`coarsen_pins`]
+//! does it when the window starts and when a connection starts, and
+//! [`Pins::settle`] for the record it writes.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -201,6 +202,19 @@ impl DevicePins {
     #[must_use]
     pub fn store(&self) -> Arc<TrustedDeviceStore> {
         Arc::clone(&self.store)
+    }
+
+    /// Write `trusted-devices.toml` back with every pairing time past its
+    /// first day kept to the day, when that changes it (P-L4): the host's
+    /// start does this once, since the store's load writes nothing and with
+    /// history off a host whose paired devices do not change never saves.
+    /// Best effort: a file that cannot be read or written is left as it is.
+    /// Whether the file was written.
+    pub fn write_back_to_the_day(&self) -> bool {
+        self.store.write_back_to_the_day().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "trusted-devices.toml was not kept to the day");
+            false
+        })
     }
 
     /// Whether a device was paired, unpaired or relabelled since the last
