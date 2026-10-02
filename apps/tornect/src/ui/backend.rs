@@ -37,8 +37,8 @@ use super::block::GuiBlockWindow;
 use super::book::{self, Change};
 use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
 use super::model::{
-    CaptureNote, Check, ClientStage, Dial, Failure, Hosting, Shared, Sharing, TorState, Viewing,
-    Wake,
+    CaptureNote, Check, ClientStage, Dial, Failure, Hosting, Shared, Sharing, TorState,
+    UnattendedBanner, Viewing, Wake,
 };
 use super::recognize::Lookalike;
 use super::stream::{FrameSlot, SlotSink};
@@ -102,6 +102,9 @@ pub enum Command {
     /// Work out the device words of a device key typed into the Unlock
     /// confirmation (F4-4).
     DeviceWords([u8; 32]),
+    /// Acknowledge the banner of devices that can connect without asking,
+    /// with re-authentication (§B.8.6.2).
+    AcknowledgeBanner,
     /// Shut down.
     Quit,
 }
@@ -243,9 +246,115 @@ fn first_run(paths: &Paths) -> bool {
 /// process holds this home's host lock.
 const HOST_LOCK_EVERY: Duration = Duration::from_secs(2);
 
+/// How often the banner of devices that can connect without asking is read
+/// again from the host's store and log.
+const BANNER_EVERY: Duration = Duration::from_secs(30);
+
+/// The banner of §B.8.6.2 for the window host: read from its guard's store
+/// (how many devices can connect without asking) and log (the last grant
+/// created, changed or enabled, unattended access turned on or resumed, or
+/// backup exported, and who did it), until that change is acknowledged with
+/// re-authentication, which is kept in memory only.
+struct BannerWatch {
+    guard: Arc<tornect_core::unattended::guard::MutationGuard>,
+    acknowledged: Mutex<Option<String>>,
+}
+
+impl BannerWatch {
+    /// The devices that can connect without asking now, and the last change.
+    fn read(&self) -> (usize, Option<(String, &'static str)>) {
+        use tornect_core::session_log::{Actor, SessionEvent};
+        use tornect_core::unattended::grant::GrantState;
+        let now = tornect_core::trusted::unix_now();
+        let store = self.guard.store();
+        let devices = store
+            .read(|s| {
+                if !s.enabled || s.paused_until.is_some_and(|until| until > now) {
+                    0
+                } else {
+                    s.grants
+                        .iter()
+                        .filter(|g| matches!(g.state, GrantState::Active))
+                        .count()
+                }
+            })
+            .unwrap_or(0);
+        let last = store.log().read_all().ok().and_then(|records| {
+            records
+                .iter()
+                .rev()
+                .find(|r| {
+                    matches!(
+                        r.event,
+                        SessionEvent::GrantCreated
+                            | SessionEvent::GrantChanged
+                            | SessionEvent::GrantEnabled
+                            | SessionEvent::UnattendedEnabled
+                            | SessionEvent::UnattendedResumed
+                            | SessionEvent::BackupExported
+                    )
+                })
+                .map(|r| {
+                    let by = match r.by {
+                        Some(Actor::Ui) => "ui",
+                        Some(Actor::Cli) => "cli",
+                        Some(Actor::Import) => "import",
+                        Some(Actor::Restore) => "restore",
+                        None => "unknown",
+                    };
+                    (r.ts.clone(), by)
+                })
+        });
+        (devices, last)
+    }
+
+    /// Put the banner as it is now into the model.
+    fn refresh(&self, shared: &Shared) {
+        let (devices, last) = self.read();
+        let acknowledged = self
+            .acknowledged
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let banner = UnattendedBanner::of(devices, last, acknowledged.as_deref());
+        if shared.read(|m| m.unattended_banner != banner) {
+            shared.update(|m| m.unattended_banner = banner);
+        }
+    }
+
+    /// Acknowledge the banner as it is now: the host's re-authentication (an
+    /// access-increasing kind of operation, so never during a remote session,
+    /// §B.8.6.2), then the banner goes until a newer change.
+    fn acknowledge(&self, shared: &Shared) {
+        use tornect_core::session_log::Actor;
+        use tornect_core::unattended::guard::ExternalOp;
+        let (_, last) = self.read();
+        let asked = self.guard.authorize(
+            Actor::Ui,
+            &ExternalOp::SettingsChange {
+                what: "acknowledge the banner of devices that can connect without asking".into(),
+            },
+        );
+        match asked {
+            Ok(()) => {
+                *self
+                    .acknowledged
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) =
+                    Some(last.map(|(at, _)| at).unwrap_or_default());
+                self.refresh(shared);
+            }
+            Err(e) => shared.update(|m| m.note(format!("The banner stays: {e}"))),
+        }
+    }
+}
+
 /// The host role, once wired.
 struct Hosted {
     serving: Arc<(HostConfig, HostDeps)>,
+    /// The banner of devices that can connect without asking (a host with its
+    /// unattended store).
+    banner: Option<Arc<BannerWatch>>,
     media: Arc<MediaHost>,
     live: Arc<LiveSessions>,
     audit: Arc<HostAudit>,
@@ -394,6 +503,8 @@ impl MediaObserver for GuiMedia {
 /// the control channel (bound before Tor, as `tornect host` does).
 async fn host_role(b: &Backend) -> Result<Hosted, String> {
     let lock = HostLock::acquire(&b.paths).map_err(|e| format!("{e:#}"))?;
+    // Its indicator is a window on top (the readiness row "indicator shown").
+    crate::host::this_is_the_window_host();
     let control = ControlChannel::default();
     // An administrator session's input goes through its administrator
     // helper (§B.8.7.5), started between the answer and the accept.
@@ -465,6 +576,23 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         started: started_tx,
     });
     let kill_watch = media.watch_kill(deps.kill.clone());
+    let banner = ctx.as_ref().ok().map(|c| {
+        Arc::new(BannerWatch {
+            guard: Arc::clone(&c.guard),
+            acknowledged: Mutex::new(None),
+        })
+    });
+    if let Some(watch) = &banner {
+        let (watch, shared) = (Arc::clone(watch), Arc::clone(&b.shared));
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(BANNER_EVERY);
+            loop {
+                every.tick().await;
+                let (watch, shared) = (Arc::clone(&watch), Arc::clone(&shared));
+                let _ = tokio::task::spawn_blocking(move || watch.refresh(&shared)).await;
+            }
+        });
+    }
     let ipc = crate::host::start_control_channel(&b.paths, ctx, deps.kill.clone(), control)
         .await
         .map_err(|e| format!("{e:#}"))?;
@@ -480,6 +608,7 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
     }
     Ok(Hosted {
         serving: Arc::new((cfg, deps)),
+        banner,
         media,
         live,
         audit,
@@ -778,6 +907,13 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                     Command::StopSharing => {
                         if let Some(hosted) = &hosted {
                             stop_sharing(&hosted.serving.1.kill, &b.shared);
+                        }
+                    }
+                    Command::AcknowledgeBanner => {
+                        if let Some(watch) = hosted.as_ref().and_then(|h| h.banner.clone()) {
+                            let shared = Arc::clone(&b.shared);
+                            // The re-authentication dialog blocks.
+                            tokio::task::spawn_blocking(move || watch.acknowledge(&shared));
                         }
                     }
                     Command::Grant => {

@@ -97,6 +97,9 @@ pub struct Model {
     pub setup: Option<Setup>,
     /// The host's consent and pairing popups, oldest first.
     pub popups: Vec<Popup>,
+    /// The banner of devices that can connect without asking (§B.8.6.2), until
+    /// its last change is acknowledged with re-authentication.
+    pub unattended_banner: Option<UnattendedBanner>,
     /// The unattended requests in their block window (§B.8.6.3), oldest first:
     /// each is shown in a window of its own on every monitor, with Block, until
     /// it ends.
@@ -336,6 +339,75 @@ pub enum PopupKind {
         /// device wants to connect as administrator.
         administrator: bool,
     },
+}
+
+/// The banner of §B.8.6.2: how many devices can connect without asking, and
+/// the last change that let them (a grant created, widened or enabled,
+/// unattended access turned on or resumed, a backup exported), shown until
+/// that change is acknowledged with re-authentication; a newer change shows
+/// it again. The acknowledgement is kept in memory only (no store field), so
+/// the banner shows again after a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnattendedBanner {
+    /// Devices that can connect without asking now.
+    pub devices: usize,
+    /// The last change: its time (RFC 3339, UTC) and who made it.
+    pub last_change: Option<(String, &'static str)>,
+}
+
+impl UnattendedBanner {
+    /// The banner of `devices` and `last_change`, unless no device can connect
+    /// without asking or that change was the one `acknowledged`.
+    #[must_use]
+    pub fn of(
+        devices: usize,
+        last_change: Option<(String, &'static str)>,
+        acknowledged: Option<&str>,
+    ) -> Option<Self> {
+        if devices == 0 {
+            return None;
+        }
+        match (&last_change, acknowledged) {
+            (Some((at, _)), Some(seen)) if at.as_str() <= seen => return None,
+            (None, Some(_)) => return None,
+            _ => {}
+        }
+        Some(Self {
+            devices,
+            last_change,
+        })
+    }
+
+    /// Its line: §B.8.6.2's sentence with the count, the day of the last change
+    /// and who made it filled in, `today` being today's day.
+    #[must_use]
+    pub fn line(&self, today: Option<Day>) -> String {
+        let devices = if self.devices == 1 {
+            "1 device can".to_owned()
+        } else {
+            format!("{} devices can", self.devices)
+        };
+        match &self.last_change {
+            Some((at, by)) => {
+                let when = day_of(at).map_or_else(
+                    || "at an unknown time".to_owned(),
+                    |day| super::pages::day_in_sentence(day, today),
+                );
+                format!("{devices} connect without asking — last change {when} by {by}")
+            }
+            None => format!("{devices} connect without asking"),
+        }
+    }
+}
+
+/// The day of an RFC 3339 time (`2026-10-02T…`).
+fn day_of(at: &str) -> Option<Day> {
+    let date = at.get(..10)?;
+    let mut parts = date.split('-');
+    let y = parts.next()?.parse().ok()?;
+    let m = parts.next()?.parse().ok()?;
+    let d = parts.next()?.parse().ok()?;
+    Day::from_ymd(y, m, d)
 }
 
 /// One unattended request in its block window (§B.8.6.3).
