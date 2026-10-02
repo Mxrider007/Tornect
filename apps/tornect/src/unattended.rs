@@ -600,11 +600,20 @@ pub enum UnattendedCmd {
         /// Waive the "prior attended session" precondition (warned and logged).
         #[arg(long)]
         waive_attended_check: bool,
+        /// Also give it administrator access (Windows: an installed copy, an
+        /// administrator account). Its password is generated and printed once,
+        /// to a terminal only.
+        #[arg(long)]
+        administrator: bool,
     },
     /// Change a grant's password.
     SetPassword {
         /// Device ID, fingerprint or pinned label.
         device: String,
+        /// Raise it to administrator access, with a new password that is
+        /// generated and printed once, to a terminal only.
+        #[arg(long)]
+        administrator: bool,
     },
     /// Re-enable a disabled grant.
     Enable {
@@ -1039,6 +1048,10 @@ fn require_ok(resp: &IpcResponse) -> anyhow::Result<()> {
              while someone may be watching."
         }
         codes::G_STORE_LOCKED => "\n  Another Tornect process holds the store lock.",
+        codes::G_NEEDS_PASSWORD => {
+            "\n  On the command line, `tornect unattended set-password <device> --administrator` \
+             gives a grant a new generated password, and administrator access with it."
+        }
         codes::G_KEYSTORE_LOCKED => "\n  The keystore could not be unlocked.",
         _ => "",
     };
@@ -1338,6 +1351,7 @@ pub async fn run_unattended(paths: &Paths, cmd: UnattendedCmd) -> anyhow::Result
             device,
             preset,
             waive_attended_check,
+            administrator,
         } => {
             if waive_attended_check {
                 // §B.8.7.4: the waiver is "warned and logged"; the guard logs it.
@@ -1347,6 +1361,16 @@ pub async fn run_unattended(paths: &Paths, cmd: UnattendedCmd) -> anyhow::Result
                 );
             }
             let device = resolve_device(paths, &route, &device).await?;
+            if administrator {
+                return administrator_form(
+                    paths,
+                    &route,
+                    device,
+                    Some((preset.into(), waive_attended_check)),
+                    &mut Terminal,
+                )
+                .await;
+            }
             register(
                 paths,
                 &route,
@@ -1356,8 +1380,14 @@ pub async fn run_unattended(paths: &Paths, cmd: UnattendedCmd) -> anyhow::Result
             )
             .await
         }
-        UnattendedCmd::SetPassword { device } => {
+        UnattendedCmd::SetPassword {
+            device,
+            administrator,
+        } => {
             let device = resolve_device(paths, &route, &device).await?;
+            if administrator {
+                return administrator_form(paths, &route, device, None, &mut Terminal).await;
+            }
             register(paths, &route, device, None, false).await
         }
         UnattendedCmd::Enable { device } => {
@@ -1470,8 +1500,8 @@ async fn register(
         IpcOp::RegStart {
             device,
             reg_request,
-            // The command line's administrator forms and its generator path come later
-            // (M-FEAT-5); until then it declares neither (decision M1-67).
+            // The plain forms raise nothing and send a chosen password, never as
+            // generated (decision M1-67): only `administrator_form` does either.
             raise: false,
             generated: false,
         },
@@ -1525,6 +1555,290 @@ async fn register(
             println!("Granted. That device can now connect without asking, using this password.")
         }
         None => println!("Password changed."),
+    }
+    Ok(())
+}
+
+/// What the administrator forms say when standard output is not a terminal
+/// (§B.8.7.4): refused before `RegStart`, so nothing is registered.
+pub(crate) const GENERATED_OFF_TERMINAL: &str = "A generated password is printed only to a \
+     terminal, and standard output is not one, so nothing was registered: run this in a terminal.";
+
+/// The line after a generated password (§B.8.7.4).
+pub(crate) const WRITE_IT_DOWN: &str =
+    "Write it down now: Tornect does not show it again and keeps no copy.";
+
+/// The ⑤a offer's question on the command line (§B.8.7.4): default yes.
+pub(crate) const OFFER_QUESTION: &str = "Give them new passwords now? [Y/n]";
+
+/// The terminal as the administrator forms use it: a seam the tests script.
+pub(crate) trait Console {
+    /// Whether standard output is a terminal: a generated password goes only
+    /// there.
+    fn stdout_is_terminal(&self) -> bool;
+    /// A line on standard output.
+    fn out(&mut self, line: &str);
+    /// A line on standard error.
+    fn err(&mut self, line: &str);
+    /// Show `question` on standard error and read one line: `None` at end of
+    /// input, on a read error, or when standard input is not a terminal.
+    fn ask(&mut self, question: &str) -> Option<String>;
+}
+
+/// This process's terminal (every platform: the console's line on Windows).
+pub(crate) struct Terminal;
+
+impl Console for Terminal {
+    fn stdout_is_terminal(&self) -> bool {
+        use std::io::IsTerminal as _;
+        std::io::stdout().is_terminal()
+    }
+
+    fn out(&mut self, line: &str) {
+        crate::host::say(format_args!("{line}"));
+    }
+
+    fn err(&mut self, line: &str) {
+        crate::host::note(format_args!("{line}"));
+    }
+
+    fn ask(&mut self, question: &str) -> Option<String> {
+        use std::io::{BufRead as _, IsTerminal as _, Write as _};
+        let stdin = std::io::stdin();
+        if !stdin.is_terminal() {
+            return None;
+        }
+        eprint!("{question} ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line),
+        }
+    }
+}
+
+/// The answer to a default-yes question (§B.8.7.4): Enter, `y` or `yes` is
+/// yes; any other answer, end of input, a read error or an input that is not
+/// a terminal (`None`) is no.
+pub(crate) fn default_yes(answer: Option<&str>) -> bool {
+    match answer.map(|a| a.trim().to_lowercase()) {
+        None => false,
+        Some(a) => a.is_empty() || a == "y" || a == "yes",
+    }
+}
+
+/// The host's status report.
+async fn status_report(
+    paths: &Paths,
+    route: &Route,
+) -> anyhow::Result<tornect_core::unattended::ipc::StatusReport> {
+    let resp = send(paths, route, IpcOp::Status).await?;
+    require_ok(&resp)?;
+    let payload = resp
+        .payload
+        .as_deref()
+        .context("Status returned no payload")?;
+    Ok(tornect_core::unattended::ipc::decode_payload(payload)?)
+}
+
+/// `device`'s pinned label: its grant's, else its pairing's, else its
+/// fingerprint.
+fn label_of(
+    paths: &Paths,
+    report: &tornect_core::unattended::ipc::StatusReport,
+    device: &DeviceId,
+) -> String {
+    if let Some(g) = report.grants.iter().find(|g| g.device == *device) {
+        return g.label.clone();
+    }
+    tornect_signal::pairing::TrustedDeviceStore::open(paths.trusted_devices_file())
+        .ok()
+        .and_then(|store| {
+            store
+                .snapshot()
+                .devices
+                .iter()
+                .find(|d| d.device == *device)
+                .map(|d| d.label.clone())
+        })
+        .unwrap_or_else(|| device.fingerprint())
+}
+
+/// One registration with a generated password (§B.8.7.4, decision M1-67):
+/// `RegStart` declares `generated` and `raise`, the host asks for its
+/// re-authentication (with the raising wording for a raise), and `RegFinish`
+/// carries `generated` with `options`. The password, as the generator spells
+/// it, for the caller to print once.
+async fn generated_registration(
+    paths: &Paths,
+    route: &Route,
+    device: DeviceId,
+    preset: Option<Preset>,
+    options: GrantOptions,
+    raise: bool,
+) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    let shown = tornect_core::unattended::password::generate_passphrase()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // What is registered is what a login normalises the typed words to
+    // (§B.8.7.2): the list's hyphens read as spaces on both sides.
+    let password = tornect_core::unattended::password::normalize(&shown);
+    let (client, reg_request) = tornect_signal::auth::PasswordRegistration::start(&password)
+        .map_err(|e| anyhow::anyhow!("starting the registration: {e}"))?;
+    let resp = send(
+        paths,
+        route,
+        IpcOp::RegStart {
+            device,
+            reg_request,
+            raise,
+            generated: true,
+        },
+    )
+    .await?;
+    require_ok(&resp)?;
+    let payload = resp
+        .payload
+        .as_deref()
+        .context("RegStart returned no payload")?;
+    let started: anyhow::Result<RegStartPayload> =
+        tornect_core::unattended::ipc::decode_payload(payload).map_err(Into::into);
+    let mut resp = resp;
+    if let Some(p) = resp.payload.as_mut() {
+        zeroize::Zeroize::zeroize(p);
+    }
+    let started = started?;
+    let host_pk = host_onion_pk(paths)?;
+    let ids = tornect_signal::auth::identifiers(device.public_key_bytes(), &host_pk);
+    let upload = client
+        .finish(&password, &started.reg_response, ids)
+        .map_err(|e| anyhow::anyhow!("finishing the registration: {e}"))?;
+    drop(password);
+    let resp = send(
+        paths,
+        route,
+        IpcOp::RegFinish {
+            device,
+            reg_txn: started.reg_txn,
+            upload,
+            preset: preset.unwrap_or(Preset::MyMachines).wire(),
+            options,
+            generated: true,
+        },
+    )
+    .await?;
+    require_ok(&resp)?;
+    Ok(shown)
+}
+
+/// The command line's administrator forms (§B.8.7.4, decision M1-67):
+/// `grant <device> --administrator` (`create`: the preset and the waiver)
+/// creates an admin grant and `set-password <device> --administrator` raises
+/// one, each a single guard operation with a generated password, printed once
+/// and only to a terminal; then the ⑤a offer to the other Control grants.
+///
+/// The command line cannot see a grant's level, its mark or clause (ii)
+/// (`StatusReport` has none of them; the operator's ruling (b) of
+/// 2026-10-02): the offer follows these two forms only, lists every other
+/// Control grant without a mark label, and nothing on the command line
+/// detects the other changes that make control reach the level (an
+/// `enable`, the helper task).
+async fn administrator_form(
+    paths: &Paths,
+    route: &Route,
+    device: DeviceId,
+    create: Option<(Preset, bool)>,
+    io: &mut dyn Console,
+) -> anyhow::Result<()> {
+    // Refused before `RegStart`, so nothing is registered (§B.8.7.4).
+    if !io.stdout_is_terminal() {
+        anyhow::bail!("{GENERATED_OFF_TERMINAL}");
+    }
+    let report = status_report(paths, route).await?;
+    let label = label_of(paths, &report, &device);
+    if create.is_some() {
+        // ⑤a's warning first (§B.8.7.1; the operator's ruling of 2026-10-02:
+        // until the wizard's step exists, this is the only way to create one).
+        io.err(&tornect_core::levels::ADMINISTRATOR_WARNING.replace("<device>", &label));
+    }
+    // The other Control grants, as they were before this change.
+    let control = tornect_core::session_log::SessionMode::Control.wire();
+    let others: Vec<(DeviceId, String)> = report
+        .grants
+        .iter()
+        .filter(|g| g.device != device && g.mode == control)
+        .map(|g| (g.device, g.label.clone()))
+        .collect();
+    let options = GrantOptions {
+        elevation: Some(tornect_core::levels::Elevation::Admin),
+        waive_attended_precondition: create.is_some_and(|(_, waive)| waive),
+        ..GrantOptions::default()
+    };
+    let shown = generated_registration(
+        paths,
+        route,
+        device,
+        create.map(|(preset, _)| preset),
+        options,
+        true,
+    )
+    .await?;
+    io.out(&format!("New password for \"{label}\": {}", shown.as_str()));
+    io.out(WRITE_IT_DOWN);
+    drop(shown);
+    offer_new_passwords(paths, route, others, io).await
+}
+
+/// The ⑤a offer (§B.8.7.1, §B.8.7.4): the other Control grants by their pinned
+/// labels under ⑤a's heading, then the default-yes question, then one
+/// *Change password* each, with a generated password printed once. A
+/// registration that does not finish (its re-authentication cancelled, say)
+/// keeps that device's old password: the list is shown again with the devices
+/// that still have it, and asked again.
+async fn offer_new_passwords(
+    paths: &Paths,
+    route: &Route,
+    mut remaining: Vec<(DeviceId, String)>,
+    io: &mut dyn Console,
+) -> anyhow::Result<()> {
+    let mut first = true;
+    while !remaining.is_empty() {
+        let labels = remaining
+            .iter()
+            .map(|(_, label)| format!("\"{label}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if first {
+            io.err(&format!(
+                "These devices have control of this computer: {labels}. From now on their \
+                 control can reach programs that run as administrator here."
+            ));
+        } else {
+            io.err(&format!(
+                "These devices still have their old password: {labels}."
+            ));
+        }
+        first = false;
+        if !default_yes(io.ask(OFFER_QUESTION).as_deref()) {
+            io.err("Their passwords were not changed.");
+            return Ok(());
+        }
+        let mut left = Vec::new();
+        for (device, label) in remaining {
+            match generated_registration(paths, route, device, None, GrantOptions::default(), false)
+                .await
+            {
+                Ok(shown) => {
+                    io.out(&format!("New password for \"{label}\": {}", shown.as_str()));
+                    io.out(WRITE_IT_DOWN);
+                }
+                Err(e) => {
+                    io.err(&format!("\"{label}\" keeps its old password: {e:#}"));
+                    left.push((device, label));
+                }
+            }
+        }
+        remaining = left;
     }
     Ok(())
 }
@@ -3060,5 +3374,391 @@ mod tests {
         if let Ok(default) = Paths::platform() {
             assert_eq!(launch_spec(&default).unwrap().home, None);
         }
+    }
+
+    // ------------------------------------------- the administrator forms (M1-67)
+
+    /// The terminal of a test: answers scripted, every line kept.
+    struct Script {
+        terminal: bool,
+        answers: std::collections::VecDeque<Option<String>>,
+        out: Vec<String>,
+        err: Vec<String>,
+        asked: Vec<String>,
+    }
+
+    impl Script {
+        fn new(terminal: bool, answers: &[Option<&str>]) -> Self {
+            Self {
+                terminal,
+                answers: answers.iter().map(|a| a.map(str::to_owned)).collect(),
+                out: Vec::new(),
+                err: Vec::new(),
+                asked: Vec::new(),
+            }
+        }
+    }
+
+    impl Console for Script {
+        fn stdout_is_terminal(&self) -> bool {
+            self.terminal
+        }
+        fn out(&mut self, line: &str) {
+            self.out.push(line.to_owned());
+        }
+        fn err(&mut self, line: &str) {
+            self.err.push(line.to_owned());
+        }
+        fn ask(&mut self, question: &str) -> Option<String> {
+            self.asked.push(question.to_owned());
+            self.answers.pop_front().flatten()
+        }
+    }
+
+    /// Re-authentication that records every dialog and refuses the `refuse`-th
+    /// plain `reg_start` (1-based): a prompt the person cancelled.
+    struct CancelOne {
+        calls: std::sync::Mutex<Vec<String>>,
+        refuse: usize,
+    }
+
+    impl tornect_core::unattended::guard::ReAuth for CancelOne {
+        fn reauthenticate(
+            &self,
+            op: &str,
+        ) -> Result<(), tornect_core::unattended::guard::ReAuthError> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(op.to_owned());
+            let plain = calls.iter().filter(|c| c.as_str() == "reg_start").count();
+            if op == "reg_start" && plain == self.refuse {
+                return Err(tornect_core::unattended::guard::ReAuthError::Denied);
+            }
+            Ok(())
+        }
+    }
+
+    /// An installed copy on a Windows administrator account, UAC at its
+    /// defaults: the administrator level exists there.
+    fn windows_admin() -> tornect_core::levels::AccountFacts {
+        tornect_core::levels::AccountFacts::Windows(tornect_core::levels::WindowsFacts {
+            installed: true,
+            enable_lua: Some(1),
+            filter_administrator_token: Some(0),
+            consent_prompt_behavior_user: Some(3),
+            consent_prompt_behavior_admin: Some(5),
+            prompt_on_secure_desktop: Some(1),
+            administrator: true,
+            ..Default::default()
+        })
+    }
+
+    /// The command line's offline route over a store of its own, on `facts`,
+    /// asking `reauth`; unattended access on.
+    fn admin_route(
+        tmp: &tempfile::TempDir,
+        facts: tornect_core::levels::AccountFacts,
+        reauth: Arc<dyn tornect_core::unattended::guard::ReAuth>,
+    ) -> (Paths, Route) {
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let secrets = Arc::new(FileSecretStore::open(paths.keys_dir()).unwrap());
+        let log = SessionLog::new(paths.sessions_log());
+        let store = GrantStore::open(
+            &paths,
+            Arc::clone(&secrets) as Arc<dyn tornect_core::SecretStore>,
+            Arc::new(SystemClock::default()),
+            log.clone(),
+        )
+        .unwrap();
+        let guard = MutationGuard::new(
+            store,
+            reauth,
+            Arc::new(NoSessionActivity),
+            Arc::new(tornect_core::levels::FixedFacts::new(
+                facts,
+                tornect_core::levels::HelperPresence::Absent,
+            )),
+        )
+        .with_paired_devices(Arc::new(AllowAllPaired))
+        .with_server_setup_source(Arc::new(
+            tornect_signal::unattended::OpaqueServerSetupSource,
+        ));
+        let ctx = HostContext {
+            guard: Arc::new(guard),
+            host_onion_pk: HOST_PK,
+            readiness: SharedReadiness::default(),
+            autostart: Arc::new(FakeAutostart::default()),
+            user_inputs: vec!["tornect".to_owned()],
+            kill: None,
+            log,
+        };
+        assert!(go(&ctx, IpcOp::On).ok);
+        (paths, Route::Offline(Box::new(ctx)))
+    }
+
+    fn guard_of(route: &Route) -> &MutationGuard {
+        let Route::Offline(ctx) = route else {
+            panic!("an offline route")
+        };
+        &ctx.guard
+    }
+
+    fn device(seed: u8) -> DeviceId {
+        DeviceId::from_bytes(
+            *ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
+    }
+
+    /// A plain Control grant with a chosen password, as `grant` makes one.
+    fn plain_grant(route: &Route, device: &DeviceId) {
+        guard_of(route)
+            .create_grant(
+                Actor::Cli,
+                device,
+                Preset::HeadlessBox,
+                &GrantOptions::default(),
+                &[0u8; 192],
+                false,
+            )
+            .unwrap();
+    }
+
+    /// §B.8.7.4: off a terminal, a generated password is refused before
+    /// `RegStart`, so nothing is registered: no dialog asked, no grant made,
+    /// nothing printed. Shown failing first (without the check, the raise's
+    /// dialog was asked and the grant made).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_generated_password_is_refused_off_a_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let (paths, route) = admin_route(&tmp, windows_admin(), reauth.clone());
+        let asked_before = reauth.calls().len();
+        let target = device(41);
+        let mut io = Script::new(false, &[]);
+        let err = administrator_form(
+            &paths,
+            &route,
+            target,
+            Some((Preset::HeadlessBox, false)),
+            &mut io,
+        )
+        .await
+        .expect_err("refused off a terminal");
+        assert_eq!(err.to_string(), GENERATED_OFF_TERMINAL);
+        assert_eq!(reauth.calls().len(), asked_before, "no dialog: no RegStart");
+        assert!(guard_of(&route).store().grant(&target).is_none());
+        assert!(io.out.is_empty(), "{:?}", io.out);
+    }
+
+    /// §B.8.7.4: the default-yes question. Enter, `y` and `yes` are yes; `n`,
+    /// any other answer, end of input, a read error and an input that is not a
+    /// terminal (all `None`) are no.
+    #[test]
+    fn the_offer_defaults_to_yes_and_reads_no_from_end_of_input() {
+        for yes in ["\n", "", "y\n", "Y", "yes\r\n", " YES "] {
+            assert!(default_yes(Some(yes)), "{yes:?}");
+        }
+        for no in ["n\n", "no", "maybe", "q"] {
+            assert!(!default_yes(Some(no)), "{no:?}");
+        }
+        assert!(
+            !default_yes(None),
+            "end of input, a read error, not a terminal"
+        );
+        assert_eq!(OFFER_QUESTION, "Give them new passwords now? [Y/n]");
+    }
+
+    /// A22, the command line (§B.8.7.4, D4, D5): `grant --administrator` on a
+    /// Windows host prints ⑤a's warning first, creates the admin grant with a
+    /// generated password printed once with the line after it, then lists the
+    /// other Control grants under ⑤a's heading (no mark label) and asks; yes
+    /// gives each a new generated password (each unmarked after it); a view-only
+    /// grant is not listed. Then a second rise (`set-password --administrator`
+    /// of another grant) offers again; no gives the line that nothing changed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a22_cli_grant_administrator_lists_the_other_control_grants_and_offers_new_passwords() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let (paths, route) = admin_route(&tmp, windows_admin(), reauth.clone());
+        let (a, b, viewer) = (device(42), device(43), device(44));
+        plain_grant(&route, &a);
+        plain_grant(&route, &b);
+        guard_of(&route)
+            .create_grant(
+                Actor::Cli,
+                &viewer,
+                Preset::HeadlessBox,
+                &GrantOptions {
+                    mode: Some(tornect_core::session_log::SessionMode::ViewOnly),
+                    ..GrantOptions::default()
+                },
+                &[0u8; 192],
+                false,
+            )
+            .unwrap();
+        let target = device(45);
+        let mut io = Script::new(true, &[Some("\n")]);
+        administrator_form(
+            &paths,
+            &route,
+            target,
+            Some((Preset::HeadlessBox, false)),
+            &mut io,
+        )
+        .await
+        .unwrap();
+        let store = guard_of(&route).store();
+        let made = store.grant(&target).unwrap();
+        assert!(made.holds_level() && !made.marked(), "{made:?}");
+        assert!(
+            io.err[0].starts_with("An unattended administrator session can change anything")
+                && io.err[0].contains(&target.fingerprint()),
+            "the warning first, naming the device: {:?}",
+            io.err
+        );
+        let heading = &io.err[1];
+        assert!(heading.starts_with("These devices have control of this computer: "));
+        assert!(heading.contains(&a.fingerprint()) && heading.contains(&b.fingerprint()));
+        assert!(
+            !heading.contains(&viewer.fingerprint()),
+            "view only: not listed"
+        );
+        assert!(
+            !heading.contains("view only until"),
+            "no mark label: {heading}"
+        );
+        assert_eq!(io.asked, vec![OFFER_QUESTION.to_owned()]);
+        assert_eq!(
+            io.out.len(),
+            6,
+            "three passwords, each with its line: {:?}",
+            io.out
+        );
+        for pair in io.out.chunks(2) {
+            assert!(pair[0].starts_with("New password for \""));
+            let words = pair[0].rsplit(": ").next().unwrap();
+            assert_eq!(words.split(' ').count(), 5, "{words}");
+            assert_eq!(pair[1], WRITE_IT_DOWN);
+        }
+        for other in [&a, &b] {
+            assert!(
+                !store.grant(other).unwrap().marked(),
+                "a generated password unmarks"
+            );
+        }
+        assert!(store.grant(&viewer).unwrap().marked(), "not changed");
+
+        // While a grant holds the level, a plain Control grant cannot be created
+        // with a chosen password (D3): the plain form leaves nothing behind.
+        let refused = guard_of(&route).create_grant(
+            Actor::Cli,
+            &device(46),
+            Preset::HeadlessBox,
+            &GrantOptions::default(),
+            &[0u8; 192],
+            false,
+        );
+        assert!(refused.is_err(), "{refused:?}");
+
+        // A second rise (`set-password --administrator` of another grant) offers
+        // again; no leaves the others' passwords as they are.
+        let mut io = Script::new(true, &[Some("n\n")]);
+        administrator_form(&paths, &route, a, None, &mut io)
+            .await
+            .unwrap();
+        assert!(store.grant(&a).unwrap().holds_level());
+        assert!(
+            !io.err
+                .iter()
+                .any(|l| l.starts_with("An unattended administrator")),
+            "no warning for set-password --administrator (not ruled)"
+        );
+        assert!(
+            io.err[0].contains(&b.fingerprint()) && io.err[0].contains(&target.fingerprint()),
+            "{:?}",
+            io.err
+        );
+        assert_eq!(io.err.last().unwrap(), "Their passwords were not changed.");
+        assert_eq!(
+            io.out.len(),
+            2,
+            "only the raised grant's password: {:?}",
+            io.out
+        );
+    }
+
+    /// §B.8.7.1 ⑤a: a *Change password* whose prompt is cancelled keeps that
+    /// device's old password; the list is shown again with the devices that
+    /// still have it, and asked again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_prompt_shows_the_list_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(CancelOne {
+            calls: std::sync::Mutex::new(Vec::new()),
+            refuse: 2,
+        });
+        let (paths, route) = admin_route(&tmp, windows_admin(), reauth);
+        let (a, b) = (device(47), device(48));
+        plain_grant(&route, &a);
+        plain_grant(&route, &b);
+        let mut io = Script::new(true, &[Some("\n"), Some("y\n")]);
+        administrator_form(
+            &paths,
+            &route,
+            device(49),
+            Some((Preset::HeadlessBox, false)),
+            &mut io,
+        )
+        .await
+        .unwrap();
+        let store = guard_of(&route).store();
+        assert_eq!(io.asked.len(), 2, "asked again: {:?}", io.err);
+        let again = io
+            .err
+            .iter()
+            .find(|l| l.starts_with("These devices still have their old password: "))
+            .expect("the list again");
+        assert!(
+            again.contains(&a.fingerprint()) != again.contains(&b.fingerprint()),
+            "only the device whose prompt was cancelled: {again}"
+        );
+        assert!(io.err.iter().any(|l| l.contains("keeps its old password")));
+        assert!(!store.grant(&a).unwrap().marked() && !store.grant(&b).unwrap().marked());
+        assert_eq!(io.out.len(), 6, "{:?}", io.out);
+    }
+
+    /// §B.8.7.4 on Linux: the administrator forms are refused with the plan's
+    /// sentence, before any dialog, and nothing is printed or registered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a22_cli_on_linux_the_administrator_forms_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let (paths, route) = admin_route(
+            &tmp,
+            tornect_core::levels::AccountFacts::Linux,
+            reauth.clone(),
+        );
+        let asked_before = reauth.calls().len();
+        let target = device(50);
+        let mut io = Script::new(true, &[]);
+        let err = administrator_form(
+            &paths,
+            &route,
+            target,
+            Some((Preset::HeadlessBox, false)),
+            &mut io,
+        )
+        .await
+        .expect_err("refused on Linux");
+        assert!(
+            err.to_string()
+                .starts_with("Administrator access does not exist on Linux: Tornect runs as you."),
+            "{err}"
+        );
+        assert_eq!(reauth.calls().len(), asked_before, "no dialog");
+        assert!(io.out.is_empty());
+        assert!(guard_of(&route).store().grant(&target).is_none());
     }
 }
