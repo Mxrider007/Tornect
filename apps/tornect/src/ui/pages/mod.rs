@@ -20,7 +20,8 @@ use super::nav::Page;
 use super::theme::{self, Face};
 use super::view::{Action, Form};
 
-/// Draw `page`.
+/// Draw `page`, under the banner of devices that can connect without asking
+/// while it is up (§B.8.6.2).
 pub fn draw(
     ui: &mut Ui,
     page: Page,
@@ -29,6 +30,9 @@ pub fn draw(
     now: Instant,
     actions: &mut Vec<Action>,
 ) {
+    if let Some(banner) = &model.unattended_banner {
+        unattended_banner(ui, banner, actions);
+    }
     match page {
         Page::Home => home::home(ui, model, form, now, actions),
         Page::AddressBook => address_book::page(ui, model, form, model.screen_shared(now), actions),
@@ -46,6 +50,41 @@ pub fn draw(
         ),
         Page::Widgets => gallery::gallery(ui),
     }
+}
+
+/// The banner of §B.8.6.2, with its one control: acknowledging it asks for
+/// re-authentication on the host.
+fn unattended_banner(
+    ui: &mut Ui,
+    banner: &super::model::UnattendedBanner,
+    actions: &mut Vec<Action>,
+) {
+    let t = theme::tokens(ui.ctx());
+    super::widgets::card(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.add(
+            egui::Label::new(
+                RichText::new(banner.line(Some(Day::today())))
+                    .font(theme::font(ui.ctx(), Face::Semibold, 14.0))
+                    .color(t.text_primary),
+            )
+            .wrap(),
+        );
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "It stays until you acknowledge it, which asks for this computer's password.",
+                )
+                .font(theme::font(ui.ctx(), Face::Regular, 13.0))
+                .color(t.text_secondary),
+            )
+            .wrap(),
+        );
+        if ui.button("Acknowledge…").clicked() {
+            actions.push(Action::AcknowledgeBanner);
+        }
+    });
+    ui.add_space(12.0);
 }
 
 /// A day as the lists say it: "Today", "Yesterday", "3 days ago" within a
@@ -1994,6 +2033,62 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// §B.8.6.2, TM-28: the banner counts the devices that can connect without
+    /// asking and names the last change and who made it, above every page,
+    /// until that change is acknowledged (a newer change shows it again); its
+    /// one control asks for the acknowledgement; with nobody able to connect
+    /// without asking there is none.
+    #[test]
+    fn the_banner_counts_grants_until_acknowledged() {
+        use super::super::model::UnattendedBanner;
+        let today = Day::today();
+        let (y, m, d) = today.ymd();
+        let at = format!("{y:04}-{m:02}-{d:02}T09:30:00Z");
+        let banner = UnattendedBanner::of(2, Some((at.clone(), "cli")), None).expect("shown");
+        assert_eq!(
+            banner.line(Some(today)),
+            "2 devices can connect without asking — last change today by cli"
+        );
+        assert_eq!(
+            UnattendedBanner::of(1, None, None)
+                .unwrap()
+                .line(Some(today)),
+            "1 device can connect without asking"
+        );
+        assert_eq!(
+            UnattendedBanner::of(0, Some((at.clone(), "ui")), None),
+            None
+        );
+        assert_eq!(
+            UnattendedBanner::of(2, Some((at.clone(), "cli")), Some(&at)),
+            None
+        );
+        let later = format!("{y:04}-{m:02}-{d:02}T10:00:00Z");
+        assert!(UnattendedBanner::of(3, Some((later, "import")), Some(&at)).is_some());
+
+        for page in PAGES {
+            let mut model = at_rest();
+            model.unattended_banner = Some(banner.clone());
+            let mut window = Window::new(model, page, egui::Theme::Dark, WIDE);
+            assert!(
+                window.nodes.iter().any(|n| n.value()
+                    == Some("2 devices can connect without asking — last change today by cli")),
+                "{page:?}: no banner"
+            );
+            let ack = window.center("Acknowledge…");
+            assert_eq!(
+                window.click(ack),
+                vec![Action::AcknowledgeBanner],
+                "{page:?}"
+            );
+            let none = Window::new(at_rest(), page, egui::Theme::Dark, WIDE);
+            assert!(
+                !none.nodes.iter().any(|n| n.label() == Some("Acknowledge…")),
+                "{page:?}"
+            );
         }
     }
 }

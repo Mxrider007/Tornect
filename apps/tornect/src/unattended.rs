@@ -29,7 +29,7 @@ use tornect_core::unattended::ipc::{
     GrantOptions, IpcOp, IpcRequest, IpcResponse, LogPage, MasterOnPayload, PolicyInputsPayload,
     RegStartPayload, codes, encode_payload,
 };
-use tornect_core::unattended::readiness::ReadinessSnapshot;
+use tornect_core::unattended::readiness::{ReadinessSnapshot, SharedReadiness};
 use tornect_core::unattended::store::{GrantStore, LoadMode};
 use tornect_core::{Config, Paths};
 use tornect_platform::autostart::{self, Autostart, AutostartState, LaunchSpec};
@@ -42,9 +42,10 @@ pub struct HostContext {
     pub guard: Arc<MutationGuard>,
     /// This host's onion identity key, for `master_on`'s stop token.
     pub host_onion_pk: [u8; 32],
-    /// The readiness rows no platform probe fills yet: all `Unknown` (§B.8.14).
-    /// [`HostContext::readiness_now`] adds the rows that are probed.
-    pub readiness: ReadinessSnapshot,
+    /// The readiness rows as last probed by the host (at its start and every
+    /// 10 min; all `Unknown` on the offline route), shared with the gate.
+    /// [`HostContext::readiness_now`] adds the rows read at each request.
+    pub readiness: SharedReadiness,
     /// Start at login (§B.8.7.5): `tornect service install|uninstall|status`
     /// and the readiness row `autostart`.
     pub autostart: Arc<dyn Autostart>,
@@ -62,7 +63,7 @@ impl HostContext {
     /// removal made outside Tornect shows at once).
     #[must_use]
     pub fn readiness_now(&self) -> ReadinessSnapshot {
-        let mut snap = self.readiness.clone();
+        let mut snap = self.readiness.get();
         snap.autostart = autostart::readiness_probe(&self.autostart.status());
         snap.panic_key = panic_key_probe(tornect_platform::hotkey::state());
         snap
@@ -857,7 +858,7 @@ fn context(
     Ok(HostContext {
         guard: Arc::new(guard),
         host_onion_pk: *host.id().public_key_bytes(),
-        readiness: ReadinessSnapshot::unknown(),
+        readiness: SharedReadiness::default(),
         autostart: autostart_backend(paths),
         user_inputs,
         kill,
@@ -1652,19 +1653,23 @@ fn print_status(
 }
 
 fn print_readiness(snap: &ReadinessSnapshot) {
-    use tornect_core::unattended::readiness::Probe;
+    use tornect_core::unattended::readiness::{Probe, row_title};
     println!(
-        "Readiness (`autostart` is probed; the other rows read Unknown until their platform \
-         probes land at M6)"
+        "Readiness (a row this computer cannot read yet is unknown: it never refuses a session, \
+         and it raises the badge)"
     );
     for (name, probe) in snap.fields() {
-        let text = match probe {
-            Probe::Ok => "ok".to_owned(),
-            Probe::Warn(m) => format!("warn: {m}"),
-            Probe::Fail(m) => format!("FAIL: {m}"),
-            Probe::Unknown => "unknown".to_owned(),
+        let title = row_title(name);
+        let line = match (name, probe) {
+            // §B.8.7.4: "Panic key: bound / unavailable".
+            ("panic_key", Probe::Ok) => format!("{title}: bound"),
+            ("panic_key", Probe::Fail(_) | Probe::Unknown) => format!("{title}: unavailable"),
+            (_, Probe::Ok) => format!("{title}: ok"),
+            (_, Probe::Warn(m)) => format!("{title}: warning: {m}"),
+            (_, Probe::Fail(m)) => format!("{title}: FAIL: {m}"),
+            (_, Probe::Unknown) => format!("{title}: unknown"),
         };
-        println!("  {name:<18} {text}");
+        println!("  {line}");
     }
     if snap.badge() {
         println!();
@@ -2032,7 +2037,7 @@ mod tests {
             ctx: HostContext {
                 guard: Arc::new(guard),
                 host_onion_pk: HOST_PK,
-                readiness: ReadinessSnapshot::unknown(),
+                readiness: SharedReadiness::default(),
                 autostart: Arc::clone(&autostart) as Arc<dyn Autostart>,
                 user_inputs: vec!["tornect".to_owned()],
                 kill: None,
@@ -2502,7 +2507,7 @@ mod tests {
         let ctx = HostContext {
             guard: Arc::new(deny),
             host_onion_pk: HOST_PK,
-            readiness: ReadinessSnapshot::unknown(),
+            readiness: SharedReadiness::default(),
             autostart: Arc::new(autostart::NoAutostart("test".to_owned())),
             user_inputs: Vec::new(),
             kill: None,

@@ -760,6 +760,7 @@ impl App {
                 tracing::debug!(id, "Block pressed in a block window");
                 self.popups.answer_block(id);
             }
+            Action::AcknowledgeBanner => self.command(Command::AcknowledgeBanner),
             Action::Confirm {
                 id,
                 matched,

@@ -179,13 +179,17 @@ pub async fn start_control_channel(
     control: ControlChannel,
 ) -> anyhow::Result<Option<JoinHandle<()>>> {
     // The panic key, the other kill path that never runs on the UI thread
-    // (D10); never in this crate's tests, which must not reach the desktop.
+    // (D10), and the readiness probes every 10 min; never in this crate's
+    // tests, which must not reach the desktop.
     if !cfg!(test) {
         start_panic_key(
             paths,
             kill.clone(),
             ctx.as_ref().ok().map(|c| Arc::clone(&c.guard)),
         );
+        if let Ok(c) = &ctx {
+            reprobe_readiness(paths, Arc::clone(&c.guard), c.readiness.clone());
+        }
     }
     let endpoint = match Endpoint::bind(&paths.state_dir).await {
         Ok(endpoint) => endpoint,
@@ -356,6 +360,58 @@ fn start_panic_key(
     });
 }
 
+/// Whether this process is the window host, whose indicator is a window on
+/// top (the readiness row "indicator shown"); the terminal host's is its
+/// terminal's lines.
+static WINDOW_HOST: AtomicBool = AtomicBool::new(false);
+
+/// This process is the window host (set before its host is wired).
+pub fn this_is_the_window_host() {
+    WINDOW_HOST.store(true, Ordering::SeqCst);
+}
+
+/// The readiness rows this computer can read now, for the host whose guard is
+/// `guard` (§B.8.7.1 ⑥; the others stay `Unknown`).
+fn probe_readiness(
+    paths: &Paths,
+    guard: &tornect_core::unattended::guard::MutationGuard,
+) -> tornect_core::unattended::readiness::ReadinessSnapshot {
+    use tornect_core::keystore::KeystoreKind;
+    use tornect_core::unattended::grant::UnattendedGrant;
+    let store = guard.store();
+    let admin_grant = store
+        .read(|s| s.grants.iter().any(UnattendedGrant::holds_level))
+        .unwrap_or(false);
+    let facts = tornect_platform::readiness::facts_now(
+        &paths.state_dir,
+        &paths.portal_restore_token(),
+        store.keystore_kind() == KeystoreKind::File,
+        WINDOW_HOST.load(Ordering::SeqCst),
+        admin_grant,
+    );
+    tornect_platform::readiness::rows(&facts)
+}
+
+/// Probe the readiness rows again every 10 min into `feed` (§B.8.7.1 ⑥: a
+/// screen-sharing grant lost, the panic key's portal gone).
+fn reprobe_readiness(
+    paths: &Paths,
+    guard: Arc<tornect_core::unattended::guard::MutationGuard>,
+    feed: tornect_core::unattended::readiness::SharedReadiness,
+) {
+    let paths = paths.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tornect_core::unattended::readiness::REPROBE_EVERY).await;
+            let (paths, guard) = (paths.clone(), Arc::clone(&guard));
+            match tokio::task::spawn_blocking(move || probe_readiness(&paths, &guard)).await {
+                Ok(snapshot) => feed.set(snapshot),
+                Err(e) => tracing::warn!(error = %e, "the readiness probe failed"),
+            }
+        }
+    });
+}
+
 /// Everything `tornect host` serves its signaling streams with.
 pub struct HostWiring {
     /// Static facts sent in the handshake.
@@ -454,6 +510,7 @@ pub fn wire(
     host_cfg.levels = levels;
 
     if let Ok(ctx) = &ctx {
+        ctx.readiness.set(probe_readiness(paths, &ctx.guard));
         deps.stop_token = Arc::new(EmergencyStop::new(Arc::clone(&ctx.guard), kill));
         // M1 has no local-zone source (decision M1-15; a tzdb-backed zone is
         // M6). The zone only matters for grant schedules, and no path in this
@@ -470,6 +527,8 @@ pub fn wire(
                 // Read at each answer (decision M1-67).
                 Arc::new(tornect_platform::levels::LiveFacts),
             )
+            // Readiness as probed at the start and every 10 min (§B.8.7.1 ⑥).
+            .with_readiness_feed(ctx.readiness.clone())
             .with_admin_authority(Arc::new(GuardAdmin::new(Arc::clone(&ctx.guard))))
             // Block suspends the grant (§B.8.6.3). Only the window host has a
             // block window with Block: the terminal host keeps the headless

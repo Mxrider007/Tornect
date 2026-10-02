@@ -146,6 +146,9 @@ pub enum Action {
         /// The request.
         id: u64,
     },
+    /// Acknowledge the banner of devices that can connect without asking
+    /// (§B.8.6.2): the host's re-authentication comes next.
+    AcknowledgeBanner,
     /// The client user's answer to the code question.
     Confirm {
         /// The question.

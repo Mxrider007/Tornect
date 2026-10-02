@@ -4,8 +4,15 @@
 //! by field **name** whose decoder ignores unknown keys, so M6 may add probes without an
 //! IPC schema bump.
 
+use std::sync::{Arc, PoisonError, RwLock};
+use std::time::Duration;
+
 use minicbor::decode::Decoder;
 use minicbor::encode::{Encoder, Write};
+
+/// How often a host probes its readiness again, after the probe at its start
+/// (§B.8.7.1 ⑥: macOS's periodic re-consent, Wayland's grant lost).
+pub const REPROBE_EVERY: Duration = Duration::from_secs(10 * 60);
 
 /// One readiness row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -114,10 +121,13 @@ pub struct ReadinessSnapshot {
     pub panic_key: Probe,
     /// Indicator + tray row.
     pub consent_indicator: Probe,
+    /// The administrator helper registered (r7, Windows, while an admin grant
+    /// exists).
+    pub admin_helper: Probe,
 }
 
 /// Field names in wire order (also the CBOR map keys).
-pub const FIELD_NAMES: [&str; 12] = [
+pub const FIELD_NAMES: [&str; 13] = [
     "capture",
     "input",
     "autostart",
@@ -130,7 +140,30 @@ pub const FIELD_NAMES: [&str; 12] = [
     "tor_self_connect",
     "panic_key",
     "consent_indicator",
+    "admin_helper",
 ];
+
+/// What each row is called where people read it (§B.8.7.1 ⑥, §B.8.7.4), by
+/// field name.
+#[must_use]
+pub fn row_title(field: &str) -> &'static str {
+    match field {
+        "capture" => "Screen capture permission",
+        "input" => "Input permission",
+        "autostart" => "Start at sign-in",
+        "auto_login" => "Automatic sign-in",
+        "keystore" => "Keystore persistent and unlockable at start",
+        "os_password" => "Account password not empty",
+        "idle_lock" => "Idle lock",
+        "lock_state" => "Lock state",
+        "console_owner" => "Console owner",
+        "tor_self_connect" => "Tor self-connect",
+        "panic_key" => "Panic key",
+        "consent_indicator" => "Indicator shown",
+        "admin_helper" => "Administrator helper registered",
+        _ => "Unknown row",
+    }
+}
 
 impl ReadinessSnapshot {
     /// The M1 stub: every row `Unknown` (never blocks, badge only).
@@ -141,7 +174,7 @@ impl ReadinessSnapshot {
 
     /// The rows in wire order.
     #[must_use]
-    pub fn fields(&self) -> [(&'static str, &Probe); 12] {
+    pub fn fields(&self) -> [(&'static str, &Probe); 13] {
         [
             ("capture", &self.capture),
             ("input", &self.input),
@@ -155,6 +188,7 @@ impl ReadinessSnapshot {
             ("tor_self_connect", &self.tor_self_connect),
             ("panic_key", &self.panic_key),
             ("consent_indicator", &self.consent_indicator),
+            ("admin_helper", &self.admin_helper),
         ]
     }
 
@@ -172,6 +206,7 @@ impl ReadinessSnapshot {
             "tor_self_connect" => &mut self.tor_self_connect,
             "panic_key" => &mut self.panic_key,
             "consent_indicator" => &mut self.consent_indicator,
+            "admin_helper" => &mut self.admin_helper,
             _ => return None,
         })
     }
@@ -205,7 +240,7 @@ impl<C> minicbor::Encode<C> for ReadinessSnapshot {
         e: &mut Encoder<W>,
         ctx: &mut C,
     ) -> Result<(), minicbor::encode::Error<W::Error>> {
-        e.map(12)?;
+        e.map(13)?;
         for (name, probe) in self.fields() {
             e.str(name)?;
             probe.encode(e, ctx)?;
@@ -236,6 +271,34 @@ impl<'b, C> minicbor::Decode<'b, C> for ReadinessSnapshot {
             }
         }
         Ok(out)
+    }
+}
+
+/// A host's readiness as last probed (at its start and every
+/// [`REPROBE_EVERY`]), shared by the gate, which answers `HOST_NOT_READY` from
+/// it, and the control channel.
+#[derive(Debug, Clone, Default)]
+pub struct SharedReadiness(Arc<RwLock<ReadinessSnapshot>>);
+
+impl SharedReadiness {
+    /// Start at `snapshot`.
+    #[must_use]
+    pub fn new(snapshot: ReadinessSnapshot) -> Self {
+        Self(Arc::new(RwLock::new(snapshot)))
+    }
+
+    /// The rows as last probed.
+    #[must_use]
+    pub fn get(&self) -> ReadinessSnapshot {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The rows of a new probe.
+    pub fn set(&self, snapshot: ReadinessSnapshot) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = snapshot;
     }
 }
 
@@ -319,5 +382,26 @@ mod tests {
         let bytes = minicbor::to_vec(&long).unwrap();
         let back: Probe = minicbor::decode(&bytes).unwrap();
         assert_eq!(back, Probe::Fail("x".repeat(MAX_PROBE_MESSAGE)));
+    }
+
+    /// The administrator helper's row (r7) travels as one more named key, which
+    /// a decoder of the twelve rows ignores; this one reads a map without it as
+    /// `Unknown` there. A probe shared with the gate is read as last set.
+    #[test]
+    fn the_admin_helper_row_is_one_more_named_key() {
+        let mut s = ReadinessSnapshot::unknown();
+        s.admin_helper = Probe::Fail("not registered".into());
+        let bytes = minicbor::to_vec(&s).unwrap();
+        assert!(bytes.windows(12).any(|w| w == b"admin_helper"));
+        let back: ReadinessSnapshot = minicbor::decode(&bytes).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(s.host_not_ready_cause(), None, "badge only");
+        assert_eq!(row_title("admin_helper"), "Administrator helper registered");
+        assert_eq!(row_title("panic_key"), "Panic key");
+
+        let shared = SharedReadiness::new(ReadinessSnapshot::unknown());
+        let reader = shared.clone();
+        shared.set(s.clone());
+        assert_eq!(reader.get(), s);
     }
 }
