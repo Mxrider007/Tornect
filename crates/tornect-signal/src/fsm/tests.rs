@@ -337,6 +337,7 @@ async fn unattended_session_end_to_end_over_a_duplex_pipe() {
         store,
         StdArc::new(AllowAllReAuth::default()),
         StdArc::new(NoSessionActivity),
+        StdArc::new(tornect_core::levels::FixedFacts::linux()),
     )
     .with_paired_devices(StdArc::new(AllowAllPaired))
     .with_server_setup_source(StdArc::new(OpaqueServerSetupSource));
@@ -5117,6 +5118,7 @@ fn unattended_pair_with(
         store,
         Arc::new(AllowAllReAuth::default()),
         Arc::new(NoSessionActivity),
+        Arc::clone(&facts),
     )
     .with_paired_devices(Arc::new(AllowAllPaired))
     .with_server_setup_source(Arc::new(OpaqueServerSetupSource));
@@ -5680,38 +5682,72 @@ async fn a23_grant_reach_on_an_attended_accept_is_refused() {
     assert_eq!(seen.env.kind, Kind::Error);
 }
 
-/// M1-67, until `ADMIN_RESULT` carries the key: real `ADMIN_RESULT`s (a command run, and
-/// one the guard refuses out of the grant's scope) reach the client without
-/// `grant_reach`, so every client keeps nothing after them (the release coupling's
-/// `ADMIN_RESULT` half; the accept half is `release_coupling_*`). The two early refusals
-/// cannot be reached from the wire (the decoder refuses such a command first): the
-/// gate's own test covers them.
+/// One admin command of [`ClientSide`] against `host`, answered.
+async fn admin_answer(
+    host: &HostSide,
+    client: &ClientSide,
+    pw: &str,
+    op: u8,
+) -> client::AdminAnswer {
+    let (a, b) = pipe();
+    let task = spawn_host(a, host);
+    let answer = client::admin(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        &client::AdminIntent {
+            password: Zeroizing::new(pw.to_owned()),
+            op,
+            device_pk: None,
+        },
+    )
+    .await
+    .expect("an admin answer");
+    let _ = task.await;
+    answer
+}
+
+/// M1-67, the release coupling (B, D1, D8.3), the `ADMIN_RESULT` half: every
+/// `ADMIN_RESULT` the real gate and guard sign carries the requester's `grant_reach`,
+/// read under the lock of the command: a command run and one the guard refuses out of
+/// the grant's scope, at 0 on Linux, 1 where clause (ii) holds, 2 for an unmarked grant
+/// at the level. The two early refusals cannot be reached from the wire (the decoder
+/// refuses such a command first): the gate's own test covers them.
+/// (`no_unattended_answer_carries_grant_reach_yet`'s `ADMIN_RESULT` half, rewritten here.)
 #[tokio::test]
-async fn no_admin_result_carries_grant_reach_yet() {
+async fn release_coupling_every_admin_result_carries_grant_reach() {
+    use tornect_core::levels::{FixedFacts, HelperPresence};
     const PW: &str = "quiet verdant otter lantern zephyr";
-    let tmp = tempfile::tempdir().unwrap();
-    let (host, client) = unattended_pair(tmp.path(), PW);
-    for op in [
-        messages::admin_op::END_SESSION,
-        messages::admin_op::MASTER_OFF,
+    for (case, facts, at_the_level, reach) in [
+        ("Linux", FixedFacts::linux(), false, 0),
+        (
+            "the helper task registered",
+            FixedFacts::new(windows_facts(|_| {}), HelperPresence::Registered),
+            false,
+            1,
+        ),
+        (
+            "an unmarked grant at the level",
+            FixedFacts::new(windows_facts(|_| {}), HelperPresence::Absent),
+            true,
+            2,
+        ),
     ] {
-        let (a, b) = pipe();
-        let task = spawn_host(a, &host);
-        let answer = client::admin(
-            b,
-            &client.cfg,
-            &client.identity,
-            &client.deps,
-            &client::AdminIntent {
-                password: Zeroizing::new(PW.to_owned()),
-                op,
-                device_pk: None,
-            },
-        )
-        .await
-        .expect("an admin answer");
-        assert_eq!(answer.grant_reach, None, "{op}");
-        let _ = task.await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, client, _guard) = unattended_pair_edited(tmp.path(), PW, Arc::new(facts), |g| {
+            if at_the_level {
+                g.elevation = tornect_core::levels::Elevation::Admin;
+                g.unmarked = true;
+            }
+        });
+        // a command run, then one out of a Headless box grant's scope
+        let ran = admin_answer(&host, &client, PW, messages::admin_op::END_SESSION).await;
+        assert!(ran.ok, "{case}");
+        assert_eq!(ran.grant_reach, Some(reach), "{case}: run");
+        let refused = admin_answer(&host, &client, PW, messages::admin_op::MASTER_OFF).await;
+        assert!(!refused.ok, "{case}");
+        assert_eq!(refused.grant_reach, Some(reach), "{case}: refused");
     }
 }
 
@@ -6320,6 +6356,7 @@ fn unattended_pair_edited(
             store,
             Arc::new(AllowAllReAuth::default()),
             Arc::new(NoSessionActivity),
+            Arc::clone(&facts),
         )
         .with_paired_devices(Arc::new(AllowAllPaired))
         .with_server_setup_source(Arc::new(OpaqueServerSetupSource))

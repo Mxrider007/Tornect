@@ -24,7 +24,9 @@ use tornect_core::id::DeviceId;
 use tornect_core::levels::{AccountFacts, Elevation, FactsSource, Level, clause_ii, served_mode};
 use tornect_core::session_log::SessionMode;
 use tornect_core::unattended::grant::{AuthRecord, GrantId, UnattendedGrant};
-use tornect_core::unattended::guard::{AdminEffect, AdminOp, AdminOutcome, MutationGuard};
+use tornect_core::unattended::guard::{
+    AdminAnswer, AdminEffect, AdminError, AdminOp, AdminOutcome, MutationGuard,
+};
 use tornect_core::unattended::limiter::{
     AttemptLimiter, FailKind, HostTransport, LimiterError, PostF2Reject, Reject, Settle,
 };
@@ -165,8 +167,25 @@ enum Admit {
 /// store, and so that a host wired without an authority **refuses** admin
 /// commands rather than silently pretending to have run them.
 pub trait AdminAuthority: Send + Sync {
-    /// Run `op` for `requester`, or refuse it.
-    fn execute(&self, requester: &DeviceId, op: AdminOp) -> AdminOutcome;
+    /// Run `op` for `requester`, whose PAKE ran against the stored `auth` record with
+    /// SHA-256 `auth_digest`, or refuse it (decision M1-67): the outcome with the
+    /// requester's `grant_reach` (`None` only from an authority without a store), or a
+    /// refusal that answers no `ADMIN_RESULT`.
+    fn execute(
+        &self,
+        requester: &DeviceId,
+        auth_digest: &[u8; 32],
+        op: AdminOp,
+    ) -> Result<(AdminOutcome, Option<u8>), ReachRefusal>;
+
+    /// An admin command refused before it runs (missing, or one this build does not run:
+    /// `why`), answered as [`Self::execute`] answers and logged with op `unknown`.
+    fn refuse_early(
+        &self,
+        requester: &DeviceId,
+        auth_digest: &[u8; 32],
+        why: &str,
+    ) -> Result<(AdminOutcome, Option<u8>), ReachRefusal>;
 }
 
 /// The default: this host executes no remote admin commands.
@@ -177,12 +196,36 @@ pub trait AdminAuthority: Send + Sync {
 pub struct RefuseAdmin;
 
 impl AdminAuthority for RefuseAdmin {
-    fn execute(&self, _requester: &DeviceId, _op: AdminOp) -> AdminOutcome {
-        AdminOutcome {
-            ok: false,
-            detail: Some("remote administration is not enabled on this host".to_owned()),
-            effect: AdminEffect::None,
-        }
+    fn execute(
+        &self,
+        _: &DeviceId,
+        _: &[u8; 32],
+        _: AdminOp,
+    ) -> Result<(AdminOutcome, Option<u8>), ReachRefusal> {
+        Ok((
+            AdminOutcome {
+                ok: false,
+                detail: Some("remote administration is not enabled on this host".to_owned()),
+                effect: AdminEffect::None,
+            },
+            None,
+        ))
+    }
+
+    fn refuse_early(
+        &self,
+        _: &DeviceId,
+        _: &[u8; 32],
+        why: &str,
+    ) -> Result<(AdminOutcome, Option<u8>), ReachRefusal> {
+        Ok((
+            AdminOutcome {
+                ok: false,
+                detail: Some(why.to_owned()),
+                effect: AdminEffect::None,
+            },
+            None,
+        ))
     }
 }
 
@@ -215,27 +258,60 @@ impl std::fmt::Debug for GuardAdmin {
 }
 
 impl AdminAuthority for GuardAdmin {
-    fn execute(&self, requester: &DeviceId, op: AdminOp) -> AdminOutcome {
-        match self.guard.admin(requester, op) {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                // A store-level failure (locked keystore, store lock held, I/O)
-                // is not a scope refusal. It is reported as a plain failure with
-                // the guard's own code so the client can tell "you may not" from
-                // "the host could not". `Err` means the command took no effect —
-                // `MutationGuard::admin` treats every write after a commit as
-                // best-effort — so `AdminEffect::None` is the truth, not a loss;
-                // the guard logs the attempt as a failed `AdminRequest`.
-                tracing::warn!(peer = ?requester, op = op.name(), error = %e, "admin command failed");
+    fn execute(
+        &self,
+        requester: &DeviceId,
+        auth_digest: &[u8; 32],
+        op: AdminOp,
+    ) -> Result<(AdminOutcome, Option<u8>), ReachRefusal> {
+        answered(
+            requester,
+            op.name(),
+            self.guard.admin(requester, auth_digest, op),
+        )
+    }
+
+    fn refuse_early(
+        &self,
+        requester: &DeviceId,
+        auth_digest: &[u8; 32],
+        why: &str,
+    ) -> Result<(AdminOutcome, Option<u8>), ReachRefusal> {
+        answered(
+            requester,
+            "unknown",
+            self.guard.admin_refused_early(requester, auth_digest, why),
+        )
+    }
+}
+
+/// The guard's admin answer as the gate answers it. A store-level failure (locked
+/// keystore, store lock held, I/O) is not a scope refusal: it is reported as a plain
+/// failure with the guard's own code, so the client can tell "you may not" from "the
+/// host could not". The command took no effect (the guard treats every write after a
+/// commit as best-effort), so `AdminEffect::None` is the truth, and the guard logged the
+/// attempt as a failed `AdminRequest`.
+fn answered(
+    requester: &DeviceId,
+    op: &str,
+    answer: Result<AdminAnswer, AdminError>,
+) -> Result<(AdminOutcome, Option<u8>), ReachRefusal> {
+    match answer {
+        Ok(answer) => Ok((answer.outcome, Some(answer.grant_reach))),
+        Err(AdminError::Refused(refusal)) => Err(refusal),
+        Err(AdminError::Failed { error, grant_reach }) => {
+            tracing::warn!(peer = ?requester, op, error = %error, "admin command failed");
+            Ok((
                 AdminOutcome {
                     ok: false,
                     detail: Some(format!(
                         "host could not apply the command (0x{:04x})",
-                        e.code()
+                        error.code()
                     )),
                     effect: AdminEffect::None,
-                }
-            }
+                },
+                Some(grant_reach),
+            ))
         }
     }
 }
@@ -717,7 +793,11 @@ impl UnattendedAuth {
         // grant's state, expiry, `active_from`, hard lock and the clock
         // rollback rule before it touches anything.
         if req.intent == intent::ADMIN {
-            return Ok(self.run_admin(&device, req.admin.as_ref()));
+            return Ok(self.run_admin(
+                &device,
+                &reach::auth_digest(&grant.auth),
+                req.admin.as_ref(),
+            ));
         }
 
         let post = match self
@@ -854,52 +934,61 @@ fn some_grant_holds_level(store: &GrantStore) -> bool {
 }
 
 impl UnattendedAuth {
-    /// The `intent = admin` branch (§B.8.4.1), reached only after F2.
-    fn run_admin(&self, device: &DeviceId, cmd: Option<&messages::AdminCmd>) -> UnattendedVerdict {
-        /// One shape for every refusal so a client cannot tell "unknown op" from
-        /// "out of scope" by the message shape alone; the guard logs the real
-        /// reason host-side.
-        fn refused(detail: &str) -> UnattendedVerdict {
-            UnattendedVerdict::Admin {
-                result: messages::AdminResult {
-                    ok: false,
-                    detail: Some(detail.to_owned()),
-                    grant_reach: None,
-                },
-                effect: AdminEffect::None,
-            }
-        }
-
-        // `admin` is required iff `intent = 1`, and `SessionRequest`'s decoder
-        // already answers `E_BAD_LEN` for the three other combinations — so
-        // `None` is unreachable from the wire. Refused rather than unwrapped:
-        // a caller building the type directly must not get a panic.
-        let Some(cmd) = cmd else {
-            return refused("admin command missing");
-        };
-        // An unknown op, or a `device_pk` present for an op that takes none (or
-        // absent for one that needs it). Not an `ERROR`: the frame decoded
-        // cleanly, so this is a command the host will not run, reported the way
-        // every other such command is.
-        let Some(op) = AdminOp::from_wire(cmd.op, cmd.device_pk) else {
-            return refused("unknown admin command");
-        };
-        let outcome = self.admin.execute(device, op);
-        tracing::info!(
-            peer = ?device,
-            op = op.name(),
-            ok = outcome.ok,
-            "admin command"
-        );
-        // No `ADMIN_RESULT` carries `grant_reach` yet: it is signed only from the
-        // requester's grant read under the lock of the command (decision M1-67).
-        UnattendedVerdict::Admin {
-            result: messages::AdminResult {
-                ok: outcome.ok,
-                detail: outcome.detail,
-                grant_reach: None,
+    /// The `intent = admin` branch (§B.8.4.1), reached only after F2. `auth_digest` is the
+    /// SHA-256 of the stored record this stream's PAKE ran against (decision M1-67).
+    fn run_admin(
+        &self,
+        device: &DeviceId,
+        auth_digest: &[u8; 32],
+        cmd: Option<&messages::AdminCmd>,
+    ) -> UnattendedVerdict {
+        // `admin` is required iff `intent = 1`, and `SessionRequest`'s decoder already
+        // answers `E_BAD_LEN` for the three other combinations — so `None` is unreachable
+        // from the wire. Refused rather than unwrapped: a caller building the type
+        // directly must not get a panic. An unknown op, or a `device_pk` present for an
+        // op that takes none (or absent for one that needs it), is not an `ERROR`: the
+        // frame decoded cleanly, so this is a command the host will not run, reported
+        // the way every other such command is, with the requester's `grant_reach` and a
+        // line of its own.
+        let answer = match cmd {
+            None => self
+                .admin
+                .refuse_early(device, auth_digest, "admin command missing"),
+            Some(cmd) => match AdminOp::from_wire(cmd.op, cmd.device_pk) {
+                None => self
+                    .admin
+                    .refuse_early(device, auth_digest, "unknown admin command"),
+                Some(op) => {
+                    let answer = self.admin.execute(device, auth_digest, op);
+                    tracing::info!(
+                        peer = ?device,
+                        op = op.name(),
+                        ok = answer.as_ref().is_ok_and(|(outcome, _)| outcome.ok),
+                        "admin command"
+                    );
+                    answer
+                }
             },
-            effect: outcome.effect,
+        };
+        match answer {
+            // Every `ADMIN_RESULT` carries the requester's `grant_reach`, read under the
+            // lock of the command (decision M1-67, D1).
+            Ok((outcome, grant_reach)) => UnattendedVerdict::Admin {
+                result: messages::AdminResult {
+                    ok: outcome.ok,
+                    detail: outcome.detail,
+                    grant_reach,
+                },
+                effect: outcome.effect,
+            },
+            // The requester's password was replaced since the PAKE: the client deletes it
+            // as stale. Nothing ran.
+            Err(ReachRefusal::AuthReplaced) => {
+                UnattendedVerdict::Reject(SessionReject::new(reject::AUTH_FAILED))
+            }
+            Err(ReachRefusal::NotEligible | ReachRefusal::MarkNotWritten) => {
+                UnattendedVerdict::Reject(SessionReject::new(reject::NOT_GRANTED))
+            }
         }
     }
 }
@@ -1069,6 +1158,7 @@ mod tests {
             store,
             Arc::new(AllowAllReAuth::default()),
             Arc::new(NoSessionActivity),
+            Arc::clone(&facts),
         )
         .with_paired_devices(Arc::new(AllowAllPaired))
         .with_server_setup_source(Arc::new(OpaqueServerSetupSource));
@@ -1270,23 +1360,57 @@ mod tests {
         }
     }
 
-    /// M1-67: no `ADMIN_RESULT` carries `grant_reach` yet, the two early refusals
-    /// included (a missing command, unreachable from the wire, and an unknown one).
+    /// M1-67 (D1): the two early refusals (a missing command, unreachable from the wire,
+    /// and an unknown one) go through the guard: the requester's grant is checked, the
+    /// answer carries its `grant_reach`, and each writes an `AdminRequest` line with op
+    /// `unknown`; a password replaced since the PAKE gets no answer (`AUTH_FAILED`). An
+    /// authority without a store has no value to give. (Rewritten from
+    /// `the_early_admin_refusals_carry_no_grant_reach_yet`.)
     #[test]
-    fn the_early_admin_refusals_carry_no_grant_reach_yet() {
-        let env = env(PW);
+    fn the_early_admin_refusals_carry_grant_reach_and_are_logged() {
+        use tornect_core::session_log::SessionEvent;
+        let mut env = env(PW);
+        let without = env.auth.run_admin(&env.device, &[0; 32], None);
+        let UnattendedVerdict::Admin { result, .. } = without else {
+            panic!("expected ADMIN_RESULT");
+        };
+        assert_eq!((result.ok, result.grant_reach), (false, None));
+        env.auth = env
+            .auth
+            .with_admin_authority(Arc::new(GuardAdmin::new(Arc::clone(&env.guard))));
+        let digest = reach::auth_digest(&env.guard.store().grant(&env.device).unwrap().auth);
         let unknown = messages::AdminCmd {
             op: 0xEE,
             device_pk: None,
         };
-        for cmd in [None, Some(&unknown)] {
-            let UnattendedVerdict::Admin { result, .. } = env.auth.run_admin(&env.device, cmd)
+        let lines = |env: &Env| {
+            env.guard
+                .store()
+                .log()
+                .read_all()
+                .unwrap()
+                .into_iter()
+                .filter(|r| {
+                    r.event == SessionEvent::AdminRequest && r.op.as_deref() == Some("unknown")
+                })
+                .count()
+        };
+        for (n, cmd) in [None, Some(&unknown)].into_iter().enumerate() {
+            let UnattendedVerdict::Admin { result, .. } =
+                env.auth.run_admin(&env.device, &digest, cmd)
             else {
                 panic!("expected ADMIN_RESULT");
             };
             assert!(!result.ok);
-            assert_eq!(result.grant_reach, None);
+            assert_eq!(result.grant_reach, Some(0), "Linux: 0");
+            assert_eq!(lines(&env), n + 1);
         }
+        let UnattendedVerdict::Reject(reject) = env.auth.run_admin(&env.device, &[0; 32], None)
+        else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(reject.reason, reject::AUTH_FAILED);
+        assert_eq!(lines(&env), 2, "no answer, no line");
     }
 
     /// The default hook has no authority wired: it refuses rather than

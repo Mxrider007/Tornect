@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 
 use crate::id::DeviceId;
 use crate::keystore::{FileSecretStore, KeystoreKind, SecretStore};
-use crate::levels::{AccountFacts, Elevation, HelperPresence};
+use crate::levels::{AccountFacts, Elevation, FixedFacts, HelperPresence};
 use crate::paths::Paths;
 use crate::session_log::{
     Actor, ChainStatus, SessionEvent, SessionLog, SessionMode, SessionRecord, TransportKind,
@@ -22,8 +22,8 @@ use super::grant::{
 };
 use super::grant::{LIFETIME_BUDGET, TransportConflict};
 use super::guard::{
-    AdminEffect, AdminOp, AllowAllPaired, AllowAllReAuth, DenyAllReAuth, ExternalOp, GuardError,
-    MutationGuard, NoSessionActivity, RandomServerSetupSource, ReAuth, ReAuthError,
+    AdminEffect, AdminError, AdminOp, AllowAllPaired, AllowAllReAuth, DenyAllReAuth, ExternalOp,
+    GuardError, MutationGuard, NoSessionActivity, RandomServerSetupSource, ReAuth, ReAuthError,
     ScriptedActivity, SuspendOutcome, stop_token,
 };
 use super::ipc::{GrantOptions, codes};
@@ -125,6 +125,7 @@ impl Env {
             store.clone(),
             Arc::new(AllowAllReAuth::default()),
             Arc::new(NoSessionActivity),
+            Arc::new(FixedFacts::linux()),
         )
         .with_server_setup_source(Arc::new(RandomServerSetupSource))
         .with_paired_devices(Arc::new(AllowAllPaired))
@@ -919,6 +920,7 @@ fn f2_4_logged_external_changes_wait_for_a_readable_log_key() {
         store.clone(),
         Arc::clone(&reauth) as Arc<dyn ReAuth>,
         Arc::new(NoSessionActivity),
+        Arc::new(FixedFacts::linux()),
     );
     for op in [
         ExternalOp::ServiceInstall { elevated: false },
@@ -1028,8 +1030,11 @@ fn u4_housekeeping_logs_expiry_and_prunes_auth_records() {
     assert_eq!(store.grant(&d).unwrap().auth, AuthRecord::Pruned);
     assert!(env.has_event(SessionEvent::GrantPruned));
     assert!(
-        matches!(g.admin(&d, AdminOp::EndSession), Ok(o) if !o.ok),
-        "an expired grant cannot act"
+        matches!(
+            g.admin(&d, &digest_of(&store, &d), AdminOp::EndSession),
+            Err(AdminError::Refused(ReachRefusal::NotEligible))
+        ),
+        "an expired grant cannot act: no answer (M1-67)"
     );
 }
 
@@ -1348,6 +1353,7 @@ fn a8_guard_refuses_access_increasing_ops_without_reauth() {
         store.clone(),
         Arc::new(DenyAllReAuth),
         Arc::new(NoSessionActivity),
+        Arc::new(FixedFacts::linux()),
     )
     .with_server_setup_source(Arc::new(RandomServerSetupSource))
     .with_paired_devices(Arc::new(AllowAllPaired));
@@ -1438,6 +1444,7 @@ fn a8_pause_cannot_be_shortened_or_cleared_without_reauth() {
         store.clone(),
         Arc::new(DenyAllReAuth),
         Arc::new(NoSessionActivity),
+        Arc::new(FixedFacts::linux()),
     )
     .with_paired_devices(Arc::new(AllowAllPaired));
     // starting and extending a pause are deny-direction
@@ -1468,8 +1475,13 @@ fn a8_pause_cannot_be_shortened_or_cleared_without_reauth() {
     );
     // with re-auth the pause ends early
     let reauth = Arc::new(AllowAllReAuth::default());
-    let allow = MutationGuard::new(store.clone(), reauth.clone(), Arc::new(NoSessionActivity))
-        .with_paired_devices(Arc::new(AllowAllPaired));
+    let allow = MutationGuard::new(
+        store.clone(),
+        reauth.clone(),
+        Arc::new(NoSessionActivity),
+        Arc::new(FixedFacts::linux()),
+    )
+    .with_paired_devices(Arc::new(AllowAllPaired));
     allow.pause(Actor::Ui, T0 + H).unwrap();
     assert_eq!(paused_until(), Some(T0 + H));
     assert_eq!(reauth.calls(), vec!["pause".to_owned()]);
@@ -1487,8 +1499,13 @@ fn a8_pause_cannot_be_shortened_or_cleared_without_reauth() {
     allow.pause(Actor::Ui, env.clock.wall() + 12 * H).unwrap();
     let activity = Arc::new(ScriptedActivity::default());
     activity.set_live(true);
-    let busy = MutationGuard::new(store.clone(), reauth.clone(), activity)
-        .with_paired_devices(Arc::new(AllowAllPaired));
+    let busy = MutationGuard::new(
+        store.clone(),
+        reauth.clone(),
+        activity,
+        Arc::new(FixedFacts::linux()),
+    )
+    .with_paired_devices(Arc::new(AllowAllPaired));
     assert_eq!(
         busy.pause(Actor::Ui, 0).unwrap_err().code(),
         codes::G_REMOTE_SESSION_ACTIVE
@@ -1502,6 +1519,7 @@ fn deny_guard(store: &GrantStore) -> MutationGuard {
         store.clone(),
         Arc::new(DenyAllReAuth),
         Arc::new(NoSessionActivity),
+        Arc::new(FixedFacts::linux()),
     )
     .with_paired_devices(Arc::new(AllowAllPaired))
 }
@@ -1572,6 +1590,7 @@ fn a8_set_options_and_pause_are_classified_again_under_the_lock_after_the_dialog
             device: d,
         }),
         Arc::new(NoSessionActivity),
+        Arc::new(FixedFacts::linux()),
     )
     .with_paired_devices(Arc::new(AllowAllPaired));
     guard
@@ -1607,6 +1626,7 @@ fn a8_set_options_and_pause_are_classified_again_under_the_lock_after_the_dialog
             until: T0 + 48 * H,
         }),
         Arc::new(NoSessionActivity),
+        Arc::new(FixedFacts::linux()),
     )
     .with_paired_devices(Arc::new(AllowAllPaired));
     guard.pause(Actor::Ui, T0 + H).unwrap();
@@ -1620,7 +1640,10 @@ fn a15_admin_requests_fail_closed_on_a_clock_rollback() {
     assert_eq!(gate(&lim, &admin), Ok(()), "raises the in-memory mark");
     let mark = env.clock.wall();
     env.clock.set_wall(mark - 60);
-    let out = guard.admin(&admin, AdminOp::Unlock(target)).unwrap();
+    let out = guard
+        .admin(&admin, &digest_of(&store, &admin), AdminOp::Unlock(target))
+        .unwrap()
+        .outcome;
     assert!(!out.ok);
     assert_eq!(out.detail.as_deref(), Some("clock rollback"));
     assert_eq!(out.effect, AdminEffect::None);
@@ -1632,7 +1655,13 @@ fn a15_admin_requests_fail_closed_on_a_clock_rollback() {
     }));
     // once the clock passes the mark the same request is in scope again
     env.clock.set_wall(mark);
-    assert!(guard.admin(&admin, AdminOp::Unlock(target)).unwrap().ok);
+    assert!(
+        guard
+            .admin(&admin, &digest_of(&store, &admin), AdminOp::Unlock(target))
+            .unwrap()
+            .outcome
+            .ok
+    );
 }
 
 #[test]
@@ -1758,9 +1787,14 @@ fn a8_guard_refuses_during_and_within_60s_after_a_remote_session() {
     drop(enable(&env, &store, d, Preset::MyMachines));
     let reauth = Arc::new(AllowAllReAuth::default());
     let activity = Arc::new(ScriptedActivity::default());
-    let guard = MutationGuard::new(store.clone(), reauth.clone(), activity.clone())
-        .with_server_setup_source(Arc::new(RandomServerSetupSource))
-        .with_paired_devices(Arc::new(AllowAllPaired));
+    let guard = MutationGuard::new(
+        store.clone(),
+        reauth.clone(),
+        activity.clone(),
+        Arc::new(FixedFacts::linux()),
+    )
+    .with_server_setup_source(Arc::new(RandomServerSetupSource))
+    .with_paired_devices(Arc::new(AllowAllPaired));
     activity.set_live(true);
     let err = guard.unlock(Actor::Ui, &d).unwrap_err();
     assert_eq!(err.code(), codes::G_REMOTE_SESSION_ACTIVE);
@@ -1803,9 +1837,14 @@ fn a8_reg_finish_without_a_live_txn_is_g_no_txn() {
     let (a, b) = (dev(1), dev(2));
     let reauth = Arc::new(AllowAllReAuth::default());
     let activity = Arc::new(ScriptedActivity::default());
-    let guard = MutationGuard::new(store.clone(), reauth.clone(), activity.clone())
-        .with_server_setup_source(Arc::new(RandomServerSetupSource))
-        .with_paired_devices(Arc::new(AllowAllPaired));
+    let guard = MutationGuard::new(
+        store.clone(),
+        reauth.clone(),
+        activity.clone(),
+        Arc::new(FixedFacts::linux()),
+    )
+    .with_server_setup_source(Arc::new(RandomServerSetupSource))
+    .with_paired_devices(Arc::new(AllowAllPaired));
     // no txn at all
     let err = guard
         .reg_finish(
@@ -2125,8 +2164,9 @@ fn admin_with_a_failing_log_line(
     let (env, store, guard, admin, target, _) = admin_env();
     store.fail_next_write(WriteClass::Runtime);
     let out = guard
-        .admin(&admin, op_for(target))
-        .expect("a committed admin command must not be reported as failed");
+        .admin(&admin, &digest_of(&store, &admin), op_for(target))
+        .expect("a committed admin command must not be reported as failed")
+        .outcome;
     (out, env, store, target)
 }
 
@@ -2170,7 +2210,11 @@ fn a15_an_admin_command_that_fails_to_commit_is_an_error_and_is_logged() {
     };
     let before = failed_lines(&env);
     store.fail_next_write(WriteClass::Policy);
-    assert!(guard.admin(&admin, AdminOp::MasterOff).is_err());
+    assert!(
+        guard
+            .admin(&admin, &digest_of(&store, &admin), AdminOp::MasterOff)
+            .is_err()
+    );
     assert!(store.enabled_at(env.clock.wall()), "nothing committed");
     assert_eq!(failed_lines(&env), before + 1);
 }
@@ -2185,15 +2229,31 @@ fn a15_out_of_scope_admin_requests_are_refused_without_state_change() {
         AdminOp::Suspend(target),
         AdminOp::Revoke(target),
     ] {
-        let out = guard.admin(&helper, op).unwrap();
+        let out = guard
+            .admin(&helper, &digest_of(&store, &helper), op)
+            .unwrap()
+            .outcome;
         assert!(!out.ok, "{op:?}");
         assert_eq!(out.effect, AdminEffect::None);
     }
     assert!(store.grant(&target).is_some());
     assert!(store.enabled_at(env.clock.wall()));
     // a helper may end its own session and revoke itself
-    assert!(guard.admin(&helper, AdminOp::EndSession).unwrap().ok);
-    let out = guard.admin(&helper, AdminOp::Revoke(helper)).unwrap();
+    assert!(
+        guard
+            .admin(&helper, &digest_of(&store, &helper), AdminOp::EndSession)
+            .unwrap()
+            .outcome
+            .ok
+    );
+    let out = guard
+        .admin(
+            &helper,
+            &digest_of(&store, &helper),
+            AdminOp::Revoke(helper),
+        )
+        .unwrap()
+        .outcome;
     assert_eq!(out.effect, AdminEffect::Revoked(helper));
     assert!(store.grant(&helper).is_none());
     // a suspended admin cannot act
@@ -2201,13 +2261,17 @@ fn a15_out_of_scope_admin_requests_are_refused_without_state_change() {
         guard.suspend(Actor::Ui, &admin).unwrap(),
         SuspendOutcome::Suspended
     );
-    assert!(!guard.admin(&admin, AdminOp::Unlock(target)).unwrap().ok);
+    // a suspended admin cannot act: no answer, so no line (M1-67)
+    assert!(matches!(
+        guard.admin(&admin, &digest_of(&store, &admin), AdminOp::Unlock(target)),
+        Err(AdminError::Refused(ReachRefusal::NotEligible))
+    ));
     let refused = env
         .log_events()
         .into_iter()
         .filter(|r| r.event == SessionEvent::AdminRequest && r.ok == Some(false))
         .count();
-    assert_eq!(refused, 6);
+    assert_eq!(refused, 5);
 }
 
 #[test]
@@ -2224,7 +2288,10 @@ fn a15_remote_unlock_resets_failstate_but_never_clears_a_local_block() {
         }
     ));
     assert_eq!(gate(&lim, &target), Err(Reject::Suspended { cause: 1 }));
-    let out = guard.admin(&admin, AdminOp::Unlock(target)).unwrap();
+    let out = guard
+        .admin(&admin, &digest_of(&store, &admin), AdminOp::Unlock(target))
+        .unwrap()
+        .outcome;
     assert!(out.ok);
     assert_eq!(out.effect, AdminEffect::Unlocked(target));
     let g = store.grant(&target).unwrap();
@@ -2251,11 +2318,17 @@ fn a15_remote_unlock_resets_failstate_but_never_clears_a_local_block() {
 fn a15_remote_unlock_clears_an_admin_suspension() {
     let (env, store, guard, admin, target, _) = admin_env();
     let lim = AttemptLimiter::new(store.clone());
-    let out = guard.admin(&admin, AdminOp::Suspend(target)).unwrap();
+    let out = guard
+        .admin(&admin, &digest_of(&store, &admin), AdminOp::Suspend(target))
+        .unwrap()
+        .outcome;
     assert_eq!(out.effect, AdminEffect::Suspended(target));
     assert_eq!(gate(&lim, &target), Err(Reject::Suspended { cause: 2 }));
     fail_n(&env, &lim, &admin, 2);
-    let out = guard.admin(&admin, AdminOp::Unlock(target)).unwrap();
+    let out = guard
+        .admin(&admin, &digest_of(&store, &admin), AdminOp::Unlock(target))
+        .unwrap()
+        .outcome;
     assert!(out.ok);
     assert_eq!(store.grant(&target).unwrap().state, GrantState::Active);
     assert_eq!(gate(&lim, &target), Ok(()));
@@ -2282,7 +2355,10 @@ fn a15_remote_unlock_keeps_a_local_cli_suspension() {
             ..
         }
     ));
-    let out = guard.admin(&admin, AdminOp::Unlock(target)).unwrap();
+    let out = guard
+        .admin(&admin, &digest_of(&store, &admin), AdminOp::Unlock(target))
+        .unwrap()
+        .outcome;
     assert!(out.ok);
     assert!(matches!(
         store.grant(&target).unwrap().state,
@@ -2300,7 +2376,10 @@ fn a15_suspend_then_unlock_against_a_local_block_changes_nothing_but_failstate()
     let lim = AttemptLimiter::new(store.clone());
     fail_n(&env, &lim, &target, 2);
     guard.block(&target).unwrap();
-    let out = guard.admin(&admin, AdminOp::Suspend(target)).unwrap();
+    let out = guard
+        .admin(&admin, &digest_of(&store, &admin), AdminOp::Suspend(target))
+        .unwrap()
+        .outcome;
     assert!(out.ok, "reported ok");
     assert_eq!(out.effect, AdminEffect::None, "state untouched");
     assert!(matches!(
@@ -2310,7 +2389,10 @@ fn a15_suspend_then_unlock_against_a_local_block_changes_nothing_but_failstate()
             ..
         }
     ));
-    let out = guard.admin(&admin, AdminOp::Unlock(target)).unwrap();
+    let out = guard
+        .admin(&admin, &digest_of(&store, &admin), AdminOp::Unlock(target))
+        .unwrap()
+        .outcome;
     assert!(out.ok);
     let g = store.grant(&target).unwrap();
     assert_eq!(g.fail.consecutive, 0);
@@ -2327,7 +2409,9 @@ fn a15_suspend_then_unlock_against_a_local_block_changes_nothing_but_failstate()
         SuspendOutcome::NoOp
     );
     guard.resume(Actor::Ui, &target).unwrap();
-    guard.admin(&admin, AdminOp::Suspend(target)).unwrap();
+    guard
+        .admin(&admin, &digest_of(&store, &admin), AdminOp::Suspend(target))
+        .unwrap();
     assert_eq!(
         guard.suspend(Actor::Ui, &target).unwrap(),
         SuspendOutcome::Suspended
@@ -2355,11 +2439,17 @@ fn a15_suspend_then_unlock_against_a_local_block_changes_nothing_but_failstate()
     guard.enable(Actor::Ui, &target).unwrap();
     assert_eq!(gate(&lim, &target), Ok(()));
     // revoke_all / master_off from the admin grant
-    let out = guard.admin(&admin, AdminOp::MasterOff).unwrap();
+    let out = guard
+        .admin(&admin, &digest_of(&store, &admin), AdminOp::MasterOff)
+        .unwrap()
+        .outcome;
     assert_eq!(out.effect, AdminEffect::MasterOff);
     assert_eq!(gate(&lim, &target), Err(Reject::NotGranted));
     assert!(
-        !guard.admin(&admin, AdminOp::RevokeAll).unwrap().ok,
+        matches!(
+            guard.admin(&admin, &digest_of(&store, &admin), AdminOp::RevokeAll),
+            Err(AdminError::Refused(ReachRefusal::NotEligible))
+        ),
         "master off: the requester is refused pre-PAKE, and the guard requires an active grant"
     );
 }
@@ -3050,9 +3140,14 @@ fn a8_access_increasing_rechecks_the_remote_session_after_the_dialog() {
         activity: activity.clone(),
         calls: parking_lot::Mutex::new(0),
     });
-    let guard = MutationGuard::new(store.clone(), reauth.clone(), activity.clone())
-        .with_server_setup_source(Arc::new(RandomServerSetupSource))
-        .with_paired_devices(Arc::new(AllowAllPaired));
+    let guard = MutationGuard::new(
+        store.clone(),
+        reauth.clone(),
+        activity.clone(),
+        Arc::new(FixedFacts::linux()),
+    )
+    .with_server_setup_source(Arc::new(RandomServerSetupSource))
+    .with_paired_devices(Arc::new(AllowAllPaired));
     let token_before = store.read(|s| s.stop_token).unwrap();
     let mut refused = 0;
     let mut check = |r: Result<(), GuardError>| {
@@ -3277,6 +3372,7 @@ fn run_reserved_at_the_commit(
         Arc::new(ReservedAtTheCommit {
             store: store.clone(),
         }),
+        Arc::new(FixedFacts::linux()),
     )
     .with_server_setup_source(Arc::new(RandomServerSetupSource))
     .with_paired_devices(Arc::new(AllowAllPaired));
@@ -3407,8 +3503,13 @@ fn a8_grant_requires_a_sas_paired_device_and_unpair_cascades() {
     let d = dev(1);
     let reauth = Arc::new(AllowAllReAuth::default());
     // the normative constructor: pairing is read from trusted-devices.toml
-    let guard = MutationGuard::new(store.clone(), reauth.clone(), Arc::new(NoSessionActivity))
-        .with_server_setup_source(Arc::new(RandomServerSetupSource));
+    let guard = MutationGuard::new(
+        store.clone(),
+        reauth.clone(),
+        Arc::new(NoSessionActivity),
+        Arc::new(FixedFacts::linux()),
+    )
+    .with_server_setup_source(Arc::new(RandomServerSetupSource));
     guard.master_on(Actor::Ui, &HOST_PK).unwrap();
     assert_eq!(reauth.calls().len(), 1);
     // unpaired ⇒ refused before any dialog, whatever the preset / waiver says
@@ -3520,6 +3621,7 @@ fn u4_failed_closed_store_is_recovered_by_reset_store_behind_reauth() {
         store.clone(),
         Arc::new(DenyAllReAuth),
         Arc::new(NoSessionActivity),
+        Arc::new(FixedFacts::linux()),
     );
     assert_eq!(
         deny.reset_store(Actor::Ui).unwrap_err().code(),
@@ -3533,6 +3635,7 @@ fn u4_failed_closed_store_is_recovered_by_reset_store_behind_reauth() {
         store.clone(),
         Arc::new(AllowAllReAuth::default()),
         activity.clone(),
+        Arc::new(FixedFacts::linux()),
     )
     .with_server_setup_source(Arc::new(RandomServerSetupSource))
     .with_paired_devices(Arc::new(AllowAllPaired));
@@ -3894,19 +3997,27 @@ fn enable_only_leaves_disabled_and_disable_is_idempotent() {
 #[test]
 fn a15_remote_master_off_and_revoke_write_the_per_event_lines() {
     let (env, store, guard, admin, target, _) = admin_env();
-    guard.admin(&admin, AdminOp::Revoke(target)).unwrap();
+    guard
+        .admin(&admin, &digest_of(&store, &admin), AdminOp::Revoke(target))
+        .unwrap();
     assert!(env.log_events().iter().any(|r| {
         r.event == SessionEvent::GrantRevoked
             && r.peer_device == Some(target)
             && r.reason.as_deref() == Some("admin")
     }));
-    let out = guard.admin(&admin, AdminOp::MasterOff).unwrap();
+    let out = guard
+        .admin(&admin, &digest_of(&store, &admin), AdminOp::MasterOff)
+        .unwrap()
+        .outcome;
     assert_eq!(out.effect, AdminEffect::MasterOff);
     assert!(env.log_events().iter().any(|r| {
         r.event == SessionEvent::UnattendedDisabled && r.reason.as_deref() == Some("admin")
     }));
     guard.master_on(Actor::Ui, &HOST_PK).unwrap();
-    let out = guard.admin(&admin, AdminOp::RevokeAll).unwrap();
+    let out = guard
+        .admin(&admin, &digest_of(&store, &admin), AdminOp::RevokeAll)
+        .unwrap()
+        .outcome;
     assert_eq!(out.effect, AdminEffect::RevokedAll(2));
     assert!(env.log_events().iter().any(|r| {
         r.event == SessionEvent::GrantRevoked
@@ -4667,5 +4778,198 @@ fn the_read_after_the_reservation_marks_without_a_deadlock() {
         .unwrap();
     assert_eq!(read.grant_reach, 0);
     assert!(!store.lock_is_held());
+    assert_eq!(store.verify_log().unwrap().status, ChainStatus::Valid);
+}
+
+// ------------------------------------------------------------------ the admin path under the lock (M1-67: B, D1)
+
+/// A guard over `store` whose account facts and helper task are `account` and `helper`.
+fn guard_on(store: &GrantStore, account: AccountFacts, helper: HelperPresence) -> MutationGuard {
+    MutationGuard::new(
+        store.clone(),
+        Arc::new(AllowAllReAuth::default()),
+        Arc::new(NoSessionActivity),
+        Arc::new(FixedFacts::new(account, helper)),
+    )
+    .with_paired_devices(Arc::new(AllowAllPaired))
+}
+
+fn admin_lines(env: &Env) -> Vec<SessionRecord> {
+    env.log_events()
+        .into_iter()
+        .filter(|r| r.event == SessionEvent::AdminRequest)
+        .collect()
+}
+
+#[test]
+fn a20_d_e_every_admin_answer_carries_the_requesters_reach() {
+    // A20 (d)(e), host side: a command run and one refused (out of scope, and an unknown
+    // command) carry the requester's `grant_reach` as its grant was loaded before the
+    // command: 2 for a grant at the level not marked (whatever its mode), 0 at none on a
+    // host without admin grants; each answer writes its `AdminRequest` line, the unknown
+    // one with op `unknown`.
+    for (at_the_level, account, reach) in
+        [(true, windows(|_| {}), 2), (false, AccountFacts::Linux, 0)]
+    {
+        let (env, store, _guard, _admin, _target, helper) = admin_env();
+        if at_the_level {
+            set_grant(&store, &helper, |g| {
+                g.elevation = Elevation::Admin;
+                g.unmarked = true;
+            });
+        }
+        let guard = guard_on(&store, account, HelperPresence::Absent);
+        let digest = digest_of(&store, &helper);
+        let lines = admin_lines(&env).len();
+        let ran = guard.admin(&helper, &digest, AdminOp::EndSession).unwrap();
+        assert!(ran.outcome.ok);
+        assert_eq!(ran.grant_reach, reach);
+        let refused = guard.admin(&helper, &digest, AdminOp::MasterOff).unwrap();
+        assert!(!refused.outcome.ok);
+        assert_eq!(refused.grant_reach, reach);
+        assert!(store.enabled_at(env.clock.wall()), "nothing ran");
+        let unknown = guard
+            .admin_refused_early(&helper, &digest, "unknown admin command")
+            .unwrap();
+        assert_eq!((unknown.outcome.ok, unknown.grant_reach), (false, reach));
+        let new_lines = admin_lines(&env);
+        assert_eq!(new_lines.len(), lines + 3);
+        assert_eq!(new_lines.last().unwrap().op.as_deref(), Some("unknown"));
+    }
+}
+
+#[test]
+fn a25_j_an_admin_command_after_a_raise_fails_auth() {
+    // A25 (j) (B): the requester's password was replaced since its PAKE (a raise
+    // replaces `auth`): AUTH_FAILED, no ADMIN_RESULT, the command does not run.
+    let (env, store, guard, admin, _target, _helper) = admin_env();
+    let proven = digest_of(&store, &admin);
+    guard.set_password(Actor::Ui, &admin, &[0xCD; 192]).unwrap();
+    let lines = admin_lines(&env).len();
+    assert!(matches!(
+        guard.admin(&admin, &proven, AdminOp::MasterOff),
+        Err(AdminError::Refused(ReachRefusal::AuthReplaced))
+    ));
+    assert!(matches!(
+        guard.admin_refused_early(&admin, &proven, "unknown admin command"),
+        Err(AdminError::Refused(ReachRefusal::AuthReplaced))
+    ));
+    assert!(
+        store.enabled_at(env.clock.wall()),
+        "the command did not run"
+    );
+    assert_eq!(admin_lines(&env).len(), lines, "no answer, no line");
+}
+
+#[test]
+fn an_admin_requester_no_longer_eligible_gets_no_answer() {
+    // B (step 1's set, under the lock of the command): gone, disabled, suspended,
+    // expired, hard-locked, Pruned, unattended access off or paused: NOT_GRANTED, no
+    // ADMIN_RESULT, nothing runs.
+    type Change = Box<dyn Fn(&GrantStore, &MutationGuard, &DeviceId)>;
+    let cases: Vec<(&str, Change)> = vec![
+        ("gone", Box::new(|_, g, d| g.revoke(Actor::Ui, d).unwrap())),
+        (
+            "disabled",
+            Box::new(|_, g, d| g.disable(Actor::Ui, d).unwrap()),
+        ),
+        (
+            "suspended",
+            Box::new(|_, g, d| {
+                g.suspend(Actor::Ui, d).unwrap();
+            }),
+        ),
+        (
+            "expired",
+            Box::new(|s, _, d| set_grant(s, d, |g| g.expires_at = Some(T0))),
+        ),
+        (
+            "hard-locked",
+            Box::new(|s, _, d| set_grant(s, d, |g| g.fail.hard_locked = true)),
+        ),
+        (
+            "Pruned",
+            Box::new(|s, _, d| set_grant(s, d, |g| g.auth = AuthRecord::Pruned)),
+        ),
+        ("off", Box::new(|_, g, _| g.master_off(Actor::Ui).unwrap())),
+        (
+            "paused",
+            Box::new(|_, g, _| g.pause(Actor::Ui, T0 + 48 * H).unwrap()),
+        ),
+    ];
+    for (case, change) in cases {
+        let (env, store, guard, admin, target, _helper) = admin_env();
+        let proven = digest_of(&store, &admin);
+        change(&store, &guard, &admin);
+        let lines = admin_lines(&env).len();
+        assert!(
+            matches!(
+                guard.admin(&admin, &proven, AdminOp::Revoke(target)),
+                Err(AdminError::Refused(ReachRefusal::NotEligible))
+            ),
+            "{case}"
+        );
+        assert!(store.grant(&target).is_some(), "{case}: nothing ran");
+        assert_eq!(admin_lines(&env).len(), lines, "{case}: no answer, no line");
+    }
+}
+
+#[test]
+fn a25_l_each_admin_refusal_under_the_lock_is_answered_and_logged() {
+    // A25 (l): each refusal decided under the lock of the command (a clock rollback, out
+    // of scope, a target without a grant, the two early refusals) is answered with the
+    // requester's `grant_reach`, logged once after the lock, without a deadlock (bounded
+    // wait), and the §B.8.13 chain verifier passes.
+    let (env, store, guard, admin, _target, helper) = admin_env();
+    let guard = Arc::new(guard);
+    let lines = admin_lines(&env).len();
+    let lim = AttemptLimiter::new(store.clone());
+    assert_eq!(gate(&lim, &admin), Ok(()), "raises the in-memory mark");
+    let mark = env.clock.wall();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let in_thread = Arc::clone(&guard);
+    let (admin_digest, helper_digest) = (digest_of(&store, &admin), digest_of(&store, &helper));
+    let clock = env.clock.clone();
+    std::thread::spawn(move || {
+        let g = &in_thread;
+        let mut answers = vec![
+            g.admin(&helper, &helper_digest, AdminOp::RevokeAll),
+            g.admin(&admin, &admin_digest, AdminOp::Revoke(dev(9))),
+            g.admin_refused_early(&admin, &admin_digest, "admin command missing"),
+            g.admin_refused_early(&admin, &admin_digest, "unknown admin command"),
+        ];
+        clock.set_wall(mark - 60);
+        answers.push(g.admin(&admin, &admin_digest, AdminOp::MasterOff));
+        let _ = tx.send(answers);
+    });
+    let answers = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("answered within the bound: no deadlock");
+    let details: Vec<Option<String>> = answers
+        .into_iter()
+        .map(|a| {
+            let a = a.unwrap();
+            assert!(!a.outcome.ok);
+            assert_eq!(a.grant_reach, 0, "Linux");
+            a.outcome.detail
+        })
+        .collect();
+    assert_eq!(
+        details,
+        [
+            "out of scope for this grant",
+            "target has no grant",
+            "admin command missing",
+            "unknown admin command",
+            "clock rollback",
+        ]
+        .map(|d| Some(d.to_owned()))
+    );
+    let new_lines = admin_lines(&env);
+    assert_eq!(new_lines.len(), lines + 5, "one line each: {new_lines:#?}");
+    assert!(new_lines[lines..].iter().all(|r| r.ok == Some(false)));
+    assert!(store.enabled_at(mark), "nothing ran");
+    assert!(!store.lock_is_held());
+    env.clock.set_wall(mark);
     assert_eq!(store.verify_log().unwrap().status, ChainStatus::Valid);
 }
