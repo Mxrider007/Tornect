@@ -483,6 +483,50 @@ impl UnattendedHook for UnattendedAuth {
     ) -> BoxFuture<'a, Result<UnattendedVerdict, HandshakeError>> {
         Box::pin(async move { self.run(ctx).await })
     }
+
+    /// Decision M1-67 (B, D10, D11): after the reservation, the account facts and the
+    /// helper task are read again and the session lowered where F-12 or the marked rule
+    /// says so, as at the gate: a setting changed since the gate counts. Lowering only.
+    fn reserved<'a>(
+        &'a self,
+        device: &'a DeviceId,
+        proof: ConsentProof,
+    ) -> BoxFuture<'a, Result<ConsentProof, SessionReject>> {
+        Box::pin(async move {
+            let ConsentProof::Unattended {
+                grant,
+                proof_fp,
+                policy,
+                block,
+                token,
+            } = proof
+            else {
+                return Ok(proof);
+            };
+            let account = self.facts.account();
+            let reach_through_host = clause_ii(
+                policy.mode(),
+                some_grant_holds_level(),
+                account,
+                self.facts.helper_task(),
+            );
+            // A grant gone since the gate reads as marked: the safe direction.
+            let marked = self
+                .limiter
+                .store()
+                .grant(device)
+                .is_none_or(|grant| marked(&grant));
+            let level = Level::new(policy.mode(), policy.elevation());
+            let served = served_mode(level, marked, reach_through_host, account);
+            Ok(ConsentProof::Unattended {
+                grant,
+                proof_fp,
+                policy: policy.lowered_to(served),
+                block,
+                token,
+            })
+        })
+    }
 }
 
 impl UnattendedAuth {
