@@ -18,6 +18,11 @@
 //! collapses whitespace and bounds the length; Unicode NFKC normalization is
 //! applied by the caller (`tornect-signal`, which owns the `unicode-normalization`
 //! dependency) before the string reaches this module.
+//!
+//! A pairing time is kept to the second for [`PAIRED_AT_PRECISE_FOR`] only,
+//! then to its UTC day ([`TrustedDevices::coarsen`], [`KnownHosts::coarsen`];
+//! P-L4, U3-I8). The writers of the two files apply it; `load` and `save`
+//! keep what they are given.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -47,6 +52,35 @@ pub fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// How long a pin keeps its pairing time to the second (24 hours): the host's
+/// session sheet asks whether a device was paired less than a day ago. From
+/// then on the stored pairing time is its UTC day (P-L4, U3-I8).
+pub const PAIRED_AT_PRECISE_FOR: u64 = 24 * 3600;
+
+/// Seconds in a day.
+const DAY_SECS: u64 = 86_400;
+
+/// Keep `paired_at` to the second until [`PAIRED_AT_PRECISE_FOR`] has passed
+/// at `now`, then to the start of its UTC day, and the same for a `last_seen`
+/// that still is the pairing second (a pin written while history is off). A
+/// clock behind the pairing changes nothing. Whether either changed.
+fn coarsen_pairing(paired_at: &mut u64, last_seen: &mut u64, now: u64) -> bool {
+    if now < paired_at.saturating_add(PAIRED_AT_PRECISE_FOR) {
+        return false;
+    }
+    let day = *paired_at - *paired_at % DAY_SECS;
+    let mut changed = false;
+    if *last_seen == *paired_at && *last_seen != day {
+        *last_seen = day;
+        changed = true;
+    }
+    if *paired_at != day {
+        *paired_at = day;
+        changed = true;
+    }
+    changed
 }
 
 /// Remove characters a peer could use to spoof or hide text, collapse
@@ -189,6 +223,15 @@ pub struct TrustedDevice {
     pub last_seen: u64,
 }
 
+impl TrustedDevice {
+    /// Keep the pairing time to the second for its first
+    /// [`PAIRED_AT_PRECISE_FOR`] only, then to its UTC day (with a last-seen
+    /// time that still is the pairing second). Whether anything changed.
+    pub fn coarsen(&mut self, now: u64) -> bool {
+        coarsen_pairing(&mut self.paired_at, &mut self.last_seen, now)
+    }
+}
+
 /// Reject history of an *unpaired* peer key (`docs/PLAN.md` §B.3: "repeated
 /// rejects ⇒ temp-ban list persisted per client pk").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +311,17 @@ impl TrustedDevices {
     /// Write the file atomically with private permissions.
     pub fn save(&self, path: &Path) -> Result<()> {
         save_private_toml(path, self)
+    }
+
+    /// [`TrustedDevice::coarsen`] for every pinned device at `now`; whether
+    /// any changed. The host's store applies it after a load and before
+    /// every save.
+    pub fn coarsen(&mut self, now: u64) -> bool {
+        let mut changed = false;
+        for device in &mut self.devices {
+            changed |= device.coarsen(now);
+        }
+        changed
     }
 
     /// The pinned record for `device`, if paired.
@@ -384,6 +438,13 @@ pub struct KnownHost {
     pub last_seen: u64,
 }
 
+impl KnownHost {
+    /// The host side's rule ([`TrustedDevice::coarsen`]) for this pin.
+    pub fn coarsen(&mut self, now: u64) -> bool {
+        coarsen_pairing(&mut self.paired_at, &mut self.last_seen, now)
+    }
+}
+
 /// The client's paired hosts (`known-hosts.toml`), keyed by onion address.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnownHosts {
@@ -408,6 +469,15 @@ impl KnownHosts {
     /// Write the file atomically with private permissions.
     pub fn save(&self, path: &Path) -> Result<()> {
         save_private_toml(path, self)
+    }
+
+    /// [`KnownHost::coarsen`] for every host at `now`; whether any changed.
+    pub fn coarsen(&mut self, now: u64) -> bool {
+        let mut changed = false;
+        for host in self.hosts.values_mut() {
+            changed |= host.coarsen(now);
+        }
+        changed
     }
 
     /// The record for `host`, if paired.
@@ -657,6 +727,48 @@ mod tests {
         let mut k2 = back;
         assert!(k2.remove(&host));
         assert!(k2.get(&host).is_none());
+    }
+
+    /// P-L4 / U3-I8: a pin keeps its pairing second for 24 hours, then its UTC
+    /// day; a last-seen time that still is the pairing second goes with it, a
+    /// later one stays. A clock behind the pairing changes nothing, and twice
+    /// is once. The client's pins follow the same rule.
+    #[test]
+    fn a_pairing_time_is_kept_to_the_second_for_a_day_then_to_the_day() {
+        let paired = 1_790_000_123;
+        let day = 1_789_948_800;
+        assert_eq!(day % 86_400, 0);
+        assert!(paired - day < 86_400);
+        let mut t = TrustedDevices::default();
+        t.pin(dev(1), "Laptop", paired);
+        t.pin(dev(2), "Phone", paired);
+        t.touch(&dev(2), paired + 600);
+        let before = t.clone();
+        assert!(!t.coarsen(paired + PAIRED_AT_PRECISE_FOR - 1));
+        assert_eq!(t, before, "24 h - 1 s: as it was");
+        assert!(!t.coarsen(paired - 5), "a clock behind the pairing");
+        assert_eq!(t, before);
+        assert!(t.coarsen(paired + PAIRED_AT_PRECISE_FOR));
+        let laptop = t.get(&dev(1)).unwrap();
+        assert_eq!((laptop.paired_at, laptop.last_seen), (day, day));
+        let phone = t.get(&dev(2)).unwrap();
+        assert_eq!((phone.paired_at, phone.last_seen), (day, paired + 600));
+        let once = t.clone();
+        assert!(
+            !t.coarsen(paired + 10 * PAIRED_AT_PRECISE_FOR),
+            "twice is once"
+        );
+        assert_eq!(t, once);
+
+        let host = TornectId::from_bytes([7u8; 32]);
+        let mut k = KnownHosts::default();
+        k.pin(host, "Desk", [3u8; 32], paired);
+        let before = k.clone();
+        assert!(!k.coarsen(paired + PAIRED_AT_PRECISE_FOR - 1));
+        assert_eq!(k, before, "24 h - 1 s: as it was");
+        assert!(k.coarsen(paired + PAIRED_AT_PRECISE_FOR));
+        let rec = k.get(&host).unwrap();
+        assert_eq!((rec.paired_at, rec.last_seen), (day, day));
     }
 
     #[test]
