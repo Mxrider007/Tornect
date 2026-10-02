@@ -720,6 +720,9 @@ pub struct Prompt {
     pub remember: (RememberOffer, RememberOffer),
     /// A password is remembered for it: used unless one is typed.
     pub remembered: bool,
+    /// The password remembered for it was gone from the keychain when it was
+    /// to be sent: the prompt asks for it again and says why (I-9).
+    pub vanished: bool,
     /// The remembered password was refused last time and deleted.
     pub stale: bool,
     /// The saved record says the grant may carry the administrator level:

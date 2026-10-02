@@ -579,9 +579,17 @@ pub fn admin(
         anyhow::bail!("not sent");
     }
     let saved = ua_client::system_passwords(&device);
-    let password = match ua_client::recall(paths, &saved, &id)? {
-        Some(password) => password,
-        None => crate::unattended::read_password("Unattended password (not shown): ")?,
+    let password = match ua_client::recall_for_use(paths, &saved, &id)? {
+        ua_client::Recalled::Password(password) => password,
+        other => {
+            if matches!(other, ua_client::Recalled::Vanished) {
+                eprintln!(
+                    "the password remembered for this host is no longer in {}; type it",
+                    saved.keychain().unwrap_or("the keychain")
+                );
+            }
+            crate::unattended::read_password("Unattended password (not shown): ")?
+        }
     };
     if password.is_empty() {
         anyhow::bail!("no password typed; nothing was sent");
@@ -653,7 +661,7 @@ pub fn admin(
                         if action == AdminAction::RevokeThisDevice
                             && let Err(e) = ua_client::forget(paths, &saved, &id)
                         {
-                            eprintln!("the remembered password could not be deleted: {e:#}");
+                            eprintln!("{e}");
                         }
                         println!("ADMIN OK {}", action.name());
                         Ok(())
@@ -717,15 +725,21 @@ fn prepare_unattended(
     {
         anyhow::bail!("--remember: {why}");
     }
-    let password = match crate::ua_client::recall(paths, &saved, &id)? {
-        Some(password) => {
+    let password = match crate::ua_client::recall_for_use(paths, &saved, &id)? {
+        crate::ua_client::Recalled::Password(password) => {
             eprintln!(
                 "using the password remembered in {}",
                 saved.keychain().unwrap_or("the keychain")
             );
             password
         }
-        None => {
+        other => {
+            if matches!(other, crate::ua_client::Recalled::Vanished) {
+                eprintln!(
+                    "the password remembered for this host is no longer in {}; type it",
+                    saved.keychain().unwrap_or("the keychain")
+                );
+            }
             if record.stale {
                 eprintln!(
                     "the password remembered for this host was refused last time and deleted; \
@@ -784,7 +798,7 @@ pub fn connect(
         // Its remembered unattended password goes too (§B.8.9.1).
         let saved = crate::ua_client::system_passwords(&device);
         if let Err(e) = crate::ua_client::forget(paths, &saved, &id) {
-            eprintln!("the remembered unattended password could not be deleted: {e:#}");
+            eprintln!("{e}");
         }
     }
     // With history off the handshake works on a copy of the known hosts, so

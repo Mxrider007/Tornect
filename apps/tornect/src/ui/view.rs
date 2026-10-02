@@ -526,6 +526,18 @@ fn password_prompt(
                     .wrap(),
                 );
             }
+            if prompt.vanished {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "The password remembered here is no longer in {}: type it.",
+                            prompt.keychain.unwrap_or("the keychain")
+                        ))
+                        .color(t.warn),
+                    )
+                    .wrap(),
+                );
+            }
             if let Some(at) = prompt.retry_at.filter(|at| *at > now) {
                 let secs =
                     u32::try_from(at.saturating_duration_since(now).as_secs()).unwrap_or(u32::MAX);

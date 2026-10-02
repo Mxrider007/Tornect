@@ -136,36 +136,129 @@ pub fn recall(
     Ok(saved.recall(&file, host)?)
 }
 
-/// Forget `host`'s unattended record and delete its remembered password (Forget).
-pub fn forget(paths: &Paths, saved: &SavedPasswords, host: &TornectId) -> anyhow::Result<()> {
+/// What the keychain gave for an attempt about to be made ([`recall_for_use`]).
+pub enum Recalled {
+    /// The remembered password.
+    Password(Zeroizing<String>),
+    /// `hosts.toml` said a password was remembered and the keychain has none (a restart
+    /// empties the Linux kernel keyrings): the flag is cleared, the password must be typed.
+    Vanished,
+    /// No password is remembered.
+    Nothing,
+}
+
+/// The remembered password of `host` for the attempt about to be made; a flag whose
+/// keychain entry is gone is cleared on the way, so that no prompt announces a remembered
+/// password again (I-9). Without a usable keychain the flag stays as it is.
+pub fn recall_for_use(
+    paths: &Paths,
+    saved: &SavedPasswords,
+    host: &TornectId,
+) -> anyhow::Result<Recalled> {
+    if let Some(password) = recall(paths, saved, host)? {
+        return Ok(Recalled::Password(password));
+    }
     let _one = hosts_lock();
     let path = paths.hosts_file();
     let mut file = HostsFile::load(&path)?;
+    // Kept meanwhile by another attempt of this process: used, not cleared.
+    if let Some(password) = saved.recall(&file, host)? {
+        return Ok(Recalled::Password(password));
+    }
+    if saved.keychain().is_none() || !file.get(host).is_some_and(|r| r.remember) {
+        return Ok(Recalled::Nothing);
+    }
+    file.entry(host).remember = false;
+    file.save(&path)?;
+    Ok(Recalled::Vanished)
+}
+
+/// What [`forget`] could not do, so that nobody is told the password went when it did not
+/// (FR2-L1).
+#[derive(Debug)]
+pub enum Kept {
+    /// The keychain refused the delete: the remembered password may still be there.
+    Password(anyhow::Error),
+    /// `hosts.toml` could not be read or written: its record stayed (the password went).
+    Record(anyhow::Error),
+}
+
+impl std::fmt::Display for Kept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Password(e) => write!(f, "the remembered password could not be deleted: {e:#}"),
+            Self::Record(e) => write!(
+                f,
+                "the remembered password was deleted, but hosts.toml could not be updated: {e:#}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Kept {}
+
+/// Forget `host`'s unattended record and delete its remembered password (Forget). The
+/// keychain entry goes first, by its derived name, so that a `hosts.toml` that cannot be
+/// read never keeps the password (F4-L2).
+pub fn forget(paths: &Paths, saved: &SavedPasswords, host: &TornectId) -> Result<(), Kept> {
+    let _one = hosts_lock();
+    saved.erase(host).map_err(|e| Kept::Password(e.into()))?;
+    forget_record(&paths.hosts_file(), saved, host).map_err(Kept::Record)
+}
+
+/// `host`'s record in the `hosts.toml` at `path` goes (its flag first).
+fn forget_record(
+    path: &std::path::Path,
+    saved: &SavedPasswords,
+    host: &TornectId,
+) -> anyhow::Result<()> {
+    let mut file = HostsFile::load(path)?;
     saved.forget(&mut file, host)?;
     if file.remove(host) {
-        file.save(&path)?;
+        file.save(path)?;
     }
     Ok(())
 }
 
-/// Delete every remembered password of this home (Rotate ID); how many went.
+/// Delete every remembered password of this home (Rotate ID): the derived entry of every
+/// host in `hosts.toml` and `known-hosts.toml`, whatever its `remember` flag says (F4-5),
+/// then the flags; how many entries were there. A file that cannot be read is reported
+/// after the entries of the other one went.
 pub fn forget_all(paths: &Paths, saved: &SavedPasswords) -> anyhow::Result<usize> {
     let _one = hosts_lock();
     let path = paths.hosts_file();
-    let mut file = HostsFile::load(&path)?;
-    let hosts: Vec<TornectId> = file
-        .hosts
-        .iter()
-        .filter(|(_, r)| r.remember)
-        .filter_map(|(onion, _)| onion.parse().ok())
-        .collect();
-    for host in &hosts {
-        saved.forget(&mut file, host)?;
+    let file = HostsFile::load(&path);
+    let known =
+        tornect_core::trusted::KnownHosts::load(&tornect_core::trusted::known_hosts_file(paths));
+    let mut hosts: Vec<TornectId> = Vec::new();
+    if let Ok(file) = &file {
+        hosts.extend(
+            file.hosts
+                .keys()
+                .filter_map(|onion| onion.parse::<TornectId>().ok()),
+        );
     }
-    if !hosts.is_empty() {
+    if let Ok(known) = &known {
+        hosts.extend(known.hosts.keys().copied());
+    }
+    hosts.sort();
+    hosts.dedup();
+    let mut gone = 0;
+    for host in &hosts {
+        if saved.erase(host)? {
+            gone += 1;
+        }
+    }
+    let mut file = file?;
+    let mut changed = false;
+    for record in file.hosts.values_mut() {
+        changed |= std::mem::take(&mut record.remember);
+    }
+    if changed {
         file.save(&path)?;
     }
-    Ok(hosts.len())
+    known?;
+    Ok(gone)
 }
 
 /// What the person chose in the prompt, for one attempt.
@@ -522,9 +615,10 @@ pub fn log_attempt(paths: &Paths, known: &KnownHost, logged: &Logged<'_>) {
     }
 }
 
-/// Settle one attempt at `host`: a refused password stale and deleted, an accepted
-/// one kept when Remember was ticked and allowed (DA-14), `hosts.toml` saved when it
-/// changed. Returns whether a password is remembered for the host now.
+/// Settle one attempt at `host`: a refused password stale and deleted when it was the
+/// remembered one, an accepted one kept when Remember was ticked and allowed (DA-14),
+/// `hosts.toml` saved when it changed. Returns whether a password is remembered for the
+/// host now.
 pub fn settle(
     paths: &Paths,
     saved: &SavedPasswords,
@@ -535,10 +629,35 @@ pub fn settle(
     let _one = hosts_lock();
     let path = paths.hosts_file();
     let mut file = HostsFile::load(&path)?;
+    let had = file.get(host).is_some_and(|r| r.remember);
+    // A refusal says something only of the password that was sent: a typed one that is
+    // not the remembered one leaves the remembered one as it is (I-9).
+    let attempt = match attempt {
+        Attempt::PasswordRefused
+            if had
+                && !matches!(
+                    saved.recall(&file, host),
+                    Ok(Some(kept)) if *kept == *request.password
+                ) =>
+        {
+            Attempt::Inconclusive
+        }
+        other => other,
+    };
     let keep = request.remember.then_some(request.password.as_str());
     let settled = saved.settle(&mut file, host, attempt, keep)?;
-    if settled.changed {
-        file.save(&path)?;
+    if settled.changed
+        && let Err(e) = file.save(&path)
+    {
+        // An entry written now whose flag never reached the file would be used and
+        // deleted by nothing (F4-5): it goes again, and the failure is reported as before.
+        if settled.remembered
+            && !had
+            && let Err(gone) = saved.erase(host)
+        {
+            tracing::warn!(error = %gone, "the password just written could not be deleted");
+        }
+        return Err(e.into());
     }
     Ok(settled.remembered)
 }
@@ -888,6 +1007,147 @@ mod tests {
         assert!(lines[1].contains(r#""reason":"password_refused""#));
         assert!(!lines[1].contains("elevation"));
         assert!(lines[2].contains(r#""op":"revoke""#) && lines[2].contains(r#""ok":true"#));
+    }
+
+    /// A home with a test keychain (the `PasswordVault` seam).
+    fn with_vault() -> (
+        tempfile::TempDir,
+        Paths,
+        std::sync::Arc<tornect_core::unattended::credentials::MemoryVault>,
+        SavedPasswords,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let vault = std::sync::Arc::new(tornect_core::unattended::credentials::MemoryVault::new());
+        let saved = SavedPasswords::new(Some(vault.clone()), [1; 32]);
+        (tmp, paths, vault, saved)
+    }
+
+    fn host(n: u8) -> TornectId {
+        TornectId::from_bytes([n; 32])
+    }
+
+    fn typed(password: &str, remember: bool) -> Request {
+        Request {
+            password: Zeroizing::new(password.to_owned()),
+            view_only: false,
+            administrator: false,
+            remember,
+        }
+    }
+
+    const ACCEPTED: Attempt = Attempt::Accepted {
+        administrator: false,
+    };
+
+    /// F4-5: when `hosts.toml` cannot be saved after the password went into the
+    /// keychain, the entry goes again and the failure is reported as before.
+    #[test]
+    fn a_failed_save_leaves_no_password_behind() {
+        use tornect_core::unattended::credentials::PasswordVault as _;
+        let (_tmp, paths, vault, saved) = with_vault();
+        let h = host(3);
+        // The atomic save writes `hosts.toml.tmp` first: a directory there fails it.
+        let tmp_file = paths.hosts_file().with_extension("toml.tmp");
+        std::fs::create_dir_all(&tmp_file).unwrap();
+        assert!(settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true)).is_err());
+        assert!(vault.names().is_empty(), "{:?}", vault.names());
+        assert!(!record(&paths, &h).remember);
+        // Saved once the file can be written: kept, flagged.
+        std::fs::remove_dir(&tmp_file).unwrap();
+        assert!(settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true)).unwrap());
+        assert_eq!(vault.names().len(), 1);
+        assert!(vault.get(&saved.entry(&h)).unwrap().is_some());
+    }
+
+    /// F4-L2: Forget deletes the keychain entry before it reads `hosts.toml`, so a
+    /// file that cannot be read keeps no password.
+    #[test]
+    fn forget_deletes_the_password_when_the_file_cannot_be_read() {
+        let (_tmp, paths, vault, saved) = with_vault();
+        let h = host(4);
+        assert!(settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true)).unwrap());
+        std::fs::write(paths.hosts_file(), "not = [valid").unwrap();
+        assert!(
+            matches!(forget(&paths, &saved, &h), Err(Kept::Record(_))),
+            "the file's error is reported, and the password went"
+        );
+        assert!(vault.names().is_empty(), "{:?}", vault.names());
+    }
+
+    /// F4-5: Rotate ID deletes the derived entry of every host of `hosts.toml` and
+    /// `known-hosts.toml`, whatever its flag says, and clears the flags.
+    #[test]
+    fn rotate_id_deletes_every_hosts_password_whatever_its_flag() {
+        use tornect_core::unattended::credentials::PasswordVault as _;
+        let (_tmp, paths, vault, saved) = with_vault();
+        let (flagged, unflagged, paired) = (host(5), host(6), host(7));
+        assert!(settle(&paths, &saved, &flagged, ACCEPTED, &typed("a", true)).unwrap());
+        // A record without the flag whose entry is in the keychain (a save that failed
+        // before), and a paired host with no record at all.
+        note_mode(&paths, &unflagged, true).unwrap();
+        vault.put(&saved.entry(&unflagged), "b").unwrap();
+        vault.put(&saved.entry(&paired), "c").unwrap();
+        let mut known = tornect_core::trusted::KnownHosts::default();
+        known.pin(paired, "Desk", [9; 32], 1);
+        known
+            .save(&tornect_core::trusted::known_hosts_file(&paths))
+            .unwrap();
+        assert_eq!(forget_all(&paths, &saved).unwrap(), 3);
+        assert!(vault.names().is_empty(), "{:?}", vault.names());
+        assert!(!record(&paths, &flagged).remember);
+        assert_eq!(forget_all(&paths, &saved).unwrap(), 0, "nothing left");
+    }
+
+    /// I-9: a flag whose keychain entry is gone (a restart empties the kernel
+    /// keyrings) is cleared when the password is needed, and the password is asked
+    /// for; a flag with its entry gives the password; without a keychain the flag stays.
+    #[test]
+    fn a_remembered_password_that_vanished_is_asked_for_again() {
+        use tornect_core::unattended::credentials::PasswordVault as _;
+        let (_tmp, paths, vault, saved) = with_vault();
+        let h = host(8);
+        assert!(settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true)).unwrap());
+        assert!(matches!(
+            recall_for_use(&paths, &saved, &h).unwrap(),
+            Recalled::Password(p) if *p == "pw"
+        ));
+        let none = SavedPasswords::none([1; 32]);
+        assert!(matches!(
+            recall_for_use(&paths, &none, &h).unwrap(),
+            Recalled::Nothing
+        ));
+        assert!(record(&paths, &h).remember, "no keychain: the flag stays");
+        vault.delete(&saved.entry(&h)).unwrap();
+        assert!(matches!(
+            recall_for_use(&paths, &saved, &h).unwrap(),
+            Recalled::Vanished
+        ));
+        assert!(!record(&paths, &h).remember, "the flag went");
+        assert!(matches!(
+            recall_for_use(&paths, &saved, &h).unwrap(),
+            Recalled::Nothing
+        ));
+    }
+
+    /// I-9: a typed password the host refuses leaves the remembered one, its flag and
+    /// no stale mark; a refusal of the remembered password itself (typed again or
+    /// recalled) deletes it and marks it stale.
+    #[test]
+    fn only_a_refusal_of_the_remembered_password_deletes_it() {
+        let (_tmp, paths, vault, saved) = with_vault();
+        let h = host(9);
+        assert!(settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true)).unwrap());
+        let refused = Attempt::PasswordRefused;
+        assert!(settle(&paths, &saved, &h, refused, &typed("typo", false)).unwrap());
+        let r = record(&paths, &h);
+        assert!(r.remember && !r.stale);
+        assert_eq!(vault.names().len(), 1);
+        assert!(!settle(&paths, &saved, &h, refused, &typed("pw", false)).unwrap());
+        let r = record(&paths, &h);
+        assert!(!r.remember && r.stale);
+        assert!(vault.names().is_empty());
     }
 
     #[test]

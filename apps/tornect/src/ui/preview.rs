@@ -313,6 +313,7 @@ fn unattended(m: &mut Model, sheet: Sheet) -> bool {
                 kept: Some(tornect_core::unattended::credentials::KEYUTILS_KEPT),
                 remember: (RememberOffer::Offered, RememberOffer::NotForAdministrator),
                 remembered: false,
+                vanished: false,
                 stale: false,
                 may_admin: false,
                 retry_at: None,

@@ -922,6 +922,7 @@ mod tests {
             kept: None,
             remember: (RememberOffer::Offered, RememberOffer::NotForAdministrator),
             remembered: false,
+            vanished: false,
             stale: false,
             may_admin: false,
             retry_at: None,
@@ -1019,6 +1020,23 @@ mod tests {
         let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
         assert!(has_text(&window, "can read it from a test keychain."));
         assert!(!has_text(&window, "It stays on this account"));
+    }
+
+    /// I-9: when the password remembered for a computer was gone from the
+    /// keychain, the prompt comes back asking for it and says why.
+    #[test]
+    fn the_prompt_asks_again_for_a_password_that_vanished() {
+        let mut model = with_book(false);
+        let id = office(&model);
+        let mut again = prompt(id);
+        again.vanished = true;
+        model.prompt = Some(again);
+        let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(
+            &window,
+            "The password remembered here is no longer in a test keychain: type it."
+        ));
+        assert!(window.controls().iter().any(|c| c == "Password"));
     }
 
     /// §B.8.10: the prompt is never shown while this screen is shared: no
