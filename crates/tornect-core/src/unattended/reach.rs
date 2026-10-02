@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 use crate::id::DeviceId;
 use crate::levels::{AccountFacts, Elevation, HelperPresence, clause_ii};
 
-use super::grant::{AuthRecord, GrantState};
+use super::grant::{AuthRecord, GrantState, UnattendedGrant, UnattendedStore};
 use super::store::{GrantStore, StoreError, StoreStatus, WriteClass};
 
 /// SHA-256 of a grant's stored `auth` record as the store encodes it: what a session's
@@ -31,6 +31,55 @@ pub fn auth_digest(auth: &AuthRecord) -> [u8; 32] {
         bytes.clear();
     }
     Sha256::digest(bytes.as_slice()).into()
+}
+
+/// The three clauses of `grant_reach` for one grant (§B.8.4.1), read from the store.
+struct Clauses {
+    /// (i) the grant holds the level (never on Linux, where the level does not exist).
+    holds: bool,
+    /// (ii) control reaches the level through the host.
+    reach_through_host: bool,
+    /// (iii) the grant's password is marked "answered 0".
+    marked: bool,
+}
+
+impl Clauses {
+    fn of(
+        store: &UnattendedStore,
+        grant: &UnattendedGrant,
+        account: AccountFacts,
+        helper_task: HelperPresence,
+    ) -> Self {
+        let some_grant_holds_level = store.grants.iter().any(UnattendedGrant::holds_level);
+        Self {
+            holds: account != AccountFacts::Linux && grant.holds_level(),
+            reach_through_host: clause_ii(grant.mode, some_grant_holds_level, account, helper_task),
+            marked: grant.marked(),
+        }
+    }
+
+    /// 2 for (i) without (iii); else 1 for (ii), or (i) with (iii); else 0.
+    fn grant_reach(&self) -> u8 {
+        if self.holds && !self.marked {
+            2
+        } else if self.reach_through_host || self.holds {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+/// `grant_reach` of `grant` as `store` holds it, on `account` and `helper_task` (§B.8.4.1;
+/// decision M1-67): what every `ADMIN_RESULT` carries, from the requester's grant as
+/// loaded under the lock of the command. Always 0 on Linux.
+pub(crate) fn grant_reach_of(
+    store: &UnattendedStore,
+    grant: &UnattendedGrant,
+    account: AccountFacts,
+    helper_task: HelperPresence,
+) -> u8 {
+    Clauses::of(store, grant, account, helper_task).grant_reach()
 }
 
 /// Why the read refuses the request (B step 1, D11). Nothing is marked on any of them.
@@ -105,21 +154,11 @@ pub fn read_after_reservation(
     if !bool::from(subtle::ConstantTimeEq::ct_eq(&proven[..], &auth_digest[..])) {
         return Err(ReachRefusal::AuthReplaced);
     }
-    // Step 2: the mark, and whether some grant holds the level, whatever its state.
-    let marked = grant.marked();
-    let some_grant_holds_level = s.grants.iter().any(|g| g.holds_level());
-    // Step 3: the three clauses (§B.8.4.1). Linux: the level does not exist, always 0.
-    let linux = account == AccountFacts::Linux;
-    let holds = !linux && grant.holds_level();
-    let reach_through_host = clause_ii(grant.mode, some_grant_holds_level, account, helper_task);
-    let grant_reach = if holds && !marked {
-        2
-    } else if reach_through_host || holds {
-        1
-    } else {
-        0
-    };
-    let grant_level = if holds && !marked {
+    // Steps 2 and 3: the mark, whether some grant holds the level, the three clauses.
+    let clauses = Clauses::of(s, grant, account, helper_task);
+    let (marked, reach_through_host) = (clauses.marked, clauses.reach_through_host);
+    let grant_reach = clauses.grant_reach();
+    let grant_level = if clauses.holds && !marked {
         Elevation::Admin
     } else {
         Elevation::None

@@ -465,17 +465,6 @@ impl GrantStore {
         self.read(|s| s.last_seen_unix)
     }
 
-    /// The rollback reference of §B.8.5.3 for wall-clock checks outside the limiter:
-    /// the persisted `last_seen_unix` raised to every reading taken under the lock so
-    /// far (`0` without a store). A reading below it is a rollback.
-    pub(crate) fn last_seen_mark(&self) -> u64 {
-        let st = self.inner.state.lock();
-        st.store
-            .as_ref()
-            .map_or(0, |s| s.last_seen_unix)
-            .max(st.wall_hwm)
-    }
-
     /// Remaining running lock of a grant, in whole seconds (0 = none). Without a runtime
     /// entry (an offline load) the persisted picture is read back without being changed.
     #[must_use]

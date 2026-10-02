@@ -1277,6 +1277,7 @@ mod tests {
             store,
             Arc::new(AllowAllReAuth::default()),
             Arc::new(NoSessionActivity),
+            Arc::new(tornect_core::levels::FixedFacts::linux()),
         )
         .with_paired_devices(Arc::new(AllowAllPaired))
         .with_server_setup_source(Arc::new(
@@ -1570,6 +1571,238 @@ mod tests {
                             .map(String::as_str),
                         Some(PASSWORD),
                         "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// M1-67 (the approved test list: "the no password in any file test, re-run with an
+    /// admin-capable grant"): the window host on a Windows administrator account's facts,
+    /// the grant at the administrator level and not marked, a client with Remember ticked.
+    /// The answer says 2, the settle fed from it keeps nothing, and no file under the home
+    /// holds the password (UTF-8 or UTF-16) or the entry's name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_password_typed_for_an_admin_capable_grant_is_in_no_file() {
+        use tornect_core::levels::{AccountFacts, Elevation, FixedFacts, HelperPresence};
+        use tornect_core::unattended::credentials::{MemoryVault, SavedPasswords};
+
+        const PASSWORD: &str = "quiet verdant otter lantern zephyr";
+        let env = env();
+        let host_device_pk = HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32]));
+        let (identity, ccfg, mut cdeps) = client(&env);
+        let device = identity.id();
+        TrustedDeviceStore::open(env.paths.trusted_devices_file())
+            .unwrap()
+            .pin(device, "Laptop")
+            .unwrap();
+        cdeps
+            .known_hosts
+            .pin(env.identity.id(), "Desk", host_device_pk)
+            .unwrap();
+        grant_unattended(&env, &device, PASSWORD);
+        edit_grant_on_disk(&env.paths, &device, |g| {
+            g.elevation = Elevation::Admin;
+            g.unmarked = true;
+        });
+        cdeps.server_key_pin = Arc::new(crate::ua_client::HostsPin::new(&env.paths));
+        let mut wiring = wire(
+            &env.paths,
+            &Config::default(),
+            Arc::clone(&env.identity),
+            host_device_pk,
+            Arc::new(ScriptedConsent::new()),
+            media(),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        let store = wiring.ctx.as_ref().unwrap().guard.store().clone();
+        let windows = AccountFacts::Windows(tornect_core::levels::WindowsFacts {
+            installed: true,
+            administrator: true,
+            ..tornect_core::levels::WindowsFacts::default()
+        });
+        wiring.deps.unattended = Arc::new(UnattendedAuth::new(
+            AttemptLimiter::new(store),
+            Arc::new(FixedOffset::utc()),
+            HostTransport::default(),
+            Arc::new(FixedFacts::new(windows, HelperPresence::Absent)),
+        ));
+        let vault = Arc::new(MemoryVault::new());
+        let saved = SavedPasswords::new(Some(vault.clone()), *device.public_key_bytes());
+        let request = crate::ua_client::Request {
+            password: zeroize::Zeroizing::new(PASSWORD.to_owned()),
+            view_only: false,
+            administrator: false,
+            remember: true,
+        };
+        let (client_end, host_end) = duplex(64 * 1024);
+        let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+        let host_task =
+            tokio::spawn(async move { serve_signaling(host_end, &cfg, &deps, |_| {}).await });
+        let session = match connect(client_end, &ccfg, &identity, &cdeps, request.intent()).await {
+            Ok(ClientOutcome::Session(session)) => session,
+            other => panic!("the window host refused its grant: {other:?}"),
+        };
+        assert_eq!(session.accept().grant_reach(), Some(2));
+        let host = env.identity.id();
+        let settled = crate::ua_client::settle(
+            &env.paths,
+            &saved,
+            &host,
+            crate::ua_client::accepted(session.accept()),
+            &request,
+        )
+        .unwrap();
+        assert!(!settled.remembered);
+        drop(session);
+        let _ = host_task.await;
+        assert!(vault.names().is_empty());
+        let entry = saved.entry(&host);
+        let utf16: Vec<u8> = PASSWORD.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let needles = [
+            PASSWORD.as_bytes().to_vec(),
+            utf16,
+            entry.as_str().as_bytes().to_vec(),
+        ];
+        let mut files = 0;
+        let mut dirs = vec![env._tmp.path().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for item in std::fs::read_dir(&dir).unwrap() {
+                let path = item.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                let bytes = std::fs::read(&path).unwrap();
+                files += 1;
+                for needle in &needles {
+                    assert!(
+                        !bytes.windows(needle.len()).any(|w| w == needle.as_slice()),
+                        "{} holds a secret",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert!(
+            files >= 4,
+            "hosts.toml, the pins, the log and the store were read"
+        );
+    }
+
+    /// M1-67 A20 (d)(e) through a real host: the window host on a Windows administrator
+    /// account's facts, wired with its guard, and a client that remembered the password.
+    /// The grant at the level and not marked: a command run (`end_session`) and one the
+    /// guard refuses (`master_off`, out of a Headless box grant's scope) are both answered
+    /// 2, and the admin settle, fed from the verified answer as the window and the command
+    /// line feed it (`ua_client::settle_admin`), deletes the remembered password at the
+    /// first answer and writes none. A grant at none on a host without admin grants: both
+    /// answered 0, and the remembered password stays in place.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a20_d_e_real_admin_answers_decide_the_keep() {
+        use tornect_core::levels::{AccountFacts, Elevation, FixedFacts, HelperPresence};
+        use tornect_core::unattended::credentials::{
+            MemoryVault, PasswordVault as _, SavedPasswords,
+        };
+        use tornect_signal::fsm::client::{AdminIntent, admin};
+
+        const PASSWORD: &str = "quiet verdant otter lantern zephyr";
+        let windows = AccountFacts::Windows(tornect_core::levels::WindowsFacts {
+            installed: true,
+            administrator: true,
+            ..tornect_core::levels::WindowsFacts::default()
+        });
+        for at_the_level in [true, false] {
+            let env = env();
+            let host_device_pk = HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32]));
+            let (identity, ccfg, mut cdeps) = client(&env);
+            let device = identity.id();
+            TrustedDeviceStore::open(env.paths.trusted_devices_file())
+                .unwrap()
+                .pin(device, "Laptop")
+                .unwrap();
+            cdeps
+                .known_hosts
+                .pin(env.identity.id(), "Desk", host_device_pk)
+                .unwrap();
+            grant_unattended(&env, &device, PASSWORD);
+            if at_the_level {
+                edit_grant_on_disk(&env.paths, &device, |g| {
+                    g.elevation = Elevation::Admin;
+                    g.unmarked = true;
+                });
+            }
+            cdeps.server_key_pin = Arc::new(crate::ua_client::HostsPin::new(&env.paths));
+            let mut wiring = wire(
+                &env.paths,
+                &Config::default(),
+                Arc::clone(&env.identity),
+                host_device_pk,
+                Arc::new(ScriptedConsent::new()),
+                media(),
+                ControlChannel::default(),
+            )
+            .unwrap();
+            let guard = Arc::clone(&wiring.ctx.as_ref().unwrap().guard);
+            let windows_guard = Arc::new(
+                tornect_core::unattended::guard::MutationGuard::new(
+                    guard.store().clone(),
+                    Arc::new(tornect_core::unattended::guard::AllowAllReAuth::default()),
+                    Arc::new(tornect_core::unattended::guard::NoSessionActivity),
+                    Arc::new(FixedFacts::new(windows, HelperPresence::Absent)),
+                )
+                .with_paired_devices(Arc::new(tornect_core::unattended::guard::AllowAllPaired)),
+            );
+            wiring.deps.unattended = Arc::new(
+                UnattendedAuth::new(
+                    AttemptLimiter::new(guard.store().clone()),
+                    Arc::new(FixedOffset::utc()),
+                    HostTransport::default(),
+                    Arc::new(FixedFacts::new(windows, HelperPresence::Absent)),
+                )
+                .with_admin_authority(Arc::new(GuardAdmin::new(windows_guard))),
+            );
+            let vault = Arc::new(MemoryVault::new());
+            let saved = SavedPasswords::new(Some(vault.clone()), *device.public_key_bytes());
+            let host = env.identity.id();
+            vault.put(&saved.entry(&host), PASSWORD).unwrap();
+            for (op, ok) in [
+                (messages::admin_op::END_SESSION, true),
+                (messages::admin_op::MASTER_OFF, false),
+            ] {
+                let case = format!("op {op}, at the level: {at_the_level}");
+                let (client_end, host_end) = duplex(64 * 1024);
+                let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+                let host_task =
+                    tokio::spawn(
+                        async move { serve_signaling(host_end, &cfg, &deps, |_| {}).await },
+                    );
+                let answer = admin(
+                    client_end,
+                    &ccfg,
+                    &identity,
+                    &cdeps,
+                    &AdminIntent {
+                        password: zeroize::Zeroizing::new(PASSWORD.to_owned()),
+                        op,
+                        device_pk: None,
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{case}: {e}"));
+                let _ = host_task.await;
+                assert_eq!(answer.ok, ok, "{case}");
+                crate::ua_client::settle_admin(&env.paths, &saved, &host, &answer).unwrap();
+                if at_the_level {
+                    assert_eq!(answer.grant_reach, Some(2), "{case}");
+                    assert!(vault.names().is_empty(), "{case}: deleted");
+                } else {
+                    assert_eq!(answer.grant_reach, Some(0), "{case}");
+                    assert_eq!(
+                        vault.names(),
+                        vec![saved.entry(&host).as_str().to_owned()],
+                        "{case}: left in place"
                     );
                 }
             }
