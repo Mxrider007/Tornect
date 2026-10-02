@@ -468,6 +468,16 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
     let ipc = crate::host::start_control_channel(&b.paths, ctx, deps.kill.clone(), control)
         .await
         .map_err(|e| format!("{e:#}"))?;
+    // What the panic key says (pressed twice: unattended access off), in the
+    // window's recent activity.
+    if let Some(mut notes) = crate::host::panic_key_notes() {
+        let shared = Arc::clone(&b.shared);
+        tokio::spawn(async move {
+            while let Ok(line) = notes.recv().await {
+                shared.update(|m| m.note(line));
+            }
+        });
+    }
     Ok(Hosted {
         serving: Arc::new((cfg, deps)),
         media,

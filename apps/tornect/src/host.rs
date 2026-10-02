@@ -178,6 +178,15 @@ pub async fn start_control_channel(
     kill: KillSwitch,
     control: ControlChannel,
 ) -> anyhow::Result<Option<JoinHandle<()>>> {
+    // The panic key, the other kill path that never runs on the UI thread
+    // (D10); never in this crate's tests, which must not reach the desktop.
+    if !cfg!(test) {
+        start_panic_key(
+            paths,
+            kill.clone(),
+            ctx.as_ref().ok().map(|c| Arc::clone(&c.guard)),
+        );
+    }
     let endpoint = match Endpoint::bind(&paths.state_dir).await {
         Ok(endpoint) => endpoint,
         Err(e @ IpcError::AlreadyRunning(_)) => {
@@ -211,6 +220,140 @@ pub async fn start_control_channel(
             );
         }
     })))
+}
+
+/// Within how long a second press of the panic key also turns unattended
+/// access off (§B.8.7.4).
+pub const PANIC_TWICE_WITHIN: Duration = Duration::from_secs(2);
+
+/// What a second press within [`PANIC_TWICE_WITHIN`] says (the toast).
+pub const PANIC_TWICE_NOTE: &str = "Unattended access is off: the panic key was pressed twice. \
+     Turn it on again with `tornect unattended on`.";
+
+/// The panic key's presses (§B.8.7.4), told off the UI thread by
+/// `tornect_platform::hotkey`: each ends every handshake and session this host
+/// serves, the host-wide kill with the PANIC reason, as `tornect panic` does,
+/// and always first; a second press within [`PANIC_TWICE_WITHIN`] then also
+/// turns unattended access off, persisted (the guard's `master_off`), and says
+/// so. Suspending the grant behind an unattended session is not done here, as
+/// `tornect panic` does not.
+pub struct PanicPresses {
+    kill: KillSwitch,
+    guard: Option<Arc<tornect_core::unattended::guard::MutationGuard>>,
+    last: std::sync::Mutex<Option<std::time::Instant>>,
+    notes: tokio::sync::broadcast::Sender<String>,
+}
+
+impl fmt::Debug for PanicPresses {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PanicPresses").finish_non_exhaustive()
+    }
+}
+
+impl PanicPresses {
+    /// Presses that end what `kill` reaches and, twice, turn `guard`'s
+    /// unattended access off (`None`: a host without its store, where there is
+    /// nothing to turn off).
+    #[must_use]
+    pub fn new(
+        kill: KillSwitch,
+        guard: Option<Arc<tornect_core::unattended::guard::MutationGuard>>,
+    ) -> Self {
+        Self {
+            kill,
+            guard,
+            last: std::sync::Mutex::new(None),
+            notes: tokio::sync::broadcast::channel(4).0,
+        }
+    }
+
+    /// What a press says to the window (the terminal gets it on stderr).
+    #[must_use]
+    pub fn notes(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.notes.subscribe()
+    }
+
+    /// One press at `now`; whether it was the second within
+    /// [`PANIC_TWICE_WITHIN`].
+    pub fn press(&self, now: std::time::Instant) -> bool {
+        // The host-wide kill first, before anything that writes the store.
+        self.kill.kill(bye::PANIC);
+        let twice = {
+            let mut last = self
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let twice =
+                last.is_some_and(|at| now.saturating_duration_since(at) <= PANIC_TWICE_WITHIN);
+            *last = if twice { None } else { Some(now) };
+            twice
+        };
+        if twice {
+            let line = match &self.guard {
+                Some(guard) => match guard.master_off(tornect_core::session_log::Actor::Ui) {
+                    Ok(()) => PANIC_TWICE_NOTE.to_owned(),
+                    Err(e) => format!(
+                        "The panic key was pressed twice, but unattended access could not be \
+                         turned off: {e}"
+                    ),
+                },
+                None => "The panic key was pressed twice; this host has no unattended store, so \
+                         there is no unattended access to turn off."
+                    .to_owned(),
+            };
+            note(format_args!("{line}"));
+            let _ = self.notes.send(line);
+        }
+        twice
+    }
+
+    /// The callback the platform's watcher calls, on its own thread.
+    #[must_use]
+    pub fn pressed(self: &Arc<Self>) -> tornect_platform::hotkey::Pressed {
+        let presses = Arc::clone(self);
+        Arc::new(move || {
+            presses.press(std::time::Instant::now());
+        })
+    }
+}
+
+/// This process's panic key, once a host has started it.
+static PANIC_KEY: std::sync::OnceLock<Arc<PanicPresses>> = std::sync::OnceLock::new();
+
+/// What the panic key says, for the window: `None` until a host started it.
+#[must_use]
+pub fn panic_key_notes() -> Option<tokio::sync::broadcast::Receiver<String>> {
+    PANIC_KEY.get().map(|presses| presses.notes())
+}
+
+/// Start the panic key of `cfg` (`security.panic_key`) for the host whose kill
+/// switch is `kill` and whose guard (if its store opened) is `guard`: bound
+/// off the UI thread by `tornect_platform::hotkey`, once per process. A chord
+/// that cannot be read leaves the key unbound (its readiness row says so).
+fn start_panic_key(
+    paths: &Paths,
+    kill: KillSwitch,
+    guard: Option<Arc<tornect_core::unattended::guard::MutationGuard>>,
+) {
+    let presses = Arc::new(PanicPresses::new(kill, guard));
+    if PANIC_KEY.set(Arc::clone(&presses)).is_err() {
+        return;
+    }
+    let text = Config::load(&paths.config_file())
+        .map(|cfg| cfg.security.panic_key)
+        .unwrap_or_else(|_| tornect_core::config::Security::default().panic_key);
+    let chord = match tornect_platform::hotkey::Chord::parse(&text) {
+        Ok(chord) => chord,
+        Err(why) => {
+            eprintln!("warning: the panic key is not bound: {why}");
+            return;
+        }
+    };
+    let pressed = presses.pressed();
+    tokio::spawn(async move {
+        let state = tornect_platform::hotkey::bind(chord, pressed).await;
+        tracing::info!(row = state.row(), "panic key");
+    });
 }
 
 /// Everything `tornect host` serves its signaling streams with.
@@ -2591,5 +2734,129 @@ mod tests {
                 "{terminal} {opted_in}"
             );
         }
+    }
+
+    /// §B.8.7.4, A9 (the in-process half; the hook and the portal are
+    /// NEEDS-DEVICE): a press of the panic key, told on a thread of the key's
+    /// own as the platform's watcher tells it, ends a live session within
+    /// 100 ms with `BYE{PANIC}`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panic_from_the_key_path_ends_sessions_within_100_ms() {
+        let env = env();
+        let consent = Arc::new(ScriptedConsent::new());
+        consent.push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+        consent.push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+        let wiring = wire(
+            &env.paths,
+            &Config::default(),
+            Arc::clone(&env.identity),
+            HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32])),
+            consent,
+            media(),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        let (client_end, host_end) = duplex(64 * 1024);
+        let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+        let host_task =
+            tokio::spawn(async move { serve_signaling(host_end, &cfg, &deps, |_| {}).await });
+        let (identity, ccfg, cdeps) = client(&env);
+        let mut session = match connect(client_end, &ccfg, &identity, &cdeps, Intent::Session)
+            .await
+            .unwrap()
+        {
+            ClientOutcome::Session(s) => s,
+            other => panic!("expected a session, got {other:?}"),
+        };
+        session.send_tor_fallback().await.unwrap();
+        session.ping().await.unwrap();
+        assert_eq!(wiring.live.count(), 1);
+
+        let presses = Arc::new(PanicPresses::new(wiring.deps.kill.clone(), None));
+        let pressed = presses.pressed();
+        let at = std::time::Instant::now();
+        std::thread::spawn(move || pressed());
+        let event = session
+            .next_event(Duration::from_millis(100))
+            .await
+            .expect("the session ended within 100 ms");
+        assert_eq!(
+            event,
+            Some(tornect_signal::fsm::client::SessionEvent::Bye {
+                reason: bye::PANIC,
+                detail: None
+            })
+        );
+        assert!(
+            at.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            at.elapsed()
+        );
+        assert_eq!(host_task.await.unwrap(), Served::Session);
+        assert_eq!(wiring.live.count(), 0);
+    }
+
+    /// §B.8.7.4: each press ends what the host serves, the kill first; a second
+    /// press within 2 s also turns unattended access off, persisted, and says
+    /// so; two presses further apart do not, and neither does a third press
+    /// right after the pair (it starts a new pair).
+    #[test]
+    fn the_panic_key_pressed_twice_within_2_s_turns_unattended_access_off() {
+        use tornect_core::keystore::FileSecretStore;
+        use tornect_core::session_log::{Actor, SessionLog};
+        use tornect_core::unattended::clock::SystemClock;
+        use tornect_core::unattended::guard::{AllowAllReAuth, MutationGuard, NoSessionActivity};
+        use tornect_core::unattended::store::GrantStore;
+
+        let env = env();
+        let secrets = Arc::new(FileSecretStore::open(env.paths.keys_dir()).unwrap());
+        let store = GrantStore::open(
+            &env.paths,
+            secrets,
+            Arc::new(SystemClock::default()),
+            SessionLog::new(env.paths.sessions_log()),
+        )
+        .unwrap();
+        let guard = Arc::new(
+            MutationGuard::new(
+                store,
+                Arc::new(AllowAllReAuth::default()),
+                Arc::new(NoSessionActivity),
+                Arc::new(tornect_core::levels::FixedFacts::linux()),
+            )
+            .with_server_setup_source(Arc::new(
+                tornect_signal::unattended::OpaqueServerSetupSource,
+            )),
+        );
+        let on = |guard: &MutationGuard| {
+            guard
+                .master_on(Actor::Cli, env.identity.id().public_key_bytes())
+                .unwrap();
+        };
+        let enabled = |guard: &MutationGuard| guard.store().read(|s| s.enabled).unwrap();
+        on(&guard);
+        let kill = KillSwitch::new();
+        let presses = PanicPresses::new(kill.clone(), Some(Arc::clone(&guard)));
+        let mut notes = presses.notes();
+        let t0 = std::time::Instant::now();
+
+        // Apart by more than 2 s: two single presses.
+        let session = kill.arm();
+        assert!(!presses.press(t0));
+        assert_eq!(kill.fired(), Some(bye::PANIC), "the kill comes first");
+        assert!(session.fired());
+        assert!(!presses.press(t0 + Duration::from_millis(2_001)));
+        assert!(enabled(&guard), "presses 2.001 s apart leave it on");
+        assert!(notes.try_recv().is_err());
+
+        // Within 2 s: off, persisted, and said.
+        assert!(presses.press(t0 + Duration::from_millis(3_000)));
+        assert!(!enabled(&guard));
+        assert_eq!(notes.try_recv().unwrap(), PANIC_TWICE_NOTE);
+
+        // A third press right after the pair starts a new pair.
+        on(&guard);
+        assert!(!presses.press(t0 + Duration::from_millis(3_500)));
+        assert!(enabled(&guard));
     }
 }

@@ -28,6 +28,8 @@ zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus.workspace = true
+# The panic key's GlobalShortcuts portal (§B.8.7.4).
+ashpd.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

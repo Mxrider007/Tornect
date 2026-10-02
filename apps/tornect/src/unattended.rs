@@ -64,6 +64,7 @@ impl HostContext {
     pub fn readiness_now(&self) -> ReadinessSnapshot {
         let mut snap = self.readiness.clone();
         snap.autostart = autostart::readiness_probe(&self.autostart.status());
+        snap.panic_key = panic_key_probe(tornect_platform::hotkey::state());
         snap
     }
 
@@ -1749,6 +1750,21 @@ pub fn devices(paths: &Paths, json: bool) -> anyhow::Result<()> {
         }
         Ok(())
     })
+}
+
+/// The readiness row of the panic key (§B.8.7.4, "Panic key: bound /
+/// unavailable"): ok where this process watches it; otherwise a red row (a
+/// badge, never `HOST_NOT_READY`, §B.8.14). A process that is no host never
+/// binds it.
+fn panic_key_probe(
+    state: tornect_platform::hotkey::KeyState,
+) -> tornect_core::unattended::readiness::Probe {
+    use tornect_core::unattended::readiness::Probe as Row;
+    use tornect_platform::hotkey::KeyState;
+    match state {
+        KeyState::Bound => Row::Ok,
+        KeyState::NotTried | KeyState::Unavailable => Row::Fail(state.row().to_owned()),
+    }
 }
 
 /// `tornect panic`

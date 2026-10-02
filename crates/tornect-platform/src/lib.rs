@@ -1,6 +1,6 @@
 //! OS session services for Tornect (`docs/PLAN.md` §B.8.8).
 //!
-//! Eight modules so far:
+//! Nine modules so far:
 //!
 //! - [`ipc`] — the owner-only local endpoint of §B.8.7.4 (Unix socket / Windows
 //!   named pipe) that the CLI talks to and the host serves.
@@ -25,9 +25,11 @@
 //! - `notify` — Linux: a desktop notification with one action over the session
 //!   D-Bus, the block window's best effort where no window can stay on top
 //!   (§B.8.6.3).
+//! - [`hotkey`] — the panic key (§B.8.7.4), off the UI thread: Windows' low-level
+//!   keyboard hook, the GlobalShortcuts portal on Linux.
 //!
 //! Everything else in §B.8.8 — presence, lock state, keep-awake, wake hooks,
-//! global hotkeys, capture-excluded windows and the other readiness probes —
+//! capture-excluded windows and the other readiness probes —
 //! lands at M6. This crate deliberately holds no stubs for them: an absent
 //! module is honest, a stub that answers `Ok` is not.
 //!
@@ -46,6 +48,7 @@
 pub mod autostart;
 pub mod helper;
 pub mod helper_task;
+pub mod hotkey;
 pub mod ipc;
 pub mod levels;
 #[cfg(target_os = "linux")]
