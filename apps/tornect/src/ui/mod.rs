@@ -213,10 +213,17 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
                 .context("starting the preview's test card")?;
         }
         drop(commands_rx);
+        let first = shared.read(|m| m.book.computers.first().map(|c| c.id));
         let mut app = App::new(shared, popups, link, commands);
         app.theme = opts.theme;
         if let Some(page) = opts.page {
             app.open_page(page);
+        }
+        if let Some(sheet) = opts.sheet {
+            preview::form(app.form_mut(), sheet, first);
+            if let Some(height) = preview::height(sheet) {
+                app.height = height;
+            }
         }
         app.stream_at = Some((1210, 0));
         let ran = event_loop.run_app(&mut app);

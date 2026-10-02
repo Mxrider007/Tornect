@@ -377,6 +377,12 @@ enum SheetArg {
     UaRefused,
     /// The connect stepper: an unattended session live.
     UaLive,
+    /// History off: Home's first-run line, and the Recent tab.
+    HistoryOff,
+    /// Forget's confirmation on the first saved computer.
+    ForgetAsk,
+    /// The Unlock confirmation with the typed device's words.
+    UaUnlock,
 }
 
 impl From<SheetArg> for ui::preview::Sheet {
@@ -407,6 +413,9 @@ impl From<SheetArg> for ui::preview::Sheet {
             SheetArg::UaPrompt => Self::UaPrompt,
             SheetArg::UaRefused => Self::UaRefused,
             SheetArg::UaLive => Self::UaLive,
+            SheetArg::HistoryOff => Self::HistoryOff,
+            SheetArg::ForgetAsk => Self::ForgetAsk,
+            SheetArg::UaUnlock => Self::UaUnlock,
         }
     }
 }

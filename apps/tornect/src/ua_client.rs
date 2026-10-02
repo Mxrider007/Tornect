@@ -750,7 +750,8 @@ impl AdminAction {
                  asking until the owner turns it on again at \"{host}\"."
             ),
             Self::Unlock => format!(
-                "Unlock your other device at \"{host}\"? Its wrong-password lock is reset there."
+                "Unlock your other device at \"{host}\"? Its wrong-password lock is reset there, \
+                 and a suspension set from another of your devices is lifted."
             ),
         }
     }
@@ -1148,6 +1149,17 @@ mod tests {
         let r = record(&paths, &h);
         assert!(!r.remember && r.stale);
         assert!(vault.names().is_empty());
+    }
+
+    /// F4-4: the Unlock confirmation says that the other device's lock is
+    /// reset and that a suspension set from another of your devices is lifted.
+    #[test]
+    fn the_unlock_confirmation_says_what_it_does() {
+        assert_eq!(
+            AdminAction::Unlock.confirmation("Desk"),
+            "Unlock your other device at \"Desk\"? Its wrong-password lock is reset there, and \
+             a suspension set from another of your devices is lifted."
+        );
     }
 
     #[test]

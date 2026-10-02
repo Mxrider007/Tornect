@@ -91,6 +91,18 @@ impl Recognizer {
         &self.known
     }
 
+    /// The device words of the device key `key`, the derivation every card
+    /// uses (§B.6.1): the Unlock confirmation shows them for a typed device
+    /// ID, to compare with that device's own screen (F4-4). A key nobody
+    /// saved is derived through the pacer.
+    #[must_use]
+    pub fn device_words(&self, key: &[u8; 32]) -> Words {
+        self.known
+            .cached(key, Role::Device)
+            .unwrap_or_else(|| self.pacer.derive(key, Role::Device))
+            .words()
+    }
+
     /// This computer's two word sets: its device key's and its address's.
     #[must_use]
     pub fn mine(&self) -> Option<MyWords> {
@@ -971,5 +983,15 @@ mod tests {
         assert!(words.paired_recently(&device(0x41), 1000 + 24 * 3600 - 1));
         assert!(!words.paired_recently(&device(0x41), 1000 + 24 * 3600));
         assert!(!words.paired_recently(&device(0x77), 1000 + 60));
+    }
+
+    /// F4-4: the words the Unlock confirmation shows for a typed device ID
+    /// are that device key's words as every card derives them (§B.6.1).
+    #[test]
+    fn device_words_are_the_cards_words() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, words) = home(tmp.path());
+        let key = *device(0x5a).public_key_bytes();
+        assert_eq!(words.device_words(&key), derive(&key, Role::Device).words());
     }
 }
