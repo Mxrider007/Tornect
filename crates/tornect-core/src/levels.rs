@@ -244,6 +244,15 @@ pub const SENTENCE_ALWAYS_ADMINISTRATOR: &str = "Windows runs every program on t
 pub const SENTENCE_ALWAYS_ADMINISTRATOR_STANDALONE: &str = "Windows runs every program on this \
     account as administrator, so control always includes administrator access. Administrator \
     access needs Tornect installed on this computer.";
+/// Under the buttons: a standalone copy on an administrator account set to
+/// elevate without prompting (`ConsentPromptBehaviorAdmin` 0), where control
+/// is administrator access in effect — why plain Allow is absent, then the
+/// standalone sentence. The first sentence of
+/// [`SENTENCE_ALWAYS_ADMINISTRATOR_STANDALONE`] would be untrue there: such
+/// an account runs its programs filtered until one asks to elevate.
+pub const SENTENCE_ADMIN_WITHOUT_PROMPT_STANDALONE: &str = "Windows lets any program on this \
+    account become administrator without a prompt, so control always includes administrator \
+    access. Administrator access needs Tornect installed on this computer.";
 /// Under the buttons: policy denies elevation to a standard account.
 pub const SENTENCE_POLICY_DENIES: &str =
     "This computer's policy does not let administrator access be given here.";
@@ -330,6 +339,30 @@ impl WindowsFacts {
     fn admin_approval_for_builtin(&self) -> bool {
         self.filter_administrator_token.unwrap_or(0) != 0
     }
+
+    /// Every program on this account runs as administrator: UAC off on an
+    /// administrator account, or the built-in Administrator without Admin
+    /// Approval Mode.
+    fn every_program_is_administrator(&self) -> bool {
+        self.administrator
+            && (!self.uac_on()
+                || (self.builtin_administrator && !self.admin_approval_for_builtin()))
+    }
+
+    /// Whether control on this account is administrator access in effect
+    /// (the operator's ruling of 2026-09-29): every program runs as
+    /// administrator (UAC off on an administrator account, or the built-in
+    /// Administrator without Admin Approval Mode), or the account is an
+    /// administrator set to elevate without prompting
+    /// (`ConsentPromptBehaviorAdmin` 0), where any program can become
+    /// administrator without a prompt. Read from these facts alone, before
+    /// the installed and standalone forms split ([`Availability::of`]), so
+    /// that neither form offers plain Allow on them.
+    #[must_use]
+    pub fn control_is_administrator(&self) -> bool {
+        self.every_program_is_administrator()
+            || (self.administrator && self.consent_prompt_behavior_admin == Some(0))
+    }
 }
 
 /// The row of the §B.2.1 table this host is in: the answers its sheet
@@ -372,16 +405,18 @@ impl Availability {
     /// `None` on every other system (the Linux row).
     ///
     /// The rows are tested in this order, the first that holds wins:
-    /// started elevated with UAC on (refuse); every program runs as
-    /// administrator (UAC off on an administrator account, or the built-in
-    /// Administrator without Admin Approval Mode) — where a standalone copy
-    /// offers View only alone, because control there is administrator
-    /// access and administrator access needs Tornect installed; standalone;
-    /// a standard account whose policy denies elevation (or UAC off);
-    /// an administrator account set to elevate without prompting — View
-    /// only and the administrator answer with the Tornect confirmation, no
-    /// plain Allow, because control there is administrator access in effect;
-    /// installed.
+    /// started elevated with UAC on (refuse); control is administrator
+    /// access in effect ([`WindowsFacts::control_is_administrator`], decided
+    /// before the forms split), where no form offers plain Allow — a
+    /// standalone copy offers View only alone, because administrator access
+    /// needs Tornect installed, and its sentence says why; installed, where
+    /// every program runs as administrator (UAC off on an administrator
+    /// account, or the built-in Administrator without Admin Approval Mode),
+    /// View only and the administrator answer with the Tornect confirmation;
+    /// installed, on an administrator account set to elevate without
+    /// prompting, the same answers, the administrator one taking the helper;
+    /// standalone; a standard account whose policy denies elevation (or UAC
+    /// off); installed.
     #[must_use]
     pub fn of(windows: Option<&WindowsFacts>) -> Self {
         let Some(f) = windows else {
@@ -403,9 +438,8 @@ impl Availability {
                 prompts_on_shared_screen: shared,
             };
         }
-        let always_admin = f.administrator
-            && (!uac || (f.builtin_administrator && !f.admin_approval_for_builtin()));
-        if always_admin {
+        if f.control_is_administrator() {
+            let every_program = f.every_program_is_administrator();
             if !f.installed {
                 return row(
                     HostRow::WindowsStandalone,
@@ -414,19 +448,34 @@ impl Availability {
                         allow: false,
                         admin: None,
                     },
-                    SENTENCE_ALWAYS_ADMINISTRATOR_STANDALONE,
+                    if every_program {
+                        SENTENCE_ALWAYS_ADMINISTRATOR_STANDALONE
+                    } else {
+                        SENTENCE_ADMIN_WITHOUT_PROMPT_STANDALONE
+                    },
+                );
+            }
+            if every_program {
+                return row(
+                    HostRow::WindowsAlwaysAdministrator,
+                    Answers {
+                        view_only: true,
+                        allow: false,
+                        admin: Some(AdminPath::TornectConfirmation {
+                            needs_helper: false,
+                        }),
+                    },
+                    SENTENCE_ALWAYS_ADMINISTRATOR,
                 );
             }
             return row(
-                HostRow::WindowsAlwaysAdministrator,
+                HostRow::WindowsAdminWithoutPrompt,
                 Answers {
                     view_only: true,
                     allow: false,
-                    admin: Some(AdminPath::TornectConfirmation {
-                        needs_helper: false,
-                    }),
+                    admin: Some(AdminPath::TornectConfirmation { needs_helper: true }),
                 },
-                SENTENCE_ALWAYS_ADMINISTRATOR,
+                ADMIN_LINE_NO_PROMPT,
             );
         }
         let plain = Answers {
@@ -439,17 +488,6 @@ impl Availability {
         }
         if !f.administrator && (!uac || f.consent_prompt_behavior_user == Some(0)) {
             return row(HostRow::WindowsPolicyDenies, plain, SENTENCE_POLICY_DENIES);
-        }
-        if f.administrator && f.consent_prompt_behavior_admin == Some(0) {
-            return row(
-                HostRow::WindowsAdminWithoutPrompt,
-                Answers {
-                    view_only: true,
-                    allow: false,
-                    admin: Some(AdminPath::TornectConfirmation { needs_helper: true }),
-                },
-                ADMIN_LINE_NO_PROMPT,
-            );
         }
         Self {
             row: HostRow::WindowsInstalled,
@@ -987,5 +1025,166 @@ mod tests {
             "control there is administrator access"
         );
         assert!(!Answers::NONE.offers(Level::VIEW_ONLY));
+    }
+
+    /// DA-16 (RP-3): a standalone copy on an administrator account set to
+    /// elevate without prompting offers View only alone, as the
+    /// always-administrator standalone row does, and says why; a standard
+    /// account with the same setting keeps plain Allow (the setting applies
+    /// to administrators only).
+    #[test]
+    fn the_standalone_no_prompt_row_offers_no_plain_allow() {
+        let view_only_alone = Answers {
+            view_only: true,
+            allow: false,
+            admin: None,
+        };
+        let no_prompt = WindowsFacts {
+            installed: false,
+            administrator: true,
+            consent_prompt_behavior_admin: Some(0),
+            ..WindowsFacts::default()
+        };
+        for f in [
+            no_prompt,
+            // The built-in Administrator under Admin Approval Mode: filtered,
+            // so this setting is what makes control administrator access.
+            WindowsFacts {
+                builtin_administrator: true,
+                filter_administrator_token: Some(1),
+                ..no_prompt
+            },
+        ] {
+            let a = Availability::of(Some(&f));
+            assert_eq!(a.row, HostRow::WindowsStandalone, "{f:?}");
+            assert_eq!(a.answers, view_only_alone, "{f:?}");
+            assert_eq!(a.offered(), view_only_alone, "{f:?}");
+            assert!(!a.offered().offers(Level::CONTROL), "{f:?}");
+            assert!(!a.offered().offers(Level::ADMIN), "{f:?}");
+            assert!(a.offered().offers(Level::VIEW_ONLY), "{f:?}");
+            assert_eq!(
+                a.sentence,
+                Some(SENTENCE_ADMIN_WITHOUT_PROMPT_STANDALONE),
+                "{f:?}"
+            );
+            assert_eq!(
+                a.offered_sentence(),
+                Some(SENTENCE_ADMIN_WITHOUT_PROMPT_STANDALONE),
+                "{f:?}"
+            );
+            assert!(!a.missing_helper(), "{f:?}");
+            assert!(a.serves(), "{f:?}");
+        }
+        assert!(SENTENCE_ADMIN_WITHOUT_PROMPT_STANDALONE.ends_with(SENTENCE_STANDALONE));
+
+        let standard = Availability::of(Some(&WindowsFacts {
+            administrator: false,
+            ..no_prompt
+        }));
+        assert_eq!(standard.row, HostRow::WindowsStandalone);
+        assert!(standard.offered().offers(Level::CONTROL));
+        assert_eq!(standard.sentence, Some(SENTENCE_STANDALONE));
+    }
+
+    /// One predicate, read before the forms split: for each of its three
+    /// facts (UAC off, the built-in Administrator without Admin Approval
+    /// Mode, elevation without prompting) neither form offers plain Allow;
+    /// the standalone form gives the same answers for all three (View only
+    /// alone) and the installed form the same levels for all three (View
+    /// only and administrator). Over every combination of the facts, plain
+    /// Allow is offered exactly where the predicate is false.
+    #[test]
+    fn control_is_administrator_answers_alike_on_both_forms() {
+        let admin = WindowsFacts {
+            administrator: true,
+            ..WindowsFacts::default()
+        };
+        let three = [
+            WindowsFacts {
+                enable_lua: Some(0),
+                ..admin
+            },
+            WindowsFacts {
+                builtin_administrator: true,
+                ..admin
+            },
+            WindowsFacts {
+                consent_prompt_behavior_admin: Some(0),
+                ..admin
+            },
+        ];
+        let levels = |a: &Answers| {
+            [Level::VIEW_ONLY, Level::CONTROL, Level::ADMIN].map(|level| a.offers(level))
+        };
+        for installed in [false, true] {
+            let answers: Vec<Availability> = three
+                .iter()
+                .map(|f| {
+                    let f = WindowsFacts { installed, ..*f };
+                    assert!(f.control_is_administrator(), "{f:?}");
+                    Availability::of(Some(&f))
+                })
+                .collect();
+            for a in &answers {
+                assert!(!a.answers.allow && !a.offered().allow, "{installed} {a:?}");
+                assert!(a.answers.view_only, "{installed} {a:?}");
+                assert_eq!(
+                    levels(&a.answers),
+                    levels(&answers[0].answers),
+                    "{installed} {a:?}"
+                );
+                if !installed {
+                    assert_eq!(a.row, HostRow::WindowsStandalone);
+                    assert_eq!(a.answers, answers[0].answers, "{a:?}");
+                }
+            }
+            assert_eq!(
+                levels(&answers[0].answers),
+                [true, false, installed],
+                "{installed}"
+            );
+        }
+
+        let mut seen = [0_usize; 2];
+        for installed in [false, true] {
+            for administrator in [false, true] {
+                for builtin_administrator in [false, true] {
+                    for enable_lua in [None, Some(0), Some(1)] {
+                        for filter_administrator_token in [None, Some(0), Some(1)] {
+                            for consent_prompt_behavior_admin in [None, Some(0), Some(5)] {
+                                for consent_prompt_behavior_user in [None, Some(0), Some(3)] {
+                                    let f = WindowsFacts {
+                                        installed,
+                                        enable_lua,
+                                        filter_administrator_token,
+                                        consent_prompt_behavior_user,
+                                        consent_prompt_behavior_admin,
+                                        administrator,
+                                        builtin_administrator,
+                                        ..WindowsFacts::default()
+                                    };
+                                    let a = Availability::of(Some(&f));
+                                    let control_is_admin = f.control_is_administrator();
+                                    assert_eq!(
+                                        f.control_is_administrator(),
+                                        WindowsFacts {
+                                            installed: !installed,
+                                            ..f
+                                        }
+                                        .control_is_administrator(),
+                                        "{f:?}"
+                                    );
+                                    assert_eq!(a.answers.allow, !control_is_admin, "{f:?}");
+                                    assert_eq!(a.offered().allow, !control_is_admin, "{f:?}");
+                                    assert!(a.serves() && a.answers.view_only, "{f:?}");
+                                    seen[usize::from(control_is_admin)] += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(seen[0] > 0 && seen[1] > 0, "{seen:?}");
     }
 }

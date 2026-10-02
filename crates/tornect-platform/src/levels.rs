@@ -315,6 +315,49 @@ mod tests {
         assert!(!secure.prompts_on_shared_screen);
     }
 
+    /// DA-16 (RP-3) through the fake registry: a standalone copy on an
+    /// administrator account set to elevate without prompting
+    /// (`ConsentPromptBehaviorAdmin` 0, alone or among Windows' defaults)
+    /// offers View only alone with its sentence; a standard account with the
+    /// same value keeps plain Allow and the standalone sentence.
+    #[test]
+    fn the_standalone_no_prompt_row_through_a_fake_registry() {
+        use tornect_core::levels::{Answers, SENTENCE_ADMIN_WITHOUT_PROMPT_STANDALONE};
+
+        let standalone = |account: Account| Account {
+            installed: false,
+            ..account
+        };
+        for values in [
+            with(&[("ConsentPromptBehaviorAdmin", 0)]),
+            fake(&[("ConsentPromptBehaviorAdmin", 0)]),
+        ] {
+            let a = Availability::of(Some(&windows_facts(&values, standalone(ADMIN))));
+            assert!(windows_facts(&values, standalone(ADMIN)).control_is_administrator());
+            assert_eq!(a.row, HostRow::WindowsStandalone);
+            assert_eq!(
+                a.offered(),
+                Answers {
+                    view_only: true,
+                    allow: false,
+                    admin: None,
+                }
+            );
+            assert_eq!(a.answers, a.offered());
+            assert_eq!(a.sentence, Some(SENTENCE_ADMIN_WITHOUT_PROMPT_STANDALONE));
+            assert_eq!(
+                a.offered_sentence(),
+                Some(SENTENCE_ADMIN_WITHOUT_PROMPT_STANDALONE)
+            );
+            assert!(a.serves());
+
+            let user = Availability::of(Some(&windows_facts(&values, standalone(USER))));
+            assert_eq!(user.row, HostRow::WindowsStandalone);
+            assert!(user.offered().allow && user.offered().view_only);
+            assert_eq!(user.sentence, Some(SENTENCE_STANDALONE));
+        }
+    }
+
     /// An account read that failed lands on a row no more permissive than a
     /// full read: elevation unreadable refuses; elevated with UAC on keeps
     /// the started-elevated refusal; the rest unreadable offers View only.
