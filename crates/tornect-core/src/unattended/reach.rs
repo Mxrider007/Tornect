@@ -82,6 +82,29 @@ pub(crate) fn grant_reach_of(
     Clauses::of(store, grant, account, helper_task).grant_reach()
 }
 
+/// A grant's own reach as the guard judges a change to it (decision M1-67, D3): 2 when
+/// it holds the level, 1 when it is control and clause (ii) holds, else 0, the mark
+/// aside; 0 on Linux. `grant` counts among the grants that hold the level in place of
+/// the store's copy of it (a grant not stored yet included).
+pub(crate) fn own_reach(
+    store: &UnattendedStore,
+    grant: &UnattendedGrant,
+    account: AccountFacts,
+    helper_task: HelperPresence,
+) -> u8 {
+    if account == AccountFacts::Linux {
+        return 0;
+    }
+    if grant.holds_level() {
+        return 2;
+    }
+    let others = store
+        .grants
+        .iter()
+        .any(|g| g.device != grant.device && g.holds_level());
+    u8::from(clause_ii(grant.mode, others, account, helper_task))
+}
+
 /// Why the read refuses the request (B step 1, D11). Nothing is marked on any of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReachRefusal {

@@ -121,6 +121,15 @@ pub fn purpose_of(op: &str) -> &'static str {
     }
 }
 
+/// What the Windows dialog says the password is for when a registration gives the
+/// device labelled `device` administrator access, or reach to it (decision M1-67, D3):
+/// "give `<device>` ADMINISTRATOR access to this computer, with a new password". The label
+/// is the grant's pinned label, sanitized when it was stored.
+#[must_use]
+pub fn raise_purpose(device: &str) -> String {
+    format!("give {device} ADMINISTRATOR access to this computer, with a new password")
+}
+
 /// A credential typed into the Windows prompt.
 ///
 /// The password is kept as the NUL-terminated UTF-16 that `LogonUserW` takes,
@@ -294,6 +303,20 @@ impl Default for WindowsReAuth {
 
 impl ReAuth for WindowsReAuth {
     fn reauthenticate(&self, op: &str) -> Result<(), ReAuthError> {
+        self.ask(op, purpose_of(op))
+    }
+
+    /// Decision M1-67 (D3): the dialog of a registration that gives `device` administrator
+    /// access, or reach to it, names both.
+    fn reauthenticate_raise(&self, device: &str) -> Result<(), ReAuthError> {
+        self.ask("raise", &raise_purpose(device))
+    }
+}
+
+impl WindowsReAuth {
+    /// One dialog saying the password is for `purpose`, then the logon check; `op` names
+    /// the operation in the log.
+    fn ask(&self, op: &str, purpose: &str) -> Result<(), ReAuthError> {
         let _open = match self.dialog.try_lock() {
             Ok(held) => held,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
@@ -305,7 +328,7 @@ impl ReAuth for WindowsReAuth {
                 ));
             }
         };
-        let verdict = match self.prompt.prompt(purpose_of(op)) {
+        let verdict = match self.prompt.prompt(purpose) {
             PromptOutcome::Cancelled => {
                 tracing::info!(
                     op,
@@ -940,6 +963,28 @@ mod tests {
             Box::new(std::sync::Arc::clone(&logon)),
         );
         (reauth, prompt, logon)
+    }
+
+    /// Decision M1-67 (D3): a registration that gives a device administrator access, or
+    /// reach to it, asks with its own wording, naming the device; the same logon check
+    /// decides.
+    #[test]
+    fn a_raising_registration_names_administrator_access_and_the_device() {
+        assert_eq!(
+            raise_purpose("Laptop"),
+            "give Laptop ADMINISTRATOR access to this computer, with a new password"
+        );
+        let (reauth, prompt, _logon) = windows(typed("PC\\ana", "right"));
+        assert_eq!(reauth.reauthenticate_raise("Laptop"), Ok(()));
+        assert_eq!(
+            prompt.purpose.lock().unwrap().as_deref(),
+            Some("give Laptop ADMINISTRATOR access to this computer, with a new password")
+        );
+        let (reauth, _, _) = windows(typed("PC\\ana", "wrong"));
+        assert_eq!(
+            reauth.reauthenticate_raise("Laptop"),
+            Err(ReAuthError::Denied)
+        );
     }
 
     /// The Windows flow, on any OS: only a verified logon as the current user

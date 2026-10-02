@@ -102,6 +102,14 @@ pub enum StoreError {
     /// the store lock.
     #[error("a remote session is live or ended less than 60 s ago")]
     RemoteSessionActive,
+    /// A change that needs a new generated password, decided under the store lock
+    /// (`G_NEEDS_PASSWORD`; decision M1-67).
+    #[error("{0}")]
+    NeedsPassword(String),
+    /// The administrator level where this host cannot give it, decided under the store
+    /// lock (`G_UNSUPPORTED`).
+    #[error("{0}")]
+    Unsupported(String),
     /// Core I/O or keystore failure.
     #[error(transparent)]
     Core(#[from] CoreError),
