@@ -705,15 +705,27 @@ pub fn settle(
     Ok(settled)
 }
 
-/// Settle a verified `ADMIN_RESULT` at `host` by its `grant_reach`. It takes no password,
-/// so none is ever kept after an admin command (DA-15): an answer that reaches deletes the
-/// remembered password first, as for an accept (C2); at 0 a remembered one stays (C3).
+/// The attempt a verified unattended `SESSION_ACCEPT` settles (C1): its signed level and
+/// the `grant_reach` decoded from it, never a value of the caller's (C11, VF-14).
+#[must_use]
+pub fn accepted(accept: &messages::SessionAccept) -> Attempt {
+    Attempt::Accepted {
+        elevation: accept.elevation(),
+        grant_reach: accept.grant_reach(),
+    }
+}
+
+/// Settle the verified `ADMIN_RESULT` `answer` at `host` by the `grant_reach` decoded from
+/// it (C11, VF-14). It takes no password, so none is ever kept after an admin command
+/// (DA-15): an answer that reaches deletes the remembered password first, as for an
+/// accept (C2); at 0 a remembered one stays (C3).
 pub fn settle_admin(
     paths: &Paths,
     saved: &SavedPasswords,
     host: &TornectId,
-    grant_reach: Option<u8>,
+    answer: &tornect_signal::fsm::client::AdminAnswer,
 ) -> anyhow::Result<Settled> {
+    let grant_reach = answer.grant_reach;
     let _one = hosts_lock();
     let first = Attempt::reaches(tornect_core::levels::Elevation::None, grant_reach)
         .then(|| delete_first(saved, host));
@@ -1455,6 +1467,75 @@ mod tests {
         }
     }
 
+    /// A verified admin answer that ran its command, with `grant_reach`.
+    fn admin_answer(grant_reach: Option<u8>) -> tornect_signal::fsm::client::AdminAnswer {
+        tornect_signal::fsm::client::AdminAnswer {
+            ok: true,
+            detail: None,
+            grant_reach,
+        }
+    }
+
+    /// C1, C11 (VF-14): every settle call site passes the key decoded from the verified
+    /// frame, the session's through [`accepted`] and the admin command's through its
+    /// answer, never a value of its own. On constructed frames (vectors 4 and 5, and
+    /// vector 4 without key 12) and constructed admin answers, the keychain ends as the
+    /// decoded key says.
+    #[test]
+    fn the_settle_call_sites_pass_the_decoded_key() {
+        use tornect_core::levels::Elevation;
+        use tornect_core::unattended::credentials::PasswordVault as _;
+        let decode = |hex: &str| {
+            let body = data_encoding::HEXLOWER.decode(hex.as_bytes()).unwrap();
+            messages::decode_body::<messages::SessionAccept>(&body).unwrap()
+        };
+        for (hex, grant_reach, kept) in [
+            (
+                "a900a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50201030004000658207777777777777777777777777777777777777777777777777777777777777777070008f40c00",
+                Some(0),
+                true,
+            ),
+            (
+                "a900a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50201030004000658207777777777777777777777777777777777777777777777777777777777777777070008f40c01",
+                Some(1),
+                false,
+            ),
+            (
+                "a800a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50201030004000658207777777777777777777777777777777777777777777777777777777777777777070008f4",
+                None,
+                false,
+            ),
+        ] {
+            let attempt = accepted(&decode(hex));
+            assert_eq!(
+                attempt,
+                Attempt::Accepted {
+                    elevation: Elevation::None,
+                    grant_reach
+                }
+            );
+            let (_tmp, paths, vault, saved) = with_vault();
+            let h = host(30);
+            let s = settle(&paths, &saved, &h, attempt, &typed("pw", true)).unwrap();
+            assert_eq!(s.remembered, kept, "{grant_reach:?}");
+            assert_eq!(vault.names().len(), usize::from(kept), "{grant_reach:?}");
+        }
+        for (grant_reach, kept) in [
+            (Some(0), true),
+            (Some(1), false),
+            (Some(2), false),
+            (None, false),
+        ] {
+            let (_tmp, paths, vault, saved) = with_vault();
+            let h = host(31);
+            vault.put(&saved.entry(&h), "pw").unwrap();
+            edit(&paths, &h, |r| r.remember = true);
+            let s = settle_admin(&paths, &saved, &h, &admin_answer(grant_reach)).unwrap();
+            assert_eq!(s.remembered, kept, "{grant_reach:?}");
+            assert_eq!(vault.names().len(), usize::from(kept), "{grant_reach:?}");
+        }
+    }
+
     /// DA-15 (C3): a verified admin answer never keeps a password, and the admin settle
     /// takes none. At 0 a remembered one stays; an answer that reaches or leaves the key out
     /// deletes it first, and the record says so for the prompt.
@@ -1463,20 +1544,20 @@ mod tests {
         use tornect_core::unattended::credentials::PasswordVault as _;
         let (_tmp, paths, vault, saved) = with_vault();
         let h = host(12);
-        let s = settle_admin(&paths, &saved, &h, Some(0)).unwrap();
+        let s = settle_admin(&paths, &saved, &h, &admin_answer(Some(0))).unwrap();
         assert!(!s.remembered && vault.names().is_empty());
         assert!(
             settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true))
                 .unwrap()
                 .remembered
         );
-        let s = settle_admin(&paths, &saved, &h, Some(0)).unwrap();
+        let s = settle_admin(&paths, &saved, &h, &admin_answer(Some(0))).unwrap();
         assert!(s.remembered && !s.forgot);
         assert_eq!(vault.names().len(), 1);
         for reach in [Some(1), Some(2), None] {
             vault.put(&saved.entry(&h), "pw").unwrap();
             edit(&paths, &h, |r| r.remember = true);
-            let s = settle_admin(&paths, &saved, &h, reach).unwrap();
+            let s = settle_admin(&paths, &saved, &h, &admin_answer(reach)).unwrap();
             assert!(s.forgot && !s.remembered, "{reach:?}");
             assert!(vault.names().is_empty(), "{reach:?}");
             let r = record(&paths, &h);

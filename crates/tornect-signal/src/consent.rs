@@ -539,11 +539,15 @@ impl SessionAccept {
     /// or the receipt's clamped level. `elevation` is written only when it
     /// is admin, so an accept at none is byte-identical to one built before
     /// the key existed; view-only never carries it ([`Level`]).
+    ///
+    /// `grant_reach` (key 12, decision M1-67) is written into an unattended
+    /// accept as the caller computed it, and never into an attended one.
     #[must_use]
     pub fn build(
         proof: ConsentProof,
         caps: ChosenCaps,
         host: &AcceptHostInfo,
+        grant_reach: Option<u8>,
     ) -> (Self, SessionToken) {
         match proof {
             ConsentProof::HumanClick { choice, token, .. } => (
@@ -560,6 +564,7 @@ impl SessionAccept {
                     ends_at: None,
                     fail_summary: None,
                     elevation: elevation_code(choice.level()),
+                    grant_reach: None,
                 },
                 SessionToken::new(*token.bytes()),
             ),
@@ -577,6 +582,7 @@ impl SessionAccept {
                     ends_at: policy.ends_at(),
                     fail_summary: policy.fail_summary(),
                     elevation: elevation_code(Level::new(policy.mode(), policy.elevation())),
+                    grant_reach,
                 },
                 SessionToken::new(*token.session_token()),
             ),
@@ -667,6 +673,7 @@ mod tests {
             proof,
             ChosenCaps::negotiate(&host_caps(), &Caps::default()),
             &info,
+            None,
         );
         assert_eq!(accept.session_type(), 0);
         assert_eq!(accept.mode(), 1);
@@ -715,6 +722,7 @@ mod tests {
             proof,
             ChosenCaps::negotiate(&host_caps(), &host_caps()),
             &info,
+            None,
         );
         assert_eq!(accept.session_type(), 1);
         assert_eq!(accept.mode(), 1);
@@ -804,6 +812,7 @@ mod tests {
             proof,
             ChosenCaps::negotiate(&Caps::default(), &Caps::default()),
             &info,
+            None,
         );
         let printed = format!("{accept:?}");
         assert!(!printed.contains("171"), "{printed}"); // 0xAB as a decimal byte
