@@ -2,7 +2,10 @@
 //!
 //! ```text
 //! Unix    <state_dir>/ipc.sock            0600, SO_PEERCRED uid == ours
-//! Windows \\.\pipe\tornect-<hash(state)>   owner-only DACL, PIPE_REJECT_REMOTE_CLIENTS
+//! Windows \\.\pipe\tornect-<hash(state)>   explicit DACL (this account only), the first
+//!                                         instance FILE_FLAG_FIRST_PIPE_INSTANCE,
+//!                                         PIPE_REJECT_REMOTE_CLIENTS, each end checks
+//!                                         the other's account (SID, from its PID)
 //! ```
 //!
 //! This module owns the socket and the peer check, and nothing else. The
@@ -22,20 +25,16 @@
 //! other.
 
 use std::fmt;
-#[cfg(unix)]
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[cfg(unix)]
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tornect_core::unattended::ipc::{IpcRequest, IpcResponse, MAX_FRAME};
-#[cfg(unix)]
 use tornect_core::unattended::ipc::{
-    decode_request, decode_response, encode_request, encode_response,
+    IpcRequest, IpcResponse, MAX_FRAME, decode_request, decode_response, encode_request,
+    encode_response,
 };
-#[cfg(unix)]
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 /// File name of the Unix endpoint inside the state directory.
 pub const SOCKET_NAME: &str = "ipc.sock";
@@ -138,6 +137,17 @@ pub enum IpcError {
     /// This platform's endpoint is not implemented yet.
     #[error("the IPC endpoint is not implemented on this platform yet ({0})")]
     Unsupported(&'static str),
+    /// Windows: the control channel's pipe already exists, made by another
+    /// process before this host; it is never used (§B.8.7.4).
+    #[error("the control channel's pipe already exists (another process made it first)")]
+    NameTaken,
+    /// Windows: the process at the other end of the pipe runs as another
+    /// account, or its account could not be read.
+    #[error("rejected an IPC peer (process {pid}) that is not of this account")]
+    ForeignAccount {
+        /// The other end's process id.
+        pid: u32,
+    },
 }
 
 /// The Unix socket path for a state directory.
@@ -162,12 +172,11 @@ pub fn pipe_name(state_dir: &Path) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// framing (Unix only until the Windows named pipe lands at M6)
+// framing (both endpoints)
 // ---------------------------------------------------------------------------
 
 /// One frame. Wiped on drop: frames carry `On`'s stop code and the
 /// registration's OPAQUE messages (§B.8.7.2, A14).
-#[cfg(unix)]
 async fn read_frame<R: AsyncRead + Unpin>(
     r: &mut R,
 ) -> Result<Option<Zeroizing<Vec<u8>>>, IpcError> {
@@ -202,7 +211,6 @@ async fn read_frame<R: AsyncRead + Unpin>(
     Ok(Some(buf))
 }
 
-#[cfg(unix)]
 async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> Result<(), IpcError> {
     let len = payload.len();
     if len > MAX_FRAME {
@@ -215,13 +223,111 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> Result
     Ok(())
 }
 
-#[cfg(unix)]
 async fn with_idle_timeout<T>(
     fut: impl Future<Output = Result<T, IpcError>>,
 ) -> Result<T, IpcError> {
     match tokio::time::timeout(IDLE_TIMEOUT, fut).await {
         Ok(r) => r,
         Err(_) => Err(IpcError::Idle),
+    }
+}
+
+/// Answer `stream`'s requests with `handler` until the client closes it: one
+/// connection of either endpoint, after its peer check.
+async fn serve_frames<S, F, Fut, R>(stream: &mut S, handler: &F) -> Result<(), IpcError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: Fn(IpcRequest) -> Fut,
+    Fut: Future<Output = R>,
+    R: Into<Reply>,
+{
+    loop {
+        let Some(frame) = with_idle_timeout(read_frame(stream)).await? else {
+            return Ok(());
+        };
+        let Reply {
+            mut response,
+            on_undelivered,
+        } = match decode_request(&frame) {
+            Ok(req) => handler(req).await.into(),
+            Err(e) => {
+                // A frame that does not decode still gets an answer, so
+                // a version-skewed CLI sees a code instead of a hang.
+                // `id` is unknown here — 0 is the documented placeholder.
+                IpcResponse::fail(0, e.code(), e.to_string()).into()
+            }
+        };
+        let delivered = match encode_response(&response) {
+            Ok(bytes) => {
+                let bytes = Zeroizing::new(bytes);
+                with_idle_timeout(write_frame(stream, &bytes)).await
+            }
+            Err(e) => Err(e.into()),
+        };
+        // The payload may be `On`'s stop code (§B.8.7.2, A14).
+        if let Some(p) = response.payload.as_mut() {
+            p.zeroize();
+        }
+        if let Err(e) = delivered {
+            if let Some(undo) = on_undelivered {
+                tracing::warn!(error = %e, "an IPC answer was not delivered; undoing its effect");
+                if let Err(join) = tokio::task::spawn_blocking(undo).await {
+                    tracing::error!(error = %join, "undoing an undelivered IPC answer failed");
+                }
+            }
+            return Err(e);
+        }
+    }
+}
+
+/// Send `req` on `stream` and read its answer, waiting up to
+/// [`RESPONSE_TIMEOUT`] for it (the host may be showing the owner an OS
+/// dialog).
+async fn exchange<S>(stream: &mut S, req: &IpcRequest) -> Result<IpcResponse, IpcError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let bytes = Zeroizing::new(encode_request(req)?);
+    with_idle_timeout(write_frame(stream, &bytes)).await?;
+    // Not the idle bound: the host may be showing the owner an OS dialog.
+    let frame = match tokio::time::timeout(RESPONSE_TIMEOUT, read_frame(stream)).await {
+        Ok(frame) => frame?.ok_or(IpcError::Truncated)?,
+        Err(_) => return Err(IpcError::NoAnswer),
+    };
+    Ok(decode_response(&frame)?)
+}
+
+/// `ERROR_ACCESS_DENIED`: what `FILE_FLAG_FIRST_PIPE_INSTANCE` fails with when
+/// the pipe exists.
+#[cfg(any(windows, test))]
+const PIPE_EXISTS: i32 = 5;
+/// `ERROR_PIPE_BUSY`: the pipe exists and has all its instances.
+#[cfg(any(windows, test))]
+const PIPE_FULL: i32 = 231;
+
+/// The Windows pipe's first instance, or no channel (§B.8.7.4): a pipe that
+/// already exists — made first by another process — is never used.
+#[cfg(any(windows, test))]
+fn claim_first<T>(created: std::io::Result<T>) -> Result<T, IpcError> {
+    created.map_err(|e| match e.raw_os_error() {
+        Some(PIPE_EXISTS | PIPE_FULL) => IpcError::NameTaken,
+        _ => IpcError::Io(e),
+    })
+}
+
+/// The Windows pipe's peer check, at both ends (§B.8.7.4): the process `pid`
+/// at the other end runs as this account (`own`, a string SID), or the
+/// connection ends before a frame is read or sent; an account that could not
+/// be read is refused too.
+#[cfg(any(windows, test))]
+fn check_account(peer: std::io::Result<String>, own: &str, pid: u32) -> Result<(), IpcError> {
+    match peer {
+        Ok(account) if account == own => Ok(()),
+        Ok(_) | Err(_) => {
+            let e = IpcError::ForeignAccount { pid };
+            tracing::warn!("{e}");
+            Err(e)
+        }
     }
 }
 
@@ -235,12 +341,10 @@ mod imp {
     use std::sync::Arc;
 
     use tokio::net::{UnixListener, UnixStream};
-    use zeroize::Zeroize as _;
 
     use super::{
-        IpcError, IpcRequest, IpcResponse, MAX_CONNECTIONS, Path, PathBuf, RESPONSE_TIMEOUT, Reply,
-        Zeroizing, decode_request, decode_response, encode_request, encode_response, read_frame,
-        socket_path, with_idle_timeout, write_frame,
+        IpcError, IpcRequest, IpcResponse, MAX_CONNECTIONS, Path, PathBuf, Reply, exchange,
+        serve_frames, socket_path,
     };
 
     /// A bound, owner-only endpoint.
@@ -356,60 +460,17 @@ mod imp {
             tracing::warn!(peer_uid = cred.uid(), peer_pid = ?cred.pid(), "{e}");
             return Err(e);
         }
-        loop {
-            let Some(frame) = with_idle_timeout(read_frame(&mut stream)).await? else {
-                return Ok(());
-            };
-            let Reply {
-                mut response,
-                on_undelivered,
-            } = match decode_request(&frame) {
-                Ok(req) => handler(req).await.into(),
-                Err(e) => {
-                    // A frame that does not decode still gets an answer, so
-                    // a version-skewed CLI sees a code instead of a hang.
-                    // `id` is unknown here — 0 is the documented placeholder.
-                    IpcResponse::fail(0, e.code(), e.to_string()).into()
-                }
-            };
-            let delivered = match encode_response(&response) {
-                Ok(bytes) => {
-                    let bytes = Zeroizing::new(bytes);
-                    with_idle_timeout(write_frame(&mut stream, &bytes)).await
-                }
-                Err(e) => Err(e.into()),
-            };
-            // The payload may be `On`'s stop code (§B.8.7.2, A14).
-            if let Some(p) = response.payload.as_mut() {
-                p.zeroize();
-            }
-            if let Err(e) = delivered {
-                if let Some(undo) = on_undelivered {
-                    tracing::warn!(error = %e, "an IPC answer was not delivered; undoing its effect");
-                    if let Err(join) = tokio::task::spawn_blocking(undo).await {
-                        tracing::error!(error = %join, "undoing an undelivered IPC answer failed");
-                    }
-                }
-                return Err(e);
-            }
-        }
+        serve_frames(&mut stream, handler).await
     }
 
     /// Send one request to a running host and read its answer, waiting up to
-    /// [`RESPONSE_TIMEOUT`] for it.
+    /// [`RESPONSE_TIMEOUT`](super::RESPONSE_TIMEOUT) for it.
     pub async fn request(state_dir: &Path, req: &IpcRequest) -> Result<IpcResponse, IpcError> {
         let path = socket_path(state_dir);
         let mut stream = UnixStream::connect(&path)
             .await
             .map_err(|_| IpcError::NotRunning(state_dir.to_path_buf()))?;
-        let bytes = Zeroizing::new(encode_request(req)?);
-        with_idle_timeout(write_frame(&mut stream, &bytes)).await?;
-        // Not the idle bound: the host may be showing the owner an OS dialog.
-        let frame = match tokio::time::timeout(RESPONSE_TIMEOUT, read_frame(&mut stream)).await {
-            Ok(frame) => frame?.ok_or(IpcError::Truncated)?,
-            Err(_) => return Err(IpcError::NoAnswer),
-        };
-        Ok(decode_response(&frame)?)
+        exchange(&mut stream, req).await
     }
 
     /// Whether a host is serving this state directory right now.
@@ -423,62 +484,362 @@ mod imp {
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
+#[allow(unsafe_code)] // the pipe's descriptor and its peers' accounts: FFI, each block below says why it is sound
 mod imp {
-    use super::{IpcError, IpcRequest, IpcResponse, Path, Reply};
+    use std::os::windows::io::AsRawHandle as _;
+    use std::ptr::null_mut;
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::{Duration, Instant};
 
-    /// Not implemented at M1.
-    #[derive(Debug)]
+    use tokio::net::windows::named_pipe::{
+        ClientOptions, NamedPipeClient, NamedPipeServer, PipeMode, ServerOptions,
+    };
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, HANDLE, HLOCAL, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY};
+    use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+    use windows_sys::Win32::System::Pipes::{
+        GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    use super::{
+        IDLE_TIMEOUT, IpcError, IpcRequest, IpcResponse, MAX_CONNECTIONS, Path, PathBuf, Reply,
+        check_account, claim_first, exchange, pipe_name, serve_frames,
+    };
+    use crate::win::{OwnedHandle, current_user_sid, sid_of, sid_string, token_user, wide};
+
+    /// How long a client waits for a free instance while every one is busy.
+    const BUSY_WAIT: Duration = Duration::from_millis(50);
+
+    /// The pipe's security descriptor: an explicit, protected DACL that admits
+    /// this account alone (`D:P(A;;GA;;;<SID>)`), never the default descriptor.
+    struct Descriptor(PSECURITY_DESCRIPTOR);
+
+    // SAFETY: the descriptor is memory this value owns alone (allocated by the
+    // conversion below, freed once on drop) and is only read after creation.
+    unsafe impl Send for Descriptor {}
+    // SAFETY: as above: nothing writes to it after creation.
+    unsafe impl Sync for Descriptor {}
+
+    impl Descriptor {
+        fn this_account_only(user_sid: &str) -> std::io::Result<Self> {
+            let text = wide(crate::helper::pipe_sddl(user_sid, false));
+            let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+            // SAFETY: `text` is NUL-terminated; on success `sd` receives a
+            // descriptor allocated with `LocalAlloc`, freed on drop.
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    null_mut(),
+                )
+            };
+            if ok == 0 || sd.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self(sd))
+        }
+    }
+
+    impl Drop for Descriptor {
+        fn drop(&mut self) {
+            // SAFETY: allocated by the conversion above, freed once.
+            unsafe { LocalFree(self.0 as HLOCAL) };
+        }
+    }
+
+    /// One server instance of `name` with `descriptor`: the first one with
+    /// `FILE_FLAG_FIRST_PIPE_INSTANCE` (a pipe that already exists fails it),
+    /// remote clients refused, at most one instance per connection served plus
+    /// the one waiting.
+    fn instance(
+        name: &str,
+        descriptor: &Descriptor,
+        first: bool,
+    ) -> std::io::Result<NamedPipeServer> {
+        let mut attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        let mut options = ServerOptions::new();
+        options
+            .first_pipe_instance(first)
+            .reject_remote_clients(true)
+            .pipe_mode(PipeMode::Byte)
+            .max_instances(MAX_CONNECTIONS + 1);
+        // SAFETY: `attributes` points at the live descriptor, and both outlive
+        // the call, which copies what it needs.
+        unsafe { options.create_with_security_attributes_raw(name, (&raw mut attributes).cast()) }
+    }
+
+    /// The account (string SID) process `pid` runs as.
+    fn account_of(pid: u32) -> std::io::Result<String> {
+        // SAFETY: plain call; a null result is an error, a handle is closed by
+        // `OwnedHandle`.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let process = OwnedHandle(process);
+        let mut token: HANDLE = null_mut();
+        // SAFETY: `process` is open; `token` receives a handle on success.
+        if unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let token = OwnedHandle(token);
+        let user = token_user(token.0)?;
+        sid_string(sid_of(&user))
+    }
+
+    /// The process id of the client connected to `pipe`.
+    fn client_pid(pipe: &NamedPipeServer) -> std::io::Result<u32> {
+        let mut pid = 0u32;
+        // SAFETY: the handle is the open pipe's; `pid` is writable.
+        if unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(pid)
+    }
+
+    /// The process id of the server `pipe` is connected to.
+    fn server_pid(pipe: &NamedPipeClient) -> std::io::Result<u32> {
+        let mut pid = 0u32;
+        // SAFETY: the handle is the open pipe's; `pid` is writable.
+        if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(pid)
+    }
+
+    /// The bound endpoint: `\\.\pipe\tornect-<hash(state_dir)>`, its first
+    /// instance created by this process.
     pub struct Endpoint {
-        _private: (),
+        name: String,
+        path: PathBuf,
+        account: String,
+        descriptor: Descriptor,
+        waiting: Mutex<Option<NamedPipeServer>>,
+    }
+
+    impl std::fmt::Debug for Endpoint {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Endpoint")
+                .field("name", &self.name)
+                .finish_non_exhaustive()
+        }
     }
 
     impl Endpoint {
-        /// Always fails at M1.
-        ///
-        /// §B.8.7.4 requires an owner-only DACL, `PIPE_REJECT_REMOTE_CLIENTS`
-        /// and a verified server SID/PID on the client side. None of that is
-        /// reachable without a Win32 binding (`windows-sys`), which is not
-        /// pinned and cannot be verified on this dev machine — and §B.8.14
-        /// schedules "IPC endpoint per OS" at M6 in any case. Returning an
-        /// error is the honest M1 answer: a named pipe created without the
-        /// DACL would be a *worse* outcome than none, because it would look
-        /// like the endpoint works.
-        pub async fn bind(_state_dir: &Path) -> Result<Self, IpcError> {
-            Err(IpcError::Unsupported(
-                "Windows named pipe: owner-only DACL and client SID check land at M6",
-            ))
+        /// Create the pipe's first instance (§B.8.7.4): the explicit DACL, and
+        /// `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a pipe another process made first
+        /// is never used: no channel then ([`IpcError::NameTaken`]).
+        pub async fn bind(state_dir: &Path) -> Result<Self, IpcError> {
+            let name = pipe_name(state_dir);
+            let account = current_user_sid()?;
+            let descriptor = Descriptor::this_account_only(&account)?;
+            let first = claim_first(instance(&name, &descriptor, true))?;
+            tracing::debug!(%name, "IPC endpoint bound");
+            Ok(Self {
+                path: PathBuf::from(&name),
+                name,
+                account,
+                descriptor,
+                waiting: Mutex::new(Some(first)),
+            })
         }
 
-        /// Unreachable at M1.
+        /// The pipe's name.
         #[must_use]
         pub fn path(&self) -> &Path {
-            Path::new("")
+            &self.path
         }
 
-        /// Unreachable at M1.
-        pub async fn serve<F, Fut, R>(&self, _handler: F) -> Result<(), IpcError>
+        /// Accept and answer requests until the task is dropped, up to
+        /// [`MAX_CONNECTIONS`] at once, as the Unix endpoint does (track D S6:
+        /// `off`, `revoke` and `panic` never wait behind another request's
+        /// re-authentication dialog). The next instance is created before a
+        /// connected one is handed over, so the name never lapses.
+        pub async fn serve<F, Fut, R>(&self, handler: F) -> Result<(), IpcError>
         where
             F: Fn(IpcRequest) -> Fut + Clone + Send + Sync + 'static,
             Fut: Future<Output = R> + Send + 'static,
             R: Into<Reply> + Send + 'static,
         {
-            Err(IpcError::Unsupported("Windows named pipe"))
+            let Some(mut waiting) = self
+                .waiting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            else {
+                return Err(IpcError::Unsupported("the pipe is served once"));
+            };
+            let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+            loop {
+                if let Err(e) = waiting.connect().await {
+                    // A client that came and went before the connection
+                    // completed: the instance is freed and waits again.
+                    tracing::debug!(error = %e, "an IPC client left before it was served");
+                    let _ = waiting.disconnect();
+                    tokio::time::sleep(BUSY_WAIT).await;
+                    continue;
+                }
+                let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+                    tracing::warn!(
+                        max = MAX_CONNECTIONS,
+                        "IPC endpoint at its connection limit; refused one"
+                    );
+                    waiting.disconnect()?;
+                    continue;
+                };
+                let connected =
+                    std::mem::replace(&mut waiting, instance(&self.name, &self.descriptor, false)?);
+                let handler = handler.clone();
+                let account = self.account.clone();
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    if let Err(e) = serve_one(connected, &account, &handler).await {
+                        // One bad client must never take the endpoint down.
+                        tracing::warn!(error = %e, "IPC connection dropped");
+                    }
+                });
+            }
         }
     }
 
-    /// Not implemented at M1.
-    pub async fn request(state_dir: &Path, _req: &IpcRequest) -> Result<IpcResponse, IpcError> {
-        let _ = state_dir;
-        Err(IpcError::Unsupported("Windows named pipe"))
+    async fn serve_one<F, Fut, R>(
+        mut pipe: NamedPipeServer,
+        account: &str,
+        handler: &F,
+    ) -> Result<(), IpcError>
+    where
+        F: Fn(IpcRequest) -> Fut,
+        Fut: Future<Output = R>,
+        R: Into<Reply>,
+    {
+        // §B.8.7.4: the client's account is checked before any frame is read.
+        let pid = client_pid(&pipe)?;
+        check_account(account_of(pid), account, pid)?;
+        serve_frames(&mut pipe, handler).await
     }
 
-    /// Always `false` at M1.
-    pub async fn is_running(_state_dir: &Path) -> bool {
-        false
+    /// Open the pipe of `state_dir`, waiting while every instance is busy (up
+    /// to [`IDLE_TIMEOUT`]); the server is identified, never allowed to
+    /// impersonate this process.
+    async fn open(state_dir: &Path, wait: bool) -> Result<NamedPipeClient, IpcError> {
+        let name = pipe_name(state_dir);
+        let until = Instant::now() + IDLE_TIMEOUT;
+        loop {
+            let opened = ClientOptions::new()
+                .security_qos_flags(SECURITY_IDENTIFICATION)
+                .open(&name);
+            match opened {
+                Ok(pipe) => return Ok(pipe),
+                Err(e) if e.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
+                    return Err(IpcError::NotRunning(state_dir.to_path_buf()));
+                }
+                Err(e)
+                    if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
+                        && wait
+                        && Instant::now() < until =>
+                {
+                    tokio::time::sleep(BUSY_WAIT).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Send one request to a running host and read its answer: the server's
+    /// account is checked first, before anything is sent (§B.8.7.4).
+    pub async fn request(state_dir: &Path, req: &IpcRequest) -> Result<IpcResponse, IpcError> {
+        let mut pipe = open(state_dir, true).await?;
+        let pid = server_pid(&pipe)?;
+        check_account(account_of(pid), &current_user_sid()?, pid)?;
+        exchange(&mut pipe, req).await
+    }
+
+    /// Whether a host is serving this state directory right now (a busy pipe
+    /// is one).
+    pub async fn is_running(state_dir: &Path) -> bool {
+        match open(state_dir, false).await {
+            Ok(_) => true,
+            Err(IpcError::Io(e)) => e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32),
+            Err(_) => false,
+        }
     }
 }
 
 pub use imp::{Endpoint, is_running, request};
+
+/// The Windows pipe's rules that do not need Windows (§B.8.7.4); the calls
+/// themselves are type-checked here and NEEDS-DEVICE(windows).
+#[cfg(test)]
+mod pipe_rules {
+    use super::*;
+
+    /// A second server, finding the pipe made already (`FILE_FLAG_FIRST_PIPE_INSTANCE`
+    /// fails, or every instance is taken), gets no endpoint and so serves nothing;
+    /// it never uses the pipe that exists. Any other failure is reported as is.
+    #[test]
+    fn a_second_server_instance_fails_to_create_and_serves_nothing() {
+        for code in [PIPE_EXISTS, PIPE_FULL] {
+            let taken = claim_first::<()>(Err(std::io::Error::from_raw_os_error(code)));
+            assert!(
+                matches!(taken, Err(IpcError::NameTaken)),
+                "{code}: {taken:?}"
+            );
+        }
+        let other = claim_first::<()>(Err(std::io::Error::from_raw_os_error(2)));
+        assert!(matches!(other, Err(IpcError::Io(_))), "{other:?}");
+        assert!(matches!(claim_first(Ok(7)), Ok(7)));
+    }
+
+    /// Each end refuses a peer of another account, and one whose account could
+    /// not be read, before a frame is read or sent; the client refuses a server
+    /// whose SID differs.
+    #[test]
+    fn the_client_refuses_a_server_whose_sid_differs() {
+        let own = "S-1-5-21-1000-2000-3000-1001";
+        assert!(check_account(Ok(own.to_owned()), own, 42).is_ok());
+        let other = check_account(Ok("S-1-5-21-1000-2000-3000-1002".to_owned()), own, 42);
+        assert!(
+            matches!(other, Err(IpcError::ForeignAccount { pid: 42 })),
+            "{other:?}"
+        );
+        let unreadable = check_account(Err(std::io::Error::from_raw_os_error(5)), own, 43);
+        assert!(
+            matches!(unreadable, Err(IpcError::ForeignAccount { pid: 43 })),
+            "{unreadable:?}"
+        );
+    }
+
+    /// The name: `\\.\pipe\tornect-` and 16 hex digits of the state directory's
+    /// hash, the same for the same directory, another for another, and no part of
+    /// the path in it.
+    #[test]
+    fn the_pipe_name_hashes_the_state_directory() {
+        let a = pipe_name(Path::new("/home/someone/.local/state/tornect"));
+        let b = pipe_name(Path::new("/home/someone/.local/state/tornect-2"));
+        assert_eq!(
+            a,
+            pipe_name(Path::new("/home/someone/.local/state/tornect"))
+        );
+        assert_ne!(a, b);
+        let hex = a.strip_prefix(r"\\.\pipe\tornect-").expect("the prefix");
+        assert_eq!(hex.len(), 16);
+        assert!(hex.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert!(!a.contains("someone"));
+    }
+}
 
 #[cfg(all(test, unix))]
 mod tests {

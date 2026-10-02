@@ -944,8 +944,9 @@ fn os_host_name() -> Option<String> {
 enum Probe {
     /// A host that answers on its control channel.
     Host,
-    /// A host holds the host lock but nothing answers: Windows until M6, or a
-    /// failed bind. The holder, for messages.
+    /// A host holds the host lock but nothing answers: its channel failed to
+    /// bind (on Windows also when another process made the pipe first, which is
+    /// never used). The holder, for messages.
     Unreachable(String),
     /// No host.
     NoHost,
@@ -987,13 +988,8 @@ async fn route(paths: &Paths) -> anyhow::Result<Route> {
 /// "A host runs here, but nothing answers for it."
 fn unreachable_host(paths: &Paths, holder: &str) -> String {
     format!(
-        "a Tornect host is running for {} ({holder}), but it has no control channel{}",
+        "a Tornect host is running for {} ({holder}), but it has no control channel",
         paths.state_dir.display(),
-        if cfg!(windows) {
-            " (on Windows no command can reach a running host until M6)"
-        } else {
-            ""
-        }
     )
 }
 
