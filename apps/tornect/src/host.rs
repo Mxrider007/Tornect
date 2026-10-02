@@ -809,6 +809,32 @@ fn peer_note_to(out: &mut dyn std::io::Write, terminal: bool, line: fmt::Argumen
     }
 }
 
+/// `tornect host`'s own `Tornect ID: …` line (FX1-L2): on stdout only when
+/// stdout is a terminal or the evidence opt-in is set, so that a journal or
+/// a file never collects this computer's address (`tornect id` and the
+/// window show it).
+pub(crate) fn own_id(line: fmt::Arguments<'_>) {
+    let stdout = std::io::stdout();
+    let terminal = stdout.is_terminal();
+    own_id_to(
+        &mut stdout.lock(),
+        terminal,
+        EVIDENCE.load(Ordering::Relaxed),
+        line,
+    );
+}
+
+fn own_id_to(
+    out: &mut dyn std::io::Write,
+    terminal: bool,
+    opted_in: bool,
+    line: fmt::Arguments<'_>,
+) {
+    if terminal || opted_in {
+        let _ = writeln!(out, "{line}").and_then(|()| out.flush());
+    }
+}
+
 fn mode_name(mode: SessionMode) -> &'static str {
     match mode {
         SessionMode::ViewOnly => "view-only",
@@ -882,9 +908,7 @@ where
         }
         FirstFrame::Handshake(stream) => match serve_host(stream, cfg, deps).await {
             Ok(outcome) => {
-                if let Some(line) = describe_outcome(&outcome) {
-                    peer_note(format_args!("{line}"));
-                }
+                note_outcome(&outcome, deps.activity.session_live());
                 if matches!(outcome, HostOutcome::Session { .. }) {
                     Served::Session
                 } else {
@@ -903,10 +927,46 @@ where
     }
 }
 
+/// The terminal's note for a handshake that ended without a live session
+/// ([`describe_outcome`]), on stderr when it is a terminal ([`peer_note`]).
+fn note_outcome(outcome: &HostOutcome, live: bool) {
+    let stderr = std::io::stderr();
+    let terminal = stderr.is_terminal();
+    note_outcome_to(&mut stderr.lock(), terminal, outcome, live);
+}
+
+fn note_outcome_to(
+    out: &mut dyn std::io::Write,
+    terminal: bool,
+    outcome: &HostOutcome,
+    live: bool,
+) {
+    if let Some(line) = describe_outcome(outcome, live) {
+        peer_note_to(out, terminal, format_args!("{line}"));
+    }
+}
+
 /// One line for a handshake that ended without a live session (the sink
-/// already reported the ones that had one).
-fn describe_outcome(outcome: &HostOutcome) -> Option<String> {
+/// already reported the ones that had one). While a session is live
+/// (`live`) this screen may be in its picture: the line names no other
+/// device, neither its label nor its fingerprint (FX1-L1).
+fn describe_outcome(outcome: &HostOutcome, live: bool) -> Option<String> {
     Some(match outcome {
+        HostOutcome::PairRejected { reason, .. } if live => format!(
+            "a pairing request was refused: {}",
+            pair_reject::name(*reason).to_ascii_lowercase()
+        ),
+        HostOutcome::PairedOnly { .. } if live => {
+            "a device paired; it asked for no session".to_owned()
+        }
+        HostOutcome::SessionRejected { reason, .. } if live => format!(
+            "a session request was refused: {}",
+            reject::name(*reason).to_ascii_lowercase()
+        ),
+        HostOutcome::Admin { ok, .. } if live => format!(
+            "a remote admin command was {}",
+            if *ok { "executed" } else { "refused" }
+        ),
         HostOutcome::PairRejected { device, reason } => format!(
             "pairing refused for device {} ({})",
             device.fingerprint(),
@@ -1901,6 +1961,76 @@ mod tests {
                 ""
             };
             assert_eq!(String::from_utf8(out).unwrap(), expected, "{terminal}");
+        }
+    }
+
+    /// FX1-L1: while a session is live the terminal's note for a refused
+    /// request (or any other handshake) names no other device, neither its
+    /// pinned label nor its fingerprint; outside a live session it is as it
+    /// was. Both states, captured through the writer `serve_signaling` uses.
+    #[test]
+    fn a_refusal_during_a_live_session_names_nobody() {
+        let device = DeviceIdentity::from_seed(&[0x33; 32]).id();
+        let fingerprint = device.fingerprint();
+        let outcomes = [
+            HostOutcome::SessionRejected {
+                device,
+                label: "Desk of Bob".to_owned(),
+                reason: reject::BUSY,
+            },
+            HostOutcome::PairRejected {
+                device,
+                reason: pair_reject::BUSY,
+            },
+        ];
+        let written = |live: bool| {
+            let mut out = Vec::new();
+            for outcome in &outcomes {
+                note_outcome_to(&mut out, true, outcome, live);
+            }
+            String::from_utf8(out).unwrap()
+        };
+        let live = written(true);
+        assert_eq!(
+            live,
+            "a session request was refused: busy\na pairing request was refused: busy\n"
+        );
+        assert!(!live.contains("Desk of Bob") && !live.contains(&fingerprint));
+        let idle = written(false);
+        assert_eq!(
+            idle,
+            format!(
+                "session refused for \"Desk of Bob\" (BUSY)\npairing refused for device \
+                 {fingerprint} (BUSY)\n"
+            )
+        );
+        let mut out = Vec::new();
+        note_outcome_to(&mut out, false, &outcomes[0], false);
+        assert!(out.is_empty(), "not a terminal: nothing");
+    }
+
+    /// FX1-L2: `tornect host`'s own `Tornect ID:` line reaches stdout only on
+    /// a terminal or with the evidence opt-in; a journal gets nothing.
+    #[test]
+    fn the_hosts_own_id_line_reaches_a_terminal_or_the_opt_in_only() {
+        for (terminal, opted_in) in [(true, false), (false, true), (true, true), (false, false)] {
+            let mut out = Vec::new();
+            own_id_to(
+                &mut out,
+                terminal,
+                opted_in,
+                format_args!("Tornect ID: abcdefgh.onion"),
+            );
+            let expected = if terminal || opted_in {
+                "Tornect ID: abcdefgh.onion\n"
+            } else {
+                ""
+            };
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                expected,
+                "{terminal} {opted_in}"
+            );
         }
     }
 }
