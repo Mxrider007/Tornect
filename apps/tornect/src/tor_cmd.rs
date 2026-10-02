@@ -330,7 +330,7 @@ async fn run_host(
         .await
         .map_err(explain)
         .context("publishing the onion service")?;
-    println!("Tornect ID: {}", listener.onion_address());
+    crate::host::own_id(format_args!("Tornect ID: {}", listener.onion_address()));
     let limits = listener.limits();
     eprintln!(
         "rendezvous budget: {} handshakes, {} live circuits; beyond that {}",

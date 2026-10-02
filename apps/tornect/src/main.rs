@@ -52,8 +52,11 @@ struct Cli {
     home: Option<PathBuf>,
 
     /// Log filter, e.g. `debug` or `tornect_signal=trace` (env: TORNECT_LOG).
-    /// Under every filter the log writes no names, labels, Tornect IDs or
-    /// fingerprints; `--log-identifiers` writes them.
+    /// Under every filter the fields of a log line that name a device, a
+    /// person or a computer read `<redacted>`; `--log-identifiers` writes
+    /// them. Message and error texts are written as they are: they can quote
+    /// a path, or a line of a file that holds a Tornect ID. With --json-logs,
+    /// warnings and errors are written in full.
     #[arg(long, global = true, value_name = "FILTER")]
     log: Option<String>,
 
@@ -63,13 +66,16 @@ struct Cli {
     #[arg(long, global = true)]
     log_identifiers: bool,
 
-    /// Emit JSON log lines on stderr.
+    /// Emit JSON log lines on stderr. Below WARN, a line with a field that
+    /// names a device, a person or a computer is left out unless
+    /// --log-identifiers is given; warnings and errors are written in full.
     #[arg(long, global = true)]
     json_logs: bool,
 
     /// Print the lines the live-check scripts read on stdout: the name of
     /// the host a session views and this computer's Tornect ID (env:
-    /// TORNECT_EVIDENCE=1). Without it the window prints session ids only.
+    /// TORNECT_EVIDENCE=1). Without it the window prints session ids only,
+    /// and `tornect host` prints its Tornect ID only to a terminal.
     #[arg(long, global = true)]
     evidence: bool,
 
@@ -138,9 +144,10 @@ enum Command {
     /// and pairing and session requests (asked on this terminal); share the
     /// screen with each accepted session.
     ///
-    /// Prints `Tornect ID: <onion>` as soon as the service is launched and
-    /// `REACHABLE` once the address is published on the Tor network. Ctrl-C stops
-    /// hosting and ends every session.
+    /// Prints `Tornect ID: <onion>` as soon as the service is launched (on a
+    /// terminal, or with --evidence) and `REACHABLE` once the address is
+    /// published on the Tor network. Ctrl-C stops hosting and ends every
+    /// session.
     Host {
         /// Exit after the first answered ping or finished session (scripted verification).
         #[arg(long)]
@@ -916,14 +923,20 @@ mod tests {
     }
 
     /// U3-L3: `--help` says that no log filter writes identifiers, and
-    /// which option does.
+    /// which option does; FX1-I2: it says what the redaction does not cover
+    /// (message and error texts, and with --json-logs the warnings).
     #[test]
     fn the_help_says_the_log_names_nobody_without_the_opt_in() {
         let help = super::Cli::command().render_long_help().to_string();
         let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
         for said in [
-            "Under every filter the log writes no names, labels, Tornect IDs or fingerprints; \
-             `--log-identifiers` writes them",
+            "Under every filter the fields of a log line that name a device, a person or a \
+             computer read `<redacted>`; `--log-identifiers` writes them",
+            "Message and error texts are written as they are: they can quote a path, or a line \
+             of a file that holds a Tornect ID",
+            "With --json-logs, warnings and errors are written in full",
+            "Below WARN, a line with a field that names a device, a person or a computer is \
+             left out unless --log-identifiers is given; warnings and errors are written in full",
             "--log-identifiers",
             "TORNECT_LOG_IDENTIFIERS=1",
         ] {
