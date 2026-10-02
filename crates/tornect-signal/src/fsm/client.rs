@@ -993,9 +993,10 @@ where
             reject: Box::new(reject),
         });
     }
-    let result: messages::AdminResult = chan.body(&rx).await?;
+    // The checks of the host's answer: a refusal names it (C4).
+    let result: messages::AdminResult = chan.answer_body(&rx).await?;
     if verify_envelope(&host_pk, &chan.th(), &rx.env).is_err() {
-        return Err(chan.fail(codes::E_BAD_SIG, "signature").await);
+        return Err(chan.refuse(codes::E_BAD_SIG, "signature").await);
     }
     chan.absorb(&rx);
     chan.close().await;
@@ -1062,36 +1063,37 @@ where
             reject: Box::new(reject),
         });
     }
-    let accept: SessionAccept = chan.body(&rx).await?;
+    // The checks of the host's answer, through to F-8: a refusal names it (C4).
+    let accept: SessionAccept = chan.answer_body(&rx).await?;
     if verify_envelope(&host_pk, &chan.th(), &rx.env).is_err() {
-        return Err(chan.fail(codes::E_BAD_SIG, "signature").await);
+        return Err(chan.refuse(codes::E_BAD_SIG, "signature").await);
     }
     chan.absorb(&rx);
 
     if accept.session_type() != messages::session_type::UNATTENDED {
-        return Err(chan.fail(codes::E_BAD_STATE, "session_type").await);
+        return Err(chan.refuse(codes::E_BAD_STATE, "session_type").await);
     }
     // The mirror of the attended rule: the token is *derived*, never sent, and
     // the host proves it holds the same one with `token_confirm` (§B.8.4.3).
     let (None, Some(confirm)) = (accept.session_token(), accept.token_confirm()) else {
-        return Err(chan.fail(codes::E_BAD_LEN, "token_confirm").await);
+        return Err(chan.refuse(codes::E_BAD_LEN, "token_confirm").await);
     };
     let ck = auth::confirm_key(&out.session_key, &th_after_response);
     let expected = auth::token_confirm(&ck, &th_after_response);
     if !bool::from(expected.ct_eq(confirm)) {
-        return Err(chan.fail(codes::E_BAD_SIG, "token_confirm").await);
+        return Err(chan.refuse(codes::E_BAD_SIG, "token_confirm").await);
     }
     let token = SessionToken::new(*auth::session_token(&out.session_key, &th_after_response));
 
     let expected_spki = ed25519_spki(&host_device_pk);
     if !bool::from(accept.quic_spki()[..].ct_eq(&expected_spki[..])) {
-        return Err(chan.fail(codes::E_BAD_SIG, "quic_spki").await);
+        return Err(chan.refuse(codes::E_BAD_SIG, "quic_spki").await);
     }
     let Some(given) = mode_from_code(accept.mode()) else {
-        return Err(chan.fail(codes::E_BAD_LEN, "mode").await);
+        return Err(chan.refuse(codes::E_BAD_LEN, "mode").await);
     };
     if TransportPolicy::from_code(accept.transport_policy()).is_none() {
-        return Err(chan.fail(codes::E_BAD_LEN, "mode").await);
+        return Err(chan.refuse(codes::E_BAD_LEN, "mode").await);
     }
     // M-FEAT-2 F-8: the host clamps toward the safe direction (§B.8.4.1), so an
     // accept above this request — control for a view-only request, or the
@@ -1101,12 +1103,12 @@ where
     let asked = mode_from_code(ua.want_mode).unwrap_or(SessionMode::ViewOnly);
     if SessionMode::most_restrictive(asked, given) != given {
         return Err(chan
-            .fail(codes::E_BAD_STATE, "mode above the request")
+            .refuse(codes::E_BAD_STATE, "mode above the request")
             .await);
     }
     if accept.elevation() == Elevation::Admin && ua.want_elevation != Elevation::Admin {
         return Err(chan
-            .fail(codes::E_BAD_STATE, "level above the request")
+            .refuse(codes::E_BAD_STATE, "level above the request")
             .await);
     }
 

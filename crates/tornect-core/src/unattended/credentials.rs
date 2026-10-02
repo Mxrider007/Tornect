@@ -8,13 +8,17 @@
 //! ‖ host onion key)[..16 bytes]>`. No address, name or label reaches the keychain: not in
 //! the entry's target, user, comment, label or attributes.
 //!
-//! What may be remembered: nothing without a usable keychain; nothing for a grant once an
-//! accept signed it the administrator level, or while the level is asked for, unless the
-//! keychain asks the person before every read (a presence gate such as Windows Hello; no
-//! Linux store has one), DA-14. A grant that may carry the level but was used without it is
-//! not known here, since an accept says only what it gave (F4-1, open). A remembered
-//! password goes stale only when it was refused (`AUTH_FAILED`, or this side's own check of
-//! the host's answer), never on a transport error or a `PREEMPTED` (B.8.4.6).
+//! What may be remembered (decision M1-67, §B.8.9.1): nothing without a usable keychain; a
+//! typed password only after this stream's verified unattended `SESSION_ACCEPT` that signed
+//! no administrator level and says `grant_reach = 0`, and never after an `ADMIN_RESULT` (the
+//! host marks a password only before it signs an accept). An answer that says 1 or 2, leaves
+//! the key out, or that this side refused deletes the remembered password first, before
+//! `hosts.toml` is read, and keeps none (C1-C4); a keychain that asks the person before a
+//! read changes nothing without a plan change (C12). The `reach` and `administrator` flags of
+//! `hosts.toml` only draw the prompt and never decide what is kept. A remembered password
+//! goes stale only when it was refused (`AUTH_FAILED`, or this side's own check of the host's
+//! PAKE reply, KE2), never on a transport error, a `PREEMPTED` or a refused answer (B.8.4.6,
+//! C4).
 
 use std::sync::Arc;
 
@@ -23,7 +27,8 @@ use zeroize::Zeroizing;
 
 use crate::error::Result;
 use crate::id::TornectId;
-use crate::unattended::hosts::HostsFile;
+use crate::levels::Elevation;
+use crate::unattended::hosts::{HostRecord, HostsFile};
 
 /// The hash domain of an entry name.
 const DOMAIN: &[u8] = b"tornect/v1/cred";
@@ -41,8 +46,9 @@ pub const NO_KEYCHAIN: &str =
 pub const KEYUTILS_KEPT: &str =
     "It stays on this account until a restart, or for a few days after you sign out.";
 
-/// The prompt's sentence when the grant may carry the administrator level and the keychain
-/// asks nobody before a read (DA-14).
+/// The prompt's sentence where no password is kept: `hosts.toml` says the host's last signed
+/// answer reached administrator access, left `grant_reach` out or was refused, or the level
+/// is asked for this time (M1-67, C5).
 pub const ADMIN_NOT_REMEMBERED: &str = "A password that can give administrator access is never \
     remembered on this computer: its keychain does not ask you before Tornect reads it.";
 
@@ -87,8 +93,9 @@ pub trait PasswordVault: Send + Sync {
     fn kept(&self) -> Option<&'static str> {
         None
     }
-    /// Whether every read asks the person first (Windows Hello, Touch ID): only such a
-    /// keychain may keep the password of a grant that can carry the administrator level.
+    /// Whether every read asks the person first (Windows Hello, Touch ID). It decides
+    /// nothing: a password whose host says it can reach administrator access is not kept in
+    /// such a keychain either, until a plan change says otherwise (M1-67, C12).
     fn presence_gated(&self) -> bool;
     /// The password kept under `entry`, if any.
     fn get(&self, entry: &EntryName) -> Result<Option<Zeroizing<String>>>;
@@ -103,6 +110,7 @@ pub trait PasswordVault: Send + Sync {
 pub struct MemoryVault {
     entries: parking_lot::Mutex<std::collections::HashMap<String, Zeroizing<String>>>,
     presence_gated: bool,
+    refuse_deletes: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for MemoryVault {
@@ -136,6 +144,13 @@ impl MemoryVault {
         names.sort();
         names
     }
+
+    /// From now on every delete fails, as a keychain that refuses one does (`refuse`), or
+    /// works again.
+    pub fn refuse_deletes(&self, refuse: bool) {
+        self.refuse_deletes
+            .store(refuse, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl PasswordVault for MemoryVault {
@@ -160,6 +175,12 @@ impl PasswordVault for MemoryVault {
     }
 
     fn delete(&self, entry: &EntryName) -> Result<bool> {
+        if self
+            .refuse_deletes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(std::io::Error::other("the test keychain refused the delete").into());
+        }
         Ok(self.entries.lock().remove(entry.as_str()).is_some())
     }
 }
@@ -172,8 +193,9 @@ pub enum RememberOffer {
     Offered,
     /// No usable keychain: [`NO_KEYCHAIN`].
     NoKeychain,
-    /// The grant may carry the administrator level and the keychain has no presence gate:
-    /// [`ADMIN_NOT_REMEMBERED`].
+    /// The host's last signed answer reached administrator access, left `grant_reach` out
+    /// or was refused (`hosts.toml`'s `reach`), or the level is asked for: no password is
+    /// kept there, whatever the keychain (C5, C12): [`ADMIN_NOT_REMEMBERED`].
     NotForAdministrator,
 }
 
@@ -189,32 +211,89 @@ impl RememberOffer {
     }
 }
 
-/// How one unattended attempt ended, as far as the remembered password is concerned.
+/// How one unattended session attempt ended, as far as the remembered password is
+/// concerned (M1-67). A verified `ADMIN_RESULT` is settled by
+/// [`SavedPasswords::settle_admin`], which takes no password.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attempt {
-    /// The host accepted: its signed accept carried the administrator level or not.
+    /// The host's unattended `SESSION_ACCEPT` verified (C1): the level it signed and its
+    /// `grant_reach` (key 12; `None` when the host left it out, so the reach is unknown).
     Accepted {
-        /// The accept signed the administrator level.
-        administrator: bool,
+        /// The administrator level the accept signed.
+        elevation: Elevation,
+        /// What the password just proven can reach through Tornect on the host: 0 none,
+        /// 1 through the host, 2 this grant holds the level.
+        grant_reach: Option<u8>,
     },
+    /// This side refused the host's `SESSION_ACCEPT` or `ADMIN_RESULT` (its decoding, its
+    /// signature, `token_confirm`, `quic_spki`, `session_type` or F-8): the remembered
+    /// password is deleted, and not marked stale (C4).
+    AnswerRefused,
     /// The password was not proven: the host's `AUTH_FAILED`, or this side's own check of
-    /// the host's answer (a wrong password or a re-registered grant).
+    /// the host's PAKE reply, KE2 (a wrong password or a re-registered grant).
     PasswordRefused,
     /// Nothing was learned about the password: the host was not reached, the stream broke,
-    /// a newer request pre-empted this one, or a reject before the password counted.
+    /// a newer request pre-empted this one, or a reject before or after the password
+    /// counted (other than `AUTH_FAILED`).
     Inconclusive,
 }
 
-/// What [`SavedPasswords::settle`] did.
+impl Attempt {
+    /// C1: a verified answer reaches when it signed the administrator level or its
+    /// `grant_reach` is anything but `Some(0)` (1, 2, or left out). Taken from that answer
+    /// alone, never from `hosts.toml`.
+    #[must_use]
+    pub fn reaches(elevation: Elevation, grant_reach: Option<u8>) -> bool {
+        elevation == Elevation::Admin || grant_reach != Some(0)
+    }
+
+    /// Whether this attempt deletes the remembered password before anything else,
+    /// `hosts.toml` included (C2 step 1, C4): an accept that reaches, or a refused answer.
+    #[must_use]
+    pub fn deletes_first(self) -> bool {
+        match self {
+            Self::Accepted {
+                elevation,
+                grant_reach,
+            } => Self::reaches(elevation, grant_reach),
+            Self::AnswerRefused => true,
+            Self::PasswordRefused | Self::Inconclusive => false,
+        }
+    }
+}
+
+/// What a delete by the derived name did ([`SavedPasswords::delete_first`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deleted {
+    /// There was no entry, or no usable keychain.
+    Nothing,
+    /// The entry was deleted.
+    Entry,
+    /// The keychain refused the delete: the entry may still be there (C7).
+    Refused,
+}
+
+/// What [`SavedPasswords::settle`] or [`SavedPasswords::settle_admin`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Settled {
     /// A password is kept in the keychain for the host now.
     pub remembered: bool,
-    /// A kept password was deleted: it was refused, or the grant turned out to carry the
-    /// administrator level.
+    /// A remembered password was deleted: it was refused, or the host's answer reached
+    /// administrator access, left `grant_reach` out or was refused.
     pub forgot: bool,
+    /// The keychain refused to delete it: `remember` stays set, so that the check when the
+    /// prompt opens deletes it (C6, C7).
+    pub delete_failed: bool,
     /// `hosts.toml` changed and needs saving.
     pub changed: bool,
+}
+
+/// Set `flag` to `to`, noting a change.
+fn set(flag: &mut bool, to: bool, changed: &mut bool) {
+    if *flag != to {
+        *flag = to;
+        *changed = true;
+    }
 }
 
 /// This device's remembered passwords: a keychain (if one is usable) and the device key the
@@ -265,14 +344,15 @@ impl SavedPasswords {
         EntryName::derive(&self.device_pk, host.public_key_bytes())
     }
 
-    /// Whether "Remember on this device" is offered for `host`: `administrator` when the
-    /// saved record says the grant may carry the administrator level, or the person asks
-    /// for it this time.
+    /// Whether "Remember on this device" is offered for a host: `reach` when its saved
+    /// record says its last signed answer reached administrator access, left `grant_reach`
+    /// out or was refused, or the person asks for the level this time (C5). A presence gate
+    /// changes nothing (C12). The answer still decides what is kept (C1).
     #[must_use]
-    pub fn offer(&self, administrator: bool) -> RememberOffer {
+    pub fn offer(&self, reach: bool) -> RememberOffer {
         match &self.vault {
             None => RememberOffer::NoKeychain,
-            Some(v) if administrator && !v.presence_gated() => RememberOffer::NotForAdministrator,
+            Some(_) if reach => RememberOffer::NotForAdministrator,
             Some(_) => RememberOffer::Offered,
         }
     }
@@ -312,16 +392,50 @@ impl SavedPasswords {
         })
     }
 
-    /// Settle one attempt at `host`. `remember`: the password to keep, when the person
-    /// ticked "Remember on this device"; kept only after an accept, only when
-    /// [`Self::offer`] allows it for the level the accept signed. A refused password is
-    /// deleted and the record marked stale; a transport error, a `PREEMPTED` or a reject
-    /// before the password counted changes nothing.
+    /// C2 step 1, C4: delete `host`'s entry by its derived name. A caller deletes with this
+    /// before it reads `hosts.toml`, so that a file that cannot be read or saved does not
+    /// stop the delete (ST-4).
+    #[must_use]
+    pub fn delete_first(&self, host: &TornectId) -> Deleted {
+        match self.erase(host) {
+            Ok(true) => Deleted::Entry,
+            Ok(false) => Deleted::Nothing,
+            Err(_) => Deleted::Refused,
+        }
+    }
+
+    /// C6: when the prompt opens and before a command-line dial, a record that says both
+    /// that the host's last answer reached and that a password is remembered (a delete the
+    /// keychain refused, C7, or an edited file) has its entry deleted first; `remember` is
+    /// cleared once the delete worked. `None` when the record asks for nothing.
+    pub fn belt(&self, hosts: &mut HostsFile, host: &TornectId) -> Option<Deleted> {
+        if !hosts.get(host).is_some_and(|r| r.reach && r.remember) {
+            return None;
+        }
+        let gone = self.delete_first(host);
+        if gone != Deleted::Refused {
+            hosts.entry(host).remember = false;
+        }
+        Some(gone)
+    }
+
+    /// Settle one session attempt at `host` (M1-67, C1-C5). `first`: what
+    /// [`Self::delete_first`] did when the caller deleted before it read `hosts.toml`;
+    /// `None` deletes here, before `hosts` is touched, when the attempt asks for it.
+    /// `remember`: the password typed, when the person ticked "Remember on this device".
+    ///
+    /// The answer alone decides (C1), never the flags of `hosts`. An accept that reaches,
+    /// or a refused answer, keeps nothing typed and deletes the remembered password (C2,
+    /// C4); an accept of `grant_reach = 0` without the level keeps a typed password only
+    /// when Remember was ticked, deleting any entry under the name before it writes, and
+    /// leaves a remembered one in place (C3). A refused password is deleted and the record
+    /// marked stale; a transport error, a `PREEMPTED` or a reject changes nothing.
     pub fn settle(
         &self,
         hosts: &mut HostsFile,
         host: &TornectId,
         attempt: Attempt,
+        first: Option<Deleted>,
         remember: Option<&str>,
     ) -> Result<Settled> {
         let mut out = Settled::default();
@@ -338,37 +452,84 @@ impl SavedPasswords {
                     out.changed = true;
                 }
             }
-            Attempt::Accepted { administrator } => {
-                let record = hosts.entry(host);
-                if record.stale {
-                    record.stale = false;
-                    out.changed = true;
-                }
-                if administrator && !record.administrator {
-                    record.administrator = true;
-                    out.changed = true;
-                }
-                let may_admin = record.administrator;
-                let offered = self.offer(may_admin) == RememberOffer::Offered;
-                if !offered {
-                    // DA-14: a grant that carries the administrator level keeps no password
-                    // in a keychain that asks nobody.
-                    let had = hosts.get(host).is_some_and(|r| r.remember);
-                    out.changed |= self.forget(hosts, host)?;
-                    out.forgot = had;
-                } else if let (Some(password), Some(vault)) = (remember, &self.vault) {
-                    vault.put(&self.entry(host), password)?;
+            Attempt::AnswerRefused => {
+                let gone = first.unwrap_or_else(|| self.delete_first(host));
+                reached(hosts.entry(host), gone, false, &mut out);
+            }
+            Attempt::Accepted {
+                elevation,
+                grant_reach,
+            } => {
+                if Attempt::reaches(elevation, grant_reach) {
+                    let gone = first.unwrap_or_else(|| self.delete_first(host));
                     let record = hosts.entry(host);
-                    if !record.remember {
-                        record.remember = true;
-                        out.changed = true;
+                    set(&mut record.stale, false, &mut out.changed);
+                    reached(record, gone, grant_reach == Some(2), &mut out);
+                } else {
+                    let record = hosts.entry(host);
+                    set(&mut record.stale, false, &mut out.changed);
+                    not_reached(record, &mut out);
+                    if let (Some(password), Some(vault)) = (remember, &self.vault) {
+                        // ST-8: a delete reaches every link of the key, a write may not.
+                        let entry = self.entry(host);
+                        vault.delete(&entry)?;
+                        vault.put(&entry, password)?;
+                        set(&mut hosts.entry(host).remember, true, &mut out.changed);
                     }
+                    out.remembered = hosts.get(host).is_some_and(|r| r.remember);
                 }
-                out.remembered = hosts.get(host).is_some_and(|r| r.remember);
             }
         }
         Ok(out)
     }
+
+    /// Settle a verified `ADMIN_RESULT` at `host`. It never keeps a password, so it takes
+    /// none: the host marks a password only before it signs an accept (DA-15). An answer
+    /// that reaches (`grant_reach` other than `Some(0)`) deletes the remembered password as
+    /// an accept does (C2); at 0 a remembered one stays (C3). `first` as for
+    /// [`Self::settle`].
+    pub fn settle_admin(
+        &self,
+        hosts: &mut HostsFile,
+        host: &TornectId,
+        grant_reach: Option<u8>,
+        first: Option<Deleted>,
+    ) -> Settled {
+        let mut out = Settled::default();
+        if Attempt::reaches(Elevation::None, grant_reach) {
+            let gone = first.unwrap_or_else(|| self.delete_first(host));
+            let record = hosts.entry(host);
+            set(&mut record.stale, false, &mut out.changed);
+            reached(record, gone, grant_reach == Some(2), &mut out);
+        } else {
+            let record = hosts.entry(host);
+            set(&mut record.stale, false, &mut out.changed);
+            not_reached(record, &mut out);
+            out.remembered = record.remember;
+        }
+        out
+    }
+}
+
+/// C2 steps 2 and 3 (C4 likewise), after the delete: `reach` set, `administrator` to whether
+/// the answer said 2, `remember` cleared unless the keychain refused the delete (C7: it
+/// stays set, so that the prompt's check deletes it), nothing kept.
+fn reached(record: &mut HostRecord, gone: Deleted, administrator: bool, out: &mut Settled) {
+    set(&mut record.reach, true, &mut out.changed);
+    set(&mut record.administrator, administrator, &mut out.changed);
+    if gone == Deleted::Refused {
+        out.delete_failed = true;
+    } else {
+        out.forgot = gone == Deleted::Entry || record.remember;
+        set(&mut record.remember, false, &mut out.changed);
+    }
+    out.remembered = false;
+}
+
+/// C3: an answer of 0 clears both flags.
+fn not_reached(record: &mut HostRecord, out: &mut Settled) {
+    set(&mut record.reach, false, &mut out.changed);
+    set(&mut record.administrator, false, &mut out.changed);
 }
 
 #[cfg(feature = "keyring")]
@@ -624,6 +785,16 @@ mod tests {
         TornectId::from_bytes([n; 32])
     }
 
+    /// An accept of `grant_reach = 0` without the level: what may be kept (C3).
+    const ZERO: Attempt = Attempt::Accepted {
+        elevation: Elevation::None,
+        grant_reach: Some(0),
+    };
+
+    /// M1-67 (C5, C12): Remember is offered only with a usable keychain, and never where
+    /// the host's last answer reached administrator access, left the key out or was
+    /// refused, or the level is asked for; a keychain that asks the person first changes
+    /// nothing.
     #[test]
     fn remember_is_offered_only_with_a_keychain_and_never_for_administrator_without_a_gate() {
         let none = SavedPasswords::none([1; 32]);
@@ -635,7 +806,8 @@ mod tests {
         assert_eq!(plain.offer(true), RememberOffer::NotForAdministrator);
         assert_eq!(RememberOffer::Offered.sentence(), None);
         let gated = SavedPasswords::new(Some(Arc::new(MemoryVault::presence_gated())), [1; 32]);
-        assert_eq!(gated.offer(true), RememberOffer::Offered);
+        assert_eq!(gated.offer(false), RememberOffer::Offered);
+        assert_eq!(gated.offer(true), RememberOffer::NotForAdministrator);
     }
 
     #[test]
@@ -646,20 +818,13 @@ mod tests {
         let h = host(7);
         // A refusal before anything is kept remembers nothing.
         let s = saved
-            .settle(&mut hosts, &h, Attempt::PasswordRefused, Some("pw"))
+            .settle(&mut hosts, &h, Attempt::PasswordRefused, None, Some("pw"))
             .unwrap();
         assert!(!s.remembered && !s.forgot);
         assert!(vault.names().is_empty());
         // An accept keeps it, under the derived name only.
         let s = saved
-            .settle(
-                &mut hosts,
-                &h,
-                Attempt::Accepted {
-                    administrator: false,
-                },
-                Some("pw"),
-            )
+            .settle(&mut hosts, &h, ZERO, None, Some("pw"))
             .unwrap();
         assert!(s.remembered && s.changed);
         assert_eq!(vault.names(), vec![saved.entry(&h).as_str().to_owned()]);
@@ -674,87 +839,161 @@ mod tests {
         // Neither a transport error nor a pre-emption makes it stale.
         for _ in 0..3 {
             let s = saved
-                .settle(&mut hosts, &h, Attempt::Inconclusive, None)
+                .settle(&mut hosts, &h, Attempt::Inconclusive, None, None)
                 .unwrap();
             assert!(s.remembered && !s.forgot && !s.changed);
         }
         assert!(!hosts.get(&h).unwrap().stale);
         // A refusal does: the entry goes, the record says why.
         let s = saved
-            .settle(&mut hosts, &h, Attempt::PasswordRefused, None)
+            .settle(&mut hosts, &h, Attempt::PasswordRefused, None, None)
             .unwrap();
         assert!(s.forgot && !s.remembered && s.changed);
         assert!(vault.names().is_empty());
         assert!(hosts.get(&h).unwrap().stale);
         assert_eq!(saved.recall(&hosts, &h).unwrap(), None);
         // The next accept clears the mark; without Remember nothing is kept.
-        saved
-            .settle(
-                &mut hosts,
-                &h,
-                Attempt::Accepted {
-                    administrator: false,
-                },
-                None,
-            )
-            .unwrap();
+        saved.settle(&mut hosts, &h, ZERO, None, None).unwrap();
         let r = hosts.get(&h).unwrap();
         assert!(!r.stale && !r.remember);
         assert!(vault.names().is_empty());
     }
 
-    /// DA-14: once an accept signed the administrator level, a keychain with no presence
-    /// gate holds no password for that host, and Remember is not offered again.
+    /// M1-67 (C1, C2, C12): an accept that says 2 deletes the remembered password even when
+    /// the level was not asked for, and keeps nothing typed; so do an accept that says 1,
+    /// one that leaves the key out and one that signs the level. A keychain that asks the
+    /// person first keeps nothing either. The record says so, for the prompt only.
     #[test]
     fn an_administrator_grant_keeps_no_password_without_a_presence_gate() {
+        for gated in [false, true] {
+            let vault = Arc::new(if gated {
+                MemoryVault::presence_gated()
+            } else {
+                MemoryVault::new()
+            });
+            let saved = SavedPasswords::new(Some(vault.clone()), [1; 32]);
+            for (elevation, grant_reach) in [
+                (Elevation::None, Some(2)),
+                (Elevation::None, Some(1)),
+                (Elevation::None, None),
+                (Elevation::Admin, Some(2)),
+            ] {
+                let mut hosts = HostsFile::default();
+                let h = host(9);
+                saved
+                    .settle(&mut hosts, &h, ZERO, None, Some("pw"))
+                    .unwrap();
+                assert_eq!(vault.names().len(), 1);
+                let reaching = Attempt::Accepted {
+                    elevation,
+                    grant_reach,
+                };
+                let s = saved
+                    .settle(&mut hosts, &h, reaching, None, Some("pw"))
+                    .unwrap();
+                let case = format!("{gated} {elevation:?} {grant_reach:?}");
+                assert!(s.forgot && !s.remembered && !s.delete_failed, "{case}");
+                assert!(vault.names().is_empty(), "{case}");
+                let r = hosts.get(&h).unwrap();
+                assert!(r.reach && !r.remember && !r.stale, "{case}");
+                assert_eq!(r.administrator, grant_reach == Some(2), "{case}");
+                assert_eq!(
+                    saved.offer(r.reach),
+                    RememberOffer::NotForAdministrator,
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// C1 (`settle` never reads the cache flags): over every start of the record's four
+    /// flags, with and without an entry already kept, every answer and the tick, the
+    /// keychain ends as the answer alone says, and so do the flags.
+    #[test]
+    fn settle_decides_from_the_body_never_from_the_flags() {
+        let answers = [
+            (Elevation::None, None),
+            (Elevation::None, Some(0)),
+            (Elevation::None, Some(1)),
+            (Elevation::None, Some(2)),
+            (Elevation::Admin, None),
+            (Elevation::Admin, Some(0)),
+            (Elevation::Admin, Some(2)),
+        ];
+        for bits in 0u8..16 {
+            for kept_before in [false, true] {
+                for (elevation, grant_reach) in answers {
+                    for tick in [false, true] {
+                        let vault = Arc::new(MemoryVault::new());
+                        let saved = SavedPasswords::new(Some(vault.clone()), [1; 32]);
+                        let h = host(4);
+                        let mut hosts = HostsFile::default();
+                        let r = hosts.entry(&h);
+                        r.reach = bits & 1 != 0;
+                        r.administrator = bits & 2 != 0;
+                        r.remember = bits & 4 != 0;
+                        r.stale = bits & 8 != 0;
+                        if kept_before {
+                            vault.put(&saved.entry(&h), "old").unwrap();
+                        }
+                        let answer = Attempt::Accepted {
+                            elevation,
+                            grant_reach,
+                        };
+                        let s = saved
+                            .settle(&mut hosts, &h, answer, None, tick.then_some("typed"))
+                            .unwrap();
+                        let now = vault.get(&saved.entry(&h)).unwrap();
+                        let now = now.as_deref().map(String::as_str);
+                        let r = hosts.get(&h).unwrap();
+                        let case = format!(
+                            "{bits:04b} {kept_before} {elevation:?} {grant_reach:?} {tick}"
+                        );
+                        if elevation == Elevation::Admin || grant_reach != Some(0) {
+                            assert_eq!(now, None, "{case}");
+                            assert!(!s.remembered && !r.remember && r.reach, "{case}");
+                            assert_eq!(r.administrator, grant_reach == Some(2), "{case}");
+                        } else {
+                            let expected = match (tick, kept_before) {
+                                (true, _) => Some("typed"),
+                                (false, true) => Some("old"),
+                                (false, false) => None,
+                            };
+                            assert_eq!(now, expected, "{case}");
+                            assert!(!r.reach && !r.administrator, "{case}");
+                            assert_eq!(r.remember, tick || bits & 4 != 0, "{case}");
+                        }
+                        assert!(!r.stale, "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// C4: a refused answer deletes the remembered password and does not mark it stale:
+    /// the record says only that the reach is unknown, and the next accept of 0 may keep a
+    /// ticked password again (C10).
+    #[test]
+    fn a_refused_accept_deletes_and_is_not_stale() {
         let vault = Arc::new(MemoryVault::new());
         let saved = SavedPasswords::new(Some(vault.clone()), [1; 32]);
         let mut hosts = HostsFile::default();
-        let h = host(9);
+        let h = host(6);
         saved
-            .settle(
-                &mut hosts,
-                &h,
-                Attempt::Accepted {
-                    administrator: false,
-                },
-                Some("pw"),
-            )
+            .settle(&mut hosts, &h, ZERO, None, Some("pw"))
             .unwrap();
-        assert_eq!(vault.names().len(), 1);
         let s = saved
-            .settle(
-                &mut hosts,
-                &h,
-                Attempt::Accepted {
-                    administrator: true,
-                },
-                Some("pw"),
-            )
+            .settle(&mut hosts, &h, Attempt::AnswerRefused, None, Some("pw"))
             .unwrap();
-        assert!(s.forgot && !s.remembered);
+        assert!(s.forgot && !s.remembered && s.changed);
         assert!(vault.names().is_empty());
         let r = hosts.get(&h).unwrap();
-        assert!(r.administrator && !r.remember);
-        assert_eq!(
-            saved.offer(r.administrator),
-            RememberOffer::NotForAdministrator
-        );
-        // A presence-gated keychain may keep it.
-        let gated = Arc::new(MemoryVault::presence_gated());
-        let saved = SavedPasswords::new(Some(gated.clone()), [1; 32]);
-        let s = saved
-            .settle(
-                &mut hosts,
-                &h,
-                Attempt::Accepted {
-                    administrator: true,
-                },
-                Some("pw"),
-            )
+        assert!(!r.stale && !r.remember && r.reach && !r.administrator);
+        saved
+            .settle(&mut hosts, &h, ZERO, None, Some("pw"))
             .unwrap();
-        assert!(s.remembered);
-        assert_eq!(gated.names().len(), 1);
+        assert!(!hosts.get(&h).unwrap().reach);
+        assert_eq!(vault.names().len(), 1);
     }
 
     #[test]
@@ -764,14 +1003,7 @@ mod tests {
         let mut hosts = HostsFile::default();
         let h = host(3);
         saved
-            .settle(
-                &mut hosts,
-                &h,
-                Attempt::Accepted {
-                    administrator: false,
-                },
-                Some("pw"),
-            )
+            .settle(&mut hosts, &h, ZERO, None, Some("pw"))
             .unwrap();
         assert!(saved.forget(&mut hosts, &h).unwrap());
         assert!(vault.names().is_empty());
