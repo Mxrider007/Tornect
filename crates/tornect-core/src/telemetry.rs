@@ -22,13 +22,15 @@ tornect_net=debug,tornect_proto=debug,tornect_session=debug,arti=warn,tor=warn,z
 
 /// The fields whose values name a person, a device or a computer: a peer's
 /// fingerprint or key, a pinned label or declared name, a Tornect ID or its
-/// prefix, an onion address, a keystore nickname. The log writes
-/// `<redacted>` in their place under every filter (`docs/PLAN.md` §B.6: no
-/// identifier in logs by default; U3-L3: a filter set for more detail,
-/// `TORNECT_LOG`, `RUST_LOG` or `--log`, keeps it); only the explicit opt-in
+/// prefix, an onion address, a keystore nickname, a file or directory path
+/// (under the home directory it names the account; a keystore path holds a
+/// Tornect ID's prefix, FR2R-I6). The log writes `<redacted>` in their place
+/// under every filter (`docs/PLAN.md` §B.6: no identifier in logs by
+/// default; U3-L3: a filter set for more detail, `TORNECT_LOG`, `RUST_LOG`
+/// or `--log`, keeps it); only the explicit opt-in
 /// ([`LogOptions::identifiers`], [`IDENTIFIERS_ENV`]) writes them as they
 /// are.
-pub const SENSITIVE_FIELDS: [&str; 10] = [
+pub const SENSITIVE_FIELDS: [&str; 12] = [
     "peer",
     "device",
     "fingerprint",
@@ -39,6 +41,8 @@ pub const SENSITIVE_FIELDS: [&str; 10] = [
     "host",
     "address",
     "nickname",
+    "path",
+    "state_dir",
 ];
 
 /// The environment variable that writes identifiers into the log when it is
@@ -382,6 +386,118 @@ mod tests {
         ] {
             let text = logged(opts.clone(), &env);
             for said in ["3f2a91c0", "Laptop", "abcdefghijklmnop.onion"] {
+                assert!(
+                    text.contains(said),
+                    "{opts:?} {env:?}: \"{said}\" missing:\n{text}"
+                );
+            }
+        }
+    }
+
+    /// FR2R-I6: a path in a log field (under the home directory it names the
+    /// account; a keystore path holds a Tornect ID's prefix) reads
+    /// `<redacted>` under the default and a chosen filter, as the other
+    /// identifying fields do, and the line still says what happened; a JSON
+    /// line below WARN that carries one is left out. Only the identifier
+    /// opt-in writes it as it is.
+    #[test]
+    fn a_path_field_is_redacted_without_the_opt_in() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        const HOME: &str = "/home/account";
+        let logged = |opts: LogOptions, env: &[(&str, &str)]| -> String {
+            let buffer = Buffer::default();
+            let writer = buffer.clone();
+            let lookup = |name: &str| {
+                env.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| (*v).to_owned())
+            };
+            let (subscriber, _guard) =
+                subscriber(opts, &lookup, move || writer.clone(), false).unwrap();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::callsite::rebuild_interest_cache();
+                tracing::info!(target: "tornect_core::session_log", path = %"/home/account/.local/state/tornect/sessions.log", "rotated sessions.log");
+                tracing::debug!(target: "tornect_signal::tor::identity", path = %"/home/account/.local/state/tornect/arti/keystore/hss/tornect-abcdefgh/ks_hs_id.ed25519_expanded_private", "removing unrecognized keystore file");
+                tracing::info!(target: "tornect_signal::tor::node", state_dir = %"/home/account/.local/state/tornect/arti", "Tor client created");
+            });
+            String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap()
+        };
+        for (opts, env) in [
+            (LogOptions::default(), vec![]),
+            (
+                LogOptions {
+                    filter: Some("trace".to_owned()),
+                    ..LogOptions::default()
+                },
+                vec![],
+            ),
+            (LogOptions::default(), vec![("TORNECT_LOG", "debug")]),
+        ] {
+            let text = logged(opts.clone(), &env);
+            for said in [
+                "rotated sessions.log",
+                "removing unrecognized keystore file",
+                "Tor client created",
+                "path=<redacted>",
+                "state_dir=<redacted>",
+            ] {
+                assert!(
+                    text.contains(said),
+                    "{opts:?} {env:?}: \"{said}\" missing:\n{text}"
+                );
+            }
+            for secret in [HOME, "abcdefgh"] {
+                assert!(
+                    !text.contains(secret),
+                    "{opts:?} {env:?}: \"{secret}\" in:\n{text}"
+                );
+            }
+        }
+        let json = logged(
+            LogOptions {
+                json: true,
+                ..LogOptions::default()
+            },
+            &[],
+        );
+        assert!(!json.contains(HOME), "{json}");
+        for (opts, env) in [
+            (
+                LogOptions {
+                    identifiers: true,
+                    ..LogOptions::default()
+                },
+                vec![],
+            ),
+            (LogOptions::default(), vec![(IDENTIFIERS_ENV, "1")]),
+            (
+                LogOptions {
+                    json: true,
+                    identifiers: true,
+                    ..LogOptions::default()
+                },
+                vec![],
+            ),
+        ] {
+            let text = logged(opts.clone(), &env);
+            for said in [
+                "/home/account/.local/state/tornect/sessions.log",
+                "tornect-abcdefgh",
+                "/home/account/.local/state/tornect/arti",
+            ] {
                 assert!(
                     text.contains(said),
                     "{opts:?} {env:?}: \"{said}\" missing:\n{text}"
