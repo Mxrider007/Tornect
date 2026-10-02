@@ -931,15 +931,17 @@ mod tests {
         }
     }
 
-    /// §B.8.10, §B.8.9.1: the prompt is masked with a reveal toggle and
-    /// "View only this time"; "Remember on this device" is off, with its
-    /// risk copy, and absent without a keychain and for a grant that may
-    /// carry the administrator level (the sentence says why); what the
-    /// computer said about waiting shows before submitting.
+    /// §B.8.10, §B.8.9.1, decision M1-67: the prompt is masked with a reveal
+    /// toggle and "View only this time"; "Remember on this device" is off,
+    /// with its risk copy and the sentence that the host's answer decides,
+    /// and absent without a keychain and where the host's last answer
+    /// reached administrator access, left the key out or was refused, or the
+    /// level is asked for (the sentence says why); what the computer said
+    /// about waiting shows before submitting.
     #[test]
     fn the_prompt_offers_remember_only_where_it_may() {
         use tornect_core::unattended::credentials::{
-            ADMIN_NOT_REMEMBERED, NO_KEYCHAIN, RememberOffer,
+            NO_KEYCHAIN, RememberOffer, reach_not_remembered,
         };
         let mut model = with_book(false);
         let id = office(&model);
@@ -956,6 +958,11 @@ mod tests {
         }
         assert!(!controls.iter().any(|c| c == "Ask for administrator access"));
         assert!(has_text(&window, "any program running as you can read it"));
+        assert!(has_text(
+            &window,
+            "If \"Office PC\" lets your access use administrator access through Tornect, \
+             the password is not remembered."
+        ));
         assert!(has_text(&window, "Connect to \"Office PC\" without asking"));
         assert!(!window.form.ua.remember, "off by default");
 
@@ -978,7 +985,13 @@ mod tests {
         let controls = window.controls();
         assert!(controls.iter().any(|c| c == "Ask for administrator access"));
         assert!(!controls.iter().any(|c| c == "Remember on this device"));
-        assert!(has_text(&window, ADMIN_NOT_REMEMBERED));
+        let reach = reach_not_remembered("\"Office PC\"");
+        assert_eq!(
+            reach,
+            "A password that can reach administrator access on \"Office PC\", or that \
+             \"Office PC\" did not rule out, is never remembered."
+        );
+        assert!(has_text(&window, &reach));
         // View only asks for no level: the choice goes.
         window.form.ua.administrator = true;
         window.form.ua.view_only = true;
@@ -990,6 +1003,17 @@ mod tests {
                 .any(|c| c == "Ask for administrator access")
         );
         assert!(!window.form.ua.administrator);
+
+        let mut reached = model.clone();
+        reached.prompt.as_mut().unwrap().remember = (
+            RememberOffer::NotForAdministrator,
+            RememberOffer::NotForAdministrator,
+        );
+        let window = Window::new(reached, Page::Home, egui::Theme::Dark, WIDE);
+        let controls = window.controls();
+        assert!(!controls.iter().any(|c| c == "Remember on this device"));
+        assert!(!controls.iter().any(|c| c == "Ask for administrator access"));
+        assert!(has_text(&window, &reach));
 
         let mut waiting = model;
         waiting.prompt.as_mut().unwrap().retry_at = Some(Instant::now() + Duration::from_secs(600));

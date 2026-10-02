@@ -1174,6 +1174,11 @@ async fn admin_command(
     };
     let host = known.label.clone();
     let saved = ua_client::system_passwords(&b.device);
+    let (named, keychain) = (
+        format!("\"{host}\""),
+        saved.keychain().unwrap_or("the keychain"),
+    );
+    let mut notes = Vec::new();
     let said = match node
         .connect_on(&id, SIGNALING_PORT, &Isolation::new())
         .await
@@ -1204,8 +1209,18 @@ async fn admin_command(
                 Ok(answer) => {
                     // An admin answer keeps no password (DA-15). Its `grant_reach` is not
                     // decoded yet: absent, so a remembered password goes (C1).
-                    if let Err(e) = ua_client::settle_admin(&b.paths, &saved, &id, None) {
-                        tracing::warn!(error = %format!("{e:#}"), "hosts.toml could not be updated");
+                    let grant_reach = None;
+                    match ua_client::settle_admin(&b.paths, &saved, &id, grant_reach) {
+                        Ok(settled) => {
+                            notes = ua_client::notes(
+                                &named,
+                                keychain,
+                                ua_client::Answered::Admin { grant_reach },
+                                false,
+                                Some(&settled),
+                            );
+                        }
+                        Err(e) => notes.push(format!("hosts.toml could not be updated: {e:#}")),
                     }
                     ua_client::log_attempt(
                         &b.paths,
@@ -1230,10 +1245,17 @@ async fn admin_command(
                 }
                 Err(e) => {
                     let ended = ua_client::ended(&e, &host);
-                    if let Err(err) =
-                        ua_client::settle(&b.paths, &saved, &id, ended.attempt, &request)
-                    {
-                        tracing::warn!(error = %format!("{err:#}"), "hosts.toml could not be updated");
+                    match ua_client::settle(&b.paths, &saved, &id, ended.attempt, &request) {
+                        Ok(settled) => {
+                            notes =
+                                ua_client::refused_notes(&named, keychain, ended.attempt, &settled);
+                        }
+                        Err(err) if ended.attempt.deletes_first() => {
+                            notes.push(format!("hosts.toml could not be updated: {err:#}"));
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %format!("{err:#}"), "hosts.toml could not be updated");
+                        }
                     }
                     ua_client::log_attempt(&b.paths, &known, &Logged::Ended(&ended.reason));
                     if ended.blocks {
@@ -1246,7 +1268,12 @@ async fn admin_command(
             }
         }
     };
-    b.shared.update(|m| m.note(said));
+    b.shared.update(|m| {
+        m.note(said);
+        for note in notes {
+            m.note(note);
+        }
+    });
     refresh_book(&b, None);
 }
 
@@ -1403,9 +1430,26 @@ async fn viewed(
     if let (Some(request), Some(known), Err(e)) = (&ua, &known, &outcome) {
         let ended = ua_client::ended(e, &known.label);
         let saved = ua_client::system_passwords(&b.device);
-        if let Err(err) = ua_client::settle(&b.paths, &saved, &id, ended.attempt, request) {
-            tracing::warn!(error = %format!("{err:#}"), "hosts.toml could not be updated");
-        }
+        let notes = match ua_client::settle(&b.paths, &saved, &id, ended.attempt, request) {
+            Ok(settled) => ua_client::refused_notes(
+                &format!("\"{}\"", known.label),
+                saved.keychain().unwrap_or("the keychain"),
+                ended.attempt,
+                &settled,
+            ),
+            Err(err) if ended.attempt.deletes_first() => {
+                vec![format!("hosts.toml could not be updated: {err:#}")]
+            }
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "hosts.toml could not be updated");
+                Vec::new()
+            }
+        };
+        b.shared.update(|m| {
+            for note in notes {
+                m.note(note);
+            }
+        });
         ua_client::log_attempt(&b.paths, known, &Logged::Ended(&ended.reason));
         let (why, step) = ua_failure(e, &ended);
         b.shared.update(|m| {
@@ -1464,10 +1508,33 @@ async fn viewed(
             elevation: session.accept().elevation(),
             grant_reach: None,
         };
-        if let Err(e) = ua_client::settle(&b.paths, &saved, &id, answer, request) {
-            b.shared
-                .update(|m| m.note(format!("The password could not be remembered: {e:#}")));
+        let settled = ua_client::settle(&b.paths, &saved, &id, answer, request);
+        let mut notes = Vec::new();
+        match &settled {
+            Ok(_) => {}
+            Err(e) if answer.deletes_first() => {
+                notes.push(format!("hosts.toml could not be updated: {e:#}"));
+            }
+            Err(e) => notes.push(format!("The password could not be remembered: {e:#}")),
         }
+        notes.extend(ua_client::notes(
+            &format!("\"{host}\""),
+            saved.keychain().unwrap_or("the keychain"),
+            ua_client::Answered::Session {
+                elevation: session.accept().elevation(),
+                grant_reach: None,
+                asked_control: !request.view_only,
+                given_control: control,
+                withheld: session.elevation_withheld(),
+            },
+            request.remember,
+            settled.as_ref().ok(),
+        ));
+        b.shared.update(|m| {
+            for note in notes {
+                m.note(note);
+            }
+        });
         if let Err(e) = ua_client::note_mode(&b.paths, &id, control) {
             tracing::warn!(error = %format!("{e:#}"), "hosts.toml could not be updated");
         }
