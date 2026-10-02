@@ -1791,7 +1791,7 @@ dots). Files, all 0600 under `Paths::state_dir`, written atomically:
   address*, shown "not paired yet". Its `later` table is an **allowlist** — a `remembered` flag, the words cache,
   display preferences — never a password, stop code, backup passphrase, token, PAKE message or key; unknown keys are
   kept for forward compatibility but never interpreted;
-- `recent.toml` (M-UI-2) — the recent connections, with the level of each (r7), written only while history is on;
+- `recent.toml` (M-UI-2) — the recent connections, with the level of each (r7), written only while history is on (off by default, the operator's ruling of 2026-09-28);
   Clear deletes it.
 
 **Saved credentials** (M-FEAT-4; decision M1-67): a remembered unattended password lives only in an OS keychain through
@@ -1847,8 +1847,7 @@ import never creates a pin.
 `last_seen` whatever the user chose: `KnownHosts::touch` writes it into `known-hosts.toml` at every completed handshake
 (`crates/tornect-core/src/trusted.rs`, called from `tornect-signal`'s pairing code), and the host's
 `TrustedDeviceStore::touch` writes it into `trusted-devices.toml` on every signed `SESSION_REQUEST`; the history switch
-must stop both (M-UI-2). Not history, and not switched off: the host's `sessions.log` (the §B.6 audit) and the
-client's unattended-connect line (B.8.10); the Privacy page says both are kept and never leave the computer.
+must stop both (M-UI-2). Not history, and never switched off: `sessions.log` records connection attempts in both directions — on the host every pairing and session request, attended and unattended (the §B.6 audit), on the client every unattended connect and admin command of this device (`UnattendedConnect`, B.8.10, B.8.13). The first-run line, the Recent tab's Off text, Forget and the Privacy page name it: the log of your unattended connections, always kept, never sent (the operator's ruling on F4-M1); where they say what is recorded, they say: "connection attempts to this computer, and the unattended connections and admin commands of this device, are always recorded in the session log; the history switch governs only the address book's recent list."
 
 **Export/import** (`tornect book export|import`, beside B.8.12): names, addresses, notes and the pinned host keys as
 *expected* keys; never passwords, never this device's identity key; encrypted like the B.8.9 backup (Argon2id +
@@ -1940,7 +1939,7 @@ per reason per device per 60 s with `count`), `UnattendedChallengeIssued`,
 `AutostartChanged` (`by`, B.8.7.4),
 `UnattendedEnabled|Disabled|Paused`, `PasswordSet`, `AdminRequest` (written for every `ADMIN_RESULT`, an unknown command included: `op` `unknown`; M1-67), `EmergencyStop`, `BackupExported`,
 `PopupSuppressedRemoteSession`, `GrantMutationRefused`, `StoreLoadFailed`, `ClockAnomaly`,
-`HostNotReady`, `SessionEndingSoon`, and (r7, M-FEAT-3) `AdminHelperStarted|Stopped|Failed`. New optional fields: `elevation` (r7), `grant`, `by: Actor`, `reason`,
+`HostNotReady`, `SessionEndingSoon`, (r7, M-FEAT-3) `AdminHelperStarted|Stopped|Failed` (`reason`; `Failed`: the helper could not be started or attached, so the session got no administrator access), and (r7, M-FEAT-4, client side) `UnattendedConnect` (one line per unattended connect or admin command of this device: the host's pinned device and label, the outcome as `reason`, and for a session its id, mode and `elevation`, for a command `op` and `ok`). New optional fields: `elevation` (r7; written only at the administrator level, so a line at none keeps its old bytes), `grant`, `by: Actor`, `reason`,
 `failures`, `lock_secs`, `count`, `block: elapsed|blocked|skipped`, `ended_by`,
 `during_remote_session`, `prev` (SHA-256 of the previous line; for the first line of a new file
 the SHA-256 of the last line of the rotated file), `tag = HMAC-SHA256(K_log, line_without_tag)`
