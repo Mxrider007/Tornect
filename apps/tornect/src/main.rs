@@ -495,6 +495,7 @@ fn main() -> anyhow::Result<()> {
     }
     let cli = Cli::parse();
     host::opt_in_evidence(cli.evidence);
+    admin_helper::opt_in_log_identifiers(cli.log_identifiers);
     let _log_guard = telemetry::init(LogOptions {
         filter: cli.log.clone(),
         file_dir: None,
