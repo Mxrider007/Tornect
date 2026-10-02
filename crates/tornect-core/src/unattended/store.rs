@@ -700,6 +700,10 @@ impl GrantStore {
                                 };
                                 disabled += 1;
                             }
+                            // What happened to a restored password after the backup is
+                            // unknown: every grant is marked, disabled ones included
+                            // (decision M1-67, D9).
+                            g.unmarked = false;
                         }
                         store.machine_id_hash = hash;
                         tracing::warn!(
@@ -764,8 +768,9 @@ impl GrantStore {
     }
 
     /// A store without a recorded machine id adopts this machine's (§B.8.12: the check
-    /// is armed from the next load on); returns whether the field changed. Persisted by
-    /// the load-time write, or by the next write of either class.
+    /// is armed from the next load on) and marks every grant, as a restore does (it may
+    /// be one this host could not detect; decision M1-67, D9); returns whether the field
+    /// changed. Persisted by the load-time write, or by the next write of either class.
     fn adopt_machine_id(&self, st: &mut State) -> bool {
         let Some(id) = self.inner.machine_id.as_deref() else {
             return false;
@@ -777,7 +782,12 @@ impl GrantStore {
             return false;
         }
         store.machine_id_hash = Some(codec::machine_id_hash(id));
-        tracing::info!("unattended store had no machine id recorded: adopted this machine's");
+        for g in &mut store.grants {
+            g.unmarked = false;
+        }
+        tracing::info!(
+            "unattended store had no machine id recorded: adopted this machine's, every grant marked"
+        );
         true
     }
 

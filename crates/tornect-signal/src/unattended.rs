@@ -811,11 +811,10 @@ impl UnattendedAuth {
     }
 }
 
-/// Whether `grant`'s password is marked "answered 0" (decision M1-67, D9, D11). Until
-/// the store keeps the mark (key 25, absent = marked) every grant reads as marked: the
-/// safe direction.
-fn marked(_grant: &UnattendedGrant) -> bool {
-    true
+/// Whether `grant`'s password is marked "answered 0" (decision M1-67, D9, D11): store
+/// key 25 absent or false. Only a registration sent as generated clears the mark.
+fn marked(grant: &UnattendedGrant) -> bool {
+    grant.marked()
 }
 
 /// Whether some grant in the store holds the administrator level (clause (ii)). No grant

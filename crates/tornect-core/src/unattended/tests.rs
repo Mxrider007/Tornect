@@ -9,6 +9,7 @@ use zeroize::Zeroizing;
 
 use crate::id::DeviceId;
 use crate::keystore::{FileSecretStore, KeystoreKind, SecretStore};
+use crate::levels::Elevation;
 use crate::paths::Paths;
 use crate::session_log::{
     Actor, ChainStatus, SessionEvent, SessionLog, SessionMode, SessionRecord, TransportKind,
@@ -946,6 +947,7 @@ fn u4_machine_id_mismatch_disables_every_grant_by_restore() {
     let store = env.open();
     let d = dev(1);
     let g = enable(&env, &store, d, Preset::MyMachines);
+    unmark_all(&store);
     drop((g, store));
     env.machine_id = Some(b"machine-B".to_vec());
     let store = env.open();
@@ -958,6 +960,7 @@ fn u4_machine_id_mismatch_disables_every_grant_by_restore() {
             ..
         }
     ));
+    assert!(grant.marked(), "a restore marks the grant (M1-67, D9)");
     assert_eq!(
         store.read(|s| s.machine_id_hash).unwrap(),
         Some(codec::machine_id_hash(b"machine-B"))
@@ -2732,6 +2735,12 @@ fn arb_grant() -> impl Strategy<Value = UnattendedGrant> {
                 state,
                 last_used,
                 fail,
+                elevation: if (created_at / 2) % 2 == 0 {
+                    Elevation::Admin
+                } else {
+                    Elevation::None
+                },
+                unmarked: (created_at / 4) % 2 == 0,
             },
         )
 }
@@ -3613,6 +3622,7 @@ fn u4_missing_machine_id_is_adopted_and_a_later_mismatch_disables() {
     let d = dev(1);
     let g = enable(&env, &store, d, Preset::MyMachines);
     assert_eq!(store.read(|s| s.machine_id_hash).unwrap(), None);
+    unmark_all(&store);
     drop((g, store));
     env.machine_id = Some(b"machine-A".to_vec());
     let store = env.open();
@@ -3620,6 +3630,10 @@ fn u4_missing_machine_id_is_adopted_and_a_later_mismatch_disables() {
         store.grant(&d).unwrap().state,
         GrantState::Active,
         "nothing to compare against: no disable"
+    );
+    assert!(
+        store.grant(&d).unwrap().marked(),
+        "the adoption marks (M1-67, D9)"
     );
     assert_eq!(
         store.read(|s| s.machine_id_hash).unwrap(),
@@ -3984,4 +3998,207 @@ fn post_f2_tor_only_grant_on_a_lan_only_host_is_transport_unavailable() {
         ),
         Err(PostF2Reject::Cooldown { .. })
     ));
+}
+
+// ------------------------------------------------------------------ store keys 24 and 25 (M1-67, D9)
+
+/// A grant built the same way every time.
+fn fixed_grant() -> UnattendedGrant {
+    UnattendedGrant::from_preset(
+        [7; 8],
+        dev(1),
+        "Laptop",
+        Actor::Ui,
+        Preset::MyMachines,
+        1,
+        AuthRecord::Opaque {
+            record: Zeroizing::new(vec![0xAB; 192]),
+        },
+        T0,
+    )
+    .unwrap()
+}
+
+/// The top-level keys of a CBOR map, in order.
+fn map_keys(bytes: &[u8]) -> Vec<u32> {
+    let mut d = minicbor::Decoder::new(bytes);
+    let n = d.map().unwrap().unwrap();
+    (0..n)
+        .map(|_| {
+            let k = d.u32().unwrap();
+            d.skip().unwrap();
+            k
+        })
+        .collect()
+}
+
+/// `bytes`, a definite CBOR map, with `count` entries that `extra` writes appended.
+fn map_plus(
+    bytes: &[u8],
+    count: u64,
+    extra: impl FnOnce(&mut minicbor::Encoder<Vec<u8>>),
+) -> Vec<u8> {
+    let mut d = minicbor::Decoder::new(bytes);
+    let n = d.map().unwrap().unwrap();
+    let body = &bytes[d.position()..];
+    let mut e = minicbor::Encoder::new(Vec::new());
+    e.map(n + count).unwrap();
+    e.writer_mut().extend_from_slice(body);
+    extra(&mut e);
+    e.into_writer()
+}
+
+/// The fixed grant as a build before decision M1-67 encoded it (captured from that
+/// build): a grant at none and marked must keep exactly these bytes.
+const FIXED_GRANT_BEFORE_M1_67: &str = "b500480707070707070707015820010101010101010101010101010101010101010101010101010101010101010102664c6170746f700300041a6a922100051a6a92210006000701088200a10058c0abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab09000b1a6b08c8000cf50e000f0310f411f412f413f41414158200a017a80000010002f40400051a6a92210006f4071a6a922100081a6a922100";
+
+#[test]
+fn store_keys_24_and_25_decode_and_an_older_rewrite_drops_them() {
+    let plain = minicbor::to_vec(fixed_grant()).unwrap();
+    assert_eq!(
+        hex::encode(&plain),
+        FIXED_GRANT_BEFORE_M1_67,
+        "a grant at none and marked writes neither key 24 nor key 25"
+    );
+    // keys 24 (the level, 1 = administrator) and 25 (unmarked), and a key no build knows
+    let added = map_plus(&plain, 3, |e| {
+        e.u32(24).unwrap().u8(1).unwrap();
+        e.u32(25).unwrap().bool(true).unwrap();
+        e.u32(99).unwrap().str("future").unwrap();
+    });
+    let back: UnattendedGrant = minicbor::decode(&added).unwrap();
+    assert_eq!(back.elevation, Elevation::Admin);
+    assert!(back.holds_level() && !back.marked());
+    let rewritten = minicbor::to_vec(&back).unwrap();
+    let mut expected = map_keys(&plain);
+    expected.extend([24, 25]);
+    assert_eq!(
+        map_keys(&rewritten),
+        expected,
+        "keys 24 and 25 survive a rewrite by this build, the unknown key does not; the grant \
+         without them: {}",
+        hex::encode(&plain)
+    );
+    // An older build decodes the same bytes skipping both keys and rewrites the store
+    // with what it knows (`store.rs` re-encodes the whole store): the plain bytes, which
+    // read as level none and marked. The safe direction.
+    let older: UnattendedGrant = minicbor::decode(&plain).unwrap();
+    assert_eq!(older.elevation, Elevation::None);
+    assert!(older.marked() && !older.holds_level());
+    // Key 25 written as false reads as marked; a level code this build does not know
+    // reads as none.
+    let falsy = map_plus(&plain, 1, |e| {
+        e.u32(25).unwrap().bool(false).unwrap();
+    });
+    assert!(
+        minicbor::decode::<UnattendedGrant>(&falsy)
+            .unwrap()
+            .marked()
+    );
+    let unknown_level = map_plus(&plain, 1, |e| {
+        e.u32(24).unwrap().u8(7).unwrap();
+    });
+    let read = minicbor::decode::<UnattendedGrant>(&unknown_level).unwrap();
+    assert_eq!(read.elevation, Elevation::None);
+    // Unmarked at none writes key 25 alone; marked at the level writes key 24 alone.
+    let mut g = fixed_grant();
+    g.unmarked = true;
+    let mut keys = map_keys(&plain);
+    keys.push(25);
+    assert_eq!(map_keys(&minicbor::to_vec(&g).unwrap()), keys);
+    let mut g = fixed_grant();
+    g.elevation = Elevation::Admin;
+    let mut keys = map_keys(&plain);
+    keys.push(24);
+    assert_eq!(map_keys(&minicbor::to_vec(&g).unwrap()), keys);
+}
+
+#[test]
+fn a25_g_backup_grant_without_key_25_is_marked() {
+    // A25 (g): backup import lands at M8 (D9); what can be shown now is the decode side:
+    // a grant written without key 25, as a backup taken before the mark holds it, arrives
+    // marked, at the level it holds.
+    let mut g = fixed_grant();
+    g.elevation = Elevation::Admin;
+    let bytes = minicbor::to_vec(&g).unwrap();
+    assert!(!map_keys(&bytes).contains(&25));
+    let back: UnattendedGrant = minicbor::decode(&bytes).unwrap();
+    assert!(back.marked());
+    assert!(back.holds_level());
+}
+
+/// Clear every grant's mark, as only a registration sent as generated may (no path of
+/// this build does yet).
+fn unmark_all(store: &GrantStore) {
+    store
+        .mutate(WriteClass::Policy, None, |s, _| {
+            for g in &mut s.grants {
+                g.unmarked = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn all_marked(store: &GrantStore) -> bool {
+    store.grants().iter().all(UnattendedGrant::marked)
+}
+
+#[test]
+fn a25_o_a_store_that_adopts_a_machine_id_marks_every_grant() {
+    // D9: a load that adopts a machine id, and the machine-id write of a restore, clear
+    // `unmarked` on every grant, disabled ones included.
+    let mut env = Env::new();
+    env.machine_id = None;
+    let store = env.open();
+    let guard = enable(&env, &store, dev(1), Preset::MyMachines);
+    guard
+        .create_grant(
+            Actor::Ui,
+            &dev(2),
+            Preset::HeadlessBox,
+            &waived(),
+            &upload(),
+        )
+        .unwrap();
+    guard.disable(Actor::Ui, &dev(2)).unwrap();
+    unmark_all(&store);
+    assert!(store.grants().iter().all(|g| !g.marked()));
+    drop((guard, store));
+    // the first load with a machine id adopts it, and marks
+    env.machine_id = Some(b"machine-A".to_vec());
+    let store = env.open();
+    assert_eq!(
+        store.read(|s| s.machine_id_hash).unwrap(),
+        Some(codec::machine_id_hash(b"machine-A"))
+    );
+    assert!(all_marked(&store), "adopted: every grant marked");
+    drop(store);
+    // persisted by the load-time write
+    let store = env.open();
+    assert!(all_marked(&store), "still marked at the next load");
+    // the same machine again: no adoption, no restore, the marks as stored
+    unmark_all(&store);
+    drop(store);
+    let store = env.open();
+    assert!(store.grants().iter().all(|g| !g.marked()));
+    drop(store);
+    // another machine: a restore, every grant marked, the disabled one included
+    env.machine_id = Some(b"machine-B".to_vec());
+    let store = env.open();
+    assert!(all_marked(&store), "restored: every grant marked");
+    assert!(
+        store
+            .grants()
+            .iter()
+            .all(|g| matches!(g.state, GrantState::Disabled { .. }))
+    );
+    drop(store);
+    // a host that cannot read its machine id detects nothing: the marks as stored (R12)
+    let store = env.open();
+    unmark_all(&store);
+    drop(store);
+    env.machine_id = None;
+    let store = env.open();
+    assert!(store.grants().iter().all(|g| !g.marked()));
 }
