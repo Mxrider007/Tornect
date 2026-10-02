@@ -51,13 +51,27 @@ pub trait BlockWindow: Send + Sync {
 /// The `ask_before_start` popup (§B.8.4.5 `AwaitLocalAllow`). M4 supplies
 /// the UI-backed implementation.
 pub trait LocalAllow: Send + Sync {
-    /// Ask the local user; `false` on Deny or when `timeout` elapses.
+    /// Ask the local user; `false` on Deny or when `timeout` elapses. `level` is
+    /// the grant's (§B.8.6.3, r7): for an admin grant the popup says that
+    /// `label` wants to connect as administrator, and it answers Deny or Allow
+    /// only, since the level comes from the grant.
+    fn ask_at<'a>(
+        &'a self,
+        who: &'a GrantId,
+        label: &'a str,
+        level: Elevation,
+        timeout: Duration,
+    ) -> BoxFuture<'a, bool>;
+
+    /// [`Self::ask_at`] for a grant at none (the popup names no level).
     fn ask<'a>(
         &'a self,
         who: &'a GrantId,
         label: &'a str,
         timeout: Duration,
-    ) -> BoxFuture<'a, bool>;
+    ) -> BoxFuture<'a, bool> {
+        self.ask_at(who, label, Elevation::None, timeout)
+    }
 }
 
 /// Headless M1 default: a timer, nobody can click Block.
@@ -82,7 +96,13 @@ impl BlockWindow for TimerOnlyWindow {
 pub struct AlwaysDeny;
 
 impl LocalAllow for AlwaysDeny {
-    fn ask<'a>(&'a self, _: &'a GrantId, _: &'a str, _: Duration) -> BoxFuture<'a, bool> {
+    fn ask_at<'a>(
+        &'a self,
+        _: &'a GrantId,
+        _: &'a str,
+        _: Elevation,
+        _: Duration,
+    ) -> BoxFuture<'a, bool> {
         Box::pin(async { false })
     }
 }

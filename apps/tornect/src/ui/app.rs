@@ -1,9 +1,10 @@
 //! The manual winit loop (`docs/research/slice.md` §2, decision D10): one
-//! event loop on the main thread and three kinds of window, each an egui
+//! event loop on the main thread and four kinds of window, each an egui
 //! context with its own egui-winit state and egui-wgpu painter: the main
-//! window, the stream window of a viewed session, and the sharing indicator
-//! (`indicator`) while this screen is shared. The other two paint on the main
-//! window's wgpu device. Never eframe: the stream window reads
+//! window, the stream window of a viewed session, the sharing indicator
+//! (`indicator`) while this screen is shared, and the block windows
+//! (`block`) while an unattended request is in its block window. The others
+//! paint on the main window's wgpu device. Never eframe: the stream window reads
 //! `WindowEvent::KeyboardInput` itself, before egui, which drops the keys it
 //! has no name for.
 
@@ -25,6 +26,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{UserAttentionType, Window, WindowAttributes, WindowId};
 
 use super::backend::{Command, StreamLink};
+use super::block;
 use super::consent::Popups;
 use super::indicator::{self, Change, Indicator};
 use super::keys;
@@ -234,6 +236,12 @@ impl Surface {
     }
 }
 
+/// One block window (§B.8.6.3): request `request`'s, on one monitor.
+struct BlockSurface {
+    request: u64,
+    surface: Surface,
+}
+
 /// The stream window of a live session.
 struct StreamView {
     surface: Surface,
@@ -260,6 +268,14 @@ pub struct App {
     shown: Indicator,
     /// The indicator is a see-through pill (the desktop composites it).
     indicator_rounded: bool,
+    /// The block windows of the requests in their block window, one per
+    /// monitor each (§B.8.6.3).
+    blocks: Vec<BlockSurface>,
+    /// The requests whose block windows were opened (or tried: a window that
+    /// failed to open is not tried again for the same request).
+    blocks_opened: Vec<u64>,
+    /// When the block windows were last put back on top.
+    blocks_asserted: Option<Instant>,
     /// The user closed the stream window of the session still in the model.
     stream_dismissed: bool,
     form: Form,
@@ -299,6 +315,9 @@ impl App {
             indicator: None,
             shown: Indicator::default(),
             indicator_rounded: false,
+            blocks: Vec::new(),
+            blocks_opened: Vec::new(),
+            blocks_asserted: None,
             stream_dismissed: false,
             form: Form::default(),
             quit_at: None,
@@ -459,6 +478,107 @@ impl App {
                 }
             }
             Change::Close => self.indicator = None,
+        }
+    }
+
+    /// Open a block window on every monitor for each request now in its block
+    /// window, and close those of the requests that ended (§B.8.6.3).
+    fn sync_blocks(&mut self, el: &ActiveEventLoop) {
+        let requests: Vec<u64> = self
+            .shared
+            .read(|m| m.blocks.iter().map(|b| b.id).collect());
+        self.blocks.retain(|b| requests.contains(&b.request));
+        self.blocks_opened.retain(|id| requests.contains(id));
+        if self.blocks.is_empty() {
+            self.blocks_asserted = None;
+        }
+        let on_wayland = wayland(el);
+        for request in requests {
+            if self.blocks_opened.contains(&request) {
+                continue;
+            }
+            self.blocks_opened.push(request);
+            // Every monitor the desktop lists, centred; one window where it
+            // lists none.
+            let monitors: Vec<_> = el.available_monitors().collect();
+            let positions: Vec<_> = if monitors.is_empty() {
+                vec![None]
+            } else {
+                monitors
+                    .iter()
+                    .map(|m| {
+                        Some(block::centred(
+                            m.position(),
+                            m.size(),
+                            m.scale_factor(),
+                            block::size(),
+                        ))
+                    })
+                    .collect()
+            };
+            for position in positions {
+                let setup = self.main_device(el);
+                match Surface::new(
+                    el,
+                    block::attributes(position, on_wayland),
+                    setup,
+                    self.theme,
+                    false,
+                ) {
+                    Ok(surface) => {
+                        // Wayland: no window stays on top; the focus is the
+                        // best this window can ask for (§B.8.6.3).
+                        if on_wayland {
+                            surface.window.focus_window();
+                        }
+                        self.blocks.push(BlockSurface { request, surface });
+                    }
+                    Err(e) => {
+                        let line = format!("a block window did not open: {e:#}");
+                        tracing::warn!("{line}");
+                        self.shared.update(|m| m.note(line));
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_block(&mut self, index: usize) {
+        let Some(open) = self.blocks.get_mut(index) else {
+            return;
+        };
+        let request = open.request;
+        let Some(block) = self
+            .shared
+            .read(|m| m.blocks.iter().find(|b| b.id == request).cloned())
+        else {
+            return;
+        };
+        let mut actions = Vec::new();
+        open.surface
+            .paint(|ui| view::block_window(ui, &block, Instant::now(), &mut actions));
+        for action in actions {
+            self.act(action, None);
+        }
+    }
+
+    fn block_event(&mut self, index: usize, event: &WindowEvent) {
+        match event {
+            // No close and no dismiss: the window lasts exactly its seconds.
+            WindowEvent::CloseRequested => {
+                tracing::debug!("a block window stays up until its time ends");
+            }
+            WindowEvent::RedrawRequested => self.draw_block(index),
+            WindowEvent::Resized(size) => {
+                if let Some(open) = self.blocks.get_mut(index) {
+                    open.surface.resized(size.width, size.height);
+                }
+            }
+            _ => {
+                if let Some(open) = self.blocks.get_mut(index) {
+                    open.surface.on_event(event);
+                }
+            }
         }
     }
 
@@ -631,6 +751,14 @@ impl App {
             } => {
                 tracing::debug!(id, ?decision, pointer, "session question answered");
                 self.popups.answer_session(id, decision);
+            }
+            Action::Ask { id, allow, pointer } => {
+                tracing::debug!(id, allow, pointer, "\"Ask before starting\" answered");
+                self.popups.answer_ask(id, allow);
+            }
+            Action::Block { id } => {
+                tracing::debug!(id, "Block pressed in a block window");
+                self.popups.answer_block(id);
             }
             Action::Confirm {
                 id,
@@ -811,6 +939,7 @@ impl ApplicationHandler<UserEvent> for App {
             Ok(surface) => {
                 self.main = Some(surface);
                 self.sync_indicator(el);
+                self.sync_blocks(el);
             }
             Err(e) => {
                 self.error = Some(e.context("opening the Tornect window"));
@@ -842,6 +971,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.sync_stream(el);
                 self.sync_indicator(el);
+                self.sync_blocks(el);
+                for open in &self.blocks {
+                    open.surface.window.request_redraw();
+                }
                 if let Some(main) = &self.main {
                     if why == Wake::Attention && ask_attention(&*main.window) {
                         self.form.window_came_back();
@@ -869,6 +1002,10 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if self.indicator.as_ref().is_some_and(|s| s.window.id() == id) {
             self.indicator_event(&event);
+            return;
+        }
+        if let Some(index) = self.blocks.iter().position(|b| b.surface.window.id() == id) {
+            self.block_event(index, &event);
             return;
         }
         let Some(main) = &mut self.main else { return };
@@ -923,6 +1060,19 @@ impl ApplicationHandler<UserEvent> for App {
         if self.stream.is_some() && self.link.settle() {
             earliest(now + OWED_RETRY);
         }
+        // The block windows are put back on top every `block::REASSERT`.
+        if !self.blocks.is_empty() {
+            let due = self.blocks_asserted.map_or(now, |at| at + block::REASSERT);
+            if now >= due {
+                for open in &self.blocks {
+                    block::reassert(&open.surface.window);
+                }
+                self.blocks_asserted = Some(now);
+                earliest(now + block::REASSERT);
+            } else {
+                earliest(due);
+            }
+        }
         for surface in [
             self.main.as_mut(),
             self.stream.as_mut().map(|v| &mut v.surface),
@@ -930,6 +1080,7 @@ impl ApplicationHandler<UserEvent> for App {
         ]
         .into_iter()
         .flatten()
+        .chain(self.blocks.iter_mut().map(|b| &mut b.surface))
         {
             if let Some(at) = surface.repaint_at {
                 if at <= now {

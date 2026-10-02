@@ -33,6 +33,7 @@ use tornect_signal::pairing::KnownHostStore;
 use tornect_signal::tor::{Ladder, LadderEvent, OnionListener};
 use tornect_signal::{Isolation, MEDIA_PORT, SIGNALING_PORT, TorNode};
 
+use super::block::GuiBlockWindow;
 use super::book::{self, Change};
 use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
 use super::model::{
@@ -440,7 +441,7 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
     }));
     let (started_tx, started) = watch::channel(0u64);
     let activity = Arc::clone(&live);
-    deps.consent = Arc::new(
+    let consent = Arc::new(
         GuiConsent::new(
             Arc::clone(&b.popups),
             Withdraw {
@@ -451,6 +452,11 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         )
         .with_words(Arc::clone(&b.words)),
     );
+    deps.consent = consent.clone();
+    // Before an unattended session (§B.8.6.3): "Ask before starting" on the
+    // same sheets, withdrawn alike, and the block window on every monitor.
+    deps.local_allow = consent;
+    deps.block_window = Arc::new(GuiBlockWindow::new(Arc::clone(&b.popups)));
     deps.sessions = Arc::new(GuiSessions {
         live: Arc::clone(&live),
         polkit: Arc::clone(&polkit),
@@ -2073,6 +2079,7 @@ mod tests {
                                 popups.answer_session(p.id, SessionDecision::AllowOnce);
                                 return;
                             }
+                            PopupKind::Ask { .. } => {}
                         }
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;
