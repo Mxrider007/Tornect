@@ -234,6 +234,16 @@ pub trait UnattendedHook: Send + Sync {
         &'a self,
         ctx: UnattendedContext<'a>,
     ) -> BoxFuture<'a, Result<UnattendedVerdict, HandshakeError>>;
+
+    /// After the session's reservation and before its `SESSION_ACCEPT` is built
+    /// (decision M1-67): read afresh what can lower the session `device` asked
+    /// for, and give back `proof` lowered where that says so, never above it, or
+    /// refuse the request. Never called while the live-session lock is held.
+    fn reserved<'a>(
+        &'a self,
+        device: &'a DeviceId,
+        proof: ConsentProof,
+    ) -> BoxFuture<'a, Result<ConsentProof, SessionReject>>;
 }
 
 /// `SESSION_REJECT{NOT_GRANTED}` for every unattended request (no grants exist).
@@ -241,6 +251,15 @@ pub trait UnattendedHook: Send + Sync {
 pub struct NotGranted;
 
 impl UnattendedHook for NotGranted {
+    fn reserved<'a>(
+        &'a self,
+        _: &'a DeviceId,
+        _: ConsentProof,
+    ) -> BoxFuture<'a, Result<ConsentProof, SessionReject>> {
+        // Never reached: no request of this hook is accepted.
+        Box::pin(async { Err(SessionReject::new(messages::reject::NOT_GRANTED)) })
+    }
+
     fn handle<'a>(
         &'a self,
         _: UnattendedContext<'a>,
@@ -624,6 +643,13 @@ impl LiveSessions {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether the live-session lock is free right now: a hook run under it would
+    /// see it taken (decision M1-67).
+    #[cfg(test)]
+    pub(crate) fn lock_is_free(&self) -> bool {
+        self.state.try_lock().is_ok()
     }
 
     /// The sessions live right now, oldest first.
@@ -1203,6 +1229,42 @@ where
         };
         return reject_session(&mut chan, deps, &peer, reason).await;
     };
+
+    // Decision M1-67: once the session is reserved, the unattended hook reads
+    // afresh what can lower it (the account facts, the helper task) and gives
+    // the proof back lowered, never above, or refuses. The live-session lock is
+    // not held here: `try_reserve` let it go. A helper started for a level the
+    // read took away ends here, never attached.
+    let (proof, helper) = if unattended {
+        match deps.unattended.reserved(&device, proof).await {
+            Ok(lowered) => {
+                let still_admin = matches!(
+                    &lowered,
+                    ConsentProof::Unattended { policy, .. } if policy.elevation() == Elevation::Admin
+                );
+                (lowered, helper.filter(|_| still_admin))
+            }
+            Err(reject) => {
+                drop(helper);
+                drop(reserved);
+                return reject_session(&mut chan, deps, &peer, reject.reason).await;
+            }
+        }
+    } else {
+        (proof, helper)
+    };
+    // The panic check again, after the hook: a kill fired while it read is
+    // refused as the Block it stands for, the reservation and any helper let go.
+    if kill.fired() {
+        let reason = if unattended {
+            messages::reject::BLOCKED_BY_LOCAL_USER
+        } else {
+            messages::reject::DENIED
+        };
+        drop(helper);
+        drop(reserved);
+        return reject_session(&mut chan, deps, &peer, reason).await;
+    }
 
     // Accept → Established. `build` is the only source of the session token:
     // the accept body carries `session_token` for attended sessions and only

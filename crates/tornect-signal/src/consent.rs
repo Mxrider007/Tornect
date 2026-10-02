@@ -210,6 +210,16 @@ impl PolicyReceipt {
         self
     }
 
+    /// The receipt lowered to `mode` (decision M1-67: a read after the
+    /// reservation only lowers): never above its own mode; view only drops the
+    /// level.
+    #[must_use]
+    pub(crate) fn lowered_to(mut self, mode: SessionMode) -> Self {
+        self.mode = SessionMode::most_restrictive(self.mode, mode);
+        self.elevation = Level::new(self.mode, self.elevation).elevation();
+        self
+    }
+
     /// The grant.
     #[must_use]
     pub fn grant(&self) -> &GrantId {

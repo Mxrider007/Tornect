@@ -1162,6 +1162,14 @@ impl AdminHelper for FakeHelper {
 struct AdminGrant;
 
 impl UnattendedHook for AdminGrant {
+    fn reserved<'a>(
+        &'a self,
+        _: &'a DeviceId,
+        proof: ConsentProof,
+    ) -> BoxFuture<'a, Result<ConsentProof, messages::SessionReject>> {
+        Box::pin(async move { Ok(proof) })
+    }
+
     fn handle<'a>(
         &'a self,
         ctx: UnattendedContext<'a>,
@@ -3066,6 +3074,14 @@ async fn unattended_accept_reports_the_derived_session_token() {
 
     struct Grant;
     impl UnattendedHook for Grant {
+        fn reserved<'a>(
+            &'a self,
+            _: &'a DeviceId,
+            proof: ConsentProof,
+        ) -> BoxFuture<'a, Result<ConsentProof, messages::SessionReject>> {
+            Box::pin(async move { Ok(proof) })
+        }
+
         fn handle<'a>(
             &'a self,
             ctx: UnattendedContext<'a>,
@@ -3143,6 +3159,14 @@ async fn an_admin_effect_fires_even_when_its_answer_cannot_be_sent() {
         hung_up: Arc<tokio::sync::Notify>,
     }
     impl UnattendedHook for AdminAfterHangup {
+        fn reserved<'a>(
+            &'a self,
+            _: &'a DeviceId,
+            proof: ConsentProof,
+        ) -> BoxFuture<'a, Result<ConsentProof, messages::SessionReject>> {
+            Box::pin(async move { Ok(proof) })
+        }
+
         fn handle<'a>(
             &'a self,
             _: UnattendedContext<'a>,
@@ -3196,6 +3220,14 @@ async fn an_admin_effect_fires_even_when_its_answer_cannot_be_sent() {
 async fn unattended_hook_errors_propagate_and_dead_streams_are_only_logged() {
     struct Fails;
     impl UnattendedHook for Fails {
+        fn reserved<'a>(
+            &'a self,
+            _: &'a DeviceId,
+            proof: ConsentProof,
+        ) -> BoxFuture<'a, Result<ConsentProof, messages::SessionReject>> {
+            Box::pin(async move { Ok(proof) })
+        }
+
         fn handle<'a>(
             &'a self,
             _: UnattendedContext<'a>,
@@ -3209,6 +3241,14 @@ async fn unattended_hook_errors_propagate_and_dead_streams_are_only_logged() {
         propagate: bool,
     }
     impl UnattendedHook for Exchanges {
+        fn reserved<'a>(
+            &'a self,
+            _: &'a DeviceId,
+            proof: ConsentProof,
+        ) -> BoxFuture<'a, Result<ConsentProof, messages::SessionReject>> {
+            Box::pin(async move { Ok(proof) })
+        }
+
         fn handle<'a>(
             &'a self,
             ctx: UnattendedContext<'a>,
@@ -4288,6 +4328,14 @@ async fn popup_suppression_during_a_live_session_is_logged() {
 async fn unattended_context_carries_the_block_window_and_local_allow_seams() {
     struct Probe;
     impl UnattendedHook for Probe {
+        fn reserved<'a>(
+            &'a self,
+            _: &'a DeviceId,
+            proof: ConsentProof,
+        ) -> BoxFuture<'a, Result<ConsentProof, messages::SessionReject>> {
+            Box::pin(async move { Ok(proof) })
+        }
+
         fn handle<'a>(
             &'a self,
             ctx: UnattendedContext<'a>,
@@ -4575,6 +4623,14 @@ async fn an_accept_that_never_completes_lets_go_of_its_reservation() {
 struct AcceptAll;
 
 impl UnattendedHook for AcceptAll {
+    fn reserved<'a>(
+        &'a self,
+        _: &'a DeviceId,
+        proof: ConsentProof,
+    ) -> BoxFuture<'a, Result<ConsentProof, messages::SessionReject>> {
+        Box::pin(async move { Ok(proof) })
+    }
+
     fn handle<'a>(
         &'a self,
         ctx: UnattendedContext<'a>,
@@ -5103,6 +5159,14 @@ struct Inflated {
 }
 
 impl UnattendedHook for Inflated {
+    fn reserved<'a>(
+        &'a self,
+        _: &'a DeviceId,
+        proof: ConsentProof,
+    ) -> BoxFuture<'a, Result<ConsentProof, messages::SessionReject>> {
+        Box::pin(async move { Ok(proof) })
+    }
+
     fn handle<'a>(
         &'a self,
         ctx: UnattendedContext<'a>,
@@ -5813,6 +5877,211 @@ async fn a25_n_view_only_by_f12_is_served_view_only() {
     .await;
     assert_eq!(mode, messages::mode::VIEW_ONLY);
     assert_eq!(elevation, tornect_core::levels::Elevation::None);
+}
+
+/// A facts source whose account turns to `later` after its first read: a setting
+/// changed between the gate and the session's reservation.
+struct ChangesAfterFirstRead {
+    reads: std::sync::atomic::AtomicUsize,
+    first: tornect_core::levels::AccountFacts,
+    later: tornect_core::levels::AccountFacts,
+}
+
+impl tornect_core::levels::FactsSource for ChangesAfterFirstRead {
+    fn account(&self) -> tornect_core::levels::AccountFacts {
+        if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.first
+        } else {
+            self.later
+        }
+    }
+
+    fn helper_task(&self) -> tornect_core::levels::HelperPresence {
+        tornect_core::levels::HelperPresence::Absent
+    }
+}
+
+/// M1-67 A21 (g), its first half: `ConsentPromptBehaviorAdmin` set to 0 after the
+/// gate read the facts and before the answer: the read after the reservation lowers
+/// the session to view only.
+#[tokio::test]
+async fn a21_g_cpba_set_after_start_lowers_the_next_answer() {
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let facts = Arc::new(ChangesAfterFirstRead {
+        reads: std::sync::atomic::AtomicUsize::new(0),
+        first: windows_facts(|_| {}),
+        later: windows_facts(|f| f.consent_prompt_behavior_admin = Some(0)),
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, client) = unattended_pair_with(tmp.path(), PW, facts.clone());
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let outcome = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .expect("an accept");
+    let ClientOutcome::Session(session) = outcome else {
+        panic!("no session");
+    };
+    assert_eq!(session.accept().mode(), messages::mode::VIEW_ONLY);
+    assert_eq!(
+        facts.reads.load(Ordering::SeqCst),
+        2,
+        "the gate's read, then this one"
+    );
+    drop(session);
+    let _ = task.await;
+}
+
+/// The hook of an [`AdminGrant`] request, with the read after the reservation
+/// played by `then`.
+struct AfterReservation<F> {
+    then: F,
+}
+
+impl<F> UnattendedHook for AfterReservation<F>
+where
+    F: Fn(ConsentProof) -> ConsentProof + Send + Sync,
+{
+    fn handle<'a>(
+        &'a self,
+        ctx: UnattendedContext<'a>,
+    ) -> BoxFuture<'a, Result<UnattendedVerdict, HandshakeError>> {
+        Box::pin(async move { AdminGrant.handle(ctx).await })
+    }
+
+    fn reserved<'a>(
+        &'a self,
+        _: &'a DeviceId,
+        proof: ConsentProof,
+    ) -> BoxFuture<'a, Result<ConsentProof, messages::SessionReject>> {
+        let proof = (self.then)(proof);
+        Box::pin(async move { Ok(proof) })
+    }
+}
+
+/// M1-67 (K18): a session lowered by the read after the reservation goes on at the
+/// lowered level, and the helper started for the level it lost ends, never attached.
+#[tokio::test]
+async fn a_lowered_answer_drops_the_started_helper() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    host.deps.unattended = Arc::new(AfterReservation {
+        then: |proof| match proof {
+            ConsentProof::Unattended {
+                grant,
+                proof_fp,
+                policy,
+                block,
+                token,
+            } => ConsentProof::Unattended {
+                grant,
+                proof_fp,
+                policy: policy.lowered_to(SessionMode::ViewOnly),
+                block,
+                token,
+            },
+            other => other,
+        },
+    });
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+    host.cfg.levels = installed_row();
+    let helper = Arc::new(FakeHelper::default());
+    *helper.script.lock().unwrap() = vec![HelperScript::Ready];
+    host.deps.admin_helper = helper.clone();
+    assert_eq!(
+        unattended_admin_session(&host).await,
+        tornect_core::levels::Elevation::None
+    );
+    assert_eq!(helper.started.load(Ordering::SeqCst), 1);
+    assert!(helper.attached.lock().unwrap().is_empty(), "never attached");
+    assert_eq!(helper.ended.load(Ordering::SeqCst), 1, "ended");
+}
+
+/// M1-67 (DA-17): the hook after the reservation runs with the live-session lock
+/// free: it could take it.
+#[tokio::test]
+async fn the_reservation_hook_runs_outside_the_session_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let live = Arc::new(LiveSessions::new());
+    let free = Arc::new(Mutex::new(None));
+    host.deps.activity = live.clone();
+    let (seen_live, seen_free) = (live.clone(), free.clone());
+    host.deps.unattended = Arc::new(AfterReservation {
+        then: move |proof| {
+            *seen_free.lock().unwrap() = Some(seen_live.lock_is_free());
+            proof
+        },
+    });
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+    host.cfg.levels = installed_row();
+    let helper = Arc::new(FakeHelper::default());
+    *helper.script.lock().unwrap() = vec![HelperScript::Ready];
+    host.deps.admin_helper = helper;
+    let _ = unattended_admin_session(&host).await;
+    assert_eq!(
+        *free.lock().unwrap(),
+        Some(true),
+        "the hook ran, the lock free"
+    );
+}
+
+/// M1-67 (FC-1): a panic pressed while the hook after the reservation reads is
+/// refused as the Block it stands for, before any accept: the panic check runs again
+/// after the hook, "checked last"; the reservation is let go and the helper ends.
+#[tokio::test]
+async fn a_panic_during_the_reservation_hook_rejects_the_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let kill = KillSwitch::new();
+    host.deps.kill = kill.clone();
+    let live = Arc::new(LiveSessions::new());
+    host.deps.activity = live.clone();
+    host.deps.unattended = Arc::new(AfterReservation {
+        then: move |proof| {
+            kill.kill(bye::PANIC);
+            proof
+        },
+    });
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+    host.cfg.levels = installed_row();
+    let helper = Arc::new(FakeHelper::default());
+    *helper.script.lock().unwrap() = vec![HelperScript::Ready];
+    host.deps.admin_helper = helper.clone();
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = raw_unattended_request(&host, CLIENT_SEED, b).await;
+    let rx = raw
+        .chan
+        .recv(Duration::from_secs(30), "answer")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rx.env.kind, Kind::SessionReject);
+    match task.await.unwrap().unwrap() {
+        HostOutcome::SessionRejected { reason, .. } => {
+            assert_eq!(reason, reject::BLOCKED_BY_LOCAL_USER);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        !SessionActivity::session_live(&*live),
+        "the reservation went"
+    );
+    assert!(helper.attached.lock().unwrap().is_empty());
+    assert_eq!(helper.ended.load(Ordering::SeqCst), 1);
 }
 
 /// A pin that records how often it was asked to record.
