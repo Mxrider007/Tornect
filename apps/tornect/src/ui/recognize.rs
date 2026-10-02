@@ -26,8 +26,11 @@ use super::model::{MyWords, Recognition};
 /// How recently a device must have been paired for its session sheet to
 /// say the scam line beside the administrator answer: "moments before",
 /// read as a day (a caller who had the pairing done may ring back hours
-/// later). The pairing time is stored as it was (`paired_at`, seconds).
+/// later). The pairing time (`paired_at`) is kept to the second for that
+/// day only, then to the day (P-L4): this window may not outlast it.
 pub const RECENTLY_PAIRED: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+const _: () = assert!(RECENTLY_PAIRED.as_secs() <= tornect_core::trusted::PAIRED_AT_PRECISE_FOR);
 
 /// This computer: the name it declares and its two keys.
 #[derive(Clone)]

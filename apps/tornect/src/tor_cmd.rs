@@ -564,6 +564,7 @@ pub fn admin(
         AdminAction::RevokeThisDevice => Some(*device.id().public_key_bytes()),
         AdminAction::EndSession | AdminAction::TurnOff => None,
     };
+    crate::history::coarsen_pins(paths);
     let pins = crate::history::Pins::open(paths, id).context("opening known-hosts.toml")?;
     let Some(known) = pins.store().get(&id) else {
         anyhow::bail!("this computer is not paired with that host; admin commands go only to one");
@@ -802,7 +803,9 @@ pub fn connect(
         }
     }
     // With history off the handshake works on a copy of the known hosts, so
-    // that its last-seen touch writes nothing (`crate::history`).
+    // that its last-seen touch writes nothing (`crate::history`); its
+    // pairing times past their first day are kept to the day first (P-L4).
+    crate::history::coarsen_pins(paths);
     let pins = crate::history::Pins::open(paths, id).context("opening known-hosts.toml")?;
     let prepared = match opts.unattended {
         Some(ua) => Some(prepare_unattended(paths, id, &device, &pins, ua)?),

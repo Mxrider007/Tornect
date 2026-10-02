@@ -566,6 +566,10 @@ pub type KeepHistory = Arc<dyn Fn() -> bool + Send + Sync>;
 /// another process stays unpaired, and writes a device's last-seen time only
 /// while its history switch says so (`docs/PLAN.md` §B.8.9.1: history off
 /// means no `last_seen` updates); trust changes are written either way.
+///
+/// A pairing time is kept to the second for its first day only
+/// ([`TrustedDevices::coarsen`], P-L4): after every load and before every
+/// save.
 pub struct TrustedDeviceStore {
     path: Option<PathBuf>,
     inner: Mutex<TrustedDevices>,
@@ -584,7 +588,8 @@ impl std::fmt::Debug for TrustedDeviceStore {
 impl TrustedDeviceStore {
     /// Load (or start empty) from `path`.
     pub fn open(path: PathBuf) -> tornect_core::Result<Self> {
-        let inner = TrustedDevices::load(&path)?;
+        let mut inner = TrustedDevices::load(&path)?;
+        inner.coarsen(trusted::unix_now());
         Ok(Self {
             path: Some(path),
             inner: Mutex::new(inner),
@@ -596,7 +601,8 @@ impl TrustedDeviceStore {
     /// the app: each trust change is merged into the file as it is then, and
     /// a last-seen time is written only while `keep` says history is kept.
     pub fn shared(path: PathBuf, keep: KeepHistory) -> tornect_core::Result<Self> {
-        let inner = TrustedDevices::load(&path)?;
+        let mut inner = TrustedDevices::load(&path)?;
+        inner.coarsen(trusted::unix_now());
         Ok(Self {
             path: Some(path),
             inner: Mutex::new(inner),
@@ -639,18 +645,25 @@ impl TrustedDeviceStore {
     }
 
     /// Write a change through: the whole copy `devices` (a store that is not
-    /// shared), or `change` made to the file as it is now (a shared one).
+    /// shared), or `change` made to the file as it is now (a shared one);
+    /// either with every pairing time past its first day kept to the day.
     fn persist(
         &self,
         devices: &TrustedDevices,
         change: impl FnOnce(&mut TrustedDevices),
     ) -> tornect_core::Result<()> {
+        let now = trusted::unix_now();
         match (&self.path, &self.history) {
             (None, _) => Ok(()),
-            (Some(path), None) => devices.save(path),
+            (Some(path), None) => {
+                let mut file = devices.clone();
+                file.coarsen(now);
+                file.save(path)
+            }
             (Some(path), Some(_)) => {
                 let mut file = TrustedDevices::load(path)?;
                 change(&mut file);
+                file.coarsen(now);
                 file.save(path)
             }
         }
@@ -742,7 +755,9 @@ impl TrustedDeviceStore {
     }
 }
 
-/// Persisted [`KnownHosts`] behind a lock (client side).
+/// Persisted [`KnownHosts`] behind a lock (client side). A pairing time is
+/// kept to the second for its first day only ([`KnownHosts::coarsen`],
+/// P-L4): after a load and before every save.
 #[derive(Debug)]
 pub struct KnownHostStore {
     path: Option<PathBuf>,
@@ -752,7 +767,8 @@ pub struct KnownHostStore {
 impl KnownHostStore {
     /// Load (or start empty) from `path`.
     pub fn open(path: PathBuf) -> tornect_core::Result<Self> {
-        let inner = KnownHosts::load(&path)?;
+        let mut inner = KnownHosts::load(&path)?;
+        inner.coarsen(trusted::unix_now());
         Ok(Self {
             path: Some(path),
             inner: Mutex::new(inner),
@@ -787,7 +803,11 @@ impl KnownHostStore {
 
     fn persist(&self, hosts: &KnownHosts) -> tornect_core::Result<()> {
         match &self.path {
-            Some(path) => hosts.save(path),
+            Some(path) => {
+                let mut file = hosts.clone();
+                file.coarsen(trusted::unix_now());
+                file.save(path)
+            }
             None => Ok(()),
         }
     }
@@ -1043,7 +1063,7 @@ mod tests {
         store.record_reject(dev(3), &BanPolicy::default()).unwrap();
         assert_eq!(load().bans[0].reject_count, 1);
         store.pin(dev(1), "Laptop").unwrap();
-        assert_eq!(load().get(&dev(1)).unwrap().last_seen, 1000, "a re-pair");
+        assert_eq!(load().get(&dev(1)).unwrap().last_seen, 0, "a re-pair");
         assert!(store.remove(&dev(2)).unwrap());
         assert!(load().get(&dev(2)).is_none());
 
@@ -1062,5 +1082,71 @@ mod tests {
         let file = load();
         assert!(file.get(&dev(1)).is_none());
         assert!(file.get(&dev(4)).is_some());
+    }
+
+    /// P-L4 / U3-I8: a file whose pairing times are past their first day is
+    /// read to the day, a load writes nothing, and the next save writes the
+    /// day (and a last-seen time that still was the pairing second); a pin
+    /// made now keeps its second. Both host stores, and the client's.
+    #[test]
+    fn an_old_pairing_time_is_loaded_and_saved_to_the_day() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trusted-devices.toml");
+        let dev = |b: u8| DeviceId::from_bytes([b; 32]);
+        let now = trusted::unix_now();
+        let day = now - now % 86_400 - 2 * 86_400;
+        let old = day + 41_234;
+        for shared in [false, true] {
+            let mut start = TrustedDevices::default();
+            start.pin(dev(1), "Laptop", old);
+            start.save(&path).unwrap();
+            let store = if shared {
+                TrustedDeviceStore::shared(path.clone(), Arc::new(|| false))
+            } else {
+                TrustedDeviceStore::open(path.clone())
+            }
+            .unwrap();
+            let read = store.get(&dev(1)).unwrap();
+            assert_eq!((read.paired_at, read.last_seen), (day, day), "{shared}");
+            assert_eq!(
+                TrustedDevices::load(&path).unwrap(),
+                start,
+                "a load writes nothing"
+            );
+            store.record_reject(dev(9), &BanPolicy::default()).unwrap();
+            let saved = TrustedDevices::load(&path).unwrap();
+            let laptop = saved.get(&dev(1)).unwrap();
+            assert_eq!((laptop.paired_at, laptop.last_seen), (day, day), "{shared}");
+            let before = trusted::unix_now();
+            store.pin(dev(2), "Phone").unwrap();
+            let phone = TrustedDevices::load(&path)
+                .unwrap()
+                .get(&dev(2))
+                .cloned()
+                .unwrap();
+            assert!(phone.paired_at >= before, "a pin made now keeps its second");
+            assert_eq!(phone.last_seen, phone.paired_at);
+        }
+
+        let file = tmp.path().join("known-hosts.toml");
+        let (desk, attic) = (
+            TornectId::from_bytes([3; 32]),
+            TornectId::from_bytes([4; 32]),
+        );
+        let mut start = KnownHosts::default();
+        start.pin(desk, "Desk", [3; 32], old);
+        start.save(&file).unwrap();
+        let hosts = KnownHostStore::open(file.clone()).unwrap();
+        assert_eq!(hosts.get(&desk).unwrap().paired_at, day);
+        assert_eq!(
+            KnownHosts::load(&file).unwrap(),
+            start,
+            "a load writes nothing"
+        );
+        hosts.pin(attic, "Attic", [4; 32]).unwrap();
+        let saved = KnownHosts::load(&file).unwrap();
+        let rec = saved.get(&desk).unwrap();
+        assert_eq!((rec.paired_at, rec.last_seen), (day, day));
+        assert!(saved.get(&attic).unwrap().paired_at > day + 86_400);
     }
 }

@@ -567,6 +567,8 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
     let b = Arc::new(b);
     let first = first_run(&b.paths);
     b.shared.update(|m| m.history_notice = first);
+    // The pairing times of known-hosts.toml past their first day (P-L4).
+    crate::history::coarsen_pins(&b.paths);
     // This computer's words and the saved keys' (derived once, off this
     // task), then the address book again with its words.
     {
@@ -1152,6 +1154,7 @@ async fn admin_command(
     (action, target): (AdminAction, Option<[u8; 32]>),
     request: ua_client::Request,
 ) {
+    crate::history::coarsen_pins(&b.paths);
     let pins = match crate::history::Pins::open(&b.paths, id) {
         Ok(pins) => pins,
         Err(e) => {
@@ -1334,6 +1337,7 @@ async fn viewed(
     });
     // With history off the handshake works on a copy of the known hosts, so
     // that its last-seen touch writes nothing (`crate::history`).
+    crate::history::coarsen_pins(&b.paths);
     let pins = crate::history::Pins::open(&b.paths, id)?;
     // Unattended access is a paired computer's (§B.8 hard rule 2).
     let known = match (&ua, pins.store().get(&id)) {
