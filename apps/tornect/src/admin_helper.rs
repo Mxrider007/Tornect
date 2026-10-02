@@ -53,6 +53,30 @@ const TICK_EVERY: Duration = Duration::from_millis(250);
 #[cfg_attr(not(windows), allow(dead_code))]
 const STALE_AFTER: Duration = Duration::from_secs(2);
 
+/// How long a helper that said `Ready` is beaten for while it waits for its
+/// session's attach (N-1): the accept's write is bounded by the signaling
+/// stream's 30 s write limit, and the `sessions.log` append follows it. A
+/// host that hangs longer between the answer and the attach lets the helper
+/// end on the missed beat.
+#[cfg_attr(not(windows), allow(dead_code))]
+const EARLY_BEAT_FOR: Duration = Duration::from_secs(40);
+
+/// Whether log lines may carry identifiers: `--log-identifiers`, or `1` in
+/// `TORNECT_LOG_IDENTIFIERS` (the rule the log itself applies).
+static LOG_IDENTIFIERS: AtomicBool = AtomicBool::new(false);
+
+/// Take the log's identifier opt-in (`--log-identifiers`, or the variable).
+pub fn opt_in_log_identifiers(flag: bool) {
+    let env = std::env::var(tornect_core::telemetry::IDENTIFIERS_ENV).ok();
+    LOG_IDENTIFIERS.store(flag || env.as_deref() == Some("1"), Ordering::Relaxed);
+}
+
+/// Whether the refusals below may name their path and SID (F-9).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn log_identifiers() -> bool {
+    LOG_IDENTIFIERS.load(Ordering::Relaxed)
+}
+
 /// Whether an administrator session is still live on a running host (F-4):
 /// ticked by a task on the host's runtime while the session lives, ended
 /// when the host says the session ended. Its link writes heartbeats only
@@ -120,8 +144,10 @@ impl SessionWatch {
 }
 
 /// The pipe's writer as a session's link writes through it: heartbeats only
-/// while the session's watch is alive (F-4); input, `ReleaseAll` and `Stop`
-/// always. A refused heartbeat ends the link's heartbeats for good.
+/// while the session's watch is alive (F-4); input and `ReleaseAll` until the
+/// session ends, since they restart the helper's clock as a heartbeat does
+/// (N-2); `Stop` always. A refused heartbeat ends the link's heartbeats for
+/// good.
 #[cfg_attr(not(windows), allow(dead_code))]
 struct Gated {
     inner: Arc<dyn FrameWrite>,
@@ -134,6 +160,9 @@ impl FrameWrite for Gated {
             return Err(std::io::Error::other(
                 "the session is over, or its host stopped ticking",
             ));
+        }
+        if self.watch.is_ended() && *frame != ToHelper::Stop.encode() {
+            return Err(std::io::Error::other("the session is over"));
         }
         self.inner.write_frame(frame)
     }
@@ -164,10 +193,11 @@ fn session_link(
 
 /// Heartbeats to a helper that said `Ready` and is not attached yet (F-3):
 /// from the moment `Ready` is read, one every [`HEARTBEAT_EVERY`], until the
-/// session's link takes over ([`Self::hand_over`]) or the helper is dropped
-/// unattached. Without it, the helper's 2 s would run from `Ready` through
-/// the accept's send and the `sessions.log` write until the link's first
-/// beat, a second after the attach.
+/// session's link takes over ([`Self::hand_over`]), the helper is dropped
+/// unattached, or [`EARLY_BEAT_FOR`] has passed (N-1). Without it, the
+/// helper's 2 s would run from `Ready` through the accept's send and the
+/// `sessions.log` write until the link's first beat, a second after the
+/// attach.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub struct EarlyBeat {
     writer: Arc<dyn FrameWrite>,
@@ -177,19 +207,28 @@ pub struct EarlyBeat {
 
 #[cfg_attr(not(windows), allow(dead_code))]
 impl EarlyBeat {
-    /// Start beating through `writer`.
+    /// Start beating through `writer`, for at most [`EARLY_BEAT_FOR`].
     #[must_use]
     pub fn start(writer: Arc<dyn FrameWrite>) -> Self {
+        Self::start_for(writer, EARLY_BEAT_FOR)
+    }
+
+    /// Start beating through `writer`, for at most `deadline`.
+    #[must_use]
+    pub fn start_for(writer: Arc<dyn FrameWrite>, deadline: Duration) -> Self {
         let (stop, stopped) = mpsc::channel::<()>();
         let beating = {
             let writer = Arc::clone(&writer);
+            let until = Instant::now() + deadline;
             std::thread::Builder::new()
                 .name("helper-early-beat".to_owned())
                 .spawn(move || {
                     while let Err(mpsc::RecvTimeoutError::Timeout) =
                         stopped.recv_timeout(HEARTBEAT_EVERY)
                     {
-                        if writer.write_frame(&ToHelper::Heartbeat.encode()).is_err() {
+                        if Instant::now() >= until
+                            || writer.write_frame(&ToHelper::Heartbeat.encode()).is_err()
+                        {
                             return;
                         }
                     }
@@ -550,6 +589,20 @@ mod windows {
 
     use super::{EarlyBeat, SessionWatch};
 
+    /// A WARN line for a refusal of the helper's files or task (F-9): its
+    /// reason class only; the path and the SID it names only under the log's
+    /// identifier opt-in.
+    fn refused(what: &str, e: &tornect_platform::autostart::AutostartError) {
+        if super::log_identifiers() {
+            tracing::warn!(error = %e, "{what}");
+        } else {
+            tracing::warn!(
+                reason = tornect_platform::helper_task::refusal_class(e),
+                "{what}"
+            );
+        }
+    }
+
     /// Windows' prompt (`ShellExecuteExW`, verb `runas`).
     pub(super) struct Prompt;
 
@@ -586,11 +639,11 @@ mod windows {
             hard_cap: HARD_CAP,
         };
         helper_task::check_files(&tasks, &install).map_err(|e| {
-            tracing::warn!(error = %e, "the administrator helper's files");
+            refused("the administrator helper's files", &e);
             NotGiven::Files
         })?;
         helper_task::run(&tasks, &install, &args).map_err(|e| {
-            tracing::warn!(error = %e, "starting the administrator helper task");
+            refused("starting the administrator helper task", &e);
             NotGiven::NotStarted
         })?;
         let pending = Pending {
@@ -696,7 +749,7 @@ mod windows {
             let install = helper_task::this_install().map_err(|_| NotGiven::Unavailable)?;
             let tasks = helper_task::for_this_user().map_err(|_| NotGiven::Unavailable)?;
             helper_task::check_files(&tasks, &install).map_err(|e| {
-                tracing::warn!(error = %e, "the administrator helper's files");
+                refused("the administrator helper's files", &e);
                 NotGiven::Files
             })?;
         }
@@ -789,6 +842,8 @@ mod tests {
         injected: Recording,
         exits: Arc<Mutex<Vec<Exit>>>,
         chord: Mutex<Option<mpsc::Sender<Event>>>,
+        /// The early beat's deadline (`EARLY_BEAT_FOR` when none).
+        early_for: Option<Duration>,
     }
 
     /// The fake pipe's pending helper, beating from its `Ready` as the
@@ -839,10 +894,10 @@ mod tests {
             let mut read = host.try_clone().unwrap();
             let ready = read_frame_from(&mut read).unwrap().unwrap();
             assert_eq!(FromHelper::decode(&ready), Some(FromHelper::Ready));
-            let beat = EarlyBeat::start(Arc::new(LockedWriter::new(
-                host.try_clone().unwrap(),
-                |_| {},
-            )));
+            let beat = EarlyBeat::start_for(
+                Arc::new(LockedWriter::new(host.try_clone().unwrap(), |_| {})),
+                self.early_for.unwrap_or(EARLY_BEAT_FOR),
+            );
             Ok(Box::new(SocketPending(host, Some(beat))))
         }
     }
@@ -1132,5 +1187,75 @@ mod tests {
             rig.kill.fired(),
             Some(tornect_signal::messages::bye::ADMIN_END)
         );
+    }
+
+    /// N-1: a helper that said `Ready` and is never attached (a host that
+    /// hangs between the answer and the accept) is beaten for a bounded time
+    /// only, then ends on the missed beat; it was never attached, so nothing
+    /// is killed.
+    #[tokio::test]
+    async fn an_unattached_helper_ends_when_its_early_beat_runs_out() {
+        let launcher = Arc::new(SocketLauncher {
+            early_for: Some(Duration::from_millis(1500)),
+            ..SocketLauncher::default()
+        });
+        let helpers = AdminHelpers::with(Some(launcher.clone() as Arc<dyn Launcher>));
+        let kill = KillSwitch::new();
+        helpers.wire(kill.clone(), Arc::new(Audit::default()), installed());
+        let started = Instant::now();
+        let held = Arc::clone(&helpers).start(&peer()).await.unwrap();
+        while launcher.exits.lock().unwrap().is_empty() {
+            assert!(
+                started.elapsed() < Duration::from_secs(6),
+                "the unattached helper outlived its early beat"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(*launcher.exits.lock().unwrap(), vec![Exit::HeartbeatMissed]);
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "it beat until its deadline"
+        );
+        assert_eq!(kill.fired(), None, "never attached: no kill");
+        drop(held);
+    }
+
+    /// N-2: once its session ended, input written through a link something
+    /// still holds is refused at the gate, so it cannot restart the helper's
+    /// clock: the helper ends on the missed beat as without it, and nothing
+    /// sent after the end is injected.
+    #[tokio::test]
+    async fn input_after_the_end_does_not_keep_the_helper_alive() {
+        let rig = rig();
+        attached(&rig, "s7").await;
+        let mut held = rig
+            .backend
+            .open_session_injector("s7", Elevation::Admin)
+            .expect("the helper is the injector");
+        let late = InputEvent::PointerMove { x: 7, y: 7 };
+        let stopped = Instant::now();
+        rig.backend.session_ended("s7");
+        let mut refused = 0;
+        while rig.launcher.exits.lock().unwrap().is_empty() {
+            assert!(
+                stopped.elapsed() < Duration::from_secs(4),
+                "input kept the helper alive"
+            );
+            if held.inject(&late).is_err() {
+                refused += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert_eq!(
+            *rig.launcher.exits.lock().unwrap(),
+            vec![Exit::HeartbeatMissed]
+        );
+        assert!(refused > 0);
+        assert!(
+            !rig.launcher.injected.0.lock().unwrap().contains(&late),
+            "nothing sent after the end was injected"
+        );
+        assert_eq!(rig.kill.fired(), None, "the session's own end: no kill");
+        drop(held);
     }
 }

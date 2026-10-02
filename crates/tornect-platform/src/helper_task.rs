@@ -372,6 +372,24 @@ pub fn run(
     ts.run(&args.to_args().join(" "))
 }
 
+/// What a log line may say of a refusal of [`check_files`] or [`run`]
+/// without the identifier opt-in (F-9): its reason class, never the path or
+/// the SID the refusal itself names.
+#[must_use]
+pub fn refusal_class(e: &AutostartError) -> &'static str {
+    match e {
+        AutostartError::Unavailable(_) => {
+            "a file or folder of the install has an owner or an entry other than \
+             administrators, or the install is outside Program Files"
+        }
+        AutostartError::Failed(_) => {
+            "the install's files could not be checked, or the task could not be started"
+        }
+        AutostartError::Unquotable(_) => "the helper's command line cannot be registered",
+        AutostartError::Cancelled => "the administrator prompt was cancelled",
+    }
+}
+
 /// The readiness line "administrator helper registered" (§B.8.14): whether
 /// the task exists, as the scheduler reports it.
 #[must_use]
@@ -898,5 +916,39 @@ mod tests {
         assert!(readiness(&Ok(None)).contains("not registered"));
         assert!(readiness(&Err(AutostartError::Failed("x".into()))).contains("could not read"));
         assert_eq!(task_name(SID), format!("Tornect admin helper {SID}"));
+    }
+
+    /// F-9: a refusal's reason class names no path and no SID, whatever the
+    /// refusal itself names (the owner, an entry, a place outside Program
+    /// Files).
+    #[test]
+    fn a_refusals_class_names_no_path_and_no_sid() {
+        let exe = install().exe;
+        let foreign = Security {
+            owner: SID.to_owned(),
+            dacl: admin_acl(),
+        };
+        let writable = Security {
+            owner: TRUSTED[1].to_owned(),
+            dacl: vec![entry(SID, 0x0012_0116, 0)],
+        };
+        let outside = Install {
+            exe: r"C:\Users\Someone\Tornect\tornect.exe".to_owned(),
+            ..install()
+        };
+        let refusals = [
+            AutostartError::Unavailable(admin_only(&exe, &foreign).unwrap_err()),
+            AutostartError::Unavailable(admin_only(&exe, &writable).unwrap_err()),
+            guarded_paths(&outside).unwrap_err(),
+            AutostartError::Failed(format!("reading {exe}: access denied")),
+        ];
+        for e in &refusals {
+            let full = e.to_string();
+            assert!(full.contains(r"C:\"), "the refusal names the path: {full}");
+            let class = refusal_class(e);
+            assert!(!class.contains("S-1-"), "{class}");
+            assert!(!class.contains(r"C:\"), "{class}");
+            assert!(!class.contains("Someone"), "{class}");
+        }
     }
 }
