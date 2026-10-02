@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 use futures::future::BoxFuture;
 use tokio::sync::Notify;
 use tornect_core::id::DeviceId;
-use tornect_core::levels::{Elevation, Level};
+use tornect_core::levels::{Elevation, FactsSource, Level, clause_ii, served_mode};
 use tornect_core::session_log::SessionMode;
-use tornect_core::unattended::grant::{AuthRecord, GrantId};
+use tornect_core::unattended::grant::{AuthRecord, GrantId, UnattendedGrant};
 use tornect_core::unattended::guard::{AdminEffect, AdminOp, AdminOutcome, MutationGuard};
 use tornect_core::unattended::limiter::{
     AttemptLimiter, FailKind, HostTransport, LimiterError, PostF2Reject, Reject, Settle,
@@ -311,15 +311,20 @@ pub struct UnattendedAuth {
     readiness: ReadinessSnapshot,
     /// Executes `intent = admin` requests (§B.8.4.1). Refuses by default.
     admin: Arc<dyn AdminAuthority>,
+    /// The account facts and the helper task's presence, read at each answer
+    /// (decision M1-67).
+    facts: Arc<dyn FactsSource>,
 }
 
 impl UnattendedAuth {
-    /// Build the hook over a loaded grant store.
+    /// Build the hook over a loaded grant store; `facts` is read at each answer
+    /// (decision M1-67): `tornect-platform`'s `LiveFacts` on a host.
     #[must_use]
     pub fn new(
         limiter: AttemptLimiter,
         tz: Arc<dyn LocalTz>,
         host_transport: HostTransport,
+        facts: Arc<dyn FactsSource>,
     ) -> Self {
         Self {
             limiter,
@@ -328,6 +333,7 @@ impl UnattendedAuth {
             host_transport,
             readiness: ReadinessSnapshot::unknown(),
             admin: Arc::new(RefuseAdmin),
+            facts,
         }
     }
 
@@ -717,6 +723,24 @@ impl UnattendedAuth {
             level.mode(),
             SessionMode::most_restrictive(grant.mode, wanted)
         );
+        // Decision M1-67 (D10, D11): the account facts and the helper task are read
+        // now, never cached from start, and control is lowered to view only where it
+        // is administrator access here (F-12) or where the password is marked and
+        // clause (ii) holds, before any helper starts. Lowering only.
+        let account = self.facts.account();
+        let reach_through_host = clause_ii(
+            grant.mode,
+            some_grant_holds_level(),
+            account,
+            self.facts.helper_task(),
+        );
+        let served = served_mode(level, marked(&grant), reach_through_host, account);
+        let level = if served == level.mode() {
+            level
+        } else {
+            // View only never carries the level (§B.8.4.1).
+            Level::new(served, Elevation::None)
+        };
 
         let policy = PolicyReceipt::mint(
             grant.id,
@@ -741,6 +765,19 @@ impl UnattendedAuth {
             caps: ChosenCaps::negotiate(ctx.host_caps, &ctx.request.caps),
         })
     }
+}
+
+/// Whether `grant`'s password is marked "answered 0" (decision M1-67, D9, D11). Until
+/// the store keeps the mark (key 25, absent = marked) every grant reads as marked: the
+/// safe direction.
+fn marked(_grant: &UnattendedGrant) -> bool {
+    true
+}
+
+/// Whether some grant in the store holds the administrator level (clause (ii)). No grant
+/// can until the store keeps a grant's level (key 24).
+fn some_grant_holds_level() -> bool {
+    false
 }
 
 impl UnattendedAuth {
@@ -982,6 +1019,7 @@ mod tests {
             limiter,
             Arc::new(tornect_core::unattended::schedule::FixedOffset::utc()),
             HostTransport::default(),
+            Arc::new(tornect_core::levels::FixedFacts::linux()),
         );
         Env {
             _tmp: tmp,
