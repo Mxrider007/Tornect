@@ -283,6 +283,26 @@ impl ReAuth for AllowAllReAuth {
     }
 }
 
+/// Which of a device's sessions an end reaches (decision M1-67, D6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndScope {
+    /// Every session of the device, live or reserved: its grant revoked, disabled or
+    /// suspended.
+    Every,
+    /// Only its sessions at the administrator level: its grant lowered (D6). A session
+    /// below the level goes on; an accept still being prepared is lowered by the read
+    /// after the reservation.
+    AtTheLevel,
+}
+
+/// Ends the sessions of one device within a second (decision M1-67, D6; §B.8.4.1's host
+/// table): the host's kill switch addressed to one device (`tornect-signal`). The
+/// offline CLI has none: no session runs there.
+pub trait DeviceSessionEnd: Send + Sync {
+    /// End the sessions of `device` that `scope` reaches, with `BYE{REVOKED}`.
+    fn end_device(&self, device: &DeviceId, scope: EndScope);
+}
+
 /// "No session" stub for the offline CLI.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoSessionActivity;
@@ -671,6 +691,7 @@ pub struct MutationGuard {
     paired: Arc<dyn PairedDevices>,
     setup: Arc<dyn ServerSetupSource>,
     facts: Arc<dyn FactsSource>,
+    device_end: Option<Arc<dyn DeviceSessionEnd>>,
     txns: Mutex<Vec<TxnEntry>>,
 }
 
@@ -707,7 +728,25 @@ impl MutationGuard {
             paired,
             setup: Arc::new(NoServerSetupSource),
             facts,
+            device_end: None,
             txns: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// End a device's sessions, live or reserved, when this guard revokes, disables,
+    /// suspends or lowers its grant (decision M1-67, D6): the host's kill switch. Without
+    /// it (the offline CLI) nothing is ended, as no session runs.
+    #[must_use]
+    pub fn with_device_end(mut self, end: Arc<dyn DeviceSessionEnd>) -> Self {
+        self.device_end = Some(end);
+        self
+    }
+
+    /// After a committed deny-direction change of `device`'s grant: the sessions `scope`
+    /// reaches end.
+    fn end_sessions_of(&self, device: &DeviceId, scope: EndScope) {
+        if let Some(end) = &self.device_end {
+            end.end_device(device, scope);
         }
     }
 
@@ -1007,6 +1046,7 @@ impl MutationGuard {
         self.store
             .remove_grant(device, &rec)
             .map_err(|e| self.refuse("revoke", Some(by), Some(device), GuardError::from(e)))?;
+        self.end_sessions_of(device, EndScope::Every);
         Ok(())
     }
 
@@ -1046,6 +1086,7 @@ impl MutationGuard {
                 Ok(())
             })
             .map_err(|e| self.refuse("disable", Some(by), Some(device), GuardError::from(e)))?;
+        self.end_sessions_of(device, EndScope::Every);
         Ok(())
     }
 
@@ -1069,7 +1110,10 @@ impl MutationGuard {
             .grant(&existing.id)
             .detail("unpair");
         match self.store.remove_grant(device, &rec) {
-            Ok(_) => Ok(true),
+            Ok(_) => {
+                self.end_sessions_of(device, EndScope::Every);
+                Ok(true)
+            }
             Err(StoreError::NoGrant) => Ok(false),
             Err(e) => Err(self.refuse("unpair", Some(by), Some(device), GuardError::from(e))),
         }
@@ -1136,6 +1180,9 @@ impl MutationGuard {
                 })
             })
             .map_err(|e| self.refuse("suspend", by, Some(device), GuardError::from(e)))?;
+        if outcome == SuspendOutcome::Suspended {
+            self.end_sessions_of(device, EndScope::Every);
+        }
         Ok(outcome)
     }
 
@@ -1380,21 +1427,28 @@ impl MutationGuard {
         let op = "set_options";
         self.require_loaded(op, Some(by), Some(device))?;
         let file_keystore = self.store.keystore_kind().is_file();
-        match self.apply_options_locked(by, device, options, file_keystore, false) {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
+        let lowered = match self.apply_options_locked(by, device, options, file_keystore, false) {
+            Ok(Some(lowered)) => lowered,
+            Ok(None) => {
+                self.access_increasing(op, by, Some(device))?;
+                self.apply_options_locked(by, device, options, file_keystore, true)
+                    .map_err(|e| self.refuse(op, Some(by), Some(device), e))?
+                    .unwrap_or(false)
+            }
             Err(e) => return Err(self.refuse(op, Some(by), Some(device), e)),
+        };
+        // A lowering, decided under the lock that committed it, ends the device's sessions
+        // at the level (D6).
+        if lowered {
+            self.end_sessions_of(device, EndScope::AtTheLevel);
         }
-        self.access_increasing(op, by, Some(device))?;
-        match self.apply_options_locked(by, device, options, file_keystore, true) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(self.refuse(op, Some(by), Some(device), e)),
-        }
+        Ok(())
     }
 
     /// Apply `options` to the locked grant, log `GrantChanged` and persist (policy
     /// write) in one critical section. A widening change without `reauthed` leaves
-    /// everything untouched and returns `Ok(false)`. Errors are returned unlogged (the
+    /// everything untouched and returns `Ok(None)`; a committed change returns whether it
+    /// took the grant off the administrator level (D6). Errors are returned unlogged (the
     /// caller writes the refusal line — never under this lock).
     fn apply_options_locked(
         &self,
@@ -1403,7 +1457,7 @@ impl MutationGuard {
         options: &GrantOptions,
         file_keystore: bool,
         reauthed: bool,
-    ) -> Result<bool, GuardError> {
+    ) -> Result<Option<bool>, GuardError> {
         // The facts a raise is judged on, read before the lock (decision M1-67).
         let facts = (self.facts.account(), self.facts.helper_task());
         let mut st = self.store.state();
@@ -1466,7 +1520,7 @@ impl MutationGuard {
         if !widened.is_empty() {
             if !reauthed {
                 st.store = Some(before);
-                return Ok(false);
+                return Ok(None);
             }
             // A widening change makes its last no-session check here, under the lock
             // that commits it (decision M1-67); a narrowing one is deny-direction.
@@ -1475,6 +1529,12 @@ impl MutationGuard {
                 return Err(e.into());
             }
         }
+        // A lowering (D6), judged on the locked grant: the caller ends the device's sessions
+        // at the level once this is committed.
+        let lowered = matches!(
+            (before.grant(device), st.store.as_ref().and_then(|s| s.grant(device))),
+            (Some(old), Some(new)) if old.holds_level() && !new.holds_level()
+        );
         let rec = SessionRecord::at(now, SessionEvent::GrantChanged)
             .by(by)
             .device(*device)
@@ -1492,7 +1552,7 @@ impl MutationGuard {
             st.store = Some(before);
             return Err(e.into());
         }
-        Ok(true)
+        Ok(Some(lowered))
     }
 
     /// Host-wide settings (access-increasing).
@@ -1924,7 +1984,8 @@ impl MutationGuard {
                 .by(by)
                 .device(*device)
                 .grant(&existing.id);
-            self.store
+            let lowered = self
+                .store
                 .mutate(WriteClass::Policy, Some(&rec), |s, now| {
                     self.no_session_at_commit()?;
                     let Some(before) = s.grant(device).cloned() else {
@@ -1954,15 +2015,20 @@ impl MutationGuard {
                         )));
                     }
                     raise_rule(raises)?;
+                    // A lowering that comes with the new password (D6).
+                    let lowered = before.holds_level() && !after.holds_level();
                     after.auth = auth;
                     after.suite = 1;
                     // Only a password sent as generated clears the mark (D9, D11).
                     after.unmarked = generated;
                     let g = s.grant_mut(device).ok_or(StoreError::NoGrant)?;
                     *g = after;
-                    Ok(())
+                    Ok(lowered)
                 })
                 .map_err(|e| self.refuse(op, Some(by), Some(device), GuardError::from(e)))?;
+            if lowered {
+                self.end_sessions_of(device, EndScope::AtTheLevel);
+            }
             return Ok(RegFinishOutcome::PasswordSet(existing.id));
         }
         let waived =

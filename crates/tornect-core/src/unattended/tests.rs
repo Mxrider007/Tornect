@@ -5437,3 +5437,80 @@ fn a25_c_a_raise_during_the_request_fails_auth_and_the_admin_command_too() {
     assert!(!store.grant(&admin).unwrap().marked());
     drop((env, guard));
 }
+
+// ------------------------------------------------------------------ the per-device end (M1-67: D6)
+
+/// Records every device whose sessions the guard ends, with the scope of the end.
+#[derive(Default)]
+struct RecordingEnd {
+    ended: parking_lot::Mutex<Vec<(DeviceId, super::guard::EndScope)>>,
+}
+
+impl super::guard::DeviceSessionEnd for RecordingEnd {
+    fn end_device(&self, device: &DeviceId, scope: super::guard::EndScope) {
+        self.ended.lock().push((*device, scope));
+    }
+}
+
+#[test]
+fn a25_p_each_local_deny_direction_change_ends_that_devices_sessions() {
+    // A25 (p), D6, the guard's half: a local revoke, disable and suspend each end every
+    // session of that device once committed, a lowering (by set_options, or with a new
+    // password) only its sessions at the level, and only that device's; a change that
+    // ends nothing (a narrowing, a no-op suspend, a refusal) ends nothing.
+    use super::guard::EndScope::{AtTheLevel, Every};
+    let (_env, store, _guard) = reach_env();
+    let end = Arc::new(RecordingEnd::default());
+    let guard =
+        guard_on(&store, windows(|_| {}), HelperPresence::Absent).with_device_end(end.clone());
+    let ended = || std::mem::take(&mut *end.ended.lock());
+    let lower = GrantOptions {
+        elevation: Some(Elevation::None),
+        ..GrantOptions::default()
+    };
+    // a lowering of a grant at the level
+    set_grant(&store, &dev(1), |g| g.elevation = Elevation::Admin);
+    guard.set_options(Actor::Ui, &dev(1), &lower).unwrap();
+    assert_eq!(ended(), vec![(dev(1), AtTheLevel)], "lowering");
+    // the same options again: nothing left to lower
+    guard.set_options(Actor::Ui, &dev(1), &lower).unwrap();
+    assert!(ended().is_empty(), "already at none");
+    // a narrowing that lowers nothing
+    guard
+        .set_options(
+            Actor::Ui,
+            &dev(1),
+            &GrantOptions {
+                block_window_s: Some(10),
+                ..GrantOptions::default()
+            },
+        )
+        .unwrap();
+    assert!(ended().is_empty(), "no lowering");
+    // a lowering that comes with a new password
+    set_grant(&store, &dev(2), |g| g.elevation = Elevation::Admin);
+    guard
+        .set_password(Actor::Ui, &dev(2), &upload(), &lower, true)
+        .unwrap();
+    assert_eq!(
+        ended(),
+        vec![(dev(2), AtTheLevel)],
+        "lowering with a password"
+    );
+    assert_eq!(
+        guard.suspend(Actor::Ui, &dev(1)).unwrap(),
+        SuspendOutcome::Suspended
+    );
+    assert_eq!(ended(), vec![(dev(1), Every)], "suspend");
+    assert_eq!(
+        guard.suspend(Actor::Ui, &dev(1)).unwrap(),
+        SuspendOutcome::NoOp
+    );
+    assert!(ended().is_empty(), "already suspended");
+    guard.disable(Actor::Ui, &dev(2)).unwrap();
+    assert_eq!(ended(), vec![(dev(2), Every)], "disable");
+    guard.revoke(Actor::Ui, &dev(1)).unwrap();
+    assert_eq!(ended(), vec![(dev(1), Every)], "revoke");
+    assert!(guard.revoke(Actor::Ui, &dev(1)).is_err());
+    assert!(ended().is_empty(), "a refused revoke ends nothing");
+}
