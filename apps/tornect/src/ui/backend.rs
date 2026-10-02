@@ -818,13 +818,21 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                         {
                             continue;
                         }
-                        let Some(request) = unattended_request(&b, &id, choice) else {
-                            b.shared.update(|m| {
-                                m.client = ClientStage::Ended(
-                                    "No password: none was typed and none is remembered.".to_owned(),
-                                );
-                            });
-                            continue;
+                        let request = match unattended_request(&b, &id, choice) {
+                            Ok(request) => request,
+                            Err(NoPassword::Vanished) => {
+                                ask_again(&b, id, None, None);
+                                continue;
+                            }
+                            Err(NoPassword::None) => {
+                                b.shared.update(|m| {
+                                    m.client = ClientStage::Ended(
+                                        "No password: none was typed and none is remembered."
+                                            .to_owned(),
+                                    );
+                                });
+                                continue;
+                            }
                         };
                         let (stop_tx, stop) = watch::channel(false);
                         let task = tokio::spawn(view_session(
@@ -842,14 +850,18 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                             b.shared.update(|m| m.note("Tor is not connected yet."));
                             continue;
                         };
-                        if let Some(request) = unattended_request(&b, &id, choice) {
-                            tokio::spawn(admin_command(
-                                Arc::clone(&b),
-                                node,
-                                id,
-                                (action, target),
-                                request,
-                            ));
+                        match unattended_request(&b, &id, choice) {
+                            Ok(request) => {
+                                tokio::spawn(admin_command(
+                                    Arc::clone(&b),
+                                    node,
+                                    id,
+                                    (action, target),
+                                    request,
+                                ));
+                            }
+                            Err(NoPassword::Vanished) => ask_again(&b, id, Some(action), target),
+                            Err(NoPassword::None) => {}
                         }
                     }
                     Command::Revoke => {
@@ -918,14 +930,38 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
 /// Make an address-book change the window asked for (on this side, never on
 /// the UI thread) and show the files as they are now.
 fn change_book(b: &Backend, change: &Change) {
-    // Forget takes the remembered unattended password too (§B.8.9.1).
-    if let Change::Forget(id) = change
-        && let Err(e) = ua_client::forget(&b.paths, &ua_client::system_passwords(&b.device), id)
-    {
-        tracing::warn!(error = %format!("{e:#}"), "the remembered password was not deleted");
-    }
-    let note = book::apply(&b.paths, change);
+    let note = match change {
+        Change::Forget(id) => forget(&b.paths, &ua_client::system_passwords(&b.device), id),
+        _ => book::apply(&b.paths, change),
+    };
     refresh_book(b, Some(note));
+}
+
+/// Forget `id`: its remembered unattended password and record (§B.8.9.1),
+/// then its pin, its saved entry and its recent lines; the note to show.
+/// When the keychain or `hosts.toml` refused, the note says what stayed, so
+/// that Forget never reports a deletion that did not happen (FR2-L1).
+fn forget(
+    paths: &Paths,
+    saved: &tornect_core::unattended::credentials::SavedPasswords,
+    id: &TornectId,
+) -> String {
+    let kept = ua_client::forget(paths, saved, id).err();
+    if let Some(e) = &kept {
+        tracing::warn!(error = %e, "Forget did not finish");
+    }
+    let note = book::apply(paths, &Change::Forget(*id));
+    match kept {
+        None => note,
+        Some(ua_client::Kept::Password(_)) => format!(
+            "{note} Its remembered password could not be deleted: it may still be in {}.",
+            saved.keychain().unwrap_or("the keychain")
+        ),
+        Some(ua_client::Kept::Record(_)) => format!(
+            "{note} Its remembered password was deleted, but its unattended record could not \
+             be removed from hosts.toml."
+        ),
+    }
 }
 
 /// Read the address book's files into the model again, keeping the checks.
@@ -1031,6 +1067,7 @@ fn open_prompt(b: &Backend, id: TornectId, admin: Option<AdminAction>, target: O
             kept: saved.kept(),
             remember: (saved.offer(false), saved.offer(true)),
             remembered: record.remember && saved.keychain().is_some(),
+            vanished: false,
             stale: record.stale,
             may_admin: record.administrator,
             retry_at: m.retry_at.get(&id).copied(),
@@ -1040,29 +1077,54 @@ fn open_prompt(b: &Backend, id: TornectId, admin: Option<AdminAction>, target: O
     });
 }
 
+/// Why the prompt's choice gave no password to send.
+enum NoPassword {
+    /// None was typed, none could be read.
+    None,
+    /// The one remembered is gone from the keychain: its flag went, and the
+    /// prompt asks for it again (I-9).
+    Vanished,
+}
+
 /// The attempt the prompt asked for: the password typed, else the one
 /// remembered for `id` (read from the keychain now, under its derived name).
-fn unattended_request(b: &Backend, id: &TornectId, choice: UaChoice) -> Option<ua_client::Request> {
+fn unattended_request(
+    b: &Backend,
+    id: &TornectId,
+    choice: UaChoice,
+) -> Result<ua_client::Request, NoPassword> {
     let password = match choice.password {
         Some(Secret(typed)) => typed,
         None => {
             let saved = ua_client::system_passwords(&b.device);
-            match ua_client::recall(&b.paths, &saved, id) {
-                Ok(Some(remembered)) => remembered,
-                Ok(None) => return None,
+            match ua_client::recall_for_use(&b.paths, &saved, id) {
+                Ok(ua_client::Recalled::Password(remembered)) => remembered,
+                Ok(ua_client::Recalled::Vanished) => return Err(NoPassword::Vanished),
+                Ok(ua_client::Recalled::Nothing) => return Err(NoPassword::None),
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "the keychain could not be read");
-                    return None;
+                    return Err(NoPassword::None);
                 }
             }
         }
     };
-    Some(ua_client::Request {
+    Ok(ua_client::Request {
         password,
         view_only: choice.view_only,
         administrator: choice.administrator,
         remember: choice.remember,
     })
+}
+
+/// Open the prompt for `id` again, asking for the password that vanished
+/// from the keychain (I-9).
+fn ask_again(b: &Backend, id: TornectId, admin: Option<AdminAction>, target: Option<[u8; 32]>) {
+    open_prompt(b, id, admin, target);
+    b.shared.update(|m| {
+        if let Some(prompt) = m.prompt.as_mut().filter(|p| p.id == id) {
+            prompt.vanished = true;
+        }
+    });
 }
 
 /// One admin command at `id` (§B.8.10): dial, one attempt, the host's signed
@@ -2040,5 +2102,73 @@ mod tests {
         assert!(first_run(&paths), "the first run");
         assert!(!first_run(&paths), "then never again");
         assert!(!first_run(&paths));
+    }
+
+    /// FR2-L1: when the keychain refuses to delete the remembered password,
+    /// Forget's note says so plainly (the pairing goes all the same); with a
+    /// keychain that deletes, the note says what went and nothing more.
+    #[test]
+    fn forget_says_when_the_password_could_not_be_deleted() {
+        use tornect_core::trusted::{KnownHosts, known_hosts_file};
+        use tornect_core::unattended::credentials::{
+            EntryName, MemoryVault, PasswordVault, SavedPasswords,
+        };
+        use zeroize::Zeroizing;
+
+        /// A keychain whose delete fails.
+        struct Refusing(MemoryVault);
+        impl PasswordVault for Refusing {
+            fn describe(&self) -> &'static str {
+                self.0.describe()
+            }
+            fn presence_gated(&self) -> bool {
+                false
+            }
+            fn get(&self, entry: &EntryName) -> tornect_core::Result<Option<Zeroizing<String>>> {
+                self.0.get(entry)
+            }
+            fn put(&self, entry: &EntryName, password: &str) -> tornect_core::Result<()> {
+                self.0.put(entry, password)
+            }
+            fn delete(&self, _: &EntryName) -> tornect_core::Result<bool> {
+                Err(std::io::Error::other("the keychain refused").into())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        paths.ensure().unwrap();
+        let host = HostIdentity::from_seed(&[0x77; 32]).id();
+        let paired = || {
+            let mut known = KnownHosts::default();
+            known.pin(host, "Desk", [9; 32], 1);
+            known.save(&known_hosts_file(&paths)).unwrap();
+        };
+        let forgot = format!(
+            "Forgot {}…: the next connection to it compares a code again.",
+            host.short()
+        );
+
+        let refusing = Arc::new(Refusing(MemoryVault::new()));
+        let saved = SavedPasswords::new(Some(refusing.clone()), [1; 32]);
+        paired();
+        refusing.0.put(&saved.entry(&host), "pw").unwrap();
+        assert_eq!(
+            forget(&paths, &saved, &host),
+            format!(
+                "{forgot} Its remembered password could not be deleted: it may still be in a \
+                 test keychain."
+            )
+        );
+        assert_eq!(refusing.0.names().len(), 1, "the password is still there");
+        let known = KnownHosts::load(&known_hosts_file(&paths)).unwrap();
+        assert!(known.get(&host).is_none(), "the pairing went all the same");
+
+        let vault = Arc::new(MemoryVault::new());
+        let saved = SavedPasswords::new(Some(vault.clone()), [1; 32]);
+        paired();
+        vault.put(&saved.entry(&host), "pw").unwrap();
+        assert_eq!(forget(&paths, &saved, &host), forgot);
+        assert!(vault.names().is_empty());
     }
 }

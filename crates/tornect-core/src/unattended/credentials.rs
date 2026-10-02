@@ -289,12 +289,20 @@ impl SavedPasswords {
         vault.get(&self.entry(host))
     }
 
+    /// Delete the keychain entry of `host` by its derived name, whatever a file says of it
+    /// (Forget before its file is read, Rotate ID, a save that failed after the entry was
+    /// written: F4-5); whether there was one. Deleting a missing entry is harmless.
+    pub fn erase(&self, host: &TornectId) -> Result<bool> {
+        match &self.vault {
+            Some(vault) => vault.delete(&self.entry(host)),
+            None => Ok(false),
+        }
+    }
+
     /// Delete the entry of `host` from the keychain and the record's `remember` flag (Forget,
     /// Rotate ID, a refused password); whether `hosts` changed.
     pub fn forget(&self, hosts: &mut HostsFile, host: &TornectId) -> Result<bool> {
-        if let Some(vault) = &self.vault {
-            vault.delete(&self.entry(host))?;
-        }
+        self.erase(host)?;
         Ok(match hosts.hosts.get_mut(&host.onion_address()) {
             Some(r) if r.remember => {
                 r.remember = false;
@@ -769,5 +777,19 @@ mod tests {
         assert!(vault.names().is_empty());
         assert!(!hosts.get(&h).unwrap().remember);
         assert!(!saved.forget(&mut hosts, &h).unwrap());
+    }
+
+    /// F4-5: an entry goes by its derived name alone, with no file that flags it; a
+    /// second delete, or one without a keychain, is harmless.
+    #[test]
+    fn erase_deletes_the_entry_whatever_a_file_says() {
+        let vault = Arc::new(MemoryVault::new());
+        let saved = SavedPasswords::new(Some(vault.clone()), [1; 32]);
+        let h = host(5);
+        vault.put(&saved.entry(&h), "pw").unwrap();
+        assert!(saved.erase(&h).unwrap());
+        assert!(vault.names().is_empty());
+        assert!(!saved.erase(&h).unwrap());
+        assert!(!SavedPasswords::none([1; 32]).erase(&h).unwrap());
     }
 }
