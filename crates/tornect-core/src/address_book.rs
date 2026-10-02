@@ -453,8 +453,10 @@ pub struct AddressBook {
 }
 
 /// History is off until it is switched on (the operator's ruling of
-/// 2026-09-28): on a new Tornect home nothing about past connections is
-/// written — no recent list, no last-connected days, no last-seen times.
+/// 2026-09-28): on a new Tornect home no list of recent connections is
+/// written — no recent list, no last-connected days, no last-seen times. The
+/// session log is not history: it records requests to this computer, and
+/// unattended connections to others, whatever the switch says (2026-09-29).
 fn history_by_default() -> bool {
     false
 }
