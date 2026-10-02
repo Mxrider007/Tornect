@@ -327,7 +327,12 @@ pub fn wire(
                 // Read at each answer (decision M1-67).
                 Arc::new(tornect_platform::levels::LiveFacts),
             )
-            .with_admin_authority(Arc::new(GuardAdmin::new(Arc::clone(&ctx.guard)))),
+            .with_admin_authority(Arc::new(GuardAdmin::new(Arc::clone(&ctx.guard))))
+            // Block suspends the grant (§B.8.6.3). Only the window host has a
+            // block window with Block: the terminal host keeps the headless
+            // seams (a timer nobody can block, every "Ask before starting"
+            // denied).
+            .with_block_guard(Arc::clone(&ctx.guard)),
         );
         host_cfg.feats = vec![messages::feats::UA1.to_owned()];
     }

@@ -15,11 +15,12 @@ use tornect_core::words::{Identicon, label_refusal};
 use tornect_signal::fsm::timeouts;
 use tornect_signal::pairing::{PairDecision, SessionDecision};
 
+use super::model::{
+    BlockRequest, Confirm, Model, Popup, PopupKind, Prompt, Recognition, Sharing, SheetLevels,
+    Viewing,
+};
 #[cfg(test)]
 use super::model::{ClientStage, Hosting, Setup, TorState};
-use super::model::{
-    Confirm, Model, Popup, PopupKind, Prompt, Recognition, Sharing, SheetLevels, Viewing,
-};
 use super::nav::{self, Page};
 use super::pages;
 use super::theme::{self, Face};
@@ -129,6 +130,21 @@ pub enum Action {
         /// Given by a primary click of the pointer, not by Space or Enter;
         /// always so for an accept (decision M1-50).
         pointer: bool,
+    },
+    /// The host user's answer to an "Ask before starting" popup (§B.8.6.3).
+    Ask {
+        /// The popup.
+        id: u64,
+        /// Allow (`false`: Deny).
+        allow: bool,
+        /// Given by a primary click of the pointer, not by Space or Enter;
+        /// always so for Allow (decision M1-50).
+        pointer: bool,
+    },
+    /// Block, in the block window of request `id` (§B.8.6.3).
+    Block {
+        /// The request.
+        id: u64,
     },
     /// The client user's answer to the code question.
     Confirm {
@@ -1093,6 +1109,60 @@ pub fn indicator_pill(
 }
 
 /// Whether `code` holds a whole code: six digits (a space allowed).
+/// A block window (§B.8.6.3, `block`): who is about to connect without asking,
+/// the seconds left, and the window's one control, Block, which a click or the
+/// keyboard answers (it only refuses).
+pub fn block_window(
+    ui: &mut egui::Ui,
+    block: &BlockRequest,
+    now: Instant,
+    actions: &mut Vec<Action>,
+) {
+    theme::ensure(ui.ctx());
+    let t = theme::tokens(ui.ctx());
+    let left = countdown(block.ends_at, now);
+    let label = shown(&block.label);
+    egui::CentralPanel::no_frame()
+        .frame(
+            egui::Frame::new()
+                .fill(t.bg_app)
+                .inner_margin(egui::Margin::symmetric(18, 14)),
+        )
+        .show(ui, |ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("\"{label}\" is connecting without asking"))
+                        .strong()
+                        .size(17.0),
+                )
+                .wrap()
+                .selectable(false),
+            );
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(format!(
+                    "The session starts in {left} s. Block refuses it, and \"{label}\" cannot \
+                     connect without asking until you resume its access on this computer."
+                ))
+                .wrap()
+                .selectable(false),
+            );
+            ui.add_space(10.0);
+            let block_button = egui::Button::new(
+                RichText::new("Block")
+                    .strong()
+                    .size(16.0)
+                    .color(t.on_sharing),
+            )
+            .fill(t.sharing_fill);
+            if ui.add(block_button).clicked() {
+                actions.push(Action::Block { id: block.id });
+            }
+        });
+    // The seconds move.
+    ui.ctx().request_repaint_after(Duration::from_millis(250));
+}
+
 fn whole_code(code: &str) -> bool {
     code.chars().filter(char::is_ascii_digit).count() == 6
 }
@@ -1136,6 +1206,7 @@ fn host_popup(
     let title = match popup.kind {
         PopupKind::Pairing { .. } => "Pairing request",
         PopupKind::Session { .. } => "Session request",
+        PopupKind::Ask { .. } => "Unattended request",
     };
     ui.label(RichText::new(title).heading().color(t.accent_text));
     ui.push_id(("popup", popup.id), |ui| match &popup.kind {
@@ -1487,6 +1558,58 @@ fn host_popup(
                     );
                 }
             }
+            ui.label(
+                RichText::new(format!(
+                    "Denied automatically in {left} s · only a mouse click can allow"
+                ))
+                .small()
+                .color(t.text_muted),
+            );
+        }
+        PopupKind::Ask {
+            label,
+            administrator,
+        } => {
+            // §B.8.6.3: the grant's level, never a choice of one (r7): Deny or
+            // Allow only.
+            let headline = if *administrator {
+                format!("\"{label}\" wants to connect as administrator")
+            } else {
+                format!("\"{label}\" wants to connect to this computer")
+            };
+            headline_row(
+                ui,
+                None,
+                RichText::new(headline).strong().size(16.0),
+                popup.deadline,
+                now,
+            );
+            ui.add(
+                egui::Label::new(
+                    "This device may connect without asking, and its access asks you before \
+                     each session. Deny refuses this session only.",
+                )
+                .wrap()
+                .selectable(false),
+            );
+            ui.add_space(4.0);
+            let armed = arm(ui, &mut form.cards, popup.id, now);
+            ui.horizontal(|ui| {
+                if let Some(pointer) = refuse(ui, "Deny") {
+                    actions.push(Action::Ask {
+                        id: popup.id,
+                        allow: false,
+                        pointer,
+                    });
+                }
+                if accept(ui, RichText::new("Allow").strong(), armed) {
+                    actions.push(Action::Ask {
+                        id: popup.id,
+                        allow: true,
+                        pointer: true,
+                    });
+                }
+            });
             ui.label(
                 RichText::new(format!(
                     "Denied automatically in {left} s · only a mouse click can allow"
@@ -1889,6 +2012,17 @@ mod tests {
                 fingerprint: "ef:01".to_owned(),
                 sas: "123 456".to_owned(),
                 pinned: None,
+            },
+            deadline: now + Duration::from_secs(60),
+        }
+    }
+
+    fn ask_popup(id: u64, now: Instant, administrator: bool) -> Popup {
+        Popup {
+            id,
+            kind: PopupKind::Ask {
+                label: "Laptop".to_owned(),
+                administrator,
             },
             deadline: now + Duration::from_secs(60),
         }
@@ -3154,5 +3288,141 @@ mod tests {
                 assert_eq!(said(&window), recent, "the confirmation too");
             }
         }
+    }
+
+    /// §B.8.6.3, r7: the "Ask before starting" sheet of an admin grant says that the
+    /// device wants to connect as administrator, a grant at none's that it wants to
+    /// connect; Deny and Allow only, since the level comes from the grant. Allow waits for
+    /// its second and answers the pointer only; no run of keys allows.
+    #[test]
+    fn the_ask_sheet_names_the_administrator_level_with_deny_and_allow_only() {
+        for administrator in [true, false] {
+            let t0 = Instant::now();
+            let model = with_popups(vec![ask_popup(5, t0, administrator)]);
+            let mut window = Harness::new(model, t0);
+            let later = t0 + Duration::from_secs(2);
+            window.pass(later, Vec::new());
+            assert_eq!(
+                window.text("\"Laptop\" wants"),
+                if administrator {
+                    "\"Laptop\" wants to connect as administrator"
+                } else {
+                    "\"Laptop\" wants to connect to this computer"
+                }
+            );
+            for absent in [
+                "View only",
+                "Allow control",
+                "Allow as administrator",
+                "Allow as administrator…",
+            ] {
+                assert!(!window.has(absent), "{absent} on the sheet");
+            }
+            let deny = window.button("Deny");
+            assert_eq!(
+                window.click(later, deny),
+                vec![Action::Ask {
+                    id: 5,
+                    allow: false,
+                    pointer: true
+                }]
+            );
+            let allow = window.button("Allow");
+            assert_eq!(
+                window.click(later, allow),
+                vec![Action::Ask {
+                    id: 5,
+                    allow: true,
+                    pointer: true
+                }]
+            );
+        }
+        // Before its second, Allow is disabled; keys alone never allow.
+        let t0 = Instant::now();
+        let mut window = Harness::new(with_popups(vec![ask_popup(6, t0, true)]), t0);
+        assert!(window.disabled("Allow"));
+        let later = t0 + Duration::from_secs(5);
+        let mut actions = Vec::new();
+        for _ in 0..4 {
+            actions.extend(window.key(later, egui::Key::Tab));
+            actions.extend(window.key(later, egui::Key::Enter));
+            actions.extend(window.key(later, egui::Key::Space));
+        }
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Ask { allow: true, .. })),
+            "{actions:?}"
+        );
+    }
+
+    /// §B.8.6.3: the block window names who is connecting without asking and the
+    /// seconds left, and has exactly one control, Block, which answers at once.
+    #[test]
+    fn the_block_window_has_one_control_block() {
+        let t0 = Instant::now();
+        let block = BlockRequest {
+            id: 9,
+            label: "Laptop".to_owned(),
+            ends_at: t0 + Duration::from_secs(10),
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let pass = |now: Instant, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(460.0, 190.0),
+                )),
+                time: Some(now.duration_since(t0).as_secs_f64()),
+                events,
+                ..egui::RawInput::default()
+            };
+            let mut actions = Vec::new();
+            let out = ctx.run_ui(raw, |ui| block_window(ui, &block, now, &mut actions));
+            let nodes: Vec<egui::accesskit::Node> = out
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .map(|u| u.nodes.iter().map(|(_, n)| n.clone()).collect())
+                .unwrap_or_default();
+            out.drop_without_applying_deltas();
+            (actions, nodes)
+        };
+        pass(t0, Vec::new());
+        let (_, nodes) = pass(t0, Vec::new());
+        let texts: Vec<String> = nodes
+            .iter()
+            .filter_map(|n| n.value().map(str::to_owned))
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == "\"Laptop\" is connecting without asking"),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("The session starts in 10 s. Block refuses it")),
+            "{texts:?}"
+        );
+        let buttons: Vec<&egui::accesskit::Node> = nodes
+            .iter()
+            .filter(|n| n.role() == egui::accesskit::Role::Button)
+            .collect();
+        assert_eq!(buttons.len(), 1, "one control");
+        assert_eq!(buttons[0].label(), Some("Block"));
+        let b = buttons[0].bounds().unwrap();
+        let at = egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut actions = pass(t0, vec![egui::Event::PointerMoved(at), press(true)]).0;
+        actions.extend(pass(t0 + Duration::from_millis(50), vec![press(false)]).0);
+        assert_eq!(actions, vec![Action::Block { id: 9 }]);
     }
 }
