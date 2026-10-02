@@ -1840,8 +1840,8 @@ mod tests {
             "Off: no list of recent connections is kept. Switched on, it keeps the day of each \
              connection (never the time) and each computer's last-connected day, only on this \
              computer; anything kept before stays until you clear it. The switch does not cover \
-             the session log: it always records connection attempts in both directions, with \
-             their time, on this computer only."
+             the session log: it always records requests to this computer, and your unattended \
+             connections to others, with their time, on this computer only."
         );
         assert!(has_text(&window, address_book::HISTORY_OFF));
         window.form.book.tab = Tab::Computers;
@@ -1856,8 +1856,8 @@ mod tests {
         assert!(has_text(&window, &question));
         assert_eq!(
             address_book::FORGET_KEEPS,
-            "Its lines in the session log stay: the session log always records connection \
-             attempts in both directions."
+            "Its lines in the session log stay: the session log always records requests to this \
+             computer, and your unattended connections to others."
         );
         assert!(has_text(&window, address_book::FORGET_KEEPS));
     }
