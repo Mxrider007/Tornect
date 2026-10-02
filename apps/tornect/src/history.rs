@@ -18,6 +18,12 @@
 //!   request. The host's store is shared with the file: a pairing, an
 //!   unpairing and a reject count are written the moment they happen (merged
 //!   into the file as it is then), a last-seen time only while history is on.
+//!
+//! On both sides a pairing time is kept to the second for its first day only,
+//! then to its UTC day (P-L4): the host's store does it after every load and
+//! before every save; on this side [`coarsen_pins`] does it when the window
+//! starts and when a connection starts, and [`Pins::settle`] for the record it
+//! writes.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -36,6 +42,31 @@ static KNOWN_HOSTS: Mutex<()> = Mutex::new(());
 /// Hold the lock on `known-hosts.toml`'s writers in this process.
 pub fn known_hosts_lock() -> MutexGuard<'static, ()> {
     KNOWN_HOSTS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Keep every pairing time in `known-hosts.toml` that is past its first day
+/// to the day (`KnownHosts::coarsen`, P-L4), under [`known_hosts_lock`]:
+/// with history off nothing else ever rewrites a pin. Best effort: a file
+/// that cannot be read or written is left as it is.
+pub fn coarsen_pins(paths: &Paths) {
+    if let Err(e) = coarsen_pins_at(paths, tornect_core::trusted::unix_now()) {
+        tracing::warn!(error = %format!("{e:#}"), "known-hosts.toml was not kept to the day");
+    }
+}
+
+/// [`coarsen_pins`] at `now`; whether the file was written.
+fn coarsen_pins_at(paths: &Paths, now: u64) -> anyhow::Result<bool> {
+    let _one = known_hosts_lock();
+    let path = known_hosts_file(paths);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut hosts = KnownHosts::load(&path)?;
+    if !hosts.coarsen(now) {
+        return Ok(false);
+    }
+    hosts.save(&path)?;
+    Ok(true)
 }
 
 /// The known hosts one connection to `host` works with.
@@ -114,6 +145,7 @@ impl Pins {
                 hosts.hosts.insert(self.host, record);
             } else if let Some(file) = hosts.hosts.get_mut(&self.host) {
                 file.last_seen = file.last_seen.max(now.last_seen);
+                file.coarsen(tornect_core::trusted::unix_now());
             } else {
                 return Ok(());
             }
@@ -538,5 +570,48 @@ mod tests {
         assert!(!pins.changed(), "no device paired or unpaired");
         // The crash: nothing flushes, nothing drops.
         std::mem::forget(pins);
+    }
+
+    /// P-L4 / U3-I8, this side: `known-hosts.toml` keeps a pin's pairing
+    /// second for its first 24 hours, then its UTC day, with a last-seen time
+    /// that still is that second; a later last-seen time stays. An old file
+    /// is loaded and saved once, then left alone; no file, nothing written.
+    #[test]
+    fn known_hosts_keep_the_pairing_time_to_the_day_after_a_day() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        let file = known_hosts_file(&paths);
+        assert!(!coarsen_pins_at(&paths, 0).unwrap());
+        assert!(!file.exists(), "no file: nothing written");
+        let (paired, day) = (1_790_000_123, 1_789_948_800);
+        let desk = HostIdentity::from_seed(&[0x55; 32]).id();
+        let studio = HostIdentity::from_seed(&[0x66; 32]).id();
+        let mut hosts = KnownHosts::default();
+        hosts.pin(desk, "Desk", [5; 32], paired);
+        hosts.pin(studio, "Studio", [6; 32], paired);
+        hosts.touch(&studio, paired + 600);
+        hosts.save(&file).unwrap();
+        let written = std::fs::read(&file).unwrap();
+
+        assert!(!coarsen_pins_at(&paths, paired + 24 * 3600 - 1).unwrap());
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            written,
+            "24 h - 1 s: as it was"
+        );
+        assert!(coarsen_pins_at(&paths, paired + 24 * 3600).unwrap());
+        let kept = KnownHosts::load(&file).unwrap();
+        let (d, s) = (kept.get(&desk).unwrap(), kept.get(&studio).unwrap());
+        assert_eq!((d.paired_at, d.last_seen), (day, day));
+        assert_eq!((s.paired_at, s.last_seen), (day, paired + 600));
+        assert!(
+            !std::fs::read_to_string(&file)
+                .unwrap()
+                .contains(&paired.to_string())
+        );
+        assert!(
+            !coarsen_pins_at(&paths, paired + 48 * 3600).unwrap(),
+            "once"
+        );
     }
 }
