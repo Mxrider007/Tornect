@@ -1154,11 +1154,13 @@ mod tests {
         let log = SessionLog::new(paths.sessions_log());
         let store = GrantStore::open(&paths, secrets, clock, log).unwrap();
 
+        // Set up as the command line would on a host where nothing reaches the level; the
+        // host, and the guard its admin path uses, then run on `facts`.
         let guard = MutationGuard::new(
-            store,
+            store.clone(),
             Arc::new(AllowAllReAuth::default()),
             Arc::new(NoSessionActivity),
-            Arc::clone(&facts),
+            Arc::new(tornect_core::levels::FixedFacts::linux()),
         )
         .with_paired_devices(Arc::new(AllowAllPaired))
         .with_server_setup_source(Arc::new(OpaqueServerSetupSource));
@@ -1176,7 +1178,7 @@ mod tests {
         // one below; this first call exists to bootstrap the store (and with it the
         // `ServerSetup` the registration must run against).
         guard
-            .create_grant(Actor::Cli, &device, preset, options, &[0u8; 192])
+            .create_grant(Actor::Cli, &device, preset, options, &[0u8; 192], false)
             .expect("create_grant");
         let setup_bytes = guard.store().server_setup().expect("bootstrapped");
         let setup = auth::parse_server_setup(&setup_bytes).unwrap();
@@ -1188,10 +1190,25 @@ mod tests {
         )
         .unwrap();
         guard
-            .set_password(Actor::Cli, &device, &record)
+            .set_password(
+                Actor::Cli,
+                &device,
+                &record,
+                &GrantOptions::default(),
+                false,
+            )
             .expect("set_password");
 
-        let guard = Arc::new(guard);
+        let guard = Arc::new(
+            MutationGuard::new(
+                store,
+                Arc::new(AllowAllReAuth::default()),
+                Arc::new(NoSessionActivity),
+                Arc::clone(&facts),
+            )
+            .with_paired_devices(Arc::new(AllowAllPaired))
+            .with_server_setup_source(Arc::new(OpaqueServerSetupSource)),
+        );
         let limiter = AttemptLimiter::new(guard.store().clone());
         let auth = UnattendedAuth::new(
             limiter,

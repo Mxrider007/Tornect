@@ -408,7 +408,9 @@ pub fn dispatch(ctx: &HostContext, req: IpcRequest) -> IpcResponse {
         IpcOp::RegStart {
             device,
             reg_request,
-        } => match guard.reg_start(by, &device) {
+            raise,
+            generated,
+        } => match guard.reg_start(by, &device, raise, generated) {
             Ok(ok) => {
                 let setup = match tornect_signal::auth::parse_server_setup(&ok.server_setup) {
                     Ok(s) => s,
@@ -445,11 +447,12 @@ pub fn dispatch(ctx: &HostContext, req: IpcRequest) -> IpcResponse {
             upload,
             preset,
             options,
+            generated,
         } => {
             let Some(preset) = Preset::from_wire(preset) else {
                 return IpcResponse::fail(id, codes::E_BAD_LEN, "unknown preset");
             };
-            unit!(guard.reg_finish(by, &device, &reg_txn, &upload, preset, &options))
+            unit!(guard.reg_finish(by, &device, &reg_txn, &upload, preset, &options, generated))
         }
 
         IpcOp::Unknown(tag) => {
@@ -1463,6 +1466,10 @@ async fn register(
         IpcOp::RegStart {
             device,
             reg_request,
+            // The command line's administrator forms and its generator path come later
+            // (M-FEAT-5); until then it declares neither (decision M1-67).
+            raise: false,
+            generated: false,
         },
     )
     .await?;
@@ -1504,6 +1511,7 @@ async fn register(
             // from the grant, so the byte sent here is ignored on that path.
             preset: preset.unwrap_or(Preset::MyMachines).wire(),
             options,
+            generated: false,
         },
     )
     .await?;
@@ -2195,6 +2203,8 @@ mod tests {
             IpcOp::RegStart {
                 device,
                 reg_request,
+                raise: false,
+                generated: false,
             },
         );
         assert!(resp.ok, "{:?}", resp.detail);
@@ -2211,6 +2221,7 @@ mod tests {
                 upload,
                 preset: Preset::HeadlessBox.wire(),
                 options: GrantOptions::default(),
+                generated: false,
             },
         );
         assert!(!resp.ok, "the grant was written beside a host");
@@ -2556,6 +2567,7 @@ mod tests {
                 upload: [0u8; 192],
                 preset: 0,
                 options: GrantOptions::default(),
+                generated: false,
             },
         );
         assert!(!resp.ok);
@@ -2585,6 +2597,8 @@ mod tests {
             IpcOp::RegStart {
                 device,
                 reg_request,
+                raise: false,
+                generated: false,
             },
         );
         assert!(resp.ok, "{:?}", resp.detail);
@@ -2601,6 +2615,7 @@ mod tests {
                 upload,
                 preset: Preset::HeadlessBox.wire(),
                 options: GrantOptions::default(),
+                generated: false,
             },
         );
         assert!(resp.ok, "{:?}", resp.detail);
