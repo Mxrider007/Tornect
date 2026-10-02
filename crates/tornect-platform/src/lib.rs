@@ -36,8 +36,9 @@
 //! `RemoteSessionActivity`) and this crate implements them (§B.8.14
 //! *Ownership*). It does not depend on `tornect-signal`.
 //!
-//! **Unsafe code** is denied everywhere but in the Windows FFI module, which
-//! opts in and carries a `SAFETY:` comment on every block.
+//! **Unsafe code** is denied everywhere but in the Windows FFI modules and the
+//! Windows half of [`ipc`] (the pipe's descriptor and its peers' accounts),
+//! which opt in and carry a `SAFETY:` comment on every block.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
