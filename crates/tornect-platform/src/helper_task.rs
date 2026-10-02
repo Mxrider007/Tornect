@@ -25,6 +25,8 @@
 //! What this cannot keep out (§B.8.7.5 *Residual*): whatever lets the host
 //! run the task lets every program of this user run it.
 
+use tornect_core::levels::HelperPresence;
+
 use crate::autostart::{AutostartError, location_under, task_command, task_facts};
 
 /// The task's name for the user `sid` (a per-user name).
@@ -387,6 +389,46 @@ pub fn refusal_class(e: &AutostartError) -> &'static str {
         }
         AutostartError::Unquotable(_) => "the helper's command line cannot be registered",
         AutostartError::Cancelled => "the administrator prompt was cancelled",
+    }
+}
+
+/// The helper task's presence from the scheduler's answer (decision M1-67): a query
+/// that fails counts as registered. The log line names the refusal's class only (F-9).
+#[must_use]
+pub fn presence(ts: &dyn HelperTasks) -> HelperPresence {
+    match ts.query() {
+        Ok(Some(_)) => HelperPresence::Registered,
+        Ok(None) => HelperPresence::Absent,
+        Err(e) => {
+            tracing::warn!(
+                class = refusal_class(&e),
+                "the administrator helper task could not be queried: it counts as registered"
+            );
+            HelperPresence::Unreadable
+        }
+    }
+}
+
+/// This user's helper task now (decision M1-67): on Windows the Task Scheduler's answer,
+/// a scheduler that cannot be reached counting as registered; elsewhere there is none.
+#[must_use]
+pub fn presence_now() -> HelperPresence {
+    #[cfg(windows)]
+    {
+        match for_this_user() {
+            Ok(ts) => presence(&ts),
+            Err(e) => {
+                tracing::warn!(
+                    class = refusal_class(&e),
+                    "the Task Scheduler could not be reached: the helper task counts as registered"
+                );
+                HelperPresence::Unreadable
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        HelperPresence::Absent
     }
 }
 
@@ -950,5 +992,44 @@ mod tests {
             assert!(!class.contains(r"C:\"), "{class}");
             assert!(!class.contains("Someone"), "{class}");
         }
+    }
+
+    /// Decision M1-67: a query that fails counts as registered; otherwise the
+    /// scheduler's answer.
+    #[test]
+    fn a_failed_presence_query_counts_as_registered() {
+        struct Failing;
+        impl HelperTasks for Failing {
+            fn query(&self) -> Result<Option<String>, AutostartError> {
+                Err(AutostartError::Failed(
+                    "the scheduler did not answer".into(),
+                ))
+            }
+            fn register(&self, _: &str) -> Result<(), AutostartError> {
+                unreachable!()
+            }
+            fn delete(&self) -> Result<(), AutostartError> {
+                unreachable!()
+            }
+            fn set_enabled(&self, _: bool) -> Result<(), AutostartError> {
+                unreachable!()
+            }
+            fn security(&self, _: &str) -> Result<Security, AutostartError> {
+                unreachable!()
+            }
+            fn run(&self, _: &str) -> Result<(), AutostartError> {
+                unreachable!()
+            }
+            fn is_this_account(&self, _: &str) -> bool {
+                unreachable!()
+            }
+        }
+        assert_eq!(presence(&Failing), HelperPresence::Unreadable);
+        assert!(presence(&Failing).counts());
+        let ts = Fake::new();
+        assert_eq!(presence(&ts), HelperPresence::Absent);
+        assert!(!presence(&ts).counts());
+        *ts.task.borrow_mut() = Some("<Task/>".to_owned());
+        assert_eq!(presence(&ts), HelperPresence::Registered);
     }
 }

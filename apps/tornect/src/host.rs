@@ -253,12 +253,9 @@ pub fn wire(
 ) -> anyhow::Result<HostWiring> {
     // The session levels this computer can give (§B.2.1). A host started
     // elevated while UAC is on, or running as root on Linux (where Tornect
-    // never runs as administrator), opens no onion service at all.
-    let levels = if running_as_root() {
-        tornect_core::levels::Availability::LINUX_ROOT
-    } else {
-        tornect_platform::levels::probe()
-    };
+    // never runs as administrator), or that cannot rule root out (decision
+    // M1-67), opens no onion service at all.
+    let levels = levels_for(root_check(), tornect_platform::levels::probe)?;
     if !levels.serves() {
         anyhow::bail!(
             "{}",
@@ -327,6 +324,8 @@ pub fn wire(
                     paranoid: cfg.network.paranoid,
                     lan_only: cfg.network.lan_only,
                 },
+                // Read at each answer (decision M1-67).
+                Arc::new(tornect_platform::levels::LiveFacts),
             )
             .with_admin_authority(Arc::new(GuardAdmin::new(Arc::clone(&ctx.guard)))),
         );
@@ -436,17 +435,65 @@ type AuthorityFactory = Arc<
         + Sync,
 >;
 
-/// Whether this process runs as root on Linux: the owner of `/proc/self` is
-/// its effective user. Elsewhere, and when it cannot be read, `false`.
-fn running_as_root() -> bool {
+/// What the Linux root check found: the owner of `/proc/self` is this
+/// process's effective user (proc(5)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum Root {
+    /// Not root (and every system but Linux).
+    No,
+    /// Root.
+    Yes,
+    /// `/proc/self` could not be read: root is not ruled out.
+    Unreadable,
+}
+
+/// The refusal of a host that cannot rule out running as root (decision M1-67).
+const SENTENCE_ROOT_UNREADABLE: &str = "Tornect could not read which user it runs as \
+    (/proc/self), so it does not share this computer: on Linux it never runs as \
+    administrator, and it cannot rule that out.";
+
+/// The Linux root check of this process.
+fn root_check() -> Root {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt as _;
-        std::fs::metadata("/proc/self").is_ok_and(|m| is_root(m.uid()))
+        root_from(std::fs::metadata("/proc/self").map(|m| m.uid()))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        false
+        Root::No
+    }
+}
+
+/// The root check from what reading `/proc/self` gave: its owner, or why it
+/// could not be read (A21: a host that cannot rule out root does not serve).
+#[cfg(any(test, target_os = "linux"))]
+fn root_from(read: std::io::Result<u32>) -> Root {
+    match read {
+        Ok(uid) if is_root(uid) => Root::Yes,
+        Ok(_) => Root::No,
+        Err(_) => Root::Unreadable,
+    }
+}
+
+/// Whether this process may run as root on Linux: root, or its user could not
+/// be read.
+#[cfg(all(test, target_os = "linux"))]
+fn running_as_root() -> bool {
+    root_check() != Root::No
+}
+
+/// The session levels a host whose root check found `root` can give: the probe's
+/// row, the root row, or a refusal when root cannot be ruled out.
+fn levels_for(
+    root: Root,
+    probe: impl FnOnce() -> tornect_core::levels::Availability,
+) -> anyhow::Result<tornect_core::levels::Availability> {
+    match root {
+        Root::No => Ok(probe()),
+        Root::Yes => Ok(tornect_core::levels::Availability::LINUX_ROOT),
+        Root::Unreadable => anyhow::bail!("{SENTENCE_ROOT_UNREADABLE}"),
     }
 }
 
@@ -1939,6 +1986,26 @@ mod tests {
             let me = std::fs::metadata("/proc/self").unwrap().uid();
             assert_eq!(running_as_root(), me == 0);
         }
+    }
+
+    /// Decision M1-67 (A21): a Linux host whose root check cannot read
+    /// `/proc/self` does not serve, and says why; one that read its user
+    /// serves as before.
+    #[test]
+    fn the_root_check_refuses_when_it_cannot_read() {
+        let unreadable = root_from(Err(std::io::Error::other("no /proc")));
+        assert_eq!(unreadable, Root::Unreadable);
+        let refused = levels_for(unreadable, || panic!("no probe")).unwrap_err();
+        assert_eq!(refused.to_string(), SENTENCE_ROOT_UNREADABLE);
+        assert_eq!(root_from(Ok(0)), Root::Yes);
+        assert!(
+            !levels_for(Root::Yes, || panic!("no probe"))
+                .unwrap()
+                .serves()
+        );
+        assert_eq!(root_from(Ok(1000)), Root::No);
+        let linux = tornect_core::levels::Availability::of(None);
+        assert_eq!(levels_for(Root::No, || linux).unwrap(), linux);
     }
 
     /// A Control session whose revocation fails, or whose watch stops, is
