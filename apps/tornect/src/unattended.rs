@@ -846,6 +846,12 @@ fn context(
     .with_server_setup_source(Arc::new(
         tornect_signal::unattended::OpaqueServerSetupSource,
     ));
+    // A revoke, disable, suspend or lowering here ends that device's sessions within a
+    // second (decision M1-67, D6); the offline route has no sessions to end.
+    let guard = match &kill {
+        Some(k) => guard.with_device_end(Arc::new(k.clone())),
+        None => guard,
+    };
     let user_inputs = policy_user_inputs(paths, &host.id().onion_address(), &guard);
     Ok(HostContext {
         guard: Arc::new(guard),
