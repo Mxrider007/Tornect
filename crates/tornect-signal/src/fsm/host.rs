@@ -1236,7 +1236,17 @@ where
     // not held here: `try_reserve` let it go. A helper started for a level the
     // read took away ends here, never attached.
     let (proof, helper) = if unattended {
+        // What the hook may give back at most: the proof as the gate minted it.
+        let minted = unattended_level(&proof);
         match deps.unattended.reserved(&device, proof).await {
+            // The read only lowers: a proof above the one passed in, in mode or in
+            // level, or no unattended proof at all, is never signed.
+            Ok(lowered) if raised(minted, unattended_level(&lowered)) => {
+                tracing::warn!(peer = ?device, "the read after the reservation raised the session; refused");
+                drop(helper);
+                drop(reserved);
+                return reject_session(&mut chan, deps, &peer, messages::reject::NOT_GRANTED).await;
+            }
             Ok(lowered) => {
                 let still_admin = matches!(
                     &lowered,
@@ -1426,6 +1436,31 @@ fn unattended_needs_helper(proof: &ConsentProof, offered: &Answers) -> bool {
                 needs_helper: false
             })
         )
+}
+
+/// The mode and level of an unattended proof; `None` for any other proof.
+fn unattended_level(proof: &ConsentProof) -> Option<(SessionMode, Elevation)> {
+    match proof {
+        ConsentProof::Unattended { policy, .. } => Some((policy.mode(), policy.elevation())),
+        _ => None,
+    }
+}
+
+/// Whether the proof given back after the reservation (`back`) is above the one the
+/// gate minted (`minted`) in mode or in level, or is no unattended proof at all
+/// (decision M1-67: that read only lowers).
+fn raised(
+    minted: Option<(SessionMode, Elevation)>,
+    back: Option<(SessionMode, Elevation)>,
+) -> bool {
+    match (minted, back) {
+        (Some((mode, level)), Some((back_mode, back_level))) => {
+            SessionMode::most_restrictive(mode, back_mode) != back_mode
+                || Elevation::most_restrictive(level, back_level) != back_level
+        }
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
 }
 
 /// An unattended session's proof lowered to none (§B.8.7.5: the helper not
