@@ -42,10 +42,17 @@ pub struct HostRecord {
     /// identities at use (never a name read from this file, §B.8.9.1).
     pub remember: bool,
     /// The remembered password was refused (`AUTH_FAILED`, or this side's own check of the
-    /// host's answer) and deleted; the prompt says so until the next success.
+    /// host's PAKE reply, KE2) and deleted; the prompt says so until the next success. A
+    /// refused answer deletes without this mark (M1-67, C4).
     pub stale: bool,
-    /// A signed accept of this host gave this device the administrator level: the prompt
-    /// offers to ask for it again, and "Remember" needs a presence-gated keychain (DA-14).
+    /// The host's last signed unattended answer was not `grant_reach = 0`, left the key
+    /// out, or was refused (M1-67, C5): the prompt offers no "Remember". Set and cleared at
+    /// every signed unattended answer, never by an attended one; it only draws the prompt
+    /// and never decides what is kept (C1, C8).
+    pub reach: bool,
+    /// The host's last signed unattended answer said `grant_reach = 2`, this device's grant
+    /// holds the administrator level there (C5): with `control`, the prompt offers to ask for
+    /// it. Set and cleared like `reach`; it only draws the prompt.
     pub administrator: bool,
     /// The last signed accept of this host was control: the host card offers the admin
     /// commands that need a control grant (the host decides their scope, §B.8.4.1).
