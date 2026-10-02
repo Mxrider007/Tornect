@@ -807,6 +807,13 @@ pub struct SessionAccept {
     /// every key; never admin unless `mode = 0` (control).
     #[n(11)]
     pub(crate) elevation: Option<u8>,
+    /// key 12 — `grant_reach` (decision M1-67): what the password just proven can reach
+    /// through Tornect on this host, whatever was asked: 0 none, 1 through the host, 2 this
+    /// grant holds the administrator level. Unattended accepts only, inside the signed body;
+    /// absent from a host that does not send it (the reach is then unknown). Left out of
+    /// `Debug` and never logged (C13).
+    #[n(12)]
+    pub(crate) grant_reach: Option<u8>,
 }
 
 impl SessionAccept {
@@ -884,6 +891,14 @@ impl SessionAccept {
             .and_then(Elevation::from_code)
             .unwrap_or(Elevation::None)
     }
+
+    /// `grant_reach` (key 12, decision M1-67): `None` on an attended accept and from a host
+    /// that does not send it. A decoded accept holds only 0, 1 or 2, and 2 whenever an
+    /// unattended accept signs the administrator level ([`decode_body`]).
+    #[must_use]
+    pub fn grant_reach(&self) -> Option<u8> {
+        self.grant_reach
+    }
 }
 
 impl Body for SessionAccept {
@@ -892,21 +907,57 @@ impl Body for SessionAccept {
     fn validate(&self) -> Result<(), BodyError> {
         self.caps.validate(Self::KIND)?;
         match self.elevation {
-            None | Some(elevation::NONE) => Ok(()),
+            None | Some(elevation::NONE) => {}
             // View-only never carries an elevation (§B.8.4.1), and neither
             // does a mode this build does not know.
-            Some(elevation::ADMIN) if self.mode == mode::CONTROL => Ok(()),
-            Some(elevation::ADMIN) => Err(BodyError::Inconsistent {
-                kind: Self::KIND,
-                field: "elevation",
-                detail: "admin only with mode = 0",
-            }),
-            Some(_) => Err(BodyError::Inconsistent {
-                kind: Self::KIND,
-                field: "elevation",
-                detail: "0 none or 1 admin",
-            }),
+            Some(elevation::ADMIN) if self.mode == mode::CONTROL => {}
+            Some(elevation::ADMIN) => {
+                return Err(BodyError::Inconsistent {
+                    kind: Self::KIND,
+                    field: "elevation",
+                    detail: "admin only with mode = 0",
+                });
+            }
+            Some(_) => {
+                return Err(BodyError::Inconsistent {
+                    kind: Self::KIND,
+                    field: "elevation",
+                    detail: "0 none or 1 admin",
+                });
+            }
         }
+        check_grant_reach(Self::KIND, self.grant_reach)?;
+        // M1-67 (B, the receive rules): the key only on an unattended accept, and an
+        // unattended accept that signs the level says 2. An attended accept keeps its
+        // rules, so the attended vector 3 still decodes.
+        let unattended = self.session_type == session_type::UNATTENDED;
+        if self.grant_reach.is_some() && !unattended {
+            return Err(BodyError::Inconsistent {
+                kind: Self::KIND,
+                field: "grant_reach",
+                detail: "unattended accepts only",
+            });
+        }
+        if unattended && self.elevation == Some(elevation::ADMIN) && self.grant_reach != Some(2) {
+            return Err(BodyError::Inconsistent {
+                kind: Self::KIND,
+                field: "grant_reach",
+                detail: "2 when the administrator level is signed",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// `grant_reach` (decision M1-67) is 0, 1 or 2 in either body that carries it.
+fn check_grant_reach(kind: Kind, grant_reach: Option<u8>) -> Result<(), BodyError> {
+    match grant_reach {
+        None | Some(0..=2) => Ok(()),
+        Some(_) => Err(BodyError::Inconsistent {
+            kind,
+            field: "grant_reach",
+            detail: "0, 1 or 2",
+        }),
     }
 }
 
@@ -933,6 +984,7 @@ impl PartialEq for SessionAccept {
             && self.ends_at == other.ends_at
             && self.fail_summary == other.fail_summary
             && self.elevation == other.elevation
+            && self.grant_reach == other.grant_reach
             && bool::from(tokens)
     }
 }
@@ -1102,7 +1154,7 @@ impl Body for AuthResponse {
 }
 
 /// `ADMIN_RESULT` (host → client, signed).
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
 #[cbor(map)]
 pub struct AdminResult {
     /// key 0 — whether the command was executed.
@@ -1111,13 +1163,28 @@ pub struct AdminResult {
     /// key 1 — untrusted free text (≤ [`MAX_DETAIL_CHARS`]).
     #[n(1)]
     pub detail: Option<String>,
+    /// key 2 — `grant_reach` (decision M1-67), as in `SESSION_ACCEPT`: what the requester's
+    /// password can reach through Tornect on this host. Absent from a host that does not send
+    /// it. Left out of `Debug` and never logged (C13).
+    #[n(2)]
+    pub grant_reach: Option<u8>,
+}
+
+impl core::fmt::Debug for AdminResult {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AdminResult")
+            .field("ok", &self.ok)
+            .field("detail", &self.detail)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Body for AdminResult {
     const KIND: Kind = Kind::AdminResult;
 
     fn validate(&self) -> Result<(), BodyError> {
-        check_detail(Self::KIND, self.detail.as_ref())
+        check_detail(Self::KIND, self.detail.as_ref())?;
+        check_grant_reach(Self::KIND, self.grant_reach)
     }
 }
 
@@ -1359,6 +1426,7 @@ mod tests {
             ends_at: None,
             fail_summary: None,
             elevation: None,
+            grant_reach: None,
         }
     }
 
@@ -1451,6 +1519,7 @@ mod tests {
         roundtrip(&AdminResult {
             ok: true,
             detail: None,
+            grant_reach: None,
         });
         roundtrip(&Candidates {
             candidates: vec!["192.0.2.1:4000".to_owned()],
@@ -1527,6 +1596,7 @@ mod tests {
                 encode_body(&AdminResult {
                     ok: false,
                     detail: None,
+                    grant_reach: None,
                 }),
             ),
             (Kind::Candidates, encode_body(&Candidates::default())),
@@ -2140,6 +2210,136 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// An unattended accept as the client receives it: `token_confirm`, no `session_token`.
+    fn unattended_accept(
+        mode: u8,
+        elevation: Option<u8>,
+        grant_reach: Option<u8>,
+    ) -> SessionAccept {
+        let mut a = accept();
+        a.session_type = session_type::UNATTENDED;
+        a.session_token = None;
+        a.token_confirm = Some([7u8; 32]);
+        a.mode = mode;
+        a.elevation = elevation;
+        a.grant_reach = grant_reach;
+        a
+    }
+
+    /// M1-67 (B), A23: `grant_reach` (key 12) decodes only in its domain. An unattended
+    /// accept with `elevation = 1` and the key absent, 0 or 1; a value of 3; the key on an
+    /// attended accept: each `E_BAD_LEN` (an `Inconsistent` body). The key at 1 or 2 with
+    /// view only, or without `elevation`, is valid: it describes the password, not the
+    /// session.
+    #[test]
+    fn a23_grant_reach_decodes_only_in_its_domain() {
+        let field_of = |a: &SessionAccept| match decode_body::<SessionAccept>(&encode_body(a)) {
+            Err(BodyError::Inconsistent { field, .. }) => field,
+            other => panic!("{other:?}"),
+        };
+        for reach in [None, Some(0), Some(1)] {
+            assert_eq!(
+                field_of(&unattended_accept(mode::CONTROL, Some(1), reach)),
+                "grant_reach",
+                "{reach:?}"
+            );
+        }
+        for bad in [3u8, 9, u8::MAX] {
+            assert_eq!(
+                field_of(&unattended_accept(mode::CONTROL, None, Some(bad))),
+                "grant_reach"
+            );
+            let result = AdminResult {
+                ok: true,
+                detail: None,
+                grant_reach: Some(bad),
+            };
+            assert!(matches!(
+                decode_body::<AdminResult>(&encode_body(&result)),
+                Err(BodyError::Inconsistent {
+                    field: "grant_reach",
+                    ..
+                })
+            ));
+        }
+        let mut attended = accept();
+        attended.grant_reach = Some(0);
+        assert_eq!(field_of(&attended), "grant_reach");
+        for (m, elevation, reach) in [
+            (mode::CONTROL, None, Some(0)),
+            (mode::CONTROL, None, Some(1)),
+            (mode::CONTROL, None, Some(2)),
+            (mode::CONTROL, Some(1), Some(2)),
+            (mode::VIEW_ONLY, None, Some(2)),
+            (mode::VIEW_ONLY, None, Some(1)),
+            (mode::CONTROL, None, None),
+        ] {
+            let a: SessionAccept =
+                decode_body(&encode_body(&unattended_accept(m, elevation, reach))).unwrap();
+            assert_eq!(a.grant_reach(), reach);
+        }
+        for reach in [None, Some(0), Some(1), Some(2)] {
+            let result = AdminResult {
+                ok: false,
+                detail: Some("x".to_owned()),
+                grant_reach: reach,
+            };
+            let back: AdminResult = decode_body(&encode_body(&result)).unwrap();
+            assert_eq!(back.grant_reach, reach);
+        }
+    }
+
+    /// A23: key 12 duplicated reads the last value; CBOR null reads as absent. Only the
+    /// host signs, so neither is a check of its own (B).
+    #[test]
+    fn a23_a_duplicated_grant_reach_reads_the_last_and_null_reads_absent() {
+        let base = encode_body(&unattended_accept(mode::CONTROL, None, None));
+        let with = |entries: &[&[u8]]| {
+            let mut body = base.clone();
+            body[0] += u8::try_from(entries.len()).unwrap();
+            for e in entries {
+                body.extend_from_slice(e);
+            }
+            body
+        };
+        let twice: SessionAccept = decode_body(&with(&[&[0x0c, 0x00], &[0x0c, 0x01]])).unwrap();
+        assert_eq!(twice.grant_reach(), Some(1));
+        let null: SessionAccept = decode_body(&with(&[&[0x0c, 0xf6]])).unwrap();
+        assert_eq!(null.grant_reach(), None);
+    }
+
+    /// M1-67 (C13), TM-9: two accepts that differ only in `grant_reach` are unequal, and
+    /// neither `Debug` shows the key.
+    #[test]
+    fn two_accepts_differing_only_in_grant_reach_are_unequal() {
+        let zero = unattended_accept(mode::CONTROL, None, Some(0));
+        for other in [None, Some(1), Some(2)] {
+            assert_ne!(zero, unattended_accept(mode::CONTROL, None, other));
+        }
+        assert_eq!(zero, unattended_accept(mode::CONTROL, None, Some(0)));
+        let two = unattended_accept(mode::CONTROL, Some(1), Some(2));
+        let text = format!("{two:?}");
+        assert!(!text.contains("grant_reach"), "{text}");
+        let result = AdminResult {
+            ok: true,
+            detail: None,
+            grant_reach: Some(2),
+        };
+        let text = format!("{result:?}");
+        assert!(
+            !text.contains("grant_reach") && !text.contains('2'),
+            "{text}"
+        );
+        assert_ne!(
+            result,
+            AdminResult {
+                ok: true,
+                detail: None,
+                grant_reach: Some(0),
+            }
+        );
     }
 
     /// Backward compatibility (r7): a peer built before the keys decodes a

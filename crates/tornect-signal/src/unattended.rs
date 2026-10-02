@@ -754,6 +754,7 @@ impl UnattendedAuth {
                 result: messages::AdminResult {
                     ok: false,
                     detail: Some(detail.to_owned()),
+                    grant_reach: None,
                 },
                 effect: AdminEffect::None,
             }
@@ -780,10 +781,13 @@ impl UnattendedAuth {
             ok = outcome.ok,
             "admin command"
         );
+        // No `ADMIN_RESULT` carries `grant_reach` yet: it is signed only from the
+        // requester's grant read under the lock of the command (decision M1-67).
         UnattendedVerdict::Admin {
             result: messages::AdminResult {
                 ok: outcome.ok,
                 detail: outcome.detail,
+                grant_reach: None,
             },
             effect: outcome.effect,
         }
@@ -1137,6 +1141,25 @@ mod tests {
                 panic!("expected ADMIN_RESULT, got reject {}", r.reason)
             }
             UnattendedVerdict::Accept { .. } => panic!("expected ADMIN_RESULT, got SESSION_ACCEPT"),
+        }
+    }
+
+    /// M1-67: no `ADMIN_RESULT` carries `grant_reach` yet, the two early refusals
+    /// included (a missing command, unreachable from the wire, and an unknown one).
+    #[test]
+    fn the_early_admin_refusals_carry_no_grant_reach_yet() {
+        let env = env(PW);
+        let unknown = messages::AdminCmd {
+            op: 0xEE,
+            device_pk: None,
+        };
+        for cmd in [None, Some(&unknown)] {
+            let UnattendedVerdict::Admin { result, .. } = env.auth.run_admin(&env.device, cmd)
+            else {
+                panic!("expected ADMIN_RESULT");
+            };
+            assert!(!result.ok);
+            assert_eq!(result.grant_reach, None);
         }
     }
 

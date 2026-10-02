@@ -1207,15 +1207,16 @@ async fn admin_command(
             };
             match client::admin(stream, &ccfg, &b.device, &deps, &command).await {
                 Ok(answer) => {
-                    // An admin answer keeps no password (DA-15). Its `grant_reach` is not
-                    // decoded yet: absent, so a remembered password goes (C1).
-                    let grant_reach = None;
-                    match ua_client::settle_admin(&b.paths, &saved, &id, grant_reach) {
+                    // An admin answer keeps no password (DA-15); its decoded `grant_reach`
+                    // decides about a remembered one (C1, C11).
+                    match ua_client::settle_admin(&b.paths, &saved, &id, &answer) {
                         Ok(settled) => {
                             notes = ua_client::notes(
                                 &named,
                                 keychain,
-                                ua_client::Answered::Admin { grant_reach },
+                                ua_client::Answered::Admin {
+                                    grant_reach: answer.grant_reach,
+                                },
                                 false,
                                 Some(&settled),
                             );
@@ -1502,12 +1503,8 @@ async fn viewed(
     let unattended = session.unattended();
     if let (Some(request), Some(known)) = (&ua, &known) {
         let saved = ua_client::system_passwords(&b.device);
-        // C1: the verified accept alone decides, before QUIC. Its `grant_reach` is not
-        // decoded yet: absent, so nothing is kept and a remembered password goes.
-        let answer = tornect_core::unattended::credentials::Attempt::Accepted {
-            elevation: session.accept().elevation(),
-            grant_reach: None,
-        };
+        // C1: the verified accept alone decides, before QUIC, by the key decoded from it.
+        let answer = ua_client::accepted(session.accept());
         let settled = ua_client::settle(&b.paths, &saved, &id, answer, request);
         let mut notes = Vec::new();
         match &settled {
@@ -1522,7 +1519,7 @@ async fn viewed(
             saved.keychain().unwrap_or("the keychain"),
             ua_client::Answered::Session {
                 elevation: session.accept().elevation(),
-                grant_reach: None,
+                grant_reach: session.accept().grant_reach(),
                 asked_control: !request.view_only,
                 given_control: control,
                 withheld: session.elevation_withheld(),

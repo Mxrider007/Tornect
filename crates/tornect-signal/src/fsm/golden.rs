@@ -161,6 +161,66 @@ const EXPECTED_UNATTENDED_REQUEST: &[(&str, &str)] = &[
     ),
 ];
 
+/// Vectors 4 to 10 (decision M1-67): the unattended answers' bodies with `grant_reach`
+/// and each body's digest as the host's third frame of a stream (`v` 1, `msg_id` 3:
+/// `HELLO_ACK`, `AUTH_CHALLENGE`, then the answer). 4-8 are `SESSION_ACCEPT`s, 9 and 10
+/// `ADMIN_RESULT`s.
+const EXPECTED_UNATTENDED_ANSWERS: &[(&str, &str)] = &[
+    (
+        "vector_4_body",
+        "a900a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50201030004000658207777777777777777777777777777777777777777777777777777777777777777070008f40c00",
+    ),
+    (
+        "vector_4_digest",
+        "da2cd532ecef91b0a851e3f036497b60c6de0dc9e8d9b1edfc9e98b940fdaba6",
+    ),
+    (
+        "vector_5_body",
+        "a900a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50201030004000658207777777777777777777777777777777777777777777777777777777777777777070008f40c01",
+    ),
+    (
+        "vector_5_digest",
+        "78942f3bd5dd918d6caef0f1314c6e8005f669bdccf8ee7b6a0a3666f24154dc",
+    ),
+    (
+        "vector_6_body",
+        "aa00a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50201030004000658207777777777777777777777777777777777777777777777777777777777777777070008f40b010c02",
+    ),
+    (
+        "vector_6_digest",
+        "a568228f81b3ec3e1ba30689d4ef00a11eb27ac453d6c87ac6e2a1c9b45be850",
+    ),
+    (
+        "vector_7_body",
+        "a900a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50201030104000658207777777777777777777777777777777777777777777777777777777777777777070008f40c02",
+    ),
+    (
+        "vector_7_digest",
+        "6420412b318e1c298a810358207e0d65f8934c19fda6af62580ded3e7059dcc6",
+    ),
+    (
+        "vector_8_body",
+        "a900a400816468323634018219078019043802f4030101582c302a300506032b6570032100705fbac01f5519899f437bc42e40255ae9ab54bff00de3433af7d687d9e71ad50201030004000658207777777777777777777777777777777777777777777777777777777777777777070008f40c02",
+    ),
+    (
+        "vector_8_digest",
+        "28366a3c3dedc21d303ed903ad6ecf730d6c5672b520a741ae9f3d5db0b6e38f",
+    ),
+    ("vector_9_body", "a200f50200"),
+    (
+        "vector_9_digest",
+        "a6e8b11651fe369fd3acb8d46c2a6cea5496da641fbb62ad9cf323a2cb8ddff5",
+    ),
+    (
+        "vector_10_body",
+        "a300f40175756e6b6e6f776e2061646d696e20636f6d6d616e640201",
+    ),
+    (
+        "vector_10_digest",
+        "16f22970a64551bd77d0b356a4a3a2cc9d6645396aa389e6e8860044c8525e37",
+    ),
+];
+
 /// Vector 2: the unpaired exchange (`PAIR_REQUEST` / `PAIR_ACCEPT`, the SAS).
 const EXPECTED_UNPAIRED: &[(&str, &str)] = &[
     (
@@ -551,6 +611,89 @@ fn golden_vector_unattended_request_bodies() {
     assert_eq!(decoded.unattended.unwrap().want_elevation, Some(1));
     let decoded: SessionRequest = decode_body(&without).unwrap();
     assert_eq!(decoded.unattended.unwrap().want_elevation, None);
+}
+
+/// Vectors 4 to 10 (decision M1-67, `docs/notes/m1-golden-vector.md`): the unattended
+/// accept with `grant_reach` (key 12) — control at reach 0, 1 and 2, control with
+/// `elevation` 1 at reach 2, view only at reach 2 — and `ADMIN_RESULT` with key 2, ok at
+/// reach 0 and refused at reach 1. The vector's caps and host device key, `token_confirm`
+/// `77` × 32; no signature (an unattended exchange runs the PAKE, whose randomness these
+/// vectors do not fix), the digest being what the host's signature covers. Each decodes
+/// back to its values; the attended vectors 1-3 are unchanged (their tests).
+#[test]
+fn golden_vector_unattended_answers_4_to_10() {
+    let caps = crate::consent::ChosenCaps::negotiate(
+        &host_config().caps,
+        &client_config(host_identity().id()).caps,
+    );
+    let accept = |mode: u8, elevation: Option<u8>, grant_reach: Option<u8>| SessionAccept {
+        caps: caps.caps().clone(),
+        quic_spki: messages::ed25519_spki(&host_device_pk()),
+        session_type: messages::session_type::UNATTENDED,
+        mode,
+        transport_policy: 0,
+        session_token: None,
+        token_confirm: Some([0x77; 32]),
+        block_window_s: 0,
+        ask_before_start: false,
+        ends_at: None,
+        fail_summary: None,
+        elevation,
+        grant_reach,
+    };
+    let control = messages::mode::CONTROL;
+    let view = messages::mode::VIEW_ONLY;
+    let accepts = [
+        ("4", accept(control, None, Some(0))),
+        ("5", accept(control, None, Some(1))),
+        ("6", accept(control, Some(1), Some(2))),
+        ("7", accept(view, None, Some(2))),
+        ("8", accept(control, None, Some(2))),
+    ];
+    let results = [
+        (
+            "9",
+            messages::AdminResult {
+                ok: true,
+                detail: None,
+                grant_reach: Some(0),
+            },
+        ),
+        (
+            "10",
+            messages::AdminResult {
+                ok: false,
+                detail: Some("unknown admin command".to_owned()),
+                grant_reach: Some(1),
+            },
+        ),
+    ];
+    let mut actual: Vec<(String, String)> = Vec::new();
+    for (n, a) in &accepts {
+        let body = encode_body(a);
+        let back: SessionAccept = decode_body(&body).unwrap();
+        assert_eq!(&back, a, "vector {n}");
+        actual.push((format!("vector_{n}_body"), hex::encode(&body)));
+        actual.push((
+            format!("vector_{n}_digest"),
+            hex::encode(digest(1, 3, Kind::SessionAccept, &body)),
+        ));
+    }
+    for (n, r) in &results {
+        let body = encode_body(r);
+        let back: messages::AdminResult = decode_body(&body).unwrap();
+        assert_eq!(&back, r, "vector {n}");
+        actual.push((format!("vector_{n}_body"), hex::encode(&body)));
+        actual.push((
+            format!("vector_{n}_digest"),
+            hex::encode(digest(1, 3, Kind::AdminResult, &body)),
+        ));
+    }
+    let actual: Vec<(&str, String)> = actual
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
+    check(&actual, EXPECTED_UNATTENDED_ANSWERS);
 }
 
 /// The committed vectors from before the keys existed still decode, at
