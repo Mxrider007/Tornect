@@ -10,7 +10,9 @@
 //! Classes: **deny-direction** operations need nothing; **access-increasing** ones need
 //! no remote session live and none ended < 60 s ago *and* a fresh [`ReAuth`] call per
 //! operation — the session check is repeated after the dialog returns, because an
-//! unattended session needs no local click and can start while the dialog is up;
+//! unattended session needs no local click and can start while the dialog is up, and
+//! made a last time under the store lock, inside the store operation that commits the
+//! change (decision M1-67), where a session reserved meanwhile counts as live;
 //! **remote admin** requests are scoped by the requester's grant (§B.8.4.1). Every
 //! mutation writes its `sessions.log` event, every refusal a
 //! `GrantMutationRefused{code}` line.
@@ -366,6 +368,7 @@ impl From<StoreError> for GuardError {
             StoreError::GrantExists => Self::Precondition("this device already has a grant".into()),
             StoreError::Options(e) => Self::Precondition(e.to_string()),
             StoreError::Invalid(m) => Self::Precondition(m),
+            StoreError::RemoteSessionActive => Self::RemoteSessionActive,
             other => Self::Store(other),
         }
     }
@@ -727,7 +730,8 @@ impl MutationGuard {
     /// `G_REMOTE_SESSION_ACTIVE` (logged) while a remote session is live or ended < 60 s
     /// ago. Called before and after every blocking step of an access-increasing
     /// operation (the re-auth dialog, the keychain bootstrap) and last thing before the
-    /// store write.
+    /// store write, except where [`Self::no_session_at_commit`] makes the last check
+    /// under the store lock.
     fn no_remote_session(
         &self,
         op: &str,
@@ -738,6 +742,39 @@ impl MutationGuard {
             return Err(self.refuse(op, Some(by), device, GuardError::RemoteSessionActive));
         }
         Ok(())
+    }
+
+    /// The last no-session check of an access-increasing operation (`create_grant`,
+    /// `set_password`, `RegFinish`, `set_options`, *enable*, *resume*, local *unlock*,
+    /// `set_settings`), made under the store lock inside the store operation that
+    /// commits it (decision M1-67, D8.4; DA-17): a session reserved after the unlocked
+    /// checks counts as live and is seen here, so the change either commits before the
+    /// session's reservation or is refused. The refusal is returned unlogged, and the
+    /// caller logs it once the lock is dropped ([`Self::refuse`] goes through
+    /// `log_event`, which takes the same mutex). It takes the live-session lock inside
+    /// the store lock: the order is store, then live-session, never the reverse.
+    fn no_session_at_commit(&self) -> Result<(), StoreError> {
+        if self.remote_session_blocks() {
+            return Err(StoreError::RemoteSessionActive);
+        }
+        Ok(())
+    }
+
+    /// Log a refusal [`Self::no_session_at_commit`] decided, now that the store lock is
+    /// dropped; any other store error passes through unlogged, as before.
+    fn refused_at_commit(
+        &self,
+        op: &str,
+        by: Actor,
+        device: Option<&DeviceId>,
+        e: StoreError,
+    ) -> GuardError {
+        match e {
+            StoreError::RemoteSessionActive => {
+                self.refuse(op, Some(by), device, GuardError::RemoteSessionActive)
+            }
+            other => other.into(),
+        }
     }
 
     /// `G_PRECONDITION` (logged) unless `device` is SAS-paired; returns its pinned label.
@@ -1119,6 +1156,7 @@ impl MutationGuard {
             .grant(&existing.id);
         self.store
             .update_grant(device, &rec, |g, _| {
+                self.no_session_at_commit()?;
                 match g.state {
                     GrantState::Disabled { .. } => g.state = GrantState::Active,
                     GrantState::Active => {}
@@ -1144,6 +1182,10 @@ impl MutationGuard {
             rec = rec.grant(&id);
         }
         let mut st = self.store.state();
+        if let Err(e) = self.no_session_at_commit() {
+            drop(st);
+            return Err(self.refuse("unlock", Some(by), Some(device), GuardError::from(e)));
+        }
         let before = st.store.clone();
         let before_rt = st.runtime.get(device).copied();
         if let Err(e) = self.store.reset_fail_locked(&mut st, device) {
@@ -1211,6 +1253,7 @@ impl MutationGuard {
         }
         self.store
             .update_grant(device, &rec, |g, _| {
+                self.no_session_at_commit()?;
                 match g.state {
                     GrantState::Suspended { .. } => g.state = GrantState::Active,
                     GrantState::Disabled { .. } => {
@@ -1288,9 +1331,17 @@ impl MutationGuard {
                 return Err(e.into());
             }
         };
-        if !widened.is_empty() && !reauthed {
-            st.store = Some(before);
-            return Ok(false);
+        if !widened.is_empty() {
+            if !reauthed {
+                st.store = Some(before);
+                return Ok(false);
+            }
+            // A widening change makes its last no-session check here, under the lock
+            // that commits it (decision M1-67); a narrowing one is deny-direction.
+            if let Err(e) = self.no_session_at_commit() {
+                st.store = Some(before);
+                return Err(e.into());
+            }
         }
         let rec = SessionRecord::at(now, SessionEvent::GrantChanged)
             .by(by)
@@ -1319,21 +1370,24 @@ impl MutationGuard {
         let rec = SessionRecord::at(self.now(), SessionEvent::GrantChanged)
             .by(by)
             .detail("host settings");
-        self.store.mutate(WriteClass::Policy, Some(&rec), |s, _| {
-            if let Some(v) = settings.keep_awake {
-                s.keep_awake = v;
-            }
-            if let Some(v) = settings.prevent_idle_lock {
-                s.prevent_idle_lock = v;
-            }
-            if let Some(v) = settings.notify {
-                s.notify = v;
-            }
-            if let Some(v) = settings.default_hard_lock_after {
-                s.default_hard_lock_after = v;
-            }
-            Ok(())
-        })?;
+        self.store
+            .mutate(WriteClass::Policy, Some(&rec), |s, _| {
+                self.no_session_at_commit()?;
+                if let Some(v) = settings.keep_awake {
+                    s.keep_awake = v;
+                }
+                if let Some(v) = settings.prevent_idle_lock {
+                    s.prevent_idle_lock = v;
+                }
+                if let Some(v) = settings.notify {
+                    s.notify = v;
+                }
+                if let Some(v) = settings.default_hard_lock_after {
+                    s.default_hard_lock_after = v;
+                }
+                Ok(())
+            })
+            .map_err(|e| self.refused_at_commit("set_settings", by, None, e))?;
         Ok(())
     }
 
@@ -1570,6 +1624,7 @@ impl MutationGuard {
                 .grant(&existing.id);
             self.store
                 .update_grant(device, &rec, |g, now| {
+                    self.no_session_at_commit()?;
                     // classified again on the locked grant: a concurrent narrowing must
                     // not turn these options into a widening that lands here
                     let widened = g.apply_options(options, now, file_keystore)?;
@@ -1641,11 +1696,15 @@ impl MutationGuard {
             rec = rec.reason("attended precondition waived");
         }
         let keep_awake = preset.defaults().keep_awake;
-        self.store.insert_grant(grant, &rec, |s| {
-            if keep_awake {
-                s.keep_awake = true;
-            }
-        })?;
+        self.store
+            .insert_grant(grant, &rec, |s| {
+                self.no_session_at_commit()?;
+                if keep_awake {
+                    s.keep_awake = true;
+                }
+                Ok(())
+            })
+            .map_err(|e| self.refused_at_commit(op, by, Some(device), e))?;
         if let Err(e) = self.store.log_event(
             &SessionRecord::at(now, SessionEvent::PasswordSet)
                 .by(by)
