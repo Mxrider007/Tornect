@@ -13,6 +13,7 @@ use minicbor::{Decode, Encode};
 use zeroize::Zeroizing;
 
 use crate::id::DeviceId;
+use crate::levels::Elevation;
 use crate::session_log::{Actor, SessionMode, TransportKind};
 
 use super::ipc::GrantOptions;
@@ -693,6 +694,51 @@ pub struct UnattendedGrant {
     /// Limiter counters.
     #[n(23)]
     pub fail: FailState,
+    /// The administrator level the grant holds (§B.8.7.1; decision M1-67, D9). Absent =
+    /// none, and none is never written, so a grant at none encodes as before; an older
+    /// build that rewrites the store drops the key, which lowers the grant.
+    #[n(24)]
+    #[cbor(with = "elevation_key", skip_if = "elevation_key::is_none")]
+    pub elevation: Elevation,
+    /// Its password is *not* marked "answered 0" (decision M1-67, D9, D11). Absent or
+    /// false = marked; only a registration sent as generated sets it, and false is
+    /// never written, so a marked grant encodes as before.
+    #[n(25)]
+    #[cbor(skip_if = "is_false")]
+    pub unmarked: bool,
+}
+
+/// `skip_if` of [`UnattendedGrant::unmarked`]: false is never written.
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// [`UnattendedGrant::elevation`] as store key 24: the §B.8.4.1 code (`0` none,
+/// `1` administrator). A code this build does not know reads as none, the lower level.
+mod elevation_key {
+    use minicbor::decode::Decoder;
+    use minicbor::encode::{Encoder, Write};
+
+    use crate::levels::Elevation;
+
+    /// Encode as the code.
+    pub fn encode<C, W: Write>(
+        v: &Elevation,
+        e: &mut Encoder<W>,
+        _: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        e.u8(v.code())?.ok()
+    }
+
+    /// Decode a code; one this build does not know is none.
+    pub fn decode<C>(d: &mut Decoder<'_>, _: &mut C) -> Result<Elevation, minicbor::decode::Error> {
+        Ok(Elevation::from_code(d.u8()?).unwrap_or(Elevation::None))
+    }
+
+    /// `skip_if`: none is never written.
+    pub fn is_none(v: &Elevation) -> bool {
+        *v == Elevation::None
+    }
 }
 
 impl fmt::Debug for UnattendedGrant {
@@ -722,6 +768,8 @@ impl fmt::Debug for UnattendedGrant {
             .field("state", &self.state)
             .field("last_used", &self.last_used)
             .field("fail", &self.fail)
+            .field("elevation", &self.elevation)
+            .field("unmarked", &self.unmarked)
             .finish()
     }
 }
@@ -867,6 +915,8 @@ impl UnattendedGrant {
                 flushed_at: now,
                 ..FailState::default()
             },
+            elevation: Elevation::None,
+            unmarked: false,
         })
     }
 
@@ -1022,6 +1072,20 @@ impl UnattendedGrant {
     #[must_use]
     pub fn is_suspended(&self) -> bool {
         matches!(self.state, GrantState::Suspended { .. })
+    }
+
+    /// Whether this grant's password is marked "answered 0" (decision M1-67, D9, D11):
+    /// store key 25 absent or false. A marked password never gets a session that can
+    /// reach the administrator level.
+    #[must_use]
+    pub fn marked(&self) -> bool {
+        !self.unmarked
+    }
+
+    /// Whether this grant holds the administrator level (store key 24, decision M1-67).
+    #[must_use]
+    pub fn holds_level(&self) -> bool {
+        self.elevation == Elevation::Admin
     }
 
     /// Whether this grant holds the cross-grant admin scope of §B.8.4.1.
