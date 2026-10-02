@@ -19,9 +19,9 @@ use super::client::{
     ClientConfig, ClientDeps, ClientOutcome, Intent, ScriptedClientUi, SessionEvent, connect,
 };
 use super::host::{
-    AdminHelper, AttachedHelper, HostConfig, HostDeps, HostOutcome, KillSwitch, LiveSession,
-    LiveSessions, SessionActivity, SessionEnd, SessionSink, StopTokenCheck, UnattendedContext,
-    UnattendedHook, UnattendedVerdict, serve_host,
+    AdminHelper, AttachedHelper, HostConfig, HostDeps, HostOutcome, KillGuard, KillSwitch,
+    LiveSession, LiveSessions, SessionActivity, SessionEnd, SessionSink, StopTokenCheck,
+    UnattendedContext, UnattendedHook, UnattendedVerdict, serve_host,
 };
 use super::vectors::host_device_pk;
 use super::*;
@@ -6755,4 +6755,374 @@ impl client::ServerKeyPin for MismatchPin {
         tornect_core::unattended::hosts::PinCheck::Mismatch
     }
     fn record(&self, _: &TornectId, _: &[u8; 32]) {}
+}
+
+/// M1-67 D6: [`KillSwitch::end_device`] ends only the sessions that watch for that
+/// device, and only those that started watching before it; an end for the level only those
+/// whose accept put them at the level, also when it came between the reservation and the
+/// accept; the host-wide kill still reaches every session.
+#[tokio::test(start_paused = true)]
+async fn a_device_end_reaches_only_that_devices_sessions() {
+    use tornect_core::unattended::guard::EndScope;
+    async fn soon(guard: &mut KillGuard) -> Option<u16> {
+        tokio::time::timeout(Duration::from_millis(100), guard.killed())
+            .await
+            .ok()
+    }
+    let kill = KillSwitch::new();
+    let (p, q) = (DeviceId::from_bytes([1; 32]), DeviceId::from_bytes([2; 32]));
+    let watching = |device: DeviceId, at_the_level: bool| {
+        let mut guard = kill.arm();
+        guard.watch_device(device);
+        guard.at_the_level(at_the_level);
+        guard
+    };
+    let mut p_at_the_level = watching(p, true);
+    let mut p_below = watching(p, false);
+    let mut q_at_the_level = watching(q, true);
+    let mut attended = kill.arm();
+    kill.end_device(&p, EndScope::AtTheLevel);
+    assert_eq!(
+        soon(&mut p_at_the_level).await,
+        Some(bye::REVOKED),
+        "a lowering, at the level"
+    );
+    assert_eq!(
+        soon(&mut p_below).await,
+        None,
+        "a lowering, below the level"
+    );
+    assert_eq!(soon(&mut q_at_the_level).await, None);
+    assert_eq!(soon(&mut attended).await, None);
+    kill.end_device(&p, EndScope::Every);
+    assert_eq!(
+        soon(&mut p_below).await,
+        Some(bye::REVOKED),
+        "a revoke, any level"
+    );
+    assert_eq!(soon(&mut q_at_the_level).await, None);
+    assert_eq!(soon(&mut attended).await, None);
+    assert!(
+        !q_at_the_level.fired(),
+        "the host-wide check is not the device's"
+    );
+    let mut later = watching(p, true);
+    assert_eq!(soon(&mut later).await, None, "ends before it watched");
+    // a lowering between the reservation and the accept, the accept at the level
+    let mut reserved = kill.arm();
+    reserved.watch_device(q);
+    kill.end_device(&q, EndScope::AtTheLevel);
+    reserved.at_the_level(true);
+    assert_eq!(
+        soon(&mut reserved).await,
+        Some(bye::REVOKED),
+        "lowered while reserved"
+    );
+    kill.kill(bye::PANIC);
+    assert_eq!(soon(&mut later).await, Some(bye::PANIC));
+    assert_eq!(soon(&mut attended).await, Some(bye::PANIC));
+}
+
+/// The owner's guard over `guard`'s store, on the always-administrator facts of these
+/// tests, wired to `host`'s kill switch as the host wires its own (decision M1-67, D6).
+fn owner_guard(
+    guard: &tornect_core::unattended::guard::MutationGuard,
+    host: &HostSide,
+) -> Arc<tornect_core::unattended::guard::MutationGuard> {
+    use tornect_core::levels::{FixedFacts, HelperPresence};
+    use tornect_core::unattended::guard::{
+        AllowAllPaired, AllowAllReAuth, MutationGuard, NoSessionActivity,
+    };
+    Arc::new(
+        MutationGuard::new(
+            guard.store().clone(),
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            Arc::new(FixedFacts::new(
+                windows_facts(|f| f.enable_lua = Some(0)),
+                HelperPresence::Absent,
+            )),
+        )
+        .with_paired_devices(Arc::new(AllowAllPaired))
+        .with_device_end(Arc::new(host.deps.kill.clone())),
+    )
+}
+
+/// The real hook, then `then` once its read after the reservation has returned: an owner's
+/// change committed after that read, before the accept goes out.
+struct AfterTheRead<F> {
+    inner: Arc<dyn UnattendedHook>,
+    then: F,
+}
+
+impl<F> UnattendedHook for AfterTheRead<F>
+where
+    F: Fn() + Send + Sync,
+{
+    fn handle<'a>(
+        &'a self,
+        ctx: UnattendedContext<'a>,
+    ) -> BoxFuture<'a, Result<UnattendedVerdict, HandshakeError>> {
+        self.inner.handle(ctx)
+    }
+
+    fn reserved<'a>(
+        &'a self,
+        device: &'a DeviceId,
+        proof: ConsentProof,
+    ) -> BoxFuture<'a, Result<ConsentProof, messages::SessionReject>> {
+        Box::pin(async move {
+            let read = self.inner.reserved(device, proof).await;
+            (self.then)();
+            read
+        })
+    }
+}
+
+/// M1-67 A25 (p): a revoke, a disable, a suspend and a lowering of P's grant, each with
+/// P's session reserved (the change committed after the read, before the accept) and with
+/// it live, end P's session with `BYE{REVOKED}` within 1 s; another device's session goes
+/// on. On a paused clock: 1 s of the host's time, however slow the machine.
+#[tokio::test(start_paused = true)]
+async fn a25_p_a_deny_direction_change_ends_that_devices_session_within_a_second() {
+    use tornect_core::levels::{Elevation, FixedFacts, HelperPresence};
+    use tornect_core::session_log::Actor;
+    use tornect_core::unattended::guard::MutationGuard;
+    use tornect_core::unattended::ipc::GrantOptions;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    type Change = fn(&MutationGuard, &DeviceId);
+    let changes: [(&str, Change); 4] = [
+        ("revoke", |g, d| g.revoke(Actor::Ui, d).unwrap()),
+        ("disable", |g, d| g.disable(Actor::Ui, d).unwrap()),
+        ("suspend", |g, d| {
+            g.suspend(Actor::Ui, d).unwrap();
+        }),
+        ("lowering", |g, d| {
+            g.set_options(
+                Actor::Ui,
+                d,
+                &GrantOptions {
+                    elevation: Some(Elevation::None),
+                    ..GrantOptions::default()
+                },
+            )
+            .unwrap();
+        }),
+    ];
+    for (case, change) in changes {
+        for reserved in [false, true] {
+            let case = format!("{case}, reserved: {reserved}");
+            let tmp = tempfile::tempdir().unwrap();
+            let facts = FixedFacts::new(
+                windows_facts(|f| f.enable_lua = Some(0)),
+                HelperPresence::Absent,
+            );
+            let (mut host, client, guard) =
+                unattended_pair_edited(tmp.path(), PW, Arc::new(facts), |g| {
+                    g.elevation = Elevation::Admin;
+                    g.unmarked = true;
+                });
+            host.cfg.levels = always_administrator();
+            host.cfg.orphan_timeout = None;
+            host.cfg.idle_timeout = Duration::from_secs(30);
+            let device = client.identity.id();
+            // the owner's guard, wired to the host's kill switch as the host wires it
+            let owner = owner_guard(&guard, &host);
+            if reserved {
+                let (owner, inner) = (Arc::clone(&owner), Arc::clone(&host.deps.unattended));
+                host.deps.unattended = Arc::new(AfterTheRead {
+                    inner,
+                    then: move || change(&owner, &device),
+                });
+            }
+            // another device, in an attended session (View only: on these facts the sheet
+            // offers no plain Allow)
+            let other = client_side(&tmp.path().join("other"), host.identity.id(), [0x33; 32]);
+            host.trusted.pin(other.identity.id(), "Other").unwrap();
+            other
+                .known
+                .pin(host.identity.id(), "Desk of Bob", host_device_pk())
+                .unwrap();
+            host.consent
+                .push_session(SessionScript::Decide(SessionDecision::AllowOnceViewOnly));
+            let (a, b) = pipe();
+            let other_task = spawn_host(a, &host);
+            let ClientOutcome::Session(mut other_session) =
+                connect(b, &other.cfg, &other.identity, &other.deps, Intent::Session)
+                    .await
+                    .unwrap()
+            else {
+                panic!("{case}: no attended session");
+            };
+            // P's session
+            let (a, b) = pipe();
+            let task = spawn_host(a, &host);
+            let ClientOutcome::Session(mut session) = connect(
+                b,
+                &client.cfg,
+                &client.identity,
+                &client.deps,
+                unattended_intent(PW, messages::mode::CONTROL, true),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{case}: {e}")) else {
+                panic!("{case}: no session");
+            };
+            assert_eq!(session.accept().elevation(), Elevation::Admin, "{case}");
+            if !reserved {
+                session.ping().await.unwrap();
+                change(&owner, &device);
+            }
+            assert_eq!(
+                session.next_event(Duration::from_secs(1)).await.unwrap(),
+                Some(SessionEvent::Bye {
+                    reason: bye::REVOKED,
+                    detail: None
+                }),
+                "{case}"
+            );
+            match task.await.unwrap().unwrap() {
+                HostOutcome::Session { end, .. } => {
+                    assert_eq!(end, SessionEnd::Killed(bye::REVOKED), "{case}");
+                }
+                other => panic!("{case}: {other:?}"),
+            }
+            // the other device's session goes on
+            other_session.ping().await.unwrap();
+            assert!(!other_task.is_finished(), "{case}");
+            drop(other_session);
+            let _ = other_task.await;
+        }
+    }
+}
+
+/// The block window during which the owner lowers the grant's level.
+struct LowerDuringTheWindow {
+    owner: Arc<tornect_core::unattended::guard::MutationGuard>,
+    device: DeviceId,
+}
+
+impl crate::consent::BlockWindow for LowerDuringTheWindow {
+    fn run<'a>(
+        &'a self,
+        _: u8,
+        _: &'a tornect_core::unattended::grant::GrantId,
+        _: &'a str,
+    ) -> BoxFuture<'a, BlockOutcome> {
+        use tornect_core::unattended::ipc::GrantOptions;
+        Box::pin(async move {
+            self.owner
+                .set_options(
+                    tornect_core::session_log::Actor::Ui,
+                    &self.device,
+                    &GrantOptions {
+                        elevation: Some(tornect_core::levels::Elevation::None),
+                        ..GrantOptions::default()
+                    },
+                )
+                .unwrap();
+            BlockOutcome::Passed(WindowPassed::Elapsed)
+        })
+    }
+}
+
+/// M1-67 A25 (d): a lowering during an administrator request's block window: the read after
+/// the reservation finds the grant at none, and the accept carries no `elevation = 1`.
+#[tokio::test]
+async fn a25_d_a_lowering_in_the_block_window_signs_no_level() {
+    use tornect_core::levels::{Elevation, FixedFacts, HelperPresence};
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let facts = || {
+        Arc::new(FixedFacts::new(
+            windows_facts(|f| f.enable_lua = Some(0)),
+            HelperPresence::Absent,
+        ))
+    };
+    let (mut host, client, guard) = unattended_pair_edited(tmp.path(), PW, facts(), |g| {
+        g.elevation = Elevation::Admin;
+        g.unmarked = true;
+    });
+    host.cfg.levels = always_administrator();
+    host.deps.block_window = Arc::new(LowerDuringTheWindow {
+        owner: guard,
+        device: client.identity.id(),
+    });
+    let (mode, elevation, reach) = signed(
+        &host,
+        &client,
+        unattended_intent(PW, messages::mode::CONTROL, true),
+    )
+    .await;
+    assert_eq!(elevation, Elevation::None, "no elevation = 1");
+    assert_eq!(
+        reach,
+        Some(1),
+        "control is administrator access on these facts"
+    );
+    assert_eq!(mode, messages::mode::VIEW_ONLY, "F-12, without the level");
+}
+
+/// M1-67 D6: a lowering ends P's sessions at the level only: P's View only session at none
+/// goes on through it, and a revoke then still ends it.
+#[tokio::test(start_paused = true)]
+async fn a_lowering_leaves_a_session_below_the_level_running() {
+    use tornect_core::levels::{Elevation, FixedFacts, HelperPresence};
+    use tornect_core::session_log::Actor;
+    use tornect_core::unattended::ipc::GrantOptions;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let facts = FixedFacts::new(
+        windows_facts(|f| f.enable_lua = Some(0)),
+        HelperPresence::Absent,
+    );
+    let (mut host, client, guard) = unattended_pair_edited(tmp.path(), PW, Arc::new(facts), |g| {
+        g.elevation = Elevation::Admin;
+        g.unmarked = true;
+    });
+    host.cfg.levels = always_administrator();
+    host.cfg.orphan_timeout = None;
+    host.cfg.idle_timeout = Duration::from_secs(30);
+    let device = client.identity.id();
+    let owner = owner_guard(&guard, &host);
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let ClientOutcome::Session(mut session) = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::VIEW_ONLY, false),
+    )
+    .await
+    .unwrap() else {
+        panic!("no session");
+    };
+    assert_eq!(session.accept().elevation(), Elevation::None);
+    session.ping().await.unwrap();
+    owner
+        .set_options(
+            Actor::Ui,
+            &device,
+            &GrantOptions {
+                elevation: Some(Elevation::None),
+                ..GrantOptions::default()
+            },
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    session.ping().await.unwrap();
+    assert!(!task.is_finished(), "below the level, the session goes on");
+    owner.revoke(Actor::Ui, &device).unwrap();
+    assert_eq!(
+        session.next_event(Duration::from_secs(1)).await.unwrap(),
+        Some(SessionEvent::Bye {
+            reason: bye::REVOKED,
+            detail: None
+        })
+    );
+    match task.await.unwrap().unwrap() {
+        HostOutcome::Session { end, .. } => assert_eq!(end, SessionEnd::Killed(bye::REVOKED)),
+        other => panic!("{other:?}"),
+    }
 }

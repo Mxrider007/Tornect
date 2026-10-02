@@ -24,7 +24,7 @@ use tokio::time::Instant;
 use tornect_core::DeviceId;
 use tornect_core::levels::{AdminPath, Answers, Availability, Elevation, Level};
 use tornect_core::session_log::SessionMode;
-use tornect_core::unattended::guard::{AdminEffect, RemoteSessionActivity};
+use tornect_core::unattended::guard::{AdminEffect, EndScope, RemoteSessionActivity};
 use zeroize::Zeroizing;
 
 use super::{
@@ -291,7 +291,7 @@ pub struct KillSwitch {
 }
 
 /// The watched state behind a [`KillSwitch`].
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct KillState {
     /// Bumped by every [`KillSwitch::kill`]. A [`KillGuard`] compares this to
     /// the value it captured at arm time, so it reacts only to a kill fired
@@ -299,6 +299,22 @@ struct KillState {
     generation: u64,
     /// The reason the most recent kill fired with (for [`KillSwitch::fired`]).
     reason: Option<u16>,
+    /// Per device, how many times [`KillSwitch::end_device`] ended its sessions
+    /// (decision M1-67, D6).
+    devices: std::collections::HashMap<DeviceId, DeviceEnds>,
+}
+
+/// One device's count of ends, per [`EndScope`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DeviceEnds {
+    every: u64,
+    at_the_level: u64,
+}
+
+impl KillState {
+    fn ends_of(&self, device: &DeviceId) -> DeviceEnds {
+        self.devices.get(device).copied().unwrap_or_default()
+    }
 }
 
 impl Default for KillSwitch {
@@ -327,6 +343,22 @@ impl KillSwitch {
         });
     }
 
+    /// End the sessions of `device` that watch for it ([`KillGuard::watch_device`], armed at
+    /// their reservation) with `BYE{REVOKED}`, live or still being accepted: all of them
+    /// for [`EndScope::Every`] (revoke, disable, suspend; local or remote), only those the
+    /// accept put at the administrator level for [`EndScope::AtTheLevel`] (a lowering).
+    /// Every other session goes on (decision M1-67, D6). A session that starts watching
+    /// after this call is unaffected.
+    pub fn end_device(&self, device: &DeviceId, scope: EndScope) {
+        self.tx.send_modify(|state| {
+            let ends = state.devices.entry(*device).or_default();
+            match scope {
+                EndScope::Every => ends.every = ends.every.wrapping_add(1),
+                EndScope::AtTheLevel => ends.at_the_level = ends.at_the_level.wrapping_add(1),
+            }
+        });
+    }
+
     /// The reason the switch most recently fired with, if it ever has.
     #[must_use]
     pub fn fired(&self) -> Option<u16> {
@@ -340,7 +372,17 @@ impl KillSwitch {
     pub fn arm(&self) -> KillGuard {
         let rx = self.tx.subscribe();
         let base = rx.borrow().generation;
-        KillGuard { rx, base }
+        KillGuard {
+            rx,
+            base,
+            device: None,
+        }
+    }
+}
+
+impl tornect_core::unattended::guard::DeviceSessionEnd for KillSwitch {
+    fn end_device(&self, device: &DeviceId, scope: EndScope) {
+        KillSwitch::end_device(self, device, scope);
     }
 }
 
@@ -349,6 +391,18 @@ impl KillSwitch {
 pub struct KillGuard {
     rx: watch::Receiver<KillState>,
     base: u64,
+    /// The device this session watches for [`KillSwitch::end_device`].
+    device: Option<Watched>,
+}
+
+/// What a [`KillGuard`] watches for its device (decision M1-67, D6).
+#[derive(Debug)]
+struct Watched {
+    device: DeviceId,
+    /// The device's count of ends when the session started watching.
+    base: DeviceEnds,
+    /// Whether the accept put the session at the administrator level.
+    at_the_level: bool,
 }
 
 impl KillGuard {
@@ -364,6 +418,14 @@ impl KillGuard {
                 {
                     return reason;
                 }
+                if let Some(watched) = &self.device {
+                    let ends = state.ends_of(&watched.device);
+                    if ends.every != watched.base.every
+                        || (watched.at_the_level && ends.at_the_level != watched.base.at_the_level)
+                    {
+                        return messages::bye::REVOKED;
+                    }
+                }
             }
             if self.rx.changed().await.is_err() {
                 std::future::pending::<()>().await;
@@ -371,10 +433,32 @@ impl KillGuard {
         }
     }
 
-    /// Whether the switch has fired since this guard was armed, without waiting.
+    /// Whether the switch has fired since this guard was armed, without waiting. Host-wide
+    /// only: an end of this session's device ends it once it runs ([`Self::killed`]).
     #[must_use]
     pub fn fired(&self) -> bool {
         self.rx.borrow().generation != self.base
+    }
+
+    /// From now on, [`KillSwitch::end_device`] for `device` also ends this session
+    /// (`BYE{REVOKED}`), also when it fires before the session starts (decision M1-67,
+    /// D6): armed at the session's reservation. An end for the level reaches it only once
+    /// [`Self::at_the_level`] says its accept put it there.
+    pub fn watch_device(&mut self, device: DeviceId) {
+        let base = self.rx.borrow().ends_of(&device);
+        self.device = Some(Watched {
+            device,
+            base,
+            at_the_level: false,
+        });
+    }
+
+    /// The watched session's level as its accept signs it: at the administrator level, a
+    /// lowering of its grant committed since the reservation ends it too (D6).
+    pub fn at_the_level(&mut self, at_the_level: bool) {
+        if let Some(watched) = &mut self.device {
+            watched.at_the_level = at_the_level;
+        }
     }
 }
 
@@ -430,24 +514,19 @@ impl Drop for EndGuard<'_> {
     }
 }
 
-/// Apply the side effect of a remote admin command to live sessions (§B.8.4.1).
-///
-/// **M1 scope, stated plainly.** [`KillSwitch`] is host-wide: it carries one
-/// `BYE` reason to every stream sharing these deps and cannot address a single
-/// device. The two host-wide effects are therefore applied exactly; the two
-/// per-device ones are not, and are not pretended to be. That gap is real but
-/// bounded — the store mutation has already happened, so the revoked or
-/// suspended device's *next* handshake fails its grant lookup, and at M1 no
-/// media session exists to tear down (`tornect-session` owns live sessions from
-/// M4, §B.8.14). The M4 row is where a per-device kill belongs; wiring a
-/// host-wide kill to a per-device effect here would end innocent sessions to
-/// look complete.
+/// Apply the side effect of a remote admin command to live sessions (§B.8.4.1): the two
+/// host-wide effects through the kill switch, the two per-device ones through its
+/// per-device end (decision M1-67, D6), which reaches only that device's sessions, live or
+/// reserved.
 fn apply_admin_effect(deps: &HostDeps, effect: &AdminEffect) {
     match effect {
         AdminEffect::MasterOff => deps.kill.kill(messages::bye::MASTER_OFF),
         AdminEffect::RevokedAll(_) => deps.kill.kill(messages::bye::REVOKED),
-        // Per-device, and the requester's own stream is already closed above.
-        AdminEffect::Revoked(_) | AdminEffect::Suspended(_) | AdminEffect::EndSession => {}
+        AdminEffect::Revoked(device) | AdminEffect::Suspended(device) => {
+            deps.kill.end_device(device, EndScope::Every);
+        }
+        // The requester's own stream is already closed above.
+        AdminEffect::EndSession => {}
         // Access-restoring: nothing to tear down.
         AdminEffect::Unlocked(_) => {}
         AdminEffect::None => {}
@@ -1229,6 +1308,12 @@ where
         };
         return reject_session(&mut chan, deps, &peer, reason).await;
     };
+    // Decision M1-67 (D6): from the reservation on, an end of this device's sessions (its
+    // grant revoked, disabled, suspended or lowered) ends this one too, also when it comes
+    // before the session starts: then at once.
+    if unattended {
+        kill.watch_device(device);
+    }
 
     // Decision M1-67: once the session is reserved, the unattended hook reads
     // afresh what can lower it (the account facts, the helper task) and gives
@@ -1291,6 +1376,8 @@ where
     let mode = mode_from_code(accept.mode()).unwrap_or(SessionMode::ViewOnly);
     // The level the accept signs, and nothing else, is the session's level.
     let elevation = Level::new(mode, accept.elevation()).elevation();
+    // At the level, a lowering of the grant since the reservation ends it too (D6).
+    kill.at_the_level(elevation == Elevation::Admin);
     chan.send(&accept, Some(&*deps.signer)).await?;
     deps.stats.accepted_total.fetch_add(1, Ordering::SeqCst);
     deps.audit.record(AuditEvent::SessionStarted {
