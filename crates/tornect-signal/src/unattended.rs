@@ -31,7 +31,7 @@ use tornect_core::unattended::limiter::{
     AttemptLimiter, FailKind, HostTransport, LimiterError, PostF2Reject, Reject, Settle,
 };
 use tornect_core::unattended::reach::{self, ReachRefusal};
-use tornect_core::unattended::readiness::{Probe, ReadinessSnapshot};
+use tornect_core::unattended::readiness::{Probe, ReadinessSnapshot, SharedReadiness};
 use tornect_core::unattended::schedule::LocalTz;
 use tornect_core::unattended::store::GrantStore;
 
@@ -385,8 +385,11 @@ pub struct UnattendedAuth {
     budgets: Arc<Mutex<Budgets>>,
     tz: Arc<dyn LocalTz>,
     host_transport: HostTransport,
-    /// M1: the all-unknown stub (§B.8.14). M6 fills this from `tornect-platform`.
+    /// M1: the all-unknown stub (§B.8.14), unless [`Self::readiness_feed`] is set.
     readiness: ReadinessSnapshot,
+    /// The host's readiness as last probed (at its start and every 10 min),
+    /// read at each request.
+    readiness_feed: Option<SharedReadiness>,
     /// Executes `intent = admin` requests (§B.8.4.1). Refuses by default.
     admin: Arc<dyn AdminAuthority>,
     /// The account facts and the helper task's presence, read at each answer
@@ -413,6 +416,7 @@ impl UnattendedAuth {
             tz,
             host_transport,
             readiness: ReadinessSnapshot::unknown(),
+            readiness_feed: None,
             admin: Arc::new(RefuseAdmin),
             facts,
             block_guard: None,
@@ -424,6 +428,21 @@ impl UnattendedAuth {
     pub fn with_readiness(mut self, readiness: ReadinessSnapshot) -> Self {
         self.readiness = readiness;
         self
+    }
+
+    /// Read the readiness rows from `feed` at each request: the host probes them
+    /// at its start and every 10 min (§B.8.7.1 ⑥).
+    #[must_use]
+    pub fn with_readiness_feed(mut self, feed: SharedReadiness) -> Self {
+        self.readiness_feed = Some(feed);
+        self
+    }
+
+    /// The readiness rows as of this request.
+    fn readiness_now(&self) -> ReadinessSnapshot {
+        self.readiness_feed
+            .as_ref()
+            .map_or_else(|| self.readiness.clone(), SharedReadiness::get)
     }
 
     /// Wire remote administration (§B.8.4.1) to an authority — normally
@@ -512,7 +531,7 @@ impl UnattendedAuth {
     /// with a badge); a `Fail` on one of the four load-bearing probes blocks
     /// with `HOST_NOT_READY` and the documented `cause`.
     fn readiness_reject(&self) -> Option<SessionReject> {
-        let r = &self.readiness;
+        let r = &self.readiness_now();
         let cause = if matches!(r.capture, Probe::Fail { .. }) {
             1
         } else if matches!(r.input, Probe::Fail { .. }) {
@@ -935,7 +954,7 @@ impl UnattendedAuth {
             post.ends_at,
             grant.block_window_s,
             grant.ask_before_start,
-            self.readiness.clone(),
+            self.readiness_now(),
             fail_summary.map(wire_fail_summary),
         )
         .with_elevation(level.elevation())
