@@ -1316,11 +1316,13 @@ mod tests {
             &saved,
             &host,
             Attempt::Accepted {
-                administrator: false,
+                elevation: tornect_core::levels::Elevation::None,
+                grant_reach: Some(0),
             },
             &request,
         )
-        .unwrap();
+        .unwrap()
+        .remembered;
         assert!(remembered);
         let known = cdeps.known_hosts.get(&host).unwrap();
         crate::ua_client::log_attempt(

@@ -5203,8 +5203,142 @@ async fn an_unattended_accept_above_the_request_is_a_violation() {
             Some(codes::E_BAD_STATE),
             "{want_mode} {admin_asked}: {err}"
         );
+        assert!(
+            matches!(err, HandshakeError::AnswerRefused { .. }),
+            "{want_mode} {admin_asked}: {err}"
+        );
         assert_eq!(pins.recorded.load(Ordering::SeqCst), 0, "nothing pinned");
         let _ = task.await;
+    }
+}
+
+/// A relay between a client and a host that hands every frame of `kind` the host sends to
+/// `tamper` on its way to the client: a frame changed after it was signed.
+fn tamper_relay(
+    client: DuplexStream,
+    host: DuplexStream,
+    kind: Kind,
+    tamper: fn(&mut Envelope),
+) -> tokio::task::JoinHandle<()> {
+    use crate::framing::{MAX_FRAME_LEN, read_frame_max};
+    tokio::spawn(async move {
+        let (mut client_rx, mut client_tx) = tokio::io::split(client);
+        let (mut host_rx, mut host_tx) = tokio::io::split(host);
+        let up = async {
+            while let Ok(Some(frame)) = read_frame_max(&mut client_rx, MAX_FRAME_LEN).await {
+                if write_frame(&mut host_tx, &frame).await.is_err() {
+                    break;
+                }
+            }
+            let _ = host_tx.shutdown().await;
+        };
+        let down = async {
+            while let Ok(Some(frame)) = read_frame_max(&mut host_rx, MAX_FRAME_LEN).await {
+                let frame = match Envelope::decode(&frame) {
+                    Ok(mut env) if env.kind == kind => {
+                        tamper(&mut env);
+                        env.encode()
+                    }
+                    _ => frame,
+                };
+                if write_frame(&mut client_tx, &frame).await.is_err() {
+                    break;
+                }
+            }
+            let _ = client_tx.shutdown().await;
+        };
+        tokio::join!(up, down);
+    })
+}
+
+/// One bit of the signature flipped.
+fn flip_sig(env: &mut Envelope) {
+    if let Some(sig) = env.sig.as_mut() {
+        sig[0] ^= 1;
+    }
+}
+
+/// A body that does not decode.
+fn garbage_body(env: &mut Envelope) {
+    env.body = vec![0xff];
+}
+
+/// M1-67 C4: only the checks of the host's `SESSION_ACCEPT` and `ADMIN_RESULT` raise
+/// `AnswerRefused`, after the same `ERROR{code}` a violation sends; a refused `HELLO_ACK`
+/// or `AUTH_CHALLENGE` stays a `Violation`. Each frame is changed on its way, after the
+/// real host signed it.
+#[tokio::test]
+async fn only_the_answers_checks_raise_answer_refused() {
+    /// The frame's kind, the change, an admin command, whether the answer is refused,
+    /// the `ERROR` code.
+    type Case = (Kind, fn(&mut Envelope), bool, bool, u16);
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let cases: [Case; 6] = [
+        (Kind::HelloAck, flip_sig, false, false, codes::E_BAD_SIG),
+        (
+            Kind::AuthChallenge,
+            garbage_body,
+            false,
+            false,
+            codes::E_BAD_LEN,
+        ),
+        (Kind::SessionAccept, flip_sig, false, true, codes::E_BAD_SIG),
+        (
+            Kind::SessionAccept,
+            garbage_body,
+            false,
+            true,
+            codes::E_BAD_LEN,
+        ),
+        (Kind::AdminResult, flip_sig, true, true, codes::E_BAD_SIG),
+        (
+            Kind::AdminResult,
+            garbage_body,
+            true,
+            true,
+            codes::E_BAD_LEN,
+        ),
+    ];
+    for (kind, tamper, admin, answer, code) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, client) = unattended_pair(tmp.path(), PW);
+        let (client_end, relay_client) = pipe();
+        let (relay_host, host_end) = pipe();
+        let task = spawn_host(host_end, &host);
+        let relay = tamper_relay(relay_client, relay_host, kind, tamper);
+        let err = if admin {
+            client::admin(
+                client_end,
+                &client.cfg,
+                &client.identity,
+                &client.deps,
+                &client::AdminIntent {
+                    password: Zeroizing::new(PW.to_owned()),
+                    op: messages::admin_op::END_SESSION,
+                    device_pk: None,
+                },
+            )
+            .await
+            .expect_err("a changed answer")
+        } else {
+            connect(
+                client_end,
+                &client.cfg,
+                &client.identity,
+                &client.deps,
+                unattended_intent(PW, messages::mode::CONTROL, false),
+            )
+            .await
+            .expect_err("a changed frame")
+        };
+        assert_eq!(err.violation_code(), Some(code), "{kind:?}: {err}");
+        assert_eq!(
+            matches!(err, HandshakeError::AnswerRefused { .. }),
+            answer,
+            "{kind:?}: {err}"
+        );
+        let _ = task.await;
+        let _ = relay.await;
     }
 }
 

@@ -580,6 +580,10 @@ pub fn admin(
         anyhow::bail!("not sent");
     }
     let saved = ua_client::system_passwords(&device);
+    // C6: a password the host's last answer did not let this device keep goes first.
+    if let Err(e) = ua_client::belt(paths, &saved, &id) {
+        tracing::warn!(error = %format!("{e:#}"), "hosts.toml could not be read");
+    }
     let password = match ua_client::recall_for_use(paths, &saved, &id)? {
         ua_client::Recalled::Password(password) => password,
         other => {
@@ -631,15 +635,9 @@ pub fn admin(
             };
             match client::admin(stream, &ccfg, &device, &deps, &command).await {
                 Ok(answer) => {
-                    if let Err(e) = ua_client::settle(
-                        paths,
-                        &saved,
-                        &id,
-                        tornect_core::unattended::credentials::Attempt::Accepted {
-                            administrator: false,
-                        },
-                        &request,
-                    ) {
+                    // An admin answer keeps no password (DA-15). Its `grant_reach` is not
+                    // decoded yet: absent, so a remembered password goes (C1).
+                    if let Err(e) = ua_client::settle_admin(paths, &saved, &id, None) {
                         eprintln!("hosts.toml could not be updated: {e:#}");
                     }
                     ua_client::log_attempt(
@@ -719,6 +717,10 @@ fn prepare_unattended(
         );
     };
     let saved = crate::ua_client::system_passwords(device);
+    // C6: a password the host's last answer did not let this device keep goes first.
+    if let Err(e) = crate::ua_client::belt(paths, &saved, &id) {
+        tracing::warn!(error = %format!("{e:#}"), "hosts.toml could not be read");
+    }
     let record = crate::ua_client::record(paths, &id);
     let may_admin = record.administrator || ua.administrator;
     if ua.remember
@@ -940,14 +942,14 @@ async fn connect_session(
         Some(format_args!("SESSION LIVE {sid}")),
     );
     if let Some(p) = &prepared {
-        match ua_client::settle(
-            paths,
-            &p.saved,
-            &id,
-            tornect_core::unattended::credentials::Attempt::Accepted { administrator },
-            &p.request,
-        ) {
-            Ok(true) if p.request.remember => eprintln!(
+        // C1: the verified accept alone decides, before QUIC. Its `grant_reach` is not
+        // decoded yet: absent, so nothing is kept and a remembered password goes.
+        let answer = tornect_core::unattended::credentials::Attempt::Accepted {
+            elevation: session.accept().elevation(),
+            grant_reach: None,
+        };
+        match ua_client::settle(paths, &p.saved, &id, answer, &p.request) {
+            Ok(s) if s.remembered && p.request.remember => eprintln!(
                 "the password is remembered in {}{}",
                 p.saved.keychain().unwrap_or("the keychain"),
                 p.saved

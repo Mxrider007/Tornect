@@ -12,7 +12,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use tornect_core::session_log::{SessionEvent, SessionLog, SessionMode, SessionRecord};
 use tornect_core::trusted::KnownHost;
-use tornect_core::unattended::credentials::{Attempt, SavedPasswords};
+use tornect_core::unattended::credentials::{Attempt, Deleted, SavedPasswords, Settled};
 use tornect_core::unattended::hosts::{HostsFile, PinCheck};
 use tornect_core::{DeviceId, Paths, TornectId};
 use tornect_signal::envelope::codes;
@@ -474,11 +474,13 @@ pub fn ended(err: &HandshakeError, host: &str) -> Ended {
             blocks: true,
             unreachable: false,
         },
-        HandshakeError::Violation { code, what }
+        // This side refused the host's answer (C4): the remembered password goes, not
+        // as stale.
+        HandshakeError::AnswerRefused { code, what }
             if *code == codes::E_BAD_STATE && what.contains("above the request") =>
         {
             plain(
-                Attempt::Inconclusive,
+                Attempt::AnswerRefused,
                 format!(
                     "\"{host}\" answered with more access than this device asked for, which it must \
                  never do; the connection was closed."
@@ -486,6 +488,11 @@ pub fn ended(err: &HandshakeError, host: &str) -> Ended {
                 "above_the_request",
             )
         }
+        HandshakeError::AnswerRefused { .. } => plain(
+            Attempt::AnswerRefused,
+            format!("The connection to \"{host}\" ended: {err}."),
+            "error",
+        ),
         // A host that no longer trusts this device answers its request as it
         // answers a stranger's: `E_BAD_STATE` (it expected a pairing).
         HandshakeError::PairingLost
@@ -615,18 +622,54 @@ pub fn log_attempt(paths: &Paths, known: &KnownHost, logged: &Logged<'_>) {
     }
 }
 
-/// Settle one attempt at `host`: a refused password stale and deleted when it was the
-/// remembered one, an accepted one kept when Remember was ticked and allowed (DA-14),
-/// `hosts.toml` saved when it changed. Returns whether a password is remembered for the
-/// host now.
+/// The delete that comes first (C2 step 1, C4), before `hosts.toml` is read; a refusal of
+/// the keychain is said in the log (the record keeps `remember`, C7).
+fn delete_first(saved: &SavedPasswords, host: &TornectId) -> Deleted {
+    let gone = saved.delete_first(host);
+    if gone == Deleted::Refused {
+        tracing::warn!("the keychain refused to delete the remembered password");
+    }
+    gone
+}
+
+/// C6, when the prompt opens and before a command-line dial: a record that says both that
+/// the host's last answer reached and that a password is remembered has its entry deleted
+/// first; `hosts.toml` saved when it changed. `None` when nothing was to be deleted.
+pub fn belt(
+    paths: &Paths,
+    saved: &SavedPasswords,
+    host: &TornectId,
+) -> anyhow::Result<Option<Deleted>> {
+    let _one = hosts_lock();
+    let path = paths.hosts_file();
+    let mut file = HostsFile::load(&path)?;
+    let done = saved.belt(&mut file, host);
+    match done {
+        Some(Deleted::Refused) => {
+            tracing::warn!("the keychain refused to delete the remembered password");
+        }
+        Some(Deleted::Entry | Deleted::Nothing) => file.save(&path)?,
+        None => {}
+    }
+    Ok(done)
+}
+
+/// Settle one session attempt at `host` (decision M1-67): the host's verified answer
+/// alone decides (C1). One that reaches administrator access, leaves `grant_reach` out or
+/// was refused deletes the remembered password first, before `hosts.toml` is read, and
+/// keeps nothing (C2, C4); an accept of 0 keeps a typed password when Remember was ticked
+/// (C3); a refused password is stale and deleted when it was the remembered one; then
+/// `hosts.toml` is saved when it changed. An error says that `hosts.toml` could not be read
+/// or saved, or that the keychain did not take the password.
 pub fn settle(
     paths: &Paths,
     saved: &SavedPasswords,
     host: &TornectId,
     attempt: Attempt,
     request: &Request,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Settled> {
     let _one = hosts_lock();
+    let first = attempt.deletes_first().then(|| delete_first(saved, host));
     let path = paths.hosts_file();
     let mut file = HostsFile::load(&path)?;
     let had = file.get(host).is_some_and(|r| r.remember);
@@ -645,7 +688,7 @@ pub fn settle(
         other => other,
     };
     let keep = request.remember.then_some(request.password.as_str());
-    let settled = saved.settle(&mut file, host, attempt, keep)?;
+    let settled = saved.settle(&mut file, host, attempt, first, keep)?;
     if settled.changed
         && let Err(e) = file.save(&path)
     {
@@ -659,7 +702,28 @@ pub fn settle(
         }
         return Err(e.into());
     }
-    Ok(settled.remembered)
+    Ok(settled)
+}
+
+/// Settle a verified `ADMIN_RESULT` at `host` by its `grant_reach`. It takes no password,
+/// so none is ever kept after an admin command (DA-15): an answer that reaches deletes the
+/// remembered password first, as for an accept (C2); at 0 a remembered one stays (C3).
+pub fn settle_admin(
+    paths: &Paths,
+    saved: &SavedPasswords,
+    host: &TornectId,
+    grant_reach: Option<u8>,
+) -> anyhow::Result<Settled> {
+    let _one = hosts_lock();
+    let first = Attempt::reaches(tornect_core::levels::Elevation::None, grant_reach)
+        .then(|| delete_first(saved, host));
+    let path = paths.hosts_file();
+    let mut file = HostsFile::load(&path)?;
+    let settled = saved.settle_admin(&mut file, host, grant_reach, first);
+    if settled.changed {
+        file.save(&path)?;
+    }
+    Ok(settled)
 }
 
 /// Record the signed mode of an accepted session at `host` (the host card
@@ -899,7 +963,7 @@ mod tests {
         assert!(changed.blocks);
         assert!(changed.text.contains("re-created since you last connected"));
         let above = ended(
-            &HandshakeError::Violation {
+            &HandshakeError::AnswerRefused {
                 code: codes::E_BAD_STATE,
                 what: "level above the request",
             },
@@ -1039,7 +1103,8 @@ mod tests {
     }
 
     const ACCEPTED: Attempt = Attempt::Accepted {
-        administrator: false,
+        elevation: tornect_core::levels::Elevation::None,
+        grant_reach: Some(0),
     };
 
     /// F4-5: when `hosts.toml` cannot be saved after the password went into the
@@ -1057,7 +1122,11 @@ mod tests {
         assert!(!record(&paths, &h).remember);
         // Saved once the file can be written: kept, flagged.
         std::fs::remove_dir(&tmp_file).unwrap();
-        assert!(settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true)).unwrap());
+        assert!(
+            settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true))
+                .unwrap()
+                .remembered
+        );
         assert_eq!(vault.names().len(), 1);
         assert!(vault.get(&saved.entry(&h)).unwrap().is_some());
     }
@@ -1068,7 +1137,11 @@ mod tests {
     fn forget_deletes_the_password_when_the_file_cannot_be_read() {
         let (_tmp, paths, vault, saved) = with_vault();
         let h = host(4);
-        assert!(settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true)).unwrap());
+        assert!(
+            settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true))
+                .unwrap()
+                .remembered
+        );
         std::fs::write(paths.hosts_file(), "not = [valid").unwrap();
         assert!(
             matches!(forget(&paths, &saved, &h), Err(Kept::Record(_))),
@@ -1084,7 +1157,11 @@ mod tests {
         use tornect_core::unattended::credentials::PasswordVault as _;
         let (_tmp, paths, vault, saved) = with_vault();
         let (flagged, unflagged, paired) = (host(5), host(6), host(7));
-        assert!(settle(&paths, &saved, &flagged, ACCEPTED, &typed("a", true)).unwrap());
+        assert!(
+            settle(&paths, &saved, &flagged, ACCEPTED, &typed("a", true))
+                .unwrap()
+                .remembered
+        );
         // A record without the flag whose entry is in the keychain (a save that failed
         // before), and a paired host with no record at all.
         note_mode(&paths, &unflagged, true).unwrap();
@@ -1109,7 +1186,11 @@ mod tests {
         use tornect_core::unattended::credentials::PasswordVault as _;
         let (_tmp, paths, vault, saved) = with_vault();
         let h = host(8);
-        assert!(settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true)).unwrap());
+        assert!(
+            settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true))
+                .unwrap()
+                .remembered
+        );
         assert!(matches!(
             recall_for_use(&paths, &saved, &h).unwrap(),
             Recalled::Password(p) if *p == "pw"
@@ -1139,16 +1220,429 @@ mod tests {
     fn only_a_refusal_of_the_remembered_password_deletes_it() {
         let (_tmp, paths, vault, saved) = with_vault();
         let h = host(9);
-        assert!(settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true)).unwrap());
+        assert!(
+            settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true))
+                .unwrap()
+                .remembered
+        );
         let refused = Attempt::PasswordRefused;
-        assert!(settle(&paths, &saved, &h, refused, &typed("typo", false)).unwrap());
+        assert!(
+            settle(&paths, &saved, &h, refused, &typed("typo", false))
+                .unwrap()
+                .remembered
+        );
         let r = record(&paths, &h);
         assert!(r.remember && !r.stale);
         assert_eq!(vault.names().len(), 1);
-        assert!(!settle(&paths, &saved, &h, refused, &typed("pw", false)).unwrap());
+        assert!(
+            !settle(&paths, &saved, &h, refused, &typed("pw", false))
+                .unwrap()
+                .remembered
+        );
         let r = record(&paths, &h);
         assert!(!r.remember && r.stale);
         assert!(vault.names().is_empty());
+    }
+
+    /// An accept that says 1.
+    const ONE: Attempt = Attempt::Accepted {
+        elevation: tornect_core::levels::Elevation::None,
+        grant_reach: Some(1),
+    };
+
+    /// An accept that leaves `grant_reach` out (an older host).
+    const ABSENT: Attempt = Attempt::Accepted {
+        elevation: tornect_core::levels::Elevation::None,
+        grant_reach: None,
+    };
+
+    /// Edit `host`'s record in hosts.toml as another program of the user could.
+    fn edit(
+        paths: &Paths,
+        host: &TornectId,
+        change: impl FnOnce(&mut tornect_core::unattended::hosts::HostRecord),
+    ) {
+        let mut file = HostsFile::load(&paths.hosts_file()).unwrap();
+        change(file.entry(host));
+        file.save(&paths.hosts_file()).unwrap();
+    }
+
+    /// A keychain that notes, at every delete, whether hosts.toml already said `reach`.
+    struct Watching {
+        inner: tornect_core::unattended::credentials::MemoryVault,
+        file: std::path::PathBuf,
+        seen: Mutex<Vec<bool>>,
+    }
+
+    impl tornect_core::unattended::credentials::PasswordVault for Watching {
+        fn describe(&self) -> &'static str {
+            "a test keychain"
+        }
+        fn presence_gated(&self) -> bool {
+            false
+        }
+        fn get(
+            &self,
+            entry: &tornect_core::unattended::credentials::EntryName,
+        ) -> tornect_core::Result<Option<Zeroizing<String>>> {
+            self.inner.get(entry)
+        }
+        fn put(
+            &self,
+            entry: &tornect_core::unattended::credentials::EntryName,
+            password: &str,
+        ) -> tornect_core::Result<()> {
+            self.inner.put(entry, password)
+        }
+        fn delete(
+            &self,
+            entry: &tornect_core::unattended::credentials::EntryName,
+        ) -> tornect_core::Result<bool> {
+            let reach =
+                HostsFile::load(&self.file).is_ok_and(|f| f.hosts.values().any(|r| r.reach));
+            self.seen.lock().unwrap().push(reach);
+            self.inner.delete(entry)
+        }
+    }
+
+    /// C2 step 1, C4: an answer that reaches, leaves the key out or was refused deletes the
+    /// remembered password first: before hosts.toml is written (the keychain sees the file
+    /// still without `reach`), and whether or not the file can be read.
+    #[test]
+    fn the_delete_comes_before_hosts_toml() {
+        use tornect_core::unattended::credentials::PasswordVault as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let vault = std::sync::Arc::new(Watching {
+            inner: tornect_core::unattended::credentials::MemoryVault::new(),
+            file: paths.hosts_file(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let saved = SavedPasswords::new(Some(vault.clone()), [1; 32]);
+        let h = host(11);
+        for answer in [ONE, ABSENT, Attempt::AnswerRefused] {
+            assert!(
+                settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true))
+                    .unwrap()
+                    .remembered
+            );
+            vault.seen.lock().unwrap().clear();
+            let s = settle(&paths, &saved, &h, answer, &typed("pw", true)).unwrap();
+            assert!(s.forgot && !s.remembered, "{answer:?}");
+            assert_eq!(vault.inner.names().len(), 0, "{answer:?}");
+            assert_eq!(
+                vault.seen.lock().unwrap().first(),
+                Some(&false),
+                "{answer:?}: the delete came after the file was written"
+            );
+            assert!(record(&paths, &h).reach, "{answer:?}");
+        }
+        // A file that cannot be read does not stop it.
+        std::fs::write(paths.hosts_file(), "not = [valid").unwrap();
+        for answer in [ONE, ABSENT, Attempt::AnswerRefused] {
+            vault.put(&saved.entry(&h), "pw").unwrap();
+            assert!(settle(&paths, &saved, &h, answer, &typed("pw", true)).is_err());
+            assert!(vault.inner.names().is_empty(), "{answer:?}");
+        }
+    }
+
+    /// DA-15 (C3): a verified admin answer never keeps a password, and the admin settle
+    /// takes none. At 0 a remembered one stays; an answer that reaches or leaves the key out
+    /// deletes it first, and the record says so for the prompt.
+    #[test]
+    fn an_admin_settle_keeps_no_password() {
+        use tornect_core::unattended::credentials::PasswordVault as _;
+        let (_tmp, paths, vault, saved) = with_vault();
+        let h = host(12);
+        let s = settle_admin(&paths, &saved, &h, Some(0)).unwrap();
+        assert!(!s.remembered && vault.names().is_empty());
+        assert!(
+            settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true))
+                .unwrap()
+                .remembered
+        );
+        let s = settle_admin(&paths, &saved, &h, Some(0)).unwrap();
+        assert!(s.remembered && !s.forgot);
+        assert_eq!(vault.names().len(), 1);
+        for reach in [Some(1), Some(2), None] {
+            vault.put(&saved.entry(&h), "pw").unwrap();
+            edit(&paths, &h, |r| r.remember = true);
+            let s = settle_admin(&paths, &saved, &h, reach).unwrap();
+            assert!(s.forgot && !s.remembered, "{reach:?}");
+            assert!(vault.names().is_empty(), "{reach:?}");
+            let r = record(&paths, &h);
+            assert!(r.reach && !r.remember, "{reach:?}");
+            assert_eq!(r.administrator, reach == Some(2), "{reach:?}");
+        }
+    }
+
+    /// C4: only a refused `SESSION_ACCEPT` or `ADMIN_RESULT` deletes. A refused `HELLO_ACK`
+    /// or `AUTH_CHALLENGE` is a violation like any other and stays inconclusive, as a
+    /// changed OPAQUE key does, and its settle deletes nothing; a refused answer, F-8
+    /// included, keeps its words.
+    #[test]
+    fn a_refused_hello_ack_is_inconclusive() {
+        let hello_ack = HandshakeError::Violation {
+            code: codes::E_BAD_SIG,
+            what: "signature",
+        };
+        let auth_challenge = HandshakeError::Violation {
+            code: codes::E_BAD_LEN,
+            what: "suite",
+        };
+        for err in [
+            &hello_ack,
+            &auth_challenge,
+            &HandshakeError::ServerKeyChanged,
+        ] {
+            assert_eq!(ended(err, "Desk").attempt, Attempt::Inconclusive, "{err}");
+        }
+        let refused = HandshakeError::AnswerRefused {
+            code: codes::E_BAD_SIG,
+            what: "signature",
+        };
+        let e = ended(&refused, "Desk");
+        assert_eq!(e.attempt, Attempt::AnswerRefused);
+        assert_eq!(
+            e.text,
+            "The connection to \"Desk\" ended: protocol violation E_BAD_SIG: signature."
+        );
+        assert_eq!(e.reason, "error");
+        let above = ended(
+            &HandshakeError::AnswerRefused {
+                code: codes::E_BAD_STATE,
+                what: "mode above the request",
+            },
+            "Desk",
+        );
+        assert_eq!(above.attempt, Attempt::AnswerRefused);
+        assert_eq!(above.reason, "above_the_request");
+        let (_tmp, paths, vault, saved) = with_vault();
+        let h = host(13);
+        assert!(
+            settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true))
+                .unwrap()
+                .remembered
+        );
+        let attempt = ended(&hello_ack, "Desk").attempt;
+        assert!(
+            settle(&paths, &saved, &h, attempt, &typed("pw", false))
+                .unwrap()
+                .remembered
+        );
+        assert_eq!(vault.names().len(), 1);
+    }
+
+    /// A24, `reach` cleared in the file: Remember shows once, and an answer of 1 still
+    /// keeps nothing (C8).
+    #[test]
+    fn a24_reach_cleared_shows_remember_and_keeps_nothing_at_1() {
+        use tornect_core::unattended::credentials::RememberOffer;
+        let (_tmp, paths, vault, saved) = with_vault();
+        let h = host(20);
+        settle(&paths, &saved, &h, ONE, &typed("pw", false)).unwrap();
+        assert!(record(&paths, &h).reach);
+        edit(&paths, &h, |r| r.reach = false);
+        assert_eq!(
+            saved.offer(record(&paths, &h).reach),
+            RememberOffer::Offered
+        );
+        let s = settle(&paths, &saved, &h, ONE, &typed("pw", true)).unwrap();
+        assert!(!s.remembered);
+        assert!(vault.names().is_empty());
+        let r = record(&paths, &h);
+        assert!(r.reach && !r.remember);
+    }
+
+    /// A24, `reach` set in the file: Remember is not offered, so nothing is written; the
+    /// next answer of 0 clears it again (C1, C8).
+    #[test]
+    fn a24_reach_set_writes_nothing() {
+        use tornect_core::unattended::credentials::RememberOffer;
+        let (_tmp, paths, vault, saved) = with_vault();
+        let h = host(21);
+        settle(&paths, &saved, &h, ACCEPTED, &typed("pw", false)).unwrap();
+        edit(&paths, &h, |r| r.reach = true);
+        assert_eq!(
+            saved.offer(record(&paths, &h).reach),
+            RememberOffer::NotForAdministrator
+        );
+        let s = settle(&paths, &saved, &h, ACCEPTED, &typed("pw", false)).unwrap();
+        assert!(!s.remembered);
+        assert!(vault.names().is_empty());
+        assert!(!record(&paths, &h).reach);
+    }
+
+    /// A24, `remember` set for a host never remembered: recall reads only that host's
+    /// derived entry, never another host's password (C8).
+    #[test]
+    fn a24_remember_set_recalls_only_that_hosts_entry() {
+        let (_tmp, paths, vault, saved) = with_vault();
+        let (kept, never) = (host(22), host(23));
+        assert!(
+            settle(&paths, &saved, &kept, ACCEPTED, &typed("kept", true))
+                .unwrap()
+                .remembered
+        );
+        edit(&paths, &never, |r| r.remember = true);
+        assert_eq!(recall(&paths, &saved, &never).unwrap(), None);
+        assert!(matches!(
+            recall_for_use(&paths, &saved, &never).unwrap(),
+            Recalled::Vanished
+        ));
+        assert_eq!(vault.names().len(), 1);
+    }
+
+    /// A24, hosts.toml rolled back after a deletion: the flag comes back with the file, the
+    /// password does not.
+    #[test]
+    fn a24_rolled_back_after_a_deletion_brings_nothing_back() {
+        let (_tmp, paths, vault, saved) = with_vault();
+        let h = host(24);
+        assert!(
+            settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true))
+                .unwrap()
+                .remembered
+        );
+        let before = std::fs::read(paths.hosts_file()).unwrap();
+        settle(&paths, &saved, &h, ONE, &typed("pw", false)).unwrap();
+        assert!(vault.names().is_empty());
+        std::fs::write(paths.hosts_file(), &before).unwrap();
+        assert!(record(&paths, &h).remember);
+        assert_eq!(recall(&paths, &saved, &h).unwrap(), None);
+        assert!(vault.names().is_empty());
+    }
+
+    /// A24, hosts.toml unreadable at an answer of 1: the entry is still deleted, and the
+    /// error is the file's (C2).
+    #[test]
+    fn a24_unreadable_at_an_answer_of_1_still_deletes() {
+        let (_tmp, paths, vault, saved) = with_vault();
+        let h = host(29);
+        assert!(
+            settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true))
+                .unwrap()
+                .remembered
+        );
+        std::fs::write(paths.hosts_file(), "not = [valid").unwrap();
+        let err = settle(&paths, &saved, &h, ONE, &typed("pw", false)).unwrap_err();
+        assert!(
+            err.downcast_ref::<tornect_core::CoreError>()
+                .is_some_and(|e| matches!(e, tornect_core::CoreError::HostsParse { .. })),
+            "{err:#}"
+        );
+        assert!(vault.names().is_empty());
+    }
+
+    /// A24, a keychain delete that fails (C7): `remember` stays set, nothing is kept, and
+    /// the check when the prompt opens deletes the entry once the keychain lets it (C6).
+    #[test]
+    fn a24_a_failed_delete_keeps_remember_and_the_prompt_deletes_it() {
+        let (_tmp, paths, vault, saved) = with_vault();
+        let h = host(25);
+        assert!(
+            settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true))
+                .unwrap()
+                .remembered
+        );
+        vault.refuse_deletes(true);
+        let s = settle(&paths, &saved, &h, ONE, &typed("pw", true)).unwrap();
+        assert!(s.delete_failed && !s.remembered && !s.forgot);
+        assert_eq!(vault.names().len(), 1);
+        let r = record(&paths, &h);
+        assert!(r.remember && r.reach);
+        assert_eq!(belt(&paths, &saved, &h).unwrap(), Some(Deleted::Refused));
+        assert!(record(&paths, &h).remember);
+        vault.refuse_deletes(false);
+        assert_eq!(belt(&paths, &saved, &h).unwrap(), Some(Deleted::Entry));
+        assert!(vault.names().is_empty());
+        assert!(!record(&paths, &h).remember);
+        assert_eq!(belt(&paths, &saved, &h).unwrap(), None);
+    }
+
+    /// A24, a crash between the accept and the save (a file that cannot be written stands
+    /// for it): nothing is kept for an answer of 1.
+    #[test]
+    fn a24_a_crash_before_the_save_keeps_nothing_at_1() {
+        let (_tmp, paths, vault, saved) = with_vault();
+        let h = host(26);
+        assert!(
+            settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true))
+                .unwrap()
+                .remembered
+        );
+        let tmp_file = paths.hosts_file().with_extension("toml.tmp");
+        std::fs::create_dir_all(&tmp_file).unwrap();
+        assert!(settle(&paths, &saved, &h, ONE, &typed("pw", true)).is_err());
+        assert!(vault.names().is_empty(), "{:?}", vault.names());
+    }
+
+    /// A24, a reject after F2 (`COOLDOWN`) with a remembered entry, then an answer of 0 to
+    /// the recalled password: both keep the entry and the flags.
+    #[test]
+    fn a24_a_reject_then_a_zero_keep_the_entry_and_the_flags() {
+        let (_tmp, paths, vault, saved) = with_vault();
+        let h = host(27);
+        assert!(
+            settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true))
+                .unwrap()
+                .remembered
+        );
+        let before = record(&paths, &h);
+        let cooldown = ended(
+            &HandshakeError::SessionRejected {
+                reject: Box::new(rejected(reject::COOLDOWN)),
+            },
+            "Desk",
+        );
+        assert_eq!(cooldown.attempt, Attempt::Inconclusive);
+        assert!(
+            settle(&paths, &saved, &h, cooldown.attempt, &typed("pw", false))
+                .unwrap()
+                .remembered
+        );
+        assert_eq!(record(&paths, &h), before);
+        let Recalled::Password(password) = recall_for_use(&paths, &saved, &h).unwrap() else {
+            panic!("the remembered password");
+        };
+        let recalled = Request {
+            password,
+            view_only: false,
+            administrator: false,
+            remember: false,
+        };
+        assert!(
+            settle(&paths, &saved, &h, ACCEPTED, &recalled)
+                .unwrap()
+                .remembered
+        );
+        assert_eq!(record(&paths, &h), before);
+        assert_eq!(vault.names().len(), 1);
+    }
+
+    /// A24, Forget while the keychain refuses the delete: Forget says so and keeps the
+    /// record with `remember` set; a later Forget deletes the entry.
+    #[test]
+    fn a24_forget_while_the_keychain_refuses_keeps_the_record() {
+        let (_tmp, paths, vault, saved) = with_vault();
+        let h = host(28);
+        assert!(
+            settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true))
+                .unwrap()
+                .remembered
+        );
+        vault.refuse_deletes(true);
+        assert!(matches!(forget(&paths, &saved, &h), Err(Kept::Password(_))));
+        assert!(record(&paths, &h).remember);
+        assert_eq!(vault.names().len(), 1);
+        vault.refuse_deletes(false);
+        forget(&paths, &saved, &h).unwrap();
+        assert!(vault.names().is_empty());
+        assert_eq!(
+            record(&paths, &h),
+            tornect_core::unattended::hosts::HostRecord::default()
+        );
     }
 
     /// F4-4: the Unlock confirmation says that the other device's lock is

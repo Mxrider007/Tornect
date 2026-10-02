@@ -92,6 +92,19 @@ pub enum HandshakeError {
         /// Which check failed (fixed text, never peer-controlled).
         what: &'static str,
     },
+    /// Client side, unattended: the host's `SESSION_ACCEPT` or `ADMIN_RESULT` failed one of
+    /// this side's checks of it (decoding and `validate`, the signature, `token_confirm`,
+    /// `quic_spki`, `session_type`, or the request's bound, F-8). Raised where
+    /// [`Self::Violation`] would be, after the same `ERROR{code}`, and only for those two
+    /// frames, so that the client deletes a remembered password without marking it stale
+    /// (decision M1-67, C4); a refused `HELLO_ACK` or `AUTH_CHALLENGE` stays a violation.
+    #[error("protocol violation {}: {what}", codes::name(*code))]
+    AnswerRefused {
+        /// The `ERROR` code sent.
+        code: u16,
+        /// Which check failed (fixed text, never peer-controlled).
+        what: &'static str,
+    },
     /// The peer sent `ERROR{code}`.
     #[error("peer reported {}", codes::name(*code))]
     PeerError {
@@ -163,11 +176,14 @@ pub enum HandshakeError {
 }
 
 impl HandshakeError {
-    /// The `ERROR` code this side sent, if the error is a violation.
+    /// The `ERROR` code this side sent, if the error is a violation (a refused answer
+    /// included).
     #[must_use]
     pub fn violation_code(&self) -> Option<u16> {
         match self {
-            HandshakeError::Violation { code, .. } => Some(*code),
+            HandshakeError::Violation { code, .. } | HandshakeError::AnswerRefused { code, .. } => {
+                Some(*code)
+            }
             _ => None,
         }
     }
@@ -888,6 +904,18 @@ where
         }
     }
 
+    /// [`Channel::body`] for the host's `SESSION_ACCEPT` or `ADMIN_RESULT` on the client:
+    /// a body that fails is [`HandshakeError::AnswerRefused`].
+    pub(crate) async fn answer_body<B: Body>(
+        &mut self,
+        rx: &Received,
+    ) -> Result<B, HandshakeError> {
+        match decode_body::<B>(&rx.env.body) {
+            Ok(b) => Ok(b),
+            Err(e) => Err(self.refuse(codes::E_BAD_LEN, body_fault(&e)).await),
+        }
+    }
+
     /// Send `ERROR{code}` (fixed detail per code, so a pinned and an unpinned
     /// peer see byte-identical answers), close, and return the matching error.
     pub async fn fail(&mut self, code: u16, what: &'static str) -> HandshakeError {
@@ -904,6 +932,18 @@ where
             let _ = self.stream.shutdown().await;
         }
         HandshakeError::Violation { code, what }
+    }
+
+    /// [`Channel::fail`] for a check of the host's `SESSION_ACCEPT` or `ADMIN_RESULT` on the
+    /// client: the same `ERROR{code}` and close, reported as
+    /// [`HandshakeError::AnswerRefused`] (C4).
+    pub(crate) async fn refuse(&mut self, code: u16, what: &'static str) -> HandshakeError {
+        match self.fail(code, what).await {
+            HandshakeError::Violation { code, what } => {
+                HandshakeError::AnswerRefused { code, what }
+            }
+            other => other,
+        }
     }
 
     /// Send `BYE{reason}` and close.

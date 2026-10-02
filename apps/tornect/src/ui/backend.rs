@@ -1073,8 +1073,12 @@ async fn unless_stopped<F: Future>(work: F, stop: &watch::Receiver<bool>) -> Opt
 /// (a remembered password, a stale one, whether the grant may carry the
 /// administrator level) and whether "Remember" can be offered here.
 fn open_prompt(b: &Backend, id: TornectId, admin: Option<AdminAction>, target: Option<[u8; 32]>) {
-    let record = ua_client::record(&b.paths, &id);
     let saved = ua_client::system_passwords(&b.device);
+    // C6: a password the host's last answer did not let this device keep goes first.
+    if let Err(e) = ua_client::belt(&b.paths, &saved, &id) {
+        tracing::warn!(error = %format!("{e:#}"), "hosts.toml could not be read");
+    }
+    let record = ua_client::record(&b.paths, &id);
     b.shared.update(|m| {
         let host = m.book.title_of(&id);
         m.prompt = Some(super::model::Prompt {
@@ -1082,7 +1086,7 @@ fn open_prompt(b: &Backend, id: TornectId, admin: Option<AdminAction>, target: O
             host,
             keychain: saved.keychain(),
             kept: saved.kept(),
-            remember: (saved.offer(false), saved.offer(true)),
+            remember: (saved.offer(record.reach), saved.offer(true)),
             remembered: record.remember && saved.keychain().is_some(),
             vanished: false,
             stale: record.stale,
@@ -1198,15 +1202,9 @@ async fn admin_command(
             };
             match client::admin(stream, &ccfg, &b.device, &deps, &command).await {
                 Ok(answer) => {
-                    if let Err(e) = ua_client::settle(
-                        &b.paths,
-                        &saved,
-                        &id,
-                        tornect_core::unattended::credentials::Attempt::Accepted {
-                            administrator: false,
-                        },
-                        &request,
-                    ) {
+                    // An admin answer keeps no password (DA-15). Its `grant_reach` is not
+                    // decoded yet: absent, so a remembered password goes (C1).
+                    if let Err(e) = ua_client::settle_admin(&b.paths, &saved, &id, None) {
                         tracing::warn!(error = %format!("{e:#}"), "hosts.toml could not be updated");
                     }
                     ua_client::log_attempt(
@@ -1460,13 +1458,13 @@ async fn viewed(
     let unattended = session.unattended();
     if let (Some(request), Some(known)) = (&ua, &known) {
         let saved = ua_client::system_passwords(&b.device);
-        if let Err(e) = ua_client::settle(
-            &b.paths,
-            &saved,
-            &id,
-            tornect_core::unattended::credentials::Attempt::Accepted { administrator },
-            request,
-        ) {
+        // C1: the verified accept alone decides, before QUIC. Its `grant_reach` is not
+        // decoded yet: absent, so nothing is kept and a remembered password goes.
+        let answer = tornect_core::unattended::credentials::Attempt::Accepted {
+            elevation: session.accept().elevation(),
+            grant_reach: None,
+        };
+        if let Err(e) = ua_client::settle(&b.paths, &saved, &id, answer, request) {
             b.shared
                 .update(|m| m.note(format!("The password could not be remembered: {e:#}")));
         }
