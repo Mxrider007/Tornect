@@ -185,7 +185,7 @@ fn enable(env: &Env, store: &GrantStore, device: DeviceId, preset: Preset) -> Mu
     let guard = env.guard(store);
     guard.master_on(Actor::Ui, &HOST_PK).unwrap();
     guard
-        .create_grant(Actor::Ui, &device, preset, &waived(), &upload())
+        .create_grant(Actor::Ui, &device, preset, &waived(), &upload(), false)
         .unwrap();
     guard
 }
@@ -1297,7 +1297,14 @@ fn a6_log_verifier_survives_rotate_id_and_a_store_reset_and_still_detects_tamper
     assert_eq!(report.status, ChainStatus::Valid, "{report:?}");
     let guard = env.guard(&store);
     guard
-        .create_grant(Actor::Ui, &d, Preset::MyMachines, &waived(), &upload())
+        .create_grant(
+            Actor::Ui,
+            &d,
+            Preset::MyMachines,
+            &waived(),
+            &upload(),
+            false,
+        )
         .unwrap();
     assert_eq!(store.verify_log().unwrap().status, ChainStatus::Valid);
     // tampering before the boundary breaks a prev link (the boundary line's hash sits
@@ -1372,11 +1379,13 @@ fn a8_guard_refuses_access_increasing_ops_without_reauth() {
         codes::G_REAUTH_FAILED
     );
     assert_eq!(
-        deny.reg_start(Actor::Cli, &d).unwrap_err().code(),
+        deny.reg_start(Actor::Cli, &d, false, false)
+            .unwrap_err()
+            .code(),
         codes::G_REAUTH_FAILED
     );
     assert_eq!(
-        deny.set_password(Actor::Cli, &d, &upload())
+        deny.set_password(Actor::Cli, &d, &upload(), &GrantOptions::default(), false)
             .unwrap_err()
             .code(),
         codes::G_REAUTH_FAILED
@@ -1774,6 +1783,7 @@ fn a8_attended_precondition_counts_sessions_in_rotated_files() {
             Preset::HelpingSomeone,
             &GrantOptions::default(),
             &upload(),
+            false,
         )
         .unwrap();
     assert!(store.grant(&h).is_some());
@@ -1854,6 +1864,7 @@ fn a8_reg_finish_without_a_live_txn_is_g_no_txn() {
             &upload(),
             Preset::MyMachines,
             &waived(),
+            false,
         )
         .unwrap_err();
     assert_eq!(err.code(), codes::G_NO_TXN);
@@ -1865,7 +1876,7 @@ fn a8_reg_finish_without_a_live_txn_is_g_no_txn() {
     );
     // RegStart re-auths and bootstraps the store lazily
     assert_eq!(store.status(), StoreStatus::AttendedOnly);
-    let start = guard.reg_start(Actor::Cli, &a).unwrap();
+    let start = guard.reg_start(Actor::Cli, &a, false, false).unwrap();
     assert_eq!(store.status(), StoreStatus::Loaded);
     assert_eq!(start.server_setup.len(), 128);
     assert_eq!(reauth.calls(), vec!["reg_start".to_owned()]);
@@ -1878,7 +1889,8 @@ fn a8_reg_finish_without_a_live_txn_is_g_no_txn() {
                 &start.reg_txn,
                 &upload(),
                 Preset::MyMachines,
-                &waived()
+                &waived(),
+                false
             )
             .unwrap_err()
             .code(),
@@ -1894,7 +1906,8 @@ fn a8_reg_finish_without_a_live_txn_is_g_no_txn() {
                 &start.reg_txn,
                 &upload(),
                 Preset::MyMachines,
-                &waived()
+                &waived(),
+                false
             )
             .unwrap_err()
             .code(),
@@ -1909,14 +1922,15 @@ fn a8_reg_finish_without_a_live_txn_is_g_no_txn() {
                 &start.reg_txn,
                 &upload(),
                 Preset::MyMachines,
-                &waived()
+                &waived(),
+                false
             )
             .unwrap_err()
             .code(),
         codes::G_NO_TXN
     );
     // a fresh txn works once; the attended precondition is enforced unless waived
-    let start = guard.reg_start(Actor::Cli, &a).unwrap();
+    let start = guard.reg_start(Actor::Cli, &a, false, false).unwrap();
     let err = guard
         .reg_finish(
             Actor::Cli,
@@ -1925,10 +1939,11 @@ fn a8_reg_finish_without_a_live_txn_is_g_no_txn() {
             &upload(),
             Preset::MyMachines,
             &GrantOptions::default(),
+            false,
         )
         .unwrap_err();
     assert_eq!(err.code(), codes::G_PRECONDITION);
-    let start = guard.reg_start(Actor::Cli, &a).unwrap();
+    let start = guard.reg_start(Actor::Cli, &a, false, false).unwrap();
     let outcome = guard
         .reg_finish(
             Actor::Cli,
@@ -1937,6 +1952,7 @@ fn a8_reg_finish_without_a_live_txn_is_g_no_txn() {
             &upload(),
             Preset::MyMachines,
             &waived(),
+            false,
         )
         .unwrap();
     assert!(matches!(
@@ -1946,7 +1962,7 @@ fn a8_reg_finish_without_a_live_txn_is_g_no_txn() {
     assert!(env.has_event(SessionEvent::GrantCreated));
     assert!(env.has_event(SessionEvent::PasswordSet));
     // set-password for the existing grant: replaces the record, refuses widening
-    let start = guard.reg_start(Actor::Cli, &a).unwrap();
+    let start = guard.reg_start(Actor::Cli, &a, false, false).unwrap();
     let err = guard
         .reg_finish(
             Actor::Cli,
@@ -1958,10 +1974,11 @@ fn a8_reg_finish_without_a_live_txn_is_g_no_txn() {
                 block_window_s: Some(0),
                 ..GrantOptions::default()
             },
+            false,
         )
         .unwrap_err();
     assert_eq!(err.code(), codes::G_PRECONDITION);
-    let start = guard.reg_start(Actor::Cli, &a).unwrap();
+    let start = guard.reg_start(Actor::Cli, &a, false, false).unwrap();
     let outcome = guard
         .reg_finish(
             Actor::Cli,
@@ -1970,6 +1987,7 @@ fn a8_reg_finish_without_a_live_txn_is_g_no_txn() {
             &[0xCD; 192],
             Preset::MyMachines,
             &GrantOptions::default(),
+            false,
         )
         .unwrap();
     assert!(matches!(
@@ -1989,6 +2007,7 @@ fn a8_reg_finish_without_a_live_txn_is_g_no_txn() {
             Preset::HeadlessBox,
             &GrantOptions::default(),
             &upload(),
+            false,
         )
         .unwrap();
     assert!(store.read(|s| s.keep_awake).unwrap());
@@ -2000,7 +2019,8 @@ fn a8_reg_finish_without_a_live_txn_is_g_no_txn() {
                 &h,
                 Preset::HelpingSomeone,
                 &GrantOptions::default(),
-                &upload()
+                &upload(),
+                false
             )
             .unwrap_err()
             .code(),
@@ -2021,6 +2041,7 @@ fn a8_reg_finish_without_a_live_txn_is_g_no_txn() {
             Preset::HelpingSomeone,
             &GrantOptions::default(),
             &upload(),
+            false,
         )
         .unwrap();
     assert_eq!(store.grant(&h).unwrap().mode, SessionMode::ViewOnly);
@@ -2044,7 +2065,14 @@ fn a8_master_on_issues_a_stop_code_and_emergency_stop_is_single_use() {
     assert!(!dbg.contains(&hex::encode(*code)));
     assert!(dbg.contains("<redacted>"));
     guard
-        .create_grant(Actor::Ui, &d, Preset::MyMachines, &waived(), &upload())
+        .create_grant(
+            Actor::Ui,
+            &d,
+            Preset::MyMachines,
+            &waived(),
+            &upload(),
+            false,
+        )
         .unwrap();
     assert!(store.enabled_at(T0));
     assert_eq!(guard.emergency_stop().unwrap(), 1);
@@ -2066,7 +2094,7 @@ fn a14_debug_output_redacts_secrets_and_the_disk_never_holds_plaintext() {
     let d = dev(1);
     let guard = env.guard(&store);
     guard.master_on(Actor::Ui, &HOST_PK).unwrap();
-    let start = guard.reg_start(Actor::Ui, &d).unwrap();
+    let start = guard.reg_start(Actor::Ui, &d, false, false).unwrap();
     let setup_hex = hex::encode(start.server_setup.as_slice());
     assert!(!format!("{start:?}").contains(&setup_hex));
     guard
@@ -2077,6 +2105,7 @@ fn a14_debug_output_redacts_secrets_and_the_disk_never_holds_plaintext() {
             &upload(),
             Preset::MyMachines,
             &waived(),
+            false,
         )
         .unwrap();
     let upload_hex = hex::encode(upload());
@@ -2116,6 +2145,7 @@ fn a14_debug_output_redacts_secrets_and_the_disk_never_holds_plaintext() {
             upload: upload(),
             preset: 0,
             options: waived(),
+            generated: false,
         },
     };
     let dbg_req = format!("{req:?}");
@@ -2139,7 +2169,14 @@ fn admin_env() -> (Env, GrantStore, MutationGuard, DeviceId, DeviceId, DeviceId)
     let (admin, target, helper) = (dev(1), dev(2), dev(3));
     let guard = enable(&env, &store, admin, Preset::MyMachines);
     guard
-        .create_grant(Actor::Ui, &target, Preset::MyMachines, &waived(), &upload())
+        .create_grant(
+            Actor::Ui,
+            &target,
+            Preset::MyMachines,
+            &waived(),
+            &upload(),
+            false,
+        )
         .unwrap();
     guard
         .create_grant(
@@ -2148,6 +2185,7 @@ fn admin_env() -> (Env, GrantStore, MutationGuard, DeviceId, DeviceId, DeviceId)
             Preset::HelpingSomeone,
             &waived(),
             &upload(),
+            false,
         )
         .unwrap();
     // helpers are active 12 h after creation
@@ -2959,8 +2997,15 @@ fn u4_offline_open_decodes_but_never_settles_decays_or_rearms() {
     let store = env.open();
     let (a, b) = (dev(1), dev(2));
     let g = enable(&env, &store, a, Preset::MyMachines);
-    g.create_grant(Actor::Ui, &b, Preset::MyMachines, &waived(), &upload())
-        .unwrap();
+    g.create_grant(
+        Actor::Ui,
+        &b,
+        Preset::MyMachines,
+        &waived(),
+        &upload(),
+        false,
+    )
+    .unwrap();
     let lim = AttemptLimiter::new(store.clone());
     // b: a running 10 s lock persisted; a: a pending (abandoned) charge
     fail_n(&env, &lim, &a, 2);
@@ -3168,11 +3213,16 @@ fn a8_access_increasing_rechecks_the_remote_session_after_the_dialog() {
                 Preset::HeadlessBox,
                 &GrantOptions::default(),
                 &upload(),
+                false,
             )
             .map(|_| ()),
     );
     assert!(store.grant(&dev(2)).is_none());
-    check(guard.reg_start(Actor::Ui, &dev(2)).map(|_| ()));
+    check(
+        guard
+            .reg_start(Actor::Ui, &dev(2), false, false)
+            .map(|_| ()),
+    );
     assert_eq!(
         guard
             .reg_finish(
@@ -3181,7 +3231,8 @@ fn a8_access_increasing_rechecks_the_remote_session_after_the_dialog() {
                 &[0; 16],
                 &upload(),
                 Preset::HeadlessBox,
-                &GrantOptions::default()
+                &GrantOptions::default(),
+                false
             )
             .unwrap_err()
             .code(),
@@ -3272,6 +3323,7 @@ fn commit_env() -> (Env, GrantStore) {
             Preset::HeadlessBox,
             &waived(),
             &upload(),
+            false,
         )
         .unwrap();
     guard.disable(Actor::Ui, &dev(1)).unwrap();
@@ -3285,8 +3337,16 @@ fn commit_env() -> (Env, GrantStore) {
 /// The eight access-increasing guard operations of A25 (k), each a change the store
 /// would accept without the session.
 fn the_eight_operations() -> Vec<(&'static str, GuardOp)> {
-    let set_password: GuardOp =
-        Box::new(|g: &MutationGuard| g.set_password(Actor::Ui, &dev(2), &[0xCD; 192]).map(|_| ()));
+    let set_password: GuardOp = Box::new(|g: &MutationGuard| {
+        g.set_password(
+            Actor::Ui,
+            &dev(2),
+            &[0xCD; 192],
+            &GrantOptions::default(),
+            false,
+        )
+        .map(|_| ())
+    });
     let create_grant: GuardOp = Box::new(|g: &MutationGuard| {
         g.create_grant(
             Actor::Ui,
@@ -3294,11 +3354,12 @@ fn the_eight_operations() -> Vec<(&'static str, GuardOp)> {
             Preset::HeadlessBox,
             &waived(),
             &upload(),
+            false,
         )
         .map(|_| ())
     });
     let reg_finish: GuardOp = Box::new(|g: &MutationGuard| {
-        let start = g.reg_start(Actor::Cli, &dev(2))?;
+        let start = g.reg_start(Actor::Cli, &dev(2), false, false)?;
         g.reg_finish(
             Actor::Cli,
             &dev(2),
@@ -3306,6 +3367,7 @@ fn the_eight_operations() -> Vec<(&'static str, GuardOp)> {
             &[0xEF; 192],
             Preset::HeadlessBox,
             &GrantOptions::default(),
+            false,
         )
         .map(|_| ())
     });
@@ -3514,12 +3576,22 @@ fn a8_grant_requires_a_sas_paired_device_and_unpair_cascades() {
     assert_eq!(reauth.calls().len(), 1);
     // unpaired ⇒ refused before any dialog, whatever the preset / waiver says
     let err = guard
-        .create_grant(Actor::Ui, &d, Preset::HeadlessBox, &waived(), &upload())
+        .create_grant(
+            Actor::Ui,
+            &d,
+            Preset::HeadlessBox,
+            &waived(),
+            &upload(),
+            false,
+        )
         .unwrap_err();
     assert_eq!(err.code(), codes::G_PRECONDITION);
     assert!(err.to_string().contains("not paired"), "{err}");
     assert_eq!(
-        guard.reg_start(Actor::Ui, &d).unwrap_err().code(),
+        guard
+            .reg_start(Actor::Ui, &d, false, false)
+            .unwrap_err()
+            .code(),
         codes::G_PRECONDITION
     );
     assert_eq!(reauth.calls().len(), 1, "no dialog for an unpaired device");
@@ -3544,6 +3616,7 @@ fn a8_grant_requires_a_sas_paired_device_and_unpair_cascades() {
             Preset::HeadlessBox,
             &GrantOptions::default(),
             &upload(),
+            false,
         )
         .unwrap();
     let g = store.grant(&d).unwrap();
@@ -3569,7 +3642,7 @@ fn a8_grant_requires_a_sas_paired_device_and_unpair_cascades() {
     trusted.save(&trusted_path).unwrap();
     assert_eq!(
         guard
-            .set_password(Actor::Ui, &d, &[0xCD; 192])
+            .set_password(Actor::Ui, &d, &[0xCD; 192], &GrantOptions::default(), false)
             .unwrap_err()
             .code(),
         codes::G_PRECONDITION
@@ -4271,6 +4344,7 @@ fn a25_o_a_store_that_adopts_a_machine_id_marks_every_grant() {
             Preset::HeadlessBox,
             &waived(),
             &upload(),
+            false,
         )
         .unwrap();
     guard.disable(Actor::Ui, &dev(2)).unwrap();
@@ -4340,6 +4414,7 @@ fn reach_env() -> (Env, GrantStore, MutationGuard) {
             Preset::HeadlessBox,
             &waived(),
             &upload(),
+            false,
         )
         .unwrap();
     (env, store, guard)
@@ -4653,8 +4728,15 @@ fn a25_h_a_replaced_password_fails_auth_and_marks_nothing() {
     let (_env, store, guard) = reach_env();
     set_grant(&store, &dev(1), |g| g.unmarked = true);
     let proven = digest_of(&store, &dev(1));
+    // a generated Change password: the new password is unmarked (A25 (h))
     guard
-        .set_password(Actor::Ui, &dev(1), &[0xCD; 192])
+        .set_password(
+            Actor::Ui,
+            &dev(1),
+            &[0xCD; 192],
+            &GrantOptions::default(),
+            true,
+        )
         .unwrap();
     assert_eq!(
         reach::read_after_reservation(
@@ -4844,7 +4926,15 @@ fn a25_j_an_admin_command_after_a_raise_fails_auth() {
     // replaces `auth`): AUTH_FAILED, no ADMIN_RESULT, the command does not run.
     let (env, store, guard, admin, _target, _helper) = admin_env();
     let proven = digest_of(&store, &admin);
-    guard.set_password(Actor::Ui, &admin, &[0xCD; 192]).unwrap();
+    guard
+        .set_password(
+            Actor::Ui,
+            &admin,
+            &[0xCD; 192],
+            &GrantOptions::default(),
+            false,
+        )
+        .unwrap();
     let lines = admin_lines(&env).len();
     assert!(matches!(
         guard.admin(&admin, &proven, AdminOp::MasterOff),
@@ -4972,4 +5062,378 @@ fn a25_l_each_admin_refusal_under_the_lock_is_answered_and_logged() {
     assert!(!store.lock_is_held());
     env.clock.set_wall(mark);
     assert_eq!(store.verify_log().unwrap().status, ChainStatus::Valid);
+}
+
+// ------------------------------------------------------------------ the raise rules (M1-67: D3, D4, D8.1, D9)
+
+/// Options that ask for the administrator level.
+fn the_level() -> GrantOptions {
+    GrantOptions {
+        elevation: Some(Elevation::Admin),
+        ..GrantOptions::default()
+    }
+}
+
+fn refused_with(env: &Env, code: u16) -> usize {
+    env.log_events()
+        .iter()
+        .filter(|r| r.event == SessionEvent::GrantMutationRefused && r.code == Some(code))
+        .count()
+}
+
+#[test]
+fn a22_set_options_raise() {
+    // A22 (D3): `set_options` never raises a grant's own reach (the level, or control
+    // where control reaches the level): `G_NEEDS_PASSWORD`, logged, nothing changed.
+    // Where control reaches nothing, control is an ordinary widening; lowering the level
+    // is deny-direction.
+    let (env, store, _guard) = reach_env();
+    let guard = guard_on(&store, windows(|_| {}), HelperPresence::Absent);
+    let err = guard
+        .set_options(Actor::Ui, &dev(1), &the_level())
+        .unwrap_err();
+    assert_eq!(err.code(), codes::G_NEEDS_PASSWORD, "{err}");
+    assert!(!store.grant(&dev(1)).unwrap().holds_level());
+    // control where the helper task makes control reach the level
+    set_grant(&store, &dev(1), |g| g.mode = SessionMode::ViewOnly);
+    let with_task = guard_on(&store, windows(|_| {}), HelperPresence::Registered);
+    let control = GrantOptions {
+        mode: Some(SessionMode::Control),
+        ..GrantOptions::default()
+    };
+    let err = with_task
+        .set_options(Actor::Ui, &dev(1), &control)
+        .unwrap_err();
+    assert_eq!(err.code(), codes::G_NEEDS_PASSWORD, "{err}");
+    assert_eq!(store.grant(&dev(1)).unwrap().mode, SessionMode::ViewOnly);
+    assert_eq!(refused_with(&env, codes::G_NEEDS_PASSWORD), 2);
+    // control reaching nothing: an ordinary widening
+    guard.set_options(Actor::Ui, &dev(1), &control).unwrap();
+    assert_eq!(store.grant(&dev(1)).unwrap().mode, SessionMode::Control);
+    // lowering the level: deny-direction, no dialog
+    set_grant(&store, &dev(2), |g| g.elevation = Elevation::Admin);
+    let deny = MutationGuard::new(
+        store.clone(),
+        Arc::new(DenyAllReAuth),
+        Arc::new(NoSessionActivity),
+        Arc::new(FixedFacts::new(windows(|_| {}), HelperPresence::Absent)),
+    )
+    .with_paired_devices(Arc::new(AllowAllPaired));
+    deny.set_options(
+        Actor::Cli,
+        &dev(2),
+        &GrantOptions {
+            elevation: Some(Elevation::None),
+            ..GrantOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(!store.grant(&dev(2)).unwrap().holds_level());
+}
+
+#[test]
+fn g_unsupported_on_linux() {
+    // §B.8.7.4, D7: the level is refused where this host cannot give it, before any
+    // dialog, and the detail says why: Linux, a copy outside Program Files, a standard
+    // account, facts that could not be read, a grant for helping someone.
+    use crate::levels::{
+        REFUSAL_ADMIN_HELPING_SOMEONE, REFUSAL_ADMIN_LINUX, REFUSAL_ADMIN_STANDALONE,
+        REFUSAL_ADMIN_STANDARD_ACCOUNT, REFUSAL_ADMIN_UNREADABLE,
+    };
+    let (_env, store, guard) = reach_env();
+    guard
+        .create_grant(
+            Actor::Ui,
+            &dev(3),
+            Preset::HelpingSomeone,
+            &waived(),
+            &upload(),
+            false,
+        )
+        .unwrap();
+    for (case, account, device, why) in [
+        ("Linux", AccountFacts::Linux, dev(1), REFUSAL_ADMIN_LINUX),
+        (
+            "standalone",
+            windows(|f| f.installed = false),
+            dev(1),
+            REFUSAL_ADMIN_STANDALONE,
+        ),
+        (
+            "standard account",
+            windows(|f| f.administrator = false),
+            dev(1),
+            REFUSAL_ADMIN_STANDARD_ACCOUNT,
+        ),
+        (
+            "unreadable",
+            AccountFacts::Unreadable,
+            dev(1),
+            REFUSAL_ADMIN_UNREADABLE,
+        ),
+        (
+            "helping someone",
+            windows(|_| {}),
+            dev(3),
+            REFUSAL_ADMIN_HELPING_SOMEONE,
+        ),
+    ] {
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let on = MutationGuard::new(
+            store.clone(),
+            reauth.clone(),
+            Arc::new(NoSessionActivity),
+            Arc::new(FixedFacts::new(account, HelperPresence::Absent)),
+        )
+        .with_paired_devices(Arc::new(AllowAllPaired));
+        let err = on
+            .set_options(Actor::Ui, &device, &the_level())
+            .unwrap_err();
+        assert_eq!(err.code(), codes::G_UNSUPPORTED, "{case}");
+        assert_eq!(err.to_string(), why, "{case}");
+        let err = on
+            .set_password(Actor::Ui, &device, &upload(), &the_level(), true)
+            .unwrap_err();
+        assert_eq!(err.code(), codes::G_UNSUPPORTED, "{case}");
+        assert!(reauth.calls().is_empty(), "{case}: no dialog");
+        assert!(!store.grant(&device).unwrap().holds_level(), "{case}");
+    }
+    // a RegStart that declares a raise, on Linux: refused before any dialog
+    let reauth = Arc::new(AllowAllReAuth::default());
+    let linux = MutationGuard::new(
+        store.clone(),
+        reauth.clone(),
+        Arc::new(NoSessionActivity),
+        Arc::new(FixedFacts::linux()),
+    )
+    .with_paired_devices(Arc::new(AllowAllPaired));
+    let err = linux
+        .reg_start(Actor::Cli, &dev(1), true, true)
+        .unwrap_err();
+    assert_eq!(err.code(), codes::G_UNSUPPORTED);
+    assert!(reauth.calls().is_empty());
+}
+
+#[test]
+fn a22_a_raise_and_a_creation_with_reach_need_a_generated_password() {
+    // A22 (D3, D4, D9; DA-18, ND-2): a raise through set-password, and a creation with
+    // reach, need `generated`: without it `G_NEEDS_PASSWORD`, nothing written; with it the
+    // level and the new `auth` land in one write and the password is unmarked; a chosen
+    // password leaves the grant marked; a `RegFinish` must match its `RegStart`; a raising
+    // `RegStart` and the window's raise ask with the raising wording.
+    let (_env, store, _guard) = reach_env();
+    let reauth = Arc::new(AllowAllReAuth::default());
+    let guard = MutationGuard::new(
+        store.clone(),
+        reauth.clone(),
+        Arc::new(NoSessionActivity),
+        Arc::new(FixedFacts::new(windows(|_| {}), HelperPresence::Absent)),
+    )
+    .with_paired_devices(Arc::new(AllowAllPaired));
+    // the window's set_password carrying the level, a chosen password: refused
+    let before = store.grant(&dev(1)).unwrap();
+    let err = guard
+        .set_password(Actor::Ui, &dev(1), &[0xC1; 192], &the_level(), false)
+        .unwrap_err();
+    assert_eq!(err.code(), codes::G_NEEDS_PASSWORD, "{err}");
+    assert_eq!(store.grant(&dev(1)).unwrap(), before, "nothing written");
+    // generated: one write, the level with the new auth, unmarked; the raising wording
+    guard
+        .set_password(Actor::Ui, &dev(1), &[0xC2; 192], &the_level(), true)
+        .unwrap();
+    let p = store.grant(&dev(1)).unwrap();
+    assert!(p.holds_level() && !p.marked());
+    assert_ne!(p.auth, before.auth);
+    assert_eq!(reauth.calls().last().map(String::as_str), Some("raise"));
+    // a chosen Change password, the level kept: marked again (D9, D11)
+    guard
+        .set_password(
+            Actor::Ui,
+            &dev(1),
+            &[0xC3; 192],
+            &GrantOptions::default(),
+            false,
+        )
+        .unwrap();
+    let p = store.grant(&dev(1)).unwrap();
+    assert!(p.holds_level() && p.marked());
+    // creating a grant with the level, or a control grant now that control reaches the
+    // level (dev(1) holds it), without `generated`: refused, nothing written
+    for (device, options) in [(dev(4), the_level()), (dev(5), GrantOptions::default())] {
+        let err = guard
+            .create_grant(
+                Actor::Ui,
+                &device,
+                Preset::HeadlessBox,
+                &options,
+                &upload(),
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), codes::G_NEEDS_PASSWORD, "{err}");
+        assert!(store.grant(&device).is_none());
+    }
+    guard
+        .create_grant(
+            Actor::Ui,
+            &dev(4),
+            Preset::HeadlessBox,
+            &the_level(),
+            &upload(),
+            true,
+        )
+        .unwrap();
+    let created = store.grant(&dev(4)).unwrap();
+    assert!(created.holds_level() && !created.marked());
+    // RegFinish against its RegStart
+    let start = guard.reg_start(Actor::Cli, &dev(2), false, false).unwrap();
+    let err = guard
+        .reg_finish(
+            Actor::Cli,
+            &dev(2),
+            &start.reg_txn,
+            &upload(),
+            Preset::HeadlessBox,
+            &GrantOptions::default(),
+            true,
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        codes::G_NEEDS_PASSWORD,
+        "generated differs: {err}"
+    );
+    let start = guard.reg_start(Actor::Cli, &dev(2), false, true).unwrap();
+    let err = guard
+        .reg_finish(
+            Actor::Cli,
+            &dev(2),
+            &start.reg_txn,
+            &upload(),
+            Preset::HeadlessBox,
+            &the_level(),
+            true,
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        codes::G_NEEDS_PASSWORD,
+        "a raise not declared: {err}"
+    );
+    assert!(!store.grant(&dev(2)).unwrap().holds_level());
+    let start = guard.reg_start(Actor::Cli, &dev(2), true, true).unwrap();
+    assert_eq!(reauth.calls().last().map(String::as_str), Some("raise"));
+    guard
+        .reg_finish(
+            Actor::Cli,
+            &dev(2),
+            &start.reg_txn,
+            &upload(),
+            Preset::HeadlessBox,
+            &the_level(),
+            true,
+        )
+        .unwrap();
+    let q = store.grant(&dev(2)).unwrap();
+    assert!(q.holds_level() && !q.marked());
+}
+
+#[test]
+fn d8_1_no_marked_grant_at_the_level_is_enabled_without_a_new_password() {
+    // D8.1, A22 (an imported or restored admin grant, and one `Disabled{Ui}` before the
+    // restore): *enable* is refused while the grant at the level is marked, whatever
+    // disabled it; a generated *Change password* clears the mark, then *enable* applies.
+    // *Resume* brings back a state the same password had: allowed, the mark kept (ND-9).
+    let (env, store, _guard) = reach_env();
+    let guard = guard_on(&store, windows(|_| {}), HelperPresence::Absent);
+    for by in [Actor::Restore, Actor::Ui] {
+        set_grant(&store, &dev(1), |g| {
+            g.elevation = Elevation::Admin;
+            g.unmarked = false;
+            g.state = GrantState::Disabled { since: T0, by };
+        });
+        let err = guard.enable(Actor::Ui, &dev(1)).unwrap_err();
+        assert_eq!(err.code(), codes::G_NEEDS_PASSWORD, "{by:?}");
+        assert!(matches!(
+            store.grant(&dev(1)).unwrap().state,
+            GrantState::Disabled { .. }
+        ));
+    }
+    assert_eq!(refused_with(&env, codes::G_NEEDS_PASSWORD), 2);
+    guard
+        .set_password(
+            Actor::Ui,
+            &dev(1),
+            &[0xC4; 192],
+            &GrantOptions::default(),
+            true,
+        )
+        .unwrap();
+    assert!(!store.grant(&dev(1)).unwrap().marked());
+    guard.enable(Actor::Ui, &dev(1)).unwrap();
+    assert_eq!(store.grant(&dev(1)).unwrap().state, GrantState::Active);
+    set_grant(&store, &dev(1), |g| {
+        g.unmarked = false;
+        g.state = GrantState::Suspended {
+            reason: SuspendReason::Local { by: Actor::Ui },
+            since: T0,
+        };
+    });
+    guard.resume(Actor::Ui, &dev(1)).unwrap();
+    let p = store.grant(&dev(1)).unwrap();
+    assert!(p.state == GrantState::Active && p.marked());
+}
+
+#[test]
+fn d8_4_raise_between_pake_and_reservation_fails_auth() {
+    // D8.4 (second half), A25 (c): a raise with a new generated password committed
+    // between P's PAKE and its reservation ends that request with AUTH_FAILED; nothing is
+    // marked, and the new password is unmarked.
+    let (_env, store, _guard) = reach_env();
+    let guard = guard_on(&store, windows(|_| {}), HelperPresence::Absent);
+    let proven = digest_of(&store, &dev(1));
+    guard
+        .set_password(Actor::Ui, &dev(1), &[0xC5; 192], &the_level(), true)
+        .unwrap();
+    assert_eq!(
+        reach::read_after_reservation(
+            &store,
+            &dev(1),
+            &proven,
+            windows(|_| {}),
+            HelperPresence::Absent
+        ),
+        Err(ReachRefusal::AuthReplaced)
+    );
+    let p = store.grant(&dev(1)).unwrap();
+    assert!(p.holds_level() && !p.marked(), "the new password unmarked");
+}
+
+#[test]
+fn a25_c_a_raise_during_the_request_fails_auth_and_the_admin_command_too() {
+    // A25 (c): P's grant raised with a new password while P's request waits (its PAKE
+    // done): the reservation's read and an admin command of P both refuse AUTH_FAILED;
+    // nothing ran, nothing marked, the new password unmarked.
+    let (env, store, guard, admin, target, _helper) = admin_env();
+    let on = guard_on(&store, windows(|_| {}), HelperPresence::Absent);
+    let proven = digest_of(&store, &admin);
+    on.set_password(Actor::Ui, &admin, &[0xC6; 192], &the_level(), true)
+        .unwrap();
+    assert!(matches!(
+        on.admin(&admin, &proven, AdminOp::Revoke(target)),
+        Err(AdminError::Refused(ReachRefusal::AuthReplaced))
+    ));
+    assert!(store.grant(&target).is_some(), "nothing ran");
+    assert_eq!(
+        reach::read_after_reservation(
+            &store,
+            &admin,
+            &proven,
+            windows(|_| {}),
+            HelperPresence::Absent
+        ),
+        Err(ReachRefusal::AuthReplaced)
+    );
+    assert!(!store.grant(&admin).unwrap().marked());
+    drop((env, guard));
 }

@@ -1291,6 +1291,7 @@ mod tests {
                 Preset::HeadlessBox,
                 &GrantOptions::default(),
                 &[0u8; 192],
+                false,
             )
             .unwrap();
         let setup =
@@ -1303,7 +1304,9 @@ mod tests {
             tornect_signal::auth::identifiers(device.public_key_bytes(), &host_onion_pk),
         )
         .unwrap();
-        guard.set_password(Actor::Cli, device, &record).unwrap();
+        guard
+            .set_password(Actor::Cli, device, &record, &GrantOptions::default(), false)
+            .unwrap();
         *on.stop_code
     }
 

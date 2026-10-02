@@ -66,6 +66,50 @@ impl Elevation {
     }
 }
 
+/// CBOR: the wire code (`GrantOptions.elevation`, §B.8.7.4); a code this build does
+/// not know is refused.
+impl<C> minicbor::Encode<C> for Elevation {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut minicbor::Encoder<W>,
+        _: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        e.u8(self.code())?.ok()
+    }
+}
+
+impl<'b, C> minicbor::Decode<'b, C> for Elevation {
+    fn decode(d: &mut minicbor::Decoder<'b>, _: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let p = d.position();
+        Self::from_code(d.u8()?)
+            .ok_or_else(|| minicbor::decode::Error::message("unknown elevation").at(p))
+    }
+}
+
+/// The warning of the wizard's step ⑤a *Administrator access* (§B.8.7.1; decision
+/// M1-62: the operator accepted the residual with it); `<device>` stands for the grant's
+/// pinned label.
+pub const ADMINISTRATOR_WARNING: &str = "An unattended administrator session can change \
+    anything on this computer, including Tornect's own settings and its log. While this is on, \
+    any device with control of this computer can reach programs that run as administrator, not \
+    only <device>.";
+
+/// Why the guard refuses the administrator level on Linux (§B.8.7.4, `G_UNSUPPORTED`).
+pub const REFUSAL_ADMIN_LINUX: &str =
+    "Administrator access does not exist on Linux: Tornect runs as you.";
+/// Why the guard refuses it on a copy outside Program Files (§B.8.7.4).
+pub const REFUSAL_ADMIN_STANDALONE: &str =
+    "Administrator access needs Tornect installed on this computer.";
+/// Why the guard refuses it on a standard account (§B.8.7.4).
+pub const REFUSAL_ADMIN_STANDARD_ACCOUNT: &str =
+    "Only an administrator account can give administrator access.";
+/// Why the guard refuses it for the *Helping someone* preset (§B.8.7.4).
+pub const REFUSAL_ADMIN_HELPING_SOMEONE: &str =
+    "A grant for helping someone cannot include administrator access.";
+/// Why the guard refuses it where the account's facts could not be read.
+pub const REFUSAL_ADMIN_UNREADABLE: &str =
+    "Tornect could not read this account's rights, so it cannot give administrator access.";
+
 /// A session's level: its mode and its elevation. View-only never carries
 /// an elevation (§B.8.4.1), so a [`Level`] cannot hold one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -765,6 +809,19 @@ mod tests {
     /// row: elevation unreadable refuses; elevated with UAC on keeps the
     /// started-elevated refusal; anything else unreadable offers View only
     /// alone and says why.
+    /// The warning of the wizard's ⑤a step (decision M1-62), kept as a constant for M-UI-5
+    /// and the command line.
+    #[test]
+    fn the_administrator_warning_is_the_planned_text() {
+        assert_eq!(
+            ADMINISTRATOR_WARNING,
+            "An unattended administrator session can change anything on this computer, \
+             including Tornect's own settings and its log. While this is on, any device with \
+             control of this computer can reach programs that run as administrator, not only \
+             <device>."
+        );
+    }
+
     #[test]
     fn an_unreadable_account_never_widens_the_offer() {
         let registry = WindowsFacts::default();

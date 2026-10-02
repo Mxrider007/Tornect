@@ -77,6 +77,14 @@ pub mod codes {
     pub const G_STORE_LOCKED: u16 = 0x0105;
     /// `RegFinish` without a live `reg_txn`.
     pub const G_NO_TXN: u16 = 0x0106;
+    /// An operation this platform cannot honour (the administrator level on Linux, on a
+    /// copy outside Program Files, for a standard account or a *Helping someone* grant);
+    /// the detail says why (r7, §B.8.7.4).
+    pub const G_UNSUPPORTED: u16 = 0x0107;
+    /// A creation or change that gives a grant its own `grant_reach` without a new
+    /// generated password, a `RegFinish` that does not match its `RegStart`, or the
+    /// *enable* of a marked admin grant (decision M1-67).
+    pub const G_NEEDS_PASSWORD: u16 = 0x0108;
 }
 
 /// Codec failure.
@@ -253,6 +261,11 @@ pub struct GrantOptions {
     #[n(12)]
     #[cbor(default)]
     pub waive_attended_precondition: bool,
+    /// The grant's administrator level (r7, §B.8.7.1; Windows only). Raising it is
+    /// access-increasing and needs a new generated password in the same write (decision
+    /// M1-67); lowering it is deny-direction.
+    #[n(13)]
+    pub elevation: Option<crate::levels::Elevation>,
 }
 
 impl GrantOptions {
@@ -363,6 +376,11 @@ pub enum IpcOp {
         device: DeviceId,
         /// `RegistrationRequest::serialize()`.
         reg_request: [u8; 32],
+        /// The registration creates a grant whose `grant_reach` is not 0, or raises one: the
+        /// dialog says so (decision M1-67). Kept with the transaction.
+        raise: bool,
+        /// The password came from the passphrase generator. Kept with the transaction.
+        generated: bool,
     },
     /// Registration finish (grant when none exists, set-password otherwise).
     RegFinish {
@@ -376,6 +394,9 @@ pub enum IpcOp {
         preset: u8,
         /// Policy options.
         options: GrantOptions,
+        /// The password came from the passphrase generator, never set for a chosen one: the
+        /// only way the host learns it (the password never crosses IPC; decision M1-67).
+        generated: bool,
     },
     /// An op tag this build does not know (answered `E_UNKNOWN_KIND`).
     Unknown(u32),
@@ -416,6 +437,8 @@ impl fmt::Debug for IpcOp {
             Self::RegStart {
                 device,
                 reg_request,
+                raise,
+                generated,
             } => f
                 .debug_struct("RegStart")
                 .field("device", device)
@@ -423,6 +446,8 @@ impl fmt::Debug for IpcOp {
                     "reg_request",
                     &format_args!("<{} bytes>", reg_request.len()),
                 )
+                .field("raise", raise)
+                .field("generated", generated)
                 .finish(),
             Self::RegFinish {
                 device,
@@ -430,6 +455,7 @@ impl fmt::Debug for IpcOp {
                 upload,
                 preset,
                 options,
+                generated,
             } => f
                 .debug_struct("RegFinish")
                 .field("device", device)
@@ -437,6 +463,7 @@ impl fmt::Debug for IpcOp {
                 .field("upload", &format_args!("<{} bytes>", upload.len()))
                 .field("preset", preset)
                 .field("options", options)
+                .field("generated", generated)
                 .finish(),
             Self::Unknown(tag) => f.debug_tuple("Unknown").field(tag).finish(),
         }
@@ -542,8 +569,8 @@ fn field_count(op: &IpcOp) -> u64 {
         | IpcOp::BackupExport { .. }
         | IpcOp::BackupImport { .. } => 1,
         IpcOp::Log { after, .. } => 1 + u64::from(after.is_some()),
-        IpcOp::RegStart { .. } => 2,
-        IpcOp::RegFinish { .. } => 5,
+        IpcOp::RegStart { .. } => 4,
+        IpcOp::RegFinish { .. } => 6,
         _ => 0,
     }
 }
@@ -583,10 +610,14 @@ impl<C> Encode<C> for IpcOp {
             Self::RegStart {
                 device,
                 reg_request,
+                raise,
+                generated,
             } => {
                 e.u32(0)?;
                 device.encode(e, ctx)?;
                 e.u32(1)?.bytes(reg_request)?;
+                e.u32(2)?.bool(*raise)?;
+                e.u32(3)?.bool(*generated)?;
             }
             Self::RegFinish {
                 device,
@@ -594,6 +625,7 @@ impl<C> Encode<C> for IpcOp {
                 upload,
                 preset,
                 options,
+                generated,
             } => {
                 e.u32(0)?;
                 device.encode(e, ctx)?;
@@ -602,6 +634,7 @@ impl<C> Encode<C> for IpcOp {
                 e.u32(3)?.u8(*preset)?;
                 e.u32(4)?;
                 options.encode(e, ctx)?;
+                e.u32(5)?.bool(*generated)?;
             }
             _ => {}
         }
@@ -677,6 +710,9 @@ impl<'b, C> Decode<'b, C> for IpcOp {
         let mut upload: Option<[u8; UPLOAD_LEN]> = None;
         let mut preset: Option<u8> = None;
         let mut options: Option<GrantOptions> = None;
+        // `RegStart.raise`, and `generated` of both: absent = false (decision M1-67).
+        let mut raise = false;
+        let mut generated = false;
         match tag {
             0..=2 | 5 | 12 | 13 | 15 | 18 => {
                 d.skip()?;
@@ -721,6 +757,8 @@ impl<'b, C> Decode<'b, C> for IpcOp {
                 match k {
                     0 => device = Some(DeviceId::decode(d, ctx)?),
                     1 => b32 = Some(fixed::<32>(d, "reg_request")?),
+                    2 => raise = d.bool()?,
+                    3 => generated = d.bool()?,
                     _ => d.skip()?,
                 }
                 Ok(())
@@ -732,6 +770,7 @@ impl<'b, C> Decode<'b, C> for IpcOp {
                     2 => upload = Some(fixed::<UPLOAD_LEN>(d, "upload")?),
                     3 => preset = Some(d.u8()?),
                     4 => options = Some(GrantOptions::decode(d, ctx)?),
+                    5 => generated = d.bool()?,
                     _ => d.skip()?,
                 }
                 Ok(())
@@ -787,6 +826,8 @@ impl<'b, C> Decode<'b, C> for IpcOp {
             19 => Self::RegStart {
                 device: device.ok_or_else(|| missing("device"))?,
                 reg_request: b32.ok_or_else(|| missing("reg_request"))?,
+                raise,
+                generated,
             },
             20 => Self::RegFinish {
                 device: device.ok_or_else(|| missing("device"))?,
@@ -794,6 +835,7 @@ impl<'b, C> Decode<'b, C> for IpcOp {
                 upload: upload.ok_or_else(|| missing("upload"))?,
                 preset: preset.ok_or_else(|| missing("preset"))?,
                 options: options.unwrap_or_default(),
+                generated,
             },
             _ => Self::Unknown(tag),
         })
@@ -1215,12 +1257,21 @@ mod tests {
             IpcOp::RegStart {
                 device: dev(7),
                 reg_request: [9; 32],
+                raise: false,
+                generated: false,
+            },
+            IpcOp::RegStart {
+                device: dev(7),
+                reg_request: [9; 32],
+                raise: true,
+                generated: true,
             },
             IpcOp::RegFinish {
                 device: dev(8),
                 reg_txn: [1; 16],
                 upload: [2; UPLOAD_LEN],
                 preset: 2,
+                generated: true,
                 options: GrantOptions {
                     label: Some("Laptop".into()),
                     mode: Some(SessionMode::ViewOnly),
@@ -1233,6 +1284,7 @@ mod tests {
                     expires_at: Some(0),
                     max_session_secs: Some(3600),
                     waive_attended_precondition: true,
+                    elevation: Some(crate::levels::Elevation::Admin),
                     ..GrantOptions::default()
                 },
             },
@@ -1443,6 +1495,7 @@ mod tests {
                 upload: [0xab; UPLOAD_LEN],
                 preset: 0,
                 options: GrantOptions::default(),
+                generated: false,
             },
         };
         let s = format!("{req:?}");
@@ -1454,6 +1507,8 @@ mod tests {
         let start = IpcOp::RegStart {
             device: dev(7),
             reg_request: [0x33; 32],
+            raise: false,
+            generated: false,
         };
         let s = format!("{start:?}");
         assert!(!s.contains("51"), "{s}");
@@ -1584,6 +1639,11 @@ mod tests {
                     lock_on_disconnect: ask,
                     hard_lock_after: hard,
                     waive_attended_precondition: waive,
+                    elevation: match hard.map(|h| h % 3) {
+                        Some(0) => Some(crate::levels::Elevation::Admin),
+                        Some(1) => Some(crate::levels::Elevation::None),
+                        _ => None,
+                    },
                 },
             )
     }
@@ -1610,10 +1670,18 @@ mod tests {
             "[a-z/]{1,40}".prop_map(|path| IpcOp::BackupExport { path }),
             "[a-z/]{1,40}".prop_map(|path| IpcOp::BackupImport { path }),
             Just(IpcOp::PolicyInputs),
-            (arb_device(), any::<[u8; 32]>()).prop_map(|(device, reg_request)| IpcOp::RegStart {
-                device,
-                reg_request
-            }),
+            (
+                arb_device(),
+                any::<[u8; 32]>(),
+                any::<bool>(),
+                any::<bool>()
+            )
+                .prop_map(|(device, reg_request, raise, generated)| IpcOp::RegStart {
+                    device,
+                    reg_request,
+                    raise,
+                    generated,
+                }),
             (
                 arb_device(),
                 any::<[u8; 16]>(),
@@ -1627,6 +1695,8 @@ mod tests {
                         reg_txn,
                         upload: [fill; UPLOAD_LEN],
                         preset,
+                        // `fill`'s low bit: both values drawn without another strategy
+                        generated: fill % 2 == 1,
                         options,
                     }
                 }),

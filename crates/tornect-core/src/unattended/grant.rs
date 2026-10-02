@@ -942,6 +942,17 @@ impl UnattendedGrant {
             }
             self.mode = mode;
         }
+        // The administrator level (r7, §B.8.7.1): raising it widens, lowering it is
+        // deny-direction (decision M1-67). Whether this host may give it at all is the
+        // guard's to decide.
+        if let Some(elevation) = options.elevation
+            && elevation != self.elevation
+        {
+            if elevation == Elevation::Admin {
+                widened.push("elevation");
+            }
+            self.elevation = elevation;
+        }
         if let Some(schedule) = &options.schedule {
             let new = if schedule.is_empty() {
                 None

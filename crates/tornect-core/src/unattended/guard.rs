@@ -26,7 +26,7 @@ use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 use crate::id::DeviceId;
-use crate::levels::FactsSource;
+use crate::levels::{AccountFacts, FactsSource, HelperPresence};
 use crate::session_log::{Actor, SessionEvent, SessionLog, SessionRecord};
 use crate::trusted::TrustedDevices;
 
@@ -37,6 +37,11 @@ use super::grant::{
 use super::ipc::{GrantOptions, codes};
 use super::reach::{self, ReachRefusal};
 use super::store::{GrantStore, State, StoreError, StoreStatus, WriteClass, push_tombstone};
+
+/// Why *enable* refuses a grant at the administrator level whose password is marked
+/// (`G_NEEDS_PASSWORD`; decision M1-67).
+const MARKED_ADMIN_ENABLE: &str = "this grant holds administrator access and its password may be \
+    kept elsewhere: give it a new generated password (Change password) before enabling it";
 
 /// A remote session must have ended at least this long ago (§B.8.6.2).
 pub const REMOTE_SESSION_COOLDOWN: Duration = Duration::from_secs(60);
@@ -64,6 +69,15 @@ pub enum ReAuthError {
 pub trait ReAuth: Send + Sync {
     /// Prove the OS user is present and knows the OS credential.
     fn reauthenticate(&self, op: &str) -> Result<(), ReAuthError>;
+
+    /// The same for a registration that gives the device labelled `device` administrator
+    /// access, or reach to it (decision M1-67, D3): the dialog says "give `<device>`
+    /// ADMINISTRATOR access to this computer, with a new password" where it can show a
+    /// sentence (Windows). The default asks as the operation `raise`.
+    fn reauthenticate_raise(&self, device: &str) -> Result<(), ReAuthError> {
+        let _ = device;
+        self.reauthenticate("raise")
+    }
 }
 
 /// Whether a remote session is live or recently ended.
@@ -332,6 +346,14 @@ pub enum GuardError {
     /// `G_NO_TXN`.
     #[error("no live registration transaction")]
     NoTxn,
+    /// `G_UNSUPPORTED`: the administrator level where this host cannot give it; the
+    /// detail says why (§B.8.7.4).
+    #[error("{0}")]
+    Unsupported(String),
+    /// `G_NEEDS_PASSWORD`: a change that needs a new generated password, or a
+    /// `RegFinish` that does not match its `RegStart` (decision M1-67).
+    #[error("{0}")]
+    NeedsPassword(String),
     /// Any other store failure (`G_PRECONDITION`).
     #[error(transparent)]
     Store(StoreError),
@@ -348,6 +370,8 @@ impl GuardError {
             Self::KeystoreLocked(_) => codes::G_KEYSTORE_LOCKED,
             Self::StoreLocked(_) => codes::G_STORE_LOCKED,
             Self::NoTxn => codes::G_NO_TXN,
+            Self::Unsupported(_) => codes::G_UNSUPPORTED,
+            Self::NeedsPassword(_) => codes::G_NEEDS_PASSWORD,
         }
     }
 }
@@ -371,6 +395,8 @@ impl From<StoreError> for GuardError {
             StoreError::Options(e) => Self::Precondition(e.to_string()),
             StoreError::Invalid(m) => Self::Precondition(m),
             StoreError::RemoteSessionActive => Self::RemoteSessionActive,
+            StoreError::NeedsPassword(m) => Self::NeedsPassword(m),
+            StoreError::Unsupported(m) => Self::Unsupported(m),
             other => Self::Store(other),
         }
     }
@@ -630,6 +656,10 @@ struct TxnEntry {
     txn: Zeroizing<[u8; 16]>,
     device: DeviceId,
     created: Instant,
+    /// The `RegStart` declared a raise (decision M1-67).
+    raise: bool,
+    /// The `RegStart` declared a generated password.
+    generated: bool,
 }
 
 /// The mutation guard (§B.8.6.2).
@@ -755,8 +785,24 @@ impl MutationGuard {
         by: Actor,
         device: Option<&DeviceId>,
     ) -> Result<(), GuardError> {
+        self.access_increasing_raising(op, by, device, None)
+    }
+
+    /// [`Self::access_increasing`], whose dialog, for a registration that gives the device
+    /// labelled `raise` administrator access or reach to it, says so (decision M1-67).
+    fn access_increasing_raising(
+        &self,
+        op: &str,
+        by: Actor,
+        device: Option<&DeviceId>,
+        raise: Option<&str>,
+    ) -> Result<(), GuardError> {
         self.no_remote_session(op, by, device)?;
-        if let Err(e) = self.reauth.reauthenticate(op) {
+        let dialog = match raise {
+            Some(label) => self.reauth.reauthenticate_raise(label),
+            None => self.reauth.reauthenticate(op),
+        };
+        if let Err(e) = dialog {
             return Err(self.refuse(op, Some(by), device, GuardError::ReauthFailed(e)));
         }
         self.no_remote_session(op, by, device)
@@ -1185,6 +1231,14 @@ impl MutationGuard {
             }
             GrantState::Disabled { .. } => {}
         }
+        if existing.holds_level() && existing.marked() {
+            return Err(self.refuse(
+                "enable",
+                Some(by),
+                Some(device),
+                GuardError::NeedsPassword(MARKED_ADMIN_ENABLE.into()),
+            ));
+        }
         let rec = SessionRecord::at(self.now(), SessionEvent::GrantEnabled)
             .by(by)
             .device(*device)
@@ -1192,6 +1246,12 @@ impl MutationGuard {
         self.store
             .update_grant(device, &rec, |g, _| {
                 self.no_session_at_commit()?;
+                // A grant at the level whose password is marked is enabled only once a new
+                // generated password cleared the mark, whatever disabled it (decision
+                // M1-67, D3, D9; checked again on the locked grant).
+                if g.holds_level() && g.marked() {
+                    return Err(StoreError::NeedsPassword(MARKED_ADMIN_ENABLE.into()));
+                }
                 match g.state {
                     GrantState::Disabled { .. } => g.state = GrantState::Active,
                     GrantState::Active => {}
@@ -1344,6 +1404,8 @@ impl MutationGuard {
         file_keystore: bool,
         reauthed: bool,
     ) -> Result<bool, GuardError> {
+        // The facts a raise is judged on, read before the lock (decision M1-67).
+        let facts = (self.facts.account(), self.facts.helper_task());
         let mut st = self.store.state();
         if st.status != StoreStatus::Loaded {
             return Err(StoreError::NotLoaded(st.status.clone()).into());
@@ -1366,6 +1428,41 @@ impl MutationGuard {
                 return Err(e.into());
             }
         };
+        // A raise of the grant's own reach (the level, or control where it reaches the
+        // level) comes only with a new generated password, never through `set_options`
+        // (decision M1-67, D3): refused before any dialog, nothing changed. The level where
+        // this host cannot give it at all is `G_UNSUPPORTED`.
+        let (account, helper_task) = facts;
+        let refusal = match (
+            before.grant(device),
+            st.store
+                .as_ref()
+                .and_then(|s| s.grant(device).map(|g| (s, g))),
+        ) {
+            (Some(old), Some((store, new))) => {
+                if new.holds_level()
+                    && !old.holds_level()
+                    && let Some(why) = Self::level_unsupported(account, new.preset)
+                {
+                    Some(GuardError::Unsupported(why.to_owned()))
+                } else if reach::own_reach(store, new, account, helper_task)
+                    > reach::own_reach(&before, old, account, helper_task)
+                {
+                    Some(GuardError::NeedsPassword(
+                        "this change gives the grant administrator reach: it needs a new \
+                         generated password (Change password)"
+                            .into(),
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(e) = refusal {
+            st.store = Some(before);
+            return Err(e);
+        }
         if !widened.is_empty() {
             if !reauthed {
                 st.store = Some(before);
@@ -1481,14 +1578,104 @@ impl MutationGuard {
 
     // ------------------------------------------------------------ registration
 
+    /// Why this host cannot give `preset`'s grant the administrator level, if it cannot
+    /// (`G_UNSUPPORTED`, §B.8.7.4; the detail says why): Linux, a *Helping someone*
+    /// grant, account facts that could not be read, a copy outside Program Files, a
+    /// standard account.
+    fn level_unsupported(account: AccountFacts, preset: Preset) -> Option<&'static str> {
+        use crate::levels::{
+            REFUSAL_ADMIN_HELPING_SOMEONE, REFUSAL_ADMIN_LINUX, REFUSAL_ADMIN_STANDALONE,
+            REFUSAL_ADMIN_STANDARD_ACCOUNT, REFUSAL_ADMIN_UNREADABLE,
+        };
+        match account {
+            AccountFacts::Linux => Some(REFUSAL_ADMIN_LINUX),
+            _ if preset == Preset::HelpingSomeone => Some(REFUSAL_ADMIN_HELPING_SOMEONE),
+            AccountFacts::Unreadable => Some(REFUSAL_ADMIN_UNREADABLE),
+            AccountFacts::Windows(f) if !f.installed => Some(REFUSAL_ADMIN_STANDALONE),
+            AccountFacts::Windows(f) if !f.administrator => Some(REFUSAL_ADMIN_STANDARD_ACCOUNT),
+            AccountFacts::Windows(_) => None,
+        }
+    }
+
+    /// How a registration (creation or set-password) of `device` with `preset` and
+    /// `options` changes the grant's own reach, judged on the store as it is now and on
+    /// `account` / `helper_task` (decision M1-67, D3): `G_UNSUPPORTED` when it would give
+    /// the level where this host cannot; otherwise whether it creates a grant with reach
+    /// or raises one (the dialog then names administrator access). Decided again under
+    /// the lock of the commit.
+    fn registration_raises(
+        &self,
+        device: &DeviceId,
+        preset: Preset,
+        options: &GrantOptions,
+        account: AccountFacts,
+        helper_task: HelperPresence,
+    ) -> Result<bool, GuardError> {
+        let now = self.now();
+        let file_keystore = self.store.keystore_kind().is_file();
+        let judged = self.store.read(|s| {
+            let before = s.grant(device).cloned();
+            let mut after = match &before {
+                Some(g) => g.clone(),
+                None => {
+                    let auth = AuthRecord::Opaque {
+                        record: Zeroizing::new(Vec::new()),
+                    };
+                    UnattendedGrant::from_preset(
+                        [0; 8],
+                        *device,
+                        "probe",
+                        Actor::Ui,
+                        preset,
+                        1,
+                        auth,
+                        now,
+                    )
+                    .map_err(|e| GuardError::Precondition(e.to_string()))?
+                }
+            };
+            after
+                .apply_options(options, now, file_keystore)
+                .map_err(|e| GuardError::Precondition(e.to_string()))?;
+            let gains_level =
+                after.holds_level() && before.as_ref().is_none_or(|g| !g.holds_level());
+            if gains_level && let Some(why) = Self::level_unsupported(account, after.preset) {
+                return Err(GuardError::Unsupported(why.to_owned()));
+            }
+            let reach_before = before
+                .as_ref()
+                .map_or(0, |g| reach::own_reach(s, g, account, helper_task));
+            Ok(reach::own_reach(s, &after, account, helper_task) > reach_before)
+        });
+        judged.unwrap_or(Ok(false))
+    }
+
     /// `RegStart` (§B.8.7.4): re-auth here; returns a single-use `reg_txn` (≤ 120 s,
     /// bound to `device`) and the `ServerSetup` bytes (bootstrapping the store first if
-    /// unattended access was never enabled).
-    pub fn reg_start(&self, by: Actor, device: &DeviceId) -> Result<RegStartOk, GuardError> {
+    /// unattended access was never enabled). `raise` (the registration creates a grant
+    /// whose `grant_reach` is not 0, or raises one) and `generated` are kept with the
+    /// transaction; a raising `RegStart` asks with its own wording, naming administrator
+    /// access and the device (decision M1-67, D3). No registration raises on Linux.
+    pub fn reg_start(
+        &self,
+        by: Actor,
+        device: &DeviceId,
+        raise: bool,
+        generated: bool,
+    ) -> Result<RegStartOk, GuardError> {
+        let op = "reg_start";
         // Cheap preconditions first: no dialog for a device that can never get a grant.
-        self.require_paired("reg_start", by, device)?;
-        self.access_increasing("reg_start", by, Some(device))?;
-        self.bootstrap_if_needed("reg_start", by)?;
+        let label = self.require_paired(op, by, device)?;
+        if raise && self.facts.account() == AccountFacts::Linux {
+            return Err(self.refuse(
+                op,
+                Some(by),
+                Some(device),
+                GuardError::Unsupported(crate::levels::REFUSAL_ADMIN_LINUX.to_owned()),
+            ));
+        }
+        self.access_increasing_raising(op, by, Some(device), raise.then_some(label.as_str()))?;
+        self.bootstrap_if_needed(op, by)?;
         let server_setup = self
             .store
             .server_setup()
@@ -1503,6 +1690,8 @@ impl MutationGuard {
             txn: txn.clone(),
             device: *device,
             created: now,
+            raise,
+            generated,
         });
         Ok(RegStartOk {
             reg_txn: txn,
@@ -1510,25 +1699,26 @@ impl MutationGuard {
         })
     }
 
-    fn take_txn(&self, device: &DeviceId, txn: &[u8; 16]) -> bool {
+    /// The live transaction `txn` of `device`, consumed: its `raise` and `generated`.
+    fn take_txn(&self, device: &DeviceId, txn: &[u8; 16]) -> Option<(bool, bool)> {
         let now = Instant::now();
         let mut txns = self.txns.lock();
         txns.retain(|t| now.duration_since(t.created) < REG_TXN_TTL);
         let pos = txns.iter().position(|t| {
             bool::from(subtle::ConstantTimeEq::ct_eq(&t.txn[..], &txn[..])) && t.device == *device
-        });
-        match pos {
-            Some(i) => {
-                txns.remove(i);
-                true
-            }
-            None => false,
-        }
+        })?;
+        let entry = txns.remove(pos);
+        Some((entry.raise, entry.generated))
     }
 
     /// `RegFinish` (§B.8.7.4): needs the live `reg_txn` (consumed), re-checks
     /// [`RemoteSessionActivity`], then creates the grant (no grant yet) or replaces its
-    /// auth record (set-password; `options` may not widen — use [`Self::set_options`]).
+    /// auth record (set-password). `generated` must be what its `RegStart` declared, and a
+    /// finish that creates a grant with reach or raises one needs a raising `RegStart`
+    /// (`G_NEEDS_PASSWORD` otherwise; decision M1-67). The options of a set-password may
+    /// carry exactly a raise, and only with `generated`; any other widening goes through
+    /// [`Self::set_options`].
+    #[allow(clippy::too_many_arguments)]
     pub fn reg_finish(
         &self,
         by: Actor,
@@ -1537,22 +1727,31 @@ impl MutationGuard {
         upload: &[u8],
         preset: Preset,
         options: &GrantOptions,
+        generated: bool,
     ) -> Result<RegFinishOutcome, GuardError> {
-        if !self.take_txn(device, reg_txn) {
-            return Err(self.refuse("reg_finish", Some(by), Some(device), GuardError::NoTxn));
-        }
+        let op = "reg_finish";
+        let Some((raise, declared_generated)) = self.take_txn(device, reg_txn) else {
+            return Err(self.refuse(op, Some(by), Some(device), GuardError::NoTxn));
+        };
         if self.remote_session_blocks() {
+            return Err(self.refuse(op, Some(by), Some(device), GuardError::RemoteSessionActive));
+        }
+        if generated != declared_generated {
             return Err(self.refuse(
-                "reg_finish",
+                op,
                 Some(by),
                 Some(device),
-                GuardError::RemoteSessionActive,
+                GuardError::NeedsPassword(
+                    "this registration's password is not what its RegStart declared".into(),
+                ),
             ));
         }
-        self.apply_registration(by, device, upload, preset, options)
+        self.apply_registration(by, device, upload, preset, options, generated, Some(raise))
     }
 
     /// One-operation grant creation (UI path): re-auth inline, then the registration.
+    /// `generated`: the password came from the passphrase generator. A creation with
+    /// reach asks with the raising wording, and needs `generated` (decision M1-67).
     pub fn create_grant(
         &self,
         by: Actor,
@@ -1560,46 +1759,84 @@ impl MutationGuard {
         preset: Preset,
         options: &GrantOptions,
         upload: &[u8],
+        generated: bool,
     ) -> Result<GrantId, GuardError> {
-        self.require_paired("create_grant", by, device)?;
-        self.access_increasing("create_grant", by, Some(device))?;
-        self.bootstrap_if_needed("create_grant", by)?;
-        self.no_remote_session("create_grant", by, Some(device))?;
+        let op = "create_grant";
+        let label = self.require_paired(op, by, device)?;
+        let raising = self
+            .registration_raises(
+                device,
+                preset,
+                options,
+                self.facts.account(),
+                self.facts.helper_task(),
+            )
+            .map_err(|e| self.refuse(op, Some(by), Some(device), e))?;
+        self.access_increasing_raising(op, by, Some(device), raising.then_some(label.as_str()))?;
+        self.bootstrap_if_needed(op, by)?;
+        self.no_remote_session(op, by, Some(device))?;
         if self.store.grant(device).is_some() {
             return Err(self.refuse(
-                "create_grant",
+                op,
                 Some(by),
                 Some(device),
                 GuardError::from(StoreError::GrantExists),
             ));
         }
-        match self.apply_registration(by, device, upload, preset, options)? {
+        match self.apply_registration(by, device, upload, preset, options, generated, None)? {
             RegFinishOutcome::Created(id) | RegFinishOutcome::PasswordSet(id) => Ok(id),
         }
     }
 
     /// One-operation password change (UI path): re-auth inline, then the registration.
+    /// `options` may carry exactly a raise (the level, or control where it reaches the
+    /// level), applied in the write that replaces `auth`, and only with `generated`; such
+    /// a change asks with the raising wording (decision M1-67, D3).
     pub fn set_password(
         &self,
         by: Actor,
         device: &DeviceId,
         upload: &[u8],
+        options: &GrantOptions,
+        generated: bool,
     ) -> Result<GrantId, GuardError> {
-        self.access_increasing("set_password", by, Some(device))?;
-        self.require_loaded("set_password", Some(by), Some(device))?;
-        let preset = self.store.grant(device).map(|g| g.preset).ok_or_else(|| {
-            self.refuse(
-                "set_password",
-                Some(by),
-                Some(device),
-                GuardError::from(StoreError::NoGrant),
+        let op = "set_password";
+        self.require_loaded(op, Some(by), Some(device))?;
+        let (preset, label) = self
+            .store
+            .grant(device)
+            .map(|g| (g.preset, g.label))
+            .ok_or_else(|| {
+                self.refuse(
+                    op,
+                    Some(by),
+                    Some(device),
+                    GuardError::from(StoreError::NoGrant),
+                )
+            })?;
+        let raising = self
+            .registration_raises(
+                device,
+                preset,
+                options,
+                self.facts.account(),
+                self.facts.helper_task(),
             )
-        })?;
-        match self.apply_registration(by, device, upload, preset, &GrantOptions::default())? {
+            .map_err(|e| self.refuse(op, Some(by), Some(device), e))?;
+        self.access_increasing_raising(op, by, Some(device), raising.then_some(label.as_str()))?;
+        self.require_loaded(op, Some(by), Some(device))?;
+        match self.apply_registration(by, device, upload, preset, options, generated, None)? {
             RegFinishOutcome::Created(id) | RegFinishOutcome::PasswordSet(id) => Ok(id),
         }
     }
 
+    /// The registration both paths share. `declared_raise`: what a `RegStart` declared
+    /// (`None` on the window's paths, which re-authenticated with the right wording
+    /// themselves). Decided under the lock of the commit (decision M1-67, D3, D4, D9): the
+    /// level where this host cannot give it ⇒ `G_UNSUPPORTED`; a creation with reach or a
+    /// raise without `generated`, or not declared at its `RegStart` ⇒ `G_NEEDS_PASSWORD`,
+    /// nothing written; the new password is unmarked exactly when it is `generated`.
+    #[allow(clippy::too_many_arguments)]
     fn apply_registration(
         &self,
         by: Actor,
@@ -1607,6 +1844,8 @@ impl MutationGuard {
         upload: &[u8],
         preset: Preset,
         options: &GrantOptions,
+        generated: bool,
+        declared_raise: Option<bool>,
     ) -> Result<RegFinishOutcome, GuardError> {
         let op = "reg_finish";
         self.require_loaded(op, Some(by), Some(device))?;
@@ -1624,13 +1863,33 @@ impl MutationGuard {
                 )),
             ));
         }
+        let account = self.facts.account();
+        let helper_task = self.facts.helper_task();
+        // What a raise or a creation with reach needs, judged on the locked store.
+        let raise_rule = |raises: bool| -> Result<(), StoreError> {
+            if raises && !generated {
+                return Err(StoreError::NeedsPassword(
+                    "a grant whose password can reach administrator access needs a new generated \
+                     password"
+                        .into(),
+                ));
+            }
+            if raises && declared_raise == Some(false) {
+                return Err(StoreError::NeedsPassword(
+                    "this registration gives the grant administrator reach, but its RegStart did \
+                     not say so"
+                        .into(),
+                ));
+            }
+            Ok(())
+        };
         let auth = AuthRecord::Opaque {
             record: Zeroizing::new(upload.to_vec()),
         };
         let now = self.now();
         let file_keystore = self.store.keystore_kind().is_file();
         if let Some(existing) = self.store.grant(device) {
-            // set-password: replace the record; options may not widen
+            // set-password: replace the record; options may carry exactly a raise
             let mut probe = existing.clone();
             let widened = probe
                 .apply_options(options, now, file_keystore)
@@ -1642,14 +1901,22 @@ impl MutationGuard {
                         GuardError::Precondition(e.to_string()),
                     )
                 })?;
-            if !widened.is_empty() {
+            let raises = self
+                .registration_raises(device, preset, options, account, helper_task)
+                .map_err(|e| self.refuse(op, Some(by), Some(device), e))?;
+            let other: Vec<&str> = widened
+                .iter()
+                .copied()
+                .filter(|w| !(raises && matches!(*w, "elevation" | "mode")))
+                .collect();
+            if !other.is_empty() {
                 return Err(self.refuse(
                     op,
                     Some(by),
                     Some(device),
                     GuardError::Precondition(format!(
                         "options widen the grant ({}); use set_options",
-                        widened.join(",")
+                        other.join(",")
                     )),
                 ));
             }
@@ -1658,19 +1925,41 @@ impl MutationGuard {
                 .device(*device)
                 .grant(&existing.id);
             self.store
-                .update_grant(device, &rec, |g, now| {
+                .mutate(WriteClass::Policy, Some(&rec), |s, now| {
                     self.no_session_at_commit()?;
-                    // classified again on the locked grant: a concurrent narrowing must
-                    // not turn these options into a widening that lands here
-                    let widened = g.apply_options(options, now, file_keystore)?;
-                    if !widened.is_empty() {
+                    let Some(before) = s.grant(device).cloned() else {
+                        return Err(StoreError::NoGrant);
+                    };
+                    let mut after = before.clone();
+                    // classified again on the locked grant: a concurrent change must not
+                    // turn these options into a widening, or a raise, that lands here
+                    let widened = after.apply_options(options, now, file_keystore)?;
+                    let raises = reach::own_reach(s, &after, account, helper_task)
+                        > reach::own_reach(s, &before, account, helper_task);
+                    if after.holds_level()
+                        && !before.holds_level()
+                        && let Some(why) = Self::level_unsupported(account, after.preset)
+                    {
+                        return Err(StoreError::Unsupported(why.to_owned()));
+                    }
+                    let other: Vec<&str> = widened
+                        .iter()
+                        .copied()
+                        .filter(|w| !(raises && matches!(*w, "elevation" | "mode")))
+                        .collect();
+                    if !other.is_empty() {
                         return Err(StoreError::Invalid(format!(
                             "options widen the grant ({}); use set_options",
-                            widened.join(",")
+                            other.join(",")
                         )));
                     }
-                    g.auth = auth;
-                    g.suite = 1;
+                    raise_rule(raises)?;
+                    after.auth = auth;
+                    after.suite = 1;
+                    // Only a password sent as generated clears the mark (D9, D11).
+                    after.unmarked = generated;
+                    let g = s.grant_mut(device).ok_or(StoreError::NoGrant)?;
+                    *g = after;
                     Ok(())
                 })
                 .map_err(|e| self.refuse(op, Some(by), Some(device), GuardError::from(e)))?;
@@ -1722,6 +2011,18 @@ impl MutationGuard {
                     GuardError::Precondition(e.to_string()),
                 )
             })?;
+        if grant.holds_level()
+            && let Some(why) = Self::level_unsupported(account, preset)
+        {
+            return Err(self.refuse(
+                op,
+                Some(by),
+                Some(device),
+                GuardError::Unsupported(why.to_owned()),
+            ));
+        }
+        // Only a password sent as generated is unmarked (D9, D11).
+        grant.unmarked = generated;
         let mut rec = SessionRecord::at(now, SessionEvent::GrantCreated)
             .by(by)
             .device(*device)
@@ -1731,15 +2032,25 @@ impl MutationGuard {
             rec = rec.reason("attended precondition waived");
         }
         let keep_awake = preset.defaults().keep_awake;
+        let candidate = grant.clone();
         self.store
             .insert_grant(grant, &rec, |s| {
                 self.no_session_at_commit()?;
+                // A creation with reach (the level, or control where clause (ii) holds)
+                // needs a generated password, decided on the locked store (DA-18, ND-3).
+                raise_rule(reach::own_reach(s, &candidate, account, helper_task) > 0)?;
                 if keep_awake {
                     s.keep_awake = true;
                 }
                 Ok(())
             })
-            .map_err(|e| self.refused_at_commit(op, by, Some(device), e))?;
+            .map_err(|e| match e {
+                StoreError::RemoteSessionActive => self.refused_at_commit(op, by, Some(device), e),
+                StoreError::NeedsPassword(_) | StoreError::Unsupported(_) => {
+                    self.refuse(op, Some(by), Some(device), GuardError::from(e))
+                }
+                other => other.into(),
+            })?;
         if let Err(e) = self.store.log_event(
             &SessionRecord::at(now, SessionEvent::PasswordSet)
                 .by(by)

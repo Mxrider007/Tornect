@@ -349,6 +349,7 @@ async fn unattended_session_end_to_end_over_a_duplex_pipe() {
             Preset::HeadlessBox,
             &GrantOptions::default(),
             &[0u8; 192],
+            false,
         )
         .unwrap();
     let setup_bytes = guard.store().server_setup().unwrap();
@@ -360,7 +361,15 @@ async fn unattended_session_end_to_end_over_a_duplex_pipe() {
         auth::identifiers(device.public_key_bytes(), &host_onion_pk),
     )
     .unwrap();
-    guard.set_password(Actor::Cli, &device, &record).unwrap();
+    guard
+        .set_password(
+            Actor::Cli,
+            &device,
+            &record,
+            &GrantOptions::default(),
+            false,
+        )
+        .unwrap();
 
     let mut host = host;
     host.deps.unattended = Arc::new(UnattendedAuth::new(
@@ -5114,14 +5123,23 @@ fn unattended_pair_with(
         SessionLog::new(paths.sessions_log()),
     )
     .unwrap();
+    // The grant is set up as the command line would on a host where nothing reaches the
+    // level; the host itself, and its admin path, run on `facts`.
     let guard = MutationGuard::new(
+        store.clone(),
+        Arc::new(AllowAllReAuth::default()),
+        Arc::new(NoSessionActivity),
+        Arc::new(tornect_core::levels::FixedFacts::linux()),
+    )
+    .with_paired_devices(Arc::new(AllowAllPaired))
+    .with_server_setup_source(Arc::new(OpaqueServerSetupSource));
+    let admin_guard = MutationGuard::new(
         store,
         Arc::new(AllowAllReAuth::default()),
         Arc::new(NoSessionActivity),
         Arc::clone(&facts),
     )
-    .with_paired_devices(Arc::new(AllowAllPaired))
-    .with_server_setup_source(Arc::new(OpaqueServerSetupSource));
+    .with_paired_devices(Arc::new(AllowAllPaired));
     guard.master_on(Actor::Cli, &host_onion_pk).unwrap();
     guard
         .create_grant(
@@ -5130,6 +5148,7 @@ fn unattended_pair_with(
             Preset::HeadlessBox,
             &GrantOptions::default(),
             &[0u8; 192],
+            false,
         )
         .unwrap();
     let setup = auth::parse_server_setup(&guard.store().server_setup().unwrap()).unwrap();
@@ -5140,7 +5159,15 @@ fn unattended_pair_with(
         auth::identifiers(device.public_key_bytes(), &host_onion_pk),
     )
     .unwrap();
-    guard.set_password(Actor::Cli, &device, &record).unwrap();
+    guard
+        .set_password(
+            Actor::Cli,
+            &device,
+            &record,
+            &GrantOptions::default(),
+            false,
+        )
+        .unwrap();
     let limiter = AttemptLimiter::new(guard.store().clone());
     host.deps.unattended = Arc::new(
         UnattendedAuth::new(
@@ -5149,7 +5176,7 @@ fn unattended_pair_with(
             HostTransport::default(),
             facts,
         )
-        .with_admin_authority(Arc::new(GuardAdmin::new(Arc::new(guard)))),
+        .with_admin_authority(Arc::new(GuardAdmin::new(Arc::new(admin_guard)))),
     );
     (host, client)
 }
@@ -6343,7 +6370,7 @@ fn unattended_pair_edited(
         .unwrap();
     let paths = Paths::from_home(tmp.join("host-home"));
     std::fs::create_dir_all(paths.keys_dir()).unwrap();
-    let open = || {
+    let open = |facts: Arc<dyn tornect_core::levels::FactsSource>| {
         let secrets = Arc::new(FileSecretStore::open(paths.keys_dir()).unwrap());
         let store = GrantStore::open(
             &paths,
@@ -6356,12 +6383,14 @@ fn unattended_pair_edited(
             store,
             Arc::new(AllowAllReAuth::default()),
             Arc::new(NoSessionActivity),
-            Arc::clone(&facts),
+            facts,
         )
         .with_paired_devices(Arc::new(AllowAllPaired))
         .with_server_setup_source(Arc::new(OpaqueServerSetupSource))
     };
-    let guard = open();
+    // Set up as the command line would on a host where nothing reaches the level; the
+    // host itself, and its guard, then run on `facts`.
+    let guard = open(Arc::new(tornect_core::levels::FixedFacts::linux()));
     guard.master_on(Actor::Cli, &host_onion_pk).unwrap();
     guard
         .create_grant(
@@ -6370,6 +6399,7 @@ fn unattended_pair_edited(
             Preset::HeadlessBox,
             &GrantOptions::default(),
             &[0u8; 192],
+            false,
         )
         .unwrap();
     let setup = auth::parse_server_setup(&guard.store().server_setup().unwrap()).unwrap();
@@ -6380,10 +6410,18 @@ fn unattended_pair_edited(
         auth::identifiers(device.public_key_bytes(), &host_onion_pk),
     )
     .unwrap();
-    guard.set_password(Actor::Cli, &device, &record).unwrap();
+    guard
+        .set_password(
+            Actor::Cli,
+            &device,
+            &record,
+            &GrantOptions::default(),
+            false,
+        )
+        .unwrap();
     drop(guard);
     edit_grant_on_disk(&paths, &device, edit);
-    let guard = Arc::new(open());
+    let guard = Arc::new(open(Arc::clone(&facts)));
     let limiter = AttemptLimiter::new(guard.store().clone());
     host.deps.unattended = Arc::new(
         UnattendedAuth::new(
@@ -6623,12 +6661,16 @@ impl crate::consent::BlockWindow for NewPasswordDuringTheWindow {
         _: &'a tornect_core::unattended::grant::GrantId,
         _: &'a str,
     ) -> BoxFuture<'a, BlockOutcome> {
+        use tornect_core::unattended::ipc::GrantOptions;
         Box::pin(async move {
             self.guard
                 .set_password(
                     tornect_core::session_log::Actor::Ui,
                     &self.device,
                     &self.record,
+                    &GrantOptions::default(),
+                    // a generated Change password (A25 (h): the new password unmarked)
+                    true,
                 )
                 .unwrap();
             BlockOutcome::Passed(WindowPassed::Elapsed)
