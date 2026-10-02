@@ -158,12 +158,17 @@ permission bits and folder names, not access lists.
   access (`service install` and `uninstall`, `unattended on`, `grant`): Tornect
   refuses them. `service install` refuses a `tornect.exe`
   outside your user folder or `C:\Program Files`, where another account could
-  replace it. `--elevated` (an administrator account only, `tornect.exe` under
-  `C:\Program Files`) registers it to run elevated, after a UAC prompt: then
-  **every remote Control session is an administrator session**. A standard
-  account is refused `--elevated`: approved with an administrator's password,
-  the task would be the administrator's, and you could neither read nor remove
-  it. A `--home` or
+  replace it. The task never runs elevated (one that an earlier version
+  registered elevated is removed first, through Windows' prompt).
+  Administrator access is given per session, by a separate helper that
+  Windows starts with its own prompt, and this build keeps that helper
+  switched off. On an administrator account set to elevate without
+  prompting, a session with control could make itself administrator
+  unasked, so this build shares View only there. Where User Account Control
+  is off, every program runs as administrator: a session with control is
+  then administrator access, offered only as "Allow as administrator" after
+  Tornect's own confirmation (a copy not under `C:\Program Files` offers View
+  only there). A `--home` or
   `TORNECT_HOME` directory is refused on Windows. Stop a running host (Ctrl-C in
   its window) before `tornect service uninstall`; `schtasks /Delete /TN Tornect
   /F` also removes it. Not yet tried on Windows.
