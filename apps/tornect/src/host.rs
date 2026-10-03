@@ -637,8 +637,9 @@ impl HostWiring {
     }
 }
 
-/// What `tornect host` says at start when stdin is not a terminal (the systemd
-/// user unit of `tornect service install`, a pipe, a script).
+/// What `tornect host` says at start when stdin is not a terminal (a pipe, a
+/// script, or the systemd user unit that `tornect service install` of earlier
+/// versions registered; today's start at login is the window, §B.1.1).
 pub(crate) const NO_TERMINAL_LINE: &str = "warning: stdin is not a terminal, so this host answers \
      pings only: every pairing, session and unattended request is refused, because nothing here \
      can ask you or show you a session (run `tornect host` in a terminal to answer them)";
