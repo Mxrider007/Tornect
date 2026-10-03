@@ -1064,8 +1064,10 @@ impl XdgAutostart {
         }
     }
 
-    /// The same backend with `check` as the executable's location rule (the
-    /// tests' executables live in temporary folders).
+    /// The same backend with `check` as the executable's location rule, for
+    /// this crate's tests only (their executables live in temporary
+    /// folders): nothing else can build the backend without the rule.
+    #[cfg(test)]
     #[must_use]
     pub fn with_exe_check(mut self, check: fn(&Path) -> Result<(), AutostartError>) -> Self {
         self.exe_check = check;
@@ -4066,6 +4068,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The location rule of decision M1-53 (4)(i) is the backend's own: an
+    /// `XdgAutostart` built as production builds it runs it, and only this
+    /// crate's tests can replace it. An executable in a temporary folder
+    /// under `/tmp`, which every account can change, is refused by
+    /// `preflight` and by `install`, and no entry is written.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_real_location_rule_refuses_an_executable_in_a_temporary_folder() {
+        let shared = tempfile::Builder::new()
+            .prefix("tornect-location-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let exe = shared.path().join("tornect");
+        std::fs::write(&exe, b"not run").unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let older = Arc::new(FakeOlder::default());
+        let entry = XdgAutostart::for_config_home(
+            config.path(),
+            LaunchSpec {
+                exe: exe.clone(),
+                home: None,
+            },
+            Arc::clone(&older) as Arc<dyn Autostart>,
+        );
+        for answer in [entry.preflight(false), entry.install(false).map(drop)] {
+            match answer {
+                Err(AutostartError::Unavailable(why)) => {
+                    assert!(why.contains("can be changed by every account"), "{why}");
+                }
+                other => panic!("{} accepted: {other:?}", exe.display()),
+            }
+        }
+        assert!(!entry.entry_path().exists(), "an entry was written");
     }
 
     /// §B.1.1: nothing registers the headless host at sign-in any more: the
