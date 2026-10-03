@@ -24,7 +24,7 @@ use tokio::time::Instant;
 use tornect_core::DeviceId;
 use tornect_core::levels::{AdminPath, Answers, Availability, Elevation, Level};
 use tornect_core::session_log::SessionMode;
-use tornect_core::unattended::guard::{AdminEffect, EndScope, RemoteSessionActivity};
+use tornect_core::unattended::guard::{AdminEffect, EndReason, EndScope, RemoteSessionActivity};
 use zeroize::Zeroizing;
 
 use super::{
@@ -304,11 +304,14 @@ struct KillState {
     devices: std::collections::HashMap<DeviceId, DeviceEnds>,
 }
 
-/// One device's count of ends, per [`EndScope`].
+/// One device's count of ends, per [`EndScope`], with the `BYE` reason of the latest of
+/// each.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DeviceEnds {
     every: u64,
     at_the_level: u64,
+    every_reason: u16,
+    at_the_level_reason: u16,
 }
 
 impl KillState {
@@ -350,11 +353,24 @@ impl KillSwitch {
     /// Every other session goes on (decision M1-67, D6). A session that starts watching
     /// after this call is unaffected.
     pub fn end_device(&self, device: &DeviceId, scope: EndScope) {
+        self.end_device_with(device, scope, messages::bye::REVOKED);
+    }
+
+    /// [`Self::end_device`] with the [`messages::bye`] reason of the change (§B.8.6.1):
+    /// `REVOKED` for a revoke, a disable, an unpair or a lowering, `SUSPENDED` for a
+    /// suspend, `PANIC` for the panic key's.
+    pub fn end_device_with(&self, device: &DeviceId, scope: EndScope, reason: u16) {
         self.tx.send_modify(|state| {
             let ends = state.devices.entry(*device).or_default();
             match scope {
-                EndScope::Every => ends.every = ends.every.wrapping_add(1),
-                EndScope::AtTheLevel => ends.at_the_level = ends.at_the_level.wrapping_add(1),
+                EndScope::Every => {
+                    ends.every = ends.every.wrapping_add(1);
+                    ends.every_reason = reason;
+                }
+                EndScope::AtTheLevel => {
+                    ends.at_the_level = ends.at_the_level.wrapping_add(1);
+                    ends.at_the_level_reason = reason;
+                }
             }
         });
     }
@@ -383,6 +399,15 @@ impl KillSwitch {
 impl tornect_core::unattended::guard::DeviceSessionEnd for KillSwitch {
     fn end_device(&self, device: &DeviceId, scope: EndScope) {
         KillSwitch::end_device(self, device, scope);
+    }
+
+    fn end_device_because(&self, device: &DeviceId, scope: EndScope, reason: EndReason) {
+        let bye = match reason {
+            EndReason::Revoked => messages::bye::REVOKED,
+            EndReason::Suspended => messages::bye::SUSPENDED,
+            EndReason::Panic => messages::bye::PANIC,
+        };
+        KillSwitch::end_device_with(self, device, scope, bye);
     }
 }
 
@@ -420,10 +445,11 @@ impl KillGuard {
                 }
                 if let Some(watched) = &self.device {
                     let ends = state.ends_of(&watched.device);
-                    if ends.every != watched.base.every
-                        || (watched.at_the_level && ends.at_the_level != watched.base.at_the_level)
-                    {
-                        return messages::bye::REVOKED;
+                    if ends.every != watched.base.every {
+                        return ends.every_reason;
+                    }
+                    if watched.at_the_level && ends.at_the_level != watched.base.at_the_level {
+                        return ends.at_the_level_reason;
                     }
                 }
             }
@@ -440,8 +466,8 @@ impl KillGuard {
         self.rx.borrow().generation != self.base
     }
 
-    /// From now on, [`KillSwitch::end_device`] for `device` also ends this session
-    /// (`BYE{REVOKED}`), also when it fires before the session starts (decision M1-67,
+    /// From now on, [`KillSwitch::end_device`] for `device` also ends this session, with
+    /// the end's reason, also when it fires before the session starts (decision M1-67,
     /// D6): armed at the session's reservation. An end for the level reaches it only once
     /// [`Self::at_the_level`] says its accept put it there.
     pub fn watch_device(&mut self, device: DeviceId) {
@@ -517,13 +543,20 @@ impl Drop for EndGuard<'_> {
 /// Apply the side effect of a remote admin command to live sessions (§B.8.4.1): the two
 /// host-wide effects through the kill switch, the two per-device ones through its
 /// per-device end (decision M1-67, D6), which reaches only that device's sessions, live or
-/// reserved.
+/// reserved, with `REVOKED` or `SUSPENDED` (§B.8.6.1). The host's guard has already ended
+/// those from its committed write, before the answer (S5B-3); this end serves an authority
+/// that does not, and finds nothing left where the guard did.
 fn apply_admin_effect(deps: &HostDeps, effect: &AdminEffect) {
     match effect {
         AdminEffect::MasterOff => deps.kill.kill(messages::bye::MASTER_OFF),
         AdminEffect::RevokedAll(_) => deps.kill.kill(messages::bye::REVOKED),
-        AdminEffect::Revoked(device) | AdminEffect::Suspended(device) => {
-            deps.kill.end_device(device, EndScope::Every);
+        AdminEffect::Revoked(device) => {
+            deps.kill
+                .end_device_with(device, EndScope::Every, messages::bye::REVOKED);
+        }
+        AdminEffect::Suspended(device) => {
+            deps.kill
+                .end_device_with(device, EndScope::Every, messages::bye::SUSPENDED);
         }
         // The requester's own stream is already closed above.
         AdminEffect::EndSession => {}
