@@ -1,5 +1,6 @@
 //! Start at login (`docs/PLAN.md` §B.8.7.5): a **user-level** registration that
-//! runs this executable's `host` command after the user logs in.
+//! starts this executable after the user logs in: on Windows the window,
+//! minimised (`tornect --background`, §B.1.1), on Linux the `host` command.
 //!
 //! | OS | Mechanism | Registered as |
 //! |---|---|---|
@@ -37,7 +38,9 @@ pub const TASK_NAME: &str = "Tornect";
 /// The systemd user unit (§B.8.7.5 names it).
 pub const UNIT_NAME: &str = "tornect-host.service";
 
-/// What the registration runs: `<exe> [--home <dir>] host`.
+/// What a registration runs: the systemd user unit `<exe> [--home <dir>] host`
+/// ([`LaunchSpec::args`]), the at-logon task the app in the background
+/// ([`LaunchSpec::app_args`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchSpec {
     /// Absolute path of the `tornect` executable.
@@ -58,6 +61,20 @@ impl LaunchSpec {
             args.push(home.clone().into_os_string());
         }
         args.push(OsString::from("host"));
+        args
+    }
+
+    /// The arguments after the executable for the app started in the
+    /// background (§B.1.1, decision M1-58): `[--home <dir>] --background`,
+    /// what the at-logon task runs.
+    #[must_use]
+    pub fn app_args(&self) -> Vec<OsString> {
+        let mut args = Vec::new();
+        if let Some(home) = &self.home {
+            args.push(OsString::from("--home"));
+            args.push(home.clone().into_os_string());
+        }
+        args.push(OsString::from("--background"));
         args
     }
 }
@@ -970,8 +987,9 @@ fn checked_sid(sid: &str) -> Result<&str, AutostartError> {
 /// priority is normal (the default, 7, is below normal), and only the plain
 /// task may be started on demand (slice-F F1-5).
 ///
-/// The task runs `tornect host` in a console window: that window is the host's
-/// visible sign and its Ctrl-C kill path (§B.6), so it is not hidden.
+/// The task runs the app in the background, `tornect.exe --background`
+/// ([`LaunchSpec::app_args`]; §B.1.1): the window host, minimised, with its
+/// sharing indicator and banner. The task itself is not hidden either.
 pub fn task_xml(
     spec: &LaunchSpec,
     user_sid: &str,
@@ -986,6 +1004,15 @@ pub fn task_xml(
         AutostartError::Unquotable(format!("{} is not valid Unicode", spec.exe.display()))
     })?;
     let command = xml_escape(&task_command(exe)?);
+    // A custom home was refused above, so this is `--background`.
+    let arguments = xml_escape(
+        &spec
+            .app_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
     let sid = xml_escape(checked_sid(user_sid)?);
     let run_level = if elevated {
         "HighestAvailable"
@@ -1003,7 +1030,7 @@ pub fn task_xml(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
 <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n\
   <RegistrationInfo>\r\n\
-    <Description>Tornect: start the host at logon. Written by `tornect service install`; `tornect service uninstall` removes it.</Description>\r\n\
+    <Description>Tornect: start the Tornect window minimised at logon. Written by `tornect service install`; `tornect service uninstall` removes it.</Description>\r\n\
   </RegistrationInfo>\r\n\
   <Triggers>\r\n\
     <LogonTrigger>\r\n\
@@ -1040,7 +1067,7 @@ pub fn task_xml(
   <Actions Context=\"Author\">\r\n\
     <Exec>\r\n\
       <Command>{command}</Command>\r\n\
-      <Arguments>host</Arguments>\r\n\
+      <Arguments>{arguments}</Arguments>\r\n\
     </Exec>\r\n\
   </Actions>\r\n\
 </Task>\r\n"
@@ -1970,7 +1997,7 @@ mod tests {
             xml.contains("<Command>&quot;C:\\Program Files\\Tornect\\tornect.exe&quot;</Command>"),
             "{xml}"
         );
-        assert!(xml.contains("<Arguments>host</Arguments>"));
+        assert!(xml.contains("<Arguments>--background</Arguments>"));
         assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
         assert_eq!(
             xml.matches(&format!("<UserId>{SID}</UserId>")).count(),
@@ -2000,7 +2027,7 @@ mod tests {
                 assert!(r.enabled && !r.elevated);
                 assert_eq!(
                     r.command.as_deref(),
-                    Some("\"C:\\Program Files\\Tornect\\tornect.exe\" host")
+                    Some("\"C:\\Program Files\\Tornect\\tornect.exe\" --background")
                 );
             }
             other => panic!("{other:?}"),
@@ -2167,7 +2194,7 @@ mod tests {
   <Triggers>\r\n    <LogonTrigger>\r\n      <Enabled>{trigger_enabled}</Enabled>\r\n      <UserId>PC\\ana</UserId>\r\n    </LogonTrigger>\r\n  </Triggers>\r\n\
   <Principals>\r\n    <Principal id=\"Author\">\r\n      <UserId>{SID}</UserId>\r\n      <LogonType>InteractiveToken</LogonType>\r\n      <RunLevel>{run_level}</RunLevel>\r\n    </Principal>\r\n  </Principals>\r\n\
   <Settings>\r\n    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n    <IdleSettings>\r\n      <StopOnIdleEnd>false</StopOnIdleEnd>\r\n    </IdleSettings>\r\n    <Enabled>{settings_enabled}</Enabled>\r\n    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n  </Settings>\r\n\
-  <Actions Context=\"Author\">\r\n    <Exec>\r\n      <Command>\"C:\\Program Files\\Tornect\\tornect.exe\"</Command>\r\n      <Arguments>host</Arguments>\r\n    </Exec>\r\n  </Actions>\r\n</Task>\r\n"
+  <Actions Context=\"Author\">\r\n    <Exec>\r\n      <Command>\"C:\\Program Files\\Tornect\\tornect.exe\"</Command>\r\n      <Arguments>--background</Arguments>\r\n    </Exec>\r\n  </Actions>\r\n</Task>\r\n"
             )
         };
         // Present.
@@ -2177,7 +2204,9 @@ mod tests {
             AutostartState::Registered(Registration {
                 enabled: true,
                 elevated: false,
-                command: Some("\"C:\\Program Files\\Tornect\\tornect.exe\" host".to_owned()),
+                command: Some(
+                    "\"C:\\Program Files\\Tornect\\tornect.exe\" --background".to_owned(),
+                ),
                 note: None,
                 unreadable: false,
             })
@@ -2617,7 +2646,7 @@ mod tests {
         assert_eq!(plain.principal.as_deref(), Some(SID));
         assert_eq!(plain.run_level.as_deref(), Some("LeastPrivilege"));
         assert_eq!(plain.command.as_deref(), Some("\"C:\\t\\tornect.exe\""));
-        assert_eq!(plain.arguments.as_deref(), Some("host"));
+        assert_eq!(plain.arguments.as_deref(), Some("--background"));
         let me = |p: &str| p.eq_ignore_ascii_case(SID) || p.eq_ignore_ascii_case("PC\\me");
         assert_eq!(registered_matches(&plain, &plain, &me), Ok(()));
         let as_name = TaskFacts {
@@ -2676,6 +2705,37 @@ mod tests {
         }
         let elevated = task_facts(&written(true));
         assert!(registered_matches(&elevated, &plain, &me).is_err());
+    }
+
+    /// §B.1.1 (decision M1-58): the at-logon task runs the app in the
+    /// background, `tornect.exe --background`, and the read-back compare checks
+    /// that argument: a task that runs the headless host (an earlier
+    /// version's) is not the one written. The systemd unit keeps `host`.
+    #[test]
+    fn the_task_runs_the_app_in_the_background() {
+        let launch = spec("C:\\Program Files\\Tornect\\tornect.exe", None);
+        assert_eq!(launch.app_args(), vec![OsString::from("--background")]);
+        assert_eq!(launch.args(), vec![OsString::from("host")], "the unit's");
+        assert_eq!(
+            spec("/usr/bin/tornect", Some("/srv/t")).app_args(),
+            ["--home", "/srv/t", "--background"]
+                .map(OsString::from)
+                .to_vec()
+        );
+        let xml = task_xml(&launch, SID, false).unwrap();
+        assert!(xml.contains("<Arguments>--background</Arguments>"), "{xml}");
+        assert!(!xml.contains(">host<"), "{xml}");
+        let written = task_facts(&xml);
+        let me = |p: &str| p.eq_ignore_ascii_case(SID);
+        assert_eq!(registered_matches(&written, &written, &me), Ok(()));
+        let the_host = TaskFacts {
+            arguments: Some("host".to_owned()),
+            ..written.clone()
+        };
+        assert!(
+            registered_matches(&written, &the_host, &me).is_err(),
+            "a task that runs the headless host is not the one written"
+        );
     }
 
     /// Slice-F F1-1: an elevated or unreadable task is removed through the
