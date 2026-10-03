@@ -379,6 +379,13 @@ impl StopTokenCheck for EmergencyStop {
     }
 }
 
+/// A condition of the host's readiness beyond the rows of §B.8.14, read at
+/// each request (§B.1.1: a window host started in background mode serves no
+/// unattended session before its sharing indicator was shown). While it
+/// answers `false`, every unattended session is refused `HOST_NOT_READY` with
+/// no `cause`.
+pub type ReadyGate = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// The real §B.8 hook.
 pub struct UnattendedAuth {
     limiter: AttemptLimiter,
@@ -390,6 +397,8 @@ pub struct UnattendedAuth {
     /// The host's readiness as last probed (at its start and every 10 min),
     /// read at each request.
     readiness_feed: Option<SharedReadiness>,
+    /// The condition of [`Self::with_ready_gate`]; none by default.
+    ready_gate: Option<ReadyGate>,
     /// Executes `intent = admin` requests (§B.8.4.1). Refuses by default.
     admin: Arc<dyn AdminAuthority>,
     /// The account facts and the helper task's presence, read at each answer
@@ -417,6 +426,7 @@ impl UnattendedAuth {
             host_transport,
             readiness: ReadinessSnapshot::unknown(),
             readiness_feed: None,
+            ready_gate: None,
             admin: Arc::new(RefuseAdmin),
             facts,
             block_guard: None,
@@ -443,6 +453,15 @@ impl UnattendedAuth {
         self.readiness_feed
             .as_ref()
             .map_or_else(|| self.readiness.clone(), SharedReadiness::get)
+    }
+
+    /// Refuse every unattended session while `gate` answers `false`, checked
+    /// beside the readiness rows, after their causes (§B.1.1): the refusal is
+    /// `HOST_NOT_READY` with no `cause`, a form the wire already has.
+    #[must_use]
+    pub fn with_ready_gate(mut self, gate: ReadyGate) -> Self {
+        self.ready_gate = Some(gate);
+        self
     }
 
     /// Wire remote administration (§B.8.4.1) to an authority — normally
@@ -546,6 +565,15 @@ impl UnattendedAuth {
         let mut rej = SessionReject::new(reject::HOST_NOT_READY);
         rej.cause = Some(cause);
         Some(rej)
+    }
+
+    /// The condition of [`Self::with_ready_gate`]: `HOST_NOT_READY` without a
+    /// `cause` while it does not hold.
+    fn ready_gate_reject(&self) -> Option<SessionReject> {
+        match &self.ready_gate {
+            Some(ready) if !ready() => Some(SessionReject::new(reject::HOST_NOT_READY)),
+            _ => None,
+        }
     }
 }
 
@@ -859,6 +887,9 @@ impl UnattendedAuth {
         };
 
         if let Some(rej) = self.readiness_reject() {
+            return Ok(UnattendedVerdict::Reject(rej));
+        }
+        if let Some(rej) = self.ready_gate_reject() {
             return Ok(UnattendedVerdict::Reject(rej));
         }
 

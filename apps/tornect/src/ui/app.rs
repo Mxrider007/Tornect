@@ -37,6 +37,9 @@ use super::view::{self, Action, Form};
 
 /// How long closing the window waits for the goodbyes before it quits anyway.
 const QUIT_WAIT: Duration = Duration::from_secs(10);
+/// How long the indicator probe of a start in background mode may take to
+/// draw its first frame before it counts as failed (§B.1.1).
+const PROBE_WAIT: Duration = Duration::from_secs(10);
 /// How often an owed `ReleaseAll` is tried again while the input queue is
 /// full (`StreamLink::settle`).
 const OWED_RETRY: Duration = Duration::from_millis(50);
@@ -87,6 +90,15 @@ fn ask_attention(window: &impl Attention) -> bool {
     }
     window.request_user_attention(Some(UserAttentionType::Critical));
     restore
+}
+
+/// The sharing indicator's window did not open at a session. In background
+/// mode the main window is minimised, so it is brought back with the
+/// attention a question asks for, and its banner shows the session (§B.1.1);
+/// a window started by hand is up with its banner already. `true` when the
+/// window was brought back, so its cards arm again.
+fn indicator_failed(window: &impl Attention, background: bool) -> bool {
+    background && ask_attention(window)
 }
 
 /// `IpcOp::Show` (a second launch, §B.1.1): the attention a question asks for
@@ -278,6 +290,10 @@ pub struct App {
     shown: Indicator,
     /// The indicator is a see-through pill (the desktop composites it).
     indicator_rounded: bool,
+    /// The indicator probe of a start in background mode (§B.1.1): the
+    /// indicator's window, opened once right after the main window and closed
+    /// at its first frame, and when it opened.
+    probe: Option<(Surface, Instant)>,
     /// The block windows of the requests in their block window, one per
     /// monitor each (§B.8.6.3).
     blocks: Vec<BlockSurface>,
@@ -301,6 +317,9 @@ pub struct App {
     /// The main window's height (the preview opens a taller one for a card
     /// low on its page).
     pub height: f64,
+    /// Started in background mode (§B.1.1): the "indicator shown" fact that
+    /// the indicator probe sets. `None` for a window started by hand.
+    pub background: Option<crate::host::IndicatorShown>,
     /// Why the window could not run.
     pub error: Option<anyhow::Error>,
 }
@@ -325,6 +344,7 @@ impl App {
             indicator: None,
             shown: Indicator::default(),
             indicator_rounded: false,
+            probe: None,
             blocks: Vec::new(),
             blocks_opened: Vec::new(),
             blocks_asserted: None,
@@ -335,6 +355,7 @@ impl App {
             title: "Tornect",
             theme: egui::Theme::Dark,
             height: 760.0,
+            background: None,
             error: None,
         }
     }
@@ -441,44 +462,109 @@ impl App {
             )
     }
 
+    /// A new indicator window for `rows` sessions.
+    fn open_indicator(&mut self, el: &ActiveEventLoop, rows: usize) -> anyhow::Result<Surface> {
+        // Top-right of the primary monitor where the desktop has one and lets
+        // a client place its window (not Wayland).
+        let position = el
+            .primary_monitor()
+            .or_else(|| el.available_monitors().next())
+            .map(|m| {
+                indicator::top_right(
+                    m.position(),
+                    m.size(),
+                    m.scale_factor(),
+                    indicator::size(rows),
+                )
+            });
+        let setup = self.main_device(el);
+        // A pill where the desktop composites transparent windows, a square
+        // elsewhere.
+        self.indicator_rounded = indicator::rounded_here(wayland(el));
+        let attrs = indicator::attributes(rows, position).with_transparent(self.indicator_rounded);
+        Surface::new(el, attrs, setup, self.theme, self.indicator_rounded)
+    }
+
+    /// The indicator probe of a start in background mode (§B.1.1): the
+    /// indicator's window, opened once right after the main window; its first
+    /// frame sets the "indicator shown" fact and it closes at once. Where the
+    /// desktop cannot keep it on top (Wayland), the compositor's own
+    /// screen-sharing indicator is the plan's fallback, and the probe proves
+    /// the window itself. A window started by hand runs no probe.
+    fn start_probe(&mut self, el: &ActiveEventLoop) {
+        if self.background.is_none() || self.probe.is_some() {
+            return;
+        }
+        match self.open_indicator(el, 1) {
+            Ok(surface) => self.probe = Some((surface, Instant::now())),
+            Err(e) => self.probe_failed(&format!("{e:#}")),
+        }
+    }
+
+    /// The probe's first frame: the indicator as it looks with no session
+    /// (nothing on it can be pressed before it closes, so its actions are
+    /// dropped), then the fact, then the window closes.
+    fn draw_probe(&mut self) {
+        let Some((mut surface, _)) = self.probe.take() else {
+            return;
+        };
+        let rounded = self.indicator_rounded;
+        surface.paint(|ui| {
+            view::indicator_pill(
+                ui,
+                &[],
+                &std::collections::HashSet::new(),
+                Instant::now(),
+                &mut Vec::new(),
+                rounded,
+            );
+        });
+        self.probe_drew();
+    }
+
+    /// The probe drew its first frame: the indicator can be shown, and the
+    /// host may serve unattended sessions (§B.1.1).
+    fn probe_drew(&mut self) {
+        self.probe = None;
+        if let Some(shown) = &self.background {
+            shown.set();
+        }
+    }
+
+    /// The probe did not open, or drew nothing in time: the fact stays unset,
+    /// so unattended sessions stay refused, and the recent activity says so.
+    fn probe_failed(&mut self, why: &str) {
+        self.probe = None;
+        let line = format!(
+            "the sharing indicator could not be shown ({why}); unattended sessions are refused \
+             until it is"
+        );
+        tracing::warn!("{line}");
+        self.shared.update(|m| m.note(line));
+    }
+
     /// Open the indicator window at the first shared session, redraw it on a
     /// change, close it at the last end.
     fn sync_indicator(&mut self, el: &ActiveEventLoop) {
         let sharing = self.shared.read(|m| m.sharing.clone());
         match self.shown.sync(&sharing) {
             Change::Keep => {}
-            Change::Open => {
-                let rows = self.shown.rows();
-                // Top-right of the primary monitor where the desktop has one
-                // and lets a client place its window (not Wayland).
-                let position = el
-                    .primary_monitor()
-                    .or_else(|| el.available_monitors().next())
-                    .map(|m| {
-                        indicator::top_right(
-                            m.position(),
-                            m.size(),
-                            m.scale_factor(),
-                            indicator::size(rows),
-                        )
-                    });
-                let setup = self.main_device(el);
-                // A pill where the desktop composites transparent windows,
-                // a square elsewhere.
-                self.indicator_rounded = indicator::rounded_here(wayland(el));
-                let attrs =
-                    indicator::attributes(rows, position).with_transparent(self.indicator_rounded);
-                match Surface::new(el, attrs, setup, self.theme, self.indicator_rounded) {
-                    Ok(surface) => self.indicator = Some(surface),
-                    Err(e) => {
-                        // The banner in the main window still shows the
-                        // session; the next session tries again.
-                        let line = format!("the sharing indicator did not open: {e:#}");
-                        tracing::warn!("{line}");
-                        self.shared.update(|m| m.note(line));
+            Change::Open => match self.open_indicator(el, self.shown.rows()) {
+                Ok(surface) => self.indicator = Some(surface),
+                Err(e) => {
+                    // The banner in the main window still shows the session
+                    // (brought up first in background mode); the next session
+                    // tries again.
+                    let line = format!("the sharing indicator did not open: {e:#}");
+                    tracing::warn!("{line}");
+                    self.shared.update(|m| m.note(line));
+                    if let Some(main) = &self.main
+                        && indicator_failed(&*main.window, self.background.is_some())
+                    {
+                        self.form.window_came_back();
                     }
                 }
-            }
+            },
             Change::Redraw => {
                 if let Some(surface) = &self.indicator {
                     let _ = surface
@@ -949,6 +1035,7 @@ impl ApplicationHandler<UserEvent> for App {
         ) {
             Ok(surface) => {
                 self.main = Some(surface);
+                self.start_probe(el);
                 self.sync_indicator(el);
                 self.sync_blocks(el);
             }
@@ -1026,6 +1113,17 @@ impl ApplicationHandler<UserEvent> for App {
             self.block_event(index, &event);
             return;
         }
+        if self
+            .probe
+            .as_ref()
+            .is_some_and(|(s, _)| s.window.id() == id)
+        {
+            // Its first frame is all the probe waits for.
+            if matches!(event, WindowEvent::RedrawRequested) {
+                self.draw_probe();
+            }
+            return;
+        }
         let Some(main) = &mut self.main else { return };
         if main.window.id() != id {
             return;
@@ -1077,6 +1175,17 @@ impl ApplicationHandler<UserEvent> for App {
         // `ReleaseAll` until the queue has room (SLICE-E E1-6).
         if self.stream.is_some() && self.link.settle() {
             earliest(now + OWED_RETRY);
+        }
+        // An indicator probe that drew nothing in time has failed.
+        if let Some(due) = self.probe.as_ref().map(|(_, at)| *at + PROBE_WAIT) {
+            if now >= due {
+                self.probe_failed(&format!(
+                    "it drew nothing within {} s",
+                    PROBE_WAIT.as_secs()
+                ));
+            } else {
+                earliest(due);
+            }
         }
         // The block windows are put back on top every `block::REASSERT`.
         if !self.blocks.is_empty() {
@@ -1254,6 +1363,96 @@ mod tests {
                 expected,
                 "minimized: {minimized:?}"
             );
+        }
+    }
+
+    /// A window as the tests open it: the model, the popups, the link and the
+    /// command channel, nothing on screen.
+    fn app() -> (App, mpsc::UnboundedReceiver<Command>) {
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let popups = Popups::new(Arc::clone(&shared));
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            App::new(shared, popups, Arc::new(StreamLink::default()), tx),
+            rx,
+        )
+    }
+
+    /// §B.1.1 (decision M1-58): in background mode the row "indicator shown"
+    /// passes only once the indicator probe drew its window, as the host
+    /// reports it (the row of its readiness answer); until then it warns
+    /// with its own text.
+    #[test]
+    fn the_indicator_row_passes_only_after_the_probe_drew() {
+        use tornect_core::unattended::readiness::Probe;
+        let (mut app, _rx) = app();
+        let shown = crate::host::IndicatorShown::default();
+        app.background = Some(shown.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = crate::unattended::test_context(tmp.path(), None);
+        ctx.indicator = Some(shown.clone());
+        let pending = Probe::Warn(tornect_platform::readiness::INDICATOR_NOT_SHOWN.to_owned());
+        assert_eq!(ctx.readiness_now().consent_indicator, pending);
+        assert!(!shown.is_set());
+        app.probe_drew();
+        assert!(shown.is_set());
+        assert_eq!(ctx.readiness_now().consent_indicator, Probe::Ok);
+        assert!(app.probe.is_none(), "the probe closes at its first frame");
+    }
+
+    /// A probe that cannot open, or draws nothing in time, keeps the row
+    /// warning (and so the host refusing unattended sessions) and says why
+    /// in the recent activity.
+    #[test]
+    fn a_failed_probe_keeps_the_row_failing() {
+        use tornect_core::unattended::readiness::Probe;
+        let (mut app, _rx) = app();
+        let shown = crate::host::IndicatorShown::default();
+        app.background = Some(shown.clone());
+        app.probe_failed("no GPU surface for the window: lost");
+        assert!(!shown.is_set());
+        assert_eq!(
+            shown.row(),
+            Probe::Warn(tornect_platform::readiness::INDICATOR_NOT_SHOWN.to_owned())
+        );
+        let said = app.shared.read(|m| m.events.clone());
+        assert!(
+            said.iter()
+                .any(|l| l.contains("the sharing indicator could not be shown")
+                    && l.contains("unattended sessions are refused")),
+            "{said:?}"
+        );
+    }
+
+    /// §B.1.1: in background mode, an indicator that does not open at
+    /// a session brings the minimised main window back with the attention a
+    /// question asks for, so its banner shows the session, and its cards arm
+    /// again; never the keyboard focus. A window started by hand is left as
+    /// it was (its banner is up).
+    #[test]
+    fn a_failed_indicator_raises_the_banner_in_background() {
+        let attention = Call::Attention(Some(UserAttentionType::Critical));
+        for (minimized, expected) in [
+            (Some(true), vec![Call::SetMinimized(false), attention]),
+            (Some(false), vec![attention]),
+            (None, vec![attention]),
+        ] {
+            let window = Recorder {
+                minimized,
+                calls: RefCell::default(),
+            };
+            assert_eq!(
+                indicator_failed(&window, true),
+                minimized == Some(true),
+                "minimized: {minimized:?}"
+            );
+            assert_eq!(window.calls.into_inner(), expected);
+            let by_hand = Recorder {
+                minimized,
+                calls: RefCell::default(),
+            };
+            assert!(!indicator_failed(&by_hand, false));
+            assert!(by_hand.calls.into_inner().is_empty());
         }
     }
 
