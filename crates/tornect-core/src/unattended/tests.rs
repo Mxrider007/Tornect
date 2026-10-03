@@ -5598,3 +5598,81 @@ fn a25_p_each_local_deny_direction_change_ends_that_devices_sessions() {
     assert!(guard.revoke(Actor::Ui, &dev(1)).is_err());
     assert!(ended().is_empty(), "a refused revoke ends nothing");
 }
+
+/// A dialog during which the helper task gets registered, so that a control grant's
+/// password starts to reach the level (clause (ii)); it records what was asked.
+struct TaskRegisteredDuringDialog {
+    facts: Arc<FixedFacts>,
+    asked: std::sync::Mutex<Vec<String>>,
+}
+
+impl ReAuth for TaskRegisteredDuringDialog {
+    fn reauthenticate(&self, op: &str) -> Result<(), ReAuthError> {
+        self.asked.lock().unwrap().push(op.to_owned());
+        self.facts.set_helper_task(HelperPresence::Registered);
+        Ok(())
+    }
+}
+
+#[test]
+fn a_raise_that_appears_during_the_window_dialog_does_not_commit() {
+    // S5B-2 (D3, AP-1): the window's create and Change password pass what their dialog
+    // said. A registration that raises only once that dialog is answered (the helper
+    // task registered meanwhile, so control now reaches the level) is refused with
+    // G_NEEDS_PASSWORD and writes nothing, even with a generated password; asked again,
+    // the dialog names the raise and the registration lands.
+    let (env, store, _guard) = reach_env();
+    let facts = Arc::new(FixedFacts::new(windows(|_| {}), HelperPresence::Absent));
+    let reauth = Arc::new(TaskRegisteredDuringDialog {
+        facts: facts.clone(),
+        asked: std::sync::Mutex::new(Vec::new()),
+    });
+    let guard = MutationGuard::new(
+        store.clone(),
+        reauth.clone(),
+        Arc::new(NoSessionActivity),
+        facts.clone(),
+    )
+    .with_paired_devices(Arc::new(AllowAllPaired));
+    let refused = refused_with(&env, codes::G_NEEDS_PASSWORD);
+    let err = guard
+        .create_grant(
+            Actor::Ui,
+            &dev(4),
+            Preset::HeadlessBox,
+            &GrantOptions::default(),
+            &upload(),
+            true,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), codes::G_NEEDS_PASSWORD, "{err}");
+    assert!(store.grant(&dev(4)).is_none(), "nothing written");
+    facts.set_helper_task(HelperPresence::Absent);
+    set_grant(&store, &dev(1), |g| g.mode = SessionMode::ViewOnly);
+    let before = store.grant(&dev(1)).unwrap();
+    let control = GrantOptions {
+        mode: Some(SessionMode::Control),
+        ..GrantOptions::default()
+    };
+    let err = guard
+        .set_password(Actor::Ui, &dev(1), &[0xC5; 192], &control, true)
+        .unwrap_err();
+    assert_eq!(err.code(), codes::G_NEEDS_PASSWORD, "{err}");
+    assert_eq!(store.grant(&dev(1)).unwrap(), before, "nothing written");
+    assert_eq!(refused_with(&env, codes::G_NEEDS_PASSWORD), refused + 2);
+    guard
+        .create_grant(
+            Actor::Ui,
+            &dev(4),
+            Preset::HeadlessBox,
+            &GrantOptions::default(),
+            &upload(),
+            true,
+        )
+        .unwrap();
+    assert!(store.grant(&dev(4)).is_some());
+    assert_eq!(
+        *reauth.asked.lock().unwrap(),
+        ["create_grant", "set_password", "raise"]
+    );
+}
