@@ -188,7 +188,12 @@ pub async fn start_control_channel(
             ctx.as_ref().ok().map(|c| Arc::clone(&c.guard)),
         );
         if let Ok(c) = &ctx {
-            reprobe_readiness(paths, Arc::clone(&c.guard), c.readiness.clone());
+            reprobe_readiness(
+                paths,
+                Arc::clone(&c.guard),
+                c.readiness.clone(),
+                c.indicator.clone(),
+            );
         }
     }
     let endpoint = match Endpoint::bind(&paths.state_dir).await {
@@ -370,11 +375,41 @@ pub fn this_is_the_window_host() {
     WINDOW_HOST.store(true, Ordering::SeqCst);
 }
 
+/// The "indicator shown" fact of a window host started in background mode
+/// (§B.1.1, decision M1-58): set once this process drew its sharing
+/// indicator's window (the probe right after the main window opens), never
+/// unset. One process is one start, so one sign-in. Until it is set, the
+/// readiness row "indicator shown" warns and no unattended session is served.
+#[derive(Debug, Clone, Default)]
+pub struct IndicatorShown(Arc<AtomicBool>);
+
+impl IndicatorShown {
+    /// Whether the indicator's window was drawn.
+    #[must_use]
+    pub fn is_set(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// The indicator's window drew its first frame.
+    pub fn set(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// The readiness row "indicator shown" of the host this fact belongs to
+    /// (§B.8.7.1 ⑥).
+    #[must_use]
+    pub fn row(&self) -> tornect_core::unattended::readiness::Probe {
+        tornect_platform::readiness::indicator_row(true, Some(self.is_set()))
+    }
+}
+
 /// The readiness rows this computer can read now, for the host whose guard is
-/// `guard` (§B.8.7.1 ⑥; the others stay `Unknown`).
+/// `guard` and, in background mode, whose indicator fact is `indicator`
+/// (§B.8.7.1 ⑥; the others stay `Unknown`).
 fn probe_readiness(
     paths: &Paths,
     guard: &tornect_core::unattended::guard::MutationGuard,
+    indicator: Option<&IndicatorShown>,
 ) -> tornect_core::unattended::readiness::ReadinessSnapshot {
     use tornect_core::keystore::KeystoreKind;
     use tornect_core::unattended::grant::UnattendedGrant;
@@ -387,6 +422,7 @@ fn probe_readiness(
         &paths.portal_restore_token(),
         store.keystore_kind() == KeystoreKind::File,
         WINDOW_HOST.load(Ordering::SeqCst),
+        indicator.map(IndicatorShown::is_set),
         admin_grant,
     );
     tornect_platform::readiness::rows(&facts)
@@ -398,13 +434,18 @@ fn reprobe_readiness(
     paths: &Paths,
     guard: Arc<tornect_core::unattended::guard::MutationGuard>,
     feed: tornect_core::unattended::readiness::SharedReadiness,
+    indicator: Option<IndicatorShown>,
 ) {
     let paths = paths.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tornect_core::unattended::readiness::REPROBE_EVERY).await;
-            let (paths, guard) = (paths.clone(), Arc::clone(&guard));
-            match tokio::task::spawn_blocking(move || probe_readiness(&paths, &guard)).await {
+            let (paths, guard, indicator) = (paths.clone(), Arc::clone(&guard), indicator.clone());
+            match tokio::task::spawn_blocking(move || {
+                probe_readiness(&paths, &guard, indicator.as_ref())
+            })
+            .await
+            {
                 Ok(snapshot) => feed.set(snapshot),
                 Err(e) => tracing::warn!(error = %e, "the readiness probe failed"),
             }
@@ -450,6 +491,26 @@ pub fn wire(
     media: Arc<MediaHost>,
     control: ControlChannel,
 ) -> anyhow::Result<HostWiring> {
+    wire_window(
+        paths, cfg, identity, device_pk, consent, media, control, None,
+    )
+}
+
+/// [`wire`], for the window host: `background` is the "indicator shown" fact
+/// of a start in background mode (`tornect --background`, §B.1.1). There the
+/// readiness row "indicator shown" reads it, and every unattended session is
+/// refused `HOST_NOT_READY` until it is set (MUST). A window started by hand
+/// (`None`) is shown with its banner and is wired as [`wire`] wires it.
+pub fn wire_window(
+    paths: &Paths,
+    cfg: &Config,
+    identity: Arc<HostIdentity>,
+    device_pk: [u8; 32],
+    consent: Arc<dyn Consent>,
+    media: Arc<MediaHost>,
+    control: ControlChannel,
+    background: Option<IndicatorShown>,
+) -> anyhow::Result<HostWiring> {
     // The session levels this computer can give (§B.2.1). A host started
     // elevated while UAC is on, or running as root on Linux (where Tornect
     // never runs as administrator), or that cannot rule root out (decision
@@ -467,7 +528,10 @@ pub fn wire(
     let live = Arc::new(LiveSessions::new());
     let polkit = Arc::new(PolkitRevocation::for_this_host());
     let ctx = match crate::unattended::host_context(paths, live.clone(), kill.clone()) {
-        Ok(ctx) => Ok(ctx),
+        Ok(mut ctx) => {
+            ctx.indicator = background.clone();
+            Ok(ctx)
+        }
         Err(e) => {
             eprintln!(
                 "warning: unattended access is unavailable ({e:#}); attended pairing and \
@@ -510,14 +574,14 @@ pub fn wire(
     host_cfg.levels = levels;
 
     if let Ok(ctx) = &ctx {
-        ctx.readiness.set(probe_readiness(paths, &ctx.guard));
+        ctx.readiness
+            .set(probe_readiness(paths, &ctx.guard, ctx.indicator.as_ref()));
         deps.stop_token = Arc::new(EmergencyStop::new(Arc::clone(&ctx.guard), kill));
         // M1 has no local-zone source (decision M1-15; a tzdb-backed zone is
         // M6). The zone only matters for grant schedules, and no path in this
         // build creates one: the presets have none and `tornect unattended
         // grant` sends none.
-        deps.unattended = Arc::new(
-            UnattendedAuth::new(
+        let auth = UnattendedAuth::new(
                 AttemptLimiter::new(ctx.guard.store().clone()),
                 Arc::new(FixedOffset::utc()),
                 HostTransport {
@@ -534,8 +598,14 @@ pub fn wire(
             // terminal host each have a block window with Block (`wire_cli`
             // gives the terminal's); "Ask before starting" is the window's
             // sheet, and denied on the terminal.
-            .with_block_guard(Arc::clone(&ctx.guard)),
-        );
+            .with_block_guard(Arc::clone(&ctx.guard));
+        // §B.1.1 (MUST): in background mode, no unattended session before
+        // the indicator was shown; the rows' causes still go first.
+        let auth = match background {
+            Some(shown) => auth.with_ready_gate(Arc::new(move || shown.is_set())),
+            None => auth,
+        };
+        deps.unattended = Arc::new(auth);
         host_cfg.feats = vec![messages::feats::UA1.to_owned()];
     }
 
@@ -2352,6 +2422,155 @@ mod tests {
         let _ = host_task.await.unwrap();
         let store = headless.ctx.as_ref().unwrap().guard.store();
         assert!(store.grants().is_empty(), "the stop code revoked nothing");
+    }
+
+    /// A paired client with an unattended grant at a host in a fresh home,
+    /// and the request it sends.
+    struct UnattendedSetup {
+        env: Env,
+        host_device_pk: [u8; 32],
+        identity: DeviceIdentity,
+        ccfg: ClientConfig,
+        cdeps: ClientDeps,
+    }
+
+    const SETUP_PASSWORD: &str = "quiet verdant otter lantern zephyr";
+
+    fn unattended_setup() -> UnattendedSetup {
+        let env = env();
+        let host_device_pk = HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32]));
+        let (identity, ccfg, cdeps) = client(&env);
+        let device = identity.id();
+        TrustedDeviceStore::open(env.paths.trusted_devices_file())
+            .unwrap()
+            .pin(device, "Laptop")
+            .unwrap();
+        cdeps
+            .known_hosts
+            .pin(env.identity.id(), "Desk", host_device_pk)
+            .unwrap();
+        grant_unattended(&env, &device, SETUP_PASSWORD);
+        UnattendedSetup {
+            env,
+            host_device_pk,
+            identity,
+            ccfg,
+            cdeps,
+        }
+    }
+
+    impl UnattendedSetup {
+        /// The window host's wiring, in background mode when `background`.
+        fn window(&self, background: Option<IndicatorShown>) -> HostWiring {
+            wire_window(
+                &self.env.paths,
+                &Config::default(),
+                Arc::clone(&self.env.identity),
+                self.host_device_pk,
+                Arc::new(ScriptedConsent::new()),
+                media(),
+                ControlChannel::default(),
+                background,
+            )
+            .unwrap()
+        }
+
+        /// One unattended request to `wiring`: what the client got, and what
+        /// the host served.
+        async fn request(
+            &self,
+            wiring: &HostWiring,
+        ) -> (
+            Result<ClientOutcome<tokio::io::DuplexStream>, tornect_signal::fsm::HandshakeError>,
+            Served,
+        ) {
+            use tornect_signal::fsm::client::UnattendedIntent;
+            let (client_end, host_end) = duplex(64 * 1024);
+            let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+            let host_task =
+                tokio::spawn(async move { serve_signaling(host_end, &cfg, &deps, |_| {}).await });
+            let intent = Intent::Unattended(UnattendedIntent {
+                password: zeroize::Zeroizing::new(SETUP_PASSWORD.to_owned()),
+                want_mode: messages::mode::CONTROL,
+                want_elevation: tornect_core::levels::Elevation::None,
+            });
+            let got = connect(client_end, &self.ccfg, &self.identity, &self.cdeps, intent).await;
+            (got, host_task.await.unwrap())
+        }
+    }
+
+    /// §B.1.1 (MUST, decision M1-58): a window host started in background
+    /// mode serves no unattended session until its readiness row "indicator
+    /// shown" passes. The request is refused `HOST_NOT_READY` with no `cause`
+    /// (a form the wire has), after the password, and no session starts.
+    /// Shown failing first (the fact not yet a gate: the session was served).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_refuses_unattended_until_the_indicator_row_passes() {
+        use tornect_core::unattended::readiness::Probe;
+        use tornect_signal::fsm::HandshakeError;
+
+        let setup = unattended_setup();
+        let shown = IndicatorShown::default();
+        let wiring = setup.window(Some(shown.clone()));
+        assert_eq!(wiring.cfg.feats, vec![messages::feats::UA1.to_owned()]);
+        let ctx = wiring.ctx.as_ref().unwrap();
+        let pending = Probe::Warn(tornect_platform::readiness::INDICATOR_NOT_SHOWN.to_owned());
+        assert_eq!(ctx.readiness.get().consent_indicator, pending, "as probed");
+        assert_eq!(shown.row(), pending);
+        match setup.request(&wiring).await {
+            (Err(HandshakeError::SessionRejected { reject: why }), served) => {
+                assert_eq!(why.reason, reject::HOST_NOT_READY);
+                assert_eq!(why.cause, None, "no cause: no new wire value");
+                assert_eq!(served, Served::Handshake);
+            }
+            (other, _) => panic!("a background host before its indicator answered {other:?}"),
+        }
+        assert_eq!(wiring.live.count(), 0, "no session started");
+        assert!(!shown.is_set());
+    }
+
+    /// §B.1.1: once the indicator's window was drawn, the same host serves
+    /// the same grant, and its row passes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_serves_after_it_passes() {
+        use tornect_core::unattended::readiness::Probe;
+        use tornect_signal::fsm::HandshakeError;
+
+        let setup = unattended_setup();
+        let shown = IndicatorShown::default();
+        let wiring = setup.window(Some(shown.clone()));
+        match setup.request(&wiring).await {
+            (Err(HandshakeError::SessionRejected { reject: why }), _) => {
+                assert_eq!(why.reason, reject::HOST_NOT_READY);
+            }
+            (other, _) => panic!("served before the indicator was shown: {other:?}"),
+        }
+        shown.set();
+        assert_eq!(shown.row(), Probe::Ok);
+        match setup.request(&wiring).await {
+            (Ok(ClientOutcome::Session(session)), served) => {
+                drop(session);
+                assert_eq!(served, Served::Session);
+            }
+            (other, _) => panic!("the background host refused after its indicator: {other:?}"),
+        }
+    }
+
+    /// §B.1.1: the gates are those of the start at sign-in. A window started
+    /// by hand runs no probe and is not gated: it serves the grant as before,
+    /// and its context carries no indicator fact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_window_started_by_hand_is_not_gated() {
+        let setup = unattended_setup();
+        let wiring = setup.window(None);
+        assert!(wiring.ctx.as_ref().unwrap().indicator.is_none());
+        match setup.request(&wiring).await {
+            (Ok(ClientOutcome::Session(session)), served) => {
+                drop(session);
+                assert_eq!(served, Served::Session);
+            }
+            (other, _) => panic!("a window started by hand refused its grant: {other:?}"),
+        }
     }
 
     /// The whole reason for the wiring. `tornect panic` (IPC `Panic`) ends a

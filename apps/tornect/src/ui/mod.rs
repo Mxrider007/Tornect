@@ -275,6 +275,7 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
             identity: Arc::new(real.identity),
             device: Arc::new(real.device),
             device_pk: real.device_pk,
+            background: None,
         },
         commands_rx,
     ));

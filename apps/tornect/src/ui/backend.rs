@@ -223,6 +223,11 @@ pub struct Backend {
     pub device_pk: [u8; 32],
     /// The device words and the look-alike alarm of this home (§B.6.1).
     pub words: Arc<super::recognize::Recognizer>,
+    /// Started in background mode (`tornect --background`, §B.1.1): the
+    /// "indicator shown" fact the window's probe sets, which the host's
+    /// readiness row and its gate on unattended sessions read. `None` for a
+    /// window started by hand.
+    pub background: Option<crate::host::IndicatorShown>,
 }
 
 /// Whether this is the window's first run in the home `paths`: the first
@@ -538,7 +543,7 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         audit,
         pins,
         polkit,
-    } = crate::host::wire(
+    } = crate::host::wire_window(
         &b.paths,
         &b.cfg,
         Arc::clone(&b.identity),
@@ -546,6 +551,7 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         Arc::new(AutoDeny),
         Arc::clone(&media),
         control.clone(),
+        b.background.clone(),
     )
     .map_err(|e| format!("{e:#}"))?;
     helpers.wire(deps.kill.clone(), audit.clone(), cfg.levels);
