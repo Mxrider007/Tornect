@@ -291,8 +291,9 @@ start after each sign-in (on Wayland, with no topmost window, the compositor's s
 fallback); the headless `tornect host` without a terminal stays pings-only (M1-53, the operator's ruling "Pings only
 when headless", M1-54); a second launch brings the running window forward (`IpcOp::Show`, §B.8.7.4) instead of failing
 on `host.lock`, and that only raises the window — it never answers, dismisses or re-orders a sheet, and it re-arms any
-sheet (§B.2.1). Recommended: in background mode, pairing from new devices is off by default ("Accept new devices only
-while Tornect's window is open"); requests from paired devices stay on. On Linux the app's autostart will be an XDG
+sheet (§B.2.1). In background mode, pairing from new devices stays on (the operator's ruling of 2026-10-03, decision
+M1-68): a new device can start pairing while the window is minimised, and the request raises the window as any request
+does. On Linux the app's autostart will be an XDG
 autostart entry (`~/.config/autostart/`), which inherits the graphical session's environment — a deviation from M1-53's
 "no XDG-autostart fallback", which concerned the headless host's unit; whether such an entry runs inside the logind
 session (the polkit revocation of §B.2.1 and the portal's restore token depend on it) is NEEDS-DEVICE(gnome, kde),
@@ -1475,7 +1476,7 @@ status|on|off|pause|grant <device> [--preset …] [--waive-attended-check] [--ad
 `tornect panic`, `tornect
 backup export|import` (`--waive-attended-check` maps to `GrantOptions.waive_attended_precondition`,
 warned and logged; `backup export` is access-increasing, B.8.6.2; `disable` is deny-direction,
-`IpcOp::Disable`; `suspend` is deny-direction, `IpcOp::Suspend` (→ `Suspended{Local{by: Cli}}`, B.8.6.3);
+`IpcOp::Disable`; `set-level <device> none` is deny-direction, `IpcOp::SetLevelNone`; `suspend` is deny-direction, `IpcOp::Suspend` (→ `Suspended{Local{by: Cli}}`, B.8.6.3);
 `resume` is access-increasing, `IpcOp::Resume` (re-auth, B.8.6.2); `service install|uninstall` = `IpcOp::ServiceInstall|ServiceUninstall` through
 the guard — an autostart change is access-increasing, B.8.6.2, and with no host running the CLI
 runs the guard offline like any other mutation); passwords via TTY prompt, never argv.
@@ -1525,6 +1526,7 @@ IpcOp = Status | On | Off | Pause { until: u64 } | Revoke { device: DeviceId } |
       | Resume { device } /* clears any Suspended{…}; access-increasing: re-auth, no remote session ≥ 60 s (B.8.6.2); UnattendedResumed{by} logged */
       | Enable { device } /* Disabled → Active; access-increasing (B.8.6.2) */
       | Disable { device } /* Active → Disabled{by: Ui|Cli}; deny-direction: no re-auth, a live session of that grant gets BYE{REVOKED}; GrantDisabled{by} logged (B.8.6.1) */
+      | SetLevelNone { device } /* tornect unattended set-level <device> none: GrantOptions.elevation → None, no other field sent (B.8.7.1); deny-direction: no re-auth, allowed during a remote session (B.8.6.2); a live session of that device at the administrator level ends (B.8.6.2), a session below the level goes on; GrantChanged logged; a grant without the level is left unchanged; every ok answer carries the condition of the turn-off sentence (B.8.7.1 ⑤a) as its payload, below */
       | ServiceInstall { elevated: bool /* at `3aa1072` the Windows whole-host elevated task (M1-53); r7: replaced by the administrator helper task, registered with the first admin grant and removed with the last (B.8.7.5) */ } | ServiceUninstall /* tornect service install|uninstall: an autostart change is access-increasing (B.8.6.2) — re-auth, no remote session ≥ 60 s; no store write; AutostartChanged{by} logged */
       | Show /* r7 (§B.1.1): raise the running window only — never answers, dismisses or re-orders a sheet; re-arms any sheet */
       | Readiness | Log { filter: tstr, after: Option<u64> } | Panic | BackupExport { path: tstr } /* access-increasing: re-auth, no remote session ≥ 60 s, BackupExported logged */ | BackupImport { path: tstr }
@@ -1533,7 +1535,7 @@ IpcOp = Status | On | Off | Pause { until: u64 } | Revoke { device: DeviceId } |
       | RegFinish { device, reg_txn: bytes[16], upload: bytes[192], preset: u8, options: GrantOptions, generated: bool }   /* grant (no grant yet) / set-password (grant exists): the CLI runs ClientRegistration itself; `generated`: the password came from the passphrase generator, never set for a chosen one — the only way the host learns it, since the password never crosses IPC (M1-67); re-checks RemoteSessionActivity before applying (below) */
 payload per op: Status → StatusReport { enabled: bool, paused_until: Option<u64>, grants: [GrantSummary /* id, device, label, preset, mode, state, expires_at, last_used, failures_since_unlock */],
                                         readiness: ReadinessSnapshot, keystore_kind: u8 /* 0 os_keychain · 1 file */ }
-                Readiness → ReadinessSnapshot (B.8.14) · Log → { lines: [tstr], next: Option<u64> } /* paged: ≤ 60 KiB per response, `next` is the cursor for the following Log{after} */
+                Readiness → ReadinessSnapshot (B.8.14) · Log → { lines: [tstr], next: Option<u64> } /* paged: ≤ 60 KiB per response, `next` is the cursor for the following Log{after} */ · SetLevelNone → { keeps: u8 /* 0 nothing · 1 another admin grant exists · 2 the administrator helper task stays registered */ }
                 every other op → payload absent
 GrantOptions = { label, mode, schedule, expires_at, auto_renew, max_session_secs, block_window_s, ask_before_start, require_absent,
                  require_tor_only, lock_on_disconnect, hard_lock_after, waive_attended_precondition: bool,
