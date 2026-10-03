@@ -961,7 +961,7 @@ pub fn host_context(
 /// is a host start or a keystore recovery, which a pre-authentication attacker
 /// cannot force. Loading as the host here made every `tornect unattended
 /// status` a load that settled, decayed and rewrote the store (track D S5).
-fn offline_context(paths: &Paths) -> anyhow::Result<HostContext> {
+pub(crate) fn offline_context(paths: &Paths) -> anyhow::Result<HostContext> {
     context(paths, LoadMode::Offline, offline_activity(paths), None)
 }
 
@@ -1051,32 +1051,50 @@ fn context(
     })
 }
 
-/// What a start-at-login registration for this home runs: this executable's
-/// `host` command, with `--home` when the home is not the platform default.
+/// What a start-at-login registration for this home runs: this executable,
+/// with `--home` when the home is not the platform default.
 ///
 /// The executable is the running one (`current_exe`, symlinks resolved on
 /// Linux), so whichever `tornect` registers is what starts; a binary deleted
 /// or replaced since it started is refused rather than registered by a stale
-/// path. A custom home is made absolute: the unit or task starts in another
-/// directory.
+/// path.
 fn launch_spec(paths: &Paths) -> anyhow::Result<LaunchSpec> {
     let exe = std::env::current_exe().context("finding this executable")?;
+    launch_spec_for(paths, exe)
+}
+
+/// `launch_spec` for the executable at `exe`: `tornect install` registers
+/// the installed copy (§B.1.1), never the program that ran the install.
+/// Refused when `exe` is not a file.
+pub(crate) fn launch_spec_for(
+    paths: &Paths,
+    exe: std::path::PathBuf,
+) -> anyhow::Result<LaunchSpec> {
     anyhow::ensure!(
         exe.is_file(),
         "{} no longer exists (was it rebuilt or replaced while running?); run          `tornect service install` from the installed binary",
         exe.display()
     );
-    let home = if Paths::platform().ok().as_ref() == Some(paths) {
-        None
+    Ok(LaunchSpec {
+        exe,
+        home: launch_home(paths)?,
+    })
+}
+
+/// The `--home` a registration for this home carries: `None` for the
+/// platform's default directories, else the home made absolute (the unit, the
+/// task or the entry starts in another directory).
+pub(crate) fn launch_home(paths: &Paths) -> anyhow::Result<Option<std::path::PathBuf>> {
+    if Paths::platform().ok().as_ref() == Some(paths) {
+        Ok(None)
     } else if *paths == Paths::from_home(&paths.config_dir) {
-        Some(
+        Ok(Some(
             std::fs::canonicalize(&paths.config_dir)
                 .with_context(|| format!("resolving {}", paths.config_dir.display()))?,
-        )
+        ))
     } else {
         anyhow::bail!("these Tornect directories are neither the default nor one --home root");
-    };
-    Ok(LaunchSpec { exe, home })
+    }
 }
 
 /// The start-at-login backend for this home, or one that says why there is
@@ -1209,7 +1227,7 @@ async fn send(paths: &Paths, route: &Route, op: IpcOp) -> anyhow::Result<IpcResp
 }
 
 /// Turn a failed response into an error the user can act on.
-fn require_ok(resp: &IpcResponse) -> anyhow::Result<()> {
+pub(crate) fn require_ok(resp: &IpcResponse) -> anyhow::Result<()> {
     if resp.ok {
         return Ok(());
     }
@@ -2367,14 +2385,14 @@ pub fn panic_now(paths: &Paths) -> anyhow::Result<()> {
 
 /// What every start-at-login message ends with (§B.8.7.5): Tornect never
 /// configures auto-login, so the host starts only once someone logs in.
-const AFTER_LOGIN_ONLY: &str = "The host starts only after you log in: Tornect never turns on \
+pub(crate) const AFTER_LOGIN_ONLY: &str = "The host starts only after you log in: Tornect never turns on \
      automatic login, so after a reboot this computer stays unreachable until someone logs in.";
 
 /// What starts at login (§B.1.1, decision M1-58), said by `service install`
 /// and `status` on both systems: the window, minimised. The name is older
 /// than the line; `the_login_host_line_is_the_readmes` keeps the line in the
 /// release README.
-const LOGIN_HOST_PINGS_ONLY: &str = "Started at login, Tornect runs in the background with its \
+pub(crate) const LOGIN_HOST_PINGS_ONLY: &str = "Started at login, Tornect runs in the background with its \
      window minimised where the desktop allows it; a request raises the window.";
 
 /// What starting at sign-in costs in privacy (§B.1.1, the setting's copy):

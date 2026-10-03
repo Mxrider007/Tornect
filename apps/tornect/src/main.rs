@@ -26,6 +26,7 @@ mod admin_helper;
 mod helper_cmd;
 mod history;
 mod host;
+mod install_cmd;
 mod prompt;
 mod secure_screen;
 mod term_block;
@@ -197,6 +198,15 @@ enum Command {
         #[command(subcommand)]
         action: unattended::BackupCmd,
     },
+    /// Install Tornect on this computer, after your password: on Linux for
+    /// you, in ~/.local/bin with a menu entry; on Windows in Program Files
+    /// (not in this build). Then choose whether Tornect starts when you sign
+    /// in. Your pairings and grants stay where they are.
+    Install,
+    /// Remove what `tornect install` set up, and the start at sign-in
+    /// whichever copy it runs, after your password. Your pairings and grants
+    /// stay.
+    Uninstall,
     /// Reach the Tor network (direct, obfs4 bridges or Snowflake, per `--bridges`)
     /// and report which transport worked.
     TorCheck,
@@ -659,6 +669,8 @@ fn main() -> anyhow::Result<()> {
         Command::Panic => unattended::panic_now(&paths),
         Command::Service { action } => unattended::service(&paths, action),
         Command::Backup { action } => unattended::backup(&paths, action),
+        Command::Install => install_cmd::install(&paths),
+        Command::Uninstall => install_cmd::uninstall(&paths),
     }
 }
 
