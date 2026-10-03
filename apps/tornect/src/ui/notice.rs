@@ -7,8 +7,10 @@
 //! is asked exactly as with the window open (decision M1-68): the
 //! notification only reads which sheets are open, and answers nothing.
 //!
-//! On Linux it goes to the session bus (`tornect_platform::notify`); this
-//! build shows none on other systems.
+//! On Linux it goes to the session bus (`tornect_platform::notify`); on
+//! Windows it is a notification-area balloon (`tornect_platform::win_notify`),
+//! which Windows 10 and 11 show as a toast; this build shows none on other
+//! systems.
 
 use std::sync::Arc;
 
@@ -17,7 +19,7 @@ use tokio::sync::mpsc;
 use super::model::{Popup, PopupKind, Shared};
 
 /// Where a notification sends the person: the sheet in the window.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 const ANSWER: &str = "Open Tornect to answer.";
 
 /// What a sheet asks, as its notification says it.
@@ -41,7 +43,7 @@ impl Asks {
 
     /// The notification's two lines: what is asked, and where to answer.
     #[must_use]
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     pub fn lines(self) -> (&'static str, &'static str) {
         match self {
             Self::Pair => ("A device asks to pair with this computer.", ANSWER),
@@ -99,10 +101,11 @@ impl Notices {
 }
 
 /// Start mirroring for the window whose model is `shared`: the returned
-/// sender takes the window's changes. On Linux they reach the session bus;
-/// elsewhere they are dropped.
+/// sender takes the window's changes. On Linux they reach the session bus, on
+/// Windows the notification area; elsewhere they are dropped.
 pub fn start(shared: Arc<Shared>) -> mpsc::UnboundedSender<NoticeChange> {
     let (tx, rx) = mpsc::unbounded_channel();
+    let note = move |line: String| shared.update(|m| m.note(line));
     #[cfg(target_os = "linux")]
     tokio::spawn(mirror(
         || async {
@@ -111,11 +114,60 @@ pub fn start(shared: Arc<Shared>) -> mpsc::UnboundedSender<NoticeChange> {
                 .map(|bus| Arc::new(bus) as Arc<dyn tornect_platform::notify::NotificationBus>)
         },
         rx,
-        move |line| shared.update(|m| m.note(line)),
+        note,
     ));
-    #[cfg(not(target_os = "linux"))]
-    drop((rx, shared));
+    #[cfg(windows)]
+    tokio::spawn(mirror_windows(rx, note));
+    #[cfg(not(any(target_os = "linux", windows)))]
+    drop((rx, note));
     tx
+}
+
+/// The id of `sheet`'s notification-area icon (sheet ids count up from 1 in
+/// a process).
+#[cfg(windows)]
+fn icon_id(sheet: u64) -> u32 {
+    u32::try_from(sheet).unwrap_or(u32::MAX)
+}
+
+/// Show and take down the Windows notifications as `changes` say, until
+/// `changes` ends: the notifications' thread starts at the first one, and
+/// one that cannot start is said once through `note`; the sheets raise the
+/// window all the same. Never called in a test: only the window's backend
+/// starts it, in background mode.
+#[cfg(windows)]
+async fn mirror_windows(mut changes: mpsc::UnboundedReceiver<NoticeChange>, note: impl Fn(String)) {
+    use tornect_platform::win_notify::Notices;
+
+    let mut notices: Option<Notices> = None;
+    let mut tried = false;
+    while let Some(change) = changes.recv().await {
+        match change {
+            NoticeChange::Show { sheet, asks } => {
+                if !tried {
+                    tried = true;
+                    match tokio::task::spawn_blocking(Notices::start).await {
+                        Ok(Ok(started)) => notices = Some(started),
+                        Ok(Err(e)) => note(format!(
+                            "the desktop notification of a request could not be shown: {e}"
+                        )),
+                        Err(e) => note(format!(
+                            "the desktop notification of a request could not be shown: {e}"
+                        )),
+                    }
+                }
+                if let Some(notices) = &notices {
+                    let (summary, body) = asks.lines();
+                    notices.show(icon_id(sheet), summary, body);
+                }
+            }
+            NoticeChange::Close { sheet } => {
+                if let Some(notices) = &notices {
+                    notices.remove(icon_id(sheet));
+                }
+            }
+        }
+    }
 }
 
 /// Show and take down the notifications as `changes` say, until `changes`
