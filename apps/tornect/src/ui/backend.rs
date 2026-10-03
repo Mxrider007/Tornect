@@ -1363,18 +1363,8 @@ async fn admin_command(
                 Ok(answer) => {
                     // An admin answer keeps no password (DA-15); its decoded `grant_reach`
                     // decides about a remembered one (C1, C11).
-                    match ua_client::settle_admin(&b.paths, &saved, &id, &answer) {
-                        Ok(settled) => {
-                            notes = ua_client::notes(
-                                &named,
-                                keychain,
-                                ua_client::Answered::Admin {
-                                    grant_reach: answer.grant_reach,
-                                },
-                                false,
-                                Some(&settled),
-                            );
-                        }
+                    match ua_client::after_admin(&b.paths, &saved, &id, &answer, &named) {
+                        Ok(after) => notes = after,
                         Err(e) => notes.push(format!("hosts.toml could not be updated: {e:#}")),
                     }
                     ua_client::log_attempt(
@@ -1658,29 +1648,24 @@ async fn viewed(
     if let (Some(request), Some(known)) = (&ua, &known) {
         let saved = ua_client::system_passwords(&b.device);
         // C1: the verified accept alone decides, before QUIC, by the key decoded from it.
-        let answer = ua_client::accepted(session.accept());
-        let settled = ua_client::settle(&b.paths, &saved, &id, answer, request);
+        let after = ua_client::after_accept(
+            &b.paths,
+            &saved,
+            &id,
+            session.accept(),
+            request,
+            &format!("\"{host}\""),
+            session.elevation_withheld(),
+        );
         let mut notes = Vec::new();
-        match &settled {
+        match &after.settled {
             Ok(_) => {}
-            Err(e) if answer.deletes_first() => {
+            Err(e) if after.deleted_first => {
                 notes.push(format!("hosts.toml could not be updated: {e:#}"));
             }
             Err(e) => notes.push(format!("The password could not be remembered: {e:#}")),
         }
-        notes.extend(ua_client::notes(
-            &format!("\"{host}\""),
-            saved.keychain().unwrap_or("the keychain"),
-            ua_client::Answered::Session {
-                elevation: session.accept().elevation(),
-                grant_reach: session.accept().grant_reach(),
-                asked_control: !request.view_only,
-                given_control: control,
-                withheld: session.elevation_withheld(),
-            },
-            request.remember,
-            settled.as_ref().ok(),
-        ));
+        notes.extend(after.notes);
         b.shared.update(|m| {
             for note in notes {
                 m.note(note);
