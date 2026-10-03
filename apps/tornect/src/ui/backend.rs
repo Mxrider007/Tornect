@@ -2082,6 +2082,92 @@ mod tests {
         );
     }
 
+    /// The row "indicator shown" as the host at `state_dir` answers it over
+    /// its control channel.
+    async fn indicator_row_of(
+        state_dir: &std::path::Path,
+    ) -> tornect_core::unattended::readiness::Probe {
+        use tornect_core::unattended::ipc::{IpcOp, IpcRequest, decode_payload};
+        use tornect_core::unattended::readiness::ReadinessSnapshot;
+        let resp = tornect_platform::ipc::request(
+            state_dir,
+            &IpcRequest {
+                id: 1,
+                op: IpcOp::Readiness,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(resp.ok, "{resp:?}");
+        let snapshot: ReadinessSnapshot =
+            decode_payload(resp.payload.as_deref().expect("a readiness payload")).unwrap();
+        snapshot.consent_indicator
+    }
+
+    /// §B.1.1 (MUST): background mode wires the window host as a start by
+    /// hand does. Its block window is the window's: a block request comes up
+    /// in the window and its Block blocks, where the headless seam is a timer
+    /// nobody can block. And the indicator fact reaches the host: its
+    /// readiness answer warns until the probe drew, then passes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_mode_wires_the_window_hosts_block_window() {
+        use tornect_core::unattended::readiness::Probe;
+        use tornect_signal::consent::BlockOutcome;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let popups = Popups::new(Arc::clone(&shared));
+        let identity = Arc::new(HostIdentity::from_seed(&[0x11; 32]));
+        let device = DeviceIdentity::from_seed(&[0x12; 32]);
+        let device_pk = HostSigner::public_key(&device);
+        let words = Arc::new(super::super::recognize::Recognizer::new(
+            paths.clone(),
+            super::super::recognize::Me {
+                name: "Linux PC".to_owned(),
+                onion: identity.id(),
+                device: tornect_core::DeviceId::from_bytes(device_pk),
+            },
+        ));
+        let shown = crate::host::IndicatorShown::default();
+        let b = Backend {
+            paths: paths.clone(),
+            cfg: Config::default(),
+            shared: Arc::clone(&shared),
+            popups: Arc::clone(&popups),
+            link: Arc::new(StreamLink::default()),
+            source: Source::TestCard,
+            host: true,
+            identity,
+            device: Arc::new(device),
+            device_pk,
+            words,
+            background: Some(shown.clone()),
+        };
+        let hosted = host_role(&b).await.expect("the window host is wired");
+        assert_eq!(
+            indicator_row_of(&paths.state_dir).await,
+            Probe::Warn(tornect_platform::readiness::INDICATOR_NOT_SHOWN.to_owned())
+        );
+        shown.set();
+        assert_eq!(indicator_row_of(&paths.state_dir).await, Probe::Ok);
+
+        let window = Arc::clone(&hosted.serving.1.block_window);
+        let running = tokio::spawn(async move { window.run(10, &[1; 8], "Laptop").await });
+        let request = loop {
+            if let Some(id) = shared.read(|m| m.blocks.first().map(|b| b.id)) {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(popups.answer_block(request), "the window's Block");
+        assert_eq!(running.await.unwrap(), BlockOutcome::Blocked);
+        if let Some(ipc) = &hosted.ipc {
+            ipc.abort();
+        }
+    }
+
     /// How the window's user answers a pairing sheet in
     /// [`pairing_requests`].
     #[derive(Debug, Clone, Copy)]
