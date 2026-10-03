@@ -20,6 +20,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use clap::Subcommand;
 use tornect_core::id::DeviceId;
+use tornect_core::levels::FactsSource;
 use tornect_core::session_log::{Actor, SessionLog};
 use tornect_core::unattended::grant::Preset;
 use tornect_core::unattended::guard::{
@@ -27,7 +28,7 @@ use tornect_core::unattended::guard::{
 };
 use tornect_core::unattended::ipc::{
     GrantOptions, IpcOp, IpcRequest, IpcResponse, LogPage, MasterOnPayload, PolicyInputsPayload,
-    RegStartPayload, codes, encode_payload,
+    RegStartPayload, SetLevelNonePayload, codes, encode_payload,
 };
 use tornect_core::unattended::readiness::{ReadinessSnapshot, SharedReadiness};
 use tornect_core::unattended::store::{GrantStore, LoadMode};
@@ -55,6 +56,10 @@ pub struct HostContext {
     pub kill: Option<KillSwitch>,
     /// `sessions.log`, for `Log`.
     pub log: SessionLog,
+    /// The account facts and the administrator helper task's presence, the
+    /// source the guard reads them from (decision M1-67): what `SetLevelNone`'s
+    /// answer says still keeps control at the administrator level.
+    pub facts: Arc<dyn FactsSource>,
 }
 
 impl HostContext {
@@ -459,9 +464,7 @@ pub fn dispatch(ctx: &HostContext, req: IpcRequest) -> IpcResponse {
 
         // §B.1.1: raising needs a window, and this host shows none.
         IpcOp::Show => IpcResponse::fail(id, codes::G_UNSUPPORTED, NO_WINDOW_TO_SHOW),
-        IpcOp::SetLevelNone { .. } => {
-            IpcResponse::fail(id, codes::G_UNSUPPORTED, "not available in this build")
-        }
+        IpcOp::SetLevelNone { device } => set_level_none(ctx, id, by, &device),
 
         IpcOp::Unknown(tag) => {
             IpcResponse::fail(id, codes::E_UNKNOWN_KIND, format!("unknown op tag {tag}"))
@@ -471,6 +474,74 @@ pub fn dispatch(ctx: &HostContext, req: IpcRequest) -> IpcResponse {
 
 /// Why a host refuses `IpcOp::Show` when it has no window to raise (§B.1.1).
 pub(crate) const NO_WINDOW_TO_SHOW: &str = "This Tornect host has no window to show.";
+
+/// The options `set-level <device> none` hands the guard (§B.8.7.4, decision
+/// M1-68): the level, and nothing else. Every other field `None` keeps what
+/// the grant holds (`GrantOptions`), so a change made meanwhile is never
+/// undone and the widening branch of `set_options` is never reached; nothing
+/// read from the store fills them, and no input can raise the level.
+fn level_none_options() -> GrantOptions {
+    GrantOptions {
+        elevation: Some(tornect_core::levels::Elevation::None),
+        ..GrantOptions::default()
+    }
+}
+
+/// `IpcOp::SetLevelNone` (§B.8.6.2's deny-direction row; decision M1-68): no
+/// re-authentication, and allowed during a remote session. The guard logs
+/// `GrantChanged` and, once a lowering is committed, ends that device's
+/// sessions at the administrator level (D6); a session below the level goes
+/// on. A grant without the level is left as it is, and the answer's detail
+/// says so. Every ok answer carries which clause of the turn-off sentence's
+/// condition holds now (§B.8.7.1 ⑤a).
+fn set_level_none(ctx: &HostContext, id: u64, by: Actor, device: &DeviceId) -> IpcResponse {
+    // Read for the answer's wording only: what the guard is sent never
+    // depends on it.
+    let held = ctx
+        .guard
+        .store()
+        .grant(device)
+        .is_some_and(|g| g.holds_level());
+    if let Err(ref e) = ctx.guard.set_options(by, device, &level_none_options()) {
+        return guard_fail(id, e);
+    }
+    let payload = SetLevelNonePayload {
+        keeps: keeps_at_the_level(ctx, device),
+    };
+    let mut r = match encode_payload(&payload) {
+        Ok(p) => IpcResponse::ok_with(id, p),
+        // Never (a one-entry map); the change is committed, so not a failure.
+        Err(_) => IpcResponse::ok(id),
+    };
+    if !held {
+        r.detail = Some(LEVEL_ALREADY_NONE.to_owned());
+    }
+    r
+}
+
+/// Which clause of the turn-off sentence's condition holds with `device` at
+/// none (§B.8.7.1 ⑤a): another grant holds the level; else the administrator
+/// helper task stays registered (a presence that cannot be read counts as
+/// registered, decision M1-67); else nothing.
+fn keeps_at_the_level(ctx: &HostContext, device: &DeviceId) -> u8 {
+    let another = ctx
+        .guard
+        .store()
+        .grants()
+        .iter()
+        .any(|g| g.device != *device && g.holds_level());
+    if another {
+        SetLevelNonePayload::ANOTHER_ADMIN_GRANT
+    } else if ctx.facts.helper_task().counts() {
+        SetLevelNonePayload::HELPER_TASK
+    } else {
+        SetLevelNonePayload::NOTHING
+    }
+}
+
+/// The detail of `SetLevelNone`'s answer for a grant without the
+/// administrator level.
+const LEVEL_ALREADY_NONE: &str = "no administrator access; unchanged";
 
 /// [`dispatch`], plus what to undo if the answer never reaches the CLI.
 ///
@@ -657,6 +728,15 @@ pub enum UnattendedCmd {
         /// Device ID, fingerprint or pinned label.
         device: String,
     },
+    /// Take a grant's administrator access away (deny-direction; no
+    /// re-authentication, also during a session). Only `none` is accepted.
+    SetLevel {
+        /// Device ID, fingerprint or pinned label.
+        device: String,
+        /// The level: `none`.
+        #[arg(value_enum)]
+        level: LevelArg,
+    },
     /// Print the readiness report.
     Readiness,
     /// Print `sessions.log`.
@@ -689,6 +769,13 @@ impl From<PresetArg> for Preset {
             PresetArg::HelpingSomeone => Self::HelpingSomeone,
         }
     }
+}
+
+/// `set-level`'s level: the command only lowers (decision M1-68).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum LevelArg {
+    /// No administrator access.
+    None,
 }
 
 /// `tornect service …` (§B.8.7.5).
@@ -853,19 +940,15 @@ fn context(
         LoadMode::Host => GrantStore::open(paths, secrets_dyn, clock, log.clone())?,
         LoadMode::Offline => GrantStore::open_offline(paths, secrets_dyn, clock, log.clone())?,
     };
-    let guard = MutationGuard::new(
-        store,
-        reauth_backend(),
-        activity,
-        Arc::new(tornect_platform::levels::LiveFacts),
-    )
-    .with_paired_devices(Arc::new(FilePairedDevices::new(
-        paths.trusted_devices_file(),
-    )))
-    .with_attended_history(Arc::new(SessionLogHistory::new(log.clone())))
-    .with_server_setup_source(Arc::new(
-        tornect_signal::unattended::OpaqueServerSetupSource,
-    ));
+    let facts: Arc<dyn FactsSource> = Arc::new(tornect_platform::levels::LiveFacts);
+    let guard = MutationGuard::new(store, reauth_backend(), activity, Arc::clone(&facts))
+        .with_paired_devices(Arc::new(FilePairedDevices::new(
+            paths.trusted_devices_file(),
+        )))
+        .with_attended_history(Arc::new(SessionLogHistory::new(log.clone())))
+        .with_server_setup_source(Arc::new(
+            tornect_signal::unattended::OpaqueServerSetupSource,
+        ));
     // A revoke, disable, suspend or lowering here ends that device's sessions within a
     // second (decision M1-67, D6); the offline route has no sessions to end.
     let guard = match &kill {
@@ -881,6 +964,7 @@ fn context(
         user_inputs,
         kill,
         log,
+        facts,
     })
 }
 
@@ -1447,6 +1531,13 @@ pub async fn run_unattended(paths: &Paths, cmd: UnattendedCmd) -> anyhow::Result
             println!("Resumed.");
             Ok(())
         }
+        UnattendedCmd::SetLevel {
+            device,
+            level: LevelArg::None,
+        } => {
+            let device = resolve_device(paths, &route, &device).await?;
+            set_level_none_cli(paths, &route, device, &mut Terminal).await
+        }
         UnattendedCmd::Readiness => {
             let resp = send(paths, &route, IpcOp::Readiness).await?;
             require_ok(&resp)?;
@@ -1592,6 +1683,26 @@ pub(crate) const WRITE_IT_DOWN: &str =
 
 /// The ⑤a offer's question on the command line (§B.8.7.4): default yes.
 pub(crate) const OFFER_QUESTION: &str = "Give them new passwords now? [Y/n]";
+
+/// The turn-off sentence (§B.8.7.1 ⑤a), printed by `set-level <device> none`;
+/// `<device>` stands for the grant's pinned label.
+pub(crate) const LEVEL_OFF: &str = "Administrator access is off for <device>. A session of \
+     <device> running as administrator ends now.";
+
+/// What the turn-off sentence adds while another grant holds the level.
+pub(crate) const LEVEL_OFF_ANOTHER_GRANT: &str = "<device> keeps control of this computer. \
+     While another device has administrator access, control can still reach programs that run \
+     as administrator. To stop that now, set <device> to View only.";
+
+/// What it adds while the administrator helper task stays registered.
+pub(crate) const LEVEL_OFF_HELPER_TASK: &str = "<device> keeps control of this computer. \
+     While the administrator helper is still registered: Tornect removes it the next time you \
+     sign in here, control can still reach programs that run as administrator. To stop that \
+     now, set <device> to View only.";
+
+/// What `set-level <device> none` says of a grant without the level.
+pub(crate) const NO_LEVEL_UNCHANGED: &str =
+    "<device> has no administrator access; nothing changed.";
 
 /// The terminal as the administrator forms use it: a seam the tests script.
 pub(crate) trait Console {
@@ -1862,6 +1973,41 @@ async fn offer_new_passwords(
             }
         }
         remaining = left;
+    }
+    Ok(())
+}
+
+/// `tornect unattended set-level <device> none` (§B.8.7.4, decision M1-68):
+/// one `SetLevelNone`, then the turn-off sentence with its condition (§B.8.7.1
+/// ⑤a), or the line that the grant had no administrator level.
+async fn set_level_none_cli(
+    paths: &Paths,
+    route: &Route,
+    device: DeviceId,
+    io: &mut dyn Console,
+) -> anyhow::Result<()> {
+    let report = status_report(paths, route).await?;
+    let label = label_of(paths, &report, &device);
+    let resp = send(paths, route, IpcOp::SetLevelNone { device }).await?;
+    require_ok(&resp)?;
+    if resp.detail.as_deref() == Some(LEVEL_ALREADY_NONE) {
+        io.out(&NO_LEVEL_UNCHANGED.replace("<device>", &label));
+        return Ok(());
+    }
+    io.out(&LEVEL_OFF.replace("<device>", &label));
+    let payload = resp
+        .payload
+        .as_deref()
+        .context("SetLevelNone returned no payload")?;
+    let payload: SetLevelNonePayload = tornect_core::unattended::ipc::decode_payload(payload)?;
+    payload.validate()?;
+    let condition = match payload.keeps {
+        SetLevelNonePayload::ANOTHER_ADMIN_GRANT => Some(LEVEL_OFF_ANOTHER_GRANT),
+        SetLevelNonePayload::HELPER_TASK => Some(LEVEL_OFF_HELPER_TASK),
+        _ => None,
+    };
+    if let Some(line) = condition {
+        io.out(&line.replace("<device>", &label));
     }
     Ok(())
 }
@@ -2220,7 +2366,8 @@ mod tests {
     use tornect_core::keystore::FileSecretStore;
     use tornect_core::unattended::clock::SystemClock;
     use tornect_core::unattended::guard::{
-        AllowAllPaired, AllowAllReAuth, DenyAllReAuth, NoSessionActivity,
+        AllowAllPaired, AllowAllReAuth, DenyAllReAuth, DeviceSessionEnd, EndScope,
+        NoSessionActivity, ScriptedActivity,
     };
     use tornect_core::unattended::ipc::{StatusReport, decode_payload};
 
@@ -2379,6 +2526,7 @@ mod tests {
                 user_inputs: vec!["tornect".to_owned()],
                 kill: None,
                 log,
+                facts: Arc::new(tornect_core::levels::FixedFacts::linux()),
             },
             autostart,
         }
@@ -2849,6 +2997,7 @@ mod tests {
             user_inputs: Vec::new(),
             kill: None,
             log: allow.ctx.log.clone(),
+            facts: Arc::new(tornect_core::levels::FixedFacts::linux()),
         };
         let resp = go(&ctx, IpcOp::Off);
         assert!(
@@ -3538,6 +3687,10 @@ mod tests {
             user_inputs: vec!["tornect".to_owned()],
             kill: None,
             log,
+            facts: Arc::new(tornect_core::levels::FixedFacts::new(
+                facts,
+                tornect_core::levels::HelperPresence::Absent,
+            )),
         };
         assert!(go(&ctx, IpcOp::On).ok);
         (paths, Route::Offline(Box::new(ctx)))
@@ -3969,5 +4122,450 @@ mod tests {
         assert_eq!(reauth.calls().len(), asked_before, "no dialog");
         assert!(io.out.is_empty());
         assert!(guard_of(&route).store().grant(&target).is_none());
+    }
+
+    // ------------------------------------------------ set-level <device> none
+
+    /// Every device end the guard asks for, in order.
+    #[derive(Default)]
+    struct RecordingEnd {
+        ended: std::sync::Mutex<Vec<(DeviceId, EndScope)>>,
+    }
+
+    impl RecordingEnd {
+        fn take(&self) -> Vec<(DeviceId, EndScope)> {
+            std::mem::take(&mut *self.ended.lock().unwrap())
+        }
+    }
+
+    impl DeviceSessionEnd for RecordingEnd {
+        fn end_device(&self, device: &DeviceId, scope: EndScope) {
+            self.ended.lock().unwrap().push((*device, scope));
+        }
+    }
+
+    /// A host context where grants can hold the administrator level: an
+    /// installed copy on a Windows administrator account's facts (the helper
+    /// task's presence as `facts` says), re-authentication allowed and
+    /// recorded, sessions as `activity` says, device ends recorded;
+    /// unattended access on.
+    struct LevelEnv {
+        tmp: tempfile::TempDir,
+        ctx: HostContext,
+        facts: Arc<tornect_core::levels::FixedFacts>,
+        activity: Arc<ScriptedActivity>,
+        ended: Arc<RecordingEnd>,
+        reauth: Arc<AllowAllReAuth>,
+    }
+
+    fn level_env() -> LevelEnv {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let secrets = Arc::new(FileSecretStore::open(paths.keys_dir()).unwrap());
+        let log = SessionLog::new(paths.sessions_log());
+        let store = GrantStore::open(
+            &paths,
+            Arc::clone(&secrets) as Arc<dyn tornect_core::SecretStore>,
+            Arc::new(SystemClock::default()),
+            log.clone(),
+        )
+        .unwrap();
+        let facts = Arc::new(tornect_core::levels::FixedFacts::new(
+            windows_admin(),
+            tornect_core::levels::HelperPresence::Absent,
+        ));
+        let activity = Arc::new(ScriptedActivity::default());
+        let ended = Arc::new(RecordingEnd::default());
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let guard = MutationGuard::new(
+            store,
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::clone(&activity) as Arc<dyn RemoteSessionActivity>,
+            Arc::clone(&facts) as Arc<dyn FactsSource>,
+        )
+        .with_paired_devices(Arc::new(AllowAllPaired))
+        .with_server_setup_source(Arc::new(
+            tornect_signal::unattended::OpaqueServerSetupSource,
+        ))
+        .with_device_end(Arc::clone(&ended) as Arc<dyn DeviceSessionEnd>);
+        let ctx = HostContext {
+            guard: Arc::new(guard),
+            host_onion_pk: HOST_PK,
+            readiness: SharedReadiness::default(),
+            autostart: Arc::new(FakeAutostart::default()),
+            user_inputs: vec!["tornect".to_owned()],
+            kill: None,
+            log,
+            facts: Arc::clone(&facts) as Arc<dyn FactsSource>,
+        };
+        assert!(go(&ctx, IpcOp::On).ok);
+        LevelEnv {
+            tmp,
+            ctx,
+            facts,
+            activity,
+            ended,
+            reauth,
+        }
+    }
+
+    impl LevelEnv {
+        /// A grant at the administrator level (a generated password), with
+        /// `options` besides.
+        fn admin_grant(&self, device: &DeviceId, options: GrantOptions) {
+            self.ctx
+                .guard
+                .create_grant(
+                    Actor::Cli,
+                    device,
+                    Preset::HeadlessBox,
+                    &GrantOptions {
+                        elevation: Some(tornect_core::levels::Elevation::Admin),
+                        ..options
+                    },
+                    &[0u8; 192],
+                    true,
+                )
+                .unwrap();
+        }
+
+        /// A Control grant at none, before any grant holds the level.
+        fn plain_grant(&self, device: &DeviceId) {
+            self.ctx
+                .guard
+                .create_grant(
+                    Actor::Cli,
+                    device,
+                    Preset::HeadlessBox,
+                    &GrantOptions::default(),
+                    &[0u8; 192],
+                    false,
+                )
+                .unwrap();
+        }
+
+        /// The same store behind a guard that refuses every re-authentication.
+        fn refusing(&self) -> HostContext {
+            let guard = MutationGuard::new(
+                self.ctx.guard.store().clone(),
+                Arc::new(DenyAllReAuth),
+                Arc::clone(&self.activity) as Arc<dyn RemoteSessionActivity>,
+                Arc::clone(&self.facts) as Arc<dyn FactsSource>,
+            )
+            .with_device_end(Arc::clone(&self.ended) as Arc<dyn DeviceSessionEnd>);
+            HostContext {
+                guard: Arc::new(guard),
+                host_onion_pk: HOST_PK,
+                readiness: SharedReadiness::default(),
+                autostart: Arc::new(autostart::NoAutostart("test".to_owned())),
+                user_inputs: Vec::new(),
+                kill: None,
+                log: self.ctx.log.clone(),
+                facts: Arc::clone(&self.facts) as Arc<dyn FactsSource>,
+            }
+        }
+
+        fn grant(&self, device: &DeviceId) -> tornect_core::unattended::grant::UnattendedGrant {
+            self.ctx.guard.store().grant(device).unwrap()
+        }
+    }
+
+    fn keeps(resp: &IpcResponse) -> u8 {
+        decode_payload::<SetLevelNonePayload>(resp.payload.as_deref().expect("a payload"))
+            .unwrap()
+            .keeps
+    }
+
+    /// Decision M1-68, §B.8.6.2's deny-direction row: `set-level none` takes
+    /// the level away with no re-authentication, also while a remote session
+    /// is live. Shown failing first: this build refused it (`G_UNSUPPORTED`).
+    #[test]
+    fn set_level_none_needs_no_reauth_and_lowers() {
+        let env = level_env();
+        let target = device(61);
+        env.admin_grant(&target, GrantOptions::default());
+        assert!(env.grant(&target).holds_level());
+        env.activity.set_live(true);
+        let refusing = env.refusing();
+        let resp = go(&refusing, IpcOp::SetLevelNone { device: target });
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(resp.detail, None, "lowered, so no unchanged note");
+        assert!(!env.grant(&target).holds_level());
+        assert_eq!(keeps(&resp), SetLevelNonePayload::NOTHING);
+    }
+
+    /// FC-4: the guard is sent the level and nothing else, built from nothing
+    /// read: every other field of the grant stays as it was.
+    #[test]
+    fn set_level_none_sends_only_the_elevation() {
+        assert_eq!(
+            level_none_options(),
+            GrantOptions {
+                elevation: Some(tornect_core::levels::Elevation::None),
+                ..GrantOptions::default()
+            }
+        );
+        let env = level_env();
+        let target = device(62);
+        env.admin_grant(
+            &target,
+            GrantOptions {
+                label: Some("Desk".to_owned()),
+                block_window_s: Some(17),
+                max_session_secs: Some(1234),
+                require_tor_only: Some(true),
+                ..GrantOptions::default()
+            },
+        );
+        let before = env.grant(&target);
+        assert!(go(&env.ctx, IpcOp::SetLevelNone { device: target }).ok);
+        let after = env.grant(&target);
+        let mut expected = before.clone();
+        expected.elevation = tornect_core::levels::Elevation::None;
+        assert!(after == expected, "only the level changed:\n{after:?}");
+    }
+
+    /// FC-4: a change made after the command line read the grant is kept (the
+    /// level goes alone, so nothing stale rides with it), and nothing asks for
+    /// a dialog: a refusing re-authentication never runs.
+    #[test]
+    fn set_level_none_never_reaches_reauth() {
+        let env = level_env();
+        let target = device(63);
+        env.admin_grant(&target, GrantOptions::default());
+        let dialogs = env.reauth.calls().len();
+        // the narrowing made meanwhile: control → view only (deny-direction)
+        env.ctx
+            .guard
+            .set_options(
+                Actor::Ui,
+                &target,
+                &GrantOptions {
+                    mode: Some(tornect_core::session_log::SessionMode::ViewOnly),
+                    ..GrantOptions::default()
+                },
+            )
+            .unwrap();
+        let resp = go(&env.refusing(), IpcOp::SetLevelNone { device: target });
+        assert!(resp.ok, "{resp:?}");
+        let after = env.grant(&target);
+        assert_eq!(after.mode, tornect_core::session_log::SessionMode::ViewOnly);
+        assert!(!after.holds_level());
+        assert_eq!(env.reauth.calls().len(), dialogs, "no dialog asked");
+    }
+
+    /// The op carries no level: whatever the grant holds, it ends at none.
+    #[test]
+    fn set_level_none_never_raises() {
+        let env = level_env();
+        let (plain, admin) = (device(64), device(65));
+        env.plain_grant(&plain);
+        env.admin_grant(&admin, GrantOptions::default());
+        for target in [plain, admin, plain] {
+            assert!(go(&env.ctx, IpcOp::SetLevelNone { device: target }).ok);
+            assert!(!env.grant(&target).holds_level());
+        }
+        assert!(!env.grant(&plain).holds_level() && !env.grant(&admin).holds_level());
+    }
+
+    /// D6: a lowering ends that device's sessions at the administrator level
+    /// only (a session below the level goes on), and no other device's.
+    #[test]
+    fn set_level_none_ends_only_the_admin_session() {
+        let env = level_env();
+        let (target, other) = (device(66), device(67));
+        env.admin_grant(&target, GrantOptions::default());
+        env.admin_grant(&other, GrantOptions::default());
+        env.ended.take();
+        assert!(go(&env.ctx, IpcOp::SetLevelNone { device: target }).ok);
+        assert_eq!(env.ended.take(), vec![(target, EndScope::AtTheLevel)]);
+        assert!(env.grant(&other).holds_level(), "another device untouched");
+        // nothing left to lower: nothing ends
+        assert!(go(&env.ctx, IpcOp::SetLevelNone { device: target }).ok);
+        assert!(env.ended.take().is_empty());
+    }
+
+    /// A grant without the level is left as it is: the answer is ok and says
+    /// so, every field stays, and no session ends.
+    #[test]
+    fn set_level_none_on_a_grant_at_none_changes_nothing() {
+        let env = level_env();
+        let target = device(68);
+        env.plain_grant(&target);
+        let before = env.grant(&target);
+        env.ended.take();
+        let resp = go(&env.ctx, IpcOp::SetLevelNone { device: target });
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(resp.detail.as_deref(), Some(LEVEL_ALREADY_NONE));
+        assert_eq!(keeps(&resp), SetLevelNonePayload::NOTHING);
+        assert!(env.grant(&target) == before, "unchanged");
+        assert!(env.ended.take().is_empty());
+        // a device with no grant is refused by the guard, nothing changed
+        let resp = go(&env.ctx, IpcOp::SetLevelNone { device: device(69) });
+        assert!(!resp.ok);
+        assert_eq!(resp.code, codes::G_PRECONDITION, "{resp:?}");
+    }
+
+    /// M1-46 (kept): a host that started without its store answers `tornect
+    /// panic` only; `set-level none` is refused with that reason and ends
+    /// nothing.
+    #[test]
+    fn a_storeless_host_refuses_set_level_none() {
+        let kill = KillSwitch::new();
+        let resp = dispatch_without_store(
+            &kill,
+            "the store is locked",
+            IpcRequest {
+                id: 4,
+                op: IpcOp::SetLevelNone { device: device(70) },
+            },
+        );
+        assert!(!resp.ok);
+        assert_eq!(resp.code, codes::G_PRECONDITION);
+        assert!(
+            resp.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("answers only `tornect panic`")),
+            "{resp:?}"
+        );
+        assert_eq!(kill.fired(), None);
+    }
+
+    /// Only `none` is a level `set-level` takes (decision M1-68): the command
+    /// cannot raise.
+    #[test]
+    fn set_level_parses_only_none() {
+        #[derive(clap::Parser, Debug)]
+        struct Cli {
+            #[command(subcommand)]
+            cmd: UnattendedCmd,
+        }
+        let parse = |args: &[&str]| {
+            <Cli as clap::Parser>::try_parse_from(["unattended"].iter().chain(args))
+        };
+        let parsed = parse(&["set-level", "Laptop", "none"]).unwrap();
+        assert!(
+            matches!(
+                parsed.cmd,
+                UnattendedCmd::SetLevel { ref device, level: LevelArg::None } if device == "Laptop"
+            ),
+            "{parsed:?}"
+        );
+        for level in ["administrator", "admin", "None", "NONE", "view", ""] {
+            assert!(
+                parse(&["set-level", "Laptop", level]).is_err(),
+                "{level:?} parsed"
+            );
+        }
+        assert!(
+            parse(&["set-level", "Laptop"]).is_err(),
+            "the level is required"
+        );
+    }
+
+    /// The command line prints the turn-off sentence (§B.8.7.1 ⑤a) after a
+    /// lowering, and the unchanged line for a grant without the level.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_level_prints_the_turn_off_sentence() {
+        let env = level_env();
+        let (target, plain) = (device(71), device(72));
+        env.plain_grant(&plain);
+        env.admin_grant(&target, GrantOptions::default());
+        let paths = Paths::from_home(env.tmp.path());
+        let route = Route::Offline(Box::new(env.refusing()));
+        let mut io = Script::new(true, &[]);
+        set_level_none_cli(&paths, &route, target, &mut io)
+            .await
+            .unwrap();
+        let label = target.fingerprint();
+        assert_eq!(io.out, vec![LEVEL_OFF.replace("<device>", &label)]);
+        assert_eq!(
+            io.out[0],
+            format!(
+                "Administrator access is off for {label}. A session of {label} running as \
+                 administrator ends now."
+            )
+        );
+        assert!(io.err.is_empty() && io.asked.is_empty());
+        assert!(!env.grant(&target).holds_level());
+        let mut io = Script::new(true, &[]);
+        set_level_none_cli(&paths, &route, plain, &mut io)
+            .await
+            .unwrap();
+        assert_eq!(
+            io.out,
+            vec![format!(
+                "{} has no administrator access; nothing changed.",
+                plain.fingerprint()
+            )]
+        );
+    }
+
+    /// The turn-off sentence's condition (§B.8.7.1 ⑤a): while another grant
+    /// holds the level, then while the helper task stays registered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_level_prints_the_turn_off_sentence_with_its_condition() {
+        let env = level_env();
+        let (first, second) = (device(73), device(74));
+        env.admin_grant(&first, GrantOptions::default());
+        env.admin_grant(&second, GrantOptions::default());
+        let paths = Paths::from_home(env.tmp.path());
+        let facts = Arc::clone(&env.facts);
+        let route = Route::Offline(Box::new(env.refusing()));
+        let mut io = Script::new(true, &[]);
+        set_level_none_cli(&paths, &route, first, &mut io)
+            .await
+            .unwrap();
+        let label = first.fingerprint();
+        assert_eq!(
+            io.out,
+            vec![
+                LEVEL_OFF.replace("<device>", &label),
+                format!(
+                    "{label} keeps control of this computer. While another device has \
+                     administrator access, control can still reach programs that run as \
+                     administrator. To stop that now, set {label} to View only."
+                ),
+            ]
+        );
+        // the last admin grant, with the helper task still registered
+        facts.set_helper_task(tornect_core::levels::HelperPresence::Registered);
+        let mut io = Script::new(true, &[]);
+        set_level_none_cli(&paths, &route, second, &mut io)
+            .await
+            .unwrap();
+        let label = second.fingerprint();
+        assert_eq!(
+            io.out,
+            vec![
+                LEVEL_OFF.replace("<device>", &label),
+                format!(
+                    "{label} keeps control of this computer. While the administrator helper is \
+                     still registered: Tornect removes it the next time you sign in here, control \
+                     can still reach programs that run as administrator. To stop that now, set \
+                     {label} to View only."
+                ),
+            ]
+        );
+        // nothing left: a presence that cannot be read still counts
+        facts.set_helper_task(tornect_core::levels::HelperPresence::Unreadable);
+        let resp = go(
+            match &route {
+                Route::Offline(ctx) => ctx,
+                Route::Host => unreachable!(),
+            },
+            IpcOp::SetLevelNone { device: second },
+        );
+        assert_eq!(keeps(&resp), SetLevelNonePayload::HELPER_TASK);
+        facts.set_helper_task(tornect_core::levels::HelperPresence::Absent);
+        let resp = go(
+            match &route {
+                Route::Offline(ctx) => ctx,
+                Route::Host => unreachable!(),
+            },
+            IpcOp::SetLevelNone { device: second },
+        );
+        assert_eq!(keeps(&resp), SetLevelNonePayload::NOTHING);
     }
 }
