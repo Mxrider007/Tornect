@@ -98,7 +98,8 @@ impl ReAuth for DevReAuth {
 
 /// What the Windows dialog says the password is for, per operation class —
 /// the same five classes as the polkit actions, so both OSes tell the user
-/// the same thing.
+/// the same thing; installing and removing Tornect, which polkit counts as
+/// autostart changes, are named as what they are.
 #[must_use]
 pub fn purpose_of(op: &str) -> &'static str {
     match op {
@@ -109,6 +110,8 @@ pub fn purpose_of(op: &str) -> &'static str {
             "turn unattended access back on for this computer"
         }
         "service_install" | "service_uninstall" => "change what starts when you log in",
+        "install" => "install Tornect on this computer",
+        "uninstall" => "remove Tornect from this computer",
         // §B.8.7.5's copy, at the moment of consent (slice-F F1-3).
         "service_install_elevated" => {
             "start the Tornect host ELEVATED at every login. Running the host elevated makes every \
@@ -514,8 +517,13 @@ impl PolkitReAuth {
             "create_grant" | "set_password" | "reg_start" => "grant",
             // Re-opens access that was closed.
             "master_on" | "enable" | "resume" | "unlock" => "enable",
-            // Changes what runs at login.
-            "service_install" | "service_install_elevated" | "service_uninstall" => "autostart",
+            // Changes what runs at login; installing or removing Tornect
+            // itself (§B.1.1), which the policy file gives no class of its own.
+            "service_install"
+            | "service_install_elevated"
+            | "service_uninstall"
+            | "install"
+            | "uninstall" => "autostart",
             // Moves secrets out of the store.
             "backup_export" | "backup_import" | "identity_view" => "export",
             // Policy and settings.
@@ -724,6 +732,8 @@ mod tests {
             "backup_import",
             "identity_view",
             "settings_change",
+            "install",
+            "uninstall",
         ] {
             let action = p.action_for(op);
             assert!(
@@ -731,6 +741,10 @@ mod tests {
                 "op `{op}` maps to `{action}`, which the policy file does not declare"
             );
         }
+        // §B.1.1: installing and removing Tornect ask through the autostart
+        // class, the policy file unchanged.
+        assert_eq!(p.action_for("install"), "org.tornect.autostart");
+        assert_eq!(p.action_for("uninstall"), "org.tornect.autostart");
         assert_eq!(
             p.action_for("some_future_operation"),
             "org.tornect.grant",
@@ -1081,9 +1095,14 @@ mod tests {
             "backup_import",
             "identity_view",
             "settings_change",
+            "install",
+            "uninstall",
         ] {
             assert!(!purpose_of(op).is_empty(), "{op}");
         }
+        // §B.1.1: the install's dialog says what it changes.
+        assert_eq!(purpose_of("install"), "install Tornect on this computer");
+        assert_eq!(purpose_of("uninstall"), "remove Tornect from this computer");
         // Slice-F F1-3: the dialog of the elevated install says what it means
         // (§B.8.7.5's copy), and no other dialog says it.
         let elevated = purpose_of("service_install_elevated");

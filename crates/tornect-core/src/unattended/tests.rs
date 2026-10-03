@@ -5769,3 +5769,190 @@ fn a_raise_that_appears_during_the_window_dialog_does_not_commit() {
         ["create_grant", "set_password", "raise"]
     );
 }
+
+// ------------------------------------------------------------ tornect install (§B.1.1)
+
+/// A guard over `store` asking `reauth` and told about remote sessions by
+/// `activity`, as the offline route builds it.
+fn install_guard(
+    store: &GrantStore,
+    reauth: Arc<dyn ReAuth>,
+    activity: Arc<dyn super::guard::RemoteSessionActivity>,
+) -> MutationGuard {
+    MutationGuard::new(
+        store.clone(),
+        reauth,
+        activity,
+        Arc::new(FixedFacts::linux()),
+    )
+}
+
+/// The `installed` and `uninstalled` lines in `sessions.log`, as (event, by).
+fn install_lines(env: &Env) -> Vec<(SessionEvent, Option<Actor>)> {
+    env.log_events()
+        .into_iter()
+        .filter(|r| matches!(r.event, SessionEvent::Installed | SessionEvent::Uninstalled))
+        .map(|r| (r.event, r.by))
+        .collect()
+}
+
+/// §B.1.1: `tornect install` and `uninstall` are access-increasing guard
+/// operations (§B.8.6.2): a fresh OS re-authentication comes first, and a
+/// refused one authorises nothing, logs the refusal and no install line.
+#[test]
+fn install_needs_reauth_first() {
+    let env = Env::new();
+    let store = env.open();
+    let deny = install_guard(&store, Arc::new(DenyAllReAuth), Arc::new(NoSessionActivity));
+    for op in [ExternalOp::Install, ExternalOp::Uninstall] {
+        match deny.authorize(Actor::Cli, &op) {
+            Err(e) => assert_eq!(e.code(), codes::G_REAUTH_FAILED, "{op:?}: {e}"),
+            Ok(()) => panic!("{op:?} authorised without re-authentication"),
+        }
+    }
+    assert!(install_lines(&env).is_empty(), "{:?}", install_lines(&env));
+    let refused: Vec<String> = env
+        .log_events()
+        .into_iter()
+        .filter(|r| r.event == SessionEvent::GrantMutationRefused)
+        .filter_map(|r| r.op)
+        .collect();
+    assert_eq!(refused, ["install", "uninstall"]);
+    let reauth = Arc::new(AllowAllReAuth::default());
+    let allow = install_guard(
+        &store,
+        Arc::clone(&reauth) as Arc<dyn ReAuth>,
+        Arc::new(NoSessionActivity),
+    );
+    allow.authorize(Actor::Cli, &ExternalOp::Install).unwrap();
+    allow.authorize(Actor::Cli, &ExternalOp::Uninstall).unwrap();
+    assert_eq!(reauth.calls(), ["install", "uninstall"]);
+}
+
+/// §B.1.1 and §B.8.6.2: no install or uninstall during a remote session or
+/// within 60 s after one, and no dialog then. The offline route, the one
+/// `tornect install` takes, knows no last session end (its activity source
+/// answers `None`), so this clause is proven here, with an injected activity
+/// source, only.
+#[test]
+fn install_is_refused_within_60_s_of_a_session() {
+    let env = Env::new();
+    let store = env.open();
+    let reauth = Arc::new(AllowAllReAuth::default());
+    let activity = Arc::new(ScriptedActivity::default());
+    let guard = install_guard(
+        &store,
+        Arc::clone(&reauth) as Arc<dyn ReAuth>,
+        Arc::clone(&activity) as Arc<dyn super::guard::RemoteSessionActivity>,
+    );
+    for ago in [0, 59] {
+        activity.set_ended_at(Some(Instant::now() - Duration::from_secs(ago)));
+        for op in [ExternalOp::Install, ExternalOp::Uninstall] {
+            match guard.authorize(Actor::Cli, &op) {
+                Err(e) => assert_eq!(e.code(), codes::G_REMOTE_SESSION_ACTIVE, "{op:?}: {e}"),
+                Ok(()) => panic!("{op:?} authorised {ago} s after a session"),
+            }
+        }
+    }
+    assert!(reauth.calls().is_empty(), "a dialog: {:?}", reauth.calls());
+    assert!(install_lines(&env).is_empty(), "{:?}", install_lines(&env));
+    activity.set_ended_at(Some(Instant::now() - Duration::from_secs(61)));
+    guard.authorize(Actor::Cli, &ExternalOp::Install).unwrap();
+    assert_eq!(reauth.calls(), ["install"]);
+}
+
+/// A dialog during which a Tornect host starts.
+struct HostStartsDuringTheDialog(Arc<ScriptedActivity>);
+
+impl ReAuth for HostStartsDuringTheDialog {
+    fn reauthenticate(&self, _op: &str) -> Result<(), ReAuthError> {
+        self.0.set_live(true);
+        Ok(())
+    }
+}
+
+/// §B.1.1 and §B.8.6.2: `tornect install` and `uninstall` run offline only,
+/// and the offline route counts a Tornect host that holds this home's host
+/// lock as a live session (it cannot see that host's sessions). So the guard
+/// refuses both while a host runs, before any dialog, and also when a host
+/// starts while the dialog is open.
+#[test]
+fn install_is_refused_while_a_host_runs() {
+    let env = Env::new();
+    let store = env.open();
+    let reauth = Arc::new(AllowAllReAuth::default());
+    let host = Arc::new(ScriptedActivity::default());
+    host.set_live(true);
+    let guard = install_guard(
+        &store,
+        Arc::clone(&reauth) as Arc<dyn ReAuth>,
+        Arc::clone(&host) as Arc<dyn super::guard::RemoteSessionActivity>,
+    );
+    for op in [ExternalOp::Install, ExternalOp::Uninstall] {
+        match guard.authorize(Actor::Cli, &op) {
+            Err(e) => assert_eq!(e.code(), codes::G_REMOTE_SESSION_ACTIVE, "{op:?}: {e}"),
+            Ok(()) => panic!("{op:?} authorised while a host runs"),
+        }
+    }
+    assert!(reauth.calls().is_empty(), "a dialog: {:?}", reauth.calls());
+    let starting = Arc::new(ScriptedActivity::default());
+    let guard = install_guard(
+        &store,
+        Arc::new(HostStartsDuringTheDialog(Arc::clone(&starting))),
+        Arc::clone(&starting) as Arc<dyn super::guard::RemoteSessionActivity>,
+    );
+    for op in [ExternalOp::Install, ExternalOp::Uninstall] {
+        starting.set_live(false);
+        match guard.authorize(Actor::Cli, &op) {
+            Err(e) => assert_eq!(e.code(), codes::G_REMOTE_SESSION_ACTIVE, "{op:?}: {e}"),
+            Ok(()) => panic!("{op:?} authorised though a host started during its dialog"),
+        }
+    }
+    assert!(install_lines(&env).is_empty(), "{:?}", install_lines(&env));
+}
+
+/// §B.1.1 ("logged"): an authorised install or uninstall writes its line,
+/// `installed` or `uninstalled` with `by`, before the caller's first file;
+/// and while the keystore cannot be read neither is authorised, before any
+/// dialog, since its line could only be buffered (slice-F F2-4).
+#[test]
+fn install_is_logged() {
+    let env = Env::new();
+    let store = env.open();
+    let g = enable(&env, &store, dev(1), Preset::MyMachines);
+    let reauth = Arc::new(AllowAllReAuth::default());
+    let guard = install_guard(
+        &store,
+        Arc::clone(&reauth) as Arc<dyn ReAuth>,
+        Arc::new(NoSessionActivity),
+    );
+    guard.authorize(Actor::Cli, &ExternalOp::Install).unwrap();
+    guard.authorize(Actor::Ui, &ExternalOp::Uninstall).unwrap();
+    assert_eq!(
+        install_lines(&env),
+        [
+            (SessionEvent::Installed, Some(Actor::Cli)),
+            (SessionEvent::Uninstalled, Some(Actor::Ui)),
+        ]
+    );
+    drop((g, guard, store));
+    *env.secrets.get_fails.lock() = true;
+    let store = env.open();
+    assert!(matches!(
+        store.status(),
+        StoreStatus::FailedClosed(StoreLoadError::KeystoreLocked(_))
+    ));
+    let reauth = Arc::new(AllowAllReAuth::default());
+    let guard = install_guard(
+        &store,
+        Arc::clone(&reauth) as Arc<dyn ReAuth>,
+        Arc::new(NoSessionActivity),
+    );
+    for op in [ExternalOp::Install, ExternalOp::Uninstall] {
+        match guard.authorize(Actor::Cli, &op) {
+            Err(e) => assert_eq!(e.code(), codes::G_KEYSTORE_LOCKED, "{op:?}: {e}"),
+            Ok(()) => panic!("{op:?} authorised while its line could only be buffered"),
+        }
+    }
+    assert!(reauth.calls().is_empty(), "a dialog: {:?}", reauth.calls());
+}

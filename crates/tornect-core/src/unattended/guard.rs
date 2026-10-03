@@ -595,6 +595,11 @@ pub enum ExternalOp {
         /// Which setting.
         what: String,
     },
+    /// `tornect install` (§B.1.1, r7): Tornect copied into Program Files on
+    /// Windows (then UAC), or into `~/.local/bin` with a menu entry on Linux.
+    Install,
+    /// `tornect uninstall` (§B.1.1, r7): what `tornect install` wrote, removed.
+    Uninstall,
 }
 
 impl ExternalOp {
@@ -608,6 +613,8 @@ impl ExternalOp {
             Self::BackupImport { .. } => "backup_import",
             Self::IdentityView => "identity_view",
             Self::SettingsChange { .. } => "settings_change",
+            Self::Install => "install",
+            Self::Uninstall => "uninstall",
         }
     }
 }
@@ -1619,8 +1626,9 @@ impl MutationGuard {
     }
 
     /// Authorize an access-increasing operation whose effect lives outside the store
-    /// (autostart, backup, identity view, settings). Logs `AutostartChanged` /
-    /// `BackupExported`; the caller performs the effect after `Ok`.
+    /// (autostart, backup, identity view, settings, installing Tornect). Logs
+    /// `AutostartChanged` / `BackupExported` / `Installed` / `Uninstalled`; the caller
+    /// performs the effect after `Ok`, so no file is written before the line.
     ///
     /// Slice-F F2-4: while `K_master` exists but cannot be read, a line cannot be
     /// tagged and the store only buffers it (§B.8.13), so a change authorised then
@@ -1632,6 +1640,8 @@ impl MutationGuard {
             ExternalOp::ServiceInstall { .. }
                 | ExternalOp::ServiceUninstall
                 | ExternalOp::BackupExport { .. }
+                | ExternalOp::Install
+                | ExternalOp::Uninstall
         );
         if logged {
             self.log_key_readable(op.name(), by)?;
@@ -1661,6 +1671,8 @@ impl MutationGuard {
                     .by(by)
                     .path(path.clone()),
             ),
+            ExternalOp::Install => Some(SessionRecord::at(now, SessionEvent::Installed).by(by)),
+            ExternalOp::Uninstall => Some(SessionRecord::at(now, SessionEvent::Uninstalled).by(by)),
             ExternalOp::BackupImport { .. }
             | ExternalOp::IdentityView
             | ExternalOp::SettingsChange { .. } => None,
