@@ -3524,6 +3524,74 @@ fn a25_k_set_settings_with_a_session_reserved_before_its_commit_is_refused() {
     a25_k_case("set_settings");
 }
 
+/// D8.4 for `op`, named `name`, an access-increasing operation beside the eight, on
+/// `store` as `env` left it: refused with `G_REMOTE_SESSION_ACTIVE`, the host-wide state
+/// and the anchor as they were, the refusal logged once, no deadlock, the chain verifier
+/// passes.
+fn refused_at_its_commit(env: &Env, store: &GrantStore, name: &'static str, op: GuardOp) {
+    let state = || {
+        store
+            .read(|s| (s.enabled, s.paused_until, s.stop_token))
+            .unwrap()
+    };
+    let before = (state(), env.anchor());
+    let lines_before = refusal_lines(env).len();
+    let results = run_reserved_at_the_commit(store, vec![(name, op)]);
+    let (_, result) = results.into_iter().next().unwrap();
+    let err = result.expect_err(name);
+    assert_eq!(err.code(), codes::G_REMOTE_SESSION_ACTIVE, "{name}: {err}");
+    assert_eq!((state(), env.anchor()), before, "{name}: nothing committed");
+    let lines = refusal_lines(env);
+    assert_eq!(
+        lines.len(),
+        lines_before + 1,
+        "{name}: logged once: {lines:#?}"
+    );
+    assert_eq!(
+        lines.last().and_then(|r| r.code),
+        Some(codes::G_REMOTE_SESSION_ACTIVE),
+        "{name}"
+    );
+    assert_eq!(
+        store.verify_log().unwrap().status,
+        ChainStatus::Valid,
+        "{name}"
+    );
+}
+
+#[test]
+fn d8_4_master_on_with_a_session_reserved_before_its_commit_is_refused() {
+    // D8.4, row 7's "every" (§B.8.6.2: master on is access-increasing): turning
+    // unattended access on checks for a session under the lock that commits it.
+    let (env, store) = commit_env();
+    env.guard(&store).master_off(Actor::Ui).unwrap();
+    let op: GuardOp = Box::new(|g: &MutationGuard| g.master_on(Actor::Ui, &[7; 32]).map(|_| ()));
+    refused_at_its_commit(&env, &store, "master_on", op);
+    assert!(!store.read(|s| s.enabled).unwrap());
+    // the session gone, the same change commits
+    env.guard(&store).master_on(Actor::Ui, &[7; 32]).unwrap();
+    assert!(store.read(|s| s.enabled).unwrap());
+}
+
+#[test]
+fn d8_4_a_shortened_pause_with_a_session_reserved_before_its_commit_is_refused() {
+    // D8.4, row 7's "every" (§B.8.6.2: ending a pause early is master on's half):
+    // shortening a running pause checks for a session under the lock that commits it;
+    // lengthening it stays deny-direction.
+    let (env, store) = commit_env();
+    env.guard(&store).pause(Actor::Ui, T0 + 3600).unwrap();
+    let op: GuardOp = Box::new(|g: &MutationGuard| g.pause(Actor::Ui, T0 + 60));
+    refused_at_its_commit(&env, &store, "pause", op);
+    assert_eq!(store.read(|s| s.paused_until).unwrap(), Some(T0 + 3600));
+    let longer: GuardOp = Box::new(|g: &MutationGuard| g.pause(Actor::Ui, T0 + 7200));
+    let results = run_reserved_at_the_commit(&store, vec![("pause", longer)]);
+    assert!(results[0].1.is_ok(), "{:?}", results[0].1);
+    assert_eq!(store.read(|s| s.paused_until).unwrap(), Some(T0 + 7200));
+    // the session gone, the shortening commits
+    env.guard(&store).pause(Actor::Ui, T0 + 60).unwrap();
+    assert_eq!(store.read(|s| s.paused_until).unwrap(), Some(T0 + 60));
+}
+
 #[test]
 fn d8_4_refused_once_without_a_deadlock() {
     // D8.4 (first half): every access-increasing operation tried while a session is
