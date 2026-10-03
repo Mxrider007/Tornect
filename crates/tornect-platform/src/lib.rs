@@ -11,7 +11,9 @@
 //!   Task Scheduler at-logon task on Windows, and the readiness row that
 //!   reports it.
 //! - [`install`] — `tornect install` and `uninstall` (§B.1.1): the per-user
-//!   install on Linux (the executable in `~/.local/bin`, a menu entry).
+//!   install on Linux (the executable in `~/.local/bin`, a menu entry), and
+//!   the Program Files install on Windows as checked steps, whose Windows
+//!   calls are not in this build.
 //! - [`levels`] — the availability probe of the session levels (§B.2.1): the
 //!   row of the table this computer is in (Windows: the location, the UAC
 //!   values and the token; Linux: one row).
