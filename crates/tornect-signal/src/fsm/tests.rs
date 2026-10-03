@@ -7826,6 +7826,216 @@ async fn a_remote_revoke_or_suspend_ends_the_target_with_the_requester_stalled()
     }
 }
 
+/// The real hook, then `then` awaited once its read after the reservation has returned: a
+/// command that commits while the session is reserved, before its accept goes out.
+struct AwaitAfterTheRead {
+    inner: Arc<dyn UnattendedHook>,
+    then: Mutex<Option<BoxFuture<'static, ()>>>,
+}
+
+impl UnattendedHook for AwaitAfterTheRead {
+    fn handle<'a>(
+        &'a self,
+        ctx: UnattendedContext<'a>,
+    ) -> BoxFuture<'a, Result<UnattendedVerdict, HandshakeError>> {
+        self.inner.handle(ctx)
+    }
+
+    fn reserved<'a>(
+        &'a self,
+        device: &'a DeviceId,
+        proof: ConsentProof,
+    ) -> BoxFuture<'a, Result<ConsentProof, messages::SessionReject>> {
+        Box::pin(async move {
+            let read = self.inner.reserved(device, proof).await;
+            let then = self.then.lock().unwrap().take();
+            if let Some(then) = then {
+                then.await;
+            }
+            read
+        })
+    }
+}
+
+/// M1-67 D6, A25 (p), §B.8.4.1 (the remote end): R, a *My machines* control grant, sends
+/// `REVOKE(P)` or `SUSPEND(P)` over the wire, its stream answered in full, while a third
+/// device is in a session. (a) P's session reserved, the command committed between the
+/// read after the reservation and the accept: the guard's end reaches it. (b) P's session
+/// live, the admin authority a guard with no end of its own: the state machine's end
+/// after the answer reaches it. Either way P's session ends within 1 s with
+/// `BYE{REVOKED}` or `BYE{SUSPENDED}`, and the third device's session goes on. On a
+/// paused clock.
+#[tokio::test(start_paused = true)]
+async fn a_remote_revoke_or_suspend_ends_a_reserved_or_live_target_and_spares_a_third_device() {
+    use tornect_core::levels::FixedFacts;
+    use tornect_core::session_log::Actor;
+    use tornect_core::unattended::grant::Preset;
+    use tornect_core::unattended::ipc::GrantOptions;
+    use tornect_core::unattended::limiter::{AttemptLimiter, HostTransport};
+    use tornect_core::unattended::schedule::FixedOffset;
+
+    use crate::unattended::{GuardAdmin, UnattendedAuth};
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    for (op, said) in [
+        (messages::admin_op::REVOKE, bye::REVOKED),
+        (messages::admin_op::SUSPEND, bye::SUSPENDED),
+    ] {
+        for reserved in [true, false] {
+            let case = format!("op {op}, reserved: {reserved}");
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut host, target, guard) =
+                unattended_pair_edited(tmp.path(), PW, Arc::new(FixedFacts::linux()), |_| {});
+            host.cfg.orphan_timeout = None;
+            host.cfg.idle_timeout = Duration::from_secs(30);
+            // R: a My machines control grant on the same host, in scope for P
+            let requester = client_side(
+                &tmp.path().join("requester"),
+                host.identity.id(),
+                [0x55; 32],
+            );
+            let r = requester.identity.id();
+            let host_onion_pk = *host.identity.id().public_key_bytes();
+            host.trusted.pin(r, "Requester").unwrap();
+            requester
+                .known
+                .pin(host.identity.id(), "Desk of Bob", host_device_pk())
+                .unwrap();
+            guard
+                .create_grant(
+                    Actor::Cli,
+                    &r,
+                    Preset::MyMachines,
+                    &GrantOptions {
+                        waive_attended_precondition: true,
+                        ..GrantOptions::default()
+                    },
+                    &[0u8; 192],
+                    false,
+                )
+                .unwrap();
+            let setup =
+                crate::auth::parse_server_setup(&guard.store().server_setup().unwrap()).unwrap();
+            let record = crate::auth::register_locally(
+                &setup,
+                PW,
+                r.public_key_bytes(),
+                crate::auth::identifiers(r.public_key_bytes(), &host_onion_pk),
+            )
+            .unwrap();
+            guard
+                .set_password(Actor::Cli, &r, &record, &GrantOptions::default(), false)
+                .unwrap();
+            // (a) the owner's guard, wired to the kill switch as the host wires it; (b) a
+            // guard that ends nothing itself
+            let authority = if reserved {
+                owner_guard(&guard, &host)
+            } else {
+                Arc::clone(&guard)
+            };
+            let inner: Arc<dyn UnattendedHook> = Arc::new(
+                UnattendedAuth::new(
+                    AttemptLimiter::new(guard.store().clone()),
+                    Arc::new(FixedOffset::utc()),
+                    HostTransport::default(),
+                    Arc::new(FixedFacts::linux()),
+                )
+                .with_admin_authority(Arc::new(GuardAdmin::new(authority))),
+            );
+            let hook = Arc::new(AwaitAfterTheRead {
+                inner,
+                then: Mutex::new(None),
+            });
+            host.deps.unattended = hook.clone();
+            // R's command over the wire, its stream answered in full
+            let command = {
+                let (cfg, deps) = (host.cfg.clone(), host.deps.clone());
+                let intent = client::AdminIntent {
+                    password: Zeroizing::new(PW.to_owned()),
+                    op,
+                    device_pk: Some(*target.identity.id().public_key_bytes()),
+                };
+                let case = case.clone();
+                async move {
+                    let (r_end, host_end) = pipe();
+                    let serving =
+                        tokio::spawn(async move { serve_host(host_end, &cfg, &deps).await });
+                    let answer = client::admin(
+                        r_end,
+                        &requester.cfg,
+                        &requester.identity,
+                        &requester.deps,
+                        &intent,
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{case}: {e}"));
+                    assert!(answer.ok, "{case}");
+                    let _ = serving.await;
+                }
+            };
+            // a third device, in an attended session
+            let other = client_side(&tmp.path().join("other"), host.identity.id(), [0x33; 32]);
+            host.trusted.pin(other.identity.id(), "Other").unwrap();
+            other
+                .known
+                .pin(host.identity.id(), "Desk of Bob", host_device_pk())
+                .unwrap();
+            host.consent
+                .push_session(SessionScript::Decide(SessionDecision::AllowOnceViewOnly));
+            let (a, b) = pipe();
+            let other_task = spawn_host(a, &host);
+            let ClientOutcome::Session(mut other_session) =
+                connect(b, &other.cfg, &other.identity, &other.deps, Intent::Session)
+                    .await
+                    .unwrap()
+            else {
+                panic!("{case}: no attended session");
+            };
+            // P's session: the command after its read (a), or once it is live (b)
+            let mut command = Some(command);
+            if reserved {
+                let after_the_read: BoxFuture<'static, ()> = Box::pin(command.take().unwrap());
+                *hook.then.lock().unwrap() = Some(after_the_read);
+            }
+            let (a, b) = pipe();
+            let task = spawn_host(a, &host);
+            let ClientOutcome::Session(mut session) = connect(
+                b,
+                &target.cfg,
+                &target.identity,
+                &target.deps,
+                unattended_intent(PW, messages::mode::CONTROL, false),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{case}: {e}")) else {
+                panic!("{case}: no session");
+            };
+            if let Some(command) = command.take() {
+                session.ping().await.unwrap();
+                command.await;
+            }
+            assert_eq!(
+                session.next_event(Duration::from_secs(1)).await.unwrap(),
+                Some(SessionEvent::Bye {
+                    reason: said,
+                    detail: None
+                }),
+                "{case}"
+            );
+            match task.await.unwrap().unwrap() {
+                HostOutcome::Session { end, .. } => {
+                    assert_eq!(end, SessionEnd::Killed(said), "{case}");
+                }
+                other => panic!("{case}: {other:?}"),
+            }
+            // the third device's session goes on
+            other_session.ping().await.unwrap();
+            assert!(!other_task.is_finished(), "{case}");
+            drop(other_session);
+            let _ = other_task.await;
+        }
+    }
+}
+
 /// P5B-1 (§B.8.6.1): the panic key's suspend of P's grant ends P's live session with
 /// `BYE{PANIC}`, also without the host-wide kill that comes first on the key's path.
 #[tokio::test(start_paused = true)]
