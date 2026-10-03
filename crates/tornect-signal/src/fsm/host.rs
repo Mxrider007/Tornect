@@ -191,6 +191,11 @@ pub struct UnattendedContext<'a> {
     pub block_window: &'a dyn BlockWindow,
     /// The `ask_before_start` popup of §B.8.4.5 `AwaitLocalAllow` (`HostDeps::local_allow`).
     pub local_allow: &'a dyn LocalAllow,
+    /// Whether another remote session is live or reserved (`HostDeps::activity`): while
+    /// one is, neither the popup nor the block window is presented (§B.8.6.2).
+    pub activity: &'a dyn SessionActivity,
+    /// `sessions.log` (`HostDeps::audit`), for the line of a suppressed popup.
+    pub audit: &'a dyn HandshakeAudit,
 }
 
 /// What the unattended handler decided.
@@ -1139,6 +1144,8 @@ where
                 exchange: &mut chan,
                 block_window: &*deps.block_window,
                 local_allow: &*deps.local_allow,
+                activity: &*deps.activity,
+                audit: &*deps.audit,
             })
             .await?;
         match verdict {

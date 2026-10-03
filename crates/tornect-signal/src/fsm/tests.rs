@@ -6733,6 +6733,136 @@ async fn a25_h_change_password_in_the_block_window_fails_auth() {
     );
 }
 
+/// A block window that counts how often it opened, and lets the session through.
+#[derive(Default)]
+struct CountingWindow(std::sync::atomic::AtomicUsize);
+
+impl crate::consent::BlockWindow for CountingWindow {
+    fn run<'a>(
+        &'a self,
+        _: u8,
+        _: &'a tornect_core::unattended::grant::GrantId,
+        _: &'a str,
+    ) -> BoxFuture<'a, BlockOutcome> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { BlockOutcome::Passed(WindowPassed::Elapsed) })
+    }
+}
+
+/// An "Ask before starting" popup that counts how often it was asked, and allows.
+#[derive(Default)]
+struct CountingAllow(std::sync::atomic::AtomicUsize);
+
+impl crate::consent::LocalAllow for CountingAllow {
+    fn ask_at<'a>(
+        &'a self,
+        _: &'a crate::consent::GrantId,
+        _: &'a str,
+        _: tornect_core::levels::Elevation,
+        _: Duration,
+    ) -> BoxFuture<'a, bool> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { true })
+    }
+}
+
+/// Another session, live while the flag is set.
+struct LiveWhile(std::sync::atomic::AtomicBool);
+
+impl SessionActivity for LiveWhile {
+    fn session_live(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// §B.8.6.2, §B.8.6.4: while another device's session is live, an unattended request
+/// that got through its PAKE opens neither the block window (nor so its notification) nor
+/// the "Ask before starting" popup, so the live viewer never sees the requester's label:
+/// it is answered `SESSION_ACTIVE`, or `DENIED` with the popup on, and logged as
+/// suppressed, as the attended popup is. Once that session is over, the same request
+/// opens them as before.
+#[tokio::test]
+async fn a_live_session_suppresses_the_block_window_and_the_ask() {
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    for (case, ask, refused) in [
+        ("block window", false, reject::SESSION_ACTIVE),
+        ("ask before starting", true, reject::DENIED),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut host, client, _guard) = unattended_pair_edited(
+            tmp.path(),
+            PW,
+            Arc::new(tornect_core::levels::FixedFacts::linux()),
+            |g| g.ask_before_start = ask,
+        );
+        let window = Arc::new(CountingWindow::default());
+        let allow = Arc::new(CountingAllow::default());
+        let live = Arc::new(LiveWhile(std::sync::atomic::AtomicBool::new(true)));
+        let audit = Arc::new(RecordingAudit::default());
+        host.deps.block_window = window.clone();
+        host.deps.local_allow = allow.clone();
+        host.deps.activity = live.clone();
+        host.deps.audit = audit.clone();
+        let device = client.identity.id();
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let err = connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            unattended_intent(PW, messages::mode::CONTROL, false),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == refused),
+            "{case}: {err}"
+        );
+        assert!(
+            matches!(
+                task.await.unwrap().unwrap(),
+                HostOutcome::SessionRejected { reason, .. } if reason == refused
+            ),
+            "{case}"
+        );
+        assert_eq!(
+            window.0.load(Ordering::SeqCst),
+            0,
+            "{case}: no block window"
+        );
+        assert_eq!(allow.0.load(Ordering::SeqCst), 0, "{case}: no popup");
+        let events = audit.0.lock().unwrap().clone();
+        assert!(
+            events.contains(&AuditEvent::PopupSuppressed {
+                device,
+                label: Some("Laptop of Ana".into()),
+                popup: SuppressedPopup::Session,
+            }),
+            "{case}"
+        );
+        assert!(
+            events.contains(&AuditEvent::SessionDenied {
+                device,
+                label: "Laptop of Ana".into(),
+                reason: refused,
+            }),
+            "{case}"
+        );
+        // that session over, the same request opens them as before
+        live.0.store(false, Ordering::SeqCst);
+        let (mode, _, _) = signed(
+            &host,
+            &client,
+            unattended_intent(PW, messages::mode::CONTROL, false),
+        )
+        .await;
+        assert_eq!(mode, messages::mode::CONTROL, "{case}");
+        assert_eq!(window.0.load(Ordering::SeqCst), 1, "{case}");
+        assert_eq!(allow.0.load(Ordering::SeqCst), usize::from(ask), "{case}");
+    }
+}
+
 /// A pin that records how often it was asked to record.
 #[derive(Default)]
 struct RecordingPin {
