@@ -398,6 +398,17 @@ pub enum IpcOp {
         /// only way the host learns it (the password never crosses IPC; decision M1-67).
         generated: bool,
     },
+    /// Raise the running window (r7, §B.1.1): un-minimise it and ask for attention. It
+    /// never answers, dismisses or re-orders a sheet, and it re-arms every open sheet
+    /// (§B.2.1). A host with no window refuses it.
+    Show,
+    /// `tornect unattended set-level <device> none` (decision M1-68): the grant's
+    /// `elevation` → none and no other field (deny-direction). It carries no level, so
+    /// nothing sent with it can raise one. → `SetLevelNonePayload`.
+    SetLevelNone {
+        /// The device.
+        device: DeviceId,
+    },
     /// An op tag this build does not know (answered `E_UNKNOWN_KIND`).
     Unknown(u32),
 }
@@ -412,14 +423,16 @@ impl fmt::Debug for IpcOp {
             | Self::ServiceUninstall
             | Self::Readiness
             | Self::Panic
-            | Self::PolicyInputs => f.write_str(self.name()),
+            | Self::PolicyInputs
+            | Self::Show => f.write_str(self.name()),
             Self::Pause { until } => f.debug_struct("Pause").field("until", until).finish(),
             Self::Revoke { device }
             | Self::Unlock { device }
             | Self::Suspend { device }
             | Self::Resume { device }
             | Self::Enable { device }
-            | Self::Disable { device } => {
+            | Self::Disable { device }
+            | Self::SetLevelNone { device } => {
                 f.debug_struct(self.name()).field("device", device).finish()
             }
             Self::ServiceInstall { elevated } => f
@@ -496,6 +509,8 @@ impl IpcOp {
             Self::PolicyInputs => 18,
             Self::RegStart { .. } => 19,
             Self::RegFinish { .. } => 20,
+            Self::Show => 21,
+            Self::SetLevelNone { .. } => 22,
             Self::Unknown(t) => *t,
         }
     }
@@ -525,6 +540,8 @@ impl IpcOp {
             Self::PolicyInputs => "policy_inputs",
             Self::RegStart { .. } => "reg_start",
             Self::RegFinish { .. } => "reg_finish",
+            Self::Show => "show",
+            Self::SetLevelNone { .. } => "set_level_none",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -565,6 +582,7 @@ fn field_count(op: &IpcOp) -> u64 {
         | IpcOp::Resume { .. }
         | IpcOp::Enable { .. }
         | IpcOp::Disable { .. }
+        | IpcOp::SetLevelNone { .. }
         | IpcOp::ServiceInstall { .. }
         | IpcOp::BackupExport { .. }
         | IpcOp::BackupImport { .. } => 1,
@@ -591,7 +609,8 @@ impl<C> Encode<C> for IpcOp {
             | Self::Suspend { device }
             | Self::Resume { device }
             | Self::Enable { device }
-            | Self::Disable { device } => {
+            | Self::Disable { device }
+            | Self::SetLevelNone { device } => {
                 e.u32(0)?;
                 device.encode(e, ctx)?;
             }
@@ -714,7 +733,7 @@ impl<'b, C> Decode<'b, C> for IpcOp {
         let mut raise = false;
         let mut generated = false;
         match tag {
-            0..=2 | 5 | 12 | 13 | 15 | 18 => {
+            0..=2 | 5 | 12 | 13 | 15 | 18 | 21 => {
                 d.skip()?;
             }
             3 => for_each_entry(d, |k, d| {
@@ -724,7 +743,7 @@ impl<'b, C> Decode<'b, C> for IpcOp {
                 }
                 Ok(())
             })?,
-            4 | 6..=10 => for_each_entry(d, |k, d| {
+            4 | 6..=10 | 22 => for_each_entry(d, |k, d| {
                 match k {
                     0 => device = Some(DeviceId::decode(d, ctx)?),
                     _ => d.skip()?,
@@ -836,6 +855,10 @@ impl<'b, C> Decode<'b, C> for IpcOp {
                 preset: preset.ok_or_else(|| missing("preset"))?,
                 options: options.unwrap_or_default(),
                 generated,
+            },
+            21 => Self::Show,
+            22 => Self::SetLevelNone {
+                device: device.ok_or_else(|| missing("device"))?,
             },
             _ => Self::Unknown(tag),
         })
@@ -984,6 +1007,36 @@ pub struct PolicyInputsPayload {
     /// 3, or 4 on a file-keystore host.
     #[n(1)]
     pub min_score: u8,
+}
+
+/// `SetLevelNone` payload: which clause of the turn-off sentence's condition applies
+/// (§B.8.7.1 ⑤a, §B.8.7.4), on every ok answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Encode, Decode)]
+#[cbor(map)]
+pub struct SetLevelNonePayload {
+    /// [`Self::NOTHING`] · [`Self::ANOTHER_ADMIN_GRANT`] · [`Self::HELPER_TASK`].
+    #[n(0)]
+    pub keeps: u8,
+}
+
+impl SetLevelNonePayload {
+    /// Nothing else keeps control at the administrator level.
+    pub const NOTHING: u8 = 0;
+    /// Another grant holds the administrator level.
+    pub const ANOTHER_ADMIN_GRANT: u8 = 1;
+    /// The administrator helper task stays registered (removed at the next sign-in).
+    pub const HELPER_TASK: u8 = 2;
+
+    /// Enforce the wire bounds: one of the three values.
+    pub fn validate(&self) -> Result<(), IpcCodecError> {
+        if self.keeps > Self::HELPER_TASK {
+            return Err(IpcCodecError::Malformed(format!(
+                "keeps: unknown value {}",
+                self.keeps
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// `On` payload: the emergency stop card of §B.8.7.4, shown once and never stored.
@@ -1288,6 +1341,8 @@ mod tests {
                     ..GrantOptions::default()
                 },
             },
+            IpcOp::Show,
+            IpcOp::SetLevelNone { device: dev(9) },
             IpcOp::Unknown(99),
         ]
     }
@@ -1304,6 +1359,135 @@ mod tests {
             assert_eq!(back, req, "{op:?}");
             assert_eq!(back.op.tag(), op.tag());
         }
+    }
+
+    /// The op tag of an encoded request, read off the wire: `{0: id, 1: [tag, {…}]}`.
+    fn wire_tag(bytes: &[u8]) -> u32 {
+        let mut d = Decoder::new(bytes);
+        let n = d.map().unwrap().unwrap();
+        for _ in 0..n {
+            if d.u32().unwrap() == 1 {
+                assert_eq!(d.array().unwrap(), Some(2));
+                return d.u32().unwrap();
+            }
+            d.skip().unwrap();
+        }
+        panic!("no op in the request")
+    }
+
+    /// A request frame built by hand: `{0: 5, 1: [tag, fields]}`, the fields written
+    /// by `fields` as one CBOR map.
+    fn frame(tag: u32, fields: impl FnOnce(&mut Encoder<Vec<u8>>)) -> Vec<u8> {
+        let mut e = Encoder::new(Vec::new());
+        e.map(2)
+            .unwrap()
+            .u32(0)
+            .unwrap()
+            .u64(5)
+            .unwrap()
+            .u32(1)
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .u32(tag)
+            .unwrap();
+        fields(&mut e);
+        e.into_writer()
+    }
+
+    /// r7 (§B.1.1, §B.8.7.4): `Show` carries no field and travels as tag 21.
+    #[test]
+    fn show_roundtrips_with_its_tag() {
+        let req = IpcRequest {
+            id: 3,
+            op: IpcOp::Show,
+        };
+        let bytes = encode_request(&req).unwrap();
+        assert_eq!(wire_tag(&bytes), 21);
+        assert_eq!(decode_request(&bytes).unwrap(), req);
+        assert_eq!(IpcOp::Show.tag(), 21);
+        assert_eq!(IpcOp::Show.name(), "show");
+        assert_eq!(format!("{:?}", IpcOp::Show), "show");
+    }
+
+    /// Decision M1-68 (§B.8.7.4): `SetLevelNone` carries the device only, as tag 22.
+    #[test]
+    fn set_level_none_roundtrips_with_its_tag() {
+        let req = IpcRequest {
+            id: 4,
+            op: IpcOp::SetLevelNone { device: dev(9) },
+        };
+        let bytes = encode_request(&req).unwrap();
+        assert_eq!(wire_tag(&bytes), 22);
+        assert_eq!(decode_request(&bytes).unwrap(), req);
+        assert_eq!(req.op.tag(), 22);
+        assert_eq!(req.op.name(), "set_level_none");
+        let shown = format!("{:?}", req.op);
+        assert!(shown.starts_with("set_level_none { device: "), "{shown}");
+        // The device is the op's only field: no level travels with it.
+        let mut d = Decoder::new(&bytes);
+        d.map().unwrap();
+        d.u32().unwrap();
+        d.u64().unwrap();
+        d.u32().unwrap();
+        d.array().unwrap();
+        d.u32().unwrap();
+        assert_eq!(d.map().unwrap(), Some(1));
+        assert_eq!(d.u32().unwrap(), 0);
+    }
+
+    /// The `SetLevelNone` payload (§B.8.7.4): `{0: keeps}`, one of three values; any
+    /// other value is refused, never read as "nothing".
+    #[test]
+    fn the_set_level_none_payload_roundtrips_and_bounds_keeps() {
+        for keeps in [
+            SetLevelNonePayload::NOTHING,
+            SetLevelNonePayload::ANOTHER_ADMIN_GRANT,
+            SetLevelNonePayload::HELPER_TASK,
+        ] {
+            let payload = SetLevelNonePayload { keeps };
+            payload.validate().unwrap();
+            let bytes = encode_payload(&payload).unwrap();
+            let back = decode_payload::<SetLevelNonePayload>(&bytes).unwrap();
+            assert_eq!(back, payload);
+        }
+        assert_eq!(SetLevelNonePayload::default().keeps, 0);
+        let unknown = SetLevelNonePayload { keeps: 3 };
+        assert!(matches!(
+            unknown.validate(),
+            Err(IpcCodecError::Malformed(_))
+        ));
+        let _ = decode_payload::<SetLevelNonePayload>(b"\xff");
+    }
+
+    /// Frames from a newer peer with tags 21 and 22 now decode to the two ops, a
+    /// field-less body for `Show` whatever it holds; 23 and up stay unknown.
+    #[test]
+    fn tags_21_and_22_are_no_longer_unknown() {
+        let show = frame(21, |e| {
+            e.map(0).unwrap();
+        });
+        assert_eq!(decode_request(&show).unwrap().op, IpcOp::Show);
+        let show_with_a_body = frame(21, |e| {
+            e.map(1).unwrap().u32(7).unwrap().str("future").unwrap();
+        });
+        assert_eq!(decode_request(&show_with_a_body).unwrap().op, IpcOp::Show);
+        let lower = frame(22, |e| {
+            e.map(1).unwrap().u32(0).unwrap().encode(dev(6)).unwrap();
+        });
+        assert_eq!(
+            decode_request(&lower).unwrap().op,
+            IpcOp::SetLevelNone { device: dev(6) }
+        );
+        // without its device, the op is refused rather than guessed
+        let no_device = frame(22, |e| {
+            e.map(0).unwrap();
+        });
+        assert!(decode_request(&no_device).is_err());
+        let next = frame(23, |e| {
+            e.map(0).unwrap();
+        });
+        assert_eq!(decode_request(&next).unwrap().op, IpcOp::Unknown(23));
     }
 
     #[test]
@@ -1700,7 +1884,9 @@ mod tests {
                         options,
                     }
                 }),
-            (21u32..).prop_map(IpcOp::Unknown),
+            Just(IpcOp::Show),
+            arb_device().prop_map(|device| IpcOp::SetLevelNone { device }),
+            (23u32..).prop_map(IpcOp::Unknown),
         ]
     }
 
