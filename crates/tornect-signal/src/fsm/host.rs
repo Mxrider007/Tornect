@@ -874,6 +874,10 @@ pub struct HostDeps {
     pub stats: Arc<HandshakeStats>,
     /// One-click kill.
     pub kill: KillSwitch,
+    /// A test's edit of every `SESSION_ACCEPT` before it is signed: the faults the
+    /// builder cannot make, for the client's checks of a signed answer.
+    #[cfg(test)]
+    pub(crate) edit_accept: Option<fn(&mut SessionAccept)>,
 }
 
 impl HostDeps {
@@ -901,6 +905,8 @@ impl HostDeps {
             random: Arc::new(OsRandom),
             stats: Arc::new(HandshakeStats::default()),
             kill: KillSwitch::new(),
+            #[cfg(test)]
+            edit_accept: None,
         }
     }
 }
@@ -1412,6 +1418,14 @@ where
         _ => None,
     };
     let (accept, token) = SessionAccept::build(proof, caps, &host_info, grant_reach);
+    #[cfg(test)]
+    let accept = {
+        let mut accept = accept;
+        if let Some(edit) = deps.edit_accept {
+            edit(&mut accept);
+        }
+        accept
+    };
     let session_id = token.session_id();
     let mode = mode_from_code(accept.mode()).unwrap_or(SessionMode::ViewOnly);
     // The level the accept signs, and nothing else, is the session's level.

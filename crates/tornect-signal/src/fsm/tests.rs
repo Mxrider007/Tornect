@@ -6886,6 +6886,88 @@ async fn a_typed_password_is_normalized_before_the_pake() {
     }
 }
 
+/// M1-67 C4: each check of a signed unattended `SESSION_ACCEPT` past its signature raises
+/// `AnswerRefused` (the client deletes a remembered password), never `Violation` (which
+/// keeps it): the session type, a missing `token_confirm` or one beside a `session_token`,
+/// a wrong `token_confirm`, the QUIC key, and a mode or transport policy this build cannot
+/// read. The host's test-only edit makes each fault before the accept is signed, the
+/// faults its builder never makes among them.
+#[tokio::test]
+async fn each_check_of_a_signed_accept_raises_answer_refused() {
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    type Edit = fn(&mut messages::SessionAccept);
+    let cases: [(&str, Edit, u16, &str); 7] = [
+        (
+            "attended session type",
+            |a| {
+                a.session_type = messages::session_type::ATTENDED;
+                a.grant_reach = None;
+            },
+            codes::E_BAD_STATE,
+            "session_type",
+        ),
+        (
+            "no token_confirm",
+            |a| a.token_confirm = None,
+            codes::E_BAD_LEN,
+            "token_confirm",
+        ),
+        (
+            "a session_token beside it",
+            |a| a.session_token = Some([7; 32]),
+            codes::E_BAD_LEN,
+            "token_confirm",
+        ),
+        (
+            "a wrong token_confirm",
+            |a| {
+                if let Some(confirm) = a.token_confirm.as_mut() {
+                    confirm[0] ^= 1;
+                }
+            },
+            codes::E_BAD_SIG,
+            "token_confirm",
+        ),
+        (
+            "another QUIC key",
+            |a| a.quic_spki[40] ^= 1,
+            codes::E_BAD_SIG,
+            "quic_spki",
+        ),
+        ("an unknown mode", |a| a.mode = 7, codes::E_BAD_LEN, "mode"),
+        (
+            "an unknown transport policy",
+            |a| a.transport_policy = 0xEE,
+            codes::E_BAD_LEN,
+            "mode",
+        ),
+    ];
+    for (case, edit, code, what) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut host, client) = unattended_pair(tmp.path(), PW);
+        host.deps.edit_accept = Some(edit);
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let err = connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            unattended_intent(PW, messages::mode::CONTROL, false),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                HandshakeError::AnswerRefused { code: c, what: w } if *c == code && *w == what
+            ),
+            "{case}: {err:?}"
+        );
+        let _ = task.await;
+    }
+}
+
 /// A pin that records how often it was asked to record.
 #[derive(Default)]
 struct RecordingPin {
