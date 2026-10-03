@@ -239,7 +239,7 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
 
     // Background mode (§B.1.1): the "indicator shown" fact that the window's
     // probe sets and the host's gate reads.
-    let background = (background && opts.host).then(crate::host::IndicatorShown::default);
+    let (gate_fact, probe_fact) = indicator_fact(background, opts.host);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -281,14 +281,14 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
             identity: Arc::new(real.identity),
             device: Arc::new(real.device),
             device_pk: real.device_pk,
-            background: background.clone(),
+            background: gate_fact,
         },
         commands_rx,
     ));
 
     let mut app = App::new(shared, popups, link, commands);
     app.theme = opts.theme;
-    app.background = background;
+    app.background = probe_fact;
     if !opts.host {
         app.title = "Tornect (connect only)";
     }
@@ -302,8 +302,48 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
     }
 }
 
+/// The "indicator shown" fact of background mode (§B.1.1) for the two halves
+/// of the window: the host's gate (`Backend`) and the window's probe (`App`).
+/// One fact, shared, when the window hosts in background mode, so that what
+/// the probe sets is what the gate reads (a gate given none would serve
+/// unattended sessions before any indicator was shown); none otherwise.
+fn indicator_fact(
+    background: bool,
+    host: bool,
+) -> (
+    Option<crate::host::IndicatorShown>,
+    Option<crate::host::IndicatorShown>,
+) {
+    let fact = (background && host).then(crate::host::IndicatorShown::default);
+    (fact.clone(), fact)
+}
+
 #[cfg(test)]
 mod tests {
+    /// §B.1.1 (MUST): in background mode the host's gate and the window's
+    /// probe hold one "indicator shown" fact: the one the probe sets is the
+    /// one the gate reads. Without background mode, or in a window that
+    /// does not host, neither has one.
+    #[test]
+    fn background_mode_gives_the_gate_and_the_probe_one_fact() {
+        let (gate, probe) = super::indicator_fact(true, true);
+        let gate = gate.expect("the gate has the fact");
+        let probe = probe.expect("the probe has the fact");
+        assert!(!gate.is_set() && !probe.is_set());
+        probe.set();
+        assert!(
+            gate.is_set(),
+            "the gate reads another fact than the probe sets"
+        );
+        for (background, host) in [(true, false), (false, true), (false, false)] {
+            let (gate, probe) = super::indicator_fact(background, host);
+            assert!(
+                gate.is_none() && probe.is_none(),
+                "background {background}, host {host}"
+            );
+        }
+    }
+
     /// A SIGTERM (what `kill` and a desktop's logout send) no longer ends the
     /// window's process abruptly: it is a quit request, which the window turns
     /// into its close path (every session ended with a goodbye). The process
