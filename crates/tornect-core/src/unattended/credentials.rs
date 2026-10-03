@@ -366,7 +366,9 @@ impl Attempt {
 /// What a delete by the derived name did ([`SavedPasswords::delete_first`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Deleted {
-    /// There was no entry, or no usable keychain.
+    /// There was no entry, or no keychain was usable to ask. [`SavedPasswords`] knows its
+    /// keychain and tells the second apart where it decides: while a password is
+    /// remembered, a delete that could not be tried reads as a refused one (C7).
     Nothing,
     /// The entry was deleted.
     Entry,
@@ -382,8 +384,8 @@ pub struct Settled {
     /// A remembered password was deleted: it was refused, or the host's answer reached
     /// administrator access, left `grant_reach` out or was refused.
     pub forgot: bool,
-    /// The keychain refused to delete it: `remember` stays set, so that the check when the
-    /// prompt opens deletes it (C6, C7).
+    /// The keychain refused to delete it, or none was usable to delete it: `remember` stays
+    /// set, so that the check when the prompt opens deletes it (C6, C7).
     pub delete_failed: bool,
     /// `hosts.toml` changed and needs saving.
     pub changed: bool,
@@ -430,6 +432,11 @@ impl SavedPasswords {
     #[must_use]
     pub fn keychain(&self) -> Option<&'static str> {
         self.vault.as_ref().map(|v| v.describe())
+    }
+
+    /// Whether a keychain was usable when this was built, so that a delete can be tried.
+    fn usable(&self) -> bool {
+        self.vault.is_some()
     }
 
     /// How long the keychain keeps a password, when that is not until it is deleted: the
@@ -508,12 +515,18 @@ impl SavedPasswords {
     /// C6: when the prompt opens and before a command-line dial, a record that says both
     /// that the host's last answer reached and that a password is remembered (a delete the
     /// keychain refused, C7, or an edited file) has its entry deleted first; `remember` is
-    /// cleared once the delete worked. `None` when the record asks for nothing.
+    /// cleared once the delete worked. Without a usable keychain the delete cannot be
+    /// tried, which is not "nothing was there": it reads as refused, and the flag stays for
+    /// the next check (C7). `None` when the record asks for nothing.
     pub fn belt(&self, hosts: &mut HostsFile, host: &TornectId) -> Option<Deleted> {
         if !hosts.get(host).is_some_and(|r| r.reach && r.remember) {
             return None;
         }
-        let gone = self.delete_first(host);
+        let gone = if self.usable() {
+            self.delete_first(host)
+        } else {
+            Deleted::Refused
+        };
         if gone != Deleted::Refused {
             hosts.entry(host).remember = false;
         }
@@ -555,7 +568,7 @@ impl SavedPasswords {
             }
             Attempt::AnswerRefused => {
                 let gone = first.unwrap_or_else(|| self.delete_first(host));
-                reached(hosts.entry(host), gone, false, &mut out);
+                reached(hosts.entry(host), gone, self.usable(), false, &mut out);
             }
             Attempt::Accepted {
                 elevation,
@@ -563,9 +576,10 @@ impl SavedPasswords {
             } => {
                 if Attempt::reaches(elevation, grant_reach) {
                     let gone = first.unwrap_or_else(|| self.delete_first(host));
+                    let usable = self.usable();
                     let record = hosts.entry(host);
                     set(&mut record.stale, false, &mut out.changed);
-                    reached(record, gone, grant_reach == Some(2), &mut out);
+                    reached(record, gone, usable, grant_reach == Some(2), &mut out);
                 } else {
                     let record = hosts.entry(host);
                     set(&mut record.stale, false, &mut out.changed);
@@ -599,9 +613,10 @@ impl SavedPasswords {
         let mut out = Settled::default();
         if Attempt::reaches(Elevation::None, grant_reach) {
             let gone = first.unwrap_or_else(|| self.delete_first(host));
+            let usable = self.usable();
             let record = hosts.entry(host);
             set(&mut record.stale, false, &mut out.changed);
-            reached(record, gone, grant_reach == Some(2), &mut out);
+            reached(record, gone, usable, grant_reach == Some(2), &mut out);
         } else {
             let record = hosts.entry(host);
             set(&mut record.stale, false, &mut out.changed);
@@ -614,11 +629,20 @@ impl SavedPasswords {
 
 /// C2 steps 2 and 3 (C4 likewise), after the delete: `reach` set, `administrator` to whether
 /// the answer said 2, `remember` cleared unless the keychain refused the delete (C7: it
-/// stays set, so that the prompt's check deletes it), nothing kept.
-fn reached(record: &mut HostRecord, gone: Deleted, administrator: bool, out: &mut Settled) {
+/// stays set, so that the prompt's check deletes it), nothing kept. With no keychain
+/// `usable`, no delete could be tried: while a password is remembered that is a refused
+/// delete too, never "nothing was there", since a keychain that answers later may still
+/// hold it.
+fn reached(
+    record: &mut HostRecord,
+    gone: Deleted,
+    usable: bool,
+    administrator: bool,
+    out: &mut Settled,
+) {
     set(&mut record.reach, true, &mut out.changed);
     set(&mut record.administrator, administrator, &mut out.changed);
-    if gone == Deleted::Refused {
+    if gone == Deleted::Refused || (!usable && record.remember) {
         out.delete_failed = true;
     } else {
         out.forgot = gone == Deleted::Entry || record.remember;
@@ -1171,5 +1195,105 @@ mod tests {
         assert!(vault.names().is_empty());
         assert!(!saved.erase(&h).unwrap());
         assert!(!SavedPasswords::none([1; 32]).erase(&h).unwrap());
+    }
+
+    /// P5A-1 (C7): with no keychain usable at that moment nothing can be deleted, which is
+    /// not "nothing was there". While a password is remembered, every answer that deletes
+    /// first (1, 2, the key left out, the level signed, a refused answer) keeps `remember`,
+    /// says that the delete failed and that nothing went, whether the caller deleted first
+    /// or the settle did; with none remembered, it is "nothing there".
+    #[test]
+    fn no_usable_keychain_is_a_failed_delete_while_a_password_is_remembered() {
+        let none = SavedPasswords::none([1; 32]);
+        let h = host(11);
+        for attempt in [
+            Attempt::Accepted {
+                elevation: Elevation::None,
+                grant_reach: Some(1),
+            },
+            Attempt::Accepted {
+                elevation: Elevation::None,
+                grant_reach: Some(2),
+            },
+            Attempt::Accepted {
+                elevation: Elevation::None,
+                grant_reach: None,
+            },
+            Attempt::Accepted {
+                elevation: Elevation::Admin,
+                grant_reach: Some(2),
+            },
+            Attempt::AnswerRefused,
+        ] {
+            for first in [None, Some(none.delete_first(&h))] {
+                let case = format!("{attempt:?} {first:?}");
+                let mut hosts = HostsFile::default();
+                hosts.entry(&h).remember = true;
+                let s = none
+                    .settle(&mut hosts, &h, attempt, first, Some("pw"))
+                    .unwrap();
+                assert!(s.delete_failed && !s.forgot && !s.remembered, "{case}");
+                let r = hosts.get(&h).unwrap();
+                assert!(r.remember && r.reach, "{case}");
+
+                let mut hosts = HostsFile::default();
+                let s = none
+                    .settle(&mut hosts, &h, attempt, first, Some("pw"))
+                    .unwrap();
+                assert!(!s.delete_failed && !s.forgot && !s.remembered, "{case}");
+                let r = hosts.get(&h).unwrap();
+                assert!(!r.remember && r.reach, "{case}");
+            }
+        }
+    }
+
+    /// P5A-1 for a verified `ADMIN_RESULT` that reaches: as for an accept.
+    #[test]
+    fn an_admin_result_without_a_usable_keychain_keeps_remember() {
+        let none = SavedPasswords::none([1; 32]);
+        let h = host(12);
+        for grant_reach in [Some(1), Some(2), None] {
+            for first in [None, Some(none.delete_first(&h))] {
+                let case = format!("{grant_reach:?} {first:?}");
+                let mut hosts = HostsFile::default();
+                hosts.entry(&h).remember = true;
+                let s = none.settle_admin(&mut hosts, &h, grant_reach, first);
+                assert!(s.delete_failed && !s.forgot && !s.remembered, "{case}");
+                assert!(hosts.get(&h).unwrap().remember, "{case}");
+
+                let mut hosts = HostsFile::default();
+                let s = none.settle_admin(&mut hosts, &h, grant_reach, first);
+                assert!(!s.delete_failed && !s.forgot && !s.remembered, "{case}");
+                assert!(!hosts.get(&h).unwrap().remember, "{case}");
+            }
+        }
+    }
+
+    /// P5A-1 (C6, C7): a password kept while the keychain answered, then an answer of 1
+    /// while it does not: the entry stays, so the flag stays, and the check when the
+    /// prompt opens keeps it while no keychain is usable; once one answers, that check
+    /// deletes the entry and clears the flag.
+    #[test]
+    fn the_prompt_check_keeps_the_flag_until_a_keychain_can_delete() {
+        let vault = Arc::new(MemoryVault::new());
+        let kept = SavedPasswords::new(Some(vault.clone()), [1; 32]);
+        let none = SavedPasswords::none([1; 32]);
+        let h = host(13);
+        let mut hosts = HostsFile::default();
+        kept.settle(&mut hosts, &h, ZERO, None, Some("pw")).unwrap();
+        let one = Attempt::Accepted {
+            elevation: Elevation::None,
+            grant_reach: Some(1),
+        };
+        let s = none.settle(&mut hosts, &h, one, None, None).unwrap();
+        assert!(s.delete_failed && !s.forgot);
+        assert_eq!(vault.names().len(), 1);
+        assert_eq!(none.belt(&mut hosts, &h), Some(Deleted::Refused));
+        assert!(hosts.get(&h).unwrap().remember);
+        assert_eq!(vault.names().len(), 1);
+        assert_eq!(kept.belt(&mut hosts, &h), Some(Deleted::Entry));
+        assert!(vault.names().is_empty());
+        assert!(!hosts.get(&h).unwrap().remember);
+        assert_eq!(kept.belt(&mut hosts, &h), None);
     }
 }
