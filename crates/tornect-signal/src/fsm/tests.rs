@@ -6778,15 +6778,14 @@ impl SessionActivity for LiveWhile {
 /// §B.8.6.2, §B.8.6.4: while another device's session is live, an unattended request
 /// that got through its PAKE opens neither the block window (nor so its notification) nor
 /// the "Ask before starting" popup, so the live viewer never sees the requester's label:
-/// it is answered `SESSION_ACTIVE`, or `DENIED` with the popup on, and logged as
-/// suppressed, as the attended popup is. Once that session is over, the same request
-/// opens them as before.
+/// it is answered `SESSION_ACTIVE`, the popup on or not, and logged as suppressed, as the
+/// attended popup is. Once that session is over, the same request opens them as before.
 #[tokio::test]
 async fn a_live_session_suppresses_the_block_window_and_the_ask() {
     const PW: &str = "quiet verdant otter lantern zephyr";
     for (case, ask, refused) in [
         ("block window", false, reject::SESSION_ACTIVE),
-        ("ask before starting", true, reject::DENIED),
+        ("ask before starting", true, reject::SESSION_ACTIVE),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let (mut host, client, _guard) = unattended_pair_edited(
