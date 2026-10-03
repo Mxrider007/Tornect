@@ -53,7 +53,7 @@ pub enum UserEvent {
 
 /// The window calls a question or a session start makes: a seam, so a test
 /// can record them. There is deliberately no `focus_window` here.
-trait Attention {
+pub(super) trait Attention {
     fn is_minimized(&self) -> Option<bool>;
     fn set_minimized(&self, minimized: bool);
     fn request_user_attention(&self, kind: Option<UserAttentionType>);
@@ -118,6 +118,21 @@ fn indicator_failed(window: &impl Attention, background: bool) -> bool {
 fn show_window(window: &impl Attention, rearm: impl FnOnce()) {
     ask_attention(window);
     rearm();
+}
+
+/// `Wake::Show`, as the event loop runs it: the raise of [`show_window`],
+/// and every open card of `form` armed again (§B.2.1).
+pub(super) fn on_show(window: &impl Attention, form: &mut Form) {
+    show_window(window, || form.window_came_back());
+}
+
+/// The sharing indicator's window did not open at a session, as the event
+/// loop handles it: [`indicator_failed`], and a window it brought back arms
+/// the cards of `form` again (§B.2.1).
+pub(super) fn on_indicator_failed(window: &impl Attention, background: bool, form: &mut Form) {
+    if indicator_failed(window, background) {
+        form.window_came_back();
+    }
 }
 
 /// A window event after which the main window is back in view (focused, or
@@ -663,10 +678,12 @@ impl App {
                     let line = format!("the sharing indicator did not open: {e:#}");
                     tracing::warn!("{line}");
                     self.shared.update(|m| m.note(line));
-                    if let Some(main) = &self.main
-                        && indicator_failed(&*main.window, self.background.is_some())
-                    {
-                        self.form.window_came_back();
+                    if let Some(main) = &self.main {
+                        on_indicator_failed(
+                            &*main.window,
+                            self.background.is_some(),
+                            &mut self.form,
+                        );
                     }
                 }
             },
@@ -1164,8 +1181,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             Wake::Show => {
                 if let Some(main) = &self.main {
-                    let form = &mut self.form;
-                    show_window(&*main.window, || form.window_came_back());
+                    on_show(&*main.window, &mut self.form);
                     main.window.request_redraw();
                 }
             }
