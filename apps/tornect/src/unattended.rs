@@ -457,11 +457,20 @@ pub fn dispatch(ctx: &HostContext, req: IpcRequest) -> IpcResponse {
             unit!(guard.reg_finish(by, &device, &reg_txn, &upload, preset, &options, generated))
         }
 
+        // §B.1.1: raising needs a window, and this host shows none.
+        IpcOp::Show => IpcResponse::fail(id, codes::G_UNSUPPORTED, NO_WINDOW_TO_SHOW),
+        IpcOp::SetLevelNone { .. } => {
+            IpcResponse::fail(id, codes::G_UNSUPPORTED, "not available in this build")
+        }
+
         IpcOp::Unknown(tag) => {
             IpcResponse::fail(id, codes::E_UNKNOWN_KIND, format!("unknown op tag {tag}"))
         }
     }
 }
+
+/// Why a host refuses `IpcOp::Show` when it has no window to raise (§B.1.1).
+pub(crate) const NO_WINDOW_TO_SHOW: &str = "This Tornect host has no window to show.";
 
 /// [`dispatch`], plus what to undo if the answer never reaches the CLI.
 ///
@@ -2856,6 +2865,30 @@ mod tests {
         let resp = go(&env.ctx, IpcOp::Unknown(4242));
         assert!(!resp.ok);
         assert_eq!(resp.code, codes::E_UNKNOWN_KIND);
+    }
+
+    /// §B.1.1, §B.8.7.4: a host with no window to raise (the terminal host, the
+    /// headless one) refuses `Show` with the reason. It is no mutation: no
+    /// dialog is asked and nothing is logged.
+    #[test]
+    fn a_host_without_a_window_refuses_show() {
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let env = env_with(
+            tempfile::tempdir().unwrap(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(NoSessionActivity),
+        );
+        let before = env.ctx.log.read_all().unwrap().len();
+        let resp = go(&env.ctx, IpcOp::Show);
+        assert!(!resp.ok);
+        assert_eq!(resp.code, codes::G_UNSUPPORTED);
+        assert_eq!(resp.detail.as_deref(), Some(NO_WINDOW_TO_SHOW));
+        assert!(reauth.calls().is_empty(), "no dialog");
+        assert_eq!(
+            env.ctx.log.read_all().unwrap().len(),
+            before,
+            "nothing logged"
+        );
     }
 
     /// The operations §B.8.14 schedules for later report that plainly instead of
