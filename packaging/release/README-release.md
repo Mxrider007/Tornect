@@ -126,53 +126,62 @@ use the window.
 
 ## Start at logon
 
-`tornect service install` registers **`tornect host`** (this executable, the
-command-line host) to start after you log in; `tornect service status` shows
-what is registered; `tornect service uninstall` removes it. Installing and
-removing ask for your OS password (the change widens access) and are refused
-while a remote session is live or ended less than a minute ago. Nothing starts
-before a login: Tornect never turns on automatic login, so after a reboot the
-computer stays unreachable until someone logs in. Run `service install` from a
-folder only you can change, and not from a folder you shared with other
-accounts, even inside your home or user folder: the check reads owners,
-permission bits and folder names, not access lists.
+`tornect service install` registers Tornect (this executable) to start after
+you log in; `tornect service status` shows what is registered; `tornect service
+uninstall` removes it. Started at login, Tornect runs in the background with
+its window minimised where the desktop allows it; a request raises the window.
+Unattended sessions wait until its sharing indicator has been shown. Starting
+at sign-in means a Tor connection at every sign-in: your local network and your
+internet provider can see that this computer uses Tor. Installing and removing
+ask for your OS password (the change widens access) and are refused while a
+remote session is live or ended less than a minute ago. Nothing starts before a
+login: Tornect never turns on automatic login, so after a reboot the computer
+stays unreachable until someone logs in. Run `service install` from a folder
+only you can change, and not from a folder you shared with other accounts, even
+inside your home or user folder: the check reads owners, permission bits and
+folder names, not access lists. A `tornect host` started without a terminal (by
+a script, or by the systemd user unit an earlier version registered) is another
+matter: the host answers pings only and refuses every session, because it has
+no window or terminal to show one.
 
-- **Linux:** a systemd user unit, `~/.config/systemd/user/tornect-host.service`,
-  started with your graphical session. Started this way the host answers pings
-  only and refuses every session, because it has no window or terminal to show
-  one. `systemctl --user stop tornect-host` ends it gracefully. `service
-  install` is refused while a Tornect host runs for this home: stop it first,
-  so that what is registered is the `tornect` you run. Keep `tornect`
+- **Linux:** an XDG autostart entry, `~/.config/autostart/tornect.desktop`,
+  which your desktop runs when your graphical session starts
+  (`tornect --background`). `service install` removes the systemd user unit an
+  earlier version registered (`tornect-host.service`), and `service status`
+  names one that is still there. `service install` is refused while a Tornect
+  host runs for this home: close its window, or stop it with Ctrl-C in its
+  terminal (`systemctl --user stop tornect-host` for a host that the older unit
+  started), so that what is registered is the `tornect` you run. Keep `tornect`
   in a folder only you (or root) can change: `service install` refuses a
   `tornect` another account could replace (under `/tmp` or a shared folder, or
   owned by another account) and a path with `$`, quotes or backslashes. The
-  password dialog is polkit's `org.tornect.autostart` action,
-  so `packaging/polkit/org.tornect.policy` must be installed. Remove it with
-  `tornect service uninstall` (or `systemctl --user disable tornect-host` and
-  deleting the file).
-- **Windows:** a Task Scheduler task `\Tornect` that runs `tornect.exe host` in a
-  console window when you log on; that window is the host (Ctrl-C in it ends
-  every session). The password dialog is Windows' secure credential prompt:
-  choose your password, not a PIN. An account that signs in only with Windows
-  Hello (a PIN, a face or a fingerprint) or a passwordless Microsoft account
-  has no password to type there, so it cannot make any change that widens
-  access (`service install` and `uninstall`, `unattended on`, `grant`): Tornect
-  refuses them. `service install` refuses a `tornect.exe`
-  outside your user folder or `C:\Program Files`, where another account could
-  replace it. The task never runs elevated (one that an earlier version
-  registered elevated is removed first, through Windows' prompt).
-  Administrator access is given per session, by a separate helper that
-  Windows starts with its own prompt, and this build keeps that helper
-  switched off. On an administrator account set to elevate without
-  prompting, a session with control could make itself administrator
-  unasked, so this build shares View only there. Where User Account Control
-  is off, every program runs as administrator: a session with control is
-  then administrator access, offered only as "Allow as administrator" after
+  password dialog is polkit's `org.tornect.autostart` action, so
+  `packaging/polkit/org.tornect.policy` must be installed. Remove it with
+  `tornect service uninstall` (or by deleting the file). Whether GNOME or KDE
+  minimise the window, and whether the entry runs inside your login session, is
+  not yet checked.
+- **Windows:** a Task Scheduler task `\Tornect` that runs
+  `tornect.exe --background` when you log on: Tornect's window, minimised. The
+  password dialog is Windows' secure credential prompt: choose your password,
+  not a PIN. An account that signs in only with Windows Hello (a PIN, a face or
+  a fingerprint) or a passwordless Microsoft account has no password to type
+  there, so it cannot make any change that widens access (`service install` and
+  `uninstall`, `unattended on`, `grant`): Tornect refuses them. `service
+  install` refuses a `tornect.exe` outside your user folder or
+  `C:\Program Files`, where another account could replace it. The task never
+  runs elevated (one that an earlier version registered elevated is removed
+  first, through Windows' prompt). Administrator access is given per session,
+  by a separate helper that Windows starts with its own prompt, and this build
+  keeps that helper switched off. On an administrator account set to elevate
+  without prompting, a session with control could make itself administrator
+  unasked, so this build shares View only there. Where User Account Control is
+  off, every program runs as administrator: a session with control is then
+  administrator access, offered only as "Allow as administrator" after
   Tornect's own confirmation (a copy not under `C:\Program Files` offers View
-  only there). A `--home` or
-  `TORNECT_HOME` directory is refused on Windows. Stop a running host (Ctrl-C in
-  its window) before `tornect service uninstall`; `schtasks /Delete /TN Tornect
-  /F` also removes it. Not yet tried on Windows.
+  only there). A `--home` or `TORNECT_HOME` directory is refused on Windows.
+  Close a running Tornect (or press Ctrl-C in the console of a
+  `tornect.exe host`) before `tornect service uninstall`; `schtasks /Delete /TN
+  Tornect /F` also removes it. Not yet tried on Windows.
 
 ## Where Tornect keeps its state
 

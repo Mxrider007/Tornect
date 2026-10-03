@@ -179,7 +179,11 @@ fn service_change(ctx: &HostContext, id: u64, by: Actor, install: Option<bool>) 
             let mut r = IpcResponse::ok(id);
             let mut said = describe_autostart(&*ctx.autostart, &state);
             if install.is_none() && ctx.kill.is_some() {
-                said.push_str(HOST_KEEPS_RUNNING);
+                said.push_str(if ctx.show.is_some() {
+                    WINDOW_KEEPS_RUNNING
+                } else {
+                    HOST_KEEPS_RUNNING
+                });
             }
             r.detail = Some(said);
             r
@@ -202,14 +206,26 @@ fn service_change(ctx: &HostContext, id: u64, by: Actor, install: Option<bool>) 
 }
 
 /// Why a running host refuses `service install` (slice-F F2-3; default 2's
-/// rule applied to install). Only Linux has a host route today.
-const HOST_ROUTE_INSTALL: &str = "a Tornect host is running; stop it (`systemctl --user stop \
-     tornect-host`, or Ctrl-C in its terminal) and run `tornect service install` again: it \
-     registers the tornect you run";
+/// rule applied to install), with the ways to stop it on both systems: the
+/// window, a `tornect host` in a terminal (on Windows also the console window
+/// an earlier version's task opened), and on Linux a host the systemd unit of
+/// earlier versions started, which has neither. It stays within the wire's
+/// string bound ([`tornect_core::unattended::ipc::MAX_STRING`]), past which a
+/// refusal is cut.
+const HOST_ROUTE_INSTALL: &str = "a Tornect host is running; stop it (close its window, Ctrl-C in \
+     its terminal, or on Linux `systemctl --user stop tornect-host` for an older start at login) \
+     and run `tornect service install` again: it registers the tornect you run";
 
-/// What `service uninstall` through a running host adds (slice-F F2-3).
-const HOST_KEEPS_RUNNING: &str = "; the running host keeps running until you stop it \
-     (`systemctl --user stop tornect-host`, or Ctrl-C in its terminal)";
+/// What `service uninstall` through a running host without a window adds
+/// (slice-F F2-3): a `tornect host` in a terminal, or on Linux one that the
+/// systemd unit of earlier versions started. Short: the whole answer must stay
+/// within the wire's string bound, or it could not be sent.
+const HOST_KEEPS_RUNNING: &str = "; the running host keeps running until you stop it (Ctrl-C in \
+     its terminal, or `systemctl --user stop tornect-host` on Linux)";
+
+/// [`HOST_KEEPS_RUNNING`] for the window host.
+const WINDOW_KEEPS_RUNNING: &str = "; the running Tornect keeps running until you stop it (close \
+     its window)";
 
 /// One line for the operator: what is registered now, and what it runs.
 fn describe_autostart(backend: &dyn Autostart, state: &AutostartState) -> String {
@@ -1145,11 +1161,10 @@ async fn route(paths: &Paths) -> anyhow::Result<Route> {
             if cfg!(windows) {
                 // Default 2 (slice F): every Windows change runs with no host
                 // running, the start-at-login one included.
-                "if it is the start-at-login host, it runs in its own console window: press \
-                 Ctrl-C in that window (or in the terminal of a host you started)"
+                "close its window, or press Ctrl-C in the terminal or console window it runs in"
             } else {
-                "stop it (Ctrl-C in its terminal, or `systemctl --user stop tornect-host` for \
-                 the start-at-login host)"
+                "close its window, press Ctrl-C in its terminal, or, for a host that an older \
+                 start at login started, run `systemctl --user stop tornect-host`"
             }
         ),
         Probe::NoHost => Ok(Route::Offline(Box::new(offline_context(paths)?))),
@@ -2355,12 +2370,22 @@ pub fn panic_now(paths: &Paths) -> anyhow::Result<()> {
 const AFTER_LOGIN_ONLY: &str = "The host starts only after you log in: Tornect never turns on \
      automatic login, so after a reboot this computer stays unreachable until someone logs in.";
 
-/// What the Linux start-at-login host serves (slice-F F2-1): the systemd user
-/// unit gives it no terminal and it has no window, so it can show no session
-/// (`crate::host::HostWiring::without_unattended`). Windows' task runs it in a
-/// console window, which is its terminal.
-const LOGIN_HOST_PINGS_ONLY: &str = "Started at login, the host answers pings only and refuses \
-     every session, because it has no window or terminal to show one.";
+/// What starts at login (§B.1.1, decision M1-58), said by `service install`
+/// and `status` on both systems: the window, minimised. The name is older
+/// than the line; `the_login_host_line_is_the_readmes` keeps the line in the
+/// release README.
+const LOGIN_HOST_PINGS_ONLY: &str = "Started at login, Tornect runs in the background with its \
+     window minimised where the desktop allows it; a request raises the window.";
+
+/// What starting at sign-in costs in privacy (§B.1.1, the setting's copy):
+/// one constant for every place that offers or reports it.
+pub(crate) const TOR_AT_SIGN_IN: &str = "Starting at sign-in means a Tor connection at every \
+     sign-in: your local network and your internet provider can see that this computer uses Tor.";
+
+/// What `service install` and `status` say after the registration, in order.
+fn sign_in_lines() -> [&'static str; 3] {
+    [LOGIN_HOST_PINGS_ONLY, TOR_AT_SIGN_IN, AFTER_LOGIN_ONLY]
+}
 
 /// `tornect service install|uninstall|status`
 ///
@@ -2383,10 +2408,9 @@ pub fn service(paths: &Paths, cmd: ServiceCmd) -> anyhow::Result<()> {
             println!("{d}.");
         }
         if installing {
-            if cfg!(target_os = "linux") {
-                println!("{LOGIN_HOST_PINGS_ONLY}");
+            for line in sign_in_lines() {
+                println!("{line}");
             }
-            println!("{AFTER_LOGIN_ONLY}");
         }
         Ok(())
     })
@@ -2402,6 +2426,9 @@ fn service_status(paths: &Paths) -> anyhow::Result<()> {
         Ok(state) => println!("{}.", describe_autostart(&*backend, state)),
         Err(e) => println!("Could not read {}: {e}", backend.describe()),
     }
+    if let Some(older) = backend.older() {
+        println!("{older}");
+    }
     let row = match autostart::readiness_probe(&status) {
         Probe::Ok => "ok".to_owned(),
         Probe::Warn(m) => format!("warn: {m}"),
@@ -2409,10 +2436,9 @@ fn service_status(paths: &Paths) -> anyhow::Result<()> {
         Probe::Unknown => "unknown".to_owned(),
     };
     println!("Readiness row `autostart`: {row}");
-    if cfg!(target_os = "linux") {
-        println!("{LOGIN_HOST_PINGS_ONLY}");
+    for line in sign_in_lines() {
+        println!("{line}");
     }
-    println!("{AFTER_LOGIN_ONLY}");
     Ok(())
 }
 
@@ -2641,6 +2667,28 @@ mod tests {
             .and_then(|s| s.strip_suffix('.'))
             .unwrap();
         assert!(readme.contains(said), "the README does not say: {said}");
+    }
+
+    /// §B.1.1: `service install` and `status` say, on both systems, what
+    /// starts at login (the window, minimised) and that starting at sign-in
+    /// means a Tor connection at every sign-in, which the local network and
+    /// the provider can see as Tor use; nothing they say names the headless
+    /// host any more.
+    #[test]
+    fn service_install_says_tor_connects_at_every_sign_in() {
+        let lines = sign_in_lines();
+        assert_eq!(
+            lines[1],
+            "Starting at sign-in means a Tor connection at every sign-in: your local network and \
+             your internet provider can see that this computer uses Tor."
+        );
+        assert_eq!(
+            lines[0],
+            "Started at login, Tornect runs in the background with its window minimised where the \
+             desktop allows it; a request raises the window."
+        );
+        assert!(lines[2].contains("never turns on automatic login"));
+        assert!(lines.iter().all(|l| !l.contains("pings only")), "{lines:?}");
     }
 
     /// Track D S5: the offline route loads the store as the offline CLI
