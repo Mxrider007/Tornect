@@ -129,6 +129,69 @@ fn comes_back(event: &WindowEvent) -> bool {
     )
 }
 
+/// Where the indicator probe of a start in background mode stands (§B.1.1),
+/// apart from its window: what decides the moment the "indicator shown" fact
+/// is set, so that it is pinned without a desktop. Opening the probe decides
+/// nothing; only the probe window's own `RedrawRequested` before its deadline
+/// is its first frame, after which the fact is set; with none by
+/// [`PROBE_WAIT`] after it opened, it has failed and the fact stays unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeState<I> {
+    /// The probe window `id` opened at `at` and waits for its first frame.
+    Waiting { id: I, at: Instant },
+    /// Its first frame came in time: draw it, then set the fact.
+    Drew,
+    /// It drew nothing in time.
+    Failed,
+}
+
+impl<I: Copy + PartialEq> ProbeState<I> {
+    /// The probe window `id` opened at `now`: it waits; nothing is set.
+    fn opened(id: I, now: Instant) -> Self {
+        Self::Waiting { id, at: now }
+    }
+
+    /// Whether the events of window `id` are the waiting probe's.
+    fn owns(self, id: I) -> bool {
+        matches!(self, Self::Waiting { id: own, .. } if own == id)
+    }
+
+    /// When a waiting probe falls due.
+    fn due(self) -> Option<Instant> {
+        match self {
+            Self::Waiting { at, .. } => Some(at + PROBE_WAIT),
+            Self::Drew | Self::Failed => None,
+        }
+    }
+
+    /// `event` reached window `id` at `now`. Only the waiting probe window's
+    /// own `RedrawRequested` is its first frame, and only before its
+    /// deadline (at or after it the probe has failed); any other event, or
+    /// another window's, changes nothing.
+    fn on_event(self, id: I, event: &WindowEvent, now: Instant) -> Self {
+        if !self.owns(id) || !matches!(event, WindowEvent::RedrawRequested) {
+            return self;
+        }
+        match self.due() {
+            Some(due) if now < due => Self::Drew,
+            _ => Self::Failed,
+        }
+    }
+
+    /// At `now`: a probe still waiting at or past its deadline has failed.
+    fn at(self, now: Instant) -> Self {
+        match self.due() {
+            Some(due) if now >= due => Self::Failed,
+            _ => self,
+        }
+    }
+}
+
+/// Why a probe that drew nothing in time failed.
+fn probe_late() -> String {
+    format!("it drew nothing within {} s", PROBE_WAIT.as_secs())
+}
+
 /// DX12's options for every wgpu instance this app creates: the FXC shader
 /// compiler (`d3dcompiler_47.dll`, part of Windows 10 and later), never DXC,
 /// whose `dxcompiler.dll` is not part of Windows and which wgpu's default
@@ -301,8 +364,8 @@ pub struct App {
     indicator_rounded: bool,
     /// The indicator probe of a start in background mode (§B.1.1): the
     /// indicator's window, opened once right after the main window and closed
-    /// at its first frame, and when it opened.
-    probe: Option<(Surface, Instant)>,
+    /// at its first frame, and where it stands.
+    probe: Option<(Surface, ProbeState<WindowId>)>,
     /// Background mode (§B.1.1): which host sheets have their desktop
     /// notification.
     notices: super::notice::Notices,
@@ -509,18 +572,32 @@ impl App {
             return;
         }
         match self.open_indicator(el, 1) {
-            Ok(surface) => self.probe = Some((surface, Instant::now())),
+            Ok(surface) => {
+                let state = ProbeState::opened(surface.window.id(), Instant::now());
+                self.probe = Some((surface, state));
+            }
             Err(e) => self.probe_failed(&format!("{e:#}")),
+        }
+    }
+
+    /// An event of the probe window, as [`ProbeState`] decides it: its first
+    /// frame is drawn and then sets the fact; a frame past its deadline
+    /// fails it; anything else leaves it waiting.
+    fn probe_event(&mut self, id: WindowId, event: &WindowEvent) {
+        let Some((surface, state)) = self.probe.take() else {
+            return;
+        };
+        match state.on_event(id, event, Instant::now()) {
+            ProbeState::Drew => self.draw_probe(surface),
+            ProbeState::Failed => self.probe_failed(&probe_late()),
+            waiting @ ProbeState::Waiting { .. } => self.probe = Some((surface, waiting)),
         }
     }
 
     /// The probe's first frame: the indicator as it looks with no session
     /// (nothing on it can be pressed before it closes, so its actions are
     /// dropped), then the fact, then the window closes.
-    fn draw_probe(&mut self) {
-        let Some((mut surface, _)) = self.probe.take() else {
-            return;
-        };
+    fn draw_probe(&mut self, mut surface: Surface) {
         let rounded = self.indicator_rounded;
         surface.paint(|ui| {
             view::indicator_pill(
@@ -1143,15 +1220,9 @@ impl ApplicationHandler<UserEvent> for App {
             self.block_event(index, &event);
             return;
         }
-        if self
-            .probe
-            .as_ref()
-            .is_some_and(|(s, _)| s.window.id() == id)
-        {
+        if self.probe.as_ref().is_some_and(|(_, state)| state.owns(id)) {
             // Its first frame is all the probe waits for.
-            if matches!(event, WindowEvent::RedrawRequested) {
-                self.draw_probe();
-            }
+            self.probe_event(id, &event);
             return;
         }
         let Some(main) = &mut self.main else { return };
@@ -1207,14 +1278,14 @@ impl ApplicationHandler<UserEvent> for App {
             earliest(now + OWED_RETRY);
         }
         // An indicator probe that drew nothing in time has failed.
-        if let Some(due) = self.probe.as_ref().map(|(_, at)| *at + PROBE_WAIT) {
-            if now >= due {
-                self.probe_failed(&format!(
-                    "it drew nothing within {} s",
-                    PROBE_WAIT.as_secs()
-                ));
-            } else {
-                earliest(due);
+        if let Some(state) = self.probe.as_ref().map(|(_, state)| *state) {
+            match state.at(now) {
+                ProbeState::Failed => self.probe_failed(&probe_late()),
+                waiting => {
+                    if let Some(due) = waiting.due() {
+                        earliest(due);
+                    }
+                }
             }
         }
         // The block windows are put back on top every `block::REASSERT`.
@@ -1427,7 +1498,93 @@ mod tests {
         app.probe_drew();
         assert!(shown.is_set());
         assert_eq!(ctx.readiness_now().consent_indicator, Probe::Ok);
-        assert!(app.probe.is_none(), "the probe closes at its first frame");
+        let t0 = Instant::now();
+        let drew = ProbeState::opened(1_u32, t0).on_event(1, &WindowEvent::RedrawRequested, t0);
+        assert!(
+            drew == ProbeState::Drew && !drew.owns(1),
+            "the probe closes at its first frame"
+        );
+    }
+
+    /// §B.1.1 (decision M1-58): opening the indicator probe sets nothing: a
+    /// probe just opened waits for its first frame, owns its own window's
+    /// events only, and falls due `PROBE_WAIT` after it opened.
+    #[test]
+    fn opening_the_probe_sets_nothing() {
+        let t0 = Instant::now();
+        let probe = ProbeState::opened(1_u32, t0);
+        assert_eq!(probe, ProbeState::Waiting { id: 1, at: t0 });
+        assert!(probe.owns(1) && !probe.owns(2));
+        assert_eq!(probe.due(), Some(t0 + PROBE_WAIT));
+    }
+
+    /// The moment the fact is set (§B.1.1): only the probe window's own
+    /// `RedrawRequested` is its first frame; another window's redraw, and
+    /// the probe window's other events, change nothing. Drawn, the probe
+    /// owns no window any more, and nothing changes it.
+    #[test]
+    fn only_the_probe_windows_own_redraw_is_its_first_frame() {
+        let t0 = Instant::now();
+        let soon = t0 + Duration::from_millis(16);
+        let probe = ProbeState::opened(1_u32, t0);
+        assert_eq!(
+            probe.on_event(2, &WindowEvent::RedrawRequested, soon),
+            probe,
+            "another window's frame"
+        );
+        for other in [
+            WindowEvent::Focused(true),
+            WindowEvent::Occluded(false),
+            WindowEvent::Resized(winit::dpi::PhysicalSize::new(240, 48)),
+            WindowEvent::CloseRequested,
+        ] {
+            assert_eq!(probe.on_event(1, &other, soon), probe, "{other:?}");
+        }
+        let drew = probe.on_event(1, &WindowEvent::RedrawRequested, soon);
+        assert_eq!(drew, ProbeState::Drew);
+        assert!(!drew.owns(1));
+        assert_eq!(drew.due(), None);
+        assert_eq!(
+            drew.on_event(1, &WindowEvent::RedrawRequested, soon),
+            ProbeState::Drew
+        );
+        assert_eq!(drew.at(t0 + PROBE_WAIT), ProbeState::Drew);
+    }
+
+    /// A redraw of the probe window at or after its deadline is no first
+    /// frame: the probe has failed, and the fact stays unset.
+    #[test]
+    fn a_redraw_after_the_deadline_sets_nothing() {
+        let t0 = Instant::now();
+        let probe = ProbeState::opened(1_u32, t0);
+        for late in [t0 + PROBE_WAIT, t0 + PROBE_WAIT + Duration::from_secs(5)] {
+            assert_eq!(
+                probe.on_event(1, &WindowEvent::RedrawRequested, late),
+                ProbeState::Failed
+            );
+        }
+        let just_in_time = t0 + PROBE_WAIT - Duration::from_millis(1);
+        assert_eq!(
+            probe.on_event(1, &WindowEvent::RedrawRequested, just_in_time),
+            ProbeState::Drew
+        );
+    }
+
+    /// The deadline: a probe with no frame fails `PROBE_WAIT` after it
+    /// opened, not before; failed, it owns no window and stays failed.
+    #[test]
+    fn the_probe_fails_at_its_deadline() {
+        let t0 = Instant::now();
+        let probe = ProbeState::opened(1_u32, t0);
+        assert_eq!(probe.due(), Some(t0 + PROBE_WAIT));
+        assert_eq!(probe.at(t0 + PROBE_WAIT - Duration::from_millis(1)), probe);
+        let failed = probe.at(t0 + PROBE_WAIT);
+        assert_eq!(failed, ProbeState::Failed);
+        assert!(!failed.owns(1));
+        assert_eq!(
+            failed.on_event(1, &WindowEvent::RedrawRequested, t0 + PROBE_WAIT),
+            ProbeState::Failed
+        );
     }
 
     /// A probe that cannot open, or draws nothing in time, keeps the row
