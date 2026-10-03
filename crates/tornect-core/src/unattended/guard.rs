@@ -1038,6 +1038,11 @@ impl MutationGuard {
             });
         self.store
             .mutate(WriteClass::Policy, Some(&rec), |s, now| {
+                // A shortened pause is access-increasing: its last no-session check is
+                // made under the lock that commits it (decision M1-67).
+                if shortens {
+                    self.no_session_at_commit()?;
+                }
                 // a pause extended while the dialog was up must not be cut short by a
                 // caller who was classified deny-direction on the earlier picture
                 if !shortens && pause_shortens(running_pause(s, now), until) {
@@ -1268,12 +1273,17 @@ impl MutationGuard {
             .map_err(|e| GuardError::Precondition(format!("rng: {e}")))?;
         let token = stop_token(host_onion_pk, &code);
         let rec = SessionRecord::at(self.now(), SessionEvent::UnattendedEnabled).by(by);
-        self.store.mutate(WriteClass::Policy, Some(&rec), |s, _| {
-            s.enabled = true;
-            s.paused_until = None;
-            s.stop_token = Some(token);
-            Ok(())
-        })?;
+        self.store
+            .mutate(WriteClass::Policy, Some(&rec), |s, _| {
+                // Access-increasing (§B.8.6.2): the last no-session check is made under
+                // the lock that commits it (decision M1-67).
+                self.no_session_at_commit()?;
+                s.enabled = true;
+                s.paused_until = None;
+                s.stop_token = Some(token);
+                Ok(())
+            })
+            .map_err(|e| self.refused_at_commit("master_on", by, None, e))?;
         Ok(MasterOnOk { stop_code: code })
     }
 
