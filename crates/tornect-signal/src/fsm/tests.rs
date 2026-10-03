@@ -7070,6 +7070,115 @@ async fn a25_d_a_lowering_in_the_block_window_signs_no_level() {
     assert_eq!(mode, messages::mode::VIEW_ONLY, "F-12, without the level");
 }
 
+/// The block window during which the owner narrows the grant to View only, after giving
+/// another device a grant at the administrator level when `admin_grant_for` names one.
+struct NarrowDuringTheWindow {
+    owner: Arc<tornect_core::unattended::guard::MutationGuard>,
+    device: DeviceId,
+    admin_grant_for: Option<DeviceId>,
+}
+
+impl crate::consent::BlockWindow for NarrowDuringTheWindow {
+    fn run<'a>(
+        &'a self,
+        _: u8,
+        _: &'a tornect_core::unattended::grant::GrantId,
+        _: &'a str,
+    ) -> BoxFuture<'a, BlockOutcome> {
+        use tornect_core::session_log::Actor;
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::ipc::GrantOptions;
+        Box::pin(async move {
+            if let Some(other) = &self.admin_grant_for {
+                self.owner
+                    .create_grant(
+                        Actor::Ui,
+                        other,
+                        Preset::HeadlessBox,
+                        &GrantOptions {
+                            elevation: Some(tornect_core::levels::Elevation::Admin),
+                            ..GrantOptions::default()
+                        },
+                        &[0u8; 192],
+                        true,
+                    )
+                    .unwrap();
+            }
+            self.owner
+                .set_options(
+                    Actor::Ui,
+                    &self.device,
+                    &GrantOptions {
+                        mode: Some(SessionMode::ViewOnly),
+                        ..GrantOptions::default()
+                    },
+                )
+                .unwrap();
+            BlockOutcome::Passed(WindowPassed::Elapsed)
+        })
+    }
+}
+
+/// M1-67 B ("a grant lowered since the gate is clamped there") and D11: P's control grant
+/// set to View only during its block window, after the gate read it as control. The read
+/// after the reservation finds P at View only and answers 0, and the session is served
+/// View only, never control at 0: for a password marked before, where nothing reaches the
+/// level, and for one this answer marks while another grant was just given the level,
+/// where control would reach it.
+#[tokio::test]
+async fn a_grant_narrowed_in_the_block_window_is_served_view_only() {
+    use tornect_core::levels::{Elevation, FixedFacts, HelperPresence};
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    for (case, unmarked, admin_grant_for) in [
+        ("marked before, nothing at the level", false, None),
+        (
+            "marked by this answer, another grant at the level",
+            true,
+            Some(DeviceId::from_bytes([0x66; 32])),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        // UAC on and no helper task: control is not administrator access, and no grant
+        // holds the level when the gate reads it, so the gate mints control.
+        let facts = Arc::new(FixedFacts::new(
+            windows_facts(|_| {}),
+            HelperPresence::Absent,
+        ));
+        let (mut host, client, guard) =
+            unattended_pair_edited(tmp.path(), PW, facts, |g| g.unmarked = unmarked);
+        let device = client.identity.id();
+        host.deps.block_window = Arc::new(NarrowDuringTheWindow {
+            owner: Arc::clone(&guard),
+            device,
+            admin_grant_for,
+        });
+        let (mode, elevation, reach) = signed(
+            &host,
+            &client,
+            unattended_intent(PW, messages::mode::CONTROL, false),
+        )
+        .await;
+        assert_eq!(
+            mode,
+            messages::mode::VIEW_ONLY,
+            "{case}: never control at 0"
+        );
+        assert_eq!(elevation, Elevation::None, "{case}");
+        assert_eq!(reach, Some(0), "{case}");
+        let stored = guard.store().grant(&device).unwrap();
+        assert_eq!(stored.mode, SessionMode::ViewOnly, "{case}");
+        assert!(stored.marked(), "{case}: answered 0, marked");
+        assert_eq!(
+            guard
+                .store()
+                .read(|s| s.grants.iter().any(|g| g.holds_level()))
+                .unwrap(),
+            admin_grant_for.is_some(),
+            "{case}"
+        );
+    }
+}
+
 /// M1-67 D6: a lowering ends P's sessions at the level only: P's View only session at none
 /// goes on through it, and a revoke then still ends it.
 #[tokio::test(start_paused = true)]
