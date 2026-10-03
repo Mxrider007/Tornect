@@ -1403,6 +1403,8 @@ mod windows_tests {
         entries: RefCell<BTreeMap<String, UninstallEntry>>,
         /// Paths whose DACL lets Users write.
         writable_by_users: BTreeSet<String>,
+        /// Paths owned by an ordinary account.
+        owned_by_users: BTreeSet<String>,
         /// Paths that became reparse points while the steps ran.
         reparse_now: RefCell<BTreeSet<String>>,
         /// Paths whose DACL came to let Users write while the steps ran.
@@ -1447,6 +1449,7 @@ mod windows_tests {
                 shortcuts: RefCell::new(BTreeMap::new()),
                 entries: RefCell::new(BTreeMap::new()),
                 writable_by_users: BTreeSet::new(),
+                owned_by_users: BTreeSet::new(),
                 reparse_now: RefCell::new(BTreeSet::new()),
                 writable_now: RefCell::new(BTreeSet::new()),
                 on_copy_link: None,
@@ -1610,6 +1613,9 @@ mod windows_tests {
                 || self.writable_now.borrow().contains(&key(path))
             {
                 security.dacl[2].mask |= 0x2;
+            }
+            if self.owned_by_users.contains(&key(path)) {
+                security.owner = "S-1-5-21-1-2-3-1001".to_owned();
             }
             Ok(security)
         }
@@ -2236,5 +2242,93 @@ mod windows_tests {
             fake.events()
         );
         assert!(fake.shortcuts.borrow().is_empty() && fake.entries.borrow().is_empty());
+    }
+
+    /// The ACL check after the copy (§B.1.1: no write, delete or owner-change
+    /// entry for a non-administrator, before anything points at the copy):
+    /// a copy that the executable's, the folder's or Program Files' DACL
+    /// lets other accounts change, or whose owner is an ordinary account, is
+    /// refused each time. Nothing points at it (no Start-menu entry, no
+    /// uninstall entry), and nothing runs elevated after the copy: it is not
+    /// deleted as administrator, and the refusal says to delete it by hand.
+    #[test]
+    fn a_copy_others_can_change_is_refused_and_nothing_points_at_it() {
+        for broken in ["exe", "folder", "program files", "owner"] {
+            let mut fake = Fake::new();
+            match broken {
+                "exe" => {
+                    fake.writable_by_users.insert(key(&fake.exe()));
+                }
+                "folder" => {
+                    fake.writable_by_users.insert(key(&fake.folder()));
+                }
+                "program files" => {
+                    fake.writable_by_users.insert(key(PF));
+                }
+                _ => {
+                    fake.owned_by_users.insert(key(&fake.exe()));
+                }
+            }
+            match install_in_program_files(&fake, &mut allow(&fake)) {
+                Err(InstallError::Refused(why)) => {
+                    assert_eq!(why, COPY_NOT_ADMIN_ONLY, "{broken}");
+                }
+                other => panic!("{broken}: installed: {other:?}"),
+            }
+            let events = fake.events();
+            assert!(
+                !events.iter().any(|e| matches!(
+                    e,
+                    Ev::WriteShortcut(_) | Ev::Elevated(Elevated::WriteEntry(_))
+                )),
+                "{broken}: {events:?}"
+            );
+            assert!(
+                matches!(fake.elevated().as_slice(), [Elevated::Copy { .. }]),
+                "{broken}: {events:?}"
+            );
+            assert!(fake.shortcuts.borrow().is_empty(), "{broken}");
+            assert!(fake.entries.borrow().is_empty(), "{broken}");
+        }
+    }
+
+    /// Where the ACL check runs in an install that passes it: its reads of
+    /// the executable, the folder and Program Files come after the copy and
+    /// before the first entry that points at the copy, and no read comes
+    /// anywhere else.
+    #[test]
+    fn the_acl_check_runs_after_the_copy_and_before_any_entry() {
+        let fake = Fake::new();
+        install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        let events = fake.events();
+        let copy = position(&events, |e| {
+            matches!(e, Ev::Elevated(Elevated::Copy { .. }))
+        });
+        let first_entry = position(&events, |e| {
+            matches!(
+                e,
+                Ev::WriteShortcut(_) | Ev::Elevated(Elevated::WriteEntry(_))
+            )
+        });
+        let reads: Vec<(usize, String)> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(at, e)| match e {
+                Ev::Security(path) => Some((at, key(path))),
+                _ => None,
+            })
+            .collect();
+        for wanted in [fake.exe(), fake.folder(), PF.to_owned()] {
+            assert!(
+                reads
+                    .iter()
+                    .any(|(at, path)| *path == key(&wanted) && copy < *at && *at < first_entry),
+                "{wanted} not read between the copy and the first entry: {events:?}"
+            );
+        }
+        assert!(
+            reads.iter().all(|(at, _)| copy < *at && *at < first_entry),
+            "{events:?}"
+        );
     }
 }
