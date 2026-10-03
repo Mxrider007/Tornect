@@ -29,13 +29,17 @@
 //! recording fake implements in the tests. This program's image is held open
 //! (share mode read only) and hashed from that handle before the guard's
 //! dialog, and held to the end; the folder is `FOLDERID_ProgramFiles`'s
-//! `Tornect`, refused when it holds anything but `tornect.exe`; after the
-//! copy (elevated) the copy is hashed and compared with the held image, then
+//! `Tornect`, and an existing one is refused, before the dialog and again
+//! after it, when it holds anything but `tornect.exe`, when it or that
+//! `tornect.exe` is a reparse point, or when the ACL rule below fails; after
+//! the copy (elevated) the folder and the copy are checked for reparse
+//! points, then the copy is hashed and compared with the held image, then
 //! checked with the administrator helper task's ACL rule ([`admin_only`]),
-//! both before anything points at it; then this user's Start-menu entry,
+//! all before anything points at it; then this user's Start-menu entry,
 //! then the Apps-and-features entry (elevated), whose command is the quoted
 //! path with the fixed argument `uninstall`. A failure undoes what was done,
-//! newest first, and only a program in Program Files or the system folder
+//! newest first, but a folder found unsafe is never deleted as
+//! administrator, and only a program in Program Files or the system folder
 //! ever runs elevated. This build has not the calls that make these steps on
 //! Windows, where `windows_system` refuses.
 
@@ -99,9 +103,13 @@ pub const SOURCE_SWAPPED: &str = "Something else replaced the Tornect file while
 pub const INSTALL_NEEDS_APPROVAL: &str =
     "Installing needs administrator approval; nothing was installed.";
 
-/// The installed copy failed the ACL check and was removed.
+/// The installed copy failed the ACL check: it is left, with nothing
+/// pointing at it, and not deleted as administrator (an account that can
+/// change its folder could have made the folder a link to another place).
 pub const COPY_NOT_ADMIN_ONLY: &str = "The installed copy could be changed by accounts other than \
-     administrators, so it was removed. Nothing was installed.";
+     administrators, so nothing points at it and Tornect was not installed. It was not deleted as \
+     administrator either, since another account could have changed what would be deleted: delete \
+     the Tornect folder in Program Files by hand.";
 
 /// One step that needs administrator rights, run through Windows' prompt
 /// (UAC).
@@ -152,7 +160,11 @@ pub trait HeldImage: std::io::Read {
 /// This computer as the Program Files install needs it; a recording fake in
 /// the tests. Every folder comes from the OS (never from the environment,
 /// which whoever starts Tornect controls); every change that needs
-/// administrator rights is one [`Elevated`] step.
+/// administrator rights is one [`Elevated`] step. The reads act on the path
+/// itself: [`Self::is_reparse_point`], [`Self::read_file`] and
+/// [`Self::security`] never follow a reparse point at the path (on Windows,
+/// `FILE_FLAG_OPEN_REPARSE_POINT`), so a link put at a checked path is seen,
+/// never looked through.
 pub trait WindowsSystem {
     /// `FOLDERID_ProgramFiles`.
     fn program_files(&self) -> Result<String, InstallError>;
@@ -165,11 +177,14 @@ pub trait WindowsSystem {
     fn open_own_image(&self) -> Result<Box<dyn HeldImage + '_>, InstallError>;
     /// The names `folder` holds; `None` when there is no such folder.
     fn folder_entries(&self, folder: &str) -> Result<Option<Vec<String>>, InstallError>;
-    /// Whether `path` is a reparse point (a junction or a link).
+    /// Whether `path` itself is a reparse point (a junction, a mount point or
+    /// a link); none is followed to answer.
     fn is_reparse_point(&self, path: &str) -> Result<bool, InstallError>;
-    /// The file at `path`, for reading.
+    /// The file at `path`, for reading; a reparse point at `path` is never
+    /// followed.
     fn read_file(&self, path: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError>;
-    /// The owner and the DACL of `path`, a file or a folder.
+    /// The owner and the DACL of `path` itself, a file or a folder; a
+    /// reparse point at `path` is read itself, never followed.
     fn security(&self, path: &str) -> Result<Security, InstallError>;
     /// The program that would run `step` elevated (checked before any step
     /// runs: only a program in Program Files or the system folder may be).
@@ -361,7 +376,11 @@ enum Done {
 }
 
 /// Undo `done`, newest first: the Start-menu entry, then the copy (an
-/// elevated step). What could not be undone is added to `error`'s message.
+/// elevated step, run only after a reparse check of its own: the folder and
+/// the copy in it must not be reparse points, or the delete would act on
+/// another place). What could not be undone is added to `error`'s message.
+/// A copy whose folder failed the ACL check never comes here: it is not
+/// deleted as administrator at all.
 fn undo(
     sys: &dyn WindowsSystem,
     target: &WindowsTarget,
@@ -372,8 +391,10 @@ fn undo(
     for step in done.iter().rev() {
         let undone = match step {
             Done::StartMenuEntry => sys.remove_shortcut(&target.start_menu_entry),
-            Done::Copied => sys.run_elevated(&Elevated::RemoveFolder {
-                folder: target.folder.clone(),
+            Done::Copied => not_a_link(sys, target).and_then(|()| {
+                sys.run_elevated(&Elevated::RemoveFolder {
+                    folder: target.folder.clone(),
+                })
             }),
         };
         if let Err(e) = undone {
@@ -388,10 +409,6 @@ fn undo(
     }
     let tail = format!(" Undoing it did not finish ({}).", failed.join("; "));
     match error {
-        InstallError::Refused(m) if m == COPY_NOT_ADMIN_ONLY => InstallError::Refused(format!(
-            "The installed copy could be changed by accounts other than administrators. \
-             Nothing was installed.{tail}"
-        )),
         InstallError::Unavailable(m) => InstallError::Unavailable(format!("{m}{tail}")),
         InstallError::Refused(m) => InstallError::Refused(format!("{m}{tail}")),
         InstallError::Cancelled(m) => InstallError::Cancelled(format!("{m}{tail}")),
@@ -399,9 +416,29 @@ fn undo(
     }
 }
 
-/// Refused when `folder` exists and holds anything but `tornect.exe`, or is
-/// a reparse point.
-fn existing_folder_ok(sys: &dyn WindowsSystem, folder: &str) -> Result<(), InstallError> {
+/// Refused when the install folder or the executable in it is a reparse
+/// point, as read right before the undo's elevated delete: nothing is
+/// deleted as administrator through one.
+fn not_a_link(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result<(), InstallError> {
+    for path in [&target.folder, &target.exe] {
+        if sys.is_reparse_point(path)? {
+            return Err(InstallError::Refused(format!(
+                "{path} is a link to another place, so Tornect did not remove it as \
+                 administrator; nothing points at it"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refused when the install folder exists and holds anything but
+/// `tornect.exe`, when it or the `tornect.exe` in it is a reparse point, or
+/// when accounts other than administrators can change it, that
+/// `tornect.exe` or a folder above it up to Program Files: the elevated copy
+/// must not write into a place another account controls (decision M1-65).
+/// Run before the dialog and again right after it.
+fn existing_folder_ok(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result<(), InstallError> {
+    let folder = &target.folder;
     let Some(entries) = sys.folder_entries(folder)? else {
         return Ok(());
     };
@@ -410,12 +447,24 @@ fn existing_folder_ok(sys: &dyn WindowsSystem, folder: &str) -> Result<(), Insta
             "{folder} is a link to another place, so Tornect was not installed there."
         )));
     }
-    if entries.iter().all(|e| e.eq_ignore_ascii_case(WINDOWS_EXE)) {
-        return Ok(());
+    if !entries.iter().all(|e| e.eq_ignore_ascii_case(WINDOWS_EXE)) {
+        return Err(InstallError::Refused(format!(
+            "{folder} already holds other files, so Tornect was not installed there."
+        )));
     }
-    Err(InstallError::Refused(format!(
-        "{folder} already holds other files, so Tornect was not installed there."
-    )))
+    let with_exe = !entries.is_empty();
+    if with_exe && sys.is_reparse_point(&target.exe)? {
+        return Err(InstallError::Refused(format!(
+            "{} is a link to another place, so Tornect was not installed there.",
+            target.exe
+        )));
+    }
+    target.admin_only(sys, with_exe).map_err(|why| {
+        InstallError::Refused(format!(
+            "{folder} could be changed by accounts other than administrators, so Tornect was \
+             not installed there ({why})."
+        ))
+    })
 }
 
 /// `tornect install` on Windows (§B.1.1), step by step:
@@ -424,26 +473,32 @@ fn existing_folder_ok(sys: &dyn WindowsSystem, folder: &str) -> Result<(), Insta
 ///    that handle, before anything else and until the end;
 /// 2. the target from the known folders; refused when its path cannot be
 ///    quoted into the uninstall command, when `<Program Files>\Tornect`
-///    holds anything but `tornect.exe` or is a reparse point, or when a step
-///    would run elevated through a program outside Program Files and the
-///    system folder;
+///    exists and fails `existing_folder_ok` (anything but `tornect.exe` in
+///    it, a reparse point, or an ACL that lets another account change it),
+///    or when a step would run elevated through a program outside Program
+///    Files and the system folder;
 /// 3. `authorize`, the mutation guard's operation (re-authentication, no
 ///    remote session for 60 s, logged): nothing before it changes anything;
+///    then the folder checked again, as the dialog may have stayed open for
+///    long;
 /// 4. the copy (elevated);
-/// 5. the copy hashed and compared with the held image, then the ACL check,
-///    both before anything points at the copy;
+/// 5. the folder and the copy checked for reparse points, then the copy
+///    hashed and compared with the held image, then the ACL check, all
+///    before anything points at the copy;
 /// 6. this user's Start-menu entry;
 /// 7. the uninstall entry (elevated).
 ///
-/// A failure after the copy undoes what was done, newest first; a cancelled
-/// prompt is [`InstallError::Cancelled`].
+/// A failure after the copy undoes what was done, newest first, but a copy
+/// whose folder failed the ACL check, or became a reparse point, is never
+/// deleted as administrator: it is left, with nothing pointing at it, and
+/// the refusal says so. A cancelled prompt is [`InstallError::Cancelled`].
 pub fn install_in_program_files(
     sys: &dyn WindowsSystem,
     authorize: &mut dyn FnMut() -> Result<(), InstallError>,
 ) -> Result<Installed, InstallError> {
     let source = HeldSource::hold(sys)?;
     let target = WindowsTarget::of(sys)?;
-    existing_folder_ok(sys, &target.folder)?;
+    existing_folder_ok(sys, &target)?;
     let copy = Elevated::Copy {
         from: source.path().to_owned(),
         to: target.exe.clone(),
@@ -456,6 +511,7 @@ pub fn install_in_program_files(
         target.elevation_ok(sys, step)?;
     }
     authorize()?;
+    existing_folder_ok(sys, &target)?;
     match sys.run_elevated(&copy) {
         Ok(()) => {}
         Err(InstallError::Cancelled(_)) => {
@@ -464,6 +520,25 @@ pub fn install_in_program_files(
         Err(e) => return Err(undo(sys, &target, &[Done::Copied], e)),
     }
     let mut done = vec![Done::Copied];
+    // The copy is read where it was written, not through a link put there
+    // during the copy.
+    for path in [&target.folder, &target.exe] {
+        match sys.is_reparse_point(path) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(undo(
+                    sys,
+                    &target,
+                    &done,
+                    InstallError::Refused(format!(
+                        "{path} became a link to another place while Tornect was copied, so \
+                         nothing was installed."
+                    )),
+                ));
+            }
+            Err(e) => return Err(undo(sys, &target, &done, e)),
+        }
+    }
     let copied = sys.read_file(&target.exe).and_then(|mut file| {
         sha256_of(&mut *file)
             .map_err(|e| InstallError::Failed(format!("reading {}: {e}", target.exe)))
@@ -482,12 +557,9 @@ pub fn install_in_program_files(
     }
     if let Err(why) = target.admin_only(sys, true) {
         tracing::warn!(%why, "the installed copy failed the ACL check");
-        return Err(undo(
-            sys,
-            &target,
-            &done,
-            InstallError::Refused(COPY_NOT_ADMIN_ONLY.to_owned()),
-        ));
+        // Not deleted as administrator: an account that can change the
+        // folder could have turned it into a link to another place first.
+        return Err(InstallError::Refused(COPY_NOT_ADMIN_ONLY.to_owned()));
     }
     if let Err(e) = sys.write_shortcut(&target.start_menu_entry, &target.exe) {
         return Err(undo(sys, &target, &done, e));
@@ -1331,6 +1403,15 @@ mod windows_tests {
         entries: RefCell<BTreeMap<String, UninstallEntry>>,
         /// Paths whose DACL lets Users write.
         writable_by_users: BTreeSet<String>,
+        /// Paths that became reparse points while the steps ran.
+        reparse_now: RefCell<BTreeSet<String>>,
+        /// Paths whose DACL came to let Users write while the steps ran.
+        writable_now: RefCell<BTreeSet<String>>,
+        /// A path that becomes a reparse point when the copy runs.
+        on_copy_link: Option<String>,
+        /// A path that becomes a reparse point when the Start-menu entry is
+        /// written.
+        on_shortcut_link: Option<String>,
         /// Elevated steps cancelled at the prompt (by kind), once each.
         cancel: RefCell<Vec<&'static str>>,
         /// Elevated steps that fail (by kind).
@@ -1366,6 +1447,10 @@ mod windows_tests {
                 shortcuts: RefCell::new(BTreeMap::new()),
                 entries: RefCell::new(BTreeMap::new()),
                 writable_by_users: BTreeSet::new(),
+                reparse_now: RefCell::new(BTreeSet::new()),
+                writable_now: RefCell::new(BTreeSet::new()),
+                on_copy_link: None,
+                on_shortcut_link: None,
                 cancel: RefCell::new(Vec::new()),
                 fail: Vec::new(),
                 runner: BTreeMap::new(),
@@ -1505,7 +1590,7 @@ mod windows_tests {
         }
 
         fn is_reparse_point(&self, path: &str) -> Result<bool, InstallError> {
-            Ok(self.reparse.contains(&key(path)))
+            Ok(self.reparse.contains(&key(path)) || self.reparse_now.borrow().contains(&key(path)))
         }
 
         fn read_file(&self, path: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError> {
@@ -1521,7 +1606,9 @@ mod windows_tests {
         fn security(&self, path: &str) -> Result<Security, InstallError> {
             self.record(Ev::Security(path.to_owned()));
             let mut security = admin_only_security();
-            if self.writable_by_users.contains(&key(path)) {
+            if self.writable_by_users.contains(&key(path))
+                || self.writable_now.borrow().contains(&key(path))
+            {
                 security.dacl[2].mask |= 0x2;
             }
             Ok(security)
@@ -1556,6 +1643,9 @@ mod windows_tests {
                         .clone()
                         .unwrap_or_else(|| self.image.clone());
                     self.files.borrow_mut().insert(key(to), bytes);
+                    if let Some(link) = &self.on_copy_link {
+                        self.reparse_now.borrow_mut().insert(key(link));
+                    }
                 }
                 Elevated::WriteEntry(entry) => {
                     self.entries
@@ -1591,6 +1681,9 @@ mod windows_tests {
             self.shortcuts
                 .borrow_mut()
                 .insert(key(link), target.to_owned());
+            if let Some(path) = &self.on_shortcut_link {
+                self.reparse_now.borrow_mut().insert(key(path));
+            }
             Ok(())
         }
 
@@ -1981,5 +2074,167 @@ mod windows_tests {
         let exe = fake.exe();
         fake.runner.insert("delete", exe);
         uninstall_from_program_files(&fake, &mut allow(&fake)).unwrap();
+    }
+
+    /// An existing `<Program Files>\Tornect` is checked as the copy will be,
+    /// before the dialog: a folder, a `tornect.exe` in it or Program Files
+    /// that accounts other than administrators can change, or a
+    /// `tornect.exe` that is a reparse point, is refused before anything is
+    /// asked or run (an empty folder too).
+    #[test]
+    fn an_existing_folder_is_checked_before_the_dialog() {
+        for broken in ["folder", "exe", "program files", "exe link"] {
+            let mut fake = Fake::new();
+            let folder = key(&fake.folder());
+            fake.folders.borrow_mut().insert(folder.clone());
+            if broken != "folder" {
+                fake.files
+                    .borrow_mut()
+                    .insert(key(&fake.exe()), PROGRAM.to_vec());
+            }
+            match broken {
+                "folder" => {
+                    fake.writable_by_users.insert(folder);
+                }
+                "exe" => {
+                    fake.writable_by_users.insert(key(&fake.exe()));
+                }
+                "program files" => {
+                    fake.writable_by_users.insert(key(PF));
+                }
+                _ => {
+                    fake.reparse.insert(key(&fake.exe()));
+                }
+            }
+            match install_in_program_files(&fake, &mut allow(&fake)) {
+                Err(InstallError::Refused(why)) => assert!(
+                    why.contains("could be changed by accounts other than administrators")
+                        || (broken == "exe link" && why.contains("is a link to another place")),
+                    "{broken}: {why}"
+                ),
+                other => panic!("{broken}: installed: {other:?}"),
+            }
+            assert!(
+                !fake
+                    .events()
+                    .iter()
+                    .any(|e| matches!(e, Ev::Authorize | Ev::Elevated(_))),
+                "{broken}: {:?}",
+                fake.events()
+            );
+        }
+    }
+
+    /// The dialog can stay open for long: the folder is checked again after
+    /// it. One that became, while it was open, a reparse point that other
+    /// accounts can change, or that appeared as one, is refused before the
+    /// copy: nothing runs elevated.
+    #[test]
+    fn a_folder_changed_during_the_dialog_is_refused_before_the_copy() {
+        for existed in [true, false] {
+            let fake = Fake::new();
+            let folder = key(&fake.folder());
+            if existed {
+                fake.folders.borrow_mut().insert(folder.clone());
+            }
+            let mut turn_into_a_link = || {
+                fake.record(Ev::Authorize);
+                fake.folders.borrow_mut().insert(folder.clone());
+                fake.reparse_now.borrow_mut().insert(folder.clone());
+                fake.writable_now.borrow_mut().insert(folder.clone());
+                Ok(())
+            };
+            match install_in_program_files(&fake, &mut turn_into_a_link) {
+                Err(InstallError::Refused(why)) => {
+                    assert!(
+                        why.contains("is a link to another place"),
+                        "existed {existed}: {why}"
+                    );
+                }
+                other => panic!("existed {existed}: installed: {other:?}"),
+            }
+            assert!(fake.events().contains(&Ev::Authorize));
+            assert!(
+                fake.elevated().is_empty(),
+                "existed {existed}: {:?}",
+                fake.events()
+            );
+            assert!(fake.shortcuts.borrow().is_empty() && fake.entries.borrow().is_empty());
+        }
+    }
+
+    /// After the copy, the folder and the copy are checked for reparse
+    /// points before the copy is read and hashed (here the copy is also not
+    /// the held image, and the link is what is reported): nothing points at
+    /// it, and the folder, now a link to another place, is never deleted as
+    /// administrator; the refusal says what was left.
+    #[test]
+    fn the_copy_is_never_read_or_removed_through_a_link() {
+        for at in ["folder", "exe"] {
+            let mut fake = Fake::new();
+            fake.copy_writes = Some(b"MZ another program".to_vec());
+            fake.on_copy_link = Some(if at == "folder" {
+                fake.folder()
+            } else {
+                fake.exe()
+            });
+            match install_in_program_files(&fake, &mut allow(&fake)) {
+                Err(InstallError::Refused(why)) => {
+                    assert!(why.contains("link to another place"), "{at}: {why}");
+                    assert!(
+                        why.contains("did not remove it as administrator"),
+                        "{at}: {why}"
+                    );
+                }
+                other => panic!("{at}: {other:?}"),
+            }
+            assert!(
+                matches!(fake.elevated().as_slice(), [Elevated::Copy { .. }]),
+                "{at}: {:?}",
+                fake.events()
+            );
+            assert!(fake.shortcuts.borrow().is_empty() && fake.entries.borrow().is_empty());
+        }
+    }
+
+    /// The undo deletes the install folder as administrator only after a
+    /// reparse check of its own, and never a folder found unsafe: a copy
+    /// that failed the ACL check is left where it is (nothing points at it,
+    /// and the refusal says so), and a folder that became a reparse point
+    /// before an undo is not deleted through it.
+    #[test]
+    fn an_install_never_deletes_as_administrator_a_folder_found_unsafe() {
+        let mut fake = Fake::new();
+        fake.writable_by_users.insert(key(&fake.folder()));
+        match install_in_program_files(&fake, &mut allow(&fake)) {
+            Err(InstallError::Refused(why)) => assert_eq!(why, COPY_NOT_ADMIN_ONLY),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            matches!(fake.elevated().as_slice(), [Elevated::Copy { .. }]),
+            "{:?}",
+            fake.events()
+        );
+        assert!(fake.shortcuts.borrow().is_empty() && fake.entries.borrow().is_empty());
+
+        let mut fake = Fake::new();
+        fake.fail = vec!["write"];
+        fake.on_shortcut_link = Some(fake.folder());
+        match install_in_program_files(&fake, &mut allow(&fake)) {
+            Err(InstallError::Failed(why)) => {
+                assert!(why.starts_with("write failed"), "{why}");
+                assert!(why.contains("did not remove it as administrator"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            !fake
+                .elevated()
+                .iter()
+                .any(|s| matches!(s, Elevated::RemoveFolder { .. })),
+            "{:?}",
+            fake.events()
+        );
+        assert!(fake.shortcuts.borrow().is_empty() && fake.entries.borrow().is_empty());
     }
 }
