@@ -99,7 +99,6 @@ impl TerminalBlockWindow {
     /// The window on `prompter`'s terminal, with the desktop notification on
     /// Linux.
     #[must_use]
-    #[expect(dead_code, reason = "no caller until the terminal host is wired to it")]
     pub fn new(prompter: Arc<Prompter>) -> Self {
         #[cfg(target_os = "linux")]
         let notify = if cfg!(test) {
