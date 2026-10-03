@@ -4672,6 +4672,31 @@ fn a25_a_and_b_a_marked_password_is_view_only_where_control_reaches_the_level() 
 }
 
 #[test]
+fn the_read_gives_the_grant_mode_as_stored() {
+    // B ("a grant lowered since the gate is clamped there"), D11: the read returns P's
+    // mode as stored under its lock, which the session is lowered to, and judges clause
+    // (ii) on it: P narrowed to View only since the gate reaches nothing through the host.
+    let (_env, store, _guard) = reach_env();
+    let account = windows(|f| f.enable_lua = Some(0));
+    let control = read_p(&store, account, HelperPresence::Absent).unwrap();
+    assert_eq!(control.grant_mode, SessionMode::Control);
+    assert!(
+        control.clause_ii,
+        "control is administrator access on these facts"
+    );
+    assert_eq!(control.grant_reach, 1);
+    set_grant(&store, &dev(1), |g| g.mode = SessionMode::ViewOnly);
+    let view = read_p(&store, account, HelperPresence::Absent).unwrap();
+    assert_eq!(view.grant_mode, SessionMode::ViewOnly);
+    assert!(
+        !view.clause_ii,
+        "View only reaches nothing through the host"
+    );
+    assert_eq!(view.grant_reach, 0);
+    assert!(view.marked && store.grant(&dev(1)).unwrap().marked());
+}
+
+#[test]
 fn a25_e_a_store_rolled_back_to_before_the_mark_fails_closed() {
     // A25 (e): the mark is a policy write. A store file rolled back to before it fails
     // closed once the anchor was written, and loads while the bump is owed (R12).

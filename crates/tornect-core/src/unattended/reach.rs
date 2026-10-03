@@ -2,9 +2,10 @@
 //! §B.8.4.1 and §B.8.6.1): one store operation, under the store lock, that checks the
 //! `auth` record the stream's PAKE ran against, refuses a grant no longer eligible, reads
 //! the "answered 0" mark and whether some grant holds the administrator level, computes
-//! `grant_reach` and the grant level the clamp uses, and marks the password before an
-//! answer of 0. It only ever lowers the session the gate minted; the account facts and
-//! the helper task's presence are read by the caller just before, outside the store lock.
+//! `grant_reach` and the grant mode and level the clamp uses, and marks the password
+//! before an answer of 0. It only ever lowers the session the gate minted; the account
+//! facts and the helper task's presence are read by the caller just before, outside the
+//! store lock.
 //!
 //! Its refusals are returned unlogged, for the caller to log once the lock is dropped, and
 //! it writes no `sessions.log` line under the lock: the mark is a policy write without
@@ -15,6 +16,7 @@ use zeroize::Zeroizing;
 
 use crate::id::DeviceId;
 use crate::levels::{AccountFacts, Elevation, HelperPresence, clause_ii};
+use crate::session_log::SessionMode;
 
 use super::grant::{AuthRecord, GrantState, UnattendedGrant, UnattendedStore};
 use super::store::{GrantStore, StoreError, StoreStatus, WriteClass};
@@ -132,6 +134,9 @@ pub struct ReachRead {
     pub marked: bool,
     /// Clause (ii) holds for the grant: with the mark, the session is View only (D11).
     pub clause_ii: bool,
+    /// The grant's mode as stored now, which clause (ii) is judged on: the session is
+    /// never served above it (B: a grant lowered since the gate is clamped there).
+    pub grant_mode: SessionMode,
 }
 
 /// B steps 1 to 4 for the session `device` asked for, whose PAKE ran against the record
@@ -179,6 +184,7 @@ pub fn read_after_reservation(
     }
     // Steps 2 and 3: the mark, whether some grant holds the level, the three clauses.
     let clauses = Clauses::of(s, grant, account, helper_task);
+    let grant_mode = grant.mode;
     let (marked, reach_through_host) = (clauses.marked, clauses.reach_through_host);
     let grant_reach = clauses.grant_reach();
     let grant_level = if clauses.holds && !marked {
@@ -201,5 +207,6 @@ pub fn read_after_reservation(
         grant_level,
         marked: marked || grant_reach == 0,
         clause_ii: reach_through_host,
+        grant_mode,
     })
 }
