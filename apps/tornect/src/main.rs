@@ -515,6 +515,10 @@ fn main() -> anyhow::Result<()> {
     };
 
     let Some(command) = cli.command else {
+        // A second launch raises the running window instead (§B.1.1).
+        if second_launch_shown(&paths) {
+            return Ok(());
+        }
         return ui::run(
             &paths,
             ui::GuiOpts {
@@ -538,22 +542,27 @@ fn main() -> anyhow::Result<()> {
             theme,
             empty,
             sheet,
-        } => ui::run(
-            &paths,
-            ui::GuiOpts {
-                source: capture.into(),
-                host: !no_host,
-                bridges: cli.bridges,
-                preview,
-                page: page.map(Into::into),
-                empty,
-                sheet: sheet.map(Into::into),
-                theme: match theme {
-                    Some(ThemeArg::Light) => egui::Theme::Light,
-                    Some(ThemeArg::Dark) | None => egui::Theme::Dark,
+        } => {
+            if !preview && !no_host && second_launch_shown(&paths) {
+                return Ok(());
+            }
+            ui::run(
+                &paths,
+                ui::GuiOpts {
+                    source: capture.into(),
+                    host: !no_host,
+                    bridges: cli.bridges,
+                    preview,
+                    page: page.map(Into::into),
+                    empty,
+                    sheet: sheet.map(Into::into),
+                    theme: match theme {
+                        Some(ThemeArg::Light) => egui::Theme::Light,
+                        Some(ThemeArg::Dark) | None => egui::Theme::Dark,
+                    },
                 },
-            },
-        ),
+            )
+        }
         Command::Id { json } => cmd_id(&paths, json),
         Command::RotateId { yes } => cmd_rotate_id(&paths, yes),
         Command::Paths => {
@@ -630,6 +639,39 @@ fn main() -> anyhow::Result<()> {
         Command::Service { action } => unattended::service(&paths, action),
         Command::Backup { action } => unattended::backup(&paths, action),
     }
+}
+
+/// How long a second window launch waits for the running Tornect to raise its
+/// window (§B.1.1); past it, the window opens as before. `ipc::request` alone
+/// waits up to its 150 s.
+const SHOW_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A second window launch (§B.1.1): when a Tornect host runs for these
+/// directories, ask it to raise its window (`IpcOp::Show`); `true` when it
+/// did, and this launch ends there. Nothing running, a refusal (a host with
+/// no window, or one without its store), an error, or no answer within
+/// [`SHOW_WAIT`] is `false`: the window opens as it always did.
+async fn shown_by_the_running_host(paths: &Paths) -> bool {
+    if host::HostLock::holder(paths).is_none() {
+        return false;
+    }
+    let req = tornect_core::unattended::ipc::IpcRequest {
+        id: 1,
+        op: tornect_core::unattended::ipc::IpcOp::Show,
+    };
+    matches!(
+        tokio::time::timeout(SHOW_WAIT, tornect_platform::ipc::request(&paths.state_dir, &req)).await,
+        Ok(Ok(resp)) if resp.ok
+    )
+}
+
+/// [`shown_by_the_running_host`], on a runtime of its own (before the
+/// window's).
+fn second_launch_shown(paths: &Paths) -> bool {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .is_ok_and(|runtime| runtime.block_on(shown_by_the_running_host(paths)))
 }
 
 /// Review finding E2-2: on Windows, Tornect's directories get no private
@@ -868,7 +910,11 @@ fn cmd_doctor(paths: &Paths) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use clap::{CommandFactory as _, Parser as _};
+    use tornect_core::unattended::ipc::{IpcRequest, IpcResponse};
 
     const ID: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwd";
 
@@ -945,5 +991,109 @@ mod tests {
         ] {
             assert!(help.contains(said), "\"{said}\" missing:\n{help}");
         }
+    }
+
+    /// The running Tornect of a test: it holds the host lock and serves the
+    /// control channel with `answer`; dropped, it stops serving.
+    struct FirstInstance {
+        _lock: super::host::HostLock,
+        serving: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for FirstInstance {
+        fn drop(&mut self) {
+            self.serving.abort();
+        }
+    }
+
+    async fn first_instance<F, Fut>(paths: &tornect_core::Paths, answer: F) -> FirstInstance
+    where
+        F: Fn(IpcRequest) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = IpcResponse> + Send + 'static,
+    {
+        paths.ensure().unwrap();
+        let lock = super::host::HostLock::acquire(paths).unwrap();
+        let endpoint = tornect_platform::ipc::Endpoint::bind(&paths.state_dir)
+            .await
+            .unwrap();
+        let serving = tokio::spawn(async move {
+            let _ = endpoint.serve(answer).await;
+        });
+        FirstInstance {
+            _lock: lock,
+            serving,
+        }
+    }
+
+    /// The first instance as a host serves it: the real dispatch over a
+    /// store in `home`, with `show` as its window's raise (`None`: no window).
+    async fn host_in(
+        home: &std::path::Path,
+        show: Option<super::unattended::ShowHook>,
+    ) -> FirstInstance {
+        let ctx = Arc::new(super::unattended::test_context(home, show));
+        first_instance(&tornect_core::Paths::from_home(home), move |req| {
+            let ctx = Arc::clone(&ctx);
+            async move { super::unattended::dispatch(&ctx, req) }
+        })
+        .await
+    }
+
+    /// §B.1.1 (row 9's test): a second launch finds the running window host,
+    /// which raises its window, and ends there: no second window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_launch_shows_the_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raised = Arc::new(AtomicUsize::new(0));
+        let hook: super::unattended::ShowHook = {
+            let raised = Arc::clone(&raised);
+            Arc::new(move || {
+                raised.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let first = host_in(tmp.path(), Some(hook)).await;
+        let paths = tornect_core::Paths::from_home(tmp.path());
+        assert!(super::shown_by_the_running_host(&paths).await);
+        assert_eq!(raised.load(Ordering::SeqCst), 1, "raised once");
+        drop(first);
+    }
+
+    /// A first instance with no window to raise (the terminal or the
+    /// headless host) refuses `Show`, and with nothing running nothing is
+    /// asked: the second launch opens its window as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_show_keeps_todays_second_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = tornect_core::Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        assert!(
+            !super::shown_by_the_running_host(&paths).await,
+            "nothing runs"
+        );
+        let first = host_in(tmp.path(), None).await;
+        assert!(!super::shown_by_the_running_host(&paths).await, "refused");
+        drop(first);
+    }
+
+    /// FC-10: a first instance that never answers holds the second launch
+    /// for 3 s, not for the 150 s `ipc::request` would wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_first_instance_does_not_hang_the_second_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = tornect_core::Paths::from_home(tmp.path());
+        let first = first_instance(&paths, |_req| async {
+            std::future::pending::<IpcResponse>().await
+        })
+        .await;
+        let (t0, real) = (tokio::time::Instant::now(), std::time::Instant::now());
+        assert!(!super::shown_by_the_running_host(&paths).await);
+        let waited = t0.elapsed();
+        assert!(
+            waited >= super::SHOW_WAIT && waited < super::SHOW_WAIT * 2,
+            "{waited:?}"
+        );
+        assert!(super::SHOW_WAIT < tornect_platform::ipc::RESPONSE_TIMEOUT);
+        assert!(real.elapsed() < std::time::Duration::from_secs(30));
+        drop(first);
     }
 }
