@@ -105,6 +105,9 @@ pub enum Command {
     /// Acknowledge the banner of devices that can connect without asking,
     /// with re-authentication (§B.8.6.2).
     AcknowledgeBanner,
+    /// Background mode: show or take down the desktop notification that
+    /// mirrors a host sheet (§B.1.1).
+    Notice(super::notice::NoticeChange),
     /// Shut down.
     Quit,
 }
@@ -733,6 +736,12 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
     let b = Arc::new(b);
     let first = first_run(&b.paths);
     b.shared.update(|m| m.history_notice = first);
+    // Background mode: the desktop notifications that mirror the host's
+    // sheets (§B.1.1).
+    let notices = b
+        .background
+        .is_some()
+        .then(|| super::notice::start(Arc::clone(&b.shared)));
     // The pairing times of known-hosts.toml past their first day (P-L4).
     crate::history::coarsen_pins(&b.paths);
     // This computer's words and the saved keys' (derived once, off this
@@ -897,6 +906,11 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                 let Some(command) = command else { break };
                 match command {
                     Command::Quit => break,
+                    Command::Notice(change) => {
+                        if let Some(notices) = &notices {
+                            let _ = notices.send(change);
+                        }
+                    }
                     Command::Connect(id) | Command::ConnectAnyway(id) => {
                         let Some(node) = node.clone() else {
                             b.shared.update(|m| m.client = ClientStage::Ended("Tor is not connected yet.".to_owned()));
@@ -1076,8 +1090,9 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
         }
     }
 
-    // Shutting down: the sessions end (`end_sessions`), every media stream
-    // gets its `Close`, then Tor goes.
+    // Shutting down: the notifications go with the window, the sessions end
+    // (`end_sessions`), every media stream gets its `Close`, then Tor goes.
+    drop(notices);
     end_sessions(viewing.take(), hosted.as_ref().map(|h| &h.serving.1.kill)).await;
     if let Some(hosted) = &hosted {
         let grace = tokio::time::Instant::now() + SHUTDOWN_GRACE;
@@ -2065,6 +2080,233 @@ mod tests {
             shared.read(|m| m.unattended_banner.is_some()),
             "back after the raise"
         );
+    }
+
+    /// How the window's user answers a pairing sheet in
+    /// [`pairing_requests`].
+    #[derive(Debug, Clone, Copy)]
+    enum Reply {
+        /// A click on the accept button.
+        Click,
+        /// The code typed from the other device's screen.
+        Type,
+        /// Deny.
+        Deny,
+    }
+
+    /// What one pairing request met: the sheet, if one came up (its device
+    /// words and the saved name its alarm named), and how the request ended
+    /// for the device.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Met {
+        sheet: Option<(tornect_core::words::Words, Option<String>)>,
+        ended: String,
+    }
+
+    /// The window host's pairing path as `host_role` wires it (the window's
+    /// sheets with device words and the look-alike alarm, §B.6.1), in a home
+    /// with one paired device, "Office PC", in background mode when
+    /// `background` is given: a run of pairing requests (a new device; a new
+    /// device declaring the paired one's name; three denials and the ban; a
+    /// paired device asking again until the rate limit; a request during a
+    /// session), and what each met.
+    async fn pairing_requests(background: Option<crate::host::IndicatorShown>) -> Vec<Met> {
+        use tornect_core::trusted::{KnownHosts, TrustedDevices};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let mut devices = TrustedDevices::default();
+        devices.pin(
+            DeviceIdentity::from_seed(&[0x41; 32]).id(),
+            "Office PC",
+            1000,
+        );
+        devices.save(&paths.trusted_devices_file()).unwrap();
+        let identity = Arc::new(HostIdentity::from_seed(&[0x11; 32]));
+        let host_pk = HostSigner::public_key(&DeviceIdentity::from_seed(&[0x12; 32]));
+        let media = Arc::new(MediaHost::new(
+            Arc::new(SystemBackend::new(Source::TestCard)),
+            Arc::new(tornect_session::NoObserver),
+            MediaLimits::default(),
+        ));
+        let mut wiring = crate::host::wire_window(
+            &paths,
+            &Config::default(),
+            Arc::clone(&identity),
+            host_pk,
+            Arc::new(AutoDeny),
+            media,
+            ControlChannel::default(),
+            background,
+        )
+        .unwrap();
+        let popups = Popups::new(Shared::new(Model::default(), Arc::new(|_| {})));
+        let (_started_tx, started) = watch::channel(0u64);
+        let live = Arc::clone(&wiring.live);
+        let words = Arc::new(super::super::recognize::Recognizer::new(
+            paths.clone(),
+            super::super::recognize::Me {
+                name: "Linux PC".to_owned(),
+                onion: identity.id(),
+                device: tornect_core::DeviceId::from_bytes(host_pk),
+            },
+        ));
+        let consent = Arc::new(
+            GuiConsent::new(
+                Arc::clone(&popups),
+                Withdraw {
+                    kill: wiring.deps.kill.clone(),
+                    started,
+                    live: Arc::new(move || live.session_live()),
+                },
+            )
+            .with_words(words),
+        );
+        wiring.deps.consent = consent.clone();
+        wiring.deps.local_allow = consent;
+        let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+
+        let request = |seed: u8, name: &'static str, reply: Option<Reply>| {
+            let (cfg, deps, popups) = (cfg.clone(), deps.clone(), Arc::clone(&popups));
+            let known = paths.state_dir.join(format!("known-{seed}.toml"));
+            let host = identity.id();
+            async move {
+                let (client_end, host_end) = tokio::io::duplex(64 * 1024);
+                let serving = tokio::spawn(async move {
+                    crate::host::serve_signaling(host_end, &cfg, &deps, |_| {}).await
+                });
+                let replying = tokio::spawn(async move {
+                    let reply = reply?;
+                    let mut sheet = None;
+                    for _ in 0..4000 {
+                        sheet = popups.shared().read(|m| m.popups.first().cloned());
+                        if sheet.is_some() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    let sheet = sheet?;
+                    let seen = popups
+                        .shared()
+                        .read(|m| m.recognition.get(&sheet.id).cloned())?;
+                    let PopupKind::Pairing { sas, .. } = &sheet.kind else {
+                        return None;
+                    };
+                    match reply {
+                        Reply::Click => {
+                            popups.answer_pairing(sheet.id, PairDecision::Accept { label: None });
+                        }
+                        Reply::Type => {
+                            popups.answer_pairing_code(sheet.id, sas, None);
+                        }
+                        Reply::Deny => {
+                            popups.answer_pairing(sheet.id, PairDecision::Reject);
+                        }
+                    }
+                    Some((seen.words, seen.looks_like))
+                });
+                let known = Arc::new(KnownHostStore::with(known, KnownHosts::default()));
+                let mut cdeps = ClientDeps::headless(known);
+                cdeps.ui = Arc::new(ScriptedClientUi::new(true));
+                let device = DeviceIdentity::from_seed(&[seed; 32]);
+                let ccfg = ClientConfig::new(host, name);
+                let ended =
+                    match connect(client_end, &ccfg, &device, &cdeps, Intent::PairOnly).await {
+                        Ok(ClientOutcome::Paired { .. }) => "paired".to_owned(),
+                        Ok(ClientOutcome::Session(_)) => "a session".to_owned(),
+                        Err(HandshakeError::PairRejected { reason, .. }) => {
+                            pair_reject::name(reason).to_owned()
+                        }
+                        Err(e) => e.to_string(),
+                    };
+                let _ = serving.await;
+                Met {
+                    sheet: replying.await.unwrap(),
+                    ended,
+                }
+            }
+        };
+
+        let mut met = Vec::new();
+        // A new device: its words, no alarm; the click pairs.
+        met.push(request(0x51, "Kitchen", Some(Reply::Click)).await);
+        // A new device declaring the paired one's name: the alarm; the click
+        // refuses, the code typed from its screen pairs.
+        met.push(request(0x52, "Office PC", Some(Reply::Click)).await);
+        met.push(request(0x52, "Office PC", Some(Reply::Type)).await);
+        // Three denials of a new device, then its ban.
+        for _ in 0..3 {
+            met.push(request(0x53, "Garage", Some(Reply::Deny)).await);
+        }
+        met.push(request(0x53, "Garage", None).await);
+        // The paired device asking again: its denials do not ban it, and the
+        // rate limit stops its fourth request.
+        for _ in 0..2 {
+            met.push(request(0x51, "Kitchen", Some(Reply::Deny)).await);
+        }
+        met.push(request(0x51, "Kitchen", None).await);
+        // During a session: BUSY, and no sheet.
+        let token = tornect_signal::consent::SessionToken::new([5; 32]);
+        let session = LiveSession {
+            device: DeviceIdentity::from_seed(&[0x60; 32]).id(),
+            label: "Laptop",
+            session_id: "s1",
+            token: &token,
+            th_final: [0; 32],
+            mode: SessionMode::ViewOnly,
+            elevation: Elevation::None,
+            unattended: false,
+        };
+        wiring.live.on_start(&session);
+        met.push(request(0x54, "Hall", None).await);
+        wiring.live.on_end("s1", None);
+        met
+    }
+
+    /// Decision M1-68 (§B.1.1 as the operator ruled it): in background mode a
+    /// new device pairs exactly as with the window open. The same pairing
+    /// requests to the window host's pairing path, by hand and in background
+    /// mode, meet the same: the limiter, the ban after three denials, BUSY
+    /// during a session, the device words, the alarm and the pairing by the
+    /// typed code. No setting and no condition is added.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_mode_changes_nothing_in_the_pairing_path() {
+        let by_hand = pairing_requests(None).await;
+        let background = pairing_requests(Some(crate::host::IndicatorShown::default())).await;
+        assert_eq!(background, by_hand);
+        let ended: Vec<&str> = by_hand.iter().map(|m| m.ended.as_str()).collect();
+        assert_eq!(
+            ended,
+            [
+                "paired",
+                "DENIED",
+                "paired",
+                "DENIED",
+                "DENIED",
+                "DENIED",
+                "BANNED",
+                "DENIED",
+                "DENIED",
+                "RATE_LIMITED",
+                "BUSY"
+            ]
+        );
+        let sheets: Vec<bool> = by_hand.iter().map(|m| m.sheet.is_some()).collect();
+        assert_eq!(
+            sheets,
+            [
+                true, true, true, true, true, true, false, true, true, false, false
+            ]
+        );
+        assert_eq!(by_hand[0].sheet.as_ref().unwrap().1, None, "no alarm");
+        for alarmed in &by_hand[1..3] {
+            assert_eq!(
+                alarmed.sheet.as_ref().unwrap().1.as_deref(),
+                Some("Office PC"),
+                "the alarm"
+            );
+        }
     }
 
     /// A pairing through the window's code question, against a host whose

@@ -27,6 +27,7 @@ mod indicator;
 mod keys;
 pub(crate) mod model;
 mod nav;
+mod notice;
 mod pages;
 pub(crate) mod preview;
 pub(crate) mod recognize;
