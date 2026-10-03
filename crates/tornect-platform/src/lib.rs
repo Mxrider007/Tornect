@@ -1,6 +1,6 @@
 //! OS session services for Tornect (`docs/PLAN.md` §B.8.8).
 //!
-//! Ten modules so far:
+//! Eleven modules so far:
 //!
 //! - [`ipc`] — the owner-only local endpoint of §B.8.7.4 (Unix socket / Windows
 //!   named pipe) that the CLI talks to and the host serves.
@@ -10,6 +10,8 @@
 //! - [`autostart`] — start at login (§B.8.7.5): a systemd user unit on Linux, a
 //!   Task Scheduler at-logon task on Windows, and the readiness row that
 //!   reports it.
+//! - [`install`] — `tornect install` and `uninstall` (§B.1.1): the per-user
+//!   install on Linux (the executable in `~/.local/bin`, a menu entry).
 //! - [`levels`] — the availability probe of the session levels (§B.2.1): the
 //!   row of the table this computer is in (Windows: the location, the UAC
 //!   values and the token; Linux: one row).
@@ -51,6 +53,7 @@ pub mod autostart;
 pub mod helper;
 pub mod helper_task;
 pub mod hotkey;
+pub mod install;
 pub mod ipc;
 pub mod levels;
 #[cfg(target_os = "linux")]
