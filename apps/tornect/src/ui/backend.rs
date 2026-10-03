@@ -501,6 +501,13 @@ impl MediaObserver for GuiMedia {
     }
 }
 
+/// The window host's raise for `IpcOp::Show` (§B.1.1): a wake of the window's
+/// event loop (`Wake::Show`). It holds the model's waker only, so it cannot
+/// answer, dismiss or re-order a sheet.
+fn show_hook(shared: Arc<Shared>) -> crate::unattended::ShowHook {
+    Arc::new(move || shared.wake(Wake::Show))
+}
+
 /// Wire the host role: the FSM with the window's consent, the media host, and
 /// the control channel (bound before Tor, as `tornect host` does).
 async fn host_role(b: &Backend) -> Result<Hosted, String> {
@@ -595,6 +602,12 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
             }
         });
     }
+    // A second launch raises this window through the control channel
+    // (`IpcOp::Show`, §B.1.1).
+    let ctx = ctx.map(|mut c| {
+        c.show = Some(show_hook(Arc::clone(&b.shared)));
+        c
+    });
     let ipc = crate::host::start_control_channel(&b.paths, ctx, deps.kill.clone(), control)
         .await
         .map_err(|e| format!("{e:#}"))?;
@@ -1879,6 +1892,76 @@ mod tests {
     use super::super::indicator::{Change, Indicator};
     use super::super::model::{Model, PopupKind};
     use super::*;
+
+    /// §B.1.1, §B.2.1: `IpcOp::Show` reaches the window host as one wake of
+    /// its event loop (`Wake::Show`, which raises the window and re-arms the
+    /// cards) and nothing else: the open sheets stay as they were, in their
+    /// order, none answered or dismissed, and it is no mutation (no dialog,
+    /// no log line).
+    #[test]
+    fn show_never_answers_dismisses_or_reorders() {
+        use super::super::model::Popup;
+        use tornect_core::unattended::ipc::{IpcOp, IpcRequest};
+
+        let woken = Arc::new(Mutex::new(Vec::new()));
+        let into = Arc::clone(&woken);
+        let shared = Shared::new(
+            Model::default(),
+            Arc::new(move |why| into.lock().unwrap().push(why)),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let sheets = vec![
+            Popup {
+                id: 3,
+                kind: PopupKind::Pairing {
+                    name: "Phone".to_owned(),
+                    fingerprint: "a1b2c3".to_owned(),
+                    sas: "123 456".to_owned(),
+                    pinned: None,
+                },
+                deadline,
+            },
+            Popup {
+                id: 4,
+                kind: PopupKind::Session {
+                    label: "Laptop".to_owned(),
+                    fingerprint: "d4e5f6".to_owned(),
+                },
+                deadline,
+            },
+        ];
+        shared.update(|m| m.popups = sheets.clone());
+        woken.lock().unwrap().clear();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::unattended::test_context(tmp.path(), Some(show_hook(Arc::clone(&shared))));
+        let lines = ctx.log.read_all().unwrap().len();
+        let resp = crate::unattended::dispatch(
+            &ctx,
+            IpcRequest {
+                id: 7,
+                op: IpcOp::Show,
+            },
+        );
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(
+            *woken.lock().unwrap(),
+            vec![Wake::Show],
+            "one wake, nothing else"
+        );
+        let after = shared.read(|m| m.popups.clone());
+        assert_eq!(
+            after
+                .iter()
+                .map(|p| (p.id, p.kind.clone(), p.deadline))
+                .collect::<Vec<_>>(),
+            sheets
+                .iter()
+                .map(|p| (p.id, p.kind.clone(), p.deadline))
+                .collect::<Vec<_>>(),
+            "the sheets as they were"
+        );
+        assert_eq!(ctx.log.read_all().unwrap().len(), lines, "nothing logged");
+    }
 
     /// §B.8.6.2 (the banner returns "after any grant creation, widening or backup
     /// export"): acknowledged, the banner goes; a raise to the administrator level
