@@ -1668,8 +1668,9 @@ fn label_of(
 /// One registration with a generated password (§B.8.7.4, decision M1-67):
 /// `RegStart` declares `generated` and `raise`, the host asks for its
 /// re-authentication (with the raising wording for a raise), and `RegFinish`
-/// carries `generated` with `options`. The password, as the generator spells
-/// it, for the caller to print once.
+/// carries `generated` with `options`. The password as it is registered, for
+/// the caller to print once: normalized (§B.8.7.2), so a list word's hyphen
+/// prints as the space every login reads it as.
 async fn generated_registration(
     paths: &Paths,
     route: &Route,
@@ -1678,11 +1679,12 @@ async fn generated_registration(
     options: GrantOptions,
     raise: bool,
 ) -> anyhow::Result<zeroize::Zeroizing<String>> {
-    let shown = tornect_core::unattended::password::generate_passphrase()
+    let drawn = tornect_core::unattended::password::generate_passphrase()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    // What is registered is what a login normalises the typed words to
-    // (§B.8.7.2): the list's hyphens read as spaces on both sides.
-    let password = tornect_core::unattended::password::normalize(&shown);
+    // What is registered, and printed, is what a login normalises the typed words
+    // to (§B.8.7.2): the list's hyphens read as spaces on both sides.
+    let password = tornect_core::unattended::password::normalize(&drawn);
+    drop(drawn);
     let (client, reg_request) = tornect_signal::auth::PasswordRegistration::start(&password)
         .map_err(|e| anyhow::anyhow!("starting the registration: {e}"))?;
     let resp = send(
@@ -1713,7 +1715,6 @@ async fn generated_registration(
     let upload = client
         .finish(&password, &started.reg_response, ids)
         .map_err(|e| anyhow::anyhow!("finishing the registration: {e}"))?;
-    drop(password);
     let resp = send(
         paths,
         route,
@@ -1728,7 +1729,7 @@ async fn generated_registration(
     )
     .await?;
     require_ok(&resp)?;
-    Ok(shown)
+    Ok(password)
 }
 
 /// The command line's administrator forms (§B.8.7.4, decision M1-67):
@@ -3639,7 +3640,12 @@ mod tests {
         for pair in io.out.chunks(2) {
             assert!(pair[0].starts_with("New password for \""));
             let words = pair[0].rsplit(": ").next().unwrap();
-            assert_eq!(words.split(' ').count(), 5, "{words}");
+            // five list words, printed as registered: a hyphenated one as two
+            assert!((5..=10).contains(&words.split(' ').count()), "{words}");
+            assert_eq!(
+                tornect_core::unattended::password::normalize(words).as_str(),
+                words
+            );
             assert_eq!(pair[1], WRITE_IT_DOWN);
         }
         for other in [&a, &b] {
@@ -3687,6 +3693,71 @@ mod tests {
             "only the raised grant's password: {:?}",
             io.out
         );
+    }
+
+    /// Whether `password` logs in to `device`'s grant, the PAKE run as a host and a
+    /// client run it (§B.8.4.4) against the record the grant holds now.
+    fn logs_in(paths: &Paths, route: &Route, device: &DeviceId, password: &str) -> bool {
+        use tornect_core::unattended::grant::AuthRecord;
+        use tornect_signal::auth;
+        let store = guard_of(route).store();
+        let setup = auth::parse_server_setup(&store.server_setup().unwrap()).unwrap();
+        let AuthRecord::Opaque { record } = store.grant(device).unwrap().auth else {
+            return false;
+        };
+        let record = auth::parse_record(&record).unwrap();
+        let host_pk = host_onion_pk(paths).unwrap();
+        let ids = || auth::identifiers(device.public_key_bytes(), &host_pk);
+        let ctx = auth::context(&[0x11; 32], auth::SUITE_OPAQUE, 0);
+        let (login, ke1) = auth::ClientLogin::start(password).unwrap();
+        let (host, ke2) = auth::HostLogin::start(
+            &setup,
+            &record,
+            &ke1,
+            device.public_key_bytes(),
+            &ctx,
+            ids(),
+        )
+        .unwrap();
+        match login.finish(password, &ke2, &ctx, ids()) {
+            Ok(out) => host.finish(&out.ke3, &ctx, ids()).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// §B.8.7.2, §B.8.7.4: a generated password is printed as it is registered
+    /// (normalized: a list word's hyphen prints as a space), and the printed text logs
+    /// in; another password does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_generated_password_is_printed_as_registered_and_logs_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let (paths, route) = admin_route(&tmp, windows_admin(), reauth);
+        let target = device(47);
+        let mut io = Script::new(true, &[]);
+        administrator_form(
+            &paths,
+            &route,
+            target,
+            Some((Preset::HeadlessBox, false)),
+            &mut io,
+        )
+        .await
+        .unwrap();
+        assert_eq!(io.out.len(), 2, "{:?}", io.out);
+        let printed = io.out[0].rsplit(": ").next().unwrap();
+        assert_eq!(
+            tornect_core::unattended::password::normalize(printed).as_str(),
+            printed
+        );
+        assert!(!printed.contains('-'), "{printed}");
+        assert!(logs_in(&paths, &route, &target, printed), "{printed}");
+        assert!(!logs_in(
+            &paths,
+            &route,
+            &target,
+            "quiet verdant otter lantern zephyr"
+        ));
     }
 
     /// §B.8.7.1 ⑤a: a *Change password* whose prompt is cancelled keeps that

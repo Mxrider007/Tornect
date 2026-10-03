@@ -6863,6 +6863,29 @@ async fn a_live_session_suppresses_the_block_window_and_the_ask() {
     }
 }
 
+/// §B.8.7.2: a password is registered normalized (one space between words, a list word's
+/// hyphen read as a space), and the client normalizes the typed one the same way before
+/// the PAKE: a generated phrase typed with its list word's hyphen, or with a run of
+/// spaces and a tab, logs in.
+#[tokio::test]
+async fn a_typed_password_is_normalized_before_the_pake() {
+    const REGISTERED: &str = "quiet t shirt otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, client) = unattended_pair(tmp.path(), REGISTERED);
+    for typed in [
+        "quiet t-shirt otter lantern zephyr",
+        "quiet  t-shirt otter\tlantern zephyr",
+    ] {
+        let (mode, _, _) = signed(
+            &host,
+            &client,
+            unattended_intent(typed, messages::mode::CONTROL, false),
+        )
+        .await;
+        assert_eq!(mode, messages::mode::CONTROL, "{typed}");
+    }
+}
+
 /// A pin that records how often it was asked to record.
 #[derive(Default)]
 struct RecordingPin {
