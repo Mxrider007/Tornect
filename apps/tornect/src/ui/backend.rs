@@ -252,8 +252,9 @@ const BANNER_EVERY: Duration = Duration::from_secs(30);
 
 /// The banner of §B.8.6.2 for the window host: read from its guard's store
 /// (how many devices can connect without asking) and log (the last grant
-/// created, changed or enabled, unattended access turned on or resumed, or
-/// backup exported, and who did it), until that change is acknowledged with
+/// created, changed, enabled or given a new password, which is how a raise to
+/// the administrator level is logged, unattended access turned on or resumed,
+/// or backup exported, and who did it), until that change is acknowledged with
 /// re-authentication, which is kept in memory only.
 struct BannerWatch {
     guard: Arc<tornect_core::unattended::guard::MutationGuard>,
@@ -289,6 +290,7 @@ impl BannerWatch {
                         SessionEvent::GrantCreated
                             | SessionEvent::GrantChanged
                             | SessionEvent::GrantEnabled
+                            | SessionEvent::PasswordSet
                             | SessionEvent::UnattendedEnabled
                             | SessionEvent::UnattendedResumed
                             | SessionEvent::BackupExported
@@ -1892,6 +1894,104 @@ mod tests {
     use super::super::indicator::{Change, Indicator};
     use super::super::model::{Model, PopupKind};
     use super::*;
+
+    /// §B.8.6.2 (the banner returns "after any grant creation, widening or backup
+    /// export"): acknowledged, the banner goes; a raise to the administrator level
+    /// through a password change, which the guard logs as `PasswordSet`, brings it
+    /// back.
+    #[test]
+    fn the_banner_returns_after_a_raise_through_a_password_change() {
+        use tornect_core::keystore::FileSecretStore;
+        use tornect_core::session_log::{Actor, SessionLog};
+        use tornect_core::unattended::clock::FakeClock;
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{
+            AllowAllPaired, AllowAllReAuth, MutationGuard, NoSessionActivity,
+            RandomServerSetupSource,
+        };
+        use tornect_core::unattended::ipc::GrantOptions;
+        use tornect_core::unattended::store::GrantStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let secrets = Arc::new(FileSecretStore::open(paths.keys_dir()).unwrap());
+        // the log's times have a resolution of one second: the raise is logged later
+        let clock = Arc::new(FakeClock::at(1_787_961_600));
+        let store = GrantStore::open(
+            &paths,
+            secrets,
+            clock.clone(),
+            SessionLog::new(paths.sessions_log()),
+        )
+        .unwrap();
+        // an installed copy on a Windows administrator account: the level exists there
+        let facts =
+            tornect_core::levels::AccountFacts::Windows(tornect_core::levels::WindowsFacts {
+                installed: true,
+                administrator: true,
+                ..tornect_core::levels::WindowsFacts::default()
+            });
+        let guard = Arc::new(
+            MutationGuard::new(
+                store,
+                Arc::new(AllowAllReAuth::default()),
+                Arc::new(NoSessionActivity),
+                Arc::new(tornect_core::levels::FixedFacts::new(
+                    facts,
+                    tornect_core::levels::HelperPresence::Absent,
+                )),
+            )
+            .with_paired_devices(Arc::new(AllowAllPaired))
+            .with_server_setup_source(Arc::new(RandomServerSetupSource)),
+        );
+        let device = tornect_core::DeviceId::from_bytes([3; 32]);
+        guard.master_on(Actor::Cli, &[9; 32]).unwrap();
+        guard
+            .create_grant(
+                Actor::Cli,
+                &device,
+                Preset::HeadlessBox,
+                &GrantOptions::default(),
+                &[0u8; 192],
+                false,
+            )
+            .unwrap();
+        let watch = BannerWatch {
+            guard: Arc::clone(&guard),
+            acknowledged: Mutex::new(None),
+        };
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.refresh(&shared);
+        assert!(
+            shared.read(|m| m.unattended_banner.is_some()),
+            "a grant created"
+        );
+        watch.acknowledge(&shared);
+        assert!(
+            shared.read(|m| m.unattended_banner.is_none()),
+            "acknowledged"
+        );
+        // a raise: a new generated password with the level, in one write
+        clock.advance(Duration::from_secs(5));
+        guard
+            .set_password(
+                Actor::Cli,
+                &device,
+                &[1u8; 192],
+                &GrantOptions {
+                    elevation: Some(Elevation::Admin),
+                    ..GrantOptions::default()
+                },
+                true,
+            )
+            .unwrap();
+        assert!(guard.store().grant(&device).unwrap().holds_level());
+        watch.refresh(&shared);
+        assert!(
+            shared.read(|m| m.unattended_banner.is_some()),
+            "back after the raise"
+        );
+    }
 
     /// A pairing through the window's code question, against a host whose
     /// user accepts it. `answer` is how the window's user answers the code
