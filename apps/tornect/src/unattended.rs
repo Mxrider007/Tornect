@@ -37,6 +37,11 @@ use tornect_platform::autostart::{self, Autostart, AutostartState, LaunchSpec};
 use tornect_platform::ipc::{Endpoint, Reply};
 use tornect_signal::fsm::host::KillSwitch;
 
+/// What `IpcOp::Show` calls on a host with a window (§B.1.1): a wake of the
+/// window's event loop, which raises the window and arms its cards again. It
+/// reaches no sheet.
+pub type ShowHook = Arc<dyn Fn() + Send + Sync>;
+
 /// Everything the dispatch needs, whichever route reached it.
 pub struct HostContext {
     /// The single enforcement point of §B.8.6.2.
@@ -60,6 +65,10 @@ pub struct HostContext {
     /// source the guard reads them from (decision M1-67): what `SetLevelNone`'s
     /// answer says still keeps control at the administrator level.
     pub facts: Arc<dyn FactsSource>,
+    /// The window host's raise (`IpcOp::Show`, §B.1.1), set by the window
+    /// before its control channel starts; `None` on a host without a window,
+    /// which refuses `Show`.
+    pub show: Option<ShowHook>,
 }
 
 impl HostContext {
@@ -462,8 +471,16 @@ pub fn dispatch(ctx: &HostContext, req: IpcRequest) -> IpcResponse {
             unit!(guard.reg_finish(by, &device, &reg_txn, &upload, preset, &options, generated))
         }
 
-        // §B.1.1: raising needs a window, and this host shows none.
-        IpcOp::Show => IpcResponse::fail(id, codes::G_UNSUPPORTED, NO_WINDOW_TO_SHOW),
+        // §B.1.1: only a host with a window raises it; the hook wakes the
+        // window and reaches no sheet. No mutation: no guard, no dialog, no
+        // log line.
+        IpcOp::Show => match &ctx.show {
+            Some(show) => {
+                show();
+                IpcResponse::ok(id)
+            }
+            None => IpcResponse::fail(id, codes::G_UNSUPPORTED, NO_WINDOW_TO_SHOW),
+        },
         IpcOp::SetLevelNone { device } => set_level_none(ctx, id, by, &device),
 
         IpcOp::Unknown(tag) => {
@@ -542,6 +559,45 @@ fn keeps_at_the_level(ctx: &HostContext, device: &DeviceId) -> u8 {
 /// The detail of `SetLevelNone`'s answer for a grant without the
 /// administrator level.
 const LEVEL_ALREADY_NONE: &str = "no administrator access; unchanged";
+
+/// A host context over a fresh store in `home`, for the tests of the window's
+/// raise and the second launch: Linux facts, re-authentication allowed, no
+/// session, no start at login; `show` is the window's raise, if any.
+#[cfg(test)]
+pub(crate) fn test_context(home: &std::path::Path, show: Option<ShowHook>) -> HostContext {
+    use tornect_core::keystore::FileSecretStore;
+    use tornect_core::unattended::clock::SystemClock;
+    use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+    let paths = Paths::from_home(home);
+    paths.ensure().expect("the test's directories");
+    let secrets = Arc::new(FileSecretStore::open(paths.keys_dir()).expect("a keystore"));
+    let log = SessionLog::new(paths.sessions_log());
+    let store = GrantStore::open(
+        &paths,
+        secrets as Arc<dyn tornect_core::SecretStore>,
+        Arc::new(SystemClock::default()),
+        log.clone(),
+    )
+    .expect("a store");
+    let facts: Arc<dyn FactsSource> = Arc::new(tornect_core::levels::FixedFacts::linux());
+    let guard = MutationGuard::new(
+        store,
+        Arc::new(AllowAllReAuth::default()),
+        Arc::new(NoSessionActivity),
+        Arc::clone(&facts),
+    );
+    HostContext {
+        guard: Arc::new(guard),
+        host_onion_pk: [0x42; 32],
+        readiness: SharedReadiness::default(),
+        autostart: Arc::new(autostart::NoAutostart("test".to_owned())),
+        user_inputs: Vec::new(),
+        kill: None,
+        log,
+        facts,
+        show,
+    }
+}
 
 /// [`dispatch`], plus what to undo if the answer never reaches the CLI.
 ///
@@ -965,6 +1021,7 @@ fn context(
         kill,
         log,
         facts,
+        show: None,
     })
 }
 
@@ -2527,6 +2584,7 @@ mod tests {
                 kill: None,
                 log,
                 facts: Arc::new(tornect_core::levels::FixedFacts::linux()),
+                show: None,
             },
             autostart,
         }
@@ -2998,6 +3056,7 @@ mod tests {
             kill: None,
             log: allow.ctx.log.clone(),
             facts: Arc::new(tornect_core::levels::FixedFacts::linux()),
+            show: None,
         };
         let resp = go(&ctx, IpcOp::Off);
         assert!(
@@ -3038,6 +3097,30 @@ mod tests {
             before,
             "nothing logged"
         );
+    }
+
+    /// M1-46 (kept): a host that started without its store answers `tornect
+    /// panic` only; `Show` is refused with that reason, and nothing ends.
+    #[test]
+    fn the_storeless_host_refuses_show() {
+        let kill = KillSwitch::new();
+        let resp = dispatch_without_store(
+            &kill,
+            "the store is locked",
+            IpcRequest {
+                id: 5,
+                op: IpcOp::Show,
+            },
+        );
+        assert!(!resp.ok);
+        assert_eq!(resp.code, codes::G_PRECONDITION);
+        assert!(
+            resp.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("answers only `tornect panic`")),
+            "{resp:?}"
+        );
+        assert_eq!(kill.fired(), None);
     }
 
     /// The operations §B.8.14 schedules for later report that plainly instead of
@@ -3691,6 +3774,7 @@ mod tests {
                 facts,
                 tornect_core::levels::HelperPresence::Absent,
             )),
+            show: None,
         };
         assert!(go(&ctx, IpcOp::On).ok);
         (paths, Route::Offline(Box::new(ctx)))
@@ -4198,6 +4282,7 @@ mod tests {
             kill: None,
             log,
             facts: Arc::clone(&facts) as Arc<dyn FactsSource>,
+            show: None,
         };
         assert!(go(&ctx, IpcOp::On).ok);
         LevelEnv {
@@ -4263,6 +4348,7 @@ mod tests {
                 kill: None,
                 log: self.ctx.log.clone(),
                 facts: Arc::clone(&self.facts) as Arc<dyn FactsSource>,
+                show: None,
             }
         }
 

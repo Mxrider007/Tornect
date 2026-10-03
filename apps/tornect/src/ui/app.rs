@@ -89,6 +89,16 @@ fn ask_attention(window: &impl Attention) -> bool {
     restore
 }
 
+/// `IpcOp::Show` (a second launch, §B.1.1): the attention a question asks for
+/// (a window known to be minimized is brought back, then the attention
+/// request, never the keyboard focus), then `rearm`, whether or not the window
+/// was brought back: a window raise re-arms every card (§B.2.1). It reaches no
+/// card otherwise, so it answers, dismisses and re-orders nothing.
+fn show_window(window: &impl Attention, rearm: impl FnOnce()) {
+    ask_attention(window);
+    rearm();
+}
+
 /// A window event after which the main window is back in view (focused, or
 /// no longer hidden): its cards arm again (review N-1).
 fn comes_back(event: &WindowEvent) -> bool {
@@ -959,6 +969,13 @@ impl ApplicationHandler<UserEvent> for App {
                     view.surface.window.request_redraw();
                 }
             }
+            Wake::Show => {
+                if let Some(main) = &self.main {
+                    let form = &mut self.form;
+                    show_window(&*main.window, || form.window_came_back());
+                    main.window.request_redraw();
+                }
+            }
             Wake::Quit => {
                 tracing::info!("asked to quit by a signal: ending every session");
                 self.quit(el);
@@ -1191,6 +1208,47 @@ mod tests {
             };
             // Review N-1: only a window brought back re-arms its cards.
             assert_eq!(ask_attention(&window), minimized == Some(true));
+            assert_eq!(
+                window.calls.into_inner(),
+                expected,
+                "minimized: {minimized:?}"
+            );
+        }
+    }
+
+    /// §B.1.1, §B.2.1: `Show` arms every open card again whatever the
+    /// window's state, where a question's attention re-arms only a window it
+    /// brought back. Shown failing first (with the question's rule, only the
+    /// minimized window re-armed).
+    #[test]
+    fn show_rearms_every_open_sheet() {
+        for minimized in [Some(true), Some(false), None] {
+            let window = Recorder {
+                minimized,
+                calls: RefCell::default(),
+            };
+            let mut rearmed = 0;
+            show_window(&window, || rearmed += 1);
+            assert_eq!(rearmed, 1, "minimized: {minimized:?}");
+        }
+    }
+
+    /// SLICE-E E1-1 for `Show`: a window known to be minimized is brought
+    /// back, then the attention request; never the keyboard focus (the seam
+    /// has no focus call), and nothing else.
+    #[test]
+    fn show_unminimises_and_asks_attention_without_focus() {
+        let attention = Call::Attention(Some(UserAttentionType::Critical));
+        for (minimized, expected) in [
+            (Some(true), vec![Call::SetMinimized(false), attention]),
+            (Some(false), vec![attention]),
+            (None, vec![attention]),
+        ] {
+            let window = Recorder {
+                minimized,
+                calls: RefCell::default(),
+            };
+            show_window(&window, || {});
             assert_eq!(
                 window.calls.into_inner(),
                 expected,

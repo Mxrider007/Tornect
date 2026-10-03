@@ -25,6 +25,9 @@ pub enum Wake {
     Frame,
     /// A popup opened or a session started: raise the main window.
     Attention,
+    /// `IpcOp::Show` (a second launch, §B.1.1): raise the main window and arm
+    /// every open card again; answer, dismiss and re-order nothing.
+    Show,
     /// The process was asked to end (SIGINT or SIGTERM; Ctrl-C or Ctrl-Break
     /// on Windows): close as the window's close button does, ending every
     /// session with a goodbye.
