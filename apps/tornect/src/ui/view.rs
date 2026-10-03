@@ -2257,6 +2257,78 @@ mod tests {
         );
     }
 
+    /// The main window as the event loop's helpers see it, minimised as
+    /// given; what they ask of it is pinned in the app's own tests.
+    struct MainWindow(Option<bool>);
+
+    impl super::super::app::Attention for MainWindow {
+        fn is_minimized(&self) -> Option<bool> {
+            self.0
+        }
+
+        fn set_minimized(&self, _minimized: bool) {}
+
+        fn request_user_attention(&self, _kind: Option<winit::window::UserAttentionType>) {}
+    }
+
+    /// A window with one card armed long ago; `event` reaches the event
+    /// loop's helper 20 s later: whether the card's accept answers a click
+    /// 300 ms after that.
+    fn answers_right_after(event: impl FnOnce(&mut Form)) -> bool {
+        let t0 = Instant::now();
+        let mut window = Harness::new(with_popups(vec![session_popup(7, t0)]), t0);
+        window.pass(t0 + Duration::from_millis(1500), Vec::new());
+        assert!(!window.disabled("Allow control"), "armed after a second");
+        let allow = window.button("Allow control");
+        let back = t0 + Duration::from_secs(20);
+        event(&mut window.form);
+        window.pass(back, Vec::new());
+        !window
+            .click(back + Duration::from_millis(300), allow)
+            .is_empty()
+    }
+
+    /// §B.2.1 (Arming, MUST): `Show` (a second launch) arms every open card
+    /// again, whatever the window's state, through the helper the event loop
+    /// calls for it: a card armed before answers nothing 300 ms after.
+    #[test]
+    fn show_arms_the_open_cards_again() {
+        for minimized in [Some(true), Some(false), None] {
+            assert!(
+                !answers_right_after(|form| super::super::app::on_show(
+                    &MainWindow(minimized),
+                    form
+                )),
+                "minimized {minimized:?}: a card answered 300 ms after Show"
+            );
+        }
+    }
+
+    /// §B.1.1, §B.2.1: in background mode, a sharing indicator that does not
+    /// open brings the minimised window back, through the helper the event
+    /// loop calls, and its cards arm again; a window it did not bring back
+    /// (not minimised, Wayland's unknown, or started by hand) keeps its
+    /// cards as they were.
+    #[test]
+    fn a_failed_indicator_that_brings_the_window_back_arms_its_cards_again() {
+        for (minimized, background, rearmed) in [
+            (Some(true), true, true),
+            (Some(false), true, false),
+            (None, true, false),
+            (Some(true), false, false),
+        ] {
+            assert_eq!(
+                answers_right_after(|form| super::super::app::on_indicator_failed(
+                    &MainWindow(minimized),
+                    background,
+                    form
+                )),
+                !rearmed,
+                "minimized {minimized:?}, background {background}"
+            );
+        }
+    }
+
     /// Decision M1-50 ("pointer-only Allow"): even after the owner has
     /// clicked in the window, Tab never reaches an accept and Space or Enter
     /// never answers one; Deny stays on the keyboard.
