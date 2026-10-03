@@ -294,6 +294,9 @@ pub struct App {
     /// indicator's window, opened once right after the main window and closed
     /// at its first frame, and when it opened.
     probe: Option<(Surface, Instant)>,
+    /// Background mode (§B.1.1): which host sheets have their desktop
+    /// notification.
+    notices: super::notice::Notices,
     /// The block windows of the requests in their block window, one per
     /// monitor each (§B.8.6.3).
     blocks: Vec<BlockSurface>,
@@ -345,6 +348,7 @@ impl App {
             shown: Indicator::default(),
             indicator_rounded: false,
             probe: None,
+            notices: super::notice::Notices::default(),
             blocks: Vec::new(),
             blocks_opened: Vec::new(),
             blocks_asserted: None,
@@ -541,6 +545,21 @@ impl App {
         );
         tracing::warn!("{line}");
         self.shared.update(|m| m.note(line));
+    }
+
+    /// Background mode (§B.1.1): each host sheet is mirrored by one desktop
+    /// notification, shown when the sheet opens and taken down when it
+    /// closes (the sheet itself raises the window through
+    /// `Wake::Attention`). A window started by hand shows none: it is up,
+    /// with its sheet.
+    fn sync_notices(&mut self) {
+        if self.background.is_none() {
+            return;
+        }
+        let popups = self.shared.read(|m| m.popups.clone());
+        for change in self.notices.sync(&popups) {
+            self.command(Command::Notice(change));
+        }
     }
 
     /// Open the indicator window at the first shared session, redraw it on a
@@ -1077,6 +1096,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.sync_stream(el);
                 self.sync_indicator(el);
                 self.sync_blocks(el);
+                self.sync_notices();
                 for open in &self.blocks {
                     open.surface.window.request_redraw();
                 }
@@ -1454,6 +1474,237 @@ mod tests {
             assert!(!indicator_failed(&by_hand, false));
             assert!(by_hand.calls.into_inner().is_empty());
         }
+    }
+
+    /// A bus that records the notifications it is asked to show and take
+    /// down (Linux).
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct FakeBus {
+        shown: std::sync::Mutex<Vec<tornect_platform::notify::Notice>>,
+        closed: std::sync::Mutex<Vec<u32>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl tornect_platform::notify::NotificationBus for FakeBus {
+        fn actions(
+            &self,
+        ) -> tornect_platform::polkit::BoxFuture<
+            '_,
+            Result<mpsc::Receiver<(u32, String)>, tornect_platform::notify::NotifyError>,
+        > {
+            let (_tx, rx) = mpsc::channel(1);
+            Box::pin(async move { Ok(rx) })
+        }
+
+        fn notify<'a>(
+            &'a self,
+            notice: &'a tornect_platform::notify::Notice,
+        ) -> tornect_platform::polkit::BoxFuture<
+            'a,
+            Result<u32, tornect_platform::notify::NotifyError>,
+        > {
+            let mut shown = self.shown.lock().unwrap();
+            shown.push(notice.clone());
+            let id = u32::try_from(shown.len()).unwrap();
+            Box::pin(async move { Ok(id) })
+        }
+
+        fn close(&self, id: u32) -> tornect_platform::polkit::BoxFuture<'_, ()> {
+            self.closed.lock().unwrap().push(id);
+            Box::pin(async {})
+        }
+    }
+
+    /// The first host sheet on screen, once there is one.
+    async fn open_sheet(popups: &Popups) -> super::super::model::Popup {
+        loop {
+            if let Some(p) = popups.shared().read(|m| m.popups.first().cloned()) {
+                return p;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// §B.1.1 (MUST): in background mode a new sheet raises the window (the
+    /// attention a question asks for, `Wake::Attention`) and mirrors one
+    /// desktop notification, with a fixed text, which goes when the sheet
+    /// goes, however it ends; a pairing sheet says so, any other host sheet
+    /// says that a device asks to connect. A window started by hand shows
+    /// none (its sheet is up).
+    #[tokio::test]
+    async fn a_sheet_in_background_raises_and_notifies() {
+        use tornect_signal::consent::LocalAllow as _;
+        use tornect_signal::fsm::host::KillSwitch;
+        use tornect_signal::pairing::{Consent as _, PairDecision, PairingPeer};
+
+        use super::super::consent::{GuiConsent, Withdraw};
+        use super::super::notice::{Asks, NoticeChange};
+
+        let woken = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let into = Arc::clone(&woken);
+        let shared = Shared::new(
+            Model::default(),
+            Arc::new(move |why| into.lock().unwrap().push(why)),
+        );
+        let popups = Popups::new(Arc::clone(&shared));
+        let (tx, mut commands) = mpsc::unbounded_channel();
+        let mut app = App::new(
+            Arc::clone(&shared),
+            Arc::clone(&popups),
+            Arc::new(StreamLink::default()),
+            tx,
+        );
+        app.background = Some(crate::host::IndicatorShown::default());
+        let (_started_tx, started) = tokio::sync::watch::channel(0u64);
+        let consent = GuiConsent::new(
+            Arc::clone(&popups),
+            Withdraw {
+                kill: KillSwitch::new(),
+                started,
+                live: Arc::new(|| false),
+            },
+        );
+        // What the window hands the mirror, and the mirror on a fake bus.
+        let (changes_tx, changes) = mpsc::unbounded_channel();
+        #[cfg(target_os = "linux")]
+        let bus = Arc::new(FakeBus::default());
+        #[cfg(target_os = "linux")]
+        let mirroring = {
+            let bus = Arc::clone(&bus);
+            tokio::spawn(super::super::notice::mirror(
+                move || async move { Ok(bus as Arc<dyn tornect_platform::notify::NotificationBus>) },
+                changes,
+                |line| panic!("{line}"),
+            ))
+        };
+        #[cfg(not(target_os = "linux"))]
+        drop(changes);
+        let mut handed = |app: &mut App| {
+            app.sync_notices();
+            let mut sent = Vec::new();
+            while let Ok(command) = commands.try_recv() {
+                let Command::Notice(change) = command else {
+                    panic!("not a notification: {command:?}");
+                };
+                let _ = changes_tx.send(change);
+                sent.push(change);
+            }
+            sent
+        };
+
+        // A pairing sheet: the raise, then one notification, then none more.
+        let device = tornect_core::DeviceIdentity::from_seed(&[8; 32]).id();
+        let peer = PairingPeer {
+            device,
+            name: "Phone".to_owned(),
+            fingerprint: device.fingerprint(),
+            pinned_label: None,
+        };
+        woken.lock().unwrap().clear();
+        let asking = consent.pairing(&peer, "123 456");
+        tokio::pin!(asking);
+        let sheet = tokio::select! {
+            _ = &mut asking => panic!("answered before anyone did"),
+            sheet = open_sheet(&popups) => sheet,
+        };
+        assert!(
+            woken.lock().unwrap().contains(&Wake::Attention),
+            "the sheet raises the window"
+        );
+        assert_eq!(
+            handed(&mut app),
+            vec![NoticeChange::Show {
+                sheet: sheet.id,
+                asks: Asks::Pair
+            }]
+        );
+        assert_eq!(handed(&mut app), vec![], "one notification per sheet");
+        // Answered: the sheet goes, and its notification with it.
+        assert!(popups.answer_pairing(sheet.id, PairDecision::Reject));
+        assert_eq!(asking.await, PairDecision::Reject);
+        assert_eq!(
+            handed(&mut app),
+            vec![NoticeChange::Close { sheet: sheet.id }]
+        );
+
+        // "Ask before starting", which times out: it says a device asks to
+        // connect, and goes with its sheet.
+        let asking = consent.ask_at(
+            &[1; 8],
+            "Laptop",
+            tornect_core::levels::Elevation::None,
+            Duration::from_millis(300),
+        );
+        tokio::pin!(asking);
+        let ask = tokio::select! {
+            _ = &mut asking => panic!("answered before its time"),
+            sheet = open_sheet(&popups) => sheet,
+        };
+        assert_eq!(
+            handed(&mut app),
+            vec![NoticeChange::Show {
+                sheet: ask.id,
+                asks: Asks::Connect
+            }]
+        );
+        assert!(!asking.await, "its time ran out: denied");
+        assert_eq!(
+            handed(&mut app),
+            vec![NoticeChange::Close { sheet: ask.id }]
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            drop(changes_tx);
+            mirroring.await.unwrap();
+            let shown = bus.shown.lock().unwrap().clone();
+            let texts: Vec<(&str, &str)> = shown
+                .iter()
+                .map(|n| (n.summary.as_str(), n.body.as_str()))
+                .collect();
+            assert_eq!(
+                texts,
+                vec![
+                    (
+                        "A device asks to pair with this computer.",
+                        "Open Tornect to answer."
+                    ),
+                    (
+                        "A device asks to connect to this computer.",
+                        "Open Tornect to answer."
+                    ),
+                ]
+            );
+            assert!(
+                shown
+                    .iter()
+                    .all(|n| n.actions.is_empty() && n.sound.is_none())
+            );
+            for _ in 0..100 {
+                if bus.closed.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let mut closed = bus.closed.lock().unwrap().clone();
+            closed.sort_unstable();
+            assert_eq!(closed, vec![1, 2], "each taken down");
+        }
+
+        // A window started by hand: the sheet raises it, no notification.
+        app.background = None;
+        let asking = consent.pairing(&peer, "654 321");
+        tokio::pin!(asking);
+        let sheet = tokio::select! {
+            _ = &mut asking => panic!("answered before anyone did"),
+            sheet = open_sheet(&popups) => sheet,
+        };
+        assert!(commands.try_recv().is_err());
+        app.sync_notices();
+        assert!(commands.try_recv().is_err(), "no notification by hand");
+        assert!(popups.answer_pairing(sheet.id, PairDecision::Reject));
+        assert_eq!(asking.await, PairDecision::Reject);
     }
 
     /// Review N-1: the main window is back in view when it gets the focus or

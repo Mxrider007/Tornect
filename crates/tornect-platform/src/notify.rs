@@ -7,7 +7,9 @@
 //! already uses (the plan names `notify-rust`, which drives the same
 //! interface; no new crate). What a notification server does with it (shows
 //! the button, plays the sound, keeps the notification up while the window
-//! runs) is the server's: NEEDS-DEVICE(gnome).
+//! runs) is the server's: NEEDS-DEVICE(gnome). The same bus carries the
+//! notification that mirrors a request's sheet in background mode
+//! ([`mirror_notice`], §B.1.1), which has no action.
 //!
 //! The bus is a seam ([`NotificationBus`]), so the request can be checked on a
 //! fake one; [`SessionBus`] is the user's session bus.
@@ -32,6 +34,8 @@ pub const BLOCK_ACTION: &str = "block";
 pub const CHIME: &str = "dialog-warning";
 /// The `urgency` hint of a notification that must not go unseen (critical).
 pub const URGENCY_CRITICAL: u8 = 2;
+/// The `urgency` hint of an ordinary notification (normal).
+pub const URGENCY_NORMAL: u8 = 1;
 
 /// Why a notification could not be shown.
 #[derive(Debug, thiserror::Error)]
@@ -89,6 +93,22 @@ pub fn block_notice(label: &str, secs: u8) -> Notice {
         sound: Some(CHIME.to_owned()),
         urgency: URGENCY_CRITICAL,
         expire_ms: i32::from(secs) * 1000,
+    }
+}
+
+/// A notification that mirrors a question on screen (`docs/PLAN.md` §B.1.1:
+/// in background mode each request's sheet has one): normal, with no action
+/// and no sound, and no time limit of its own (`expire_timeout` 0), because
+/// it is taken down with its question.
+#[must_use]
+pub fn mirror_notice(summary: &str, body: &str) -> Notice {
+    Notice {
+        summary: summary.to_owned(),
+        body: body.to_owned(),
+        actions: Vec::new(),
+        sound: None,
+        urgency: URGENCY_NORMAL,
+        expire_ms: 0,
     }
 }
 
@@ -330,6 +350,41 @@ mod tests {
         invoke.send((7, "block".to_owned())).await.unwrap();
         assert_eq!(shown.action().await.as_deref(), Some(BLOCK_ACTION));
 
+        drop(shown);
+        for _ in 0..100 {
+            if !bus.closed.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*bus.closed.lock().unwrap(), vec![7]);
+    }
+
+    /// A notification that mirrors a question on a fake bus: normal, with no
+    /// action and no sound, never expiring by itself; dropped, it is taken
+    /// down.
+    #[tokio::test]
+    async fn a_mirror_notice_on_a_fake_bus() {
+        let bus = Arc::new(FakeBus::default());
+        let shown = Shown::show(bus.clone(), &mirror_notice("A summary.", "A body."))
+            .await
+            .unwrap();
+        let notice = bus.shown.lock().unwrap()[0].clone();
+        assert_eq!(
+            notice,
+            Notice {
+                summary: "A summary.".to_owned(),
+                body: "A body.".to_owned(),
+                actions: Vec::new(),
+                sound: None,
+                urgency: 1,
+                expire_ms: 0,
+            }
+        );
+        assert!(notice.action_list().is_empty());
+        let hints = notice.hints();
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints["urgency"], zbus::zvariant::Value::U8(1));
         drop(shown);
         for _ in 0..100 {
             if !bus.closed.lock().unwrap().is_empty() {
