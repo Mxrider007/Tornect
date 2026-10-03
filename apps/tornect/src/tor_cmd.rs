@@ -637,16 +637,14 @@ pub fn admin(
                 Ok(answer) => {
                     // An admin answer keeps no password (DA-15); its decoded `grant_reach`
                     // decides about a remembered one (C1, C11).
-                    match ua_client::settle_admin(paths, &saved, &id, &answer) {
-                        Ok(settled) => say_notes(&ua_client::notes(
-                            &format!("\"{}\"", known.label),
-                            saved.keychain().unwrap_or("the keychain"),
-                            ua_client::Answered::Admin {
-                                grant_reach: answer.grant_reach,
-                            },
-                            false,
-                            Some(&settled),
-                        )),
+                    match ua_client::after_admin(
+                        paths,
+                        &saved,
+                        &id,
+                        &answer,
+                        &format!("\"{}\"", known.label),
+                    ) {
+                        Ok(notes) => say_notes(&notes),
                         Err(e) => eprintln!("hosts.toml could not be updated: {e:#}"),
                     }
                     ua_client::log_attempt(
@@ -986,16 +984,16 @@ async fn connect_session(
     );
     if let Some(p) = &prepared {
         // C1: the verified accept alone decides, before QUIC, by the key decoded from it.
-        let answer = ua_client::accepted(session.accept());
-        let answered = ua_client::Answered::Session {
-            elevation: session.accept().elevation(),
-            grant_reach: session.accept().grant_reach(),
-            asked_control: !p.request.view_only,
-            given_control: control,
-            withheld: session.elevation_withheld(),
-        };
-        let settled = ua_client::settle(paths, &p.saved, &id, answer, &p.request);
-        match &settled {
+        let after = ua_client::after_accept(
+            paths,
+            &p.saved,
+            &id,
+            session.accept(),
+            &p.request,
+            &format!("\"{}\"", p.known.label),
+            session.elevation_withheld(),
+        );
+        match &after.settled {
             Ok(s) if s.remembered && p.request.remember => eprintln!(
                 "the password is remembered in {}{}",
                 p.saved.keychain().unwrap_or("the keychain"),
@@ -1005,18 +1003,12 @@ async fn connect_session(
                     .unwrap_or_default()
             ),
             Ok(_) => {}
-            Err(e) if answer.deletes_first() => {
+            Err(e) if after.deleted_first => {
                 eprintln!("hosts.toml could not be updated: {e:#}");
             }
             Err(e) => eprintln!("the password could not be remembered: {e:#}"),
         }
-        say_notes(&ua_client::notes(
-            &format!("\"{}\"", p.known.label),
-            p.saved.keychain().unwrap_or("the keychain"),
-            answered,
-            p.request.remember,
-            settled.as_ref().ok(),
-        ));
+        say_notes(&after.notes);
         ua_client::log_attempt(
             paths,
             &p.known,

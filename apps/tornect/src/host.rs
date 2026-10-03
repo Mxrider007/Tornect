@@ -1673,10 +1673,11 @@ mod tests {
     /// account's facts (UAC on, no helper task), a client with Remember ticked and an
     /// entry planted for the host. The grant at the administrator level and not marked:
     /// every answer the host signs says 2 (the level not asked, view only, the level asked
-    /// with no helper to give it), and the settle, fed from that verified frame as the
-    /// window and the command line feed it (`ua_client::accepted`), keeps nothing and has
-    /// deleted the planted entry. A grant at none on a host without admin grants: every
-    /// answer says 0, and the typed password is kept in place of the planted one.
+    /// with no helper to give it), and the window's and the command line's own path after
+    /// a session started (`ua_client::after_accept`), fed that verified frame, keeps
+    /// nothing and has deleted the planted entry. A grant at none on a host without admin
+    /// grants: every answer says 0, and the typed password is kept in place of the planted
+    /// one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a20_real_host_frame_decides_the_keep() {
         use tornect_core::levels::{AccountFacts, Elevation, FixedFacts, HelperPresence};
@@ -1756,13 +1757,16 @@ mod tests {
                         other => panic!("{case}: {other:?}"),
                     };
                 let signed = session.accept().grant_reach();
-                let settled = crate::ua_client::settle(
+                let settled = crate::ua_client::after_accept(
                     &env.paths,
                     &saved,
                     &host,
-                    crate::ua_client::accepted(session.accept()),
+                    session.accept(),
                     &request,
+                    "\"Desk\"",
+                    session.elevation_withheld(),
                 )
+                .settled
                 .unwrap();
                 drop(session);
                 let _ = host_task.await;
@@ -1905,10 +1909,10 @@ mod tests {
     /// account's facts, wired with its guard, and a client that remembered the password.
     /// The grant at the level and not marked: a command run (`end_session`) and one the
     /// guard refuses (`master_off`, out of a Headless box grant's scope) are both answered
-    /// 2, and the admin settle, fed from the verified answer as the window and the command
-    /// line feed it (`ua_client::settle_admin`), deletes the remembered password at the
-    /// first answer and writes none. A grant at none on a host without admin grants: both
-    /// answered 0, and the remembered password stays in place.
+    /// 2, and the window's and the command line's own path after an admin answer
+    /// (`ua_client::after_admin`), fed the verified answer, deletes the remembered password
+    /// at the first answer and writes none. A grant at none on a host without admin
+    /// grants: both answered 0, and the remembered password stays in place.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a20_d_e_real_admin_answers_decide_the_keep() {
         use tornect_core::levels::{AccountFacts, Elevation, FixedFacts, HelperPresence};
@@ -2003,7 +2007,8 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{case}: {e}"));
                 let _ = host_task.await;
                 assert_eq!(answer.ok, ok, "{case}");
-                crate::ua_client::settle_admin(&env.paths, &saved, &host, &answer).unwrap();
+                crate::ua_client::after_admin(&env.paths, &saved, &host, &answer, "\"Desk\"")
+                    .unwrap();
                 if at_the_level {
                     assert_eq!(answer.grant_reach, Some(2), "{case}");
                     assert!(vault.names().is_empty(), "{case}: deleted");

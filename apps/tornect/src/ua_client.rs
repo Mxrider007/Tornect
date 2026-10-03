@@ -738,6 +738,79 @@ pub fn settle_admin(
     Ok(settled)
 }
 
+/// What a verified unattended `SESSION_ACCEPT` left at a host (decision M1-67, C1).
+pub struct AfterAccept {
+    /// What [`settle`] did, or why it failed.
+    pub settled: anyhow::Result<Settled>,
+    /// The answer deleted the remembered password before anything else (C2): a failed
+    /// settle then failed to update `hosts.toml`, not to remember.
+    pub deleted_first: bool,
+    /// The notes after the answer.
+    pub notes: Vec<String>,
+}
+
+/// The settle and the notes after the verified unattended `accept` of `request` at
+/// `host`, named `named` (quoted) in the notes: the command line's and the window's one
+/// path once a session started (decision M1-67, C1), by the attempt decoded from the
+/// signed frame alone. `withheld`: the level was asked for and not given.
+pub fn after_accept(
+    paths: &Paths,
+    saved: &SavedPasswords,
+    host: &TornectId,
+    accept: &messages::SessionAccept,
+    request: &Request,
+    named: &str,
+    withheld: bool,
+) -> AfterAccept {
+    let attempt = accepted(accept);
+    let settled = settle(paths, saved, host, attempt, request);
+    let answered = Answered::Session {
+        elevation: accept.elevation(),
+        grant_reach: accept.grant_reach(),
+        asked_control: !request.view_only,
+        given_control: matches!(
+            tornect_signal::consent::mode_from_code(accept.mode()),
+            Some(SessionMode::Control)
+        ),
+        withheld,
+    };
+    let notes = notes(
+        named,
+        saved.keychain().unwrap_or("the keychain"),
+        answered,
+        request.remember,
+        settled.as_ref().ok(),
+    );
+    AfterAccept {
+        settled,
+        deleted_first: attempt.deletes_first(),
+        notes,
+    }
+}
+
+/// The admin settle and the notes after the verified `ADMIN_RESULT` `answer` at `host`,
+/// named `named` (quoted) in the notes: the command line's and the window's one path once
+/// an admin command was answered (decision M1-67, C11). An error says that `hosts.toml`
+/// could not be updated.
+pub fn after_admin(
+    paths: &Paths,
+    saved: &SavedPasswords,
+    host: &TornectId,
+    answer: &tornect_signal::fsm::client::AdminAnswer,
+    named: &str,
+) -> anyhow::Result<Vec<String>> {
+    let settled = settle_admin(paths, saved, host, answer)?;
+    Ok(notes(
+        named,
+        saved.keychain().unwrap_or("the keychain"),
+        Answered::Admin {
+            grant_reach: answer.grant_reach,
+        },
+        false,
+        Some(&settled),
+    ))
+}
+
 /// What one verified unattended answer was, for the notes after it (decision M1-67).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answered {
