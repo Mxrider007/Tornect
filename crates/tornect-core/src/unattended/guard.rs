@@ -1806,7 +1806,15 @@ impl MutationGuard {
                 ),
             ));
         }
-        self.apply_registration(by, device, upload, preset, options, generated, Some(raise))
+        self.apply_registration(
+            by,
+            device,
+            upload,
+            preset,
+            options,
+            generated,
+            Asked::RegStart(raise),
+        )
     }
 
     /// One-operation grant creation (UI path): re-auth inline, then the registration.
@@ -1843,7 +1851,8 @@ impl MutationGuard {
                 GuardError::from(StoreError::GrantExists),
             ));
         }
-        match self.apply_registration(by, device, upload, preset, options, generated, None)? {
+        let asked = Asked::Dialog(raising);
+        match self.apply_registration(by, device, upload, preset, options, generated, asked)? {
             RegFinishOutcome::Created(id) | RegFinishOutcome::PasswordSet(id) => Ok(id),
         }
     }
@@ -1885,17 +1894,19 @@ impl MutationGuard {
             .map_err(|e| self.refuse(op, Some(by), Some(device), e))?;
         self.access_increasing_raising(op, by, Some(device), raising.then_some(label.as_str()))?;
         self.require_loaded(op, Some(by), Some(device))?;
-        match self.apply_registration(by, device, upload, preset, options, generated, None)? {
+        let asked = Asked::Dialog(raising);
+        match self.apply_registration(by, device, upload, preset, options, generated, asked)? {
             RegFinishOutcome::Created(id) | RegFinishOutcome::PasswordSet(id) => Ok(id),
         }
     }
 
-    /// The registration both paths share. `declared_raise`: what a `RegStart` declared
-    /// (`None` on the window's paths, which re-authenticated with the right wording
-    /// themselves). Decided under the lock of the commit (decision M1-67, D3, D4, D9): the
-    /// level where this host cannot give it ⇒ `G_UNSUPPORTED`; a creation with reach or a
-    /// raise without `generated`, or not declared at its `RegStart` ⇒ `G_NEEDS_PASSWORD`,
-    /// nothing written; the new password is unmarked exactly when it is `generated`.
+    /// The registration both paths share. `asked`: whether what the owner confirmed named
+    /// a raise, a `RegStart`'s declaration or the window's own dialog, worded on facts and a
+    /// store read taken before it. Decided under the lock of the commit (decision M1-67, D3,
+    /// D4, D9): the level where this host cannot give it ⇒ `G_UNSUPPORTED`; a creation with
+    /// reach or a raise without `generated`, or one that what was confirmed did not name
+    /// (it appeared meanwhile: S5B-2) ⇒ `G_NEEDS_PASSWORD`, nothing written; the new
+    /// password is unmarked exactly when it is `generated`.
     #[allow(clippy::too_many_arguments)]
     fn apply_registration(
         &self,
@@ -1905,7 +1916,7 @@ impl MutationGuard {
         preset: Preset,
         options: &GrantOptions,
         generated: bool,
-        declared_raise: Option<bool>,
+        asked: Asked,
     ) -> Result<RegFinishOutcome, GuardError> {
         let op = "reg_finish";
         self.require_loaded(op, Some(by), Some(device))?;
@@ -1934,14 +1945,19 @@ impl MutationGuard {
                         .into(),
                 ));
             }
-            if raises && declared_raise == Some(false) {
-                return Err(StoreError::NeedsPassword(
+            match asked {
+                Asked::RegStart(false) if raises => Err(StoreError::NeedsPassword(
                     "this registration gives the grant administrator reach, but its RegStart did \
                      not say so"
                         .into(),
-                ));
+                )),
+                Asked::Dialog(false) if raises => Err(StoreError::NeedsPassword(
+                    "this registration gives the grant administrator reach, but the confirmation \
+                     did not say so"
+                        .into(),
+                )),
+                Asked::RegStart(_) | Asked::Dialog(_) => Ok(()),
             }
-            Ok(())
         };
         let auth = AuthRecord::Opaque {
             record: Zeroizing::new(upload.to_vec()),
@@ -2479,4 +2495,14 @@ impl MutationGuard {
             effect,
         })
     }
+}
+
+/// What the owner confirmed before a registration, and whether it named a raise
+/// (decision M1-67, D3): a `RegStart`'s declaration, or the window's own dialog.
+#[derive(Debug, Clone, Copy)]
+enum Asked {
+    /// The `RegStart` of this registration declared `raise`.
+    RegStart(bool),
+    /// The window's create or Change password dialog, worded for a raise or not.
+    Dialog(bool),
 }
