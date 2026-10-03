@@ -295,12 +295,31 @@ pub enum EndScope {
     AtTheLevel,
 }
 
+/// Why a device's sessions end: what their `BYE` says (§B.8.6.1's mapping; decision
+/// M1-67, D6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndReason {
+    /// `REVOKED`: the grant revoked, disabled, unpaired or lowered.
+    Revoked,
+    /// `SUSPENDED`: the grant suspended locally, by the block window or by an admin command.
+    Suspended,
+    /// `PANIC`: the grant suspended by the panic key.
+    Panic,
+}
+
 /// Ends the sessions of one device within a second (decision M1-67, D6; §B.8.4.1's host
 /// table): the host's kill switch addressed to one device (`tornect-signal`). The
 /// offline CLI has none: no session runs there.
 pub trait DeviceSessionEnd: Send + Sync {
     /// End the sessions of `device` that `scope` reaches, with `BYE{REVOKED}`.
     fn end_device(&self, device: &DeviceId, scope: EndScope);
+
+    /// End them with the `BYE` that `reason` maps to. An end that does not tell the
+    /// reasons apart ends them as [`Self::end_device`] does.
+    fn end_device_because(&self, device: &DeviceId, scope: EndScope, reason: EndReason) {
+        let _ = reason;
+        self.end_device(device, scope);
+    }
 }
 
 /// "No session" stub for the offline CLI.
@@ -743,10 +762,10 @@ impl MutationGuard {
     }
 
     /// After a committed deny-direction change of `device`'s grant: the sessions `scope`
-    /// reaches end.
-    fn end_sessions_of(&self, device: &DeviceId, scope: EndScope) {
+    /// reaches end, saying `reason`.
+    fn end_sessions_of(&self, device: &DeviceId, scope: EndScope, reason: EndReason) {
         if let Some(end) = &self.device_end {
-            end.end_device(device, scope);
+            end.end_device_because(device, scope, reason);
         }
     }
 
@@ -1046,7 +1065,7 @@ impl MutationGuard {
         self.store
             .remove_grant(device, &rec)
             .map_err(|e| self.refuse("revoke", Some(by), Some(device), GuardError::from(e)))?;
-        self.end_sessions_of(device, EndScope::Every);
+        self.end_sessions_of(device, EndScope::Every, EndReason::Revoked);
         Ok(())
     }
 
@@ -1086,7 +1105,7 @@ impl MutationGuard {
                 Ok(())
             })
             .map_err(|e| self.refuse("disable", Some(by), Some(device), GuardError::from(e)))?;
-        self.end_sessions_of(device, EndScope::Every);
+        self.end_sessions_of(device, EndScope::Every, EndReason::Revoked);
         Ok(())
     }
 
@@ -1111,7 +1130,7 @@ impl MutationGuard {
             .detail("unpair");
         match self.store.remove_grant(device, &rec) {
             Ok(_) => {
-                self.end_sessions_of(device, EndScope::Every);
+                self.end_sessions_of(device, EndScope::Every, EndReason::Revoked);
                 Ok(true)
             }
             Err(StoreError::NoGrant) => Ok(false),
@@ -1181,7 +1200,13 @@ impl MutationGuard {
             })
             .map_err(|e| self.refuse("suspend", by, Some(device), GuardError::from(e)))?;
         if outcome == SuspendOutcome::Suspended {
-            self.end_sessions_of(device, EndScope::Every);
+            // §B.8.6.1: a suspend says SUSPENDED; the panic key's says PANIC.
+            let why = if reason == SuspendReason::Panic {
+                EndReason::Panic
+            } else {
+                EndReason::Suspended
+            };
+            self.end_sessions_of(device, EndScope::Every, why);
         }
         Ok(outcome)
     }
@@ -1440,7 +1465,7 @@ impl MutationGuard {
         // A lowering, decided under the lock that committed it, ends the device's sessions
         // at the level (D6).
         if lowered {
-            self.end_sessions_of(device, EndScope::AtTheLevel);
+            self.end_sessions_of(device, EndScope::AtTheLevel, EndReason::Revoked);
         }
         Ok(())
     }
@@ -2043,7 +2068,7 @@ impl MutationGuard {
                 })
                 .map_err(|e| self.refuse(op, Some(by), Some(device), GuardError::from(e)))?;
             if lowered {
-                self.end_sessions_of(device, EndScope::AtTheLevel);
+                self.end_sessions_of(device, EndScope::AtTheLevel, EndReason::Revoked);
             }
             return Ok(RegFinishOutcome::PasswordSet(existing.id));
         }
@@ -2298,6 +2323,25 @@ impl MutationGuard {
         for rec in &after {
             if let Err(e) = self.store.log_event(rec) {
                 tracing::warn!(error = %e, op = op_name, "could not log an AdminRequest line");
+            }
+        }
+        // A remote revoke or suspend ends that device's sessions here, once its write has
+        // committed and its lines are written, whatever becomes of the requester's stream
+        // (D6; S5B-3). The host-wide effects stay with the state machine, after the
+        // answer: they end the requester's own stream too.
+        if let Ok(outcome) = &result {
+            match &outcome.effect {
+                AdminEffect::Revoked(target) => {
+                    self.end_sessions_of(target, EndScope::Every, EndReason::Revoked);
+                }
+                AdminEffect::Suspended(target) => {
+                    self.end_sessions_of(target, EndScope::Every, EndReason::Suspended);
+                }
+                AdminEffect::None
+                | AdminEffect::RevokedAll(_)
+                | AdminEffect::MasterOff
+                | AdminEffect::Unlocked(_)
+                | AdminEffect::EndSession => {}
             }
         }
         match result {
