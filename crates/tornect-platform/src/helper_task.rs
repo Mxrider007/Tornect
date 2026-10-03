@@ -259,6 +259,35 @@ pub trait HelperTasks {
     fn run(&self, arg: &str) -> Result<(), AutostartError>;
     /// Whether `principal` (a SID or a name) is this account.
     fn is_this_account(&self, principal: &str) -> bool;
+    /// Whether the task exists, for its presence (decision M1-67): `false` only where
+    /// the scheduler says there is no such task, an error for every other failure, so
+    /// that a presence that cannot be read counts as registered. The default reads
+    /// [`Self::query`] by its contract (`None`: no task); an implementation whose
+    /// `query` reads a failure as no task, for a registration's read-back, answers
+    /// this itself.
+    fn exists(&self) -> Result<bool, AutostartError> {
+        self.query().map(|task| task.is_some())
+    }
+}
+
+/// `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`: the Task Scheduler has no task of that
+/// name.
+#[cfg(any(windows, test))]
+const TASK_NOT_FOUND: i32 = 0x8007_0002_u32.cast_signed();
+
+/// The helper task's existence from the HRESULT of the Task Scheduler's `GetTask`
+/// (decision M1-67): found on success, absent only on "not found", and every other
+/// failure an error (access denied, the scheduler not running, ...), which
+/// [`presence`] counts as registered.
+#[cfg(any(windows, test))]
+pub(crate) fn exists_from_get_task(hr: i32) -> Result<bool, AutostartError> {
+    match hr {
+        TASK_NOT_FOUND => Ok(false),
+        hr if hr >= 0 => Ok(true),
+        hr => Err(AutostartError::Failed(format!(
+            "the Task Scheduler could not read the task: HRESULT {hr:#010x}"
+        ))),
+    }
 }
 
 /// Where the helper runs from.
@@ -396,9 +425,9 @@ pub fn refusal_class(e: &AutostartError) -> &'static str {
 /// that fails counts as registered. The log line names the refusal's class only (F-9).
 #[must_use]
 pub fn presence(ts: &dyn HelperTasks) -> HelperPresence {
-    match ts.query() {
-        Ok(Some(_)) => HelperPresence::Registered,
-        Ok(None) => HelperPresence::Absent,
+    match ts.exists() {
+        Ok(true) => HelperPresence::Registered,
+        Ok(false) => HelperPresence::Absent,
         Err(e) => {
             tracing::warn!(
                 class = refusal_class(&e),
@@ -1031,5 +1060,59 @@ mod tests {
         assert!(!presence(&ts).counts());
         *ts.task.borrow_mut() = Some("<Task/>".to_owned());
         assert_eq!(presence(&ts), HelperPresence::Registered);
+    }
+
+    /// Decision M1-67 (a presence that cannot be read counts as registered): the
+    /// presence asks [`HelperTasks::exists`], never `query`'s reading of a failure as no
+    /// task (the registration's read-back keeps that), and on Windows `exists` is absent
+    /// only on the scheduler's "not found".
+    #[test]
+    fn a_presence_that_cannot_be_read_is_never_absent() {
+        /// A scheduler whose `query` reads its failure as no task, as `schtasks /Query`'s
+        /// non-zero exit is read, and whose own presence read fails.
+        struct DeniedRead;
+        impl HelperTasks for DeniedRead {
+            fn query(&self) -> Result<Option<String>, AutostartError> {
+                Ok(None)
+            }
+            fn register(&self, _: &str) -> Result<(), AutostartError> {
+                unreachable!()
+            }
+            fn delete(&self) -> Result<(), AutostartError> {
+                unreachable!()
+            }
+            fn set_enabled(&self, _: bool) -> Result<(), AutostartError> {
+                unreachable!()
+            }
+            fn security(&self, _: &str) -> Result<Security, AutostartError> {
+                unreachable!()
+            }
+            fn run(&self, _: &str) -> Result<(), AutostartError> {
+                unreachable!()
+            }
+            fn is_this_account(&self, _: &str) -> bool {
+                unreachable!()
+            }
+            fn exists(&self) -> Result<bool, AutostartError> {
+                exists_from_get_task(0x8007_0005_u32.cast_signed())
+            }
+        }
+        assert_eq!(presence(&DeniedRead), HelperPresence::Unreadable);
+        assert!(presence(&DeniedRead).counts());
+        assert!(exists_from_get_task(0).unwrap(), "S_OK: found");
+        assert!(exists_from_get_task(1).unwrap(), "S_FALSE: found");
+        assert!(!exists_from_get_task(TASK_NOT_FOUND).unwrap(), "not found");
+        for failed in [
+            0x8007_0005_u32, // access denied
+            0x8004_1315,     // the Task Scheduler service is not running
+            0x8007_06BA,     // the RPC server is unavailable
+            0x8007_0003,     // the path is not found
+            0x8000_4005,     // unspecified
+        ] {
+            assert!(
+                exists_from_get_task(failed.cast_signed()).is_err(),
+                "{failed:#010x}"
+            );
+        }
     }
 }
