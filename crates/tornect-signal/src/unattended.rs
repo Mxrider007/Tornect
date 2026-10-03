@@ -612,8 +612,9 @@ impl UnattendedHook for UnattendedAuth {
     /// operation under the store lock checks the `auth` record this stream proved,
     /// refuses a grant no longer eligible, reads the mark and whether some grant holds
     /// the level, computes `grant_reach` and marks the password before an answer of 0.
-    /// The session is lowered to what that read allows (the clamp's grant level, F-12,
-    /// the marked rule), never raised, and carries the `grant_reach` it computed.
+    /// The session is lowered to what that read allows (the grant's mode as stored, the
+    /// clamp's grant level, F-12, the marked rule), never raised, and carries the
+    /// `grant_reach` it computed.
     fn reserved<'a>(
         &'a self,
         device: &'a DeviceId,
@@ -652,6 +653,10 @@ impl UnattendedHook for UnattendedAuth {
                     return Err(SessionReject::new(reject::NOT_GRANTED));
                 }
             };
+            // Never above the grant as stored under the lock: a mode narrowed since the
+            // gate is clamped first, so the level and the marked rule are judged on the
+            // mode served.
+            let policy = policy.lowered_to(read.grant_mode);
             let elevation = Elevation::most_restrictive(policy.elevation(), read.grant_level);
             let policy = policy.with_elevation(elevation);
             let level = Level::new(policy.mode(), policy.elevation());
