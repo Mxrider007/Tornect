@@ -28,6 +28,7 @@ mod history;
 mod host;
 mod prompt;
 mod secure_screen;
+mod term_block;
 mod tor_cmd;
 mod ua_client;
 mod ui;

@@ -11,7 +11,7 @@ use std::io::IsTerminal as _;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, MutexGuard, mpsc, watch};
 use tornect_core::TornectId;
 use tornect_core::levels::{
     ADMIN_LINE, ADMIN_LINE_NO_PROMPT, AdminPath, Answers, Availability, LINE_VIEW_ONLY,
@@ -39,10 +39,15 @@ const CONFIRM_TIMEOUT: Duration = Duration::from_secs(50);
 /// question, not before, so a host that only ever answers pings never touches
 /// the terminal (a background job that reads it would be stopped by the shell).
 /// Lines typed before a question is shown are discarded, so a stale answer
-/// never counts for a new question.
+/// never counts for a new question. A block window goes before every question
+/// ([`Prompter::priority`]).
 pub struct Prompter {
     lines: Mutex<Option<mpsc::Receiver<String>>>,
     source: Source,
+    /// Block windows holding the terminal now ([`Prompter::priority`]): while
+    /// any does, the open question's read is cancelled and no question is
+    /// shown.
+    blocking: watch::Sender<u32>,
 }
 
 /// Whether the terminal asks the questions: only when both its input and
@@ -71,21 +76,54 @@ impl Prompter {
             Arc::new(Self {
                 lines: Mutex::new(None),
                 source: Source::Stdin,
+                blocking: watch::channel(0).0,
             })
         })
     }
 
     /// Show `question` and wait for the next line typed after it; `None` once
-    /// stdin is closed. Questions queue behind one another.
+    /// stdin is closed. Questions queue behind one another. A block window
+    /// goes before them all ([`Prompter::priority`]): while one holds the
+    /// terminal, the open question's wait ends with `None` and a question
+    /// queued behind it is not shown (`None` too), which every question
+    /// answers as a closed terminal does, a refusal.
     pub async fn ask(&self, question: &str) -> Option<String> {
         let mut lines = self.lines.lock().await;
+        if self.block_window_open() {
+            return None;
+        }
         if lines.is_none() {
             *lines = self.start();
         }
         let rx = lines.as_mut()?;
         while rx.try_recv().is_ok() {}
         eprintln!("{question}");
-        rx.recv().await
+        let mut blocking = self.blocking.subscribe();
+        tokio::select! {
+            // Checked first: a line typed for the block window is never this
+            // question's answer.
+            biased;
+            _ = blocking.wait_for(|open| *open > 0) => None,
+            line = rx.recv() => line,
+        }
+    }
+
+    /// The terminal for a block window (§B.8.6.3), taken ahead of every
+    /// question: from this call on, the open question's read is cancelled
+    /// and no question is shown until the returned hold is dropped. The
+    /// caller prints its line at once, then reads with
+    /// [`Priority::next_line`].
+    pub fn priority(&self) -> Priority<'_> {
+        self.blocking.send_modify(|open| *open += 1);
+        Priority {
+            prompter: self,
+            lines: None,
+        }
+    }
+
+    /// Whether a block window holds the terminal.
+    pub(crate) fn block_window_open(&self) -> bool {
+        *self.blocking.borrow() > 0
     }
 
     fn start(&self) -> Option<mpsc::Receiver<String>> {
@@ -124,8 +162,44 @@ impl Prompter {
         let prompter = Arc::new(Self {
             lines: Mutex::new(Some(rx)),
             source: Source::Scripted,
+            blocking: watch::channel(0).0,
         });
         (prompter, tx)
+    }
+}
+
+/// A block window's hold on the terminal ([`Prompter::priority`]).
+pub struct Priority<'a> {
+    prompter: &'a Prompter,
+    lines: Option<MutexGuard<'a, Option<mpsc::Receiver<String>>>>,
+}
+
+impl Priority<'_> {
+    /// The next line typed, trimmed; `None` once stdin has ended (or could not
+    /// be read). Lines typed before the hold was taken count too: the block
+    /// window only looks for `block`, so a stale line can only block.
+    pub async fn next_line(&mut self) -> Option<String> {
+        if self.lines.is_none() {
+            let prompter = self.prompter;
+            // The open question lets go at once (its read is cancelled), and
+            // a question queued before this hold passes without being shown.
+            let mut lines = prompter.lines.lock().await;
+            if lines.is_none() {
+                *lines = prompter.start();
+            }
+            self.lines = Some(lines);
+        }
+        self.lines.as_mut()?.as_mut()?.recv().await
+    }
+}
+
+impl Drop for Priority<'_> {
+    fn drop(&mut self) {
+        // Before the terminal is let go (the guard is dropped after this), so
+        // a question waiting for it is shown.
+        self.prompter
+            .blocking
+            .send_modify(|open| *open = open.saturating_sub(1));
     }
 }
 
