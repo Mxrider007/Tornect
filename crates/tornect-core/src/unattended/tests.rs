@@ -5005,6 +5005,90 @@ fn an_admin_requester_no_longer_eligible_gets_no_answer() {
 }
 
 #[test]
+fn a_rolled_back_clock_refuses_an_ineligible_or_replaced_requester_first() {
+    // S5B-1 (B: a gone, ineligible or replaced grant is refused as in step 1, no
+    // ADMIN_RESULT): on a clock behind `last_seen`, what that clock can still decide is
+    // checked before the rollback is answered. Gone, disabled, suspended, expired,
+    // hard-locked, Pruned, unattended access off: NOT_GRANTED; the password replaced:
+    // AUTH_FAILED; for a command and for an early refusal alike, with no line and nothing
+    // run. An eligible, proven requester still gets the rollback answer
+    // (`a15_admin_requests_fail_closed_on_a_clock_rollback`).
+    type Change = Box<dyn Fn(&GrantStore, &MutationGuard, &DeviceId)>;
+    let cases: Vec<(&str, Change, ReachRefusal)> = vec![
+        (
+            "gone",
+            Box::new(|_, g, d| g.revoke(Actor::Ui, d).unwrap()),
+            ReachRefusal::NotEligible,
+        ),
+        (
+            "disabled",
+            Box::new(|_, g, d| g.disable(Actor::Ui, d).unwrap()),
+            ReachRefusal::NotEligible,
+        ),
+        (
+            "suspended",
+            Box::new(|_, g, d| {
+                g.suspend(Actor::Ui, d).unwrap();
+            }),
+            ReachRefusal::NotEligible,
+        ),
+        (
+            "expired",
+            Box::new(|s, _, d| set_grant(s, d, |g| g.expires_at = Some(T0))),
+            ReachRefusal::NotEligible,
+        ),
+        (
+            "hard-locked",
+            Box::new(|s, _, d| set_grant(s, d, |g| g.fail.hard_locked = true)),
+            ReachRefusal::NotEligible,
+        ),
+        (
+            "Pruned",
+            Box::new(|s, _, d| set_grant(s, d, |g| g.auth = AuthRecord::Pruned)),
+            ReachRefusal::NotEligible,
+        ),
+        (
+            "off",
+            Box::new(|_, g, _| g.master_off(Actor::Ui).unwrap()),
+            ReachRefusal::NotEligible,
+        ),
+        (
+            "replaced",
+            Box::new(|_, g, d| {
+                g.set_password(Actor::Ui, d, &[0xCD; 192], &GrantOptions::default(), false)
+                    .unwrap();
+            }),
+            ReachRefusal::AuthReplaced,
+        ),
+    ];
+    for (case, change, refusal) in cases {
+        let (env, store, guard, admin, target, _helper) = admin_env();
+        let lim = AttemptLimiter::new(store.clone());
+        assert_eq!(
+            gate(&lim, &admin),
+            Ok(()),
+            "{case}: raises the in-memory mark"
+        );
+        let proven = digest_of(&store, &admin);
+        change(&store, &guard, &admin);
+        env.clock.set_wall(env.clock.wall() - 60);
+        let lines = admin_lines(&env).len();
+        let answer = guard.admin(&admin, &proven, AdminOp::Revoke(target));
+        assert!(
+            matches!(&answer, Err(AdminError::Refused(r)) if *r == refusal),
+            "{case}: {answer:?}"
+        );
+        let early = guard.admin_refused_early(&admin, &proven, "unknown admin command");
+        assert!(
+            matches!(&early, Err(AdminError::Refused(r)) if *r == refusal),
+            "{case}: {early:?}"
+        );
+        assert!(store.grant(&target).is_some(), "{case}: nothing ran");
+        assert_eq!(admin_lines(&env).len(), lines, "{case}: no answer, no line");
+    }
+}
+
+#[test]
 fn a25_l_each_admin_refusal_under_the_lock_is_answered_and_logged() {
     // A25 (l): each refusal decided under the lock of the command (a clock rollback, out
     // of scope, a target without a grant, the two early refusals) is answered with the

@@ -2204,10 +2204,32 @@ impl MutationGuard {
                 return Err(AdminError::Refused(ReachRefusal::NotEligible));
             };
             let grant_reach = reach::grant_reach_of(store, &req, account, helper_task);
-            let enabled = store.active_at(now);
             // The rollback rule of every wall-clock evaluation (§B.8.5.3): the requester's
-            // `active_from` / expiry cannot be judged on a clock behind `last_seen`.
+            // `active_from` and a pause cannot be judged on a clock behind `last_seen`.
             let rollback = now < store.last_seen_unix.max(seen);
+            // The eligibility the gate applies (its own ladder lock excepted: this very
+            // stream's charge armed it), then the record this stream proved. Every term a
+            // clock behind `last_seen` can still decide is checked before a rollback is
+            // answered, so that a gone, ineligible or replaced grant is refused as at the
+            // read after the reservation, with no answer signed (B; S5B-1). An expiry
+            // already reached on that clock is reached now as well.
+            let standing = store.enabled
+                && req.state == GrantState::Active
+                && !req.expired_at(now)
+                && req.auth != AuthRecord::Pruned
+                && !req.fail.hard_locked;
+            let timely = store.active_at(now) && now >= req.active_from;
+            if rollback {
+                self.store
+                    .note_anomaly_locked(&mut st, now, self.store.clock().mono());
+            }
+            if !standing || (!rollback && !timely) {
+                return Err(AdminError::Refused(ReachRefusal::NotEligible));
+            }
+            let proven = reach::auth_digest(&req.auth);
+            if !bool::from(subtle::ConstantTimeEq::ct_eq(&proven[..], &auth_digest[..])) {
+                return Err(AdminError::Refused(ReachRefusal::AuthReplaced));
+            }
             let base = |ok: bool| {
                 SessionRecord::at(now, SessionEvent::AdminRequest)
                     .device(*requester)
@@ -2217,26 +2239,9 @@ impl MutationGuard {
                     .unattended(true)
             };
             let result = if rollback {
-                self.store
-                    .note_anomaly_locked(&mut st, now, self.store.clock().mono());
                 after.push(base(false).detail("clock rollback"));
                 Ok(refused("clock rollback"))
             } else {
-                // The eligibility the gate applies (its own ladder lock excepted: this
-                // very stream's charge armed it), then the record this stream proved.
-                let eligible = enabled
-                    && req.state == GrantState::Active
-                    && !req.expired_at(now)
-                    && req.auth != AuthRecord::Pruned
-                    && now >= req.active_from
-                    && !req.fail.hard_locked;
-                if !eligible {
-                    return Err(AdminError::Refused(ReachRefusal::NotEligible));
-                }
-                let proven = reach::auth_digest(&req.auth);
-                if !bool::from(subtle::ConstantTimeEq::ct_eq(&proven[..], &auth_digest[..])) {
-                    return Err(AdminError::Refused(ReachRefusal::AuthReplaced));
-                }
                 match op {
                     Err(why) => {
                         after.push(base(false).detail(why));
