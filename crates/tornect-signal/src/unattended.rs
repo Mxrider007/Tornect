@@ -864,22 +864,18 @@ impl UnattendedAuth {
 
         // ---- another session live: neither the popup nor the block window opens ----
         // Either would show this device's label on a screen another device may be
-        // watching, and no session can start while that one is live (§B.8.6.2, §B.8.6.4).
-        // Logged as suppressed, as the attended popup is; the popup's request is answered
-        // `DENIED`, as a withdrawn popup is, the block window's `SESSION_ACTIVE`, as the
-        // reservation answers it.
+        // watching, and no session can start while that one is live (§B.8.6.2, §B.8.6.4):
+        // the post-F2 refusal `SESSION_ACTIVE`, before the popup (§B.8.4.5), whether or
+        // not the grant asks before starting; logged as suppressed, as the attended popup is.
         if ctx.activity.session_live() {
             ctx.audit.record(AuditEvent::PopupSuppressed {
                 device,
                 label: Some(ctx.label.to_owned()),
                 popup: SuppressedPopup::Session,
             });
-            let reason = if grant.ask_before_start {
-                reject::DENIED
-            } else {
-                reject::SESSION_ACTIVE
-            };
-            return Ok(UnattendedVerdict::Reject(SessionReject::new(reason)));
+            return Ok(UnattendedVerdict::Reject(SessionReject::new(
+                reject::SESSION_ACTIVE,
+            )));
         }
 
         // ---- ask_before_start, then the block window ----
