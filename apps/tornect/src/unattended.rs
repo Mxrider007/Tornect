@@ -1490,7 +1490,20 @@ async fn register(
     let policy: PolicyInputsPayload = tornect_core::unattended::ipc::decode_payload(payload)?;
 
     let password = prompt_new_password(&policy.user_inputs, policy.min_score)?;
+    register_with(paths, route, device, preset, waive_attended_check, password).await
+}
 
+/// [`register`] once `password`, a chosen one, has been read: sent never as
+/// generated and never raising (decision M1-67, D4); only
+/// [`administrator_form`] does either.
+async fn register_with(
+    paths: &Paths,
+    route: &Route,
+    device: DeviceId,
+    preset: Option<Preset>,
+    waive_attended_check: bool,
+    password: zeroize::Zeroizing<String>,
+) -> anyhow::Result<()> {
     let (client, reg_request) = tornect_signal::auth::PasswordRegistration::start(&password)
         .map_err(|e| anyhow::anyhow!("starting the registration: {e}"))?;
 
@@ -1757,11 +1770,11 @@ async fn administrator_form(
     }
     let report = status_report(paths, route).await?;
     let label = label_of(paths, &report, &device);
-    if create.is_some() {
-        // ⑤a's warning first (§B.8.7.1; the operator's ruling of 2026-10-02:
-        // until the wizard's step exists, this is the only way to create one).
-        io.err(&tornect_core::levels::ADMINISTRATOR_WARNING.replace("<device>", &label));
-    }
+    // ⑤a's warning first (§B.8.7.1, §B.8.7.4; the operator's rulings of
+    // 2026-10-02): before an admin grant is created, since until the wizard's
+    // step exists this is the only way to create one, and before a grant is
+    // raised, which gives it the same access.
+    io.err(&tornect_core::levels::ADMINISTRATOR_WARNING.replace("<device>", &label));
     // The other Control grants, as they were before this change.
     let control = tornect_core::session_log::SessionMode::Control.wire();
     let others: Vec<(DeviceId, String)> = report
@@ -3577,7 +3590,8 @@ mod tests {
     /// other Control grants under ⑤a's heading (no mark label) and asks; yes
     /// gives each a new generated password (each unmarked after it); a view-only
     /// grant is not listed. Then a second rise (`set-password --administrator`
-    /// of another grant) offers again; no gives the line that nothing changed.
+    /// of another grant) prints the warning first too and offers again; no gives
+    /// the line that nothing changed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a22_cli_grant_administrator_lists_the_other_control_grants_and_offers_new_passwords() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3676,13 +3690,13 @@ mod tests {
             .unwrap();
         assert!(store.grant(&a).unwrap().holds_level());
         assert!(
-            !io.err
-                .iter()
-                .any(|l| l.starts_with("An unattended administrator")),
-            "no warning for set-password --administrator (not ruled)"
+            io.err[0].starts_with("An unattended administrator session can change anything")
+                && io.err[0].contains(&a.fingerprint()),
+            "the warning first for set-password --administrator too: {:?}",
+            io.err
         );
         assert!(
-            io.err[0].contains(&b.fingerprint()) && io.err[0].contains(&target.fingerprint()),
+            io.err[1].contains(&b.fingerprint()) && io.err[1].contains(&target.fingerprint()),
             "{:?}",
             io.err
         );
@@ -3758,6 +3772,97 @@ mod tests {
             &target,
             "quiet verdant otter lantern zephyr"
         ));
+    }
+
+    /// §B.8.7.4 (the operator's ruling of 2026-10-02): `set-password
+    /// --administrator` prints ⑤a's warning, naming the device, before it raises
+    /// the grant, as `grant --administrator` does before it creates one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_password_administrator_prints_the_warning_before_the_raise() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let (paths, route) = admin_route(&tmp, windows_admin(), reauth);
+        let target = device(51);
+        plain_grant(&route, &target);
+        let mut io = Script::new(true, &[]);
+        administrator_form(&paths, &route, target, None, &mut io)
+            .await
+            .unwrap();
+        assert_eq!(
+            io.err[0],
+            tornect_core::levels::ADMINISTRATOR_WARNING.replace("<device>", &target.fingerprint())
+        );
+        assert!(
+            guard_of(&route)
+                .store()
+                .grant(&target)
+                .unwrap()
+                .holds_level()
+        );
+        assert_eq!(io.out.len(), 2, "the password and its line: {:?}", io.out);
+    }
+
+    /// D4 (decision M1-67): the plain `grant` and `set-password` register a chosen
+    /// password, never as generated and never raising. Each asks the plain dialog;
+    /// a plain password change leaves the password marked, of a grant at reach 0
+    /// and of one at the level alike; a new Control grant that would reach the
+    /// level is refused `G_NEEDS_PASSWORD`, nothing written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_plain_forms_send_a_chosen_password_and_no_raise() {
+        const CHOSEN: &str = "quiet verdant otter lantern zephyr";
+        let chosen = || zeroize::Zeroizing::new(CHOSEN.to_owned());
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let (paths, route) = admin_route(&tmp, windows_admin(), reauth.clone());
+        let store = guard_of(&route).store();
+        let (plain, admin, newcomer) = (device(48), device(49), device(50));
+        // a grant at reach 0: the plain dialog, the chosen password, still marked
+        plain_grant(&route, &plain);
+        let asked = reauth.calls().len();
+        register_with(&paths, &route, plain, None, false, chosen())
+            .await
+            .unwrap();
+        assert_eq!(reauth.calls()[asked..], ["reg_start".to_owned()]);
+        assert!(store.grant(&plain).unwrap().marked());
+        assert!(logs_in(&paths, &route, &plain, CHOSEN));
+        // a grant at the level (generated, so unmarked): a plain change marks it
+        let mut io = Script::new(true, &[Some("n\n")]);
+        administrator_form(
+            &paths,
+            &route,
+            admin,
+            Some((Preset::HeadlessBox, false)),
+            &mut io,
+        )
+        .await
+        .unwrap();
+        assert!(!store.grant(&admin).unwrap().marked());
+        let asked = reauth.calls().len();
+        register_with(&paths, &route, admin, None, false, chosen())
+            .await
+            .unwrap();
+        assert_eq!(reauth.calls()[asked..], ["reg_start".to_owned()]);
+        let after = store.grant(&admin).unwrap();
+        assert!(after.holds_level() && after.marked(), "{after:?}");
+        // a new Control grant, where control now reaches the level: refused
+        let asked = reauth.calls().len();
+        let err = register_with(
+            &paths,
+            &route,
+            newcomer,
+            Some(Preset::HeadlessBox),
+            false,
+            chosen(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("(0x{:04x})", codes::G_NEEDS_PASSWORD)),
+            "{err:#}"
+        );
+        assert_eq!(reauth.calls()[asked..], ["reg_start".to_owned()]);
+        assert!(store.grant(&newcomer).is_none(), "nothing written");
     }
 
     /// §B.8.7.1 ⑤a: a *Change password* whose prompt is cancelled keeps that
