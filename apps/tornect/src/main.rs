@@ -85,6 +85,13 @@ struct Cli {
     #[arg(long, global = true, value_name = "MODE", value_parser = parse_bridge_mode)]
     bridges: Option<BridgeMode>,
 
+    /// Start the window minimised, as the start at sign-in does: unattended
+    /// sessions wait until its sharing indicator has been shown, and a
+    /// request raises the window. If Tornect already runs for this home, end
+    /// at once. Takes no subcommand.
+    #[arg(long)]
+    background: bool,
+
     /// Without a subcommand, the window opens (`tornect gui`).
     #[command(subcommand)]
     command: Option<Command>,
@@ -516,8 +523,15 @@ fn main() -> anyhow::Result<()> {
     };
 
     let Some(command) = cli.command else {
-        // A second launch raises the running window instead (§B.1.1).
-        if second_launch_shown(&paths) {
+        if cli.background {
+            // The start at sign-in (§B.1.1): with a Tornect host running here
+            // it ends at once and asks that host nothing, so a window someone
+            // minimised stays minimised.
+            if background_already_running(&paths) {
+                return Ok(());
+            }
+        } else if second_launch_shown(&paths) {
+            // A second launch raises the running window instead (§B.1.1).
             return Ok(());
         }
         return ui::run(
@@ -532,8 +546,13 @@ fn main() -> anyhow::Result<()> {
                 sheet: None,
                 theme: egui::Theme::Dark,
             },
+            cli.background,
         );
     };
+    anyhow::ensure!(
+        !cli.background,
+        "--background starts the window minimised; it takes no subcommand"
+    );
     match command {
         Command::Gui {
             capture,
@@ -562,6 +581,7 @@ fn main() -> anyhow::Result<()> {
                         Some(ThemeArg::Dark) | None => egui::Theme::Dark,
                     },
                 },
+                false,
             )
         }
         Command::Id { json } => cmd_id(&paths, json),
@@ -664,6 +684,13 @@ async fn shown_by_the_running_host(paths: &Paths) -> bool {
         tokio::time::timeout(SHOW_WAIT, tornect_platform::ipc::request(&paths.state_dir, &req)).await,
         Ok(Ok(resp)) if resp.ok
     )
+}
+
+/// A `--background` launch (the start at sign-in, §B.1.1) that finds a
+/// Tornect host running for these directories: it ends at once, with exit
+/// code 0, and sends that host nothing (no `Show`).
+fn background_already_running(paths: &Paths) -> bool {
+    host::HostLock::holder(paths).is_some()
 }
 
 /// [`shown_by_the_running_host`], on a runtime of its own (before the
@@ -1073,6 +1100,37 @@ mod tests {
         );
         let first = host_in(tmp.path(), None).await;
         assert!(!super::shown_by_the_running_host(&paths).await, "refused");
+        drop(first);
+    }
+
+    /// §B.1.1: a `--background` launch (the start at sign-in) parses with no
+    /// subcommand, after `--home` too; with a Tornect host running here it
+    /// ends at once and sends it nothing, so no `Show` raises a window someone
+    /// minimised; with nothing running its window opens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_with_a_running_host_exits_quietly() {
+        let cli = super::Cli::try_parse_from(["tornect", "--background"]).unwrap();
+        assert!(cli.background && cli.command.is_none());
+        let cli =
+            super::Cli::try_parse_from(["tornect", "--home", "/srv/t", "--background"]).unwrap();
+        assert!(cli.background && cli.command.is_none());
+        assert!(!super::Cli::try_parse_from(["tornect"]).unwrap().background);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = tornect_core::Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        assert!(!super::background_already_running(&paths), "nothing runs");
+        let asked = Arc::new(AtomicUsize::new(0));
+        let first = {
+            let asked = Arc::clone(&asked);
+            first_instance(&paths, move |req| {
+                asked.fetch_add(1, Ordering::SeqCst);
+                async move { IpcResponse::ok(req.id) }
+            })
+            .await
+        };
+        assert!(super::background_already_running(&paths));
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "nothing sent: no Show");
         drop(first);
     }
 
