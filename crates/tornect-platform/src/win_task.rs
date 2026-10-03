@@ -71,6 +71,16 @@ impl Scheduler {
 }
 
 impl HelperTasks for Scheduler {
+    /// Not `query`'s reading, which takes every failure for no task (right for a
+    /// registration's read-back): the Task Scheduler's `GetTask`, absent only on its
+    /// "not found" (decision M1-67: a presence that cannot be read counts as
+    /// registered).
+    fn exists(&self) -> Result<bool, AutostartError> {
+        let hr = get_task(&self.name)
+            .map_err(|e| AutostartError::Failed(format!("asking the Task Scheduler: {e}")))?;
+        crate::helper_task::exists_from_get_task(hr)
+    }
+
     fn query(&self) -> Result<Option<String>, AutostartError> {
         let out = self.quiet(&["/Query", "/TN", &self.name, "/XML"])?;
         let text = crate::autostart::decode_console_output(&out.stdout);
@@ -414,6 +424,54 @@ fn run_task(name: &str, arg: &str) -> std::io::Result<()> {
         check(hr, "running the helper task")?;
         drop(Com(running));
         Ok(())
+    })();
+    if com >= 0 {
+        // SAFETY: balances the successful `CoInitializeEx`.
+        unsafe { CoUninitialize() };
+    }
+    result
+}
+
+/// The HRESULT of `ITaskFolder::GetTask` for the task `name` in the root folder, the
+/// task released at once; an error only when the scheduler cannot be asked.
+fn get_task(name: &str) -> std::io::Result<Hresult> {
+    // SAFETY: plain call; balanced below when it succeeds.
+    let com = unsafe { CoInitializeEx(null(), COINIT_MULTITHREADED as u32) };
+    let result = (|| {
+        let mut service: *mut c_void = null_mut();
+        // SAFETY: the CLSID and IID are the Task Scheduler's; `service`
+        // receives an ITaskService pointer on success.
+        let hr = unsafe {
+            CoCreateInstance(
+                &CLSID_TASK_SCHEDULER,
+                null_mut(),
+                CLSCTX_INPROC_SERVER,
+                &IID_ITASK_SERVICE,
+                &mut service,
+            )
+        };
+        check(hr, "creating the Task Scheduler service")?;
+        let service = Com(service);
+        // SAFETY: `service` is an ITaskService.
+        let vt = unsafe { service.vtbl::<TaskServiceVtbl>() };
+        // SAFETY: the local computer and the current user: four empty VARIANTs.
+        let hr = unsafe { (vt.connect)(service.0, EMPTY, EMPTY, EMPTY, EMPTY) };
+        check(hr, "connecting to the Task Scheduler")?;
+        let root = Bstr::new("\\")?;
+        let mut folder: *mut c_void = null_mut();
+        // SAFETY: `root` is a BSTR alive for the call; `folder` receives an
+        // ITaskFolder.
+        let hr = unsafe { (vt.get_folder)(service.0, root.0, &mut folder) };
+        check(hr, "opening the task folder")?;
+        let folder = Com(folder);
+        let task_name = Bstr::new(name)?;
+        let mut task: *mut c_void = null_mut();
+        // SAFETY: `folder` is an ITaskFolder; `task` receives an IRegisteredTask
+        // on success and stays null otherwise.
+        let hr =
+            unsafe { (folder.vtbl::<TaskFolderVtbl>().get_task)(folder.0, task_name.0, &mut task) };
+        drop(Com(task));
+        Ok(hr)
     })();
     if com >= 0 {
         // SAFETY: balances the successful `CoInitializeEx`.
