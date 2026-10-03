@@ -33,6 +33,11 @@ pub struct Facts {
     /// The window host is running, which shows the indicator; `false` for the
     /// terminal host.
     pub window: bool,
+    /// A window host started in background mode (§B.1.1): whether this
+    /// process drew its sharing indicator's window (`Some(true)`), or has not,
+    /// yet or at all (`Some(false)`). `None` for a host started otherwise,
+    /// whose row follows [`Self::window`].
+    pub indicator_drawn: Option<bool>,
     /// Some grant holds the administrator level (Windows).
     pub admin_grant: bool,
     /// The administrator helper task (Windows).
@@ -79,14 +84,7 @@ pub fn rows(facts: &Facts) -> ReadinessSnapshot {
         KeyState::Bound => Probe::Ok,
         state @ (KeyState::NotTried | KeyState::Unavailable) => Probe::Fail(state.row().to_owned()),
     };
-    snap.consent_indicator = if facts.window {
-        Probe::Ok
-    } else {
-        Probe::Warn(
-            "no window: the sharing indicator is this terminal's lines, not a window on top"
-                .to_owned(),
-        )
-    };
+    snap.consent_indicator = indicator_row(facts.window, facts.indicator_drawn);
     snap.admin_helper = match (facts.admin_grant, facts.helper) {
         (false, _) => Probe::Ok,
         (true, HelperPresence::Registered) => Probe::Ok,
@@ -102,6 +100,30 @@ pub fn rows(facts: &Facts) -> ReadinessSnapshot {
     snap
 }
 
+/// What the row "indicator shown" says while a window host started in
+/// background mode has not drawn its sharing indicator's window (§B.1.1).
+pub const INDICATOR_NOT_SHOWN: &str = "not shown yet: Tornect started in the background and has \
+     not drawn its sharing indicator yet, so it refuses unattended sessions until it has";
+
+/// The row "indicator shown" (§B.8.7.1 ⑥, §B.1.1). Outside background mode
+/// (`background` is `None`) the window host's indicator is a window on top and
+/// the terminal host's is its terminal's lines. In background mode it passes
+/// once this process drew its indicator's window, and warns until then; the
+/// host's own gate refuses unattended sessions meanwhile, as this row alone
+/// never does (§B.8.14).
+#[must_use]
+pub fn indicator_row(window: bool, background: Option<bool>) -> Probe {
+    match background {
+        Some(true) => Probe::Ok,
+        Some(false) => Probe::Warn(INDICATOR_NOT_SHOWN.to_owned()),
+        None if window => Probe::Ok,
+        None => Probe::Warn(
+            "no window: the sharing indicator is this terminal's lines, not a window on top"
+                .to_owned(),
+        ),
+    }
+}
+
 /// Read the facts of this computer for a host whose home is `state_dir`.
 #[must_use]
 pub fn facts_now(
@@ -109,6 +131,7 @@ pub fn facts_now(
     restore_token: &Path,
     file_keystore: bool,
     window: bool,
+    indicator_drawn: Option<bool>,
     admin_grant: bool,
 ) -> Facts {
     let _ = state_dir;
@@ -119,6 +142,7 @@ pub fn facts_now(
         auto_login: auto_login(),
         panic_key: crate::hotkey::state(),
         window,
+        indicator_drawn,
         admin_grant,
         helper: if admin_grant {
             crate::helper_task::presence_now()
@@ -175,6 +199,7 @@ mod tests {
             auto_login: Some(true),
             panic_key: KeyState::Bound,
             window: true,
+            indicator_drawn: None,
             admin_grant: false,
             helper: HelperPresence::Absent,
         }
@@ -254,6 +279,7 @@ mod tests {
                             auto_login: Some(false),
                             panic_key,
                             window: false,
+                            indicator_drawn: None,
                             admin_grant: true,
                             helper,
                         });
@@ -261,6 +287,41 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// §B.1.1: only a window host started in background mode reads the row
+    /// "indicator shown" from its indicator's first frame. A window started
+    /// by hand keeps the row as before (its window is up, with its banner),
+    /// and so does the terminal host; a background start that has not drawn
+    /// its indicator warns with its own text, never the terminal's. None of
+    /// these rows refuses a session by itself (§B.8.14).
+    #[test]
+    fn a_window_started_by_hand_keeps_its_indicator_row() {
+        let by_hand = rows(&facts());
+        assert_eq!(by_hand.consent_indicator, Probe::Ok);
+        assert_eq!(indicator_row(true, None), Probe::Ok);
+        let terminal = indicator_row(false, None);
+        assert_eq!(
+            terminal,
+            Probe::Warn(
+                "no window: the sharing indicator is this terminal's lines, not a window on top"
+                    .to_owned()
+            )
+        );
+
+        let mut f = facts();
+        f.indicator_drawn = Some(false);
+        let pending = rows(&f).consent_indicator;
+        assert_eq!(pending, Probe::Warn(INDICATOR_NOT_SHOWN.to_owned()));
+        assert_ne!(pending, terminal, "not the terminal's text");
+        f.window = false;
+        assert_eq!(rows(&f).consent_indicator, pending, "the fact decides");
+        f.indicator_drawn = Some(true);
+        assert_eq!(rows(&f).consent_indicator, Probe::Ok);
+        for drawn in [None, Some(false), Some(true)] {
+            f.indicator_drawn = drawn;
+            assert_eq!(rows(&f).host_not_ready_cause(), None);
         }
     }
 

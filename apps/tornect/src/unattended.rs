@@ -69,17 +69,25 @@ pub struct HostContext {
     /// before its control channel starts; `None` on a host without a window,
     /// which refuses `Show`.
     pub show: Option<ShowHook>,
+    /// The "indicator shown" fact of a window host started in background mode
+    /// (§B.1.1), which its readiness row is read from; `None` on every other
+    /// host and on the offline route.
+    pub indicator: Option<crate::host::IndicatorShown>,
 }
 
 impl HostContext {
     /// The readiness report as of now: the static rows plus the probed ones
     /// (`autostart`, read from the OS on every request, so an install or a
-    /// removal made outside Tornect shows at once).
+    /// removal made outside Tornect shows at once), and in background mode
+    /// "indicator shown", from its fact.
     #[must_use]
     pub fn readiness_now(&self) -> ReadinessSnapshot {
         let mut snap = self.readiness.get();
         snap.autostart = autostart::readiness_probe(&self.autostart.status());
         snap.panic_key = panic_key_probe(tornect_platform::hotkey::state());
+        if let Some(shown) = &self.indicator {
+            snap.consent_indicator = shown.row();
+        }
         snap
     }
 
@@ -596,6 +604,7 @@ pub(crate) fn test_context(home: &std::path::Path, show: Option<ShowHook>) -> Ho
         log,
         facts,
         show,
+        indicator: None,
     }
 }
 
@@ -1022,6 +1031,7 @@ fn context(
         log,
         facts,
         show: None,
+        indicator: None,
     })
 }
 
@@ -2585,6 +2595,7 @@ mod tests {
                 log,
                 facts: Arc::new(tornect_core::levels::FixedFacts::linux()),
                 show: None,
+                indicator: None,
             },
             autostart,
         }
@@ -3057,6 +3068,7 @@ mod tests {
             log: allow.ctx.log.clone(),
             facts: Arc::new(tornect_core::levels::FixedFacts::linux()),
             show: None,
+            indicator: None,
         };
         let resp = go(&ctx, IpcOp::Off);
         assert!(
@@ -3775,6 +3787,7 @@ mod tests {
                 tornect_core::levels::HelperPresence::Absent,
             )),
             show: None,
+            indicator: None,
         };
         assert!(go(&ctx, IpcOp::On).ok);
         (paths, Route::Offline(Box::new(ctx)))
@@ -4283,6 +4296,7 @@ mod tests {
             log,
             facts: Arc::clone(&facts) as Arc<dyn FactsSource>,
             show: None,
+            indicator: None,
         };
         assert!(go(&ctx, IpcOp::On).ok);
         LevelEnv {
@@ -4349,6 +4363,7 @@ mod tests {
                 log: self.ctx.log.clone(),
                 facts: Arc::clone(&self.facts) as Arc<dyn FactsSource>,
                 show: None,
+                indicator: None,
             }
         }
 
