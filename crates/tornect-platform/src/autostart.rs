@@ -166,9 +166,20 @@ pub trait Autostart: Send + Sync {
     fn manual_removal(&self) -> String;
 
     /// A line for `status` about an older registration this backend replaces
-    /// and still finds; `None` when there is none.
+    /// and still finds, or could not check; `None` when there is none.
     fn older(&self) -> Option<String> {
         None
+    }
+
+    /// Whether this backend has no mechanism here at all, so that nothing of
+    /// its kind can be registered and its `Unavailable` is a definite "not
+    /// registered" ([`NoAutostart`]). `false` for a backend whose
+    /// `Unavailable` may hide a registration it could not read, such as a
+    /// systemd user unit whose manager does not answer: a backend replacing
+    /// it never takes that answer for absent (decision M1-53 (6): a failed
+    /// query means "not registered" only beside a definite not-found).
+    fn no_mechanism(&self) -> bool {
+        false
     }
 }
 
@@ -265,6 +276,10 @@ impl Autostart for NoAutostart {
 
     fn manual_removal(&self) -> String {
         "there is no start-at-login registration to remove here".to_owned()
+    }
+
+    fn no_mechanism(&self) -> bool {
+        true
     }
 }
 
@@ -1003,7 +1018,10 @@ fn config_home() -> Result<PathBuf, AutostartError> {
 /// both, the unit's host would take this home's lock at login before the
 /// window. So `install` removes such a unit before it writes the entry,
 /// `uninstall` removes both, and [`Autostart::older`] names a unit still
-/// present.
+/// present. A unit that cannot be checked (no user manager answers, or the
+/// query fails) is never taken for absent: `install` then writes no entry,
+/// `uninstall` removes the entry and fails, both with the reason and the
+/// manual removal, and `status` passes the reason on.
 pub struct XdgAutostart {
     entry_dir: PathBuf,
     spec: LaunchSpec,
@@ -1060,9 +1078,28 @@ impl XdgAutostart {
         self.entry_dir.join(XDG_ENTRY)
     }
 
-    /// Whether the registration this backend replaces is still there.
-    fn older_present(&self) -> bool {
-        matches!(self.older.status(), Ok(AutostartState::Registered(_)))
+    /// What is known of the registration this backend replaces: present or
+    /// absent only on a definite answer (decision M1-53 (6)).
+    fn older_state(&self) -> Older {
+        match self.older.status() {
+            Ok(AutostartState::Registered(_)) => Older::Present,
+            Ok(AutostartState::Absent) => Older::Absent,
+            Ok(AutostartState::Unavailable(_)) if self.older.no_mechanism() => Older::Absent,
+            Ok(AutostartState::Unavailable(why)) => Older::Unknown(why),
+            Err(e) => Older::Unknown(e.to_string()),
+        }
+    }
+
+    /// What `older`, a refused `install` and a failed `uninstall` say, after
+    /// "the", of a registration that could not be checked. The manual
+    /// removal comes before the reason: an answer through the host is cut
+    /// at the wire's string bound.
+    fn older_unchecked(&self, why: &str) -> String {
+        format!(
+            "older start at login ({UNIT_NAME}) could not be checked; if it is still registered, \
+             {} ({why})",
+            self.older.manual_removal()
+        )
     }
 
     /// Write the entry atomically: a new temporary file beside it (never one
@@ -1092,6 +1129,16 @@ impl XdgAutostart {
     }
 }
 
+/// What an [`XdgAutostart`] knows of the registration it replaces.
+enum Older {
+    /// Registered.
+    Present,
+    /// Not registered, a definite answer.
+    Absent,
+    /// It could not be checked, for this reason.
+    Unknown(String),
+}
+
 impl Autostart for XdgAutostart {
     fn preflight(&self, elevated: bool) -> Result<(), AutostartError> {
         if elevated {
@@ -1109,8 +1156,17 @@ impl Autostart for XdgAutostart {
         let text = xdg_entry_text(&self.spec)?;
         // The headless host's unit goes first: kept, its host would hold
         // this home's lock at login before the window.
-        if self.older_present() {
-            self.older.uninstall()?;
+        match self.older_state() {
+            Older::Present => {
+                self.older.uninstall()?;
+            }
+            Older::Absent => {}
+            Older::Unknown(why) => {
+                return Err(AutostartError::Failed(format!(
+                    "the {}",
+                    self.older_unchecked(&why)
+                )));
+            }
         }
         self.write_entry(&text)?;
         self.status()
@@ -1128,8 +1184,17 @@ impl Autostart for XdgAutostart {
                 )));
             }
         }
-        if self.older_present() {
-            self.older.uninstall()?;
+        match self.older_state() {
+            Older::Present => {
+                self.older.uninstall()?;
+            }
+            Older::Absent => {}
+            Older::Unknown(why) => {
+                return Err(AutostartError::Failed(format!(
+                    "the {}",
+                    self.older_unchecked(&why)
+                )));
+            }
         }
         self.status()
     }
@@ -1138,9 +1203,16 @@ impl Autostart for XdgAutostart {
         match std::fs::read_to_string(self.entry_path()) {
             Ok(text) => Ok(AutostartState::Registered(entry_registration(&text))),
             // No entry: what starts at login, if anything, is the older unit.
+            // What could not be learned of it is passed on, never `Absent`;
+            // its `Unavailable` as an error, because this backend has its
+            // mechanism and only the older one's answer is missing (the
+            // removal routes then treat it as possibly registered).
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => match self.older.status() {
-                Ok(AutostartState::Registered(r)) => Ok(AutostartState::Registered(r)),
-                _ => Ok(AutostartState::Absent),
+                Ok(AutostartState::Unavailable(_)) if self.older.no_mechanism() => {
+                    Ok(AutostartState::Absent)
+                }
+                Ok(AutostartState::Unavailable(why)) => Err(AutostartError::Unavailable(why)),
+                answer => answer,
             },
             Err(e) => Err(AutostartError::Failed(format!(
                 "reading {}: {e}",
@@ -1150,7 +1222,7 @@ impl Autostart for XdgAutostart {
     }
 
     fn describe(&self) -> String {
-        if !self.entry_path().exists() && self.older_present() {
+        if !self.entry_path().exists() && !matches!(self.older_state(), Older::Absent) {
             return self.older.describe();
         }
         format!("XDG autostart entry {}", self.entry_path().display())
@@ -1158,16 +1230,20 @@ impl Autostart for XdgAutostart {
 
     fn manual_removal(&self) -> String {
         let entry = format!("delete {}", self.entry_path().display());
-        if self.older_present() {
-            format!("{entry}; {}", self.older.manual_removal())
-        } else {
-            entry
+        match self.older_state() {
+            Older::Absent => entry,
+            Older::Present | Older::Unknown(_) => {
+                format!("{entry}; {}", self.older.manual_removal())
+            }
         }
     }
 
     fn older(&self) -> Option<String> {
-        self.older_present()
-            .then(|| OLDER_UNIT_STILL_REGISTERED.to_owned())
+        match self.older_state() {
+            Older::Present => Some(OLDER_UNIT_STILL_REGISTERED.to_owned()),
+            Older::Absent => None,
+            Older::Unknown(why) => Some(format!("The {}.", self.older_unchecked(&why))),
+        }
     }
 }
 
@@ -3552,6 +3628,29 @@ mod tests {
         present: std::sync::Mutex<bool>,
         removed: std::sync::atomic::AtomicUsize,
         fail: bool,
+        /// `Some`: `status` cannot tell, whatever `present` says.
+        unchecked: Option<Unchecked>,
+    }
+
+    /// How a unit of earlier versions that cannot be asked answers `status`,
+    /// as the real one does: no user manager answers (`Unavailable`), or
+    /// `systemctl` could not run (an error).
+    #[derive(Debug, Clone, Copy)]
+    enum Unchecked {
+        Unavailable,
+        Error,
+    }
+
+    impl Unchecked {
+        const BOTH: [Self; 2] = [Self::Unavailable, Self::Error];
+
+        /// The reason the fake gives.
+        fn reason(self) -> &'static str {
+            match self {
+                Self::Unavailable => "no systemd user manager answers (Failed to connect to bus)",
+                Self::Error => "running /usr/bin/systemctl: Permission denied",
+            }
+        }
     }
 
     impl FakeOlder {
@@ -3595,6 +3694,15 @@ mod tests {
         }
 
         fn status(&self) -> Result<AutostartState, AutostartError> {
+            match self.unchecked {
+                Some(how @ Unchecked::Unavailable) => {
+                    return Ok(AutostartState::Unavailable(how.reason().to_owned()));
+                }
+                Some(how @ Unchecked::Error) => {
+                    return Err(AutostartError::Failed(how.reason().to_owned()));
+                }
+                None => {}
+            }
             Ok(if *self.present.lock().unwrap() {
                 AutostartState::Registered(Registration {
                     enabled: true,
@@ -3849,6 +3957,115 @@ mod tests {
         assert_eq!(entry.older().as_deref(), Some(OLDER_UNIT_STILL_REGISTERED));
         older.set_present(false);
         assert!(entry.older().is_none());
+    }
+
+    /// Decision M1-53 (6)'s rule for the unit of earlier versions: only a
+    /// definite answer means it is not registered. A unit that cannot be
+    /// asked (no user manager answers, or `systemctl` cannot run), here one
+    /// that is still enabled, is never taken for absent: `install` writes no
+    /// entry beside it, and `uninstall` removes the entry, then fails; both
+    /// give the reason and the manual removal, and neither touches the unit.
+    #[test]
+    fn install_and_uninstall_stop_at_an_old_unit_that_cannot_be_checked() {
+        for how in Unchecked::BOTH {
+            let tmp = tempfile::tempdir().unwrap();
+            let older = Arc::new(FakeOlder {
+                unchecked: Some(how),
+                ..FakeOlder::present()
+            });
+            let entry = xdg(tmp.path(), "/usr/bin/tornect", &older);
+            let says_why = |said: &str| {
+                assert!(said.contains("could not be checked"), "{how:?}: {said}");
+                assert!(said.contains(how.reason()), "{how:?}: {said}");
+                assert!(
+                    said.contains("systemctl --user disable --now tornect-host.service"),
+                    "{how:?}: {said}"
+                );
+            };
+            match entry.install(false) {
+                Err(e) => says_why(&e.to_string()),
+                Ok(state) => panic!("{how:?}: installed beside the unit: {state:?}"),
+            }
+            assert!(!entry.entry_path().exists(), "{how:?}: an entry beside it");
+
+            std::fs::create_dir_all(tmp.path().join("autostart")).unwrap();
+            std::fs::write(
+                entry.entry_path(),
+                xdg_entry_text(&spec("/usr/bin/tornect", None)).unwrap(),
+            )
+            .unwrap();
+            match entry.uninstall() {
+                Err(e) => says_why(&e.to_string()),
+                Ok(state) => panic!("{how:?}: removed, said {state:?}, the unit stays"),
+            }
+            assert!(!entry.entry_path().exists(), "{how:?}: the entry stayed");
+            match entry.uninstall() {
+                Err(e) => says_why(&e.to_string()),
+                Ok(state) => panic!("{how:?}: nothing to remove, said {state:?}"),
+            }
+            assert_eq!(older.uninstalls(), 0, "{how:?}: the unit was asked");
+        }
+    }
+
+    /// What `status` could not learn it passes on: with no entry and a unit
+    /// of earlier versions that cannot be asked, the answer is the unit's
+    /// reason as an error, never `Absent`, so the readiness row never says
+    /// "not registered"; it is described as the unit. Beside an entry too,
+    /// `older` says that the unit could not be checked, and the manual
+    /// removal names it.
+    #[test]
+    fn an_old_unit_that_cannot_be_checked_is_never_reported_absent() {
+        for how in Unchecked::BOTH {
+            let tmp = tempfile::tempdir().unwrap();
+            let older = Arc::new(FakeOlder {
+                unchecked: Some(how),
+                ..FakeOlder::default()
+            });
+            let entry = xdg(tmp.path(), "/usr/bin/tornect", &older);
+            let status = entry.status();
+            match (&status, how) {
+                (Err(AutostartError::Unavailable(why)), Unchecked::Unavailable)
+                | (Err(AutostartError::Failed(why)), Unchecked::Error) => {
+                    assert_eq!(why, how.reason());
+                }
+                other => panic!("{how:?}: {other:?}"),
+            }
+            match readiness_probe(&status) {
+                Probe::Warn(m) => {
+                    assert!(m.contains(how.reason()), "{how:?}: {m}");
+                    assert!(!m.contains("not registered"), "{how:?}: {m}");
+                }
+                other => panic!("{how:?}: {other:?}"),
+            }
+            assert!(
+                entry.describe().contains("tornect-host.service"),
+                "{how:?}: {}",
+                entry.describe()
+            );
+            for with_entry in [false, true] {
+                if with_entry {
+                    std::fs::create_dir_all(tmp.path().join("autostart")).unwrap();
+                    std::fs::write(
+                        entry.entry_path(),
+                        xdg_entry_text(&spec("/usr/bin/tornect", None)).unwrap(),
+                    )
+                    .unwrap();
+                    assert!(matches!(entry.status(), Ok(AutostartState::Registered(_))));
+                }
+                let said = entry.older().unwrap_or_default();
+                assert!(
+                    said.contains("could not be checked") && said.contains(how.reason()),
+                    "{how:?}, entry {with_entry}: {said:?}"
+                );
+                assert!(
+                    entry
+                        .manual_removal()
+                        .contains("systemctl --user disable --now tornect-host.service"),
+                    "{how:?}, entry {with_entry}: {}",
+                    entry.manual_removal()
+                );
+            }
+        }
     }
 
     /// §B.1.1: nothing registers the headless host at sign-in any more: the

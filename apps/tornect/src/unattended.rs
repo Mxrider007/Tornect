@@ -3592,6 +3592,78 @@ mod tests {
         }
     }
 
+    /// Through the running host, `service uninstall` with no autostart entry
+    /// beside a unit of earlier versions that cannot be asked (no user
+    /// manager answers, or the query fails; the Linux backend, over a fake
+    /// unit) never answers "nothing starts at login": like any registration
+    /// whose state cannot be read it goes through the guard, then fails with
+    /// the reason and the manual removal, logged as failed.
+    #[test]
+    fn service_uninstall_fails_beside_an_old_unit_that_cannot_be_checked() {
+        for (older, why) in [
+            (
+                FakeAutostart {
+                    state: std::sync::Mutex::new(Some(AutostartState::Unavailable(
+                        "no systemd user manager answers".to_owned(),
+                    ))),
+                    ..FakeAutostart::default()
+                },
+                "no systemd user manager answers",
+            ),
+            (
+                FakeAutostart {
+                    unreadable_status: Some("systemctl could not run".to_owned()),
+                    ..FakeAutostart::default()
+                },
+                "systemctl could not run",
+            ),
+        ] {
+            let reauth = Arc::new(AllowAllReAuth::default());
+            let mut env = env_with_autostart(
+                tempfile::tempdir().unwrap(),
+                Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+                Arc::new(NoSessionActivity),
+                FakeAutostart::default(),
+            );
+            let config = tempfile::tempdir().unwrap();
+            let older = Arc::new(older);
+            env.ctx.autostart = Arc::new(autostart::XdgAutostart::for_config_home(
+                config.path(),
+                LaunchSpec {
+                    exe: "/usr/bin/tornect".into(),
+                    home: None,
+                },
+                Arc::clone(&older) as Arc<dyn Autostart>,
+            ));
+            env.ctx.kill = Some(KillSwitch::new());
+            let resp = go(&env.ctx, IpcOp::ServiceUninstall);
+            assert!(!resp.ok, "{why}: {:?}", resp.detail);
+            assert_eq!(resp.code, codes::G_PRECONDITION, "{why}: {:?}", resp.detail);
+            let said = resp.detail.unwrap_or_default();
+            assert!(!said.contains("nothing starts at login"), "{said}");
+            assert!(said.contains("could not be checked"), "{said}");
+            assert!(
+                said.contains("remove it by hand as the test says"),
+                "{said}"
+            );
+            assert!(said.contains(why), "{said}");
+            assert_eq!(reauth.calls(), vec!["service_uninstall".to_owned()]);
+            assert_eq!(older.uninstalls(), 0, "{why}: the unit was asked");
+            assert_eq!(
+                autostart_lines(&env.ctx),
+                vec![
+                    (Some(Actor::Cli), Some("uninstall".to_owned()), None),
+                    (
+                        Some(Actor::Cli),
+                        Some("uninstall failed".to_owned()),
+                        Some(false)
+                    ),
+                ],
+                "{why}"
+            );
+        }
+    }
+
     /// SLICE-D D1 still holds for autostart: a host that starts while the
     /// offline command's dialog is open stops the change.
     #[test]
