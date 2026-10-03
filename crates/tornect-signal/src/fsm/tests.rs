@@ -6882,8 +6882,9 @@ where
 
 /// M1-67 A25 (p): a revoke, a disable, a suspend and a lowering of P's grant, each with
 /// P's session reserved (the change committed after the read, before the accept) and with
-/// it live, end P's session with `BYE{REVOKED}` within 1 s; another device's session goes
-/// on. On a paused clock: 1 s of the host's time, however slow the machine.
+/// it live, end P's session within 1 s, with `BYE{SUSPENDED}` for the suspend and
+/// `BYE{REVOKED}` for the others (§B.8.6.1; P5B-1); another device's session goes on. On a
+/// paused clock: 1 s of the host's time, however slow the machine.
 #[tokio::test(start_paused = true)]
 async fn a25_p_a_deny_direction_change_ends_that_devices_session_within_a_second() {
     use tornect_core::levels::{Elevation, FixedFacts, HelperPresence};
@@ -6911,6 +6912,11 @@ async fn a25_p_a_deny_direction_change_ends_that_devices_session_within_a_second
         }),
     ];
     for (case, change) in changes {
+        let expected = if case == "suspend" {
+            bye::SUSPENDED
+        } else {
+            bye::REVOKED
+        };
         for reserved in [false, true] {
             let case = format!("{case}, reserved: {reserved}");
             let tmp = tempfile::tempdir().unwrap();
@@ -6977,14 +6983,14 @@ async fn a25_p_a_deny_direction_change_ends_that_devices_session_within_a_second
             assert_eq!(
                 session.next_event(Duration::from_secs(1)).await.unwrap(),
                 Some(SessionEvent::Bye {
-                    reason: bye::REVOKED,
+                    reason: expected,
                     detail: None
                 }),
                 "{case}"
             );
             match task.await.unwrap().unwrap() {
                 HostOutcome::Session { end, .. } => {
-                    assert_eq!(end, SessionEnd::Killed(bye::REVOKED), "{case}");
+                    assert_eq!(end, SessionEnd::Killed(expected), "{case}");
                 }
                 other => panic!("{case}: {other:?}"),
             }
@@ -7280,4 +7286,240 @@ async fn ask_before_starting_names_the_administrator_level() {
         );
         assert_eq!(sink.starts.load(Ordering::SeqCst), 0);
     }
+}
+
+/// P5B-1 (§B.8.6.1): a device end carries its change's `BYE` reason, for every session and
+/// for the level alike: `REVOKED` for a revoke, a disable or a lowering, `SUSPENDED` for a
+/// suspend, `PANIC` for the panic key's; the plain end says `REVOKED`.
+#[tokio::test(start_paused = true)]
+async fn a_device_end_says_why() {
+    use tornect_core::unattended::guard::{DeviceSessionEnd, EndReason, EndScope};
+    let kill = KillSwitch::new();
+    let p = DeviceId::from_bytes([1; 32]);
+    for (reason, scope, said) in [
+        (EndReason::Revoked, EndScope::Every, bye::REVOKED),
+        (EndReason::Suspended, EndScope::Every, bye::SUSPENDED),
+        (EndReason::Panic, EndScope::Every, bye::PANIC),
+        (EndReason::Revoked, EndScope::AtTheLevel, bye::REVOKED),
+        (EndReason::Suspended, EndScope::AtTheLevel, bye::SUSPENDED),
+    ] {
+        let mut guard = kill.arm();
+        guard.watch_device(p);
+        guard.at_the_level(true);
+        kill.end_device_because(&p, scope, reason);
+        let ended = tokio::time::timeout(Duration::from_millis(100), guard.killed()).await;
+        assert_eq!(ended.ok(), Some(said), "{reason:?} {scope:?}");
+    }
+    let mut guard = kill.arm();
+    guard.watch_device(p);
+    DeviceSessionEnd::end_device(&kill, &p, EndScope::Every);
+    let ended = tokio::time::timeout(Duration::from_millis(100), guard.killed()).await;
+    assert_eq!(ended.ok(), Some(bye::REVOKED), "the plain end");
+}
+
+/// A relay that hands the client the host's frames up to and including the first of
+/// `kind`, then reads nothing more from the host: from there on the client's stream takes
+/// nothing, and a host frame larger than the host's pipe stays unwritten.
+fn stalling_relay(
+    client: DuplexStream,
+    host: DuplexStream,
+    kind: Kind,
+) -> tokio::task::JoinHandle<()> {
+    use crate::framing::{MAX_FRAME_LEN, read_frame_max};
+    tokio::spawn(async move {
+        let (mut client_rx, mut client_tx) = tokio::io::split(client);
+        let (mut host_rx, mut host_tx) = tokio::io::split(host);
+        let up = async {
+            while let Ok(Some(frame)) = read_frame_max(&mut client_rx, MAX_FRAME_LEN).await {
+                if write_frame(&mut host_tx, &frame).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let down = async {
+            while let Ok(Some(frame)) = read_frame_max(&mut host_rx, MAX_FRAME_LEN).await {
+                let last = Envelope::decode(&frame).is_ok_and(|env| env.kind == kind);
+                if write_frame(&mut client_tx, &frame).await.is_err() || last {
+                    break;
+                }
+            }
+            std::future::pending::<()>().await;
+        };
+        tokio::join!(up, down);
+    })
+}
+
+/// S5B-3, P5B-1 (D6; §B.8.6.1): R, a *My machines* control grant, revokes or suspends P
+/// while P's session is live and R's stream takes nothing after the host's PAKE reply, so
+/// the host's `ADMIN_RESULT` to R cannot be written. P's session still ends within 1 s,
+/// with `BYE{REVOKED}` or `BYE{SUSPENDED}`: the end comes from the guard's committed
+/// write, not after the answer. On a paused clock.
+#[tokio::test(start_paused = true)]
+async fn a_remote_revoke_or_suspend_ends_the_target_with_the_requester_stalled() {
+    use tornect_core::levels::FixedFacts;
+    use tornect_core::session_log::Actor;
+    use tornect_core::unattended::grant::Preset;
+    use tornect_core::unattended::ipc::GrantOptions;
+    use tornect_core::unattended::limiter::{AttemptLimiter, HostTransport};
+    use tornect_core::unattended::schedule::FixedOffset;
+
+    use crate::unattended::{GuardAdmin, UnattendedAuth};
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    for (case, op, said) in [
+        ("revoke", messages::admin_op::REVOKE, bye::REVOKED),
+        ("suspend", messages::admin_op::SUSPEND, bye::SUSPENDED),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut host, target, guard) =
+            unattended_pair_edited(tmp.path(), PW, Arc::new(FixedFacts::linux()), |_| {});
+        host.cfg.orphan_timeout = None;
+        host.cfg.idle_timeout = Duration::from_secs(30);
+        // R: a My machines control grant on the same host, in scope to revoke or suspend P
+        let requester = client_side(
+            &tmp.path().join("requester"),
+            host.identity.id(),
+            [0x55; 32],
+        );
+        let r = requester.identity.id();
+        let host_onion_pk = *host.identity.id().public_key_bytes();
+        host.trusted.pin(r, "Requester").unwrap();
+        requester
+            .known
+            .pin(host.identity.id(), "Desk of Bob", host_device_pk())
+            .unwrap();
+        guard
+            .create_grant(
+                Actor::Cli,
+                &r,
+                Preset::MyMachines,
+                &GrantOptions {
+                    waive_attended_precondition: true,
+                    ..GrantOptions::default()
+                },
+                &[0u8; 192],
+                false,
+            )
+            .unwrap();
+        let setup =
+            crate::auth::parse_server_setup(&guard.store().server_setup().unwrap()).unwrap();
+        let record = crate::auth::register_locally(
+            &setup,
+            PW,
+            r.public_key_bytes(),
+            crate::auth::identifiers(r.public_key_bytes(), &host_onion_pk),
+        )
+        .unwrap();
+        guard
+            .set_password(Actor::Cli, &r, &record, &GrantOptions::default(), false)
+            .unwrap();
+        // the host's admin authority: its guard, wired to its kill switch as the host
+        // wires it
+        let owner = owner_guard(&guard, &host);
+        host.deps.unattended = Arc::new(
+            UnattendedAuth::new(
+                AttemptLimiter::new(guard.store().clone()),
+                Arc::new(FixedOffset::utc()),
+                HostTransport::default(),
+                Arc::new(FixedFacts::linux()),
+            )
+            .with_admin_authority(Arc::new(GuardAdmin::new(owner))),
+        );
+        // P's session, live
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let ClientOutcome::Session(mut session) = connect(
+            b,
+            &target.cfg,
+            &target.identity,
+            &target.deps,
+            unattended_intent(PW, messages::mode::CONTROL, false),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{case}: {e}")) else {
+            panic!("{case}: no session");
+        };
+        session.ping().await.unwrap();
+        // R's command, its stream stalled after the host's PAKE reply
+        let (r_end, relay_client) = pipe();
+        let (relay_host, host_end) = duplex(32);
+        let answering = spawn_host(host_end, &host);
+        let _relay = stalling_relay(relay_client, relay_host, Kind::AuthChallenge);
+        let intent = client::AdminIntent {
+            password: Zeroizing::new(PW.to_owned()),
+            op,
+            device_pk: Some(*target.identity.id().public_key_bytes()),
+        };
+        let asking = tokio::spawn(async move {
+            client::admin(
+                r_end,
+                &requester.cfg,
+                &requester.identity,
+                &requester.deps,
+                &intent,
+            )
+            .await
+        });
+        assert_eq!(
+            session.next_event(Duration::from_secs(1)).await.unwrap(),
+            Some(SessionEvent::Bye {
+                reason: said,
+                detail: None
+            }),
+            "{case}"
+        );
+        assert!(
+            !answering.is_finished(),
+            "{case}: the answer to R is not written"
+        );
+        match task.await.unwrap().unwrap() {
+            HostOutcome::Session { end, .. } => {
+                assert_eq!(end, SessionEnd::Killed(said), "{case}");
+            }
+            other => panic!("{case}: {other:?}"),
+        }
+        asking.abort();
+        answering.abort();
+    }
+}
+
+/// P5B-1 (§B.8.6.1): the panic key's suspend of P's grant ends P's live session with
+/// `BYE{PANIC}`, also without the host-wide kill that comes first on the key's path.
+#[tokio::test(start_paused = true)]
+async fn the_panic_keys_suspend_ends_the_device_with_panic() {
+    use tornect_core::levels::FixedFacts;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, guard) =
+        unattended_pair_edited(tmp.path(), PW, Arc::new(FixedFacts::linux()), |_| {});
+    host.cfg.orphan_timeout = None;
+    host.cfg.idle_timeout = Duration::from_secs(30);
+    let device = client.identity.id();
+    let owner = owner_guard(&guard, &host);
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let ClientOutcome::Session(mut session) = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .unwrap() else {
+        panic!("no session");
+    };
+    session.ping().await.unwrap();
+    owner.panic(&device).unwrap();
+    assert_eq!(
+        session.next_event(Duration::from_secs(1)).await.unwrap(),
+        Some(SessionEvent::Bye {
+            reason: bye::PANIC,
+            detail: None
+        })
+    );
+    match task.await.unwrap().unwrap() {
+        HostOutcome::Session { end, .. } => assert_eq!(end, SessionEnd::Killed(bye::PANIC)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(host.deps.kill.fired(), None, "no host-wide kill");
 }
