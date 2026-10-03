@@ -874,8 +874,12 @@ where
     let host_onion_pk = cfg.host.public_key_bytes();
     let device_pk = HostSigner::public_key(identity);
 
+    // §B.8.7.2: a password is registered normalized (NFC, one space between words, a
+    // list word's hyphen read as a space), so the typed one is normalized the same
+    // way before the PAKE.
+    let password = tornect_core::unattended::password::normalize(password);
     // A fresh ClientLogin per stream: the OPRF blind must never be reused.
-    let (login, ke1) = auth::ClientLogin::start(password)
+    let (login, ke1) = auth::ClientLogin::start(&password)
         .map_err(|_| HandshakeError::Aborted("PAKE start failed"))?;
 
     let intent = asked.intent;
@@ -922,7 +926,7 @@ where
 
     let ctx = auth::context(&th_after_request, auth::SUITE_OPAQUE, intent);
     let ids = auth::identifiers(&device_pk, host_onion_pk);
-    let out = match login.finish(password, &ke2, &ctx, ids) {
+    let out = match login.finish(&password, &ke2, &ctx, ids) {
         Ok(out) => out,
         Err(_) => {
             // §B.8.4.2: the server MAC failed — either the password is wrong or
