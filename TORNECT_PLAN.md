@@ -1484,7 +1484,8 @@ runs the guard offline like any other mutation); passwords via TTY prompt, never
 operation with a generated password printed once; nothing raises the level, or turns a grant to Control where Control
 reaches it, without a new password. `grant --administrator` first prints ⑤a's warning (§B.8.7.1): until the wizard's
 Administrator step exists (M-UI-5), the command line is the only way to create an admin grant (the operator's ruling
-of 2026-10-02). When such a change makes other Control grants reach the level, the command prints
+of 2026-10-02); `set-password --administrator` prints the same warning before it raises a grant (the same ruling).
+When such a change makes other Control grants reach the level, the command prints
 the heading of the ⑤a offer (§B.8.7.1) and the devices, then asks "Give them new passwords now? [Y/n]" and runs one
 *Change password* per device. This is a new default-yes question on every platform: Enter is yes; end of input, a read
 error or an input that is not a terminal is no, and the mark applies (§B.8.6.1). The built yes/no question, which
