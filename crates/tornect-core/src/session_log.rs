@@ -129,6 +129,12 @@ pub enum SessionEvent {
     /// (§B.8.10): the host's pinned device and label, the outcome (`reason`),
     /// and for a session its id, mode and `elevation`; for a command `op`, `ok`.
     UnattendedConnect,
+    /// `tornect install` (§B.1.1; `by`): logged by the guard before the first
+    /// file is written.
+    Installed,
+    /// `tornect uninstall` (§B.1.1; `by`): logged by the guard before the first
+    /// file is removed.
+    Uninstalled,
 }
 
 /// What the client may do.
@@ -1326,6 +1332,7 @@ mod tests {
     /// §B.8.13 (r7): a `session_started` line carries `elevation` only for an
     /// administrator session, so a line at none is the line it always was;
     /// the helper's three events have their names (M-UI-3 Security F-16).
+    /// So do the two of `tornect install` and `uninstall` (§B.1.1).
     #[test]
     fn the_level_and_the_helper_events_reach_the_log() {
         use crate::levels::Elevation;
@@ -1349,6 +1356,8 @@ mod tests {
             (SessionEvent::AdminHelperStarted, "admin_helper_started"),
             (SessionEvent::AdminHelperStopped, "admin_helper_stopped"),
             (SessionEvent::AdminHelperFailed, "admin_helper_failed"),
+            (SessionEvent::Installed, "installed"),
+            (SessionEvent::Uninstalled, "uninstalled"),
         ] {
             let line = serde_json::to_string(&SessionRecord::at(0, event).reason("late")).unwrap();
             assert!(line.contains(&format!(r#""event":"{name}""#)), "{line}");
