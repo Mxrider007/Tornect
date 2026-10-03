@@ -1,11 +1,15 @@
 //! Start at login (`docs/PLAN.md` §B.8.7.5): a **user-level** registration that
-//! starts this executable after the user logs in: on Windows the window,
-//! minimised (`tornect --background`, §B.1.1), on Linux the `host` command.
+//! starts this executable's window, minimised, after the user logs in
+//! (`tornect --background`, §B.1.1, decision M1-58).
 //!
 //! | OS | Mechanism | Registered as |
 //! |---|---|---|
-//! | Linux | systemd user unit, `WantedBy=graphical-session.target` | `~/.config/systemd/user/tornect-host.service` |
+//! | Linux | XDG autostart entry, run by the desktop as the graphical session starts | `~/.config/autostart/tornect.desktop` |
 //! | Windows | Task Scheduler, a logon trigger for this user only | task `\Tornect` |
+//!
+//! The Linux entry replaces the systemd user unit `tornect-host.service` of the
+//! headless host, which earlier versions registered: installing the entry
+//! removes such a unit, and `status` names one still present.
 //!
 //! Every variant starts **after** a login: Tornect never configures auto-login,
 //! so a machine that reboots to a login screen stays offline until someone logs
@@ -20,9 +24,9 @@
 //! **Paths.** Every executable is named by an absolute path — `systemctl` from
 //! `/usr/bin` or `/bin`, `schtasks.exe` from the Windows system directory — and
 //! never looked up on `PATH`. Every path written into a registration is quoted
-//! for the reader that parses it (systemd's command-line rules, the Task
-//! Scheduler's command field); a path that cannot be quoted is refused, never
-//! written half-escaped.
+//! for the reader that parses it (the Desktop Entry rules, systemd's command-line
+//! rules, the Task Scheduler's command field); a path that cannot be quoted is
+//! refused, never written half-escaped.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -35,8 +39,17 @@ use tornect_core::unattended::readiness::Probe;
 /// The Windows Task Scheduler task, in the root folder (`\Tornect`).
 pub const TASK_NAME: &str = "Tornect";
 
-/// The systemd user unit (§B.8.7.5 names it).
+/// The systemd user unit (§B.8.7.5 names it): what earlier versions
+/// registered on Linux, now only removed.
 pub const UNIT_NAME: &str = "tornect-host.service";
+
+/// The XDG autostart entry's file name, in `~/.config/autostart/` (§B.1.1).
+pub const XDG_ENTRY: &str = "tornect.desktop";
+
+/// What `tornect service status` adds while the unit of earlier versions is
+/// still registered beside, or instead of, the autostart entry.
+pub const OLDER_UNIT_STILL_REGISTERED: &str = "An older start at login (tornect-host.service) \
+     is still registered; `tornect service install` replaces it.";
 
 /// What a registration runs: the systemd user unit `<exe> [--home <dir>] host`
 /// ([`LaunchSpec::args`]), the at-logon task the app in the background
@@ -151,6 +164,12 @@ pub trait Autostart: Send + Sync {
     /// How to remove the registration by hand, for a message ("remove it
     /// …"): what the user can do when Tornect refuses to.
     fn manual_removal(&self) -> String;
+
+    /// A line for `status` about an older registration this backend replaces
+    /// and still finds; `None` when there is none.
+    fn older(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The readiness row of §B.8.7.1 ⑥ for a [`Autostart::status`] answer.
@@ -198,8 +217,8 @@ pub fn readiness_probe(status: &Result<AutostartState, AutostartError>) -> Probe
 pub fn for_this_os(spec: LaunchSpec) -> Arc<dyn Autostart> {
     #[cfg(target_os = "linux")]
     {
-        match SystemdUserUnit::new(spec) {
-            Ok(unit) => Arc::new(unit),
+        match XdgAutostart::new(spec) {
+            Ok(entry) => Arc::new(entry),
             Err(e) => Arc::new(NoAutostart(e.to_string())),
         }
     }
@@ -853,6 +872,302 @@ impl Autostart for SystemdUserUnit {
             self.unit_name,
             self.unit_path().display()
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linux: an XDG autostart entry
+// ---------------------------------------------------------------------------
+
+/// Quote one item of a desktop entry's `Exec=` value (the Desktop Entry
+/// Specification, "The Exec key"): in double quotes, with `"`, `` ` ``, `$`
+/// and `\` escaped by a backslash and `%` written `%%` (a field code); then
+/// every backslash is doubled, because the string rules of a desktop file are
+/// undone first. Control characters (a newline included) and text that is not
+/// UTF-8 cannot be written safely and are refused.
+fn desktop_quote(item: &std::ffi::OsStr) -> Result<String, AutostartError> {
+    let s = item.to_str().ok_or_else(|| {
+        AutostartError::Unquotable(format!(
+            "{} is not valid UTF-8, which a desktop entry cannot hold",
+            item.to_string_lossy()
+        ))
+    })?;
+    if s.chars().any(char::is_control) {
+        return Err(AutostartError::Unquotable(format!(
+            "{s:?} contains a control character"
+        )));
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' | '`' | '$' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '%' => out.push_str("%%"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    Ok(out.replace('\\', "\\\\"))
+}
+
+/// The `Exec=` value of a desktop entry that runs `exe` with `args`: every item
+/// in double quotes with `"`, `` ` ``, `$` and `\` escaped and `%` written
+/// `%%`, every backslash then doubled for the file's string rules; control
+/// characters and text that is not UTF-8 refused; the executable absolute. One
+/// function for every desktop entry Tornect writes.
+pub fn desktop_exec(exe: &Path, args: &[OsString]) -> Result<String, AutostartError> {
+    if !exe.is_absolute() {
+        return Err(AutostartError::Unquotable(format!(
+            "{} is not an absolute path",
+            exe.display()
+        )));
+    }
+    let mut line = desktop_quote(exe.as_os_str())?;
+    for arg in args {
+        line.push(' ');
+        line.push_str(&desktop_quote(arg)?);
+    }
+    Ok(line)
+}
+
+/// The autostart entry `tornect service install` writes on Linux (§B.1.1):
+/// the keys `Type`, `Name` and `Exec` only, `Exec` running this executable in
+/// the background ([`LaunchSpec::app_args`]).
+pub fn xdg_entry_text(spec: &LaunchSpec) -> Result<String, AutostartError> {
+    if let Some(home) = &spec.home
+        && !home.is_absolute()
+    {
+        return Err(AutostartError::Unquotable(format!(
+            "the home {} is not an absolute path",
+            home.display()
+        )));
+    }
+    let exec = desktop_exec(&spec.exe, &spec.app_args())?;
+    Ok(format!(
+        "# Tornect: start the window minimised at sign-in (docs/PLAN.md §B.1.1).\n\
+         # Written by `tornect service install`; `tornect service uninstall` removes it.\n\
+         [Desktop Entry]\n\
+         Type=Application\n\
+         Name=Tornect\n\
+         Exec={exec}\n"
+    ))
+}
+
+/// What an autostart entry on disk says: registered, with its `Exec=` value,
+/// and not started when the desktop's own startup settings turned it off
+/// (`Hidden=true`, or GNOME's `X-GNOME-Autostart-enabled=false`).
+fn entry_registration(text: &str) -> Registration {
+    let value = |key: &str| {
+        text.lines()
+            .find_map(|l| l.trim().strip_prefix(key)?.trim_start().strip_prefix('='))
+            .map(str::trim)
+    };
+    let off =
+        value("Hidden") == Some("true") || value("X-GNOME-Autostart-enabled") == Some("false");
+    Registration {
+        enabled: !off,
+        elevated: false,
+        command: value("Exec").map(str::to_owned),
+        note: off.then(|| "it is turned off in the desktop's startup settings".to_owned()),
+        unreadable: false,
+    }
+}
+
+/// The user's configuration directory: `XDG_CONFIG_HOME` when absolute, else
+/// `HOME/.config`.
+fn config_home() -> Result<PathBuf, AutostartError> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .map(|h| h.join(".config"))
+        })
+        .ok_or_else(|| {
+            AutostartError::Unavailable(
+                "neither XDG_CONFIG_HOME nor HOME names this user's configuration directory"
+                    .to_owned(),
+            )
+        })
+}
+
+/// The Linux backend (§B.1.1, decision M1-58): an XDG autostart entry,
+/// `<configuration directory>/autostart/tornect.desktop`, which the desktop
+/// runs as the graphical session starts, with that session's environment.
+/// It replaces the systemd user unit of the headless host (`older`): with
+/// both, the unit's host would take this home's lock at login before the
+/// window. So `install` removes such a unit before it writes the entry,
+/// `uninstall` removes both, and [`Autostart::older`] names a unit still
+/// present.
+pub struct XdgAutostart {
+    entry_dir: PathBuf,
+    spec: LaunchSpec,
+    older: Arc<dyn Autostart>,
+    exe_check: fn(&Path) -> Result<(), AutostartError>,
+}
+
+impl std::fmt::Debug for XdgAutostart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("XdgAutostart")
+            .field("entry_dir", &self.entry_dir)
+            .field("spec", &self.spec)
+            .finish_non_exhaustive()
+    }
+}
+
+impl XdgAutostart {
+    /// The backend for this user: the configuration directory from
+    /// `XDG_CONFIG_HOME` (when absolute) or `HOME`, and the systemd user unit
+    /// of earlier versions as the registration it replaces.
+    pub fn new(spec: LaunchSpec) -> Result<Self, AutostartError> {
+        let config_home = config_home()?;
+        let older = SystemdUserUnit::for_config_home(&config_home, UNIT_NAME, spec.clone());
+        Ok(Self::for_config_home(&config_home, spec, Arc::new(older)))
+    }
+
+    /// The backend for an explicit configuration directory, replacing
+    /// `older` (the tests give a fake one: never the real unit).
+    #[must_use]
+    pub fn for_config_home(
+        config_home: &Path,
+        spec: LaunchSpec,
+        older: Arc<dyn Autostart>,
+    ) -> Self {
+        Self {
+            entry_dir: config_home.join("autostart"),
+            spec,
+            older,
+            exe_check: this_users_exe_location_ok,
+        }
+    }
+
+    /// The same backend with `check` as the executable's location rule (the
+    /// tests' executables live in temporary folders).
+    #[must_use]
+    pub fn with_exe_check(mut self, check: fn(&Path) -> Result<(), AutostartError>) -> Self {
+        self.exe_check = check;
+        self
+    }
+
+    /// The entry this backend writes.
+    #[must_use]
+    pub fn entry_path(&self) -> PathBuf {
+        self.entry_dir.join(XDG_ENTRY)
+    }
+
+    /// Whether the registration this backend replaces is still there.
+    fn older_present(&self) -> bool {
+        matches!(self.older.status(), Ok(AutostartState::Registered(_)))
+    }
+
+    /// Write the entry atomically: a new temporary file beside it (never one
+    /// that exists, so never through a link), then a rename over it.
+    fn write_entry(&self, text: &str) -> Result<(), AutostartError> {
+        use std::io::Write as _;
+        let io = |e: std::io::Error| {
+            AutostartError::Failed(format!("writing {}: {e}", self.entry_path().display()))
+        };
+        std::fs::create_dir_all(&self.entry_dir).map_err(io)?;
+        let tmp = self.entry_dir.join(format!(".{XDG_ENTRY}.tmp"));
+        match std::fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io(e)),
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(text.as_bytes()))
+            .map_err(io)?;
+        std::fs::rename(&tmp, self.entry_path()).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            io(e)
+        })
+    }
+}
+
+impl Autostart for XdgAutostart {
+    fn preflight(&self, elevated: bool) -> Result<(), AutostartError> {
+        if elevated {
+            return Err(AutostartError::Unavailable(
+                "there is no elevated start at login on Linux: the autostart entry runs as you"
+                    .to_owned(),
+            ));
+        }
+        xdg_entry_text(&self.spec)?;
+        (self.exe_check)(&self.spec.exe)
+    }
+
+    fn install(&self, elevated: bool) -> Result<AutostartState, AutostartError> {
+        self.preflight(elevated)?;
+        let text = xdg_entry_text(&self.spec)?;
+        // The headless host's unit goes first: kept, its host would hold
+        // this home's lock at login before the window.
+        if self.older_present() {
+            self.older.uninstall()?;
+        }
+        self.write_entry(&text)?;
+        self.status()
+    }
+
+    fn uninstall(&self) -> Result<AutostartState, AutostartError> {
+        let path = self.entry_path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(AutostartError::Failed(format!(
+                    "removing {}: {e}",
+                    path.display()
+                )));
+            }
+        }
+        if self.older_present() {
+            self.older.uninstall()?;
+        }
+        self.status()
+    }
+
+    fn status(&self) -> Result<AutostartState, AutostartError> {
+        match std::fs::read_to_string(self.entry_path()) {
+            Ok(text) => Ok(AutostartState::Registered(entry_registration(&text))),
+            // No entry: what starts at login, if anything, is the older unit.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match self.older.status() {
+                Ok(AutostartState::Registered(r)) => Ok(AutostartState::Registered(r)),
+                _ => Ok(AutostartState::Absent),
+            },
+            Err(e) => Err(AutostartError::Failed(format!(
+                "reading {}: {e}",
+                self.entry_path().display()
+            ))),
+        }
+    }
+
+    fn describe(&self) -> String {
+        if !self.entry_path().exists() && self.older_present() {
+            return self.older.describe();
+        }
+        format!("XDG autostart entry {}", self.entry_path().display())
+    }
+
+    fn manual_removal(&self) -> String {
+        let entry = format!("delete {}", self.entry_path().display());
+        if self.older_present() {
+            format!("{entry}; {}", self.older.manual_removal())
+        } else {
+            entry
+        }
+    }
+
+    fn older(&self) -> Option<String> {
+        self.older_present()
+            .then(|| OLDER_UNIT_STILL_REGISTERED.to_owned())
     }
 }
 
@@ -3228,5 +3543,334 @@ mod tests {
         assert_eq!(after.unwrap(), AutostartState::Absent);
         assert!(!unit.unit_path().exists(), "the unit file is gone");
         assert!(wants.symlink_metadata().is_err(), "nothing stays enabled");
+    }
+
+    /// The unit of earlier versions, as a fake the XDG entry replaces: never
+    /// the real one, whose `systemctl` calls would reach this user's manager.
+    #[derive(Default)]
+    struct FakeOlder {
+        present: std::sync::Mutex<bool>,
+        removed: std::sync::atomic::AtomicUsize,
+        fail: bool,
+    }
+
+    impl FakeOlder {
+        fn present() -> Self {
+            Self {
+                present: std::sync::Mutex::new(true),
+                ..Self::default()
+            }
+        }
+
+        fn set_present(&self, present: bool) {
+            *self.present.lock().unwrap() = present;
+        }
+
+        fn uninstalls(&self) -> usize {
+            self.removed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Autostart for FakeOlder {
+        fn preflight(&self, _elevated: bool) -> Result<(), AutostartError> {
+            Ok(())
+        }
+
+        fn install(&self, _elevated: bool) -> Result<AutostartState, AutostartError> {
+            Err(AutostartError::Failed(
+                "the entry never installs the unit".to_owned(),
+            ))
+        }
+
+        fn uninstall(&self) -> Result<AutostartState, AutostartError> {
+            self.removed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                return Err(AutostartError::Failed(
+                    "systemctl --user disable failed".to_owned(),
+                ));
+            }
+            self.set_present(false);
+            Ok(AutostartState::Absent)
+        }
+
+        fn status(&self) -> Result<AutostartState, AutostartError> {
+            Ok(if *self.present.lock().unwrap() {
+                AutostartState::Registered(Registration {
+                    enabled: true,
+                    command: Some("\"/usr/bin/tornect\" \"host\"".to_owned()),
+                    ..Registration::default()
+                })
+            } else {
+                AutostartState::Absent
+            })
+        }
+
+        fn describe(&self) -> String {
+            "systemd user unit /cfg/systemd/user/tornect-host.service".to_owned()
+        }
+
+        fn manual_removal(&self) -> String {
+            "remove it by hand with `systemctl --user disable --now tornect-host.service`"
+                .to_owned()
+        }
+    }
+
+    /// An XDG backend over the temporary configuration directory `dir`, for
+    /// `exe` (whose location the tests do not check: it lives nowhere real),
+    /// replacing `older`.
+    fn xdg(dir: &Path, exe: &str, older: &Arc<FakeOlder>) -> XdgAutostart {
+        XdgAutostart::for_config_home(
+            dir,
+            spec(exe, None),
+            Arc::clone(older) as Arc<dyn Autostart>,
+        )
+        .with_exe_check(|_| Ok(()))
+    }
+
+    /// §B.1.1 (decision M1-58): on Linux the start at sign-in is an XDG
+    /// autostart entry, `autostart/tornect.desktop` in the configuration
+    /// directory, with the keys `Type`, `Name` and `Exec` only, and `Exec`
+    /// runs the app in the background (with the home, absolute, when it is
+    /// not the default one). `status` reads it back and the readiness row
+    /// passes; turned off in the desktop's startup settings, it is said to be
+    /// registered but not started. There is no elevated variant.
+    #[test]
+    fn the_xdg_entry_runs_the_app_in_the_background() {
+        let tmp = tempfile::tempdir().unwrap();
+        let older = Arc::new(FakeOlder::default());
+        let entry = xdg(tmp.path(), "/opt/Tornect App/tornect", &older);
+        assert_eq!(
+            entry.entry_path(),
+            tmp.path().join("autostart").join("tornect.desktop")
+        );
+        assert_eq!(entry.status().unwrap(), AutostartState::Absent);
+        let state = entry.install(false).unwrap();
+        let text = std::fs::read_to_string(entry.entry_path()).unwrap();
+        let keys: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.starts_with('#') && l.contains('='))
+            .filter_map(|l| l.split('=').next())
+            .collect();
+        assert_eq!(keys, ["Type", "Name", "Exec"], "{text}");
+        assert!(
+            text.contains(
+                "\n[Desktop Entry]\nType=Application\nName=Tornect\n\
+                 Exec=\"/opt/Tornect App/tornect\" \"--background\"\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            state,
+            AutostartState::Registered(Registration {
+                enabled: true,
+                elevated: false,
+                command: Some("\"/opt/Tornect App/tornect\" \"--background\"".to_owned()),
+                note: None,
+                unreadable: false,
+            })
+        );
+        assert_eq!(readiness_probe(&Ok(state)), Probe::Ok);
+        assert!(
+            entry.describe().ends_with("tornect.desktop"),
+            "{}",
+            entry.describe()
+        );
+        assert!(entry.older().is_none());
+        assert!(matches!(
+            entry.preflight(true),
+            Err(AutostartError::Unavailable(_))
+        ));
+        let homed = xdg_entry_text(&spec("/usr/bin/tornect", Some("/srv/tornect home"))).unwrap();
+        assert!(
+            homed.contains(
+                "\nExec=\"/usr/bin/tornect\" \"--home\" \"/srv/tornect home\" \"--background\"\n"
+            ),
+            "{homed}"
+        );
+        assert!(xdg_entry_text(&spec("/usr/bin/tornect", Some("relative"))).is_err());
+        std::fs::write(
+            entry.entry_path(),
+            format!("{text}X-GNOME-Autostart-enabled=false\n"),
+        )
+        .unwrap();
+        match entry.status() {
+            Ok(AutostartState::Registered(r)) => {
+                assert!(!r.enabled);
+                assert_eq!(
+                    r.note.as_deref(),
+                    Some("it is turned off in the desktop's startup settings")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Every item of the entry's `Exec` value is quoted by the Desktop Entry
+    /// rules: `"`, `` ` ``, `$` and `\` escaped, `%` written `%%`, then every
+    /// backslash doubled for the file's string rules. A control character (a
+    /// newline included), text that is not UTF-8 and a relative executable
+    /// are refused.
+    #[test]
+    fn xdg_exec_items_are_quoted_or_refused() {
+        let exec = |exe: &str, args: &[&str]| {
+            desktop_exec(
+                Path::new(exe),
+                &args.iter().map(OsString::from).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            exec("/usr/bin/tornect", &["--background"]).unwrap(),
+            "\"/usr/bin/tornect\" \"--background\""
+        );
+        for (item, quoted) in [
+            ("plain", "\"plain\""),
+            ("with space", "\"with space\""),
+            ("50%", "\"50%%\""),
+            ("%f", "\"%%f\""),
+            ("say \"hi\"", "\"say \\\\\"hi\\\\\"\""),
+            ("$HOME", "\"\\\\$HOME\""),
+            ("`id`", "\"\\\\`id\\\\`\""),
+            ("a\\b", "\"a\\\\\\\\b\""),
+            ("it's;~&|<>*?#()", "\"it's;~&|<>*?#()\""),
+        ] {
+            assert_eq!(
+                exec("/usr/bin/tornect", &[item]).unwrap(),
+                format!("\"/usr/bin/tornect\" {quoted}"),
+                "{item:?}"
+            );
+        }
+        for bad in ["line\nbreak", "tab\there", "nul\0"] {
+            assert!(
+                matches!(
+                    exec("/usr/bin/tornect", &[bad]),
+                    Err(AutostartError::Unquotable(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        assert!(matches!(
+            exec("tornect", &[]),
+            Err(AutostartError::Unquotable(_))
+        ));
+        assert!(matches!(
+            exec("/opt/a\nb/tornect", &[]),
+            Err(AutostartError::Unquotable(_))
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let not_utf8 = std::ffi::OsStr::from_bytes(b"/opt/\xff/tornect");
+            assert!(matches!(
+                desktop_exec(Path::new(not_utf8), &[]),
+                Err(AutostartError::Unquotable(_))
+            ));
+        }
+    }
+
+    /// The unit of earlier versions (the headless host at login) is removed
+    /// when the entry is written, before it, so the two never start together;
+    /// a removal that fails writes no entry. With no such unit, nothing is
+    /// removed.
+    #[test]
+    fn installing_the_entry_removes_the_old_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let older = Arc::new(FakeOlder::present());
+        let entry = xdg(tmp.path(), "/usr/bin/tornect", &older);
+        assert_eq!(entry.older().as_deref(), Some(OLDER_UNIT_STILL_REGISTERED));
+        entry.install(false).unwrap();
+        assert_eq!(older.uninstalls(), 1);
+        assert!(entry.entry_path().is_file());
+        assert!(entry.older().is_none());
+        entry.install(false).unwrap();
+        assert_eq!(older.uninstalls(), 1, "nothing more to remove");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let stuck = Arc::new(FakeOlder {
+            fail: true,
+            ..FakeOlder::present()
+        });
+        let entry = xdg(tmp.path(), "/usr/bin/tornect", &stuck);
+        assert!(entry.install(false).is_err());
+        assert!(!entry.entry_path().exists(), "no entry beside the unit");
+    }
+
+    /// `uninstall` removes the entry and the unit of earlier versions; with
+    /// neither left, it removes nothing.
+    #[test]
+    fn uninstall_removes_entry_and_old_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let older = Arc::new(FakeOlder::default());
+        let entry = xdg(tmp.path(), "/usr/bin/tornect", &older);
+        entry.install(false).unwrap();
+        // An earlier version registered its unit again beside the entry.
+        older.set_present(true);
+        assert_eq!(entry.uninstall().unwrap(), AutostartState::Absent);
+        assert!(!entry.entry_path().exists());
+        assert_eq!(older.uninstalls(), 1);
+        assert_eq!(entry.uninstall().unwrap(), AutostartState::Absent);
+        assert_eq!(older.uninstalls(), 1, "nothing left to remove");
+    }
+
+    /// `status` names a unit of earlier versions still registered: alone,
+    /// where the unit is what starts at login (the headless host) and is
+    /// described as the unit; and beside the entry.
+    #[test]
+    fn status_names_an_old_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let older = Arc::new(FakeOlder::present());
+        let entry = xdg(tmp.path(), "/usr/bin/tornect", &older);
+        match entry.status() {
+            Ok(AutostartState::Registered(r)) => {
+                assert_eq!(r.command.as_deref(), Some("\"/usr/bin/tornect\" \"host\""));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            entry.describe().contains("tornect-host.service"),
+            "{}",
+            entry.describe()
+        );
+        assert_eq!(
+            entry.older().as_deref(),
+            Some(
+                "An older start at login (tornect-host.service) is still registered; `tornect \
+                 service install` replaces it."
+            )
+        );
+        assert!(entry.manual_removal().contains("systemctl --user disable"));
+        std::fs::create_dir_all(tmp.path().join("autostart")).unwrap();
+        std::fs::write(
+            entry.entry_path(),
+            xdg_entry_text(&spec("/usr/bin/tornect", None)).unwrap(),
+        )
+        .unwrap();
+        assert!(entry.describe().ends_with("tornect.desktop"));
+        assert_eq!(entry.older().as_deref(), Some(OLDER_UNIT_STILL_REGISTERED));
+        older.set_present(false);
+        assert!(entry.older().is_none());
+    }
+
+    /// §B.1.1: nothing registers the headless host at sign-in any more: the
+    /// task and the entry both run the app in the background; only
+    /// `LaunchSpec::args`, the unit of earlier versions that is now only
+    /// removed, still names `host`.
+    #[test]
+    fn no_autostart_names_the_headless_host() {
+        let task = task_xml(
+            &spec("C:\\Program Files\\Tornect\\tornect.exe", None),
+            SID,
+            false,
+        )
+        .unwrap();
+        assert_eq!(task_facts(&task).arguments.as_deref(), Some("--background"));
+        assert!(!task.contains(">host<"), "{task}");
+        let entry = xdg_entry_text(&spec("/usr/bin/tornect", Some("/srv/t"))).unwrap();
+        let exec = entry
+            .lines()
+            .find_map(|l| l.strip_prefix("Exec="))
+            .expect("an Exec line");
+        assert!(!exec.contains("\"host\""), "{exec}");
+        assert!(exec.ends_with("\"--background\""), "{exec}");
     }
 }
