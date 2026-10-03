@@ -530,10 +530,10 @@ pub fn wire(
             // Readiness as probed at the start and every 10 min (§B.8.7.1 ⑥).
             .with_readiness_feed(ctx.readiness.clone())
             .with_admin_authority(Arc::new(GuardAdmin::new(Arc::clone(&ctx.guard))))
-            // Block suspends the grant (§B.8.6.3). Only the window host has a
-            // block window with Block: the terminal host keeps the headless
-            // seams (a timer nobody can block, every "Ask before starting"
-            // denied).
+            // Block suspends the grant (§B.8.6.3). The window host and the
+            // terminal host each have a block window with Block (`wire_cli`
+            // gives the terminal's); "Ask before starting" is the window's
+            // sheet, and denied on the terminal.
             .with_block_guard(Arc::clone(&ctx.guard)),
         );
         host_cfg.feats = vec![messages::feats::UA1.to_owned()];
@@ -574,8 +574,9 @@ pub(crate) const NO_TERMINAL_LINE: &str = "warning: stdin is not a terminal, so 
      can ask you or show you a session (run `tornect host` in a terminal to answer them)";
 
 /// Wire `tornect host`, the command-line host, whose terminal (`prompter`)
-/// answers the popups and shows every session. With no terminal (`None`)
-/// nothing can ask or show, so the host answers pings only
+/// answers the popups, shows every session and runs the block window with
+/// Block ([`crate::term_block::TerminalBlockWindow`]; decision M1-68). With no
+/// terminal (`None`) nothing can ask or show, so the host answers pings only
 /// ([`HostWiring::without_unattended`]).
 pub fn wire_cli(
     paths: &Paths,
@@ -598,15 +599,21 @@ pub fn wire_cli(
                     device: tornect_core::DeviceId::from_bytes(device_pk),
                 },
             );
-            wire(
+            let mut wiring = wire(
                 paths,
                 cfg,
                 identity,
                 device_pk,
-                Arc::new(CliConsent::new(prompter).with_words(Arc::new(words))),
+                Arc::new(CliConsent::new(Arc::clone(&prompter)).with_words(Arc::new(words))),
                 media,
                 control,
-            )
+            )?;
+            // The block window with Block, on this terminal (§B.8.6.3): it
+            // goes before every question there. "Ask before starting" stays
+            // denied (`AlwaysDeny`).
+            wiring.deps.block_window =
+                Arc::new(crate::term_block::TerminalBlockWindow::new(prompter));
+            Ok(wiring)
         }
         None => Ok(wire(
             paths,
@@ -1648,6 +1655,237 @@ mod tests {
         assert!(line.contains(r#""peer_name":"Desk""#), "{line}");
         assert!(line.contains(r#""reason":"accepted""#), "{line}");
         assert!(!line.contains(&host.onion_address()), "{line}");
+    }
+
+    /// [`grant_unattended`] with `options` (a block window, say).
+    fn grant_unattended_with(
+        env: &Env,
+        device: &DeviceId,
+        password: &str,
+        options: tornect_core::unattended::ipc::GrantOptions,
+    ) {
+        use tornect_core::keystore::FileSecretStore;
+        use tornect_core::session_log::Actor;
+        use tornect_core::unattended::clock::SystemClock;
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{
+            AllowAllPaired, AllowAllReAuth, MutationGuard, NoSessionActivity,
+        };
+        use tornect_core::unattended::ipc::GrantOptions;
+        use tornect_core::unattended::store::GrantStore;
+
+        let host_onion_pk = *env.identity.id().public_key_bytes();
+        let secrets = Arc::new(FileSecretStore::open(env.paths.keys_dir()).unwrap());
+        let store = GrantStore::open(
+            &env.paths,
+            secrets,
+            Arc::new(SystemClock::default()),
+            SessionLog::new(env.paths.sessions_log()),
+        )
+        .unwrap();
+        let guard = MutationGuard::new(
+            store,
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            Arc::new(tornect_core::levels::FixedFacts::linux()),
+        )
+        .with_paired_devices(Arc::new(AllowAllPaired))
+        .with_server_setup_source(Arc::new(
+            tornect_signal::unattended::OpaqueServerSetupSource,
+        ));
+        guard.master_on(Actor::Cli, &host_onion_pk).unwrap();
+        guard
+            .create_grant(
+                Actor::Cli,
+                device,
+                Preset::HeadlessBox,
+                &options,
+                &[0u8; 192],
+                false,
+            )
+            .unwrap();
+        let setup =
+            tornect_signal::auth::parse_server_setup(&guard.store().server_setup().unwrap())
+                .unwrap();
+        let record = tornect_signal::auth::register_locally(
+            &setup,
+            password,
+            device.public_key_bytes(),
+            tornect_signal::auth::identifiers(device.public_key_bytes(), &host_onion_pk),
+        )
+        .unwrap();
+        guard
+            .set_password(Actor::Cli, device, &record, &GrantOptions::default(), false)
+            .unwrap();
+    }
+
+    /// Decision M1-68 (§B.8.6.3): the terminal host's block window is the
+    /// terminal's, with Block: `block` typed there blocks. The host with no
+    /// terminal keeps the headless seams (a timer nobody can block) and
+    /// answers pings only.
+    #[tokio::test(start_paused = true)]
+    async fn the_terminal_host_uses_the_terminal_block_window() {
+        use tornect_signal::consent::{BlockOutcome, WindowPassed};
+
+        let env = env();
+        let (prompter, typed) = Prompter::scripted();
+        let terminal = wire_cli(
+            &env.paths,
+            &Config::default(),
+            Arc::clone(&env.identity),
+            [9; 32],
+            Some(Arc::clone(&prompter)),
+            media(),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        let window = Arc::clone(&terminal.deps.block_window);
+        let running = tokio::spawn(async move { window.run(10, &[1; 8], "Laptop").await });
+        while !prompter.block_window_open() {
+            tokio::task::yield_now().await;
+        }
+        typed.send("block".to_owned()).await.unwrap();
+        assert_eq!(running.await.unwrap(), BlockOutcome::Blocked);
+        drop(terminal);
+
+        let headless = wire_cli(
+            &env.paths,
+            &Config::default(),
+            Arc::clone(&env.identity),
+            [9; 32],
+            None,
+            media(),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        assert!(headless.cfg.feats.is_empty(), "pings only");
+        assert_eq!(
+            headless.deps.block_window.run(1, &[1; 8], "Laptop").await,
+            BlockOutcome::Passed(WindowPassed::Elapsed),
+            "a timer nobody can block"
+        );
+    }
+
+    /// R-A (§B.8.6.3, PLAN:1977 and 2207): `block` typed on the terminal host's
+    /// terminal during the block window refuses the request
+    /// `BLOCKED_BY_LOCAL_USER` and suspends the grant (`LocalBlock`) before
+    /// `SESSION_ACCEPT`: no session starts, so nothing reaches the media layer
+    /// (the FSM's `block_means_no_capture`, through the real terminal host).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_block_means_no_capture() {
+        use std::sync::atomic::AtomicUsize;
+        use tornect_core::unattended::grant::{GrantState, SuspendReason};
+        use tornect_signal::fsm::HandshakeError;
+
+        /// Counts the sessions that start: a capture starts only there.
+        struct Starts {
+            inner: Arc<dyn SessionSink>,
+            started: AtomicUsize,
+        }
+
+        impl SessionSink for Starts {
+            fn on_start(&self, session: &LiveSession<'_>) {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                self.inner.on_start(session);
+            }
+
+            fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
+                self.inner.on_end(session_id, end);
+            }
+        }
+
+        const PASSWORD: &str = "quiet verdant otter lantern zephyr";
+        let env = env();
+        let host_device_pk = HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32]));
+        let (identity, ccfg, cdeps) = client(&env);
+        let device = identity.id();
+        TrustedDeviceStore::open(env.paths.trusted_devices_file())
+            .unwrap()
+            .pin(device, "Laptop")
+            .unwrap();
+        cdeps
+            .known_hosts
+            .pin(env.identity.id(), "Desk", host_device_pk)
+            .unwrap();
+        grant_unattended_with(
+            &env,
+            &device,
+            PASSWORD,
+            tornect_core::unattended::ipc::GrantOptions {
+                block_window_s: Some(10),
+                ..tornect_core::unattended::ipc::GrantOptions::default()
+            },
+        );
+        let (prompter, typed) = Prompter::scripted();
+        let mut wiring = wire_cli(
+            &env.paths,
+            &Config::default(),
+            Arc::clone(&env.identity),
+            host_device_pk,
+            Some(Arc::clone(&prompter)),
+            media(),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        let starts = Arc::new(Starts {
+            inner: Arc::clone(&wiring.deps.sessions),
+            started: AtomicUsize::new(0),
+        });
+        wiring.deps.sessions = starts.clone();
+        let request = crate::ua_client::Request {
+            password: zeroize::Zeroizing::new(PASSWORD.to_owned()),
+            view_only: false,
+            administrator: false,
+            remember: false,
+        };
+        let (client_end, host_end) = duplex(64 * 1024);
+        let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+        let host_task =
+            tokio::spawn(async move { serve_signaling(host_end, &cfg, &deps, |_| {}).await });
+        let client_task = tokio::spawn(async move {
+            connect(client_end, &ccfg, &identity, &cdeps, request.intent()).await
+        });
+        // The block line is up once the window holds the terminal.
+        let up = tokio::time::timeout(Duration::from_secs(60), async {
+            while !prompter.block_window_open() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(up.is_ok(), "the block window never opened");
+        assert_eq!(starts.started.load(Ordering::SeqCst), 0);
+        typed.send("block".to_owned()).await.unwrap();
+        let err = client_task.await.unwrap().expect_err("blocked");
+        assert!(
+            matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == reject::BLOCKED_BY_LOCAL_USER),
+            "{err}"
+        );
+        assert_eq!(host_task.await.unwrap(), Served::Handshake);
+        assert_eq!(
+            starts.started.load(Ordering::SeqCst),
+            0,
+            "no session started, so nothing was captured"
+        );
+        assert_eq!(wiring.live.count(), 0);
+        let state = wiring
+            .ctx
+            .as_ref()
+            .unwrap()
+            .guard
+            .store()
+            .grant(&device)
+            .unwrap()
+            .state;
+        assert!(
+            matches!(
+                state,
+                GrantState::Suspended {
+                    reason: SuspendReason::LocalBlock,
+                    ..
+                }
+            ),
+            "{state:?}"
+        );
     }
 
     /// Change `device`'s grant as stored in `paths`' store, keeping its generation (so the
