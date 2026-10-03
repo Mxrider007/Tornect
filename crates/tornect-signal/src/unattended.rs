@@ -39,10 +39,10 @@ use crate::auth;
 use crate::consent::{
     BlockOutcome, ChosenCaps, ConsentProof, DerivedToken, PolicyReceipt, TransportPolicy,
 };
-use crate::fsm::HandshakeError;
 use crate::fsm::host::{
     KillSwitch, StopTokenCheck, UnattendedContext, UnattendedHook, UnattendedVerdict,
 };
+use crate::fsm::{AuditEvent, HandshakeError, SuppressedPopup};
 use crate::messages::{self, AuthChallenge, SessionReject, bye, intent, mode, reject};
 
 /// Suites this build speaks (§B.8.4.2). Suite 2 (SPAKE2) is specified but not
@@ -862,6 +862,26 @@ impl UnattendedAuth {
             return Ok(UnattendedVerdict::Reject(rej));
         }
 
+        // ---- another session live: neither the popup nor the block window opens ----
+        // Either would show this device's label on a screen another device may be
+        // watching, and no session can start while that one is live (§B.8.6.2, §B.8.6.4).
+        // Logged as suppressed, as the attended popup is; the popup's request is answered
+        // `DENIED`, as a withdrawn popup is, the block window's `SESSION_ACTIVE`, as the
+        // reservation answers it.
+        if ctx.activity.session_live() {
+            ctx.audit.record(AuditEvent::PopupSuppressed {
+                device,
+                label: Some(ctx.label.to_owned()),
+                popup: SuppressedPopup::Session,
+            });
+            let reason = if grant.ask_before_start {
+                reject::DENIED
+            } else {
+                reject::SESSION_ACTIVE
+            };
+            return Ok(UnattendedVerdict::Reject(SessionReject::new(reason)));
+        }
+
         // ---- ask_before_start, then the block window ----
         let label = ctx.label;
         // The popup names the grant's level (§B.8.6.3, r7): an admin grant's
@@ -1339,6 +1359,8 @@ mod tests {
                 exchange: &mut exchange,
                 block_window: block,
                 local_allow: allow,
+                activity: &crate::fsm::host::NoSession,
+                audit: &crate::fsm::NoAudit,
             })
             .await;
         let k = client_key.lock().unwrap().clone();
@@ -1396,6 +1418,8 @@ mod tests {
                 exchange: &mut exchange,
                 block_window: &block,
                 local_allow: &allow,
+                activity: &crate::fsm::host::NoSession,
+                audit: &crate::fsm::NoAudit,
             })
             .await
             .expect("admin exchange completes")
@@ -1936,6 +1960,8 @@ mod tests {
                     exchange: &mut ex,
                     block_window: &TimerOnlyWindow,
                     local_allow: &DenyAll,
+                    activity: &crate::fsm::host::NoSession,
+                    audit: &crate::fsm::NoAudit,
                 })
                 .await
         };
@@ -2003,6 +2029,8 @@ mod tests {
                 exchange: &mut exchange,
                 block_window: &TimerOnlyWindow,
                 local_allow: &DenyAll,
+                activity: &crate::fsm::host::NoSession,
+                audit: &crate::fsm::NoAudit,
             })
             .await
             .unwrap();
@@ -2042,6 +2070,8 @@ mod tests {
                         exchange: &mut exchange,
                         block_window: &TimerOnlyWindow,
                         local_allow: &DenyAll,
+                        activity: &crate::fsm::host::NoSession,
+                        audit: &crate::fsm::NoAudit,
                     })
                     .await,
                 None::<Vec<u8>>,
