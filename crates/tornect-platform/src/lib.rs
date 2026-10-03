@@ -63,6 +63,8 @@ mod win;
 #[cfg(windows)]
 mod win_helper;
 #[cfg(windows)]
+pub mod win_notify;
+#[cfg(windows)]
 mod win_task;
 
 /// Restrict this process's run-time DLL loads that name no folder to the
