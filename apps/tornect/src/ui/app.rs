@@ -92,6 +92,15 @@ fn ask_attention(window: &impl Attention) -> bool {
     restore
 }
 
+/// Background mode (§B.1.1): the main window is minimised right after it is
+/// created; nothing asks for attention or takes the focus. Where the desktop
+/// ignores the request (GNOME on Wayland may), it is an ordinary window.
+fn start_minimised(window: &impl Attention, background: bool) {
+    if background {
+        window.set_minimized(true);
+    }
+}
+
 /// The sharing indicator's window did not open at a session. In background
 /// mode the main window is minimised, so it is brought back with the
 /// attention a question asks for, and its banner shows the session (§B.1.1);
@@ -1053,6 +1062,7 @@ impl ApplicationHandler<UserEvent> for App {
             false,
         ) {
             Ok(surface) => {
+                start_minimised(&*surface.window, self.background.is_some());
                 self.main = Some(surface);
                 self.start_probe(el);
                 self.sync_indicator(el);
@@ -1442,6 +1452,25 @@ mod tests {
                     && l.contains("unattended sessions are refused")),
             "{said:?}"
         );
+    }
+
+    /// §B.1.1: in background mode the main window is minimised as it opens,
+    /// and nothing asks for attention; a window started by hand is left as
+    /// it opens.
+    #[test]
+    fn background_starts_the_window_minimised() {
+        for (background, expected) in [(true, vec![Call::SetMinimized(true)]), (false, vec![])] {
+            let window = Recorder {
+                minimized: Some(false),
+                calls: RefCell::default(),
+            };
+            start_minimised(&window, background);
+            assert_eq!(
+                window.calls.into_inner(),
+                expected,
+                "background: {background}"
+            );
+        }
     }
 
     /// §B.1.1: in background mode, an indicator that does not open at

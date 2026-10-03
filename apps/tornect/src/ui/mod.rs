@@ -182,8 +182,10 @@ fn start(paths: &Paths, opts: &GuiOpts) -> anyhow::Result<Start> {
     })
 }
 
-/// Open the window and run until it is closed.
-pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
+/// Open the window and run until it is closed; with `background`, minimised,
+/// as the start at sign-in does (`tornect --background`, §B.1.1): unattended
+/// sessions wait until the indicator has been shown.
+pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()> {
     install_crypto_provider();
     let Start { model, real } = start(paths, &opts)?;
 
@@ -235,6 +237,9 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
         return app.error.take().map_or(Ok(()), Err);
     };
 
+    // Background mode (§B.1.1): the "indicator shown" fact that the window's
+    // probe sets and the host's gate reads.
+    let background = (background && opts.host).then(crate::host::IndicatorShown::default);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -276,13 +281,14 @@ pub fn run(paths: &Paths, opts: GuiOpts) -> anyhow::Result<()> {
             identity: Arc::new(real.identity),
             device: Arc::new(real.device),
             device_pk: real.device_pk,
-            background: None,
+            background: background.clone(),
         },
         commands_rx,
     ));
 
     let mut app = App::new(shared, popups, link, commands);
     app.theme = opts.theme;
+    app.background = background;
     if !opts.host {
         app.title = "Tornect (connect only)";
     }
