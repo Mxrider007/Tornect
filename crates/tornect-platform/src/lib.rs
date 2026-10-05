@@ -68,6 +68,8 @@ mod win;
 #[cfg(windows)]
 mod win_helper;
 #[cfg(windows)]
+pub mod win_install;
+#[cfg(windows)]
 pub mod win_notify;
 #[cfg(windows)]
 mod win_task;

@@ -268,7 +268,7 @@ const EMPTY: Variant = Variant {
     extra: 0,
 };
 
-type Hresult = i32;
+pub(crate) type Hresult = i32;
 type Release = unsafe extern "system" fn(*mut c_void) -> u32;
 
 /// IUnknown and IDispatch: the first seven slots of every vtable here.
@@ -313,14 +313,14 @@ struct RegisteredTaskVtbl {
 }
 
 /// A COM interface pointer, released on drop.
-struct Com(*mut c_void);
+pub(crate) struct Com(pub(crate) *mut c_void);
 
 impl Com {
     /// Its vtable as `T`.
     ///
     /// # Safety
     /// `T` must be this interface's vtable layout (or a prefix of it).
-    unsafe fn vtbl<T>(&self) -> &T {
+    pub(crate) unsafe fn vtbl<T>(&self) -> &T {
         // SAFETY: a COM object's first field is its vtable pointer; the
         // caller names the right layout.
         unsafe { &**(self.0 as *const *const T) }
@@ -361,7 +361,7 @@ impl Drop for Bstr {
     }
 }
 
-fn check(hr: Hresult, what: &str) -> std::io::Result<()> {
+pub(crate) fn check(hr: Hresult, what: &str) -> std::io::Result<()> {
     if hr < 0 {
         Err(std::io::Error::other(format!(
             "{what} failed: HRESULT {hr:#010x}"

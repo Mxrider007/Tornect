@@ -40,8 +40,9 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::{
-    FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_ProgramFiles, SEE_MASK_NOASYNC,
-    SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, SHGetKnownFolderPath, ShellExecuteExW,
+    FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_ProgramFiles, FOLDERID_Programs,
+    SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, SHGetKnownFolderPath,
+    ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use windows_sys::core::{BOOL, PWSTR};
@@ -168,6 +169,8 @@ pub(crate) enum KnownFolder {
     ProgramFiles,
     /// `FOLDERID_LocalAppData`: `C:\Users\<name>\AppData\Local`.
     LocalAppData,
+    /// `FOLDERID_Programs`: this user's Start-menu programs folder.
+    Programs,
 }
 
 /// A known folder of this user, from the OS (`SHGetKnownFolderPath`) rather
@@ -178,6 +181,7 @@ pub(crate) fn known_folder(which: KnownFolder) -> std::io::Result<PathBuf> {
         KnownFolder::Profile => &FOLDERID_Profile,
         KnownFolder::ProgramFiles => &FOLDERID_ProgramFiles,
         KnownFolder::LocalAppData => &FOLDERID_LocalAppData,
+        KnownFolder::Programs => &FOLDERID_Programs,
     };
     let mut path: *mut u16 = null_mut();
     // SAFETY: `id` points to a constant GUID; no flags; a null token means
