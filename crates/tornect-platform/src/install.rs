@@ -395,11 +395,21 @@ impl WindowsTarget {
     /// The target on this computer; refused when the executable's path
     /// cannot be written into the uninstall entry's command.
     pub fn of(sys: &dyn WindowsSystem) -> Result<Self, InstallError> {
+        let mut target = Self::entry_of(sys)?;
+        target.system_directory = sys.system_directory()?;
+        target.start_menu_entry = windows_join(&sys.start_menu_programs()?, START_MENU_ENTRY);
+        Ok(target)
+    }
+
+    /// The Program Files part of the target only, from `FOLDERID_ProgramFiles`
+    /// alone: the folder, the executable and the uninstall entry, with no
+    /// system folder and no Start-menu entry (left empty: the account an
+    /// elevated step runs as may not have this user's folders). What the
+    /// installed copy's own elevated steps use, and nothing else.
+    pub fn entry_of(sys: &dyn WindowsSystem) -> Result<Self, InstallError> {
         let program_files = sys.program_files()?;
-        let system_directory = sys.system_directory()?;
         let folder = windows_join(&program_files, WINDOWS_FOLDER);
         let exe = windows_join(&folder, WINDOWS_EXE);
-        let start_menu_entry = windows_join(&sys.start_menu_programs()?, START_MENU_ENTRY);
         let entry = UninstallEntry {
             key: UNINSTALL_KEY.to_owned(),
             display_name: ENTRY_NAME.to_owned(),
@@ -408,10 +418,10 @@ impl WindowsTarget {
         };
         Ok(Self {
             program_files,
-            system_directory,
+            system_directory: String::new(),
             folder,
             exe,
-            start_menu_entry,
+            start_menu_entry: String::new(),
             entry,
         })
     }
@@ -488,6 +498,54 @@ impl<'a> HeldSource<'a> {
     pub fn path(&self) -> &str {
         self.image.path()
     }
+}
+
+/// Refused unless this program, `own` (the final path of its image), is the
+/// installed copy `target.exe` as paths compare, neither that copy nor its
+/// folder is a reparse point, and the ACL check passes for both and every
+/// folder up to Program Files: the checks the installed copy makes before it
+/// changes anything as administrator.
+fn own_copy_ok(
+    sys: &dyn WindowsSystem,
+    target: &WindowsTarget,
+    own: &str,
+) -> Result<(), InstallError> {
+    if !same_path(own, &target.exe) {
+        return Err(InstallError::Refused(format!(
+            "{own} is not the installed copy {}, so it changes nothing as administrator",
+            target.exe
+        )));
+    }
+    for path in [&target.folder, &target.exe] {
+        if sys.is_reparse_point(path)? {
+            return Err(InstallError::Refused(format!(
+                "{path} is a link to another place, so the installed copy changes nothing"
+            )));
+        }
+    }
+    target.admin_only(sys, true).map_err(|why| {
+        InstallError::Refused(format!(
+            "the installed copy could be changed by accounts other than administrators \
+             ({why}), so it changes nothing"
+        ))
+    })
+}
+
+/// `tornect install-entry` (§B.1.1): the installed copy's own elevated
+/// step, the second prompt of `tornect install`. Refused unless this
+/// program, `own`, is the installed copy from the known folder, neither that
+/// copy nor its folder is a reparse point, and the ACL check passes; then
+/// `write` writes the uninstall entry of [`WindowsTarget::entry_of`],
+/// computed here, and nothing else. Nothing comes from the command line, and
+/// this user's folders are never asked.
+pub fn write_own_entry(
+    sys: &dyn WindowsSystem,
+    own: &str,
+    write: &dyn Fn(&UninstallEntry) -> Result<(), InstallError>,
+) -> Result<(), InstallError> {
+    let target = WindowsTarget::entry_of(sys)?;
+    own_copy_ok(sys, &target, own)?;
+    write(&target.entry)
 }
 
 /// What a finished install in Program Files holds.
@@ -1635,6 +1693,8 @@ mod windows_tests {
         /// Windows' list of removals at the next restart, or why it cannot
         /// be read.
         pending: RefCell<Result<Vec<String>, String>>,
+        /// This user's Start-menu folder cannot be found.
+        no_start_menu: bool,
     }
 
     fn kind(step: &Elevated) -> &'static str {
@@ -1673,6 +1733,7 @@ mod windows_tests {
                 fail: Vec::new(),
                 runner: BTreeMap::new(),
                 pending: RefCell::new(Ok(Vec::new())),
+                no_start_menu: false,
             }
         }
 
@@ -1785,6 +1846,9 @@ mod windows_tests {
         }
 
         fn start_menu_programs(&self) -> Result<String, InstallError> {
+            if self.no_start_menu {
+                return Err(InstallError::Unavailable("no Start menu here".to_owned()));
+            }
             Ok(PROGRAMS.to_owned())
         }
 
@@ -3005,5 +3069,90 @@ mod windows_tests {
             other => panic!("{other:?}"),
         }
         assert_nothing_asked(&fake, "unreadable");
+    }
+
+    /// What the installed copy's entry step was given to write.
+    type Written = RefCell<Vec<UninstallEntry>>;
+
+    /// The entry step's writer: records the entry, writes nothing.
+    fn record(written: &Written) -> impl Fn(&UninstallEntry) -> Result<(), InstallError> + '_ {
+        move |entry| {
+            written.borrow_mut().push(entry.clone());
+            Ok(())
+        }
+    }
+
+    /// The copy as the first prompt leaves it: the folder and `tornect.exe`.
+    fn copied(fake: &Fake) {
+        fake.folders.borrow_mut().insert(key(&fake.folder()));
+        fake.files
+            .borrow_mut()
+            .insert(key(&fake.exe()), PROGRAM.to_vec());
+    }
+
+    /// The installed copy's entry step changes nothing unless it is the
+    /// installed copy and passes its checks: run as this copy in Downloads
+    /// or as another program in Program Files, with the ACL check failing,
+    /// or with the folder or the copy a reparse point, nothing is written.
+    #[test]
+    fn the_entry_step_refuses_outside_program_files() {
+        for broken in [
+            "downloads",
+            "another program",
+            "acl",
+            "folder link",
+            "exe link",
+        ] {
+            let mut fake = Fake::new();
+            copied(&fake);
+            let own = match broken {
+                "downloads" => IMAGE.to_owned(),
+                "another program" => format!("{PF}\\Other\\tornect.exe"),
+                _ => fake.exe(),
+            };
+            match broken {
+                "acl" => {
+                    fake.writable_by_users.insert(key(&fake.folder()));
+                }
+                "folder link" => {
+                    fake.reparse.insert(key(&fake.folder()));
+                }
+                "exe link" => {
+                    fake.reparse.insert(key(&fake.exe()));
+                }
+                _ => {}
+            }
+            let written = Written::default();
+            let done = write_own_entry(&fake, &own, &record(&written));
+            assert!(
+                matches!(done, Err(InstallError::Refused(_))),
+                "{broken}: {done:?}"
+            );
+            assert!(written.borrow().is_empty(), "{broken}");
+            assert!(fake.elevated().is_empty(), "{broken}");
+        }
+    }
+
+    /// The entry step writes exactly the entry computed from Program Files,
+    /// whatever case its own path is in, and never asks for this user's
+    /// Start menu, which the elevated account may not have.
+    #[test]
+    fn the_entry_step_writes_exactly_its_values() {
+        let mut fake = Fake::new();
+        fake.no_start_menu = true;
+        copied(&fake);
+        let written = Written::default();
+        write_own_entry(&fake, &fake.exe().to_uppercase(), &record(&written)).unwrap();
+        assert_eq!(
+            *written.borrow(),
+            [UninstallEntry {
+                key: "Tornect".to_owned(),
+                display_name: "Tornect".to_owned(),
+                display_version: env!("CARGO_PKG_VERSION").to_owned(),
+                uninstall_string: "\"C:\\Program Files\\Tornect\\tornect.exe\" uninstall"
+                    .to_owned(),
+            }]
+        );
+        assert!(fake.elevated().is_empty());
     }
 }
