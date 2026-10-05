@@ -488,6 +488,50 @@ enum ConfigAction {
     },
 }
 
+/// An internal step of the installed copy (§B.1.1), run elevated by
+/// `tornect install` on Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InternalStep {
+    /// `tornect install-entry`: write Tornect's uninstall entry.
+    InstallEntry,
+}
+
+/// The internal step this program's whole command line, `args`, asks for:
+/// exactly the program and the step's name, nothing before or after it and
+/// in that case only; anything else is not a step (and the parser refuses
+/// it).
+fn internal_step(args: &[std::ffi::OsString]) -> Option<InternalStep> {
+    match args {
+        [_, step] if step == tornect_platform::install::ENTRY_STEP_ARGUMENT => {
+            Some(InternalStep::InstallEntry)
+        }
+        _ => None,
+    }
+}
+
+/// Run `step`: exit code 0 when it was done, 1 when it was refused or
+/// failed (it runs hidden: no text is seen). It starts no runtime, takes no
+/// lock, opens no store, logs nothing and reads no environment variable and
+/// no other argument. Not on this system: exit code 2.
+fn run_internal_step(step: InternalStep) -> i32 {
+    #[cfg(windows)]
+    {
+        use tornect_platform::win_install::{RealWindows, own_path, write_uninstall_entry};
+        let sys = RealWindows::of_this_computer();
+        let done = own_path().and_then(|own| match step {
+            InternalStep::InstallEntry => {
+                tornect_platform::install::write_own_entry(&sys, &own, &write_uninstall_entry)
+            }
+        });
+        i32::from(done.is_err())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = step;
+        2
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // Review finding E2-4: before anything can load a DLL by name, run-time
     // loads are restricted to the system directory (never the current
@@ -505,6 +549,11 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(helper_cmd::run(
             &std::env::args_os().skip(2).collect::<Vec<_>>(),
         ));
+    }
+    // The installed copy's internal steps, the same way: before anything
+    // reads the environment, a config or a file, and with no other argument.
+    if let Some(step) = internal_step(&std::env::args_os().collect::<Vec<_>>()) {
+        std::process::exit(run_internal_step(step));
     }
     // Windows: with arguments, print to the console this was started from
     // (a window-subsystem program has none of its own); without, the window
@@ -1009,6 +1058,32 @@ mod tests {
         assert!(admin(&["revoke-this-device"]).is_ok());
         assert!(admin(&["unlock"]).is_err(), "unlock names the device");
         assert!(admin(&["end-session", "--password", "x"]).is_ok());
+    }
+
+    /// The installed copy's entry step is the whole command line: the
+    /// program and `install-entry`, nothing before or after it, in that case
+    /// only; anything else is not the step, and the parser refuses it.
+    #[test]
+    fn the_entry_step_takes_no_other_argument() {
+        let args = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            super::internal_step(&args(&["tornect.exe", "install-entry"])),
+            Some(super::InternalStep::InstallEntry)
+        );
+        for not in [
+            &["tornect.exe", "install-entry", "x"][..],
+            &["tornect.exe", "--home", "x", "install-entry"],
+            &["tornect.exe", "install-entry", "--home", "x"],
+            &["tornect.exe", "Install-Entry"],
+            &["tornect.exe", "install-entry "],
+            &["tornect.exe"],
+            &["install-entry"],
+            &[],
+        ] {
+            assert_eq!(super::internal_step(&args(not)), None, "{not:?}");
+        }
+        assert!(super::Cli::try_parse_from(["tornect", "install-entry"]).is_err());
+        assert!(super::Cli::try_parse_from(["tornect", "install-entry", "x"]).is_err());
     }
 
     /// U3-L3: `--help` says that no log filter writes identifiers, and
