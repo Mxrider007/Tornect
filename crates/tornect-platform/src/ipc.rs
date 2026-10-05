@@ -2,8 +2,12 @@
 //!
 //! ```text
 //! Unix    <state_dir>/ipc.sock            0600, SO_PEERCRED uid == ours
-//! Windows \\.\pipe\tornect-<hash(state)>   explicit DACL (this account only), the first
-//!                                         instance FILE_FLAG_FIRST_PIPE_INSTANCE,
+//! Windows \\.\pipe\tornect-ctl-<32 hex>    a name drawn from 128 random bits at each
+//!                                         host start, written once the pipe exists
+//!                                         into <state_dir>\ipc.pipe (this account
+//!                                         only), from which the command line reads
+//!                                         it; explicit DACL (this account only), the
+//!                                         first instance FILE_FLAG_FIRST_PIPE_INSTANCE,
 //!                                         PIPE_REJECT_REMOTE_CLIENTS, each end checks
 //!                                         the other's account (SID, from its PID)
 //! ```
@@ -148,6 +152,10 @@ pub enum IpcError {
         /// The other end's process id.
         pid: u32,
     },
+    /// Windows: the control channel's name file holds anything but a control
+    /// pipe's name; no pipe was opened (§B.8.7.4).
+    #[error("the control channel's name file is not one Tornect wrote; no host was asked")]
+    NameFile,
 }
 
 /// The Unix socket path for a state directory.
@@ -156,19 +164,112 @@ pub fn socket_path(state_dir: &Path) -> PathBuf {
     state_dir.join(SOCKET_NAME)
 }
 
-/// The Windows pipe name for a state directory (§B.8.7.4).
-///
-/// The state directory is hashed rather than embedded so that two
-/// `TORNECT_HOME`s on one machine get distinct pipes without the path — which
-/// can contain a user name — appearing in a namespace every process can list.
-#[must_use]
-pub fn pipe_name(state_dir: &Path) -> String {
-    use sha2::{Digest as _, Sha256};
-    let mut h = Sha256::new();
-    h.update(state_dir.as_os_str().as_encoded_bytes());
-    let digest = h.finalize();
-    let hex = data_encoding::HEXLOWER.encode(&digest[..8]);
-    format!(r"\\.\pipe\tornect-{hex}")
+/// File name, inside the state directory, of the Windows control pipe's name
+/// (§B.8.7.4): written by the host once its pipe exists, with a descriptor
+/// that admits this account alone, and read by the command line.
+pub const PIPE_NAME_FILE: &str = "ipc.pipe";
+
+/// Every control pipe's name starts so; 32 lowercase hex digits follow. It is
+/// not the administrator helper's prefix (`helper::PIPE_PREFIX`).
+#[cfg(any(windows, test))]
+const CONTROL_PIPE_PREFIX: &str = r"\\.\pipe\tornect-ctl-";
+
+/// The most the command line reads of the name file; a name is 53 bytes.
+#[cfg(any(windows, test))]
+const NAME_FILE_MAX: u64 = 128;
+
+/// The control pipe's name for 16 random bytes (§B.8.7.4). It is drawn afresh
+/// at each host start and never computed from the state directory, so another
+/// account can neither predict it nor create the pipe first, and no part of
+/// the path appears in a namespace every process can list.
+#[cfg(any(windows, test))]
+fn control_pipe_name(random: &[u8; 16]) -> String {
+    let mut name = String::with_capacity(CONTROL_PIPE_PREFIX.len() + 32);
+    name.push_str(CONTROL_PIPE_PREFIX);
+    name.push_str(&data_encoding::HEXLOWER.encode(random));
+    name
+}
+
+/// A fresh control pipe name: 128 bits from the system's random source.
+#[cfg(any(windows, test))]
+fn new_control_pipe_name() -> std::io::Result<String> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(control_pipe_name(&random))
+}
+
+/// Whether `name` is exactly a control pipe's name as [`control_pipe_name`]
+/// writes it: this machine's pipes, the control prefix and 32 lowercase hex
+/// digits, and nothing before or after them.
+#[cfg(any(windows, test))]
+fn valid_control_pipe_name(name: &str) -> bool {
+    name.strip_prefix(CONTROL_PIPE_PREFIX).is_some_and(|hex| {
+        hex.len() == 32 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// The control pipe's name, read from the name file of `state_dir` (at most
+/// [`NAME_FILE_MAX`] bytes): no file means no host ([`IpcError::NotRunning`]);
+/// anything but exactly a control pipe's name is refused
+/// ([`IpcError::NameFile`]) and never taken for a running host.
+#[cfg(any(windows, test))]
+fn read_pipe_name(state_dir: &Path) -> Result<String, IpcError> {
+    use std::io::Read as _;
+    let file = match std::fs::File::open(state_dir.join(PIPE_NAME_FILE)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Err(IpcError::NotRunning(state_dir.to_path_buf()));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let mut bytes = Vec::new();
+    file.take(NAME_FILE_MAX).read_to_end(&mut bytes)?;
+    match std::str::from_utf8(&bytes) {
+        Ok(name) if valid_control_pipe_name(name) => Ok(name.to_owned()),
+        _ => Err(IpcError::NameFile),
+    }
+}
+
+/// Write `name` into the name file of `state_dir` in one replacement: a new
+/// temporary file beside it, made by `create_new` (on Windows with the pipe's
+/// this-account-only descriptor), written and flushed, then moved over the
+/// name file by `replace`. On any failure the temporary file is removed and
+/// the name file is left as it was.
+#[cfg(any(windows, test))]
+fn write_pipe_name(
+    state_dir: &Path,
+    name: &str,
+    create_new: impl FnOnce(&Path) -> std::io::Result<std::fs::File>,
+    replace: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let tmp = state_dir.join(format!(
+        "{PIPE_NAME_FILE}.{}.tmp",
+        data_encoding::HEXLOWER.encode(&random)
+    ));
+    let mut file = create_new(&tmp)?;
+    let mut written = file
+        .write_all(name.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if written.is_ok() {
+        written = replace(&tmp, &state_dir.join(PIPE_NAME_FILE));
+    }
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// Remove the name file of `state_dir` if it still names `name`: a host that
+/// stops takes its own name away, never one written after it.
+#[cfg(any(windows, test))]
+fn remove_pipe_name(state_dir: &Path, name: &str) {
+    if read_pipe_name(state_dir).is_ok_and(|current| current == name) {
+        let _ = std::fs::remove_file(state_dir.join(PIPE_NAME_FILE));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -484,9 +585,9 @@ mod imp {
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
-#[allow(unsafe_code)] // the pipe's descriptor and its peers' accounts: FFI, each block below says why it is sound
+#[allow(unsafe_code)] // the pipe's descriptor, its name file and its peers' accounts: FFI, each block below says why it is sound
 mod imp {
-    use std::os::windows::io::AsRawHandle as _;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use std::ptr::null_mut;
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::{Duration, Instant};
@@ -495,13 +596,17 @@ mod imp {
         ClientOptions, NamedPipeClient, NamedPipeServer, PipeMode, ServerOptions,
     };
     use windows_sys::Win32::Foundation::{
-        ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, HANDLE, HLOCAL, LocalFree,
+        ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, GENERIC_WRITE, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+        LocalFree,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY};
-    use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, MOVEFILE_REPLACE_EXISTING,
+        MOVEFILE_WRITE_THROUGH, MoveFileExW, SECURITY_IDENTIFICATION,
+    };
     use windows_sys::Win32::System::Pipes::{
         GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
     };
@@ -510,8 +615,9 @@ mod imp {
     };
 
     use super::{
-        IDLE_TIMEOUT, IpcError, IpcRequest, IpcResponse, MAX_CONNECTIONS, Path, PathBuf, Reply,
-        check_account, claim_first, exchange, pipe_name, serve_frames,
+        IDLE_TIMEOUT, IpcError, IpcRequest, IpcResponse, MAX_CONNECTIONS, PIPE_NAME_FILE, Path,
+        PathBuf, Reply, check_account, claim_first, exchange, new_control_pipe_name,
+        read_pipe_name, remove_pipe_name, serve_frames, write_pipe_name,
     };
     use crate::win::{OwnedHandle, current_user_sid, sid_of, sid_string, token_user, wide};
 
@@ -581,6 +687,54 @@ mod imp {
         unsafe { options.create_with_security_attributes_raw(name, (&raw mut attributes).cast()) }
     }
 
+    /// A new file at `path` (it must not exist) with `descriptor`, open for
+    /// writing and shared with nobody: the name file's temporary copy.
+    fn create_owner_only(path: &Path, descriptor: &Descriptor) -> std::io::Result<std::fs::File> {
+        let name = wide(path);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        // SAFETY: `name` is NUL-terminated; `attributes` points at the live
+        // descriptor, and both outlive the call; no template handle.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                &raw const attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `handle` is a file handle this call just opened and owns
+        // alone; the `File` closes it once, on drop.
+        Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+    }
+
+    /// Move `from` over `to`, replacing it (`MoveFileExW`); the moved file
+    /// keeps its descriptor.
+    fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+        let (from, to) = (wide(from), wide(to));
+        // SAFETY: both names are NUL-terminated and outlive the call.
+        let ok = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// The account (string SID) process `pid` runs as.
     fn account_of(pid: u32) -> std::io::Result<String> {
         // SAFETY: plain call; a null result is an error, a handle is closed by
@@ -620,14 +774,23 @@ mod imp {
         Ok(pid)
     }
 
-    /// The bound endpoint: `\\.\pipe\tornect-<hash(state_dir)>`, its first
-    /// instance created by this process.
+    /// The bound endpoint: `\\.\pipe\tornect-ctl-<32 hex>`, a fresh random
+    /// name, its first instance created by this process and the name written
+    /// into the state directory's name file, which the endpoint removes when
+    /// dropped if it still holds this name.
     pub struct Endpoint {
         name: String,
         path: PathBuf,
+        state_dir: PathBuf,
         account: String,
         descriptor: Descriptor,
         waiting: Mutex<Option<NamedPipeServer>>,
+    }
+
+    impl Drop for Endpoint {
+        fn drop(&mut self) {
+            remove_pipe_name(&self.state_dir, &self.name);
+        }
     }
 
     impl std::fmt::Debug for Endpoint {
@@ -639,18 +802,32 @@ mod imp {
     }
 
     impl Endpoint {
-        /// Create the pipe's first instance (§B.8.7.4): the explicit DACL, and
-        /// `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a pipe another process made first
-        /// is never used: no channel then ([`IpcError::NameTaken`]).
+        /// Create the pipe's first instance under a fresh random name
+        /// (§B.8.7.4): the explicit DACL, and `FILE_FLAG_FIRST_PIPE_INSTANCE`,
+        /// so a pipe another process made first is never used: no channel then
+        /// ([`IpcError::NameTaken`]). Then the name is written into
+        /// `<state_dir>\ipc.pipe` with the same descriptor; a name that could
+        /// not be written means no channel either, and a name file left by an
+        /// earlier host is removed, best effort.
         pub async fn bind(state_dir: &Path) -> Result<Self, IpcError> {
-            let name = pipe_name(state_dir);
+            let name = new_control_pipe_name()?;
             let account = current_user_sid()?;
             let descriptor = Descriptor::this_account_only(&account)?;
             let first = claim_first(instance(&name, &descriptor, true))?;
+            if let Err(e) = write_pipe_name(
+                state_dir,
+                &name,
+                |tmp| create_owner_only(tmp, &descriptor),
+                replace_file,
+            ) {
+                let _ = std::fs::remove_file(state_dir.join(PIPE_NAME_FILE));
+                return Err(e.into());
+            }
             tracing::debug!(%name, "IPC endpoint bound");
             Ok(Self {
                 path: PathBuf::from(&name),
                 name,
+                state_dir: state_dir.to_path_buf(),
                 account,
                 descriptor,
                 waiting: Mutex::new(Some(first)),
@@ -731,11 +908,13 @@ mod imp {
         serve_frames(&mut pipe, handler).await
     }
 
-    /// Open the pipe of `state_dir`, waiting while every instance is busy (up
-    /// to [`IDLE_TIMEOUT`]); the server is identified, never allowed to
-    /// impersonate this process.
+    /// Open the pipe whose name the host wrote into `state_dir`'s name file,
+    /// waiting while every instance is busy (up to [`IDLE_TIMEOUT`]); the
+    /// server is identified, never allowed to impersonate this process. No
+    /// name file, or no pipe of that name, means no host; a name file that
+    /// holds anything else is refused before any pipe is opened.
     async fn open(state_dir: &Path, wait: bool) -> Result<NamedPipeClient, IpcError> {
-        let name = pipe_name(state_dir);
+        let name = read_pipe_name(state_dir)?;
         let until = Instant::now() + IDLE_TIMEOUT;
         loop {
             let opened = ClientOptions::new()
@@ -822,22 +1001,129 @@ mod pipe_rules {
         );
     }
 
-    /// The name: `\\.\pipe\tornect-` and 16 hex digits of the state directory's
-    /// hash, the same for the same directory, another for another, and no part of
-    /// the path in it.
+    /// The name: `\\.\pipe\tornect-ctl-` and the 32 lowercase hex digits of 16
+    /// random bytes, another at each start, never the helper's prefix and
+    /// never anything computed from the state directory.
     #[test]
-    fn the_pipe_name_hashes_the_state_directory() {
-        let a = pipe_name(Path::new("/home/someone/.local/state/tornect"));
-        let b = pipe_name(Path::new("/home/someone/.local/state/tornect-2"));
+    fn a_control_pipe_name_is_random_each_time() {
+        let fixed = control_pipe_name(&[0xab; 16]);
+        assert_eq!(fixed, format!(r"\\.\pipe\tornect-ctl-{}", "ab".repeat(16)));
+        assert!(valid_control_pipe_name(&fixed));
+        let first = new_control_pipe_name().unwrap();
+        let second = new_control_pipe_name().unwrap();
+        assert_ne!(first, second);
+        for name in [&first, &second] {
+            assert!(valid_control_pipe_name(name), "{name}");
+            assert!(!name.starts_with(crate::helper::PIPE_PREFIX), "{name}");
+        }
+        assert_eq!(first.len(), CONTROL_PIPE_PREFIX.len() + 32);
+    }
+
+    fn write_here(dir: &Path, name: &str) -> std::io::Result<()> {
+        write_pipe_name(
+            dir,
+            name,
+            |tmp| std::fs::File::create_new(tmp),
+            |from, to| std::fs::rename(from, to),
+        )
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// What the host writes the command line reads back, with no temporary
+    /// file left; a later start replaces the name; a stopping host removes
+    /// only its own name; a failed write leaves the name file as it was.
+    #[test]
+    fn the_name_file_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let first = new_control_pipe_name().unwrap();
+        write_here(dir, &first).unwrap();
+        assert_eq!(read_pipe_name(dir).unwrap(), first);
         assert_eq!(
-            a,
-            pipe_name(Path::new("/home/someone/.local/state/tornect"))
+            std::fs::read(dir.join(PIPE_NAME_FILE)).unwrap(),
+            first.as_bytes()
         );
-        assert_ne!(a, b);
-        let hex = a.strip_prefix(r"\\.\pipe\tornect-").expect("the prefix");
-        assert_eq!(hex.len(), 16);
-        assert!(hex.bytes().all(|c| c.is_ascii_hexdigit()));
-        assert!(!a.contains("someone"));
+        assert_eq!(entries(dir), [PIPE_NAME_FILE]);
+
+        let second = new_control_pipe_name().unwrap();
+        write_here(dir, &second).unwrap();
+        assert_eq!(read_pipe_name(dir).unwrap(), second);
+        assert_eq!(entries(dir), [PIPE_NAME_FILE]);
+
+        let failed = write_pipe_name(
+            dir,
+            &first,
+            |tmp| std::fs::File::create_new(tmp),
+            |_, _| Err(std::io::Error::other("the move failed")),
+        );
+        assert!(failed.is_err());
+        assert_eq!(read_pipe_name(dir).unwrap(), second);
+        assert_eq!(entries(dir), [PIPE_NAME_FILE]);
+
+        remove_pipe_name(dir, &first);
+        assert_eq!(read_pipe_name(dir).unwrap(), second);
+        remove_pipe_name(dir, &second);
+        assert!(entries(dir).is_empty());
+    }
+
+    /// No name file is no host: the command line opens no pipe and computes
+    /// no name.
+    #[test]
+    fn no_name_file_means_no_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let read = read_pipe_name(tmp.path());
+        assert!(
+            matches!(&read, Err(IpcError::NotRunning(dir)) if dir == tmp.path()),
+            "{read:?}"
+        );
+    }
+
+    /// A name file that holds anything but exactly a control pipe's name is
+    /// refused, never taken for a running host: the helper's pipe, another
+    /// machine's pipe, extra bytes, upper case, a short name, an empty file,
+    /// bytes that are not text, an overlong file.
+    #[test]
+    fn a_name_file_that_is_not_a_control_pipe_is_refused() {
+        let hex = "0123456789abcdef".repeat(2);
+        let good = format!(r"\\.\pipe\tornect-ctl-{hex}");
+        let bad: Vec<Vec<u8>> = vec![
+            crate::helper::pipe_name(&[7; 16]).into_bytes(),
+            format!(r"\\server\pipe\tornect-ctl-{hex}").into_bytes(),
+            format!("{good}\n").into_bytes(),
+            format!(" {good}").into_bytes(),
+            format!("{good}00").into_bytes(),
+            good.to_uppercase().into_bytes(),
+            format!(r"\\.\pipe\tornect-ctl-{}", hex.to_uppercase()).into_bytes(),
+            good.as_bytes()[..good.len() - 1].to_vec(),
+            Vec::new(),
+            vec![0xff; 53],
+            good.repeat(3).into_bytes(),
+        ];
+        for bytes in bad {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(PIPE_NAME_FILE), &bytes).unwrap();
+            let read = read_pipe_name(tmp.path());
+            assert!(
+                matches!(read, Err(IpcError::NameFile)),
+                "{:?}: {read:?}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(PIPE_NAME_FILE), &good).unwrap();
+        assert_eq!(read_pipe_name(tmp.path()).unwrap(), good);
+        assert_eq!(
+            IpcError::NameFile.to_string(),
+            "the control channel's name file is not one Tornect wrote; no host was asked"
+        );
     }
 }
 
