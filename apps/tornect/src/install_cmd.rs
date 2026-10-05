@@ -19,7 +19,8 @@
 //!
 //! `tornect uninstall` removes the start at sign-in, whatever copy it runs,
 //! then the menu entry and the copy; on Windows it is refused while an
-//! administrator grant exists or the administrator helper task is registered.
+//! administrator grant exists or the administrator helper task is registered,
+//! and while Tornect cannot read its grants.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,6 +50,13 @@ pub(crate) const LINUX_INSTALLED: &str = "Tornect is installed in ~/.local/bin, 
 #[cfg(any(windows, test))]
 pub(crate) const REMOVE_ADMIN_FIRST: &str =
     "Remove administrator access first: tornect unattended set-level <device> none";
+
+/// `uninstall`'s refusal on Windows while the grants cannot be read (a store
+/// that failed closed): whether a device still has administrator access
+/// cannot be told.
+#[cfg(any(windows, test))]
+pub(crate) const GRANTS_UNREADABLE: &str = "Tornect cannot read its grants now, so it cannot tell \
+     whether a device still has administrator access; nothing was removed.";
 
 /// What `uninstall` says where it finds nothing to remove.
 pub(crate) const NOTHING_INSTALLED: &str =
@@ -466,9 +474,17 @@ fn guard_step(
 
 /// `uninstall`'s refusal while administrator access remains: the grants that
 /// hold the level, by label, or the administrator helper task that is still
-/// registered.
+/// registered; and while the grants cannot be read (a store that failed
+/// closed). Where unattended access was never enabled no grant can exist,
+/// and the uninstall goes on.
 #[cfg(any(windows, test))]
 fn admin_access_left(ctx: &HostContext) -> Option<String> {
+    if matches!(
+        ctx.guard.store().status(),
+        tornect_core::unattended::store::StoreStatus::FailedClosed(_)
+    ) {
+        return Some(GRANTS_UNREADABLE.to_owned());
+    }
     let held: Vec<String> = ctx
         .guard
         .store()
@@ -492,8 +508,9 @@ fn admin_access_left(ctx: &HostContext) -> Option<String> {
     })
 }
 
-/// `tornect uninstall` on Windows: refused beside a running host and while
-/// administrator access remains; then the Program Files steps, with the
+/// `tornect uninstall` on Windows: refused beside a running host, while
+/// administrator access remains and while the grants cannot be read; then
+/// the Program Files steps, with the
 /// guard's operation and the removal of the start at sign-in (whatever copy
 /// it runs) between the checks and the first change.
 #[cfg(any(windows, test))]
@@ -569,7 +586,7 @@ mod tests {
     };
     use tornect_core::unattended::ipc::GrantOptions;
     use tornect_core::unattended::readiness::SharedReadiness;
-    use tornect_core::unattended::store::GrantStore;
+    use tornect_core::unattended::store::{GrantStore, StoreStatus};
     use tornect_platform::autostart::{AutostartError, Registration};
     use tornect_platform::install::{Elevated, HeldImage, WindowsSystem};
 
@@ -915,9 +932,15 @@ mod tests {
     /// The offline route's context over a store of its own in a temporary
     /// home, on `facts`, with re-authentication allowed `allow` times.
     fn env(facts: FixedFacts, allow: usize) -> Env {
+        env_with(facts, allow, |_| {})
+    }
+
+    /// [`env`], with `before_open` run on the home before its store opens.
+    fn env_with(facts: FixedFacts, allow: usize, before_open: impl FnOnce(&Paths)) -> Env {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(tmp.path().join("home"));
         paths.ensure().unwrap();
+        before_open(&paths);
         let bin = tmp.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let secrets = Arc::new(FileSecretStore::open(paths.keys_dir()).unwrap());
@@ -1534,5 +1557,72 @@ mod tests {
             );
             assert_eq!(backends.installs(), 0, "{what}");
         }
+    }
+
+    /// §B.1.1: on Windows `tornect uninstall` is refused while Tornect
+    /// cannot read its grants (here a store file with no key, which fails
+    /// closed), since it cannot tell whether a device still has
+    /// administrator access; nothing is asked or removed.
+    #[test]
+    fn uninstall_is_refused_while_the_store_failed_closed() {
+        let mut env = env_with(windows_admin(), 1, |paths| {
+            std::fs::write(paths.unattended_store(), b"not a store").unwrap();
+        });
+        let status = env.ctx.guard.store().status();
+        assert!(matches!(status, StoreStatus::FailedClosed(_)), "{status:?}");
+        let backends = Backends::default();
+        let make = |spec| backends.make(spec);
+        let mut script = Script::answering(&[]);
+        let mut deps = Deps {
+            ctx: &mut env.ctx,
+            console: &mut script,
+            host_running: false,
+            autostart_for: &make,
+        };
+        let err = uninstall_windows(&mut deps, &env.paths, &Untouched)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "Tornect cannot read its grants now, so it cannot tell whether a device still has \
+             administrator access; nothing was removed."
+        );
+        assert!(env.dialogs.asked().is_empty());
+        assert!(backends.specs().is_empty());
+    }
+
+    /// Where unattended access was never enabled (no store, so no grant can
+    /// exist) a Windows uninstall goes on to its steps: here it removes a
+    /// start at sign-in after the guard's dialog.
+    #[test]
+    fn uninstall_goes_on_when_unattended_access_was_never_enabled() {
+        let mut env = env(windows_admin(), 1);
+        assert_eq!(env.ctx.guard.store().status(), StoreStatus::AttendedOnly);
+        let backends = Backends {
+            registered: Some(AutostartState::Registered(Registration {
+                enabled: true,
+                command: Some(
+                    "\"C:\\Program Files\\Tornect\\tornect.exe\" \"--background\"".to_owned(),
+                ),
+                ..Registration::default()
+            })),
+            ..Backends::default()
+        };
+        let make = |spec| backends.make(spec);
+        let mut script = Script::answering(&[]);
+        let mut deps = Deps {
+            ctx: &mut env.ctx,
+            console: &mut script,
+            host_running: false,
+            autostart_for: &make,
+        };
+        uninstall_windows(&mut deps, &env.paths, &Bare).unwrap();
+        assert_eq!(env.dialogs.asked(), ["uninstall"]);
+        assert!(script.said(&removed_line(&env.paths)), "{:?}", script.lines);
+        assert!(
+            !script.lines.iter().any(|l| l.contains(GRANTS_UNREADABLE)),
+            "{:?}",
+            script.lines
+        );
     }
 }
