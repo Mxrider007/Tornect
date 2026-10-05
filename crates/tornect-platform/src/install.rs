@@ -42,9 +42,11 @@
 //! administrator. Each elevated step runs only through its own program
 //! ([`elevated_command`]): the system folder's robocopy, reg and cmd for the
 //! copy, the entry's delete and the folder's removal, and the installed copy,
-//! after its checks, for the entry; the held image must be named
-//! `tornect.exe`, since the copy keeps the name. This build has not the calls
-//! that make these steps on Windows, where `windows_system` refuses.
+//! after its checks, for the entry and for its own removal at the next
+//! restart, which an uninstall run from that copy asks for instead of
+//! deleting the folder it runs from; the held image must be named
+//! `tornect.exe`, since the copy keeps the name. The Windows calls are those
+//! of the `win_install` module.
 
 use crate::helper_task::{Install as HelperInstall, Security, admin_only, guarded_paths};
 
@@ -99,15 +101,14 @@ pub const UNINSTALL_ROOT: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\
 /// only argument (§B.1.1, the CLI list).
 pub const ENTRY_STEP_ARGUMENT: &str = "install-entry";
 
+/// The installed copy's internal step that marks itself and its folder for
+/// removal at the next restart: its only argument (§B.1.1, the CLI list).
+pub const RESTART_STEP_ARGUMENT: &str = "remove-at-restart";
+
 /// Why an image not named `tornect.exe` is not installed: the copy keeps
 /// the file's name, and the installed program is `tornect.exe`.
 pub const SOURCE_NOT_NAMED_TORNECT_EXE: &str = "Tornect can be installed only from a file named \
      tornect.exe. Rename this copy to tornect.exe and run it again.";
-
-/// Why `tornect install` and `uninstall` refuse on Windows in this build:
-/// the calls that make the steps below on Windows are not in it.
-pub const PROGRAM_FILES_UNAVAILABLE: &str =
-    "Installing in Program Files is not available in this build.";
 
 /// The installed copy is not the file that was held and hashed.
 pub const SOURCE_SWAPPED: &str = "Something else replaced the Tornect file while it was being \
@@ -152,6 +153,13 @@ pub enum Elevated {
     },
     /// Delete the install folder and what it holds.
     RemoveFolder {
+        /// The folder.
+        folder: String,
+    },
+    /// Have the installed copy, which an uninstall runs from, delete
+    /// anything else in its folder and mark itself and then the folder for
+    /// removal at the next restart.
+    RemoveAtRestart {
         /// The folder.
         folder: String,
     },
@@ -217,6 +225,9 @@ pub trait WindowsSystem {
     fn uninstall_entry_exists(&self, key: &str) -> Result<bool, InstallError>;
     /// Whether a file is at `path`.
     fn file_exists(&self, path: &str) -> Result<bool, InstallError>;
+    /// This program's own path: the final path of its image, resolved as
+    /// [`Self::open_own_image`] resolves the image it holds.
+    fn own_path(&self) -> Result<String, InstallError>;
     /// Every string of Windows' list of renames and deletes at the next
     /// restart (`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager`,
     /// value `PendingFileRenameOperations`), as stored: pairs of a source and
@@ -230,14 +241,11 @@ pub trait WindowsSystem {
     fn remove_shortcut(&self, link: &str) -> Result<(), InstallError>;
 }
 
-/// This computer for the Program Files install. The calls that would make
-/// the steps below on Windows are not in this build, so `tornect install`
-/// and `uninstall` refuse there before anything is asked.
+/// This computer for the Program Files install: its known folders and the
+/// calls that make the steps below ([`crate::win_install::RealWindows`]).
 #[cfg(windows)]
 pub fn windows_system() -> Result<Box<dyn WindowsSystem>, InstallError> {
-    Err(InstallError::Unavailable(
-        PROGRAM_FILES_UNAVAILABLE.to_owned(),
-    ))
+    Ok(Box::new(crate::win_install::RealWindows::of_this_computer()))
 }
 
 /// The system folder's copy program.
@@ -262,6 +270,9 @@ const CMD: &str = "cmd.exe";
 ///   AutoRun command) and `/v:off` (no delayed expansion).
 /// - The entry's write: the installed copy, `tornect.exe install-entry`,
 ///   which takes nothing else and computes the entry itself.
+/// - The removal at the next restart: the installed copy,
+///   `tornect.exe remove-at-restart`, which takes nothing else and marks
+///   only itself and its own folder.
 ///
 /// Every path is quoted, and none ends in `\` before its closing quote.
 pub fn elevated_command(step: &Elevated, target: &WindowsTarget) -> (String, String) {
@@ -284,6 +295,7 @@ pub fn elevated_command(step: &Elevated, target: &WindowsTarget) -> (String, Str
             format!("/d /v:off /c rmdir /s /q \"{}\"", quotable_folder(folder)),
         ),
         Elevated::WriteEntry(_) => (target.exe.clone(), ENTRY_STEP_ARGUMENT.to_owned()),
+        Elevated::RemoveAtRestart { .. } => (target.exe.clone(), RESTART_STEP_ARGUMENT.to_owned()),
     }
 }
 
@@ -546,6 +558,47 @@ pub fn write_own_entry(
     let target = WindowsTarget::entry_of(sys)?;
     own_copy_ok(sys, &target, own)?;
     write(&target.entry)
+}
+
+/// `tornect remove-at-restart` (§B.1.1): the installed copy's own elevated
+/// step, the second prompt of an uninstall run from it. Refused unless this
+/// program, `own`, is the installed copy from the known folder, neither that
+/// copy nor its folder is a reparse point, and the ACL check passes; then
+/// every entry of its folder other than `tornect.exe` goes at once
+/// (`delete`: a file, a folder with what it holds, or a link as a link,
+/// never followed), and only then the copy and then its folder are marked
+/// for removal at the next restart (`mark`), in that order, since Windows
+/// removes a folder at the restart only when it is empty by then. A refusal
+/// or a failed delete marks nothing. Nothing comes from the command line.
+pub fn mark_own_folder_for_restart(
+    sys: &dyn WindowsSystem,
+    own: &str,
+    delete: &dyn Fn(&str) -> Result<(), InstallError>,
+    mark: &dyn Fn(&str) -> Result<(), InstallError>,
+) -> Result<(), InstallError> {
+    let target = WindowsTarget::entry_of(sys)?;
+    own_copy_ok(sys, &target, own)?;
+    let entries = sys
+        .folder_entries(&target.folder)?
+        .ok_or_else(|| InstallError::Failed(format!("{} is not there", target.folder)))?;
+    for name in entries
+        .iter()
+        .filter(|name| !name.eq_ignore_ascii_case(WINDOWS_EXE))
+    {
+        delete(&windows_join(&target.folder, name))?;
+    }
+    mark(&target.exe)?;
+    mark(&target.folder)
+}
+
+/// Whether this program is the installed copy,
+/// `<Program Files>\Tornect\tornect.exe` from the known folder, as paths
+/// compare: an uninstall run from it (as Apps and features runs it) has that
+/// copy mark itself and its folder for removal at the next restart instead
+/// of deleting the folder it runs from.
+pub fn runs_from_install(sys: &dyn WindowsSystem) -> Result<bool, InstallError> {
+    let target = WindowsTarget::entry_of(sys)?;
+    Ok(same_path(&sys.own_path()?, &target.exe))
 }
 
 /// What a finished install in Program Files holds.
@@ -853,7 +906,8 @@ pub struct WindowsRemoval {
     pub uninstall_entry: bool,
     /// This user's Start-menu entry.
     pub start_menu_entry: bool,
-    /// The install folder.
+    /// The install folder: removed, or, for an uninstall run from the
+    /// installed copy, marked by that copy for removal at the next restart.
     pub folder: bool,
 }
 
@@ -886,9 +940,13 @@ fn removable_folder(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result<b
 /// folders only (never this program's own path or the environment), the
 /// install folder checked (not a reparse point, administrators only) before
 /// `authorize`, the mutation guard's operation, and again right before its
-/// elevated delete; then the uninstall entry (elevated), this user's
+/// elevated step; then the uninstall entry (elevated), this user's
 /// Start-menu entry and the folder (elevated), each only where it exists.
-/// Nothing there: nothing asked.
+/// Run from the installed copy ([`runs_from_install`]), the folder's step is
+/// that copy's own `remove-at-restart`, waited for like every other: it
+/// marks the copy and the folder for removal at the next restart, so no
+/// elevated program outlives the uninstall; from any other copy the folder
+/// is deleted at once. Nothing there: nothing asked.
 pub fn uninstall_from_program_files(
     sys: &dyn WindowsSystem,
     authorize: &mut dyn FnMut() -> Result<(), InstallError>,
@@ -903,8 +961,16 @@ pub fn uninstall_from_program_files(
     let delete_entry = Elevated::DeleteEntry {
         key: target.entry.key.clone(),
     };
-    let remove_folder = Elevated::RemoveFolder {
-        folder: target.folder.clone(),
+    // The folder an uninstall runs from cannot be deleted while it runs:
+    // the installed copy marks it for the next restart instead.
+    let remove_folder = if folder && runs_from_install(sys)? {
+        Elevated::RemoveAtRestart {
+            folder: target.folder.clone(),
+        }
+    } else {
+        Elevated::RemoveFolder {
+            folder: target.folder.clone(),
+        }
     };
     for (step, needed) in [(&delete_entry, entry), (&remove_folder, folder)] {
         if needed {
@@ -1695,6 +1761,8 @@ mod windows_tests {
         pending: RefCell<Result<Vec<String>, String>>,
         /// This user's Start-menu folder cannot be found.
         no_start_menu: bool,
+        /// This program's own path.
+        own: String,
     }
 
     fn kind(step: &Elevated) -> &'static str {
@@ -1703,6 +1771,7 @@ mod windows_tests {
             Elevated::WriteEntry(_) => "write",
             Elevated::DeleteEntry { .. } => "delete",
             Elevated::RemoveFolder { .. } => "remove",
+            Elevated::RemoveAtRestart { .. } => "restart",
         }
     }
 
@@ -1734,6 +1803,7 @@ mod windows_tests {
                 runner: BTreeMap::new(),
                 pending: RefCell::new(Ok(Vec::new())),
                 no_start_menu: false,
+                own: IMAGE.to_owned(),
             }
         }
 
@@ -1908,7 +1978,7 @@ mod windows_tests {
                     Elevated::Copy { .. } => system("robocopy.exe"),
                     Elevated::DeleteEntry { .. } => system("reg.exe"),
                     Elevated::RemoveFolder { .. } => system("cmd.exe"),
-                    Elevated::WriteEntry(_) => self.exe(),
+                    Elevated::WriteEntry(_) | Elevated::RemoveAtRestart { .. } => self.exe(),
                 })
         }
 
@@ -1954,6 +2024,8 @@ mod windows_tests {
                         .retain(|f, _| !f.starts_with(&prefix));
                     self.folders.borrow_mut().remove(&folder);
                 }
+                // Marked: the folder stays until the restart.
+                Elevated::RemoveAtRestart { .. } => {}
             }
             Ok(())
         }
@@ -1969,6 +2041,10 @@ mod windows_tests {
 
         fn pending_removals(&self) -> Result<Vec<String>, InstallError> {
             self.pending.borrow().clone().map_err(InstallError::Failed)
+        }
+
+        fn own_path(&self) -> Result<String, InstallError> {
+            Ok(self.own.clone())
         }
 
         fn write_shortcut(&self, link: &str, target: &str) -> Result<(), InstallError> {
@@ -2782,6 +2858,9 @@ mod windows_tests {
             folder: target.folder.clone(),
         };
         let write = Elevated::WriteEntry(target.entry.clone());
+        let restart = Elevated::RemoveAtRestart {
+            folder: target.folder.clone(),
+        };
         let built = [
             (
                 &copy,
@@ -2809,6 +2888,11 @@ mod windows_tests {
                 &write,
                 "C:\\Program Files\\Tornect\\tornect.exe",
                 "install-entry",
+            ),
+            (
+                &restart,
+                "C:\\Program Files\\Tornect\\tornect.exe",
+                "remove-at-restart",
             ),
         ];
         for (step, program, parameters) in built {
@@ -3154,5 +3238,170 @@ mod windows_tests {
             }]
         );
         assert!(fake.elevated().is_empty());
+    }
+
+    /// What the restart step was given to delete and to mark, in order.
+    type Done = RefCell<Vec<String>>;
+
+    /// An uninstall run from the installed copy (as Apps and features runs
+    /// it) removes the entry (reg) and the Start-menu entry at once, checks
+    /// the folder again and then has that copy mark itself and its folder
+    /// for removal at the next restart: never the cmd removal of the folder
+    /// it runs from. Through any program but the installed copy (cmd,
+    /// PowerShell) that step is refused before the dialog.
+    #[test]
+    fn an_uninstall_run_from_the_installed_copy_marks_its_folder_for_the_restart() {
+        let mut fake = Fake::new();
+        fake.installed();
+        fake.own = fake.exe();
+        let removed = uninstall_from_program_files(&fake, &mut allow(&fake)).unwrap();
+        assert_eq!(
+            removed,
+            WindowsRemoval {
+                uninstall_entry: true,
+                start_menu_entry: true,
+                folder: true
+            }
+        );
+        let events = fake.events();
+        let authorize = position(&events, |e| *e == Ev::Authorize);
+        let changes: Vec<Ev> = events[authorize + 1..]
+            .iter()
+            .filter(|e| !matches!(e, Ev::Security(_)))
+            .cloned()
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                Ev::Elevated(Elevated::DeleteEntry {
+                    key: "Tornect".to_owned()
+                }),
+                Ev::RemoveShortcut(Fake::link()),
+                Ev::Elevated(Elevated::RemoveAtRestart {
+                    folder: fake.folder()
+                }),
+            ]
+        );
+        let shortcut = position(&events, |e| matches!(e, Ev::RemoveShortcut(_)));
+        let step = position(&events, |e| {
+            matches!(e, Ev::Elevated(Elevated::RemoveAtRestart { .. }))
+        });
+        assert!(
+            events[shortcut..step]
+                .iter()
+                .any(|e| matches!(e, Ev::Security(_))),
+            "the folder was not checked again: {events:?}"
+        );
+        for runner in [
+            system("cmd.exe"),
+            system("WindowsPowerShell\\v1.0\\powershell.exe"),
+        ] {
+            let mut fake = Fake::new();
+            fake.installed();
+            fake.own = fake.exe();
+            fake.runner.insert("restart", runner.clone());
+            match uninstall_from_program_files(&fake, &mut allow(&fake)) {
+                Err(InstallError::Unavailable(why)) => {
+                    assert!(why.contains(&runner), "{runner}: {why}");
+                    assert!(why.contains(&fake.exe()), "{runner}: {why}");
+                }
+                other => panic!("{runner}: {other:?}"),
+            }
+            assert!(fake.elevated().is_empty(), "{runner}: {:?}", fake.events());
+            assert!(!fake.events().contains(&Ev::Authorize), "{runner}");
+        }
+    }
+
+    /// The installed copy's restart step changes nothing unless it is the
+    /// installed copy and passes its checks: run as this copy in Downloads
+    /// or as another program in Program Files, with the ACL check failing,
+    /// or with the folder or the copy a reparse point, nothing is deleted
+    /// and nothing marked.
+    #[test]
+    fn the_restart_step_refuses_outside_program_files() {
+        for broken in [
+            "downloads",
+            "another program",
+            "acl",
+            "folder link",
+            "exe link",
+        ] {
+            let mut fake = Fake::new();
+            copied(&fake);
+            fake.files
+                .borrow_mut()
+                .insert(key(&format!("{}\\left.log", fake.folder())), b"x".to_vec());
+            let own = match broken {
+                "downloads" => IMAGE.to_owned(),
+                "another program" => format!("{PF}\\Other\\tornect.exe"),
+                _ => fake.exe(),
+            };
+            match broken {
+                "acl" => {
+                    fake.writable_by_users.insert(key(&fake.exe()));
+                }
+                "folder link" => {
+                    fake.reparse.insert(key(&fake.folder()));
+                }
+                "exe link" => {
+                    fake.reparse.insert(key(&fake.exe()));
+                }
+                _ => {}
+            }
+            let done = Done::default();
+            let deleted = |path: &str| {
+                done.borrow_mut().push(format!("delete {path}"));
+                Ok(())
+            };
+            let marked = |path: &str| {
+                done.borrow_mut().push(format!("mark {path}"));
+                Ok(())
+            };
+            let result = mark_own_folder_for_restart(&fake, &own, &deleted, &marked);
+            assert!(
+                matches!(result, Err(InstallError::Refused(_))),
+                "{broken}: {result:?}"
+            );
+            assert!(done.borrow().is_empty(), "{broken}: {:?}", done.borrow());
+        }
+    }
+
+    /// The restart step deletes every other entry of its folder first, then
+    /// marks the copy and then the folder, in that order; a delete that
+    /// fails marks nothing.
+    #[test]
+    fn the_restart_step_marks_the_copy_then_its_folder() {
+        let fake = Fake::new();
+        copied(&fake);
+        fake.files
+            .borrow_mut()
+            .insert(key(&format!("{}\\left.log", fake.folder())), b"x".to_vec());
+        let done = Done::default();
+        let deleted = |path: &str| {
+            done.borrow_mut().push(format!("delete {path}"));
+            Ok(())
+        };
+        let marked = |path: &str| {
+            done.borrow_mut().push(format!("mark {path}"));
+            Ok(())
+        };
+        mark_own_folder_for_restart(&fake, &fake.exe(), &deleted, &marked).unwrap();
+        assert_eq!(
+            *done.borrow(),
+            [
+                format!("delete {}\\left.log", fake.folder()),
+                format!("mark {}", fake.exe()),
+                format!("mark {}", fake.folder()),
+            ]
+        );
+        let done = Done::default();
+        let in_use = |path: &str| Err(InstallError::Failed(format!("{path} is in use")));
+        let marked = |path: &str| {
+            done.borrow_mut().push(format!("mark {path}"));
+            Ok(())
+        };
+        let result = mark_own_folder_for_restart(&fake, &fake.exe(), &in_use, &marked);
+        assert!(matches!(result, Err(InstallError::Failed(_))), "{result:?}");
+        assert!(done.borrow().is_empty(), "{:?}", done.borrow());
     }
 }
