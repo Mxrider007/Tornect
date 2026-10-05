@@ -28,9 +28,10 @@ use windows_sys::Win32::Security::{
     OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileAttributesW,
-    GetFinalPathNameByHandleW, INVALID_FILE_ATTRIBUTES, READ_CONTROL, VOLUME_NAME_DOS,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, GetFileAttributesW, GetFinalPathNameByHandleW, INVALID_FILE_ATTRIBUTES,
+    MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW, READ_CONTROL, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
@@ -237,6 +238,46 @@ pub fn write_uninstall_entry(entry: &UninstallEntry) -> Result<(), InstallError>
         if status != ERROR_SUCCESS {
             return Err(failed(io::Error::from_raw_os_error(status as i32)));
         }
+    }
+    Ok(())
+}
+
+/// Delete `path`, an entry of the install folder other than the installed
+/// copy, at once: a file, a folder with what it holds, or a link (a
+/// junction, a mount point or a symbolic link) as a link, never followed.
+/// The installed copy's restart step, elevated.
+pub fn delete_in_folder(path: &str) -> Result<(), InstallError> {
+    let failed = |e: io::Error| InstallError::Failed(format!("removing {path}: {e}"));
+    let name = wide(path);
+    // SAFETY: `name` is NUL-terminated; the attributes of `path` itself.
+    let attributes = unsafe { GetFileAttributesW(name.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(failed(io::Error::last_os_error()));
+    }
+    let directory = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let link = attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    match (link, directory) {
+        // The link itself: `remove_dir` and `remove_file` never follow one.
+        (true, true) => std::fs::remove_dir(path),
+        (_, false) => std::fs::remove_file(path),
+        // `remove_dir_all` removes a link inside as a link, never its target.
+        (false, true) => std::fs::remove_dir_all(path),
+    }
+    .map_err(failed)
+}
+
+/// Mark `path` for removal at the next restart
+/// (`MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)`, which needs
+/// administrator rights): the installed copy's restart step, elevated, for
+/// the copy and then its folder.
+pub fn mark_for_removal_at_restart(path: &str) -> Result<(), InstallError> {
+    let name = wide(path);
+    // SAFETY: `name` is NUL-terminated; no new name: a delete at the restart.
+    if unsafe { MoveFileExW(name.as_ptr(), null(), MOVEFILE_DELAY_UNTIL_REBOOT) } == 0 {
+        return Err(InstallError::Failed(format!(
+            "marking {path} for removal at the next restart: {}",
+            io::Error::last_os_error()
+        )));
     }
     Ok(())
 }
@@ -533,6 +574,10 @@ fn step_failed(step: &Elevated, target: &WindowsTarget, code: u32) -> String {
         Elevated::RemoveFolder { folder } => {
             format!("{folder} could not be removed (cmd exit code {code}).")
         }
+        Elevated::RemoveAtRestart { folder } => format!(
+            "The installed copy could not mark {folder} for removal at the next restart (exit \
+             code {code}); it stays, and nothing points at it."
+        ),
     }
 }
 
@@ -652,6 +697,10 @@ impl WindowsSystem for RealWindows {
 
     fn pending_removals(&self) -> Result<Vec<String>, InstallError> {
         pending_renames().map_err(|e| InstallError::Failed(e.to_string()))
+    }
+
+    fn own_path(&self) -> Result<String, InstallError> {
+        own_path()
     }
 
     fn write_shortcut(&self, link: &str, target: &str) -> Result<(), InstallError> {
