@@ -37,16 +37,17 @@ use windows_sys::Win32::System::Com::{
     CoInitializeEx, CoUninitialize,
 };
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_READ, KEY_WOW64_64KEY, REG_SAM_FLAGS,
-    RRF_RT_REG_MULTI_SZ, RegCloseKey, RegGetValueW, RegOpenKeyExW,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY,
+    REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ, RRF_RT_REG_MULTI_SZ, RegCloseKey,
+    RegCreateKeyExW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
 };
 use windows_sys::Win32::UI::Shell::ShellLink;
 use windows_sys::core::GUID;
 
 use crate::helper_task::{Ace, Security};
 use crate::install::{
-    Elevated, HeldImage, InstallError, UNINSTALL_ROOT, WindowsSystem, WindowsTarget,
-    elevated_command, step_succeeded,
+    Elevated, HeldImage, InstallError, UNINSTALL_ROOT, UninstallEntry, WindowsSystem,
+    WindowsTarget, elevated_command, step_succeeded,
 };
 use crate::win::{ElevateError, KnownFolder, wide};
 use crate::win_task::{Com, Hresult, check};
@@ -160,6 +161,84 @@ impl HeldImage for Image {
     fn path(&self) -> &str {
         &self.path
     }
+}
+
+/// This program's image, opened with share mode read only (from
+/// `own_image`, never argv[0]), and the final path of that handle.
+fn held_own_image() -> io::Result<(std::fs::File, String)> {
+    let own = crate::win_helper::own_image()?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&own)?;
+    let path = final_path_of(&file)?;
+    Ok((file, path))
+}
+
+/// This program's own path as the installed copy's steps compare it: the
+/// final path of its image, resolved as the install resolves the image it
+/// holds.
+pub fn own_path() -> Result<String, InstallError> {
+    held_own_image()
+        .map(|(_, path)| path)
+        .map_err(|e| InstallError::Failed(format!("finding this program: {e}")))
+}
+
+/// Write `entry` under HKLM in the 64-bit view: its key and the three
+/// values `DisplayName`, `DisplayVersion` and `UninstallString` (REG_SZ),
+/// nothing else. The installed copy's elevated step; unelevated, the key
+/// cannot be opened for writing and nothing is written.
+pub fn write_uninstall_entry(entry: &UninstallEntry) -> Result<(), InstallError> {
+    let failed = |e: io::Error| {
+        InstallError::Failed(format!("writing Tornect's entry in Apps and features: {e}"))
+    };
+    let path = wide(format!("{UNINSTALL_ROOT}\\{}", entry.key));
+    let mut key: HKEY = null_mut();
+    // SAFETY: `path` is NUL-terminated; no class, no security attributes;
+    // `key` receives an open key on success; no disposition asked.
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            path.as_ptr(),
+            0,
+            null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE | KEY_WOW64_64KEY,
+            null(),
+            &mut key,
+            null_mut(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(failed(io::Error::from_raw_os_error(status as i32)));
+    }
+    let key = Key(key);
+    for (name, value) in [
+        ("DisplayName", &entry.display_name),
+        ("DisplayVersion", &entry.display_version),
+        ("UninstallString", &entry.uninstall_string),
+    ] {
+        let name = wide(name);
+        let data = wide(value);
+        let bytes = u32::try_from(data.len() * 2)
+            .map_err(|_| failed(io::Error::other("a value is too long")))?;
+        // SAFETY: `key` is open with KEY_SET_VALUE; `name` and `data` are
+        // NUL-terminated and `data` is `bytes` long, its NUL included.
+        let status = unsafe {
+            RegSetValueExW(
+                key.0,
+                name.as_ptr(),
+                0,
+                REG_SZ,
+                data.as_ptr().cast::<u8>(),
+                bytes,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(failed(io::Error::from_raw_os_error(status as i32)));
+        }
+    }
+    Ok(())
 }
 
 /// The final path of the open file `file` (`GetFinalPathNameByHandleW`, the
@@ -485,15 +564,8 @@ impl WindowsSystem for RealWindows {
     }
 
     fn open_own_image(&self) -> Result<Box<dyn HeldImage + '_>, InstallError> {
-        let failed = |e: io::Error| InstallError::Failed(format!("opening this program: {e}"));
-        // This process's image as Windows names it, never argv[0].
-        let own = crate::win_helper::own_image().map_err(failed)?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ)
-            .open(&own)
-            .map_err(failed)?;
-        let path = final_path_of(&file).map_err(failed)?;
+        let (file, path) = held_own_image()
+            .map_err(|e| InstallError::Failed(format!("opening this program: {e}")))?;
         Ok(Box::new(Image { file, path }))
     }
 
