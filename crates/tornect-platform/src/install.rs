@@ -113,6 +113,13 @@ pub const PROGRAM_FILES_UNAVAILABLE: &str =
 pub const SOURCE_SWAPPED: &str = "Something else replaced the Tornect file while it was being \
      copied, so nothing was installed.";
 
+/// Why an install over an earlier install is refused (the operator's
+/// words): an upgrade is `tornect uninstall`, then `tornect install`.
+#[must_use]
+pub fn already_installed(folder: &str) -> String {
+    format!("Tornect is already installed in {folder}. Run tornect uninstall first.")
+}
+
 /// The administrator prompt of an install was cancelled.
 pub const INSTALL_NEEDS_APPROVAL: &str =
     "Installing needs administrator approval; nothing was installed.";
@@ -210,6 +217,13 @@ pub trait WindowsSystem {
     fn uninstall_entry_exists(&self, key: &str) -> Result<bool, InstallError>;
     /// Whether a file is at `path`.
     fn file_exists(&self, path: &str) -> Result<bool, InstallError>;
+    /// Every string of Windows' list of renames and deletes at the next
+    /// restart (`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager`,
+    /// value `PendingFileRenameOperations`), as stored: pairs of a source and
+    /// a destination, a delete with an empty destination, the paths with the
+    /// `\??\` prefix. An empty list when the value does not exist; an error
+    /// when it cannot be read. Only read, never written.
+    fn pending_removals(&self) -> Result<Vec<String>, InstallError>;
     /// Write this user's Start-menu entry `link`, which starts `target`.
     fn write_shortcut(&self, link: &str, target: &str) -> Result<(), InstallError>;
     /// Remove this user's Start-menu entry `link`.
@@ -555,11 +569,17 @@ fn not_a_link(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result<(), Ins
 /// when accounts other than administrators can change it, that
 /// `tornect.exe` or a folder above it up to Program Files: the elevated copy
 /// must not write into a place another account controls (decision M1-65).
-/// Run before the dialog and again right after it.
+/// Then, folder or no folder: refused while Windows is to remove the folder
+/// at the next restart, or cannot say ([`no_removal_pending`]), and over an
+/// earlier install ([`no_earlier_install`]). Run before the dialog and again
+/// right after it.
 fn existing_folder_ok(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result<(), InstallError> {
     let folder = &target.folder;
     let Some(entries) = sys.folder_entries(folder)? else {
-        return Ok(());
+        // Either can be left without the folder: a removal at the next
+        // restart, and an entry that would point at the new copy.
+        no_removal_pending(sys, target)?;
+        return no_earlier_install(sys, target);
     };
     if sys.is_reparse_point(folder)? {
         return Err(InstallError::Refused(format!(
@@ -583,7 +603,65 @@ fn existing_folder_ok(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result
             "{folder} could be changed by accounts other than administrators, so Tornect was \
              not installed there ({why})."
         ))
-    })
+    })?;
+    no_removal_pending(sys, target)?;
+    no_earlier_install(sys, target)
+}
+
+/// Refused while Windows' list of renames and deletes at the next restart
+/// names the install folder or a path under it ([`names_folder`]), since a
+/// copy put there now would be deleted then; refused too while that list
+/// cannot be read, since such a removal cannot be ruled out. Only the
+/// value's own absence (an empty list) lets the install go on.
+fn no_removal_pending(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result<(), InstallError> {
+    let folder = &target.folder;
+    let pending = sys.pending_removals().map_err(|why| {
+        InstallError::Refused(format!(
+            "Tornect cannot read whether Windows is to remove {folder} at the next restart \
+             ({why}), so it was not installed: a copy put there now could be deleted then."
+        ))
+    })?;
+    if pending.iter().any(|entry| names_folder(entry, folder)) {
+        return Err(InstallError::Refused(format!(
+            "Windows is still to remove {folder} at the next restart, so Tornect was not \
+             installed: a copy put there now would be deleted then. Restart the computer, then \
+             run tornect install again."
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `entry`, one string of the list of renames and deletes at the
+/// next restart, names `folder` or a path under it: with a leading `!` and
+/// then a leading `\??\` taken off, it is `folder` itself or `folder`
+/// followed by `\`, ASCII letters in either case. An empty string (a
+/// delete's destination) names nothing; an 8.3 short name is not resolved
+/// (Tornect's own marks use the long path).
+fn names_folder(entry: &str, folder: &str) -> bool {
+    let path = entry.strip_prefix('!').unwrap_or(entry);
+    let path = path.strip_prefix(r"\??\").unwrap_or(path);
+    !path.is_empty()
+        && path
+            .get(..folder.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(folder))
+        && path[folder.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| c == '\\')
+}
+
+/// Refused when an earlier install is there: its program
+/// `<Program Files>\Tornect\tornect.exe`, its uninstall entry or this user's
+/// Start-menu entry. Nothing is replaced in place (the operator's ruling):
+/// an upgrade is `tornect uninstall`, then `tornect install`.
+fn no_earlier_install(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result<(), InstallError> {
+    if sys.file_exists(&target.exe)?
+        || sys.uninstall_entry_exists(&target.entry.key)?
+        || sys.file_exists(&target.start_menu_entry)?
+    {
+        return Err(InstallError::Refused(already_installed(&target.folder)));
+    }
+    Ok(())
 }
 
 /// `tornect install` on Windows (§B.1.1), step by step:
@@ -596,7 +674,10 @@ fn existing_folder_ok(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result
 ///    quoted into the uninstall command, when `<Program Files>\Tornect`
 ///    exists and fails `existing_folder_ok` (anything but `tornect.exe` in
 ///    it, a reparse point, or an ACL that lets another account change it),
-///    or when a step would run elevated through any program but its own
+///    while Windows is to remove that folder at the next restart (or cannot
+///    say), over an earlier install (its program, its uninstall entry or
+///    this user's Start-menu entry, folder or no folder), or when a step
+///    would run elevated through any program but its own
 ///    ([`elevated_command`]);
 /// 3. `authorize`, the mutation guard's operation (re-authentication, no
 ///    remote session for 60 s, logged): nothing before it changes anything;
@@ -1468,6 +1549,11 @@ mod windows_tests {
         "C:\\Users\\u\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs";
     const IMAGE: &str = "C:\\Users\\u\\Downloads\\tornect\\tornect.exe";
     const PROGRAM: &[u8] = b"MZ the program";
+    const ALREADY_INSTALLED: &str =
+        "Tornect is already installed in C:\\Program Files\\Tornect. Run tornect uninstall first.";
+    const AWAITS_REMOVAL: &str = "Windows is still to remove C:\\Program Files\\Tornect at the \
+         next restart, so Tornect was not installed: a copy put there now would be deleted then. \
+         Restart the computer, then run tornect install again.";
 
     /// What the fake was asked, in order.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1546,6 +1632,9 @@ mod windows_tests {
         /// the step's own (the system folder's robocopy, reg or cmd; the
         /// installed copy for the entry).
         runner: BTreeMap<&'static str, String>,
+        /// Windows' list of removals at the next restart, or why it cannot
+        /// be read.
+        pending: RefCell<Result<Vec<String>, String>>,
     }
 
     fn kind(step: &Elevated) -> &'static str {
@@ -1583,6 +1672,7 @@ mod windows_tests {
                 cancel: RefCell::new(Vec::new()),
                 fail: Vec::new(),
                 runner: BTreeMap::new(),
+                pending: RefCell::new(Ok(Vec::new())),
             }
         }
 
@@ -1813,6 +1903,10 @@ mod windows_tests {
                 || self.files.borrow().contains_key(&key(path)))
         }
 
+        fn pending_removals(&self) -> Result<Vec<String>, InstallError> {
+            self.pending.borrow().clone().map_err(InstallError::Failed)
+        }
+
         fn write_shortcut(&self, link: &str, target: &str) -> Result<(), InstallError> {
             self.record(Ev::WriteShortcut(link.to_owned()));
             self.shortcuts
@@ -1944,8 +2038,7 @@ mod windows_tests {
 
     /// An existing `<Program Files>\Tornect` that holds anything but
     /// `tornect.exe`, or is a reparse point, is refused before the dialog
-    /// and before any prompt; one that holds only `tornect.exe` (an earlier
-    /// install, or one cut short) is installed over, and checked again.
+    /// and before any prompt.
     #[test]
     fn a_non_empty_existing_folder_is_refused() {
         let fake = Fake::new();
@@ -1986,10 +2079,21 @@ mod windows_tests {
             .files
             .borrow_mut()
             .insert(key(&earlier.exe()), b"old".to_vec());
-        install_in_program_files(&earlier, &mut allow(&earlier)).unwrap();
+        match install_in_program_files(&earlier, &mut allow(&earlier)) {
+            Err(InstallError::Refused(why)) => assert_eq!(why, ALREADY_INSTALLED),
+            other => panic!("installed over an earlier install: {other:?}"),
+        }
+        assert!(
+            !earlier
+                .events()
+                .iter()
+                .any(|e| matches!(e, Ev::Authorize | Ev::Elevated(_))),
+            "{:?}",
+            earlier.events()
+        );
         assert_eq!(
             earlier.files.borrow().get(&key(&earlier.exe())),
-            Some(&PROGRAM.to_vec())
+            Some(&b"old".to_vec())
         );
     }
 
@@ -2764,5 +2868,142 @@ mod windows_tests {
         });
         assert!(authorize < copy && copy < write, "{events:?}");
         assert_eq!(fake.elevated().len(), 2, "{events:?}");
+    }
+
+    /// Nothing is asked and nothing runs: no dialog, no prompt, no entry.
+    fn assert_nothing_asked(fake: &Fake, what: &str) {
+        assert!(
+            !fake
+                .events()
+                .iter()
+                .any(|e| matches!(e, Ev::Authorize | Ev::Elevated(_) | Ev::WriteShortcut(_))),
+            "{what}: {:?}",
+            fake.events()
+        );
+    }
+
+    /// An earlier install is refused before anything is asked, in the
+    /// operator's words, and nothing of it is replaced: its program, its
+    /// uninstall entry or this user's Start-menu entry, each alone; the
+    /// entry and the Start-menu entry also with no folder left.
+    #[test]
+    fn an_earlier_install_is_refused_before_anything_is_asked() {
+        for found in [
+            "program",
+            "entry",
+            "start menu",
+            "entry, no folder",
+            "start menu, no folder",
+        ] {
+            let fake = Fake::new();
+            if !found.ends_with("no folder") {
+                fake.folders.borrow_mut().insert(key(&fake.folder()));
+            }
+            if found == "program" {
+                fake.files
+                    .borrow_mut()
+                    .insert(key(&fake.exe()), b"old".to_vec());
+            } else if found.starts_with("entry") {
+                let entry = WindowsTarget::of(&fake).unwrap().entry;
+                fake.entries
+                    .borrow_mut()
+                    .insert(UNINSTALL_KEY.to_owned(), entry);
+            } else {
+                fake.shortcuts
+                    .borrow_mut()
+                    .insert(key(&Fake::link()), fake.exe());
+            }
+            match install_in_program_files(&fake, &mut allow(&fake)) {
+                Err(InstallError::Refused(why)) => assert_eq!(why, ALREADY_INSTALLED, "{found}"),
+                other => panic!("{found}: installed over it: {other:?}"),
+            }
+            assert_nothing_asked(&fake, found);
+        }
+    }
+
+    /// While Windows' list of removals at the next restart names the install
+    /// folder or a path under it (a delete, or a rename's destination), the
+    /// install is refused with a text that says to restart, folder present
+    /// or absent, before anything is asked; and after the dialog, before the
+    /// copy, when the list came to name it while the dialog was open.
+    #[test]
+    fn an_install_is_refused_while_its_folder_awaits_removal_at_the_restart() {
+        for list in [
+            vec![
+                "\\??\\C:\\Program Files\\Tornect\\tornect.exe".to_owned(),
+                String::new(),
+            ],
+            vec!["\\??\\C:\\PROGRAM FILES\\TORNECT".to_owned()],
+            vec![
+                "\\??\\C:\\Temp\\a".to_owned(),
+                "!\\??\\C:\\Program Files\\Tornect\\tornect.exe".to_owned(),
+            ],
+        ] {
+            for folder in [true, false] {
+                let fake = Fake::new();
+                if folder {
+                    fake.folders.borrow_mut().insert(key(&fake.folder()));
+                }
+                *fake.pending.borrow_mut() = Ok(list.clone());
+                let what = format!("{list:?}, folder {folder}");
+                match install_in_program_files(&fake, &mut allow(&fake)) {
+                    Err(InstallError::Refused(why)) => assert_eq!(why, AWAITS_REMOVAL, "{what}"),
+                    other => panic!("{what}: {other:?}"),
+                }
+                assert_nothing_asked(&fake, &what);
+            }
+        }
+        let fake = Fake::new();
+        let mut named_meanwhile = || {
+            fake.record(Ev::Authorize);
+            *fake.pending.borrow_mut() = Ok(vec![
+                "\\??\\C:\\Program Files\\Tornect".to_owned(),
+                String::new(),
+            ]);
+            Ok(())
+        };
+        match install_in_program_files(&fake, &mut named_meanwhile) {
+            Err(InstallError::Refused(why)) => assert_eq!(why, AWAITS_REMOVAL),
+            other => panic!("{other:?}"),
+        }
+        assert!(fake.events().contains(&Ev::Authorize));
+        assert!(fake.elevated().is_empty(), "{:?}", fake.events());
+    }
+
+    /// A removal at the next restart of anything but the install folder or
+    /// a path under it refuses nothing: a folder whose name only begins
+    /// with `Tornect`, another folder named `Tornect`, a rename elsewhere.
+    #[test]
+    fn a_removal_pending_elsewhere_does_not_refuse_the_install() {
+        let fake = Fake::new();
+        *fake.pending.borrow_mut() = Ok(vec![
+            "\\??\\C:\\Program Files\\Tornect2\\tornect.exe".to_owned(),
+            String::new(),
+            "\\??\\C:\\Program Files\\Other\\Tornect".to_owned(),
+            String::new(),
+            "\\??\\C:\\Temp\\a".to_owned(),
+            "!\\??\\C:\\Temp\\b".to_owned(),
+        ]);
+        install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        assert!(fake.events().contains(&Ev::Authorize));
+        assert!(fake.entries.borrow().contains_key(UNINSTALL_KEY));
+    }
+
+    /// A list of removals at the next restart that cannot be read refuses
+    /// the install, which could be deleted then: nothing is asked or run.
+    #[test]
+    fn an_unreadable_restart_list_refuses_the_install() {
+        let fake = Fake::new();
+        *fake.pending.borrow_mut() = Err("access denied".to_owned());
+        match install_in_program_files(&fake, &mut allow(&fake)) {
+            Err(InstallError::Refused(why)) => assert_eq!(
+                why,
+                "Tornect cannot read whether Windows is to remove C:\\Program Files\\Tornect at \
+                 the next restart (access denied), so it was not installed: a copy put there now \
+                 could be deleted then."
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_nothing_asked(&fake, "unreadable");
     }
 }

@@ -152,6 +152,25 @@ fn registered(backend: &dyn Autostart) -> bool {
     matches!(backend.status(), Ok(AutostartState::Registered(_)) | Err(_))
 }
 
+/// Whether `backend`'s start at sign-in may run the installed copy `exe`: a
+/// registration whose command names it (ASCII letters in either case), one
+/// whose command cannot be read, or a status that cannot be read (as
+/// [`registered`] counts it). Nothing registered, or no mechanism here, is
+/// not an earlier install.
+#[cfg(any(windows, test))]
+fn starts_the_installed_copy(backend: &dyn Autostart, exe: &str) -> bool {
+    match backend.status() {
+        Ok(AutostartState::Registered(registration)) => match &registration.command {
+            Some(command) if !registration.unreadable => command
+                .to_ascii_lowercase()
+                .contains(&exe.to_ascii_lowercase()),
+            _ => true,
+        },
+        Ok(AutostartState::Absent | AutostartState::Unavailable(_)) => false,
+        Err(_) => true,
+    }
+}
+
 /// `tornect install`.
 pub fn install(paths: &Paths) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
@@ -370,10 +389,11 @@ fn windows_install_home_refusal() -> String {
     )
 }
 
-/// `tornect install` on Windows: refused with a custom home and beside a
-/// running host, then the Program Files steps with the guard's operation
-/// between the held, hashed source and the first change, and the offer to
-/// start at sign-in for the installed copy.
+/// `tornect install` on Windows: refused with a custom home, beside a
+/// running host and while a start at sign-in may run an earlier install's
+/// copy; then the Program Files steps with the guard's operation between
+/// the held, hashed source and the first change, and the offer to start at
+/// sign-in for the installed copy.
 #[cfg(any(windows, test))]
 pub(crate) fn install_windows(
     deps: &mut Deps<'_>,
@@ -383,6 +403,22 @@ pub(crate) fn install_windows(
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!custom_home, windows_install_home_refusal());
     anyhow::ensure!(!deps.host_running, CLOSE_FIRST);
+    // An earlier install's start at sign-in, before anything is asked: the
+    // steps below read its program and its entries, not the task.
+    let folder = format!(
+        "{}\\{}",
+        sys.program_files()?.trim_end_matches('\\'),
+        tornect_platform::install::WINDOWS_FOLDER
+    );
+    let exe = format!("{folder}\\{}", tornect_platform::install::WINDOWS_EXE);
+    let sign_in = (deps.autostart_for)(LaunchSpec {
+        exe: PathBuf::from(&exe),
+        home: None,
+    });
+    anyhow::ensure!(
+        !starts_the_installed_copy(&*sign_in, &exe),
+        tornect_platform::install::already_installed(&folder)
+    );
     let guard = Arc::clone(&deps.ctx.guard);
     let refused = std::cell::RefCell::new(None);
     let authorized = std::cell::Cell::new(false);
@@ -579,6 +615,8 @@ mod tests {
         state: Mutex<Option<AutostartState>>,
         installs: Mutex<usize>,
         uninstalls: Mutex<usize>,
+        /// Its status cannot be read.
+        unreadable: bool,
     }
 
     impl Autostart for FakeSignIn {
@@ -609,6 +647,11 @@ mod tests {
         }
 
         fn status(&self) -> Result<AutostartState, AutostartError> {
+            if self.unreadable {
+                return Err(AutostartError::Failed(
+                    "the test's status cannot be read".to_owned(),
+                ));
+            }
             Ok(self
                 .state
                 .lock()
@@ -632,6 +675,8 @@ mod tests {
         made: Mutex<Vec<Arc<FakeSignIn>>>,
         /// What a new backend finds registered.
         registered: Option<AutostartState>,
+        /// Whether a new backend's status cannot be read.
+        unreadable: bool,
     }
 
     impl Backends {
@@ -639,6 +684,7 @@ mod tests {
             let backend = Arc::new(FakeSignIn {
                 spec: Some(spec),
                 state: Mutex::new(self.registered.clone()),
+                unreadable: self.unreadable,
                 ..FakeSignIn::default()
             });
             self.made.lock().unwrap().push(Arc::clone(&backend));
@@ -788,6 +834,67 @@ mod tests {
         }
         fn file_exists(&self, _: &str) -> Result<bool, InstallError> {
             panic!("read a file")
+        }
+        fn pending_removals(&self) -> Result<Vec<String>, InstallError> {
+            panic!("read the registry")
+        }
+        fn write_shortcut(&self, _: &str, _: &str) -> Result<(), InstallError> {
+            panic!("wrote a shortcut")
+        }
+        fn remove_shortcut(&self, _: &str) -> Result<(), InstallError> {
+            panic!("removed a shortcut")
+        }
+    }
+
+    /// Windows with nothing of Tornect on it, whose image cannot be opened:
+    /// an install that goes on stops there, before anything is asked.
+    struct Bare;
+
+    /// Why [`Bare`]'s install stops.
+    const BARE_IMAGE: &str = "the test's image cannot be opened";
+
+    impl WindowsSystem for Bare {
+        fn program_files(&self) -> Result<String, InstallError> {
+            Ok("C:\\Program Files".to_owned())
+        }
+        fn system_directory(&self) -> Result<String, InstallError> {
+            Ok("C:\\Windows\\System32".to_owned())
+        }
+        fn start_menu_programs(&self) -> Result<String, InstallError> {
+            Ok("C:\\Users\\u\\Start Menu\\Programs".to_owned())
+        }
+        fn open_own_image(&self) -> Result<Box<dyn HeldImage + '_>, InstallError> {
+            Err(InstallError::Failed(BARE_IMAGE.to_owned()))
+        }
+        fn folder_entries(&self, _: &str) -> Result<Option<Vec<String>>, InstallError> {
+            Ok(None)
+        }
+        fn is_reparse_point(&self, _: &str) -> Result<bool, InstallError> {
+            Ok(false)
+        }
+        fn read_file(&self, _: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError> {
+            panic!("read a file")
+        }
+        fn security(
+            &self,
+            _: &str,
+        ) -> Result<tornect_platform::helper_task::Security, InstallError> {
+            panic!("read an ACL")
+        }
+        fn elevated_program(&self, _: &Elevated) -> String {
+            panic!("asked for a program")
+        }
+        fn run_elevated(&self, _: &Elevated) -> Result<(), InstallError> {
+            panic!("ran a step elevated")
+        }
+        fn uninstall_entry_exists(&self, _: &str) -> Result<bool, InstallError> {
+            Ok(false)
+        }
+        fn file_exists(&self, _: &str) -> Result<bool, InstallError> {
+            Ok(false)
+        }
+        fn pending_removals(&self) -> Result<Vec<String>, InstallError> {
+            Ok(Vec::new())
         }
         fn write_shortcut(&self, _: &str, _: &str) -> Result<(), InstallError> {
             panic!("wrote a shortcut")
@@ -1340,5 +1447,92 @@ mod tests {
         assert!(err.starts_with(REMOVE_ADMIN_FIRST), "{err}");
         assert!(err.contains("helper task is still registered"), "{err}");
         assert!(env.dialogs.asked().is_empty());
+    }
+
+    /// §B.1.1 (no install over an install, the operator's ruling): a start
+    /// at sign-in that runs the installed copy, whose command cannot be read
+    /// or whose status cannot be read, refuses `tornect install` before
+    /// anything is asked; one that runs another copy does not.
+    #[test]
+    fn an_earlier_sign_in_start_refuses_the_install() {
+        let installed = "C:\\Program Files\\Tornect\\tornect.exe";
+        let registered = |command: Option<String>, unreadable: bool| {
+            Some(AutostartState::Registered(Registration {
+                enabled: true,
+                elevated: false,
+                command,
+                note: None,
+                unreadable,
+            }))
+        };
+        let cases = [
+            (
+                "the installed copy",
+                registered(
+                    Some(format!("\"{}\" \"--background\"", installed.to_uppercase())),
+                    false,
+                ),
+                false,
+                true,
+            ),
+            (
+                "a command that cannot be read",
+                registered(None, true),
+                false,
+                true,
+            ),
+            ("a status that cannot be read", None, true, true),
+            (
+                "another copy",
+                registered(
+                    Some(
+                        "\"C:\\Users\\u\\Downloads\\tornect\\tornect.exe\" \"--background\""
+                            .to_owned(),
+                    ),
+                    false,
+                ),
+                false,
+                false,
+            ),
+        ];
+        for (what, state, unreadable, refused) in cases {
+            let mut env = env(windows_admin(), 2);
+            let backends = Backends {
+                registered: state,
+                unreadable,
+                ..Backends::default()
+            };
+            let make = |spec| backends.make(spec);
+            let mut script = Script::answering(&[]);
+            let mut deps = Deps {
+                ctx: &mut env.ctx,
+                console: &mut script,
+                host_running: false,
+                autostart_for: &make,
+            };
+            let err = install_windows(&mut deps, &env.paths, &Bare, false)
+                .unwrap_err()
+                .to_string();
+            if refused {
+                assert_eq!(
+                    err,
+                    "Tornect is already installed in C:\\Program Files\\Tornect. Run tornect \
+                     uninstall first.",
+                    "{what}"
+                );
+            } else {
+                assert_eq!(err, BARE_IMAGE, "{what}: it did not go on");
+            }
+            assert!(env.dialogs.asked().is_empty(), "{what}");
+            assert_eq!(
+                backends.specs(),
+                [LaunchSpec {
+                    exe: PathBuf::from(installed),
+                    home: None,
+                }],
+                "{what}"
+            );
+            assert_eq!(backends.installs(), 0, "{what}");
+        }
     }
 }
