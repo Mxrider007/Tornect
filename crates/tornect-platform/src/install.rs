@@ -39,11 +39,13 @@
 //! then the Apps-and-features entry (elevated), whose command is the quoted
 //! path with the fixed argument `uninstall`. A failure undoes what was done,
 //! newest first, but a folder found unsafe is never deleted as
-//! administrator, and only a program in Program Files or the system folder
-//! ever runs elevated. This build has not the calls that make these steps on
-//! Windows, where `windows_system` refuses.
+//! administrator. Each elevated step runs only through its own program
+//! ([`elevated_command`]): the system folder's robocopy, reg and cmd for the
+//! copy, the entry's delete and the folder's removal, and the installed copy,
+//! after its checks, for the entry; the held image must be named
+//! `tornect.exe`, since the copy keeps the name. This build has not the calls
+//! that make these steps on Windows, where `windows_system` refuses.
 
-use crate::autostart::location_under;
 use crate::helper_task::{Install as HelperInstall, Security, admin_only, guarded_paths};
 
 /// The name the installed program's entries show: the Linux menu entry, and
@@ -90,6 +92,18 @@ pub const UNINSTALL_KEY: &str = "Tornect";
 /// The uninstall command's fixed argument (§B.1.1).
 pub const UNINSTALL_ARGUMENT: &str = "uninstall";
 
+/// Where the uninstall entry's key is, under HKLM.
+pub const UNINSTALL_ROOT: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+
+/// The installed copy's internal step that writes the uninstall entry: its
+/// only argument (§B.1.1, the CLI list).
+pub const ENTRY_STEP_ARGUMENT: &str = "install-entry";
+
+/// Why an image not named `tornect.exe` is not installed: the copy keeps
+/// the file's name, and the installed program is `tornect.exe`.
+pub const SOURCE_NOT_NAMED_TORNECT_EXE: &str = "Tornect can be installed only from a file named \
+     tornect.exe. Rename this copy to tornect.exe and run it again.";
+
 /// Why `tornect install` and `uninstall` refuse on Windows in this build:
 /// the calls that make the steps below on Windows are not in it.
 pub const PROGRAM_FILES_UNAVAILABLE: &str =
@@ -112,7 +126,7 @@ pub const COPY_NOT_ADMIN_ONLY: &str = "The installed copy could be changed by ac
      the Tornect folder in Program Files by hand.";
 
 /// One step that needs administrator rights, run through Windows' prompt
-/// (UAC).
+/// (UAC), each only through its own program ([`elevated_command`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Elevated {
     /// Copy the held image at `from` to `to`, creating the folder.
@@ -187,7 +201,7 @@ pub trait WindowsSystem {
     /// reparse point at `path` is read itself, never followed.
     fn security(&self, path: &str) -> Result<Security, InstallError>;
     /// The program that would run `step` elevated (checked before any step
-    /// runs: only a program in Program Files or the system folder may be).
+    /// runs: only the step's own program, [`elevated_command`]'s, may be).
     fn elevated_program(&self, step: &Elevated) -> String;
     /// Run `step` through Windows' prompt: [`InstallError::Cancelled`] when
     /// the prompt was dismissed and nothing ran.
@@ -210,6 +224,110 @@ pub fn windows_system() -> Result<Box<dyn WindowsSystem>, InstallError> {
     Err(InstallError::Unavailable(
         PROGRAM_FILES_UNAVAILABLE.to_owned(),
     ))
+}
+
+/// The system folder's copy program.
+const ROBOCOPY: &str = "robocopy.exe";
+
+/// The system folder's registry program.
+const REG: &str = "reg.exe";
+
+/// The system folder's command interpreter.
+const CMD: &str = "cmd.exe";
+
+/// The program that runs `step` elevated and its parameters: the only
+/// program [`WindowsSystem::elevated_program`] may name for it (decision
+/// M1-65).
+///
+/// - The copy: the system folder's `robocopy.exe`, from the held image's
+///   folder into `<Program Files>\Tornect`, the file `tornect.exe` only, with
+///   no retry and no option that copies owners or ACLs, moves or mirrors
+///   (robocopy keeps the file's name, so the source is named `tornect.exe`).
+/// - The entry's delete: the system folder's `reg.exe`, in the 64-bit view.
+/// - The folder's removal: the system folder's `cmd.exe`, with `/d` (no
+///   AutoRun command) and `/v:off` (no delayed expansion).
+/// - The entry's write: the installed copy, `tornect.exe install-entry`,
+///   which takes nothing else and computes the entry itself.
+///
+/// Every path is quoted, and none ends in `\` before its closing quote.
+pub fn elevated_command(step: &Elevated, target: &WindowsTarget) -> (String, String) {
+    let system = |name: &str| windows_join(&target.system_directory, name);
+    match step {
+        Elevated::Copy { from, to } => (
+            system(ROBOCOPY),
+            format!(
+                "\"{}\" \"{}\" {WINDOWS_EXE} /R:0 /W:0",
+                quotable_folder(parent_of(from)),
+                quotable_folder(parent_of(to)),
+            ),
+        ),
+        Elevated::DeleteEntry { key } => (
+            system(REG),
+            format!("delete \"HKLM\\{UNINSTALL_ROOT}\\{key}\" /f /reg:64"),
+        ),
+        Elevated::RemoveFolder { folder } => (
+            system(CMD),
+            format!("/d /v:off /c rmdir /s /q \"{}\"", quotable_folder(folder)),
+        ),
+        Elevated::WriteEntry(_) => (target.exe.clone(), ENTRY_STEP_ARGUMENT.to_owned()),
+    }
+}
+
+/// Whether `step`'s program ended as a success: robocopy only with 1 (the
+/// file was copied; with 0 nothing was, and since the folder holds no other
+/// file, 2 to 7 do not mean success either), every other one only with 0.
+#[must_use]
+pub fn step_succeeded(step: &Elevated, exit_code: u32) -> bool {
+    match step {
+        Elevated::Copy { .. } => exit_code == 1,
+        _ => exit_code == 0,
+    }
+}
+
+/// The folder `path` is in: what comes before its last `\` (or `/`).
+fn parent_of(path: &str) -> &str {
+    path.rfind(['\\', '/']).map_or("", |at| &path[..at])
+}
+
+/// `folder` as it goes between quotes: without a trailing `\`, which would
+/// escape the closing quote, and a drive's root as `X:\.`, never `X:`
+/// (that drive's current folder).
+fn quotable_folder(folder: &str) -> String {
+    let trimmed = folder.trim_end_matches(['\\', '/']);
+    let bytes = trimmed.as_bytes();
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        format!("{trimmed}\\.")
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Whether `a` and `b` are the same path as they are compared here: `/`
+/// read as `\`, ASCII letters in either case; nothing else is resolved, so
+/// another spelling of the same file is refused.
+fn same_path(a: &str, b: &str) -> bool {
+    a.replace('/', "\\")
+        .eq_ignore_ascii_case(&b.replace('/', "\\"))
+}
+
+/// Refused unless the held image can be the copy's source: robocopy keeps
+/// the file's name, so it must be `tornect.exe` (in any case), and its path
+/// goes quoted into robocopy's parameters, so it holds no `%`, `"` or
+/// control character.
+fn source_ok(path: &str) -> Result<(), InstallError> {
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    if !name.eq_ignore_ascii_case(WINDOWS_EXE) {
+        return Err(InstallError::Refused(
+            SOURCE_NOT_NAMED_TORNECT_EXE.to_owned(),
+        ));
+    }
+    if path.chars().any(|c| c.is_control() || c == '"' || c == '%') {
+        return Err(InstallError::Refused(format!(
+            "{path:?} holds a character Windows' copy cannot take (%, \" or a control \
+             character), so Tornect was not installed from it."
+        )));
+    }
+    Ok(())
 }
 
 /// `dir\name`.
@@ -284,18 +402,19 @@ impl WindowsTarget {
         })
     }
 
-    /// Refused unless `step` would run elevated through a program in
-    /// Program Files or the system folder (decision M1-65: an executable
-    /// another program of this user can replace is never elevated).
+    /// Refused unless `step` would run elevated through its own program,
+    /// [`elevated_command`]'s, and no other (decision M1-65: an executable
+    /// another program of this user can replace is never elevated, nor a
+    /// system program a step does not need, such as PowerShell).
     fn elevation_ok(&self, sys: &dyn WindowsSystem, step: &Elevated) -> Result<(), InstallError> {
         let program = sys.elevated_program(step);
-        let trusted = [self.program_files.clone(), self.system_directory.clone()];
-        if location_under(&program, &trusted) {
+        let (own, _) = elevated_command(step, self);
+        if same_path(&program, &own) {
             return Ok(());
         }
         Err(InstallError::Unavailable(format!(
-            "Tornect runs nothing as administrator from {program}: only a program in Program \
-             Files or the Windows system folder, which other accounts cannot change"
+            "Tornect runs nothing as administrator from {program}: this step runs only {own}, \
+             which other accounts cannot change."
         )))
     }
 
@@ -470,13 +589,15 @@ fn existing_folder_ok(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result
 /// `tornect install` on Windows (§B.1.1), step by step:
 ///
 /// 1. this program's image, held open (share mode read only) and hashed from
-///    that handle, before anything else and until the end;
+///    that handle, before anything else and until the end; refused when its
+///    file is not named `tornect.exe` or its path holds `%`, `"` or a
+///    control character (the copy keeps the name and takes the path quoted);
 /// 2. the target from the known folders; refused when its path cannot be
 ///    quoted into the uninstall command, when `<Program Files>\Tornect`
 ///    exists and fails `existing_folder_ok` (anything but `tornect.exe` in
 ///    it, a reparse point, or an ACL that lets another account change it),
-///    or when a step would run elevated through a program outside Program
-///    Files and the system folder;
+///    or when a step would run elevated through any program but its own
+///    ([`elevated_command`]);
 /// 3. `authorize`, the mutation guard's operation (re-authentication, no
 ///    remote session for 60 s, logged): nothing before it changes anything;
 ///    then the folder checked again, as the dialog may have stayed open for
@@ -497,6 +618,7 @@ pub fn install_in_program_files(
     authorize: &mut dyn FnMut() -> Result<(), InstallError>,
 ) -> Result<Installed, InstallError> {
     let source = HeldSource::hold(sys)?;
+    source_ok(source.path())?;
     let target = WindowsTarget::of(sys)?;
     existing_folder_ok(sys, &target)?;
     let copy = Elevated::Copy {
@@ -1393,6 +1515,8 @@ mod windows_tests {
     struct Fake {
         events: RefCell<Vec<Ev>>,
         program_files: String,
+        /// Where the held image is.
+        image_path: String,
         image: Vec<u8>,
         /// What a copy writes instead of the held image (a swap).
         copy_writes: Option<Vec<u8>>,
@@ -1418,8 +1542,9 @@ mod windows_tests {
         cancel: RefCell<Vec<&'static str>>,
         /// Elevated steps that fail (by kind).
         fail: Vec<&'static str>,
-        /// The program that would run a step elevated, by kind; System32's
-        /// otherwise.
+        /// The program that would run a step elevated, by kind; otherwise
+        /// the step's own (the system folder's robocopy, reg or cmd; the
+        /// installed copy for the entry).
         runner: BTreeMap<&'static str, String>,
     }
 
@@ -1441,6 +1566,7 @@ mod windows_tests {
             Self {
                 events: RefCell::new(Vec::new()),
                 program_files: PF.to_owned(),
+                image_path: IMAGE.to_owned(),
                 image: PROGRAM.to_vec(),
                 copy_writes: None,
                 files: RefCell::new(BTreeMap::new()),
@@ -1549,7 +1675,7 @@ mod windows_tests {
 
     impl HeldImage for FakeImage<'_> {
         fn path(&self) -> &str {
-            IMAGE
+            &self.fake.image_path
         }
     }
 
@@ -1624,7 +1750,12 @@ mod windows_tests {
             self.runner
                 .get(kind(step))
                 .cloned()
-                .unwrap_or_else(|| format!("{SYSTEM32}\\robocopy.exe"))
+                .unwrap_or_else(|| match step {
+                    Elevated::Copy { .. } => system("robocopy.exe"),
+                    Elevated::DeleteEntry { .. } => system("reg.exe"),
+                    Elevated::RemoveFolder { .. } => system("cmd.exe"),
+                    Elevated::WriteEntry(_) => self.exe(),
+                })
         }
 
         fn run_elevated(&self, step: &Elevated) -> Result<(), InstallError> {
@@ -1698,6 +1829,11 @@ mod windows_tests {
             self.shortcuts.borrow_mut().remove(&key(link));
             Ok(())
         }
+    }
+
+    /// The system folder's program `name`.
+    fn system(name: &str) -> String {
+        format!("{SYSTEM32}\\{name}")
     }
 
     /// The guard's operation as the steps see it: recorded, allowed.
@@ -2074,12 +2210,18 @@ mod windows_tests {
             Err(InstallError::Unavailable(_))
         ));
         assert!(fake.elevated().is_empty());
-        // The installed copy itself may run a step: it is in Program Files.
+        // Not the installed copy either: the entry's delete runs only
+        // through the system folder's reg.
         let mut fake = Fake::new();
         fake.installed();
         let exe = fake.exe();
-        fake.runner.insert("delete", exe);
-        uninstall_from_program_files(&fake, &mut allow(&fake)).unwrap();
+        fake.runner.insert("delete", exe.clone());
+        match uninstall_from_program_files(&fake, &mut allow(&fake)) {
+            Err(InstallError::Unavailable(why)) => assert!(why.contains(&exe), "{why}"),
+            other => panic!("the installed copy deleted the entry: {other:?}"),
+        }
+        assert!(fake.elevated().is_empty(), "{:?}", fake.events());
+        assert!(!fake.events().contains(&Ev::Authorize));
     }
 
     /// An existing `<Program Files>\Tornect` is checked as the copy will be,
@@ -2330,5 +2472,297 @@ mod windows_tests {
             reads.iter().all(|(at, _)| copy < *at && *at < first_entry),
             "{events:?}"
         );
+    }
+
+    /// Each elevated step runs only through its own program (decision
+    /// M1-65): the copy through the system folder's `robocopy.exe`, the
+    /// entry's delete through its `reg.exe`, the folder's removal through
+    /// its `cmd.exe`. Any other program is refused before the dialog, with
+    /// nothing run elevated and a refusal that names it and the step's own:
+    /// another program in Program Files, the installed copy, this copy in
+    /// Downloads, PowerShell, another step's system program.
+    #[test]
+    fn each_elevated_step_runs_only_its_own_program() {
+        let own = [
+            ("copy", system("robocopy.exe")),
+            ("delete", system("reg.exe")),
+            ("remove", system("cmd.exe")),
+        ];
+        for (step, program) in &own {
+            let mut runners = vec![
+                format!("{PF}\\Other\\other.exe"),
+                format!("{PF}\\Tornect\\tornect.exe"),
+                IMAGE.to_owned(),
+                system("WindowsPowerShell\\v1.0\\powershell.exe"),
+            ];
+            runners.extend(
+                own.iter()
+                    .filter(|(s, _)| s != step)
+                    .map(|(_, p)| p.clone()),
+            );
+            for runner in runners {
+                let mut fake = Fake::new();
+                if *step != "copy" {
+                    fake.installed();
+                }
+                fake.runner.insert(step, runner.clone());
+                let done = if *step == "copy" {
+                    install_in_program_files(&fake, &mut allow(&fake)).map(drop)
+                } else {
+                    uninstall_from_program_files(&fake, &mut allow(&fake)).map(drop)
+                };
+                match done {
+                    Err(InstallError::Unavailable(why)) => {
+                        assert!(why.contains(&runner), "{step} {runner}: {why}");
+                        assert!(why.contains(program.as_str()), "{step} {runner}: {why}");
+                    }
+                    other => panic!("{step} through {runner}: {other:?}"),
+                }
+                assert!(
+                    fake.elevated().is_empty(),
+                    "{step} {runner}: {:?}",
+                    fake.events()
+                );
+                assert!(!fake.events().contains(&Ev::Authorize), "{step} {runner}");
+            }
+        }
+    }
+
+    /// The uninstall entry is written only by the installed copy: a write
+    /// through robocopy, reg, another program in Program Files or this copy
+    /// in Downloads is refused before the dialog, and nothing is left.
+    #[test]
+    fn the_entry_is_written_only_by_the_installed_copy() {
+        for runner in [
+            system("robocopy.exe"),
+            system("reg.exe"),
+            format!("{PF}\\Other\\tornect.exe"),
+            IMAGE.to_owned(),
+        ] {
+            let mut fake = Fake::new();
+            fake.runner.insert("write", runner.clone());
+            match install_in_program_files(&fake, &mut allow(&fake)) {
+                Err(InstallError::Unavailable(why)) => {
+                    assert!(why.contains(&runner), "{runner}: {why}");
+                    assert!(why.contains(&fake.exe()), "{runner}: {why}");
+                }
+                other => panic!("written through {runner}: {other:?}"),
+            }
+            assert!(fake.elevated().is_empty(), "{runner}: {:?}", fake.events());
+            assert!(!fake.events().contains(&Ev::Authorize), "{runner}");
+            fake.assert_nothing_installed();
+        }
+        let fake = Fake::new();
+        install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        assert!(fake.entries.borrow().contains_key(UNINSTALL_KEY));
+    }
+
+    /// The installed copy runs as administrator only after its ACL check
+    /// passed in this run: a copy that fails it is refused, the copy is the
+    /// only elevated step, and the entry is never written.
+    #[test]
+    fn the_installed_copy_runs_nothing_after_a_failed_acl_check() {
+        for broken in ["exe", "folder", "owner"] {
+            let mut fake = Fake::new();
+            match broken {
+                "exe" => {
+                    fake.writable_by_users.insert(key(&fake.exe()));
+                }
+                "folder" => {
+                    fake.writable_by_users.insert(key(&fake.folder()));
+                }
+                _ => {
+                    fake.owned_by_users.insert(key(&fake.exe()));
+                }
+            }
+            match install_in_program_files(&fake, &mut allow(&fake)) {
+                Err(InstallError::Refused(why)) => assert_eq!(why, COPY_NOT_ADMIN_ONLY, "{broken}"),
+                other => panic!("{broken}: {other:?}"),
+            }
+            let elevated = fake.elevated();
+            assert!(
+                matches!(elevated.as_slice(), [Elevated::Copy { .. }]),
+                "{broken}: {elevated:?}"
+            );
+        }
+    }
+
+    /// Every elevated step's program and parameters, built from the step
+    /// and the known folders only: robocopy copies the held file's folder's
+    /// `tornect.exe` into `<Program Files>\Tornect` with no retry and
+    /// nothing that copies owners or ACLs, moves or mirrors; reg deletes
+    /// the entry in the 64-bit view; cmd removes the folder with no AutoRun
+    /// command and no delayed expansion; the installed copy writes the
+    /// entry. No quoted path ends in `\` before its closing quote, and a
+    /// source at a drive root is never that drive's current folder.
+    #[test]
+    fn each_elevated_step_has_its_fixed_program_and_arguments() {
+        let fake = Fake::new();
+        let target = WindowsTarget::of(&fake).unwrap();
+        let copy = Elevated::Copy {
+            from: IMAGE.to_owned(),
+            to: target.exe.clone(),
+        };
+        let root = Elevated::Copy {
+            from: "D:\\tornect.exe".to_owned(),
+            to: target.exe.clone(),
+        };
+        let delete = Elevated::DeleteEntry {
+            key: UNINSTALL_KEY.to_owned(),
+        };
+        let remove = Elevated::RemoveFolder {
+            folder: target.folder.clone(),
+        };
+        let write = Elevated::WriteEntry(target.entry.clone());
+        let built = [
+            (
+                &copy,
+                "C:\\Windows\\System32\\robocopy.exe",
+                "\"C:\\Users\\u\\Downloads\\tornect\" \"C:\\Program Files\\Tornect\" tornect.exe \
+                 /R:0 /W:0",
+            ),
+            (
+                &root,
+                "C:\\Windows\\System32\\robocopy.exe",
+                "\"D:\\.\" \"C:\\Program Files\\Tornect\" tornect.exe /R:0 /W:0",
+            ),
+            (
+                &delete,
+                "C:\\Windows\\System32\\reg.exe",
+                "delete \"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Tornect\" \
+                 /f /reg:64",
+            ),
+            (
+                &remove,
+                "C:\\Windows\\System32\\cmd.exe",
+                "/d /v:off /c rmdir /s /q \"C:\\Program Files\\Tornect\"",
+            ),
+            (
+                &write,
+                "C:\\Program Files\\Tornect\\tornect.exe",
+                "install-entry",
+            ),
+        ];
+        for (step, program, parameters) in built {
+            let (got_program, got_parameters) = elevated_command(step, &target);
+            assert_eq!(got_program, program, "{step:?}");
+            assert_eq!(got_parameters, parameters, "{step:?}");
+            assert!(!got_parameters.contains("\\\""), "{got_parameters}");
+            let upper = got_parameters.to_uppercase();
+            for flag in ["/SEC", "/COPYALL", "/MOV", "/MIR", "/PURGE"] {
+                assert!(!upper.contains(flag), "{flag}: {got_parameters}");
+            }
+        }
+    }
+
+    /// Robocopy succeeds only with exit code 1 (the file was copied): 0
+    /// copied nothing, 2 to 7 met other files (the folder holds none), 8 and
+    /// above failed. Every other step's program succeeds only with 0.
+    #[test]
+    fn robocopy_succeeds_only_when_it_copied_the_file() {
+        let target = WindowsTarget::of(&Fake::new()).unwrap();
+        let copy = Elevated::Copy {
+            from: IMAGE.to_owned(),
+            to: target.exe.clone(),
+        };
+        assert!(step_succeeded(&copy, 1));
+        for code in [0, 2, 3, 4, 5, 6, 7, 8, 16, u32::MAX] {
+            assert!(!step_succeeded(&copy, code), "{code}");
+        }
+        for step in [
+            Elevated::DeleteEntry {
+                key: UNINSTALL_KEY.to_owned(),
+            },
+            Elevated::RemoveFolder {
+                folder: target.folder.clone(),
+            },
+            Elevated::WriteEntry(target.entry.clone()),
+        ] {
+            assert!(step_succeeded(&step, 0), "{step:?}");
+            for code in [1, 2, 5, 16, u32::MAX] {
+                assert!(!step_succeeded(&step, code), "{step:?}: {code}");
+            }
+        }
+    }
+
+    /// Robocopy keeps the file's name, so the held image must be named
+    /// `tornect.exe` (in any case), and its path goes quoted into robocopy's
+    /// parameters, so it may hold no `%`, `"` or control character: anything
+    /// else is refused right after the image is held, before anything is
+    /// asked or run.
+    #[test]
+    fn a_source_not_named_tornect_exe_is_refused_before_anything_is_asked() {
+        let only_held = |fake: &Fake, path: &str| {
+            let events = fake.events();
+            assert!(
+                events
+                    .iter()
+                    .all(|e| matches!(e, Ev::OpenImage | Ev::ReadImage | Ev::CloseImage)),
+                "{path}: {events:?}"
+            );
+            assert_eq!(events.last(), Some(&Ev::CloseImage), "{path}");
+        };
+        for path in [
+            "C:\\Users\\u\\Downloads\\tornect-copy.exe",
+            "C:\\Users\\u\\Downloads\\tornect.exe.exe",
+            "C:\\Users\\u\\Downloads\\tornect",
+            "C:\\Users\\u\\Downloads\\tornect.exe\\other.exe",
+        ] {
+            let mut fake = Fake::new();
+            fake.image_path = path.to_owned();
+            match install_in_program_files(&fake, &mut allow(&fake)) {
+                Err(InstallError::Refused(why)) => {
+                    assert_eq!(why, SOURCE_NOT_NAMED_TORNECT_EXE, "{path}");
+                }
+                other => panic!("{path}: {other:?}"),
+            }
+            only_held(&fake, path);
+        }
+        for path in [
+            "C:\\Users\\u\\100%\\tornect.exe",
+            "C:\\Users\\u\\a\"b\\tornect.exe",
+            "C:\\Users\\u\\a\u{1b}b\\tornect.exe",
+        ] {
+            let mut fake = Fake::new();
+            fake.image_path = path.to_owned();
+            match install_in_program_files(&fake, &mut allow(&fake)) {
+                Err(InstallError::Refused(why)) => assert_eq!(
+                    why,
+                    format!(
+                        "{path:?} holds a character Windows' copy cannot take (%, \" or a \
+                         control character), so Tornect was not installed from it."
+                    ),
+                    "{path}"
+                ),
+                other => panic!("{path:?}: {other:?}"),
+            }
+            only_held(&fake, path);
+        }
+        let mut fake = Fake::new();
+        fake.image_path = "C:\\Users\\u\\Downloads\\TORNECT.EXE".to_owned();
+        install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+    }
+
+    /// One guard operation covers both prompts: the dialog comes once,
+    /// before the copy's prompt and before the entry's.
+    #[test]
+    fn one_guard_operation_covers_both_prompts() {
+        let fake = Fake::new();
+        install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        let events = fake.events();
+        assert_eq!(
+            events.iter().filter(|e| **e == Ev::Authorize).count(),
+            1,
+            "{events:?}"
+        );
+        let authorize = position(&events, |e| *e == Ev::Authorize);
+        let copy = position(&events, |e| {
+            matches!(e, Ev::Elevated(Elevated::Copy { .. }))
+        });
+        let write = position(&events, |e| {
+            matches!(e, Ev::Elevated(Elevated::WriteEntry(_)))
+        });
+        assert!(authorize < copy && copy < write, "{events:?}");
+        assert_eq!(fake.elevated().len(), 2, "{events:?}");
     }
 }
