@@ -13,9 +13,10 @@
 //!   about Tor at every sign-in, and the question `Start Tornect when I sign
 //!   in? [y/N]`: only a yes registers the start at sign-in, for the installed
 //!   copy, through `tornect service install`'s own guard operation.
-//! - Windows: the Program Files steps of `tornect_platform::install`. This
-//!   build has not the calls that make them, so both commands refuse before
-//!   anything is asked.
+//! - Windows: the Program Files steps of `tornect_platform::install`: the
+//!   install's two prompts (the copy, then the installed copy writing its
+//!   own entry), and an uninstall that, run from the installed copy, has
+//!   that copy mark itself and its folder for removal at the next restart.
 //!
 //! `tornect uninstall` removes the start at sign-in, whatever copy it runs,
 //! then the menu entry and the copy; on Windows it is refused while an
@@ -61,6 +62,16 @@ pub(crate) const GRANTS_UNREADABLE: &str = "Tornect cannot read its grants now, 
 /// What `uninstall` says where it finds nothing to remove.
 pub(crate) const NOTHING_INSTALLED: &str =
     "Tornect is not installed here, and nothing starts it at sign-in; nothing was removed.";
+
+/// What an uninstall run from the installed copy says before its last line:
+/// that copy's folder goes at the next restart.
+#[cfg(any(windows, test))]
+fn at_the_restart_line(folder: &str) -> String {
+    format!(
+        "Windows removes Tornect's folder ({folder}) at the next restart; until then nothing \
+         starts Tornect from it. Install Tornect again only after that restart."
+    )
+}
 
 /// What `uninstall` says once it is done.
 fn removed_line(paths: &Paths) -> String {
@@ -510,9 +521,10 @@ fn admin_access_left(ctx: &HostContext) -> Option<String> {
 
 /// `tornect uninstall` on Windows: refused beside a running host, while
 /// administrator access remains and while the grants cannot be read; then
-/// the Program Files steps, with the
-/// guard's operation and the removal of the start at sign-in (whatever copy
-/// it runs) between the checks and the first change.
+/// the Program Files steps, with the guard's operation and the removal of the
+/// start at sign-in (whatever copy it runs) between the checks and the first
+/// change. Run from the installed copy, it then says that the folder goes at
+/// the next restart.
 #[cfg(any(windows, test))]
 pub(crate) fn uninstall_windows(
     deps: &mut Deps<'_>,
@@ -524,11 +536,14 @@ pub(crate) fn uninstall_windows(
         anyhow::bail!(why);
     }
     let program_files = sys.program_files()?;
+    let folder = format!(
+        "{}\\{}",
+        program_files.trim_end_matches('\\'),
+        tornect_platform::install::WINDOWS_FOLDER
+    );
     let sign_in = (deps.autostart_for)(LaunchSpec {
         exe: PathBuf::from(format!(
-            "{}\\{}\\{}",
-            program_files.trim_end_matches('\\'),
-            tornect_platform::install::WINDOWS_FOLDER,
+            "{folder}\\{}",
             tornect_platform::install::WINDOWS_EXE
         )),
         home: None,
@@ -546,23 +561,30 @@ pub(crate) fn uninstall_windows(
         Ok(())
     };
     let mut done =
-        tornect_platform::install::uninstall_from_program_files(sys, &mut remove_sign_in).map(drop);
+        tornect_platform::install::uninstall_from_program_files(sys, &mut remove_sign_in);
     if done.is_ok() && !authorized.get() {
         if !registered(&*sign_in) {
             deps.console.out(NOTHING_INSTALLED);
             return Ok(());
         }
         // Nothing in Program Files, but a start at sign-in of some copy.
-        done = remove_sign_in();
+        done = remove_sign_in().map(|()| tornect_platform::install::WindowsRemoval::default());
     }
     if let Some(e) = refused.take() {
         return Err(refusal(paths, &e));
     }
-    if let Err(e) = done {
-        if authorized.get() {
-            log_failure(deps.ctx, SessionEvent::Uninstalled, "uninstall", &e);
+    let removed = match done {
+        Ok(removed) => removed,
+        Err(e) => {
+            if authorized.get() {
+                log_failure(deps.ctx, SessionEvent::Uninstalled, "uninstall", &e);
+            }
+            return Err(e.into());
         }
-        return Err(e.into());
+    };
+    // Run from the installed copy, its folder went to the next restart.
+    if removed.folder && tornect_platform::install::runs_from_install(sys)? {
+        deps.console.out(&at_the_restart_line(&folder));
     }
     deps.console.out(&removed_line(paths));
     Ok(())
@@ -855,6 +877,9 @@ mod tests {
         fn pending_removals(&self) -> Result<Vec<String>, InstallError> {
             panic!("read the registry")
         }
+        fn own_path(&self) -> Result<String, InstallError> {
+            panic!("read the image's path")
+        }
         fn write_shortcut(&self, _: &str, _: &str) -> Result<(), InstallError> {
             panic!("wrote a shortcut")
         }
@@ -912,6 +937,9 @@ mod tests {
         }
         fn pending_removals(&self) -> Result<Vec<String>, InstallError> {
             Ok(Vec::new())
+        }
+        fn own_path(&self) -> Result<String, InstallError> {
+            Ok("C:\\Users\\u\\Downloads\\tornect\\tornect.exe".to_owned())
         }
         fn write_shortcut(&self, _: &str, _: &str) -> Result<(), InstallError> {
             panic!("wrote a shortcut")

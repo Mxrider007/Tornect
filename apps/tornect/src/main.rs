@@ -199,9 +199,9 @@ enum Command {
         action: unattended::BackupCmd,
     },
     /// Install Tornect on this computer, after your password: on Linux for
-    /// you, in ~/.local/bin with a menu entry; on Windows in Program Files
-    /// (not in this build). Then choose whether Tornect starts when you sign
-    /// in. Your pairings and grants stay where they are.
+    /// you, in ~/.local/bin with a menu entry; on Windows in Program Files.
+    /// Then choose whether Tornect starts when you sign in. Your pairings and
+    /// grants stay where they are.
     Install,
     /// Remove what `tornect install` set up, and the start at sign-in
     /// whichever copy it runs, after your password. Your pairings and grants
@@ -489,11 +489,14 @@ enum ConfigAction {
 }
 
 /// An internal step of the installed copy (§B.1.1), run elevated by
-/// `tornect install` on Windows.
+/// `tornect install` and `tornect uninstall` on Windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InternalStep {
     /// `tornect install-entry`: write Tornect's uninstall entry.
     InstallEntry,
+    /// `tornect remove-at-restart`: mark this copy and its folder for
+    /// removal at the next restart.
+    RemoveAtRestart,
 }
 
 /// The internal step this program's whole command line, `args`, asks for:
@@ -504,6 +507,9 @@ fn internal_step(args: &[std::ffi::OsString]) -> Option<InternalStep> {
     match args {
         [_, step] if step == tornect_platform::install::ENTRY_STEP_ARGUMENT => {
             Some(InternalStep::InstallEntry)
+        }
+        [_, step] if step == tornect_platform::install::RESTART_STEP_ARGUMENT => {
+            Some(InternalStep::RemoveAtRestart)
         }
         _ => None,
     }
@@ -516,11 +522,22 @@ fn internal_step(args: &[std::ffi::OsString]) -> Option<InternalStep> {
 fn run_internal_step(step: InternalStep) -> i32 {
     #[cfg(windows)]
     {
-        use tornect_platform::win_install::{RealWindows, own_path, write_uninstall_entry};
+        use tornect_platform::win_install::{
+            RealWindows, delete_in_folder, mark_for_removal_at_restart, own_path,
+            write_uninstall_entry,
+        };
         let sys = RealWindows::of_this_computer();
         let done = own_path().and_then(|own| match step {
             InternalStep::InstallEntry => {
                 tornect_platform::install::write_own_entry(&sys, &own, &write_uninstall_entry)
+            }
+            InternalStep::RemoveAtRestart => {
+                tornect_platform::install::mark_own_folder_for_restart(
+                    &sys,
+                    &own,
+                    &delete_in_folder,
+                    &mark_for_removal_at_restart,
+                )
             }
         });
         i32::from(done.is_err())
@@ -1084,6 +1101,29 @@ mod tests {
         }
         assert!(super::Cli::try_parse_from(["tornect", "install-entry"]).is_err());
         assert!(super::Cli::try_parse_from(["tornect", "install-entry", "x"]).is_err());
+    }
+
+    /// The installed copy's restart step is the whole command line too: the
+    /// program and `remove-at-restart`, nothing before or after it, in that
+    /// case only.
+    #[test]
+    fn the_restart_step_takes_no_other_argument() {
+        let args = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            super::internal_step(&args(&["tornect.exe", "remove-at-restart"])),
+            Some(super::InternalStep::RemoveAtRestart)
+        );
+        for not in [
+            &["tornect.exe", "remove-at-restart", "C:\\Windows"][..],
+            &["tornect.exe", "--home", "x", "remove-at-restart"],
+            &["tornect.exe", "remove-at-restart", "--home", "x"],
+            &["tornect.exe", "Remove-At-Restart"],
+            &["tornect.exe", "remove-at-restart", "install-entry"],
+            &["remove-at-restart"],
+        ] {
+            assert_eq!(super::internal_step(&args(not)), None, "{not:?}");
+        }
+        assert!(super::Cli::try_parse_from(["tornect", "remove-at-restart"]).is_err());
     }
 
     /// U3-L3: `--help` says that no log filter writes identifiers, and
