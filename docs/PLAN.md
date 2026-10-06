@@ -1835,8 +1835,8 @@ failed `hosts.toml` save right after the entry was written (the entry is deleted
 every host in `hosts.toml` and `known-hosts.toml`, whatever its flags). On Linux a deletion reaches the key in the
 persistent keyring and in this sign-in; a copy that another open sign-in still holds after its persistent keyring
 expired stays until that sign-in ends. If the keychain refuses the delete, Forget says so ("The password remembered for
-<host> could not be deleted from <keychain>; Forget again, or Rotate ID, deletes it later.") and keeps the host's record
-with `remember` set, so a later Forget, the check when the prompt opens, or Rotate ID deletes it. **What Forget
+<host> could not be deleted from <keychain>; Rotate ID deletes it later.") and keeps the host's record
+with `remember` set, so the check when the prompt opens, or Rotate ID, deletes it. **What Forget
 leaves:** the client's `sessions.log` lines of past unattended connections to that host (B.8.10, B.8.13): the log of
 your unattended connections is always kept and never sent. Tests: a known password saved through Remember appears in no
 file under the state directory (M-FEAT-4). New, for the fix round or M-FEAT-5 (F4-5, F4-L2): Rotate ID deletes an entry
