@@ -8116,6 +8116,244 @@ async fn a_remote_revoke_or_suspend_ends_a_reserved_or_live_target_and_spares_a_
     }
 }
 
+/// The grant of `device` and the `PanicDisconnect` lines of the store's log (§B.8.7.4).
+fn panic_trace(
+    guard: &tornect_core::unattended::guard::MutationGuard,
+    device: &DeviceId,
+) -> (tornect_core::unattended::grant::GrantState, usize) {
+    let state = guard.store().grant(device).unwrap().state;
+    let lines = guard
+        .store()
+        .log()
+        .read_all()
+        .unwrap()
+        .iter()
+        .filter(|r| r.event == LogEvent::PanicDisconnect && r.peer_device == Some(*device))
+        .count();
+    (state, lines)
+}
+
+fn suspended_by_panic(state: &tornect_core::unattended::grant::GrantState) -> bool {
+    use tornect_core::unattended::grant::{GrantState, SuspendReason};
+    matches!(
+        state,
+        GrantState::Suspended {
+            reason: SuspendReason::Panic,
+            ..
+        }
+    )
+}
+
+/// §B.8.7.4, Part C row 9a: the host-wide kill of the panic key ends a live unattended
+/// session with `BYE{PANIC}` first, and then that session's grant is suspended
+/// (`Suspended{Panic}`, one `PanicDisconnect` line): the device is refused `SUSPENDED`
+/// before any password exchange until a local Resume.
+#[tokio::test]
+async fn a_panic_suspends_the_grant_of_a_live_unattended_session() {
+    use tornect_core::levels::FixedFacts;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, guard) =
+        unattended_pair_edited(tmp.path(), PW, Arc::new(FixedFacts::linux()), |_| {});
+    host.cfg.orphan_timeout = None;
+    host.cfg.idle_timeout = Duration::from_secs(30);
+    let device = client.identity.id();
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let ClientOutcome::Session(mut session) = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .unwrap() else {
+        panic!("no session");
+    };
+    session.ping().await.unwrap();
+    assert_eq!(
+        panic_trace(&guard, &device),
+        (tornect_core::unattended::grant::GrantState::Active, 0)
+    );
+    host.deps.kill.kill(bye::PANIC);
+    assert_eq!(
+        session.next_event(Duration::from_secs(1)).await.unwrap(),
+        Some(SessionEvent::Bye {
+            reason: bye::PANIC,
+            detail: None
+        })
+    );
+    match task.await.unwrap().unwrap() {
+        HostOutcome::Session { end, .. } => assert_eq!(end, SessionEnd::Killed(bye::PANIC)),
+        other => panic!("{other:?}"),
+    }
+    let (state, lines) = panic_trace(&guard, &device);
+    assert!(suspended_by_panic(&state), "{state:?}");
+    assert_eq!(lines, 1);
+    // Until a local Resume: refused before any password exchange.
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .expect_err("suspended");
+    assert!(
+        matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == reject::SUSPENDED),
+        "{err}"
+    );
+    let _ = task.await;
+}
+
+/// The person at the host presses the panic key while the block window is up, then
+/// the window ends without Block.
+struct PanicDuringTheWindow(KillSwitch);
+
+impl crate::consent::BlockWindow for PanicDuringTheWindow {
+    fn run<'a>(
+        &'a self,
+        _: u8,
+        _: &'a tornect_core::unattended::grant::GrantId,
+        _: &'a str,
+    ) -> BoxFuture<'a, BlockOutcome> {
+        Box::pin(async move {
+            self.0.kill(bye::PANIC);
+            BlockOutcome::Passed(WindowPassed::Elapsed)
+        })
+    }
+}
+
+/// §B.8.7.4, Part C row 9a: a panic while an unattended request past its PAKE is still
+/// being accepted (its block window up) refuses it as the Block it stands for, before
+/// any accept, and then suspends its grant (`Suspended{Panic}`, not `LocalBlock`).
+#[tokio::test]
+async fn a_panic_suspends_a_reserved_unattended_session() {
+    use tornect_core::levels::FixedFacts;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, guard) =
+        unattended_pair_edited(tmp.path(), PW, Arc::new(FixedFacts::linux()), |_| {});
+    host.deps.block_window = Arc::new(PanicDuringTheWindow(host.deps.kill.clone()));
+    let sink = Arc::new(CountingSink::default());
+    host.deps.activity = sink.live.clone();
+    host.deps.sessions = sink.clone();
+    let device = client.identity.id();
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .expect_err("refused");
+    assert!(
+        matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == reject::BLOCKED_BY_LOCAL_USER),
+        "{err}"
+    );
+    match task.await.unwrap().unwrap() {
+        HostOutcome::SessionRejected { reason, .. } => {
+            assert_eq!(reason, reject::BLOCKED_BY_LOCAL_USER);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0, "nothing started");
+    let (state, lines) = panic_trace(&guard, &device);
+    assert!(suspended_by_panic(&state), "{state:?}");
+    assert_eq!(lines, 1);
+}
+
+/// §B.8.7.4: the panic key ends an attended session too, but suspends nothing: the
+/// device's grant stays as it was and no `PanicDisconnect` line is written.
+#[tokio::test]
+async fn a_panic_suspends_nothing_for_an_attended_session() {
+    use tornect_core::levels::FixedFacts;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, guard) =
+        unattended_pair_edited(tmp.path(), PW, Arc::new(FixedFacts::linux()), |_| {});
+    host.cfg.orphan_timeout = None;
+    host.cfg.idle_timeout = Duration::from_secs(30);
+    host.consent
+        .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+    let device = client.identity.id();
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let ClientOutcome::Session(mut session) = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        Intent::Session,
+    )
+    .await
+    .unwrap() else {
+        panic!("no attended session");
+    };
+    session.ping().await.unwrap();
+    host.deps.kill.kill(bye::PANIC);
+    assert_eq!(
+        session.next_event(Duration::from_secs(1)).await.unwrap(),
+        Some(SessionEvent::Bye {
+            reason: bye::PANIC,
+            detail: None
+        })
+    );
+    match task.await.unwrap().unwrap() {
+        HostOutcome::Session {
+            end, unattended, ..
+        } => {
+            assert_eq!(end, SessionEnd::Killed(bye::PANIC));
+            assert!(!unattended);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        panic_trace(&guard, &device),
+        (tornect_core::unattended::grant::GrantState::Active, 0)
+    );
+}
+
+/// §B.8.7.4: a handshake that never passed its PAKE suspends nothing, a panic during
+/// it notwithstanding: a wrong password ends it as such, the grant stays `Active` and no
+/// `PanicDisconnect` line is written.
+#[tokio::test]
+async fn a_panic_before_the_pake_suspends_nothing() {
+    use tornect_core::levels::FixedFacts;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, client, guard) =
+        unattended_pair_edited(tmp.path(), PW, Arc::new(FixedFacts::linux()), |_| {});
+    let device = client.identity.id();
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    // The host armed this stream (it waits for HELLO), then the panic key.
+    tokio::task::yield_now().await;
+    host.deps.kill.kill(bye::PANIC);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent("not the password at all", messages::mode::CONTROL, false),
+    )
+    .await
+    .expect_err("a wrong password");
+    assert!(matches!(err, HandshakeError::PasswordRefused), "{err}");
+    assert!(task.await.unwrap().is_err(), "the host saw the abort");
+    assert_eq!(
+        panic_trace(&guard, &device),
+        (tornect_core::unattended::grant::GrantState::Active, 0)
+    );
+}
+
 /// P5B-1 (§B.8.6.1): the panic key's suspend of P's grant ends P's live session with
 /// `BYE{PANIC}`, also without the host-wide kill that comes first on the key's path.
 #[tokio::test(start_paused = true)]

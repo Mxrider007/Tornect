@@ -244,8 +244,9 @@ pub const PANIC_TWICE_NOTE: &str = "Unattended access is off: the panic key was 
 /// serves, the host-wide kill with the PANIC reason, as `tornect panic` does,
 /// and always first; a second press within [`PANIC_TWICE_WITHIN`] then also
 /// turns unattended access off, persisted (the guard's `master_off`), and says
-/// so. Suspending the grant behind an unattended session is not done here, as
-/// `tornect panic` does not.
+/// so. Each unattended session the kill ended past its PAKE then suspends its
+/// own grant (`Suspended{Panic}`, until a local Resume), as it does for
+/// `tornect panic`; nothing here suspends a grant.
 pub struct PanicPresses {
     kill: KillSwitch,
     guard: Option<Arc<tornect_core::unattended::guard::MutationGuard>>,
@@ -2648,6 +2649,102 @@ mod tests {
         assert!(wiring.live.last_session_ended_at().is_some());
         // Still refused: the cool-down runs from the session's end.
         assert_eq!(on(3).code, codes_ipc::G_REMOTE_SESSION_ACTIVE);
+    }
+
+    /// §B.8.7.4, Part C row 9a: `tornect panic` ends a live unattended session first
+    /// (`BYE{PANIC}`), and then that session's grant is suspended (`Suspended{Panic}`):
+    /// the device is refused `SUSPENDED` until a local Resume.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tornect_panic_suspends_the_grant_behind_an_unattended_session() {
+        use tornect_core::unattended::grant::{GrantState, SuspendReason};
+        use tornect_signal::fsm::HandshakeError;
+        use tornect_signal::fsm::client::UnattendedIntent;
+
+        const PASSWORD: &str = "quiet verdant otter lantern zephyr";
+        let env = env();
+        let host_device_pk = HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32]));
+        let (identity, ccfg, cdeps) = client(&env);
+        let device = identity.id();
+        TrustedDeviceStore::open(env.paths.trusted_devices_file())
+            .unwrap()
+            .pin(device, "Laptop")
+            .unwrap();
+        cdeps
+            .known_hosts
+            .pin(env.identity.id(), "Desk", host_device_pk)
+            .unwrap();
+        grant_unattended(&env, &device, PASSWORD);
+        let unattended = || {
+            Intent::Unattended(UnattendedIntent {
+                password: zeroize::Zeroizing::new(PASSWORD.to_owned()),
+                want_mode: messages::mode::CONTROL,
+                want_elevation: tornect_core::levels::Elevation::None,
+            })
+        };
+        let wiring = wire(
+            &env.paths,
+            &Config::default(),
+            Arc::clone(&env.identity),
+            host_device_pk,
+            Arc::new(ScriptedConsent::new()),
+            media(),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        let ctx = wiring.ctx.as_ref().unwrap();
+        let (client_end, host_end) = duplex(64 * 1024);
+        let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+        let host_task =
+            tokio::spawn(async move { serve_signaling(host_end, &cfg, &deps, |_| {}).await });
+        let mut session = match connect(client_end, &ccfg, &identity, &cdeps, unattended()).await {
+            Ok(ClientOutcome::Session(s)) => s,
+            other => panic!("no unattended session: {other:?}"),
+        };
+        session.send_tor_fallback().await.unwrap();
+        session.ping().await.unwrap();
+        let state = ctx.guard.store().grant(&device).unwrap().state;
+        assert_eq!(state, GrantState::Active);
+
+        let resp = crate::unattended::dispatch(
+            ctx,
+            IpcRequest {
+                id: 1,
+                op: IpcOp::Panic,
+            },
+        );
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(
+            session.next_event(Duration::from_secs(10)).await.unwrap(),
+            Some(tornect_signal::fsm::client::SessionEvent::Bye {
+                reason: bye::PANIC,
+                detail: None
+            })
+        );
+        assert_eq!(host_task.await.unwrap(), Served::Session);
+        let state = ctx.guard.store().grant(&device).unwrap().state;
+        assert!(
+            matches!(
+                state,
+                GrantState::Suspended {
+                    reason: SuspendReason::Panic,
+                    ..
+                }
+            ),
+            "{state:?}"
+        );
+
+        // Until a local Resume: refused before any password exchange.
+        let (client_end, host_end) = duplex(64 * 1024);
+        let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+        let host_task =
+            tokio::spawn(async move { serve_signaling(host_end, &cfg, &deps, |_| {}).await });
+        match connect(client_end, &ccfg, &identity, &cdeps, unattended()).await {
+            Err(HandshakeError::SessionRejected { reject: why }) => {
+                assert_eq!(why.reason, reject::SUSPENDED);
+            }
+            other => panic!("a suspended grant answered {other:?}"),
+        }
+        let _ = host_task.await;
     }
 
     /// Both protocols answer on the one port: a ping stream is served by the
