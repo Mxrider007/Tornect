@@ -475,8 +475,10 @@ impl UnattendedAuth {
 
     /// A Block in the block window suspends the grant through `guard`
     /// (§B.8.6.3: `Suspended{LocalBlock}`, until a local *Resume*; a remote
-    /// unlock never clears it) as well as refusing the request. Without this
-    /// call a Block only refuses.
+    /// unlock never clears it) as well as refusing the request, and so does the
+    /// panic key's kill of a session past its PAKE (§B.8.7.4:
+    /// `Suspended{Panic}`). Without this call a Block only refuses, and a panic
+    /// only ends.
     #[must_use]
     pub fn with_block_guard(mut self, guard: Arc<MutationGuard>) -> Self {
         self.block_guard = Some(guard);
@@ -646,6 +648,19 @@ impl UnattendedHook for UnattendedAuth {
         ctx: UnattendedContext<'a>,
     ) -> BoxFuture<'a, Result<UnattendedVerdict, HandshakeError>> {
         Box::pin(async move { self.run(ctx).await })
+    }
+
+    /// §B.8.7.4: the panic key ended an unattended session of `device` past its
+    /// PAKE, so its grant goes to `Suspended{Panic}` (logged by the guard), cleared
+    /// only by a local Resume; a grant already suspended for a local reason stays
+    /// as it is. A store that cannot take the change is warned about.
+    fn panicked(&self, device: &DeviceId) {
+        let Some(guard) = &self.block_guard else {
+            return;
+        };
+        if let Err(e) = guard.panic(device) {
+            tracing::warn!(peer = ?device, error = %e, "the panic key could not suspend the grant");
+        }
     }
 
     /// Decision M1-67 (B steps 1 to 4, D2, D10, D11): after the reservation, the account
