@@ -16,6 +16,13 @@
 //! Elsewhere the windows do not take the focus: they are on top, and keys typed
 //! for another program must not land on them.
 //!
+//! A window counts as shown only once it drew its first frame (the app reports
+//! it where it paints the block windows), or on Linux once the notification
+//! server showed the notification. A request whose block window was shown
+//! nowhere before its end, or could no longer be shown anywhere, is refused
+//! (`BlockOutcome::NotShown`: `HOST_NOT_READY` without a cause, the grant left
+//! as it was): nobody could have pressed Block.
+//!
 //! The terminal host (`tornect host`) has no such window: it keeps the headless
 //! seams, so nobody can press Block there and every "Ask before starting" is
 //! denied (the minimal shell of M4 is not built in M-FEAT-5).
@@ -23,12 +30,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::sync::watch;
 use tornect_signal::consent::{BlockOutcome, BlockWindow, GrantId, WindowPassed};
 use tornect_signal::pairing::BoxFuture;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::window::{Window, WindowAttributes, WindowLevel};
 
-use super::consent::Popups;
+use super::consent::{BlockSurfaces, Popups};
 
 /// The windows' title: what Alt+Tab, the overview and the taskbar show. It
 /// names no device, as the indicator's does not.
@@ -124,6 +132,16 @@ impl GuiBlockWindow {
             notify: cfg!(target_os = "linux"),
         }
     }
+
+    /// Tests: the windows only, never the session bus of the machine running
+    /// them.
+    #[cfg(test)]
+    pub(super) fn without_notification(popups: Arc<Popups>) -> Self {
+        Self {
+            popups,
+            notify: false,
+        }
+    }
 }
 
 impl BlockWindow for GuiBlockWindow {
@@ -137,17 +155,28 @@ impl BlockWindow for GuiBlockWindow {
             let length = Duration::from_secs(u64::from(secs));
             // Exactly `secs`, counted from when the window is put up.
             let deadline = tokio::time::Instant::now() + length;
-            let (shown, clicked) = self.popups.open_block(label, Instant::now() + length);
+            let (shown, clicked, surfaces) = self.popups.open_block(label, Instant::now() + length);
+            let (notice, notice_now) = watch::channel(if self.notify {
+                Notice::Pending
+            } else {
+                Notice::Absent
+            });
             let blocked = async {
                 tokio::select! {
                     Ok(()) = clicked => {}
-                    () = notified(self.notify, label, secs) => {}
+                    () = notified(self.notify, label, secs, &notice) => {}
                     else => std::future::pending::<()>().await,
                 }
             };
-            let outcome = match tokio::time::timeout_at(deadline, blocked).await {
-                Ok(()) => BlockOutcome::Blocked,
-                Err(_) => BlockOutcome::Passed(WindowPassed::Elapsed),
+            // A Block at the same moment as the end or as the last failure
+            // still blocks.
+            let outcome = tokio::select! {
+                biased;
+                () = blocked => BlockOutcome::Blocked,
+                () = shown_nowhere(surfaces.clone(), notice_now.clone()) => BlockOutcome::NotShown,
+                () = tokio::time::sleep_until(deadline) => {
+                    at_the_end(*surfaces.borrow(), *notice_now.borrow())
+                }
             };
             drop(shown);
             outcome
@@ -155,10 +184,61 @@ impl BlockWindow for GuiBlockWindow {
     }
 }
 
+/// The block window's desktop notification (Linux), as far as it is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Notice {
+    /// Being sent.
+    Pending,
+    /// The notification server showed it.
+    Shown,
+    /// None: not sent on this system, or it could not be shown.
+    Absent,
+}
+
+/// Whether the request's block window can no longer be shown anywhere: every
+/// window failed to open, and no notification is up or still coming.
+fn nowhere(surfaces: BlockSurfaces, notice: Notice) -> bool {
+    surfaces == BlockSurfaces::Failed && notice == Notice::Absent
+}
+
+/// The outcome at the window's end without Block (§B.8.6.3): the veto passed
+/// only where a window drew its first frame or the notification was shown;
+/// otherwise nobody could have pressed Block, and the request is refused.
+fn at_the_end(surfaces: BlockSurfaces, notice: Notice) -> BlockOutcome {
+    if surfaces == BlockSurfaces::Drew || notice == Notice::Shown {
+        BlockOutcome::Passed(WindowPassed::Elapsed)
+    } else {
+        BlockOutcome::NotShown
+    }
+}
+
+/// Resolves once the request's block window can no longer be shown anywhere
+/// ([`nowhere`]); pending otherwise.
+async fn shown_nowhere(
+    mut surfaces: watch::Receiver<BlockSurfaces>,
+    mut notice: watch::Receiver<Notice>,
+) {
+    loop {
+        let now = (*surfaces.borrow_and_update(), *notice.borrow_and_update());
+        if nowhere(now.0, now.1) {
+            return;
+        }
+        let changed = tokio::select! {
+            changed = surfaces.changed() => changed,
+            changed = notice.changed() => changed,
+        };
+        if changed.is_err() {
+            // The window ended: its end decides.
+            return std::future::pending().await;
+        }
+    }
+}
+
 /// The desktop notification's Block (Linux): resolves when Block is pressed in
 /// it; pending for as long as it is polled otherwise (no notification sent, or
-/// none could be shown). Dropped, it takes the notification down.
-async fn notified(notify: bool, label: &str, secs: u8) {
+/// none could be shown). `notice` says whether it was shown. Dropped, it takes
+/// the notification down.
+async fn notified(notify: bool, label: &str, secs: u8, notice: &watch::Sender<Notice>) {
     #[cfg(target_os = "linux")]
     if notify {
         use tornect_platform::notify::{BLOCK_ACTION, SessionBus, Shown, block_notice};
@@ -166,11 +246,13 @@ async fn notified(notify: bool, label: &str, secs: u8) {
             Ok(bus) => bus,
             Err(e) => {
                 tracing::debug!(error = %e, "no notification for the block window");
+                notice.send_replace(Notice::Absent);
                 return std::future::pending().await;
             }
         };
         match Shown::show(Arc::new(bus), &block_notice(label, secs)).await {
             Ok(mut shown) => {
+                notice.send_replace(Notice::Shown);
                 while let Some(action) = shown.action().await {
                     if action == BLOCK_ACTION {
                         return;
@@ -182,11 +264,12 @@ async fn notified(notify: bool, label: &str, secs: u8) {
             }
             Err(e) => {
                 tracing::debug!(error = %e, "the block window's notification was not shown");
+                notice.send_replace(Notice::Absent);
             }
         }
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = (notify, label, secs);
+    let _ = (notify, label, secs, notice);
     std::future::pending().await
 }
 
@@ -216,6 +299,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_block_window_lasts_exactly_its_seconds() {
         let (popups, block) = window();
+        popups.draw_blocks_at_once();
         let run = tokio::spawn({
             let block = GuiBlockWindow {
                 popups: Arc::clone(&popups),
@@ -240,6 +324,51 @@ mod tests {
             BlockOutcome::Passed(WindowPassed::Skipped)
         );
         assert!(shown(&popups).is_empty(), "no window at 0 s");
+    }
+
+    /// §B.8.6.3: a block window shown nowhere refuses the request
+    /// (`NotShown`), never lets it through: with no report from the app (which
+    /// reports nothing when it creates a window, only its first frame), at the
+    /// window's end and not before; when every window failed to open, at once.
+    /// The rule: only a window that drew or a notification that was shown lets
+    /// the veto pass.
+    #[tokio::test(start_paused = true)]
+    async fn a_block_window_shown_nowhere_refuses_the_request() {
+        let (popups, block) = window();
+        let run = tokio::spawn(async move { block.run(10, &[7; 8], "Laptop").await });
+        tokio::time::sleep(Duration::from_millis(9_999)).await;
+        assert_eq!(shown(&popups), vec!["Laptop".to_owned()], "up at 9.999 s");
+        assert!(!run.is_finished(), "not over before its seconds");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(run.await.unwrap(), BlockOutcome::NotShown);
+        assert!(shown(&popups).is_empty(), "down when it ends");
+
+        let (popups, block) = window();
+        let started = tokio::time::Instant::now();
+        let run = tokio::spawn(async move { block.run(10, &[7; 8], "Laptop").await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let id = popups.shared().read(|m| m.blocks[0].id);
+        popups.block_failed(id);
+        assert_eq!(run.await.unwrap(), BlockOutcome::NotShown);
+        assert!(started.elapsed() < Duration::from_secs(2), "at once");
+        assert!(shown(&popups).is_empty());
+
+        use BlockSurfaces::{Drew, Failed, Waiting};
+        let passed = BlockOutcome::Passed(WindowPassed::Elapsed);
+        let refused = BlockOutcome::NotShown;
+        for (surfaces, notice, end, gone) in [
+            (Waiting, Notice::Absent, refused, false),
+            (Waiting, Notice::Pending, refused, false),
+            (Waiting, Notice::Shown, passed, false),
+            (Drew, Notice::Absent, passed, false),
+            (Drew, Notice::Pending, passed, false),
+            (Failed, Notice::Absent, refused, true),
+            (Failed, Notice::Pending, refused, false),
+            (Failed, Notice::Shown, passed, false),
+        ] {
+            assert_eq!(at_the_end(surfaces, notice), end, "{surfaces:?} {notice:?}");
+            assert_eq!(nowhere(surfaces, notice), gone, "{surfaces:?} {notice:?}");
+        }
     }
 
     /// Block, pressed in the window before its end, refuses at once; the window

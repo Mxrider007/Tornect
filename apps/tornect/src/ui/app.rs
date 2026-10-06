@@ -734,30 +734,49 @@ impl App {
                     })
                     .collect()
             };
+            let mut opened = Vec::with_capacity(positions.len());
             for position in positions {
                 let setup = self.main_device(el);
-                match Surface::new(
+                let surface = Surface::new(
                     el,
                     block::attributes(position, on_wayland),
                     setup,
                     self.theme,
                     false,
-                ) {
-                    Ok(surface) => {
-                        // Wayland: no window stays on top; the focus is the
-                        // best this window can ask for (§B.8.6.3).
-                        if on_wayland {
-                            surface.window.focus_window();
-                        }
-                        self.blocks.push(BlockSurface { request, surface });
-                    }
-                    Err(e) => {
-                        let line = format!("a block window did not open: {e:#}");
-                        tracing::warn!("{line}");
-                        self.shared.update(|m| m.note(line));
-                    }
+                );
+                // Wayland: no window stays on top; the focus is the best this
+                // window can ask for (§B.8.6.3).
+                if let (Ok(surface), true) = (&surface, on_wayland) {
+                    surface.window.focus_window();
+                }
+                opened.push(surface);
+            }
+            self.place_blocks(request, opened);
+        }
+    }
+
+    /// Request `request`'s block windows as they opened, one per monitor: each
+    /// that opened is kept, each that did not is said in the recent activity,
+    /// and when none opened the request's block window is told at once that
+    /// it was shown nowhere (§B.8.6.3). A window that opened counts as shown
+    /// only at its first frame ([`Self::draw_block`]).
+    fn place_blocks(&mut self, request: u64, opened: Vec<anyhow::Result<Surface>>) {
+        let mut any = false;
+        for surface in opened {
+            match surface {
+                Ok(surface) => {
+                    self.blocks.push(BlockSurface { request, surface });
+                    any = true;
+                }
+                Err(e) => {
+                    let line = format!("a block window did not open: {e:#}");
+                    tracing::warn!("{line}");
+                    self.shared.update(|m| m.note(line));
                 }
             }
+        }
+        if !any {
+            self.popups.block_failed(request);
         }
     }
 
@@ -775,6 +794,9 @@ impl App {
         let mut actions = Vec::new();
         open.surface
             .paint(|ui| view::block_window(ui, &block, Instant::now(), &mut actions));
+        // Its first frame: the request's block window was shown (§B.8.6.3);
+        // later frames change nothing.
+        self.popups.block_drew(request);
         for action in actions {
             self.act(action, None);
         }
@@ -1623,6 +1645,39 @@ mod tests {
             said.iter()
                 .any(|l| l.contains("the sharing indicator could not be shown")
                     && l.contains("unattended sessions are refused")),
+            "{said:?}"
+        );
+    }
+
+    /// §B.8.6.3: when none of a request's block windows opens, the app says
+    /// why in the recent activity and tells the request's block window at
+    /// once that it was shown nowhere; its block window then refuses the
+    /// request without waiting for its end.
+    #[tokio::test(start_paused = true)]
+    async fn a_block_surface_that_fails_reports_it() {
+        use tornect_signal::consent::{BlockOutcome, BlockWindow as _};
+        let (mut app, _rx) = app();
+        let window = block::GuiBlockWindow::without_notification(Arc::clone(&app.popups));
+        let started = tokio::time::Instant::now();
+        let run = tokio::spawn(async move { window.run(10, &[7; 8], "Laptop").await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let request = app.shared.read(|m| m.blocks[0].id);
+        app.place_blocks(
+            request,
+            vec![
+                Err(anyhow::anyhow!("no GPU surface for the window")),
+                Err(anyhow::anyhow!("lost")),
+            ],
+        );
+        assert_eq!(run.await.unwrap(), BlockOutcome::NotShown);
+        assert!(started.elapsed() < Duration::from_secs(2), "at once");
+        assert!(app.blocks.is_empty());
+        let said = app.shared.read(|m| m.events.clone());
+        assert_eq!(
+            said.iter()
+                .filter(|l| l.contains("a block window did not open"))
+                .count(),
+            2,
             "{said:?}"
         );
     }

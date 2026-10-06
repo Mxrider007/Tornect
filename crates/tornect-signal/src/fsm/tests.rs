@@ -7563,6 +7563,87 @@ async fn block_means_no_capture() {
     assert_eq!(sink.starts.load(Ordering::SeqCst), 0);
 }
 
+/// §B.8.6.3: a block window that could not be shown is no veto that passed: the
+/// request is refused `HOST_NOT_READY` without a cause before any accept, so nothing
+/// starts; the grant stays `Active` (nothing is suspended, unlike a Block), and one
+/// `HostNotReady` line names the device.
+#[tokio::test]
+async fn a_block_window_not_shown_is_refused_and_the_grant_stays() {
+    use tornect_core::unattended::grant::GrantState;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    /// No block window drew a frame anywhere.
+    struct ShownNowhere;
+    impl crate::consent::BlockWindow for ShownNowhere {
+        fn run<'a>(
+            &'a self,
+            _: u8,
+            _: &'a crate::consent::GrantId,
+            _: &'a str,
+        ) -> BoxFuture<'a, BlockOutcome> {
+            Box::pin(async { BlockOutcome::NotShown })
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, guard) = unattended_pair_edited(
+        tmp.path(),
+        PW,
+        Arc::new(tornect_core::levels::FixedFacts::linux()),
+        |_| {},
+    );
+    host.deps.block_window = Arc::new(ShownNowhere);
+    let sink = Arc::new(CountingSink::default());
+    host.deps.activity = sink.live.clone();
+    host.deps.sessions = sink.clone();
+    let device = client.identity.id();
+    let logged_before = guard.store().log().read_all().unwrap().len();
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .expect_err("not shown");
+    assert!(
+        matches!(
+            &err,
+            HandshakeError::SessionRejected { reject }
+                if reject.reason == reject::HOST_NOT_READY && reject.cause.is_none()
+        ),
+        "{err}"
+    );
+    match task.await.unwrap().unwrap() {
+        HostOutcome::SessionRejected { reason, .. } => {
+            assert_eq!(reason, reject::HOST_NOT_READY);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0, "nothing started");
+    assert_eq!(
+        guard.store().grant(&device).unwrap().state,
+        GrantState::Active
+    );
+    let lines = guard.store().log().read_all().unwrap();
+    let new = &lines[logged_before..];
+    let not_ready: Vec<_> = new
+        .iter()
+        .filter(|r| r.event == LogEvent::HostNotReady)
+        .collect();
+    assert_eq!(not_ready.len(), 1, "{new:?}");
+    assert_eq!(not_ready[0].peer_device, Some(device));
+    assert!(not_ready[0].unattended);
+    assert!(
+        !new.iter().any(|r| matches!(
+            r.event,
+            LogEvent::UnattendedSuspended | LogEvent::UnattendedBlockedByLocalUser
+        )),
+        "{new:?}"
+    );
+}
+
 /// §B.8.6.3, r7 (TM-29): "Ask before starting" is given the grant's level, so an admin
 /// grant's popup names administrator access and a grant at none's does not; denied, the
 /// request is refused `DENIED` and nothing starts.
