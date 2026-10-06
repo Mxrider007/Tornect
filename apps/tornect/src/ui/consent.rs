@@ -84,11 +84,29 @@ enum Answer {
     Block(oneshot::Sender<()>),
 }
 
+/// What the app has reported about the block windows of one request
+/// (§B.8.6.3): a window counts as shown only once it drew its first frame,
+/// never because it was created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BlockSurfaces {
+    /// No window drew yet, and not every one failed to open.
+    Waiting,
+    /// A window of the request drew its first frame.
+    Drew,
+    /// None of the request's windows could be opened.
+    Failed,
+}
+
 /// The open questions and their answer channels.
 pub struct Popups {
     shared: Arc<Shared>,
     next: AtomicU64,
     answers: Mutex<HashMap<u64, Answer>>,
+    /// Where the app's reports on each open block window go.
+    block_surfaces: Mutex<HashMap<u64, watch::Sender<BlockSurfaces>>>,
+    /// Tests: every block window counts as drawn as soon as it opens.
+    #[cfg(test)]
+    draw_at_once: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Popups {
@@ -105,6 +123,9 @@ impl Popups {
             shared,
             next: AtomicU64::new(1),
             answers: Mutex::new(HashMap::new()),
+            block_surfaces: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            draw_at_once: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -241,18 +262,76 @@ impl Popups {
     }
 
     /// Show the block window of `label`'s request until `ends_at`: the window is
-    /// up while the returned guard lives, and the receiver resolves on Block.
+    /// up while the returned guard lives, the first receiver resolves on Block,
+    /// and the second carries what the app reports of the request's windows
+    /// ([`Popups::block_drew`], [`Popups::block_failed`]).
     pub(super) fn open_block(
         &self,
         label: &str,
         ends_at: Instant,
-    ) -> (OnScreen<'_>, oneshot::Receiver<()>) {
+    ) -> (
+        OnScreen<'_>,
+        oneshot::Receiver<()>,
+        watch::Receiver<BlockSurfaces>,
+    ) {
         let (tx, rx) = oneshot::channel();
+        let (reports, surfaces) = watch::channel(BlockSurfaces::Waiting);
+        #[cfg(test)]
+        if self.draw_at_once.load(Ordering::Relaxed) {
+            reports.send_replace(BlockSurfaces::Drew);
+        }
         let label = label.to_owned();
-        let shown = self.open(Answer::Block(tx), |id, m| {
-            m.blocks.push(BlockRequest { id, label, ends_at });
-        });
-        (shown, rx)
+        // The report channel is in place before the app can see the request.
+        let shown = self.open_registered(
+            Answer::Block(tx),
+            |id| {
+                self.block_surfaces
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(id, reports);
+            },
+            |id, m| {
+                m.blocks.push(BlockRequest { id, label, ends_at });
+            },
+        );
+        (shown, rx, surfaces)
+    }
+
+    /// The app drew the first frame of a block window of request `id`
+    /// (§B.8.6.3): that request's window was shown.
+    pub fn block_drew(&self, id: u64) {
+        self.report_block(id, BlockSurfaces::Drew);
+    }
+
+    /// None of request `id`'s block windows could be opened (§B.8.6.3).
+    pub fn block_failed(&self, id: u64) {
+        self.report_block(id, BlockSurfaces::Failed);
+    }
+
+    /// The first report for an open block window stands; a later one, and one
+    /// for a window that has ended, changes nothing.
+    fn report_block(&self, id: u64, what: BlockSurfaces) {
+        if let Some(reports) = self
+            .block_surfaces
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+        {
+            reports.send_if_modified(|now| {
+                let first = *now == BlockSurfaces::Waiting;
+                if first {
+                    *now = what;
+                }
+                first
+            });
+        }
+    }
+
+    /// Tests: count every block window opened from now on as drawn, as the
+    /// app reports its first frame.
+    #[cfg(test)]
+    pub(super) fn draw_blocks_at_once(&self) {
+        self.draw_at_once.store(true, Ordering::Relaxed);
     }
 
     fn open(
@@ -260,11 +339,21 @@ impl Popups {
         answer: Answer,
         show: impl FnOnce(u64, &mut super::model::Model),
     ) -> OnScreen<'_> {
+        self.open_registered(answer, |_| {}, show)
+    }
+
+    fn open_registered(
+        &self,
+        answer: Answer,
+        register: impl FnOnce(u64),
+        show: impl FnOnce(u64, &mut super::model::Model),
+    ) -> OnScreen<'_> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         self.answers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id, answer);
+        register(id);
         self.shared.update(|m| show(id, m));
         self.shared.wake(Wake::Attention);
         OnScreen { popups: self, id }
@@ -282,6 +371,13 @@ impl Drop for OnScreen<'_> {
     fn drop(&mut self) {
         let id = self.id;
         drop(self.popups.take(id));
+        drop(
+            self.popups
+                .block_surfaces
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id),
+        );
         self.popups.shared.update(|m| {
             m.popups.retain(|p| p.id != id);
             m.recognition.remove(&id);

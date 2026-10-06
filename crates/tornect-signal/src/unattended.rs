@@ -495,6 +495,19 @@ impl UnattendedAuth {
         }
     }
 
+    /// A block window that could not be shown (§B.8.6.3): one `HostNotReady`
+    /// line for `device`, through the guard of [`Self::with_block_guard`]; the
+    /// grant is left as it was. The request is refused whatever this does.
+    fn not_shown(&self, device: &DeviceId) {
+        tracing::warn!("the block window could not be shown; the request was refused");
+        let Some(guard) = &self.block_guard else {
+            return;
+        };
+        if let Err(e) = guard.block_window_not_shown(device) {
+            tracing::warn!(peer = ?device, error = %e, "a block window not shown could not be logged");
+        }
+    }
+
     /// §B.8.5.2, evaluated **before** the charge so a busy host never writes a
     /// counter it will not use.
     fn admit(&self, device: &DeviceId, hard_locked: bool) -> Admit {
@@ -942,6 +955,15 @@ impl UnattendedAuth {
                 self.blocked(&device);
                 return Ok(UnattendedVerdict::Reject(SessionReject::new(
                     reject::BLOCKED_BY_LOCAL_USER,
+                )));
+            }
+            BlockOutcome::NotShown => {
+                // §B.8.6.3: a block window shown nowhere is no veto that
+                // passed: `HOST_NOT_READY` without a cause, logged, and the
+                // grant is left as it was (no suspend); nothing is captured.
+                self.not_shown(&device);
+                return Ok(UnattendedVerdict::Reject(SessionReject::new(
+                    reject::HOST_NOT_READY,
                 )));
             }
         };

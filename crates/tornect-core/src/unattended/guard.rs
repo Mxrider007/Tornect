@@ -1170,6 +1170,21 @@ impl MutationGuard {
         self.suspend_with(device, SuspendReason::LocalBlock, None)
     }
 
+    /// A block window that could not be shown (§B.8.6.3): one `HostNotReady`
+    /// line for `device`; the grant is left as it was (the request is refused,
+    /// nothing is suspended).
+    pub fn block_window_not_shown(&self, device: &DeviceId) -> Result<(), GuardError> {
+        let id = self.store.grant(device).map(|g| g.id);
+        let mut rec = SessionRecord::at(self.now(), SessionEvent::HostNotReady)
+            .device(*device)
+            .unattended(true);
+        if let Some(id) = id {
+            rec = rec.grant(&id);
+        }
+        self.store.log_event(&rec)?;
+        Ok(())
+    }
+
     /// The panic key ended an unattended session (§B.8.7.4): grant → `Suspended{Panic}`.
     pub fn panic(&self, device: &DeviceId) -> Result<SuspendOutcome, GuardError> {
         let rec = SessionRecord::at(self.now(), SessionEvent::PanicDisconnect)

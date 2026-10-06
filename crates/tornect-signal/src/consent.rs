@@ -108,13 +108,20 @@ impl LocalAllow for AlwaysDeny {
 }
 
 /// What a [`BlockWindow`] returns; `Blocked` never reaches
-/// [`SessionAccept::build`] (it ends in `SESSION_REJECT{BLOCKED_BY_LOCAL_USER}`).
+/// [`SessionAccept::build`] (it ends in `SESSION_REJECT{BLOCKED_BY_LOCAL_USER}`),
+/// and neither does `NotShown` (`SESSION_REJECT{HOST_NOT_READY}` without a
+/// cause, §B.8.6.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockOutcome {
     /// Nobody clicked Block.
     Passed(WindowPassed),
     /// Block was clicked.
     Blocked,
+    /// No block window drew its first frame, nor on Linux was its
+    /// notification shown, before the window's end: nobody could have
+    /// pressed Block, so the request is refused and the grant stays as it
+    /// was (§B.8.6.3).
+    NotShown,
 }
 
 /// The only block evidence a [`ConsentProof`] can carry.
