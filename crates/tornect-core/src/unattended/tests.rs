@@ -512,6 +512,48 @@ fn u1_hard_lock_on_20th_failure_stays_until_unlock() {
     assert!(env.has_event(SessionEvent::UnattendedUnlock));
 }
 
+/// A `set_options` that changes nothing (a level `none` asked of a grant without the
+/// level) logs no `GrantChanged` line and writes nothing: the log, the store's file and
+/// its generation stay as they were; a change that does change the grant still logs and
+/// writes. A device without a grant and a store that is not loaded are still refused.
+#[test]
+fn set_options_that_change_nothing_log_and_write_nothing() {
+    let env = Env::new();
+    let store = env.open();
+    let d = dev(1);
+    let g = enable(&env, &store, d, Preset::MyMachines);
+    let level_none = GrantOptions {
+        elevation: Some(Elevation::None),
+        ..GrantOptions::default()
+    };
+    let (lines, generation, bytes) = (env.log_events().len(), store.generation(), env.file_bytes());
+    g.set_options(Actor::Cli, &d, &level_none).unwrap();
+    assert_eq!(env.log_events().len(), lines, "no line");
+    assert_eq!(store.generation(), generation, "no write");
+    assert_eq!(env.file_bytes(), bytes, "the file as it was");
+    g.set_options(
+        Actor::Cli,
+        &d,
+        &GrantOptions {
+            ask_before_start: Some(true),
+            ..GrantOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(env.log_events().len(), lines + 1, "a change is logged");
+    assert!(store.generation() > generation, "and written");
+    assert!(g.set_options(Actor::Cli, &dev(9), &level_none).is_err());
+    drop((g, store));
+    *env.secrets.get_fails.lock() = true;
+    let store = env.open();
+    assert!(matches!(store.status(), StoreStatus::FailedClosed(_)));
+    assert!(
+        env.guard(&store)
+            .set_options(Actor::Cli, &d, &level_none)
+            .is_err()
+    );
+}
+
 #[test]
 fn u1_hard_lock_after_zero_disables_consecutive_only_and_lifetime_60_hard_locks() {
     let env = Env::new();
