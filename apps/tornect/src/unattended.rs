@@ -555,10 +555,20 @@ fn set_level_none(ctx: &HostContext, id: u64, by: Actor, device: &DeviceId) -> I
 }
 
 /// Which clause of the turn-off sentence's condition holds with `device` at
-/// none (§B.8.7.1 ⑤a): another grant holds the level; else the administrator
-/// helper task stays registered (a presence that cannot be read counts as
-/// registered, decision M1-67); else nothing.
+/// none (§B.8.7.1 ⑤a), said only of a device that has control: another grant
+/// holds the level; else the administrator helper task stays registered (a
+/// presence that cannot be read counts as registered, decision M1-67); else,
+/// and for a device with view only, which reaches nothing that runs as
+/// administrator, nothing.
 fn keeps_at_the_level(ctx: &HostContext, device: &DeviceId) -> u8 {
+    let control = ctx
+        .guard
+        .store()
+        .grant(device)
+        .is_some_and(|g| g.mode == tornect_core::session_log::SessionMode::Control);
+    if !control {
+        return SetLevelNonePayload::NOTHING;
+    }
     let another = ctx
         .guard
         .store()
@@ -1787,16 +1797,18 @@ pub(crate) const OFFER_QUESTION: &str = "Give them new passwords now? [Y/n]";
 pub(crate) const LEVEL_OFF: &str = "Administrator access is off for <device>. A session of \
      <device> running as administrator ends now.";
 
-/// What the turn-off sentence adds while another grant holds the level.
+/// What the turn-off sentence adds, for a device with control, while another
+/// grant holds the level.
 pub(crate) const LEVEL_OFF_ANOTHER_GRANT: &str = "<device> keeps control of this computer. \
      While another device has administrator access, control can still reach programs that run \
-     as administrator. To stop that now, set <device> to View only.";
+     as administrator. To stop that now, disable <device>.";
 
-/// What it adds while the administrator helper task stays registered.
+/// What it adds, for a device with control, while the administrator helper
+/// task stays registered.
 pub(crate) const LEVEL_OFF_HELPER_TASK: &str = "<device> keeps control of this computer. \
      While the administrator helper is still registered: Tornect removes it the next time you \
      sign in here, control can still reach programs that run as administrator. To stop that \
-     now, set <device> to View only.";
+     now, disable <device>.";
 
 /// What `set-level <device> none` says of a grant without the level.
 pub(crate) const NO_LEVEL_UNCHANGED: &str =
@@ -4592,6 +4604,49 @@ mod tests {
         assert_eq!(env.reauth.calls().len(), dialogs, "no dialog asked");
     }
 
+    /// The turn-off sentence's addition is said only of a device that has
+    /// control (§B.8.7.1 ⑤a): with view only, a device at none reaches nothing
+    /// that runs as administrator, whatever else holds the level, so nothing is
+    /// added; a device with control still gets it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_turn_off_addition_is_not_said_for_a_view_only_device() {
+        let env = level_env();
+        let (viewer, other) = (device(75), device(76));
+        env.admin_grant(&viewer, GrantOptions::default());
+        env.admin_grant(&other, GrantOptions::default());
+        env.ctx
+            .guard
+            .set_options(
+                Actor::Ui,
+                &viewer,
+                &GrantOptions {
+                    mode: Some(tornect_core::session_log::SessionMode::ViewOnly),
+                    ..GrantOptions::default()
+                },
+            )
+            .unwrap();
+        env.facts
+            .set_helper_task(tornect_core::levels::HelperPresence::Registered);
+        let paths = Paths::from_home(env.tmp.path());
+        let route = Route::Offline(Box::new(env.refusing()));
+        let mut io = Script::new(true, &[]);
+        set_level_none_cli(&paths, &route, viewer, &mut io)
+            .await
+            .unwrap();
+        assert_eq!(
+            io.out,
+            vec![LEVEL_OFF.replace("<device>", &viewer.fingerprint())]
+        );
+        let resp = go(
+            match &route {
+                Route::Offline(ctx) => ctx,
+                Route::Host => unreachable!(),
+            },
+            IpcOp::SetLevelNone { device: other },
+        );
+        assert_eq!(keeps(&resp), SetLevelNonePayload::HELPER_TASK);
+    }
+
     /// The op carries no level: whatever the grant holds, it ends at none.
     #[test]
     fn set_level_none_never_raises() {
@@ -4804,7 +4859,7 @@ mod tests {
                 format!(
                     "{label} keeps control of this computer. While another device has \
                      administrator access, control can still reach programs that run as \
-                     administrator. To stop that now, set {label} to View only."
+                     administrator. To stop that now, disable {label}."
                 ),
             ]
         );
@@ -4822,8 +4877,8 @@ mod tests {
                 format!(
                     "{label} keeps control of this computer. While the administrator helper is \
                      still registered: Tornect removes it the next time you sign in here, control \
-                     can still reach programs that run as administrator. To stop that now, set \
-                     {label} to View only."
+                     can still reach programs that run as administrator. To stop that now, \
+                     disable {label}."
                 ),
             ]
         );
