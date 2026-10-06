@@ -8354,6 +8354,73 @@ async fn a_panic_before_the_pake_suspends_nothing() {
     );
 }
 
+/// §B.8.4.1: "End the session there" (`end_session`) ends the requester's own session:
+/// P's live unattended session gets `BYE{ADMIN_END}` within 1 s, while another device's
+/// session goes on.
+#[tokio::test]
+async fn end_session_ends_the_requesters_session_with_admin_end() {
+    use tornect_core::levels::FixedFacts;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, _guard) =
+        unattended_pair_edited(tmp.path(), PW, Arc::new(FixedFacts::linux()), |_| {});
+    host.cfg.orphan_timeout = None;
+    host.cfg.idle_timeout = Duration::from_secs(30);
+    // another device, in an attended session
+    let other = client_side(&tmp.path().join("other"), host.identity.id(), [0x33; 32]);
+    host.trusted.pin(other.identity.id(), "Other").unwrap();
+    other
+        .known
+        .pin(host.identity.id(), "Desk of Bob", host_device_pk())
+        .unwrap();
+    host.consent
+        .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+    let (a, b) = pipe();
+    let other_task = spawn_host(a, &host);
+    let ClientOutcome::Session(mut other_session) =
+        connect(b, &other.cfg, &other.identity, &other.deps, Intent::Session)
+            .await
+            .unwrap()
+    else {
+        panic!("no attended session");
+    };
+    // P's session
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let ClientOutcome::Session(mut session) = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .unwrap() else {
+        panic!("no session");
+    };
+    session.ping().await.unwrap();
+    // P asks, from another stream, to end its session there.
+    let answer = admin_answer(&host, &client, PW, messages::admin_op::END_SESSION).await;
+    assert!(answer.ok, "{answer:?}");
+    assert_eq!(
+        session.next_event(Duration::from_secs(1)).await.unwrap(),
+        Some(SessionEvent::Bye {
+            reason: bye::ADMIN_END,
+            detail: None
+        })
+    );
+    match task.await.unwrap().unwrap() {
+        HostOutcome::Session { end, .. } => assert_eq!(end, SessionEnd::Killed(bye::ADMIN_END)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(host.deps.kill.fired(), None, "no host-wide kill");
+    // the other device's session goes on
+    other_session.ping().await.unwrap();
+    assert!(!other_task.is_finished());
+    drop(other_session);
+    let _ = other_task.await;
+}
+
 /// P5B-1 (§B.8.6.1): the panic key's suspend of P's grant ends P's live session with
 /// `BYE{PANIC}`, also without the host-wide kill that comes first on the key's path.
 #[tokio::test(start_paused = true)]
