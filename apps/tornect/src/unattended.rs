@@ -386,21 +386,15 @@ pub fn dispatch(ctx: &HostContext, req: IpcRequest) -> IpcResponse {
 
         IpcOp::Panic => {
             // §B.8.7.4: the panic key "ends any session and, if it was
-            // unattended, suspends that grant". Ending sessions is what the
-            // kill switch does: `tornect host` arms every stream with this
-            // switch, so this ends every handshake and session it serves.
-            // Suspending the grant behind an unattended session is the M4 half
-            // (`tornect-session` owns live sessions); M1 ends what it can reach
-            // and says so rather than suspending an arbitrary grant.
+            // unattended, suspends that grant". The kill switch, which arms
+            // every stream this host serves, ends every handshake and session
+            // first; each unattended session it ended past its PAKE then
+            // suspends its own grant (`Suspended{Panic}`, until a local Resume).
             match &ctx.kill {
                 Some(k) => {
                     k.kill(tornect_signal::messages::bye::PANIC);
                     let mut r = IpcResponse::ok(id);
-                    r.detail = Some(
-                        "every handshake and session was ended; suspending the grant behind \
-                         an unattended session lands at M4 (docs/PLAN.md §B.8.14)"
-                            .to_owned(),
-                    );
+                    r.detail = Some(PANIC_DONE.to_owned());
                     r
                 }
                 None => IpcResponse::fail(
@@ -705,6 +699,10 @@ pub async fn serve_without_store(
         .await
         .context("serving IPC")
 }
+
+/// What `tornect panic` says the host did (§B.8.7.4).
+pub(crate) const PANIC_DONE: &str = "Every handshake and session was ended; a device whose \
+     unattended session was ended is suspended until you resume it.";
 
 /// [`dispatch`] for a host with no store. Such a host serves no unattended
 /// session, so there is no grant to suspend behind one.
@@ -4669,6 +4667,48 @@ mod tests {
             "{resp:?}"
         );
         assert_eq!(kill.fired(), None);
+    }
+
+    /// §B.8.7.4: `tornect panic` says what the host did: the kill fired with `PANIC`,
+    /// ending every handshake and session, and a device whose unattended session was
+    /// ended is suspended until a local Resume. A host without its store serves no
+    /// unattended session and claims no suspend.
+    #[test]
+    fn tornect_panic_says_what_it_did() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_context(tmp.path(), None);
+        let kill = KillSwitch::new();
+        ctx.kill = Some(kill.clone());
+        let resp = dispatch(
+            &ctx,
+            IpcRequest {
+                id: 1,
+                op: IpcOp::Panic,
+            },
+        );
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(kill.fired(), Some(tornect_signal::messages::bye::PANIC));
+        assert_eq!(
+            resp.detail.as_deref(),
+            Some(
+                "Every handshake and session was ended; a device whose unattended session \
+                 was ended is suspended until you resume it."
+            )
+        );
+        let storeless = KillSwitch::new();
+        let resp = dispatch_without_store(
+            &storeless,
+            "the store is locked",
+            IpcRequest {
+                id: 2,
+                op: IpcOp::Panic,
+            },
+        );
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(
+            resp.detail.as_deref(),
+            Some("every handshake and session was ended")
+        );
     }
 
     /// Only `none` is a level `set-level` takes (decision M1-68): the command

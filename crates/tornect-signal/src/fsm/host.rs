@@ -249,6 +249,16 @@ pub trait UnattendedHook: Send + Sync {
         device: &'a DeviceId,
         proof: ConsentProof,
     ) -> BoxFuture<'a, Result<ConsentProof, SessionReject>>;
+
+    /// The host-wide kill of the panic key or of `tornect panic` ended an
+    /// unattended session of `device` past its PAKE, live or still being
+    /// accepted (§B.8.7.4): its grant is suspended (`Suspended{Panic}`, cleared
+    /// only by a local Resume). Called once per such session, after its
+    /// goodbye or its refusal went out; the kill itself came first. Nothing by
+    /// default.
+    fn panicked(&self, device: &DeviceId) {
+        let _ = device;
+    }
 }
 
 /// `SESSION_REJECT{NOT_GRANTED}` for every unattended request (no grants exist).
@@ -471,6 +481,17 @@ impl KillGuard {
         self.rx.borrow().generation != self.base
     }
 
+    /// The reason of the latest host-wide kill since this guard was armed, if the switch
+    /// fired since then; an end of this session's device is not one.
+    #[must_use]
+    pub fn fired_with(&self) -> Option<u16> {
+        let state = self.rx.borrow();
+        if state.generation == self.base {
+            return None;
+        }
+        state.reason
+    }
+
     /// From now on, [`KillSwitch::end_device`] for `device` also ends this session, with
     /// the end's reason, also when it fires before the session starts (decision M1-67,
     /// D6): armed at the session's reservation. An end for the level reaches it only once
@@ -542,6 +563,16 @@ impl Drop for EndGuard<'_> {
                 detail: "aborted".to_owned(),
             });
         }
+    }
+}
+
+/// After an unattended session of `device` past its PAKE ended, its goodbye or its
+/// refusal sent (§B.8.7.4): when what ended it was the host-wide kill of the panic key or
+/// of `tornect panic`, its grant is suspended through the hook. An end of the device
+/// alone (the guard's own suspend, a revoke) is no such kill.
+fn suspend_after_panic(deps: &HostDeps, kill: &KillGuard, device: &DeviceId) {
+    if kill.fired_with() == Some(messages::bye::PANIC) {
+        deps.unattended.panicked(device);
     }
 }
 
@@ -1341,7 +1372,11 @@ where
         } else {
             messages::reject::DENIED
         };
-        return reject_session(&mut chan, deps, &peer, reason).await;
+        let refused = reject_session(&mut chan, deps, &peer, reason).await;
+        if unattended {
+            suspend_after_panic(deps, &kill, &device);
+        }
+        return refused;
     }
     // Checked and reserved in one step: a second session that gets here while
     // this accept is still being written sees the reservation, not an empty
@@ -1404,7 +1439,11 @@ where
         };
         drop(helper);
         drop(reserved);
-        return reject_session(&mut chan, deps, &peer, reason).await;
+        let refused = reject_session(&mut chan, deps, &peer, reason).await;
+        if unattended {
+            suspend_after_panic(deps, &kill, &device);
+        }
+        return refused;
     }
 
     // Accept → Established. `build` is the only source of the session token:
@@ -1524,6 +1563,9 @@ where
             let _ = tokio::time::timeout(GOODBYE, chan.close()).await;
         }
         Goodbye::Nothing => {}
+    }
+    if unattended && matches!(end, Ok(SessionEnd::Killed(messages::bye::PANIC))) {
+        suspend_after_panic(deps, &kill, &device);
     }
     let end = end?;
     Ok(HostOutcome::Session {
