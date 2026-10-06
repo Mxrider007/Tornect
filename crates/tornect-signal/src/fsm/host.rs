@@ -581,8 +581,9 @@ fn suspend_after_panic(deps: &HostDeps, kill: &KillGuard, device: &DeviceId) {
 /// per-device end (decision M1-67, D6), which reaches only that device's sessions, live or
 /// reserved, with `REVOKED` or `SUSPENDED` (§B.8.6.1). The host's guard has already ended
 /// those from its committed write, before the answer (S5B-3); this end serves an authority
-/// that does not, and finds nothing left where the guard did.
-fn apply_admin_effect(deps: &HostDeps, effect: &AdminEffect) {
+/// that does not, and finds nothing left where the guard did. "End the session there"
+/// ends the sessions of `requester`, the device that asked, with `ADMIN_END`.
+fn apply_admin_effect(deps: &HostDeps, requester: &DeviceId, effect: &AdminEffect) {
     match effect {
         AdminEffect::MasterOff => deps.kill.kill(messages::bye::MASTER_OFF),
         AdminEffect::RevokedAll(_) => deps.kill.kill(messages::bye::REVOKED),
@@ -594,8 +595,10 @@ fn apply_admin_effect(deps: &HostDeps, effect: &AdminEffect) {
             deps.kill
                 .end_device_with(device, EndScope::Every, messages::bye::SUSPENDED);
         }
-        // The requester's own stream is already closed above.
-        AdminEffect::EndSession => {}
+        AdminEffect::EndSession => {
+            deps.kill
+                .end_device_with(requester, EndScope::Every, messages::bye::ADMIN_END);
+        }
         // Access-restoring: nothing to tear down.
         AdminEffect::Unlocked(_) => {}
         AdminEffect::None => {}
@@ -1222,7 +1225,7 @@ where
                 // reported only after the effect has fired.
                 let sent = chan.send(&result, Some(&*deps.signer)).await;
                 chan.close().await;
-                apply_admin_effect(deps, &effect);
+                apply_admin_effect(deps, &device, &effect);
                 sent?;
                 return Ok(HostOutcome::Admin { device, ok });
             }
