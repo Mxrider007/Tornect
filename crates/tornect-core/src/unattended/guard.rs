@@ -1539,6 +1539,14 @@ impl MutationGuard {
                 return Err(e.into());
             }
         };
+        // A change that changes nothing (a level `none` asked of a grant without the
+        // level): no `GrantChanged` line and no write. Judged here, under the lock, on the
+        // loaded store's own grant, so it never answers for a grant another operation is
+        // changing, a missing grant or a store that is not loaded.
+        if before.grant(device) == st.store.as_ref().and_then(|s| s.grant(device)) {
+            st.store = Some(before);
+            return Ok(Some(false));
+        }
         // A raise of the grant's own reach (the level, or control where it reaches the
         // level) comes only with a new generated password, never through `set_options`
         // (decision M1-67, D3): refused before any dialog, nothing changed. The level where
