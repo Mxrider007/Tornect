@@ -9,6 +9,7 @@
 //! remembered one stale.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use tornect_core::session_log::{SessionEvent, SessionLog, SessionMode, SessionRecord};
 use tornect_core::trusted::KnownHost;
@@ -58,11 +59,82 @@ pub fn refuse_password_sources(
     Ok(())
 }
 
-/// One writer of `hosts.toml` at a time in this process: the FSM's pin and the
-/// remembered-password bookkeeping both load, change and save it.
-fn hosts_lock() -> MutexGuard<'static, ()> {
+/// How long an operation on `hosts.toml` waits for another Tornect that holds the
+/// lock beside it, so that a stuck process never stalls this one without bound.
+const HOSTS_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// How often the lock beside `hosts.toml` is tried again while another Tornect
+/// holds it.
+const HOSTS_LOCK_RETRY: Duration = Duration::from_millis(50);
+
+/// What an operation on `hosts.toml` fails with when another Tornect held the lock
+/// beside it for all of [`HOSTS_LOCK_WAIT`].
+const HOSTS_LOCK_HELD: &str =
+    "another Tornect held the lock beside hosts.toml for more than 10 s; nothing was saved";
+
+const _: () = assert!(HOSTS_LOCK_WAIT.as_secs() == 10, "the text names the wait");
+
+/// One writer of `hosts.toml` at a time (§B.8.9.1): in this process the FSM's pin
+/// and the remembered-password bookkeeping both load, change and save it, and the
+/// window and a command line are two processes that do the same. The guard holds
+/// this process's mutex, and the OS lock on `hosts.toml.lock` beside the file when
+/// it could be taken ([`HostsLock::held`]); both are released when it drops. The
+/// lock orders the saves, not the answers.
+struct HostsLock {
+    _process: MutexGuard<'static, ()>,
+    file: Result<std::fs::File, String>,
+}
+
+impl HostsLock {
+    /// The OS lock is held, so `hosts.toml` may be read and saved; otherwise why
+    /// not, and the caller's operation fails with it.
+    fn held(&self) -> anyhow::Result<()> {
+        match &self.file {
+            Ok(_) => Ok(()),
+            Err(why) => Err(anyhow::anyhow!("{why}")),
+        }
+    }
+}
+
+/// This process's mutex, then the OS lock beside `hosts_file` (§B.8.9.1).
+fn hosts_lock(hosts_file: &std::path::Path) -> HostsLock {
     static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+    let process = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    HostsLock {
+        _process: process,
+        file: lock_file(hosts_file, HOSTS_LOCK_WAIT),
+    }
+}
+
+/// The OS lock on `hosts.toml.lock` beside `hosts_file`: the file created if missing
+/// (this account's only), locked exclusively, tried every [`HOSTS_LOCK_RETRY`] for at
+/// most `wait`; released when the returned file is dropped. A lock that cannot be
+/// opened or taken is an error, never a way around it.
+fn lock_file(hosts_file: &std::path::Path, wait: Duration) -> Result<std::fs::File, String> {
+    let not_taken = |e: &dyn std::fmt::Display| {
+        format!("the lock beside hosts.toml could not be taken ({e}); nothing was saved")
+    };
+    if let Some(dir) = hosts_file.parent().filter(|dir| !dir.exists()) {
+        tornect_core::keystore::create_private_dir(dir).map_err(|e| not_taken(&e))?;
+    }
+    let mut name = hosts_file.as_os_str().to_owned();
+    name.push(".lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(&name).map_err(|e| not_taken(&e))?;
+    let until = Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < until => {
+                std::thread::sleep(HOSTS_LOCK_RETRY);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return Err(HOSTS_LOCK_HELD.to_owned()),
+            Err(std::fs::TryLockError::Error(e)) => return Err(not_taken(&e)),
+        }
+    }
 }
 
 /// `hosts.toml` as the FSM's pin of the host's OPAQUE key (§B.8.9, A16): checked
@@ -85,7 +157,13 @@ impl HostsPin {
 
 impl ServerKeyPin for HostsPin {
     fn check(&self, host: &TornectId, server_s_pk: &[u8; 32]) -> PinCheck {
-        let _one = hosts_lock();
+        let one = hosts_lock(&self.path);
+        // A lock not taken is an unreadable file: never "no pin yet", which would
+        // trust a new host key.
+        if let Err(e) = one.held() {
+            tracing::warn!(error = %e, "hosts.toml could not be read: the host's key cannot be checked");
+            return PinCheck::Mismatch;
+        }
         match HostsFile::load(&self.path) {
             Ok(file) => file.check_pin(host, server_s_pk),
             Err(e) => {
@@ -96,7 +174,11 @@ impl ServerKeyPin for HostsPin {
     }
 
     fn record(&self, host: &TornectId, server_s_pk: &[u8; 32]) {
-        let _one = hosts_lock();
+        let one = hosts_lock(&self.path);
+        if let Err(e) = one.held() {
+            tracing::warn!(error = %e, "hosts.toml could not be saved");
+            return;
+        }
         let saved = HostsFile::load(&self.path).and_then(|mut file| {
             if file
                 .record_success(host, *server_s_pk, tornect_signal::auth::SUITE_OPAQUE)
@@ -118,7 +200,11 @@ impl ServerKeyPin for HostsPin {
 /// administrator level).
 #[must_use]
 pub fn record(paths: &Paths, host: &TornectId) -> tornect_core::unattended::hosts::HostRecord {
-    let _one = hosts_lock();
+    let one = hosts_lock(&paths.hosts_file());
+    if let Err(e) = one.held() {
+        tracing::warn!(error = %e, "hosts.toml could not be read");
+        return tornect_core::unattended::hosts::HostRecord::default();
+    }
     HostsFile::load(&paths.hosts_file())
         .ok()
         .and_then(|f| f.get(host).cloned())
@@ -131,7 +217,8 @@ pub fn recall(
     saved: &SavedPasswords,
     host: &TornectId,
 ) -> anyhow::Result<Option<Zeroizing<String>>> {
-    let _one = hosts_lock();
+    let one = hosts_lock(&paths.hosts_file());
+    one.held()?;
     let file = HostsFile::load(&paths.hosts_file())?;
     Ok(saved.recall(&file, host)?)
 }
@@ -158,8 +245,9 @@ pub fn recall_for_use(
     if let Some(password) = recall(paths, saved, host)? {
         return Ok(Recalled::Password(password));
     }
-    let _one = hosts_lock();
     let path = paths.hosts_file();
+    let one = hosts_lock(&path);
+    one.held()?;
     let mut file = HostsFile::load(&path)?;
     // Kept meanwhile by another attempt of this process: used, not cleared.
     if let Some(password) = saved.recall(&file, host)? {
@@ -201,8 +289,9 @@ impl std::error::Error for Kept {}
 /// keychain entry goes first, by its derived name, so that a `hosts.toml` that cannot be
 /// read never keeps the password (F4-L2).
 pub fn forget(paths: &Paths, saved: &SavedPasswords, host: &TornectId) -> Result<(), Kept> {
-    let _one = hosts_lock();
+    let one = hosts_lock(&paths.hosts_file());
     saved.erase(host).map_err(|e| Kept::Password(e.into()))?;
+    one.held().map_err(Kept::Record)?;
     forget_record(&paths.hosts_file(), saved, host).map_err(Kept::Record)
 }
 
@@ -225,8 +314,8 @@ fn forget_record(
 /// then the flags; how many entries were there. A file that cannot be read is reported
 /// after the entries of the other one went.
 pub fn forget_all(paths: &Paths, saved: &SavedPasswords) -> anyhow::Result<usize> {
-    let _one = hosts_lock();
     let path = paths.hosts_file();
+    let one = hosts_lock(&path);
     let file = HostsFile::load(&path);
     let known =
         tornect_core::trusted::KnownHosts::load(&tornect_core::trusted::known_hosts_file(paths));
@@ -249,6 +338,7 @@ pub fn forget_all(paths: &Paths, saved: &SavedPasswords) -> anyhow::Result<usize
             gone += 1;
         }
     }
+    one.held()?;
     let mut file = file?;
     let mut changed = false;
     for record in file.hosts.values_mut() {
@@ -640,8 +730,9 @@ pub fn belt(
     saved: &SavedPasswords,
     host: &TornectId,
 ) -> anyhow::Result<Option<Deleted>> {
-    let _one = hosts_lock();
     let path = paths.hosts_file();
+    let one = hosts_lock(&path);
+    one.held()?;
     let mut file = HostsFile::load(&path)?;
     let done = saved.belt(&mut file, host);
     match done {
@@ -668,9 +759,10 @@ pub fn settle(
     attempt: Attempt,
     request: &Request,
 ) -> anyhow::Result<Settled> {
-    let _one = hosts_lock();
-    let first = attempt.deletes_first().then(|| delete_first(saved, host));
     let path = paths.hosts_file();
+    let one = hosts_lock(&path);
+    let first = attempt.deletes_first().then(|| delete_first(saved, host));
+    one.held()?;
     let mut file = HostsFile::load(&path)?;
     let had = file.get(host).is_some_and(|r| r.remember);
     // A refusal says something only of the password that was sent: a typed one that is
@@ -726,10 +818,11 @@ pub fn settle_admin(
     answer: &tornect_signal::fsm::client::AdminAnswer,
 ) -> anyhow::Result<Settled> {
     let grant_reach = answer.grant_reach;
-    let _one = hosts_lock();
+    let path = paths.hosts_file();
+    let one = hosts_lock(&path);
     let first = Attempt::reaches(tornect_core::levels::Elevation::None, grant_reach)
         .then(|| delete_first(saved, host));
-    let path = paths.hosts_file();
+    one.held()?;
     let mut file = HostsFile::load(&path)?;
     let settled = saved.settle_admin(&mut file, host, grant_reach, first);
     if settled.changed {
@@ -922,8 +1015,9 @@ pub fn refused_notes(
 /// Record the signed mode of an accepted session at `host` (the host card
 /// offers the control grants' admin actions from it).
 pub fn note_mode(paths: &Paths, host: &TornectId, control: bool) -> anyhow::Result<()> {
-    let _one = hosts_lock();
     let path = paths.hosts_file();
+    let one = hosts_lock(&path);
+    one.held()?;
     let mut file = HostsFile::load(&path)?;
     let record = file.entry(host);
     if record.control != control {
@@ -936,8 +1030,9 @@ pub fn note_mode(paths: &Paths, host: &TornectId, control: bool) -> anyhow::Resu
 /// The person read that `host`'s unattended setup was re-created (A16): its
 /// pin goes, and the next accept pins the new key.
 pub fn renew_pin(paths: &Paths, host: &TornectId) -> anyhow::Result<()> {
-    let _one = hosts_lock();
     let path = paths.hosts_file();
+    let one = hosts_lock(&path);
+    one.held()?;
     let mut file = HostsFile::load(&path)?;
     file.clear_pin(host);
     file.save(&path)?;
@@ -1284,6 +1379,84 @@ mod tests {
 
     fn host(n: u8) -> TornectId {
         TornectId::from_bytes([n; 32])
+    }
+
+    /// §B.8.9.1: a second holder of the lock beside `hosts.toml` (another Tornect,
+    /// as a second open of the file stands for here) waits while the first holds
+    /// it, gives up with the lock's own error when the wait runs out, and gets the
+    /// lock once the first lets go; the lock file is this account's only.
+    #[test]
+    fn a_second_holder_waits_for_the_hosts_file_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hosts = tmp.path().join("state").join("hosts.toml");
+        let first = lock_file(&hosts, HOSTS_LOCK_WAIT).unwrap();
+        assert_eq!(
+            lock_file(&hosts, Duration::from_millis(120)).unwrap_err(),
+            HOSTS_LOCK_HELD
+        );
+        let waiter = std::thread::spawn({
+            let hosts = hosts.clone();
+            move || lock_file(&hosts, HOSTS_LOCK_WAIT).map(drop)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !waiter.is_finished(),
+            "it waits while the first holds the lock"
+        );
+        drop(first);
+        assert_eq!(waiter.join().unwrap(), Ok(()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let lock = tmp.path().join("state").join("hosts.toml.lock");
+            let mode = std::fs::metadata(lock).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(
+            HOSTS_LOCK_HELD,
+            "another Tornect held the lock beside hosts.toml for more than 10 s; nothing was saved"
+        );
+    }
+
+    /// The lock beside `hosts.toml` cannot be taken (its path is a directory here):
+    /// an operation that saves fails with the lock's error, and `hosts.toml` is
+    /// left as it was; there is no way around the lock.
+    #[test]
+    fn a_lock_that_cannot_be_taken_fails_the_save() {
+        let (_tmp, paths, _vault, saved) = with_vault();
+        let desk = host(4);
+        note_mode(&paths, &desk, true).unwrap();
+        let before = std::fs::read(paths.hosts_file()).unwrap();
+        let lock = paths.state_dir.join("hosts.toml.lock");
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        let refused = note_mode(&paths, &desk, false).unwrap_err().to_string();
+        assert!(
+            refused.starts_with("the lock beside hosts.toml could not be taken")
+                && refused.ends_with("nothing was saved"),
+            "{refused}"
+        );
+        assert!(renew_pin(&paths, &desk).is_err());
+        assert!(belt(&paths, &saved, &desk).is_err());
+        assert_eq!(std::fs::read(paths.hosts_file()).unwrap(), before);
+    }
+
+    /// A pin check whose lock cannot be taken answers `Mismatch`, so no proof is
+    /// sent, even for a host with no pin yet, whose answer would otherwise be "no
+    /// pin": a lock not taken never trusts a new host key. The pin's record then
+    /// writes nothing.
+    #[test]
+    fn a_pin_check_without_the_lock_is_a_mismatch() {
+        let (_tmp, paths, _vault, _saved) = with_vault();
+        let pin = HostsPin::new(&paths);
+        let desk = host(5);
+        assert_eq!(pin.check(&desk, &[9; 32]), PinCheck::NoPin);
+        let lock = paths.state_dir.join("hosts.toml.lock");
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        assert_eq!(pin.check(&desk, &[9; 32]), PinCheck::Mismatch);
+        pin.record(&desk, &[9; 32]);
+        assert!(!paths.hosts_file().exists(), "nothing written");
     }
 
     fn typed(password: &str, remember: bool) -> Request {
