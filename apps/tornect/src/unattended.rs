@@ -4699,6 +4699,27 @@ mod tests {
         assert_eq!(resp.code, codes::G_PRECONDITION, "{resp:?}");
     }
 
+    /// `set-level none` on a grant without the level changes nothing and leaves
+    /// no trace: no line in the log and no write of the store; the answer still
+    /// says "no administrator access; unchanged".
+    #[test]
+    fn set_level_none_at_none_logs_and_writes_nothing() {
+        let env = level_env();
+        let target = device(77);
+        env.plain_grant(&target);
+        let store = env.ctx.guard.store();
+        let (lines, generation) = (store.log().read_all().unwrap().len(), store.generation());
+        let resp = go(&env.ctx, IpcOp::SetLevelNone { device: target });
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(resp.detail.as_deref(), Some(LEVEL_ALREADY_NONE));
+        assert_eq!(
+            store.log().read_all().unwrap().len(),
+            lines,
+            "nothing logged"
+        );
+        assert_eq!(store.generation(), generation, "nothing written");
+    }
+
     /// M1-46 (kept): a host that started without its store answers `tornect
     /// panic` only; `set-level none` is refused with that reason and ends
     /// nothing.
