@@ -1132,6 +1132,24 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
     b.shared.update(|m| m.closed = true);
 }
 
+/// The window's notes after the verified accept of an unattended connect to the
+/// host named `named` (quoted): what the settle said, then the attempt's notes,
+/// but for the one that the administrator level was not given, which the Home
+/// status line says for as long as the session lasts (said there once).
+fn connect_notes(named: &str, after: ua_client::AfterAccept) -> Vec<String> {
+    let mut notes = Vec::new();
+    match &after.settled {
+        Ok(_) => {}
+        Err(e) if after.deleted_first => {
+            notes.push(format!("hosts.toml could not be updated: {e:#}"));
+        }
+        Err(e) => notes.push(format!("The password could not be remembered: {e:#}")),
+    }
+    let not_given = tornect_core::unattended::credentials::note::level_not_given(named);
+    notes.extend(after.notes.into_iter().filter(|note| *note != not_given));
+    notes
+}
+
 /// Make an address-book change the window asked for (on this side, never on
 /// the UI thread) and show the files as they are now.
 fn change_book(b: &Backend, change: &Change) {
@@ -1155,11 +1173,21 @@ fn forget(
     if let Some(e) = &kept {
         tracing::warn!(error = %e, "Forget did not finish");
     }
+    // Named as the connect's notes name a host: its pinned label, quoted; read
+    // before the change below takes the pin away.
+    let named =
+        tornect_core::trusted::KnownHosts::load(&tornect_core::trusted::known_hosts_file(paths))
+            .ok()
+            .and_then(|known| known.get(id).map(|pin| format!("\"{}\"", pin.label)))
+            .unwrap_or_else(|| format!("{}…", id.short()));
     let note = book::apply(paths, &Change::Forget(*id));
     match kept {
         None => note,
+        // The window lists no computer once its pin and entry went, so it
+        // offers no second Forget: Rotate ID is what deletes the password then.
         Some(ua_client::Kept::Password(_)) => format!(
-            "{note} Its remembered password could not be deleted: it may still be in {}.",
+            "{note} The password remembered for {named} could not be deleted from {}; Rotate ID \
+             deletes it later.",
             saved.keychain().unwrap_or("the keychain")
         ),
         Some(ua_client::Kept::Record(_)) => format!(
@@ -1691,15 +1719,7 @@ async fn viewed(
             &format!("\"{host}\""),
             session.elevation_withheld(),
         );
-        let mut notes = Vec::new();
-        match &after.settled {
-            Ok(_) => {}
-            Err(e) if after.deleted_first => {
-                notes.push(format!("hosts.toml could not be updated: {e:#}"));
-            }
-            Err(e) => notes.push(format!("The password could not be remembered: {e:#}")),
-        }
-        notes.extend(after.notes);
+        let notes = connect_notes(&format!("\"{host}\""), after);
         b.shared.update(|m| {
             for note in notes {
                 m.note(note);
@@ -2892,8 +2912,8 @@ mod tests {
         assert_eq!(
             forget(&paths, &saved, &host),
             format!(
-                "{forgot} Its remembered password could not be deleted: it may still be in a \
-                 test keychain."
+                "{forgot} The password remembered for \"Desk\" could not be deleted from a test \
+                 keychain; Rotate ID deletes it later."
             )
         );
         assert_eq!(refusing.0.names().len(), 1, "the password is still there");
@@ -2906,5 +2926,101 @@ mod tests {
         vault.put(&saved.entry(&host), "pw").unwrap();
         assert_eq!(forget(&paths, &saved, &host), forgot);
         assert!(vault.names().is_empty());
+    }
+
+    /// After a refused delete the window cannot offer Forget for that host again:
+    /// Forget took its pin and its address-book entry, so the address book lists
+    /// no computer to forget, while `hosts.toml` keeps the record with `remember`
+    /// set, for the check when the prompt opens or Rotate ID to delete it.
+    #[test]
+    fn forget_is_not_offered_again_after_a_refused_delete() {
+        use tornect_core::trusted::{KnownHosts, known_hosts_file};
+        use tornect_core::unattended::credentials::{
+            EntryName, MemoryVault, PasswordVault, SavedPasswords,
+        };
+        use tornect_core::unattended::hosts::HostsFile;
+        use zeroize::Zeroizing;
+
+        /// A keychain whose delete fails.
+        struct Refusing(MemoryVault);
+        impl PasswordVault for Refusing {
+            fn describe(&self) -> &'static str {
+                self.0.describe()
+            }
+            fn presence_gated(&self) -> bool {
+                false
+            }
+            fn get(&self, entry: &EntryName) -> tornect_core::Result<Option<Zeroizing<String>>> {
+                self.0.get(entry)
+            }
+            fn put(&self, entry: &EntryName, password: &str) -> tornect_core::Result<()> {
+                self.0.put(entry, password)
+            }
+            fn delete(&self, _: &EntryName) -> tornect_core::Result<bool> {
+                Err(std::io::Error::other("the keychain refused").into())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        paths.ensure().unwrap();
+        let host = HostIdentity::from_seed(&[0x78; 32]).id();
+        let mut known = KnownHosts::default();
+        known.pin(host, "Desk", [9; 32], 1);
+        known.save(&known_hosts_file(&paths)).unwrap();
+        let mut file = HostsFile::default();
+        file.entry(&host).remember = true;
+        file.save(&paths.hosts_file()).unwrap();
+        let refusing = Arc::new(Refusing(MemoryVault::new()));
+        let saved = SavedPasswords::new(Some(refusing.clone()), [1; 32]);
+        refusing.0.put(&saved.entry(&host), "pw").unwrap();
+        let today = tornect_core::address_book::Day::today();
+        assert!(
+            book::read(&paths, today, None)
+                .computers
+                .iter()
+                .any(|c| c.id == host),
+            "listed, with its Forget, before"
+        );
+
+        let note = forget(&paths, &saved, &host);
+        assert_eq!(refusing.0.names().len(), 1, "the password is still there");
+        assert!(
+            !book::read(&paths, today, None)
+                .computers
+                .iter()
+                .any(|c| c.id == host),
+            "no computer left to forget"
+        );
+        let record = HostsFile::load(&paths.hosts_file()).unwrap();
+        assert!(record.get(&host).is_some_and(|r| r.remember));
+        // So the note names what does delete it.
+        assert!(note.ends_with("; Rotate ID deletes it later."), "{note}");
+    }
+
+    /// The window says once that the administrator level was not given: on the
+    /// Home status line, not again in the recent activity; its other notes stay,
+    /// in order, after what the settle said.
+    #[test]
+    fn the_window_does_not_repeat_the_level_not_given_note() {
+        use tornect_core::unattended::credentials::note;
+        let named = "\"Desk\"";
+        let after = ua_client::AfterAccept {
+            settled: Err(anyhow::anyhow!("the disk is full")),
+            deleted_first: false,
+            notes: vec![
+                note::view_only(named),
+                note::level_not_given(named),
+                note::failed_delete(named, "a test keychain"),
+            ],
+        };
+        assert_eq!(
+            connect_notes(named, after),
+            vec![
+                "The password could not be remembered: the disk is full".to_owned(),
+                note::view_only(named),
+                note::failed_delete(named, "a test keychain"),
+            ]
+        );
     }
 }
