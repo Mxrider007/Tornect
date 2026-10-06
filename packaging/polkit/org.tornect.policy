@@ -65,8 +65,8 @@
   </action>
 
   <action id="org.tornect.autostart">
-    <description>Change whether Tornect starts at login</description>
-    <message>Authentication is required to change whether Tornect starts automatically when you log in.</message>
+    <description>Install or remove Tornect, or change whether it starts at login</description>
+    <message>Authentication is required to install or remove Tornect, or to change whether it starts automatically when you log in.</message>
     <defaults>
       <allow_any>auth_self</allow_any>
       <allow_inactive>auth_self</allow_inactive>

@@ -1427,7 +1427,7 @@ mod tests {
         assert_eq!(bin, ["tornect"]);
     }
 
-    /// §B.1.1 (the operator's default): on Windows `tornect uninstall` is
+    /// §B.1.1 (the built default, which the operator kept): on Windows `tornect uninstall` is
     /// refused while a grant holds the administrator level, naming the
     /// device and `set-level <device> none`, and while the administrator
     /// helper task is registered; nothing is asked or removed.
