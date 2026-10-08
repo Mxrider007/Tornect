@@ -8,6 +8,7 @@
 mod address_book;
 mod gallery;
 mod home;
+pub(super) mod viewer;
 
 use std::time::Instant;
 
