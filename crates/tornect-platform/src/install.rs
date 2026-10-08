@@ -625,7 +625,10 @@ enum Done {
 /// Undo `done`, newest first: the Start-menu entry, then the copy (an
 /// elevated step, run only after a reparse check of its own: the folder and
 /// the copy in it must not be reparse points, or the delete would act on
-/// another place). What could not be undone is added to `error`'s message.
+/// another place). What could not be undone is added to `error`'s message,
+/// after its reason; when the copy itself stayed, the message says that
+/// Tornect was not installed and that the folder may still hold a copy that
+/// nothing points at.
 /// A copy whose folder failed the ACL check never comes here: it is not
 /// deleted as administrator at all.
 fn undo(
@@ -635,6 +638,7 @@ fn undo(
     error: InstallError,
 ) -> InstallError {
     let mut failed = Vec::new();
+    let mut copy_left = false;
     for step in done.iter().rev() {
         let undone = match step {
             Done::StartMenuEntry => sys.remove_shortcut(&target.start_menu_entry),
@@ -645,6 +649,7 @@ fn undo(
             }),
         };
         if let Err(e) = undone {
+            copy_left |= *step == Done::Copied;
             failed.push(match step {
                 Done::StartMenuEntry => format!("removing {}: {e}", target.start_menu_entry),
                 Done::Copied => format!("removing {}: {e}", target.folder),
@@ -654,7 +659,16 @@ fn undo(
     if failed.is_empty() {
         return error;
     }
-    let tail = format!(" Undoing it did not finish ({}).", failed.join("; "));
+    let details = failed.join("; ");
+    let tail = if copy_left {
+        format!(
+            " Tornect was not installed, and undoing it did not finish ({details}): {} may still \
+             hold a copy, and nothing points at it.",
+            target.folder
+        )
+    } else {
+        format!(" Undoing it did not finish ({details}).")
+    };
     match error {
         InstallError::Unavailable(m) => InstallError::Unavailable(format!("{m}{tail}")),
         InstallError::Refused(m) => InstallError::Refused(format!("{m}{tail}")),
@@ -2341,6 +2355,29 @@ mod windows_tests {
                 other => panic!("{at}: {other:?}"),
             }
             fake.assert_nothing_installed();
+        }
+    }
+
+    /// When the undo of an install cannot remove the copy (here its prompt
+    /// dismissed too, after the entry's prompt was), the error keeps the reason
+    /// the install stopped as its first words, then says that Tornect was not
+    /// installed, what did not finish, and that the folder may still hold a copy
+    /// that nothing points at (§B.1.1).
+    #[test]
+    fn an_undo_that_left_the_copy_says_so_after_the_reason() {
+        let fake = Fake::new();
+        fake.cancel.borrow_mut().extend(["write", "remove"]);
+        let folder = fake.folder();
+        match install_in_program_files(&fake, &mut allow(&fake)) {
+            Err(InstallError::Cancelled(why)) => assert_eq!(
+                why,
+                format!(
+                    "{INSTALL_NEEDS_APPROVAL} Tornect was not installed, and undoing it did not \
+                     finish (removing {folder}: the prompt was dismissed): {folder} may still \
+                     hold a copy, and nothing points at it."
+                )
+            ),
+            other => panic!("{other:?}"),
         }
     }
 
