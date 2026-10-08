@@ -393,7 +393,10 @@ fn on_key(
     key: keys::KeyInput,
     now: Instant,
 ) -> bool {
-    match keys::key_route(chord, viewer.keyboard_local, forwarder.is_open(), key) {
+    // While paused, keys go to the window's controls, as in a view-only
+    // session; the chord does not resume.
+    let sends = forwarder.is_open() && !forwarder.is_paused();
+    match keys::key_route(chord, viewer.keyboard_local, sends, key) {
         keys::Route::Host { usb, pressed } => forwarder.key(usb, pressed),
         keys::Route::Window => return true,
         keys::Route::Nowhere => {}
@@ -423,9 +426,9 @@ fn on_button(forwarder: &mut Forwarder, viewer: &mut ViewerState, button: Button
 /// asks the tokio side for anything. `viewing`, the signed level, is only
 /// read: no action raises the level or opens a closed forwarder.
 fn apply_viewer_action(
-    _forwarder: &mut Forwarder,
+    forwarder: &mut Forwarder,
     viewer: &mut ViewerState,
-    _viewing: Option<&Viewing>,
+    viewing: Option<&Viewing>,
     action: &Action,
 ) -> Option<Command> {
     match action {
@@ -436,6 +439,13 @@ fn apply_viewer_action(
         }
         Action::Viewer(ViewerAction::Details(open)) => {
             viewer.details = *open;
+            None
+        }
+        // The switch, in a control session only: the one way to resume.
+        Action::Viewer(ViewerAction::Pause(pause)) => {
+            if viewing.is_some_and(|v| v.control) {
+                forwarder.pause(*pause);
+            }
             None
         }
         _ => None,
@@ -989,6 +999,7 @@ impl App {
         // Every frame: this computer may start sharing its screen during
         // the session, and the window then names nobody.
         view.viewer.shared = self.shared.read(|m| m.screen_shared(Instant::now()));
+        view.viewer.input_paused = view.forwarder.is_paused();
         let picture = view.video.id().zip(view.video.size());
         let mut actions = Vec::new();
         let mut drawn = None;
@@ -2545,6 +2556,8 @@ mod tests {
             Action::Viewer(ViewerAction::Pin(false)),
             Action::Viewer(ViewerAction::Details(true)),
             Action::Viewer(ViewerAction::Details(false)),
+            Action::Viewer(ViewerAction::Pause(true)),
+            Action::Viewer(ViewerAction::Pause(false)),
         ];
         let w = Window::new(true);
         for open in [false, true] {
@@ -2585,5 +2598,90 @@ mod tests {
         }
         assert_eq!(commands.try_recv(), Ok(Command::EndViewing));
         assert_eq!(commands.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// A session's window starts unpaused with the keyboard on the host: the
+    /// forwarder and the window's state are built anew for each session.
+    #[test]
+    fn a_new_session_starts_unpaused_with_the_keyboard_on_the_host() {
+        let (_, forwarder, viewer) = viewer(true);
+        assert!(!forwarder.is_paused());
+        assert!(forwarder.is_open());
+        assert!(!viewer.keyboard_local);
+        assert!(!viewer.input_paused);
+    }
+
+    /// While paused, neither the chord, nor a press on the picture, nor
+    /// winit's replay of held keys when the window gets the focus back, nor
+    /// a new picture resumes input, and nothing goes out; the switch does.
+    #[test]
+    fn only_the_switch_resumes_input() {
+        let mut window = viewer(true);
+        let control = Viewing {
+            control: true,
+            ..Window::new(true).viewing
+        };
+        apply_viewer_action(
+            &mut window.1,
+            &mut window.2,
+            Some(&control),
+            &Action::Viewer(ViewerAction::Pause(true)),
+        );
+        assert_eq!(
+            window.1.drain(),
+            vec![tornect_input::InputEvent::ReleaseAll]
+        );
+        let chord = [
+            press(CTRL),
+            press(ALT),
+            press(SHIFT),
+            press(KEY_M),
+            release(KEY_M),
+        ];
+        type_keys(&mut window, &chord);
+        type_keys(&mut window, &chord);
+        window.1.moved((500.0, 300.0));
+        on_button(&mut window.1, &mut window.2, Button::Left, true);
+        on_button(&mut window.1, &mut window.2, Button::Left, false);
+        let replayed = keys::KeyInput {
+            synthetic: true,
+            ..press(KEY_A)
+        };
+        type_keys(&mut window, &[replayed, press(KEY_A)]);
+        window.1.set_areas(
+            Some(PictureRect {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            }),
+            None,
+            Vec::new(),
+        );
+        window.1.flush();
+        assert!(window.1.is_paused());
+        assert!(window.1.drain().is_empty());
+        apply_viewer_action(
+            &mut window.1,
+            &mut window.2,
+            Some(&control),
+            &Action::Viewer(ViewerAction::Pause(false)),
+        );
+        assert!(!window.1.is_paused());
+        // The chords left the keyboard here: a press on the picture gives
+        // it back, and both go out.
+        on_button(&mut window.1, &mut window.2, Button::Left, true);
+        assert!(!window.2.keyboard_local);
+        type_keys(&mut window, &[press(KEY_A)]);
+        assert_eq!(
+            window.1.drain(),
+            vec![
+                tornect_input::InputEvent::PointerButton {
+                    button: Button::Left,
+                    pressed: true
+                },
+                key(KEY_A, true)
+            ]
+        );
     }
 }
