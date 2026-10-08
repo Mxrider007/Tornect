@@ -272,6 +272,30 @@ fn remove_pipe_name(state_dir: &Path, name: &str) {
     }
 }
 
+/// The Windows control channel's bind, in its order (§B.8.7.4): a fresh name
+/// from `new_name`; the pipe's first instance under it (`create_first`), a pipe
+/// that already exists refused before any file is touched ([`claim_first`]);
+/// then the name written into the name file through `create_new` and `replace`
+/// ([`write_pipe_name`]). A name that could not be written means no channel,
+/// and a name file left by an earlier host is removed, best effort. The name
+/// and the first instance.
+#[cfg(any(windows, test))]
+fn bind_steps<P>(
+    state_dir: &Path,
+    new_name: impl FnOnce() -> std::io::Result<String>,
+    create_first: impl FnOnce(&str) -> std::io::Result<P>,
+    create_new: impl FnOnce(&Path) -> std::io::Result<std::fs::File>,
+    replace: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(String, P), IpcError> {
+    let name = new_name()?;
+    let first = claim_first(create_first(&name))?;
+    if let Err(e) = write_pipe_name(state_dir, &name, create_new, replace) {
+        let _ = std::fs::remove_file(state_dir.join(PIPE_NAME_FILE));
+        return Err(e.into());
+    }
+    Ok((name, first))
+}
+
 // ---------------------------------------------------------------------------
 // framing (both endpoints)
 // ---------------------------------------------------------------------------
@@ -635,9 +659,9 @@ mod imp {
     };
 
     use super::{
-        IDLE_TIMEOUT, IpcError, IpcRequest, IpcResponse, MAX_CONNECTIONS, PIPE_NAME_FILE, Path,
-        PathBuf, Reply, check_account, claim_first, exchange, new_control_pipe_name,
-        read_pipe_name, remove_pipe_name, running, serve_frames, write_pipe_name,
+        IDLE_TIMEOUT, IpcError, IpcRequest, IpcResponse, MAX_CONNECTIONS, Path, PathBuf, Reply,
+        bind_steps, check_account, exchange, new_control_pipe_name, read_pipe_name,
+        remove_pipe_name, running, serve_frames,
     };
     use crate::win::{OwnedHandle, current_user_sid, sid_of, sid_string, token_user, wide};
 
@@ -830,19 +854,15 @@ mod imp {
         /// not be written means no channel either, and a name file left by an
         /// earlier host is removed, best effort.
         pub async fn bind(state_dir: &Path) -> Result<Self, IpcError> {
-            let name = new_control_pipe_name()?;
             let account = current_user_sid()?;
             let descriptor = Descriptor::this_account_only(&account)?;
-            let first = claim_first(instance(&name, &descriptor, true))?;
-            if let Err(e) = write_pipe_name(
+            let (name, first) = bind_steps(
                 state_dir,
-                &name,
+                new_control_pipe_name,
+                |name| instance(name, &descriptor, true),
                 |tmp| create_owner_only(tmp, &descriptor),
                 replace_file,
-            ) {
-                let _ = std::fs::remove_file(state_dir.join(PIPE_NAME_FILE));
-                return Err(e.into());
-            }
+            )?;
             tracing::debug!(%name, "IPC endpoint bound");
             Ok(Self {
                 path: PathBuf::from(&name),
@@ -1133,6 +1153,71 @@ mod pipe_rules {
         assert_eq!(read_pipe_name(dir).unwrap(), second);
         remove_pipe_name(dir, &second);
         assert!(entries(dir).is_empty());
+    }
+
+    /// The Windows bind (§B.8.7.4): a fresh name at each bind, the pipe's first
+    /// instance created under it before the name file is written; a pipe that
+    /// already exists (5, or 231 with every instance taken) is refused with no
+    /// file written, moved or removed; a name file that could not be written
+    /// means no channel and no `ipc.pipe`, an earlier one removed too. The
+    /// descriptor is NEEDS-DEVICE(windows).
+    #[test]
+    fn bind_creates_the_pipe_under_a_fresh_name_before_its_name_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let order = std::cell::RefCell::new(Vec::new());
+        let bind = || {
+            bind_steps(
+                dir,
+                || {
+                    order.borrow_mut().push("name");
+                    new_control_pipe_name()
+                },
+                |name| {
+                    order.borrow_mut().push("pipe");
+                    Ok(name.to_owned())
+                },
+                |tmp| {
+                    order.borrow_mut().push("file");
+                    std::fs::File::create_new(tmp)
+                },
+                |from, to| {
+                    order.borrow_mut().push("move");
+                    std::fs::rename(from, to)
+                },
+            )
+        };
+        let (first, pipe) = bind().unwrap();
+        assert_eq!(pipe, first, "the pipe carries the name drawn");
+        assert_eq!(*order.borrow(), ["name", "pipe", "file", "move"]);
+        assert_eq!(read_pipe_name(dir).unwrap(), first);
+        let (second, _) = bind().unwrap();
+        assert_ne!(first, second, "a fresh name at each bind");
+        assert_eq!(read_pipe_name(dir).unwrap(), second);
+        for code in [PIPE_EXISTS, PIPE_FULL] {
+            let taken = bind_steps(
+                dir,
+                new_control_pipe_name,
+                |_| Err::<(), _>(std::io::Error::from_raw_os_error(code)),
+                |_| -> std::io::Result<std::fs::File> { panic!("{code}: a file was written") },
+                |_, _| -> std::io::Result<()> { panic!("{code}: a file was moved") },
+            );
+            assert!(
+                matches!(taken, Err(IpcError::NameTaken)),
+                "{code}: {taken:?}"
+            );
+            assert_eq!(read_pipe_name(dir).unwrap(), second, "{code}");
+            assert_eq!(entries(dir), [PIPE_NAME_FILE], "{code}");
+        }
+        let failed = bind_steps(
+            dir,
+            new_control_pipe_name,
+            |name| Ok(name.to_owned()),
+            |tmp| std::fs::File::create_new(tmp),
+            |_, _| Err(std::io::Error::other("the move failed")),
+        );
+        assert!(matches!(failed, Err(IpcError::Io(_))), "{failed:?}");
+        assert!(entries(dir).is_empty(), "{:?}", entries(dir));
     }
 
     /// No name file is no host: the command line opens no pipe and computes
