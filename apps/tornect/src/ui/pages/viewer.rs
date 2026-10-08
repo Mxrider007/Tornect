@@ -15,6 +15,7 @@ use egui::{Color32, CornerRadius, RichText, Stroke, vec2};
 use super::super::model::Viewing;
 use super::super::theme::{self, Tokens};
 use super::super::view::{Action, clock};
+use super::super::widgets;
 
 /// How long the toolbar stays after the pointer last moved over the window
 /// (the operator's default of 2026-10-07; a constant until the settings
@@ -31,6 +32,9 @@ const RELAY_LINE: &str = "Relayed via Tor: quality limited";
 /// The pin's name, for the tooltip and the accessibility tree.
 const PIN: &str = "Keep this bar shown";
 
+/// The switch that pauses this computer's input, in a control session.
+const PAUSE: &str = "Pause my input";
+
 /// How far the frame rate looks back.
 const FPS_OVER: Duration = Duration::from_secs(1);
 
@@ -41,6 +45,8 @@ pub enum ViewerAction {
     Pin(bool),
     /// The connection's details: open them (`true`) or close them.
     Details(bool),
+    /// The switch: pause this computer's input (`true`), or resume it.
+    Pause(bool),
 }
 
 /// What the stream window of one session keeps between frames.
@@ -58,6 +64,10 @@ pub struct ViewerState {
     pub pinned: bool,
     /// The connection's details are open.
     pub details: bool,
+    /// The forwarder's pause as it stands for this frame: `draw_stream`
+    /// reads it from the forwarder, its one keeper, before every frame, and
+    /// the switch and the note draw it.
+    pub input_paused: bool,
     /// `(when, pictures decoded so far)`, one a frame, over the last
     /// [`FPS_OVER`]: the frame rate.
     samples: VecDeque<(Instant, u64)>,
@@ -151,6 +161,21 @@ pub fn fps(samples: &VecDeque<(Instant, u64)>, now: Instant) -> u64 {
         .or(samples.front())
         .map_or(latest, |(_, n)| *n);
     latest.saturating_sub(base)
+}
+
+/// The note under the toolbar while this computer's input is paused. The
+/// host is named only while this screen is not shared.
+#[must_use]
+pub fn pause_note(v: &Viewing, viewer: &ViewerState) -> String {
+    let whom = if viewer.shared {
+        "The remote computer"
+    } else {
+        v.host.as_str()
+    };
+    format!(
+        "Your input is paused: keyboard and mouse stay on this computer. {whom} still shows its \
+         screen."
+    )
 }
 
 /// The help line under the toolbar of a control session: where the keyboard
@@ -326,6 +351,13 @@ fn toolbar(
                             actions.push(Action::Viewer(ViewerAction::Details(!viewer.details)));
                         }
                         ui.label(RichText::new(chip_text(v)).color(chip_color(v, t)));
+                        if v.control {
+                            ui.label(RichText::new(PAUSE).small());
+                            let mut paused = viewer.input_paused;
+                            if widgets::toggle(ui, &mut paused, PAUSE).changed() {
+                                actions.push(Action::Viewer(ViewerAction::Pause(paused)));
+                            }
+                        }
                         if pin(ui, viewer.pinned).clicked() {
                             actions.push(Action::Viewer(ViewerAction::Pin(!viewer.pinned)));
                         }
@@ -352,11 +384,12 @@ fn toolbar(
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(egui::Margin::symmetric(10, 4))
                     .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(help_line(v, viewer))
-                                .small()
-                                .color(t.text_secondary),
-                        );
+                        let line = if viewer.input_paused {
+                            pause_note(v, viewer)
+                        } else {
+                            help_line(v, viewer)
+                        };
+                        ui.label(RichText::new(line).small().color(t.text_secondary));
                     });
             });
         viewer.areas.push(help.response.rect);
@@ -556,13 +589,15 @@ pub(crate) mod testing {
                 .any(|n| n.label() == Some(text) || n.value() == Some(text))
         }
 
-        /// The centre of the widget whose name or text starts with `text`.
+        /// The centre of the widget whose name starts with `text` or, where
+        /// none does, of the text that starts with it.
         pub(crate) fn centre(&self, text: &str) -> egui::Pos2 {
             let starts = |t: Option<&str>| t.is_some_and(|t| t.starts_with(text));
             let b = self
                 .nodes
                 .iter()
-                .find(|n| starts(n.label()) || starts(n.value()))
+                .find(|n| starts(n.label()))
+                .or_else(|| self.nodes.iter().find(|n| starts(n.value())))
                 .and_then(egui::accesskit::Node::bounds)
                 .unwrap_or_else(|| panic!("no \"{text}\" on screen"));
             egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32)
@@ -731,6 +766,42 @@ mod tests {
             "{:?}",
             w.texts()
         );
+    }
+
+    /// The switch is in the toolbar of a control session only; while paused
+    /// the note replaces the help line, naming the host only while this
+    /// screen is not shared.
+    #[test]
+    fn the_pause_switch_is_absent_in_a_view_only_session() {
+        let mut w = Window::new(false);
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        assert!(!w.has(PAUSE), "{:?}", w.texts());
+        let mut w = Window::new(true);
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        assert!(w.has(PAUSE), "{:?}", w.texts());
+        assert_eq!(
+            w.click(ms(100), PAUSE),
+            vec![Action::Viewer(ViewerAction::Pause(true))]
+        );
+        for (shared, whom) in [(false, "Desk"), (true, "The remote computer")] {
+            w.viewer.input_paused = true;
+            w.viewer.shared = shared;
+            w.pass(ms(200), Vec::new());
+            let note = format!(
+                "Your input is paused: keyboard and mouse stay on this computer. {whom} still \
+                 shows its screen."
+            );
+            assert!(w.has(&note), "{:?}", w.texts());
+            assert!(
+                !w.texts()
+                    .iter()
+                    .any(|t| t.contains("your keyboard goes to")),
+                "{:?}",
+                w.texts()
+            );
+        }
     }
 
     /// The relay line stays on screen with the toolbar hidden.

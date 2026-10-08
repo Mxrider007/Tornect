@@ -391,6 +391,8 @@ pub struct Forwarder {
     visible: Option<PictureRect>,
     /// What the window draws over the picture (its toolbar).
     blocked: Vec<PictureRect>,
+    /// The viewer paused this computer's input.
+    paused: bool,
     cursor: Option<(f64, f64)>,
     held: BTreeSet<Button>,
     pending_move: Option<(u16, u16)>,
@@ -416,6 +418,29 @@ impl Forwarder {
     #[must_use]
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Pause (`true`) or resume this computer's input. Pausing lets go of
+    /// everything on the host first (only in a session that sends input),
+    /// then nothing goes out until resumed; resuming gives back only what
+    /// [`new`](Self::new) gave: a view-only forwarder stays closed.
+    pub fn pause(&mut self, paused: bool) {
+        if paused && !self.paused {
+            self.release_all();
+        }
+        self.paused = paused;
+    }
+
+    /// Whether the viewer paused this computer's input.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Whether input goes out now: the session sends input and it is not
+    /// paused.
+    fn sends(&self) -> bool {
+        self.open && !self.paused
     }
 
     /// Where the picture was drawn last (none before the first picture),
@@ -458,7 +483,7 @@ impl Forwarder {
     /// The pointer moved to `pos` (physical pixels in the window).
     pub fn moved(&mut self, pos: (f64, f64)) {
         self.cursor = Some(pos);
-        let Some(rect) = self.picture.filter(|_| self.open) else {
+        let Some(rect) = self.picture.filter(|_| self.sends()) else {
             return;
         };
         // Off the picture, a move is sent only while a button forwarded from
@@ -479,7 +504,7 @@ impl Forwarder {
     /// A button went down or up. A press counts only on the picture; the
     /// release of a forwarded press always goes out, wherever it happens.
     pub fn button(&mut self, button: Button, pressed: bool) {
-        if !self.open {
+        if !self.sends() {
             return;
         }
         if pressed {
@@ -504,7 +529,7 @@ impl Forwarder {
     /// The wheel turned by `lines` (winit's `LineDelta`: `+y` away from the
     /// user, `+x` to the left) or, from a touchpad, by `pixels`.
     pub fn wheel(&mut self, lines: (f64, f64), pixels: (f64, f64)) {
-        if !self.open || !self.on_picture() {
+        if !self.sends() || !self.on_picture() {
             return;
         }
         let unit = f64::from(WHEEL_NOTCH);
@@ -519,7 +544,7 @@ impl Forwarder {
     /// screen the viewer has not seen (SLICE-E E1-4). A release always goes
     /// out; the host drops one for a key it never saw pressed.
     pub fn key(&mut self, usb: u32, pressed: bool) {
-        if !self.open || (pressed && self.picture.is_none()) {
+        if !self.sends() || (pressed && self.picture.is_none()) {
             return;
         }
         self.flush_pending();
@@ -538,9 +563,10 @@ impl Forwarder {
     }
 
     /// The viewer took the keyboard back with its chord: the host lets go of
-    /// everything this viewer holds, as on focus loss.
+    /// everything this viewer holds, as on focus loss. While paused nothing
+    /// goes out: the pause let go of everything already.
     pub fn release_all(&mut self) {
-        if !self.open {
+        if !self.sends() {
             return;
         }
         self.flush_pending();
@@ -548,11 +574,11 @@ impl Forwarder {
         self.out.push(InputEvent::ReleaseAll);
     }
 
-    /// Whether a press now goes to the host: the session sends input and
-    /// the pointer is on the picture.
+    /// Whether a press now goes to the host: the session sends input, it is
+    /// not paused, and the pointer is on the picture.
     #[must_use]
     pub fn counts_press(&self) -> bool {
-        self.open && self.on_picture()
+        self.sends() && self.on_picture()
     }
 
     /// Let the coalesced move and wheel go out.
@@ -766,8 +792,62 @@ mod tests {
         f.moved((500.0, 300.0));
         assert!(!f.counts_press());
         f.release_all();
+        f.pause(true);
+        f.pause(false);
+        f.release_all();
+        f.key(0x07_0004, true);
         f.flush();
         assert!(!f.is_open());
+        assert!(f.drain().is_empty());
+    }
+
+    /// Pausing lets go of everything on the host, then nothing goes out:
+    /// no move, press, wheel turn, key or release, until resumed.
+    #[test]
+    fn pausing_releases_everything_then_sends_nothing() {
+        let mut f = open();
+        f.moved((500.0, 300.0));
+        f.button(Button::Left, true);
+        f.key(0x07_0004, true);
+        f.pause(true);
+        let sent = f.drain();
+        assert_eq!(sent.last(), Some(&InputEvent::ReleaseAll), "{sent:?}");
+        assert!(f.is_paused());
+        f.moved((600.0, 300.0));
+        f.button(Button::Left, false);
+        f.button(Button::Right, true);
+        f.wheel((0.0, 2.0), (0.0, 0.0));
+        f.key(0x07_0004, false);
+        f.key(0x07_0005, true);
+        f.release_all();
+        f.pause(true);
+        f.flush();
+        assert!(!f.counts_press());
+        assert!(f.drain().is_empty(), "nothing while paused");
+        f.pause(false);
+        f.key(0x07_0005, true);
+        assert_eq!(
+            f.drain(),
+            vec![InputEvent::Key {
+                usb: 0x07_0005,
+                pressed: true
+            }]
+        );
+    }
+
+    /// Resuming gives back only what the session was built with: a
+    /// view-only forwarder stays closed and sends nothing.
+    #[test]
+    fn resume_never_opens_a_view_only_session() {
+        let mut f = Forwarder::new(false);
+        f.set_picture(Some(RECT));
+        f.pause(true);
+        f.pause(false);
+        assert!(!f.is_open());
+        f.moved((500.0, 300.0));
+        f.button(Button::Left, true);
+        f.key(0x07_0004, true);
+        f.flush();
         assert!(f.drain().is_empty());
     }
 
