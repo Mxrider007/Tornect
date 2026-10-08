@@ -47,6 +47,57 @@ pub enum ViewerAction {
     Details(bool),
     /// The switch: pause this computer's input (`true`), or resume it.
     Pause(bool),
+    /// The Send keys menu: open it (`true`) or close it.
+    KeysMenu(bool),
+    /// Send a key combination to the remote computer.
+    SendKeys(Combo),
+}
+
+/// A key combination the Send keys menu sends, in a control session only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Combo {
+    /// Ctrl+Alt+Del: sent only to a host that said it does not run Windows
+    /// (Windows never takes an injected one to its secure screen).
+    CtrlAltDel,
+    /// Alt+Tab.
+    AltTab,
+    /// The Super (Windows) key.
+    Super,
+    /// Print Screen.
+    PrintScreen,
+}
+
+impl Combo {
+    /// The menu's items, in order.
+    pub const ALL: [Self; 4] = [
+        Self::CtrlAltDel,
+        Self::AltTab,
+        Self::Super,
+        Self::PrintScreen,
+    ];
+
+    /// Its keys as USB usages (`tornect_input::keymap`), pressed in this
+    /// order and released in reverse: the left Control, Alt and Super.
+    #[must_use]
+    pub fn usages(self) -> &'static [u32] {
+        match self {
+            Self::CtrlAltDel => &[0x07_00e0, 0x07_00e2, 0x07_004c],
+            Self::AltTab => &[0x07_00e2, 0x07_002b],
+            Self::Super => &[0x07_00e3],
+            Self::PrintScreen => &[0x07_0046],
+        }
+    }
+
+    /// Its words in the menu.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CtrlAltDel => "Ctrl+Alt+Del",
+            Self::AltTab => "Alt+Tab",
+            Self::Super => "Super (Windows key)",
+            Self::PrintScreen => "Print Screen",
+        }
+    }
 }
 
 /// What the stream window of one session keeps between frames.
@@ -64,6 +115,10 @@ pub struct ViewerState {
     pub pinned: bool,
     /// The connection's details are open.
     pub details: bool,
+    /// The Send keys menu is open.
+    pub keys_menu: bool,
+    /// Whether the host said it runs Windows; `None` until it says.
+    pub host_windows: Option<bool>,
     /// The forwarder's pause as it stands for this frame: `draw_stream`
     /// reads it from the forwarder, its one keeper, before every frame, and
     /// the switch and the note draw it.
@@ -120,7 +175,7 @@ impl ViewerState {
         if self.hidden {
             return None;
         }
-        if self.pinned || self.details {
+        if self.pinned || self.details || self.keys_menu {
             self.active_at = Some(now);
             return None;
         }
@@ -325,6 +380,7 @@ fn toolbar(
     ctx.request_repaint_after(FPS_OVER);
     let rate = fps(&viewer.samples, now);
     let mut badge_clicked = false;
+    let (mut keys_clicked, mut keys_at) = (false, None);
     let t = theme::tokens(ctx);
     let area = egui::Area::new(egui::Id::new("viewer-toolbar"))
         .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 8.0))
@@ -357,6 +413,13 @@ fn toolbar(
                             if widgets::toggle(ui, &mut paused, PAUSE).changed() {
                                 actions.push(Action::Viewer(ViewerAction::Pause(paused)));
                             }
+                            let send = ui.button("Send keys");
+                            if send.clicked() {
+                                keys_clicked = true;
+                                let open = !viewer.keys_menu;
+                                actions.push(Action::Viewer(ViewerAction::KeysMenu(open)));
+                            }
+                            keys_at = Some(send.rect.left());
                         }
                         if pin(ui, viewer.pinned).clicked() {
                             actions.push(Action::Viewer(ViewerAction::Pin(!viewer.pinned)));
@@ -399,11 +462,55 @@ fn toolbar(
         let at = egui::pos2(pill.left(), below);
         let open = details(ctx, v, input_sent, rate, now, at, t);
         viewer.areas.push(open.response.rect);
+        below = open.response.rect.bottom() + 4.0;
         // A press anywhere else closes them (the badge toggles them itself).
         if open.response.clicked_elsewhere() && !badge_clicked {
             actions.push(Action::Viewer(ViewerAction::Details(false)));
         }
     }
+    if viewer.keys_menu
+        && let Some(left) = keys_at
+    {
+        let menu = keys_menu(ctx, viewer, egui::pos2(left, below), actions, t);
+        viewer.areas.push(menu.response.rect);
+        if menu.response.clicked_elsewhere() && !keys_clicked {
+            actions.push(Action::Viewer(ViewerAction::KeysMenu(false)));
+        }
+    }
+}
+
+/// The Send keys menu at `at`: Ctrl+Alt+Del is greyed until the host says
+/// it does not run Windows, never sent into a silent loss.
+fn keys_menu(
+    ctx: &egui::Context,
+    viewer: &ViewerState,
+    at: egui::Pos2,
+    actions: &mut Vec<Action>,
+    t: &Tokens,
+) -> egui::InnerResponse<()> {
+    egui::Area::new(egui::Id::new("viewer-keys"))
+        .fixed_pos(at)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(t.surface_overlay)
+                .stroke(Stroke::new(1.0, t.border_subtle))
+                .corner_radius(CornerRadius::same(8))
+                .shadow(t.popup_shadow)
+                .inner_margin(egui::Margin::same(6))
+                .show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        for combo in Combo::ALL {
+                            let sendable =
+                                combo != Combo::CtrlAltDel || viewer.host_windows == Some(false);
+                            let item = egui::Button::new(combo.label()).frame(false);
+                            if ui.add_enabled(sendable, item).clicked() {
+                                actions.push(Action::Viewer(ViewerAction::SendKeys(combo)));
+                            }
+                        }
+                    });
+                });
+        })
 }
 
 /// The connection's details, under the toolbar at `at`: the route, the
@@ -587,6 +694,15 @@ pub(crate) mod testing {
             self.nodes
                 .iter()
                 .any(|n| n.label() == Some(text) || n.value() == Some(text))
+        }
+
+        /// Whether the widget named `text` was disabled in the last pass.
+        pub(crate) fn disabled(&self, text: &str) -> bool {
+            self.nodes
+                .iter()
+                .find(|n| n.label() == Some(text))
+                .unwrap_or_else(|| panic!("no \"{text}\" on screen"))
+                .is_disabled()
         }
 
         /// The centre of the widget whose name starts with `text` or, where
@@ -802,6 +918,32 @@ mod tests {
                 w.texts()
             );
         }
+    }
+
+    /// The Send keys menu is in the toolbar of a control session only.
+    #[test]
+    fn send_keys_is_absent_in_a_view_only_session() {
+        let mut w = Window::new(false);
+        w.viewer.keys_menu = true;
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        for item in [
+            "Send keys",
+            "Ctrl+Alt+Del",
+            "Alt+Tab",
+            "Super (Windows key)",
+            "Print Screen",
+        ] {
+            assert!(!w.has(item), "{item}: {:?}", w.texts());
+        }
+        let mut w = Window::new(true);
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        assert!(w.has("Send keys"));
+        assert_eq!(
+            w.click(ms(100), "Send keys"),
+            vec![Action::Viewer(ViewerAction::KeysMenu(true))]
+        );
     }
 
     /// The relay line stays on screen with the toolbar hidden.
