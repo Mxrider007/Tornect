@@ -715,3 +715,42 @@ impl WindowsSystem for RealWindows {
         }
     }
 }
+
+/// Whether what this process writes goes anywhere: to the console it was started from
+/// (attached at the start, `crate::attach_parent_console`), or to an output redirected to a
+/// file or a pipe. `tornect.exe` is a window-subsystem program, so one started with neither,
+/// as Apps and features starts the uninstall entry's command, writes its lines nowhere
+/// (§B.1.1).
+#[must_use]
+pub fn has_output() -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+    // SAFETY: plain call.
+    let out = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    !out.is_null() && out != INVALID_HANDLE_VALUE
+}
+
+/// Show `text` in one message box titled "Tornect", with a warning icon when `warning` (an
+/// error or a refusal), and wait until it is closed: what `tornect install` and `tornect
+/// uninstall` said where nothing else shows it (§B.1.1).
+pub fn show_message(text: &str, warning: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MessageBoxW,
+    };
+    let text = wide(text);
+    let title = wide("Tornect");
+    let icon = if warning {
+        MB_ICONWARNING
+    } else {
+        MB_ICONINFORMATION
+    };
+    // SAFETY: both strings are NUL-terminated and outlive the call; no owner window.
+    unsafe {
+        MessageBoxW(
+            null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | icon | MB_SETFOREGROUND,
+        )
+    };
+}

@@ -96,6 +96,71 @@ pub(crate) struct Deps<'a> {
     pub autostart_for: &'a dyn Fn(LaunchSpec) -> Arc<dyn Autostart>,
 }
 
+/// What `install` and `uninstall` say, kept where nothing would show it: Windows'
+/// Apps and features starts the uninstall entry's command with no console, as do
+/// Explorer and the Run box (§B.1.1: the command says what it did or why it
+/// refused). Shown at the end in one message box, the error after the lines.
+#[cfg(any(windows, test))]
+#[derive(Debug, Default)]
+struct Collected {
+    lines: Vec<String>,
+}
+
+#[cfg(any(windows, test))]
+impl Collected {
+    /// The message box's text: every line in order, then the command's error as
+    /// the command line prints it.
+    fn text(&self, done: &anyhow::Result<()>) -> String {
+        use std::fmt::Write as _;
+        let mut text = self.lines.join("\n");
+        if let Err(e) = done {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            let _ = write!(text, "{e:#}");
+        }
+        text
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Console for Collected {
+    fn stdout_is_terminal(&self) -> bool {
+        false
+    }
+
+    fn out(&mut self, line: &str) {
+        self.lines.push(line.to_owned());
+    }
+
+    fn err(&mut self, line: &str) {
+        self.lines.push(line.to_owned());
+    }
+
+    /// Nobody can answer there: as with an input that is not a terminal, no
+    /// answer, which every question of these commands takes for no.
+    fn ask(&mut self, _: &str) -> Option<String> {
+        None
+    }
+}
+
+/// Run `command` on this process's output, or, where it has none (Windows: a
+/// start from Apps and features, Explorer or the Run box), with what it says
+/// collected and shown at the end in one message box, its error after the
+/// lines (§B.1.1).
+#[cfg(windows)]
+fn said_somewhere(
+    command: impl FnOnce(&mut dyn Console) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if tornect_platform::win_install::has_output() {
+        return command(&mut unattended::Terminal);
+    }
+    let mut collected = Collected::default();
+    let done = command(&mut collected);
+    tornect_platform::win_install::show_message(&collected.text(&done), done.is_err());
+    done
+}
+
 /// The answer to a default-no question: `y` or `yes` (any case) is yes;
 /// Enter, any other answer, end of input, a read error or an input that is
 /// not a terminal (`None`) is no.
@@ -214,19 +279,20 @@ pub fn install(paths: &Paths) -> anyhow::Result<()> {
     }
     #[cfg(windows)]
     {
-        let sys = tornect_platform::install::windows_system()?;
-        let host_running = crate::host::HostLock::holder(paths).is_some();
-        anyhow::ensure!(!host_running, CLOSE_FIRST);
-        let mut ctx = unattended::offline_context(paths)?;
-        let mut console = unattended::Terminal;
-        let custom_home = Paths::platform().ok().as_ref() != Some(paths);
-        let mut deps = Deps {
-            ctx: &mut ctx,
-            console: &mut console,
-            host_running,
-            autostart_for: &tornect_platform::autostart::for_this_os,
-        };
-        install_windows(&mut deps, paths, &*sys, custom_home)
+        said_somewhere(|console| {
+            let sys = tornect_platform::install::windows_system()?;
+            let host_running = crate::host::HostLock::holder(paths).is_some();
+            anyhow::ensure!(!host_running, CLOSE_FIRST);
+            let mut ctx = unattended::offline_context(paths)?;
+            let custom_home = Paths::platform().ok().as_ref() != Some(paths);
+            let mut deps = Deps {
+                ctx: &mut ctx,
+                console,
+                host_running,
+                autostart_for: &tornect_platform::autostart::for_this_os,
+            };
+            install_windows(&mut deps, paths, &*sys, custom_home)
+        })
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
@@ -254,18 +320,19 @@ pub fn uninstall(paths: &Paths) -> anyhow::Result<()> {
     }
     #[cfg(windows)]
     {
-        let sys = tornect_platform::install::windows_system()?;
-        let host_running = crate::host::HostLock::holder(paths).is_some();
-        anyhow::ensure!(!host_running, CLOSE_FIRST);
-        let mut ctx = unattended::offline_context(paths)?;
-        let mut console = unattended::Terminal;
-        let mut deps = Deps {
-            ctx: &mut ctx,
-            console: &mut console,
-            host_running,
-            autostart_for: &tornect_platform::autostart::for_this_os,
-        };
-        uninstall_windows(&mut deps, paths, &*sys)
+        said_somewhere(|console| {
+            let sys = tornect_platform::install::windows_system()?;
+            let host_running = crate::host::HostLock::holder(paths).is_some();
+            anyhow::ensure!(!host_running, CLOSE_FIRST);
+            let mut ctx = unattended::offline_context(paths)?;
+            let mut deps = Deps {
+                ctx: &mut ctx,
+                console,
+                host_running,
+                autostart_for: &tornect_platform::autostart::for_this_os,
+            };
+            uninstall_windows(&mut deps, paths, &*sys)
+        })
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
@@ -560,6 +627,9 @@ pub(crate) fn uninstall_windows(
         }
         Ok(())
     };
+    // Whether this is the installed copy, read once, before anything is removed:
+    // what the uninstall says at its end reads nothing after the removal.
+    let from_install = tornect_platform::install::runs_from_install(sys);
     let mut done =
         tornect_platform::install::uninstall_from_program_files(sys, &mut remove_sign_in);
     if done.is_ok() && !authorized.get() {
@@ -583,7 +653,7 @@ pub(crate) fn uninstall_windows(
         }
     };
     // Run from the installed copy, its folder went to the next restart.
-    if removed.folder && tornect_platform::install::runs_from_install(sys)? {
+    if removed.folder && matches!(from_install, Ok(true)) {
         deps.console.out(&at_the_restart_line(&folder));
     }
     deps.console.out(&removed_line(paths));
@@ -1651,6 +1721,150 @@ mod tests {
             !script.lines.iter().any(|l| l.contains(GRANTS_UNREADABLE)),
             "{:?}",
             script.lines
+        );
+    }
+
+    /// With nowhere to write (Windows: Apps and features starts the uninstall
+    /// entry's command with no console), what the command says is kept, in
+    /// order, for one message box, its error after the lines; nobody can answer
+    /// a question there, so each is a no.
+    #[test]
+    fn with_nowhere_to_write_the_lines_and_the_error_go_into_one_message() {
+        let mut collected = Collected::default();
+        assert!(!collected.stdout_is_terminal());
+        collected.out("first");
+        assert_eq!(collected.ask(SIGN_IN_QUESTION), None);
+        collected.err("second");
+        assert_eq!(collected.text(&Ok(())), "first\nsecond");
+        assert_eq!(
+            collected.text(&Err(anyhow::anyhow!(CLOSE_FIRST))),
+            format!("first\nsecond\n{CLOSE_FIRST}")
+        );
+        assert_eq!(
+            Collected::default().text(&Err(anyhow::anyhow!(CLOSE_FIRST))),
+            CLOSE_FIRST
+        );
+    }
+
+    /// Windows with Tornect in Program Files (the folder administrators' only,
+    /// no uninstall entry, no Start-menu entry), and this program the installed
+    /// copy; every elevated step is recorded, and nothing can be read of this
+    /// program once one ran.
+    #[derive(Default)]
+    struct InstalledHere {
+        ran: Mutex<Vec<Elevated>>,
+    }
+
+    impl WindowsSystem for InstalledHere {
+        fn program_files(&self) -> Result<String, InstallError> {
+            Ok("C:\\Program Files".to_owned())
+        }
+        fn system_directory(&self) -> Result<String, InstallError> {
+            Ok("C:\\Windows\\System32".to_owned())
+        }
+        fn start_menu_programs(&self) -> Result<String, InstallError> {
+            Ok("C:\\Users\\u\\Start Menu\\Programs".to_owned())
+        }
+        fn open_own_image(&self) -> Result<Box<dyn HeldImage + '_>, InstallError> {
+            panic!("opened the image")
+        }
+        fn folder_entries(&self, folder: &str) -> Result<Option<Vec<String>>, InstallError> {
+            Ok((folder == "C:\\Program Files\\Tornect").then(|| vec!["tornect.exe".to_owned()]))
+        }
+        fn is_reparse_point(&self, _: &str) -> Result<bool, InstallError> {
+            Ok(false)
+        }
+        fn read_file(&self, _: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError> {
+            panic!("read a file")
+        }
+        fn security(
+            &self,
+            _: &str,
+        ) -> Result<tornect_platform::helper_task::Security, InstallError> {
+            use tornect_platform::helper_task::{Ace, Security};
+            let ace = |sid: &str, mask| Ace {
+                sid: sid.to_owned(),
+                allow: true,
+                mask,
+                flags: 0,
+            };
+            Ok(Security {
+                owner: "S-1-5-32-544".to_owned(),
+                dacl: vec![
+                    ace("S-1-5-18", 0x001F_01FF),
+                    ace("S-1-5-32-544", 0x001F_01FF),
+                    ace("S-1-5-32-545", 0x0012_00A9),
+                ],
+            })
+        }
+        fn elevated_program(&self, step: &Elevated) -> String {
+            let target = tornect_platform::install::WindowsTarget::of(self).unwrap();
+            tornect_platform::install::elevated_command(step, &target).0
+        }
+        fn run_elevated(&self, step: &Elevated) -> Result<(), InstallError> {
+            self.ran.lock().unwrap().push(step.clone());
+            Ok(())
+        }
+        fn uninstall_entry_exists(&self, _: &str) -> Result<bool, InstallError> {
+            Ok(false)
+        }
+        fn file_exists(&self, _: &str) -> Result<bool, InstallError> {
+            Ok(false)
+        }
+        fn pending_removals(&self) -> Result<Vec<String>, InstallError> {
+            panic!("read the list of removals")
+        }
+        fn own_path(&self) -> Result<String, InstallError> {
+            if !self.ran.lock().unwrap().is_empty() {
+                return Err(InstallError::Failed(
+                    "this program read after its removal".to_owned(),
+                ));
+            }
+            Ok("C:\\Program Files\\Tornect\\tornect.exe".to_owned())
+        }
+        fn write_shortcut(&self, _: &str, _: &str) -> Result<(), InstallError> {
+            panic!("wrote a shortcut")
+        }
+        fn remove_shortcut(&self, _: &str) -> Result<(), InstallError> {
+            panic!("removed a shortcut")
+        }
+    }
+
+    /// §B.1.1: an uninstall run from the installed copy (as Apps and features
+    /// runs it) has that copy mark its folder for removal at the next restart,
+    /// and says so before its last line; whether it runs from the installed
+    /// copy is read before anything is removed, so nothing read after the
+    /// removal can end a finished uninstall in an error. With nowhere to write,
+    /// both lines go into the one message.
+    #[test]
+    fn an_uninstall_from_the_installed_copy_says_its_folder_goes_at_the_restart() {
+        let mut env = env(windows_admin(), 1);
+        let backends = Backends::default();
+        let make = |spec| backends.make(spec);
+        let sys = InstalledHere::default();
+        let mut collected = Collected::default();
+        let mut deps = Deps {
+            ctx: &mut env.ctx,
+            console: &mut collected,
+            host_running: false,
+            autostart_for: &make,
+        };
+        let done = uninstall_windows(&mut deps, &env.paths, &sys);
+        assert!(done.is_ok(), "{done:?}");
+        assert_eq!(
+            *sys.ran.lock().unwrap(),
+            [Elevated::RemoveAtRestart {
+                folder: "C:\\Program Files\\Tornect".to_owned()
+            }]
+        );
+        assert_eq!(env.dialogs.asked(), ["uninstall"]);
+        assert_eq!(
+            collected.text(&done),
+            format!(
+                "{}\n{}",
+                at_the_restart_line("C:\\Program Files\\Tornect"),
+                removed_line(&env.paths)
+            )
         );
     }
 }
