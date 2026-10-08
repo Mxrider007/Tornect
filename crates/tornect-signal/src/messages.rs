@@ -78,6 +78,21 @@ pub mod elevation {
     pub const ADMIN: u8 = 1;
 }
 
+/// The bits of the host's notice code, key 1 of its `PONG` ([`HostPong`],
+/// decision M1-70, §B.8.4.1). The other bits are reserved: kept as received
+/// and ignored.
+pub mod notice {
+    /// The host runs Windows.
+    pub const WINDOWS: u8 = 0x01;
+    /// The session is not at the administrator level on a Windows host, so
+    /// its input cannot reach windows that run as administrator (UIPI,
+    /// §B.2.1).
+    pub const NO_ADMIN_WINDOWS: u8 = 0x02;
+    /// A secure Windows screen is showing: a UAC prompt, the lock or the
+    /// sign-in screen (§B.8.8).
+    pub const SECURE_SCREEN: u8 = 0x04;
+}
+
 /// `SESSION_ACCEPT.session_type`.
 pub mod session_type {
     /// Attended: a human clicked Allow.
@@ -1255,6 +1270,28 @@ pub struct Pong {
 }
 
 impl Body for Pong {
+    const KIND: Kind = Kind::Pong;
+}
+
+/// `PONG` as the host of a session sends it, and as the client reads it
+/// (decision M1-70): [`Pong`]'s nonce and key 1, the host's notice code (the
+/// bits of [`notice`]). Absent, it says nothing new and the bytes are
+/// [`Pong`]'s: a peer built before the key reads a `HostPong` as a plain
+/// `PONG`, and a plain `PONG` reads as a `HostPong` with no notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Encode, Decode)]
+#[cbor(map)]
+pub struct HostPong {
+    /// key 0 — the `PING.nonce`.
+    #[n(0)]
+    pub nonce: u64,
+    /// key 1 — the host's notice code: a number, never text, so the viewer
+    /// says its own fixed sentences. Bits it does not know are kept as
+    /// received and ignored.
+    #[n(1)]
+    pub notice: Option<u8>,
+}
+
+impl Body for HostPong {
     const KIND: Kind = Kind::Pong;
 }
 

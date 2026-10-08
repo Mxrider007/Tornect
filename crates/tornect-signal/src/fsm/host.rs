@@ -39,8 +39,8 @@ use crate::consent::{
 use crate::envelope::{Kind, codes};
 use crate::framing::FrameError;
 use crate::messages::{
-    self, AdminResult, Bye, Caps, Hello, HelloAck, PairAccept, PairReject, PairRequest, Ping, Pong,
-    SessionAccept, SessionReject, SessionRequest, clamp_feats, ed25519_spki,
+    self, AdminResult, Bye, Caps, Hello, HelloAck, HostPong, PairAccept, PairReject, PairRequest,
+    Ping, SessionAccept, SessionReject, SessionRequest, clamp_feats, ed25519_spki,
 };
 use crate::pairing::{
     AutoDeny, BoxFuture, Consent, PairDecision, PairRefusal, PairingLimits, PairingPeer,
@@ -667,6 +667,15 @@ pub trait SessionSink: Send + Sync {
     fn on_start(&self, session: &LiveSession<'_>);
     /// The session is over. `end` is `None` when it ended in a protocol error.
     fn on_end(&self, session_id: &str, end: Option<&SessionEnd>);
+
+    /// The notice code for the viewer of live session `session_id`
+    /// (decision M1-70, §B.8.4.1): the host's `PONG` carries it in key 1, in
+    /// its first `PONG` and again only when it changes. `None`, the default,
+    /// says nothing.
+    fn notice(&self, session_id: &str) -> Option<u8> {
+        let _ = session_id;
+        None
+    }
 }
 
 /// What [`SessionSink::on_start`] is told about a live session.
@@ -779,6 +788,9 @@ struct LiveState {
     /// Accepts between the one-session gate and `on_start` (SLICE-C3 C3-1).
     reserved: usize,
     last_ended: Option<std::time::Instant>,
+    /// Each live session's notice code for its viewer (decision M1-70), by
+    /// session id; a session with none says nothing.
+    notices: std::collections::HashMap<String, u8>,
 }
 
 impl LiveState {
@@ -827,6 +839,29 @@ impl LiveSessions {
     pub fn count(&self) -> usize {
         crate::pairing::lock(&self.state).live.len()
     }
+
+    /// Set the notice code of live session `session_id` for its viewer
+    /// (decision M1-70); ignored for a session that is not live.
+    pub fn set_notice(&self, session_id: &str, code: u8) {
+        let mut state = crate::pairing::lock(&self.state);
+        if state.live.iter().any(|s| s.session_id == session_id) {
+            state.notices.insert(session_id.to_owned(), code);
+        }
+    }
+
+    /// Set (`on`) or clear `bits` in the notice code of live session
+    /// `session_id`. Only a session that has a code changes: one that was
+    /// told nothing at its start, a view-only one, stays told nothing.
+    pub fn set_notice_bits(&self, session_id: &str, bits: u8, on: bool) {
+        let mut state = crate::pairing::lock(&self.state);
+        if let Some(code) = state.notices.get_mut(session_id) {
+            if on {
+                *code |= bits;
+            } else {
+                *code &= !bits;
+            }
+        }
+    }
 }
 
 impl SessionSink for LiveSessions {
@@ -843,9 +878,17 @@ impl SessionSink for LiveSessions {
     fn on_end(&self, session_id: &str, _: Option<&SessionEnd>) {
         let mut state = crate::pairing::lock(&self.state);
         state.live.retain(|s| s.session_id != session_id);
+        state.notices.remove(session_id);
         // Set even for an id this tracker never saw: a later end only lengthens
         // the guard's cool-down, which errs on the refusing side.
         state.last_ended = Some(std::time::Instant::now());
+    }
+
+    fn notice(&self, session_id: &str) -> Option<u8> {
+        crate::pairing::lock(&self.state)
+            .notices
+            .get(session_id)
+            .copied()
     }
 }
 
@@ -1535,7 +1578,7 @@ where
     drop(reserved);
     let ended = {
         let _established = Counted::new(&deps.stats.established);
-        established(&mut chan, cfg, deps, &mut kill).await
+        established(&mut chan, cfg, deps, &mut kill, &session_id).await
     };
     let (end, goodbye) = match ended {
         Ok((end, goodbye)) => (Ok(end), goodbye),
@@ -1869,10 +1912,15 @@ async fn established<S>(
     cfg: &HostConfig,
     deps: &HostDeps,
     kill: &mut KillGuard,
+    session_id: &str,
 ) -> Result<(SessionEnd, Goodbye), HandshakeError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // The notice code the viewer was last told (decision M1-70): it goes
+    // out in the first `PONG` and then only when it changes; any other
+    // `PONG` has the plain bytes.
+    let mut told: Option<u8> = None;
     // `checked_add`: a configured timeout near `Duration::MAX` means "never",
     // never a panic.
     let orphan_at = cfg
@@ -1915,7 +1963,15 @@ where
                 // (SLICE-B2 B2-1). The write goes first, so one that can
                 // finish does; a kill that cuts one short leaves a torn frame,
                 // after which nothing more is written.
-                let pong = Pong { nonce: ping.nonce };
+                let notice = deps
+                    .sessions
+                    .notice(session_id)
+                    .filter(|code| told != Some(*code));
+                told = notice.or(told);
+                let pong = HostPong {
+                    nonce: ping.nonce,
+                    notice,
+                };
                 tokio::select! {
                     biased;
                     sent = chan.send(&pong, None) => {
