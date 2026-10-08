@@ -56,6 +56,41 @@ pub enum UserEvent {
 
 /// The window calls a question or a session start makes: a seam, so a test
 /// can record them. There is deliberately no `focus_window` here.
+/// The stream window's full screen: a seam, so a test can record the calls.
+/// It reaches nothing else of the window, its title least of all.
+pub(super) trait FullScreen {
+    fn set_fullscreen(&self, on: bool);
+}
+
+impl FullScreen for Window {
+    fn set_fullscreen(&self, on: bool) {
+        Window::set_fullscreen(
+            self,
+            on.then_some(winit::window::Fullscreen::Borderless(None)),
+        );
+    }
+}
+
+/// Send what `forwarder` has ready through `send`, then tell `window` the
+/// full screen the viewer wants (`wanted`) if it changed since it was last
+/// told (`told`): a chord that leaves full screen has its ReleaseAll out
+/// first.
+fn drain_then_fullscreen(
+    forwarder: &mut Forwarder,
+    mut send: impl FnMut(tornect_input::InputEvent),
+    window: &impl FullScreen,
+    wanted: bool,
+    told: &mut bool,
+) {
+    for event in forwarder.drain() {
+        send(event);
+    }
+    if wanted != *told {
+        window.set_fullscreen(wanted);
+        *told = wanted;
+    }
+}
+
 pub(super) trait Attention {
     fn is_minimized(&self) -> Option<bool>;
     fn set_minimized(&self, minimized: bool);
@@ -383,6 +418,8 @@ struct StreamView {
     viewer: ViewerState,
     /// The viewer's own chord (decision M1-70), seeing every key first.
     chord: keys::Chord,
+    /// Whether the window was last told to be full screen.
+    fullscreen: bool,
 }
 
 /// One key of the stream window at `now`, through the chord first (decision
@@ -403,10 +440,12 @@ fn on_key(
         keys::Route::Nowhere => {}
         keys::Route::TakeBack => {
             // The modifiers pressed before the M already went to the host:
-            // it lets go of everything first.
+            // it lets go of everything first. Full screen is left after
+            // that, once the ReleaseAll is out.
             forwarder.release_all();
             viewer.keyboard_local = true;
             viewer.show_toolbar(now);
+            viewer.leave_fullscreen();
         }
         keys::Route::GiveBack => viewer.keyboard_local = false,
     }
@@ -458,6 +497,11 @@ fn apply_viewer_action(
         }
         Action::Viewer(ViewerAction::OneToOne(on)) => {
             viewer.one_to_one = *on;
+            None
+        }
+        // The window's own: nothing goes to the host.
+        Action::Viewer(ViewerAction::Fullscreen(on)) => {
+            viewer.fullscreen = *on;
             None
         }
         // The switch, in a control session only: the one way to resume.
@@ -658,6 +702,7 @@ impl App {
                             input_sent: 0,
                             viewer: ViewerState::default(),
                             chord: keys::Chord::default(),
+                            fullscreen: false,
                         });
                     }
                     Err(e) => {
@@ -1280,18 +1325,26 @@ impl App {
         }
     }
 
-    /// Send what the forwarder has ready.
+    /// Send what the forwarder has ready, then apply the full screen the
+    /// viewer wants.
     fn send_input(&mut self) {
         let Some(view) = &mut self.stream else { return };
-        for event in view.forwarder.drain() {
-            if self.link.send(event) {
-                view.input_sent += 1;
-            } else {
-                tracing::debug!(
-                    "an input event was not sent (no control session, or the queue is full)"
-                );
-            }
-        }
+        let (link, sent) = (&self.link, &mut view.input_sent);
+        drain_then_fullscreen(
+            &mut view.forwarder,
+            |event| {
+                if link.send(event) {
+                    *sent += 1;
+                } else {
+                    tracing::debug!(
+                        "an input event was not sent (no control session, or the queue is full)"
+                    );
+                }
+            },
+            &*view.surface.window,
+            view.viewer.fullscreen,
+            &mut view.fullscreen,
+        );
     }
 
     fn stream_event(&mut self, event: WindowEvent) {
@@ -3037,5 +3090,141 @@ mod tests {
         assert_eq!(model.viewer_notice(), Some(0x01));
         model.host_notice = None;
         assert_eq!(model.viewer_notice(), None);
+    }
+
+    /// A window that records what it is told, in one log with what goes to
+    /// the host.
+    struct Screen<'a>(&'a RefCell<Vec<String>>);
+
+    impl FullScreen for Screen<'_> {
+        fn set_fullscreen(&self, on: bool) {
+            self.0.borrow_mut().push(format!("fullscreen {on}"));
+        }
+    }
+
+    /// The chord in full screen: the modifiers pressed before its M already
+    /// went to the host, then ReleaseAll goes out, and only then is the
+    /// window told to leave full screen; the toolbar shows.
+    #[test]
+    fn the_chord_leaves_fullscreen_after_releasing_everything() {
+        let log = RefCell::new(Vec::new());
+        for control in [true, false] {
+            log.borrow_mut().clear();
+            let mut window = viewer(control);
+            window.2.fullscreen = true;
+            let mut told = true;
+            type_keys(
+                &mut window,
+                &[press(CTRL), press(ALT), press(SHIFT), press(KEY_M)],
+            );
+            assert!(!window.2.fullscreen);
+            drain_then_fullscreen(
+                &mut window.1,
+                |e| log.borrow_mut().push(format!("{e:?}")),
+                &Screen(&log),
+                window.2.fullscreen,
+                &mut told,
+            );
+            let want: Vec<String> = if control {
+                [CTRL, ALT, SHIFT]
+                    .iter()
+                    .map(|k| format!("{:?}", key(*k, true)))
+                    .chain([
+                        format!("{:?}", tornect_input::InputEvent::ReleaseAll),
+                        "fullscreen false".to_owned(),
+                    ])
+                    .collect()
+            } else {
+                vec!["fullscreen false".to_owned()]
+            };
+            assert_eq!(*log.borrow(), want, "control {control}");
+            assert!(!told);
+        }
+    }
+
+    /// Full screen is only ever told to the window as full screen on or
+    /// off, once per change: nothing else of the window, and its title
+    /// least of all, goes through it.
+    #[test]
+    fn fullscreen_never_changes_the_title() {
+        let log = RefCell::new(Vec::new());
+        let screen = Screen(&log);
+        let (_, mut forwarder, mut state) = viewer(true);
+        let viewing = Window::new(true).viewing;
+        let mut told = false;
+        for on in [true, true, false, false, true] {
+            let action = Action::Viewer(ViewerAction::Fullscreen(on));
+            assert_eq!(
+                apply_viewer_action(&mut forwarder, &mut state, Some(&viewing), &action),
+                None
+            );
+            drain_then_fullscreen(&mut forwarder, |_| {}, &screen, state.fullscreen, &mut told);
+        }
+        assert_eq!(
+            *log.borrow(),
+            ["fullscreen true", "fullscreen false", "fullscreen true"]
+        );
+        assert_eq!(STREAM_TITLE, "Tornect: remote screen");
+    }
+
+    /// The Fullscreen button, in a control or a view-only session, asks only
+    /// for full screen: it neither opens a closed forwarder nor sends anything
+    /// through an open one, gives no command, and toasts say where the bar
+    /// is and when the window is back.
+    #[test]
+    fn the_fullscreen_button_sends_nothing() {
+        for control in [false, true] {
+            let mut w = Window::new(control);
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(0), Vec::new());
+            assert_eq!(
+                w.click(ms(100), "Fullscreen"),
+                vec![Action::Viewer(ViewerAction::Fullscreen(true))]
+            );
+            w.viewer.fullscreen = true;
+            w.pass(ms(200), Vec::new());
+            w.pass(ms(200), Vec::new());
+            assert!(
+                w.has("Fullscreen. Move the pointer to the top edge for this bar."),
+                "{:?}",
+                w.texts()
+            );
+            assert!(w.has("Relayed via Tor: quality limited"));
+            w.viewer.fullscreen = false;
+            w.pass(ms(300), Vec::new());
+            w.pass(ms(300), Vec::new());
+            assert!(w.has("Back to a window"), "{:?}", w.texts());
+        }
+        let w = Window::new(true);
+        for open in [false, true] {
+            for (control, administrator) in [(false, false), (true, false), (true, true)] {
+                let viewing = Viewing {
+                    control,
+                    administrator,
+                    ..w.viewing.clone()
+                };
+                for on in [true, false] {
+                    let mut forwarder = Forwarder::new(open);
+                    forwarder.set_picture(Some(PictureRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1280.0,
+                        height: 720.0,
+                    }));
+                    let mut state = ViewerState::default();
+                    let action = Action::Viewer(ViewerAction::Fullscreen(on));
+                    assert_eq!(
+                        apply_viewer_action(&mut forwarder, &mut state, Some(&viewing), &action),
+                        None
+                    );
+                    assert_eq!(forwarder.is_open(), open);
+                    forwarder.flush();
+                    assert!(forwarder.drain().is_empty(), "open: {open}");
+                }
+            }
+        }
+        let (mut app, mut commands) = app();
+        app.act(Action::Viewer(ViewerAction::Fullscreen(true)), None);
+        assert_eq!(commands.try_recv(), Err(TryRecvError::Empty));
     }
 }
