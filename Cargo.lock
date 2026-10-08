@@ -7296,6 +7296,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "png",
  "pollster",
  "qrcode",
  "rustix 1.1.4",

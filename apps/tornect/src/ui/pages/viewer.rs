@@ -8,11 +8,15 @@
 //! as actions; nothing here sends input.
 
 use std::collections::VecDeque;
+use std::io;
+use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use egui::{Color32, CornerRadius, RichText, Stroke, vec2};
 
 use super::super::model::Viewing;
+use super::super::screenshot;
 use super::super::theme::{self, Tokens};
 use super::super::view::{Action, clock};
 use super::super::widgets;
@@ -38,6 +42,34 @@ const PAUSE: &str = "Pause my input";
 /// How far the frame rate looks back.
 const FPS_OVER: Duration = Duration::from_secs(1);
 
+/// The Screenshot button's name, for the tooltip and the accessibility tree.
+const SCREENSHOT: &str = "Save a screenshot";
+
+/// How long a toast stays.
+const TOAST_FOR: Duration = Duration::from_millis(3500);
+
+/// How a screenshot's thread says it went: where the file is, or why not.
+type Saved = io::Result<PathBuf>;
+
+/// A short message over the bottom of the picture, for [`TOAST_FOR`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Toast {
+    /// A screenshot was saved: the words that say where, from the Pictures
+    /// folder's own name on. Never shown while this screen is shared.
+    Saved(String),
+    /// A screenshot could not be saved.
+    NotSaved,
+}
+
+impl Toast {
+    fn text(&self) -> &str {
+        match self {
+            Self::Saved(text) => text,
+            Self::NotSaved => screenshot::NOT_SAVED,
+        }
+    }
+}
+
 /// One of the toolbar's own controls, as the window asks for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewerAction {
@@ -54,6 +86,8 @@ pub enum ViewerAction {
     /// Show the picture at its own size, one picture pixel to one pixel of
     /// the screen, with scroll bars (`true`), or fit it to the window.
     OneToOne(bool),
+    /// Save the picture as it stands as a PNG on this computer.
+    Screenshot,
 }
 
 /// A key combination the Send keys menu sends, in a control session only.
@@ -144,6 +178,13 @@ pub struct ViewerState {
     /// What the toolbar drew over the window in the last frame, in points:
     /// no press, wheel turn or move there goes to the remote computer.
     areas: Vec<egui::Rect>,
+    /// The Screenshot button is offered (never in the preview, which writes
+    /// nothing on this computer).
+    pub screenshots: bool,
+    /// The toast on screen, and when it came.
+    toast: Option<(Toast, Instant)>,
+    /// Where screenshot threads say how they went, read at the next frame.
+    saved: Option<(mpsc::Sender<Saved>, mpsc::Receiver<Saved>)>,
 }
 
 impl ViewerState {
@@ -171,6 +212,27 @@ impl ViewerState {
     #[must_use]
     pub fn visible(&self) -> Option<egui::Rect> {
         self.visible
+    }
+
+    /// Where a screenshot's thread says how it went: the window takes it at
+    /// its next frame.
+    pub fn screenshot_done(&mut self) -> mpsc::Sender<Saved> {
+        self.saved.get_or_insert_with(mpsc::channel).0.clone()
+    }
+
+    /// Take what screenshot threads said since the last frame: the newest
+    /// becomes the toast.
+    fn collect_screenshots(&mut self, now: Instant) {
+        let Some((_, done)) = &self.saved else {
+            return;
+        };
+        while let Ok(saved) = done.try_recv() {
+            let toast = match saved {
+                Ok(path) => Toast::Saved(screenshot::saved_text(&path)),
+                Err(_) => Toast::NotSaved,
+            };
+            self.toast = Some((toast, now));
+        }
     }
 
     /// Whether the toolbar shows this frame, given where the pointer is and
@@ -322,6 +384,7 @@ pub fn stream_window(
     let t = theme::tokens(ui.ctx());
     viewer.areas.clear();
     viewer.visible = None;
+    viewer.collect_screenshots(now);
     // Outside the picture, so no press there reaches the remote computer;
     // shown whether or not the toolbar is.
     egui::Panel::bottom("viewer-relay")
@@ -400,7 +463,49 @@ pub fn stream_window(
     if let Some(v) = viewing {
         toolbar(ui.ctx(), v, input_sent, now, actions, viewer);
     }
+    if let Some(area) = toast(ui.ctx(), viewer, now, t) {
+        viewer.areas.push(area);
+    }
     drawn
+}
+
+/// The toast over the bottom of the picture while it lasts, whether or not
+/// the toolbar shows. A saved screenshot's is decided every frame: in a
+/// frame where this screen is shared it is dropped, so it never shows then.
+/// Returns where it was drawn, in points.
+fn toast(
+    ctx: &egui::Context,
+    viewer: &mut ViewerState,
+    now: Instant,
+    t: &Tokens,
+) -> Option<egui::Rect> {
+    if viewer.shared && matches!(viewer.toast, Some((Toast::Saved(_), _))) {
+        viewer.toast = None;
+    }
+    let (toast, at) = viewer.toast.clone()?;
+    let Some(left) = (at + TOAST_FOR)
+        .checked_duration_since(now)
+        .filter(|left| !left.is_zero())
+    else {
+        viewer.toast = None;
+        return None;
+    };
+    ctx.request_repaint_after(left);
+    let area = egui::Area::new(egui::Id::new("viewer-toast"))
+        .anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -40.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(t.surface_overlay)
+                .stroke(Stroke::new(1.0, t.border_subtle))
+                .corner_radius(CornerRadius::same(8))
+                .shadow(t.popup_shadow)
+                .inner_margin(egui::Margin::symmetric(12, 6))
+                .show(ui, |ui| {
+                    ui.label(toast.text());
+                });
+        });
+    Some(area.response.rect)
 }
 
 /// The picture at its own size inside a scroll area with solid bars beside
@@ -521,6 +626,9 @@ fn toolbar(
                                 actions.push(Action::Viewer(ViewerAction::KeysMenu(open)));
                             }
                             keys_at = Some(send.rect.left());
+                        }
+                        if viewer.screenshots && camera(ui).clicked() {
+                            actions.push(Action::Viewer(ViewerAction::Screenshot));
                         }
                         if pin(ui, viewer.pinned).clicked() {
                             actions.push(Action::Viewer(ViewerAction::Pin(!viewer.pinned)));
@@ -696,6 +804,35 @@ fn pin(ui: &mut egui::Ui, pinned: bool) -> egui::Response {
     response.on_hover_text(PIN)
 }
 
+/// The Screenshot button: a camera. Its only words are its name, in the
+/// tooltip and the accessibility tree.
+fn camera(ui: &mut egui::Ui) -> egui::Response {
+    let t = theme::tokens(ui.ctx());
+    let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, SCREENSHOT));
+    let color = if response.hovered() {
+        t.text_primary
+    } else {
+        t.text_secondary
+    };
+    let painter = ui.painter();
+    let centre = rect.center() + vec2(0.0, 1.0);
+    // A camera: its body, its lens and its viewfinder.
+    painter.rect_stroke(
+        egui::Rect::from_center_size(centre, vec2(17.0, 12.0)),
+        CornerRadius::same(2),
+        Stroke::new(1.6, color),
+        egui::StrokeKind::Middle,
+    );
+    painter.circle_stroke(centre, 3.4, Stroke::new(1.6, color));
+    painter.rect_filled(
+        egui::Rect::from_center_size(centre + vec2(-3.5, -7.5), vec2(6.0, 2.5)),
+        CornerRadius::same(1),
+        color,
+    );
+    response.on_hover_text(SCREENSHOT)
+}
+
 /// The stream window at 1280 × 760 points, driven one pass at a time with the
 /// clock and the events a test gives, as the event loop drives it; its
 /// widgets found by their names in the accessibility tree.
@@ -840,6 +977,8 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::io;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     use super::testing::Window;
@@ -1095,5 +1234,111 @@ mod tests {
             !texts.iter().any(|t| t.contains("administrator")),
             "{texts:?}"
         );
+    }
+
+    /// Whether any text on screen says a screenshot was saved.
+    fn says_saved(w: &Window) -> bool {
+        w.texts().iter().any(|t| t.contains("Screenshot saved"))
+    }
+
+    /// A saved screenshot's toast says where the file went while this
+    /// screen is not shared, and goes in the first frame it is: one up when
+    /// sharing begins goes and does not come back, and one that comes while
+    /// shared never shows. A failure's toast names nothing and shows either
+    /// way; a toast goes after 3.5 s.
+    #[test]
+    fn the_saved_path_is_not_shown_while_this_screen_is_shared() {
+        let path = PathBuf::from(
+            "/data/account/Pictures/Tornect/Tornect screenshot 2026-10-08 07-30-05.png",
+        );
+        let saved =
+            "Screenshot saved to Pictures/Tornect/Tornect screenshot 2026-10-08 07-30-05.png";
+        let mut w = Window::new(true);
+        w.pass(ms(0), Vec::new());
+        w.viewer.screenshot_done().send(Ok(path.clone())).unwrap();
+        w.pass(ms(100), Vec::new());
+        w.pass(ms(100), Vec::new());
+        assert!(w.has(saved), "{:?}", w.texts());
+        // Sharing begins while it is up.
+        w.viewer.shared = true;
+        w.pass(ms(200), Vec::new());
+        w.pass(ms(200), Vec::new());
+        assert!(!says_saved(&w), "{:?}", w.texts());
+        w.viewer.shared = false;
+        w.pass(ms(300), Vec::new());
+        w.pass(ms(300), Vec::new());
+        assert!(!says_saved(&w), "{:?}", w.texts());
+        // Saved while shared.
+        w.viewer.shared = true;
+        w.viewer.screenshot_done().send(Ok(path)).unwrap();
+        w.pass(ms(400), Vec::new());
+        w.pass(ms(400), Vec::new());
+        assert!(!says_saved(&w), "{:?}", w.texts());
+        w.viewer.shared = false;
+        w.pass(ms(500), Vec::new());
+        w.pass(ms(500), Vec::new());
+        assert!(!says_saved(&w), "{:?}", w.texts());
+        // A failure, shared or not.
+        w.viewer.shared = true;
+        w.viewer
+            .screenshot_done()
+            .send(Err(io::ErrorKind::NotFound.into()))
+            .unwrap();
+        w.pass(ms(600), Vec::new());
+        w.pass(ms(600), Vec::new());
+        assert!(
+            w.has("The screenshot could not be saved."),
+            "{:?}",
+            w.texts()
+        );
+        w.pass(ms(4000), Vec::new());
+        assert!(w.has("The screenshot could not be saved."), "3.4 s");
+        w.pass(ms(4200), Vec::new());
+        assert!(!w.has("The screenshot could not be saved."), "3.6 s");
+    }
+
+    /// The saved toast names the Pictures folder by its own name, then
+    /// `Tornect` and the file: never the absolute path, which holds the
+    /// account's home folder.
+    #[test]
+    fn the_toast_names_no_absolute_path() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("Pictures")).unwrap();
+        let dir = root.path().join("Pictures").join("Tornect");
+        let picture = crate::ui::stream::Picture {
+            width: 2,
+            height: 2,
+            rgba: vec![9; 16],
+            fresh: false,
+        };
+        let at = std::time::UNIX_EPOCH + Duration::from_secs(1_791_444_605);
+        let path = screenshot::save(&dir, &picture, at).unwrap();
+        let mut w = Window::new(false);
+        w.viewer.screenshot_done().send(Ok(path)).unwrap();
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        let want =
+            "Screenshot saved to Pictures/Tornect/Tornect screenshot 2026-10-08 07-30-05.png";
+        assert!(w.has(want), "{:?}", w.texts());
+        let absolute = root.path().to_string_lossy().into_owned();
+        let parent = root
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        for text in w.texts() {
+            assert!(
+                !text.contains(&absolute) && !text.contains(&parent),
+                "{text}"
+            );
+        }
+        for (path, want) in [
+            ("Tornect/a.png", "Screenshot saved to Tornect/a.png"),
+            ("/a.png", "Screenshot saved to a.png"),
+            ("/b/c/d/e.png", "Screenshot saved to c/d/e.png"),
+        ] {
+            assert_eq!(screenshot::saved_text(std::path::Path::new(path)), want);
+        }
     }
 }
