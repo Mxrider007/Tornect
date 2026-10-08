@@ -11,13 +11,24 @@
 
 use std::path::{Path, PathBuf};
 
-use directories::BaseDirs;
+use directories::{BaseDirs, UserDirs};
 
 use crate::error::{CoreError, Result};
 use crate::keystore::create_private_dir;
 
 /// Environment variable that overrides every directory with one root.
 pub const HOME_ENV: &str = "TORNECT_HOME";
+
+/// Where the stream window saves its screenshots: `Tornect` in the
+/// platform's Pictures folder (Linux `XDG_PICTURES_DIR`, macOS
+/// `~/Pictures`, Windows `FOLDERID_Pictures`); `None` when the platform names
+/// none. `TORNECT_HOME` does not move it: a screenshot is the user's file,
+/// not Tornect's state.
+#[must_use]
+pub fn pictures_dir() -> Option<PathBuf> {
+    let user = UserDirs::new()?;
+    Some(user.picture_dir()?.join("Tornect"))
+}
 
 /// Resolved directories.
 #[derive(Debug, Clone, PartialEq, Eq)]
