@@ -51,6 +51,9 @@ pub enum ViewerAction {
     KeysMenu(bool),
     /// Send a key combination to the remote computer.
     SendKeys(Combo),
+    /// Show the picture at its own size, one picture pixel to one pixel of
+    /// the screen, with scroll bars (`true`), or fit it to the window.
+    OneToOne(bool),
 }
 
 /// A key combination the Send keys menu sends, in a control session only.
@@ -117,6 +120,11 @@ pub struct ViewerState {
     pub details: bool,
     /// The Send keys menu is open.
     pub keys_menu: bool,
+    /// The picture at its own size with scroll bars, not fitted.
+    pub one_to_one: bool,
+    /// At its own size, the part of the window that shows the picture in
+    /// the last frame, in points; `None` when fitted (all of it shows).
+    visible: Option<egui::Rect>,
     /// Whether the host said it runs Windows; `None` until it says.
     pub host_windows: Option<bool>,
     /// The forwarder's pause as it stands for this frame: `draw_stream`
@@ -156,6 +164,13 @@ impl ViewerState {
     #[must_use]
     pub fn areas(&self) -> &[egui::Rect] {
         &self.areas
+    }
+
+    /// The part of the window that showed the picture in the last frame, in
+    /// points, where it is not all on screen.
+    #[must_use]
+    pub fn visible(&self) -> Option<egui::Rect> {
+        self.visible
     }
 
     /// Whether the toolbar shows this frame, given where the pointer is and
@@ -255,6 +270,14 @@ pub fn help_line(v: &Viewing, viewer: &ViewerState) -> String {
     }
 }
 
+/// Where the whole picture lies when shown at its own size (`shown`, in
+/// points) and scrolled by `offset` inside `view`: it moves with the scroll
+/// offset, and only its part inside `view` is on screen.
+#[must_use]
+pub fn one_to_one_rect(view: egui::Rect, offset: egui::Vec2, shown: egui::Vec2) -> egui::Rect {
+    egui::Rect::from_min_size(view.min - offset, shown)
+}
+
 /// The level chip's words: from the signed accept alone (`Viewing`'s
 /// `control`, `administrator` and `unattended`; §B.2.1, §B.8.10), never from
 /// the address book or anything the host's label says.
@@ -298,6 +321,7 @@ pub fn stream_window(
     theme::ensure(ui.ctx());
     let t = theme::tokens(ui.ctx());
     viewer.areas.clear();
+    viewer.visible = None;
     // Outside the picture, so no press there reaches the remote computer;
     // shown whether or not the toolbar is.
     egui::Panel::bottom("viewer-relay")
@@ -320,6 +344,27 @@ pub fn stream_window(
         .show(ui, |ui| {
             let avail = ui.available_rect_before_wrap();
             match picture {
+                Some((texture, size)) if viewer.one_to_one => {
+                    let control = viewing.is_some_and(|v| v.control);
+                    let (view, rect) = one_to_one(ui, texture, size, control);
+                    // The bars, beside the part on screen, are never the host's.
+                    for bar in [
+                        egui::Rect::from_min_max(
+                            egui::pos2(view.right(), avail.top()),
+                            avail.right_bottom(),
+                        ),
+                        egui::Rect::from_min_max(
+                            egui::pos2(avail.left(), view.bottom()),
+                            avail.right_bottom(),
+                        ),
+                    ] {
+                        if bar.is_positive() {
+                            viewer.areas.push(bar);
+                        }
+                    }
+                    viewer.visible = Some(view);
+                    drawn = Some(rect);
+                }
                 Some((texture, size)) => {
                     let (x, y, w, h) = super::super::stream::letterbox(
                         (avail.min.x, avail.min.y, avail.width(), avail.height()),
@@ -356,6 +401,54 @@ pub fn stream_window(
         toolbar(ui.ctx(), v, input_sent, now, actions, viewer);
     }
     drawn
+}
+
+/// The picture at its own size inside a scroll area with solid bars beside
+/// it, never over it. In a control session only the bars scroll it: the
+/// wheel goes to the host and a drag is a drag there. Returns the part of the
+/// window that shows it and where the whole picture lies, in points.
+fn one_to_one(
+    ui: &mut egui::Ui,
+    texture: egui::TextureId,
+    size: (u32, u32),
+    control: bool,
+) -> (egui::Rect, egui::Rect) {
+    let ppp = ui.ctx().pixels_per_point();
+    let shown = vec2(size.0 as f32 / ppp, size.1 as f32 / ppp);
+    let scrolled = ui
+        .scope(|ui| {
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+            egui::ScrollArea::both()
+                .id_salt("viewer-picture")
+                .auto_shrink(false)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    scroll_bar: true,
+                    drag: egui::scroll_area::DragScroll::Never,
+                    mouse_wheel: !control,
+                })
+                .show(ui, |ui| {
+                    // Named for a screen reader, never by the host's name.
+                    let (_, response) = ui.allocate_exact_size(shown, egui::Sense::hover());
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Image,
+                            true,
+                            "The remote screen",
+                        )
+                    });
+                })
+        })
+        .inner;
+    let view = scrolled.inner_rect;
+    let rect = one_to_one_rect(view, scrolled.state.offset, shown);
+    ui.painter_at(view).image(
+        texture,
+        rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
+    (view, rect)
 }
 
 /// The floating toolbar, drawn after the picture, over it, while it shows.
@@ -413,6 +506,14 @@ fn toolbar(
                             if widgets::toggle(ui, &mut paused, PAUSE).changed() {
                                 actions.push(Action::Viewer(ViewerAction::Pause(paused)));
                             }
+                        }
+                        for (one_to_one, label) in [(false, "Fit"), (true, "1:1")] {
+                            let chosen = viewer.one_to_one == one_to_one;
+                            if ui.selectable_label(chosen, label).clicked() && !chosen {
+                                actions.push(Action::Viewer(ViewerAction::OneToOne(one_to_one)));
+                            }
+                        }
+                        if v.control {
                             let send = ui.button("Send keys");
                             if send.clicked() {
                                 keys_clicked = true;
