@@ -1825,7 +1825,9 @@ async fn viewed(
 }
 
 /// Where an unattended attempt that got no session belongs in the stepper:
-/// the password (step 2) or the computer's own checks after it (step 3).
+/// reaching the computer (step 1) when its host stopped answering before the
+/// password was tried, the password (step 2) or the computer's own checks
+/// after it (step 3).
 fn ua_failure(err: &HandshakeError, ended: &ua_client::Ended) -> (Failure, u8) {
     if ended.blocks {
         return (Failure::SetupChanged, 2);
@@ -1841,6 +1843,9 @@ fn ua_failure(err: &HandshakeError, ended: &ua_client::Ended) -> (Failure, u8) {
                 || r.reason == reject::POPUP_TIMEOUT;
             (Failure::NotLetIn, if after { 3 } else { 2 })
         }
+        // A host that stopped answering before the password was tried: not
+        // a person who did not answer.
+        HandshakeError::Timeout("HELLO_ACK" | "AUTH_CHALLENGE") => (Failure::Unreachable, 1),
         HandshakeError::Timeout(_) => (Failure::TimedOut, 3),
         _ => (Failure::Other, 2),
     }
@@ -1884,6 +1889,9 @@ fn classify(err: &HandshakeError, check: Option<CodeCheck>) -> Failure {
             Failure::TimedOut
         }
         // A host that stopped answering before anyone was asked anything.
+        // Only an unattended attempt waits for an `AUTH_CHALLENGE`, and it
+        // never comes here (`ua_failure` words it, the same way); the name
+        // stays so that the two read alike.
         (HandshakeError::Timeout("HELLO_ACK" | "AUTH_CHALLENGE"), _) => Failure::Unreachable,
         (HandshakeError::Timeout(_), _) => Failure::TimedOut,
         (HandshakeError::Violation { code, .. } | HandshakeError::PeerError { code, .. }, _)
@@ -3043,9 +3051,12 @@ mod tests {
         );
     }
 
-    /// A host that stops answering before anything is asked of anyone (its
-    /// `HELLO_ACK`, or an unattended `AUTH_CHALLENGE`) reads as unreachable,
-    /// never as a person who did not answer.
+    /// An attended or a pairing connect (`classify`) whose host stops
+    /// answering before anything is asked of anyone (its `HELLO_ACK`; an
+    /// `AUTH_CHALLENGE`, which only an unattended attempt waits for, would
+    /// read the same) reads as unreachable, never as a person who did not
+    /// answer. An unattended attempt is worded by `ua_failure`:
+    /// `an_unattended_stall_reads_as_unreachable`.
     #[test]
     fn a_stalled_host_reads_as_unreachable() {
         for what in ["HELLO_ACK", "AUTH_CHALLENGE"] {
@@ -3097,5 +3108,26 @@ mod tests {
             Failure::CodeUnanswered.advice(),
             "Nothing was saved. Press Connect again and answer the code question on this computer."
         );
+    }
+
+    /// An unattended attempt (`ua_failure`) whose host stops answering
+    /// before the password was tried (its `HELLO_ACK` or `AUTH_CHALLENGE`)
+    /// reads as unreachable at the step of reaching the computer, never as a
+    /// person who did not answer; one whose accept never came after the
+    /// password still reads as timed out at the computer's checks.
+    #[test]
+    fn an_unattended_stall_reads_as_unreachable() {
+        for what in ["HELLO_ACK", "AUTH_CHALLENGE"] {
+            let err = HandshakeError::Timeout(what);
+            let ended = ua_client::ended(&err, "Office PC");
+            assert_eq!(
+                ua_failure(&err, &ended),
+                (Failure::Unreachable, 1),
+                "{what}"
+            );
+        }
+        let err = HandshakeError::Timeout("SESSION_ACCEPT");
+        let ended = ua_client::ended(&err, "Office PC");
+        assert_eq!(ua_failure(&err, &ended), (Failure::TimedOut, 3));
     }
 }
