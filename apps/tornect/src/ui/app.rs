@@ -449,7 +449,7 @@ fn apply_viewer_action(
         // In a control session only; Ctrl+Alt+Del only to a host that said
         // it does not run Windows, never into a silent loss.
         Action::Viewer(ViewerAction::SendKeys(combo)) => {
-            let sendable = *combo != Combo::CtrlAltDel || viewer.host_windows == Some(false);
+            let sendable = *combo != Combo::CtrlAltDel || viewer.host_windows() == Some(false);
             if sendable && viewing.is_some_and(|v| v.control) {
                 forwarder.send_combo(combo.usages());
             }
@@ -1027,6 +1027,7 @@ impl App {
         view.viewer.shared = self.shared.read(|m| m.screen_shared(Instant::now()));
         view.viewer.input_paused = view.forwarder.is_paused();
         view.viewer.screenshots = self.screenshots;
+        view.viewer.host_notice = self.shared.read(super::model::Model::viewer_notice);
         let picture = view.video.id().zip(view.video.size());
         let mut actions = Vec::new();
         let mut drawn = None;
@@ -2965,5 +2966,76 @@ mod tests {
         let (mut app, mut commands) = app();
         app.act(shot, None);
         assert_eq!(commands.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// Ctrl+Alt+Del towards a host that said it does not run Windows is sent;
+    /// towards one that said it does, it is greyed with the note and its
+    /// action, should it come, sends nothing.
+    #[test]
+    fn ctrl_alt_del_is_sent_to_linux_hosts_and_greyed_with_a_note_on_windows_hosts() {
+        let send = Action::Viewer(ViewerAction::SendKeys(Combo::CtrlAltDel));
+        for (code, sent) in [(0x00, true), (0x04, true), (0x01, false), (0x03, false)] {
+            let mut w = Window::new(true);
+            w.viewer.host_notice = Some(code);
+            w.viewer.keys_menu = true;
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(0), Vec::new());
+            assert_eq!(w.disabled("Ctrl+Alt+Del"), !sent, "{code:#x}");
+            assert_eq!(
+                w.has("not possible on Windows computers"),
+                !sent,
+                "{code:#x}"
+            );
+            let clicked = w.click(ms(100), "Ctrl+Alt+Del");
+            assert_eq!(clicked.is_empty(), !sent, "{code:#x}");
+            let viewing = w.viewing.clone();
+            let mut forwarder = Forwarder::new(true);
+            forwarder.set_picture(Some(PictureRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1280.0,
+                height: 720.0,
+            }));
+            apply_viewer_action(&mut forwarder, &mut w.viewer, Some(&viewing), &send);
+            let drained = forwarder.drain();
+            if sent {
+                assert_eq!(
+                    drained,
+                    vec![
+                        key(CTRL, true),
+                        key(ALT, true),
+                        key(0x07_004c, true),
+                        key(0x07_004c, false),
+                        key(ALT, false),
+                        key(CTRL, false)
+                    ]
+                );
+            } else {
+                assert!(drained.is_empty(), "{code:#x}");
+            }
+        }
+    }
+
+    /// A new session's window knows nothing of the host's platform, whatever
+    /// the last one was told: Ctrl+Alt+Del is greyed without the note.
+    #[test]
+    fn the_hosts_platform_is_unknown_in_a_new_session() {
+        let (_, _, viewer) = viewer(true);
+        assert_eq!(viewer.host_notice, None);
+        assert_eq!(viewer.host_windows(), None);
+        let mut w = Window::new(true);
+        w.viewer.keys_menu = true;
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        assert!(w.disabled("Ctrl+Alt+Del"));
+        assert!(!w.has("not possible on Windows computers"));
+        let mut model = Model {
+            host_notice: Some(0x01),
+            ..Model::default()
+        };
+        model.client = ClientStage::Live(w.viewing.clone());
+        assert_eq!(model.viewer_notice(), Some(0x01));
+        model.host_notice = None;
+        assert_eq!(model.viewer_notice(), None);
     }
 }
