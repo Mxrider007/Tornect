@@ -581,6 +581,21 @@ impl Forwarder {
         self.sends() && self.on_picture()
     }
 
+    /// A key combination, as USB usages: pressed in order, then released in
+    /// reverse, with the checks of [`key`](Self::key): nothing in a
+    /// view-only or paused session, nor before the first picture.
+    pub fn send_combo(&mut self, usages: &[u32]) {
+        if !self.sends() || self.picture.is_none() {
+            return;
+        }
+        for &usb in usages {
+            self.key(usb, true);
+        }
+        for &usb in usages.iter().rev() {
+            self.key(usb, false);
+        }
+    }
+
     /// Let the coalesced move and wheel go out.
     pub fn flush(&mut self) {
         self.flush_pending();
@@ -796,8 +811,66 @@ mod tests {
         f.pause(false);
         f.release_all();
         f.key(0x07_0004, true);
+        f.send_combo(&[0x07_00e2, 0x07_002b]);
         f.flush();
         assert!(!f.is_open());
+        assert!(f.drain().is_empty());
+    }
+
+    /// A combination goes out as its presses in order, then its releases in
+    /// reverse; nothing before the first picture or while paused.
+    #[test]
+    fn a_combo_goes_out_as_presses_then_releases_in_reverse() {
+        let key = |usb, pressed| InputEvent::Key { usb, pressed };
+        let mut f = Forwarder::new(true);
+        f.send_combo(&[0x07_00e2, 0x07_002b]);
+        assert!(f.drain().is_empty(), "before the first picture");
+        f.set_picture(Some(RECT));
+        f.send_combo(&[0x07_00e0, 0x07_00e2, 0x07_004c]);
+        assert_eq!(
+            f.drain(),
+            vec![
+                key(0x07_00e0, true),
+                key(0x07_00e2, true),
+                key(0x07_004c, true),
+                key(0x07_004c, false),
+                key(0x07_00e2, false),
+                key(0x07_00e0, false),
+            ]
+        );
+        f.pause(true);
+        f.drain();
+        f.send_combo(&[0x07_00e3]);
+        assert!(f.drain().is_empty(), "while paused");
+        // The menu's combinations are rows of the key table.
+        let codes: Vec<Vec<&str>> = super::super::pages::viewer::Combo::ALL
+            .iter()
+            .map(|c| {
+                c.usages()
+                    .iter()
+                    .map(|u| tornect_input::keymap::by_usb(*u).map_or("?", |k| k.code))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            [
+                vec!["ControlLeft", "AltLeft", "Delete"],
+                vec!["AltLeft", "Tab"],
+                vec!["MetaLeft"],
+                vec!["PrintScreen"],
+            ]
+        );
+    }
+
+    /// A view-only forwarder drops a combination.
+    #[test]
+    fn a_view_only_forwarder_drops_a_combo() {
+        let mut f = Forwarder::new(false);
+        f.set_picture(Some(RECT));
+        for combo in [&[0x07_00e2, 0x07_002b][..], &[0x07_00e3], &[0x07_0046]] {
+            f.send_combo(combo);
+        }
         assert!(f.drain().is_empty());
     }
 
