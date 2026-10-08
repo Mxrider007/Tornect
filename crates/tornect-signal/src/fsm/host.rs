@@ -314,6 +314,10 @@ struct KillState {
     generation: u64,
     /// The reason the most recent kill fired with (for [`KillSwitch::fired`]).
     reason: Option<u16>,
+    /// Bumped by every [`KillSwitch::kill`] with `PANIC` (§B.8.7.4). Apart from
+    /// `reason`, so a later kill with another reason never hides a panic from a
+    /// [`KillGuard`] armed before it.
+    panics: u64,
     /// Per device, how many times [`KillSwitch::end_device`] ended its sessions
     /// (decision M1-67, D6).
     devices: std::collections::HashMap<DeviceId, DeviceEnds>,
@@ -358,6 +362,9 @@ impl KillSwitch {
             // exact rather than risking a debug overflow panic.
             state.generation = state.generation.wrapping_add(1);
             state.reason = Some(reason);
+            if reason == messages::bye::PANIC {
+                state.panics = state.panics.wrapping_add(1);
+            }
         });
     }
 
@@ -402,10 +409,14 @@ impl KillSwitch {
     #[must_use]
     pub fn arm(&self) -> KillGuard {
         let rx = self.tx.subscribe();
-        let base = rx.borrow().generation;
+        let (base, panic_base) = {
+            let state = rx.borrow();
+            (state.generation, state.panics)
+        };
         KillGuard {
             rx,
             base,
+            panic_base,
             device: None,
         }
     }
@@ -431,6 +442,8 @@ impl tornect_core::unattended::guard::DeviceSessionEnd for KillSwitch {
 pub struct KillGuard {
     rx: watch::Receiver<KillState>,
     base: u64,
+    /// The switch's count of panics when this guard was armed.
+    panic_base: u64,
     /// The device this session watches for [`KillSwitch::end_device`].
     device: Option<Watched>,
 }
@@ -481,15 +494,11 @@ impl KillGuard {
         self.rx.borrow().generation != self.base
     }
 
-    /// The reason of the latest host-wide kill since this guard was armed, if the switch
-    /// fired since then; an end of this session's device is not one.
+    /// Whether the host-wide kill fired with `PANIC` since this guard was armed, whatever
+    /// kill fired after it (§B.8.7.4); an end of this session's device is not one.
     #[must_use]
-    pub fn fired_with(&self) -> Option<u16> {
-        let state = self.rx.borrow();
-        if state.generation == self.base {
-            return None;
-        }
-        state.reason
+    pub fn panicked_since_arm(&self) -> bool {
+        self.rx.borrow().panics != self.panic_base
     }
 
     /// From now on, [`KillSwitch::end_device`] for `device` also ends this session, with
@@ -567,11 +576,15 @@ impl Drop for EndGuard<'_> {
 }
 
 /// After an unattended session of `device` past its PAKE ended, its goodbye or its
-/// refusal sent (§B.8.7.4): when what ended it was the host-wide kill of the panic key or
-/// of `tornect panic`, its grant is suspended through the hook. An end of the device
-/// alone (the guard's own suspend, a revoke) is no such kill.
+/// refusal sent (§B.8.7.4): when the host-wide kill of the panic key or of `tornect panic`
+/// fired since the session was armed, its grant is suspended through the hook, also when
+/// another kill (Stop, the window closed, `unattended off`) fired after the panic and its
+/// reason is the one the goodbye carried. An end of the device alone (the guard's own
+/// suspend, a revoke) is no such kill. The reverse order suspends too: a panic that fires
+/// after another end and before this check suspends a grant whose session it did not end,
+/// which errs on the side of less access.
 fn suspend_after_panic(deps: &HostDeps, kill: &KillGuard, device: &DeviceId) {
-    if kill.fired_with() == Some(messages::bye::PANIC) {
+    if kill.panicked_since_arm() {
         deps.unattended.panicked(device);
     }
 }
@@ -1567,7 +1580,7 @@ where
         }
         Goodbye::Nothing => {}
     }
-    if unattended && matches!(end, Ok(SessionEnd::Killed(messages::bye::PANIC))) {
+    if unattended {
         suspend_after_panic(deps, &kill, &device);
     }
     let end = end?;
