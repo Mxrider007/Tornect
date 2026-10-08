@@ -339,7 +339,8 @@ fn countdown(deadline: Instant, now: Instant) -> u64 {
     deadline.saturating_duration_since(now).as_secs()
 }
 
-fn clock(since: Instant, now: Instant) -> String {
+/// `now - since` as minutes and seconds, `mm:ss`.
+pub(super) fn clock(since: Instant, now: Instant) -> String {
     let secs = now.saturating_duration_since(since).as_secs();
     format!("{:02}:{:02}", secs / 60, secs % 60)
 }
@@ -2987,12 +2988,22 @@ mod tests {
         for shared in [false, true] {
             let mut viewer = ViewerState::default();
             viewer.shared = shared;
+            viewer.details = true;
             let texts = viewer_texts(&viewing, &mut viewer);
             assert_eq!(
                 texts.iter().any(|t| t.contains("Desk")),
                 !shared,
                 "shared: {shared}: {texts:?}"
             );
+            // The help line and the connection's details are on screen.
+            let whom = if shared {
+                "the remote computer"
+            } else {
+                "Desk"
+            };
+            let help = format!("your keyboard goes to {whom}.");
+            assert!(texts.iter().any(|t| t.contains(&help)), "{texts:?}");
+            assert!(texts.iter().any(|t| t == "Route"), "{texts:?}");
         }
     }
 

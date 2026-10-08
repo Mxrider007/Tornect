@@ -434,6 +434,10 @@ fn apply_viewer_action(
             viewer.pinned = *on;
             None
         }
+        Action::Viewer(ViewerAction::Details(open)) => {
+            viewer.details = *open;
+            None
+        }
         _ => None,
     }
 }
@@ -2539,6 +2543,8 @@ mod tests {
             Action::EndViewing,
             Action::Viewer(ViewerAction::Pin(true)),
             Action::Viewer(ViewerAction::Pin(false)),
+            Action::Viewer(ViewerAction::Details(true)),
+            Action::Viewer(ViewerAction::Details(false)),
         ];
         let w = Window::new(true);
         for open in [false, true] {
