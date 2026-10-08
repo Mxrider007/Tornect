@@ -933,6 +933,7 @@ impl PolkitRevocation {
 impl SessionSink for CliSessions {
     fn on_start(&self, session: &LiveSession<'_>) {
         self.live.on_start(session);
+        crate::secure_screen::on_start(&self.live, session, cfg!(windows));
         self.polkit.on_start(session);
         self.media.on_start(session);
         say(format_args!("SESSION LIVE {}", session.session_id));
@@ -957,25 +958,25 @@ impl SessionSink for CliSessions {
         #[cfg(windows)]
         if session.mode == SessionMode::Control {
             let (live, id) = (Arc::clone(&self.live), session.session_id.to_owned());
+            let (sessions, told_id) = (Arc::clone(&self.live), id.clone());
             tokio::spawn(async move {
                 crate::secure_screen::run(
                     Arc::new(crate::secure_screen::WindowsDesktop),
                     crate::secure_screen::EVERY,
                     move || live.snapshot().iter().any(|s| s.session_id == id),
-                    |shown| {
-                        note(format_args!(
-                            "{}",
-                            if shown {
-                                crate::secure_screen::NOTICE
-                            } else {
-                                crate::secure_screen::NOTICE_GONE
-                            }
-                        ));
+                    move |shown| {
+                        // The viewer is told too, by the bit its PONGs carry.
+                        let line = crate::secure_screen::on_change(&sessions, &told_id, shown);
+                        note(format_args!("{line}"));
                     },
                 )
                 .await;
             });
         }
+    }
+
+    fn notice(&self, session_id: &str) -> Option<u8> {
+        self.live.notice(session_id)
     }
 
     fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
