@@ -1070,6 +1070,9 @@ impl App {
         // Every frame: this computer may start sharing its screen during
         // the session, and the window then names nobody.
         view.viewer.shared = self.shared.read(|m| m.screen_shared(Instant::now()));
+        // Every frame too: a live session of this computer's own host, as
+        // the sharing indicator shows it; the strip says so in full screen.
+        view.viewer.sharing = self.shared.read(|m| !m.sharing.is_empty());
         view.viewer.input_paused = view.forwarder.is_paused();
         view.viewer.screenshots = self.screenshots;
         view.viewer.host_notice = self.shared.read(super::model::Model::viewer_notice);
