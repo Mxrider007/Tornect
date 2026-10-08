@@ -690,8 +690,8 @@ pub enum ClientStage {
 /// A live session as the stream window shows it.
 #[derive(Debug, Clone)]
 pub struct Viewing {
-    /// The host's pinned label (the window title; never the onion address,
-    /// `docs/UI_PLAN.md` §8).
+    /// The host's pinned label: shown inside the stream window, never while
+    /// this screen is shared; never the onion address (`docs/UI_PLAN.md` §8).
     pub host: String,
     /// Input goes to the host: the signed `SESSION_ACCEPT` said control.
     pub control: bool,

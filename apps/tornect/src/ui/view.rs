@@ -23,6 +23,7 @@ use super::model::{
 use super::model::{ClientStage, Hosting, Setup, TorState};
 use super::nav::{self, Page};
 use super::pages;
+use super::pages::viewer::ViewerState;
 use super::theme::{self, Face};
 use super::widgets;
 use crate::ua_client::AdminAction;
@@ -1748,7 +1749,8 @@ fn confirm_popup(
 
 /// The stream window (§8): a slim bar with the host, the mode and Stop, and
 /// the picture letterboxed below it. Returns where the picture was drawn, in
-/// points, once there is one.
+/// points, once there is one. The host is named only while this screen is
+/// not shared (`viewer.shared`).
 pub fn stream_window(
     ui: &mut egui::Ui,
     viewing: Option<&Viewing>,
@@ -1756,6 +1758,7 @@ pub fn stream_window(
     input_sent: u64,
     now: Instant,
     actions: &mut Vec<Action>,
+    viewer: &mut ViewerState,
 ) -> Option<egui::Rect> {
     theme::ensure(ui.ctx());
     let t = theme::tokens(ui.ctx());
@@ -1768,7 +1771,10 @@ pub fn stream_window(
         .show(ui, |ui| {
             ui.horizontal(|ui| match viewing {
                 Some(v) => {
-                    ui.label(RichText::new(&v.host).strong());
+                    // A picture of this screen may leave it: no name then.
+                    if !viewer.shared {
+                        ui.label(RichText::new(&v.host).strong());
+                    }
                     // The level only from the signed accept (§B.2.1); an
                     // unattended session's badge says so (§B.8.10).
                     let (mode, color) = if v.control && v.administrator {
@@ -2763,13 +2769,22 @@ mod tests {
                 0,
                 Instant::now(),
                 &mut actions,
+                &mut Default::default(),
             );
         })
         .drop_without_applying_deltas();
         let rect = drawn.expect("a picture was drawn");
         assert!((rect.width() / rect.height() - 16.0 / 9.0).abs() < 0.01);
         ctx.run_ui(egui::RawInput::default(), |ui| {
-            drawn = stream_window(ui, None, None, 0, Instant::now(), &mut actions);
+            drawn = stream_window(
+                ui,
+                None,
+                None,
+                0,
+                Instant::now(),
+                &mut actions,
+                &mut Default::default(),
+            );
         })
         .drop_without_applying_deltas();
         assert!(drawn.is_none());
@@ -2999,8 +3014,15 @@ mod tests {
             let mut nodes = Vec::new();
             for _ in 0..2 {
                 let out = ctx.run_ui(egui::RawInput::default(), |ui| {
-                    let _ =
-                        stream_window(ui, Some(&viewing), None, 0, Instant::now(), &mut Vec::new());
+                    let _ = stream_window(
+                        ui,
+                        Some(&viewing),
+                        None,
+                        0,
+                        Instant::now(),
+                        &mut Vec::new(),
+                        &mut Default::default(),
+                    );
                 });
                 if let Some(update) = &out.platform_output.accesskit_update {
                     nodes = update.nodes.iter().map(|(_, n)| n.clone()).collect();
@@ -3013,6 +3035,63 @@ mod tests {
                 .collect();
             assert!(texts.iter().any(|t| t == shown), "{texts:?}");
             assert!(!texts.iter().any(|t| t == hidden), "{texts:?}");
+        }
+    }
+
+    /// Every text of the stream window as a screen reader gets it: each
+    /// accessibility node's label, value and description, after two passes
+    /// (egui lays out on the first).
+    fn viewer_texts(viewing: &Viewing, viewer: &mut ViewerState) -> Vec<String> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut nodes = Vec::new();
+        for _ in 0..2 {
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let _ = stream_window(
+                    ui,
+                    Some(viewing),
+                    Some((egui::TextureId::User(0), (1600, 900))),
+                    0,
+                    Instant::now(),
+                    &mut Vec::new(),
+                    viewer,
+                );
+            });
+            if let Some(update) = &out.platform_output.accesskit_update {
+                nodes = update.nodes.iter().map(|(_, n)| n.clone()).collect();
+            }
+            out.drop_without_applying_deltas();
+        }
+        nodes
+            .iter()
+            .flat_map(|n| [n.label(), n.value(), n.description()])
+            .flatten()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The host's name shows inside the viewer only while this screen is not
+    /// shared: a picture of this screen that leaves it never carries the name
+    /// of the computer it is connected to.
+    #[test]
+    fn the_viewer_names_the_host_only_while_this_screen_is_not_shared() {
+        let viewing = Viewing {
+            host: "Desk".to_owned(),
+            control: true,
+            administrator: false,
+            unattended: false,
+            since: Instant::now(),
+            pictures: 1,
+            size: (1600, 900),
+        };
+        for shared in [false, true] {
+            let mut viewer = ViewerState { shared };
+            let texts = viewer_texts(&viewing, &mut viewer);
+            assert_eq!(
+                texts.iter().any(|t| t.contains("Desk")),
+                !shared,
+                "shared: {shared}: {texts:?}"
+            );
         }
     }
 
