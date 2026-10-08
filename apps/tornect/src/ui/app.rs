@@ -33,7 +33,7 @@ use super::indicator::{self, Change, Indicator};
 use super::keys;
 use super::model::{ClientStage, Shared, Viewing, Wake};
 use super::nav::Page;
-use super::pages::viewer::{ViewerAction, ViewerState};
+use super::pages::viewer::{Combo, ViewerAction, ViewerState};
 use super::stream::{Forwarder, Picture, PictureRect, VideoTexture, button};
 use super::view::{self, Action, Form};
 
@@ -439,6 +439,20 @@ fn apply_viewer_action(
         }
         Action::Viewer(ViewerAction::Details(open)) => {
             viewer.details = *open;
+            None
+        }
+        Action::Viewer(ViewerAction::KeysMenu(open)) => {
+            viewer.keys_menu = *open;
+            None
+        }
+        // In a control session only; Ctrl+Alt+Del only to a host that said
+        // it does not run Windows, never into a silent loss.
+        Action::Viewer(ViewerAction::SendKeys(combo)) => {
+            let sendable = *combo != Combo::CtrlAltDel || viewer.host_windows == Some(false);
+            if sendable && viewing.is_some_and(|v| v.control) {
+                forwarder.send_combo(combo.usages());
+            }
+            viewer.keys_menu = false;
             None
         }
         // The switch, in a control session only: the one way to resume.
@@ -2558,6 +2572,12 @@ mod tests {
             Action::Viewer(ViewerAction::Details(false)),
             Action::Viewer(ViewerAction::Pause(true)),
             Action::Viewer(ViewerAction::Pause(false)),
+            Action::Viewer(ViewerAction::KeysMenu(true)),
+            Action::Viewer(ViewerAction::KeysMenu(false)),
+            Action::Viewer(ViewerAction::SendKeys(Combo::CtrlAltDel)),
+            Action::Viewer(ViewerAction::SendKeys(Combo::AltTab)),
+            Action::Viewer(ViewerAction::SendKeys(Combo::Super)),
+            Action::Viewer(ViewerAction::SendKeys(Combo::PrintScreen)),
         ];
         let w = Window::new(true);
         for open in [false, true] {
@@ -2683,5 +2703,62 @@ mod tests {
                 key(KEY_A, true)
             ]
         );
+    }
+
+    /// Ctrl+Alt+Del is greyed while the host has not said its platform (so
+    /// always, until the host says it): a click on it does nothing, and the
+    /// action, should it come, sends nothing; the other items send.
+    #[test]
+    fn ctrl_alt_del_is_greyed_while_the_hosts_platform_is_unknown() {
+        let mut w = Window::new(true);
+        w.viewer.keys_menu = true;
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        assert!(w.disabled("Ctrl+Alt+Del"));
+        for other in ["Alt+Tab", "Super (Windows key)", "Print Screen"] {
+            assert!(!w.disabled(other), "{other}");
+        }
+        assert!(w.click(ms(100), "Ctrl+Alt+Del").is_empty());
+        let viewing = w.viewing.clone();
+        let mut forwarder = Forwarder::new(true);
+        forwarder.set_picture(Some(PictureRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1280.0,
+            height: 720.0,
+        }));
+        let send = |combo| Action::Viewer(ViewerAction::SendKeys(combo));
+        assert_eq!(
+            w.click(ms(200), "Alt+Tab"),
+            vec![send(Combo::AltTab)],
+            "{:?}",
+            w.texts()
+        );
+        // Ctrl+Alt+Del's action, should it come, sends nothing and closes
+        // the menu as any item does.
+        apply_viewer_action(
+            &mut forwarder,
+            &mut w.viewer,
+            Some(&viewing),
+            &send(Combo::CtrlAltDel),
+        );
+        assert!(forwarder.drain().is_empty());
+        assert!(!w.viewer.keys_menu);
+        apply_viewer_action(
+            &mut forwarder,
+            &mut w.viewer,
+            Some(&viewing),
+            &send(Combo::AltTab),
+        );
+        assert_eq!(
+            forwarder.drain(),
+            vec![
+                key(ALT, true),
+                key(0x07_002b, true),
+                key(0x07_002b, false),
+                key(ALT, false)
+            ]
+        );
+        assert!(!w.viewer.keys_menu, "sending closes the menu");
     }
 }
