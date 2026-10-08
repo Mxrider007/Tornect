@@ -351,6 +351,22 @@ struct BlockSurface {
     surface: Surface,
 }
 
+/// A block window that opened, as [`App::place_blocks`] keeps it: the GPU surface
+/// in the app, a stand-in in the tests, which open no GPU window.
+trait KeptBlock {
+    /// Keep the opened window of request `request`; it reports nothing (§B.8.6.3).
+    fn keep(self, app: &mut App, request: u64);
+}
+
+impl KeptBlock for Surface {
+    fn keep(self, app: &mut App, request: u64) {
+        app.blocks.push(BlockSurface {
+            request,
+            surface: self,
+        });
+    }
+}
+
 /// The stream window of a live session.
 struct StreamView {
     surface: Surface,
@@ -761,11 +777,18 @@ impl App {
     /// it was shown nowhere (§B.8.6.3). A window that opened counts as shown
     /// only at its first frame ([`Self::draw_block`]).
     fn place_blocks(&mut self, request: u64, opened: Vec<anyhow::Result<Surface>>) {
+        self.place_kept_blocks(request, opened);
+    }
+
+    /// [`Self::place_blocks`] for any kind of kept window (the tests keep no GPU
+    /// surface): a window that opened is kept and reports nothing, so it is not
+    /// shown before its first frame.
+    fn place_kept_blocks<W: KeptBlock>(&mut self, request: u64, opened: Vec<anyhow::Result<W>>) {
         let mut any = false;
         for surface in opened {
             match surface {
                 Ok(surface) => {
-                    self.blocks.push(BlockSurface { request, surface });
+                    surface.keep(self, request);
                     any = true;
                 }
                 Err(e) => {
@@ -1680,6 +1703,64 @@ mod tests {
             2,
             "{said:?}"
         );
+    }
+
+    /// A block window that opened, kept without a GPU window.
+    struct OpenedBlock;
+
+    /// What a test's monitors opened, one result per block window.
+    type Opened = fn() -> Vec<anyhow::Result<OpenedBlock>>;
+
+    impl KeptBlock for OpenedBlock {
+        fn keep(self, _: &mut App, _: u64) {}
+    }
+
+    /// §B.8.6.3: a block window that opened counts as shown only at its first
+    /// frame. Placing one that opened, alone or beside one that did not, tells
+    /// the request's block window nothing, so with no frame drawn it refuses the
+    /// request at its end (10 s) and not before; once a window of the request
+    /// drew its first frame, the request passes at its end.
+    #[tokio::test(start_paused = true)]
+    async fn a_block_window_that_opened_is_not_shown_until_it_draws() {
+        use tornect_signal::consent::{BlockOutcome, BlockWindow as _, WindowPassed};
+        let cases: [(&str, Opened, bool); 3] = [
+            ("one opened", || vec![Ok(OpenedBlock)], false),
+            (
+                "one opened, one did not",
+                || vec![Ok(OpenedBlock), Err(anyhow::anyhow!("lost"))],
+                false,
+            ),
+            ("one opened and drew", || vec![Ok(OpenedBlock)], true),
+        ];
+        for (case, opened, drew) in cases {
+            let (mut app, _rx) = app();
+            let window = block::GuiBlockWindow::without_notification(Arc::clone(&app.popups));
+            let started = tokio::time::Instant::now();
+            let run = tokio::spawn(async move { window.run(10, &[7; 8], "Laptop").await });
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let request = app.shared.read(|m| m.blocks[0].id);
+            app.place_kept_blocks(request, opened());
+            if drew {
+                // Its first frame, as `draw_block` reports it.
+                app.popups.block_drew(request);
+            }
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            assert!(!run.is_finished(), "{case}: before its end");
+            let outcome = run.await.unwrap();
+            assert!(
+                started.elapsed() >= Duration::from_secs(10),
+                "{case}: at its end"
+            );
+            if drew {
+                assert_eq!(
+                    outcome,
+                    BlockOutcome::Passed(WindowPassed::Elapsed),
+                    "{case}"
+                );
+            } else {
+                assert_eq!(outcome, BlockOutcome::NotShown, "{case}");
+            }
+        }
     }
 
     /// §B.1.1: in background mode the main window is minimised as it opens,
