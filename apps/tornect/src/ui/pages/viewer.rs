@@ -7,13 +7,14 @@
 //! so nothing in it outlives the session. What the user asks for comes back
 //! as actions; nothing here sends input.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use egui::{Color32, CornerRadius, RichText, Stroke, vec2};
 
 use super::super::model::Viewing;
 use super::super::theme::{self, Tokens};
-use super::super::view::Action;
+use super::super::view::{Action, clock};
 
 /// How long the toolbar stays after the pointer last moved over the window
 /// (the operator's default of 2026-10-07; a constant until the settings
@@ -30,11 +31,16 @@ const RELAY_LINE: &str = "Relayed via Tor: quality limited";
 /// The pin's name, for the tooltip and the accessibility tree.
 const PIN: &str = "Keep this bar shown";
 
+/// How far the frame rate looks back.
+const FPS_OVER: Duration = Duration::from_secs(1);
+
 /// One of the toolbar's own controls, as the window asks for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewerAction {
     /// The pin: keep the toolbar shown (`true`), or let it hide again.
     Pin(bool),
+    /// The connection's details: open them (`true`) or close them.
+    Details(bool),
 }
 
 /// What the stream window of one session keeps between frames.
@@ -50,6 +56,11 @@ pub struct ViewerState {
     pub keyboard_local: bool,
     /// The pin keeps the toolbar shown (not stored: the operator's default).
     pub pinned: bool,
+    /// The connection's details are open.
+    pub details: bool,
+    /// `(when, pictures decoded so far)`, one a frame, over the last
+    /// [`FPS_OVER`]: the frame rate.
+    samples: VecDeque<(Instant, u64)>,
     /// The toolbar is hidden.
     hidden: bool,
     /// When the pointer last moved over the window while the toolbar showed,
@@ -99,7 +110,7 @@ impl ViewerState {
         if self.hidden {
             return None;
         }
-        if self.pinned {
+        if self.pinned || self.details {
             self.active_at = Some(now);
             return None;
         }
@@ -110,6 +121,57 @@ impl ViewerState {
         } else {
             Some(until - now)
         }
+    }
+
+    /// Note how many pictures were decoded by `now`; keep [`FPS_OVER`] of
+    /// samples (and the newest one older than that).
+    fn sample(&mut self, pictures: u64, now: Instant) {
+        self.samples.push_back((now, pictures));
+        if let Some(ago) = now.checked_sub(FPS_OVER) {
+            while self.samples.get(1).is_some_and(|(at, _)| *at <= ago) {
+                self.samples.pop_front();
+            }
+        }
+    }
+}
+
+/// The frame rate: the pictures decoded over the last second, from
+/// `(when, pictures decoded so far)` samples, oldest first; before a second
+/// has passed, those since the oldest sample.
+#[must_use]
+pub fn fps(samples: &VecDeque<(Instant, u64)>, now: Instant) -> u64 {
+    let Some(&(_, latest)) = samples.back() else {
+        return 0;
+    };
+    let ago = now.checked_sub(FPS_OVER);
+    let base = samples
+        .iter()
+        .rev()
+        .find(|(at, _)| ago.is_some_and(|ago| *at <= ago))
+        .or(samples.front())
+        .map_or(latest, |(_, n)| *n);
+    latest.saturating_sub(base)
+}
+
+/// The help line under the toolbar of a control session: where the keyboard
+/// goes, and the chord that takes it back. The host is named only while this
+/// screen is not shared.
+#[must_use]
+pub fn help_line(v: &Viewing, viewer: &ViewerState) -> String {
+    if viewer.keyboard_local {
+        "Your keyboard stays on this computer. Click the picture or press Ctrl+Alt+Shift+M to \
+         give it back."
+            .to_owned()
+    } else {
+        let whom = if viewer.shared {
+            "the remote computer"
+        } else {
+            v.host.as_str()
+        };
+        format!(
+            "While this window has the focus, your keyboard goes to {whom}. Press \
+             Ctrl+Alt+Shift+M to take it back and show this bar."
+        )
     }
 }
 
@@ -225,8 +287,7 @@ fn toolbar(
     actions: &mut Vec<Action>,
     viewer: &mut ViewerState,
 ) {
-    // The session's clock and the input sent are not on the toolbar itself.
-    let _ = (input_sent, v.since);
+    viewer.sample(v.pictures, now);
     let pointer = ctx.input(|i| i.pointer.latest_pos());
     let top = ctx.content_rect().top();
     if let Some(left) = viewer.follow(pointer, top, now) {
@@ -235,6 +296,10 @@ fn toolbar(
     if viewer.hidden {
         return;
     }
+    // The frame rate falls when pictures stop coming: draw again to say so.
+    ctx.request_repaint_after(FPS_OVER);
+    let rate = fps(&viewer.samples, now);
+    let mut badge_clicked = false;
     let t = theme::tokens(ctx);
     let area = egui::Area::new(egui::Id::new("viewer-toolbar"))
         .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 8.0))
@@ -251,7 +316,15 @@ fn toolbar(
                         if !viewer.shared {
                             ui.label(RichText::new(&v.host).strong());
                         }
-                        ui.label(RichText::new("Tor relay").small().color(t.warn));
+                        let badge = format!("Tor relay · {rate} fps · {}×{}", v.size.0, v.size.1);
+                        let badge = ui.add(
+                            egui::Label::new(RichText::new(badge).small().color(t.warn))
+                                .sense(egui::Sense::click()),
+                        );
+                        if badge.clicked() {
+                            badge_clicked = true;
+                            actions.push(Action::Viewer(ViewerAction::Details(!viewer.details)));
+                        }
                         ui.label(RichText::new(chip_text(v)).color(chip_color(v, t)));
                         if pin(ui, viewer.pinned).clicked() {
                             actions.push(Action::Viewer(ViewerAction::Pin(!viewer.pinned)));
@@ -266,7 +339,92 @@ fn toolbar(
                     });
                 });
         });
-    viewer.areas.push(area.response.rect);
+    let pill = area.response.rect;
+    viewer.areas.push(pill);
+    let mut below = pill.bottom() + 4.0;
+    if v.control {
+        let help = egui::Area::new(egui::Id::new("viewer-help"))
+            .anchor(egui::Align2::CENTER_TOP, vec2(0.0, below - top))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(t.surface_overlay)
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(10, 4))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(help_line(v, viewer))
+                                .small()
+                                .color(t.text_secondary),
+                        );
+                    });
+            });
+        viewer.areas.push(help.response.rect);
+        below = help.response.rect.bottom() + 4.0;
+    }
+    if viewer.details {
+        let at = egui::pos2(pill.left(), below);
+        let open = details(ctx, v, input_sent, rate, now, at, t);
+        viewer.areas.push(open.response.rect);
+        // A press anywhere else closes them (the badge toggles them itself).
+        if open.response.clicked_elsewhere() && !badge_clicked {
+            actions.push(Action::Viewer(ViewerAction::Details(false)));
+        }
+    }
+}
+
+/// The connection's details, under the toolbar at `at`: the route, the
+/// picture, the level, the session's clock and, in a control session, the
+/// input sent. Nothing in them names the host.
+fn details(
+    ctx: &egui::Context,
+    v: &Viewing,
+    input_sent: u64,
+    rate: u64,
+    now: Instant,
+    at: egui::Pos2,
+    t: &Tokens,
+) -> egui::InnerResponse<()> {
+    let muted = |text: &str| RichText::new(text).color(t.text_muted);
+    egui::Area::new(egui::Id::new("viewer-details"))
+        .fixed_pos(at)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(t.surface_overlay)
+                .stroke(Stroke::new(1.0, t.border_subtle))
+                .corner_radius(CornerRadius::same(10))
+                .shadow(t.popup_shadow)
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    egui::Grid::new("viewer-details-rows")
+                        .num_columns(2)
+                        .spacing(vec2(16.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.label(muted("Route"));
+                            ui.vertical(|ui| {
+                                ui.label("Relayed through Tor");
+                                ui.label(muted("private, and slower than a direct link").small());
+                                ui.label(RichText::new(RELAY_LINE).small().color(t.warn));
+                            });
+                            ui.end_row();
+                            ui.label(muted("Picture"));
+                            ui.label(format!("{}×{} · {rate} fps", v.size.0, v.size.1));
+                            ui.end_row();
+                            ui.label(muted("Mode"));
+                            ui.label(chip_text(v));
+                            ui.end_row();
+                            ui.label(muted("Session"));
+                            ui.label(clock(v.since, now));
+                            ui.end_row();
+                            if v.control {
+                                ui.label(muted("Input"));
+                                ui.label(format!("{input_sent} events sent"));
+                                ui.end_row();
+                            }
+                        });
+                });
+        })
 }
 
 /// The pin: a toggle that keeps the toolbar shown. Its only words are its
@@ -429,7 +587,8 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
 
     use super::testing::Window;
     use super::*;
@@ -472,6 +631,106 @@ mod tests {
         assert!(w.has("End session"), "2.4 s after the last move");
         w.pass(ms(5800), Vec::new());
         assert!(!w.has("End session"), "2.6 s after the last move");
+    }
+
+    /// The frame rate is the number of pictures decoded over the last
+    /// second: thirty a second reads 30, a stall of two seconds 0, and
+    /// before a second has passed the pictures since the window opened; the
+    /// badge says it with the picture's size.
+    #[test]
+    fn the_frame_rate_counts_pictures_over_the_last_second() {
+        let t0 = Instant::now();
+        let mut v = ViewerState::default();
+        for i in 0..=90u64 {
+            v.sample(i, t0 + ms(i * 100 / 3));
+        }
+        assert_eq!(fps(&v.samples, t0 + ms(3000)), 30);
+        assert!(
+            v.samples.len() <= 32,
+            "a second of samples: {}",
+            v.samples.len()
+        );
+        v.sample(90, t0 + ms(5000));
+        assert_eq!(fps(&v.samples, t0 + ms(5000)), 0);
+        let mut v = ViewerState::default();
+        for i in 0..=12u64 {
+            v.sample(i, t0 + ms(i * 40));
+        }
+        assert_eq!(fps(&v.samples, t0 + ms(480)), 12);
+        assert_eq!(fps(&VecDeque::new(), t0), 0);
+        let mut w = Window::new(true);
+        for k in 0..=10u64 {
+            w.viewing.pictures = 1 + 3 * k;
+            w.pass(ms(100 * k), Vec::new());
+        }
+        assert!(w.has("Tor relay · 30 fps · 1600×900"), "{:?}", w.texts());
+    }
+
+    /// The connection's details open from the badge and say the route, the
+    /// picture, the level, the session's clock and the input sent; while
+    /// this screen is shared nothing in them, nor in the help line, names
+    /// the host. A press elsewhere closes them.
+    #[test]
+    fn the_details_name_no_host_while_this_screen_is_shared() {
+        let mut w = Window::new(true);
+        w.viewer.shared = true;
+        w.input_sent = 7;
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        assert!(!w.has("Route"), "closed at first");
+        let asked = w.click(ms(100), "Tor relay");
+        assert_eq!(asked, vec![Action::Viewer(ViewerAction::Details(true))]);
+        // As the window applies the action.
+        w.viewer.details = true;
+        w.pass(ms(200), Vec::new());
+        w.pass(ms(200), Vec::new());
+        for text in [
+            "Route",
+            "Relayed through Tor",
+            "private, and slower than a direct link",
+            "Picture",
+            "Mode",
+            "control",
+            "Session",
+            "00:00",
+            "Input",
+            "7 events sent",
+        ] {
+            assert!(w.has(text), "{text}: {:?}", w.texts());
+        }
+        let texts = w.texts();
+        assert!(!texts.iter().any(|t| t.contains("Desk")), "{texts:?}");
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("your keyboard goes to the remote computer")),
+            "{texts:?}"
+        );
+        // The details stay while open, however long the pointer rests.
+        w.pass(ms(9000), Vec::new());
+        assert!(w.has("Route"));
+        // A press on the picture, away from them, closes them.
+        let away = egui::pos2(640.0, 600.0);
+        let press = |pressed| egui::Event::PointerButton {
+            pos: away,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut asked = w.pass(ms(9100), vec![egui::Event::PointerMoved(away), press(true)]);
+        asked.extend(w.pass(ms(9100), vec![press(false)]));
+        assert_eq!(asked, vec![Action::Viewer(ViewerAction::Details(false))]);
+        // In a view-only session there is no input row and no help line.
+        let mut w = Window::new(false);
+        w.viewer.details = true;
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        assert!(w.has("Route") && !w.has("Input"), "{:?}", w.texts());
+        assert!(
+            !w.texts().iter().any(|t| t.contains("your keyboard")),
+            "{:?}",
+            w.texts()
+        );
     }
 
     /// The relay line stays on screen with the toolbar hidden.
