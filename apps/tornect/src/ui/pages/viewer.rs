@@ -58,6 +58,9 @@ const ADMIN_WINDOWS: &str =
 /// Why Ctrl+Alt+Del is greyed towards a host that said it runs Windows.
 const NOT_ON_WINDOWS: &str = "not possible on Windows computers";
 
+/// The Fullscreen button's name, for the tooltip and the accessibility tree.
+const FULLSCREEN: &str = "Fullscreen";
+
 /// How a screenshot's thread says it went: where the file is, or why not.
 type Saved = io::Result<PathBuf>;
 
@@ -71,6 +74,10 @@ enum Toast {
     NotSaved,
     /// The host's secure Windows screen closed.
     SecureScreenGone,
+    /// The window went full screen.
+    Fullscreen,
+    /// The window left full screen.
+    Windowed,
 }
 
 impl Toast {
@@ -79,6 +86,8 @@ impl Toast {
             Self::Saved(text) => text,
             Self::NotSaved => screenshot::NOT_SAVED,
             Self::SecureScreenGone => crate::secure_screen::NOTICE_GONE,
+            Self::Fullscreen => "Fullscreen. Move the pointer to the top edge for this bar.",
+            Self::Windowed => "Back to a window",
         }
     }
 }
@@ -101,6 +110,8 @@ pub enum ViewerAction {
     OneToOne(bool),
     /// Save the picture as it stands as a PNG on this computer.
     Screenshot,
+    /// Show the window full screen (`true`), or as a window again.
+    Fullscreen(bool),
 }
 
 /// A key combination the Send keys menu sends, in a control session only.
@@ -178,6 +189,11 @@ pub struct ViewerState {
     pub host_notice: Option<u8>,
     /// The host's secure screen showed in the last frame.
     secure_shown: bool,
+    /// The window is to be full screen: the app tells the window, and
+    /// nothing else of it changes (never its title).
+    pub fullscreen: bool,
+    /// Full screen in the last frame, for its toasts.
+    was_fullscreen: bool,
     /// The forwarder's pause as it stands for this frame: `draw_stream`
     /// reads it from the forwarder, its one keeper, before every frame, and
     /// the switch and the note draw it.
@@ -252,6 +268,24 @@ impl ViewerState {
             && self
                 .host_notice
                 .is_some_and(|code| code & notice::NO_ADMIN_WINDOWS != 0)
+    }
+
+    /// Leave full screen (the chord does, after its ReleaseAll).
+    pub fn leave_fullscreen(&mut self) {
+        self.fullscreen = false;
+    }
+
+    /// Say it when the window goes full screen or comes back.
+    fn follow_fullscreen(&mut self, now: Instant) {
+        if self.fullscreen != self.was_fullscreen {
+            let toast = if self.fullscreen {
+                Toast::Fullscreen
+            } else {
+                Toast::Windowed
+            };
+            self.toast = Some((toast, now));
+            self.was_fullscreen = self.fullscreen;
+        }
     }
 
     /// Take the host's notice for this frame: none outside a control
@@ -439,6 +473,7 @@ pub fn stream_window(
     viewer.visible = None;
     viewer.collect_screenshots(now);
     viewer.follow_notice(viewing.is_some_and(|v| v.control), now);
+    viewer.follow_fullscreen(now);
     // Outside the picture, so no press there reaches the remote computer;
     // shown whether or not the toolbar is.
     egui::Panel::bottom("viewer-relay")
@@ -679,6 +714,10 @@ fn toolbar(
                                 actions.push(Action::Viewer(ViewerAction::OneToOne(one_to_one)));
                             }
                         }
+                        if corners(ui, viewer.fullscreen).clicked() {
+                            let on = !viewer.fullscreen;
+                            actions.push(Action::Viewer(ViewerAction::Fullscreen(on)));
+                        }
                         if v.control {
                             let send = ui.button("Send keys");
                             if send.clicked() {
@@ -913,6 +952,35 @@ fn pin(ui: &mut egui::Ui, pinned: bool) -> egui::Response {
     );
     painter.circle_filled(head, 4.5, color);
     response.on_hover_text(PIN)
+}
+
+/// The Fullscreen button: a toggle drawn as four corners. Its only words are
+/// its name, in the tooltip and the accessibility tree.
+fn corners(ui: &mut egui::Ui, on: bool) -> egui::Response {
+    let t = theme::tokens(ui.ctx());
+    let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on, FULLSCREEN)
+    });
+    let color = if on {
+        t.accent_text
+    } else if response.hovered() {
+        t.text_primary
+    } else {
+        t.text_secondary
+    };
+    let painter = ui.painter();
+    if on {
+        painter.rect_filled(rect, CornerRadius::same(6), t.accent_tint);
+    }
+    let (c, r, arm) = (rect.center(), 7.0, 4.0);
+    let stroke = Stroke::new(1.6, color);
+    for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        let corner = c + vec2(sx * r, sy * r);
+        painter.line_segment([corner, corner - vec2(sx * arm, 0.0)], stroke);
+        painter.line_segment([corner, corner - vec2(0.0, sy * arm)], stroke);
+    }
+    response.on_hover_text(FULLSCREEN)
 }
 
 /// The Screenshot button: a camera. Its only words are its name, in the
