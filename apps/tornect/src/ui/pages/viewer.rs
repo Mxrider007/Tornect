@@ -35,6 +35,11 @@ const TOP_EDGE: f32 = 8.0;
 /// The relay line: the picture comes through Tor (always shown).
 const RELAY_LINE: &str = "Relayed via Tor: quality limited";
 
+/// The strip's line while a session of this computer's own host is live:
+/// the strip stays on screen in full screen too, where the window may cover
+/// the sharing indicator. It names nobody.
+const SHARING_LINE: &str = "This computer's screen is being shared.";
+
 /// The pin's name, for the tooltip and the accessibility tree.
 const PIN: &str = "Keep this bar shown";
 
@@ -168,6 +173,11 @@ pub struct ViewerState {
     /// (`Model::screen_shared`), read every frame: the window then names
     /// nobody.
     pub shared: bool,
+    /// A session of this computer's own host is live (`Model::sharing` is
+    /// not empty: the sharing indicator's own condition), read every frame:
+    /// the strip below the picture then says this screen is being shared,
+    /// in full screen too.
+    pub sharing: bool,
     /// The chord took the keyboard back from the remote computer: keys go to
     /// this window's controls until the chord again, or a press on the
     /// picture, gives it back.
@@ -474,8 +484,9 @@ pub fn stream_window(
     viewer.collect_screenshots(now);
     viewer.follow_notice(viewing.is_some_and(|v| v.control), now);
     viewer.follow_fullscreen(now);
+    let sharing = viewer.sharing;
     // Outside the picture, so no press there reaches the remote computer;
-    // shown whether or not the toolbar is.
+    // shown whether or not the toolbar is, and in full screen.
     egui::Panel::bottom("viewer-relay")
         .frame(
             egui::Frame::new()
@@ -489,6 +500,14 @@ pub fn stream_window(
                 RichText::new("The session has ended.").small()
             };
             ui.label(line);
+            if sharing {
+                ui.label(
+                    RichText::new(SHARING_LINE)
+                        .small()
+                        .strong()
+                        .color(t.danger_text),
+                );
+            }
         });
     let mut drawn = None;
     egui::CentralPanel::no_frame()
@@ -1663,6 +1682,37 @@ mod tests {
         ] {
             model.client = after;
             assert_eq!(model.viewer_notice(), None);
+        }
+    }
+
+    /// While a session of this computer's own host is live, the strip below
+    /// the picture says this screen is being shared, windowed and in full
+    /// screen, with the toolbar shown and hidden, naming nobody; with no
+    /// live session of this computer's host it does not.
+    #[test]
+    fn the_strip_says_this_screen_is_shared_while_this_computer_shares() {
+        assert_eq!(SHARING_LINE, "This computer's screen is being shared.");
+        for fullscreen in [false, true] {
+            let mut w = Window::new(true);
+            w.viewer.fullscreen = fullscreen;
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(0), Vec::new());
+            assert!(!w.has(SHARING_LINE), "{fullscreen}: {:?}", w.texts());
+            w.viewer.sharing = true;
+            w.viewer.shared = true;
+            for at in [100, 3000] {
+                w.pass(ms(at), Vec::new());
+                w.pass(ms(at), Vec::new());
+                let texts = w.texts();
+                assert!(w.has(SHARING_LINE), "{fullscreen}, {at} ms: {texts:?}");
+                assert!(!texts.iter().any(|t| t.contains("Desk")), "{texts:?}");
+            }
+            assert!(!w.viewer.toolbar_shown(), "{fullscreen}: the toolbar hid");
+            w.viewer.sharing = false;
+            w.viewer.shared = false;
+            w.pass(ms(3100), Vec::new());
+            w.pass(ms(3100), Vec::new());
+            assert!(!w.has(SHARING_LINE), "{fullscreen}: {:?}", w.texts());
         }
     }
 }
