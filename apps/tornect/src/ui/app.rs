@@ -8,9 +8,10 @@
 //! `WindowEvent::KeyboardInput` itself, before egui, which drops the keys it
 //! has no name for.
 
+use std::io;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use egui::ViewportId;
 use egui_wgpu::winit::Painter;
@@ -466,6 +467,8 @@ fn apply_viewer_action(
             }
             None
         }
+        // The window saves the picture it has; nothing goes to the host.
+        Action::Viewer(ViewerAction::Screenshot) => None,
         _ => None,
     }
 }
@@ -536,6 +539,10 @@ pub struct App {
     /// Started in background mode (§B.1.1): the "indicator shown" fact that
     /// the indicator probe sets. `None` for a window started by hand.
     pub background: Option<crate::host::IndicatorShown>,
+    /// The stream window offers screenshots, saved in the Pictures folder:
+    /// off unless set, so the preview, which writes nothing on this
+    /// computer, never offers them.
+    pub screenshots: bool,
     /// Why the window could not run.
     pub error: Option<anyhow::Error>,
 }
@@ -573,6 +580,7 @@ impl App {
             theme: egui::Theme::Dark,
             height: 760.0,
             background: None,
+            screenshots: false,
             error: None,
         }
     }
@@ -1018,6 +1026,7 @@ impl App {
         // the session, and the window then names nobody.
         view.viewer.shared = self.shared.read(|m| m.screen_shared(Instant::now()));
         view.viewer.input_paused = view.forwarder.is_paused();
+        view.viewer.screenshots = self.screenshots;
         let picture = view.video.id().zip(view.video.size());
         let mut actions = Vec::new();
         let mut drawn = None;
@@ -1111,6 +1120,9 @@ impl App {
                     self.command(command);
                 }
                 self.send_input();
+                if action == Action::Viewer(ViewerAction::Screenshot) {
+                    self.screenshot();
+                }
             }
             Action::DismissConnect => self.popups.shared().update(|m| {
                 if matches!(m.client, ClientStage::Ended(_)) {
@@ -1230,6 +1242,40 @@ impl App {
             }
             Action::ConfirmSetupChanged(id) => self.command(Command::ConfirmSetupChanged(id)),
             Action::DeviceWords(key) => self.command(Command::DeviceWords(key)),
+        }
+    }
+
+    /// Save the stream window's last picture in the Pictures folder, on a
+    /// thread of its own, never this one; the window says how it went at its
+    /// next frame. No log line names the folder, the path or the file.
+    fn screenshot(&mut self) {
+        if !self.screenshots {
+            return;
+        }
+        let Some(view) = &mut self.stream else { return };
+        let done = view.viewer.screenshot_done();
+        let failed = done.clone();
+        let Some(dir) = tornect_core::paths::pictures_dir() else {
+            let _ = failed.send(Err(io::ErrorKind::NotFound.into()));
+            view.surface.window.request_redraw();
+            return;
+        };
+        let picture = view.picture.clone();
+        let now = SystemTime::now();
+        let shared = Arc::clone(&self.shared);
+        let spawned = std::thread::Builder::new()
+            .name("tornect-screenshot".to_owned())
+            .spawn(move || {
+                let saved = super::screenshot::save(&dir, &picture, now);
+                if let Err(e) = &saved {
+                    tracing::debug!(kind = ?e.kind(), "a screenshot was not saved");
+                }
+                let _ = done.send(saved);
+                shared.wake(Wake::Frame);
+            });
+        if spawned.is_err() {
+            let _ = failed.send(Err(io::ErrorKind::Other.into()));
+            view.surface.window.request_redraw();
         }
     }
 
@@ -2852,5 +2898,72 @@ mod tests {
                     pressed: true
                 })
         );
+    }
+
+    /// The preview runs the real window with nothing behind it and writes
+    /// nothing on this computer: a window opened as it is offers no
+    /// screenshot; the real one sets them on.
+    #[test]
+    fn the_preview_offers_no_screenshot() {
+        let (app, _commands) = app();
+        assert!(!app.screenshots);
+        for control in [false, true] {
+            let mut w = Window::new(control);
+            w.viewer.screenshots = app.screenshots;
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(0), Vec::new());
+            assert!(!w.has("Save a screenshot"), "{:?}", w.texts());
+            assert!(w.has("End session"));
+            w.viewer.screenshots = true;
+            w.pass(ms(100), Vec::new());
+            w.pass(ms(100), Vec::new());
+            assert!(w.has("Save a screenshot"), "{:?}", w.texts());
+        }
+    }
+
+    /// A screenshot, in a control or a view-only session, is the window's
+    /// own business: the button asks only for it, it neither opens a closed
+    /// forwarder nor sends anything through an open one, and it gives the
+    /// tokio side no command.
+    #[test]
+    fn a_screenshot_sends_nothing() {
+        let shot = Action::Viewer(ViewerAction::Screenshot);
+        for control in [false, true] {
+            let mut w = Window::new(control);
+            w.viewer.screenshots = true;
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(0), Vec::new());
+            assert_eq!(w.click(ms(100), "Save a screenshot"), vec![shot.clone()]);
+        }
+        let w = Window::new(true);
+        for open in [false, true] {
+            for (control, administrator) in [(false, false), (true, false), (true, true)] {
+                for unattended in [false, true] {
+                    let viewing = Viewing {
+                        control,
+                        administrator,
+                        unattended,
+                        ..w.viewing.clone()
+                    };
+                    let mut forwarder = Forwarder::new(open);
+                    forwarder.set_picture(Some(PictureRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1280.0,
+                        height: 720.0,
+                    }));
+                    let mut state = ViewerState::default();
+                    let command =
+                        apply_viewer_action(&mut forwarder, &mut state, Some(&viewing), &shot);
+                    assert_eq!(command, None);
+                    assert_eq!(forwarder.is_open(), open);
+                    forwarder.flush();
+                    assert!(forwarder.drain().is_empty(), "open: {open}");
+                }
+            }
+        }
+        let (mut app, mut commands) = app();
+        app.act(shot, None);
+        assert_eq!(commands.try_recv(), Err(TryRecvError::Empty));
     }
 }

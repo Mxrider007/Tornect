@@ -38,6 +38,8 @@ egui-wgpu.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
 qrcode.workspace = true
+# The stream window's screenshot: a PNG with no metadata chunk.
+png.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true

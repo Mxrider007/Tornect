@@ -31,6 +31,7 @@ mod notice;
 mod pages;
 pub(crate) mod preview;
 pub(crate) mod recognize;
+mod screenshot;
 mod stream;
 mod theme;
 mod view;
@@ -288,6 +289,7 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
 
     let mut app = App::new(shared, popups, link, commands);
     app.theme = opts.theme;
+    app.screenshots = true;
     app.background = probe_fact;
     if !opts.host {
         app.title = "Tornect (connect only)";
