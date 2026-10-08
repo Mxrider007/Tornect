@@ -299,13 +299,15 @@ impl ViewerState {
     }
 
     /// Take the host's notice for this frame: none outside a control
-    /// session; when its secure screen closes, the toast says so.
+    /// session; when its secure screen closes, the toast says so. Only a
+    /// code without the bit says that: no code is the session's end, which
+    /// says nothing of the host's screen.
     fn follow_notice(&mut self, control: bool, now: Instant) {
         if !control {
             self.host_notice = None;
         }
         let secure = self.secure_screen();
-        if self.secure_shown && !secure {
+        if self.secure_shown && !secure && self.host_notice.is_some() {
             self.toast = Some((Toast::SecureScreenGone, now));
         }
         self.secure_shown = secure;
@@ -1727,5 +1729,28 @@ mod tests {
             w.pass(ms(3100), Vec::new());
             assert!(!w.has(SHARING_LINE), "{fullscreen}: {:?}", w.texts());
         }
+    }
+
+    /// A session that ends while the host's secure screen shows (the model
+    /// then hands the window no code) says nothing of it closing; a code
+    /// without the bit still says it closed.
+    #[test]
+    fn a_session_ending_during_a_secure_screen_says_nothing_closed() {
+        let gone = crate::secure_screen::NOTICE_GONE;
+        let mut w = Window::new(true);
+        w.viewer.host_notice = Some(0x05);
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        assert!(w.has(crate::secure_screen::NOTICE), "{:?}", w.texts());
+        w.viewer.host_notice = None;
+        w.pass(ms(100), Vec::new());
+        w.pass(ms(100), Vec::new());
+        assert!(!w.has(gone), "the end: {:?}", w.texts());
+        w.viewer.host_notice = Some(0x05);
+        w.pass(ms(200), Vec::new());
+        w.viewer.host_notice = Some(0x01);
+        w.pass(ms(300), Vec::new());
+        w.pass(ms(300), Vec::new());
+        assert!(w.has(gone), "the bit cleared: {:?}", w.texts());
     }
 }
