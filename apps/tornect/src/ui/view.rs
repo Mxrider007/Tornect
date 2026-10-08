@@ -17,12 +17,13 @@ use tornect_signal::pairing::{PairDecision, SessionDecision};
 
 use super::model::{
     BlockRequest, Confirm, Model, Popup, PopupKind, Prompt, Recognition, Sharing, SheetLevels,
-    Viewing,
 };
 #[cfg(test)]
-use super::model::{ClientStage, Hosting, Setup, TorState};
+use super::model::{ClientStage, Hosting, Setup, TorState, Viewing};
 use super::nav::{self, Page};
 use super::pages;
+use super::pages::viewer::ViewerAction;
+#[cfg(test)]
 use super::pages::viewer::ViewerState;
 use super::theme::{self, Face};
 use super::widgets;
@@ -95,6 +96,8 @@ pub enum Action {
     MoveIndicator,
     /// End the session this machine views, or stop asking for one.
     EndViewing,
+    /// One of the stream window's own controls.
+    Viewer(ViewerAction),
     /// Put the connect stepper away after a connection that ended.
     DismissConnect,
     /// Open the desktop's screen-sharing dialog now (the first-run grant).
@@ -1747,110 +1750,7 @@ fn confirm_popup(
     });
 }
 
-/// The stream window (§8): a slim bar with the host, the mode and Stop, and
-/// the picture letterboxed below it. Returns where the picture was drawn, in
-/// points, once there is one. The host is named only while this screen is
-/// not shared (`viewer.shared`).
-pub fn stream_window(
-    ui: &mut egui::Ui,
-    viewing: Option<&Viewing>,
-    picture: Option<(egui::TextureId, (u32, u32))>,
-    input_sent: u64,
-    now: Instant,
-    actions: &mut Vec<Action>,
-    viewer: &mut ViewerState,
-) -> Option<egui::Rect> {
-    theme::ensure(ui.ctx());
-    let t = theme::tokens(ui.ctx());
-    egui::Panel::top("stream-bar")
-        .frame(
-            egui::Frame::new()
-                .fill(t.bg_sidebar)
-                .inner_margin(egui::Margin::symmetric(12, 8)),
-        )
-        .show(ui, |ui| {
-            ui.horizontal(|ui| match viewing {
-                Some(v) => {
-                    // A picture of this screen may leave it: no name then.
-                    if !viewer.shared {
-                        ui.label(RichText::new(&v.host).strong());
-                    }
-                    // The level only from the signed accept (§B.2.1); an
-                    // unattended session's badge says so (§B.8.10).
-                    let (mode, color) = if v.control && v.administrator {
-                        ("Control · administrator", t.danger_text)
-                    } else if v.control {
-                        ("control", t.ok)
-                    } else {
-                        ("view only", t.text_muted)
-                    };
-                    if v.unattended {
-                        ui.label(
-                            RichText::new(crate::ua_client::badge(v.control, v.administrator))
-                                .color(color),
-                        );
-                    } else {
-                        ui.label(RichText::new(mode).color(color));
-                    }
-                    ui.label(
-                        RichText::new(format!(
-                            "{} · {}×{} · {} pictures · {} inputs",
-                            clock(v.since, now),
-                            v.size.0,
-                            v.size.1,
-                            v.pictures,
-                            input_sent
-                        ))
-                        .small()
-                        .monospace(),
-                    );
-                    ui.label(
-                        RichText::new("Relayed via Tor: quality limited")
-                            .small()
-                            .color(t.warn),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Stop").clicked() {
-                            actions.push(Action::EndViewing);
-                        }
-                    });
-                }
-                None => {
-                    ui.label("The session has ended.");
-                }
-            });
-        });
-    let mut drawn = None;
-    egui::CentralPanel::no_frame()
-        .frame(egui::Frame::new().fill(Color32::BLACK))
-        .show(ui, |ui| {
-            let avail = ui.available_rect_before_wrap();
-            match picture {
-                Some((texture, size)) => {
-                    let (x, y, w, h) = super::stream::letterbox(
-                        (avail.min.x, avail.min.y, avail.width(), avail.height()),
-                        size,
-                    );
-                    let rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
-                    ui.painter().image(
-                        texture,
-                        rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
-                    drawn = Some(rect);
-                }
-                None => {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(
-                            RichText::new("Waiting for the first picture…").color(t.text_muted),
-                        );
-                    });
-                }
-            }
-        });
-    drawn
-}
+pub use super::pages::viewer::stream_window;
 
 #[cfg(test)]
 mod tests {
@@ -3085,10 +2985,8 @@ mod tests {
             size: (1600, 900),
         };
         for shared in [false, true] {
-            let mut viewer = ViewerState {
-                shared,
-                ..ViewerState::default()
-            };
+            let mut viewer = ViewerState::default();
+            viewer.shared = shared;
             let texts = viewer_texts(&viewing, &mut viewer);
             assert_eq!(
                 texts.iter().any(|t| t.contains("Desk")),

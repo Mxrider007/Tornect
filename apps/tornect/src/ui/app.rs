@@ -31,9 +31,9 @@ use super::block;
 use super::consent::Popups;
 use super::indicator::{self, Change, Indicator};
 use super::keys;
-use super::model::{ClientStage, Shared, Wake};
+use super::model::{ClientStage, Shared, Viewing, Wake};
 use super::nav::Page;
-use super::pages::viewer::ViewerState;
+use super::pages::viewer::{ViewerAction, ViewerState};
 use super::stream::{Forwarder, Picture, PictureRect, VideoTexture, button};
 use super::view::{self, Action, Form};
 
@@ -384,13 +384,14 @@ struct StreamView {
     chord: keys::Chord,
 }
 
-/// One key of the stream window, through the chord first (decision M1-70).
-/// `true` when it goes to the window's own controls.
+/// One key of the stream window at `now`, through the chord first (decision
+/// M1-70). `true` when it goes to the window's own controls.
 fn on_key(
     chord: &mut keys::Chord,
     forwarder: &mut Forwarder,
     viewer: &mut ViewerState,
     key: keys::KeyInput,
+    now: Instant,
 ) -> bool {
     match keys::key_route(chord, viewer.keyboard_local, forwarder.is_open(), key) {
         keys::Route::Host { usb, pressed } => forwarder.key(usb, pressed),
@@ -401,6 +402,7 @@ fn on_key(
             // it lets go of everything first.
             forwarder.release_all();
             viewer.keyboard_local = true;
+            viewer.show_toolbar(now);
         }
         keys::Route::GiveBack => viewer.keyboard_local = false,
     }
@@ -414,6 +416,36 @@ fn on_button(forwarder: &mut Forwarder, viewer: &mut ViewerState, button: Button
         viewer.keyboard_local = false;
     }
     forwarder.button(button, pressed);
+}
+
+/// What one of the viewer's actions does (decision M1-70). The toolbar's
+/// controls change only the window's own state; End session is the one that
+/// asks the tokio side for anything. `viewing`, the signed level, is only
+/// read: no action raises the level or opens a closed forwarder.
+fn apply_viewer_action(
+    _forwarder: &mut Forwarder,
+    viewer: &mut ViewerState,
+    _viewing: Option<&Viewing>,
+    action: &Action,
+) -> Option<Command> {
+    match action {
+        Action::EndViewing => Some(Command::EndViewing),
+        Action::Viewer(ViewerAction::Pin(on)) => {
+            viewer.pinned = *on;
+            None
+        }
+        _ => None,
+    }
+}
+
+/// A rectangle in points as the forwarder takes it, in physical pixels.
+fn to_pixels(rect: egui::Rect, pixels_per_point: f64) -> PictureRect {
+    PictureRect {
+        x: f64::from(rect.min.x) * pixels_per_point,
+        y: f64::from(rect.min.y) * pixels_per_point,
+        width: f64::from(rect.width()) * pixels_per_point,
+        height: f64::from(rect.height()) * pixels_per_point,
+    }
 }
 
 /// The stream window lost the keyboard: the chord forgets its modifiers,
@@ -969,13 +1001,11 @@ impl App {
                 viewer,
             );
         });
+        // What the toolbar drew over the picture never forwards its clicks.
         let ppp = f64::from(view.surface.ctx.pixels_per_point());
-        view.forwarder.set_picture(drawn.map(|r| PictureRect {
-            x: f64::from(r.min.x) * ppp,
-            y: f64::from(r.min.y) * ppp,
-            width: f64::from(r.width()) * ppp,
-            height: f64::from(r.height()) * ppp,
-        }));
+        let blocked = view.viewer.areas().iter().map(|r| to_pixels(*r, ppp));
+        view.forwarder
+            .set_areas(drawn.map(|r| to_pixels(r, ppp)), None, blocked.collect());
         for action in actions {
             self.act(action, None);
         }
@@ -1029,7 +1059,25 @@ impl App {
                     tracing::debug!(error = %e, "moving the sharing indicator");
                 }
             }
-            Action::EndViewing => self.command(Command::EndViewing),
+            Action::EndViewing | Action::Viewer(_) => {
+                // Every action of the viewer goes through one function; with
+                // no stream window up, End still ends.
+                let viewing = self.shared.read(|m| match &m.client {
+                    ClientStage::Live(v) => Some(v.clone()),
+                    _ => None,
+                });
+                let (mut closed, mut unused) = (Forwarder::new(false), ViewerState::default());
+                let (forwarder, viewer) = match &mut self.stream {
+                    Some(view) => (&mut view.forwarder, &mut view.viewer),
+                    None => (&mut closed, &mut unused),
+                };
+                if let Some(command) =
+                    apply_viewer_action(forwarder, viewer, viewing.as_ref(), &action)
+                {
+                    self.command(command);
+                }
+                self.send_input();
+            }
             Action::DismissConnect => self.popups.shared().update(|m| {
                 if matches!(m.client, ClientStage::Ended(_)) {
                     m.client = ClientStage::Idle;
@@ -1204,6 +1252,7 @@ impl App {
                     &mut view.forwarder,
                     &mut view.viewer,
                     input,
+                    Instant::now(),
                 ) {
                     view.surface.on_event(&event);
                 }
@@ -1459,6 +1508,7 @@ mod tests {
     use tokio::sync::mpsc::error::TryRecvError;
 
     use super::super::model::Model;
+    use super::super::pages::viewer::testing::Window;
     use super::*;
 
     /// Review finding E2-4: DX12 compiles shaders with FXC, whatever the
@@ -2199,7 +2249,7 @@ mod tests {
         keys: &[keys::KeyInput],
     ) -> Vec<bool> {
         keys.iter()
-            .map(|k| on_key(chord, forwarder, viewer, *k))
+            .map(|k| on_key(chord, forwarder, viewer, *k, Instant::now()))
             .collect()
     }
 
@@ -2349,5 +2399,185 @@ mod tests {
                 key(KEY_M, true),
             ]
         );
+    }
+
+    fn ms(ms: u64) -> Duration {
+        Duration::from_millis(ms)
+    }
+
+    /// Where the window drew the picture and its toolbar in the last pass,
+    /// handed to `forwarder` as `draw_stream` does (one pixel a point).
+    fn hand_areas(w: &Window, forwarder: &mut Forwarder) {
+        forwarder.set_areas(
+            w.drawn.map(|r| to_pixels(r, 1.0)),
+            None,
+            w.viewer
+                .areas()
+                .iter()
+                .map(|r| to_pixels(*r, 1.0))
+                .collect(),
+        );
+    }
+
+    /// The pin keeps the toolbar shown however long the pointer rests;
+    /// unpinned, it hides again.
+    #[test]
+    fn a_pinned_toolbar_never_hides() {
+        let mut w = Window::new(true);
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        let mut forwarder = Forwarder::new(true);
+        let viewing = w.viewing.clone();
+        let actions = w.click(ms(100), "Keep this bar shown");
+        assert_eq!(actions, vec![Action::Viewer(ViewerAction::Pin(true))]);
+        for a in &actions {
+            assert_eq!(
+                apply_viewer_action(&mut forwarder, &mut w.viewer, Some(&viewing), a),
+                None
+            );
+        }
+        for at in [3, 10, 600] {
+            w.pass(Duration::from_secs(at), Vec::new());
+            assert!(w.has("End session"), "{at} s");
+        }
+        let actions = w.click(Duration::from_secs(601), "Keep this bar shown");
+        assert_eq!(actions, vec![Action::Viewer(ViewerAction::Pin(false))]);
+        for a in &actions {
+            apply_viewer_action(&mut forwarder, &mut w.viewer, Some(&viewing), a);
+        }
+        w.pass(Duration::from_secs(604), Vec::new());
+        assert!(!w.has("End session"));
+    }
+
+    /// The chord brings the hidden toolbar back, in a control session and
+    /// in a view-only one.
+    #[test]
+    fn the_chord_shows_the_toolbar() {
+        for control in [true, false] {
+            let mut w = Window::new(control);
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(3000), Vec::new());
+            assert!(!w.has("End session"));
+            let (mut chord, mut forwarder, _) = viewer(control);
+            let now = w.start + ms(3100);
+            for k in [press(CTRL), press(ALT), press(SHIFT), press(KEY_M)] {
+                on_key(&mut chord, &mut forwarder, &mut w.viewer, k, now);
+            }
+            w.pass(ms(3100), Vec::new());
+            w.pass(ms(3100), Vec::new());
+            assert!(w.has("End session"), "control: {control}");
+        }
+    }
+
+    /// A press on the toolbar, on any of its controls, never reaches the
+    /// host, though the toolbar floats over the picture; beside it, the
+    /// picture still takes one.
+    #[test]
+    fn a_press_on_the_toolbar_never_reaches_the_host() {
+        let mut w = Window::new(true);
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        let picture = w.drawn.expect("a picture");
+        let mut forwarder = Forwarder::new(true);
+        hand_areas(&w, &mut forwarder);
+        for name in [
+            "End session",
+            "Keep this bar shown",
+            "control",
+            "Tor relay",
+            "Desk",
+        ] {
+            let at = w.centre(name);
+            assert!(picture.contains(at), "{name} is over the picture");
+            forwarder.moved((f64::from(at.x), f64::from(at.y)));
+            on_button(&mut forwarder, &mut w.viewer, Button::Left, true);
+            on_button(&mut forwarder, &mut w.viewer, Button::Left, false);
+        }
+        forwarder.flush();
+        assert!(forwarder.drain().is_empty());
+        forwarder.moved((640.0, 400.0));
+        on_button(&mut forwarder, &mut w.viewer, Button::Left, true);
+        assert!(
+            forwarder
+                .drain()
+                .contains(&tornect_input::InputEvent::PointerButton {
+                    button: Button::Left,
+                    pressed: true
+                })
+        );
+    }
+
+    /// A wheel turn over the toolbar is not forwarded; beside it, it is.
+    #[test]
+    fn a_wheel_turn_over_the_toolbar_is_not_forwarded() {
+        let mut w = Window::new(true);
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        let mut forwarder = Forwarder::new(true);
+        hand_areas(&w, &mut forwarder);
+        let at = w.centre("End session");
+        forwarder.moved((f64::from(at.x), f64::from(at.y)));
+        forwarder.wheel((0.0, 1.0), (0.0, 0.0));
+        forwarder.flush();
+        assert!(forwarder.drain().is_empty());
+        forwarder.moved((640.0, 400.0));
+        forwarder.wheel((0.0, 1.0), (0.0, 0.0));
+        forwarder.flush();
+        assert!(
+            forwarder
+                .drain()
+                .contains(&tornect_input::InputEvent::Wheel { dx: 0, dy: 120 })
+        );
+    }
+
+    /// Every action of the viewer, at every signed level, on a closed and an
+    /// open forwarder: the forwarder stays as it was built, a closed one
+    /// sends nothing, and the only command any of them gives is End.
+    #[test]
+    fn no_toolbar_action_raises_the_level_or_opens_input() {
+        let all = [
+            Action::EndViewing,
+            Action::Viewer(ViewerAction::Pin(true)),
+            Action::Viewer(ViewerAction::Pin(false)),
+        ];
+        let w = Window::new(true);
+        for open in [false, true] {
+            for (control, administrator) in [(false, false), (true, false), (true, true)] {
+                for unattended in [false, true] {
+                    let viewing = Viewing {
+                        control,
+                        administrator,
+                        unattended,
+                        ..w.viewing.clone()
+                    };
+                    for action in &all {
+                        let mut forwarder = Forwarder::new(open);
+                        forwarder.set_picture(Some(PictureRect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 1280.0,
+                            height: 720.0,
+                        }));
+                        forwarder.moved((640.0, 400.0));
+                        let mut state = ViewerState::default();
+                        let command =
+                            apply_viewer_action(&mut forwarder, &mut state, Some(&viewing), action);
+                        assert_eq!(forwarder.is_open(), open, "{action:?}");
+                        if !open {
+                            forwarder.flush();
+                            assert!(forwarder.drain().is_empty(), "{action:?}");
+                        }
+                        let end = *action == Action::EndViewing;
+                        assert_eq!(command, end.then_some(Command::EndViewing), "{action:?}");
+                    }
+                }
+            }
+        }
+        let (mut app, mut commands) = app();
+        for action in all {
+            app.act(action, None);
+        }
+        assert_eq!(commands.try_recv(), Ok(Command::EndViewing));
+        assert_eq!(commands.try_recv(), Err(TryRecvError::Empty));
     }
 }
