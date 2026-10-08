@@ -264,7 +264,10 @@ const CMD: &str = "cmd.exe";
 /// - The copy: the system folder's `robocopy.exe`, from the held image's
 ///   folder into `<Program Files>\Tornect`, the file `tornect.exe` only, with
 ///   no retry and no option that copies owners or ACLs, moves or mirrors
-///   (robocopy keeps the file's name, so the source is named `tornect.exe`).
+///   (robocopy keeps the file's name, so the source is named `tornect.exe`);
+///   its data, attributes and times only (`/COPY:DATX`), never an alternate
+///   data stream such as a download's mark, which every account could read
+///   there.
 /// - The entry's delete: the system folder's `reg.exe`, in the 64-bit view.
 /// - The folder's removal: the system folder's `cmd.exe`, with `/d` (no
 ///   AutoRun command) and `/v:off` (no delayed expansion).
@@ -281,7 +284,7 @@ pub fn elevated_command(step: &Elevated, target: &WindowsTarget) -> (String, Str
         Elevated::Copy { from, to } => (
             system(ROBOCOPY),
             format!(
-                "\"{}\" \"{}\" {WINDOWS_EXE} /R:0 /W:0",
+                "\"{}\" \"{}\" {WINDOWS_EXE} /R:0 /W:0 /COPY:DATX",
                 quotable_folder(parent_of(from)),
                 quotable_folder(parent_of(to)),
             ),
@@ -2866,12 +2869,12 @@ mod windows_tests {
                 &copy,
                 "C:\\Windows\\System32\\robocopy.exe",
                 "\"C:\\Users\\u\\Downloads\\tornect\" \"C:\\Program Files\\Tornect\" tornect.exe \
-                 /R:0 /W:0",
+                 /R:0 /W:0 /COPY:DATX",
             ),
             (
                 &root,
                 "C:\\Windows\\System32\\robocopy.exe",
-                "\"D:\\.\" \"C:\\Program Files\\Tornect\" tornect.exe /R:0 /W:0",
+                "\"D:\\.\" \"C:\\Program Files\\Tornect\" tornect.exe /R:0 /W:0 /COPY:DATX",
             ),
             (
                 &delete,
