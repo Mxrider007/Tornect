@@ -510,6 +510,24 @@ impl Forwarder {
         self.out.push(InputEvent::ReleaseAll);
     }
 
+    /// The viewer took the keyboard back with its chord: the host lets go of
+    /// everything this viewer holds, as on focus loss.
+    pub fn release_all(&mut self) {
+        if !self.open {
+            return;
+        }
+        self.flush_pending();
+        self.held.clear();
+        self.out.push(InputEvent::ReleaseAll);
+    }
+
+    /// Whether a press now goes to the host: the session sends input and
+    /// the pointer is on the picture.
+    #[must_use]
+    pub fn counts_press(&self) -> bool {
+        self.open && self.on_picture()
+    }
+
     /// Let the coalesced move and wheel go out.
     pub fn flush(&mut self) {
         self.flush_pending();
@@ -710,6 +728,20 @@ mod tests {
         f.key(0x07_0004, true);
         f.focus_lost();
         assert_eq!(f.drain(), vec![key_a(true), InputEvent::ReleaseAll]);
+    }
+
+    /// A view-only session sends nothing through the paths the viewer's
+    /// toolbar and its chord added either.
+    #[test]
+    fn no_new_path_sends_in_a_view_only_session() {
+        let mut f = Forwarder::new(false);
+        f.set_picture(Some(RECT));
+        f.moved((500.0, 300.0));
+        assert!(!f.counts_press());
+        f.release_all();
+        f.flush();
+        assert!(!f.is_open());
+        assert!(f.drain().is_empty());
     }
 
     /// SLICE-E E1-4: keys typed while the window still waits for the first
