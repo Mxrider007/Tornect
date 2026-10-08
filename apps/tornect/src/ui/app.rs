@@ -32,6 +32,7 @@ use super::indicator::{self, Change, Indicator};
 use super::keys;
 use super::model::{ClientStage, Shared, Wake};
 use super::nav::Page;
+use super::pages::viewer::ViewerState;
 use super::stream::{Forwarder, Picture, PictureRect, VideoTexture, button};
 use super::view::{self, Action, Form};
 
@@ -375,6 +376,9 @@ struct StreamView {
     forwarder: Forwarder,
     last_flush: Instant,
     input_sent: u64,
+    /// The window's own state, built with it and dropped with it: nothing
+    /// in it outlives the session.
+    viewer: ViewerState,
 }
 
 /// The application: the main window, the stream window while a session is
@@ -538,6 +542,7 @@ impl App {
                             forwarder: Forwarder::new(control),
                             last_flush: Instant::now(),
                             input_sent: 0,
+                            viewer: ViewerState::default(),
                         });
                     }
                     Err(e) => {
@@ -902,10 +907,14 @@ impl App {
             ClientStage::Live(v) => Some(v.clone()),
             _ => None,
         });
+        // Every frame: this computer may start sharing its screen during
+        // the session, and the window then names nobody.
+        view.viewer.shared = self.shared.read(|m| m.screen_shared(Instant::now()));
         let picture = view.video.id().zip(view.video.size());
         let mut actions = Vec::new();
         let mut drawn = None;
         let sent = view.input_sent;
+        let viewer = &mut view.viewer;
         view.surface.paint(|ui| {
             drawn = view::stream_window(
                 ui,
@@ -914,6 +923,7 @@ impl App {
                 sent,
                 Instant::now(),
                 &mut actions,
+                viewer,
             );
         });
         let ppp = f64::from(view.surface.ctx.pixels_per_point());
