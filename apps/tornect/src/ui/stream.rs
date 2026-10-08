@@ -387,6 +387,10 @@ const PIXELS_PER_NOTCH: f64 = 40.0;
 pub struct Forwarder {
     open: bool,
     picture: Option<PictureRect>,
+    /// The part of the picture on screen, where the window shows less.
+    visible: Option<PictureRect>,
+    /// What the window draws over the picture (its toolbar).
+    blocked: Vec<PictureRect>,
     cursor: Option<(f64, f64)>,
     held: BTreeSet<Button>,
     pending_move: Option<(u16, u16)>,
@@ -414,16 +418,39 @@ impl Forwarder {
         self.open
     }
 
-    /// Where the picture was drawn last (none before the first picture).
+    /// Where the picture was drawn last (none before the first picture),
+    /// all of it on screen and nothing over it.
     pub fn set_picture(&mut self, picture: Option<PictureRect>) {
         self.picture = picture;
+        self.visible = None;
+        self.blocked.clear();
     }
 
-    /// Whether the pointer is on the picture now.
+    /// Where the picture was drawn last, the part of it on screen (`None`:
+    /// all of it), and what the window drew over it: a press, a wheel turn
+    /// or a move counts only on the visible picture outside every blocked
+    /// rectangle.
+    pub fn set_areas(
+        &mut self,
+        picture: Option<PictureRect>,
+        visible: Option<PictureRect>,
+        blocked: Vec<PictureRect>,
+    ) {
+        self.set_picture(picture);
+        self.visible = visible;
+        self.blocked = blocked;
+    }
+
+    /// Whether the pointer is on the picture now: on its visible part and
+    /// under nothing the window drew over it.
     #[must_use]
     pub fn on_picture(&self) -> bool {
         match (self.picture, self.cursor) {
-            (Some(rect), Some(pos)) => rect.contains(pos),
+            (Some(rect), Some(pos)) => {
+                rect.contains(pos)
+                    && self.visible.is_none_or(|v| v.contains(pos))
+                    && !self.blocked.iter().any(|b| b.contains(pos))
+            }
             _ => false,
         }
     }
@@ -436,7 +463,7 @@ impl Forwarder {
         };
         // Off the picture, a move is sent only while a button forwarded from
         // it is held (a drag), clamped to the edge.
-        if rect.contains(pos) || !self.held.is_empty() {
+        if self.on_picture() || !self.held.is_empty() {
             let at = rect.normalized(pos);
             if self.last_move != Some(at) {
                 self.pending_move = Some(at);
