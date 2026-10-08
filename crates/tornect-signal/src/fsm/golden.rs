@@ -814,3 +814,71 @@ async fn fuzz_seeds_match_the_golden_vectors_and_reach_a_session() {
         assert!(outcome.established(), "{scenario:?}: {outcome:?}");
     }
 }
+
+/// Vector 11 (decision M1-70, `docs/notes/m1-golden-vector.md`).
+const EXPECTED_PONG_NOTICE: &[(&str, &str)] = &[
+    ("vector_11_body", "a200010103"),
+    ("vector_11_frame", "8501041045a200010103f6"),
+];
+
+/// Vector 11 (decision M1-70): the host's `PONG` with its notice code, key 1 = 3 (the
+/// host runs Windows, and the session's input cannot reach administrator windows), as
+/// the host's fourth frame of a stream (`v` 1, `msg_id` 4, unsigned): its body and its
+/// frame. Vectors 1 to 10 and the fuzz seeds are unchanged (their tests).
+#[test]
+fn golden_vector_pong_notice() {
+    let pong = messages::HostPong {
+        nonce: 1,
+        notice: Some(messages::notice::WINDOWS | messages::notice::NO_ADMIN_WINDOWS),
+    };
+    let body = encode_body(&pong);
+    assert_eq!(decode_body::<messages::HostPong>(&body).unwrap(), pong);
+    let actual = vec![
+        ("vector_11_body", hex::encode(&body)),
+        (
+            "vector_11_frame",
+            hex::encode(unsigned(4, Kind::Pong, body)),
+        ),
+    ];
+    check(&actual, EXPECTED_PONG_NOTICE);
+}
+
+/// A `PONG` with no notice is, byte for byte, the `PONG` a host built before the key
+/// sends.
+#[test]
+fn a_pong_without_a_notice_has_the_old_bytes() {
+    for nonce in [0, 1, 0x3333_3333_3333_3333, u64::MAX] {
+        assert_eq!(
+            encode_body(&messages::HostPong {
+                nonce,
+                notice: None
+            }),
+            encode_body(&Pong { nonce }),
+            "{nonce}"
+        );
+    }
+}
+
+/// A peer built before the key reads vector 11's body as a plain `PONG` with the same
+/// nonce; this build reads its notice, and keeps a bit it does not know as received.
+#[test]
+fn an_old_pong_decoder_ignores_the_notice() {
+    let body = hex::decode(EXPECTED_PONG_NOTICE[0].1).unwrap();
+    assert_eq!(decode_body::<Pong>(&body).unwrap(), Pong { nonce: 1 });
+    assert_eq!(
+        decode_body::<messages::HostPong>(&body).unwrap(),
+        messages::HostPong {
+            nonce: 1,
+            notice: Some(3)
+        }
+    );
+    let unknown = encode_body(&messages::HostPong {
+        nonce: 7,
+        notice: Some(0xf9),
+    });
+    assert_eq!(decode_body::<Pong>(&unknown).unwrap(), Pong { nonce: 7 });
+    assert_eq!(
+        decode_body::<messages::HostPong>(&unknown).unwrap().notice,
+        Some(0xf9)
+    );
+}

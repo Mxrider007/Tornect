@@ -178,6 +178,26 @@ reads as absent (`messages::tests::a23_a_duplicated_grant_reach_reads_the_last_a
 built before the key decodes these bodies and ignores key 12. The fuzz seeds below come from vectors 1 and 2 and are
 unchanged.
 
+## Vector 11 — PONG with a notice (M-UI-4)
+
+The host's `PONG` carries key 1, `notice` (decision M1-70, §B.8.4.1): one byte of bits, never text, from which the
+viewer says its own fixed sentences (0x01 the host runs Windows, 0x02 the session is not at the administrator level on
+a Windows host, so its input cannot reach administrator windows, 0x04 a secure Windows screen is showing; other bits
+reserved, kept as received and ignored). The host of a Control session sends it in its first `PONG`, 0 included, and
+again only when it changes; every other `PONG` is the plain one. The vector is the body of
+`HostPong{nonce: 1, notice: 3}` and its envelope as the host's fourth frame of a stream (`v` 1, `msg_id` 4, kind 16
+`PONG`, unsigned; the envelope without the frame's `u32` length prefix) (`fsm::golden::golden_vector_pong_notice`).
+
+| Value | Hex |
+|---|---|
+| body | `a200010103` |
+| envelope | `8501041045a200010103f6` |
+
+The body is the map `{0: 1, 1: 3}`. With no notice the key is absent and the body is `a10001`, byte for byte a plain
+`PONG{nonce: 1}` (`fsm::golden::a_pong_without_a_notice_has_the_old_bytes`). A peer built before the key decodes
+vector 11 as `PONG{nonce: 1}` and never sees key 1 (`fsm::golden::an_old_pong_decoder_ignores_the_notice`). Vectors 1
+to 10 and the fuzz seeds below are unchanged.
+
 ## Reading the frames
 
 Vector 1 `frame_1` decodes as `[1, 1, 1, body, sig]`; its body is the map
