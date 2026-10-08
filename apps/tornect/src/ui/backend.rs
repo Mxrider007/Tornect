@@ -1749,6 +1749,7 @@ async fn viewed(
     }
     *live = Some(sid);
     b.shared.update(|m| {
+        m.host_notice = None;
         m.client = ClientStage::Live(Viewing {
             host: host.clone(),
             control,
@@ -1776,6 +1777,16 @@ async fn viewed(
         rx
     });
     let mut sink = SlotSink::new(Arc::clone(&b.link.slot), Arc::clone(&b.shared));
+    // The host's notice code (decision M1-70), into the model as it changes;
+    // the stream window shows it in a control session only.
+    let mut notices = session.notices();
+    let told = Arc::clone(&b.shared);
+    let notices_task = tokio::spawn(async move {
+        while notices.changed().await.is_ok() {
+            let code = *notices.borrow_and_update();
+            told.update(|m| m.host_notice = code);
+        }
+    });
     let end = crate::tor_cmd::watch(
         node,
         &id,
@@ -1787,6 +1798,8 @@ async fn viewed(
         Some(&mut sink),
     )
     .await;
+    notices_task.abort();
+    b.shared.update(|m| m.host_notice = None);
     b.link.set_input(None);
     Ok(match end? {
         End::You => {

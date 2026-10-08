@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, CornerRadius, RichText, Stroke, vec2};
 
+use tornect_signal::messages::notice;
+
 use super::super::model::Viewing;
 use super::super::screenshot;
 use super::super::theme::{self, Tokens};
@@ -48,6 +50,14 @@ const SCREENSHOT: &str = "Save a screenshot";
 /// How long a toast stays.
 const TOAST_FOR: Duration = Duration::from_millis(3500);
 
+/// The line of a control session whose input cannot reach windows that run
+/// as administrator on the host (§B.2.1), said when the host says so.
+const ADMIN_WINDOWS: &str =
+    "Some windows here run as administrator; your clicks cannot reach them in this session.";
+
+/// Why Ctrl+Alt+Del is greyed towards a host that said it runs Windows.
+const NOT_ON_WINDOWS: &str = "not possible on Windows computers";
+
 /// How a screenshot's thread says it went: where the file is, or why not.
 type Saved = io::Result<PathBuf>;
 
@@ -59,6 +69,8 @@ enum Toast {
     Saved(String),
     /// A screenshot could not be saved.
     NotSaved,
+    /// The host's secure Windows screen closed.
+    SecureScreenGone,
 }
 
 impl Toast {
@@ -66,6 +78,7 @@ impl Toast {
         match self {
             Self::Saved(text) => text,
             Self::NotSaved => screenshot::NOT_SAVED,
+            Self::SecureScreenGone => crate::secure_screen::NOTICE_GONE,
         }
     }
 }
@@ -159,8 +172,12 @@ pub struct ViewerState {
     /// At its own size, the part of the window that shows the picture in
     /// the last frame, in points; `None` when fitted (all of it shows).
     visible: Option<egui::Rect>,
-    /// Whether the host said it runs Windows; `None` until it says.
-    pub host_windows: Option<bool>,
+    /// The host's notice code (decision M1-70): `draw_stream` sets it every
+    /// frame, in a control session only; `None` until the host says, so
+    /// nothing is known of it in a new session.
+    pub host_notice: Option<u8>,
+    /// The host's secure screen showed in the last frame.
+    secure_shown: bool,
     /// The forwarder's pause as it stands for this frame: `draw_stream`
     /// reads it from the forwarder, its one keeper, before every frame, and
     /// the switch and the note draw it.
@@ -212,6 +229,42 @@ impl ViewerState {
     #[must_use]
     pub fn visible(&self) -> Option<egui::Rect> {
         self.visible
+    }
+
+    /// Whether the host said it runs Windows; `None` until it says.
+    #[must_use]
+    pub fn host_windows(&self) -> Option<bool> {
+        self.host_notice.map(|code| code & notice::WINDOWS != 0)
+    }
+
+    /// The host says a secure Windows screen shows.
+    fn secure_screen(&self) -> bool {
+        self.host_notice
+            .is_some_and(|code| code & notice::SECURE_SCREEN != 0)
+    }
+
+    /// The host says this session's input cannot reach its administrator
+    /// windows: only ever in a control session not at the administrator
+    /// level.
+    fn no_admin_windows(&self, v: &Viewing) -> bool {
+        v.control
+            && !v.administrator
+            && self
+                .host_notice
+                .is_some_and(|code| code & notice::NO_ADMIN_WINDOWS != 0)
+    }
+
+    /// Take the host's notice for this frame: none outside a control
+    /// session; when its secure screen closes, the toast says so.
+    fn follow_notice(&mut self, control: bool, now: Instant) {
+        if !control {
+            self.host_notice = None;
+        }
+        let secure = self.secure_screen();
+        if self.secure_shown && !secure {
+            self.toast = Some((Toast::SecureScreenGone, now));
+        }
+        self.secure_shown = secure;
     }
 
     /// Where a screenshot's thread says how it went: the window takes it at
@@ -385,6 +438,7 @@ pub fn stream_window(
     viewer.areas.clear();
     viewer.visible = None;
     viewer.collect_screenshots(now);
+    viewer.follow_notice(viewing.is_some_and(|v| v.control), now);
     // Outside the picture, so no press there reaches the remote computer;
     // shown whether or not the toolbar is.
     egui::Panel::bottom("viewer-relay")
@@ -571,7 +625,15 @@ fn toolbar(
     if let Some(left) = viewer.follow(pointer, top, now) {
         ctx.request_repaint_after(left);
     }
+    let t = theme::tokens(ctx);
     if viewer.hidden {
+        // The secure screen is said with the toolbar hidden too.
+        if viewer.secure_screen() {
+            let line = under_pill(ctx, "viewer-secure", top + 8.0, top, |ui| {
+                ui.label(RichText::new(crate::secure_screen::NOTICE).color(t.warn));
+            });
+            viewer.areas.push(line);
+        }
         return;
     }
     // The frame rate falls when pictures stop coming: draw again to say so.
@@ -579,7 +641,6 @@ fn toolbar(
     let rate = fps(&viewer.samples, now);
     let mut badge_clicked = false;
     let (mut keys_clicked, mut keys_at) = (false, None);
-    let t = theme::tokens(ctx);
     let area = egui::Area::new(egui::Id::new("viewer-toolbar"))
         .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 8.0))
         .order(egui::Order::Foreground)
@@ -646,6 +707,13 @@ fn toolbar(
     let pill = area.response.rect;
     viewer.areas.push(pill);
     let mut below = pill.bottom() + 4.0;
+    if viewer.secure_screen() {
+        let line = under_pill(ctx, "viewer-secure", below, top, |ui| {
+            ui.label(RichText::new(crate::secure_screen::NOTICE).color(t.warn));
+        });
+        viewer.areas.push(line);
+        below = line.bottom() + 4.0;
+    }
     if v.control {
         let help = egui::Area::new(egui::Id::new("viewer-help"))
             .anchor(egui::Align2::CENTER_TOP, vec2(0.0, below - top))
@@ -667,9 +735,17 @@ fn toolbar(
         viewer.areas.push(help.response.rect);
         below = help.response.rect.bottom() + 4.0;
     }
+    let admin_windows = viewer.no_admin_windows(v);
+    if admin_windows {
+        let line = under_pill(ctx, "viewer-admin-windows", below, top, |ui| {
+            ui.label(RichText::new(ADMIN_WINDOWS).small().color(t.warn));
+        });
+        viewer.areas.push(line);
+        below = line.bottom() + 4.0;
+    }
     if viewer.details {
         let at = egui::pos2(pill.left(), below);
-        let open = details(ctx, v, input_sent, rate, now, at, t);
+        let open = details(ctx, v, input_sent, rate, now, at, admin_windows);
         viewer.areas.push(open.response.rect);
         below = open.response.rect.bottom() + 4.0;
         // A press anywhere else closes them (the badge toggles them itself).
@@ -688,8 +764,33 @@ fn toolbar(
     }
 }
 
+/// A line under the toolbar, `y` points below the window's `top`, centred,
+/// on the toolbar's surface. Returns where it was drawn.
+fn under_pill(
+    ctx: &egui::Context,
+    id: &str,
+    y: f32,
+    top: f32,
+    add: impl FnOnce(&mut egui::Ui),
+) -> egui::Rect {
+    let t = theme::tokens(ctx);
+    egui::Area::new(egui::Id::new(id))
+        .anchor(egui::Align2::CENTER_TOP, vec2(0.0, y - top))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(t.surface_overlay)
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(egui::Margin::symmetric(10, 4))
+                .show(ui, add);
+        })
+        .response
+        .rect
+}
+
 /// The Send keys menu at `at`: Ctrl+Alt+Del is greyed until the host says
-/// it does not run Windows, never sent into a silent loss.
+/// it does not run Windows, never sent into a silent loss; towards a host
+/// that said it does, the menu says why.
 fn keys_menu(
     ctx: &egui::Context,
     viewer: &ViewerState,
@@ -711,10 +812,13 @@ fn keys_menu(
                     ui.vertical(|ui| {
                         for combo in Combo::ALL {
                             let sendable =
-                                combo != Combo::CtrlAltDel || viewer.host_windows == Some(false);
+                                combo != Combo::CtrlAltDel || viewer.host_windows() == Some(false);
                             let item = egui::Button::new(combo.label()).frame(false);
                             if ui.add_enabled(sendable, item).clicked() {
                                 actions.push(Action::Viewer(ViewerAction::SendKeys(combo)));
+                            }
+                            if combo == Combo::CtrlAltDel && viewer.host_windows() == Some(true) {
+                                ui.label(RichText::new(NOT_ON_WINDOWS).small().color(t.text_muted));
                             }
                         }
                     });
@@ -723,8 +827,9 @@ fn keys_menu(
 }
 
 /// The connection's details, under the toolbar at `at`: the route, the
-/// picture, the level, the session's clock and, in a control session, the
-/// input sent. Nothing in them names the host.
+/// picture, the level (with the administrator-windows line when the host
+/// said it, `admin_windows`), the session's clock and, in a control session,
+/// the input sent. Nothing in them names the host.
 fn details(
     ctx: &egui::Context,
     v: &Viewing,
@@ -732,8 +837,9 @@ fn details(
     rate: u64,
     now: Instant,
     at: egui::Pos2,
-    t: &Tokens,
+    admin_windows: bool,
 ) -> egui::InnerResponse<()> {
+    let t = theme::tokens(ctx);
     let muted = |text: &str| RichText::new(text).color(t.text_muted);
     egui::Area::new(egui::Id::new("viewer-details"))
         .fixed_pos(at)
@@ -761,7 +867,12 @@ fn details(
                             ui.label(format!("{}×{} · {rate} fps", v.size.0, v.size.1));
                             ui.end_row();
                             ui.label(muted("Mode"));
-                            ui.label(chip_text(v));
+                            ui.vertical(|ui| {
+                                ui.label(chip_text(v));
+                                if admin_windows {
+                                    ui.label(RichText::new(ADMIN_WINDOWS).small().color(t.warn));
+                                }
+                            });
                             ui.end_row();
                             ui.label(muted("Session"));
                             ui.label(clock(v.since, now));
@@ -1339,6 +1450,151 @@ mod tests {
             ("/b/c/d/e.png", "Screenshot saved to c/d/e.png"),
         ] {
             assert_eq!(screenshot::saved_text(std::path::Path::new(path)), want);
+        }
+    }
+
+    /// How many of the texts on screen are `text`.
+    fn times(w: &Window, text: &str) -> usize {
+        w.texts().iter().filter(|t| *t == text).count()
+    }
+
+    /// The secure screen: the host's own words over the picture with the
+    /// toolbar shown and hidden, their area kept from the remote computer,
+    /// no host named; when it closes, the toast says so for 3.5 s.
+    #[test]
+    fn the_secure_screen_notice_shows_the_plans_words_and_names_no_host() {
+        let notice = crate::secure_screen::NOTICE;
+        assert_eq!(
+            notice,
+            "The computer is showing a secure Windows screen; the person there must answer it"
+        );
+        let mut w = Window::new(true);
+        w.viewer.shared = true;
+        w.viewer.host_notice = Some(0x05);
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        assert!(w.has(notice), "{:?}", w.texts());
+        let texts = w.texts();
+        assert!(!texts.iter().any(|t| t.contains("Desk")), "{texts:?}");
+        let at = w.centre(notice);
+        assert!(w.viewer.areas().iter().any(|r| r.contains(at)), "shown");
+        w.pass(ms(3000), Vec::new());
+        w.pass(ms(3000), Vec::new());
+        assert!(!w.viewer.toolbar_shown());
+        assert!(w.has(notice), "hidden: {:?}", w.texts());
+        let at = w.centre(notice);
+        assert!(w.viewer.areas().iter().any(|r| r.contains(at)), "hidden");
+        w.viewer.host_notice = Some(0x01);
+        w.pass(ms(3100), Vec::new());
+        w.pass(ms(3100), Vec::new());
+        assert!(!w.has(notice));
+        let gone = crate::secure_screen::NOTICE_GONE;
+        assert!(w.has(gone), "{:?}", w.texts());
+        w.pass(ms(6500), Vec::new());
+        assert!(w.has(gone), "3.4 s");
+        w.pass(ms(6700), Vec::new());
+        assert!(!w.has(gone), "3.6 s");
+    }
+
+    /// The administrator-windows line, under the toolbar and in the details:
+    /// only in a control session not at the administrator level, and only
+    /// when the host said so.
+    #[test]
+    fn the_administrator_windows_line_is_said_only_when_the_host_says_so() {
+        for (control, administrator) in [(false, false), (true, false), (true, true)] {
+            for code in [
+                None,
+                Some(0x00),
+                Some(0x01),
+                Some(0x02),
+                Some(0x03),
+                Some(0x07),
+            ] {
+                let mut w = Window::new(control);
+                w.viewing.administrator = administrator;
+                w.viewer.host_notice = code;
+                w.pass(ms(0), Vec::new());
+                w.pass(ms(0), Vec::new());
+                let want = control && !administrator && code.is_some_and(|c| c & 0x02 != 0);
+                let case = format!("control {control}, administrator {administrator}, {code:?}");
+                assert_eq!(w.has(ADMIN_WINDOWS), want, "{case}: {:?}", w.texts());
+                let under = times(&w, ADMIN_WINDOWS);
+                w.viewer.details = true;
+                w.pass(ms(100), Vec::new());
+                w.pass(ms(100), Vec::new());
+                if want {
+                    assert!(
+                        times(&w, ADMIN_WINDOWS) > under,
+                        "{case}: in the details too"
+                    );
+                } else {
+                    assert_eq!(times(&w, ADMIN_WINDOWS), 0, "{case}");
+                }
+            }
+        }
+    }
+
+    /// A view-only window shows nothing a host sends, whatever the code: no
+    /// notice, no line, no platform; and the model hands it none.
+    #[test]
+    fn a_view_only_session_shows_no_notice_whatever_the_host_sends() {
+        let mut w = Window::new(false);
+        w.viewer.host_notice = Some(0xff);
+        w.viewer.details = true;
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        for text in [
+            crate::secure_screen::NOTICE,
+            ADMIN_WINDOWS,
+            NOT_ON_WINDOWS,
+            "Ctrl+Alt+Del",
+        ] {
+            assert!(
+                !w.texts().iter().any(|t| t.contains(text)),
+                "{text}: {:?}",
+                w.texts()
+            );
+        }
+        assert_eq!(w.viewer.host_windows(), None);
+        w.viewer.host_notice = Some(0x00);
+        w.pass(ms(100), Vec::new());
+        w.pass(ms(100), Vec::new());
+        assert!(!w.has(crate::secure_screen::NOTICE_GONE));
+        let mut model = crate::ui::model::Model {
+            host_notice: Some(0x07),
+            ..crate::ui::model::Model::default()
+        };
+        model.client = crate::ui::model::ClientStage::Live(Viewing {
+            control: false,
+            ..w.viewing.clone()
+        });
+        assert_eq!(model.viewer_notice(), None);
+        model.client = crate::ui::model::ClientStage::Live(Viewing {
+            control: true,
+            ..w.viewing.clone()
+        });
+        assert_eq!(model.viewer_notice(), Some(0x07));
+    }
+
+    /// Once the session is over the model hands the window no notice,
+    /// whatever the host last said.
+    #[test]
+    fn the_notice_is_cleared_when_the_session_ends() {
+        use crate::ui::model::{ClientStage, Model};
+        let w = Window::new(true);
+        let mut model = Model {
+            host_notice: Some(0x05),
+            client: ClientStage::Live(w.viewing.clone()),
+            ..Model::default()
+        };
+        assert_eq!(model.viewer_notice(), Some(0x05));
+        for after in [
+            ClientStage::Ended("ended".to_owned()),
+            ClientStage::Idle,
+            ClientStage::Asking,
+        ] {
+            model.client = after;
+            assert_eq!(model.viewer_notice(), None);
         }
     }
 }

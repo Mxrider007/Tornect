@@ -121,6 +121,10 @@ pub struct Model {
     pub sharing: Vec<Sharing>,
     /// The session this machine is viewing.
     pub client: ClientStage,
+    /// The notice code the viewed session's host last sent (decision M1-70,
+    /// §B.8.4.1): a number, the bits of `tornect_signal::messages::notice`.
+    /// `None` until the host says, and again once the session is over.
+    pub host_notice: Option<u8>,
     /// The connection this computer last asked for: the ID dialed (for Try
     /// again), when it started, whether it went through pairing, and how it
     /// failed if it ended without a session.
@@ -196,6 +200,16 @@ pub struct Model {
 }
 
 impl Model {
+    /// The host's notice code as the stream window may use it: in a control
+    /// session only, so a view-only window shows nothing a host sends.
+    #[must_use]
+    pub fn viewer_notice(&self) -> Option<u8> {
+        match &self.client {
+            ClientStage::Live(v) if v.control => self.host_notice,
+            _ => None,
+        }
+    }
+
     /// How many [`Model::events`] are kept.
     pub const EVENTS_KEPT: usize = 6;
 
