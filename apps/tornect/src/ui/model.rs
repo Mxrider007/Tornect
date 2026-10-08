@@ -210,6 +210,20 @@ impl Model {
         }
     }
 
+    /// The viewed session went live as `viewing`: no notice code of an
+    /// earlier session's host is kept, so nothing is known of this one's
+    /// until it says.
+    pub fn go_live(&mut self, viewing: Viewing) {
+        self.host_notice = None;
+        self.client = ClientStage::Live(viewing);
+    }
+
+    /// The viewed session's watch returned: its host's notice code goes, so
+    /// none is shown from now on, nor kept for the next session.
+    pub fn end_notices(&mut self) {
+        self.host_notice = None;
+    }
+
     /// How many [`Model::events`] are kept.
     pub const EVENTS_KEPT: usize = 6;
 
@@ -924,4 +938,37 @@ pub enum Check {
     },
     /// It did not, and why.
     Unreachable(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A new viewed session starts with no notice code, whatever the last
+    /// host said, and the code goes once the session's watch returned.
+    #[test]
+    fn a_stale_notice_is_cleared_at_going_live_and_after_the_end() {
+        let viewing = Viewing {
+            host: "Office PC".to_owned(),
+            control: true,
+            administrator: false,
+            unattended: false,
+            since: Instant::now(),
+            pictures: 0,
+            size: (0, 0),
+        };
+        let mut model = Model {
+            host_notice: Some(0x07),
+            ..Model::default()
+        };
+        model.go_live(viewing);
+        assert_eq!(model.host_notice, None);
+        assert!(matches!(model.client, ClientStage::Live(_)));
+        assert_eq!(model.viewer_notice(), None);
+        model.host_notice = Some(0x05);
+        assert_eq!(model.viewer_notice(), Some(0x05));
+        model.end_notices();
+        assert_eq!(model.host_notice, None);
+        assert_eq!(model.viewer_notice(), None);
+    }
 }

@@ -1749,8 +1749,7 @@ async fn viewed(
     }
     *live = Some(sid);
     b.shared.update(|m| {
-        m.host_notice = None;
-        m.client = ClientStage::Live(Viewing {
+        m.go_live(Viewing {
             host: host.clone(),
             control,
             administrator,
@@ -1799,7 +1798,9 @@ async fn viewed(
     )
     .await;
     notices_task.abort();
-    b.shared.update(|m| m.host_notice = None);
+    // Awaited, so that no code the task held lands after the clear.
+    let _ = notices_task.await;
+    b.shared.update(super::model::Model::end_notices);
     b.link.set_input(None);
     Ok(match end? {
         End::You => {
