@@ -69,7 +69,8 @@ pub(crate) const NOTHING_INSTALLED: &str =
 fn at_the_restart_line(folder: &str) -> String {
     format!(
         "Windows removes Tornect's folder ({folder}) at the next restart; until then nothing \
-         starts Tornect from it. Install Tornect again only after that restart."
+         in this account starts Tornect from it, but another account on this computer can \
+         still run it. Install Tornect again only after that restart."
     )
 }
 
