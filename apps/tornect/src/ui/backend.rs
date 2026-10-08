@@ -1867,7 +1867,8 @@ fn classify(err: &HandshakeError, check: Option<CodeCheck>) -> Failure {
     use tornect_signal::envelope::codes::E_VERSION;
     match (err, check) {
         (_, Some(CodeCheck::Differ)) => Failure::CodesDiffer,
-        (_, Some(CodeCheck::Unanswered)) => Failure::TimedOut,
+        // This computer's own question went unanswered: nobody there to blame.
+        (_, Some(CodeCheck::Unanswered)) => Failure::CodeUnanswered,
         (HandshakeError::PairRejected { reason, .. }, _) if *reason == pair_reject::DENIED => {
             Failure::Denied
         }
@@ -1882,6 +1883,8 @@ fn classify(err: &HandshakeError, check: Option<CodeCheck>) -> Failure {
         {
             Failure::TimedOut
         }
+        // A host that stopped answering before anyone was asked anything.
+        (HandshakeError::Timeout("HELLO_ACK" | "AUTH_CHALLENGE"), _) => Failure::Unreachable,
         (HandshakeError::Timeout(_), _) => Failure::TimedOut,
         (HandshakeError::Violation { code, .. } | HandshakeError::PeerError { code, .. }, _)
             if *code == E_VERSION =>
@@ -3037,6 +3040,62 @@ mod tests {
                 note::view_only(named),
                 note::failed_delete(named, "a test keychain"),
             ]
+        );
+    }
+
+    /// A host that stops answering before anything is asked of anyone (its
+    /// `HELLO_ACK`, or an unattended `AUTH_CHALLENGE`) reads as unreachable,
+    /// never as a person who did not answer.
+    #[test]
+    fn a_stalled_host_reads_as_unreachable() {
+        for what in ["HELLO_ACK", "AUTH_CHALLENGE"] {
+            assert_eq!(
+                classify(&HandshakeError::Timeout(what), None),
+                Failure::Unreachable,
+                "{what}"
+            );
+        }
+        // A popup or a pairing question that ran out of time is still the
+        // person's.
+        let popup = HandshakeError::SessionRejected {
+            reject: Box::new(tornect_signal::messages::SessionReject::new(
+                reject::POPUP_TIMEOUT,
+            )),
+        };
+        let pairing = HandshakeError::PairRejected {
+            reason: pair_reject::TIMEOUT,
+            detail: None,
+        };
+        for err in [popup, pairing, HandshakeError::Timeout("SESSION_ACCEPT")] {
+            assert_eq!(classify(&err, None), Failure::TimedOut, "{err}");
+        }
+    }
+
+    /// This computer's own code question, left unanswered, has its own
+    /// words: nobody at the other computer is blamed.
+    #[test]
+    fn an_unanswered_code_question_here_has_its_own_words() {
+        for err in [
+            HandshakeError::Timeout("PAIR_ACCEPT"),
+            HandshakeError::Closed,
+            HandshakeError::PairRejected {
+                reason: pair_reject::TIMEOUT,
+                detail: None,
+            },
+        ] {
+            assert_eq!(
+                classify(&err, Some(CodeCheck::Unanswered)),
+                Failure::CodeUnanswered,
+                "{err}"
+            );
+        }
+        assert_eq!(
+            Failure::CodeUnanswered.title(),
+            "Nobody answered the code question here"
+        );
+        assert_eq!(
+            Failure::CodeUnanswered.advice(),
+            "Nothing was saved. Press Connect again and answer the code question on this computer."
         );
     }
 }

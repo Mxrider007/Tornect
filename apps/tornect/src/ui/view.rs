@@ -893,10 +893,12 @@ fn scam_line(ui: &mut egui::Ui) {
 }
 
 /// A name a device declared, as a sheet quotes it: without quotation marks
-/// or middle dots, which could imitate the sheet's own lines.
+/// or middle dots, which could imitate the sheet's own lines: every one a
+/// label may not hold (`tornect_core::words::label_refusal`).
 fn quoted_free(name: &str) -> String {
+    use tornect_core::words::{MIDDLE_DOTS, QUOTATION_MARKS};
     name.chars()
-        .filter(|c| !matches!(c, '"' | '\u{201c}' | '\u{201d}' | '·' | '•'))
+        .filter(|c| !QUOTATION_MARKS.contains(c) && !MIDDLE_DOTS.contains(c))
         .collect()
 }
 
@@ -3490,5 +3492,25 @@ mod tests {
         let mut actions = pass(t0, vec![egui::Event::PointerMoved(at), press(true)]).0;
         actions.extend(pass(t0 + Duration::from_millis(50), vec![press(false)]).0);
         assert_eq!(actions, vec![Action::Block { id: 9 }]);
+    }
+
+    /// A sheet strips from a quoted name every quotation mark and middle
+    /// dot a label may not hold, the five it always stripped among them.
+    #[test]
+    fn quoted_free_strips_every_quote_and_dot_the_pin_refuses() {
+        use tornect_core::words::{MIDDLE_DOTS, QUOTATION_MARKS, label_refusal};
+        for c in QUOTATION_MARKS.iter().chain(&MIDDLE_DOTS) {
+            let name = format!("Desk{c}of{c}Bob");
+            assert!(label_refusal(&name).is_some(), "{c:?}");
+            assert_eq!(quoted_free(&name), "DeskofBob", "{c:?}");
+        }
+        for c in ['"', '\u{201c}', '\u{201d}', '·', '•'] {
+            assert!(
+                QUOTATION_MARKS.contains(&c) || MIDDLE_DOTS.contains(&c),
+                "{c:?}"
+            );
+        }
+        assert_eq!(QUOTATION_MARKS.len() + MIDDLE_DOTS.len(), 11);
+        assert_eq!(quoted_free("Desk of Bob"), "Desk of Bob");
     }
 }

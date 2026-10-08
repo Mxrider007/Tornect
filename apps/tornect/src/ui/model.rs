@@ -618,6 +618,8 @@ pub enum Failure {
     NotLetIn,
     /// Unattended: the computer's unattended setup was re-created (A16).
     SetupChanged,
+    /// Nobody answered the code question on this computer.
+    CodeUnanswered,
     /// Anything else; the stage's own words say what.
     Other,
 }
@@ -635,6 +637,7 @@ impl Failure {
             Self::WrongPassword => "Wrong password",
             Self::NotLetIn => "The computer did not let this device in",
             Self::SetupChanged => "Its unattended setup was re-created",
+            Self::CodeUnanswered => "Nobody answered the code question here",
             Self::Other => "The connection ended",
         }
     }
@@ -655,6 +658,10 @@ impl Failure {
                  for it, then try again."
             }
             Self::VersionMismatch => "Update Tornect on both computers, then try again.",
+            Self::CodeUnanswered => {
+                "Nothing was saved. Press Connect again and answer the code question on this \
+                 computer."
+            }
             Self::CodesDiffer => {
                 "If the codes differed, something between you may have changed them. Try again \
                  later, ideally after checking the ID with the person at that computer."

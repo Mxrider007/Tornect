@@ -515,6 +515,16 @@ fn list_skeletons() -> &'static std::collections::HashSet<String> {
 /// device's four words already read as its words in the name slot.
 pub const LABEL_LIST_WORDS: usize = 3;
 
+/// The quotation marks a label may not hold ([`label_refusal`]): a sheet
+/// quotes a name between them, and one inside the name could close the
+/// quote early. A sheet strips them from a name it quotes.
+pub const QUOTATION_MARKS: [char; 5] = ['"', '\u{201c}', '\u{201d}', '\u{201e}', '\u{ff02}'];
+
+/// The middle dots a label may not hold ([`label_refusal`]): they could
+/// imitate a sheet's own separators. A sheet strips them from a name it
+/// quotes.
+pub const MIDDLE_DOTS: [char; 6] = ['·', '•', '∙', '⋅', '\u{2027}', '\u{30fb}'];
+
 /// Why `label` may not be pinned as a device's or a computer's name, if it
 /// may not (§B.6.1 item 7: a label never puts words in the name slot, and
 /// never imitates a sheet's own lines): it holds a quotation mark or a
@@ -525,10 +535,10 @@ pub const LABEL_LIST_WORDS: usize = 3;
 /// is not checked again when a sheet shows it.
 #[must_use]
 pub fn label_refusal(label: &str) -> Option<&'static str> {
-    if label.contains(['"', '\u{201c}', '\u{201d}', '\u{201e}', '\u{ff02}']) {
+    if label.contains(QUOTATION_MARKS) {
         return Some("it holds a quotation mark");
     }
-    if label.contains(['·', '•', '∙', '⋅', '\u{2027}', '\u{30fb}']) {
+    if label.contains(MIDDLE_DOTS) {
         return Some("it holds a middle dot");
     }
     let list = wordlist();
