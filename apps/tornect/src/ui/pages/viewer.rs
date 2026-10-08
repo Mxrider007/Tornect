@@ -9,4 +9,8 @@ pub struct ViewerState {
     /// (`Model::screen_shared`), read every frame: the window then names
     /// nobody.
     pub shared: bool,
+    /// The chord took the keyboard back from the remote computer: keys go to
+    /// this window's controls until the chord again, or a press on the
+    /// picture, gives it back.
+    pub keyboard_local: bool,
 }
