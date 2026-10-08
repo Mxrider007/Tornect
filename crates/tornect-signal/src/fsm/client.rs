@@ -18,6 +18,7 @@ use std::time::Duration;
 use ed25519_dalek::VerifyingKey;
 use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tornect_core::levels::Elevation;
 use tornect_core::unattended::hosts::PinCheck;
@@ -279,6 +280,9 @@ pub struct ClientSession<S> {
     /// M2 frames that arrived while [`ClientSession::ping`] waited for its
     /// `PONG`; [`ClientSession::next_event`] hands them out first.
     pending: VecDeque<SessionEvent>,
+    /// The host's last notice code (decision M1-70): `None` until a `PONG`
+    /// that answers this side's `PING` carries one.
+    notices: watch::Sender<Option<u8>>,
 }
 
 impl<S> ClientSession<S>
@@ -330,6 +334,14 @@ where
         TransportPolicy::from_code(self.accept.transport_policy()).unwrap_or_default()
     }
 
+    /// The host's notice code as it changes (decision M1-70, §B.8.4.1): a
+    /// number, the bits of [`messages::notice`], from the last `PONG` that
+    /// answered this side's `PING` and carried one; `None` until then.
+    #[must_use]
+    pub fn notices(&self) -> watch::Receiver<Option<u8>> {
+        self.notices.subscribe()
+    }
+
     /// Send `PING` and wait [`timeouts::PONG`] for the matching `PONG`;
     /// returns the round trip. The Tor circuit is a heartbeat channel in both
     /// directions (§B.2), so a `PING` from the host that arrives meanwhile is
@@ -349,9 +361,12 @@ where
                 return Err(HandshakeError::Closed);
             };
             if rx.env.kind == Kind::Pong {
-                let pong: Pong = self.chan.body(&rx).await?;
+                let pong: messages::HostPong = self.chan.body(&rx).await?;
                 if pong.nonce != nonce {
                     return Err(self.chan.fail(codes::E_BAD_STATE, "pong nonce").await);
+                }
+                if let Some(code) = pong.notice {
+                    self.notices.send_replace(Some(code));
                 }
                 return Ok(start.elapsed());
             }
@@ -780,6 +795,7 @@ where
         asked_elevation: Elevation::None,
         random: Arc::clone(&deps.random),
         pending: VecDeque::new(),
+        notices: watch::Sender::new(None),
     })))
 }
 
@@ -1142,5 +1158,6 @@ where
         asked_elevation: ua.want_elevation,
         random: Arc::clone(&deps.random),
         pending: VecDeque::new(),
+        notices: watch::Sender::new(None),
     })))
 }

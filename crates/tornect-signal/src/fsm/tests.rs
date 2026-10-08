@@ -8719,3 +8719,209 @@ async fn the_panic_keys_suspend_ends_the_device_with_panic() {
     }
     assert_eq!(host.deps.kill.fired(), None, "no host-wide kill");
 }
+
+/// A sink that answers `notice` from a script, one code a call, and keeps nothing else.
+struct ScriptedNotices(Mutex<std::collections::VecDeque<u8>>);
+
+impl SessionSink for ScriptedNotices {
+    fn on_start(&self, _: &LiveSession<'_>) {}
+    fn on_end(&self, _: &str, _: Option<&SessionEnd>) {}
+    fn notice(&self, _: &str) -> Option<u8> {
+        self.0.lock().unwrap().pop_front()
+    }
+}
+
+/// Decision M1-70: the host's notice code goes out in its first `PONG`, 0 included, and
+/// then only when it changes; every other `PONG` has the plain bytes of a host built
+/// before the key.
+#[tokio::test]
+async fn the_host_sends_the_notice_first_and_then_only_when_it_changes() {
+    use crate::messages::{HostPong, encode_body};
+    for (script, want) in [
+        ([0, 0, 4], [Some(0), None, Some(4)]),
+        ([3, 3, 7], [Some(3), None, Some(7)]),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut host = host_side(tmp.path(), HOST_SEED);
+        host.deps.sessions = Arc::new(ScriptedNotices(Mutex::new(script.into())));
+        host.trusted
+            .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+            .unwrap();
+        host.consent
+            .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+        raw.hello_ack().await;
+        assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+        for (nonce, want) in (10u64..).zip(want) {
+            raw.chan.send(&Ping { nonce }, None).await.unwrap();
+            let pong = raw.recv().await.unwrap();
+            assert_eq!(pong.env.kind, Kind::Pong);
+            let expected = match want {
+                Some(code) => encode_body(&HostPong {
+                    nonce,
+                    notice: Some(code),
+                }),
+                None => encode_body(&Pong { nonce }),
+            };
+            assert_eq!(pong.env.body, expected, "{script:?}, nonce {nonce}");
+        }
+        raw.chan.bye(bye::USER).await.unwrap();
+        match task.await.unwrap().unwrap() {
+            HostOutcome::Session { .. } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// A host that answers the client's `PING`s with `answers`: each a `PONG` with the
+/// `PING`'s nonce (or the wrong one) and the given notice; then `BYE`, or after a wrong
+/// nonce the client's `ERROR`.
+fn notice_host(
+    stream: DuplexStream,
+    answers: Vec<(bool, Option<u8>)>,
+) -> tokio::task::JoinHandle<()> {
+    let real = HostIdentity::from_seed(&HOST_SEED);
+    let real_pk = HostSigner::public_key(&real);
+    tokio::spawn(async move {
+        let mut h = RawHost::new(stream, &real_pk);
+        h.take_hello().await;
+        h.ack(&real).await;
+        h.take(Kind::SessionRequest).await;
+        h.chan.send(&genuine_accept(), Some(&real)).await.unwrap();
+        for (right, notice) in answers {
+            let ping = h
+                .chan
+                .recv(Duration::from_secs(5), "ping")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(ping.env.kind, Kind::Ping);
+            let nonce = decode_body::<Ping>(&ping.env.body).unwrap().nonce;
+            let answer = messages::HostPong {
+                nonce: if right { nonce } else { nonce ^ 1 },
+                notice,
+            };
+            h.chan.send(&answer, None).await.unwrap();
+            if !right {
+                let reply = h
+                    .chan
+                    .recv(Duration::from_secs(5), "error")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(reply.env.kind, Kind::Error);
+                return;
+            }
+        }
+        h.chan.bye(bye::USER).await.unwrap();
+    })
+}
+
+/// The client of [`notice_host`]: a session with it.
+async fn notice_client(
+    tmp: &std::path::Path,
+    answers: Vec<(bool, Option<u8>)>,
+) -> (
+    Box<client::ClientSession<DuplexStream>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let host_id = HostIdentity::from_seed(&HOST_SEED).id();
+    let client = client_side(tmp, host_id, CLIENT_SEED);
+    client
+        .known
+        .pin(host_id, "Desk of Bob", host_device_pk())
+        .unwrap();
+    let (a, b) = pipe();
+    let host = notice_host(a, answers);
+    let outcome = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        Intent::Session,
+    )
+    .await
+    .unwrap();
+    let ClientOutcome::Session(session) = outcome else {
+        panic!("expected a session");
+    };
+    (session, host)
+}
+
+/// Decision M1-70: the client publishes the code of each `PONG` that answers its own
+/// `PING` and carries one; a `PONG` without the key keeps the last code.
+#[tokio::test]
+async fn the_client_publishes_the_last_notice_of_a_matching_pong() {
+    let tmp = tempfile::tempdir().unwrap();
+    let answers = vec![
+        (true, Some(5)),
+        (true, None),
+        (true, Some(1)),
+        (true, Some(0)),
+    ];
+    let (mut session, host) = notice_client(tmp.path(), answers).await;
+    let notices = session.notices();
+    assert_eq!(*notices.borrow(), None, "nothing before the first PONG");
+    for want in [Some(5), Some(5), Some(1), Some(0)] {
+        session.ping().await.unwrap();
+        assert_eq!(*notices.borrow(), want);
+    }
+    assert_eq!(
+        session.next_event(Duration::from_secs(5)).await.unwrap(),
+        Some(SessionEvent::Bye {
+            reason: bye::USER,
+            detail: None
+        })
+    );
+    host.await.unwrap();
+}
+
+/// A `PONG` whose nonce is not its `PING`'s is refused before its notice is read:
+/// nothing is published.
+#[tokio::test]
+async fn a_pong_with_a_wrong_nonce_publishes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut session, host) = notice_client(tmp.path(), vec![(false, Some(4))]).await;
+    let notices = session.notices();
+    let err = session.ping().await.unwrap_err();
+    assert_eq!(err.violation_code(), Some(codes::E_BAD_STATE), "{err}");
+    assert_eq!(*notices.borrow(), None);
+    host.await.unwrap();
+}
+
+/// Decision M1-70: `LiveSessions` keeps a notice code only for a live session, sets and
+/// clears its bits only where there is a code, and forgets it when the session ends.
+#[test]
+fn the_notice_is_forgotten_when_the_session_ends() {
+    let live = LiveSessions::new();
+    let token = SessionToken::new([7; 32]);
+    let id = token.session_id();
+    live.set_notice(&id, 1);
+    assert_eq!(live.notice(&id), None, "not live yet");
+    live.on_start(&LiveSession {
+        device: DeviceId::from_bytes([7; 32]),
+        label: "Other",
+        session_id: &id,
+        token: &token,
+        th_final: [0; 32],
+        mode: SessionMode::Control,
+        elevation: tornect_core::levels::Elevation::None,
+        unattended: false,
+    });
+    assert_eq!(live.notice(&id), None, "nothing said yet");
+    live.set_notice_bits(&id, messages::notice::SECURE_SCREEN, true);
+    assert_eq!(live.notice(&id), None, "no code to change");
+    live.set_notice(&id, 3);
+    assert_eq!(live.notice(&id), Some(3));
+    live.set_notice_bits(&id, messages::notice::SECURE_SCREEN, true);
+    assert_eq!(live.notice(&id), Some(7));
+    live.set_notice_bits(&id, messages::notice::SECURE_SCREEN, false);
+    assert_eq!(live.notice(&id), Some(3));
+    assert_eq!(live.notice("another"), None);
+    live.on_end(&id, None);
+    assert_eq!(live.notice(&id), None);
+    live.set_notice(&id, 1);
+    assert_eq!(live.notice(&id), None, "ended");
+}
