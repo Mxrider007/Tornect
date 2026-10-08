@@ -432,6 +432,26 @@ fn check_account(peer: std::io::Result<String>, own: &str, pid: u32) -> Result<(
     }
 }
 
+/// Whether the command line takes the Windows pipe its name file names for a running host
+/// (§B.8.7.4), from what opening it gave (`opened`) and the check of its server's account
+/// (`server_is_ours`, the check `request` makes before anything is sent): a pipe it opened
+/// counts only when that check passes. A name file left by a host that did not stop
+/// cleanly can name a pipe another account made since; that pipe, or one whose server's
+/// account cannot be read, is no host, so the command line falls to the host lock. A pipe
+/// whose every instance is busy counts; no name file, no pipe of that name or a name file
+/// that is not one is no host.
+#[cfg(any(windows, test))]
+fn running<P>(
+    opened: Result<P, IpcError>,
+    server_is_ours: impl FnOnce(&P) -> Result<(), IpcError>,
+) -> bool {
+    match opened {
+        Ok(pipe) => server_is_ours(&pipe).is_ok(),
+        Err(IpcError::Io(e)) => e.raw_os_error() == Some(PIPE_FULL),
+        Err(_) => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unix
 // ---------------------------------------------------------------------------
@@ -617,7 +637,7 @@ mod imp {
     use super::{
         IDLE_TIMEOUT, IpcError, IpcRequest, IpcResponse, MAX_CONNECTIONS, PIPE_NAME_FILE, Path,
         PathBuf, Reply, check_account, claim_first, exchange, new_control_pipe_name,
-        read_pipe_name, remove_pipe_name, serve_frames, write_pipe_name,
+        read_pipe_name, remove_pipe_name, running, serve_frames, write_pipe_name,
     };
     use crate::win::{OwnedHandle, current_user_sid, sid_of, sid_string, token_user, wide};
 
@@ -946,14 +966,14 @@ mod imp {
         exchange(&mut pipe, req).await
     }
 
-    /// Whether a host is serving this state directory right now (a busy pipe
-    /// is one).
+    /// Whether a host of this account is serving this state directory right
+    /// now (a busy pipe is one): a pipe whose server runs as another account,
+    /// or whose account cannot be read, is none (§B.8.7.4).
     pub async fn is_running(state_dir: &Path) -> bool {
-        match open(state_dir, false).await {
-            Ok(_) => true,
-            Err(IpcError::Io(e)) => e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32),
-            Err(_) => false,
-        }
+        running(open(state_dir, false).await, |pipe| {
+            let pid = server_pid(pipe)?;
+            check_account(account_of(pid), &current_user_sid()?, pid)
+        })
     }
 }
 
@@ -999,6 +1019,47 @@ mod pipe_rules {
             matches!(unreadable, Err(IpcError::ForeignAccount { pid: 43 })),
             "{unreadable:?}"
         );
+    }
+
+    /// A name file left by a host that did not stop cleanly is trusted only for a pipe of
+    /// this account: a pipe the command line opened is a running host only when its
+    /// server's account is this account; another account's pipe, one whose account cannot
+    /// be read and one whose server's process cannot be told are not, so the command line
+    /// falls to the host lock (the offline guard when no host holds it). A pipe whose every
+    /// instance is busy still counts; no name file, no pipe and a name file that is not one
+    /// are no host.
+    #[test]
+    fn a_pipe_of_another_account_is_no_running_host() {
+        let own = "S-1-5-21-1000-2000-3000-1001";
+        let opened = || Ok::<(), IpcError>(());
+        assert!(running(opened(), |_| check_account(
+            Ok(own.to_owned()),
+            own,
+            42
+        )));
+        assert!(!running(opened(), |_| check_account(
+            Ok("S-1-5-21-1000-2000-3000-1002".to_owned()),
+            own,
+            42
+        )));
+        assert!(!running(opened(), |_| check_account(
+            Err(std::io::Error::from_raw_os_error(5)),
+            own,
+            43
+        )));
+        assert!(!running(opened(), |_| Err(IpcError::Io(
+            std::io::Error::from_raw_os_error(1)
+        ))));
+        let not_asked = |_: &()| -> Result<(), IpcError> { panic!("no pipe was opened") };
+        let busy = IpcError::Io(std::io::Error::from_raw_os_error(PIPE_FULL));
+        assert!(running(Err(busy), not_asked));
+        for none in [
+            IpcError::NotRunning(PathBuf::from("state")),
+            IpcError::NameFile,
+            IpcError::Io(std::io::Error::from_raw_os_error(2)),
+        ] {
+            assert!(!running(Err(none), not_asked));
+        }
     }
 
     /// The name: `\\.\pipe\tornect-ctl-` and the 32 lowercase hex digits of 16
