@@ -40,7 +40,7 @@ const RELAY_LINE: &str = "Relayed via Tor: quality limited";
 /// the sharing indicator. It names nobody.
 const SHARING_LINE: &str = "This computer's screen is being shared.";
 
-/// The pin's name, for the tooltip and the accessibility tree.
+/// The pin's name, for the accessibility tree.
 const PIN: &str = "Keep this bar shown";
 
 /// The switch that pauses this computer's input, in a control session.
@@ -49,7 +49,7 @@ const PAUSE: &str = "Pause my input";
 /// How far the frame rate looks back.
 const FPS_OVER: Duration = Duration::from_secs(1);
 
-/// The Screenshot button's name, for the tooltip and the accessibility tree.
+/// The Screenshot button's name, for the accessibility tree.
 const SCREENSHOT: &str = "Save a screenshot";
 
 /// How long a toast stays.
@@ -63,7 +63,7 @@ const ADMIN_WINDOWS: &str =
 /// Why Ctrl+Alt+Del is greyed towards a host that said it runs Windows.
 const NOT_ON_WINDOWS: &str = "not possible on Windows computers";
 
-/// The Fullscreen button's name, for the tooltip and the accessibility tree.
+/// The Fullscreen button's name, for the accessibility tree.
 const FULLSCREEN: &str = "Fullscreen";
 
 /// How a screenshot's thread says it went: where the file is, or why not.
@@ -946,7 +946,8 @@ fn details(
 }
 
 /// The pin: a toggle that keeps the toolbar shown. Its only words are its
-/// name, in the tooltip and the accessibility tree.
+/// name, in the accessibility tree: no tooltip, which would float over the
+/// picture beyond the toolbar's areas.
 fn pin(ui: &mut egui::Ui, pinned: bool) -> egui::Response {
     let t = theme::tokens(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), egui::Sense::click());
@@ -970,11 +971,11 @@ fn pin(ui: &mut egui::Ui, pinned: bool) -> egui::Response {
         Stroke::new(1.8, color),
     );
     painter.circle_filled(head, 4.5, color);
-    response.on_hover_text(PIN)
+    response
 }
 
 /// The Fullscreen button: a toggle drawn as four corners. Its only words are
-/// its name, in the tooltip and the accessibility tree.
+/// its name, in the accessibility tree (no tooltip, as for the pin).
 fn corners(ui: &mut egui::Ui, on: bool) -> egui::Response {
     let t = theme::tokens(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), egui::Sense::click());
@@ -999,11 +1000,11 @@ fn corners(ui: &mut egui::Ui, on: bool) -> egui::Response {
         painter.line_segment([corner, corner - vec2(sx * arm, 0.0)], stroke);
         painter.line_segment([corner, corner - vec2(0.0, sy * arm)], stroke);
     }
-    response.on_hover_text(FULLSCREEN)
+    response
 }
 
 /// The Screenshot button: a camera. Its only words are its name, in the
-/// tooltip and the accessibility tree.
+/// accessibility tree (no tooltip, as for the pin).
 fn camera(ui: &mut egui::Ui) -> egui::Response {
     let t = theme::tokens(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), egui::Sense::click());
@@ -1028,7 +1029,7 @@ fn camera(ui: &mut egui::Ui) -> egui::Response {
         CornerRadius::same(1),
         color,
     );
-    response.on_hover_text(SCREENSHOT)
+    response
 }
 
 /// The stream window at 1280 × 760 points, driven one pass at a time with the
@@ -1153,6 +1154,18 @@ pub(crate) mod testing {
                 .and_then(egui::accesskit::Node::bounds)
                 .unwrap_or_else(|| panic!("no \"{text}\" on screen"));
             egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32)
+        }
+
+        /// The centre of every widget whose name starts with `text`, and of
+        /// every text that starts with it: each copy of a line drawn twice.
+        pub(crate) fn centres(&self, text: &str) -> Vec<egui::Pos2> {
+            let starts = |t: Option<&str>| t.is_some_and(|t| t.starts_with(text));
+            self.nodes
+                .iter()
+                .filter(|n| starts(n.label()) || starts(n.value()))
+                .filter_map(egui::accesskit::Node::bounds)
+                .map(|b| egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
+                .collect()
         }
 
         /// A click at `at` on the widget named `text`, in two passes (down,
