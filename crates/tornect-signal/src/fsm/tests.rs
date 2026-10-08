@@ -8354,6 +8354,143 @@ async fn a_panic_before_the_pake_suspends_nothing() {
     );
 }
 
+/// §B.8.7.4, Part C row 9a: a kill with another reason right after the panic key (Stop
+/// sharing, the window closed, Ctrl+C, `unattended off`) does not take the suspend back.
+/// The goodbye carries the later reason, and the grant of the live unattended session
+/// the panic ended is suspended all the same (`Suspended{Panic}`, one `PanicDisconnect`
+/// line).
+#[tokio::test]
+async fn a_panic_then_another_kill_still_suspends_a_live_unattended_session() {
+    use tornect_core::levels::FixedFacts;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, guard) =
+        unattended_pair_edited(tmp.path(), PW, Arc::new(FixedFacts::linux()), |_| {});
+    host.cfg.orphan_timeout = None;
+    host.cfg.idle_timeout = Duration::from_secs(30);
+    let device = client.identity.id();
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let ClientOutcome::Session(mut session) = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .unwrap() else {
+        panic!("no session");
+    };
+    session.ping().await.unwrap();
+    // At once: the session sees only the later reason.
+    host.deps.kill.kill(bye::PANIC);
+    host.deps.kill.kill(bye::USER);
+    assert_eq!(
+        session.next_event(Duration::from_secs(1)).await.unwrap(),
+        Some(SessionEvent::Bye {
+            reason: bye::USER,
+            detail: None
+        })
+    );
+    match task.await.unwrap().unwrap() {
+        HostOutcome::Session { end, .. } => assert_eq!(end, SessionEnd::Killed(bye::USER)),
+        other => panic!("{other:?}"),
+    }
+    let (state, lines) = panic_trace(&guard, &device);
+    assert!(suspended_by_panic(&state), "{state:?}");
+    assert_eq!(lines, 1);
+}
+
+/// §B.8.7.4: a guard sees every panic fired after it was armed, whatever kill fires after
+/// the panic; never one fired before it was armed, and never the end of one device with the
+/// panic's reason (the guard's own suspend ends that device so).
+#[test]
+fn a_guard_sees_a_panic_since_it_was_armed_whatever_fires_after() {
+    use tornect_core::unattended::guard::EndScope;
+    let kill = KillSwitch::new();
+    let armed = kill.arm();
+    assert!(!armed.panicked_since_arm());
+    kill.kill(bye::PANIC);
+    let later = kill.arm();
+    kill.kill(bye::USER);
+    assert!(
+        armed.panicked_since_arm(),
+        "a later kill does not hide the panic"
+    );
+    assert!(!later.panicked_since_arm(), "a panic before it was armed");
+    let device = DeviceId::from_bytes([1; 32]);
+    let mut watching = kill.arm();
+    watching.watch_device(device);
+    kill.end_device_with(&device, EndScope::Every, bye::PANIC);
+    assert!(
+        !watching.panicked_since_arm(),
+        "the end of one device is no panic"
+    );
+}
+
+/// The person at the host presses the panic key while the block window is up and at once
+/// Stop sharing (or closes the window), then the window ends without Block.
+struct PanicThenStopDuringTheWindow(KillSwitch);
+
+impl crate::consent::BlockWindow for PanicThenStopDuringTheWindow {
+    fn run<'a>(
+        &'a self,
+        _: u8,
+        _: &'a tornect_core::unattended::grant::GrantId,
+        _: &'a str,
+    ) -> BoxFuture<'a, BlockOutcome> {
+        Box::pin(async move {
+            self.0.kill(bye::PANIC);
+            self.0.kill(bye::USER);
+            BlockOutcome::Passed(WindowPassed::Elapsed)
+        })
+    }
+}
+
+/// §B.8.7.4, Part C row 9a: a kill with another reason right after the panic key does not
+/// take the suspend back on the refusal path either: an unattended request past its PAKE
+/// is refused as the Block the panic stands for, nothing starts, and its grant is
+/// suspended (`Suspended{Panic}`, one `PanicDisconnect` line).
+#[tokio::test]
+async fn a_panic_then_another_kill_still_suspends_a_refused_unattended_request() {
+    use tornect_core::levels::FixedFacts;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, guard) =
+        unattended_pair_edited(tmp.path(), PW, Arc::new(FixedFacts::linux()), |_| {});
+    host.deps.block_window = Arc::new(PanicThenStopDuringTheWindow(host.deps.kill.clone()));
+    let sink = Arc::new(CountingSink::default());
+    host.deps.activity = sink.live.clone();
+    host.deps.sessions = sink.clone();
+    let device = client.identity.id();
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .expect_err("refused");
+    assert!(
+        matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == reject::BLOCKED_BY_LOCAL_USER),
+        "{err}"
+    );
+    match task.await.unwrap().unwrap() {
+        HostOutcome::SessionRejected { reason, .. } => {
+            assert_eq!(reason, reject::BLOCKED_BY_LOCAL_USER);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0, "nothing started");
+    let (state, lines) = panic_trace(&guard, &device);
+    assert!(suspended_by_panic(&state), "{state:?}");
+    assert_eq!(lines, 1);
+}
+
 /// §B.8.4.1: "End the session there" (`end_session`) ends the requester's own session:
 /// P's live unattended session gets `BYE{ADMIN_END}` within 1 s, while another device's
 /// session goes on.
