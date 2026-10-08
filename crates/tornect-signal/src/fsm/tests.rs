@@ -8491,6 +8491,126 @@ async fn a_panic_then_another_kill_still_suspends_a_refused_unattended_request()
     assert_eq!(lines, 1);
 }
 
+/// The host's own unattended hook, with the panic key pressed while its read after the
+/// reservation runs.
+struct PanicDuringTheRead {
+    inner: Arc<dyn UnattendedHook>,
+    kill: KillSwitch,
+}
+
+impl UnattendedHook for PanicDuringTheRead {
+    fn handle<'a>(
+        &'a self,
+        ctx: UnattendedContext<'a>,
+    ) -> BoxFuture<'a, Result<UnattendedVerdict, HandshakeError>> {
+        self.inner.handle(ctx)
+    }
+
+    fn reserved<'a>(
+        &'a self,
+        device: &'a DeviceId,
+        proof: ConsentProof,
+    ) -> BoxFuture<'a, Result<ConsentProof, messages::SessionReject>> {
+        self.kill.kill(bye::PANIC);
+        self.inner.reserved(device, proof)
+    }
+
+    fn panicked(&self, device: &DeviceId) {
+        self.inner.panicked(device);
+    }
+}
+
+/// §B.8.7.4, Part C row 9a: a panic while the read after the reservation runs refuses the
+/// unattended request past its PAKE as the Block it stands for, nothing starts, and then
+/// its grant is suspended (`Suspended{Panic}`, one `PanicDisconnect` line): the panic
+/// check after that read suspends as the one before it does.
+#[tokio::test]
+async fn a_panic_during_the_read_after_the_reservation_suspends_the_grant() {
+    use tornect_core::levels::FixedFacts;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, guard) =
+        unattended_pair_edited(tmp.path(), PW, Arc::new(FixedFacts::linux()), |_| {});
+    host.deps.unattended = Arc::new(PanicDuringTheRead {
+        inner: Arc::clone(&host.deps.unattended),
+        kill: host.deps.kill.clone(),
+    });
+    let sink = Arc::new(CountingSink::default());
+    host.deps.activity = sink.live.clone();
+    host.deps.sessions = sink.clone();
+    let device = client.identity.id();
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .expect_err("refused");
+    assert!(
+        matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == reject::BLOCKED_BY_LOCAL_USER),
+        "{err}"
+    );
+    match task.await.unwrap().unwrap() {
+        HostOutcome::SessionRejected { reason, .. } => {
+            assert_eq!(reason, reject::BLOCKED_BY_LOCAL_USER);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0, "nothing started");
+    let (state, lines) = panic_trace(&guard, &device);
+    assert!(suspended_by_panic(&state), "{state:?}");
+    assert_eq!(lines, 1);
+}
+
+/// §B.8.7.4, Part C row 9a: a panic pressed once the host had armed the stream and before
+/// the PAKE, when the right password and the block window then pass, refuses that request
+/// as the Block it stands for, and suspends its grant, since the request got past its
+/// PAKE (`Suspended{Panic}`, one `PanicDisconnect` line).
+#[tokio::test]
+async fn a_panic_before_the_pake_then_the_right_password_suspends_the_grant() {
+    use tornect_core::levels::FixedFacts;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, guard) =
+        unattended_pair_edited(tmp.path(), PW, Arc::new(FixedFacts::linux()), |_| {});
+    let sink = Arc::new(CountingSink::default());
+    host.deps.activity = sink.live.clone();
+    host.deps.sessions = sink.clone();
+    let device = client.identity.id();
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    // The host armed this stream (it waits for HELLO), then the panic key.
+    tokio::task::yield_now().await;
+    host.deps.kill.kill(bye::PANIC);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .expect_err("refused");
+    assert!(
+        matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == reject::BLOCKED_BY_LOCAL_USER),
+        "{err}"
+    );
+    match task.await.unwrap().unwrap() {
+        HostOutcome::SessionRejected { reason, .. } => {
+            assert_eq!(reason, reject::BLOCKED_BY_LOCAL_USER);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0, "nothing started");
+    let (state, lines) = panic_trace(&guard, &device);
+    assert!(suspended_by_panic(&state), "{state:?}");
+    assert_eq!(lines, 1);
+}
+
 /// §B.8.4.1: "End the session there" (`end_session`) ends the requester's own session:
 /// P's live unattended session gets `BYE{ADMIN_END}` within 1 s, while another device's
 /// session goes on.
