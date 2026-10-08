@@ -2667,6 +2667,68 @@ mod tests {
         );
     }
 
+    /// Nothing else drawn over the picture forwards a press, a wheel turn or
+    /// a move either: the help line, the open details, the open Send keys
+    /// menu, a toast and the administrator-windows line (under the toolbar
+    /// and in the details), all up at once in a control session; beside them
+    /// the picture still takes a press. To a screen reader the picture is
+    /// "The remote screen", fitted and at its own size.
+    #[test]
+    fn a_press_on_a_line_a_menu_or_a_toast_never_reaches_the_host() {
+        let mut w = Window::new(true);
+        w.viewer.details = true;
+        w.viewer.keys_menu = true;
+        w.viewer.host_notice = Some(0x02);
+        w.pass(ms(0), Vec::new());
+        w.viewer
+            .screenshot_done()
+            .send(Err(io::ErrorKind::NotFound.into()))
+            .unwrap();
+        w.pass(ms(100), Vec::new());
+        w.pass(ms(100), Vec::new());
+        assert!(w.has("The remote screen"), "fitted: {:?}", w.texts());
+        let picture = w.drawn.expect("a picture");
+        let mut forwarder = Forwarder::new(true);
+        hand_areas(&w, &mut forwarder);
+        for name in [
+            "While this window has the focus, your keyboard goes to Desk.",
+            "Route",
+            "Print Screen",
+            "The screenshot could not be saved.",
+            "Some windows here run as administrator;",
+        ] {
+            let all = w.centres(name);
+            assert!(!all.is_empty(), "no \"{name}\": {:?}", w.texts());
+            for at in all {
+                assert!(picture.contains(at), "{name} is over the picture");
+                forwarder.moved((f64::from(at.x), f64::from(at.y)));
+                forwarder.button(Button::Left, true);
+                forwarder.button(Button::Left, false);
+                forwarder.wheel((0.0, 1.0), (0.0, 0.0));
+                forwarder.flush();
+                assert!(forwarder.drain().is_empty(), "{name} at {at:?}");
+            }
+        }
+        forwarder.moved((60.0, 650.0));
+        forwarder.button(Button::Left, true);
+        assert!(
+            forwarder
+                .drain()
+                .contains(&tornect_input::InputEvent::PointerButton {
+                    button: Button::Left,
+                    pressed: true
+                })
+        );
+        w.viewer.one_to_one = true;
+        w.pass(ms(200), Vec::new());
+        w.pass(ms(200), Vec::new());
+        assert!(
+            w.has("The remote screen"),
+            "at its own size: {:?}",
+            w.texts()
+        );
+    }
+
     /// Every action of the viewer, at every signed level, on a closed and an
     /// open forwarder: the forwarder stays as it was built, a closed one
     /// sends nothing, and the only command any of them gives is End.
