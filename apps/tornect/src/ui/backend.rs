@@ -388,6 +388,7 @@ struct GuiSessions {
 impl SessionSink for GuiSessions {
     fn on_start(&self, session: &LiveSession<'_>) {
         self.live.on_start(session);
+        crate::secure_screen::on_start(&self.live, session, cfg!(windows));
         self.polkit.on_start(session);
         self.media.on_start(session);
         self.started.send_modify(|n| *n = n.wrapping_add(1));
@@ -421,6 +422,7 @@ impl SessionSink for GuiSessions {
         #[cfg(windows)]
         if control {
             let (shared, id) = (Arc::clone(&self.shared), session.session_id.to_owned());
+            let (sessions, told_id) = (Arc::clone(&self.live), id.clone());
             tokio::spawn(async move {
                 let live = {
                     let shared = Arc::clone(&shared);
@@ -431,11 +433,8 @@ impl SessionSink for GuiSessions {
                     crate::secure_screen::EVERY,
                     live,
                     move |shown| {
-                        let line = if shown {
-                            crate::secure_screen::NOTICE
-                        } else {
-                            crate::secure_screen::NOTICE_GONE
-                        };
+                        // The viewer is told too, by the bit its PONGs carry.
+                        let line = crate::secure_screen::on_change(&sessions, &told_id, shown);
                         tracing::info!("{line}");
                         shared.update(|m| m.note(line.to_owned()));
                     },
@@ -443,6 +442,10 @@ impl SessionSink for GuiSessions {
                 .await;
             });
         }
+    }
+
+    fn notice(&self, session_id: &str) -> Option<u8> {
+        self.live.notice(session_id)
     }
 
     fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
