@@ -1439,6 +1439,49 @@ mod tests {
         assert!(renew_pin(&paths, &desk).is_err());
         assert!(belt(&paths, &saved, &desk).is_err());
         assert_eq!(std::fs::read(paths.hosts_file()).unwrap(), before);
+        // Every other operation that saves `hosts.toml` holds the lock too: each one
+        // that went on without it is named here.
+        let mut went_on = Vec::new();
+        let fresh = host(6);
+        let settled = settle(&paths, &saved, &fresh, ACCEPTED, &typed("pw", true));
+        if settled.is_ok() || saved.erase(&fresh).unwrap() {
+            went_on.push("settle");
+        }
+        if settle_admin(&paths, &saved, &fresh, &admin_answer(Some(0))).is_ok() {
+            went_on.push("settle_admin");
+        }
+        if std::fs::read(paths.hosts_file()).unwrap() != before {
+            went_on.push("a settle wrote hosts.toml");
+        }
+        // A remembered password whose keychain entry is gone, and one still there,
+        // made while the lock can be taken.
+        std::fs::remove_dir(&lock).unwrap();
+        let (vanished, kept) = (host(7), host(8));
+        for h in [vanished, kept] {
+            assert!(
+                settle(&paths, &saved, &h, ACCEPTED, &typed("pw", true))
+                    .unwrap()
+                    .remembered
+            );
+        }
+        assert!(saved.erase(&vanished).unwrap());
+        let before = std::fs::read(paths.hosts_file()).unwrap();
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        if recall_for_use(&paths, &saved, &vanished).is_ok() {
+            went_on.push("recall_for_use");
+        }
+        if !matches!(forget(&paths, &saved, &kept), Err(Kept::Record(_))) {
+            went_on.push("forget");
+        }
+        if forget_all(&paths, &saved).is_ok() {
+            went_on.push("forget_all");
+        }
+        if std::fs::read(paths.hosts_file()).unwrap() != before {
+            went_on.push("a flag cleared or a record removed in hosts.toml");
+        }
+        assert!(went_on.is_empty(), "without the lock: {went_on:?}");
+        assert!(!saved.erase(&kept).unwrap(), "Forget deleted the password");
     }
 
     /// A pin check whose lock cannot be taken answers `Mismatch`, so no proof is
