@@ -455,6 +455,10 @@ fn apply_viewer_action(
             viewer.keys_menu = false;
             None
         }
+        Action::Viewer(ViewerAction::OneToOne(on)) => {
+            viewer.one_to_one = *on;
+            None
+        }
         // The switch, in a control session only: the one way to resume.
         Action::Viewer(ViewerAction::Pause(pause)) => {
             if viewing.is_some_and(|v| v.control) {
@@ -1033,8 +1037,9 @@ impl App {
         // What the toolbar drew over the picture never forwards its clicks.
         let ppp = f64::from(view.surface.ctx.pixels_per_point());
         let blocked = view.viewer.areas().iter().map(|r| to_pixels(*r, ppp));
+        let visible = view.viewer.visible().map(|r| to_pixels(r, ppp));
         view.forwarder
-            .set_areas(drawn.map(|r| to_pixels(r, ppp)), None, blocked.collect());
+            .set_areas(drawn.map(|r| to_pixels(r, ppp)), visible, blocked.collect());
         for action in actions {
             self.act(action, None);
         }
@@ -2439,7 +2444,7 @@ mod tests {
     fn hand_areas(w: &Window, forwarder: &mut Forwarder) {
         forwarder.set_areas(
             w.drawn.map(|r| to_pixels(r, 1.0)),
-            None,
+            w.viewer.visible().map(|r| to_pixels(r, 1.0)),
             w.viewer
                 .areas()
                 .iter()
@@ -2578,6 +2583,8 @@ mod tests {
             Action::Viewer(ViewerAction::SendKeys(Combo::AltTab)),
             Action::Viewer(ViewerAction::SendKeys(Combo::Super)),
             Action::Viewer(ViewerAction::SendKeys(Combo::PrintScreen)),
+            Action::Viewer(ViewerAction::OneToOne(true)),
+            Action::Viewer(ViewerAction::OneToOne(false)),
         ];
         let w = Window::new(true);
         for open in [false, true] {
@@ -2760,5 +2767,90 @@ mod tests {
             ]
         );
         assert!(!w.viewer.keys_menu, "sending closes the menu");
+    }
+
+    /// At its own size, scrolled: a 2000 × 1200 picture in a 1000 × 600
+    /// view scrolled by (500, 300) puts the picture's centre under the
+    /// view's centre, in the wire's units; drawn in the window, the picture
+    /// keeps its size, and only the part on screen counts.
+    #[test]
+    fn one_to_one_maps_the_pointer_with_the_scroll_offset() {
+        use super::super::pages::viewer::one_to_one_rect;
+        let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+        let picture = one_to_one_rect(view, egui::vec2(500.0, 300.0), egui::vec2(2000.0, 1200.0));
+        assert_eq!(
+            picture,
+            egui::Rect::from_min_size(egui::pos2(-500.0, -300.0), egui::vec2(2000.0, 1200.0))
+        );
+        let mut forwarder = Forwarder::new(true);
+        forwarder.set_areas(
+            Some(to_pixels(picture, 1.0)),
+            Some(to_pixels(view, 1.0)),
+            Vec::new(),
+        );
+        forwarder.moved((500.0, 300.0));
+        forwarder.flush();
+        let centre = (
+            tornect_input::normalize(1000.0, 2000.0),
+            tornect_input::normalize(600.0, 1200.0),
+        );
+        assert_eq!(
+            forwarder.drain(),
+            vec![tornect_input::InputEvent::PointerMove {
+                x: centre.0,
+                y: centre.1
+            }]
+        );
+        // Half of the picture on each axis, to within one of its pixels.
+        assert!((f64::from(centre.0) / 65_535.0 - 0.5).abs() <= 1.0 / 2000.0);
+        assert!((f64::from(centre.1) / 65_535.0 - 0.5).abs() <= 1.0 / 1200.0);
+        // In the window: the 1600 × 900 picture at its own size, not fitted.
+        let mut w = Window::new(true);
+        w.viewer.one_to_one = true;
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        let drawn = w.drawn.expect("a picture");
+        assert_eq!(drawn.size(), egui::vec2(1600.0, 900.0));
+        let visible = w.viewer.visible().expect("a part on screen");
+        assert!(
+            visible.width() < 1280.0 && visible.height() < 760.0,
+            "{visible:?}"
+        );
+    }
+
+    /// At its own size, a press on the picture outside the part on screen,
+    /// or on a scroll bar, never counts; inside it, it does.
+    #[test]
+    fn a_press_outside_the_visible_part_never_counts() {
+        let mut w = Window::new(true);
+        w.viewer.one_to_one = true;
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        let mut forwarder = Forwarder::new(true);
+        hand_areas(&w, &mut forwarder);
+        let (drawn, visible) = (w.drawn.unwrap(), w.viewer.visible().unwrap());
+        for at in [
+            // the vertical bar, beside the visible part
+            egui::pos2(visible.right() + 2.0, visible.center().y),
+            // the horizontal bar
+            egui::pos2(visible.center().x, visible.bottom() + 2.0),
+        ] {
+            assert!(drawn.contains(at), "{at:?} is on the whole picture");
+            forwarder.moved((f64::from(at.x), f64::from(at.y)));
+            on_button(&mut forwarder, &mut w.viewer, Button::Left, true);
+            on_button(&mut forwarder, &mut w.viewer, Button::Left, false);
+        }
+        forwarder.flush();
+        assert!(forwarder.drain().is_empty());
+        forwarder.moved((640.0, 500.0));
+        on_button(&mut forwarder, &mut w.viewer, Button::Left, true);
+        assert!(
+            forwarder
+                .drain()
+                .contains(&tornect_input::InputEvent::PointerButton {
+                    button: Button::Left,
+                    pressed: true
+                })
+        );
     }
 }
