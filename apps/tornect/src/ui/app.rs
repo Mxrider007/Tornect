@@ -19,6 +19,7 @@ use egui_wgpu::{
 };
 use tokio::sync::mpsc;
 use tornect_core::levels::AdminPath;
+use tornect_input::Button;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
@@ -379,6 +380,47 @@ struct StreamView {
     /// The window's own state, built with it and dropped with it: nothing
     /// in it outlives the session.
     viewer: ViewerState,
+    /// The viewer's own chord (decision M1-70), seeing every key first.
+    chord: keys::Chord,
+}
+
+/// One key of the stream window, through the chord first (decision M1-70).
+/// `true` when it goes to the window's own controls.
+fn on_key(
+    chord: &mut keys::Chord,
+    forwarder: &mut Forwarder,
+    viewer: &mut ViewerState,
+    key: keys::KeyInput,
+) -> bool {
+    match keys::key_route(chord, viewer.keyboard_local, forwarder.is_open(), key) {
+        keys::Route::Host { usb, pressed } => forwarder.key(usb, pressed),
+        keys::Route::Window => return true,
+        keys::Route::Nowhere => {}
+        keys::Route::TakeBack => {
+            // The modifiers pressed before the M already went to the host:
+            // it lets go of everything first.
+            forwarder.release_all();
+            viewer.keyboard_local = true;
+        }
+        keys::Route::GiveBack => viewer.keyboard_local = false,
+    }
+    false
+}
+
+/// A pointer button of the stream window: a press that goes to the host
+/// also gives it the keyboard back.
+fn on_button(forwarder: &mut Forwarder, viewer: &mut ViewerState, button: Button, pressed: bool) {
+    if pressed && forwarder.counts_press() {
+        viewer.keyboard_local = false;
+    }
+    forwarder.button(button, pressed);
+}
+
+/// The stream window lost the keyboard: the chord forgets its modifiers,
+/// and the host lets go of everything this viewer holds.
+fn on_focus_lost(chord: &mut keys::Chord, forwarder: &mut Forwarder) {
+    chord.reset();
+    forwarder.focus_lost();
 }
 
 /// The application: the main window, the stream window while a session is
@@ -543,6 +585,7 @@ impl App {
                             last_flush: Instant::now(),
                             input_sent: 0,
                             viewer: ViewerState::default(),
+                            chord: keys::Chord::default(),
                         });
                     }
                     Err(e) => {
@@ -1141,24 +1184,31 @@ impl App {
                 view.surface.resized(size.width, size.height);
                 return;
             }
-            // Keys go to the host by physical scancode, and never to egui
-            // during a control session (slice.md §2).
+            // Every key goes through the chord first; keys go to the host by
+            // physical scancode, and never to egui while the keyboard is on
+            // the host in a control session (slice.md §2).
             WindowEvent::KeyboardInput {
                 event: key,
                 is_synthetic,
                 ..
-            } if control => {
-                // Synthetic events are winit's replay of keys held when the
-                // focus moved; the host lets go of those on focus loss. The
-                // host's own autorepeat repeats a held key.
-                if !*is_synthetic
-                    && !key.repeat
-                    && let Some(usb) = keys::usb_for_physical_key(key.physical_key)
-                {
-                    view.forwarder.key(usb, key.state == ElementState::Pressed);
+            } => {
+                let input = keys::KeyInput {
+                    usb: keys::usb_for_physical_key(key.physical_key),
+                    pressed: key.state == ElementState::Pressed,
+                    repeat: key.repeat,
+                    synthetic: *is_synthetic,
+                    is_m: keys::is_m(key),
+                };
+                if on_key(
+                    &mut view.chord,
+                    &mut view.forwarder,
+                    &mut view.viewer,
+                    input,
+                ) {
+                    view.surface.on_event(&event);
                 }
             }
-            WindowEvent::ModifiersChanged(_) if control => {}
+            WindowEvent::ModifiersChanged(_) if control && !view.viewer.keyboard_local => {}
             WindowEvent::CursorMoved { position, .. } => {
                 view.forwarder.moved((position.x, position.y));
                 view.surface.on_event(&event);
@@ -1171,7 +1221,12 @@ impl App {
                 state, button: b, ..
             } => {
                 if let Some(b) = button(*b) {
-                    view.forwarder.button(b, *state == ElementState::Pressed);
+                    on_button(
+                        &mut view.forwarder,
+                        &mut view.viewer,
+                        b,
+                        *state == ElementState::Pressed,
+                    );
                 }
                 view.surface.on_event(&event);
             }
@@ -1185,7 +1240,7 @@ impl App {
                 view.surface.on_event(&event);
             }
             WindowEvent::Focused(false) => {
-                view.forwarder.focus_lost();
+                on_focus_lost(&mut view.chord, &mut view.forwarder);
                 view.surface.on_event(&event);
             }
             _ => view.surface.on_event(&event),
@@ -2066,9 +2121,6 @@ mod tests {
         assert!(!comes_back(&WindowEvent::RedrawRequested));
     }
 
-    /// The indicator's Stop asks the tokio side to stop sharing, as the
-    /// banner's does, and nothing else; moving it with no window up does
-    /// nothing.
     /// The window titles, which the window manager, the taskbar, Alt+Tab,
     /// screen-share pickers and an attention request show, name nobody: the
     /// main window is "Tornect", the stream window "Tornect: remote screen",
@@ -2085,6 +2137,9 @@ mod tests {
         assert_eq!(indicator::TITLE, "Tornect: sharing");
     }
 
+    /// The indicator's Stop asks the tokio side to stop sharing, as the
+    /// banner's does, and nothing else; moving it with no window up does
+    /// nothing.
     #[test]
     fn the_indicators_stop_asks_to_stop_sharing() {
         let shared = Shared::new(Model::default(), Arc::new(|_| {}));
@@ -2096,5 +2151,203 @@ mod tests {
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
         app.act(Action::MoveIndicator, None);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    const CTRL: u32 = 0x07_00e0;
+    const ALT: u32 = 0x07_00e2;
+    const SHIFT: u32 = 0x07_00e1;
+    const KEY_M: u32 = 0x07_0010;
+    const KEY_A: u32 = 0x07_0004;
+
+    fn press(usb: u32) -> keys::KeyInput {
+        keys::KeyInput {
+            usb: Some(usb),
+            pressed: true,
+            repeat: false,
+            synthetic: false,
+            is_m: usb == KEY_M,
+        }
+    }
+
+    fn release(usb: u32) -> keys::KeyInput {
+        keys::KeyInput {
+            pressed: false,
+            ..press(usb)
+        }
+    }
+
+    fn key(usb: u32, pressed: bool) -> tornect_input::InputEvent {
+        tornect_input::InputEvent::Key { usb, pressed }
+    }
+
+    /// The stream window's input of one session, as `sync_stream` builds it,
+    /// with a picture drawn over the whole of a 1000 × 600 window.
+    fn viewer(control: bool) -> (keys::Chord, Forwarder, ViewerState) {
+        let mut forwarder = Forwarder::new(control);
+        forwarder.set_picture(Some(PictureRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 600.0,
+        }));
+        (keys::Chord::default(), forwarder, ViewerState::default())
+    }
+
+    /// Feed `keys` to the window; whether each went to its own controls.
+    fn type_keys(
+        (chord, forwarder, viewer): &mut (keys::Chord, Forwarder, ViewerState),
+        keys: &[keys::KeyInput],
+    ) -> Vec<bool> {
+        keys.iter()
+            .map(|k| on_key(chord, forwarder, viewer, *k))
+            .collect()
+    }
+
+    /// The chord in a control session: the modifiers pressed before the M
+    /// went to the host, then exactly one ReleaseAll; the M itself, pressed
+    /// or released, never goes there, nor do the modifiers let go of after.
+    #[test]
+    fn the_chord_releases_everything_and_never_forwards_its_key() {
+        let mut window = viewer(true);
+        type_keys(
+            &mut window,
+            &[
+                press(CTRL),
+                press(ALT),
+                press(SHIFT),
+                press(KEY_M),
+                release(KEY_M),
+                release(SHIFT),
+                release(ALT),
+                release(CTRL),
+            ],
+        );
+        assert_eq!(
+            window.1.drain(),
+            vec![
+                key(CTRL, true),
+                key(ALT, true),
+                key(SHIFT, true),
+                tornect_input::InputEvent::ReleaseAll,
+            ]
+        );
+        assert!(window.2.keyboard_local);
+    }
+
+    /// In a view-only session the chord sends nothing, nor does anything
+    /// else: the keys go to the window's own controls, the chord's M nowhere.
+    #[test]
+    fn the_chord_in_a_view_only_session_sends_nothing() {
+        let mut window = viewer(false);
+        let chord = [
+            press(CTRL),
+            press(ALT),
+            press(SHIFT),
+            press(KEY_M),
+            release(KEY_M),
+            release(SHIFT),
+            release(ALT),
+            release(CTRL),
+        ];
+        for _ in 0..2 {
+            let to_window = type_keys(&mut window, &chord);
+            assert_eq!(
+                to_window,
+                [true, true, true, false, false, true, true, true],
+                "the M of the chord goes nowhere"
+            );
+        }
+        window.1.moved((500.0, 300.0));
+        on_button(&mut window.1, &mut window.2, Button::Left, true);
+        on_button(&mut window.1, &mut window.2, Button::Left, false);
+        on_focus_lost(&mut window.0, &mut window.1);
+        window.1.flush();
+        assert!(window.1.drain().is_empty());
+    }
+
+    /// After the chord, keys go to this window and none to the host until
+    /// the chord again, or a press on the picture, gives the keyboard back;
+    /// the chord sends no key of its own either way.
+    #[test]
+    fn after_the_chord_no_key_goes_to_the_host_until_it_is_given_back() {
+        let chord = [
+            press(CTRL),
+            press(ALT),
+            press(SHIFT),
+            press(KEY_M),
+            release(KEY_M),
+            release(SHIFT),
+            release(ALT),
+            release(CTRL),
+        ];
+        let mut window = viewer(true);
+        type_keys(&mut window, &chord);
+        window.1.drain();
+        assert_eq!(
+            type_keys(&mut window, &[press(KEY_A), release(KEY_A)]),
+            [true, true]
+        );
+        assert!(
+            window.1.drain().is_empty(),
+            "typed while the keyboard is here"
+        );
+        // The chord again: back to the host, its own keys not sent; the
+        // modifiers let go of after it go out as releases the host drops.
+        type_keys(&mut window, &chord);
+        assert!(!window.2.keyboard_local);
+        assert_eq!(
+            window.1.drain(),
+            vec![key(SHIFT, false), key(ALT, false), key(CTRL, false)]
+        );
+        assert_eq!(
+            type_keys(&mut window, &[press(KEY_A), release(KEY_A)]),
+            [false, false]
+        );
+        assert_eq!(window.1.drain(), vec![key(KEY_A, true), key(KEY_A, false)]);
+        // A press on the picture gives it back too, and goes to the host.
+        type_keys(&mut window, &chord);
+        window.1.drain();
+        window.1.moved((2000.0, 300.0)); // off the picture
+        on_button(&mut window.1, &mut window.2, Button::Left, true);
+        on_button(&mut window.1, &mut window.2, Button::Left, false);
+        assert!(window.2.keyboard_local, "a press off the picture");
+        assert!(window.1.drain().is_empty());
+        window.1.moved((500.0, 300.0));
+        on_button(&mut window.1, &mut window.2, Button::Left, true);
+        assert!(!window.2.keyboard_local);
+        type_keys(&mut window, &[press(KEY_A)]);
+        let sent = window.1.drain();
+        assert_eq!(
+            sent[1..],
+            [
+                tornect_input::InputEvent::PointerButton {
+                    button: Button::Left,
+                    pressed: true
+                },
+                key(KEY_A, true)
+            ],
+            "{sent:?}"
+        );
+    }
+
+    /// A focus loss makes the chord forget the modifiers held before it: an
+    /// M pressed after it is an M for the host.
+    #[test]
+    fn focus_loss_forgets_the_chords_modifiers() {
+        let mut window = viewer(true);
+        type_keys(&mut window, &[press(CTRL), press(ALT), press(SHIFT)]);
+        on_focus_lost(&mut window.0, &mut window.1);
+        assert_eq!(type_keys(&mut window, &[press(KEY_M)]), [false]);
+        assert!(!window.2.keyboard_local);
+        assert_eq!(
+            window.1.drain(),
+            vec![
+                key(CTRL, true),
+                key(ALT, true),
+                key(SHIFT, true),
+                tornect_input::InputEvent::ReleaseAll,
+                key(KEY_M, true),
+            ]
+        );
     }
 }

@@ -5,6 +5,12 @@
 //! maps it to the USB HID usage that travels on the wire, with
 //! `tornect_input::keymap::by_win` on Windows (Set-1, E0 in the high byte) and
 //! `by_evdev` on Linux (X11 and Wayland keycodes minus 8).
+//!
+//! Every key goes through the viewer's own chord first, Ctrl+Alt+Shift+M
+//! (decision M1-70): it takes the keyboard back from the remote computer, and
+//! its M never reaches it.
+
+use std::collections::BTreeSet;
 
 use tornect_input::keymap;
 
@@ -53,6 +59,157 @@ pub fn usb_for_physical_key(key: winit::keyboard::PhysicalKey) -> Option<u32> {
 #[must_use]
 pub fn usb_for_physical_key(_: winit::keyboard::PhysicalKey) -> Option<u32> {
     None
+}
+
+/// Whether `key` is the layout's M, the chord's letter, whatever the
+/// modifiers and Caps Lock say.
+#[cfg(any(windows, target_os = "linux"))]
+#[must_use]
+pub fn is_m(key: &winit::event::KeyEvent) -> bool {
+    use winit::keyboard::Key;
+    use winit::platform::modifier_supplement::KeyEventExtModifierSupplement as _;
+    matches!(key.key_without_modifiers(), Key::Character(c) if c.eq_ignore_ascii_case("m"))
+}
+
+/// Where winit gives no key without its modifiers: the physical M.
+#[cfg(not(any(windows, target_os = "linux")))]
+#[must_use]
+pub fn is_m(key: &winit::event::KeyEvent) -> bool {
+    use winit::keyboard::{KeyCode, PhysicalKey};
+    key.physical_key == PhysicalKey::Code(KeyCode::KeyM)
+}
+
+/// The chord's modifiers by USB usage, the left and the right key of each.
+const CONTROL: [u32; 2] = [0x07_00e0, 0x07_00e4];
+const ALT: [u32; 2] = [0x07_00e2, 0x07_00e6];
+const SHIFT: [u32; 2] = [0x07_00e1, 0x07_00e5];
+
+/// Whether `usb` is one of the chord's modifiers.
+fn is_modifier(usb: u32) -> bool {
+    [CONTROL, ALT, SHIFT].iter().any(|pair| pair.contains(&usb))
+}
+
+/// One physical key event as plain values (a winit `KeyEvent` cannot be
+/// built in a test).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyInput {
+    /// The key's USB usage, if the key table has a row for it.
+    pub usb: Option<u32>,
+    /// Down (`true`) or up.
+    pub pressed: bool,
+    /// The platform's repeat of a held key.
+    pub repeat: bool,
+    /// winit's replay of a key held when the window got or lost the focus.
+    pub synthetic: bool,
+    /// The layout's M.
+    pub is_m: bool,
+}
+
+/// What a key event is to the chord.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChordKey {
+    /// Not the chord's.
+    Other,
+    /// The chord: a fresh M press while Control, Alt and Shift are held.
+    Chord,
+    /// A later event of the M that made the chord: a repeat, or its release.
+    Swallow,
+}
+
+/// Follows Control, Alt and Shift, either side, from the physical keys it is
+/// fed, and tells the chord. Only a fresh M press makes it: not a repeat,
+/// and not winit's replay of a held key, which updates the modifiers only.
+#[derive(Debug, Default)]
+pub struct Chord {
+    /// The modifiers held, by USB usage.
+    held: BTreeSet<u32>,
+    /// The M that made the chord is down.
+    m_down: bool,
+    /// That M's USB usage.
+    m_usb: Option<u32>,
+}
+
+impl Chord {
+    /// Feed one key event.
+    pub fn feed(&mut self, key: KeyInput) -> ChordKey {
+        if let Some(usb) = key.usb
+            && is_modifier(usb)
+        {
+            if key.pressed {
+                self.held.insert(usb);
+            } else {
+                self.held.remove(&usb);
+            }
+        }
+        if self.m_down && key.is_m && key.usb == self.m_usb {
+            if !key.pressed {
+                self.m_down = false;
+            }
+            return ChordKey::Swallow;
+        }
+        if key.pressed && !key.repeat && !key.synthetic && key.is_m && self.modifiers_held() {
+            self.m_down = true;
+            self.m_usb = key.usb;
+            return ChordKey::Chord;
+        }
+        ChordKey::Other
+    }
+
+    /// The window lost the focus: a modifier let go of elsewhere is not
+    /// remembered as held.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn modifiers_held(&self) -> bool {
+        [CONTROL, ALT, SHIFT]
+            .iter()
+            .all(|pair| pair.iter().any(|usb| self.held.contains(usb)))
+    }
+}
+
+/// Where a key event of the stream window goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// To the remote computer.
+    Host {
+        /// The key's USB usage.
+        usb: u32,
+        /// Down (`true`) or up.
+        pressed: bool,
+    },
+    /// To the window's own controls.
+    Window,
+    /// Nowhere.
+    Nowhere,
+    /// The chord with the keyboard on the remote computer: everything held
+    /// there is let go of first, then the keyboard stays here.
+    TakeBack,
+    /// The chord with the keyboard here: it goes back to the remote computer.
+    GiveBack,
+}
+
+/// Where `key` goes, the chord seeing it first, in control (`open`) and
+/// view-only sessions alike. While the keyboard is here (`local`), and in a
+/// view-only session, keys go to the window's controls, never to the remote
+/// computer. Otherwise a key with a usage goes there, but not winit's replay
+/// of a key held when the focus moved (the host lets go of those on focus
+/// loss) nor the platform's repeat (the host repeats a held key itself).
+#[must_use]
+pub fn key_route(chord: &mut Chord, local: bool, open: bool, key: KeyInput) -> Route {
+    match chord.feed(key) {
+        ChordKey::Chord if open && local => Route::GiveBack,
+        ChordKey::Chord => Route::TakeBack,
+        ChordKey::Swallow => Route::Nowhere,
+        ChordKey::Other if !open || local => Route::Window,
+        ChordKey::Other => match key.usb {
+            Some(usb) if !key.synthetic && !key.repeat => Route::Host {
+                usb,
+                pressed: key.pressed,
+            },
+            _ => Route::Nowhere,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -138,6 +295,140 @@ mod tests {
         }
         // evdev 240 is KEY_UNKNOWN, what winit reports for an unidentified key.
         assert_eq!(usb_from_scancode(KeyPlatform::Linux, 240), None);
+    }
+
+    const CTRL: u32 = 0x07_00e0;
+    const ALT_L: u32 = 0x07_00e2;
+    const SHIFT_L: u32 = 0x07_00e1;
+    const KEY_M: u32 = 0x07_0010;
+    const KEY_G: u32 = 0x07_000a;
+    const END: u32 = 0x07_004d;
+
+    fn press(usb: u32) -> KeyInput {
+        KeyInput {
+            usb: Some(usb),
+            pressed: true,
+            repeat: false,
+            synthetic: false,
+            is_m: usb == KEY_M,
+        }
+    }
+
+    fn release(usb: u32) -> KeyInput {
+        KeyInput {
+            pressed: false,
+            ..press(usb)
+        }
+    }
+
+    /// Control, Alt and Shift on either side, in any mix, then M: the chord.
+    #[test]
+    fn either_side_of_each_modifier_makes_the_chord() {
+        for control in CONTROL {
+            for alt in ALT {
+                for shift in SHIFT {
+                    let mut chord = Chord::default();
+                    for usb in [control, alt, shift] {
+                        assert_eq!(chord.feed(press(usb)), ChordKey::Other);
+                    }
+                    assert_eq!(
+                        chord.feed(press(KEY_M)),
+                        ChordKey::Chord,
+                        "{control:x} {alt:x} {shift:x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The panic key (Ctrl+Alt+End), gaming mode's exit (Ctrl+Alt+G) and
+    /// Ctrl+Alt+M without Shift are not the chord.
+    #[test]
+    fn the_panic_key_and_the_gaming_chord_are_not_the_chord() {
+        for keys in [
+            [CTRL, ALT_L, END],
+            [CTRL, ALT_L, KEY_G],
+            [CTRL, ALT_L, KEY_M],
+        ] {
+            let mut chord = Chord::default();
+            for usb in keys {
+                assert_eq!(chord.feed(press(usb)), ChordKey::Other, "{keys:x?}");
+            }
+        }
+    }
+
+    /// winit's replay of held keys when the window gets the focus updates
+    /// the modifiers but never makes the chord itself.
+    #[test]
+    fn a_synthetic_press_never_makes_the_chord() {
+        let replayed = |usb| KeyInput {
+            synthetic: true,
+            ..press(usb)
+        };
+        let mut chord = Chord::default();
+        for usb in [CTRL, ALT_L, SHIFT_L] {
+            chord.feed(press(usb));
+        }
+        assert_eq!(chord.feed(replayed(KEY_M)), ChordKey::Other);
+        assert_eq!(chord.feed(release(KEY_M)), ChordKey::Other);
+        // Modifiers held when the focus came back count for a real M.
+        let mut chord = Chord::default();
+        for usb in [CTRL, ALT_L, SHIFT_L] {
+            assert_eq!(chord.feed(replayed(usb)), ChordKey::Other);
+        }
+        assert_eq!(chord.feed(press(KEY_M)), ChordKey::Chord);
+    }
+
+    /// The chord's M makes it once; its repeats and its release are
+    /// swallowed, so a held chord never flips the keyboard twice.
+    #[test]
+    fn holding_the_chord_does_not_flip_the_keyboard() {
+        let mut chord = Chord::default();
+        for usb in [CTRL, ALT_L, SHIFT_L] {
+            chord.feed(press(usb));
+        }
+        let mut seen = vec![chord.feed(press(KEY_M))];
+        for _ in 0..10 {
+            seen.push(chord.feed(KeyInput {
+                repeat: true,
+                ..press(KEY_M)
+            }));
+        }
+        seen.push(chord.feed(release(KEY_M)));
+        assert_eq!(seen[0], ChordKey::Chord);
+        assert!(
+            seen[1..].iter().all(|k| *k == ChordKey::Swallow),
+            "{seen:?}"
+        );
+        // The route: the keyboard comes here once; nothing goes anywhere else.
+        let mut chord = Chord::default();
+        let mut routes = Vec::new();
+        let mut local = false;
+        for key in [press(CTRL), press(ALT_L), press(SHIFT_L), press(KEY_M)]
+            .into_iter()
+            .chain((0..10).map(|_| KeyInput {
+                repeat: true,
+                ..press(KEY_M)
+            }))
+            .chain([release(KEY_M)])
+        {
+            let route = key_route(&mut chord, local, true, key);
+            if route == Route::TakeBack {
+                local = true;
+            }
+            routes.push(route);
+        }
+        assert_eq!(
+            routes.iter().filter(|r| **r == Route::TakeBack).count(),
+            1,
+            "{routes:?}"
+        );
+        assert!(!routes.contains(&Route::GiveBack), "{routes:?}");
+        assert!(
+            routes[4..].iter().all(|r| *r == Route::Nowhere),
+            "{routes:?}"
+        );
+        assert!(local);
     }
 
     /// On this machine, through winit itself: each key's physical code goes

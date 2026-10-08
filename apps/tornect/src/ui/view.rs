@@ -3085,7 +3085,10 @@ mod tests {
             size: (1600, 900),
         };
         for shared in [false, true] {
-            let mut viewer = ViewerState { shared };
+            let mut viewer = ViewerState {
+                shared,
+                ..ViewerState::default()
+            };
             let texts = viewer_texts(&viewing, &mut viewer);
             assert_eq!(
                 texts.iter().any(|t| t.contains("Desk")),
