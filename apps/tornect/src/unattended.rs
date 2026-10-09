@@ -104,78 +104,25 @@ impl HostContext {
 }
 
 /// `tornect service install` (`install = Some(elevated)`) or `uninstall`
-/// (`None`): §B.8.7.4's `ServiceInstall`/`ServiceUninstall`.
-///
-/// Order: the backend's preflight first (no dialog for a change that can never
-/// be made), then the guard — no remote session for 60 s, a fresh OS
-/// re-authentication, the session check again, and the `AutostartChanged{by}`
-/// line written *before* the effect, so no change can happen unlogged — then
-/// the OS registration. A registration that then fails is answered as a
-/// failure and logged as one (`ok: false`), next to the authorised line. No
-/// store write (§B.8.7.4).
+/// (`None`): §B.8.7.4's `ServiceInstall`/`ServiceUninstall`, through the
+/// control channel or offline. A running host refuses an install before
+/// anything else (its backend registers the host's own executable); the
+/// change itself is [`autostart_change`], which the window runs too.
 fn service_change(ctx: &HostContext, id: u64, by: Actor, install: Option<bool>) -> IpcResponse {
-    let (op, what) = match install {
-        Some(elevated) => (ExternalOp::ServiceInstall { elevated }, "install"),
-        None => (ExternalOp::ServiceUninstall, "uninstall"),
-    };
-    match install {
-        Some(elevated) => {
-            // Slice-F F2-3: a running host's backend was built when the host
-            // started, from its own executable, so through it `install` would
-            // register that binary (or a path deleted since), not the
-            // `tornect` the user ran. Refused before the dialog.
-            if ctx.kill.is_some() {
-                return IpcResponse::fail(id, codes::G_PRECONDITION, HOST_ROUTE_INSTALL);
-            }
-            // r7: the whole-host elevated task is gone (an older command
-            // line may still ask for it), refused before any dialog.
-            if elevated {
-                return IpcResponse::fail(id, codes::G_PRECONDITION, autostart::ELEVATED_TASK_GONE);
-            }
-            if let Err(e) = ctx.autostart.preflight(elevated) {
-                return IpcResponse::fail(id, codes::G_PRECONDITION, e.to_string());
-            }
-        }
-        // Removing nothing changes nothing: no dialog, no log line.
-        None => match ctx.autostart.status() {
-            Ok(AutostartState::Absent) => {
-                let mut r = IpcResponse::ok(id);
-                r.detail = Some(describe_autostart(&*ctx.autostart, &AutostartState::Absent));
-                return r;
-            }
-            Ok(AutostartState::Unavailable(why)) => {
-                return IpcResponse::fail(
-                    id,
-                    codes::G_PRECONDITION,
-                    format!("start at login is unavailable here: {why}"),
-                );
-            }
-            Ok(AutostartState::Registered(_)) | Err(_) => {}
-        },
+    // Slice-F F2-3: a running host's backend was built when the host started,
+    // from its own executable, so through it `install` would register that
+    // binary (or a path deleted since), not the `tornect` the user ran.
+    // Refused before the dialog.
+    if install.is_some() && ctx.kill.is_some() {
+        return IpcResponse::fail(id, codes::G_PRECONDITION, HOST_ROUTE_INSTALL);
     }
-    if let Err(ref e) = ctx.guard.authorize(by, &op) {
-        // Slice-F F2-4: while the keystore cannot be read, a removal is refused
-        // too (its line could only be buffered). Say first how to do it by
-        // hand: the detail is cut at `MAX_STRING` characters.
-        if install.is_none() && matches!(e, GuardError::KeystoreLocked(_)) {
-            return IpcResponse::fail(
-                id,
-                e.code(),
-                format!(
-                    "the keystore cannot be read, so this removal could not be logged and was \
-                     refused; {} ({e})",
-                    ctx.autostart.manual_removal()
-                ),
-            );
+    match autostart_change(&ctx.guard, &*ctx.autostart, by, install) {
+        Ok(AutostartChange::NothingToRemove) => {
+            let mut r = IpcResponse::ok(id);
+            r.detail = Some(describe_autostart(&*ctx.autostart, &AutostartState::Absent));
+            r
         }
-        return guard_fail(id, e);
-    }
-    let done = match install {
-        Some(elevated) => ctx.autostart.install(elevated),
-        None => ctx.autostart.uninstall(),
-    };
-    match done {
-        Ok(state) => {
+        Ok(AutostartChange::Done(state)) => {
             let mut r = IpcResponse::ok(id);
             let mut said = describe_autostart(&*ctx.autostart, &state);
             if install.is_none() && ctx.kill.is_some() {
@@ -188,6 +135,97 @@ fn service_change(ctx: &HostContext, id: u64, by: Actor, install: Option<bool>) 
             r.detail = Some(said);
             r
         }
+        Err(refused) => IpcResponse::fail(id, refused.code, refused.detail),
+    }
+}
+
+/// What a start-at-login change did.
+#[derive(Debug)]
+pub(crate) enum AutostartChange {
+    /// Registered or removed: what is registered now.
+    Done(AutostartState),
+    /// A removal with nothing registered: no dialog, no log line.
+    NothingToRemove,
+}
+
+/// Why a start-at-login change was not made: the `G_*` code and the reason.
+#[derive(Debug)]
+pub(crate) struct AutostartRefused {
+    /// The `G_*` code (§B.8.7.4).
+    pub code: u16,
+    /// The reason, as the command line says it.
+    pub detail: String,
+}
+
+/// Change what starts at login (`install = Some(elevated)`, or `None` to
+/// remove it) through `guard` as `by`, with the registration `autostart`.
+///
+/// Order: the backend's preflight first (no dialog for a change that can
+/// never be made), then the guard — no remote session for 60 s, a fresh OS
+/// re-authentication, the session check again, and the `AutostartChanged{by}`
+/// line written *before* the effect, so no change can happen unlogged — then
+/// the OS registration. A registration that then fails is answered as a
+/// failure and logged as one (`ok: false`), next to the authorised line. No
+/// store write (§B.8.7.4).
+pub(crate) fn autostart_change(
+    guard: &MutationGuard,
+    autostart: &dyn Autostart,
+    by: Actor,
+    install: Option<bool>,
+) -> Result<AutostartChange, AutostartRefused> {
+    let refused = |code, detail: String| AutostartRefused { code, detail };
+    let (op, what) = match install {
+        Some(elevated) => (ExternalOp::ServiceInstall { elevated }, "install"),
+        None => (ExternalOp::ServiceUninstall, "uninstall"),
+    };
+    match install {
+        Some(elevated) => {
+            // r7: the whole-host elevated task is gone (an older command
+            // line may still ask for it), refused before any dialog.
+            if elevated {
+                return Err(refused(
+                    codes::G_PRECONDITION,
+                    autostart::ELEVATED_TASK_GONE.to_owned(),
+                ));
+            }
+            if let Err(e) = autostart.preflight(elevated) {
+                return Err(refused(codes::G_PRECONDITION, e.to_string()));
+            }
+        }
+        // Removing nothing changes nothing: no dialog, no log line.
+        None => match autostart.status() {
+            Ok(AutostartState::Absent) => return Ok(AutostartChange::NothingToRemove),
+            Ok(AutostartState::Unavailable(why)) => {
+                return Err(refused(
+                    codes::G_PRECONDITION,
+                    format!("start at login is unavailable here: {why}"),
+                ));
+            }
+            Ok(AutostartState::Registered(_)) | Err(_) => {}
+        },
+    }
+    if let Err(ref e) = guard.authorize(by, &op) {
+        // Slice-F F2-4: while the keystore cannot be read, a removal is refused
+        // too (its line could only be buffered). Say first how to do it by
+        // hand: the detail is cut at `MAX_STRING` characters.
+        if install.is_none() && matches!(e, GuardError::KeystoreLocked(_)) {
+            return Err(refused(
+                e.code(),
+                format!(
+                    "the keystore cannot be read, so this removal could not be logged and was \
+                     refused; {} ({e})",
+                    autostart.manual_removal()
+                ),
+            ));
+        }
+        return Err(refused(e.code(), e.to_string()));
+    }
+    let done = match install {
+        Some(elevated) => autostart.install(elevated),
+        None => autostart.uninstall(),
+    };
+    match done {
+        Ok(state) => Ok(AutostartChange::Done(state)),
         Err(e) => {
             let rec = tornect_core::session_log::SessionRecord::at(
                 wall_now(),
@@ -197,10 +235,10 @@ fn service_change(ctx: &HostContext, id: u64, by: Actor, install: Option<bool>) 
             .detail(format!("{what} failed"))
             .ok(false)
             .reason(e.to_string());
-            if let Err(log_err) = ctx.guard.store().log_event(&rec) {
+            if let Err(log_err) = guard.store().log_event(&rec) {
                 tracing::warn!(error = %log_err, "could not log the failed autostart change");
             }
-            IpcResponse::fail(id, codes::G_PRECONDITION, e.to_string())
+            Err(refused(codes::G_PRECONDITION, e.to_string()))
         }
     }
 }
@@ -2494,93 +2532,14 @@ mod tests {
 
     use super::*;
 
+    use crate::test_support::FakeAutostart;
+
     const HOST_PK: [u8; 32] = [0x42; 32];
 
     struct Env {
         _tmp: tempfile::TempDir,
         ctx: HostContext,
         autostart: Arc<FakeAutostart>,
-    }
-
-    /// A start-at-login backend that records what it was asked and answers
-    /// as scripted.
-    #[derive(Default)]
-    struct FakeAutostart {
-        installs: std::sync::Mutex<Vec<bool>>,
-        uninstalls: std::sync::atomic::AtomicUsize,
-        state: std::sync::Mutex<Option<AutostartState>>,
-        /// `Some`: `preflight` refuses with this reason.
-        refuse: Option<String>,
-        /// `Some`: `install`/`uninstall` fail with this reason after preflight.
-        fail: Option<String>,
-        /// `Some`: `status` fails with this reason.
-        unreadable_status: Option<String>,
-    }
-
-    impl FakeAutostart {
-        fn installs(&self) -> Vec<bool> {
-            self.installs.lock().unwrap().clone()
-        }
-
-        fn uninstalls(&self) -> usize {
-            self.uninstalls.load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
-    impl Autostart for FakeAutostart {
-        fn preflight(&self, _elevated: bool) -> Result<(), autostart::AutostartError> {
-            match &self.refuse {
-                Some(why) => Err(autostart::AutostartError::Unavailable(why.clone())),
-                None => Ok(()),
-            }
-        }
-
-        fn install(&self, elevated: bool) -> Result<AutostartState, autostart::AutostartError> {
-            self.preflight(elevated)?;
-            self.installs.lock().unwrap().push(elevated);
-            if let Some(why) = &self.fail {
-                return Err(autostart::AutostartError::Failed(why.clone()));
-            }
-            let state = AutostartState::Registered(autostart::Registration {
-                enabled: true,
-                elevated,
-                command: Some("\"/opt/tornect\" \"host\"".to_owned()),
-                note: None,
-                unreadable: false,
-            });
-            *self.state.lock().unwrap() = Some(state.clone());
-            Ok(state)
-        }
-
-        fn uninstall(&self) -> Result<AutostartState, autostart::AutostartError> {
-            self.uninstalls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if let Some(why) = &self.fail {
-                return Err(autostart::AutostartError::Failed(why.clone()));
-            }
-            *self.state.lock().unwrap() = None;
-            Ok(AutostartState::Absent)
-        }
-
-        fn status(&self) -> Result<AutostartState, autostart::AutostartError> {
-            if let Some(why) = &self.unreadable_status {
-                return Err(autostart::AutostartError::Failed(why.clone()));
-            }
-            Ok(self
-                .state
-                .lock()
-                .unwrap()
-                .clone()
-                .unwrap_or(AutostartState::Absent))
-        }
-
-        fn describe(&self) -> String {
-            "the test's start-at-login backend".to_owned()
-        }
-
-        fn manual_removal(&self) -> String {
-            "remove it by hand as the test says".to_owned()
-        }
     }
 
     /// A context wired like the offline CLI, but with re-authentication

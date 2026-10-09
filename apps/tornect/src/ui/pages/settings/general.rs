@@ -6,7 +6,7 @@
 use egui::{RichText, Ui};
 use tornect_core::config::Theme;
 
-use super::super::super::model::{Model, SettingsChange};
+use super::super::super::model::{ManagerOp, Model, SettingsChange};
 use super::super::super::theme::{self, Face};
 use super::super::super::view::Action;
 use super::super::super::widgets::{self, Button, Kind};
@@ -30,6 +30,44 @@ pub(in super::super) const THEMES: [(Theme, &str); 3] = [
 
 /// The longest name `config.toml` keeps, in bytes.
 pub(in super::super) const NAME_MAX: usize = 64;
+
+/// The switch of §B.1.1.
+pub(in super::super) const SIGN_IN: &str = "Start Tornect when I sign in";
+
+/// What the switch says before it acts, after the command line's sentence
+/// on Tor (§B.1.1, as approved).
+pub(in super::super) const WHILE_IT_RUNS: &str = "While Tornect runs, devices you gave unattended \
+    access can connect, new devices can ask to pair, and anyone with this computer's Tornect ID \
+    can see that it is online.";
+
+/// The answer that turns the start at sign-in on, after the text.
+pub(in super::super) const TURN_ON: &str = "Turn on";
+
+/// When what starts at sign-in cannot be read or changed here.
+pub(in super::super) const SIGN_IN_UNAVAILABLE: &str =
+    "What starts at sign-in cannot be read on this computer.";
+
+/// That Tornect must be closed for its install or removal (§B.1.1).
+pub(in super::super) const CLOSE_FIRST: &str = "Close Tornect before installing or removing it.";
+
+/// The install's state and its command.
+#[must_use]
+pub(in super::super) fn install_lines(installed: Option<bool>) -> [&'static str; 2] {
+    match installed {
+        Some(true) => [
+            "Installed.",
+            "To remove it: tornect uninstall in a terminal.",
+        ],
+        Some(false) => [
+            "Not installed.",
+            "To install it: tornect install in a terminal.",
+        ],
+        None => [
+            "Whether Tornect is installed could not be read.",
+            "To install it: tornect install in a terminal.",
+        ],
+    }
+}
 
 /// The General section.
 pub(super) fn section(
@@ -113,4 +151,82 @@ pub(super) fn section(
     {
         actions.push(Action::SaveSettings(SettingsChange::Theme(*theme)));
     }
+    ui.add_space(20.0);
+    sign_in(ui, model, form, actions);
+}
+
+/// The start at sign-in (§B.1.1): the switch, as the system says it is now;
+/// turning it on first says what it means, with Cancel first; then one
+/// operation of the window host's guard (the same as `tornect service
+/// install`), and the switch moves only on its answer. And whether Tornect
+/// is installed, with the command that installs or removes it.
+fn sign_in(ui: &mut Ui, model: &Model, form: &mut SettingsForm, actions: &mut Vec<Action>) {
+    let t = theme::tokens(ui.ctx());
+    widgets::section_header(ui, "Start at sign-in");
+    ui.add_space(6.0);
+    match &model.manager {
+        None => {
+            form.sign_in_asking = false;
+            line(ui, super::security::NO_GUARD, t.text_secondary);
+        }
+        Some(manager) => match manager.sign_in {
+            None => {
+                form.sign_in_asking = false;
+                line(ui, SIGN_IN_UNAVAILABLE, t.text_secondary);
+            }
+            Some(registered) => {
+                ui.add_enabled_ui(!model.manager_busy, |ui| {
+                    ui.horizontal(|ui| {
+                        let mut on = registered;
+                        if widgets::toggle(ui, &mut on, SIGN_IN).changed() {
+                            if on {
+                                form.sign_in_asking = true;
+                            } else {
+                                actions.push(Action::Manager(ManagerOp::SignIn(false)));
+                            }
+                        }
+                        ui.label(SIGN_IN);
+                    });
+                });
+                if registered {
+                    form.sign_in_asking = false;
+                }
+                if form.sign_in_asking {
+                    line(
+                        ui,
+                        &format!("{} {WHILE_IT_RUNS}", crate::unattended::TOR_AT_SIGN_IN),
+                        t.text_primary,
+                    );
+                    ui.horizontal(|ui| {
+                        if Button::new(Kind::Secondary, "Cancel")
+                            .small()
+                            .show(ui)
+                            .clicked()
+                        {
+                            form.sign_in_asking = false;
+                        }
+                        if Button::new(Kind::Primary, TURN_ON)
+                            .small()
+                            .enabled(!model.manager_busy)
+                            .show(ui)
+                            .clicked()
+                        {
+                            actions.push(Action::Manager(ManagerOp::SignIn(true)));
+                            form.sign_in_asking = false;
+                        }
+                    });
+                }
+            }
+        },
+    }
+    if let Some(note) = model.manager_note {
+        line(ui, note, t.danger_text);
+    }
+    ui.add_space(20.0);
+    widgets::section_header(ui, "Installation");
+    ui.add_space(6.0);
+    for text in install_lines(model.manager.as_ref().and_then(|m| m.installed)) {
+        line(ui, text, t.text_secondary);
+    }
+    line(ui, CLOSE_FIRST, t.text_muted);
 }

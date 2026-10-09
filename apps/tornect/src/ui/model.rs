@@ -983,6 +983,13 @@ pub struct Manager {
     pub prevent_idle_lock: bool,
     /// See [`Manager::keep_awake`].
     pub notify: bool,
+    /// What starts at sign-in, as the system says it now: `Some(true)` when
+    /// Tornect is registered, `Some(false)` when nothing is, `None` when it
+    /// cannot be read or is unavailable here.
+    pub sign_in: Option<bool>,
+    /// Whether Tornect is installed on this computer, by the install's own
+    /// probe; `None` when it cannot be read.
+    pub installed: Option<bool>,
 }
 
 /// A device that can connect here without asking, as the manager shows it
@@ -1010,9 +1017,9 @@ pub struct GrantRow {
 /// side runs through the window host's guard as the window (`Actor::Ui`);
 /// the page changes only on the guard's answer. Turn off, Pause, Revoke all,
 /// Suspend, Disable, Revoke and Remove are deny-direction and ask no
-/// password; Turn on, Enable, Unlock, Resume and the host settings are
-/// access-increasing: one dialog each, never during or 60 s after a remote
-/// session.
+/// password; Turn on, Enable, Unlock, Resume, the host settings and the
+/// start at sign-in are access-increasing: one dialog each, never during or
+/// 60 s after a remote session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagerOp {
     /// Turn unattended access on: a new emergency stop code is shown once.
@@ -1027,6 +1034,9 @@ pub enum ManagerOp {
     Resume(DeviceId),
     /// Change one host setting kept in the store.
     Setting(HostSetting),
+    /// Start Tornect when this user signs in, or stop doing so (§B.1.1): the
+    /// same guard operation as `tornect service install|uninstall`.
+    SignIn(bool),
     /// Turn unattended access off.
     Off,
     /// Pause unattended access: only while no pause runs, so that no choice
