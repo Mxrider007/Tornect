@@ -37,8 +37,8 @@ use super::block::GuiBlockWindow;
 use super::book::{self, Change};
 use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
 use super::model::{
-    CaptureNote, Check, ClientStage, Dial, Failure, Hosting, Settings, SettingsChange, Shared,
-    Sharing, TorState, UnattendedBanner, Viewing, Wake,
+    CaptureNote, Check, ClientStage, Dial, Failure, GrantRow, Hosting, Manager, Settings,
+    SettingsChange, Shared, Sharing, TorState, UnattendedBanner, Viewing, Wake,
 };
 use super::recognize::Lookalike;
 use super::stream::{FrameSlot, SlotSink};
@@ -392,12 +392,114 @@ impl BannerWatch {
     }
 }
 
+/// How often Settings, Security's view of unattended access is read again
+/// from the window host's guard.
+const MANAGER_EVERY: Duration = Duration::from_secs(30);
+
+/// Settings, Security's view of unattended access for the window host
+/// (§B.8.7.3): a copy of the host's context, read on a blocking thread at the
+/// host role's start, every [`MANAGER_EVERY`] and after each answer of the
+/// guard, so that opening a page asks for nothing. It writes nothing.
+struct ManagerWatch {
+    ctx: crate::unattended::HostContext,
+    words: Arc<super::recognize::Recognizer>,
+}
+
+impl ManagerWatch {
+    /// The readiness rows as the host last probed them, with the rows this
+    /// process knows at once: the panic key, and in background mode whether
+    /// the indicator was shown. The start at sign-in is not asked of the
+    /// system here: on Windows that runs `schtasks`, which would open a
+    /// console window from this windowed program at every read.
+    fn readiness(&self) -> tornect_core::unattended::readiness::ReadinessSnapshot {
+        use tornect_core::unattended::readiness::Probe;
+        use tornect_platform::hotkey::{self, KeyState};
+        let mut snap = self.ctx.readiness.get();
+        snap.panic_key = match hotkey::state() {
+            KeyState::Bound => Probe::Ok,
+            state => Probe::Fail(state.row().to_owned()),
+        };
+        if let Some(shown) = &self.ctx.indicator {
+            snap.consent_indicator = shown.row();
+        }
+        snap
+    }
+
+    /// Unattended access as the store and the readiness rows say it now.
+    fn read(&self) -> Manager {
+        use tornect_core::unattended::readiness::Probe;
+        use tornect_core::words::Role;
+        let now = tornect_core::trusted::unix_now();
+        let readiness = self.readiness();
+        let not_ready = readiness.badge();
+        let rows: Vec<(&'static str, Probe)> = readiness
+            .fields()
+            .iter()
+            .map(|(name, probe)| (*name, (*probe).clone()))
+            .collect();
+        let store = self.ctx.guard.store();
+        let report = store.status_report(readiness);
+        let given_by = store
+            .read(|s| {
+                s.grants
+                    .iter()
+                    .map(|g| (g.id, g.created_by))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let paused_until = report.paused_until.filter(|until| *until > now);
+        let grants: Vec<GrantRow> = report
+            .grants
+            .iter()
+            .map(|g| GrantRow {
+                label: g.label.clone(),
+                words: self
+                    .words
+                    .known()
+                    .cached(g.device.public_key_bytes(), Role::Device)
+                    .map(|h| h.words()),
+                created_by: given_by
+                    .iter()
+                    .find(|(id, _)| *id == g.id)
+                    .map(|(_, by)| *by),
+                last_used: g.last_used,
+                state: g.state.clone(),
+                failures: g.failures_since_unlock,
+            })
+            .collect();
+        let without_asking = if report.enabled && paused_until.is_none() {
+            grants.iter().filter(|g| g.state == "active").count()
+        } else {
+            0
+        };
+        Manager {
+            on: report.enabled,
+            paused_until,
+            without_asking,
+            grants,
+            readiness: rows,
+            not_ready,
+        }
+    }
+
+    /// Put unattended access as it is now into the model.
+    fn refresh(&self, shared: &Shared) {
+        let view = Some(self.read());
+        if shared.read(|m| m.manager != view) {
+            shared.update(|m| m.manager = view);
+        }
+    }
+}
+
 /// The host role, once wired.
 struct Hosted {
     serving: Arc<(HostConfig, HostDeps)>,
     /// The banner of devices that can connect without asking (a host with its
     /// unattended store).
     banner: Option<Arc<BannerWatch>>,
+    /// Settings, Security's view of unattended access (a host with its
+    /// unattended store).
+    manager: Option<Arc<ManagerWatch>>,
     media: Arc<MediaHost>,
     live: Arc<LiveSessions>,
     audit: Arc<HostAudit>,
@@ -647,6 +749,36 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
             }
         });
     }
+    // Settings, Security reads its own copy of the context: the control
+    // channel takes this one.
+    let manager = ctx.as_ref().ok().map(|c| {
+        Arc::new(ManagerWatch {
+            ctx: crate::unattended::HostContext {
+                guard: Arc::clone(&c.guard),
+                host_onion_pk: c.host_onion_pk,
+                readiness: c.readiness.clone(),
+                autostart: Arc::clone(&c.autostart),
+                user_inputs: c.user_inputs.clone(),
+                kill: c.kill.clone(),
+                log: c.log.clone(),
+                facts: Arc::clone(&c.facts),
+                show: None,
+                indicator: c.indicator.clone(),
+            },
+            words: Arc::clone(&b.words),
+        })
+    });
+    if let Some(watch) = &manager {
+        let (watch, shared) = (Arc::clone(watch), Arc::clone(&b.shared));
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(MANAGER_EVERY);
+            loop {
+                every.tick().await;
+                let (watch, shared) = (Arc::clone(&watch), Arc::clone(&shared));
+                let _ = tokio::task::spawn_blocking(move || watch.refresh(&shared)).await;
+            }
+        });
+    }
     // A second launch raises this window through the control channel
     // (`IpcOp::Show`, §B.1.1).
     let ctx = ctx.map(|mut c| {
@@ -669,6 +801,7 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
     Ok(Hosted {
         serving: Arc::new((cfg, deps)),
         banner,
+        manager,
         media,
         live,
         audit,
@@ -1045,8 +1178,15 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     Command::AcknowledgeBanner => {
                         if let Some(watch) = hosted.as_ref().and_then(|h| h.banner.clone()) {
                             let shared = Arc::clone(&b.shared);
-                            // The re-authentication dialog blocks.
-                            tokio::task::spawn_blocking(move || watch.acknowledge(&shared));
+                            let manager = hosted.as_ref().and_then(|h| h.manager.clone());
+                            // The re-authentication dialog blocks; the
+                            // manager's view is read again after the answer.
+                            tokio::task::spawn_blocking(move || {
+                                watch.acknowledge(&shared);
+                                if let Some(manager) = manager {
+                                    manager.refresh(&shared);
+                                }
+                            });
                         }
                     }
                     Command::Grant => {
@@ -2263,6 +2403,107 @@ mod tests {
         let shared = Shared::new(Model::default(), Arc::new(|_| {}));
         watch.acknowledge(&shared);
         assert_eq!(reauth.calls(), ["acknowledge_banner"]);
+    }
+
+    /// Settings, Security's view is read from the window host's guard
+    /// (§B.8.7.3): the master switch, a running pause, each grant's pinned
+    /// label, who gave it access, its state, when it last connected and its
+    /// failed attempts, how many devices can connect without asking, and the
+    /// readiness rows with the badge they raise. Reading writes nothing.
+    #[test]
+    fn the_manager_view_is_read_from_the_guard() {
+        use tornect_core::keystore::FileSecretStore;
+        use tornect_core::session_log::{Actor, SessionLog};
+        use tornect_core::unattended::clock::FakeClock;
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{
+            AllowAllPaired, AllowAllReAuth, MutationGuard, NoSessionActivity,
+            RandomServerSetupSource,
+        };
+        use tornect_core::unattended::ipc::GrantOptions;
+        use tornect_core::unattended::readiness::{FIELD_NAMES, SharedReadiness};
+        use tornect_core::unattended::store::GrantStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let secrets = Arc::new(FileSecretStore::open(paths.keys_dir()).unwrap());
+        let log = SessionLog::new(paths.sessions_log());
+        let store = GrantStore::open(
+            &paths,
+            secrets,
+            Arc::new(FakeClock::at(1_787_961_600)),
+            log.clone(),
+        )
+        .unwrap();
+        let facts: Arc<dyn tornect_core::levels::FactsSource> =
+            Arc::new(tornect_core::levels::FixedFacts::linux());
+        let guard = Arc::new(
+            MutationGuard::new(
+                store,
+                Arc::new(AllowAllReAuth::default()),
+                Arc::new(NoSessionActivity),
+                Arc::clone(&facts),
+            )
+            .with_paired_devices(Arc::new(AllowAllPaired))
+            .with_server_setup_source(Arc::new(RandomServerSetupSource)),
+        );
+        let watch = ManagerWatch {
+            ctx: crate::unattended::HostContext {
+                guard: Arc::clone(&guard),
+                host_onion_pk: [0x42; 32],
+                readiness: SharedReadiness::default(),
+                autostart: Arc::new(tornect_platform::autostart::NoAutostart("test".to_owned())),
+                user_inputs: Vec::new(),
+                kill: None,
+                log,
+                facts,
+                show: None,
+                indicator: None,
+            },
+            words: Arc::new(super::super::recognize::Recognizer::default()),
+        };
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.refresh(&shared);
+        let off = shared.read(|m| m.manager.clone()).expect("read");
+        assert!(!off.on && off.grants.is_empty() && off.without_asking == 0);
+        guard.master_on(Actor::Cli, &[9; 32]).unwrap();
+        let device = tornect_core::DeviceId::from_bytes([3; 32]);
+        guard
+            .create_grant(
+                Actor::Cli,
+                &device,
+                Preset::HeadlessBox,
+                &GrantOptions::default(),
+                &[0u8; 192],
+                false,
+            )
+            .unwrap();
+        let logged = std::fs::read(paths.sessions_log()).unwrap();
+        watch.refresh(&shared);
+        let on = shared.read(|m| m.manager.clone()).expect("read");
+        assert!(on.on);
+        assert_eq!(on.paused_until, None);
+        assert_eq!(on.without_asking, 1);
+        let [row] = on.grants.as_slice() else {
+            panic!("one row: {:?}", on.grants);
+        };
+        assert_eq!(row.label, guard.store().grant(&device).unwrap().label);
+        assert_eq!(row.created_by, Some(Actor::Cli));
+        assert_eq!(row.state, "active");
+        assert_eq!((row.last_used, row.failures), (None, 0));
+        let names: Vec<&str> = on.readiness.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, FIELD_NAMES);
+        assert_eq!(on.not_ready, watch.readiness().badge());
+        assert_eq!(
+            std::fs::read(paths.sessions_log()).unwrap(),
+            logged,
+            "reading logs nothing"
+        );
+        guard.pause(Actor::Cli, u64::MAX).unwrap();
+        watch.refresh(&shared);
+        let paused = shared.read(|m| m.manager.clone()).expect("read");
+        assert_eq!(paused.paused_until, Some(u64::MAX));
+        assert_eq!(paused.without_asking, 0, "none while paused");
     }
 
     /// The row "indicator shown" as the host at `state_dir` answers it over
