@@ -88,6 +88,14 @@ impl Recognizer {
         }
     }
 
+    /// The name this computer declares, as the first run's question set it
+    /// (before the recognizer is shared).
+    pub fn set_name(&mut self, name: &str) {
+        if let Some(me) = &mut self.me {
+            name.clone_into(&mut me.name);
+        }
+    }
+
     /// The keys derived so far (the saved ones).
     #[must_use]
     pub fn known(&self) -> &Known {

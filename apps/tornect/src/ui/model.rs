@@ -203,6 +203,10 @@ pub struct Model {
     /// The diagnostics report of Settings, About (`crate::diagnostics`: it
     /// names nobody); empty until the tokio side has gathered it.
     pub diagnostics: String,
+    /// The first start of this home in a window on screen: Home asks the
+    /// name others see, and nothing that could send it (the host's start,
+    /// Tor, a connection) runs until it is answered or skipped.
+    pub name_question: bool,
 }
 
 impl Model {

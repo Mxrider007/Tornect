@@ -29,7 +29,7 @@ pub(in super::super) const THEMES: [(Theme, &str); 3] = [
 ];
 
 /// The longest name `config.toml` keeps, in bytes.
-const NAME_MAX: usize = 64;
+pub(in super::super) const NAME_MAX: usize = 64;
 
 /// The General section.
 pub(super) fn section(

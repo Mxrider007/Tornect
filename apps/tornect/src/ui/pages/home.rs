@@ -25,6 +25,10 @@ pub(super) const HISTORY_NOTICE: &str = "Tornect keeps no list of your recent co
     log on this computer always records connection attempts in both directions: requests to this \
     computer, and your unattended connections to others. It is never sent anywhere.";
 
+/// The first run's question (the redesign's First run), asked before
+/// anything sends this computer's name.
+pub(super) const NAME_QUESTION: &str = "What should other devices call this computer?";
+
 /// How long "Copied" shows after Copy ID.
 const COPIED_FOR: Duration = Duration::from_secs(2);
 /// From this content width on, the ID and connect cards sit side by side.
@@ -54,6 +58,13 @@ pub(super) fn home(
          connect without asking, if you gave one unattended access).",
     );
     ui.add_space(14.0);
+
+    // The first start: the name others see is asked before anything can
+    // send it; until it is answered or skipped Home offers nothing else.
+    if model.name_question {
+        name_question(ui, model, form, actions);
+        return;
+    }
 
     // The first run: what history keeps, said once (history is off until
     // switched on).
@@ -538,6 +549,49 @@ fn connect_card(
         needs = content_height(ui, top) + CARD_FRAME_HEIGHT;
     });
     needs
+}
+
+/// The first run's question, the saved name filled in (on a fresh home the
+/// neutral default), with Save and Skip.
+fn name_question(ui: &mut Ui, model: &Model, form: &mut Form, actions: &mut Vec<Action>) {
+    let t = theme::tokens(ui.ctx());
+    widgets::card(ui, |ui| {
+        ui.set_width(ui.available_width());
+        widgets::section_header(ui, NAME_QUESTION);
+        ui.add(
+            egui::Label::new(
+                RichText::new(super::settings::general::NAME_NOTE)
+                    .font(theme::font(ui.ctx(), Face::Regular, 13.0))
+                    .color(t.text_secondary),
+            )
+            .wrap(),
+        );
+        ui.add_space(8.0);
+        let saved = &model.settings.device_name;
+        let name = form.first_name.get_or_insert_with(|| saved.clone());
+        let mut done = None;
+        ui.horizontal_wrapped(|ui| {
+            let field = widgets::text_field(ui, name, saved, false, 260.0);
+            let typed = name.trim();
+            let valid = !typed.is_empty() && typed.len() <= super::settings::general::NAME_MAX;
+            let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if Button::new(Kind::Primary, "Save")
+                .enabled(valid)
+                .show(ui)
+                .clicked()
+                || (entered && valid)
+            {
+                done = Some(Some(typed.to_owned()));
+            }
+            if Button::new(Kind::Ghost, "Skip").show(ui).clicked() {
+                done = Some(None);
+            }
+        });
+        if let Some(answer) = done {
+            actions.push(Action::FirstRunName(answer));
+            form.first_name = None;
+        }
+    });
 }
 
 /// The Tor line, in words and colour.

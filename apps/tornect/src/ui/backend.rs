@@ -92,6 +92,8 @@ pub enum Command {
     /// Save one change of the settings pages in `config.toml`. Never an
     /// operation of §B.8.6.2: those run through the unattended guard.
     SaveSettings(SettingsChange),
+    /// The first run's question answered: the name typed, or `None` (Skip).
+    FirstRunName(Option<String>),
     /// Open the password prompt for `id`, for a session or an admin command
     /// (with the other device an Unlock names) (§B.8.10).
     AskPassword(TornectId, Option<AdminAction>, Option<[u8; 32]>),
@@ -778,10 +780,59 @@ fn refresh_diagnostics(b: &Backend) {
     });
 }
 
+/// Whether a start asks the first run's question: on the first start of a
+/// home (`first_run`; an upgraded install has its marker and is not asked),
+/// unless the window starts in background mode, with no window shown, where
+/// the neutral default stays.
+fn name_question_due(first: bool, background: bool) -> bool {
+    first && !background
+}
+
+/// Ask the first run's question and wait for its answer: until it comes,
+/// nothing starts that could send this computer's name (the host role, Tor,
+/// a connection); only the settings pages act meanwhile, and they send
+/// nothing. The name saved then goes into every copy the start reads: the
+/// configuration the host and the client are built from, the recognizer's
+/// own entry and the model. `false`: the window closed first, and nothing
+/// was started (a name not given stays the neutral default next time).
+async fn ask_the_name(b: &mut Backend, commands: &mut mpsc::UnboundedReceiver<Command>) -> bool {
+    b.shared.update(|m| m.name_question = true);
+    loop {
+        match commands.recv().await {
+            Some(Command::FirstRunName(name)) => {
+                if let Some(name) = name {
+                    save_settings(&b.paths, &b.shared, &SettingsChange::DeviceName(name));
+                }
+                break;
+            }
+            Some(Command::SaveSettings(change)) => save_settings(&b.paths, &b.shared, &change),
+            Some(Command::Quit) | None => return false,
+            Some(_) => {}
+        }
+    }
+    let name = b.shared.read(|m| m.settings.device_name.clone());
+    // The backend is the recognizer's only holder until it starts.
+    if let Some(words) = Arc::get_mut(&mut b.words) {
+        words.set_name(&name);
+    }
+    b.shared.update(|m| {
+        m.device_name.clone_from(&name);
+        m.name_question = false;
+    });
+    b.cfg.general.device_name = name;
+    true
+}
+
 /// Run until [`Command::Quit`], then shut down and mark the model closed.
-pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
-    let b = Arc::new(b);
+pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
     let first = first_run(&b.paths);
+    if name_question_due(first, b.background.is_some())
+        && !ask_the_name(&mut b, &mut commands).await
+    {
+        b.shared.update(|m| m.closed = true);
+        return;
+    }
+    let b = Arc::new(b);
     b.shared.update(|m| m.history_notice = first);
     refresh_diagnostics(&b);
     // Background mode: the desktop notifications that mirror the host's
@@ -1038,6 +1089,8 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                     Command::ClearHistory => change_book(&b, &Change::Clear),
                     Command::SetHistory(on) => change_book(&b, &Change::History(on)),
                     Command::SaveSettings(change) => save_settings(&b.paths, &b.shared, &change),
+                    // Answered before the start; a late one changes nothing.
+                    Command::FirstRunName(_) => {}
                     Command::AskPassword(id, admin, target) => open_prompt(&b, id, admin, target),
                     Command::DeviceWords(key) => {
                         // Argon2id over 64 MiB: off the command loop, paced
@@ -3062,6 +3115,125 @@ mod tests {
         assert!(
             !printed.contains("198.51") && printed.contains("1 lines"),
             "{printed}"
+        );
+    }
+
+    /// A window's backend for the first run's tests, in a fresh home under
+    /// `tmp`: shown on screen (not in background mode), hosting.
+    fn first_start(tmp: &tempfile::TempDir) -> (Backend, Arc<Shared>, Paths) {
+        let paths = Paths::from_home(tmp.path().join("home"));
+        paths.ensure().unwrap();
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let identity = Arc::new(HostIdentity::from_seed(&[0x21; 32]));
+        let device = DeviceIdentity::from_seed(&[0x22; 32]);
+        let device_pk = HostSigner::public_key(&device);
+        let words = Arc::new(super::super::recognize::Recognizer::new(
+            paths.clone(),
+            super::super::recognize::Me {
+                name: tornect_core::config::default_device_name(),
+                onion: identity.id(),
+                device: tornect_core::DeviceId::from_bytes(device_pk),
+            },
+        ));
+        let b = Backend {
+            paths: paths.clone(),
+            cfg: Config::default(),
+            shared: Arc::clone(&shared),
+            popups: Popups::new(Arc::clone(&shared)),
+            link: Arc::new(StreamLink::default()),
+            source: Source::TestCard,
+            host: true,
+            identity,
+            device: Arc::new(device),
+            device_pk,
+            words,
+            background: None,
+        };
+        (b, shared, paths)
+    }
+
+    /// The first run's question (the operator's ruling: before the first
+    /// pairing or connection sends the name): until it is answered nothing
+    /// acts (a connect asked meanwhile is dropped, no host and no Tor are
+    /// started), and the answer reaches every copy the held start reads:
+    /// `config.toml`, the configuration the host's `HostConfig` and the
+    /// client's `ClientConfig` are built from, the recognizer's own entry and
+    /// the model.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_run_asks_the_name_before_anything_is_sent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut b, shared, paths) = first_start(&tmp);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Command::Connect(TornectId::from_bytes([0x42; 32])))
+            .unwrap();
+        tx.send(Command::FirstRunName(Some("Desk by the window".to_owned())))
+            .unwrap();
+        assert!(ask_the_name(&mut b, &mut rx).await);
+        shared.read(|m| {
+            assert!(matches!(m.client, ClientStage::Idle), "nothing dialed");
+            assert!(!m.name_question);
+            assert_eq!(m.device_name, "Desk by the window");
+        });
+        assert_eq!(b.cfg.general.device_name, "Desk by the window");
+        assert_eq!(
+            Config::load(&paths.config_file())
+                .unwrap()
+                .general
+                .device_name,
+            "Desk by the window"
+        );
+        assert!(
+            b.words
+                .saved()
+                .iter()
+                .any(|s| s.name == "Desk by the window")
+        );
+        let hosted = host_role(&b).await.expect("the window host is wired");
+        assert_eq!(hosted.serving.0.host_name, "Desk by the window");
+        if let Some(ipc) = &hosted.ipc {
+            ipc.abort();
+        }
+    }
+
+    /// Skip keeps the neutral default, written nowhere; a window closed
+    /// before the answer starts nothing, and its home keeps the neutral
+    /// name.
+    #[tokio::test]
+    async fn skipping_keeps_the_neutral_name() {
+        let neutral = tornect_core::config::default_device_name();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut b, shared, paths) = first_start(&tmp);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Command::FirstRunName(None)).unwrap();
+        assert!(ask_the_name(&mut b, &mut rx).await);
+        assert_eq!(b.cfg.general.device_name, neutral);
+        shared.read(|m| assert_eq!(m.device_name, neutral));
+        assert!(!paths.config_file().exists(), "nothing saved");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut b, shared, paths) = first_start(&tmp);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Command::Quit).unwrap();
+        assert!(!ask_the_name(&mut b, &mut rx).await, "closed first");
+        assert!(shared.read(|m| m.name_question), "never answered");
+        assert_eq!(b.cfg.general.device_name, neutral);
+        assert!(!paths.config_file().exists());
+    }
+
+    /// Only the first start of a home asks, and only in a window shown on
+    /// screen: an existing home (the first run's marker is there, as after an
+    /// upgrade) and a start in background mode keep the name they have.
+    #[test]
+    fn an_existing_home_is_not_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        let first = first_run(&paths);
+        assert!(first && name_question_due(first, false), "a fresh home");
+        assert!(!name_question_due(first, true), "background mode");
+        let again = first_run(&paths);
+        assert!(
+            !again && !name_question_due(again, false),
+            "an existing home"
         );
     }
 
