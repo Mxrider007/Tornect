@@ -2979,6 +2979,30 @@ mod tests {
         assert!(!window.controls().iter().any(|c| c == security::ROTATE));
     }
 
+    /// One password dialog at a time, Rotate ID's included: while another
+    /// operation waits at its dialog (a section's operation, or the
+    /// wizard's), neither Rotate ID's button nor its dialog sends anything.
+    #[test]
+    fn rotate_id_sends_nothing_while_another_operation_asks() {
+        use settings::security;
+        let mut model = at_rest();
+        model.manager = Some(manager_on());
+        let mut busy = model.clone();
+        busy.manager_busy = true;
+        let mut running = model;
+        running.wizard.running = Some(1);
+        for (what, model) in [("a section's operation", busy), ("the wizard", running)] {
+            let mut window = security_section(model, (WIDE.0, 2400.0));
+            let at = window.center(security::ROTATE);
+            assert!(window.click(at).is_empty(), "{what}");
+            assert!(window.form.settings.rotate.is_none(), "{what}: no dialog");
+            window.form.settings.rotate = Some("ROTATE".to_owned());
+            assert!(window.pass(Vec::new()).is_empty(), "{what}");
+            let at = window.center("Rotate ID");
+            assert!(window.click(at).is_empty(), "{what}: nothing sent");
+        }
+    }
+
     /// The Privacy section, opened from the section list.
     fn privacy(model: Model, size: (f32, f32)) -> Window {
         let mut window = Window::new(model, Page::Settings, egui::Theme::Dark, size);

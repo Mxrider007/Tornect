@@ -303,24 +303,34 @@ pub(super) fn section(
     if shared {
         form.rotate = None;
     } else {
-        rotate(ui, t, manager, form, actions);
+        let asking = model.manager_busy || model.wizard.running.is_some();
+        rotate(ui, t, manager, asking, form, actions);
     }
 }
 
 /// Rotate ID (§B.8.12): its dialog names the devices whose unattended access
 /// it removes and asks for the typed word, Cancel first; no password (it
-/// removes access, it gives none). Not offered while this screen is shared.
+/// removes access, it gives none). Not offered while this screen is shared,
+/// and neither it nor its dialog sends anything while another operation
+/// waits at its password dialog (`asking`).
 fn rotate(
     ui: &mut Ui,
     t: &Tokens,
     manager: &Manager,
+    asking: bool,
     form: &mut SettingsForm,
     actions: &mut Vec<Action>,
 ) {
     ui.add_space(20.0);
     widgets::section_header(ui, "Rotate ID");
     let Some(typed) = &mut form.rotate else {
-        if Button::new(Kind::Danger, ROTATE).small().show(ui).clicked() {
+        if Button::new(Kind::Danger, ROTATE)
+            .small()
+            .enabled(!asking)
+            .show(ui)
+            .clicked()
+            && !asking
+        {
             form.rotate = Some(String::new());
         }
         return;
@@ -341,10 +351,11 @@ fn rotate(
         }
         if Button::new(Kind::Danger, "Rotate ID")
             .small()
-            .enabled(ready)
+            .enabled(ready && !asking)
             .show(ui)
             .clicked()
             && ready
+            && !asking
         {
             actions.push(Action::Manager(ManagerOp::RotateId));
             done = true;
