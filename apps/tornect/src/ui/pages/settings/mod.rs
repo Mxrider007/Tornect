@@ -13,6 +13,7 @@ pub(super) mod display;
 pub(super) mod general;
 pub(super) mod privacy;
 pub(super) mod security;
+pub(super) mod wizard;
 
 use egui::{RichText, Ui};
 
@@ -90,6 +91,19 @@ pub struct SettingsForm {
     pub(super) sign_in_asking: bool,
     /// Rotate ID's dialog is open, with the word typed so far.
     pub(super) rotate: Option<String>,
+    /// The grant wizard is open, at its step, with what it chose so far.
+    pub(super) wizard: Option<wizard::Wizard>,
+    /// How many times the wizard's *Turn on* was pressed in this window: each
+    /// press names its answer by its number.
+    pub(super) attempts: u64,
+}
+
+impl SettingsForm {
+    /// Close the grant wizard: what it chose goes, and its passwords are
+    /// wiped (the window left Settings, Security).
+    pub fn close_wizard(&mut self) {
+        self.wizard = None;
+    }
 }
 
 /// Below this page width (points) the section list uses its short names.
@@ -141,6 +155,9 @@ pub(super) fn page(
         }
     }
     ui.add_space(18.0);
+    if form.settings.section != Section::Security {
+        form.settings.close_wizard();
+    }
     match form.settings.section {
         Section::General => general::section(ui, model, &mut form.settings, shared, actions),
         Section::Connection => {

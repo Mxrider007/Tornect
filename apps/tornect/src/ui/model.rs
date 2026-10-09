@@ -13,6 +13,8 @@ use tornect_core::config::{BridgeMode, Theme, Viewer};
 use tornect_core::levels::{Answers, Availability};
 use tornect_core::session_log::Actor;
 use tornect_core::unattended::credentials::RememberOffer;
+use tornect_core::unattended::grant::Preset;
+use tornect_core::unattended::ipc::GrantOptions;
 use tornect_core::unattended::readiness::Probe;
 use tornect_core::{DeviceId, TornectId};
 
@@ -229,6 +231,9 @@ pub struct Model {
     /// down": then it is dropped (wiped). Never logged, never in `Debug`; a
     /// window that closes while it is here turns unattended access off again.
     pub stop_card: Option<Secret>,
+    /// The grant wizard of Settings, Security (§B.8.7.1) as the tokio side
+    /// last answered it.
+    pub wizard: WizardView,
 }
 
 impl Model {
@@ -1020,11 +1025,21 @@ pub struct GrantRow {
 /// side runs through the window host's guard as the window (`Actor::Ui`);
 /// the page changes only on the guard's answer. Turn off, Pause, Revoke all,
 /// Suspend, Disable, Revoke and Remove are deny-direction and ask no
-/// password; Turn on, Enable, Unlock, Resume, the host settings and the
-/// start at sign-in are access-increasing: one dialog each, never during or
-/// 60 s after a remote session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// password; Turn on, Enable, Unlock, Resume, the host settings, the start
+/// at sign-in and the wizard's grant are access-increasing: one dialog each,
+/// never during or 60 s after a remote session. The wizard's two reads ask
+/// nothing and change nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagerOp {
+    /// The grant wizard opened: read the paired devices it may give access.
+    WizardDevices,
+    /// Judge whether a choice of the wizard makes the grant's reach non-zero
+    /// (decision M1-67): then its password can only be generated.
+    Preview(Box<WizardChoice>),
+    /// Give a device unattended access as the wizard chose it: one
+    /// registration (its one dialog), then, while unattended access is off,
+    /// Turn on (its own dialog) and a new stop code shown once.
+    Grant(Box<GrantRequest>),
     /// Turn unattended access on: a new emergency stop code is shown once.
     On,
     /// The stop code was written down: it is dropped (no guard operation).
@@ -1059,6 +1074,122 @@ pub enum ManagerOp {
     Revoke(DeviceId),
     /// Remove the device: its unattended access, then its pairing.
     Remove(DeviceId),
+}
+
+/// What the grant wizard chose for a new grant (§B.8.7.1 ②, ③, ⑤).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WizardChoice {
+    /// The paired device.
+    pub device: DeviceId,
+    /// The preset.
+    pub preset: Preset,
+    /// The options set over the preset's defaults (the waiver among them).
+    pub options: GrantOptions,
+}
+
+/// A new password for a grant on its way from the wizard to the tokio side
+/// (decision M1-67): only the wizard's generator builds `Generated`, and the
+/// tokio side registers the password as generated exactly when it is that
+/// arm. No flag that says "generated" crosses beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewPassword {
+    /// Drawn by the passphrase generator (five words of EFF's long list), as
+    /// a login reads it.
+    Generated(Secret),
+    /// Typed by the person ("Use my own password"), as a login reads it.
+    Chosen(Secret),
+}
+
+impl NewPassword {
+    /// The password itself.
+    #[must_use]
+    pub fn secret(&self) -> &Secret {
+        match self {
+            Self::Generated(s) | Self::Chosen(s) => s,
+        }
+    }
+}
+
+/// The wizard's *Turn on*: its choice and its password.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantRequest {
+    /// Which press of *Turn on* this is (the answer names it).
+    pub attempt: u64,
+    /// What it gives.
+    pub choice: WizardChoice,
+    /// The new password.
+    pub password: NewPassword,
+}
+
+/// A paired device the grant wizard may give unattended access (§B.8.7.1
+/// ②): one without it yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// The device.
+    pub device: DeviceId,
+    /// The label pinned when it was paired.
+    pub label: String,
+    /// Its device words, once derived.
+    pub words: Option<Words>,
+    /// An attended session from it has completed here (§B.8.6.1); without
+    /// one its access needs the waiver.
+    pub attended: bool,
+}
+
+/// The password policy's inputs of §B.8.7.2 for the wizard's meter (this
+/// computer's names, the labels, the onion address): never shown, never in
+/// `Debug`.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct PolicyInputs {
+    /// The inputs.
+    pub inputs: Vec<String>,
+    /// The score a chosen password needs: 4 on a file keystore, else 3.
+    pub min_score: u8,
+}
+
+impl std::fmt::Debug for PolicyInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PolicyInputs({} inputs, score {})",
+            self.inputs.len(),
+            self.min_score
+        )
+    }
+}
+
+/// How the tokio side answered a press of the wizard's *Turn on*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WizardAnswer {
+    /// The device was given access (and unattended access turned on, if it
+    /// was off and the person confirmed it).
+    Done,
+    /// Nothing was saved, for this reason, in plain words.
+    Refused(&'static str),
+    /// Nothing was saved: something changed while the person was asked, and
+    /// this device now needs a new generated password (`G_NEEDS_PASSWORD`).
+    NeedsGenerated,
+}
+
+/// The grant wizard as the tokio side last answered it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WizardView {
+    /// Whether a paired device without unattended access exists, as the
+    /// tokio side last read it with the manager's view: Settings, Security
+    /// offers the wizard then. `None` until read.
+    pub offer: Option<bool>,
+    /// The paired devices the wizard may give access, read when it opened;
+    /// `None` until read.
+    pub devices: Option<Vec<Candidate>>,
+    /// The password policy's inputs, read with the devices.
+    pub policy: Option<PolicyInputs>,
+    /// The last choice judged, and whether its password can only be
+    /// generated (`None`: it could not be judged, so it can only be).
+    pub preview: Option<(WizardChoice, Option<bool>)>,
+    /// The press of *Turn on* that runs now.
+    pub running: Option<u64>,
+    /// How the last press ended.
+    pub answer: Option<(u64, WizardAnswer)>,
 }
 
 /// One host setting of Settings, Security, as it is to be.

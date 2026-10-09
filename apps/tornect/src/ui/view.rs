@@ -405,6 +405,11 @@ pub fn main_window(
             p.id == *id || (model.admin_confirm.contains(&p.id) && confirmation_card(p.id) == *id)
         }) || model.confirm.as_ref().is_some_and(|c| c.id == *id)
     });
+    // The grant wizard's passwords go with it when the window leaves
+    // Settings (§B.8.7.2).
+    if form.page != Page::Settings {
+        form.settings.close_wizard();
+    }
     // The sidebar's room, with nothing in it yet.
     let side = egui::Panel::left("sidebar")
         .exact_size(nav::width(window))
