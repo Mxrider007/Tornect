@@ -183,6 +183,9 @@ pub enum Action {
     /// Save one change of the settings pages in `config.toml` (never an
     /// operation of §B.8.6.2).
     SaveSettings(SettingsChange),
+    /// The first run's question answered: the name typed, or `None` (Skip:
+    /// the neutral default stays).
+    FirstRunName(Option<String>),
     /// Open the password prompt for an unattended connect to this computer
     /// (§B.8.10): the prompt comes before anything is dialed.
     AskPassword(TornectId),
@@ -269,6 +272,8 @@ pub struct Form {
     pub book: pages::BookForm,
     /// The settings page's own state.
     pub settings: pages::SettingsForm,
+    /// The first run's name as typed so far.
+    pub first_name: Option<String>,
     /// The password prompt's fields.
     pub ua: UaForm,
     /// What the request sheet last kept in view: its viewport's size, its

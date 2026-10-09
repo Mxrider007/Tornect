@@ -1285,6 +1285,7 @@ impl App {
             Action::ClearHistory => self.command(Command::ClearHistory),
             Action::SetHistory(on) => self.command(Command::SetHistory(on)),
             Action::SaveSettings(change) => self.command(Command::SaveSettings(change)),
+            Action::FirstRunName(name) => self.command(Command::FirstRunName(name)),
             Action::AskPassword(id) => {
                 self.form.ua.clear();
                 self.command(Command::AskPassword(id, None, None));
