@@ -2107,7 +2107,7 @@ mod tests {
             .iter()
             .map(|s| s.title())
             .collect();
-        assert_eq!(titles, ["General", "Privacy"]);
+        assert_eq!(titles, ["General", "Privacy", "About"]);
         for size in [WIDE, NARROW] {
             let mut window = Window::new(at_rest(), Page::Settings, egui::Theme::Dark, size);
             assert_eq!(window.form.settings.section, settings::Section::General);
@@ -2238,8 +2238,10 @@ mod tests {
     /// live, another Tornect process hosting), no section of the settings
     /// page offers a control that writes, a name half typed included: the
     /// hidden card stands in their place, and what is left to press is the
-    /// section list, the sidebar and the banner; what the sections say
-    /// stays.
+    /// section list, the sidebar, the banner and "Copy report" (which copies
+    /// the diagnostics report as shown, naming nobody, and writes nothing);
+    /// what the sections say stays, and About, which writes nothing, shows
+    /// no hidden card.
     #[test]
     fn no_settings_write_while_shared() {
         let titles: Vec<&str> = settings::Section::LISTED
@@ -2267,11 +2269,16 @@ mod tests {
                     window.form.settings.name = Some("Desk".to_owned());
                     window.pass(Vec::new());
                     let case = format!("{why} {section:?} {size:?}");
-                    assert!(has_text(&window, HIDDEN_WHILE_SHARED), "{case}");
-                    assert!(has_text(&window, settings::WRITES_HIDDEN), "{case}");
+                    // About has no control that writes, so nothing to hide.
+                    if section != settings::Section::About {
+                        assert!(has_text(&window, HIDDEN_WHILE_SHARED), "{case}");
+                        assert!(has_text(&window, settings::WRITES_HIDDEN), "{case}");
+                    }
                     for control in window.controls() {
                         assert!(
-                            titles.contains(&control.as_str()) || chrome.contains(&control),
+                            titles.contains(&control.as_str())
+                                || chrome.contains(&control)
+                                || control == "Copy report",
                             "{case}: \"{control}\" writes while shared"
                         );
                     }
@@ -2462,6 +2469,69 @@ mod tests {
             assert!(
                 !book.nodes.iter().any(|n| n.label() == Some(KEEP)),
                 "{size:?}: the Recent tab's own switch is hidden too"
+            );
+        }
+    }
+
+    /// Settings, About: the version, the protocol, the licence, where the
+    /// third-party licences are, that nothing checks for updates, and the
+    /// diagnostics report as the window gathered it; the page's one control
+    /// copies the report as shown, and nothing on it reaches the network
+    /// (no check, no connection, no download).
+    #[test]
+    fn the_about_page_offers_no_network_action() {
+        use settings::about;
+        assert_eq!(
+            about::LICENCES,
+            "The licences of the code Tornect includes from others are in \
+             THIRD_PARTY_LICENSES.txt, beside the program in each release."
+        );
+        assert_eq!(
+            about::NO_UPDATES,
+            "Tornect never checks for updates by itself."
+        );
+        assert_eq!(about::REVIEW, "Review it before you share it.");
+        let titles: Vec<&str> = settings::Section::LISTED
+            .iter()
+            .map(|s| s.title())
+            .collect();
+        let report = "Tornect 0.1.0, protocol 1\nSystem: linux x86_64";
+        for size in [WIDE, NARROW] {
+            let mut model = at_rest();
+            model.diagnostics = report.to_owned();
+            let chrome = chrome_controls(&model, size);
+            let mut window = Window::new(model, Page::Settings, egui::Theme::Dark, size);
+            let at = window.center("About");
+            assert!(
+                window.click(at).is_empty(),
+                "{size:?}: opening it asks nothing"
+            );
+            assert!(
+                window.pass(Vec::new()).is_empty(),
+                "{size:?}: drawing it asks nothing"
+            );
+            for text in [
+                format!("Version {}", tornect_core::VERSION),
+                format!("Protocol {}", tornect_core::PROTOCOL_VERSION),
+                "GPL-3.0-or-later".to_owned(),
+                about::LICENCES.to_owned(),
+                about::NO_UPDATES.to_owned(),
+                about::REVIEW.to_owned(),
+                report.to_owned(),
+            ] {
+                assert!(has_text(&window, &text), "{size:?}: {text}");
+            }
+            let own: Vec<String> = window
+                .controls()
+                .into_iter()
+                .filter(|c| !chrome.contains(c) && !titles.contains(&c.as_str()))
+                .collect();
+            assert_eq!(own, ["Copy report"], "{size:?}");
+            let at = window.center("Copy report");
+            assert_eq!(
+                window.click(at),
+                vec![Action::Copy(report.to_owned())],
+                "{size:?}"
             );
         }
     }

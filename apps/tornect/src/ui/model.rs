@@ -200,6 +200,9 @@ pub struct Model {
     pub closed: bool,
     /// What `config.toml` holds of what the settings pages change.
     pub settings: Settings,
+    /// The diagnostics report of Settings, About (`crate::diagnostics`: it
+    /// names nobody); empty until the tokio side has gathered it.
+    pub diagnostics: String,
 }
 
 impl Model {

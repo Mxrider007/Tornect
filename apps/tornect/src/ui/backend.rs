@@ -768,11 +768,22 @@ fn grant(_: std::path::PathBuf) -> Result<(bool, bool), String> {
     Err("this desktop needs no grant".to_owned())
 }
 
+/// Put the diagnostics report of Settings, About into the model, gathered
+/// off the command loop (it reads the keystore, the log and lyrebird).
+fn refresh_diagnostics(b: &Backend) {
+    let (paths, cfg, shared) = (b.paths.clone(), b.cfg.clone(), Arc::clone(&b.shared));
+    tokio::task::spawn_blocking(move || {
+        let report = crate::diagnostics::report(&crate::diagnostics::gather(&paths, &cfg));
+        shared.update(|m| m.diagnostics = report);
+    });
+}
+
 /// Run until [`Command::Quit`], then shut down and mark the model closed.
 pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
     let b = Arc::new(b);
     let first = first_run(&b.paths);
     b.shared.update(|m| m.history_notice = first);
+    refresh_diagnostics(&b);
     // Background mode: the desktop notifications that mirror the host's
     // sheets (§B.1.1).
     let notices = b
@@ -850,6 +861,8 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
         tokio::select! {
             started = async { tor_start.as_mut().expect("guarded").await }, if tor_start.is_some() => {
                 tor_start = None;
+                // The way into Tor that worked is known now.
+                refresh_diagnostics(&b);
                 match started {
                     Ok(Ok(started)) => {
                         let started = Arc::new(started);

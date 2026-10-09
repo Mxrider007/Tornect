@@ -23,6 +23,7 @@ compile_error!(
 );
 
 mod admin_helper;
+mod diagnostics;
 mod helper_cmd;
 mod history;
 mod host;
