@@ -21,8 +21,8 @@ use tornect_session::FrameSink as _;
 
 use super::model::{
     Book, CaptureNote, ClientStage, Computer, Confirm, Device, Dial, Failure, Hosting, Model,
-    MyWords, Popup, PopupKind, Recognition, Setup, Shared, Sharing, SheetLevels, TorState,
-    UaRecord, Viewing,
+    MyWords, Popup, PopupKind, Recognition, Settings, Setup, Shared, Sharing, SheetLevels,
+    TorState, UaRecord, Viewing,
 };
 use super::stream::{FrameSlot, SlotSink};
 
@@ -45,6 +45,10 @@ pub fn model(everything: bool, empty: bool) -> Model {
     let mut m = Model {
         id: Some(synthetic_id().display_groups()),
         device_name: "Linux PC".to_owned(),
+        settings: Settings {
+            device_name: "Linux PC".to_owned(),
+            ..Settings::default()
+        },
         book: if empty {
             Book {
                 history: true,
@@ -751,5 +755,26 @@ mod tests {
             "the window's set-up makes its home"
         );
         assert_ne!(real.model.id.as_deref(), Some(made_up.as_str()));
+    }
+
+    /// The preview draws in the theme its command line names (the settings
+    /// page shows that one chosen), and its settings page shows made-up
+    /// values: it reads no configuration and creates nothing.
+    #[test]
+    fn the_preview_draws_in_the_theme_it_was_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let paths = Paths::from_home(&home);
+        for (theme, saved) in [
+            (egui::Theme::Dark, tornect_core::config::Theme::Dark),
+            (egui::Theme::Light, tornect_core::config::Theme::Light),
+        ] {
+            let mut preview = opts(true, Some(Page::Settings));
+            preview.theme = theme;
+            let start = start(&paths, &preview).unwrap();
+            assert_eq!(start.model.settings.theme, saved);
+            assert_eq!(start.model.settings.device_name, "Linux PC");
+            assert!(!home.exists(), "{theme:?}: the preview created {home:?}");
+        }
     }
 }

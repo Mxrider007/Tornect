@@ -1,6 +1,6 @@
-//! The main window's pages (the redesign's §4). In this version Home and the
-//! Address book show what works today; Sessions and Settings, whose content
-//! comes in later versions, each show one plain line saying so, and never a
+//! The main window's pages (the redesign's §4). In this version Home, the
+//! Address book and Settings show what works today; Sessions, whose content
+//! comes in a later version, shows one plain line saying so, and never a
 //! control that does nothing. The widget gallery is reached only from the
 //! preview. Trust surfaces are not pages: the open questions are drawn above
 //! the page, the banner above everything (`view`).
@@ -8,6 +8,7 @@
 mod address_book;
 mod gallery;
 mod home;
+mod settings;
 pub(super) mod viewer;
 
 use std::time::Instant;
@@ -16,6 +17,7 @@ use egui::{RichText, Ui};
 use tornect_core::address_book::Day;
 
 pub use self::address_book::{BookForm, Tab};
+pub use self::settings::SettingsForm;
 use super::model::Model;
 use super::nav::Page;
 use super::theme::{self, Face};
@@ -43,12 +45,7 @@ pub fn draw(
             "The list of past sessions arrives in a later version; each session is already \
              recorded in this computer's session log.",
         ),
-        Page::Settings => later(
-            ui,
-            page,
-            "Settings arrive in a later version; until then, the command line's help lists \
-             the commands that change them.",
-        ),
+        Page::Settings => settings::page(ui, model, form, model.screen_shared(now), actions),
         Page::Widgets => gallery::gallery(ui),
     }
 }
@@ -354,15 +351,14 @@ mod tests {
     #[test]
     fn a_later_page_offers_no_control() {
         let listed: Vec<&str> = Page::LISTED.iter().map(|p| p.title()).collect();
-        for page in [Page::Sessions, Page::Settings] {
-            for size in [WIDE, NARROW] {
-                let window = Window::new(at_rest(), page, egui::Theme::Dark, size);
-                for control in window.controls() {
-                    assert!(
-                        listed.contains(&control.as_str()),
-                        "{page:?}: \"{control}\" does nothing yet"
-                    );
-                }
+        let page = Page::Sessions;
+        for size in [WIDE, NARROW] {
+            let window = Window::new(at_rest(), page, egui::Theme::Dark, size);
+            for control in window.controls() {
+                assert!(
+                    listed.contains(&control.as_str()),
+                    "{page:?}: \"{control}\" does nothing yet"
+                );
             }
         }
     }
@@ -2090,6 +2086,197 @@ mod tests {
                 !none.nodes.iter().any(|n| n.label() == Some("Acknowledge…")),
                 "{page:?}"
             );
+        }
+    }
+
+    /// The controls the sidebar and the banner offer over `model` (the
+    /// Sessions page draws none of its own).
+    fn chrome_controls(model: &Model, size: (f32, f32)) -> Vec<String> {
+        Window::new(model.clone(), Page::Sessions, egui::Theme::Dark, size).controls()
+    }
+
+    /// The settings page lists the sections built so far, in the redesign's
+    /// order, opens on General, and asks for nothing when it or a section is
+    /// opened; General's controls each send one change of the settings file,
+    /// never an operation of §B.8.6.2.
+    #[test]
+    fn the_settings_page_lists_its_sections() {
+        use super::super::model::SettingsChange;
+        use tornect_core::config::Theme;
+        let titles: Vec<&str> = settings::Section::LISTED
+            .iter()
+            .map(|s| s.title())
+            .collect();
+        assert_eq!(titles, ["General"]);
+        for size in [WIDE, NARROW] {
+            let mut window = Window::new(at_rest(), Page::Settings, egui::Theme::Dark, size);
+            assert_eq!(window.form.settings.section, settings::Section::General);
+            for title in &titles {
+                assert!(
+                    window.controls().iter().any(|c| c == title),
+                    "{size:?}: {title}"
+                );
+                let at = window.center(title);
+                assert!(window.click(at).is_empty(), "{size:?}: {title}");
+            }
+            for text in [
+                "Name others see",
+                settings::general::NAME_NOTE,
+                settings::general::NEXT_START,
+                "Theme",
+            ] {
+                assert!(has_text(&window, text), "{size:?}: {text}");
+            }
+            for (_, choice) in settings::general::THEMES {
+                assert!(
+                    window.controls().iter().any(|c| c == choice),
+                    "{size:?}: {choice}"
+                );
+            }
+            let light = window.center("Light");
+            assert_eq!(
+                window.click(light),
+                vec![Action::SaveSettings(SettingsChange::Theme(Theme::Light))],
+                "{size:?}"
+            );
+            let change = window.center("Change");
+            assert!(window.click(change).is_empty(), "{size:?}");
+            // What typing puts in the field (as the other page tests do).
+            window.form.settings.name = Some("Desk by the window".to_owned());
+            window.pass(Vec::new());
+            let save = window.center("Save");
+            assert_eq!(
+                window.click(save),
+                vec![Action::SaveSettings(SettingsChange::DeviceName(
+                    "Desk by the window".to_owned()
+                ))],
+                "{size:?}"
+            );
+            assert_eq!(
+                window.form.settings.name, None,
+                "{size:?}: the field closes"
+            );
+        }
+    }
+
+    /// Settings, General: the name others see is the saved one, shown and put
+    /// into the field exactly as saved; on a fresh configuration that is the
+    /// neutral default ("Linux PC", "Windows PC"), never this computer's
+    /// network name. The host name here is invented and planted where the
+    /// window keeps the name in use, not read: no settings file asks for a
+    /// host name, so a computer named like the default cannot make this pass
+    /// or fail.
+    #[test]
+    fn the_name_field_starts_neutral_and_never_shows_the_host_name() {
+        use super::super::model::Settings;
+        let neutral = if cfg!(windows) {
+            "Windows PC"
+        } else if cfg!(target_os = "linux") {
+            "Linux PC"
+        } else {
+            return;
+        };
+        let planted_host = "quillmere-desk-4821";
+        let stored = "Brightwater studio 7731";
+        let fresh = Settings::of(&tornect_core::Config::default());
+        let chosen = Settings {
+            device_name: stored.to_owned(),
+            ..Settings::default()
+        };
+        for (saved, expected) in [(fresh, neutral), (chosen, stored)] {
+            let mut model = at_rest();
+            model.device_name = planted_host.to_owned();
+            model.settings = saved;
+            for size in [WIDE, NARROW] {
+                let mut window =
+                    Window::new(model.clone(), Page::Settings, egui::Theme::Dark, size);
+                let case = format!("{expected} {size:?}");
+                assert!(
+                    has_text(&window, &format!("\u{201c}{expected}\u{201d}")),
+                    "{case}"
+                );
+                let change = window.center("Change");
+                assert!(window.click(change).is_empty(), "{case}");
+                assert_eq!(
+                    window.form.settings.name.as_deref(),
+                    Some(expected),
+                    "{case}"
+                );
+                // The field is drawn from the next pass on.
+                assert!(window.pass(Vec::new()).is_empty(), "{case}");
+                let fields: Vec<&str> = window
+                    .nodes
+                    .iter()
+                    .filter(|n| n.role() == Role::TextInput)
+                    .filter_map(Node::value)
+                    .collect();
+                assert_eq!(fields, [expected], "{case}");
+                assert!(
+                    !window.nodes.iter().any(|n| {
+                        [n.value(), n.label(), n.placeholder()]
+                            .into_iter()
+                            .flatten()
+                            .any(|v| v.contains(planted_host))
+                    }),
+                    "{case}"
+                );
+            }
+        }
+        for source in [
+            include_str!("settings/mod.rs"),
+            include_str!("settings/general.rs"),
+        ] {
+            assert!(!source.contains("host_name"));
+        }
+    }
+
+    /// While this screen may be in a picture that leaves it (a session
+    /// live, another Tornect process hosting), no section of the settings
+    /// page offers a control that writes, a name half typed included: the
+    /// hidden card stands in their place, and what is left to press is the
+    /// section list, the sidebar and the banner; what the sections say
+    /// stays.
+    #[test]
+    fn no_settings_write_while_shared() {
+        let titles: Vec<&str> = settings::Section::LISTED
+            .iter()
+            .map(|s| s.title())
+            .collect();
+        let mut sharing = at_rest();
+        sharing.sharing = vec![super::super::model::Sharing {
+            session_id: "00".to_owned(),
+            label: "Laptop".to_owned(),
+            control: true,
+            unattended: false,
+            since: Instant::now(),
+            capture: None,
+        }];
+        let mut elsewhere = at_rest();
+        elsewhere.hosted_elsewhere = true;
+        for (why, model) in [("sharing", sharing), ("elsewhere", elsewhere)] {
+            for section in settings::Section::LISTED {
+                for size in [WIDE, NARROW] {
+                    let chrome = chrome_controls(&model, size);
+                    let mut window =
+                        Window::new(model.clone(), Page::Settings, egui::Theme::Dark, size);
+                    window.form.settings.section = section;
+                    window.form.settings.name = Some("Desk".to_owned());
+                    window.pass(Vec::new());
+                    let case = format!("{why} {section:?} {size:?}");
+                    assert!(has_text(&window, HIDDEN_WHILE_SHARED), "{case}");
+                    assert!(has_text(&window, settings::WRITES_HIDDEN), "{case}");
+                    for control in window.controls() {
+                        assert!(
+                            titles.contains(&control.as_str()) || chrome.contains(&control),
+                            "{case}: \"{control}\" writes while shared"
+                        );
+                    }
+                    assert!(
+                        !window.nodes.iter().any(|n| n.role() == Role::TextInput),
+                        "{case}"
+                    );
+                }
+            }
         }
     }
 }

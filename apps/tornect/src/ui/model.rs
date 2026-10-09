@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use tornect_core::TornectId;
 use tornect_core::address_book::{Day, mixes_scripts};
+use tornect_core::config::Theme;
 use tornect_core::levels::{Answers, Availability};
 use tornect_core::unattended::credentials::RememberOffer;
 
@@ -197,6 +198,8 @@ pub struct Model {
     pub unlock_words: Option<([u8; 32], Words)>,
     /// The tokio side has finished shutting down.
     pub closed: bool,
+    /// What `config.toml` holds of what the settings pages change.
+    pub settings: Settings,
 }
 
 impl Model {
@@ -938,6 +941,58 @@ pub enum Check {
     },
     /// It did not, and why.
     Unreachable(String),
+}
+
+/// What `config.toml` holds of what the settings pages change, as saved:
+/// read at the window's start and again after each save from the window. The
+/// name others see may differ from the one in use until the next start.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Settings {
+    /// The name others see, as saved.
+    pub device_name: String,
+    /// The window's colours.
+    pub theme: Theme,
+    /// Why the last save from the window was not made, in plain words;
+    /// `None` once one was.
+    pub problem: Option<&'static str>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self::of(&tornect_core::Config::default())
+    }
+}
+
+impl Settings {
+    /// What `cfg` holds.
+    #[must_use]
+    pub fn of(cfg: &tornect_core::Config) -> Self {
+        Self {
+            device_name: cfg.general.device_name.clone(),
+            theme: cfg.general.theme,
+            problem: None,
+        }
+    }
+}
+
+/// One change the settings pages ask for. None of them is an operation of
+/// §B.8.6.2: those go through the unattended guard, never through this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsChange {
+    /// The name others see (it applies at the next start).
+    DeviceName(String),
+    /// The window's colours (they apply at once).
+    Theme(Theme),
+}
+
+impl SettingsChange {
+    /// Make the change in `cfg`.
+    pub fn apply(&self, cfg: &mut tornect_core::Config) {
+        match self {
+            Self::DeviceName(name) => cfg.general.device_name.clone_from(name),
+            Self::Theme(theme) => cfg.general.theme = *theme,
+        }
+    }
 }
 
 #[cfg(test)]
