@@ -37,8 +37,8 @@ use super::block::GuiBlockWindow;
 use super::book::{self, Change};
 use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
 use super::model::{
-    CaptureNote, Check, ClientStage, Dial, Failure, Hosting, Shared, Sharing, TorState,
-    UnattendedBanner, Viewing, Wake,
+    CaptureNote, Check, ClientStage, Dial, Failure, Hosting, Settings, SettingsChange, Shared,
+    Sharing, TorState, UnattendedBanner, Viewing, Wake,
 };
 use super::recognize::Lookalike;
 use super::stream::{FrameSlot, SlotSink};
@@ -89,6 +89,9 @@ pub enum Command {
     ClearHistory,
     /// Keep a history of connections, or stop keeping one.
     SetHistory(bool),
+    /// Save one change of the settings pages in `config.toml`. Never an
+    /// operation of §B.8.6.2: those run through the unattended guard.
+    SaveSettings(SettingsChange),
     /// Open the password prompt for `id`, for a session or an admin command
     /// (with the other device an Unlock names) (§B.8.10).
     AskPassword(TornectId, Option<AdminAction>, Option<[u8; 32]>),
@@ -248,6 +251,37 @@ fn first_run(paths: &Paths) -> bool {
         tracing::debug!(error = %e, "the history notice will show again");
     }
     true
+}
+
+/// The settings page's line when a change was not saved because this screen
+/// may be in a picture that leaves it (the change may not be this
+/// computer's user's own).
+const NOT_SAVED_SHARED: &str = "Not saved: this screen is shared.";
+
+/// The settings page's line when `config.toml` could not be read or
+/// written (the reason goes to the log, which may name the path).
+const NOT_SAVED_FILE: &str = "Not saved: the settings file could not be read or written.";
+
+/// Save one settings change: `config.toml` as it is now, with the change,
+/// checked and written back; the model then holds what was saved. Nothing is
+/// saved while this screen may be in a picture that leaves it.
+fn save_settings(paths: &Paths, shared: &Shared, change: &SettingsChange) {
+    if shared.read(|m| m.screen_shared(Instant::now())) {
+        shared.update(|m| m.settings.problem = Some(NOT_SAVED_SHARED));
+        return;
+    }
+    let path = paths.config_file();
+    let saved = Config::load(&path).and_then(|mut cfg| {
+        change.apply(&mut cfg);
+        cfg.save(&path).map(|()| cfg)
+    });
+    match saved {
+        Ok(cfg) => shared.update(|m| m.settings = Settings::of(&cfg)),
+        Err(e) => {
+            tracing::warn!(error = %e, "the settings were not saved");
+            shared.update(|m| m.settings.problem = Some(NOT_SAVED_FILE));
+        }
+    }
 }
 
 /// How often a window that is not the host looks whether another Tornect
@@ -990,6 +1024,7 @@ pub async fn run(b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
                     }
                     Command::ClearHistory => change_book(&b, &Change::Clear),
                     Command::SetHistory(on) => change_book(&b, &Change::History(on)),
+                    Command::SaveSettings(change) => save_settings(&b.paths, &b.shared, &change),
                     Command::AskPassword(id, admin, target) => open_prompt(&b, id, admin, target),
                     Command::DeviceWords(key) => {
                         // Argon2id over 64 MiB: off the command loop, paced
@@ -2920,6 +2955,71 @@ mod tests {
             assert_eq!(sessions.notice(id), want, "{id}");
             sessions.on_end(id, None);
         }
+    }
+
+    /// Settings, General: a saved name and theme reach `config.toml`, the
+    /// file's other keys stay as they were, and the model then holds what
+    /// was saved while the name in use stays until the next start. While
+    /// this screen is shared nothing is saved, and a file that cannot be
+    /// read keeps what it holds; each says so.
+    #[test]
+    fn a_saved_name_and_theme_reach_the_config() {
+        use tornect_core::config::Theme;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        let path = paths.config_file();
+        let mut before = Config::default();
+        before.media.max_fps = 30;
+        before.save(&path).unwrap();
+        let shared = Shared::new(
+            Model {
+                device_name: "Linux PC".to_owned(),
+                ..Model::default()
+            },
+            Arc::new(|_| {}),
+        );
+        save_settings(
+            &paths,
+            &shared,
+            &SettingsChange::DeviceName("Desk by the window".to_owned()),
+        );
+        save_settings(&paths, &shared, &SettingsChange::Theme(Theme::Light));
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.general.device_name, "Desk by the window");
+        assert_eq!(cfg.general.theme, Theme::Light);
+        assert_eq!(cfg.media.max_fps, 30, "the other keys stay");
+        shared.read(|m| {
+            assert_eq!(m.settings, Settings::of(&cfg));
+            assert_eq!(m.settings.problem, None);
+            assert_eq!(
+                m.device_name, "Linux PC",
+                "the name in use until the next start"
+            );
+        });
+
+        shared.update(|m| m.hosted_elsewhere = true);
+        save_settings(&paths, &shared, &SettingsChange::Theme(Theme::Dark));
+        assert_eq!(
+            Config::load(&path).unwrap(),
+            cfg,
+            "nothing saved while shared"
+        );
+        shared.read(|m| {
+            assert_eq!(m.settings.theme, Theme::Light);
+            assert_eq!(m.settings.problem, Some(NOT_SAVED_SHARED));
+        });
+
+        shared.update(|m| m.hosted_elsewhere = false);
+        std::fs::write(&path, "this is = not [valid").unwrap();
+        save_settings(&paths, &shared, &SettingsChange::Theme(Theme::Dark));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "this is = not [valid"
+        );
+        shared.read(|m| {
+            assert_eq!(m.settings.theme, Theme::Light);
+            assert_eq!(m.settings.problem, Some(NOT_SAVED_FILE));
+        });
     }
 
     /// The history notice shows on the first run of a home only.

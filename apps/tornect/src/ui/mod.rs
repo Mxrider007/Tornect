@@ -106,7 +106,8 @@ pub struct GuiOpts {
     pub empty: bool,
     /// With `preview` and `page`: one host sheet of this kind on screen.
     pub sheet: Option<preview::Sheet>,
-    /// The theme the windows draw with.
+    /// With `preview`: the theme the windows draw with (a real window draws
+    /// with the one saved in the settings).
     pub theme: egui::Theme,
 }
 
@@ -135,6 +136,10 @@ fn start(paths: &Paths, opts: &GuiOpts) -> anyhow::Result<Start> {
         if let Some(sheet) = opts.sheet {
             preview::sheet(&mut model, sheet);
         }
+        model.settings.theme = match opts.theme {
+            egui::Theme::Dark => tornect_core::config::Theme::Dark,
+            egui::Theme::Light => tornect_core::config::Theme::Light,
+        };
         return Ok(Start { model, real: None });
     }
     paths.ensure().context("creating Tornect directories")?;
@@ -143,6 +148,8 @@ fn start(paths: &Paths, opts: &GuiOpts) -> anyhow::Result<Start> {
     let (device, _) = load_or_create_device_identity(&store)?;
     let device_pk = HostSigner::public_key(&device);
     let mut cfg = Config::load(&paths.config_file())?;
+    // What the file holds, before the command line's overrides.
+    let settings = model::Settings::of(&cfg);
     if let Some(mode) = opts.bridges {
         cfg.tor.bridges = mode;
     }
@@ -163,6 +170,7 @@ fn start(paths: &Paths, opts: &GuiOpts) -> anyhow::Result<Start> {
     let model = Model {
         id: Some(identity.id().display_groups()),
         device_name: cfg.general.device_name.clone(),
+        settings,
         book: book::read(paths, tornect_core::address_book::Day::today(), None),
         hosting: if opts.host {
             Hosting::Waiting
@@ -222,7 +230,6 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
         drop(commands_rx);
         let first = shared.read(|m| m.book.computers.first().map(|c| c.id));
         let mut app = App::new(shared, popups, link, commands);
-        app.theme = opts.theme;
         if let Some(page) = opts.page {
             app.open_page(page);
         }
@@ -288,7 +295,6 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
     ));
 
     let mut app = App::new(shared, popups, link, commands);
-    app.theme = opts.theme;
     app.screenshots = true;
     app.background = probe_fact;
     if !opts.host {
