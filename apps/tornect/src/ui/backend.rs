@@ -503,6 +503,10 @@ fn refusal(e: &tornect_core::unattended::guard::GuardError) -> &'static str {
 /// reason applies.
 const NOT_CHANGED: &str = "Not done: unattended access could not be changed.";
 
+/// Why the wizard's *Turn on* did not register a password of the person's
+/// own: it does not meet the policy of §B.8.7.2.
+const NOT_THE_POLICY: &str = "Not done: this password is too short, too long or too easy to guess.";
+
 /// Why the wizard's *Turn on* waits for nothing: another operation asks for
 /// this computer's password right now (one dialog at a time).
 const ANOTHER_ASKS: &str =
@@ -937,6 +941,17 @@ impl ManagerWatch {
             .map_err(|e| refused(&e))?;
         if preview.generated_only() && !generated {
             return Err(WizardAnswer::NeedsGenerated);
+        }
+        // §B.8.7.2 once more on this side, as the command line's client checks
+        // it: a chosen password that does not meet it goes no further (no
+        // dialog).
+        if let NewPassword::Chosen(chosen) = password {
+            use tornect_core::unattended::password as policy;
+            let inputs: Vec<&str> = self.ctx.user_inputs.iter().map(String::as_str).collect();
+            let file_keystore = self.ctx.min_score() >= policy::MIN_SCORE_FILE_KEYSTORE;
+            if policy::check(chosen.0.as_str(), &inputs, file_keystore).is_err() {
+                return Err(WizardAnswer::Refused(NOT_THE_POLICY));
+            }
         }
         let not_done = |_| WizardAnswer::Refused(NOT_CHANGED);
         let secret = password.secret().0.as_str();
@@ -5099,7 +5114,7 @@ mod tests {
 
     fn chosen_pw() -> NewPassword {
         NewPassword::Chosen(Secret(zeroize::Zeroizing::new(
-            "quiet verdant otter lantern 41".to_owned(),
+            "quiet verdant otter lantern 41 cobalt fjord".to_owned(),
         )))
     }
 
@@ -5346,6 +5361,33 @@ mod tests {
         assert_eq!(reauth.calls(), ["raise", "master_on"]);
         let grant = watch.ctx.guard.store().grant(&device).expect("given");
         assert!(!grant.marked(), "generated: unmarked");
+    }
+
+    /// §B.8.7.2: a chosen password that does not meet the policy (here, on a
+    /// file keystore, too easy to guess) is refused by the tokio side too,
+    /// before any dialog: nothing is written and no store is created.
+    #[test]
+    fn a_weak_chosen_password_is_refused_before_any_dialog() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let watch = wizard_watch(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(NoSessionActivity),
+            linux_facts(),
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        let weak = NewPassword::Chosen(Secret(zeroize::Zeroizing::new("password1234".to_owned())));
+        watch.wizard_grant(turn_on(device, weak), &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((1, WizardAnswer::Refused(NOT_THE_POLICY)))
+        );
+        assert!(reauth.calls().is_empty(), "no dialog");
+        assert!(watch.ctx.guard.store().grant(&device).is_none());
+        assert!(!Paths::from_home(tmp.path()).unattended_store().exists());
     }
 
     /// §B.8.6.2: during a remote session (and 60 s after one) the wizard's
