@@ -2674,4 +2674,55 @@ mod tests {
             assert!(has_text(&window, text), "{text}");
         }
     }
+
+    /// The first run's question on Home: "What should other devices call
+    /// this computer?" with the saved name filled in (on a fresh home the
+    /// neutral default), Save and Skip; until it is answered Home offers
+    /// nothing else (no connect field, no other card).
+    #[test]
+    fn home_asks_the_name_first_with_the_neutral_default() {
+        let mut model = at_rest();
+        model.name_question = true;
+        let neutral = model.settings.device_name.clone();
+        for size in [WIDE, NARROW] {
+            let mut window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, size);
+            assert!(has_text(&window, home::NAME_QUESTION), "{size:?}");
+            let fields: Vec<&str> = window
+                .nodes
+                .iter()
+                .filter(|n| n.role() == Role::TextInput)
+                .filter_map(Node::value)
+                .collect();
+            assert_eq!(
+                fields,
+                [neutral.as_str()],
+                "{size:?}: only the name's field"
+            );
+            let chrome = chrome_controls(&model, size);
+            let mut own: Vec<String> = window
+                .controls()
+                .into_iter()
+                .filter(|c| !chrome.contains(c))
+                .collect();
+            own.sort();
+            assert_eq!(own, ["", "Save", "Skip"], "{size:?}: the field, Save, Skip");
+            let at = window.center("Skip");
+            assert_eq!(
+                window.click(at),
+                vec![Action::FirstRunName(None)],
+                "{size:?}"
+            );
+            window.form.first_name = Some("Desk by the window".to_owned());
+            window.pass(Vec::new());
+            let at = window.center("Save");
+            assert_eq!(
+                window.click(at),
+                vec![Action::FirstRunName(Some("Desk by the window".to_owned()))],
+                "{size:?}"
+            );
+        }
+        model.name_question = false;
+        let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(!has_text(&window, home::NAME_QUESTION));
+    }
 }
