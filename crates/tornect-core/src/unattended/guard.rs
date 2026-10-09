@@ -600,6 +600,9 @@ pub enum ExternalOp {
     Install,
     /// `tornect uninstall` (§B.1.1, r7): what `tornect install` wrote, removed.
     Uninstall,
+    /// The window's acknowledgement of the banner of devices that can connect
+    /// without asking (§B.8.6.2): re-authentication with its own purpose.
+    AcknowledgeBanner,
 }
 
 impl ExternalOp {
@@ -615,6 +618,7 @@ impl ExternalOp {
             Self::SettingsChange { .. } => "settings_change",
             Self::Install => "install",
             Self::Uninstall => "uninstall",
+            Self::AcknowledgeBanner => "acknowledge_banner",
         }
     }
 }
@@ -1698,7 +1702,8 @@ impl MutationGuard {
             ExternalOp::Uninstall => Some(SessionRecord::at(now, SessionEvent::Uninstalled).by(by)),
             ExternalOp::BackupImport { .. }
             | ExternalOp::IdentityView
-            | ExternalOp::SettingsChange { .. } => None,
+            | ExternalOp::SettingsChange { .. }
+            | ExternalOp::AcknowledgeBanner => None,
         };
         if let Some(rec) = rec {
             self.store.log_event(&rec)?;
