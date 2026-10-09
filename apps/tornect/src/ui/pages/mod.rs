@@ -2297,7 +2297,15 @@ mod tests {
                         assert!(
                             labels.contains(&control.as_str())
                                 || chrome.contains(&control)
-                                || control == "Copy report",
+                                || control == "Copy report"
+                                || (section == settings::Section::Security
+                                    && [
+                                        "Turn off",
+                                        "For 12 hours",
+                                        "Until I turn it back on",
+                                        "Revoke all…"
+                                    ]
+                                    .contains(&control.as_str())),
                             "{case}: \"{control}\" writes while shared"
                         );
                     }
@@ -2322,6 +2330,7 @@ mod tests {
             without_asking: 1,
             grants: vec![
                 GrantRow {
+                    device: tornect_core::DeviceId::from_bytes([1; 32]),
                     label: "Office laptop".to_owned(),
                     words: tornect_core::words::Words::from_cached("abandon ability able about"),
                     created_by: Some(Actor::Ui),
@@ -2330,6 +2339,7 @@ mod tests {
                     failures: 0,
                 },
                 GrantRow {
+                    device: tornect_core::DeviceId::from_bytes([2; 32]),
                     label: "Tablet".to_owned(),
                     words: None,
                     created_by: Some(Actor::Cli),
@@ -2361,7 +2371,8 @@ mod tests {
     /// its device words, who gave it access, when it last connected, its
     /// state and its failed attempts since the last unlock; the readiness
     /// rows show by their titles, the panic key bound or not, then the
-    /// static advisory. Nothing on the section can be pressed.
+    /// static advisory. What can be pressed is the section's deny-direction
+    /// operations.
     #[test]
     fn the_manager_rows_show_the_planned_fields() {
         use settings::security;
@@ -2395,7 +2406,8 @@ mod tests {
                     chrome.contains(&control)
                         || settings::Section::LISTED
                             .iter()
-                            .any(|s| s.label(narrow) == control),
+                            .any(|s| s.label(narrow) == control)
+                        || security_controls().contains(&control.as_str()),
                     "{size:?}: \"{control}\""
                 );
             }
@@ -2571,6 +2583,229 @@ mod tests {
                     "{size:?}: \"{control}\""
                 );
             }
+        }
+    }
+
+    /// Every control of Settings, Security over [`manager_on`]: Turn off,
+    /// the pause's ends, Revoke all and each row's operations.
+    fn security_controls() -> Vec<&'static str> {
+        let mut controls = vec![settings::security::TURN_OFF, settings::security::REVOKE_ALL];
+        controls.extend(settings::security::PAUSE_ENDS.map(|(_, label)| label));
+        controls.extend(settings::security::ROW_OPS.map(|(label, _)| label));
+        controls
+    }
+
+    /// [`manager_on`] with its first device only.
+    fn one_device() -> super::super::model::Manager {
+        let mut manager = manager_on();
+        manager.grants.truncate(1);
+        manager
+    }
+
+    /// A click on a control of Settings, Security sends one operation for
+    /// the window host's guard and nothing else; the section does not change
+    /// on the click (it shows what the guard's answer is read back as):
+    /// Turn off, each end of the pause, Revoke all after its question, and
+    /// each operation of a device's row, naming that device.
+    #[test]
+    fn a_manager_click_sends_one_command_and_writes_nothing() {
+        use super::super::model::{ManagerOp, PauseEnd};
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        let mut model = at_rest();
+        model.manager = Some(one_device());
+        for size in [WIDE, NARROW] {
+            let mut window = security_section(model.clone(), size);
+            let mut clicks = vec![
+                ("Turn off", ManagerOp::Off),
+                ("For 12 hours", ManagerOp::Pause(PauseEnd::TwelveHours)),
+                (
+                    "Until I turn it back on",
+                    ManagerOp::Pause(PauseEnd::UntilOn),
+                ),
+                ("Suspend", ManagerOp::Suspend(device)),
+                ("Disable", ManagerOp::Disable(device)),
+                ("Revoke unattended", ManagerOp::Revoke(device)),
+                ("Remove device", ManagerOp::Remove(device)),
+            ];
+            for (label, op) in clicks.drain(..) {
+                let at = window.center(label);
+                assert_eq!(
+                    window.click(at),
+                    vec![Action::Manager(op)],
+                    "{size:?}: {label}"
+                );
+                assert!(window.pass(Vec::new()).is_empty(), "{size:?}: {label}");
+                assert!(has_text(&window, "Office laptop"), "{size:?}: {label}");
+                assert!(has_text(&window, "On"), "{size:?}: {label}");
+            }
+            let at = window.center("Revoke all…");
+            assert!(window.click(at).is_empty(), "{size:?}: the question first");
+            // The question is drawn from the next pass on.
+            assert!(window.pass(Vec::new()).is_empty(), "{size:?}");
+            assert!(
+                has_text(&window, "Remove unattended access for 1 device?"),
+                "{size:?}"
+            );
+            let at = window.center("Remove");
+            assert_eq!(
+                window.click(at),
+                vec![Action::Manager(ManagerOp::RevokeAll)],
+                "{size:?}"
+            );
+        }
+        assert_eq!(
+            settings::security::revoke_all_question(2),
+            "Remove unattended access for all 2 devices?"
+        );
+    }
+
+    /// The pause offers the two ends ruled so far, 12 hours and until access
+    /// is turned back on, and no end at 08:00 (it waits for the operator:
+    /// this version keeps no time zone of the computer).
+    #[test]
+    fn pause_offers_the_two_settled_ends() {
+        use super::super::model::{ManagerOp, PauseEnd};
+        let mut model = at_rest();
+        model.manager = Some(one_device());
+        for size in [WIDE, NARROW] {
+            let mut window = security_section(model.clone(), size);
+            let controls = window.controls();
+            assert!(controls.iter().any(|c| c == "For 12 hours"), "{size:?}");
+            assert!(
+                controls.iter().any(|c| c == "Until I turn it back on"),
+                "{size:?}"
+            );
+            assert!(!controls.iter().any(|c| c.contains("08:00")), "{size:?}");
+            for (label, end) in [
+                ("For 12 hours", PauseEnd::TwelveHours),
+                ("Until I turn it back on", PauseEnd::UntilOn),
+            ] {
+                let at = window.center(label);
+                assert_eq!(
+                    window.click(at),
+                    vec![Action::Manager(ManagerOp::Pause(end))],
+                    "{size:?}"
+                );
+            }
+        }
+    }
+
+    /// While a pause runs, the section offers no end of a pause (one ending
+    /// sooner would turn access back on, which only master on may do); Turn
+    /// off stays. Off, it offers neither.
+    #[test]
+    fn a_running_pause_offers_no_shorter_end() {
+        for until in [
+            u64::MAX,
+            Day::today().days() as u64 * 86_400 + 86_400 + 3_600,
+        ] {
+            let mut manager = one_device();
+            manager.paused_until = Some(until);
+            let mut model = at_rest();
+            model.manager = Some(manager);
+            for size in [WIDE, NARROW] {
+                let window = security_section(model.clone(), size);
+                let controls = window.controls();
+                assert!(has_text(&window, "Paused until"), "{size:?}");
+                for (_, end) in settings::security::PAUSE_ENDS {
+                    assert!(!controls.iter().any(|c| c == end), "{size:?}: {end}");
+                }
+                assert!(controls.iter().any(|c| c == "Turn off"), "{size:?}");
+            }
+        }
+        let mut off = one_device();
+        off.on = false;
+        let mut model = at_rest();
+        model.manager = Some(off);
+        let window = security_section(model, WIDE);
+        let controls = window.controls();
+        assert!(
+            !controls
+                .iter()
+                .any(|c| c == "Turn off" || c == "For 12 hours")
+        );
+    }
+
+    /// The desktop's screen-sharing grant on Settings, Security uses the
+    /// first-run step's own commands: Grant again sends the grant, Revoke
+    /// forgets it; while this screen is shared neither is offered and the
+    /// state stays.
+    #[test]
+    fn the_sharing_grant_controls_use_the_existing_commands() {
+        let mut model = at_rest();
+        model.manager = Some(one_device());
+        model.setup = Some(Setup {
+            token_file: std::path::PathBuf::from("restore-token"),
+            granted: true,
+            busy: false,
+            note: None,
+        });
+        // The block is the section's last: windows tall enough to reach it.
+        for size in [TALL, (NARROW.0, 1600.0)] {
+            let mut window = security_section(model.clone(), size);
+            assert!(has_text(&window, "Granted and remembered"), "{size:?}");
+            assert!(!has_text(&window, "restore-token"), "{size:?}: no path");
+            let at = window.center("Grant again");
+            assert_eq!(window.click(at), vec![Action::Grant], "{size:?}");
+            let at = window.center("Revoke");
+            assert_eq!(window.click(at), vec![Action::Revoke], "{size:?}");
+            assert!(has_text(&window, settings::security::STOP_LINE), "{size:?}");
+        }
+        let mut shared = model;
+        shared.hosted_elsewhere = true;
+        let window = security_section(shared, TALL);
+        assert!(has_text(&window, "Granted and remembered"));
+        let controls = window.controls();
+        assert!(!controls.iter().any(|c| c == "Grant again" || c == "Revoke"));
+    }
+
+    /// While this screen may be in a picture that leaves it, Turn off, the
+    /// pause's ends and Revoke all stay offered (§B.8.6.2: deny-direction
+    /// operations always), naming no device and no number: Revoke all asks
+    /// "Remove unattended access for every device?".
+    #[test]
+    fn master_off_and_pause_stay_offered_while_shared() {
+        use super::super::model::ManagerOp;
+        let mut model = at_rest();
+        model.manager = Some(manager_on());
+        model.hosted_elsewhere = true;
+        for size in [WIDE, NARROW] {
+            let mut window = security_section(model.clone(), size);
+            let controls = window.controls();
+            for offered in [
+                "Turn off",
+                "For 12 hours",
+                "Until I turn it back on",
+                "Revoke all…",
+            ] {
+                assert!(controls.iter().any(|c| c == offered), "{size:?}: {offered}");
+            }
+            for (label, _) in settings::security::ROW_OPS {
+                assert!(!controls.iter().any(|c| c == label), "{size:?}: {label}");
+            }
+            let at = window.center("Revoke all…");
+            assert!(window.click(at).is_empty(), "{size:?}");
+            assert!(window.pass(Vec::new()).is_empty(), "{size:?}");
+            assert!(
+                has_text(&window, settings::security::REVOKE_ALL_SHARED),
+                "{size:?}"
+            );
+            for gone in ["Office laptop", "Tablet", "2 devices", "all 2"] {
+                assert!(!has_text(&window, gone), "{size:?}: {gone}");
+            }
+            assert!(
+                !window.nodes.iter().any(|n| n
+                    .value()
+                    .is_some_and(|v| v.starts_with("Remove unattended access")
+                        && v.chars().any(|c| c.is_ascii_digit()))),
+                "{size:?}: a number"
+            );
+            let at = window.center("Remove");
+            assert_eq!(
+                window.click(at),
+                vec![Action::Manager(ManagerOp::RevokeAll)],
+                "{size:?}"
+            );
         }
     }
 
