@@ -6,6 +6,7 @@
 //! leaves it, every control that writes gives way to the hidden card, and
 //! what the sections say stays.
 
+pub(super) mod about;
 pub(super) mod general;
 pub(super) mod privacy;
 
@@ -24,12 +25,14 @@ pub(super) enum Section {
     General,
     /// What others learn, what is kept here, the history switch.
     Privacy,
+    /// The version, the licences and the diagnostics report.
+    About,
 }
 
 impl Section {
     /// The sections the page lists, in the redesign's order: only those
     /// built.
-    pub const LISTED: [Self; 2] = [Self::General, Self::Privacy];
+    pub const LISTED: [Self; 3] = [Self::General, Self::Privacy, Self::About];
 
     /// The section's name in the list.
     #[must_use]
@@ -37,6 +40,7 @@ impl Section {
         match self {
             Self::General => "General",
             Self::Privacy => "Privacy",
+            Self::About => "About",
         }
     }
 }
@@ -81,6 +85,7 @@ pub(super) fn page(
     match form.settings.section {
         Section::General => general::section(ui, model, &mut form.settings, shared, actions),
         Section::Privacy => privacy::section(ui, model, shared, actions),
+        Section::About => about::section(ui, model, actions),
     }
 }
 
