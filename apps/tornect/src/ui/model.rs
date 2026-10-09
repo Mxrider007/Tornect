@@ -12,7 +12,9 @@ use tornect_core::TornectId;
 use tornect_core::address_book::{Day, mixes_scripts};
 use tornect_core::config::{BridgeMode, Theme, Viewer};
 use tornect_core::levels::{Answers, Availability};
+use tornect_core::session_log::Actor;
 use tornect_core::unattended::credentials::RememberOffer;
+use tornect_core::unattended::readiness::Probe;
 
 use crate::ua_client::AdminAction;
 use tornect_core::words::{Identicon, Words};
@@ -207,6 +209,11 @@ pub struct Model {
     /// name others see, and nothing that could send it (the host's start,
     /// Tor, a connection) runs until it is answered or skipped.
     pub name_question: bool,
+    /// Unattended access as Settings, Security and Home show it (§B.8.7.3),
+    /// as this window's host last read it from its guard; `None` while the
+    /// window has no guard (no host role here, a store that did not open,
+    /// another Tornect holding it) and until the first read.
+    pub manager: Option<Manager>,
 }
 
 impl Model {
@@ -934,6 +941,48 @@ pub struct Device {
     pub paired: Day,
     /// The day of its last session request.
     pub last_seen: Day,
+}
+
+/// Unattended access as Settings, Security and Home show it (§B.8.7.3),
+/// read by the tokio side from the window host's own guard: at the host
+/// role's start, every half minute and after each answer of the guard. It
+/// holds no secret: no password, no stop code, no device key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Manager {
+    /// The master switch.
+    pub on: bool,
+    /// When the running pause ends (Unix seconds); `u64::MAX`: when
+    /// unattended access is turned back on. `None` while no pause runs.
+    pub paused_until: Option<u64>,
+    /// How many devices can connect without asking now: the active grants,
+    /// while unattended access is on and not paused.
+    pub without_asking: usize,
+    /// One row per grant, in the store's order.
+    pub grants: Vec<GrantRow>,
+    /// The readiness rows (§B.8.7.1 ⑥) by field name, in their order.
+    pub readiness: Vec<(&'static str, Probe)>,
+    /// A readiness row is not green: Home's sticky not-ready badge, while
+    /// unattended access is on.
+    pub not_ready: bool,
+}
+
+/// A device that can connect here without asking, as the manager shows it
+/// (§B.8.7.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantRow {
+    /// The label pinned at pairing (never the name the device declares).
+    pub label: String,
+    /// Its device words, once derived.
+    pub words: Option<Words>,
+    /// Who gave it access, when the store said so in the same read.
+    pub created_by: Option<Actor>,
+    /// When it last connected (Unix seconds).
+    pub last_used: Option<u64>,
+    /// Its state, as `tornect unattended status` labels it (`active`,
+    /// `disabled:ui`, `locked:<seconds>`, …).
+    pub state: String,
+    /// Its failed attempts since the last unlock.
+    pub failures: u32,
 }
 
 /// A reachability check: one pairing-free ping over Tor, asked on a click.

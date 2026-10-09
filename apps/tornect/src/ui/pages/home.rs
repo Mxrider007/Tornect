@@ -29,6 +29,18 @@ pub(super) const HISTORY_NOTICE: &str = "Tornect keeps no list of your recent co
 /// anything sends this computer's name.
 pub(super) const NAME_QUESTION: &str = "What should other devices call this computer?";
 
+/// Home's sticky badge while a readiness row is not green and unattended
+/// access is on (§B.8.7.1 ⑥).
+pub(super) const NOT_READY: &str = "Unattended access is not ready: see Settings, Security.";
+
+/// Home's badge of how many devices can connect without asking (§B.8.7.3).
+fn without_asking(devices: usize) -> String {
+    match devices {
+        1 => "1 device can connect without asking".to_owned(),
+        n => format!("{n} devices can connect without asking"),
+    }
+}
+
 /// How long "Copied" shows after Copy ID.
 const COPIED_FOR: Duration = Duration::from_secs(2);
 /// From this content width on, the ID and connect cards sit side by side.
@@ -81,6 +93,32 @@ pub(super) fn home(
             );
         });
         ui.add_space(GAP - 8.0);
+    }
+
+    // Unattended access as the guard says it (§B.8.7.3): how many devices
+    // can connect without asking, which stays when the banner is
+    // acknowledged and is not drawn while this screen is shared (how many
+    // devices there are is hidden with the address book); and the sticky
+    // not-ready badge while unattended access is on (§B.8.7.1 ⑥).
+    if let Some(manager) = &model.manager {
+        let count = manager.without_asking > 0 && !model.screen_shared(now);
+        let not_ready = manager.on && manager.not_ready;
+        if count || not_ready {
+            ui.horizontal_wrapped(|ui| {
+                if count {
+                    widgets::chip(
+                        ui,
+                        Tone::Warn,
+                        true,
+                        &without_asking(manager.without_asking),
+                    );
+                }
+                if not_ready {
+                    widgets::chip(ui, Tone::Danger, true, NOT_READY);
+                }
+            });
+            ui.add_space(GAP - 8.0);
+        }
     }
 
     // The connection this computer asked for comes first, while it lasts.

@@ -2112,6 +2112,7 @@ mod tests {
             [
                 "General",
                 "Connection",
+                "Security",
                 "Display and quality",
                 "Privacy",
                 "About"
@@ -2268,8 +2269,10 @@ mod tests {
             since: Instant::now(),
             capture: None,
         }];
+        sharing.manager = Some(manager_on());
         let mut elsewhere = at_rest();
         elsewhere.hosted_elsewhere = true;
+        elsewhere.manager = Some(manager_on());
         for (why, model) in [("sharing", sharing), ("elsewhere", elsewhere)] {
             for section in settings::Section::LISTED {
                 for size in [WIDE, NARROW] {
@@ -2303,6 +2306,270 @@ mod tests {
                         "{case}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Unattended access as a window host read it: on, two devices (one
+    /// active, one locked), the panic key bound and one row not read yet.
+    fn manager_on() -> super::super::model::Manager {
+        use super::super::model::{GrantRow, Manager};
+        use tornect_core::session_log::Actor;
+        use tornect_core::unattended::readiness::Probe;
+        Manager {
+            on: true,
+            paused_until: None,
+            without_asking: 1,
+            grants: vec![
+                GrantRow {
+                    label: "Office laptop".to_owned(),
+                    words: tornect_core::words::Words::from_cached("abandon ability able about"),
+                    created_by: Some(Actor::Ui),
+                    last_used: None,
+                    state: "active".to_owned(),
+                    failures: 0,
+                },
+                GrantRow {
+                    label: "Tablet".to_owned(),
+                    words: None,
+                    created_by: Some(Actor::Cli),
+                    last_used: Some(1_000_000_000),
+                    state: "locked:120".to_owned(),
+                    failures: 3,
+                },
+            ],
+            readiness: vec![("panic_key", Probe::Ok), ("capture", Probe::Unknown)],
+            not_ready: true,
+        }
+    }
+
+    /// The Security section, opened from the section list.
+    fn security_section(model: Model, size: (f32, f32)) -> Window {
+        let mut window = Window::new(model, Page::Settings, egui::Theme::Dark, size);
+        let at = window.center("Security");
+        assert!(window.click(at).is_empty(), "opening it asks nothing");
+        assert_eq!(window.form.settings.section, settings::Section::Security);
+        assert!(
+            window.pass(Vec::new()).is_empty(),
+            "drawing it asks nothing"
+        );
+        window
+    }
+
+    /// Settings, Security (§B.8.7.3): the header says whether unattended
+    /// access is on, off or paused; each device's row shows its pinned label,
+    /// its device words, who gave it access, when it last connected, its
+    /// state and its failed attempts since the last unlock; the readiness
+    /// rows show by their titles, the panic key bound or not, then the
+    /// static advisory. Nothing on the section can be pressed.
+    #[test]
+    fn the_manager_rows_show_the_planned_fields() {
+        use settings::security;
+        let mut model = at_rest();
+        model.manager = Some(manager_on());
+        for size in [WIDE, NARROW] {
+            let window = security_section(model.clone(), size);
+            for text in [
+                "Unattended access",
+                "On",
+                "Office laptop",
+                "Active",
+                "device words: abandon · ability · able · about",
+                "Given in this window · never connected · 0 failed attempts since the last \
+                 unlock",
+                "Tablet",
+                "Locked for 2 min",
+                "Given on the command line · last connected on 9 Sep 2001 · 3 failed attempts \
+                 since the last unlock",
+                "Readiness",
+                "Panic key: bound",
+                "Screen capture permission: unknown",
+                security::ADVISORY,
+            ] {
+                assert!(has_text(&window, text), "{size:?}: {text}");
+            }
+            let chrome = chrome_controls(&model, size);
+            let narrow = size == NARROW;
+            for control in window.controls() {
+                assert!(
+                    chrome.contains(&control)
+                        || settings::Section::LISTED
+                            .iter()
+                            .any(|s| s.label(narrow) == control),
+                    "{size:?}: \"{control}\""
+                );
+            }
+        }
+        let today = Day::from_ymd(2026, 10, 9).unwrap();
+        let mut paused = manager_on();
+        paused.paused_until = Some(today.days() as u64 * 86_400 + 8 * 3_600);
+        assert_eq!(security::header(&paused, today).1, "Paused until 08:00 UTC");
+        paused.paused_until = Some((today.days() as u64 + 1) * 86_400 + 8 * 3_600);
+        assert_eq!(
+            security::header(&paused, today).1,
+            "Paused until 08:00 UTC on 10 Oct 2026"
+        );
+        paused.paused_until = Some(u64::MAX);
+        assert_eq!(
+            security::header(&paused, today).1,
+            security::PAUSED_UNTIL_ON
+        );
+        paused.on = false;
+        assert_eq!(security::header(&paused, today).1, "Off");
+        for (label, said) in [
+            ("disabled:ui", "Disabled in this window"),
+            ("suspended:local_block", "Suspended: blocked here"),
+            ("hard_locked", "Hard-locked"),
+            ("not_yet_active", "Not yet active"),
+            ("expired", "Expired"),
+        ] {
+            assert_eq!(security::state_text(label).1, said);
+        }
+        assert_eq!(
+            security::readiness_line(
+                "os_password",
+                &tornect_core::unattended::readiness::Probe::Fail("empty".to_owned())
+            )
+            .1,
+            "Account password not empty: re-authentication cannot protect settings on this \
+             account"
+        );
+    }
+
+    /// Home's badge "N devices can connect without asking" (§B.8.7.3) is
+    /// unattended access as the guard says it, not the banner: it stays
+    /// when the banner is acknowledged and goes when no device can connect
+    /// without asking.
+    #[test]
+    fn the_badge_stays_after_the_banner_is_acknowledged() {
+        use super::super::model::UnattendedBanner;
+        let badge =
+            |window: &Window, text: &str| window.nodes.iter().any(|n| n.value() == Some(text));
+        let mut model = at_rest();
+        let mut manager = manager_on();
+        manager.without_asking = 2;
+        manager.not_ready = false;
+        model.manager = Some(manager);
+        let at = format!("{}T09:30:00Z", {
+            let (y, m, d) = Day::today().ymd();
+            format!("{y:04}-{m:02}-{d:02}")
+        });
+        model.unattended_banner = UnattendedBanner::of(2, Some((at, "cli")), None);
+        for size in [WIDE, NARROW] {
+            let window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, size);
+            assert!(
+                badge(&window, "2 devices can connect without asking"),
+                "{size:?}: with the banner"
+            );
+        }
+        model.unattended_banner = None;
+        for size in [WIDE, NARROW] {
+            let window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, size);
+            assert!(
+                badge(&window, "2 devices can connect without asking"),
+                "{size:?}: acknowledged"
+            );
+        }
+        if let Some(manager) = &mut model.manager {
+            manager.without_asking = 1;
+        }
+        let window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
+        assert!(badge(&window, "1 device can connect without asking"));
+        if let Some(manager) = &mut model.manager {
+            manager.without_asking = 0;
+        }
+        let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(!has_text(&window, "can connect without asking"));
+    }
+
+    /// While this screen may be in a picture that leaves it, Home draws no
+    /// badge of how many devices can connect without asking.
+    #[test]
+    fn the_badge_is_not_drawn_while_shared() {
+        let mut model = at_rest();
+        let mut manager = manager_on();
+        manager.not_ready = false;
+        model.manager = Some(manager);
+        model.sharing = vec![super::super::model::Sharing {
+            session_id: "00".to_owned(),
+            label: "Laptop".to_owned(),
+            control: true,
+            unattended: false,
+            since: Instant::now(),
+            capture: None,
+        }];
+        let mut elsewhere = model.clone();
+        elsewhere.sharing.clear();
+        elsewhere.hosted_elsewhere = true;
+        for model in [model, elsewhere] {
+            for size in [WIDE, NARROW] {
+                let window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, size);
+                assert!(!has_text(&window, "can connect without asking"), "{size:?}");
+            }
+        }
+    }
+
+    /// Home's not-ready badge (§B.8.7.1 ⑥) shows while a readiness row is
+    /// not green and unattended access is on, and goes once every row is
+    /// (or unattended access is off).
+    #[test]
+    fn a_not_ready_row_raises_the_badge_until_ready() {
+        let mut model = at_rest();
+        model.manager = Some(manager_on());
+        let window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(&window, home::NOT_READY));
+        let mut ready = manager_on();
+        ready.not_ready = false;
+        model.manager = Some(ready);
+        let window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
+        assert!(!has_text(&window, home::NOT_READY));
+        let mut off = manager_on();
+        off.on = false;
+        model.manager = Some(off);
+        let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(!has_text(&window, home::NOT_READY));
+    }
+
+    /// While this screen may be in a picture that leaves it, Settings,
+    /// Security shows no device: the hidden card stands in their place,
+    /// whether unattended access is on and what the readiness rows say stay.
+    #[test]
+    fn the_security_section_while_shared_shows_the_hidden_card() {
+        let mut model = at_rest();
+        model.manager = Some(manager_on());
+        model.hosted_elsewhere = true;
+        for size in [WIDE, NARROW] {
+            let window = security_section(model.clone(), size);
+            assert!(has_text(&window, HIDDEN_WHILE_SHARED), "{size:?}");
+            for gone in ["Office laptop", "Tablet", "device words", "failed attempt"] {
+                assert!(!has_text(&window, gone), "{size:?}: {gone}");
+            }
+            for kept in ["On", "Panic key: bound"] {
+                assert!(has_text(&window, kept), "{size:?}: {kept}");
+            }
+        }
+    }
+
+    /// A window without the guard (no host role here, a store that did not
+    /// open, another Tornect holding it) says so on Settings, Security, and
+    /// shows nothing else of unattended access and no control.
+    #[test]
+    fn without_a_guard_the_security_section_offers_no_control() {
+        use settings::security;
+        for size in [WIDE, NARROW] {
+            let window = security_section(at_rest(), size);
+            assert!(has_text(&window, security::NO_GUARD), "{size:?}");
+            assert!(!has_text(&window, "Readiness"), "{size:?}");
+            let chrome = chrome_controls(&at_rest(), size);
+            let narrow = size == NARROW;
+            for control in window.controls() {
+                assert!(
+                    chrome.contains(&control)
+                        || settings::Section::LISTED
+                            .iter()
+                            .any(|s| s.label(narrow) == control),
+                    "{size:?}: \"{control}\""
+                );
             }
         }
     }
