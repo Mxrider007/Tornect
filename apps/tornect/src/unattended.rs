@@ -2039,9 +2039,10 @@ async fn administrator_form(
     let report = status_report(paths, route).await?;
     let label = label_of(paths, &report, &device);
     // ⑤a's warning first (§B.8.7.1, §B.8.7.4; the operator's rulings of
-    // 2026-10-02): before an admin grant is created, since until the wizard's
-    // step exists this is the only way to create one, and before a grant is
-    // raised, which gives it the same access.
+    // 2026-10-02): before an admin grant is created, as the wizard's
+    // Administrator step shows it (that step and this form are the two ways
+    // to create one), and before a grant is raised, which gives it the same
+    // access.
     io.err(&tornect_core::levels::ADMINISTRATOR_WARNING.replace("<device>", &label));
     // The other Control grants, as they were before this change.
     let control = tornect_core::session_log::SessionMode::Control.wire();
