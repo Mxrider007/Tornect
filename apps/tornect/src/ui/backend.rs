@@ -495,6 +495,7 @@ fn refusal(e: &tornect_core::unattended::guard::GuardError) -> &'static str {
         GuardError::NeedsPassword(_) => {
             "Not done: this device needs a new password before its access can be enabled."
         }
+        GuardError::Unsupported(why) => level_refusal(why).unwrap_or(NOT_CHANGED),
         _ => NOT_CHANGED,
     }
 }
@@ -502,6 +503,25 @@ fn refusal(e: &tornect_core::unattended::guard::GuardError) -> &'static str {
 /// Why an operation of Settings, Security was not done, when no plainer
 /// reason applies.
 const NOT_CHANGED: &str = "Not done: unattended access could not be changed.";
+
+/// Why the guard refuses the administrator level here (`G_UNSUPPORTED`,
+/// §B.8.7.4), as the plan words it: the guard's reason when it is one of
+/// those sentences, never any other text.
+fn level_refusal(why: &str) -> Option<&'static str> {
+    use tornect_core::levels::{
+        REFUSAL_ADMIN_HELPING_SOMEONE, REFUSAL_ADMIN_LINUX, REFUSAL_ADMIN_STANDALONE,
+        REFUSAL_ADMIN_STANDARD_ACCOUNT, REFUSAL_ADMIN_UNREADABLE,
+    };
+    [
+        REFUSAL_ADMIN_LINUX,
+        REFUSAL_ADMIN_STANDALONE,
+        REFUSAL_ADMIN_STANDARD_ACCOUNT,
+        REFUSAL_ADMIN_HELPING_SOMEONE,
+        REFUSAL_ADMIN_UNREADABLE,
+    ]
+    .into_iter()
+    .find(|text| *text == why)
+}
 
 /// Why the wizard's *Turn on* did not register a password of the person's
 /// own: it does not meet the policy of §B.8.7.2.
@@ -891,9 +911,11 @@ impl ManagerWatch {
             inputs: self.ctx.user_inputs.clone(),
             min_score: self.ctx.min_score(),
         };
+        let account = self.ctx.facts.account();
         shared.update(|m| {
             m.wizard.devices = Some(devices);
             m.wizard.policy = Some(policy);
+            m.wizard.account = Some(account);
         });
     }
 
@@ -901,14 +923,20 @@ impl ManagerWatch {
     /// only be generated, into the model. The guard's preview: no dialog, no
     /// line, no write.
     fn wizard_preview(&self, choice: WizardChoice, shared: &Shared) {
+        use tornect_core::unattended::guard::GuardError;
         let judged = self
             .ctx
             .guard
-            .preview(&choice.device, choice.preset, &choice.options)
-            .ok();
+            .preview(&choice.device, choice.preset, &choice.options);
+        let refused = match &judged {
+            Err(GuardError::Unsupported(why)) => level_refusal(why),
+            _ => None,
+        };
+        let judged = judged.ok();
         let generated_only = judged.as_ref().map(|p| p.generated_only());
         let raises = judged.as_ref().map(|p| p.raises);
         shared.update(|m| {
+            m.wizard.level_refused = refused.map(|why| (choice.clone(), why));
             m.wizard.raises = Some((choice.clone(), raises));
             m.wizard.preview = Some((choice, generated_only));
         });
@@ -5732,5 +5760,195 @@ mod tests {
         assert_eq!(devices.iter().map(|c| c.device).collect::<Vec<_>>(), [two]);
         watch.wizard_grant(turn_on(two, generated_pw()), &shared);
         assert_eq!(shared.read(|m| m.wizard.offer), Some(false), "none left");
+    }
+
+    // ------------------------------------------------------------ ⑤a (§B.8.7.1)
+
+    /// The wizard's *Turn on* as press `attempt` for `device`, `preset`, with
+    /// the administrator level, the attended precondition waived.
+    fn with_level(
+        attempt: u64,
+        device: tornect_core::DeviceId,
+        preset: tornect_core::unattended::grant::Preset,
+        password: NewPassword,
+    ) -> GrantRequest {
+        GrantRequest {
+            attempt,
+            choice: WizardChoice {
+                device,
+                preset,
+                options: tornect_core::unattended::ipc::GrantOptions {
+                    waive_attended_precondition: true,
+                    elevation: Some(Elevation::Admin),
+                    ..Default::default()
+                },
+            },
+            password,
+        }
+    }
+
+    /// Decision M1-67, §B.8.7.1 ⑤a: on an installed Tornect of a Windows
+    /// administrator account the wizard's grant with the level and a chosen
+    /// password is refused before any dialog, and nothing is written; with a
+    /// generated one it is one raising dialog (then Turn on's), and the grant
+    /// holds the level with its password unmarked. The wizard opened reads
+    /// the guard's account facts.
+    #[test]
+    fn an_administrator_grant_is_created_only_with_a_generated_password() {
+        use tornect_core::levels::{FactsSource, FixedFacts, HelperPresence};
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let facts = Arc::new(FixedFacts::new(windows_admin(), HelperPresence::Absent));
+        let watch = wizard_watch(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(NoSessionActivity),
+            Arc::clone(&facts),
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.wizard_devices(&shared);
+        assert_eq!(shared.read(|m| m.wizard.account), Some(windows_admin()));
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        watch.wizard_grant(
+            with_level(1, device, Preset::MyMachines, chosen_pw()),
+            &shared,
+        );
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((1, WizardAnswer::NeedsGenerated))
+        );
+        assert!(reauth.calls().is_empty(), "no dialog");
+        assert!(watch.ctx.guard.store().grant(&device).is_none());
+        watch.wizard_grant(
+            with_level(2, device, Preset::MyMachines, generated_pw()),
+            &shared,
+        );
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((2, WizardAnswer::Done))
+        );
+        assert_eq!(reauth.calls(), ["raise", "master_on"]);
+        let grant = watch.ctx.guard.store().grant(&device).expect("given");
+        assert!(grant.holds_level(), "the level");
+        assert!(!grant.marked(), "generated: unmarked");
+        assert_eq!(facts.helper_task(), HelperPresence::Absent);
+    }
+
+    /// The guard's refusal of the level as the wizard learns it: the preview
+    /// of `request`'s choice puts the plan's sentence into the model, and its
+    /// Turn on is refused in it before any dialog, nothing written.
+    fn refused_with(
+        account: tornect_core::levels::AccountFacts,
+        request: GrantRequest,
+        why: &'static str,
+    ) {
+        use tornect_core::levels::{FixedFacts, HelperPresence};
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let watch = wizard_watch(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(NoSessionActivity),
+            Arc::new(FixedFacts::new(account, HelperPresence::Absent)),
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.wizard_preview(request.choice.clone(), &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.level_refused.clone()),
+            Some((request.choice.clone(), why))
+        );
+        let device = request.choice.device;
+        watch.wizard_grant(request, &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((1, WizardAnswer::Refused(why)))
+        );
+        assert!(reauth.calls().is_empty(), "{why}: no dialog");
+        assert!(watch.ctx.guard.store().grant(&device).is_none(), "{why}");
+    }
+
+    /// §B.8.7.4: a standard account and a copy outside Program Files cannot
+    /// give the level: the step learns the guard's reason, and a grant with
+    /// the level is refused in it.
+    #[test]
+    fn a_standard_account_or_portable_copy_is_refused_with_its_reason() {
+        use tornect_core::levels::{
+            AccountFacts, REFUSAL_ADMIN_STANDALONE, REFUSAL_ADMIN_STANDARD_ACCOUNT, WindowsFacts,
+        };
+        use tornect_core::unattended::grant::Preset;
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        let standard = AccountFacts::Windows(WindowsFacts {
+            installed: true,
+            ..Default::default()
+        });
+        let portable = AccountFacts::Windows(WindowsFacts {
+            administrator: true,
+            ..Default::default()
+        });
+        for (account, why) in [
+            (standard, REFUSAL_ADMIN_STANDARD_ACCOUNT),
+            (portable, REFUSAL_ADMIN_STANDALONE),
+        ] {
+            refused_with(
+                account,
+                with_level(1, device, Preset::MyMachines, generated_pw()),
+                why,
+            );
+        }
+    }
+
+    /// §B.8.7.1 ⑤a: *Helping someone* refuses the level, on an account that
+    /// could give it otherwise.
+    #[test]
+    fn helping_someone_refuses_the_administrator_step() {
+        use tornect_core::levels::REFUSAL_ADMIN_HELPING_SOMEONE;
+        use tornect_core::unattended::grant::Preset;
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        refused_with(
+            windows_admin(),
+            with_level(1, device, Preset::HelpingSomeone, generated_pw()),
+            REFUSAL_ADMIN_HELPING_SOMEONE,
+        );
+    }
+
+    /// §B.8.6.2: a grant with the level is access-increasing: refused during
+    /// and within a minute after a remote session, before any dialog, and
+    /// nothing is written.
+    #[test]
+    fn the_administrator_step_waits_for_the_remote_session_rule() {
+        use tornect_core::levels::{FixedFacts, HelperPresence};
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{AllowAllReAuth, ScriptedActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let activity = Arc::new(ScriptedActivity::default());
+        activity.set_live(true);
+        let watch = wizard_watch(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::clone(&activity)
+                as Arc<dyn tornect_core::unattended::guard::RemoteSessionActivity>,
+            Arc::new(FixedFacts::new(windows_admin(), HelperPresence::Absent)),
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        watch.wizard_grant(
+            with_level(1, device, Preset::MyMachines, generated_pw()),
+            &shared,
+        );
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((
+                1,
+                WizardAnswer::Refused(
+                    "Not done: a remote session is running, or ended less than a minute ago."
+                )
+            ))
+        );
+        assert!(reauth.calls().is_empty(), "no dialog");
+        assert!(watch.ctx.guard.store().grant(&device).is_none());
     }
 }
