@@ -7,6 +7,7 @@
 //! what the sections say stays.
 
 pub(super) mod about;
+pub(super) mod connection;
 pub(super) mod display;
 pub(super) mod general;
 pub(super) mod privacy;
@@ -24,6 +25,8 @@ pub(super) enum Section {
     /// The name others see and the theme.
     #[default]
     General,
+    /// How Tornect reaches the Tor network.
+    Connection,
     /// How the stream window opens.
     Display,
     /// What others learn, what is kept here, the history switch.
@@ -35,13 +38,30 @@ pub(super) enum Section {
 impl Section {
     /// The sections the page lists, in the redesign's order: only those
     /// built.
-    pub const LISTED: [Self; 4] = [Self::General, Self::Display, Self::Privacy, Self::About];
+    pub const LISTED: [Self; 5] = [
+        Self::General,
+        Self::Connection,
+        Self::Display,
+        Self::Privacy,
+        Self::About,
+    ];
+
+    /// The section's name in the list where the page is `narrow` (below
+    /// [`NARROW_BELOW`] points): shorter there, so the list fits.
+    #[must_use]
+    pub fn label(self, narrow: bool) -> &'static str {
+        match (self, narrow) {
+            (Self::Display, true) => "Display",
+            _ => self.title(),
+        }
+    }
 
     /// The section's name in the list.
     #[must_use]
     pub fn title(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::Connection => "Connection",
             Self::Display => "Display and quality",
             Self::Privacy => "Privacy",
             Self::About => "About",
@@ -56,7 +76,12 @@ pub struct SettingsForm {
     pub(super) section: Section,
     /// The name others see as typed so far, while it is being changed.
     pub(super) name: Option<String>,
+    /// The private bridge lines as typed so far.
+    pub(super) bridge_lines: Option<String>,
 }
+
+/// Below this page width (points) the section list uses its short names.
+const NARROW_BELOW: f32 = 600.0;
 
 /// What a section shows in place of the controls that write while this
 /// screen is shared.
@@ -78,7 +103,8 @@ pub(super) fn page(
             .color(t.text_primary),
     );
     ui.add_space(10.0);
-    let names: Vec<&str> = Section::LISTED.iter().map(|s| s.title()).collect();
+    let narrow = ui.available_width() < NARROW_BELOW;
+    let names: Vec<&str> = Section::LISTED.iter().map(|s| s.label(narrow)).collect();
     let mut index = Section::LISTED
         .iter()
         .position(|s| *s == form.settings.section)
@@ -88,6 +114,9 @@ pub(super) fn page(
     ui.add_space(18.0);
     match form.settings.section {
         Section::General => general::section(ui, model, &mut form.settings, shared, actions),
+        Section::Connection => {
+            connection::section(ui, model, &mut form.settings, shared, actions);
+        }
         Section::Display => display::section(ui, model, shared, actions),
         Section::Privacy => privacy::section(ui, model, shared, actions),
         Section::About => about::section(ui, model, actions),

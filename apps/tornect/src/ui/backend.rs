@@ -3035,6 +3035,36 @@ mod tests {
         });
     }
 
+    /// Settings, Connection: the way to Tor, the private bridge lines and the
+    /// proof-of-work defence reach `config.toml`, and the model then holds
+    /// them; the lines are never printed.
+    #[test]
+    fn the_bridge_choice_and_lines_reach_the_config() {
+        use super::super::model::{BridgeLines, TorChoice};
+        use tornect_core::config::BridgeMode;
+        const LINE: &str =
+            "obfs4 198.51.100.7:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=AAAA iat-mode=0";
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let choice = TorChoice {
+            bridges: BridgeMode::Snowflake,
+            bridge_lines: BridgeLines(vec![LINE.to_owned()]),
+            pow_defense: false,
+        };
+        save_settings(&paths, &shared, &SettingsChange::Tor(choice.clone()));
+        let cfg = Config::load(&paths.config_file()).unwrap();
+        assert_eq!(cfg.tor.bridges, BridgeMode::Snowflake);
+        assert_eq!(cfg.tor.bridge_lines, [LINE]);
+        assert!(!cfg.tor.pow_defense);
+        shared.read(|m| assert_eq!(m.settings.tor, choice));
+        let printed = format!("{:?}", SettingsChange::Tor(choice));
+        assert!(
+            !printed.contains("198.51") && printed.contains("1 lines"),
+            "{printed}"
+        );
+    }
+
     /// The history notice shows on the first run of a home only.
     #[test]
     fn the_history_notice_shows_once() {
