@@ -453,8 +453,13 @@ fn on_key(
 }
 
 /// A pointer button of the stream window: a press that goes to the host
-/// also gives it the keyboard back.
+/// also gives it the keyboard back. A press while the details or the Send
+/// keys menu are open only closes them: it goes nowhere, nor does its
+/// release, which finds nothing held.
 fn on_button(forwarder: &mut Forwarder, viewer: &mut ViewerState, button: Button, pressed: bool) {
+    if pressed && (viewer.details || viewer.keys_menu) {
+        return;
+    }
     if pressed && forwarder.counts_press() {
         viewer.keyboard_local = false;
     }
@@ -2728,6 +2733,56 @@ mod tests {
             "at its own size: {:?}",
             w.texts()
         );
+    }
+
+    /// A press on the picture while the details or the Send keys menu are
+    /// open only closes them: neither it nor its release reaches the host,
+    /// and the keyboard stays where it was; the next press goes out.
+    #[test]
+    fn the_press_that_closes_a_menu_goes_nowhere() {
+        for (details, keys_menu) in [(true, false), (false, true)] {
+            let mut w = Window::new(true);
+            w.viewer.details = details;
+            w.viewer.keys_menu = keys_menu;
+            w.viewer.keyboard_local = true;
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(0), Vec::new());
+            let viewing = w.viewing.clone();
+            let mut forwarder = Forwarder::new(true);
+            hand_areas(&w, &mut forwarder);
+            let away = egui::pos2(60.0, 650.0);
+            forwarder.moved((f64::from(away.x), f64::from(away.y)));
+            forwarder.flush();
+            forwarder.drain();
+            let press = |pressed| egui::Event::PointerButton {
+                pos: away,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            // The window takes the press with the state of the last frame,
+            // then egui's pass closes what was open.
+            on_button(&mut forwarder, &mut w.viewer, Button::Left, true);
+            let mut asked = w.pass(ms(100), vec![egui::Event::PointerMoved(away), press(true)]);
+            asked.extend(w.pass(ms(100), vec![press(false)]));
+            for a in &asked {
+                apply_viewer_action(&mut forwarder, &mut w.viewer, Some(&viewing), a);
+            }
+            on_button(&mut forwarder, &mut w.viewer, Button::Left, false);
+            forwarder.flush();
+            assert!(forwarder.drain().is_empty(), "{asked:?}");
+            assert!(!w.viewer.details && !w.viewer.keys_menu, "{asked:?}");
+            assert!(w.viewer.keyboard_local);
+            on_button(&mut forwarder, &mut w.viewer, Button::Left, true);
+            assert!(!w.viewer.keyboard_local);
+            assert_eq!(
+                forwarder.drain(),
+                vec![tornect_input::InputEvent::PointerButton {
+                    button: Button::Left,
+                    pressed: true
+                }]
+            );
+        }
     }
 
     /// Every action of the viewer, at every signed level, on a closed and an
