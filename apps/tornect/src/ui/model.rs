@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use tornect_core::TornectId;
 use tornect_core::address_book::{Day, mixes_scripts};
-use tornect_core::config::Theme;
+use tornect_core::config::{Theme, Viewer};
 use tornect_core::levels::{Answers, Availability};
 use tornect_core::unattended::credentials::RememberOffer;
 
@@ -955,6 +955,8 @@ pub struct Settings {
     pub device_name: String,
     /// The window's colours.
     pub theme: Theme,
+    /// How the stream window opens for a new session.
+    pub viewer: Viewer,
     /// Why the last save from the window was not made, in plain words;
     /// `None` once one was.
     pub problem: Option<&'static str>,
@@ -973,6 +975,7 @@ impl Settings {
         Self {
             device_name: cfg.general.device_name.clone(),
             theme: cfg.general.theme,
+            viewer: cfg.viewer,
             problem: None,
         }
     }
@@ -986,6 +989,8 @@ pub enum SettingsChange {
     DeviceName(String),
     /// The window's colours (they apply at once).
     Theme(Theme),
+    /// How the stream window opens (from the next session on).
+    Viewer(Viewer),
 }
 
 impl SettingsChange {
@@ -994,6 +999,7 @@ impl SettingsChange {
         match self {
             Self::DeviceName(name) => cfg.general.device_name.clone_from(name),
             Self::Theme(theme) => cfg.general.theme = *theme,
+            Self::Viewer(viewer) => cfg.viewer = *viewer,
         }
     }
 }

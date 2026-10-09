@@ -718,6 +718,8 @@ impl App {
             }
             Some(control) => {
                 let setup = self.main_device(el);
+                // How the window opens: as the settings hold it now.
+                let stored = self.shared.read(|m| m.settings.viewer);
                 // A neutral title: the window manager, the taskbar, Alt+Tab
                 // and screen-share pickers read it, so it names nobody (the
                 // toolbar inside the window names the host only while this
@@ -738,7 +740,7 @@ impl App {
                             forwarder: Forwarder::new(control),
                             last_flush: Instant::now(),
                             input_sent: 0,
-                            viewer: ViewerState::default(),
+                            viewer: ViewerState::opened(&stored),
                             chord: keys::Chord::default(),
                             fullscreen: false,
                         });
