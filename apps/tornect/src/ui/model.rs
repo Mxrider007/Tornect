@@ -951,6 +951,9 @@ impl Computer {
 /// A device that can ask to connect here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
+    /// Its key, never shown: the manager's view of its unattended access is
+    /// found by it.
+    pub id: DeviceId,
     /// The label pinned when it was paired.
     pub label: String,
     /// Its device words, once derived.
@@ -1215,6 +1218,9 @@ pub struct WizardView {
     /// Each grant's administrator level and mark, read with the manager's
     /// view (decision M1-67): the raise, the restore and their lines.
     pub levels: Vec<(DeviceId, GrantLevel)>,
+    /// Each granted device's lines on its address-book card (§B.8.6.1), read
+    /// with the manager's view.
+    pub cards: Vec<(DeviceId, DeviceCard)>,
     /// This computer's account facts as the guard read them when the wizard
     /// opened and with the manager's view (decision M1-67): on Linux the
     /// administrator level does not exist, so ⑤a and the raise are absent;
@@ -1244,6 +1250,27 @@ pub struct GrantLevel {
     pub marked: bool,
     /// Its preset (*Helping someone* never holds the level).
     pub preset: Preset,
+}
+
+/// A granted device's lines on its card in the address book's Devices tab
+/// (§B.8.6.1, decision M1-67).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceCard {
+    /// Its sessions are served view only, and why.
+    pub view_only: Option<ViewOnly>,
+    /// How many of its admin commands ran nothing; `None` when the session
+    /// log could not be read.
+    pub nothing_ran: Option<usize>,
+}
+
+/// Why a control grant's sessions are served view only (§B.8.6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewOnly {
+    /// Its password is marked, and a new generated one restores control.
+    UntilNewPassword,
+    /// This computer's account settings make control administrator access,
+    /// and the grant does not hold the level.
+    AccountSettings,
 }
 
 /// One host setting of Settings, Security, as it is to be.

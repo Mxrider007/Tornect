@@ -37,10 +37,10 @@ use super::block::GuiBlockWindow;
 use super::book::{self, Change};
 use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
 use super::model::{
-    Candidate, CaptureNote, Check, ClientStage, Dial, Failure, GrantLevel, GrantRequest, GrantRow,
-    HostSetting, Hosting, Manager, ManagerOp, NewPassword, PauseEnd, PolicyInputs, Settings,
-    SettingsChange, Shared, Sharing, TorState, UnattendedBanner, Viewing, Wake, WizardAnswer,
-    WizardChoice, WizardView,
+    Candidate, CaptureNote, Check, ClientStage, DeviceCard, Dial, Failure, GrantLevel,
+    GrantRequest, GrantRow, HostSetting, Hosting, Manager, ManagerOp, NewPassword, PauseEnd,
+    PolicyInputs, Settings, SettingsChange, Shared, Sharing, TorState, UnattendedBanner, ViewOnly,
+    Viewing, Wake, WizardAnswer, WizardChoice, WizardView,
 };
 use super::recognize::Lookalike;
 use super::stream::{FrameSlot, SlotSink};
@@ -673,12 +673,14 @@ impl ManagerWatch {
             })
             .unwrap_or_default();
         let account = Some(self.ctx.facts.account());
+        let cards = self.cards();
         if shared.read(|m| {
             m.manager != view
                 || m.wizard.offer != offer
                 || m.wizard.modes != modes
                 || m.wizard.levels != levels
                 || m.wizard.account != account
+                || m.wizard.cards != cards
         }) {
             shared.update(|m| {
                 m.manager = view;
@@ -686,8 +688,74 @@ impl ManagerWatch {
                 m.wizard.modes = modes;
                 m.wizard.levels = levels;
                 m.wizard.account = account;
+                m.wizard.cards = cards;
             });
         }
+    }
+
+    /// Each granted device's card lines in the address book (§B.8.6.1,
+    /// decision M1-67): whether its sessions are served view only and why,
+    /// decided by the levels' own rules on the account's facts now, and how
+    /// many of its admin commands ran nothing, counted over the session log
+    /// and its rotated files (read only).
+    fn cards(&self) -> Vec<(tornect_core::DeviceId, DeviceCard)> {
+        use tornect_core::levels::{self, AccountFacts, HelperPresence, Level};
+        let grants: Vec<(tornect_core::DeviceId, SessionMode, Elevation, bool)> = self
+            .ctx
+            .guard
+            .store()
+            .read(|s| {
+                s.grants
+                    .iter()
+                    .map(|g| (g.device, g.mode, g.elevation, g.marked()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if grants.is_empty() {
+            return Vec::new();
+        }
+        let account = self.ctx.facts.account();
+        let some_holds = grants.iter().any(|(_, _, e, _)| *e == Elevation::Admin);
+        // Clause (ii) needs the helper task's presence only where nothing else
+        // decides it, and only a marked control grant's line depends on it; its
+        // query starts a program on Windows, so it is read only then.
+        let needs_helper = account != AccountFacts::Linux
+            && !some_holds
+            && !account.control_is_administrator()
+            && grants
+                .iter()
+                .any(|(_, mode, _, marked)| *mode == SessionMode::Control && *marked);
+        let helper = if needs_helper {
+            self.ctx.facts.helper_task()
+        } else {
+            HelperPresence::Absent
+        };
+        let records = self.ctx.log.read_all_including_rotated().ok();
+        grants
+            .into_iter()
+            .map(|(device, mode, elevation, marked)| {
+                let level = Level::new(mode, elevation);
+                let clause = levels::clause_ii(mode, some_holds, account, helper);
+                let served = levels::served_mode(level, marked, clause, account);
+                let renewed = levels::served_mode(level, false, clause, account);
+                let view_only = (mode == SessionMode::Control && served == SessionMode::ViewOnly)
+                    .then_some(if renewed == SessionMode::Control {
+                        ViewOnly::UntilNewPassword
+                    } else {
+                        ViewOnly::AccountSettings
+                    });
+                let nothing_ran = records.as_ref().map(|r| {
+                    tornect_core::session_log::admin_commands_that_ran_nothing(r, &device)
+                });
+                (
+                    device,
+                    DeviceCard {
+                        view_only,
+                        nothing_ran,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Whether a paired device of this host has no grant yet: what the grant
@@ -6426,5 +6494,79 @@ mod tests {
         );
         assert!(!store.grant(&two).unwrap().holds_level());
         assert_eq!(reauth.calls(), asked, "no dialog");
+    }
+
+    // ------------------------------------------------------------ the device cards (§B.8.6.1)
+
+    /// §B.8.6.1, decision M1-67: the device cards' lines follow the levels'
+    /// own rules on the account's facts now: on a Windows administrator
+    /// account (UAC on) a control grant with a chosen, so marked, password
+    /// beside a grant at the level is view only until it gets a new password;
+    /// with UAC off it is view only for the account's settings; the grant at
+    /// the level with its generated password has no line, and on Linux none
+    /// has. The count is the session log's, and reading it writes nothing.
+    #[test]
+    fn the_device_cards_follow_the_levels_rules() {
+        use tornect_core::levels::{AccountFacts, FixedFacts, HelperPresence, WindowsFacts};
+        use tornect_core::session_log::{SessionEvent, SessionRecord};
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let facts = Arc::new(FixedFacts::new(windows_admin(), HelperPresence::Absent));
+        let watch = wizard_watch(
+            tmp.path(),
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            Arc::clone(&facts),
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let [one, two] = [1, 2].map(|b| tornect_core::DeviceId::from_bytes([b; 32]));
+        watch.wizard_grant(turn_on(one, chosen_pw()), &shared);
+        watch.wizard_grant(
+            with_level(2, two, Preset::MyMachines, generated_pw()),
+            &shared,
+        );
+        let card = |device| {
+            shared.read(|m| {
+                m.wizard
+                    .cards
+                    .iter()
+                    .find(|(d, _)| *d == device)
+                    .map(|(_, c)| *c)
+            })
+        };
+        watch.refresh(&shared);
+        assert_eq!(
+            card(one).and_then(|c| c.view_only),
+            Some(ViewOnly::UntilNewPassword)
+        );
+        assert_eq!(card(two).and_then(|c| c.view_only), None);
+        assert_eq!(card(one).and_then(|c| c.nothing_ran), Some(0));
+        facts.set_account(AccountFacts::Windows(WindowsFacts {
+            installed: true,
+            administrator: true,
+            enable_lua: Some(0),
+            ..Default::default()
+        }));
+        watch.refresh(&shared);
+        assert_eq!(
+            card(one).and_then(|c| c.view_only),
+            Some(ViewOnly::AccountSettings)
+        );
+        assert_eq!(card(two).and_then(|c| c.view_only), None);
+        facts.set_account(AccountFacts::Linux);
+        watch.refresh(&shared);
+        assert_eq!(card(one).and_then(|c| c.view_only), None);
+        let refused = SessionRecord::now(SessionEvent::AdminRequest)
+            .device(one)
+            .op("suspend")
+            .ok(false);
+        watch.ctx.log.append(&refused).unwrap();
+        let log = Paths::from_home(tmp.path()).sessions_log();
+        let before = std::fs::read(&log).unwrap();
+        watch.refresh(&shared);
+        assert_eq!(card(one).and_then(|c| c.nothing_ran), Some(1));
+        assert_eq!(card(two).and_then(|c| c.nothing_ran), Some(0));
+        assert_eq!(std::fs::read(&log).unwrap(), before, "read only");
     }
 }

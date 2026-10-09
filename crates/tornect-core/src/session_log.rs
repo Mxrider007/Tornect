@@ -1293,6 +1293,44 @@ impl RejectAggregator {
     }
 }
 
+/// How many of `device`'s admin commands ran nothing (§B.8.6.1, decision M1-67), over
+/// `records` in their order (the rotated files' and the live file's, oldest first, as
+/// [`SessionLog::read_all_including_rotated`] returns them): its `AdminRequest` lines
+/// answered `ok` false (a refused command, an unknown one included), and its
+/// `end_session` commands logged while it had no session open (a `SessionStarted` of it
+/// whose `SessionEnded` had not come). A command answered `ok` that changed nothing
+/// cannot be told from one that acted, and one refused before its grant was read wrote
+/// no line: neither is counted. It reads only the records given; nothing is logged.
+#[must_use]
+pub fn admin_commands_that_ran_nothing(records: &[SessionRecord], device: &DeviceId) -> usize {
+    let mut open: Vec<&str> = Vec::new();
+    let mut count = 0;
+    for r in records {
+        let of_device = r.peer_device.as_ref() == Some(device);
+        match r.event {
+            SessionEvent::SessionStarted if of_device => {
+                if let Some(id) = r.session_id.as_deref() {
+                    open.push(id);
+                }
+            }
+            SessionEvent::SessionEnded => {
+                if let Some(id) = r.session_id.as_deref() {
+                    open.retain(|o| *o != id);
+                }
+            }
+            SessionEvent::AdminRequest if of_device => {
+                let refused = r.ok == Some(false);
+                let end_without_session = r.op.as_deref() == Some("end_session") && open.is_empty();
+                if refused || end_without_session {
+                    count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1769,5 +1807,79 @@ mod tests {
             matches!(rep.status, ChainStatus::Broken { line: 2, .. }),
             "{rep:?}"
         );
+    }
+
+    /// §B.8.6.1 (decision M1-67): the device card's count rises for each admin command
+    /// of the device that ran nothing: one refused, one unknown (refused too), an
+    /// `end_session` while it had no session open; not for an `end_session` during its
+    /// open session, an executed `revoke`, another device's commands, or after its
+    /// session ended for nothing but a later `end_session`.
+    #[test]
+    fn the_card_count_rises_for_an_admin_command_that_ran_nothing() {
+        let dev = DeviceId::from_bytes([1u8; 32]);
+        let other = DeviceId::from_bytes([2u8; 32]);
+        let admin = |device, op: &str, ok: bool| {
+            SessionRecord::at(1_700_000_000, SessionEvent::AdminRequest)
+                .device(device)
+                .op(op)
+                .ok(ok)
+                .unattended(true)
+        };
+        let started = SessionRecord::at(1_700_000_000, SessionEvent::SessionStarted)
+            .peer(dev, "Laptop")
+            .session("s1")
+            .mode(SessionMode::Control)
+            .unattended(true);
+        let ended = SessionRecord::at(1_700_000_100, SessionEvent::SessionEnded)
+            .peer(dev, "Laptop")
+            .session("s1");
+        let mut records = Vec::new();
+        let count = |records: &[SessionRecord]| admin_commands_that_ran_nothing(records, &dev);
+        assert_eq!(count(&records), 0);
+        records.push(admin(dev, "suspend", false));
+        assert_eq!(count(&records), 1, "refused");
+        records.push(admin(dev, "unknown", false));
+        assert_eq!(count(&records), 2, "unknown");
+        records.push(admin(dev, "end_session", true));
+        assert_eq!(count(&records), 3, "no session open");
+        records.push(started);
+        records.push(admin(dev, "end_session", true));
+        assert_eq!(count(&records), 3, "its session was open");
+        records.push(ended);
+        records.push(admin(dev, "revoke", true));
+        assert_eq!(count(&records), 3, "an executed revoke");
+        records.push(admin(other, "suspend", false));
+        records.push(admin(other, "end_session", true));
+        assert_eq!(count(&records), 3, "another device's");
+        records.push(admin(dev, "end_session", true));
+        assert_eq!(count(&records), 4, "its session had ended");
+    }
+
+    /// Counting reads the records only: the live file and a rotated one are
+    /// byte-identical before and after.
+    #[test]
+    fn counting_writes_nothing_to_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SessionLog::new(dir.path().join("logs").join("sessions.log"));
+        let dev = DeviceId::from_bytes([1u8; 32]);
+        let refused = SessionRecord::now(SessionEvent::AdminRequest)
+            .device(dev)
+            .op("suspend")
+            .ok(false);
+        log.append(&refused).unwrap();
+        let rotated = log.rotated_path(1);
+        std::fs::copy(log.path(), &rotated).unwrap();
+        log.append(&refused).unwrap();
+        let before = (
+            std::fs::read(log.path()).unwrap(),
+            std::fs::read(&rotated).unwrap(),
+        );
+        let records = log.read_all_including_rotated().unwrap();
+        assert_eq!(admin_commands_that_ran_nothing(&records, &dev), 3);
+        let after = (
+            std::fs::read(log.path()).unwrap(),
+            std::fs::read(&rotated).unwrap(),
+        );
+        assert_eq!(before, after);
     }
 }

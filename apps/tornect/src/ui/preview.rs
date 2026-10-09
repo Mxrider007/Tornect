@@ -543,6 +543,7 @@ fn sample_book(today: Day) -> Book {
         ],
         devices: vec![
             Device {
+                id: tornect_core::DeviceId::from_bytes([0x5a; 32]),
                 label: "Laptop".to_owned(),
                 words: Some(words("orbit crisp lamp arctic")),
                 identicon: Some(Identicon::from_seed([0x5a, 0x3c, 0x02])),
@@ -550,6 +551,7 @@ fn sample_book(today: Day) -> Book {
                 last_seen: ago(1),
             },
             Device {
+                id: tornect_core::DeviceId::from_bytes([0xb6; 32]),
                 label: "Tablet".to_owned(),
                 words: Some(words("kid print proud pilot")),
                 identicon: Some(Identicon::from_seed([0xb6, 0x21, 0x05])),
