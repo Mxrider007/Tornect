@@ -2142,6 +2142,12 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     Command::SetHistory(on) => change_book(&b, &Change::History(on)),
                     Command::SaveSettings(change) => save_settings(&b.paths, &b.shared, &change),
                     Command::Manager(ManagerOp::RotateId) => {
+                        // Not while another operation waits at its password
+                        // dialog: the wipe would come between its dialog and
+                        // its commit.
+                        if b.shared.read(|m| m.manager_busy || m.wizard.running.is_some()) {
+                            continue;
+                        }
                         if let Some(manager) = hosted.as_ref().and_then(|h| h.manager.clone()) {
                             rotating = Some(manager);
                             b.shared.update(|m| m.rotating = true);
