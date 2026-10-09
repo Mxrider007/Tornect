@@ -7,6 +7,7 @@
 //! what the sections say stays.
 
 pub(super) mod general;
+pub(super) mod privacy;
 
 use egui::{RichText, Ui};
 
@@ -21,18 +22,21 @@ pub(super) enum Section {
     /// The name others see and the theme.
     #[default]
     General,
+    /// What others learn, what is kept here, the history switch.
+    Privacy,
 }
 
 impl Section {
     /// The sections the page lists, in the redesign's order: only those
     /// built.
-    pub const LISTED: [Self; 1] = [Self::General];
+    pub const LISTED: [Self; 2] = [Self::General, Self::Privacy];
 
     /// The section's name in the list.
     #[must_use]
     pub fn title(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::Privacy => "Privacy",
         }
     }
 }
@@ -76,6 +80,7 @@ pub(super) fn page(
     ui.add_space(18.0);
     match form.settings.section {
         Section::General => general::section(ui, model, &mut form.settings, shared, actions),
+        Section::Privacy => privacy::section(ui, model, shared, actions),
     }
 }
 

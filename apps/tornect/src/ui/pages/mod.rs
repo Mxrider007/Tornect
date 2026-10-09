@@ -2107,18 +2107,22 @@ mod tests {
             .iter()
             .map(|s| s.title())
             .collect();
-        assert_eq!(titles, ["General"]);
+        assert_eq!(titles, ["General", "Privacy"]);
         for size in [WIDE, NARROW] {
             let mut window = Window::new(at_rest(), Page::Settings, egui::Theme::Dark, size);
             assert_eq!(window.form.settings.section, settings::Section::General);
-            for title in &titles {
+            for (title, section) in titles.iter().zip(settings::Section::LISTED) {
                 assert!(
                     window.controls().iter().any(|c| c == title),
                     "{size:?}: {title}"
                 );
                 let at = window.center(title);
                 assert!(window.click(at).is_empty(), "{size:?}: {title}");
+                assert_eq!(window.form.settings.section, section, "{size:?}");
             }
+            let at = window.center("General");
+            assert!(window.click(at).is_empty(), "{size:?}");
+            assert!(window.pass(Vec::new()).is_empty(), "{size:?}");
             for text in [
                 "Name others see",
                 settings::general::NAME_NOTE,
@@ -2277,6 +2281,188 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The Privacy section, opened from the section list.
+    fn privacy(model: Model, size: (f32, f32)) -> Window {
+        let mut window = Window::new(model, Page::Settings, egui::Theme::Dark, size);
+        let at = window.center("Privacy");
+        assert!(window.click(at).is_empty(), "opening it asks nothing");
+        assert_eq!(window.form.settings.section, settings::Section::Privacy);
+        assert!(
+            window.pass(Vec::new()).is_empty(),
+            "drawing it asks nothing"
+        );
+        window
+    }
+
+    /// Settings, Privacy: the plan's sentences word for word (Part C row
+    /// 10's line; §B.6's name for the session log and what it records), the
+    /// screenshots line and the rest of what the page says, all on the page
+    /// at both sizes; places named in words, no path.
+    #[test]
+    fn the_privacy_page_says_the_planned_lines() {
+        use settings::privacy;
+        assert_eq!(
+            privacy::UNATTENDED_KEPT,
+            "For each computer you connect to unattended, this device keeps whether a password is \
+             remembered and whether your access there is control or reaches administrator \
+             access; Forget removes it."
+        );
+        assert_eq!(
+            privacy::LOG_KEPT,
+            "The session log is the log of your unattended connections, always kept, never sent."
+        );
+        assert_eq!(
+            privacy::LOG_RECORDS,
+            "Connection attempts to this computer, and the unattended connections and admin \
+             commands of this device, are always recorded in the session log; the history switch \
+             governs only the address book's recent list."
+        );
+        assert_eq!(
+            privacy::SCREENSHOTS,
+            "Screenshots are saved in Pictures/Tornect, named by the date and time."
+        );
+        assert_eq!(
+            privacy::NETWORK_LINE,
+            "Your IP address stays hidden: every session is relayed through Tor. Tornect has no \
+             accounts, no telemetry and no update checks, and it checks whether a saved computer \
+             is reachable only when you click \"Check if reachable\"."
+        );
+        for size in [WIDE, NARROW] {
+            let window = privacy(with_book(false), size);
+            for text in [
+                privacy::UNATTENDED_KEPT,
+                privacy::LOG_KEPT,
+                privacy::LOG_RECORDS,
+                privacy::SCREENSHOTS,
+                privacy::NETWORK_LINE,
+                settings::general::NAME_NOTE,
+                "The name \u{201c}Linux PC\u{201d}",
+            ] {
+                assert!(has_text(&window, text), "{size:?}: {text}");
+            }
+            for (what, how_long) in privacy::STORED {
+                assert!(has_text(&window, what), "{size:?}: {what}");
+                assert!(has_text(&window, how_long), "{size:?}: {how_long}");
+            }
+            for value in window.nodes.iter().filter_map(Node::value) {
+                for path in ['~', '\\'] {
+                    assert!(!value.contains(path), "{size:?}: {value}");
+                }
+                assert!(
+                    !value.contains(".toml") && !value.contains(".log"),
+                    "{size:?}: {value}"
+                );
+            }
+        }
+    }
+
+    /// The Privacy page's history switch is the Recent tab's setting, not a
+    /// second one: both show the one state, and a click on either sends the
+    /// same action; Clear history on either clears the one history.
+    #[test]
+    fn the_privacy_switch_is_the_recent_switch() {
+        use egui::accesskit::Toggled;
+        const KEEP: &str = "Keep a list of recent connections";
+        for on in [true, false] {
+            let mut model = with_book(false);
+            model.book.history = on;
+            let mut recent = Window::new(model.clone(), Page::AddressBook, egui::Theme::Dark, WIDE);
+            recent.form.book.tab = Tab::Recent;
+            recent.pass(Vec::new());
+            let mut mirror = privacy(model, WIDE);
+            let shown = if on { Toggled::True } else { Toggled::False };
+            assert_eq!(recent.node(KEEP).toggled(), Some(shown), "{on}");
+            assert_eq!(mirror.node(KEEP).toggled(), Some(shown), "{on}");
+            for window in [&mut recent, &mut mirror] {
+                let at = window.center(KEEP);
+                assert_eq!(window.click(at), vec![Action::SetHistory(!on)], "{on}");
+                let at = window.center("Clear history");
+                assert_eq!(window.click(at), vec![Action::ClearHistory], "{on}");
+            }
+        }
+    }
+
+    /// With history off the Privacy page writes no history: the click that
+    /// turns it off, applied as the window's tokio side applies it, leaves
+    /// off the one switch that both writers of `last_seen` read (their own
+    /// tests: `history`), so a connection made then is not recorded; the
+    /// page then shows the switch off and asks for nothing by itself.
+    #[test]
+    fn the_privacy_page_writes_no_history_while_off() {
+        use egui::accesskit::Toggled;
+        use tornect_core::address_book::Store;
+        const KEEP: &str = "Keep a list of recent connections";
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = tornect_core::Paths::from_home(tmp.path().join("home"));
+        let store = Store::new(&paths);
+        store.set_history(true).unwrap();
+        assert!(store.keeps_history());
+        let mut model = with_book(false);
+        model.book.history = true;
+        let mut window = privacy(model, WIDE);
+        let at = window.center(KEEP);
+        let asked = window.click(at);
+        assert_eq!(asked, vec![Action::SetHistory(false)]);
+        for action in asked {
+            if let Action::SetHistory(on) = action {
+                super::super::book::apply(&paths, &super::super::book::Change::History(on));
+            }
+        }
+        assert!(!store.keeps_history());
+        let id = TornectId::from_bytes([0x42; 32]);
+        assert!(
+            !store
+                .record_visit(id, [7; 32], "Office PC", Day::today())
+                .unwrap()
+        );
+        assert!(!store.recent_path().exists(), "no recent list written");
+        window.model.book.history = false;
+        for _ in 0..2 {
+            assert!(window.pass(Vec::new()).is_empty());
+        }
+        assert_eq!(window.node(KEEP).toggled(), Some(Toggled::False));
+    }
+
+    /// While this screen is shared, the Privacy page's history switch and
+    /// Clear give way to the hidden card, as the Recent tab's do (the whole
+    /// address book is hidden then: the mirror is no wider); what the page
+    /// says stays.
+    #[test]
+    fn the_privacy_history_controls_while_shared_are_hidden() {
+        use settings::privacy;
+        const KEEP: &str = "Keep a list of recent connections";
+        let mut model = with_book(false);
+        model.hosted_elsewhere = true;
+        for size in [WIDE, NARROW] {
+            let window = privacy(model.clone(), size);
+            assert!(has_text(&window, HIDDEN_WHILE_SHARED), "{size:?}");
+            assert!(
+                !window.nodes.iter().any(|n| n.label() == Some(KEEP)),
+                "{size:?}"
+            );
+            assert!(
+                !window.controls().iter().any(|c| c == "Clear history"),
+                "{size:?}"
+            );
+            for text in [
+                privacy::LOG_RECORDS,
+                privacy::LOG_KEPT,
+                privacy::UNATTENDED_KEPT,
+                privacy::SCREENSHOTS,
+                privacy::NETWORK_LINE,
+            ] {
+                assert!(has_text(&window, text), "{size:?}: {text}");
+            }
+            let mut book = Window::new(model.clone(), Page::AddressBook, egui::Theme::Dark, size);
+            book.form.book.tab = Tab::Recent;
+            book.pass(Vec::new());
+            assert!(
+                !book.nodes.iter().any(|n| n.label() == Some(KEEP)),
+                "{size:?}: the Recent tab's own switch is hidden too"
+            );
         }
     }
 }
