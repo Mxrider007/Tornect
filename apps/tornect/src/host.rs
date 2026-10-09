@@ -3479,4 +3479,38 @@ mod tests {
         assert!(!presses.press(t0 + Duration::from_millis(3_500)));
         assert!(enabled(&guard));
     }
+
+    /// The terminal's sessions sink tells a Control session's viewer the
+    /// host's start code from the session's start on, through `notice`: 0 on
+    /// a host that does not run Windows; on Windows, at the level none, the
+    /// Windows bit and the administrator-windows bit. A view-only session's
+    /// viewer is told nothing.
+    #[tokio::test]
+    async fn the_terminal_sink_tells_the_viewer_the_start_code() {
+        let sessions = CliSessions {
+            live: Arc::new(LiveSessions::new()),
+            polkit: Arc::new(PolkitRevocation::for_this_host()),
+            media: media(),
+            control: ControlChannel::default(),
+        };
+        let token = tornect_signal::consent::SessionToken::new([5; 32]);
+        let control = if cfg!(windows) { 0x03 } else { 0x00 };
+        for (id, mode, want) in [
+            ("c1", SessionMode::Control, Some(control)),
+            ("v1", SessionMode::ViewOnly, None),
+        ] {
+            sessions.on_start(&LiveSession {
+                device: DeviceIdentity::from_seed(&[9; 32]).id(),
+                label: "Laptop",
+                session_id: id,
+                token: &token,
+                th_final: [0; 32],
+                mode,
+                elevation: tornect_core::levels::Elevation::None,
+                unattended: false,
+            });
+            assert_eq!(sessions.notice(id), want, "{id}");
+            sessions.on_end(id, None);
+        }
+    }
 }
