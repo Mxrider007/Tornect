@@ -414,6 +414,65 @@ struct ManagerWatch {
     /// model and while the closing window takes it back, so that one of the
     /// two always sees the other.
     closing: Mutex<bool>,
+    /// The start-at-sign-in registration for the executable at a path, built
+    /// at each change for the program running then (as the command line's
+    /// offline route builds it); a fake in the tests.
+    autostart_for: AutostartFor,
+    /// Whether Tornect is installed on this computer (the install's probe).
+    installed: Arc<dyn Fn() -> Option<bool> + Send + Sync>,
+}
+
+/// How [`ManagerWatch`] builds a start-at-sign-in registration for an
+/// executable.
+type AutostartFor =
+    Arc<dyn Fn(&std::path::Path) -> Arc<dyn tornect_platform::autostart::Autostart> + Send + Sync>;
+
+/// The registration `tornect service install` would make for the executable
+/// at `exe` and the home `paths`; refused (nothing can be registered) when
+/// that executable is gone.
+fn autostart_for(paths: Paths) -> AutostartFor {
+    use tornect_platform::autostart;
+    Arc::new(
+        move |exe| match crate::unattended::launch_spec_for(&paths, exe.to_path_buf()) {
+            Ok(spec) => autostart::for_this_os(spec),
+            Err(e) => Arc::new(autostart::NoAutostart(format!("{e:#}"))),
+        },
+    )
+}
+
+/// Whether Tornect is installed on this computer, by the install's own
+/// probe (§B.1.1): on Linux the per-user files, on Windows the copy in
+/// Program Files; `None` where it cannot be read.
+fn installed_now() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        tornect_platform::install::LinuxInstall::for_this_user()
+            .ok()
+            .map(|files| files.installed())
+    }
+    #[cfg(windows)]
+    {
+        let sys = tornect_platform::install::windows_system().ok()?;
+        let target = tornect_platform::install::WindowsTarget::entry_of(&*sys).ok()?;
+        Some(std::path::Path::new(&target.exe).is_file())
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
+/// Why a start-at-sign-in change was not made, in plain words, by its code.
+fn sign_in_refusal(code: u16) -> &'static str {
+    use tornect_core::unattended::ipc::codes;
+    match code {
+        codes::G_REMOTE_SESSION_ACTIVE => {
+            "Not done: a remote session is running, or ended less than a minute ago."
+        }
+        codes::G_REAUTH_FAILED => "Not done: this computer's password was not confirmed.",
+        codes::G_KEYSTORE_LOCKED => "Not done: Tornect cannot read its keystore right now.",
+        _ => "Not done: what starts at sign-in could not be changed from here.",
+    }
 }
 
 /// How long the shorter pause of Settings, Security lasts.
@@ -448,15 +507,20 @@ const PAUSE_RUNS: &str = "Not done: a pause is running already.";
 const PAIRING_KEPT: &str = "Unattended access was removed, but the pairing could not be removed.";
 
 impl ManagerWatch {
-    /// The readiness rows as the host last probed them, with the rows this
-    /// process knows at once: the panic key, and in background mode whether
-    /// the indicator was shown. The start at sign-in is not asked of the
-    /// system here: on Windows that runs `schtasks`, which would open a
-    /// console window from this windowed program at every read.
-    fn readiness(&self) -> tornect_core::unattended::readiness::ReadinessSnapshot {
+    /// The readiness rows as the host last probed them, with the rows read
+    /// now: the start at sign-in from `autostart` (the system's answer), the
+    /// panic key, and in background mode whether the indicator was shown.
+    fn readiness(
+        &self,
+        autostart: &Result<
+            tornect_platform::autostart::AutostartState,
+            tornect_platform::autostart::AutostartError,
+        >,
+    ) -> tornect_core::unattended::readiness::ReadinessSnapshot {
         use tornect_core::unattended::readiness::Probe;
         use tornect_platform::hotkey::{self, KeyState};
         let mut snap = self.ctx.readiness.get();
+        snap.autostart = tornect_platform::autostart::readiness_probe(autostart);
         snap.panic_key = match hotkey::state() {
             KeyState::Bound => Probe::Ok,
             state => Probe::Fail(state.row().to_owned()),
@@ -471,8 +535,15 @@ impl ManagerWatch {
     fn read(&self) -> Manager {
         use tornect_core::unattended::readiness::Probe;
         use tornect_core::words::Role;
+        use tornect_platform::autostart::AutostartState;
         let now = tornect_core::trusted::unix_now();
-        let readiness = self.readiness();
+        let autostart = self.ctx.autostart.status();
+        let sign_in = match &autostart {
+            Ok(AutostartState::Registered(_)) => Some(true),
+            Ok(AutostartState::Absent) => Some(false),
+            Ok(AutostartState::Unavailable(_)) | Err(_) => None,
+        };
+        let readiness = self.readiness(&autostart);
         let not_ready = readiness.badge();
         let rows: Vec<(&'static str, Probe)> = readiness
             .fields()
@@ -528,6 +599,8 @@ impl ManagerWatch {
             keep_awake,
             prevent_idle_lock,
             notify,
+            sign_in,
+            installed: (self.installed)(),
         }
     }
 
@@ -571,6 +644,22 @@ impl ManagerWatch {
             ManagerOp::Enable(device) => guard.enable(Actor::Ui, &device).map_err(|e| refusal(&e)),
             ManagerOp::Unlock(device) => guard.unlock(Actor::Ui, &device).map_err(|e| refusal(&e)),
             ManagerOp::Resume(device) => guard.resume(Actor::Ui, &device).map_err(|e| refusal(&e)),
+            ManagerOp::SignIn(on) => {
+                let backend = match std::env::current_exe() {
+                    Ok(exe) => (self.autostart_for)(&exe),
+                    Err(_) => Arc::new(tornect_platform::autostart::NoAutostart(
+                        "this program's file cannot be found".to_owned(),
+                    )),
+                };
+                crate::unattended::autostart_change(
+                    guard,
+                    &*backend,
+                    Actor::Ui,
+                    on.then_some(false),
+                )
+                .map(|_| ())
+                .map_err(|refused| sign_in_refusal(refused.code))
+            }
             ManagerOp::Setting(setting) => {
                 let mut settings = tornect_core::unattended::guard::HostSettings::default();
                 match setting {
@@ -955,6 +1044,8 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
             words: Arc::clone(&b.words),
             trusted: Arc::clone(&deps.trusted),
             closing: Mutex::new(false),
+            autostart_for: autostart_for(b.paths.clone()),
+            installed: Arc::new(installed_now),
         })
     });
     if let Some(watch) = &manager {
@@ -1426,6 +1517,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                                     | ManagerOp::Unlock(_)
                                     | ManagerOp::Resume(_)
                                     | ManagerOp::Setting(_)
+                                    | ManagerOp::SignIn(_)
                             );
                             if asks {
                                 if b.shared.read(|m| m.manager_busy) {
@@ -2686,6 +2778,10 @@ mod tests {
             words: Arc::new(super::super::recognize::Recognizer::default()),
             trusted: Arc::new(TrustedDeviceStore::ephemeral(Default::default())),
             closing: Mutex::new(false),
+            autostart_for: Arc::new(|_| {
+                Arc::new(tornect_platform::autostart::NoAutostart("test".to_owned()))
+            }),
+            installed: Arc::new(|| None),
         };
         let shared = Shared::new(Model::default(), Arc::new(|_| {}));
         watch.refresh(&shared);
@@ -2718,7 +2814,10 @@ mod tests {
         assert_eq!((row.last_used, row.failures), (None, 0));
         let names: Vec<&str> = on.readiness.iter().map(|(name, _)| *name).collect();
         assert_eq!(names, FIELD_NAMES);
-        assert_eq!(on.not_ready, watch.readiness().badge());
+        assert_eq!(
+            on.not_ready,
+            watch.readiness(&watch.ctx.autostart.status()).badge()
+        );
         assert_eq!(
             std::fs::read(paths.sessions_log()).unwrap(),
             logged,
@@ -2817,6 +2916,10 @@ mod tests {
             words: Arc::new(super::super::recognize::Recognizer::default()),
             trusted: Arc::clone(&trusted),
             closing: Mutex::new(false),
+            autostart_for: Arc::new(|_| {
+                Arc::new(tornect_platform::autostart::NoAutostart("test".to_owned()))
+            }),
+            installed: Arc::new(|| None),
         };
         let shared = Shared::new(Model::default(), Arc::new(|_| {}));
         let state = |device: tornect_core::DeviceId| {
@@ -2928,6 +3031,10 @@ mod tests {
             words: Arc::new(super::super::recognize::Recognizer::default()),
             trusted: Arc::new(TrustedDeviceStore::ephemeral(Default::default())),
             closing: Mutex::new(false),
+            autostart_for: Arc::new(|_| {
+                Arc::new(tornect_platform::autostart::NoAutostart("test".to_owned()))
+            }),
+            installed: Arc::new(|| None),
         }
     }
 
@@ -3245,6 +3352,181 @@ mod tests {
         );
         let view = shared.read(|m| m.manager.clone()).expect("read");
         assert_eq!(view.grants[0].state, "disabled:restore");
+    }
+
+    /// `watch` reading and changing what starts at sign-in through `fake`.
+    fn with_autostart(
+        mut watch: ManagerWatch,
+        fake: &Arc<crate::test_support::FakeAutostart>,
+    ) -> ManagerWatch {
+        use tornect_platform::autostart::Autostart;
+        watch.ctx.autostart = Arc::clone(fake) as Arc<dyn Autostart>;
+        let fake = Arc::clone(fake);
+        watch.autostart_for = Arc::new(move |_| Arc::clone(&fake) as Arc<dyn Autostart>);
+        watch
+    }
+
+    /// §B.1.1: the window's "Start Tornect when I sign in" runs the guard's
+    /// operation of `tornect service install`, as the window: one dialog
+    /// under its own name, the line `AutostartChanged` by the window, then
+    /// the registration, and the switch reads what the system says after.
+    /// A password not confirmed registers nothing.
+    #[test]
+    fn the_sign_in_switch_goes_through_the_guard() {
+        use tornect_core::session_log::{Actor, SessionEvent};
+        use tornect_core::unattended::guard::{AllowAllReAuth, DenyAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let fake = Arc::new(crate::test_support::FakeAutostart::default());
+        let watch = with_autostart(
+            manager_over(
+                tmp.path(),
+                Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+                Arc::new(NoSessionActivity),
+                tornect_core::levels::AccountFacts::Linux,
+                b"this machine",
+            ),
+            &fake,
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.refresh(&shared);
+        let sign_in = |shared: &Shared| shared.read(|m| m.manager.as_ref().and_then(|v| v.sign_in));
+        assert_eq!(sign_in(&shared), Some(false));
+        watch.run(ManagerOp::SignIn(true), &shared);
+        assert_eq!(reauth.calls(), ["service_install"]);
+        assert_eq!(fake.installs(), [false]);
+        assert_eq!(sign_in(&shared), Some(true));
+        assert_eq!(shared.read(|m| m.manager_note), None);
+        assert!(watch.ctx.log.read_all().unwrap().iter().any(|r| {
+            r.event == SessionEvent::AutostartChanged
+                && r.by == Some(Actor::Ui)
+                && r.detail.as_deref() == Some("install")
+        }));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Arc::new(crate::test_support::FakeAutostart::default());
+        let watch = with_autostart(
+            manager_over(
+                tmp.path(),
+                Arc::new(DenyAllReAuth),
+                Arc::new(NoSessionActivity),
+                tornect_core::levels::AccountFacts::Linux,
+                b"this machine",
+            ),
+            &fake,
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.run(ManagerOp::SignIn(true), &shared);
+        assert!(fake.installs().is_empty(), "nothing registered");
+        assert_eq!(
+            shared.read(|m| m.manager_note),
+            Some("Not done: this computer's password was not confirmed.")
+        );
+        assert_eq!(sign_in(&shared), Some(false));
+    }
+
+    /// §B.8.6.2: during a remote session, and for 60 s after one, the switch
+    /// registers nothing and asks no dialog; the section says why.
+    #[test]
+    fn the_sign_in_switch_waits_for_the_remote_session_rule() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, RemoteSessionActivity};
+        struct Live;
+        impl RemoteSessionActivity for Live {
+            fn last_session_ended_at(&self) -> Option<Instant> {
+                None
+            }
+            fn session_live(&self) -> bool {
+                true
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let fake = Arc::new(crate::test_support::FakeAutostart::default());
+        let watch = with_autostart(
+            manager_over(
+                tmp.path(),
+                Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+                Arc::new(Live),
+                tornect_core::levels::AccountFacts::Linux,
+                b"this machine",
+            ),
+            &fake,
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.run(ManagerOp::SignIn(true), &shared);
+        assert!(fake.installs().is_empty());
+        assert!(reauth.calls().is_empty(), "no dialog");
+        assert_eq!(
+            shared.read(|m| m.manager_note),
+            Some("Not done: a remote session is running, or ended less than a minute ago.")
+        );
+        assert_eq!(
+            shared.read(|m| m.manager.as_ref().and_then(|v| v.sign_in)),
+            Some(false)
+        );
+    }
+
+    /// Turning the start at sign-in off with nothing registered changes
+    /// nothing and asks nothing; with a registration it asks once and
+    /// removes it.
+    #[test]
+    fn turning_sign_in_off_with_nothing_registered_asks_nothing() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let fake = Arc::new(crate::test_support::FakeAutostart::default());
+        let watch = with_autostart(
+            manager_over(
+                tmp.path(),
+                Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+                Arc::new(NoSessionActivity),
+                tornect_core::levels::AccountFacts::Linux,
+                b"this machine",
+            ),
+            &fake,
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.run(ManagerOp::SignIn(false), &shared);
+        assert!(reauth.calls().is_empty());
+        assert_eq!(fake.uninstalls(), 0);
+        assert_eq!(shared.read(|m| m.manager_note), None);
+        watch.run(ManagerOp::SignIn(true), &shared);
+        watch.run(ManagerOp::SignIn(false), &shared);
+        assert_eq!(reauth.calls(), ["service_install", "service_uninstall"]);
+        assert_eq!(fake.uninstalls(), 1);
+        assert_eq!(
+            shared.read(|m| m.manager.as_ref().and_then(|v| v.sign_in)),
+            Some(false)
+        );
+    }
+
+    /// The install state Settings, General shows is the install's own probe
+    /// (§B.1.1): the per-user files, here in a temporary home.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_install_state_follows_the_install_probe() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let (bin, apps) = (tmp.path().join("bin"), tmp.path().join("apps"));
+        let mut watch = manager_over(
+            &tmp.path().join("home"),
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            tornect_core::levels::AccountFacts::Linux,
+            b"this machine",
+        );
+        let files = tornect_platform::install::LinuxInstall::new(bin.clone(), apps);
+        let probe = files.clone();
+        watch.installed = Arc::new(move || Some(probe.installed()));
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.refresh(&shared);
+        let installed =
+            |shared: &Shared| shared.read(|m| m.manager.as_ref().and_then(|v| v.installed));
+        assert_eq!(installed(&shared), Some(false));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(files.exe(), b"").unwrap();
+        watch.refresh(&shared);
+        assert_eq!(installed(&shared), Some(true));
     }
 
     /// The row "indicator shown" as the host at `state_dir` answers it over

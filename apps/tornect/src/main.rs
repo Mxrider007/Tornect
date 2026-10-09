@@ -31,6 +31,8 @@ mod install_cmd;
 mod prompt;
 mod secure_screen;
 mod term_block;
+#[cfg(test)]
+mod test_support;
 mod tor_cmd;
 mod ua_client;
 mod ui;

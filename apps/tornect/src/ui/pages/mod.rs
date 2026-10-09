@@ -2353,6 +2353,8 @@ mod tests {
             keep_awake: false,
             prevent_idle_lock: false,
             notify: false,
+            sign_in: Some(false),
+            installed: Some(false),
         }
     }
 
@@ -2871,6 +2873,97 @@ mod tests {
         window.form.settings.section = settings::Section::Security;
         window.pass(Vec::new());
         assert!(!has_text(&window, "0a1b-2c3d"), "not under a sheet");
+    }
+
+    /// Settings, General's "Start Tornect when I sign in" (§B.1.1): turning
+    /// it on first says what it means, as approved, with Cancel first; only
+    /// its "Turn on" sends the operation (the switch moves on the guard's
+    /// answer, not on the click); turning it off sends the removal at once.
+    #[test]
+    fn the_sign_in_switch_shows_the_tor_text_before_it_acts() {
+        use super::super::model::ManagerOp;
+        use settings::general;
+        let text = format!(
+            "{} {}",
+            crate::unattended::TOR_AT_SIGN_IN,
+            general::WHILE_IT_RUNS
+        );
+        assert_eq!(
+            text,
+            "Starting at sign-in means a Tor connection at every sign-in: your local network and \
+             your internet provider can see that this computer uses Tor. While Tornect runs, \
+             devices you gave unattended access can connect, new devices can ask to pair, and \
+             anyone with this computer's Tornect ID can see that it is online."
+        );
+        let mut model = at_rest();
+        model.manager = Some(one_device());
+        for size in [TALL, (NARROW.0, 1600.0)] {
+            let mut window = Window::new(model.clone(), Page::Settings, egui::Theme::Dark, size);
+            assert!(!has_text(&window, &text), "{size:?}");
+            let at = window.center(general::SIGN_IN);
+            assert!(
+                window.click(at).is_empty(),
+                "{size:?}: the click asks nothing yet"
+            );
+            assert!(window.pass(Vec::new()).is_empty(), "{size:?}");
+            assert!(has_text(&window, &text), "{size:?}: the text first");
+            let cancel = window.node("Cancel").bounds().expect("bounds");
+            let turn_on = window.node(general::TURN_ON).bounds().expect("bounds");
+            assert!(cancel.x0 < turn_on.x0, "{size:?}: Cancel first");
+            let at = window.center("Cancel");
+            assert!(window.click(at).is_empty(), "{size:?}");
+            assert!(window.pass(Vec::new()).is_empty(), "{size:?}");
+            assert!(!has_text(&window, &text), "{size:?}: cancelled");
+            let at = window.center(general::SIGN_IN);
+            assert!(window.click(at).is_empty(), "{size:?}");
+            assert!(window.pass(Vec::new()).is_empty(), "{size:?}");
+            let at = window.center(general::TURN_ON);
+            assert_eq!(
+                window.click(at),
+                vec![Action::Manager(ManagerOp::SignIn(true))],
+                "{size:?}"
+            );
+        }
+        let mut on = one_device();
+        on.sign_in = Some(true);
+        model.manager = Some(on);
+        let mut window = Window::new(model.clone(), Page::Settings, egui::Theme::Dark, TALL);
+        let at = window.center(general::SIGN_IN);
+        assert_eq!(
+            window.click(at),
+            vec![Action::Manager(ManagerOp::SignIn(false))]
+        );
+        model.manager = None;
+        let window = Window::new(model, Page::Settings, egui::Theme::Dark, TALL);
+        assert!(
+            has_text(&window, settings::security::NO_GUARD),
+            "no guard: said"
+        );
+        assert!(!window.controls().iter().any(|c| c == general::SIGN_IN));
+    }
+
+    /// Settings, General says whether Tornect is installed, by the install's
+    /// probe, with the command that installs or removes it and that Tornect
+    /// must be closed first (§B.1.1).
+    #[test]
+    fn the_install_state_and_its_command_are_shown() {
+        use settings::general;
+        for (installed, state, command) in [
+            (Some(true), "Installed.", "tornect uninstall"),
+            (Some(false), "Not installed.", "tornect install"),
+            (None, "could not be read", "tornect install"),
+        ] {
+            let mut manager = one_device();
+            manager.installed = installed;
+            let mut model = at_rest();
+            model.manager = Some(manager);
+            for size in [TALL, (NARROW.0, 1600.0)] {
+                let window = Window::new(model.clone(), Page::Settings, egui::Theme::Dark, size);
+                for text in [state, command, general::CLOSE_FIRST] {
+                    assert!(has_text(&window, text), "{installed:?} {size:?}: {text}");
+                }
+            }
+        }
     }
 
     /// The Privacy section, opened from the section list.

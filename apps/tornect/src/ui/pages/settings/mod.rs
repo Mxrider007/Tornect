@@ -86,6 +86,8 @@ pub struct SettingsForm {
     pub(super) bridge_lines: Option<String>,
     /// Security's "Revoke all…" asks its question.
     pub(super) revoke_all: bool,
+    /// General's start at sign-in says what it means before it acts.
+    pub(super) sign_in_asking: bool,
 }
 
 /// Below this page width (points) the section list uses its short names.
