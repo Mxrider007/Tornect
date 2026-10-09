@@ -102,12 +102,27 @@ pub(in super::super) const REMOVE: &str = "Remove";
 /// An operation of a device's row, given the device.
 pub(in super::super) type RowOp = fn(DeviceId) -> ManagerOp;
 
-/// A row's operations, each deny-direction (§B.8.7.3).
-pub(in super::super) const ROW_OPS: [(&str, RowOp); 4] = [
-    ("Suspend", ManagerOp::Suspend),
-    ("Disable", ManagerOp::Disable),
-    ("Revoke unattended", ManagerOp::Revoke),
-    ("Remove device", ManagerOp::Remove),
+/// What a row's button does.
+#[derive(Debug, Clone, Copy)]
+pub(in super::super) enum RowAction {
+    /// Send this deny-direction operation for the row's device.
+    Send(RowOp),
+    /// Open *Change password* for the row's grant (the wizard's ④ alone).
+    ChangePassword,
+    /// Open *Change mode* for the row's grant.
+    ChangeMode,
+}
+
+/// A row's buttons (§B.8.7.3): its deny-direction operations, then *Change
+/// password…* and *Change mode…*, which open their step in the section's
+/// place (each change asks for the password where it gives access).
+pub(in super::super) const ROW_OPS: [(&str, RowAction); 6] = [
+    ("Suspend", RowAction::Send(ManagerOp::Suspend)),
+    ("Disable", RowAction::Send(ManagerOp::Disable)),
+    ("Revoke unattended", RowAction::Send(ManagerOp::Revoke)),
+    ("Remove device", RowAction::Send(ManagerOp::Remove)),
+    ("Change password…", RowAction::ChangePassword),
+    ("Change mode…", RowAction::ChangeMode),
 ];
 
 /// How to end every session at once.
@@ -205,7 +220,7 @@ pub(super) fn section(
         line(ui, NO_DEVICE, t.text_secondary);
     } else {
         for row in &manager.grants {
-            grant_row(ui, t, row, model.manager_busy, actions);
+            grant_row(ui, t, row, model.manager_busy, form, actions);
             ui.add_space(8.0);
         }
     }
@@ -468,7 +483,14 @@ pub(in super::super) fn header(manager: &Manager, today: Day) -> (Tone, String) 
 /// One device's row: its pinned label, its state, its device words, who
 /// gave it access, when it last connected and its failed attempts since the
 /// last unlock (§B.8.7.3), and its operations.
-fn grant_row(ui: &mut Ui, t: &Tokens, row: &GrantRow, busy: bool, actions: &mut Vec<Action>) {
+fn grant_row(
+    ui: &mut Ui,
+    t: &Tokens,
+    row: &GrantRow,
+    busy: bool,
+    form: &mut SettingsForm,
+    actions: &mut Vec<Action>,
+) {
     widgets::card(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
@@ -509,13 +531,33 @@ fn grant_row(ui: &mut Ui, t: &Tokens, row: &GrantRow, busy: bool, actions: &mut 
             {
                 actions.push(Action::Manager(op(row.device)));
             }
-            for (label, op) in ROW_OPS {
+            for (label, action) in ROW_OPS {
                 if Button::new(Kind::Secondary, label)
                     .small()
                     .show(ui)
                     .clicked()
                 {
-                    actions.push(Action::Manager(op(row.device)));
+                    match action {
+                        RowAction::Send(op) => actions.push(Action::Manager(op(row.device))),
+                        RowAction::ChangePassword => {
+                            let w = super::wizard::Wizard::change_password(
+                                row.device,
+                                row.label.clone(),
+                            );
+                            // The guard's preview of the change: whether its
+                            // password can only be generated.
+                            if let Some(choice) = w.change_choice() {
+                                actions.push(Action::Manager(ManagerOp::Preview(Box::new(choice))));
+                            }
+                            form.wizard = Some(w);
+                        }
+                        RowAction::ChangeMode => {
+                            form.wizard = Some(super::wizard::Wizard::change_mode(
+                                row.device,
+                                row.label.clone(),
+                            ));
+                        }
+                    }
                 }
             }
         });

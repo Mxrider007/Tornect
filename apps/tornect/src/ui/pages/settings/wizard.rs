@@ -154,6 +154,22 @@ pub(in super::super) const NEEDS_GENERATED: &str = "Something changed while you 
 /// The commit of ⑦.
 pub(in super::super) const TURN_ON: &str = "Turn on";
 
+/// The manager's *Change password*, its row button and its commit.
+pub(in super::super) const CHANGE_PASSWORD: &str = "Change password";
+
+/// The manager's *Change mode*'s commits.
+pub(in super::super) const TO_VIEW_ONLY: &str = "Change to View only";
+
+/// See [`TO_VIEW_ONLY`].
+pub(in super::super) const TO_CONTROL: &str = "Change to Control";
+
+/// Mode → Control where control reaches programs that run as administrator
+/// (§B.8.7.1, decision M1-67); `<device>` stands for the grant's pinned
+/// label.
+pub(in super::super) const CONTROL_NEEDS_PASSWORD: &str = "Control here can reach programs that \
+    run as administrator, so <device> needs a new password. The current password stops working \
+    when you finish, also where it is remembered.";
+
 /// How long ①'s Continue waits, still, before a click counts (M1-50).
 const ARM_AFTER: Duration = Duration::from_secs(1);
 
@@ -190,6 +206,8 @@ pub(in super::super) enum Step {
     Check,
     /// ⑦ What is given, and *Turn on*.
     Summary,
+    /// The manager's *Change mode* of an existing grant.
+    Mode,
 }
 
 impl Step {
@@ -204,6 +222,7 @@ impl Step {
             Self::Options => "Options",
             Self::Check => "Check this computer",
             Self::Summary => "Summary",
+            Self::Mode => "Change mode",
         }
     }
 }
@@ -247,6 +266,18 @@ impl Options {
     }
 }
 
+/// A change of an existing grant from the manager (§B.8.7.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in super::super) struct Changing {
+    /// The grant's pinned label.
+    pub(in super::super) label: String,
+    /// The mode the new password comes with: control, where control reaches
+    /// the administrator level; `None`: the password only.
+    pub(in super::super) mode: Option<SessionMode>,
+    /// *Change mode* to control asked the guard's preview.
+    pub(in super::super) asked: bool,
+}
+
 /// What the wizard remembers from pass to pass. Never printed: its
 /// passwords are wiped when it is dropped.
 pub(in super::super) struct Wizard {
@@ -275,6 +306,8 @@ pub(in super::super) struct Wizard {
     pub(in super::super) again: Zeroizing<String>,
     /// The press of *Turn on* waiting for its answer.
     pub(in super::super) attempt: Option<u64>,
+    /// A change of an existing grant from the manager, in place of a new one.
+    pub(in super::super) change: Option<Changing>,
     /// Something changed while the person was asked: from then on the
     /// password can only be generated.
     pub(in super::super) generated_only: bool,
@@ -309,13 +342,57 @@ impl Wizard {
             typed: room(),
             again: room(),
             attempt: None,
+            change: None,
             generated_only: false,
             note: None,
         }
     }
 
+    /// The manager's *Change password* of `device`'s grant, labelled
+    /// `label`: ④ alone, with a new passphrase.
+    #[must_use]
+    pub(in super::super) fn change_password(device: DeviceId, label: String) -> Self {
+        let mut w = Self::new();
+        w.device = Some(device);
+        w.change = Some(Changing {
+            label,
+            mode: None,
+            asked: false,
+        });
+        w.open_password();
+        w
+    }
+
+    /// What a change from the manager registers, for the guard's preview.
+    #[must_use]
+    pub(in super::super) fn change_choice(&self) -> Option<WizardChoice> {
+        self.change.as_ref().and_then(|_| self.choice())
+    }
+
+    /// The manager's *Change mode* of `device`'s grant, labelled `label`.
+    #[must_use]
+    pub(in super::super) fn change_mode(device: DeviceId, label: String) -> Self {
+        let mut w = Self::change_password(device, label);
+        w.drop_passwords();
+        w.step = Step::Mode;
+        w
+    }
+
     /// What ②, ③ and ⑤ chose: every option goes into the one registration.
+    /// For a change from the manager: the options that change nothing (the
+    /// grant keeps its preset, which a registration of an existing grant
+    /// reads from the store), but the mode where control needs the password.
     fn choice(&self) -> Option<WizardChoice> {
+        if let Some(change) = &self.change {
+            return Some(WizardChoice {
+                device: self.device?,
+                preset: Preset::MyMachines,
+                options: GrantOptions {
+                    mode: change.mode,
+                    ..GrantOptions::default()
+                },
+            });
+        }
         let o = self.options;
         Some(WizardChoice {
             device: self.device?,
@@ -405,8 +482,12 @@ pub(in super::super) fn draw(
         }
     }
     ui.add_space(4.0);
+    let title = match (&w.change, w.step) {
+        (Some(_), Step::Password) => CHANGE_PASSWORD,
+        _ => w.step.title(),
+    };
     ui.label(
-        RichText::new(w.step.title())
+        RichText::new(title)
             .font(theme::font(ui.ctx(), Face::Semibold, 17.0))
             .color(t.text_primary),
     );
@@ -416,7 +497,13 @@ pub(in super::super) fn draw(
         Step::Before => before(ui, t, w, &mut close),
         Step::Device => device(ui, t, model, w, &mut close),
         Step::Preset => preset(ui, t, w, &mut close, actions),
-        Step::Password => password_step(ui, t, model, w, &mut close),
+        Step::Password => {
+            let attempt = form.attempts + 1;
+            if password_step(ui, t, model, w, &mut close, attempt, actions) {
+                form.attempts = attempt;
+            }
+        }
+        Step::Mode => mode_step(ui, t, model, w, &mut close, actions),
         Step::Options => options(ui, t, model, manager, w, &mut close, actions),
         Step::Check => check(ui, t, manager, w, &mut close),
         Step::Summary => {
@@ -708,10 +795,32 @@ fn may_use_own(model: &Model, w: &Wizard) -> bool {
 }
 
 /// ④: the generator's passphrase, or the person's own password where the
-/// reach stays 0.
-fn password_step(ui: &mut Ui, t: &Tokens, model: &Model, w: &mut Wizard, close: &mut bool) {
+/// reach stays 0. For a change from the manager ④ is all: its commit sends
+/// the new password as press `attempt`; whether it was pressed.
+fn password_step(
+    ui: &mut Ui,
+    t: &Tokens,
+    model: &Model,
+    w: &mut Wizard,
+    close: &mut bool,
+    attempt: u64,
+    actions: &mut Vec<Action>,
+) -> bool {
     if let Some(note) = w.note {
         line(ui, note, t.danger_text);
+        ui.add_space(6.0);
+    }
+    if let Some(Changing {
+        label,
+        mode: Some(_),
+        ..
+    }) = &w.change
+    {
+        line(
+            ui,
+            &CONTROL_NEEDS_PASSWORD.replace("<device>", label),
+            t.text_primary,
+        );
         ui.add_space(6.0);
     }
     let may_own = may_use_own(model, w);
@@ -773,9 +882,22 @@ fn password_step(ui: &mut Ui, t: &Tokens, model: &Model, w: &mut Wizard, close: 
             w.own = true;
         }
     }
+    let waiting = w.attempt.is_some();
+    if waiting {
+        ui.spinner();
+    }
     ui.add_space(10.0);
+    let mut pressed = false;
     ui.horizontal(|ui| {
-        cancel(ui, true, close);
+        cancel(ui, !waiting, close);
+        if w.change.is_some() {
+            // ④ alone: its commit, pointer only.
+            let ready = ready && !waiting;
+            if pointer_only(ui, CHANGE_PASSWORD, ready) && ready {
+                pressed = send_change(w, attempt, actions);
+            }
+            return;
+        }
         if Button::new(Kind::Secondary, "Back")
             .small()
             .show(ui)
@@ -787,6 +909,134 @@ fn password_step(ui: &mut Ui, t: &Tokens, model: &Model, w: &mut Wizard, close: 
         if pointer_only(ui, "Continue", ready) && ready {
             w.note = None;
             w.step = Step::Options;
+        }
+    });
+    pressed
+}
+
+/// Send the manager's change with ④'s password as press `attempt`: the
+/// wizard keeps no copy; whether it was sent.
+fn send_change(w: &mut Wizard, attempt: u64, actions: &mut Vec<Action>) -> bool {
+    let new = if w.own {
+        Some(NewPassword::Chosen(Secret(password::normalize(&w.typed))))
+    } else {
+        w.passphrase.take()
+    };
+    let (Some(choice), Some(password)) = (w.choice(), new) else {
+        return false;
+    };
+    actions.push(Action::Manager(ManagerOp::ChangePassword(Box::new(
+        GrantRequest {
+            attempt,
+            choice,
+            password,
+        },
+    ))));
+    w.drop_passwords();
+    w.note = None;
+    w.attempt = Some(attempt);
+    true
+}
+
+/// The manager's *Change mode* (§B.8.7.3): to view only, one operation that
+/// narrows; to control, the guard's preview first: where control reaches the
+/// administrator level, ④ with the plan's sentence and a generated password
+/// in one registration; otherwise one operation that widens (it asks for the
+/// password).
+fn mode_step(
+    ui: &mut Ui,
+    t: &Tokens,
+    model: &Model,
+    w: &mut Wizard,
+    close: &mut bool,
+    actions: &mut Vec<Action>,
+) {
+    let (Some(device), Some(change)) = (w.device, w.change.clone()) else {
+        *close = true;
+        return;
+    };
+    let now = model
+        .wizard
+        .modes
+        .iter()
+        .find(|(d, _)| *d == device)
+        .map(|(_, mode)| *mode);
+    let to_control = WizardChoice {
+        device,
+        preset: Preset::MyMachines,
+        options: GrantOptions {
+            mode: Some(SessionMode::Control),
+            ..GrantOptions::default()
+        },
+    };
+    let raises = model
+        .wizard
+        .raises
+        .as_ref()
+        .filter(|(c, _)| *c == to_control)
+        .map(|(_, r)| *r);
+    let named = match now {
+        Some(SessionMode::Control) => "Control",
+        Some(SessionMode::ViewOnly) => "View only",
+        None => "…",
+    };
+    line(ui, &format!("{}: {named}", change.label), t.text_primary);
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        cancel(ui, true, close);
+        match now {
+            Some(SessionMode::Control) => {
+                if Button::new(Kind::Primary, TO_VIEW_ONLY)
+                    .small()
+                    .show(ui)
+                    .clicked()
+                {
+                    actions.push(Action::Manager(ManagerOp::SetMode(
+                        device,
+                        SessionMode::ViewOnly,
+                    )));
+                    *close = true;
+                }
+            }
+            Some(SessionMode::ViewOnly) if !change.asked => {
+                if Button::new(Kind::Primary, "Continue")
+                    .small()
+                    .show(ui)
+                    .clicked()
+                {
+                    actions.push(Action::Manager(ManagerOp::Preview(Box::new(
+                        to_control.clone(),
+                    ))));
+                    if let Some(c) = w.change.as_mut() {
+                        c.asked = true;
+                    }
+                }
+            }
+            Some(SessionMode::ViewOnly) => match raises {
+                // Not judged yet.
+                None => {
+                    ui.spinner();
+                }
+                // Control raises the reach (or it could not be judged):
+                // only with a new generated password.
+                Some(Some(true) | None) => {
+                    if let Some(c) = w.change.as_mut() {
+                        c.mode = Some(SessionMode::Control);
+                    }
+                    w.generated_only = true;
+                    w.open_password();
+                }
+                Some(Some(false)) => {
+                    if pointer_only(ui, TO_CONTROL, true) {
+                        actions.push(Action::Manager(ManagerOp::SetMode(
+                            device,
+                            SessionMode::Control,
+                        )));
+                        *close = true;
+                    }
+                }
+            },
+            None => {}
         }
     });
 }
@@ -1449,6 +1699,166 @@ mod tests {
         &mut window.form.settings.wizard.as_mut().expect("open").options
     }
 
+    /// The window host with one device given access, `mode`, in its rows.
+    fn with_a_grant(mode: SessionMode) -> Model {
+        use super::super::super::super::model::GrantRow;
+        use tornect_core::session_log::Actor;
+        let mut model = model(true);
+        if let Some(manager) = model.manager.as_mut() {
+            manager.on = true;
+            manager.grants = vec![GrantRow {
+                device: device(1),
+                label: "Office laptop".to_owned(),
+                words: None,
+                created_by: Some(Actor::Ui),
+                last_used: None,
+                state: "active".to_owned(),
+                failures: 0,
+            }];
+        }
+        model.wizard.modes = vec![(device(1), mode)];
+        model
+    }
+
+    /// The change from the manager that registers the password only.
+    fn no_change() -> WizardChoice {
+        WizardChoice {
+            device: device(1),
+            preset: Preset::MyMachines,
+            options: GrantOptions::default(),
+        }
+    }
+
+    /// §B.8.7.3, decision M1-67: *Change password* is the wizard's ④ alone:
+    /// its preview is of the change itself, "Use my own password" only where
+    /// it says the reach stays 0 (never at the level), and its commit answers
+    /// a primary pointer click only.
+    #[test]
+    fn change_password_at_the_level_offers_only_the_generator() {
+        for (judged, offered) in [(Some(true), false), (None, false), (Some(false), true)] {
+            let mut window = Window::new(with_a_grant(SessionMode::Control), WIDE);
+            assert_eq!(
+                window.click("Change password…"),
+                vec![Action::Manager(ManagerOp::Preview(Box::new(no_change())))]
+            );
+            assert_eq!(window.step(), Some(Step::Password));
+            assert!(window.has_text(CHANGE_PASSWORD));
+            window.model.wizard.preview = Some((no_change(), judged));
+            window.pass(Vec::new());
+            assert_eq!(window.has_control(USE_MY_OWN), offered, "{judged:?}");
+            assert!(!window.has_control("Back"), "④ alone");
+            for key in [egui::Key::Enter, egui::Key::Space] {
+                assert!(window.key(key).is_empty(), "{judged:?} {key:?}");
+            }
+        }
+    }
+
+    /// §B.8.7.3: *Change password* sends the change that changes nothing but
+    /// the password (never the page's picture of the grant's options), with
+    /// the generator's passphrase or the person's own as the one value; then
+    /// keeps no copy and closes on the answer.
+    #[test]
+    fn change_password_sends_no_option_change() {
+        for own in [false, true] {
+            let mut window = Window::new(with_a_grant(SessionMode::Control), WIDE);
+            window.click("Change password…");
+            window.model.wizard.preview = Some((no_change(), Some(false)));
+            window.pass(Vec::new());
+            let expected = if own {
+                assert!(window.click(USE_MY_OWN).is_empty());
+                window.type_into(FIELD, OWN);
+                window.type_into(AGAIN, OWN);
+                NewPassword::Chosen(Secret(password::normalize(OWN)))
+            } else {
+                NewPassword::Generated(Secret(Zeroizing::new(window.phrase())))
+            };
+            let sent = window.click(CHANGE_PASSWORD);
+            let [Action::Manager(ManagerOp::ChangePassword(request))] = sent.as_slice() else {
+                panic!("{own}: {sent:?}");
+            };
+            assert_eq!(request.choice, no_change(), "{own}");
+            assert_eq!(request.password, expected, "{own}");
+            let w = window.wizard().expect("waiting");
+            assert!(
+                w.passphrase.is_none() && w.typed.is_empty(),
+                "{own}: no copy"
+            );
+            window.model.wizard.answer = Some((request.attempt, WizardAnswer::Done));
+            window.pass(Vec::new());
+            assert!(window.wizard().is_none(), "{own}: closed on the answer");
+        }
+    }
+
+    /// §B.8.7.3, PLAN's mode → Control (decision M1-67): *Change mode* of a
+    /// view-only grant to control asks the guard's preview first; where
+    /// control reaches the administrator level it is ④ with the plan's
+    /// sentence and the generator only, and the one registration carries the
+    /// mode; where it reaches nothing more, one operation that widens; a
+    /// control grant goes to view only in one operation.
+    #[test]
+    fn mode_to_control_at_the_level_needs_a_new_password() {
+        let to_control = WizardChoice {
+            options: GrantOptions {
+                mode: Some(SessionMode::Control),
+                ..GrantOptions::default()
+            },
+            ..no_change()
+        };
+        for raises in [true, false] {
+            let mut window = Window::new(with_a_grant(SessionMode::ViewOnly), WIDE);
+            assert!(window.click("Change mode…").is_empty());
+            assert_eq!(window.step(), Some(Step::Mode));
+            assert!(window.has_text("Office laptop: View only"));
+            assert_eq!(
+                window.click("Continue"),
+                vec![Action::Manager(ManagerOp::Preview(Box::new(
+                    to_control.clone()
+                )))]
+            );
+            window.model.wizard.raises = Some((to_control.clone(), Some(raises)));
+            window.model.wizard.preview = Some((to_control.clone(), Some(raises)));
+            window.pass(Vec::new());
+            window.pass(Vec::new());
+            if raises {
+                assert_eq!(window.step(), Some(Step::Password));
+                assert!(
+                    window.has_text(&CONTROL_NEEDS_PASSWORD.replace("<device>", "Office laptop"))
+                );
+                assert!(!window.has_control(USE_MY_OWN), "the generator only");
+                let shown = window.phrase();
+                let sent = window.click(CHANGE_PASSWORD);
+                let [Action::Manager(ManagerOp::ChangePassword(request))] = sent.as_slice() else {
+                    panic!("{sent:?}");
+                };
+                assert_eq!(request.choice, to_control);
+                assert_eq!(
+                    request.password,
+                    NewPassword::Generated(Secret(Zeroizing::new(shown)))
+                );
+            } else {
+                assert_eq!(
+                    window.click(TO_CONTROL),
+                    vec![Action::Manager(ManagerOp::SetMode(
+                        device(1),
+                        SessionMode::Control
+                    ))]
+                );
+                assert!(window.wizard().is_none());
+            }
+        }
+        // A control grant: to view only, one operation.
+        let mut window = Window::new(with_a_grant(SessionMode::Control), WIDE);
+        assert!(window.click("Change mode…").is_empty());
+        assert_eq!(
+            window.click(TO_VIEW_ONLY),
+            vec![Action::Manager(ManagerOp::SetMode(
+                device(1),
+                SessionMode::ViewOnly
+            ))]
+        );
+        assert!(window.wizard().is_none());
+    }
+
     /// §B.8.7.1 ⑥: this computer's readiness rows as the host read them; a
     /// red row needs "Enable anyway — it will not work until fixed" before ⑦
     /// (Continue does nothing until it is ticked), and with no red row
@@ -1769,6 +2179,7 @@ mod tests {
                         Some(Step::Options) => 5,
                         Some(Step::Check) => 6,
                         Some(Step::Summary) => 7,
+                        Some(Step::Mode) => 8,
                     };
                     assert!(order(window.step()) <= order(Some(step)), "{case}: went on");
                 }

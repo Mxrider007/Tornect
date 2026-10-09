@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use tornect_core::address_book::{Day, mixes_scripts};
 use tornect_core::config::{BridgeMode, Theme, Viewer};
 use tornect_core::levels::{Answers, Availability};
-use tornect_core::session_log::Actor;
+use tornect_core::session_log::{Actor, SessionMode};
 use tornect_core::unattended::credentials::RememberOffer;
 use tornect_core::unattended::grant::Preset;
 use tornect_core::unattended::ipc::GrantOptions;
@@ -1040,6 +1040,15 @@ pub enum ManagerOp {
     /// registration (its one dialog), then, while unattended access is off,
     /// Turn on (its own dialog) and a new stop code shown once.
     Grant(Box<GrantRequest>),
+    /// Give a device's grant a new password from the manager (*Change
+    /// password*, §B.8.7.3): one registration (its one dialog) whose options
+    /// change nothing but, where control reaches the administrator level, the
+    /// mode.
+    ChangePassword(Box<GrantRequest>),
+    /// Set a device's mode from the manager (*Change mode*): to view only,
+    /// deny-direction; to control where control reaches nothing more, a
+    /// widening that asks for the password.
+    SetMode(DeviceId, SessionMode),
     /// Turn unattended access on: a new emergency stop code is shown once.
     On,
     /// The stop code was written down: it is dropped (no guard operation).
@@ -1186,6 +1195,11 @@ pub struct WizardView {
     /// The last choice judged, and whether its password can only be
     /// generated (`None`: it could not be judged, so it can only be).
     pub preview: Option<(WizardChoice, Option<bool>)>,
+    /// The last choice judged, and whether it raises the grant's own reach
+    /// (`None`: it could not be judged).
+    pub raises: Option<(WizardChoice, Option<bool>)>,
+    /// Each grant's mode, read with the manager's view (*Change mode*).
+    pub modes: Vec<(DeviceId, SessionMode)>,
     /// The press of *Turn on* that runs now.
     pub running: Option<u64>,
     /// How the last press ended.
