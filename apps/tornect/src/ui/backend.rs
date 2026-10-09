@@ -243,21 +243,38 @@ pub struct Backend {
     pub background: Option<crate::host::IndicatorShown>,
 }
 
-/// Whether this is the window's first run in the home `paths`: the first
-/// time, a marker is left in the state directory so that the history notice
-/// shows once. The marker says nothing about any connection. When it cannot
-/// be written the notice shows again next time.
-fn first_run(paths: &Paths) -> bool {
-    let marker = paths.state_dir.join("history-notice-shown");
-    if marker.exists() {
-        return false;
-    }
+/// The marker the window's first run leaves in the state directory of the
+/// home `paths`. It says nothing about any connection.
+fn first_run_marker(paths: &Paths) -> std::path::PathBuf {
+    paths.state_dir.join("history-notice-shown")
+}
+
+/// Whether this is the window's first run in the home `paths`: its marker is
+/// not there yet. The check writes nothing.
+fn first_run_due(paths: &Paths) -> bool {
+    !first_run_marker(paths).exists()
+}
+
+/// Leave the first run's marker, so that the history notice and the name
+/// question show once. When it cannot be written they show again next time.
+fn mark_first_run(paths: &Paths) {
+    let marker = first_run_marker(paths);
     if let Err(e) =
         std::fs::create_dir_all(&paths.state_dir).and_then(|()| std::fs::write(&marker, b""))
     {
         tracing::debug!(error = %e, "the history notice will show again");
     }
-    true
+}
+
+/// Whether this is the window's first run in the home `paths`, checked and
+/// marked at once, for a start that asks nothing (background mode): the
+/// first time, the marker is left so that the history notice shows once.
+fn first_run(paths: &Paths) -> bool {
+    let first = first_run_due(paths);
+    if first {
+        mark_first_run(paths);
+    }
+    first
 }
 
 /// The settings page's line when a change was not saved because this screen
@@ -1777,15 +1794,84 @@ async fn ask_the_name(b: &mut Backend, commands: &mut mpsc::UnboundedReceiver<Co
     true
 }
 
+/// Look every [`HOST_LOCK_EVERY`] whether another Tornect process holds the
+/// host lock of the home `paths`, into `hosted_elsewhere`, from the start on:
+/// such a process may share this screen, which the window cannot see, and
+/// the first run's question hides what sharing hides too. It stops before
+/// this window takes the host role (`take_host_role`): it would count the
+/// window's own lock as another process's.
+fn watch_host_lock_early(paths: Paths, shared: Arc<Shared>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(HOST_LOCK_EVERY);
+        loop {
+            every.tick().await;
+            let paths = paths.clone();
+            let held = tokio::task::spawn_blocking(move || HostLock::holder(&paths).is_some())
+                .await
+                .unwrap_or(true);
+            if shared.read(|m| m.hosted_elsewhere) != held {
+                shared.update(|m| m.hosted_elsewhere = held);
+            }
+        }
+    })
+}
+
+/// The start before anything can send this computer's name: whether another
+/// Tornect process holds this home's host lock, read before the first frame
+/// of the question and then watched (`watch_host_lock_early`); the first
+/// run's check; and on the first start of a window shown on screen the
+/// question, whose marker is left only once it is answered (in background
+/// mode, which asks nothing, at once). `None`: the window closed during the
+/// question, and the next start asks it again. Otherwise whether this was
+/// the first run, and the early watch.
+async fn before_the_start(
+    b: &mut Backend,
+    commands: &mut mpsc::UnboundedReceiver<Command>,
+) -> Option<(bool, JoinHandle<()>)> {
+    let paths = b.paths.clone();
+    let held = tokio::task::spawn_blocking(move || HostLock::holder(&paths).is_some())
+        .await
+        .unwrap_or(true);
+    b.shared.update(|m| m.hosted_elsewhere = held);
+    let early = watch_host_lock_early(b.paths.clone(), Arc::clone(&b.shared));
+    if !name_question_due(first_run_due(&b.paths), b.background.is_some()) {
+        return Some((first_run(&b.paths), early));
+    }
+    if !ask_the_name(b, commands).await {
+        early.abort();
+        return None;
+    }
+    mark_first_run(&b.paths);
+    Some((true, early))
+}
+
+/// The host role, when this window is to be the host, taken once the early
+/// host-lock watch has stopped. The window that holds the lock is hosted by
+/// no other process, whatever the watch read last.
+async fn take_host_role(b: &Backend, early: JoinHandle<()>) -> Option<Hosted> {
+    early.abort();
+    let _ = early.await;
+    if !b.host {
+        return None;
+    }
+    match host_role(b).await {
+        Ok(hosted) => {
+            b.shared.update(|m| m.hosted_elsewhere = false);
+            Some(hosted)
+        }
+        Err(why) => {
+            b.shared.update(|m| m.hosting = Hosting::Off(why));
+            None
+        }
+    }
+}
+
 /// Run until [`Command::Quit`], then shut down and mark the model closed.
 pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>) {
-    let first = first_run(&b.paths);
-    if name_question_due(first, b.background.is_some())
-        && !ask_the_name(&mut b, &mut commands).await
-    {
+    let Some((first, early)) = before_the_start(&mut b, &mut commands).await else {
         b.shared.update(|m| m.closed = true);
         return;
-    }
+    };
     let b = Arc::new(b);
     b.shared.update(|m| m.history_notice = first);
     refresh_diagnostics(&b);
@@ -1827,17 +1913,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
             }
         });
     }
-    let hosted = if b.host {
-        match host_role(&b).await {
-            Ok(hosted) => Some(hosted),
-            Err(why) => {
-                b.shared.update(|m| m.hosting = Hosting::Off(why));
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let hosted = take_host_role(&b, early).await;
     // Not the host here: another Tornect process may be, and may share this
     // screen, which this window cannot see. While one holds the host lock,
     // the window hides what it hides while sharing.
@@ -5179,6 +5255,96 @@ mod tests {
         assert!(first_run(&paths), "the first run");
         assert!(!first_run(&paths), "then never again");
         assert!(!first_run(&paths));
+    }
+
+    /// While another Tornect process holds this home's host lock, the first
+    /// run's question is shared from its first frame on, as every page is:
+    /// a settings change and the name sent meanwhile are not saved, and
+    /// `config.toml` stays byte for byte as it was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_run_question_is_shared_while_another_process_hosts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut b, shared, paths) = first_start(&tmp);
+        Config::default().save(&paths.config_file()).unwrap();
+        let before = std::fs::read(paths.config_file()).unwrap();
+        let held = HostLock::acquire(&paths).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let meanwhile = async {
+            while !shared.read(|m| m.name_question) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                shared.read(|m| m.screen_shared(Instant::now())),
+                "shared while the question is open"
+            );
+            tx.send(Command::SaveSettings(SettingsChange::DeviceName(
+                "Desk".to_owned(),
+            )))
+            .unwrap();
+            tx.send(Command::FirstRunName(Some("Desk by the window".to_owned())))
+                .unwrap();
+        };
+        let (started, ()) = tokio::join!(before_the_start(&mut b, &mut rx), meanwhile);
+        let (first, early) = started.expect("answered");
+        early.abort();
+        assert!(first);
+        assert_eq!(
+            std::fs::read(paths.config_file()).unwrap(),
+            before,
+            "nothing saved"
+        );
+        shared.read(|m| assert_eq!(m.settings.problem, Some(NOT_SAVED_SHARED)));
+        drop(held);
+    }
+
+    /// A window that becomes the host is hosted by no other process: the
+    /// early watch, which read another process's lock, stops before the
+    /// window takes the lock, so the window's own lock never counts as
+    /// another's, and `hosted_elsewhere` is false from then on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_window_that_becomes_the_host_is_not_hosted_elsewhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut b, shared, paths) = first_start(&tmp);
+        let held = HostLock::acquire(&paths).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Command::FirstRunName(None)).unwrap();
+        let (first, early) = before_the_start(&mut b, &mut rx).await.expect("answered");
+        assert!(first);
+        assert!(
+            shared.read(|m| m.hosted_elsewhere),
+            "another process held the lock"
+        );
+        drop(held);
+        let hosted = take_host_role(&b, early)
+            .await
+            .expect("the window host is wired");
+        assert!(
+            !shared.read(|m| m.hosted_elsewhere),
+            "this window holds the lock"
+        );
+        tokio::time::sleep(HOST_LOCK_EVERY + Duration::from_millis(500)).await;
+        assert!(
+            !shared.read(|m| m.hosted_elsewhere),
+            "its own lock is not another process's"
+        );
+        if let Some(ipc) = &hosted.ipc {
+            ipc.abort();
+        }
+    }
+
+    /// A window closed during the first run's question leaves no marker: the
+    /// next start asks the question again, with the history notice.
+    #[tokio::test]
+    async fn closing_during_the_question_asks_it_again_next_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut b, _shared, paths) = first_start(&tmp);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Command::Quit).unwrap();
+        assert!(
+            before_the_start(&mut b, &mut rx).await.is_none(),
+            "closed first"
+        );
+        assert!(first_run(&paths), "the next start is a first run");
     }
 
     /// FR2-L1: when the keychain refuses to delete the remembered password,

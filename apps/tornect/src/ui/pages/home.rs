@@ -73,8 +73,14 @@ pub(super) fn home(
 
     // The first start: the name others see is asked before anything can
     // send it; until it is answered or skipped Home offers nothing else.
+    // While this screen may be in a picture that leaves it, the hidden card
+    // stands in its place (nothing would be saved).
     if model.name_question {
-        name_question(ui, model, form, actions);
+        if model.screen_shared(now) {
+            super::hidden_card(ui, super::settings::WRITES_HIDDEN);
+        } else {
+            name_question(ui, model, form, actions);
+        }
         return;
     }
 
