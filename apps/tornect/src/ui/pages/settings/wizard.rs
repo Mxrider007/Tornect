@@ -1,5 +1,5 @@
-//! The grant wizard of Settings, Security (§B.8.7.1 ① to ⑦, without ⑤a): it gives
-//! one paired device unattended access. ① says what that means, the scam
+//! The grant wizard of Settings, Security (§B.8.7.1 ① to ⑦): it gives one
+//! paired device unattended access. ① says what that means, the scam
 //! line, this system's limits and what is kept and who learns what; its
 //! Continue answers a pointer click only, armed after a second, with Cancel
 //! first in the key order. ② lists the paired devices without access (one
@@ -11,7 +11,11 @@
 //! growing, its undo state cleared every frame. ⑤ sets the
 //! grant's options over the preset's defaults, each by its own rule, and
 //! shows the host-wide ones as they are; an option that makes the reach
-//! non-zero takes an own password back to ④'s generator. ⑥ shows this
+//! non-zero takes an own password back to ④'s generator. ⑤a, where the
+//! guard's account facts are not Linux's, offers the administrator level,
+//! off in every preset, with its warning, or the guard's refusal; on, it
+//! takes ④ back to the generator with the new-grant line under it (on Linux
+//! ⑤ says why the step is absent). ⑥ shows this
 //! computer's readiness rows; a red one needs "Enable anyway". ⑦ sums it up,
 //! and *Turn on* sends it as one operation, which the tokio side runs
 //! through the guard; the wizard changes only on its answer. ④ and ⑦
@@ -23,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use egui::{RichText, Ui};
 use tornect_core::DeviceId;
+use tornect_core::levels::{ADMINISTRATOR_WARNING, AccountFacts, Elevation};
 use tornect_core::session_log::SessionMode;
 use tornect_core::unattended::grant::{MAX_BLOCK_WINDOW_S, Preset};
 use tornect_core::unattended::ipc::GrantOptions;
@@ -170,6 +175,20 @@ pub(in super::super) const CONTROL_NEEDS_PASSWORD: &str = "Control here can reac
     run as administrator, so <device> needs a new password. The current password stops working \
     when you finish, also where it is remembered.";
 
+/// ⑤a's switch (§B.8.7.1); `<device>` stands for the device's pinned label.
+pub(in super::super) const ADMINISTRATOR_PROMPT: &str = "Let <device> also use programs that run \
+    as administrator when it connects without asking";
+
+/// Under ④'s passphrase for a new grant with the administrator level
+/// (§B.8.7.1, decision M1-67); `<device>` stands for the pinned label.
+pub(in super::super) const NEW_GRANT_LINE: &str = "An up-to-date Tornect on <device> does not \
+    keep this password; type it in the Tornect window there each time.";
+
+/// In ⑤a's place on Linux, where the step is absent (§B.8.7.1).
+pub(in super::super) const LINUX_SENTENCE: &str = "On Linux, Tornect runs as you. An unattended \
+    session can do what you can do without a password; when the system asks for a password, they \
+    see that window and can type into it.";
+
 /// How long ①'s Continue waits, still, before a click counts (M1-50).
 const ARM_AFTER: Duration = Duration::from_secs(1);
 
@@ -202,6 +221,8 @@ pub(in super::super) enum Step {
     Password,
     /// ⑤ The grant's options.
     Options,
+    /// ⑤a The administrator level (not on Linux).
+    Administrator,
     /// ⑥ This computer's readiness.
     Check,
     /// ⑦ What is given, and *Turn on*.
@@ -220,6 +241,7 @@ impl Step {
             Self::Preset => "Choose how it is used",
             Self::Password => "Password",
             Self::Options => "Options",
+            Self::Administrator => "Administrator access",
             Self::Check => "Check this computer",
             Self::Summary => "Summary",
             Self::Mode => "Change mode",
@@ -246,6 +268,8 @@ pub(in super::super) struct Options {
     pub(in super::super) require_tor_only: bool,
     /// Lock this computer when a session ends.
     pub(in super::super) lock_on_disconnect: bool,
+    /// ⑤a: the administrator level (off in every preset).
+    pub(in super::super) admin: bool,
 }
 
 impl Options {
@@ -262,6 +286,7 @@ impl Options {
             require_absent: false,
             require_tor_only: false,
             lock_on_disconnect: d.lock_on_disconnect,
+            admin: false,
         }
     }
 }
@@ -313,6 +338,8 @@ pub(in super::super) struct Wizard {
     pub(in super::super) generated_only: bool,
     /// Why the last *Turn on* saved nothing.
     pub(in super::super) note: Option<&'static str>,
+    /// ④'s passphrase was shown with the new-grant line under it.
+    pub(in super::super) level_line: bool,
 }
 
 impl std::fmt::Debug for Wizard {
@@ -345,6 +372,7 @@ impl Wizard {
             change: None,
             generated_only: false,
             note: None,
+            level_line: false,
         }
     }
 
@@ -407,6 +435,7 @@ impl Wizard {
                 lock_on_disconnect: Some(o.lock_on_disconnect),
                 hard_lock_after: Some(o.hard_lock_after),
                 waive_attended_precondition: self.waive,
+                elevation: o.admin.then_some(Elevation::Admin),
                 ..GrantOptions::default()
             },
         })
@@ -417,7 +446,17 @@ impl Wizard {
     fn open_password(&mut self) {
         self.step = Step::Password;
         self.passphrase = generated();
+        self.level_line = false;
         self.drop_own();
+    }
+
+    /// ②'s, ③'s and ⑤'s choice with the administrator level on: what ⑤a
+    /// asks the guard's preview of, to learn whether this computer can give
+    /// it.
+    fn with_level(&self) -> Option<WizardChoice> {
+        let mut choice = self.choice()?;
+        choice.options.elevation = Some(Elevation::Admin);
+        Some(choice)
     }
 
     /// The own password and its copy, wiped.
@@ -505,6 +544,7 @@ pub(in super::super) fn draw(
         }
         Step::Mode => mode_step(ui, t, model, w, &mut close, actions),
         Step::Options => options(ui, t, model, manager, w, &mut close, actions),
+        Step::Administrator => administrator(ui, t, model, w, &mut close, actions),
         Step::Check => check(ui, t, manager, w, &mut close),
         Step::Summary => {
             let attempt = form.attempts + 1;
@@ -775,6 +815,9 @@ pub(in super::super) fn options_line(preset: Preset, o: &Options) -> String {
     if o.lock_on_disconnect {
         parts.push("locks this computer when a session ends".to_owned());
     }
+    if o.admin {
+        parts.push("administrator access".to_owned());
+    }
     parts.join(" · ")
 }
 
@@ -870,6 +913,14 @@ fn password_step(
         );
         ui.add_space(4.0);
         line(ui, WRITE_IT_DOWN, t.warn);
+        if w.options.admin && w.change.is_none() {
+            line(
+                ui,
+                &NEW_GRANT_LINE.replace("<device>", &label_of(model, w)),
+                t.text_primary,
+            );
+            w.level_line = true;
+        }
         line(ui, GENERATED_ESTIMATE, t.text_secondary);
         ready = true;
         if may_own
@@ -1060,6 +1111,10 @@ fn options(
         .policy
         .as_ref()
         .is_none_or(|p| p.min_score >= password::MIN_SCORE_FILE_KEYSTORE);
+    let level_step = level_step(model);
+    if !level_step {
+        w.options.admin = false;
+    }
     let o = &mut w.options;
     widgets::section_header(ui, "Mode");
     ui.radio_value(&mut o.mode, SessionMode::Control, "Control");
@@ -1144,6 +1199,10 @@ fn options(
         t.text_secondary,
     );
     line(ui, HOST_WIDE, t.text_secondary);
+    if model.wizard.account == Some(AccountFacts::Linux) {
+        ui.add_space(8.0);
+        line(ui, LINUX_SENTENCE, t.text_secondary);
+    }
     ui.add_space(10.0);
     ui.horizontal(|ui| {
         cancel(ui, true, close);
@@ -1159,10 +1218,120 @@ fn options(
             .small()
             .show(ui)
             .clicked()
-            && let Some(choice) = w.choice()
         {
-            actions.push(Action::Manager(ManagerOp::Preview(Box::new(choice))));
-            w.step = Step::Check;
+            if level_step {
+                // ⑤a first asks whether this computer can give the level.
+                if let Some(probe) = w.with_level() {
+                    actions.push(Action::Manager(ManagerOp::Preview(Box::new(probe))));
+                    w.step = Step::Administrator;
+                }
+            } else if let Some(choice) = w.choice() {
+                actions.push(Action::Manager(ManagerOp::Preview(Box::new(choice))));
+                w.step = Step::Check;
+            }
+        }
+    });
+}
+
+/// Whether the wizard offers ⑤a: the guard read this computer's account
+/// facts, and they are not Linux's (an account whose facts could not be
+/// read is offered the step and gets the guard's refusal there).
+fn level_step(model: &Model) -> bool {
+    matches!(
+        model.wizard.account,
+        Some(AccountFacts::Windows(_) | AccountFacts::Unreadable)
+    )
+}
+
+/// The pinned label of the device the wizard gives access or changes.
+fn label_of(model: &Model, w: &Wizard) -> String {
+    if let Some(change) = &w.change {
+        return change.label.clone();
+    }
+    model
+        .wizard
+        .devices
+        .iter()
+        .flatten()
+        .find(|c| Some(c.device) == w.device)
+        .map_or_else(String::new, |c| c.label.clone())
+}
+
+/// ⑤a (§B.8.7.1, decision M1-67): the administrator level, off in every
+/// preset, its warning while on, and the grant's block window; where the
+/// guard's preview of the choice with the level refused it, the guard's
+/// reason and no switch. With the level on, ④ is the generator's only, with
+/// the new-grant line under its passphrase: a password that was not shown
+/// with that line goes, and Continue opens ④ again.
+fn administrator(
+    ui: &mut Ui,
+    t: &Tokens,
+    model: &Model,
+    w: &mut Wizard,
+    close: &mut bool,
+    actions: &mut Vec<Action>,
+) {
+    let label = label_of(model, w);
+    let probe = w.with_level();
+    let refused = model
+        .wizard
+        .level_refused
+        .as_ref()
+        .filter(|(c, _)| Some(c) == probe.as_ref())
+        .map(|(_, why)| *why);
+    let judged = model
+        .wizard
+        .preview
+        .as_ref()
+        .is_some_and(|(c, _)| Some(c) == probe.as_ref());
+    if let Some(why) = refused {
+        w.options.admin = false;
+        line(ui, why, t.text_primary);
+    } else if judged {
+        ui.checkbox(
+            &mut w.options.admin,
+            ADMINISTRATOR_PROMPT.replace("<device>", &label),
+        );
+        if w.options.admin {
+            line(
+                ui,
+                &ADMINISTRATOR_WARNING.replace("<device>", &label),
+                t.warn,
+            );
+        }
+    } else {
+        ui.spinner();
+    }
+    ui.add_space(6.0);
+    line(
+        ui,
+        &format!("Time to stop a connection: {} s", w.options.block_window_s),
+        t.text_secondary,
+    );
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        cancel(ui, true, close);
+        if Button::new(Kind::Secondary, "Back")
+            .small()
+            .show(ui)
+            .clicked()
+        {
+            w.step = Step::Options;
+        }
+        if Button::new(Kind::Primary, "Continue")
+            .small()
+            .show(ui)
+            .clicked()
+        {
+            if w.options.admin && (w.own || !w.level_line) {
+                // ④ again: a new passphrase, the generator's only, with the
+                // new-grant line under it.
+                w.note = None;
+                w.open_password();
+            } else if let Some(choice) = w.choice() {
+                actions.push(Action::Manager(ManagerOp::Preview(Box::new(choice))));
+                w.step = Step::Check;
+            }
         }
     });
 }
@@ -2176,7 +2345,7 @@ mod tests {
                         Some(Step::Device) => 2,
                         Some(Step::Preset) => 3,
                         Some(Step::Password) => 4,
-                        Some(Step::Options) => 5,
+                        Some(Step::Options | Step::Administrator) => 5,
                         Some(Step::Check) => 6,
                         Some(Step::Summary) => 7,
                         Some(Step::Mode) => 8,
@@ -2424,6 +2593,193 @@ mod tests {
             window.pass(Vec::new());
             assert!(window.has_control(OPEN), "{size:?}");
             assert!(window.wizard().is_none(), "{size:?}");
+        }
+    }
+
+    // ------------------------------------------------------------ ⑤a (§B.8.7.1)
+
+    /// An installed Tornect on a Windows administrator account, as the guard
+    /// reads its facts.
+    fn windows_admin() -> AccountFacts {
+        AccountFacts::Windows(tornect_core::levels::WindowsFacts {
+            installed: true,
+            administrator: true,
+            ..Default::default()
+        })
+    }
+
+    /// The wizard at ⑤ for `preset` with the guard's account facts
+    /// `account`, then ⑤'s Continue: the preview it asked for.
+    fn continue_from_options(
+        preset: &str,
+        account: Option<AccountFacts>,
+    ) -> (Window, WizardChoice) {
+        let mut window = at_options(preset, false);
+        window.model.wizard.account = account;
+        window.pass(Vec::new());
+        let sent = window.click("Continue");
+        let Some(Action::Manager(ManagerOp::Preview(choice))) = sent.first() else {
+            panic!("no preview asked: {sent:?}");
+        };
+        let choice = (**choice).clone();
+        (window, choice)
+    }
+
+    /// The guard's preview of `choice` answered: whether its password can
+    /// only be generated, or the level refused for `why`.
+    fn judge(
+        window: &mut Window,
+        choice: &WizardChoice,
+        generated_only: Option<bool>,
+        why: Option<&'static str>,
+    ) {
+        window.model.wizard.preview = Some((choice.clone(), generated_only));
+        window.model.wizard.level_refused = why.map(|why| (choice.clone(), why));
+        window.pass(Vec::new());
+    }
+
+    /// ⑤a's switch for the fixture's device.
+    fn prompt() -> String {
+        ADMINISTRATOR_PROMPT.replace("<device>", "Office laptop")
+    }
+
+    /// §B.8.7.1 ⑤a: the step follows ⑤ only where the guard read account
+    /// facts that are not Linux's (none read: no step); it asks the guard's
+    /// preview of the choice with the level, and its switch is off in every
+    /// preset, so the grant it sends on carries no level.
+    #[test]
+    fn the_administrator_step_is_windows_only_and_off_in_every_preset() {
+        for preset in [
+            Preset::MyMachines,
+            Preset::HelpingSomeone,
+            Preset::HeadlessBox,
+        ] {
+            assert!(!Options::of(preset).admin, "{preset:?}");
+        }
+        for account in [None, Some(AccountFacts::Linux)] {
+            let (window, choice) = continue_from_options("My machines", account);
+            assert_eq!(window.step(), Some(Step::Check), "{account:?}");
+            assert_eq!(choice.options.elevation, None, "{account:?}");
+            assert!(!window.has_control(&prompt()), "{account:?}");
+        }
+        for preset in ["My machines", "Headless box"] {
+            let (mut window, probe) = continue_from_options(preset, Some(windows_admin()));
+            assert_eq!(window.step(), Some(Step::Administrator), "{preset}");
+            assert_eq!(
+                probe.options.elevation,
+                Some(Elevation::Admin),
+                "{preset}: the preview of the level"
+            );
+            judge(&mut window, &probe, Some(true), None);
+            assert!(window.has_control(&prompt()), "{preset}");
+            assert!(!window.wizard().expect("open").options.admin, "{preset}");
+            assert!(
+                !window.has_text(&ADMINISTRATOR_WARNING.replace("<device>", "Office laptop")),
+                "{preset}: no warning while off"
+            );
+            let sent = window.click("Continue");
+            let Some(Action::Manager(ManagerOp::Preview(choice))) = sent.first() else {
+                panic!("{preset}: no preview asked: {sent:?}");
+            };
+            assert_eq!(choice.options.elevation, None, "{preset}: no level");
+            assert_eq!(window.step(), Some(Step::Check), "{preset}");
+        }
+    }
+
+    /// §B.8.7.1: on Linux the step is absent and ⑤ says the plan's sentence
+    /// in its place; on Windows facts the sentence is not shown.
+    #[test]
+    fn the_linux_wizard_says_the_planned_sentence() {
+        let mut window = at_options("My machines", false);
+        window.model.wizard.account = Some(AccountFacts::Linux);
+        window.pass(Vec::new());
+        assert!(window.has_text(LINUX_SENTENCE));
+        let sent = window.click("Continue");
+        let Some(Action::Manager(ManagerOp::Preview(choice))) = sent.first() else {
+            panic!("no preview asked: {sent:?}");
+        };
+        assert_eq!(choice.options.elevation, None);
+        assert_eq!(window.step(), Some(Step::Check), "no ⑤a");
+        let mut window = at_options("My machines", false);
+        window.model.wizard.account = Some(windows_admin());
+        window.pass(Vec::new());
+        assert!(!window.has_text(LINUX_SENTENCE));
+    }
+
+    /// Decision M1-67, §B.8.7.1: with the level on, ⑤a shows its warning
+    /// and the grant's block window, and its Continue opens ④ again with a
+    /// new passphrase and the new-grant line under it, offering no own
+    /// password; from there the grant goes out with the level and the
+    /// generated password. With the level off ④ never shows the line.
+    #[test]
+    fn the_new_grant_line_shows_under_the_password() {
+        let new_grant = NEW_GRANT_LINE.replace("<device>", "Office laptop");
+        let (mut window, probe) = continue_from_options("My machines", Some(windows_admin()));
+        judge(&mut window, &probe, Some(true), None);
+        let shown_before = window.phrase();
+        assert!(window.click(&prompt()).is_empty());
+        assert!(window.wizard().expect("open").options.admin);
+        assert!(window.has_text(&ADMINISTRATOR_WARNING.replace("<device>", "Office laptop")));
+        assert!(window.has_text("Time to stop a connection: 3 s"));
+        assert!(
+            window.click("Continue").is_empty(),
+            "④ again, nothing asked"
+        );
+        assert_eq!(window.step(), Some(Step::Password));
+        assert!(window.has_text(&new_grant), "the line under the passphrase");
+        assert_ne!(window.phrase(), shown_before, "a new passphrase");
+        assert!(!window.has_control(USE_MY_OWN), "the generator's only");
+        assert!(window.click("Continue").is_empty());
+        assert_eq!(window.step(), Some(Step::Options));
+        let sent = window.click("Continue");
+        assert_eq!(
+            sent,
+            vec![Action::Manager(ManagerOp::Preview(Box::new(probe.clone())))]
+        );
+        judge(&mut window, &probe, Some(true), None);
+        assert_eq!(window.step(), Some(Step::Administrator));
+        assert!(window.wizard().expect("open").options.admin, "still on");
+        let sent = window.click("Continue");
+        let Some(Action::Manager(ManagerOp::Preview(choice))) = sent.first() else {
+            panic!("no preview asked: {sent:?}");
+        };
+        let choice = (**choice).clone();
+        assert_eq!(choice.options.elevation, Some(Elevation::Admin));
+        judge(&mut window, &choice, Some(true), None);
+        assert_eq!(window.step(), Some(Step::Check));
+        assert!(window.click("Continue").is_empty());
+        let sent = grants(&window.click(TURN_ON));
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].choice, choice);
+        assert!(matches!(sent[0].password, NewPassword::Generated(_)));
+        let window = at_password(WIDE, Some(false));
+        assert!(!window.has_text(&new_grant));
+    }
+
+    /// §B.8.7.4: where the guard's preview refuses the level (Helping
+    /// someone, a standard account, a copy outside Program Files), ⑤a says
+    /// the guard's reason and offers no switch; Continue goes on without the
+    /// level.
+    #[test]
+    fn a_refused_level_shows_its_reason_and_no_switch() {
+        use tornect_core::levels::{
+            REFUSAL_ADMIN_HELPING_SOMEONE, REFUSAL_ADMIN_STANDALONE, REFUSAL_ADMIN_STANDARD_ACCOUNT,
+        };
+        for (preset, why) in [
+            ("Helping someone", REFUSAL_ADMIN_HELPING_SOMEONE),
+            ("My machines", REFUSAL_ADMIN_STANDARD_ACCOUNT),
+            ("My machines", REFUSAL_ADMIN_STANDALONE),
+        ] {
+            let (mut window, probe) = continue_from_options(preset, Some(windows_admin()));
+            judge(&mut window, &probe, None, Some(why));
+            assert!(window.has_text(why), "{why}");
+            assert!(!window.has_control(&prompt()), "{why}: no switch");
+            let sent = window.click("Continue");
+            let Some(Action::Manager(ManagerOp::Preview(choice))) = sent.first() else {
+                panic!("{why}: no preview asked: {sent:?}");
+            };
+            assert_eq!(choice.options.elevation, None, "{why}");
+            assert_eq!(window.step(), Some(Step::Check), "{why}");
         }
     }
 }

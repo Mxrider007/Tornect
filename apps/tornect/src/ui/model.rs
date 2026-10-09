@@ -1200,6 +1200,13 @@ pub struct WizardView {
     pub raises: Option<(WizardChoice, Option<bool>)>,
     /// Each grant's mode, read with the manager's view (*Change mode*).
     pub modes: Vec<(DeviceId, SessionMode)>,
+    /// This computer's account facts as the guard read them when the wizard
+    /// opened (decision M1-67): on Linux the administrator level does not
+    /// exist, so ⑤a is absent; `None` until read.
+    pub account: Option<tornect_core::levels::AccountFacts>,
+    /// The last choice judged whose administrator level this computer cannot
+    /// give, with the guard's reason in the plan's words (§B.8.7.4).
+    pub level_refused: Option<(WizardChoice, &'static str)>,
     /// The press of *Turn on* that runs now.
     pub running: Option<u64>,
     /// How the last press ended.
