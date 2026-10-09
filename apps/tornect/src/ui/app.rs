@@ -54,8 +54,6 @@ pub enum UserEvent {
     Wake(Wake),
 }
 
-/// The window calls a question or a session start makes: a seam, so a test
-/// can record them. There is deliberately no `focus_window` here.
 /// The stream window's full screen: a seam, so a test can record the calls.
 /// It reaches nothing else of the window, its title least of all.
 pub(super) trait FullScreen {
@@ -91,6 +89,8 @@ fn drain_then_fullscreen(
     }
 }
 
+/// The window calls a question or a session start makes: a seam, so a test
+/// can record them. There is deliberately no `focus_window` here.
 pub(super) trait Attention {
     fn is_minimized(&self) -> Option<bool>;
     fn set_minimized(&self, minimized: bool);
@@ -683,7 +683,8 @@ impl App {
                 let setup = self.main_device(el);
                 // A neutral title: the window manager, the taskbar, Alt+Tab
                 // and screen-share pickers read it, so it names nobody (the
-                // bar inside the window names the host).
+                // toolbar inside the window names the host only while this
+                // screen is not shared).
                 let mut attrs = Window::default_attributes()
                     .with_title(STREAM_TITLE)
                     .with_inner_size(LogicalSize::new(1280.0, 760.0));
