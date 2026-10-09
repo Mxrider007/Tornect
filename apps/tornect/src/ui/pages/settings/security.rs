@@ -127,6 +127,28 @@ pub(in super::super) const ROW_OPS: [(&str, RowAction); 6] = [
     ("Change mode…", RowAction::ChangeMode),
 ];
 
+/// The row button that turns a device's administrator level off.
+pub(in super::super) const LEVEL_OFF_BUTTON: &str = "Turn administrator access off";
+
+/// What a turn-off of `label`'s administrator level says (§B.8.7.1 ⑤a, the
+/// command line's sentences): the turn-off sentence, and, when `keeps` says
+/// control still reaches the level, its condition.
+#[must_use]
+pub(in super::super) fn level_off_lines(label: &str, keeps: u8) -> Vec<String> {
+    use crate::unattended::{LEVEL_OFF, LEVEL_OFF_ANOTHER_GRANT, LEVEL_OFF_HELPER_TASK};
+    use tornect_core::unattended::ipc::SetLevelNonePayload;
+    let mut lines = vec![LEVEL_OFF.replace("<device>", label)];
+    let condition = match keeps {
+        SetLevelNonePayload::ANOTHER_ADMIN_GRANT => Some(LEVEL_OFF_ANOTHER_GRANT),
+        SetLevelNonePayload::HELPER_TASK => Some(LEVEL_OFF_HELPER_TASK),
+        _ => None,
+    };
+    if let Some(condition) = condition {
+        lines.push(condition.replace("<device>", label));
+    }
+    lines
+}
+
 /// How to end every session at once.
 pub(in super::super) const STOP_LINE: &str = "To end every session now: Stop in the sharing \
     bar, or tornect panic in a terminal.";
@@ -526,6 +548,12 @@ fn grant_row(
             );
         }
         line(ui, &details(row, Day::today()), t.text_secondary);
+        // The turn-off just made, with its condition (§B.8.7.1 ⑤a).
+        if let Some((_, keeps)) = model.wizard.level_off.filter(|(d, _)| *d == row.device) {
+            for text in level_off_lines(&row.label, keeps) {
+                line(ui, &text, t.text_primary);
+            }
+        }
         ui.horizontal_wrapped(|ui| {
             // What the state lets come back, each asking for the password.
             let (kind, _) = row
@@ -584,6 +612,14 @@ fn grant_row(
                         }
                     }
                 }
+            }
+            if level.is_some_and(|l| l.holds)
+                && Button::new(Kind::Secondary, LEVEL_OFF_BUTTON)
+                    .small()
+                    .show(ui)
+                    .clicked()
+            {
+                actions.push(Action::Manager(ManagerOp::LevelOff(row.device)));
             }
             if may_raise
                 && Button::new(Kind::Secondary, super::wizard::RAISE)

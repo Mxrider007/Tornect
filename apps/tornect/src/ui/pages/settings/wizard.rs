@@ -3578,4 +3578,59 @@ mod tests {
             }
         }
     }
+
+    // ------------------------------------------------------------ the turn-off (§B.8.7.1 ⑤a)
+
+    /// §B.8.7.1 ⑤a, decision M1-68: "Turn administrator access off" on the
+    /// row of a grant that holds the level sends the turn-off at once (no
+    /// step); the row then says the command line's turn-off sentence and,
+    /// where control still reaches the level, its condition, ending "To stop
+    /// that now, disable <device>."; a grant without the level offers none.
+    #[test]
+    fn the_turn_off_line_carries_its_condition() {
+        use super::super::security::LEVEL_OFF_BUTTON;
+        use crate::unattended::{LEVEL_OFF, LEVEL_OFF_ANOTHER_GRANT, LEVEL_OFF_HELPER_TASK};
+        use tornect_core::unattended::ipc::SetLevelNonePayload;
+        let at_level = GrantLevel {
+            holds: true,
+            ..plain()
+        };
+        let mut window = Window::new(with_a_level("active", at_level), WIDE);
+        assert_eq!(
+            window.click(LEVEL_OFF_BUTTON),
+            vec![Action::Manager(ManagerOp::LevelOff(device(1)))]
+        );
+        assert!(window.wizard().is_none(), "no step");
+        let window = Window::new(with_a_level("active", plain()), WIDE);
+        assert!(
+            !window.has_control(LEVEL_OFF_BUTTON),
+            "no level, no turn-off"
+        );
+        let off = LEVEL_OFF.replace("<device>", "Office laptop");
+        for (keeps, condition) in [
+            (SetLevelNonePayload::NOTHING, None),
+            (
+                SetLevelNonePayload::ANOTHER_ADMIN_GRANT,
+                Some(LEVEL_OFF_ANOTHER_GRANT),
+            ),
+            (
+                SetLevelNonePayload::HELPER_TASK,
+                Some(LEVEL_OFF_HELPER_TASK),
+            ),
+        ] {
+            let mut model = with_a_level("active", plain());
+            model.wizard.level_off = Some((device(1), keeps));
+            let window = Window::new(model, WIDE);
+            assert!(window.has_text(&off), "{keeps}");
+            for text in [LEVEL_OFF_ANOTHER_GRANT, LEVEL_OFF_HELPER_TASK] {
+                let said = window.has_text(&text.replace("<device>", "Office laptop"));
+                assert_eq!(said, condition == Some(text), "{keeps}");
+            }
+            assert_eq!(
+                window.has_text("To stop that now, disable Office laptop."),
+                condition.is_some(),
+                "{keeps}"
+            );
+        }
+    }
 }
