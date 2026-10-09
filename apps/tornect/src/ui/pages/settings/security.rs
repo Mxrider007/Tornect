@@ -18,7 +18,9 @@
 use egui::{RichText, Ui};
 use tornect_core::DeviceId;
 use tornect_core::address_book::Day;
+use tornect_core::levels::AccountFacts;
 use tornect_core::session_log::Actor;
+use tornect_core::unattended::grant::Preset;
 use tornect_core::unattended::readiness::{Probe, row_title};
 
 use super::super::super::model::{
@@ -220,7 +222,7 @@ pub(super) fn section(
         line(ui, NO_DEVICE, t.text_secondary);
     } else {
         for row in &manager.grants {
-            grant_row(ui, t, row, model.manager_busy, form, actions);
+            grant_row(ui, t, model, row, form, actions);
             ui.add_space(8.0);
         }
     }
@@ -486,11 +488,25 @@ pub(in super::super) fn header(manager: &Manager, today: Day) -> (Tone, String) 
 fn grant_row(
     ui: &mut Ui,
     t: &Tokens,
+    model: &Model,
     row: &GrantRow,
-    busy: bool,
     form: &mut SettingsForm,
     actions: &mut Vec<Action>,
 ) {
+    let busy = model.manager_busy;
+    // The grant's level and mark (decision M1-67), where the view read them.
+    let level = model
+        .wizard
+        .levels
+        .iter()
+        .find(|(d, _)| *d == row.device)
+        .map(|(_, level)| *level);
+    let restore = level.is_some_and(|l| l.holds && l.marked);
+    // The level exists where the guard's account facts are not Linux's.
+    let may_raise = matches!(
+        model.wizard.account,
+        Some(AccountFacts::Windows(_) | AccountFacts::Unreadable)
+    ) && level.is_some_and(|l| !l.holds && l.preset != Preset::HelpingSomeone);
     widgets::card(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
@@ -529,7 +545,16 @@ fn grant_row(
                     .show(ui)
                     .clicked()
             {
-                actions.push(Action::Manager(op(row.device)));
+                if label == "Enable" && restore {
+                    // A marked grant at the level is enabled only after a
+                    // new generated password (§B.8.6.1): its step first.
+                    form.wizard = Some(super::wizard::Wizard::restore(
+                        row.device,
+                        row.label.clone(),
+                    ));
+                } else {
+                    actions.push(Action::Manager(op(row.device)));
+                }
             }
             for (label, action) in ROW_OPS {
                 if Button::new(Kind::Secondary, label)
@@ -559,6 +584,20 @@ fn grant_row(
                         }
                     }
                 }
+            }
+            if may_raise
+                && Button::new(Kind::Secondary, super::wizard::RAISE)
+                    .small()
+                    .show(ui)
+                    .clicked()
+            {
+                let w = super::wizard::Wizard::raise(row.device, row.label.clone());
+                // The guard's preview of the raise: whether this computer can
+                // give the level, and the passphrase is shown only then.
+                if let Some(choice) = w.change_choice() {
+                    actions.push(Action::Manager(ManagerOp::Preview(Box::new(choice))));
+                }
+                form.wizard = Some(w);
             }
         });
     });

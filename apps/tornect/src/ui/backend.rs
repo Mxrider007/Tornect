@@ -37,10 +37,10 @@ use super::block::GuiBlockWindow;
 use super::book::{self, Change};
 use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
 use super::model::{
-    Candidate, CaptureNote, Check, ClientStage, Dial, Failure, GrantRequest, GrantRow, HostSetting,
-    Hosting, Manager, ManagerOp, NewPassword, PauseEnd, PolicyInputs, Settings, SettingsChange,
-    Shared, Sharing, TorState, UnattendedBanner, Viewing, Wake, WizardAnswer, WizardChoice,
-    WizardView,
+    Candidate, CaptureNote, Check, ClientStage, Dial, Failure, GrantLevel, GrantRequest, GrantRow,
+    HostSetting, Hosting, Manager, ManagerOp, NewPassword, PauseEnd, PolicyInputs, Settings,
+    SettingsChange, Shared, Sharing, TorState, UnattendedBanner, Viewing, Wake, WizardAnswer,
+    WizardChoice, WizardView,
 };
 use super::recognize::Lookalike;
 use super::stream::{FrameSlot, SlotSink};
@@ -654,12 +654,38 @@ impl ManagerWatch {
             .store()
             .read(|s| s.grants.iter().map(|g| (g.device, g.mode)).collect())
             .unwrap_or_default();
-        if shared.read(|m| m.manager != view || m.wizard.offer != offer || m.wizard.modes != modes)
-        {
+        let levels: Vec<(tornect_core::DeviceId, GrantLevel)> = self
+            .ctx
+            .guard
+            .store()
+            .read(|s| {
+                s.grants
+                    .iter()
+                    .map(|g| {
+                        let level = GrantLevel {
+                            holds: g.holds_level(),
+                            marked: g.marked(),
+                            preset: g.preset,
+                        };
+                        (g.device, level)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let account = Some(self.ctx.facts.account());
+        if shared.read(|m| {
+            m.manager != view
+                || m.wizard.offer != offer
+                || m.wizard.modes != modes
+                || m.wizard.levels != levels
+                || m.wizard.account != account
+        }) {
             shared.update(|m| {
                 m.manager = view;
                 m.wizard.offer = offer;
                 m.wizard.modes = modes;
+                m.wizard.levels = levels;
+                m.wizard.account = account;
             });
         }
     }
@@ -714,6 +740,10 @@ impl ManagerWatch {
                 self.change_password(*request, shared);
                 return false;
             }
+            ManagerOp::Restore(request) => {
+                self.restore(*request, shared);
+                return false;
+            }
             other => other,
         };
         let mut paired_changed = false;
@@ -739,7 +769,8 @@ impl ManagerWatch {
             | ManagerOp::WizardDevices
             | ManagerOp::Preview(_)
             | ManagerOp::Grant(_)
-            | ManagerOp::ChangePassword(_) => Ok(()),
+            | ManagerOp::ChangePassword(_)
+            | ManagerOp::Restore(_) => Ok(()),
             ManagerOp::SetMode(device, mode) => guard
                 .set_options(
                     Actor::Ui,
@@ -958,6 +989,39 @@ impl ManagerWatch {
         let changed = self.set_password(&choice, &password);
         drop(password);
         let answer = changed.err().unwrap_or(WizardAnswer::Done);
+        shared.update(|m| {
+            m.wizard.running = None;
+            m.wizard.answer = Some((attempt, answer));
+        });
+        self.refresh(shared);
+    }
+
+    /// The restore of a marked grant at the administrator level (§B.8.6.1,
+    /// decision M1-67): its new generated password first (the window's
+    /// password change, its one dialog), then *Enable* (its own); a refused
+    /// enable leaves the new password and the grant disabled. The password is
+    /// dropped (wiped) whatever happened; the answer goes into the model; the
+    /// view is read again.
+    fn restore(&self, request: GrantRequest, shared: &Shared) {
+        use tornect_core::session_log::Actor;
+        let GrantRequest {
+            attempt,
+            choice,
+            password,
+        } = request;
+        let changed = if matches!(password, NewPassword::Generated(_)) {
+            self.set_password(&choice, &password)
+        } else {
+            Err(WizardAnswer::NeedsGenerated)
+        };
+        drop(password);
+        let answer = match changed {
+            Ok(()) => match self.ctx.guard.enable(Actor::Ui, &choice.device) {
+                Ok(()) => WizardAnswer::Done,
+                Err(e) => WizardAnswer::Refused(refusal(&e)),
+            },
+            Err(answer) => answer,
+        };
         shared.update(|m| {
             m.wizard.running = None;
             m.wizard.answer = Some((attempt, answer));
@@ -1902,15 +1966,19 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                             });
                         }
                     }
-                    Command::Manager(op @ (ManagerOp::Grant(_) | ManagerOp::ChangePassword(_))) => {
+                    Command::Manager(
+                        op @ (ManagerOp::Grant(_)
+                        | ManagerOp::ChangePassword(_)
+                        | ManagerOp::Restore(_)),
+                    ) => {
                         if let Some(manager) = hosted.as_ref().and_then(|h| h.manager.clone()) {
                             // One password dialog at a time, kept in the
                             // wizard's own state: a press while another
                             // operation asks for one is answered, not queued.
                             let attempt = match &op {
-                                ManagerOp::Grant(request) | ManagerOp::ChangePassword(request) => {
-                                    request.attempt
-                                }
+                                ManagerOp::Grant(request)
+                                | ManagerOp::ChangePassword(request)
+                                | ManagerOp::Restore(request) => request.attempt,
                                 _ => continue,
                             };
                             if b.shared.read(|m| m.manager_busy || m.wizard.running.is_some()) {
@@ -5950,5 +6018,208 @@ mod tests {
         );
         assert!(reauth.calls().is_empty(), "no dialog");
         assert!(watch.ctx.guard.store().grant(&device).is_none());
+    }
+
+    // ------------------------------------------------------------ the raise and the restore (§B.8.7.1)
+
+    /// The manager's raise of `device`'s grant to the administrator level
+    /// with `password`, as press `attempt`.
+    fn raise(attempt: u64, device: tornect_core::DeviceId, password: NewPassword) -> GrantRequest {
+        GrantRequest {
+            attempt,
+            choice: WizardChoice {
+                device,
+                preset: tornect_core::unattended::grant::Preset::MyMachines,
+                options: tornect_core::unattended::ipc::GrantOptions {
+                    elevation: Some(Elevation::Admin),
+                    ..Default::default()
+                },
+            },
+            password,
+        }
+    }
+
+    /// Decision M1-67: the manager's raise is one registration with a
+    /// generated password: a chosen one is refused before any dialog and the
+    /// grant keeps no level; the level by an options change alone is refused
+    /// by the guard; a generated one asks once, with the raising wording, and
+    /// the grant holds the level, its password unmarked.
+    #[test]
+    fn a_raise_registers_the_level_with_a_generated_password_only() {
+        use tornect_core::levels::{FixedFacts, HelperPresence};
+        use tornect_core::session_log::Actor;
+        use tornect_core::unattended::guard::{AllowAllReAuth, GuardError, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let watch = wizard_watch(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(NoSessionActivity),
+            Arc::new(FixedFacts::new(windows_admin(), HelperPresence::Absent)),
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        watch.wizard_grant(turn_on(device, generated_pw()), &shared);
+        assert_eq!(reauth.calls(), ["reg_start", "master_on"]);
+        watch.change_password(raise(2, device, chosen_pw()), &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((2, WizardAnswer::NeedsGenerated))
+        );
+        assert_eq!(reauth.calls(), ["reg_start", "master_on"], "no dialog");
+        let store = watch.ctx.guard.store();
+        assert!(!store.grant(&device).unwrap().holds_level());
+        let level_alone = watch.ctx.guard.set_options(
+            Actor::Ui,
+            &device,
+            &raise(3, device, generated_pw()).choice.options,
+        );
+        assert!(
+            matches!(level_alone, Err(GuardError::NeedsPassword(_))),
+            "{level_alone:?}"
+        );
+        assert!(!store.grant(&device).unwrap().holds_level());
+        watch.change_password(raise(4, device, generated_pw()), &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((4, WizardAnswer::Done))
+        );
+        assert_eq!(reauth.calls().last().map(String::as_str), Some("raise"));
+        let grant = store.grant(&device).unwrap();
+        assert!(grant.holds_level() && !grant.marked());
+        let levels = shared.read(|m| m.wizard.levels.clone());
+        assert_eq!(
+            levels
+                .iter()
+                .find(|(d, _)| *d == device)
+                .map(|(_, l)| l.holds),
+            Some(true),
+            "the view reads the level"
+        );
+    }
+
+    /// The window host's view over the store in `home` as on the machine
+    /// `machine` (another machine id: a restored state), with a guard that
+    /// asks `reauth`, reads `facts` and makes a real `ServerSetup`.
+    fn watch_on_machine(
+        home: &std::path::Path,
+        reauth: Arc<dyn tornect_core::unattended::guard::ReAuth>,
+        facts: Arc<tornect_core::levels::FixedFacts>,
+        machine: &[u8],
+    ) -> ManagerWatch {
+        use tornect_core::unattended::guard::{AllowAllPaired, MutationGuard, NoSessionActivity};
+        let mut watch = manager_over(
+            home,
+            Arc::clone(&reauth),
+            Arc::new(NoSessionActivity),
+            tornect_core::levels::AccountFacts::Linux,
+            machine,
+        );
+        watch.ctx.guard = Arc::new(
+            MutationGuard::new(
+                watch.ctx.guard.store().clone(),
+                reauth,
+                Arc::new(NoSessionActivity),
+                Arc::clone(&facts) as Arc<dyn tornect_core::levels::FactsSource>,
+            )
+            .with_paired_devices(Arc::new(AllowAllPaired))
+            .with_server_setup_source(Arc::new(
+                tornect_signal::unattended::OpaqueServerSetupSource,
+            )),
+        );
+        watch.ctx.facts = facts;
+        watch
+    }
+
+    /// §B.8.6.1, decision M1-67: a grant at the level restored on another
+    /// machine is disabled and marked; the restore gives it a new generated
+    /// password (one dialog), then enables it (its own), and it is active and
+    /// unmarked; a chosen password is refused before any dialog; a refused
+    /// password dialog leaves it disabled and marked, and no enable is asked.
+    #[test]
+    fn a_restored_grant_is_enabled_after_its_new_password() {
+        use tornect_core::levels::{FixedFacts, HelperPresence};
+        use tornect_core::unattended::grant::{GrantState, Preset};
+        use tornect_core::unattended::guard::{AllowAllReAuth, DenyAllReAuth};
+        let tmp = tempfile::tempdir().unwrap();
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        let facts = || Arc::new(FixedFacts::new(windows_admin(), HelperPresence::Absent));
+        {
+            let watch = watch_on_machine(
+                tmp.path(),
+                Arc::new(AllowAllReAuth::default()),
+                facts(),
+                b"the first machine",
+            );
+            let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+            watch.wizard_grant(
+                with_level(1, device, Preset::MyMachines, generated_pw()),
+                &shared,
+            );
+            assert_eq!(
+                shared.read(|m| m.wizard.answer),
+                Some((1, WizardAnswer::Done))
+            );
+        }
+        let restore = |attempt, password| GrantRequest {
+            attempt,
+            choice: WizardChoice {
+                device,
+                preset: Preset::MyMachines,
+                options: tornect_core::unattended::ipc::GrantOptions::default(),
+            },
+            password,
+        };
+        let denied = watch_on_machine(
+            tmp.path(),
+            Arc::new(DenyAllReAuth),
+            facts(),
+            b"another machine",
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let grant = denied.ctx.guard.store().grant(&device).unwrap();
+        assert!(grant.holds_level() && grant.marked(), "restored: marked");
+        denied.restore(restore(2, generated_pw()), &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((
+                2,
+                WizardAnswer::Refused("Not done: this computer's password was not confirmed.")
+            ))
+        );
+        let grant = denied.ctx.guard.store().grant(&device).unwrap();
+        assert!(grant.marked(), "unchanged");
+        assert!(
+            matches!(grant.state, GrantState::Disabled { .. }),
+            "{:?}",
+            grant.state
+        );
+        drop(denied);
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let watch = watch_on_machine(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            facts(),
+            b"another machine",
+        );
+        watch.restore(restore(3, chosen_pw()), &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((3, WizardAnswer::NeedsGenerated))
+        );
+        assert!(reauth.calls().is_empty(), "no dialog");
+        watch.restore(restore(4, generated_pw()), &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((4, WizardAnswer::Done))
+        );
+        assert_eq!(reauth.calls(), ["set_password", "enable"]);
+        let grant = watch.ctx.guard.store().grant(&device).unwrap();
+        assert!(!grant.marked(), "a new generated password");
+        assert!(
+            matches!(grant.state, GrantState::Active),
+            "{:?}",
+            grant.state
+        );
     }
 }
