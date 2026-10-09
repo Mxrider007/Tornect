@@ -2848,6 +2848,43 @@ mod tests {
         assert_eq!(commands.try_recv(), Err(TryRecvError::Empty));
     }
 
+    /// The actions' own check of the signed level: through a forwarder left
+    /// open in a session whose accept says view only, no key combination
+    /// and no ReleaseAll goes out, and nothing pauses.
+    #[test]
+    fn a_view_only_level_sends_nothing_through_an_open_forwarder() {
+        let w = Window::new(false);
+        for action in [
+            Action::Viewer(ViewerAction::SendKeys(Combo::AltTab)),
+            Action::Viewer(ViewerAction::SendKeys(Combo::Super)),
+            Action::Viewer(ViewerAction::SendKeys(Combo::PrintScreen)),
+            Action::Viewer(ViewerAction::Pause(true)),
+        ] {
+            let mut forwarder = Forwarder::new(true);
+            forwarder.set_picture(Some(PictureRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1280.0,
+                height: 720.0,
+            }));
+            forwarder.moved((640.0, 400.0));
+            forwarder.flush();
+            forwarder.drain();
+            let mut state = ViewerState::default();
+            apply_viewer_action(&mut forwarder, &mut state, Some(&w.viewing), &action);
+            forwarder.flush();
+            let sent = forwarder.drain();
+            assert!(
+                !sent.iter().any(|e| matches!(
+                    e,
+                    tornect_input::InputEvent::Key { .. } | tornect_input::InputEvent::ReleaseAll
+                )),
+                "{action:?}: {sent:?}"
+            );
+            assert!(!forwarder.is_paused(), "{action:?}");
+        }
+    }
+
     /// A session's window starts unpaused with the keyboard on the host: the
     /// forwarder and the window's state are built anew for each session.
     #[test]
