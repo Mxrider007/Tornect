@@ -1753,4 +1753,18 @@ mod tests {
         w.pass(ms(300), Vec::new());
         assert!(w.has(gone), "the bit cleared: {:?}", w.texts());
     }
+
+    /// An open Send keys menu keeps the toolbar, with no move of the
+    /// pointer: the pill and the menu are still shown at 0, 2.6 and 9 s.
+    #[test]
+    fn an_open_send_keys_menu_keeps_the_toolbar() {
+        let mut w = Window::new(true);
+        w.viewer.keys_menu = true;
+        for at in [0, 2600, 9000] {
+            w.pass(ms(at), Vec::new());
+            w.pass(ms(at), Vec::new());
+            assert!(w.has("End session"), "{at} ms: {:?}", w.texts());
+            assert!(w.has("Alt+Tab"), "{at} ms: {:?}", w.texts());
+        }
+    }
 }
