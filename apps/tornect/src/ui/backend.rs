@@ -2878,6 +2878,50 @@ mod tests {
         }
     }
 
+    /// The window's sessions sink tells a Control session's viewer the
+    /// host's start code from the session's start on, through `notice`: 0 on
+    /// a host that does not run Windows; on Windows, at the level none, the
+    /// Windows bit and the administrator-windows bit. A view-only session's
+    /// viewer is told nothing.
+    #[tokio::test]
+    async fn the_window_sink_tells_the_viewer_the_start_code() {
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let media = Arc::new(MediaHost::new(
+            Arc::new(SystemBackend::new(Source::TestCard)),
+            Arc::new(GuiMedia {
+                shared: Arc::clone(&shared),
+            }),
+            MediaLimits::default(),
+        ));
+        let (started, _seen) = watch::channel(0u64);
+        let sessions = GuiSessions {
+            live: Arc::new(LiveSessions::new()),
+            polkit: Arc::new(PolkitRevocation::for_this_host()),
+            media,
+            shared: Arc::clone(&shared),
+            started,
+        };
+        let token = tornect_signal::consent::SessionToken::new([5; 32]);
+        let control = if cfg!(windows) { 0x03 } else { 0x00 };
+        for (id, mode, want) in [
+            ("c1", SessionMode::Control, Some(control)),
+            ("v1", SessionMode::ViewOnly, None),
+        ] {
+            sessions.on_start(&LiveSession {
+                device: DeviceIdentity::from_seed(&[9; 32]).id(),
+                label: "Laptop",
+                session_id: id,
+                token: &token,
+                th_final: [0; 32],
+                mode,
+                elevation: Elevation::None,
+                unattended: false,
+            });
+            assert_eq!(sessions.notice(id), want, "{id}");
+            sessions.on_end(id, None);
+        }
+    }
+
     /// The history notice shows on the first run of a home only.
     #[test]
     fn the_history_notice_shows_once() {
