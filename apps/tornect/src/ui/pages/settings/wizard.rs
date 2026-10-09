@@ -1,4 +1,4 @@
-//! The grant wizard of Settings, Security (§B.8.7.1 ① to ⑤ and ⑦): it gives
+//! The grant wizard of Settings, Security (§B.8.7.1 ① to ⑦, without ⑤a): it gives
 //! one paired device unattended access. ① says what that means, the scam
 //! line, this system's limits and what is kept and who learns what; its
 //! Continue answers a pointer click only, armed after a second, with Cancel
@@ -7,10 +7,12 @@
 //! presets with their defaults, ④ the password: the generator's passphrase,
 //! shown once and never selectable, or, only where the guard's preview says
 //! the grant's reach stays 0 (decision M1-67), one of the person's own,
-//! masked, never copied, its undo state cleared every frame. ⑤ sets the
+//! masked, never copied, at most one character beyond the policy and never
+//! growing, its undo state cleared every frame. ⑤ sets the
 //! grant's options over the preset's defaults, each by its own rule, and
 //! shows the host-wide ones as they are; an option that makes the reach
-//! non-zero takes an own password back to ④'s generator. ⑦ sums it up,
+//! non-zero takes an own password back to ④'s generator. ⑥ shows this
+//! computer's readiness rows; a red one needs "Enable anyway". ⑦ sums it up,
 //! and *Turn on* sends it as one operation, which the tokio side runs
 //! through the guard; the wizard changes only on its answer. ④ and ⑦
 //! complete by a primary pointer click only. Every password and passphrase
@@ -34,7 +36,7 @@ use super::super::super::model::{
 };
 use super::super::super::theme::{self, Face, Tokens};
 use super::super::super::view::Action;
-use super::super::super::widgets::{self, Button, Kind};
+use super::super::super::widgets::{self, Button, Kind, Tone};
 use super::{SettingsForm, line};
 
 /// The Security section's button that opens the wizard (§B.8.7.1).
@@ -158,12 +160,20 @@ const ARM_AFTER: Duration = Duration::from_secs(1);
 /// The ids of ④'s two fields, whose undo copies are dropped every frame.
 const FIELD_IDS: [&str; 2] = ["wizard-password", "wizard-password-again"];
 
-/// Room for a password of [`password::MAX_CHARS`] characters, reserved
-/// before the first is typed: a string that grows leaves its outgrown
-/// copies in freed memory, unwiped.
-const FIELD_ROOM: usize = password::MAX_CHARS * 4;
+/// Room for a password of [`password::MAX_CHARS`] characters and one more
+/// (a field takes no more: [`FIELD_CHARS`]), reserved before the first is
+/// typed: a string that grows leaves its outgrown copies in freed memory,
+/// unwiped.
+const FIELD_ROOM: usize = FIELD_CHARS * 4;
 
-/// The wizard's steps, in order (⑥ comes with its commit).
+/// The most a password field takes: one character more than the policy
+/// allows, so that the meter can say so.
+const FIELD_CHARS: usize = password::MAX_CHARS + 1;
+
+/// The tick a red readiness row needs before ⑦ (§B.8.7.1 ⑥).
+pub(in super::super) const ENABLE_ANYWAY: &str = "Enable anyway — it will not work until fixed";
+
+/// The wizard's steps, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in super::super) enum Step {
     /// ① What it means, the scam line, the limits, the disclosures.
@@ -176,6 +186,8 @@ pub(in super::super) enum Step {
     Password,
     /// ⑤ The grant's options.
     Options,
+    /// ⑥ This computer's readiness.
+    Check,
     /// ⑦ What is given, and *Turn on*.
     Summary,
 }
@@ -190,6 +202,7 @@ impl Step {
             Self::Preset => "Choose how it is used",
             Self::Password => "Password",
             Self::Options => "Options",
+            Self::Check => "Check this computer",
             Self::Summary => "Summary",
         }
     }
@@ -249,6 +262,8 @@ pub(in super::super) struct Wizard {
     pub(in super::super) preset: Preset,
     /// ⑤'s choices.
     pub(in super::super) options: Options,
+    /// ⑥'s "Enable anyway" for a red readiness row.
+    pub(in super::super) enable_anyway: bool,
     /// The generator's passphrase of ④, drawn when ④ opens: shown there
     /// only, sent as generated.
     pub(in super::super) passphrase: Option<NewPassword>,
@@ -288,6 +303,7 @@ impl Wizard {
             waive: false,
             preset: Preset::MyMachines,
             options: Options::of(Preset::MyMachines),
+            enable_anyway: false,
             passphrase: None,
             own: false,
             typed: room(),
@@ -402,6 +418,7 @@ pub(in super::super) fn draw(
         Step::Preset => preset(ui, t, w, &mut close, actions),
         Step::Password => password_step(ui, t, model, w, &mut close),
         Step::Options => options(ui, t, model, manager, w, &mut close, actions),
+        Step::Check => check(ui, t, manager, w, &mut close),
         Step::Summary => {
             let attempt = form.attempts + 1;
             if summary(ui, t, model, manager, w, &mut close, attempt, actions) {
@@ -714,6 +731,7 @@ fn password_step(ui: &mut Ui, t: &Tokens, model: &Model, w: &mut Wizard, close: 
                 egui::TextEdit::singleline(&mut **text)
                     .id(egui::Id::new(id))
                     .password(true)
+                    .char_limit(FIELD_CHARS)
                     .hint_text(hint)
                     .desired_width(300.0),
             );
@@ -894,6 +912,50 @@ fn options(
             && let Some(choice) = w.choice()
         {
             actions.push(Action::Manager(ManagerOp::Preview(Box::new(choice))));
+            w.step = Step::Check;
+        }
+    });
+}
+
+/// ⑥: this computer's readiness rows as the window host last read them,
+/// with the static advisory (§B.8.7.1 ⑥); a red row needs "Enable anyway —
+/// it will not work until fixed" before ⑦.
+fn check(ui: &mut Ui, t: &Tokens, manager: &Manager, w: &mut Wizard, close: &mut bool) {
+    let mut red = false;
+    for (name, probe) in &manager.readiness {
+        let (tone, text) = super::security::readiness_line(name, probe);
+        red |= tone == Tone::Danger;
+        ui.horizontal_top(|ui| {
+            widgets::dot(ui, tone);
+            line(ui, &text, t.text_primary);
+        });
+    }
+    ui.add_space(6.0);
+    line(ui, super::security::ADVISORY, t.text_muted);
+    if red {
+        ui.add_space(8.0);
+        ui.checkbox(&mut w.enable_anyway, ENABLE_ANYWAY);
+    } else {
+        w.enable_anyway = false;
+    }
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        cancel(ui, true, close);
+        if Button::new(Kind::Secondary, "Back")
+            .small()
+            .show(ui)
+            .clicked()
+        {
+            w.step = Step::Options;
+        }
+        let ready = !red || w.enable_anyway;
+        if Button::new(Kind::Primary, "Continue")
+            .small()
+            .enabled(ready)
+            .show(ui)
+            .clicked()
+            && ready
+        {
             w.step = Step::Summary;
         }
     });
@@ -970,9 +1032,8 @@ pub(in super::super) fn meter(
     (true, lines)
 }
 
-/// ⑦: what is given, the readiness rows as they are, and *Turn on*, which
-/// sends the choice and the password as press `attempt`; whether it was
-/// pressed.
+/// ⑦: what is given and *Turn on*, which sends the choice and the password
+/// as press `attempt`; whether it was pressed.
 #[allow(clippy::too_many_arguments)]
 fn summary(
     ui: &mut Ui,
@@ -1022,15 +1083,6 @@ fn summary(
         },
         t.text_primary,
     );
-    ui.add_space(8.0);
-    widgets::section_header(ui, "Readiness");
-    for (name, probe) in &manager.readiness {
-        let (tone, text) = super::security::readiness_line(name, probe);
-        ui.horizontal_top(|ui| {
-            widgets::dot(ui, tone);
-            line(ui, &text, t.text_primary);
-        });
-    }
     ui.add_space(8.0);
     if !manager.on {
         line(ui, ASKS_TWICE, t.text_secondary);
@@ -1342,6 +1394,8 @@ mod tests {
         };
         window.model.wizard.preview = Some(((**choice).clone(), judged.flatten()));
         window.pass(Vec::new());
+        assert_eq!(window.step(), Some(Step::Check));
+        assert!(window.click("Continue").is_empty());
         assert_eq!(window.step(), Some(Step::Summary));
     }
 
@@ -1380,6 +1434,8 @@ mod tests {
         };
         window.model.wizard.preview = Some(((**choice).clone(), Some(false)));
         window.pass(Vec::new());
+        assert_eq!(window.step(), Some(Step::Check));
+        assert!(window.click("Continue").is_empty());
         let sent = grants(&window.click(TURN_ON));
         assert_eq!(sent.len(), 1);
         assert_eq!(
@@ -1391,6 +1447,63 @@ mod tests {
 
     fn options_mut(window: &mut Window) -> &mut Options {
         &mut window.form.settings.wizard.as_mut().expect("open").options
+    }
+
+    /// §B.8.7.1 ⑥: this computer's readiness rows as the host read them; a
+    /// red row needs "Enable anyway — it will not work until fixed" before ⑦
+    /// (Continue does nothing until it is ticked), and with no red row
+    /// nothing is asked.
+    #[test]
+    fn a_red_row_needs_enable_anyway() {
+        for (rows, red) in [
+            (
+                vec![("panic_key", Probe::Ok), ("capture", Probe::Unknown)],
+                false,
+            ),
+            (
+                vec![
+                    ("panic_key", Probe::Fail("not bound".to_owned())),
+                    ("capture", Probe::Ok),
+                ],
+                true,
+            ),
+        ] {
+            let mut window = at_options("My machines", false);
+            window.model.manager.as_mut().expect("a guard").readiness = rows;
+            let sent = window.click("Continue");
+            let Some(Action::Manager(ManagerOp::Preview(chosen))) = sent.first() else {
+                panic!("no preview asked: {sent:?}");
+            };
+            window.model.wizard.preview = Some(((**chosen).clone(), Some(false)));
+            window.pass(Vec::new());
+            assert_eq!(window.step(), Some(Step::Check), "{red}");
+            assert!(window.has_text("Panic key"), "{red}");
+            assert!(window.has_text(super::super::security::ADVISORY), "{red}");
+            assert_eq!(window.has_control(ENABLE_ANYWAY), red);
+            assert!(window.click("Continue").is_empty());
+            if red {
+                assert_eq!(window.step(), Some(Step::Check), "not without the tick");
+                assert!(window.click(ENABLE_ANYWAY).is_empty());
+                assert!(window.click("Continue").is_empty());
+            }
+            assert_eq!(window.step(), Some(Step::Summary), "{red}");
+        }
+    }
+
+    /// §B.8.7.2: a password field takes one character more than the policy
+    /// allows and no more, inside the room reserved before typing, so a long
+    /// paste never makes it grow; the meter says how long a password may be.
+    #[test]
+    fn a_long_paste_never_grows_a_password_field() {
+        let mut window = at_password(WIDE, Some(false));
+        assert!(window.click(USE_MY_OWN).is_empty());
+        assert!(window.click(FIELD).is_empty());
+        window.pass(vec![egui::Event::Paste("x7!Qz".repeat(120))]);
+        window.pass(Vec::new());
+        let w = window.wizard().expect("open");
+        assert_eq!(w.typed.chars().count(), FIELD_CHARS);
+        assert_eq!(w.typed.capacity(), FIELD_ROOM);
+        assert!(window.has_text("At most 128 characters."));
     }
 
     /// §B.8.6.1: a device without a completed attended session gets access
@@ -1546,6 +1659,8 @@ mod tests {
             panic!("no preview asked: {sent:?}");
         };
         assert_eq!(choice.options.mode, Some(SessionMode::Control));
+        assert_eq!(window.step(), Some(Step::Check));
+        assert!(window.click("Continue").is_empty());
         // Turn on waits for the preview of this choice.
         assert!(window.wizard().unwrap().own);
         assert!(grants(&window.click(TURN_ON)).is_empty(), "not judged yet");
@@ -1652,7 +1767,8 @@ mod tests {
                         Some(Step::Preset) => 3,
                         Some(Step::Password) => 4,
                         Some(Step::Options) => 5,
-                        Some(Step::Summary) => 6,
+                        Some(Step::Check) => 6,
+                        Some(Step::Summary) => 7,
                     };
                     assert!(order(window.step()) <= order(Some(step)), "{case}: went on");
                 }
