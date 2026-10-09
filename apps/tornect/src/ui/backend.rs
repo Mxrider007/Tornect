@@ -846,6 +846,15 @@ impl ManagerWatch {
                 guard.disable(Actor::Ui, &device).map_err(|e| refusal(&e))
             }
             ManagerOp::Revoke(device) => guard.revoke(Actor::Ui, &device).map_err(|e| refusal(&e)),
+            // The command line's `set-level <device> none` as the window: the
+            // guard ends a session at the level itself; no dialog.
+            ManagerOp::LevelOff(device) => guard
+                .set_options(Actor::Ui, &device, &crate::unattended::level_none_options())
+                .map(|()| {
+                    let keeps = crate::unattended::keeps_at_the_level(&self.ctx, &device);
+                    shared.update(|m| m.wizard.level_off = Some((device, keeps)));
+                })
+                .map_err(|e| refusal(&e)),
             ManagerOp::Remove(device) => match guard.unpair(Actor::Ui, &device) {
                 Ok(_) => match self.trusted.remove(&device) {
                     Ok(removed) => {
@@ -6360,5 +6369,62 @@ mod tests {
         let store = watch.ctx.guard.store();
         assert!(!store.grant(&one).unwrap().marked(), "its new password");
         assert!(store.grant(&two).unwrap().marked(), "its old password");
+    }
+
+    // ------------------------------------------------------------ the turn-off (§B.8.7.1 ⑤a)
+
+    /// §B.8.6.2, decision M1-68: turning the administrator level off is
+    /// deny-direction: no dialog, also during a remote session; the grant
+    /// keeps control without the level, and the answer says which clause of
+    /// the turn-off sentence's condition holds: another grant at the level,
+    /// then, once that one is off too, nothing.
+    #[test]
+    fn turning_the_level_off_asks_no_reauth() {
+        use tornect_core::levels::{FixedFacts, HelperPresence};
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{AllowAllReAuth, ScriptedActivity};
+        use tornect_core::unattended::ipc::SetLevelNonePayload;
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let activity = Arc::new(ScriptedActivity::default());
+        let watch = wizard_watch(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::clone(&activity)
+                as Arc<dyn tornect_core::unattended::guard::RemoteSessionActivity>,
+            Arc::new(FixedFacts::new(windows_admin(), HelperPresence::Absent)),
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let [one, two] = [1, 2].map(|b| tornect_core::DeviceId::from_bytes([b; 32]));
+        for (attempt, device) in [(1, one), (2, two)] {
+            watch.wizard_grant(
+                with_level(attempt, device, Preset::MyMachines, generated_pw()),
+                &shared,
+            );
+            assert_eq!(
+                shared.read(|m| m.wizard.answer),
+                Some((attempt, WizardAnswer::Done))
+            );
+        }
+        let asked = reauth.calls();
+        activity.set_live(true);
+        let store = watch.ctx.guard.store();
+        watch.run(ManagerOp::LevelOff(one), &shared);
+        assert_eq!(reauth.calls(), asked, "no dialog");
+        let grant = store.grant(&one).unwrap();
+        assert!(!grant.holds_level());
+        assert_eq!(grant.mode, SessionMode::Control, "control kept");
+        assert_eq!(
+            shared.read(|m| m.wizard.level_off),
+            Some((one, SetLevelNonePayload::ANOTHER_ADMIN_GRANT))
+        );
+        assert_eq!(shared.read(|m| m.manager_note), None);
+        watch.run(ManagerOp::LevelOff(two), &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.level_off),
+            Some((two, SetLevelNonePayload::NOTHING))
+        );
+        assert!(!store.grant(&two).unwrap().holds_level());
+        assert_eq!(reauth.calls(), asked, "no dialog");
     }
 }
