@@ -16,8 +16,8 @@ use tornect_signal::fsm::timeouts;
 use tornect_signal::pairing::{PairDecision, SessionDecision};
 
 use super::model::{
-    BlockRequest, Confirm, ManagerOp, Model, Popup, PopupKind, Prompt, Recognition, SettingsChange,
-    Sharing, SheetLevels,
+    BlockRequest, Confirm, ManagerOp, Model, Popup, PopupKind, Prompt, Recognition, RotateFailed,
+    SettingsChange, Sharing, SheetLevels,
 };
 #[cfg(test)]
 use super::model::{ClientStage, Hosting, Setup, TorState, Viewing};
@@ -212,6 +212,40 @@ pub enum Action {
     /// The person read that this computer's unattended setup was re-created:
     /// connecting may go on, and the next accept pins its new key (A16).
     ConfirmSetupChanged(TornectId),
+    /// Close the window: the card of a Rotate ID that did not finish was
+    /// read (§B.8.12).
+    CloseWindow,
+}
+
+/// The main window's one card when Rotate ID did not finish, with Close.
+fn rotate_failed(ui: &mut egui::Ui, failed: RotateFailed, actions: &mut Vec<Action>) {
+    let t = theme::tokens(ui.ctx());
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::new()
+                .fill(t.bg_app)
+                .inner_margin(egui::Margin::same(32)),
+        )
+        .show(ui, |ui| {
+            widgets::card(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(pages::SettingsForm::rotate_failed(failed))
+                            .font(theme::font(ui.ctx(), Face::Semibold, 14.0))
+                            .color(t.text_primary),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(10.0);
+                if widgets::Button::new(widgets::Kind::Primary, "Close")
+                    .show(ui)
+                    .clicked()
+                {
+                    actions.push(Action::CloseWindow);
+                }
+            });
+        });
 }
 
 /// The password prompt's fields (§B.8.10). The password is wiped when the
@@ -374,6 +408,12 @@ pub fn main_window(
 ) {
     theme::ensure(ui.ctx());
     let t = theme::tokens(ui.ctx());
+    // Rotate ID did not finish (§B.8.12): one card says what was left, and
+    // its Close closes the window; nothing else is drawn.
+    if let Some(failed) = model.rotate_failed {
+        rotate_failed(ui, failed, actions);
+        return;
+    }
     let window = ui.max_rect().width();
     let mut below = ui.max_rect();
     if !model.sharing.is_empty() {

@@ -24,7 +24,7 @@ use tornect_core::unattended::grant::Preset;
 use tornect_core::unattended::readiness::{Probe, row_title};
 
 use super::super::super::model::{
-    GrantRow, HostSetting, Manager, ManagerOp, Model, PauseEnd, Setup,
+    GrantRow, HostSetting, Manager, ManagerOp, Model, PauseEnd, RotateFailed, Setup,
 };
 use super::super::super::theme::{self, Face, Tokens};
 use super::super::super::view::Action;
@@ -172,6 +172,29 @@ pub(in super::super) fn rotate_question(labels: &[&str]) -> String {
          removed for: {named}. Type ROTATE to go on. Tornect closes when it is done; start it \
          again to use the new ID."
     )
+}
+
+/// The window's one card when Rotate ID removed unattended access but did
+/// not change the ID (§B.8.12).
+pub(in super::super) const ROTATE_DID_NOT_FINISH: &str = "Rotate ID did not finish: unattended \
+    access was removed, but this computer keeps its old ID. Start Tornect again and use Rotate ID \
+    again.";
+
+/// The window's one card when Rotate ID changed nothing (§B.8.12).
+pub(in super::super) const ROTATE_DID_NOT_RUN: &str =
+    "Rotate ID did not run: nothing was changed. Start Tornect again and use Rotate ID again.";
+
+impl SettingsForm {
+    /// What the main window's one card says when Rotate ID did not finish
+    /// (`view::main_window` draws it in place of everything else; it reaches
+    /// this section's texts through the form's type).
+    #[must_use]
+    pub(in crate::ui) fn rotate_failed(failed: RotateFailed) -> &'static str {
+        match failed {
+            RotateFailed::AccessRemoved => ROTATE_DID_NOT_FINISH,
+            RotateFailed::NothingChanged => ROTATE_DID_NOT_RUN,
+        }
+    }
 }
 
 /// Revoke all's question naming how many devices lose their access.

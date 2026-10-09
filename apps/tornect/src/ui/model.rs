@@ -231,6 +231,9 @@ pub struct Model {
     /// Rotate ID runs: the window closes once it returned (no time limit cuts
     /// it short).
     pub rotating: bool,
+    /// Rotate ID did not finish (§B.8.12): the window stays open on one card
+    /// that says what was left, until it is closed.
+    pub rotate_failed: Option<RotateFailed>,
     /// The emergency stop code of the last *Turn on*, grouped as the command
     /// line prints it (§B.8.7.4), until the person clicks "I have written it
     /// down": then it is dropped (wiped). Never logged, never in `Debug`; a
@@ -293,6 +296,17 @@ impl Model {
         let extra = self.events.len().saturating_sub(Self::EVENTS_KEPT);
         self.events.drain(..extra);
     }
+}
+
+/// What a Rotate ID that did not finish left (§B.8.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotateFailed {
+    /// Every grant was wiped, but the identity step failed: this computer
+    /// keeps its old ID.
+    AccessRemoved,
+    /// Nothing was wiped: Tor did not stop, or the rotation failed before
+    /// the wipe.
+    NothingChanged,
 }
 
 /// The connection to the Tor network.
