@@ -39,8 +39,8 @@ use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
 use super::model::{
     Candidate, CaptureNote, Check, ClientStage, DeviceCard, Dial, Failure, GrantLevel,
     GrantRequest, GrantRow, HostSetting, Hosting, Manager, ManagerOp, NewPassword, PauseEnd,
-    PolicyInputs, Settings, SettingsChange, Shared, Sharing, TorState, UnattendedBanner, ViewOnly,
-    Viewing, Wake, WizardAnswer, WizardChoice, WizardView,
+    PolicyInputs, RotateFailed, Settings, SettingsChange, Shared, Sharing, TorState,
+    UnattendedBanner, ViewOnly, Viewing, Wake, WizardAnswer, WizardChoice, WizardView,
 };
 use super::recognize::Lookalike;
 use super::stream::{FrameSlot, SlotSink};
@@ -2383,27 +2383,101 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
     if let Some(status) = status {
         status.abort();
     }
+    // Rotate ID, with every session ended, the onion service gone and Tor
+    // stopped; the window waits for it (§B.8.12).
+    if let Some(manager) = rotating {
+        let stopped = stop_tor_for_rotation(tor_start, publish, listener, node).await;
+        let (paths, device) = (b.paths.clone(), Arc::clone(&b.device));
+        rotate_at_close(&b.shared, stopped, move || manager.rotate(&paths, &device)).await;
+        return;
+    }
     drop(listener);
     if let Some(node) = node
         && let Ok(node) = Arc::try_unwrap(node)
     {
         node.shutdown().await;
     }
-    // Rotate ID, with every session ended, the onion service gone and Tor
-    // stopped; the window waits for it (§B.8.12).
-    if let Some(manager) = rotating {
-        let (paths, device) = (b.paths.clone(), Arc::clone(&b.device));
-        match tokio::task::spawn_blocking(move || manager.rotate(&paths, &device)).await {
-            Ok(Ok(rotated)) => say(format_args!(
-                "Rotate ID: unattended access removed for {} device(s); the new ID is used \
-                 from the next start",
-                rotated.grants
-            )),
-            // No error text: it may name a path, which names the account.
-            Ok(Err(_)) | Err(_) => tracing::warn!("Rotate ID did not finish"),
-        }
-    }
     b.shared.update(|m| m.closed = true);
+}
+
+/// Tor's part of the shutdown before Rotate ID (§B.8.12): a publish still
+/// running is aborted and waited for, a Tor start still running is waited
+/// for (it is never cancelled), then the listener goes and the node is shut
+/// down. `false`: Tor did not shut down, since another task still holds the
+/// node, and the rotation must not run.
+async fn stop_tor_for_rotation(
+    tor_start: Option<JoinHandle<anyhow::Result<TorNode>>>,
+    publish: Option<JoinHandle<anyhow::Result<OnionListener>>>,
+    listener: Option<OnionListener>,
+    node: Option<Arc<TorNode>>,
+) -> bool {
+    if let Some(publish) = publish {
+        publish.abort();
+        let _ = publish.await;
+    }
+    let mut node = node;
+    if let Some(start) = tor_start
+        && let Ok(Ok(started)) = start.await
+    {
+        node = Some(Arc::new(started));
+    }
+    drop(listener);
+    match node.map(Arc::try_unwrap) {
+        None => true,
+        Some(Ok(node)) => {
+            node.shutdown().await;
+            true
+        }
+        Some(Err(_)) => false,
+    }
+}
+
+/// Rotate ID at the window's close (§B.8.12), once Tor is `stopped`:
+/// `rotate` runs off this task, and the window closes after it. With Tor not
+/// stopped nothing is wiped. A rotation that did not finish leaves the
+/// window open on one card that says what is left (`rotate_failed`), with
+/// `rotating` still set, so that the window waits for its Close. Neither the
+/// card nor the log says the error: it may name a path, which names the
+/// account.
+async fn rotate_at_close<F>(shared: &Shared, stopped: bool, rotate: F)
+where
+    F: FnOnce() -> anyhow::Result<crate::rotate::Rotated> + Send + 'static,
+{
+    let failed = if stopped {
+        match tokio::task::spawn_blocking(rotate).await {
+            Ok(Ok(rotated)) => {
+                say(format_args!(
+                    "Rotate ID: unattended access removed for {} device(s); the new ID is used \
+                     from the next start",
+                    rotated.grants
+                ));
+                None
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Rotate ID did not finish");
+                Some(
+                    if e.downcast_ref::<crate::rotate::PartialRotation>().is_some() {
+                        RotateFailed::AccessRemoved
+                    } else {
+                        RotateFailed::NothingChanged
+                    },
+                )
+            }
+            // A panic: what it wiped is not known, so the card claims no
+            // removed access.
+            Err(_) => {
+                tracing::warn!("Rotate ID did not finish");
+                Some(RotateFailed::NothingChanged)
+            }
+        }
+    } else {
+        tracing::warn!("Rotate ID did not run: Tor did not stop");
+        Some(RotateFailed::NothingChanged)
+    };
+    shared.update(|m| match failed {
+        None => m.closed = true,
+        Some(failed) => m.rotate_failed = Some(failed),
+    });
 }
 
 /// The window's notes after the verified accept of an unattended connect to the
@@ -5351,6 +5425,161 @@ mod tests {
             "closed first"
         );
         assert!(first_run(&paths), "the next start is a first run");
+    }
+
+    /// A window host's view of unattended access in `home` for Rotate ID:
+    /// unattended access on, one device with a grant.
+    fn rotation_watch(home: &std::path::Path) -> ManagerWatch {
+        use tornect_core::session_log::Actor;
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        use tornect_core::unattended::ipc::GrantOptions;
+        let watch = manager_over(
+            home,
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            tornect_core::levels::AccountFacts::Linux,
+            b"machine-R",
+        );
+        let guard = &watch.ctx.guard;
+        guard.master_on(Actor::Cli, &[0x42; 32]).unwrap();
+        guard
+            .create_grant(
+                Actor::Cli,
+                &tornect_core::DeviceId::from_bytes([3; 32]),
+                Preset::HeadlessBox,
+                &GrantOptions::default(),
+                &[0u8; 192],
+                false,
+            )
+            .unwrap();
+        watch
+    }
+
+    /// The home's own keys, whose writes fail: the identity step of a
+    /// rotation cannot write the new seed.
+    struct NoWrites(tornect_core::keystore::FileSecretStore);
+
+    impl tornect_core::SecretStore for NoWrites {
+        fn get(&self, name: &str) -> tornect_core::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
+            self.0.get(name)
+        }
+        fn put(&self, _: &str, _: &[u8]) -> tornect_core::Result<()> {
+            Err(tornect_core::CoreError::Io(std::io::Error::other(
+                "no writes in this test",
+            )))
+        }
+        fn delete(&self, name: &str) -> tornect_core::Result<bool> {
+            self.0.delete(name)
+        }
+    }
+
+    /// §B.8.12: a rotation whose identity step fails after the guard's wipe
+    /// leaves the window open on the card that says access was removed and
+    /// the old ID kept: `closed` stays unset and `rotating` set (the window
+    /// keeps waiting); every grant is gone, and the ID is the old one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rotation_whose_identity_step_fails_keeps_the_card() {
+        use tornect_core::keystore::{FileSecretStore, load_or_create_host_identity};
+        use tornect_core::session_log::Actor;
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = rotation_watch(tmp.path());
+        let paths = Paths::from_home(tmp.path());
+        let keys = FileSecretStore::open(paths.keys_dir()).unwrap();
+        let (old, _) = load_or_create_host_identity(&keys).unwrap();
+        let shared = Shared::new(
+            Model {
+                rotating: true,
+                ..Model::default()
+            },
+            Arc::new(|_| {}),
+        );
+        let guard = Arc::clone(&watch.ctx.guard);
+        let failing = NoWrites(keys.clone());
+        rotate_at_close(&shared, true, move || {
+            crate::rotate::rotate_id(&paths, &guard, Actor::Ui, &failing, None)
+        })
+        .await;
+        shared.read(|m| {
+            assert_eq!(m.rotate_failed, Some(RotateFailed::AccessRemoved));
+            assert!(!m.closed, "the window stays on its card");
+            assert!(m.rotating, "and keeps waiting");
+        });
+        assert!(
+            watch.ctx.guard.store().grants().is_empty(),
+            "access removed"
+        );
+        let (now, created) = load_or_create_host_identity(&keys).unwrap();
+        assert!(!created);
+        assert_eq!(now.id(), old.id(), "the old ID kept");
+    }
+
+    /// §B.8.12: while another task still holds the Tor node (Tor did not
+    /// stop), Rotate ID does not run: the store is unchanged, and the
+    /// window's card says nothing was changed, the window still open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_still_held_refuses_the_rotation() {
+        use tornect_core::keystore::FileSecretStore;
+        use tornect_core::session_log::Actor;
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = rotation_watch(tmp.path());
+        let before = watch.ctx.guard.store().grants();
+        let paths = Paths::from_home(tmp.path());
+        let keys = FileSecretStore::open(paths.keys_dir()).unwrap();
+        let shared = Shared::new(
+            Model {
+                rotating: true,
+                ..Model::default()
+            },
+            Arc::new(|_| {}),
+        );
+        let guard = Arc::clone(&watch.ctx.guard);
+        rotate_at_close(&shared, false, move || {
+            crate::rotate::rotate_id(&paths, &guard, Actor::Ui, &keys, None)
+        })
+        .await;
+        shared.read(|m| {
+            assert_eq!(m.rotate_failed, Some(RotateFailed::NothingChanged));
+            assert!(!m.closed && m.rotating, "the window stays on its card");
+        });
+        assert_eq!(watch.ctx.guard.store().grants(), before, "nothing wiped");
+        assert!(watch.ctx.guard.store().read(|s| s.enabled).unwrap());
+    }
+
+    /// §B.8.12: before Rotate ID runs, Tor's shutdown aborts a publish still
+    /// running and waits for its end, and waits for a Tor start still
+    /// running (it is never cancelled), so that neither holds the node when
+    /// the rotation runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shutdown_before_the_rotation_stops_the_publish_and_the_tor_start() {
+        use std::sync::atomic::AtomicBool;
+        let (held, mut publishing) = tokio::sync::oneshot::channel::<()>();
+        let publish: JoinHandle<anyhow::Result<OnionListener>> = tokio::spawn(async move {
+            let _held = held;
+            std::future::pending::<anyhow::Result<OnionListener>>().await
+        });
+        let started = Arc::new(AtomicBool::new(false));
+        let tor_start: JoinHandle<anyhow::Result<TorNode>> = {
+            let started = Arc::clone(&started);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                started.store(true, Ordering::SeqCst);
+                Err(anyhow::anyhow!("no Tor in this test"))
+            })
+        };
+        assert!(
+            stop_tor_for_rotation(Some(tor_start), Some(publish), None, None).await,
+            "no node held"
+        );
+        assert_eq!(
+            publishing.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed),
+            "the publish ended before the rotation"
+        );
+        assert!(
+            started.load(Ordering::SeqCst),
+            "the Tor start was waited for"
+        );
     }
 
     /// FR2-L1: when the keychain refuses to delete the remembered password,

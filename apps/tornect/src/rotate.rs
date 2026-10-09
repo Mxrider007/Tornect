@@ -28,11 +28,34 @@ pub(crate) struct Rotated {
     pub passwords: anyhow::Result<usize>,
 }
 
+/// A rotation that stopped after the guard's wipe: unattended access was
+/// removed, but the identity step failed, so this home keeps its old ID. It
+/// reads as its `error` does, so the command line says what it said before.
+#[derive(Debug)]
+pub(crate) struct PartialRotation {
+    /// Why the identity step failed.
+    pub error: anyhow::Error,
+}
+
+impl std::fmt::Display for PartialRotation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for PartialRotation {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
 /// Rotate the ID of the home `paths` as `by`: `guard`'s rotate operation
 /// first, then the identity in `store`; `saved` are this device's remembered
 /// passwords (the keychain's, a test's own vault), when it has a device key.
 /// The Tor keys are removed before the new seed is written, so a failure
-/// there leaves the old identity whole rather than half rotated.
+/// there leaves the old identity whole rather than half rotated. A failure
+/// after the guard's wipe is a [`PartialRotation`]: every grant is gone, and
+/// the ID is the old one.
 pub(crate) fn rotate_id(
     paths: &Paths,
     guard: &MutationGuard,
@@ -41,6 +64,23 @@ pub(crate) fn rotate_id(
     saved: Option<&SavedPasswords>,
 ) -> anyhow::Result<Rotated> {
     let grants = guard.rotate_id(by)?;
+    let (id, forgotten) = new_identity(paths, store)
+        .map_err(|error| anyhow::Error::new(PartialRotation { error }))?;
+    let passwords = saved.map_or(Ok(0), |saved| ua_client::forget_all(paths, saved));
+    Ok(Rotated {
+        grants,
+        id,
+        forgotten,
+        passwords,
+    })
+}
+
+/// The identity step of a rotation: the old ID's Tor keys and service state
+/// go, then a new identity seed is written into `store`.
+fn new_identity(
+    paths: &Paths,
+    store: &dyn SecretStore,
+) -> anyhow::Result<(TornectId, tornect_signal::ForgottenIdentity)> {
     let mut forgotten = tornect_signal::ForgottenIdentity::default();
     if store.contains(keystore::HOST_IDENTITY_SEED)? {
         let (old, _) = load_or_create_host_identity(store)?;
@@ -48,13 +88,7 @@ pub(crate) fn rotate_id(
             .context("removing the old Tornect ID from the Tor keystore and state")?;
     }
     let host = keystore::rotate_host_identity(store)?;
-    let passwords = saved.map_or(Ok(0), |saved| ua_client::forget_all(paths, saved));
-    Ok(Rotated {
-        grants,
-        id: host.id(),
-        forgotten,
-        passwords,
-    })
+    Ok((host.id(), forgotten))
 }
 
 #[cfg(test)]
