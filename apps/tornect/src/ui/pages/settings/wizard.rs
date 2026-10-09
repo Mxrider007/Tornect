@@ -30,6 +30,7 @@ use tornect_core::DeviceId;
 use tornect_core::levels::{ADMINISTRATOR_WARNING, AccountFacts, Elevation};
 use tornect_core::session_log::SessionMode;
 use tornect_core::unattended::grant::{MAX_BLOCK_WINDOW_S, Preset};
+use tornect_core::unattended::guard::NewlyReaching;
 use tornect_core::unattended::ipc::GrantOptions;
 use tornect_core::unattended::password::{self, PolicyError};
 use zeroize::Zeroizing;
@@ -203,6 +204,25 @@ pub(in super::super) const RAISE_LINE: &str = "Administrator access needs a new 
 pub(in super::super) const RESTORE_LINE: &str = "Administrator access for <device> needs a new \
     password after a restore or an import. The old one stops working when you finish.";
 
+/// The ⑤a offer's heading (§B.8.7.1); `<labels>` stands for the pinned
+/// labels of the devices it names.
+pub(in super::super) const OFFER_HEADING: &str = "These devices have control of this computer: \
+    <labels>. From now on their control can reach programs that run as administrator here.";
+
+/// The offer's tick (§B.8.7.1), ticked when the offer opens.
+pub(in super::super) const GIVE_NEW: &str = "Give them new passwords now";
+
+/// Unticked, the offer names only the devices whose password is marked
+/// (§B.8.7.1, §B.8.6.1); `<labels>` stands for their pinned labels.
+pub(in super::super) const UNTICKED_LINE: &str = "<labels> get view only until you give each \
+    one a new password: their current passwords may be kept on those devices, were chosen, or \
+    are older than this version of Tornect.";
+
+/// After a round of the offer whose prompts did not all finish (§B.8.7.1,
+/// §B.8.7.4); `<labels>` stands for the pinned labels.
+pub(in super::super) const STILL_OLD: &str =
+    "These devices still have their old password: <labels>.";
+
 /// How long ①'s Continue waits, still, before a click counts (M1-50).
 const ARM_AFTER: Duration = Duration::from_secs(1);
 
@@ -248,6 +268,9 @@ pub(in super::super) enum Step {
     /// The manager's *Enable* of a marked grant at the level: its new
     /// password first.
     Restore,
+    /// ⑤a's offer of new passwords to the other control grants a change
+    /// made reach the administrator level.
+    Offer,
 }
 
 impl Step {
@@ -264,7 +287,7 @@ impl Step {
             Self::Check => "Check this computer",
             Self::Summary => "Summary",
             Self::Mode => "Change mode",
-            Self::Raise => "Administrator access",
+            Self::Raise | Self::Offer => "Administrator access",
             Self::Restore => "Enable",
         }
     }
@@ -324,6 +347,22 @@ pub(in super::super) struct Changing {
     pub(in super::super) asked: bool,
 }
 
+/// ⑤a's offer (§B.8.7.1, decision M1-67): one round of prompts over the
+/// devices it names, then the devices left on their old password again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in super::super) struct Offer {
+    /// This round's devices still to be asked, the first one asked now.
+    pub(in super::super) queue: Vec<NewlyReaching>,
+    /// This round's devices whose new password did not finish.
+    pub(in super::super) left: Vec<NewlyReaching>,
+    /// A round left these devices on their old password.
+    pub(in super::super) again: bool,
+    /// "Give them new passwords now".
+    pub(in super::super) give: bool,
+    /// The round's prompts run.
+    pub(in super::super) asking: bool,
+}
+
 /// What the wizard remembers from pass to pass. Never printed: its
 /// passwords are wiped when it is dropped.
 pub(in super::super) struct Wizard {
@@ -361,6 +400,8 @@ pub(in super::super) struct Wizard {
     pub(in super::super) note: Option<&'static str>,
     /// ④'s passphrase was shown with the new-grant line under it.
     pub(in super::super) level_line: bool,
+    /// ⑤a's offer, once a change made other control grants reach the level.
+    pub(in super::super) offer: Option<Offer>,
 }
 
 impl std::fmt::Debug for Wizard {
@@ -394,6 +435,7 @@ impl Wizard {
             generated_only: false,
             note: None,
             level_line: false,
+            offer: None,
         }
     }
 
@@ -432,6 +474,51 @@ impl Wizard {
         w.generated_only = true;
         w.step = Step::Restore;
         w
+    }
+
+    /// ⑤a's offer for the devices `reaching`, at its heading, ticked: every
+    /// password of the change that led here is gone.
+    fn open_offer(&mut self, reaching: Vec<NewlyReaching>) {
+        self.drop_passwords();
+        self.note = None;
+        self.step = Step::Offer;
+        self.offer = Some(Offer {
+            queue: reaching,
+            left: Vec::new(),
+            again: false,
+            give: true,
+            asking: false,
+        });
+    }
+
+    /// The answer to the offer's prompt for its first device (`done`: its
+    /// new password is registered), or that prompt skipped: then the next
+    /// device's prompt with a new passphrase, or, the round over, the devices
+    /// left on their old password listed again. Whether none is left.
+    fn offer_next(&mut self, done: bool) -> bool {
+        let Some(offer) = self.offer.as_mut() else {
+            return true;
+        };
+        if !offer.queue.is_empty() {
+            let asked = offer.queue.remove(0);
+            if !done {
+                offer.left.push(asked);
+            }
+        }
+        let prompt = if offer.queue.is_empty() {
+            if offer.left.is_empty() {
+                return true;
+            }
+            offer.queue = std::mem::take(&mut offer.left);
+            offer.again = true;
+            offer.give = true;
+            offer.asking = false;
+            false
+        } else {
+            true
+        };
+        self.passphrase = if prompt { generated() } else { None };
+        false
     }
 
     /// After a refused answer: the same step again with a new passphrase
@@ -560,19 +647,34 @@ pub(in super::super) fn draw(
         && attempt == answered
     {
         w.attempt = None;
-        match answer {
-            WizardAnswer::Done => {
+        if w.step == Step::Offer {
+            // An offer's prompt: the next device, or the round's end.
+            if let WizardAnswer::Refused(why) = answer {
+                w.note = Some(why);
+            }
+            if w.offer_next(answer == WizardAnswer::Done) {
                 form.wizard = None;
                 return;
             }
-            WizardAnswer::NeedsGenerated => {
-                w.generated_only = true;
-                w.note = Some(NEEDS_GENERATED);
-                w.again();
-            }
-            WizardAnswer::Refused(why) => {
-                w.note = Some(why);
-                w.again();
+        } else {
+            match answer {
+                WizardAnswer::Done if !model.wizard.reaching.is_empty() => {
+                    // Other control grants now reach the level: ⑤a's offer.
+                    w.open_offer(model.wizard.reaching.clone());
+                }
+                WizardAnswer::Done => {
+                    form.wizard = None;
+                    return;
+                }
+                WizardAnswer::NeedsGenerated => {
+                    w.generated_only = true;
+                    w.note = Some(NEEDS_GENERATED);
+                    w.again();
+                }
+                WizardAnswer::Refused(why) => {
+                    w.note = Some(why);
+                    w.again();
+                }
             }
         }
     }
@@ -602,6 +704,12 @@ pub(in super::super) fn draw(
         Step::Raise | Step::Restore => {
             let attempt = form.attempts + 1;
             if level_password(ui, t, model, w, &mut close, attempt, actions) {
+                form.attempts = attempt;
+            }
+        }
+        Step::Offer => {
+            let attempt = form.attempts + 1;
+            if offer_step(ui, t, w, &mut close, attempt, actions) {
                 form.attempts = attempt;
             }
         }
@@ -1257,6 +1365,145 @@ fn level_password(
             pressed = true;
         }
     });
+    pressed
+}
+
+/// The pinned labels of `devices`, as the offer's lines name them.
+fn labels(devices: &[NewlyReaching]) -> String {
+    devices
+        .iter()
+        .map(|d| d.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// ⑤a's offer (§B.8.7.1, decision M1-67): the heading with the devices'
+/// pinned labels (after a round that left some on their old password, the
+/// command line's "These devices still have their old password: …"), "Give
+/// them new passwords now" ticked; unticked, the line naming only the
+/// devices whose password is marked (none marked: no line), and Continue
+/// closes, the marks applying; ticked, Continue asks for each device in
+/// turn: a new generated passphrase shown once, and *Change password*,
+/// which answers a primary pointer click only and sends it as press
+/// `attempt`, its own registration and dialog; Cancel there leaves that
+/// device on its old password. Whether a prompt was pressed.
+fn offer_step(
+    ui: &mut Ui,
+    t: &Tokens,
+    w: &mut Wizard,
+    close: &mut bool,
+    attempt: u64,
+    actions: &mut Vec<Action>,
+) -> bool {
+    let Some(offer) = w.offer.clone() else {
+        *close = true;
+        return false;
+    };
+    if let Some(note) = w.note {
+        line(ui, note, t.danger_text);
+        ui.add_space(6.0);
+    }
+    if !offer.asking {
+        let heading = if offer.again {
+            STILL_OLD
+        } else {
+            OFFER_HEADING
+        };
+        line(
+            ui,
+            &heading.replace("<labels>", &labels(&offer.queue)),
+            t.text_primary,
+        );
+        ui.add_space(6.0);
+        let mut give = offer.give;
+        ui.checkbox(&mut give, GIVE_NEW);
+        let marked: Vec<NewlyReaching> = offer.queue.iter().filter(|d| d.marked).cloned().collect();
+        if !give && !marked.is_empty() {
+            line(
+                ui,
+                &UNTICKED_LINE.replace("<labels>", &labels(&marked)),
+                t.warn,
+            );
+        }
+        ui.add_space(10.0);
+        let mut next = false;
+        ui.horizontal(|ui| {
+            next = pointer_only(ui, "Continue", true);
+        });
+        if let Some(o) = w.offer.as_mut() {
+            o.give = give;
+        }
+        if next {
+            w.note = None;
+            if give {
+                if let Some(o) = w.offer.as_mut() {
+                    o.asking = true;
+                }
+                w.passphrase = generated();
+            } else {
+                *close = true;
+            }
+        }
+        return false;
+    }
+    let Some(device) = offer.queue.first() else {
+        *close = true;
+        return false;
+    };
+    ui.label(
+        RichText::new(format!("New password for {}", device.label))
+            .font(theme::font(ui.ctx(), Face::Semibold, 15.0))
+            .color(t.text_primary),
+    );
+    if let Some(phrase) = &w.passphrase {
+        ui.add(
+            egui::Label::new(
+                RichText::new(phrase.secret().0.as_str())
+                    .font(theme::font(ui.ctx(), Face::Mono, 20.0))
+                    .color(t.text_primary),
+            )
+            .selectable(false),
+        );
+        ui.add_space(4.0);
+        line(ui, WRITE_IT_DOWN, t.warn);
+    }
+    let waiting = w.attempt.is_some();
+    if waiting {
+        ui.spinner();
+    }
+    ui.add_space(10.0);
+    let mut pressed = false;
+    let mut skip = false;
+    ui.horizontal(|ui| {
+        skip = Button::new(Kind::Secondary, "Cancel")
+            .small()
+            .enabled(!waiting)
+            .show(ui)
+            .clicked()
+            && !waiting;
+        let ready = !waiting && w.passphrase.is_some();
+        if pointer_only(ui, CHANGE_PASSWORD, ready)
+            && ready
+            && let Some(password) = w.passphrase.take()
+        {
+            actions.push(Action::Manager(ManagerOp::ChangePassword(Box::new(
+                GrantRequest {
+                    attempt,
+                    choice: WizardChoice {
+                        device: device.device,
+                        preset: Preset::MyMachines,
+                        options: GrantOptions::default(),
+                    },
+                    password,
+                },
+            ))));
+            w.attempt = Some(attempt);
+            pressed = true;
+        }
+    });
+    if skip && w.offer_next(false) {
+        *close = true;
+    }
     pressed
 }
 
@@ -2515,7 +2762,7 @@ mod tests {
                         Some(Step::Password) => 4,
                         Some(Step::Options | Step::Administrator) => 5,
                         Some(Step::Check) => 6,
-                        Some(Step::Summary) => 7,
+                        Some(Step::Summary | Step::Offer) => 7,
                         Some(Step::Mode | Step::Raise | Step::Restore) => 8,
                     };
                     assert!(order(window.step()) <= order(Some(step)), "{case}: went on");
@@ -3154,6 +3401,181 @@ mod tests {
                 vec![Action::Manager(ManagerOp::Enable(device(1)))],
                 "{level:?}"
             );
+        }
+    }
+
+    // ------------------------------------------------------------ ⑤a's offer (§B.8.7.1)
+
+    /// Two other control grants the change made reach the level: "Laptop A"
+    /// marked, "Desk B" not.
+    fn reaching() -> Vec<NewlyReaching> {
+        vec![
+            NewlyReaching {
+                device: device(2),
+                label: "Laptop A".to_owned(),
+                marked: true,
+            },
+            NewlyReaching {
+                device: device(3),
+                label: "Desk B".to_owned(),
+                marked: false,
+            },
+        ]
+    }
+
+    /// ⑦'s Turn on answered Done, the change having made `reaching` reach
+    /// the level (the tokio side lists them): the wizard at the offer.
+    fn at_offer(reaching: Vec<NewlyReaching>) -> Window {
+        let mut window = at_summary(WIDE);
+        let sent = grants(&window.click(TURN_ON));
+        assert_eq!(sent.len(), 1);
+        window.model.wizard.answer = Some((sent[0].attempt, WizardAnswer::Done));
+        window.model.wizard.reaching = reaching;
+        window.pass(Vec::new());
+        assert_eq!(window.step(), Some(Step::Offer));
+        window
+    }
+
+    /// The registrations among `actions`.
+    fn renewals(actions: &[Action]) -> Vec<GrantRequest> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Manager(ManagerOp::ChangePassword(request)) => Some((**request).clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// §B.8.7.1 ⑤a, decision M1-67: after a change that made other control
+    /// grants reach the level the wizard does not close: the offer names them
+    /// by their pinned labels under the plan's heading, "Give them new
+    /// passwords now" ticked; an answer with none to name closes it.
+    #[test]
+    fn the_offer_lists_the_newly_reaching_devices_by_label() {
+        let window = at_offer(reaching());
+        assert!(window.has_text(&OFFER_HEADING.replace("<labels>", "Laptop A, Desk B")));
+        assert!(window.has_control(GIVE_NEW));
+        assert!(
+            window
+                .wizard()
+                .and_then(|w| w.offer.as_ref())
+                .is_some_and(|o| o.give),
+            "ticked"
+        );
+        let mut window = at_summary(WIDE);
+        let sent = grants(&window.click(TURN_ON));
+        window.model.wizard.answer = Some((sent[0].attempt, WizardAnswer::Done));
+        window.pass(Vec::new());
+        assert!(window.wizard().is_none(), "none to name: closed");
+    }
+
+    /// The operator's ruling (b) of 2026-10-02, §B.8.6.1: unticked, the offer
+    /// names only the devices whose password is marked, in the plan's line,
+    /// and its Continue closes with nothing sent; with none marked there is
+    /// no line.
+    #[test]
+    fn the_unticked_line_names_only_marked_devices() {
+        let mut window = at_offer(reaching());
+        let marked_line = UNTICKED_LINE.replace("<labels>", "Laptop A");
+        assert!(!window.has_text(&marked_line), "not while ticked");
+        assert!(window.click(GIVE_NEW).is_empty());
+        assert!(window.has_text(&marked_line));
+        assert!(!window.has_text("Desk B get view only"));
+        assert!(window.click("Continue").is_empty(), "nothing sent");
+        assert!(window.wizard().is_none());
+        let unmarked = reaching()
+            .into_iter()
+            .map(|d| NewlyReaching { marked: false, ..d })
+            .collect();
+        let mut window = at_offer(unmarked);
+        assert!(window.click(GIVE_NEW).is_empty());
+        assert!(!window.has_text("get view only"));
+    }
+
+    /// §B.8.7.1: each device's new password is its own prompt: a new
+    /// passphrase, shown once, and *Change password*, which sends one
+    /// registration for that device alone, its passphrase as generated and no
+    /// option change; the next device gets another passphrase.
+    #[test]
+    fn each_new_password_is_its_own_registration() {
+        let mut window = at_offer(reaching());
+        assert!(window.click("Continue").is_empty());
+        let mut seen: Vec<String> = Vec::new();
+        for (d, label) in [(device(2), "Laptop A"), (device(3), "Desk B")] {
+            assert!(
+                window.has_text(&format!("New password for {label}")),
+                "{label}"
+            );
+            let shown = window.phrase();
+            let sent = renewals(&window.click(CHANGE_PASSWORD));
+            assert_eq!(sent.len(), 1, "{label}");
+            assert_eq!(sent[0].choice.device, d);
+            assert_eq!(sent[0].choice.options, GrantOptions::default());
+            assert!(
+                matches!(&sent[0].password, NewPassword::Generated(p) if p.0.as_str() == shown),
+                "{label}"
+            );
+            assert!(!seen.contains(&shown), "{label}: a passphrase of its own");
+            seen.push(shown);
+            window.model.wizard.answer = Some((sent[0].attempt, WizardAnswer::Done));
+            window.pass(Vec::new());
+        }
+        assert!(
+            window.wizard().is_none(),
+            "every device has its new password"
+        );
+    }
+
+    /// §B.8.7.1, §B.8.7.4: a prompt that does not finish (its dialog
+    /// refused, or Cancel) leaves that device on its old password; once the
+    /// round is over the step lists those devices again under the command
+    /// line's sentence, ticked, and asks for them again.
+    #[test]
+    fn a_cancelled_prompt_lists_the_remaining_devices() {
+        let mut window = at_offer(reaching());
+        assert!(window.click("Continue").is_empty());
+        let first = renewals(&window.click(CHANGE_PASSWORD));
+        assert_eq!(first.len(), 1);
+        window.model.wizard.answer = Some((
+            first[0].attempt,
+            WizardAnswer::Refused("Not done: this computer's password was not confirmed."),
+        ));
+        window.pass(Vec::new());
+        assert!(window.has_text("New password for Desk B"));
+        let second = renewals(&window.click(CHANGE_PASSWORD));
+        assert_eq!(second.len(), 1);
+        window.model.wizard.answer = Some((second[0].attempt, WizardAnswer::Done));
+        window.pass(Vec::new());
+        assert!(window.has_text(&STILL_OLD.replace("<labels>", "Laptop A")));
+        assert!(
+            window
+                .wizard()
+                .and_then(|w| w.offer.as_ref())
+                .is_some_and(|o| o.give && o.queue.len() == 1)
+        );
+        assert!(window.click("Continue").is_empty());
+        assert!(window.has_text("New password for Laptop A"));
+        assert!(window.click("Cancel").is_empty());
+        assert!(window.has_text(&STILL_OLD.replace("<labels>", "Laptop A")));
+    }
+
+    /// M-UI-3's rule on the offer's prompts: no run of Tabs followed by
+    /// Enter or Space sends a registration.
+    #[test]
+    fn no_key_completes_an_offer_prompt() {
+        // Past the sidebar and the section list to every button of the step.
+        for tabs in 0..=20 {
+            for key in [egui::Key::Enter, egui::Key::Space] {
+                let mut window = at_offer(reaching());
+                assert!(window.click("Continue").is_empty());
+                let mut sent = Vec::new();
+                for _ in 0..tabs {
+                    sent.extend(window.key(egui::Key::Tab));
+                }
+                sent.extend(window.key(key));
+                assert!(renewals(&sent).is_empty(), "{tabs} tabs {key:?}: {sent:?}");
+            }
         }
     }
 }

@@ -82,3 +82,34 @@ impl Autostart for FakeAutostart {
         "remove it by hand as the test says".to_owned()
     }
 }
+
+/// Re-authentication that answers each dialog in turn as scripted (`true`:
+/// confirmed, `false`: refused, as when the person cancels it), confirming
+/// once the script is used up, and records every dialog by its operation.
+pub(crate) struct ReAuthSequence {
+    answers: std::sync::Mutex<std::collections::VecDeque<bool>>,
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+impl ReAuthSequence {
+    pub(crate) fn new(answers: &[bool]) -> Self {
+        Self {
+            answers: std::sync::Mutex::new(answers.iter().copied().collect()),
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl tornect_core::unattended::guard::ReAuth for ReAuthSequence {
+    fn reauthenticate(&self, op: &str) -> Result<(), tornect_core::unattended::guard::ReAuthError> {
+        self.calls.lock().unwrap().push(op.to_owned());
+        match self.answers.lock().unwrap().pop_front() {
+            Some(false) => Err(tornect_core::unattended::guard::ReAuthError::Denied),
+            _ => Ok(()),
+        }
+    }
+}
