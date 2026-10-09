@@ -99,10 +99,12 @@ pub struct SettingsForm {
 }
 
 impl SettingsForm {
-    /// Close the grant wizard: what it chose goes, and its passwords are
-    /// wiped (the window left Settings, Security).
-    pub fn close_wizard(&mut self) {
+    /// Close the grant wizard: what it chose goes, its passwords are wiped
+    /// and its fields' state leaves `ctx`'s memory (the window left
+    /// Settings, Security).
+    pub fn close_wizard(&mut self, ctx: &egui::Context) {
         self.wizard = None;
+        wizard::forget_fields(ctx, true);
     }
 }
 
@@ -156,7 +158,7 @@ pub(super) fn page(
     }
     ui.add_space(18.0);
     if form.settings.section != Section::Security {
-        form.settings.close_wizard();
+        form.settings.close_wizard(ui.ctx());
     }
     match form.settings.section {
         Section::General => general::section(ui, model, &mut form.settings, shared, actions),

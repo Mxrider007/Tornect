@@ -1,4 +1,4 @@
-//! The grant wizard of Settings, Security (§B.8.7.1 ① to ④ and ⑦): it gives
+//! The grant wizard of Settings, Security (§B.8.7.1 ① to ⑤ and ⑦): it gives
 //! one paired device unattended access. ① says what that means, the scam
 //! line, this system's limits and what is kept and who learns what; its
 //! Continue answers a pointer click only, armed after a second, with Cancel
@@ -7,7 +7,10 @@
 //! presets with their defaults, ④ the password: the generator's passphrase,
 //! shown once and never selectable, or, only where the guard's preview says
 //! the grant's reach stays 0 (decision M1-67), one of the person's own,
-//! masked, never copied, its undo state cleared every frame. ⑦ sums it up,
+//! masked, never copied, its undo state cleared every frame. ⑤ sets the
+//! grant's options over the preset's defaults, each by its own rule, and
+//! shows the host-wide ones as they are; an option that makes the reach
+//! non-zero takes an own password back to ④'s generator. ⑦ sums it up,
 //! and *Turn on* sends it as one operation, which the tokio side runs
 //! through the guard; the wizard changes only on its answer. ④ and ⑦
 //! complete by a primary pointer click only. Every password and passphrase
@@ -19,7 +22,7 @@ use std::time::{Duration, Instant};
 use egui::{RichText, Ui};
 use tornect_core::DeviceId;
 use tornect_core::session_log::SessionMode;
-use tornect_core::unattended::grant::Preset;
+use tornect_core::unattended::grant::{MAX_BLOCK_WINDOW_S, Preset};
 use tornect_core::unattended::ipc::GrantOptions;
 use tornect_core::unattended::password::{self, PolicyError};
 use zeroize::Zeroizing;
@@ -120,6 +123,23 @@ pub(in super::super) const AGAIN: &str = "Type it again";
 /// The two entries of an own password differ.
 pub(in super::super) const DIFFER: &str = "The two entries differ.";
 
+/// The hard lock off (`hard_lock_after` 0), as §B.8.7.1 ⑤ warns of it.
+pub(in super::super) const HARD_LOCK_OFF: &str = "With 0 the hard lock is off: guessing is then \
+    limited only by the lifetime budget, at most 60 failed attempts until you unlock it here plus \
+    about 52 a year, at most 24 a day (about 33 on the first day), and by the notifications.";
+
+/// An expiry of "never" (§B.8.6.1).
+pub(in super::super) const NEVER_WARNING: &str = "Access that never ends stays until you remove \
+    it, also if that device is lost or you forget it.";
+
+/// Lock-on-disconnect, where this computer cannot be unlocked from another
+/// device (§B.8.8: Windows and GNOME).
+pub(in super::super) const LOCK_WARNING: &str = "Once this computer locks, no session can see or \
+    use it until someone here unlocks it.";
+
+/// Where ⑤ sends the host-wide options.
+pub(in super::super) const HOST_WIDE: &str = "Set on the Security page for every device.";
+
 /// ⑦, while unattended access is off: two dialogs follow.
 pub(in super::super) const ASKS_TWICE: &str = "You are asked for your password once to give \
     access, and once more to turn unattended access on.";
@@ -143,7 +163,7 @@ const FIELD_IDS: [&str; 2] = ["wizard-password", "wizard-password-again"];
 /// copies in freed memory, unwiped.
 const FIELD_ROOM: usize = password::MAX_CHARS * 4;
 
-/// The wizard's steps, in order (⑤ and ⑥ come with their commits).
+/// The wizard's steps, in order (⑥ comes with its commit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in super::super) enum Step {
     /// ① What it means, the scam line, the limits, the disclosures.
@@ -154,6 +174,8 @@ pub(in super::super) enum Step {
     Preset,
     /// ④ The password.
     Password,
+    /// ⑤ The grant's options.
+    Options,
     /// ⑦ What is given, and *Turn on*.
     Summary,
 }
@@ -167,7 +189,47 @@ impl Step {
             Self::Device => "Choose a device",
             Self::Preset => "Choose how it is used",
             Self::Password => "Password",
+            Self::Options => "Options",
             Self::Summary => "Summary",
+        }
+    }
+}
+
+/// ⑤'s choices: the preset's defaults (§B.8.6.1) until changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in super::super) struct Options {
+    /// Control or view only.
+    pub(in super::super) mode: SessionMode,
+    /// The access never ends (an explicit choice, with its warning).
+    pub(in super::super) never: bool,
+    /// Seconds to stop a connection.
+    pub(in super::super) block_window_s: u8,
+    /// Failed attempts in a row before the hard lock; 0: off (warned).
+    pub(in super::super) hard_lock_after: u32,
+    /// "Ask before starting".
+    pub(in super::super) ask_before_start: bool,
+    /// Only while nobody is at this computer.
+    pub(in super::super) require_absent: bool,
+    /// Pictures and input through Tor only.
+    pub(in super::super) require_tor_only: bool,
+    /// Lock this computer when a session ends.
+    pub(in super::super) lock_on_disconnect: bool,
+}
+
+impl Options {
+    /// What `preset` sets.
+    #[must_use]
+    pub(in super::super) fn of(preset: Preset) -> Self {
+        let d = preset.defaults();
+        Self {
+            mode: d.mode,
+            never: false,
+            block_window_s: d.block_window_s,
+            hard_lock_after: d.hard_lock_after,
+            ask_before_start: d.ask_before_start,
+            require_absent: false,
+            require_tor_only: false,
+            lock_on_disconnect: d.lock_on_disconnect,
         }
     }
 }
@@ -185,6 +247,8 @@ pub(in super::super) struct Wizard {
     pub(in super::super) waive: bool,
     /// The preset chosen at ③.
     pub(in super::super) preset: Preset,
+    /// ⑤'s choices.
+    pub(in super::super) options: Options,
     /// The generator's passphrase of ④, drawn when ④ opens: shown there
     /// only, sent as generated.
     pub(in super::super) passphrase: Option<NewPassword>,
@@ -223,6 +287,7 @@ impl Wizard {
             device: None,
             waive: false,
             preset: Preset::MyMachines,
+            options: Options::of(Preset::MyMachines),
             passphrase: None,
             own: false,
             typed: room(),
@@ -233,12 +298,21 @@ impl Wizard {
         }
     }
 
-    /// What ② and ③ chose.
+    /// What ②, ③ and ⑤ chose: every option goes into the one registration.
     fn choice(&self) -> Option<WizardChoice> {
+        let o = self.options;
         Some(WizardChoice {
             device: self.device?,
             preset: self.preset,
             options: GrantOptions {
+                mode: Some(o.mode),
+                expires_at: o.never.then_some(0),
+                block_window_s: Some(o.block_window_s),
+                ask_before_start: Some(o.ask_before_start),
+                require_absent: Some(o.require_absent),
+                require_tor_only: Some(o.require_tor_only),
+                lock_on_disconnect: Some(o.lock_on_disconnect),
+                hard_lock_after: Some(o.hard_lock_after),
                 waive_attended_precondition: self.waive,
                 ..GrantOptions::default()
             },
@@ -327,6 +401,7 @@ pub(in super::super) fn draw(
         Step::Device => device(ui, t, model, w, &mut close),
         Step::Preset => preset(ui, t, w, &mut close, actions),
         Step::Password => password_step(ui, t, model, w, &mut close),
+        Step::Options => options(ui, t, model, manager, w, &mut close, actions),
         Step::Summary => {
             let attempt = form.attempts + 1;
             if summary(ui, t, model, manager, w, &mut close, attempt, actions) {
@@ -508,11 +583,14 @@ fn preset(ui: &mut Ui, t: &Tokens, w: &mut Wizard, close: &mut bool, actions: &m
             .small()
             .show(ui)
             .clicked()
-            && let Some(choice) = w.choice()
         {
-            actions.push(Action::Manager(ManagerOp::Preview(Box::new(choice))));
-            w.note = None;
-            w.open_password();
+            // ⑤ starts from this preset's defaults.
+            w.options = Options::of(w.preset);
+            if let Some(choice) = w.choice() {
+                actions.push(Action::Manager(ManagerOp::Preview(Box::new(choice))));
+                w.note = None;
+                w.open_password();
+            }
         }
     });
 }
@@ -551,6 +629,47 @@ pub(in super::super) fn preset_defaults(preset: Preset) -> String {
     }
     if d.keep_awake {
         parts.push("keeps this computer awake".to_owned());
+    }
+    parts.join(" · ")
+}
+
+/// ⑤'s choices as ⑦ sums them up, in the words of the presets' lines.
+#[must_use]
+pub(in super::super) fn options_line(preset: Preset, o: &Options) -> String {
+    let d = preset.defaults();
+    let mut parts = vec![match o.mode {
+        SessionMode::Control => "Control".to_owned(),
+        SessionMode::ViewOnly => "View only".to_owned(),
+    }];
+    parts.push(match o.block_window_s {
+        0 => "no time to stop a connection".to_owned(),
+        s => format!("{s} s to stop a connection"),
+    });
+    if o.ask_before_start {
+        parts.push("asks you before starting".to_owned());
+    }
+    if o.never {
+        parts.push("never ends".to_owned());
+    } else if let Some(span) = d.expiry_span_s {
+        let days = span / 86_400;
+        parts.push(if d.auto_renew {
+            format!("ends after {days} days without use")
+        } else {
+            format!("ends after {days} days")
+        });
+    }
+    parts.push(match o.hard_lock_after {
+        0 => "no hard lock".to_owned(),
+        n => format!("hard lock after {n} failed attempts in a row"),
+    });
+    if o.require_absent {
+        parts.push("only while nobody is using this computer".to_owned());
+    }
+    if o.require_tor_only {
+        parts.push("pictures and input through Tor only".to_owned());
+    }
+    if o.lock_on_disconnect {
+        parts.push("locks this computer when a session ends".to_owned());
     }
     parts.join(" · ")
 }
@@ -649,6 +768,132 @@ fn password_step(ui: &mut Ui, t: &Tokens, model: &Model, w: &mut Wizard, close: 
         }
         if pointer_only(ui, "Continue", ready) && ready {
             w.note = None;
+            w.step = Step::Options;
+        }
+    });
+}
+
+/// ⑤: the grant's options over the preset's defaults, each by its rule
+/// (§B.8.7.1 ⑤, §B.8.6.1); the host-wide ones as they are, set on the
+/// Security page. Continue asks the guard's preview of the choice again (an
+/// option can make the reach non-zero) and opens ⑦.
+fn options(
+    ui: &mut Ui,
+    t: &Tokens,
+    model: &Model,
+    manager: &Manager,
+    w: &mut Wizard,
+    close: &mut bool,
+    actions: &mut Vec<Action>,
+) {
+    let d = w.preset.defaults();
+    let file_keystore = model
+        .wizard
+        .policy
+        .as_ref()
+        .is_none_or(|p| p.min_score >= password::MIN_SCORE_FILE_KEYSTORE);
+    let o = &mut w.options;
+    widgets::section_header(ui, "Mode");
+    ui.radio_value(&mut o.mode, SessionMode::Control, "Control");
+    ui.radio_value(&mut o.mode, SessionMode::ViewOnly, "View only");
+    ui.add_space(8.0);
+    widgets::section_header(ui, "Ends");
+    let lasts = match (d.expiry_span_s, d.auto_renew) {
+        (Some(span), true) => format!("After {} days without use", span / 86_400),
+        (Some(span), false) => format!("After {} days", span / 86_400),
+        (None, _) => "Never".to_owned(),
+    };
+    ui.radio_value(&mut o.never, false, lasts);
+    // "Never" is refused on a file keystore and where the preset caps the
+    // expiry (§B.8.6.1, T3b): not offered there.
+    if d.expiry_cap_s.is_none() && !file_keystore && d.expiry_span_s.is_some() {
+        ui.radio_value(&mut o.never, true, "Never");
+        if o.never {
+            line(ui, NEVER_WARNING, t.warn);
+        }
+    } else {
+        o.never = false;
+    }
+    ui.add_space(8.0);
+    widgets::section_header(ui, "Time to stop a connection");
+    // The preset's bounds (Helping someone: at least 5 s).
+    o.block_window_s = o
+        .block_window_s
+        .clamp(d.min_block_window_s, MAX_BLOCK_WINDOW_S);
+    ui.add(
+        egui::Slider::new(
+            &mut o.block_window_s,
+            d.min_block_window_s..=MAX_BLOCK_WINDOW_S,
+        )
+        .suffix(" s"),
+    );
+    ui.add_space(8.0);
+    widgets::section_header(ui, "Hard lock after failed attempts in a row");
+    ui.add(egui::Slider::new(
+        &mut o.hard_lock_after,
+        0..=tornect_core::unattended::grant::LIFETIME_BUDGET,
+    ));
+    if o.hard_lock_after == 0 {
+        line(ui, HARD_LOCK_OFF, t.warn);
+    }
+    ui.add_space(8.0);
+    widgets::section_header(ui, "When it connects");
+    ui.checkbox(&mut o.ask_before_start, "Ask before starting");
+    ui.checkbox(
+        &mut o.require_absent,
+        "Only while nobody is using this computer",
+    );
+    ui.checkbox(
+        &mut o.require_tor_only,
+        "Pictures and input through Tor only",
+    );
+    // Refused with Headless box (§B.8.7.1 ⑤): not offered there.
+    if d.lock_on_disconnect_allowed {
+        ui.checkbox(
+            &mut o.lock_on_disconnect,
+            "Lock this computer when a session ends",
+        );
+        if o.lock_on_disconnect {
+            line(ui, LOCK_WARNING, t.warn);
+        }
+    } else {
+        o.lock_on_disconnect = false;
+    }
+    ui.add_space(8.0);
+    widgets::section_header(ui, "For every device");
+    let state = |on: bool| if on { "on" } else { "off" };
+    line(
+        ui,
+        &format!("Keep this computer awake: {}", state(manager.keep_awake)),
+        t.text_secondary,
+    );
+    line(
+        ui,
+        &format!(
+            "Prevent idle lock while unattended access is on: {}",
+            state(manager.prevent_idle_lock)
+        ),
+        t.text_secondary,
+    );
+    line(ui, HOST_WIDE, t.text_secondary);
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        cancel(ui, true, close);
+        if Button::new(Kind::Secondary, "Back")
+            .small()
+            .show(ui)
+            .clicked()
+        {
+            // Back at ④ a new passphrase is drawn: none is shown twice.
+            w.open_password();
+        }
+        if Button::new(Kind::Primary, "Continue")
+            .small()
+            .show(ui)
+            .clicked()
+            && let Some(choice) = w.choice()
+        {
+            actions.push(Action::Manager(ManagerOp::Preview(Box::new(choice))));
             w.step = Step::Summary;
         }
     });
@@ -739,6 +984,21 @@ fn summary(
     attempt: u64,
     actions: &mut Vec<Action>,
 ) -> bool {
+    // An own password waits for the guard's preview of this very choice; one
+    // whose reach is or becomes non-zero (or cannot be judged) goes, and ④
+    // offers the generator only.
+    let judged = w.choice().and_then(|choice| {
+        model
+            .wizard
+            .preview
+            .as_ref()
+            .filter(|(c, _)| *c == choice)
+            .map(|(_, generated_only)| *generated_only)
+    });
+    if w.own && w.attempt.is_none() && judged.is_some_and(|j| j != Some(false)) {
+        w.open_password();
+        return false;
+    }
     let label = model
         .wizard
         .devices
@@ -752,6 +1012,7 @@ fn summary(
         .map_or("", |(_, n)| *n);
     line(ui, &format!("Device: {label}"), t.text_primary);
     line(ui, &format!("Used as: {name}"), t.text_primary);
+    line(ui, &options_line(w.preset, &w.options), t.text_secondary);
     line(
         ui,
         if w.own {
@@ -791,7 +1052,8 @@ fn summary(
         {
             w.open_password();
         }
-        let ready = !waiting && (w.own || w.passphrase.is_some());
+        let own_judged = judged == Some(Some(false));
+        let ready = !waiting && ((w.own && own_judged) || (!w.own && w.passphrase.is_some()));
         if pointer_only(ui, TURN_ON, ready) && ready {
             let new = if w.own {
                 Some(NewPassword::Chosen(Secret(password::normalize(&w.typed))))
@@ -1068,10 +1330,233 @@ mod tests {
         window
     }
 
-    /// From ④ to ⑦.
+    /// From ④ through ⑤ to ⑦, the guard's preview of the choice answered as
+    /// before (the options unchanged).
     fn to_summary(window: &mut Window) {
         assert!(window.click("Continue").is_empty());
+        assert_eq!(window.step(), Some(Step::Options));
+        let judged = window.model.wizard.preview.as_ref().map(|(_, j)| *j);
+        let sent = window.click("Continue");
+        let Some(Action::Manager(ManagerOp::Preview(choice))) = sent.first() else {
+            panic!("no preview asked: {sent:?}");
+        };
+        window.model.wizard.preview = Some(((**choice).clone(), judged.flatten()));
+        window.pass(Vec::new());
         assert_eq!(window.step(), Some(Step::Summary));
+    }
+
+    /// The wizard at ⑤ for `preset`, with a file keystore or not.
+    fn at_options(preset: &str, file_keystore: bool) -> Window {
+        let mut model = model(true);
+        if file_keystore {
+            model.wizard.policy = Some(PolicyInputs {
+                inputs: vec!["tornect".to_owned()],
+                min_score: password::MIN_SCORE_FILE_KEYSTORE,
+            });
+        }
+        let mut window = Window::new(model, WIDE);
+        open(&mut window);
+        arm(&mut window);
+        assert!(window.click("Continue").is_empty());
+        assert!(window.click("Office laptop").is_empty());
+        assert!(window.click("Continue").is_empty());
+        assert!(window.click(preset).is_empty());
+        let sent = window.click("Continue");
+        let Some(Action::Manager(ManagerOp::Preview(choice))) = sent.first() else {
+            panic!("no preview asked: {sent:?}");
+        };
+        window.model.wizard.preview = Some(((**choice).clone(), Some(false)));
+        window.pass(Vec::new());
+        assert!(window.click("Continue").is_empty());
+        assert_eq!(window.step(), Some(Step::Options));
+        window
+    }
+
+    /// The options of the grant `window`'s Turn on sends, from ⑤.
+    fn sent_options(window: &mut Window) -> GrantOptions {
+        let sent = window.click("Continue");
+        let Some(Action::Manager(ManagerOp::Preview(choice))) = sent.first() else {
+            panic!("no preview asked: {sent:?}");
+        };
+        window.model.wizard.preview = Some(((**choice).clone(), Some(false)));
+        window.pass(Vec::new());
+        let sent = grants(&window.click(TURN_ON));
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].choice, **choice,
+            "the options judged are those sent"
+        );
+        sent[0].choice.options.clone()
+    }
+
+    fn options_mut(window: &mut Window) -> &mut Options {
+        &mut window.form.settings.wizard.as_mut().expect("open").options
+    }
+
+    /// §B.8.6.1: a device without a completed attended session gets access
+    /// only with the waiver: ②'s Continue does nothing until the waiver is
+    /// ticked, and the choice carries the waiver only then (a device whose
+    /// attended session completed is asked none and sends none).
+    #[test]
+    fn the_waiver_is_needed_for_a_device_without_an_attended_session() {
+        assert!(!choice().options.waive_attended_precondition);
+        let mut window = Window::new(model(false), WIDE);
+        open(&mut window);
+        arm(&mut window);
+        assert!(window.click("Continue").is_empty());
+        assert_eq!(window.step(), Some(Step::Device));
+        assert!(!window.has_control(WAIVER), "not before a device is chosen");
+        assert!(window.click("Office laptop").is_empty());
+        assert!(window.has_control(WAIVER));
+        assert!(window.click("Continue").is_empty());
+        assert_eq!(window.step(), Some(Step::Device), "inert until the tick");
+        assert!(window.click(WAIVER).is_empty());
+        assert!(window.click("Continue").is_empty());
+        assert_eq!(window.step(), Some(Step::Preset));
+        let sent = window.click("Continue");
+        let Some(Action::Manager(ManagerOp::Preview(chosen))) = sent.first() else {
+            panic!("no preview asked: {sent:?}");
+        };
+        assert!(chosen.options.waive_attended_precondition);
+    }
+
+    /// §B.8.7.2: the wizard and its passwords go when the window leaves
+    /// Settings, Security, for another section or another page: the own
+    /// password's fields and their state with it.
+    #[test]
+    fn leaving_the_section_or_the_page_closes_the_wizard() {
+        for leave in ["General", "Home"] {
+            let mut window = at_password(WIDE, Some(false));
+            assert!(window.click(USE_MY_OWN).is_empty());
+            window.type_into(FIELD, OWN);
+            let state = |window: &Window, id: &str| {
+                egui::text_edit::TextEditState::load(&window.ctx, egui::Id::new(id))
+            };
+            assert!(state(&window, FIELD_IDS[0]).is_some(), "{leave}");
+            assert!(window.click(leave).is_empty(), "{leave}");
+            window.pass(Vec::new());
+            assert!(window.wizard().is_none(), "{leave}");
+            for id in FIELD_IDS {
+                assert!(state(&window, id).is_none(), "{leave}: {id}");
+            }
+        }
+    }
+
+    /// §B.8.7.1 ⑤, §B.8.6.1: each option keeps its rule, and every option
+    /// goes into the one registration. "Never" only with its warning, and
+    /// not offered on a file keystore or where the preset caps the expiry;
+    /// the time to stop a connection within the preset's bounds (Helping
+    /// someone at least 5 s); a hard lock of 0 with the plan's warning;
+    /// lock-on-disconnect with its warning, and not offered with Headless
+    /// box; keep-awake and the idle lock shown as they are, set on the
+    /// Security page only.
+    #[test]
+    fn each_option_keeps_its_planned_rule() {
+        // My machines on an OS keychain: never, with its warning; the hard lock
+        // off, warned; lock-on-disconnect, warned; the others as ticked.
+        let mut window = at_options("My machines", false);
+        assert!(!window.has_text(NEVER_WARNING));
+        assert!(window.click("Never").is_empty());
+        assert!(window.has_text(NEVER_WARNING));
+        options_mut(&mut window).hard_lock_after = 0;
+        window.pass(Vec::new());
+        assert!(window.has_text(HARD_LOCK_OFF));
+        assert!(
+            window
+                .click("Lock this computer when a session ends")
+                .is_empty()
+        );
+        assert!(window.has_text(LOCK_WARNING));
+        assert!(
+            window
+                .click("Only while nobody is using this computer")
+                .is_empty()
+        );
+        assert!(window.click("View only").is_empty());
+        for line in [
+            "Keep this computer awake: off",
+            "Prevent idle lock while unattended access is on: off",
+            HOST_WIDE,
+        ] {
+            assert!(window.has_text(line), "{line}");
+        }
+        for label in [
+            "Keep this computer awake",
+            "Prevent idle lock while unattended access is on",
+        ] {
+            assert!(
+                !window.has_control(label),
+                "{label}: set on the Security page"
+            );
+        }
+        let sent = sent_options(&mut window);
+        assert_eq!(sent.expires_at, Some(0));
+        assert_eq!(sent.hard_lock_after, Some(0));
+        assert_eq!(sent.lock_on_disconnect, Some(true));
+        assert_eq!(sent.require_absent, Some(true));
+        assert_eq!(sent.require_tor_only, Some(false));
+        assert_eq!(sent.mode, Some(SessionMode::ViewOnly));
+        assert_eq!(sent.block_window_s, Some(3));
+        assert_eq!(sent.ask_before_start, Some(false));
+        // A file keystore: never is not offered.
+        let window = at_options("My machines", true);
+        assert!(!window.has_control("Never"));
+        // Headless box caps the expiry and refuses lock-on-disconnect.
+        let window = at_options("Headless box", false);
+        assert!(!window.has_control("Never"));
+        assert!(!window.has_control("Lock this computer when a session ends"));
+        // Helping someone: at least 5 s to stop a connection, asks first.
+        let mut window = at_options("Helping someone", false);
+        let slider = window
+            .nodes
+            .iter()
+            .find(|n| n.role() == Role::Slider)
+            .expect("the slider");
+        assert_eq!(slider.min_numeric_value(), Some(5.0));
+        assert_eq!(
+            slider.max_numeric_value(),
+            Some(f64::from(MAX_BLOCK_WINDOW_S))
+        );
+        options_mut(&mut window).block_window_s = 0;
+        window.pass(Vec::new());
+        assert_eq!(options_mut(&mut window).block_window_s, 5, "kept in bounds");
+        let sent = sent_options(&mut window);
+        assert_eq!(sent.block_window_s, Some(5));
+        assert_eq!(sent.ask_before_start, Some(true));
+        assert_eq!(sent.mode, Some(SessionMode::ViewOnly));
+    }
+
+    /// §B.8.7.1 ④, ⑤ (decision M1-67): an option that makes the reach
+    /// non-zero after an own password was chosen (control where control
+    /// reaches the administrator level) takes it away: back at ④, the own
+    /// password wiped, the generator only.
+    #[test]
+    fn a_chosen_password_goes_when_an_option_makes_the_reach_non_zero() {
+        let mut window = at_options("Helping someone", false);
+        assert!(window.click("Back").is_empty());
+        assert_eq!(window.step(), Some(Step::Password));
+        assert!(window.click(USE_MY_OWN).is_empty());
+        window.type_into(FIELD, OWN);
+        window.type_into(AGAIN, OWN);
+        assert!(window.click("Continue").is_empty());
+        assert_eq!(window.step(), Some(Step::Options));
+        assert!(window.click("Control").is_empty());
+        let sent = window.click("Continue");
+        let Some(Action::Manager(ManagerOp::Preview(choice))) = sent.first() else {
+            panic!("no preview asked: {sent:?}");
+        };
+        assert_eq!(choice.options.mode, Some(SessionMode::Control));
+        // Turn on waits for the preview of this choice.
+        assert!(window.wizard().unwrap().own);
+        assert!(grants(&window.click(TURN_ON)).is_empty(), "not judged yet");
+        window.model.wizard.preview = Some(((**choice).clone(), Some(true)));
+        window.pass(Vec::new());
+        window.pass(Vec::new());
+        assert_eq!(window.step(), Some(Step::Password));
+        let w = window.wizard().unwrap();
+        assert!(!w.own && w.typed.is_empty() && w.again.is_empty());
+        assert!(!window.has_control(USE_MY_OWN));
+        window.phrase();
     }
 
     /// ④ to ⑦ with the generator's passphrase.
@@ -1166,7 +1651,8 @@ mod tests {
                         Some(Step::Device) => 2,
                         Some(Step::Preset) => 3,
                         Some(Step::Password) => 4,
-                        Some(Step::Summary) => 5,
+                        Some(Step::Options) => 5,
+                        Some(Step::Summary) => 6,
                     };
                     assert!(order(window.step()) <= order(Some(step)), "{case}: went on");
                 }
