@@ -271,6 +271,33 @@ fn transport_of(line: &str) -> Option<&'static str> {
         .find(|p| first.eq_ignore_ascii_case(p))
 }
 
+/// Why a non-blank bridge line is not used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineFault {
+    /// Its transport is not one `lyrebird` serves.
+    NotLyrebird,
+    /// A line of this transport that does not parse.
+    Unparsed(&'static str),
+}
+
+/// A trimmed, non-blank bridge line's transport, or why it is not used: the
+/// one check that the ladder and [`Ladder::rejected_lines`] both make.
+fn check_line(line: &str) -> std::result::Result<&'static str, LineFault> {
+    let kind = transport_of(line).ok_or(LineFault::NotLyrebird)?;
+    // Parsed here rather than first in `Transport::apply`, so a bad line
+    // costs only itself, not its whole rung.
+    let parses = line
+        .parse::<BridgeConfigBuilder>()
+        .ok()
+        .and_then(|b| b.build().ok())
+        .is_some();
+    if parses {
+        Ok(kind)
+    } else {
+        Err(LineFault::Unparsed(kind))
+    }
+}
+
 /// The ordered transports one start will try, plus what was left out and why.
 #[derive(Debug, Clone)]
 pub struct Ladder {
@@ -301,6 +328,22 @@ impl Ladder {
         )
     }
 
+    /// The numbers (from 1) of the lines of `lines` that a ladder would leave
+    /// out: a transport `lyrebird` does not serve, or a line that does not
+    /// parse; a blank line is never among them. A bad line is named by this
+    /// number only, never by its content: a private bridge is useful only
+    /// while a censor does not know it.
+    #[must_use]
+    pub fn rejected_lines(lines: &[String]) -> Vec<usize> {
+        lines
+            .iter()
+            .map(|l| l.trim())
+            .enumerate()
+            .filter(|(_, line)| !line.is_empty() && check_line(line).is_err())
+            .map(|(i, _)| i + 1)
+            .collect()
+    }
+
     /// As [`Ladder::from_config`] with `mode` instead of `tor.bridges`
     /// (the CLI's `--bridges` override).
     #[must_use]
@@ -328,24 +371,21 @@ impl Ladder {
             // Lines are named by their position only: a private bridge is useful
             // only while the censor does not know it, and for a vanilla line the
             // first token *is* its address (SLICE-A1 A1-5).
-            let Some(kind) = transport_of(line) else {
-                rejected_lines.push(format!(
-                    "bridge line {n}: not an obfs4, webtunnel or snowflake bridge line"
-                ));
-                continue;
+            let (kind, parses) = match check_line(line) {
+                Ok(kind) => (kind, true),
+                Err(LineFault::Unparsed(kind)) => (kind, false),
+                Err(LineFault::NotLyrebird) => {
+                    rejected_lines.push(format!(
+                        "bridge line {n}: not an obfs4, webtunnel or snowflake bridge line"
+                    ));
+                    continue;
+                }
             };
             if kind == "snowflake" {
                 private_snowflake = true;
             } else {
                 private_obfs4 = true;
             }
-            // Parsed here rather than first in `Transport::apply`, so a bad line
-            // costs only itself, not its whole rung (SLICE-A1 A1-6).
-            let parses = line
-                .parse::<BridgeConfigBuilder>()
-                .ok()
-                .and_then(|b| b.build().ok())
-                .is_some();
             if !parses {
                 rejected_lines.push(format!("bridge line {n} ({kind}): could not be parsed"));
                 continue;
@@ -891,5 +931,41 @@ mod tests {
         .apply(&mut builder)
         .unwrap_err();
         assert!(matches!(err, SignalError::Config(_)), "{err}");
+    }
+
+    /// The settings page's check is the builder's: the numbers it gives are
+    /// exactly the lines the ladder leaves out, by position (a transport
+    /// `lyrebird` does not serve, a line that does not parse), blank lines
+    /// never among them.
+    #[test]
+    fn rejected_lines_agrees_with_the_builder() {
+        let (tmp, paths) = paths();
+        let lyrebird = fake_lyrebird(tmp.path());
+        let lines = vec![
+            PRIVATE_OBFS4.to_owned(),
+            "meek_lite 192.0.2.20:80 url=https://example.invalid".to_owned(),
+            "   ".to_owned(),
+            "obfs4 198.51.100.7:443 NOTAFINGERPRINT cert=SECRETCERT iat-mode=0".to_owned(),
+            "198.51.100.9:443 4352E58420E68F5E40BF7C74FADDCCD9D1349413".to_owned(),
+            BUILTIN_SNOWFLAKE[0].to_owned(),
+        ];
+        let tor = Tor {
+            bridge_lines: lines.clone(),
+            ..Tor::default()
+        };
+        let ladder = Ladder::build(&paths, &tor, BridgeMode::Auto, Ok(lyrebird));
+        let built: Vec<usize> = ladder
+            .rejected_lines
+            .iter()
+            .map(|message| {
+                let rest = message.strip_prefix("bridge line ").expect(message);
+                let digits = rest.split(|c: char| !c.is_ascii_digit()).next().unwrap();
+                digits.parse().unwrap()
+            })
+            .collect();
+        assert_eq!(built, [2, 4, 5]);
+        assert_eq!(Ladder::rejected_lines(&lines), built);
+        assert!(Ladder::rejected_lines(&[]).is_empty());
+        assert!(Ladder::rejected_lines(&["  ".to_owned()]).is_empty());
     }
 }

@@ -2109,12 +2109,19 @@ mod tests {
             .collect();
         assert_eq!(
             titles,
-            ["General", "Display and quality", "Privacy", "About"]
+            [
+                "General",
+                "Connection",
+                "Display and quality",
+                "Privacy",
+                "About"
+            ]
         );
         for size in [WIDE, NARROW] {
             let mut window = Window::new(at_rest(), Page::Settings, egui::Theme::Dark, size);
             assert_eq!(window.form.settings.section, settings::Section::General);
-            for (title, section) in titles.iter().zip(settings::Section::LISTED) {
+            for section in settings::Section::LISTED {
+                let title = &section.label(size == NARROW);
                 assert!(
                     window.controls().iter().any(|c| c == title),
                     "{size:?}: {title}"
@@ -2252,10 +2259,6 @@ mod tests {
     /// no hidden card.
     #[test]
     fn no_settings_write_while_shared() {
-        let titles: Vec<&str> = settings::Section::LISTED
-            .iter()
-            .map(|s| s.title())
-            .collect();
         let mut sharing = at_rest();
         sharing.sharing = vec![super::super::model::Sharing {
             session_id: "00".to_owned(),
@@ -2282,9 +2285,14 @@ mod tests {
                         assert!(has_text(&window, HIDDEN_WHILE_SHARED), "{case}");
                         assert!(has_text(&window, settings::WRITES_HIDDEN), "{case}");
                     }
+                    let narrow = size == NARROW;
+                    let labels: Vec<&str> = settings::Section::LISTED
+                        .iter()
+                        .map(|s| s.label(narrow))
+                        .collect();
                     for control in window.controls() {
                         assert!(
-                            titles.contains(&control.as_str())
+                            labels.contains(&control.as_str())
                                 || chrome.contains(&control)
                                 || control == "Copy report",
                             "{case}: \"{control}\" writes while shared"
@@ -2499,12 +2507,12 @@ mod tests {
             "Tornect never checks for updates by itself."
         );
         assert_eq!(about::REVIEW, "Review it before you share it.");
-        let titles: Vec<&str> = settings::Section::LISTED
-            .iter()
-            .map(|s| s.title())
-            .collect();
         let report = "Tornect 0.1.0, protocol 1\nSystem: linux x86_64";
         for size in [WIDE, NARROW] {
+            let titles: Vec<&str> = settings::Section::LISTED
+                .iter()
+                .map(|s| s.label(size == NARROW))
+                .collect();
             let mut model = at_rest();
             model.diagnostics = report.to_owned();
             let chrome = chrome_controls(&model, size);
@@ -2608,5 +2616,62 @@ mod tests {
                 .any(|c| c == "1:1" || c == display::BADGE)
         );
         assert!(has_text(&window, display::HOST_RATE));
+    }
+
+    /// Settings, Connection: a private bridge line that does not parse is
+    /// reported by its number only, its content shown nowhere but in its
+    /// field, and Save waits until every line parses; the way to Tor sends
+    /// its one change.
+    #[test]
+    fn a_bad_bridge_line_is_reported_by_its_number_only() {
+        use super::super::model::{BridgeLines, SettingsChange, TorChoice};
+        use settings::connection;
+        use tornect_core::config::BridgeMode;
+        const GOOD: &str =
+            "obfs4 198.51.100.7:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=AAAA iat-mode=0";
+        const BAD: &str = "obfs4 198.51.100.8:443 NOTAFINGERPRINT cert=SECRETCERT iat-mode=0";
+        let stored = at_rest().settings.tor;
+        let mut window = Window::new(at_rest(), Page::Settings, egui::Theme::Dark, WIDE);
+        let at = window.center("Connection");
+        assert!(window.click(at).is_empty());
+        window.form.settings.bridge_lines = Some(format!("{GOOD}\n{BAD}"));
+        window.pass(Vec::new());
+        assert!(has_text(&window, &connection::bad_line(2)));
+        assert!(!has_text(&window, &connection::bad_line(1)));
+        assert!(window.node("Save").is_disabled());
+        for node in &window.nodes {
+            if node.role() == Role::Label {
+                let value = node.value().unwrap_or("");
+                assert!(
+                    !value.contains("SECRETCERT") && !value.contains("198.51"),
+                    "{value}"
+                );
+            }
+        }
+        window.form.settings.bridge_lines = Some(format!("{GOOD}\n\n"));
+        window.pass(Vec::new());
+        let at = window.center("Save");
+        assert_eq!(
+            window.click(at),
+            vec![Action::SaveSettings(SettingsChange::Tor(TorChoice {
+                bridge_lines: BridgeLines(vec![GOOD.to_owned()]),
+                ..stored.clone()
+            }))]
+        );
+        let at = window.center("Snowflake");
+        assert_eq!(
+            window.click(at),
+            vec![Action::SaveSettings(SettingsChange::Tor(TorChoice {
+                bridges: BridgeMode::Snowflake,
+                ..stored
+            }))]
+        );
+        for text in [
+            connection::NEXT_START,
+            connection::BY_NUMBER,
+            connection::NO_DIRECT,
+        ] {
+            assert!(has_text(&window, text), "{text}");
+        }
     }
 }
