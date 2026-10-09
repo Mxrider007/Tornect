@@ -6,7 +6,10 @@
 //! thread of its own and says where the file went from the Pictures folder's
 //! own name on, never the absolute path (it holds the account's home folder),
 //! and nothing while this screen is shared. Nothing here logs the folder, the
-//! path or the name.
+//! path or the name. On Unix the folder it makes and every file are this
+//! user's only (`0700`, `0600`), and a folder already there is used only when
+//! it is a real folder, not a link, of this user (the owner is checked on
+//! Linux); on Windows the folder inherits the account's permissions.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write as _};
@@ -47,7 +50,8 @@ fn nth(first: &str, n: u32) -> String {
 /// Save `picture` into `dir` as a new PNG file, never over another one:
 /// 8-bit RGBA with every pixel opaque, and nothing else in it. `dir` is made
 /// if missing; its parent, the Pictures folder, must be there already, and
-/// nothing is written anywhere else. Returns where the file went.
+/// nothing is written anywhere else; a `dir` already there must be one this
+/// user may write screenshots into ([`folder`]). Returns where the file went.
 pub fn save(dir: &Path, picture: &Picture, now: SystemTime) -> io::Result<PathBuf> {
     let size = u64::from(picture.width) * u64::from(picture.height) * 4;
     if size == 0 || usize::try_from(size).ok() != Some(picture.rgba.len()) {
@@ -56,15 +60,11 @@ pub fn save(dir: &Path, picture: &Picture, now: SystemTime) -> io::Result<PathBu
             "no picture to save",
         ));
     }
-    if let Err(e) = fs::create_dir(dir)
-        && e.kind() != io::ErrorKind::AlreadyExists
-    {
-        return Err(e);
-    }
+    folder(dir)?;
     let first = file_name(now);
     for n in 1..=SAME_SECOND {
         let path = dir.join(nth(&first, n));
-        let file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let file = match new_file(&path) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -79,6 +79,84 @@ pub fn save(dir: &Path, picture: &Picture, now: SystemTime) -> io::Result<PathBu
         };
     }
     Err(io::ErrorKind::AlreadyExists.into())
+}
+
+/// Make the screenshots' folder `dir` if it is missing (on Unix this user's
+/// only: `0700`), or take the one there: on Unix only a real folder, not a
+/// link, of this user, and never re-moded; on Windows as it is.
+fn folder(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    let made = {
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new().mode(0o700).create(dir)
+    };
+    #[cfg(not(unix))]
+    let made = fs::create_dir(dir);
+    match made {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => existing(dir),
+        Err(e) => Err(e),
+    }
+}
+
+/// A screenshots' folder that is already there: on Unix it must be a real
+/// folder (the entry itself, so never a link) of this user, or nothing is
+/// written.
+#[cfg(unix)]
+fn existing(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let found = fs::symlink_metadata(dir)?;
+    if may_hold(found.file_type().is_dir(), found.uid(), this_user()?) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "not a folder of this user",
+        ))
+    }
+}
+
+/// A screenshots' folder that is already there, on Windows: as it is (it
+/// inherits the account's permissions).
+#[cfg(not(unix))]
+fn existing(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Whether a folder found where the screenshots go may hold them: a folder
+/// itself (`is_dir` of the entry, not of what a link points to) owned by
+/// this user (`me`), where this user is known.
+#[cfg(unix)]
+fn may_hold(is_dir: bool, owner: u32, me: Option<u32>) -> bool {
+    is_dir && me.is_none_or(|me| me == owner)
+}
+
+/// This process's user: on Linux the owner of `/proc/self` (proc(5)); an
+/// error when it cannot be read, so nothing is written then.
+#[cfg(target_os = "linux")]
+fn this_user() -> io::Result<Option<u32>> {
+    use std::os::unix::fs::MetadataExt as _;
+    fs::metadata("/proc/self").map(|m| Some(m.uid()))
+}
+
+/// This process's user, on a Unix system without `/proc/self`: not known,
+/// so only the link check holds there.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn this_user() -> io::Result<Option<u32>> {
+    Ok(None)
+}
+
+/// A new file at `path`, never over another one; on Unix this user's only
+/// (`0600`).
+fn new_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 /// `picture` as a PNG into `file`: the signature, IHDR, the image data and
@@ -282,5 +360,48 @@ mod tests {
             b"kept"
         );
         assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
+    }
+
+    /// On Unix the folder a screenshot makes and its file are this user's
+    /// only (`0700`, `0600`); a folder already there keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn the_folder_and_the_file_are_this_users_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let (_root, dir) = pictures();
+        let path = save(&dir, &picture(), at()).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        let (_root, dir) = pictures();
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
+        save(&dir, &picture(), at()).unwrap();
+        assert_eq!(mode(&dir), 0o750, "never re-moded");
+    }
+
+    /// On Unix a screenshots' folder that is a link (even to a folder of
+    /// this user) or a file is refused, and nothing is written anywhere; so
+    /// is a folder of another user.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_is_a_link_or_not_this_users_is_refused() {
+        let (root, dir) = pictures();
+        let elsewhere = root.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+        let before = listing(root.path());
+        assert!(save(&dir, &picture(), at()).is_err());
+        assert_eq!(listing(root.path()), before);
+        assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
+        let (root, dir) = pictures();
+        fs::write(&dir, b"not a folder").unwrap();
+        let before = listing(root.path());
+        assert!(save(&dir, &picture(), at()).is_err());
+        assert_eq!(listing(root.path()), before);
+        assert!(may_hold(true, 1000, Some(1000)));
+        assert!(may_hold(true, 1000, None));
+        assert!(!may_hold(true, 1001, Some(1000)), "another user's");
+        assert!(!may_hold(false, 1000, Some(1000)), "a link or a file");
     }
 }
