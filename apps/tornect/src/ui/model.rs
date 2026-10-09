@@ -221,6 +221,9 @@ pub struct Model {
     /// An operation of Settings, Security that asks for the password is
     /// running: the section offers none other until it returns.
     pub manager_busy: bool,
+    /// Rotate ID runs: the window closes once it returned (no time limit cuts
+    /// it short).
+    pub rotating: bool,
     /// The emergency stop code of the last *Turn on*, grouped as the command
     /// line prints it (§B.8.7.4), until the person clicks "I have written it
     /// down": then it is dropped (wiped). Never logged, never in `Debug`; a
@@ -1037,6 +1040,10 @@ pub enum ManagerOp {
     /// Start Tornect when this user signs in, or stop doing so (§B.1.1): the
     /// same guard operation as `tornect service install|uninstall`.
     SignIn(bool),
+    /// Rotate ID (§B.8.12): the window ends every session, stops its host
+    /// role and Tor, then the guard wipes everything unattended and this
+    /// computer gets a new ID; the window closes after.
+    RotateId,
     /// Turn unattended access off.
     Off,
     /// Pause unattended access: only while no pause runs, so that no choice

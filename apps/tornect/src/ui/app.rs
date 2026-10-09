@@ -40,6 +40,14 @@ use super::view::{self, Action, Form};
 
 /// How long closing the window waits for the goodbyes before it quits anyway.
 const QUIT_WAIT: Duration = Duration::from_secs(10);
+
+/// Whether the window stops waiting for the tokio side to close at `now`,
+/// having asked it to at `quit_at`: after [`QUIT_WAIT`], unless Rotate ID
+/// runs, which the window waits for whatever it takes (§B.8.12: the new ID
+/// must be written before the window goes).
+fn gives_up(quit_at: Option<Instant>, now: Instant, rotating: bool) -> bool {
+    !rotating && quit_at.is_some_and(|at| now.duration_since(at) >= QUIT_WAIT)
+}
 /// How long the indicator probe of a start in background mode may take to
 /// draw its first frame before it counts as failed (§B.1.1).
 const PROBE_WAIT: Duration = Duration::from_secs(10);
@@ -1532,7 +1540,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             Wake::Model | Wake::Attention => {
-                if self.quit_at.is_some() {
+                // Rotate ID closes the window once it returned (§B.8.12).
+                if self.quit_at.is_some() || self.shared.read(|m| m.rotating) {
                     self.quit(el);
                 }
                 self.sync_theme();
@@ -1599,14 +1608,14 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let now = Instant::now();
-        if let Some(quit_at) = self.quit_at
-            && now.duration_since(quit_at) >= QUIT_WAIT
-        {
+        let rotating = self.shared.read(|m| m.rotating);
+        if gives_up(self.quit_at, now, rotating) {
             tracing::warn!("the goodbyes took too long; quitting anyway");
             el.exit();
             return;
         }
-        let mut wake_at: Option<Instant> = self.quit_at.map(|at| at + QUIT_WAIT);
+        let mut wake_at: Option<Instant> =
+            self.quit_at.filter(|_| !rotating).map(|at| at + QUIT_WAIT);
         let mut earliest = |at: Instant| {
             wake_at = Some(wake_at.map_or(at, |w| w.min(at)));
         };
@@ -1691,6 +1700,20 @@ mod tests {
     use super::super::model::Model;
     use super::super::pages::viewer::testing::Window;
     use super::*;
+
+    /// §B.8.12: the window gives the tokio side 10 s to close, but waits for
+    /// Rotate ID whatever it takes: the new ID is written before it goes.
+    #[test]
+    fn the_window_closes_only_after_the_rotation_returns() {
+        let at = Instant::now();
+        assert!(!gives_up(None, at + Duration::from_secs(60), false));
+        assert!(!gives_up(Some(at), at + Duration::from_secs(9), false));
+        assert!(gives_up(Some(at), at + QUIT_WAIT, false));
+        assert!(
+            !gives_up(Some(at), at + Duration::from_secs(600), true),
+            "the rotation is waited for"
+        );
+    }
 
     /// Review finding E2-4: DX12 compiles shaders with FXC, whatever the
     /// environment says, so wgpu never looks for `dxcompiler.dll` by name, and
