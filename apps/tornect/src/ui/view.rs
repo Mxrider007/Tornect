@@ -408,7 +408,7 @@ pub fn main_window(
     // The grant wizard's passwords go with it when the window leaves
     // Settings (§B.8.7.2).
     if form.page != Page::Settings {
-        form.settings.close_wizard();
+        form.settings.close_wizard(ui.ctx());
     }
     // The sidebar's room, with nothing in it yet.
     let side = egui::Panel::left("sidebar")

@@ -5301,6 +5301,53 @@ mod tests {
         }
     }
 
+    /// Decision M1-67: where control is administrator access (UAC off) the
+    /// wizard's Turn on with a chosen password is refused before any dialog,
+    /// the guard's preview judging the store the first enable creates, and no
+    /// store is created; with a generated password the raising dialog and
+    /// Turn on's follow, and the new grant is unmarked: the preview and the
+    /// commit agree on a store that did not exist yet.
+    #[test]
+    fn a_chosen_password_where_the_reach_is_non_zero_asks_nothing() {
+        use tornect_core::levels::{FixedFacts, HelperPresence};
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let uac_off =
+            tornect_core::levels::AccountFacts::Windows(tornect_core::levels::WindowsFacts {
+                installed: true,
+                administrator: true,
+                enable_lua: Some(0),
+                ..Default::default()
+            });
+        let watch = wizard_watch(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(NoSessionActivity),
+            Arc::new(FixedFacts::new(uac_off, HelperPresence::Absent)),
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        watch.wizard_grant(turn_on(device, chosen_pw()), &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((1, WizardAnswer::NeedsGenerated))
+        );
+        assert!(reauth.calls().is_empty(), "no dialog");
+        let paths = Paths::from_home(tmp.path());
+        assert!(!paths.unattended_store().exists(), "no store created");
+        let mut generated = turn_on(device, generated_pw());
+        generated.attempt = 2;
+        watch.wizard_grant(generated, &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((2, WizardAnswer::Done))
+        );
+        assert_eq!(reauth.calls(), ["raise", "master_on"]);
+        let grant = watch.ctx.guard.store().grant(&device).expect("given");
+        assert!(!grant.marked(), "generated: unmarked");
+    }
+
     /// §B.8.6.2: during a remote session (and 60 s after one) the wizard's
     /// *Turn on* is refused in plain words before any dialog: nothing is
     /// written, access stays off, no stop code, no success.
