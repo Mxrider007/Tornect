@@ -16,8 +16,8 @@ use tornect_signal::fsm::timeouts;
 use tornect_signal::pairing::{PairDecision, SessionDecision};
 
 use super::model::{
-    BlockRequest, Confirm, Model, Popup, PopupKind, Prompt, Recognition, SettingsChange, Sharing,
-    SheetLevels,
+    BlockRequest, Confirm, ManagerOp, Model, Popup, PopupKind, Prompt, Recognition, SettingsChange,
+    Sharing, SheetLevels,
 };
 #[cfg(test)]
 use super::model::{ClientStage, Hosting, Setup, TorState, Viewing};
@@ -183,6 +183,9 @@ pub enum Action {
     /// Save one change of the settings pages in `config.toml` (never an
     /// operation of §B.8.6.2).
     SaveSettings(SettingsChange),
+    /// One operation of Settings, Security, which the window host's guard
+    /// runs (§B.8.6.2): the page changes only on its answer.
+    Manager(ManagerOp),
     /// The first run's question answered: the name typed, or `None` (Skip:
     /// the neutral default stays).
     FirstRunName(Option<String>),

@@ -8,13 +8,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use tornect_core::TornectId;
 use tornect_core::address_book::{Day, mixes_scripts};
 use tornect_core::config::{BridgeMode, Theme, Viewer};
 use tornect_core::levels::{Answers, Availability};
 use tornect_core::session_log::Actor;
 use tornect_core::unattended::credentials::RememberOffer;
 use tornect_core::unattended::readiness::Probe;
+use tornect_core::{DeviceId, TornectId};
 
 use crate::ua_client::AdminAction;
 use tornect_core::words::{Identicon, Words};
@@ -214,6 +214,9 @@ pub struct Model {
     /// window has no guard (no host role here, a store that did not open,
     /// another Tornect holding it) and until the first read.
     pub manager: Option<Manager>,
+    /// Why the last operation of Settings, Security was not done, in plain
+    /// words (never a path); `None` once one is done.
+    pub manager_note: Option<&'static str>,
 }
 
 impl Model {
@@ -970,6 +973,8 @@ pub struct Manager {
 /// (§B.8.7.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantRow {
+    /// The device, which the row's operations name.
+    pub device: DeviceId,
     /// The label pinned at pairing (never the name the device declares).
     pub label: String,
     /// Its device words, once derived.
@@ -983,6 +988,38 @@ pub struct GrantRow {
     pub state: String,
     /// Its failed attempts since the last unlock.
     pub failures: u32,
+}
+
+/// One operation of Settings, Security (§B.8.6.2, §B.8.7.3), which the tokio
+/// side runs through the window host's guard as the window (`Actor::Ui`);
+/// the page changes only on the guard's answer. These are deny-direction:
+/// none asks for the password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagerOp {
+    /// Turn unattended access off.
+    Off,
+    /// Pause unattended access: only while no pause runs, so that no choice
+    /// can end one sooner (which would turn access back on).
+    Pause(PauseEnd),
+    /// Remove unattended access for every device.
+    RevokeAll,
+    /// Suspend the device's access until a local Resume.
+    Suspend(DeviceId),
+    /// Disable the device's access until it is enabled again.
+    Disable(DeviceId),
+    /// Remove the device's unattended access; it stays paired.
+    Revoke(DeviceId),
+    /// Remove the device: its unattended access, then its pairing.
+    Remove(DeviceId),
+}
+
+/// When a pause started from Settings, Security ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseEnd {
+    /// Twelve hours after the click.
+    TwelveHours,
+    /// When unattended access is turned back on.
+    UntilOn,
 }
 
 /// A reachability check: one pairing-free ping over Tor, asked on a click.

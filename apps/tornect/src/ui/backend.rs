@@ -37,8 +37,8 @@ use super::block::GuiBlockWindow;
 use super::book::{self, Change};
 use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
 use super::model::{
-    CaptureNote, Check, ClientStage, Dial, Failure, GrantRow, Hosting, Manager, Settings,
-    SettingsChange, Shared, Sharing, TorState, UnattendedBanner, Viewing, Wake,
+    CaptureNote, Check, ClientStage, Dial, Failure, GrantRow, Hosting, Manager, ManagerOp,
+    PauseEnd, Settings, SettingsChange, Shared, Sharing, TorState, UnattendedBanner, Viewing, Wake,
 };
 use super::recognize::Lookalike;
 use super::stream::{FrameSlot, SlotSink};
@@ -92,6 +92,9 @@ pub enum Command {
     /// Save one change of the settings pages in `config.toml`. Never an
     /// operation of §B.8.6.2: those run through the unattended guard.
     SaveSettings(SettingsChange),
+    /// Run one operation of Settings, Security through the window host's
+    /// guard, as the window (§B.8.6.2).
+    Manager(ManagerOp),
     /// The first run's question answered: the name typed, or `None` (Skip).
     FirstRunName(Option<String>),
     /// Open the password prompt for `id`, for a session or an admin command
@@ -403,7 +406,37 @@ const MANAGER_EVERY: Duration = Duration::from_secs(30);
 struct ManagerWatch {
     ctx: crate::unattended::HostContext,
     words: Arc<super::recognize::Recognizer>,
+    /// The host's own paired devices, from which *Remove device* removes one.
+    trusted: Arc<tornect_signal::pairing::TrustedDeviceStore>,
 }
+
+/// How long the shorter pause of Settings, Security lasts.
+const PAUSE_SHORT: Duration = Duration::from_secs(12 * 3600);
+
+/// Why an operation of Settings, Security was not done, in plain words: the
+/// guard's reason, never its detail (which may name a path).
+fn refusal(e: &tornect_core::unattended::guard::GuardError) -> &'static str {
+    use tornect_core::unattended::guard::GuardError;
+    match e {
+        GuardError::RemoteSessionActive => {
+            "Not done: a remote session is running, or ended less than a minute ago."
+        }
+        GuardError::ReauthFailed(_) => "Not done: this computer's password was not confirmed.",
+        GuardError::KeystoreLocked(_) => "Not done: Tornect cannot read its keystore right now.",
+        GuardError::StoreLocked(_) => {
+            "Not done: another Tornect command is changing unattended access right now."
+        }
+        _ => "Not done: unattended access could not be changed.",
+    }
+}
+
+/// Why a pause was not started from Settings, Security: one runs already,
+/// and a pause is never ended sooner from there.
+const PAUSE_RUNS: &str = "Not done: a pause is running already.";
+
+/// Why *Remove device* left the pairing: its unattended access is gone, but
+/// the paired devices could not be written.
+const PAIRING_KEPT: &str = "Unattended access was removed, but the pairing could not be removed.";
 
 impl ManagerWatch {
     /// The readiness rows as the host last probed them, with the rows this
@@ -452,6 +485,7 @@ impl ManagerWatch {
             .grants
             .iter()
             .map(|g| GrantRow {
+                device: g.device,
                 label: g.label.clone(),
                 words: self
                     .words
@@ -488,6 +522,77 @@ impl ManagerWatch {
         if shared.read(|m| m.manager != view) {
             shared.update(|m| m.manager = view);
         }
+    }
+
+    /// Run `op` through the guard as the window (`Actor::Ui`), then read the
+    /// view again; whether the paired devices changed. Each is
+    /// deny-direction and asks no dialog; after master off, a pause and
+    /// revoke-all the live sessions end as the control channel ends them,
+    /// and the guard ends a device's own sessions itself. A pause is never
+    /// started while one runs: ending one sooner would turn access back on.
+    fn run(&self, op: ManagerOp, shared: &Shared) -> bool {
+        use tornect_core::session_log::Actor;
+        use tornect_signal::messages::bye;
+        let guard = &self.ctx.guard;
+        let end_sessions = |reason| {
+            if let Some(kill) = &self.ctx.kill {
+                kill.kill(reason);
+            }
+        };
+        let mut paired_changed = false;
+        let done: Result<(), &'static str> = match op {
+            ManagerOp::Off => guard
+                .master_off(Actor::Ui)
+                .map(|()| end_sessions(bye::MASTER_OFF))
+                .map_err(|e| refusal(&e)),
+            ManagerOp::Pause(end) => {
+                let now = tornect_core::trusted::unix_now();
+                let running = guard
+                    .store()
+                    .read(|s| s.paused_until.is_some_and(|until| until > now))
+                    .unwrap_or(false);
+                let until = match end {
+                    PauseEnd::TwelveHours => now.saturating_add(PAUSE_SHORT.as_secs()),
+                    PauseEnd::UntilOn => u64::MAX,
+                };
+                if running {
+                    Err(PAUSE_RUNS)
+                } else {
+                    guard
+                        .pause(Actor::Ui, until)
+                        .map(|()| end_sessions(bye::PAUSED))
+                        .map_err(|e| refusal(&e))
+                }
+            }
+            ManagerOp::RevokeAll => guard
+                .revoke_all(Actor::Ui)
+                .map(|_| end_sessions(bye::REVOKED))
+                .map_err(|e| refusal(&e)),
+            ManagerOp::Suspend(device) => guard
+                .suspend(Actor::Ui, &device)
+                .map(|_| ())
+                .map_err(|e| refusal(&e)),
+            ManagerOp::Disable(device) => {
+                guard.disable(Actor::Ui, &device).map_err(|e| refusal(&e))
+            }
+            ManagerOp::Revoke(device) => guard.revoke(Actor::Ui, &device).map_err(|e| refusal(&e)),
+            ManagerOp::Remove(device) => match guard.unpair(Actor::Ui, &device) {
+                Ok(_) => match self.trusted.remove(&device) {
+                    Ok(removed) => {
+                        paired_changed = removed;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "a paired device was not removed");
+                        Err(PAIRING_KEPT)
+                    }
+                },
+                Err(e) => Err(refusal(&e)),
+            },
+        };
+        shared.update(|m| m.manager_note = done.err());
+        self.refresh(shared);
+        paired_changed
     }
 }
 
@@ -766,6 +871,7 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
                 indicator: c.indicator.clone(),
             },
             words: Arc::clone(&b.words),
+            trusted: Arc::clone(&deps.trusted),
         })
     });
     if let Some(watch) = &manager {
@@ -1226,6 +1332,18 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     Command::ClearHistory => change_book(&b, &Change::Clear),
                     Command::SetHistory(on) => change_book(&b, &Change::History(on)),
                     Command::SaveSettings(change) => save_settings(&b.paths, &b.shared, &change),
+                    Command::Manager(op) => {
+                        if let Some(manager) = hosted.as_ref().and_then(|h| h.manager.clone()) {
+                            let b = Arc::clone(&b);
+                            // Off the command loop: the guard writes the store
+                            // and the log.
+                            tokio::task::spawn_blocking(move || {
+                                if manager.run(op, &b.shared) {
+                                    refresh_book(&b, None);
+                                }
+                            });
+                        }
+                    }
                     // Answered before the start; a late one changes nothing.
                     Command::FirstRunName(_) => {}
                     Command::AskPassword(id, admin, target) => open_prompt(&b, id, admin, target),
@@ -2461,6 +2579,7 @@ mod tests {
                 indicator: None,
             },
             words: Arc::new(super::super::recognize::Recognizer::default()),
+            trusted: Arc::new(TrustedDeviceStore::ephemeral(Default::default())),
         };
         let shared = Shared::new(Model::default(), Arc::new(|_| {}));
         watch.refresh(&shared);
@@ -2504,6 +2623,146 @@ mod tests {
         let paused = shared.read(|m| m.manager.clone()).expect("read");
         assert_eq!(paused.paused_until, Some(u64::MAX));
         assert_eq!(paused.without_asking, 0, "none while paused");
+    }
+
+    /// Settings, Security's operations are deny-direction (§B.8.6.2): run
+    /// as the window, none asks for the password, and each changes the store
+    /// as the guard says. Suspend, Disable, Revoke unattended and Remove
+    /// device (which removes the pairing too); a pause of 12 hours, and none
+    /// while one runs (one ending sooner would turn access back on); until
+    /// access is turned back on; Revoke all; Turn off, which ends the live
+    /// sessions as the control channel does.
+    #[test]
+    fn deny_direction_ops_ask_no_reauth() {
+        use tornect_core::keystore::FileSecretStore;
+        use tornect_core::session_log::{Actor, SessionLog};
+        use tornect_core::trusted::{TrustedDevice, TrustedDevices};
+        use tornect_core::unattended::clock::SystemClock;
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{
+            AllowAllPaired, AllowAllReAuth, MutationGuard, NoSessionActivity,
+            RandomServerSetupSource, ReAuth,
+        };
+        use tornect_core::unattended::ipc::GrantOptions;
+        use tornect_core::unattended::readiness::SharedReadiness;
+        use tornect_core::unattended::store::GrantStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let secrets = Arc::new(FileSecretStore::open(paths.keys_dir()).unwrap());
+        let log = SessionLog::new(paths.sessions_log());
+        let store = GrantStore::open(
+            &paths,
+            secrets,
+            Arc::new(SystemClock::default()),
+            log.clone(),
+        )
+        .unwrap();
+        let facts: Arc<dyn tornect_core::levels::FactsSource> =
+            Arc::new(tornect_core::levels::FixedFacts::linux());
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let guard = Arc::new(
+            MutationGuard::new(
+                store,
+                Arc::clone(&reauth) as Arc<dyn ReAuth>,
+                Arc::new(NoSessionActivity),
+                Arc::clone(&facts),
+            )
+            .with_paired_devices(Arc::new(AllowAllPaired))
+            .with_server_setup_source(Arc::new(RandomServerSetupSource)),
+        );
+        let [a, b, c, d] = [1u8, 2, 3, 4].map(|i| tornect_core::DeviceId::from_bytes([i; 32]));
+        guard.master_on(Actor::Cli, &[9; 32]).unwrap();
+        for device in [a, b, c, d] {
+            guard
+                .create_grant(
+                    Actor::Cli,
+                    &device,
+                    Preset::HeadlessBox,
+                    &GrantOptions::default(),
+                    &[0u8; 192],
+                    false,
+                )
+                .unwrap();
+        }
+        let trusted = Arc::new(TrustedDeviceStore::ephemeral(TrustedDevices {
+            devices: vec![TrustedDevice {
+                device: d,
+                label: "Desk".to_owned(),
+                paired_at: 1,
+                last_seen: 1,
+            }],
+            ..TrustedDevices::default()
+        }));
+        let kill = KillSwitch::new();
+        let watch = ManagerWatch {
+            ctx: crate::unattended::HostContext {
+                guard: Arc::clone(&guard),
+                host_onion_pk: [0x42; 32],
+                readiness: SharedReadiness::default(),
+                autostart: Arc::new(tornect_platform::autostart::NoAutostart("test".to_owned())),
+                user_inputs: Vec::new(),
+                kill: Some(kill.clone()),
+                log,
+                facts,
+                show: None,
+                indicator: None,
+            },
+            words: Arc::new(super::super::recognize::Recognizer::default()),
+            trusted: Arc::clone(&trusted),
+        };
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let state = |device: tornect_core::DeviceId| {
+            guard
+                .store()
+                .status_report(Default::default())
+                .grants
+                .into_iter()
+                .find(|g| g.device == device)
+                .map(|g| g.state)
+        };
+        let paused = || guard.store().read(|s| s.paused_until).flatten();
+        let asked = reauth.calls();
+
+        assert!(!watch.run(ManagerOp::Suspend(a), &shared));
+        assert_eq!(state(a).as_deref(), Some("suspended:local"));
+        assert!(!watch.run(ManagerOp::Disable(b), &shared));
+        assert_eq!(state(b).as_deref(), Some("disabled:ui"));
+        assert!(!watch.run(ManagerOp::Revoke(c), &shared));
+        assert_eq!(state(c), None);
+        assert!(watch.run(ManagerOp::Remove(d), &shared), "the pairing goes");
+        assert_eq!(state(d), None);
+        assert!(trusted.get(&d).is_none());
+
+        let now = tornect_core::trusted::unix_now();
+        watch.run(ManagerOp::Pause(PauseEnd::TwelveHours), &shared);
+        let until = paused().expect("paused");
+        assert!(
+            until >= now + 12 * 3600 && until <= now + 12 * 3600 + 60,
+            "{until}"
+        );
+        assert_eq!(kill.fired(), Some(bye::PAUSED));
+        watch.run(ManagerOp::Pause(PauseEnd::UntilOn), &shared);
+        assert_eq!(paused(), Some(until), "a running pause is not changed");
+        assert_eq!(shared.read(|m| m.manager_note), Some(PAUSE_RUNS));
+        assert_eq!(reauth.calls(), asked, "no dialog");
+
+        // Turned back on (a dialog of the command line, not counted), then
+        // paused until it is turned on again.
+        guard.master_on(Actor::Cli, &[9; 32]).unwrap();
+        let asked = reauth.calls();
+        watch.run(ManagerOp::Pause(PauseEnd::UntilOn), &shared);
+        assert_eq!(paused(), Some(u64::MAX));
+        assert_eq!(shared.read(|m| m.manager_note), None);
+        watch.run(ManagerOp::RevokeAll, &shared);
+        assert!(guard.store().read(|s| s.grants.is_empty()).unwrap());
+        watch.run(ManagerOp::Off, &shared);
+        assert!(!guard.store().read(|s| s.enabled).unwrap());
+        assert_eq!(kill.fired(), Some(bye::MASTER_OFF));
+        assert_eq!(reauth.calls(), asked, "no dialog");
+        assert_eq!(shared.read(|m| m.manager_note), None);
+        let view = shared.read(|m| m.manager.clone()).expect("read again");
+        assert!(!view.on && view.grants.is_empty());
     }
 
     /// The row "indicator shown" as the host at `state_dir` answers it over

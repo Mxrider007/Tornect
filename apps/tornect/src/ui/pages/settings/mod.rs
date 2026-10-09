@@ -84,6 +84,8 @@ pub struct SettingsForm {
     pub(super) name: Option<String>,
     /// The private bridge lines as typed so far.
     pub(super) bridge_lines: Option<String>,
+    /// Security's "Revoke all…" asks its question.
+    pub(super) revoke_all: bool,
 }
 
 /// Below this page width (points) the section list uses its short names.
@@ -140,7 +142,9 @@ pub(super) fn page(
         Section::Connection => {
             connection::section(ui, model, &mut form.settings, shared, actions);
         }
-        Section::Security => security::section(ui, model, shared),
+        Section::Security => {
+            security::section(ui, model, &mut form.settings, shared, actions);
+        }
         Section::Display => display::section(ui, model, shared, actions),
         Section::Privacy => privacy::section(ui, model, shared, actions),
         Section::About => about::section(ui, model, actions),
