@@ -169,7 +169,7 @@ pub(super) fn page(
             security::section(ui, model, &mut form.settings, shared, actions);
         }
         Section::Display => display::section(ui, model, shared, actions),
-        Section::Privacy => privacy::section(ui, model, shared, actions),
+        Section::Privacy => privacy::section(ui, model, form, shared, actions),
         Section::About => about::section(ui, model, actions),
     }
 }

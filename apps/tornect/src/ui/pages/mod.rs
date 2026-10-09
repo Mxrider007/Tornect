@@ -1,13 +1,12 @@
-//! The main window's pages (the redesign's §4). In this version Home, the
-//! Address book and Settings show what works today; Sessions, whose content
-//! comes in a later version, shows one plain line saying so, and never a
-//! control that does nothing. The widget gallery is reached only from the
-//! preview. Trust surfaces are not pages: the open questions are drawn above
+//! The main window's pages (the redesign's §4): Home, the Address book,
+//! Sessions and Settings show what works today, and never a control that
+//! does nothing. The widget gallery is reached only from the preview. Trust surfaces are not pages: the open questions are drawn above
 //! the page, the banner above everything (`view`).
 
 mod address_book;
 mod gallery;
 mod home;
+mod sessions;
 mod settings;
 pub(super) mod viewer;
 
@@ -17,6 +16,7 @@ use egui::{RichText, Ui};
 use tornect_core::address_book::Day;
 
 pub use self::address_book::{BookForm, Tab};
+pub(super) use self::sessions::rows as session_rows;
 pub use self::settings::SettingsForm;
 use super::model::Model;
 use super::nav::Page;
@@ -39,12 +39,7 @@ pub fn draw(
     match page {
         Page::Home => home::home(ui, model, form, now, actions),
         Page::AddressBook => address_book::page(ui, model, form, model.screen_shared(now), actions),
-        Page::Sessions => later(
-            ui,
-            page,
-            "The list of past sessions arrives in a later version; each session is already \
-             recorded in this computer's session log.",
-        ),
+        Page::Sessions => sessions::page(ui, model, form, model.screen_shared(now)),
         Page::Settings => settings::page(ui, model, form, model.screen_shared(now), actions),
         Page::Widgets => gallery::gallery(ui),
     }
@@ -142,21 +137,6 @@ fn hidden_card(ui: &mut Ui, what: &str) {
             .wrap(),
         );
     });
-}
-
-/// A page whose content comes in a later version: its title and one line.
-fn later(ui: &mut Ui, page: Page, note: &str) {
-    let t = theme::tokens(ui.ctx());
-    ui.label(
-        RichText::new(page.title())
-            .font(theme::font(ui.ctx(), Face::Bold, 26.0))
-            .color(t.text_primary),
-    );
-    ui.label(
-        RichText::new(note)
-            .font(theme::font(ui.ctx(), Face::Regular, 14.0))
-            .color(t.text_secondary),
-    );
 }
 
 #[cfg(test)]
@@ -342,23 +322,6 @@ mod tests {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    /// A page whose content comes later shows its one line and no control:
-    /// nothing to press or type into but the sidebar's pages.
-    #[test]
-    fn a_later_page_offers_no_control() {
-        let listed: Vec<&str> = Page::LISTED.iter().map(|p| p.title()).collect();
-        let page = Page::Sessions;
-        for size in [WIDE, NARROW] {
-            let window = Window::new(at_rest(), page, egui::Theme::Dark, size);
-            for control in window.controls() {
-                assert!(
-                    listed.contains(&control.as_str()),
-                    "{page:?}: \"{control}\" does nothing yet"
-                );
             }
         }
     }
@@ -3492,5 +3455,149 @@ mod tests {
             .filter(|n| n.label() == Some(address_book::MANAGE))
             .count();
         assert_eq!(links, 2, "one per card");
+    }
+
+    // ------------------------------------------------------------ the Sessions page (§B.8.13)
+
+    /// A session that ended here, a refused request and a client connect, as
+    /// the log holds them: with a device key, a grant id, a path, a transport
+    /// and free details, none of which the page may show.
+    fn session_lines() -> Vec<tornect_core::session_log::SessionRecord> {
+        use tornect_core::session_log::{SessionEvent, SessionMode, SessionRecord, TransportKind};
+        let [laptop, tablet, desk] = [1, 2, 3].map(|b| tornect_core::DeviceId::from_bytes([b; 32]));
+        let mut started = SessionRecord::now(SessionEvent::SessionStarted)
+            .peer(laptop, "Office laptop")
+            .session("s1")
+            .mode(SessionMode::Control)
+            .unattended(true)
+            .transport(TransportKind::Direct)
+            .grant(&[7; 8]);
+        started.path = Some("/home/someone/secret".to_owned());
+        let ended = SessionRecord::now(SessionEvent::SessionEnded)
+            .peer(laptop, "Office laptop")
+            .session("s1")
+            .detail("Killed(3)");
+        let denied = SessionRecord::now(SessionEvent::SessionDenied)
+            .peer(tablet, "Tablet")
+            .detail("busy elsewhere");
+        let connect = SessionRecord::now(SessionEvent::UnattendedConnect)
+            .peer(desk, "Desk")
+            .session("c1")
+            .mode(SessionMode::ViewOnly)
+            .unattended(true)
+            .reason("accepted");
+        vec![started, ended, denied, connect]
+    }
+
+    /// The Sessions page over `records`' rows at `size`, this screen shared
+    /// or not.
+    fn sessions_window(
+        records: &[tornect_core::session_log::SessionRecord],
+        shared: bool,
+        size: (f32, f32),
+    ) -> Window {
+        let mut model = at_rest();
+        model.sessions = Some(session_rows(records));
+        model.log_folder = Some("/home/someone/.local/share/tornect/logs".to_owned());
+        if shared {
+            model.sharing = vec![super::super::model::Sharing {
+                session_id: "00".to_owned(),
+                label: "Viewer".to_owned(),
+                control: false,
+                unattended: false,
+                since: Instant::now(),
+                capture: None,
+            }];
+        }
+        Window::new(model, Page::Sessions, egui::Theme::Dark, size)
+    }
+
+    /// Whether any node of `window` names or says `text`.
+    fn anywhere(window: &Window, text: &str) -> bool {
+        window.nodes.iter().any(|n| {
+            n.value().is_some_and(|v| v.contains(text))
+                || n.label().is_some_and(|l| l.contains(text))
+        })
+    }
+
+    /// §B.8.13, as the operator ruled: the Sessions page shows the time, the
+    /// pinned label, the mode, attended or unattended and how it ended, each
+    /// from a fixed list, and nothing else of the lines: no device key, grant
+    /// id, path, transport or free detail; drawing it asks nothing; "Open log
+    /// folder" shows the folder's path and asks nothing.
+    #[test]
+    fn the_sessions_page_shows_only_the_planned_columns() {
+        let records = session_lines();
+        let laptop = tornect_core::DeviceId::from_bytes([1; 32]);
+        for size in [WIDE, NARROW] {
+            let mut window = sessions_window(&records, false, size);
+            for title in sessions::COLUMNS {
+                assert!(has_text(&window, title), "{size:?}: {title}");
+            }
+            for text in [
+                "Office laptop",
+                "Control",
+                "Unattended",
+                "ended here",
+                "Tablet",
+                "refused",
+                "Desk",
+                "View only",
+                "connected",
+            ] {
+                assert!(has_text(&window, text), "{size:?}: {text}");
+            }
+            for hidden in [
+                laptop.fingerprint(),
+                "0707070707070707".to_owned(),
+                "/home/someone".to_owned(),
+                "Killed".to_owned(),
+                "busy elsewhere".to_owned(),
+                "Direct".to_owned(),
+            ] {
+                assert!(!anywhere(&window, &hidden), "{size:?}: {hidden}");
+            }
+            assert!(window.pass(Vec::new()).is_empty(), "drawing asks nothing");
+            let at = window.center(sessions::OPEN_LOG_FOLDER);
+            assert!(window.click(at).is_empty(), "{size:?}: asks nothing");
+            // The path is drawn in the pass after the click.
+            assert!(window.pass(Vec::new()).is_empty());
+            assert!(
+                has_text(&window, "/home/someone/.local/share/tornect/logs"),
+                "{size:?}"
+            );
+        }
+    }
+
+    /// While this screen may be in a picture that leaves it, the Sessions
+    /// page shows the hidden card: no row, no column, no folder.
+    #[test]
+    fn the_sessions_page_while_shared_shows_the_hidden_card() {
+        let records = session_lines();
+        for size in [WIDE, NARROW] {
+            let window = sessions_window(&records, true, size);
+            assert!(has_text(&window, HIDDEN_WHILE_SHARED), "{size:?}");
+            assert!(has_text(&window, sessions::HIDDEN), "{size:?}");
+            for text in ["Office laptop", "Tablet", "Desk", "How it ended"] {
+                assert!(!anywhere(&window, text), "{size:?}: {text}");
+            }
+            assert!(!anywhere(&window, sessions::OPEN_LOG_FOLDER), "{size:?}");
+        }
+    }
+
+    /// Settings, Privacy links to the Sessions page, but not while this
+    /// screen is shared.
+    #[test]
+    fn the_privacy_page_links_to_the_sessions_page() {
+        use settings::privacy::PAST_SESSIONS;
+        // Tall enough for the page's last sections.
+        let mut window = privacy(with_book(false), (1200.0, 2400.0));
+        let at = window.center(PAST_SESSIONS);
+        assert!(window.click(at).is_empty());
+        assert_eq!(window.form.page, Page::Sessions);
+        let mut shared = with_book(false);
+        shared.hosted_elsewhere = true;
+        let window = privacy(shared, (1200.0, 2400.0));
+        assert!(!anywhere(&window, PAST_SESSIONS));
     }
 }
