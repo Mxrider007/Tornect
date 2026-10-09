@@ -3434,4 +3434,63 @@ mod tests {
         let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
         assert!(!has_text(&window, home::NAME_QUESTION));
     }
+
+    /// §B.8.6.1 (decision M1-67): on the address book's Devices tab a granted
+    /// device's card says why its sessions are view only, in the plan's two
+    /// lines (its password marked; this computer's account settings, with the
+    /// device's label), and how many of its admin commands ran nothing; every
+    /// card links to Settings, Security, and the link asks the backend
+    /// nothing; a device without unattended access gets the link only.
+    #[test]
+    fn the_view_only_lines_show_where_the_plan_puts_them() {
+        use super::super::model::{DeviceCard, ViewOnly};
+        let devices_tab = |model: Model| {
+            let mut window = Window::new(model, Page::AddressBook, egui::Theme::Dark, TALL);
+            window.form.book.tab = Tab::Devices;
+            for _ in 0..2 {
+                assert!(window.pass(Vec::new()).is_empty());
+            }
+            window
+        };
+        let mut model = with_book(false);
+        let (laptop, tablet) = (model.book.devices[0].id, model.book.devices[1].id);
+        model.wizard.cards = vec![
+            (
+                laptop,
+                DeviceCard {
+                    view_only: Some(ViewOnly::UntilNewPassword),
+                    nothing_ran: Some(2),
+                },
+            ),
+            (
+                tablet,
+                DeviceCard {
+                    view_only: Some(ViewOnly::AccountSettings),
+                    nothing_ran: Some(0),
+                },
+            ),
+        ];
+        let mut window = devices_tab(model.clone());
+        assert!(has_text(&window, address_book::VIEW_ONLY_UNTIL));
+        assert!(has_text(
+            &window,
+            &address_book::VIEW_ONLY_ACCOUNT.replace("<device>", "Tablet")
+        ));
+        assert!(has_text(&window, "Admin commands that ran nothing: 2"));
+        assert!(has_text(&window, "Admin commands that ran nothing: 0"));
+        let at = window.center(address_book::MANAGE);
+        assert!(window.click(at).is_empty(), "asks nothing");
+        assert_eq!(window.form.page, Page::Settings);
+        assert_eq!(window.form.settings.section, settings::Section::Security);
+        model.wizard.cards.clear();
+        let window = devices_tab(model);
+        assert!(!has_text(&window, "View only"));
+        assert!(!has_text(&window, "Admin commands that ran nothing"));
+        let links = window
+            .nodes
+            .iter()
+            .filter(|n| n.label() == Some(address_book::MANAGE))
+            .count();
+        assert_eq!(links, 2, "one per card");
+    }
 }
