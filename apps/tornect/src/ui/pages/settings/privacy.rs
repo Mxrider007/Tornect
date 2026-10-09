@@ -8,8 +8,9 @@ use egui::{RichText, Ui};
 
 use super::super::super::icons::Icon;
 use super::super::super::model::Model;
+use super::super::super::nav::Page;
 use super::super::super::theme::{self, Face};
-use super::super::super::view::Action;
+use super::super::super::view::{Action, Form};
 use super::super::super::widgets::{self, Button, Kind};
 use super::general::NAME_NOTE;
 use super::line;
@@ -29,6 +30,9 @@ pub(in super::super) const LOG_RECORDS: &str = "Connection attempts to this comp
 pub(in super::super) const UNATTENDED_KEPT: &str = "For each computer you connect to unattended, \
     this device keeps whether a password is remembered and whether your access there is control \
     or reaches administrator access; Forget removes it.";
+
+/// The Privacy page's link to the Sessions page.
+pub(in super::super) const PAST_SESSIONS: &str = "Show past sessions";
 
 /// The session log, as §B.6's history paragraph names it.
 pub(in super::super) const LOG_KEPT: &str =
@@ -56,7 +60,13 @@ pub(in super::super) const STORED: [(&str, &str); 4] = [
 const KEEP_HISTORY: &str = "Keep a list of recent connections";
 
 /// The Privacy section.
-pub(super) fn section(ui: &mut Ui, model: &Model, shared: bool, actions: &mut Vec<Action>) {
+pub(super) fn section(
+    ui: &mut Ui,
+    model: &Model,
+    form: &mut Form,
+    shared: bool,
+    actions: &mut Vec<Action>,
+) {
     let t = theme::tokens(ui.ctx());
     widgets::section_header(ui, "What others learn");
     ui.label(
@@ -121,6 +131,15 @@ pub(super) fn section(ui: &mut Ui, model: &Model, shared: bool, actions: &mut Ve
     ui.add_space(20.0);
     widgets::section_header(ui, "Session log");
     line(ui, LOG_KEPT, t.text_secondary);
+    // The past sessions, on their own page (hidden there while shared).
+    if !shared
+        && Button::new(Kind::Ghost, PAST_SESSIONS)
+            .small()
+            .show(ui)
+            .clicked()
+    {
+        form.page = Page::Sessions;
+    }
 
     ui.add_space(20.0);
     widgets::section_header(ui, "Screenshots");

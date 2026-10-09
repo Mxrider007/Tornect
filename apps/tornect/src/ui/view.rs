@@ -279,6 +279,8 @@ pub struct Form {
     pub first_name: Option<String>,
     /// The password prompt's fields.
     pub ua: UaForm,
+    /// The Sessions page shows the session log's folder.
+    pub log_folder_shown: bool,
     /// What the request sheet last kept in view: its viewport's size, its
     /// newest card, how many cards it held and how tall they were. When any
     /// of them changes the newest card's answers are brought into view again.
