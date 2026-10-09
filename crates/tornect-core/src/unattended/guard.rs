@@ -1746,43 +1746,126 @@ impl MutationGuard {
         account: AccountFacts,
         helper_task: HelperPresence,
     ) -> Result<bool, GuardError> {
-        let now = self.now();
-        let file_keystore = self.store.keystore_kind().is_file();
+        let (now, file_keystore) = (self.now(), self.store.keystore_kind().is_file());
         let judged = self.store.read(|s| {
-            let before = s.grant(device).cloned();
-            let mut after = match &before {
-                Some(g) => g.clone(),
-                None => {
-                    let auth = AuthRecord::Opaque {
-                        record: Zeroizing::new(Vec::new()),
-                    };
-                    UnattendedGrant::from_preset(
-                        [0; 8],
-                        *device,
-                        "probe",
-                        Actor::Ui,
-                        preset,
-                        1,
-                        auth,
-                        now,
-                    )
-                    .map_err(|e| GuardError::Precondition(e.to_string()))?
-                }
-            };
-            after
-                .apply_options(options, now, file_keystore)
-                .map_err(|e| GuardError::Precondition(e.to_string()))?;
-            let gains_level =
-                after.holds_level() && before.as_ref().is_none_or(|g| !g.holds_level());
-            if gains_level && let Some(why) = Self::level_unsupported(account, after.preset) {
-                return Err(GuardError::Unsupported(why.to_owned()));
-            }
-            let reach_before = before
-                .as_ref()
-                .map_or(0, |g| reach::own_reach(s, g, account, helper_task));
-            Ok(reach::own_reach(s, &after, account, helper_task) > reach_before)
+            Self::judge_reach(
+                s,
+                device,
+                preset,
+                options,
+                (account, helper_task),
+                (now, file_keystore),
+                false,
+            )
         });
-        judged.unwrap_or(Ok(false))
+        judged.map_or(Ok(false), |r| r.map(|p| p.raises))
+    }
+
+    /// [`Self::registration_raises`]'s judgement on the store `s`, on `facts` (the account,
+    /// the helper task) and at `at` (the wall clock, a file keystore), with the other
+    /// grants the change makes reach the level when `list` is set.
+    fn judge_reach(
+        s: &super::grant::UnattendedStore,
+        device: &DeviceId,
+        preset: Preset,
+        options: &GrantOptions,
+        facts: (AccountFacts, HelperPresence),
+        at: (u64, bool),
+        list: bool,
+    ) -> Result<ReachPreview, GuardError> {
+        let ((account, helper_task), (now, file_keystore)) = (facts, at);
+        let before = s.grant(device).cloned();
+        let mut after = match &before {
+            Some(g) => g.clone(),
+            None => {
+                let auth = AuthRecord::Opaque {
+                    record: Zeroizing::new(Vec::new()),
+                };
+                UnattendedGrant::from_preset(
+                    [0; 8],
+                    *device,
+                    "probe",
+                    Actor::Ui,
+                    preset,
+                    1,
+                    auth,
+                    now,
+                )
+                .map_err(|e| GuardError::Precondition(e.to_string()))?
+            }
+        };
+        after
+            .apply_options(options, now, file_keystore)
+            .map_err(|e| GuardError::Precondition(e.to_string()))?;
+        let gains_level = after.holds_level() && before.as_ref().is_none_or(|g| !g.holds_level());
+        if gains_level && let Some(why) = Self::level_unsupported(account, after.preset) {
+            return Err(GuardError::Unsupported(why.to_owned()));
+        }
+        let reach_before = before
+            .as_ref()
+            .map_or(0, |g| reach::own_reach(s, g, account, helper_task));
+        let reach_after = reach::own_reach(s, &after, account, helper_task);
+        let newly_reaching = if list {
+            // The store as the change leaves it: each other grant's own reach judged
+            // there and here.
+            let mut changed = s.clone();
+            match changed.grants.iter_mut().find(|g| g.device == *device) {
+                Some(g) => *g = after,
+                None => changed.grants.push(after),
+            }
+            s.grants
+                .iter()
+                .filter(|g| {
+                    g.device != *device
+                        && reach::own_reach(&changed, g, account, helper_task)
+                            > reach::own_reach(s, g, account, helper_task)
+                })
+                .map(|g| NewlyReaching {
+                    device: g.device,
+                    label: g.label.clone(),
+                    marked: g.marked(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(ReachPreview {
+            raises: reach_after > reach_before,
+            reach_before,
+            reach_after,
+            newly_reaching,
+        })
+    }
+
+    /// The preview of a registration (a creation, or a new password) or an options change
+    /// of `device`'s grant with `preset` and `options` (§B.8.7.1 ④, decision M1-67):
+    /// whether it raises the grant's own reach, its reach before and after, and the other
+    /// grants whose control it makes reach the administrator level, each with its pinned
+    /// label and its mark. Judged by the functions the commit judges with, on the account
+    /// facts and the helper task read now and the store as it is now (a store not created
+    /// yet as the first enable creates it: empty); the commit judges again under its lock.
+    /// Read only: no dialog, no log line, no write. The level where this host cannot give
+    /// it is `G_UNSUPPORTED`, and options the grant cannot take `G_PRECONDITION`, both
+    /// returned unlogged.
+    pub fn preview(
+        &self,
+        device: &DeviceId,
+        preset: Preset,
+        options: &GrantOptions,
+    ) -> Result<ReachPreview, GuardError> {
+        let facts = (self.facts.account(), self.facts.helper_task());
+        let now = self.now();
+        let at = (now, self.store.keystore_kind().is_file());
+        let judge = |s: &super::grant::UnattendedStore| {
+            Self::judge_reach(s, device, preset, options, facts, at, true)
+        };
+        self.store.read(judge).unwrap_or_else(|| {
+            judge(&super::grant::UnattendedStore::bootstrap(
+                Zeroizing::new(Vec::new()),
+                None,
+                now,
+            ))
+        })
     }
 
     /// `RegStart` (§B.8.7.4): re-auth here; returns a single-use `reg_txn` (≤ 120 s,
@@ -2588,6 +2671,48 @@ impl MutationGuard {
             detail: None,
             effect,
         })
+    }
+}
+
+/// One other grant whose control a change would newly make reach the administrator
+/// level (decision M1-67; the list of §B.8.7.1 ⑤a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewlyReaching {
+    /// Its device.
+    pub device: DeviceId,
+    /// Its pinned label.
+    pub label: String,
+    /// Its password is marked "answered 0" (§B.8.6.1): it is served view only there
+    /// until it gets a new generated password.
+    pub marked: bool,
+}
+
+/// What a registration (a creation or a new password) or an options change of one
+/// device's grant would do to its reach, judged as the commit judges it (decision M1-67;
+/// §B.8.7.1 ④'s "is or becomes"): [`MutationGuard::preview`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachPreview {
+    /// The change raises the grant's own reach, a creation with reach included: its
+    /// registration needs a raising `RegStart` and a generated password, and
+    /// `set_options` refuses it (`G_NEEDS_PASSWORD`).
+    pub raises: bool,
+    /// The grant's own reach before the change (2: it holds the level; 1: its control
+    /// reaches the level; 0: neither), the mark aside; 0 for a grant not stored yet and
+    /// always 0 on Linux.
+    pub reach_before: u8,
+    /// The grant's own reach after the change, in the same terms.
+    pub reach_after: u8,
+    /// The other grants whose control the change makes reach the level, in the store's
+    /// order.
+    pub newly_reaching: Vec<NewlyReaching>,
+}
+
+impl ReachPreview {
+    /// The grant's reach is or becomes non-zero: its new password can only be
+    /// generated (§B.8.7.1 ④, §B.8.7.2).
+    #[must_use]
+    pub fn generated_only(&self) -> bool {
+        self.reach_before > 0 || self.reach_after > 0
     }
 }
 
