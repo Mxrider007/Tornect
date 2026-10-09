@@ -99,7 +99,8 @@ impl ReAuth for DevReAuth {
 /// What the Windows dialog says the password is for, per operation class —
 /// the same five classes as the polkit actions, so both OSes tell the user
 /// the same thing; installing and removing Tornect, which polkit counts as
-/// autostart changes, are named as what they are.
+/// autostart changes, and the banner's acknowledgement, which polkit counts as
+/// a settings change, are named as what they are.
 #[must_use]
 pub fn purpose_of(op: &str) -> &'static str {
     match op {
@@ -119,6 +120,9 @@ pub fn purpose_of(op: &str) -> &'static str {
         }
         "backup_export" | "backup_import" | "identity_view" => "export or import Tornect's secrets",
         "set_settings" | "set_options" | "settings_change" => "change a Tornect security setting",
+        "acknowledge_banner" => {
+            "confirm that you have seen which devices can connect without asking"
+        }
         // The strongest wording for an operation this build does not know.
         _ => "give a device unattended access to this computer, or change its password",
     }
@@ -526,8 +530,10 @@ impl PolkitReAuth {
             | "uninstall" => "autostart",
             // Moves secrets out of the store.
             "backup_export" | "backup_import" | "identity_view" => "export",
-            // Policy and settings.
-            "set_settings" | "set_options" | "settings_change" => "settings",
+            // Policy and settings; the banner's acknowledgement too, whose
+            // message is the settings one (an action of its own would change
+            // the policy file).
+            "set_settings" | "set_options" | "settings_change" | "acknowledge_banner" => "settings",
             // An operation this build does not know: use the most consequential
             // wording rather than the mildest, and say so in the log.
             other => {
@@ -1136,5 +1142,30 @@ mod tests {
             "{shown}"
         );
         assert_eq!(c.password_wide().last(), Some(&0));
+    }
+
+    /// The banner's acknowledgement asks with its own purpose (§B.8.6.2): what
+    /// it confirms, not a change of a security setting.
+    #[test]
+    fn the_acknowledgement_names_its_own_purpose() {
+        assert_eq!(
+            purpose_of("acknowledge_banner"),
+            "confirm that you have seen which devices can connect without asking"
+        );
+        assert_ne!(
+            purpose_of("acknowledge_banner"),
+            purpose_of("settings_change")
+        );
+    }
+
+    /// On Linux the acknowledgement asks through the settings action, whose
+    /// message the policy file keeps as it is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_acknowledgement_maps_to_the_settings_action() {
+        assert_eq!(
+            PolkitReAuth::new().action_for("acknowledge_banner"),
+            "org.tornect.settings"
+        );
     }
 }
