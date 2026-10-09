@@ -375,12 +375,9 @@ impl BannerWatch {
         use tornect_core::session_log::Actor;
         use tornect_core::unattended::guard::ExternalOp;
         let (_, last) = self.read();
-        let asked = self.guard.authorize(
-            Actor::Ui,
-            &ExternalOp::SettingsChange {
-                what: "acknowledge the banner of devices that can connect without asking".into(),
-            },
-        );
+        let asked = self
+            .guard
+            .authorize(Actor::Ui, &ExternalOp::AcknowledgeBanner);
         match asked {
             Ok(()) => {
                 *self
@@ -2229,6 +2226,43 @@ mod tests {
             shared.read(|m| m.unattended_banner.is_some()),
             "back after the raise"
         );
+    }
+
+    /// §B.8.6.2: the banner's acknowledgement asks as an operation of its own,
+    /// so that the dialog says what the password confirms.
+    #[test]
+    fn the_acknowledgement_asks_as_its_own_operation() {
+        use tornect_core::keystore::FileSecretStore;
+        use tornect_core::levels::{AccountFacts, FixedFacts, HelperPresence};
+        use tornect_core::session_log::SessionLog;
+        use tornect_core::unattended::clock::FakeClock;
+        use tornect_core::unattended::guard::{AllowAllReAuth, MutationGuard, NoSessionActivity};
+        use tornect_core::unattended::store::GrantStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let secrets = Arc::new(FileSecretStore::open(paths.keys_dir()).unwrap());
+        let store = GrantStore::open(
+            &paths,
+            secrets,
+            Arc::new(FakeClock::at(1_787_961_600)),
+            SessionLog::new(paths.sessions_log()),
+        )
+        .unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let guard = Arc::new(MutationGuard::new(
+            store,
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(NoSessionActivity),
+            Arc::new(FixedFacts::new(AccountFacts::Linux, HelperPresence::Absent)),
+        ));
+        let watch = BannerWatch {
+            guard,
+            acknowledged: Mutex::new(None),
+        };
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.acknowledge(&shared);
+        assert_eq!(reauth.calls(), ["acknowledge_banner"]);
     }
 
     /// The row "indicator shown" as the host at `state_dir` answers it over
