@@ -1,16 +1,18 @@
 //! The Settings page (the redesign's §4): the sections built so far, each
 //! drawn from the model alone. None of them offers an operation of
 //! §B.8.6.2: a change goes to the tokio side as one
-//! [`Action::SaveSettings`], which saves `config.toml`. Opening the page or a
-//! section asks for nothing. While this screen may be in a picture that
-//! leaves it, every control that writes gives way to the hidden card, and
-//! what the sections say stays.
+//! [`Action::SaveSettings`], which saves `config.toml`, and Security shows
+//! unattended access as the window's guard last read it, changing nothing.
+//! Opening the page or a section asks for nothing. While this screen may be
+//! in a picture that leaves it, every control that writes gives way to the
+//! hidden card, and what the sections say stays.
 
 pub(super) mod about;
 pub(super) mod connection;
 pub(super) mod display;
 pub(super) mod general;
 pub(super) mod privacy;
+pub(super) mod security;
 
 use egui::{RichText, Ui};
 
@@ -27,6 +29,8 @@ pub(super) enum Section {
     General,
     /// How Tornect reaches the Tor network.
     Connection,
+    /// Unattended access: its state, the devices, the readiness rows.
+    Security,
     /// How the stream window opens.
     Display,
     /// What others learn, what is kept here, the history switch.
@@ -38,9 +42,10 @@ pub(super) enum Section {
 impl Section {
     /// The sections the page lists, in the redesign's order: only those
     /// built.
-    pub const LISTED: [Self; 5] = [
+    pub const LISTED: [Self; 6] = [
         Self::General,
         Self::Connection,
+        Self::Security,
         Self::Display,
         Self::Privacy,
         Self::About,
@@ -62,6 +67,7 @@ impl Section {
         match self {
             Self::General => "General",
             Self::Connection => "Connection",
+            Self::Security => "Security",
             Self::Display => "Display and quality",
             Self::Privacy => "Privacy",
             Self::About => "About",
@@ -104,19 +110,37 @@ pub(super) fn page(
     );
     ui.add_space(10.0);
     let narrow = ui.available_width() < NARROW_BELOW;
-    let names: Vec<&str> = Section::LISTED.iter().map(|s| s.label(narrow)).collect();
-    let mut index = Section::LISTED
-        .iter()
-        .position(|s| *s == form.settings.section)
-        .unwrap_or(0);
-    widgets::segmented(ui, &mut index, &names);
-    form.settings.section = Section::LISTED.get(index).copied().unwrap_or_default();
+    // Where the page is narrow, the list takes two rows, so that every
+    // name fits.
+    let listed = Section::LISTED;
+    let rows: Vec<&[Section]> = if narrow {
+        let (first, second) = listed.split_at(3);
+        vec![first, second]
+    } else {
+        vec![&listed[..]]
+    };
+    for (i, row) in rows.into_iter().enumerate() {
+        if i > 0 {
+            ui.add_space(6.0);
+        }
+        let names: Vec<&str> = row.iter().map(|s| s.label(narrow)).collect();
+        // No segment of a row is selected when the section is in the other.
+        let mut index = row
+            .iter()
+            .position(|s| *s == form.settings.section)
+            .unwrap_or(usize::MAX);
+        widgets::segmented(ui, &mut index, &names);
+        if let Some(section) = row.get(index) {
+            form.settings.section = *section;
+        }
+    }
     ui.add_space(18.0);
     match form.settings.section {
         Section::General => general::section(ui, model, &mut form.settings, shared, actions),
         Section::Connection => {
             connection::section(ui, model, &mut form.settings, shared, actions);
         }
+        Section::Security => security::section(ui, model, shared),
         Section::Display => display::section(ui, model, shared, actions),
         Section::Privacy => privacy::section(ui, model, shared, actions),
         Section::About => about::section(ui, model, actions),
