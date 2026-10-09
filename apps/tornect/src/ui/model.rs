@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use tornect_core::TornectId;
 use tornect_core::address_book::{Day, mixes_scripts};
-use tornect_core::config::{Theme, Viewer};
+use tornect_core::config::{BridgeMode, Theme, Viewer};
 use tornect_core::levels::{Answers, Availability};
 use tornect_core::unattended::credentials::RememberOffer;
 
@@ -957,6 +957,8 @@ pub struct Settings {
     pub theme: Theme,
     /// How the stream window opens for a new session.
     pub viewer: Viewer,
+    /// How Tornect reaches the Tor network (from the next start).
+    pub tor: TorChoice,
     /// Why the last save from the window was not made, in plain words;
     /// `None` once one was.
     pub problem: Option<&'static str>,
@@ -976,6 +978,11 @@ impl Settings {
             device_name: cfg.general.device_name.clone(),
             theme: cfg.general.theme,
             viewer: cfg.viewer,
+            tor: TorChoice {
+                bridges: cfg.tor.bridges,
+                bridge_lines: BridgeLines(cfg.tor.bridge_lines.clone()),
+                pow_defense: cfg.tor.pow_defense,
+            },
             problem: None,
         }
     }
@@ -991,6 +998,30 @@ pub enum SettingsChange {
     Theme(Theme),
     /// How the stream window opens (from the next session on).
     Viewer(Viewer),
+    /// How Tornect reaches the Tor network (from the next start).
+    Tor(TorChoice),
+}
+
+/// How Tornect reaches the Tor network, as `config.toml` holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorChoice {
+    /// Direct Tor, bridges, or the automatic ladder.
+    pub bridges: BridgeMode,
+    /// Private bridge lines.
+    pub bridge_lines: BridgeLines,
+    /// The onion service's proof-of-work defence.
+    pub pow_defense: bool,
+}
+
+/// Private bridge lines: useful only while a censor does not know them, so
+/// never printed (`Debug` says how many there are).
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct BridgeLines(pub Vec<String>);
+
+impl std::fmt::Debug for BridgeLines {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BridgeLines({} lines)", self.0.len())
+    }
 }
 
 impl SettingsChange {
@@ -1000,6 +1031,11 @@ impl SettingsChange {
             Self::DeviceName(name) => cfg.general.device_name.clone_from(name),
             Self::Theme(theme) => cfg.general.theme = *theme,
             Self::Viewer(viewer) => cfg.viewer = *viewer,
+            Self::Tor(tor) => {
+                cfg.tor.bridges = tor.bridges;
+                cfg.tor.bridge_lines.clone_from(&tor.bridge_lines.0);
+                cfg.tor.pow_defense = tor.pow_defense;
+            }
         }
     }
 }

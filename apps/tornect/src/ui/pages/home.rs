@@ -541,7 +541,7 @@ fn connect_card(
 }
 
 /// The Tor line, in words and colour.
-fn tor_line(t: &Tokens, tor: &TorState) -> (String, egui::Color32) {
+pub(super) fn tor_line(t: &Tokens, tor: &TorState) -> (String, egui::Color32) {
     match tor {
         TorState::Starting => ("Tor: starting…".to_owned(), t.text_muted),
         TorState::Trying { via, attempt, of } => (
