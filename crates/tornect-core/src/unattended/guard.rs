@@ -808,6 +808,18 @@ impl MutationGuard {
         &self.store
     }
 
+    /// What the grant precondition of §B.8.6.1 finds for `device` in this guard's own
+    /// sources, read only: its pinned pairing label (`None`: not paired, so it gets no
+    /// grant) and whether an attended session from it has completed (without one a grant
+    /// needs the waiver, which *Headless box* gives itself).
+    #[must_use]
+    pub fn precondition(&self, device: &DeviceId) -> (Option<String>, bool) {
+        (
+            self.paired.pinned_label(device),
+            self.history.completed_attended_sessions(device) > 0,
+        )
+    }
+
     fn now(&self) -> u64 {
         self.store.clock().wall()
     }

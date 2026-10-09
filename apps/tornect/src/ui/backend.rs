@@ -37,9 +37,10 @@ use super::block::GuiBlockWindow;
 use super::book::{self, Change};
 use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
 use super::model::{
-    CaptureNote, Check, ClientStage, Dial, Failure, GrantRow, HostSetting, Hosting, Manager,
-    ManagerOp, PauseEnd, Settings, SettingsChange, Shared, Sharing, TorState, UnattendedBanner,
-    Viewing, Wake,
+    Candidate, CaptureNote, Check, ClientStage, Dial, Failure, GrantRequest, GrantRow, HostSetting,
+    Hosting, Manager, ManagerOp, NewPassword, PauseEnd, PolicyInputs, Settings, SettingsChange,
+    Shared, Sharing, TorState, UnattendedBanner, Viewing, Wake, WizardAnswer, WizardChoice,
+    WizardView,
 };
 use super::recognize::Lookalike;
 use super::stream::{FrameSlot, SlotSink};
@@ -494,9 +495,18 @@ fn refusal(e: &tornect_core::unattended::guard::GuardError) -> &'static str {
         GuardError::NeedsPassword(_) => {
             "Not done: this device needs a new password before its access can be enabled."
         }
-        _ => "Not done: unattended access could not be changed.",
+        _ => NOT_CHANGED,
     }
 }
+
+/// Why an operation of Settings, Security was not done, when no plainer
+/// reason applies.
+const NOT_CHANGED: &str = "Not done: unattended access could not be changed.";
+
+/// Why the wizard's *Turn on* waits for nothing: another operation asks for
+/// this computer's password right now (one dialog at a time).
+const ANOTHER_ASKS: &str =
+    "Not done: another Tornect command is changing unattended access right now.";
 
 /// Why a pause was not started from Settings, Security: one runs already,
 /// and a pause is never ended sooner from there.
@@ -604,12 +614,33 @@ impl ManagerWatch {
         }
     }
 
-    /// Put unattended access as it is now into the model.
+    /// Put unattended access as it is now into the model, and whether the
+    /// grant wizard has a device to offer.
     fn refresh(&self, shared: &Shared) {
         let view = Some(self.read());
-        if shared.read(|m| m.manager != view) {
-            shared.update(|m| m.manager = view);
+        let offer = Some(self.offer());
+        if shared.read(|m| m.manager != view || m.wizard.offer != offer) {
+            shared.update(|m| {
+                m.manager = view;
+                m.wizard.offer = offer;
+            });
         }
+    }
+
+    /// Whether a paired device of this host has no grant yet: what the grant
+    /// wizard can offer (§B.8.7.1 ②). Reads no log.
+    fn offer(&self) -> bool {
+        let granted: Vec<tornect_core::DeviceId> = self
+            .ctx
+            .guard
+            .store()
+            .read(|s| s.grants.iter().map(|g| g.device).collect())
+            .unwrap_or_default();
+        self.trusted
+            .snapshot()
+            .devices
+            .iter()
+            .any(|d| !granted.contains(&d.device))
     }
 
     /// Run `op` through the guard as the window (`Actor::Ui`), then read the
@@ -626,6 +657,23 @@ impl ManagerWatch {
             if let Some(kill) = &self.ctx.kill {
                 kill.kill(reason);
             }
+        };
+        // The wizard's operations keep their own state: none of them touches
+        // the section's note or its busy flag.
+        let op = match op {
+            ManagerOp::WizardDevices => {
+                self.wizard_devices(shared);
+                return false;
+            }
+            ManagerOp::Preview(choice) => {
+                self.wizard_preview(*choice, shared);
+                return false;
+            }
+            ManagerOp::Grant(request) => {
+                self.wizard_grant(*request, shared);
+                return false;
+            }
+            other => other,
         };
         let mut paired_changed = false;
         let done: Result<(), &'static str> = match op {
@@ -645,8 +693,11 @@ impl ManagerWatch {
             ManagerOp::Unlock(device) => guard.unlock(Actor::Ui, &device).map_err(|e| refusal(&e)),
             ManagerOp::Resume(device) => guard.resume(Actor::Ui, &device).map_err(|e| refusal(&e)),
             // Rotate ID runs at the window's close (`ManagerWatch::rotate`),
-            // never here.
-            ManagerOp::RotateId => Ok(()),
+            // never here; the wizard's operations returned above.
+            ManagerOp::RotateId
+            | ManagerOp::WizardDevices
+            | ManagerOp::Preview(_)
+            | ManagerOp::Grant(_) => Ok(()),
             ManagerOp::SignIn(on) => {
                 let backend = match std::env::current_exe() {
                     Ok(exe) => (self.autostart_for)(&exe),
@@ -771,6 +822,149 @@ impl ManagerWatch {
         let store = tornect_core::keystore::FileSecretStore::open(paths.keys_dir())?;
         let saved = ua_client::system_passwords(device);
         crate::rotate::rotate_id(paths, &self.ctx.guard, Actor::Ui, &store, Some(&saved))
+    }
+
+    /// The paired devices the grant wizard may give unattended access
+    /// (§B.8.7.1 ②), into the model: this host's paired devices without a
+    /// grant, each with what the guard's own precondition finds (§B.8.6.1:
+    /// its pinned label, an attended session completed), and the password
+    /// policy's inputs for the meter (§B.8.7.2). Writes nothing.
+    fn wizard_devices(&self, shared: &Shared) {
+        use tornect_core::words::Role;
+        let guard = &self.ctx.guard;
+        let devices: Vec<Candidate> = self
+            .trusted
+            .snapshot()
+            .devices
+            .iter()
+            .filter(|d| guard.store().grant(&d.device).is_none())
+            .filter_map(|d| {
+                let (label, attended) = guard.precondition(&d.device);
+                label.map(|label| Candidate {
+                    device: d.device,
+                    label,
+                    words: self
+                        .words
+                        .known()
+                        .cached(d.device.public_key_bytes(), Role::Device)
+                        .map(|h| h.words()),
+                    attended,
+                })
+            })
+            .collect();
+        let policy = PolicyInputs {
+            inputs: self.ctx.user_inputs.clone(),
+            min_score: self.ctx.min_score(),
+        };
+        shared.update(|m| {
+            m.wizard.devices = Some(devices);
+            m.wizard.policy = Some(policy);
+        });
+    }
+
+    /// Judge the wizard's `choice` (decision M1-67): whether its password can
+    /// only be generated, into the model. The guard's preview: no dialog, no
+    /// line, no write.
+    fn wizard_preview(&self, choice: WizardChoice, shared: &Shared) {
+        let judged = self
+            .ctx
+            .guard
+            .preview(&choice.device, choice.preset, &choice.options)
+            .ok()
+            .map(|p| p.generated_only());
+        shared.update(|m| m.wizard.preview = Some((choice, judged)));
+    }
+
+    /// The wizard's *Turn on* (§B.8.7.1 ⑦): one registration as the window,
+    /// then, while unattended access is off, *Turn on* with its own dialog and
+    /// the new stop code on its one card (§B.8.7.4: delivered only by the
+    /// click). The password is dropped (wiped) whatever happened, then the
+    /// answer goes into the model, then the view is read again.
+    fn wizard_grant(&self, request: GrantRequest, shared: &Shared) {
+        use tornect_core::session_log::Actor;
+        let GrantRequest {
+            attempt,
+            choice,
+            password,
+        } = request;
+        let registered = self.register(&choice, &password);
+        drop(password);
+        let answer = match registered {
+            Ok(()) => {
+                let on = self.ctx.guard.store().read(|s| s.enabled).unwrap_or(false);
+                if !on {
+                    match self.ctx.guard.master_on(Actor::Ui, &self.ctx.host_onion_pk) {
+                        Ok(ok) => self.show_stop_code(&ok.stop_code, shared),
+                        Err(e) => shared.update(|m| m.manager_note = Some(refusal(&e))),
+                    }
+                }
+                WizardAnswer::Done
+            }
+            Err(answer) => answer,
+        };
+        shared.update(|m| {
+            m.wizard.running = None;
+            m.wizard.answer = Some((attempt, answer));
+        });
+        self.refresh(shared);
+    }
+
+    /// One registration of the wizard's `choice` with `password`, as the
+    /// window (§B.8.7.4's two messages, both halves in this process): the
+    /// guard's preview again, a chosen password refused where the grant's
+    /// reach is or becomes non-zero (no dialog); `RegStart` with the raise the
+    /// preview found and `generated` from the password's own arm (its one
+    /// dialog; it creates the store at the first enable); the client's half;
+    /// `RegFinish` at once. A raise that appeared while the person was asked
+    /// is refused by the guard, and nothing is written.
+    fn register(&self, choice: &WizardChoice, password: &NewPassword) -> Result<(), WizardAnswer> {
+        use tornect_core::session_log::Actor;
+        use tornect_core::unattended::guard::GuardError;
+        use tornect_signal::auth;
+        let guard = &self.ctx.guard;
+        let WizardChoice {
+            device,
+            preset,
+            options,
+        } = choice;
+        let generated = matches!(password, NewPassword::Generated(_));
+        let refused = |e: &GuardError| match e {
+            GuardError::NeedsPassword(_) => WizardAnswer::NeedsGenerated,
+            e => WizardAnswer::Refused(refusal(e)),
+        };
+        let preview = guard
+            .preview(device, *preset, options)
+            .map_err(|e| refused(&e))?;
+        if preview.generated_only() && !generated {
+            return Err(WizardAnswer::NeedsGenerated);
+        }
+        let not_done = |_| WizardAnswer::Refused(NOT_CHANGED);
+        let secret = password.secret().0.as_str();
+        let (client, reg_request) = auth::PasswordRegistration::start(secret).map_err(not_done)?;
+        let started = guard
+            .reg_start(Actor::Ui, device, preview.raises, generated)
+            .map_err(|e| refused(&e))?;
+        let setup = auth::parse_server_setup(&started.server_setup).map_err(not_done)?;
+        // `credential_identifier` is the device's key, as at every login (§B.8.4.3).
+        let reg_response =
+            auth::registration_response(&setup, &reg_request, device.public_key_bytes())
+                .map_err(not_done)?;
+        let ids = auth::identifiers(device.public_key_bytes(), &self.ctx.host_onion_pk);
+        let upload = client
+            .finish(secret, &reg_response, ids)
+            .map_err(not_done)?;
+        guard
+            .reg_finish(
+                Actor::Ui,
+                device,
+                &started.reg_txn,
+                &upload,
+                *preset,
+                options,
+                generated,
+            )
+            .map(|_| ())
+            .map_err(|e| refused(&e))
     }
 
     /// Turn unattended access off because its stop code was not delivered.
@@ -1534,10 +1728,55 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                             break;
                         }
                     }
+                    Command::Manager(ManagerOp::WizardDevices) => {
+                        if let Some(manager) = hosted.as_ref().and_then(|h| h.manager.clone()) {
+                            // A new wizard: none of the last one's answers
+                            // (a press still running stays known: one dialog at
+                            // a time).
+                            b.shared.update(|m| {
+                                m.wizard = WizardView {
+                                    offer: m.wizard.offer,
+                                    running: m.wizard.running,
+                                    ..WizardView::default()
+                                };
+                            });
+                            let shared = Arc::clone(&b.shared);
+                            tokio::task::spawn_blocking(move || manager.wizard_devices(&shared));
+                        }
+                    }
+                    Command::Manager(ManagerOp::Preview(choice)) => {
+                        if let Some(manager) = hosted.as_ref().and_then(|h| h.manager.clone()) {
+                            let shared = Arc::clone(&b.shared);
+                            tokio::task::spawn_blocking(move || {
+                                manager.wizard_preview(*choice, &shared);
+                            });
+                        }
+                    }
+                    Command::Manager(ManagerOp::Grant(request)) => {
+                        if let Some(manager) = hosted.as_ref().and_then(|h| h.manager.clone()) {
+                            // One password dialog at a time, kept in the
+                            // wizard's own state: a press while another
+                            // operation asks for one is answered, not queued.
+                            let attempt = request.attempt;
+                            if b.shared.read(|m| m.manager_busy || m.wizard.running.is_some()) {
+                                b.shared.update(|m| {
+                                    m.wizard.answer =
+                                        Some((attempt, WizardAnswer::Refused(ANOTHER_ASKS)));
+                                });
+                                continue;
+                            }
+                            b.shared.update(|m| m.wizard.running = Some(attempt));
+                            let shared = Arc::clone(&b.shared);
+                            tokio::task::spawn_blocking(move || {
+                                manager.wizard_grant(*request, &shared);
+                            });
+                        }
+                    }
                     Command::Manager(op) => {
                         if let Some(manager) = hosted.as_ref().and_then(|h| h.manager.clone()) {
                             // One password dialog at a time: an operation that
-                            // asks for one waits for none other.
+                            // asks for one waits for none other (the wizard's
+                            // included).
                             let asks = matches!(
                                 op,
                                 ManagerOp::On
@@ -1548,7 +1787,8 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                                     | ManagerOp::SignIn(_)
                             );
                             if asks {
-                                if b.shared.read(|m| m.manager_busy) {
+                                if b.shared.read(|m| m.manager_busy || m.wizard.running.is_some())
+                                {
                                     continue;
                                 }
                                 b.shared.update(|m| m.manager_busy = true);
@@ -3220,7 +3460,7 @@ mod tests {
         let shared = Shared::new(Model::default(), Arc::new(|_| {}));
         let asks = |op: ManagerOp| {
             let before = reauth.calls().len();
-            watch.run(op, &shared);
+            watch.run(op.clone(), &shared);
             assert_eq!(shared.read(|m| m.manager_note), None, "{op:?}");
             reauth.calls()[before..].to_vec()
         };
@@ -4829,5 +5069,308 @@ mod tests {
         let err = HandshakeError::Timeout("SESSION_ACCEPT");
         let ended = ua_client::ended(&err, "Office PC");
         assert_eq!(ua_failure(&err, &ended), (Failure::TimedOut, 3));
+    }
+
+    // ------------------------------------------------------------ the grant wizard (§B.8.7.1)
+
+    /// The wizard's *Turn on* for `device` with `password`, as press 1: a
+    /// *My machines* grant, the attended precondition waived.
+    fn turn_on(device: tornect_core::DeviceId, password: NewPassword) -> GrantRequest {
+        GrantRequest {
+            attempt: 1,
+            choice: WizardChoice {
+                device,
+                preset: tornect_core::unattended::grant::Preset::MyMachines,
+                options: tornect_core::unattended::ipc::GrantOptions {
+                    waive_attended_precondition: true,
+                    ..Default::default()
+                },
+            },
+            password,
+        }
+    }
+
+    /// A generated or a chosen password of the wizard (both pass the policy).
+    fn generated_pw() -> NewPassword {
+        NewPassword::Generated(Secret(zeroize::Zeroizing::new(
+            "plaza cubicle ruse ditto unwind".to_owned(),
+        )))
+    }
+
+    fn chosen_pw() -> NewPassword {
+        NewPassword::Chosen(Secret(zeroize::Zeroizing::new(
+            "quiet verdant otter lantern 41".to_owned(),
+        )))
+    }
+
+    /// A Windows administrator account of an installed Tornect, UAC on.
+    fn windows_admin() -> tornect_core::levels::AccountFacts {
+        tornect_core::levels::AccountFacts::Windows(tornect_core::levels::WindowsFacts {
+            installed: true,
+            administrator: true,
+            ..Default::default()
+        })
+    }
+
+    /// The window host's view of unattended access over a fresh store in
+    /// `home`, as [`manager_over`] makes it, with a guard that asks `reauth`,
+    /// sees `activity`, reads `facts` and makes a real `ServerSetup` at the
+    /// first enable (the wizard runs both halves of the registration).
+    fn wizard_watch(
+        home: &std::path::Path,
+        reauth: Arc<dyn tornect_core::unattended::guard::ReAuth>,
+        activity: Arc<dyn tornect_core::unattended::guard::RemoteSessionActivity>,
+        facts: Arc<tornect_core::levels::FixedFacts>,
+    ) -> ManagerWatch {
+        use tornect_core::unattended::guard::{AllowAllPaired, MutationGuard, NoSessionActivity};
+        let mut watch = manager_over(
+            home,
+            Arc::clone(&reauth),
+            Arc::new(NoSessionActivity),
+            tornect_core::levels::AccountFacts::Linux,
+            b"this machine",
+        );
+        watch.ctx.guard = Arc::new(
+            MutationGuard::new(
+                watch.ctx.guard.store().clone(),
+                reauth,
+                activity,
+                Arc::clone(&facts) as Arc<dyn tornect_core::levels::FactsSource>,
+            )
+            .with_paired_devices(Arc::new(AllowAllPaired))
+            .with_server_setup_source(Arc::new(
+                tornect_signal::unattended::OpaqueServerSetupSource,
+            )),
+        );
+        watch.ctx.facts = facts;
+        watch
+    }
+
+    /// Linux facts, as a source the tests can change.
+    fn linux_facts() -> Arc<tornect_core::levels::FixedFacts> {
+        Arc::new(tornect_core::levels::FixedFacts::linux())
+    }
+
+    /// Every password that crosses the window's channel is a `Secret`: a
+    /// manager command carrying the wizard's new password prints none of it,
+    /// whichever arm it is.
+    #[test]
+    fn a_manager_command_with_a_password_prints_redacted() {
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        for password in [generated_pw(), chosen_pw()] {
+            let command = Command::Manager(ManagerOp::Grant(Box::new(turn_on(device, password))));
+            let printed = format!("{command:?}");
+            for word in ["plaza", "cubicle", "verdant", "otter"] {
+                assert!(!printed.contains(word), "{printed}");
+            }
+            assert!(printed.contains("<redacted>"), "{printed}");
+        }
+    }
+
+    /// §B.8.6.2, §B.8.7.4: the wizard's *Turn on* asks one dialog per
+    /// operation: `reg_start` (its registration; `reg_finish` asks none),
+    /// then `master_on` while unattended access was off, with the new stop
+    /// code on its one card; with access on, `reg_start` only.
+    #[test]
+    fn the_wizard_asks_one_dialog_per_operation() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let watch = wizard_watch(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(NoSessionActivity),
+            linux_facts(),
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let (one, two) = (
+            tornect_core::DeviceId::from_bytes([1; 32]),
+            tornect_core::DeviceId::from_bytes([2; 32]),
+        );
+        watch.wizard_grant(turn_on(one, generated_pw()), &shared);
+        assert_eq!(reauth.calls(), ["reg_start", "master_on"]);
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((1, WizardAnswer::Done))
+        );
+        assert!(
+            shared.read(|m| m.stop_card.is_some()),
+            "the stop code's card"
+        );
+        let store = watch.ctx.guard.store();
+        assert!(store.read(|s| s.enabled).unwrap());
+        assert!(store.grant(&one).is_some());
+        // Access on: one dialog, no new stop code.
+        shared.update(|m| m.stop_card = None);
+        watch.wizard_grant(turn_on(two, generated_pw()), &shared);
+        assert_eq!(reauth.calls(), ["reg_start", "master_on", "reg_start"]);
+        assert!(shared.read(|m| m.stop_card.is_none()));
+        assert!(store.grant(&two).is_some());
+        let view = shared.read(|m| m.manager.clone()).expect("read again");
+        assert_eq!(view.grants.len(), 2);
+    }
+
+    /// Decision M1-67: the tokio side registers the wizard's password as
+    /// generated exactly when it is the generator's arm: a chosen password
+    /// leaves the grant marked, a generated one does not.
+    #[test]
+    fn only_a_generated_password_registers_as_generated() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = wizard_watch(
+            tmp.path(),
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            linux_facts(),
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let (one, two) = (
+            tornect_core::DeviceId::from_bytes([1; 32]),
+            tornect_core::DeviceId::from_bytes([2; 32]),
+        );
+        watch.wizard_grant(turn_on(one, chosen_pw()), &shared);
+        watch.wizard_grant(turn_on(two, generated_pw()), &shared);
+        let store = watch.ctx.guard.store();
+        assert!(store.grant(&one).unwrap().marked(), "chosen: marked");
+        assert!(!store.grant(&two).unwrap().marked(), "generated: unmarked");
+    }
+
+    /// The administrator helper task registers while the person answers the
+    /// dialog (`RegStart`'s): control here now reaches the level.
+    struct TaskDuringDialog {
+        facts: Arc<tornect_core::levels::FixedFacts>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl tornect_core::unattended::guard::ReAuth for TaskDuringDialog {
+        fn reauthenticate(
+            &self,
+            op: &str,
+        ) -> Result<(), tornect_core::unattended::guard::ReAuthError> {
+            self.asked.lock().unwrap().push(op.to_owned());
+            self.facts
+                .set_helper_task(tornect_core::levels::HelperPresence::Registered);
+            Ok(())
+        }
+    }
+
+    /// Decision M1-67: a raise that appears while the person is asked
+    /// (the helper task registered meanwhile, so the new control grant now
+    /// reaches the level) is refused at `RegFinish`, a chosen password and a
+    /// generated one alike: the answer says so, no grant is written, and
+    /// unattended access stays off (no second dialog).
+    #[test]
+    fn a_raise_that_appeared_meanwhile_is_refused_and_written_nowhere() {
+        use tornect_core::levels::{FixedFacts, HelperPresence};
+        use tornect_core::unattended::guard::NoSessionActivity;
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        for password in [chosen_pw(), generated_pw()] {
+            let tmp = tempfile::tempdir().unwrap();
+            let facts = Arc::new(FixedFacts::new(windows_admin(), HelperPresence::Absent));
+            let reauth = Arc::new(TaskDuringDialog {
+                facts: Arc::clone(&facts),
+                asked: Mutex::new(Vec::new()),
+            });
+            let watch = wizard_watch(
+                tmp.path(),
+                Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+                Arc::new(NoSessionActivity),
+                Arc::clone(&facts),
+            );
+            let preview = watch
+                .ctx
+                .guard
+                .preview(
+                    &device,
+                    tornect_core::unattended::grant::Preset::MyMachines,
+                    &turn_on(device, chosen_pw()).choice.options,
+                )
+                .unwrap();
+            assert!(!preview.generated_only(), "at the click: reach 0");
+            let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+            watch.wizard_grant(turn_on(device, password), &shared);
+            assert_eq!(
+                shared.read(|m| m.wizard.answer),
+                Some((1, WizardAnswer::NeedsGenerated))
+            );
+            let store = watch.ctx.guard.store();
+            assert!(store.grant(&device).is_none(), "written nowhere");
+            assert!(!store.read(|s| s.enabled).unwrap_or(false), "still off");
+            assert_eq!(*reauth.asked.lock().unwrap(), ["reg_start"]);
+            assert!(shared.read(|m| m.stop_card.is_none()));
+        }
+    }
+
+    /// §B.8.6.2: during a remote session (and 60 s after one) the wizard's
+    /// *Turn on* is refused in plain words before any dialog: nothing is
+    /// written, access stays off, no stop code, no success.
+    #[test]
+    fn the_wizard_waits_for_the_remote_session_rule() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, ScriptedActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let activity = Arc::new(ScriptedActivity::default());
+        activity.set_live(true);
+        let watch = wizard_watch(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::clone(&activity)
+                as Arc<dyn tornect_core::unattended::guard::RemoteSessionActivity>,
+            linux_facts(),
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        watch.wizard_grant(turn_on(device, generated_pw()), &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((
+                1,
+                WizardAnswer::Refused(
+                    "Not done: a remote session is running, or ended less than a minute ago."
+                )
+            ))
+        );
+        assert!(reauth.calls().is_empty(), "no dialog");
+        assert!(watch.ctx.guard.store().grant(&device).is_none());
+        assert!(shared.read(|m| m.stop_card.is_none() && m.wizard.running.is_none()));
+    }
+
+    /// The wizard's devices (§B.8.7.1 ②): the host's paired devices without
+    /// a grant, each saying whether an attended session from it completed,
+    /// with the policy's inputs; the section's offer follows the view.
+    #[test]
+    fn the_wizard_lists_the_paired_devices_without_access() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, two) = (
+            tornect_core::DeviceId::from_bytes([1; 32]),
+            tornect_core::DeviceId::from_bytes([2; 32]),
+        );
+        let trusted = TrustedDeviceStore::ephemeral(Default::default());
+        trusted.pin(one, "Office laptop").unwrap();
+        trusted.pin(two, "Tablet").unwrap();
+        let watch = ManagerWatch {
+            trusted: Arc::new(trusted),
+            ..wizard_watch(
+                tmp.path(),
+                Arc::new(AllowAllReAuth::default()),
+                Arc::new(NoSessionActivity),
+                linux_facts(),
+            )
+        };
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.refresh(&shared);
+        assert_eq!(shared.read(|m| m.wizard.offer), Some(true));
+        watch.wizard_devices(&shared);
+        let devices = shared.read(|m| m.wizard.devices.clone()).unwrap();
+        assert_eq!(devices.len(), 2);
+        assert!(devices.iter().all(|c| !c.attended), "no session yet");
+        assert!(shared.read(|m| m.wizard.policy.is_some()));
+        watch.wizard_grant(turn_on(one, generated_pw()), &shared);
+        watch.wizard_devices(&shared);
+        let devices = shared.read(|m| m.wizard.devices.clone()).unwrap();
+        assert_eq!(devices.iter().map(|c| c.device).collect::<Vec<_>>(), [two]);
+        watch.wizard_grant(turn_on(two, generated_pw()), &shared);
+        assert_eq!(shared.read(|m| m.wizard.offer), Some(false), "none left");
     }
 }

@@ -11,6 +11,9 @@
 //! all stay (naming no device and no number) and the devices give way to the
 //! hidden card. A window without the guard (no host role here, a store that
 //! did not open, another Tornect holding it) says so and offers no control.
+//! "Turn on for a device…" opens the grant wizard in the section's place
+//! (`wizard`), offered while a paired device has no unattended access and
+//! never while this screen is shared.
 
 use egui::{RichText, Ui};
 use tornect_core::DeviceId;
@@ -152,10 +155,21 @@ pub(super) fn section(
     let t = theme::tokens(ui.ctx());
     widgets::section_header(ui, "Unattended access");
     let Some(manager) = &model.manager else {
+        form.wizard = None;
         line(ui, NO_GUARD, t.text_secondary);
         stopping(ui, t);
         return;
     };
+    if shared {
+        // A picture that leaves this screen never shows the wizard, and its
+        // passwords go with it.
+        form.wizard = None;
+    }
+    if form.wizard.is_some() {
+        super::wizard::draw(ui, model, manager, form, actions);
+        return;
+    }
+    super::wizard::forget_fields(ui.ctx(), true);
     let (tone, state) = header(manager, Day::today());
     ui.add_space(4.0);
     widgets::chip(ui, tone, true, &state);
@@ -193,6 +207,22 @@ pub(super) fn section(
         for row in &manager.grants {
             grant_row(ui, t, row, model.manager_busy, actions);
             ui.add_space(8.0);
+        }
+    }
+    if !shared {
+        match model.wizard.offer {
+            Some(true) => {
+                if Button::new(Kind::Secondary, super::wizard::OPEN)
+                    .small()
+                    .show(ui)
+                    .clicked()
+                {
+                    form.wizard = Some(super::wizard::Wizard::new());
+                    actions.push(Action::Manager(ManagerOp::WizardDevices));
+                }
+            }
+            Some(false) => line(ui, super::wizard::NO_DEVICE, t.text_secondary),
+            None => {}
         }
     }
     ui.add_space(20.0);
