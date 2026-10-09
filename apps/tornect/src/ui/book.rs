@@ -135,6 +135,7 @@ pub fn read(paths: &Paths, today: Day, derived: Option<&Known>) -> Book {
             .map(|d| {
                 let h = derived.and_then(|k| k.cached(d.device.public_key_bytes(), Role::Device));
                 Device {
+                    id: d.device,
                     label: d.label.clone(),
                     words: h.map(|h| h.words()),
                     identicon: h.map(|h| h.identicon()),

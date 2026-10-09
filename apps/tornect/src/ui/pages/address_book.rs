@@ -9,7 +9,8 @@ use egui::{Align, Layout, Margin, RichText, Sense, Stroke, Ui, WidgetInfo, Widge
 use tornect_core::TornectId;
 
 use super::super::icons::{self, Icon};
-use super::super::model::{Book, Check, ClientStage, Computer, Model};
+use super::super::model::{Book, Check, ClientStage, Computer, DeviceCard, Model, ViewOnly};
+use super::super::nav::Page;
 use super::super::theme::{self, Face, Tokens};
 use super::super::view::{Action, Form};
 use super::super::widgets::{self, Button, Kind, Tone};
@@ -155,7 +156,7 @@ pub(super) fn page(
     match form.book.tab {
         Tab::Computers => computers(ui, t, model, form, actions),
         Tab::Recent => recent(ui, t, book, actions),
-        Tab::Devices => devices(ui, t, book, !model.sharing.is_empty()),
+        Tab::Devices => devices(ui, t, model, form, !model.sharing.is_empty()),
     }
     ui.add_space(8.0);
 }
@@ -1016,8 +1017,47 @@ fn recent(ui: &mut Ui, t: &Tokens, book: &Book, actions: &mut Vec<Action>) {
     });
 }
 
-/// The Devices tab: who can ask to connect here (read-only in this version).
-fn devices(ui: &mut Ui, t: &Tokens, book: &Book, shared: bool) {
+/// The two View-only lines of a device's card (§B.8.6.1, decision M1-67).
+pub(super) const VIEW_ONLY_UNTIL: &str = "View only until it gets a new password";
+
+/// See [`VIEW_ONLY_UNTIL`]; `<device>` stands for the pinned label.
+pub(super) const VIEW_ONLY_ACCOUNT: &str = "View only: this computer's account settings make \
+    control administrator access, so control needs administrator access for <device>";
+
+/// The card's link to the manager (Settings, Security).
+pub(super) const MANAGE: &str = "Set up or manage unattended access…";
+
+/// A granted device's lines (§B.8.6.1): why its sessions are view only, if
+/// they are, and how many of its admin commands ran nothing.
+fn card_lines(ui: &mut Ui, t: &Tokens, label: &str, card: DeviceCard) {
+    let small = |ui: &mut Ui, text: &str, color| {
+        ui.label(
+            RichText::new(text)
+                .font(theme::font(ui.ctx(), Face::Regular, 12.0))
+                .color(color),
+        );
+    };
+    match card.view_only {
+        Some(ViewOnly::UntilNewPassword) => small(ui, VIEW_ONLY_UNTIL, t.warn),
+        Some(ViewOnly::AccountSettings) => {
+            small(ui, &VIEW_ONLY_ACCOUNT.replace("<device>", label), t.warn);
+        }
+        None => {}
+    }
+    if let Some(n) = card.nothing_ran {
+        small(
+            ui,
+            &format!("Admin commands that ran nothing: {n}"),
+            t.text_muted,
+        );
+    }
+}
+
+/// The Devices tab: who can ask to connect here (read-only in this version),
+/// each card with its unattended access's lines where it has some (§B.8.6.1)
+/// and the link to the manager.
+fn devices(ui: &mut Ui, t: &Tokens, model: &Model, form: &mut Form, shared: bool) {
+    let book = &model.book;
     if book.devices.is_empty() {
         widgets::card(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1056,6 +1096,21 @@ fn devices(ui: &mut Ui, t: &Tokens, book: &Book, shared: bool) {
                                         .font(theme::font(ui.ctx(), Face::Regular, 12.0))
                                         .color(t.text_muted),
                                 );
+                            }
+                            let card = model
+                                .wizard
+                                .cards
+                                .iter()
+                                .find(|(d, _)| *d == device.id)
+                                .map(|(_, card)| *card);
+                            if let Some(card) = card.filter(|_| !shared) {
+                                card_lines(ui, t, &device.label, card);
+                            }
+                            if !shared
+                                && Button::new(Kind::Ghost, MANAGE).small().show(ui).clicked()
+                            {
+                                form.page = Page::Settings;
+                                form.settings.section = super::settings::Section::Security;
                             }
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
