@@ -1,21 +1,28 @@
 //! Settings, Security: unattended access as this computer's own guard last
 //! read it (§B.8.7.3): whether it is on, off or paused, the devices that can
 //! connect without asking and what is known of each, and the readiness rows
-//! (§B.8.7.1 ⑥). The tokio side reads all of it by itself, so opening the
-//! section asks for nothing, and nothing here changes anything. While this
-//! screen may be in a picture that leaves it, the devices give way to the
+//! (§B.8.7.1 ⑥); then the desktop's screen-sharing grant and how to stop
+//! every session. The tokio side reads all of it by itself, so opening the
+//! section asks for nothing. Its controls are deny-direction (§B.8.6.2):
+//! each sends one operation that the window host's guard runs, and the
+//! section changes only when the guard's answer is read back. A pause is
+//! offered only while none runs, so no choice can end one sooner. While this
+//! screen may be in a picture that leaves it, Turn off, the pause and Revoke
+//! all stay (naming no device and no number) and the devices give way to the
 //! hidden card. A window without the guard (no host role here, a store that
-//! did not open, another Tornect holding it) says so and shows nothing else.
+//! did not open, another Tornect holding it) says so and offers no control.
 
 use egui::{RichText, Ui};
+use tornect_core::DeviceId;
 use tornect_core::address_book::Day;
 use tornect_core::session_log::Actor;
 use tornect_core::unattended::readiness::{Probe, row_title};
 
-use super::super::super::model::{GrantRow, Manager, Model};
+use super::super::super::model::{GrantRow, Manager, ManagerOp, Model, PauseEnd, Setup};
 use super::super::super::theme::{self, Face, Tokens};
-use super::super::super::widgets::{self, Tone};
-use super::line;
+use super::super::super::view::Action;
+use super::super::super::widgets::{self, Button, Kind, Tone};
+use super::{SettingsForm, line};
 
 /// What the section says when this window has no guard.
 pub(in super::super) const NO_GUARD: &str =
@@ -37,27 +44,83 @@ pub(in super::super) const EMPTY_PASSWORD: &str =
 pub(in super::super) const ADVISORY: &str = "Tornect cannot judge the strength of your OS \
     password; unattended access is only as safe as it.";
 
+/// Master off.
+pub(in super::super) const TURN_OFF: &str = "Turn off";
+
+/// The pause's ends, offered only while no pause runs (§B.8.6.2: 12 h and
+/// until re-enabled; the end at 08:00 waits for the operator's ruling, as
+/// this version keeps no time zone of the computer).
+pub(in super::super) const PAUSE_ENDS: [(PauseEnd, &str); 2] = [
+    (PauseEnd::TwelveHours, "For 12 hours"),
+    (PauseEnd::UntilOn, "Until I turn it back on"),
+];
+
+/// Revoke all, which asks first.
+pub(in super::super) const REVOKE_ALL: &str = "Revoke all…";
+
+/// Revoke all's question while this screen is shared: no number.
+pub(in super::super) const REVOKE_ALL_SHARED: &str = "Remove unattended access for every device?";
+
+/// The answer of Revoke all's question that removes.
+pub(in super::super) const REMOVE: &str = "Remove";
+
+/// An operation of a device's row, given the device.
+pub(in super::super) type RowOp = fn(DeviceId) -> ManagerOp;
+
+/// A row's operations, each deny-direction (§B.8.7.3).
+pub(in super::super) const ROW_OPS: [(&str, RowOp); 4] = [
+    ("Suspend", ManagerOp::Suspend),
+    ("Disable", ManagerOp::Disable),
+    ("Revoke unattended", ManagerOp::Revoke),
+    ("Remove device", ManagerOp::Remove),
+];
+
+/// How to end every session at once.
+pub(in super::super) const STOP_LINE: &str = "To end every session now: Stop in the sharing \
+    bar, or tornect panic in a terminal.";
+
+/// Revoke all's question naming how many devices lose their access.
+#[must_use]
+pub(in super::super) fn revoke_all_question(devices: usize) -> String {
+    match devices {
+        1 => "Remove unattended access for 1 device?".to_owned(),
+        n => format!("Remove unattended access for all {n} devices?"),
+    }
+}
+
 /// The Security section.
-pub(super) fn section(ui: &mut Ui, model: &Model, shared: bool) {
+pub(super) fn section(
+    ui: &mut Ui,
+    model: &Model,
+    form: &mut SettingsForm,
+    shared: bool,
+    actions: &mut Vec<Action>,
+) {
     let t = theme::tokens(ui.ctx());
     widgets::section_header(ui, "Unattended access");
     let Some(manager) = &model.manager else {
         line(ui, NO_GUARD, t.text_secondary);
+        stopping(ui, t);
         return;
     };
     let (tone, state) = header(manager, Day::today());
     ui.add_space(4.0);
     widgets::chip(ui, tone, true, &state);
+    ui.add_space(10.0);
+    header_controls(ui, manager, form, shared, actions);
+    if let Some(note) = model.manager_note {
+        line(ui, note, t.danger_text);
+    }
     ui.add_space(12.0);
     if shared {
         // How many devices there are, and which, is hidden with the
-        // address book.
+        // address book; their operations go with them.
         super::super::hidden_card(ui, super::WRITES_HIDDEN);
     } else if manager.grants.is_empty() {
         line(ui, NO_DEVICE, t.text_secondary);
     } else {
         for row in &manager.grants {
-            grant_row(ui, t, row);
+            grant_row(ui, t, row, actions);
             ui.add_space(8.0);
         }
     }
@@ -72,6 +135,139 @@ pub(super) fn section(ui: &mut Ui, model: &Model, shared: bool) {
     }
     ui.add_space(6.0);
     line(ui, ADVISORY, t.text_muted);
+    if let Some(setup) = &model.setup {
+        ui.add_space(20.0);
+        screen_sharing(ui, t, setup, !model.sharing.is_empty(), shared, actions);
+    }
+    stopping(ui, t);
+}
+
+/// Turn off and the pause's ends while unattended access is on (the ends
+/// only while no pause runs), and Revoke all with its question: while this
+/// screen is shared too, naming no device and no number.
+fn header_controls(
+    ui: &mut Ui,
+    manager: &Manager,
+    form: &mut SettingsForm,
+    shared: bool,
+    actions: &mut Vec<Action>,
+) {
+    if manager.on {
+        ui.horizontal_wrapped(|ui| {
+            if Button::new(Kind::Secondary, TURN_OFF)
+                .small()
+                .show(ui)
+                .clicked()
+            {
+                actions.push(Action::Manager(ManagerOp::Off));
+            }
+            if manager.paused_until.is_none() {
+                ui.label("Pause:");
+                for (end, label) in PAUSE_ENDS {
+                    if Button::new(Kind::Secondary, label)
+                        .small()
+                        .show(ui)
+                        .clicked()
+                    {
+                        actions.push(Action::Manager(ManagerOp::Pause(end)));
+                    }
+                }
+            }
+        });
+        ui.add_space(6.0);
+    }
+    if !shared && manager.grants.is_empty() {
+        form.revoke_all = false;
+        return;
+    }
+    if form.revoke_all {
+        let question = if shared {
+            REVOKE_ALL_SHARED.to_owned()
+        } else {
+            revoke_all_question(manager.grants.len())
+        };
+        ui.label(question);
+        ui.horizontal(|ui| {
+            if Button::new(Kind::Secondary, "Cancel")
+                .small()
+                .show(ui)
+                .clicked()
+            {
+                form.revoke_all = false;
+            }
+            if Button::new(Kind::Danger, REMOVE).small().show(ui).clicked() {
+                actions.push(Action::Manager(ManagerOp::RevokeAll));
+                form.revoke_all = false;
+            }
+        });
+    } else if Button::new(Kind::Danger, REVOKE_ALL)
+        .small()
+        .show(ui)
+        .clicked()
+    {
+        form.revoke_all = true;
+    }
+}
+
+/// The desktop's screen-sharing grant (§B.2.1's first-run step): its state,
+/// granting again and revoking through the step's own commands, which act
+/// only while the step exists. While this screen is shared, only the state.
+fn screen_sharing(
+    ui: &mut Ui,
+    t: &Tokens,
+    setup: &Setup,
+    sharing: bool,
+    shared: bool,
+    actions: &mut Vec<Action>,
+) {
+    widgets::section_header(ui, "Screen sharing on this desktop");
+    if setup.granted {
+        line(
+            ui,
+            "Granted and remembered: a session starts without the desktop's dialog.",
+            t.ok,
+        );
+    } else {
+        line(ui, "Not granted yet.", t.text_secondary);
+    }
+    if shared {
+        return;
+    }
+    ui.horizontal(|ui| {
+        let label = if setup.granted {
+            "Grant again"
+        } else {
+            "Grant screen sharing"
+        };
+        if Button::new(Kind::Secondary, label)
+            .small()
+            .enabled(!setup.busy && !sharing)
+            .show(ui)
+            .clicked()
+        {
+            actions.push(Action::Grant);
+        }
+        if setup.granted
+            && Button::new(Kind::Secondary, "Revoke")
+                .small()
+                .enabled(!setup.busy)
+                .show(ui)
+                .clicked()
+        {
+            actions.push(Action::Revoke);
+        }
+    });
+    if let Some(note) = &setup.note {
+        line(ui, note, t.text_secondary);
+    }
+}
+
+/// How every session ends at once (§B.6), and that the panic key's state is
+/// its readiness row.
+fn stopping(ui: &mut Ui, t: &Tokens) {
+    ui.add_space(20.0);
+    widgets::section_header(ui, "Stopping a session");
+    line(ui, STOP_LINE, t.text_secondary);
 }
 
 /// The header's state: on, off, or paused until when (UTC: this version
@@ -97,8 +293,8 @@ pub(in super::super) fn header(manager: &Manager, today: Day) -> (Tone, String) 
 
 /// One device's row: its pinned label, its state, its device words, who
 /// gave it access, when it last connected and its failed attempts since the
-/// last unlock (§B.8.7.3).
-fn grant_row(ui: &mut Ui, t: &Tokens, row: &GrantRow) {
+/// last unlock (§B.8.7.3), and its operations.
+fn grant_row(ui: &mut Ui, t: &Tokens, row: &GrantRow, actions: &mut Vec<Action>) {
     widgets::card(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
@@ -118,6 +314,17 @@ fn grant_row(ui: &mut Ui, t: &Tokens, row: &GrantRow) {
             );
         }
         line(ui, &details(row, Day::today()), t.text_secondary);
+        ui.horizontal_wrapped(|ui| {
+            for (label, op) in ROW_OPS {
+                if Button::new(Kind::Secondary, label)
+                    .small()
+                    .show(ui)
+                    .clicked()
+                {
+                    actions.push(Action::Manager(op(row.device)));
+                }
+            }
+        });
     });
 }
 
