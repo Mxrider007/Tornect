@@ -553,7 +553,7 @@ pub(crate) const NO_WINDOW_TO_SHOW: &str = "This Tornect host has no window to s
 /// the grant holds (`GrantOptions`), so a change made meanwhile is never
 /// undone and the widening branch of `set_options` is never reached; nothing
 /// read from the store fills them, and no input can raise the level.
-fn level_none_options() -> GrantOptions {
+pub(crate) fn level_none_options() -> GrantOptions {
     GrantOptions {
         elevation: Some(tornect_core::levels::Elevation::None),
         ..GrantOptions::default()
@@ -598,7 +598,7 @@ fn set_level_none(ctx: &HostContext, id: u64, by: Actor, device: &DeviceId) -> I
 /// presence that cannot be read counts as registered, decision M1-67); else,
 /// and for a device with view only, which reaches nothing that runs as
 /// administrator, nothing.
-fn keeps_at_the_level(ctx: &HostContext, device: &DeviceId) -> u8 {
+pub(crate) fn keeps_at_the_level(ctx: &HostContext, device: &DeviceId) -> u8 {
     let control = ctx
         .guard
         .store()

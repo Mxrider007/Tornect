@@ -1086,6 +1086,9 @@ pub enum ManagerOp {
     Disable(DeviceId),
     /// Remove the device's unattended access; it stays paired.
     Revoke(DeviceId),
+    /// Turn the device's administrator level off (deny-direction, as `tornect
+    /// unattended set-level <device> none`): a session of it at the level ends.
+    LevelOff(DeviceId),
     /// Remove the device: its unattended access, then its pairing.
     Remove(DeviceId),
 }
@@ -1205,6 +1208,10 @@ pub struct WizardView {
     pub raises: Option<(WizardChoice, Option<bool>)>,
     /// Each grant's mode, read with the manager's view (*Change mode*).
     pub modes: Vec<(DeviceId, SessionMode)>,
+    /// The last turn-off of a device's administrator level: the device, and
+    /// which clause of the turn-off sentence's condition holds (§B.8.7.1 ⑤a,
+    /// the command line's `SetLevelNonePayload` values).
+    pub level_off: Option<(DeviceId, u8)>,
     /// Each grant's administrator level and mark, read with the manager's
     /// view (decision M1-67): the raise, the restore and their lines.
     pub levels: Vec<(DeviceId, GrantLevel)>,
