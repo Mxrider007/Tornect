@@ -37,8 +37,9 @@ use super::block::GuiBlockWindow;
 use super::book::{self, Change};
 use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
 use super::model::{
-    CaptureNote, Check, ClientStage, Dial, Failure, GrantRow, Hosting, Manager, ManagerOp,
-    PauseEnd, Settings, SettingsChange, Shared, Sharing, TorState, UnattendedBanner, Viewing, Wake,
+    CaptureNote, Check, ClientStage, Dial, Failure, GrantRow, HostSetting, Hosting, Manager,
+    ManagerOp, PauseEnd, Settings, SettingsChange, Shared, Sharing, TorState, UnattendedBanner,
+    Viewing, Wake,
 };
 use super::recognize::Lookalike;
 use super::stream::{FrameSlot, SlotSink};
@@ -408,6 +409,11 @@ struct ManagerWatch {
     words: Arc<super::recognize::Recognizer>,
     /// The host's own paired devices, from which *Remove device* removes one.
     trusted: Arc<tornect_signal::pairing::TrustedDeviceStore>,
+    /// The window is closing: a stop code that arrives now is not shown,
+    /// and access is turned off again. Held while a code is put into the
+    /// model and while the closing window takes it back, so that one of the
+    /// two always sees the other.
+    closing: Mutex<bool>,
 }
 
 /// How long the shorter pause of Settings, Security lasts.
@@ -425,6 +431,9 @@ fn refusal(e: &tornect_core::unattended::guard::GuardError) -> &'static str {
         GuardError::KeystoreLocked(_) => "Not done: Tornect cannot read its keystore right now.",
         GuardError::StoreLocked(_) => {
             "Not done: another Tornect command is changing unattended access right now."
+        }
+        GuardError::NeedsPassword(_) => {
+            "Not done: this device needs a new password before its access can be enabled."
         }
         _ => "Not done: unattended access could not be changed.",
     }
@@ -480,6 +489,9 @@ impl ManagerWatch {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let (keep_awake, prevent_idle_lock, notify) = store
+            .read(|s| (s.keep_awake, s.prevent_idle_lock, s.notify))
+            .unwrap_or_default();
         let paused_until = report.paused_until.filter(|until| *until > now);
         let grants: Vec<GrantRow> = report
             .grants
@@ -513,6 +525,9 @@ impl ManagerWatch {
             grants,
             readiness: rows,
             not_ready,
+            keep_awake,
+            prevent_idle_lock,
+            notify,
         }
     }
 
@@ -541,6 +556,32 @@ impl ManagerWatch {
         };
         let mut paired_changed = false;
         let done: Result<(), &'static str> = match op {
+            ManagerOp::On => match guard.master_on(Actor::Ui, &self.ctx.host_onion_pk) {
+                Ok(ok) => {
+                    self.show_stop_code(&ok.stop_code, shared);
+                    Ok(())
+                }
+                Err(e) => Err(refusal(&e)),
+            },
+            ManagerOp::StopCodeWrittenDown => {
+                // Delivered: the only copy goes, wiped on drop.
+                shared.update(|m| m.stop_card = None);
+                Ok(())
+            }
+            ManagerOp::Enable(device) => guard.enable(Actor::Ui, &device).map_err(|e| refusal(&e)),
+            ManagerOp::Unlock(device) => guard.unlock(Actor::Ui, &device).map_err(|e| refusal(&e)),
+            ManagerOp::Resume(device) => guard.resume(Actor::Ui, &device).map_err(|e| refusal(&e)),
+            ManagerOp::Setting(setting) => {
+                let mut settings = tornect_core::unattended::guard::HostSettings::default();
+                match setting {
+                    HostSetting::KeepAwake(on) => settings.keep_awake = Some(on),
+                    HostSetting::PreventIdleLock(on) => settings.prevent_idle_lock = Some(on),
+                    HostSetting::Notify(on) => settings.notify = Some(on),
+                }
+                guard
+                    .set_settings(Actor::Ui, settings)
+                    .map_err(|e| refusal(&e))
+            }
             ManagerOp::Off => guard
                 .master_off(Actor::Ui)
                 .map(|()| end_sessions(bye::MASTER_OFF))
@@ -590,9 +631,50 @@ impl ManagerWatch {
                 Err(e) => Err(refusal(&e)),
             },
         };
-        shared.update(|m| m.manager_note = done.err());
+        shared.update(|m| {
+            m.manager_note = done.err();
+            m.manager_busy = false;
+        });
         self.refresh(shared);
         paired_changed
+    }
+
+    /// Put the stop code `code` of a *Turn on* into the model as the one card
+    /// (§B.8.7.4), grouped as the command line prints it; a window already
+    /// closing never shows it and turns access off again instead.
+    fn show_stop_code(&self, code: &[u8; 16], shared: &Shared) {
+        let closing = self.closing.lock().unwrap_or_else(PoisonError::into_inner);
+        if *closing {
+            self.undelivered();
+            return;
+        }
+        let card = Secret(crate::unattended::format_stop_code(code));
+        shared.update(|m| m.stop_card = Some(card));
+    }
+
+    /// The window is closing: a stop code still on its card was never
+    /// confirmed as written down, so unattended access must not stay on
+    /// under it (§B.8.7.4): the code is dropped and access turned off again.
+    fn close_undelivered(&self, shared: &Shared) {
+        let mut closing = self.closing.lock().unwrap_or_else(PoisonError::into_inner);
+        *closing = true;
+        let mut card = None;
+        shared.update_quiet(|m| card = m.stop_card.take());
+        if card.is_some() {
+            drop(card);
+            self.undelivered();
+        }
+    }
+
+    /// Turn unattended access off because its stop code was not delivered.
+    fn undelivered(&self) {
+        use tornect_core::session_log::Actor;
+        if let Err(e) = self.ctx.guard.master_off_undelivered_stop_code(Actor::Ui) {
+            tracing::warn!(
+                code = e.code(),
+                "a stop code nobody holds: access not turned off"
+            );
+        }
     }
 }
 
@@ -872,6 +954,7 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
             },
             words: Arc::clone(&b.words),
             trusted: Arc::clone(&deps.trusted),
+            closing: Mutex::new(false),
         })
     });
     if let Some(watch) = &manager {
@@ -1334,6 +1417,22 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     Command::SaveSettings(change) => save_settings(&b.paths, &b.shared, &change),
                     Command::Manager(op) => {
                         if let Some(manager) = hosted.as_ref().and_then(|h| h.manager.clone()) {
+                            // One password dialog at a time: an operation that
+                            // asks for one waits for none other.
+                            let asks = matches!(
+                                op,
+                                ManagerOp::On
+                                    | ManagerOp::Enable(_)
+                                    | ManagerOp::Unlock(_)
+                                    | ManagerOp::Resume(_)
+                                    | ManagerOp::Setting(_)
+                            );
+                            if asks {
+                                if b.shared.read(|m| m.manager_busy) {
+                                    continue;
+                                }
+                                b.shared.update(|m| m.manager_busy = true);
+                            }
                             let b = Arc::clone(&b);
                             // Off the command loop: the guard writes the store
                             // and the log.
@@ -1449,6 +1548,12 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
         }
     }
 
+    // A stop code shown but never confirmed as written down: unattended
+    // access does not stay on under a card nobody holds (§B.8.7.4).
+    if let Some(manager) = hosted.as_ref().and_then(|h| h.manager.clone()) {
+        let shared = Arc::clone(&b.shared);
+        let _ = tokio::task::spawn_blocking(move || manager.close_undelivered(&shared)).await;
+    }
     // Shutting down: the notifications go with the window, the sessions end
     // (`end_sessions`), every media stream gets its `Close`, then Tor goes.
     drop(notices);
@@ -2580,6 +2685,7 @@ mod tests {
             },
             words: Arc::new(super::super::recognize::Recognizer::default()),
             trusted: Arc::new(TrustedDeviceStore::ephemeral(Default::default())),
+            closing: Mutex::new(false),
         };
         let shared = Shared::new(Model::default(), Arc::new(|_| {}));
         watch.refresh(&shared);
@@ -2710,6 +2816,7 @@ mod tests {
             },
             words: Arc::new(super::super::recognize::Recognizer::default()),
             trusted: Arc::clone(&trusted),
+            closing: Mutex::new(false),
         };
         let shared = Shared::new(Model::default(), Arc::new(|_| {}));
         let state = |device: tornect_core::DeviceId| {
@@ -2763,6 +2870,381 @@ mod tests {
         assert_eq!(shared.read(|m| m.manager_note), None);
         let view = shared.read(|m| m.manager.clone()).expect("read again");
         assert!(!view.on && view.grants.is_empty());
+    }
+
+    /// A window host's view of unattended access over a fresh store in
+    /// `home` (the machine `machine`): its guard asks `reauth`, sees
+    /// `activity` and reads `account`; every device counts as paired.
+    fn manager_over(
+        home: &std::path::Path,
+        reauth: Arc<dyn tornect_core::unattended::guard::ReAuth>,
+        activity: Arc<dyn tornect_core::unattended::guard::RemoteSessionActivity>,
+        account: tornect_core::levels::AccountFacts,
+        machine: &[u8],
+    ) -> ManagerWatch {
+        use tornect_core::keystore::FileSecretStore;
+        use tornect_core::session_log::SessionLog;
+        use tornect_core::unattended::clock::SystemClock;
+        use tornect_core::unattended::guard::{
+            AllowAllPaired, MutationGuard, RandomServerSetupSource,
+        };
+        use tornect_core::unattended::readiness::SharedReadiness;
+        use tornect_core::unattended::store::GrantStore;
+        let paths = Paths::from_home(home);
+        paths.ensure().unwrap();
+        let secrets = Arc::new(FileSecretStore::open(paths.keys_dir()).unwrap());
+        let log = SessionLog::new(paths.sessions_log());
+        let store = GrantStore::open_with_machine_id(
+            &paths,
+            secrets,
+            Arc::new(SystemClock::default()),
+            log.clone(),
+            Some(machine.to_vec()),
+        )
+        .unwrap();
+        let facts: Arc<dyn tornect_core::levels::FactsSource> =
+            Arc::new(tornect_core::levels::FixedFacts::new(
+                account,
+                tornect_core::levels::HelperPresence::Absent,
+            ));
+        let guard = Arc::new(
+            MutationGuard::new(store, reauth, activity, Arc::clone(&facts))
+                .with_paired_devices(Arc::new(AllowAllPaired))
+                .with_server_setup_source(Arc::new(RandomServerSetupSource)),
+        );
+        ManagerWatch {
+            ctx: crate::unattended::HostContext {
+                guard,
+                host_onion_pk: [0x42; 32],
+                readiness: SharedReadiness::default(),
+                autostart: Arc::new(tornect_platform::autostart::NoAutostart("test".to_owned())),
+                user_inputs: Vec::new(),
+                kill: Some(KillSwitch::new()),
+                log,
+                facts,
+                show: None,
+                indicator: None,
+            },
+            words: Arc::new(super::super::recognize::Recognizer::default()),
+            trusted: Arc::new(TrustedDeviceStore::ephemeral(Default::default())),
+            closing: Mutex::new(false),
+        }
+    }
+
+    /// The emergency stop code as the window's card holds it, read back
+    /// into its 16 bytes.
+    fn card_bytes(text: &str) -> [u8; 16] {
+        let hex: String = text.chars().filter(char::is_ascii_hexdigit).collect();
+        let mut out = [0u8; 16];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
+    }
+
+    /// §B.8.7.4: *Turn on* asks for the password once and shows the new stop
+    /// code on one card, grouped as the command line prints it: the code the
+    /// store's token was made from, and nowhere in the model's `Debug`. A
+    /// second Turn on replaces the card (the old code stops working); the
+    /// click on "I have written it down" drops it, and access stays on.
+    #[test]
+    fn master_on_shows_the_stop_code_once() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity, stop_token};
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let watch = manager_over(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(NoSessionActivity),
+            tornect_core::levels::AccountFacts::Linux,
+            b"this machine",
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.run(ManagerOp::On, &shared);
+        assert_eq!(reauth.calls(), ["master_on"]);
+        let card = shared.read(|m| m.stop_card.clone()).expect("a card");
+        let groups: Vec<String> = card.0.split('-').map(str::to_owned).collect();
+        assert_eq!(groups.len(), 8, "eight groups");
+        assert!(
+            groups
+                .iter()
+                .all(|g| g.len() == 4 && g.chars().all(|c| c.is_ascii_hexdigit()))
+        );
+        let token = watch.ctx.guard.store().read(|s| s.stop_token).flatten();
+        assert_eq!(token, Some(stop_token(&[0x42; 32], &card_bytes(&card.0))));
+        let debug = shared.read(|m| format!("{m:?}"));
+        assert!(
+            debug.contains("Secret(<redacted>)"),
+            "the card is in the model"
+        );
+        assert!(!debug.contains(card.0.as_str()));
+        for pair in groups.windows(2) {
+            assert!(!debug.contains(&pair.join("-")), "{pair:?}");
+        }
+        watch.run(ManagerOp::On, &shared);
+        let second = shared.read(|m| m.stop_card.clone()).expect("one card");
+        assert!(second.0 != card.0, "a new code replaces the card");
+        watch.run(ManagerOp::StopCodeWrittenDown, &shared);
+        assert!(
+            shared.read(|m| m.stop_card.is_none()),
+            "dropped on the click"
+        );
+        assert!(watch.ctx.guard.store().read(|s| s.enabled).unwrap());
+    }
+
+    /// §B.8.7.4: a stop code whose card ends without the click (the window
+    /// closed, Quit, the tokio side shutting down) leaves no access on under
+    /// it: the closing window turns unattended access off again first, logged
+    /// as a code not delivered, also after the card was hidden while this
+    /// screen was shared; a Turn on that returns once the window is closing
+    /// shows nothing and turns access off at once; a delivered code changes
+    /// nothing at the close.
+    #[test]
+    fn a_stop_card_closed_without_the_click_turns_access_off_again() {
+        use tornect_core::session_log::SessionEvent;
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let open = |home: &std::path::Path| {
+            manager_over(
+                home,
+                Arc::new(AllowAllReAuth::default()),
+                Arc::new(NoSessionActivity),
+                tornect_core::levels::AccountFacts::Linux,
+                b"this machine",
+            )
+        };
+        let on = |watch: &ManagerWatch| watch.ctx.guard.store().read(|s| s.enabled).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = open(tmp.path());
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.run(ManagerOp::On, &shared);
+        assert!(shared.read(|m| m.stop_card.is_some()) && on(&watch));
+        shared.update(|m| m.hosted_elsewhere = true);
+        watch.close_undelivered(&shared);
+        assert!(shared.read(|m| m.stop_card.is_none()), "the code is gone");
+        assert!(!on(&watch), "access is off again");
+        assert_eq!(
+            watch.ctx.guard.store().read(|s| s.stop_token).flatten(),
+            None
+        );
+        assert!(watch.ctx.log.read_all().unwrap().iter().any(|r| {
+            r.event == SessionEvent::UnattendedDisabled
+                && r.reason.as_deref() == Some("stop code not delivered")
+        }));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = open(tmp.path());
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.close_undelivered(&shared);
+        watch.run(ManagerOp::On, &shared);
+        assert!(shared.read(|m| m.stop_card.is_none()), "never shown");
+        assert!(!on(&watch), "off at once");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = open(tmp.path());
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.run(ManagerOp::On, &shared);
+        watch.run(ManagerOp::StopCodeWrittenDown, &shared);
+        watch.close_undelivered(&shared);
+        assert!(on(&watch), "a delivered code changes nothing");
+    }
+
+    /// §B.8.6.2: each access-increasing operation of Settings, Security asks
+    /// for the password once, under its own name: Turn on, Enable, Resume,
+    /// Unlock and a host setting; each then does what the guard says.
+    #[test]
+    fn access_increasing_ops_reauth_once_each() {
+        use tornect_core::session_log::Actor;
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        use tornect_core::unattended::ipc::GrantOptions;
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let watch = manager_over(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(NoSessionActivity),
+            tornect_core::levels::AccountFacts::Linux,
+            b"this machine",
+        );
+        let guard = Arc::clone(&watch.ctx.guard);
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let asks = |op: ManagerOp| {
+            let before = reauth.calls().len();
+            watch.run(op, &shared);
+            assert_eq!(shared.read(|m| m.manager_note), None, "{op:?}");
+            reauth.calls()[before..].to_vec()
+        };
+        assert_eq!(asks(ManagerOp::On), ["master_on"]);
+        watch.run(ManagerOp::StopCodeWrittenDown, &shared);
+        let [a, b, c] = [1u8, 2, 3].map(|i| tornect_core::DeviceId::from_bytes([i; 32]));
+        for device in [a, b, c] {
+            guard
+                .create_grant(
+                    Actor::Cli,
+                    &device,
+                    Preset::HeadlessBox,
+                    &GrantOptions::default(),
+                    &[0u8; 192],
+                    false,
+                )
+                .unwrap();
+        }
+        let state = |device| {
+            guard
+                .store()
+                .status_report(Default::default())
+                .grants
+                .into_iter()
+                .find(|g| g.device == device)
+                .map(|g| g.state)
+        };
+        assert!(asks(ManagerOp::Disable(a)).is_empty(), "deny-direction");
+        assert_eq!(asks(ManagerOp::Enable(a)), ["enable"]);
+        assert_eq!(state(a).as_deref(), Some("active"));
+        assert!(asks(ManagerOp::Suspend(b)).is_empty(), "deny-direction");
+        assert_eq!(asks(ManagerOp::Resume(b)), ["resume"]);
+        assert_eq!(state(b).as_deref(), Some("active"));
+        assert_eq!(asks(ManagerOp::Unlock(c)), ["unlock"]);
+        assert_eq!(
+            asks(ManagerOp::Setting(HostSetting::KeepAwake(true))),
+            ["set_settings"]
+        );
+        assert!(guard.store().read(|s| s.keep_awake).unwrap());
+        assert!(shared.read(|m| m.manager.as_ref().is_some_and(|v| v.keep_awake)));
+        assert!(!shared.read(|m| m.manager_busy));
+    }
+
+    /// §B.8.6.2: a password not confirmed changes nothing: Turn on leaves
+    /// access off with no stop code, a host setting stays as it was, and the
+    /// section shows what it showed, with the refusal in plain words.
+    #[test]
+    fn a_refused_reauth_leaves_store_and_page_unchanged() {
+        use tornect_core::unattended::guard::{DenyAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = manager_over(
+            tmp.path(),
+            Arc::new(DenyAllReAuth),
+            Arc::new(NoSessionActivity),
+            tornect_core::levels::AccountFacts::Linux,
+            b"this machine",
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.refresh(&shared);
+        let before = shared.read(|m| m.manager.clone());
+        watch.run(ManagerOp::On, &shared);
+        assert_eq!(
+            shared.read(|m| m.manager_note),
+            Some("Not done: this computer's password was not confirmed.")
+        );
+        assert!(shared.read(|m| m.stop_card.is_none()));
+        assert!(!watch.ctx.guard.store().read(|s| s.enabled).unwrap_or(false));
+        assert_eq!(
+            shared.read(|m| m.manager.clone()),
+            before,
+            "the page as it was"
+        );
+        watch.run(ManagerOp::Setting(HostSetting::Notify(true)), &shared);
+        assert!(shared.read(|m| m.manager_note.is_some()));
+        assert_eq!(shared.read(|m| m.manager.clone()), before);
+    }
+
+    /// §B.8.6.2: no access-increasing operation runs during a remote session
+    /// or in the 60 s after one: the window's refuses before any dialog, in
+    /// plain words, and nothing changes.
+    #[test]
+    fn access_increasing_ops_wait_for_the_remote_session_rule() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, RemoteSessionActivity};
+        struct Live;
+        impl RemoteSessionActivity for Live {
+            fn last_session_ended_at(&self) -> Option<Instant> {
+                None
+            }
+            fn session_live(&self) -> bool {
+                true
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let watch = manager_over(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(Live),
+            tornect_core::levels::AccountFacts::Linux,
+            b"this machine",
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.run(ManagerOp::On, &shared);
+        assert_eq!(
+            shared.read(|m| m.manager_note),
+            Some("Not done: a remote session is running, or ended less than a minute ago.")
+        );
+        assert!(reauth.calls().is_empty(), "no dialog");
+        assert!(shared.read(|m| m.stop_card.is_none()));
+        assert!(!watch.ctx.guard.store().read(|s| s.enabled).unwrap_or(false));
+    }
+
+    /// Decision M1-67: a grant that holds the administrator level and was
+    /// restored on another machine (disabled and marked) is not enabled from
+    /// the window until a new generated password cleared its mark: Enable is
+    /// refused, said in plain words, and the grant stays disabled.
+    #[test]
+    fn enabling_a_marked_admin_grant_is_refused_until_a_new_password() {
+        use tornect_core::levels::{AccountFacts, WindowsFacts};
+        use tornect_core::session_log::Actor;
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        use tornect_core::unattended::ipc::GrantOptions;
+        let windows = AccountFacts::Windows(WindowsFacts {
+            installed: true,
+            administrator: true,
+            ..WindowsFacts::default()
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let device = tornect_core::DeviceId::from_bytes([7; 32]);
+        {
+            let watch = manager_over(
+                tmp.path(),
+                Arc::new(AllowAllReAuth::default()),
+                Arc::new(NoSessionActivity),
+                windows,
+                b"the first machine",
+            );
+            let guard = &watch.ctx.guard;
+            guard.master_on(Actor::Cli, &[0x42; 32]).unwrap();
+            guard
+                .create_grant(
+                    Actor::Cli,
+                    &device,
+                    Preset::HeadlessBox,
+                    &GrantOptions {
+                        elevation: Some(Elevation::Admin),
+                        ..GrantOptions::default()
+                    },
+                    &[0u8; 192],
+                    true,
+                )
+                .unwrap();
+            let grant = guard.store().grant(&device).unwrap();
+            assert!(grant.holds_level() && !grant.marked());
+        }
+        let watch = manager_over(
+            tmp.path(),
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            windows,
+            b"another machine",
+        );
+        let grant = watch.ctx.guard.store().grant(&device).unwrap();
+        assert!(grant.holds_level() && grant.marked(), "restored: marked");
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.run(ManagerOp::Enable(device), &shared);
+        assert_eq!(
+            shared.read(|m| m.manager_note),
+            Some("Not done: this device needs a new password before its access can be enabled.")
+        );
+        let view = shared.read(|m| m.manager.clone()).expect("read");
+        assert_eq!(view.grants[0].state, "disabled:restore");
     }
 
     /// The row "indicator shown" as the host at `state_dir` answers it over

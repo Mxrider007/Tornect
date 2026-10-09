@@ -2350,6 +2350,9 @@ mod tests {
             ],
             readiness: vec![("panic_key", Probe::Ok), ("capture", Probe::Unknown)],
             not_ready: true,
+            keep_awake: false,
+            prevent_idle_lock: false,
+            notify: false,
         }
     }
 
@@ -2587,11 +2590,17 @@ mod tests {
     }
 
     /// Every control of Settings, Security over [`manager_on`]: Turn off,
-    /// the pause's ends, Revoke all and each row's operations.
+    /// the pause's ends, Revoke all, each row's operations (the locked
+    /// device's Unlock among them) and the host settings' switches.
     fn security_controls() -> Vec<&'static str> {
-        let mut controls = vec![settings::security::TURN_OFF, settings::security::REVOKE_ALL];
+        let mut controls = vec![
+            settings::security::TURN_OFF,
+            settings::security::REVOKE_ALL,
+            "Unlock",
+        ];
         controls.extend(settings::security::PAUSE_ENDS.map(|(_, label)| label));
         controls.extend(settings::security::ROW_OPS.map(|(label, _)| label));
+        controls.extend(settings::security::SETTINGS.map(|(label, _)| label));
         controls
     }
 
@@ -2807,6 +2816,61 @@ mod tests {
                 "{size:?}"
             );
         }
+    }
+
+    /// §B.8.7.4: the stop code is drawn on one card, once, as text, with
+    /// what it does and that it is shown only now; not while this screen is
+    /// shared and not under a sheet (it is kept, and drawn again after);
+    /// "I have written it down" sends the delivery and nothing else.
+    #[test]
+    fn the_stop_card_is_one_card_until_written_down() {
+        use super::super::backend::Secret;
+        use super::super::model::ManagerOp;
+        use settings::security;
+        let code = "0a1b-2c3d-4e5f-6a7b-8c9d-0e1f-2a3b-4c5d";
+        let mut model = at_rest();
+        model.manager = Some(one_device());
+        model.stop_card = Some(Secret(zeroize::Zeroizing::new(code.to_owned())));
+        for size in [WIDE, NARROW] {
+            let mut window = security_section(model.clone(), size);
+            let shown = window
+                .nodes
+                .iter()
+                .filter(|n| n.value().is_some_and(|v| v.contains("0a1b-2c3d")))
+                .count();
+            assert_eq!(shown, 1, "{size:?}: one card");
+            for text in [
+                security::STOP_HEADING,
+                security::STOP_DOES,
+                security::WRITE_IT_DOWN,
+            ] {
+                assert!(has_text(&window, text), "{size:?}: {text}");
+            }
+            let at = window.center(security::WRITTEN_DOWN);
+            assert_eq!(
+                window.click(at),
+                vec![Action::Manager(ManagerOp::StopCodeWrittenDown)],
+                "{size:?}"
+            );
+        }
+        let mut shared = model.clone();
+        shared.hosted_elsewhere = true;
+        let window = security_section(shared, WIDE);
+        assert!(!has_text(&window, "0a1b-2c3d"), "not while shared");
+        assert!(!has_text(&window, security::STOP_HEADING));
+        let mut asking = model;
+        asking.popups = vec![Popup {
+            id: 5,
+            kind: PopupKind::Session {
+                label: "Laptop".to_owned(),
+                fingerprint: "ab:cd".to_owned(),
+            },
+            deadline: Instant::now() + Duration::from_secs(60),
+        }];
+        let mut window = Window::new(asking, Page::Settings, egui::Theme::Dark, WIDE);
+        window.form.settings.section = settings::Section::Security;
+        window.pass(Vec::new());
+        assert!(!has_text(&window, "0a1b-2c3d"), "not under a sheet");
     }
 
     /// The Privacy section, opened from the section list.

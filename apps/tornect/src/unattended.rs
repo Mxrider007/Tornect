@@ -2132,7 +2132,7 @@ fn host_onion_pk(paths: &Paths) -> anyhow::Result<[u8; 32]> {
 /// `xxxx-xxxx-xxxx-xxxx …` — grouped so it can be read aloud and written down.
 /// Built in one buffer sized up front and wiped on drop: no intermediate copy of
 /// the code is left behind (§B.8.7.2, A14).
-fn format_stop_code(code: &[u8; 16]) -> zeroize::Zeroizing<String> {
+pub(crate) fn format_stop_code(code: &[u8; 16]) -> zeroize::Zeroizing<String> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = zeroize::Zeroizing::new(String::with_capacity(48));
     for (i, b) in code.iter().enumerate() {
