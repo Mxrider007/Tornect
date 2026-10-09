@@ -3398,6 +3398,30 @@ mod tests {
         assert!(!has_text(&window, home::NAME_QUESTION));
     }
 
+    /// While this screen may be in a picture that leaves it (here another
+    /// Tornect process hosts this home), the first run's question is not
+    /// drawn: Home shows the hidden card in its place, with no name field,
+    /// no Save and no Skip.
+    #[test]
+    fn home_hides_the_name_question_while_shared() {
+        let mut model = at_rest();
+        model.name_question = true;
+        model.hosted_elsewhere = true;
+        for size in [WIDE, NARROW] {
+            let window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, size);
+            assert!(has_text(&window, HIDDEN_WHILE_SHARED), "{size:?}");
+            assert!(!has_text(&window, home::NAME_QUESTION), "{size:?}");
+            assert!(
+                window.nodes.iter().all(|n| n.role() != Role::TextInput),
+                "{size:?}: no name field"
+            );
+            let controls = window.controls();
+            for gone in ["Save", "Skip"] {
+                assert!(!controls.iter().any(|c| c == gone), "{size:?}: {gone}");
+            }
+        }
+    }
+
     /// §B.8.6.1 (decision M1-67): on the address book's Devices tab a granted
     /// device's card says why its sessions are view only, in the plan's two
     /// lines (its password marked; this computer's account settings, with the
