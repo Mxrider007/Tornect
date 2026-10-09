@@ -283,6 +283,16 @@ fn wayland(el: &ActiveEventLoop) -> bool {
 /// The stream window's title: it names neither the host nor its address.
 pub const STREAM_TITLE: &str = "Tornect: remote screen";
 
+/// How egui draws the saved theme: "Match the system" follows the theme
+/// the desktop reports, and dark while it reports none.
+fn preference(theme: tornect_core::config::Theme) -> egui::ThemePreference {
+    match theme {
+        tornect_core::config::Theme::Dark => egui::ThemePreference::Dark,
+        tornect_core::config::Theme::Light => egui::ThemePreference::Light,
+        tornect_core::config::Theme::System => egui::ThemePreference::System,
+    }
+}
+
 /// One window with its egui context, input state and painter.
 struct Surface {
     window: Arc<Window>,
@@ -301,7 +311,7 @@ impl Surface {
         el: &ActiveEventLoop,
         attrs: WindowAttributes,
         setup: WgpuSetup,
-        theme: egui::Theme,
+        theme: egui::ThemePreference,
         transparent: bool,
     ) -> anyhow::Result<Self> {
         let window = Arc::new(el.create_window(attrs)?);
@@ -580,8 +590,9 @@ pub struct App {
     /// The main window's title: a connect-only instance says so, so that two
     /// instances on one desktop can be told apart.
     pub title: &'static str,
-    /// The theme every window draws with.
-    pub theme: egui::Theme,
+    /// The theme every window draws with: the one saved in the settings,
+    /// from the model (`Settings::theme`).
+    theme: egui::ThemePreference,
     /// The main window's height (the preview opens a taller one for a card
     /// low on its page).
     pub height: f64,
@@ -606,6 +617,7 @@ impl App {
         link: Arc<StreamLink>,
         commands: mpsc::UnboundedSender<Command>,
     ) -> Self {
+        let theme = preference(shared.read(|m| m.settings.theme));
         Self {
             shared,
             popups,
@@ -626,11 +638,31 @@ impl App {
             quit_at: None,
             stream_at: None,
             title: "Tornect",
-            theme: egui::Theme::Dark,
+            theme,
             height: 760.0,
             background: None,
             screenshots: false,
             error: None,
+        }
+    }
+
+    /// Draw every window in the theme the settings hold now: a theme chosen
+    /// on the settings page applies once it is saved, without a restart.
+    fn sync_theme(&mut self) {
+        let theme = preference(self.shared.read(|m| m.settings.theme));
+        if theme == self.theme {
+            return;
+        }
+        self.theme = theme;
+        let surfaces = self
+            .main
+            .iter()
+            .chain(self.stream.iter().map(|v| &v.surface))
+            .chain(self.indicator.iter())
+            .chain(self.blocks.iter().map(|b| &b.surface));
+        for surface in surfaces {
+            surface.ctx.set_theme(theme);
+            surface.window.request_redraw();
         }
     }
 
@@ -1250,6 +1282,7 @@ impl App {
             Action::SaveEntry(id, name) => self.command(Command::SaveEntry(id, name)),
             Action::ClearHistory => self.command(Command::ClearHistory),
             Action::SetHistory(on) => self.command(Command::SetHistory(on)),
+            Action::SaveSettings(change) => self.command(Command::SaveSettings(change)),
             Action::AskPassword(id) => {
                 self.form.ua.clear();
                 self.command(Command::AskPassword(id, None, None));
@@ -1498,6 +1531,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.quit_at.is_some() {
                     self.quit(el);
                 }
+                self.sync_theme();
                 self.sync_stream(el);
                 self.sync_indicator(el);
                 self.sync_blocks(el);
@@ -1796,6 +1830,50 @@ mod tests {
             App::new(shared, popups, Arc::new(StreamLink::default()), tx),
             rx,
         )
+    }
+
+    /// Settings, General: a theme chosen on the page goes to the tokio side
+    /// as one change, and once it is saved (the model holds it) the windows
+    /// draw with it, without a restart; a window starts with the saved one.
+    /// "Match the system" follows the desktop's theme.
+    #[test]
+    fn the_theme_choice_applies_at_once() {
+        use super::super::model::SettingsChange;
+        use tornect_core::config::Theme;
+        let (mut app, mut rx) = app();
+        assert_eq!(app.theme, egui::ThemePreference::Dark);
+        app.act(
+            Action::SaveSettings(SettingsChange::Theme(Theme::Light)),
+            None,
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Ok(Command::SaveSettings(SettingsChange::Theme(Theme::Light)))
+        );
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        app.sync_theme();
+        assert_eq!(
+            app.theme,
+            egui::ThemePreference::Dark,
+            "not before it is saved"
+        );
+        for (saved, drawn) in [
+            (Theme::Light, egui::ThemePreference::Light),
+            (Theme::System, egui::ThemePreference::System),
+            (Theme::Dark, egui::ThemePreference::Dark),
+        ] {
+            app.shared.update(|m| m.settings.theme = saved);
+            app.sync_theme();
+            assert_eq!(app.theme, drawn);
+        }
+
+        let mut model = Model::default();
+        model.settings.theme = Theme::Light;
+        let shared = Shared::new(model, Arc::new(|_| {}));
+        let popups = Popups::new(Arc::clone(&shared));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let started = App::new(shared, popups, Arc::new(StreamLink::default()), tx);
+        assert_eq!(started.theme, egui::ThemePreference::Light);
     }
 
     /// §B.1.1 (decision M1-58): in background mode the row "indicator shown"

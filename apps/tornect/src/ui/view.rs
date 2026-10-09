@@ -16,7 +16,8 @@ use tornect_signal::fsm::timeouts;
 use tornect_signal::pairing::{PairDecision, SessionDecision};
 
 use super::model::{
-    BlockRequest, Confirm, Model, Popup, PopupKind, Prompt, Recognition, Sharing, SheetLevels,
+    BlockRequest, Confirm, Model, Popup, PopupKind, Prompt, Recognition, SettingsChange, Sharing,
+    SheetLevels,
 };
 #[cfg(test)]
 use super::model::{ClientStage, Hosting, Setup, TorState, Viewing};
@@ -179,6 +180,9 @@ pub enum Action {
     ClearHistory,
     /// Keep a history of connections, or stop keeping one.
     SetHistory(bool),
+    /// Save one change of the settings pages in `config.toml` (never an
+    /// operation of §B.8.6.2).
+    SaveSettings(SettingsChange),
     /// Open the password prompt for an unattended connect to this computer
     /// (§B.8.10): the prompt comes before anything is dialed.
     AskPassword(TornectId),
@@ -263,6 +267,8 @@ pub struct Form {
     pub qr: bool,
     /// The address book page's own state.
     pub book: pages::BookForm,
+    /// The settings page's own state.
+    pub settings: pages::SettingsForm,
     /// The password prompt's fields.
     pub ua: UaForm,
     /// What the request sheet last kept in view: its viewport's size, its

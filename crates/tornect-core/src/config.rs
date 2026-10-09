@@ -31,6 +31,8 @@ pub struct Config {
     pub media: Media,
     /// Host-side safety controls (§B.6).
     pub security: Security,
+    /// The stream window's defaults when a session opens.
+    pub viewer: Viewer,
 }
 
 /// Naming and startup.
@@ -41,6 +43,75 @@ pub struct General {
     pub device_name: String,
     /// Start the host service at login (needed for unattended access).
     pub autostart: bool,
+    /// The window's colours (the settings page's General section).
+    pub theme: Theme,
+}
+
+/// The window's colours (`[general] theme = "…"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    /// Light text on a dark background (the default).
+    #[default]
+    Dark,
+    /// Dark text on a light background.
+    Light,
+    /// Whichever of the two the operating system uses.
+    System,
+}
+
+/// The stream window's defaults when a session opens (`[viewer]`); each
+/// default is what the window did before it could be chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Viewer {
+    /// The picture fitted to the window, or at its own size.
+    pub picture: Picture,
+    /// The window opens full screen.
+    pub fullscreen_at_open: bool,
+    /// When the toolbar hides after the pointer last moved.
+    pub toolbar_hides: ToolbarHides,
+    /// The toolbar shows the connection's badge (the frame rate and size).
+    pub show_badge: bool,
+}
+
+/// How the stream window shows the picture (`[viewer] picture = "…"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Picture {
+    /// Fitted to the window.
+    #[default]
+    Fit,
+    /// At its own size, with scroll bars.
+    OneToOne,
+}
+
+/// When the stream window's toolbar hides (`[viewer] toolbar_hides = "…"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ToolbarHides {
+    /// 2.5 seconds after the pointer last moved.
+    #[default]
+    #[serde(rename = "after-2.5s")]
+    After2_5s,
+    /// 5 seconds after the pointer last moved.
+    #[serde(rename = "after-5s")]
+    After5s,
+    /// Never: the toolbar stays.
+    #[serde(rename = "never")]
+    Never,
+}
+
+impl ToolbarHides {
+    /// How long after the pointer last moved the toolbar hides; `None`:
+    /// never.
+    #[must_use]
+    pub const fn after(self) -> Option<std::time::Duration> {
+        match self {
+            Self::After2_5s => Some(std::time::Duration::from_millis(2500)),
+            Self::After5s => Some(std::time::Duration::from_secs(5)),
+            Self::Never => None,
+        }
+    }
 }
 
 /// Connectivity and privacy mode.
@@ -176,6 +247,7 @@ impl Default for Config {
             tor: Tor::default(),
             media: Media::default(),
             security: Security::default(),
+            viewer: Viewer::default(),
         }
     }
 }
@@ -185,6 +257,18 @@ impl Default for General {
         Self {
             device_name: default_device_name(),
             autostart: false,
+            theme: Theme::Dark,
+        }
+    }
+}
+
+impl Default for Viewer {
+    fn default() -> Self {
+        Self {
+            picture: Picture::Fit,
+            fullscreen_at_open: false,
+            toolbar_hides: ToolbarHides::After2_5s,
+            show_badge: true,
         }
     }
 }
@@ -464,6 +548,58 @@ panic_key = "Ctrl+Alt+End"
             toml::from_str(&format!("[general]\ndevice_name = \"{invented_host}\"\n")).unwrap();
         stored.validate().unwrap();
         assert_eq!(stored.general.device_name, invented_host);
+    }
+
+    /// The theme and the stream window's defaults: a config file that names
+    /// none of them gets what the window did before they could be chosen
+    /// (dark; the picture fitted, not full screen at open, the toolbar
+    /// hiding 2.5 s after the pointer last moved, the badge shown), and a
+    /// file that names them keeps them.
+    #[test]
+    fn the_theme_and_viewer_defaults_are_the_built_ones() {
+        let built = Viewer {
+            picture: Picture::Fit,
+            fullscreen_at_open: false,
+            toolbar_hides: ToolbarHides::After2_5s,
+            show_badge: true,
+        };
+        for cfg in [
+            Config::default(),
+            toml::from_str("").unwrap(),
+            toml::from_str("[general]\ndevice_name = \"Desk\"\n\n[viewer]\n").unwrap(),
+        ] {
+            assert_eq!(cfg.general.theme, Theme::Dark);
+            assert_eq!(cfg.viewer, built);
+        }
+        assert_eq!(
+            ToolbarHides::After2_5s.after(),
+            Some(std::time::Duration::from_millis(2500))
+        );
+        assert_eq!(
+            ToolbarHides::After5s.after(),
+            Some(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(ToolbarHides::Never.after(), None);
+
+        let chosen: Config = toml::from_str(
+            "[general]\ntheme = \"system\"\n\n[viewer]\npicture = \"one-to-one\"\n\
+             fullscreen_at_open = true\ntoolbar_hides = \"never\"\nshow_badge = false\n",
+        )
+        .unwrap();
+        assert_eq!(chosen.general.theme, Theme::System);
+        assert_eq!(
+            chosen.viewer,
+            Viewer {
+                picture: Picture::OneToOne,
+                fullscreen_at_open: true,
+                toolbar_hides: ToolbarHides::Never,
+                show_badge: false,
+            }
+        );
+        let text = toml::to_string_pretty(&chosen).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back, chosen);
+        assert!(text.contains("toolbar_hides = \"never\""), "{text}");
     }
 
     #[test]
