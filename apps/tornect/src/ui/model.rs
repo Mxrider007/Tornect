@@ -1220,6 +1220,11 @@ pub struct WizardView {
     pub running: Option<u64>,
     /// How the last press ended.
     pub answer: Option<(u64, WizardAnswer)>,
+    /// With a press that gave access: the other control grants the change
+    /// made reach the administrator level (decision M1-67), each with its
+    /// pinned label and its mark, as the guard's preview of that change
+    /// listed them; empty for any other answer.
+    pub reaching: Vec<tornect_core::unattended::guard::NewlyReaching>,
 }
 
 /// A grant's administrator level and mark as the manager reads them

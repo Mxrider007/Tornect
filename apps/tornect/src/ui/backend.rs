@@ -988,10 +988,14 @@ impl ManagerWatch {
         } = request;
         let changed = self.set_password(&choice, &password);
         drop(password);
-        let answer = changed.err().unwrap_or(WizardAnswer::Done);
+        let (answer, reaching) = match changed {
+            Ok(reaching) => (WizardAnswer::Done, reaching),
+            Err(answer) => (answer, Vec::new()),
+        };
         shared.update(|m| {
             m.wizard.running = None;
             m.wizard.answer = Some((attempt, answer));
+            m.wizard.reaching = reaching;
         });
         self.refresh(shared);
     }
@@ -1015,26 +1019,29 @@ impl ManagerWatch {
             Err(WizardAnswer::NeedsGenerated)
         };
         drop(password);
-        let answer = match changed {
-            Ok(()) => match self.ctx.guard.enable(Actor::Ui, &choice.device) {
-                Ok(()) => WizardAnswer::Done,
-                Err(e) => WizardAnswer::Refused(refusal(&e)),
+        let (answer, reaching) = match changed {
+            Ok(reaching) => match self.ctx.guard.enable(Actor::Ui, &choice.device) {
+                Ok(()) => (WizardAnswer::Done, reaching),
+                Err(e) => (WizardAnswer::Refused(refusal(&e)), Vec::new()),
             },
-            Err(answer) => answer,
+            Err(answer) => (answer, Vec::new()),
         };
         shared.update(|m| {
             m.wizard.running = None;
             m.wizard.answer = Some((attempt, answer));
+            m.wizard.reaching = reaching;
         });
         self.refresh(shared);
     }
 
-    /// [`Self::change_password`]'s registration: how it failed, if it did.
+    /// [`Self::change_password`]'s registration: how it failed, if it did;
+    /// else the other control grants it made reach the administrator level,
+    /// as its preview listed them.
     fn set_password(
         &self,
         choice: &WizardChoice,
         password: &NewPassword,
-    ) -> Result<(), WizardAnswer> {
+    ) -> Result<Vec<tornect_core::unattended::guard::NewlyReaching>, WizardAnswer> {
         use tornect_core::session_log::Actor;
         use tornect_core::unattended::guard::GuardError;
         use tornect_signal::auth;
@@ -1069,7 +1076,7 @@ impl ManagerWatch {
             .map_err(not_done)?;
         guard
             .set_password(Actor::Ui, device, &upload, &choice.options, generated)
-            .map(|_| ())
+            .map(|_| preview.newly_reaching)
             .map_err(|e| refused(&e))
     }
 
@@ -1102,8 +1109,10 @@ impl ManagerWatch {
         } = request;
         let registered = self.register(&choice, &password);
         drop(password);
+        let mut reaching = Vec::new();
         let answer = match registered {
-            Ok(()) => {
+            Ok(listed) => {
+                reaching = listed;
                 let on = self.ctx.guard.store().read(|s| s.enabled).unwrap_or(false);
                 if !on {
                     match self.ctx.guard.master_on(Actor::Ui, &self.ctx.host_onion_pk) {
@@ -1118,6 +1127,7 @@ impl ManagerWatch {
         shared.update(|m| {
             m.wizard.running = None;
             m.wizard.answer = Some((attempt, answer));
+            m.wizard.reaching = reaching;
         });
         self.refresh(shared);
     }
@@ -1129,8 +1139,14 @@ impl ManagerWatch {
     /// preview found and `generated` from the password's own arm (its one
     /// dialog; it creates the store at the first enable); the client's half;
     /// `RegFinish` at once. A raise that appeared while the person was asked
-    /// is refused by the guard, and nothing is written.
-    fn register(&self, choice: &WizardChoice, password: &NewPassword) -> Result<(), WizardAnswer> {
+    /// is refused by the guard, and nothing is written. Registered: the other
+    /// control grants it made reach the administrator level, as its preview
+    /// listed them.
+    fn register(
+        &self,
+        choice: &WizardChoice,
+        password: &NewPassword,
+    ) -> Result<Vec<tornect_core::unattended::guard::NewlyReaching>, WizardAnswer> {
         use tornect_core::session_log::Actor;
         use tornect_core::unattended::guard::GuardError;
         use tornect_signal::auth;
@@ -1177,7 +1193,7 @@ impl ManagerWatch {
                 options,
                 generated,
             )
-            .map(|_| ())
+            .map(|_| preview.newly_reaching)
             .map_err(|e| refused(&e))
     }
 
@@ -6221,5 +6237,128 @@ mod tests {
             "{:?}",
             grant.state
         );
+    }
+
+    // ------------------------------------------------------------ ⑤a's offer (§B.8.7.1)
+
+    /// Decision M1-67: an answer that gave access names the other control
+    /// grants the change made reach the administrator level, with their
+    /// pinned labels and marks, as its preview listed them; a change that
+    /// made none reach it names none.
+    #[test]
+    fn a_new_admin_grant_names_the_control_grants_it_makes_reach() {
+        use tornect_core::levels::{FixedFacts, HelperPresence};
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{AllowAllReAuth, NewlyReaching, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = wizard_watch(
+            tmp.path(),
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            Arc::new(FixedFacts::new(windows_admin(), HelperPresence::Absent)),
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let [one, two, three] = [1, 2, 3].map(|b| tornect_core::DeviceId::from_bytes([b; 32]));
+        watch.wizard_grant(turn_on(one, generated_pw()), &shared);
+        assert!(
+            shared.read(|m| m.wizard.reaching.is_empty()),
+            "reaches nothing"
+        );
+        let mut chosen = turn_on(two, chosen_pw());
+        chosen.attempt = 2;
+        watch.wizard_grant(chosen, &shared);
+        watch.wizard_grant(
+            with_level(3, three, Preset::MyMachines, generated_pw()),
+            &shared,
+        );
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((3, WizardAnswer::Done))
+        );
+        let store = watch.ctx.guard.store();
+        let named = |device| NewlyReaching {
+            device,
+            label: store.grant(&device).unwrap().label.clone(),
+            marked: store.grant(&device).unwrap().marked(),
+        };
+        assert_eq!(
+            shared.read(|m| m.wizard.reaching.clone()),
+            [named(one), named(two)]
+        );
+        assert!(named(two).marked && !named(one).marked);
+    }
+
+    /// §B.8.7.1: each of the offer's new passwords is its own registration
+    /// and dialog: with the first confirmed and the second refused, the first
+    /// device gets its new generated password (its mark goes), the second
+    /// keeps its old one (still marked), and the answer says why.
+    #[test]
+    fn each_offer_prompt_is_its_own_registration_and_dialog() {
+        use crate::test_support::ReAuthSequence;
+        use tornect_core::levels::{FixedFacts, HelperPresence};
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::NoSessionActivity;
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(ReAuthSequence::new(&[true, true, true, true, true, false]));
+        let watch = wizard_watch(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::new(NoSessionActivity),
+            Arc::new(FixedFacts::new(windows_admin(), HelperPresence::Absent)),
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let [one, two, three] = [1, 2, 3].map(|b| tornect_core::DeviceId::from_bytes([b; 32]));
+        watch.wizard_grant(turn_on(one, chosen_pw()), &shared);
+        let mut chosen = turn_on(two, chosen_pw());
+        chosen.attempt = 2;
+        watch.wizard_grant(chosen, &shared);
+        watch.wizard_grant(
+            with_level(3, three, Preset::MyMachines, generated_pw()),
+            &shared,
+        );
+        let listed: Vec<_> = shared.read(|m| {
+            m.wizard
+                .reaching
+                .iter()
+                .map(|d| (d.device, d.marked))
+                .collect()
+        });
+        assert_eq!(listed, [(one, true), (two, true)]);
+        let renew = |attempt, device| GrantRequest {
+            attempt,
+            choice: WizardChoice {
+                device,
+                preset: Preset::MyMachines,
+                options: tornect_core::unattended::ipc::GrantOptions::default(),
+            },
+            password: generated_pw(),
+        };
+        watch.change_password(renew(4, one), &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((4, WizardAnswer::Done))
+        );
+        watch.change_password(renew(5, two), &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((
+                5,
+                WizardAnswer::Refused("Not done: this computer's password was not confirmed.")
+            ))
+        );
+        assert_eq!(
+            reauth.calls(),
+            [
+                "reg_start",
+                "master_on",
+                "reg_start",
+                "raise",
+                "set_password",
+                "set_password"
+            ]
+        );
+        let store = watch.ctx.guard.store();
+        assert!(!store.grant(&one).unwrap().marked(), "its new password");
+        assert!(store.grant(&two).unwrap().marked(), "its old password");
     }
 }
