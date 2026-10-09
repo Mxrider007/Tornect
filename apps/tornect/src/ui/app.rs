@@ -592,6 +592,9 @@ pub struct App {
     stream_dismissed: bool,
     form: Form,
     quit_at: Option<Instant>,
+    /// The card of a Rotate ID that did not finish was closed: the window
+    /// goes (§B.8.12).
+    leave: bool,
     /// Where the stream window opens (the preview puts it beside the main
     /// window; otherwise the desktop places it).
     pub stream_at: Option<(i32, i32)>,
@@ -644,6 +647,7 @@ impl App {
             stream_dismissed: false,
             form: Form::default(),
             quit_at: None,
+            leave: false,
             stream_at: None,
             title: "Tornect",
             theme,
@@ -1341,6 +1345,7 @@ impl App {
                 self.popups.shared().update(|m| m.prompt = None);
             }
             Action::ConfirmSetupChanged(id) => self.command(Command::ConfirmSetupChanged(id)),
+            Action::CloseWindow => self.leave = true,
             Action::DeviceWords(key) => self.command(Command::DeviceWords(key)),
         }
     }
@@ -1599,6 +1604,11 @@ impl ApplicationHandler<UserEvent> for App {
             main.window.request_redraw();
         }
         match &event {
+            // A Rotate ID that did not finish keeps the window on its card
+            // (`closed` never comes): closing the window closes it.
+            WindowEvent::CloseRequested if self.shared.read(|m| m.rotate_failed.is_some()) => {
+                el.exit();
+            }
             WindowEvent::CloseRequested => self.quit(el),
             WindowEvent::RedrawRequested => self.draw_main(),
             WindowEvent::Resized(size) => main.resized(size.width, size.height),
@@ -1607,6 +1617,10 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        if self.leave {
+            el.exit();
+            return;
+        }
         let now = Instant::now();
         let rotating = self.shared.read(|m| m.rotating);
         if gives_up(self.quit_at, now, rotating) {

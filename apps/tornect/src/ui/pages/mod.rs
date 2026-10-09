@@ -3003,6 +3003,51 @@ mod tests {
         }
     }
 
+    /// A Rotate ID that did not finish (§B.8.12): the main window shows one
+    /// card with the operator's sentence for what was left and one Close
+    /// button, and nothing else (no page, no navigation, no path); Close
+    /// asks the window to close.
+    #[test]
+    fn a_rotation_that_did_not_finish_shows_one_card() {
+        use super::super::model::RotateFailed;
+        use settings::security;
+        assert_eq!(
+            security::ROTATE_DID_NOT_FINISH,
+            "Rotate ID did not finish: unattended access was removed, but this computer keeps \
+             its old ID. Start Tornect again and use Rotate ID again."
+        );
+        assert_eq!(
+            security::ROTATE_DID_NOT_RUN,
+            "Rotate ID did not run: nothing was changed. Start Tornect again and use Rotate ID \
+             again."
+        );
+        for (failed, text) in [
+            (RotateFailed::AccessRemoved, security::ROTATE_DID_NOT_FINISH),
+            (RotateFailed::NothingChanged, security::ROTATE_DID_NOT_RUN),
+        ] {
+            let mut model = at_rest();
+            model.rotating = true;
+            model.rotate_failed = Some(failed);
+            for size in [WIDE, NARROW] {
+                let mut window =
+                    Window::new(model.clone(), Page::Settings, egui::Theme::Dark, size);
+                // The sentence, and no other text: every text node carries
+                // it or, wrapped at the narrow width, one of its lines.
+                assert!(has_text(&window, text), "{failed:?} {size:?}");
+                for shown in window.nodes.iter().filter_map(Node::value) {
+                    assert!(text.contains(shown), "{failed:?} {size:?}: {shown}");
+                }
+                assert_eq!(window.controls(), ["Close"], "{failed:?} {size:?}");
+                let at = window.center("Close");
+                assert_eq!(
+                    window.click(at),
+                    vec![Action::CloseWindow],
+                    "{failed:?} {size:?}"
+                );
+            }
+        }
+    }
+
     /// The Privacy section, opened from the section list.
     fn privacy(model: Model, size: (f32, f32)) -> Window {
         let mut window = Window::new(model, Page::Settings, egui::Theme::Dark, size);
