@@ -7,6 +7,7 @@
 //! what the sections say stays.
 
 pub(super) mod about;
+pub(super) mod display;
 pub(super) mod general;
 pub(super) mod privacy;
 
@@ -23,6 +24,8 @@ pub(super) enum Section {
     /// The name others see and the theme.
     #[default]
     General,
+    /// How the stream window opens.
+    Display,
     /// What others learn, what is kept here, the history switch.
     Privacy,
     /// The version, the licences and the diagnostics report.
@@ -32,13 +35,14 @@ pub(super) enum Section {
 impl Section {
     /// The sections the page lists, in the redesign's order: only those
     /// built.
-    pub const LISTED: [Self; 3] = [Self::General, Self::Privacy, Self::About];
+    pub const LISTED: [Self; 4] = [Self::General, Self::Display, Self::Privacy, Self::About];
 
     /// The section's name in the list.
     #[must_use]
     pub fn title(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::Display => "Display and quality",
             Self::Privacy => "Privacy",
             Self::About => "About",
         }
@@ -84,6 +88,7 @@ pub(super) fn page(
     ui.add_space(18.0);
     match form.settings.section {
         Section::General => general::section(ui, model, &mut form.settings, shared, actions),
+        Section::Display => display::section(ui, model, shared, actions),
         Section::Privacy => privacy::section(ui, model, shared, actions),
         Section::About => about::section(ui, model, actions),
     }

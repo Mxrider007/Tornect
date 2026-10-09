@@ -1,7 +1,8 @@
 //! The stream window (the redesign's S6, `docs/UI_PLAN.md` §8): the picture
-//! fills the window; a floating toolbar at the top centre hides itself
-//! [`HIDE_AFTER`] after the pointer last moved and comes back at the top
-//! edge or on the viewer's chord; the relay line stays below the picture.
+//! fills the window; a floating toolbar at the top centre hides itself a
+//! while after the pointer last moved (2.5 s unless Settings, Display and
+//! quality says otherwise) and comes back at the top edge or on the
+//! viewer's chord; the relay line stays below the picture.
 //! Drawn from the session's `Viewing` and the window's own [`ViewerState`],
 //! which lives in the app's stream window of one session and dies with it,
 //! so nothing in it outlives the session. What the user asks for comes back
@@ -15,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, CornerRadius, RichText, Stroke, vec2};
 
+use tornect_core::config::{Picture, ToolbarHides, Viewer};
 use tornect_signal::messages::notice;
 
 use super::super::model::Viewing;
@@ -22,11 +24,6 @@ use super::super::screenshot;
 use super::super::theme::{self, Tokens};
 use super::super::view::{Action, clock};
 use super::super::widgets;
-
-/// How long the toolbar stays after the pointer last moved over the window
-/// (the operator's default of 2026-10-07; a constant until the settings
-/// page).
-pub const HIDE_AFTER: Duration = Duration::from_millis(2500);
 
 /// How near the window's top edge, in points, the pointer brings the toolbar
 /// back.
@@ -184,6 +181,13 @@ pub struct ViewerState {
     pub keyboard_local: bool,
     /// The pin keeps the toolbar shown (not stored: the operator's default).
     pub pinned: bool,
+    /// When the toolbar hides after the pointer last moved (the settings'
+    /// choice when the session opened; 2.5 s by default, the operator's
+    /// default of 2026-10-07).
+    pub hides: ToolbarHides,
+    /// The badge (the route, the frame rate, the size) is left out of the
+    /// toolbar (the settings' choice when the session opened).
+    pub badge_off: bool,
     /// The connection's details are open.
     pub details: bool,
     /// The Send keys menu is open.
@@ -231,7 +235,22 @@ pub struct ViewerState {
 }
 
 impl ViewerState {
-    /// Bring the toolbar back (the chord) for another [`HIDE_AFTER`].
+    /// A new session's window as the settings hold it (Settings, Display
+    /// and quality): fitted or at its own size, full screen or not, when the
+    /// toolbar hides and whether it shows the badge. Each default is what the
+    /// window did before it could be chosen.
+    #[must_use]
+    pub fn opened(stored: &Viewer) -> Self {
+        Self {
+            one_to_one: stored.picture == Picture::OneToOne,
+            fullscreen: stored.fullscreen_at_open,
+            hides: stored.toolbar_hides,
+            badge_off: !stored.show_badge,
+            ..Self::default()
+        }
+    }
+
+    /// Bring the toolbar back (the chord) for another while.
     pub fn show_toolbar(&mut self, now: Instant) {
         self.hidden = false;
         self.active_at = Some(now);
@@ -335,9 +354,10 @@ impl ViewerState {
     }
 
     /// Whether the toolbar shows this frame, given where the pointer is and
-    /// the window's top edge: it hides [`HIDE_AFTER`] after the pointer last
-    /// moved while it showed, unless pinned, and comes back when the pointer
-    /// reaches the top edge. While it shows, how long until it may hide.
+    /// the window's top edge: it hides [`ViewerState::hides`] after the
+    /// pointer last moved while it showed (never, if so chosen), unless
+    /// pinned, and comes back when the pointer reaches the top edge. While it
+    /// shows, how long until it may hide.
     fn follow(&mut self, pointer: Option<egui::Pos2>, top: f32, now: Instant) -> Option<Duration> {
         let moved = pointer.is_some() && pointer != self.pointer;
         self.pointer = pointer;
@@ -355,7 +375,7 @@ impl ViewerState {
             self.active_at = Some(now);
             return None;
         }
-        let until = self.active_at.unwrap_or(now) + HIDE_AFTER;
+        let until = self.active_at.unwrap_or(now) + self.hides.after()?;
         if now >= until {
             self.hidden = true;
             None
@@ -712,14 +732,18 @@ fn toolbar(
                         if !viewer.shared {
                             ui.label(RichText::new(&v.host).strong());
                         }
-                        let badge = format!("Tor relay · {rate} fps · {}×{}", v.size.0, v.size.1);
-                        let badge = ui.add(
-                            egui::Label::new(RichText::new(badge).small().color(t.warn))
-                                .sense(egui::Sense::click()),
-                        );
-                        if badge.clicked() {
-                            badge_clicked = true;
-                            actions.push(Action::Viewer(ViewerAction::Details(!viewer.details)));
+                        if !viewer.badge_off {
+                            let badge =
+                                format!("Tor relay · {rate} fps · {}×{}", v.size.0, v.size.1);
+                            let badge = ui.add(
+                                egui::Label::new(RichText::new(badge).small().color(t.warn))
+                                    .sense(egui::Sense::click()),
+                            );
+                            if badge.clicked() {
+                                badge_clicked = true;
+                                actions
+                                    .push(Action::Viewer(ViewerAction::Details(!viewer.details)));
+                            }
                         }
                         ui.label(RichText::new(chip_text(v)).color(chip_color(v, t)));
                         if v.control {
@@ -1766,5 +1790,55 @@ mod tests {
             assert!(w.has("End session"), "{at} ms: {:?}", w.texts());
             assert!(w.has("Alt+Tab"), "{at} ms: {:?}", w.texts());
         }
+    }
+
+    /// Settings, Display and quality: a new session's window opens as the
+    /// settings hold it (here at its own size, full screen, the toolbar
+    /// never hiding, no badge), and their defaults are what the window did
+    /// before they could be chosen (fitted, not full screen, the toolbar
+    /// hiding 2.5 s after the pointer last moved, the badge shown).
+    #[test]
+    fn the_viewer_opens_with_the_stored_defaults() {
+        use tornect_core::config::{Picture, ToolbarHides, Viewer};
+        let built = ViewerState::opened(&Viewer::default());
+        assert!(!built.one_to_one && !built.fullscreen && !built.badge_off);
+        assert_eq!(built.hides.after(), Some(ms(2500)));
+
+        let mut w = Window::new(true);
+        w.viewer = ViewerState::opened(&Viewer::default());
+        w.pass(ms(0), Vec::new());
+        assert!(w.texts().iter().any(|t| t.starts_with("Tor relay")));
+        w.pass(ms(2400), Vec::new());
+        assert!(w.viewer.toolbar_shown(), "before 2.5 s");
+        w.pass(ms(2600), Vec::new());
+        assert!(!w.viewer.toolbar_shown(), "after 2.5 s");
+
+        let mut w = Window::new(true);
+        w.viewer = ViewerState::opened(&Viewer {
+            toolbar_hides: ToolbarHides::After5s,
+            ..Viewer::default()
+        });
+        for (at, shown) in [(0, true), (4_900, true), (5_100, false)] {
+            w.pass(ms(at), Vec::new());
+            assert_eq!(w.viewer.toolbar_shown(), shown, "{at} ms");
+        }
+
+        let mut w = Window::new(true);
+        w.viewer = ViewerState::opened(&Viewer {
+            picture: Picture::OneToOne,
+            fullscreen_at_open: true,
+            toolbar_hides: ToolbarHides::Never,
+            show_badge: false,
+        });
+        assert!(w.viewer.one_to_one && w.viewer.fullscreen);
+        for at in [0, 3_000, 10_000, 60_000] {
+            w.pass(ms(at), Vec::new());
+            assert!(w.viewer.toolbar_shown(), "{at} ms: never hides");
+            assert!(
+                !w.texts().iter().any(|t| t.starts_with("Tor relay")),
+                "{at} ms: no badge"
+            );
+        }
+        assert!(w.viewer.visible().is_some(), "at its own size");
     }
 }

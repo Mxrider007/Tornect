@@ -2107,7 +2107,10 @@ mod tests {
             .iter()
             .map(|s| s.title())
             .collect();
-        assert_eq!(titles, ["General", "Privacy", "About"]);
+        assert_eq!(
+            titles,
+            ["General", "Display and quality", "Privacy", "About"]
+        );
         for size in [WIDE, NARROW] {
             let mut window = Window::new(at_rest(), Page::Settings, egui::Theme::Dark, size);
             assert_eq!(window.form.settings.section, settings::Section::General);
@@ -2115,6 +2118,11 @@ mod tests {
                 assert!(
                     window.controls().iter().any(|c| c == title),
                     "{size:?}: {title}"
+                );
+                let right = window.node(title).bounds().expect("bounds").x1;
+                assert!(
+                    right <= f64::from(size.0),
+                    "{size:?}: {title} ends at {right}"
                 );
                 let at = window.center(title);
                 assert!(window.click(at).is_empty(), "{size:?}: {title}");
@@ -2534,5 +2542,71 @@ mod tests {
                 "{size:?}"
             );
         }
+    }
+
+    /// Settings, Display and quality: each choice sends the stored viewer
+    /// defaults with that one change (the picture's sizes in the toolbar's
+    /// own words), from what the settings hold; while this screen is shared
+    /// the controls give way to the hidden card and the fixed lines stay.
+    #[test]
+    fn the_display_section_sends_the_viewer_defaults() {
+        use super::super::model::SettingsChange;
+        use settings::display;
+        use tornect_core::config::{Picture, ToolbarHides, Viewer};
+        let stored = Viewer::default();
+        let mut window = Window::new(at_rest(), Page::Settings, egui::Theme::Dark, WIDE);
+        let at = window.center("Display and quality");
+        assert!(window.click(at).is_empty());
+        assert!(window.pass(Vec::new()).is_empty());
+        for text in [display::HOST_RATE, display::QUALITY_LATER] {
+            assert!(has_text(&window, text), "{text}");
+        }
+        let save = |viewer| vec![Action::SaveSettings(SettingsChange::Viewer(viewer))];
+        let at = window.center("1:1");
+        assert_eq!(
+            window.click(at),
+            save(Viewer {
+                picture: Picture::OneToOne,
+                ..stored
+            })
+        );
+        let at = window.center(display::FULLSCREEN);
+        assert_eq!(
+            window.click(at),
+            save(Viewer {
+                fullscreen_at_open: true,
+                ..stored
+            })
+        );
+        let at = window.center("Never");
+        assert_eq!(
+            window.click(at),
+            save(Viewer {
+                toolbar_hides: ToolbarHides::Never,
+                ..stored
+            })
+        );
+        let at = window.center(display::BADGE);
+        assert_eq!(
+            window.click(at),
+            save(Viewer {
+                show_badge: false,
+                ..stored
+            })
+        );
+        assert!(window.controls().iter().any(|c| c == "Fit"));
+        let mut model = at_rest();
+        model.hosted_elsewhere = true;
+        let mut window = Window::new(model, Page::Settings, egui::Theme::Dark, WIDE);
+        window.form.settings.section = settings::Section::Display;
+        window.pass(Vec::new());
+        assert!(has_text(&window, HIDDEN_WHILE_SHARED));
+        assert!(
+            !window
+                .controls()
+                .iter()
+                .any(|c| c == "1:1" || c == display::BADGE)
+        );
+        assert!(has_text(&window, display::HOST_RATE));
     }
 }
