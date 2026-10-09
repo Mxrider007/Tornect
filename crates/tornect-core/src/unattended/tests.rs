@@ -5998,3 +5998,206 @@ fn install_is_logged() {
     }
     assert!(reauth.calls().is_empty(), "a dialog: {:?}", reauth.calls());
 }
+
+// ------------------------------------------------------------------ the reach preview (M1-67, §B.8.7.1 ④)
+
+/// A registration of `device` through `RegStart` / `RegFinish` as the window runs it,
+/// declaring `raise` and `generated`: the code of a refusal.
+fn register_as_ui(
+    guard: &MutationGuard,
+    device: &DeviceId,
+    preset: Preset,
+    options: &GrantOptions,
+    raise: bool,
+    generated: bool,
+) -> Result<(), u16> {
+    let started = guard
+        .reg_start(Actor::Ui, device, raise, generated)
+        .map_err(|e| e.code())?;
+    guard
+        .reg_finish(
+            Actor::Ui,
+            device,
+            &started.reg_txn,
+            &[0xA5; 192],
+            preset,
+            options,
+            generated,
+        )
+        .map(|_| ())
+        .map_err(|e| e.code())
+}
+
+#[test]
+fn the_preview_matches_what_the_commit_decides() {
+    // §B.8.7.1 ④, decision M1-67: what the preview says is what the commit decides. A
+    // creation, a new password or an options change it calls a raise commits only with a
+    // raising RegStart and a generated password (`G_NEEDS_PASSWORD` otherwise, nothing
+    // written); one it calls no raise commits a chosen password; the level where this host
+    // cannot give it is `G_UNSUPPORTED` in both. On Linux, on a Windows administrator
+    // account with and without another grant at the level, and on the account settings
+    // that make control administrator access; with the other grants a raise makes reach
+    // the level, each with its pinned label and its mark.
+    let new = dev(3);
+    for (case, account, other_at_level, raises, reach) in [
+        ("Linux", AccountFacts::Linux, false, false, 0),
+        ("Windows", windows(|_| {}), false, false, 0),
+        (
+            "Windows, another at the level",
+            windows(|_| {}),
+            true,
+            true,
+            1,
+        ),
+        (
+            "UAC off",
+            windows(|f| f.enable_lua = Some(0)),
+            false,
+            true,
+            1,
+        ),
+    ] {
+        let (_env, store, _guard) = reach_env();
+        if other_at_level {
+            set_grant(&store, &dev(2), |g| {
+                g.elevation = Elevation::Admin;
+                g.unmarked = true;
+            });
+        }
+        let guard = guard_on(&store, account, HelperPresence::Absent);
+        // A new control grant (My machines).
+        let p = guard.preview(&new, Preset::MyMachines, &waived()).unwrap();
+        assert_eq!(
+            (p.raises, p.reach_before, p.reach_after),
+            (raises, 0, reach),
+            "{case}"
+        );
+        assert_eq!(p.generated_only(), raises, "{case}");
+        assert!(
+            p.newly_reaching.is_empty(),
+            "{case}: control at none adds none"
+        );
+        let chosen = register_as_ui(&guard, &new, Preset::MyMachines, &waived(), false, false);
+        if raises {
+            assert_eq!(chosen, Err(codes::G_NEEDS_PASSWORD), "{case}");
+            assert!(store.grant(&new).is_none(), "{case}: nothing written");
+            register_as_ui(&guard, &new, Preset::MyMachines, &waived(), true, true).unwrap();
+            assert!(!store.grant(&new).unwrap().marked(), "{case}");
+        } else {
+            assert_eq!(chosen, Ok(()), "{case}");
+            assert!(store.grant(&new).unwrap().marked(), "{case}");
+        }
+        // The level for P (`dev(1)`): an options change and a new password.
+        let level = guard.preview(&dev(1), Preset::MyMachines, &the_level());
+        let by_options = guard.set_options(Actor::Ui, &dev(1), &the_level());
+        if account == AccountFacts::Linux {
+            assert_eq!(level.unwrap_err().code(), codes::G_UNSUPPORTED, "{case}");
+            assert_eq!(
+                by_options.unwrap_err().code(),
+                codes::G_UNSUPPORTED,
+                "{case}"
+            );
+            continue;
+        }
+        let level = level.unwrap();
+        assert_eq!(
+            (level.raises, level.reach_before, level.reach_after),
+            (true, reach, 2),
+            "{case}"
+        );
+        let expected: Vec<(DeviceId, String, bool)> = if raises {
+            // Every other control grant reaches the level already.
+            Vec::new()
+        } else {
+            [dev(2), new]
+                .iter()
+                .map(|d| {
+                    let g = store.grant(d).unwrap();
+                    (*d, g.label.clone(), g.marked())
+                })
+                .collect()
+        };
+        let listed: Vec<(DeviceId, String, bool)> = level
+            .newly_reaching
+            .iter()
+            .map(|n| (n.device, n.label.clone(), n.marked))
+            .collect();
+        assert_eq!(listed, expected, "{case}");
+        assert_eq!(
+            by_options.unwrap_err().code(),
+            codes::G_NEEDS_PASSWORD,
+            "{case}"
+        );
+        let chosen = guard.set_password(Actor::Ui, &dev(1), &[0xC1; 192], &the_level(), false);
+        assert_eq!(
+            chosen.unwrap_err().code(),
+            codes::G_NEEDS_PASSWORD,
+            "{case}"
+        );
+        assert!(!store.grant(&dev(1)).unwrap().holds_level(), "{case}");
+        guard
+            .set_password(Actor::Ui, &dev(1), &[0xC2; 192], &the_level(), true)
+            .unwrap();
+        assert!(store.grant(&dev(1)).unwrap().holds_level(), "{case}");
+        // A new password with no change: no raise, a chosen one commits.
+        let same = guard
+            .preview(&dev(1), Preset::MyMachines, &GrantOptions::default())
+            .unwrap();
+        assert_eq!(
+            (same.raises, same.reach_before, same.reach_after),
+            (false, 2, 2),
+            "{case}"
+        );
+        assert!(same.generated_only(), "{case}: the reach is non-zero");
+    }
+}
+
+#[test]
+fn the_preview_writes_and_logs_nothing() {
+    // The preview only reads: no dialog, no sessions.log line (its refusals included), no
+    // store write (the file and the keychain anchor unchanged); and a store not created
+    // yet is judged as the first enable creates it (empty), without creating it.
+    let (env, store, _guard) = reach_env();
+    let reauth = Arc::new(AllowAllReAuth::default());
+    let guard = MutationGuard::new(
+        store.clone(),
+        reauth.clone(),
+        Arc::new(NoSessionActivity),
+        Arc::new(FixedFacts::new(windows(|_| {}), HelperPresence::Absent)),
+    )
+    .with_paired_devices(Arc::new(AllowAllPaired));
+    let (lines, bytes, anchor) = (env.log_events().len(), env.file_bytes(), env.anchor());
+    assert!(
+        guard
+            .preview(&dev(1), Preset::MyMachines, &the_level())
+            .unwrap()
+            .raises
+    );
+    guard
+        .preview(&dev(9), Preset::HeadlessBox, &waived())
+        .unwrap();
+    let linux = guard_on(&store, AccountFacts::Linux, HelperPresence::Absent);
+    let refused = linux.preview(&dev(1), Preset::MyMachines, &the_level());
+    assert_eq!(refused.unwrap_err().code(), codes::G_UNSUPPORTED);
+    let helping = guard.preview(&dev(9), Preset::HelpingSomeone, &the_level());
+    assert_eq!(helping.unwrap_err().code(), codes::G_UNSUPPORTED);
+    assert!(reauth.calls().is_empty(), "no dialog");
+    assert_eq!(env.log_events().len(), lines, "no line");
+    assert_eq!(env.file_bytes(), bytes, "no write");
+    assert_eq!(env.anchor(), anchor, "no policy write");
+    // Not created yet: judged empty, and still not created.
+    let fresh = Env::new();
+    let fresh_store = fresh.open();
+    let log_before = std::fs::read(fresh.paths.sessions_log()).ok();
+    let uac_off = guard_on(
+        &fresh_store,
+        windows(|f| f.enable_lua = Some(0)),
+        HelperPresence::Absent,
+    );
+    let p = uac_off
+        .preview(&dev(1), Preset::MyMachines, &waived())
+        .unwrap();
+    assert_eq!((p.raises, p.reach_before, p.reach_after), (true, 0, 1));
+    assert!(!fresh.paths.unattended_store().exists(), "nothing created");
+    assert_eq!(std::fs::read(fresh.paths.sessions_log()).ok(), log_before);
+}
