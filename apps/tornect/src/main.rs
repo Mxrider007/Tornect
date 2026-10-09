@@ -29,6 +29,7 @@ mod history;
 mod host;
 mod install_cmd;
 mod prompt;
+mod rotate;
 mod secure_screen;
 mod term_block;
 #[cfg(test)]
@@ -847,6 +848,12 @@ fn cmd_id(paths: &Paths, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Why `tornect rotate-id` refuses beside a running host: the window or
+/// `tornect host` holds the unattended store, which the rotation wipes first.
+const ROTATE_NEEDS_TORNECT_CLOSED: &str = "a running Tornect holds unattended access here; close \
+     its window (or press Ctrl-C in its terminal) and run tornect rotate-id --yes again, or use \
+     Rotate ID in the window's Settings, Security";
+
 fn cmd_rotate_id(paths: &Paths, yes: bool) -> anyhow::Result<()> {
     if !yes {
         eprintln!(
@@ -855,54 +862,60 @@ fn cmd_rotate_id(paths: &Paths, yes: bool) -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
-    let store = open_store(paths)?;
-    // Arti's keystore holds its own copy of the identity key, keys derived from
-    // it and the service's intro-point state (tornect-signal `tor::identity`);
-    // an invalidated identity must not stay recoverable there. Done before the
-    // new seed is written, so a failure leaves the old identity whole instead of
-    // half rotated.
-    use tornect_core::SecretStore as _;
-    if store.contains(keystore::HOST_IDENTITY_SEED)? {
-        let (old, _) = load_or_create_host_identity(&store)?;
-        let forgotten = tornect_signal::forget_identity(paths, &old.id()).with_context(|| {
-            format!(
-                "removing the old Tornect ID {} from the Tor keystore and state",
-                old.id()
-            )
-        })?;
-        if forgotten == tornect_signal::ForgottenIdentity::default() {
-            eprintln!("the old ID had no Tor keys or service state on this machine");
-        } else {
-            eprintln!(
-                "removed the old ID's Tor keys and service state ({} key(s){})",
-                forgotten.keys_removed,
-                if forgotten.state_removed {
-                    ", intro-point state"
-                } else {
-                    ""
-                }
-            );
+    // Everything unattended is wiped through the guard, opened as the offline
+    // command line opens it: refused while a host holds the store.
+    let ctx = match unattended::offline_context(paths) {
+        Ok(ctx) => ctx,
+        Err(e)
+            if matches!(
+                e.downcast_ref::<tornect_core::unattended::store::StoreError>(),
+                Some(tornect_core::unattended::store::StoreError::Locked(_))
+            ) =>
+        {
+            anyhow::bail!(ROTATE_NEEDS_TORNECT_CLOSED)
         }
-    }
-    let host = keystore::rotate_host_identity(&store)?;
+        Err(e) => return Err(e),
+    };
+    let store = open_store(paths)?;
+    use tornect_core::SecretStore as _;
     // The unattended passwords this computer remembers go with the old ID
     // (§B.8.9.1): a new start keeps none of them.
-    if store.contains(keystore::DEVICE_IDENTITY_SEED)? {
+    let saved = if store.contains(keystore::DEVICE_IDENTITY_SEED)? {
         let (device, _) = load_or_create_device_identity(&store)?;
-        let saved = ua_client::system_passwords(&device);
-        match ua_client::forget_all(paths, &saved) {
-            Ok(0) => {}
-            Ok(n) => eprintln!("deleted {n} remembered unattended password(s) from the keychain"),
-            Err(e) => {
-                eprintln!("the remembered unattended passwords could not all be deleted: {e:#}")
-            }
-        }
+        Some(ua_client::system_passwords(&device))
+    } else {
+        None
+    };
+    let rotated = rotate::rotate_id(
+        paths,
+        &ctx.guard,
+        tornect_core::session_log::Actor::Cli,
+        &store,
+        saved.as_ref(),
+    )?;
+    if rotated.grants > 0 {
+        eprintln!("removed unattended access for {} device(s)", rotated.grants);
     }
-    let log = tornect_core::session_log::SessionLog::new(paths.sessions_log());
-    log.append(&tornect_core::session_log::SessionRecord::now(
-        tornect_core::session_log::SessionEvent::HostIdRotated,
-    ))?;
-    println!("New Tornect ID: {}", host.id().onion_address());
+    let forgotten = rotated.forgotten;
+    if forgotten == tornect_signal::ForgottenIdentity::default() {
+        eprintln!("the old ID had no Tor keys or service state on this machine");
+    } else {
+        eprintln!(
+            "removed the old ID's Tor keys and service state ({} key(s){})",
+            forgotten.keys_removed,
+            if forgotten.state_removed {
+                ", intro-point state"
+            } else {
+                ""
+            }
+        );
+    }
+    match rotated.passwords {
+        Ok(0) => {}
+        Ok(n) => eprintln!("deleted {n} remembered unattended password(s) from the keychain"),
+        Err(e) => eprintln!("the remembered unattended passwords could not all be deleted: {e:#}"),
+    }
+    println!("New Tornect ID: {}", rotated.id.onion_address());
     Ok(())
 }
 

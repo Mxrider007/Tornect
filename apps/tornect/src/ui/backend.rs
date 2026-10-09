@@ -644,6 +644,9 @@ impl ManagerWatch {
             ManagerOp::Enable(device) => guard.enable(Actor::Ui, &device).map_err(|e| refusal(&e)),
             ManagerOp::Unlock(device) => guard.unlock(Actor::Ui, &device).map_err(|e| refusal(&e)),
             ManagerOp::Resume(device) => guard.resume(Actor::Ui, &device).map_err(|e| refusal(&e)),
+            // Rotate ID runs at the window's close (`ManagerWatch::rotate`),
+            // never here.
+            ManagerOp::RotateId => Ok(()),
             ManagerOp::SignIn(on) => {
                 let backend = match std::env::current_exe() {
                     Ok(exe) => (self.autostart_for)(&exe),
@@ -712,8 +715,9 @@ impl ManagerWatch {
                         paired_changed = removed;
                         Ok(())
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "a paired device was not removed");
+                    // No error text: it may name a path, which names the account.
+                    Err(_) => {
+                        tracing::warn!("a paired device was not removed");
                         Err(PAIRING_KEPT)
                     }
                 },
@@ -753,6 +757,20 @@ impl ManagerWatch {
             drop(card);
             self.undelivered();
         }
+    }
+
+    /// Rotate the ID of the home `paths` (§B.8.12), the host role and Tor
+    /// stopped: the guard's rotate operation as the window, then the new
+    /// identity, and the passwords `device` remembers go with the old ID.
+    fn rotate(
+        &self,
+        paths: &Paths,
+        device: &DeviceIdentity,
+    ) -> anyhow::Result<crate::rotate::Rotated> {
+        use tornect_core::session_log::Actor;
+        let store = tornect_core::keystore::FileSecretStore::open(paths.keys_dir())?;
+        let saved = ua_client::system_passwords(device);
+        crate::rotate::rotate_id(paths, &self.ctx.guard, Actor::Ui, &store, Some(&saved))
     }
 
     /// Turn unattended access off because its stop code was not delivered.
@@ -1317,6 +1335,9 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
     let mut granting: Option<JoinHandle<Result<(bool, bool), String>>> = None;
     let slots = Arc::new(Semaphore::new(tornect_signal::tor::MAX_LIVE_CIRCUITS));
     let mut media_streams = JoinSet::new();
+    // Rotate ID was asked for: it runs once the sessions, the host role and
+    // Tor have stopped, and the window closes after it.
+    let mut rotating: Option<Arc<ManagerWatch>> = None;
 
     loop {
         tokio::select! {
@@ -1506,6 +1527,13 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     Command::ClearHistory => change_book(&b, &Change::Clear),
                     Command::SetHistory(on) => change_book(&b, &Change::History(on)),
                     Command::SaveSettings(change) => save_settings(&b.paths, &b.shared, &change),
+                    Command::Manager(ManagerOp::RotateId) => {
+                        if let Some(manager) = hosted.as_ref().and_then(|h| h.manager.clone()) {
+                            rotating = Some(manager);
+                            b.shared.update(|m| m.rotating = true);
+                            break;
+                        }
+                    }
                     Command::Manager(op) => {
                         if let Some(manager) = hosted.as_ref().and_then(|h| h.manager.clone()) {
                             // One password dialog at a time: an operation that
@@ -1684,6 +1712,20 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
         && let Ok(node) = Arc::try_unwrap(node)
     {
         node.shutdown().await;
+    }
+    // Rotate ID, with every session ended, the onion service gone and Tor
+    // stopped; the window waits for it (§B.8.12).
+    if let Some(manager) = rotating {
+        let (paths, device) = (b.paths.clone(), Arc::clone(&b.device));
+        match tokio::task::spawn_blocking(move || manager.rotate(&paths, &device)).await {
+            Ok(Ok(rotated)) => say(format_args!(
+                "Rotate ID: unattended access removed for {} device(s); the new ID is used \
+                 from the next start",
+                rotated.grants
+            )),
+            // No error text: it may name a path, which names the account.
+            Ok(Err(_)) | Err(_) => tracing::warn!("Rotate ID did not finish"),
+        }
     }
     b.shared.update(|m| m.closed = true);
 }

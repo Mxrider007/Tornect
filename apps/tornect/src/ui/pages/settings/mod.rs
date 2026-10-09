@@ -88,6 +88,8 @@ pub struct SettingsForm {
     pub(super) revoke_all: bool,
     /// General's start at sign-in says what it means before it acts.
     pub(super) sign_in_asking: bool,
+    /// Rotate ID's dialog is open, with the word typed so far.
+    pub(super) rotate: Option<String>,
 }
 
 /// Below this page width (points) the section list uses its short names.

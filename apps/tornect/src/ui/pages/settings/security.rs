@@ -111,6 +111,27 @@ pub(in super::super) const ROW_OPS: [(&str, RowOp); 4] = [
 pub(in super::super) const STOP_LINE: &str = "To end every session now: Stop in the sharing \
     bar, or tornect panic in a terminal.";
 
+/// Rotate ID, which asks first.
+pub(in super::super) const ROTATE: &str = "Rotate ID…";
+
+/// The word Rotate ID's dialog asks for.
+pub(in super::super) const ROTATE_WORD: &str = "ROTATE";
+
+/// Rotate ID's dialog, naming the devices whose access it removes.
+#[must_use]
+pub(in super::super) fn rotate_question(labels: &[&str]) -> String {
+    let named = if labels.is_empty() {
+        "no device".to_owned()
+    } else {
+        labels.join(", ")
+    };
+    format!(
+        "This makes a new Tornect ID. Every pairing stops working, and unattended access is \
+         removed for: {named}. Type ROTATE to go on. Tornect closes when it is done; start it \
+         again to use the new ID."
+    )
+}
+
 /// Revoke all's question naming how many devices lose their access.
 #[must_use]
 pub(in super::super) fn revoke_all_question(devices: usize) -> String {
@@ -210,6 +231,59 @@ pub(super) fn section(
         screen_sharing(ui, t, setup, !model.sharing.is_empty(), shared, actions);
     }
     stopping(ui, t);
+    if shared {
+        form.rotate = None;
+    } else {
+        rotate(ui, t, manager, form, actions);
+    }
+}
+
+/// Rotate ID (§B.8.12): its dialog names the devices whose unattended access
+/// it removes and asks for the typed word, Cancel first; no password (it
+/// removes access, it gives none). Not offered while this screen is shared.
+fn rotate(
+    ui: &mut Ui,
+    t: &Tokens,
+    manager: &Manager,
+    form: &mut SettingsForm,
+    actions: &mut Vec<Action>,
+) {
+    ui.add_space(20.0);
+    widgets::section_header(ui, "Rotate ID");
+    let Some(typed) = &mut form.rotate else {
+        if Button::new(Kind::Danger, ROTATE).small().show(ui).clicked() {
+            form.rotate = Some(String::new());
+        }
+        return;
+    };
+    let labels: Vec<&str> = manager.grants.iter().map(|g| g.label.as_str()).collect();
+    line(ui, &rotate_question(&labels), t.text_primary);
+    ui.add_space(6.0);
+    widgets::text_field(ui, typed, ROTATE_WORD, true, 160.0);
+    let ready = typed.trim() == ROTATE_WORD;
+    let mut done = false;
+    ui.horizontal(|ui| {
+        if Button::new(Kind::Secondary, "Cancel")
+            .small()
+            .show(ui)
+            .clicked()
+        {
+            done = true;
+        }
+        if Button::new(Kind::Danger, "Rotate ID")
+            .small()
+            .enabled(ready)
+            .show(ui)
+            .clicked()
+            && ready
+        {
+            actions.push(Action::Manager(ManagerOp::RotateId));
+            done = true;
+        }
+    });
+    if done {
+        form.rotate = None;
+    }
 }
 
 /// Turn off and the pause's ends while unattended access is on (the ends

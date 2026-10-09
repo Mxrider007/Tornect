@@ -2598,6 +2598,7 @@ mod tests {
         let mut controls = vec![
             settings::security::TURN_OFF,
             settings::security::REVOKE_ALL,
+            settings::security::ROTATE,
             "Unlock",
         ];
         controls.extend(settings::security::PAUSE_ENDS.map(|(_, label)| label));
@@ -2964,6 +2965,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Rotate ID's dialog (§B.8.12) names the devices whose unattended
+    /// access it removes and asks for the typed word ROTATE, Cancel first;
+    /// only with the word does Rotate ID send the operation (no password: it
+    /// removes access). Not offered while this screen is shared.
+    #[test]
+    fn the_rotate_dialog_names_the_grants_and_needs_the_word() {
+        use super::super::model::ManagerOp;
+        use settings::security;
+        let question = security::rotate_question(&["Office laptop", "Tablet"]);
+        assert_eq!(
+            question,
+            "This makes a new Tornect ID. Every pairing stops working, and unattended access is \
+             removed for: Office laptop, Tablet. Type ROTATE to go on. Tornect closes when it is \
+             done; start it again to use the new ID."
+        );
+        let mut model = at_rest();
+        model.manager = Some(manager_on());
+        // The dialog is the section's last: windows tall enough to reach it.
+        for size in [(WIDE.0, 2400.0), (NARROW.0, 3200.0)] {
+            let mut window = security_section(model.clone(), size);
+            let at = window.center(security::ROTATE);
+            assert!(window.click(at).is_empty(), "{size:?}: the dialog first");
+            assert!(window.pass(Vec::new()).is_empty(), "{size:?}");
+            assert!(has_text(&window, &question), "{size:?}");
+            let cancel = window.node("Cancel").bounds().expect("bounds");
+            let rotate = window.node("Rotate ID").bounds().expect("bounds");
+            assert!(cancel.x0 < rotate.x0, "{size:?}: Cancel first");
+            for typed in ["", "rotate", "ROTATE ID"] {
+                window.form.settings.rotate = Some(typed.to_owned());
+                assert!(window.pass(Vec::new()).is_empty(), "{size:?}");
+                let at = window.center("Rotate ID");
+                assert!(window.click(at).is_empty(), "{size:?}: {typed:?}");
+            }
+            window.form.settings.rotate = Some("ROTATE".to_owned());
+            assert!(window.pass(Vec::new()).is_empty(), "{size:?}");
+            let at = window.center("Rotate ID");
+            assert_eq!(
+                window.click(at),
+                vec![Action::Manager(ManagerOp::RotateId)],
+                "{size:?}"
+            );
+            assert!(window.form.settings.rotate.is_none(), "{size:?}: closed");
+        }
+        let mut shared = model;
+        shared.hosted_elsewhere = true;
+        let window = security_section(shared, (WIDE.0, 2400.0));
+        assert!(!window.controls().iter().any(|c| c == security::ROTATE));
     }
 
     /// The Privacy section, opened from the section list.
