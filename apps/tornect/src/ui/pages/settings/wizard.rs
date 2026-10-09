@@ -189,6 +189,20 @@ pub(in super::super) const LINUX_SENTENCE: &str = "On Linux, Tornect runs as you
     session can do what you can do without a password; when the system asks for a password, they \
     see that window and can type into it.";
 
+/// The manager's raise of a grant to the administrator level, its row
+/// button.
+pub(in super::super) const RAISE: &str = "Give administrator access…";
+
+/// Raising a grant to the administrator level (§B.8.7.1, decision M1-67);
+/// `<device>` stands for the pinned label.
+pub(in super::super) const RAISE_LINE: &str = "Administrator access needs a new password for \
+    <device>. The current password stops working when you finish, also where it is remembered.";
+
+/// Enabling a marked grant at the level (§B.8.7.1, decision M1-67);
+/// `<device>` stands for the pinned label.
+pub(in super::super) const RESTORE_LINE: &str = "Administrator access for <device> needs a new \
+    password after a restore or an import. The old one stops working when you finish.";
+
 /// How long ①'s Continue waits, still, before a click counts (M1-50).
 const ARM_AFTER: Duration = Duration::from_secs(1);
 
@@ -229,6 +243,11 @@ pub(in super::super) enum Step {
     Summary,
     /// The manager's *Change mode* of an existing grant.
     Mode,
+    /// The manager's raise of a grant to the administrator level.
+    Raise,
+    /// The manager's *Enable* of a marked grant at the level: its new
+    /// password first.
+    Restore,
 }
 
 impl Step {
@@ -245,6 +264,8 @@ impl Step {
             Self::Check => "Check this computer",
             Self::Summary => "Summary",
             Self::Mode => "Change mode",
+            Self::Raise => "Administrator access",
+            Self::Restore => "Enable",
         }
     }
 }
@@ -391,6 +412,40 @@ impl Wizard {
         w
     }
 
+    /// The manager's raise of `device`'s grant, labelled `label`, to the
+    /// administrator level: a new passphrase, shown once the guard's preview
+    /// of the raise says this computer can give the level.
+    #[must_use]
+    pub(in super::super) fn raise(device: DeviceId, label: String) -> Self {
+        let mut w = Self::change_password(device, label);
+        w.options.admin = true;
+        w.generated_only = true;
+        w.step = Step::Raise;
+        w
+    }
+
+    /// The manager's *Enable* of `device`'s marked grant at the level,
+    /// labelled `label`: a new passphrase first (§B.8.6.1).
+    #[must_use]
+    pub(in super::super) fn restore(device: DeviceId, label: String) -> Self {
+        let mut w = Self::change_password(device, label);
+        w.generated_only = true;
+        w.step = Step::Restore;
+        w
+    }
+
+    /// After a refused answer: the same step again with a new passphrase
+    /// (the raise and the restore), else ④.
+    fn again(&mut self) {
+        match self.step {
+            Step::Raise | Step::Restore => {
+                self.passphrase = generated();
+                self.drop_own();
+            }
+            _ => self.open_password(),
+        }
+    }
+
     /// What a change from the manager registers, for the guard's preview.
     #[must_use]
     pub(in super::super) fn change_choice(&self) -> Option<WizardChoice> {
@@ -417,6 +472,7 @@ impl Wizard {
                 preset: Preset::MyMachines,
                 options: GrantOptions {
                     mode: change.mode,
+                    elevation: self.options.admin.then_some(Elevation::Admin),
                     ..GrantOptions::default()
                 },
             });
@@ -512,11 +568,11 @@ pub(in super::super) fn draw(
             WizardAnswer::NeedsGenerated => {
                 w.generated_only = true;
                 w.note = Some(NEEDS_GENERATED);
-                w.open_password();
+                w.again();
             }
             WizardAnswer::Refused(why) => {
                 w.note = Some(why);
-                w.open_password();
+                w.again();
             }
         }
     }
@@ -543,6 +599,12 @@ pub(in super::super) fn draw(
             }
         }
         Step::Mode => mode_step(ui, t, model, w, &mut close, actions),
+        Step::Raise | Step::Restore => {
+            let attempt = form.attempts + 1;
+            if level_password(ui, t, model, w, &mut close, attempt, actions) {
+                form.attempts = attempt;
+            }
+        }
         Step::Options => options(ui, t, model, manager, w, &mut close, actions),
         Step::Administrator => administrator(ui, t, model, w, &mut close, actions),
         Step::Check => check(ui, t, manager, w, &mut close),
@@ -1090,6 +1152,112 @@ fn mode_step(
             None => {}
         }
     });
+}
+
+/// The manager's raise to the administrator level and the restore of a
+/// marked grant at it (§B.8.7.1, decision M1-67): the plan's lines (the
+/// raise: its sentence, then the new-grant line), a generated passphrase
+/// shown once, Cancel first and Continue, which answers a primary pointer
+/// click only, once the passphrase is shown, and sends it as press
+/// `attempt` in one registration (the restore: then *Enable*). The raise
+/// waits for the guard's preview and shows its refusal where this computer
+/// cannot give the level. Whether Continue was pressed.
+fn level_password(
+    ui: &mut Ui,
+    t: &Tokens,
+    model: &Model,
+    w: &mut Wizard,
+    close: &mut bool,
+    attempt: u64,
+    actions: &mut Vec<Action>,
+) -> bool {
+    let restore = w.step == Step::Restore;
+    let Some(choice) = w.choice() else {
+        *close = true;
+        return false;
+    };
+    if let Some(note) = w.note {
+        line(ui, note, t.danger_text);
+        ui.add_space(6.0);
+    }
+    let label = label_of(model, w);
+    let refused = model
+        .wizard
+        .level_refused
+        .as_ref()
+        .filter(|(c, _)| !restore && *c == choice)
+        .map(|(_, why)| *why);
+    let judged = restore
+        || model
+            .wizard
+            .preview
+            .as_ref()
+            .is_some_and(|(c, _)| *c == choice);
+    let mut shown = false;
+    if let Some(why) = refused {
+        line(ui, why, t.text_primary);
+    } else if !judged {
+        ui.spinner();
+    } else if let Some(phrase) = &w.passphrase {
+        if restore {
+            line(
+                ui,
+                &RESTORE_LINE.replace("<device>", &label),
+                t.text_primary,
+            );
+        } else {
+            line(ui, &RAISE_LINE.replace("<device>", &label), t.text_primary);
+            line(
+                ui,
+                &NEW_GRANT_LINE.replace("<device>", &label),
+                t.text_primary,
+            );
+        }
+        ui.add_space(6.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(phrase.secret().0.as_str())
+                    .font(theme::font(ui.ctx(), Face::Mono, 20.0))
+                    .color(t.text_primary),
+            )
+            .selectable(false),
+        );
+        ui.add_space(4.0);
+        line(ui, WRITE_IT_DOWN, t.warn);
+        shown = true;
+    }
+    let waiting = w.attempt.is_some();
+    if waiting {
+        ui.spinner();
+    }
+    ui.add_space(10.0);
+    let mut pressed = false;
+    ui.horizontal(|ui| {
+        cancel(ui, !waiting, close);
+        if refused.is_some() {
+            return;
+        }
+        let ready = shown && !waiting;
+        if pointer_only(ui, "Continue", ready)
+            && ready
+            && let Some(password) = w.passphrase.take()
+        {
+            let request = Box::new(GrantRequest {
+                attempt,
+                choice: choice.clone(),
+                password,
+            });
+            actions.push(Action::Manager(if restore {
+                ManagerOp::Restore(request)
+            } else {
+                ManagerOp::ChangePassword(request)
+            }));
+            w.note = None;
+            w.attempt = Some(attempt);
+            pressed = true;
+        }
+    });
+    pressed
 }
 
 /// ⑤: the grant's options over the preset's defaults, each by its rule
@@ -2348,7 +2516,7 @@ mod tests {
                         Some(Step::Options | Step::Administrator) => 5,
                         Some(Step::Check) => 6,
                         Some(Step::Summary) => 7,
-                        Some(Step::Mode) => 8,
+                        Some(Step::Mode | Step::Raise | Step::Restore) => 8,
                     };
                     assert!(order(window.step()) <= order(Some(step)), "{case}: went on");
                 }
@@ -2780,6 +2948,212 @@ mod tests {
             };
             assert_eq!(choice.options.elevation, None, "{why}");
             assert_eq!(window.step(), Some(Step::Check), "{why}");
+        }
+    }
+
+    // ------------------------------------------------------------ the raise and the restore (§B.8.7.1)
+
+    use super::super::super::super::model::GrantLevel;
+
+    /// No level, no mark, *My machines*.
+    fn plain() -> GrantLevel {
+        GrantLevel {
+            holds: false,
+            marked: false,
+            preset: Preset::MyMachines,
+        }
+    }
+
+    /// The window host with `device(1)`'s control grant in `state`, its
+    /// level and mark `level`, on Windows facts.
+    fn with_a_level(state: &str, level: GrantLevel) -> Model {
+        let mut model = with_a_grant(SessionMode::Control);
+        if let Some(manager) = model.manager.as_mut() {
+            manager.grants[0].state = state.to_owned();
+        }
+        model.wizard.levels = vec![(device(1), level)];
+        model.wizard.account = Some(windows_admin());
+        model
+    }
+
+    /// "Give administrator access…" on the row: the raise's step, and the
+    /// preview it asked for.
+    fn at_raise() -> (Window, WizardChoice) {
+        let mut window = Window::new(with_a_level("active", plain()), WIDE);
+        let sent = window.click(RAISE);
+        let Some(Action::Manager(ManagerOp::Preview(choice))) = sent.first() else {
+            panic!("no preview asked: {sent:?}");
+        };
+        let choice = (**choice).clone();
+        assert_eq!(window.step(), Some(Step::Raise));
+        (window, choice)
+    }
+
+    /// Decision M1-67, §B.8.7.1: the raise from the manager asks the guard's
+    /// preview of the level alone; until it answers no passphrase is shown
+    /// and Continue sends nothing; then the plan's two lines and the
+    /// passphrase, and no own password; Continue sends that generated
+    /// passphrase with the level in one registration and keeps no copy. The
+    /// row offers no raise where the level does not exist (Linux facts, none
+    /// read), where the grant holds it, or for *Helping someone*.
+    #[test]
+    fn the_raise_cannot_finish_without_the_new_password() {
+        let (mut window, choice) = at_raise();
+        assert_eq!(
+            choice.options,
+            GrantOptions {
+                elevation: Some(Elevation::Admin),
+                ..GrantOptions::default()
+            },
+            "the level alone"
+        );
+        assert!(
+            window.click("Continue").is_empty(),
+            "not before the preview"
+        );
+        judge(&mut window, &choice, Some(true), None);
+        assert!(window.has_text(&RAISE_LINE.replace("<device>", "Office laptop")));
+        assert!(window.has_text(&NEW_GRANT_LINE.replace("<device>", "Office laptop")));
+        assert!(!window.has_control(USE_MY_OWN));
+        let shown = window.phrase();
+        let sent = window.click("Continue");
+        let [Action::Manager(ManagerOp::ChangePassword(request))] = sent.as_slice() else {
+            panic!("one registration: {sent:?}");
+        };
+        assert_eq!(request.choice, choice);
+        assert!(
+            matches!(&request.password, NewPassword::Generated(p) if p.0.as_str() == shown),
+            "the passphrase shown, as generated"
+        );
+        assert!(
+            window.wizard().is_some_and(|w| w.passphrase.is_none()),
+            "no copy"
+        );
+        for (account, level) in [
+            (Some(AccountFacts::Linux), plain()),
+            (None, plain()),
+            (
+                Some(windows_admin()),
+                GrantLevel {
+                    holds: true,
+                    ..plain()
+                },
+            ),
+            (
+                Some(windows_admin()),
+                GrantLevel {
+                    preset: Preset::HelpingSomeone,
+                    ..plain()
+                },
+            ),
+        ] {
+            let mut model = with_a_level("active", level);
+            model.wizard.account = account;
+            let window = Window::new(model, WIDE);
+            assert!(!window.has_control(RAISE), "{account:?} {level:?}");
+        }
+    }
+
+    /// §B.8.7.1: the raise offers Cancel first, then Continue: Cancel is on
+    /// the left and in the key order, Continue is not in it (a pointer click
+    /// only); Cancel closes the step and sends nothing. A refused level
+    /// shows the guard's reason and only Cancel.
+    #[test]
+    fn the_raise_offers_cancel_first() {
+        let (mut window, choice) = at_raise();
+        judge(&mut window, &choice, Some(true), None);
+        assert!(window.center("Cancel").x < window.center("Continue").x);
+        assert!(
+            window
+                .node("Cancel")
+                .supports_action(egui::accesskit::Action::Focus)
+        );
+        assert!(
+            !window
+                .node("Continue")
+                .supports_action(egui::accesskit::Action::Focus),
+            "pointer only"
+        );
+        assert!(window.click("Cancel").is_empty());
+        assert!(window.wizard().is_none(), "closed");
+        let (mut window, choice) = at_raise();
+        let why = tornect_core::levels::REFUSAL_ADMIN_STANDARD_ACCOUNT;
+        judge(&mut window, &choice, None, Some(why));
+        assert!(window.has_text(why));
+        assert!(!window.has_control("Continue"));
+        assert!(window.has_control("Cancel"));
+    }
+
+    /// M-UI-3's rule on the raise: no run of Tabs followed by Enter or Space
+    /// sends its registration; the click on Continue does.
+    #[test]
+    fn no_key_continues_the_raise() {
+        let raised = |actions: &[Action]| {
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Manager(ManagerOp::ChangePassword(_))))
+        };
+        // Past the sidebar and the section list to every button of the step.
+        for tabs in 0..=20 {
+            for key in [egui::Key::Enter, egui::Key::Space] {
+                let (mut window, choice) = at_raise();
+                judge(&mut window, &choice, Some(true), None);
+                let mut sent = Vec::new();
+                for _ in 0..tabs {
+                    sent.extend(window.key(egui::Key::Tab));
+                }
+                sent.extend(window.key(key));
+                assert!(!raised(&sent), "{tabs} tabs {key:?}: {sent:?}");
+            }
+        }
+        let (mut window, choice) = at_raise();
+        judge(&mut window, &choice, Some(true), None);
+        assert!(raised(&window.click("Continue")));
+    }
+
+    /// §B.8.6.1, decision M1-67: *Enable* on a disabled grant that holds the
+    /// level with its password marked sends no enable: the restore's step
+    /// opens with the plan's sentence and a generated passphrase, and its
+    /// Continue sends that passphrase with no option change, the enable to
+    /// follow it; an unmarked grant at the level, or a marked one without
+    /// it, is enabled at once.
+    #[test]
+    fn enabling_a_marked_grant_asks_for_a_new_password_first() {
+        let marked = GrantLevel {
+            holds: true,
+            marked: true,
+            ..plain()
+        };
+        let mut window = Window::new(with_a_level("disabled:restore", marked), WIDE);
+        assert!(window.click("Enable").is_empty(), "no enable yet");
+        assert_eq!(window.step(), Some(Step::Restore));
+        assert!(window.has_text(&RESTORE_LINE.replace("<device>", "Office laptop")));
+        let shown = window.phrase();
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            assert!(window.key(key).is_empty(), "{key:?}");
+        }
+        let sent = window.click("Continue");
+        let [Action::Manager(ManagerOp::Restore(request))] = sent.as_slice() else {
+            panic!("one restore: {sent:?}");
+        };
+        assert_eq!(request.choice, no_change());
+        assert!(matches!(&request.password, NewPassword::Generated(p) if p.0.as_str() == shown));
+        for level in [
+            GrantLevel {
+                holds: true,
+                ..plain()
+            },
+            GrantLevel {
+                marked: true,
+                ..plain()
+            },
+        ] {
+            let mut window = Window::new(with_a_level("disabled:restore", level), WIDE);
+            assert_eq!(
+                window.click("Enable"),
+                vec![Action::Manager(ManagerOp::Enable(device(1)))],
+                "{level:?}"
+            );
         }
     }
 }

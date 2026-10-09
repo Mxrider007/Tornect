@@ -1045,6 +1045,11 @@ pub enum ManagerOp {
     /// change nothing but, where control reaches the administrator level, the
     /// mode.
     ChangePassword(Box<GrantRequest>),
+    /// Give a device's grant that holds the administrator level, marked
+    /// after a restore or an import, a new generated password, then enable
+    /// it (§B.8.6.1, decision M1-67): one registration (its one dialog), then
+    /// *Enable* (its own).
+    Restore(Box<GrantRequest>),
     /// Set a device's mode from the manager (*Change mode*): to view only,
     /// deny-direction; to control where control reaches nothing more, a
     /// widening that asks for the password.
@@ -1200,9 +1205,13 @@ pub struct WizardView {
     pub raises: Option<(WizardChoice, Option<bool>)>,
     /// Each grant's mode, read with the manager's view (*Change mode*).
     pub modes: Vec<(DeviceId, SessionMode)>,
+    /// Each grant's administrator level and mark, read with the manager's
+    /// view (decision M1-67): the raise, the restore and their lines.
+    pub levels: Vec<(DeviceId, GrantLevel)>,
     /// This computer's account facts as the guard read them when the wizard
-    /// opened (decision M1-67): on Linux the administrator level does not
-    /// exist, so ⑤a is absent; `None` until read.
+    /// opened and with the manager's view (decision M1-67): on Linux the
+    /// administrator level does not exist, so ⑤a and the raise are absent;
+    /// `None` until read.
     pub account: Option<tornect_core::levels::AccountFacts>,
     /// The last choice judged whose administrator level this computer cannot
     /// give, with the guard's reason in the plan's words (§B.8.7.4).
@@ -1211,6 +1220,18 @@ pub struct WizardView {
     pub running: Option<u64>,
     /// How the last press ended.
     pub answer: Option<(u64, WizardAnswer)>,
+}
+
+/// A grant's administrator level and mark as the manager reads them
+/// (decision M1-67).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrantLevel {
+    /// It holds the administrator level.
+    pub holds: bool,
+    /// Its password is marked "answered 0" (§B.8.6.1).
+    pub marked: bool,
+    /// Its preset (*Helping someone* never holds the level).
+    pub preset: Preset,
 }
 
 /// One host setting of Settings, Security, as it is to be.
