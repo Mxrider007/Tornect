@@ -397,6 +397,31 @@ impl BannerWatch {
     }
 }
 
+/// How often the Sessions page's rows are read again from the session log.
+const SESSIONS_EVERY: Duration = Duration::from_secs(30);
+
+/// The Sessions page's rows and the log's folder (§B.8.13), from the session
+/// log and its rotated files, into the model when they changed: read on a
+/// blocking thread at the start and every [`SESSIONS_EVERY`], so that opening
+/// the page asks for nothing. Reads only.
+fn refresh_sessions(paths: &Paths, shared: &Shared) {
+    let log = tornect_core::session_log::SessionLog::new(paths.sessions_log());
+    let rows = log
+        .read_all_including_rotated()
+        .ok()
+        .map(|records| super::pages::session_rows(&records));
+    let folder = paths
+        .sessions_log()
+        .parent()
+        .map(|p| p.display().to_string());
+    if shared.read(|m| m.sessions != rows || m.log_folder != folder) {
+        shared.update(|m| {
+            m.sessions = rows;
+            m.log_folder = folder;
+        });
+    }
+}
+
 /// How often Settings, Security's view of unattended access is read again
 /// from the window host's guard.
 const MANAGER_EVERY: Duration = Duration::from_secs(30);
@@ -1764,6 +1789,18 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
     let b = Arc::new(b);
     b.shared.update(|m| m.history_notice = first);
     refresh_diagnostics(&b);
+    {
+        let (paths, shared) = (b.paths.clone(), Arc::clone(&b.shared));
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(SESSIONS_EVERY);
+            loop {
+                every.tick().await;
+                let (paths, shared) = (paths.clone(), Arc::clone(&shared));
+                let _ =
+                    tokio::task::spawn_blocking(move || refresh_sessions(&paths, &shared)).await;
+            }
+        });
+    }
     // Background mode: the desktop notifications that mirror the host's
     // sheets (§B.1.1).
     let notices = b
@@ -6568,5 +6605,39 @@ mod tests {
         assert_eq!(card(one).and_then(|c| c.nothing_ran), Some(1));
         assert_eq!(card(two).and_then(|c| c.nothing_ran), Some(0));
         assert_eq!(std::fs::read(&log).unwrap(), before, "read only");
+    }
+
+    // ------------------------------------------------------------ the Sessions page (§B.8.13)
+
+    /// §B.8.13: the tokio side reads the Sessions page's rows from the log by
+    /// itself, and reading writes nothing: the log stays byte-identical, no
+    /// file is added, and the rows hold the planned fields only.
+    #[test]
+    fn viewing_the_sessions_page_writes_nothing() {
+        use tornect_core::session_log::{SessionEvent, SessionLog, SessionMode, SessionRecord};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let log = SessionLog::new(paths.sessions_log());
+        let started = SessionRecord::now(SessionEvent::SessionStarted)
+            .peer(tornect_core::DeviceId::from_bytes([1; 32]), "Office laptop")
+            .session("s1")
+            .mode(SessionMode::Control);
+        log.append(&started).unwrap();
+        let dir = paths.sessions_log().parent().unwrap().to_path_buf();
+        let files = || std::fs::read_dir(&dir).unwrap().count();
+        let (before, count) = (std::fs::read(paths.sessions_log()).unwrap(), files());
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        refresh_sessions(&paths, &shared);
+        let rows = shared.read(|m| m.sessions.clone()).expect("read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "Office laptop");
+        assert_eq!(rows[0].mode, Some(SessionMode::Control));
+        assert_eq!(
+            shared.read(|m| m.log_folder.clone()),
+            Some(dir.display().to_string())
+        );
+        assert_eq!(std::fs::read(paths.sessions_log()).unwrap(), before);
+        assert_eq!(files(), count, "no file added");
     }
 }

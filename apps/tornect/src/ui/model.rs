@@ -208,6 +208,11 @@ pub struct Model {
     /// The diagnostics report of Settings, About (`crate::diagnostics`: it
     /// names nobody); empty until the tokio side has gathered it.
     pub diagnostics: String,
+    /// The Sessions page's rows (§B.8.13), newest first, as the tokio side
+    /// last read them from the session log; `None` until read.
+    pub sessions: Option<Vec<SessionRow>>,
+    /// The session log's folder, which "Open log folder" shows.
+    pub log_folder: Option<String>,
     /// The first start of this home in a window on screen: Home asks the
     /// name others see, and nothing that could send it (the host's start,
     /// Tor, a connection) runs until it is answered or skipped.
@@ -1271,6 +1276,21 @@ pub enum ViewOnly {
     /// This computer's account settings make control administrator access,
     /// and the grant does not hold the level.
     AccountSettings,
+}
+
+/// One row of the Sessions page (§B.8.13): only what the plan lets it show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRow {
+    /// When, as "YYYY-MM-DD HH:MM UTC".
+    pub when: String,
+    /// The other side's pinned label; "—" where the line has none.
+    pub label: String,
+    /// Control or view only, where the line says.
+    pub mode: Option<SessionMode>,
+    /// Unattended or attended, where the line says.
+    pub unattended: Option<bool>,
+    /// How it ended, from a fixed list of words.
+    pub ended: &'static str,
 }
 
 /// One host setting of Settings, Security, as it is to be.
