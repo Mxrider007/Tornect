@@ -16,6 +16,7 @@ use tornect_core::unattended::credentials::RememberOffer;
 use tornect_core::unattended::readiness::Probe;
 use tornect_core::{DeviceId, TornectId};
 
+use super::backend::Secret;
 use crate::ua_client::AdminAction;
 use tornect_core::words::{Identicon, Words};
 
@@ -217,6 +218,14 @@ pub struct Model {
     /// Why the last operation of Settings, Security was not done, in plain
     /// words (never a path); `None` once one is done.
     pub manager_note: Option<&'static str>,
+    /// An operation of Settings, Security that asks for the password is
+    /// running: the section offers none other until it returns.
+    pub manager_busy: bool,
+    /// The emergency stop code of the last *Turn on*, grouped as the command
+    /// line prints it (§B.8.7.4), until the person clicks "I have written it
+    /// down": then it is dropped (wiped). Never logged, never in `Debug`; a
+    /// window that closes while it is here turns unattended access off again.
+    pub stop_card: Option<Secret>,
 }
 
 impl Model {
@@ -967,6 +976,13 @@ pub struct Manager {
     /// A readiness row is not green: Home's sticky not-ready badge, while
     /// unattended access is on.
     pub not_ready: bool,
+    /// The host settings kept in the store: keep this computer awake, prevent
+    /// its idle lock, notify at each unattended session.
+    pub keep_awake: bool,
+    /// See [`Manager::keep_awake`].
+    pub prevent_idle_lock: bool,
+    /// See [`Manager::keep_awake`].
+    pub notify: bool,
 }
 
 /// A device that can connect here without asking, as the manager shows it
@@ -992,10 +1008,25 @@ pub struct GrantRow {
 
 /// One operation of Settings, Security (§B.8.6.2, §B.8.7.3), which the tokio
 /// side runs through the window host's guard as the window (`Actor::Ui`);
-/// the page changes only on the guard's answer. These are deny-direction:
-/// none asks for the password.
+/// the page changes only on the guard's answer. Turn off, Pause, Revoke all,
+/// Suspend, Disable, Revoke and Remove are deny-direction and ask no
+/// password; Turn on, Enable, Unlock, Resume and the host settings are
+/// access-increasing: one dialog each, never during or 60 s after a remote
+/// session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagerOp {
+    /// Turn unattended access on: a new emergency stop code is shown once.
+    On,
+    /// The stop code was written down: it is dropped (no guard operation).
+    StopCodeWrittenDown,
+    /// Enable the device's disabled access.
+    Enable(DeviceId),
+    /// Unlock the device's locked access (its failed attempts are reset).
+    Unlock(DeviceId),
+    /// Resume the device's suspended access.
+    Resume(DeviceId),
+    /// Change one host setting kept in the store.
+    Setting(HostSetting),
     /// Turn unattended access off.
     Off,
     /// Pause unattended access: only while no pause runs, so that no choice
@@ -1011,6 +1042,17 @@ pub enum ManagerOp {
     Revoke(DeviceId),
     /// Remove the device: its unattended access, then its pairing.
     Remove(DeviceId),
+}
+
+/// One host setting of Settings, Security, as it is to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostSetting {
+    /// Keep this computer awake while unattended access is on.
+    KeepAwake(bool),
+    /// Prevent the idle lock while unattended access is on.
+    PreventIdleLock(bool),
+    /// Notify at each unattended session.
+    Notify(bool),
 }
 
 /// When a pause started from Settings, Security ends.

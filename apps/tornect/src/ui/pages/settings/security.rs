@@ -18,7 +18,9 @@ use tornect_core::address_book::Day;
 use tornect_core::session_log::Actor;
 use tornect_core::unattended::readiness::{Probe, row_title};
 
-use super::super::super::model::{GrantRow, Manager, ManagerOp, Model, PauseEnd, Setup};
+use super::super::super::model::{
+    GrantRow, HostSetting, Manager, ManagerOp, Model, PauseEnd, Setup,
+};
 use super::super::super::theme::{self, Face, Tokens};
 use super::super::super::view::Action;
 use super::super::super::widgets::{self, Button, Kind, Tone};
@@ -46,6 +48,36 @@ pub(in super::super) const ADVISORY: &str = "Tornect cannot judge the strength o
 
 /// Master off.
 pub(in super::super) const TURN_OFF: &str = "Turn off";
+
+/// Master on, which asks for the password and shows a new stop code once.
+pub(in super::super) const TURN_ON: &str = "Turn on";
+
+/// The stop code card's heading (§B.8.7.4).
+pub(in super::super) const STOP_HEADING: &str = "Emergency stop code";
+
+/// What the stop code does.
+pub(in super::super) const STOP_DOES: &str = "Typed at another of your devices, it turns \
+    unattended access off here and removes every grant.";
+
+/// Under the stop code (§B.8.7.4, as the command line says it).
+pub(in super::super) const WRITE_IT_DOWN: &str =
+    "Write it down now: Tornect does not show it again and keeps no copy.";
+
+/// The click that delivers the stop code.
+pub(in super::super) const WRITTEN_DOWN: &str = "I have written it down";
+
+/// A host setting as it is to be, given its switch's new state.
+pub(in super::super) type SettingOf = fn(bool) -> HostSetting;
+
+/// The host settings kept in the store, as their switches name them.
+pub(in super::super) const SETTINGS: [(&str, SettingOf); 3] = [
+    ("Keep this computer awake", HostSetting::KeepAwake),
+    (
+        "Prevent idle lock while unattended access is on",
+        HostSetting::PreventIdleLock,
+    ),
+    ("Notify me of each unattended session", HostSetting::Notify),
+];
 
 /// The pause's ends, offered only while no pause runs (§B.8.6.2: 12 h and
 /// until re-enabled; the end at 08:00 waits for the operator's ruling, as
@@ -107,6 +139,24 @@ pub(super) fn section(
     ui.add_space(4.0);
     widgets::chip(ui, tone, true, &state);
     ui.add_space(10.0);
+    // The one stop-code card: never while this screen is shared or a sheet
+    // is up (kept until the click, drawn again after).
+    let sheet = !model.popups.is_empty() || model.confirm.is_some();
+    if let Some(code) = model.stop_card.as_ref().filter(|_| !shared && !sheet) {
+        stop_card(ui, t, &code.0, actions);
+        ui.add_space(10.0);
+    }
+    if !shared && (!manager.on || manager.paused_until.is_some()) {
+        if Button::new(Kind::Primary, TURN_ON)
+            .small()
+            .enabled(!model.manager_busy)
+            .show(ui)
+            .clicked()
+        {
+            actions.push(Action::Manager(ManagerOp::On));
+        }
+        ui.add_space(6.0);
+    }
     header_controls(ui, manager, form, shared, actions);
     if let Some(note) = model.manager_note {
         line(ui, note, t.danger_text);
@@ -120,7 +170,7 @@ pub(super) fn section(
         line(ui, NO_DEVICE, t.text_secondary);
     } else {
         for row in &manager.grants {
-            grant_row(ui, t, row, actions);
+            grant_row(ui, t, row, model.manager_busy, actions);
             ui.add_space(8.0);
         }
     }
@@ -135,6 +185,26 @@ pub(super) fn section(
     }
     ui.add_space(6.0);
     line(ui, ADVISORY, t.text_muted);
+    if !shared {
+        ui.add_space(20.0);
+        widgets::section_header(ui, "While unattended access is on");
+        ui.add_enabled_ui(!model.manager_busy, |ui| {
+            let now = [
+                manager.keep_awake,
+                manager.prevent_idle_lock,
+                manager.notify,
+            ];
+            for ((label, setting), was) in SETTINGS.into_iter().zip(now) {
+                ui.horizontal(|ui| {
+                    let mut on = was;
+                    if widgets::toggle(ui, &mut on, label).changed() {
+                        actions.push(Action::Manager(ManagerOp::Setting(setting(on))));
+                    }
+                    ui.label(label);
+                });
+            }
+        });
+    }
     if let Some(setup) = &model.setup {
         ui.add_space(20.0);
         screen_sharing(ui, t, setup, !model.sharing.is_empty(), shared, actions);
@@ -294,7 +364,7 @@ pub(in super::super) fn header(manager: &Manager, today: Day) -> (Tone, String) 
 /// One device's row: its pinned label, its state, its device words, who
 /// gave it access, when it last connected and its failed attempts since the
 /// last unlock (§B.8.7.3), and its operations.
-fn grant_row(ui: &mut Ui, t: &Tokens, row: &GrantRow, actions: &mut Vec<Action>) {
+fn grant_row(ui: &mut Ui, t: &Tokens, row: &GrantRow, busy: bool, actions: &mut Vec<Action>) {
     widgets::card(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
@@ -315,6 +385,26 @@ fn grant_row(ui: &mut Ui, t: &Tokens, row: &GrantRow, actions: &mut Vec<Action>)
         }
         line(ui, &details(row, Day::today()), t.text_secondary);
         ui.horizontal_wrapped(|ui| {
+            // What the state lets come back, each asking for the password.
+            let (kind, _) = row
+                .state
+                .split_once(':')
+                .unwrap_or((row.state.as_str(), ""));
+            let back: Option<(&str, RowOp)> = match kind {
+                "disabled" => Some(("Enable", ManagerOp::Enable)),
+                "locked" | "hard_locked" => Some(("Unlock", ManagerOp::Unlock)),
+                "suspended" => Some(("Resume", ManagerOp::Resume)),
+                _ => None,
+            };
+            if let Some((label, op)) = back
+                && Button::new(Kind::Primary, label)
+                    .small()
+                    .enabled(!busy)
+                    .show(ui)
+                    .clicked()
+            {
+                actions.push(Action::Manager(op(row.device)));
+            }
             for (label, op) in ROW_OPS {
                 if Button::new(Kind::Secondary, label)
                     .small()
@@ -325,6 +415,35 @@ fn grant_row(ui: &mut Ui, t: &Tokens, row: &GrantRow, actions: &mut Vec<Action>)
                 }
             }
         });
+    });
+}
+
+/// The one card of a new stop code: what it does, the code as text that
+/// cannot be selected or copied, that it is shown once, and the click that
+/// delivers it (§B.8.7.4).
+fn stop_card(ui: &mut Ui, t: &Tokens, code: &str, actions: &mut Vec<Action>) {
+    widgets::card(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            RichText::new(STOP_HEADING)
+                .font(theme::font(ui.ctx(), Face::Semibold, 15.0))
+                .color(t.text_primary),
+        );
+        line(ui, STOP_DOES, t.text_secondary);
+        ui.add_space(6.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(code)
+                    .font(theme::font(ui.ctx(), Face::Mono, 20.0))
+                    .color(t.text_primary),
+            )
+            .selectable(false),
+        );
+        ui.add_space(6.0);
+        line(ui, WRITE_IT_DOWN, t.warn);
+        if Button::new(Kind::Primary, WRITTEN_DOWN).show(ui).clicked() {
+            actions.push(Action::Manager(ManagerOp::StopCodeWrittenDown));
+        }
     });
 }
 
