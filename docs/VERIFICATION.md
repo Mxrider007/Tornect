@@ -1120,6 +1120,6 @@ home.
 | The Sessions page after real sessions | NEEDS-DEVICE(linux, windows) | Recipe: one attended and one unattended session each way between two computers; Sessions on each: the rows newest first, each with its time, the other side's label, its mode, attended or unattended and how it ended, no key or path; compare `sessions.log` before and after opening the page: unchanged |
 | The Windows target type-checks | VERIFIED (check only) at each commit of the settings pages | `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnullvm -j 1 -- -D warnings -A clippy::result_large_err` |
 
-Not done, said here so that nobody reads it as done: ③'s lines of the presets' defaults and the one press of Turn on at a time (the command
-loop answers a second one) are built without a test of their own yet; the pause's end at 08:00 is OPEN until a zone
+Not done, said here so that nobody reads it as done: the one press of Turn on at a time (the command
+loop answers a second one) is built without a test of its own yet; the pause's end at 08:00 is OPEN until a zone
 source exists; a `config.toml` is still written in place, not atomically.
