@@ -752,6 +752,34 @@ impl ManagerWatch {
                 m.wizard.cards = cards;
             });
         }
+        // The last turn-off's lines (§B.8.7.1 ⑤a) are true only while that
+        // grant is there, active and without the level: read again with the
+        // view, they go once it holds the level, is gone or is not active.
+        let off = shared.read(|m| m.wizard.level_off);
+        if let Some((device, _)) = off {
+            let still = self
+                .ctx
+                .guard
+                .store()
+                .read(|s| {
+                    s.grants.iter().any(|g| {
+                        g.device == device
+                            && !g.holds_level()
+                            && matches!(
+                                g.state,
+                                tornect_core::unattended::grant::GrantState::Active
+                            )
+                    })
+                })
+                .unwrap_or(false);
+            if !still {
+                shared.update(|m| {
+                    if m.wizard.level_off == off {
+                        m.wizard.level_off = None;
+                    }
+                });
+            }
+        }
     }
 
     /// Each granted device's card lines in the address book (§B.8.6.1,
@@ -853,6 +881,11 @@ impl ManagerWatch {
                 kill.kill(reason);
             }
         };
+        // The last turn-off's lines speak of the state before this operation:
+        // they go with it (a turn-off sets its own again).
+        if shared.read(|m| m.wizard.level_off.is_some()) {
+            shared.update(|m| m.wizard.level_off = None);
+        }
         // The wizard's operations keep their own state: none of them touches
         // the section's note or its busy flag.
         let op = match op {
@@ -7069,6 +7102,58 @@ mod tests {
         );
         assert!(!store.grant(&two).unwrap().holds_level());
         assert_eq!(reauth.calls(), asked, "no dialog");
+    }
+
+    /// The turn-off's lines go once they stop being true: a raise of the
+    /// device (the view then reads its grant at the level), a change made
+    /// elsewhere that the view reads next (the grant disabled), and the next
+    /// operation of the section.
+    #[test]
+    fn the_turn_off_lines_go_when_they_stop_being_true() {
+        use tornect_core::levels::{FixedFacts, HelperPresence};
+        use tornect_core::session_log::Actor;
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = wizard_watch(
+            tmp.path(),
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            Arc::new(FixedFacts::new(windows_admin(), HelperPresence::Absent)),
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let [one, two] = [1, 2].map(|b| tornect_core::DeviceId::from_bytes([b; 32]));
+        for (attempt, device) in [(1, one), (2, two)] {
+            watch.wizard_grant(
+                with_level(attempt, device, Preset::MyMachines, generated_pw()),
+                &shared,
+            );
+        }
+        // Turned off, then raised again.
+        watch.run(ManagerOp::LevelOff(one), &shared);
+        assert!(shared.read(|m| m.wizard.level_off).is_some());
+        watch.change_password(raise(3, one, generated_pw()), &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((3, WizardAnswer::Done))
+        );
+        assert!(watch.ctx.guard.store().grant(&one).unwrap().holds_level());
+        assert_eq!(shared.read(|m| m.wizard.level_off), None, "raised");
+        // Turned off, then disabled from the command line.
+        watch.run(ManagerOp::LevelOff(two), &shared);
+        assert!(shared.read(|m| m.wizard.level_off).is_some());
+        watch.ctx.guard.disable(Actor::Cli, &two).unwrap();
+        watch.refresh(&shared);
+        assert_eq!(shared.read(|m| m.wizard.level_off), None, "disabled");
+        // Turned off, then the section's next operation.
+        watch.run(ManagerOp::LevelOff(one), &shared);
+        assert!(shared.read(|m| m.wizard.level_off).is_some());
+        watch.run(ManagerOp::Setting(HostSetting::Notify(true)), &shared);
+        assert_eq!(
+            shared.read(|m| m.wizard.level_off),
+            None,
+            "the next operation"
+        );
     }
 
     // ------------------------------------------------------------ the device cards (§B.8.6.1)
