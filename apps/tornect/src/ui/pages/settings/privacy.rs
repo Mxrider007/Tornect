@@ -69,14 +69,26 @@ pub(super) fn section(
 ) {
     let t = theme::tokens(ui.ctx());
     widgets::section_header(ui, "What others learn");
+    // The name in use, as Home names it (the saved one until the start
+    // fills it in); a saved rename is sent from the next start on.
+    let saved = &model.settings.device_name;
+    let in_use = if model.device_name.is_empty() {
+        saved
+    } else {
+        &model.device_name
+    };
     ui.label(
-        RichText::new(format!(
-            "The name \u{201c}{}\u{201d}",
-            model.settings.device_name
-        ))
-        .font(theme::font(ui.ctx(), Face::Semibold, 14.0))
-        .color(t.text_primary),
+        RichText::new(format!("The name \u{201c}{in_use}\u{201d}"))
+            .font(theme::font(ui.ctx(), Face::Semibold, 14.0))
+            .color(t.text_primary),
     );
+    if saved != in_use {
+        line(
+            ui,
+            &format!("\u{201c}{saved}\u{201d} from the next start."),
+            t.text_secondary,
+        );
+    }
     line(ui, NAME_NOTE, t.text_secondary);
     ui.add_space(4.0);
     line(ui, NETWORK_LINE, t.text_secondary);
