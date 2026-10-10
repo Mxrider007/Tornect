@@ -1411,7 +1411,15 @@ mod tests {
         done.unwrap();
         let (done, script) = env.uninstall(&|spec| backends.make(spec));
         done.unwrap();
-        assert_eq!(env.ctx.guard.store().grants(), grants);
+        // The store's flush time is kept to the second: a write in a later
+        // second moves it.
+        let unflushed = |mut grants: Vec<tornect_core::unattended::grant::UnattendedGrant>| {
+            for grant in &mut grants {
+                grant.fail.flushed_at = 0;
+            }
+            grants
+        };
+        assert_eq!(unflushed(env.ctx.guard.store().grants()), unflushed(grants));
         assert_eq!(
             std::fs::read(env.paths.trusted_devices_file()).unwrap(),
             b"# paired devices\n"
