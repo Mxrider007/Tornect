@@ -2213,6 +2213,28 @@ mod tests {
         }
     }
 
+    /// No other settings section, the grant wizard, the Sessions page or
+    /// Home reads this computer's network name: none of their sources names
+    /// it (built behaviour, pinned).
+    #[test]
+    fn no_other_page_reads_the_host_name() {
+        for (file, source) in [
+            ("settings/about.rs", include_str!("settings/about.rs")),
+            (
+                "settings/connection.rs",
+                include_str!("settings/connection.rs"),
+            ),
+            ("settings/display.rs", include_str!("settings/display.rs")),
+            ("settings/privacy.rs", include_str!("settings/privacy.rs")),
+            ("settings/security.rs", include_str!("settings/security.rs")),
+            ("settings/wizard.rs", include_str!("settings/wizard.rs")),
+            ("sessions.rs", include_str!("sessions.rs")),
+            ("home.rs", include_str!("home.rs")),
+        ] {
+            assert!(!source.contains("host_name"), "{file}");
+        }
+    }
+
     /// While this screen may be in a picture that leaves it (a session
     /// live, another Tornect process hosting), no section of the settings
     /// page offers a control that writes, a name half typed included: the
