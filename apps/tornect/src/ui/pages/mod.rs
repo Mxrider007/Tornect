@@ -2641,6 +2641,43 @@ mod tests {
         manager
     }
 
+    /// "Give administrator access…" is offered on a control row only: the
+    /// administrator level is a level of control.
+    #[test]
+    fn a_view_only_row_offers_no_raise() {
+        use super::super::model::GrantLevel;
+        use tornect_core::session_log::SessionMode;
+        use tornect_core::unattended::grant::Preset;
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        let mut model = at_rest();
+        model.manager = Some(manager_on());
+        model.wizard.account = Some(tornect_core::levels::AccountFacts::Windows(
+            tornect_core::levels::WindowsFacts {
+                installed: true,
+                administrator: true,
+                ..Default::default()
+            },
+        ));
+        model.wizard.levels = vec![(
+            device,
+            GrantLevel {
+                holds: false,
+                marked: false,
+                preset: Preset::MyMachines,
+            },
+        )];
+        for (mode, offered) in [(SessionMode::ViewOnly, 0), (SessionMode::Control, 1)] {
+            model.wizard.modes = vec![(device, mode)];
+            let window = security_section(model.clone(), WIDE);
+            let raises = window
+                .controls()
+                .iter()
+                .filter(|c| *c == settings::wizard::RAISE)
+                .count();
+            assert_eq!(raises, offered, "{mode:?}");
+        }
+    }
+
     /// A click on a control of Settings, Security sends one operation for
     /// the window host's guard and nothing else; the section does not change
     /// on the click (it shows what the guard's answer is read back as):

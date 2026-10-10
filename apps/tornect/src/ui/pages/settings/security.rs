@@ -19,7 +19,7 @@ use egui::{RichText, Ui};
 use tornect_core::DeviceId;
 use tornect_core::address_book::Day;
 use tornect_core::levels::AccountFacts;
-use tornect_core::session_log::Actor;
+use tornect_core::session_log::{Actor, SessionMode};
 use tornect_core::unattended::grant::Preset;
 use tornect_core::unattended::readiness::{Probe, row_title};
 
@@ -590,11 +590,18 @@ fn grant_row(
         .find(|(d, _)| *d == row.device)
         .map(|(_, level)| *level);
     let restore = level.is_some_and(|l| l.holds && l.marked);
-    // The level exists where the guard's account facts are not Linux's.
+    // The level exists where the guard's account facts are not Linux's, and
+    // it is a level of control: a view-only row offers no raise.
+    let control = model
+        .wizard
+        .modes
+        .iter()
+        .any(|(d, mode)| *d == row.device && *mode == SessionMode::Control);
     let may_raise = matches!(
         model.wizard.account,
         Some(AccountFacts::Windows(_) | AccountFacts::Unreadable)
-    ) && level.is_some_and(|l| !l.holds && l.preset != Preset::HelpingSomeone);
+    ) && control
+        && level.is_some_and(|l| !l.holds && l.preset != Preset::HelpingSomeone);
     widgets::card(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
