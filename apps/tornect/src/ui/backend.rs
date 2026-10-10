@@ -3571,6 +3571,92 @@ mod tests {
         assert_eq!(reauth.calls(), ["acknowledge_banner"]);
     }
 
+    /// A banner watch over a store in `home` with unattended access on and
+    /// one grant just created (so the banner shows), whose guard asks
+    /// `reauth` and sees `activity`.
+    fn banner_with_a_grant(
+        home: &std::path::Path,
+        reauth: Arc<dyn tornect_core::unattended::guard::ReAuth>,
+        activity: Arc<dyn tornect_core::unattended::guard::RemoteSessionActivity>,
+    ) -> BannerWatch {
+        use tornect_core::session_log::Actor;
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{AllowAllReAuth, MutationGuard, NoSessionActivity};
+        use tornect_core::unattended::ipc::GrantOptions;
+        let setup = manager_over(
+            home,
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            tornect_core::levels::AccountFacts::Linux,
+            b"this machine",
+        );
+        let guard = &setup.ctx.guard;
+        guard.master_on(Actor::Cli, &[9; 32]).unwrap();
+        guard
+            .create_grant(
+                Actor::Cli,
+                &tornect_core::DeviceId::from_bytes([3; 32]),
+                Preset::HeadlessBox,
+                &GrantOptions::default(),
+                &[0u8; 192],
+                false,
+            )
+            .unwrap();
+        BannerWatch {
+            guard: Arc::new(MutationGuard::new(
+                guard.store().clone(),
+                reauth,
+                activity,
+                Arc::clone(&setup.ctx.facts),
+            )),
+            acknowledged: Mutex::new(None),
+        }
+    }
+
+    /// §B.8.6.2: an acknowledgement whose password is not confirmed changes
+    /// nothing: the banner stays, also when the view is read again.
+    #[test]
+    fn a_refused_acknowledgement_keeps_the_banner() {
+        use tornect_core::unattended::guard::{DenyAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = banner_with_a_grant(
+            tmp.path(),
+            Arc::new(DenyAllReAuth),
+            Arc::new(NoSessionActivity),
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.refresh(&shared);
+        assert!(shared.read(|m| m.unattended_banner.is_some()), "shown");
+        watch.acknowledge(&shared);
+        watch.refresh(&shared);
+        assert!(shared.read(|m| m.unattended_banner.is_some()), "it stays");
+    }
+
+    /// §B.8.6.2: the acknowledgement is an access-increasing kind of
+    /// operation: during a remote session it asks no dialog and the banner
+    /// stays.
+    #[test]
+    fn no_acknowledgement_during_a_remote_session() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, ScriptedActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let activity = Arc::new(ScriptedActivity::default());
+        activity.set_live(true);
+        let watch = banner_with_a_grant(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            Arc::clone(&activity)
+                as Arc<dyn tornect_core::unattended::guard::RemoteSessionActivity>,
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.refresh(&shared);
+        assert!(shared.read(|m| m.unattended_banner.is_some()), "shown");
+        watch.acknowledge(&shared);
+        watch.refresh(&shared);
+        assert!(reauth.calls().is_empty(), "no dialog");
+        assert!(shared.read(|m| m.unattended_banner.is_some()), "it stays");
+    }
+
     /// Settings, Security's view is read from the window host's guard
     /// (§B.8.7.3): the master switch, a running pause, each grant's pinned
     /// label, who gave it access, its state, when it last connected and its
