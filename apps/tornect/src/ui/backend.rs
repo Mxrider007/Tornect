@@ -1199,7 +1199,9 @@ impl ManagerWatch {
         let (answer, reaching) = match changed {
             Ok(reaching) => match self.ctx.guard.enable(Actor::Ui, &choice.device) {
                 Ok(()) => (WizardAnswer::Done, reaching),
-                Err(e) => (WizardAnswer::Refused(refusal(&e)), Vec::new()),
+                // The new password stays: the step says so and asks for no
+                // other.
+                Err(_) => (WizardAnswer::SetNotEnabled, Vec::new()),
             },
             Err(answer) => (answer, Vec::new()),
         };
@@ -7053,6 +7055,69 @@ mod tests {
         assert!(!grant.marked(), "a new generated password");
         assert!(
             matches!(grant.state, GrantState::Active),
+            "{:?}",
+            grant.state
+        );
+    }
+
+    /// §B.8.6.1: a restore whose new password is set but whose *Enable* is
+    /// refused answers so: the grant keeps the new password (unmarked) and
+    /// stays disabled.
+    #[test]
+    fn a_restore_whose_enable_is_refused_keeps_the_new_password() {
+        use crate::test_support::ReAuthSequence;
+        use tornect_core::levels::{FixedFacts, HelperPresence};
+        use tornect_core::unattended::grant::{GrantState, Preset};
+        use tornect_core::unattended::guard::AllowAllReAuth;
+        let tmp = tempfile::tempdir().unwrap();
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        let facts = || Arc::new(FixedFacts::new(windows_admin(), HelperPresence::Absent));
+        {
+            let watch = watch_on_machine(
+                tmp.path(),
+                Arc::new(AllowAllReAuth::default()),
+                facts(),
+                b"the first machine",
+            );
+            let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+            watch.wizard_grant(
+                with_level(1, device, Preset::MyMachines, generated_pw()),
+                &shared,
+            );
+            assert_eq!(
+                shared.read(|m| m.wizard.answer),
+                Some((1, WizardAnswer::Done))
+            );
+        }
+        let reauth = Arc::new(ReAuthSequence::new(&[true, false]));
+        let watch = watch_on_machine(
+            tmp.path(),
+            Arc::clone(&reauth) as Arc<dyn tornect_core::unattended::guard::ReAuth>,
+            facts(),
+            b"another machine",
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.restore(
+            GrantRequest {
+                attempt: 2,
+                choice: WizardChoice {
+                    device,
+                    preset: Preset::MyMachines,
+                    options: tornect_core::unattended::ipc::GrantOptions::default(),
+                },
+                password: generated_pw(),
+            },
+            &shared,
+        );
+        assert_eq!(
+            shared.read(|m| m.wizard.answer),
+            Some((2, WizardAnswer::SetNotEnabled))
+        );
+        assert_eq!(reauth.calls(), ["set_password", "enable"]);
+        let grant = watch.ctx.guard.store().grant(&device).unwrap();
+        assert!(!grant.marked(), "the new password is set");
+        assert!(
+            matches!(grant.state, GrantState::Disabled { .. }),
             "{:?}",
             grant.state
         );

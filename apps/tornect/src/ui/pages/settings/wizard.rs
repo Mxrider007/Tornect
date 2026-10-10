@@ -216,6 +216,11 @@ pub(in super::super) const RAISE_LINE: &str = "Administrator access needs a new 
 pub(in super::super) const RESTORE_LINE: &str = "Administrator access for <device> needs a new \
     password after a restore or an import. The old one stops working when you finish.";
 
+/// The restore's end when its new password was set but *Enable* was refused
+/// (§B.8.6.1); `<device>` stands for the pinned label.
+pub(in super::super) const RESTORED_NOT_ENABLED: &str =
+    "The new password for <device> is set. Its access is still disabled: use Enable on its row.";
+
 /// The ⑤a offer's heading (§B.8.7.1); `<labels>` stands for the pinned
 /// labels of the devices it names.
 pub(in super::super) const OFFER_HEADING: &str = "These devices have control of this computer: \
@@ -411,6 +416,9 @@ pub(in super::super) struct Wizard {
     pub(in super::super) level_line: bool,
     /// ⑤a's offer, once a change made other control grants reach the level.
     pub(in super::super) offer: Option<Offer>,
+    /// The restore's new password was set and *Enable* refused: the step
+    /// ends with the sentence that says so.
+    pub(in super::super) not_enabled: bool,
 }
 
 impl std::fmt::Debug for Wizard {
@@ -446,6 +454,7 @@ impl Wizard {
             note: None,
             level_line: false,
             offer: None,
+            not_enabled: false,
         }
     }
 
@@ -694,6 +703,11 @@ pub(in super::super) fn draw(
                 WizardAnswer::Refused(why) => {
                     w.note = Some(why);
                     w.again();
+                }
+                // The restore's new password is set: no other is asked.
+                WizardAnswer::SetNotEnabled => {
+                    w.drop_passwords();
+                    w.not_enabled = true;
                 }
             }
         }
@@ -1321,6 +1335,16 @@ fn level_password(
         ui.add_space(6.0);
     }
     let label = label_of(model, w);
+    if w.not_enabled {
+        line(
+            ui,
+            &RESTORED_NOT_ENABLED.replace("<device>", &label),
+            t.text_primary,
+        );
+        ui.add_space(10.0);
+        ui.horizontal(|ui| cancel(ui, true, close));
+        return false;
+    }
     let refused = model
         .wizard
         .level_refused
@@ -3628,6 +3652,33 @@ mod tests {
                 "{level:?}"
             );
         }
+    }
+
+    /// §B.8.6.1: a restore whose new password was set but whose *Enable* was
+    /// refused ends with the sentence that says so, and with no new
+    /// passphrase (the password set stays the grant's).
+    #[test]
+    fn a_restore_whose_enable_was_refused_asks_for_no_other_password() {
+        let marked = GrantLevel {
+            holds: true,
+            marked: true,
+            ..plain()
+        };
+        let mut window = Window::new(with_a_level("disabled:restore", marked), WIDE);
+        assert!(window.click("Enable").is_empty(), "no enable yet");
+        window.phrase();
+        let sent = window.click("Continue");
+        let [Action::Manager(ManagerOp::Restore(request))] = sent.as_slice() else {
+            panic!("one restore: {sent:?}");
+        };
+        window.model.wizard.answer = Some((request.attempt, WizardAnswer::SetNotEnabled));
+        window.pass(Vec::new());
+        window.pass(Vec::new());
+        assert_eq!(window.step(), Some(Step::Restore));
+        assert!(window.has_text(&RESTORED_NOT_ENABLED.replace("<device>", "Office laptop")));
+        let w = window.wizard().expect("open");
+        assert!(w.passphrase.is_none(), "no new passphrase");
+        assert!(!window.has_control("Continue"));
     }
 
     // ------------------------------------------------------------ ⑤a's offer (§B.8.7.1)
