@@ -12,8 +12,9 @@
 //! grant's options over the preset's defaults, each by its own rule, and
 //! shows the host-wide ones as they are; an option that makes the reach
 //! non-zero takes an own password back to ④'s generator. ⑤a, where the
-//! guard's account facts are not Linux's, offers the administrator level,
-//! off in every preset, with its warning, or the guard's refusal; on, it
+//! guard's account facts are not Linux's and ⑤ chose Control, offers the
+//! administrator level, off in every preset, with its warning, or the guard's
+//! refusal; on, it
 //! takes ④ back to the generator with the new-grant line under it (on Linux
 //! ⑤ says why the step is absent). ⑥ shows this
 //! computer's readiness rows; a red one needs "Enable anyway". ⑦ sums it up,
@@ -1592,7 +1593,8 @@ fn options(
         .policy
         .as_ref()
         .is_none_or(|p| p.min_score >= password::MIN_SCORE_FILE_KEYSTORE);
-    let level_step = level_step(model);
+    // ⑤a for control only: the administrator level is a level of control.
+    let level_step = level_step(model) && w.options.mode == SessionMode::Control;
     if !level_step {
         w.options.admin = false;
     }
@@ -3248,8 +3250,10 @@ mod tests {
     }
 
     /// The wizard at ⑤ for `preset` with the guard's account facts
-    /// `account`, then ⑤'s Continue (for *Headless box* with no time to stop
-    /// a connection, after its "I understand"): the preview it asked for.
+    /// `account`, then ⑤'s Continue (for *Helping someone*, View only by
+    /// default, after choosing Control, since ⑤a is a step of control; for
+    /// *Headless box* with no time to stop a connection, after its "I
+    /// understand"): the preview it asked for.
     fn continue_from_options(
         preset: &str,
         account: Option<AccountFacts>,
@@ -3257,6 +3261,9 @@ mod tests {
         let mut window = at_options(preset, false);
         window.model.wizard.account = account;
         window.pass(Vec::new());
+        if preset == "Helping someone" {
+            assert!(window.click("Control").is_empty());
+        }
         if window.has_control(I_UNDERSTAND) {
             assert!(window.click(I_UNDERSTAND).is_empty());
         }
@@ -3327,6 +3334,38 @@ mod tests {
             assert_eq!(choice.options.elevation, None, "{preset}: no level");
             assert_eq!(window.step(), Some(Step::Check), "{preset}");
         }
+    }
+
+    /// §B.8.7.1 ⑤a: the administrator level is a level of control: with View
+    /// only at ⑤ the wizard goes on with no ⑤a, and its choice carries no
+    /// level, also after ⑤a had turned it on for control.
+    #[test]
+    fn view_only_offers_no_administrator_step() {
+        let mut window = at_options("My machines", false);
+        window.model.wizard.account = Some(windows_admin());
+        window.pass(Vec::new());
+        assert!(window.click("View only").is_empty());
+        let sent = window.click("Continue");
+        let Some(Action::Manager(ManagerOp::Preview(choice))) = sent.first() else {
+            panic!("no preview asked: {sent:?}");
+        };
+        assert_eq!(window.step(), Some(Step::Check), "no ⑤a");
+        assert_eq!(choice.options.mode, Some(SessionMode::ViewOnly));
+        assert_eq!(choice.options.elevation, None);
+        // The level on at ⑤a for control, then back to ⑤ and View only.
+        let (mut window, probe) = continue_from_options("My machines", Some(windows_admin()));
+        judge(&mut window, &probe, Some(true), None);
+        assert!(window.click(&prompt()).is_empty());
+        assert!(window.wizard().expect("open").options.admin);
+        assert!(window.click("Back").is_empty());
+        assert_eq!(window.step(), Some(Step::Options));
+        assert!(window.click("View only").is_empty());
+        let sent = window.click("Continue");
+        let Some(Action::Manager(ManagerOp::Preview(choice))) = sent.first() else {
+            panic!("no preview asked: {sent:?}");
+        };
+        assert_eq!(window.step(), Some(Step::Check), "no ⑤a");
+        assert_eq!(choice.options.elevation, None, "the level went");
     }
 
     /// §B.8.7.1: on Linux the step is absent and ⑤ says the plan's sentence
