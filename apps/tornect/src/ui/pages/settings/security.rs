@@ -309,7 +309,13 @@ pub(super) fn section(
     ui.add_space(20.0);
     widgets::section_header(ui, "Readiness");
     for (name, probe) in &manager.readiness {
-        let (tone, text) = readiness_line(name, probe);
+        // While shared, no probe's message: it may name a path, and so the
+        // account.
+        let (tone, text) = if shared {
+            readiness_state(name, probe)
+        } else {
+            readiness_line(name, probe)
+        };
         ui.horizontal_top(|ui| {
             widgets::dot(ui, tone);
             line(ui, &text, t.text_primary);
@@ -800,6 +806,24 @@ pub(in super::super) fn readiness_line(name: &str, probe: &Probe) -> (Tone, Stri
         (_, Probe::Ok) => (Tone::Ok, format!("{title}: ok")),
         (_, Probe::Warn(m)) => (Tone::Warn, format!("{title}: warning: {m}")),
         (_, Probe::Fail(m)) => (Tone::Danger, format!("{title}: FAIL: {m}")),
+        (_, Probe::Unknown) => (Tone::Neutral, format!("{title}: unknown")),
+    }
+}
+
+/// A readiness row while this screen is shared: its title and its state
+/// word only ("ok", "warning", "FAIL", "unknown"; the panic key's "bound" or
+/// "unavailable"), never the probe's message.
+#[must_use]
+fn readiness_state(name: &str, probe: &Probe) -> (Tone, String) {
+    let title = row_title(name);
+    match (name, probe) {
+        ("panic_key", Probe::Ok) => (Tone::Ok, format!("{title}: bound")),
+        ("panic_key", Probe::Fail(_) | Probe::Unknown) => {
+            (Tone::Danger, format!("{title}: unavailable"))
+        }
+        (_, Probe::Ok) => (Tone::Ok, format!("{title}: ok")),
+        (_, Probe::Warn(_)) => (Tone::Warn, format!("{title}: warning")),
+        (_, Probe::Fail(_)) => (Tone::Danger, format!("{title}: FAIL")),
         (_, Probe::Unknown) => (Tone::Neutral, format!("{title}: unknown")),
     }
 }
