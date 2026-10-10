@@ -266,7 +266,7 @@ pub(super) fn section(
         .as_ref()
         .filter(|_| !shared && !sheet && !blocking)
     {
-        stop_card(ui, t, &code.0, actions);
+        stop_card(ui, t, &code.0, model.stop_card_id, actions);
         ui.add_space(10.0);
     }
     if !shared && (!manager.on || manager.paused_until.is_some()) {
@@ -707,8 +707,8 @@ fn grant_row(
 
 /// The one card of a new stop code: what it does, the code as text that
 /// cannot be selected or copied, that it is shown once, and the click that
-/// delivers it (§B.8.7.4).
-fn stop_card(ui: &mut Ui, t: &Tokens, code: &str, actions: &mut Vec<Action>) {
+/// delivers it (§B.8.7.4), naming the card by its number `id`.
+fn stop_card(ui: &mut Ui, t: &Tokens, code: &str, id: u64, actions: &mut Vec<Action>) {
     widgets::card(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(
@@ -729,7 +729,7 @@ fn stop_card(ui: &mut Ui, t: &Tokens, code: &str, actions: &mut Vec<Action>) {
         ui.add_space(6.0);
         line(ui, WRITE_IT_DOWN, t.warn);
         if Button::new(Kind::Primary, WRITTEN_DOWN).show(ui).clicked() {
-            actions.push(Action::Manager(ManagerOp::StopCodeWrittenDown));
+            actions.push(Action::Manager(ManagerOp::StopCodeWrittenDown(id)));
         }
     });
 }

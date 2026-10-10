@@ -2925,7 +2925,7 @@ mod tests {
             let at = window.center(security::WRITTEN_DOWN);
             assert_eq!(
                 window.click(at),
-                vec![Action::Manager(ManagerOp::StopCodeWrittenDown)],
+                vec![Action::Manager(ManagerOp::StopCodeWrittenDown(0))],
                 "{size:?}"
             );
         }

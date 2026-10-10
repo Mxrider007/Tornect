@@ -927,9 +927,14 @@ impl ManagerWatch {
                 }
                 Err(e) => Err(refusal(&e)),
             },
-            ManagerOp::StopCodeWrittenDown => {
-                // Delivered: the only copy goes, wiped on drop.
-                shared.update(|m| m.stop_card = None);
+            ManagerOp::StopCodeWrittenDown(id) => {
+                // Delivered: the only copy goes, wiped on drop; a click on an
+                // earlier card leaves a newer one up.
+                shared.update(|m| {
+                    if m.stop_card_id == id {
+                        m.stop_card = None;
+                    }
+                });
                 Ok(())
             }
             ManagerOp::Enable(device) => guard.enable(Actor::Ui, &device).map_err(|e| refusal(&e)),
@@ -1062,7 +1067,10 @@ impl ManagerWatch {
             return;
         }
         let card = Secret(crate::unattended::format_stop_code(code));
-        shared.update(|m| m.stop_card = Some(card));
+        shared.update(|m| {
+            m.stop_card_id = m.stop_card_id.wrapping_add(1);
+            m.stop_card = Some(card);
+        });
     }
 
     /// The window is closing: a stop code still on its card was never
@@ -4036,12 +4044,48 @@ mod tests {
         watch.run(ManagerOp::On, &shared);
         let second = shared.read(|m| m.stop_card.clone()).expect("one card");
         assert!(second.0 != card.0, "a new code replaces the card");
-        watch.run(ManagerOp::StopCodeWrittenDown, &shared);
+        watch.run(
+            ManagerOp::StopCodeWrittenDown(shared.read(|m| m.stop_card_id)),
+            &shared,
+        );
         assert!(
             shared.read(|m| m.stop_card.is_none()),
             "dropped on the click"
         );
         assert!(watch.ctx.guard.store().read(|s| s.enabled).unwrap());
+    }
+
+    /// §B.8.7.4: "I have written it down" drops only the card it was
+    /// clicked on: a click on an earlier card leaves a newer one up, whose
+    /// code was not shown yet.
+    #[test]
+    fn the_click_drops_only_its_own_card() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = manager_over(
+            tmp.path(),
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            tornect_core::levels::AccountFacts::Linux,
+            b"this machine",
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        watch.run(ManagerOp::On, &shared);
+        let first = shared.read(|m| m.stop_card_id);
+        watch.run(ManagerOp::On, &shared);
+        let second = shared.read(|m| m.stop_card_id);
+        assert_ne!(first, second, "each card its number");
+        let shown = shared
+            .read(|m| m.stop_card.clone())
+            .expect("the second card");
+        watch.run(ManagerOp::StopCodeWrittenDown(first), &shared);
+        assert_eq!(
+            shared.read(|m| m.stop_card.clone()),
+            Some(shown),
+            "the newer card stays"
+        );
+        watch.run(ManagerOp::StopCodeWrittenDown(second), &shared);
+        assert!(shared.read(|m| m.stop_card.is_none()), "its own click");
     }
 
     /// §B.8.7.4: a stop code whose card ends without the click (the window
@@ -4096,7 +4140,10 @@ mod tests {
         let watch = open(tmp.path());
         let shared = Shared::new(Model::default(), Arc::new(|_| {}));
         watch.run(ManagerOp::On, &shared);
-        watch.run(ManagerOp::StopCodeWrittenDown, &shared);
+        watch.run(
+            ManagerOp::StopCodeWrittenDown(shared.read(|m| m.stop_card_id)),
+            &shared,
+        );
         watch.close_undelivered(&shared);
         assert!(on(&watch), "a delivered code changes nothing");
     }
@@ -4128,7 +4175,10 @@ mod tests {
             reauth.calls()[before..].to_vec()
         };
         assert_eq!(asks(ManagerOp::On), ["master_on"]);
-        watch.run(ManagerOp::StopCodeWrittenDown, &shared);
+        watch.run(
+            ManagerOp::StopCodeWrittenDown(shared.read(|m| m.stop_card_id)),
+            &shared,
+        );
         let [a, b, c] = [1u8, 2, 3].map(|i| tornect_core::DeviceId::from_bytes([i; 32]));
         for device in [a, b, c] {
             guard
