@@ -5772,6 +5772,52 @@ mod tests {
         assert_eq!(now.id(), old.id(), "the old ID kept");
     }
 
+    /// §B.8.12: the window waits for a slow rotation past the quit's cut:
+    /// while the rotation runs, `rotating` stays set and `closed` unset (the
+    /// window keeps waiting); `closed` comes only once it has returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_window_closes_only_after_a_slow_rotation_returns() {
+        use tornect_core::keystore::FileSecretStore;
+        use tornect_core::session_log::Actor;
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = rotation_watch(tmp.path());
+        let paths = Paths::from_home(tmp.path());
+        let keys = FileSecretStore::open(paths.keys_dir()).unwrap();
+        let shared = Shared::new(
+            Model {
+                rotating: true,
+                ..Model::default()
+            },
+            Arc::new(|_| {}),
+        );
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (began, running) = tokio::sync::oneshot::channel::<()>();
+        let guard = Arc::clone(&watch.ctx.guard);
+        let closing = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move {
+                rotate_at_close(&shared, true, move || {
+                    let _ = began.send(());
+                    held.recv().expect("released");
+                    crate::rotate::rotate_id(&paths, &guard, Actor::Ui, &keys, None)
+                })
+                .await;
+            })
+        };
+        running.await.expect("the rotation runs");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        shared.read(|m| {
+            assert!(m.rotating, "the window keeps waiting");
+            assert!(!m.closed, "not before the rotation returns");
+        });
+        release.send(()).unwrap();
+        closing.await.unwrap();
+        shared.read(|m| {
+            assert!(m.closed, "closed once it returned");
+            assert_eq!(m.rotate_failed, None);
+        });
+    }
+
     /// §B.8.12: while another task still holds the Tor node (Tor did not
     /// stop), Rotate ID does not run: the store is unchanged, and the
     /// window's card says nothing was changed, the window still open.
