@@ -96,14 +96,24 @@ pub struct SettingsForm {
     /// How many times the wizard's *Turn on* was pressed in this window: each
     /// press names its answer by its number.
     pub(super) attempts: u64,
+    /// A press whose wizard closed before its answer came: its Done can
+    /// still open ⑤a's offer (§B.8.7.1, decision M1-67) the next time
+    /// Security is drawn.
+    pub(super) pending: Option<u64>,
 }
 
 impl SettingsForm {
     /// Close the grant wizard: what it chose goes, its passwords are wiped
     /// and its fields' state leaves `ctx`'s memory (the window left
-    /// Settings, Security).
+    /// Settings, Security). A press of it still waiting for its answer is
+    /// kept in `pending`.
     pub fn close_wizard(&mut self, ctx: &egui::Context) {
-        self.wizard = None;
+        if let Some(w) = self.wizard.take()
+            && let Some(attempt) = w.attempt
+            && w.step != wizard::Step::Offer
+        {
+            self.pending = Some(attempt);
+        }
         wizard::forget_fields(ctx, true);
     }
 }
