@@ -2784,6 +2784,37 @@ mod tests {
         }
     }
 
+    /// One pass of `window` with `events`, as `Window::pass` runs it, and
+    /// what the window asked to copy in it (`pass` keeps none).
+    fn copied_in(window: &mut Window, events: Vec<egui::Event>) -> Vec<String> {
+        let now = window.start + Duration::from_secs(5) + window.later;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, window.size)),
+            time: Some(5.0),
+            events,
+            ..egui::RawInput::default()
+        };
+        let mut actions = Vec::new();
+        let (model, form) = (&window.model, &mut window.form);
+        let out = window.ctx.run_ui(raw, |ui| {
+            main_window(ui, model, form, now, &mut actions);
+        });
+        if let Some(update) = &out.platform_output.accesskit_update {
+            window.nodes = update.nodes.iter().map(|(_, n)| n.clone()).collect();
+        }
+        let copied = out
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        out.drop_without_applying_deltas();
+        copied
+    }
+
     /// §B.8.7.4: the stop code is drawn on one card, once, as text, with
     /// what it does and that it is shown only now; not while this screen is
     /// shared and not under a sheet (it is kept, and drawn again after);
@@ -2812,6 +2843,43 @@ mod tests {
             ] {
                 assert!(has_text(&window, text), "{size:?}: {text}");
             }
+            // Nothing copies the code: a drag across it, then Copy, Cmd+C
+            // and Ctrl+C.
+            let b = window
+                .nodes
+                .iter()
+                .find(|n| n.value() == Some(code))
+                .and_then(Node::bounds)
+                .expect("the code's place");
+            let (from, to) = (
+                egui::pos2(b.x0 as f32 + 1.0, ((b.y0 + b.y1) / 2.0) as f32),
+                egui::pos2(b.x1 as f32 - 1.0, ((b.y0 + b.y1) / 2.0) as f32),
+            );
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let mut copied = copied_in(
+                &mut window,
+                vec![egui::Event::PointerMoved(from), button(from, true)],
+            );
+            copied.extend(copied_in(&mut window, vec![egui::Event::PointerMoved(to)]));
+            copied.extend(copied_in(&mut window, vec![button(to, false)]));
+            copied.extend(copied_in(&mut window, vec![egui::Event::Copy]));
+            for modifiers in [egui::Modifiers::COMMAND, egui::Modifiers::CTRL] {
+                let key = |pressed| egui::Event::Key {
+                    key: egui::Key::C,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers,
+                };
+                copied.extend(copied_in(&mut window, vec![key(true), key(false)]));
+                copied.extend(copied_in(&mut window, Vec::new()));
+            }
+            assert!(copied.is_empty(), "{size:?}: {copied:?}");
             let at = window.center(security::WRITTEN_DOWN);
             assert_eq!(
                 window.click(at),
