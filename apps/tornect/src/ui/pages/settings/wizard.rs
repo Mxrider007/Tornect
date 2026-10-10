@@ -2483,6 +2483,76 @@ mod tests {
         assert!(window.wizard().is_none());
     }
 
+    /// A new preview of an equal choice: the answer of an earlier one (of
+    /// this opening or an earlier one) goes as the tokio side takes the new
+    /// request, so neither ④'s "Use my own password" nor *Change mode*'s
+    /// raise acts on it before the new answer lands.
+    #[test]
+    fn no_answer_of_an_earlier_preview_is_used() {
+        // The wizard: back to ③ and on to ④ again.
+        let mut window = at_password(WIDE, Some(false));
+        assert!(window.has_control(USE_MY_OWN));
+        assert!(window.click("Back").is_empty());
+        assert_eq!(window.step(), Some(Step::Preset));
+        assert_eq!(
+            window.click("Continue"),
+            vec![Action::Manager(ManagerOp::Preview(Box::new(choice())))]
+        );
+        // As the tokio side takes the request.
+        window.model.wizard.forget_preview();
+        window.pass(Vec::new());
+        assert_eq!(window.step(), Some(Step::Password));
+        assert!(!window.has_control(USE_MY_OWN), "the earlier answer");
+        window.model.wizard.preview = Some((choice(), Some(false)));
+        window.pass(Vec::new());
+        assert!(window.has_control(USE_MY_OWN), "its own answer");
+
+        // *Change password*, opened again over an answer of its last opening.
+        let mut window = Window::new(with_a_grant(SessionMode::Control), WIDE);
+        window.model.wizard.preview = Some((no_change(), Some(false)));
+        assert_eq!(
+            window.click("Change password…"),
+            vec![Action::Manager(ManagerOp::Preview(Box::new(no_change())))]
+        );
+        window.model.wizard.forget_preview();
+        window.pass(Vec::new());
+        assert_eq!(window.step(), Some(Step::Password));
+        assert!(
+            !window.has_control(USE_MY_OWN),
+            "an earlier opening's answer"
+        );
+
+        // *Change mode* to control, over a raise judged at an earlier opening.
+        let to_control = WizardChoice {
+            options: GrantOptions {
+                mode: Some(SessionMode::Control),
+                ..GrantOptions::default()
+            },
+            ..no_change()
+        };
+        let mut window = Window::new(with_a_grant(SessionMode::ViewOnly), WIDE);
+        window.model.wizard.raises = Some((to_control.clone(), Some(false)));
+        window.model.wizard.preview = Some((to_control.clone(), Some(false)));
+        assert!(window.click("Change mode…").is_empty());
+        assert_eq!(
+            window.click("Continue"),
+            vec![Action::Manager(ManagerOp::Preview(Box::new(
+                to_control.clone()
+            )))]
+        );
+        window.model.wizard.forget_preview();
+        window.pass(Vec::new());
+        window.pass(Vec::new());
+        assert_eq!(window.step(), Some(Step::Mode));
+        assert!(
+            !window.has_control(TO_CONTROL),
+            "an earlier opening's raise"
+        );
+        window.model.wizard.raises = Some((to_control, Some(false)));
+        window.pass(Vec::new());
+        assert!(window.has_control(TO_CONTROL), "its own answer");
+    }
+
     /// §B.8.7.1 ⑥: this computer's readiness rows as the host read them; a
     /// red row needs "Enable anyway — it will not work until fixed" before ⑦
     /// (Continue does nothing until it is ticked), and with no red row

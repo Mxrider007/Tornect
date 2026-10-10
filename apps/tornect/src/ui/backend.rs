@@ -2195,6 +2195,11 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     }
                     Command::Manager(ManagerOp::Preview(choice)) => {
                         if let Some(manager) = hosted.as_ref().and_then(|h| h.manager.clone()) {
+                            // Until this preview's answer lands, the pages
+                            // read none (④'s own password, *Change mode*'s
+                            // raise): an earlier answer may judge an equal
+                            // choice on a computer that has changed since.
+                            b.shared.update(|m| m.wizard.forget_preview());
                             let shared = Arc::clone(&b.shared);
                             tokio::task::spawn_blocking(move || {
                                 manager.wizard_preview(*choice, &shared);
