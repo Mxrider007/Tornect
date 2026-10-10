@@ -1249,7 +1249,8 @@ fn mode_step(
 
 /// The manager's raise to the administrator level and the restore of a
 /// marked grant at it (§B.8.7.1, decision M1-67): the plan's lines (the
-/// raise: its sentence, then the new-grant line), a generated passphrase
+/// raise: ⑤a's warning once the guard's preview has judged the level, its
+/// sentence, then the new-grant line), a generated passphrase
 /// shown once, Cancel first and Continue, which answers a primary pointer
 /// click only, once the passphrase is shown, and sends it as press
 /// `attempt` in one registration (the restore: then *Enable*). The raise
@@ -1299,6 +1300,12 @@ fn level_password(
                 t.text_primary,
             );
         } else {
+            // What ⑤a says of the level, said where the level is given.
+            line(
+                ui,
+                &ADMINISTRATOR_WARNING.replace("<device>", &label),
+                t.warn,
+            );
             line(ui, &RAISE_LINE.replace("<device>", &label), t.text_primary);
             line(
                 ui,
@@ -3262,6 +3269,43 @@ mod tests {
             let window = Window::new(model, WIDE);
             assert!(!window.has_control(RAISE), "{account:?} {level:?}");
         }
+    }
+
+    /// §B.8.7.1 ⑤a's warning where the level is given: the raise draws it,
+    /// with the device's label, above the raise's sentence once the guard's
+    /// preview has judged the level and did not refuse it; the restore keeps
+    /// its own sentence only.
+    #[test]
+    fn the_raise_shows_the_administrator_warning() {
+        let warning = ADMINISTRATOR_WARNING.replace("<device>", "Office laptop");
+        let raise = RAISE_LINE.replace("<device>", "Office laptop");
+        let top = |window: &Window, text: &str| {
+            window
+                .nodes
+                .iter()
+                .find(|n| n.value().is_some_and(|v| v.contains(text)))
+                .and_then(Node::bounds)
+                .map(|b| b.y0)
+                .expect("drawn")
+        };
+        let (mut window, choice) = at_raise();
+        assert!(!window.has_text(&warning), "not before the preview");
+        judge(&mut window, &choice, Some(true), None);
+        assert!(window.has_text(&warning));
+        assert!(top(&window, &warning) < top(&window, &raise), "above");
+        let (mut window, choice) = at_raise();
+        let why = tornect_core::levels::REFUSAL_ADMIN_STANDARD_ACCOUNT;
+        judge(&mut window, &choice, None, Some(why));
+        assert!(!window.has_text(&warning), "refused");
+        let marked = GrantLevel {
+            holds: true,
+            marked: true,
+            ..plain()
+        };
+        let mut window = Window::new(with_a_level("disabled:restore", marked), WIDE);
+        assert!(window.click("Enable").is_empty());
+        assert!(window.has_text(&RESTORE_LINE.replace("<device>", "Office laptop")));
+        assert!(!window.has_text(&warning), "the restore");
     }
 
     /// §B.8.7.1: the raise offers Cancel first, then Continue: Cancel is on
