@@ -158,6 +158,10 @@ pub(in super::super) const HOST_WIDE: &str = "Set on the Security page for every
 pub(in super::super) const ASKS_TWICE: &str = "You are asked for your password once to give \
     access, and once more to turn unattended access on.";
 
+/// ⑦, while a pause runs (§B.8.6.2); `<device>` stands for the pinned label.
+pub(in super::super) const PAUSED_SUMMARY: &str =
+    "Unattended access is paused: <device> can connect once the pause ends.";
+
 /// `G_NEEDS_PASSWORD` at *Turn on*: a raise appeared while the person was
 /// asked (decision M1-67).
 pub(in super::super) const NEEDS_GENERATED: &str = "Something changed while you were asked: this \
@@ -1987,6 +1991,13 @@ fn summary(
     if !manager.on {
         line(ui, ASKS_TWICE, t.text_secondary);
     }
+    if manager.paused_until.is_some() {
+        line(
+            ui,
+            &PAUSED_SUMMARY.replace("<device>", &label),
+            t.text_secondary,
+        );
+    }
     let waiting = w.attempt.is_some();
     if waiting {
         ui.spinner();
@@ -3651,6 +3662,22 @@ mod tests {
                 vec![Action::Manager(ManagerOp::Enable(device(1)))],
                 "{level:?}"
             );
+        }
+    }
+
+    /// §B.8.6.2: ⑦ says, while a pause runs, that the device can connect only
+    /// once it ends; without a pause it says nothing of one.
+    #[test]
+    fn the_summary_says_a_running_pause() {
+        let paused = PAUSED_SUMMARY.replace("<device>", "Office laptop");
+        for pause in [None, Some(u64::MAX)] {
+            let mut window = at_password(WIDE, Some(false));
+            if let Some(manager) = window.model.manager.as_mut() {
+                manager.on = true;
+                manager.paused_until = pause;
+            }
+            to_summary(&mut window);
+            assert_eq!(window.has_text(&paused), pause.is_some(), "{pause:?}");
         }
     }
 
