@@ -69,7 +69,9 @@ pub(in super::super) const LIMITS_WINDOWS: [&str; 2] = [
      input, and it cannot be unlocked from another device: that needs a system service, \
      planned after this release.",
     "A session's clicks and keys do not reach programs that run as administrator or Windows' \
-     prompts for an administrator, and nothing says so.",
+     prompts for an administrator, unless another device has administrator access here or this \
+     account's settings make control administrator access. The other device is told when they \
+     are out of its reach.",
 ];
 
 /// What is kept and who learns what (§B.8.7.1 ①, as the operator approved
@@ -172,6 +174,12 @@ pub(in super::super) const TO_VIEW_ONLY: &str = "Change to View only";
 
 /// See [`TO_VIEW_ONLY`].
 pub(in super::super) const TO_CONTROL: &str = "Change to Control";
+
+/// ④ while the guard's preview of the choice says only a generated password
+/// will do (§B.8.7.1, decision M1-67); `<device>` stands for the device's
+/// pinned label.
+pub(in super::super) const GENERATED_ONLY: &str = "Control here can reach programs that run as \
+    administrator, so <device> needs a generated password.";
 
 /// Mode → Control where control reaches programs that run as administrator
 /// (§B.8.7.1, decision M1-67); `<device>` stands for the grant's pinned
@@ -1071,6 +1079,23 @@ fn password_step(
             w.open_password();
         }
     } else if let Some(phrase) = &w.passphrase {
+        // Why there is no own password, once the guard's preview of exactly
+        // this choice said so (a change of mode says it in its own line).
+        let changes_mode = w.change.as_ref().is_some_and(|c| c.mode.is_some());
+        let generated_only = w.choice().is_some_and(|choice| {
+            model
+                .wizard
+                .preview
+                .as_ref()
+                .is_some_and(|(judged, only)| *judged == choice && *only == Some(true))
+        });
+        if generated_only && !changes_mode {
+            line(
+                ui,
+                &GENERATED_ONLY.replace("<device>", &label_of(model, w)),
+                t.text_primary,
+            );
+        }
         ui.add(
             egui::Label::new(
                 RichText::new(phrase.secret().0.as_str())
@@ -3372,6 +3397,40 @@ mod tests {
         let window = at_options("My machines", false);
         assert!(!window.has_text(HEADLESS_STATEMENT));
         assert!(!window.has_control(I_UNDERSTAND));
+    }
+
+    /// §B.8.7.1 ④ where control here reaches programs that run as
+    /// administrator: while the guard's preview of this choice says only a
+    /// generated password will do, ④ says why above the passphrase, with the
+    /// device's label, and offers no own password; while the preview is
+    /// pending, could not judge, or allows an own password, it does not.
+    #[test]
+    fn the_password_step_says_why_the_password_is_generated() {
+        let why = GENERATED_ONLY.replace("<device>", "Office laptop");
+        let top = |window: &Window, text: &str| {
+            window
+                .nodes
+                .iter()
+                .find(|n| n.value().is_some_and(|v| v.contains(text)))
+                .and_then(Node::bounds)
+                .map(|b| b.y0)
+                .expect("drawn")
+        };
+        let mut window = at_password(WIDE, Some(true));
+        assert!(window.has_text(&why));
+        assert!(!window.has_control(USE_MY_OWN));
+        let phrase = window.phrase();
+        assert!(
+            top(&window, &why) < top(&window, &phrase),
+            "above the passphrase"
+        );
+        window.model.wizard.preview = None;
+        window.pass(Vec::new());
+        assert!(!window.has_text(&why), "pending");
+        for judged in [None, Some(false)] {
+            let window = at_password(WIDE, judged);
+            assert!(!window.has_text(&why), "{judged:?}");
+        }
     }
 
     /// §B.8.7.1: the raise offers Cancel first, then Continue: Cancel is on
