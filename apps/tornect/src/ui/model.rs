@@ -1259,6 +1259,17 @@ pub struct WizardView {
     pub reaching: Vec<tornect_core::unattended::guard::NewlyReaching>,
 }
 
+impl WizardView {
+    /// A new preview was asked for: no answer of an earlier one stands in
+    /// for its answer (it judged a computer that may have changed since,
+    /// for an equal choice of this or an earlier opening), so the last
+    /// answer and the raise it read go until the new answer lands.
+    pub fn forget_preview(&mut self) {
+        self.preview = None;
+        self.raises = None;
+    }
+}
+
 /// A grant's administrator level and mark as the manager reads them
 /// (decision M1-67).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
