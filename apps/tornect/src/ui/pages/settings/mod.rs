@@ -77,7 +77,7 @@ impl Section {
 }
 
 /// What the Settings page remembers from pass to pass.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct SettingsForm {
     /// The section shown.
     pub(super) section: Section,
@@ -100,6 +100,30 @@ pub struct SettingsForm {
     /// still open ⑤a's offer (§B.8.7.1, decision M1-67) the next time
     /// Security is drawn.
     pub(super) pending: Option<u64>,
+}
+
+/// Printed with the private bridge lines typed so far as their count only:
+/// a bridge's address never reaches a log or a panic message.
+impl std::fmt::Debug for SettingsForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettingsForm")
+            .field("section", &self.section)
+            .field("name", &self.name)
+            .field(
+                "bridge_lines",
+                &self
+                    .bridge_lines
+                    .as_ref()
+                    .map(|typed| typed.lines().count()),
+            )
+            .field("revoke_all", &self.revoke_all)
+            .field("sign_in_asking", &self.sign_in_asking)
+            .field("rotate", &self.rotate)
+            .field("wizard", &self.wizard)
+            .field("attempts", &self.attempts)
+            .field("pending", &self.pending)
+            .finish()
+    }
 }
 
 impl SettingsForm {
@@ -194,4 +218,29 @@ fn line(ui: &mut Ui, text: &str, color: egui::Color32) {
         )
         .wrap(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SettingsForm;
+
+    /// The form prints the private bridge lines typed so far as their count,
+    /// never a line.
+    #[test]
+    fn the_form_prints_no_bridge_line() {
+        let form = SettingsForm {
+            bridge_lines: Some(
+                "obfs4 192.0.2.7:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=AAAA \
+                 iat-mode=0\nobfs4 198.51.100.9:80 FEDCBA9876543210FEDCBA9876543210FEDCBA98 \
+                 cert=BBBB iat-mode=0"
+                    .to_owned(),
+            ),
+            ..SettingsForm::default()
+        };
+        let printed = format!("{form:?}");
+        assert!(printed.contains("bridge_lines: Some(2)"), "{printed}");
+        for line in ["192.0.2.7", "198.51.100.9", "obfs4", "cert="] {
+            assert!(!printed.contains(line), "{line}: {printed}");
+        }
+    }
 }
