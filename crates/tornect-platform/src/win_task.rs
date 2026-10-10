@@ -49,8 +49,15 @@ impl Scheduler {
     }
 
     fn quiet(&self, args: &[&str]) -> Result<std::process::Output, AutostartError> {
+        use std::os::windows::process::CommandExt as _;
+        /// `CREATE_NO_WINDOW`: `schtasks` is a console program, and the
+        /// window (a windowed program) runs it too; without the flag Windows
+        /// opens a console window for it at each call.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         Command::new(&self.schtasks)
             .args(args)
+            .stdin(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|e| AutostartError::Failed(format!("running schtasks.exe: {e}")))
     }
