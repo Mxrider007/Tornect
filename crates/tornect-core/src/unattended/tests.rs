@@ -6395,3 +6395,65 @@ fn an_operation_after_rotate_id_is_refused() {
     assert_eq!(store.status(), StoreStatus::AttendedOnly);
     assert!(store.grants().is_empty(), "no grant");
 }
+
+// ------------------------------------------------------------------ a password change whose grant went
+
+/// A dialog during which the device's grant is revoked on the same guard, as
+/// another window or the command line would while a password change waits at
+/// its re-authentication.
+struct RevokeDuringDialog {
+    guard: std::sync::OnceLock<std::sync::Weak<MutationGuard>>,
+    device: DeviceId,
+}
+
+impl ReAuth for RevokeDuringDialog {
+    fn reauthenticate(&self, _op: &str) -> Result<(), ReAuthError> {
+        if let Some(guard) = self.guard.get().and_then(std::sync::Weak::upgrade) {
+            guard.revoke(Actor::Cli, &self.device).unwrap();
+        }
+        Ok(())
+    }
+}
+
+/// §B.8.7.3: a password change commits only to the grant it was asked for.
+/// Its grant revoked while the change waits at its dialog, the change is
+/// refused (no grant), and none is created in its place, even for a preset
+/// that waives the attended precondition.
+#[test]
+fn a_password_change_whose_grant_went_creates_none() {
+    let env = Env::new();
+    let store = env.open();
+    let d = dev(1);
+    drop(enable(&env, &store, d, Preset::HeadlessBox));
+    let reauth = Arc::new(RevokeDuringDialog {
+        guard: std::sync::OnceLock::new(),
+        device: d,
+    });
+    let guard = Arc::new(
+        MutationGuard::new(
+            store.clone(),
+            reauth.clone(),
+            Arc::new(NoSessionActivity),
+            Arc::new(FixedFacts::linux()),
+        )
+        .with_server_setup_source(Arc::new(RandomServerSetupSource))
+        .with_paired_devices(Arc::new(AllowAllPaired)),
+    );
+    reauth.guard.set(Arc::downgrade(&guard)).expect("set once");
+    let created = |env: &Env| {
+        env.log_events()
+            .iter()
+            .filter(|r| r.event == SessionEvent::GrantCreated)
+            .count()
+    };
+    let before = created(&env);
+    let refused = guard
+        .set_password(Actor::Ui, &d, &[0xCD; 192], &GrantOptions::default(), false)
+        .unwrap_err();
+    assert_eq!(
+        refused.to_string(),
+        GuardError::from(StoreError::NoGrant).to_string()
+    );
+    assert!(store.grant(&d).is_none(), "no grant for the device");
+    assert_eq!(created(&env), before, "no grant created after");
+}
