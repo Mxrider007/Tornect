@@ -2027,6 +2027,7 @@ impl MutationGuard {
             options,
             generated,
             Asked::RegStart(raise),
+            false,
         )
     }
 
@@ -2065,7 +2066,9 @@ impl MutationGuard {
             ));
         }
         let asked = Asked::Dialog(raising);
-        match self.apply_registration(by, device, upload, preset, options, generated, asked)? {
+        match self
+            .apply_registration(by, device, upload, preset, options, generated, asked, false)?
+        {
             RegFinishOutcome::Created(id) | RegFinishOutcome::PasswordSet(id) => Ok(id),
         }
     }
@@ -2073,7 +2076,9 @@ impl MutationGuard {
     /// One-operation password change (UI path): re-auth inline, then the registration.
     /// `options` may carry exactly a raise (the level, or control where it reaches the
     /// level), applied in the write that replaces `auth`, and only with `generated`; such
-    /// a change asks with the raising wording (decision M1-67, D3).
+    /// a change asks with the raising wording (decision M1-67, D3). It commits only to
+    /// the grant it was asked for: a grant gone meanwhile (revoked while the dialog
+    /// was up) refuses it with `NoGrant`, and no grant is created in its place.
     pub fn set_password(
         &self,
         by: Actor,
@@ -2108,7 +2113,9 @@ impl MutationGuard {
         self.access_increasing_raising(op, by, Some(device), raising.then_some(label.as_str()))?;
         self.require_loaded(op, Some(by), Some(device))?;
         let asked = Asked::Dialog(raising);
-        match self.apply_registration(by, device, upload, preset, options, generated, asked)? {
+        match self
+            .apply_registration(by, device, upload, preset, options, generated, asked, true)?
+        {
             RegFinishOutcome::Created(id) | RegFinishOutcome::PasswordSet(id) => Ok(id),
         }
     }
@@ -2119,7 +2126,10 @@ impl MutationGuard {
     /// D4, D9): the level where this host cannot give it ⇒ `G_UNSUPPORTED`; a creation with
     /// reach or a raise without `generated`, or one that what was confirmed did not name
     /// (it appeared meanwhile: S5B-2) ⇒ `G_NEEDS_PASSWORD`, nothing written; the new
-    /// password is unmarked exactly when it is `generated`.
+    /// password is unmarked exactly when it is `generated`. `must_exist`: a password
+    /// change of an existing grant only (`set_password`); a grant gone by then is
+    /// refused with `NoGrant` (and one gone by the commit, under its lock), never
+    /// created anew.
     #[allow(clippy::too_many_arguments)]
     fn apply_registration(
         &self,
@@ -2130,6 +2140,7 @@ impl MutationGuard {
         options: &GrantOptions,
         generated: bool,
         asked: Asked,
+        must_exist: bool,
     ) -> Result<RegFinishOutcome, GuardError> {
         let op = "reg_finish";
         self.require_loaded(op, Some(by), Some(device))?;
@@ -2264,6 +2275,14 @@ impl MutationGuard {
                 self.end_sessions_of(device, EndScope::AtTheLevel, EndReason::Revoked);
             }
             return Ok(RegFinishOutcome::PasswordSet(existing.id));
+        }
+        if must_exist {
+            return Err(self.refuse(
+                op,
+                Some(by),
+                Some(device),
+                GuardError::from(StoreError::NoGrant),
+            ));
         }
         let waived =
             options.waive_attended_precondition || preset.defaults().waives_attended_precondition;
