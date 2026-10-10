@@ -24,7 +24,7 @@ use tornect_core::unattended::grant::Preset;
 use tornect_core::unattended::readiness::{Probe, row_title};
 
 use super::super::super::model::{
-    GrantRow, HostSetting, Manager, ManagerOp, Model, PauseEnd, RotateFailed, Setup,
+    GrantRow, HostSetting, Manager, ManagerOp, Model, PauseEnd, RotateFailed, Setup, WizardAnswer,
 };
 use super::super::super::theme::{self, Face, Tokens};
 use super::super::super::view::Action;
@@ -83,6 +83,23 @@ pub(in super::super) const SETTINGS: [(&str, SettingOf); 3] = [
     ),
     ("Notify me of each unattended session", HostSetting::Notify),
 ];
+
+/// A press whose wizard closed before its answer came (§B.8.7.1, decision
+/// M1-67): once its answer is in, a Done that made other control grants
+/// reach the administrator level opens ⑤a's offer, as the open wizard
+/// would have; any other answer only ends the wait.
+fn offer_pending(model: &Model, form: &mut SettingsForm) {
+    let (Some(attempt), Some((answered, answer))) = (form.pending, model.wizard.answer) else {
+        return;
+    };
+    if answered != attempt {
+        return;
+    }
+    form.pending = None;
+    if answer == WizardAnswer::Done && !model.wizard.reaching.is_empty() {
+        form.wizard = Some(super::wizard::Wizard::offer(model.wizard.reaching.clone()));
+    }
+}
 
 /// The pause's ends, offered only while no pause runs (§B.8.6.2: 12 h and
 /// until re-enabled; the end at 08:00 is left out, OPEN until a zone source
@@ -224,8 +241,10 @@ pub(super) fn section(
     };
     if shared {
         // A picture that leaves this screen never shows the wizard, and its
-        // passwords go with it.
-        form.wizard = None;
+        // passwords go with it (a press still waiting for its answer is kept).
+        form.close_wizard(ui.ctx());
+    } else if form.wizard.is_none() {
+        offer_pending(model, form);
     }
     if form.wizard.is_some() {
         super::wizard::draw(ui, model, manager, form, actions);
