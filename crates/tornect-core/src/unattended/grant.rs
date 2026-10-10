@@ -77,7 +77,8 @@ pub struct UnattendedStore {
     /// Master switch.
     #[n(1)]
     pub enabled: bool,
-    /// Paused until this unix time (12 h / until 08:00 / until re-enabled).
+    /// Paused until this unix time (12 h / until re-enabled; until 08:00 is OPEN until a
+    /// zone source exists).
     #[n(2)]
     pub paused_until: Option<u64>,
     /// `opaque-ke` `ServerSetup::serialize()` (128 B); created at the first unattended

@@ -85,8 +85,8 @@ pub(in super::super) const SETTINGS: [(&str, SettingOf); 3] = [
 ];
 
 /// The pause's ends, offered only while no pause runs (§B.8.6.2: 12 h and
-/// until re-enabled; the end at 08:00 waits for the operator's ruling, as
-/// this version keeps no time zone of the computer).
+/// until re-enabled; the end at 08:00 is left out, OPEN until a zone source
+/// exists, as the operator ruled: this version keeps no time zone of the computer).
 pub(in super::super) const PAUSE_ENDS: [(PauseEnd, &str); 2] = [
     (PauseEnd::TwelveHours, "For 12 hours"),
     (PauseEnd::UntilOn, "Until I turn it back on"),

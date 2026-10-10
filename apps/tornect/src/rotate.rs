@@ -177,7 +177,7 @@ mod tests {
         assert_eq!(rotations[0].by, Some(Actor::Ui));
     }
 
-    /// Q-3 as the operator ruled: `tornect rotate-id` refuses while a host
+    /// As the operator ruled: `tornect rotate-id` refuses while a host
     /// holds the unattended store (it opens the store as the command line's
     /// offline route does), and changes nothing.
     #[test]
