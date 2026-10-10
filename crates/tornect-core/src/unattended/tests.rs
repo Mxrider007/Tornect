@@ -6201,3 +6201,75 @@ fn the_preview_writes_and_logs_nothing() {
     assert!(!fresh.paths.unattended_store().exists(), "nothing created");
     assert_eq!(std::fs::read(fresh.paths.sessions_log()).ok(), log_before);
 }
+
+// ------------------------------------------------------------------ the level in the log
+
+/// The session log names administrator access: a grant created at the level
+/// says so in the detail of its `GrantCreated` and `PasswordSet` lines, and
+/// so does the `PasswordSet` line of a raise; a grant created without the
+/// level says nothing of it.
+#[test]
+fn the_log_names_administrator_access() {
+    let env = Env::new();
+    let store = env.open();
+    let guard = guard_on(&store, windows(|_| {}), HelperPresence::Absent)
+        .with_server_setup_source(Arc::new(RandomServerSetupSource));
+    guard.master_on(Actor::Ui, &HOST_PK).unwrap();
+    for d in [dev(2), dev(3)] {
+        guard
+            .create_grant(
+                Actor::Ui,
+                &d,
+                Preset::MyMachines,
+                &waived(),
+                &upload(),
+                false,
+            )
+            .unwrap();
+    }
+    guard
+        .create_grant(
+            Actor::Ui,
+            &dev(1),
+            Preset::MyMachines,
+            &GrantOptions {
+                elevation: Some(Elevation::Admin),
+                ..waived()
+            },
+            &upload(),
+            true,
+        )
+        .unwrap();
+    guard
+        .set_password(Actor::Ui, &dev(3), &[0xCD; 192], &the_level(), true)
+        .unwrap();
+    assert!(store.grant(&dev(1)).unwrap().holds_level());
+    assert!(store.grant(&dev(3)).unwrap().holds_level());
+    let lines = env.log_events();
+    let names_it = |event: SessionEvent, d: DeviceId| {
+        lines
+            .iter()
+            .filter(|r| r.event == event && r.peer_device == Some(d))
+            .any(|r| {
+                r.detail
+                    .as_deref()
+                    .is_some_and(|t| t.contains("administrator access"))
+            })
+    };
+    assert!(
+        names_it(SessionEvent::GrantCreated, dev(1)),
+        "created at the level"
+    );
+    assert!(names_it(SessionEvent::PasswordSet, dev(1)), "its password");
+    assert!(names_it(SessionEvent::PasswordSet, dev(3)), "the raise");
+    for d in [dev(2), dev(3)] {
+        assert!(
+            !names_it(SessionEvent::GrantCreated, d),
+            "{d:?}: created without it"
+        );
+    }
+    assert!(
+        !names_it(SessionEvent::PasswordSet, dev(2)),
+        "without the level"
+    );
+}
