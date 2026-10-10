@@ -3171,6 +3171,44 @@ mod tests {
         window
     }
 
+    /// Settings, Privacy names the name in use, as Home does; a saved rename
+    /// shows under it as the name from the next start; before the start
+    /// fills the name in use in, the saved one stands.
+    #[test]
+    fn the_privacy_page_names_the_name_in_use() {
+        let mut model = with_book(false);
+        model.settings.device_name = "Desk by the window".to_owned();
+        for size in [WIDE, NARROW] {
+            let window = privacy(model.clone(), size);
+            assert!(
+                has_text(&window, "The name \u{201c}Linux PC\u{201d}"),
+                "{size:?}"
+            );
+            assert!(
+                has_text(
+                    &window,
+                    "\u{201c}Desk by the window\u{201d} from the next start."
+                ),
+                "{size:?}"
+            );
+        }
+        model.settings.device_name = "Linux PC".to_owned();
+        let window = privacy(model.clone(), WIDE);
+        assert!(has_text(&window, "The name \u{201c}Linux PC\u{201d}"));
+        assert!(!has_text(&window, "from the next start"), "equal names");
+        model.device_name.clear();
+        model.settings.device_name = "Desk by the window".to_owned();
+        let window = privacy(model, WIDE);
+        assert!(has_text(
+            &window,
+            "The name \u{201c}Desk by the window\u{201d}"
+        ));
+        assert!(
+            !has_text(&window, "from the next start"),
+            "before the start"
+        );
+    }
+
     /// Settings, Privacy: the plan's sentences word for word (Part C row
     /// 10's line; §B.6's name for the session log and what it records), the
     /// screenshots line and the rest of what the page says, all on the page
