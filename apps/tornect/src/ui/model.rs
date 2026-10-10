@@ -1208,6 +1208,9 @@ pub enum WizardAnswer {
     /// Nothing was saved: something changed while the person was asked, and
     /// this device now needs a new generated password (`G_NEEDS_PASSWORD`).
     NeedsGenerated,
+    /// The restore's new password was set, but *Enable* was refused: the
+    /// grant keeps that password and stays disabled (§B.8.6.1).
+    SetNotEnabled,
 }
 
 /// The grant wizard as the tokio side last answered it.
