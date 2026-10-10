@@ -1617,9 +1617,11 @@ fn options(
     }
     ui.add_space(8.0);
     widgets::section_header(ui, "Hard lock after failed attempts in a row");
+    // Below the lifetime budget: at the budget the lock in a row would be as
+    // off as at 0, without the warning that 0 shows.
     ui.add(egui::Slider::new(
         &mut o.hard_lock_after,
-        0..=tornect_core::unattended::grant::LIFETIME_BUDGET,
+        0..=tornect_core::unattended::grant::LIFETIME_BUDGET - 1,
     ));
     if o.hard_lock_after == 0 {
         line(ui, HARD_LOCK_OFF, t.warn);
@@ -2678,6 +2680,20 @@ mod tests {
         options_mut(&mut window).hard_lock_after = 0;
         window.pass(Vec::new());
         assert!(window.has_text(HARD_LOCK_OFF));
+        // No value the hard lock's slider offers turns the lock in a row off
+        // without that warning: it ends below the lifetime budget.
+        let hard_lock = window
+            .nodes
+            .iter()
+            .find(|n| n.role() == Role::Slider && n.numeric_value() == Some(0.0))
+            .expect("the hard lock's slider");
+        assert_eq!(hard_lock.min_numeric_value(), Some(0.0));
+        assert_eq!(
+            hard_lock.max_numeric_value(),
+            Some(f64::from(
+                tornect_core::unattended::grant::LIFETIME_BUDGET - 1
+            ))
+        );
         assert!(!window.has_control("Lock this computer when a session ends"));
         assert!(!window.has_control("Only while nobody is using this computer"));
         assert!(window.click("View only").is_empty());
