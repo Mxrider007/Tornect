@@ -6352,6 +6352,16 @@ mod tests {
             }
             assert!(printed.contains("<redacted>"), "{printed}");
         }
+        for password in [generated_pw(), chosen_pw()] {
+            let command = Command::Manager(ManagerOp::ChangePassword(Box::new(turn_on(
+                device, password,
+            ))));
+            let printed = format!("{command:?}");
+            for word in ["plaza", "cubicle", "verdant", "otter"] {
+                assert!(!printed.contains(word), "{printed}");
+            }
+            assert!(printed.contains("<redacted>"), "{printed}");
+        }
     }
 
     /// §B.8.6.2, §B.8.7.4: the wizard's *Turn on* asks one dialog per

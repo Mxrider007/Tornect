@@ -2411,6 +2411,31 @@ mod tests {
             for key in [egui::Key::Enter, egui::Key::Space] {
                 assert!(window.key(key).is_empty(), "{judged:?} {key:?}");
             }
+            // No run of Tabs followed by Enter or Space sends the change.
+            for tabs in 1..=4 {
+                for key in [egui::Key::Enter, egui::Key::Space] {
+                    let mut window = Window::new(with_a_grant(SessionMode::Control), WIDE);
+                    window.click("Change password…");
+                    window.model.wizard.preview = Some((no_change(), judged));
+                    window.pass(Vec::new());
+                    let mut actions = Vec::new();
+                    for _ in 0..tabs {
+                        actions.extend(window.key(egui::Key::Tab));
+                    }
+                    actions.extend(window.key(key));
+                    let case = format!("{judged:?} {tabs} tabs {key:?}");
+                    assert!(
+                        !actions
+                            .iter()
+                            .any(|a| matches!(a, Action::Manager(ManagerOp::ChangePassword(_)))),
+                        "{case}: sent"
+                    );
+                    assert!(
+                        matches!(window.step(), None | Some(Step::Password)),
+                        "{case}: went on"
+                    );
+                }
+            }
         }
     }
 
@@ -2645,6 +2670,13 @@ mod tests {
         assert_eq!(w.typed.chars().count(), FIELD_CHARS);
         assert_eq!(w.typed.capacity(), FIELD_ROOM);
         assert!(window.has_text("At most 128 characters."));
+        // The second field keeps the same limit and room.
+        assert!(window.click(AGAIN).is_empty());
+        window.pass(vec![egui::Event::Paste("x7!Qz".repeat(120))]);
+        window.pass(Vec::new());
+        let w = window.wizard().expect("open");
+        assert_eq!(w.again.chars().count(), FIELD_CHARS);
+        assert_eq!(w.again.capacity(), FIELD_ROOM);
     }
 
     /// §B.8.6.1: a device without a completed attended session gets access
