@@ -2674,6 +2674,46 @@ mod tests {
         assert!(chosen.options.waive_attended_precondition);
     }
 
+    /// §B.8.6.1: ③ draws each preset's defaults under its name, in `PRESETS`
+    /// order and in exactly these words, at both widths (built behaviour,
+    /// pinned).
+    #[test]
+    fn the_preset_step_shows_each_presets_defaults() {
+        let lines = [
+            "Control · 3 s to stop a connection · ends after 90 days without use",
+            "View only · 10 s to stop a connection · asks you before starting · starts working \
+             12 hours after it is given · ends after 7 days · sessions of up to 4 hours",
+            "Control · no time to stop a connection · ends after 90 days without use · keeps this \
+             computer awake",
+        ];
+        for ((preset, name), want) in PRESETS.into_iter().zip(lines) {
+            assert_eq!(preset_defaults(preset), want, "{name}");
+        }
+        for size in [WIDE, NARROW] {
+            let mut window = Window::new(model(true), size);
+            open(&mut window);
+            arm(&mut window);
+            assert!(window.click("Continue").is_empty());
+            assert!(window.click("Office laptop").is_empty());
+            assert!(window.click("Continue").is_empty());
+            assert_eq!(window.step(), Some(Step::Preset));
+            let mut below = 0.0;
+            for ((_, name), want) in PRESETS.into_iter().zip(lines) {
+                assert!(window.has_control(name), "{size:?}: {name}");
+                let radio = window.node(name).bounds().expect("bounds");
+                let line = window
+                    .nodes
+                    .iter()
+                    .find(|n| n.value() == Some(want))
+                    .and_then(|n| n.bounds())
+                    .unwrap_or_else(|| panic!("{size:?}: no line {want:?}"));
+                assert!(radio.y0 >= below, "{size:?}: {name} after the line above");
+                assert!(line.y0 >= radio.y1 - 1.0, "{size:?}: {want:?} under {name}");
+                below = line.y1 - 1.0;
+            }
+        }
+    }
+
     /// §B.8.7.2: the wizard and its passwords go when the window leaves
     /// Settings, Security, for another section or another page: the own
     /// password's fields and their state with it.
