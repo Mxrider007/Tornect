@@ -587,6 +587,23 @@ const PAUSE_RUNS: &str = "Not done: a pause is running already.";
 /// the paired devices could not be written.
 const PAIRING_KEPT: &str = "Unattended access was removed, but the pairing could not be removed.";
 
+/// Whether the section's operation `op` asks for this computer's password:
+/// one dialog at a time, so such an operation waits for none other and
+/// holds the section's busy flag until it is done. The others are
+/// deny-direction and ask nothing.
+fn asks_password(op: &ManagerOp) -> bool {
+    matches!(
+        op,
+        ManagerOp::On
+            | ManagerOp::Enable(_)
+            | ManagerOp::Unlock(_)
+            | ManagerOp::Resume(_)
+            | ManagerOp::Setting(_)
+            | ManagerOp::SignIn(_)
+            | ManagerOp::SetMode(_, SessionMode::Control)
+    )
+}
+
 impl ManagerWatch {
     /// The readiness rows as the host last probed them, with the rows read
     /// now: the start at sign-in from `autostart` (the system's answer), the
@@ -822,6 +839,9 @@ impl ManagerWatch {
     /// revoke-all the live sessions end as the control channel ends them,
     /// and the guard ends a device's own sessions itself. A pause is never
     /// started while one runs: ending one sooner would turn access back on.
+    /// The busy flag is cleared only by an operation that set it
+    /// ([`asks_password`]): one that asks nothing leaves another's dialog
+    /// counted.
     fn run(&self, op: ManagerOp, shared: &Shared) -> bool {
         use tornect_core::session_log::Actor;
         use tornect_signal::messages::bye;
@@ -856,6 +876,7 @@ impl ManagerWatch {
             }
             other => other,
         };
+        let asks = asks_password(&op);
         let mut paired_changed = false;
         let done: Result<(), &'static str> = match op {
             ManagerOp::On => match guard.master_on(Actor::Ui, &self.ctx.host_onion_pk) {
@@ -982,7 +1003,9 @@ impl ManagerWatch {
         };
         shared.update(|m| {
             m.manager_note = done.err();
-            m.manager_busy = false;
+            if asks {
+                m.manager_busy = false;
+            }
         });
         self.refresh(shared);
         paired_changed
@@ -2212,17 +2235,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                             // One password dialog at a time: an operation that
                             // asks for one waits for none other (the wizard's
                             // included).
-                            let asks = matches!(
-                                op,
-                                ManagerOp::On
-                                    | ManagerOp::Enable(_)
-                                    | ManagerOp::Unlock(_)
-                                    | ManagerOp::Resume(_)
-                                    | ManagerOp::Setting(_)
-                                    | ManagerOp::SignIn(_)
-                                    | ManagerOp::SetMode(_, SessionMode::Control)
-                            );
-                            if asks {
+                            if asks_password(&op) {
                                 if b.shared.read(|m| m.manager_busy || m.wizard.running.is_some())
                                 {
                                     continue;
@@ -4012,6 +4025,32 @@ mod tests {
         assert!(guard.store().read(|s| s.keep_awake).unwrap());
         assert!(shared.read(|m| m.manager.as_ref().is_some_and(|v| v.keep_awake)));
         assert!(!shared.read(|m| m.manager_busy));
+    }
+
+    /// Only an operation that asks for the password clears the section's
+    /// busy flag, which only such an operation sets: a Turn off or a
+    /// Disable while another operation's dialog is up leaves it set, so the
+    /// section offers no second dialog beside the first.
+    #[test]
+    fn only_an_asking_operation_clears_the_busy_flag() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = manager_over(
+            tmp.path(),
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            tornect_core::levels::AccountFacts::Linux,
+            b"this machine",
+        );
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        shared.update(|m| m.manager_busy = true);
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        for op in [ManagerOp::Off, ManagerOp::Disable(device)] {
+            watch.run(op.clone(), &shared);
+            assert!(shared.read(|m| m.manager_busy), "{op:?}");
+        }
+        watch.run(ManagerOp::On, &shared);
+        assert!(!shared.read(|m| m.manager_busy), "Turn on clears it");
     }
 
     /// §B.8.6.2: a password not confirmed changes nothing: Turn on leaves
