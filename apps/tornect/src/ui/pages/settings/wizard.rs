@@ -140,11 +140,6 @@ pub(in super::super) const HARD_LOCK_OFF: &str = "With 0 the hard lock is off: g
 pub(in super::super) const NEVER_WARNING: &str = "Access that never ends stays until you remove \
     it, also if that device is lost or you forget it.";
 
-/// Lock-on-disconnect, where this computer cannot be unlocked from another
-/// device (§B.8.8: Windows and GNOME).
-pub(in super::super) const LOCK_WARNING: &str = "Once this computer locks, no session can see or \
-    use it until someone here unlocks it.";
-
 /// Where ⑤ sends the host-wide options.
 pub(in super::super) const HOST_WIDE: &str = "Set on the Security page for every device.";
 
@@ -306,12 +301,8 @@ pub(in super::super) struct Options {
     pub(in super::super) hard_lock_after: u32,
     /// "Ask before starting".
     pub(in super::super) ask_before_start: bool,
-    /// Only while nobody is at this computer.
-    pub(in super::super) require_absent: bool,
     /// Pictures and input through Tor only.
     pub(in super::super) require_tor_only: bool,
-    /// Lock this computer when a session ends.
-    pub(in super::super) lock_on_disconnect: bool,
     /// ⑤a: the administrator level (off in every preset).
     pub(in super::super) admin: bool,
 }
@@ -327,9 +318,7 @@ impl Options {
             block_window_s: d.block_window_s,
             hard_lock_after: d.hard_lock_after,
             ask_before_start: d.ask_before_start,
-            require_absent: false,
             require_tor_only: false,
-            lock_on_disconnect: d.lock_on_disconnect,
             admin: false,
         }
     }
@@ -573,9 +562,11 @@ impl Wizard {
                 expires_at: o.never.then_some(0),
                 block_window_s: Some(o.block_window_s),
                 ask_before_start: Some(o.ask_before_start),
-                require_absent: Some(o.require_absent),
+                // Not offered (OPEN until the host carries them out): saved
+                // as off, every preset's default.
+                require_absent: Some(false),
                 require_tor_only: Some(o.require_tor_only),
-                lock_on_disconnect: Some(o.lock_on_disconnect),
+                lock_on_disconnect: Some(false),
                 hard_lock_after: Some(o.hard_lock_after),
                 waive_attended_precondition: self.waive,
                 elevation: o.admin.then_some(Elevation::Admin),
@@ -976,14 +967,8 @@ pub(in super::super) fn options_line(preset: Preset, o: &Options) -> String {
         0 => "no hard lock".to_owned(),
         n => format!("hard lock after {n} failed attempts in a row"),
     });
-    if o.require_absent {
-        parts.push("only while nobody is using this computer".to_owned());
-    }
     if o.require_tor_only {
         parts.push("pictures and input through Tor only".to_owned());
-    }
-    if o.lock_on_disconnect {
-        parts.push("locks this computer when a session ends".to_owned());
     }
     if o.admin {
         parts.push("administrator access".to_owned());
@@ -1578,25 +1563,12 @@ fn options(
     widgets::section_header(ui, "When it connects");
     ui.checkbox(&mut o.ask_before_start, "Ask before starting");
     ui.checkbox(
-        &mut o.require_absent,
-        "Only while nobody is using this computer",
-    );
-    ui.checkbox(
         &mut o.require_tor_only,
         "Pictures and input through Tor only",
     );
-    // Refused with Headless box (§B.8.7.1 ⑤): not offered there.
-    if d.lock_on_disconnect_allowed {
-        ui.checkbox(
-            &mut o.lock_on_disconnect,
-            "Lock this computer when a session ends",
-        );
-        if o.lock_on_disconnect {
-            line(ui, LOCK_WARNING, t.warn);
-        }
-    } else {
-        o.lock_on_disconnect = false;
-    }
+    // "Only while nobody is using this computer" and "Lock this computer
+    // when a session ends" are not offered: nothing carries them out yet
+    // (OPEN in docs/VERIFICATION.md, as the operator ruled).
     ui.add_space(8.0);
     widgets::section_header(ui, "For every device");
     let state = |on: bool| if on { "on" } else { "off" };
@@ -2554,13 +2526,13 @@ mod tests {
     /// not offered on a file keystore or where the preset caps the expiry;
     /// the time to stop a connection within the preset's bounds (Helping
     /// someone at least 5 s); a hard lock of 0 with the plan's warning;
-    /// lock-on-disconnect with its warning, and not offered with Headless
-    /// box; keep-awake and the idle lock shown as they are, set on the
-    /// Security page only.
+    /// lock-on-disconnect and "only while nobody is using this computer" not
+    /// offered (nothing carries them out yet) and saved as off; keep-awake and
+    /// the idle lock shown as they are, set on the Security page only.
     #[test]
     fn each_option_keeps_its_planned_rule() {
         // My machines on an OS keychain: never, with its warning; the hard lock
-        // off, warned; lock-on-disconnect, warned; the others as ticked.
+        // off, warned; the two options not offered; the others as ticked.
         let mut window = at_options("My machines", false);
         assert!(!window.has_text(NEVER_WARNING));
         assert!(window.click("Never").is_empty());
@@ -2568,17 +2540,8 @@ mod tests {
         options_mut(&mut window).hard_lock_after = 0;
         window.pass(Vec::new());
         assert!(window.has_text(HARD_LOCK_OFF));
-        assert!(
-            window
-                .click("Lock this computer when a session ends")
-                .is_empty()
-        );
-        assert!(window.has_text(LOCK_WARNING));
-        assert!(
-            window
-                .click("Only while nobody is using this computer")
-                .is_empty()
-        );
+        assert!(!window.has_control("Lock this computer when a session ends"));
+        assert!(!window.has_control("Only while nobody is using this computer"));
         assert!(window.click("View only").is_empty());
         for line in [
             "Keep this computer awake: off",
@@ -2599,8 +2562,8 @@ mod tests {
         let sent = sent_options(&mut window);
         assert_eq!(sent.expires_at, Some(0));
         assert_eq!(sent.hard_lock_after, Some(0));
-        assert_eq!(sent.lock_on_disconnect, Some(true));
-        assert_eq!(sent.require_absent, Some(true));
+        assert_eq!(sent.lock_on_disconnect, Some(false));
+        assert_eq!(sent.require_absent, Some(false));
         assert_eq!(sent.require_tor_only, Some(false));
         assert_eq!(sent.mode, Some(SessionMode::ViewOnly));
         assert_eq!(sent.block_window_s, Some(3));
