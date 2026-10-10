@@ -19,6 +19,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -46,6 +47,10 @@ const MARKED_ADMIN_ENABLE: &str = "this grant holds administrator access and its
 /// What the detail of a grant's `GrantCreated` and `PasswordSet` lines says
 /// when the grant holds the administrator level (§B.8.13).
 const ADMINISTRATOR_ACCESS: &str = "administrator access";
+
+/// Why every operation but Rotate ID itself is refused once Rotate ID ran
+/// (`G_PRECONDITION`): the store is wiped, and the next start reads it.
+const ROTATED: &str = "Rotate ID ran; restart Tornect";
 
 /// A remote session must have ended at least this long ago (§B.8.6.2).
 pub const REMOTE_SESSION_COOLDOWN: Duration = Duration::from_secs(60);
@@ -727,6 +732,10 @@ pub struct MutationGuard {
     facts: Arc<dyn FactsSource>,
     device_end: Option<Arc<dyn DeviceSessionEnd>>,
     txns: Mutex<Vec<TxnEntry>>,
+    /// Rotate ID ran (§B.8.12): no store is bootstrapped and none is changed
+    /// any more by this guard, whatever dialog was open then. Set under the
+    /// `txns` lock with the wipe, and read under it with the bootstrap.
+    rotated: AtomicBool,
 }
 
 impl std::fmt::Debug for MutationGuard {
@@ -764,6 +773,7 @@ impl MutationGuard {
             facts,
             device_end: None,
             txns: Mutex::new(Vec::new()),
+            rotated: AtomicBool::new(false),
         }
     }
 
@@ -972,12 +982,26 @@ impl MutationGuard {
         }
     }
 
+    /// Refused (`G_PRECONDITION`) once Rotate ID ran.
+    fn not_rotated(
+        &self,
+        op: &str,
+        by: Option<Actor>,
+        device: Option<&DeviceId>,
+    ) -> Result<(), GuardError> {
+        if self.rotated.load(Ordering::SeqCst) {
+            return Err(self.refuse(op, by, device, GuardError::Precondition(ROTATED.into())));
+        }
+        Ok(())
+    }
+
     fn require_loaded(
         &self,
         op: &str,
         by: Option<Actor>,
         device: Option<&DeviceId>,
     ) -> Result<(), GuardError> {
+        self.not_rotated(op, by, device)?;
         match self.store.status() {
             StoreStatus::Loaded => Ok(()),
             other => Err(self.refuse(
@@ -990,14 +1014,20 @@ impl MutationGuard {
     }
 
     fn bootstrap_if_needed(&self, op: &str, by: Actor) -> Result<(), GuardError> {
-        if self.store.status() == StoreStatus::AttendedOnly {
-            let setup = self
-                .setup
-                .generate()
-                .map_err(|m| self.refuse(op, Some(by), None, GuardError::Precondition(m)))?;
-            self.store
-                .bootstrap(setup)
-                .map_err(|e| self.refuse(op, Some(by), None, GuardError::from(e)))?;
+        {
+            // Rotate ID wipes under this lock: a store wiped while a dialog
+            // was open is not bootstrapped again.
+            let _rotation = self.txns.lock();
+            self.not_rotated(op, Some(by), None)?;
+            if self.store.status() == StoreStatus::AttendedOnly {
+                let setup = self
+                    .setup
+                    .generate()
+                    .map_err(|m| self.refuse(op, Some(by), None, GuardError::Precondition(m)))?;
+                self.store
+                    .bootstrap(setup)
+                    .map_err(|e| self.refuse(op, Some(by), None, GuardError::from(e)))?;
+            }
         }
         self.require_loaded(op, Some(by), None)
     }
@@ -1265,12 +1295,20 @@ impl MutationGuard {
     /// failed-closed store is wiped too). Logs `HostIdRotated{by}` after the wipe,
     /// untagged — the line the next `master_on` records as its key epoch (§B.8.13) — so
     /// the app must not append its own `HostIdRotated` line. Returns the number of
-    /// grants wiped.
+    /// grants wiped. From then on this guard refuses every operation that needs the
+    /// store or would bootstrap one (`G_PRECONDITION`), one whose dialog was open
+    /// meanwhile included: the next start reads the wiped store.
     pub fn rotate_id(&self, by: Actor) -> Result<usize, GuardError> {
+        // No registration of a dialog still open survives the wipe, and from
+        // now on this guard bootstraps and changes nothing (`not_rotated`).
+        let mut txns = self.txns.lock();
+        txns.clear();
+        self.rotated.store(true, Ordering::SeqCst);
         let n = self.store.grants().len();
         self.store
             .wipe_all()
             .map_err(|e| self.refuse("rotate_id", Some(by), None, GuardError::from(e)))?;
+        drop(txns);
         let rec = SessionRecord::at(self.now(), SessionEvent::HostIdRotated)
             .by(by)
             .detail(format!("unattended store wiped ({n} grant(s))"));
