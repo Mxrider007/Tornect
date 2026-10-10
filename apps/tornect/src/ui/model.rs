@@ -242,6 +242,9 @@ pub struct Model {
     /// down": then it is dropped (wiped). Never logged, never in `Debug`; a
     /// window that closes while it is here turns unattended access off again.
     pub stop_card: Option<Secret>,
+    /// The number of the card in [`Self::stop_card`]: each new card has its
+    /// own, and "I have written it down" names the card it was clicked on.
+    pub stop_card_id: u64,
     /// The grant wizard of Settings, Security (§B.8.7.1) as the tokio side
     /// last answered it.
     pub wizard: WizardView,
@@ -1081,8 +1084,9 @@ pub enum ManagerOp {
     SetMode(DeviceId, SessionMode),
     /// Turn unattended access on: a new emergency stop code is shown once.
     On,
-    /// The stop code was written down: it is dropped (no guard operation).
-    StopCodeWrittenDown,
+    /// The stop code of the card with this number was written down: that
+    /// card is dropped, a newer one stays (no guard operation).
+    StopCodeWrittenDown(u64),
     /// Enable the device's disabled access.
     Enable(DeviceId),
     /// Unlock the device's locked access (its failed attempts are reset).
