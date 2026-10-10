@@ -610,6 +610,20 @@ fn asks_password(op: &ManagerOp) -> bool {
     )
 }
 
+/// One press of the wizard's *Turn on*, *Change password* or restore at a
+/// time (one password dialog at a time, kept in the wizard's own state):
+/// while another operation asks for this computer's password, the press
+/// `attempt` is answered, not queued, and the running press stays;
+/// otherwise it becomes the running press. Whether it was taken.
+fn take_press(m: &mut super::model::Model, attempt: u64) -> bool {
+    if m.manager_busy || m.wizard.running.is_some() {
+        m.wizard.answer = Some((attempt, WizardAnswer::Refused(ANOTHER_ASKS)));
+        return false;
+    }
+    m.wizard.running = Some(attempt);
+    true
+}
+
 impl ManagerWatch {
     /// The readiness rows as the host last probed them, with the rows read
     /// now: the start at sign-in from `autostart` (the system's answer), the
@@ -2278,14 +2292,11 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                                 | ManagerOp::Restore(request) => request.attempt,
                                 _ => continue,
                             };
-                            if b.shared.read(|m| m.manager_busy || m.wizard.running.is_some()) {
-                                b.shared.update(|m| {
-                                    m.wizard.answer =
-                                        Some((attempt, WizardAnswer::Refused(ANOTHER_ASKS)));
-                                });
+                            let mut taken = false;
+                            b.shared.update(|m| taken = take_press(m, attempt));
+                            if !taken {
                                 continue;
                             }
-                            b.shared.update(|m| m.wizard.running = Some(attempt));
                             let shared = Arc::clone(&b.shared);
                             // `run` hands the wizard's operations to their own
                             // methods, apart from the section's note and flag.
@@ -6266,6 +6277,65 @@ mod tests {
     /// Linux facts, as a source the tests can change.
     fn linux_facts() -> Arc<tornect_core::levels::FixedFacts> {
         Arc::new(tornect_core::levels::FixedFacts::linux())
+    }
+
+    /// §B.8.7.4: one press of the wizard at a time, decided where the
+    /// command loop decides it: a second press while one runs, and a press
+    /// while a section operation asks for this computer's password, are
+    /// answered that another command is changing access, with the running
+    /// press unchanged; once the running press is cleared, as *Turn on* and
+    /// *Change password* clear it when they end, a press is taken.
+    #[test]
+    fn one_press_of_the_wizard_at_a_time() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let press = |attempt| {
+            let mut taken = false;
+            shared.update(|m| taken = take_press(m, attempt));
+            taken
+        };
+        let state = || shared.read(|m| (m.wizard.running, m.wizard.answer));
+        let refused = |attempt| Some((attempt, WizardAnswer::Refused(ANOTHER_ASKS)));
+        assert!(press(1));
+        assert_eq!(state(), (Some(1), None));
+        assert!(!press(2), "a second press while one runs");
+        assert_eq!(state(), (Some(1), refused(2)));
+        shared.update(|m| m.wizard.running = None);
+        shared.update(|m| m.manager_busy = true);
+        assert!(!press(3), "a press while a section operation asks");
+        assert_eq!(state(), (None, refused(3)));
+        shared.update(|m| m.manager_busy = false);
+        // The wizard's operations clear the running press when they end.
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = wizard_watch(
+            tmp.path(),
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            linux_facts(),
+        );
+        let device = tornect_core::DeviceId::from_bytes([1; 32]);
+        assert!(press(1));
+        watch.run(
+            ManagerOp::Grant(Box::new(turn_on(device, generated_pw()))),
+            &shared,
+        );
+        assert_eq!(shared.read(|m| m.wizard.running), None, "Turn on ended");
+        assert!(press(1), "taken once Turn on ended");
+        assert!(!press(2));
+        assert_eq!(state(), (Some(1), refused(2)));
+        shared.update(|m| m.wizard.running = None);
+        assert!(press(1));
+        watch.run(
+            ManagerOp::ChangePassword(Box::new(turn_on(device, generated_pw()))),
+            &shared,
+        );
+        assert_eq!(
+            shared.read(|m| m.wizard.running),
+            None,
+            "Change password ended"
+        );
+        assert!(press(4), "taken once Change password ended");
+        assert_eq!(state().0, Some(4));
     }
 
     /// Every password that crosses the window's channel is a `Secret`: a
