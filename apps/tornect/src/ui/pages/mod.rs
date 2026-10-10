@@ -2053,7 +2053,7 @@ mod tests {
     }
 
     /// The controls the sidebar and the banner offer over `model` (the
-    /// Sessions page draws none of its own).
+    /// Sessions page draws only "Open log folder", and that only when not shared).
     fn chrome_controls(model: &Model, size: (f32, f32)) -> Vec<String> {
         Window::new(model.clone(), Page::Sessions, egui::Theme::Dark, size).controls()
     }
@@ -2634,9 +2634,9 @@ mod tests {
         );
     }
 
-    /// The pause offers the two ends ruled so far, 12 hours and until access
-    /// is turned back on, and no end at 08:00 (it waits for the operator:
-    /// this version keeps no time zone of the computer).
+    /// The pause offers the two ruled ends, 12 hours and until access is
+    /// turned back on, and no end at 08:00 (OPEN until a zone source exists, as
+    /// the operator ruled: this version keeps no time zone of the computer).
     #[test]
     fn pause_offers_the_two_settled_ends() {
         use super::super::model::{ManagerOp, PauseEnd};

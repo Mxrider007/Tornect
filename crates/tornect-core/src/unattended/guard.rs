@@ -1063,7 +1063,8 @@ impl MutationGuard {
         Ok(())
     }
 
-    /// Pause until `until` (unix seconds; 12 h / until 08:00 / until re-enabled). Live
+    /// Pause until `until` (unix seconds; 12 h / until re-enabled; until 08:00 is OPEN until a
+    /// zone source exists). Live
     /// sessions get `BYE{PAUSED}`. Starting or extending a pause is deny-direction;
     /// ending a running pause early — an `until` before its end, or not in the future —
     /// has the effect of *master on* and is therefore access-increasing (re-auth, no
