@@ -745,7 +745,19 @@ fn toolbar(
                                     .push(Action::Viewer(ViewerAction::Details(!viewer.details)));
                             }
                         }
-                        ui.label(RichText::new(chip_text(v)).color(chip_color(v, t)));
+                        let chip = RichText::new(chip_text(v)).color(chip_color(v, t));
+                        if viewer.badge_off {
+                            // The badge is off: the chip opens the details in
+                            // its place, and toggles them as the badge does.
+                            let chip = ui.add(egui::Label::new(chip).sense(egui::Sense::click()));
+                            if chip.clicked() {
+                                badge_clicked = true;
+                                actions
+                                    .push(Action::Viewer(ViewerAction::Details(!viewer.details)));
+                            }
+                        } else {
+                            ui.label(chip);
+                        }
                         if v.control {
                             ui.label(RichText::new(PAUSE).small());
                             let mut paused = viewer.input_paused;
@@ -1292,6 +1304,64 @@ mod tests {
             w.pass(ms(100 * k), Vec::new());
         }
         assert!(w.has("Tor relay · 30 fps · 1600×900"), "{:?}", w.texts());
+    }
+
+    /// With the badge off (Display and quality), a click on the level chip
+    /// opens the details in its place and closes them again, and the press
+    /// never reaches the host; with the badge on, the chip opens nothing.
+    #[test]
+    fn the_level_chip_opens_the_details_when_the_badge_is_off() {
+        use crate::ui::stream::{Forwarder, PictureRect};
+        use tornect_input::Button;
+        let mut w = Window::new(true);
+        w.viewer.badge_off = true;
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        assert!(
+            !w.texts().iter().any(|t| t.contains("Tor relay")),
+            "no badge"
+        );
+        let at = w.centre("control");
+        let asked = w.click(ms(100), "control");
+        assert_eq!(asked, vec![Action::Viewer(ViewerAction::Details(true))]);
+        // As the window applies the action.
+        w.viewer.details = true;
+        w.pass(ms(200), Vec::new());
+        w.pass(ms(200), Vec::new());
+        assert!(w.has("Route"), "{:?}", w.texts());
+        // A second click on the chip (the details show "control" too).
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut asked = w.pass(ms(300), vec![egui::Event::PointerMoved(at), press(true)]);
+        asked.extend(w.pass(ms(300), vec![press(false)]));
+        assert_eq!(asked, vec![Action::Viewer(ViewerAction::Details(false))]);
+        // The press on the chip, as the window hands it to the forwarder.
+        let pixels = |r: egui::Rect| PictureRect {
+            x: f64::from(r.min.x),
+            y: f64::from(r.min.y),
+            width: f64::from(r.width()),
+            height: f64::from(r.height()),
+        };
+        let mut forwarder = Forwarder::new(true);
+        forwarder.set_areas(
+            w.drawn.map(pixels),
+            w.viewer.visible().map(pixels),
+            w.viewer.areas().iter().map(|r| pixels(*r)).collect(),
+        );
+        forwarder.moved((f64::from(at.x), f64::from(at.y)));
+        forwarder.button(Button::Left, true);
+        forwarder.button(Button::Left, false);
+        forwarder.flush();
+        assert!(forwarder.drain().is_empty());
+        // The badge on: the chip is a label only.
+        let mut w = Window::new(true);
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        assert!(w.click(ms(100), "control").is_empty());
     }
 
     /// The connection's details open from the badge and say the route, the
