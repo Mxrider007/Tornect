@@ -283,7 +283,8 @@ fn first_run(paths: &Paths) -> bool {
 const NOT_SAVED_SHARED: &str = "Not saved: this screen is shared.";
 
 /// The settings page's line when `config.toml` could not be read or
-/// written (the reason goes to the log, which may name the path).
+/// written (the log gets a fixed line: the reason may name the path, and so
+/// the account).
 const NOT_SAVED_FILE: &str = "Not saved: the settings file could not be read or written.";
 
 /// Save one settings change: `config.toml` as it is now, with the change,
@@ -301,8 +302,9 @@ fn save_settings(paths: &Paths, shared: &Shared, change: &SettingsChange) {
     });
     match saved {
         Ok(cfg) => shared.update(|m| m.settings = Settings::of(&cfg)),
-        Err(e) => {
-            tracing::warn!(error = %e, "the settings were not saved");
+        // No error text: it may name the path, which names the account.
+        Err(_) => {
+            tracing::warn!("the settings were not saved");
             shared.update(|m| m.settings.problem = Some(NOT_SAVED_FILE));
         }
     }
@@ -5253,6 +5255,61 @@ mod tests {
         assert!(
             !printed.contains("198.51") && printed.contains("1 lines"),
             "{printed}"
+        );
+    }
+
+    /// A settings change that cannot be saved logs a fixed line, as the log
+    /// writes it: no error text, which names the settings file's path, and
+    /// so the account.
+    #[test]
+    fn a_failed_save_logs_no_path() {
+        use std::io::Write;
+        use tornect_core::config::Theme;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = Capture(Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .fmt_fields(tornect_core::telemetry::redacting_fields())
+                .with_ansi(false)
+                .with_writer(move || writer.clone()),
+        );
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        paths.ensure().unwrap();
+        std::fs::write(paths.config_file(), "this is = not [valid").unwrap();
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        save_settings(&paths, &shared, &SettingsChange::Theme(Theme::Dark));
+        assert_eq!(shared.read(|m| m.settings.problem), Some(NOT_SAVED_FILE));
+        let logged = String::from_utf8(
+            buffer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+        )
+        .unwrap();
+        assert!(logged.contains("the settings were not saved"), "{logged}");
+        let home = tmp.path().to_string_lossy();
+        assert!(
+            !logged.contains(&*home) && !logged.contains("config.toml"),
+            "{logged}"
         );
     }
 
