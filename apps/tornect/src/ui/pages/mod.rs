@@ -2530,6 +2530,48 @@ mod tests {
         }
     }
 
+    /// While this screen may be in a picture that leaves it, each readiness
+    /// row says its title and its state word only: a probe's message (it may
+    /// name a path, and so the account) shows only when nothing is shared.
+    #[test]
+    fn the_readiness_rows_while_shared_say_their_state_only() {
+        use tornect_core::unattended::readiness::Probe;
+        let warned = "reading /home/someone/x: denied";
+        let failed = "no file at /home/someone/y";
+        let mut manager = manager_on();
+        manager.readiness = vec![
+            ("panic_key", Probe::Ok),
+            ("keystore", Probe::Warn(warned.to_owned())),
+            ("autostart", Probe::Fail(failed.to_owned())),
+            ("capture", Probe::Unknown),
+        ];
+        let mut model = at_rest();
+        model.manager = Some(manager);
+        let mut shared = model.clone();
+        shared.hosted_elsewhere = true;
+        for size in [WIDE, NARROW] {
+            let window = security_section(shared.clone(), size);
+            for gone in ["/home/", warned, failed] {
+                assert!(!has_text(&window, gone), "{size:?}: {gone}");
+            }
+            for state in [
+                "Panic key: bound",
+                "Keystore persistent and unlockable at start: warning",
+                "Start at sign-in: FAIL",
+                "Screen capture permission: unknown",
+            ] {
+                assert!(has_text(&window, state), "{size:?}: {state}");
+            }
+            let window = security_section(model.clone(), size);
+            for said in [
+                format!("Keystore persistent and unlockable at start: warning: {warned}"),
+                format!("Start at sign-in: FAIL: {failed}"),
+            ] {
+                assert!(has_text(&window, &said), "{size:?}: {said}");
+            }
+        }
+    }
+
     /// A window without the guard (no host role here, a store that did not
     /// open, another Tornect holding it) says so on Settings, Security, and
     /// shows nothing else of unattended access and no control.
