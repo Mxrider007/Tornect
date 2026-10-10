@@ -1320,6 +1320,9 @@ fn a6_log_verifier_survives_rotate_id_and_a_store_reset_and_still_detects_tamper
             && r.by == Some(Actor::Ui)
             && r.detail.as_deref().is_some_and(|s| s.contains("1 grant"))
     }));
+    drop((guard, store));
+    let store = env.open();
+    let guard = env.guard(&store);
     let on = guard.master_on(Actor::Ui, &HOST_PK).unwrap();
     assert_eq!(on.stop_code.len(), 16);
     assert!(store.grant(&d).is_none());
@@ -6272,4 +6275,123 @@ fn the_log_names_administrator_access() {
         !names_it(SessionEvent::PasswordSet, dev(2)),
         "without the level"
     );
+}
+
+// ------------------------------------------------------------------ Rotate ID beside a dialog
+
+/// A dialog during which Rotate ID runs on the same guard, as the window's
+/// Rotate ID would while another operation waits at its re-authentication.
+#[derive(Default)]
+struct RotateDuringDialog {
+    guard: std::sync::OnceLock<std::sync::Weak<MutationGuard>>,
+}
+
+impl ReAuth for RotateDuringDialog {
+    fn reauthenticate(&self, _op: &str) -> Result<(), ReAuthError> {
+        if let Some(guard) = self.guard.get().and_then(std::sync::Weak::upgrade) {
+            guard.rotate_id(Actor::Ui).unwrap();
+        }
+        Ok(())
+    }
+}
+
+/// A guard over `store` whose every dialog runs Rotate ID on it first.
+fn rotating_guard(store: &GrantStore) -> Arc<MutationGuard> {
+    let reauth = Arc::new(RotateDuringDialog::default());
+    let guard = Arc::new(
+        MutationGuard::new(
+            store.clone(),
+            reauth.clone(),
+            Arc::new(NoSessionActivity),
+            Arc::new(FixedFacts::linux()),
+        )
+        .with_server_setup_source(Arc::new(RandomServerSetupSource))
+        .with_paired_devices(Arc::new(AllowAllPaired)),
+    );
+    reauth.guard.set(Arc::downgrade(&guard)).expect("set once");
+    guard
+}
+
+/// The refusal of an operation once Rotate ID ran.
+fn refused_after_rotate_id(e: &GuardError) -> bool {
+    e.code() == codes::G_PRECONDITION && e.to_string().contains("Rotate ID ran; restart Tornect")
+}
+
+/// §B.8.12: Rotate ID runs while Turn on waits at its dialog. When the dialog
+/// returns, the wiped store is not bootstrapped again: master on is refused,
+/// the store stays attended-only and holds no grant.
+#[test]
+fn master_on_whose_dialog_outlives_rotate_id_is_refused() {
+    let env = Env::new();
+    let store = env.open();
+    let first = enable(&env, &store, dev(1), Preset::MyMachines);
+    first.master_off(Actor::Ui).unwrap();
+    drop(first);
+    let guard = rotating_guard(&store);
+    let refused = guard.master_on(Actor::Ui, &HOST_PK).unwrap_err();
+    assert!(refused_after_rotate_id(&refused), "{refused}");
+    assert_eq!(store.status(), StoreStatus::AttendedOnly);
+    assert!(store.grants().is_empty(), "no grant");
+}
+
+/// §B.8.12: Rotate ID runs while the wizard's registration waits at its
+/// dialog, on a home whose store is not bootstrapped yet. When the dialog
+/// returns, `reg_start` is refused: nothing is bootstrapped and no grant can
+/// follow.
+#[test]
+fn reg_start_whose_dialog_outlives_rotate_id_is_refused() {
+    let env = Env::new();
+    let store = env.open();
+    let d = dev(1);
+    let guard = rotating_guard(&store);
+    let Err(refused) = guard.reg_start(Actor::Ui, &d, false, true) else {
+        panic!("reg_start ran after Rotate ID");
+    };
+    assert!(refused_after_rotate_id(&refused), "{refused}");
+    assert_eq!(store.status(), StoreStatus::AttendedOnly);
+    assert!(store.grant(&d).is_none(), "no grant");
+}
+
+/// An operation that reaches the guard after Rotate ID (from a connection
+/// accepted before it, say) is refused: the registration started before it
+/// cannot be finished, and neither master on, a new registration nor a grant
+/// is possible until the next start.
+#[test]
+fn an_operation_after_rotate_id_is_refused() {
+    let env = Env::new();
+    let store = env.open();
+    let d = dev(1);
+    let guard = env.guard(&store);
+    guard.master_on(Actor::Cli, &HOST_PK).unwrap();
+    let started = guard.reg_start(Actor::Cli, &d, false, true).unwrap();
+    guard.rotate_id(Actor::Ui).unwrap();
+    let finished = guard.reg_finish(
+        Actor::Cli,
+        &d,
+        &started.reg_txn,
+        &upload(),
+        Preset::MyMachines,
+        &waived(),
+        true,
+    );
+    assert!(finished.is_err(), "the registration cannot be finished");
+    let on = guard.master_on(Actor::Cli, &HOST_PK).unwrap_err();
+    assert!(refused_after_rotate_id(&on), "{on}");
+    let Err(again) = guard.reg_start(Actor::Cli, &d, false, true) else {
+        panic!("reg_start ran after Rotate ID");
+    };
+    assert!(refused_after_rotate_id(&again), "{again}");
+    let created = guard
+        .create_grant(
+            Actor::Cli,
+            &d,
+            Preset::MyMachines,
+            &waived(),
+            &upload(),
+            false,
+        )
+        .unwrap_err();
+    assert!(refused_after_rotate_id(&created), "{created}");
+    assert_eq!(store.status(), StoreStatus::AttendedOnly);
+    assert!(store.grants().is_empty(), "no grant");
 }
