@@ -1784,11 +1784,13 @@ fn name_question_due(first: bool, background: bool) -> bool {
 
 /// Ask the first run's question and wait for its answer: until it comes,
 /// nothing starts that could send this computer's name (the host role, Tor,
-/// a connection); only the settings pages act meanwhile, and they send
-/// nothing. The name saved then goes into every copy the start reads: the
-/// configuration the host and the client are built from, the recognizer's
-/// own entry and the model. `false`: the window closed first, and nothing
-/// was started (a name not given stays the neutral default next time).
+/// a connection); only a settings change, the history switch and Clear
+/// history act meanwhile, each on this computer's own files as the started
+/// window does it, and nothing reaches the network. The name saved then
+/// goes into every copy the start reads: the configuration the host and the
+/// client are built from, the recognizer's own entry and the model.
+/// `false`: the window closed first, and nothing was started (a name not
+/// given stays the neutral default next time).
 async fn ask_the_name(b: &mut Backend, commands: &mut mpsc::UnboundedReceiver<Command>) -> bool {
     b.shared.update(|m| m.name_question = true);
     loop {
@@ -1800,6 +1802,8 @@ async fn ask_the_name(b: &mut Backend, commands: &mut mpsc::UnboundedReceiver<Co
                 break;
             }
             Some(Command::SaveSettings(change)) => save_settings(&b.paths, &b.shared, &change),
+            Some(Command::SetHistory(on)) => change_book(b, &Change::History(on)),
+            Some(Command::ClearHistory) => change_book(b, &Change::Clear),
             Some(Command::Quit) | None => return false,
             Some(_) => {}
         }
@@ -5352,6 +5356,38 @@ mod tests {
         assert!(shared.read(|m| m.name_question), "never answered");
         assert_eq!(b.cfg.general.device_name, neutral);
         assert!(!paths.config_file().exists());
+    }
+
+    /// The history switch and Clear history work while the first run's
+    /// question waits: each acts at once on this computer's own files, before
+    /// the answer.
+    #[tokio::test]
+    async fn the_question_keeps_the_history_switch_and_clear() {
+        use tornect_core::address_book::{Day, Store};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut b, shared, paths) = first_start(&tmp);
+        let store = Store::new(&paths);
+        store.set_history(true).unwrap();
+        let id = TornectId::from_bytes([0x42; 32]);
+        assert!(
+            store
+                .record_visit(id, [7; 32], "Desk", Day::today())
+                .unwrap()
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Command::ClearHistory).unwrap();
+        tx.send(Command::SetHistory(false)).unwrap();
+        tx.send(Command::FirstRunName(None)).unwrap();
+        assert!(ask_the_name(&mut b, &mut rx).await);
+        assert!(store.recent().unwrap().visits.is_empty(), "cleared");
+        assert!(!store.keeps_history(), "switched off");
+        shared.read(|m| {
+            assert!(m.book.recent.is_empty() && !m.book.history);
+            assert_eq!(
+                m.book.note.as_deref(),
+                Some("History is off: no list of recent connections is kept from now on.")
+            );
+        });
     }
 
     /// Only the first start of a home asks, and only in a window shown on
