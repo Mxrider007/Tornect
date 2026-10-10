@@ -501,6 +501,14 @@ impl Wizard {
         });
     }
 
+    /// ⑤a's offer alone, for the devices `reaching`: the answer of a press
+    /// whose wizard had closed (§B.8.7.1, decision M1-67).
+    pub(in super::super) fn offer(reaching: Vec<NewlyReaching>) -> Self {
+        let mut w = Self::new();
+        w.open_offer(reaching);
+        w
+    }
+
     /// The answer to the offer's prompt for its first device (`done`: its
     /// new password is registered), or that prompt skipped: then the next
     /// device's prompt with a new passphrase, or, the round over, the devices
@@ -3566,6 +3574,39 @@ mod tests {
         window.pass(Vec::new());
         assert_eq!(window.step(), Some(Step::Offer));
         window
+    }
+
+    /// §B.8.7.1 ⑤a, decision M1-67: a raise whose wizard closed while its
+    /// dialog was open (the window left Settings) still opens the offer
+    /// once its Done comes, having made other control grants reach the
+    /// level, the next time Security is drawn; a Done with none to name
+    /// opens nothing.
+    #[test]
+    fn a_done_after_the_wizard_closed_opens_the_offer() {
+        for (listed, offered) in [(reaching(), true), (Vec::new(), false)] {
+            let (mut window, choice) = at_raise();
+            judge(&mut window, &choice, Some(true), None);
+            let sent = window.click("Continue");
+            let [Action::Manager(ManagerOp::ChangePassword(request))] = sent.as_slice() else {
+                panic!("one registration: {sent:?}");
+            };
+            let attempt = request.attempt;
+            window.form.page = Page::Home;
+            window.pass(Vec::new());
+            assert!(window.wizard().is_none(), "closed with the page");
+            window.model.wizard.answer = Some((attempt, WizardAnswer::Done));
+            window.model.wizard.reaching = listed;
+            window.pass(Vec::new());
+            window.form.page = Page::Settings;
+            window.pass(Vec::new());
+            window.pass(Vec::new());
+            assert_eq!(
+                window.has_text(&OFFER_HEADING.replace("<labels>", "Laptop A, Desk B")),
+                offered
+            );
+            assert_eq!(window.step() == Some(Step::Offer), offered);
+            assert_eq!(window.form.settings.pending, None, "the wait ended");
+        }
     }
 
     /// The registrations among `actions`.
