@@ -957,26 +957,65 @@ impl SessionLog {
         Ok(out)
     }
 
+    /// Every well-formed record that could be read from the retained rotated files
+    /// (oldest first) and the live file, and whether all of them could be: a line that
+    /// is not UTF-8 is skipped, and a file that cannot be read to its end keeps the
+    /// records read before the error, which the log names without the file's path
+    /// (the window's Sessions page and device cards, §B.8.13).
+    pub fn read_all_readable(&self) -> (Vec<SessionRecord>, bool) {
+        let mut out = Vec::new();
+        let mut whole = true;
+        let files = (1..=ROTATE_KEEP)
+            .rev()
+            .map(|n| self.rotated_path(n))
+            .chain([self.path.clone()]);
+        for path in files {
+            match Self::read_records_into(&path, &mut out) {
+                Ok(read) => whole &= read,
+                Err(_) => {
+                    tracing::warn!("part of the session log could not be read");
+                    whole = false;
+                }
+            }
+        }
+        (out, whole)
+    }
+
     fn read_records_of(path: &Path) -> Result<Vec<SessionRecord>> {
+        let mut out = Vec::new();
+        Self::read_records_into(path, &mut out)?;
+        Ok(out)
+    }
+
+    /// The well-formed records of the file at `path`, appended to `out` as they are
+    /// read, line by line as bytes: a line that does not parse is skipped as malformed,
+    /// and so is one that is not UTF-8 (then `false`). An I/O error ends the read, the
+    /// records before it in `out`.
+    fn read_records_into(path: &Path, out: &mut Vec<SessionRecord>) -> Result<bool> {
         let file = match fs_err::File::open(path) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
             Err(e) => return Err(e.into()),
         };
-        let mut out = Vec::new();
-        for (n, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let mut whole = true;
+        for (n, line) in std::io::BufReader::new(file).split(b'\n').enumerate() {
             let line = line?;
+            let Ok(line) = std::str::from_utf8(&line) else {
+                tracing::warn!(line = n + 1, "skipping sessions.log line that is not UTF-8");
+                whole = false;
+                continue;
+            };
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<SessionRecord>(&line) {
+            match serde_json::from_str::<SessionRecord>(line) {
                 Ok(r) => out.push(r),
                 Err(e) => {
                     tracing::warn!(line = n + 1, error = %e, "skipping malformed sessions.log line")
                 }
             }
         }
-        Ok(out)
+        Ok(whole)
     }
 
     /// Raw lines of the live file (no rotated files), for the paged `Log` IPC op.
@@ -1881,5 +1920,42 @@ mod tests {
             std::fs::read(&rotated).unwrap(),
         );
         assert_eq!(before, after);
+    }
+
+    /// A line that is not UTF-8 is skipped as malformed, and the records around it
+    /// are read; the window's reader says that part could not be read.
+    #[test]
+    fn a_line_that_is_not_utf8_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SessionLog::new(dir.path().join("logs").join("sessions.log"));
+        let dev = DeviceId::from_bytes([1u8; 32]);
+        let r1 = SessionRecord::now(SessionEvent::PairAccepted).peer(dev, "Laptop");
+        let r2 = SessionRecord::now(SessionEvent::PairRejected).peer(dev, "Laptop");
+        log.append(&r1).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(log.path())
+            .unwrap()
+            .write_all(b"{\"event\":\"\xff\xfe\"}\n")
+            .unwrap();
+        log.append(&r2).unwrap();
+        assert_eq!(log.read_all().unwrap(), vec![r1.clone(), r2.clone()]);
+        assert_eq!(log.read_all_readable(), (vec![r1, r2], false));
+    }
+
+    /// A file that cannot be read keeps what the other files hold: the window's reader
+    /// returns the records it could read and says that part could not be.
+    #[test]
+    fn a_file_that_cannot_be_read_keeps_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SessionLog::new(dir.path().join("logs").join("sessions.log"));
+        let dev = DeviceId::from_bytes([1u8; 32]);
+        let r1 = SessionRecord::now(SessionEvent::PairAccepted).peer(dev, "Laptop");
+        log.append(&r1).unwrap();
+        std::fs::rename(log.path(), log.rotated_path(1)).unwrap();
+        // A directory where the live file is: it opens, but cannot be read.
+        std::fs::create_dir(log.path()).unwrap();
+        assert!(log.read_all_including_rotated().is_err());
+        assert_eq!(log.read_all_readable(), (vec![r1], false));
     }
 }

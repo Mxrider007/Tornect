@@ -34,6 +34,9 @@ pub(super) const OPEN_LOG_FOLDER: &str = "Open log folder";
 /// Under the newest rows, when the log holds more.
 pub(super) const OLDER: &str = "Older sessions are in the session log.";
 
+/// Above the rows, when part of the session log could not be read.
+pub(super) const PART_UNREADABLE: &str = "Part of the session log could not be read.";
+
 /// The columns' titles.
 pub(super) const COLUMNS: [&str; 5] = ["When", "With", "Mode", "Access", "How it ended"];
 
@@ -139,11 +142,19 @@ pub(super) fn page(ui: &mut Ui, model: &Model, form: &mut Form, shared: bool) {
                 .color(color),
         );
     };
+    // What could be read is shown, and the part that could not be is said.
+    if model.sessions_partial {
+        text(ui, PART_UNREADABLE, t.warn);
+    }
     match &model.sessions {
         None => {
             ui.spinner();
         }
-        Some(rows) if rows.is_empty() => text(ui, NONE_YET, t.text_secondary),
+        Some(rows) if rows.is_empty() => {
+            if !model.sessions_partial {
+                text(ui, NONE_YET, t.text_secondary);
+            }
+        }
         Some(rows) => {
             widgets::card(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -239,5 +250,57 @@ mod tests {
             rows.iter().map(|r| r.ended).collect::<Vec<_>>(),
             ["refused", "—", "connection closed"]
         );
+    }
+
+    /// Every text the page draws over `model`, not shared, after two passes.
+    fn texts(model: &Model) -> Vec<String> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut form = Form::default();
+        let mut nodes = Vec::new();
+        for _ in 0..2 {
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                page(ui, model, &mut form, false);
+            });
+            if let Some(update) = &out.platform_output.accesskit_update {
+                nodes = update.nodes.iter().map(|(_, n)| n.clone()).collect();
+            }
+            out.drop_without_applying_deltas();
+        }
+        nodes
+            .iter()
+            .flat_map(|n: &egui::accesskit::Node| [n.label(), n.value()])
+            .flatten()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Part of the session log could not be read: the page says so above the
+    /// rows that could be, and with none it says nothing else (no spinner for
+    /// ever, no "nothing recorded").
+    #[test]
+    fn a_log_read_in_part_says_so() {
+        let dev = DeviceId::from_bytes([1; 32]);
+        let records = vec![
+            SessionRecord::now(SessionEvent::SessionStarted)
+                .peer(dev, "Office laptop")
+                .session("a"),
+        ];
+        let mut model = Model {
+            sessions: Some(rows(&records)),
+            sessions_partial: true,
+            ..Model::default()
+        };
+        let said = texts(&model);
+        assert!(said.iter().any(|t| t == PART_UNREADABLE), "{said:?}");
+        assert!(said.iter().any(|t| t == "Office laptop"), "{said:?}");
+        model.sessions = Some(Vec::new());
+        let said = texts(&model);
+        assert!(said.iter().any(|t| t == PART_UNREADABLE), "{said:?}");
+        assert!(!said.iter().any(|t| t == NONE_YET), "{said:?}");
+        model.sessions_partial = false;
+        let said = texts(&model);
+        assert!(!said.iter().any(|t| t == PART_UNREADABLE), "{said:?}");
+        assert!(said.iter().any(|t| t == NONE_YET), "{said:?}");
     }
 }

@@ -211,6 +211,9 @@ pub struct Model {
     /// The Sessions page's rows (§B.8.13), newest first, as the tokio side
     /// last read them from the session log; `None` until read.
     pub sessions: Option<Vec<SessionRow>>,
+    /// Part of the session log could not be read: the rows are those that
+    /// could be, and the Sessions page says so.
+    pub sessions_partial: bool,
     /// The session log's folder, which "Open log folder" shows.
     pub log_folder: Option<String>,
     /// The first start of this home in a window on screen: Home asks the
@@ -1291,8 +1294,8 @@ pub struct GrantLevel {
 pub struct DeviceCard {
     /// Its sessions are served view only, and why.
     pub view_only: Option<ViewOnly>,
-    /// How many of its admin commands ran nothing; `None` when the session
-    /// log could not be read.
+    /// How many of its admin commands ran nothing, counted over what could be
+    /// read of the session log.
     pub nothing_ran: Option<usize>,
 }
 

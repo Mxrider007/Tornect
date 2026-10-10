@@ -425,18 +425,22 @@ const SESSIONS_EVERY: Duration = Duration::from_secs(30);
 /// the page asks for nothing. Reads only.
 fn refresh_sessions(paths: &Paths, shared: &Shared) {
     let log = tornect_core::session_log::SessionLog::new(paths.sessions_log());
-    let rows = log
-        .read_all_including_rotated()
-        .ok()
-        .map(|records| super::pages::session_rows(&records));
+    // The rows that could be read, and whether a part could not be (the
+    // reader logs it without the file's path).
+    let (records, whole) = log.read_all_readable();
+    let rows = Some(super::pages::session_rows(&records));
+    let partial = !whole;
     let folder = paths
         .sessions_log()
         .parent()
         .map(|p| p.display().to_string());
-    if shared.read(|m| m.sessions != rows || m.log_folder != folder) {
+    if shared
+        .read(|m| m.sessions != rows || m.log_folder != folder || m.sessions_partial != partial)
+    {
         shared.update(|m| {
             m.sessions = rows;
             m.log_folder = folder;
+            m.sessions_partial = partial;
         });
     }
 }
@@ -819,7 +823,9 @@ impl ManagerWatch {
         } else {
             HelperPresence::Absent
         };
-        let records = self.ctx.log.read_all_including_rotated().ok();
+        // What could be read of the log: a part that cannot be leaves the
+        // counts of the rest.
+        let records = Some(self.ctx.log.read_all_readable().0);
         grants
             .into_iter()
             .map(|(device, mode, elevation, marked)| {
@@ -7461,5 +7467,46 @@ mod tests {
         );
         assert_eq!(std::fs::read(paths.sessions_log()).unwrap(), before);
         assert_eq!(files(), count, "no file added");
+    }
+
+    /// §B.8.13: a log read in part keeps the rows that could be read: a line
+    /// that is not UTF-8 among good ones leaves the good rows, and a file
+    /// that cannot be read leaves none, with the page's sentence either way
+    /// and never a spinner for ever.
+    #[test]
+    fn a_log_read_in_part_keeps_its_rows() {
+        use std::io::Write as _;
+        use tornect_core::session_log::{SessionEvent, SessionLog, SessionMode, SessionRecord};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let log = SessionLog::new(paths.sessions_log());
+        let started = SessionRecord::now(SessionEvent::SessionStarted)
+            .peer(tornect_core::DeviceId::from_bytes([1; 32]), "Office laptop")
+            .session("s1")
+            .mode(SessionMode::Control);
+        log.append(&started).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(paths.sessions_log())
+            .unwrap()
+            .write_all(b"\xff\xfe\n")
+            .unwrap();
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        refresh_sessions(&paths, &shared);
+        shared.read(|m| {
+            let rows = m.sessions.as_ref().expect("the rows read");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].label, "Office laptop");
+            assert!(m.sessions_partial, "part could not be read");
+        });
+        // A directory where the live file is: it cannot be read.
+        std::fs::remove_file(paths.sessions_log()).unwrap();
+        std::fs::create_dir(paths.sessions_log()).unwrap();
+        refresh_sessions(&paths, &shared);
+        shared.read(|m| {
+            assert_eq!(m.sessions.as_deref().map(<[_]>::len), Some(0), "no spinner");
+            assert!(m.sessions_partial);
+        });
     }
 }
