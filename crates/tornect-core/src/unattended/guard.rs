@@ -43,6 +43,10 @@ use super::store::{GrantStore, State, StoreError, StoreStatus, WriteClass, push_
 const MARKED_ADMIN_ENABLE: &str = "this grant holds administrator access and its password may be \
     kept elsewhere: give it a new generated password (Change password) before enabling it";
 
+/// What the detail of a grant's `GrantCreated` and `PasswordSet` lines says
+/// when the grant holds the administrator level (§B.8.13).
+const ADMINISTRATOR_ACCESS: &str = "administrator access";
+
 /// A remote session must have ended at least this long ago (§B.8.6.2).
 pub const REMOTE_SESSION_COOLDOWN: Duration = Duration::from_secs(60);
 /// A `reg_txn` lives this long (§B.8.7.4).
@@ -2166,10 +2170,15 @@ impl MutationGuard {
                     )),
                 ));
             }
-            let rec = SessionRecord::at(now, SessionEvent::PasswordSet)
+            let mut rec = SessionRecord::at(now, SessionEvent::PasswordSet)
                 .by(by)
                 .device(*device)
                 .grant(&existing.id);
+            // The log names the level the grant holds with this password (a
+            // raise, or a new password at the level).
+            if probe.holds_level() {
+                rec = rec.detail(ADMINISTRATOR_ACCESS);
+            }
             let lowered = self
                 .store
                 .mutate(WriteClass::Policy, Some(&rec), |s, now| {
@@ -2275,11 +2284,16 @@ impl MutationGuard {
         }
         // Only a password sent as generated is unmarked (D9, D11).
         grant.unmarked = generated;
+        let at_the_level = grant.holds_level();
         let mut rec = SessionRecord::at(now, SessionEvent::GrantCreated)
             .by(by)
             .device(*device)
             .grant(&id)
-            .detail(format!("preset {}", preset.wire()));
+            .detail(if at_the_level {
+                format!("preset {}, {ADMINISTRATOR_ACCESS}", preset.wire())
+            } else {
+                format!("preset {}", preset.wire())
+            });
         if options.waive_attended_precondition {
             rec = rec.reason("attended precondition waived");
         }
@@ -2303,12 +2317,14 @@ impl MutationGuard {
                 }
                 other => other.into(),
             })?;
-        if let Err(e) = self.store.log_event(
-            &SessionRecord::at(now, SessionEvent::PasswordSet)
-                .by(by)
-                .device(*device)
-                .grant(&id),
-        ) {
+        let mut set = SessionRecord::at(now, SessionEvent::PasswordSet)
+            .by(by)
+            .device(*device)
+            .grant(&id);
+        if at_the_level {
+            set = set.detail(ADMINISTRATOR_ACCESS);
+        }
+        if let Err(e) = self.store.log_event(&set) {
             tracing::warn!(error = %e, "could not log PasswordSet");
         }
         Ok(RegFinishOutcome::Created(id))
