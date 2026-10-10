@@ -255,10 +255,17 @@ pub(super) fn section(
     ui.add_space(4.0);
     widgets::chip(ui, tone, true, &state);
     ui.add_space(10.0);
-    // The one stop-code card: never while this screen is shared or a sheet
-    // is up (kept until the click, drawn again after).
+    // The one stop-code card: never while this screen is shared, a sheet is
+    // up or a block window runs (the unattended session it leads to may send
+    // a frame before the window counts this screen as shared); kept until the
+    // click, drawn again after.
     let sheet = !model.popups.is_empty() || model.confirm.is_some();
-    if let Some(code) = model.stop_card.as_ref().filter(|_| !shared && !sheet) {
+    let blocking = !model.blocks.is_empty();
+    if let Some(code) = model
+        .stop_card
+        .as_ref()
+        .filter(|_| !shared && !sheet && !blocking)
+    {
         stop_card(ui, t, &code.0, actions);
         ui.add_space(10.0);
     }
@@ -825,5 +832,65 @@ fn readiness_state(name: &str, probe: &Probe) -> (Tone, String) {
         (_, Probe::Warn(_)) => (Tone::Warn, format!("{title}: warning")),
         (_, Probe::Fail(_)) => (Tone::Danger, format!("{title}: FAIL")),
         (_, Probe::Unknown) => (Tone::Neutral, format!("{title}: unknown")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{Model, SettingsForm, section};
+    use crate::ui::backend::Secret;
+    use crate::ui::model::{BlockRequest, Manager};
+
+    /// Every text the section draws over `model`, not shared, after two
+    /// passes.
+    fn texts(model: &Model) -> Vec<String> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut form = SettingsForm::default();
+        let mut nodes = Vec::new();
+        for _ in 0..2 {
+            let mut actions = Vec::new();
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                section(ui, model, &mut form, false, &mut actions);
+            });
+            if let Some(update) = &out.platform_output.accesskit_update {
+                nodes = update.nodes.iter().map(|(_, n)| n.clone()).collect();
+            }
+            out.drop_without_applying_deltas();
+        }
+        nodes
+            .iter()
+            .flat_map(|n: &egui::accesskit::Node| [n.label(), n.value()])
+            .flatten()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The stop code's card is not drawn while a block window runs: the
+    /// unattended session it leads to may send a frame before the window
+    /// counts this screen as shared.
+    #[test]
+    fn no_stop_card_while_a_block_window_runs() {
+        let code = "ABCD EFGH JKLM NPQR";
+        let mut model = Model {
+            manager: Some(Manager {
+                on: true,
+                ..Manager::default()
+            }),
+            stop_card: Some(Secret(zeroize::Zeroizing::new(code.to_owned()))),
+            ..Model::default()
+        };
+        assert!(texts(&model).iter().any(|t| t.contains(code)), "drawn");
+        model.blocks.push(BlockRequest {
+            id: 1,
+            label: "Office laptop".to_owned(),
+            ends_at: Instant::now() + Duration::from_secs(5),
+        });
+        assert!(
+            !texts(&model).iter().any(|t| t.contains(code)),
+            "not while a block window runs"
+        );
     }
 }
