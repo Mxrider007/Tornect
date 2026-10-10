@@ -140,6 +140,15 @@ pub(in super::super) const HARD_LOCK_OFF: &str = "With 0 the hard lock is off: g
 pub(in super::super) const NEVER_WARNING: &str = "Access that never ends stays until you remove \
     it, also if that device is lost or you forget it.";
 
+/// ⑤ for *Headless box* (the plan's statement for that preset, §B.8.7.1).
+pub(in super::super) const HEADLESS_STATEMENT: &str = "With this preset a session can start the \
+    moment the password is accepted, and anyone who turns this computer on gets its desktop as the \
+    paired device would.";
+
+/// The tick ⑤ needs for *Headless box* with no time to stop a connection,
+/// before its Continue.
+pub(in super::super) const I_UNDERSTAND: &str = "I understand";
+
 /// Where ⑤ sends the host-wide options.
 pub(in super::super) const HOST_WIDE: &str = "Set on the Security page for every device.";
 
@@ -369,6 +378,9 @@ pub(in super::super) struct Wizard {
     pub(in super::super) options: Options,
     /// ⑥'s "Enable anyway" for a red readiness row.
     pub(in super::super) enable_anyway: bool,
+    /// ⑤'s "I understand" for *Headless box* with no time to stop a
+    /// connection.
+    pub(in super::super) understood: bool,
     /// The generator's passphrase of ④, drawn when ④ opens: shown there
     /// only, sent as generated.
     pub(in super::super) passphrase: Option<NewPassword>,
@@ -415,6 +427,7 @@ impl Wizard {
             preset: Preset::MyMachines,
             options: Options::of(Preset::MyMachines),
             enable_anyway: false,
+            understood: false,
             passphrase: None,
             own: false,
             typed: room(),
@@ -1557,6 +1570,18 @@ fn options(
         )
         .suffix(" s"),
     );
+    // Headless box: the plan's statement, and no time to stop a connection
+    // only with the person's acknowledgement.
+    let headless = w.preset == Preset::HeadlessBox;
+    let acknowledge = headless && o.block_window_s == 0;
+    if headless {
+        line(ui, HEADLESS_STATEMENT, t.warn);
+    }
+    if acknowledge {
+        ui.checkbox(&mut w.understood, I_UNDERSTAND);
+    } else {
+        w.understood = false;
+    }
     ui.add_space(8.0);
     widgets::section_header(ui, "Hard lock after failed attempts in a row");
     ui.add(egui::Slider::new(
@@ -1608,10 +1633,13 @@ fn options(
             // Back at ④ a new passphrase is drawn: none is shown twice.
             w.open_password();
         }
+        let ready = !acknowledge || w.understood;
         if Button::new(Kind::Primary, "Continue")
             .small()
+            .enabled(ready)
             .show(ui)
             .clicked()
+            && ready
         {
             if level_step {
                 // ⑤a first asks whether this computer can give the level.
@@ -2994,7 +3022,8 @@ mod tests {
     }
 
     /// The wizard at ⑤ for `preset` with the guard's account facts
-    /// `account`, then ⑤'s Continue: the preview it asked for.
+    /// `account`, then ⑤'s Continue (for *Headless box* with no time to stop
+    /// a connection, after its "I understand"): the preview it asked for.
     fn continue_from_options(
         preset: &str,
         account: Option<AccountFacts>,
@@ -3002,6 +3031,9 @@ mod tests {
         let mut window = at_options(preset, false);
         window.model.wizard.account = account;
         window.pass(Vec::new());
+        if window.has_control(I_UNDERSTAND) {
+            assert!(window.click(I_UNDERSTAND).is_empty());
+        }
         let sent = window.click("Continue");
         let Some(Action::Manager(ManagerOp::Preview(choice))) = sent.first() else {
             panic!("no preview asked: {sent:?}");
@@ -3306,6 +3338,40 @@ mod tests {
         assert!(window.click("Enable").is_empty());
         assert!(window.has_text(&RESTORE_LINE.replace("<device>", "Office laptop")));
         assert!(!window.has_text(&warning), "the restore");
+    }
+
+    /// §B.8.7.1 ⑤ for *Headless box*: the plan's statement is drawn, and with
+    /// no time to stop a connection Continue does nothing until "I
+    /// understand" is ticked; at 1 s no tick is needed; *My machines* shows
+    /// neither.
+    #[test]
+    fn headless_box_says_its_statement_and_needs_the_tick_at_0_s() {
+        let mut window = at_options("Headless box", false);
+        assert_eq!(window.wizard().map(|w| w.options.block_window_s), Some(0));
+        assert!(window.has_text(HEADLESS_STATEMENT));
+        assert!(window.has_control(I_UNDERSTAND));
+        assert!(window.click("Continue").is_empty(), "not before the tick");
+        assert_eq!(window.step(), Some(Step::Options));
+        assert!(window.click(I_UNDERSTAND).is_empty());
+        let sent = window.click("Continue");
+        assert!(
+            matches!(sent.first(), Some(Action::Manager(ManagerOp::Preview(_)))),
+            "{sent:?}"
+        );
+        assert_eq!(window.step(), Some(Step::Check));
+        let mut window = at_options("Headless box", false);
+        options_mut(&mut window).block_window_s = 1;
+        window.pass(Vec::new());
+        assert!(window.has_text(HEADLESS_STATEMENT));
+        assert!(!window.has_control(I_UNDERSTAND), "1 s: no tick");
+        let sent = window.click("Continue");
+        assert!(
+            matches!(sent.first(), Some(Action::Manager(ManagerOp::Preview(_)))),
+            "{sent:?}"
+        );
+        let window = at_options("My machines", false);
+        assert!(!window.has_text(HEADLESS_STATEMENT));
+        assert!(!window.has_control(I_UNDERSTAND));
     }
 
     /// §B.8.7.1: the raise offers Cancel first, then Continue: Cancel is on
