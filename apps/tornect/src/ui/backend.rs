@@ -1404,8 +1404,8 @@ struct Hosted {
     _lock: HostLock,
 }
 
-/// The window's [`SessionSink`]: the tracker, the media layer, then the
-/// sharing indicator, and a bump of the counter that withdraws open popups.
+/// The window's [`SessionSink`]: the tracker, the sharing indicator, then the
+/// media layer, and a bump of the counter that withdraws open popups.
 struct GuiSessions {
     live: Arc<LiveSessions>,
     /// polkit's remembered approvals, revoked during Control sessions.
@@ -1420,8 +1420,6 @@ impl SessionSink for GuiSessions {
         self.live.on_start(session);
         crate::secure_screen::on_start(&self.live, session, cfg!(windows));
         self.polkit.on_start(session);
-        self.media.on_start(session);
-        self.started.send_modify(|n| *n = n.wrapping_add(1));
         let control = session.mode == SessionMode::Control;
         // The level the host signed in the accept (H5): never inferred from
         // the answer given on the sheet.
@@ -1445,6 +1443,10 @@ impl SessionSink for GuiSessions {
             }
             m.sharing.push(sharing);
         });
+        // The media starts only now: the window counts this screen as shared
+        // (and hides what sharing hides) before a frame can leave it.
+        self.media.on_start(session);
+        self.started.send_modify(|n| *n = n.wrapping_add(1));
         self.shared.wake(Wake::Attention);
         say(format_args!("SESSION LIVE {}", session.session_id));
         // §B.8.8: a secure Windows screen (a UAC prompt, Ctrl+Alt+Del, the
