@@ -3566,6 +3566,27 @@ mod tests {
         assert!(has_text(&window, display::HOST_RATE));
     }
 
+    /// Settings, Display and quality: under its choices the section says
+    /// when they take effect; not while this screen is shared, when the
+    /// choices give way to the hidden card.
+    #[test]
+    fn the_display_choices_say_when_they_apply() {
+        use settings::display;
+        for size in [WIDE, NARROW] {
+            let mut window = Window::new(at_rest(), Page::Settings, egui::Theme::Dark, size);
+            window.form.settings.section = settings::Section::Display;
+            window.pass(Vec::new());
+            assert!(has_text(&window, display::NEXT_SESSION), "{size:?}");
+            let mut model = at_rest();
+            model.hosted_elsewhere = true;
+            let mut window = Window::new(model, Page::Settings, egui::Theme::Dark, size);
+            window.form.settings.section = settings::Section::Display;
+            window.pass(Vec::new());
+            assert!(has_text(&window, HIDDEN_WHILE_SHARED), "{size:?}");
+            assert!(!has_text(&window, display::NEXT_SESSION), "{size:?}");
+        }
+    }
+
     /// Settings, Connection: a private bridge line that does not parse is
     /// reported by its number only, its content shown nowhere but in its
     /// field, and Save waits until every line parses; the way to Tor sends
