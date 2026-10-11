@@ -110,10 +110,12 @@ pub(in super::super) fn rows(records: &[SessionRecord]) -> Vec<SessionRow> {
                     label: label(r),
                     mode: r.mode,
                     unattended: Some(true),
-                    ended: if r.reason.as_deref() == Some("accepted") {
-                        "connected"
-                    } else {
-                        "not connected"
+                    // An admin command's name and whether it ran stay off
+                    // the page.
+                    ended: match r.reason.as_deref() {
+                        Some("accepted") => "connected",
+                        Some("admin") => "admin command",
+                        _ => "not connected",
                     },
                 },
                 _ => return None,
@@ -249,6 +251,39 @@ mod tests {
         assert_eq!(
             rows.iter().map(|r| r.ended).collect::<Vec<_>>(),
             ["refused", "—", "connection closed"]
+        );
+    }
+
+    /// A client's admin command to a computer (its `UnattendedConnect` line
+    /// with the reason "admin") ends "admin command"; the command's name and
+    /// whether it ran stay off the page.
+    #[test]
+    fn an_admin_command_row_says_admin_command() {
+        let dev = DeviceId::from_bytes([1; 32]);
+        let records = vec![
+            SessionRecord::now(SessionEvent::UnattendedConnect)
+                .peer(dev, "Office laptop")
+                .unattended(true)
+                .reason("admin")
+                .op("end_session")
+                .ok(false),
+        ];
+        let rows = rows(&records);
+        assert_eq!(
+            rows.iter().map(|r| r.ended).collect::<Vec<_>>(),
+            ["admin command"]
+        );
+        let model = Model {
+            sessions: Some(rows),
+            ..Model::default()
+        };
+        let said = texts(&model);
+        assert!(said.iter().any(|t| t == "admin command"), "{said:?}");
+        assert!(
+            !said
+                .iter()
+                .any(|t| t.contains("end_session") || t.contains("false")),
+            "{said:?}"
         );
     }
 
