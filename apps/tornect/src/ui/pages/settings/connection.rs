@@ -19,7 +19,7 @@ use super::{SettingsForm, line};
 /// The ways to reach Tor, as the page names them.
 pub(in super::super) const MODES: [(BridgeMode, &str); 4] = [
     (BridgeMode::Auto, "Automatic"),
-    (BridgeMode::Off, "Direct only"),
+    (BridgeMode::Off, "Tor without bridges"),
     (BridgeMode::Obfs4, "obfs4 bridges"),
     (BridgeMode::Snowflake, "Snowflake"),
 ];
