@@ -16,7 +16,7 @@ use super::{SettingsForm, line};
 /// neutral.
 pub(in super::super) const NAME_NOTE: &str = "Sent to every device you pair with and every \
     computer you connect to; they show it and save it. The default is neutral. Tornect never \
-    uses this computer's own network name.";
+    sends or shows this computer's own network name.";
 
 /// When a saved name is used.
 pub(in super::super) const NEXT_START: &str = "Applies the next time Tornect starts.";
