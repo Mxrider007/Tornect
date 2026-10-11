@@ -51,16 +51,16 @@ pub(in super::super) const OPEN: &str = "Turn on for a device…";
 
 /// What unattended access is, at ①.
 pub(in super::super) const EXPLANATION: &str = "Unattended access lets a paired device connect \
-    to this computer without anyone here accepting: it needs that device and the password you \
-    set now.";
+    to this computer with the password you set now, without anyone here accepting unless you \
+    choose to be asked first.";
 
 /// The scam step (§B.8.7.1 ①).
 pub(in super::super) const SCAM: &str = "Did someone call and ask you to set this up? Hang up.";
 
 /// This system's limits (§B.8.8), on Linux.
 pub(in super::super) const LIMITS_LINUX: [&str; 2] = [
-    "While this computer is locked, a session shows no picture and takes no input: GNOME closes \
-     remote access while the screen is locked, and it cannot be unlocked from another device.",
+    "On GNOME, while this computer is locked, a session shows no picture and takes no input, and \
+     it cannot be unlocked from another device. On other desktops this is not checked yet.",
     "At the login screen, before anyone signs in, there is nothing to connect to.",
 ];
 
@@ -121,7 +121,7 @@ pub(in super::super) const PRESETS: [(Preset, &str); 3] = [
 pub(in super::super) const WRITE_IT_DOWN: &str = super::security::WRITE_IT_DOWN;
 
 /// The generator's offline estimate (§B.8.2.2).
-pub(in super::super) const GENERATED_ESTIMATE: &str = "Offline guessing estimate: about 900 \
+pub(in super::super) const GENERATED_ESTIMATE: &str = "Offline guessing estimate: about 450 \
     million years on one strong graphics card, if this computer's Tornect data were stolen.";
 
 /// The secondary choice of ④, offered only where the reach stays 0.
@@ -141,8 +141,9 @@ pub(in super::super) const DIFFER: &str = "The two entries differ.";
 
 /// The hard lock off (`hard_lock_after` 0), as §B.8.7.1 ⑤ warns of it.
 pub(in super::super) const HARD_LOCK_OFF: &str = "With 0 the hard lock is off: guessing is then \
-    limited only by the lifetime budget, at most 60 failed attempts until you unlock it here plus \
-    about 52 a year, at most 24 a day (about 33 on the first day), and by the notifications.";
+    limited only by the lifetime budget, at most 60 failed attempts until it is unlocked here or \
+    from one of your devices with control under My machines, plus about 52 a year, at most 24 a \
+    day (about 33 on the first day), and by the notifications.";
 
 /// An expiry of "never" (§B.8.6.1).
 pub(in super::super) const NEVER_WARNING: &str = "Access that never ends stays until you remove \
@@ -168,9 +169,11 @@ pub(in super::super) const ASKS_TWICE: &str = "You are asked for your password o
 pub(in super::super) const PAUSED_SUMMARY: &str =
     "Unattended access is paused: <device> can connect once the pause ends.";
 
-/// `G_NEEDS_PASSWORD` at *Turn on*: a raise appeared while the person was
-/// asked (decision M1-67).
-pub(in super::super) const NEEDS_GENERATED: &str = "Something changed while you were asked: this \
+/// Only a generated password will do now (decision M1-67): the guard's
+/// preview at the commit found the reach non-zero before any dialog, or
+/// `G_NEEDS_PASSWORD` after the dialog said a raise appeared while the
+/// person was asked.
+pub(in super::super) const NEEDS_GENERATED: &str = "Something changed on this computer: this \
     device now needs a new generated password. Nothing was saved.";
 
 /// The commit of ⑦.
@@ -197,6 +200,13 @@ pub(in super::super) const GENERATED_ONLY: &str = "Control here can reach progra
 pub(in super::super) const CONTROL_NEEDS_PASSWORD: &str = "Control here can reach programs that \
     run as administrator, so <device> needs a new password. The current password stops working \
     when you finish, also where it is remembered.";
+
+/// Mode → Control where the guard's preview could not judge whether control
+/// reaches programs that run as administrator (a new generated password all
+/// the same); `<device>` stands for the grant's pinned label.
+pub(in super::super) const CANNOT_TELL_NEEDS_PASSWORD: &str = "Tornect cannot tell now whether \
+    control here reaches programs that run as administrator, so <device> needs a new password. \
+    The current password stops working when you finish, also where it is remembered.";
 
 /// ⑤a's switch (§B.8.7.1); `<device>` stands for the device's pinned label.
 pub(in super::super) const ADMINISTRATOR_PROMPT: &str = "Let <device> also use programs that run \
@@ -366,6 +376,9 @@ pub(in super::super) struct Changing {
     pub(in super::super) mode: Option<SessionMode>,
     /// *Change mode* to control asked the guard's preview.
     pub(in super::super) asked: bool,
+    /// That preview could not judge whether control reaches the
+    /// administrator level.
+    pub(in super::super) unjudged: bool,
 }
 
 /// ⑤a's offer (§B.8.7.1, decision M1-67): one round of prompts over the
@@ -478,6 +491,7 @@ impl Wizard {
             label,
             mode: None,
             asked: false,
+            unjudged: false,
         });
         w.open_password();
         w
@@ -991,7 +1005,8 @@ pub(in super::super) fn preset_defaults(preset: Preset) -> String {
     parts.join(" · ")
 }
 
-/// ⑤'s choices as ⑦ sums them up, in the words of the presets' lines.
+/// ⑤'s choices as ⑦ sums them up, with the preset's defaults that ⑤ does not
+/// change, in the words of the presets' lines.
 #[must_use]
 pub(in super::super) fn options_line(preset: Preset, o: &Options) -> String {
     let d = preset.defaults();
@@ -1006,6 +1021,12 @@ pub(in super::super) fn options_line(preset: Preset, o: &Options) -> String {
     if o.ask_before_start {
         parts.push("asks you before starting".to_owned());
     }
+    if d.active_from_delay_s > 0 {
+        parts.push(format!(
+            "starts working {} hours after it is given",
+            d.active_from_delay_s / 3600
+        ));
+    }
     if o.never {
         parts.push("never ends".to_owned());
     } else if let Some(span) = d.expiry_span_s {
@@ -1016,8 +1037,14 @@ pub(in super::super) fn options_line(preset: Preset, o: &Options) -> String {
             format!("ends after {days} days")
         });
     }
+    if let Some(max) = d.max_session_secs {
+        parts.push(format!("sessions of up to {} hours", max / 3600));
+    }
+    if d.keep_awake {
+        parts.push("keeps this computer awake".to_owned());
+    }
     parts.push(match o.hard_lock_after {
-        0 => "no hard lock".to_owned(),
+        0 => "no hard lock after failed attempts in a row".to_owned(),
         n => format!("hard lock after {n} failed attempts in a row"),
     });
     if o.require_tor_only {
@@ -1064,14 +1091,16 @@ fn password_step(
     if let Some(Changing {
         label,
         mode: Some(_),
+        unjudged,
         ..
     }) = &w.change
     {
-        line(
-            ui,
-            &CONTROL_NEEDS_PASSWORD.replace("<device>", label),
-            t.text_primary,
-        );
+        let needs = if *unjudged {
+            CANNOT_TELL_NEEDS_PASSWORD
+        } else {
+            CONTROL_NEEDS_PASSWORD
+        };
+        line(ui, &needs.replace("<device>", label), t.text_primary);
         ui.add_space(6.0);
     }
     let may_own = may_use_own(model, w);
@@ -1295,9 +1324,10 @@ fn mode_step(
                 }
                 // Control raises the reach (or it could not be judged):
                 // only with a new generated password.
-                Some(Some(true) | None) => {
+                Some(raised @ (Some(true) | None)) => {
                     if let Some(c) = w.change.as_mut() {
                         c.mode = Some(SessionMode::Control);
+                        c.unjudged = raised.is_none();
                     }
                     w.generated_only = true;
                     w.open_password();
@@ -1674,9 +1704,15 @@ fn options(
     ui.add_space(8.0);
     widgets::section_header(ui, "For every device");
     let state = |on: bool| if on { "on" } else { "off" };
+    // A Headless box grant turns this setting on when it is created.
+    let awake = if headless && !manager.keep_awake {
+        "on from Turn on (Headless box)"
+    } else {
+        state(manager.keep_awake)
+    };
     line(
         ui,
-        &format!("Keep this computer awake: {}", state(manager.keep_awake)),
+        &format!("Keep this computer awake: {awake}"),
         t.text_secondary,
     );
     line(
@@ -1916,9 +1952,9 @@ pub(in super::super) fn meter(
         format!("Strength {} of 4: strong enough.", checked.score),
     )];
     let floor = if checked.score >= 4 {
-        "at least about 4 months"
+        "at least about 2 months"
     } else {
-        "at least about 1.2 days"
+        "at least about 14 hours"
     };
     lines.push((
         true,
@@ -2552,6 +2588,46 @@ mod tests {
         assert!(window.wizard().is_none());
     }
 
+    /// §B.8.7.3: where *Change mode*'s preview could not judge whether
+    /// control reaches programs that run as administrator, ④ says that
+    /// Tornect cannot tell (a new generated password all the same); a judged
+    /// raise keeps its sentence.
+    #[test]
+    fn an_unjudged_change_of_mode_says_it_cannot_tell() {
+        let to_control = WizardChoice {
+            options: GrantOptions {
+                mode: Some(SessionMode::Control),
+                ..GrantOptions::default()
+            },
+            ..no_change()
+        };
+        let cannot = CANNOT_TELL_NEEDS_PASSWORD.replace("<device>", "Office laptop");
+        let reaches = CONTROL_NEEDS_PASSWORD.replace("<device>", "Office laptop");
+        for judged in [None, Some(true)] {
+            let mut window = Window::new(with_a_grant(SessionMode::ViewOnly), WIDE);
+            assert!(window.click("Change mode…").is_empty());
+            assert_eq!(
+                window.click("Continue"),
+                vec![Action::Manager(ManagerOp::Preview(Box::new(
+                    to_control.clone()
+                )))]
+            );
+            window.model.wizard.raises = Some((to_control.clone(), judged));
+            window.model.wizard.preview = Some((to_control.clone(), judged));
+            window.pass(Vec::new());
+            window.pass(Vec::new());
+            assert_eq!(window.step(), Some(Step::Password), "{judged:?}");
+            assert_eq!(window.has_text(&cannot), judged.is_none(), "{judged:?}");
+            assert_eq!(window.has_text(&reaches), judged.is_some(), "{judged:?}");
+            assert_eq!(
+                window.has_text("Control here can reach programs"),
+                judged.is_some(),
+                "{judged:?}"
+            );
+            assert!(!window.has_control(USE_MY_OWN), "{judged:?}");
+        }
+    }
+
     /// A new preview of an equal choice: the answer of an earlier one (of
     /// this opening or an earlier one) goes as the tokio side takes the new
     /// request, so neither ④'s "Use my own password" nor *Change mode*'s
@@ -2751,6 +2827,41 @@ mod tests {
                 below = line.y1 - 1.0;
             }
         }
+    }
+
+    /// §B.8.7.1 ⑦: the summary also names the preset's defaults that ⑤ does
+    /// not change, in ③'s words, and a hard lock of 0 as none after failed
+    /// attempts in a row; ⑤ for Headless box, while keep-awake is off here,
+    /// says that Turn on turns it on.
+    #[test]
+    fn the_summary_names_the_defaults_the_options_keep() {
+        let helping = options_line(Preset::HelpingSomeone, &Options::of(Preset::HelpingSomeone));
+        assert_eq!(
+            helping,
+            "View only · 10 s to stop a connection · asks you before starting · starts working 12 \
+             hours after it is given · ends after 7 days · sessions of up to 4 hours · hard lock \
+             after 10 failed attempts in a row"
+        );
+        let mut headless = Options::of(Preset::HeadlessBox);
+        headless.hard_lock_after = 0;
+        assert_eq!(
+            options_line(Preset::HeadlessBox, &headless),
+            "Control · no time to stop a connection · ends after 90 days without use · keeps this \
+             computer awake · no hard lock after failed attempts in a row"
+        );
+        let window = at_options("Headless box", false);
+        assert!(window.has_text("Keep this computer awake: on from Turn on (Headless box)"));
+        let mut window = at_options("Helping someone", false);
+        let sent = window.click("Continue");
+        let Some(Action::Manager(ManagerOp::Preview(choice))) = sent.first() else {
+            panic!("no preview asked: {sent:?}");
+        };
+        window.model.wizard.preview = Some(((**choice).clone(), Some(false)));
+        window.pass(Vec::new());
+        assert_eq!(window.step(), Some(Step::Check));
+        assert!(window.click("Continue").is_empty());
+        assert_eq!(window.step(), Some(Step::Summary));
+        assert!(window.has_text(&helping));
     }
 
     /// §B.8.7.2: the wizard and its passwords go when the window leaves
