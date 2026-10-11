@@ -3250,6 +3250,7 @@ mod tests {
                 ),
                 "{size:?}"
             );
+            assert!(has_text(&window, settings::privacy::ID_LINE), "{size:?}");
         }
         model.settings.device_name = "Linux PC".to_owned();
         let window = privacy(model.clone(), WIDE);
@@ -3297,9 +3298,10 @@ mod tests {
         );
         assert_eq!(
             privacy::NETWORK_LINE,
-            "Your IP address stays hidden: every session is relayed through Tor. Tornect has no \
-             accounts, no telemetry and no update checks, and it checks whether a saved computer \
-             is reachable only when you click \"Check if reachable\"."
+            "Your IP address stays hidden from the computers you connect to and those that connect \
+             here: every session is relayed through Tor. Tornect has no accounts, no telemetry and \
+             no update checks, and it checks whether a saved computer is reachable only when you \
+             click \"Check if reachable\"."
         );
         for size in [WIDE, NARROW] {
             let window = privacy(with_book(false), size);

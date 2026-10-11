@@ -16,9 +16,14 @@ use super::general::NAME_NOTE;
 use super::line;
 
 /// What every computer and device this one meets learns, beside the name.
-pub(in super::super) const NETWORK_LINE: &str = "Your IP address stays hidden: every session is \
-    relayed through Tor. Tornect has no accounts, no telemetry and no update checks, and it \
-    checks whether a saved computer is reachable only when you click \"Check if reachable\".";
+pub(in super::super) const NETWORK_LINE: &str = "Your IP address stays hidden from the computers \
+    you connect to and those that connect here: every session is relayed through Tor. Tornect has \
+    no accounts, no telemetry and no update checks, and it checks whether a saved computer is \
+    reachable only when you click \"Check if reachable\".";
+
+/// Beside the name: what else identifies this computer to the others.
+pub(in super::super) const ID_LINE: &str =
+    "They also see this computer's ID or device words, which identify it.";
 
 /// What the history switch governs, and what it does not (§B.6).
 pub(in super::super) const LOG_RECORDS: &str = "Connection attempts to this computer, and the \
@@ -90,6 +95,7 @@ pub(super) fn section(
         );
     }
     line(ui, NAME_NOTE, t.text_secondary);
+    line(ui, ID_LINE, t.text_secondary);
     ui.add_space(4.0);
     line(ui, NETWORK_LINE, t.text_secondary);
 
