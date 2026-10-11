@@ -726,7 +726,8 @@ impl ManagerWatch {
     /// grant wizard has a device to offer.
     fn refresh(&self, shared: &Shared) {
         let view = Some(self.read());
-        let offer = Some(self.offer());
+        let (offer, all_granted) = self.offer();
+        let offer = Some(offer);
         let modes: Vec<(tornect_core::DeviceId, SessionMode)> = self
             .ctx
             .guard
@@ -756,6 +757,7 @@ impl ManagerWatch {
         if shared.read(|m| {
             m.manager != view
                 || m.wizard.offer != offer
+                || m.wizard.all_granted != all_granted
                 || m.wizard.modes != modes
                 || m.wizard.levels != levels
                 || m.wizard.account != account
@@ -764,6 +766,7 @@ impl ManagerWatch {
             shared.update(|m| {
                 m.manager = view;
                 m.wizard.offer = offer;
+                m.wizard.all_granted = all_granted;
                 m.wizard.modes = modes;
                 m.wizard.levels = levels;
                 m.wizard.account = account;
@@ -868,19 +871,19 @@ impl ManagerWatch {
     }
 
     /// Whether a paired device of this host has no grant yet: what the grant
-    /// wizard can offer (§B.8.7.1 ②). Reads no log.
-    fn offer(&self) -> bool {
+    /// wizard can offer (§B.8.7.1 ②); and, when none has, whether that is
+    /// because every paired device already has one (false: none is paired).
+    /// Reads no log.
+    fn offer(&self) -> (bool, bool) {
         let granted: Vec<tornect_core::DeviceId> = self
             .ctx
             .guard
             .store()
             .read(|s| s.grants.iter().map(|g| g.device).collect())
             .unwrap_or_default();
-        self.trusted
-            .snapshot()
-            .devices
-            .iter()
-            .any(|d| !granted.contains(&d.device))
+        let paired = self.trusted.snapshot();
+        let offer = paired.devices.iter().any(|d| !granted.contains(&d.device));
+        (offer, !offer && !paired.devices.is_empty())
     }
 
     /// Run `op` through the guard as the window (`Actor::Ui`), then read the
@@ -6801,6 +6804,37 @@ mod tests {
         assert_eq!(devices.iter().map(|c| c.device).collect::<Vec<_>>(), [two]);
         watch.wizard_grant(turn_on(two, generated_pw()), &shared);
         assert_eq!(shared.read(|m| m.wizard.offer), Some(false), "none left");
+    }
+
+    /// With no device to offer, the view tells "no device is paired" from
+    /// "every paired device already has unattended access".
+    #[test]
+    fn no_device_to_offer_says_which_case() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let one = tornect_core::DeviceId::from_bytes([1; 32]);
+        let watch = ManagerWatch {
+            trusted: Arc::new(TrustedDeviceStore::ephemeral(Default::default())),
+            ..wizard_watch(
+                tmp.path(),
+                Arc::new(AllowAllReAuth::default()),
+                Arc::new(NoSessionActivity),
+                linux_facts(),
+            )
+        };
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let offer = || shared.read(|m| (m.wizard.offer, m.wizard.all_granted));
+        watch.refresh(&shared);
+        assert_eq!(offer(), (Some(false), false), "no device is paired");
+        watch.trusted.pin(one, "Office laptop").unwrap();
+        watch.refresh(&shared);
+        assert_eq!(offer(), (Some(true), false));
+        watch.wizard_grant(turn_on(one, generated_pw()), &shared);
+        assert_eq!(
+            offer(),
+            (Some(false), true),
+            "every paired device has access"
+        );
     }
 
     // ------------------------------------------------------------ ⑤a (§B.8.7.1)

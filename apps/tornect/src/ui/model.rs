@@ -1227,6 +1227,9 @@ pub struct WizardView {
     /// tokio side last read it with the manager's view: Settings, Security
     /// offers the wizard then. `None` until read.
     pub offer: Option<bool>,
+    /// With no device to offer: whether devices are paired and each of them
+    /// already has unattended access (false: no device is paired).
+    pub all_granted: bool,
     /// The paired devices the wizard may give access, read when it opened;
     /// `None` until read.
     pub devices: Option<Vec<Candidate>>,

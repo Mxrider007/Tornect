@@ -309,7 +309,15 @@ pub(super) fn section(
                     actions.push(Action::Manager(ManagerOp::WizardDevices));
                 }
             }
-            Some(false) => line(ui, super::wizard::NO_DEVICE, t.text_secondary),
+            Some(false) => line(
+                ui,
+                if model.wizard.all_granted {
+                    super::wizard::ALL_GRANTED
+                } else {
+                    super::wizard::NO_DEVICE
+                },
+                t.text_secondary,
+            ),
             None => {}
         }
     }
