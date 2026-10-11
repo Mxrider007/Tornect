@@ -3008,6 +3008,28 @@ mod tests {
         assert!(!has_text(&window, "0a1b-2c3d"), "not under a sheet");
     }
 
+    /// Settings, Security with no device to offer the wizard: "Pair a device
+    /// first" while no device is paired, and that every paired device already
+    /// has unattended access when each has.
+    #[test]
+    fn the_security_page_says_why_no_device_is_offered() {
+        use settings::wizard;
+        let mut model = at_rest();
+        model.manager = Some(one_device());
+        model.wizard.offer = Some(false);
+        for (all_granted, shown, absent) in [
+            (false, wizard::NO_DEVICE, wizard::ALL_GRANTED),
+            (true, wizard::ALL_GRANTED, wizard::NO_DEVICE),
+        ] {
+            model.wizard.all_granted = all_granted;
+            for size in [WIDE, NARROW] {
+                let window = security_section(model.clone(), size);
+                assert!(has_text(&window, shown), "{all_granted} {size:?}");
+                assert!(!has_text(&window, absent), "{all_granted} {size:?}");
+            }
+        }
+    }
+
     /// Settings, General's "Start Tornect when I sign in" (§B.1.1): turning
     /// it on first says what it means, as approved, with Cancel first; only
     /// its "Turn on" sends the operation (the switch moves on the guard's

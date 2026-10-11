@@ -101,6 +101,11 @@ pub(in super::super) const DISCLOSURES: [&str; 6] = [
 pub(in super::super) const NO_DEVICE: &str =
     "Pair a device first: only a paired device can be given unattended access.";
 
+/// Settings, Security with no device to offer because every paired device
+/// already has unattended access.
+pub(in super::super) const ALL_GRANTED: &str =
+    "Every paired device here already has unattended access.";
+
 /// The waiver of §B.8.6.1, for a device with no completed attended session.
 pub(in super::super) const WAIVER: &str =
     "This device has not had a session here that you accepted. Give it unattended access anyway.";
