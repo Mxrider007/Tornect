@@ -37,6 +37,9 @@ pub(in super::super) const HOST_RATE: &str =
 /// What is not offered yet.
 pub(in super::super) const QUALITY_LATER: &str = "Quality choices come later.";
 
+/// Under the choices: when they take effect.
+pub(in super::super) const NEXT_SESSION: &str = "Applies to the next session you open.";
+
 /// The Display and quality section.
 pub(super) fn section(ui: &mut Ui, model: &Model, shared: bool, actions: &mut Vec<Action>) {
     let t = theme::tokens(ui.ctx());
@@ -99,6 +102,8 @@ pub(super) fn section(ui: &mut Ui, model: &Model, shared: bool, actions: &mut Ve
         if let Some(viewer) = chosen {
             actions.push(Action::SaveSettings(SettingsChange::Viewer(viewer)));
         }
+        ui.add_space(6.0);
+        line(ui, NEXT_SESSION, t.text_secondary);
         if let Some(problem) = model.settings.problem {
             line(ui, problem, t.danger_text);
         }
