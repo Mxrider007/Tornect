@@ -118,6 +118,9 @@ pub enum Command {
     /// Background mode: show or take down the desktop notification that
     /// mirrors a host sheet (§B.1.1).
     Notice(super::notice::NoticeChange),
+    /// Try Tor, or the publishing of this computer's ID, again now, rather
+    /// than when the automatic try after its failure is due (B02).
+    RetryTor,
     /// Shut down.
     Quit,
 }
@@ -1749,13 +1752,215 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
     })
 }
 
+/// The wait before the first automatic try after Tor, or the publishing of
+/// this computer's ID, failed (B02).
+const RETRY_FIRST: Duration = Duration::from_secs(30);
+/// The longest wait between two automatic tries: each failure in a row
+/// doubles the wait, up to this.
+const RETRY_MOST: Duration = Duration::from_secs(5 * 60);
+
+/// What the window says when no way into Tor worked (B02): plain words, no
+/// command and no file name; why each way failed is in the recent activity
+/// (the ladder's own notes).
+pub(super) const TOR_DOWN: &str = "Check that this computer is online. Where Tor is blocked, \
+    choose bridges in Settings, Connection, then start Tornect again.";
+
+/// What the window says when none of the ways into Tor the settings allow
+/// can run here (the ladder is empty: a bridge helper is missing).
+pub(super) const TOR_NO_WAY: &str = "None of the ways to reach Tor chosen in Settings, \
+    Connection can run on this computer; Settings, About shows what is missing.";
+
+/// The hosting line's words when this computer's ID could not be published.
+pub(super) const PUBLISH_FAILED: &str = "this ID could not be published";
+
+/// The hosting line's words when the published ID stopped being served.
+pub(super) const SERVICE_STOPPED: &str = "this ID stopped being served";
+
+/// The wait before the automatic try that follows `failures` failures in a
+/// row: [`RETRY_FIRST`] after the first, twice as long after each next
+/// one, at most [`RETRY_MOST`].
+fn retry_after(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    RETRY_FIRST.saturating_mul(1 << doublings).min(RETRY_MOST)
+}
+
+/// A start that runs on a task of its own and starts again after a failure
+/// (B02): Tor's, through the bridge ladder (each try builds its ladder from
+/// the same configuration, as the first did: decisions M1-38 and M1-40),
+/// and the publishing of this computer's ID. A running start is never
+/// cancelled here: Tor's owns runtimes that must not be dropped inside this
+/// one. A failure arms the next try ([`retry_after`]); [`Restarting::next`]
+/// says when it is due, and the caller starts it.
+struct Restarting<T> {
+    /// The start running now.
+    task: Option<JoinHandle<anyhow::Result<T>>>,
+    /// Failures in a row since the last start that worked.
+    failures: u32,
+    /// The next try's time, after a failure.
+    due: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+/// What [`Restarting::next`] came to.
+enum Restart<T> {
+    /// The start worked.
+    Started(T),
+    /// It failed, and the next try is due after this wait.
+    Failed(anyhow::Error, Duration),
+    /// The next try is due: the caller starts it.
+    Due,
+}
+
+impl<T> Restarting<T> {
+    /// Nothing running and nothing due.
+    fn idle() -> Self {
+        Self {
+            task: None,
+            failures: 0,
+            due: None,
+        }
+    }
+
+    /// Run `task` as the start (any wait for a try ends).
+    fn start(&mut self, task: JoinHandle<anyhow::Result<T>>) {
+        self.due = None;
+        self.task = Some(task);
+    }
+
+    /// Whether a start runs, or a try waits.
+    fn pending(&self) -> bool {
+        self.task.is_some() || self.due.is_some()
+    }
+
+    /// A failure, the start's own or one seen elsewhere (a listener that
+    /// closed): the next try is armed. Returns its wait.
+    fn failed(&mut self) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        let wait = retry_after(self.failures);
+        self.due = Some(Box::pin(tokio::time::sleep(wait)));
+        wait
+    }
+
+    /// Try again now, not when the armed try is due: `true` when a try was
+    /// waited for (the caller starts it); `false` while a start runs or
+    /// nothing failed.
+    fn now(&mut self) -> bool {
+        self.task.is_none() && self.due.take().is_some()
+    }
+
+    /// The running start, taken (Rotate ID waits for it, §B.8.12).
+    fn take_task(&mut self) -> Option<JoinHandle<anyhow::Result<T>>> {
+        self.task.take()
+    }
+
+    /// The next thing that happens: the running start returns, or the armed
+    /// try comes due. Safe to drop at any await (a `select!` arm): the task
+    /// and the timer stay as they were.
+    async fn next(&mut self) -> Restart<T> {
+        if let Some(task) = &mut self.task {
+            let out = task.await;
+            self.task = None;
+            match out {
+                Ok(Ok(started)) => {
+                    self.failures = 0;
+                    Restart::Started(started)
+                }
+                Ok(Err(e)) => Restart::Failed(e, self.failed()),
+                Err(e) => Restart::Failed(anyhow::Error::new(e), self.failed()),
+            }
+        } else if let Some(due) = &mut self.due {
+            due.as_mut().await;
+            self.due = None;
+            Restart::Due
+        } else {
+            std::future::pending().await
+        }
+    }
+}
+
+/// None of the ways into Tor the settings allow can run here: the window
+/// says [`TOR_NO_WAY`] rather than [`TOR_DOWN`].
+#[derive(Debug)]
+struct NoWayIn;
+
+impl std::fmt::Display for NoWayIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no way to reach the Tor network can run here")
+    }
+}
+
+/// The plain words of a Tor start that failed with `e`.
+fn tor_down_words(e: &anyhow::Error) -> &'static str {
+    if e.downcast_ref::<NoWayIn>().is_some() {
+        TOR_NO_WAY
+    } else {
+        TOR_DOWN
+    }
+}
+
+/// Tor did not start (B02): the window says what to check, and when it
+/// tries again by itself; a host answers no request meanwhile.
+fn tor_failed(m: &mut super::model::Model, words: &str, wait: Duration, hosting: bool) {
+    m.tor = TorState::Failed(words.to_owned());
+    m.tor_retry = Some(Instant::now() + wait);
+    m.note(format!(
+        "tor: not reachable; trying again in {}",
+        super::model::wait_in_words(wait)
+    ));
+    if hosting {
+        m.hosting = Hosting::Off("Tor is not reachable".to_owned());
+    }
+}
+
+/// Tor is tried again, from its first step as at the start; a host waits
+/// for it.
+fn tor_retrying(m: &mut super::model::Model, hosting: bool) {
+    m.tor = TorState::Starting;
+    m.tor_retry = None;
+    if hosting {
+        m.hosting = Hosting::Waiting;
+    }
+}
+
+/// This computer's ID is not served (`why`: it could not be published, or
+/// it stopped): the hosting line says so, and when it is tried again.
+fn hosting_failed(m: &mut super::model::Model, why: &str, wait: Duration) {
+    m.hosting = Hosting::Off(why.to_owned());
+    m.tor_retry = Some(Instant::now() + wait);
+}
+
+/// This computer's ID is published again.
+fn republishing(m: &mut super::model::Model) {
+    m.hosting = Hosting::Publishing;
+    m.tor_retry = None;
+}
+
+/// Start Tor on a task of its own (it is never cancelled).
+fn spawn_tor(b: &Backend) -> JoinHandle<anyhow::Result<TorNode>> {
+    tokio::spawn(start_tor(
+        b.paths.clone(),
+        b.cfg.clone(),
+        Arc::clone(&b.shared),
+    ))
+}
+
+/// Publish this computer's ID through `node`, on a task of its own.
+fn spawn_publish(
+    node: &Arc<TorNode>,
+    identity: &Arc<HostIdentity>,
+) -> JoinHandle<anyhow::Result<OnionListener>> {
+    let (n, identity) = (Arc::clone(node), Arc::clone(identity));
+    tokio::spawn(async move { n.publish(&identity).await.map_err(explain) })
+}
+
 /// Reach the Tor network through the bridge ladder (decision M1-38),
-/// showing each step in the window.
+/// showing each step in the window. A failure is told in the window's own
+/// plain words ([`tor_down_words`]), not in the command line's.
 async fn start_tor(paths: Paths, cfg: Config, shared: Arc<Shared>) -> anyhow::Result<TorNode> {
     let ladder = Ladder::from_config(&paths, &cfg.tor);
     for line in &ladder.rejected_lines {
         shared.update(|m| m.note(format!("tor: ignoring {line}")));
     }
+    let no_way = ladder.rungs.is_empty();
     let events = Arc::clone(&shared);
     TorNode::start_auto(&paths, &cfg, &ladder, move |event| {
         let state = match event {
@@ -1791,7 +1996,10 @@ async fn start_tor(paths: Paths, cfg: Config, shared: Arc<Shared>) -> anyhow::Re
         events.update(|m| m.tor = state);
     })
     .await
-    .map_err(explain)
+    .map_err(|e| {
+        let e = anyhow::Error::new(e);
+        if no_way { e.context(NoWayIn) } else { e }
+    })
 }
 
 /// Keep the hosting line current with the onion service's reachability.
@@ -2035,16 +2243,14 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
     }
 
     // Tor starts on a task of its own and is never cancelled: the ladder owns
-    // runtimes that must not be dropped inside this one.
-    let mut tor_start = Some(tokio::spawn(start_tor(
-        b.paths.clone(),
-        b.cfg.clone(),
-        Arc::clone(&b.shared),
-    )));
+    // runtimes that must not be dropped inside this one. A start that fails
+    // is tried again after a wait, as is the publishing of this ID (B02).
+    let mut tor = Restarting::idle();
+    tor.start(spawn_tor(&b));
     let mut node: Option<Arc<TorNode>> = None;
     let mut listener: Option<OnionListener> = None;
     let mut status: Option<JoinHandle<()>> = None;
-    let mut publish: Option<JoinHandle<anyhow::Result<OnionListener>>> = None;
+    let mut publish: Restarting<OnionListener> = Restarting::idle();
     let mut viewing: Option<(watch::Sender<bool>, JoinHandle<()>)> = None;
     let mut granting: Option<JoinHandle<Result<(bool, bool), String>>> = None;
     let slots = Arc::new(Semaphore::new(tornect_signal::tor::MAX_LIVE_CIRCUITS));
@@ -2055,53 +2261,68 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
 
     loop {
         tokio::select! {
-            started = async { tor_start.as_mut().expect("guarded").await }, if tor_start.is_some() => {
-                tor_start = None;
-                // The way into Tor that worked is known now.
-                refresh_diagnostics(&b);
-                match started {
-                    Ok(Ok(started)) => {
-                        let started = Arc::new(started);
-                        if hosted.is_some() {
-                            b.shared.update(|m| m.hosting = Hosting::Publishing);
-                            let (n, identity) = (Arc::clone(&started), Arc::clone(&b.identity));
-                            publish = Some(tokio::spawn(async move {
-                                n.publish(&identity).await.map_err(explain)
-                            }));
-                        }
-                        node = Some(started);
+            step = tor.next(), if tor.pending() => match step {
+                Restart::Started(started) => {
+                    // The way into Tor that worked is known now.
+                    refresh_diagnostics(&b);
+                    let started = Arc::new(started);
+                    b.shared.update(|m| m.tor_retry = None);
+                    if hosted.is_some() {
+                        b.shared.update(republishing);
+                        publish.start(spawn_publish(&started, &b.identity));
                     }
-                    Ok(Err(e)) => {
-                        let why = format!("{e:#}");
-                        b.shared.update(|m| {
-                            m.tor = TorState::Failed(why.clone());
-                            if hosted.is_some() {
-                                m.hosting = Hosting::Off("Tor is not reachable".to_owned());
-                            }
-                        });
-                    }
-                    Err(e) => b.shared.update(|m| m.tor = TorState::Failed(e.to_string())),
+                    node = Some(started);
                 }
-            }
-            published = async { publish.as_mut().expect("guarded").await }, if publish.is_some() => {
-                publish = None;
-                match published {
-                    Ok(Ok(l)) => {
-                        say_evidence(format_args!("Tornect ID: {}", l.onion_address()), None);
-                        status = Some(watch_reachability(&l, Arc::clone(&b.shared)));
-                        listener = Some(l);
+                Restart::Failed(e, wait) => {
+                    refresh_diagnostics(&b);
+                    if e.downcast_ref::<tokio::task::JoinError>().is_some() {
+                        tracing::warn!(error = %e, "the Tor start task failed");
                     }
-                    Ok(Err(e)) => {
-                        let why = format!("publishing failed: {e:#}");
-                        b.shared.update(|m| m.hosting = Hosting::Off(why));
-                    }
-                    Err(e) => b.shared.update(|m| m.hosting = Hosting::Off(e.to_string())),
+                    let words = tor_down_words(&e);
+                    b.shared.update(|m| tor_failed(m, words, wait, hosted.is_some()));
                 }
-            }
+                Restart::Due => {
+                    b.shared.update(|m| tor_retrying(m, hosted.is_some()));
+                    tor.start(spawn_tor(&b));
+                }
+            },
+            step = publish.next(), if publish.pending() => match step {
+                Restart::Started(l) => {
+                    say_evidence(format_args!("Tornect ID: {}", l.onion_address()), None);
+                    if let Some(old) = status.take() {
+                        old.abort();
+                    }
+                    status = Some(watch_reachability(&l, Arc::clone(&b.shared)));
+                    listener = Some(l);
+                    b.shared.update(|m| m.tor_retry = None);
+                }
+                Restart::Failed(e, wait) => {
+                    let line = format!("publishing this ID failed: {}", e.root_cause());
+                    tracing::warn!("{line}");
+                    b.shared.update(|m| {
+                        m.note(line);
+                        hosting_failed(m, PUBLISH_FAILED, wait);
+                    });
+                }
+                Restart::Due => {
+                    if let Some(n) = &node {
+                        b.shared.update(republishing);
+                        publish.start(spawn_publish(n, &b.identity));
+                    }
+                }
+            },
             stream = async { listener.as_mut().expect("guarded").accept().await }, if listener.is_some() => {
                 let (Some(stream), Some(hosted)) = (stream, &hosted) else {
+                    // The onion service stopped: published again after a wait.
                     listener = None;
-                    b.shared.update(|m| m.hosting = Hosting::Off("the listener closed".to_owned()));
+                    if let Some(old) = status.take() {
+                        old.abort();
+                    }
+                    let wait = publish.failed();
+                    b.shared.update(|m| {
+                        m.note("this ID stopped being served; publishing it again");
+                        hosting_failed(m, SERVICE_STOPPED, wait);
+                    });
                     continue;
                 };
                 while media_streams.try_join_next().is_some() {}
@@ -2152,6 +2373,19 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                 let Some(command) = command else { break };
                 match command {
                     Command::Quit => break,
+                    // Now rather than when the automatic try is due: Tor's
+                    // start, or else the publishing of this ID.
+                    Command::RetryTor => {
+                        if tor.now() {
+                            b.shared.update(|m| tor_retrying(m, hosted.is_some()));
+                            tor.start(spawn_tor(&b));
+                        } else if let Some(n) = &node
+                            && publish.now()
+                        {
+                            b.shared.update(republishing);
+                            publish.start(spawn_publish(n, &b.identity));
+                        }
+                    }
                     Command::Notice(change) => {
                         if let Some(notices) = &notices {
                             let _ = notices.send(change);
@@ -2478,7 +2712,8 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
     // Rotate ID, with every session ended, the onion service gone and Tor
     // stopped; the window waits for it (§B.8.12).
     if let Some(manager) = rotating {
-        let stopped = stop_tor_for_rotation(tor_start, publish, listener, node).await;
+        let stopped =
+            stop_tor_for_rotation(tor.take_task(), publish.take_task(), listener, node).await;
         let (paths, device) = (b.paths.clone(), Arc::clone(&b.device));
         rotate_at_close(&b.shared, stopped, move || manager.rotate(&paths, &device)).await;
         return;
@@ -5959,6 +6194,147 @@ mod tests {
             started.load(Ordering::SeqCst),
             "the Tor start was waited for"
         );
+    }
+
+    /// B02: the wait before each automatic try doubles from 30 s and stops
+    /// growing at 5 min, however many failures come in a row.
+    #[test]
+    fn the_retry_wait_doubles_up_to_five_minutes() {
+        let secs: Vec<u64> = (1..=7).map(|n| retry_after(n).as_secs()).collect();
+        assert_eq!(secs, [30, 60, 120, 240, 300, 300, 300]);
+        assert_eq!(retry_after(0), RETRY_FIRST);
+        assert_eq!(retry_after(u32::MAX), RETRY_MOST);
+    }
+
+    /// B02: a start that fails is not the end. Its failure arms the next
+    /// try, which comes due after the wait and no sooner; a second failure in
+    /// a row waits twice as long; a start that works resets the count, so the
+    /// next failure waits 30 s again. Before the fix the first failure was
+    /// final: nothing ever started Tor again.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_start_is_tried_again_after_its_wait() {
+        let fails = || tokio::spawn(async { Err::<u32, _>(anyhow::anyhow!("offline")) });
+        let mut tor: Restarting<u32> = Restarting::idle();
+        assert!(!tor.pending(), "nothing runs, nothing waits");
+        tor.start(fails());
+        let Restart::Failed(e, wait) = tor.next().await else {
+            panic!("the start failed");
+        };
+        assert_eq!(e.to_string(), "offline");
+        assert_eq!(wait, Duration::from_secs(30));
+        assert!(tor.pending(), "a try waits");
+        let armed = tokio::time::Instant::now();
+        assert!(matches!(tor.next().await, Restart::Due));
+        assert_eq!(
+            armed.elapsed(),
+            Duration::from_secs(30),
+            "due after its wait"
+        );
+        assert!(!tor.pending(), "the caller starts the try");
+
+        tor.start(fails());
+        let Restart::Failed(_, wait) = tor.next().await else {
+            panic!("failed again");
+        };
+        assert_eq!(wait, Duration::from_secs(60), "twice as long");
+        assert!(matches!(tor.next().await, Restart::Due));
+
+        tor.start(tokio::spawn(async { Ok(7) }));
+        assert!(matches!(tor.next().await, Restart::Started(7)));
+        assert!(!tor.pending());
+        tor.start(fails());
+        let Restart::Failed(_, wait) = tor.next().await else {
+            panic!("failed after working");
+        };
+        assert_eq!(wait, Duration::from_secs(30), "the count starts again");
+
+        // A panicked start is a failure like any other.
+        fn boom() -> anyhow::Result<u32> {
+            panic!("in the start")
+        }
+        let mut panics: Restarting<u32> = Restarting::idle();
+        panics.start(tokio::spawn(async { boom() }));
+        assert!(matches!(panics.next().await, Restart::Failed(..)));
+        assert!(panics.pending());
+    }
+
+    /// B02: Try again starts the waiting try at once, and only that: while a
+    /// start runs, or when nothing failed, it does nothing; a listener that
+    /// closed arms a try as a failed start does.
+    #[tokio::test(start_paused = true)]
+    async fn try_again_ends_the_wait_and_only_the_wait() {
+        let mut publish: Restarting<u32> = Restarting::idle();
+        assert!(!publish.now(), "nothing failed");
+        publish.start(tokio::spawn(async { Err(anyhow::anyhow!("no service")) }));
+        assert!(!publish.now(), "a start runs");
+        assert!(matches!(publish.next().await, Restart::Failed(..)));
+        assert!(publish.now(), "the wait ends");
+        assert!(!publish.pending(), "and the caller starts the try");
+        assert!(!publish.now(), "once");
+
+        let mut serving: Restarting<u32> = Restarting::idle();
+        assert_eq!(serving.failed(), Duration::from_secs(30));
+        let armed = tokio::time::Instant::now();
+        assert!(matches!(serving.next().await, Restart::Due));
+        assert_eq!(armed.elapsed(), Duration::from_secs(30));
+    }
+
+    /// B02: what the window shows through a failure and its try. Tor's
+    /// failure says what to check in plain words, when the next try comes,
+    /// and turns a host's requests off; the try starts from Tor's first step
+    /// with the host waiting for it; a publish that failed says so on the
+    /// hosting line, and publishing again clears the countdown.
+    #[test]
+    fn the_model_through_a_failure_and_its_try() {
+        let mut m = Model::default();
+        tor_failed(&mut m, TOR_DOWN, Duration::from_secs(30), true);
+        assert_eq!(m.tor, TorState::Failed(TOR_DOWN.to_owned()));
+        let left = m.tor_retry.expect("a try waits") - Instant::now();
+        assert!(left <= Duration::from_secs(30) && left > Duration::from_secs(25));
+        assert_eq!(m.hosting, Hosting::Off("Tor is not reachable".to_owned()));
+        assert!(
+            m.events
+                .last()
+                .is_some_and(|e| e.contains("trying again in 30 s")),
+            "{:?}",
+            m.events
+        );
+        tor_retrying(&mut m, true);
+        assert_eq!(m.tor, TorState::Starting);
+        assert_eq!(m.tor_retry, None);
+        assert_eq!(m.hosting, Hosting::Waiting);
+
+        let mut viewer = Model::default();
+        tor_failed(&mut viewer, TOR_DOWN, Duration::from_secs(60), false);
+        tor_retrying(&mut viewer, false);
+        assert_eq!(viewer.hosting, Hosting::Waiting, "not a host: untouched");
+
+        hosting_failed(&mut m, PUBLISH_FAILED, Duration::from_secs(30));
+        assert_eq!(m.hosting, Hosting::Off(PUBLISH_FAILED.to_owned()));
+        assert!(m.tor_retry.is_some());
+        republishing(&mut m);
+        assert_eq!(m.hosting, Hosting::Publishing);
+        assert_eq!(m.tor_retry, None);
+    }
+
+    /// B02: the window's words for a Tor that did not start name no command,
+    /// no file and no setting key (the terminal's hint said `tor.bridge_lines`
+    /// in config.toml and `tornect doctor`); a ladder with no way in that can
+    /// run here gets its own words.
+    #[test]
+    fn a_tor_failure_is_said_in_plain_words() {
+        let offline = anyhow::Error::new(tornect_signal::SignalError::Bootstrap(
+            "could not reach the Tor network".to_owned(),
+        ));
+        assert_eq!(tor_down_words(&offline), TOR_DOWN);
+        let none = anyhow::Error::new(tornect_signal::SignalError::Bootstrap("no way".to_owned()))
+            .context(NoWayIn);
+        assert_eq!(tor_down_words(&none), TOR_NO_WAY);
+        for words in [TOR_DOWN, TOR_NO_WAY, PUBLISH_FAILED, SERVICE_STOPPED] {
+            for terminal in ["`", "tornect ", "config.toml", "bridge_lines", "https://"] {
+                assert!(!words.contains(terminal), "{words:?} says {terminal:?}");
+            }
+        }
     }
 
     /// FR2-L1: when the keychain refuses to delete the remembered password,

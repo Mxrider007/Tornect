@@ -463,6 +463,54 @@ mod tests {
         assert!(window.click(connect).is_empty());
     }
 
+    /// B02: a Tor that did not start says what to check in plain words (no
+    /// command, no file) and when it tries again by itself, on Home and in
+    /// Settings, Connection, each with a button that tries now; once Tor is
+    /// up and publishing this ID failed, the countdown is the hosting
+    /// line's; while nothing waits for a try there is no button.
+    #[test]
+    fn a_tor_failure_counts_down_to_its_next_try_and_offers_one_now() {
+        use super::super::backend::{PUBLISH_FAILED, TOR_DOWN};
+        let mut model = at_rest();
+        model.tor = TorState::Failed(TOR_DOWN.to_owned());
+        model.hosting = Hosting::Off("Tor is not reachable".to_owned());
+        model.tor_retry = Some(Instant::now() + Duration::from_secs(120));
+        let mut window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(
+            &window,
+            "Tor: not reachable. Check that this computer is online."
+        ));
+        assert!(has_text(&window, "Trying again in 2 min."));
+        assert!(!has_text(&window, "config.toml") && !has_text(&window, "tornect doctor"));
+        let now = window.center(home::RETRY);
+        assert_eq!(window.click(now), vec![Action::RetryTor]);
+
+        let mut settings = Window::new(model.clone(), Page::Settings, egui::Theme::Light, WIDE);
+        settings.form.settings.section = settings::Section::Connection;
+        settings.pass(Vec::new());
+        assert!(has_text(&settings, "Trying again in"));
+        let now = settings.center(home::RETRY);
+        assert_eq!(settings.click(now), vec![Action::RetryTor]);
+
+        let mut published = model.clone();
+        published.tor = TorState::Ready { via: "direct Tor" };
+        published.hosting = Hosting::Off(PUBLISH_FAILED.to_owned());
+        published.tor_retry = Some(Instant::now() + Duration::from_secs(40));
+        let mut window = Window::new(published, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(
+            &window,
+            "Incoming requests: off (this ID could not be published); trying again in"
+        ));
+        assert!(!has_text(&window, "Trying again in"), "Tor is up");
+        let now = window.center(home::RETRY);
+        assert_eq!(window.click(now), vec![Action::RetryTor]);
+
+        model.tor_retry = None;
+        let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(&window, "Tor: not reachable."));
+        assert!(!window.controls().iter().any(|c| c == home::RETRY));
+    }
+
     /// Review F-2: a question that arrives while the page is scrolled to its
     /// end is drawn in view, in its region above the page's scroll area: its
     /// Deny and its accepts are inside the window, and Deny is still the

@@ -215,6 +215,8 @@ pub enum Action {
     /// Close the window: the card of a Rotate ID that did not finish was
     /// read (§B.8.12).
     CloseWindow,
+    /// Try Tor, or publishing this computer's ID, again now (B02).
+    RetryTor,
 }
 
 /// The main window's one card when Rotate ID did not finish, with Close.

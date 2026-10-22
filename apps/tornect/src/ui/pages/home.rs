@@ -414,8 +414,17 @@ fn id_card(
                     ),
                 );
             }
-            status_line(ui, Icon::Globe, tor_line(t, &model.tor));
-            status_line(ui, Icon::ShieldCheck, hosting_line(t, &model.hosting));
+            let retry = retry_in(model, now);
+            status_line(ui, Icon::Globe, tor_line(t, &model.tor, retry));
+            // The countdown is the Tor line's while Tor is down, else the
+            // hosting line's (publishing this ID failed or stopped).
+            let hosting_retry = retry.filter(|_| model.tor.is_ready());
+            status_line(
+                ui,
+                Icon::ShieldCheck,
+                hosting_line(t, &model.hosting, hosting_retry),
+            );
+            retry_button(ui, model, actions);
             needs = content_height(ui, top) + CARD_FRAME_HEIGHT;
         });
     needs
@@ -638,8 +647,40 @@ fn name_question(ui: &mut Ui, model: &Model, form: &mut Form, actions: &mut Vec<
     });
 }
 
-/// The Tor line, in words and colour.
-pub(super) fn tor_line(t: &Tokens, tor: &TorState) -> (String, egui::Color32) {
+/// How long until Tornect tries Tor, or publishing this ID, again by
+/// itself (B02), at `now`; `None` while nothing waits for a try.
+pub(super) fn retry_in(model: &Model, now: Instant) -> Option<Duration> {
+    model.tor_retry.map(|at| at.saturating_duration_since(now))
+}
+
+/// "Try again" while a try waits (B02): Tor's, or publishing this ID's,
+/// now rather than when it is due. The countdown beside it is redrawn
+/// every second.
+pub(super) fn retry_button(ui: &mut Ui, model: &Model, actions: &mut Vec<Action>) {
+    if model.tor_retry.is_none() {
+        return;
+    }
+    ui.ctx().request_repaint_after(Duration::from_secs(1));
+    if Button::new(Kind::Secondary, RETRY)
+        .icon(Icon::ArrowRight)
+        .small()
+        .show(ui)
+        .clicked()
+    {
+        actions.push(Action::RetryTor);
+    }
+}
+
+/// The retry button's words.
+pub(super) const RETRY: &str = "Try again now";
+
+/// The Tor line, in words and colour; `retry`: how long until Tornect tries
+/// again by itself after Tor did not start.
+pub(super) fn tor_line(
+    t: &Tokens,
+    tor: &TorState,
+    retry: Option<Duration>,
+) -> (String, egui::Color32) {
     match tor {
         TorState::Starting => ("Tor: starting…".to_owned(), t.text_muted),
         TorState::Trying { via, attempt, of } => (
@@ -651,13 +692,23 @@ pub(super) fn tor_line(t: &Tokens, tor: &TorState) -> (String, egui::Color32) {
             None => (format!("Tor: connecting via {via}, {pct}%"), t.text_muted),
         },
         TorState::Ready { via } => (format!("Tor: connected via {via}"), t.ok),
-        TorState::Failed(why) => (format!("Tor: not reachable ({why})"), t.danger_text),
+        TorState::Failed(why) => (
+            match retry {
+                Some(wait) => format!(
+                    "Tor: not reachable. {why} Trying again in {}.",
+                    super::super::model::wait_in_words(wait)
+                ),
+                None => format!("Tor: not reachable. {why}"),
+            },
+            t.danger_text,
+        ),
     }
 }
 
 /// The hosting line, in words and colour. One label, whatever the state:
-/// the promise it makes must stay true (SLICE-E E1-5).
-fn hosting_line(t: &Tokens, hosting: &Hosting) -> (String, egui::Color32) {
+/// the promise it makes must stay true (SLICE-E E1-5). `retry`: how long
+/// until publishing this ID is tried again by itself.
+fn hosting_line(t: &Tokens, hosting: &Hosting, retry: Option<Duration>) -> (String, egui::Color32) {
     match hosting {
         Hosting::Waiting => (
             "Incoming requests: waiting for Tor".to_owned(),
@@ -691,7 +742,16 @@ fn hosting_line(t: &Tokens, hosting: &Hosting) -> (String, egui::Color32) {
             },
             t.warn,
         ),
-        Hosting::Off(why) => (format!("Incoming requests: off ({why})"), t.text_muted),
+        Hosting::Off(why) => (
+            match retry {
+                Some(wait) => format!(
+                    "Incoming requests: off ({why}); trying again in {}",
+                    super::super::model::wait_in_words(wait)
+                ),
+                None => format!("Incoming requests: off ({why})"),
+            },
+            t.text_muted,
+        ),
     }
 }
 
