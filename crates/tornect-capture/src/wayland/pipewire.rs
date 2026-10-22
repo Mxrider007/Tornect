@@ -706,6 +706,8 @@ struct Inner {
     skipped: u64,
     /// A malformed buffer was already logged.
     warned: bool,
+    /// This side closed the stream ([`Shared::close`]): no picture is kept.
+    closed: bool,
 }
 
 /// The one-picture slot between the PipeWire callbacks and the capture thread.
@@ -728,6 +730,7 @@ impl Shared {
                 delivered: 0,
                 skipped: 0,
                 warned: false,
+                closed: false,
             }),
             wake: Condvar::new(),
             size: AtomicU64::new(0),
@@ -802,6 +805,11 @@ impl Shared {
     /// A buffer arrived holding a picture in `plane`, `stride` bytes per row.
     pub(crate) fn offer(&self, plane: &[u8], stride: i32) {
         let mut inner = self.lock();
+        // One that comes while the stream is torn down is let go of.
+        if inner.closed {
+            inner.skipped += 1;
+            return;
+        }
         let Some(format) = inner.format else {
             inner.skipped += 1;
             return;
@@ -890,14 +898,30 @@ impl Shared {
     }
 
     /// This side is closing the stream: what PipeWire reports while it is torn
-    /// down is not a failure worth logging.
+    /// down is not a failure worth logging, and the slot lets go of its
+    /// picture and takes no other. The slot outlives the stream wherever a
+    /// `WaylandInput` is kept (the session backend keeps one until the
+    /// injector is built), and it must not keep the last full-size picture of
+    /// the screen with it. Both happen under the slot's lock, which `offer`
+    /// takes too, so no buffer can slip in between.
     fn close(&self) {
         let mut inner = self.lock();
         if !matches!(inner.status, Status::Failed(_)) {
             inner.status = Status::Failed("the screen capture was closed".to_owned());
         }
+        inner.closed = true;
+        let held = (inner.latest.take(), std::mem::take(&mut inner.spare));
         drop(inner);
+        drop(held);
         self.wake.notify_all();
+    }
+
+    /// Whether the slot holds picture memory: an unread picture, or a buffer
+    /// kept to pack the next one into.
+    #[cfg(test)]
+    fn holds_picture(&self) -> bool {
+        let inner = self.lock();
+        inner.latest.is_some() || inner.spare.capacity() > 0
     }
 
     /// Pictures delivered and buffers skipped so far.
@@ -1755,6 +1779,36 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// Once this side closes the stream the slot holds no picture, unread or
+    /// spare, and takes none from a buffer that comes while the stream is
+    /// torn down: what still holds the slot (a kept `WaylandInput`) holds no
+    /// screen.
+    #[test]
+    fn a_closed_slot_keeps_no_picture() {
+        let good = || Fake::new(vec![7; 16], chunk(0, 16, 8, 0));
+        for spare in [false, true] {
+            let data = fake_data();
+            data.shared
+                .set_format(Ok(Some(format(PixelFormat::Bgrx, 2, 2))));
+            assert!(good().process(&data));
+            if spare {
+                // A buffer that does not pack hands the unread picture's
+                // memory to the spare.
+                assert!(Fake::new(vec![7; 24], chunk(0, 24, 4, 0)).process(&data));
+                assert!(data.shared.next(Duration::ZERO).unwrap().is_none());
+            }
+            assert!(data.shared.holds_picture(), "spare {spare}");
+            data.shared.close();
+            assert!(!data.shared.holds_picture(), "spare {spare}");
+            assert!(good().process(&data), "queued back");
+            assert!(!data.shared.holds_picture(), "spare {spare}: after close");
+            assert!(matches!(
+                data.shared.next(Duration::ZERO),
+                Err(CaptureError::Failed(m)) if m.contains("closed")
+            ));
+        }
     }
 
     #[test]
