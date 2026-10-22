@@ -975,8 +975,11 @@ impl SessionSink for CliSessions {
         }
     }
 
+    /// The start code and the secure-screen bit, with the media layer's
+    /// no-input bit added (a control session with nothing to inject into).
     fn notice(&self, session_id: &str) -> Option<u8> {
-        self.live.notice(session_id)
+        self.media
+            .viewer_notice(session_id, self.live.notice(session_id))
     }
 
     fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {

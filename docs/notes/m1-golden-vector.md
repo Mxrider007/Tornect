@@ -182,8 +182,8 @@ unchanged.
 
 The host's `PONG` carries key 1, `notice` (decision M1-70, §B.8.4.1): one byte of bits, never text, from which the
 viewer says its own fixed sentences (0x01 the host runs Windows, 0x02 the session is not at the administrator level on
-a Windows host, so its input cannot reach administrator windows, 0x04 a secure Windows screen is showing; other bits
-reserved, kept as received and ignored). The host of a Control session sends it in its first `PONG`, 0 included, and
+a Windows host, so its input cannot reach administrator windows, 0x04 a secure Windows screen is showing, 0x08 since
+2026-10-22 the session's input reaches nothing on the host; other bits reserved, kept as received and ignored). The host of a Control session sends it in its first `PONG`, 0 included, and
 again only when it changes; every other `PONG` is the plain one. The vector is the body of
 `HostPong{nonce: 1, notice: 3}` and its envelope as the host's fourth frame of a stream (`v` 1, `msg_id` 4, kind 16
 `PONG`, unsigned; the envelope without the frame's `u32` length prefix) (`fsm::golden::golden_vector_pong_notice`).

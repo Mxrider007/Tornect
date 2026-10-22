@@ -57,6 +57,12 @@ const TOAST_FOR: Duration = Duration::from_millis(3500);
 const ADMIN_WINDOWS: &str =
     "Some windows here run as administrator; your clicks cannot reach them in this session.";
 
+/// The line of a control session whose host said its input reaches nothing
+/// there (no injector: on GNOME, the desktop's dialog left "Allow Remote
+/// Interaction" off), said when the host says so.
+const NO_INPUT_LINE: &str = "The remote computer did not allow control: you can watch, but your \
+     mouse and keyboard reach nothing there.";
+
 /// Why Ctrl+Alt+Del is greyed towards a host that said it runs Windows.
 const NOT_ON_WINDOWS: &str = "not possible on Windows computers";
 
@@ -203,6 +209,9 @@ pub struct ViewerState {
     pub host_notice: Option<u8>,
     /// The host's secure screen showed in the last frame.
     secure_shown: bool,
+    /// The host said, by the last frame, that this session's input reaches
+    /// nothing there.
+    no_input_shown: bool,
     /// The window is to be full screen: the app tells the window, and
     /// nothing else of it changes (never its title).
     pub fullscreen: bool,
@@ -299,6 +308,14 @@ impl ViewerState {
                 .is_some_and(|code| code & notice::NO_ADMIN_WINDOWS != 0)
     }
 
+    /// The host says this control session's input reaches nothing there.
+    fn no_input(&self, v: &Viewing) -> bool {
+        v.control
+            && self
+                .host_notice
+                .is_some_and(|code| code & notice::NO_INPUT != 0)
+    }
+
     /// Leave full screen (the chord does, after its ReleaseAll).
     pub fn leave_fullscreen(&mut self) {
         self.fullscreen = false;
@@ -320,7 +337,9 @@ impl ViewerState {
     /// Take the host's notice for this frame: none outside a control
     /// session; when its secure screen closes, the toast says so. Only a
     /// code without the bit says that: no code is the session's end, which
-    /// says nothing of the host's screen.
+    /// says nothing of the host's screen. When the host first says that the
+    /// session's input reaches nothing there, the toolbar comes back, so
+    /// that the line under it is seen.
     fn follow_notice(&mut self, control: bool, now: Instant) {
         if !control {
             self.host_notice = None;
@@ -330,6 +349,13 @@ impl ViewerState {
             self.toast = Some((Toast::SecureScreenGone, now));
         }
         self.secure_shown = secure;
+        let no_input = self
+            .host_notice
+            .is_some_and(|code| code & notice::NO_INPUT != 0);
+        if no_input && !self.no_input_shown {
+            self.show_toolbar(now);
+        }
+        self.no_input_shown = no_input;
     }
 
     /// Where a screenshot's thread says how it went: the window takes it at
@@ -831,6 +857,14 @@ fn toolbar(
         viewer.areas.push(help.response.rect);
         below = help.response.rect.bottom() + 4.0;
     }
+    let no_input = viewer.no_input(v);
+    if no_input {
+        let line = under_pill(ctx, "viewer-no-input", below, top, |ui| {
+            ui.label(RichText::new(NO_INPUT_LINE).small().color(t.warn));
+        });
+        viewer.areas.push(line);
+        below = line.bottom() + 4.0;
+    }
     let admin_windows = viewer.no_admin_windows(v);
     if admin_windows {
         let line = under_pill(ctx, "viewer-admin-windows", below, top, |ui| {
@@ -841,7 +875,11 @@ fn toolbar(
     }
     if viewer.details {
         let at = egui::pos2(pill.left(), below);
-        let open = details(ctx, v, input_sent, rate, now, at, admin_windows);
+        let lines = ModeLines {
+            no_input,
+            admin_windows,
+        };
+        let open = details(ctx, v, input_sent, rate, now, at, lines);
         viewer.areas.push(open.response.rect);
         below = open.response.rect.bottom() + 4.0;
         // A press anywhere else closes them (the badge toggles them itself).
@@ -922,10 +960,19 @@ fn keys_menu(
         })
 }
 
+/// The lines the details say under the level, each when the host said it.
+#[derive(Debug, Clone, Copy)]
+struct ModeLines {
+    /// The session's input reaches nothing on the host.
+    no_input: bool,
+    /// Its input cannot reach the host's administrator windows.
+    admin_windows: bool,
+}
+
 /// The connection's details, under the toolbar at `at`: the route, the
-/// picture, the level (with the administrator-windows line when the host
-/// said it, `admin_windows`), the session's clock and, in a control session,
-/// the input sent. Nothing in them names the host.
+/// picture, the level (with the no-input and administrator-windows lines
+/// when the host said them, `lines`), the session's clock and, in a control
+/// session, the input sent. Nothing in them names the host.
 fn details(
     ctx: &egui::Context,
     v: &Viewing,
@@ -933,7 +980,7 @@ fn details(
     rate: u64,
     now: Instant,
     at: egui::Pos2,
-    admin_windows: bool,
+    lines: ModeLines,
 ) -> egui::InnerResponse<()> {
     let t = theme::tokens(ctx);
     let muted = |text: &str| RichText::new(text).color(t.text_muted);
@@ -965,7 +1012,10 @@ fn details(
                             ui.label(muted("Mode"));
                             ui.vertical(|ui| {
                                 ui.label(chip_text(v));
-                                if admin_windows {
+                                if lines.no_input {
+                                    ui.label(RichText::new(NO_INPUT_LINE).small().color(t.warn));
+                                }
+                                if lines.admin_windows {
                                     ui.label(RichText::new(ADMIN_WINDOWS).small().color(t.warn));
                                 }
                             });
@@ -1730,6 +1780,67 @@ mod tests {
         }
     }
 
+    /// The no-input line, under the toolbar and in the details: only in a
+    /// control session, and only when the host says the session's input
+    /// reaches nothing there. Said after the toolbar hid, it brings the
+    /// toolbar back once, with the line, whose area the remote computer
+    /// never gets.
+    #[test]
+    fn the_no_input_line_is_said_only_when_the_host_says_so() {
+        assert_eq!(
+            NO_INPUT_LINE,
+            "The remote computer did not allow control: you can watch, but your mouse and \
+             keyboard reach nothing there."
+        );
+        for control in [false, true] {
+            for code in [
+                None,
+                Some(0x00),
+                Some(0x01),
+                Some(0x07),
+                Some(0x08),
+                Some(0x0b),
+            ] {
+                let mut w = Window::new(control);
+                w.viewer.host_notice = code;
+                w.pass(ms(0), Vec::new());
+                w.pass(ms(0), Vec::new());
+                let want = control && code.is_some_and(|c| c & 0x08 != 0);
+                let case = format!("control {control}, {code:?}");
+                assert_eq!(w.has(NO_INPUT_LINE), want, "{case}: {:?}", w.texts());
+                let under = times(&w, NO_INPUT_LINE);
+                w.viewer.details = true;
+                w.pass(ms(100), Vec::new());
+                w.pass(ms(100), Vec::new());
+                if want {
+                    assert!(
+                        times(&w, NO_INPUT_LINE) > under,
+                        "{case}: in the details too"
+                    );
+                } else {
+                    assert_eq!(times(&w, NO_INPUT_LINE), 0, "{case}");
+                }
+            }
+        }
+        let mut w = Window::new(true);
+        w.viewer.host_notice = Some(0x00);
+        for at in [0, 3000] {
+            w.pass(ms(at), Vec::new());
+            w.pass(ms(at), Vec::new());
+        }
+        assert!(!w.viewer.toolbar_shown(), "the toolbar hid");
+        w.viewer.host_notice = Some(0x08);
+        w.pass(ms(9000), Vec::new());
+        w.pass(ms(9000), Vec::new());
+        assert!(w.viewer.toolbar_shown(), "the toolbar came back");
+        assert!(w.has(NO_INPUT_LINE), "{:?}", w.texts());
+        let at = w.centre(NO_INPUT_LINE);
+        assert!(w.viewer.areas().iter().any(|r| r.contains(at)));
+        w.pass(ms(12000), Vec::new());
+        w.pass(ms(12000), Vec::new());
+        assert!(!w.viewer.toolbar_shown(), "called back once, not for good");
+    }
+
     /// A view-only window shows nothing a host sends, whatever the code: no
     /// notice, no line, no platform; and the model hands it none.
     #[test]
@@ -1742,6 +1853,7 @@ mod tests {
         for text in [
             crate::secure_screen::NOTICE,
             ADMIN_WINDOWS,
+            NO_INPUT_LINE,
             NOT_ON_WINDOWS,
             "Ctrl+Alt+Del",
         ] {

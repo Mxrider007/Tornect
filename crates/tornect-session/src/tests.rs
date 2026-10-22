@@ -100,6 +100,9 @@ struct TestBackend {
     cancelled: AtomicBool,
     /// Holds the source's pictures back while set ([`Card::stalled`]).
     stalled: Arc<AtomicBool>,
+    /// The open keeps nothing to build an injector from, as on a Wayland
+    /// host whose dialog left remote interaction off.
+    no_injector: bool,
 }
 
 /// The desktop's dialog: up until `cancel` turns `true` (then `true`), or for
@@ -128,7 +131,9 @@ impl MediaBackend for TestBackend {
             self.cancelled.store(true, Ordering::SeqCst);
             return Err(CaptureError::Unavailable("the session ended".into()));
         }
-        *self.input.lock().unwrap() = Some(self.recorder.clone());
+        if !self.no_injector {
+            *self.input.lock().unwrap() = Some(self.recorder.clone());
+        }
         Ok(Box::new(Card {
             // Faster than the encoder's 15 fps, so the encoder sets the pace.
             inner: TestCard::new(256, 96, 60),
@@ -446,6 +451,72 @@ async fn view_only_input_is_never_decoded_or_injected() {
         rig.backend.open_injector().is_none(),
         "the view-only session's input handle was kept"
     );
+}
+
+/// A control session served with no injector says so to its viewer: the
+/// notice code its host tells gains `NO_INPUT`, and only for that session.
+/// Its input is still read and dropped, as the signed accept leaves the
+/// viewer sending it. A view-only session stays told nothing, and a control
+/// session with an injector is told only what its host says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_session_with_no_injector_tells_its_viewer() {
+    use tornect_signal::messages::notice;
+    let rig = rig_with(
+        TestBackend {
+            no_injector: true,
+            ..TestBackend::default()
+        },
+        MediaLimits::default(),
+    );
+    let (id, binding) = start(&rig.host, 13, SessionMode::Control);
+    let (view_id, _) = start(&rig.host, 14, SessionMode::ViewOnly);
+    // Nothing is said before the stream is served.
+    assert_eq!(rig.host.viewer_notice(&id, Some(0)), Some(0));
+    let (mut client, served) = connect(&rig.host);
+    assert_eq!(
+        bind_raw(&mut client, &binding).await,
+        0,
+        "BindOk says control"
+    );
+    let key = InputEvent::Key {
+        usb: KEY_A,
+        pressed: true,
+    };
+    write_msg(&mut client, &Msg::Input(key.encode()))
+        .await
+        .unwrap();
+    sync(&mut client, 1).await;
+    assert_eq!(rig.host.viewer_notice(&id, Some(0)), Some(notice::NO_INPUT));
+    assert_eq!(
+        rig.host.viewer_notice(&id, Some(notice::WINDOWS)),
+        Some(notice::WINDOWS | notice::NO_INPUT)
+    );
+    assert_eq!(rig.host.viewer_notice(&id, None), None);
+    assert_eq!(rig.host.viewer_notice(&view_id, None), None);
+    assert_eq!(rig.host.viewer_notice(&view_id, Some(0)), Some(0));
+    assert_eq!(
+        rig.seen.lines()[0],
+        "started card 256x96 Control input=false"
+    );
+    drop(client);
+    let MediaOutcome::Served { report, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!((report.input_injected, report.input_dropped), (0, 1));
+
+    // The same host with an injector says nothing of the kind.
+    let rig = rig_with(TestBackend::default(), MediaLimits::default());
+    let (id, binding) = start(&rig.host, 15, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    sync(&mut client, 2).await;
+    assert_eq!(
+        rig.seen.lines()[0],
+        "started card 256x96 Control input=true"
+    );
+    assert_eq!(rig.host.viewer_notice(&id, Some(0)), Some(0));
+    drop(client);
+    served.await.unwrap();
 }
 
 /// SLICE-A2 A2-3 and the hand-off's release rule: control input is rate
@@ -1569,6 +1640,95 @@ async fn an_accepted_session_streams_until_the_panic_key() {
     );
     fsm.await.unwrap().unwrap();
     assert_eq!(rig.host.live(), 0);
+}
+
+/// The hosts' session sinks in small: the media layer's sessions, and a
+/// notice code of 0 for every session (a control session's start code on a
+/// host that does not run Windows), with what the media layer knows added.
+struct NoticeSink(Arc<MediaHost>);
+
+impl SessionSink for NoticeSink {
+    fn on_start(&self, session: &LiveSession<'_>) {
+        self.0.on_start(session);
+    }
+
+    fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
+        self.0.on_end(session_id, end);
+    }
+
+    fn notice(&self, session_id: &str) -> Option<u8> {
+        self.0.viewer_notice(session_id, Some(0))
+    }
+}
+
+/// Through the real handshake: a control session whose host has nothing to
+/// inject into tells its viewer so in the `PONG` that answers its next
+/// `PING`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_viewer_of_a_control_session_with_no_injector_hears_it_at_its_next_ping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let identity = Arc::new(HostIdentity::from_seed(&[0x13; 32]));
+    let trusted = Arc::new(TrustedDeviceStore::with(
+        tmp.path().join("trusted-devices.toml"),
+        tornect_core::trusted::TrustedDevices::default(),
+    ));
+    let consent = Arc::new(ScriptedConsent::new());
+    consent.push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+    consent.push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+    let rig = rig_with(
+        TestBackend {
+            no_injector: true,
+            ..TestBackend::default()
+        },
+        MediaLimits::default(),
+    );
+    let mut deps = HostDeps::headless(identity.clone(), trusted);
+    deps.consent = consent;
+    deps.sessions = Arc::new(NoticeSink(rig.host.clone()));
+    let kill = deps.kill.clone();
+    let cfg = HostConfig::new("Desk", [9; 32]);
+    let (client_end, host_end) = duplex(64 * 1024);
+    let fsm = tokio::spawn(async move { serve_host(host_end, &cfg, &deps).await });
+
+    let known = Arc::new(KnownHostStore::with(
+        tmp.path().join("known-hosts.toml"),
+        tornect_core::trusted::KnownHosts::default(),
+    ));
+    let mut client_deps = ClientDeps::headless(known);
+    client_deps.ui = Arc::new(ScriptedClientUi::new(true));
+    let device = DeviceIdentity::from_seed(&[0x24; 32]);
+    let ccfg = ClientConfig::new(identity.id(), "Laptop");
+    let ClientOutcome::Session(mut session) =
+        client::connect(client_end, &ccfg, &device, &client_deps, Intent::Session)
+            .await
+            .unwrap()
+    else {
+        panic!("no session");
+    };
+    session.send_tor_fallback().await.unwrap();
+    let notices = session.notices();
+    session.ping().await.unwrap();
+    assert_eq!(*notices.borrow(), Some(0), "before the media stream");
+
+    let binding = Binding::new(session.session_token(), &session.th());
+    let (media, served) = connect(&rig.host);
+    let viewer = MediaViewer::bind(media, &binding, WAIT).await.unwrap();
+    assert_eq!(viewer.bound().mode, SessionMode::Control);
+    let started = std::time::Instant::now();
+    while rig.seen.lines().is_empty() {
+        assert!(started.elapsed() < WAIT, "capture never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    session.ping().await.unwrap();
+    assert_eq!(
+        *notices.borrow(),
+        Some(tornect_signal::messages::notice::NO_INPUT)
+    );
+
+    kill.kill(bye::PANIC);
+    drop(viewer);
+    assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
+    fsm.await.unwrap().unwrap();
 }
 
 /// A host that never stops sending: `BindOk`, then the same `Video` unit for
