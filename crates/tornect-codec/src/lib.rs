@@ -17,10 +17,11 @@ use openh264::encoder::{
 };
 use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSource as _};
 
-/// Largest picture OpenH264 encodes.
-pub const MAX_WIDTH: u32 = 3840;
-/// Largest picture OpenH264 encodes.
-pub const MAX_HEIGHT: u32 = 2160;
+/// The longest side OpenH264 encodes: 3840 wide, or 3840 tall when the
+/// picture stands upright (level 5.2, `openh264` 0.9.8 `Encoder::reinit`).
+pub const MAX_LONG_SIDE: u32 = 3840;
+/// The shortest side OpenH264 encodes: 2160, across either axis.
+pub const MAX_SHORT_SIDE: u32 = 2160;
 
 /// Codec failures.
 #[derive(Debug, thiserror::Error)]
@@ -93,11 +94,20 @@ impl std::fmt::Debug for H264Encoder {
     }
 }
 
-/// The even picture size OpenH264 encodes for a `w`×`h` source (odd edges
-/// dropped, clamped to the codec maximum).
+/// The even picture size OpenH264 encodes for a `w`×`h` source: odd edges
+/// dropped, then clamped to the codec maximum in the picture's own
+/// orientation, at most 3840×2160 wide and at most 2160×3840 upright. A
+/// portrait screen is sent whole up to 3840 rows; clamping each axis to the
+/// landscape maximum would cut off its bottom, and with it the part of the
+/// screen the viewer's pointer can reach.
 #[must_use]
 pub fn encoded_size(w: u32, h: u32) -> (u32, u32) {
-    ((w & !1).min(MAX_WIDTH), (h & !1).min(MAX_HEIGHT))
+    let (w, h) = (w & !1, h & !1);
+    if h > w {
+        (w.min(MAX_SHORT_SIDE), h.min(MAX_LONG_SIDE))
+    } else {
+        (w.min(MAX_LONG_SIDE), h.min(MAX_SHORT_SIDE))
+    }
 }
 
 impl H264Encoder {
@@ -281,6 +291,48 @@ mod tests {
         enc.force_keyframe();
         let k = enc.encode(&card(w, h, 2), w, h).unwrap();
         assert!(k.keyframe);
+    }
+
+    /// The crop keeps the picture's orientation: a landscape picture is held
+    /// to 3840×2160, an upright one to 2160×3840, so a portrait screen is not
+    /// cut at row 2160.
+    #[test]
+    fn the_crop_is_clamped_in_the_pictures_own_orientation() {
+        for ((w, h), want) in [
+            ((1920, 1080), (1920, 1080)),
+            ((1921, 1081), (1920, 1080)),
+            ((7680, 2160), (3840, 2160)),
+            ((5120, 2880), (3840, 2160)),
+            ((1440, 2560), (1440, 2560)),
+            ((2160, 3840), (2160, 3840)),
+            ((1081, 2561), (1080, 2560)),
+            ((2880, 5120), (2160, 3840)),
+            ((2400, 3000), (2160, 3000)),
+            ((1080, 7680), (1080, 3840)),
+            ((3000, 3000), (3000, 2160)),
+        ] {
+            let (ew, eh) = encoded_size(w, h);
+            assert_eq!((ew, eh), want, "{w}x{h}");
+            assert!(ew % 2 == 0 && eh % 2 == 0, "{w}x{h}");
+            assert!(ew.max(eh) <= MAX_LONG_SIDE && ew.min(eh) <= MAX_SHORT_SIDE);
+        }
+    }
+
+    /// An upright picture taller than 2160 rows is encoded and decoded
+    /// whole, and the largest upright picture is one OpenH264 takes.
+    #[test]
+    fn a_portrait_picture_is_encoded_whole() {
+        let mut enc = H264Encoder::new(EncoderSettings::default()).unwrap();
+        let mut dec = H264Decoder::new().unwrap();
+        let (w, h) = (1200, 2400);
+        let au = enc.encode(&card(w, h, 0), w, h).unwrap();
+        assert_eq!(enc.size(), (w, h));
+        let frame = dec.decode(&au.data).unwrap().expect("a picture");
+        assert_eq!((frame.width, frame.height), (w, h));
+        let (w, h) = (2160, 3840);
+        let au = enc.encode(&card(w, h, 1), w, h).unwrap();
+        assert!(au.keyframe, "a new size starts with an IDR");
+        assert_eq!(enc.size(), (w, h));
     }
 
     #[test]

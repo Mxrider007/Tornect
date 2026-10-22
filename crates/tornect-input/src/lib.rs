@@ -739,11 +739,27 @@ mod tests {
 
     #[test]
     fn a_position_over_the_visible_region_lands_inside_it() {
-        let crop = |w: u32, h: u32| ((w & !1).min(3840), (h & !1).min(2160));
+        // `tornect_codec::encoded_size`: even sizes, at most 3840x2160 wide
+        // and 2160x3840 upright.
+        let crop = |w: u32, h: u32| {
+            let (w, h) = (w & !1, h & !1);
+            if h > w {
+                (w.min(2160), h.min(3840))
+            } else {
+                (w.min(3840), h.min(2160))
+            }
+        };
         // Two 4K screens side by side: the viewer sees the left 3840x2160.
         assert_eq!(place(65535, 65535, (7680, 2160), crop), (3839, 2159));
         assert_eq!(place(0, 0, (7680, 2160), crop), (0, 0));
         assert_eq!(place(32768, 0, (7680, 2160), crop), (1920, 0));
+        // An upright screen is sent whole: its bottom row (a Windows taskbar)
+        // is in reach.
+        assert_eq!(place(65535, 65535, (1440, 2560), crop), (1439, 2559));
+        assert_eq!(place(65535, 65535, (2160, 3840), crop), (2159, 3839));
+        // Beyond the upright maximum, the top-left 2160x3840 and no more.
+        assert_eq!(place(65535, 65535, (2400, 4000), crop), (2159, 3839));
+        assert_eq!(place(65535, 65535, (2400, 3000), crop), (2159, 2999));
         // An odd screen loses its last column and row, as the encoder does.
         assert_eq!(place(65535, 65535, (1921, 1081), crop), (1919, 1079));
         assert_eq!(place(65535, 65535, (1920, 1080), whole), (1919, 1079));

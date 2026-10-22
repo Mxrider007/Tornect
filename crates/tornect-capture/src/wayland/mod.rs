@@ -412,9 +412,14 @@ mod tests {
     use super::*;
 
     /// `tornect_codec::encoded_size`, which the session layer passes in: even
-    /// sizes, at most 3840×2160.
+    /// sizes, at most 3840×2160 wide and 2160×3840 upright.
     fn encoded(w: u32, h: u32) -> (u32, u32) {
-        ((w & !1).min(3840), (h & !1).min(2160))
+        let (w, h) = (w & !1, h & !1);
+        if h > w {
+            (w.min(2160), h.min(3840))
+        } else {
+            (w.min(3840), h.min(2160))
+        }
     }
 
     fn whole(w: u32, h: u32) -> (u32, u32) {
@@ -540,6 +545,13 @@ mod tests {
             map.place(65535, 65535, (1921, 1081), encoded),
             Some((1919.0, 1079.0))
         );
+        // A rotated 4K monitor at 200 %: 2160×3840 pixels, 1080×1920
+        // logical, sent whole, so the far corner is the screen's own.
+        let map = PointerMap::new((1080, 1920), (2160, 3840)).unwrap();
+        assert_eq!(
+            map.place(65535, 65535, (2160, 3840), encoded),
+            Some((2159.0 * 0.5, 3839.0 * 0.5))
+        );
         // Fractional scaling (125 %): 2560×1600 pixels, 2048×1280 logical.
         let map = PointerMap::new((2048, 1280), (2560, 1600)).unwrap();
         let (x, y) = map.place(65535, 65535, (2560, 1600), encoded).unwrap();
@@ -550,6 +562,8 @@ mod tests {
             ((1280, 800), (1280, 800)),
             ((1, 1), (2, 2)),
             ((3000, 2000), (2000, 1000)),
+            ((1440, 2560), (1440, 2560)),
+            ((1440, 2560), (2880, 5120)),
         ] {
             let map = PointerMap::new(logical, pixels).unwrap();
             for (x, y) in [(0, 0), (65535, 65535), (65535, 0), (12345, 54321)] {
