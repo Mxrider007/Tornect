@@ -93,7 +93,7 @@ tor-llcrypto = "=0.45.0"
 tor-keymgr = { version = "=0.45.0", features = ["keymgr"] }
 tor-rtcompat = { version = "=0.45.0", features = ["tokio", "rustls"] }
 safelog = "0.9"
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
 futures = "0.3.34"
 
 # Milestone 1 — signaling protocol, pairing, unattended access (docs/PLAN.md §B.3,

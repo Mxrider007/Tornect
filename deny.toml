@@ -34,6 +34,15 @@ ignore = [
   # the title bar's text from a local system font. No peer-supplied data reaches
   # it; egui's own text uses skrifa. Dropping it means `wayland-csd-adwaita-notitle`.
   { id = "RUSTSEC-2026-0192", reason = "reached only by winit's GNOME title-bar drawing of a local system font; no peer input" },
+  # zbus 6 absorbed `zbus_names`, `zvariant` and `zvariant_derive`, so their
+  # standalone crates are marked unmaintained, with no fixed version. They come in
+  # through zbus 5: ashpd 0.13.13 (the latest ashpd, the portal client of the
+  # Wayland capture and the platform crate) requires it, and tornect-platform
+  # shares that one zbus for its own D-Bus calls. Drop these three once ashpd
+  # moves to zbus 6.
+  { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6; reached through zbus 5, which ashpd 0.13.13 (latest) requires; no advisory against its code" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6; reached through zbus 5, which ashpd 0.13.13 (latest) requires; no advisory against its code" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive merged into zbus 6; a build-time proc macro of zbus 5, which ashpd 0.13.13 (latest) requires" },
 ]
 
 [licenses]
