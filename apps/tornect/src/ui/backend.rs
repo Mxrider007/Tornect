@@ -3239,13 +3239,15 @@ async fn viewed(
             paired_now: false,
             failed: None,
             unattended: ua.is_some(),
+            went_live: false,
         };
         m.ua_live = None;
     });
     // With history off the handshake works on a copy of the known hosts, so
     // that its last-seen touch writes nothing (`crate::history`).
     crate::history::coarsen_pins(&b.paths);
-    let pins = crate::history::Pins::open(&b.paths, id)?;
+    let pins =
+        crate::history::Pins::open(&b.paths, id).inspect_err(|_| failed(b, Failure::Other))?;
     // Unattended access is a paired computer's (§B.8 hard rule 2).
     let known = match (&ua, pins.store().get(&id)) {
         (Some(_), None) => {
@@ -3258,6 +3260,7 @@ async fn viewed(
     let isolation = Isolation::new();
     let Some(stream) = unless_stopped(node.connect_on(&id, SIGNALING_PORT, &isolation), stop).await
     else {
+        failed(b, Failure::Cancelled);
         return Ok("Cancelled.".to_owned());
     };
     if stream.is_err() {
@@ -3303,6 +3306,7 @@ async fn viewed(
     }
     refresh_book(b, None);
     let Some(outcome) = outcome else {
+        failed(b, Failure::Cancelled);
         if let (Some(_), Some(known)) = (&ua, &known) {
             ua_client::log_attempt(&b.paths, known, &Logged::Ended("cancelled"));
         }
@@ -3356,6 +3360,7 @@ async fn viewed(
         not_started(e, pairing.ended())
     })?;
     let ClientOutcome::Session(mut session) = outcome else {
+        failed(b, Failure::Other);
         anyhow::bail!("paired, but no session came of it");
     };
     // The input gate: the signed SESSION_ACCEPT's mode, never the media
@@ -3527,16 +3532,20 @@ fn ua_failure(err: &HandshakeError, ended: &ua_client::Ended) -> (Failure, u8) {
 /// Record why the connection ended without a session, at the step it had
 /// reached.
 fn failed(b: &Backend, why: Failure) {
-    b.shared.update(|m| {
-        let step = match m.client {
-            ClientStage::Pairing { .. } | ClientStage::Checking => 2,
-            ClientStage::Asking => 3,
-            ClientStage::Live(_) => 4,
-            _ if why == Failure::CodesDiffer => 2,
-            _ => 1,
-        };
-        m.dial.failed = Some((why, step));
-    });
+    b.shared.update(|m| failed_at_stage(m, why));
+}
+
+/// [`failed`] on the model: the step is the stage's (a cancel included, so
+/// that the stepper ticks only the steps done, B25).
+fn failed_at_stage(m: &mut super::model::Model, why: Failure) {
+    let step = match m.client {
+        ClientStage::Pairing { .. } | ClientStage::Checking => 2,
+        ClientStage::Asking => 3,
+        ClientStage::Live(_) => 4,
+        _ if why == Failure::CodesDiffer => 2,
+        _ => 1,
+    };
+    m.dial.failed = Some((why, step));
 }
 
 /// Where a handshake that ended before its session belongs in the connect
@@ -6315,6 +6324,32 @@ mod tests {
         republishing(&mut m);
         assert_eq!(m.hosting, Hosting::Publishing);
         assert_eq!(m.tor_retry, None);
+    }
+
+    /// B25: a cancel is recorded at the step the dial had reached, as a
+    /// failure is: reaching the computer, pairing (or checking the
+    /// password), waiting for approval. Before the fix a cancel recorded
+    /// nothing, and the stepper showed every step ticked.
+    #[test]
+    fn a_cancel_is_recorded_at_its_step() {
+        for (stage, step) in [
+            (ClientStage::Reaching { id: "x".to_owned() }, 1),
+            (
+                ClientStage::Pairing {
+                    sas: "305 116".to_owned(),
+                },
+                2,
+            ),
+            (ClientStage::Checking, 2),
+            (ClientStage::Asking, 3),
+        ] {
+            let mut m = Model {
+                client: stage.clone(),
+                ..Model::default()
+            };
+            failed_at_stage(&mut m, Failure::Cancelled);
+            assert_eq!(m.dial.failed, Some((Failure::Cancelled, step)), "{stage:?}");
+        }
     }
 
     /// B02: the window's words for a Tor that did not start name no command,

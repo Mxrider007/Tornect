@@ -271,6 +271,7 @@ impl Model {
     /// until it says.
     pub fn go_live(&mut self, viewing: Viewing) {
         self.host_notice = None;
+        self.dial.went_live = true;
         self.client = ClientStage::Live(viewing);
     }
 
@@ -691,6 +692,9 @@ pub struct Dial {
     pub failed: Option<(Failure, u8)>,
     /// An unattended connect: the stepper names its own steps.
     pub unattended: bool,
+    /// The session went live: only then does an end that names no failure
+    /// read "The session ended", with every step done (B25).
+    pub went_live: bool,
 }
 
 /// Why a connection ended without a session: the connect stepper's error
@@ -716,6 +720,8 @@ pub enum Failure {
     SetupChanged,
     /// Nobody answered the code question on this computer.
     CodeUnanswered,
+    /// This computer's Cancel stopped it before the session started (B25).
+    Cancelled,
     /// Anything else; the stage's own words say what.
     Other,
 }
@@ -734,6 +740,7 @@ impl Failure {
             Self::NotLetIn => "The computer did not let this device in",
             Self::SetupChanged => "Its unattended setup was re-created",
             Self::CodeUnanswered => "Nobody answered the code question here",
+            Self::Cancelled => "Cancelled",
             Self::Other => "The connection ended",
         }
     }
@@ -770,6 +777,9 @@ impl Failure {
             Self::SetupChanged => {
                 "If that wasn't you, revoke devices there. Connecting waits until you say you \
                  read this."
+            }
+            Self::Cancelled => {
+                "You stopped it before the session started. Try again when you want to."
             }
             Self::Other => "Try again, or go back.",
         }

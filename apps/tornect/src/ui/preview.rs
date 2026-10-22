@@ -351,6 +351,7 @@ fn unattended(m: &mut Model, sheet: Sheet) -> bool {
                 paired_now: false,
                 failed: (sheet == Sheet::UaRefused).then_some((Failure::NotLetIn, 2)),
                 unattended: true,
+                went_live: sheet == Sheet::UaLive,
             };
             m.client = if sheet == Sheet::UaRefused {
                 ClientStage::Ended(crate::ua_client::reject_text(
@@ -481,6 +482,7 @@ fn stage(m: &mut Model, sheet: Sheet) -> bool {
         paired_now: sheet != Sheet::StageAsking,
         failed,
         unattended: false,
+        went_live: sheet == Sheet::StageLive,
     };
     true
 }
