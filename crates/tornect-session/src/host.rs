@@ -41,6 +41,7 @@ use tornect_proto::{
 };
 use tornect_signal::consent::{SessionToken, mode_code};
 use tornect_signal::fsm::host::{KillSwitch, LiveSession, SessionEnd, SessionSink};
+use tornect_signal::messages::notice;
 
 use crate::flow::{AckWindow, KeyframeLimiter, TokenBucket};
 
@@ -268,6 +269,9 @@ struct Registered {
     elevation: Elevation,
     label: String,
     bound: bool,
+    /// A control session whose stream is served with no injector: its
+    /// viewer's input reaches nothing here.
+    no_input: bool,
     /// Set to the `Close` reason when the session ends.
     end: watch::Sender<Option<u16>>,
 }
@@ -363,6 +367,24 @@ impl MediaHost {
 
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Registered>> {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `code`, the notice code the host tells the viewer of session
+    /// `session_id` (decision M1-70, §B.8.4.1), with what the media layer
+    /// knows added: [`notice::NO_INPUT`] once the session's control stream is
+    /// served with nothing to inject into. A session told nothing (`None`, a
+    /// view-only one) stays told nothing. The hosts' session sinks answer
+    /// [`SessionSink::notice`] with it, so the viewer of a control session
+    /// whose clicks go nowhere hears why at its next `PING`.
+    #[must_use]
+    pub fn viewer_notice(&self, session_id: &str, code: Option<u8>) -> Option<u8> {
+        let code = code?;
+        let no_input = self.lock().get(session_id).is_some_and(|s| s.no_input);
+        Some(if no_input {
+            code | notice::NO_INPUT
+        } else {
+            code
+        })
     }
 
     /// Serve one stream accepted on the media port, from its `Bind` to its end.
@@ -565,6 +587,17 @@ impl MediaHost {
             None
         };
         let mut injector = injector.map(|sink| Tracked::new(Boxed(sink)));
+        // A control session left without an injector says so to its viewer,
+        // which still sends what the signed accept allows (SLICE-C2 C2-6).
+        if matches!(mode, SessionMode::Control) && injector.is_none() {
+            tracing::warn!(
+                session = %session_id,
+                "control session with no injector: its viewer's input reaches nothing here"
+            );
+            if let Some(session) = self.lock().get_mut(&session_id) {
+                session.no_input = true;
+            }
+        }
         self.observer.capture_started(&CaptureStarted {
             session_id: &session_id,
             label: &label,
@@ -766,6 +799,7 @@ impl SessionSink for MediaHost {
                 elevation: session.elevation,
                 label: session.label.to_owned(),
                 bound: false,
+                no_input: false,
                 end,
             },
         );

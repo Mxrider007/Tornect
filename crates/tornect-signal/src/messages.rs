@@ -91,6 +91,12 @@ pub mod notice {
     /// A secure Windows screen is showing: a UAC prompt, the lock or the
     /// sign-in screen (§B.8.8).
     pub const SECURE_SCREEN: u8 = 0x04;
+    /// The Control session's input reaches nothing on the host: its media
+    /// stream is served with no injector (the desktop's dialog left remote
+    /// interaction off, XTEST is missing, …). The viewer still decides from
+    /// the signed accept whether it sends input (SLICE-C2 C2-6); this only
+    /// lets it say why nothing happens.
+    pub const NO_INPUT: u8 = 0x08;
 }
 
 /// `SESSION_ACCEPT.session_type`.
