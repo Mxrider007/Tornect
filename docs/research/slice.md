@@ -114,9 +114,13 @@ its core crates at 0.100 on 2026-09-03 but not the `windows`/`windows-sys` umbre
 ## 6. Windows capture + input (windows-sys 0.61.2)
 
 - GDI: `GetDC(0)` → `CreateCompatibleDC` → top-down 32-bit `CreateDIBSection` →
-  `BitBlt(SRCCOPY | CAPTUREBLT)` from the virtual-screen origin (`SM_X/YVIRTUALSCREEN`,
+  `BitBlt(SRCCOPY)` from the virtual-screen origin (`SM_X/YVIRTUALSCREEN`,
   `SM_CX/CYVIRTUALSCREEN`) → `GdiFlush`; cursor via `GetCursorInfo` + `DrawIconEx`. DXGI
-  Desktop Duplication is the step after the slice.
+  Desktop Duplication is the step after the slice. No `CAPTUREBLT`: it makes Windows hide and
+  re-show the pointer around every blit, so the host's pointer flickers for the whole session
+  (Mozilla bug 1053264, fixed in Firefox 35 by dropping the flag where DWM composes; FFmpeg's
+  gdigrab thread on the same flicker). DWM, always on from Windows 8, composes layered windows
+  into the screen DC already; NEEDS-DEVICE(windows) for that check.
 - `SendInput`: absolute moves with `MOVE | ABSOLUTE | VIRTUALDESK` over 0..65535 (the GDI
   picture is the virtual desktop, so the normalized coordinates pass through); keys by
   `KEYEVENTF_SCANCODE` (+`EXTENDEDKEY` for E0), Pause/NumLock by VK. winit sets per-monitor
