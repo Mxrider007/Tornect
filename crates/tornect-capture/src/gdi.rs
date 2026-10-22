@@ -19,9 +19,9 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, HBITMAP, HDC, HGDIOBJ, ReleaseDC,
-    SRCCOPY, SelectObject,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, HBITMAP, HDC, HGDIOBJ, ROP_CODE,
+    ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -41,6 +41,16 @@ pub struct GdiCapture {
 }
 
 static DPI_AWARE: Once = Once::new();
+
+/// The raster operation of every grab: a plain copy, without `CAPTUREBLT`.
+/// With that flag Windows hides the pointer and shows it again around each
+/// blit, so the host's own pointer flickers at the capture rate for as long
+/// as a session lasts (Mozilla bug 1053264, which dropped it wherever DWM
+/// composes). The flag only added layered windows, and DWM, always on since
+/// Windows 8 and so on every supported target (Windows 10 20H1+), composes
+/// them into the screen DC already. The cursor is drawn by `DrawIconEx`
+/// either way: a blit never copies it.
+const RASTER_OP: ROP_CODE = SRCCOPY;
 
 /// Measure in physical pixels. Without per-monitor awareness Windows reports a
 /// scaled desktop and `BitBlt` copies a scaled, partial picture on a high-DPI
@@ -160,19 +170,7 @@ fn grab() -> Result<Frame, CaptureError> {
             return Err(gdi_failed("CreateDIBSection"));
         }
         gdi.previous = SelectObject(gdi.memory, gdi.bitmap);
-        // CAPTUREBLT includes layered (translucent, always-on-top) windows.
-        if BitBlt(
-            gdi.memory,
-            0,
-            0,
-            w,
-            h,
-            gdi.screen,
-            x,
-            y,
-            SRCCOPY | CAPTUREBLT,
-        ) == 0
-        {
+        if BitBlt(gdi.memory, 0, 0, w, h, gdi.screen, x, y, RASTER_OP) == 0 {
             return Err(gdi_failed("BitBlt"));
         }
         draw_cursor(gdi.memory, x, y);
@@ -267,5 +265,14 @@ mod tests {
         assert_eq!(frame.bgrx.len(), (frame.width * frame.height * 4) as usize);
         assert!(frame.bgrx.chunks_exact(4).all(|p| p[3] == 0xff));
         assert_eq!(capture.name(), "gdi");
+    }
+
+    /// Every grab is a plain copy: `CAPTUREBLT` would make the host's own
+    /// pointer flicker for the whole session.
+    #[test]
+    fn the_grab_copies_without_captureblt() {
+        use windows_sys::Win32::Graphics::Gdi::CAPTUREBLT;
+        assert_eq!(RASTER_OP, SRCCOPY);
+        assert_eq!(RASTER_OP & CAPTUREBLT, 0);
     }
 }
