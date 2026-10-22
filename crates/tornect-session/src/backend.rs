@@ -42,7 +42,10 @@ pub struct SystemBackend {
     /// built from. `open_injector` has no other way to reach the session
     /// `open_source` opened; the media host asks the two in that order for
     /// one session, and M1 serves one session at a time. It holds the session
-    /// weakly, so it keeps nothing open once capture stops.
+    /// weakly, so it keeps nothing open once capture stops, and the picture
+    /// slot it shares with the source lets go of the picture when the stream
+    /// closes; it is dropped when the injector is built, when the session
+    /// turns out view-only, and when the session ends.
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     wayland_input: Mutex<Option<tornect_capture::wayland::WaylandInput>>,
 }
@@ -99,6 +102,21 @@ impl MediaBackend for SystemBackend {
     /// holds the desktop's keyboard-and-pointer grant, and nothing may build
     /// an injector into it for a view-only viewer.
     fn view_only(&self) {
+        self.forget_input();
+    }
+
+    /// Drops the Wayland input handle a session that never got its injector
+    /// left behind (its viewer left, or the session ended, between the open
+    /// and the injector): nothing is kept for a session that is over. One
+    /// session is served at a time, so the handle kept is that session's.
+    fn session_ended(&self, _session_id: &str) {
+        self.forget_input();
+    }
+}
+
+impl SystemBackend {
+    /// Let go of the last Wayland source's input handle, if it is still kept.
+    fn forget_input(&self) {
         #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
         self.wayland_input
             .lock()
@@ -178,12 +196,16 @@ impl SystemBackend {
     ) -> Result<Box<dyn VideoSource>, CaptureError> {
         use tornect_capture::wayland::{WaylandOptions, WaylandSource};
         let mut options = WaylandOptions::new(self.restore_token.clone());
-        options.cancel = Some(cancel);
+        options.cancel = Some(cancel.clone());
         let (source, input) = WaylandSource::open(&options)?;
-        *self
-            .wayland_input
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(input);
+        // A session that ended while the open finished gets nothing kept: its
+        // source is dropped unread, and `session_ended` may have run already.
+        if !*cancel.borrow() {
+            *self
+                .wayland_input
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(input);
+        }
         Ok(Box::new(source))
     }
 
