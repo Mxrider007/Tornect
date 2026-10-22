@@ -23,7 +23,7 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
 6. The smoke tests below passed on the unpacked zips.
 7. The zips carry the licence texts and notices that the bundled dependencies require of a binary
    distribution: `LICENSE`, `THIRD_PARTY_NOTICES.md`, lyrebird's notice (`pt/lyrebird.txt`) and
-   `THIRD_PARTY_LICENSES.txt`, which `dist` generates per platform (step 2; met since `7f47bc0`,
+   `THIRD_PARTY_LICENSES.txt`, which `dist` generates per platform (step 2; met since `594711b`,
    `docs/VERIFICATION.md`, *Release tooling*).
 
 ## Steps
@@ -75,7 +75,7 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
      executable starts, its imports resolve and it accepts the bundled `lyrebird.exe`), and on a
      Windows machine when one is at hand. Under Wine the `--home` goes inside the Wine user's
      profile folder, `C:\users\<user>\…`, not under `target/tornect-test/` (which Wine sees as
-     `Z:\…`): since `cfa7237`, `tornect.exe` refuses a `--home` or `TORNECT_HOME` outside the profile
+     `Z:\…`): since `b09d919`, `tornect.exe` refuses a `--home` or `TORNECT_HOME` outside the profile
      folder that Windows names (review finding E2-2). From the unpacked zip, through Wine's `cmd`
      so that `%USERPROFILE%` names that folder:
      `wine cmd /v:on /c 'tornect.exe --home %USERPROFILE%\tornect-smoke-h1 id & echo exit !ERRORLEVEL!'`
