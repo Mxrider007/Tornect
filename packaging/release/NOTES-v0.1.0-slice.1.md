@@ -60,7 +60,7 @@ Tornect homes on that machine talked to each other over the real Tor network; no
   16:12): each time the windows were up and the hosts reachable over Tor, and no step was taken at the VM's
   screen. The fifth attempt (2026-09-24, 19:39–20:07) verified the first-run grant live (19:44:08), and the
   pairing crossed Tor (the host accepted at 19:43:57), but the client's 50 s code check ran out unanswered
-  (19:44:47), so the client pinned nothing; fixed since (`f8bc454`, `a30d02a`): the window's code check now stays
+  (19:44:47), so the client pinned nothing; fixed since (`a4887c2`, `f4bced7`): the window's code check now stays
   up for up to 10 minutes. Everything after the pairing (control, pointer and keys, Stop, view only, the keyboard
   answer) is **NOT PERFORMED**, paused pending a re-run. No input has crossed Tor in a live run, and no key has
   been injected live.
@@ -113,7 +113,7 @@ Advisories that `deny.toml` ignores, each with its reason:
 **RUSTSEC-2026-0285** (GHSA-2mjx-qc3c-rqvc) was found by the refresh of that database and fixed before this
 release: rustls 0.23.43 accepted TLS 1.3 handshake messages across a key change within one record (CVSS 3.1
 5.3). Tornect reached it through Arti's TLS client on every Tor channel, with no practical impact, since Tor
-authenticates relays in its own link handshake. rustls is now 0.23.45 (commit `b580203`).
+authenticates relays in its own link handshake. rustls is now 0.23.45 (commit `00bc286`).
 
 **Licences:** each zip carries `THIRD_PARTY_LICENSES.txt`, generated offline from the locally pinned sources:
 every crate built into the program with its version, licence and licence texts, the C libraries, the fonts, the
@@ -225,19 +225,19 @@ By the identifiers of the security reviews that found them.
 ## Security reviews
 
 The window, the viewer's input, the "Tornect: sharing" window, the Windows build, the packaging and start at
-login were reviewed in two ranges (`73e9314..3ca4094` and `3ca4094..176e9de`, threat modeling without a
+login were reviewed in two ranges (`0e3afea..2480dfb` and `2480dfb..75f6df8`, threat modeling without a
 refuter pass). Every fix since was checked against the finding it claims to close, and the release preparation
-was reviewed, up to commit `e0b7ae4`. No Critical or High finding; the three Mediums (a question answered by
+was reviewed, up to commit `bd8178a`. No Critical or High finding; the three Mediums (a question answered by
 keys typed for another program; a start-at-login host that served unattended sessions nobody saw; a failed task
 query read as "not registered") and RUSTSEC-2026-0285 are fixed; what is still open is listed above.
-The Wayland backend (`5ba8f11..73e9314`: the unsafe code that talks to PipeWire, the portal and grant handling,
+The Wayland backend (`d1ef55b..0e3afea`: the unsafe code that talks to PipeWire, the portal and grant handling,
 the idle ping and the fixes of that session) was reviewed on 2026-09-24 (slice G: two threat modelers and the
 Security parent, read-only, threat modeling without a refuter pass): 0 Critical, 0 High, 0 Medium; six Lows,
-fixed in `b116d43`, `af1ec8e`, `a5564e2`, `0189554`, `5ca1be9` with `235eff5`, and `e08e819`; one Info (G2-3,
+fixed in `717d77a`, `79a06b1`, `996e6db`, `4f12573`, `602d0f9` with `117fb34`, and `3379655`; one Info (G2-3,
 above). A closure check in three rounds verified all six fixes closed in code (a screen-size change on a real
 X11 desktop still needs one, as "Not verified" says) and found the later changes sound (the viewer's code
-question, `f8bc454`, and the host's report of a device it paired that then says nothing, `a30d02a`, which only
+question, `a4887c2`, and the host's report of a device it paired that then says nothing, `f4bced7`, which only
 relabels an outcome). It filed two new Infos, both fixed: N-2, the order in which owed key releases were sent
-(`3c0969e`), and R2-I1, a code-question message that could say "Paired" when nothing had been pinned (`0d4b884`,
-verified closed in the third round). The third round also read the documentation after `e0b7ae4` for its security
+(`339f785`), and R2-I1, a code-question message that could say "Paired" when nothing had been pinned (`a024c32`,
+verified closed in the third round). The third round also read the documentation after `bd8178a` for its security
 statements and found none false; nothing above Low is open.

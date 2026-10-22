@@ -35,7 +35,7 @@ its core crates at 0.100 on 2026-09-03 but not the `windows`/`windows-sys` umbre
   libc++ ⇒ `CXXSTDLIB_x86_64_pc_windows_gnullvm = "c++"` (`.cargo/config.toml` `[env]`).
 - `+crt-static` for the target (`.cargo/config.toml`): libunwind and libc++ link statically
   (llvm-mingw's `libc++.a` includes the ABI library), so `tornect.exe` needs no DLLs beside it.
-  **Corrected 2026-09-23 (decision M1-51, `b7ef5a9`):** not for libc++. The first link of the whole
+  **Corrected 2026-09-23 (decision M1-51, `818bb8a`):** not for libc++. The first link of the whole
   app imported `libc++.dll`, because `cc` emits `rustc-link-lib=c++`, a dylib request, and lld picks
   `libc++.dll.a`. Now `CXXSTDLIB_x86_64_pc_windows_gnullvm = ""` and `-C link-arg=-l:libc++.a` in the
   target's rustflags; `tornect.exe` imports only DLLs Windows ships. (Wine 10.0 and nasm 3.01 are on

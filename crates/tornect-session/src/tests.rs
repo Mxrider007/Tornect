@@ -908,7 +908,7 @@ async fn a_session_that_ends_while_its_source_opens_ends_the_open() {
 }
 
 /// Opens as `SystemBackend` does on Wayland, behind a gate that stands for the
-/// blocking pool's delay before the open's first line. (At `c514fdc` it made
+/// blocking pool's delay before the open's first line. (At `37a70e1` it made
 /// its cancel only past the gate, in an `opening` slot that `cancel_open`
 /// took, as `SystemBackend` did; that shape failed both tests below.)
 #[derive(Default)]
