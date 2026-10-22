@@ -470,6 +470,24 @@ fn on_key(
     false
 }
 
+/// A close request of the stream window: whether it ends the session.
+///
+/// While the keyboard is on the remote computer in a control session (not
+/// taken back with the chord, not paused, the picture in) and Alt is held,
+/// it is the Alt+F4 that Windows (winit hands no F4 key, and DefWindowProc
+/// turns it into a close) or the desktop (mutter takes the binding before
+/// the window sees F4) made a close of this window: F4 goes to the remote
+/// computer, where Alt already went, and the session stays. Every other
+/// close ends it, as do End session and, with the keyboard taken back
+/// (Ctrl+Alt+Shift+M, decision M1-70), Alt+F4 itself.
+fn on_close_request(chord: &keys::Chord, forwarder: &mut Forwarder, viewer: &ViewerState) -> bool {
+    if forwarder.takes_keys() && !viewer.keyboard_local && chord.alt_held() {
+        forwarder.send_combo(&[keys::F4]);
+        return false;
+    }
+    true
+}
+
 /// A pointer button of the stream window: a press that goes to the host
 /// also gives it the keyboard back. A press while the details or the Send
 /// keys menu are open only closes them: it goes nowhere, nor does its
@@ -1412,6 +1430,10 @@ impl App {
         let control = view.forwarder.is_open();
         match &event {
             WindowEvent::CloseRequested => {
+                if !on_close_request(&view.chord, &mut view.forwarder, &view.viewer) {
+                    self.send_input();
+                    return;
+                }
                 // Closing the window ends the session, with its goodbye.
                 self.command(Command::EndViewing);
                 self.close_stream();
@@ -2578,6 +2600,117 @@ mod tests {
         assert!(window.1.drain().is_empty());
     }
 
+    /// B10: Alt+F4 in a control session reaches the remote computer. Windows
+    /// and GNOME turn it into a close request of the stream window with Alt
+    /// held (winit hands the window no F4): that close sends F4 after the
+    /// Alt already sent and ends nothing. Before the fix every close request
+    /// sent End session.
+    #[test]
+    fn alt_f4_in_a_control_session_goes_to_the_remote_computer() {
+        for alt in [ALT, 0x07_00e6] {
+            let mut window = viewer(true);
+            type_keys(&mut window, &[press(alt)]);
+            let (chord, forwarder, state) = &mut window;
+            assert!(
+                !on_close_request(chord, forwarder, state),
+                "the session stays"
+            );
+            type_keys(&mut window, &[release(alt)]);
+            assert_eq!(
+                window.1.drain(),
+                vec![
+                    key(alt, true),
+                    key(keys::F4, true),
+                    key(keys::F4, false),
+                    key(alt, false),
+                ]
+            );
+        }
+    }
+
+    /// B10: every other close request still ends the session: no Alt held
+    /// (the title bar's close), Alt let go of or forgotten with the focus, the
+    /// keyboard taken back with the chord (Alt+F4 then closes, decision
+    /// M1-70), input paused, a view-only session, and a control session
+    /// before its first picture (Alt went nowhere either). None sends F4.
+    #[test]
+    fn every_other_close_request_ends_the_session() {
+        let no_alt = viewer(true);
+        let mut released = viewer(true);
+        type_keys(&mut released, &[press(ALT), release(ALT)]);
+        let mut unfocused = viewer(true);
+        type_keys(&mut unfocused, &[press(ALT)]);
+        on_focus_lost(&mut unfocused.0, &mut unfocused.1);
+        let mut taken_back = viewer(true);
+        type_keys(
+            &mut taken_back,
+            &[
+                press(CTRL),
+                press(ALT),
+                press(SHIFT),
+                press(KEY_M),
+                release(KEY_M),
+                release(SHIFT),
+                release(CTRL),
+            ],
+        );
+        assert!(taken_back.2.keyboard_local && taken_back.0.alt_held());
+        let mut paused = viewer(true);
+        type_keys(&mut paused, &[press(ALT)]);
+        paused.1.pause(true);
+        let mut view_only = viewer(false);
+        type_keys(&mut view_only, &[press(ALT)]);
+        let mut no_picture = viewer(true);
+        no_picture.1.set_picture(None);
+        type_keys(&mut no_picture, &[press(ALT)]);
+        for (case, mut window) in [
+            ("no Alt", no_alt),
+            ("Alt let go of", released),
+            ("focus lost", unfocused),
+            ("keyboard taken back", taken_back),
+            ("paused", paused),
+            ("view only", view_only),
+            ("no picture yet", no_picture),
+        ] {
+            window.1.drain();
+            let (chord, forwarder, state) = &mut window;
+            assert!(on_close_request(chord, forwarder, state), "{case}");
+            assert!(
+                !window.1.drain().contains(&key(keys::F4, true)),
+                "{case}: no F4"
+            );
+        }
+    }
+
+    /// B10: Send keys has Alt+F4, the sure way where the desktop takes the
+    /// binding before Alt reaches this window: Alt and F4 down, then up.
+    #[test]
+    fn send_keys_sends_alt_f4() {
+        let mut w = Window::new(true);
+        w.viewer.keys_menu = true;
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        assert!(!w.disabled("Alt+F4"));
+        let action = Action::Viewer(ViewerAction::SendKeys(Combo::AltF4));
+        assert_eq!(w.click(ms(100), "Alt+F4"), vec![action.clone()]);
+        let (_, mut forwarder, mut state) = viewer(true);
+        assert_eq!(
+            apply_viewer_action(&mut forwarder, &mut state, Some(&w.viewing), &action),
+            None
+        );
+        assert_eq!(
+            forwarder.drain(),
+            vec![
+                key(ALT, true),
+                key(keys::F4, true),
+                key(keys::F4, false),
+                key(ALT, false),
+            ]
+        );
+        assert!(Combo::ALL.contains(&Combo::AltF4));
+        assert_eq!(Combo::AltF4.label(), "Alt+F4");
+    }
+
     /// After the chord, keys go to this window and none to the host until
     /// the chord again, or a press on the picture, gives the keyboard back;
     /// the chord sends no key of its own either way.
@@ -2924,6 +3057,7 @@ mod tests {
             Action::Viewer(ViewerAction::SendKeys(Combo::AltTab)),
             Action::Viewer(ViewerAction::SendKeys(Combo::Super)),
             Action::Viewer(ViewerAction::SendKeys(Combo::PrintScreen)),
+            Action::Viewer(ViewerAction::SendKeys(Combo::AltF4)),
             Action::Viewer(ViewerAction::OneToOne(true)),
             Action::Viewer(ViewerAction::OneToOne(false)),
         ];
@@ -2978,6 +3112,7 @@ mod tests {
             Action::Viewer(ViewerAction::SendKeys(Combo::AltTab)),
             Action::Viewer(ViewerAction::SendKeys(Combo::Super)),
             Action::Viewer(ViewerAction::SendKeys(Combo::PrintScreen)),
+            Action::Viewer(ViewerAction::SendKeys(Combo::AltF4)),
             Action::Viewer(ViewerAction::Pause(true)),
         ] {
             let mut forwarder = Forwarder::new(true);
