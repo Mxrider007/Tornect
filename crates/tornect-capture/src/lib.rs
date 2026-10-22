@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 mod cursor;
 #[cfg(windows)]
 pub mod gdi;
+// GDI's way through a secure Windows screen; tested on every system.
+#[cfg(any(windows, test))]
+mod outage;
 pub mod synthetic;
 // The PipeWire structures are mirrored for LP64 only.
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
