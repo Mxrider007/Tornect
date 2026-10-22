@@ -56,14 +56,20 @@ pub(super) fn section(
 ) {
     let t = theme::tokens(ui.ctx());
     let stored = &model.settings.tor;
-    let (status, color) = super::super::home::tor_line(t, &model.tor);
+    let retry = super::super::home::retry_in(model, std::time::Instant::now());
+    let (status, color) =
+        super::super::home::tor_line(t, &model.tor, retry.filter(|_| !model.tor.is_ready()));
     widgets::card(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.label(
-            RichText::new(status)
-                .font(theme::font(ui.ctx(), Face::Semibold, 14.0))
-                .color(color),
+        ui.add(
+            egui::Label::new(
+                RichText::new(status)
+                    .font(theme::font(ui.ctx(), Face::Semibold, 14.0))
+                    .color(color),
+            )
+            .wrap(),
         );
+        super::super::home::retry_button(ui, model, actions);
     });
     ui.add_space(16.0);
     widgets::section_header(ui, "How to reach Tor");

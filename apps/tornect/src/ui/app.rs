@@ -1347,6 +1347,7 @@ impl App {
             Action::ConfirmSetupChanged(id) => self.command(Command::ConfirmSetupChanged(id)),
             Action::CloseWindow => self.leave = true,
             Action::DeviceWords(key) => self.command(Command::DeviceWords(key)),
+            Action::RetryTor => self.command(Command::RetryTor),
         }
     }
 

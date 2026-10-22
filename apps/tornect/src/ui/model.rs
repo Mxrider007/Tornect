@@ -102,6 +102,11 @@ pub struct Model {
     pub tor: TorState,
     /// Whether this machine answers requests.
     pub hosting: Hosting,
+    /// When Tornect tries again by itself, after Tor did not start or this
+    /// computer's ID could not be published or stopped being served (B02):
+    /// Home and Settings, Connection count down to it and offer Try again.
+    /// `None` while nothing waits for a try.
+    pub tor_retry: Option<Instant>,
     /// The first-run desktop grant, on a Wayland desktop this machine shares.
     pub setup: Option<Setup>,
     /// The host's consent and pairing popups, oldest first.
@@ -315,6 +320,20 @@ pub enum RotateFailed {
     NothingChanged,
 }
 
+/// `wait`, as the window says it: seconds below a minute and a half,
+/// whole minutes (rounded up) from there.
+#[must_use]
+pub fn wait_in_words(wait: Duration) -> String {
+    let secs = wait
+        .as_secs()
+        .saturating_add(u64::from(wait.subsec_nanos() > 0));
+    if secs < 90 {
+        format!("{secs} s")
+    } else {
+        format!("{} min", secs.div_ceil(60))
+    }
+}
+
 /// The connection to the Tor network.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum TorState {
@@ -344,7 +363,8 @@ pub enum TorState {
         /// The transport.
         via: &'static str,
     },
-    /// No way in worked.
+    /// No way in worked: what to check, in plain words (no command, no file
+    /// name; why each way failed is in the recent activity).
     Failed(String),
 }
 
