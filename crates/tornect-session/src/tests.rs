@@ -41,6 +41,9 @@ const KEY_A: u32 = 0x07_0004;
 struct Card {
     inner: TestCard,
     closed: Arc<AtomicBool>,
+    /// While set, the card has no new picture, as GDI has none while a
+    /// secure Windows screen shows: it waits the timeout and says so.
+    stalled: Arc<AtomicBool>,
 }
 
 impl VideoSource for Card {
@@ -49,6 +52,10 @@ impl VideoSource for Card {
     }
 
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+        if self.stalled.load(Ordering::SeqCst) {
+            std::thread::sleep(timeout);
+            return Ok(None);
+        }
         self.inner.next_frame(timeout)
     }
 }
@@ -91,6 +98,8 @@ struct TestBackend {
     open_waits: bool,
     /// An open ended because its cancel turned `true`.
     cancelled: AtomicBool,
+    /// Holds the source's pictures back while set ([`Card::stalled`]).
+    stalled: Arc<AtomicBool>,
 }
 
 /// The desktop's dialog: up until `cancel` turns `true` (then `true`), or for
@@ -124,6 +133,7 @@ impl MediaBackend for TestBackend {
             // Faster than the encoder's 15 fps, so the encoder sets the pace.
             inner: TestCard::new(256, 96, 60),
             closed: Arc::clone(&self.closed),
+            stalled: Arc::clone(&self.stalled),
         }))
     }
 
@@ -1331,6 +1341,51 @@ async fn a_keyframe_request_forces_an_idr_at_a_bounded_rate() {
         panic!("not served");
     };
     assert_eq!((report.keyframe_requests, report.keyframes_forced), (2, 1));
+}
+
+/// A source with no new picture for a while (GDI while a secure Windows
+/// screen shows) leaves the session up: the host still answers, a
+/// `KeyframeRequest` made meanwhile is kept, and the first picture after the
+/// pause is that keyframe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_with_no_picture_for_a_while_keeps_the_session() {
+    let rig = rig(MediaLimits::default());
+    let (_, binding) = start(&rig.host, 12, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    let (seq, _) = next_video(&mut client).await;
+    write_msg(&mut client, &Msg::VideoAck { seq })
+        .await
+        .unwrap();
+    rig.backend.stalled.store(true, Ordering::SeqCst);
+    // A picture already on its way may still come; then nothing does.
+    loop {
+        match tokio::time::timeout(Duration::from_millis(500), read_msg(&mut client)).await {
+            Err(_) => break,
+            Ok(Ok(Some(Msg::Video { seq, .. }))) => write_msg(&mut client, &Msg::VideoAck { seq })
+                .await
+                .unwrap(),
+            Ok(other) => panic!("during the pause: {other:?}"),
+        }
+    }
+    write_msg(&mut client, &Msg::KeyframeRequest).await.unwrap();
+    for nonce in 1..=3 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sync(&mut client, nonce).await;
+    }
+    rig.backend.stalled.store(false, Ordering::SeqCst);
+    let (_, flags) = next_video(&mut client).await;
+    assert_ne!(
+        flags & video_flags::KEYFRAME,
+        0,
+        "the picture after the pause"
+    );
+    drop(client);
+    let MediaOutcome::Served { report, end, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!(end, MediaEnd::ViewerLeft);
+    assert_eq!((report.keyframe_requests, report.keyframes_forced), (1, 1));
 }
 
 /// The first frame is read at a `Bind`'s size: a peer announcing 8 MiB gets a

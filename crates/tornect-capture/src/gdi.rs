@@ -10,8 +10,12 @@
 //! handles are raw pointers (not `Send`), and a capture that owns none across
 //! calls can move between threads freely.
 //!
-//! Limits (Windows by design): the secure desktop (UAC prompt, lock screen)
-//! cannot be captured from a user-session process.
+//! Limits (Windows by design): the secure desktop (UAC prompt, Ctrl+Alt+Del,
+//! lock screen) cannot be captured from a user-session process. A grab that
+//! fails then is waited out (`outage.rs`): `next_frame` says there is no
+//! new picture, the viewer keeps the last one (in a control session the
+//! host's secure-screen notice tells it why), and capture ends only when the
+//! screen stays unreadable for a minute.
 #![allow(unsafe_code)]
 
 use std::ptr::null_mut;
@@ -32,12 +36,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SM_YVIRTUALSCREEN,
 };
 
+use crate::outage::Outage;
 use crate::{CaptureError, Frame, VideoSource};
 
 /// Grabs the virtual desktop of this user session.
 #[derive(Debug, Default)]
 pub struct GdiCapture {
-    _private: (),
+    /// The spell of failed grabs under way, if any.
+    outage: Outage,
 }
 
 static DPI_AWARE: Once = Once::new();
@@ -243,9 +249,11 @@ impl VideoSource for GdiCapture {
         "gdi"
     }
 
-    /// Polls: every call copies the whole virtual desktop.
-    fn next_frame(&mut self, _timeout: Duration) -> Result<Option<Frame>, CaptureError> {
-        grab().map(Some)
+    /// Polls: every call copies the whole virtual desktop. A copy that fails
+    /// (a secure screen shows) waits `timeout` and answers `Ok(None)`, for up
+    /// to a minute in a row.
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+        self.outage.poll(timeout, grab)
     }
 }
 
