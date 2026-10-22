@@ -71,8 +71,9 @@ its core crates at 0.100 on 2026-09-03 but not the `windows`/`windows-sys` umbre
   .rate_control_mode(Bitrate).skip_frames(false).intra_frame_period(0).complexity(Low)
   .vui(VuiConfig::bt601())` — **BT.601**, because the crate's RGB↔YUV converters are BT.601
   limited range (codecs.md §3.2's `bt709()` would mis-tag the colours).
-- Input: tightly packed rows, **even** width and height, ≤ 3840×2160 (`tornect-codec` crops
-  an odd edge). `YUVBuffer::from_bgra8_source(BgraSliceU8::new(..))` takes BGRx directly.
+- Input: tightly packed rows, **even** width and height, ≤ 3840×2160 wide or ≤ 2160×3840
+  upright (the crate's `Encoder::reinit` refuses only a long side over 3840 or a short side
+  over 2160; `tornect-codec` crops an odd edge and clamps in the picture's own orientation). `YUVBuffer::from_bgra8_source(BgraSliceU8::new(..))` takes BGRx directly.
 - `force_intra_frame()` → next AU is an IDR. Decoder: `Decoder::new()?.decode(au)? →
   write_rgba8`; no decoder threads (unsafe API).
 - Licence: bindings + Cisco source BSD-2-Clause. Cisco's patent coverage applies only to its
