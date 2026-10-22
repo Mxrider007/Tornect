@@ -1227,6 +1227,7 @@ mod tests {
             paired_now: false,
             failed: None,
             unattended: true,
+            went_live: false,
         };
         model.client = ClientStage::Checking;
         let window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
@@ -1766,6 +1767,7 @@ mod tests {
             paired_now: true,
             failed,
             unattended: false,
+            went_live: false,
         };
         let steps = [
             "Reaching the computer over Tor",
@@ -1864,6 +1866,59 @@ mod tests {
         let window = Window::new(live, Page::Home, egui::Theme::Dark, WIDE);
         assert!(!has_text(&window, "Desk"));
         assert!(has_text(&window, "(Control · administrator)"));
+    }
+
+    /// B25: a dial cancelled before its session, or one that ended early
+    /// with nothing classified, never reads as a session that ran: no "The
+    /// session ended" and no step ticked past where it stopped; a cancel
+    /// says "Cancelled". Only a dial that went live and ended reads "The
+    /// session ended" with every step done.
+    #[test]
+    fn a_cancelled_dial_is_not_a_session_that_ended() {
+        use super::super::model::{ClientStage, Dial, Failure};
+        let id = TornectId::from_bytes([0x42; 32]);
+        let dial = |failed, went_live| Dial {
+            id: Some(id),
+            since: Some(Instant::now()),
+            paired_now: true,
+            failed,
+            unattended: false,
+            went_live,
+        };
+        let ticked = |window: &Window| -> Vec<u8> {
+            (1..=4)
+                .filter(|n| has_text(window, &format!("✓ {n}")))
+                .collect()
+        };
+        for (failed, words, done) in [
+            (Some((Failure::Cancelled, 1)), "Cancelled.", vec![]),
+            (
+                Some((Failure::Cancelled, 3)),
+                "Cancelled before the session started.",
+                vec![1, 2],
+            ),
+            (None, "Cancelled.", vec![]),
+        ] {
+            let mut model = at_rest();
+            model.client = ClientStage::Ended(words.to_owned());
+            model.dial = dial(failed, false);
+            let mut window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+            assert!(!has_text(&window, "The session ended"), "{failed:?}");
+            assert!(has_text(&window, "Not connected"), "{failed:?}");
+            assert_eq!(ticked(&window), done, "{failed:?}");
+            if failed.is_some() {
+                assert!(has_text(&window, Failure::Cancelled.title()));
+                assert!(has_text(&window, Failure::Cancelled.advice()));
+            }
+            let again = window.center("Try again");
+            assert_eq!(window.click(again), vec![Action::Connect(id)]);
+        }
+        let mut ended = at_rest();
+        ended.client = ClientStage::Ended("Session with \"Desk\" ended (by you).".to_owned());
+        ended.dial = dial(None, true);
+        let window = Window::new(ended, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(&window, "The session ended"));
+        assert_eq!(ticked(&window), vec![1, 2, 3, 4]);
     }
 
     /// The first run says once that no recent list is kept unless history

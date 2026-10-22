@@ -10,7 +10,7 @@ use egui::{Align, Layout, Margin, RichText, Stroke, Ui, vec2};
 use tornect_core::TornectId;
 
 use super::super::icons::{self, Icon};
-use super::super::model::{ClientStage, Computer, Hosting, Model, Setup, TorState};
+use super::super::model::{ClientStage, Computer, Failure, Hosting, Model, Setup, TorState};
 use super::super::nav::Page;
 use super::super::theme::{self, Face, Tokens};
 use super::super::view::{Action, Form, SAS_SIZE};
@@ -866,24 +866,32 @@ fn connect_stepper(
 ) {
     let dial = &model.dial;
     let stage = &model.client;
-    // The step the connection is on (1 ..= 4), and 5 once it is live.
+    let over = matches!(stage, ClientStage::Ended(_));
+    // The step the connection is on (1 ..= 4), and 5 once it is live. An
+    // end that names no failure is a session's end only when one went live;
+    // otherwise no step is shown as done (B25).
     let at = match stage {
         ClientStage::Idle | ClientStage::Reaching { .. } => 1,
         ClientStage::Pairing { .. } | ClientStage::Checking => 2,
         ClientStage::Asking => 3,
         ClientStage::Live(_) => 5,
-        ClientStage::Ended(_) => dial.failed.map_or(5, |(_, step)| step),
+        ClientStage::Ended(_) => match dial.failed {
+            Some((_, step)) => step,
+            None if dial.went_live => 5,
+            None => 0,
+        },
     };
     let failed = match stage {
         ClientStage::Ended(_) => dial.failed,
         _ => None,
     };
+    let cancelled = failed.is_some_and(|(why, _)| why == Failure::Cancelled);
     ui.horizontal(|ui| {
         widgets::section_header(
             ui,
             match stage {
                 ClientStage::Live(_) => "Connected",
-                ClientStage::Ended(_) if failed.is_none() => "The session ended",
+                ClientStage::Ended(_) if failed.is_none() && dial.went_live => "The session ended",
                 ClientStage::Ended(_) => "Not connected",
                 _ => "Connecting to a computer",
             },
@@ -960,14 +968,21 @@ fn connect_stepper(
         attended_steps
     };
     // While the password is checked the computer's own checks may already
-    // run: both steps show as under way.
-    let active = |n: u8| n == at || (dial.unattended && at == 2 && n == 3);
+    // run: both steps show as under way. Nothing is under way once over.
+    let active = |n: u8| !over && (n == at || (dial.unattended && at == 2 && n == 3));
     for (n, (title, note)) in (1u8..).zip(steps) {
         let (mark, color) = if failed.is_some_and(|(_, step)| step == n) {
-            ("✕", t.danger_text)
+            (
+                "✕",
+                if cancelled {
+                    t.text_muted
+                } else {
+                    t.danger_text
+                },
+            )
         } else if n < at || (n == 2 && at > 2 && !dial.paired_now && !dial.unattended) {
             ("✓", t.ok)
-        } else if active(n) && failed.is_none() {
+        } else if active(n) {
             ("…", t.accent_text)
         } else {
             ("·", t.text_muted)
@@ -989,7 +1004,7 @@ fn connect_stepper(
                         .font(theme::font(ui.ctx(), Face::Regular, 12.0))
                         .color(t.text_muted),
                 );
-                if active(n) && failed.is_none() {
+                if active(n) {
                     match stage {
                         ClientStage::Pairing { sas } => {
                             ui.label("The computer shows a code too. The question above asks whether they match:");
@@ -1083,7 +1098,11 @@ fn connect_stepper(
                 ui.label(
                     RichText::new(failure.title())
                         .font(theme::font(ui.ctx(), Face::Semibold, 15.0))
-                        .color(t.danger_text),
+                        .color(if cancelled {
+                            t.text_primary
+                        } else {
+                            t.danger_text
+                        }),
                 );
                 ui.add(
                     egui::Label::new(RichText::new(failure.advice()).color(t.text_secondary))
