@@ -443,6 +443,13 @@ impl Forwarder {
         self.open && !self.paused
     }
 
+    /// Whether a key pressed now goes to the host: input goes out, and the
+    /// first picture is in (before it, [`key`](Self::key) sends no press).
+    #[must_use]
+    pub fn takes_keys(&self) -> bool {
+        self.sends() && self.picture.is_some()
+    }
+
     /// Where the picture was drawn last (none before the first picture),
     /// all of it on screen and nothing over it.
     pub fn set_picture(&mut self, picture: Option<PictureRect>) {
@@ -857,6 +864,7 @@ mod tests {
             [
                 vec!["ControlLeft", "AltLeft", "Delete"],
                 vec!["AltLeft", "Tab"],
+                vec!["AltLeft", "F4"],
                 vec!["MetaLeft"],
                 vec!["PrintScreen"],
             ]

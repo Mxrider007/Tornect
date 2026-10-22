@@ -166,7 +166,18 @@ impl Chord {
             .iter()
             .all(|pair| pair.iter().any(|usb| self.held.contains(usb)))
     }
+
+    /// Whether an Alt key, either side, is held: a close request that comes
+    /// meanwhile is the desktop's or Windows' Alt+F4, whose F4 the window
+    /// never sees as a key.
+    #[must_use]
+    pub fn alt_held(&self) -> bool {
+        ALT.iter().any(|usb| self.held.contains(usb))
+    }
 }
+
+/// F4's USB usage: the key of an Alt+F4 that a close request stands for.
+pub const F4: u32 = 0x07_003d;
 
 /// Where a key event of the stream window goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -64,6 +64,13 @@ its core crates at 0.100 on 2026-09-03 but not the `windows`/`windows-sys` umbre
   async (pollster); `paint_and_update_textures(viewport, ppp, clear, &prims, &mut delta, vec![], &window)`.
 - Limits: no keyboard-shortcuts-inhibit on Wayland (GNOME keeps Super, Alt+Tab); on Windows
   the shell keeps Win, Alt+Tab, Ctrl+Alt+Del.
+- Alt+F4 never arrives as a key: winit 0.30 drops `WM_SYSKEYDOWN` `VK_F4` and DefWindowProc
+  turns it into `SC_CLOSE` → `WM_CLOSE` → `CloseRequested`; mutter takes the binding and sends
+  the window a close. Only the Alt press arrives. So the stream window reads a close request
+  that comes with Alt held, in a control session whose keyboard is on the remote computer (not
+  taken back with Ctrl+Alt+Shift+M, not paused), as Alt+F4: it sends F4 to the host and keeps
+  the session (audit finding B10). Every other close ends the session, as does End session.
+  Send keys has Alt+F4 too: the sure way, whatever a desktop does with the keys themselves.
 
 ## 3. Codec (openh264 0.9.8)
 

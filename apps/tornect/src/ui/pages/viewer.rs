@@ -134,13 +134,18 @@ pub enum Combo {
     Super,
     /// Print Screen.
     PrintScreen,
+    /// Alt+F4: the sure way to send it, whatever this computer's desktop
+    /// does with the keys themselves (a close request that comes with Alt
+    /// held sends F4 too, `app::on_close_request`).
+    AltF4,
 }
 
 impl Combo {
     /// The menu's items, in order.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::CtrlAltDel,
         Self::AltTab,
+        Self::AltF4,
         Self::Super,
         Self::PrintScreen,
     ];
@@ -154,6 +159,7 @@ impl Combo {
             Self::AltTab => &[0x07_00e2, 0x07_002b],
             Self::Super => &[0x07_00e3],
             Self::PrintScreen => &[0x07_0046],
+            Self::AltF4 => &[0x07_00e2, 0x07_003d],
         }
     }
 
@@ -165,6 +171,7 @@ impl Combo {
             Self::AltTab => "Alt+Tab",
             Self::Super => "Super (Windows key)",
             Self::PrintScreen => "Print Screen",
+            Self::AltF4 => "Alt+F4",
         }
     }
 }
@@ -1528,6 +1535,7 @@ mod tests {
             "Send keys",
             "Ctrl+Alt+Del",
             "Alt+Tab",
+            "Alt+F4",
             "Super (Windows key)",
             "Print Screen",
         ] {
