@@ -53,6 +53,9 @@ wgpu = { workspace = true, features = ["dx12"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+# Paused-clock runtimes (`start_paused`) in the host and terminal tests; without
+# it `cargo test -p tornect` alone does not compile (feature unification hid it).
+tokio = { workspace = true, features = ["test-util"] }
 # A capturing subscriber: no device words in any trace (§B.6.1 W-B4).
 tracing-subscriber.workspace = true
 ed25519-dalek.workspace = true
