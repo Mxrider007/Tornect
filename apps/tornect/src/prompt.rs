@@ -911,6 +911,49 @@ mod tests {
         );
     }
 
+    /// B04 review: a requester that leaves now withdraws its question (the
+    /// host FSM drops the consent future), at a moment the requester
+    /// chooses. The terminal says that request closed before the question
+    /// queued behind it shows, and a line typed for the withdrawn question
+    /// does not answer the next one.
+    #[tokio::test(start_paused = true)]
+    async fn a_question_withdrawn_by_its_requester_never_takes_the_next_answer() {
+        let (prompter, tx) = Prompter::scripted();
+        let consent = Arc::new(CliConsent::new(Arc::clone(&prompter)));
+        let ask = |label: &str, seed: u8| {
+            let consent = Arc::clone(&consent);
+            let peer = TrustedPeer {
+                device: tornect_core::DeviceIdentity::from_seed(&[seed; 32]).id(),
+                label: label.to_owned(),
+            };
+            tokio::spawn(async move {
+                let summary = SessionRequestSummary {
+                    caps: tornect_signal::messages::Caps::default(),
+                };
+                consent.session(&peer, &summary).await
+            })
+        };
+        let first = ask("A", 7);
+        tokio::task::yield_now().await;
+        let second = ask("B", 8);
+        tokio::task::yield_now().await;
+        // A's requester leaves: the FSM drops A's question.
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        tx.send("a".to_owned()).await.unwrap();
+        tokio::time::sleep(ARM_AFTER).await;
+        assert!(!second.is_finished(), "the early line did not answer B");
+        tx.send("v".to_owned()).await.unwrap();
+        assert_eq!(second.await.unwrap(), SessionDecision::AllowOnceViewOnly);
+        let shown = prompter.shown();
+        assert_eq!(shown.len(), 4, "{shown:?}");
+        assert!(shown[0].contains("\"A\""), "{shown:?}");
+        assert_eq!(shown[1], closed_line("A"));
+        assert!(shown[2].contains("\"B\""), "{shown:?}");
+        assert_eq!(shown[3], TOO_SOON);
+    }
+
     /// The terminal asks only when both stdin and stderr are a terminal:
     /// with stderr redirected to a file or a log, nothing is asked there.
     #[test]
