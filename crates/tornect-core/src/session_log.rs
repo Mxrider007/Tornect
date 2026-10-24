@@ -1079,6 +1079,24 @@ impl SessionLog {
         epoch: Option<&[u8; 32]>,
     ) -> Result<ChainReport> {
         let key = self.chain.lock().key.clone();
+        self.walk(key.as_deref(), head, epoch)
+    }
+
+    /// [`Self::verify_chain`] without a key, a head or a key epoch, whatever key the
+    /// handle holds: the `prev` links, the front and torn lines are checked, no tag
+    /// is. What can be checked where the store that keeps the head and the epoch
+    /// could not be read: a key without its epoch would judge lines tagged under a
+    /// wiped key as forged.
+    pub fn verify_links(&self) -> Result<ChainReport> {
+        self.walk(None, None, None)
+    }
+
+    fn walk(
+        &self,
+        key: Option<&[u8; 32]>,
+        head: Option<&[u8; 32]>,
+        epoch: Option<&[u8; 32]>,
+    ) -> Result<ChainReport> {
         let mut files: Vec<PathBuf> = (1..=ROTATE_KEEP)
             .rev()
             .map(|n| self.rotated_path(n))
@@ -1172,7 +1190,7 @@ impl SessionLog {
                                 "prev link does not match the previous line",
                             ));
                         }
-                        match (&key, chain.tag) {
+                        match (key, chain.tag) {
                             (Some(k), Some(tag)) => {
                                 let expected = line_tag(k, &chain.without_tag);
                                 let verifies = bool::from(subtle::ConstantTimeEq::ct_eq(

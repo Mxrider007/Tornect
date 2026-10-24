@@ -1304,13 +1304,20 @@ impl GrantStore {
     /// The §B.8.13 startup verifier: walks the chain against the stored head and the
     /// store's key epoch (lines tagged under a wiped key are prev-linked only); validly
     /// tagged lines beyond the head are accepted and the head advanced (runtime write).
+    /// A store that is not loaded has no head and no epoch to give, so the log's links
+    /// alone are checked ([`SessionLog::verify_links`]), never its tags: one that failed
+    /// closed may still hold `K_log`, and without the epoch every line tagged under an
+    /// earlier key (before a *Rotate ID* or a store reset) would read as forged.
     pub fn verify_log(&self) -> Result<ChainReport, StoreError> {
         let mut st = self.inner.state.lock();
-        let (head, epoch) = st
-            .store
-            .as_ref()
-            .map_or((None, None), |s| (s.chain_head(), s.log_chain_epoch));
-        let report = self.inner.log.verify_chain(head.as_ref(), epoch.as_ref())?;
+        let report = match (&st.status, st.store.as_ref()) {
+            (StoreStatus::Loaded, Some(s)) => {
+                let (head, epoch) = (s.chain_head(), s.log_chain_epoch);
+                self.inner.log.verify_chain(head.as_ref(), epoch.as_ref())?
+            }
+            _ => self.inner.log.verify_links()?,
+        };
+        let head = st.store.as_ref().and_then(UnattendedStore::chain_head);
         if st.status == StoreStatus::Loaded
             && let Some(last) = report.last_hash
             && matches!(report.status, ChainStatus::Valid | ChainStatus::MissingHead)

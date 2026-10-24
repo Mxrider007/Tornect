@@ -505,13 +505,7 @@ fn check_log(
     store: &tornect_core::unattended::store::GrantStore,
 ) -> tornect_core::unattended::readiness::Probe {
     use tornect_core::unattended::readiness::{Probe, session_log_row};
-    use tornect_core::unattended::store::StoreStatus;
-    // A store loaded, or one that exists but could not be read, keeps a head.
-    let head_expected = matches!(
-        store.status(),
-        StoreStatus::Loaded | StoreStatus::FailedClosed(_)
-    );
-    let row = session_log_row(&store.verify_log(), head_expected);
+    let row = session_log_row(&store.verify_log(), &store.status());
     if let Probe::Fail(why) | Probe::Warn(why) = &row {
         tracing::warn!(%why, "sessions.log");
         eprintln!("warning: sessions.log: {why}");

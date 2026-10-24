@@ -283,32 +283,38 @@ impl<'b, C> minicbor::Decode<'b, C> for ReadinessSnapshot {
 }
 
 /// The row "Session log intact" from the start-up verifier's answer
-/// ([`GrantStore::verify_log`](super::store::GrantStore::verify_log), §B.8.13).
-/// A broken chain fails ("log modified or truncated at line N", the file named
-/// when the break is inside one); a valid chain without a stored head warns
-/// where a store exists to keep one (`head_expected`: loaded, or failed closed
-/// and so unread) and is fine where none does (an attended-only host keeps no
-/// head); a log that could not be read warns.
+/// ([`GrantStore::verify_log`](super::store::GrantStore::verify_log), §B.8.13)
+/// over a store in `status`. A broken chain fails ("log modified or truncated
+/// at line N", the file named when the break is inside one); a log that could
+/// not be read warns. A chain whose links hold is fine where no store keeps a
+/// head (an attended-only host); a loaded store without a stored head warns;
+/// a store that exists but could not be read warns too, since only the links
+/// were checked then, not the tags or the end.
 #[must_use]
 pub fn session_log_row(
     verdict: &Result<crate::session_log::ChainReport, super::store::StoreError>,
-    head_expected: bool,
+    status: &super::store::StoreStatus,
 ) -> Probe {
+    use super::store::StoreStatus;
     use crate::session_log::ChainStatus;
     match verdict {
-        Ok(report) => match &report.status {
-            ChainStatus::Valid => Probe::Ok,
-            ChainStatus::MissingHead if head_expected => Probe::Warn(
+        Ok(report) => match (&report.status, status) {
+            (ChainStatus::Broken { file, line, reason }, _) if file.is_empty() => Probe::Fail(
+                format!("log modified or truncated at line {line}: {reason}"),
+            ),
+            (ChainStatus::Broken { file, line, reason }, _) => Probe::Fail(format!(
+                "log modified or truncated at line {line} of {file}: {reason}"
+            )),
+            (_, StoreStatus::FailedClosed(_)) => Probe::Warn(
+                "the unattended store could not be read, so only the log's links were \
+                 checked, not its tags or its end"
+                    .to_owned(),
+            ),
+            (ChainStatus::MissingHead, StoreStatus::Loaded) => Probe::Warn(
                 "the log's links hold, but no stored head was there to check its end against"
                     .to_owned(),
             ),
-            ChainStatus::MissingHead => Probe::Ok,
-            ChainStatus::Broken { file, line, reason } if file.is_empty() => Probe::Fail(format!(
-                "log modified or truncated at line {line}: {reason}"
-            )),
-            ChainStatus::Broken { file, line, reason } => Probe::Fail(format!(
-                "log modified or truncated at line {line} of {file}: {reason}"
-            )),
+            (ChainStatus::Valid | ChainStatus::MissingHead, _) => Probe::Ok,
         },
         Err(e) => Probe::Warn(format!("the log could not be checked: {e}")),
     }
@@ -429,7 +435,11 @@ mod tests {
     /// only: a broken chain names the line, never `HOST_NOT_READY`.
     #[test]
     fn the_session_log_row_says_where_the_log_broke() {
+        use super::super::codec::StoreLoadError;
+        use super::super::store::StoreStatus;
         use crate::session_log::{ChainReport, ChainStatus};
+        let (loaded, none) = (StoreStatus::Loaded, StoreStatus::AttendedOnly);
+        let unread = StoreStatus::FailedClosed(StoreLoadError::BadTag);
         let report = |status| ChainReport {
             status,
             lines: 9,
@@ -439,38 +449,49 @@ mod tests {
             torn_lines: 0,
         };
         assert_eq!(
-            session_log_row(&Ok(report(ChainStatus::Valid)), true),
+            session_log_row(&Ok(report(ChainStatus::Valid)), &loaded),
             Probe::Ok
         );
         assert!(matches!(
-            session_log_row(&Ok(report(ChainStatus::MissingHead)), true),
+            session_log_row(&Ok(report(ChainStatus::MissingHead)), &loaded),
             Probe::Warn(_)
         ));
         assert_eq!(
-            session_log_row(&Ok(report(ChainStatus::MissingHead)), false),
+            session_log_row(&Ok(report(ChainStatus::MissingHead)), &none),
             Probe::Ok,
             "an attended-only host keeps no head"
         );
+        // A store that could not be read gave no head, no epoch and no key: the
+        // links alone were checked, which is said, whatever they came to.
+        for status in [ChainStatus::Valid, ChainStatus::MissingHead] {
+            match session_log_row(&Ok(report(status)), &unread) {
+                Probe::Warn(why) => assert!(why.contains("only the log's links"), "{why}"),
+                other => panic!("{other:?}"),
+            }
+        }
         let broken = ChainStatus::Broken {
             file: "sessions.log".into(),
             line: 7,
             reason: "prev link does not match the previous line".into(),
         };
-        assert_eq!(
-            session_log_row(&Ok(report(broken)), false),
-            Probe::Fail(
-                "log modified or truncated at line 7 of sessions.log: prev link does not \
-                 match the previous line"
-                    .into()
-            )
-        );
+        for status in [&none, &loaded, &unread] {
+            assert_eq!(
+                session_log_row(&Ok(report(broken.clone())), status),
+                Probe::Fail(
+                    "log modified or truncated at line 7 of sessions.log: prev link does not \
+                     match the previous line"
+                        .into()
+                ),
+                "a broken link fails, read store or not: {status:?}"
+            );
+        }
         let cut = ChainStatus::Broken {
             file: String::new(),
             line: 9,
             reason: "stored head matches no line (truncated log)".into(),
         };
         assert_eq!(
-            session_log_row(&Ok(report(cut)), true),
+            session_log_row(&Ok(report(cut)), &loaded),
             Probe::Fail(
                 "log modified or truncated at line 9: stored head matches no line (truncated log)"
                     .into()
@@ -479,7 +500,7 @@ mod tests {
         assert!(matches!(
             session_log_row(
                 &Err(super::super::store::StoreError::Invalid("x".into())),
-                true
+                &loaded
             ),
             Probe::Warn(_)
         ));
