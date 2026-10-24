@@ -45,6 +45,10 @@ pub enum SessionEvent {
     PairAccepted,
     /// The user rejected a pairing.
     PairRejected,
+    /// A paired device was removed on this host (*Remove device*; `by`, the
+    /// peer and its pinned label): it pairs again, comparing a code, before
+    /// another session.
+    DeviceUnpaired,
     /// A paired device asked for a session.
     SessionRequested,
     /// A session began streaming.
@@ -1409,7 +1413,8 @@ mod tests {
     /// §B.8.13 (r7): a `session_started` line carries `elevation` only for an
     /// administrator session, so a line at none is the line it always was;
     /// the helper's three events have their names (M-UI-3 Security F-16).
-    /// So do the two of `tornect install` and `uninstall` (§B.1.1).
+    /// So do the two of `tornect install` and `uninstall` (§B.1.1), and the
+    /// removal of a paired device.
     #[test]
     fn the_level_and_the_helper_events_reach_the_log() {
         use crate::levels::Elevation;
@@ -1435,6 +1440,7 @@ mod tests {
             (SessionEvent::AdminHelperFailed, "admin_helper_failed"),
             (SessionEvent::Installed, "installed"),
             (SessionEvent::Uninstalled, "uninstalled"),
+            (SessionEvent::DeviceUnpaired, "device_unpaired"),
         ] {
             let line = serde_json::to_string(&SessionRecord::at(0, event).reason("late")).unwrap();
             assert!(line.contains(&format!(r#""event":"{name}""#)), "{line}");

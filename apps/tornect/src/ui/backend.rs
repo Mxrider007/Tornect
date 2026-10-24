@@ -461,6 +461,9 @@ struct ManagerWatch {
     words: Arc<super::recognize::Recognizer>,
     /// The host's own paired devices, from which *Remove device* removes one.
     trusted: Arc<tornect_signal::pairing::TrustedDeviceStore>,
+    /// The host's live sessions: *Remove device* ends one of the removed
+    /// device, attended ones included (the guard ends its unattended ones).
+    live: Arc<LiveSessions>,
     /// The window is closing: a stop code that arrives now is not shown,
     /// and access is turned off again. Held while a code is put into the
     /// model and while the closing window takes it back, so that one of the
@@ -592,9 +595,17 @@ const ANOTHER_ASKS: &str =
 /// and a pause is never ended sooner from there.
 const PAUSE_RUNS: &str = "Not done: a pause is running already.";
 
-/// Why *Remove device* left the pairing: its unattended access is gone, but
-/// the paired devices could not be written.
-const PAIRING_KEPT: &str = "Unattended access was removed, but the pairing could not be removed.";
+/// Why *Remove device* left the pairing: its unattended access, if it had
+/// any, is gone, but the paired devices could not be written.
+const PAIRING_KEPT: &str = "The pairing could not be removed: the list of paired devices could \
+    not be written. Unattended access, if the device had it, was removed.";
+
+/// Why *Remove device* changed nothing: unattended access's store did not
+/// load, so a grant the device may have cannot be removed before its pairing
+/// (decision M1-25: never a grant for an unpaired device, which would come
+/// back with a later pairing).
+const STORE_CLOSED: &str = "Not done: unattended access's store could not be read, so this \
+    device's unattended access cannot be removed first. Nothing was changed.";
 
 /// Whether the section's operation `op` asks for this computer's password:
 /// one dialog at a time, so such an operation waits for none other and
@@ -938,6 +949,9 @@ impl ManagerWatch {
             other => other,
         };
         let asks = asks_password(&op);
+        // Remove device is also on the address book's Devices tab: why it
+        // was not done is said there too.
+        let removing = matches!(op, ManagerOp::Remove(_));
         let mut paired_changed = false;
         let done: Result<(), &'static str> = match op {
             ManagerOp::On => match guard.master_on(Actor::Ui, &self.ctx.host_onion_pk) {
@@ -1052,29 +1066,68 @@ impl ManagerWatch {
                     shared.update(|m| m.wizard.level_off = Some((device, keeps)));
                 })
                 .map_err(|e| refusal(&e)),
+            ManagerOp::Remove(_)
+                if matches!(
+                    guard.store().status(),
+                    tornect_core::unattended::store::StoreStatus::FailedClosed(_)
+                ) =>
+            {
+                Err(STORE_CLOSED)
+            }
             ManagerOp::Remove(device) => match guard.unpair(Actor::Ui, &device) {
-                Ok(_) => match self.trusted.remove(&device) {
-                    Ok(removed) => {
-                        paired_changed = removed;
-                        Ok(())
+                Ok(_) => {
+                    let removed = self.unpin(&device);
+                    // Deny-direction, whether or not the file could be
+                    // written (the running host forgot the pin either way):
+                    // a session of the device ends, attended or not.
+                    if self.live.snapshot().iter().any(|s| s.device == device) {
+                        end_sessions(bye::REVOKED);
                     }
-                    // No error text: it may name a path, which names the account.
-                    Err(_) => {
-                        tracing::warn!("a paired device was not removed");
-                        Err(PAIRING_KEPT)
-                    }
-                },
+                    removed.map(|removed| paired_changed = removed)
+                }
                 Err(e) => Err(refusal(&e)),
             },
         };
         shared.update(|m| {
             m.manager_note = done.err();
+            if removing && let Err(why) = done {
+                m.book.note = Some(why.to_owned());
+            }
             if asks {
                 m.manager_busy = false;
             }
         });
         self.refresh(shared);
         paired_changed
+    }
+
+    /// *Remove device*'s second step, after the guard's unpair (decision
+    /// M1-25: the grant goes first, so a crash between the two leaves a
+    /// paired device without a grant, never the reverse): the pairing goes
+    /// from the host's paired devices, and a pairing that went is logged
+    /// (`DeviceUnpaired`, with the pinned label), whether or not the device
+    /// had unattended access. Whether a pairing went; the refusal's words
+    /// when the file could not be written.
+    fn unpin(&self, device: &tornect_core::DeviceId) -> Result<bool, &'static str> {
+        use tornect_core::session_log::{Actor, SessionEvent, SessionRecord};
+        let label = self.trusted.get(device).map(|d| d.label);
+        match self.trusted.remove(device) {
+            Ok(true) => {
+                let line = SessionRecord::now(SessionEvent::DeviceUnpaired)
+                    .by(Actor::Ui)
+                    .peer(*device, label.unwrap_or_default());
+                if self.ctx.log.append(&line).is_err() {
+                    tracing::warn!("the removal of a paired device was not logged");
+                }
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            // No error text: it may name a path, which names the account.
+            Err(_) => {
+                tracing::warn!("a paired device was not removed");
+                Err(PAIRING_KEPT)
+            }
+        }
     }
 
     /// Put the stop code `code` of a *Turn on* into the model as the one card
@@ -1703,6 +1756,7 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
             },
             words: Arc::clone(&b.words),
             trusted: Arc::clone(&deps.trusted),
+            live: Arc::clone(&live),
             closing: Mutex::new(false),
             autostart_for: autostart_for(b.paths.clone()),
             installed: Arc::new(installed_now),
@@ -4013,6 +4067,7 @@ mod tests {
             },
             words: Arc::new(super::super::recognize::Recognizer::default()),
             trusted: Arc::new(TrustedDeviceStore::ephemeral(Default::default())),
+            live: Arc::new(LiveSessions::new()),
             closing: Mutex::new(false),
             autostart_for: Arc::new(|_| {
                 Arc::new(tornect_platform::autostart::NoAutostart("test".to_owned()))
@@ -4151,6 +4206,7 @@ mod tests {
             },
             words: Arc::new(super::super::recognize::Recognizer::default()),
             trusted: Arc::clone(&trusted),
+            live: Arc::new(LiveSessions::new()),
             closing: Mutex::new(false),
             autostart_for: Arc::new(|_| {
                 Arc::new(tornect_platform::autostart::NoAutostart("test".to_owned()))
@@ -4266,12 +4322,195 @@ mod tests {
             },
             words: Arc::new(super::super::recognize::Recognizer::default()),
             trusted: Arc::new(TrustedDeviceStore::ephemeral(Default::default())),
+            live: Arc::new(LiveSessions::new()),
             closing: Mutex::new(false),
             autostart_for: Arc::new(|_| {
                 Arc::new(tornect_platform::autostart::NoAutostart("test".to_owned()))
             }),
             installed: Arc::new(|| None),
         }
+    }
+
+    /// B27: *Remove device* (the address book's Devices tab and Settings,
+    /// Security) removes a paired device that has no unattended access too,
+    /// through the guard's unpair (a no-op without a grant) and then the pin:
+    /// the pin goes, one `DeviceUnpaired` line names the device by its
+    /// pinned label, and a live session of it ends with `REVOKED`, attended
+    /// as well (no grant ends it). A live session of another device goes on;
+    /// a device no longer paired changes nothing and logs nothing.
+    #[test]
+    fn remove_device_unpairs_a_device_without_unattended_access() {
+        use tornect_core::session_log::{Actor, SessionEvent as Logged};
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let (laptop, tablet) = (
+            tornect_core::DeviceId::from_bytes([1; 32]),
+            tornect_core::DeviceId::from_bytes([2; 32]),
+        );
+        let trusted = TrustedDeviceStore::ephemeral(Default::default());
+        trusted.pin(laptop, "Office laptop").unwrap();
+        trusted.pin(tablet, "Tablet").unwrap();
+        let watch = ManagerWatch {
+            trusted: Arc::new(trusted),
+            ..manager_over(
+                tmp.path(),
+                Arc::new(AllowAllReAuth::default()),
+                Arc::new(NoSessionActivity),
+                tornect_core::levels::AccountFacts::Linux,
+                b"machine",
+            )
+        };
+        let kill = watch.ctx.kill.clone().expect("a host's kill switch");
+        let token = tornect_signal::consent::SessionToken::new([5; 32]);
+        watch.live.on_start(&LiveSession {
+            device: tablet,
+            label: "Tablet",
+            session_id: "s1",
+            token: &token,
+            th_final: [0; 32],
+            mode: SessionMode::Control,
+            elevation: Elevation::None,
+            unattended: false,
+        });
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let unpaired = || {
+            watch
+                .ctx
+                .log
+                .read_all()
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.event == Logged::DeviceUnpaired)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            watch.run(ManagerOp::Remove(laptop), &shared),
+            "the pairing goes"
+        );
+        assert!(watch.trusted.get(&laptop).is_none());
+        assert!(watch.trusted.get(&tablet).is_some());
+        assert_eq!(kill.fired(), None, "the tablet's session goes on");
+        assert_eq!(shared.read(|m| m.manager_note), None);
+        let lines = unpaired();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].peer_device, Some(laptop));
+        assert_eq!(lines[0].peer_name.as_deref(), Some("Office laptop"));
+        assert_eq!(lines[0].by, Some(Actor::Ui));
+
+        assert!(watch.run(ManagerOp::Remove(tablet), &shared));
+        assert!(watch.trusted.get(&tablet).is_none());
+        assert_eq!(
+            kill.fired(),
+            Some(bye::REVOKED),
+            "its attended session ends"
+        );
+        assert_eq!(unpaired().len(), 2);
+
+        assert!(!watch.run(ManagerOp::Remove(laptop), &shared), "not paired");
+        assert_eq!(unpaired().len(), 2, "nothing more is logged");
+        assert_eq!(
+            shared.read(|m| (m.manager_note, m.book.note.clone())),
+            (None, None)
+        );
+    }
+
+    /// B27: a pairing whose file cannot be written is not reported as
+    /// removed: the section and the Devices tab both say why, nothing is
+    /// logged as unpaired, and a live session of the device still ends (the
+    /// running host forgot the pin, deny-direction either way).
+    #[test]
+    fn a_pairing_that_cannot_be_written_says_so_on_the_devices_tab() {
+        use tornect_core::session_log::SessionEvent as Logged;
+        use tornect_core::trusted::{TrustedDevice, TrustedDevices};
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        let tmp = tempfile::tempdir().unwrap();
+        let laptop = tornect_core::DeviceId::from_bytes([1; 32]);
+        // A directory where the file should be: every save fails.
+        let blocked = tmp.path().join("trusted-devices.toml");
+        std::fs::create_dir(&blocked).unwrap();
+        let trusted = TrustedDeviceStore::with(
+            blocked,
+            TrustedDevices {
+                devices: vec![TrustedDevice {
+                    device: laptop,
+                    label: "Office laptop".to_owned(),
+                    paired_at: 1,
+                    last_seen: 1,
+                }],
+                ..TrustedDevices::default()
+            },
+        );
+        let watch = ManagerWatch {
+            trusted: Arc::new(trusted),
+            ..manager_over(
+                &tmp.path().join("home"),
+                Arc::new(AllowAllReAuth::default()),
+                Arc::new(NoSessionActivity),
+                tornect_core::levels::AccountFacts::Linux,
+                b"machine",
+            )
+        };
+        let kill = watch.ctx.kill.clone().expect("a host's kill switch");
+        let token = tornect_signal::consent::SessionToken::new([5; 32]);
+        watch.live.on_start(&LiveSession {
+            device: laptop,
+            label: "Office laptop",
+            session_id: "s1",
+            token: &token,
+            th_final: [0; 32],
+            mode: SessionMode::ViewOnly,
+            elevation: Elevation::None,
+            unattended: false,
+        });
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        assert!(!watch.run(ManagerOp::Remove(laptop), &shared));
+        assert_eq!(shared.read(|m| m.manager_note), Some(PAIRING_KEPT));
+        assert_eq!(
+            shared.read(|m| m.book.note.clone()).as_deref(),
+            Some(PAIRING_KEPT)
+        );
+        assert_eq!(kill.fired(), Some(bye::REVOKED));
+        let logged = watch.ctx.log.read_all().unwrap();
+        assert!(!logged.iter().any(|r| r.event == Logged::DeviceUnpaired));
+    }
+
+    /// B27: while unattended access's store failed closed, *Remove device*
+    /// changes nothing: a grant the device may have could not be removed
+    /// first, and a pin removed without it would leave a grant for an
+    /// unpaired device, live again at a later pairing (decision M1-25). The
+    /// section and the Devices tab say why.
+    #[test]
+    fn remove_device_changes_nothing_while_the_store_failed_closed() {
+        use tornect_core::unattended::guard::{AllowAllReAuth, NoSessionActivity};
+        use tornect_core::unattended::store::StoreStatus;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        std::fs::write(paths.unattended_store(), b"not a store").unwrap();
+        let laptop = tornect_core::DeviceId::from_bytes([1; 32]);
+        let trusted = TrustedDeviceStore::ephemeral(Default::default());
+        trusted.pin(laptop, "Office laptop").unwrap();
+        let watch = ManagerWatch {
+            trusted: Arc::new(trusted),
+            ..manager_over(
+                tmp.path(),
+                Arc::new(AllowAllReAuth::default()),
+                Arc::new(NoSessionActivity),
+                tornect_core::levels::AccountFacts::Linux,
+                b"machine",
+            )
+        };
+        let status = watch.ctx.guard.store().status();
+        assert!(matches!(status, StoreStatus::FailedClosed(_)), "{status:?}");
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        assert!(!watch.run(ManagerOp::Remove(laptop), &shared));
+        assert!(watch.trusted.get(&laptop).is_some(), "the pairing stays");
+        assert_eq!(shared.read(|m| m.manager_note), Some(STORE_CLOSED));
+        assert_eq!(
+            shared.read(|m| m.book.note.clone()).as_deref(),
+            Some(STORE_CLOSED)
+        );
     }
 
     /// The emergency stop code as the window's card holds it, read back

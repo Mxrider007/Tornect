@@ -3956,6 +3956,80 @@ mod tests {
         assert_eq!(links, 2, "one per card");
     }
 
+    /// B27: the Devices tab removes a paired device, with unattended access
+    /// or without, after a question that names it by its label and device
+    /// words: the first click only asks, "Keep it" takes it back, and only
+    /// Remove sends the window host's *Remove device* for that device, once
+    /// (the guard's unpair, then the pin). Without the window host's guard
+    /// no card offers it, and the tab says so.
+    #[test]
+    fn the_devices_tab_removes_a_device_after_asking() {
+        use super::super::model::{Manager, ManagerOp};
+        let devices_tab = |model: Model| {
+            let mut window = Window::new(model, Page::AddressBook, egui::Theme::Dark, TALL);
+            window.form.book.tab = Tab::Devices;
+            for _ in 0..2 {
+                assert!(window.pass(Vec::new()).is_empty());
+            }
+            window
+        };
+        let remove_buttons = |window: &Window| -> Vec<egui::Pos2> {
+            window
+                .nodes
+                .iter()
+                .filter(|n| n.label() == Some(address_book::REMOVE_DEVICE))
+                .filter_map(Node::bounds)
+                .map(|b| egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
+                .collect()
+        };
+        let mut model = with_book(false);
+        model.manager = Some(Manager::default());
+        let tablet = &model.book.devices[1];
+        let (id, words) = (tablet.id, tablet.words.expect("derived").shown());
+        let question = address_book::remove_question("Tablet");
+        let named = |window: &Window| {
+            let words = format!("device words: {words}");
+            window
+                .nodes
+                .iter()
+                .filter(|n| n.value() == Some(words.as_str()))
+                .count()
+        };
+        let mut window = devices_tab(model.clone());
+        assert_eq!(remove_buttons(&window).len(), 2, "one per card");
+        assert!(!has_text(&window, address_book::NO_REMOVE));
+        let on_its_card = named(&window);
+        assert!(on_its_card > 0);
+        let at = remove_buttons(&window)[1];
+        assert!(window.click(at).is_empty(), "the question first");
+        assert_eq!(window.form.book.removing, Some(id));
+        assert!(window.pass(Vec::new()).is_empty());
+        assert!(has_text(&window, &question));
+        assert_eq!(named(&window), 2 * on_its_card, "and in the question");
+        let keep = window.center("Keep it");
+        assert!(window.click(keep).is_empty());
+        assert_eq!(window.form.book.removing, None);
+        assert!(window.pass(Vec::new()).is_empty());
+        assert!(!has_text(&window, &question));
+        let at = remove_buttons(&window)[1];
+        assert!(window.click(at).is_empty());
+        assert!(window.pass(Vec::new()).is_empty());
+        let sure = window.center(address_book::REMOVE);
+        assert_eq!(
+            window.click(sure),
+            vec![Action::Manager(ManagerOp::Remove(id))]
+        );
+        assert_eq!(window.form.book.removing, None);
+        for _ in 0..3 {
+            assert!(window.pass(Vec::new()).is_empty(), "sent once");
+        }
+        assert!(!has_text(&window, &question));
+        model.manager = None;
+        let window = devices_tab(model);
+        assert!(remove_buttons(&window).is_empty());
+        assert!(has_text(&window, address_book::NO_REMOVE));
+    }
+
     // ------------------------------------------------------------ the Sessions page (§B.8.13)
 
     /// A session that ended here, a refused request and a client connect, as

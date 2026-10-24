@@ -6,10 +6,12 @@
 //! and nothing is checked in the background.
 
 use egui::{Align, Layout, Margin, RichText, Sense, Stroke, Ui, WidgetInfo, WidgetType, vec2};
-use tornect_core::TornectId;
+use tornect_core::{DeviceId, TornectId};
 
 use super::super::icons::{self, Icon};
-use super::super::model::{Book, Check, ClientStage, Computer, DeviceCard, Model, ViewOnly};
+use super::super::model::{
+    Book, Check, ClientStage, Computer, Device, DeviceCard, ManagerOp, Model, ViewOnly,
+};
 use super::super::nav::Page;
 use super::super::theme::{self, Face, Tokens};
 use super::super::view::{Action, Form};
@@ -44,6 +46,8 @@ pub struct BookForm {
     pub adding: Option<(String, String)>,
     /// The computer whose Forget waits for its confirmation.
     pub forgetting: Option<TornectId>,
+    /// The paired device whose Remove waits for its confirmation.
+    pub removing: Option<DeviceId>,
 }
 
 /// The Recent tab's line while history is off: the switch governs the
@@ -156,7 +160,7 @@ pub(super) fn page(
     match form.book.tab {
         Tab::Computers => computers(ui, t, model, form, actions),
         Tab::Recent => recent(ui, t, book, actions),
-        Tab::Devices => devices(ui, t, model, form, !model.sharing.is_empty()),
+        Tab::Devices => devices(ui, t, model, form, !model.sharing.is_empty(), actions),
     }
     ui.add_space(8.0);
 }
@@ -665,7 +669,7 @@ fn admin_row(
                 let field = widgets::text_field(ui, typed, "Its device ID", true, 320.0);
                 field.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Device ID"));
                 muted(ui, t, "`tornect id` on that device shows its device ID.");
-                let device = typed.trim().parse::<tornect_core::DeviceId>().ok();
+                let device = typed.trim().parse::<DeviceId>().ok();
                 // The typed device's words (§B.6.1), to compare with that
                 // device's own Home before anything is sent (F4-4).
                 if let Some(key) = device.map(|d| *d.public_key_bytes()) {
@@ -1053,11 +1057,55 @@ fn card_lines(ui: &mut Ui, t: &Tokens, label: &str, card: DeviceCard) {
     }
 }
 
-/// The Devices tab: who can ask to connect here (read-only in this version),
-/// each card with its unattended access's lines where it has some (§B.8.6.1)
-/// and the link to the manager.
-fn devices(ui: &mut Ui, t: &Tokens, model: &Model, form: &mut Form, shared: bool) {
+/// The button on a paired device's card that removes it, after a question.
+pub(super) const REMOVE_DEVICE: &str = "Remove device…";
+
+/// The answer of Remove's question that removes the device.
+pub(super) const REMOVE: &str = "Remove";
+
+/// Remove's question for the paired device `label`: what goes, and what it
+/// takes to come back.
+pub(super) fn remove_question(label: &str) -> String {
+    format!(
+        "Remove \"{label}\"? It can no longer ask for a session here until it pairs again, \
+         comparing a code on both screens. Its unattended access goes too, if it has any, and a \
+         session of it running now ends."
+    )
+}
+
+/// Why no card offers Remove: the window host's guard, which removes a
+/// device's unattended access before its pairing, is not there.
+pub(super) const NO_REMOVE: &str = "Devices cannot be removed from this window right now.";
+
+/// Under the list: what pairing gives, and what Remove takes back.
+pub(super) const DEVICES_NOTE: &str = "A paired device still asks before every session, unless \
+    you gave it unattended access (a password of its own). A removed device pairs again, \
+    comparing a code, before its next session.";
+
+/// The Devices tab: who can ask to connect here, each card with its
+/// unattended access's lines where it has some (§B.8.6.1), the link to the
+/// manager, and Remove, which asks first and goes through the window host's
+/// guard as Settings, Security's *Remove device* does: unattended access
+/// first, then the pairing (decision M1-25).
+fn devices(
+    ui: &mut Ui,
+    t: &Tokens,
+    model: &Model,
+    form: &mut Form,
+    shared: bool,
+    actions: &mut Vec<Action>,
+) {
     let book = &model.book;
+    // A question about a device that is gone, or while this screen is
+    // shared, is not kept.
+    if shared
+        || form
+            .book
+            .removing
+            .is_some_and(|d| !book.devices.iter().any(|device| device.id == d))
+    {
+        form.book.removing = None;
+    }
     if book.devices.is_empty() {
         widgets::card(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1071,6 +1119,7 @@ fn devices(ui: &mut Ui, t: &Tokens, model: &Model, form: &mut Form, shared: bool
         });
         return;
     }
+    let can_remove = !shared && model.manager.is_some();
     widgets::card_frame(t, 14, Margin::same(6)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         for device in &book.devices {
@@ -1106,11 +1155,23 @@ fn devices(ui: &mut Ui, t: &Tokens, model: &Model, form: &mut Form, shared: bool
                             if let Some(card) = card.filter(|_| !shared) {
                                 card_lines(ui, t, &device.label, card);
                             }
-                            if !shared
-                                && Button::new(Kind::Ghost, MANAGE).small().show(ui).clicked()
-                            {
-                                form.page = Page::Settings;
-                                form.settings.section = super::settings::Section::Security;
+                            if !shared {
+                                ui.horizontal_wrapped(|ui| {
+                                    if Button::new(Kind::Ghost, MANAGE).small().show(ui).clicked() {
+                                        form.page = Page::Settings;
+                                        form.settings.section = super::settings::Section::Security;
+                                    }
+                                    if can_remove
+                                        && form.book.removing != Some(device.id)
+                                        && Button::new(Kind::Ghost, REMOVE_DEVICE)
+                                            .icon(Icon::Trash)
+                                            .small()
+                                            .show(ui)
+                                            .clicked()
+                                    {
+                                        form.book.removing = Some(device.id);
+                                    }
+                                });
                             }
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1125,15 +1186,60 @@ fn devices(ui: &mut Ui, t: &Tokens, model: &Model, form: &mut Form, shared: bool
                             );
                         });
                     });
+                    if can_remove && form.book.removing == Some(device.id) {
+                        remove_row(ui, t, device, form, actions);
+                    }
                 });
         }
     });
     ui.add_space(GAP);
-    note_line(
-        ui,
-        Icon::ShieldCheck,
-        "A paired device still asks before every session, unless you gave it unattended access \
-         (a password of its own). This list is read-only in this version.",
-        t.text_muted,
-    );
+    note_line(ui, Icon::ShieldCheck, DEVICES_NOTE, t.text_muted);
+    if !shared && model.manager.is_none() {
+        note_line(ui, Icon::Info, NO_REMOVE, t.text_muted);
+    }
+}
+
+/// Remove's question for `device`, named by its pinned label and its device
+/// words (its key is never shown), with its two answers; only Remove sends
+/// anything.
+fn remove_row(
+    ui: &mut Ui,
+    t: &Tokens,
+    device: &Device,
+    form: &mut Form,
+    actions: &mut Vec<Action>,
+) {
+    ui.add_space(4.0);
+    widgets::card_frame(t, 12, Margin::same(12))
+        .stroke(Stroke::new(1.0, theme::tint(t.danger_text, 0.5)))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(
+                egui::Label::new(
+                    RichText::new(remove_question(&device.label)).color(t.text_primary),
+                )
+                .wrap(),
+            );
+            if let Some(words) = device.words {
+                muted(ui, t, &format!("device words: {}", words.shown()));
+            }
+            ui.horizontal(|ui| {
+                if Button::new(Kind::Secondary, "Keep it")
+                    .small()
+                    .show(ui)
+                    .clicked()
+                {
+                    form.book.removing = None;
+                }
+                if Button::new(Kind::Danger, REMOVE)
+                    .icon(Icon::Trash)
+                    .small()
+                    .show(ui)
+                    .clicked()
+                {
+                    actions.push(Action::Manager(ManagerOp::Remove(device.id)));
+                    form.book.removing = None;
+                }
+            });
+        });
 }
