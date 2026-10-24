@@ -3,8 +3,10 @@
 //!
 //! Milestone 0 ships the identity/config commands; Milestone 1 adds `host`,
 //! `ping` and `connect` over the live Tor network; the vertical slice adds the
-//! window (`ui`, decision D10's egui-everywhere fallback); `demo` arrives with
-//! later milestones (`docs/PLAN.md` Part C).
+//! window (`ui`, decision D10's egui-everywhere fallback); the quality presets
+//! add `demo --loopback --headless-stats`, the media pipeline measured in one
+//! process (M3's loopback demo, with its packetizer and render, comes later:
+//! `docs/PLAN.md` Part C).
 
 #![forbid(unsafe_code)]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -23,6 +25,7 @@ compile_error!(
 );
 
 mod admin_helper;
+mod demo_cmd;
 mod diagnostics;
 mod helper_cmd;
 mod history;
@@ -303,6 +306,38 @@ enum Command {
         /// reason.
         #[arg(long, hide = true, value_name = "PASSWORD", num_args = 0..=1)]
         password: Option<Option<String>>,
+    },
+    /// Measure the media pipeline on this computer: a synthetic desktop sent
+    /// through the real host and viewer in one process, with no Tor, no
+    /// network and no window. Prints the stage times once a second, then a
+    /// summary read against the latency targets of the plan (§B.7). Only
+    /// `--loopback --headless-stats` is available; build with `--release`
+    /// for numbers worth recording.
+    Demo {
+        /// Host and viewer in this process, over an in-memory pipe.
+        #[arg(long)]
+        loopback: bool,
+        /// Print the numbers; show no picture.
+        #[arg(long)]
+        headless_stats: bool,
+        /// The synthetic desktop's size, WIDTHxHEIGHT.
+        #[arg(long, value_name = "WxH", default_value = "1920x1080", value_parser = demo_cmd::parse_size)]
+        size: (u32, u32),
+        /// The synthetic desktop's frame rate: it delivers at that rate, as
+        /// a desktop does; the encoder keeps to the preset's.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=240))]
+        fps: u32,
+        /// The picture quality the viewer asks for: best-quality, balanced or
+        /// best-performance.
+        #[arg(long, value_name = "PRESET", default_value_t = QualityPreset::Balanced)]
+        quality: QualityPreset,
+        /// How long to measure, in seconds.
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=3600))]
+        seconds: u32,
+        /// The encoder's threads: 1, 0 for automatic (one less than the
+        /// cores, 1 to 4), or 2 to 4.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=4))]
+        threads: u8,
     },
     /// Send one admin command to a paired host on this device's unattended
     /// access there (its password asked on this terminal; one attempt, after a
@@ -770,6 +805,27 @@ fn main() -> anyhow::Result<()> {
                 device.as_deref(),
                 cli.bridges,
             )
+        }
+        Command::Demo {
+            loopback,
+            headless_stats,
+            size,
+            fps,
+            quality,
+            seconds,
+            threads,
+        } => {
+            if !(loopback && headless_stats) {
+                eprintln!("{}", demo_cmd::ONLY_LOOPBACK);
+                std::process::exit(2);
+            }
+            demo_cmd::run(demo_cmd::DemoOpts {
+                size,
+                fps,
+                quality,
+                run_for: std::time::Duration::from_secs(u64::from(seconds)),
+                threads,
+            })
         }
         Command::Unattended { action } => unattended::unattended(&paths, action),
         Command::Devices { json } => unattended::devices(&paths, json),
@@ -1242,6 +1298,96 @@ mod tests {
             .to_string();
         assert!(help.contains("--quality <PRESET>"), "{help}");
         assert!(help.contains("best-performance"), "{help}");
+    }
+
+    /// The quality design §3.6: `tornect demo` with its defaults (1920×1080
+    /// at 30 fps, Balanced, 10 s, one encoder thread) and each option in its
+    /// range; the two mode flags are parsed so that their absence is said
+    /// with exit code 2 (`demo_cmd::ONLY_LOOPBACK`), not by the parser.
+    #[test]
+    fn demo_takes_its_options_within_their_ranges() {
+        use tornect_core::config::QualityPreset;
+        let parse =
+            |args: &[&str]| super::Cli::try_parse_from(["tornect", "demo"].iter().chain(args));
+        let demo_of = |args: &[&str]| match parse(args).unwrap().command {
+            Some(super::Command::Demo {
+                loopback,
+                headless_stats,
+                size,
+                fps,
+                quality,
+                seconds,
+                threads,
+            }) => (
+                loopback,
+                headless_stats,
+                size,
+                fps,
+                quality,
+                seconds,
+                threads,
+            ),
+            other => panic!("not demo: {other:?}"),
+        };
+        assert_eq!(
+            demo_of(&["--loopback", "--headless-stats"]),
+            (true, true, (1920, 1080), 30, QualityPreset::Balanced, 10, 1)
+        );
+        assert_eq!(
+            demo_of(&[
+                "--loopback",
+                "--headless-stats",
+                "--size",
+                "3538x1918",
+                "--fps",
+                "60",
+                "--quality",
+                "best-performance",
+                "--seconds",
+                "3",
+                "--threads",
+                "0",
+            ]),
+            (
+                true,
+                true,
+                (3538, 1918),
+                60,
+                QualityPreset::BestPerformance,
+                3,
+                0
+            )
+        );
+        assert_eq!(
+            demo_of(&[]),
+            (
+                false,
+                false,
+                (1920, 1080),
+                30,
+                QualityPreset::Balanced,
+                10,
+                1
+            ),
+            "parsed, then refused by the demo itself"
+        );
+        for wrong in [
+            &["--size", "100x100"][..],
+            &["--size", "1920"],
+            &["--fps", "0"],
+            &["--fps", "241"],
+            &["--quality", "fast"],
+            &["--seconds", "0"],
+            &["--seconds", "3601"],
+            &["--threads", "5"],
+            &["--threads", "-1"],
+        ] {
+            assert!(parse(wrong).is_err(), "{wrong:?}");
+        }
+        assert_eq!(
+            super::demo_cmd::ONLY_LOOPBACK,
+            "demo: only --loopback --headless-stats is available"
+        );
     }
 
     /// `tornect connect --unattended`: its options need it, it never pairs,
