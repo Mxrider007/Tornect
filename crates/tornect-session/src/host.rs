@@ -1698,6 +1698,23 @@ fn interval(settings: &StreamSettings) -> Duration {
     Duration::from_secs(1) / settings.fps()
 }
 
+/// Waits until `due` in turns of at most [`POLL`]; `false`, at once, when
+/// `stop` is set. A low frame rate (`[media] max_fps = 1` paces a second
+/// apart) thus never holds a stop back longer than a poll: the source, the
+/// portal's session among them, goes as soon as the session ends.
+fn pace(due: Instant, stop: &AtomicBool) -> bool {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= due {
+            return true;
+        }
+        std::thread::sleep((due - now).min(POLL));
+    }
+}
+
 /// The capture thread: one picture per credit, paced to the current
 /// settings' frame rate, until told to stop or its channels close. Each
 /// desktop is fitted under the settings' cap before it is encoded: scaled
@@ -1744,11 +1761,10 @@ fn encode_loop(
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
-        if let Some(due) = paced.map(|at| at + interval(&settings.current)) {
-            let now = Instant::now();
-            if due > now {
-                std::thread::sleep(due - now);
-            }
+        if let Some(due) = paced.map(|at| at + interval(&settings.current))
+            && !pace(due, &control.stop)
+        {
+            return;
         }
         let (frame, repeat) = loop {
             if control.stop.load(Ordering::SeqCst) {
@@ -2296,6 +2312,11 @@ mod tests {
     );
 
     fn scripted(sizes: &[(u32, u32)]) -> Scripted {
+        scripted_under(sizes, QualityCaps::default())
+    }
+
+    /// [`scripted`] under `caps`.
+    fn scripted_under(sizes: &[(u32, u32)], caps: QualityCaps) -> Scripted {
         let queue = Arc::new(Mutex::new(sizes.iter().copied().collect()));
         let recycled = Arc::new(Mutex::new(Vec::new()));
         let source = Script {
@@ -2303,7 +2324,6 @@ mod tests {
             index: 0,
             recycled: Arc::clone(&recycled),
         };
-        let caps = QualityCaps::default();
         let initial = quality::settings(QualityPreset::Balanced, Route::Tor, &caps);
         let pipeline = Pipeline::start(Box::new(source), initial, Route::Tor, caps, 4);
         (pipeline, queue, recycled)
@@ -2332,6 +2352,71 @@ mod tests {
         let mut decoder = tornect_codec::H264Decoder::new().unwrap();
         let frame = decoder.decode(au).unwrap().expect("a picture");
         (frame.width, frame.height)
+    }
+
+    /// The pacing wait ends at its instant, or as soon as a stop is set,
+    /// whichever comes first; an instant already past does not wait.
+    #[test]
+    fn the_pacing_wait_ends_at_its_instant_or_at_a_stop() {
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        assert!(pace(started, &stop), "already due");
+        assert!(pace(started - Duration::from_secs(1), &stop));
+        assert!(started.elapsed() < POLL, "no wait for an instant past");
+
+        let due = Instant::now() + Duration::from_millis(250);
+        assert!(pace(due, &stop));
+        assert!(Instant::now() >= due, "not before its instant");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let setter = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                stop.store(true, Ordering::SeqCst);
+            })
+        };
+        let asked = Instant::now();
+        assert!(!pace(asked + Duration::from_secs(10), &stop), "stopped");
+        assert!(
+            asked.elapsed() < Duration::from_millis(50) + POLL + Duration::from_millis(200),
+            "a stop is taken within a poll: {:?}",
+            asked.elapsed()
+        );
+        setter.join().unwrap();
+        assert!(
+            !pace(Instant::now() - Duration::from_secs(1), &stop),
+            "stop first"
+        );
+    }
+
+    /// A stop while the capture thread paces to a low frame rate
+    /// (`[media] max_fps = 1`: a second between pictures) ends the thread,
+    /// and with it the source, within a poll rather than at the end of that
+    /// second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_while_pacing_a_low_frame_rate_lets_go_of_the_source_within_a_poll() {
+        let caps = QualityCaps {
+            max_fps: 1,
+            ..QualityCaps::default()
+        };
+        let (mut pipeline, queue, _) = scripted_under(&[(320, 240), (320, 240)], caps);
+        picture(&mut pipeline).await;
+        // The second picture waits for its turn, a second after the first.
+        pipeline.credit();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let asked = Instant::now();
+        pipeline.stop().await;
+        assert!(
+            asked.elapsed() < POLL + Duration::from_millis(300),
+            "the capture thread let go in {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(
+            queue.lock().unwrap().len(),
+            1,
+            "nothing grabbed after the stop"
+        );
     }
 
     /// The design §6.6 step 2 on a still screen: a quality change is taken
