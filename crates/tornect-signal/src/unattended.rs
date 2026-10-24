@@ -708,12 +708,17 @@ fn gate_reject(r: Reject) -> SessionReject {
     out
 }
 
-/// Map a post-F2 policy refusal onto its wire body.
+/// Map a post-F2 policy refusal onto its wire body: `COOLDOWN` carries the time
+/// left in `retry_after_s` (§B.8.4.6), which the client says.
 fn post_f2_reject(r: PostF2Reject) -> SessionReject {
     let mut out = SessionReject::new(r.code());
     out.next_open_in_s = match r {
         PostF2Reject::NotYetActive { next_open_in_s } => Some(next_open_in_s),
         PostF2Reject::OutsideSchedule { next_open_in_s } => next_open_in_s,
+        _ => None,
+    };
+    out.retry_after_s = match r {
+        PostF2Reject::Cooldown { retry_after_s } => Some(retry_after_s),
         _ => None,
     };
     out
@@ -1304,6 +1309,24 @@ mod tests {
     const PW: &str = "quiet verdant otter lantern zephyr";
     const HOST_PK: [u8; 32] = [0x22; 32];
     const TH_REQ: [u8; 32] = [0x33; 32];
+
+    /// §B.8.4.6: `COOLDOWN` tells the client how long to wait, as the
+    /// pre-PAKE `LOCKED_OUT` does; the other post-F2 refusals carry their own
+    /// field or none.
+    #[test]
+    fn the_cooldown_reject_carries_the_time_left() {
+        let r = post_f2_reject(PostF2Reject::Cooldown { retry_after_s: 42 });
+        assert_eq!(
+            (r.reason, r.retry_after_s, r.next_open_in_s),
+            (reject::COOLDOWN, Some(42), None)
+        );
+        let r = post_f2_reject(PostF2Reject::OutsideSchedule {
+            next_open_in_s: Some(7),
+        });
+        assert_eq!((r.retry_after_s, r.next_open_in_s), (None, Some(7)));
+        let r = post_f2_reject(PostF2Reject::NotGranted);
+        assert_eq!((r.retry_after_s, r.next_open_in_s), (None, None));
+    }
 
     /// Denies every `ask_before_start` popup.
     struct DenyAll;
