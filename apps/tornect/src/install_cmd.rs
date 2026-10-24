@@ -8,8 +8,10 @@
 //! they are (one home per user).
 //!
 //! - Linux: this program, read from the handle opened before anything else,
-//!   is copied into `~/.local/bin` with a menu entry
-//!   (`tornect_platform::install::LinuxInstall`). Then the setting's copy
+//!   is copied into `~/.local/bin` with a menu entry, a link entry for
+//!   `tornect:` links and its line in `mimeapps.list`
+//!   (`tornect_platform::install::LinuxInstall`); the install's line says
+//!   what links do (design `invite` §4.6). Then the setting's copy
 //!   about Tor at every sign-in, and the question `Start Tornect when I sign
 //!   in? [y/N]`: only a yes registers the start at sign-in, for the installed
 //!   copy, through `tornect service install`'s own guard operation.
@@ -19,7 +21,8 @@
 //!   that copy mark itself and its folder for removal at the next restart.
 //!
 //! `tornect uninstall` removes the start at sign-in, whatever copy it runs,
-//! then the menu entry and the copy; on Windows it is refused while an
+//! then the link entry's line in `mimeapps.list`, the menu entry, the link
+//! entry and the copy; on Windows it is refused while an
 //! administrator grant exists or the administrator helper task is registered,
 //! and while Tornect cannot read its grants.
 
@@ -42,9 +45,45 @@ pub(crate) const SIGN_IN_QUESTION: &str = "Start Tornect when I sign in? [y/N]";
 /// Why `install` and `uninstall` refuse beside a running Tornect host.
 pub(crate) const CLOSE_FIRST: &str = "Close Tornect before installing or removing it.";
 
-/// What a Linux install says once its files are written.
+/// What a Linux install says once its files are written, by what it did
+/// about `tornect:` links in `mimeapps` (design `invite` §4.6). The install
+/// never fails over the links: the program works, and pasting an invitation
+/// always does.
 #[cfg(target_os = "linux")]
-pub(crate) const LINUX_INSTALLED: &str = "Tornect is installed in ~/.local/bin, with a menu entry.";
+pub(crate) fn linux_installed(
+    links: &tornect_platform::install::LinkHandler,
+    mimeapps: &std::path::Path,
+) -> String {
+    use tornect_platform::install::{LINK_ENTRY, LINK_MIME, LinkHandler};
+    const INSTALLED: &str = "Tornect is installed in ~/.local/bin, with a menu entry";
+    let path = mimeapps.display();
+    match links {
+        LinkHandler::Registered => format!("{INSTALLED}; tornect:// links open it."),
+        LinkHandler::OtherDefault => format!(
+            "{INSTALLED}. tornect:// links open another program here ({path} says so); Tornect \
+             left that as it is."
+        ),
+        LinkHandler::TurnedOff => format!(
+            "{INSTALLED}. tornect:// links are turned off for Tornect in {path}; Tornect left \
+             that as it is."
+        ),
+        LinkHandler::NotChanged(why) => format!(
+            "{INSTALLED}. tornect:// links do not open it: {path} was not changed ({why}). To \
+             turn them on, add the line \"{LINK_MIME}={LINK_ENTRY};\" under [Default \
+             Applications] in it."
+        ),
+    }
+}
+
+/// What a Linux uninstall says about a `mimeapps.list` that still names the
+/// link entry and could not be changed (design `invite` §4.6).
+#[cfg(target_os = "linux")]
+fn association_left_line(mimeapps: &std::path::Path, why: &str) -> String {
+    format!(
+        "{} still names Tornect for tornect:// links: it was not changed ({why}).",
+        mimeapps.display()
+    )
+}
 
 /// The start of `uninstall`'s refusal on Windows while administrator access
 /// remains (the devices follow).
@@ -398,25 +437,32 @@ pub fn uninstall(paths: &Paths) -> anyhow::Result<()> {
 pub(crate) trait UserInstall {
     /// The installed executable.
     fn exe(&self) -> PathBuf;
+    /// This user's `mimeapps.list`, named in what the commands say.
+    fn mimeapps(&self) -> PathBuf;
     /// What `install` checks before writing, writing nothing.
     fn preflight(&self, home: Option<&std::path::Path>) -> Result<(), InstallError>;
-    /// Copy `source` and write the menu entry.
+    /// Copy `source`, write the menu entry and the link entry, and name the
+    /// link entry in `mimeapps.list`: what that last step did.
     fn install(
         &self,
         source: &mut dyn std::io::Read,
         home: Option<&std::path::Path>,
-    ) -> Result<(), InstallError>;
+    ) -> Result<tornect_platform::install::LinkHandler, InstallError>;
     /// Whether anything of an install is there.
     fn installed(&self) -> bool;
-    /// Remove the menu entry and the copy; what was left (not a regular
-    /// file).
-    fn uninstall(&self) -> Result<Vec<PathBuf>, InstallError>;
+    /// Take the link entry out of `mimeapps.list`, remove the menu entry,
+    /// the link entry and the copy.
+    fn uninstall(&self) -> Result<tornect_platform::install::Removal, InstallError>;
 }
 
 #[cfg(target_os = "linux")]
 impl UserInstall for tornect_platform::install::LinuxInstall {
     fn exe(&self) -> PathBuf {
         Self::exe(self)
+    }
+
+    fn mimeapps(&self) -> PathBuf {
+        Self::mimeapps(self)
     }
 
     fn preflight(&self, home: Option<&std::path::Path>) -> Result<(), InstallError> {
@@ -427,7 +473,7 @@ impl UserInstall for tornect_platform::install::LinuxInstall {
         &self,
         source: &mut dyn std::io::Read,
         home: Option<&std::path::Path>,
-    ) -> Result<(), InstallError> {
+    ) -> Result<tornect_platform::install::LinkHandler, InstallError> {
         Self::install(self, source, home)
     }
 
@@ -435,8 +481,8 @@ impl UserInstall for tornect_platform::install::LinuxInstall {
         Self::installed(self)
     }
 
-    fn uninstall(&self) -> Result<Vec<PathBuf>, InstallError> {
-        Self::uninstall(self).map(|removal| removal.left)
+    fn uninstall(&self) -> Result<tornect_platform::install::Removal, InstallError> {
+        Self::uninstall(self)
     }
 }
 
@@ -454,17 +500,22 @@ pub(crate) fn install_linux(
     let home = unattended::launch_home(paths)?;
     files.preflight(home.as_deref())?;
     authorize(paths, deps.ctx, &ExternalOp::Install)?;
-    if let Err(e) = files.install(source, home.as_deref()) {
-        log_failure(deps.ctx, SessionEvent::Installed, "install", &e);
-        return Err(e.into());
-    }
-    deps.console.out(LINUX_INSTALLED);
+    let links = match files.install(source, home.as_deref()) {
+        Ok(links) => links,
+        Err(e) => {
+            log_failure(deps.ctx, SessionEvent::Installed, "install", &e);
+            return Err(e.into());
+        }
+    };
+    deps.console
+        .out(&linux_installed(&links, &files.mimeapps()));
     offer_sign_in(deps, paths, files.exe())
 }
 
 /// `tornect uninstall` on Linux: refused beside a running host; nothing to
 /// remove asks nothing; else the guard's operation, then the start at
-/// sign-in (whatever copy it runs), the menu entry and the copy.
+/// sign-in (whatever copy it runs), the link entry's association in
+/// `mimeapps.list`, the menu entry, the link entry and the copy.
 #[cfg(target_os = "linux")]
 pub(crate) fn uninstall_linux(
     deps: &mut Deps<'_>,
@@ -491,18 +542,22 @@ pub(crate) fn uninstall_linux(
         Ok(())
     }
     .and_then(|()| files.uninstall());
-    let left = match removed {
-        Ok(left) => left,
+    let removal = match removed {
+        Ok(removal) => removal,
         Err(e) => {
             log_failure(deps.ctx, SessionEvent::Uninstalled, "uninstall", &e);
             return Err(e.into());
         }
     };
-    for path in left {
+    for path in removal.left {
         deps.console.out(&format!(
             "{} is not a regular file, so it was left as it is.",
             path.display()
         ));
+    }
+    if let tornect_platform::install::Association::Left(why) = &removal.association {
+        deps.console
+            .out(&association_left_line(&files.mimeapps(), why));
     }
     deps.console.out(&removed_line(paths));
     Ok(())
@@ -728,7 +783,9 @@ mod tests {
     use tornect_core::unattended::readiness::SharedReadiness;
     use tornect_core::unattended::store::{GrantStore, StoreStatus};
     use tornect_platform::autostart::{AutostartError, Registration};
-    use tornect_platform::install::{Elevated, HeldImage, WindowsSystem};
+    use tornect_platform::install::{
+        Association, Elevated, HeldImage, LinkHandler, Removal, WindowsSystem,
+    };
 
     use super::*;
 
@@ -922,16 +979,23 @@ mod tests {
     }
 
     /// The per-user install over a folder of the test's: it writes the
-    /// executable only, and records what it was asked.
+    /// executable only, and records what it was asked; `links` and
+    /// `association` are what its `mimeapps.list` steps answer.
     struct FakeFiles {
         dir: PathBuf,
         homes: Mutex<Vec<Option<PathBuf>>>,
         fail: Option<&'static str>,
+        links: LinkHandler,
+        association: Association,
     }
 
     impl UserInstall for FakeFiles {
         fn exe(&self) -> PathBuf {
             self.dir.join("tornect")
+        }
+
+        fn mimeapps(&self) -> PathBuf {
+            self.dir.join("config").join("mimeapps.list")
         }
 
         fn preflight(&self, home: Option<&std::path::Path>) -> Result<(), InstallError> {
@@ -943,25 +1007,30 @@ mod tests {
             &self,
             source: &mut dyn std::io::Read,
             _home: Option<&std::path::Path>,
-        ) -> Result<(), InstallError> {
+        ) -> Result<LinkHandler, InstallError> {
             if let Some(why) = self.fail {
                 return Err(InstallError::Failed(why.to_owned()));
             }
             let mut bytes = Vec::new();
             source.read_to_end(&mut bytes).unwrap();
             std::fs::write(self.exe(), bytes).unwrap();
-            Ok(())
+            Ok(self.links.clone())
         }
 
         fn installed(&self) -> bool {
             self.exe().exists()
         }
 
-        fn uninstall(&self) -> Result<Vec<PathBuf>, InstallError> {
+        fn uninstall(&self) -> Result<Removal, InstallError> {
+            let mut removal = Removal {
+                association: self.association.clone(),
+                ..Removal::default()
+            };
             if self.exe().exists() {
                 std::fs::remove_file(self.exe()).unwrap();
+                removal.removed.push(self.exe());
             }
-            Ok(Vec::new())
+            Ok(removal)
         }
     }
 
@@ -1163,6 +1232,8 @@ mod tests {
                 dir: bin,
                 homes: Mutex::new(Vec::new()),
                 fail: None,
+                links: LinkHandler::Registered,
+                association: Association::NotThere,
             },
         }
     }
@@ -1254,7 +1325,10 @@ mod tests {
             let (done, script) = env.install(&[answer], &backends);
             done.unwrap();
             assert!(
-                script.said(LINUX_INSTALLED),
+                script.said(&linux_installed(
+                    &LinkHandler::Registered,
+                    &env.files.mimeapps()
+                )),
                 "{answer:?}: {:?}",
                 script.lines
             );
@@ -1274,6 +1348,105 @@ mod tests {
             assert_eq!(backends.installs(), 1, "{answer:?}");
         }
         assert_eq!(SIGN_IN_QUESTION, "Start Tornect when I sign in? [y/N]");
+    }
+
+    /// Design `invite` §4.6: the install's line says, word for word, what
+    /// `tornect:` links do after its `mimeapps.list` step; the install
+    /// succeeds whatever that step did.
+    #[test]
+    fn the_install_says_what_links_do() {
+        let path = std::path::Path::new("/home/u/.config/mimeapps.list");
+        let why = "it is a link to another file, which Tornect never writes through";
+        for (links, line) in [
+            (
+                LinkHandler::Registered,
+                "Tornect is installed in ~/.local/bin, with a menu entry; tornect:// links open \
+                 it."
+                .to_owned(),
+            ),
+            (
+                LinkHandler::OtherDefault,
+                "Tornect is installed in ~/.local/bin, with a menu entry. tornect:// links open \
+                 another program here (/home/u/.config/mimeapps.list says so); Tornect left that \
+                 as it is."
+                    .to_owned(),
+            ),
+            (
+                LinkHandler::TurnedOff,
+                "Tornect is installed in ~/.local/bin, with a menu entry. tornect:// links are \
+                 turned off for Tornect in /home/u/.config/mimeapps.list; Tornect left that as it \
+                 is."
+                .to_owned(),
+            ),
+            (
+                LinkHandler::NotChanged(why.to_owned()),
+                format!(
+                    "Tornect is installed in ~/.local/bin, with a menu entry. tornect:// links do \
+                     not open it: /home/u/.config/mimeapps.list was not changed ({why}). To turn \
+                     them on, add the line \"x-scheme-handler/tornect=tornect-link.desktop;\" \
+                     under [Default Applications] in it."
+                ),
+            ),
+        ] {
+            assert_eq!(linux_installed(&links, path), line);
+            let mut env = linux_env(2);
+            env.files.links = links.clone();
+            let backends = Backends::default();
+            let (done, script) = env.install(&[None], &backends);
+            done.unwrap();
+            let said = linux_installed(&links, &env.files.mimeapps());
+            assert!(script.said(&said), "{links:?}: {:?}", script.lines);
+            assert!(env.files.installed(), "{links:?}");
+        }
+    }
+
+    /// Design `invite` §4.6: an uninstall that could not take the link entry
+    /// out of a `mimeapps.list` that still names it says so, before its last
+    /// line; one that took it out, or found nothing, says nothing of it.
+    #[test]
+    fn the_uninstall_says_when_mimeapps_still_names_tornect() {
+        let why = "it is a link to another file, which Tornect never writes through";
+        for (association, says) in [
+            (Association::Left(why.to_owned()), true),
+            (Association::Removed, false),
+            (Association::NotThere, false),
+        ] {
+            let mut env = linux_env(4);
+            let backends = Backends::default();
+            env.install(&[None], &backends).0.unwrap();
+            env.files.association = association.clone();
+            let (done, script) = env.uninstall(&|spec| backends.make(spec));
+            done.unwrap();
+            let line = format!(
+                "{} still names Tornect for tornect:// links: it was not changed ({why}).",
+                env.files.mimeapps().display()
+            );
+            assert_eq!(
+                association_left_line(&env.files.mimeapps(), why),
+                line,
+                "{association:?}"
+            );
+            assert_eq!(
+                script.said(&line),
+                says,
+                "{association:?}: {:?}",
+                script.lines
+            );
+            assert!(
+                !script
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("still names Tornect"))
+                    || says,
+                "{association:?}"
+            );
+            let last = script.lines.last().cloned().unwrap_or_default();
+            assert_eq!(
+                last,
+                format!("out: {}", removed_line(&env.paths)),
+                "{association:?}"
+            );
+        }
     }
 
     /// A terminal at which, while the sign-in question waits, Tornect is

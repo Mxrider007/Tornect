@@ -20,8 +20,14 @@
 //! it nor a folder above it can be changed by another account, and none is a
 //! link). Each file is written to a new temporary file in its folder and
 //! renamed over its name, so a link found at any of the names is replaced,
-//! never followed. Uninstalling removes exactly these three files, and only
-//! where they are regular files.
+//! never followed. Last, since GIO finds no handler from `MimeType=` alone,
+//! the link entry is named for `x-scheme-handler/tornect` in this user's
+//! `mimeapps.list` (`$XDG_CONFIG_HOME`, else `~/.config`): our lines only,
+//! every other byte kept, never through a link, and never over the user's
+//! own removal or another program's default; that step reports
+//! ([`LinkHandler`]) and never fails the install. Uninstalling takes those
+//! lines out again and removes exactly the three files, and only where they
+//! are regular files.
 //!
 //! The folders come from the caller ([`LinuxInstall::new`]) or from `HOME`
 //! ([`LinuxInstall::for_this_user`]), never from Tornect's data directory or
@@ -1046,16 +1052,12 @@ pub fn uninstall_from_program_files(
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    FOLDER_OTHERS_CAN_CHANGE, LINK_ENTRY, LINK_MIME, LINUX_EXE, LinkHandler, LinuxInstall,
-    MENU_ENTRY, Removal,
+    Association, FOLDER_OTHERS_CAN_CHANGE, LINK_ENTRY, LINK_MIME, LINUX_EXE, LinkHandler,
+    LinuxInstall, MENU_ENTRY, MIMEAPPS, Removal,
 };
 
 /// The `mimeapps.list` edit of the Linux install: pure text.
 #[cfg(target_os = "linux")]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the Linux install's file side calls it next")
-)]
 mod mimeapps;
 
 /// The per-user install on Linux.
@@ -1066,7 +1068,7 @@ mod linux {
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
 
-    use super::{ENTRY_NAME, InstallError, LINK_ARGUMENT};
+    use super::{ENTRY_NAME, InstallError, LINK_ARGUMENT, mimeapps};
     use crate::autostart::{
         AutostartError, PathFacts, desktop_exec, desktop_exec_bare, parse_status_ids,
         unix_exe_location_ok,
@@ -1087,6 +1089,22 @@ mod linux {
     /// The MIME type a `tornect:` link has for the desktop: GIO looks a
     /// scheme's handler up as `x-scheme-handler/<scheme>`.
     pub const LINK_MIME: &str = "x-scheme-handler/tornect";
+
+    /// The per-user list of the XDG MIME Applications spec, in the
+    /// configuration folder: where `xdg-mime default` writes, and what GIO,
+    /// KService and `xdg-mime` read first after a desktop's own list.
+    pub const MIMEAPPS: &str = "mimeapps.list";
+
+    /// The largest `mimeapps.list` the install edits.
+    const MIMEAPPS_MAX: u64 = 256 * 1024;
+
+    /// How many times the edit of `mimeapps.list` is made when another
+    /// program keeps changing the file meanwhile.
+    const MIMEAPPS_TRIES: usize = 3;
+
+    /// How much of a `mimeapps.list` the uninstall reads to tell whether one
+    /// it cannot edit still names the link entry.
+    const MIMEAPPS_SCAN: u64 = 1024 * 1024;
 
     /// Why the bin folder cannot take the copy: it, or a folder above it,
     /// fails the location rule; the rule's own reason follows.
@@ -1113,12 +1131,14 @@ mod linux {
         })
     }
 
-    /// The per-user install: the executable in `bin_dir`, the menu entry in
-    /// `apps_dir`.
+    /// The per-user install: the executable in `bin_dir`, the menu entry
+    /// and the link entry in `apps_dir`, the association of `tornect:` links
+    /// in `config_dir`'s `mimeapps.list`.
     #[derive(Clone)]
     pub struct LinuxInstall {
         bin_dir: PathBuf,
         apps_dir: PathBuf,
+        config_dir: PathBuf,
         /// The tests' file facts; elsewhere this process's, always.
         #[cfg(test)]
         facts: Option<Facts>,
@@ -1129,6 +1149,7 @@ mod linux {
             f.debug_struct("LinuxInstall")
                 .field("bin_dir", &self.bin_dir)
                 .field("apps_dir", &self.apps_dir)
+                .field("config_dir", &self.config_dir)
                 .finish_non_exhaustive()
         }
     }
@@ -1151,6 +1172,20 @@ mod linux {
         NotChanged(String),
     }
 
+    /// What [`LinuxInstall::uninstall`] did about `tornect:` links in this
+    /// user's `mimeapps.list`. The uninstall never fails over it.
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    pub enum Association {
+        /// Nothing there named the link entry (or there is no such file).
+        #[default]
+        NotThere,
+        /// The link entry was taken out of it.
+        Removed,
+        /// It still names the link entry: it was not changed, for this
+        /// reason.
+        Left(String),
+    }
+
     /// What [`LinuxInstall::uninstall`] did.
     #[derive(Debug, Default, Clone, PartialEq, Eq)]
     pub struct Removal {
@@ -1159,23 +1194,29 @@ mod linux {
         /// Found at an install's name but not a regular file (a link, a
         /// folder): not what `install` wrote, so left as it is.
         pub left: Vec<PathBuf>,
+        /// The association of `tornect:` links in `mimeapps.list`.
+        pub association: Association,
     }
 
     impl LinuxInstall {
-        /// The install into `bin_dir` (the executable) and `apps_dir` (the
-        /// menu entry), both absolute.
+        /// The install into `bin_dir` (the executable), `apps_dir` (the menu
+        /// entry and the link entry) and `config_dir` (its `mimeapps.list`),
+        /// all absolute.
         #[must_use]
-        pub fn new(bin_dir: PathBuf, apps_dir: PathBuf) -> Self {
+        pub fn new(bin_dir: PathBuf, apps_dir: PathBuf, config_dir: PathBuf) -> Self {
             Self {
                 bin_dir,
                 apps_dir,
+                config_dir,
                 #[cfg(test)]
                 facts: None,
             }
         }
 
-        /// This user's install (§B.1.1): `$HOME/.local/bin` and
-        /// `$HOME/.local/share/applications`.
+        /// This user's install (§B.1.1): `$HOME/.local/bin`,
+        /// `$HOME/.local/share/applications`, and the configuration folder:
+        /// `$XDG_CONFIG_HOME` when it is absolute, else `$HOME/.config` (the
+        /// XDG Base Directory spec).
         pub fn for_this_user() -> Result<Self, InstallError> {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -1187,9 +1228,14 @@ mod linux {
                             .to_owned(),
                     )
                 })?;
+            let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| home.join(".config"));
             Ok(Self::new(
                 home.join(".local").join("bin"),
                 home.join(".local").join("share").join("applications"),
+                config_dir,
             ))
         }
 
@@ -1222,6 +1268,13 @@ mod linux {
         #[must_use]
         pub fn link_entry(&self) -> PathBuf {
             self.apps_dir.join(LINK_ENTRY)
+        }
+
+        /// This user's `mimeapps.list`, where the install names the link
+        /// entry for `tornect:` links.
+        #[must_use]
+        pub fn mimeapps(&self) -> PathBuf {
+            self.config_dir.join(MIMEAPPS)
         }
 
         /// The menu entry's text: the keys `Type`, `Name` and `Exec` only,
@@ -1284,54 +1337,77 @@ mod linux {
 
         /// Copy `source` (this program, read from the handle the command
         /// opened first) to [`Self::exe`], then write the menu entry, then the
-        /// link entry. Refused before anything is written by
+        /// link entry, then name the link entry for `tornect:` links in
+        /// [`Self::mimeapps`]. Refused before anything is written by
         /// [`Self::preflight`]'s checks; the bin folder is checked again once
         /// it exists. A menu entry that cannot be written removes the copy
         /// again, and a link entry that cannot be written removes the menu
         /// entry and the copy; a folder this call created and a failure left
-        /// empty is removed too.
+        /// empty is removed too. The `mimeapps.list` step never fails the
+        /// install: what it did is the answer (the rules of `edit_mimeapps`).
         pub fn install(
             &self,
             source: &mut dyn std::io::Read,
             home: Option<&Path>,
-        ) -> Result<(), InstallError> {
+        ) -> Result<LinkHandler, InstallError> {
             self.preflight(home)?;
             let entry = self.menu_entry_text(home)?;
             let link_entry = self.link_entry_text(home)?;
-            let mut created = create_dirs(&self.bin_dir)?;
+            let mut created = create_dirs(&self.bin_dir, 0o755)?;
             let copied = self.location_ok(&self.bin_dir).and_then(|()| {
-                write_new(&self.bin_dir, LINUX_EXE, 0o755, &mut |f| {
-                    std::io::copy(&mut *source, f).map(drop)
-                })
+                write_new(
+                    &self.bin_dir,
+                    LINUX_EXE,
+                    0o755,
+                    &mut |f| std::io::copy(&mut *source, f).map(drop),
+                    &|| true,
+                )
+                .map_err(InstallError::from)
             });
             if let Err(e) = copied {
                 remove_empty(&created);
                 return Err(e);
             }
-            let written = create_dirs(&self.apps_dir).and_then(|dirs| {
+            let written = create_dirs(&self.apps_dir, 0o755).and_then(|dirs| {
                 created.extend(dirs);
-                write_new(&self.apps_dir, MENU_ENTRY, 0o644, &mut |f| {
-                    f.write_all(entry.as_bytes())
-                })
+                write_new(
+                    &self.apps_dir,
+                    MENU_ENTRY,
+                    0o644,
+                    &mut |f| f.write_all(entry.as_bytes()),
+                    &|| true,
+                )
+                .map_err(InstallError::from)
             });
             if let Err(e) = written {
                 let _ = std::fs::remove_file(self.exe());
                 remove_empty(&created);
                 return Err(e);
             }
-            let linked = write_new(&self.apps_dir, LINK_ENTRY, 0o644, &mut |f| {
-                f.write_all(link_entry.as_bytes())
-            });
+            let linked = write_new(
+                &self.apps_dir,
+                LINK_ENTRY,
+                0o644,
+                &mut |f| f.write_all(link_entry.as_bytes()),
+                &|| true,
+            );
             if let Err(e) = linked {
                 let _ = std::fs::remove_file(self.menu_entry());
                 let _ = std::fs::remove_file(self.exe());
                 remove_empty(&created);
-                return Err(e);
+                return Err(e.into());
             }
-            Ok(())
+            Ok(
+                match edit_mimeapps(&self.config_dir, &mimeapps::add, &|| {}) {
+                    Ok((handler, _)) => handler,
+                    Err(why) => LinkHandler::NotChanged(why),
+                },
+            )
         }
 
-        /// Whether anything [`Self::install`] writes is at its name.
+        /// Whether anything [`Self::install`] writes is at its name (an
+        /// association left alone in `mimeapps.list` is not: GIO skips an
+        /// entry that is not there).
         #[must_use]
         pub fn installed(&self) -> bool {
             [self.menu_entry(), self.link_entry(), self.exe()]
@@ -1339,11 +1415,15 @@ mod linux {
                 .any(|p| std::fs::symlink_metadata(p).is_ok())
         }
 
-        /// Remove the menu entry, then the link entry, then the executable:
-        /// regular files only, anything else at those names left and
-        /// reported. Removing nothing changes nothing.
+        /// Take the link entry out of [`Self::mimeapps`] (never failing the
+        /// uninstall: [`Association`]), then remove the menu entry, the link
+        /// entry and the executable: regular files only, anything else at
+        /// those names left and reported. Removing nothing changes nothing.
         pub fn uninstall(&self) -> Result<Removal, InstallError> {
-            let mut done = Removal::default();
+            let mut done = Removal {
+                association: self.dissociate(),
+                ..Removal::default()
+            };
             for path in [self.menu_entry(), self.link_entry(), self.exe()] {
                 match std::fs::symlink_metadata(&path) {
                     Ok(m) if m.file_type().is_file() => {
@@ -1363,6 +1443,21 @@ mod linux {
                 }
             }
             Ok(done)
+        }
+
+        /// Take the link entry out of [`Self::mimeapps`]; a file that cannot
+        /// be edited is reported only while it still names the link entry.
+        fn dissociate(&self) -> Association {
+            match edit_mimeapps(
+                &self.config_dir,
+                &|text| (mimeapps::remove(text), ()),
+                &|| {},
+            ) {
+                Ok(((), true)) => Association::Removed,
+                Ok(((), false)) => Association::NotThere,
+                Err(why) if may_name_link_entry(&self.mimeapps()) => Association::Left(why),
+                Err(_) => Association::NotThere,
+            }
         }
 
         /// This process's ids and the real `stat`, or the tests'.
@@ -1422,16 +1517,18 @@ mod linux {
             .unwrap_or(dir)
     }
 
-    /// Create `dir` and the folders above it that are missing (mode 0755
-    /// before the umask); the ones created, from the top.
-    fn create_dirs(dir: &Path) -> Result<Vec<PathBuf>, InstallError> {
+    /// Create `dir` and the folders above it that are missing, with `mode`
+    /// before the umask (0755 for the program's folders, 0700 for a
+    /// configuration folder, as the XDG Base Directory spec asks); the ones
+    /// created, from the top.
+    fn create_dirs(dir: &Path, mode: u32) -> Result<Vec<PathBuf>, InstallError> {
         let missing: Vec<&Path> = dir
             .ancestors()
             .take_while(|p| std::fs::symlink_metadata(p).is_err())
             .collect();
         let mut created = Vec::new();
         for path in missing.into_iter().rev() {
-            if let Err(e) = std::fs::DirBuilder::new().mode(0o755).create(path) {
+            if let Err(e) = std::fs::DirBuilder::new().mode(mode).create(path) {
                 remove_empty(&created);
                 return Err(InstallError::Failed(format!(
                     "creating {}: {e}",
@@ -1451,19 +1548,47 @@ mod linux {
         }
     }
 
+    /// Why [`write_new`] put nothing in place.
+    #[derive(Debug)]
+    enum WriteError {
+        /// `unchanged` said the file changed since it was read: nothing was
+        /// replaced.
+        Changed,
+        /// The write failed.
+        Failed(InstallError),
+    }
+
+    impl From<WriteError> for InstallError {
+        fn from(e: WriteError) -> Self {
+            match e {
+                WriteError::Changed => {
+                    Self::Failed("another program changed the file meanwhile".to_owned())
+                }
+                WriteError::Failed(e) => e,
+            }
+        }
+    }
+
     /// Write `name` in `dir` with `mode`: into a new temporary file beside it
     /// (never one that exists, so never through a link), then renamed over
     /// the name, which replaces a link there rather than following it.
+    /// `unchanged` is asked just before the rename; `false` removes the
+    /// temporary file and replaces nothing ([`WriteError::Changed`]).
     fn write_new(
         dir: &Path,
         name: &str,
         mode: u32,
         fill: &mut dyn FnMut(&mut std::fs::File) -> std::io::Result<()>,
-    ) -> Result<(), InstallError> {
+        unchanged: &dyn Fn() -> bool,
+    ) -> Result<(), WriteError> {
         let target = dir.join(name);
         let tmp = dir.join(format!(".{name}.tmp"));
-        let failed =
-            |e: std::io::Error| InstallError::Failed(format!("writing {}: {e}", target.display()));
+        let failed = |e: std::io::Error| {
+            WriteError::Failed(InstallError::Failed(format!(
+                "writing {}: {e}",
+                target.display()
+            )))
+        };
         match std::fs::remove_file(&tmp) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => {}
@@ -1483,10 +1608,148 @@ mod linux {
             let _ = std::fs::remove_file(&tmp);
             return Err(failed(e));
         }
+        if !unchanged() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(WriteError::Changed);
+        }
         std::fs::rename(&tmp, &target).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             failed(e)
         })
+    }
+
+    /// A `mimeapps.list` as read for an edit: its text and its permission
+    /// bits; `None` when there is no such file.
+    type Snapshot = Option<(String, u32)>;
+
+    /// Read `path` for an edit. Refused, with the reason: a link (never
+    /// written through or replaced: dotfile managers use them), anything but
+    /// a regular file, more than 256 KiB, text that is not UTF-8, or a file
+    /// replaced between its check and its opening.
+    fn read_mimeapps(path: &Path) -> Result<Snapshot, String> {
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let unreadable = |e: std::io::Error| format!("it could not be read: {e}");
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(unreadable(e)),
+        };
+        if meta.file_type().is_symlink() {
+            return Err(
+                "it is a link to another file, which Tornect never writes through".to_owned(),
+            );
+        }
+        if !meta.is_file() {
+            return Err("it is not a regular file".to_owned());
+        }
+        let too_large = || "it is larger than 256 KiB".to_owned();
+        if meta.len() > MIMEAPPS_MAX {
+            return Err(too_large());
+        }
+        let file = std::fs::File::open(path).map_err(unreadable)?;
+        let opened = file.metadata().map_err(unreadable)?;
+        if (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+            return Err("another program replaced it while it was read".to_owned());
+        }
+        let mut bytes = Vec::new();
+        file.take(MIMEAPPS_MAX + 1)
+            .read_to_end(&mut bytes)
+            .map_err(unreadable)?;
+        if bytes.len() as u64 > MIMEAPPS_MAX {
+            return Err(too_large());
+        }
+        let text = String::from_utf8(bytes).map_err(|_| "it is not UTF-8 text".to_owned())?;
+        Ok(Some((text, meta.mode() & 0o777)))
+    }
+
+    /// Edit `config_dir`'s `mimeapps.list` with `edit` (design `invite`
+    /// §4.5), which answers the new text (`None`: no change) and what to
+    /// report. A missing file is created (mode 0644) and a missing
+    /// configuration folder with it (mode 0700); an existing file keeps its
+    /// mode, and one left empty is removed. The new text goes in with
+    /// [`write_new`]: the file is read again just before the rename (after
+    /// `meanwhile`, the tests' other program) and, when another program
+    /// changed it, the edit starts over from the new text, at most three
+    /// times. Refused (the reason, nothing changed): what [`read_mimeapps`]
+    /// refuses, a failed write, or a file that kept changing. A writer that
+    /// acts between the last read and the rename can still lose its change:
+    /// nothing locks this file, GIO included.
+    fn edit_mimeapps<T>(
+        config_dir: &Path,
+        edit: &dyn Fn(&str) -> (Option<String>, T),
+        meanwhile: &dyn Fn(),
+    ) -> Result<(T, bool), String> {
+        if !config_dir.is_absolute() {
+            return Err(format!("{} is not an absolute path", config_dir.display()));
+        }
+        let path = config_dir.join(MIMEAPPS);
+        let mut created = Vec::new();
+        let result = (|| {
+            for _ in 0..MIMEAPPS_TRIES {
+                let before = read_mimeapps(&path)?;
+                let (new, answer) = edit(before.as_ref().map_or("", |(text, _)| text.as_str()));
+                let Some(new) = new else {
+                    return Ok((answer, false));
+                };
+                let unchanged = || {
+                    meanwhile();
+                    read_mimeapps(&path).is_ok_and(|now| now == before)
+                };
+                let done = if new.is_empty() {
+                    if unchanged() {
+                        std::fs::remove_file(&path).map_err(|e| {
+                            WriteError::Failed(InstallError::Failed(format!(
+                                "removing {}: {e}",
+                                path.display()
+                            )))
+                        })
+                    } else {
+                        Err(WriteError::Changed)
+                    }
+                } else {
+                    created.extend(create_dirs(config_dir, 0o700).map_err(|e| e.to_string())?);
+                    let mode = before.as_ref().map_or(0o644, |(_, mode)| *mode);
+                    write_new(
+                        config_dir,
+                        MIMEAPPS,
+                        mode,
+                        &mut |f| f.write_all(new.as_bytes()),
+                        &unchanged,
+                    )
+                };
+                match done {
+                    Ok(()) => return Ok((answer, true)),
+                    Err(WriteError::Changed) => {}
+                    Err(WriteError::Failed(e)) => return Err(e.to_string()),
+                }
+            }
+            Err("another program kept changing it".to_owned())
+        })();
+        if result.is_err() {
+            remove_empty(&created);
+        }
+        result
+    }
+
+    /// Whether the file at `path`, read through a link if it is one, may
+    /// still name the link entry: a regular file whose first MiB holds its
+    /// name, or one that cannot be read or is larger. Anything else (no
+    /// file, a folder, a link to nothing) does not.
+    fn may_name_link_entry(path: &Path) -> bool {
+        use std::io::Read as _;
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() => {}
+            _ => return false,
+        }
+        let mut bytes = Vec::new();
+        let read = std::fs::File::open(path)
+            .and_then(|f| f.take(MIMEAPPS_SCAN + 1).read_to_end(&mut bytes));
+        read.is_err()
+            || bytes.len() as u64 > MIMEAPPS_SCAN
+            || bytes
+                .windows(LINK_ENTRY.len())
+                .any(|w| w == LINK_ENTRY.as_bytes())
     }
 
     #[cfg(test)]
@@ -1536,6 +1799,7 @@ mod linux {
                 LinuxInstall::new(
                     self.root.join("home/.local/bin"),
                     self.root.join("home/.local/share/applications"),
+                    self.root.join("home/.config"),
                 )
                 .with_facts(UID, GID, owned)
             }
@@ -1571,17 +1835,32 @@ mod linux {
         fn linux_install_writes_only_the_injected_dirs() {
             let tree = Tree::new();
             let install = tree.install();
-            install
-                .install(&mut std::io::Cursor::new(PROGRAM), None)
-                .unwrap();
+            assert_eq!(
+                install
+                    .install(&mut std::io::Cursor::new(PROGRAM), None)
+                    .unwrap(),
+                LinkHandler::Registered
+            );
             assert_eq!(
                 tree.files(),
                 set(&[
+                    "home/.config/mimeapps.list",
                     "home/.local/bin/tornect",
                     "home/.local/share/applications/tornect-link.desktop",
                     "home/.local/share/applications/tornect.desktop"
                 ])
             );
+            assert_eq!(
+                install.mimeapps(),
+                tree.root.join("home/.config/mimeapps.list")
+            );
+            assert_eq!(
+                std::fs::read_to_string(install.mimeapps()).unwrap(),
+                BOTH_GROUPS
+            );
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&install.mimeapps()), 0o644);
+            assert_eq!(mode(&tree.root.join("home/.config")), 0o700);
             assert_eq!(std::fs::read(install.exe()).unwrap(), PROGRAM);
             let mode = std::fs::metadata(install.exe())
                 .unwrap()
@@ -1728,6 +2007,7 @@ mod linux {
             let install = LinuxInstall::new(
                 tree.root.join("home/50% off/bin"),
                 tree.root.join("home/apps"),
+                tree.root.join("home/config"),
             )
             .with_facts(UID, GID, owned);
             let home = tree.root.join("my home");
@@ -1744,6 +2024,7 @@ mod linux {
             let bad = LinuxInstall::new(
                 tree.root.join("home/new\nline/bin"),
                 tree.root.join("home/apps2"),
+                tree.root.join("home/config2"),
             )
             .with_facts(UID, GID, owned);
             match bad.install(&mut std::io::Cursor::new(PROGRAM), None) {
@@ -1755,8 +2036,12 @@ mod linux {
             for dir in ["home/new\nline", "home/apps2"] {
                 assert!(!tree.root.join(dir).exists(), "{dir:?} was created");
             }
-            let relative = LinuxInstall::new(tree.root.join("home/bin3"), tree.root.join("a3"))
-                .with_facts(UID, GID, owned);
+            let relative = LinuxInstall::new(
+                tree.root.join("home/bin3"),
+                tree.root.join("a3"),
+                tree.root.join("c3"),
+            )
+            .with_facts(UID, GID, owned);
             assert!(matches!(
                 relative.install(
                     &mut std::io::Cursor::new(PROGRAM),
@@ -1776,6 +2061,7 @@ mod linux {
             let install = LinuxInstall::new(
                 PathBuf::from("/home/u/.local/bin"),
                 PathBuf::from("/home/u/.local/share/applications"),
+                PathBuf::from("/home/u/.config"),
             );
             assert_eq!(
                 install.link_entry(),
@@ -1814,6 +2100,7 @@ mod linux {
             let install = LinuxInstall::new(
                 tree.root.join("home/50% off/bin"),
                 tree.root.join("home/apps"),
+                tree.root.join("home/config"),
             )
             .with_facts(UID, GID, owned);
             let home = tree.root.join("my home");
@@ -1845,6 +2132,7 @@ mod linux {
             let bad = LinuxInstall::new(
                 tree.root.join("home/new\nline/bin"),
                 tree.root.join("home/apps2"),
+                tree.root.join("home/config2"),
             )
             .with_facts(UID, GID, owned);
             assert!(matches!(
@@ -1927,6 +2215,382 @@ mod linux {
                 ])
             );
             assert!(!install.installed());
+        }
+
+        /// `mimeapps.list` after an install into an empty configuration
+        /// folder.
+        const BOTH_GROUPS: &str = "[Added Associations]\n\
+                                   x-scheme-handler/tornect=tornect-link.desktop;\n\
+                                   \n\
+                                   [Default Applications]\n\
+                                   x-scheme-handler/tornect=tornect-link.desktop;\n";
+
+        /// The user's own `mimeapps.list`: CRLF, comments, other groups.
+        const USERS_OWN: &str = "# mine\r\n\
+                                 [Default Applications]\r\n\
+                                 text/html=firefox.desktop;\r\n\
+                                 \r\n\
+                                 [Added Associations]\r\n\
+                                 x-scheme-handler/tornect=other.desktop;\r\n";
+
+        /// Uninstalling gives back the user's `mimeapps.list` byte for byte,
+        /// and its mode; one the install created goes again, and the
+        /// configuration folder stays.
+        #[test]
+        fn uninstall_gives_back_the_mimeapps_list() {
+            let tree = Tree::new();
+            let install = tree.install();
+            let config = tree.root.join("home/.config");
+            std::fs::create_dir_all(&config).unwrap();
+            std::fs::write(install.mimeapps(), USERS_OWN).unwrap();
+            std::fs::set_permissions(install.mimeapps(), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            assert_eq!(
+                install
+                    .install(&mut std::io::Cursor::new(PROGRAM), None)
+                    .unwrap(),
+                LinkHandler::Registered
+            );
+            assert_eq!(
+                std::fs::read_to_string(install.mimeapps()).unwrap(),
+                "# mine\r\n\
+                 [Default Applications]\r\n\
+                 text/html=firefox.desktop;\r\n\
+                 x-scheme-handler/tornect=tornect-link.desktop;\r\n\
+                 \r\n\
+                 [Added Associations]\r\n\
+                 x-scheme-handler/tornect=other.desktop;tornect-link.desktop;\r\n"
+            );
+            let mode = || {
+                std::fs::metadata(install.mimeapps())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode(), 0o600);
+            let removal = install.uninstall().unwrap();
+            assert_eq!(removal.association, Association::Removed);
+            assert_eq!(
+                std::fs::read_to_string(install.mimeapps()).unwrap(),
+                USERS_OWN
+            );
+            assert_eq!(mode(), 0o600);
+            assert!(!config.join(".mimeapps.list.tmp").exists());
+
+            // Created by the install: removed by the uninstall.
+            std::fs::remove_file(install.mimeapps()).unwrap();
+            install
+                .install(&mut std::io::Cursor::new(PROGRAM), None)
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(install.mimeapps()).unwrap(),
+                BOTH_GROUPS
+            );
+            assert_eq!(
+                install.uninstall().unwrap().association,
+                Association::Removed
+            );
+            assert!(tree.files().is_empty(), "{:?}", tree.files());
+            assert!(config.is_dir());
+            // Nothing left to take out.
+            assert_eq!(install.uninstall().unwrap(), Removal::default());
+        }
+
+        /// What the install says about links follows the user's file: another
+        /// program's default is left (`OtherDefault`), a removal the user
+        /// wrote writes nothing (`TurnedOff`); the program is installed in
+        /// both cases.
+        #[test]
+        fn the_install_reports_what_links_do() {
+            let tree = Tree::new();
+            let install = tree.install();
+            std::fs::create_dir_all(tree.root.join("home/.config")).unwrap();
+            let other = "[Default Applications]\nx-scheme-handler/tornect=other.desktop;\n";
+            std::fs::write(install.mimeapps(), other).unwrap();
+            assert_eq!(
+                install
+                    .install(&mut std::io::Cursor::new(PROGRAM), None)
+                    .unwrap(),
+                LinkHandler::OtherDefault
+            );
+            assert_eq!(
+                std::fs::read_to_string(install.mimeapps()).unwrap(),
+                format!(
+                    "{other}\n[Added Associations]\nx-scheme-handler/tornect=tornect-link.desktop;\n"
+                )
+            );
+            install.uninstall().unwrap();
+            assert_eq!(std::fs::read_to_string(install.mimeapps()).unwrap(), other);
+
+            let off = "[Removed Associations]\nx-scheme-handler/tornect=tornect-link.desktop;\n";
+            std::fs::write(install.mimeapps(), off).unwrap();
+            assert_eq!(
+                install
+                    .install(&mut std::io::Cursor::new(PROGRAM), None)
+                    .unwrap(),
+                LinkHandler::TurnedOff
+            );
+            assert!(install.exe().is_file() && install.link_entry().is_file());
+            assert_eq!(std::fs::read_to_string(install.mimeapps()).unwrap(), off);
+            let removal = install.uninstall().unwrap();
+            assert_eq!(removal.association, Association::NotThere);
+            assert_eq!(std::fs::read_to_string(install.mimeapps()).unwrap(), off);
+        }
+
+        /// A `mimeapps.list` that is a link (a dotfile manager's) is never
+        /// written through or replaced: the install says so and goes on, the
+        /// link and its target stay as they were. The uninstall reports it
+        /// only while the target names the link entry.
+        #[test]
+        fn a_linked_mimeapps_list_is_never_written() {
+            let tree = Tree::new();
+            let install = tree.install();
+            let config = tree.root.join("home/.config");
+            std::fs::create_dir_all(&config).unwrap();
+            let target = tree.root.join("dotfiles-mimeapps.list");
+            std::fs::write(&target, USERS_OWN).unwrap();
+            symlink(&target, install.mimeapps()).unwrap();
+            match install
+                .install(&mut std::io::Cursor::new(PROGRAM), None)
+                .unwrap()
+            {
+                LinkHandler::NotChanged(why) => assert!(why.contains("link"), "{why}"),
+                other => panic!("wrote through a link: {other:?}"),
+            }
+            let still_a_link = || {
+                std::fs::symlink_metadata(install.mimeapps())
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            };
+            assert!(still_a_link());
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), USERS_OWN);
+            assert!(!config.join(".mimeapps.list.tmp").exists());
+            assert!(install.exe().is_file() && install.link_entry().is_file());
+            // The target names no link entry: nothing to report.
+            assert_eq!(
+                install.uninstall().unwrap().association,
+                Association::NotThere
+            );
+            // The user added the line to the target by hand: reported.
+            install
+                .install(&mut std::io::Cursor::new(PROGRAM), None)
+                .unwrap();
+            let by_hand = format!(
+                "{USERS_OWN}[Default Applications]\r\nx-scheme-handler/tornect=tornect-link.desktop;\r\n"
+            );
+            std::fs::write(&target, &by_hand).unwrap();
+            match install.uninstall().unwrap().association {
+                Association::Left(why) => assert!(why.contains("link"), "{why}"),
+                other => panic!("{other:?}"),
+            }
+            assert!(still_a_link());
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), by_hand);
+        }
+
+        /// A `mimeapps.list` that is not UTF-8, larger than 256 KiB, or not a
+        /// regular file is not changed, and the install goes on.
+        #[test]
+        fn an_unreadable_mimeapps_list_is_not_changed() {
+            let large = format!("# {}\n", "x".repeat(256 * 1024));
+            let not_utf8: &[u8] = b"[Added Associations]\ntext/plain=\xff.desktop;\n";
+            for (content, why) in [
+                (Some(not_utf8.to_vec()), "not UTF-8"),
+                (Some(large.into_bytes()), "larger than 256 KiB"),
+                (None, "not a regular file"),
+            ] {
+                let tree = Tree::new();
+                let install = tree.install();
+                std::fs::create_dir_all(tree.root.join("home/.config")).unwrap();
+                match &content {
+                    Some(bytes) => std::fs::write(install.mimeapps(), bytes).unwrap(),
+                    None => std::fs::create_dir(install.mimeapps()).unwrap(),
+                }
+                match install
+                    .install(&mut std::io::Cursor::new(PROGRAM), None)
+                    .unwrap()
+                {
+                    LinkHandler::NotChanged(got) => assert!(got.contains(why), "{got}"),
+                    other => panic!("{why}: {other:?}"),
+                }
+                match &content {
+                    Some(bytes) => assert_eq!(&std::fs::read(install.mimeapps()).unwrap(), bytes),
+                    None => assert!(install.mimeapps().is_dir()),
+                }
+                assert!(install.exe().is_file(), "{why}");
+                // None of them names the link entry: nothing reported.
+                assert_eq!(
+                    install.uninstall().unwrap().association,
+                    Association::NotThere,
+                    "{why}"
+                );
+            }
+        }
+
+        /// Another program that changes `mimeapps.list` between the read and
+        /// the rename: the edit starts over from its text, so both changes
+        /// are in the file; one that keeps changing it gets the file left
+        /// with its own change only, after three tries.
+        #[test]
+        fn a_mimeapps_list_changed_meanwhile_is_edited_again() {
+            use std::cell::Cell;
+            let tmp = tempfile::tempdir().unwrap();
+            let config = tmp.path().join("config");
+            std::fs::create_dir(&config).unwrap();
+            let path = config.join(MIMEAPPS);
+            std::fs::write(&path, "[Default Applications]\ntext/html=a.desktop;\n").unwrap();
+            let other = "[Added Associations]\ntext/plain=b.desktop;\n";
+            let calls = Cell::new(0);
+            let once = || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    let mut text = std::fs::read_to_string(&path).unwrap();
+                    text.push_str(other);
+                    std::fs::write(&path, text).unwrap();
+                }
+            };
+            let (handler, written) = edit_mimeapps(&config, &mimeapps::add, &once).unwrap();
+            assert_eq!((handler, written), (LinkHandler::Registered, true));
+            assert_eq!(calls.get(), 2);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "[Default Applications]\n\
+                 text/html=a.desktop;\n\
+                 x-scheme-handler/tornect=tornect-link.desktop;\n\
+                 [Added Associations]\n\
+                 text/plain=b.desktop;\n\
+                 x-scheme-handler/tornect=tornect-link.desktop;\n"
+            );
+
+            std::fs::write(&path, "k=v\n").unwrap();
+            let always = || {
+                let mut text = std::fs::read_to_string(&path).unwrap();
+                text.push_str("# again\n");
+                std::fs::write(&path, text).unwrap();
+            };
+            assert_eq!(
+                edit_mimeapps(&config, &mimeapps::add, &always),
+                Err("another program kept changing it".to_owned())
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "k=v\n# again\n# again\n# again\n"
+            );
+            assert!(!config.join(".mimeapps.list.tmp").exists());
+        }
+
+        /// A missing configuration folder (and the folders above it) is
+        /// created owner-only, 0700, with the file 0644 in it; a relative
+        /// configuration folder changes nothing.
+        #[test]
+        fn a_missing_config_folder_is_created_owner_only() {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = tmp.path().join("xdg/config");
+            let (handler, written) = edit_mimeapps(&config, &mimeapps::add, &|| {}).unwrap();
+            assert_eq!((handler, written), (LinkHandler::Registered, true));
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&tmp.path().join("xdg")), 0o700);
+            assert_eq!(mode(&config), 0o700);
+            assert_eq!(mode(&config.join(MIMEAPPS)), 0o644);
+            assert_eq!(
+                std::fs::read_to_string(config.join(MIMEAPPS)).unwrap(),
+                BOTH_GROUPS
+            );
+            // A removal never creates the folder.
+            let other = tmp.path().join("nowhere/config");
+            assert_eq!(
+                edit_mimeapps(&other, &|t| (mimeapps::remove(t), ()), &|| {}),
+                Ok(((), false))
+            );
+            assert!(!tmp.path().join("nowhere").exists());
+            assert!(matches!(
+                edit_mimeapps(Path::new("relative/config"), &mimeapps::add, &|| {}),
+                Err(why) if why.contains("not an absolute path")
+            ));
+            assert!(!Path::new("relative").exists());
+        }
+
+        /// GIO (`/usr/bin/gio`, GLib) opens a `tornect:` link with the
+        /// installed link entry, with the URI as the one argument after
+        /// `open-link --`, and finds no handler once uninstalled; also with a
+        /// custom home that needs quotes. Isolated `HOME` and `XDG_*`; the
+        /// installed program is a shell script that records its arguments.
+        #[test]
+        #[ignore = "needs /usr/bin/gio"]
+        fn gio_opens_a_link_with_the_installed_entry() {
+            use std::process::Command;
+            let tree = Tree::new();
+            let home = tree.root.join("home");
+            let runtime = tree.root.join("run");
+            for dir in ["data", "conf", "run"] {
+                std::fs::create_dir(tree.root.join(dir)).unwrap();
+            }
+            std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let out = tree.root.join("argv");
+            let program = format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '[%s]' \"$a\"; done > '{0}.tmp'\nmv '{0}.tmp' '{0}'\n",
+                out.display()
+            );
+            let gio = |args: &[&str]| {
+                let output = Command::new("/usr/bin/gio")
+                    .args(args)
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("HOME", &home)
+                    .env("XDG_DATA_HOME", home.join(".local/share"))
+                    .env("XDG_CONFIG_HOME", home.join(".config"))
+                    .env("XDG_DATA_DIRS", tree.root.join("data"))
+                    .env("XDG_CONFIG_DIRS", tree.root.join("conf"))
+                    .env("XDG_RUNTIME_DIR", &runtime)
+                    .env("XDG_CURRENT_DESKTOP", "")
+                    .env("DBUS_SESSION_BUS_ADDRESS", "disabled:")
+                    .env("GIO_USE_VFS", "local")
+                    .output()
+                    .expect("/usr/bin/gio runs");
+                (
+                    output.status.success(),
+                    String::from_utf8_lossy(&output.stdout).into_owned(),
+                )
+            };
+            let id = tornect_core::keys::HostIdentity::from_seed(&[7; 32]).id();
+            let link = tornect_core::invite::link(&id);
+            let custom = tree.root.join("my home");
+            for (custom_home, expected) in [
+                (None, format!("[open-link][--][{link}]")),
+                (
+                    Some(custom.as_path()),
+                    format!("[--home][{}][open-link][--][{link}]", custom.display()),
+                ),
+            ] {
+                let install = tree.install();
+                assert_eq!(
+                    install
+                        .install(&mut std::io::Cursor::new(program.clone()), custom_home)
+                        .unwrap(),
+                    LinkHandler::Registered
+                );
+                let (ok, mime) = gio(&["mime", LINK_MIME]);
+                assert!(ok, "{mime}");
+                assert!(
+                    mime.lines().next().is_some_and(
+                        |l| l.starts_with("Default application") && l.ends_with(LINK_ENTRY)
+                    ),
+                    "{mime}"
+                );
+                let _ = std::fs::remove_file(&out);
+                let (ok, said) = gio(&["open", &link]);
+                assert!(ok, "gio open failed: {said}");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !out.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                assert_eq!(std::fs::read_to_string(&out).unwrap(), expected);
+                install.uninstall().unwrap();
+                let (_, mime) = gio(&["mime", LINK_MIME]);
+                assert!(mime.starts_with("No default applications"), "{mime}");
+                assert!(!mime.contains(LINK_ENTRY), "{mime}");
+            }
         }
 
         /// Uninstalling where nothing was installed removes nothing and

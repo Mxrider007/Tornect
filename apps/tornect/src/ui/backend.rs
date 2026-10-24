@@ -5152,7 +5152,11 @@ mod tests {
             tornect_core::levels::AccountFacts::Linux,
             b"this machine",
         );
-        let files = tornect_platform::install::LinuxInstall::new(bin.clone(), apps);
+        let files = tornect_platform::install::LinuxInstall::new(
+            bin.clone(),
+            apps,
+            tmp.path().join("config"),
+        );
         let probe = files.clone();
         watch.installed = Arc::new(move || Some(probe.installed()));
         let shared = Shared::new(Model::default(), Arc::new(|_| {}));
