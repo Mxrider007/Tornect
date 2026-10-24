@@ -17,7 +17,9 @@ use tornect_codec::{DecodedFrame, EncoderSettings, H264Encoder};
 use tornect_core::session_log::SessionMode;
 use tornect_core::{DeviceId, DeviceIdentity, HostIdentity};
 use tornect_input::{Button, InputError, InputEvent, InputSink};
-use tornect_proto::{Msg, codec, read_msg, reason, video_flags, write_msg};
+use tornect_proto::{
+    HostStats, Msg, QualityInfo, codec, quality, read_msg, reason, video_flags, write_msg,
+};
 use tornect_signal::consent::SessionToken;
 use tornect_signal::fsm::client::{
     self, ClientConfig, ClientDeps, ClientOutcome, Intent, ScriptedClientUi, SessionEvent,
@@ -36,6 +38,15 @@ use crate::*;
 
 const WAIT: Duration = Duration::from_secs(10);
 const KEY_A: u32 = 0x07_0004;
+/// What a host applies to every stream (`host.rs` `applied_quality`), and
+/// what the scripted hosts here say in their `BindOk`.
+const APPLIED: QualityInfo = QualityInfo {
+    preset: quality::BALANCED,
+    max_fps: 15,
+    kbps: 1500,
+    max_long: 3840,
+    max_short: 2160,
+};
 
 /// A test card that says when it was closed.
 struct Card {
@@ -1363,6 +1374,7 @@ async fn a_viewer_with_nothing_to_say_pings_the_host() {
         height: 720,
         codec: codec::H264,
         mode: 0,
+        quality: APPLIED,
     };
     write_msg(&mut host, &bind_ok).await.unwrap();
     let start = tokio::time::Instant::now();
@@ -1402,6 +1414,7 @@ async fn run_viewer_with(
         height: 720,
         codec: codec::H264,
         mode: 0,
+        quality: APPLIED,
     };
     write_msg(&mut host, &bind_ok).await.unwrap();
     (host, viewer)
@@ -1467,6 +1480,46 @@ async fn a_viewer_without_an_input_channel_sends_no_input() {
     drop(host);
     let (_, stats) = viewer.await.unwrap();
     assert_eq!(stats.input_sent, 0);
+}
+
+/// The quality design §4.6: a host's `Quality` and `Stats` are display-only
+/// to the viewer, which reads on past them; a host's `SetQuality` is a frame
+/// it must not send, as `Input` is.
+#[tokio::test(start_paused = true)]
+async fn a_viewer_reads_on_past_quality_and_stats_and_refuses_a_host_set_quality() {
+    let (mut host, viewer) = run_viewer_with(None).await;
+    for msg in [
+        Msg::Quality {
+            width: 1280,
+            height: 694,
+            quality: APPLIED,
+        },
+        Msg::Stats(HostStats {
+            window_ms: 1000,
+            ..HostStats::default()
+        }),
+        Msg::Close {
+            reason: reason::ENDED_BY_HOST,
+        },
+    ] {
+        write_msg(&mut host, &msg).await.unwrap();
+    }
+    let (end, _) = viewer.await.unwrap();
+    assert!(
+        matches!(end, Ok(ViewerEnd::Host(r)) if r == reason::ENDED_BY_HOST),
+        "{end:?}"
+    );
+
+    let (mut host, viewer) = run_viewer_with(None).await;
+    let set = Msg::SetQuality {
+        quality: quality::BEST_QUALITY,
+    };
+    write_msg(&mut host, &set).await.unwrap();
+    let (end, _) = viewer.await.unwrap();
+    assert!(
+        matches!(end, Err(ViewerError::Unexpected("SetQuality"))),
+        "{end:?}"
+    );
 }
 
 /// Addendum Q3: a session that ends while its source is still opening (on
@@ -1992,6 +2045,192 @@ async fn a_first_frame_that_is_not_a_bind_is_refused_unread() {
     );
 }
 
+/// The viewer's `Bind` with `preset` instead of the one it sends.
+fn bind_with(binding: &Binding, preset: u8) -> Msg {
+    let Msg::Bind {
+        session_id, mac, ..
+    } = binding.msg()
+    else {
+        unreachable!("a binding's message is a Bind");
+    };
+    Msg::Bind {
+        session_id,
+        mac,
+        quality: preset,
+    }
+}
+
+/// The quality design §4.1: whichever preset the viewer's `Bind` names,
+/// `BindOk` gives the exact size of the first picture and what the stream
+/// applies, the same for every preset at this step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bind_of_each_preset_gets_what_the_stream_applies() {
+    let rig = rig(MediaLimits::default());
+    for (seed, preset) in [
+        (40, quality::BEST_QUALITY),
+        (41, quality::BALANCED),
+        (42, quality::BEST_PERFORMANCE),
+    ] {
+        let (_, binding) = start(&rig.host, seed, SessionMode::ViewOnly);
+        let (mut client, served) = connect(&rig.host);
+        write_msg(&mut client, &bind_with(&binding, preset))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_msg(&mut client).await.unwrap(),
+            Some(Msg::BindOk {
+                width: 256,
+                height: 96,
+                codec: codec::H264,
+                mode: 1,
+                quality: APPLIED,
+            }),
+            "preset {preset}"
+        );
+        drop(client);
+        assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
+    }
+    assert_eq!(rig.backend.sources.load(Ordering::SeqCst), 3);
+}
+
+/// The quality design §8 host test 2: a `Bind` naming a preset this version
+/// does not know is refused like any malformed bind, before its session is
+/// looked up or claimed: nothing is captured, and the real bind still works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bind_with_an_unknown_preset_is_refused_before_anything_opens() {
+    let rig = rig(MediaLimits::default());
+    let (_, binding) = start(&rig.host, 43, SessionMode::Control);
+    for preset in [0, 4, 9, 255] {
+        let (mut client, served) = connect(&rig.host);
+        write_msg(&mut client, &bind_with(&binding, preset))
+            .await
+            .unwrap();
+        assert_eq!(served.await.unwrap(), MediaOutcome::NotBound);
+        assert_eq!(
+            read_msg(&mut client).await.unwrap(),
+            Some(Msg::BindRefused {
+                reason: reason::PROTOCOL
+            }),
+            "preset {preset}"
+        );
+    }
+    assert_eq!(rig.backend.sources.load(Ordering::SeqCst), 0);
+    let (client, served) = connect(&rig.host);
+    let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
+    drop(viewer);
+    assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
+}
+
+/// The quality design §4.7: a viewer of the version before it sends a
+/// 49-byte `Bind`, which is refused as a protocol error with nothing opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bind_of_the_previous_version_is_refused() {
+    let rig = rig(MediaLimits::default());
+    let (_, binding) = start(&rig.host, 44, SessionMode::Control);
+    let mut old = bind_with(&binding, quality::BALANCED).encode();
+    old.pop();
+    old[..4].copy_from_slice(&49u32.to_be_bytes());
+    let (mut client, served) = connect(&rig.host);
+    client.write_all(&old).await.unwrap();
+    assert_eq!(served.await.unwrap(), MediaOutcome::NotBound);
+    assert_eq!(
+        read_msg(&mut client).await.unwrap(),
+        Some(Msg::BindRefused {
+            reason: reason::PROTOCOL
+        })
+    );
+    assert_eq!(rig.backend.sources.load(Ordering::SeqCst), 0);
+}
+
+/// The quality design §4.6: `SetQuality` is legal in control and view-only
+/// sessions alike and changes nothing yet: pictures keep coming, input is
+/// still injected in control and still dropped undecoded in view-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_quality_is_taken_in_either_mode() {
+    for (seed, mode) in [(45, SessionMode::Control), (46, SessionMode::ViewOnly)] {
+        let rig = rig(MediaLimits::default());
+        let (_, binding) = start(&rig.host, seed, mode);
+        let (mut client, served) = connect(&rig.host);
+        bind_raw(&mut client, &binding).await;
+        for preset in [
+            quality::BEST_PERFORMANCE,
+            quality::BEST_QUALITY,
+            quality::BALANCED,
+            quality::BALANCED,
+        ] {
+            write_msg(&mut client, &Msg::SetQuality { quality: preset })
+                .await
+                .unwrap();
+        }
+        let key = InputEvent::Key {
+            usb: KEY_A,
+            pressed: true,
+        };
+        write_msg(&mut client, &Msg::Input(key.encode()))
+            .await
+            .unwrap();
+        sync(&mut client, 7).await;
+        let (first, _) = next_video(&mut client).await;
+        write_msg(&mut client, &Msg::VideoAck { seq: first })
+            .await
+            .unwrap();
+        next_video(&mut client).await;
+        write_msg(
+            &mut client,
+            &Msg::Close {
+                reason: reason::ENDED_BY_VIEWER,
+            },
+        )
+        .await
+        .unwrap();
+        let MediaOutcome::Served { report, end, .. } = served.await.unwrap() else {
+            panic!("not served");
+        };
+        assert_eq!(end, MediaEnd::ViewerLeft, "{mode:?}");
+        if matches!(mode, SessionMode::Control) {
+            assert_eq!(report.input_injected, 1);
+            assert_eq!(rig.backend.recorder.events()[0], key);
+        } else {
+            assert_eq!((report.input_injected, report.input_dropped), (0, 1));
+        }
+        assert_eq!(rig.backend.sources.load(Ordering::SeqCst), 1, "{mode:?}");
+    }
+}
+
+/// The quality design §8 host test 14: a viewer's `Quality` or `Stats`, the
+/// host's own messages, ends the stream as a protocol error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_viewers_quality_or_stats_is_a_protocol_error() {
+    let rig = rig(MediaLimits::default());
+    for (seed, msg) in [
+        (
+            47,
+            Msg::Quality {
+                width: 256,
+                height: 96,
+                quality: APPLIED,
+            },
+        ),
+        (
+            48,
+            Msg::Stats(HostStats {
+                window_ms: 1,
+                ..HostStats::default()
+            }),
+        ),
+    ] {
+        let (_, binding) = start(&rig.host, seed, SessionMode::Control);
+        let (mut client, served) = connect(&rig.host);
+        bind_raw(&mut client, &binding).await;
+        write_msg(&mut client, &msg).await.unwrap();
+        let MediaOutcome::Served { end, .. } = served.await.unwrap() else {
+            panic!("not served");
+        };
+        assert_eq!(end, MediaEnd::Protocol, "{msg:?}");
+        assert_eq!(until_close(&mut client).await, Some(reason::PROTOCOL));
+    }
+}
+
 /// Capture that cannot start refuses the bind, says why, and starts nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_capture_that_cannot_start_refuses_the_bind() {
@@ -2043,6 +2282,7 @@ async fn an_undecodable_unit_asks_for_a_keyframe_and_is_still_acknowledged() {
             height: 96,
             codec: codec::H264,
             mode: 0,
+            quality: APPLIED,
         };
         write_msg(&mut host, &bind_ok).await.unwrap();
         // The P-frame alone: the viewer has no parameter sets to decode it with.
@@ -2267,6 +2507,7 @@ impl Flood {
                 height: 720,
                 codec: codec::H264,
                 mode: 1,
+                quality: APPLIED,
             },
         )
         .await

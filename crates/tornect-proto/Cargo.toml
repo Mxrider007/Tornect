@@ -18,6 +18,8 @@ tokio = { workspace = true, features = ["io-util"] }
 zeroize.workspace = true
 
 [dev-dependencies]
+# Property tests of the wire format (decode never panics; valid messages round-trip).
+proptest.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 
 [lints]

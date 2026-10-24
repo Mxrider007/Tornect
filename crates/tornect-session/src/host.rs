@@ -5,7 +5,7 @@
 //!
 //! 1. **Bind.** The first frame must be a `Bind`. It must arrive complete
 //!    within [`MediaLimits::bind_deadline`], and it is read at its fixed size,
-//!    so an unbound peer holds nothing for long and costs the host 49 bytes.
+//!    so an unbound peer holds nothing for long and costs the host 50 bytes.
 //!    The session must be live and not yet bound, and the MAC must verify
 //!    under that session's token and `th_final` (`tornect_proto::bind_mac_ok`,
 //!    constant time). Reading a `Bind` takes no slot: a live session's viewer
@@ -34,13 +34,13 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Notify, Semaphore, mpsc, watch};
 use tornect_capture::{CaptureError, VideoSource};
 use tornect_codec::scale::{ResolutionCap, Scaler};
-use tornect_codec::{EncoderSettings, H264Encoder};
+use tornect_codec::{EncoderSettings, H264Encoder, MAX_LONG_SIDE, MAX_SHORT_SIDE};
 use tornect_core::levels::Elevation;
 use tornect_core::session_log::SessionMode;
 use tornect_input::{InputError, InputEvent, InputSink, Tracked};
 use tornect_proto::{
-    MAX_CLIENT_FRAME, Msg, ProtoError, SESSION_ID_LEN, codec, read_msg_max, reason, video_flags,
-    write_msg,
+    BIND_TYPE, MAX_CLIENT_FRAME, Msg, ProtoError, QualityInfo, SESSION_ID_LEN, codec, quality,
+    read_msg_max, reason, video_flags, write_msg,
 };
 use tornect_signal::consent::{SessionToken, mode_code};
 use tornect_signal::fsm::host::{KillSwitch, LiveSession, SessionEnd, SessionSink};
@@ -62,8 +62,8 @@ const INBOUND_DEPTH: usize = 64;
 const PINGS_PER_SEC: u32 = 5;
 /// `Ping`s answered at once.
 const PING_BURST: u32 = 10;
-/// A `Bind` frame: the type byte, the session id, the MAC.
-const BIND_LEN: usize = 1 + SESSION_ID_LEN + 32;
+/// A `Bind` frame: the type byte, the session id, the MAC, the preset.
+const BIND_LEN: usize = 1 + SESSION_ID_LEN + 32 + 1;
 
 /// The host's bounds on media streams.
 #[derive(Debug, Clone, Copy)]
@@ -397,7 +397,13 @@ impl MediaHost {
     {
         let (mut rd, mut wr) = tokio::io::split(stream);
         let deadline = tokio::time::Instant::now() + self.limits.bind_deadline;
-        let (session_id, mac) = match tokio::time::timeout_at(deadline, read_bind(&mut rd)).await {
+        // The viewer's preset is read, and a code this version does not know
+        // refused with the malformed binds below, before any look-up. It is
+        // not applied: every stream runs `MediaLimits.encoder`
+        // (`applied_quality`).
+        let (session_id, mac, _preset) = match tokio::time::timeout_at(deadline, read_bind(&mut rd))
+            .await
+        {
             Ok(Ok(bind)) => bind,
             Ok(Err(ProtoError::Io(e))) => {
                 tracing::debug!(error = %e, "media stream closed before its bind");
@@ -571,6 +577,7 @@ impl MediaHost {
             height: first.height,
             codec: codec::H264,
             mode: mode_code(mode),
+            quality: applied_quality(&self.limits.encoder),
         };
         if let Err(stop) = send(&mut wr, &bind_ok, &mut end, None).await {
             pipeline.stop().await;
@@ -769,20 +776,57 @@ impl SessionSink for MediaHost {
     }
 }
 
+/// What every stream applies, said in `BindOk`: `MediaLimits.encoder`'s
+/// frame rate and bitrate (the Balanced preset's) and the codec's own picture
+/// cap, which the pipeline fits every desktop under.
+fn applied_quality(encoder: &EncoderSettings) -> QualityInfo {
+    let edge = |side: u32| u16::try_from(side).unwrap_or(u16::MAX);
+    QualityInfo {
+        preset: quality::BALANCED,
+        // `as` saturates (NaN gives 0); a frame rate under 1 reads as 1.
+        max_fps: (encoder.max_fps as u8).max(1),
+        kbps: (encoder.bitrate_bps / 1000).max(1),
+        max_long: edge(MAX_LONG_SIDE),
+        max_short: edge(MAX_SHORT_SIDE),
+    }
+}
+
+/// What a `Bind` carries: the session id, the MAC and the viewer's preset.
+type Bound = (String, [u8; 32], u8);
+
 /// The first frame of a media stream, read without trusting its length prefix:
 /// a `Bind` is exactly [`BIND_LEN`] bytes, so that is all an unbound peer can
-/// make the host read.
-async fn read_bind<R: AsyncRead + Unpin>(r: &mut R) -> Result<(String, [u8; 32]), ProtoError> {
+/// make the host read. Returns the session id, the MAC and the viewer's
+/// preset code (one `tornect_proto::quality` knows; any other is malformed).
+async fn read_bind<R: AsyncRead + Unpin>(r: &mut R) -> Result<Bound, ProtoError> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
     if len != BIND_LEN {
+        // A viewer of another Tornect version sends a `Bind` of another
+        // length (the quality design, §4.7). One more byte, the frame's type,
+        // tells it from anything else, so the host's log can say why the
+        // stream is refused; a frame longer than any client frame is refused
+        // unread.
+        if (1..=MAX_CLIENT_FRAME).contains(&len) {
+            let mut ty = [0u8; 1];
+            r.read_exact(&mut ty).await?;
+            if ty[0] == BIND_TYPE {
+                tracing::info!(
+                    "a media bind of {len} bytes: the viewer may run a different Tornect version"
+                );
+            }
+        }
         return Err(ProtoError::Size(len));
     }
     let mut frame = [0u8; BIND_LEN];
     r.read_exact(&mut frame).await?;
     match Msg::decode(&frame)? {
-        Msg::Bind { session_id, mac } => Ok((session_id, mac)),
+        Msg::Bind {
+            session_id,
+            mac,
+            quality,
+        } => Ok((session_id, mac, quality)),
         _ => Err(ProtoError::Malformed("Bind")),
     }
 }
@@ -1109,8 +1153,18 @@ impl Served<'_> {
                 }
             }
             Msg::Pong { .. } => {}
+            // Legal in control and view-only sessions alike, and it costs
+            // nothing here: the stream keeps `MediaLimits.encoder`
+            // (`applied_quality`) whatever the viewer picks. Never logged
+            // per message.
+            Msg::SetQuality { .. } => {}
             Msg::Close { .. } => return Handled::End(MediaEnd::ViewerLeft),
-            Msg::Bind { .. } | Msg::BindOk { .. } | Msg::BindRefused { .. } | Msg::Video { .. } => {
+            Msg::Bind { .. }
+            | Msg::BindOk { .. }
+            | Msg::BindRefused { .. }
+            | Msg::Video { .. }
+            | Msg::Quality { .. }
+            | Msg::Stats(_) => {
                 return Handled::End(MediaEnd::Protocol);
             }
         }
@@ -1372,5 +1426,178 @@ mod tests {
             quiet.due(false),
             "room in the queue: let go of at the deadline"
         );
+    }
+
+    /// The message of every event logged while it is the thread's subscriber.
+    struct Lines(Arc<Mutex<Vec<String>>>);
+
+    struct Message<'a>(&'a mut String);
+
+    impl tracing::field::Visit for Message<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for Lines {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = String::new();
+            event.record(&mut Message(&mut line));
+            self.0.lock().unwrap().push(line);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// `read_bind` over `bytes`, with what it logged and how many bytes it read.
+    fn read_bind_of(bytes: &[u8]) -> (Result<Bound, ProtoError>, Vec<String>, u64) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut cursor = std::io::Cursor::new(bytes);
+        let read = tracing::subscriber::with_default(Lines(Arc::clone(&lines)), || {
+            runtime.block_on(read_bind(&mut cursor))
+        });
+        let lines = lines.lock().unwrap().clone();
+        (read, lines, cursor.position())
+    }
+
+    fn bind(quality: u8) -> Msg {
+        Msg::Bind {
+            session_id: "0123456789abcdef".into(),
+            mac: [7; 32],
+            quality,
+        }
+    }
+
+    /// The quality design §4.1: a `Bind` is 50 bytes and carries the
+    /// viewer's preset, which `read_bind` returns; an unknown code is a
+    /// malformed bind, refused like any other before a look-up.
+    #[test]
+    fn a_bind_carries_the_viewers_preset() {
+        for code in [
+            quality::BEST_QUALITY,
+            quality::BALANCED,
+            quality::BEST_PERFORMANCE,
+        ] {
+            let frame = bind(code).encode();
+            assert_eq!(frame.len(), 4 + BIND_LEN);
+            let (read, lines, at) = read_bind_of(&frame);
+            assert_eq!(
+                read.unwrap(),
+                ("0123456789abcdef".to_owned(), [7; 32], code)
+            );
+            assert!(lines.is_empty(), "{lines:?}");
+            assert_eq!(at, frame.len() as u64);
+        }
+        for code in [0, 4, 9, 255] {
+            let (read, lines, _) = read_bind_of(&bind(code).encode());
+            assert!(
+                matches!(read, Err(ProtoError::Malformed("Bind"))),
+                "preset {code}: {read:?}"
+            );
+            assert!(lines.is_empty(), "{lines:?}");
+        }
+    }
+
+    /// The quality design §4.7: a `Bind` of another length (an older
+    /// viewer's 49 bytes, a later one's) is refused and logged at info as a
+    /// version mismatch, after one more byte (its type); a first frame of
+    /// another type is refused without that line, and one longer than any
+    /// client frame is refused at its length prefix, unread.
+    #[test]
+    fn a_bind_of_another_length_is_logged_as_another_version() {
+        let mut old = 49u32.to_be_bytes().to_vec();
+        old.push(BIND_TYPE);
+        old.extend_from_slice(b"0123456789abcdef");
+        old.extend_from_slice(&[7; 32]);
+        let mut longer = bind(quality::BALANCED).encode();
+        longer[3] += 1;
+        longer.push(0);
+        for (frame, len) in [(old, 49), (longer, 51)] {
+            let (read, lines, at) = read_bind_of(&frame);
+            assert!(
+                matches!(read, Err(ProtoError::Size(n)) if n == len),
+                "{read:?}"
+            );
+            assert_eq!(
+                lines,
+                [format!(
+                    "a media bind of {len} bytes: the viewer may run a different Tornect version"
+                )]
+            );
+            assert_eq!(at, 5, "the length prefix and the type byte only");
+        }
+
+        let ping = Msg::Ping { nonce: 1 }.encode();
+        let (read, lines, at) = read_bind_of(&ping);
+        assert!(matches!(read, Err(ProtoError::Size(9))), "{read:?}");
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(at, 5);
+
+        let mut huge = (8u32 << 20).to_be_bytes().to_vec();
+        huge.push(BIND_TYPE);
+        let (read, lines, at) = read_bind_of(&huge);
+        assert!(
+            matches!(read, Err(ProtoError::Size(n)) if n == 8 << 20),
+            "{read:?}"
+        );
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(at, 4, "refused at its length prefix");
+    }
+
+    /// `BindOk`'s `QualityInfo` says what every stream applies: the
+    /// encoder's frame rate and bitrate under the Balanced code, and the
+    /// codec's picture cap; any encoder settings give a `QualityInfo` the
+    /// viewer accepts.
+    #[test]
+    fn bind_ok_says_what_the_stream_applies() {
+        assert_eq!(
+            applied_quality(&EncoderSettings::default()),
+            QualityInfo {
+                preset: quality::BALANCED,
+                max_fps: 15,
+                kbps: 1500,
+                max_long: 3840,
+                max_short: 2160,
+            }
+        );
+        for (max_fps, bitrate_bps, fps, kbps) in [
+            (0.5, 999, 1, 1),
+            (f32::NAN, 0, 1, 1),
+            (1000.0, u32::MAX, 255, u32::MAX / 1000),
+        ] {
+            let info = applied_quality(&EncoderSettings {
+                max_fps,
+                bitrate_bps,
+                ..EncoderSettings::default()
+            });
+            assert_eq!((info.max_fps, info.kbps), (fps, kbps));
+            let ok = Msg::BindOk {
+                width: 1,
+                height: 1,
+                codec: codec::H264,
+                mode: 0,
+                quality: info,
+            };
+            assert_eq!(Msg::decode(&ok.encode()[4..]).unwrap(), ok);
+        }
     }
 }

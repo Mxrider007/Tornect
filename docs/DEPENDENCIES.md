@@ -32,7 +32,7 @@ The library crates (`arti-client`, `tor-hsservice`, …) use their own 0.x numbe
 | `hex` | 0.4.3 | — | Fingerprint rendering. | none | 2026-08-28 | crates.io |
 | `tokio` | 1.53.1 | rt, macros, sync, time, net, io-util, fs, signal | Async runtime for M1+ (Arti and quinn both require it). | none | 2026-08-28 | crates.io |
 | `bytes` / `parking_lot` | 1.12.1 / 0.12.5 | — | Buffers / locks for M1+. | none | 2026-08-28 | crates.io |
-| `tempfile` / `proptest` (dev) | 3.27.0 / 1.11.0 | — | Tests. `proptest` is a dev-dependency of tornect-core, -signal, -platform and, from 2026-10-24, tornect-codec (the `scale` properties of the quality design §8). | none | 2026-08-28 | crates.io |
+| `tempfile` / `proptest` (dev) | 3.27.0 / 1.11.0 | — | Tests. `proptest` is a dev-dependency of tornect-core, -signal, -platform and, from 2026-10-24, tornect-codec (the `scale` properties of the quality design §8) and tornect-proto (the media frames: any short frame decodes without a panic, valid messages round-trip). | none | 2026-08-28 | crates.io |
 
 ## Milestone 1 (tornect-signal: embedded Arti)
 
@@ -123,7 +123,7 @@ encrypted store and the IPC message set are `#[cbor(map)]` structs with integer 
 
 | Crate | Version | Features | Why | Build requirements | Verified | Source |
 |---|---|---|---|---|---|---|
-| `libfuzzer-sys` | 0.4.13 | — | `fuzz_target!` for `cargo +nightly fuzz run framing` (`docs/PLAN.md` §D.5: fuzz every wire parser). `fuzz/Cargo.toml` builds `tornect-signal` with `default-features = false` (no `tor-pow` JIT) and has its own lock file. | nightly toolchain (`-Zsanitizer`), C++ compiler for libFuzzer | 2026-08-28 on the build VM | crates.io (`max_version` 0.4.13) |
+| `libfuzzer-sys` | 0.4.13 | — | `fuzz_target!` for `cargo +nightly fuzz run framing` (`docs/PLAN.md` §D.5: fuzz every wire parser). `fuzz/Cargo.toml` builds `tornect-signal` with `default-features = false` (no `tor-pow` JIT) and has its own lock file. From 2026-10-24 it also takes `tornect-proto` by path (pure Rust) for the `media` target. | nightly toolchain (`-Zsanitizer`), C++ compiler for libFuzzer | 2026-08-28 on the build VM | crates.io (`max_version` 0.4.13) |
 | `tornect-core` (path), `tokio` `test-util` + `time` | — | — | The `envelope` target (F1, §B.8.15) builds fixed host/device identities and in-memory trusted/known-host stores, re-signs fuzzed frames over the running transcript, and runs both FSMs on a paused-time runtime so every §B.8.4.5 timer fires at once when the input ends. | nightly toolchain | 2026-08-29 on the build VM | `fuzz/fuzz_targets/envelope.rs` |
 | `arbitrary` | =1.4.2 | — | The F3 target (`fuzz/fuzz_targets/store.rs`, §B.8.15) builds `UnattendedStore` / `FailState` values and `(wall, mono)` clock readings from the fuzzer's bytes with `Unstructured::{arbitrary, int_in_range, ratio}` (`src/unstructured.rs` 86–604 in the crate source); no derive — core types keep no `Arbitrary` impls, the target assembles them field by field. Pinned in the workspace table too (`arbitrary = "=1.4.2"`, unused there until a crate derives it); `minicbor` and `zeroize` in `fuzz/Cargo.toml` reuse the workspace pins. MIT OR Apache-2.0. | nightly (with the fuzz crate) | 2026-08-29 on the build VM | crate source `~/.cargo/registry/src/*/arbitrary-1.4.2/src/unstructured.rs`; `fuzz/Cargo.lock` checksum `c3d036a3…8bf1` |
 

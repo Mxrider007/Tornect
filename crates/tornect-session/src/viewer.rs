@@ -8,7 +8,9 @@ use tokio::sync::mpsc;
 use tornect_codec::{DecodedFrame, H264Decoder};
 use tornect_core::session_log::SessionMode;
 use tornect_input::InputEvent;
-use tornect_proto::{Msg, ProtoError, bind_mac, codec, read_msg, reason, video_flags, write_msg};
+use tornect_proto::{
+    Msg, ProtoError, bind_mac, codec, quality, read_msg, reason, video_flags, write_msg,
+};
 use tornect_signal::consent::{SessionToken, mode_from_code};
 
 use crate::flow::KeyframeLimiter;
@@ -49,11 +51,12 @@ impl Binding {
         &self.session_id
     }
 
-    /// The `Bind` frame.
+    /// The `Bind` frame, which asks for the Balanced preset.
     pub(crate) fn msg(&self) -> Msg {
         Msg::Bind {
             session_id: self.session_id.clone(),
             mac: self.mac,
+            quality: quality::BALANCED,
         }
     }
 }
@@ -69,9 +72,10 @@ impl std::fmt::Debug for Binding {
 /// What the host's `BindOk` announced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundStream {
-    /// Width of the first picture: a hint, not a promise (SLICE-A2 A2-4).
+    /// Width of the first picture, as the host announced it. Display-only:
+    /// each picture is sized from what it decodes (SLICE-A2 A2-4).
     pub width: u32,
-    /// Height of the first picture: a hint, not a promise.
+    /// Height of the first picture, as the host announced it. Display-only.
     pub height: u32,
     /// Control or view-only.
     pub mode: SessionMode,
@@ -80,8 +84,8 @@ pub struct BoundStream {
 /// Where decoded pictures go.
 pub trait FrameSink: Send {
     /// Picture `seq`, decoded. Size the display from `frame`, every time: the
-    /// host may change resolution at any access unit, and `BindOk` is only a
-    /// hint (SLICE-A2 A2-4).
+    /// host may change resolution at any access unit, and the sizes it
+    /// announces are display-only (SLICE-A2 A2-4).
     fn picture(&mut self, seq: u32, frame: &DecodedFrame);
 }
 
@@ -181,6 +185,7 @@ where
                 height,
                 codec,
                 mode,
+                ..
             }) => match (codec, mode_from_code(mode)) {
                 (codec::H264, Some(mode)) => BoundStream {
                     width,
@@ -347,6 +352,9 @@ where
                     next_ping = tokio::time::Instant::now() + PING_EVERY;
                 }
                 Some(Msg::Pong { .. }) => {}
+                // Display-only (the quality design, §4.6): neither sizes a
+                // buffer nor ends the stream.
+                Some(Msg::Quality { .. } | Msg::Stats(_)) => {}
                 Some(Msg::Close { reason }) => return Ok(ViewerEnd::Host(reason)),
                 Some(other) => return Err(ViewerError::Unexpected(kind(&other))),
                 None => return Ok(ViewerEnd::Closed),
@@ -408,6 +416,9 @@ fn kind(msg: &Msg) -> &'static str {
         Msg::KeyframeRequest => "KeyframeRequest",
         Msg::Ping { .. } => "Ping",
         Msg::Pong { .. } => "Pong",
+        Msg::SetQuality { .. } => "SetQuality",
+        Msg::Quality { .. } => "Quality",
+        Msg::Stats(_) => "Stats",
         Msg::Close { .. } => "Close",
     }
 }

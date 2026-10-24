@@ -1877,7 +1877,7 @@ mod tests {
     /// session the host had ended on purpose (`tornect panic`).
     #[tokio::test(start_paused = true)]
     async fn a_host_end_whose_media_circuit_closes_first_is_the_hosts() {
-        use tornect_proto::{Msg, codec, read_msg, write_msg};
+        use tornect_proto::{Msg, QualityInfo, codec, quality, read_msg, write_msg};
         let Live {
             mut session,
             kill,
@@ -1894,6 +1894,13 @@ mod tests {
                 height: 360,
                 codec: codec::H264,
                 mode: 1,
+                quality: QualityInfo {
+                    preset: quality::BALANCED,
+                    max_fps: 15,
+                    kbps: 1500,
+                    max_long: 3840,
+                    max_short: 2160,
+                },
             };
             write_msg(&mut host_media, &ok).await.unwrap();
             host_media
