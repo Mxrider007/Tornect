@@ -2918,14 +2918,16 @@ async fn a_second_pick_within_the_interval_is_answered_when_it_is_over() {
     );
 }
 
-/// `picks` (cycled) sent every 5 ms for `flood` to a host serving a still
-/// screen, with what the host wrote meanwhile read on another task, stamped
-/// from just before the first pick; then a `Close` after one more `wait`.
-/// Returns the stamped frames, the picks sent and the host's report.
+/// A pick sent every 5 ms for `flood` to a host serving a still screen, each
+/// `pick(applied)`, where `applied` is the preset the viewer last heard is in
+/// force (Balanced from `BindOk`, then each `Quality`), with what the host
+/// wrote meanwhile read on another task, stamped from just before the first
+/// pick; then a `Close` after one more `wait`. Returns the stamped frames,
+/// the picks sent and the host's report.
 async fn flood_of_picks(
     rig: &Rig,
     seed: u8,
-    picks: &[u8],
+    pick: fn(u8) -> u8,
     flood: Duration,
     wait: Duration,
 ) -> (Vec<(Duration, Msg)>, u64, MediaReport) {
@@ -2934,19 +2936,22 @@ async fn flood_of_picks(
     bind_raw(&mut client, &binding).await;
     go_still(rig, &mut client, &mut Decoded::new()).await;
     let (mut rd, mut wr) = tokio::io::split(client);
+    let applied = Arc::new(std::sync::atomic::AtomicU8::new(quality::BALANCED));
+    let heard = Arc::clone(&applied);
     let started = std::time::Instant::now();
     let reader = tokio::spawn(async move {
         let mut said = Vec::new();
         while let Some(msg) = read_msg(&mut rd).await.unwrap() {
+            if let Msg::Quality { quality, .. } = msg {
+                heard.store(quality.preset, Ordering::SeqCst);
+            }
             said.push((started.elapsed(), msg));
         }
         said
     });
     let mut sent = 0u64;
-    for &quality in picks.iter().cycle() {
-        if started.elapsed() >= flood {
-            break;
-        }
+    while started.elapsed() < flood {
+        let quality = pick(applied.load(Ordering::SeqCst));
         write_msg(&mut wr, &Msg::SetQuality { quality })
             .await
             .unwrap();
@@ -2989,7 +2994,7 @@ async fn a_flood_of_picks_of_the_preset_in_force_is_answered_once_per_interval()
     let (said, sent, report) = flood_of_picks(
         &rig,
         72,
-        &[quality::BALANCED],
+        |_| quality::BALANCED,
         flood,
         interval + Duration::from_millis(200),
     )
@@ -3036,7 +3041,12 @@ async fn a_flood_of_picks_of_the_preset_in_force_is_answered_once_per_interval()
 /// rebuilds the encoder (an IDR of the last picture each time) at most once
 /// per keyframe interval, the longer of the two bounds here: within the
 /// flood's 3 s, at most ceil(3 s / 1 s) + 1; one more may come for the last
-/// pick. Each rebuild is said in a `Quality` before its picture.
+/// pick. Each rebuild is said in a `Quality` before its picture. The flood
+/// always picks the preset not in force, as the viewer last heard: at every
+/// turn of the gate it asks for a rebuild, the most a viewer can, so the
+/// keyframe limiter alone bounds them (picks that alternate one by one meet
+/// the gate's turns, taken as a frame is read, in step with the 5 ms beat,
+/// and then mostly with the preset in force).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_alternating_flood_rebuilds_at_most_once_per_keyframe_interval() {
     let interval = Duration::from_millis(300);
@@ -3050,7 +3060,13 @@ async fn an_alternating_flood_rebuilds_at_most_once_per_keyframe_interval() {
     let (said, sent, report) = flood_of_picks(
         &rig,
         73,
-        &[quality::BEST_PERFORMANCE, quality::BEST_QUALITY],
+        |applied| {
+            if applied == quality::BEST_PERFORMANCE {
+                quality::BEST_QUALITY
+            } else {
+                quality::BEST_PERFORMANCE
+            }
+        },
         flood,
         turn + Duration::from_millis(300),
     )
@@ -3173,6 +3189,130 @@ async fn rebuilds_and_keyframe_requests_share_the_keyframe_limiter() {
         "the request right after the rebuild forced nothing"
     );
     assert_eq!((report.quality_changes, report.repeats), (2, 2));
+}
+
+/// A link of `chunk` bytes per `tick` from the host to a viewer on
+/// [`connect_narrow`]: what the host writes reaches the returned pipe at that
+/// rate, as it reaches a viewer over a link slower than the stream.
+fn slow_link(
+    from_host: ReadHalf<NarrowPipe>,
+    chunk: usize,
+    tick: Duration,
+) -> ReadHalf<SimplexStream> {
+    let (viewer, mut link) = simplex(1 << 20);
+    let mut from_host = from_host;
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; chunk];
+        loop {
+            let mut got = 0;
+            while got < chunk {
+                let n = match from_host.read(&mut buf[..chunk - got]).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                if link.write_all(&buf[..n]).await.is_err() {
+                    return;
+                }
+                got += n;
+            }
+            tokio::time::sleep(tick).await;
+        }
+    });
+    viewer
+}
+
+/// The host's next frame over a [`slow_link`], within `wait`; a `Video` is
+/// acknowledged as soon as it has been read, as a viewer does.
+async fn next_over_link(
+    link: &mut ReadHalf<SimplexStream>,
+    to_host: &mut WriteHalf<NarrowPipe>,
+    wait: Duration,
+) -> Option<Msg> {
+    let msg = tokio::time::timeout(wait, read_msg(link))
+        .await
+        .ok()?
+        .unwrap()
+        .expect("the stream is open");
+    if let Msg::Video { seq, .. } = msg {
+        write_msg(to_host, &Msg::VideoAck { seq }).await.unwrap();
+    }
+    Some(msg)
+}
+
+/// The quality design §3.2 on a stream the link limits: every picture's write
+/// outlasts Balanced's frame interval, so the viewer's acks, taken while a
+/// write waits, have the next picture encoded before the write ends, and a
+/// picture is ready whenever the host could act on a pick. The pick is acted
+/// on all the same: its `Quality` comes within a few picture writes (the
+/// gate's first turn is at once), not never.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pick_is_acted_on_while_the_link_limits_the_stream() {
+    let rig = rig(MediaLimits::default());
+    let (_, binding) = start(&rig.host, 76, SessionMode::Control);
+    let (mut client, served) = connect_narrow(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    let (from_host, mut to_host) = tokio::io::split(client);
+    let mut link = slow_link(from_host, 4, Duration::from_millis(20));
+
+    // Past the first IDR, pictures arrive at the link's pace (a P-frame of
+    // the card is about 30 bytes framed: 8 ticks), further apart than
+    // Balanced's 66 ms frame interval plus a tick: each write outlasts both.
+    let mut arrived = Vec::new();
+    let since = tokio::time::Instant::now();
+    while arrived.len() < 6 {
+        in_time(since, "six pictures");
+        if let Some(Msg::Video { .. }) = next_over_link(&mut link, &mut to_host, WAIT).await {
+            arrived.push(std::time::Instant::now());
+        }
+    }
+    let spacing = (arrived[5] - arrived[1]) / 4;
+    assert!(
+        spacing > Duration::from_millis(100),
+        "the link limits the stream: pictures {spacing:?} apart"
+    );
+
+    let asked = std::time::Instant::now();
+    write_msg(
+        &mut to_host,
+        &Msg::SetQuality {
+            quality: quality::BEST_PERFORMANCE,
+        },
+    )
+    .await
+    .unwrap();
+    // The gate's first turn is at once: then the write under way, the
+    // picture encoded meanwhile, perhaps a `Stats`, and the `Quality`
+    // itself, each about a picture's spacing at most.
+    let bound = (spacing * 6).max(MediaLimits::default().quality_interval);
+    loop {
+        let left = bound.saturating_sub(asked.elapsed());
+        match next_over_link(&mut link, &mut to_host, left).await {
+            None => panic!("the pick was not acted on within {bound:?}"),
+            Some(Msg::Quality {
+                quality: BEST_PERFORMANCE,
+                ..
+            }) => break,
+            // Pictures already on their way, at Balanced.
+            Some(Msg::Video { .. } | Msg::Stats(_)) => {}
+            Some(other) => panic!("{other:?}"),
+        }
+    }
+
+    write_msg(
+        &mut to_host,
+        &Msg::Close {
+            reason: reason::ENDED_BY_VIEWER,
+        },
+    )
+    .await
+    .unwrap();
+    let MediaOutcome::Served { report, end, .. } =
+        tokio::time::timeout(WAIT, served).await.unwrap().unwrap()
+    else {
+        panic!("not served");
+    };
+    assert_eq!(end, MediaEnd::ViewerLeft);
+    assert_eq!((report.quality_requests, report.quality_changes), (1, 1));
 }
 
 /// A desktop whose size changes: a card of one size for its first `after`

@@ -769,6 +769,22 @@ impl MediaHost {
         let mut torn = false;
 
         let ended = 'serve: loop {
+            // The viewer's latest pick, at the gate's turn, before anything
+            // else is written: a rebuild, or the answer that the preset it
+            // named already applies. Taken on every turn of the loop, not
+            // only when the select below finds nothing else to do: on a
+            // stream the link limits, each write outlasts the frame interval
+            // and the acks taken while it waits have the next picture encoded
+            // before it ends, so a picture is ready at every select and a
+            // pick behind it would never be acted on. Before the turn this
+            // changes nothing, and the turn comes at most once per
+            // `quality_interval`, so it never holds pictures back.
+            if let Some(answer) = served.quality_due(Instant::now())
+                && let Err(stop) = send(&mut wr, &answer, &mut end, Some(&mut served)).await
+            {
+                torn = stop.torn;
+                break stop.end;
+            }
             if let Some(frame) = pending.take() {
                 // Said before the picture it covers: a change of settings or
                 // of size (the quality design §4.1), then the means, when due.
@@ -856,16 +872,9 @@ impl MediaHost {
                         tracing::debug!(session = %session_id, "viewer quiet: released what it held");
                     }
                 }
-                // The viewer's latest pick, at the gate's turn: a rebuild, or
-                // the answer that the preset it named already applies.
-                Event::Quality => {
-                    if let Some(answer) = served.quality_due(Instant::now())
-                        && let Err(stop) = send(&mut wr, &answer, &mut end, Some(&mut served)).await
-                    {
-                        torn = stop.torn;
-                        break stop.end;
-                    }
-                }
+                // The gate's turn came while nothing else happened: it is
+                // taken at the top of the loop.
+                Event::Quality => {}
                 Event::Frame(Some(Ok(frame))) => pending = Some(frame),
                 Event::Frame(Some(Err(e))) => {
                     tracing::warn!(error = %e, session = %session_id, "screen capture stopped");
@@ -1145,7 +1154,7 @@ enum Event {
     Frame(Option<Result<Encoded, PipelineError>>),
     /// The viewer has said nothing for [`MediaLimits::viewer_quiet`].
     Quiet,
-    /// The quality gate may act on the viewer's latest pick.
+    /// The quality gate's turn came: the loop wakes to take it at its top.
     Quality,
 }
 
