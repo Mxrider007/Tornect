@@ -311,18 +311,7 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
         commands_rx,
     ));
 
-    let mut app = App::new(shared, popups, link, commands);
-    // The link this window was opened for (design `invite` §2.4): at most an
-    // ID in the connect field, which Connect dials only once its row has been
-    // seen, still, for a second, and only on a click.
-    if let Some(shown) = opts.link {
-        app.link_arrived(shown);
-    }
-    app.screenshots = true;
-    app.background = probe_fact;
-    if !opts.host {
-        app.title = "Tornect (connect only)";
-    }
+    let mut app = real_window(App::new(shared, popups, link, commands), &opts, probe_fact);
     let ran = event_loop.run_app(&mut app);
     // Arti's final state flush happens as its runtime shuts down.
     shutdown_runtime(runtime);
@@ -331,6 +320,23 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// A real window's `App` (not the preview's), as `run` opens it: the link it
+/// was opened for in its connect field (design `invite` §2.4: at most an ID
+/// there, which Connect dials only once its row has been seen, still, for a
+/// second, and only on a click), screenshots offered, background mode's
+/// probe, and the connect-only title when it does not host.
+fn real_window(mut app: App, opts: &GuiOpts, probe: Option<crate::host::IndicatorShown>) -> App {
+    if let Some(shown) = opts.link {
+        app.link_arrived(shown);
+    }
+    app.screenshots = true;
+    app.background = probe;
+    if !opts.host {
+        app.title = "Tornect (connect only)";
+    }
+    app
 }
 
 /// The "indicator shown" fact of background mode (§B.1.1) for the two halves
@@ -401,6 +407,97 @@ mod tests {
             Hosting::Off(super::LINK_WINDOW_OFF.to_owned())
         );
         assert!(start.model.setup.is_none(), "no first-run screen grant");
+    }
+
+    /// Design `invite` §2.4, L-1, L-5: the real window `run` opens for a
+    /// link has the link's ID in its connect field (a refused link or this
+    /// computer's own ID: only the note), on Home, says it is connect-only,
+    /// and sends nothing to the tokio side; a window opened without a link
+    /// fills nothing.
+    #[test]
+    fn the_window_opened_for_a_link_has_it_in_the_field() {
+        use std::sync::Arc;
+
+        use super::app::App;
+        use super::backend::StreamLink;
+        use super::consent::Popups;
+        use super::model::{Model, Shared};
+        use super::view::LinkNote;
+
+        let key = |seed: u8| {
+            tornect_core::TornectId::from_public_key(
+                &ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key(),
+            )
+        };
+        let (own, id) = (key(6), key(7));
+        let opts = |host, link| super::GuiOpts {
+            source: tornect_session::Source::Desktop,
+            host,
+            bridges: None,
+            preview: false,
+            page: None,
+            empty: false,
+            sheet: None,
+            theme: egui::Theme::Dark,
+            link,
+        };
+        for (host, link, field, notes, title) in [
+            (
+                false,
+                Some(ShownLink::Fill(id)),
+                id.display_groups(),
+                vec![LinkNote::Filled(id)],
+                "Tornect (connect only)",
+            ),
+            (
+                false,
+                Some(ShownLink::Refused),
+                String::new(),
+                vec![LinkNote::Refused],
+                "Tornect (connect only)",
+            ),
+            (
+                false,
+                Some(ShownLink::Fill(own)),
+                String::new(),
+                vec![LinkNote::Own],
+                "Tornect (connect only)",
+            ),
+            (
+                false,
+                None,
+                String::new(),
+                Vec::new(),
+                "Tornect (connect only)",
+            ),
+            (true, None, String::new(), Vec::new(), "Tornect"),
+        ] {
+            let case = format!("host {host}, {link:?}");
+            let model = Model {
+                id: Some(own.display_groups()),
+                ..Model::default()
+            };
+            let shared = Shared::new(model, Arc::new(|_| {}));
+            let before = shared.read(|m| format!("{m:?}"));
+            let popups = Popups::new(Arc::clone(&shared));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let app = App::new(
+                Arc::clone(&shared),
+                popups,
+                Arc::new(StreamLink::default()),
+                tx,
+            );
+            let mut app = super::real_window(app, &opts(host, link), None);
+            assert_eq!(app.title, title, "{case}");
+            assert!(app.screenshots, "{case}");
+            assert!(app.background.is_none(), "{case}");
+            let form = app.form_mut();
+            assert_eq!(form.connect_to, field, "{case}");
+            assert_eq!(form.link_notes().collect::<Vec<_>>(), notes, "{case}");
+            assert_eq!(form.page, super::Page::Home, "{case}");
+            assert!(rx.try_recv().is_err(), "nothing sent: {case}");
+            assert_eq!(shared.read(|m| format!("{m:?}")), before, "{case}");
+        }
     }
 
     /// §B.1.1 (MUST): in background mode the host's gate and the window's

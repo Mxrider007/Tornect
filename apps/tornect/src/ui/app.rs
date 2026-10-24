@@ -749,6 +749,25 @@ impl App {
         }
     }
 
+    /// The wakes taken without the event loop: a new picture for the stream
+    /// window, and `Show` (its raise, then its link: [`Self::show`]). Any
+    /// other is given back for `user_event` to take with the loop.
+    fn wake_window(&mut self, why: Wake) -> Option<Wake> {
+        match why {
+            Wake::Frame => {
+                if let Some(view) = &self.stream {
+                    view.surface.window.request_redraw();
+                }
+                None
+            }
+            Wake::Show(link) => {
+                self.show(link);
+                None
+            }
+            Wake::Model | Wake::Attention | Wake::Quit => Some(why),
+        }
+    }
+
     fn command(&self, command: Command) {
         // The tokio side outlives the window; a send can only fail after it
         // has shut down, when nothing is left to do anyway.
@@ -1590,13 +1609,12 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
         let UserEvent::Wake(why) = event;
+        let Some(why) = self.wake_window(why) else {
+            return;
+        };
         match why {
-            Wake::Frame => {
-                if let Some(view) = &self.stream {
-                    view.surface.window.request_redraw();
-                }
-            }
-            Wake::Show(link) => self.show(link),
+            // Taken by `wake_window`.
+            Wake::Frame | Wake::Show(_) => {}
             Wake::Quit => {
                 tracing::info!("asked to quit by a signal: ending every session");
                 self.quit(el);
@@ -2510,11 +2528,12 @@ mod tests {
     }
 
     /// Design `invite` §2.4, L-1: a link the window takes, the one it was
-    /// opened for or one `Show` brings (here before the main window is up),
-    /// at most fills the connect field: no command reaches the tokio side
-    /// and the model is unchanged. The fill is checked against this
-    /// computer's own ID and the key's validity again; a plain `Show`
-    /// changes nothing of the field.
+    /// opened for or one `Show` brings (here before the main window is up,
+    /// through the wake dispatch the event loop runs), at most fills the
+    /// connect field: no command reaches the tokio side and the model is
+    /// unchanged. The fill is checked against this computer's own ID and
+    /// the key's validity again; a plain `Show` changes nothing of the
+    /// field. The wakes that need the loop are given back to it.
     #[test]
     fn a_link_only_fills_the_connect_field() {
         let key = |seed: u8| {
@@ -2542,7 +2561,7 @@ mod tests {
             tx,
         );
         app.open_page(Page::Sessions);
-        app.show(Some(ShownLink::Fill(id)));
+        assert_eq!(app.wake_window(Wake::Show(Some(ShownLink::Fill(id)))), None);
         assert_eq!(app.form.connect_to, id.display_groups());
         assert_eq!(app.form.page, Page::Home);
         let notes = |app: &App| app.form.link_notes().collect::<Vec<_>>();
@@ -2561,12 +2580,16 @@ mod tests {
                 "{link:?}"
             );
         }
-        app.show(None);
+        assert_eq!(app.wake_window(Wake::Show(None)), None);
         assert_eq!(
             notes(&app),
             vec![view::LinkNote::Filled(id), view::LinkNote::Refused]
         );
         assert_eq!(app.form.connect_to, id.display_groups());
+        for why in [Wake::Model, Wake::Attention, Wake::Quit] {
+            assert_eq!(app.wake_window(why), Some(why));
+        }
+        assert_eq!(app.wake_window(Wake::Frame), None);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(shared.read(|m| format!("{m:?}")), before);
     }
