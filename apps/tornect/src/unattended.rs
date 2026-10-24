@@ -1297,39 +1297,71 @@ pub(crate) fn require_ok(resp: &IpcResponse) -> anyhow::Result<()> {
     anyhow::bail!("{detail} (0x{:04x}){hint}", resp.code)
 }
 
-/// Resolve a device argument: an exact device ID, else a unique fingerprint or
-/// label match among the grants this host knows.
+/// Resolve a device argument: an exact device ID, else a unique match among
+/// the devices this host knows, granted or only paired.
+///
+/// Paired devices count as well as grants (audit B19): `grant` is for a
+/// device that has no grant yet, which the status report never lists, so a
+/// label or fingerprint could name only devices that need no `grant`. The
+/// host still refuses a grant for a device that is not paired (§B.8 hard
+/// rule 2).
 async fn resolve_device(paths: &Paths, route: &Route, arg: &str) -> anyhow::Result<DeviceId> {
     if let Ok(id) = arg.parse::<DeviceId>() {
         return Ok(id);
     }
-    let resp = send(paths, route, IpcOp::Status).await?;
-    require_ok(&resp)?;
-    let payload = resp
-        .payload
-        .as_deref()
-        .context("Status returned no payload")?;
-    let report: tornect_core::unattended::ipc::StatusReport =
-        tornect_core::unattended::ipc::decode_payload(payload)?;
-    let needle = arg.to_lowercase();
-    let matches: Vec<&tornect_core::unattended::ipc::GrantSummary> = report
+    let report = status_report(paths, route).await?;
+    let mut known: Vec<(DeviceId, String)> = report
         .grants
-        .iter()
-        .filter(|g| {
-            g.label.to_lowercase() == needle
-                || g.device.fingerprint().starts_with(&needle)
-                || g.device.to_string().starts_with(&needle)
-        })
+        .into_iter()
+        .map(|g| (g.device, g.label))
         .collect();
+    match tornect_signal::pairing::TrustedDeviceStore::open(paths.trusted_devices_file()) {
+        Ok(store) => known.extend(
+            store
+                .snapshot()
+                .devices
+                .into_iter()
+                .map(|d| (d.device, d.label)),
+        ),
+        // The grants still resolve; `tornect devices` reports the file.
+        Err(e) => tracing::warn!(error = %e, "the paired devices could not be read"),
+    }
+    match_device(arg, &known)
+}
+
+/// [`resolve_device`]'s match of `arg` among `known` (device, pinned label)
+/// pairs, where one device may come twice (its grant's label and its
+/// pairing's): a label in any case, a prefix of the fingerprint with or
+/// without its dashes, or a prefix of the device ID. More than one device
+/// matching is refused, never guessed.
+fn match_device(arg: &str, known: &[(DeviceId, String)]) -> anyhow::Result<DeviceId> {
+    let needle = arg.trim().to_lowercase();
+    // An empty prefix would match every device.
+    let prefix: String = needle
+        .chars()
+        .filter(|c| *c != '-' && !c.is_whitespace())
+        .collect();
+    let mut matches: Vec<(DeviceId, &str)> = Vec::new();
+    for (device, label) in known {
+        let hit = label.to_lowercase() == needle
+            || (!prefix.is_empty()
+                && (device.fingerprint().replace('-', "").starts_with(&prefix)
+                    || device.to_string().starts_with(&prefix)));
+        if hit && !matches.iter().any(|(seen, _)| seen == device) {
+            matches.push((*device, label));
+        }
+    }
     match matches.as_slice() {
-        [one] => Ok(one.device),
+        [(one, _)] => Ok(*one),
         [] => anyhow::bail!(
-            "no device matches {arg:?}; `tornect unattended status` lists the ones this host knows"
+            "no device matches {arg:?}; `tornect devices` lists the paired devices with their \
+             fingerprints and IDs"
         ),
         many => {
-            let labels: Vec<&str> = many.iter().map(|g| g.label.as_str()).collect();
+            let labels: Vec<&str> = many.iter().map(|(_, label)| *label).collect();
             anyhow::bail!(
-                "{arg:?} matches {} devices ({}); use the full device ID",
+                "{arg:?} matches {} devices ({}); use its fingerprint or its full device ID \
+                 (`tornect devices` lists both)",
                 many.len(),
                 labels.join(", ")
             )
@@ -2381,12 +2413,32 @@ pub fn devices(paths: &Paths, json: bool) -> anyhow::Result<()> {
             return Ok(());
         }
         println!("{} paired device(s):", paired.len());
-        for d in paired {
-            let ua = grants.get(&d.device).map_or("—", String::as_str);
-            println!("  {:<24} {:<14} {}", d.label, ua, d.device.fingerprint());
+        for line in device_lines(paired, &grants) {
+            println!("{line}");
         }
         Ok(())
     })
+}
+
+/// `tornect devices`' rows: label, unattended state and fingerprint, then the
+/// full device ID on a line of its own (B19: the one argument every
+/// `tornect unattended` command takes, whatever the labels).
+fn device_lines(
+    paired: &[tornect_core::trusted::TrustedDevice],
+    grants: &std::collections::HashMap<DeviceId, String>,
+) -> Vec<String> {
+    let mut lines = Vec::with_capacity(paired.len() * 2);
+    for d in paired {
+        let ua = grants.get(&d.device).map_or("—", String::as_str);
+        lines.push(format!(
+            "  {:<24} {:<14} {}",
+            d.label,
+            ua,
+            d.device.fingerprint()
+        ));
+        lines.push(format!("    ID {}", d.device));
+    }
+    lines
 }
 
 /// The readiness row of the panic key (§B.8.7.4, "Panic key: bound /
@@ -3928,6 +3980,114 @@ mod tests {
                 false,
             )
             .unwrap();
+    }
+
+    /// B19: a device paired without a grant (the one `grant` is for)
+    /// resolves by its pinned label in any case, by a fingerprint prefix with
+    /// or without its dashes, and by a device ID prefix; a granted device
+    /// still does; an argument that names two devices, or none, is refused.
+    /// Failed before the fix: only grants were searched, so the paired
+    /// device's label and fingerprint matched nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paired_device_without_a_grant_resolves_by_label_and_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let (paths, route) = admin_route(
+            &tmp,
+            tornect_core::levels::AccountFacts::Linux,
+            reauth.clone(),
+        );
+        let paired = device(61);
+        let granted = device(62);
+        let twin = device(63);
+        let trusted =
+            tornect_signal::pairing::TrustedDeviceStore::open(paths.trusted_devices_file())
+                .unwrap();
+        assert_eq!(trusted.pin(paired, "Windows PC").unwrap(), "Windows PC");
+        assert_eq!(trusted.pin(twin, "Windows PC").unwrap(), "Windows PC (2)");
+        trusted.pin(granted, "Desk").unwrap();
+        plain_grant(&route, &granted);
+        assert!(guard_of(&route).store().grant(&paired).is_none());
+
+        let fingerprint = paired.fingerprint();
+        let id = paired.to_string();
+        for arg in [
+            "Windows PC".to_owned(),
+            "windows pc".to_owned(),
+            fingerprint.clone(),
+            fingerprint[..9].to_owned(),
+            fingerprint.replace('-', "")[..8].to_owned(),
+            fingerprint.to_uppercase(),
+            id[..20].to_owned(),
+        ] {
+            assert_eq!(
+                resolve_device(&paths, &route, &arg).await.unwrap(),
+                paired,
+                "{arg:?}"
+            );
+        }
+        assert_eq!(
+            resolve_device(&paths, &route, "Windows PC (2)")
+                .await
+                .unwrap(),
+            twin
+        );
+        assert_eq!(
+            resolve_device(&paths, &route, &granted.fingerprint())
+                .await
+                .unwrap(),
+            granted
+        );
+        assert_eq!(
+            resolve_device(&paths, &route, &id).await.unwrap(),
+            paired,
+            "the full ID"
+        );
+
+        let none = resolve_device(&paths, &route, "Laptop").await.unwrap_err();
+        assert!(
+            none.to_string().contains("`tornect devices` lists"),
+            "{none}"
+        );
+        for empty in ["", " ", "-"] {
+            assert!(
+                resolve_device(&paths, &route, empty).await.is_err(),
+                "{empty:?} names no device"
+            );
+        }
+        // The grant's label and the pairing's name one device: one match.
+        let both = [(paired, "Laptop".to_owned()), (paired, "Laptop".to_owned())];
+        assert_eq!(match_device("laptop", &both).unwrap(), paired);
+        // Two devices behind one prefix: refused, never guessed.
+        let prefix = &paired.fingerprint()[..1];
+        let alike = (65..=255)
+            .map(device)
+            .find(|d| d.fingerprint().starts_with(prefix))
+            .expect("a fingerprint that starts alike");
+        let two = [(paired, "A".to_owned()), (alike, "B".to_owned())];
+        let refused = match_device(prefix, &two).unwrap_err().to_string();
+        assert!(refused.contains("matches 2 devices (A, B)"), "{refused}");
+    }
+
+    /// B19: `tornect devices` shows each paired device's full ID under its
+    /// row, so every device can be named whatever its label.
+    #[test]
+    fn the_devices_list_shows_each_full_device_id() {
+        let d = device(64);
+        let paired = [tornect_core::trusted::TrustedDevice {
+            device: d,
+            label: "Windows PC".to_owned(),
+            paired_at: 0,
+            last_seen: 0,
+        }];
+        let lines = device_lines(&paired, &std::collections::HashMap::new());
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("Windows PC") && lines[0].contains(&d.fingerprint()),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1], format!("    ID {d}"));
+        assert_eq!(lines[1].trim_start()[3..].parse::<DeviceId>().unwrap(), d);
     }
 
     /// §B.8.7.4: off a terminal, a generated password is refused before
