@@ -691,8 +691,12 @@ fn exec_start_of(unit_text: &str) -> Option<String> {
 /// the host starts at the next login (a host already running here would hold
 /// this home's lock anyway).
 ///
-/// With no `systemctl` binary the backend reports `Unavailable`; the XDG
-/// autostart fallback of §B.8.7.5 is not implemented.
+/// With no `systemctl` binary where [`Self::SYSTEMCTL`] looks (a
+/// distribution without systemd) the backend reports `Unavailable` and has no
+/// mechanism here ([`Autostart::no_mechanism`]): no unit of it can be
+/// registered, so the XDG autostart entry that replaces it ([`XdgAutostart`])
+/// takes that answer for absent. A manager that does not answer is not that
+/// case: its unit may still be registered.
 #[derive(Debug, Clone)]
 pub struct SystemdUserUnit {
     systemctl: Option<PathBuf>,
@@ -739,6 +743,15 @@ impl SystemdUserUnit {
             unit_name: unit_name.to_owned(),
             spec,
         }
+    }
+
+    /// The same backend with `systemctl` at `bin`, or none, for this crate's
+    /// tests only: a system without systemd, whatever this one has.
+    #[cfg(test)]
+    #[must_use]
+    fn with_systemctl(mut self, bin: Option<PathBuf>) -> Self {
+        self.systemctl = bin;
+        self
     }
 
     /// The unit file this backend writes.
@@ -887,6 +900,14 @@ impl Autostart for SystemdUserUnit {
             self.unit_name,
             self.unit_path().display()
         )
+    }
+
+    /// No `systemctl` where [`Self::SYSTEMCTL`] looks: no systemd, so no unit
+    /// can be registered (every version looked only there, so none was
+    /// registered through another). A `systemctl` whose manager does not
+    /// answer is a mechanism whose unit could not be read.
+    fn no_mechanism(&self) -> bool {
+        self.systemctl.is_none()
     }
 }
 
@@ -4073,6 +4094,101 @@ mod tests {
                     entry.manual_removal()
                 );
             }
+        }
+    }
+
+    /// Audit B09: on a distribution without systemd (no `systemctl` where
+    /// the unit backend looks for it) no unit of earlier versions can be
+    /// registered, so the entry installs, reads back and is removed as on any
+    /// XDG desktop, with nothing said of an older start at login. The unit
+    /// backend used to answer only `Unavailable`, which the entry takes for
+    /// "could not be checked": install and uninstall then failed there,
+    /// telling the user to run a `systemctl` they do not have. A `systemctl`
+    /// whose manager does not answer stays unchecked (the tests above), and
+    /// the executable's location rule still holds without systemd.
+    #[test]
+    fn without_systemd_the_entry_is_installed_and_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = |config: &Path, exe: &Path| {
+            SystemdUserUnit::for_config_home(
+                config,
+                UNIT_NAME,
+                LaunchSpec {
+                    exe: exe.to_path_buf(),
+                    home: None,
+                },
+            )
+            .with_systemctl(None)
+        };
+        let older = unit(tmp.path(), Path::new("/usr/bin/tornect"));
+        assert!(older.no_mechanism());
+        assert!(matches!(older.status(), Ok(AutostartState::Unavailable(_))));
+        assert!(
+            !older
+                .clone()
+                .with_systemctl(Some(PathBuf::from("/usr/bin/systemctl")))
+                .no_mechanism(),
+            "a systemctl is a mechanism, answering or not"
+        );
+        let entry = XdgAutostart::for_config_home(
+            tmp.path(),
+            spec("/usr/bin/tornect", None),
+            Arc::new(older),
+        )
+        .with_exe_check(|_| Ok(()));
+        assert_eq!(entry.status().unwrap(), AutostartState::Absent);
+        assert!(entry.older().is_none());
+        match entry.install(false) {
+            Ok(AutostartState::Registered(r)) => assert!(r.enabled && !r.elevated, "{r:?}"),
+            other => panic!("not installed without systemd: {other:?}"),
+        }
+        assert!(entry.entry_path().is_file());
+        assert!(matches!(entry.status(), Ok(AutostartState::Registered(_))));
+        assert!(entry.older().is_none());
+        assert!(
+            entry.describe().ends_with("tornect.desktop"),
+            "{}",
+            entry.describe()
+        );
+        assert_eq!(
+            entry.manual_removal(),
+            format!("delete {}", entry.entry_path().display())
+        );
+        assert_eq!(entry.uninstall().unwrap(), AutostartState::Absent);
+        assert!(!entry.entry_path().exists());
+        assert_eq!(entry.uninstall().unwrap(), AutostartState::Absent);
+        assert_eq!(
+            readiness_probe(&entry.status()),
+            Probe::Warn(
+                "not registered: the host does not start at login (`tornect service install`)"
+                    .to_owned()
+            )
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            let shared = tempfile::Builder::new()
+                .prefix("tornect-location-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let exe = shared.path().join("tornect");
+            std::fs::write(&exe, b"not run").unwrap();
+            let config = tempfile::tempdir().unwrap();
+            let entry = XdgAutostart::for_config_home(
+                config.path(),
+                LaunchSpec {
+                    exe: exe.clone(),
+                    home: None,
+                },
+                Arc::new(unit(config.path(), &exe)),
+            );
+            match entry.install(false) {
+                Err(AutostartError::Unavailable(why)) => {
+                    assert!(why.contains("can be changed by every account"), "{why}");
+                }
+                other => panic!("{} accepted: {other:?}", exe.display()),
+            }
+            assert!(!entry.entry_path().exists(), "an entry was written");
         }
     }
 
