@@ -214,6 +214,9 @@ By the identifiers of the security reviews that found them.
 **The build process** (nothing here changes the shipped bytes today)
 - **E3-2:** inputs from outside the repository (a user cargo configuration, `CARGO_TARGET_*`, `RUSTC_WRAPPER`,
   `CC`/`CFLAGS`, the host compiler's defaults) would reach the release build unrecorded.
+- **E3-4:** after 2026-10-26, when the Tor Browser signing subkey expires, the lyrebird check accepts an
+  expired-key signature only when it is dated before the expiry. That date is the signer's own claim, so a
+  holder of the retired subkey can backdate one; the SHA-256 pins still decide what ships.
 - **E3-5:** `BUILD-INFO.txt`'s Windows lines ("all Windows' own", "UCRT", llvm-mingw's asset hash) rest on a
   deny-list of three name prefixes and a clang version line.
 - **P3-I1:** the `deny.toml` checks read line prefixes, so another spelling of the same setting would pass them.
