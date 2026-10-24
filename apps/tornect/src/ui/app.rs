@@ -667,6 +667,9 @@ pub struct App {
     /// off unless set, so the preview, which writes nothing on this
     /// computer, never offers them.
     pub screenshots: bool,
+    /// The preview's `--sheet viewer-…`: what the stream window opens with
+    /// (its Quality menu with a pick on its way, or its details).
+    pub stream_sheet: Option<super::preview::StreamSheet>,
     /// Why the window could not run.
     pub error: Option<anyhow::Error>,
 }
@@ -707,6 +710,7 @@ impl App {
             height: 760.0,
             background: None,
             screenshots: false,
+            stream_sheet: None,
             error: None,
         }
     }
@@ -840,6 +844,10 @@ impl App {
                 match Surface::new(el, attrs, setup, self.theme, false) {
                     Ok(surface) => {
                         let max = surface.painter.max_texture_side().unwrap_or(8192);
+                        let mut viewer = ViewerState::opened(&stored);
+                        if let Some(sheet) = self.stream_sheet {
+                            super::preview::open_stream(sheet, &mut viewer, Instant::now());
+                        }
                         self.stream = Some(StreamView {
                             surface,
                             video: VideoTexture::new(u32::try_from(max).unwrap_or(8192)),
@@ -847,7 +855,7 @@ impl App {
                             forwarder: Forwarder::new(control),
                             last_flush: Instant::now(),
                             input_sent: 0,
-                            viewer: ViewerState::opened(&stored),
+                            viewer,
                             chord: keys::Chord::default(),
                             fullscreen: false,
                         });

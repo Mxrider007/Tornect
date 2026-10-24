@@ -236,7 +236,7 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
         // Its model came ready-made: one wake opens what it shows (the full
         // preview's stream window), as the first update of a real window does.
         shared.wake(Wake::Model);
-        if opts.page.is_none() {
+        if opts.page.is_none() || opts.sheet.and_then(preview::Sheet::stream).is_some() {
             let (slot, frames) = (Arc::clone(&link.slot), Arc::clone(&shared));
             std::thread::Builder::new()
                 .name("tornect-preview".to_owned())
@@ -250,6 +250,7 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
             app.open_page(page);
         }
         if let Some(sheet) = opts.sheet {
+            app.stream_sheet = sheet.stream();
             preview::form(app.form_mut(), sheet, first);
             if let Some(height) = preview::height(sheet) {
                 app.height = height;

@@ -15,8 +15,10 @@ use tornect_capture::{TestCard, VideoSource as _};
 use tornect_codec::{DecodeTiming, DecodedFrame};
 use tornect_core::TornectId;
 use tornect_core::address_book::Day;
+use tornect_core::config::QualityPreset;
 use tornect_core::levels::{Availability, WindowsFacts};
 use tornect_core::words::{Identicon, Words};
+use tornect_proto::{HostStats, QualityInfo};
 use tornect_session::FrameSink as _;
 
 use super::model::{
@@ -24,6 +26,7 @@ use super::model::{
     MyWords, Popup, PopupKind, Recognition, Settings, Setup, Shared, Sharing, SheetLevels,
     StreamInfo, TorState, UaRecord, Viewing,
 };
+use super::pages::viewer::ViewerState;
 use super::stream::{FrameSlot, SlotSink};
 
 /// What the setup card names: a stand-in, never a path of this machine.
@@ -148,12 +151,119 @@ pub enum Sheet {
     /// The connect field filled from a `tornect:` link (design `invite`
     /// §2.2): its note, and Connect waiting a second after it is seen.
     LinkFilled,
+    /// The stream window's Quality menu with a pick on its way: "Changing…"
+    /// under it for its first 10 s (the quality design §3.2).
+    ViewerQuality,
+    /// The stream window's details with the Quality and Timing rows (the
+    /// quality design §3.3).
+    ViewerDetails,
+}
+
+impl Sheet {
+    /// What the stream window opens with for this sheet, if it is one of
+    /// the stream window's.
+    #[must_use]
+    pub fn stream(self) -> Option<StreamSheet> {
+        match self {
+            Self::ViewerQuality => Some(StreamSheet::QualityMenu),
+            Self::ViewerDetails => Some(StreamSheet::Details),
+            _ => None,
+        }
+    }
+}
+
+/// What the preview's stream window opens with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamSheet {
+    /// The Quality menu, a pick of Balanced on its way.
+    QualityMenu,
+    /// The details.
+    Details,
+}
+
+/// Open the preview's stream window `viewer` as `sheet` shows it, the
+/// toolbar pinned so that it stays.
+pub fn open_stream(sheet: StreamSheet, viewer: &mut ViewerState, now: Instant) {
+    viewer.pinned = true;
+    match sheet {
+        StreamSheet::QualityMenu => {
+            viewer.pick_quality(
+                QualityPreset::Balanced,
+                Some(QualityPreset::BestPerformance),
+                now,
+            );
+            viewer.quality_menu = true;
+        }
+        StreamSheet::Details => viewer.details = true,
+    }
+}
+
+/// What the preview's host says it applies: Best performance, whose cap
+/// is the test card's 1280 × 720.
+fn sample_quality() -> QualityInfo {
+    QualityInfo {
+        preset: tornect_session::quality::code(QualityPreset::BestPerformance),
+        max_fps: 20,
+        kbps: 1000,
+        max_long: 1280,
+        max_short: 720,
+    }
+}
+
+/// The preview's host means: invented numbers, a 2560 × 1440 desktop.
+fn sample_host() -> HostStats {
+    HostStats {
+        source_width: 2560,
+        source_height: 1440,
+        frames: 10,
+        window_ms: 1000,
+        grab_us: 4000,
+        age_us: 6200,
+        scale_us: 2100,
+        convert_us: 1500,
+        encode_us: 9800,
+        send_us: 120_000,
+        ack_us: 1_100_000,
+    }
+}
+
+/// The preview's stream as the host would describe it, with this
+/// computer's invented means.
+fn sample_stream() -> StreamInfo {
+    let mut stream = StreamInfo {
+        applied: Some(sample_quality()),
+        announced: (1280, 720),
+        host: Some(sample_host()),
+        ..StreamInfo::default()
+    };
+    stream.decode_ms.add(3.1);
+    stream.convert_ms.add(1.2);
+    stream
+}
+
+/// A live session viewed at the control level, of the made-up "Office
+/// PC", for the stream window's sheets.
+fn viewed(now: Instant) -> Viewing {
+    Viewing {
+        host: "Office PC".to_owned(),
+        control: true,
+        administrator: false,
+        unattended: false,
+        since: now,
+        pictures: 0,
+        size: (0, 0),
+        stream: sample_stream(),
+    }
 }
 
 /// Put one host sheet of `sheet`'s kind on screen, with invented words.
 pub fn sheet(m: &mut Model, sheet: Sheet) {
     let deadline = Instant::now() + Duration::from_secs(60);
     if stage(m, sheet) || unattended(m, sheet) || book(m, sheet) {
+        return;
+    }
+    if sheet.stream().is_some() {
+        m.client = ClientStage::Live(viewed(Instant::now()));
         return;
     }
     let (kind, seen) = match sheet {
@@ -664,16 +774,7 @@ fn fill(m: &mut Model) {
             input: true,
         }),
     }];
-    m.client = ClientStage::Live(Viewing {
-        host: "Office PC".to_owned(),
-        control: true,
-        administrator: false,
-        unattended: false,
-        since: now,
-        pictures: 0,
-        size: (0, 0),
-        stream: StreamInfo::default(),
-    });
+    m.client = ClientStage::Live(viewed(now));
     m.note("preview: nothing here is real");
     // Nothing to shut down: closing the window quits at once.
     m.closed = true;
@@ -704,10 +805,13 @@ fn rest(m: &mut Model) {
 }
 
 /// Feed the stream window a moving test card at 10 pictures a second, on a
-/// thread of its own, for the life of the process.
+/// thread of its own, for the life of the process, with what a host would
+/// say of it (invented numbers).
 pub fn card(slot: Arc<FrameSlot>, shared: Arc<Shared>) {
     let mut card = TestCard::new(1280, 720, 10);
     let mut sink = SlotSink::new(slot, shared);
+    sink.quality(1280, 720, &sample_quality());
+    sink.host_stats(&sample_host());
     let mut seq = 0u32;
     loop {
         if let Ok(Some(frame)) = card.next_frame(Duration::from_millis(100)) {
@@ -724,7 +828,10 @@ pub fn card(slot: Arc<FrameSlot>, shared: Arc<Shared>) {
                     width: frame.width,
                     height: frame.height,
                     rgba,
-                    timing: DecodeTiming::default(),
+                    timing: DecodeTiming {
+                        decode: Duration::from_micros(3100),
+                        convert: Duration::from_micros(1200),
+                    },
                 },
             );
         }
@@ -802,6 +909,61 @@ mod tests {
         let before = format!("{book:?}");
         sheet(&mut book, Sheet::LinkFilled);
         assert_eq!(format!("{book:?}"), before, "no question, no stage");
+    }
+
+    /// `--sheet viewer-quality` and `--sheet viewer-details` (the quality
+    /// design §3.2, §3.3): a live session with what a host would say of it,
+    /// and the stream window opens pinned, with its Quality menu and a pick
+    /// of Balanced on its way ("Changing…" under it, the applied Best
+    /// performance checked), or with its details and their Quality and
+    /// Timing rows. No other sheet opens the stream window so.
+    #[test]
+    fn the_stream_sheets_show_the_quality_menu_and_the_timing_rows() {
+        use super::super::pages::viewer::testing::Window;
+        let ms = Duration::from_millis;
+        let menu: &[&str] = &[
+            "Best quality",
+            "Balanced",
+            "Best performance",
+            "Changing…",
+            "Tor relay · Best performance · 0 fps · 1280×720",
+        ];
+        let details: &[&str] = &[
+            "Best performance · up to 20 fps · 1.0 Mbit/s",
+            "Scaled down from 2560×1440",
+            "Remote computer: capture 4.0 ms · scale 2.1 ms · convert 1.5 ms · encode 9.8 ms · \
+             send 120 ms",
+            "Round trip: 1.1 s",
+        ];
+        for (which, texts) in [
+            (Sheet::ViewerQuality, menu),
+            (Sheet::ViewerDetails, details),
+        ] {
+            let mut m = model(false, false);
+            sheet(&mut m, which);
+            let ClientStage::Live(viewing) = &m.client else {
+                panic!("{which:?}: no live session");
+            };
+            let mut w = Window::new(true);
+            w.viewing = viewing.clone();
+            w.viewing.pictures = 0;
+            w.viewing.size = (1280, 720);
+            open_stream(
+                which.stream().expect("a stream sheet"),
+                &mut w.viewer,
+                w.start,
+            );
+            for at in [0, 5000] {
+                w.pass(ms(at), Vec::new());
+                w.pass(ms(at), Vec::new());
+                for text in texts {
+                    assert!(w.has(text), "{which:?}, {at} ms: {text}: {:?}", w.texts());
+                }
+            }
+        }
+        for other in [Sheet::New, Sheet::StageLive, Sheet::LinkFilled] {
+            assert_eq!(other.stream(), None);
+        }
     }
 
     /// The preview draws in the theme its command line names (the settings

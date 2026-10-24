@@ -439,6 +439,10 @@ enum SheetArg {
     UaUnlock,
     /// The connect field filled from a link, with its note.
     LinkFilled,
+    /// The stream window's Quality menu, a pick on its way.
+    ViewerQuality,
+    /// The stream window's details with the Quality and Timing rows.
+    ViewerDetails,
 }
 
 impl From<SheetArg> for ui::preview::Sheet {
@@ -473,6 +477,8 @@ impl From<SheetArg> for ui::preview::Sheet {
             SheetArg::ForgetAsk => Self::ForgetAsk,
             SheetArg::UaUnlock => Self::UaUnlock,
             SheetArg::LinkFilled => Self::LinkFilled,
+            SheetArg::ViewerQuality => Self::ViewerQuality,
+            SheetArg::ViewerDetails => Self::ViewerDetails,
         }
     }
 }
