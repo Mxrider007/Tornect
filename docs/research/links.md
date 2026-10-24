@@ -242,6 +242,22 @@ with `dpkg-deb -x`, run with `PATH` pointing at them, `DISPLAY=:99`, `BROWSER=/b
   ([MFSA 2007-27, CVE-2007-3845](https://www.mozilla.org/security/advisories/mfsa2007-27/), fixed
   in 2.0.0.6). How current Firefox escapes a `"` in a `tornect://` URL on Windows is **UNVERIFIED**
   here; L-3 makes the answer harmless (finding 7).
+- **Repeated launches, once a site is always allowed (added 2026-10-24, after the final review).**
+  The "always allow" box of both browsers removes the prompt, so the prompt alone does not bound how
+  many cold link launches (each one more connect-only window with its own Tor client) a page can
+  cause. What the sources show, read here, not run: Chromium keeps one global flag,
+  `g_accept_requests` ("Whether we accept requests for launching external protocols. This is set to
+  false every time an external protocol is requested, and set back to true on each user gesture";
+  `GetBlockState` returns `BLOCK` while it is false: "If we are being carpet bombed, block the
+  request"), so without a user gesture between them a second launch is blocked
+  (`external_protocol_handler.cc` at commit `20e8909e`, an older revision; current Chrome and Edge
+  NEEDS-DEVICE). Firefox blocks a second external-protocol iframe added without user interaction
+  ("Iframe with external protocol was blocked"; prefs `dom.block_external_protocol_in_iframes`,
+  `dom.disable_open_during_load`; mochitest
+  `uriloader/exthandler/tests/mochitest/browser_first_prompt_not_blocked_without_user_interaction.js`);
+  whether a top-level `location = 'tornect://…'` loop in an always-allowed tab is limited is
+  **UNVERIFIED**. The NEEDS-DEVICE row "Cold link launches from an always-allowed page" in
+  `docs/VERIFICATION.md` (*Invitation links*) counts the launches.
 - **Windows itself.** "When ShellExecute executes the pluggable protocol handler with a string on
   the command line, any non-encoded spaces, quotes, and backslashes in the URI will be interpreted
   as part of the command line"; mitigation: avoid them and "Quote the %1 in the registration";
@@ -333,3 +349,5 @@ positional, so the same URL is a clap error, not an option.
 - A generic desktop (`XDG_CURRENT_DESKTOP` unknown): `xdg-open` with the step-9 `Exec` form.
 - Windows 10/11: `RegDeleteTreeW` deleting the named key, the `REG_OPENED_EXISTING_KEY` race check,
   and how Edge, Chrome and Firefox escape a `"` in a clicked `tornect://` link.
+- Firefox, Chrome and Edge, on Linux and on Windows: how many `tornect open-link` processes a page
+  the user set to always allow can start in 30 s (§3, "Repeated launches").
