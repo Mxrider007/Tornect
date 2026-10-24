@@ -1390,6 +1390,66 @@ fn a6_log_verifier_survives_rotate_id_and_a_store_reset_and_still_detects_tamper
     assert_eq!(report.status, ChainStatus::Valid, "{report:?}");
 }
 
+/// B13 review: a store that failed closed for a reason other than its keystore (here a
+/// file older than the anchor) still installs `K_log` from the readable `K_master`, but
+/// gives no head and no key epoch. Its log, which spans a *Rotate ID*, is then checked
+/// for its links only: checking its tags against the current key without the epoch read
+/// the first line of the wiped key's epoch as "tag does not verify". A broken link still
+/// fails.
+#[test]
+fn b13_a_store_that_failed_closed_checks_the_links_of_a_log_across_key_epochs() {
+    let env = Env::new();
+    let store = env.open();
+    let d = dev(1);
+    let guard = enable(&env, &store, d, Preset::MyMachines);
+    guard.rotate_id(Actor::Ui).unwrap();
+    drop((guard, store));
+    let store = env.open();
+    let guard = env.guard(&store);
+    guard.master_on(Actor::Ui, &HOST_PK).unwrap();
+    guard
+        .create_grant(
+            Actor::Ui,
+            &d,
+            Preset::MyMachines,
+            &waived(),
+            &upload(),
+            false,
+        )
+        .unwrap();
+    let report = store.verify_log().unwrap();
+    assert_eq!(report.status, ChainStatus::Valid, "{report:?}");
+    assert!(report.previous_epoch_lines > 0, "{report:?}");
+    let snapshot = env.file_bytes();
+    guard.disable(Actor::Ui, &d).unwrap();
+    drop((guard, store));
+    std::fs::write(env.paths.unattended_store(), &snapshot).unwrap();
+
+    let store = env.open();
+    assert!(
+        matches!(
+            store.status(),
+            StoreStatus::FailedClosed(StoreLoadError::OlderThanAnchor { .. })
+        ),
+        "{:?}",
+        store.status()
+    );
+    assert!(store.log().has_log_key(), "K_master can be read");
+    let report = store.verify_log().unwrap();
+    assert_eq!(report.status, ChainStatus::MissingHead, "{report:?}");
+    assert_eq!(report.previous_epoch_lines, 0, "no tag was looked at");
+
+    let text = std::fs::read_to_string(env.paths.sessions_log()).unwrap();
+    let tampered = text.replacen("unattended_enabled", "unattended_paused", 1);
+    assert_ne!(text, tampered);
+    std::fs::write(env.paths.sessions_log(), tampered).unwrap();
+    let report = store.verify_log().unwrap();
+    assert!(
+        matches!(&report.status, ChainStatus::Broken { reason, .. } if reason.contains("prev")),
+        "{report:?}"
+    );
+}
+
 use std::io::Write as _;
 
 // ------------------------------------------------------------------ A8
