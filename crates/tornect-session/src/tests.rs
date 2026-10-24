@@ -3315,6 +3315,112 @@ async fn a_pick_is_acted_on_while_the_link_limits_the_stream() {
     assert_eq!((report.quality_requests, report.quality_changes), (1, 1));
 }
 
+/// The quality design §6.6, a pick of the preset on its way to the pipeline:
+/// with the ack window full the capture thread has no credit and cannot take
+/// a change, so a pick of Best performance is handed over and waits there. A
+/// second pick of it a gate's interval later takes the gate's turn and is
+/// answered by nothing: no `Quality` naming Balanced, which still applies,
+/// nor Best performance, which does not yet. Once the viewer acknowledges
+/// again, the change applies: one `Quality` naming it, before one repeat of
+/// the last picture, an IDR.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pick_of_the_preset_on_its_way_is_answered_by_its_change() {
+    let interval = Duration::from_millis(300);
+    let rig = rig(MediaLimits {
+        quality_interval: interval,
+        keyframe_interval: interval,
+        ..MediaLimits::default()
+    });
+    let (_, binding) = start(&rig.host, 77, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    // Read, acknowledging nothing, until the window is full.
+    let mut unacked = Vec::new();
+    while let Ok(msg) =
+        tokio::time::timeout(Duration::from_millis(500), read_msg(&mut client)).await
+    {
+        match msg.unwrap().expect("the stream is open") {
+            Msg::Video { seq, .. } => unacked.push(seq),
+            Msg::Stats(_) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(unacked.len(), 23, "Balanced's window");
+
+    for nonce in [1, 2] {
+        write_msg(
+            &mut client,
+            &Msg::SetQuality {
+                quality: quality::BEST_PERFORMANCE,
+            },
+        )
+        .await
+        .unwrap();
+        // The host handles the pick, and its turn when it has come, before
+        // the ping: nothing is said before the `Pong`.
+        write_msg(&mut client, &Msg::Ping { nonce }).await.unwrap();
+        match tokio::time::timeout(WAIT, read_msg(&mut client))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Some(Msg::Pong { nonce: n }) if n == nonce => {}
+            other => panic!("while the window is full, pick {nonce}: {other:?}"),
+        }
+        if nonce == 1 {
+            // The second pick comes after the gate's next turn.
+            tokio::time::sleep(interval + Duration::from_millis(50)).await;
+        }
+    }
+    assert!(
+        tokio::time::timeout(interval, read_msg(&mut client))
+            .await
+            .is_err(),
+        "nothing while the window stays full"
+    );
+
+    for seq in unacked {
+        write_msg(&mut client, &Msg::VideoAck { seq })
+            .await
+            .unwrap();
+    }
+    let resumed = tokio::time::Instant::now();
+    let mut said = Vec::new();
+    let mut pictures = Vec::new();
+    while resumed.elapsed() < Duration::from_secs(1) {
+        match next_acking(&mut client).await {
+            msg @ Msg::Quality { .. } => said.push((pictures.len(), msg)),
+            Msg::Video { flags, .. } => pictures.push(flags & video_flags::KEYFRAME != 0),
+            Msg::Stats(_) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(
+        said,
+        [(
+            0,
+            Msg::Quality {
+                width: 256,
+                height: 96,
+                quality: BEST_PERFORMANCE,
+            }
+        )],
+        "one Quality, before the first picture after the window drained"
+    );
+    assert!(pictures.len() > 5, "{pictures:?}");
+    assert!(pictures[0], "the repeat is an IDR");
+    let report = close_and_report(&mut client, served).await;
+    assert_eq!(
+        (
+            report.quality_requests,
+            report.quality_changes,
+            report.repeats,
+            report.keyframes_forced
+        ),
+        (2, 1, 1, 0)
+    );
+}
+
 /// A desktop whose size changes: a card of one size for its first `after`
 /// pictures, then a card of another.
 struct Resizing {

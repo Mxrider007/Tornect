@@ -2345,4 +2345,124 @@ mod tests {
         assert_eq!(ms(QualityPreset::BestPerformance), 50_000);
         assert_eq!(ms(QualityPreset::BestQuality), 83_333);
     }
+
+    /// The code the pipeline was handed and the capture thread has not taken
+    /// yet (0 for none), taken as the thread would.
+    fn handed(served: &Served<'_>) -> u8 {
+        served.pipeline.control.quality.swap(0, Ordering::SeqCst)
+    }
+
+    /// `Served::quality_due` at explicit instants, each branch of the gate's
+    /// turn (the quality design §6.6), over a pipeline that is never given a
+    /// credit, so its capture thread takes no change by itself:
+    /// - a pick of another preset than the pipeline's waits for the gate's
+    ///   and the keyframe limiter's turns, then is handed over and spends both;
+    /// - a pick of the preset on its way to the pipeline takes the gate's turn
+    ///   and nothing else: no `Quality` (Balanced still applies, the new
+    ///   preset does not yet), no second hand-over, which would be a rebuild
+    ///   only the gate bounds, and the limiter's turn kept;
+    /// - a pick of the preset in force is answered with what applies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_gates_turn_acts_by_what_the_pipeline_holds() {
+        let interval = Duration::from_millis(300);
+        let keyframes = Duration::from_secs(1);
+        let caps = QualityCaps::default();
+        let balanced = quality::settings(QualityPreset::Balanced, Route::Tor, &caps);
+        let fast = quality::settings(QualityPreset::BestPerformance, Route::Tor, &caps);
+        let (mut pipeline, _, _) = scripted(&[]);
+        let (_frames, mut inbound) = mpsc::channel(1);
+        let (_heard, heard) = watch::channel(tokio::time::Instant::now());
+        let t0 = Instant::now();
+        let at = |d: Duration| tokio::time::Instant::from_std(t0 + d);
+        let mut served = Served {
+            injector: None,
+            quiet: Quiet::new(Duration::from_secs(3), heard),
+            inbound: &mut inbound,
+            inputs: TokenBucket::new(250, 500, t0),
+            pings: TokenBucket::new(PINGS_PER_SEC, PING_BURST, t0),
+            keyframes: KeyframeLimiter::new(keyframes),
+            pipeline: &mut pipeline,
+            window: AckWindow::new(23, 281_250),
+            window_caps: (32, 1024 * 1024),
+            quality: QualityState {
+                gate: QualityGate::new(interval),
+                target: QualityPreset::Balanced,
+                applied: balanced,
+                size: (1920, 1080),
+            },
+            stats: StatsWindow::new(Duration::from_secs(1), t0),
+            report: MediaReport::default(),
+            pong_owed: None,
+            session_id: "s",
+        };
+        let code = tornect_proto::quality::BEST_PERFORMANCE;
+
+        // The first pick acts at once: handed over, both turns spent.
+        served.quality.gate.request(code);
+        assert!(
+            served
+                .quality_deadline()
+                .is_some_and(|due| due <= tokio::time::Instant::now()),
+            "at once"
+        );
+        assert_eq!(served.quality_due(t0), None);
+        assert_eq!(served.quality.target, QualityPreset::BestPerformance);
+        assert_eq!(handed(&served), code, "taken by the capture thread");
+        assert_eq!(served.keyframes.ready_at(), Some(t0 + keyframes));
+
+        // The same pick again, on its way: due at the gate's turn alone.
+        served.quality.gate.request(code);
+        assert_eq!(served.quality_deadline(), Some(at(interval)));
+        assert_eq!(served.quality_due(t0 + interval / 2), None);
+        assert_eq!(served.quality.gate.wanted(), Some(code), "before the turn");
+        assert_eq!(served.quality_due(t0 + interval), None, "no Quality");
+        assert_eq!(served.quality.gate.wanted(), None, "the turn is taken");
+        assert_eq!(served.quality_deadline(), None);
+        assert_eq!(handed(&served), 0, "not handed over again");
+        assert_eq!(served.keyframes.ready_at(), Some(t0 + keyframes));
+        assert_eq!(served.quality.applied, balanced);
+
+        // Its first picture is announced; a pick of it now is answered.
+        let first = Encoded {
+            data: Vec::new(),
+            keyframe: true,
+            width: 1280,
+            height: 720,
+            captured_at: t0,
+            source: (1920, 1080),
+            times: StageTimes::default(),
+            ready_at: t0,
+            repeat: true,
+            announce: Some(Announce { settings: fast }),
+        };
+        let said = Msg::Quality {
+            width: 1280,
+            height: 720,
+            quality: fast.info(),
+        };
+        assert_eq!(served.announce(&first), Some(said.clone()));
+        assert_eq!(served.report.quality_changes, 1);
+        served.quality.gate.request(code);
+        assert_eq!(served.quality_due(t0 + interval * 2), Some(said));
+        assert_eq!(handed(&served), 0, "no encoder work");
+
+        // Another preset waits for the limiter's turn too.
+        let best = tornect_proto::quality::BEST_QUALITY;
+        served.quality.gate.request(best);
+        assert_eq!(served.quality_deadline(), Some(at(keyframes)));
+        assert_eq!(served.quality_due(t0 + interval * 3), None);
+        assert_eq!(
+            served.quality.gate.wanted(),
+            Some(best),
+            "the limiter's turn"
+        );
+        assert_eq!(handed(&served), 0);
+        assert_eq!(served.quality_due(t0 + keyframes), None);
+        assert_eq!(served.quality.target, QualityPreset::BestQuality);
+        assert_eq!(handed(&served), best);
+        assert_eq!(served.keyframes.ready_at(), Some(t0 + keyframes * 2));
+        assert_eq!(served.report.quality_changes, 1, "counted when announced");
+        drop(served);
+        pipeline.stop().await;
+    }
 }
