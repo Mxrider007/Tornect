@@ -842,8 +842,11 @@ impl UnattendedAuth {
         };
 
         // ---- pre-PAKE gate (uncharged, safe to disclose to a key holder) ----
-        let gate = match self.limiter.gate(&device, req.suite, SUPPORTED_SUITES) {
-            Ok(ok) => ok,
+        // Its grant is not the one charged below: a pre-emption may wait
+        // between the two, and the charge re-runs the gate on the grant as
+        // it is then.
+        match self.limiter.gate(&device, req.suite, SUPPORTED_SUITES) {
+            Ok(_) => {}
             Err(r) => {
                 let hard = r.code() == reject::HARD_LOCKED;
                 if hard && matches!(self.admit(&device, true), Admit::Silent) {
@@ -852,7 +855,7 @@ impl UnattendedAuth {
                 }
                 return Ok(UnattendedVerdict::Reject(gate_reject(r)));
             }
-        };
+        }
 
         // ---- host-wide budgets (§B.8.5.2) ----
         let (slot, preempted) = match self.admit(&device, false) {
@@ -941,7 +944,18 @@ impl UnattendedAuth {
         // from this pk pre-empts us rather than being answered `UA_BUSY`, and a
         // handler dropped before its settlement settles it on the way out.
         slot.mark_charged();
-        debug_assert_eq!(charged.grant_id, gate.grant_id);
+        // The record was read outside the limiter's lock: an owner who
+        // revoked and granted this device again in between would have the new
+        // grant charged and the old record answer the PAKE. Never run it on a
+        // record that is not the charged grant's; the retryable `UA_BUSY`
+        // lets the device ask again at once, against the new grant.
+        if charged.grant_id != grant.id {
+            let _ = slot.settle(Settle::Fail(FailKind::Preempted));
+            tracing::warn!(peer = ?device, "the grant changed while the request was charged; answered busy");
+            return Ok(UnattendedVerdict::Reject(SessionReject::new(
+                reject::UA_BUSY,
+            )));
+        }
 
         let (host_login, ke2) =
             match auth::HostLogin::start(&setup, &stored, ke1, &device_pk, &ctx_bytes, ids) {
@@ -2271,6 +2285,114 @@ mod tests {
         .unwrap();
         assert_accepted(second, "the pre-empting request");
         assert_eq!(first.await.unwrap(), Some(reject::PREEMPTED));
+    }
+
+    /// The owner revokes this device's access and grants it again (the same
+    /// password) while a pre-empting request waits for the stale handshake
+    /// to settle: the newer request is charged on, and runs the PAKE against,
+    /// the new grant. Its gate had seen the old grant, and an assertion that
+    /// the gate's grant is the charged one panicked the handler in debug
+    /// builds (B03 review).
+    #[tokio::test]
+    async fn a_grant_renewed_while_a_preemption_settles_is_the_one_used() {
+        let env = env(PW);
+        let old = env.guard.store().grant(&env.device).unwrap().id;
+        let entered = Arc::new(Notify::new());
+
+        /// Revokes and grants the device again when dropped: when the stale
+        /// handshake, pre-empted, drops its exchange.
+        struct Renew {
+            guard: Arc<MutationGuard>,
+            device: DeviceId,
+        }
+        impl Drop for Renew {
+            fn drop(&mut self) {
+                self.guard.revoke(Actor::Cli, &self.device).unwrap();
+                let setup =
+                    auth::parse_server_setup(&self.guard.store().server_setup().unwrap()).unwrap();
+                let record = register_locally(
+                    &setup,
+                    PW,
+                    self.device.public_key_bytes(),
+                    auth::identifiers(self.device.public_key_bytes(), &HOST_PK),
+                )
+                .unwrap();
+                self.guard
+                    .create_grant(
+                        Actor::Cli,
+                        &self.device,
+                        Preset::HeadlessBox,
+                        &GrantOptions::default(),
+                        &record,
+                        false,
+                    )
+                    .unwrap();
+            }
+        }
+
+        /// Signals once it reaches AwaitKe3, then stalls (bounded), holding
+        /// the renewal.
+        struct Stalled {
+            entered: Arc<Notify>,
+            renew: Option<Renew>,
+        }
+        impl crate::fsm::AuthExchange for Stalled {
+            fn challenge<'a>(
+                &'a mut self,
+                _: AuthChallenge,
+            ) -> BoxFuture<'a, Result<(AuthResponse, [u8; 32]), HandshakeError>> {
+                let renew = self.renew.take();
+                Box::pin(async move {
+                    let _renew = renew;
+                    self.entered.notify_waiters();
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    Err(HandshakeError::Timeout("AUTH_RESPONSE"))
+                })
+            }
+        }
+
+        let caps = Caps::default();
+        let (state, ke1) = auth::ClientLogin::start(PW).unwrap();
+        drop(state);
+        let req = request(auth::SUITE_OPAQUE, Some(ke1));
+        let wait_entered = entered.notified();
+        let first = async {
+            let mut ex = Stalled {
+                entered: Arc::clone(&entered),
+                renew: Some(Renew {
+                    guard: Arc::clone(&env.guard),
+                    device: env.device,
+                }),
+            };
+            env.auth
+                .handle(UnattendedContext {
+                    device: env.device,
+                    label: "Laptop",
+                    request: &req,
+                    th_after_request: TH_REQ,
+                    host_pk: HOST_PK,
+                    host_caps: &caps,
+                    exchange: &mut ex,
+                    block_window: &TimerOnlyWindow,
+                    local_allow: &DenyAll,
+                    activity: &crate::fsm::host::NoSession,
+                    audit: &crate::fsm::NoAudit,
+                })
+                .await
+        };
+        let (verdict, second) = tokio::join!(first, async {
+            wait_entered.await;
+            run(&env, PW, &TimerOnlyWindow, &DenyAll).await.0
+        });
+
+        let UnattendedVerdict::Reject(r) = verdict.unwrap() else {
+            panic!("the stale handshake should have been pre-empted");
+        };
+        assert_eq!(r.reason, reject::PREEMPTED);
+        let renewed = env.guard.store().grant(&env.device).unwrap();
+        assert_ne!(renewed.id, old, "the grant was renewed");
+        assert_accepted(second, "the request after the renewal");
+        assert!(!renewed.fail.pending, "its charge is settled");
     }
 
     /// Records every audit event, for assertions.
