@@ -2545,7 +2545,8 @@ mod tests {
         app.show(Some(ShownLink::Fill(id)));
         assert_eq!(app.form.connect_to, id.display_groups());
         assert_eq!(app.form.page, Page::Home);
-        assert_eq!(app.form.link, Some(view::LinkNote::Filled(id)));
+        let notes = |app: &App| app.form.link_notes().collect::<Vec<_>>();
+        assert_eq!(notes(&app), vec![view::LinkNote::Filled(id)]);
         for (link, note) in [
             (ShownLink::Fill(own), view::LinkNote::Own),
             (ShownLink::Fill(not_a_key), view::LinkNote::Refused),
@@ -2553,10 +2554,18 @@ mod tests {
         ] {
             app.link_arrived(link);
             assert_eq!(app.form.connect_to, id.display_groups(), "{link:?}");
-            assert_eq!(app.form.link, Some(note), "{link:?}");
+            // The earlier fill is still in the field, and still said so.
+            assert_eq!(
+                notes(&app),
+                vec![view::LinkNote::Filled(id), note],
+                "{link:?}"
+            );
         }
         app.show(None);
-        assert_eq!(app.form.link, Some(view::LinkNote::Refused));
+        assert_eq!(
+            notes(&app),
+            vec![view::LinkNote::Filled(id), view::LinkNote::Refused]
+        );
         assert_eq!(app.form.connect_to, id.display_groups());
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(shared.read(|m| format!("{m:?}")), before);

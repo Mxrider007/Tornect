@@ -309,14 +309,16 @@ pub struct Form {
     /// When Copy invitation was last pressed (its button says "Copied" for
     /// a while).
     pub invited: Option<Instant>,
-    /// What the last `tornect:` link said under the connect field (design
-    /// `invite` §2.2).
-    pub(super) link: Option<LinkNote>,
     /// The ID a link filled into the connect field, while the field still
     /// yields it, and its Connect row's arming: counted from the first pass
     /// that draws the row, again after every return of the window and every
-    /// later link (L-1, L-4).
+    /// later link (L-1, L-4). Its note shows for as long as it is kept,
+    /// whatever a later link said (design `invite` §2.2).
     link_fill: Option<(TornectId, Option<Card>)>,
+    /// The note of the last link when it filled nothing: `Refused` or
+    /// `Own`, never `Filled`. Shown under the note of a fill still in the
+    /// field, until the field is edited or another link arrives.
+    link_refusal: Option<LinkNote>,
     /// The connect field gives up the keyboard focus at its next pass: a
     /// link filled it.
     pub(super) unfocus_connect: bool,
@@ -363,26 +365,28 @@ impl Form {
     /// touches no card, prompt, dial or saved entry (L-1, L-4). The ID is
     /// checked again here, since what came over IPC may be any 32 bytes:
     /// one that is no key is a refused link, this computer's own (`own`) is
-    /// said so; neither fills anything. A fill takes the keyboard focus from
-    /// the field and leaves Connect disarmed until its row has been seen,
-    /// still, for a second; any link restarts that second for a fill still
-    /// in the field. The window shows Home, unless the grant wizard is open
-    /// (leaving Settings would close it and wipe its passwords).
+    /// said so; neither fills anything, nor takes away the note of a fill
+    /// still in the field, which is still what Connect dials. A fill takes
+    /// the keyboard focus from the field and leaves Connect disarmed until
+    /// its row has been seen, still, for a second; any link restarts that
+    /// second for a fill still in the field. The window shows Home, unless
+    /// the grant wizard is open (leaving Settings would close it and wipe its
+    /// passwords).
     pub fn link_arrived(&mut self, link: ShownLink, own: Option<TornectId>) {
         if let Some((_, card)) = &mut self.link_fill {
             *card = None;
         }
-        self.link = Some(match link {
-            ShownLink::Fill(id) if id.verifying_key().is_err() => LinkNote::Refused,
-            ShownLink::Fill(id) if Some(id) == own => LinkNote::Own,
+        self.link_refusal = match link {
+            ShownLink::Fill(id) if id.verifying_key().is_err() => Some(LinkNote::Refused),
+            ShownLink::Fill(id) if Some(id) == own => Some(LinkNote::Own),
             ShownLink::Fill(id) => {
                 self.connect_to = id.display_groups();
                 self.link_fill = Some((id, None));
                 self.unfocus_connect = true;
-                LinkNote::Filled(id)
+                None
             }
-            ShownLink::Refused => LinkNote::Refused,
-        });
+            ShownLink::Refused => Some(LinkNote::Refused),
+        };
         if !self.settings.wizard_open() {
             self.page = Page::Home;
         }
@@ -408,11 +412,19 @@ impl Form {
         {
             self.link_fill = None;
         }
-        match self.link {
-            Some(LinkNote::Filled(filled)) if field_id != Some(filled) => self.link = None,
-            Some(LinkNote::Refused | LinkNote::Own) if changed => self.link = None,
-            _ => {}
+        if changed {
+            self.link_refusal = None;
         }
+    }
+
+    /// The notes under the connect field, in the order they are drawn: the
+    /// fill's while the field still yields its ID, then the refusal of a
+    /// later link that filled nothing (design `invite` §2.2). Both show
+    /// when both apply, so that a link refused after a fill never hides
+    /// that the field still holds the fill.
+    pub(super) fn link_notes(&self) -> impl Iterator<Item = LinkNote> + use<> {
+        let filled = self.link_fill.map(|(id, _)| LinkNote::Filled(id));
+        filled.into_iter().chain(self.link_refusal)
     }
 }
 
@@ -420,7 +432,8 @@ impl Form {
 /// §2.2). None of the notes names the ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LinkNote {
-    /// It filled in this ID; shown while the field still yields it.
+    /// It filled in this ID; shown while the field still yields it, a
+    /// later link's refusal under it.
     Filled(TornectId),
     /// It held no valid Tornect ID; shown until the field is edited or
     /// another link arrives.

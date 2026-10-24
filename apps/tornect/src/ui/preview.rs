@@ -790,8 +790,8 @@ mod tests {
             form(&mut filled, Sheet::LinkFilled, first);
             assert_eq!(filled.connect_to, link_id().display_groups());
             assert_eq!(
-                filled.link,
-                Some(super::super::view::LinkNote::Filled(link_id()))
+                filled.link_notes().collect::<Vec<_>>(),
+                vec![super::super::view::LinkNote::Filled(link_id())]
             );
         }
         let mut book = model(false, false);

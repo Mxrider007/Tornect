@@ -1072,7 +1072,8 @@ mod tests {
     /// comes back into view (`window_came_back`, which the event loop runs
     /// for `Focused(true)`, `Occluded(false)` and the `Show` raise), and
     /// whenever another link arrives, a refused one included: the fill
-    /// stays, its Connect waits again.
+    /// stays, still said so beside the refusal (§2.2), its Connect waits
+    /// again.
     #[test]
     fn a_link_fill_arms_again_after_a_return() {
         let id = key_id(7);
@@ -1097,13 +1098,66 @@ mod tests {
         assert!(window.pass(Vec::new()).is_empty());
         assert_eq!(window.form.connect_to, id.display_groups());
         assert!(has_text(&window, home::LINK_REFUSED));
-        assert!(!has_text(&window, home::LINK_FILLED));
+        assert!(
+            has_text(&window, home::LINK_FILLED),
+            "the field still holds the fill"
+        );
         assert!(window.node("Connect").is_disabled(), "another link came");
         let connect = window.center("Connect");
         assert!(window.click(connect).is_empty());
         window.later += Duration::from_secs(1);
         assert!(window.pass(Vec::new()).is_empty());
         assert_eq!(window.click(connect), vec![Action::Connect(id)]);
+    }
+
+    /// §2.2, L-1, L-4: a link that fills nothing (refused, no key, or this
+    /// computer's own ID) after a fill still in the field keeps the fill's
+    /// note, above its own: the field holds an ID a link put there, and it
+    /// says so for as long as Connect would dial it. An edit that leaves the
+    /// field yielding that ID takes only the refusal's note away.
+    #[test]
+    fn a_later_refused_link_keeps_the_fill_said() {
+        let (own, id) = (key_id(6), key_id(7));
+        let mut model = at_rest();
+        model.id = Some(own.display_groups());
+        for (later, says) in [
+            (ShownLink::Refused, home::LINK_REFUSED),
+            (ShownLink::Fill(not_a_key()), home::LINK_REFUSED),
+            (ShownLink::Fill(own), home::LINK_OWN),
+        ] {
+            let case = format!("{later:?} {says}");
+            let mut window = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
+            window.form.link_arrived(ShownLink::Fill(id), Some(own));
+            window.pass(Vec::new());
+            window.form.link_arrived(later, Some(own));
+            for _ in 0..3 {
+                assert!(window.pass(Vec::new()).is_empty(), "{case}");
+            }
+            assert_eq!(window.form.connect_to, id.display_groups(), "{case}");
+            let top = |window: &Window, text: &str| {
+                window
+                    .nodes
+                    .iter()
+                    .find(|n| n.value().is_some_and(|v| v.contains(text)))
+                    .and_then(Node::bounds)
+                    .map(|b| b.y0)
+            };
+            let (filled, refused) = (top(&window, home::LINK_FILLED), top(&window, says));
+            assert!(filled.is_some() && refused.is_some(), "{case}");
+            assert!(filled < refused, "the fill's note first: {case}");
+            // An edit that keeps the ID (a hyphen is no character of it).
+            let at = field_at(&window, None);
+            assert!(window.click(at).is_empty(), "{case}");
+            window.pass(vec![egui::Event::Text("-".to_owned())]);
+            window.pass(Vec::new());
+            assert_ne!(window.form.connect_to, id.display_groups(), "{case}");
+            assert!(!has_text(&window, says), "{case}");
+            assert!(has_text(&window, home::LINK_FILLED), "{case}");
+            window.later += Duration::from_secs(1);
+            assert!(window.pass(Vec::new()).is_empty(), "{case}");
+            let connect = window.center("Connect");
+            assert_eq!(window.click(connect), vec![Action::Connect(id)], "{case}");
+        }
     }
 
     /// L-4: with a pairing and a session question open, a link's raise and

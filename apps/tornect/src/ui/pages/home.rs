@@ -564,7 +564,7 @@ fn connect_card(
         if let Err(problem) = &checked {
             id_field::problem_line(ui, t, problem);
         }
-        if let Some(note) = form.link {
+        for note in form.link_notes() {
             link_note(ui, t, note);
         }
         let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
