@@ -66,6 +66,12 @@ Host                          Tor network                       Client
 The full design — research, decision record, protocol, milestones — is in
 [`docs/PLAN.md`](docs/PLAN.md).
 
+## Download
+
+Download Tornect only from https://github.com/Mxrider007/Tornect/releases, the one place
+its release zips and their `SHA256SUMS` are published. A copy offered anywhere else, or a
+download link someone sends with a Tornect ID, may not be Tornect.
+
 ## Building from source
 
 Requirements: Rust stable ≥ 1.90 (edition 2024), a C/C++ compiler, `cmake`,
