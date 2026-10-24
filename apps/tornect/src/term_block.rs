@@ -15,6 +15,11 @@
 //! closed terminal answers it, a refusal), prints its line at once, and reads
 //! the lines typed from then on until its seconds end.
 //!
+//! Two unattended requests can overlap, each with its window. The lines go to
+//! the window that opened first, and a typed line cannot say which request it
+//! means, so one `block` blocks every window open then, each saying so; a
+//! window that opens beside another says that too (audit B20).
+//!
 //! It fails closed (OP-13): standard input ending, or a line that cannot be
 //! written, before the seconds end is a Block, as a closed terminal denies a
 //! question (`prompt`). Nothing more is printed then, as there is no terminal
@@ -40,6 +45,13 @@ fn block_line(label: &str, secs: u8) -> String {
         "Unattended session from {label} starts in {secs} s. Type block and press Enter to block \
          it."
     )
+}
+
+/// The line a window adds when it opens beside others (`open` in all, itself
+/// included): the lines typed cannot say which request they mean, so one
+/// `block` blocks every one of them (B20).
+fn several_line(open: u32) -> String {
+    format!("{open} unattended requests are waiting. Typing block blocks all of them.")
 }
 
 /// The line after a Block, with the command that resumes the device.
@@ -221,10 +233,18 @@ impl BlockWindow for TerminalBlockWindow {
                 // A terminal that cannot be written refuses (OP-13).
                 return BlockOutcome::Blocked;
             }
+            let open = hold.open_windows();
+            if open > 1 && (self.say)(&several_line(open)).is_err() {
+                return BlockOutcome::Blocked;
+            }
+            // A `block` typed while another window holds the terminal is read
+            // there, and blocks this one too (B20).
+            let elsewhere = hold.blocked_by_another();
             let typed = async {
                 loop {
                     match hold.next_line().await {
                         Some(line) if line.trim().eq_ignore_ascii_case(BLOCK_WORD) => {
+                            hold.block_every_open_window();
                             return Ended::Typed;
                         }
                         Some(_) => {}
@@ -236,6 +256,7 @@ impl BlockWindow for TerminalBlockWindow {
             let ended = tokio::time::timeout_at(deadline, async {
                 tokio::select! {
                     ended = typed => ended,
+                    () = elsewhere => Ended::Typed,
                     () = self.notified(label, secs) => Ended::Notification,
                 }
             })
@@ -391,6 +412,42 @@ mod tests {
             assert_eq!(unknown.matches(label).count(), 1, "{unknown}");
             assert!(unknown.contains("tornect devices lists"), "{unknown}");
         }
+    }
+
+    /// B20: two windows open together (devices A and B connecting within a
+    /// second): the second says that `block` blocks all of them, and one
+    /// `block`, read by the first window, which holds the terminal, blocks
+    /// both, each with its own line. Before the fix the first was blocked
+    /// and the second ran out its seconds and started. A window that opens
+    /// after that `block` is not blocked by it.
+    #[tokio::test(start_paused = true)]
+    async fn one_block_blocks_every_open_window() {
+        let (prompter, typed) = Prompter::scripted();
+        let (first, said_first) = recorded(Arc::clone(&prompter), false);
+        let (second, said_second) = recorded(Arc::clone(&prompter), false);
+        let t0 = Instant::now();
+        let first = tokio::spawn(async move { first.run(3, &GRANT, "Desk").await });
+        settle().await;
+        let second = tokio::spawn(async move { second.run(3, &[2; 8], "Laptop").await });
+        settle().await;
+        assert_eq!(said_first.lines(), vec![block_line("Desk", 3)]);
+        assert_eq!(
+            said_second.lines(),
+            vec![block_line("Laptop", 3), several_line(2)]
+        );
+        typed.send("block".to_owned()).await.unwrap();
+        assert_eq!(first.await.unwrap(), BlockOutcome::Blocked);
+        assert_eq!(second.await.unwrap(), BlockOutcome::Blocked);
+        assert_eq!(t0.elapsed(), Duration::ZERO);
+        assert_eq!(said_first.lines()[1], blocked_line("Desk", None));
+        assert_eq!(said_second.lines()[2], blocked_line("Laptop", None));
+
+        let (third, said_third) = recorded(prompter, false);
+        assert_eq!(
+            third.run(3, &[3; 8], "Phone").await,
+            BlockOutcome::Passed(WindowPassed::Elapsed)
+        );
+        assert_eq!(said_third.lines(), vec![block_line("Phone", 3)]);
     }
 
     /// FC-2: a question open on the terminal (a pairing request from any
