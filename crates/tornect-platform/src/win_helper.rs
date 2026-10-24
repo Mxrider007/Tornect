@@ -11,7 +11,6 @@
 use std::ffi::c_void;
 use std::path::Path;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -51,19 +50,17 @@ use windows_sys::Win32::System::Threading::{
     OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VK_CONTROL, VK_END, VK_LCONTROL, VK_LMENU, VK_MENU, VK_RCONTROL, VK_RMENU,
-};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_END;
 use windows_sys::Win32::UI::Shell::{
     SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-    LLKHF_LOWER_IL_INJECTED, MSG, SW_HIDE, SetWindowsHookExW, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG, SW_HIDE, SetWindowsHookExW,
+    WH_KEYBOARD_LL,
 };
 
 use crate::helper::{ClientFacts, ServerFacts};
+use crate::hotkey::Modifiers;
 use crate::win::{OwnedHandle, wide};
 
 /// One end of a helper pipe, opened for overlapped I/O: each read and each
@@ -601,9 +598,11 @@ pub(crate) fn start_elevated(exe: &Path, params: &str) -> Result<Launched, Launc
     Ok(Launched { process, pid })
 }
 
-/// The panic chord's state in the hook: only whether Ctrl and Alt are down.
-static CTRL: AtomicBool = AtomicBool::new(false);
-static ALT: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// The panic chord's modifiers as the hook saw them. A low-level hook
+    /// runs on the thread that set it, so only that thread touches this.
+    static CHORD: std::cell::Cell<Modifiers> = const { std::cell::Cell::new(Modifiers::NONE) };
+}
 /// Told once when the chord is pressed.
 static PANIC: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
@@ -611,7 +610,9 @@ static PANIC: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 /// (§B.8.7.5, amendment §1.10 (a)): a low-level keyboard hook on its own
 /// thread, run by the elevated helper so that it sees keys while an elevated
 /// window has focus. It ignores injected events, matches only the chord and
-/// keeps no keystroke (two flags). `pressed` is called once.
+/// keeps no keystroke (the modifiers' state only); a modifier counts only
+/// while the system's key state still has it down, as in the host's own
+/// hook ([`Modifiers`]). `pressed` is called once.
 pub(crate) fn watch_panic_chord(pressed: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
     *PANIC.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(pressed));
     let (set, hooked) = std::sync::mpsc::channel();
@@ -643,32 +644,19 @@ pub(crate) fn watch_panic_chord(pressed: impl FnOnce() + Send + 'static) -> std:
 }
 
 unsafe extern "system" fn chord_hook(code: i32, wparam: usize, lparam: isize) -> isize {
+    const CTRL_ALT: u8 = Modifiers::CTRL | Modifiers::ALT;
     if code == HC_ACTION as i32 && lparam != 0 {
         // SAFETY: for `HC_ACTION` a low-level keyboard hook's `lparam` points
         // to a KBDLLHOOKSTRUCT valid during this call.
         let key = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-        let injected = key.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED) != 0;
-        if !injected {
-            let down = matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
-            let up = matches!(wparam as u32, WM_KEYUP | WM_SYSKEYUP);
-            let vk = key.vkCode as u16;
-            if vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL {
-                if down || up {
-                    CTRL.store(down, Ordering::SeqCst);
-                }
-            } else if vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU {
-                if down || up {
-                    ALT.store(down, Ordering::SeqCst);
-                }
-            } else if vk == VK_END
-                && down
-                && CTRL.load(Ordering::SeqCst)
-                && ALT.load(Ordering::SeqCst)
-            {
-                let told = PANIC.lock().unwrap_or_else(PoisonError::into_inner).take();
-                if let Some(told) = told {
-                    told();
-                }
+        let held = CHORD
+            .try_with(|mods| crate::hotkey::win::chord_event(mods, key, wparam, VK_END))
+            .ok()
+            .flatten();
+        if held.is_some_and(|held| held & CTRL_ALT == CTRL_ALT) {
+            let told = PANIC.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(told) = told {
+                told();
             }
         }
     }

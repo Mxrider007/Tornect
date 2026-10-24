@@ -7,8 +7,10 @@
 //! - **Windows**: a low-level keyboard hook (`WH_KEYBOARD_LL`) on its own
 //!   thread, with its own message loop, that ignores injected events
 //!   (`LLKHF_INJECTED`, `LLKHF_LOWER_IL_INJECTED`): only physical keys press
-//!   it. The hook only signals; a second thread calls `pressed`, so the hook
-//!   returns at once (NEEDS-DEVICE(windows)).
+//!   it. A modifier the hook saw go down counts only while the system's key
+//!   state still has it down ([`Modifiers`]), so one let go on the secure
+//!   desktop never lingers. The hook only signals; a second thread calls
+//!   `pressed`, so the hook returns at once (NEEDS-DEVICE(windows)).
 //! - **Linux**: the GlobalShortcuts portal of xdg-desktop-portal (through
 //!   `ashpd`) where the desktop offers it: the chord is the shortcut's
 //!   preferred trigger, and the desktop may ask the person to confirm or
@@ -121,6 +123,14 @@ impl Chord {
         Ok(chord)
     }
 
+    /// The chord's modifiers as [`Modifiers`] bits.
+    #[cfg(any(windows, test))]
+    pub(crate) fn modifier_bits(&self) -> u8 {
+        (if self.ctrl { Modifiers::CTRL } else { 0 })
+            | (if self.alt { Modifiers::ALT } else { 0 })
+            | (if self.shift { Modifiers::SHIFT } else { 0 })
+    }
+
     /// The chord as the GlobalShortcuts portal's preferred trigger (the XDG
     /// shortcut format: `CTRL+ALT+End`).
     #[must_use]
@@ -161,6 +171,73 @@ impl KeyState {
             Self::Bound => "Panic key: bound",
             Self::NotTried | Self::Unavailable => "Panic key: unavailable",
         }
+    }
+}
+
+/// What a low-level keyboard hook knows of a chord's modifiers (Windows: this
+/// module's hook and the administrator helper's; plain logic, tested on every
+/// OS).
+///
+/// A hook sees a modifier go down and up only while its desktop takes the
+/// input. The key-ups of Ctrl+Alt+Del, and any key let go while a UAC prompt
+/// or the lock screen is up, happen on the secure desktop and never reach it,
+/// so what the hook saw alone kept Ctrl and Alt held after they were let go,
+/// and a later Ctrl+End, or a bare End, pressed the panic key (audit B08). So
+/// when the chord's key goes down, the system's own key state is read as
+/// well, and a modifier the hook saw go down counts only while the system
+/// still has it down; one the system has up is forgotten.
+///
+/// Only physical keys press the panic key: injected events never make a
+/// modifier count. They do move the system's key state, though, so an
+/// injected key-up can make it say "up" for a key someone holds; after an
+/// injected event of a modifier, what the hook saw stands until that
+/// modifier's next physical event, and a remote viewer's injected input can
+/// neither press nor hold off the panic key.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Modifiers {
+    /// The modifiers whose last physical event was a key-down.
+    down: u8,
+    /// The modifiers with an injected event since their last physical one.
+    injected: u8,
+}
+
+#[cfg(any(windows, test))]
+impl Modifiers {
+    /// Ctrl, either side.
+    pub(crate) const CTRL: u8 = 1;
+    /// Alt, either side.
+    pub(crate) const ALT: u8 = 2;
+    /// Shift, either side.
+    pub(crate) const SHIFT: u8 = 4;
+    /// Nothing seen yet.
+    pub(crate) const NONE: Self = Self {
+        down: 0,
+        injected: 0,
+    };
+
+    /// A key-down or key-up of the modifier `bit`, physical or injected.
+    pub(crate) fn key(&mut self, bit: u8, down: bool, injected: bool) {
+        if injected {
+            self.injected |= bit;
+            return;
+        }
+        self.injected &= !bit;
+        if down {
+            self.down |= bit;
+        } else {
+            self.down &= !bit;
+        }
+    }
+
+    /// The modifiers held as the chord's key goes down, `system` being those
+    /// the system's key state has down now (`GetAsyncKeyState`): each the
+    /// hook saw go down physically and the system still has down, or whose
+    /// system state an injected event has moved since. One the system has up
+    /// otherwise was let go where the hook could not see it, and is forgotten.
+    pub(crate) fn held(&mut self, system: u8) -> u8 {
+        self.down &= system | self.injected;
+        self.down
     }
 }
 
@@ -289,15 +366,16 @@ async fn bind_here(_: Chord, _: Pressed) -> KeyState {
 
 #[cfg(windows)]
 #[allow(unsafe_code)] // the hook's FFI; each block says why it is sound
-mod win {
+pub(crate) mod win {
+    use std::cell::Cell;
     use std::ptr::{null, null_mut};
-    use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
     use std::sync::{Mutex, PoisonError, mpsc};
 
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        VK_CONTROL, VK_DELETE, VK_END, VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LMENU, VK_LSHIFT,
-        VK_MENU, VK_PAUSE, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
+        GetAsyncKeyState, VK_CONTROL, VK_DELETE, VK_END, VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL,
+        VK_LMENU, VK_LSHIFT, VK_MENU, VK_PAUSE, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
@@ -305,15 +383,16 @@ mod win {
         WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
-    use super::{Chord, Key, Pressed};
+    use super::{Chord, Key, Modifiers, Pressed};
 
-    /// The chord's state in the hook: which modifiers are down.
-    static CTRL: AtomicBool = AtomicBool::new(false);
-    static ALT: AtomicBool = AtomicBool::new(false);
-    static SHIFT: AtomicBool = AtomicBool::new(false);
+    thread_local! {
+        /// The chord's modifiers as the hook saw them. A low-level hook runs
+        /// on the thread that set it, so only that thread touches this.
+        static MODS: Cell<Modifiers> = const { Cell::new(Modifiers::NONE) };
+    }
     /// The chord watched: its key and modifiers (set once, before the hook).
     static KEY: AtomicU16 = AtomicU16::new(0);
-    static WANT: AtomicU16 = AtomicU16::new(0);
+    static WANT: AtomicU8 = AtomicU8::new(0);
     /// Where a press is signalled: a thread outside the hook calls `pressed`.
     static PRESSES: Mutex<Option<mpsc::Sender<()>>> = Mutex::new(None);
 
@@ -328,12 +407,69 @@ mod win {
         }
     }
 
+    /// The modifier a virtual-key code is (either side's code or the generic
+    /// one), as a [`Modifiers`] bit.
+    fn modifier_of(vk: u16) -> Option<u8> {
+        match vk {
+            VK_CONTROL | VK_LCONTROL | VK_RCONTROL => Some(Modifiers::CTRL),
+            VK_MENU | VK_LMENU | VK_RMENU => Some(Modifiers::ALT),
+            VK_SHIFT | VK_LSHIFT | VK_RSHIFT => Some(Modifiers::SHIFT),
+            _ => None,
+        }
+    }
+
+    /// The modifiers the system's key state has down now, either side.
+    fn system_modifiers() -> u8 {
+        let down = |vk: u16| {
+            // SAFETY: plain call with a virtual-key code; it takes no
+            // pointer.
+            let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
+            // The high bit (a negative answer) means down now.
+            state < 0
+        };
+        [
+            (VK_CONTROL, Modifiers::CTRL),
+            (VK_MENU, Modifiers::ALT),
+            (VK_SHIFT, Modifiers::SHIFT),
+        ]
+        .into_iter()
+        .filter(|&(vk, _)| down(vk))
+        .fold(0, |bits, (_, bit)| bits | bit)
+    }
+
+    /// One event of a low-level keyboard hook, kept in `mods`: a modifier's
+    /// is recorded, an injected one too ([`Modifiers::key`]); the physical
+    /// key-down of `trigger` answers the modifiers held with it
+    /// ([`Modifiers::held`], against the system's key state). This module's
+    /// hook and the administrator helper's both use it.
+    pub(crate) fn chord_event(
+        mods: &Cell<Modifiers>,
+        key: &KBDLLHOOKSTRUCT,
+        wparam: usize,
+        trigger: u16,
+    ) -> Option<u8> {
+        let injected = key.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED) != 0;
+        let down = matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+        let up = matches!(wparam as u32, WM_KEYUP | WM_SYSKEYUP);
+        let vk = key.vkCode as u16;
+        let mut state = mods.get();
+        let held = match modifier_of(vk) {
+            Some(bit) => {
+                if down || up {
+                    state.key(bit, down, injected);
+                }
+                None
+            }
+            None if down && !injected && vk == trigger => Some(state.held(system_modifiers())),
+            None => None,
+        };
+        mods.set(state);
+        held
+    }
+
     pub(super) fn watch(chord: Chord, pressed: Pressed) -> std::io::Result<()> {
         KEY.store(vk(chord.key), Ordering::SeqCst);
-        WANT.store(
-            u16::from(chord.ctrl) | u16::from(chord.alt) << 1 | u16::from(chord.shift) << 2,
-            Ordering::SeqCst,
-        );
+        WANT.store(chord.modifier_bits(), Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         *PRESSES.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx);
         std::thread::Builder::new()
@@ -376,36 +512,17 @@ mod win {
             // SAFETY: for `HC_ACTION` a low-level keyboard hook's `lparam`
             // points to a KBDLLHOOKSTRUCT valid during this call.
             let key = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-            let injected = key.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED) != 0;
-            if !injected {
-                let down = matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
-                let up = matches!(wparam as u32, WM_KEYUP | WM_SYSKEYUP);
-                let vk = key.vkCode as u16;
-                if vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL {
-                    if down || up {
-                        CTRL.store(down, Ordering::SeqCst);
-                    }
-                } else if vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU {
-                    if down || up {
-                        ALT.store(down, Ordering::SeqCst);
-                    }
-                } else if vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT {
-                    if down || up {
-                        SHIFT.store(down, Ordering::SeqCst);
-                    }
-                } else if down && vk == KEY.load(Ordering::SeqCst) {
-                    let held = u16::from(CTRL.load(Ordering::SeqCst))
-                        | u16::from(ALT.load(Ordering::SeqCst)) << 1
-                        | u16::from(SHIFT.load(Ordering::SeqCst)) << 2;
-                    if held == WANT.load(Ordering::SeqCst)
-                        && let Some(tx) = PRESSES
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .as_ref()
-                    {
-                        let _ = tx.send(());
-                    }
-                }
+            let held = MODS
+                .try_with(|mods| chord_event(mods, key, wparam, KEY.load(Ordering::SeqCst)))
+                .ok()
+                .flatten();
+            if held == Some(WANT.load(Ordering::SeqCst))
+                && let Some(tx) = PRESSES
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+            {
+                let _ = tx.send(());
             }
         }
         // SAFETY: passes the event on unchanged, as a hook must.
@@ -449,6 +566,89 @@ mod tests {
         ] {
             assert!(Chord::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// The chord's modifiers as the hook compares them.
+    #[test]
+    fn the_chord_names_its_modifier_bits() {
+        let bits = |text: &str| Chord::parse(text).unwrap().modifier_bits();
+        assert_eq!(bits("Ctrl+Alt+End"), Modifiers::CTRL | Modifiers::ALT);
+        assert_eq!(bits("Ctrl+Shift+F12"), Modifiers::CTRL | Modifiers::SHIFT);
+        assert_eq!(
+            bits("Alt+Shift+Ctrl+Pause"),
+            Modifiers::CTRL | Modifiers::ALT | Modifiers::SHIFT
+        );
+    }
+
+    /// Audit B08: Ctrl+Alt+Del's key-ups happen on the secure desktop, which
+    /// the hook never sees; afterwards the system has both keys up. A later
+    /// Ctrl+End, or a bare End, is not the panic chord: the modifiers the
+    /// system has up are forgotten. What the hook saw alone (the old rule)
+    /// would have held Ctrl and Alt and pressed the panic key, twice for a
+    /// double press, which turns unattended access off.
+    #[test]
+    fn a_modifier_let_go_on_the_secure_desktop_does_not_linger() {
+        const WANT: u8 = Modifiers::CTRL | Modifiers::ALT;
+        let mut mods = Modifiers::NONE;
+        // Ctrl and Alt go down; Del switches to the secure desktop.
+        mods.key(Modifiers::CTRL, true, false);
+        mods.key(Modifiers::ALT, true, false);
+        // Back on the desktop, Ctrl+End: the system has only Ctrl down.
+        mods.key(Modifiers::CTRL, true, false);
+        assert_ne!(mods.held(Modifiers::CTRL), WANT);
+        assert_eq!(mods.held(Modifiers::CTRL), Modifiers::CTRL, "Alt forgotten");
+        mods.key(Modifiers::CTRL, false, false);
+        // A bare End, twice.
+        assert_eq!(mods.held(0), 0);
+        assert_eq!(mods.held(0), 0);
+
+        // The same, nothing pressed between: a bare End is no chord.
+        let mut mods = Modifiers::NONE;
+        mods.key(Modifiers::CTRL, true, false);
+        mods.key(Modifiers::ALT, true, false);
+        assert_eq!(mods.held(0), 0);
+
+        // The real chord still presses it, afterwards and before.
+        mods.key(Modifiers::CTRL, true, false);
+        mods.key(Modifiers::ALT, true, false);
+        assert_eq!(mods.held(WANT), WANT);
+        assert_eq!(mods.held(WANT), WANT, "held for a second press");
+        let mut fresh = Modifiers::default();
+        fresh.key(Modifiers::ALT, true, false);
+        fresh.key(Modifiers::CTRL, true, false);
+        assert_eq!(fresh.held(WANT | Modifiers::SHIFT), WANT);
+        fresh.key(Modifiers::ALT, false, false);
+        assert_eq!(fresh.held(WANT), Modifiers::CTRL, "a key-up the hook saw");
+    }
+
+    /// Only physical keys press the panic key, and injected input never holds
+    /// it off: injected modifiers count for nothing, even with the system's
+    /// key state down; injected key-ups, which put the system's state up,
+    /// leave a physically held modifier counted until its next physical
+    /// event.
+    #[test]
+    fn injected_modifiers_neither_press_nor_hold_off_the_panic_key() {
+        const WANT: u8 = Modifiers::CTRL | Modifiers::ALT;
+        let mut mods = Modifiers::NONE;
+        mods.key(Modifiers::CTRL, true, true);
+        mods.key(Modifiers::ALT, true, true);
+        assert_eq!(mods.held(WANT), 0, "injected keys pressed it");
+
+        let mut mods = Modifiers::NONE;
+        mods.key(Modifiers::CTRL, true, false);
+        mods.key(Modifiers::ALT, true, false);
+        mods.key(Modifiers::CTRL, false, true);
+        mods.key(Modifiers::ALT, false, true);
+        assert_eq!(mods.held(0), WANT, "injected key-ups held it off");
+        // Down again, injected, and up: still held physically.
+        mods.key(Modifiers::ALT, true, true);
+        mods.key(Modifiers::ALT, false, true);
+        assert_eq!(mods.held(Modifiers::CTRL), WANT);
+        // The next physical events decide again.
+        mods.key(Modifiers::ALT, false, false);
+        assert_eq!(mods.held(0), Modifiers::CTRL);
+        mods.key(Modifiers::CTRL, true, false);
+        assert_eq!(mods.held(0), 0, "the system has Ctrl up");
     }
 
     /// Without the portal (or a portal that does not list the shortcut back), the
