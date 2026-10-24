@@ -482,6 +482,34 @@ async fn until_made<T, E: fmt::Display>(what: &str, mut make: impl FnMut() -> Re
     }
 }
 
+/// The Windows endpoint's waiting pipe instance after it served nobody (a
+/// connection refused at the limit, or a client that left before it was
+/// served): `waiting` itself once `free` (`DisconnectNamedPipe`) has made it
+/// ready for the next client, or else a new one from `replace`. An instance
+/// that cannot be freed never connects again, and waiting on it again would
+/// leave the endpoint standing but serving nothing, with no warning (audit
+/// B17). `waiting` is dropped only once its replacement is made, so the
+/// pipe's name never lapses.
+#[cfg(any(windows, test))]
+async fn freed_or_replaced<P, R>(
+    waiting: P,
+    free: impl FnOnce(&P) -> std::io::Result<()>,
+    replace: impl FnOnce() -> R,
+) -> P
+where
+    R: Future<Output = P>,
+{
+    match free(&waiting) {
+        Ok(()) => waiting,
+        Err(e) => {
+            tracing::warn!(error = %e, "an IPC pipe instance could not be freed; replacing it");
+            let next = replace().await;
+            drop(waiting);
+            next
+        }
+    }
+}
+
 /// Whether an `accept` error means the listening socket itself is unusable
 /// (`EBADF`, `EINVAL`, `ENOTSOCK`), which ends the endpoint. Every other one
 /// is about one connection or a passing shortage (`EMFILE` and `ENFILE` at
@@ -786,8 +814,8 @@ mod imp {
 
     use super::{
         IDLE_TIMEOUT, IpcError, IpcRequest, IpcResponse, MAX_CONNECTIONS, Path, PathBuf, Reply,
-        bind_steps, check_account, exchange, new_control_pipe_name, read_pipe_name,
-        remove_pipe_name, running, serve_frames, until_made,
+        bind_steps, check_account, exchange, freed_or_replaced, new_control_pipe_name,
+        read_pipe_name, remove_pipe_name, running, serve_frames, until_made,
     };
     use crate::win::{OwnedHandle, current_user_sid, sid_of, sid_string, token_user, wide};
 
@@ -1014,8 +1042,10 @@ mod imp {
         /// cannot be made yet (every instance taken while a finished
         /// connection's handle is still closing, a passing shortage of
         /// resources) is tried again after a pause while the connected one
-        /// waits, and an instance that cannot be freed after a refusal is
-        /// replaced the same way (audit B17): neither ends the endpoint.
+        /// waits, and an instance that cannot be freed after a refusal, or
+        /// after a client that left before it was served, is replaced the
+        /// same way (audit B17): neither ends the endpoint or leaves it
+        /// waiting on an instance that can never connect.
         pub async fn serve<F, Fut, R>(&self, handler: F) -> Result<(), IpcError>
         where
             F: Fn(IpcRequest) -> Fut + Clone + Send + Sync + 'static,
@@ -1036,7 +1066,10 @@ mod imp {
                     // A client that came and went before the connection
                     // completed: the instance is freed and waits again.
                     tracing::debug!(error = %e, "an IPC client left before it was served");
-                    let _ = waiting.disconnect();
+                    waiting = freed_or_replaced(waiting, NamedPipeServer::disconnect, || {
+                        self.next_instance()
+                    })
+                    .await;
                     tokio::time::sleep(BUSY_WAIT).await;
                     continue;
                 }
@@ -1045,11 +1078,10 @@ mod imp {
                         max = MAX_CONNECTIONS,
                         "IPC endpoint at its connection limit; refused one"
                     );
-                    if let Err(e) = waiting.disconnect() {
-                        // Made before the old one is dropped: the name stays.
-                        tracing::warn!(error = %e, "an IPC pipe instance could not be freed");
-                        waiting = self.next_instance().await;
-                    }
+                    waiting = freed_or_replaced(waiting, NamedPipeServer::disconnect, || {
+                        self.next_instance()
+                    })
+                    .await;
                     continue;
                 };
                 let connected = std::mem::replace(&mut waiting, self.next_instance().await);
@@ -1187,6 +1219,56 @@ mod pipe_rules {
         assert_eq!(made, "the instance");
         assert_eq!(tries, 4);
         assert_eq!(started.elapsed(), Duration::from_millis(50 + 100 + 200));
+    }
+
+    /// Audit B17 (Windows): after a refusal at the limit, or a client that
+    /// left before it was served, the waiting instance is freed for the next
+    /// client; one that cannot be freed is replaced, never waited on again
+    /// (that left the endpoint standing but serving nothing, silently), and
+    /// is dropped only after its replacement is made, so the name stays.
+    #[tokio::test]
+    async fn a_pipe_instance_that_cannot_be_freed_is_replaced() {
+        use std::sync::{Arc, Mutex};
+
+        const INVALID_HANDLE: i32 = 6;
+
+        /// An instance that notes when it is dropped.
+        struct Instance(&'static str, Arc<Mutex<Vec<String>>>);
+        impl Drop for Instance {
+            fn drop(&mut self) {
+                self.1.lock().unwrap().push(format!("{} dropped", self.0));
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let freed = freed_or_replaced(
+            Instance("waiting", Arc::clone(&events)),
+            |_| Ok(()),
+            || async { panic!("a freed instance was replaced") },
+        )
+        .await;
+        assert_eq!(freed.0, "waiting", "a freed instance waits again");
+        drop(freed);
+        events.lock().unwrap().clear();
+
+        let replaced = freed_or_replaced(
+            Instance("stuck", Arc::clone(&events)),
+            |_| Err(std::io::Error::from_raw_os_error(INVALID_HANDLE)),
+            || {
+                let events = Arc::clone(&events);
+                async move {
+                    events.lock().unwrap().push("next made".to_owned());
+                    Instance("next", events)
+                }
+            },
+        )
+        .await;
+        assert_eq!(replaced.0, "next", "the stuck instance was waited on again");
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["next made", "stuck dropped"],
+            "the name lapsed between the two instances"
+        );
     }
 
     /// A second server, finding the pipe made already (`FILE_FLAG_FIRST_PIPE_INSTANCE`
