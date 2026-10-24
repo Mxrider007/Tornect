@@ -1938,8 +1938,19 @@ where
                     e,
                 ));
             }
-            // An already pinned device keeps its label (re-pair).
-            let pinned = deps.trusted.pin(*device, &wanted)?;
+            // An already pinned device keeps its label (re-pair). A pin that
+            // cannot be written is not kept, and the owner's Allow still
+            // leaves a line: the requester was told it is paired, this host
+            // does not trust it (decision M1-55's half-paired state).
+            let pinned = match deps.trusted.pin(*device, &wanted) {
+                Ok(pinned) => pinned,
+                Err(e) => {
+                    deps.audit
+                        .record(AuditEvent::PairNotSaved { device: *device });
+                    tracing::warn!(peer = ?device, "the pairing was allowed but could not be saved");
+                    return Err(e.into());
+                }
+            };
             deps.audit.record(AuditEvent::PairAccepted {
                 device: *device,
                 label: pinned.clone(),

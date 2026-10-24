@@ -357,6 +357,14 @@ pub enum AuditEvent {
         /// Which card it was waiting on: what it asked for.
         popup: SuppressedPopup,
     },
+    /// The owner allowed a pairing and `PAIR_ACCEPT` went out, but the pin
+    /// could not be written: the device is not paired here, neither in the
+    /// file nor in this running host. Logged as a `pair_rejected` line with
+    /// the detail [`PAIR_NOT_SAVED`].
+    PairNotSaved {
+        /// The peer.
+        device: DeviceId,
+    },
     /// A consent popup was not shown because a remote session is live
     /// (§B.8.6.2: answered `BUSY`, `popup_suppressed_remote_session` logged,
     /// the owner notified afterwards).
@@ -373,6 +381,10 @@ pub enum AuditEvent {
 /// The `detail` of the log line of [`AuditEvent::RequesterLeft`]: not a wire
 /// code, nothing was sent.
 pub const REQUESTER_LEFT: &str = "REQUESTER_LEFT";
+
+/// The `detail` of the log line of [`AuditEvent::PairNotSaved`]: not a wire
+/// code, the requester was answered `PAIR_ACCEPT`.
+pub const PAIR_NOT_SAVED: &str = "PAIR_NOT_SAVED";
 
 /// Which consent popup [`AuditEvent::PopupSuppressed`] or
 /// [`AuditEvent::RequesterLeft`] refers to.
@@ -637,6 +649,9 @@ impl HandshakeAudit for HostAudit {
                     None => record.device(device),
                 }
             }
+            AuditEvent::PairNotSaved { device } => SessionRecord::now(SessionEvent::PairRejected)
+                .device(device)
+                .detail(PAIR_NOT_SAVED),
             AuditEvent::PopupSuppressed {
                 device,
                 label,

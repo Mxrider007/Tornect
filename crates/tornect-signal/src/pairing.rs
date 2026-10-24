@@ -703,13 +703,16 @@ impl TrustedDeviceStore {
     }
 
     /// Pin `device` and persist; returns the pinned label (an already pinned
-    /// device keeps its label).
+    /// device keeps its label). A pin that cannot be written is not kept in
+    /// memory either: trust is never given by this running host alone, which
+    /// the file and the log would not show.
     pub fn pin(&self, device: DeviceId, label: &str) -> tornect_core::Result<String> {
         let mut t = lock(&self.inner);
         let now = trusted::unix_now();
+        let before = t.clone();
         let pinned = t.pin(device, label, now).label.clone();
         let keep = self.keeps_history();
-        self.persist(&t, |file| {
+        let persisted = self.persist(&t, |file| {
             if file.is_trusted(&device) {
                 // A re-pair: the pin stays as it is; only its reject history
                 // goes, and its last-seen time moves only with history on.
@@ -720,7 +723,11 @@ impl TrustedDeviceStore {
             } else {
                 file.pin(device, &pinned, now);
             }
-        })?;
+        });
+        if let Err(e) = persisted {
+            *t = before;
+            return Err(e);
+        }
         Ok(pinned)
     }
 
@@ -975,6 +982,27 @@ mod tests {
         drop(p.admit([3u8; 32]).unwrap());
         drop(p.admit([1u8; 32]).unwrap());
         assert_eq!(p.admit([1u8; 32]).unwrap_err(), PairRefusal::RateLimited);
+    }
+
+    /// A pin whose file cannot be written is not kept in memory either
+    /// (B11 review): the running host would trust a device that the file
+    /// and the log never say was paired.
+    #[test]
+    fn a_pin_that_was_not_written_is_not_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.toml");
+        let dev = DeviceId::from_bytes([5u8; 32]);
+        let store = TrustedDeviceStore::open(path.clone()).unwrap();
+        // The temporary file's name taken by a directory: a save fails, a
+        // load works.
+        let in_the_way = tmp.path().join("t.toml.tmp");
+        std::fs::create_dir(&in_the_way).unwrap();
+        assert!(store.pin(dev, "Laptop").is_err());
+        assert!(store.get(&dev).is_none());
+        std::fs::remove_dir(&in_the_way).unwrap();
+        assert_eq!(store.pin(dev, "Laptop").unwrap(), "Laptop");
+        assert!(store.get(&dev).is_some());
+        assert!(TrustedDevices::load(&path).unwrap().is_trusted(&dev));
     }
 
     #[test]
