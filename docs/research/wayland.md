@@ -542,6 +542,62 @@ AvailableCursorModes = Hidden | Embedded | Metadata
 ```
 (The full session flow in `src/main.rs` compiles but was **not run** — it opens an interactive consent dialog.)
 
+### 4.6 `maxFramerate` in the consumer's `EnumFormat` (verified 2026-10-24, the quality design's step 20)
+
+Question: does a consumer that adds `SPA_FORMAT_VIDEO_maxFramerate` (key `0x20005`) to its
+`EnumFormat` pod as a Range of fractions `[n/1 default, 1/1 min, n/1 max]` make the
+compositor deliver at most `n` pictures a second, and can the property break negotiation?
+Sources read (upstream code at the tags named, fetched through their GitHub mirrors):
+
+- **PipeWire 1.6.2** `spa/include/spa/pod/filter.h` (`spa_pod_filter_prop`, identical in
+  1.4.0 for the Range∩Range branch): two Ranges intersect to `[max(min1, min2),
+  min(max1, max2)]`, an empty intersection is `-EINVAL`, and the default is the second
+  pod's if it lies in the new range, else the first's, else the new minimum. A property
+  only one side carries is copied as it is unless it is `MANDATORY` (it is then
+  `-EINVAL`), so a producer that offers no `maxFramerate` still negotiates, and fixation
+  takes our default `n/1`.
+- **mutter 50.0** `src/backends/meta-screen-cast-stream-src.c`: every format object carries
+  `SPA_FORMAT_VIDEO_framerate` fixed at `0/1` (variable) and, when the stream has a
+  frame rate, `SPA_FORMAT_VIDEO_maxFramerate` as `SPA_POD_CHOICE_RANGE_Fraction(def =
+  refresh, min = 1/1, max = refresh)` (`push_format_object` ~326–337, the format list
+  ~1470–1495; neither property is mandatory). `maybe_record_frame_with_timestamp`
+  (~1339–1357) skips a frame that comes sooner than `G_USEC_PER_SEC ×
+  max_framerate.denom / max_framerate.num` after the last one, queues a follow-up and
+  keeps the damage, so the next frame carries what changed: the cap throttles without
+  losing content. The range has been negotiable since mutter MR 134 (2018, "screen-cast-src:
+  Allow negotiating the framerate": "Allow letting the sink clamp the framerate range").
+- **KWin** (`master` and `v6.0.0`) `src/plugins/screencast/screencaststream.cpp`:
+  `buildFormat` offers `framerate` `0/1` and `maxFramerate` as a Range `(refresh, 0/1,
+  refresh)`; the negotiated `m_videoFormat.max_framerate` sets the stream's frame interval
+  (6.0: `frameInterval = 1000 × denom / num`) or its `VsyncSource` rate (`master`,
+  `framerate()`). It throttles.
+- **xdg-desktop-portal-wlr** (`master`, `v0.7.1`) `src/screencast/pipewire_screencast.c`:
+  offers `framerate` `0/1` and, when its rate is above 0 (the lower of its `max_fps` setting
+  and the output's refresh), `maxFramerate` as a Range `(rate, 1/1, rate)`; on
+  `param_changed` it sets `cast->framerate = max_framerate.num / denom`, and
+  `wlr_screencast.c` paces with `fps_limit_measure_end(&cast->fps_limit, cast->framerate)`.
+  It throttles. (It has no RemoteDesktop portal, so a Tornect host cannot use it today.)
+- **libwebrtc** (Chrome, Firefox; `webrtc-sdk/webrtc` `m125_release`)
+  `modules/desktop_capture/linux/wayland/screencast_stream_utils.cc` `BuildFormat`: the
+  consumer adds both `framerate` and `maxFramerate` as `SPA_POD_CHOICE_RANGE_Fraction(rate,
+  0/1, rate)`, against all three compositors above: the same consumer-side cap has shipped in
+  the browsers for years.
+
+**Verdict: favourable.** The capture crate asks for `maxFramerate` `[n/1, 1/1, n/1]` with
+`n` = `SourceRequest.max_fps` (`quality::capture_fps`, 20 over Tor by default; from the
+host's config only), held to 1 to 120 (`WaylandOptions.max_fps`, `enum_format_pod(Some(n))`);
+`None` keeps the 232-byte pod of §4.3/report §4.6 byte for byte. A compositor whose refresh
+is below `n` keeps its own maximum (the intersection), one that offers no `maxFramerate`
+gets ours copied and fixated at `n/1`, and none of the three marks the property mandatory.
+What it saves is the copy of every picture the encoder would drop (the PipeWire thread's
+`pack()` per frame); encoder pacing and the ack credits bound the rate either way.
+`parse_format` reads the negotiated `maxFramerate` (a fraction, plain or the first of a
+Choice, from the property's own bytes; one cut short is left out without failing the format)
+for the debug lines "PipeWire format negotiated" and "Wayland screen cast negotiated".
+Not verified live here (no desktop in this container): GNOME on the build VM, KDE and a
+wlroots compositor are `NEEDS-DEVICE` rows in `docs/VERIFICATION.md` (*Quality presets*).
+Fallback if a compositor ever refuses the property: `max_fps: None` for that desktop.
+
 ---
 
 ## 5. Compatibility constraints

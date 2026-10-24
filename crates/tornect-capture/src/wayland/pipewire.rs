@@ -49,6 +49,7 @@ const SPA_FORMAT_VIDEO_FORMAT: u32 = 0x2_0001;
 const SPA_FORMAT_VIDEO_MODIFIER: u32 = 0x2_0002;
 const SPA_FORMAT_VIDEO_SIZE: u32 = 0x2_0003;
 const SPA_FORMAT_VIDEO_FRAMERATE: u32 = 0x2_0004;
+const SPA_FORMAT_VIDEO_MAX_FRAMERATE: u32 = 0x2_0005;
 const SPA_MEDIA_TYPE_VIDEO: u32 = 2;
 const SPA_MEDIA_SUBTYPE_RAW: u32 = 1;
 const SPA_VIDEO_FORMAT_RGBX: u32 = 7;
@@ -339,7 +340,7 @@ pub(crate) struct AlignedPod {
 impl AlignedPod {
     /// The pod's bytes.
     #[cfg(test)]
-    fn bytes(&self) -> Vec<u8> {
+    pub(crate) fn bytes(&self) -> Vec<u8> {
         self.words.iter().flat_map(|w| w.to_ne_bytes()).collect()
     }
 
@@ -424,11 +425,22 @@ impl PodWriter {
     }
 }
 
+/// The highest `maxFramerate` this consumer asks for.
+pub(crate) const MAX_POD_FPS: u32 = 120;
+
 /// The `EnumFormat` pod of report §4.6: raw video in BGRx (the default, listed
 /// again as the first alternative), BGRx, BGRA, RGBx or RGBA, any size from
 /// 1×1 to 8192×8192 (1920×1080 preferred), and any frame rate from `0/1` (the
 /// variable rate mutter offers) to 1000/1 (30/1 preferred).
-pub(crate) fn enum_format_pod() -> AlignedPod {
+///
+/// With `max_fps`, held to 1 to [`MAX_POD_FPS`], it also asks for a
+/// `maxFramerate` of at most that many pictures a second: a Range of
+/// fractions, `n/1` preferred, from `1/1` to `n/1` (`docs/research/wayland.md`
+/// §4.6: mutter, KWin and xdg-desktop-portal-wlr offer a Range from 1/1, or
+/// 0/1, to the monitor's refresh rate, and space their pictures by the rate
+/// the intersection fixates on, so the PipeWire thread copies no picture the
+/// encoder would drop). Without it the pod is the report's, byte for byte.
+pub(crate) fn enum_format_pod(max_fps: Option<u32>) -> AlignedPod {
     let mut pod = PodWriter::default();
     pod.object(SPA_TYPE_OBJECT_FORMAT, SPA_PARAM_ENUM_FORMAT, |pod| {
         pod.prop_id(SPA_FORMAT_MEDIA_TYPE, SPA_MEDIA_TYPE_VIDEO);
@@ -460,6 +472,16 @@ pub(crate) fn enum_format_pod() -> AlignedPod {
             2,
             &[30, 1, 0, 1, 1000, 1],
         );
+        if let Some(fps) = max_fps {
+            let fps = fps.clamp(1, MAX_POD_FPS);
+            pod.prop_choice(
+                SPA_FORMAT_VIDEO_MAX_FRAMERATE,
+                SPA_CHOICE_RANGE,
+                SPA_TYPE_FRACTION,
+                2,
+                &[fps, 1, 1, 1, fps, 1],
+            );
+        }
     });
     pod.finish()
 }
@@ -475,6 +497,9 @@ pub(crate) struct Negotiated {
     pub(crate) height: u32,
     /// A `modifier` property is present: DMA-BUF was negotiated.
     pub(crate) modifier: bool,
+    /// The `maxFramerate` fraction (`num`, `denom`), when one is there and
+    /// whole. For the log only: nothing is sized or paced from it.
+    pub(crate) max_framerate: Option<(u32, u32)>,
 }
 
 fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
@@ -495,6 +520,7 @@ pub(crate) fn parse_format(pod: &[u8]) -> Option<Negotiated> {
     let pod = pod.get(..end)?;
     let (mut media_type, mut subtype, mut format, mut dims, mut modifier) =
         (None, None, None, None, false);
+    let mut max_framerate = None;
     let mut at: usize = 16;
     while at.checked_add(16)? <= end {
         let key = u32_at(pod, at)?;
@@ -520,6 +546,10 @@ pub(crate) fn parse_format(pod: &[u8]) -> Option<Negotiated> {
                 dims = Some((u32_at(value, first)?, u32_at(value, first + 4)?));
             }
             (SPA_FORMAT_VIDEO_MODIFIER, _) => modifier = true,
+            // A fraction cut short is left out; the format still parses.
+            (SPA_FORMAT_VIDEO_MAX_FRAMERATE, SPA_TYPE_FRACTION) => {
+                max_framerate = u32_at(value, first).zip(u32_at(value, first + 4));
+            }
             _ => {}
         }
         // The value, then its padding to 8 bytes.
@@ -536,6 +566,7 @@ pub(crate) fn parse_format(pod: &[u8]) -> Option<Negotiated> {
         width,
         height,
         modifier,
+        max_framerate,
     })
 }
 
@@ -571,6 +602,8 @@ pub(crate) struct VideoFormat {
     pub(crate) pixel: PixelFormat,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    /// What [`Negotiated::max_framerate`] said, for the log.
+    pub(crate) max_framerate: Option<(u32, u32)>,
 }
 
 impl VideoFormat {
@@ -597,6 +630,7 @@ impl VideoFormat {
             pixel,
             width,
             height,
+            max_framerate: negotiated.max_framerate,
         })
     }
 }
@@ -793,7 +827,13 @@ impl Shared {
                         (u64::from(f.width) << 32) | u64::from(f.height),
                         Ordering::Release,
                     );
-                    tracing::debug!(width = f.width, height = f.height, pixel = ?f.pixel, "PipeWire format negotiated");
+                    tracing::debug!(
+                        width = f.width,
+                        height = f.height,
+                        pixel = ?f.pixel,
+                        max_framerate = ?f.max_framerate,
+                        "PipeWire format negotiated"
+                    );
                 }
                 self.lock().format = format;
                 self.wake.notify_all();
@@ -1126,7 +1166,13 @@ unsafe impl Send for PwCapture {}
 impl PwCapture {
     /// Connect to the portal's PipeWire remote (`fd`, from
     /// `OpenPipeWireRemote`) and consume node `node`.
-    pub(crate) fn connect(fd: OwnedFd, node: u32) -> Result<Self, CaptureError> {
+    /// With `max_fps`, the stream asks for at most that many pictures a
+    /// second ([`enum_format_pod`]).
+    pub(crate) fn connect(
+        fd: OwnedFd,
+        node: u32,
+        max_fps: Option<u32>,
+    ) -> Result<Self, CaptureError> {
         let api = api()?;
         // SAFETY: a plain constructor; a NULL property dictionary is allowed.
         let thread_loop = unsafe { (api.thread_loop_new)(c"tornect-pipewire".as_ptr(), null()) };
@@ -1149,7 +1195,7 @@ impl PwCapture {
         }
         // SAFETY: the loop runs; the lock is released just below.
         unsafe { (api.thread_loop_lock)(thread_loop) };
-        let connected = capture.connect_locked(fd, node);
+        let connected = capture.connect_locked(fd, node, max_fps);
         // SAFETY: taken just above, on this thread.
         unsafe { (api.thread_loop_unlock)(thread_loop) };
         connected.map(|()| capture)
@@ -1157,7 +1203,12 @@ impl PwCapture {
 
     /// The part of [`Self::connect`] made with the loop lock held. On an error
     /// the caller drops `self`, which releases whatever was made.
-    fn connect_locked(&mut self, fd: OwnedFd, node: u32) -> Result<(), CaptureError> {
+    fn connect_locked(
+        &mut self,
+        fd: OwnedFd,
+        node: u32,
+        max_fps: Option<u32>,
+    ) -> Result<(), CaptureError> {
         let api = self.api;
         // SAFETY: the loop lock is held (caller); the loop outlives the context,
         // which `Drop` destroys first.
@@ -1195,7 +1246,7 @@ impl PwCapture {
         // SAFETY: `hook` and `data` stay allocated, at the same address, until
         // after `pw_stream_destroy` (see `Drop`); `EVENTS` is static.
         unsafe { (api.stream_add_listener)(self.stream, self.hook, &EVENTS, self.data.cast()) };
-        let pod = enum_format_pod();
+        let pod = enum_format_pod(max_fps);
         let mut params = [pod.as_ptr()];
         // SAFETY: `params` holds one valid, 8-byte-aligned pod, which PipeWire
         // copies before returning (`stream.c` 238–278).
@@ -1296,7 +1347,7 @@ mod tests {
 
     #[test]
     fn the_enum_format_pod_is_the_232_bytes_of_the_report() {
-        let pod = enum_format_pod();
+        let pod = enum_format_pod(None);
         let expected: Vec<u8> = EXPECTED.iter().flat_map(|w| w.to_ne_bytes()).collect();
         assert_eq!(expected.len(), 232);
         assert_eq!(pod.bytes(), expected);
@@ -1313,8 +1364,75 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 modifier: false,
+                max_framerate: None,
             })
         );
+    }
+
+    /// The report's pod with a `maxFramerate` of 20/1 appended (the quality
+    /// design §6.4): 14 words more, 288 bytes.
+    #[rustfmt::skip]
+    const EXPECTED_MAX20: [u32; 72] = {
+        let mut words = [0u32; 72];
+        let mut i = 0;
+        while i < 58 {
+            words[i] = EXPECTED[i];
+            i += 1;
+        }
+        words[0] = 280; // the object body grows by 56 bytes
+        let tail: [u32; 14] = [
+            0x20005, 0, // 0xE8 key VIDEO_maxFramerate, flags
+            40, 19, // 0xF0 Choice, body 8 + 8 + 3 × 8
+            1, 0, // 0xF8 Range
+            8, 11, // 0x100 child: element size 8, Fraction
+            20, 1, 1, 1, 20, 1, // 0x108 default 20/1, min 1/1, max 20/1
+        ];
+        while i < 72 {
+            words[i] = tail[i - 58];
+            i += 1;
+        }
+        words
+    };
+
+    #[test]
+    fn a_frame_rate_cap_appends_max_framerate_and_nothing_else() {
+        let pod = enum_format_pod(Some(20));
+        let expected: Vec<u8> = EXPECTED_MAX20
+            .iter()
+            .flat_map(|w| w.to_ne_bytes())
+            .collect();
+        assert_eq!(expected.len(), 288);
+        assert_eq!(pod.bytes(), expected);
+        assert_eq!(pod.as_ptr() as usize % 8, 0);
+        // The pod reads back whole, its cap with it.
+        assert_eq!(
+            parse_format(&pod.bytes()),
+            Some(Negotiated {
+                format: SPA_VIDEO_FORMAT_BGRX,
+                width: 1920,
+                height: 1080,
+                modifier: false,
+                max_framerate: Some((20, 1)),
+            })
+        );
+        // Held to 1 ..= MAX_POD_FPS: the default and the maximum say it.
+        for (asked, held) in [
+            (0, 1),
+            (1, 1),
+            (60, 60),
+            (120, 120),
+            (121, 120),
+            (u32::MAX, 120),
+        ] {
+            let bytes = enum_format_pod(Some(asked)).bytes();
+            assert_eq!(bytes.len(), 288, "{asked}");
+            let words: Vec<u32> = bytes
+                .chunks_exact(4)
+                .map(|w| u32::from_ne_bytes(w.try_into().unwrap()))
+                .collect();
+            assert_eq!(&words[66..72], &[held, 1, 1, 1, held, 1], "{asked}");
+            assert_eq!(&words[..58], &EXPECTED_MAX20[..58], "{asked}");
+        }
     }
 
     /// The mirrors, as the 1.6.2 headers lay them out on LP64 (also asserted at
@@ -1418,6 +1536,7 @@ mod tests {
             width: 1280,
             height: 800,
             modifier: false,
+            max_framerate: Some((60, 1)),
         };
         assert_eq!(parse_format(&pod), Some(want));
         assert_eq!(
@@ -1425,9 +1544,14 @@ mod tests {
             Ok(VideoFormat {
                 pixel: PixelFormat::Bgrx,
                 width: 1280,
-                height: 800
+                height: 800,
+                max_framerate: Some((60, 1)),
             })
         );
+        let want = Negotiated {
+            max_framerate: None,
+            ..want
+        };
         // A value wrapped in a one-element Choice (None) reads the same.
         #[rustfmt::skip]
         let size_choice: &[u32] = &[
@@ -1442,7 +1566,74 @@ mod tests {
         // Trailing bytes past the pod's own size are ignored.
         let mut longer = pod.clone();
         longer.extend_from_slice(&[0xAA; 24]);
-        assert_eq!(parse_format(&longer), Some(want));
+        assert_eq!(
+            parse_format(&longer),
+            Some(Negotiated {
+                max_framerate: Some((60, 1)),
+                ..want
+            })
+        );
+    }
+
+    /// `maxFramerate` (the quality design §6.4): read from its own bytes only,
+    /// plain or as a Choice; a fraction cut short, or a value of another type,
+    /// leaves it out and the format still parses; one that runs past the pod
+    /// is a malformed pod, as any value is.
+    #[test]
+    fn max_framerate_is_read_when_whole_and_never_fails_the_format() {
+        let want = |max_framerate| Negotiated {
+            format: SPA_VIDEO_FORMAT_BGRX,
+            width: 1280,
+            height: 800,
+            modifier: false,
+            max_framerate,
+        };
+        let plain: &[u32] = &[0x20005, 0, 8, SPA_TYPE_FRACTION, 20, 1];
+        assert_eq!(
+            parse_format(&object(&[VIDEO, RAW, BGRX, SIZE, plain])),
+            Some(want(Some((20, 1))))
+        );
+        // The cap before the size: the order of properties does not matter.
+        assert_eq!(
+            parse_format(&object(&[VIDEO, MAX_RATE, RAW, BGRX, SIZE, RATE])),
+            Some(want(Some((60, 1))))
+        );
+        // A fraction whose value holds 4 bytes, not 8: the denominator would be
+        // the next property's key, so the cap is left out.
+        let cut: &[u32] = &[0x20005, 0, 4, SPA_TYPE_FRACTION, 20, 0];
+        assert_eq!(
+            parse_format(&object(&[VIDEO, RAW, BGRX, cut, SIZE])),
+            Some(want(None))
+        );
+        // A Range whose elements say 8 bytes but whose body holds only the
+        // numerator of the first.
+        #[rustfmt::skip]
+        let short_choice: &[u32] = &[
+            0x20005, 0, 20, SPA_TYPE_CHOICE,
+            SPA_CHOICE_RANGE, 0, 8, SPA_TYPE_FRACTION,
+            60, 0,
+        ];
+        assert_eq!(
+            parse_format(&object(&[VIDEO, RAW, BGRX, short_choice, SIZE])),
+            Some(want(None))
+        );
+        // Another type under the key is not a cap.
+        let as_int: &[u32] = &[0x20005, 0, 4, 4, 20, 0];
+        assert_eq!(
+            parse_format(&object(&[VIDEO, RAW, BGRX, SIZE, as_int])),
+            Some(want(None))
+        );
+        // A value that claims to run past the pod fails it, as for any key.
+        let runaway: &[u32] = &[0x20005, 0, 4096, SPA_TYPE_FRACTION, 20, 1];
+        assert_eq!(
+            parse_format(&object(&[VIDEO, RAW, BGRX, SIZE, runaway])),
+            None
+        );
+        // The pod cut inside the cap: malformed.
+        let pod = object(&[VIDEO, RAW, BGRX, SIZE, MAX_RATE]);
+        for cut in [pod.len() - 4, pod.len() - 12, pod.len() - 24] {
+            assert_eq!(parse_format(&pod[..cut]), None, "cut at {cut}");
+        }
     }
 
     #[test]
@@ -1503,6 +1694,7 @@ mod tests {
                 width,
                 height,
                 modifier: false,
+                max_framerate: None,
             };
             assert!(VideoFormat::check(n).is_err(), "{width}x{height}");
         }
@@ -1513,6 +1705,7 @@ mod tests {
             pixel,
             width,
             height,
+            max_framerate: None,
         }
     }
 
@@ -1883,9 +2076,13 @@ mod tests {
             on_param_changed(data_ptr, SPA_PARAM_FORMAT, words.as_ptr().cast());
         }
         assert_eq!(data.shared.pixel_size(), Some((1280, 800)));
+        // The pod carries mutter's 60/1 `maxFramerate` range: it is read.
         assert_eq!(
             data.shared.wait_negotiated(Duration::ZERO).unwrap(),
-            format(PixelFormat::Bgrx, 1280, 800)
+            VideoFormat {
+                max_framerate: Some((60, 1)),
+                ..format(PixelFormat::Bgrx, 1280, 800)
+            }
         );
         // Streaming, then the compositor ends the cast: the capture thread hears it.
         let why = c"node removed";

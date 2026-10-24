@@ -54,6 +54,11 @@ pub struct WaylandOptions {
     /// does: the portal session is closed, which takes its dialog down, and no
     /// restore token is kept for it.
     pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    /// The most pictures a second the stream asks the compositor for (its
+    /// `maxFramerate`, held to 1 to 120), so that the PipeWire thread copies
+    /// no picture the encoder would drop. `None` asks for no cap: the
+    /// compositor delivers at its own rate.
+    pub max_fps: Option<u32>,
 }
 
 impl WaylandOptions {
@@ -66,6 +71,7 @@ impl WaylandOptions {
             dialog_wait: DIALOG_WAIT,
             bus: Bus::Session,
             cancel: None,
+            max_fps: None,
         }
     }
 }
@@ -104,12 +110,13 @@ impl WaylandSource {
             cancel: options.cancel.clone(),
         })?;
         let portal = Arc::new(portal);
-        let capture = PwCapture::connect(opened.fd, opened.node_id)?;
+        let capture = PwCapture::connect(opened.fd, opened.node_id, options.max_fps)?;
         let format = capture.shared().wait_negotiated(NEGOTIATE_WAIT)?;
         tracing::info!(
             node = opened.node_id,
             width = format.width,
             height = format.height,
+            max_framerate = ?format.max_framerate,
             logical = ?opened.logical,
             input = opened.input,
             "Wayland screen cast negotiated"
@@ -430,6 +437,24 @@ mod tests {
         (w, h)
     }
 
+    /// The options a caller does not set ask the compositor for no frame-rate
+    /// cap: the stream's pod is then the report's, byte for byte
+    /// (`pipewire::tests::the_enum_format_pod_is_the_232_bytes_of_the_report`).
+    #[test]
+    fn options_ask_for_no_frame_rate_cap_unless_given_one() {
+        let options = WaylandOptions::new(None);
+        assert_eq!(options.max_fps, None);
+        assert_eq!(
+            pipewire::enum_format_pod(options.max_fps).bytes().len(),
+            232
+        );
+        let capped = WaylandOptions {
+            max_fps: Some(20),
+            ..WaylandOptions::new(None)
+        };
+        assert_eq!(pipewire::enum_format_pod(capped.max_fps).bytes().len(), 288);
+    }
+
     #[test]
     fn buttons_keys_and_the_wheel_become_evdev_calls() {
         let mut wheel = WheelAccumulator::default();
@@ -633,6 +658,7 @@ mod tests {
             pixel: pipewire::PixelFormat::Bgrx,
             width: 1280,
             height: 800,
+            max_framerate: None,
         })));
         // Input not granted at the dialog; no logical size from the portal.
         assert!(
@@ -685,6 +711,7 @@ mod tests {
             pixel: pipewire::PixelFormat::Bgrx,
             width: 1280,
             height: 800,
+            max_framerate: None,
         })));
         let mut viewer = tornect_input::Tracked::new(
             input(&portal, &shared, Some((1280, 800)), true)

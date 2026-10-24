@@ -85,8 +85,10 @@ impl MediaBackend for SystemBackend {
     /// On Wayland `cancel` ends the wait on the desktop's dialog: the portal
     /// session is closed, which takes the dialog down, and no restore token is
     /// kept for a session that is over. The other sources do not wait. The
-    /// card runs at most at `request`'s rate; the desktop sources deliver at
-    /// their own (the encoder paces them).
+    /// card and the Wayland stream run at most at `request`'s rate (the
+    /// stream asks the compositor for that `maxFramerate`); X11 and GDI
+    /// deliver at their own, and the encoder paces every source to the
+    /// preset's rate.
     fn open_source(
         &self,
         request: SourceRequest,
@@ -97,7 +99,7 @@ impl MediaBackend for SystemBackend {
                 let (width, height, _) = CARD;
                 Ok(Box::new(TestCard::new(width, height, card_fps(request))))
             }
-            Source::Desktop => self.desktop_source(cancel),
+            Source::Desktop => self.desktop_source(request, cancel),
         }
     }
 
@@ -159,10 +161,11 @@ fn desktop_for(session_type: Option<&str>) -> Desktop {
 impl SystemBackend {
     fn desktop_source(
         &self,
+        request: SourceRequest,
         cancel: watch::Receiver<bool>,
     ) -> Result<Box<dyn VideoSource>, CaptureError> {
         match desktop_for(session_type().as_deref()) {
-            Desktop::Wayland => self.wayland_source(cancel),
+            Desktop::Wayland => self.wayland_source(request, cancel),
             Desktop::X11 => Ok(Box::new(tornect_capture::x11::X11Capture::open()?)),
         }
     }
@@ -199,14 +202,18 @@ impl SystemBackend {
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 impl SystemBackend {
     /// Opens the portal session: the desktop's dialog, unless the restore
-    /// token still holds, until `cancel` turns `true`.
+    /// token still holds, until `cancel` turns `true`. The stream asks the
+    /// compositor for at most `request`'s rate, which comes from the host's
+    /// config and never from the viewer.
     fn wayland_source(
         &self,
+        request: SourceRequest,
         cancel: watch::Receiver<bool>,
     ) -> Result<Box<dyn VideoSource>, CaptureError> {
         use tornect_capture::wayland::{WaylandOptions, WaylandSource};
         let mut options = WaylandOptions::new(self.restore_token.clone());
         options.cancel = Some(cancel.clone());
+        options.max_fps = Some(request.max_fps);
         let (source, input) = WaylandSource::open(&options)?;
         // A session that ended while the open finished gets nothing kept: its
         // source is dropped unread, and `session_ended` may have run already.
@@ -242,6 +249,7 @@ impl SystemBackend {
 impl SystemBackend {
     fn wayland_source(
         &self,
+        _request: SourceRequest,
         _cancel: watch::Receiver<bool>,
     ) -> Result<Box<dyn VideoSource>, CaptureError> {
         Err(CaptureError::Unavailable(
@@ -258,6 +266,7 @@ impl SystemBackend {
 impl SystemBackend {
     fn desktop_source(
         &self,
+        _request: SourceRequest,
         _cancel: watch::Receiver<bool>,
     ) -> Result<Box<dyn VideoSource>, CaptureError> {
         Ok(Box::new(tornect_capture::gdi::GdiCapture::open()?))
@@ -276,6 +285,7 @@ impl SystemBackend {
 impl SystemBackend {
     fn desktop_source(
         &self,
+        _request: SourceRequest,
         _cancel: watch::Receiver<bool>,
     ) -> Result<Box<dyn VideoSource>, CaptureError> {
         Err(CaptureError::Unavailable(
