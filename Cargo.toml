@@ -23,8 +23,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/Mxrider420z/Tornect"
-homepage = "https://github.com/Mxrider420z/Tornect"
+repository = "https://github.com/Mxrider007/Tornect"
+homepage = "https://github.com/Mxrider007/Tornect"
 authors = ["Tornect contributors"]
 publish = false
 

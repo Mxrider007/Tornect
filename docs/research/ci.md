@@ -6,7 +6,9 @@ nextest / cargo-deny tooling, Rust edition 2024, the xtask alias, and cross-`car
 feasibility for the Windows (`windows` crate) and macOS (`objc2` family) platform code.
 Every claim cites a URL, a `gh api` call, or a path under `/tmp/crates-src/<crate>`.
 Repo facts: `Mxrider420z/Tornect` is **private** (`gh api repos/Mxrider420z/Tornect` →
-`private=true`), default branch `main`.
+`private=true`), default branch `main`. (2026-10-24: the repository has moved to
+https://github.com/Mxrider007/Tornect, which `gh api repos/Mxrider007/Tornect` reports as
+`private=false`.)
 
 ## 0. What was actually verified on this VM (the build VM, Rust 1.96.0 stable)
 
