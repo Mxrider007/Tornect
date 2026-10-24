@@ -544,6 +544,11 @@ jobs:
         with: { files: target/dist/tornect, generate_release_notes: true, fail_on_unmatched_files: true }
 ```
 
+(2026-10-24, audit finding B30: the `[profile.dist]` this sketch builds with was removed from
+`Cargo.toml`, since nothing used it. Releases are built by `cargo xtask dist`, with
+`cargo build --locked --release`, and `BUILD-INFO.txt` records `[profile.release]`; see
+`docs/RELEASING.md`. A release job would run that, not the `--profile dist` line above.)
+
 Add `.github/dependabot.yml` with `package-ecosystem: github-actions` so the floating
 majors get bumped by PR; or replace `@vN` with the full SHAs in §1 (`@<sha> # v7.0.1`).
 

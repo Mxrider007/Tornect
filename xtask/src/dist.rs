@@ -123,6 +123,24 @@ pub fn dist(root: &Path, args: &[String]) -> anyhow::Result<()> {
          [profile.release] alone (audit finding B30). Unset them",
         overrides.join(", ")
     );
+    // The repository's own cargo configuration reaches every build too.
+    // BUILD-INFO.txt records `.cargo/config.toml` line by line, under a profile
+    // line that names Cargo.toml alone, so a profile set there is refused, and
+    // so is an extensionless `.cargo/config`, which cargo would read instead.
+    ensure!(
+        !root.join(".cargo").join("config").exists(),
+        ".cargo/config exists: cargo reads it in place of .cargo/config.toml, the file \
+         BUILD-INFO.txt records. Merge it into .cargo/config.toml and remove it"
+    );
+    let config = fs::read_to_string(root.join(".cargo").join("config.toml"))
+        .context("reading .cargo/config.toml")?;
+    if let Some(line) = cargo_config_profile(&config) {
+        bail!(
+            ".cargo/config.toml sets a profile (`{line}`): it would change the release build, \
+             and BUILD-INFO.txt's profile line records Cargo.toml's [profile.release] alone \
+             (audit finding B30). Move it to Cargo.toml"
+        );
+    }
     let version = env!("CARGO_PKG_VERSION");
     let git = Git::read(root)?;
     if git.dirty {
@@ -204,6 +222,39 @@ fn release_profile_overrides(names: impl Iterator<Item = std::ffi::OsString>) ->
         .collect();
     found.sort();
     found
+}
+
+/// The first line of a cargo configuration file that sets a profile: a
+/// `[profile…]` table (any spacing or quoting of its first key) or, before any
+/// table, a `profile…` key (dotted, or an inline table). Read by lines, as
+/// xtask has no TOML parser; a `[profile` line inside a multi-line string
+/// counts too, which only refuses more.
+fn cargo_config_profile(config: &str) -> Option<String> {
+    let first_key = |name: &str| {
+        name.split('.')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .trim()
+            == "profile"
+    };
+    let mut top_level = true;
+    for line in config.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            top_level = false;
+            let name = header.trim_start_matches('[').split(']').next();
+            if first_key(name.unwrap_or_default()) {
+                return Some(line.to_owned());
+            }
+        } else if top_level && first_key(line.split('=').next().unwrap_or_default()) {
+            return Some(line.to_owned());
+        }
+    }
+    None
 }
 
 /// `[profile.release]` of the workspace's `Cargo.toml` and its sub-tables
@@ -1265,6 +1316,56 @@ mod tests {
         );
         assert!(release_profile("[profile.dev]\nopt-level = 1\n").is_err());
         assert!(release_profile("[profile.release]\nlto = \"fat\" # comment\n").is_err());
+    }
+
+    /// B30 (review): the repository's `.cargo/config.toml` reaches the release
+    /// build as well, so a profile set there stops dist; today's file sets none.
+    #[test]
+    fn a_profile_in_the_repositorys_cargo_config_is_found() {
+        let root = crate::workspace_root().unwrap();
+        let config = fs::read_to_string(root.join(".cargo").join("config.toml")).unwrap();
+        assert_eq!(cargo_config_profile(&config), None);
+        assert!(
+            !root.join(".cargo").join("config").exists(),
+            "cargo would read .cargo/config in place of .cargo/config.toml"
+        );
+
+        let appended = format!("{config}\n[profile.release.build-override]\nopt-level = 0\n");
+        for (edited, line) in [
+            ("[profile.release]\nlto = \"fat\"\n", "[profile.release]"),
+            (
+                "[env]\nA = \"1\"\n\n  [ profile . release ]  \n",
+                "[ profile . release ]",
+            ),
+            (
+                "[\"profile\".release.package.foo]\nopt-level = 0\n",
+                "[\"profile\".release.package.foo]",
+            ),
+            ("[profile]\nrelease = { lto = \"fat\" }\n", "[profile]"),
+            (
+                "profile.release.lto = \"fat\"\n[alias]\nx = \"run\"\n",
+                "profile.release.lto = \"fat\"",
+            ),
+            (
+                "# top\n'profile' = { release = { strip = true } }\n",
+                "'profile' = { release = { strip = true } }",
+            ),
+            (appended.as_str(), "[profile.release.build-override]"),
+        ] {
+            assert_eq!(
+                cargo_config_profile(edited).as_deref(),
+                Some(line),
+                "{edited}"
+            );
+        }
+        for clean in [
+            "# [profile.release]\n[alias]\nxtask = \"run\"\n",
+            "[env]\nprofile = \"an environment variable\"\n",
+            "[target.x86_64-pc-windows-gnullvm]\nrustflags = [\"-C\", \"profile=x\"]\n",
+            "[profiles]\nx = 1\n",
+        ] {
+            assert_eq!(cargo_config_profile(clean), None, "{clean}");
+        }
     }
 
     /// B30: a `CARGO_PROFILE_RELEASE_*` variable changes the build behind the
