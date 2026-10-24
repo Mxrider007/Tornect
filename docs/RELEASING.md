@@ -65,7 +65,9 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
      texts in `packaging/licenses/`; the licences of the C code and fonts inside crates, the Rust
      standard library's notices, and on Windows llvm-mingw's runtime;
    - stages the zip's files in `target/dist/stage/` with the commit's time and fixed modes, refuses
-     any file that holds the build machine's home path, and writes
+     any file that holds a path of the build machine (the workspace, `CARGO_HOME`, `RUSTUP_HOME`,
+     llvm-mingw or the home directory; the home directory, a generic path such as `/root/`, is not
+     looked for in the two lyrebird files pinned by SHA-256; audit finding B28), and writes
      `target/dist/tornect-<version>-<os>-x86_64.zip`, tested with `unzip -t`;
    - last, `target/dist/SHA256SUMS` over the zips of this run.
 3. Check: `cd target/dist && sha256sum -c SHA256SUMS`; read both `BUILD-INFO.txt` (the
