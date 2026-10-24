@@ -9526,6 +9526,70 @@ async fn a_pairing_accept_that_cannot_be_written_pins_nothing_and_is_logged() {
     );
 }
 
+/// B11 review: an owner's Allow whose `PAIR_ACCEPT` went out but whose pin
+/// cannot be written leaves a log line, and no trusted device in the running
+/// host either. The store's error used to return before `PairAccepted`: no
+/// line at all, while the device stayed trusted in memory until a restart.
+#[tokio::test]
+async fn a_pairing_that_cannot_be_saved_is_logged_and_not_trusted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    // A directory where the file should be: every save fails.
+    let blocked = tmp.path().join("blocked-trusted-devices.toml");
+    std::fs::create_dir(&blocked).unwrap();
+    host.trusted = Arc::new(TrustedDeviceStore::with(blocked, TrustedDevices::default()));
+    host.deps.trusted = host.trusted.clone();
+    host.consent
+        .push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    let device = DeviceIdentity::from_seed(&CLIENT_SEED).id();
+
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    raw.chan.send(&raw_pair_request(), None).await.unwrap();
+    let accept = raw.recv().await.unwrap();
+    assert_eq!(accept.env.kind, Kind::PairAccept);
+    let outcome = host_noticed(task).await;
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert!(
+        host.trusted.get(&device).is_none(),
+        "a pin the file does not have is not kept in memory"
+    );
+    let events = audit.0.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AuditEvent::PairNotSaved { device: d } if *d == device)),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AuditEvent::PairAccepted { .. })),
+        "{events:?}"
+    );
+}
+
+/// A pairing that could not be saved is logged as a refusal of the pairing
+/// with the fixed detail `PAIR_NOT_SAVED`, the device alone (no label was
+/// pinned).
+#[test]
+fn a_pairing_not_saved_is_logged_as_a_refusal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let audit = HostAudit::new(Arc::new(SessionLog::new(tmp.path().join("sessions.log"))));
+    let device = DeviceId::from_bytes([3u8; 32]);
+    audit.record(AuditEvent::PairNotSaved { device });
+    let records = audit.log().read_all().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].event, LogEvent::PairRejected);
+    assert_eq!(records[0].peer_device, Some(device));
+    assert_eq!(records[0].peer_name, None);
+    assert_eq!(records[0].detail.as_deref(), Some(PAIR_NOT_SAVED));
+}
+
 /// B11: a refusal is logged even when it cannot be written: the owner's Deny
 /// of a pairing and of a session, and an unattended reject. Each line used
 /// to be written only after a successful send, so a requester that had gone
