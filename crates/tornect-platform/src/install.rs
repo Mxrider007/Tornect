@@ -134,6 +134,12 @@ pub const URL_KEY_APPEARED: &str = "Another program registered tornect:// links 
      (HKEY_CURRENT_USER\\Software\\Classes\\tornect), so Tornect was not installed. Run tornect \
      install again: it leaves that registration as it is.";
 
+/// Added to an undone install's message when the registration of `tornect:`
+/// links it wrote was changed by another program before the undo: the undo
+/// left it (L-6).
+pub const URL_KEY_CHANGED_MEANWHILE: &str = " Another program changed \
+     HKEY_CURRENT_USER\\Software\\Classes\\tornect meanwhile; Tornect left it as it is.";
+
 /// What [`URL_SCHEME_KEY`] holds, as [`WindowsSystem::url_handler`] reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UrlKey {
@@ -730,10 +736,14 @@ enum Done {
 /// Undo `done`, newest first: the link registration this install wrote, the
 /// Start-menu entry, then the copy (an elevated step, run only after a
 /// reparse check of its own: the folder and the copy in it must not be
-/// reparse points, or the delete would act on another place). What could not
-/// be undone is added to `error`'s message, after its reason; when the copy
-/// itself stayed, the message says that Tornect was not installed and that
-/// the folder may still hold a copy that nothing points at.
+/// reparse points, or the delete would act on another place). The
+/// registration is read again first, since the prompt before the undo may
+/// have stayed open for long: it is removed only while its command is still
+/// the installed copy's (L-6), and one another program put in its place
+/// meanwhile is left and named in the message. What could not be undone is
+/// added to `error`'s message, after its reason; when the copy itself
+/// stayed, the message says that Tornect was not installed and that the
+/// folder may still hold a copy that nothing points at.
 /// A copy whose folder failed the ACL check never comes here: it is not
 /// deleted as administrator at all.
 fn undo(
@@ -744,9 +754,20 @@ fn undo(
 ) -> InstallError {
     let mut failed = Vec::new();
     let mut copy_left = false;
+    let mut url_left = false;
     for step in done.iter().rev() {
         let undone = match step {
-            Done::UrlHandler => sys.remove_url_handler(),
+            Done::UrlHandler => match sys.url_handler() {
+                Ok(UrlKey::Command(command)) if command == target.url_command => {
+                    sys.remove_url_handler()
+                }
+                Ok(UrlKey::Absent) => Ok(()),
+                Ok(UrlKey::Command(_) | UrlKey::Other) => {
+                    url_left = true;
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            },
             Done::StartMenuEntry => sys.remove_shortcut(&target.start_menu_entry),
             Done::Copied => not_a_link(sys, target).and_then(|()| {
                 sys.run_elevated(&Elevated::RemoveFolder {
@@ -763,11 +784,13 @@ fn undo(
             });
         }
     }
-    if failed.is_empty() {
+    if failed.is_empty() && !url_left {
         return error;
     }
     let details = failed.join("; ");
-    let tail = if copy_left {
+    let mut tail = if failed.is_empty() {
+        String::new()
+    } else if copy_left {
         format!(
             " Tornect was not installed, and undoing it did not finish ({details}): {} may still \
              hold a copy, and nothing points at it.",
@@ -776,6 +799,9 @@ fn undo(
     } else {
         format!(" Undoing it did not finish ({details}).")
     };
+    if url_left {
+        tail.push_str(URL_KEY_CHANGED_MEANWHILE);
+    }
     match error {
         InstallError::Unavailable(m) => InstallError::Unavailable(format!("{m}{tail}")),
         InstallError::Refused(m) => InstallError::Refused(format!("{m}{tail}")),
@@ -2865,6 +2891,9 @@ mod windows_tests {
         url: RefCell<UrlKey>,
         /// Writing the link registration fails.
         fail_url: bool,
+        /// What another program puts in the link registration while the
+        /// prompt of an elevated step (by kind) is open, once.
+        url_during_prompt: RefCell<Option<(&'static str, UrlKey)>>,
     }
 
     fn kind(step: &Elevated) -> &'static str {
@@ -2908,6 +2937,7 @@ mod windows_tests {
                 own: IMAGE.to_owned(),
                 url: RefCell::new(UrlKey::Absent),
                 fail_url: false,
+                url_during_prompt: RefCell::new(None),
             }
         }
 
@@ -3098,6 +3128,13 @@ mod windows_tests {
         }
 
         fn run_elevated(&self, step: &Elevated) -> Result<(), InstallError> {
+            let during = self.url_during_prompt.borrow().clone();
+            if let Some((at, now)) = during
+                && at == kind(step)
+            {
+                *self.url_during_prompt.borrow_mut() = None;
+                *self.url.borrow_mut() = now;
+            }
             let mut cancel = self.cancel.borrow_mut();
             if let Some(at) = cancel.iter().position(|k| *k == kind(step)) {
                 cancel.remove(at);
@@ -4730,6 +4767,71 @@ mod windows_tests {
             ]
         );
         fake.assert_nothing_installed();
+    }
+
+    /// L-6: the undo of a second prompt cancelled or failed reads the
+    /// registration again before removing it, since that prompt may have
+    /// stayed open for long: one another program put in its place meanwhile
+    /// is left, and the message says so; one already gone is not reported.
+    /// The rest is undone as before.
+    #[test]
+    fn the_undo_leaves_a_link_registration_changed_during_the_second_prompt() {
+        for (now, reported) in [
+            (theirs(), true),
+            (UrlKey::Other, true),
+            (UrlKey::Absent, false),
+        ] {
+            for at in ["cancel", "fail"] {
+                let mut fake = Fake::new();
+                if at == "cancel" {
+                    fake.cancel.borrow_mut().push("write");
+                } else {
+                    fake.fail = vec!["write"];
+                }
+                *fake.url_during_prompt.borrow_mut() = Some(("write", now.clone()));
+                let why = match install_in_program_files(&fake, &mut allow(&fake)) {
+                    Err(InstallError::Cancelled(why)) if at == "cancel" => why,
+                    Err(InstallError::Failed(why)) if at == "fail" => why,
+                    other => panic!("{now:?} {at}: {other:?}"),
+                };
+                assert_eq!(
+                    why.ends_with(URL_KEY_CHANGED_MEANWHILE),
+                    reported,
+                    "{now:?} {at}: {why}"
+                );
+                let events = fake.events();
+                assert!(!events.contains(&Ev::RemoveUrl), "{now:?} {at}: {events:?}");
+                assert_eq!(fake.url(), now, "{at}");
+                let url = position(&events, |e| matches!(e, Ev::WriteUrl(_)));
+                let after: Vec<Ev> = events[url + 1..]
+                    .iter()
+                    .filter(|e| !matches!(e, Ev::Elevated(Elevated::WriteEntry(_))))
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    after,
+                    [
+                        Ev::RemoveShortcut(Fake::link()),
+                        Ev::Elevated(Elevated::RemoveFolder {
+                            folder: fake.folder()
+                        }),
+                        Ev::CloseImage,
+                    ],
+                    "{now:?} {at}"
+                );
+                fake.assert_nothing_installed();
+            }
+        }
+        // Still this install's own command: removed, and nothing is added.
+        let fake = Fake::new();
+        fake.cancel.borrow_mut().push("write");
+        *fake.url_during_prompt.borrow_mut() = Some(("write", UrlKey::Command(fake.url_command())));
+        match install_in_program_files(&fake, &mut allow(&fake)) {
+            Err(InstallError::Cancelled(why)) => assert_eq!(why, INSTALL_NEEDS_APPROVAL),
+            other => panic!("{other:?}"),
+        }
+        assert!(fake.events().contains(&Ev::RemoveUrl));
+        assert_eq!(fake.url(), UrlKey::Absent);
     }
 
     /// Design `invite` §4.5, L-6: a registration that is not this install's
