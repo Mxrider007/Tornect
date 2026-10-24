@@ -134,6 +134,12 @@ impl Console for Collected {
         self.lines.push(line.to_owned());
     }
 
+    /// Never kept: the lines end in a message box, not a terminal, and a
+    /// secret is shown only on a terminal (`GENERATED_OFF_TERMINAL`).
+    fn secret_line(&mut self, _: &str, _: &str) -> anyhow::Result<()> {
+        anyhow::bail!("{}", unattended::GENERATED_OFF_TERMINAL)
+    }
+
     fn err(&mut self, line: &str) {
         self.lines.push(line.to_owned());
     }
@@ -846,6 +852,11 @@ mod tests {
 
         fn out(&mut self, line: &str) {
             self.lines.push(format!("out: {line}"));
+        }
+
+        fn secret_line(&mut self, prefix: &str, secret: &str) -> anyhow::Result<()> {
+            self.lines.push(format!("secret: {prefix}{secret}"));
+            Ok(())
         }
 
         fn err(&mut self, line: &str) {

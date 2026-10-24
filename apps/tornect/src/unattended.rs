@@ -1597,7 +1597,7 @@ pub async fn run_unattended(paths: &Paths, cmd: UnattendedCmd) -> anyhow::Result
             println!("Unattended access is ON.");
             println!();
             println!("  EMERGENCY STOP CODE");
-            print_secret_line(&format_stop_code(&card.stop_code))?;
+            print_secret_line("  ", &format_stop_code(&card.stop_code))?;
             println!();
             println!("  Write this down and keep it away from this computer. Presenting it from");
             println!("  any device turns unattended access off, revokes every grant and ends any");
@@ -1891,6 +1891,9 @@ pub(crate) trait Console {
     fn stdout_is_terminal(&self) -> bool;
     /// A line on standard output.
     fn out(&mut self, line: &str);
+    /// `prefix` then `secret` as one line on standard output, leaving no
+    /// copy of `secret` in a buffer that is never wiped ([`print_secret_line`]).
+    fn secret_line(&mut self, prefix: &str, secret: &str) -> anyhow::Result<()>;
     /// A line on standard error.
     fn err(&mut self, line: &str);
     /// Show `question` on standard error and read one line: `None` at end of
@@ -1909,6 +1912,10 @@ impl Console for Terminal {
 
     fn out(&mut self, line: &str) {
         crate::host::say(format_args!("{line}"));
+    }
+
+    fn secret_line(&mut self, prefix: &str, secret: &str) -> anyhow::Result<()> {
+        print_secret_line(prefix, secret)
     }
 
     fn err(&mut self, line: &str) {
@@ -2098,7 +2105,8 @@ async fn administrator_form(
         true,
     )
     .await?;
-    io.out(&format!("New password for \"{label}\": {}", shown.as_str()));
+    io.secret_line(&new_password_prefix(&label), &shown)
+        .with_context(|| not_printed(&label))?;
     io.out(WRITE_IT_DOWN);
     drop(shown);
     offer_new_passwords(paths, route, others, io).await
@@ -2144,7 +2152,8 @@ async fn offer_new_passwords(
                 .await
             {
                 Ok(shown) => {
-                    io.out(&format!("New password for \"{label}\": {}", shown.as_str()));
+                    io.secret_line(&new_password_prefix(&label), &shown)
+                        .with_context(|| not_printed(&label))?;
                     io.out(WRITE_IT_DOWN);
                 }
                 Err(e) => {
@@ -2216,32 +2225,74 @@ pub(crate) fn format_stop_code(code: &[u8; 16]) -> zeroize::Zeroizing<String> {
     out
 }
 
-/// Print `  <secret>\n` straight to the stdout descriptor: `std`'s stdout buffer
-/// is process-global and never wiped (track D S12).
-fn print_secret_line(secret: &str) -> anyhow::Result<()> {
-    use std::io::Write as _;
-    let mut line = zeroize::Zeroizing::new(String::with_capacity(secret.len() + 3));
-    line.push_str("  ");
+/// The text before a generated password on its line (§B.8.7.4).
+fn new_password_prefix(label: &str) -> String {
+    format!("New password for \"{label}\": ")
+}
+
+/// Why a command stopped after a generated password it registered could not
+/// be printed: nobody has seen that password.
+fn not_printed(label: &str) -> String {
+    format!(
+        "the new password for \"{label}\" was registered but could not be printed; give it \
+         another with `tornect unattended set-password`"
+    )
+}
+
+/// `prefix`, `secret` and a newline as one line, in one buffer sized up front
+/// (so it never grows, leaving an outgrown copy in freed memory) and wiped on
+/// drop (§B.8.7.2 "all intermediates in Zeroizing").
+fn secret_line_text(prefix: &str, secret: &str) -> zeroize::Zeroizing<String> {
+    let mut line = zeroize::Zeroizing::new(String::with_capacity(prefix.len() + secret.len() + 1));
+    line.push_str(prefix);
     line.push_str(secret);
     line.push('\n');
-    std::io::stdout().flush()?;
+    line
+}
+
+/// Print `prefix`, `secret` and a newline as one line, written past `std`'s
+/// stdout buffer, which is process-global and never wiped (track D S12;
+/// audit B24): a `println!` or a `format!` of the secret leaves copies that
+/// stay in memory for the rest of the process. `prefix` is not secret.
+///
+/// The line is built by [`secret_line_text`], and stdout stays locked from
+/// the flush of what was buffered before it to the end of its write, so no
+/// other line lands in the buffer meanwhile. On Unix it goes straight to the
+/// descriptor. Elsewhere it goes through `std` as one whole line onto an
+/// empty buffer, which `std`'s line writer hands to the console in one
+/// piece without copying it into its buffer.
+///
+/// What this cannot wipe: the terminal's own copy (its scrollback, and on
+/// Windows the console host and the UTF-16 conversion `std` makes on the
+/// stack to write to a console), and whatever the kernel keeps of the write.
+/// Those are the point of showing it: the password is shown once, to be
+/// written down.
+fn print_secret_line(prefix: &str, secret: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let line = secret_line_text(prefix, secret);
+    let mut out = std::io::stdout().lock();
+    out.flush()?;
     #[cfg(unix)]
-    {
-        let stdout = std::io::stdout();
-        let mut rest = line.as_bytes();
-        while !rest.is_empty() {
-            match rustix::io::write(&stdout, rest) {
-                Ok(n) => rest = &rest[n..],
-                Err(rustix::io::Errno::INTR) => {}
-                Err(e) => return Err(std::io::Error::from(e).into()),
-            }
-        }
-    }
+    write_to_fd(&out, line.as_bytes())?;
     #[cfg(not(unix))]
     {
-        let mut out = std::io::stdout();
         out.write_all(line.as_bytes())?;
         out.flush()?;
+    }
+    Ok(())
+}
+
+/// All of `bytes` to `fd` with no buffer between, retrying an interrupted
+/// write.
+#[cfg(unix)]
+fn write_to_fd(fd: &impl rustix::fd::AsFd, bytes: &[u8]) -> std::io::Result<()> {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match rustix::io::write(fd, rest) {
+            Ok(n) => rest = &rest[n..],
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(())
 }
@@ -3056,6 +3107,32 @@ mod tests {
         );
     }
 
+    /// B24: a password's line is built in one buffer that never grows (no
+    /// outgrown copy left in freed memory), and written whole, with no
+    /// buffer between it and the descriptor.
+    #[test]
+    fn a_secret_line_is_built_in_place_and_written_whole() {
+        let line = secret_line_text(
+            &new_password_prefix("Windows PC"),
+            "quiet verdant otter lantern zephyr",
+        );
+        assert_eq!(
+            line.as_str(),
+            "New password for \"Windows PC\": quiet verdant otter lantern zephyr\n"
+        );
+        assert_eq!(line.capacity(), line.len(), "sized up front");
+        #[cfg(unix)]
+        {
+            use std::io::Read as _;
+            let (tx, mut rx) = std::os::unix::net::UnixStream::pair().unwrap();
+            write_to_fd(&tx, line.as_bytes()).unwrap();
+            drop(tx);
+            let mut got = String::new();
+            rx.read_to_string(&mut got).unwrap();
+            assert_eq!(got, *line);
+        }
+    }
+
     /// Only `On` carries an undo; a refused `On` needs none.
     #[test]
     fn only_a_successful_on_carries_an_undo() {
@@ -3834,6 +3911,8 @@ mod tests {
         terminal: bool,
         answers: std::collections::VecDeque<Option<String>>,
         out: Vec<String>,
+        /// The indexes in `out` of the lines written as secret lines.
+        secret: Vec<usize>,
         err: Vec<String>,
         asked: Vec<String>,
     }
@@ -3844,6 +3923,7 @@ mod tests {
                 terminal,
                 answers: answers.iter().map(|a| a.map(str::to_owned)).collect(),
                 out: Vec::new(),
+                secret: Vec::new(),
                 err: Vec::new(),
                 asked: Vec::new(),
             }
@@ -3856,6 +3936,11 @@ mod tests {
         }
         fn out(&mut self, line: &str) {
             self.out.push(line.to_owned());
+        }
+        fn secret_line(&mut self, prefix: &str, secret: &str) -> anyhow::Result<()> {
+            self.secret.push(self.out.len());
+            self.out.push(format!("{prefix}{secret}"));
+            Ok(())
         }
         fn err(&mut self, line: &str) {
             self.err.push(line.to_owned());
@@ -4202,6 +4287,9 @@ mod tests {
             "three passwords, each with its line: {:?}",
             io.out
         );
+        // B24: every password line went out as a secret line, never
+        // through `out` (whose `format!` and std's stdout buffer keep it).
+        assert_eq!(io.secret, [0, 2, 4], "{:?}", io.out);
         for pair in io.out.chunks(2) {
             assert!(pair[0].starts_with("New password for \""));
             let words = pair[0].rsplit(": ").next().unwrap();
