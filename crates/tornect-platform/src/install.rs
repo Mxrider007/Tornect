@@ -47,10 +47,16 @@
 //! points, then the copy is hashed and compared with the held image, then
 //! checked with the administrator helper task's ACL rule ([`admin_only`]),
 //! all before anything points at it; then this user's Start-menu entry,
-//! then the Apps-and-features entry (elevated), whose command is the quoted
-//! path with the fixed argument `uninstall`. A failure undoes what was done,
-//! newest first, but a folder found unsafe is never deleted as
-//! administrator. Each elevated step runs only through its own program
+//! then this user's registration of `tornect:` links
+//! (`HKEY_CURRENT_USER\Software\Classes\tornect`, no elevation; design
+//! `invite` §4.5), written only where no such key was there before the
+//! dialog: a leftover with this install's own command is kept and never
+//! undone, and any other key is left as it is and reported
+//! ([`WindowsLinks`]); then the Apps-and-features entry (elevated), whose
+//! command is the quoted path with the fixed argument `uninstall`. A failure
+//! undoes what was done, newest first, but a folder found unsafe is never
+//! deleted as administrator, and a registration this install did not write
+//! is never deleted. Each elevated step runs only through its own program
 //! ([`elevated_command`]): the system folder's robocopy, reg and cmd for the
 //! copy, the entry's delete and the folder's removal, and the installed copy,
 //! after its checks, for the entry and for its own removal at the next
@@ -112,6 +118,43 @@ pub const UNINSTALL_ROOT: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\
 /// writes it, then `--`, then the link, so the link stays one positional
 /// argument whatever it holds (design `invite` §4.5, L-3).
 pub const LINK_ARGUMENT: &str = "open-link";
+
+/// This user's registration of `tornect:` links, under `HKEY_CURRENT_USER`
+/// (design `invite` §4.5): written without elevation, and in
+/// `HKEY_CLASSES_ROOT` it wins over an HKLM key of the same name.
+pub const URL_SCHEME_KEY: &str = "Software\\Classes\\tornect";
+
+/// The default value of [`URL_SCHEME_KEY`]: the `URL:` name Windows shows.
+pub const URL_SCHEME_NAME: &str = "URL:Tornect link";
+
+/// Why an install stopped when a registration of `tornect:` links appeared
+/// between its check before the dialog and its write: nothing is written over
+/// it, and a second install leaves it as it is.
+pub const URL_KEY_APPEARED: &str = "Another program registered tornect:// links meanwhile \
+     (HKEY_CURRENT_USER\\Software\\Classes\\tornect), so Tornect was not installed. Run tornect \
+     install again: it leaves that registration as it is.";
+
+/// What [`URL_SCHEME_KEY`] holds, as [`WindowsSystem::url_handler`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UrlKey {
+    /// No such key.
+    Absent,
+    /// The key, with the default value of its `shell\open\command`.
+    Command(String),
+    /// The key, without a command that can be read: no
+    /// `shell\open\command`, or a default value of another type or too long.
+    Other,
+}
+
+/// What an install did about `tornect:` links (design `invite` §4.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsLinks {
+    /// This user's registration runs the installed copy: written by this
+    /// install, or a leftover of an earlier one with the same command, kept.
+    Registered,
+    /// A registration that is not Tornect's is there: left as it is.
+    OtherProgram,
+}
 
 /// The installed copy's internal step that writes the uninstall entry: its
 /// only argument (§B.1.1, the CLI list).
@@ -255,6 +298,20 @@ pub trait WindowsSystem {
     fn write_shortcut(&self, link: &str, target: &str) -> Result<(), InstallError>;
     /// Remove this user's Start-menu entry `link`.
     fn remove_shortcut(&self, link: &str) -> Result<(), InstallError>;
+    /// This user's registration of `tornect:` links,
+    /// `HKEY_CURRENT_USER\`[`URL_SCHEME_KEY`]: absent, its command, or a key
+    /// whose command cannot be read. Only read.
+    fn url_handler(&self) -> Result<UrlKey, InstallError>;
+    /// Write that registration, without elevation: the key with its default
+    /// value [`URL_SCHEME_NAME`] and an empty `URL Protocol`, then
+    /// `shell\open\command` with `command`. When the key is already there as
+    /// it is created (it appeared since [`Self::url_handler`]), nothing is
+    /// written and the error is [`URL_KEY_APPEARED`]; a key it created and
+    /// could not finish is deleted again.
+    fn write_url_handler(&self, command: &str) -> Result<(), InstallError>;
+    /// Delete that registration, the key and everything under it; a key
+    /// that is not there is no error.
+    fn remove_url_handler(&self) -> Result<(), InstallError>;
 }
 
 /// This computer for the Program Files install: its known folders and the
@@ -380,18 +437,17 @@ fn windows_join(dir: &str, name: &str) -> String {
     format!("{}\\{name}", dir.trim_end_matches(['\\', '/']))
 }
 
-/// The uninstall entry's command (§B.1.1): the installed executable's
-/// absolute path in quotes, then the fixed argument. Refused: a path that is
-/// not absolute on a drive, or that holds a control character, `"` (not a
-/// legal file-name character) or `%` (which Windows may read as a
+/// Refused unless `exe` can go quoted into a command Windows keeps (`what`
+/// names it): a path absolute on a drive, holding no control character, `"`
+/// (not a legal file-name character) or `%` (which Windows may read as a
 /// variable).
-pub fn uninstall_command(exe: &str) -> Result<String, InstallError> {
+fn command_path_ok(exe: &str, what: &str) -> Result<(), InstallError> {
     let bytes = exe.as_bytes();
     let on_a_drive =
         bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
     if !on_a_drive {
         return Err(InstallError::Unavailable(format!(
-            "{exe:?} is not an absolute path on a drive, which Windows' uninstall entry needs"
+            "{exe:?} is not an absolute path on a drive, which {what} needs"
         )));
     }
     if let Some(c) = exe
@@ -399,10 +455,31 @@ pub fn uninstall_command(exe: &str) -> Result<String, InstallError> {
         .find(|c| c.is_control() || *c == '"' || *c == '%')
     {
         return Err(InstallError::Unavailable(format!(
-            "{exe:?} contains {c:?}, which Windows' uninstall entry cannot hold in its command"
+            "{exe:?} contains {c:?}, which {what} cannot hold in its command"
         )));
     }
+    Ok(())
+}
+
+/// The uninstall entry's command (§B.1.1): the installed executable's
+/// absolute path in quotes, then the fixed argument. Refused: a path that is
+/// not absolute on a drive, or that holds a control character, `"` (not a
+/// legal file-name character) or `%` (which Windows may read as a
+/// variable).
+pub fn uninstall_command(exe: &str) -> Result<String, InstallError> {
+    command_path_ok(exe, "Windows' uninstall entry")?;
     Ok(format!("\"{exe}\" {UNINSTALL_ARGUMENT}"))
+}
+
+/// The command of this user's registration of `tornect:` links (design
+/// `invite` §4.5): the installed executable's absolute path in quotes,
+/// [`LINK_ARGUMENT`], `--`, then the link as Windows puts it in, `"%1"`.
+/// Whatever a link holds, a `"` included, lands after `--`: positionals,
+/// never an option or a subcommand (L-3). Refused as [`uninstall_command`]
+/// refuses.
+pub fn url_handler_command(exe: &str) -> Result<String, InstallError> {
+    command_path_ok(exe, "Windows' registration of tornect:// links")?;
+    Ok(format!("\"{exe}\" {LINK_ARGUMENT} -- \"%1\""))
 }
 
 /// Where the Program Files install goes: from the known folders only.
@@ -420,23 +497,29 @@ pub struct WindowsTarget {
     pub start_menu_entry: String,
     /// The uninstall entry.
     pub entry: UninstallEntry,
+    /// The command of this user's registration of `tornect:` links
+    /// ([`url_handler_command`]).
+    pub url_command: String,
 }
 
 impl WindowsTarget {
     /// The target on this computer; refused when the executable's path
-    /// cannot be written into the uninstall entry's command.
+    /// cannot be written into the uninstall entry's command (nor, then, into
+    /// the link registration's).
     pub fn of(sys: &dyn WindowsSystem) -> Result<Self, InstallError> {
         let mut target = Self::entry_of(sys)?;
         target.system_directory = sys.system_directory()?;
         target.start_menu_entry = windows_join(&sys.start_menu_programs()?, START_MENU_ENTRY);
+        target.url_command = url_handler_command(&target.exe)?;
         Ok(target)
     }
 
     /// The Program Files part of the target only, from `FOLDERID_ProgramFiles`
     /// alone: the folder, the executable and the uninstall entry, with no
-    /// system folder and no Start-menu entry (left empty: the account an
-    /// elevated step runs as may not have this user's folders). What the
-    /// installed copy's own elevated steps use, and nothing else.
+    /// system folder, no Start-menu entry and no link registration (left
+    /// empty: the account an elevated step runs as may not have this user's
+    /// folders or registry). What the installed copy's own elevated steps
+    /// use, and nothing else.
     pub fn entry_of(sys: &dyn WindowsSystem) -> Result<Self, InstallError> {
         let program_files = sys.program_files()?;
         let folder = windows_join(&program_files, WINDOWS_FOLDER);
@@ -454,6 +537,7 @@ impl WindowsTarget {
             exe,
             start_menu_entry: String::new(),
             entry,
+            url_command: String::new(),
         })
     }
 
@@ -627,6 +711,8 @@ pub struct Installed {
     pub folder: String,
     /// The installed executable.
     pub exe: String,
+    /// What `tornect:` links open here.
+    pub links: WindowsLinks,
 }
 
 /// What an install did so far, undone in reverse on a failure.
@@ -636,15 +722,18 @@ enum Done {
     Copied,
     /// The Start-menu entry is written.
     StartMenuEntry,
+    /// The link registration is written by this install (a leftover it found
+    /// is never here, so never undone).
+    UrlHandler,
 }
 
-/// Undo `done`, newest first: the Start-menu entry, then the copy (an
-/// elevated step, run only after a reparse check of its own: the folder and
-/// the copy in it must not be reparse points, or the delete would act on
-/// another place). What could not be undone is added to `error`'s message,
-/// after its reason; when the copy itself stayed, the message says that
-/// Tornect was not installed and that the folder may still hold a copy that
-/// nothing points at.
+/// Undo `done`, newest first: the link registration this install wrote, the
+/// Start-menu entry, then the copy (an elevated step, run only after a
+/// reparse check of its own: the folder and the copy in it must not be
+/// reparse points, or the delete would act on another place). What could not
+/// be undone is added to `error`'s message, after its reason; when the copy
+/// itself stayed, the message says that Tornect was not installed and that
+/// the folder may still hold a copy that nothing points at.
 /// A copy whose folder failed the ACL check never comes here: it is not
 /// deleted as administrator at all.
 fn undo(
@@ -657,6 +746,7 @@ fn undo(
     let mut copy_left = false;
     for step in done.iter().rev() {
         let undone = match step {
+            Done::UrlHandler => sys.remove_url_handler(),
             Done::StartMenuEntry => sys.remove_shortcut(&target.start_menu_entry),
             Done::Copied => not_a_link(sys, target).and_then(|()| {
                 sys.run_elevated(&Elevated::RemoveFolder {
@@ -667,6 +757,7 @@ fn undo(
         if let Err(e) = undone {
             copy_left |= *step == Done::Copied;
             failed.push(match step {
+                Done::UrlHandler => format!("removing HKEY_CURRENT_USER\\{URL_SCHEME_KEY}: {e}"),
                 Done::StartMenuEntry => format!("removing {}: {e}", target.start_menu_entry),
                 Done::Copied => format!("removing {}: {e}", target.folder),
             });
@@ -822,7 +913,12 @@ fn no_earlier_install(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result
 ///    say), over an earlier install (its program, its uninstall entry or
 ///    this user's Start-menu entry, folder or no folder), or when a step
 ///    would run elevated through any program but its own
-///    ([`elevated_command`]);
+///    ([`elevated_command`]); then this user's registration of `tornect:`
+///    links read ([`WindowsSystem::url_handler`], design `invite` §4.5):
+///    only an absent key is written below; one whose command is this
+///    install's own ([`url_handler_command`]) is a leftover of it, kept and
+///    never undone; any other is left as it is
+///    ([`WindowsLinks::OtherProgram`]), and the install goes on;
 /// 3. `authorize`, the mutation guard's operation (re-authentication, no
 ///    remote session for 60 s, logged): nothing before it changes anything;
 ///    then the folder checked again, as the dialog may have stayed open for
@@ -831,8 +927,11 @@ fn no_earlier_install(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result
 /// 5. the folder and the copy checked for reparse points, then the copy
 ///    hashed and compared with the held image, then the ACL check, all
 ///    before anything points at the copy;
-/// 6. this user's Start-menu entry;
-/// 7. the uninstall entry (elevated).
+/// 6. this user's Start-menu entry, then (6b) the link registration, where
+///    step 2 found none (no elevation; a key that appeared meanwhile is never
+///    written over: [`URL_KEY_APPEARED`]);
+/// 7. the uninstall entry (elevated): a prompt cancelled there undoes 6b
+///    and 6 too.
 ///
 /// A failure after the copy undoes what was done, newest first, but a copy
 /// whose folder failed the ACL check, or became a reparse point, is never
@@ -857,6 +956,12 @@ pub fn install_in_program_files(
     for step in [&copy, &write, &remove] {
         target.elevation_ok(sys, step)?;
     }
+    let url_key = sys.url_handler()?;
+    let links = match &url_key {
+        UrlKey::Absent => WindowsLinks::Registered,
+        UrlKey::Command(command) if *command == target.url_command => WindowsLinks::Registered,
+        UrlKey::Command(_) | UrlKey::Other => WindowsLinks::OtherProgram,
+    };
     authorize()?;
     existing_folder_ok(sys, &target)?;
     match sys.run_elevated(&copy) {
@@ -912,6 +1017,13 @@ pub fn install_in_program_files(
         return Err(undo(sys, &target, &done, e));
     }
     done.push(Done::StartMenuEntry);
+    // Before the elevated entry, so that a prompt cancelled there undoes it.
+    if url_key == UrlKey::Absent {
+        if let Err(e) = sys.write_url_handler(&target.url_command) {
+            return Err(undo(sys, &target, &done, e));
+        }
+        done.push(Done::UrlHandler);
+    }
     match sys.run_elevated(&write) {
         Ok(()) => {}
         Err(InstallError::Cancelled(_)) => {
@@ -929,6 +1041,7 @@ pub fn install_in_program_files(
     Ok(Installed {
         folder: target.folder,
         exe: target.exe,
+        links,
     })
 }
 
@@ -939,9 +1052,22 @@ pub struct WindowsRemoval {
     pub uninstall_entry: bool,
     /// This user's Start-menu entry.
     pub start_menu_entry: bool,
+    /// This user's registration of `tornect:` links, whose command ran the
+    /// installed copy.
+    pub url_handler: bool,
     /// The install folder: removed, or, for an uninstall run from the
     /// installed copy, marked by that copy for removal at the next restart.
     pub folder: bool,
+    /// A registration of `tornect:` links that is not Tornect's (another
+    /// command, or none that can be read) is there: left as it is.
+    pub url_handler_left: bool,
+}
+
+impl WindowsRemoval {
+    /// Whether anything was removed (a registration left alone is not).
+    fn removed_anything(&self) -> bool {
+        self.uninstall_entry || self.start_menu_entry || self.url_handler || self.folder
+    }
 }
 
 /// Whether the install folder is there, refused when it is but may not be
@@ -974,7 +1100,12 @@ fn removable_folder(sys: &dyn WindowsSystem, target: &WindowsTarget) -> Result<b
 /// install folder checked (not a reparse point, administrators only) before
 /// `authorize`, the mutation guard's operation, and again right before its
 /// elevated step; then the uninstall entry (elevated), this user's
-/// Start-menu entry and the folder (elevated), each only where it exists.
+/// Start-menu entry, this user's registration of `tornect:` links and the
+/// folder (elevated), each only where it exists. The registration is
+/// removed only while its command is the installed copy's
+/// ([`url_handler_command`]), read before `authorize` and again right before
+/// the removal (design `invite` L-6); any other is left as it is and
+/// reported ([`WindowsRemoval::url_handler_left`]).
 /// Run from the installed copy ([`runs_from_install`]), the folder's step is
 /// that copy's own `remove-at-restart`, waited for like every other: it
 /// marks the copy and the folder for removal at the next restart, so no
@@ -988,8 +1119,15 @@ pub fn uninstall_from_program_files(
     let folder = removable_folder(sys, &target)?;
     let entry = sys.uninstall_entry_exists(&target.entry.key)?;
     let link = sys.file_exists(&target.start_menu_entry)?;
-    if !(folder || entry || link) {
-        return Ok(WindowsRemoval::default());
+    let ours = UrlKey::Command(target.url_command.clone());
+    let url_key = sys.url_handler()?;
+    let url_ours = url_key == ours;
+    let mut removed = WindowsRemoval {
+        url_handler_left: !url_ours && url_key != UrlKey::Absent,
+        ..WindowsRemoval::default()
+    };
+    if !(folder || entry || link || url_ours) {
+        return Ok(removed);
     }
     let delete_entry = Elevated::DeleteEntry {
         key: target.entry.key.clone(),
@@ -1011,9 +1149,8 @@ pub fn uninstall_from_program_files(
         }
     }
     authorize()?;
-    let mut removed = WindowsRemoval::default();
     let cancelled = |removed: &WindowsRemoval| {
-        InstallError::Cancelled(if *removed == WindowsRemoval::default() {
+        InstallError::Cancelled(if !removed.removed_anything() {
             format!(
                 "Removing Tornect needs administrator approval; it stays installed in {}.",
                 target.folder
@@ -1036,6 +1173,18 @@ pub fn uninstall_from_program_files(
     if link {
         sys.remove_shortcut(&target.start_menu_entry)?;
         removed.start_menu_entry = true;
+    }
+    if url_ours {
+        // The dialog may have stayed open for long: what is deleted is what
+        // runs the installed copy now.
+        match sys.url_handler()? {
+            now if now == ours => {
+                sys.remove_url_handler()?;
+                removed.url_handler = true;
+            }
+            UrlKey::Absent => {}
+            UrlKey::Command(_) | UrlKey::Other => removed.url_handler_left = true,
+        }
     }
     if folder {
         if !removable_folder(sys, &target)? {
@@ -2637,6 +2786,8 @@ mod windows_tests {
         WriteShortcut(String),
         RemoveShortcut(String),
         Security(String),
+        WriteUrl(String),
+        RemoveUrl,
     }
 
     /// Owner Administrators; SYSTEM and Administrators full control,
@@ -2710,6 +2861,10 @@ mod windows_tests {
         no_start_menu: bool,
         /// This program's own path.
         own: String,
+        /// This user's registration of `tornect:` links.
+        url: RefCell<UrlKey>,
+        /// Writing the link registration fails.
+        fail_url: bool,
     }
 
     fn kind(step: &Elevated) -> &'static str {
@@ -2751,6 +2906,8 @@ mod windows_tests {
                 pending: RefCell::new(Ok(Vec::new())),
                 no_start_menu: false,
                 own: IMAGE.to_owned(),
+                url: RefCell::new(UrlKey::Absent),
+                fail_url: false,
             }
         }
 
@@ -2764,6 +2921,15 @@ mod windows_tests {
 
         fn link() -> String {
             format!("{PROGRAMS}\\Tornect.lnk")
+        }
+
+        /// The link registration's command for the installed copy.
+        fn url_command(&self) -> String {
+            format!("\"{}\" open-link -- \"%1\"", self.exe())
+        }
+
+        fn url(&self) -> UrlKey {
+            self.url.borrow().clone()
         }
 
         fn events(&self) -> Vec<Ev> {
@@ -2807,6 +2973,7 @@ mod windows_tests {
                 "{:?}",
                 self.entries.borrow()
             );
+            assert_ne!(self.url(), UrlKey::Command(self.url_command()));
         }
 
         /// An install as `install_in_program_files` leaves it.
@@ -2822,6 +2989,7 @@ mod windows_tests {
             self.entries
                 .borrow_mut()
                 .insert(UNINSTALL_KEY.to_owned(), target.entry);
+            *self.url.borrow_mut() = UrlKey::Command(self.url_command());
         }
     }
 
@@ -3010,6 +3178,30 @@ mod windows_tests {
             self.shortcuts.borrow_mut().remove(&key(link));
             Ok(())
         }
+
+        fn url_handler(&self) -> Result<UrlKey, InstallError> {
+            Ok(self.url())
+        }
+
+        /// As `RegCreateKeyExW`'s disposition tells it: a key already there
+        /// is not written.
+        fn write_url_handler(&self, command: &str) -> Result<(), InstallError> {
+            self.record(Ev::WriteUrl(command.to_owned()));
+            if self.url() != UrlKey::Absent {
+                return Err(InstallError::Refused(URL_KEY_APPEARED.to_owned()));
+            }
+            if self.fail_url {
+                return Err(InstallError::Failed("the registry refused".to_owned()));
+            }
+            *self.url.borrow_mut() = UrlKey::Command(command.to_owned());
+            Ok(())
+        }
+
+        fn remove_url_handler(&self) -> Result<(), InstallError> {
+            self.record(Ev::RemoveUrl);
+            *self.url.borrow_mut() = UrlKey::Absent;
+            Ok(())
+        }
     }
 
     /// The system folder's program `name`.
@@ -3086,6 +3278,10 @@ mod windows_tests {
                     entry.uninstall_string,
                     "\"K:\\Known Apps\\Tornect\\tornect.exe\" uninstall"
                 ),
+                Ev::WriteUrl(command) => assert_eq!(
+                    command,
+                    "\"K:\\Known Apps\\Tornect\\tornect.exe\" open-link -- \"%1\""
+                ),
                 Ev::Security(path) => assert!(path.starts_with("K:\\Known Apps"), "{path}"),
                 Ev::Elevated(other) => panic!("{other:?}"),
                 _ => {}
@@ -3110,7 +3306,10 @@ mod windows_tests {
         assert!(
             !events.iter().any(|e| matches!(
                 e,
-                Ev::WriteShortcut(_) | Ev::Elevated(Elevated::WriteEntry(_)) | Ev::Security(_)
+                Ev::WriteShortcut(_)
+                    | Ev::WriteUrl(_)
+                    | Ev::Elevated(Elevated::WriteEntry(_))
+                    | Ev::Security(_)
             )),
             "{events:?}"
         );
@@ -3201,6 +3400,7 @@ mod windows_tests {
         assert_eq!(
             events[write + 1..],
             [
+                Ev::RemoveUrl,
                 Ev::RemoveShortcut(Fake::link()),
                 Ev::Elevated(Elevated::RemoveFolder {
                     folder: fake.folder()
@@ -3268,6 +3468,10 @@ mod windows_tests {
                 uninstall_command(&format!("{bad}\\tornect.exe")).is_err(),
                 "{bad:?}"
             );
+            assert!(
+                url_handler_command(&format!("{bad}\\tornect.exe")).is_err(),
+                "{bad:?}"
+            );
         }
     }
 
@@ -3325,7 +3529,9 @@ mod windows_tests {
             WindowsRemoval {
                 uninstall_entry: true,
                 start_menu_entry: true,
-                folder: true
+                url_handler: true,
+                folder: true,
+                url_handler_left: false,
             }
         );
         let events = fake.events();
@@ -3342,6 +3548,7 @@ mod windows_tests {
                     key: "Tornect".to_owned()
                 }),
                 Ev::RemoveShortcut(Fake::link()),
+                Ev::RemoveUrl,
                 Ev::Elevated(Elevated::RemoveFolder {
                     folder: fake.folder()
                 }),
@@ -3635,7 +3842,7 @@ mod windows_tests {
             assert!(
                 !events.iter().any(|e| matches!(
                     e,
-                    Ev::WriteShortcut(_) | Ev::Elevated(Elevated::WriteEntry(_))
+                    Ev::WriteShortcut(_) | Ev::WriteUrl(_) | Ev::Elevated(Elevated::WriteEntry(_))
                 )),
                 "{broken}: {events:?}"
             );
@@ -3663,7 +3870,7 @@ mod windows_tests {
         let first_entry = position(&events, |e| {
             matches!(
                 e,
-                Ev::WriteShortcut(_) | Ev::Elevated(Elevated::WriteEntry(_))
+                Ev::WriteShortcut(_) | Ev::WriteUrl(_) | Ev::Elevated(Elevated::WriteEntry(_))
             )
         });
         let reads: Vec<(usize, String)> = events
@@ -4230,7 +4437,9 @@ mod windows_tests {
             WindowsRemoval {
                 uninstall_entry: true,
                 start_menu_entry: true,
-                folder: true
+                url_handler: true,
+                folder: true,
+                url_handler_left: false,
             }
         );
         let events = fake.events();
@@ -4247,6 +4456,7 @@ mod windows_tests {
                     key: "Tornect".to_owned()
                 }),
                 Ev::RemoveShortcut(Fake::link()),
+                Ev::RemoveUrl,
                 Ev::Elevated(Elevated::RemoveAtRestart {
                     folder: fake.folder()
                 }),
@@ -4373,5 +4583,343 @@ mod windows_tests {
         let result = mark_own_folder_for_restart(&fake, &fake.exe(), &in_use, &marked);
         assert!(matches!(result, Err(InstallError::Failed(_))), "{result:?}");
         assert!(done.borrow().is_empty(), "{:?}", done.borrow());
+    }
+
+    /// Another program's registration of `tornect:` links.
+    fn theirs() -> UrlKey {
+        UrlKey::Command("\"C:\\Program Files\\Other\\other.exe\" \"%1\"".to_owned())
+    }
+
+    /// Whether the link registration was written or removed.
+    fn url_touched(fake: &Fake) -> bool {
+        fake.events()
+            .iter()
+            .any(|e| matches!(e, Ev::WriteUrl(_) | Ev::RemoveUrl))
+    }
+
+    /// Design `invite` §4.5: the link registration's command is the
+    /// installed copy's path in quotes, `open-link`, `--`, then `"%1"`; the
+    /// target carries it, and the installed copy's own elevated steps, which
+    /// never touch this user's registry, leave it empty. A path the command
+    /// cannot hold is refused as the uninstall entry's is.
+    #[test]
+    fn the_link_command_is_quoted_with_its_fixed_arguments() {
+        let command = "\"C:\\Program Files\\Tornect\\tornect.exe\" open-link -- \"%1\"";
+        assert_eq!(
+            url_handler_command("C:\\Program Files\\Tornect\\tornect.exe").unwrap(),
+            command
+        );
+        assert_eq!(
+            WindowsTarget::of(&Fake::new()).unwrap().url_command,
+            command
+        );
+        assert_eq!(
+            WindowsTarget::entry_of(&Fake::new()).unwrap().url_command,
+            ""
+        );
+        for bad in [
+            "tornect.exe",
+            "\\\\server\\share\\tornect.exe",
+            "C:/Tornect/tornect.exe",
+            "C:\\a\"b\\tornect.exe",
+            "C:\\100%\\tornect.exe",
+            "C:\\a\u{7}b\\tornect.exe",
+            "C:\\a\u{85}b\\tornect.exe",
+        ] {
+            match url_handler_command(bad) {
+                Err(InstallError::Unavailable(why)) => assert!(
+                    why.contains("Windows' registration of tornect:// links"),
+                    "{bad:?}: {why}"
+                ),
+                other => panic!("{bad:?}: {other:?}"),
+            }
+        }
+        assert_eq!(URL_SCHEME_KEY, "Software\\Classes\\tornect");
+        assert_eq!(URL_SCHEME_NAME, "URL:Tornect link");
+    }
+
+    /// Design `invite` §4.5, step 6b: with no registration there, the
+    /// install writes exactly the installed copy's command, once, after the
+    /// Start-menu entry and before the elevated uninstall entry, and links
+    /// open Tornect.
+    #[test]
+    fn the_link_registration_is_written_after_the_shortcut_and_before_the_entry() {
+        let fake = Fake::new();
+        let installed = install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        assert_eq!(installed.links, WindowsLinks::Registered);
+        let events = fake.events();
+        let writes: Vec<&Ev> = events
+            .iter()
+            .filter(|e| matches!(e, Ev::WriteUrl(_)))
+            .collect();
+        assert_eq!(
+            writes,
+            [&Ev::WriteUrl(
+                "\"C:\\Program Files\\Tornect\\tornect.exe\" open-link -- \"%1\"".to_owned()
+            )]
+        );
+        let authorize = position(&events, |e| *e == Ev::Authorize);
+        let shortcut = position(&events, |e| matches!(e, Ev::WriteShortcut(_)));
+        let url = position(&events, |e| matches!(e, Ev::WriteUrl(_)));
+        let entry = position(&events, |e| {
+            matches!(e, Ev::Elevated(Elevated::WriteEntry(_)))
+        });
+        assert!(
+            authorize < shortcut && shortcut < url && url < entry,
+            "{events:?}"
+        );
+        assert!(!events.contains(&Ev::RemoveUrl), "{events:?}");
+        assert_eq!(fake.url(), UrlKey::Command(fake.url_command()));
+    }
+
+    /// A second prompt (the uninstall entry's) cancelled or failed undoes the
+    /// registration this install wrote, newest first: before the Start-menu
+    /// entry and the copy. A registration whose own write failed was not
+    /// kept, so the undo starts at the Start-menu entry.
+    #[test]
+    fn a_cancelled_second_prompt_undoes_the_link_registration() {
+        for at in ["cancel", "fail"] {
+            let mut fake = Fake::new();
+            if at == "cancel" {
+                fake.cancel.borrow_mut().push("write");
+            } else {
+                fake.fail = vec!["write"];
+            }
+            assert!(
+                install_in_program_files(&fake, &mut allow(&fake)).is_err(),
+                "{at}"
+            );
+            let events = fake.events();
+            let url = position(&events, |e| matches!(e, Ev::WriteUrl(_)));
+            let after: Vec<Ev> = events[url + 1..]
+                .iter()
+                .filter(|e| !matches!(e, Ev::Elevated(Elevated::WriteEntry(_))))
+                .cloned()
+                .collect();
+            assert_eq!(
+                after,
+                [
+                    Ev::RemoveUrl,
+                    Ev::RemoveShortcut(Fake::link()),
+                    Ev::Elevated(Elevated::RemoveFolder {
+                        folder: fake.folder()
+                    }),
+                    Ev::CloseImage,
+                ],
+                "{at}"
+            );
+            assert_eq!(fake.url(), UrlKey::Absent, "{at}");
+            fake.assert_nothing_installed();
+        }
+        let mut fake = Fake::new();
+        fake.fail_url = true;
+        match install_in_program_files(&fake, &mut allow(&fake)) {
+            Err(InstallError::Failed(why)) => assert_eq!(why, "the registry refused"),
+            other => panic!("{other:?}"),
+        }
+        let events = fake.events();
+        let url = position(&events, |e| matches!(e, Ev::WriteUrl(_)));
+        assert_eq!(
+            events[url + 1..],
+            [
+                Ev::RemoveShortcut(Fake::link()),
+                Ev::Elevated(Elevated::RemoveFolder {
+                    folder: fake.folder()
+                }),
+                Ev::CloseImage,
+            ]
+        );
+        fake.assert_nothing_installed();
+    }
+
+    /// Design `invite` §4.5, L-6: a registration that is not this install's
+    /// (another program's command, a near miss of Tornect's, or a key without
+    /// a command that can be read) is never written over and never undone: the
+    /// install goes on and says so, and a cancel undoes only what it wrote.
+    #[test]
+    fn a_foreign_link_registration_is_left_and_reported() {
+        for key in [
+            theirs(),
+            UrlKey::Command(
+                "\"C:\\Program Files\\Tornect\\tornect.exe\" open-link -- \"%1\" --home C:\\x"
+                    .to_owned(),
+            ),
+            UrlKey::Other,
+        ] {
+            let fake = Fake::new();
+            *fake.url.borrow_mut() = key.clone();
+            let installed = install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+            assert_eq!(installed.links, WindowsLinks::OtherProgram, "{key:?}");
+            assert_eq!(fake.url(), key);
+            assert!(!url_touched(&fake), "{key:?}: {:?}", fake.events());
+            assert!(fake.entries.borrow().contains_key(UNINSTALL_KEY), "{key:?}");
+
+            let fake = Fake::new();
+            *fake.url.borrow_mut() = key.clone();
+            fake.cancel.borrow_mut().push("write");
+            assert!(
+                matches!(
+                    install_in_program_files(&fake, &mut allow(&fake)),
+                    Err(InstallError::Cancelled(_))
+                ),
+                "{key:?}"
+            );
+            assert_eq!(fake.url(), key);
+            assert!(!url_touched(&fake), "{key:?}: {:?}", fake.events());
+            fake.assert_nothing_installed();
+        }
+    }
+
+    /// Design `invite` §4.5: a registration whose command is this install's
+    /// own is a leftover of it (an earlier install of this computer's
+    /// Program Files copy): kept, links open Tornect, nothing is written, and
+    /// a cancelled prompt never deletes it.
+    #[test]
+    fn a_leftover_with_this_installs_command_is_kept_and_never_undone() {
+        let fake = Fake::new();
+        *fake.url.borrow_mut() = UrlKey::Command(fake.url_command());
+        let installed = install_in_program_files(&fake, &mut allow(&fake)).unwrap();
+        assert_eq!(installed.links, WindowsLinks::Registered);
+        assert!(!url_touched(&fake), "{:?}", fake.events());
+        assert_eq!(fake.url(), UrlKey::Command(fake.url_command()));
+
+        let fake = Fake::new();
+        *fake.url.borrow_mut() = UrlKey::Command(fake.url_command());
+        fake.cancel.borrow_mut().push("write");
+        assert!(matches!(
+            install_in_program_files(&fake, &mut allow(&fake)),
+            Err(InstallError::Cancelled(_))
+        ));
+        assert!(!url_touched(&fake), "{:?}", fake.events());
+        assert_eq!(fake.url(), UrlKey::Command(fake.url_command()));
+        assert!(fake.shortcuts.borrow().is_empty() && fake.entries.borrow().is_empty());
+    }
+
+    /// A registration that appears while the dialog is open is never written
+    /// over: the write finds it (`REG_OPENED_EXISTING_KEY` on Windows), and
+    /// the install stops with [`URL_KEY_APPEARED`], what it did undone and
+    /// the other program's key as it was.
+    #[test]
+    fn a_link_registration_that_appears_during_the_dialog_is_not_written_over() {
+        let fake = Fake::new();
+        let mut appears = || {
+            fake.record(Ev::Authorize);
+            *fake.url.borrow_mut() = theirs();
+            Ok(())
+        };
+        match install_in_program_files(&fake, &mut appears) {
+            Err(InstallError::Refused(why)) => assert_eq!(why, URL_KEY_APPEARED),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(fake.url(), theirs());
+        let events = fake.events();
+        assert!(!events.contains(&Ev::RemoveUrl), "{events:?}");
+        assert!(
+            !fake
+                .elevated()
+                .iter()
+                .any(|s| matches!(s, Elevated::WriteEntry(_))),
+            "{events:?}"
+        );
+        fake.assert_nothing_installed();
+    }
+
+    /// L-6: an uninstall removes this user's registration only while its
+    /// command is the installed copy's; another program's, or one without a
+    /// readable command, is left and reported, installed or not (with
+    /// nothing else there nothing is asked).
+    #[test]
+    fn uninstall_removes_only_this_installs_link_registration() {
+        for key in [theirs(), UrlKey::Other] {
+            let fake = Fake::new();
+            fake.installed();
+            *fake.url.borrow_mut() = key.clone();
+            let removed = uninstall_from_program_files(&fake, &mut allow(&fake)).unwrap();
+            assert_eq!(
+                removed,
+                WindowsRemoval {
+                    uninstall_entry: true,
+                    start_menu_entry: true,
+                    url_handler: false,
+                    folder: true,
+                    url_handler_left: true,
+                },
+                "{key:?}"
+            );
+            assert_eq!(fake.url(), key);
+            assert!(!url_touched(&fake), "{key:?}");
+
+            let fake = Fake::new();
+            *fake.url.borrow_mut() = key.clone();
+            let removed = uninstall_from_program_files(&fake, &mut allow(&fake)).unwrap();
+            assert_eq!(
+                removed,
+                WindowsRemoval {
+                    url_handler_left: true,
+                    ..WindowsRemoval::default()
+                },
+                "{key:?}"
+            );
+            assert!(!fake.events().contains(&Ev::Authorize), "{key:?}");
+            assert!(!url_touched(&fake), "{key:?}");
+            assert_eq!(fake.url(), key);
+        }
+    }
+
+    /// A registration with the installed copy's command, left with nothing
+    /// else of an install, is still Tornect's: the uninstall asks the guard,
+    /// then removes it and nothing else.
+    #[test]
+    fn a_leftover_link_registration_alone_is_removed_after_the_dialog() {
+        let fake = Fake::new();
+        *fake.url.borrow_mut() = UrlKey::Command(fake.url_command());
+        let removed = uninstall_from_program_files(&fake, &mut allow(&fake)).unwrap();
+        assert_eq!(
+            removed,
+            WindowsRemoval {
+                url_handler: true,
+                ..WindowsRemoval::default()
+            }
+        );
+        let events = fake.events();
+        let authorize = position(&events, |e| *e == Ev::Authorize);
+        assert_eq!(events[authorize + 1..], [Ev::RemoveUrl], "{events:?}");
+        assert!(!events[..authorize].contains(&Ev::RemoveUrl));
+        assert_eq!(fake.url(), UrlKey::Absent);
+    }
+
+    /// The registration is read again right before its removal, since the
+    /// dialog may stay open for long: one another program put in its place
+    /// meanwhile is left and reported, one already gone is neither removed
+    /// nor reported; the rest of the uninstall goes on.
+    #[test]
+    fn a_link_registration_changed_during_the_dialog_is_not_removed() {
+        for (now, left) in [
+            (theirs(), true),
+            (UrlKey::Other, true),
+            (UrlKey::Absent, false),
+        ] {
+            let fake = Fake::new();
+            fake.installed();
+            let mut changes = || {
+                fake.record(Ev::Authorize);
+                *fake.url.borrow_mut() = now.clone();
+                Ok(())
+            };
+            let removed = uninstall_from_program_files(&fake, &mut changes).unwrap();
+            assert_eq!(
+                removed,
+                WindowsRemoval {
+                    uninstall_entry: true,
+                    start_menu_entry: true,
+                    url_handler: false,
+                    folder: true,
+                    url_handler_left: left,
+                },
+                "{now:?}"
+            );
+            assert!(!url_touched(&fake), "{now:?}: {:?}", fake.events());
+            assert_eq!(fake.url(), now);
+        }
     }
 }

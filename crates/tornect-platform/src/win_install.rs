@@ -6,9 +6,12 @@
 //! entry and Windows' list of removals at the next restart, both read in the
 //! registry's 64-bit view, the Start-menu entry (`IShellLinkW` and
 //! `IPersistFile`, declared here in the order of `shobjidl_core.h` and
-//! `objidl.h`, since `windows-sys` has none), and each elevated step through
-//! Windows' prompt with the program and parameters of
-//! [`elevated_command`]. Type-checked only: NEEDS-DEVICE(windows).
+//! `objidl.h`, since `windows-sys` has none), this user's registration of
+//! `tornect:` links under `HKEY_CURRENT_USER` (design `invite` §4.5: read,
+//! written only where `RegCreateKeyExW` created the key, deleted with
+//! `RegDeleteTreeW` and `RegDeleteKeyW`), and each elevated step through
+//! Windows' prompt with the program and parameters of [`elevated_command`].
+//! Type-checked only: NEEDS-DEVICE(windows).
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
@@ -20,7 +23,8 @@ use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, HLOCAL, LocalFree,
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS,
+    ERROR_UNSUPPORTED_TYPE, HLOCAL, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{
@@ -38,17 +42,20 @@ use windows_sys::Win32::System::Com::{
     CoInitializeEx, CoUninitialize,
 };
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY,
-    REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ, RRF_RT_REG_MULTI_SZ, RegCloseKey,
-    RegCreateKeyExW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_CREATE_SUB_KEY, KEY_QUERY_VALUE, KEY_READ,
+    KEY_SET_VALUE, KEY_WOW64_64KEY, REG_CREATE_KEY_DISPOSITION, REG_CREATED_NEW_KEY,
+    REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ, RRF_NOEXPAND, RRF_RT_REG_MULTI_SZ,
+    RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteTreeW, RegGetValueW,
+    RegOpenKeyExW, RegSetValueExW,
 };
 use windows_sys::Win32::UI::Shell::ShellLink;
 use windows_sys::core::GUID;
 
 use crate::helper_task::{Ace, Security};
 use crate::install::{
-    Elevated, HeldImage, InstallError, UNINSTALL_ROOT, UninstallEntry, WindowsSystem,
-    WindowsTarget, elevated_command, step_succeeded,
+    Elevated, HeldImage, InstallError, UNINSTALL_ROOT, URL_KEY_APPEARED, URL_SCHEME_KEY,
+    URL_SCHEME_NAME, UninstallEntry, UrlKey, WindowsSystem, WindowsTarget, elevated_command,
+    step_succeeded,
 };
 use crate::win::{ElevateError, KnownFolder, wide};
 use crate::win_task::{Com, Hresult, check};
@@ -62,6 +69,18 @@ const PENDING_RENAMES: &str = "PendingFileRenameOperations";
 /// How many times the list is read when it grows between the size and the
 /// read.
 const PENDING_READS: usize = 3;
+
+/// The link registration's subkey that holds its command.
+const URL_COMMAND_KEY: &str = "shell\\open\\command";
+
+/// The longest command of a link registration that is read, in bytes, its
+/// NUL included: Tornect's own is far shorter, so a longer one is not
+/// Tornect's.
+const URL_COMMAND_MAX: u32 = 4096;
+
+/// How many times that command is read when it grows between the size and
+/// the read.
+const URL_COMMAND_READS: usize = 3;
 
 /// `IID_IShellLinkW` (shobjidl_core.h).
 const IID_ISHELL_LINK_W: GUID = GUID::from_u128(0x000214f9_0000_0000_c000_000000000046);
@@ -219,25 +238,217 @@ pub fn write_uninstall_entry(entry: &UninstallEntry) -> Result<(), InstallError>
         ("DisplayVersion", &entry.display_version),
         ("UninstallString", &entry.uninstall_string),
     ] {
-        let name = wide(name);
-        let data = wide(value);
-        let bytes = u32::try_from(data.len() * 2)
-            .map_err(|_| failed(io::Error::other("a value is too long")))?;
-        // SAFETY: `key` is open with KEY_SET_VALUE; `name` and `data` are
-        // NUL-terminated and `data` is `bytes` long, its NUL included.
+        set_string(&key, Some(name), value).map_err(failed)?;
+    }
+    Ok(())
+}
+
+/// Set the `REG_SZ` value `name` of `key`, open with `KEY_SET_VALUE`, to
+/// `value`; `None` is the key's default value.
+fn set_string(key: &Key, name: Option<&str>, value: &str) -> io::Result<()> {
+    let name = name.map(wide);
+    let data = wide(value);
+    let bytes =
+        u32::try_from(data.len() * 2).map_err(|_| io::Error::other("a value is too long"))?;
+    // SAFETY: `key` is open with KEY_SET_VALUE; the name is NUL-terminated or
+    // null (the default value); `data` is NUL-terminated and `bytes` long,
+    // its NUL included.
+    let status = unsafe {
+        RegSetValueExW(
+            key.0,
+            name.as_ref().map_or(null(), |n| n.as_ptr()),
+            0,
+            REG_SZ,
+            data.as_ptr().cast::<u8>(),
+            bytes,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(())
+}
+
+/// `parent\path` created, or opened when it is there, with `access`: the key
+/// and whether it was created (`REG_CREATED_NEW_KEY`) or opened.
+fn create_key(
+    parent: HKEY,
+    path: &str,
+    access: REG_SAM_FLAGS,
+) -> io::Result<(Key, REG_CREATE_KEY_DISPOSITION)> {
+    let name = wide(path);
+    let mut key: HKEY = null_mut();
+    let mut disposition: REG_CREATE_KEY_DISPOSITION = 0;
+    // SAFETY: `parent` is open (or predefined); `name` is NUL-terminated; no
+    // class, no security attributes; `key` receives an open key and
+    // `disposition` what was done, on success.
+    let status = unsafe {
+        RegCreateKeyExW(
+            parent,
+            name.as_ptr(),
+            0,
+            null(),
+            REG_OPTION_NON_VOLATILE,
+            access,
+            null(),
+            &mut key,
+            &mut disposition,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok((Key(key), disposition))
+}
+
+/// This user's registration of `tornect:` links at `HKCU\<path>` (design
+/// `invite` §4.5; `path` is [`URL_SCHEME_KEY`] but in the tests): absent
+/// when the key is not there; else the default value of its
+/// `shell\open\command`, a `REG_SZ` (a `REG_EXPAND_SZ` is not expanded and
+/// counts as another type) without its trailing NULs, asked for its size and
+/// read, again when it grew in between, at most [`URL_COMMAND_READS`] times.
+/// A key that cannot be opened for reading, or a command that is missing, of
+/// another type, longer than [`URL_COMMAND_MAX`], cannot be read or is not
+/// UTF-16, is [`UrlKey::Other`]: a registration left as it is.
+fn url_key_at(path: &str) -> io::Result<UrlKey> {
+    let name = wide(path);
+    let mut key: HKEY = null_mut();
+    // SAFETY: `name` is NUL-terminated; `key` receives an open key on success.
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            name.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    };
+    let key = match status {
+        ERROR_SUCCESS => Key(key),
+        ERROR_FILE_NOT_FOUND => return Ok(UrlKey::Absent),
+        ERROR_ACCESS_DENIED => return Ok(UrlKey::Other),
+        e => return Err(io::Error::from_raw_os_error(e as i32)),
+    };
+    let command = wide(URL_COMMAND_KEY);
+    let flags = RRF_RT_REG_SZ | RRF_NOEXPAND;
+    for _ in 0..URL_COMMAND_READS {
+        let mut size = 0u32;
+        // SAFETY: `key` is open with KEY_QUERY_VALUE; `command` is
+        // NUL-terminated; the default value's size only: no type, no buffer.
         let status = unsafe {
-            RegSetValueExW(
+            RegGetValueW(
                 key.0,
-                name.as_ptr(),
-                0,
-                REG_SZ,
-                data.as_ptr().cast::<u8>(),
-                bytes,
+                command.as_ptr(),
+                null(),
+                flags,
+                null_mut(),
+                null_mut(),
+                &mut size,
             )
         };
-        if status != ERROR_SUCCESS {
-            return Err(failed(io::Error::from_raw_os_error(status as i32)));
+        match status {
+            ERROR_SUCCESS => {}
+            ERROR_FILE_NOT_FOUND | ERROR_UNSUPPORTED_TYPE | ERROR_ACCESS_DENIED => {
+                return Ok(UrlKey::Other);
+            }
+            e => return Err(io::Error::from_raw_os_error(e as i32)),
         }
+        if !(2..=URL_COMMAND_MAX).contains(&size) || !size.is_multiple_of(2) {
+            return Ok(UrlKey::Other);
+        }
+        let mut units = vec![0u16; size as usize / 2];
+        let mut read = size;
+        // SAFETY: as above; `units` is writable for `read` bytes; no type
+        // asked.
+        let status = unsafe {
+            RegGetValueW(
+                key.0,
+                command.as_ptr(),
+                null(),
+                flags,
+                null_mut(),
+                units.as_mut_ptr().cast::<c_void>(),
+                &mut read,
+            )
+        };
+        match status {
+            ERROR_SUCCESS => {
+                if read > size || !read.is_multiple_of(2) {
+                    return Ok(UrlKey::Other);
+                }
+                units.truncate(read as usize / 2);
+                let end = units
+                    .iter()
+                    .rposition(|unit| *unit != 0)
+                    .map_or(0, |at| at + 1);
+                units.truncate(end);
+                return Ok(String::from_utf16(&units).map_or(UrlKey::Other, UrlKey::Command));
+            }
+            ERROR_MORE_DATA => {}
+            ERROR_FILE_NOT_FOUND | ERROR_UNSUPPORTED_TYPE | ERROR_ACCESS_DENIED => {
+                return Ok(UrlKey::Other);
+            }
+            e => return Err(io::Error::from_raw_os_error(e as i32)),
+        }
+    }
+    Ok(UrlKey::Other)
+}
+
+/// Write this user's registration of `tornect:` links at `HKCU\<path>`
+/// (design `invite` §4.5): the key, created by this call or nothing is
+/// written ([`URL_KEY_APPEARED`]: one that is there, whoever made it, is
+/// never written to); its default value [`URL_SCHEME_NAME`] and an empty
+/// `URL Protocol`; then `shell\open\command` with `command` as its default
+/// value. A failure after the key was created deletes it again with all it
+/// holds.
+fn write_url_key_at(path: &str, command: &str) -> Result<(), InstallError> {
+    let failed = |e: &dyn std::fmt::Display| {
+        InstallError::Failed(format!("writing HKEY_CURRENT_USER\\{path}: {e}"))
+    };
+    let (key, disposition) =
+        create_key(HKEY_CURRENT_USER, path, KEY_SET_VALUE | KEY_CREATE_SUB_KEY)
+            .map_err(|e| failed(&e))?;
+    if disposition != REG_CREATED_NEW_KEY {
+        // There since the check before the dialog: not Tornect's to write.
+        return Err(InstallError::Refused(URL_KEY_APPEARED.to_owned()));
+    }
+    let written = (|| {
+        set_string(&key, None, URL_SCHEME_NAME)?;
+        set_string(&key, Some("URL Protocol"), "")?;
+        let (open, _) = create_key(key.0, URL_COMMAND_KEY, KEY_SET_VALUE)?;
+        set_string(&open, None, command)
+    })();
+    // Closed before a delete.
+    drop(key);
+    let Err(e) = written else {
+        return Ok(());
+    };
+    match delete_key_tree_at(path) {
+        Ok(()) => Err(failed(&e)),
+        Err(left) => Err(failed(&format!(
+            "{e}; deleting the key it created again failed too ({left}), so it is left half \
+             written"
+        ))),
+    }
+}
+
+/// Delete `HKCU\<path>` with everything under it: `RegDeleteTreeW` with the
+/// subkey's name, then `RegDeleteKeyW` for the key itself in case the tree
+/// delete left it (Microsoft does not say whether it does; Wine deletes it,
+/// `docs/research/links.md` §4.3). A key that is not there, at either call,
+/// is no error.
+fn delete_key_tree_at(path: &str) -> io::Result<()> {
+    let name = wide(path);
+    // SAFETY: HKEY_CURRENT_USER is a predefined key, which RegDeleteTreeW
+    // takes as it is; `name` is NUL-terminated.
+    let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, name.as_ptr()) };
+    if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    // SAFETY: as above.
+    let status = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, name.as_ptr()) };
+    if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
+        return Err(io::Error::from_raw_os_error(status as i32));
     }
     Ok(())
 }
@@ -405,7 +616,8 @@ struct Key(HKEY);
 
 impl Drop for Key {
     fn drop(&mut self) {
-        // SAFETY: the key was opened by `RegOpenKeyExW` and is closed once.
+        // SAFETY: the key was opened by `RegOpenKeyExW` or `RegCreateKeyExW`
+        // and is closed once.
         unsafe { RegCloseKey(self.0) };
     }
 }
@@ -713,6 +925,22 @@ impl WindowsSystem for RealWindows {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(InstallError::Failed(format!("removing {link}: {e}"))),
         }
+    }
+
+    fn url_handler(&self) -> Result<UrlKey, InstallError> {
+        url_key_at(URL_SCHEME_KEY).map_err(|e| {
+            InstallError::Failed(format!("reading HKEY_CURRENT_USER\\{URL_SCHEME_KEY}: {e}"))
+        })
+    }
+
+    fn write_url_handler(&self, command: &str) -> Result<(), InstallError> {
+        write_url_key_at(URL_SCHEME_KEY, command)
+    }
+
+    fn remove_url_handler(&self) -> Result<(), InstallError> {
+        delete_key_tree_at(URL_SCHEME_KEY).map_err(|e| {
+            InstallError::Failed(format!("removing HKEY_CURRENT_USER\\{URL_SCHEME_KEY}: {e}"))
+        })
     }
 }
 

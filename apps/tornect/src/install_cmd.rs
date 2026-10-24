@@ -17,8 +17,11 @@
 //!   copy, through `tornect service install`'s own guard operation.
 //! - Windows: the Program Files steps of `tornect_platform::install`: the
 //!   install's two prompts (the copy, then the installed copy writing its
-//!   own entry), and an uninstall that, run from the installed copy, has
-//!   that copy mark itself and its folder for removal at the next restart.
+//!   own entry) with this user's registration of `tornect:` links between
+//!   them (never over another program's; the install's line says what links
+//!   do, design `invite` §4.6), and an uninstall that, run from the
+//!   installed copy, has that copy mark itself and its folder for removal at
+//!   the next restart.
 //!
 //! `tornect uninstall` removes the start at sign-in, whatever copy it runs,
 //! then the link entry's line in `mimeapps.list`, the menu entry, the link
@@ -83,6 +86,38 @@ fn association_left_line(mimeapps: &std::path::Path, why: &str) -> String {
         "{} still names Tornect for tornect:// links: it was not changed ({why}).",
         mimeapps.display()
     )
+}
+
+/// What a Windows install or uninstall says of a registration of `tornect:`
+/// links that is not Tornect's, left as it is (design `invite` §4.6).
+#[cfg(any(windows, test))]
+fn url_handler_left_line() -> String {
+    format!(
+        "tornect:// links open another program here (HKEY_CURRENT_USER\\{}); Tornect left that \
+         as it is.",
+        tornect_platform::install::URL_SCHEME_KEY
+    )
+}
+
+/// What a Windows install says once it is done, by what it did about
+/// `tornect:` links (design `invite` §4.6).
+#[cfg(any(windows, test))]
+pub(crate) fn windows_installed(
+    folder: &str,
+    links: tornect_platform::install::WindowsLinks,
+) -> String {
+    use tornect_platform::install::WindowsLinks;
+    match links {
+        WindowsLinks::Registered => {
+            format!("Tornect is installed in {folder}; tornect:// links open it.")
+        }
+        WindowsLinks::OtherProgram => {
+            format!(
+                "Tornect is installed in {folder}. {}",
+                url_handler_left_line()
+            )
+        }
+    }
 }
 
 /// The start of `uninstall`'s refusal on Windows while administrator access
@@ -580,8 +615,9 @@ fn windows_install_home_refusal() -> String {
 /// `tornect install` on Windows: refused with a custom home, beside a
 /// running host and while a start at sign-in may run an earlier install's
 /// copy; then the Program Files steps with the guard's operation between
-/// the held, hashed source and the first change, and the offer to start at
-/// sign-in for the installed copy.
+/// the held, hashed source and the first change, the line that says what
+/// `tornect:` links open, and the offer to start at sign-in for the
+/// installed copy.
 #[cfg(any(windows, test))]
 pub(crate) fn install_windows(
     deps: &mut Deps<'_>,
@@ -626,7 +662,7 @@ pub(crate) fn install_windows(
         }
     };
     deps.console
-        .out(&format!("Tornect is installed in {}.", installed.folder));
+        .out(&windows_installed(&installed.folder, installed.links));
     offer_sign_in(deps, paths, PathBuf::from(installed.exe))
 }
 
@@ -692,8 +728,9 @@ fn admin_access_left(ctx: &HostContext) -> Option<String> {
 /// administrator access remains and while the grants cannot be read; then
 /// the Program Files steps, with the guard's operation and the removal of the
 /// start at sign-in (whatever copy it runs) between the checks and the first
-/// change. Run from the installed copy, it then says that the folder goes at
-/// the next restart.
+/// change. A registration of `tornect:` links that is not Tornect's, left
+/// as it is, is named first, even where nothing else was there. Run from the
+/// installed copy, it then says that the folder goes at the next restart.
 #[cfg(any(windows, test))]
 pub(crate) fn uninstall_windows(
     deps: &mut Deps<'_>,
@@ -734,13 +771,22 @@ pub(crate) fn uninstall_windows(
     let from_install = tornect_platform::install::runs_from_install(sys);
     let mut done =
         tornect_platform::install::uninstall_from_program_files(sys, &mut remove_sign_in);
-    if done.is_ok() && !authorized.get() {
+    if let Ok(found) = &done
+        && !authorized.get()
+    {
+        let url_handler_left = found.url_handler_left;
         if !registered(&*sign_in) {
+            if url_handler_left {
+                deps.console.out(&url_handler_left_line());
+            }
             deps.console.out(NOTHING_INSTALLED);
             return Ok(());
         }
         // Nothing in Program Files, but a start at sign-in of some copy.
-        done = remove_sign_in().map(|()| tornect_platform::install::WindowsRemoval::default());
+        done = remove_sign_in().map(|()| tornect_platform::install::WindowsRemoval {
+            url_handler_left,
+            ..Default::default()
+        });
     }
     if let Some(e) = refused.take() {
         return Err(refusal(paths, &e));
@@ -754,6 +800,9 @@ pub(crate) fn uninstall_windows(
             return Err(e.into());
         }
     };
+    if removed.url_handler_left {
+        deps.console.out(&url_handler_left_line());
+    }
     // Run from the installed copy, its folder went to the next restart.
     if removed.folder && matches!(from_install, Ok(true)) {
         deps.console.out(&at_the_restart_line(&folder));
@@ -784,7 +833,7 @@ mod tests {
     use tornect_core::unattended::store::{GrantStore, StoreStatus};
     use tornect_platform::autostart::{AutostartError, Registration};
     use tornect_platform::install::{
-        Association, Elevated, HeldImage, LinkHandler, Removal, WindowsSystem,
+        Association, Elevated, HeldImage, LinkHandler, Removal, UrlKey, WindowsLinks, WindowsSystem,
     };
 
     use super::*;
@@ -1089,6 +1138,15 @@ mod tests {
         fn remove_shortcut(&self, _: &str) -> Result<(), InstallError> {
             panic!("removed a shortcut")
         }
+        fn url_handler(&self) -> Result<UrlKey, InstallError> {
+            panic!("read the link registration")
+        }
+        fn write_url_handler(&self, _: &str) -> Result<(), InstallError> {
+            panic!("wrote the link registration")
+        }
+        fn remove_url_handler(&self) -> Result<(), InstallError> {
+            panic!("removed the link registration")
+        }
     }
 
     /// Windows with nothing of Tornect on it, whose image cannot be opened:
@@ -1149,6 +1207,15 @@ mod tests {
         }
         fn remove_shortcut(&self, _: &str) -> Result<(), InstallError> {
             panic!("removed a shortcut")
+        }
+        fn url_handler(&self) -> Result<UrlKey, InstallError> {
+            Ok(UrlKey::Absent)
+        }
+        fn write_url_handler(&self, _: &str) -> Result<(), InstallError> {
+            panic!("wrote the link registration")
+        }
+        fn remove_url_handler(&self) -> Result<(), InstallError> {
+            panic!("removed the link registration")
         }
     }
 
@@ -2118,13 +2185,35 @@ mod tests {
         );
     }
 
+    /// Owner Administrators; SYSTEM and Administrators full control, Users
+    /// read and execute: what only administrators can change.
+    fn admin_only_security() -> tornect_platform::helper_task::Security {
+        use tornect_platform::helper_task::{Ace, Security};
+        let ace = |sid: &str, mask| Ace {
+            sid: sid.to_owned(),
+            allow: true,
+            mask,
+            flags: 0,
+        };
+        Security {
+            owner: "S-1-5-32-544".to_owned(),
+            dacl: vec![
+                ace("S-1-5-18", 0x001F_01FF),
+                ace("S-1-5-32-544", 0x001F_01FF),
+                ace("S-1-5-32-545", 0x0012_00A9),
+            ],
+        }
+    }
+
     /// Windows with Tornect in Program Files (the folder administrators' only,
     /// no uninstall entry, no Start-menu entry), and this program the installed
     /// copy; every elevated step is recorded, and nothing can be read of this
-    /// program once one ran.
+    /// program once one ran. With `foreign_url`, another program's
+    /// registration of `tornect:` links is there.
     #[derive(Default)]
     struct InstalledHere {
         ran: Mutex<Vec<Elevated>>,
+        foreign_url: bool,
     }
 
     impl WindowsSystem for InstalledHere {
@@ -2153,21 +2242,7 @@ mod tests {
             &self,
             _: &str,
         ) -> Result<tornect_platform::helper_task::Security, InstallError> {
-            use tornect_platform::helper_task::{Ace, Security};
-            let ace = |sid: &str, mask| Ace {
-                sid: sid.to_owned(),
-                allow: true,
-                mask,
-                flags: 0,
-            };
-            Ok(Security {
-                owner: "S-1-5-32-544".to_owned(),
-                dacl: vec![
-                    ace("S-1-5-18", 0x001F_01FF),
-                    ace("S-1-5-32-544", 0x001F_01FF),
-                    ace("S-1-5-32-545", 0x0012_00A9),
-                ],
-            })
+            Ok(admin_only_security())
         }
         fn elevated_program(&self, step: &Elevated) -> String {
             let target = tornect_platform::install::WindowsTarget::of(self).unwrap();
@@ -2199,6 +2274,19 @@ mod tests {
         }
         fn remove_shortcut(&self, _: &str) -> Result<(), InstallError> {
             panic!("removed a shortcut")
+        }
+        fn url_handler(&self) -> Result<UrlKey, InstallError> {
+            Ok(if self.foreign_url {
+                UrlKey::Other
+            } else {
+                UrlKey::Absent
+            })
+        }
+        fn write_url_handler(&self, _: &str) -> Result<(), InstallError> {
+            panic!("wrote the link registration")
+        }
+        fn remove_url_handler(&self) -> Result<(), InstallError> {
+            panic!("removed the link registration")
         }
     }
 
@@ -2238,5 +2326,268 @@ mod tests {
                 removed_line(&env.paths)
             )
         );
+    }
+
+    /// The program [`Fresh`] installs.
+    const FRESH_PROGRAM: &[u8] = b"MZ the program";
+
+    /// Where [`Fresh`]'s image is.
+    const FRESH_IMAGE: &str = "C:\\Users\\u\\Downloads\\tornect.exe";
+
+    /// The link registration's command for [`Fresh`]'s installed copy.
+    const FRESH_URL_COMMAND: &str =
+        "\"C:\\Program Files\\Tornect\\tornect.exe\" open-link -- \"%1\"";
+
+    /// [`Fresh`]'s image, held.
+    struct FreshImage(std::io::Cursor<&'static [u8]>);
+
+    impl std::io::Read for FreshImage {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.0, buf)
+        }
+    }
+
+    impl HeldImage for FreshImage {
+        fn path(&self) -> &str {
+            FRESH_IMAGE
+        }
+    }
+
+    /// Windows with nothing of Tornect in Program Files, on which an install
+    /// runs to its end (every step succeeds, and the copy is the held image),
+    /// and this user's registration of `tornect:` links as `url` holds it.
+    struct Fresh {
+        url: Mutex<UrlKey>,
+        copied: Mutex<bool>,
+    }
+
+    impl Fresh {
+        fn with(url: UrlKey) -> Self {
+            Self {
+                url: Mutex::new(url),
+                copied: Mutex::new(false),
+            }
+        }
+
+        fn url(&self) -> UrlKey {
+            self.url.lock().unwrap().clone()
+        }
+    }
+
+    impl WindowsSystem for Fresh {
+        fn program_files(&self) -> Result<String, InstallError> {
+            Ok("C:\\Program Files".to_owned())
+        }
+        fn system_directory(&self) -> Result<String, InstallError> {
+            Ok("C:\\Windows\\System32".to_owned())
+        }
+        fn start_menu_programs(&self) -> Result<String, InstallError> {
+            Ok("C:\\Users\\u\\Start Menu\\Programs".to_owned())
+        }
+        fn open_own_image(&self) -> Result<Box<dyn HeldImage + '_>, InstallError> {
+            Ok(Box::new(FreshImage(std::io::Cursor::new(FRESH_PROGRAM))))
+        }
+        fn folder_entries(&self, folder: &str) -> Result<Option<Vec<String>>, InstallError> {
+            Ok(
+                (*self.copied.lock().unwrap() && folder == "C:\\Program Files\\Tornect")
+                    .then(|| vec!["tornect.exe".to_owned()]),
+            )
+        }
+        fn is_reparse_point(&self, _: &str) -> Result<bool, InstallError> {
+            Ok(false)
+        }
+        fn read_file(&self, _: &str) -> Result<Box<dyn std::io::Read + '_>, InstallError> {
+            Ok(Box::new(std::io::Cursor::new(FRESH_PROGRAM)))
+        }
+        fn security(
+            &self,
+            _: &str,
+        ) -> Result<tornect_platform::helper_task::Security, InstallError> {
+            Ok(admin_only_security())
+        }
+        fn elevated_program(&self, step: &Elevated) -> String {
+            let target = tornect_platform::install::WindowsTarget::of(self).unwrap();
+            tornect_platform::install::elevated_command(step, &target).0
+        }
+        fn run_elevated(&self, step: &Elevated) -> Result<(), InstallError> {
+            if matches!(step, Elevated::Copy { .. }) {
+                *self.copied.lock().unwrap() = true;
+            }
+            Ok(())
+        }
+        fn uninstall_entry_exists(&self, _: &str) -> Result<bool, InstallError> {
+            Ok(false)
+        }
+        fn file_exists(&self, _: &str) -> Result<bool, InstallError> {
+            Ok(false)
+        }
+        fn pending_removals(&self) -> Result<Vec<String>, InstallError> {
+            Ok(Vec::new())
+        }
+        fn own_path(&self) -> Result<String, InstallError> {
+            Ok(FRESH_IMAGE.to_owned())
+        }
+        fn write_shortcut(&self, _: &str, _: &str) -> Result<(), InstallError> {
+            Ok(())
+        }
+        fn remove_shortcut(&self, _: &str) -> Result<(), InstallError> {
+            Ok(())
+        }
+        fn url_handler(&self) -> Result<UrlKey, InstallError> {
+            Ok(self.url())
+        }
+        fn write_url_handler(&self, command: &str) -> Result<(), InstallError> {
+            *self.url.lock().unwrap() = UrlKey::Command(command.to_owned());
+            Ok(())
+        }
+        fn remove_url_handler(&self) -> Result<(), InstallError> {
+            *self.url.lock().unwrap() = UrlKey::Absent;
+            Ok(())
+        }
+    }
+
+    /// Design `invite` §4.6: a Windows install's line says, word for word,
+    /// what `tornect:` links open: Tornect where the install wrote the
+    /// registration or found its own leftover, another program where another
+    /// registration is there, which stays as it was.
+    #[test]
+    fn the_windows_install_says_what_links_do() {
+        let registered =
+            "Tornect is installed in C:\\Program Files\\Tornect; tornect:// links open it.";
+        let other = "Tornect is installed in C:\\Program Files\\Tornect. tornect:// links open \
+                     another program here (HKEY_CURRENT_USER\\Software\\Classes\\tornect); Tornect \
+                     left that as it is.";
+        let folder = "C:\\Program Files\\Tornect";
+        assert_eq!(
+            windows_installed(folder, WindowsLinks::Registered),
+            registered
+        );
+        assert_eq!(windows_installed(folder, WindowsLinks::OtherProgram), other);
+        let ours = UrlKey::Command(FRESH_URL_COMMAND.to_owned());
+        let theirs = UrlKey::Command("\"C:\\Program Files\\Other\\other.exe\" \"%1\"".to_owned());
+        for (found, line, after) in [
+            (UrlKey::Absent, registered, ours.clone()),
+            (ours.clone(), registered, ours.clone()),
+            (theirs.clone(), other, theirs.clone()),
+            (UrlKey::Other, other, UrlKey::Other),
+        ] {
+            let mut env = env(windows_admin(), 1);
+            let backends = Backends::default();
+            let make = |spec| backends.make(spec);
+            let sys = Fresh::with(found.clone());
+            let mut script = Script::answering(&[]);
+            let mut deps = Deps {
+                ctx: &mut env.ctx,
+                console: &mut script,
+                host_running: false,
+                autostart_for: &make,
+            };
+            install_windows(&mut deps, &env.paths, &sys, false).unwrap();
+            assert!(script.said(line), "{found:?}: {:?}", script.lines);
+            assert!(
+                !script
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("tornect://") && l != &format!("out: {line}")),
+                "{found:?}: {:?}",
+                script.lines
+            );
+            assert_eq!(sys.url(), after, "{found:?}");
+            assert_eq!(env.dialogs.asked(), ["install"], "{found:?}");
+        }
+    }
+
+    /// Design `invite` §4.6: a Windows uninstall that left another program's
+    /// registration of `tornect:` links says so before its other lines, also
+    /// where nothing else of Tornect was there (nothing is asked then); one
+    /// that removed Tornect's own registration says nothing of links.
+    #[test]
+    fn the_windows_uninstall_names_a_link_registration_it_left() {
+        let left = "tornect:// links open another program here \
+                    (HKEY_CURRENT_USER\\Software\\Classes\\tornect); Tornect left that as it is.";
+        assert_eq!(url_handler_left_line(), left);
+
+        let mut env = env(windows_admin(), 1);
+        let backends = Backends::default();
+        let make = |spec| backends.make(spec);
+        let sys = InstalledHere {
+            foreign_url: true,
+            ..InstalledHere::default()
+        };
+        let mut collected = Collected::default();
+        let mut deps = Deps {
+            ctx: &mut env.ctx,
+            console: &mut collected,
+            host_running: false,
+            autostart_for: &make,
+        };
+        let done = uninstall_windows(&mut deps, &env.paths, &sys);
+        assert!(done.is_ok(), "{done:?}");
+        assert_eq!(
+            collected.text(&done),
+            format!(
+                "{left}\n{}\n{}",
+                at_the_restart_line("C:\\Program Files\\Tornect"),
+                removed_line(&env.paths)
+            )
+        );
+
+        let mut env = self::env(windows_admin(), 1);
+        let sys = Fresh::with(UrlKey::Other);
+        let mut collected = Collected::default();
+        let mut deps = Deps {
+            ctx: &mut env.ctx,
+            console: &mut collected,
+            host_running: false,
+            autostart_for: &make,
+        };
+        let done = uninstall_windows(&mut deps, &env.paths, &sys);
+        assert_eq!(
+            collected.text(&done),
+            format!("{left}\n{NOTHING_INSTALLED}")
+        );
+        assert!(env.dialogs.asked().is_empty());
+        assert_eq!(sys.url(), UrlKey::Other);
+
+        // Nothing in Program Files, but a start at sign-in of some copy.
+        let mut env = self::env(windows_admin(), 1);
+        let signed_in = Backends {
+            registered: Some(AutostartState::Registered(Registration {
+                enabled: true,
+                command: Some("\"C:\\Users\\u\\tornect.exe\" \"--background\"".to_owned()),
+                ..Registration::default()
+            })),
+            ..Backends::default()
+        };
+        let make_signed_in = |spec| signed_in.make(spec);
+        let mut collected = Collected::default();
+        let mut deps = Deps {
+            ctx: &mut env.ctx,
+            console: &mut collected,
+            host_running: false,
+            autostart_for: &make_signed_in,
+        };
+        let done = uninstall_windows(&mut deps, &env.paths, &sys);
+        assert_eq!(
+            collected.text(&done),
+            format!("{left}\n{}", removed_line(&env.paths))
+        );
+        assert_eq!(env.dialogs.asked(), ["uninstall"]);
+        assert_eq!(sys.url(), UrlKey::Other);
+
+        // Tornect's own registration, left alone: removed after the dialog.
+        let mut env = self::env(windows_admin(), 1);
+        let sys = Fresh::with(UrlKey::Command(FRESH_URL_COMMAND.to_owned()));
+        let mut collected = Collected::default();
+        let mut deps = Deps {
+            ctx: &mut env.ctx,
+            console: &mut collected,
+            host_running: false,
+            autostart_for: &make,
+        };
+        let done = uninstall_windows(&mut deps, &env.paths, &sys);
+        assert_eq!(collected.text(&done), removed_line(&env.paths));
+        assert_eq!(env.dialogs.asked(), ["uninstall"]);
+        assert_eq!(sys.url(), UrlKey::Absent);
     }
 }
