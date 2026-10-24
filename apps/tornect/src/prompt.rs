@@ -48,6 +48,9 @@ pub struct Prompter {
     /// any does, the open question's read is cancelled and no question is
     /// shown.
     blocking: watch::Sender<u32>,
+    /// How many times `block` was typed in a block window: each time blocks
+    /// every window open then ([`Priority::block_every_open_window`]).
+    blocks: watch::Sender<u64>,
 }
 
 /// Whether the terminal asks the questions: only when both its input and
@@ -77,6 +80,7 @@ impl Prompter {
                 lines: Mutex::new(None),
                 source: Source::Stdin,
                 blocking: watch::channel(0).0,
+                blocks: watch::channel(0).0,
             })
         })
     }
@@ -118,6 +122,7 @@ impl Prompter {
         Priority {
             prompter: self,
             lines: None,
+            blocks_before: *self.blocks.borrow(),
         }
     }
 
@@ -163,18 +168,52 @@ impl Prompter {
             lines: Mutex::new(Some(rx)),
             source: Source::Scripted,
             blocking: watch::channel(0).0,
+            blocks: watch::channel(0).0,
         });
         (prompter, tx)
     }
 }
 
 /// A block window's hold on the terminal ([`Prompter::priority`]).
+///
+/// Several windows can be open at once (unattended requests overlap), and
+/// the lines typed go to the one that opened first, as they cannot say which
+/// request they mean. So a `block` typed there blocks every window open then,
+/// each one saying so (audit B20): one `block` never lets another request
+/// through that the person may have meant.
 pub struct Priority<'a> {
     prompter: &'a Prompter,
     lines: Option<MutexGuard<'a, Option<mpsc::Receiver<String>>>>,
+    /// [`Prompter::blocks`] when this window opened: a `block` typed after
+    /// that blocks it too, one typed before does not.
+    blocks_before: u64,
 }
 
 impl Priority<'_> {
+    /// Block windows open now, this one included.
+    pub fn open_windows(&self) -> u32 {
+        *self.prompter.blocking.borrow()
+    }
+
+    /// `block` was typed: every window open now is blocked, this one and
+    /// those waiting for the terminal behind it ([`Priority::blocked_by_another`]).
+    pub fn block_every_open_window(&self) {
+        self.prompter.blocks.send_modify(|typed| *typed += 1);
+    }
+
+    /// Resolves once `block` was typed in a window open beside this one,
+    /// after this one opened; pending otherwise. Borrows nothing of the
+    /// hold, so it runs beside [`Priority::next_line`].
+    pub fn blocked_by_another(&self) -> impl Future<Output = ()> + Send + use<> {
+        let mut blocks = self.prompter.blocks.subscribe();
+        let before = self.blocks_before;
+        async move {
+            if blocks.wait_for(|typed| *typed > before).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
     /// The next line typed, trimmed; `None` once stdin has ended (or could not
     /// be read). Lines typed before the hold was taken count too: the block
     /// window only looks for `block`, so a stale line can only block.
