@@ -258,6 +258,16 @@ pub trait LogonCheck: Send + Sync {
 /// any error refuses. The typed password lives in a wiped buffer for the few
 /// calls that need it; only the outcome kind is logged.
 ///
+/// The dialog and the check of what was typed run on a thread of their own,
+/// and the operation waits for them at most [`Self::DIALOG_TIMEOUT`]: past
+/// it, it is refused (`Denied`, logged `timed_out`), and a credential typed
+/// later is wiped without being checked (audit B18). A dialog left open
+/// used to keep the operation waiting with no bound, so the command line
+/// gave up after [`crate::ipc::RESPONSE_TIMEOUT`] and said so, and the
+/// operation was applied when the password came. CredUI has no call that
+/// closes its dialog, so it stays on the secure desktop until answered or
+/// cancelled, and until then no other dialog opens.
+///
 /// Limits, stated plainly: a Windows Hello PIN or fingerprint is not a password
 /// `LogonUserW` can check, so the user must pick the password option in the
 /// dialog (NEEDS-DEVICE); an account with an empty password cannot be verified
@@ -266,11 +276,14 @@ pub trait LogonCheck: Send + Sync {
 /// closed. As on every OS, this proves a human at the host knows the OS
 /// credential; it does not stop code already running as this user.
 pub struct WindowsReAuth {
-    prompt: Box<dyn CredentialPrompt>,
-    logon: Box<dyn LogonCheck>,
+    prompt: std::sync::Arc<dyn CredentialPrompt>,
+    logon: std::sync::Arc<dyn LogonCheck>,
     /// One dialog at a time, never a queue (as the polkit backend's: track D
-    /// S1/S6).
+    /// S1/S6): held by the dialog's thread until the dialog really returns,
+    /// even after the operation stopped waiting for it.
     dialog: std::sync::Arc<std::sync::Mutex<()>>,
+    /// How long an operation waits for the dialog and the logon check.
+    timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for WindowsReAuth {
@@ -280,6 +293,13 @@ impl std::fmt::Debug for WindowsReAuth {
 }
 
 impl WindowsReAuth {
+    /// How long an operation waits for the dialog and the check of what was
+    /// typed before it is refused: polkit's dialog bound
+    /// (`PolkitReAuth::DIALOG_TIMEOUT`), the registration transaction's own
+    /// 120 s life (§B.8.7.4), and below [`crate::ipc::RESPONSE_TIMEOUT`], so
+    /// the host answers before the command line stops waiting.
+    pub const DIALOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
     /// The OS dialog and `LogonUserW`.
     #[cfg(windows)]
     #[must_use]
@@ -294,10 +314,18 @@ impl WindowsReAuth {
     #[must_use]
     pub fn with_backends(prompt: Box<dyn CredentialPrompt>, logon: Box<dyn LogonCheck>) -> Self {
         Self {
-            prompt,
-            logon,
+            prompt: std::sync::Arc::from(prompt),
+            logon: std::sync::Arc::from(logon),
             dialog: std::sync::Arc::default(),
+            timeout: Self::DIALOG_TIMEOUT,
         }
+    }
+
+    /// Override how long an operation waits for the dialog (tests).
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
@@ -321,66 +349,133 @@ impl ReAuth for WindowsReAuth {
 }
 
 impl WindowsReAuth {
-    /// One dialog saying the password is for `purpose`, then the logon check; `op` names
-    /// the operation in the log.
+    /// One dialog saying the password is for `purpose`, then the logon check, on a thread
+    /// of their own, waited for at most the timeout; `op` names the operation in the log.
     fn ask(&self, op: &str, purpose: &str) -> Result<(), ReAuthError> {
-        let _open = match self.dialog.try_lock() {
-            Ok(held) => held,
-            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return Err(ReAuthError::Unavailable(
-                    "another Tornect re-authentication dialog is already open; answer or \
-                     cancel it, then retry"
-                        .to_owned(),
-                ));
-            }
-        };
-        let verdict = match self.prompt.prompt(purpose) {
-            PromptOutcome::Cancelled => {
+        let deadline = std::time::Instant::now() + self.timeout;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (prompt, logon, dialog) = (
+            std::sync::Arc::clone(&self.prompt),
+            std::sync::Arc::clone(&self.logon),
+            std::sync::Arc::clone(&self.dialog),
+        );
+        let (op_owned, purpose) = (op.to_owned(), purpose.to_owned());
+        let started = std::thread::Builder::new()
+            .name("reauth-dialog".to_owned())
+            // An explicit size: std then never reads `RUST_MIN_STACK`.
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let verdict = dialog_flow(&*prompt, &*logon, &dialog, &op_owned, &purpose, deadline);
+                // An operation that stopped waiting drops the late verdict here.
+                let _ = tx.send(verdict);
+            });
+        if let Err(e) = started {
+            tracing::warn!(
+                op,
+                outcome = "prompt_failed",
+                "re-authentication unavailable"
+            );
+            return Err(ReAuthError::Unavailable(format!(
+                "the re-authentication dialog could not be started: {e}"
+            )));
+        }
+        match rx.recv_timeout(self.timeout) {
+            Ok(verdict) => verdict,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 tracing::info!(
                     op,
-                    outcome = "cancelled",
-                    "re-authentication was not granted"
-                );
-                return Err(ReAuthError::Denied);
-            }
-            PromptOutcome::Failed(why) => {
-                tracing::warn!(
-                    op,
-                    outcome = "prompt_failed",
-                    "re-authentication unavailable"
-                );
-                return Err(ReAuthError::Unavailable(why));
-            }
-            // The credential is dropped, and its password wiped, at the end
-            // of this arm.
-            PromptOutcome::Entered(credential) => self.logon.verify(&credential),
-        };
-        match verdict {
-            LogonOutcome::CurrentUser => {
-                tracing::info!(op, outcome = "verified", "re-authenticated");
-                Ok(())
-            }
-            LogonOutcome::OtherUser => {
-                tracing::info!(
-                    op,
-                    outcome = "other_user",
+                    outcome = "timed_out",
                     "re-authentication was not granted"
                 );
                 Err(ReAuthError::Denied)
             }
-            LogonOutcome::Rejected => {
-                tracing::info!(
-                    op,
-                    outcome = "rejected",
-                    "re-authentication was not granted"
-                );
-                Err(ReAuthError::Denied)
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::warn!(op, outcome = "prompt_failed", "re-authentication failed");
+                Err(ReAuthError::Failed(
+                    "the re-authentication dialog ended without an answer".to_owned(),
+                ))
             }
-            LogonOutcome::Failed(why) => {
-                tracing::warn!(op, outcome = "logon_failed", "re-authentication failed");
-                Err(ReAuthError::Failed(why))
-            }
+        }
+    }
+}
+
+/// [`WindowsReAuth::ask`]'s dialog and logon check, on the dialog's own thread: one
+/// dialog at a time (`dialog` held until it returns); a credential typed after `deadline`,
+/// when the operation has stopped waiting, is wiped and never checked.
+fn dialog_flow(
+    prompt: &dyn CredentialPrompt,
+    logon: &dyn LogonCheck,
+    dialog: &std::sync::Mutex<()>,
+    op: &str,
+    purpose: &str,
+    deadline: std::time::Instant,
+) -> Result<(), ReAuthError> {
+    let _open = match dialog.try_lock() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return Err(ReAuthError::Unavailable(
+                "another Tornect re-authentication dialog is already open; answer or \
+                 cancel it, then retry"
+                    .to_owned(),
+            ));
+        }
+    };
+    let verdict = match prompt.prompt(purpose) {
+        PromptOutcome::Cancelled => {
+            tracing::info!(
+                op,
+                outcome = "cancelled",
+                "re-authentication was not granted"
+            );
+            return Err(ReAuthError::Denied);
+        }
+        PromptOutcome::Failed(why) => {
+            tracing::warn!(
+                op,
+                outcome = "prompt_failed",
+                "re-authentication unavailable"
+            );
+            return Err(ReAuthError::Unavailable(why));
+        }
+        // Too late: the operation was refused already. The credential is
+        // dropped, and its password wiped, unchecked.
+        PromptOutcome::Entered(_) if std::time::Instant::now() >= deadline => {
+            tracing::info!(
+                op,
+                outcome = "too_late",
+                "a password typed after the re-authentication timed out was not checked"
+            );
+            return Err(ReAuthError::Denied);
+        }
+        // The credential is dropped, and its password wiped, at the end
+        // of this arm.
+        PromptOutcome::Entered(credential) => logon.verify(&credential),
+    };
+    match verdict {
+        LogonOutcome::CurrentUser => {
+            tracing::info!(op, outcome = "verified", "re-authenticated");
+            Ok(())
+        }
+        LogonOutcome::OtherUser => {
+            tracing::info!(
+                op,
+                outcome = "other_user",
+                "re-authentication was not granted"
+            );
+            Err(ReAuthError::Denied)
+        }
+        LogonOutcome::Rejected => {
+            tracing::info!(
+                op,
+                outcome = "rejected",
+                "re-authentication was not granted"
+            );
+            Err(ReAuthError::Denied)
+        }
+        LogonOutcome::Failed(why) => {
+            tracing::warn!(op, outcome = "logon_failed", "re-authentication failed");
+            Err(ReAuthError::Failed(why))
         }
     }
 }
@@ -1061,6 +1156,89 @@ mod tests {
             prompt.purpose.lock().unwrap().is_none(),
             "no dialog was shown"
         );
+    }
+
+    /// A dialog left open: each one shown answers the right password only
+    /// once `release` says so.
+    struct LeftOpen {
+        shown: AtomicUsize,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl CredentialPrompt for std::sync::Arc<LeftOpen> {
+        fn prompt(&self, _purpose: &str) -> PromptOutcome {
+            self.shown.fetch_add(1, Ordering::SeqCst);
+            let _ = self.release.lock().unwrap().recv();
+            typed("PC\\ana", "right")
+        }
+    }
+
+    /// Audit B18: an operation waits for the Windows dialog at most its
+    /// timeout and is then refused, an answer the host gives while the
+    /// command line still waits (`ipc::RESPONSE_TIMEOUT`). The dialog used
+    /// to have no bound: the command line gave up and said so, and the
+    /// operation was applied when the password came. A password typed into
+    /// the dialog after the refusal is never checked, so nothing is applied;
+    /// until that dialog returns no other opens, and the next operation asks
+    /// again.
+    #[test]
+    fn a_dialog_left_open_past_its_timeout_refuses_and_its_late_password_is_not_checked() {
+        use std::time::{Duration, Instant};
+        assert!(
+            WindowsReAuth::DIALOG_TIMEOUT + Duration::from_secs(20) <= crate::ipc::RESPONSE_TIMEOUT
+        );
+        let (release, released) = std::sync::mpsc::channel();
+        let prompt = std::sync::Arc::new(LeftOpen {
+            shown: AtomicUsize::new(0),
+            release: std::sync::Mutex::new(released),
+        });
+        let logon = std::sync::Arc::new(FakeLogon::default());
+        let timeout = Duration::from_millis(300);
+        let reauth = std::sync::Arc::new(
+            WindowsReAuth::with_backends(
+                Box::new(std::sync::Arc::clone(&prompt)),
+                Box::new(std::sync::Arc::clone(&logon)),
+            )
+            .with_timeout(timeout),
+        );
+
+        let started = Instant::now();
+        let (done, answered) = std::sync::mpsc::channel();
+        let asking = std::sync::Arc::clone(&reauth);
+        std::thread::spawn(move || done.send(asking.reauthenticate("enable")));
+        let answer = answered
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the operation still waits for the dialog past its timeout");
+        assert_eq!(answer, Err(ReAuthError::Denied));
+        assert!(started.elapsed() >= timeout, "{:?}", started.elapsed());
+        assert_eq!(prompt.shown.load(Ordering::SeqCst), 1);
+
+        // The dialog is still on screen: no second one opens.
+        match reauth.reauthenticate("resume") {
+            Err(ReAuthError::Unavailable(m)) => assert!(m.contains("already open"), "{m}"),
+            other => panic!("expected an immediate refusal, got {other:?}"),
+        }
+        assert_eq!(prompt.shown.load(Ordering::SeqCst), 1);
+
+        // The owner comes back and types the right password: it is wiped
+        // unchecked, and the dialog's thread lets go of the dialog.
+        release.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(20);
+        while reauth.dialog.try_lock().is_err() {
+            assert!(Instant::now() < until, "the late dialog never returned");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            logon.calls.load(Ordering::SeqCst),
+            0,
+            "a password typed after the refusal was checked"
+        );
+
+        // The next operation asks again, and in time the password allows it.
+        release.send(()).unwrap();
+        assert_eq!(reauth.reauthenticate("enable"), Ok(()));
+        assert_eq!(prompt.shown.load(Ordering::SeqCst), 2);
+        assert_eq!(logon.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
