@@ -205,24 +205,14 @@ fn pinned_cargo_deny_dir() -> String {
     format!("cargo-deny-{CARGO_DENY_VERSION}-x86_64-unknown-linux-musl")
 }
 
-/// `cargo-deny`: the pinned copy under `target/tools/`, else another copy there,
-/// else on `PATH`.
-fn find_cargo_deny(root: &Path) -> Option<PathBuf> {
-    find_cargo_deny_in(
-        &root.join("target").join("tools"),
-        std::env::var_os("PATH").as_deref(),
-    )
-}
-
-/// The pinned directory first; then the other directories of `tools` in name
-/// order, never in the order the file system lists them, so two machines with
-/// the same directories pick the same copy; then `PATH`.
-fn find_cargo_deny_in(tools: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
+/// Every `cargo-deny` the gate may run, in the order [`choose_cargo_deny`]
+/// tries them: the pinned directory of `tools` first; then its other
+/// directories in name order, never in the order the file system lists them,
+/// so two machines with the same directories pick the same copy; then each
+/// absolute `PATH` directory in turn (a relative one would let the current
+/// directory choose what runs).
+fn cargo_deny_candidates(tools: &Path, path: Option<&OsStr>) -> Vec<PathBuf> {
     let bin = format!("cargo-deny{}", std::env::consts::EXE_SUFFIX);
-    let pinned = tools.join(pinned_cargo_deny_dir()).join(&bin);
-    if pinned.is_file() {
-        return Some(pinned);
-    }
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(tools)
         .into_iter()
         .flatten()
@@ -230,11 +220,21 @@ fn find_cargo_deny_in(tools: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
         .map(|entry| entry.path())
         .collect();
     dirs.sort();
-    let bundled = dirs
+    let on_path = path
         .into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|dir| dir.is_absolute());
+    let mut found: Vec<PathBuf> = Vec::new();
+    for candidate in std::iter::once(tools.join(pinned_cargo_deny_dir()))
+        .chain(dirs)
+        .chain(on_path)
         .map(|dir| dir.join(&bin))
-        .find(|candidate| candidate.is_file());
-    bundled.or_else(|| path.and_then(|path| search_path(path, &bin)))
+    {
+        if candidate.is_file() && !found.contains(&candidate) {
+            found.push(candidate);
+        }
+    }
+    found
 }
 
 /// `cargo-deny --version` must name [`CARGO_DENY_VERSION`]: `cargo-deny 0.20.2`,
@@ -250,6 +250,56 @@ fn check_cargo_deny_version(bin: &Path, exit_ok: bool, stdout: &str) -> anyhow::
         install_cargo_deny()
     );
     Ok(said.to_owned())
+}
+
+/// The first of `candidates` whose `--version`, as `version_of` reports it
+/// (its success and its standard output), names [`CARGO_DENY_VERSION`], with
+/// those words. A copy of another release earlier in the order is passed over,
+/// so one under `target/tools/` cannot hide a pinned one on `PATH` (B29). No
+/// candidate: B3-6's error. None of the pinned release: one candidate's own
+/// refusal, or each candidate named with what it said.
+fn choose_cargo_deny(
+    candidates: &[PathBuf],
+    mut version_of: impl FnMut(&Path) -> anyhow::Result<(bool, String)>,
+) -> anyhow::Result<(PathBuf, String)> {
+    require_cargo_deny(candidates.first().cloned())?;
+    let mut refused = Vec::new();
+    let mut last = None;
+    for bin in candidates {
+        let said = match version_of(bin) {
+            Ok((exit_ok, stdout)) => match check_cargo_deny_version(bin, exit_ok, &stdout) {
+                Ok(version) => return Ok((bin.clone(), version)),
+                Err(e) => {
+                    last = Some(e);
+                    match (stdout.trim(), exit_ok) {
+                        ("", true) => "says nothing".to_owned(),
+                        ("", false) => "fails and says nothing".to_owned(),
+                        (said, true) => format!("is `{said}`"),
+                        (said, false) => format!("is `{said}` but fails"),
+                    }
+                }
+            },
+            Err(e) => {
+                let said = format!("does not run ({e:#})");
+                last = Some(e);
+                said
+            }
+        };
+        refused.push(format!("{} {said}", bin.display()));
+    }
+    match (refused.len(), last) {
+        (1, Some(e)) => Err(e),
+        _ => bail!(
+            "none of the {} copies of cargo-deny found is cargo-deny {CARGO_DENY_VERSION}: {}. The \
+             gate and dist run the first that is, in this order: target/tools/{}/, the other \
+             directories of target/tools/ by name, then PATH; another release reads deny.toml \
+             and the advisories with other rules. {}",
+            refused.len(),
+            refused.join("; "),
+            pinned_cargo_deny_dir(),
+            install_cargo_deny()
+        ),
+    }
 }
 
 fn install_cargo_deny() -> String {
@@ -473,23 +523,22 @@ pub(crate) struct Deny {
 /// the gate fails (decision B3-6): a gate that could not check advisories and
 /// licences is not green.
 pub(crate) fn deny(root: &Path) -> anyhow::Result<Deny> {
-    let bin = match require_cargo_deny(find_cargo_deny(root)) {
-        Ok(bin) => bin,
-        Err(e) => {
-            println!("==> cargo deny check (offline)");
-            return Err(e);
-        }
-    };
-    let version = Command::new(&bin)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("running {} --version", bin.display()))?;
-    let version = match check_cargo_deny_version(
-        &bin,
-        version.status.success(),
-        &String::from_utf8_lossy(&version.stdout),
-    ) {
-        Ok(version) => version,
+    let candidates = cargo_deny_candidates(
+        &root.join("target").join("tools"),
+        std::env::var_os("PATH").as_deref(),
+    );
+    let chosen = choose_cargo_deny(&candidates, |bin| {
+        let out = Command::new(bin)
+            .arg("--version")
+            .output()
+            .with_context(|| format!("running {} --version", bin.display()))?;
+        Ok((
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        ))
+    });
+    let (bin, version) = match chosen {
+        Ok(chosen) => chosen,
         Err(e) => {
             println!("==> cargo deny check (offline)");
             return Err(e);
@@ -584,6 +633,11 @@ mod tests {
                 "{name} leaks into the spawned cargo"
             );
         }
+    }
+
+    /// The copy the gate tries first.
+    fn find_cargo_deny_in(tools: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
+        cargo_deny_candidates(tools, path).into_iter().next()
     }
 
     /// B3-6: with no `cargo-deny` under `target/tools/` or on `PATH`, the gate
@@ -683,6 +737,106 @@ mod tests {
             assert!(err.contains("/opt/cargo-deny"), "{said}: {err}");
             assert!(err.contains("releases/tag/0.20.2"), "{said}: {err}");
         }
+    }
+
+    /// B29 (review): a copy of another release under `target/tools/` no longer
+    /// hides a pinned one on `PATH` (the very install the refusal recommends);
+    /// the pinned one, when it comes first, is the only one run; and with none
+    /// pinned, every copy tried is named with what it said.
+    #[test]
+    fn a_cargo_deny_of_another_release_does_not_hide_the_pinned_one() {
+        let dir = std::env::temp_dir().join(format!("xtask-deny-next-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tools = dir.join("tools");
+        let bin_dir = dir.join("bin");
+        let bin = format!("cargo-deny{}", std::env::consts::EXE_SUFFIX);
+        let newer = tools
+            .join("cargo-deny-0.21.0-x86_64-unknown-linux-musl")
+            .join(&bin);
+        let on_path = bin_dir.join(&bin);
+        for copy in [&newer, &on_path] {
+            std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+            std::fs::write(copy, b"").unwrap();
+        }
+        let path = std::env::join_paths([&bin_dir, &bin_dir]).unwrap();
+        let candidates = cargo_deny_candidates(&tools, Some(&path));
+        assert_eq!(candidates, [newer.clone(), on_path.clone()]);
+
+        // 0.21.0 under target/tools/, 0.20.2 on PATH: PATH's runs.
+        let mut asked = Vec::new();
+        let chosen = choose_cargo_deny(&candidates, |bin| {
+            asked.push(bin.to_owned());
+            let said = if bin == newer.as_path() {
+                "cargo-deny 0.21.0\n"
+            } else {
+                "cargo-deny 0.20.2\n"
+            };
+            Ok((true, said.to_owned()))
+        })
+        .unwrap();
+        assert_eq!(chosen, (on_path.clone(), "cargo-deny 0.20.2".to_owned()));
+        assert_eq!(asked, [newer.clone(), on_path.clone()]);
+
+        // Neither is 0.20.2: both are named, with what each said.
+        let err = choose_cargo_deny(&candidates, |bin| {
+            if bin == newer.as_path() {
+                Ok((true, "cargo-deny 0.21.0\n".to_owned()))
+            } else {
+                Err(anyhow::anyhow!(
+                    "running {} --version: denied",
+                    bin.display()
+                ))
+            }
+        })
+        .unwrap_err()
+        .to_string();
+        for part in [
+            "none of the 2 copies of cargo-deny found is cargo-deny 0.20.2",
+            &format!("{} is `cargo-deny 0.21.0`", newer.display()),
+            &format!("{} does not run (running", on_path.display()),
+            "then PATH",
+            "releases/tag/0.20.2",
+        ] {
+            assert!(err.contains(part), "{part}: {err}");
+        }
+        let err = choose_cargo_deny(&candidates, |_| Ok((false, String::new())))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fails and says nothing"), "{err}");
+
+        // One copy only: its own refusal, as before.
+        let err = choose_cargo_deny(std::slice::from_ref(&newer), |_| {
+            Ok((true, "cargo-deny 0.21.0".to_owned()))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("is `cargo-deny 0.21.0`, not cargo-deny 0.20.2"),
+            "{err}"
+        );
+
+        // The pinned copy comes first and is the only one asked.
+        let pinned = tools.join(pinned_cargo_deny_dir()).join(&bin);
+        std::fs::create_dir_all(pinned.parent().unwrap()).unwrap();
+        std::fs::write(&pinned, b"").unwrap();
+        let candidates = cargo_deny_candidates(&tools, Some(&path));
+        assert_eq!(candidates, [pinned.clone(), newer.clone(), on_path.clone()]);
+        let mut asked = Vec::new();
+        let chosen = choose_cargo_deny(&candidates, |bin| {
+            asked.push(bin.to_owned());
+            Ok((true, "cargo-deny 0.20.2".to_owned()))
+        })
+        .unwrap();
+        assert_eq!(chosen.0, pinned);
+        assert_eq!(asked, [pinned]);
+
+        // Nothing found: B3-6, before anything runs.
+        let err = choose_cargo_deny(&[], |_| panic!("nothing to run"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cargo-deny not found"), "{err}");
+        assert!(err.contains("B3-6"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The pin here is the one the docs and the release notes name.

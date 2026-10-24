@@ -7,9 +7,10 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
 ## What must be true before a tag
 
 1. `main` is clean and `cargo xtask verify` is green on it. The gate fails without cargo-deny
-   (decision B3-6), and with any cargo-deny but the pinned 0.20.2 (it takes
-   `target/tools/cargo-deny-0.20.2-x86_64-unknown-linux-musl/` first and checks `--version`;
-   audit finding B29), so "green" includes advisories, bans, licences and sources. The advisory check
+   (decision B3-6), and with any cargo-deny but the pinned 0.20.2 (it tries
+   `target/tools/cargo-deny-0.20.2-x86_64-unknown-linux-musl/` first, then the other directories of
+   `target/tools/` by name, then `PATH`, and runs the first whose `--version` says 0.20.2; audit
+   finding B29), so "green" includes advisories, bans, licences and sources. The advisory check
    runs offline against the RustSec database on disk, so fetch that database first (step 1); the
    gate names its commit and date (review finding E3-3). The gate and `dist` refuse when
    `$CARGO_HOME/advisory-dbs/` holds more than one database copy, or one that is not RustSec's,
