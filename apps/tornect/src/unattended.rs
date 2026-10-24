@@ -4154,6 +4154,81 @@ mod tests {
         assert!(refused.contains("matches 2 devices (A, B)"), "{refused}");
     }
 
+    /// B23: the terminal block window's line after a Block gives a resume
+    /// command that works as printed for the default names, "Windows PC"
+    /// and a second one pinned "Windows PC (2)": the grant's device found in
+    /// the store, its argument one shell word that clap takes as
+    /// `UnattendedCmd::Resume` and `resolve_device` resolves to that grant's
+    /// device. The label as the argument, as it was printed, is refused by
+    /// clap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_block_lines_resume_command_resumes_that_device() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            cmd: UnattendedCmd,
+        }
+        use clap::Parser as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let reauth = Arc::new(AllowAllReAuth::default());
+        let (paths, route) = admin_route(
+            &tmp,
+            tornect_core::levels::AccountFacts::Linux,
+            reauth.clone(),
+        );
+        let trusted =
+            tornect_signal::pairing::TrustedDeviceStore::open(paths.trusted_devices_file())
+                .unwrap();
+        let first = device(71);
+        let second = device(72);
+        assert_eq!(trusted.pin(first, "Windows PC").unwrap(), "Windows PC");
+        assert_eq!(trusted.pin(second, "Windows PC").unwrap(), "Windows PC (2)");
+        plain_grant(&route, &first);
+        plain_grant(&route, &second);
+        let store = guard_of(&route).store().clone();
+        for (device, label) in [(first, "Windows PC"), (second, "Windows PC (2)")] {
+            let grant = store.grant(&device).unwrap();
+            let found = crate::term_block::device_of_grant(&store, &grant.id);
+            assert_eq!(found, Some(device));
+            let line = crate::term_block::blocked_line(label, found.as_ref());
+            let command = line
+                .rsplit_once('(')
+                .and_then(|(_, c)| c.strip_suffix(")."))
+                .unwrap_or_else(|| panic!("{line}"));
+            let words: Vec<&str> = command.split_whitespace().collect();
+            assert_eq!(words[..3], ["tornect", "unattended", "resume"], "{line}");
+            assert_eq!(words.len(), 4, "one argument: {line}");
+            assert!(
+                words[3].chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+                "nothing a shell reads: {line}"
+            );
+            let parsed = Cli::try_parse_from(
+                ["tornect unattended"]
+                    .into_iter()
+                    .chain(words[2..].iter().copied()),
+            )
+            .unwrap_or_else(|e| panic!("{line}: {e}"));
+            let UnattendedCmd::Resume { device: arg } = parsed.cmd else {
+                panic!("not resume: {line}");
+            };
+            assert_eq!(
+                resolve_device(&paths, &route, &arg).await.unwrap(),
+                device,
+                "{line}"
+            );
+            let as_printed_before = ["tornect unattended", "resume"]
+                .into_iter()
+                .chain(label.split_whitespace());
+            assert!(Cli::try_parse_from(as_printed_before).is_err(), "{label}");
+        }
+        assert_eq!(
+            crate::term_block::device_of_grant(&store, &[0xee; 8]),
+            None,
+            "no such grant"
+        );
+    }
+
     /// B19: `tornect devices` shows each paired device's full ID under its
     /// row, so every device can be named whatever its label.
     #[test]

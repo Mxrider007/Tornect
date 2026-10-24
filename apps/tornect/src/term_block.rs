@@ -24,6 +24,8 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tornect_core::DeviceId;
+use tornect_core::unattended::store::GrantStore;
 use tornect_signal::consent::{BlockOutcome, BlockWindow, GrantId, WindowPassed};
 use tornect_signal::pairing::BoxFuture;
 
@@ -40,12 +42,38 @@ fn block_line(label: &str, secs: u8) -> String {
     )
 }
 
-/// The line after a Block.
-fn blocked_line(label: &str) -> String {
-    format!(
-        "Blocked. {label} stays suspended until you resume it here (tornect unattended resume \
-         {label})."
-    )
+/// The line after a Block, with the command that resumes the device.
+///
+/// The command names the device by its fingerprint (audit B23): unique,
+/// made of hex digits and dashes only, so it reaches `tornect unattended
+/// resume` as one argument from any shell, and `resolve_device` takes it.
+/// A label never goes into the command: the default names have a space
+/// ("Windows PC"), and a second one a parenthesis ("Windows PC (2)").
+/// Where the device cannot be found, the line says where its fingerprint
+/// is listed.
+pub(crate) fn blocked_line(label: &str, device: Option<&DeviceId>) -> String {
+    match device {
+        Some(device) => format!(
+            "Blocked. {label} stays suspended until you resume it here (tornect unattended \
+             resume {}).",
+            device.fingerprint()
+        ),
+        None => format!(
+            "Blocked. {label} stays suspended until you resume it here (tornect unattended \
+             resume with its fingerprint, which tornect devices lists)."
+        ),
+    }
+}
+
+/// The device a grant belongs to.
+type DeviceOf = Arc<dyn Fn(&GrantId) -> Option<DeviceId> + Send + Sync>;
+
+/// The device of grant `id` in `store`; `None` when the store holds no such
+/// grant (or cannot be read).
+pub(crate) fn device_of_grant(store: &GrantStore, id: &GrantId) -> Option<DeviceId> {
+    store
+        .read(|s| s.grants.iter().find(|g| g.id == *id).map(|g| g.device))
+        .flatten()
 }
 
 /// Where the window's lines go: one line, written and flushed.
@@ -86,6 +114,9 @@ pub struct TerminalBlockWindow {
     prompter: Arc<Prompter>,
     say: Say,
     notify: Notify,
+    /// Names the blocked device in the resume command; `None` before
+    /// [`TerminalBlockWindow::with_grants`].
+    device_of: Option<DeviceOf>,
 }
 
 impl std::fmt::Debug for TerminalBlockWindow {
@@ -112,7 +143,16 @@ impl TerminalBlockWindow {
             prompter,
             say: Arc::new(to_stderr),
             notify,
+            device_of: None,
         }
+    }
+
+    /// The line after a Block names the device's fingerprint, found by its
+    /// grant in `store` (B23).
+    #[must_use]
+    pub fn with_grants(mut self, store: GrantStore) -> Self {
+        self.device_of = Some(Arc::new(move |id: &GrantId| device_of_grant(&store, id)));
+        self
     }
 
     /// The desktop notification's Block (Linux): resolves when Block is
@@ -161,7 +201,12 @@ impl TerminalBlockWindow {
 }
 
 impl BlockWindow for TerminalBlockWindow {
-    fn run<'a>(&'a self, secs: u8, _: &'a GrantId, label: &'a str) -> BoxFuture<'a, BlockOutcome> {
+    fn run<'a>(
+        &'a self,
+        secs: u8,
+        who: &'a GrantId,
+        label: &'a str,
+    ) -> BoxFuture<'a, BlockOutcome> {
         Box::pin(async move {
             if secs == 0 {
                 // `block_window_s = 0`: no window at all (the grant's choice).
@@ -201,7 +246,8 @@ impl BlockWindow for TerminalBlockWindow {
                 Ok(Ended::Typed | Ended::Notification) => {
                     // Said before the terminal is let go; a line that cannot
                     // be written changes nothing now.
-                    let _ = (self.say)(&blocked_line(label));
+                    let device = self.device_of.as_ref().and_then(|of| of(who));
+                    let _ = (self.say)(&blocked_line(label, device.as_ref()));
                     BlockOutcome::Blocked
                 }
             };
@@ -250,6 +296,7 @@ mod tests {
                 Ok(())
             }),
             notify: Notify::Off,
+            device_of: None,
         };
         (window, said)
     }
@@ -295,7 +342,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn typing_block_blocks() {
         let (prompter, typed) = Prompter::scripted();
-        let (window, said) = recorded(prompter, false);
+        let (mut window, said) = recorded(prompter, false);
+        let laptop = DeviceId::from_bytes([3; 32]);
+        window.device_of = Some(Arc::new(move |id: &GrantId| {
+            (*id == GRANT).then_some(laptop)
+        }));
         let t0 = Instant::now();
         let running = tokio::spawn(async move { window.run(10, &GRANT, "Laptop").await });
         settle().await;
@@ -309,9 +360,37 @@ mod tests {
         assert_eq!(t0.elapsed(), Duration::from_secs(2));
         assert_eq!(
             said.lines()[1],
-            "Blocked. Laptop stays suspended until you resume it here (tornect unattended \
-             resume Laptop)."
+            format!(
+                "Blocked. Laptop stays suspended until you resume it here (tornect unattended \
+                 resume {}).",
+                laptop.fingerprint()
+            )
         );
+    }
+
+    /// B23: the resume command names the device by its fingerprint, never
+    /// by its label, which can have a space or a parenthesis; where the
+    /// device is not found, no command with a label is printed either.
+    #[test]
+    fn the_resume_command_never_carries_a_label() {
+        let device = DeviceId::from_bytes([4; 32]);
+        for label in ["Windows PC", "Windows PC (2)", "Linux PC", "Laptop"] {
+            let line = blocked_line(label, Some(&device));
+            assert!(
+                line.starts_with(&format!("Blocked. {label} stays suspended")),
+                "{line}"
+            );
+            assert!(
+                line.ends_with(&format!(
+                    "(tornect unattended resume {}).",
+                    device.fingerprint()
+                )),
+                "{line}"
+            );
+            let unknown = blocked_line(label, None);
+            assert_eq!(unknown.matches(label).count(), 1, "{unknown}");
+            assert!(unknown.contains("tornect devices lists"), "{unknown}");
+        }
     }
 
     /// FC-2: a question open on the terminal (a pairing request from any

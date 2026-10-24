@@ -764,9 +764,14 @@ pub fn wire_cli(
             )?;
             // The block window with Block, on this terminal (§B.8.6.3): it
             // goes before every question there. "Ask before starting" stays
-            // denied (`AlwaysDeny`).
-            wiring.deps.block_window =
-                Arc::new(crate::term_block::TerminalBlockWindow::new(prompter));
+            // denied (`AlwaysDeny`). Its line after a Block names the device
+            // by the fingerprint its grant gives (B23).
+            let window = crate::term_block::TerminalBlockWindow::new(prompter);
+            let window = match &wiring.ctx {
+                Ok(ctx) => window.with_grants(ctx.guard.store().clone()),
+                Err(_) => window,
+            };
+            wiring.deps.block_window = Arc::new(window);
             Ok(wiring)
         }
         None => Ok(wire(
