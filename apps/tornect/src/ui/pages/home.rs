@@ -29,6 +29,10 @@ pub(super) const HISTORY_NOTICE: &str = "Tornect keeps no list of your recent co
 /// anything sends this computer's name.
 pub(super) const NAME_QUESTION: &str = "What should other devices call this computer?";
 
+/// What the connect field says of this computer's own ID (B26), as Add
+/// computer does.
+pub(super) const OWN_ID: &str = "That is this computer's own ID.";
+
 /// Home's sticky badge while a readiness row is not green and unattended
 /// access is on (§B.8.7.1 ⑥).
 pub(super) const NOT_READY: &str = "Unattended access is not ready: see Settings, Security.";
@@ -503,10 +507,26 @@ fn connect_card(
             ui.available_width(),
         );
         let parsed = form.connect_to.trim().parse::<TornectId>();
-        let ready = model.tor.is_ready() && idle && parsed.is_ok();
-        if !form.connect_to.trim().is_empty() && parsed.is_err() {
+        // This computer's own ID connects nowhere (B26): it would ask this
+        // computer for a session with itself.
+        let own = model
+            .id
+            .as_deref()
+            .and_then(|groups| groups.parse::<TornectId>().ok());
+        let is_own = parsed.as_ref().is_ok_and(|id| Some(*id) == own);
+        let ready = model.tor.is_ready() && idle && parsed.is_ok() && !is_own;
+        let problem = if form.connect_to.trim().is_empty() {
+            None
+        } else if parsed.is_err() {
+            Some("That is not a Tornect ID: 56 letters a–z and digits 2–7.")
+        } else if is_own {
+            Some(OWN_ID)
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
             ui.label(
-                RichText::new("That is not a Tornect ID: 56 letters a–z and digits 2–7.")
+                RichText::new(problem)
                     .font(theme::font(ui.ctx(), Face::Regular, 12.0))
                     .color(t.danger_text),
             );
@@ -514,14 +534,15 @@ fn connect_card(
         let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         // The look-alike warning for the ID in the field (§B.6.1 item 4):
         // Connect then takes a second, deliberate click on its own button.
+        // Never for this computer's own ID, which is not a different address.
         let warned = model
             .connect_warning
             .as_ref()
-            .filter(|w| parsed.as_ref().is_ok_and(|id| *id == w.id));
+            .filter(|w| !is_own && parsed.as_ref().is_ok_and(|id| *id == w.id));
         // Or it could not be compared with every saved ID (F-4).
         let unchecked = model
             .connect_unchecked
-            .filter(|u| parsed.as_ref().is_ok_and(|id| id == u));
+            .filter(|u| !is_own && parsed.as_ref().is_ok_and(|id| id == u));
         let second_click = warned.map(|w| w.id).or(unchecked);
         if let Some(warning) = warned {
             // Never the saved name while this screen may be in a picture
