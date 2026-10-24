@@ -562,6 +562,28 @@ impl Licences {
     }
 }
 
+/// The Rust standard library's notices, `share/doc/rust/COPYRIGHT-library.html`
+/// under the sysroot. rustup's `rustc` component installs the file (its
+/// `lib/rustlib/manifest-rustc-<host>` lists it), so every rustup profile has
+/// it, the minimal one included; `rust-docs` does not bring it. A missing file
+/// means a sysroot that is not a rustup toolchain, such as a distribution's
+/// rustc that keeps its documents elsewhere.
+fn std_notices(sysroot: &Path) -> anyhow::Result<String> {
+    let notices = sysroot
+        .join("share")
+        .join("doc")
+        .join("rust")
+        .join("COPYRIGHT-library.html");
+    fs::read_to_string(&notices).with_context(|| {
+        format!(
+            "reading {} (the Rust standard library's notices, which the toolchain's `rustc` \
+             component installs; is `rustc --print sysroot` a rustup toolchain? A release is \
+             built with the pinned one of rust-toolchain.toml)",
+            notices.display()
+        )
+    })
+}
+
 /// Collect the licences for `triple`; `toolchain` adds the standard library and
 /// llvm-mingw's runtime (the gate's test leaves them out).
 pub fn collect(
@@ -575,19 +597,7 @@ pub fn collect(
     let mut items = Vec::new();
 
     if let Some(tc) = toolchain {
-        let notices = tc
-            .sysroot
-            .join("share")
-            .join("doc")
-            .join("rust")
-            .join("COPYRIGHT-library.html");
-        let html = fs::read_to_string(&notices).with_context(|| {
-            format!(
-                "reading {} (the Rust standard library's notices; `rustup component add \
-                 rust-docs` installs them)",
-                notices.display()
-            )
-        })?;
+        let html = std_notices(tc.sysroot)?;
         let n = texts.add(
             format!(
                 "The Rust standard library's notices: COPYRIGHT-library.html of {}, as \
@@ -1202,6 +1212,26 @@ mod tests {
                 .unwrap_or_else(|| panic!("{triple}: no line for ring"));
             assert!(ring.contains("  linked  Apache-2.0 AND ISC  ["), "{ring}");
         }
+    }
+
+    /// B31: a missing notices file points at the `rustc` component and the
+    /// sysroot, not at `rust-docs`, which does not ship the file.
+    #[test]
+    fn missing_std_notices_name_the_rustc_component() {
+        let sysroot = std::env::temp_dir().join(format!("xtask-sysroot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&sysroot);
+        fs::create_dir_all(&sysroot).unwrap();
+        let err = format!("{:#}", std_notices(&sysroot).unwrap_err());
+        assert!(err.contains("COPYRIGHT-library.html"), "{err}");
+        assert!(err.contains("`rustc` component"), "{err}");
+        assert!(err.contains("rustc --print sysroot"), "{err}");
+        assert!(!err.contains("rust-docs"), "{err}");
+
+        let doc = sysroot.join("share").join("doc").join("rust");
+        fs::create_dir_all(&doc).unwrap();
+        fs::write(doc.join("COPYRIGHT-library.html"), "<p>notices</p>").unwrap();
+        assert_eq!(std_notices(&sysroot).unwrap(), "<p>notices</p>");
+        fs::remove_dir_all(&sysroot).unwrap();
     }
 
     /// Each canonical text is the one `SOURCES.md` records, byte for byte as

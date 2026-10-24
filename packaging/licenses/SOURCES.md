@@ -14,7 +14,7 @@ here.
 | File | Licence | Copied from | SHA-256 |
 |---|---|---|---|
 | `Apache-2.0.txt` | Apache License 2.0, with its appendix | Ubuntu 26.04's `/usr/share/common-licenses/Apache-2.0` (package `base-files`) | `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
-| `BSD-2-Clause.txt` | BSD 2-Clause | Rust 1.96.0's `share/doc/rust/licenses/BSD-2-Clause.txt` (the SPDX text, from the rust-docs component) | `f32fb3b417a194167cfad068223fc975ba96c5960513a10f66a3c28720aec1df` |
+| `BSD-2-Clause.txt` | BSD 2-Clause | Rust 1.96.0's `share/doc/rust/licenses/BSD-2-Clause.txt` (the SPDX text, from the `rustc` component) | `f32fb3b417a194167cfad068223fc975ba96c5960513a10f66a3c28720aec1df` |
 | `BSL-1.0.txt` | Boost Software License 1.0 | `LICENSE` of the crates `error-code` 3.4.0 and `xxhash-rust` 0.8.18 (the same bytes) | `c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566` |
 | `LGPL-3.0.txt` | GNU LGPL version 3 (it adds to the GNU GPL version 3, which is Tornect's `LICENSE`) | Ubuntu 26.04's `/usr/share/common-licenses/LGPL-3` | `e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118` |
 | `MIT.txt` | MIT | Rust 1.96.0's `share/doc/rust/licenses/MIT.txt` (the SPDX text) | `b85dcd3e453d05982552c52b5fc9e0bdd6d23c6f8e844b984a88af32570b0cc0` |
