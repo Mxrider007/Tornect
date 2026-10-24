@@ -290,6 +290,7 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
             device: Arc::new(real.device),
             device_pk: real.device_pk,
             background: gate_fact,
+            hosted_store: std::sync::OnceLock::new(),
         },
         commands_rx,
     ));

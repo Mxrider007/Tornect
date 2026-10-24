@@ -213,6 +213,17 @@ impl std::fmt::Debug for GrantStore {
     }
 }
 
+/// `K_master` from `secrets`: `None` when it does not exist, `KeystoreLocked` when it
+/// exists but cannot be read.
+fn read_master_from(secrets: &dyn SecretStore) -> Result<Option<MasterKey>, StoreLoadError> {
+    match secrets.get(MASTER_KEY_ENTRY) {
+        Ok(Some(bytes)) => MasterKey::parse(&bytes).map(Some),
+        Ok(None) => Ok(None),
+        Err(CoreError::KeychainLocked(m)) => Err(StoreLoadError::KeystoreLocked(m)),
+        Err(e) => Err(StoreLoadError::KeystoreLocked(e.to_string())),
+    }
+}
+
 fn take_lock(path: &Path) -> Result<std::fs::File, StoreError> {
     let mut opts = fs_err::OpenOptions::new();
     opts.read(true).write(true).create(true).truncate(false);
@@ -506,12 +517,20 @@ impl GrantStore {
     // ----------------------------------------------------------------- loading
 
     fn read_master(&self) -> Result<Option<MasterKey>, StoreLoadError> {
-        match self.inner.secrets.get(MASTER_KEY_ENTRY) {
-            Ok(Some(bytes)) => MasterKey::parse(&bytes).map(Some),
-            Ok(None) => Ok(None),
-            Err(CoreError::KeychainLocked(m)) => Err(StoreLoadError::KeystoreLocked(m)),
-            Err(e) => Err(StoreLoadError::KeystoreLocked(e.to_string())),
-        }
+        read_master_from(&*self.inner.secrets)
+    }
+
+    /// The `K_log` a store over `secrets` installs on its log handle (§B.8.13), for a
+    /// process that appends to `sessions.log` without holding the store (the client's
+    /// lines of `tornect connect`): `None` while no `K_master` exists, whose lines are
+    /// untagged. [`StoreLoadError::KeystoreLocked`] when it exists but cannot be read,
+    /// where the store holds its own lines back rather than append them untagged;
+    /// another error for an entry that does not parse, under which the store appends
+    /// untagged.
+    pub fn current_log_key(
+        secrets: &dyn SecretStore,
+    ) -> Result<Option<Zeroizing<[u8; 32]>>, StoreLoadError> {
+        Ok(read_master_from(secrets)?.map(|m| m.k_log()))
     }
 
     fn read_file(&self) -> Result<Option<Vec<u8>>, StoreLoadError> {

@@ -676,15 +676,46 @@ pub enum Logged<'a> {
     Ended(&'a str),
 }
 
-/// Append the client's line for one unattended attempt at `known` (the pin).
+/// Append the client's line for one unattended attempt at `known` (the pin), in a
+/// process that runs no host: [`log_attempt_via`] without a host's store.
 pub fn log_attempt(paths: &Paths, known: &KnownHost, logged: &Logged<'_>) {
-    let mut record = SessionRecord::now(SessionEvent::UnattendedConnect)
+    log_attempt_via(None, paths, known, logged);
+}
+
+/// Append the client's line for one unattended attempt at `known` (the pin). Once
+/// this home holds a `K_master`, every line of `sessions.log` must carry its tag
+/// (§B.8.13), or the host's verifier reads the log as modified at that line. So the
+/// line goes through `host`, the store of the host this process runs (the window),
+/// which tags it, keeps the head and holds it back while the keystore cannot be read,
+/// with one writer on the log; and without one, through a handle of its own keyed as
+/// the store keys its own ([`append_own`]).
+pub fn log_attempt_via(
+    host: Option<&tornect_core::unattended::store::GrantStore>,
+    paths: &Paths,
+    known: &KnownHost,
+    logged: &Logged<'_>,
+) {
+    let record = attempt_record(known, logged);
+    let written = match host {
+        Some(store) => store.log_event(&record).map_err(|e| e.to_string()),
+        None => tornect_core::keystore::FileSecretStore::open(paths.keys_dir())
+            .map_err(|e| e.to_string())
+            .and_then(|secrets| append_own(paths, &secrets, &record)),
+    };
+    if let Err(e) = written {
+        tracing::warn!(error = %e, "the unattended connect was not logged");
+    }
+}
+
+/// The client's line for one unattended attempt at `known`.
+fn attempt_record(known: &KnownHost, logged: &Logged<'_>) -> SessionRecord {
+    let record = SessionRecord::now(SessionEvent::UnattendedConnect)
         .unattended(true)
         .peer(
             DeviceId::from_bytes(known.host_device_pk),
             known.label.clone(),
         );
-    record = match logged {
+    match logged {
         Logged::Session {
             id,
             control,
@@ -706,10 +737,33 @@ pub fn log_attempt(paths: &Paths, known: &KnownHost, logged: &Logged<'_>) {
         }
         Logged::Admin { op, ok } => record.op(*op).ok(*ok).reason("admin"),
         Logged::Ended(reason) => record.reason(*reason),
-    };
-    if let Err(e) = SessionLog::new(paths.sessions_log()).append(&record) {
-        tracing::warn!(error = %e, "the unattended connect was not logged");
     }
+}
+
+/// Append `record` to this home's `sessions.log` through a handle of its own, keyed
+/// with the `K_log` of `secrets` (the keystore the host's store reads, `keys/`), so
+/// that the line verifies as the host's own do: tagged where a `K_master` exists,
+/// untagged where none does or where its entry does not parse, as the store appends
+/// then. Where it exists but cannot be read the line is not written: untagged after
+/// the chain started it would read as tampering at every host start, and this process
+/// has nowhere to hold it until the key can be read, as the host's store does.
+fn append_own(
+    paths: &Paths,
+    secrets: &dyn tornect_core::SecretStore,
+    record: &SessionRecord,
+) -> Result<(), String> {
+    use tornect_core::unattended::codec::StoreLoadError;
+    use tornect_core::unattended::store::GrantStore;
+    let key = match GrantStore::current_log_key(secrets) {
+        Ok(key) => key,
+        Err(StoreLoadError::KeystoreLocked(_)) => {
+            return Err("this home's log key could not be read".to_owned());
+        }
+        Err(_) => None,
+    };
+    let log = SessionLog::new(paths.sessions_log());
+    log.set_log_key(key);
+    log.append(record).map_err(|e| e.to_string())
 }
 
 /// The delete that comes first (C2 step 1, C4), before `hosts.toml` is read; a refusal of
@@ -1360,6 +1414,65 @@ mod tests {
         assert!(lines[1].contains(r#""reason":"password_refused""#));
         assert!(!lines[1].contains("elevation"));
         assert!(lines[2].contains(r#""op":"revoke""#) && lines[2].contains(r#""ok":true"#));
+    }
+
+    /// B13 review: a client line written where no host runs in this process is keyed
+    /// as the host's store keys its own lines: untagged while no `K_master` exists,
+    /// tagged with its `K_log` once one does (the verifier checks every line after the
+    /// chain started), and not written while it exists but cannot be read, where an
+    /// untagged line would read as tampering at every host start.
+    #[test]
+    fn a_line_without_a_host_is_keyed_as_the_store_keys_its_own() {
+        use tornect_core::keystore::{FileSecretStore, SecretStore};
+        use tornect_core::session_log::{line_tag, parse_line_chain};
+        use tornect_core::unattended::codec::{MASTER_KEY_ENTRY, MasterKey};
+
+        /// A keystore whose every read fails (a keychain locked).
+        struct Locked;
+        impl SecretStore for Locked {
+            fn get(&self, _: &str) -> tornect_core::Result<Option<Zeroizing<Vec<u8>>>> {
+                Err(tornect_core::CoreError::KeychainLocked("locked".into()))
+            }
+            fn put(&self, _: &str, _: &[u8]) -> tornect_core::Result<()> {
+                Ok(())
+            }
+            fn delete(&self, _: &str) -> tornect_core::Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let known = KnownHost {
+            label: "Desk".to_owned(),
+            host_device_pk: [7; 32],
+            paired_at: 1,
+            last_seen: 1,
+        };
+        let record = attempt_record(&known, &Logged::Ended("unreachable"));
+        let secrets = FileSecretStore::open(paths.keys_dir()).unwrap();
+        append_own(&paths, &secrets, &record).unwrap();
+        let master = MasterKey::generate().unwrap();
+        secrets.put(MASTER_KEY_ENTRY, &master.to_entry()).unwrap();
+        append_own(&paths, &secrets, &record).unwrap();
+        assert!(append_own(&paths, &Locked, &record).is_err());
+
+        let log = std::fs::read_to_string(paths.sessions_log()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "nothing written while the key is unreadable: {log}"
+        );
+        assert_eq!(parse_line_chain(lines[0]).unwrap().tag, None);
+        let chain = parse_line_chain(lines[1]).unwrap();
+        assert_eq!(
+            chain.tag,
+            Some(line_tag(&master.k_log(), &chain.without_tag)),
+            "{}",
+            lines[1]
+        );
     }
 
     /// A home with a test keychain (the `PasswordVault` seam).
