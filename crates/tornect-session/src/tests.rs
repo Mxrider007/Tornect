@@ -1682,9 +1682,11 @@ async fn run_viewer_hooked(
 }
 
 /// The next `SetQuality` the viewer wrote to the scripted host `host`, past
-/// its pings: the preset's code. Anything else is a failure.
+/// its pings, within [`WAIT`]: the preset's code. Anything else is a failure.
 async fn next_set_quality(host: &mut DuplexStream) -> u8 {
+    let since = tokio::time::Instant::now();
     loop {
+        in_time(since, "a SetQuality");
         match tokio::time::timeout(WAIT, read_msg(host))
             .await
             .expect("a frame in time")
