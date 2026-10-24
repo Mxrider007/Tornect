@@ -44,6 +44,15 @@ pub enum CodecError {
         /// Height.
         h: u32,
     },
+    /// A picture of a size the codec does not take: odd sides, under 2×2, or
+    /// above 3840×2160 either way up.
+    #[error("a {w}x{h} picture cannot be coded here (even sides, at most 3840x2160 either way up)")]
+    PictureSize {
+        /// Width.
+        w: u32,
+        /// Height.
+        h: u32,
+    },
 }
 
 fn h264(e: impl std::fmt::Display) -> CodecError {
