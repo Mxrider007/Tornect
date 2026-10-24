@@ -660,7 +660,7 @@ impl MediaHost {
                 // taken while the write waits and may credit the next picture,
                 // so the window must already hold this one (SLICE-A2 A2-6).
                 // A failed write ends the stream, so nothing is left counted.
-                served.window.sent(seq, len);
+                served.window.sent(seq, len, Instant::now());
                 if let Err(stop) = send(&mut wr, &msg, &mut end, Some(&mut served)).await {
                     torn = stop.torn;
                     break stop.end;
@@ -1110,7 +1110,7 @@ impl Served<'_> {
         };
         match msg {
             Msg::VideoAck { seq } => {
-                if self.window.ack(seq) && self.window.has_room() {
+                if self.window.ack(seq, now).is_some() && self.window.has_room() {
                     self.pipeline.credit();
                 }
             }

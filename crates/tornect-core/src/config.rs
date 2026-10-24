@@ -15,6 +15,9 @@ use crate::error::{CoreError, Result};
 /// Current on-disk config schema version.
 pub const CONFIG_VERSION: u32 = 1;
 
+/// The most `[media] encoder_threads` may ask for: OpenH264 runs at most 4.
+pub const MAX_ENCODER_THREADS: u8 = 4;
+
 /// Top-level configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -73,6 +76,59 @@ pub struct Viewer {
     pub toolbar_hides: ToolbarHides,
     /// The toolbar shows the connection's badge (the frame rate and size).
     pub show_badge: bool,
+    /// The picture quality a session opens with; the stream window's
+    /// Quality menu changes it during a session.
+    pub quality: QualityPreset,
+}
+
+/// The picture quality the viewer asks for (`[viewer] quality = "…"`): the
+/// host maps it to a picture size, a frame rate and a bitrate, each bounded
+/// by its own `[media]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QualityPreset {
+    /// The sharpest picture; needs the fastest link.
+    BestQuality,
+    /// A sharp picture at a steady pace (the default).
+    #[default]
+    Balanced,
+    /// The quickest response; a smaller picture.
+    BestPerformance,
+}
+
+impl QualityPreset {
+    /// Every preset, sharpest first.
+    pub const ALL: [Self; 3] = [Self::BestQuality, Self::Balanced, Self::BestPerformance];
+
+    /// Its name in `config.toml` and on the command line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BestQuality => "best-quality",
+            Self::Balanced => "balanced",
+            Self::BestPerformance => "best-performance",
+        }
+    }
+}
+
+impl std::fmt::Display for QualityPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for QualityPreset {
+    type Err = String;
+
+    /// One of [`QualityPreset::as_str`]'s names, exactly.
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.as_str() == s)
+            .ok_or_else(|| {
+                format!("{s:?} is not a quality: use best-quality, balanced or best-performance")
+            })
+    }
 }
 
 /// How the stream window shows the picture (`[viewer] picture = "…"`).
@@ -204,26 +260,34 @@ pub enum LatencyMode {
     PreferSmoothness,
 }
 
-/// Streaming quality and codec preferences.
+/// Limits on what this computer sends when it is shared: the viewer picks a
+/// quality preset, and these bound every number of it. A limit out of its
+/// range is held to it where it is used, with a warning, so a config that
+/// loaded before still loads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Media {
-    /// Upper bitrate cap for the ABR controller (kbit/s).
+    /// Reserved for the direct route (not used yet), kbit/s.
     pub max_bitrate_kbps: u32,
-    /// Lower bitrate floor before the resolution ladder steps down (kbit/s).
+    /// No preset goes below it, kbit/s.
     pub min_bitrate_kbps: u32,
-    /// Frame-rate cap.
+    /// No preset and no capture exceeds it, frames a second.
     pub max_fps: u32,
-    /// Codec ladder, best first.
+    /// Reserved: not used yet (M3). The codec ladder, best first.
     pub codec_preference: Vec<Codec>,
-    /// Jitter-buffer preference.
+    /// Reserved: not used yet (M3). The jitter-buffer preference.
     pub latency_mode: LatencyMode,
-    /// Bitrate cap when media is relayed through Tor (kbit/s).
+    /// Bitrate of Best quality over Tor; no preset there exceeds it, kbit/s.
     pub tor_fallback_max_kbps: u32,
-    /// Negotiate HDR (HEVC Main10 / AV1 10-bit) when both ends support it.
+    /// Reserved: not used yet (M3). HDR (HEVC Main10 / AV1 10-bit) when
+    /// both ends support it.
     pub hdr: bool,
-    /// Prefer 4:4:4 chroma for text-heavy desktop work when the encoder supports it.
+    /// Reserved: not used yet (M3). 4:4:4 chroma for text-heavy desktop
+    /// work when the encoder supports it.
     pub text_mode_444: bool,
+    /// Encoder threads: 1 (the default) is one thread; 0 picks from this
+    /// computer's cores (one fewer than it has, 1 to 4); 2 to 4 is that many.
+    pub encoder_threads: u8,
 }
 
 /// Host-side safety controls.
@@ -269,6 +333,7 @@ impl Default for Viewer {
             fullscreen_at_open: false,
             toolbar_hides: ToolbarHides::After2_5s,
             show_badge: true,
+            quality: QualityPreset::Balanced,
         }
     }
 }
@@ -317,6 +382,7 @@ impl Default for Media {
             tor_fallback_max_kbps: 4_000,
             hdr: false,
             text_mode_444: false,
+            encoder_threads: 1,
         }
     }
 }
@@ -410,6 +476,12 @@ impl Config {
             return Err(CoreError::ConfigInvalid(format!(
                 "media.max_fps ({}) must be between 1 and 240",
                 m.max_fps
+            )));
+        }
+        if m.encoder_threads > MAX_ENCODER_THREADS {
+            return Err(CoreError::ConfigInvalid(format!(
+                "media.encoder_threads ({}) must be between 0 and {MAX_ENCODER_THREADS}",
+                m.encoder_threads
             )));
         }
         if m.codec_preference.is_empty() {
@@ -652,6 +724,7 @@ panic_key = "Ctrl+Alt+End"
             fullscreen_at_open: false,
             toolbar_hides: ToolbarHides::After2_5s,
             show_badge: true,
+            quality: QualityPreset::Balanced,
         };
         for cfg in [
             Config::default(),
@@ -684,6 +757,7 @@ panic_key = "Ctrl+Alt+End"
                 fullscreen_at_open: true,
                 toolbar_hides: ToolbarHides::Never,
                 show_badge: false,
+                quality: QualityPreset::Balanced,
             }
         );
         let text = toml::to_string_pretty(&chosen).unwrap();
@@ -710,5 +784,75 @@ panic_key = "Ctrl+Alt+End"
         let mut cfg = Config::default();
         cfg.media.min_bitrate_kbps = cfg.media.max_bitrate_kbps + 1;
         assert!(cfg.validate().is_err());
+    }
+
+    /// The quality design §6.1: `[viewer] quality` is written and read in
+    /// kebab-case, every preset round-trips through the file and the command
+    /// line's names, and a name this version does not know is refused (a
+    /// parse error for the file, a message naming the three for the command
+    /// line).
+    #[test]
+    fn the_viewer_quality_round_trips_in_kebab_case() {
+        let names = ["best-quality", "balanced", "best-performance"];
+        assert_eq!(QualityPreset::ALL.map(QualityPreset::as_str), names);
+        for (preset, name) in QualityPreset::ALL.into_iter().zip(names) {
+            let mut cfg = Config::default();
+            cfg.viewer.quality = preset;
+            let text = toml::to_string_pretty(&cfg).unwrap();
+            assert!(text.contains(&format!("quality = \"{name}\"")), "{text}");
+            let back: Config = toml::from_str(&text).unwrap();
+            assert_eq!(back.viewer.quality, preset);
+            assert_eq!(name.parse::<QualityPreset>(), Ok(preset));
+            assert_eq!(preset.to_string(), name);
+        }
+        for bad in ["fast", "Balanced", "best_quality", ""] {
+            let text = format!("[viewer]\nquality = \"{bad}\"\n");
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad:?}");
+            let refused = bad.parse::<QualityPreset>().unwrap_err();
+            assert!(
+                refused.contains("best-quality, balanced or best-performance"),
+                "{refused}"
+            );
+        }
+    }
+
+    /// The quality design §6.1: a config written before the presets loads
+    /// Balanced and one encoder thread; `encoder_threads` takes 0 to 4 and
+    /// nothing else; and no existing key gets a new rule, so a
+    /// `min_bitrate_kbps` above `tor_fallback_max_kbps` still validates (the
+    /// host clamps it where it uses it).
+    #[test]
+    fn the_quality_keys_default_and_only_encoder_threads_is_checked() {
+        let old: Config =
+            toml::from_str("[media]\nmax_fps = 30\n\n[viewer]\nshow_badge = false\n").unwrap();
+        old.validate().unwrap();
+        assert_eq!(old.viewer.quality, QualityPreset::Balanced);
+        assert_eq!(old.media.encoder_threads, 1);
+        assert_eq!(Config::default().media.encoder_threads, 1);
+
+        for threads in 0..=4 {
+            let mut cfg = Config::default();
+            cfg.media.encoder_threads = threads;
+            cfg.validate().unwrap();
+        }
+        for threads in [5, u8::MAX] {
+            let mut cfg = Config::default();
+            cfg.media.encoder_threads = threads;
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(&format!(
+                    "media.encoder_threads ({threads}) must be between 0 and 4"
+                )),
+                "{err}"
+            );
+        }
+
+        let mut cfg = Config::default();
+        cfg.media.min_bitrate_kbps = 5000;
+        assert!(cfg.media.min_bitrate_kbps > cfg.media.tor_fallback_max_kbps);
+        cfg.validate().unwrap();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back, cfg);
     }
 }

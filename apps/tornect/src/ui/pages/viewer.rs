@@ -2019,6 +2019,7 @@ mod tests {
             fullscreen_at_open: true,
             toolbar_hides: ToolbarHides::Never,
             show_badge: false,
+            quality: tornect_core::config::QualityPreset::BestPerformance,
         });
         assert!(w.viewer.one_to_one && w.viewer.fullscreen);
         for at in [0, 3_000, 10_000, 60_000] {

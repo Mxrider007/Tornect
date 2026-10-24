@@ -37,6 +37,7 @@
 pub mod backend;
 pub mod flow;
 pub mod host;
+pub mod quality;
 pub mod viewer;
 
 pub use backend::{DesktopBackend, Source, SystemBackend};
