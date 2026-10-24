@@ -14,9 +14,10 @@
 //!    that squat the slots therefore cannot starve a real viewer (SLICE-C1
 //!    C1-1); how many streams are open at once is the caller's bound (the
 //!    listener's: 4 per circuit).
-//! 2. **Capture.** Only now is the source opened (§B.6). A capture thread makes
-//!    one picture per credit, and credits come from the ack window, so nothing
-//!    is captured that could not be sent.
+//! 2. **Capture.** Only now is the source opened (§B.6), for the host's own
+//!    capture rate ([`SourceRequest`]), whatever preset the viewer named. A
+//!    capture thread makes one picture per credit, and credits come from the
+//!    ack window, so nothing is captured that could not be sent.
 //! 3. **Serve**, until the session ends (the FSM's `on_end`: `BYE`, the kill
 //!    switch, a timeout), the viewer leaves, or something breaks. The viewer's
 //!    frames (input, acks, pings, `Close`) are handled by one code path, also
@@ -25,28 +26,30 @@
 //!    still holds.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Notify, Semaphore, mpsc, watch};
-use tornect_capture::{CaptureError, VideoSource};
-use tornect_codec::scale::{ResolutionCap, Scaler};
-use tornect_codec::{EncoderSettings, H264Encoder, MAX_LONG_SIDE, MAX_SHORT_SIDE};
+use tornect_capture::{CaptureError, Frame, VideoSource};
+use tornect_codec::H264Encoder;
+use tornect_codec::scale::Scaler;
+use tornect_core::config::{Media, QualityPreset};
 use tornect_core::levels::Elevation;
 use tornect_core::session_log::SessionMode;
 use tornect_input::{InputError, InputEvent, InputSink, Tracked};
 use tornect_proto::{
-    BIND_TYPE, MAX_CLIENT_FRAME, Msg, ProtoError, QualityInfo, SESSION_ID_LEN, codec, quality,
-    read_msg_max, reason, video_flags, write_msg,
+    BIND_TYPE, MAX_CLIENT_FRAME, MAX_FRAME, Msg, ProtoError, SESSION_ID_LEN, codec, read_msg_max,
+    reason, video_flags, write_msg,
 };
 use tornect_signal::consent::{SessionToken, mode_code};
 use tornect_signal::fsm::host::{KillSwitch, LiveSession, SessionEnd, SessionSink};
 use tornect_signal::messages::notice;
 
-use crate::flow::{AckWindow, KeyframeLimiter, TokenBucket};
+use crate::flow::{AckWindow, KeyframeLimiter, StageTimes, TokenBucket};
+use crate::quality::{self, QualityCaps, Route, StreamSettings};
 
 /// How often the capture thread checks its stop flag while it waits.
 const POLL: Duration = Duration::from_millis(100);
@@ -64,6 +67,10 @@ const PINGS_PER_SEC: u32 = 5;
 const PING_BURST: u32 = 10;
 /// A `Bind` frame: the type byte, the session id, the MAC, the preset.
 const BIND_LEN: usize = 1 + SESSION_ID_LEN + 32 + 1;
+/// What a `Video` frame adds to its access unit: the type byte, `seq`,
+/// `flags` and `ts_ms`. An access unit longer than `MAX_FRAME` less this
+/// cannot be framed.
+const VIDEO_OVERHEAD: usize = 1 + 4 + 1 + 4;
 
 /// The host's bounds on media streams.
 #[derive(Debug, Clone, Copy)]
@@ -78,9 +85,13 @@ pub struct MediaLimits {
     pub max_waiting: usize,
     /// How long capture may take, after the bind, to deliver its first picture.
     pub first_frame_deadline: Duration,
-    /// Access units in flight before the host waits for a `VideoAck`.
+    /// The most access units in flight before the host waits for a
+    /// `VideoAck`. Each preset's window is derived from its frame rate
+    /// ([`quality::window`]) and held to this.
     pub window_frames: usize,
-    /// Bytes in flight before the host waits for a `VideoAck`.
+    /// The most bytes in flight before the host waits for a `VideoAck`. Each
+    /// preset's window is derived from its bitrate ([`quality::window`]) and
+    /// held to this.
     pub window_bytes: usize,
     /// Input events a control viewer may inject per second, on average.
     /// Releases (key-up, button-up, `ReleaseAll`) do not count and are never
@@ -95,8 +106,14 @@ pub struct MediaLimits {
     /// counted from the last frame read, also while a write to the viewer
     /// waits (slice-G G2-1).
     pub viewer_quiet: Duration,
-    /// The encoder. Its frame rate also paces capture.
-    pub encoder: EncoderSettings,
+    /// The host's bounds on every preset, from its `[media]`
+    /// ([`MediaLimits::with_media`]).
+    pub caps: QualityCaps,
+    /// Least time between two actions on the viewer's quality picks (an
+    /// encoder rebuild, or saying again what applies).
+    pub quality_interval: Duration,
+    /// How often the host sends the viewer its per-stage means (`Stats`).
+    pub stats_every: Duration,
 }
 
 impl Default for MediaLimits {
@@ -105,25 +122,67 @@ impl Default for MediaLimits {
             bind_deadline: Duration::from_secs(10),
             max_waiting: 8,
             first_frame_deadline: Duration::from_secs(10),
-            // At 8, a Tor round trip of 1.0–1.3 s held the test card to 6.3 fps
-            // (live run, 2026-09-21); 15 fps needs about 20 in flight. The byte
-            // cap still bounds what can queue.
-            window_frames: 20,
-            window_bytes: 512 * 1024,
+            // Caps on the derived windows (the quality design §3.1): Best
+            // performance's 20 fps over a 1.5 s span needs 30 in flight, Best
+            // quality's 4 Mbit/s 750 000 bytes. (At 8 in flight, a Tor round
+            // trip of 1.0–1.3 s held the test card to 6.3 fps, live run of
+            // 2026-09-21.)
+            window_frames: 32,
+            window_bytes: 1024 * 1024,
             input_rate: 250,
             input_burst: 500,
             keyframe_interval: Duration::from_secs(1),
             // The viewer pings every second when it has nothing else to say.
             viewer_quiet: Duration::from_secs(3),
-            encoder: EncoderSettings::default(),
+            caps: QualityCaps::default(),
+            quality_interval: Duration::from_secs(2),
+            stats_every: Duration::from_secs(1),
         }
+    }
+}
+
+impl MediaLimits {
+    /// The defaults, with the preset caps of the host's `[media]`. A value
+    /// out of its range is held to it, and said once at warn: the config
+    /// still loads, as it did before the presets.
+    #[must_use]
+    pub fn with_media(media: &Media) -> Self {
+        let (caps, notes) = QualityCaps::from_media(media);
+        for note in &notes {
+            tracing::warn!("{note}");
+        }
+        Self {
+            caps,
+            ..Self::default()
+        }
+    }
+}
+
+/// What a source is opened for ([`MediaBackend::open_source`]). It comes from
+/// the host's config and the stream's route only, never from anything the
+/// viewer sent: every preset opens capture alike, and a preset change never
+/// reopens it.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceRequest {
+    /// The highest rate to capture at ([`quality::capture_fps`]); the
+    /// encoder paces each preset's own, which is never higher.
+    pub max_fps: u32,
+}
+
+impl SourceRequest {
+    /// Capture at `max_fps` at most.
+    #[must_use]
+    pub const fn new(max_fps: u32) -> Self {
+        Self { max_fps }
     }
 }
 
 /// What a bound session captures, and where its input goes. It is asked only
 /// after a verified `Bind`, which is how capture follows the accept (§B.6).
 pub trait MediaBackend: Send + Sync {
-    /// Open the picture source. It may block: it runs on a blocking thread.
+    /// Open the picture source for `request`. It may block: it runs on a
+    /// blocking thread.
     ///
     /// `cancel` turns `true` when the session ends, or its stream is dropped,
     /// before the open is done. The Wayland open waits on the desktop's
@@ -133,6 +192,7 @@ pub trait MediaBackend: Send + Sync {
     /// does not wait ignores it.
     fn open_source(
         &self,
+        request: SourceRequest,
         cancel: watch::Receiver<bool>,
     ) -> Result<Box<dyn VideoSource>, CaptureError>;
 
@@ -390,8 +450,19 @@ impl MediaHost {
         })
     }
 
-    /// Serve one stream accepted on the media port, from its `Bind` to its end.
+    /// Serve one stream accepted on the onion service's media port, from its
+    /// `Bind` to its end: [`Self::serve_on`] over [`Route::Tor`].
     pub async fn serve<S>(&self, stream: S) -> MediaOutcome
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.serve_on(stream, Route::Tor).await
+    }
+
+    /// Serve one stream accepted on `route`'s listener, from its `Bind` to
+    /// its end. The route is the host's: the listener that accepted the
+    /// stream says it, never the viewer.
+    pub async fn serve_on<S>(&self, stream: S, route: Route) -> MediaOutcome
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -399,8 +470,8 @@ impl MediaHost {
         let deadline = tokio::time::Instant::now() + self.limits.bind_deadline;
         // The viewer's preset is read, and a code this version does not know
         // refused with the malformed binds below, before any look-up. It is
-        // not applied: every stream runs `MediaLimits.encoder`
-        // (`applied_quality`).
+        // not applied yet: every stream runs Balanced (the design's step 12
+        // applies it).
         let (session_id, mac, _preset) = match tokio::time::timeout_at(deadline, read_bind(&mut rd))
             .await
         {
@@ -445,7 +516,7 @@ impl MediaHost {
             refuse(&mut wr, reason::BAD_BIND).await;
             return MediaOutcome::NotBound;
         };
-        self.run(session_id, claimed, rd, wr).await
+        self.run(session_id, claimed, route, rd, wr).await
     }
 
     /// Bind `session_id` with `mac`. A session the FSM has not registered yet
@@ -494,6 +565,7 @@ impl MediaHost {
         &self,
         session_id: String,
         claimed: Claimed,
+        route: Route,
         rd: R,
         mut wr: W,
     ) -> MediaOutcome
@@ -511,14 +583,17 @@ impl MediaHost {
         // Capture starts here, after a verified bind (§B.6, decision M1-39).
         // The open's cancel is made before the open, and belongs to it alone:
         // an end that comes before the blocking thread has even started still
-        // reaches it (slice-G G1-1).
+        // reaches it (slice-G G1-1). What it is opened for comes from this
+        // host's config and the route alone, whatever preset the viewer named.
+        let caps = self.limits.caps;
+        let request = SourceRequest::new(quality::capture_fps(route, &caps));
         let (cancel, cancelled) = watch::channel(false);
         let ends_the_open = EndsTheOpen(cancel);
         let backend = Arc::clone(&self.backend);
         let opened = tokio::select! {
             biased;
             _ = end.changed() => None,
-            opened = tokio::task::spawn_blocking(move || backend.open_source(cancelled)) => {
+            opened = tokio::task::spawn_blocking(move || backend.open_source(request, cancelled)) => {
                 Some(opened)
             }
         };
@@ -545,7 +620,15 @@ impl MediaHost {
             self.backend.view_only();
         }
         let source_name = source.name();
-        let mut pipeline = Pipeline::start(source, self.limits.encoder, self.limits.window_frames);
+        // Every stream runs Balanced until the design's step 12 applies the
+        // viewer's preset; its numbers are the host's table under its caps.
+        let initial = quality::settings(QualityPreset::Balanced, route, &caps);
+        let (window_frames, window_bytes) = quality::window(
+            &initial,
+            self.limits.window_frames,
+            self.limits.window_bytes,
+        );
+        let mut pipeline = Pipeline::start(source, initial, route, caps, self.limits.window_frames);
         pipeline.credit();
         let first = tokio::select! {
             biased;
@@ -577,7 +660,7 @@ impl MediaHost {
             height: first.height,
             codec: codec::H264,
             mode: mode_code(mode),
-            quality: applied_quality(&self.limits.encoder),
+            quality: initial.info(),
         };
         if let Err(stop) = send(&mut wr, &bind_ok, &mut end, None).await {
             pipeline.stop().await;
@@ -630,7 +713,7 @@ impl MediaHost {
             pings: TokenBucket::new(PINGS_PER_SEC, PING_BURST, epoch),
             keyframes: KeyframeLimiter::new(self.limits.keyframe_interval),
             pipeline: &mut pipeline,
-            window: AckWindow::new(self.limits.window_frames, self.limits.window_bytes),
+            window: AckWindow::new(window_frames, window_bytes),
             report: MediaReport::default(),
             pong_owed: None,
             session_id: &session_id,
@@ -773,21 +856,6 @@ impl SessionSink for MediaHost {
             session.end.send_replace(Some(reason));
         }
         self.backend.session_ended(session_id);
-    }
-}
-
-/// What every stream applies, said in `BindOk`: `MediaLimits.encoder`'s
-/// frame rate and bitrate (the Balanced preset's) and the codec's own picture
-/// cap, which the pipeline fits every desktop under.
-fn applied_quality(encoder: &EncoderSettings) -> QualityInfo {
-    let edge = |side: u32| u16::try_from(side).unwrap_or(u16::MAX);
-    QualityInfo {
-        preset: quality::BALANCED,
-        // `as` saturates (NaN gives 0); a frame rate under 1 reads as 1.
-        max_fps: (encoder.max_fps as u8).max(1),
-        kbps: (encoder.bitrate_bps / 1000).max(1),
-        max_long: edge(MAX_LONG_SIDE),
-        max_short: edge(MAX_SHORT_SIDE),
     }
 }
 
@@ -1154,9 +1222,9 @@ impl Served<'_> {
             }
             Msg::Pong { .. } => {}
             // Legal in control and view-only sessions alike, and it costs
-            // nothing here: the stream keeps `MediaLimits.encoder`
-            // (`applied_quality`) whatever the viewer picks. Never logged
-            // per message.
+            // nothing here: every stream runs Balanced until the design's
+            // step 12 applies the viewer's pick through the gate. Never
+            // logged per message.
             Msg::SetQuality { .. } => {}
             Msg::Close { .. } => return Handled::End(MediaEnd::ViewerLeft),
             Msg::Bind { .. }
@@ -1206,6 +1274,33 @@ struct Encoded {
     width: u32,
     height: u32,
     captured_at: Instant,
+    /// The captured picture's size, before it was fitted.
+    #[allow(dead_code)] // read by the main loop from the design's step 12
+    source: (u32, u32),
+    /// What each stage took; a repeat has no grab and no age.
+    #[allow(dead_code)] // read by the main loop from the design's step 12
+    times: StageTimes,
+    /// When the encode was done.
+    #[allow(dead_code)] // read by the main loop from the design's step 12
+    ready_at: Instant,
+    /// The last picture encoded again after a quality change: the viewer
+    /// already has it, at another size.
+    #[allow(dead_code)] // read by the main loop from the design's step 12
+    repeat: bool,
+    /// What to say before this picture (`Quality`): set when the settings or
+    /// the encoded size changed since the picture before it. The first
+    /// picture has none unless the settings changed before it (`BindOk`
+    /// says the rest).
+    #[allow(dead_code)] // read by the main loop from the design's step 12
+    announce: Option<Announce>,
+}
+
+/// The settings a picture and those after it are encoded with; its size is
+/// the picture's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)] // read by the main loop from the design's step 12
+struct Announce {
+    settings: StreamSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1229,6 +1324,9 @@ impl PipelineError {
 struct Control {
     stop: AtomicBool,
     keyframe: AtomicBool,
+    /// The preset code to change to (`tornect_proto::quality`); 0 for none.
+    /// The latest wins.
+    quality: AtomicU8,
 }
 
 /// Capture and encoding, on a blocking thread that owns the source: when the
@@ -1243,13 +1341,32 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    fn start(source: Box<dyn VideoSource>, settings: EncoderSettings, depth: usize) -> Self {
+    /// Capture from `source` and encode with `settings`; a quality change
+    /// takes its settings from the table for `route` under `caps`. At most
+    /// `depth` pictures wait to be taken.
+    fn start(
+        source: Box<dyn VideoSource>,
+        settings: StreamSettings,
+        route: Route,
+        caps: QualityCaps,
+        depth: usize,
+    ) -> Self {
         let control = Arc::new(Control::default());
         let (credits, credit_rx) = std::sync::mpsc::channel();
         let (frame_tx, frames) = mpsc::channel(depth.max(1));
         let ctl = Arc::clone(&control);
         let thread = tokio::task::spawn_blocking(move || {
-            encode_loop(source, settings, &credit_rx, &frame_tx, &ctl);
+            encode_loop(
+                source,
+                Settings {
+                    current: settings,
+                    route,
+                    caps,
+                },
+                &credit_rx,
+                &frame_tx,
+                &ctl,
+            );
         });
         Self {
             control,
@@ -1280,6 +1397,17 @@ impl Pipeline {
         self.control.keyframe.store(true, Ordering::SeqCst);
     }
 
+    /// Change to the preset of wire code `code` (`tornect_proto::quality`;
+    /// another code is ignored). The capture thread takes it at its next
+    /// turn, within [`POLL`] while it waits for a picture: a new encoder,
+    /// whose first picture is an IDR, and on a still screen the last picture
+    /// encoded again. The caller bounds how often (the quality gate and the
+    /// keyframe limiter).
+    #[allow(dead_code)] // called by the main loop from the design's step 12
+    fn set_quality(&self, code: u8) {
+        self.control.quality.store(code, Ordering::SeqCst);
+    }
+
     /// Stop, and wait for the capture thread to let go of the source.
     async fn stop(&mut self) {
         self.control.stop.store(true, Ordering::SeqCst);
@@ -1298,21 +1426,40 @@ impl Drop for Pipeline {
     }
 }
 
-/// The capture thread: one picture per credit, paced to the encoder's frame
-/// rate, until told to stop or its channels close. Each desktop is fitted
-/// under the codec's maximum before it is encoded: scaled whole when it is
-/// larger, never cropped, so the picture shows the `shown_region` the
-/// injectors map the viewer's pointer over (`backend.rs`). Each picture's
-/// buffer goes back to the source once it is encoded
-/// (`VideoSource::recycle`).
+/// What the capture thread encodes with, and where a quality change takes
+/// its settings from.
+struct Settings {
+    current: StreamSettings,
+    route: Route,
+    caps: QualityCaps,
+}
+
+/// The time between two pictures at `settings`' frame rate.
+fn interval(settings: &StreamSettings) -> Duration {
+    Duration::from_secs(1) / settings.fps()
+}
+
+/// The capture thread: one picture per credit, paced to the current
+/// settings' frame rate, until told to stop or its channels close. Each
+/// desktop is fitted under the settings' cap before it is encoded: scaled
+/// whole when it is larger, never cropped, so the picture shows the
+/// `shown_region` the injectors map the viewer's pointer over
+/// (`backend.rs`).
+///
+/// The last fresh picture is kept: a quality change, taken on every [`POLL`]
+/// turn while the thread waits for a picture, builds a new encoder and, on a
+/// still screen, encodes that picture again at once (the design's §6.6). Its
+/// buffer goes back to the source (`VideoSource::recycle`) when a newer
+/// picture replaces it. A keyframe request still waits for the next picture,
+/// as before.
 fn encode_loop(
     mut source: Box<dyn VideoSource>,
-    settings: EncoderSettings,
+    mut settings: Settings,
     credits: &std::sync::mpsc::Receiver<()>,
     out: &mpsc::Sender<Result<Encoded, PipelineError>>,
     control: &Control,
 ) {
-    let mut encoder = match H264Encoder::new(settings) {
+    let mut encoder = match H264Encoder::new(settings.current.encoder) {
         Ok(encoder) => encoder,
         Err(e) => {
             let _ = out.blocking_send(Err(PipelineError::Encoder(e.to_string())));
@@ -1320,8 +1467,13 @@ fn encode_loop(
         }
     };
     let mut scaler = Scaler::default();
-    let interval = Duration::from_secs_f32(1.0 / settings.max_fps.max(1.0));
-    let mut last: Option<Instant> = None;
+    // When the last picture was taken, for the pacing.
+    let mut paced: Option<Instant> = None;
+    let mut last: Option<Frame> = None;
+    // The size of the last picture encoded; `None` before the first.
+    let mut size: Option<(u32, u32)> = None;
+    // The settings changed since the last picture encoded.
+    let mut changed = false;
     loop {
         loop {
             if control.stop.load(Ordering::SeqCst) {
@@ -1333,18 +1485,32 @@ fn encode_loop(
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
-        if let Some(due) = last.map(|last| last + interval) {
+        if let Some(due) = paced.map(|at| at + interval(&settings.current)) {
             let now = Instant::now();
             if due > now {
                 std::thread::sleep(due - now);
             }
         }
-        let frame = loop {
+        let (frame, repeat) = loop {
             if control.stop.load(Ordering::SeqCst) {
                 return;
             }
+            if let Some(preset) = quality::preset(control.quality.swap(0, Ordering::SeqCst)) {
+                settings.current = quality::settings(preset, settings.route, &settings.caps);
+                encoder = match H264Encoder::new(settings.current.encoder) {
+                    Ok(encoder) => encoder,
+                    Err(e) => {
+                        let _ = out.blocking_send(Err(PipelineError::Encoder(e.to_string())));
+                        return;
+                    }
+                };
+                changed = true;
+                if let Some(frame) = last.take() {
+                    break (frame, true);
+                }
+            }
             match source.next_frame(POLL) {
-                Ok(Some(frame)) => break frame,
+                Ok(Some(frame)) => break (frame, false),
                 // A damage-driven source had nothing new.
                 Ok(None) => {}
                 Err(e) => {
@@ -1353,26 +1519,63 @@ fn encode_loop(
                 }
             }
         };
-        last = Some(Instant::now());
+        paced = Some(Instant::now());
         if control.keyframe.swap(false, Ordering::SeqCst) {
             encoder.force_keyframe();
         }
-        let encoded = scaler
-            .fit(&frame.bgrx, frame.width, frame.height, ResolutionCap::CODEC)
-            .and_then(|fitted| encoder.encode(fitted.bgrx, fitted.width, fitted.height))
-            .map(|au| {
-                let (width, height) = encoder.size();
-                Encoded {
+        let started = Instant::now();
+        let fitted = scaler
+            .fit(&frame.bgrx, frame.width, frame.height, settings.current.cap)
+            .and_then(|fitted| {
+                let (scale, width, height) = (fitted.took, fitted.width, fitted.height);
+                encoder
+                    .encode(fitted.bgrx, width, height)
+                    .map(|au| (au, scale, width, height))
+            });
+        let encoded = match fitted {
+            Err(e) => Err(PipelineError::Encoder(e.to_string())),
+            // It could not be framed (`Msg::encode` would refuse it): the
+            // stream ends `ENCODER_FAILED` rather than with a broken frame.
+            Ok((au, ..)) if au.data.len() > MAX_FRAME - VIDEO_OVERHEAD => Err(
+                PipelineError::Encoder(format!("access unit too large ({} bytes)", au.data.len())),
+            ),
+            Ok((au, scale, width, height)) => {
+                let resized = size.is_some_and(|size| size != (width, height));
+                size = Some((width, height));
+                let announce = (changed || resized).then_some(Announce {
+                    settings: settings.current,
+                });
+                changed = false;
+                Ok(Encoded {
                     data: au.data,
                     keyframe: au.keyframe,
                     width,
                     height,
                     captured_at: frame.captured_at,
-                }
-            })
-            .map_err(|e| PipelineError::Encoder(e.to_string()));
-        // Encoded: the picture's buffer goes back for the source to fill again.
-        source.recycle(frame.bgrx);
+                    source: (frame.width, frame.height),
+                    times: StageTimes {
+                        // Nothing new was captured for a repeat.
+                        grab: if repeat { Duration::ZERO } else { frame.grab },
+                        age: if repeat {
+                            Duration::ZERO
+                        } else {
+                            started.saturating_duration_since(frame.captured_at)
+                        },
+                        scale,
+                        convert: au.convert,
+                        encode: au.encode,
+                    },
+                    ready_at: Instant::now(),
+                    repeat,
+                    announce,
+                })
+            }
+        };
+        // The picture is kept for a quality change to encode again; the one
+        // it replaces goes back for the source to fill again.
+        if let Some(old) = last.replace(frame) {
+            source.recycle(old.bgrx);
+        }
         let failed = encoded.is_err();
         if out.blocking_send(encoded).is_err() || failed {
             return;
@@ -1493,9 +1696,9 @@ mod tests {
     #[test]
     fn a_bind_carries_the_viewers_preset() {
         for code in [
-            quality::BEST_QUALITY,
-            quality::BALANCED,
-            quality::BEST_PERFORMANCE,
+            tornect_proto::quality::BEST_QUALITY,
+            tornect_proto::quality::BALANCED,
+            tornect_proto::quality::BEST_PERFORMANCE,
         ] {
             let frame = bind(code).encode();
             assert_eq!(frame.len(), 4 + BIND_LEN);
@@ -1528,7 +1731,7 @@ mod tests {
         old.push(BIND_TYPE);
         old.extend_from_slice(b"0123456789abcdef");
         old.extend_from_slice(&[7; 32]);
-        let mut longer = bind(quality::BALANCED).encode();
+        let mut longer = bind(tornect_proto::quality::BALANCED).encode();
         longer[3] += 1;
         longer.push(0);
         for (frame, len) in [(old, 49), (longer, 51)] {
@@ -1563,20 +1766,25 @@ mod tests {
         assert_eq!(at, 4, "refused at its length prefix");
     }
 
-    /// `BindOk`'s `QualityInfo` says what every stream applies: the
-    /// encoder's frame rate and bitrate under the Balanced code, and the
-    /// codec's picture cap; any encoder settings give a `QualityInfo` the
-    /// viewer accepts.
+    /// `BindOk`'s `QualityInfo` says what the stream applies: until the
+    /// design's step 12, Balanced from the host's table under its caps (the
+    /// 1080p cap, 15 fps, 1500 kbit/s); and any settings, even ones out of
+    /// every range, give a `QualityInfo` the viewer accepts.
     #[test]
     fn bind_ok_says_what_the_stream_applies() {
+        let applied = quality::settings(
+            QualityPreset::Balanced,
+            Route::Tor,
+            &MediaLimits::default().caps,
+        );
         assert_eq!(
-            applied_quality(&EncoderSettings::default()),
-            QualityInfo {
-                preset: quality::BALANCED,
+            applied.info(),
+            tornect_proto::QualityInfo {
+                preset: tornect_proto::quality::BALANCED,
                 max_fps: 15,
                 kbps: 1500,
-                max_long: 3840,
-                max_short: 2160,
+                max_long: 1920,
+                max_short: 1080,
             }
         );
         for (max_fps, bitrate_bps, fps, kbps) in [
@@ -1584,11 +1792,15 @@ mod tests {
             (f32::NAN, 0, 1, 1),
             (1000.0, u32::MAX, 255, u32::MAX / 1000),
         ] {
-            let info = applied_quality(&EncoderSettings {
-                max_fps,
-                bitrate_bps,
-                ..EncoderSettings::default()
-            });
+            let info = StreamSettings {
+                encoder: tornect_codec::EncoderSettings {
+                    max_fps,
+                    bitrate_bps,
+                    ..applied.encoder
+                },
+                ..applied
+            }
+            .info();
             assert_eq!((info.max_fps, info.kbps), (fps, kbps));
             let ok = Msg::BindOk {
                 width: 1,
@@ -1599,5 +1811,321 @@ mod tests {
             };
             assert_eq!(Msg::decode(&ok.encode()[4..]).unwrap(), ok);
         }
+    }
+
+    /// `[media]` reaches the presets through `with_media`: its caps, each
+    /// value out of range held (and logged once at warn, with the note's
+    /// text), every other limit the default.
+    #[test]
+    fn the_limits_take_their_caps_from_the_media_config() {
+        let media = Media {
+            max_fps: 10,
+            min_bitrate_kbps: 5000,
+            encoder_threads: 2,
+            ..Media::default()
+        };
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let limits = tracing::subscriber::with_default(Lines(Arc::clone(&lines)), || {
+            MediaLimits::with_media(&media)
+        });
+        assert_eq!(
+            limits.caps,
+            QualityCaps {
+                max_fps: 10,
+                tor_max_kbps: 4000,
+                min_kbps: 4000,
+                encoder_threads: 2,
+            }
+        );
+        assert_eq!(
+            *lines.lock().unwrap(),
+            [
+                "media.min_bitrate_kbps (5000) is above media.tor_fallback_max_kbps (4000): \
+              presets use 4000"
+            ]
+        );
+        let defaults = MediaLimits::default();
+        assert_eq!(
+            (limits.window_frames, limits.window_bytes),
+            (defaults.window_frames, defaults.window_bytes)
+        );
+        assert_eq!(
+            (defaults.window_frames, defaults.window_bytes),
+            (32, 1 << 20)
+        );
+        assert_eq!(
+            (limits.quality_interval, limits.stats_every),
+            (Duration::from_secs(2), Duration::from_secs(1))
+        );
+        assert_eq!(
+            MediaLimits::with_media(&Media::default()).caps,
+            defaults.caps
+        );
+    }
+
+    /// The longest access unit a `Video` frame carries: one byte more and the
+    /// frame would be over `MAX_FRAME`, which the viewer refuses; the
+    /// pipeline ends the stream `ENCODER_FAILED` above it instead.
+    #[tokio::test]
+    async fn the_access_unit_bound_is_the_longest_video_frame() {
+        let longest = MAX_FRAME - VIDEO_OVERHEAD;
+        let video = |len: usize| Msg::Video {
+            seq: 1,
+            flags: video_flags::KEYFRAME,
+            ts_ms: 2,
+            data: vec![0x5a; len],
+        };
+        let frame = video(longest).encode();
+        assert_eq!(frame.len(), 4 + MAX_FRAME);
+        let read = tornect_proto::read_msg(&mut frame.as_slice())
+            .await
+            .unwrap();
+        assert_eq!(read, Some(video(longest)));
+        let mut over = (u32::try_from(MAX_FRAME).unwrap() + 1)
+            .to_be_bytes()
+            .to_vec();
+        over.push(0x10);
+        assert!(matches!(
+            tornect_proto::read_msg(&mut over.as_slice()).await,
+            Err(ProtoError::Size(_))
+        ));
+        assert_eq!(
+            PipelineError::Encoder("access unit too large".into()).reason(),
+            reason::ENCODER_FAILED
+        );
+    }
+
+    /// Pictures of the sizes queued, then nothing (a still screen); counts
+    /// the buffers given back.
+    struct Script {
+        sizes: Arc<Mutex<std::collections::VecDeque<(u32, u32)>>>,
+        index: u32,
+        recycled: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl VideoSource for Script {
+        fn name(&self) -> &'static str {
+            "script"
+        }
+
+        fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+            let Some((width, height)) = self.sizes.lock().unwrap().pop_front() else {
+                std::thread::sleep(timeout);
+                return Ok(None);
+            };
+            self.index += 1;
+            Ok(Some(Frame {
+                width,
+                height,
+                bgrx: tornect_capture::TestCard::render(width, height, self.index),
+                captured_at: Instant::now(),
+                grab: Duration::from_micros(700),
+            }))
+        }
+
+        fn recycle(&mut self, bgrx: Vec<u8>) {
+            self.recycled.lock().unwrap().push(bgrx.len());
+        }
+    }
+
+    /// A pipeline over a [`Script`] at Balanced: the queue of sizes it will
+    /// capture, and the lengths of the buffers it gave back.
+    type Scripted = (
+        Pipeline,
+        Arc<Mutex<std::collections::VecDeque<(u32, u32)>>>,
+        Arc<Mutex<Vec<usize>>>,
+    );
+
+    fn scripted(sizes: &[(u32, u32)]) -> Scripted {
+        let queue = Arc::new(Mutex::new(sizes.iter().copied().collect()));
+        let recycled = Arc::new(Mutex::new(Vec::new()));
+        let source = Script {
+            sizes: Arc::clone(&queue),
+            index: 0,
+            recycled: Arc::clone(&recycled),
+        };
+        let caps = QualityCaps::default();
+        let initial = quality::settings(QualityPreset::Balanced, Route::Tor, &caps);
+        let pipeline = Pipeline::start(Box::new(source), initial, Route::Tor, caps, 4);
+        (pipeline, queue, recycled)
+    }
+
+    /// The next picture, after a credit.
+    async fn picture(pipeline: &mut Pipeline) -> Encoded {
+        pipeline.credit();
+        tokio::time::timeout(Duration::from_secs(10), pipeline.next())
+            .await
+            .expect("a picture in time")
+            .expect("the pipeline runs")
+            .expect("encoded")
+    }
+
+    /// No picture within `wait` of a credit.
+    async fn no_picture(pipeline: &mut Pipeline, wait: Duration) {
+        pipeline.credit();
+        assert!(
+            tokio::time::timeout(wait, pipeline.next()).await.is_err(),
+            "a picture came"
+        );
+    }
+
+    fn decoded_size(au: &[u8]) -> (u32, u32) {
+        let mut decoder = tornect_codec::H264Decoder::new().unwrap();
+        let frame = decoder.decode(au).unwrap().expect("a picture");
+        (frame.width, frame.height)
+    }
+
+    /// The design §6.6 step 2 on a still screen: a quality change is taken
+    /// while the thread waits for a picture, and the last picture is encoded
+    /// again at once with a new encoder: an IDR at the new preset's size,
+    /// announced with its settings, the same capture (no grab, no age), and
+    /// decoded at that size. Back to Balanced, the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_quality_change_on_a_still_screen_encodes_the_last_picture_again() {
+        let (mut pipeline, _, recycled) = scripted(&[(1920, 1080)]);
+        let first = picture(&mut pipeline).await;
+        assert!(first.keyframe && !first.repeat);
+        assert!(first.announce.is_none(), "BindOk says the first");
+        assert_eq!((first.width, first.height), (1920, 1080));
+        assert_eq!(first.source, (1920, 1080));
+        assert_eq!(first.times.grab, Duration::from_micros(700));
+        no_picture(&mut pipeline, Duration::from_millis(300)).await;
+
+        let caps = QualityCaps::default();
+        let asked = Instant::now();
+        pipeline.set_quality(tornect_proto::quality::BEST_PERFORMANCE);
+        let again = tokio::time::timeout(Duration::from_secs(10), pipeline.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            asked.elapsed() < POLL + Duration::from_millis(500),
+            "taken within a poll: {:?}",
+            asked.elapsed()
+        );
+        assert!(again.repeat && again.keyframe);
+        assert_eq!((again.width, again.height), (1280, 720));
+        assert_eq!(again.source, (1920, 1080));
+        assert_eq!(again.captured_at, first.captured_at, "the same capture");
+        assert_eq!(
+            (again.times.grab, again.times.age),
+            (Duration::ZERO, Duration::ZERO)
+        );
+        let best_performance = quality::settings(QualityPreset::BestPerformance, Route::Tor, &caps);
+        assert_eq!(
+            again.announce,
+            Some(Announce {
+                settings: best_performance
+            })
+        );
+        assert_eq!(decoded_size(&again.data), (1280, 720));
+
+        pipeline.set_quality(tornect_proto::quality::BALANCED);
+        let back = picture(&mut pipeline).await;
+        assert!(back.repeat && back.keyframe);
+        assert_eq!((back.width, back.height), (1920, 1080));
+        assert_eq!(
+            back.announce.map(|a| a.settings.preset),
+            Some(QualityPreset::Balanced)
+        );
+        assert_eq!(decoded_size(&back.data), (1920, 1080));
+        assert!(
+            recycled.lock().unwrap().is_empty(),
+            "the one picture is kept, never given back while it is the last"
+        );
+        pipeline.stop().await;
+    }
+
+    /// A change taken before any picture applies to the first one, which
+    /// then carries it; a code no preset has changes nothing (no new
+    /// encoder, no picture on a still screen); a keyframe request on a still
+    /// screen waits for the next picture, as before the presets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_known_preset_changes_the_encoder() {
+        let (mut pipeline, queue, _) = scripted(&[]);
+        pipeline.set_quality(tornect_proto::quality::BEST_QUALITY);
+        no_picture(&mut pipeline, Duration::from_millis(300)).await;
+        queue.lock().unwrap().push_back((640, 360));
+        let first = tokio::time::timeout(Duration::from_secs(10), pipeline.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!first.repeat && first.keyframe);
+        assert_eq!(
+            first.announce.map(|a| a.settings.preset),
+            Some(QualityPreset::BestQuality),
+            "changed before the first picture"
+        );
+
+        for code in [0, 4, 9, 255] {
+            pipeline.set_quality(code);
+            no_picture(&mut pipeline, Duration::from_millis(250)).await;
+        }
+        pipeline.force_keyframe();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), pipeline.next())
+                .await
+                .is_err(),
+            "a keyframe request on a still screen waits for a picture"
+        );
+        queue.lock().unwrap().push_back((640, 360));
+        let next = tokio::time::timeout(Duration::from_secs(10), pipeline.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!next.repeat && next.keyframe, "the forced keyframe");
+        assert!(next.announce.is_none(), "nothing changed");
+        pipeline.stop().await;
+    }
+
+    /// A source that changes size is announced at its first picture of the
+    /// new size, with the settings in force, and only then; each picture's
+    /// buffer goes back when a newer one replaces it, never the last.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_source_resize_is_announced_and_replaced_pictures_go_back() {
+        let sizes = [(640, 360), (640, 360), (800, 600), (800, 600), (2560, 1440)];
+        let (mut pipeline, _, recycled) = scripted(&sizes);
+        let mut seen = Vec::new();
+        for _ in sizes {
+            let p = picture(&mut pipeline).await;
+            assert!(!p.repeat);
+            seen.push((
+                (p.width, p.height),
+                p.announce.map(|a| a.settings.preset),
+                p.keyframe,
+            ));
+        }
+        let bal = Some(QualityPreset::Balanced);
+        assert_eq!(
+            seen,
+            [
+                ((640, 360), None, true),
+                ((640, 360), None, false),
+                ((800, 600), bal, true),
+                ((800, 600), None, false),
+                // Scaled under Balanced's 1080p cap: a new encoded size.
+                ((1920, 1080), bal, true),
+            ]
+        );
+        assert_eq!(
+            *recycled.lock().unwrap(),
+            [640 * 360 * 4, 640 * 360 * 4, 800 * 600 * 4, 800 * 600 * 4],
+            "every picture but the last given back, in order"
+        );
+        pipeline.stop().await;
+    }
+
+    /// Pacing follows the settings in force: Balanced's 15 fps, Best
+    /// performance's 20, Best quality's 12.
+    #[test]
+    fn pictures_are_paced_at_the_current_presets_rate() {
+        let caps = QualityCaps::default();
+        let ms = |p| interval(&quality::settings(p, Route::Tor, &caps)).as_micros();
+        assert_eq!(ms(QualityPreset::Balanced), 66_666);
+        assert_eq!(ms(QualityPreset::BestPerformance), 50_000);
+        assert_eq!(ms(QualityPreset::BestQuality), 83_333);
     }
 }

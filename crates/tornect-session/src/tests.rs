@@ -38,14 +38,16 @@ use crate::*;
 
 const WAIT: Duration = Duration::from_secs(10);
 const KEY_A: u32 = 0x07_0004;
-/// What a host applies to every stream (`host.rs` `applied_quality`), and
-/// what the scripted hosts here say in their `BindOk`.
+/// What a host applies to every stream until the design's step 12 applies
+/// the viewer's pick (Balanced from the table under the default caps: the
+/// 1080p cap, 15 fps, 1500 kbit/s), and what the scripted hosts here say in
+/// their `BindOk`.
 const APPLIED: QualityInfo = QualityInfo {
     preset: quality::BALANCED,
     max_fps: 15,
     kbps: 1500,
-    max_long: 3840,
-    max_short: 2160,
+    max_long: 1920,
+    max_short: 1080,
 };
 
 /// A test card that says when it was closed.
@@ -126,6 +128,8 @@ struct TestBackend {
     /// The source the open returns instead of the card, taken by the first
     /// open.
     desktop: Mutex<Option<Box<dyn VideoSource>>>,
+    /// What each open was asked for, in order.
+    requests: Mutex<Vec<SourceRequest>>,
 }
 
 /// The desktop's dialog: up until `cancel` turns `true` (then `true`), or for
@@ -144,9 +148,11 @@ fn dialog(cancel: &tokio::sync::watch::Receiver<bool>) -> bool {
 impl MediaBackend for TestBackend {
     fn open_source(
         &self,
+        request: SourceRequest,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Box<dyn VideoSource>, CaptureError> {
         self.sources.fetch_add(1, Ordering::SeqCst);
+        self.requests.lock().unwrap().push(request);
         if self.fail {
             return Err(CaptureError::Unavailable("no screen here".into()));
         }
@@ -422,9 +428,11 @@ async fn the_test_card_reaches_the_viewer_in_order() {
     );
 }
 
-/// Every picture's buffer goes back to its source once it is encoded, so a
-/// source that paints or packs into a buffer given back allocates no memory
-/// per picture.
+/// Every picture's buffer goes back to its source once a newer picture
+/// replaces it, so a source that paints or packs into a buffer given back
+/// allocates no memory per picture. The last one is kept, for a quality
+/// change to encode again on a still screen (the design §6.6), and goes with
+/// the source.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_picture_buffer_goes_back_to_the_source() {
     let rig = rig(MediaLimits::default());
@@ -445,7 +453,7 @@ async fn each_picture_buffer_goes_back_to_the_source() {
     assert!(report.frames_sent >= 5);
     let recycled = rig.backend.recycled.load(Ordering::SeqCst) as u64;
     assert!(
-        recycled >= report.frames_sent,
+        recycled + 1 >= report.frames_sent,
         "{recycled} buffers back for {} pictures sent",
         report.frames_sent
     );
@@ -513,7 +521,9 @@ impl FrameSink for FirstPicture {
 /// picture shows exactly the `shown_region` the injectors map the pointer
 /// over: the right screen reaches the picture's right edge, and the odd last
 /// column and row never reach it. `BindOk` and the sharing indicator give
-/// the scaled size.
+/// the scaled size. The stream runs Balanced until the design's step 12
+/// applies the viewer's pick, so the cap is Balanced's 1920×1080 (Best
+/// quality's is the codec's own).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_desktop_above_the_codec_maximum_is_scaled_whole() {
     let backend = TestBackend {
@@ -526,9 +536,12 @@ async fn a_desktop_above_the_codec_maximum_is_scaled_whole() {
     let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
     let (rw, rh) = tornect_codec::scale::shown_region(TwoScreens::SIZE.0, TwoScreens::SIZE.1);
     assert_eq!((rw, rh), (7680, 2160));
-    let picture =
-        tornect_codec::scale::picture_size((rw, rh), tornect_codec::scale::ResolutionCap::CODEC);
-    assert_eq!(picture, (3840, 1080), "half of the region either way");
+    let cap = tornect_codec::scale::ResolutionCap::new(
+        u32::from(APPLIED.max_long),
+        u32::from(APPLIED.max_short),
+    );
+    let picture = tornect_codec::scale::picture_size((rw, rh), cap);
+    assert_eq!(picture, (1920, 540), "a quarter of the region either way");
     assert_eq!(
         (viewer.bound().width, viewer.bound().height),
         picture,
@@ -576,7 +589,7 @@ async fn a_desktop_above_the_codec_maximum_is_scaled_whole() {
     assert_eq!(
         rig.seen.lines(),
         [
-            "started two screens 3840x1080 ViewOnly input=false",
+            "started two screens 1920x540 ViewOnly input=false",
             "stopped ViewerLeft"
         ]
     );
@@ -878,7 +891,10 @@ async fn a_key_held_by_a_viewer_that_goes_quiet_is_released() {
 
 /// A control session over a [`connect_narrow`] pipe, with an ack window that
 /// never fills, whose viewer pressed `KEY_A` and then stopped reading: from
-/// then on the host's picture write waits for good.
+/// then on the host's picture write waits for good. (The caps are far above
+/// the window the stream derives, 23 units for Balanced, and the viewer reads
+/// at most 3 pictures before it stops: the write stalls on the pipe, never
+/// on the window.)
 async fn press_then_stop_reading(
     seed: u8,
     viewer_quiet: Duration,
@@ -1581,6 +1597,7 @@ impl GatedOpen {
 impl MediaBackend for GatedOpen {
     fn open_source(
         &self,
+        _: SourceRequest,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Box<dyn VideoSource>, CaptureError> {
         self.entered.store(true, Ordering::SeqCst);
@@ -2091,6 +2108,46 @@ async fn a_bind_of_each_preset_gets_what_the_stream_applies() {
         assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
     }
     assert_eq!(rig.backend.sources.load(Ordering::SeqCst), 3);
+}
+
+/// The quality design §5 rule 1 (step 11): a source is opened for the
+/// fastest preset's rate on the route, held to the host's `max_fps`: from
+/// the host's config and the route alone, so binds naming different presets
+/// make identical requests. `serve_on` with the Tor route serves as `serve`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_source_is_opened_at_the_hosts_capture_rate_whatever_the_preset() {
+    for (max_fps, want) in [(60, 20), (10, 10)] {
+        let rig = rig(MediaLimits {
+            caps: crate::quality::QualityCaps {
+                max_fps,
+                ..crate::quality::QualityCaps::default()
+            },
+            ..MediaLimits::default()
+        });
+        for (seed, preset) in [(45, quality::BEST_QUALITY), (46, quality::BEST_PERFORMANCE)] {
+            let (_, binding) = start(&rig.host, seed, SessionMode::Control);
+            let (mut client, server) = duplex(1 << 20);
+            let host = Arc::clone(&rig.host);
+            let served =
+                tokio::spawn(
+                    async move { host.serve_on(server, crate::quality::Route::Tor).await },
+                );
+            write_msg(&mut client, &bind_with(&binding, preset))
+                .await
+                .unwrap();
+            assert!(matches!(
+                read_msg(&mut client).await.unwrap(),
+                Some(Msg::BindOk { .. })
+            ));
+            drop(client);
+            assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
+        }
+        assert_eq!(
+            *rig.backend.requests.lock().unwrap(),
+            [SourceRequest::new(want); 2],
+            "max_fps {max_fps}"
+        );
+    }
 }
 
 /// The quality design §8 host test 2: a `Bind` naming a preset this version

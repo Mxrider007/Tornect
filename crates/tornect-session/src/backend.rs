@@ -11,11 +11,18 @@ use tokio::sync::watch;
 use tornect_capture::{CaptureError, TestCard, VideoSource};
 use tornect_input::InputSink;
 
-use crate::host::MediaBackend;
+use crate::host::{MediaBackend, SourceRequest};
 
 /// Size and rate of the shared test card: enough for the index strip to
-/// survive the encoder, small enough for a Tor circuit.
+/// survive the encoder, small enough for a Tor circuit. The rate is held to
+/// the request's ([`card_fps`]).
 const CARD: (u32, u32, u32) = (1280, 720, 15);
+
+/// The test card's rate for `request`: its own, never above the request's,
+/// at least 1.
+fn card_fps(request: SourceRequest) -> u32 {
+    CARD.2.min(request.max_fps).max(1)
+}
 
 /// What a host shares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -77,15 +84,18 @@ impl SystemBackend {
 impl MediaBackend for SystemBackend {
     /// On Wayland `cancel` ends the wait on the desktop's dialog: the portal
     /// session is closed, which takes the dialog down, and no restore token is
-    /// kept for a session that is over. The other sources do not wait.
+    /// kept for a session that is over. The other sources do not wait. The
+    /// card runs at most at `request`'s rate; the desktop sources deliver at
+    /// their own (the encoder paces them).
     fn open_source(
         &self,
+        request: SourceRequest,
         cancel: watch::Receiver<bool>,
     ) -> Result<Box<dyn VideoSource>, CaptureError> {
         match self.source {
             Source::TestCard => {
-                let (width, height, fps) = CARD;
-                Ok(Box::new(TestCard::new(width, height, fps)))
+                let (width, height, _) = CARD;
+                Ok(Box::new(TestCard::new(width, height, card_fps(request))))
             }
             Source::Desktop => self.desktop_source(cancel),
         }
@@ -365,11 +375,39 @@ mod tests {
     #[test]
     fn the_test_card_shares_a_card_and_injects_nothing() {
         let backend = SystemBackend::new(Source::TestCard);
-        let mut source = backend.open_source(watch::channel(false).1).unwrap();
+        let mut source = backend
+            .open_source(SourceRequest::new(20), watch::channel(false).1)
+            .unwrap();
         assert_eq!(source.name(), "synthetic");
         let frame = source.next_frame(Duration::from_secs(1)).unwrap().unwrap();
         assert_eq!((frame.width, frame.height), (CARD.0, CARD.1));
         assert!(backend.open_injector().is_none());
+    }
+
+    /// The card runs at its own 15 fps under the host's capture rate (20 on
+    /// Tor), and at the request's when that is lower: at 2 fps no second
+    /// picture comes within 100 ms, at 15 one comes within the second.
+    #[test]
+    fn the_test_card_runs_at_most_at_the_requested_rate() {
+        assert_eq!(card_fps(SourceRequest::new(20)), 15);
+        assert_eq!(card_fps(SourceRequest::new(15)), 15);
+        assert_eq!(card_fps(SourceRequest::new(2)), 2);
+        assert_eq!(card_fps(SourceRequest::new(0)), 1);
+        let backend = SystemBackend::new(Source::TestCard);
+        let mut slow = backend
+            .open_source(SourceRequest::new(2), watch::channel(false).1)
+            .unwrap();
+        assert!(slow.next_frame(Duration::from_secs(1)).unwrap().is_some());
+        assert!(
+            slow.next_frame(Duration::from_millis(100))
+                .unwrap()
+                .is_none()
+        );
+        let mut card = backend
+            .open_source(SourceRequest::new(20), watch::channel(false).1)
+            .unwrap();
+        assert!(card.next_frame(Duration::from_secs(1)).unwrap().is_some());
+        assert!(card.next_frame(Duration::from_secs(1)).unwrap().is_some());
     }
 
     /// A Wayland session shares through the portal; every other session type
@@ -418,7 +456,9 @@ mod tests {
         if desktop_for(session_type().as_deref()) == Desktop::Wayland {
             return;
         }
-        match SystemBackend::new(Source::Desktop).open_source(watch::channel(false).1) {
+        match SystemBackend::new(Source::Desktop)
+            .open_source(SourceRequest::new(20), watch::channel(false).1)
+        {
             Ok(source) => assert_eq!(source.name(), "x11"),
             Err(CaptureError::Unavailable(why)) => assert!(!why.is_empty()),
             Err(e) => panic!("{e}"),
@@ -446,7 +486,7 @@ mod tests {
         if std::env::var_os(CHILD).is_some() {
             let backend = SystemBackend::new(Source::Desktop);
             let refused = backend
-                .open_source(watch::channel(false).1)
+                .open_source(SourceRequest::new(20), watch::channel(false).1)
                 .err()
                 .expect("captured another machine's display");
             assert!(

@@ -542,9 +542,10 @@ impl AdminBackend {
 impl MediaBackend for AdminBackend {
     fn open_source(
         &self,
+        request: tornect_session::SourceRequest,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Box<dyn tornect_capture::VideoSource>, tornect_capture::CaptureError> {
-        self.inner.open_source(cancel)
+        self.inner.open_source(request, cancel)
     }
 
     fn open_injector(&self) -> Option<Box<dyn InputSink>> {
@@ -915,11 +916,16 @@ mod tests {
     struct Inner(Recording);
 
     impl MediaBackend for Inner {
+        /// Refuses, naming the rate it was asked for.
         fn open_source(
             &self,
+            request: tornect_session::SourceRequest,
             _: tokio::sync::watch::Receiver<bool>,
         ) -> Result<Box<dyn tornect_capture::VideoSource>, tornect_capture::CaptureError> {
-            Err(tornect_capture::CaptureError::Unavailable("test".into()))
+            Err(tornect_capture::CaptureError::Unavailable(format!(
+                "test at {} fps",
+                request.max_fps
+            )))
         }
 
         fn open_injector(&self) -> Option<Box<dyn InputSink>> {
@@ -981,6 +987,22 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         panic!("timed out");
+    }
+
+    /// Capture is the inner backend's, opened for what the media host asked
+    /// (the quality design's `SourceRequest`): the helper only ever injects.
+    #[test]
+    fn the_source_is_the_inner_backends_for_the_same_request() {
+        let rig = rig();
+        let refused = rig
+            .backend
+            .open_source(
+                tornect_session::SourceRequest::new(17),
+                tokio::sync::watch::channel(false).1,
+            )
+            .err()
+            .expect("the inner backend refuses");
+        assert_eq!(refused.to_string(), "capture unavailable: test at 17 fps");
     }
 
     /// The fake pipe end to end: an attached helper becomes the injector of

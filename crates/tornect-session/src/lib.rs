@@ -27,6 +27,7 @@
 //! | the viewer sizes pictures from what it decodes, never from `BindOk` | [`FrameSink::picture`] |
 //! | everything held is released when the session ends | `tornect_input::Tracked`, dropped on every exit path |
 //! | a keyframe after a decode error | [`MediaViewer`]; the host bounds the rate with [`flow::KeyframeLimiter`] |
+//! | capture opens at the host's own rate, whatever preset the viewer names (the quality design §5) | [`SourceRequest`], [`quality::capture_fps`] |
 //!
 //! Consent gating is structural. A media stream is served only for a session
 //! the FSM accepted, and only to a peer that holds that session's token.
@@ -43,7 +44,7 @@ pub mod viewer;
 pub use backend::{DesktopBackend, Source, SystemBackend};
 pub use host::{
     CaptureStarted, MediaBackend, MediaEnd, MediaHost, MediaLimits, MediaObserver, MediaOutcome,
-    MediaReport, NoObserver,
+    MediaReport, NoObserver, SourceRequest,
 };
 pub use viewer::{
     Binding, BoundStream, FrameSink, MediaViewer, ViewerEnd, ViewerError, ViewerStats,
