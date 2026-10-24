@@ -51,15 +51,22 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the CLI waits for the host's answer to one request.
 ///
 /// It must outlast the slowest thing a handler does, which is an OS
-/// re-authentication dialog (`reauth::PolkitReAuth::DIALOG_TIMEOUT`, 120 s),
-/// plus a margin. Waiting only [`IDLE_TIMEOUT`] let the host apply an op — and,
-/// for `On`, rotate in a stop code nobody saw — after the CLI had already told
-/// the owner it failed (track D S1).
+/// re-authentication dialog (`reauth::PolkitReAuth::DIALOG_TIMEOUT` and
+/// [`crate::reauth::WindowsReAuth::DIALOG_TIMEOUT`], 120 s each), plus a
+/// margin. Waiting only [`IDLE_TIMEOUT`] let the host apply an op — and, for
+/// `On`, rotate in a stop code nobody saw — after the CLI had already told the
+/// owner it failed (track D S1); so did a Windows dialog with no bound at all
+/// (audit B18).
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(150);
 
 #[cfg(target_os = "linux")]
 const _: () = assert!(
     RESPONSE_TIMEOUT.as_secs() >= crate::reauth::PolkitReAuth::DIALOG_TIMEOUT.as_secs() + 20,
+    "the CLI must keep waiting for as long as a re-authentication dialog can stay open"
+);
+
+const _: () = assert!(
+    RESPONSE_TIMEOUT.as_secs() >= crate::reauth::WindowsReAuth::DIALOG_TIMEOUT.as_secs() + 20,
     "the CLI must keep waiting for as long as a re-authentication dialog can stay open"
 );
 
