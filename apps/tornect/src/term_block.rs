@@ -488,9 +488,10 @@ mod tests {
             matches!(outcome, Ok(Ok(BlockOutcome::Blocked))),
             "the window took the line: {outcome:?}"
         );
-        // the terminal is the questions' again
+        // the terminal is the questions' again, once the question is armed
         let next = ask("PAIRING REQUEST: again");
         settle().await;
+        tokio::time::sleep(crate::prompt::ARM_AFTER).await;
         typed.send("yes".to_owned()).await.unwrap();
         assert_eq!(next.await.unwrap().as_deref(), Some("yes"));
     }
