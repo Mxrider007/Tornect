@@ -8,9 +8,11 @@
 //!   thread, with its own message loop, that ignores injected events
 //!   (`LLKHF_INJECTED`, `LLKHF_LOWER_IL_INJECTED`): only physical keys press
 //!   it. A modifier the hook saw go down counts only while the system's key
-//!   state still has it down (the `Modifiers` state), so one let go on the
-//!   secure desktop never lingers. The hook only signals; a second thread calls
-//!   `pressed`, so the hook returns at once (NEEDS-DEVICE(windows)).
+//!   state still has it down (the `Modifiers` state), and every switch of
+//!   the input desktop forgets them (`EVENT_SYSTEM_DESKTOPSWITCH`), so one
+//!   let go on the secure desktop never lingers. The hook only signals; a
+//!   second thread calls `pressed`, so the hook returns at once
+//!   (NEEDS-DEVICE(windows)).
 //! - **Linux**: the GlobalShortcuts portal of xdg-desktop-portal (through
 //!   `ashpd`) where the desktop offers it: the chord is the shortcut's
 //!   preferred trigger, and the desktop may ask the person to confirm or
@@ -188,11 +190,16 @@ impl KeyState {
 /// still has it down; one the system has up is forgotten.
 ///
 /// Only physical keys press the panic key: injected events never make a
-/// modifier count. They do move the system's key state, though, so an
-/// injected key-up can make it say "up" for a key someone holds; after an
-/// injected event of a modifier, what the hook saw stands until that
-/// modifier's next physical event, and a remote viewer's injected input can
-/// neither press nor hold off the panic key.
+/// modifier count by themselves. They do move the system's key state,
+/// though, so an injected key-up can make it say "up" for a key someone
+/// holds; after an injected event of a modifier, what the hook saw stands
+/// until that modifier's next physical event, so a remote viewer's injected
+/// key-ups cannot hold the panic key off. The price: injected events of a
+/// modifier keep a stale one (its key-up missed) counted until that
+/// modifier's next physical event. So every switch of the input desktop,
+/// where key-ups go missing, also forgets all the hook saw
+/// ([`Modifiers::desktop_switched`]): after Ctrl+Alt+Del, a viewer's Ctrl+C
+/// and Alt+Tab no longer turn the owner's bare End into the chord.
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Modifiers {
@@ -238,6 +245,17 @@ impl Modifiers {
     pub(crate) fn held(&mut self, system: u8) -> u8 {
         self.down &= system | self.injected;
         self.down
+    }
+
+    /// The input desktop switched (the secure desktop of Ctrl+Alt+Del, a UAC
+    /// prompt or the lock screen came or went): the hook saw none of the
+    /// key-ups there, so all it saw is forgotten, injected events included.
+    /// A modifier held across the switch counts again at its next physical
+    /// key-down: the chord pressed afresh works at once; one begun before the
+    /// switch and finished after it does not, which errs toward not pressing
+    /// the panic key rather than pressing it by mistake.
+    pub(crate) fn desktop_switched(&mut self) {
+        *self = Self::NONE;
     }
 }
 
@@ -372,23 +390,27 @@ pub(crate) mod win {
     use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
     use std::sync::{Mutex, PoisonError, mpsc};
 
+    use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, VK_CONTROL, VK_DELETE, VK_END, VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL,
         VK_LMENU, VK_LSHIFT, VK_MENU, VK_PAUSE, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-        LLKHF_LOWER_IL_INJECTED, MSG, SetWindowsHookExW, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
-        WM_SYSKEYDOWN, WM_SYSKEYUP,
+        CallNextHookEx, EVENT_SYSTEM_DESKTOPSWITCH, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT,
+        LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, MSG, SetWindowsHookExW, WH_KEYBOARD_LL,
+        WINEVENT_OUTOFCONTEXT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
     use super::{Chord, Key, Modifiers, Pressed};
 
     thread_local! {
-        /// The chord's modifiers as the hook saw them. A low-level hook runs
-        /// on the thread that set it, so only that thread touches this.
-        static MODS: Cell<Modifiers> = const { Cell::new(Modifiers::NONE) };
+        /// The chord's modifiers as this thread's hook saw them: the panic
+        /// key's hook here, the administrator helper's chord hook there. A
+        /// low-level hook, and an out-of-context WinEvent hook, run on the
+        /// thread that set them, so only that thread touches its own.
+        pub(crate) static MODS: Cell<Modifiers> = const { Cell::new(Modifiers::NONE) };
     }
     /// The chord watched: its key and modifiers (set once, before the hook).
     static KEY: AtomicU16 = AtomicU16::new(0);
@@ -467,6 +489,52 @@ pub(crate) mod win {
         held
     }
 
+    /// Forget this thread's [`MODS`] at every switch of the input desktop
+    /// ([`Modifiers::desktop_switched`]): an out-of-context WinEvent hook for
+    /// `EVENT_SYSTEM_DESKTOPSWITCH`, called on this thread's message loop,
+    /// which the caller runs (a keyboard hook's thread). It lives as long as
+    /// the thread. Where it cannot be set, the system's key state still
+    /// clears what was let go unseen ([`Modifiers::held`]), short of a
+    /// viewer's injected events of that modifier.
+    pub(crate) fn forget_on_desktop_switch() {
+        // SAFETY: an out-of-context hook (no module: nothing is loaded into
+        // other processes) for one system event from every process and
+        // thread; `desktop_switched` has the WINEVENTPROC signature and lives
+        // as long as the program.
+        let hook = unsafe {
+            SetWinEventHook(
+                EVENT_SYSTEM_DESKTOPSWITCH,
+                EVENT_SYSTEM_DESKTOPSWITCH,
+                null_mut(),
+                Some(desktop_switched),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            )
+        };
+        if hook.is_null() {
+            tracing::warn!(
+                "desktop switches cannot be watched; the panic key relies on the system's key state alone"
+            );
+        }
+    }
+
+    unsafe extern "system" fn desktop_switched(
+        _hook: HWINEVENTHOOK,
+        _event: u32,
+        _window: HWND,
+        _object: i32,
+        _child: i32,
+        _thread: u32,
+        _time: u32,
+    ) {
+        let _ = MODS.try_with(|mods| {
+            let mut state = mods.get();
+            state.desktop_switched();
+            mods.set(state);
+        });
+    }
+
     pub(super) fn watch(chord: Chord, pressed: Pressed) -> std::io::Result<()> {
         KEY.store(vk(chord.key), Ordering::SeqCst);
         WANT.store(chord.modifier_bits(), Ordering::SeqCst);
@@ -495,6 +563,7 @@ pub(crate) mod win {
                     let _ = set.send(Err(std::io::Error::last_os_error()));
                     return;
                 }
+                forget_on_desktop_switch();
                 let _ = set.send(Ok(()));
                 // SAFETY: all-zero is a valid MSG to fill.
                 let mut msg: MSG = unsafe { std::mem::zeroed() };
@@ -649,6 +718,60 @@ mod tests {
         assert_eq!(mods.held(0), Modifiers::CTRL);
         mods.key(Modifiers::CTRL, true, false);
         assert_eq!(mods.held(0), 0, "the system has Ctrl up");
+    }
+
+    /// Audit B08, the case the system's key state cannot settle: Ctrl+Alt+Del
+    /// leaves Ctrl and Alt stale, then a viewer's Ctrl+C and Alt+Tab
+    /// (injected) put both out of the system state's reach. A bare End at the
+    /// host would match the chord, and a double press turns unattended access
+    /// off. The desktop switches of Ctrl+Alt+Del forget them first, so it
+    /// does not; the chord pressed afresh still does, and injected input
+    /// still never makes a modifier count.
+    #[test]
+    fn a_desktop_switch_forgets_modifiers_injected_input_kept_stale() {
+        const WANT: u8 = Modifiers::CTRL | Modifiers::ALT;
+        let viewer_copies_and_switches = |mods: &mut Modifiers| {
+            for bit in [Modifiers::CTRL, Modifiers::ALT] {
+                mods.key(bit, true, true);
+                mods.key(bit, false, true);
+            }
+        };
+
+        // Without the switches the hook would miss: what the reset fixes.
+        let mut mods = Modifiers::NONE;
+        mods.key(Modifiers::CTRL, true, false);
+        mods.key(Modifiers::ALT, true, false);
+        viewer_copies_and_switches(&mut mods);
+        assert_eq!(mods.held(0), WANT, "the stale case the reset is for");
+
+        // Ctrl and Alt go down; Del switches to the secure desktop, Cancel
+        // switches back; the key-ups happened there.
+        let mut mods = Modifiers::NONE;
+        mods.key(Modifiers::CTRL, true, false);
+        mods.key(Modifiers::ALT, true, false);
+        mods.desktop_switched();
+        mods.desktop_switched();
+        viewer_copies_and_switches(&mut mods);
+        assert_eq!(mods.held(0), 0, "a bare End pressed the panic key");
+        assert_eq!(mods.held(0), 0, "a second bare End pressed it");
+        mods.key(Modifiers::CTRL, true, false);
+        assert_eq!(mods.held(Modifiers::CTRL), Modifiers::CTRL, "Ctrl+End");
+
+        // Injected modifiers after a switch count for nothing.
+        let mut mods = Modifiers::NONE;
+        mods.desktop_switched();
+        mods.key(Modifiers::CTRL, true, true);
+        mods.key(Modifiers::ALT, true, true);
+        assert_eq!(mods.held(WANT), 0);
+
+        // The real chord, pressed after the switch, still presses it.
+        let mut mods = Modifiers::NONE;
+        mods.key(Modifiers::CTRL, true, false);
+        mods.key(Modifiers::ALT, true, false);
+        mods.desktop_switched();
+        mods.key(Modifiers::CTRL, true, false);
+        mods.key(Modifiers::ALT, true, false);
+        assert_eq!(mods.held(WANT), WANT);
     }
 
     /// Without the portal (or a portal that does not list the shortcut back), the
