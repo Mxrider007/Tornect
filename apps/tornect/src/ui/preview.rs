@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tornect_capture::{TestCard, VideoSource as _};
-use tornect_codec::DecodedFrame;
+use tornect_codec::{DecodeTiming, DecodedFrame};
 use tornect_core::TornectId;
 use tornect_core::address_book::Day;
 use tornect_core::levels::{Availability, WindowsFacts};
@@ -721,6 +721,7 @@ pub fn card(slot: Arc<FrameSlot>, shared: Arc<Shared>) {
                     width: frame.width,
                     height: frame.height,
                     rgba,
+                    timing: DecodeTiming::default(),
                 },
             );
         }

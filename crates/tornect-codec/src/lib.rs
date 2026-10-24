@@ -293,8 +293,17 @@ impl H264Encoder {
     }
 }
 
+/// What one decoded picture took ([`H264Decoder::decode`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeTiming {
+    /// OpenH264's decode of the access unit.
+    pub decode: Duration,
+    /// The I420 → RGBA conversion.
+    pub convert: Duration,
+}
+
 /// A decoded picture.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DecodedFrame {
     /// Width.
     pub width: u32,
@@ -302,11 +311,15 @@ pub struct DecodedFrame {
     pub height: u32,
     /// Tightly packed RGBA (alpha 255).
     pub rgba: Vec<u8>,
+    /// What decoding this picture took.
+    pub timing: DecodeTiming,
 }
 
 /// OpenH264 decoder.
 pub struct H264Decoder {
     dec: Decoder,
+    /// The last picture, its RGBA buffer reused from one picture to the next.
+    frame: DecodedFrame,
 }
 
 impl std::fmt::Debug for H264Decoder {
@@ -315,28 +328,60 @@ impl std::fmt::Debug for H264Decoder {
     }
 }
 
+/// Whether the viewer shows a decoded `w`×`h` picture: at least 1×1 and at
+/// most 3840×2160 either way up, the largest picture a Tornect host sends.
+/// A bigger one is a hostile or broken stream, and is refused before its
+/// RGBA buffer is sized, so that buffer never exceeds 3840·2160·4 bytes.
+fn shows(w: u32, h: u32) -> bool {
+    w >= 1 && h >= 1 && w.max(h) <= MAX_LONG_SIDE && w.min(h) <= MAX_SHORT_SIDE
+}
+
 impl H264Decoder {
     /// A new decoder (no decoder threads: the API is unsafe with them).
     pub fn new() -> Result<Self, CodecError> {
         Ok(Self {
             dec: Decoder::new().map_err(h264)?,
+            frame: DecodedFrame::default(),
         })
     }
 
-    /// Decode one access unit; `None` while the decoder buffers (no picture yet).
-    /// An error means the bitstream is corrupt: request a keyframe.
-    pub fn decode(&mut self, access_unit: &[u8]) -> Result<Option<DecodedFrame>, CodecError> {
+    /// Decode one access unit; `None` while the decoder buffers (no picture
+    /// yet). The picture is lent until the next call, and its RGBA buffer is
+    /// reused while the size holds. An error means the bitstream is corrupt
+    /// or its picture too large: request a keyframe.
+    ///
+    /// # Errors
+    /// [`CodecError::PictureSize`] for a picture above 3840×2160 either way
+    /// up (a Tornect host never sends one); [`CodecError::H264`] if OpenH264
+    /// fails.
+    pub fn decode(&mut self, access_unit: &[u8]) -> Result<Option<&DecodedFrame>, CodecError> {
+        let start = Instant::now();
         let Some(yuv) = self.dec.decode(access_unit).map_err(h264)? else {
             return Ok(None);
         };
+        let decoded = Instant::now();
         let (w, h) = yuv.dimensions();
-        let mut rgba = vec![0u8; w * h * 4];
-        yuv.write_rgba8(&mut rgba);
-        Ok(Some(DecodedFrame {
-            width: u32::try_from(w).map_err(h264)?,
-            height: u32::try_from(h).map_err(h264)?,
-            rgba,
-        }))
+        let (width, height) = (
+            u32::try_from(w).unwrap_or(u32::MAX),
+            u32::try_from(h).unwrap_or(u32::MAX),
+        );
+        if !shows(width, height) {
+            return Err(CodecError::PictureSize {
+                w: width,
+                h: height,
+            });
+        }
+        // `write_rgba8` wants exactly w·h·4 bytes; resizing keeps the
+        // allocation, so equal sizes never allocate again.
+        self.frame.rgba.resize(w * h * 4, 0);
+        yuv.write_rgba8(&mut self.frame.rgba);
+        self.frame.width = width;
+        self.frame.height = height;
+        self.frame.timing = DecodeTiming {
+            decode: decoded - start,
+            convert: decoded.elapsed(),
+        };
+        Ok(Some(&self.frame))
     }
 }
 
@@ -420,7 +465,7 @@ mod tests {
             }
             assert!(!au.data.is_empty());
             if let Some(frame) = dec.decode(&au.data).unwrap() {
-                decoded = Some(frame);
+                decoded = Some(frame.clone());
             }
         }
         let frame = decoded.expect("decoder produced a picture");
@@ -799,6 +844,224 @@ mod tests {
         // A refused picture leaves it alone.
         assert!(enc.encode(&[0; 4], 3, 3).is_err());
         assert_eq!(enc.yuv_at(), Some(second));
+    }
+
+    /// The RGBA buffer is lent, not handed over: equal sizes decode into the
+    /// same allocation, and a smaller picture keeps it too.
+    #[test]
+    fn the_rgba_buffer_is_reused_while_the_size_holds() {
+        let mut enc = H264Encoder::new(EncoderSettings::default()).unwrap();
+        let mut dec = H264Decoder::new().unwrap();
+        let mut at = None;
+        for t in 0..4 {
+            let au = enc.encode(&card(320, 240, t), 320, 240).unwrap();
+            let frame = dec.decode(&au.data).unwrap().expect("a picture");
+            assert_eq!((frame.width, frame.height), (320, 240));
+            assert_eq!(frame.rgba.len(), 320 * 240 * 4);
+            let ptr = frame.rgba.as_ptr();
+            assert_eq!(*at.get_or_insert(ptr), ptr, "picture {t}");
+        }
+        let au = enc.encode(&card(160, 120, 4), 160, 120).unwrap();
+        let frame = dec.decode(&au.data).unwrap().expect("a picture");
+        assert_eq!((frame.width, frame.height), (160, 120));
+        assert_eq!(frame.rgba.len(), 160 * 120 * 4, "sized exactly");
+        assert_eq!(Some(frame.rgba.as_ptr()), at, "a smaller picture fits");
+    }
+
+    #[test]
+    fn decode_and_convert_are_timed() {
+        let mut enc = H264Encoder::new(EncoderSettings::default()).unwrap();
+        let mut dec = H264Decoder::new().unwrap();
+        let au = enc.encode(&card(640, 360, 0), 640, 360).unwrap();
+        let frame = dec.decode(&au.data).unwrap().expect("a picture");
+        assert!(frame.timing.decode > Duration::ZERO, "{:?}", frame.timing);
+        assert!(frame.timing.convert > Duration::ZERO, "{:?}", frame.timing);
+    }
+
+    /// The viewer's bound is the host's: up to 3840×2160 either way up.
+    #[test]
+    fn the_viewer_shows_pictures_up_to_the_codec_maximum() {
+        for (w, h) in [
+            (1, 1),
+            (1366, 768),
+            (3840, 2160),
+            (2160, 3840),
+            (3840, 16),
+            (16, 3840),
+            (2160, 2160),
+        ] {
+            assert!(shows(w, h), "{w}x{h}");
+        }
+        for (w, h) in [
+            (0, 0),
+            (0, 16),
+            (16, 0),
+            (3856, 16),
+            (16, 3856),
+            (2176, 2176),
+            (3840, 2176),
+            (2176, 3840),
+            (4096, 2160),
+            (u32::MAX, u32::MAX),
+        ] {
+            assert!(!shows(w, h), "{w}x{h}");
+        }
+    }
+
+    /// Writes H.264 syntax elements most significant bit first.
+    #[derive(Default)]
+    struct Bits {
+        out: Vec<u8>,
+        acc: u8,
+        n: u8,
+    }
+
+    impl Bits {
+        fn bit(&mut self, one: bool) {
+            self.acc = self.acc << 1 | u8::from(one);
+            self.n += 1;
+            if self.n == 8 {
+                self.out.push(self.acc);
+                (self.acc, self.n) = (0, 0);
+            }
+        }
+
+        /// `u(n)`.
+        fn u(&mut self, n: u32, v: u32) {
+            for i in (0..n).rev() {
+                self.bit(v >> i & 1 == 1);
+            }
+        }
+
+        /// `ue(v)`, Exp-Golomb.
+        fn ue(&mut self, v: u32) {
+            let x = v + 1;
+            let len = 32 - x.leading_zeros();
+            self.u(len - 1, 0);
+            self.u(len, x);
+        }
+
+        fn align(&mut self) {
+            while self.n != 0 {
+                self.bit(false);
+            }
+        }
+
+        /// `rbsp_trailing_bits()`.
+        fn finish(mut self) -> Vec<u8> {
+            self.bit(true);
+            self.align();
+            self.out
+        }
+    }
+
+    /// One Annex-B NAL unit, emulation prevention included.
+    fn nal(header: u8, rbsp: &[u8]) -> Vec<u8> {
+        let mut out = vec![0, 0, 0, 1, header];
+        let mut zeros = 0;
+        for &b in rbsp {
+            if zeros >= 2 && b <= 3 {
+                out.push(3);
+                zeros = 0;
+            }
+            out.push(b);
+            zeros = if b == 0 { zeros + 1 } else { 0 };
+        }
+        out
+    }
+
+    /// A hand-made Baseline access unit: SPS and PPS for a picture of
+    /// `mbs_w`×`mbs_h` macroblocks, then an IDR slice of grey I_PCM
+    /// macroblocks. OpenH264's encoder stops at 3840×2160, so this is how a
+    /// larger picture reaches the decoder, as a hostile host could send it.
+    fn pcm_access_unit(mbs_w: u32, mbs_h: u32) -> Vec<u8> {
+        let mut sps = Bits::default();
+        sps.u(8, 66); // profile_idc: Baseline
+        sps.u(8, 0); // constraint flags, reserved bits
+        sps.u(8, 52); // level_idc 5.2
+        sps.ue(0); // seq_parameter_set_id
+        sps.ue(0); // log2_max_frame_num_minus4
+        sps.ue(2); // pic_order_cnt_type
+        sps.ue(1); // max_num_ref_frames
+        sps.bit(false); // gaps_in_frame_num_value_allowed_flag
+        sps.ue(mbs_w - 1); // pic_width_in_mbs_minus1
+        sps.ue(mbs_h - 1); // pic_height_in_map_units_minus1
+        sps.bit(true); // frame_mbs_only_flag
+        sps.bit(true); // direct_8x8_inference_flag
+        sps.bit(false); // frame_cropping_flag
+        sps.bit(false); // vui_parameters_present_flag
+        let mut pps = Bits::default();
+        pps.ue(0); // pic_parameter_set_id
+        pps.ue(0); // seq_parameter_set_id
+        pps.bit(false); // entropy_coding_mode_flag: CAVLC
+        pps.bit(false); // bottom_field_pic_order_in_frame_present_flag
+        pps.ue(0); // num_slice_groups_minus1
+        pps.ue(0); // num_ref_idx_l0_default_active_minus1
+        pps.ue(0); // num_ref_idx_l1_default_active_minus1
+        pps.bit(false); // weighted_pred_flag
+        pps.u(2, 0); // weighted_bipred_idc
+        pps.ue(0); // pic_init_qp_minus26 (se 0)
+        pps.ue(0); // pic_init_qs_minus26 (se 0)
+        pps.ue(0); // chroma_qp_index_offset (se 0)
+        pps.bit(true); // deblocking_filter_control_present_flag
+        pps.bit(false); // constrained_intra_pred_flag
+        pps.bit(false); // redundant_pic_cnt_present_flag
+        let mut slice = Bits::default();
+        slice.ue(0); // first_mb_in_slice
+        slice.ue(7); // slice_type: I, every slice
+        slice.ue(0); // pic_parameter_set_id
+        slice.u(4, 0); // frame_num
+        slice.ue(0); // idr_pic_id
+        slice.bit(false); // no_output_of_prior_pics_flag
+        slice.bit(false); // long_term_reference_flag
+        slice.ue(0); // slice_qp_delta (se 0)
+        slice.ue(1); // disable_deblocking_filter_idc
+        for _ in 0..mbs_w * mbs_h {
+            slice.ue(25); // mb_type: I_PCM
+            slice.align(); // pcm_alignment_zero_bit
+            slice.out.extend_from_slice(&[128; 256 + 2 * 64]);
+        }
+        let mut au = nal(0x67, &sps.finish());
+        au.extend(nal(0x68, &pps.finish()));
+        au.extend(nal(0x65, &slice.finish()));
+        au
+    }
+
+    /// A picture above 3840×2160 either way up is refused before anything
+    /// is sized for it, and the decoder goes on with the next stream. The
+    /// same hand-made stream at 3840 wide decodes, so the bound is what
+    /// refuses the larger one.
+    #[test]
+    fn a_picture_above_the_codec_maximum_is_refused() {
+        let mut dec = H264Decoder::new().unwrap();
+        let frame = dec
+            .decode(&pcm_access_unit(240, 1))
+            .unwrap()
+            .expect("a picture");
+        assert_eq!((frame.width, frame.height), (3840, 16));
+        assert!(
+            frame
+                .rgba
+                .chunks_exact(4)
+                .all(|px| px[3] == 255 && px[..3].iter().all(|&c| c.abs_diff(px[0]) <= 1)),
+            "grey"
+        );
+        let before = frame.clone();
+        for (mbs_w, mbs_h, w, h) in [(241, 1, 3856, 16), (1, 241, 16, 3856)] {
+            assert!(
+                matches!(
+                    dec.decode(&pcm_access_unit(mbs_w, mbs_h)),
+                    Err(CodecError::PictureSize { w: ew, h: eh }) if (ew, eh) == (w, h)
+                ),
+                "{w}x{h}"
+            );
+            assert_eq!(dec.frame, before, "the last picture is left alone");
+        }
+        let frame = dec
+            .decode(&pcm_access_unit(1, 240))
+            .unwrap()
+            .expect("a picture");
+        assert_eq!((frame.width, frame.height), (16, 3840));
     }
 
     #[test]

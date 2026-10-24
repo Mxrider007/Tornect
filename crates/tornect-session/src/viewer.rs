@@ -317,7 +317,7 @@ where
                     match decoder.decode(&data) {
                         Ok(Some(frame)) => {
                             stats.decoded += 1;
-                            sink.picture(seq, &frame);
+                            sink.picture(seq, frame);
                         }
                         // The decoder is buffering.
                         Ok(None) => {}

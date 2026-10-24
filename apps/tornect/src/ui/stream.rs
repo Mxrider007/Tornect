@@ -641,6 +641,7 @@ impl Forwarder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tornect_codec::DecodeTiming;
 
     const RECT: PictureRect = PictureRect {
         x: 100.0,
@@ -958,6 +959,7 @@ mod tests {
             width: 1,
             height: 1,
             rgba: vec![9, 9, 9, 255],
+            timing: DecodeTiming::default(),
         });
         let shared = Shared::new(super::super::model::Model::default(), Arc::new(|_| {}));
         let _sink = SlotSink::new(Arc::clone(&slot), shared);
@@ -1032,6 +1034,7 @@ mod tests {
                 width: 1,
                 height: 1,
                 rgba: vec![n, n, n, 255],
+                timing: DecodeTiming::default(),
             });
         }
         assert!(slot.take(&mut mine));
