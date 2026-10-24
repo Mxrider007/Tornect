@@ -136,6 +136,129 @@ Same driver, same homes, the tree at `a10c995` plus the window change.
 - **Fix for run 1** (`6f27930`): `ClientSession::bye` waits for the host to close (it closes once
   it has read the `BYE`) before closing, within 3 s.
 
+## The loopback demo (the quality design's step 18), 2026-10-24
+
+`tornect demo --loopback --headless-stats` (`apps/tornect/src/demo_cmd.rs`, `0e2aa6bf`): a real `MediaHost` and
+`MediaViewer` in one process over a 4 MiB `tokio::io::duplex`, no Tor, no network, no window. The source is the
+stamped test card; the host serves it as it serves a Tor stream (`Route::Tor`, so each preset runs its Tor row:
+Best quality 12 fps, Balanced 15, Best performance 20) with `MediaLimits`' defaults and the given encoder
+threads. End to end (e2e) runs from the card's capture stamp of picture *n* to the viewer having decoded and
+converted picture *n* (one in-process clock). `encode p50` is the median of the host's per-second mean encode
+times; B7 `convert+encode` is the host's scale + convert + encode per picture sent; `capture` is the card's own
+paint per fresh picture; `lost` is pictures sent minus pictures decoded.
+
+**Where it ran:** not the dev VM of `CLAUDE.md`: this build container (4 vCPU "Intel(R) Xeon(R) Processor @
+2.10GHz", x86_64, no GPU, no display), as root (the demo serves nobody, so the host's root refusal of M1-67
+does not apply to it). Binary: `cargo build --release -p tornect` (thin LTO, codegen-units 1) of the working tree
+during this work: before the pre-bind log budget (`f9ad35ad`) and the demo's last edit (`0e2aa6bf`'s error
+text for a viewer left behind); neither touches the loopback path's timing, and `507500fc` changes only the
+Wayland source. Each run 10 s, the card at 30 fps, one run at a
+time, nothing else running. Command, for each row:
+`target/release/tornect demo --loopback --headless-stats --size <WxH> --quality <preset> --threads <n> --seconds 10`
+(stderr, OpenH264's own warnings, left out).
+
+| `--size` | `--quality` | `--threads` | picture | fps | e2e p50 / p95 ms | encode p50 ms | decode p50 ms | lost | B7 capture | B7 convert+encode | B7 decode | exit |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1280x720 | best-quality | 1 | 1280x720 | 11.8 | 8.5 / 13.1 | 5.5 | 1.3 | 0 | 0.7/4 PASS | 6.8/5 FAIL | 1.4/4 PASS | 0 |
+| 1280x720 | balanced | 1 | 1280x720 | 14.8 | 8.6 / 12.2 | 5.6 | 1.3 | 0 | 0.7/4 PASS | 6.8/5 FAIL | 1.4/4 PASS | 0 |
+| 1280x720 | best-performance | 1 | 1280x720 | 19.7 | 8.4 / 13.5 | 5.6 | 1.3 | 0 | 0.7/4 PASS | 6.9/5 FAIL | 1.3/4 PASS | 0 |
+| 1920x1080 | best-quality | 1 | 1920x1080 | 11.7 | 18.0 / 27.4 | 11.6 | 3.0 | 0 | 1.7/4 PASS | 14.1/5 FAIL | 3.3/4 PASS | 0 |
+| 1920x1080 | balanced | 1 | 1920x1080 | 14.6 | 19.3 / 26.3 | 12.3 | 3.0 | 0 | 1.6/4 PASS | 15.3/5 FAIL | 3.3/4 PASS | 0 |
+| 1920x1080 | best-performance | 1 | 1280x720 | 19.3 | 11.6 / 15.8 | 5.3 | 1.3 | 0 | 1.5/4 PASS | 10.0/5 FAIL | 1.3/4 PASS | 0 |
+| 2560x1440 | best-quality | 1 | 2560x1440 | 11.6 | 31.7 / 49.2 | 20.6 | 5.3 | 0 | 2.9/4 PASS | 24.9/5 FAIL | 5.6/4 FAIL | 0 |
+| 2560x1440 | balanced | 1 | 1920x1080 | 14.4 | 25.0 / 33.1 | 11.5 | 3.0 | 0 | 2.9/4 PASS | 21.0/5 FAIL | 3.1/4 PASS | 0 |
+| 2560x1440 | best-performance | 1 | 1280x720 | 18.9 | 10.8 / 16.6 | 5.5 | 1.3 | 0 | 2.8/4 PASS | 9.3/5 FAIL | 1.3/4 PASS | 0 |
+| 3538x1918 | best-quality | 1 | 3538x1918 | 10.3 | 387.8 / 975.3 | 41.9 | 9.7 | 9 | 5.3/4 FAIL | 49.5/5 FAIL | 10.4/4 FAIL | 1 |
+| 3538x1918 | balanced | 1 | 1920x1040 | 13.9 | 32.3 / 41.3 | 17.1 | 3.0 | 0 | 5.3/4 FAIL | 28.5/5 FAIL | 3.2/4 PASS | 0 |
+| 3538x1918 | best-performance | 1 | 1280x692 | 18.1 | 16.7 / 20.6 | 6.5 | 1.5 | 0 | 5.1/4 FAIL | 14.6/5 FAIL | 1.6/4 PASS | 0 |
+| 1280x720 | best-quality | 0 | 1280x720 | 11.9 | 8.1 / 11.8 | 5.3 | 1.4 | 0 | 0.8/4 PASS | 6.6/5 FAIL | 1.5/4 PASS | 0 |
+| 1280x720 | balanced | 0 | 1280x720 | 14.8 | 8.2 / 12.9 | 5.2 | 1.3 | 0 | 0.7/4 PASS | 6.7/5 FAIL | 1.4/4 PASS | 0 |
+| 1280x720 | best-performance | 0 | 1280x720 | 19.7 | 8.6 / 11.7 | 5.8 | 1.4 | 0 | 0.7/4 PASS | 6.9/5 FAIL | 1.4/4 PASS | 0 |
+| 1920x1080 | best-quality | 0 | 1920x1080 | 11.8 | 17.2 / 25.0 | 10.6 | 2.9 | 0 | 1.7/4 PASS | 13.5/5 FAIL | 3.2/4 PASS | 0 |
+| 1920x1080 | balanced | 0 | 1920x1080 | 14.6 | 17.2 / 25.1 | 11.0 | 2.9 | 0 | 1.6/4 PASS | 13.7/5 FAIL | 3.1/4 PASS | 0 |
+| 1920x1080 | best-performance | 0 | 1280x720 | 19.3 | 11.8 / 16.6 | 5.6 | 1.3 | 0 | 1.6/4 PASS | 10.4/5 FAIL | 1.4/4 PASS | 0 |
+| 2560x1440 | best-quality | 0 | 2560x1440 | 11.6 | 28.9 / 45.5 | 18.0 | 5.1 | 0 | 2.9/4 PASS | 23.0/5 FAIL | 5.6/4 FAIL | 0 |
+| 2560x1440 | balanced | 0 | 1920x1080 | 14.4 | 24.7 / 33.1 | 11.0 | 2.9 | 0 | 3.0/4 PASS | 21.3/5 FAIL | 3.1/4 PASS | 0 |
+| 2560x1440 | best-performance | 0 | 1280x720 | 18.9 | 10.9 / 15.8 | 5.6 | 1.4 | 0 | 2.9/4 PASS | 9.3/5 FAIL | 1.5/4 PASS | 0 |
+| 3538x1918 | best-quality | 0 | 3538x1918 | 10.7 | 349.1 / 590.5 | 40.3 | 9.2 | 5 | 5.5/4 FAIL | 48.0/5 FAIL | 10.1/4 FAIL | 1 |
+| 3538x1918 | balanced | 0 | 1920x1040 | 13.9 | 30.9 / 38.7 | 15.6 | 3.0 | 0 | 5.3/4 FAIL | 27.0/5 FAIL | 3.1/4 PASS | 0 |
+| 3538x1918 | best-performance | 0 | 1280x692 | 18.1 | 17.2 / 24.4 | 6.6 | 1.5 | 0 | 5.3/4 FAIL | 15.7/5 FAIL | 1.6/4 PASS | 0 |
+
+A whole run as printed (the other 23 have the same shape):
+
+```
+### tornect demo --loopback --headless-stats --size 1920x1080 --quality balanced --threads 1 --seconds 10
+DEMO START size=1920x1080 fps=30 quality=balanced picture=1920x1080 threads=1
+STATS t=1 fps=15.9 picture=1920x1080 kbps=75 grab_ms=2.7 age_ms=0.0 scale_ms=0.0 convert_ms=2.1 encode_ms=18.5 send_ms=0.2 ack_ms=7.0 decode_ms=4.5 yuv2rgb_ms=1.9 e2e_ms=27.0
+STATS t=2 fps=14.5 picture=1920x1080 kbps=8 grab_ms=1.5 age_ms=0.0 scale_ms=0.0 convert_ms=2.1 encode_ms=14.1 send_ms=0.2 ack_ms=5.0 decode_ms=3.1 yuv2rgb_ms=1.6 e2e_ms=21.5
+STATS t=3 fps=14.7 picture=1920x1080 kbps=9 grab_ms=1.5 age_ms=0.0 scale_ms=0.0 convert_ms=1.7 encode_ms=11.8 send_ms=0.2 ack_ms=4.8 decode_ms=2.9 yuv2rgb_ms=1.5 e2e_ms=18.1
+STATS t=4 fps=14.5 picture=1920x1080 kbps=9 grab_ms=1.5 age_ms=0.0 scale_ms=0.0 convert_ms=1.7 encode_ms=11.6 send_ms=0.2 ack_ms=5.2 decode_ms=3.3 yuv2rgb_ms=1.6 e2e_ms=18.5
+STATS t=5 fps=14.5 picture=1920x1080 kbps=9 grab_ms=1.5 age_ms=0.0 scale_ms=0.0 convert_ms=1.8 encode_ms=12.3 send_ms=0.2 ack_ms=5.3 decode_ms=3.4 yuv2rgb_ms=1.7 e2e_ms=19.7
+STATS t=6 fps=14.6 picture=1920x1080 kbps=8 grab_ms=1.5 age_ms=0.0 scale_ms=0.0 convert_ms=1.8 encode_ms=16.3 send_ms=0.2 ack_ms=4.9 decode_ms=2.9 yuv2rgb_ms=1.6 e2e_ms=22.7
+STATS t=7 fps=14.6 picture=1920x1080 kbps=9 grab_ms=1.5 age_ms=0.0 scale_ms=0.0 convert_ms=1.8 encode_ms=12.9 send_ms=0.2 ack_ms=4.8 decode_ms=2.9 yuv2rgb_ms=1.6 e2e_ms=19.5
+STATS t=8 fps=14.6 picture=1920x1080 kbps=8 grab_ms=1.5 age_ms=0.0 scale_ms=0.0 convert_ms=1.7 encode_ms=11.9 send_ms=0.2 ack_ms=4.9 decode_ms=3.0 yuv2rgb_ms=1.6 e2e_ms=18.6
+STATS t=9 fps=14.5 picture=1920x1080 kbps=9 grab_ms=1.5 age_ms=0.0 scale_ms=0.0 convert_ms=1.8 encode_ms=12.2 send_ms=0.2 ack_ms=5.0 decode_ms=3.2 yuv2rgb_ms=1.6 e2e_ms=19.2
+SUMMARY frames=147 fps=14.6 e2e_p50_ms=19.3 e2e_p95_ms=26.3 encode_p50_ms=12.3 decode_p50_ms=3.0 lost=0 unreadable=0
+B7 capture=1.6/4 PASS convert+encode=15.3/5 FAIL decode=3.3/4 PASS (B.7 targets are hardware, 1080p60, direct path)
+### exit=0
+```
+
+**Read against §B.7** (its targets are for hardware encoders at 1080p60 on the direct path; this is the
+software OpenH264 path of the slice, so the misses are expected and stated, not waived):
+
+- **convert+encode: FAIL in all 24 runs** (6.6 ms at 720p … 49.5 ms at 3538×1918 Best quality, against
+  5 ms). OpenH264 alone takes 5.2–5.8 ms per 720p picture here.
+- **decode: FAIL at 2560×1440 Best quality** (5.6/4 ms) **and 3538×1918 Best quality** (10.1–10.4/4); PASS
+  at every picture of 1920 wide or less (1.3–3.3 ms).
+- **capture: FAIL at 3538×1918** (5.1–5.5/4 ms): this is the test card's paint of 6.8 Mpx, not a capture
+  backend; real backends report their own `Frame.grab` (NEEDS-DEVICE rows in `docs/VERIFICATION.md`).
+- **Delivered rates match the Tor rows:** Best quality 11.6–11.9 fps of 12, Balanced 13.9–14.8 of 15, Best
+  performance 18.1–19.7 of 20: at least 90 % of each cap, with nothing lost, except Best quality at
+  3538×1918 (10.3–10.7 fps; next point).
+- **Best quality at 3538×1918 does not keep up (exit 1 both times):** the viewer's RGBA conversion takes
+  73–103 ms per picture (STATS `yuv2rgb_ms`), slower than the host's 12 fps, so pictures queue in the ack
+  window: `ack_ms` climbs from 168 to 896 ms over 9 s and e2e p50 is 349–388 ms (p95 590–975). At the
+  host's end the viewer is still 5–9 pictures behind, its next write meets the closed pipe ("broken pipe"),
+  and the demo exits 1. A re-run with the new error text (`0e2aa6bf`) said the same with 3 pictures behind.
+- **The cause is the picture's width, not its size:** the `openh264` crate converts with SIMD only when the
+  width is a multiple of 8 (`openh264-0.9.8/src/decoder.rs:604`, `write_rgba8`) and otherwise falls back to a
+  scalar loop. Every scaled picture's width is a multiple of 8 (`picture_size`), but a desktop under a
+  preset's cap is encoded at its own width (only an odd edge cropped): 3538 (the dev VM), 1366 (common
+  laptops). Measured side by side (10 s, Best quality, `--threads 1`; STATS lines but the last left out):
+
+```
+### --size 3536x1918 --quality best-quality --threads 1
+DEMO START size=3536x1918 fps=30 quality=best-quality picture=3536x1918 threads=1
+STATS t=9 fps=11.2 picture=3536x1918 kbps=9 grab_ms=5.0 age_ms=0.0 scale_ms=0.0 convert_ms=6.0 encode_ms=38.4 send_ms=0.2 ack_ms=16.0 decode_ms=10.5 yuv2rgb_ms=5.3 e2e_ms=60.6
+SUMMARY frames=113 fps=11.2 e2e_p50_ms=64.5 e2e_p95_ms=90.3 encode_p50_ms=41.4 decode_p50_ms=10.3 lost=0 unreadable=0
+B7 capture=5.8/4 FAIL convert+encode=51.0/5 FAIL decode=11.0/4 FAIL (B.7 targets are hardware, 1080p60, direct path)
+### exit=0
+### --size 1366x768 --quality best-quality --threads 1
+DEMO START size=1366x768 fps=30 quality=best-quality picture=1366x768 threads=1
+STATS t=9 fps=11.8 picture=1366x768 kbps=6 grab_ms=0.8 age_ms=0.0 scale_ms=0.0 convert_ms=1.0 encode_ms=7.8 send_ms=0.2 ack_ms=15.4 decode_ms=1.5 yuv2rgb_ms=13.8 e2e_ms=24.1
+SUMMARY frames=119 fps=11.8 e2e_p50_ms=23.9 e2e_p95_ms=31.6 encode_p50_ms=7.8 decode_p50_ms=1.8 lost=0 unreadable=0
+B7 capture=0.8/4 PASS convert+encode=8.5/5 FAIL decode=1.8/4 PASS (B.7 targets are hardware, 1080p60, direct path)
+### exit=0
+### --size 1368x768 --quality best-quality --threads 1
+DEMO START size=1368x768 fps=30 quality=best-quality picture=1368x768 threads=1
+STATS t=9 fps=11.8 picture=1368x768 kbps=14 grab_ms=0.8 age_ms=0.0 scale_ms=0.0 convert_ms=1.0 encode_ms=8.0 send_ms=0.2 ack_ms=3.5 decode_ms=1.9 yuv2rgb_ms=1.1 e2e_ms=12.3
+SUMMARY frames=119 fps=11.8 e2e_p50_ms=11.0 e2e_p95_ms=19.5 encode_p50_ms=8.0 decode_p50_ms=1.8 lost=0 unreadable=0
+B7 capture=0.9/4 PASS convert+encode=9.0/5 FAIL decode=1.9/4 PASS (B.7 targets are hardware, 1080p60, direct path)
+### exit=0
+```
+
+  12–19 times the conversion cost (13.8 against 1.1 ms; 73–103 against 5.3 ms) for 2 columns. Recorded as an OPEN finding in `docs/VERIFICATION.md`
+  ("RGBA conversion of a picture whose width is not a multiple of 8"); not fixed here: either the host fits
+  every picture's width to a multiple of 8 (a crop of up to 7 columns, which amends M1-74 (3)'s "the whole
+  desktop but for an odd last column") or `tornect-codec` converts the last columns itself.
+- **Encoder threads (`--threads 0`, automatic: 3 on 4 vCPU) against 1:** encode p50 1.04–1.14× faster at
+  1080p and above (20.6 → 18.0 ms at 2560×1440 Best quality, 41.9 → 40.3 ms at 3538×1918), no change at 720p.
+  Far from the 1.5× that design §9 asks before the default may change: the default stays 1 (M1-74 (5)).
+- **`unreadable=0` in every run:** each decoded picture's index was read back from the strip and matched to
+  its capture stamp, so the e2e numbers are per picture, not estimates.
+- `kbps` falls to 6–14 after the first second: the card is a still picture with a moving square and strip,
+  so it measures CPU stages, not link rates (those come from the live Tor run, design §9 row 1, NEEDS-DEVICE).
+
 ## Appendix: the driver (Python 3, standard library only)
 
 Run from the repository root after `cargo build --workspace --bins`:
