@@ -748,6 +748,57 @@ mod tests {
         }
     }
 
+    /// B26: the connect field refuses this computer's own ID, as Add
+    /// computer does: it says so, Connect stays disabled, Enter asks for
+    /// nothing, and no look-alike warning or "Connect anyway" is offered for
+    /// it (it is not a different address). Another valid ID still connects.
+    #[test]
+    fn the_connect_field_refuses_this_computers_own_id() {
+        let mut model = with_book(false);
+        let mine = ed25519_dalek::SigningKey::from_bytes(&[6; 32]).verifying_key();
+        let own = TornectId::from_public_key(&mine);
+        model.id = Some(own.display_groups());
+        model.connect_warning = Some(super::super::model::ConnectWarning {
+            id: own,
+            name: "Linux PC".to_owned(),
+        });
+        let mut window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        for typed in [own.display_groups(), own.to_string()] {
+            window.form.connect_to = typed.clone();
+            window.pass(Vec::new());
+            window.pass(Vec::new());
+            assert!(has_text(&window, home::OWN_ID), "{typed}");
+            assert!(!has_text(&window, "Looks like"), "{typed}");
+            assert!(
+                !window.controls().iter().any(|c| c == "Connect anyway"),
+                "{typed}"
+            );
+            assert!(window.node("Connect").is_disabled(), "{typed}");
+            let connect = window.center("Connect");
+            assert!(window.click(connect).is_empty(), "{typed}");
+            let field = window
+                .nodes
+                .iter()
+                .find(|n| n.role() == Role::TextInput)
+                .and_then(Node::bounds)
+                .expect("the connect field");
+            let at = egui::pos2(
+                ((field.x0 + field.x1) / 2.0) as f32,
+                ((field.y0 + field.y1) / 2.0) as f32,
+            );
+            assert!(window.click(at).is_empty(), "{typed}");
+            assert!(window.key(egui::Key::Enter).is_empty(), "{typed}");
+        }
+        let other = TornectId::from_public_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key(),
+        );
+        window.form.connect_to = other.display_groups();
+        window.pass(Vec::new());
+        assert!(!has_text(&window, home::OWN_ID));
+        let connect = window.center("Connect");
+        assert_eq!(window.click(connect), vec![Action::Connect(other)]);
+    }
+
     /// Rename starts from the saved name and saves what was typed.
     #[test]
     fn rename_saves_the_typed_name() {

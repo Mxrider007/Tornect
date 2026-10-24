@@ -2399,6 +2399,12 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                         if viewing.as_ref().is_some_and(|(_, task)| !task.is_finished()) {
                             continue;
                         }
+                        // The connect field refuses this computer's own ID;
+                        // nothing is dialled should one come (B26).
+                        if id == b.identity.id() {
+                            b.shared.update(own_id_refused);
+                            continue;
+                        }
                         // The second click counts only for the ID warned about.
                         let anyway = matches!(command, Command::ConnectAnyway(_))
                             && b.shared.read(|m| {
@@ -2600,6 +2606,10 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                         if viewing.as_ref().is_some_and(|(_, task)| !task.is_finished())
                             || b.shared.read(|m| m.setup_changed.contains(&id))
                         {
+                            continue;
+                        }
+                        if id == b.identity.id() {
+                            b.shared.update(own_id_refused);
                             continue;
                         }
                         let request = match unattended_request(&b, &id, choice) {
@@ -3528,6 +3538,18 @@ fn ua_failure(err: &HandshakeError, ended: &ua_client::Ended) -> (Failure, u8) {
         _ => (Failure::Other, 2),
     }
 }
+
+/// A connect to this computer's own ID, refused before anything is dialled
+/// (B26): no warning stays, and the stepper says why, with nothing done.
+fn own_id_refused(m: &mut super::model::Model) {
+    m.connect_warning = None;
+    m.connect_unchecked = None;
+    m.dial = Dial::default();
+    m.client = ClientStage::Ended(OWN_ID.to_owned());
+}
+
+/// What a connect to this computer's own ID ends with.
+const OWN_ID: &str = "That is this computer's own ID: there is nothing to connect to.";
 
 /// Record why the connection ended without a session, at the step it had
 /// reached.
@@ -6350,6 +6372,28 @@ mod tests {
             failed_at_stage(&mut m, Failure::Cancelled);
             assert_eq!(m.dial.failed, Some((Failure::Cancelled, step)), "{stage:?}");
         }
+    }
+
+    /// B26: a connect to this computer's own ID ends before anything is
+    /// dialled, with the reason and no warning left over, and the stepper
+    /// shows no step done.
+    #[test]
+    fn this_computers_own_id_is_refused() {
+        let own = HostIdentity::from_seed(&[0x31; 32]).id();
+        let mut m = Model {
+            connect_warning: Some(super::super::model::ConnectWarning {
+                id: own,
+                name: "Linux PC".to_owned(),
+            }),
+            connect_unchecked: Some(own),
+            ..Model::default()
+        };
+        m.dial.went_live = true;
+        own_id_refused(&mut m);
+        assert!(matches!(&m.client, ClientStage::Ended(why) if why == OWN_ID));
+        assert!(m.connect_warning.is_none() && m.connect_unchecked.is_none());
+        assert_eq!(m.dial.id, None);
+        assert!(!m.dial.went_live && m.dial.failed.is_none());
     }
 
     /// B02: the window's words for a Tor that did not start name no command,
