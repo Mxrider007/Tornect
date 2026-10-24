@@ -193,8 +193,9 @@ struct Inner {
 /// [`MutationGuard`](super::guard::MutationGuard), the single enforcement point of
 /// §B.8.6.2 (re-auth, remote-session rule, refusal lines); the public surface is the
 /// read API plus the runtime-state writes the host performs on its own
-/// ([`Self::record_session_end`], [`Self::housekeeping`], [`Self::verify_log`],
-/// [`Self::log_event`], [`Self::retry_load`]) and the limiter's charge / settle.
+/// ([`Self::record_session_start`], [`Self::record_session_end`],
+/// [`Self::housekeeping`], [`Self::verify_log`], [`Self::log_event`],
+/// [`Self::retry_load`]) and the limiter's charge / settle.
 #[derive(Clone)]
 pub struct GrantStore {
     inner: Arc<Inner>,
@@ -1099,6 +1100,26 @@ impl GrantStore {
             },
         );
         Ok(())
+    }
+
+    /// Record an unattended session's start on the grant's `last_used` (runtime write):
+    /// `at = now`, no duration yet (§B.8.4.5 `Accepting`: `SESSION_ACCEPT` →
+    /// `last_used`). [`Self::record_session_end`] then adds its length, so `at +
+    /// duration_secs` is the session's end, which the reconnect cooldown counts from.
+    pub fn record_session_start(
+        &self,
+        device: &DeviceId,
+        transport: crate::session_log::TransportKind,
+    ) -> Result<(), StoreError> {
+        self.mutate(WriteClass::Runtime, None, |s, now| {
+            let g = s.grant_mut(device).ok_or(StoreError::NoGrant)?;
+            g.last_used = Some(super::grant::LastUsed {
+                at: now,
+                transport,
+                duration_secs: 0,
+            });
+            Ok(())
+        })
     }
 
     /// Record how a session ended on the grant's `last_used` (runtime write).
