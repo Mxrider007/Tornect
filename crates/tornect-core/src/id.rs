@@ -347,8 +347,9 @@ impl<'b, C> minicbor::Decode<'b, C> for TornectId {
 /// `s` without a case-insensitive ASCII `suffix`. Typed or pasted text can hold any
 /// character, so the cut point may fall inside a multi-byte one: `get` answers `None`
 /// there instead of the panic a range index would raise (such a tail cannot equal an
-/// ASCII suffix anyway).
-fn strip_suffix_ignore_case<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+/// ASCII suffix anyway). Crate-visible so the invitation parser strips `.onion` the
+/// same boundary-safe way.
+pub(crate) fn strip_suffix_ignore_case<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
     let cut = s.len().checked_sub(suffix.len())?;
     let tail = s.get(cut..)?;
     if tail.eq_ignore_ascii_case(suffix) {
@@ -492,6 +493,27 @@ mod tests {
         );
         assert_eq!(strip_suffix_ignore_case("ë.onion", ONION_SUFFIX), Some("ë"));
         assert_eq!(strip_suffix_ignore_case("onion", ONION_SUFFIX), None);
+    }
+
+    /// The cases the invitation design names: six bytes before the end of `x€onion`
+    /// fall inside the `€` (the slice that used to panic), while `€.onion` and a
+    /// combining accent before `.onion` cut on a boundary and strip to a short body.
+    #[test]
+    fn a_cut_inside_a_character_is_an_error_not_a_panic() {
+        for text in ["x€onion", "€.onion", "ab\u{301}.onion"] {
+            assert!(text.parse::<TornectId>().is_err(), "{text}");
+            assert!(text.parse::<DeviceId>().is_err(), "{text}");
+        }
+        assert_eq!(strip_suffix_ignore_case("x€onion", ONION_SUFFIX), None);
+        assert_eq!(strip_suffix_ignore_case("€.onion", ONION_SUFFIX), Some("€"));
+        assert_eq!(
+            strip_suffix_ignore_case("ab\u{301}.onion", ONION_SUFFIX),
+            Some("ab\u{301}")
+        );
+        assert_eq!(
+            strip_suffix_ignore_case("x€.OnIoN", ONION_SUFFIX),
+            Some("x€")
+        );
     }
 
     proptest! {
