@@ -1320,12 +1320,50 @@ impl MediaObserver for CliMedia {
     fn capture_stopped(&self, session_id: &str, report: &MediaReport, end: &MediaEnd) {
         say(format_args!("SHARING STOPPED {session_id}"));
         note(format_args!(
-            "screen sharing stopped ({}): {} pictures, {} KiB sent",
+            "screen sharing stopped ({}): {} pictures, {} KiB sent; {}",
             describe_media_end(*end),
             report.frames_sent,
-            report.bytes_sent / 1024
+            report.bytes_sent / 1024,
+            stage_means(report)
         ));
     }
+}
+
+/// The means of a served stream's stages, for the host's stop line (the
+/// quality design §3.5): `encode 9.8 ms, scale 2.1 ms, convert 1.5 ms, send
+/// 120 ms, round trip 1.1 s, quality changes 2`. The stage means are over the
+/// pictures sent and the round trip over the acks; each is left out when
+/// there were none.
+pub(crate) fn stage_means(report: &MediaReport) -> String {
+    let mut parts = Vec::new();
+    if report.frames_sent > 0 {
+        let mean = |sum: u64| duration_text(sum / report.frames_sent);
+        parts.push(format!("encode {}", mean(report.encode_us)));
+        parts.push(format!("scale {}", mean(report.scale_us)));
+        parts.push(format!("convert {}", mean(report.convert_us)));
+        parts.push(format!("send {}", mean(report.send_us)));
+    }
+    if let Some(rtt) = report.ack_us.checked_div(report.acks) {
+        parts.push(format!("round trip {}", duration_text(rtt)));
+    }
+    parts.push(format!("quality changes {}", report.quality_changes));
+    parts.join(", ")
+}
+
+/// A duration in µs as people read it (the quality design §3.3): one decimal
+/// under 10 ms (`9.8 ms`), whole milliseconds under a second (`120 ms`), then
+/// seconds with one decimal (`1.1 s`).
+pub(crate) fn duration_text(us: u64) -> String {
+    let tenths_ms = us.saturating_add(50) / 100;
+    if tenths_ms < 100 {
+        return format!("{}.{} ms", tenths_ms / 10, tenths_ms % 10);
+    }
+    let ms = us.saturating_add(500) / 1000;
+    if ms < 1000 {
+        return format!("{ms} ms");
+    }
+    let tenths_s = us.saturating_add(50_000) / 100_000;
+    format!("{}.{} s", tenths_s / 10, tenths_s % 10)
 }
 
 pub(crate) fn describe_media_end(end: MediaEnd) -> String {
@@ -1639,6 +1677,56 @@ mod tests {
     };
 
     use super::*;
+
+    /// The quality design §3.5: the host's stop line (the terminal's and the
+    /// window's) ends with the stream's stage means, in §3.3's format: one
+    /// decimal under 10 ms, whole milliseconds under a second, then seconds;
+    /// a mean with nothing to average is left out.
+    #[test]
+    fn the_stop_line_says_the_stage_means() {
+        let report = MediaReport {
+            frames_sent: 10,
+            acks: 4,
+            encode_us: 98_000,
+            scale_us: 21_000,
+            convert_us: 15_000,
+            send_us: 1_200_000,
+            ack_us: 4_400_000,
+            quality_changes: 2,
+            ..MediaReport::default()
+        };
+        assert_eq!(
+            stage_means(&report),
+            "encode 9.8 ms, scale 2.1 ms, convert 1.5 ms, send 120 ms, round trip 1.1 s, \
+             quality changes 2"
+        );
+        assert_eq!(
+            stage_means(&MediaReport::default()),
+            "quality changes 0",
+            "no picture, no ack"
+        );
+        let unacked = MediaReport {
+            frames_sent: 1,
+            encode_us: 12_345,
+            ..MediaReport::default()
+        };
+        assert_eq!(
+            stage_means(&unacked),
+            "encode 12 ms, scale 0.0 ms, convert 0.0 ms, send 0.0 ms, quality changes 0"
+        );
+        for (us, text) in [
+            (0, "0.0 ms"),
+            (9_949, "9.9 ms"),
+            (9_950, "10 ms"),
+            (120_000, "120 ms"),
+            (999_499, "999 ms"),
+            (999_500, "1.0 s"),
+            (1_100_000, "1.1 s"),
+            (u64::MAX, "18446744073709.5 s"),
+        ] {
+            assert_eq!(duration_text(us), text, "{us} µs");
+        }
+    }
 
     struct Env {
         _tmp: tempfile::TempDir,

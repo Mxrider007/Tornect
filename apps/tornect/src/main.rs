@@ -43,7 +43,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
-use tornect_core::config::BridgeMode;
+use tornect_core::config::{BridgeMode, QualityPreset};
 use tornect_core::invite::{self, IdProblem};
 use tornect_core::keystore::{
     self, FileSecretStore, load_or_create_device_identity, load_or_create_host_identity,
@@ -270,6 +270,11 @@ enum Command {
         /// Keep only the signaling session: open no media stream.
         #[arg(long)]
         no_video: bool,
+        /// The picture quality to ask for: best-quality, balanced or
+        /// best-performance (default: [viewer] quality in config.toml, itself
+        /// balanced). The host fits it to its own limits.
+        #[arg(long, value_name = "PRESET")]
+        quality: Option<QualityPreset>,
         /// Connect without asking: this device's unattended access at the host
         /// (a paired host whose owner gave it). The password is asked on this
         /// terminal, never taken from the command line or the environment; one
@@ -719,6 +724,7 @@ fn main() -> anyhow::Result<()> {
             forget,
             pings,
             no_video,
+            quality,
             unattended,
             view_only,
             remember,
@@ -734,6 +740,7 @@ fn main() -> anyhow::Result<()> {
                     forget,
                     pings,
                     video: !no_video,
+                    quality,
                     unattended: unattended.then_some(tor_cmd::UnattendedOpts {
                         view_only,
                         remember,
@@ -1191,6 +1198,45 @@ mod tests {
     use tornect_core::unattended::ipc::{IpcRequest, IpcResponse, ShownLink};
 
     const ID: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwd";
+
+    /// The quality design §3.5: `tornect connect <id> --quality P` takes the
+    /// three presets by their config names and nothing else (the refusal
+    /// names them); without it the session asks for `[viewer] quality`.
+    #[test]
+    fn connect_takes_a_quality_preset_by_its_name() {
+        use tornect_core::config::QualityPreset;
+        let parse = |args: &[&str]| {
+            super::Cli::try_parse_from(["tornect", "connect", ID].iter().chain(args))
+        };
+        let quality_of = |args: &[&str]| {
+            let Some(super::Command::Connect { quality, .. }) = parse(args).unwrap().command else {
+                panic!("not connect");
+            };
+            quality
+        };
+        assert_eq!(quality_of(&[]), None, "the config's value then");
+        for preset in QualityPreset::ALL {
+            assert_eq!(quality_of(&["--quality", preset.as_str()]), Some(preset));
+        }
+        assert_eq!(
+            quality_of(&["--unattended", "--quality=best-performance"]),
+            Some(QualityPreset::BestPerformance)
+        );
+        for wrong in ["fast", "Balanced", "", "speed"] {
+            let err = parse(&["--quality", wrong]).unwrap_err().to_string();
+            assert!(
+                err.contains("best-quality") && err.contains("best-performance"),
+                "{wrong:?}: {err}"
+            );
+        }
+        let help = super::Cli::command()
+            .find_subcommand_mut("connect")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--quality <PRESET>"), "{help}");
+        assert!(help.contains("best-performance"), "{help}");
+    }
 
     /// `tornect connect --unattended`: its options need it, it never pairs,
     /// and a `--password` is parsed only to be refused with the reason.

@@ -14,14 +14,14 @@ use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tornect_capture::TestCard;
 use tornect_codec::DecodedFrame;
-use tornect_core::config::BridgeMode;
+use tornect_core::config::{BridgeMode, QualityPreset};
 use tornect_core::keystore::{
     FileSecretStore, load_or_create_device_identity, load_or_create_host_identity,
 };
 use tornect_core::session_log::SessionMode;
 use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
 use tornect_input::InputEvent;
-use tornect_proto::ProtoError;
+use tornect_proto::{HostStats, ProtoError, QualityInfo};
 use tornect_session::{
     Binding, DesktopBackend, FrameSink, MediaHost, MediaLimits, MediaViewer, Source, SystemBackend,
     ViewerEnd, ViewerError, ViewerStats,
@@ -72,6 +72,10 @@ const BYE_GRACE: Duration = Duration::from_secs(5);
 
 /// How often `tornect connect` reports the pictures it receives.
 const VIDEO_NOTE_EVERY: Duration = Duration::from_secs(5);
+/// Least time between two `MEDIA QUALITY` lines, and between two `MEDIA
+/// TIMING` lines (the quality design §3.5): a host that keeps saying things
+/// cannot flood the terminal.
+const MEDIA_LINE_EVERY: Duration = Duration::from_secs(1);
 
 fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
@@ -266,7 +270,8 @@ async fn run_host(
             Arc::clone(&helpers),
         )),
         Arc::new(CliMedia::new(control.clone())),
-        MediaLimits::default(),
+        // The presets' bounds come from this host's `[media]`.
+        MediaLimits::with_media(&cfg.media),
     ));
     let HostWiring {
         cfg: host_cfg,
@@ -531,6 +536,8 @@ pub struct ConnectOpts {
     pub pings: Option<u32>,
     /// Open the session's media stream and receive the shared screen.
     pub video: bool,
+    /// The picture quality to ask for; `None` asks for `[viewer] quality`.
+    pub quality: Option<QualityPreset>,
     /// Connect without asking, on this device's unattended grant.
     pub unattended: Option<UnattendedOpts>,
 }
@@ -1043,15 +1050,18 @@ async fn connect_session(
 
     let interrupts = Interrupts::listen();
     let end = if opts.video {
+        let watching = WatchOptions {
+            pings: opts.pings,
+            quality: opts.quality.unwrap_or(cfg.viewer.quality),
+            ..WatchOptions::default()
+        };
         watch(
             node,
             &id,
             &isolation,
             &mut session,
-            opts.pings,
             &interrupts.pressed,
-            None,
-            None,
+            watching,
         )
         .await?
     } else {
@@ -1138,28 +1148,48 @@ pub(crate) enum End {
     NoPicture(anyhow::Error),
 }
 
+/// How [`watch`] receives the screen.
+#[derive(Default)]
+pub(crate) struct WatchOptions<'a> {
+    /// End the session after this many pings; `None` keeps it until the user
+    /// ends it.
+    pub pings: Option<u32>,
+    /// Each event goes to the host: the caller passes one only for a control
+    /// session, by the signed `SESSION_ACCEPT`'s mode (SLICE-C2 C2-6).
+    pub input: Option<mpsc::Receiver<InputEvent>>,
+    /// Every picture, and what the host says about them, also go here (the
+    /// window's).
+    pub forward: Option<&'a mut dyn FrameSink>,
+    /// The preset the `Bind` asks for.
+    pub quality: QualityPreset,
+    /// The viewer's picks during the session, each sent as a `SetQuality`.
+    pub quality_rx: Option<watch::Receiver<QualityPreset>>,
+}
+
 /// Open the session's media stream beside the signaling stream and receive
 /// the screen, while the signaling stream keeps the session alive. Whichever
 /// side ends first ends the other. `interrupted` turning `true` is the user's
-/// own end (Ctrl-C, or the window's Stop). Every picture also goes to
-/// `forward` (the window's), and each event from `input` goes to the host:
-/// the caller passes one only for a control session, by the signed
-/// `SESSION_ACCEPT`'s mode (SLICE-C2 C2-6).
-#[allow(clippy::too_many_arguments)]
+/// own end (Ctrl-C, or the window's Stop). `options` say what else goes
+/// where.
 pub(crate) async fn watch<S>(
     node: &TorNode,
     id: &TornectId,
     isolation: &Isolation,
     session: &mut ClientSession<S>,
-    pings: Option<u32>,
     interrupted: &watch::Receiver<bool>,
-    input: Option<mpsc::Receiver<InputEvent>>,
-    forward: Option<&mut dyn FrameSink>,
+    options: WatchOptions<'_>,
 ) -> anyhow::Result<End>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let binding = Binding::new(session.session_token(), &session.th());
+    let WatchOptions {
+        pings,
+        input,
+        forward,
+        quality,
+        quality_rx,
+    } = options;
+    let binding = Binding::new(session.session_token(), &session.th()).with_quality(quality);
     let opened = async {
         let stream = node
             .connect_on(id, MEDIA_PORT, isolation)
@@ -1167,7 +1197,7 @@ where
             .map_err(explain)?;
         MediaViewer::bind(stream, &binding, MEDIA_BIND_WAIT)
             .await
-            .map_err(|e| anyhow::Error::new(e).context("binding the media stream"))
+            .map_err(bind_failed)
     };
     let viewer = match unless_interrupted(opened, interrupted).await {
         None => {
@@ -1181,15 +1211,11 @@ where
         }
     };
     let bound = *viewer.bound();
-    println!(
-        "MEDIA BOUND {}x{} ({})",
-        bound.width,
-        bound.height,
-        match bound.mode {
-            SessionMode::ViewOnly => "view-only",
-            _ => "control",
-        }
-    );
+    println!("{}", bound_line(&bound));
+    let viewer = match quality_rx {
+        Some(picks) => viewer.with_quality(picks),
+        None => viewer,
+    };
 
     let mut pictures = CliPictures::new(forward);
     let mut stats = ViewerStats::default();
@@ -1211,6 +1237,14 @@ where
         (Err(e), End::You) => End::NoPicture(anyhow::Error::new(e)),
         (_, end) => end,
     })
+}
+
+/// A bind that failed, as `MEDIA FAILED` and the window's "No picture" say
+/// it: a host of another version reads "binding the media stream: the other
+/// computer runs a different version of Tornect; use the same version on
+/// both" (the quality design §3.5).
+fn bind_failed(e: ViewerError) -> anyhow::Error {
+    anyhow::Error::new(e).context("binding the media stream")
 }
 
 /// `work`, unless the first Ctrl-C comes first (`None`): opening and binding
@@ -1317,8 +1351,10 @@ fn media_end(viewed: &Result<ViewerEnd, ViewerError>, end: &End) -> String {
 }
 
 /// The CLI's stand-in for a viewer window: counts what it decodes, says so every
-/// few seconds, and checks the test card's frame index when there is one. The
-/// window, when there is one, gets every picture too (`forward`).
+/// few seconds, and checks the test card's frame index when there is one. It
+/// says what the host applies when that changes, and the host's means with
+/// its own, each at most once a second. The window, when there is one, gets
+/// every picture and every word from the host too (`forward`).
 struct CliPictures<'a> {
     forward: Option<&'a mut dyn FrameSink>,
     started: Instant,
@@ -1326,9 +1362,22 @@ struct CliPictures<'a> {
     decoded: u64,
     size: Option<(u32, u32)>,
     /// The first and last test-card index, while every picture has carried the
-    /// next one.
+    /// next one, or the last again just after a change of what the host
+    /// applies (a quality change encodes the last picture again).
     card: Option<(u32, u32)>,
     card_in_order: bool,
+    /// The host said it applies something new since the last picture.
+    changed_since_picture: bool,
+    /// What the host last said it applies, at which exact size.
+    said: Option<(u32, u32, QualityInfo)>,
+    /// When the last `MEDIA QUALITY` and `MEDIA TIMING` lines went out.
+    quality_line: Option<Instant>,
+    timing_line: Option<Instant>,
+    /// This viewer's decode and conversion since the last `MEDIA TIMING`
+    /// line: sums in µs, and the pictures.
+    decode_us: u64,
+    convert_us: u64,
+    timed: u64,
 }
 
 impl<'a> CliPictures<'a> {
@@ -1342,6 +1391,13 @@ impl<'a> CliPictures<'a> {
             size: None,
             card: None,
             card_in_order: true,
+            changed_since_picture: false,
+            said: None,
+            quality_line: None,
+            timing_line: None,
+            decode_us: 0,
+            convert_us: 0,
+            timed: 0,
         }
     }
 
@@ -1350,9 +1406,18 @@ impl<'a> CliPictures<'a> {
     }
 
     fn report(&self, stats: &ViewerStats) {
+        for line in self.report_lines(stats) {
+            println!("{line}");
+        }
+    }
+
+    /// The lines that end a stream: `MEDIA OK` (its wording is what the
+    /// evidence drivers match), the card's order, the input sent, and what
+    /// the host last said it applies.
+    fn report_lines(&self, stats: &ViewerStats) -> Vec<String> {
         let secs = self.started.elapsed().as_secs_f64().max(0.001);
         let (w, h) = self.size.unwrap_or_default();
-        println!(
+        let mut lines = vec![format!(
             "MEDIA {} pictures={} units={} keyframes={} errors={} size={w}x{h} fps={:.1} kbps={:.0}",
             if self.decoded > 0 { "OK" } else { "EMPTY" },
             self.decoded,
@@ -1361,30 +1426,194 @@ impl<'a> CliPictures<'a> {
             stats.decode_errors,
             self.fps(),
             stats.bytes as f64 * 8.0 / 1000.0 / secs,
-        );
+        )];
         // Only a test card carries an index in every picture, in order.
         if let Some((first, last)) = self.card.filter(|_| self.card_in_order && self.decoded > 1) {
-            println!("MEDIA CARD first={first} last={last} in-order");
+            lines.push(format!("MEDIA CARD first={first} last={last} in-order"));
         }
         if stats.input_sent > 0 {
-            println!("MEDIA INPUT sent={}", stats.input_sent);
+            lines.push(format!("MEDIA INPUT sent={}", stats.input_sent));
         }
+        // The last value is always in the report, also when the one-second
+        // limit held its line back.
+        if let Some((width, height, quality)) = self.said {
+            lines.push(quality_line(width, height, &quality));
+        }
+        lines
+    }
+
+    /// What the host applies changed (`FrameSink::quality`): the line to
+    /// print now, if any. The first is `BindOk`'s, which the `MEDIA BOUND`
+    /// line already said; later ones go out at most once a second.
+    fn quality_at(
+        &mut self,
+        width: u32,
+        height: u32,
+        quality: &QualityInfo,
+        now: Instant,
+    ) -> Option<String> {
+        let first = self.said.is_none();
+        self.said = Some((width, height, *quality));
+        self.changed_since_picture = !first;
+        if first {
+            return None;
+        }
+        if self
+            .quality_line
+            .is_some_and(|at| now.duration_since(at) < MEDIA_LINE_EVERY)
+        {
+            // The report says the last value.
+            return None;
+        }
+        self.quality_line = Some(now);
+        Some(quality_line(width, height, quality))
+    }
+
+    /// The host's means arrived (`FrameSink::host_stats`): the `MEDIA
+    /// TIMING` line to print now, with this viewer's own means since the
+    /// last one, at most once a second.
+    fn host_stats_at(&mut self, host: &HostStats, now: Instant) -> Option<String> {
+        if self
+            .timing_line
+            .is_some_and(|at| now.duration_since(at) < MEDIA_LINE_EVERY)
+        {
+            return None;
+        }
+        self.timing_line = Some(now);
+        let line = timing_line(
+            mean_us(self.decode_us, self.timed),
+            mean_us(self.convert_us, self.timed),
+            host,
+        );
+        (self.decode_us, self.convert_us, self.timed) = (0, 0, 0);
+        Some(line)
+    }
+}
+
+/// `sum` over `n`, 0 for none.
+fn mean_us(sum: u64, n: u64) -> u64 {
+    sum.checked_div(n).unwrap_or(0)
+}
+
+/// `d` in whole microseconds, saturating.
+fn micros(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// A preset's config name from its wire code.
+fn preset_name(code: u8) -> String {
+    tornect_session::quality::preset(code)
+        .map_or_else(|| format!("preset-{code}"), |p| p.as_str().to_owned())
+}
+
+/// What a `QualityInfo` says, as the `MEDIA` lines put it:
+/// `quality=balanced fps<=15 kbps=1500 cap=1920x1080`.
+fn quality_fields(quality: &QualityInfo) -> String {
+    format!(
+        "quality={} fps<={} kbps={} cap={}x{}",
+        preset_name(quality.preset),
+        quality.max_fps,
+        quality.kbps,
+        quality.max_long,
+        quality.max_short
+    )
+}
+
+/// The line that says the stream is bound (the quality design §3.5):
+/// `MEDIA BOUND 1280x720 (control) quality=balanced fps<=15 kbps=1500
+/// cap=1920x1080`.
+fn bound_line(bound: &tornect_session::BoundStream) -> String {
+    format!(
+        "MEDIA BOUND {}x{} ({}) {}",
+        bound.width,
+        bound.height,
+        match bound.mode {
+            SessionMode::ViewOnly => "view-only",
+            _ => "control",
+        },
+        quality_fields(&bound.quality)
+    )
+}
+
+/// The line that says what the host applies now: `MEDIA QUALITY
+/// quality=best-performance fps<=20 kbps=1000 cap=1280x720 size=1280x694`.
+fn quality_line(width: u32, height: u32, quality: &QualityInfo) -> String {
+    format!(
+        "MEDIA QUALITY {} size={width}x{height}",
+        quality_fields(quality)
+    )
+}
+
+/// The line of per-stage means (the quality design §3.5): this viewer's
+/// decode and conversion, the host's stages, the ack round trip and the
+/// source size. Every number from the host is display-only.
+fn timing_line(decode_us: u64, convert_us: u64, host: &HostStats) -> String {
+    format!(
+        "MEDIA TIMING decode_ms={} yuv2rgb_ms={} host_grab_ms={} host_age_ms={} \
+         host_scale_ms={} host_convert_ms={} host_encode_ms={} host_send_ms={} ack_ms={} \
+         source={}x{}",
+        ms_field(decode_us),
+        ms_field(convert_us),
+        ms_field(u64::from(host.grab_us)),
+        ms_field(u64::from(host.age_us)),
+        ms_field(u64::from(host.scale_us)),
+        ms_field(u64::from(host.convert_us)),
+        ms_field(u64::from(host.encode_us)),
+        ms_field(u64::from(host.send_us)),
+        ms_field(u64::from(host.ack_us)),
+        host.source_width,
+        host.source_height,
+    )
+}
+
+/// µs as a `_ms=` value: one decimal under 10 ms (`3.1`), whole
+/// milliseconds from there (`120`, `1100`).
+fn ms_field(us: u64) -> String {
+    let tenths = us.saturating_add(50) / 100;
+    if tenths < 100 {
+        format!("{}.{}", tenths / 10, tenths % 10)
+    } else {
+        (us.saturating_add(500) / 1000).to_string()
     }
 }
 
 impl FrameSink for CliPictures<'_> {
+    fn quality(&mut self, width: u32, height: u32, quality: &QualityInfo) {
+        if let Some(forward) = self.forward.as_deref_mut() {
+            forward.quality(width, height, quality);
+        }
+        if let Some(line) = self.quality_at(width, height, quality, Instant::now()) {
+            println!("{line}");
+        }
+    }
+
+    fn host_stats(&mut self, stats: &HostStats) {
+        if let Some(forward) = self.forward.as_deref_mut() {
+            forward.host_stats(stats);
+        }
+        if let Some(line) = self.host_stats_at(stats, Instant::now()) {
+            println!("{line}");
+        }
+    }
+
     fn picture(&mut self, seq: u32, frame: &DecodedFrame) {
         if let Some(forward) = self.forward.as_deref_mut() {
             forward.picture(seq, frame);
         }
         self.decoded += 1;
+        self.decode_us = self.decode_us.saturating_add(micros(frame.timing.decode));
+        self.convert_us = self.convert_us.saturating_add(micros(frame.timing.convert));
+        self.timed += 1;
         // Sized from the picture itself, never from `BindOk` (SLICE-A2 A2-4).
         self.size = Some((frame.width, frame.height));
         // RGBA keeps green at offset 1, as the BGRx the card is drawn in does.
         let index = TestCard::read_index(&frame.rgba, frame.width, frame.height);
+        let repeat_allowed = std::mem::take(&mut self.changed_since_picture);
         self.card = match (self.card, index) {
             (None, Some(index)) if self.decoded == 1 => Some((index, index)),
-            (Some((first, last)), Some(index)) if index == last.wrapping_add(1) => {
+            (Some((first, last)), Some(index))
+                if index == last.wrapping_add(1) || (repeat_allowed && index == last) =>
+            {
                 Some((first, index))
             }
             (card, _) => {
@@ -1824,6 +2053,272 @@ mod tests {
             "{end:?}"
         );
         host.await.unwrap().unwrap();
+    }
+
+    /// The quality design §3.5: the `MEDIA` lines of the presets, as the
+    /// design words them, and the numbers' format (one decimal under 10 ms,
+    /// whole milliseconds from there; every host value saturates).
+    #[test]
+    fn the_media_lines_say_the_preset_and_the_stage_means() {
+        use tornect_session::BoundStream;
+        let balanced = QualityInfo {
+            preset: tornect_proto::quality::BALANCED,
+            max_fps: 15,
+            kbps: 1500,
+            max_long: 1920,
+            max_short: 1080,
+        };
+        let mut bound = BoundStream {
+            width: 1280,
+            height: 720,
+            mode: SessionMode::Control,
+            quality: balanced,
+        };
+        assert_eq!(
+            bound_line(&bound),
+            "MEDIA BOUND 1280x720 (control) quality=balanced fps<=15 kbps=1500 cap=1920x1080"
+        );
+        bound.mode = SessionMode::ViewOnly;
+        assert!(bound_line(&bound).starts_with("MEDIA BOUND 1280x720 (view-only) quality="));
+        let performance = QualityInfo {
+            preset: tornect_proto::quality::BEST_PERFORMANCE,
+            max_fps: 20,
+            kbps: 1000,
+            max_long: 1280,
+            max_short: 720,
+        };
+        assert_eq!(
+            quality_line(1280, 694, &performance),
+            "MEDIA QUALITY quality=best-performance fps<=20 kbps=1000 cap=1280x720 size=1280x694"
+        );
+        let host = HostStats {
+            source_width: 2560,
+            source_height: 1440,
+            frames: 15,
+            window_ms: 1000,
+            grab_us: 4000,
+            age_us: 6200,
+            scale_us: 2100,
+            convert_us: 1500,
+            encode_us: 9800,
+            send_us: 120_000,
+            ack_us: 1_100_000,
+        };
+        assert_eq!(
+            timing_line(3100, 1200, &host),
+            "MEDIA TIMING decode_ms=3.1 yuv2rgb_ms=1.2 host_grab_ms=4.0 host_age_ms=6.2 \
+             host_scale_ms=2.1 host_convert_ms=1.5 host_encode_ms=9.8 host_send_ms=120 \
+             ack_ms=1100 source=2560x1440"
+        );
+        for (us, text) in [
+            (0, "0.0"),
+            (49, "0.0"),
+            (50, "0.1"),
+            (9_949, "9.9"),
+            (9_950, "10"),
+            (999_499, "999"),
+            (1_100_000, "1100"),
+            (u64::from(u32::MAX), "4294967"),
+            (u64::MAX, "18446744073709551"),
+        ] {
+            assert_eq!(ms_field(us), text, "{us} µs");
+        }
+        let unknown = QualityInfo {
+            preset: 9,
+            ..balanced
+        };
+        assert!(quality_line(8, 2, &unknown).contains("quality=preset-9 "));
+    }
+
+    /// The quality design §3.5: a host of another version is said as such,
+    /// on the `MEDIA FAILED` line and in the window's "No picture" note.
+    #[test]
+    fn a_host_of_another_version_is_said_on_the_failed_line() {
+        assert_eq!(
+            format!("MEDIA FAILED: {:#}", bind_failed(ViewerError::Version)),
+            "MEDIA FAILED: binding the media stream: the other computer runs a different \
+             version of Tornect; use the same version on both"
+        );
+    }
+
+    /// A picture of the test card at `index`, as the decoder lends it (the
+    /// card's BGRx keeps green where RGBA does, which is what the index is
+    /// read from).
+    fn card_picture(width: u32, height: u32, index: u32) -> DecodedFrame {
+        DecodedFrame {
+            width,
+            height,
+            rgba: TestCard::render(width, height, index),
+            timing: tornect_codec::DecodeTiming {
+                decode: Duration::from_micros(3000),
+                convert: Duration::from_micros(1000),
+            },
+        }
+    }
+
+    /// The quality design §3.5: `MEDIA CARD … in-order` accepts the last
+    /// index again right after the host said it applies something new (a
+    /// quality change encodes the last picture again), and nowhere else.
+    #[test]
+    fn the_card_check_takes_a_repeat_only_after_a_quality_change() {
+        let balanced = QualityInfo {
+            preset: tornect_proto::quality::BALANCED,
+            max_fps: 15,
+            kbps: 1500,
+            max_long: 1920,
+            max_short: 1080,
+        };
+        let performance = QualityInfo {
+            preset: tornect_proto::quality::BEST_PERFORMANCE,
+            ..balanced
+        };
+        let stats = ViewerStats::default();
+        let card_line = |pictures: &CliPictures<'_>| {
+            pictures
+                .report_lines(&stats)
+                .into_iter()
+                .find(|line| line.starts_with("MEDIA CARD"))
+        };
+
+        let mut pictures = CliPictures::new(None);
+        pictures.quality(256, 96, &balanced);
+        for index in [5, 6] {
+            pictures.picture(index, &card_picture(256, 96, index));
+        }
+        pictures.quality(256, 96, &performance);
+        for index in [6, 7, 8] {
+            pictures.picture(index, &card_picture(256, 96, index));
+        }
+        assert_eq!(
+            card_line(&pictures).as_deref(),
+            Some("MEDIA CARD first=5 last=8 in-order")
+        );
+
+        // The same index again with no change before it is out of order.
+        let mut pictures = CliPictures::new(None);
+        pictures.quality(256, 96, &balanced);
+        for index in [5, 6, 6, 7] {
+            pictures.picture(index, &card_picture(256, 96, index));
+        }
+        assert_eq!(card_line(&pictures), None);
+
+        // A change lets one repeat through, not two.
+        let mut pictures = CliPictures::new(None);
+        pictures.quality(256, 96, &balanced);
+        pictures.picture(0, &card_picture(256, 96, 5));
+        pictures.quality(256, 96, &performance);
+        for index in [5, 5] {
+            pictures.picture(index, &card_picture(256, 96, index));
+        }
+        assert_eq!(card_line(&pictures), None);
+    }
+
+    /// Records what a `CliPictures` forwards.
+    #[derive(Default)]
+    struct Forwarded {
+        pictures: Vec<u32>,
+        said: Vec<(u32, u32, QualityInfo)>,
+        host: Vec<HostStats>,
+    }
+
+    impl FrameSink for Forwarded {
+        fn picture(&mut self, seq: u32, _: &DecodedFrame) {
+            self.pictures.push(seq);
+        }
+
+        fn quality(&mut self, width: u32, height: u32, quality: &QualityInfo) {
+            self.said.push((width, height, *quality));
+        }
+
+        fn host_stats(&mut self, stats: &HostStats) {
+            self.host.push(*stats);
+        }
+    }
+
+    /// The quality design §3.5: the `MEDIA QUALITY` line goes out when what
+    /// the host applies changes (not for `BindOk`'s, which `MEDIA BOUND`
+    /// says), at most once a second, and the last value is always in the
+    /// final report; `MEDIA TIMING` goes out with a host's means at most
+    /// once a second, with this viewer's means since the line before. The
+    /// window gets every picture and every word from the host whatever the
+    /// terminal prints.
+    #[test]
+    fn the_quality_and_timing_lines_are_rate_limited_and_the_window_gets_all() {
+        let balanced = QualityInfo {
+            preset: tornect_proto::quality::BALANCED,
+            max_fps: 15,
+            kbps: 1500,
+            max_long: 1920,
+            max_short: 1080,
+        };
+        let quick = QualityInfo {
+            preset: tornect_proto::quality::BEST_PERFORMANCE,
+            max_fps: 20,
+            kbps: 1000,
+            max_long: 1280,
+            max_short: 720,
+        };
+        let sharp = QualityInfo {
+            preset: tornect_proto::quality::BEST_QUALITY,
+            max_fps: 12,
+            kbps: 4000,
+            max_long: 3840,
+            max_short: 2160,
+        };
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut window = Forwarded::default();
+        let mut pictures = CliPictures::new(Some(&mut window));
+        assert_eq!(pictures.quality_at(1600, 900, &balanced, at(0)), None);
+        assert_eq!(
+            pictures.quality_at(1280, 720, &quick, at(10)).as_deref(),
+            Some(
+                "MEDIA QUALITY quality=best-performance fps<=20 kbps=1000 cap=1280x720 \
+                 size=1280x720"
+            )
+        );
+        assert_eq!(pictures.quality_at(1600, 900, &sharp, at(500)), None);
+        let host = |frames| HostStats {
+            source_width: 1600,
+            source_height: 900,
+            frames,
+            window_ms: 1000,
+            encode_us: 9800,
+            ..HostStats::default()
+        };
+        pictures.picture(1, &card_picture(64, 48, 1));
+        pictures.picture(2, &card_picture(64, 48, 2));
+        let first = pictures.host_stats_at(&host(1), at(600)).unwrap();
+        assert!(
+            first.starts_with("MEDIA TIMING decode_ms=3.0 yuv2rgb_ms=1.0 host_grab_ms=0.0 "),
+            "{first}"
+        );
+        assert!(first.contains(" host_encode_ms=9.8 "), "{first}");
+        assert!(first.ends_with(" source=1600x900"), "{first}");
+        assert_eq!(pictures.host_stats_at(&host(2), at(1500)), None);
+        let next = pictures.host_stats_at(&host(3), at(1600)).unwrap();
+        assert!(
+            next.starts_with("MEDIA TIMING decode_ms=0.0 yuv2rgb_ms=0.0 "),
+            "no picture since the line before: {next}"
+        );
+        let report = pictures.report_lines(&ViewerStats::default());
+        assert_eq!(
+            report.last().map(String::as_str),
+            Some(
+                "MEDIA QUALITY quality=best-quality fps<=12 kbps=4000 cap=3840x2160 \
+                 size=1600x900"
+            ),
+            "{report:?}"
+        );
+        assert!(report[0].starts_with("MEDIA OK pictures=2 "), "{report:?}");
+
+        // Through the hooks, everything reaches the window.
+        pictures.quality(1600, 900, &balanced);
+        pictures.host_stats(&host(4));
+        pictures.picture(3, &card_picture(64, 48, 3));
+        assert_eq!(window.said, [(1600, 900, balanced)]);
+        assert_eq!(window.host, [host(4)]);
+        assert_eq!(window.pictures, [1, 2, 3]);
     }
 
     /// A live session's media stream, whose host end took the `Bind` and

@@ -1639,12 +1639,14 @@ impl MediaObserver for GuiMedia {
     fn capture_stopped(&self, session_id: &str, report: &MediaReport, end: &MediaEnd) {
         say(format_args!("SHARING STOPPED {session_id}"));
         let line = format!(
-            "screen sharing stopped ({}): {} pictures, {} KiB sent; input {} injected, {} dropped",
+            "screen sharing stopped ({}): {} pictures, {} KiB sent; input {} injected, {} \
+             dropped; {}",
             crate::host::describe_media_end(*end),
             report.frames_sent,
             report.bytes_sent / 1024,
             report.input_injected,
-            report.input_dropped
+            report.input_dropped,
+            crate::host::stage_means(report)
         );
         note(format_args!("{line}"));
         self.shared.update(|m| m.note(line));
@@ -1679,7 +1681,8 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         Arc::new(GuiMedia {
             shared: Arc::clone(&b.shared),
         }),
-        MediaLimits::default(),
+        // The presets' bounds come from this host's `[media]`.
+        MediaLimits::with_media(&b.cfg.media),
     ));
     let HostWiring {
         cfg,
@@ -3563,17 +3566,13 @@ async fn viewed(
             told.update(|m| m.host_notice = code);
         }
     });
-    let end = crate::tor_cmd::watch(
-        node,
-        &id,
-        &isolation,
-        &mut session,
-        None,
-        stop,
+    let watching = crate::tor_cmd::WatchOptions {
         input,
-        Some(&mut sink),
-    )
-    .await;
+        forward: Some(&mut sink),
+        quality: b.shared.read(|m| m.settings.viewer.quality),
+        ..crate::tor_cmd::WatchOptions::default()
+    };
+    let end = crate::tor_cmd::watch(node, &id, &isolation, &mut session, stop, watching).await;
     notices_task.abort();
     // Awaited, so that no code the task held lands after the clear.
     let _ = notices_task.await;
