@@ -797,6 +797,8 @@ impl MediaHost {
         let mut seq: u32 = 0;
         let mut pending = Some(first);
         let mut torn = false;
+        // The instant the gate's timer slept until, when it woke the loop.
+        let mut turn: Option<Instant> = None;
 
         let ended = 'serve: loop {
             // The viewer's latest pick, at the gate's turn, before anything
@@ -808,8 +810,14 @@ impl MediaHost {
             // before it ends, so a picture is ready at every select and a
             // pick behind it would never be acted on. Before the turn this
             // changes nothing, and the turn comes at most once per
-            // `quality_interval`, so it never holds pictures back.
-            if let Some(answer) = served.quality_due(Instant::now())
+            // `quality_interval`, so it never holds pictures back. Woken by
+            // the gate's timer, it acts as of the instant the timer slept
+            // until: the timer's clock (tokio's, which a test may pause and
+            // advance) can be ahead of `Instant::now()`, and a turn declined
+            // there would wake the loop again at once.
+            let now = Instant::now();
+            let now = turn.take().map_or(now, |at| now.max(at));
+            if let Some(answer) = served.quality_due(now)
                 && let Err(stop) = send(&mut wr, &answer, &mut end, Some(&mut served)).await
             {
                 torn = stop.torn;
@@ -904,7 +912,7 @@ impl MediaHost {
                 }
                 // The gate's turn came while nothing else happened: it is
                 // taken at the top of the loop.
-                Event::Quality => {}
+                Event::Quality => turn = quality_at.map(tokio::time::Instant::into_std),
                 Event::Frame(Some(Ok(frame))) => pending = Some(frame),
                 Event::Frame(Some(Err(e))) => {
                     tracing::warn!(error = %e, session = %session_id, "screen capture stopped");
@@ -2577,6 +2585,58 @@ mod tests {
     /// yet (0 for none), taken as the thread would.
     fn handed(served: &Served<'_>) -> u8 {
         served.pipeline.control.quality.swap(0, Ordering::SeqCst)
+    }
+
+    /// The gate's deadline is an instant its turn acts at: with a keyframe
+    /// interval too long for the clock, the turn the select sleeps until
+    /// hands the pick over there, and the deadline then clears, so the arm
+    /// does not fire again and again without acting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_gates_deadline_is_the_instant_its_turn_acts_at() {
+        let caps = QualityCaps::default();
+        let balanced = quality::settings(QualityPreset::Balanced, Route::Tor, &caps);
+        let (mut pipeline, _, _) = scripted(&[]);
+        let (_frames, mut inbound) = mpsc::channel(1);
+        let (_heard, heard) = watch::channel(tokio::time::Instant::now());
+        let t0 = Instant::now();
+        let mut served = Served {
+            injector: None,
+            quiet: Quiet::new(Duration::from_secs(3), heard),
+            inbound: &mut inbound,
+            inputs: TokenBucket::new(250, 500, t0),
+            pings: TokenBucket::new(PINGS_PER_SEC, PING_BURST, t0),
+            keyframes: KeyframeLimiter::new(Duration::MAX),
+            pipeline: &mut pipeline,
+            window: AckWindow::new(23, 281_250),
+            window_caps: (32, 1024 * 1024),
+            quality: QualityState {
+                gate: QualityGate::new(Duration::from_millis(300)),
+                target: QualityPreset::Balanced,
+                applied: balanced,
+                size: (1920, 1080),
+            },
+            stats: StatsWindow::new(Duration::from_secs(1), t0),
+            report: MediaReport::default(),
+            pong_owed: None,
+            session_id: "s",
+        };
+        let fast = tornect_proto::quality::BEST_PERFORMANCE;
+        served.quality.gate.request(fast);
+        assert_eq!(served.quality_due(t0), None);
+        assert_eq!(handed(&served), fast, "the first acts at once");
+
+        let best = tornect_proto::quality::BEST_QUALITY;
+        served.quality.gate.request(best);
+        let due = served.quality_deadline().expect("a pick waits").into_std();
+        assert!(due > t0 + Duration::from_secs(1 << 30), "the far turn");
+        assert_eq!(served.quality_due(due - Duration::from_nanos(1)), None);
+        assert_eq!(served.quality.gate.wanted(), Some(best), "not yet");
+        assert_eq!(served.quality_due(due), None);
+        assert_eq!(served.quality.target, QualityPreset::BestQuality, "acted");
+        assert_eq!(handed(&served), best);
+        assert_eq!(served.quality_deadline(), None, "nothing left to wake for");
+        drop(served);
+        pipeline.stop().await;
     }
 
     /// `Served::quality_due` at explicit instants, each branch of the gate's

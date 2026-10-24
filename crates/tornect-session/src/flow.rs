@@ -147,15 +147,17 @@ impl KeyframeLimiter {
         }
     }
 
-    /// Whether a request at `now` may force a keyframe.
+    /// Whether a request at `now` may force a keyframe: from
+    /// [`Self::ready_at`] on, the very instant a caller waits for, even an
+    /// interval too long for the clock (the host's quality gate sleeps until
+    /// that instant and must then be admitted, or it would wake again at
+    /// once).
     pub fn allow(&mut self, now: Instant) -> bool {
-        match self.last {
-            Some(last) if now.saturating_duration_since(last) < self.interval => false,
-            _ => {
-                self.last = Some(now);
-                true
-            }
+        if self.ready_at().is_some_and(|at| now < at) {
+            return false;
         }
+        self.last = Some(now);
+        true
     }
 
     /// From when [`Self::allow`] admits a keyframe: `None` before any was
@@ -559,6 +561,8 @@ mod tests {
         let far = k.ready_at().unwrap();
         assert!(far > t0 + Duration::from_secs(1 << 30));
         assert!(!k.allow(far - Duration::from_secs(1)));
+        assert!(k.allow(far), "admitted at the instant it said");
+        assert!(!k.allow(far), "and that spends the turn");
     }
 
     /// The gate acts on the first request at once, on the latest of several,
