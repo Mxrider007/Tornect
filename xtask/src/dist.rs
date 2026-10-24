@@ -9,7 +9,8 @@
 //! --release` into `target/dist/cargo/`; checks on the executable (its dynamic
 //! libraries or DLLs); the debug info stripped; the third-party licence file
 //! (`licences.rs`); a staging tree in `target/dist/stage/`, where no file may
-//! hold the build machine's home path; then
+//! hold a path of the build machine (the workspace, `CARGO_HOME`, `RUSTUP_HOME`,
+//! llvm-mingw, the home directory); then
 //! `target/dist/tornect-<version>-<os>-x86_64.zip`. Last, `SHA256SUMS` over this
 //! run's zips.
 //!
@@ -336,8 +337,66 @@ struct Tools {
     /// `strip --version`, first line (Linux builds).
     strip: Option<String>,
     mingw: Option<LlvmMingw>,
-    /// `$HOME/`, which no file in a zip may contain.
-    home: Option<String>,
+    /// The paths of this machine that no file in a zip may contain.
+    local_paths: Vec<LocalPath>,
+}
+
+/// A directory of the build machine whose path no file in a zip may hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalPath {
+    /// What the directory is, for the error.
+    what: &'static str,
+    /// Its path with one trailing `/`, so that `/w/` does not match `/work/`.
+    needle: Vec<u8>,
+    /// The home directory: a generic path such as `/root/` or `/home/runner/`
+    /// can sit in a pinned third-party file, from its own build machine.
+    home: bool,
+}
+
+/// The directories whose paths a zip must not carry (audit finding B28): the
+/// workspace and `CARGO_HOME`, which the build's `--remap-path-prefix` hides,
+/// rustup's toolchains, llvm-mingw and the home directory. Each is checked on
+/// its own, so a workspace outside the home directory is checked too. `/`,
+/// empty paths and repeats are left out.
+fn local_paths(dirs: &[(&'static str, Option<&Path>)]) -> Vec<LocalPath> {
+    let mut paths: Vec<LocalPath> = Vec::new();
+    for &(what, dir) in dirs {
+        let Some(dir) = dir else {
+            continue;
+        };
+        let bytes = dir.as_os_str().as_encoded_bytes();
+        let end = bytes.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
+        if end == 0 {
+            continue;
+        }
+        let mut needle = bytes[..end].to_vec();
+        needle.push(b'/');
+        if paths.iter().any(|p| p.needle == needle) {
+            continue;
+        }
+        paths.push(LocalPath {
+            what,
+            needle,
+            home: what == HOME_DIR,
+        });
+    }
+    paths
+}
+
+const HOME_DIR: &str = "the home directory";
+
+/// The first of `paths` in a file's bytes, and where. A file that `pt-fetch`
+/// pinned by SHA-256 (`third_party`) is the Tor Project's, byte for byte, so
+/// the generic home path is not looked for in it; every other path is.
+fn find_local_path<'a>(
+    bytes: &[u8],
+    paths: &'a [LocalPath],
+    third_party: bool,
+) -> Option<(&'a LocalPath, usize)> {
+    paths
+        .iter()
+        .filter(|p| !(third_party && p.home))
+        .find_map(|p| find(bytes, &p.needle).map(|at| (p, at)))
 }
 
 struct LlvmMingw {
@@ -383,10 +442,18 @@ impl Tools {
         } else {
             None
         };
-        let home = std::env::var("HOME")
-            .ok()
-            .filter(|h| h.len() > 1)
-            .map(|h| format!("{}/", h.trim_end_matches('/')));
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let cargo_home = crate::cargo_home();
+        let rustup_home = std::env::var_os("RUSTUP_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".rustup")));
+        let local_paths = local_paths(&[
+            ("the workspace", Some(root)),
+            ("CARGO_HOME", cargo_home.as_deref()),
+            ("RUSTUP_HOME", rustup_home.as_deref()),
+            ("llvm-mingw", mingw.as_ref().map(|m| m.root.as_path())),
+            (HOME_DIR, home.as_deref()),
+        ]);
         Ok(Self {
             rustc,
             sysroot,
@@ -396,7 +463,7 @@ impl Tools {
             cc,
             strip,
             mingw,
-            home,
+            local_paths,
         })
     }
 }
@@ -545,15 +612,16 @@ fn package(
     let stamp = SystemTime::UNIX_EPOCH + Duration::from_secs(git.epoch);
     for file in &files {
         let path = dir.join(file);
-        if let Some(home) = &tools.home {
-            let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            if let Some(at) = find(&bytes, home.as_bytes()) {
-                bail!(
-                    "{} holds this machine's home directory path at byte {at}; a zip must not \
-                     carry it (the build's --remap-path-prefix list misses a path)",
-                    path.display()
-                );
-            }
+        let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let third_party = *file == lyrebird || file == "pt/lyrebird.txt";
+        if let Some((local, at)) = find_local_path(&bytes, &tools.local_paths, third_party) {
+            bail!(
+                "{} holds the path of {} ({}) at byte {at}; a zip must not carry a path of the \
+                 build machine (the build's --remap-path-prefix list misses a path)",
+                path.display(),
+                local.what,
+                String::from_utf8_lossy(&local.needle)
+            );
         }
         fs::File::open(&path)
             .and_then(|f| f.set_modified(stamp))
@@ -1261,6 +1329,40 @@ mod tests {
         assert_eq!(find(b"abc/home/u/x", b"/home/u/"), Some(3));
         assert_eq!(find(b"/home/runner/x", b"/home/u/"), None);
         assert_eq!(find(b"abc", b""), None);
+    }
+
+    /// B28: with the workspace outside the home directory (here `/w` and
+    /// `/root`), a path under the workspace is still refused; the generic
+    /// home path is not looked for in the pinned lyrebird files.
+    #[test]
+    fn every_local_path_is_looked_for_not_only_home() {
+        let paths = local_paths(&[
+            ("the workspace", Some(Path::new("/w"))),
+            ("CARGO_HOME", Some(Path::new("/root/.cargo/"))),
+            ("RUSTUP_HOME", None),
+            ("llvm-mingw", Some(Path::new("/"))),
+            (HOME_DIR, Some(Path::new("/root"))),
+            ("again", Some(Path::new("/w/"))),
+        ]);
+        let needles: Vec<&[u8]> = paths.iter().map(|p| p.needle.as_slice()).collect();
+        assert_eq!(needles, [&b"/w/"[..], b"/root/.cargo/", b"/root/"]);
+
+        let what = |bytes: &[u8], third_party: bool| {
+            find_local_path(bytes, &paths, third_party).map(|(p, at)| (p.what, at))
+        };
+        // A C `__FILE__` from OUT_DIR under the workspace, which `$HOME` alone missed.
+        let out_dir = b"..assert /w/target/dist/cargo/release/build/x/out/a.c..";
+        assert_eq!(what(out_dir, false), Some(("the workspace", 9)));
+        assert_eq!(what(out_dir, true), Some(("the workspace", 9)));
+        assert_eq!(what(b"/work/x /wx", false), None);
+        // The home path: refused in Tornect's own files, not in the pinned ones.
+        assert_eq!(what(b"go: /root/go/pkg", false), Some((HOME_DIR, 4)));
+        assert_eq!(what(b"go: /root/go/pkg", true), None);
+        assert_eq!(
+            what(b"/root/.cargo/registry", true),
+            Some(("CARGO_HOME", 0))
+        );
+        assert_eq!(what(b"nothing local", false), None);
     }
 
     /// RELEASING.md item 7: each zip carries the generated licence texts
