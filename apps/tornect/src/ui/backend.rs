@@ -1120,22 +1120,23 @@ impl ManagerWatch {
     /// paired device without a grant, never the reverse): the pairing goes
     /// from the host's paired devices, and a pairing that went is logged
     /// (`DeviceUnpaired`, with the pinned label), whether or not the device
-    /// had unattended access. Whether a pairing went; the refusal's words
-    /// when the file could not be written.
+    /// had unattended access. A pin whose removal could not be written
+    /// before is still in the file: it is written again, and fails the same
+    /// way while the file stays unwritable. Whether a pairing went; the
+    /// refusal's words when the file could not be written.
     fn unpin(&self, device: &tornect_core::DeviceId) -> Result<bool, &'static str> {
         use tornect_core::session_log::{Actor, SessionEvent, SessionRecord};
-        let label = self.trusted.get(device).map(|d| d.label);
         match self.trusted.remove(device) {
-            Ok(true) => {
+            Ok(Some(label)) => {
                 let line = SessionRecord::now(SessionEvent::DeviceUnpaired)
                     .by(Actor::Ui)
-                    .peer(*device, label.unwrap_or_default());
+                    .peer(*device, label);
                 if self.ctx.log.append(&line).is_err() {
                     tracing::warn!("the removal of a paired device was not logged");
                 }
                 Ok(true)
             }
-            Ok(false) => Ok(false),
+            Ok(None) => Ok(false),
             // No error text: it may name a path, which names the account.
             Err(_) => {
                 tracing::warn!("a paired device was not removed");
@@ -4492,6 +4493,19 @@ mod tests {
             Some(PAIRING_KEPT)
         );
         assert_eq!(kill.fired(), Some(bye::REVOKED));
+        let logged = watch.ctx.log.read_all().unwrap();
+        assert!(!logged.iter().any(|r| r.event == Logged::DeviceUnpaired));
+
+        // A second Remove on the same card: the running host forgot the pin
+        // at the first, but the file still has it. It says so again rather
+        // than finding nothing to remove (B27 review).
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        assert!(!watch.run(ManagerOp::Remove(laptop), &shared));
+        assert_eq!(shared.read(|m| m.manager_note), Some(PAIRING_KEPT));
+        assert_eq!(
+            shared.read(|m| m.book.note.clone()).as_deref(),
+            Some(PAIRING_KEPT)
+        );
         let logged = watch.ctx.log.read_all().unwrap();
         assert!(!logged.iter().any(|r| r.event == Logged::DeviceUnpaired));
     }

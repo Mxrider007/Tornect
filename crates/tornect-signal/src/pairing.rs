@@ -749,16 +749,30 @@ impl TrustedDeviceStore {
         }
     }
 
-    /// Unpair `device` and persist.
-    pub fn remove(&self, device: &DeviceId) -> tornect_core::Result<bool> {
+    /// Unpair `device` and persist; the label of the pin that went, if one
+    /// did. The pin goes from memory even when the file cannot be written
+    /// (deny-direction: this running host stops trusting the device at
+    /// once). It is then still in the file, so a later call writes its
+    /// removal again rather than finding nothing to do, and fails the same
+    /// way while the file stays unwritable.
+    pub fn remove(&self, device: &DeviceId) -> tornect_core::Result<Option<String>> {
         let mut t = lock(&self.inner);
-        let removed = t.remove(device);
-        if removed {
+        let label = match t.get(device) {
+            Some(d) => Some(d.label.clone()),
+            None => match &self.path {
+                Some(path) => TrustedDevices::load(path)?
+                    .get(device)
+                    .map(|d| d.label.clone()),
+                None => None,
+            },
+        };
+        if label.is_some() {
+            t.remove(device);
             self.persist(&t, |file| {
                 file.remove(device);
             })?;
         }
-        Ok(removed)
+        Ok(label)
     }
 
     /// Until when `device` is temp-banned (Unix seconds), if it is.
@@ -1005,6 +1019,30 @@ mod tests {
         assert!(TrustedDevices::load(&path).unwrap().is_trusted(&dev));
     }
 
+    /// A removal whose file cannot be written forgets the pin here at once
+    /// (deny-direction); the pin is still in the file, so the next removal
+    /// writes it again instead of finding nothing to do (B27 review).
+    #[test]
+    fn a_removal_that_was_not_written_is_written_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.toml");
+        let dev = DeviceId::from_bytes([5u8; 32]);
+        let store = TrustedDeviceStore::open(path.clone()).unwrap();
+        store.pin(dev, "Laptop").unwrap();
+        let in_the_way = tmp.path().join("t.toml.tmp");
+        std::fs::create_dir(&in_the_way).unwrap();
+        assert!(store.remove(&dev).is_err());
+        assert!(store.get(&dev).is_none(), "the running host forgot it");
+        assert!(
+            store.remove(&dev).is_err(),
+            "still in the file: tried again"
+        );
+        std::fs::remove_dir(&in_the_way).unwrap();
+        assert_eq!(store.remove(&dev).unwrap().as_deref(), Some("Laptop"));
+        assert!(!TrustedDevices::load(&path).unwrap().is_trusted(&dev));
+        assert_eq!(store.remove(&dev).unwrap(), None);
+    }
+
     #[test]
     fn stores_persist_through_their_files() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1020,8 +1058,8 @@ mod tests {
         let again = TrustedDeviceStore::open(store.path().unwrap().to_owned()).unwrap();
         assert_eq!(again.get(&dev).unwrap().label, "Ｌaptop");
         assert!(again.snapshot().bans.is_empty());
-        assert!(again.remove(&dev).unwrap());
-        assert!(!again.remove(&dev).unwrap());
+        assert_eq!(again.remove(&dev).unwrap().as_deref(), Some("Ｌaptop"));
+        assert_eq!(again.remove(&dev).unwrap(), None);
 
         let hosts = KnownHostStore::open(tmp.path().join("k.toml")).unwrap();
         let host = TornectId::from_bytes([9u8; 32]);
@@ -1113,7 +1151,7 @@ mod tests {
         assert_eq!(load().bans[0].reject_count, 1);
         store.pin(dev(1), "Laptop").unwrap();
         assert_eq!(load().get(&dev(1)).unwrap().last_seen, 0, "a re-pair");
-        assert!(store.remove(&dev(2)).unwrap());
+        assert!(store.remove(&dev(2)).unwrap().is_some());
         assert!(load().get(&dev(2)).is_none());
 
         // History on: the time is written too.
