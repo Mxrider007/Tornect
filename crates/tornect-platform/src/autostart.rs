@@ -955,16 +955,53 @@ fn desktop_quote(item: &std::ffi::OsStr) -> Result<String, AutostartError> {
 /// characters and text that is not UTF-8 refused; the executable absolute. One
 /// function for every desktop entry Tornect writes.
 pub fn desktop_exec(exe: &Path, args: &[OsString]) -> Result<String, AutostartError> {
+    exec_line(exe, args, desktop_quote)
+}
+
+/// Whether `item` can stand in an `Exec=` value unquoted: not empty, and
+/// every character a letter or a digit (of any script) or one of
+/// `/ . _ - + , : @ =`. That leaves out every character the Desktop Entry
+/// Specification reserves (space, tab, newline, `"`, `'`, `\`, `>`, `<`,
+/// `~`, `|`, `&`, `;`, `$`, `*`, `?`, `#`, `(`, `)`, `` ` ``), `%` (a field
+/// code) and what a shell reads as a pattern or an expansion (`[`, `]`, `{`,
+/// `}`, `!`): generic `xdg-open` hands the value to `eval`.
+fn desktop_bare(item: &str) -> bool {
+    !item.is_empty()
+        && item.chars().all(|c| {
+            c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ',' | ':' | '@' | '=')
+        })
+}
+
+/// The `Exec=` value of a desktop entry that runs `exe` with `args`, each item
+/// bare where [`desktop_bare`] allows it and otherwise quoted as
+/// [`desktop_exec`] quotes it, with the same refusals. For an entry that
+/// generic `xdg-open` runs (the link entry of `tornect install`): its generic
+/// path splits the value at spaces without reading quotes, so a quoted
+/// program never runs there (`docs/research/links.md` finding 1). GIO and
+/// KService read both forms alike.
+pub fn desktop_exec_bare(exe: &Path, args: &[OsString]) -> Result<String, AutostartError> {
+    exec_line(exe, args, |item| match item.to_str() {
+        Some(text) if desktop_bare(text) => Ok(text.to_owned()),
+        _ => desktop_quote(item),
+    })
+}
+
+/// `exe` (absolute) and `args`, each written by `item`, separated by spaces.
+fn exec_line(
+    exe: &Path,
+    args: &[OsString],
+    item: impl Fn(&std::ffi::OsStr) -> Result<String, AutostartError>,
+) -> Result<String, AutostartError> {
     if !exe.is_absolute() {
         return Err(AutostartError::Unquotable(format!(
             "{} is not an absolute path",
             exe.display()
         )));
     }
-    let mut line = desktop_quote(exe.as_os_str())?;
+    let mut line = item(exe.as_os_str())?;
     for arg in args {
         line.push(' ');
-        line.push_str(&desktop_quote(arg)?);
+        line.push_str(&item(arg)?);
     }
     Ok(line)
 }
@@ -3900,6 +3937,95 @@ mod tests {
             let not_utf8 = std::ffi::OsStr::from_bytes(b"/opt/\xff/tornect");
             assert!(matches!(
                 desktop_exec(Path::new(not_utf8), &[]),
+                Err(AutostartError::Unquotable(_))
+            ));
+        }
+    }
+
+    /// The link entry's `Exec` (`docs/research/links.md` finding 1): an item
+    /// of letters, digits and `/ . _ - + , : @ =` stays bare, so generic
+    /// `xdg-open`, which splits at spaces without reading quotes, runs it;
+    /// any other item is quoted exactly as `desktop_exec` quotes it, and the
+    /// same items are refused.
+    #[test]
+    fn bare_exec_items_are_bare_quoted_or_refused() {
+        let exec = |exe: &str, args: &[&str]| {
+            desktop_exec_bare(
+                Path::new(exe),
+                &args.iter().map(OsString::from).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            exec(
+                "/home/u/.local/bin/tornect",
+                &["--home", "/srv/t-1/x_y.z", "open-link", "--"]
+            )
+            .unwrap(),
+            "/home/u/.local/bin/tornect --home /srv/t-1/x_y.z open-link --"
+        );
+        for bare in ["/a+b,c:d@e=f", "/home/josé/bin", "/home/ユーザー/bin", "--"] {
+            assert_eq!(
+                exec("/usr/bin/tornect", &[bare]).unwrap(),
+                format!("/usr/bin/tornect {bare}"),
+                "{bare:?}"
+            );
+        }
+        // Each one quoted, exactly as `desktop_exec` quotes it.
+        for item in [
+            "",
+            "with space",
+            "50%",
+            "%u",
+            "say \"hi\"",
+            "$HOME",
+            "`id`",
+            "a\\b",
+            "it's",
+            "~/x",
+            "a;b",
+            "a&b",
+            "a|b",
+            "a<b>",
+            "a*b?",
+            "#a",
+            "(a)",
+            "[ab]",
+            "{a,b}",
+            "a!b",
+            "a^b",
+            "e\u{301}",
+            "a\u{a0}b",
+        ] {
+            let bare = exec("/usr/bin/tornect", &[item]).unwrap();
+            let quoted = desktop_exec(Path::new("/usr/bin/tornect"), &[OsString::from(item)])
+                .unwrap()
+                .replacen("\"/usr/bin/tornect\"", "/usr/bin/tornect", 1);
+            assert_eq!(bare, quoted, "{item:?}");
+            assert!(bare.ends_with('"'), "{item:?} stayed bare: {bare}");
+        }
+        assert_eq!(
+            exec("/opt/50% off/tornect", &["open-link"]).unwrap(),
+            "\"/opt/50%% off/tornect\" open-link"
+        );
+        for bad in ["line\nbreak", "tab\there", "nul\0"] {
+            assert!(
+                matches!(
+                    exec("/usr/bin/tornect", &[bad]),
+                    Err(AutostartError::Unquotable(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        assert!(matches!(
+            exec("tornect", &[]),
+            Err(AutostartError::Unquotable(_))
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let not_utf8 = std::ffi::OsStr::from_bytes(b"/opt/\xff/tornect");
+            assert!(matches!(
+                desktop_exec_bare(Path::new(not_utf8), &[]),
                 Err(AutostartError::Unquotable(_))
             ));
         }

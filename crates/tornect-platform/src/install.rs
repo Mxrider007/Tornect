@@ -9,14 +9,19 @@
 //! to `~/.local/share/applications/tornect.desktop`, with the keys `Type`,
 //! `Name` and `Exec` only, `Exec` quoted by
 //! [`desktop_exec`](crate::autostart::desktop_exec), the function the
-//! start-at-sign-in entry uses. Before anything is written, the folder of the
-//! executable passes the start at login's location rule
+//! start-at-sign-in entry uses. Beside it goes the link entry
+//! `tornect-link.desktop`, the handler of `tornect:` links (design `invite`
+//! §4.5): `NoDisplay=true`, `MimeType=x-scheme-handler/tornect;`, and an
+//! `Exec` that runs `open-link -- %u`, its items bare where they can be
+//! ([`desktop_exec_bare`](crate::autostart::desktop_exec_bare)). Before
+//! anything is written, the folder of the executable passes the start at
+//! login's location rule
 //! ([`unix_exe_location_ok`](crate::autostart::unix_exe_location_ok): neither
 //! it nor a folder above it can be changed by another account, and none is a
 //! link). Each file is written to a new temporary file in its folder and
-//! renamed over its name, so a link found at either name is replaced, never
-//! followed. Uninstalling removes exactly these two files, and only where they
-//! are regular files.
+//! renamed over its name, so a link found at any of the names is replaced,
+//! never followed. Uninstalling removes exactly these three files, and only
+//! where they are regular files.
 //!
 //! The folders come from the caller ([`LinuxInstall::new`]) or from `HOME`
 //! ([`LinuxInstall::for_this_user`]), never from Tornect's data directory or
@@ -1040,7 +1045,9 @@ pub fn uninstall_from_program_files(
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{FOLDER_OTHERS_CAN_CHANGE, LINUX_EXE, LinuxInstall, MENU_ENTRY, Removal};
+pub use linux::{
+    FOLDER_OTHERS_CAN_CHANGE, LINK_ENTRY, LINK_MIME, LINUX_EXE, LinuxInstall, MENU_ENTRY, Removal,
+};
 
 /// The per-user install on Linux.
 #[cfg(target_os = "linux")]
@@ -1050,9 +1057,10 @@ mod linux {
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
 
-    use super::{ENTRY_NAME, InstallError};
+    use super::{ENTRY_NAME, InstallError, LINK_ARGUMENT};
     use crate::autostart::{
-        AutostartError, PathFacts, desktop_exec, parse_status_ids, unix_exe_location_ok,
+        AutostartError, PathFacts, desktop_exec, desktop_exec_bare, parse_status_ids,
+        unix_exe_location_ok,
     };
 
     /// The installed executable's name in the bin folder.
@@ -1060,6 +1068,16 @@ mod linux {
 
     /// The menu entry's file name in the applications folder.
     pub const MENU_ENTRY: &str = "tornect.desktop";
+
+    /// The link entry's file name in the applications folder: the handler of
+    /// `tornect:` links, a desktop entry of its own (design `invite` §4.5),
+    /// since a link runs `open-link -- <link>`, never the hosting window, and
+    /// the entry never shows in menus (`NoDisplay=true`).
+    pub const LINK_ENTRY: &str = "tornect-link.desktop";
+
+    /// The MIME type a `tornect:` link has for the desktop: GIO looks a
+    /// scheme's handler up as `x-scheme-handler/<scheme>`.
+    pub const LINK_MIME: &str = "x-scheme-handler/tornect";
 
     /// Why the bin folder cannot take the copy: it, or a folder above it,
     /// fails the location rule; the rule's own reason follows.
@@ -1173,22 +1191,17 @@ mod linux {
             self.apps_dir.join(MENU_ENTRY)
         }
 
+        /// The link entry: the handler of `tornect:` links.
+        #[must_use]
+        pub fn link_entry(&self) -> PathBuf {
+            self.apps_dir.join(LINK_ENTRY)
+        }
+
         /// The menu entry's text: the keys `Type`, `Name` and `Exec` only,
         /// `Exec` opening the installed window, with `--home` when the
         /// install is for a custom home (absolute).
         pub fn menu_entry_text(&self, home: Option<&Path>) -> Result<String, InstallError> {
-            let mut args = Vec::new();
-            if let Some(home) = home {
-                if !home.is_absolute() {
-                    return Err(InstallError::Unavailable(format!(
-                        "the home {} is not an absolute path",
-                        home.display()
-                    )));
-                }
-                args.push(OsString::from("--home"));
-                args.push(home.as_os_str().to_owned());
-            }
-            let exec = desktop_exec(&self.exe(), &args)
+            let exec = desktop_exec(&self.exe(), &home_args(home)?)
                 .map_err(|e| InstallError::Unavailable(e.to_string()))?;
             Ok(format!(
                 "# Written by `tornect install`; `tornect uninstall` removes it.\n\
@@ -1199,10 +1212,35 @@ mod linux {
             ))
         }
 
+        /// The link entry's text (design `invite` §4.5): `NoDisplay=true`,
+        /// `MimeType=x-scheme-handler/tornect;`, and an `Exec` that runs the
+        /// installed executable with `--home` as the menu entry does, then
+        /// `open-link --` and the link as its one argument, `%u`, unquoted and
+        /// last (the specification forbids a quoted field code). Each item is
+        /// bare unless it needs quotes ([`desktop_exec_bare`]): generic
+        /// `xdg-open` runs no program written in quotes
+        /// (`docs/research/links.md` finding 1).
+        pub fn link_entry_text(&self, home: Option<&Path>) -> Result<String, InstallError> {
+            let mut args = home_args(home)?;
+            args.push(OsString::from(LINK_ARGUMENT));
+            args.push(OsString::from("--"));
+            let exec = desktop_exec_bare(&self.exe(), &args)
+                .map_err(|e| InstallError::Unavailable(e.to_string()))?;
+            Ok(format!(
+                "# Written by `tornect install`; `tornect uninstall` removes it.\n\
+                 [Desktop Entry]\n\
+                 Type=Application\n\
+                 Name={ENTRY_NAME}\n\
+                 NoDisplay=true\n\
+                 MimeType={LINK_MIME};\n\
+                 Exec={exec} %u\n"
+            ))
+        }
+
         /// Checks what [`Self::install`] would write, writing nothing: both
-        /// folders are absolute, the menu entry's `Exec` quotes, and the bin
-        /// folder (while it does not exist, the nearest folder above it that
-        /// does) passes the location rule.
+        /// folders are absolute, the `Exec` of the menu entry and of the link
+        /// entry can be written, and the bin folder (while it does not exist,
+        /// the nearest folder above it that does) passes the location rule.
         pub fn preflight(&self, home: Option<&Path>) -> Result<(), InstallError> {
             for dir in [&self.bin_dir, &self.apps_dir] {
                 if !dir.is_absolute() {
@@ -1213,15 +1251,18 @@ mod linux {
                 }
             }
             self.menu_entry_text(home)?;
+            self.link_entry_text(home)?;
             self.location_ok(nearest_existing(&self.bin_dir))
         }
 
         /// Copy `source` (this program, read from the handle the command
-        /// opened first) to [`Self::exe`] and write the menu entry. Refused
-        /// before anything is written by [`Self::preflight`]'s checks; the bin
-        /// folder is checked again once it exists. A menu entry that cannot
-        /// be written removes the copy again; a folder this call created and
-        /// a refusal left empty is removed too.
+        /// opened first) to [`Self::exe`], then write the menu entry, then the
+        /// link entry. Refused before anything is written by
+        /// [`Self::preflight`]'s checks; the bin folder is checked again once
+        /// it exists. A menu entry that cannot be written removes the copy
+        /// again, and a link entry that cannot be written removes the menu
+        /// entry and the copy; a folder this call created and a failure left
+        /// empty is removed too.
         pub fn install(
             &self,
             source: &mut dyn std::io::Read,
@@ -1229,6 +1270,7 @@ mod linux {
         ) -> Result<(), InstallError> {
             self.preflight(home)?;
             let entry = self.menu_entry_text(home)?;
+            let link_entry = self.link_entry_text(home)?;
             let mut created = create_dirs(&self.bin_dir)?;
             let copied = self.location_ok(&self.bin_dir).and_then(|()| {
                 write_new(&self.bin_dir, LINUX_EXE, 0o755, &mut |f| {
@@ -1250,23 +1292,32 @@ mod linux {
                 remove_empty(&created);
                 return Err(e);
             }
+            let linked = write_new(&self.apps_dir, LINK_ENTRY, 0o644, &mut |f| {
+                f.write_all(link_entry.as_bytes())
+            });
+            if let Err(e) = linked {
+                let _ = std::fs::remove_file(self.menu_entry());
+                let _ = std::fs::remove_file(self.exe());
+                remove_empty(&created);
+                return Err(e);
+            }
             Ok(())
         }
 
         /// Whether anything [`Self::install`] writes is at its name.
         #[must_use]
         pub fn installed(&self) -> bool {
-            [self.menu_entry(), self.exe()]
+            [self.menu_entry(), self.link_entry(), self.exe()]
                 .iter()
                 .any(|p| std::fs::symlink_metadata(p).is_ok())
         }
 
-        /// Remove the menu entry, then the executable: regular files only,
-        /// anything else at those names left and reported. Removing nothing
-        /// changes nothing.
+        /// Remove the menu entry, then the link entry, then the executable:
+        /// regular files only, anything else at those names left and
+        /// reported. Removing nothing changes nothing.
         pub fn uninstall(&self) -> Result<Removal, InstallError> {
             let mut done = Removal::default();
-            for path in [self.menu_entry(), self.exe()] {
+            for path in [self.menu_entry(), self.link_entry(), self.exe()] {
                 match std::fs::symlink_metadata(&path) {
                     Ok(m) if m.file_type().is_file() => {
                         std::fs::remove_file(&path).map_err(|e| {
@@ -1320,6 +1371,21 @@ mod linux {
                 InstallError::Refused(format!("{FOLDER_OTHERS_CAN_CHANGE} ({why})"))
             })
         }
+    }
+
+    /// `--home <home>` for an install for a custom home (absolute), else
+    /// nothing.
+    fn home_args(home: Option<&Path>) -> Result<Vec<OsString>, InstallError> {
+        let Some(home) = home else {
+            return Ok(Vec::new());
+        };
+        if !home.is_absolute() {
+            return Err(InstallError::Unavailable(format!(
+                "the home {} is not an absolute path",
+                home.display()
+            )));
+        }
+        Ok(vec![OsString::from("--home"), home.as_os_str().to_owned()])
     }
 
     /// `dir`, or the nearest folder above it that exists.
@@ -1485,6 +1551,7 @@ mod linux {
                 tree.files(),
                 set(&[
                     "home/.local/bin/tornect",
+                    "home/.local/share/applications/tornect-link.desktop",
                     "home/.local/share/applications/tornect.desktop"
                 ])
             );
@@ -1494,6 +1561,14 @@ mod linux {
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o755, "{mode:o}");
+            for entry in [install.menu_entry(), install.link_entry()] {
+                let mode = std::fs::metadata(&entry).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o644, "{}: {mode:o}", entry.display());
+            }
+            assert_eq!(
+                std::fs::read_to_string(install.link_entry()).unwrap(),
+                install.link_entry_text(None).unwrap()
+            );
             let entry = std::fs::read_to_string(install.menu_entry()).unwrap();
             let exe = install.exe();
             assert_eq!(
@@ -1556,33 +1631,59 @@ mod linux {
             let apps = tree.root.join("home/.local/share/applications");
             std::fs::create_dir_all(&bin).unwrap();
             std::fs::create_dir_all(&apps).unwrap();
-            for victim in ["victim-exe", "victim-entry", "victim-tmp", "victim-tmp2"] {
+            let victims = [
+                "victim-exe",
+                "victim-entry",
+                "victim-link",
+                "victim-tmp",
+                "victim-tmp2",
+                "victim-tmp3",
+            ];
+            for victim in victims {
                 std::fs::write(tree.root.join(victim), b"victim").unwrap();
             }
             symlink(tree.root.join("victim-exe"), bin.join("tornect")).unwrap();
             symlink(tree.root.join("victim-entry"), apps.join("tornect.desktop")).unwrap();
+            symlink(
+                tree.root.join("victim-link"),
+                apps.join("tornect-link.desktop"),
+            )
+            .unwrap();
             symlink(tree.root.join("victim-tmp"), bin.join(".tornect.tmp")).unwrap();
             symlink(
                 tree.root.join("victim-tmp2"),
                 apps.join(".tornect.desktop.tmp"),
             )
             .unwrap();
+            symlink(
+                tree.root.join("victim-tmp3"),
+                apps.join(".tornect-link.desktop.tmp"),
+            )
+            .unwrap();
             install
                 .install(&mut std::io::Cursor::new(PROGRAM), None)
                 .unwrap();
-            for victim in ["victim-exe", "victim-entry", "victim-tmp", "victim-tmp2"] {
+            for victim in victims {
                 assert_eq!(std::fs::read(tree.root.join(victim)).unwrap(), b"victim");
             }
-            for path in [install.exe(), install.menu_entry()] {
+            for path in [install.exe(), install.menu_entry(), install.link_entry()] {
                 let kind = std::fs::symlink_metadata(&path).unwrap().file_type();
                 assert!(kind.is_file(), "{} is not a regular file", path.display());
             }
             assert_eq!(std::fs::read(install.exe()).unwrap(), PROGRAM);
+            assert_eq!(
+                std::fs::read_to_string(install.link_entry()).unwrap(),
+                install.link_entry_text(None).unwrap()
+            );
             assert!(!bin.join(".tornect.tmp").exists());
+            assert!(!apps.join(".tornect-link.desktop.tmp").exists());
             std::fs::remove_file(install.exe()).unwrap();
             symlink(tree.root.join("victim-exe"), install.exe()).unwrap();
             let removal = install.uninstall().unwrap();
-            assert_eq!(removal.removed, [install.menu_entry()]);
+            assert_eq!(
+                removal.removed,
+                [install.menu_entry(), install.link_entry()]
+            );
             assert_eq!(removal.left, [install.exe()]);
             assert_eq!(
                 std::fs::read(tree.root.join("victim-exe")).unwrap(),
@@ -1639,8 +1740,138 @@ mod linux {
             assert!(!tree.root.join("home/bin3").exists());
         }
 
-        /// Uninstalling removes the menu entry and the executable it wrote,
-        /// and nothing else in either folder.
+        /// The link entry (design `invite` §4.5) is exactly this text, with
+        /// and without a custom home; its `Exec` items are bare
+        /// (`docs/research/links.md` finding 1) and `%u` comes last,
+        /// unquoted.
+        #[test]
+        fn the_link_entry_is_the_designed_text() {
+            let install = LinuxInstall::new(
+                PathBuf::from("/home/u/.local/bin"),
+                PathBuf::from("/home/u/.local/share/applications"),
+            );
+            assert_eq!(
+                install.link_entry(),
+                Path::new("/home/u/.local/share/applications/tornect-link.desktop")
+            );
+            let head = "# Written by `tornect install`; `tornect uninstall` removes it.\n\
+                        [Desktop Entry]\n\
+                        Type=Application\n\
+                        Name=Tornect\n\
+                        NoDisplay=true\n\
+                        MimeType=x-scheme-handler/tornect;\n";
+            assert_eq!(
+                install.link_entry_text(None).unwrap(),
+                format!("{head}Exec=/home/u/.local/bin/tornect open-link -- %u\n")
+            );
+            assert_eq!(
+                install
+                    .link_entry_text(Some(Path::new("/srv/tornect/h1")))
+                    .unwrap(),
+                format!(
+                    "{head}Exec=/home/u/.local/bin/tornect --home /srv/tornect/h1 open-link -- %u\n"
+                )
+            );
+            assert_eq!(LINK_ENTRY, "tornect-link.desktop");
+            assert_eq!(LINK_MIME, "x-scheme-handler/tornect");
+            assert_eq!(LINK_ARGUMENT, "open-link");
+        }
+
+        /// An item of the link entry's `Exec` that needs quotes gets them, as
+        /// the menu entry's do (`%` as `%%`); `%u` stays unquoted and last.
+        /// A control character in a path, or a relative home, refuses the
+        /// install before anything is written, through the link entry too.
+        #[test]
+        fn the_link_entry_exec_quotes_only_what_needs_it() {
+            let tree = Tree::new();
+            let install = LinuxInstall::new(
+                tree.root.join("home/50% off/bin"),
+                tree.root.join("home/apps"),
+            )
+            .with_facts(UID, GID, owned);
+            let home = tree.root.join("my home");
+            install
+                .install(&mut std::io::Cursor::new(PROGRAM), Some(&home))
+                .unwrap();
+            let entry = std::fs::read_to_string(install.link_entry()).unwrap();
+            let exec = format!(
+                "Exec=\"{}/home/50%% off/bin/tornect\" --home \"{}/my home\" open-link -- %u",
+                tree.root.display(),
+                tree.root.display()
+            );
+            assert!(entry.lines().any(|l| l == exec), "{entry}");
+            assert_eq!(entry.lines().last(), Some(exec.as_str()));
+            for (home, item) in [
+                ("/srv/it's", "\"/srv/it's\""),
+                ("/srv/$x", "\"/srv/\\\\$x\""),
+                ("/srv/[a]", "\"/srv/[a]\""),
+                ("/srv/~x", "\"/srv/~x\""),
+                ("/srv/josé", "/srv/josé"),
+            ] {
+                let text = install.link_entry_text(Some(Path::new(home))).unwrap();
+                let last = text.lines().last().unwrap();
+                assert!(
+                    last.ends_with(&format!(" --home {item} open-link -- %u")),
+                    "{home:?}: {last}"
+                );
+            }
+            let bad = LinuxInstall::new(
+                tree.root.join("home/new\nline/bin"),
+                tree.root.join("home/apps2"),
+            )
+            .with_facts(UID, GID, owned);
+            assert!(matches!(
+                bad.link_entry_text(None),
+                Err(InstallError::Unavailable(_))
+            ));
+            assert!(matches!(
+                install.link_entry_text(Some(Path::new("relative/home"))),
+                Err(InstallError::Unavailable(_))
+            ));
+            assert!(matches!(
+                install.link_entry_text(Some(&tree.root.join("tab\there"))),
+                Err(InstallError::Unavailable(_))
+            ));
+        }
+
+        /// A link entry that cannot be written (here a folder stands at its
+        /// name, so the rename fails) removes the menu entry and the copy
+        /// written before it, and the folders the install created.
+        #[test]
+        fn a_failed_link_entry_removes_the_other_two() {
+            let tree = Tree::new();
+            let install = tree.install();
+            std::fs::create_dir_all(install.link_entry()).unwrap();
+            match install.install(&mut std::io::Cursor::new(PROGRAM), None) {
+                Err(InstallError::Failed(why)) => {
+                    assert!(why.contains("tornect-link.desktop"), "{why}");
+                }
+                other => panic!("installed without its link entry: {other:?}"),
+            }
+            assert!(tree.files().is_empty(), "{:?}", tree.files());
+            assert!(!tree.root.join("home/.local/bin").exists());
+            assert!(!install.exe().exists());
+            assert!(!install.menu_entry().exists());
+            assert!(install.link_entry().is_dir());
+        }
+
+        /// The link entry alone counts as an install, so `uninstall` removes
+        /// it.
+        #[test]
+        fn the_link_entry_alone_is_an_install() {
+            let tree = Tree::new();
+            let install = tree.install();
+            let apps = tree.root.join("home/.local/share/applications");
+            std::fs::create_dir_all(&apps).unwrap();
+            std::fs::write(install.link_entry(), b"x").unwrap();
+            assert!(install.installed());
+            let removal = install.uninstall().unwrap();
+            assert_eq!(removal.removed, [install.link_entry()]);
+            assert!(!install.installed());
+        }
+
+        /// Uninstalling removes the menu entry, the link entry and the
+        /// executable it wrote, and nothing else in either folder.
         #[test]
         fn uninstall_removes_exactly_what_install_wrote() {
             let tree = Tree::new();
@@ -1656,7 +1887,10 @@ mod linux {
             )
             .unwrap();
             let removal = install.uninstall().unwrap();
-            assert_eq!(removal.removed, [install.menu_entry(), install.exe()]);
+            assert_eq!(
+                removal.removed,
+                [install.menu_entry(), install.link_entry(), install.exe()]
+            );
             assert!(removal.left.is_empty());
             assert_eq!(
                 tree.files(),
