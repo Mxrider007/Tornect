@@ -193,7 +193,20 @@ fn forbidden_deps(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `cargo-deny`: the prebuilt copy under `target/tools/<dir>/`, else on `PATH`.
+/// The cargo-deny release the gate and dist run (docs/DEPENDENCIES.md). Another
+/// release reads `deny.toml` and the advisory database with other rules, so
+/// [`deny`] refuses it rather than let a check of unknown meaning pass (audit
+/// finding B29).
+pub(crate) const CARGO_DENY_VERSION: &str = "0.20.2";
+
+/// The directory the pinned release's prebuilt archive unpacks into, under
+/// `target/tools/`.
+fn pinned_cargo_deny_dir() -> String {
+    format!("cargo-deny-{CARGO_DENY_VERSION}-x86_64-unknown-linux-musl")
+}
+
+/// `cargo-deny`: the pinned copy under `target/tools/`, else another copy there,
+/// else on `PATH`.
 fn find_cargo_deny(root: &Path) -> Option<PathBuf> {
     find_cargo_deny_in(
         &root.join("target").join("tools"),
@@ -201,14 +214,52 @@ fn find_cargo_deny(root: &Path) -> Option<PathBuf> {
     )
 }
 
+/// The pinned directory first; then the other directories of `tools` in name
+/// order, never in the order the file system lists them, so two machines with
+/// the same directories pick the same copy; then `PATH`.
 fn find_cargo_deny_in(tools: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
     let bin = format!("cargo-deny{}", std::env::consts::EXE_SUFFIX);
-    let tools = std::fs::read_dir(tools).ok();
-    let bundled = tools.into_iter().flatten().flatten().find_map(|entry| {
-        let candidate = entry.path().join(&bin);
-        candidate.is_file().then_some(candidate)
-    });
+    let pinned = tools.join(pinned_cargo_deny_dir()).join(&bin);
+    if pinned.is_file() {
+        return Some(pinned);
+    }
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(tools)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    dirs.sort();
+    let bundled = dirs
+        .into_iter()
+        .map(|dir| dir.join(&bin))
+        .find(|candidate| candidate.is_file());
     bundled.or_else(|| path.and_then(|path| search_path(path, &bin)))
+}
+
+/// `cargo-deny --version` must name [`CARGO_DENY_VERSION`]: `cargo-deny 0.20.2`,
+/// optionally followed by build details. Its words, for BUILD-INFO.txt.
+fn check_cargo_deny_version(bin: &Path, exit_ok: bool, stdout: &str) -> anyhow::Result<String> {
+    let said = stdout.trim();
+    let mut words = said.split_whitespace();
+    ensure!(
+        exit_ok && words.next() == Some("cargo-deny") && words.next() == Some(CARGO_DENY_VERSION),
+        "{} is `{said}`, not cargo-deny {CARGO_DENY_VERSION}: the gate and dist run the pinned \
+         release only, since another reads deny.toml and the advisories with other rules. {}",
+        bin.display(),
+        install_cargo_deny()
+    );
+    Ok(said.to_owned())
+}
+
+fn install_cargo_deny() -> String {
+    format!(
+        "Install the pinned {CARGO_DENY_VERSION}: unpack the x86_64-unknown-linux-musl archive of \
+         https://github.com/EmbarkStudios/cargo-deny/releases/tag/{CARGO_DENY_VERSION} into \
+         target/tools/ (it makes target/tools/{}/), or `cargo install --locked \
+         cargo-deny@{CARGO_DENY_VERSION}`",
+        pinned_cargo_deny_dir()
+    )
 }
 
 /// An executable named `bin` in an absolute `PATH` directory; a relative entry
@@ -433,7 +484,17 @@ pub(crate) fn deny(root: &Path) -> anyhow::Result<Deny> {
         .arg("--version")
         .output()
         .with_context(|| format!("running {} --version", bin.display()))?;
-    let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
+    let version = match check_cargo_deny_version(
+        &bin,
+        version.status.success(),
+        &String::from_utf8_lossy(&version.stdout),
+    ) {
+        Ok(version) => version,
+        Err(e) => {
+            println!("==> cargo deny check (offline)");
+            return Err(e);
+        }
+    };
     let db = match advisory_db() {
         Ok(db) => db,
         Err(e) => {
@@ -453,13 +514,14 @@ pub(crate) fn deny(root: &Path) -> anyhow::Result<Deny> {
 }
 
 fn require_cargo_deny(found: Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    found.context(
-        "cargo-deny not found, neither under target/tools/<dir>/ nor on PATH. The gate fails \
-         without it (decision B3-6): advisories, bans, licences and sources would go unchecked. \
-         Install the pinned 0.20.2: unpack the x86_64-unknown-linux-musl archive of \
-         https://github.com/EmbarkStudios/cargo-deny/releases/tag/0.20.2 into target/tools/, \
-         or `cargo install --locked cargo-deny@0.20.2`",
-    )
+    found.with_context(|| {
+        format!(
+            "cargo-deny not found, neither under target/tools/<dir>/ nor on PATH. The gate fails \
+             without it (decision B3-6): advisories, bans, licences and sources would go \
+             unchecked. {}",
+            install_cargo_deny()
+        )
+    })
 }
 
 fn verify(root: &Path, extra: &[String]) -> anyhow::Result<()> {
@@ -558,6 +620,91 @@ mod tests {
             Some(bin_dir.join(&bin))
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// B29: the pinned copy wins whatever else `target/tools/` holds, and
+    /// without it the choice is by name, never by the file system's order.
+    #[test]
+    fn the_pinned_cargo_deny_is_chosen_first_then_by_name() {
+        let dir = std::env::temp_dir().join(format!("xtask-deny-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tools = dir.join("tools");
+        let bin = format!("cargo-deny{}", std::env::consts::EXE_SUFFIX);
+        let mut copies = Vec::new();
+        for name in [
+            "cargo-deny-0.21.0-x86_64-unknown-linux-musl",
+            "cargo-deny-0.19.0-x86_64-unknown-linux-musl",
+            "cargo-deny-0.20.2-x86_64-unknown-linux-musl",
+            "a-cargo-deny-copy",
+        ] {
+            std::fs::create_dir_all(tools.join(name)).unwrap();
+            let copy = tools.join(name).join(&bin);
+            std::fs::write(&copy, b"").unwrap();
+            copies.push(copy);
+        }
+        assert_eq!(
+            pinned_cargo_deny_dir(),
+            "cargo-deny-0.20.2-x86_64-unknown-linux-musl"
+        );
+        assert_eq!(find_cargo_deny_in(&tools, None), Some(copies[2].clone()));
+        std::fs::remove_file(&copies[2]).unwrap();
+        assert_eq!(find_cargo_deny_in(&tools, None), Some(copies[3].clone()));
+        std::fs::remove_file(&copies[3]).unwrap();
+        assert_eq!(find_cargo_deny_in(&tools, None), Some(copies[1].clone()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// B29: a cargo-deny of another release, or one whose `--version` failed
+    /// or said nothing, fails the gate.
+    #[test]
+    fn a_cargo_deny_of_another_release_is_refused() {
+        let bin = Path::new("/opt/cargo-deny");
+        assert_eq!(
+            check_cargo_deny_version(bin, true, "cargo-deny 0.20.2\n").unwrap(),
+            "cargo-deny 0.20.2"
+        );
+        assert_eq!(
+            check_cargo_deny_version(bin, true, "cargo-deny 0.20.2 (1a2b3c4 2025-12-01)").unwrap(),
+            "cargo-deny 0.20.2 (1a2b3c4 2025-12-01)"
+        );
+        for (exit_ok, said) in [
+            (true, "cargo-deny 0.21.0"),
+            (true, "cargo-deny 0.20.20"),
+            (true, "cargo-deny 0.20"),
+            (true, "cargo-deny"),
+            (true, ""),
+            (true, "some-other-tool 0.20.2"),
+            (false, "cargo-deny 0.20.2"),
+        ] {
+            let err = check_cargo_deny_version(bin, exit_ok, said)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not cargo-deny 0.20.2"), "{said}: {err}");
+            assert!(err.contains("/opt/cargo-deny"), "{said}: {err}");
+            assert!(err.contains("releases/tag/0.20.2"), "{said}: {err}");
+        }
+    }
+
+    /// The pin here is the one the docs and the release notes name.
+    #[test]
+    fn the_cargo_deny_pin_matches_the_docs() {
+        let root = workspace_root().unwrap();
+        let read = |rel: &str| std::fs::read_to_string(root.join(rel)).unwrap();
+        assert!(
+            read("docs/DEPENDENCIES.md").contains(&format!(
+                "| cargo-deny and the RustSec advisory database | {CARGO_DENY_VERSION} "
+            )),
+            "docs/DEPENDENCIES.md"
+        );
+        assert!(
+            read("docs/RELEASING.md").contains(&pinned_cargo_deny_dir()),
+            "docs/RELEASING.md"
+        );
+        assert!(
+            read("packaging/release/NOTES-v0.1.0-slice.1.md")
+                .contains(&format!("cargo-deny {CARGO_DENY_VERSION},")),
+            "the release notes"
+        );
     }
 
     /// E3-3: the database's commit and date come from its `git log` line.
