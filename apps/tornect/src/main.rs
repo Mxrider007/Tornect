@@ -819,11 +819,23 @@ fn open_link(
     bridges: Option<BridgeMode>,
     link: &std::ffi::OsStr,
 ) -> anyhow::Result<()> {
-    let shown = shown_link(link);
-    if second_launch_shown(paths, Some(shown)) {
-        return Ok(());
+    let raised = |shown| second_launch_shown(paths, Some(shown));
+    match link_launch(shown_link(link), raised, bridges) {
+        Some(opts) => ui::run(paths, opts, false),
+        None => Ok(()),
     }
-    ui::run(paths, link_window_opts(bridges, shown), false)
+}
+
+/// What a link launch does with what it read of its link, `shown` (design
+/// `invite` §2.4, L-5): first `raised`, the running window asked to raise
+/// itself with it; when that took it, nothing more (`None`). Otherwise the
+/// window to open, always [`link_window_opts`]'s connect-only one.
+fn link_launch(
+    shown: ShownLink,
+    raised: impl FnOnce(ShownLink) -> bool,
+    bridges: Option<BridgeMode>,
+) -> Option<ui::GuiOpts> {
+    (!raised(shown)).then(|| link_window_opts(bridges, shown))
 }
 
 /// What the window gets of an opened link: its ID, or the word that it was
@@ -902,25 +914,56 @@ fn cmd_id(paths: &Paths, json: bool, invitation: bool) -> anyhow::Result<()> {
     let store = open_store(paths)?;
     let (host, created) = load_or_create_host_identity(&store)?;
     let (device, _) = load_or_create_device_identity(&store)?;
-    if invitation {
-        println!("{}", invite::invitation(&host.id()));
+    let shown = if invitation {
+        IdShown::Invitation
     } else if json {
-        println!(
-            "{}",
-            id_json(&host.id(), &device.id(), created, &paths.keys_dir())
-        );
+        IdShown::Json
     } else {
-        if created {
-            println!(
-                "Generated a new Tornect ID (stored in {}).",
-                paths.keys_dir().display()
-            );
-        }
-        for line in id_lines(&host.id(), &device.id()) {
-            println!("{line}");
+        IdShown::Lines
+    };
+    println!(
+        "{}",
+        id_output(shown, &host.id(), &device.id(), created, &paths.keys_dir())
+    );
+    Ok(())
+}
+
+/// Which form of `tornect id` is printed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdShown {
+    /// The lines of [`id_lines`], after a word on a new ID.
+    Lines,
+    /// `--json`: [`id_json`].
+    Json,
+    /// `--invitation`: the invitation alone (design `invite` §2.5).
+    Invitation,
+}
+
+/// What `tornect id` prints, without the final newline.
+fn id_output(
+    shown: IdShown,
+    id: &tornect_core::TornectId,
+    device: &tornect_core::DeviceId,
+    created: bool,
+    keystore: &std::path::Path,
+) -> String {
+    match shown {
+        IdShown::Invitation => invite::invitation(id),
+        IdShown::Json => id_json(id, device, created, keystore).to_string(),
+        IdShown::Lines => {
+            let generated = created.then(|| {
+                format!(
+                    "Generated a new Tornect ID (stored in {}).",
+                    keystore.display()
+                )
+            });
+            generated
+                .into_iter()
+                .chain(id_lines(id, device))
+                .collect::<Vec<_>>()
+                .join("\n")
         }
     }
-    Ok(())
 }
 
 /// `tornect id`'s lines: the ID, its groups, its link (design `invite`
@@ -1475,6 +1518,42 @@ mod tests {
         }
     }
 
+    /// L-5 (review): what a link launch does is decided apart from the
+    /// window, so its wiring is tested: the running window is asked first,
+    /// with exactly what was read of the link; when it took the link,
+    /// nothing opens; otherwise the window that opens is the connect-only
+    /// link window, with the link and the launch's bridges, never a preview.
+    #[test]
+    fn a_link_launch_raises_or_opens_a_connect_only_window() {
+        for shown in [ShownLink::Fill(key(9)), ShownLink::Refused] {
+            let mut asked = Vec::new();
+            let raised = |s| {
+                asked.push(s);
+                true
+            };
+            assert!(
+                super::link_launch(shown, raised, None).is_none(),
+                "{shown:?}"
+            );
+            assert_eq!(asked, [shown]);
+
+            for bridges in [None, Some(BridgeMode::Obfs4)] {
+                let mut asked = Vec::new();
+                let refused = |s| {
+                    asked.push(s);
+                    false
+                };
+                let opts = super::link_launch(shown, refused, bridges).expect("a window");
+                assert_eq!(asked, [shown]);
+                assert!(!opts.host, "{shown:?}: a link never starts hosting");
+                assert_eq!(opts.link, Some(shown));
+                assert_eq!(opts.bridges, bridges);
+                assert!(!opts.preview && !opts.empty);
+                assert!(opts.page.is_none() && opts.sheet.is_none());
+            }
+        }
+    }
+
     /// Design `invite` §2.4, §4.1: `open-link` reads its argument with the
     /// strict link grammar alone: an ID that is no link, a link with anything
     /// more, and text that is not UTF-8 are refused, each with its problem.
@@ -1633,6 +1712,37 @@ mod tests {
         ));
         let both = parse(&["tornect", "id", "--json", "--invitation"]).unwrap_err();
         assert_eq!(both.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// Design `invite` §2.5 (review): what `tornect id` prints in each form.
+    /// `--invitation` is exactly the invitation, whether the ID was just
+    /// made or not; `--json` is the JSON object; the lines say a new ID
+    /// first.
+    #[test]
+    fn id_prints_each_form_as_designed() {
+        use super::IdShown;
+        let id = key(9);
+        let device = tornect_core::DeviceId::from_bytes(*key(10).public_key_bytes());
+        let keystore = std::path::Path::new("/k");
+        for created in [false, true] {
+            let output = |shown| super::id_output(shown, &id, &device, created, keystore);
+            assert_eq!(
+                output(IdShown::Invitation),
+                tornect_core::invite::invitation(&id),
+                "{created}"
+            );
+            let json: serde_json::Value = serde_json::from_str(&output(IdShown::Json)).unwrap();
+            assert_eq!(json, super::id_json(&id, &device, created, keystore));
+            let lines = output(IdShown::Lines);
+            let shown: Vec<&str> = lines.lines().collect();
+            let expected = super::id_lines(&id, &device);
+            let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+            assert_eq!(shown[usize::from(created)..], expected);
+            assert_eq!(
+                created,
+                lines.starts_with("Generated a new Tornect ID (stored in /k).\n")
+            );
+        }
     }
 
     /// §B.1.1: a `--background` launch (the start at sign-in) parses with no
