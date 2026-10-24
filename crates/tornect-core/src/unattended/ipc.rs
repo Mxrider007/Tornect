@@ -22,7 +22,7 @@ use minicbor::decode::Decoder;
 use minicbor::encode::{Encoder, Write};
 use minicbor::{Decode, Encode};
 
-use crate::id::DeviceId;
+use crate::id::{DeviceId, TornectId};
 use crate::session_log::SessionMode;
 
 use super::grant::{GrantId, Window};
@@ -288,10 +288,35 @@ impl GrantOptions {
     }
 }
 
+/// What a `tornect:` link opened gave the window (design `invite` §4.3): the ID to put
+/// in the connect field, or the word that the link was refused. It names an ID and
+/// nothing else, so it can fill a field and never act (L-1). `Debug` never shows the
+/// ID (L-7).
+///
+/// Decoded from IPC, a `Fill` holds any 32 bytes: the window checks them again on
+/// receipt (they must be a key, and not this computer's own ID) before it fills
+/// anything.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ShownLink {
+    /// The link named this ID: put it in the connect field.
+    Fill(TornectId),
+    /// The link held no valid Tornect ID: fill nothing, and say so.
+    Refused,
+}
+
+impl fmt::Debug for ShownLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fill(_) => f.write_str("Fill(<redacted>)"),
+            Self::Refused => f.write_str("Refused"),
+        }
+    }
+}
+
 /// The operations of §B.8.7.4. `Debug` redacts the registration material: `reg_txn`
 /// is the 120 s capability that lets a `RegFinish` land and `upload` / `reg_request`
 /// are password-derived OPAQUE bytes (offline-attack material, T4 / A14), so an IPC
-/// trace never carries them.
+/// trace never carries them; and the ID a `Show` link names.
 // `RegFinish` carries the 192-byte upload inline: one message per registration, never
 // stored in bulk, so the size skew is irrelevant.
 #[allow(clippy::large_enum_variant)]
@@ -401,7 +426,18 @@ pub enum IpcOp {
     /// Raise the running window (r7, §B.1.1): un-minimise it and ask for attention. It
     /// never answers, dismisses or re-orders a sheet, and it re-arms every open sheet
     /// (§B.2.1). A host with no window refuses it.
-    Show,
+    ///
+    /// With a `link` (a `tornect:` link opened while this window runs; design `invite`
+    /// §2.4, §4.4), the window then fills its connect field with the link's ID, or says
+    /// the link was refused. Nothing more: no connect, pair, answer or log line.
+    ///
+    /// Fields: key 0, the ID as a 32-byte bstr (`Fill`); key 1, `true` (`Refused`);
+    /// neither, a plain raise. Both keys together, a key 0 that is not 32 bytes, a key 1
+    /// that is not `true`, or a body that is not a map are refused.
+    Show {
+        /// The link opened, if this raise came from one.
+        link: Option<ShownLink>,
+    },
     /// `tornect unattended set-level <device> none` (decision M1-68): the grant's
     /// `elevation` → none and no other field (deny-direction). It carries no level, so
     /// nothing sent with it can raise one. → `SetLevelNonePayload`.
@@ -424,7 +460,13 @@ impl fmt::Debug for IpcOp {
             | Self::Readiness
             | Self::Panic
             | Self::PolicyInputs
-            | Self::Show => f.write_str(self.name()),
+            | Self::Show { link: None } => f.write_str(self.name()),
+            Self::Show {
+                link: Some(ShownLink::Fill(_)),
+            } => f.write_str("show { link: <redacted> }"),
+            Self::Show {
+                link: Some(ShownLink::Refused),
+            } => f.write_str("show { link: refused }"),
             Self::Pause { until } => f.debug_struct("Pause").field("until", until).finish(),
             Self::Revoke { device }
             | Self::Unlock { device }
@@ -509,7 +551,7 @@ impl IpcOp {
             Self::PolicyInputs => 18,
             Self::RegStart { .. } => 19,
             Self::RegFinish { .. } => 20,
-            Self::Show => 21,
+            Self::Show { .. } => 21,
             Self::SetLevelNone { .. } => 22,
             Self::Unknown(t) => *t,
         }
@@ -540,7 +582,7 @@ impl IpcOp {
             Self::PolicyInputs => "policy_inputs",
             Self::RegStart { .. } => "reg_start",
             Self::RegFinish { .. } => "reg_finish",
-            Self::Show => "show",
+            Self::Show { .. } => "show",
             Self::SetLevelNone { .. } => "set_level_none",
             Self::Unknown(_) => "unknown",
         }
@@ -587,6 +629,7 @@ fn field_count(op: &IpcOp) -> u64 {
         | IpcOp::BackupExport { .. }
         | IpcOp::BackupImport { .. } => 1,
         IpcOp::Log { after, .. } => 1 + u64::from(after.is_some()),
+        IpcOp::Show { link } => u64::from(link.is_some()),
         IpcOp::RegStart { .. } => 4,
         IpcOp::RegFinish { .. } => 6,
         _ => 0,
@@ -626,6 +669,16 @@ impl<C> Encode<C> for IpcOp {
             Self::BackupExport { path } | Self::BackupImport { path } => {
                 e.u32(0)?.str(path)?;
             }
+            Self::Show { link } => match link {
+                Some(ShownLink::Fill(id)) => {
+                    e.u32(0)?;
+                    id.encode(e, ctx)?;
+                }
+                Some(ShownLink::Refused) => {
+                    e.u32(1)?.bool(true)?;
+                }
+                None => {}
+            },
             Self::RegStart {
                 device,
                 reg_request,
@@ -732,10 +785,30 @@ impl<'b, C> Decode<'b, C> for IpcOp {
         // `RegStart.raise`, and `generated` of both: absent = false (decision M1-67).
         let mut raise = false;
         let mut generated = false;
+        // `Show`'s link (design `invite` §4.4).
+        let mut fill: Option<TornectId> = None;
+        let mut refused = false;
         match tag {
-            0..=2 | 5 | 12 | 13 | 15 | 18 | 21 => {
+            0..=2 | 5 | 12 | 13 | 15 | 18 => {
                 d.skip()?;
             }
+            21 => for_each_entry(d, |k, d| {
+                match k {
+                    0 => fill = Some(TornectId::decode(d, ctx)?),
+                    1 => {
+                        let p = d.position();
+                        if !d.bool()? {
+                            return Err(minicbor::decode::Error::message(
+                                "show: key 1 is only ever true",
+                            )
+                            .at(p));
+                        }
+                        refused = true;
+                    }
+                    _ => d.skip()?,
+                }
+                Ok(())
+            })?,
             3 => for_each_entry(d, |k, d| {
                 match k {
                     0 => until = Some(d.u64()?),
@@ -856,7 +929,18 @@ impl<'b, C> Decode<'b, C> for IpcOp {
                 options: options.unwrap_or_default(),
                 generated,
             },
-            21 => Self::Show,
+            21 => Self::Show {
+                link: match (fill, refused) {
+                    (None, false) => None,
+                    (Some(id), false) => Some(ShownLink::Fill(id)),
+                    (None, true) => Some(ShownLink::Refused),
+                    (Some(_), true) => {
+                        return Err(minicbor::decode::Error::message(
+                            "show: a link is filled or refused, never both",
+                        ));
+                    }
+                },
+            },
             22 => Self::SetLevelNone {
                 device: device.ok_or_else(|| missing("device"))?,
             },
@@ -1341,10 +1425,22 @@ mod tests {
                     ..GrantOptions::default()
                 },
             },
-            IpcOp::Show,
+            IpcOp::Show { link: None },
+            IpcOp::Show {
+                link: Some(ShownLink::Fill(link_id())),
+            },
+            IpcOp::Show {
+                link: Some(ShownLink::Refused),
+            },
             IpcOp::SetLevelNone { device: dev(9) },
             IpcOp::Unknown(99),
         ]
+    }
+
+    /// The ID a `Show` link names in these tests: a real key, so that its base32 is
+    /// what a user would see.
+    fn link_id() -> TornectId {
+        TornectId::from_public_key(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key())
     }
 
     #[test]
@@ -1395,19 +1491,59 @@ mod tests {
         e.into_writer()
     }
 
-    /// r7 (§B.1.1, §B.8.7.4): `Show` carries no field and travels as tag 21.
+    /// r7 (§B.1.1, §B.8.7.4) and design `invite` §4.4: `Show` travels as tag 21 in its
+    /// three forms, with these exact bytes (a plain raise has no field, a fill the ID's
+    /// 32 key bytes under key 0, a refusal `true` under key 1) and this exact `Debug`,
+    /// which never shows the ID in any written form (L-7).
     #[test]
     fn show_roundtrips_with_its_tag() {
-        let req = IpcRequest {
-            id: 3,
-            op: IpcOp::Show,
-        };
-        let bytes = encode_request(&req).unwrap();
-        assert_eq!(wire_tag(&bytes), 21);
-        assert_eq!(decode_request(&bytes).unwrap(), req);
-        assert_eq!(IpcOp::Show.tag(), 21);
-        assert_eq!(IpcOp::Show.name(), "show");
-        assert_eq!(format!("{:?}", IpcOp::Show), "show");
+        let id = link_id();
+        let mut fill = vec![0x82, 0x15, 0xA1, 0x00, 0x58, 0x20];
+        fill.extend_from_slice(id.public_key_bytes());
+        for (op, bytes, debug) in [
+            (IpcOp::Show { link: None }, vec![0x82, 0x15, 0xA0], "show"),
+            (
+                IpcOp::Show {
+                    link: Some(ShownLink::Fill(id)),
+                },
+                fill,
+                "show { link: <redacted> }",
+            ),
+            (
+                IpcOp::Show {
+                    link: Some(ShownLink::Refused),
+                },
+                vec![0x82, 0x15, 0xA1, 0x01, 0xF5],
+                "show { link: refused }",
+            ),
+        ] {
+            assert_eq!(minicbor::to_vec(&op).unwrap(), bytes, "{debug}");
+            assert_eq!(minicbor::decode::<IpcOp>(&bytes).unwrap(), op, "{debug}");
+            let req = IpcRequest { id: 3, op };
+            let framed = encode_request(&req).unwrap();
+            assert_eq!(wire_tag(&framed), 21);
+            assert_eq!(decode_request(&framed).unwrap(), req);
+            assert_eq!(req.op.tag(), 21);
+            assert_eq!(req.op.name(), "show");
+            assert_eq!(format!("{:?}", req.op), debug);
+            let shown = format!("{req:?}");
+            for written in [
+                id.base32(),
+                id.base32().to_uppercase(),
+                id.short(),
+                id.display_groups(),
+                hex::encode(id.public_key_bytes()),
+                format!("{:?}", id.public_key_bytes()),
+            ] {
+                assert!(!shown.contains(&written), "{shown}");
+            }
+        }
+        assert_eq!(
+            format!("{:?}", ShownLink::Fill(id)),
+            "Fill(<redacted>)",
+            "the link alone is redacted too"
+        );
+        assert_eq!(format!("{:?}", ShownLink::Refused), "Refused");
     }
 
     /// Decision M1-68 (§B.8.7.4): `SetLevelNone` carries the device only, as tag 22.
@@ -1460,18 +1596,147 @@ mod tests {
         let _ = decode_payload::<SetLevelNonePayload>(b"\xff");
     }
 
-    /// Frames from a newer peer with tags 21 and 22 now decode to the two ops, a
-    /// field-less body for `Show` whatever it holds; 23 and up stay unknown.
+    /// Frames from a newer peer with tags 21 and 22 now decode to the two ops; a key
+    /// `Show` does not know is skipped, so the body `{7: "future"}` is still a plain
+    /// raise; 23 and up stay unknown. `Show`'s own keys are read strictly (design
+    /// `invite` §4.4): a key 0 that is not a 32-byte string, a key 1 that is not
+    /// `true`, both keys together, and a body that is not a map are refused with an
+    /// `E_*` code, never read as a plain raise or as a guess.
     #[test]
     fn tags_21_and_22_are_no_longer_unknown() {
         let show = frame(21, |e| {
             e.map(0).unwrap();
         });
-        assert_eq!(decode_request(&show).unwrap().op, IpcOp::Show);
+        assert_eq!(
+            decode_request(&show).unwrap().op,
+            IpcOp::Show { link: None }
+        );
         let show_with_a_body = frame(21, |e| {
             e.map(1).unwrap().u32(7).unwrap().str("future").unwrap();
         });
-        assert_eq!(decode_request(&show_with_a_body).unwrap().op, IpcOp::Show);
+        assert_eq!(
+            decode_request(&show_with_a_body).unwrap().op,
+            IpcOp::Show { link: None }
+        );
+        let fill_and_more = frame(21, |e| {
+            e.map(2)
+                .unwrap()
+                .u32(7)
+                .unwrap()
+                .str("future")
+                .unwrap()
+                .u32(0)
+                .unwrap()
+                .bytes(link_id().public_key_bytes())
+                .unwrap();
+        });
+        assert_eq!(
+            decode_request(&fill_and_more).unwrap().op,
+            IpcOp::Show {
+                link: Some(ShownLink::Fill(link_id()))
+            }
+        );
+        // An indefinite map is a map too.
+        let indefinite = frame(21, |e| {
+            e.begin_map()
+                .unwrap()
+                .u32(1)
+                .unwrap()
+                .bool(true)
+                .unwrap()
+                .end()
+                .unwrap();
+        });
+        assert_eq!(
+            decode_request(&indefinite).unwrap().op,
+            IpcOp::Show {
+                link: Some(ShownLink::Refused)
+            }
+        );
+        let refused: [(&str, Vec<u8>); 9] = [
+            (
+                "a 31-byte key 0",
+                frame(21, |e| {
+                    e.map(1).unwrap().u32(0).unwrap().bytes(&[7; 31]).unwrap();
+                }),
+            ),
+            (
+                "a 33-byte key 0",
+                frame(21, |e| {
+                    e.map(1).unwrap().u32(0).unwrap().bytes(&[7; 33]).unwrap();
+                }),
+            ),
+            (
+                "a key 0 that is text",
+                frame(21, |e| {
+                    e.map(1)
+                        .unwrap()
+                        .u32(0)
+                        .unwrap()
+                        .str(&link_id().base32())
+                        .unwrap();
+                }),
+            ),
+            (
+                "{1: false}",
+                frame(21, |e| {
+                    e.map(1).unwrap().u32(1).unwrap().bool(false).unwrap();
+                }),
+            ),
+            (
+                "{1: 1}",
+                frame(21, |e| {
+                    e.map(1).unwrap().u32(1).unwrap().u8(1).unwrap();
+                }),
+            ),
+            (
+                "{0: id, 1: true}",
+                frame(21, |e| {
+                    e.map(2)
+                        .unwrap()
+                        .u32(0)
+                        .unwrap()
+                        .bytes(link_id().public_key_bytes())
+                        .unwrap()
+                        .u32(1)
+                        .unwrap()
+                        .bool(true)
+                        .unwrap();
+                }),
+            ),
+            (
+                "{1: true, 0: id}",
+                frame(21, |e| {
+                    e.map(2)
+                        .unwrap()
+                        .u32(1)
+                        .unwrap()
+                        .bool(true)
+                        .unwrap()
+                        .u32(0)
+                        .unwrap()
+                        .bytes(link_id().public_key_bytes())
+                        .unwrap();
+                }),
+            ),
+            (
+                "an array body",
+                frame(21, |e| {
+                    e.array(0).unwrap();
+                }),
+            ),
+            (
+                "a null body",
+                frame(21, |e| {
+                    e.null().unwrap();
+                }),
+            ),
+        ];
+        for (what, bytes) in refused {
+            let err = decode_request(&bytes).expect_err(what);
+            assert_eq!(err.code(), codes::E_BAD_LEN, "{what}: {err}");
+            assert!(!err.to_string().contains(&link_id().base32()), "{what}");
+        }
         let lower = frame(22, |e| {
             e.map(1).unwrap().u32(0).unwrap().encode(dev(6)).unwrap();
         });
@@ -1488,6 +1753,43 @@ mod tests {
             e.map(0).unwrap();
         });
         assert_eq!(decode_request(&next).unwrap().op, IpcOp::Unknown(23));
+    }
+
+    /// The committed seeds of the `ipc` fuzz target for `Show` (`fuzz/seeds/ipc/`, the
+    /// corpus policy of decision M1-36), embedded at compile time so this test needs no
+    /// path at run time: each is a whole request frame and decodes to its form.
+    #[test]
+    fn the_show_fuzz_seeds_decode_as_recorded() {
+        let id = TornectId::from_bytes(
+            include_bytes!("../../../../fuzz/seeds/ipc/show-fill.bin")[10..42]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(id, link_id(), "the fill seed names the test key");
+        for (seed, link) in [
+            (
+                &include_bytes!("../../../../fuzz/seeds/ipc/show-plain.bin")[..],
+                None,
+            ),
+            (
+                &include_bytes!("../../../../fuzz/seeds/ipc/show-fill.bin")[..],
+                Some(ShownLink::Fill(id)),
+            ),
+            (
+                &include_bytes!("../../../../fuzz/seeds/ipc/show-refused.bin")[..],
+                Some(ShownLink::Refused),
+            ),
+        ] {
+            let req = decode_request(seed).unwrap();
+            assert_eq!(
+                req,
+                IpcRequest {
+                    id: 1,
+                    op: IpcOp::Show { link }
+                }
+            );
+            assert_eq!(encode_request(&req).unwrap(), seed, "canonical bytes");
+        }
     }
 
     #[test]
@@ -1884,7 +2186,12 @@ mod tests {
                         options,
                     }
                 }),
-            Just(IpcOp::Show),
+            prop_oneof![
+                Just(None),
+                any::<[u8; 32]>().prop_map(|b| Some(ShownLink::Fill(TornectId::from_bytes(b)))),
+                Just(Some(ShownLink::Refused)),
+            ]
+            .prop_map(|link| IpcOp::Show { link }),
             arb_device().prop_map(|device| IpcOp::SetLevelNone { device }),
             (23u32..).prop_map(IpcOp::Unknown),
         ]

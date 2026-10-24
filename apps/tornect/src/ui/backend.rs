@@ -1652,10 +1652,11 @@ impl MediaObserver for GuiMedia {
 }
 
 /// The window host's raise for `IpcOp::Show` (§B.1.1): a wake of the window's
-/// event loop (`Wake::Show`). It holds the model's waker only, so it cannot
-/// answer, dismiss or re-order a sheet.
+/// event loop (`Wake::Show`), carrying the link a link launch sent (design
+/// `invite` §2.4). It holds the model's waker only, so it cannot answer,
+/// dismiss or re-order a sheet, connect, or write the model.
 fn show_hook(shared: Arc<Shared>) -> crate::unattended::ShowHook {
-    Arc::new(move || shared.wake(Wake::Show))
+    Arc::new(move |link| shared.wake(Wake::Show(link)))
 }
 
 /// Wire the host role: the FSM with the window's consent, the media host, and
@@ -3777,70 +3778,96 @@ mod tests {
     /// its event loop (`Wake::Show`, which raises the window and re-arms the
     /// cards) and nothing else: the open sheets stay as they were, in their
     /// order, none answered or dismissed, and it is no mutation (no dialog,
-    /// no log line).
+    /// no log line). Design `invite` §2.4, §4.4: the same holds with a link,
+    /// a fill or a refusal, which travels with the wake exactly as it came,
+    /// and writes nothing into the model (no connect, no address-book entry).
     #[test]
     fn show_never_answers_dismisses_or_reorders() {
         use super::super::model::Popup;
-        use tornect_core::unattended::ipc::{IpcOp, IpcRequest};
+        use tornect_core::unattended::ipc::{IpcOp, IpcRequest, ShownLink};
 
-        let woken = Arc::new(Mutex::new(Vec::new()));
-        let into = Arc::clone(&woken);
-        let shared = Shared::new(
-            Model::default(),
-            Arc::new(move |why| into.lock().unwrap().push(why)),
+        let id = TornectId::from_public_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key(),
         );
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let sheets = vec![
-            Popup {
-                id: 3,
-                kind: PopupKind::Pairing {
-                    name: "Phone".to_owned(),
-                    fingerprint: "a1b2c3".to_owned(),
-                    sas: "123 456".to_owned(),
-                    pinned: None,
+        // Not a key: what arrives is passed on as it came, for the window
+        // to check again (a decoded fill holds any 32 bytes).
+        let not_a_key = (0u8..=255)
+            .map(|b| TornectId::from_bytes([b; 32]))
+            .find(|id| id.verifying_key().is_err())
+            .expect("some repeated byte is no curve point");
+        for link in [
+            None,
+            Some(ShownLink::Fill(id)),
+            Some(ShownLink::Fill(not_a_key)),
+            Some(ShownLink::Refused),
+        ] {
+            let woken = Arc::new(Mutex::new(Vec::new()));
+            let into = Arc::clone(&woken);
+            let shared = Shared::new(
+                Model::default(),
+                Arc::new(move |why| into.lock().unwrap().push(why)),
+            );
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let sheets = vec![
+                Popup {
+                    id: 3,
+                    kind: PopupKind::Pairing {
+                        name: "Phone".to_owned(),
+                        fingerprint: "a1b2c3".to_owned(),
+                        sas: "123 456".to_owned(),
+                        pinned: None,
+                    },
+                    deadline,
                 },
-                deadline,
-            },
-            Popup {
-                id: 4,
-                kind: PopupKind::Session {
-                    label: "Laptop".to_owned(),
-                    fingerprint: "d4e5f6".to_owned(),
+                Popup {
+                    id: 4,
+                    kind: PopupKind::Session {
+                        label: "Laptop".to_owned(),
+                        fingerprint: "d4e5f6".to_owned(),
+                    },
+                    deadline,
                 },
-                deadline,
-            },
-        ];
-        shared.update(|m| m.popups = sheets.clone());
-        woken.lock().unwrap().clear();
-        let tmp = tempfile::tempdir().unwrap();
-        let ctx = crate::unattended::test_context(tmp.path(), Some(show_hook(Arc::clone(&shared))));
-        let lines = ctx.log.read_all().unwrap().len();
-        let resp = crate::unattended::dispatch(
-            &ctx,
-            IpcRequest {
-                id: 7,
-                op: IpcOp::Show,
-            },
-        );
-        assert!(resp.ok, "{resp:?}");
-        assert_eq!(
-            *woken.lock().unwrap(),
-            vec![Wake::Show],
-            "one wake, nothing else"
-        );
-        let after = shared.read(|m| m.popups.clone());
-        assert_eq!(
-            after
-                .iter()
-                .map(|p| (p.id, p.kind.clone(), p.deadline))
-                .collect::<Vec<_>>(),
-            sheets
-                .iter()
-                .map(|p| (p.id, p.kind.clone(), p.deadline))
-                .collect::<Vec<_>>(),
-            "the sheets as they were"
-        );
-        assert_eq!(ctx.log.read_all().unwrap().len(), lines, "nothing logged");
+            ];
+            shared.update(|m| m.popups = sheets.clone());
+            woken.lock().unwrap().clear();
+            let before = shared.read(|m| format!("{m:?}"));
+            let tmp = tempfile::tempdir().unwrap();
+            let ctx =
+                crate::unattended::test_context(tmp.path(), Some(show_hook(Arc::clone(&shared))));
+            let lines = ctx.log.read_all().unwrap().len();
+            let resp = crate::unattended::dispatch(
+                &ctx,
+                IpcRequest {
+                    id: 7,
+                    op: IpcOp::Show { link },
+                },
+            );
+            assert!(resp.ok, "{resp:?}");
+            assert_eq!(resp.payload, None, "{link:?}");
+            assert_eq!(
+                *woken.lock().unwrap(),
+                vec![Wake::Show(link)],
+                "one wake, nothing else"
+            );
+            let after = shared.read(|m| m.popups.clone());
+            assert_eq!(
+                after
+                    .iter()
+                    .map(|p| (p.id, p.kind.clone(), p.deadline))
+                    .collect::<Vec<_>>(),
+                sheets
+                    .iter()
+                    .map(|p| (p.id, p.kind.clone(), p.deadline))
+                    .collect::<Vec<_>>(),
+                "the sheets as they were"
+            );
+            assert_eq!(
+                shared.read(|m| format!("{m:?}")),
+                before,
+                "the model as it was: {link:?}"
+            );
+            assert_eq!(ctx.log.read_all().unwrap().len(), lines, "nothing logged");
+        }
     }
 
     /// §B.8.6.2 (the banner returns "after any grant creation, widening or backup

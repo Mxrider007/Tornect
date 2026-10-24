@@ -14,7 +14,7 @@ use tornect_core::levels::{Answers, Availability};
 use tornect_core::session_log::{Actor, SessionMode};
 use tornect_core::unattended::credentials::RememberOffer;
 use tornect_core::unattended::grant::Preset;
-use tornect_core::unattended::ipc::GrantOptions;
+use tornect_core::unattended::ipc::{GrantOptions, ShownLink};
 use tornect_core::unattended::readiness::Probe;
 use tornect_core::{DeviceId, TornectId};
 
@@ -32,8 +32,10 @@ pub enum Wake {
     /// A popup opened or a session started: raise the main window.
     Attention,
     /// `IpcOp::Show` (a second launch, §B.1.1): raise the main window and arm
-    /// every open card again; answer, dismiss and re-order nothing.
-    Show,
+    /// every open card again; answer, dismiss and re-order nothing. With the
+    /// link a `tornect:` link launch sent (design `invite` §2.4), which at most
+    /// fills the connect field.
+    Show(Option<ShownLink>),
     /// The process was asked to end (SIGINT or SIGTERM; Ctrl-C or Ctrl-Break
     /// on Windows): close as the window's close button does, ending every
     /// session with a goodbye.

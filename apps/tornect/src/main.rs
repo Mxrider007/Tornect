@@ -761,7 +761,7 @@ async fn shown_by_the_running_host(paths: &Paths) -> bool {
     }
     let req = tornect_core::unattended::ipc::IpcRequest {
         id: 1,
-        op: tornect_core::unattended::ipc::IpcOp::Show,
+        op: tornect_core::unattended::ipc::IpcOp::Show { link: None },
     };
     matches!(
         tokio::time::timeout(SHOW_WAIT, tornect_platform::ipc::request(&paths.state_dir, &req)).await,
@@ -1249,7 +1249,8 @@ mod tests {
         let raised = Arc::new(AtomicUsize::new(0));
         let hook: super::unattended::ShowHook = {
             let raised = Arc::clone(&raised);
-            Arc::new(move || {
+            Arc::new(move |link| {
+                assert_eq!(link, None, "a second launch sends no link");
                 raised.fetch_add(1, Ordering::SeqCst);
             })
         };

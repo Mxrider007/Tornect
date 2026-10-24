@@ -28,7 +28,7 @@ use tornect_core::unattended::guard::{
 };
 use tornect_core::unattended::ipc::{
     GrantOptions, IpcOp, IpcRequest, IpcResponse, LogPage, MasterOnPayload, PolicyInputsPayload,
-    RegStartPayload, SetLevelNonePayload, codes, encode_payload,
+    RegStartPayload, SetLevelNonePayload, ShownLink, codes, encode_payload,
 };
 use tornect_core::unattended::readiness::{ReadinessSnapshot, SharedReadiness};
 use tornect_core::unattended::store::{GrantStore, LoadMode};
@@ -39,8 +39,10 @@ use tornect_signal::fsm::host::KillSwitch;
 
 /// What `IpcOp::Show` calls on a host with a window (§B.1.1): a wake of the
 /// window's event loop, which raises the window and arms its cards again. It
-/// reaches no sheet.
-pub type ShowHook = Arc<dyn Fn() + Send + Sync>;
+/// reaches no sheet. The link, if the raise came from an opened `tornect:`
+/// link (design `invite` §2.4), goes with the wake and at most fills the
+/// connect field.
+pub type ShowHook = Arc<dyn Fn(Option<ShownLink>) + Send + Sync>;
 
 /// Everything the dispatch needs, whichever route reached it.
 pub struct HostContext {
@@ -529,10 +531,11 @@ pub fn dispatch(ctx: &HostContext, req: IpcRequest) -> IpcResponse {
 
         // §B.1.1: only a host with a window raises it; the hook wakes the
         // window and reaches no sheet. No mutation: no guard, no dialog, no
-        // log line.
-        IpcOp::Show => match &ctx.show {
+        // log line. A link goes to the window as it came: the window checks
+        // its ID again before it fills anything (design `invite` §2.4).
+        IpcOp::Show { link } => match &ctx.show {
             Some(show) => {
-                show();
+                show(link);
                 IpcResponse::ok(id)
             }
             None => IpcResponse::fail(id, codes::G_UNSUPPORTED, NO_WINDOW_TO_SHOW),
@@ -3267,9 +3270,27 @@ mod tests {
         assert_eq!(resp.code, codes::E_UNKNOWN_KIND);
     }
 
+    /// The three forms of `Show` (design `invite` §4.4): a plain raise, a
+    /// link's fill, a refused link.
+    fn every_show() -> [IpcOp; 3] {
+        let id = tornect_core::TornectId::from_public_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key(),
+        );
+        [
+            IpcOp::Show { link: None },
+            IpcOp::Show {
+                link: Some(ShownLink::Fill(id)),
+            },
+            IpcOp::Show {
+                link: Some(ShownLink::Refused),
+            },
+        ]
+    }
+
     /// §B.1.1, §B.8.7.4: a host with no window to raise (the terminal host, the
-    /// headless one) refuses `Show` with the reason. It is no mutation: no
-    /// dialog is asked and nothing is logged.
+    /// headless one) refuses `Show` with the reason, with a link too (design
+    /// `invite` §4.4). It is no mutation: no dialog is asked and nothing is
+    /// logged.
     #[test]
     fn a_host_without_a_window_refuses_show() {
         let reauth = Arc::new(AllowAllReAuth::default());
@@ -3279,10 +3300,12 @@ mod tests {
             Arc::new(NoSessionActivity),
         );
         let before = env.ctx.log.read_all().unwrap().len();
-        let resp = go(&env.ctx, IpcOp::Show);
-        assert!(!resp.ok);
-        assert_eq!(resp.code, codes::G_UNSUPPORTED);
-        assert_eq!(resp.detail.as_deref(), Some(NO_WINDOW_TO_SHOW));
+        for show in every_show() {
+            let resp = go(&env.ctx, show.clone());
+            assert!(!resp.ok, "{show:?}");
+            assert_eq!(resp.code, codes::G_UNSUPPORTED, "{show:?}");
+            assert_eq!(resp.detail.as_deref(), Some(NO_WINDOW_TO_SHOW), "{show:?}");
+        }
         assert!(reauth.calls().is_empty(), "no dialog");
         assert_eq!(
             env.ctx.log.read_all().unwrap().len(),
@@ -3292,26 +3315,26 @@ mod tests {
     }
 
     /// M1-46 (kept): a host that started without its store answers `tornect
-    /// panic` only; `Show` is refused with that reason, and nothing ends.
+    /// panic` only; `Show` is refused with that reason, with a link too, and
+    /// nothing ends.
     #[test]
     fn the_storeless_host_refuses_show() {
         let kill = KillSwitch::new();
-        let resp = dispatch_without_store(
-            &kill,
-            "the store is locked",
-            IpcRequest {
-                id: 5,
-                op: IpcOp::Show,
-            },
-        );
-        assert!(!resp.ok);
-        assert_eq!(resp.code, codes::G_PRECONDITION);
-        assert!(
-            resp.detail
-                .as_deref()
-                .is_some_and(|d| d.contains("answers only `tornect panic`")),
-            "{resp:?}"
-        );
+        for show in every_show() {
+            let resp = dispatch_without_store(
+                &kill,
+                "the store is locked",
+                IpcRequest { id: 5, op: show },
+            );
+            assert!(!resp.ok);
+            assert_eq!(resp.code, codes::G_PRECONDITION);
+            assert!(
+                resp.detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("answers only `tornect panic`")),
+                "{resp:?}"
+            );
+        }
         assert_eq!(kill.fired(), None);
     }
 

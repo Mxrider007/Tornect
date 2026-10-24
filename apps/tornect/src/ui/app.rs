@@ -1572,7 +1572,10 @@ impl ApplicationHandler<UserEvent> for App {
                     view.surface.window.request_redraw();
                 }
             }
-            Wake::Show => {
+            // A link (design `invite` §2.4) raises like a second launch; it
+            // fills nothing here. Its fill is the connect field's, which
+            // checks the ID again and keeps Connect disarmed until seen.
+            Wake::Show(_link) => {
                 if let Some(main) = &self.main {
                     on_show(&*main.window, &mut self.form);
                     main.window.request_redraw();

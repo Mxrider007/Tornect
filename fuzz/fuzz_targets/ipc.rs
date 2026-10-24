@@ -4,8 +4,13 @@
 //! within the wire bounds and decode back to the same value.
 //!
 //! ```text
-//! cargo +nightly fuzz run ipc -- -max_total_time=600
+//! cargo +nightly fuzz run ipc target/fuzz-corpus/ipc fuzz/seeds/ipc fuzz/corpus/ipc -- -max_total_time=600
 //! ```
+//!
+//! Corpus policy (decision M1-36): `fuzz/seeds/ipc/` holds the committed seeds, the
+//! three forms of `Show` (design `invite` §4.4), checked by
+//! `tornect_core::unattended::ipc::tests::the_show_fuzz_seeds_decode_as_recorded`;
+//! `fuzz/corpus/ipc/` is a `cmin` result; campaigns write to `target/fuzz-corpus/ipc`.
 
 #![no_main]
 
