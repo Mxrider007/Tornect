@@ -250,7 +250,8 @@ B7 capture=0.9/4 PASS convert+encode=9.0/5 FAIL decode=1.9/4 PASS (B.7 targets a
   12–19 times the conversion cost (13.8 against 1.1 ms; 73–103 against 5.3 ms) for 2 columns. Recorded as an OPEN finding in `docs/VERIFICATION.md`
   ("RGBA conversion of a picture whose width is not a multiple of 8"); not fixed here: either the host fits
   every picture's width to a multiple of 8 (a crop of up to 7 columns, which amends M1-74 (3)'s "the whole
-  desktop but for an odd last column") or `tornect-codec` converts the last columns itself.
+  desktop but for an odd last column") or `tornect-codec` converts the last columns itself. Fixed since by a variant of
+  the second (`2458eb96`: the codec converts such a width whole): the next section.
 - **Encoder threads (`--threads 0`, automatic: 3 on 4 vCPU) against 1:** encode p50 1.04–1.14× faster at
   1080p and above (20.6 → 18.0 ms at 2560×1440 Best quality, 41.9 → 40.3 ms at 3538×1918), no change at 720p.
   Far from the 1.5× that design §9 asks before the default may change: the default stays 1 (M1-74 (5)).
@@ -258,6 +259,54 @@ B7 capture=0.9/4 PASS convert+encode=9.0/5 FAIL decode=1.9/4 PASS (B.7 targets a
   its capture stamp, so the e2e numbers are per picture, not estimates.
 - `kbps` falls to 6–14 after the first second: the card is a still picture with a moving square and strip,
   so it measures CPU stages, not link rates (those come from the live Tor run, design §9 row 1, NEEDS-DEVICE).
+
+## The loopback demo after the final reviews' fixes, 2026-10-24
+
+The same container, command and reading as the section above, with a binary built at `31c75b7b` (`cargo build
+--release -p tornect`, 4 min 6 s): the codec's own RGBA conversion for a width that is not a multiple of 8
+(`2458eb96`), the stop-aware pacing (`7aba5d27`), the gate's turn (`05ffc570`) and the Wayland retry
+(`31c75b7b`, not on this path). The commit after it changes only a doc comment and the docs. Each run 10 s, one at
+a time, nothing else running; stderr (OpenH264's warnings) left out. `yuv2rgb` is the range of the viewer's
+per-second conversion means.
+
+| `--size` | `--quality` | `--threads` | picture | fps | e2e p50 / p95 ms | encode p50 ms | decode p50 ms | yuv2rgb ms | lost | B7 capture | B7 convert+encode | B7 decode | exit |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 3538x1918 | best-quality | 1 | 3538x1918 | 11.2 | 79.8 / 109.8 | 39.8 | 10.1 | 22.8–26.5 | 0 | 5.4/4 FAIL | 48.1/5 FAIL | 10.8/4 FAIL | 0 |
+| 3538x1918 | best-quality | 0 | 3538x1918 | 11.3 | 71.8 / 103.6 | 32.5 | 9.5 | 23.4–26.3 | 0 | 5.4/4 FAIL | 41.4/5 FAIL | 10.1/4 FAIL | 0 |
+| 3538x1918 | balanced | 1 | 1920x1040 | 13.9 | 31.2 / 39.3 | 16.4 | 3.0 | 1.4–1.7 | 0 | 5.3/4 FAIL | 27.1/5 FAIL | 3.1/4 PASS | 0 |
+| 1366x768 | best-quality | 1 | 1366x768 | 11.8 | 14.1 / 19.8 | 8.1 | 1.8 | 4.0–5.2 | 0 | 0.9/4 PASS | 8.6/5 FAIL | 1.8/4 PASS | 0 |
+| 1368x768 | best-quality | 1 | 1368x768 | 11.8 | 10.5 / 15.8 | 7.5 | 1.8 | 0.7–1.0 | 0 | 0.8/4 PASS | 8.4/5 FAIL | 1.7/4 PASS | 0 |
+| 1920x1080 | balanced | 1 | 1920x1080 | 14.6 | 18.4 / 26.1 | 12.1 | 2.9 | 1.4–1.8 | 0 | 1.6/4 PASS | 14.7/5 FAIL | 3.0/4 PASS | 0 |
+
+The first row as printed:
+
+```
+### tornect demo --loopback --headless-stats --size 3538x1918 --quality best-quality --threads 1 --seconds 10
+DEMO START size=3538x1918 fps=30 quality=best-quality picture=3538x1918 threads=1
+STATS t=1 fps=12.0 picture=3538x1918 kbps=422 grab_ms=9.2 age_ms=0.0 scale_ms=0.0 convert_ms=6.4 encode_ms=52.4 send_ms=0.2 ack_ms=41.9 decode_ms=15.0 yuv2rgb_ms=25.5 e2e_ms=98.8
+STATS t=2 fps=11.2 picture=3538x1918 kbps=8 grab_ms=4.8 age_ms=0.0 scale_ms=0.0 convert_ms=5.6 encode_ms=38.6 send_ms=0.2 ack_ms=32.5 decode_ms=9.7 yuv2rgb_ms=22.8 e2e_ms=77.5
+STATS t=3 fps=11.3 picture=3538x1918 kbps=10 grab_ms=5.0 age_ms=0.0 scale_ms=0.0 convert_ms=5.7 encode_ms=37.7 send_ms=0.2 ack_ms=33.5 decode_ms=9.1 yuv2rgb_ms=23.9 e2e_ms=76.4
+STATS t=4 fps=11.3 picture=3538x1918 kbps=8 grab_ms=4.9 age_ms=0.0 scale_ms=0.0 convert_ms=5.7 encode_ms=38.4 send_ms=0.2 ack_ms=34.3 decode_ms=9.9 yuv2rgb_ms=24.3 e2e_ms=78.3
+STATS t=5 fps=11.3 picture=3538x1918 kbps=10 grab_ms=4.8 age_ms=0.0 scale_ms=0.0 convert_ms=5.8 encode_ms=36.8 send_ms=0.2 ack_ms=36.1 decode_ms=10.6 yuv2rgb_ms=25.1 e2e_ms=78.6
+STATS t=6 fps=11.0 picture=3538x1918 kbps=10 grab_ms=4.8 age_ms=0.0 scale_ms=0.0 convert_ms=6.2 encode_ms=39.8 send_ms=0.4 ack_ms=34.9 decode_ms=10.9 yuv2rgb_ms=24.8 e2e_ms=82.7
+STATS t=7 fps=10.9 picture=3538x1918 kbps=8 grab_ms=4.8 age_ms=0.0 scale_ms=0.0 convert_ms=6.2 encode_ms=39.8 send_ms=0.4 ack_ms=34.9 decode_ms=10.3 yuv2rgb_ms=25.0 e2e_ms=89.4
+STATS t=8 fps=11.8 picture=3538x1918 kbps=8 grab_ms=5.5 age_ms=0.0 scale_ms=0.0 convert_ms=6.2 encode_ms=47.0 send_ms=0.2 ack_ms=36.5 decode_ms=10.9 yuv2rgb_ms=26.5 e2e_ms=91.3
+STATS t=9 fps=11.2 picture=3538x1918 kbps=9 grab_ms=4.6 age_ms=0.0 scale_ms=0.0 convert_ms=5.9 encode_ms=47.7 send_ms=0.2 ack_ms=37.7 decode_ms=10.8 yuv2rgb_ms=24.9 e2e_ms=83.2
+SUMMARY frames=113 fps=11.2 e2e_p50_ms=79.8 e2e_p95_ms=109.8 encode_p50_ms=39.8 decode_p50_ms=10.1 lost=0 unreadable=0
+B7 capture=5.4/4 FAIL convert+encode=48.1/5 FAIL decode=10.8/4 FAIL (B.7 targets are hardware, 1080p60, direct path)
+### exit=0
+```
+
+- **Best quality at 3538×1918 now keeps up (exit 0 with `--threads 1` and `0`, nothing lost):** the viewer's
+  conversion takes 22.8–26.5 ms a picture, against 73–103 ms before, so `ack_ms` stays at 32–42 ms instead of
+  climbing to 896, and e2e p50 is 72–80 ms instead of 349–388. 11.2–11.3 fps of 12 is 93 %.
+- **1366×768:** 4.0–5.2 ms against 13.8 before; the ×8 width beside it (1368, still `openh264`'s AVX2 path)
+  0.7–1.0. The codec's converter is not as fast as that path (here about 4–5× its cost per pixel, in a
+  process whose encoder is busy on another core), but it is no longer the stage that limits the viewer: decode
+  plus conversion at 3538×1918 (about 35 ms) fits in Best quality's 83 ms interval.
+- **Unchanged by the fixes:** 1920×1080 Balanced (14.6 fps, e2e p50 18.4 against 19.3 ms) and 3538×1918
+  Balanced (13.9 fps, 31.2 against 32.3 ms) read as before, within run-to-run noise; §B.7's software-path
+  FAILs stand as in the section above.
 
 ## Appendix: the driver (Python 3, standard library only)
 

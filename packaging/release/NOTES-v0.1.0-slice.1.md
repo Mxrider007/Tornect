@@ -209,6 +209,10 @@ By the identifiers of the security reviews that found them.
 - **G2-3:** when a viewer with control says nothing for 3 s (a Tor stall counts), or keeps sending for 6 s while
   this computer cannot get a picture through to it, this computer lets go of the keys and buttons it holds; a drag
   then ends where the pointer last was.
+- A `config.toml` setting whose value this build does not know (for example a `[viewer] quality`, `picture` or
+  `toolbar_hides`, a `[general] theme` or a `[tor] bridges` value that a later version wrote, or a typo) stops
+  Tornect from starting, the host included, with "cannot parse configuration" and the file, line and setting.
+  Correct that line or delete it: a deleted setting takes its default.
 - No client in this build asks for an unattended session, so an unattended grant cannot yet be used.
 - Everything travels over Tor: a few frames per second for a large desktop, and a connection takes from
   seconds to minutes to set up. Direct QUIC with hole punching comes later.
