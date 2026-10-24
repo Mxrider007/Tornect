@@ -4383,23 +4383,41 @@ mod tests {
     }
 
     /// Settings, Display and quality: each choice sends the stored viewer
-    /// defaults with that one change (the picture's sizes in the toolbar's
-    /// own words), from what the settings hold; while this screen is shared
-    /// the controls give way to the hidden card and the fixed lines stay.
+    /// defaults with that one change (the presets and the picture's sizes in
+    /// the toolbar's own words), from what the settings hold; while this
+    /// screen is shared the controls give way to the hidden card and the
+    /// fixed lines stay (the host's: the viewer chooses the quality, within
+    /// `[media]`, the quality design §3.4).
     #[test]
     fn the_display_section_sends_the_viewer_defaults() {
         use super::super::model::SettingsChange;
         use settings::display;
-        use tornect_core::config::{Picture, ToolbarHides, Viewer};
+        use tornect_core::config::{Picture, QualityPreset, ToolbarHides, Viewer};
         let stored = Viewer::default();
         let mut window = Window::new(at_rest(), Page::Settings, egui::Theme::Dark, WIDE);
         let at = window.center("Display and quality");
         assert!(window.click(at).is_empty());
         assert!(window.pass(Vec::new()).is_empty());
-        for text in [display::HOST_RATE, display::QUALITY_LATER] {
+        for text in [display::HOST_QUALITY, display::HOST_LIMITS] {
             assert!(has_text(&window, text), "{text}");
         }
         let save = |viewer| vec![Action::SaveSettings(SettingsChange::Viewer(viewer))];
+        let at = window.center("Best performance");
+        assert_eq!(
+            window.click(at),
+            save(Viewer {
+                quality: QualityPreset::BestPerformance,
+                ..stored
+            })
+        );
+        let at = window.center("Best quality");
+        assert_eq!(
+            window.click(at),
+            save(Viewer {
+                quality: QualityPreset::BestQuality,
+                ..stored
+            })
+        );
         let at = window.center("1:1");
         assert_eq!(
             window.click(at),
@@ -4443,9 +4461,81 @@ mod tests {
             !window
                 .controls()
                 .iter()
-                .any(|c| c == "1:1" || c == display::BADGE)
+                .any(|c| c == "1:1" || c == display::BADGE || c == "Balanced")
         );
-        assert!(has_text(&window, display::HOST_RATE));
+        assert!(has_text(&window, display::HOST_QUALITY));
+        assert!(has_text(&window, display::HOST_LIMITS));
+    }
+
+    /// Settings, Display and quality (the quality design §3.4): the viewer
+    /// section opens with "Picture quality" and its three presets, the
+    /// saved one chosen (Balanced by default), the hint on where a session
+    /// changes it under them; the host section's old lines are gone.
+    #[test]
+    fn the_display_section_offers_the_picture_quality() {
+        use egui::accesskit::Toggled;
+        use settings::display;
+        use tornect_core::config::QualityPreset;
+        assert_eq!(
+            display::QUALITY_HINT,
+            "Change it during a session from the toolbar's Quality menu."
+        );
+        assert_eq!(
+            display::HOST_QUALITY,
+            "The person viewing this computer chooses the picture quality."
+        );
+        assert_eq!(
+            display::HOST_LIMITS,
+            "Limits for what this computer sends are in config.toml, [media]."
+        );
+        assert_eq!(
+            display::QUALITIES.map(|(_, name)| name),
+            ["Best quality", "Balanced", "Best performance"]
+        );
+        for (saved, on) in [
+            (None, "Balanced"),
+            (Some(QualityPreset::BestQuality), "Best quality"),
+            (Some(QualityPreset::BestPerformance), "Best performance"),
+        ] {
+            let mut model = at_rest();
+            if let Some(saved) = saved {
+                model.settings.viewer.quality = saved;
+            }
+            let mut window = Window::new(model, Page::Settings, egui::Theme::Dark, WIDE);
+            window.form.settings.section = settings::Section::Display;
+            window.pass(Vec::new());
+            assert!(has_text(&window, "Picture quality"), "{saved:?}");
+            assert!(has_text(&window, display::QUALITY_HINT), "{saved:?}");
+            assert!(has_text(&window, display::NEXT_SESSION), "{saved:?}");
+            for (_, name) in display::QUALITIES {
+                let want = if name == on {
+                    Toggled::True
+                } else {
+                    Toggled::False
+                };
+                assert_eq!(window.node(name).toggled(), Some(want), "{saved:?}: {name}");
+            }
+            // Picking the saved one saves nothing.
+            let at = window.center(on);
+            assert!(window.click(at).is_empty(), "{saved:?}");
+            // Above the picture's size.
+            let top = |text: &str| {
+                window
+                    .nodes
+                    .iter()
+                    .find(|n| n.value() == Some(text))
+                    .and_then(Node::bounds)
+                    .unwrap_or_else(|| panic!("no \"{text}\""))
+                    .y0
+            };
+            assert!(top("Picture quality") < top("Picture size"), "{saved:?}");
+            for gone in [
+                "The frame rate this computer sends when it is shared is fixed in this version.",
+                "Quality choices come later.",
+            ] {
+                assert!(!has_text(&window, gone), "{gone}");
+            }
+        }
     }
 
     /// Settings, Display and quality: under its choices the section says
