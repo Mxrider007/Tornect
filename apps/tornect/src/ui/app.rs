@@ -470,6 +470,12 @@ fn on_key(
     false
 }
 
+/// Whether a close request of a window with Alt held is the desktop's
+/// Alt+F4: on Windows and the Linux desktops. On macOS Alt (Option)+F4
+/// closes nothing, and an Option-click on the close button is the usual
+/// "close every window": a close there ends the session as any other does.
+const ALT_CLOSE_IS_ALT_F4: bool = !cfg!(target_os = "macos");
+
 /// A close request of the stream window: whether it ends the session.
 ///
 /// While the keyboard is on the remote computer in a control session (not
@@ -479,9 +485,21 @@ fn on_key(
 /// the window sees F4) made a close of this window: F4 goes to the remote
 /// computer, where Alt already went, and the session stays. Every other
 /// close ends it, as do End session and, with the keyboard taken back
-/// (Ctrl+Alt+Shift+M, decision M1-70), Alt+F4 itself.
+/// (Ctrl+Alt+Shift+M, decision M1-70), Alt+F4 itself; so does every close
+/// on macOS ([`ALT_CLOSE_IS_ALT_F4`]).
 fn on_close_request(chord: &keys::Chord, forwarder: &mut Forwarder, viewer: &ViewerState) -> bool {
-    if forwarder.takes_keys() && !viewer.keyboard_local && chord.alt_held() {
+    close_ends_session(ALT_CLOSE_IS_ALT_F4, chord, forwarder, viewer)
+}
+
+/// [`on_close_request`] where a close with Alt held is (`alt_f4`) or is
+/// not the desktop's Alt+F4.
+fn close_ends_session(
+    alt_f4: bool,
+    chord: &keys::Chord,
+    forwarder: &mut Forwarder,
+    viewer: &ViewerState,
+) -> bool {
+    if alt_f4 && forwarder.takes_keys() && !viewer.keyboard_local && chord.alt_held() {
         forwarder.send_combo(&[keys::F4]);
         return false;
     }
@@ -2612,7 +2630,7 @@ mod tests {
             type_keys(&mut window, &[press(alt)]);
             let (chord, forwarder, state) = &mut window;
             assert!(
-                !on_close_request(chord, forwarder, state),
+                !close_ends_session(true, chord, forwarder, state),
                 "the session stays"
             );
             type_keys(&mut window, &[release(alt)]);
@@ -2626,6 +2644,23 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// B10 review: on macOS a close with Option held is no Alt+F4 (that
+    /// closes nothing there; an Option-click on the close button closes
+    /// every window): it ends the session, and no F4 goes to the remote
+    /// computer.
+    #[test]
+    fn a_close_with_option_held_on_macos_ends_the_session() {
+        for alt in [ALT, 0x07_00e6] {
+            let mut window = viewer(true);
+            type_keys(&mut window, &[press(alt)]);
+            window.1.drain();
+            let (chord, forwarder, state) = &mut window;
+            assert!(close_ends_session(false, chord, forwarder, state));
+            assert!(!window.1.drain().contains(&key(keys::F4, true)));
+        }
+        assert_eq!(ALT_CLOSE_IS_ALT_F4, !cfg!(target_os = "macos"));
     }
 
     /// B10: every other close request still ends the session: no Alt held
