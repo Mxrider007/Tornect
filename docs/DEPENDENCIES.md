@@ -32,7 +32,7 @@ The library crates (`arti-client`, `tor-hsservice`, …) use their own 0.x numbe
 | `hex` | 0.4.3 | — | Fingerprint rendering. | none | 2026-08-28 | crates.io |
 | `tokio` | 1.53.1 | rt, macros, sync, time, net, io-util, fs, signal | Async runtime for M1+ (Arti and quinn both require it). | none | 2026-08-28 | crates.io |
 | `bytes` / `parking_lot` | 1.12.1 / 0.12.5 | — | Buffers / locks for M1+. | none | 2026-08-28 | crates.io |
-| `tempfile` / `proptest` (dev) | 3.27.0 / 1.11.0 | — | Tests. | none | 2026-08-28 | crates.io |
+| `tempfile` / `proptest` (dev) | 3.27.0 / 1.11.0 | — | Tests. `proptest` is a dev-dependency of tornect-core, -signal, -platform and, from 2026-10-24, tornect-codec (the `scale` properties of the quality design §8). | none | 2026-08-28 | crates.io |
 
 ## Milestone 1 (tornect-signal: embedded Arti)
 

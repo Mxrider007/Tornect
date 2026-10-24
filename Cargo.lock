@@ -7347,6 +7347,7 @@ name = "tornect-codec"
 version = "0.1.0"
 dependencies = [
  "openh264",
+ "proptest",
  "thiserror 2.0.20",
  "tracing",
 ]

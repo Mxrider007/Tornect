@@ -17,6 +17,8 @@ use openh264::encoder::{
 };
 use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSource as _};
 
+pub mod scale;
+
 /// The longest side OpenH264 encodes: 3840 wide, or 3840 tall when the
 /// picture stands upright (level 5.2, `openh264` 0.9.8 `Encoder::reinit`).
 pub const MAX_LONG_SIDE: u32 = 3840;

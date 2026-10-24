@@ -13,6 +13,9 @@ openh264.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [features]
 default = []
 # FFmpeg libavcodec hw contexts (NVENC/AMF/QSV/VAAPI/VideoToolbox); needs libav* dev headers + libclang (CI-verified)
