@@ -1713,13 +1713,18 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
     // same sheets, withdrawn alike, and the block window on every monitor.
     deps.local_allow = consent;
     deps.block_window = Arc::new(GuiBlockWindow::new(Arc::clone(&b.popups)));
-    deps.sessions = Arc::new(GuiSessions {
-        live: Arc::clone(&live),
-        polkit: Arc::clone(&polkit),
-        media: Arc::clone(&media),
-        shared: Arc::clone(&b.shared),
-        started: started_tx,
-    });
+    // Each unattended session's length goes on its grant (the reconnect
+    // cooldown, §B.8.6.4), as on the terminal host.
+    deps.sessions = crate::host::UnattendedUse::wrap(
+        &ctx,
+        Arc::new(GuiSessions {
+            live: Arc::clone(&live),
+            polkit: Arc::clone(&polkit),
+            media: Arc::clone(&media),
+            shared: Arc::clone(&b.shared),
+            started: started_tx,
+        }),
+    );
     let kill_watch = media.watch_kill(deps.kill.clone());
     let banner = ctx.as_ref().ok().map(|c| {
         Arc::new(BannerWatch {
