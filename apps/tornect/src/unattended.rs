@@ -1012,7 +1012,7 @@ pub(crate) fn offline_context(paths: &Paths) -> anyhow::Result<HostContext> {
 }
 
 /// What the offline guard asks about remote sessions: the host lock.
-fn offline_activity(paths: &Paths) -> Arc<dyn RemoteSessionActivity> {
+pub(crate) fn offline_activity(paths: &Paths) -> Arc<dyn RemoteSessionActivity> {
     Arc::new(HostLockActivity {
         paths: paths.clone(),
     })
