@@ -29,7 +29,7 @@ use std::sync::Arc;
 use tornect_core::Paths;
 use tornect_core::session_log::{Actor, SessionEvent, SessionRecord};
 use tornect_core::unattended::guard::{ExternalOp, GuardError};
-use tornect_core::unattended::ipc::{IpcOp, IpcRequest, IpcResponse};
+use tornect_core::unattended::ipc::{IpcOp, IpcRequest, IpcResponse, codes};
 use tornect_platform::autostart::{Autostart, AutostartState, LaunchSpec};
 use tornect_platform::install::InstallError;
 
@@ -212,15 +212,49 @@ fn log_failure(ctx: &HostContext, event: SessionEvent, what: &str, e: &InstallEr
     }
 }
 
+/// What the sign-in step says of a Tornect host that started while the
+/// install ran (`holder`, from the host lock): most likely the window, opened
+/// from the menu entry or shortcut the install had just written. It found
+/// the unattended store held by this install, so it runs without unattended
+/// access until it is started again (a host never retries its store,
+/// decision M1-46).
+pub(crate) fn opened_meanwhile(holder: &str) -> String {
+    format!(
+        "Tornect was opened while this install ran ({holder}); it cannot use unattended access \
+         until you close it and open it again."
+    )
+}
+
+/// The refusal of a yes beside that host: the guard counts it as a live
+/// session, which is not what happened (audit B21).
+fn sign_in_not_set_up(holder: &str, exe: &std::path::Path) -> String {
+    format!(
+        "{} Start at sign-in was not set up: close Tornect, then run `tornect service \
+         install` with the installed copy, {}.",
+        opened_meanwhile(holder),
+        exe.display()
+    )
+}
+
 /// The setting's copy, then the question; on a yes, `tornect service
 /// install` for the installed copy at `exe`, through its own guard operation
-/// (a second dialog, `AutostartChanged` logged).
+/// (a second dialog, `AutostartChanged` logged). A Tornect host that started
+/// meanwhile (the install holds the store until it returns) is named, with
+/// what to do: a yes is not tried beside it, and one it refused, having
+/// started during the dialog, says so rather than "a remote session is
+/// live" (B21).
 fn offer_sign_in(deps: &mut Deps<'_>, paths: &Paths, exe: PathBuf) -> anyhow::Result<()> {
     deps.console.out(unattended::TOR_AT_SIGN_IN);
-    if !default_no(deps.console.ask(SIGN_IN_QUESTION).as_deref()) {
+    let yes = default_no(deps.console.ask(SIGN_IN_QUESTION).as_deref());
+    if let Some(holder) = crate::host::HostLock::holder(paths) {
+        anyhow::ensure!(!yes, sign_in_not_set_up(&holder, &exe));
+        deps.console.err(&opened_meanwhile(&holder));
         return Ok(());
     }
-    deps.ctx.autostart = (deps.autostart_for)(unattended::launch_spec_for(paths, exe)?);
+    if !yes {
+        return Ok(());
+    }
+    deps.ctx.autostart = (deps.autostart_for)(unattended::launch_spec_for(paths, exe.clone())?);
     let resp = unattended::dispatch(
         deps.ctx,
         IpcRequest {
@@ -228,6 +262,12 @@ fn offer_sign_in(deps: &mut Deps<'_>, paths: &Paths, exe: PathBuf) -> anyhow::Re
             op: IpcOp::ServiceInstall { elevated: false },
         },
     );
+    if !resp.ok
+        && resp.code == codes::G_REMOTE_SESSION_ACTIVE
+        && let Some(holder) = crate::host::HostLock::holder(paths)
+    {
+        anyhow::bail!(sign_in_not_set_up(&holder, &exe));
+    }
     unattended::require_ok(&resp)?;
     if let Some(said) = &resp.detail {
         deps.console.out(&format!("{said}."));
@@ -682,6 +722,7 @@ mod tests {
     use tornect_core::unattended::grant::Preset;
     use tornect_core::unattended::guard::{
         AllowAllPaired, MutationGuard, NoSessionActivity, ReAuth, ReAuthError,
+        RemoteSessionActivity,
     };
     use tornect_core::unattended::ipc::GrantOptions;
     use tornect_core::unattended::readiness::SharedReadiness;
@@ -696,6 +737,10 @@ mod tests {
     struct Dialogs {
         asked: Mutex<Vec<String>>,
         allow: usize,
+        /// While the dialog of this operation is up, a Tornect host starts
+        /// for this home (it takes the host lock, held from then on).
+        host_starts: Mutex<Option<(&'static str, Paths)>>,
+        host: Mutex<Option<crate::host::HostLock>>,
     }
 
     impl Dialogs {
@@ -703,6 +748,8 @@ mod tests {
             Arc::new(Self {
                 asked: Mutex::new(Vec::new()),
                 allow,
+                host_starts: Mutex::new(None),
+                host: Mutex::new(None),
             })
         }
 
@@ -713,6 +760,11 @@ mod tests {
 
     impl ReAuth for Dialogs {
         fn reauthenticate(&self, op: &str) -> Result<(), ReAuthError> {
+            if let Some((during, paths)) = &*self.host_starts.lock().unwrap()
+                && *during == op
+            {
+                *self.host.lock().unwrap() = Some(crate::host::HostLock::acquire(paths).unwrap());
+            }
             let mut asked = self.asked.lock().unwrap();
             asked.push(op.to_owned());
             if asked.len() <= self.allow {
@@ -1047,6 +1099,22 @@ mod tests {
 
     /// [`env`], with `before_open` run on the home before its store opens.
     fn env_with(facts: FixedFacts, allow: usize, before_open: impl FnOnce(&Paths)) -> Env {
+        env_full(facts, allow, before_open, |_| Arc::new(NoSessionActivity))
+    }
+
+    /// [`env`] whose guard sees a running Tornect host as a live session,
+    /// as the offline route's does (`HostLockActivity`).
+    fn env_seeing_hosts(facts: FixedFacts, allow: usize) -> Env {
+        env_full(facts, allow, |_| {}, unattended::offline_activity)
+    }
+
+    /// [`env_with`], the guard's view of remote sessions from `activity`.
+    fn env_full(
+        facts: FixedFacts,
+        allow: usize,
+        before_open: impl FnOnce(&Paths),
+        activity: impl FnOnce(&Paths) -> Arc<dyn RemoteSessionActivity>,
+    ) -> Env {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(tmp.path().join("home"));
         paths.ensure().unwrap();
@@ -1067,7 +1135,7 @@ mod tests {
         let guard = MutationGuard::new(
             store,
             Arc::clone(&dialogs) as Arc<dyn ReAuth>,
-            Arc::new(NoSessionActivity),
+            activity(&paths),
             Arc::clone(&facts),
         )
         .with_paired_devices(Arc::new(AllowAllPaired))
@@ -1206,6 +1274,117 @@ mod tests {
             assert_eq!(backends.installs(), 1, "{answer:?}");
         }
         assert_eq!(SIGN_IN_QUESTION, "Start Tornect when I sign in? [y/N]");
+    }
+
+    /// A terminal at which, while the sign-in question waits, Tornect is
+    /// opened from the menu entry the install has just written: its host
+    /// takes the host lock (and finds the store held by the install).
+    struct OpenedWhileAsking<'p> {
+        script: Script,
+        paths: &'p Paths,
+        host: Option<crate::host::HostLock>,
+    }
+
+    impl Console for OpenedWhileAsking<'_> {
+        fn stdout_is_terminal(&self) -> bool {
+            true
+        }
+
+        fn out(&mut self, line: &str) {
+            self.script.out(line);
+        }
+
+        fn secret_line(&mut self, prefix: &str, secret: &str) -> anyhow::Result<()> {
+            self.script.secret_line(prefix, secret)
+        }
+
+        fn err(&mut self, line: &str) {
+            self.script.err(line);
+        }
+
+        fn ask(&mut self, question: &str) -> Option<String> {
+            self.host = Some(crate::host::HostLock::acquire(self.paths).unwrap());
+            self.script.ask(question)
+        }
+    }
+
+    /// B21: Tornect opened from the new menu entry while "Start Tornect when
+    /// I sign in?" waits. A yes is refused with what happened and what to do
+    /// (close Tornect, then `tornect service install` with the installed
+    /// copy), before any dialog, never as "a remote session is live"; a no
+    /// says that the Tornect just opened has no unattended access until it
+    /// is opened again. The install stays either way.
+    #[test]
+    fn a_tornect_opened_while_the_sign_in_question_waits_is_named() {
+        let pid = format!("pid {}", std::process::id());
+        for (answer, yes) in [(Some("y\n"), true), (Some("\n"), false), (None, false)] {
+            let mut env = linux_env(2);
+            let backends = Backends::default();
+            let make = |spec| backends.make(spec);
+            let paths = env.paths.clone();
+            let mut console = OpenedWhileAsking {
+                script: Script::answering(&[answer]),
+                paths: &paths,
+                host: None,
+            };
+            let mut deps = Deps {
+                ctx: &mut env.ctx,
+                console: &mut console,
+                host_running: false,
+                autostart_for: &make,
+            };
+            let done = install_linux(
+                &mut deps,
+                &env.paths,
+                &env.files,
+                &mut std::io::Cursor::new(b"the program".to_vec()),
+            );
+            assert!(env.files.installed(), "{answer:?}: the install stays");
+            assert_eq!(backends.installs(), 0, "{answer:?}");
+            assert_eq!(env.dialogs.asked(), ["install"], "{answer:?}: no dialog");
+            if yes {
+                let err = done.unwrap_err().to_string();
+                assert!(err.starts_with(&opened_meanwhile(&pid)), "{err}");
+                assert!(
+                    err.contains(
+                        "Start at sign-in was not set up: close Tornect, then run \
+                         `tornect service install` with the installed copy"
+                    ) && err.contains(&env.files.exe().display().to_string()),
+                    "{err}"
+                );
+                assert!(!err.contains("remote session"), "{err}");
+            } else {
+                done.unwrap();
+                assert!(
+                    console
+                        .script
+                        .lines
+                        .contains(&format!("err: {}", opened_meanwhile(&pid))),
+                    "{answer:?}: {:?}",
+                    console.script.lines
+                );
+            }
+        }
+    }
+
+    /// B21: a Tornect opened while the sign-in's own dialog is up. The
+    /// guard counts its host as a live session (the offline route cannot
+    /// see its sessions) and refuses; the command line says what happened
+    /// instead of "a remote session is live". Failed before the fix.
+    #[test]
+    fn a_tornect_opened_during_the_sign_in_dialog_is_named() {
+        let mut env = env_seeing_hosts(FixedFacts::linux(), 2);
+        *env.dialogs.host_starts.lock().unwrap() = Some(("service_install", env.paths.clone()));
+        let backends = Backends::default();
+        let (done, _) = env.install(&[Some("yes\n")], &backends);
+        let err = done.unwrap_err().to_string();
+        let pid = format!("pid {}", std::process::id());
+        assert!(err.starts_with(&opened_meanwhile(&pid)), "{err}");
+        assert!(err.contains("Start at sign-in was not set up"), "{err}");
+        assert!(!err.contains("remote session"), "{err}");
+        assert_eq!(env.dialogs.asked(), ["install", "service_install"]);
+        assert_eq!(backends.installs(), 0);
+        assert!(env.files.installed(), "the install stays");
     }
 
     /// §B.1.1: the setting's copy (Tor at every sign-in) is printed before
