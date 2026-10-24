@@ -347,6 +347,54 @@ impl StatsWindow {
     }
 }
 
+/// At most `max` log lines in each `window`, for lines a peer that has not
+/// bound a session can cause: such a peer must not be able to fill the log
+/// file. Each line let through says how many were left out before it.
+#[derive(Debug)]
+pub struct LineBudget {
+    window: Duration,
+    max: u32,
+    started: Option<Instant>,
+    used: u32,
+    left_out: u64,
+}
+
+impl LineBudget {
+    /// A budget of `max` lines in each `window`.
+    #[must_use]
+    pub fn new(window: Duration, max: u32) -> Self {
+        Self {
+            window,
+            max,
+            started: None,
+            used: 0,
+            left_out: 0,
+        }
+    }
+
+    /// Whether a line may be logged at `now`: `Some` with the number of
+    /// lines left out since the last one let through, or `None` (counted)
+    /// once this window's lines are used up. A window starts with the first
+    /// line asked for after the last one ended; a clock that went backwards
+    /// stays in the current window.
+    pub fn take(&mut self, now: Instant) -> Option<u64> {
+        if self
+            .started
+            .is_none_or(|s| now.saturating_duration_since(s) >= self.window)
+        {
+            self.started = Some(now);
+            self.used = 0;
+        }
+        if self.used < self.max {
+            self.used += 1;
+            Some(std::mem::take(&mut self.left_out))
+        } else {
+            self.left_out = self.left_out.saturating_add(1);
+            None
+        }
+    }
+}
+
 /// Add `d` in microseconds to `sum`, saturating.
 fn add(sum: &mut u64, d: Duration) {
     *sum = sum.saturating_add(u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
@@ -653,5 +701,37 @@ mod tests {
         let mut w = StatsWindow::new(Duration::from_secs(1), t0 + Duration::from_secs(5));
         assert!(!w.due(t0));
         assert_eq!(w.take(t0, (1, 1)).window_ms, 1);
+    }
+
+    /// The PR-C review's I-2: lines a peer without a session causes are
+    /// let through `max` per window, the first one after a gap saying how
+    /// many it left out; a new window starts with the first line after the
+    /// last one ended, and a clock that went backwards stays in the window.
+    #[test]
+    fn a_line_budget_lets_max_lines_through_per_window_and_counts_the_rest() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut b = LineBudget::new(s(60), 3);
+        assert_eq!(b.take(t0), Some(0));
+        assert_eq!(b.take(t0 + s(1)), Some(0));
+        assert_eq!(b.take(t0 + s(2)), Some(0));
+        for i in 0..1000 {
+            assert_eq!(b.take(t0 + s(3) + Duration::from_millis(i)), None);
+        }
+        assert_eq!(b.take(t0 + s(59)), None, "still the first window");
+        assert_eq!(b.take(t0), None, "a clock gone backwards: same window");
+        assert_eq!(b.take(t0 + s(60)), Some(1002), "the next window says so");
+        assert_eq!(b.take(t0 + s(61)), Some(0));
+        assert_eq!(b.take(t0 + s(62)), Some(0));
+        assert_eq!(b.take(t0 + s(63)), None);
+        assert_eq!(b.take(t0 + s(500)), Some(1), "a quiet gap: a new window");
+
+        let mut none = LineBudget::new(s(60), 0);
+        assert_eq!(none.take(t0), None);
+        assert_eq!(none.take(t0 + s(60)), None);
+        let mut full = LineBudget::new(s(60), 0);
+        full.left_out = u64::MAX;
+        assert_eq!(full.take(t0), None);
+        assert_eq!(full.left_out, u64::MAX, "saturates");
     }
 }

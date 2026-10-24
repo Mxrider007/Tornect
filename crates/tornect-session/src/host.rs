@@ -58,7 +58,9 @@ use tornect_signal::consent::{SessionToken, mode_code};
 use tornect_signal::fsm::host::{KillSwitch, LiveSession, SessionEnd, SessionSink};
 use tornect_signal::messages::notice;
 
-use crate::flow::{AckWindow, KeyframeLimiter, QualityGate, StageTimes, StatsWindow, TokenBucket};
+use crate::flow::{
+    AckWindow, KeyframeLimiter, LineBudget, QualityGate, StageTimes, StatsWindow, TokenBucket,
+};
 use crate::quality::{self, QualityCaps, Route, StreamSettings};
 
 /// How often the capture thread checks its stop flag, and a quality change,
@@ -401,7 +403,15 @@ pub struct MediaHost {
     backend: Arc<dyn MediaBackend>,
     observer: Arc<dyn MediaObserver>,
     limits: MediaLimits,
+    /// The lines a stream without a bound session can cause (the PR-C
+    /// review's I-2): any peer that reaches the media port can open streams.
+    pre_bind: Mutex<LineBudget>,
 }
+
+/// At most [`PRE_BIND_LINES`] log lines in each [`PRE_BIND_WINDOW`] about
+/// streams that have not bound a session.
+const PRE_BIND_LINES: u32 = 20;
+const PRE_BIND_WINDOW: Duration = Duration::from_secs(60);
 
 impl std::fmt::Debug for MediaHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -427,6 +437,7 @@ impl MediaHost {
             backend,
             observer,
             limits,
+            pre_bind: Mutex::new(LineBudget::new(PRE_BIND_WINDOW, PRE_BIND_LINES)),
         }
     }
 
@@ -506,21 +517,35 @@ impl MediaHost {
         let deadline = tokio::time::Instant::now() + self.limits.bind_deadline;
         // The viewer's preset is read, and a code this version does not know
         // refused with the malformed binds below, before any look-up.
-        let (session_id, mac, preset) = match tokio::time::timeout_at(deadline, read_bind(&mut rd))
-            .await
+        let pre_bind = &self.pre_bind;
+        let (session_id, mac, preset) = match tokio::time::timeout_at(
+            deadline,
+            read_bind(&mut rd, pre_bind),
+        )
+        .await
         {
             Ok(Ok(bind)) => bind,
             Ok(Err(ProtoError::Io(e))) => {
-                tracing::debug!(error = %e, "media stream closed before its bind");
+                if let Some(left_out) = line(pre_bind) {
+                    tracing::debug!(error = %e, left_out, "media stream closed before its bind");
+                }
                 return MediaOutcome::NotBound;
             }
             Ok(Err(e)) => {
-                tracing::debug!(error = %e, "media stream opened with something other than a bind");
+                if let Some(left_out) = line(pre_bind) {
+                    tracing::debug!(
+                        error = %e,
+                        left_out,
+                        "media stream opened with something other than a bind"
+                    );
+                }
                 refuse(&mut wr, reason::PROTOCOL).await;
                 return MediaOutcome::NotBound;
             }
             Err(_) => {
-                tracing::debug!("media stream sent no bind in time");
+                if let Some(left_out) = line(pre_bind) {
+                    tracing::debug!(left_out, "media stream sent no bind in time");
+                }
                 return MediaOutcome::NotBound;
             }
         };
@@ -532,10 +557,13 @@ impl MediaHost {
             // refusal is written.
             Lookup::Unknown => {
                 let Ok(_waiting) = Arc::clone(&self.waiting).try_acquire_owned() else {
-                    tracing::warn!(
-                        max = self.limits.max_waiting,
-                        "media bind refused: too many are waiting for their session"
-                    );
+                    if let Some(left_out) = line(pre_bind) {
+                        tracing::warn!(
+                            max = self.limits.max_waiting,
+                            left_out,
+                            "media bind refused: too many are waiting for their session"
+                        );
+                    }
                     refuse(&mut wr, reason::BAD_BIND).await;
                     return MediaOutcome::Busy;
                 };
@@ -546,7 +574,9 @@ impl MediaHost {
             }
         };
         let Some(claimed) = claimed else {
-            tracing::info!(session = %session_id, "media bind refused");
+            if let Some(left_out) = line(pre_bind) {
+                tracing::info!(session = %session_id, left_out, "media bind refused");
+            }
             refuse(&mut wr, reason::BAD_BIND).await;
             return MediaOutcome::NotBound;
         };
@@ -963,7 +993,13 @@ struct Stream {
 /// a `Bind` is exactly [`BIND_LEN`] bytes, so that is all an unbound peer can
 /// make the host read. Returns the session id, the MAC and the viewer's
 /// preset (a code `tornect_proto::quality` does not know is malformed).
-async fn read_bind<R: AsyncRead + Unpin>(r: &mut R) -> Result<Bound, ProtoError> {
+///
+/// Its own line, the one a viewer of another version causes, is let through
+/// by `lines`, as every line before a session is bound.
+async fn read_bind<R: AsyncRead + Unpin>(
+    r: &mut R,
+    lines: &Mutex<LineBudget>,
+) -> Result<Bound, ProtoError> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
@@ -976,8 +1012,11 @@ async fn read_bind<R: AsyncRead + Unpin>(r: &mut R) -> Result<Bound, ProtoError>
         if (1..=MAX_CLIENT_FRAME).contains(&len) {
             let mut ty = [0u8; 1];
             r.read_exact(&mut ty).await?;
-            if ty[0] == BIND_TYPE {
+            if ty[0] == BIND_TYPE
+                && let Some(left_out) = line(lines)
+            {
                 tracing::info!(
+                    left_out,
                     "a media bind of {len} bytes: the viewer may run a different Tornect version"
                 );
             }
@@ -996,6 +1035,15 @@ async fn read_bind<R: AsyncRead + Unpin>(r: &mut R) -> Result<Bound, ProtoError>
             .ok_or(ProtoError::Malformed("Bind")),
         _ => Err(ProtoError::Malformed("Bind")),
     }
+}
+
+/// Whether a line about a stream without a bound session may be logged now:
+/// how many were left out before it, or `None` while `lines` is used up.
+fn line(lines: &Mutex<LineBudget>) -> Option<u64> {
+    lines
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take(tokio::time::Instant::now().into_std())
 }
 
 /// Read the client's frames into `tx` until it closes the stream or breaks
@@ -1842,15 +1890,22 @@ mod tests {
         );
     }
 
-    /// The message of every event logged while it is the thread's subscriber.
-    struct Lines(Arc<Mutex<Vec<String>>>);
+    /// The message of every event logged while it is the thread's
+    /// subscriber, and in `.1` its `left_out` field.
+    struct Lines(Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<Option<u64>>>>);
 
-    struct Message<'a>(&'a mut String);
+    struct Message<'a>(&'a mut String, &'a mut Option<u64>);
 
     impl tracing::field::Visit for Message<'_> {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             if field.name() == "message" {
                 *self.0 = format!("{value:?}");
+            }
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            if field.name() == "left_out" {
+                *self.1 = Some(value);
             }
         }
     }
@@ -1869,9 +1924,10 @@ mod tests {
         fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
 
         fn event(&self, event: &tracing::Event<'_>) {
-            let mut line = String::new();
-            event.record(&mut Message(&mut line));
+            let (mut line, mut left_out) = (String::new(), None);
+            event.record(&mut Message(&mut line, &mut left_out));
             self.0.lock().unwrap().push(line);
+            self.1.lock().unwrap().push(left_out);
         }
 
         fn enter(&self, _: &tracing::span::Id) {}
@@ -1886,11 +1942,96 @@ mod tests {
             .build()
             .unwrap();
         let mut cursor = std::io::Cursor::new(bytes);
-        let read = tracing::subscriber::with_default(Lines(Arc::clone(&lines)), || {
-            runtime.block_on(read_bind(&mut cursor))
-        });
+        let budget = Mutex::new(LineBudget::new(PRE_BIND_WINDOW, PRE_BIND_LINES));
+        let read =
+            tracing::subscriber::with_default(Lines(Arc::clone(&lines), Arc::default()), || {
+                runtime.block_on(read_bind(&mut cursor, &budget))
+            });
         let lines = lines.lock().unwrap().clone();
         (read, lines, cursor.position())
+    }
+
+    /// Opens no source and injects nothing: for streams that never bind.
+    struct Unused;
+
+    impl MediaBackend for Unused {
+        fn open_source(
+            &self,
+            _: SourceRequest,
+            _: watch::Receiver<bool>,
+        ) -> Result<Box<dyn VideoSource>, CaptureError> {
+            Err(CaptureError::Unavailable("no source here".into()))
+        }
+
+        fn open_injector(&self) -> Option<Box<dyn InputSink>> {
+            None
+        }
+    }
+
+    /// Serve a stream whose viewer sent `first` and nothing more.
+    async fn serve_sent(host: &MediaHost, first: &[u8]) -> MediaOutcome {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(first).await.unwrap();
+        host.serve(server).await
+    }
+
+    /// The PR-C review's I-2: streams that bind no session log at most
+    /// `PRE_BIND_LINES` lines a window, however many a peer opens; the first
+    /// line of the next window says how many were left out.
+    #[test]
+    fn streams_without_a_session_log_at_most_a_budget_of_lines() {
+        let (messages, left_out) = (Arc::new(Mutex::new(Vec::new())), Arc::default());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let host = MediaHost::new(
+            Arc::new(Unused),
+            Arc::new(NoObserver),
+            MediaLimits::default(),
+        );
+        let lines = Lines(Arc::clone(&messages), Arc::clone(&left_out));
+        tracing::subscriber::with_default(lines, || {
+            runtime.block_on(async {
+                // Closed at once: no time passes, so all 50 fall in one window.
+                for _ in 0..50 {
+                    let (client, server) = tokio::io::duplex(64);
+                    drop(client);
+                    let outcome = host.serve(server).await;
+                    assert!(matches!(outcome, MediaOutcome::NotBound), "{outcome:?}");
+                }
+                tokio::time::advance(PRE_BIND_WINDOW).await;
+                let ping = Msg::Ping { nonce: 1 }.encode();
+                let outcome = serve_sent(&host, &ping).await;
+                assert!(matches!(outcome, MediaOutcome::NotBound), "{outcome:?}");
+                let unknown = bind(tornect_proto::quality::BALANCED).encode();
+                let outcome = serve_sent(&host, &unknown).await;
+                assert!(matches!(outcome, MediaOutcome::NotBound), "{outcome:?}");
+            });
+        });
+        let messages = messages.lock().unwrap().clone();
+        let left_out = left_out.lock().unwrap().clone();
+        let budget = PRE_BIND_LINES as usize;
+        assert_eq!(messages.len(), budget + 2, "{messages:?}");
+        assert!(
+            messages[..budget]
+                .iter()
+                .all(|m| m == "media stream closed before its bind"),
+            "{messages:?}"
+        );
+        assert!(left_out[..budget].iter().all(|n| *n == Some(0)));
+        assert_eq!(
+            (messages[budget].as_str(), left_out[budget]),
+            (
+                "media stream opened with something other than a bind",
+                Some(50 - PRE_BIND_LINES as u64)
+            )
+        );
+        assert_eq!(
+            (messages[budget + 1].as_str(), left_out[budget + 1]),
+            ("media bind refused", Some(0))
+        );
     }
 
     fn bind(quality: u8) -> Msg {
@@ -2042,9 +2183,10 @@ mod tests {
             ..Media::default()
         };
         let lines = Arc::new(Mutex::new(Vec::new()));
-        let limits = tracing::subscriber::with_default(Lines(Arc::clone(&lines)), || {
-            MediaLimits::with_media(&media)
-        });
+        let limits =
+            tracing::subscriber::with_default(Lines(Arc::clone(&lines), Arc::default()), || {
+                MediaLimits::with_media(&media)
+            });
         assert_eq!(
             limits.caps,
             QualityCaps {
