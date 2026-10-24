@@ -235,8 +235,9 @@ enum Command {
     /// must accept, receive the shared screen, and keep the session alive until
     /// Ctrl-C.
     ///
-    /// There is no viewer window yet: the pictures are decoded and counted.
-    /// Uses this instance's own Tor state; run it under a different TORNECT_HOME
+    /// This command shows no picture: it decodes and counts the pictures (the
+    /// window, `tornect` without a subcommand, shows them). Uses this
+    /// instance's own Tor state; run it under a different TORNECT_HOME
     /// than the host when both live on one machine.
     Connect {
         /// The host's Tornect ID (56-character onion address, with or without `.onion`).
@@ -1140,6 +1141,36 @@ mod tests {
             assert_eq!(super::internal_step(&args(not)), None, "{not:?}");
         }
         assert!(super::Cli::try_parse_from(["tornect", "remove-at-restart"]).is_err());
+    }
+
+    /// B32: `--help` describes what this build does: a remote desktop whose
+    /// pictures travel over Tor, not the direct QUIC or the game streaming
+    /// that later milestones plan; and `connect` no longer says there is no
+    /// viewer window, which the window has.
+    #[test]
+    fn the_help_describes_this_build() {
+        let help = super::Cli::command().render_help().to_string();
+        assert!(
+            help.contains(
+                "Tornect — remote desktop over Tor onion services: no servers, no accounts, no \
+                 port forwarding"
+            ),
+            "{help}"
+        );
+        for stale in ["QUIC", "game streaming", "Milestone"] {
+            assert!(!help.contains(stale), "`{stale}` in:\n{help}");
+        }
+        let connect = super::Cli::command()
+            .find_subcommand_mut("connect")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        let connect = connect.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(!connect.contains("no viewer window"), "{connect}");
+        assert!(
+            connect.contains("the window, `tornect` without a subcommand, shows them"),
+            "{connect}"
+        );
     }
 
     /// U3-L3: `--help` says that no log filter writes identifiers, and
