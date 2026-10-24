@@ -784,26 +784,31 @@ async fn a_viewer_heard_while_a_picture_write_waits_keeps_its_key() {
     tokio::time::timeout(WAIT, served).await.unwrap().unwrap();
 }
 
-/// G2-1, a burst: while the host's write waits, a viewer whose frames fill
-/// the queue (the reader then waits on the loop, and cannot hear it any more)
-/// counts as heard for one more quiet period after its last frame read, and
-/// no longer. A busy viewer is not let go of at the first deadline, and one
-/// that vanished right after a burst cannot hold its keys until the write
-/// ends.
+/// G2-1, a burst, now that the host reads the viewer's frames while its write
+/// waits (PR-A of the quality design): a viewer that sends more than the queue
+/// holds and then goes quiet counts as heard up to its last frame, so it is
+/// not let go of before one quiet period after the burst, and it is let go of
+/// then, well before the write ends. Before, its frames filled the queue
+/// behind the write and the release fell back on the queue-full rule, one more
+/// quiet period later (about two after the burst, which the bound below
+/// refuses); that rule is kept for a loop that falls behind its reader, and
+/// `host::tests::a_full_queue_holds_the_quiet_release_for_one_more_quiet_period`
+/// pins it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_viewer_whose_frames_fill_the_queue_is_let_go_one_quiet_period_later() {
+async fn a_viewer_that_bursts_then_goes_quiet_while_a_write_waits_is_let_go_after_one_quiet_period()
+{
     let quiet = Duration::from_secs(2);
     let (rig, session_id, mut client, served) = press_then_stop_reading(18, quiet).await;
-    // 64 fill the queue, the reader holds one more, the rest wait in the pipe.
+    // More than the queue's 64.
     for nonce in 0..80 {
         write_msg(&mut client, &Msg::Ping { nonce }).await.unwrap();
     }
     let burst = tokio::time::Instant::now();
-    tokio::time::sleep(quiet + quiet / 2).await;
+    tokio::time::sleep(quiet - Duration::from_millis(100)).await;
     assert_eq!(
         rig.backend.recorder.events().len(),
         1,
-        "let go of at the first deadline, while its frames filled the queue"
+        "let go of before one quiet period after its burst"
     );
     let release = InputEvent::Key {
         usb: KEY_A,
@@ -811,8 +816,8 @@ async fn a_viewer_whose_frames_fill_the_queue_is_let_go_one_quiet_period_later()
     };
     while !rig.backend.recorder.events().contains(&release) {
         assert!(
-            burst.elapsed() < WAIT,
-            "never let go of: {:?}",
+            burst.elapsed() < quiet + quiet / 2,
+            "not let go of one quiet period after its burst: {:?}",
             rig.backend.recorder.events()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
