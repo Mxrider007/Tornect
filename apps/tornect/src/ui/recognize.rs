@@ -663,9 +663,28 @@ mod tests {
         let words = Arc::new(words);
         let popups = popups();
         let consent = consent(&popups, Arc::clone(&words));
-        // The pacer has just run: the next unsaved key waits its second.
-        let _ = words.pacer().derive(&[0x90; 32], Role::Device);
-        assert_eq!(words.pacer().runs(), 1);
+        // The pacer is busy with another run until the request is withdrawn,
+        // so its derivation is still queued then however loaded this machine
+        // is. (A derivation run first left that to the clock: on a busy
+        // machine it took longer than the pacer's second, and the request's
+        // derivation started at once, before the withdrawal.)
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let busy = {
+            let words = Arc::clone(&words);
+            std::thread::spawn(move || {
+                words.pacer().run(|| {
+                    let _ = released.recv();
+                });
+            })
+        };
+        let started = Instant::now();
+        while words.pacer().runs() < 1 {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the run never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         // The FSM's popup timeout, standing in for a withdrawal: the answer
         // is dropped while its derivation is still queued.
         let peer = peer(0x7a, "Kitchen");
@@ -675,8 +694,11 @@ mod tests {
         )
         .await;
         assert!(timed_out.is_err(), "answered before its derivation ran");
-        // Well past the pacer's second: the queued run saw the flag and
-        // skipped the derivation.
+        assert_eq!(words.pacer().runs(), 1, "derived beside another run");
+        release.send(()).unwrap();
+        busy.join().unwrap();
+        // Well past the pacer's second: the queued run, given its turn, saw
+        // the flag and skipped the derivation.
         tokio::time::sleep(Duration::from_millis(1300)).await;
         assert_eq!(words.pacer().runs(), 1, "a withdrawn request was derived");
         assert!(popups.shared().read(|m| m.popups.is_empty()));
