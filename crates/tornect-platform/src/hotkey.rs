@@ -8,8 +8,8 @@
 //!   thread, with its own message loop, that ignores injected events
 //!   (`LLKHF_INJECTED`, `LLKHF_LOWER_IL_INJECTED`): only physical keys press
 //!   it. A modifier the hook saw go down counts only while the system's key
-//!   state still has it down ([`Modifiers`]), so one let go on the secure
-//!   desktop never lingers. The hook only signals; a second thread calls
+//!   state still has it down (the `Modifiers` state), so one let go on the
+//!   secure desktop never lingers. The hook only signals; a second thread calls
 //!   `pressed`, so the hook returns at once (NEEDS-DEVICE(windows)).
 //! - **Linux**: the GlobalShortcuts portal of xdg-desktop-portal (through
 //!   `ashpd`) where the desktop offers it: the chord is the shortcut's

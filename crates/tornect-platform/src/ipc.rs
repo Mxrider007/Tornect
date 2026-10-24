@@ -632,9 +632,9 @@ mod imp {
         /// holding it. One dialog at a time is the re-auth backend's rule, not
         /// the endpoint's.
         ///
-        /// An `accept` that fails pauses the loop and is tried again
-        /// ([`Backoff`], audit B17); only a listening socket that is itself
-        /// unusable ends it, with that error.
+        /// An `accept` that fails pauses the loop and is tried again (a
+        /// back-off of 50 ms doubling to 1 s, audit B17); only a listening
+        /// socket that is itself unusable ends it, with that error.
         pub async fn serve<F, Fut, R>(&self, handler: F) -> Result<(), IpcError>
         where
             F: Fn(IpcRequest) -> Fut + Clone + Send + Sync + 'static,
