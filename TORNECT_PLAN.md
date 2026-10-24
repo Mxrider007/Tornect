@@ -300,6 +300,43 @@ session (the polkit revocation of §B.2.1 and the portal's restore token depend 
 checked at the build VM console. The setting's copy says that starting at sign-in means a Tor connection at every
 sign-in, visible to the local network and the provider as Tor use. The window's "Start Tornect when I sign in" shows, before it acts: "Starting at sign-in means a Tor connection at every sign-in: your local network and your internet provider can see that this computer uses Tor. While Tornect runs, devices you gave unattended access can connect, new devices can ask to pair, and anyone with this computer's Tornect ID can see that it is online." It then runs the same guard operation as `tornect service install|uninstall` with no host running, in the window's own process (re-authentication, no remote session for 60 s, `AutostartChanged{by: ui}`, M-UI-5); the control channel still refuses an install sent to a running host.
 
+**Invitations and `tornect:` links (decision M1-73).** The ID stays the 56-character onion ID; these make it easy to
+share. Home's ID card reads *Copy ID · Copy invitation · Show QR code*. Copy invitation (and `tornect id --invitation`)
+copies a fixed text: the ID in groups, `tornect://<ID>` and the one download location,
+`https://github.com/Mxrider007/Tornect/releases` (from the workspace `repository` field, pinned by a test), with no
+device name and no device words (§B.6.1); the QR code still encodes `<ID>.onion`. A link is `tornect:` (any ASCII case),
+an optional `//`, the 56 characters, an optional `.onion` and an optional `/`, at most 128 bytes; anything else, a
+parameter included, refuses the whole link. The Connect field and Add a computer also take a whole pasted invitation
+(at most 4096 bytes; exactly one distinct ID, so a text whose visible ID and link differ is refused) and rewrite a
+pasted link or text to the ID's groups; both fields say what is wrong with the same per-problem words, and `tornect
+connect|ping|admin` read the same forms and never echo their input. **Opening a link** runs `tornect open-link --
+<link>`: with a window host holding this home's `host.lock`, it raises that window with `IpcOp::Show { link }`
+(§B.8.7.4), exactly as a second launch does; otherwise (or when that host has no window) it opens a **connect-only**
+window (`host: false`; no host lock, no onion service, no IPC endpoint, so no unattended grant can be served; its ID card
+reads "Incoming requests: off (opened from a link; open Tornect itself to answer requests)"). Either way the link at
+most puts the ID in the Connect field: the window checks it again (an ID that is no key, or this computer's own, fills
+nothing and says why; so does a refused link), takes the keyboard focus from the field, shows Home unless the grant
+wizard is open, and keeps Connect, Connect anyway and Enter disarmed until the Connect row has been on screen, unmoved,
+for 1 s, counted from its first drawing and again after every return of the window and every later link. It never
+connects, pairs, answers a sheet or starts hosting (§B.6, *Links never act*). Several connect-only windows may coexist
+(a link clicked while a hosting window is still starting, or beside a link window); none hosts. **Registration follows
+install, and only install:** on Linux, `tornect install` also writes `~/.local/share/applications/tornect-link.desktop`
+(`NoDisplay=true`, `MimeType=x-scheme-handler/tornect;`, `Exec=<exe> [--home <home>] open-link -- %u`, each item bare
+unless it needs quotes, so that generic `xdg-open` can run it; the menu entry stays free of field codes) and, because
+GIO finds no handler from `MimeType=` alone, merges the exact line `x-scheme-handler/tornect=tornect-link.desktop;` into
+`[Added Associations]` and, where that key has no default yet, `[Default Applications]` of `$XDG_CONFIG_HOME/mimeapps.list`
+(`~/.config/mimeapps.list` when that variable is not absolute): every other byte kept, a link never written through,
+nothing written when `[Removed Associations]` lists the entry (the user turned it off), another program's default
+left; the edit never fails the install, which says what links now do. `tornect uninstall` takes the items out again
+(a file the install created goes with them). On Windows, the non-elevated part of `tornect install` writes
+`HKCU\Software\Classes\tornect` — `(Default)` `URL:Tornect link`, an empty `URL Protocol`, and under
+`shell\open\command` `"<Program Files>\Tornect\tornect.exe" open-link -- "%1"` — only where no such key exists (read
+before the guard's dialog; `RegCreateKeyExW` must create it), after the Start-menu entry and before the elevated
+uninstall entry, so a cancelled second prompt undoes it; a key that is not Tornect's is left as it is and reported,
+and the uninstall removes the key only while its command is the installed copy's, read again right before the
+removal. A standalone copy registers nothing, nothing is ever written over another program's registration, and macOS
+is not covered.
+
 **"Starts with the computer", stated plainly (v1).** Windows: Tornect starts when you sign in; with Windows automatic
 sign-in — the owner's choice, never configured by Tornect; a pre-boot disk PIN still needs a person at every boot — that
 is at boot. Before sign-in, on the lock screen and on Windows permission prompts the computer cannot be seen or
@@ -694,6 +731,33 @@ scancode for games, keysym for typing (per-app heuristic toggle in HUD).
   stores no password-equivalent — the SPAKE2 fallback suite does, §B.8.4.7); there is
   no password-less auto-accept; lockouts persist; indicator, panic key and log apply
   unchanged; all session starts/ends logged locally (`sessions.log`).
+- **Links never act** (decision M1-73; §B.1.1 *Invitations and `tornect:` links*), requirements:
+  **L-1** no path from `tornect open-link`, `IpcOp::Show { link }` or a link window's start produces an
+  action or a command (no Connect or Connect anyway, pairing, session, answer, prompt, password or saved
+  entry); only a pointer click on Connect, or Enter in the focused field, dials, and after a link's fill
+  only once the Connect row has been on screen, unmoved, for 1 s; the look-alike check (§B.6.1) still
+  runs for a filled ID. **L-2** strict grammar: no parameter is ever parsed; a link (128 bytes) and field
+  text (4096 bytes) are size-bounded before any work; an ID that arrives over IPC is checked again by the
+  window (the CBOR decode takes any 32 bytes); a text whose visible ID and link differ is refused.
+  **L-3** arguments stay in their slot: the OS passes the link after `--` as `open-link`'s one positional,
+  and the argument parser refuses any other, so a `"` a browser leaves unescaped cannot add an option or
+  a subcommand; nothing before the parser treats `open-link` specially. **L-4** `Show` with a link stays
+  a raise (§B.2.1): it never reaches a sheet and never takes the focus; the connect field gives up the
+  keyboard focus at a fill. **L-5** a link never starts hosting: a cold link launch is connect-only; only
+  the owner's own launches (the menu, the command line, the start at sign-in) host. **L-6** registration
+  follows install: only `tornect install` registers the scheme, only for the installed executable, and
+  never over another program's registration; `tornect uninstall` removes only Tornect's (on Linux a
+  regular file at the known name and the list items naming `tornect-link.desktop`; on Windows a key whose
+  command is the installed copy's) and reports anything else. **L-7** nothing leaks: Tornect never fetches
+  the download URL; the link text, the field text and the ID are never logged (`open-link` logs a static
+  problem name only); `Show`'s `Debug` is redacted; the command line never echoes an ID argument; the
+  invitation carries no name and no words. **L-8** consent before capture, view-only, the indicator, the
+  panic key, pinned keys and SAS pairing are unchanged.
+- **Cross-feature rule** (decision M1-73; invitations make connecting to a stranger's host easier): nothing
+  of the viewer's (clipboard, files, chat attachments) is sent to a host unless the viewer chose it for
+  that host, by a per-session action or a per-host setting the viewer turned on; never by default on the
+  first session with a newly paired host. Nothing received from a host (a URL, a file) is opened
+  automatically. Every clipboard, file-transfer and chat design carries this rule.
 - **Privacy modes**: Default (signaling via Tor, media direct — peers see each
   other's IP, stated in UI) · **Paranoid** (everything via Tor, quality capped) ·
   LAN-only toggle.
@@ -1474,7 +1538,7 @@ in the wizard, readiness row "Panic key: bound / unavailable"); the indicator's 
 tray item and `tornect panic` always work; rebinding needs re-auth. **CLI:** `tornect unattended
 status|on|off|pause|grant <device> [--preset …] [--waive-attended-check] [--administrator]|enable <device>|disable <device>|revoke <device>|--all|unlock <device>|suspend
 <device>|resume <device>|set-password
-<device> [--administrator]|set-level <device> none|readiness|log`, `tornect service install|uninstall|status`, `tornect install|uninstall` (r7, §B.1.1), `tornect input-helper` (r7; internal — started only by the host, B.8.7.5), `tornect install-entry` (internal — run elevated only by `tornect install` on Windows, as the installed copy; it takes no argument and writes only Tornect's uninstall entry, §B.1.1), `tornect remove-at-restart` (internal — run elevated only by `tornect uninstall` on Windows, as the installed copy; it takes no argument, removes any other file in its folder and marks that copy and its folder for removal at the next restart, §B.1.1),
+<device> [--administrator]|set-level <device> none|readiness|log`, `tornect service install|uninstall|status`, `tornect install|uninstall` (r7, §B.1.1), `tornect input-helper` (r7; internal — started only by the host, B.8.7.5), `tornect install-entry` (internal — run elevated only by `tornect install` on Windows, as the installed copy; it takes no argument and writes only Tornect's uninstall entry, §B.1.1), `tornect remove-at-restart` (internal — run elevated only by `tornect uninstall` on Windows, as the installed copy; it takes no argument, removes any other file in its folder and marks that copy and its folder for removal at the next restart, §B.1.1), `tornect open-link -- <link>` (M1-73: what the OS runs for an opened `tornect:` link — the link is its one positional, read strictly; it raises the running window with `Show { link }` or opens a connect-only window, with at most the ID in the connect field, and never connects by itself, §B.1.1), `tornect id [--json | --invitation]` (M1-73: the `Link` line, `"link"` in the JSON; `--invitation` prints only the invitation text of §B.1.1),
 `tornect panic`, `tornect
 backup export|import` (`--waive-attended-check` maps to `GrantOptions.waive_attended_precondition`,
 warned and logged; `backup export` is access-increasing, B.8.6.2; `disable` is deny-direction,
@@ -1530,7 +1594,7 @@ IpcOp = Status | On | Off | Pause { until: u64 } | Revoke { device: DeviceId } |
       | Disable { device } /* Active → Disabled{by: Ui|Cli}; deny-direction: no re-auth, a live session of that grant gets BYE{REVOKED}; GrantDisabled{by} logged (B.8.6.1) */
       | SetLevelNone { device } /* tornect unattended set-level <device> none: GrantOptions.elevation → None, no other field sent (B.8.7.1); deny-direction: no re-auth, allowed during a remote session (B.8.6.2); a live session of that device at the administrator level ends (B.8.6.2), a session below the level goes on; GrantChanged logged; a grant without the level is left unchanged; every ok answer carries the condition of the turn-off sentence (B.8.7.1 ⑤a) as its payload, below */
       | ServiceInstall { elevated: bool /* at `b025d3b` the Windows whole-host elevated task (M1-53); r7: replaced by the administrator helper task, registered with the first admin grant and removed with the last (B.8.7.5) */ } | ServiceUninstall /* tornect service install|uninstall: an autostart change is access-increasing (B.8.6.2) — re-auth, no remote session ≥ 60 s; no store write; AutostartChanged{by} logged */
-      | Show /* r7 (§B.1.1): raise the running window only — never answers, dismisses or re-orders a sheet; re-arms any sheet */
+      | Show { link: Option<ShownLink> } /* r7 (§B.1.1): raise the running window only — never answers, dismisses or re-orders a sheet; re-arms any sheet. M1-73: an opened tornect: link rides along, ShownLink = Fill(TornectId) | Refused; tag 21 kept, its fields map: key 0 = bstr .size 32 (the ID, Fill), key 1 = true (a refused link), neither = a plain raise — bytes 82 15 A0 · 82 15 A1 00 58 20 <32 bytes> · 82 15 A1 01 F5; a key 0 that is not a 32-byte bstr, a key 1 that is not true, keys 0 and 1 together, or a body that is not a map ⇒ E_BAD_LEN; unknown keys skipped (a body {7: …} is a plain raise); Debug exactly "show", "show { link: <redacted> }", "show { link: refused }"; the response is unchanged (ok, or G_UNSUPPORTED from a host with no window), no guard call, no log line; the window checks the ID again (any 32 bytes decode) and at most fills its connect field (§B.6 Links never act) */
       | Readiness | Log { filter: tstr, after: Option<u64> } | Panic | BackupExport { path: tstr } /* access-increasing: re-auth, no remote session ≥ 60 s, BackupExported logged */ | BackupImport { path: tstr }
       | PolicyInputs                                                          → payload = { user_inputs: [tstr], min_score: u8 }   /* B.8.7.2 inputs; the CLI runs zxcvbn locally and refuses weak passwords itself */
       | RegStart  { device, reg_request: bytes[32], raise: bool, generated: bool }                          → payload = { reg_response: bytes[64], reg_txn: bytes[16] }   /* a CBOR map like every payload; re-auth happens here (a raising RegStart — one that creates a grant whose grant_reach is not 0, or raises one — asks with its own wording naming administrator access (the window's inline re-authentication uses the same raising wording); raise and generated are kept with the txn, and a RegFinish that does not match them is refused with G_NEEDS_PASSWORD; M1-67); txn single-use, ≤ 120 s, bound to device */
@@ -2287,14 +2351,15 @@ address book, history, the device words and logs. M-UI-1 (the foundation) is don
 | 12 | **M-CODEC-1** Abstraction + conformance | traits, registry, fallback, `doctor` lines, the parser gate (§B.5), the GPU YUV→RGB shader, a golden stream | unit, property, fuzz, golden CRCs | 2–3 | **Security mandatory** (parser); Architecture | — (build VM) |
 | 13 | **M-CODEC-2** Windows Media Foundation | the async hardware MFT encoder (BGRA→NV12, Constrained Baseline, CBR, forced IDR) + the MF decoder behind the gate | cross-check; conformance | 3–4 | **Security mandatory** (COM/FFI, DLL loading, hostile decode); Performance | conformance, the hostile corpus, ms/frame |
 | 14 | **M-CODEC-3** NVENC (Windows) | own bindings (struct versions checked against the driver's maximum), a D3D11 device, system-memory input first | as above | 3–4 | **Security mandatory** (driver FFI); Performance | as above; fps over Tor |
+| 14a | Invitation links (design `invite`, decision M1-73) | Copy invitation and `tornect id --invitation` (the ID's groups, `tornect://<ID>`, the one download location from the workspace `repository` field); the strict `tornect:` grammar and the ID found in pasted text (`tornect_core::invite`, no I/O); one set of per-problem messages for Home's Connect field and Add a computer, with Home's new no-key check; `connect\|ping\|admin` reading IDs, links and invitations without echo; `tornect open-link -- <link>` raising the running window with `IpcOp::Show { link }` (§B.8.7.4) or opening a connect-only window; the connect field's fill, its notes and its 1 s arming; the Linux link entry and `mimeapps.list` merge and the Windows HKCU handler in `tornect install\|uninstall` (§B.1.1; §B.6 *Links never act*) | the parsers' tables and proptests, fuzz target `invite` and the `ipc` seeds of the three `Show` forms; `Show`'s exact bytes, refusals and redacted `Debug`; a link only ever raises and fills (dispatch, the second-launch harness, a windowless host refusing it); clap: the link is the one positional after `--`; a fill never connects, arms from first sight and again after a return or a later link, takes the focus, reaches no sheet, keeps the wizard; the link entry's exact text, the `mimeapps.list` merge and its exact undo, the ignored `gio` test; the Windows recording fake (order, undo after a cancelled prompt, another program's key, leftovers, the re-read before removal) and the registry calls on real keys under Wine | 7 | **Security mandatory** (an IPC change, the install, OS registration) | Windows 10/11: `reg query` after the install, cold and warm `start tornect://`, the Edge/Chrome/Firefox prompts and their escaping of `"`, the injection attempt, another program's key, both uninstall paths, `RegDeleteTreeW`; GNOME at the build VM console (`xdg-open` cold and warm, Snap Firefox's portal path, Chrome, the `mimeapps.list` diff); KDE; a generic desktop |
 | 15 | Release-range security pass | slices as D–G over everything above; fixes | a regression test per finding | 3–5 | **Security mandatory** | — |
 | 15a | Final Windows pass (with a standard account) | after row 15, before the tag: attended administrator on an administrator account and on a second, standard Windows account; UAC cancelled, then the sheet re-armed; unattended administrator through the task; the task removed with the last admin grant and at uninstall; the old whole-host task removed at upgrade; panic, Stop and `tornect panic` with an elevated window focused; the secure-desktop notice; `PromptOnSecureDesktop` 0; the M-UI-4/M-UI-5 surfaces and every row-15 fix | a written checklist | 0.5–1 | **Security mandatory** (its checklist) | yes |
 | 16 | Pre-tag docs pass | Part G rows; README honest limits (the plain statements of §B.1.1, B.8.8, the release's limits below); SECURITY.md (the helper, T9); the release notes and the release README, whose lines on the whole-host elevated task (incl. "cannot be started on demand") are rewritten; VERIFICATION rows; the code-signing decision (Part F.8) | `xtask verify` doc checks | 1–2 | Security reads the security statements | — |
 | 17 | Console check | the GUI over real Tor, build VM ↔ Windows PC: pairing with words, the four answers incl. UAC, an unattended administrator session, codecs, the start after a reboot | Security's written checklist | 0.5–1 (the operator present) | Security (checklist) | yes, both machines |
 | 18 | Dist + tag | `cargo xtask dist` at the tagged head; the operator's go | reproducible zips; Security reads the manifest (no NVIDIA file, licence texts present) | 0.5–1 | Security (manifest) | — |
 
-Total ≈ 49–69 days (UI 15–20, features 20–27, codecs 8–11, plan, Windows pass and release 6–11). Order: row 0 →
-M-FEAT-1 → M-UI-2/M-UI-3 (words and levels on screen) → M-FEAT-3/4/5/6 → the panic suspend (row 9a) → M-UI-4/5/6, with the codec track (rows 12–14)
+Total ≈ 56–76 days (UI 15–20, features 27–34 with the invitation links of row 14a, codecs 8–11, plan, Windows pass and release 6–11). Order: row 0 →
+M-FEAT-1 → M-UI-2/M-UI-3 (words and levels on screen) → M-FEAT-3/4/5/6 → the panic suspend (row 9a) → M-UI-4/5/6, the invitation links (row 14a) before the release-range pass, with the codec track (rows 12–14)
 beside it. The Windows PC is needed in batches: after M-FEAT-3 (elevation), after M-FEAT-5/6 (unattended, autostart),
 after M-CODEC-3 (codecs), the final pass (row 15a), then the console check.
 
@@ -2496,6 +2561,9 @@ tag."* — `/milestone <n>` (created in M0) expands to exactly this.
 | Latency regressions creeping in | H×M | §B.7 gates are executable (netem suite in CI-linux + headless-stats), regressions fail the build |
 | Scope creep (it's a fun project) | H×M | Post-v1 backlog exists precisely to say "later"; milestones gate features |
 | Abuse of remote-access software | L×H | §B.6 consent architecture: no silent sessions, persistent indicator, panic key, local session log — these are requirements, not options |
+| A web page starts Tornect through a `tornect:` link (M1-73) | M×M | A cold link launch opens a connect-only window (no hosting, no onion service, no IPC endpoint, no unattended serving); the browser asks before each external launch; a link only fills the connect field, which gives up the focus, with Connect disarmed for 1 s from first sight and again after every return or later link; nothing connects, pairs or answers by itself (§B.6 *Links never act*); repeated links only raise and re-arm, the last fill wins |
+| Fake or altered invitations: a look-alike ID, a download link to a malicious copy, coached sharing (M1-73) | M×H | The look-alike alarm and SAS pairing (§B.6.1); a text whose visible ID and link differ is refused (`Several`); Tornect never opens a URL from text; README, SECURITY.md and the release notes name the one download location, https://github.com/Mxrider007/Tornect/releases; the consent sheet on the host |
+| The repository owner name changes, or a stale one is taken over, so invitations point at someone else's downloads (M1-73) | L×H | One source, the workspace `repository` field, from which the invitation's download URL is derived and pinned by a test (`DOWNLOAD_URL`); never rename the repository; if it is renamed, keep the old name registered so nobody else can take it |
 | Unattended-access abuse or lockout DoS (stolen/cloned device keys, coached relatives, a hostile Control session, the owner locking themselves out, keychain unusable at autostart, lock-screen dead ends) | M×H | §B.8: two factors + per-grant OPAQUE; count-based ladder with lifetime budget, per-grant scope, no global breaker; remote revoke/unlock from another *My machines* Control device + emergency stop code; OS re-authentication for every access-increasing change through Tornect's own surfaces (endpoint-level rewrites by a Control session are out of scope, T9); file-keystore fallback with a stricter password policy; honest per-OS readiness (§B.8.8); the adversarial A-suite is cumulative — each milestone's rows are listed in §B.8.14 and gate it |
 | Tor fallback transport contradicts the research: §B.2/§B.8.4.2/M2 tunnel the same QUIC connection through the onion stream for a uniform `BIND` check, while quic.md §0/§9 argues for the session protocol directly over the onion stream (double congestion control, wasted Initial padding/DPLPMTUD probes, extra handshake RTTs) | M×M | §B.8.17 item 7: decide at M2 with a measured onion-stream throughput; if direct, a `BIND` equivalent over the onion stream (HMAC over `th` + `session_token`) keeps the token check uniform; the M2 accept row for the Tor tunnel is then re-worded, not dropped |
 
