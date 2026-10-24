@@ -41,7 +41,7 @@
 <policyconfig>
 
   <vendor>Tornect</vendor>
-  <vendor_url>https://github.com/Mxrider420z/Tornect</vendor_url>
+  <vendor_url>https://github.com/Mxrider007/Tornect</vendor_url>
 
   <action id="org.tornect.grant">
     <description>Allow a device to connect without asking</description>

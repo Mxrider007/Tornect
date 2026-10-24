@@ -69,7 +69,7 @@ Requirements: Rust stable ≥ 1.90 (edition 2024), a C/C++ compiler, `cmake`,
 builds without any system media libraries.
 
 ```bash
-git clone https://github.com/Mxrider420z/Tornect.git
+git clone https://github.com/Mxrider007/Tornect.git
 cd Tornect
 cargo run -p tornect -- id        # generates and prints this machine's Tornect ID
 cargo run -p tornect -- doctor    # environment report

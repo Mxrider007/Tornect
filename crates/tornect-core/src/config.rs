@@ -392,9 +392,7 @@ impl Config {
             crate::keystore::create_private_dir(parent)?;
         }
         let body = toml::to_string_pretty(self)?;
-        let text = format!(
-            "# Tornect configuration — https://github.com/Mxrider420z/Tornect\n# Every key is optional; delete a key to restore its default.\n\n{body}"
-        );
+        let text = format!("{}{body}", header());
         crate::keystore::write_private_file_atomic(path, text.as_bytes())?;
         Ok(())
     }
@@ -450,9 +448,42 @@ impl Config {
     }
 }
 
+/// The comment lines [`Config::save`] writes above the settings. The link is
+/// the workspace's `repository` (Cargo.toml), so it follows the repository
+/// when it moves instead of naming an old one (audit finding B32).
+fn header() -> String {
+    format!(
+        "# Tornect configuration — {}\n# Every key is optional; delete a key to restore its \
+         default.\n\n",
+        env!("CARGO_PKG_REPOSITORY")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B32: the header links the repository the release is published from,
+    /// and the settings still load from a file that starts with it.
+    #[test]
+    fn the_header_links_the_published_repository() {
+        assert_eq!(
+            env!("CARGO_PKG_REPOSITORY"),
+            "https://github.com/Mxrider007/Tornect"
+        );
+        assert_eq!(
+            header(),
+            "# Tornect configuration — https://github.com/Mxrider007/Tornect\n# Every key is \
+             optional; delete a key to restore its default.\n\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::default().save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(&header()), "{text}");
+        assert!(!text.contains("Mxrider420z"), "{text}");
+        assert_eq!(Config::load(&path).unwrap(), Config::default());
+    }
 
     #[test]
     fn defaults_are_valid_and_roundtrip() {

@@ -2539,7 +2539,7 @@ tag."* — `/milestone <n>` (created in M0) expands to exactly this.
 
 ## Part G — Execution status (kept current at every session hand-off)
 
-Last update: **2026-09-27** (plan r7 and the UI foundation; before them the sessions of 2026-09-23 and 2026-09-24). Repository: https://github.com/Mxrider420z/Tornect (private,
+Last update: **2026-09-27** (plan r7 and the UI foundation; before them the sessions of 2026-09-23 and 2026-09-24). Repository: https://github.com/Mxrider007/Tornect (public,
 branch `main`). Per-milestone detail lives in `docs/notes/m<N>-state.md`; every acceptance
 check with its real status is in `docs/VERIFICATION.md`; every deviation from this plan is a
 numbered row in `docs/notes/decisions.md`.
