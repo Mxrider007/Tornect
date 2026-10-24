@@ -30,6 +30,10 @@ zeroize.workspace = true
 zbus.workspace = true
 # The panic key's GlobalShortcuts portal (§B.8.7.4).
 ashpd.workspace = true
+# `open(O_NOFOLLOW | O_NONBLOCK)` for the `mimeapps.list` edit of `tornect install`
+# (design `invite` §4.5): the workspace's pin, with `fs`, which the app's tree
+# already enables (calloop, polling, tempfile, wayland-backend, x11rb).
+rustix = { workspace = true, features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

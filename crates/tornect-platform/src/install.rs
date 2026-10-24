@@ -1797,34 +1797,57 @@ mod linux {
     /// bits; `None` when there is no such file.
     type Snapshot = Option<(String, u32)>;
 
+    /// Why a `mimeapps.list` that is a symbolic link is not edited.
+    const MIMEAPPS_IS_A_LINK: &str =
+        "it is a link to another file, which Tornect never writes through";
+
+    /// Why a `mimeapps.list` that is a folder, a FIFO, a device or a socket
+    /// is not edited.
+    const MIMEAPPS_NOT_REGULAR: &str = "it is not a regular file";
+
     /// Read `path` for an edit. Refused, with the reason: a link (never
     /// written through or replaced: dotfile managers use them), anything but
     /// a regular file, more than 256 KiB, text that is not UTF-8, or a file
     /// replaced between its check and its opening.
     fn read_mimeapps(path: &Path) -> Result<Snapshot, String> {
-        use std::io::Read as _;
-        use std::os::unix::fs::MetadataExt as _;
-        let unreadable = |e: std::io::Error| format!("it could not be read: {e}");
         let meta = match std::fs::symlink_metadata(path) {
             Ok(meta) => meta,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(unreadable(e)),
+            Err(e) => return Err(format!("it could not be read: {e}")),
         };
         if meta.file_type().is_symlink() {
-            return Err(
-                "it is a link to another file, which Tornect never writes through".to_owned(),
-            );
+            return Err(MIMEAPPS_IS_A_LINK.to_owned());
         }
         if !meta.is_file() {
-            return Err("it is not a regular file".to_owned());
+            return Err(MIMEAPPS_NOT_REGULAR.to_owned());
         }
-        let too_large = || "it is larger than 256 KiB".to_owned();
         if meta.len() > MIMEAPPS_MAX {
-            return Err(too_large());
+            return Err("it is larger than 256 KiB".to_owned());
         }
-        let file = std::fs::File::open(path).map_err(unreadable)?;
+        read_checked(path, &meta).map(Some)
+    }
+
+    /// Read `path`, `checked` a moment ago as a regular file of at most 256
+    /// KiB. Opened without following a link and without waiting on a FIFO
+    /// ([`open_no_wait`]), so whatever another program put there since the
+    /// check is refused, never read through or waited on: a link, anything
+    /// but a regular file, or another file than the one checked.
+    fn read_checked(path: &Path, checked: &std::fs::Metadata) -> Result<(String, u32), String> {
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let unreadable = |e: std::io::Error| format!("it could not be read: {e}");
+        let file = match open_no_wait(path, false) {
+            Ok(file) => file,
+            Err(e) if e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
+                return Err(MIMEAPPS_IS_A_LINK.to_owned());
+            }
+            Err(e) => return Err(unreadable(e)),
+        };
         let opened = file.metadata().map_err(unreadable)?;
-        if (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+        if !opened.is_file() {
+            return Err(MIMEAPPS_NOT_REGULAR.to_owned());
+        }
+        if (opened.dev(), opened.ino()) != (checked.dev(), checked.ino()) {
             return Err("another program replaced it while it was read".to_owned());
         }
         let mut bytes = Vec::new();
@@ -1832,10 +1855,28 @@ mod linux {
             .read_to_end(&mut bytes)
             .map_err(unreadable)?;
         if bytes.len() as u64 > MIMEAPPS_MAX {
-            return Err(too_large());
+            return Err("it is larger than 256 KiB".to_owned());
         }
         let text = String::from_utf8(bytes).map_err(|_| "it is not UTF-8 text".to_owned())?;
-        Ok(Some((text, meta.mode() & 0o777)))
+        Ok((text, checked.mode() & 0o777))
+    }
+
+    /// Open `path` for reading without waiting (`O_NONBLOCK`: a FIFO opens at
+    /// once instead of waiting for a writer, and is then refused by its
+    /// type), never as a controlling terminal, and, unless `follow`, without
+    /// following a symbolic link (`O_NOFOLLOW`: `ELOOP`). Reads of a regular
+    /// file are not changed by `O_NONBLOCK`.
+    fn open_no_wait(path: &Path, follow: bool) -> std::io::Result<std::fs::File> {
+        use rustix::fs::{Mode, OFlags};
+        let mut flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+        if !follow {
+            flags |= OFlags::NOFOLLOW;
+        }
+        Ok(std::fs::File::from(rustix::fs::open(
+            path,
+            flags,
+            Mode::empty(),
+        )?))
     }
 
     /// Edit `config_dir`'s `mimeapps.list` with `edit` (design `invite`
@@ -1917,9 +1958,20 @@ mod linux {
             Ok(meta) if meta.is_file() => {}
             _ => return false,
         }
+        // Opened without waiting, and read only when what was opened is
+        // still a regular file: a FIFO put there since the check is never
+        // waited on.
+        let file = match open_no_wait(path, true) {
+            Ok(file) => file,
+            Err(_) => return true,
+        };
+        match file.metadata() {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return false,
+            Err(_) => return true,
+        }
         let mut bytes = Vec::new();
-        let read = std::fs::File::open(path)
-            .and_then(|f| f.take(MIMEAPPS_SCAN + 1).read_to_end(&mut bytes));
+        let read = file.take(MIMEAPPS_SCAN + 1).read_to_end(&mut bytes);
         read.is_err()
             || bytes.len() as u64 > MIMEAPPS_SCAN
             || bytes
@@ -1930,7 +1982,7 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use std::collections::BTreeSet;
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _, symlink};
 
         use super::*;
 
@@ -2601,6 +2653,61 @@ mod linux {
                     "{why}"
                 );
             }
+        }
+
+        /// What another program of this user puts at `mimeapps.list` between
+        /// its check and its opening is refused, never read through or waited
+        /// on: a link (`O_NOFOLLOW`), a FIFO (`O_NONBLOCK`: opened at once,
+        /// then refused by its type). The file that was checked reads as
+        /// before, and the uninstall's check may still read through a link
+        /// but never waits on a FIFO.
+        #[test]
+        fn a_mimeapps_list_swapped_after_its_check_is_never_read_through_or_waited_on() {
+            use rustix::fs::{CWD, FileType, Mode};
+            use std::sync::mpsc;
+            /// `f` on its own thread: an answer within 10 s, or the test
+            /// fails instead of hanging.
+            fn in_time<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || tx.send(f()));
+                rx.recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("it waited on a FIFO")
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(MIMEAPPS);
+            let target = tmp.path().join("dotfiles-mimeapps.list");
+            std::fs::write(&target, "x-scheme-handler/tornect=tornect-link.desktop;\n").unwrap();
+            std::fs::write(&path, "k=v\n").unwrap();
+            let checked = std::fs::symlink_metadata(&path).unwrap();
+            assert_eq!(
+                read_checked(&path, &checked),
+                Ok(("k=v\n".to_owned(), checked.mode() & 0o777))
+            );
+
+            std::fs::remove_file(&path).unwrap();
+            symlink(&target, &path).unwrap();
+            assert_eq!(
+                read_checked(&path, &checked),
+                Err(MIMEAPPS_IS_A_LINK.to_owned())
+            );
+            assert!(may_name_link_entry(&path), "read through the link");
+
+            std::fs::remove_file(&path).unwrap();
+            rustix::fs::mknodat(CWD, &path, FileType::Fifo, Mode::from_raw_mode(0o600), 0).unwrap();
+            let (fifo, check) = (path.clone(), checked.clone());
+            assert_eq!(
+                in_time(move || read_checked(&fifo, &check)),
+                Err(MIMEAPPS_NOT_REGULAR.to_owned())
+            );
+            let fifo = path.clone();
+            let opened = in_time(move || open_no_wait(&fifo, true).map(|f| f.metadata()));
+            assert!(opened.unwrap().unwrap().file_type().is_fifo());
+            let fifo = path.clone();
+            assert!(!in_time(move || may_name_link_entry(&fifo)));
+            assert!(matches!(
+                read_mimeapps(&path),
+                Err(why) if why == MIMEAPPS_NOT_REGULAR
+            ));
         }
 
         /// Another program that changes `mimeapps.list` between the read and
