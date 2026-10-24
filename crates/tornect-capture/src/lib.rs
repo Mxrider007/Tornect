@@ -41,6 +41,9 @@ pub struct Frame {
     pub bgrx: Vec<u8>,
     /// When the picture was taken.
     pub captured_at: Instant,
+    /// The source's own cost to produce this picture (the copy, the pack,
+    /// the grab, the render), not the time spent waiting for one.
+    pub grab: Duration,
 }
 
 impl std::fmt::Debug for Frame {
@@ -49,6 +52,7 @@ impl std::fmt::Debug for Frame {
             .field("width", &self.width)
             .field("height", &self.height)
             .field("bytes", &self.bgrx.len())
+            .field("grab", &self.grab)
             .finish_non_exhaustive()
     }
 }
@@ -77,4 +81,9 @@ pub trait VideoSource: Send {
 
     /// The next picture, waiting at most `timeout`.
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError>;
+
+    /// The consumer is done with `bgrx`, the buffer of a picture this source
+    /// gave out: a source may keep it to put a later picture in, rather than
+    /// allocate one per picture. The default lets go of it.
+    fn recycle(&mut self, _bgrx: Vec<u8>) {}
 }

@@ -7335,6 +7335,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tornect-codec",
  "tornect-core",
  "tornect-input",
  "tracing",

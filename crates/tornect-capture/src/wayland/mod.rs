@@ -186,6 +186,12 @@ impl VideoSource for WaylandSource {
         }
         self.capture.shared().next(timeout)
     }
+
+    /// The buffer goes back to the PipeWire slot, to pack a later picture
+    /// into; once the stream is closed it is dropped.
+    fn recycle(&mut self, bgrx: Vec<u8>) {
+        self.capture.shared().recycle(bgrx);
+    }
 }
 
 /// What an injector for a [`WaylandSource`]'s session is built from. It holds

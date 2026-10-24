@@ -95,6 +95,7 @@ mod tests {
             height: 2,
             bgrx: vec![0xff; 16],
             captured_at: Instant::now(),
+            grab: Duration::ZERO,
         }
     }
 

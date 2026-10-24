@@ -167,6 +167,7 @@ impl X11Capture {
         // Checked before the request: `GetImage` of a geometry no desktop has
         // would have the server build a reply that size (SLICE-B3 B3-7).
         let expected = frame_bytes(width, height)?;
+        let started = Instant::now();
         let image = self
             .conn
             .get_image(ImageFormat::Z_PIXMAP, self.root, 0, 0, w, h, !0)
@@ -203,6 +204,7 @@ impl X11Capture {
             height,
             bgrx,
             captured_at,
+            grab: started.elapsed(),
         })
     }
 }

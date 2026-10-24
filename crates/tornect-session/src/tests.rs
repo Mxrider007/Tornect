@@ -44,6 +44,8 @@ struct Card {
     /// While set, the card has no new picture, as GDI has none while a
     /// secure Windows screen shows: it waits the timeout and says so.
     stalled: Arc<AtomicBool>,
+    /// Buffers handed back by the pipeline.
+    recycled: Arc<AtomicUsize>,
 }
 
 impl VideoSource for Card {
@@ -57,6 +59,11 @@ impl VideoSource for Card {
             return Ok(None);
         }
         self.inner.next_frame(timeout)
+    }
+
+    fn recycle(&mut self, bgrx: Vec<u8>) {
+        self.recycled.fetch_add(1, Ordering::SeqCst);
+        self.inner.recycle(bgrx);
     }
 }
 
@@ -100,6 +107,8 @@ struct TestBackend {
     cancelled: AtomicBool,
     /// Holds the source's pictures back while set ([`Card::stalled`]).
     stalled: Arc<AtomicBool>,
+    /// Buffers the pipeline handed back to the card ([`Card::recycled`]).
+    recycled: Arc<AtomicUsize>,
     /// The open keeps nothing to build an injector from, as on a Wayland
     /// host whose dialog left remote interaction off.
     no_injector: bool,
@@ -145,6 +154,7 @@ impl MediaBackend for TestBackend {
             inner: TestCard::new(256, 96, 60),
             closed: Arc::clone(&self.closed),
             stalled: Arc::clone(&self.stalled),
+            recycled: Arc::clone(&self.recycled),
         }))
     }
 
@@ -401,6 +411,35 @@ async fn the_test_card_reaches_the_viewer_in_order() {
     );
 }
 
+/// Every picture's buffer goes back to its source once it is encoded, so a
+/// source that paints or packs into a buffer given back allocates no memory
+/// per picture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_picture_buffer_goes_back_to_the_source() {
+    let rig = rig(MediaLimits::default());
+    let (_, binding) = start(&rig.host, 1, SessionMode::Control);
+    let (client, served) = connect(&rig.host);
+    let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
+    let (mut pictures, done) = Pictures::wanting(5);
+    let mut stats = ViewerStats::default();
+    viewer
+        .run(&mut pictures, &mut stats, async {
+            let _ = done.await;
+        })
+        .await
+        .unwrap();
+    let MediaOutcome::Served { report, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert!(report.frames_sent >= 5);
+    let recycled = rig.backend.recycled.load(Ordering::SeqCst) as u64;
+    assert!(
+        recycled >= report.frames_sent,
+        "{recycled} buffers back for {} pictures sent",
+        report.frames_sent
+    );
+}
+
 /// Two side-by-side 4K screens, 7681×2161 with an odd last column and row:
 /// the left screen blue, the right one red, the odd column and row white.
 /// One picture, then a still screen.
@@ -439,6 +478,7 @@ impl VideoSource for TwoScreens {
             height: h,
             bgrx,
             captured_at: std::time::Instant::now(),
+            grab: Duration::ZERO,
         }))
     }
 }

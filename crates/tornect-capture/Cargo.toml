@@ -30,6 +30,9 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The test card's index is read back from scaled, encoded and decoded pictures
+# (synthetic.rs; quality design §8). A sibling crate, never a normal dependency.
+tornect-codec.workspace = true
 # `start_paused` for the portal's timeout tests (wayland/mod.rs, wayland/portal.rs):
 # without it `cargo test -p tornect-capture` alone does not compile, since only a
 # workspace build unifies the feature in from another crate's dev-dependencies.

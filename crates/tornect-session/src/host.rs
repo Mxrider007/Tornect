@@ -1248,7 +1248,9 @@ impl Drop for Pipeline {
 /// rate, until told to stop or its channels close. Each desktop is fitted
 /// under the codec's maximum before it is encoded: scaled whole when it is
 /// larger, never cropped, so the picture shows the `shown_region` the
-/// injectors map the viewer's pointer over (`backend.rs`).
+/// injectors map the viewer's pointer over (`backend.rs`). Each picture's
+/// buffer goes back to the source once it is encoded
+/// (`VideoSource::recycle`).
 fn encode_loop(
     mut source: Box<dyn VideoSource>,
     settings: EncoderSettings,
@@ -1315,6 +1317,8 @@ fn encode_loop(
                 }
             })
             .map_err(|e| PipelineError::Encoder(e.to_string()));
+        // Encoded: the picture's buffer goes back for the source to fill again.
+        source.recycle(frame.bgrx);
         let failed = encoded.is_err();
         if out.blocking_send(encoded).is_err() || failed {
             return;

@@ -818,13 +818,16 @@ impl Shared {
             Some(unread) => unread.bgrx,
             None => std::mem::take(&mut inner.spare),
         };
+        let started = Instant::now();
         match pack(plane, stride, format, &mut out) {
             Ok(()) => {
+                let captured_at = Instant::now();
                 inner.latest = Some(Frame {
                     width: format.width,
                     height: format.height,
                     bgrx: out,
-                    captured_at: Instant::now(),
+                    captured_at,
+                    grab: captured_at - started,
                 });
                 inner.delivered += 1;
                 drop(inner);
@@ -838,6 +841,22 @@ impl Shared {
                 }
             }
         }
+    }
+
+    /// The capture thread is done with `bgrx`, a picture it took: the
+    /// largest such buffer becomes the spare the next picture is packed
+    /// into, so `offer` stops allocating one per picture. A closed slot
+    /// keeps nothing ([`Shared::close`]): the buffer is dropped, after the
+    /// lock is let go of, as is a spare it replaces.
+    pub(crate) fn recycle(&self, bgrx: Vec<u8>) {
+        let mut inner = self.lock();
+        let unused = if inner.closed || bgrx.capacity() <= inner.spare.capacity() {
+            bgrx
+        } else {
+            std::mem::replace(&mut inner.spare, bgrx)
+        };
+        drop(inner);
+        drop(unused);
     }
 
     fn skip(&self, why: Skip) {
@@ -1804,11 +1823,43 @@ mod tests {
             assert!(!data.shared.holds_picture(), "spare {spare}");
             assert!(good().process(&data), "queued back");
             assert!(!data.shared.holds_picture(), "spare {spare}: after close");
+            // Nor does a picture's buffer that the capture thread gives back
+            // after the close.
+            data.shared.recycle(vec![7; 64]);
+            assert!(!data.shared.holds_picture(), "spare {spare}: recycled");
             assert!(matches!(
                 data.shared.next(Duration::ZERO),
                 Err(CaptureError::Failed(m)) if m.contains("closed")
             ));
         }
+    }
+
+    /// A picture's buffer that the capture thread gives back is the one the
+    /// next picture is packed into: same memory, no allocation per picture.
+    /// A smaller buffer does not replace it, and `grab` is the pack alone.
+    #[test]
+    fn a_buffer_given_back_is_packed_into_next() {
+        let data = fake_data();
+        data.shared
+            .set_format(Ok(Some(format(PixelFormat::Bgrx, 2, 2))));
+        let good = |v: u8| Fake::new(vec![v; 16], chunk(0, 16, 8, 0));
+        assert!(good(1).process(&data));
+        let first = data.shared.next(Duration::ZERO).unwrap().unwrap();
+        let kept = (first.bgrx.as_ptr(), first.bgrx.capacity());
+        data.shared.recycle(first.bgrx);
+        data.shared.recycle(Vec::with_capacity(4));
+        let before = Instant::now();
+        assert!(good(2).process(&data));
+        let took = before.elapsed();
+        let second = data.shared.next(Duration::ZERO).unwrap().unwrap();
+        assert_eq!(second.bgrx, [2; 16]);
+        assert_eq!((second.bgrx.as_ptr(), second.bgrx.capacity()), kept);
+        assert!(second.grab <= took, "{:?} of {took:?}", second.grab);
+        // Nothing given back: the next picture needs memory of its own.
+        assert!(good(3).process(&data));
+        let third = data.shared.next(Duration::ZERO).unwrap().unwrap();
+        assert_eq!(third.bgrx, [3; 16]);
+        assert_ne!(third.bgrx.as_ptr(), second.bgrx.as_ptr());
     }
 
     #[test]

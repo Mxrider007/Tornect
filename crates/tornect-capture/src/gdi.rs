@@ -159,6 +159,9 @@ fn grab() -> Result<Frame, CaptureError> {
         },
         ..Default::default()
     };
+    // From the screen DC through the copy and the pad bytes: the grab's own
+    // cost, timed outside the `unsafe` blocks.
+    let started = Instant::now();
     // SAFETY: every call gets handles created just above and checked for null;
     // `info` lives across `CreateDIBSection`, which writes the DIB's address to
     // `bits`. `Gdi`'s drop releases every object, on every path.
@@ -198,6 +201,7 @@ fn grab() -> Result<Frame, CaptureError> {
         height,
         bgrx,
         captured_at,
+        grab: started.elapsed(),
     })
 }
 
