@@ -97,7 +97,8 @@ pub enum Signature {
         /// When it was made, `YYYY-MM-DD`.
         made: String,
         /// That key has expired since, at this time (seconds since the
-        /// epoch); the signature was made before it.
+        /// epoch); the signature is dated before it, by its signer's own
+        /// clock (E3-4).
         key_expired: Option<u64>,
     },
     /// Not checked, and why.
@@ -120,7 +121,7 @@ impl std::fmt::Display for Signature {
                 if let Some(expired) = key_expired {
                     write!(
                         f,
-                        " (that key expired at {} UTC, after the signature was made)",
+                        " (that key expired at {} UTC, after the time the signature gives)",
                         crate::dist::utc(*expired)
                     )?;
                 }
@@ -526,7 +527,10 @@ fn key_expiries(colons: &str) -> Vec<(String, u64)> {
 /// creation time, `VALIDSIG`'s fourth field, is before the expiry that
 /// `expiries` (the pinned key file) gives the signing key and its primary,
 /// whichever comes first: a signature dated after the key expired, which only
-/// someone holding the retired key could make, is refused.
+/// someone holding the retired key could make, is refused. That date is the
+/// signer's own claim, so the same holder can backdate a signature to before
+/// the expiry, and this check cannot tell; the SHA-256 pins still decide what
+/// is installed.
 fn judge_signature(
     exit_ok: bool,
     status: &str,
@@ -830,7 +834,7 @@ mod tests {
         );
         assert!(
             accepted.to_string().ends_with(
-                "(that key expired at 2026-10-26 11:04:57 UTC, after the signature was made)"
+                "(that key expired at 2026-10-26 11:04:57 UTC, after the time the signature gives)"
             ),
             "{accepted}"
         );
