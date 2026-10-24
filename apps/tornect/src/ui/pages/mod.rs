@@ -463,6 +463,19 @@ mod tests {
         assert!(window.click(connect).is_empty());
     }
 
+    /// Design `invite` §2.4: the ID card of a window opened for a link says
+    /// it answers no request, and how to answer them.
+    #[test]
+    fn a_link_window_says_it_answers_no_request() {
+        let mut model = at_rest();
+        model.hosting = Hosting::Off(super::super::LINK_WINDOW_OFF.to_owned());
+        let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(has_text(
+            &window,
+            "Incoming requests: off (opened from a link; open Tornect itself to answer requests)"
+        ));
+    }
+
     /// B02: a Tor that did not start says what to check in plain words (no
     /// command, no file) and when it tries again by itself, on Home and in
     /// Settings, Connection, each with a button that tries now; once Tor is

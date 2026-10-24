@@ -729,6 +729,7 @@ mod tests {
             empty: false,
             sheet: None,
             theme: egui::Theme::Dark,
+            link: None,
         }
     }
 

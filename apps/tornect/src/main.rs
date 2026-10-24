@@ -44,10 +44,12 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use tornect_core::config::BridgeMode;
+use tornect_core::invite::{self, IdProblem};
 use tornect_core::keystore::{
     self, FileSecretStore, load_or_create_device_identity, load_or_create_host_identity,
 };
 use tornect_core::telemetry::{self, LogOptions};
+use tornect_core::unattended::ipc::ShownLink;
 use tornect_core::{Config, Paths};
 
 #[derive(Parser, Debug)]
@@ -137,6 +139,10 @@ enum Command {
         /// Print machine-readable JSON.
         #[arg(long)]
         json: bool,
+        /// Print only an invitation to share: this ID, its tornect:// link and
+        /// where to get Tornect.
+        #[arg(long, conflicts_with = "json")]
+        invitation: bool,
     },
     /// Generate a new Tornect ID. Invalidates every pairing and unattended grant.
     RotateId {
@@ -214,12 +220,21 @@ enum Command {
     /// Reach the Tor network (direct, obfs4 bridges or Snowflake, per `--bridges`)
     /// and report which transport worked.
     TorCheck,
+    /// Open a tornect:// link: bring Tornect's window forward, or open a
+    /// connect-only window, with the link's ID in the connect field. It never
+    /// connects by itself.
+    OpenLink {
+        /// The link, `tornect://<ID>`, given after `--`.
+        #[arg(value_name = "LINK")]
+        link: std::ffi::OsString,
+    },
     /// Connect to a host by Tornect ID over Tor and measure round-trip times.
     ///
     /// Uses this instance's own Tor state; run it under a different TORNECT_HOME
     /// than the host when both live on one machine.
     Ping {
-        /// The host's Tornect ID (56-character onion address, with or without `.onion`).
+        /// The host's Tornect ID (56 characters, with or without `.onion`), its
+        /// tornect:// link, or a whole invitation in quotes.
         onion: String,
         /// Number of pings to send (a host answers at most 100 per session).
         #[arg(
@@ -240,7 +255,8 @@ enum Command {
     /// instance's own Tor state; run it under a different TORNECT_HOME
     /// than the host when both live on one machine.
     Connect {
-        /// The host's Tornect ID (56-character onion address, with or without `.onion`).
+        /// The host's Tornect ID (56 characters, with or without `.onion`), its
+        /// tornect:// link, or a whole invitation in quotes.
         onion: String,
         /// Pair with the host (if it is new) and stop there.
         #[arg(long)]
@@ -290,7 +306,8 @@ enum Command {
     /// devices there. The last two work only from a "My machines" access with
     /// control; the host decides and answers.
     Admin {
-        /// The host's Tornect ID (56-character onion address, with or without `.onion`).
+        /// The host's Tornect ID (56 characters, with or without `.onion`), its
+        /// tornect:// link, or a whole invitation in quotes.
         onion: String,
         /// What to do.
         #[arg(value_enum)]
@@ -611,7 +628,7 @@ fn main() -> anyhow::Result<()> {
             if background_already_running(&paths) {
                 return Ok(());
             }
-        } else if second_launch_shown(&paths) {
+        } else if second_launch_shown(&paths, None) {
             // A second launch raises the running window instead (§B.1.1).
             return Ok(());
         }
@@ -626,6 +643,7 @@ fn main() -> anyhow::Result<()> {
                 empty: false,
                 sheet: None,
                 theme: egui::Theme::Dark,
+                link: None,
             },
             cli.background,
         );
@@ -644,7 +662,7 @@ fn main() -> anyhow::Result<()> {
             empty,
             sheet,
         } => {
-            if !preview && !no_host && second_launch_shown(&paths) {
+            if !preview && !no_host && second_launch_shown(&paths, None) {
                 return Ok(());
             }
             ui::run(
@@ -661,11 +679,12 @@ fn main() -> anyhow::Result<()> {
                         Some(ThemeArg::Light) => egui::Theme::Light,
                         Some(ThemeArg::Dark) | None => egui::Theme::Dark,
                     },
+                    link: None,
                 },
                 false,
             )
         }
-        Command::Id { json } => cmd_id(&paths, json),
+        Command::Id { json, invitation } => cmd_id(&paths, json, invitation),
         Command::RotateId { yes } => cmd_rotate_id(&paths, yes),
         Command::Paths => {
             for (name, dir) in paths.all() {
@@ -689,6 +708,7 @@ fn main() -> anyhow::Result<()> {
             tor_cmd::host(&paths, once, pow, cli.bridges, capture.into())
         }
         Command::TorCheck => tor_cmd::tor_check(&paths, cli.bridges),
+        Command::OpenLink { link } => open_link(&paths, cli.bridges, &link),
         Command::Ping { onion, count } => tor_cmd::ping(&paths, &onion, count, cli.bridges),
         Command::Connect {
             onion,
@@ -751,17 +771,18 @@ fn main() -> anyhow::Result<()> {
 const SHOW_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// A second window launch (§B.1.1): when a Tornect host runs for these
-/// directories, ask it to raise its window (`IpcOp::Show`); `true` when it
-/// did, and this launch ends there. Nothing running, a refusal (a host with
-/// no window, or one without its store), an error, or no answer within
-/// [`SHOW_WAIT`] is `false`: the window opens as it always did.
-async fn shown_by_the_running_host(paths: &Paths) -> bool {
+/// directories, ask it to raise its window (`IpcOp::Show`), with the `link`
+/// a link launch opened (design `invite` §2.4); `true` when it did, and this
+/// launch ends there. Nothing running, a refusal (a host with no window, or
+/// one without its store), an error, or no answer within [`SHOW_WAIT`] is
+/// `false`: the window opens as it always did.
+async fn shown_by_the_running_host(paths: &Paths, link: Option<ShownLink>) -> bool {
     if host::HostLock::holder(paths).is_none() {
         return false;
     }
     let req = tornect_core::unattended::ipc::IpcRequest {
         id: 1,
-        op: tornect_core::unattended::ipc::IpcOp::Show { link: None },
+        op: tornect_core::unattended::ipc::IpcOp::Show { link },
     };
     matches!(
         tokio::time::timeout(SHOW_WAIT, tornect_platform::ipc::request(&paths.state_dir, &req)).await,
@@ -778,11 +799,69 @@ fn background_already_running(paths: &Paths) -> bool {
 
 /// [`shown_by_the_running_host`], on a runtime of its own (before the
 /// window's).
-fn second_launch_shown(paths: &Paths) -> bool {
+fn second_launch_shown(paths: &Paths, link: Option<ShownLink>) -> bool {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .is_ok_and(|runtime| runtime.block_on(shown_by_the_running_host(paths)))
+        .is_ok_and(|runtime| runtime.block_on(shown_by_the_running_host(paths, link)))
+}
+
+/// `tornect open-link -- <link>`, what the OS runs for an opened `tornect:`
+/// link (design `invite` §2.4). The running window is raised with the link;
+/// with none (or a host without a window) a connect-only window opens with
+/// it. Either way the link at most fills the connect field: nothing
+/// connects, pairs or answers, and a link never starts hosting (L-1, L-5).
+fn open_link(
+    paths: &Paths,
+    bridges: Option<BridgeMode>,
+    link: &std::ffi::OsStr,
+) -> anyhow::Result<()> {
+    let shown = shown_link(link);
+    if second_launch_shown(paths, Some(shown)) {
+        return Ok(());
+    }
+    ui::run(paths, link_window_opts(bridges, shown), false)
+}
+
+/// What the window gets of an opened link: its ID, or the word that it was
+/// refused, so the window can say why nothing was filled in (there is no
+/// console when the OS starts this). A refusal is logged by its static
+/// problem name only, never the link (L-7), and told on stderr for a
+/// terminal.
+fn shown_link(link: &std::ffi::OsStr) -> ShownLink {
+    match read_link(link) {
+        Ok(id) => ShownLink::Fill(id),
+        Err(problem) => {
+            tracing::info!(problem = problem.name(), "a tornect: link was refused");
+            eprintln!("That link was not opened: {problem}.");
+            ShownLink::Refused
+        }
+    }
+}
+
+/// The strict link reading of design `invite` §4.1; text that is not UTF-8
+/// is no link.
+fn read_link(link: &std::ffi::OsStr) -> Result<tornect_core::TornectId, IdProblem> {
+    link.to_str()
+        .ok_or(IdProblem::NotALink)
+        .and_then(invite::parse_link)
+}
+
+/// The window a link opens when no Tornect window runs here: connect-only
+/// (L-5), so a web page that opens a link never starts hosting, the onion
+/// service or unattended access; it takes no host lock and serves no IPC.
+fn link_window_opts(bridges: Option<BridgeMode>, shown: ShownLink) -> ui::GuiOpts {
+    ui::GuiOpts {
+        source: tornect_session::Source::Desktop,
+        host: false,
+        bridges,
+        preview: false,
+        page: None,
+        empty: false,
+        sheet: None,
+        theme: egui::Theme::Dark,
+        link: Some(shown),
+    }
 }
 
 /// Review finding E2-2: on Windows, Tornect's directories get no private
@@ -816,20 +895,16 @@ fn open_store(paths: &Paths) -> anyhow::Result<FileSecretStore> {
     FileSecretStore::open(paths.keys_dir()).context("opening keystore")
 }
 
-fn cmd_id(paths: &Paths, json: bool) -> anyhow::Result<()> {
+fn cmd_id(paths: &Paths, json: bool, invitation: bool) -> anyhow::Result<()> {
     let store = open_store(paths)?;
     let (host, created) = load_or_create_host_identity(&store)?;
     let (device, _) = load_or_create_device_identity(&store)?;
-    if json {
+    if invitation {
+        println!("{}", invite::invitation(&host.id()));
+    } else if json {
         println!(
             "{}",
-            serde_json::json!({
-                "tornect_id": host.id().onion_address(),
-                "device_id": device.id().to_string(),
-                "device_fingerprint": device.id().fingerprint(),
-                "created": created,
-                "keystore": paths.keys_dir(),
-            })
+            id_json(&host.id(), &device.id(), created, &paths.keys_dir())
         );
     } else {
         if created {
@@ -838,15 +913,42 @@ fn cmd_id(paths: &Paths, json: bool) -> anyhow::Result<()> {
                 paths.keys_dir().display()
             );
         }
-        println!("Tornect ID : {}", host.id().onion_address());
-        println!("           : {}", host.id().display_groups());
-        println!(
-            "Device ID  : {}  (fingerprint {})",
-            device.id(),
-            device.id().fingerprint()
-        );
+        for line in id_lines(&host.id(), &device.id()) {
+            println!("{line}");
+        }
     }
     Ok(())
+}
+
+/// `tornect id`'s lines: the ID, its groups, its link (design `invite`
+/// §2.5) and this device's ID.
+fn id_lines(id: &tornect_core::TornectId, device: &tornect_core::DeviceId) -> [String; 4] {
+    [
+        format!("Tornect ID : {}", id.onion_address()),
+        format!("           : {}", id.display_groups()),
+        format!("Link       : {}", invite::link(id)),
+        format!(
+            "Device ID  : {device}  (fingerprint {})",
+            device.fingerprint()
+        ),
+    ]
+}
+
+/// `tornect id --json`.
+fn id_json(
+    id: &tornect_core::TornectId,
+    device: &tornect_core::DeviceId,
+    created: bool,
+    keystore: &std::path::Path,
+) -> serde_json::Value {
+    serde_json::json!({
+        "tornect_id": id.onion_address(),
+        "link": invite::link(id),
+        "device_id": device.to_string(),
+        "device_fingerprint": device.fingerprint(),
+        "created": created,
+        "keystore": keystore,
+    })
 }
 
 /// Why `tornect rotate-id` refuses beside a running host: the window or
@@ -1036,8 +1138,11 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use std::path::PathBuf;
+
     use clap::{CommandFactory as _, Parser as _};
-    use tornect_core::unattended::ipc::{IpcRequest, IpcResponse};
+    use tornect_core::config::BridgeMode;
+    use tornect_core::unattended::ipc::{IpcRequest, IpcResponse, ShownLink};
 
     const ID: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwd";
 
@@ -1256,26 +1361,275 @@ mod tests {
         };
         let first = host_in(tmp.path(), Some(hook)).await;
         let paths = tornect_core::Paths::from_home(tmp.path());
-        assert!(super::shown_by_the_running_host(&paths).await);
+        assert!(super::shown_by_the_running_host(&paths, None).await);
         assert_eq!(raised.load(Ordering::SeqCst), 1, "raised once");
         drop(first);
     }
 
     /// A first instance with no window to raise (the terminal or the
-    /// headless host) refuses `Show`, and with nothing running nothing is
-    /// asked: the second launch opens its window as before.
+    /// headless host) refuses `Show`, a link's too (design `invite` §2.4: the
+    /// link then opens a connect-only window), and with nothing running
+    /// nothing is asked: the second launch opens its window as before.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_show_keeps_todays_second_window() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = tornect_core::Paths::from_home(tmp.path());
         paths.ensure().unwrap();
-        assert!(
-            !super::shown_by_the_running_host(&paths).await,
-            "nothing runs"
-        );
+        for link in [
+            None,
+            Some(ShownLink::Fill(key(7))),
+            Some(ShownLink::Refused),
+        ] {
+            assert!(
+                !super::shown_by_the_running_host(&paths, link).await,
+                "nothing runs"
+            );
+        }
         let first = host_in(tmp.path(), None).await;
-        assert!(!super::shown_by_the_running_host(&paths).await, "refused");
+        for link in [
+            None,
+            Some(ShownLink::Fill(key(7))),
+            Some(ShownLink::Refused),
+        ] {
+            assert!(
+                !super::shown_by_the_running_host(&paths, link).await,
+                "refused: {link:?}"
+            );
+        }
         drop(first);
+    }
+
+    /// A real key's ID, from its seed byte.
+    fn key(seed: u8) -> tornect_core::TornectId {
+        tornect_core::TornectId::from_public_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key(),
+        )
+    }
+
+    /// The first instance as a window host whose raise records what each
+    /// `Show` carried.
+    async fn recording_host(
+        home: &std::path::Path,
+    ) -> (FirstInstance, Arc<std::sync::Mutex<Vec<Option<ShownLink>>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook: super::unattended::ShowHook = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |link| seen.lock().unwrap().push(link))
+        };
+        (host_in(home, Some(hook)).await, seen)
+    }
+
+    /// Design `invite` §2.4: a link opened while the window host runs raises
+    /// that window with the link's ID, read strictly from the link the OS
+    /// passed, and the launch ends there (no second window). Nothing is
+    /// written to `sessions.log`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_link_launch_fills_the_running_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (first, seen) = recording_host(tmp.path()).await;
+        let paths = tornect_core::Paths::from_home(tmp.path());
+        let log = tornect_core::session_log::SessionLog::new(paths.sessions_log());
+        let lines = log.read_all().unwrap().len();
+        let id = key(9);
+        let shown = super::shown_link(std::ffi::OsStr::new(&tornect_core::invite::link(&id)));
+        assert_eq!(shown, ShownLink::Fill(id));
+        assert!(super::shown_by_the_running_host(&paths, Some(shown)).await);
+        assert_eq!(*seen.lock().unwrap(), vec![Some(ShownLink::Fill(id))]);
+        assert_eq!(log.read_all().unwrap().len(), lines, "nothing logged");
+        drop(first);
+    }
+
+    /// Design `invite` §2.4: a link that holds no valid ID still raises the
+    /// running window, which is told it was refused (so it can say why
+    /// nothing was filled in), and the launch ends there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_link_still_raises_the_running_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (first, seen) = recording_host(tmp.path()).await;
+        let paths = tornect_core::Paths::from_home(tmp.path());
+        let with_extras = format!("{}?connect=1", tornect_core::invite::link(&key(9)));
+        let shown = super::shown_link(std::ffi::OsStr::new(&with_extras));
+        assert_eq!(shown, ShownLink::Refused);
+        assert!(super::shown_by_the_running_host(&paths, Some(shown)).await);
+        assert_eq!(*seen.lock().unwrap(), vec![Some(ShownLink::Refused)]);
+        drop(first);
+    }
+
+    /// Design `invite` §2.4, L-5: the window a link opens with no Tornect
+    /// window running is connect-only, for a fill and a refusal alike: it
+    /// takes no host lock, publishes nothing and serves no IPC, so no
+    /// unattended grant can be served from it.
+    #[test]
+    fn the_link_window_is_connect_only() {
+        for shown in [ShownLink::Fill(key(9)), ShownLink::Refused] {
+            for bridges in [None, Some(BridgeMode::Snowflake)] {
+                let opts = super::link_window_opts(bridges, shown);
+                assert!(!opts.host, "{shown:?}");
+                assert!(!opts.preview);
+                assert_eq!(opts.link, Some(shown));
+                assert_eq!(opts.bridges, bridges);
+            }
+        }
+    }
+
+    /// Design `invite` §2.4, §4.1: `open-link` reads its argument with the
+    /// strict link grammar alone: an ID that is no link, a link with anything
+    /// more, and text that is not UTF-8 are refused, each with its problem.
+    #[test]
+    fn open_link_reads_only_a_link() {
+        use tornect_core::invite::{self, IdProblem};
+        let id = key(9);
+        let read = |s: &str| super::read_link(std::ffi::OsStr::new(s));
+        assert_eq!(read(&invite::link(&id)), Ok(id));
+        assert_eq!(read(&format!("tornect:{}.onion/", id.base32())), Ok(id));
+        assert_eq!(read(&id.base32()), Err(IdProblem::NotALink));
+        assert_eq!(read(&invite::invitation(&id)), Err(IdProblem::LinkExtras));
+        assert_eq!(
+            read(&format!("{}\" --home C:\\x", invite::link(&id))),
+            Err(IdProblem::NotAlphabet(Some('"')))
+        );
+        assert_eq!(
+            read(&format!("{} --home C:\\x", invite::link(&id))),
+            Err(IdProblem::LinkExtras)
+        );
+        assert_eq!(read(""), Err(IdProblem::NotALink));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let mut bytes = invite::link(&id).into_bytes();
+            bytes.push(0xFF);
+            assert_eq!(
+                super::read_link(std::ffi::OsStr::from_bytes(&bytes)),
+                Err(IdProblem::NotALink)
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt as _;
+            let mut wide: Vec<u16> = invite::link(&id).encode_utf16().collect();
+            wide.push(0xD800);
+            assert_eq!(
+                super::read_link(&std::ffi::OsString::from_wide(&wide)),
+                Err(IdProblem::NotALink)
+            );
+        }
+    }
+
+    /// Design `invite` §2.4, L-3: `open-link` takes exactly one link, after
+    /// `--` as the OS passes it, so whatever a link holds (a `"` a browser
+    /// left unescaped, `--home`, a subcommand) stays inside that one
+    /// argument; a second argument is refused rather than read. The
+    /// subcommand is the name the OS registration writes.
+    #[test]
+    fn open_link_takes_one_link_after_the_separator() {
+        let link = tornect_core::invite::link(&key(9));
+        let parse = |args: &[&str]| super::Cli::try_parse_from(args.iter().copied());
+        let taken = |args: &[&str]| match parse(args).map(|cli| (cli.home, cli.command)) {
+            Ok((home, Some(super::Command::OpenLink { link }))) => (home, link),
+            other => panic!("{args:?}: {other:?}"),
+        };
+        assert_eq!(
+            taken(&["tornect", "open-link", "--", &link]),
+            (None, link.clone().into())
+        );
+        assert_eq!(
+            taken(&["tornect", "open-link", &link]),
+            (None, link.clone().into())
+        );
+        assert_eq!(
+            taken(&["tornect", "--home", "/h", "open-link", "--", "L"]),
+            (Some(PathBuf::from("/h")), "L".into())
+        );
+        let injected = "tornect://x\" --home C:\\x";
+        assert_eq!(
+            taken(&["tornect", "open-link", "--", injected]),
+            (None, injected.into())
+        );
+        assert_eq!(
+            taken(&["tornect", "open-link", "--", "--home"]),
+            (None, "--home".into())
+        );
+        for refused in [
+            &["tornect", "open-link", "--", "L", "--home", "/x"][..],
+            &[
+                "tornect",
+                "open-link",
+                "--",
+                "tornect://x\"",
+                "--home",
+                "C:\\x",
+            ],
+            &["tornect", "open-link", "L", "extra"],
+            &["tornect", "open-link", "--", "L", "gui"],
+            &["tornect", "open-link"],
+            &["tornect", "open-link", "--"],
+            &["tornect", "--background", "open-link", "--", "L"],
+        ] {
+            let parsed = parse(refused);
+            let accepted = parsed
+                .as_ref()
+                .is_ok_and(|cli| !cli.background || cli.command.is_none());
+            assert!(!accepted, "{refused:?}: {parsed:?}");
+        }
+        assert_eq!(
+            tornect_platform::install::LINK_ARGUMENT,
+            "open-link",
+            "the registration's subcommand"
+        );
+        assert!(
+            super::Cli::command()
+                .find_subcommand(tornect_platform::install::LINK_ARGUMENT)
+                .is_some()
+        );
+        let help = super::Cli::command()
+            .find_subcommand_mut("open-link")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            help.contains(
+                "Open a tornect:// link: bring Tornect's window forward, or open a connect-only \
+                 window, with the link's ID in the connect field. It never connects by itself"
+            ),
+            "{help}"
+        );
+    }
+
+    /// Design `invite` §2.5: `tornect id` shows the link under the ID and
+    /// its groups, `--json` carries it as `"link"`, and `--invitation`
+    /// (which `--json` excludes) is the invitation alone.
+    #[test]
+    fn id_shows_the_link_and_prints_an_invitation() {
+        let id = key(9);
+        let device = tornect_core::DeviceId::from_bytes(*key(10).public_key_bytes());
+        let link = tornect_core::invite::link(&id);
+        let lines = super::id_lines(&id, &device);
+        assert_eq!(lines[0], format!("Tornect ID : {}", id.onion_address()));
+        assert_eq!(lines[1], format!("           : {}", id.display_groups()));
+        assert_eq!(lines[2], format!("Link       : {link}"));
+        assert!(lines[3].starts_with("Device ID  : "), "{}", lines[3]);
+        let json = super::id_json(&id, &device, false, std::path::Path::new("/k"));
+        assert_eq!(json["link"], serde_json::json!(link));
+        assert_eq!(json["tornect_id"], serde_json::json!(id.onion_address()));
+
+        let parse = |args: &[&str]| super::Cli::try_parse_from(args.iter().copied());
+        assert!(matches!(
+            parse(&["tornect", "id", "--invitation"]).unwrap().command,
+            Some(super::Command::Id {
+                json: false,
+                invitation: true
+            })
+        ));
+        assert!(matches!(
+            parse(&["tornect", "id"]).unwrap().command,
+            Some(super::Command::Id {
+                json: false,
+                invitation: false
+            })
+        ));
+        let both = parse(&["tornect", "id", "--json", "--invitation"]).unwrap_err();
+        assert_eq!(both.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     /// §B.1.1: a `--background` launch (the start at sign-in) parses with no
@@ -1320,7 +1674,7 @@ mod tests {
         })
         .await;
         let (t0, real) = (tokio::time::Instant::now(), std::time::Instant::now());
-        assert!(!super::shown_by_the_running_host(&paths).await);
+        assert!(!super::shown_by_the_running_host(&paths, None).await);
         let waited = t0.elapsed();
         assert!(
             waited >= super::SHOW_WAIT && waited < super::SHOW_WAIT * 2,

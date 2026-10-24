@@ -443,6 +443,15 @@ async fn run_host(
     Ok(())
 }
 
+/// The host a command names (design `invite` §2.5): a bare Tornect ID, its
+/// `tornect:` link, or a whole pasted invitation. A refusal names the problem
+/// only: the input is never echoed, and never logged (L-7).
+fn named_host(text: &str) -> anyhow::Result<TornectId> {
+    tornect_core::invite::find_id(text)
+        .map(|found| found.id)
+        .map_err(|problem| anyhow::anyhow!("that is not a Tornect ID: {problem}"))
+}
+
 /// `tornect ping <onion> [--count N]`
 pub fn ping(
     paths: &Paths,
@@ -451,9 +460,7 @@ pub fn ping(
     bridges: Option<BridgeMode>,
 ) -> anyhow::Result<()> {
     install_crypto_provider();
-    let id: TornectId = onion
-        .parse()
-        .map_err(|e| anyhow::anyhow!("{onion:?} is not a Tornect ID: {e}"))?;
+    let id = named_host(onion)?;
     let mut cfg = Config::load(&paths.config_file())?;
     if let Some(mode) = bridges {
         cfg.tor.bridges = mode;
@@ -543,9 +550,7 @@ pub fn admin(
 
     use crate::ua_client::{self, AdminAction, Logged};
     install_crypto_provider();
-    let id: TornectId = onion
-        .parse()
-        .map_err(|e| anyhow::anyhow!("that is not a Tornect ID: {e}"))?;
+    let id = named_host(onion)?;
     let mut cfg = Config::load(&paths.config_file())?;
     if let Some(mode) = bridges {
         cfg.tor.bridges = mode;
@@ -817,9 +822,7 @@ pub fn connect(
     bridges: Option<BridgeMode>,
 ) -> anyhow::Result<()> {
     install_crypto_provider();
-    let id: TornectId = onion
-        .parse()
-        .map_err(|e| anyhow::anyhow!("{onion:?} is not a Tornect ID: {e}"))?;
+    let id = named_host(onion)?;
     let mut cfg = Config::load(&paths.config_file())?;
     if let Some(mode) = bridges {
         cfg.tor.bridges = mode;
@@ -1619,6 +1622,69 @@ mod tests {
     };
 
     use super::*;
+
+    /// Design `invite` §2.5: `connect`, `ping` and `admin` take the host's ID
+    /// bare, grouped, with `.onion`, as a `tornect:` link or inside a whole
+    /// pasted invitation. A refusal reads "that is not a Tornect ID: <the
+    /// problem>" and never echoes what was given (L-7): not a typo'd ID, not a
+    /// link's parameters, not the text around it.
+    #[test]
+    fn a_command_takes_an_id_a_link_or_an_invitation_and_never_echoes_it() {
+        use tornect_core::invite::{self, IdProblem};
+        let id = TornectId::from_public_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key(),
+        );
+        for given in [
+            id.base32(),
+            id.onion_address(),
+            id.display_groups(),
+            invite::link(&id),
+            format!("tornect:{}", id.base32().to_uppercase()),
+            invite::invitation(&id),
+            format!("my id is {}, thanks", id.display_groups()),
+        ] {
+            assert_eq!(named_host(&given).unwrap(), id, "{given}");
+        }
+        let mut typo = id.base32();
+        typo.replace_range(10..11, if &typo[10..11] == "a" { "b" } else { "a" });
+        let other = TornectId::from_public_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[8; 32]).verifying_key(),
+        );
+        for (given, problem) in [
+            (String::new(), IdProblem::Empty),
+            (typo.clone(), IdProblem::Checksum),
+            (
+                format!("{}?secret=hunter2", invite::link(&id)),
+                IdProblem::LinkExtras,
+            ),
+            (
+                format!("{} {}", invite::link(&id), invite::link(&other)),
+                IdProblem::Several,
+            ),
+            (
+                "see you at the cafe on main street at noon".to_owned(),
+                IdProblem::NoId,
+            ),
+            ("call me at noon".to_owned(), IdProblem::Short { found: 12 }),
+        ] {
+            let err = named_host(&given).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!("that is not a Tornect ID: {problem}"),
+                "{given}"
+            );
+            for part in given.split_whitespace() {
+                assert!(
+                    part.len() < 4 || !err.contains(part),
+                    "{part:?} echoed: {err}"
+                );
+            }
+            assert!(
+                !err.contains(&id.base32()) && !err.contains("hunter2"),
+                "{err}"
+            );
+        }
+    }
 
     /// The client's end of the signaling stream, whose writes can be frozen,
     /// as a host that grants no Tor flow-control credit freezes them.

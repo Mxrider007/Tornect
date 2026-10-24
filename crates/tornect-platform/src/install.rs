@@ -97,6 +97,11 @@ pub const UNINSTALL_ARGUMENT: &str = "uninstall";
 /// Where the uninstall entry's key is, under HKLM.
 pub const UNINSTALL_ROOT: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
 
+/// The subcommand an opened `tornect:` link runs: the OS's registration
+/// writes it, then `--`, then the link, so the link stays one positional
+/// argument whatever it holds (design `invite` §4.5, L-3).
+pub const LINK_ARGUMENT: &str = "open-link";
+
 /// The installed copy's internal step that writes the uninstall entry: its
 /// only argument (§B.1.1, the CLI list).
 pub const ENTRY_STEP_ARGUMENT: &str = "install-entry";

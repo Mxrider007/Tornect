@@ -45,6 +45,7 @@ use tornect_core::config::BridgeMode;
 use tornect_core::keystore::{
     FileSecretStore, load_or_create_device_identity, load_or_create_host_identity,
 };
+use tornect_core::unattended::ipc::ShownLink;
 use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths};
 use tornect_session::{DesktopBackend, Source};
 use tornect_signal::{HostSigner, install_crypto_provider, shutdown_runtime};
@@ -109,6 +110,25 @@ pub struct GuiOpts {
     /// With `preview`: the theme the windows draw with (a real window draws
     /// with the one saved in the settings).
     pub theme: egui::Theme,
+    /// The `tornect:` link this window was opened for (`tornect open-link`,
+    /// design `invite` §2.4): at most an ID for the connect field. A window
+    /// opened for a link does not host.
+    pub link: Option<ShownLink>,
+}
+
+/// Why a window opened for a link answers no request (design `invite` §2.4):
+/// the ID card's line reads "Incoming requests: off (…)" with this.
+pub(crate) const LINK_WINDOW_OFF: &str =
+    "opened from a link; open Tornect itself to answer requests";
+
+/// The hosting line a window starts with: waiting for Tor when it hosts,
+/// else off, saying why.
+fn first_hosting(host: bool, link: Option<ShownLink>) -> Hosting {
+    match (host, link) {
+        (true, _) => Hosting::Waiting,
+        (false, Some(_)) => Hosting::Off(LINK_WINDOW_OFF.to_owned()),
+        (false, None) => Hosting::Off("started with --no-host".to_owned()),
+    }
 }
 
 /// What the window starts from: its first model and, for a real window (not
@@ -172,11 +192,7 @@ fn start(paths: &Paths, opts: &GuiOpts) -> anyhow::Result<Start> {
         device_name: cfg.general.device_name.clone(),
         settings,
         book: book::read(paths, tornect_core::address_book::Day::today(), None),
-        hosting: if opts.host {
-            Hosting::Waiting
-        } else {
-            Hosting::Off("started with --no-host".to_owned())
-        },
+        hosting: first_hosting(opts.host, opts.link),
         setup,
         ..Model::default()
     };
@@ -329,6 +345,58 @@ fn indicator_fact(
 
 #[cfg(test)]
 mod tests {
+    use tornect_core::unattended::ipc::ShownLink;
+
+    use super::model::Hosting;
+
+    /// Design `invite` §2.4, L-5: a window opened for a link, a fill or a
+    /// refusal, starts connect-only with the line that says why it answers
+    /// nothing; `--no-host` keeps its own line; a hosting window waits for
+    /// Tor as before. The real set-up, from a fresh home, gives the same.
+    #[test]
+    fn a_link_window_says_why_it_answers_no_request() {
+        let id = tornect_core::TornectId::from_public_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key(),
+        );
+        for link in [ShownLink::Fill(id), ShownLink::Refused] {
+            assert_eq!(
+                super::first_hosting(false, Some(link)),
+                Hosting::Off(super::LINK_WINDOW_OFF.to_owned())
+            );
+            assert_eq!(super::first_hosting(true, Some(link)), Hosting::Waiting);
+        }
+        assert_eq!(
+            super::first_hosting(false, None),
+            Hosting::Off("started with --no-host".to_owned())
+        );
+        assert_eq!(super::first_hosting(true, None), Hosting::Waiting);
+        assert_eq!(
+            super::LINK_WINDOW_OFF,
+            "opened from a link; open Tornect itself to answer requests"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = tornect_core::Paths::from_home(tmp.path());
+        let opts = super::GuiOpts {
+            source: tornect_session::Source::Desktop,
+            host: false,
+            bridges: None,
+            preview: false,
+            page: None,
+            empty: false,
+            sheet: None,
+            theme: egui::Theme::Dark,
+            link: Some(ShownLink::Refused),
+        };
+        let start = super::start(&paths, &opts).unwrap();
+        assert!(start.real.is_some());
+        assert_eq!(
+            start.model.hosting,
+            Hosting::Off(super::LINK_WINDOW_OFF.to_owned())
+        );
+        assert!(start.model.setup.is_none(), "no first-run screen grant");
+    }
+
     /// §B.1.1 (MUST): in background mode the host's gate and the window's
     /// probe hold one "indicator shown" fact: the one the probe sets is the
     /// one the gate reads. Without background mode, or in a window that
