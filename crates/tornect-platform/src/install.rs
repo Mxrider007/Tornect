@@ -1046,8 +1046,17 @@ pub fn uninstall_from_program_files(
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    FOLDER_OTHERS_CAN_CHANGE, LINK_ENTRY, LINK_MIME, LINUX_EXE, LinuxInstall, MENU_ENTRY, Removal,
+    FOLDER_OTHERS_CAN_CHANGE, LINK_ENTRY, LINK_MIME, LINUX_EXE, LinkHandler, LinuxInstall,
+    MENU_ENTRY, Removal,
 };
+
+/// The `mimeapps.list` edit of the Linux install: pure text.
+#[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the Linux install's file side calls it next")
+)]
+mod mimeapps;
 
 /// The per-user install on Linux.
 #[cfg(target_os = "linux")]
@@ -1122,6 +1131,24 @@ mod linux {
                 .field("apps_dir", &self.apps_dir)
                 .finish_non_exhaustive()
         }
+    }
+
+    /// What `tornect install` did about `tornect:` links in this user's
+    /// `mimeapps.list` (design `invite` §4.5). The install never fails over
+    /// it: the program is installed and pasting an invitation always works.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum LinkHandler {
+        /// The file names the link entry for `x-scheme-handler/tornect`, and
+        /// as the default: links open Tornect.
+        Registered,
+        /// A `[Default Applications]` line names another program first for
+        /// these links; Tornect left it as it is.
+        OtherDefault,
+        /// `[Removed Associations]` lists the link entry for these links: the
+        /// user turned it off, so nothing was written.
+        TurnedOff,
+        /// The file was not changed, for this reason.
+        NotChanged(String),
     }
 
     /// What [`LinuxInstall::uninstall`] did.

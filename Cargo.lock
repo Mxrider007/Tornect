@@ -7415,6 +7415,7 @@ dependencies = [
  "data-encoding",
  "fs-err",
  "getrandom 0.4.3",
+ "proptest",
  "serde",
  "sha2 0.11.0",
  "tempfile",
