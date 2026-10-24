@@ -344,6 +344,12 @@ impl<'b, C> minicbor::Decode<'b, C> for TornectId {
     }
 }
 
+/// Whether `c` belongs to the RFC 4648 base32 alphabet an onion address is written in,
+/// in either case: `A`–`Z`, `a`–`z`, `2`–`7`. Never `0`, `1`, `8` or `9`.
+pub(crate) fn is_b32(c: char) -> bool {
+    matches!(c, 'A'..='Z' | 'a'..='z' | '2'..='7')
+}
+
 /// `s` without a case-insensitive ASCII `suffix`. Typed or pasted text can hold any
 /// character, so the cut point may fall inside a multi-byte one: `get` answers `None`
 /// there instead of the panic a range index would raise (such a tail cannot equal an
@@ -514,6 +520,27 @@ mod tests {
             strip_suffix_ignore_case("x€.OnIoN", ONION_SUFFIX),
             Some("x€")
         );
+    }
+
+    /// The alphabet `base32()` writes in, and nothing else: every character of a
+    /// rendered address passes, the four digits base32 leaves out and any other
+    /// character do not.
+    #[test]
+    fn is_b32_is_the_onion_alphabet() {
+        let all: String = ('\0'..='\u{7f}').filter(|&c| is_b32(c)).collect();
+        assert_eq!(
+            all,
+            "234567ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        );
+        for c in [
+            '0', '1', '8', '9', '-', '.', ' ', 'é', 'Ａ', '\u{200b}', '\u{202e}',
+        ] {
+            assert!(!is_b32(c), "{c:?}");
+        }
+        for addr in KNOWN {
+            let id: TornectId = addr.parse().unwrap();
+            assert!(id.base32().chars().all(is_b32), "{addr}");
+        }
     }
 
     proptest! {

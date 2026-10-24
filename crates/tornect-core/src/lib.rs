@@ -11,6 +11,7 @@ pub mod address_book;
 pub mod config;
 pub mod error;
 pub mod id;
+pub mod invite;
 pub mod keys;
 pub mod keystore;
 pub mod levels;
