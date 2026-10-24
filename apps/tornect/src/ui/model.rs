@@ -98,7 +98,8 @@ impl Shared {
 /// Everything the windows show.
 #[derive(Debug, Clone, Default)]
 pub struct Model {
-    /// This machine's Tornect ID in 4-character groups, once known.
+    /// This machine's Tornect ID in 8-character groups
+    /// ([`TornectId::display_groups`]), once known; [`Model::own_id`] reads it.
     pub id: Option<String>,
     /// The connection to the Tor network.
     pub tor: TorState,

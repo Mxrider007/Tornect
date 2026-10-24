@@ -42,7 +42,9 @@ const TOKEN_TRIM: [char; 22] = [
     '’', '«', '»',
 ];
 
-/// A text of at most this many whitespace-separated tokens may be one typed ID.
+/// A text of at most this many whitespace-separated tokens may be one typed ID;
+/// a longer one only when it is nothing but an ID in smaller groups
+/// ([`grouped_id_shape`]).
 const MAX_TYPED_TOKENS: usize = 8;
 
 /// The [`TornectId::display_groups`] form: seven groups of eight characters.
@@ -222,7 +224,9 @@ pub fn parse_link(s: &str) -> Result<TornectId, IdProblem> {
 ///    U+200D, U+2060, U+FEFF) are removed, never bidi controls;
 /// 3. surrounding whitespace is trimmed; nothing left is [`IdProblem::Empty`];
 /// 4. one `tornect:` token is a link, read by [`parse_link`];
-/// 5. at most eight tokens without `:` or `/` are a typed ID, read without its
+/// 5. at most eight tokens without `:` or `/`, or more tokens of nothing but ASCII
+///    letters, digits and hyphens that make exactly 56 characters (an ID written
+///    in smaller groups, such as fours), are a typed ID, read without its
 ///    whitespace and hyphens and with one optional `.onion`;
 /// 6. otherwise, and when step 5 failed, the text is searched: `tornect:` tokens
 ///    (any malformed one fails the whole text), 56-character tokens and seven
@@ -275,9 +279,32 @@ fn has_scheme(s: &str) -> bool {
         .is_some_and(|p| p.eq_ignore_ascii_case(PREFIX))
 }
 
-/// Step 5's condition: few enough tokens, none of them part of a URL.
+/// Step 5's condition: no token part of a URL, and few enough tokens or an ID
+/// in smaller groups.
 fn typed_shape(text: &str) -> bool {
-    text.split_whitespace().nth(MAX_TYPED_TOKENS).is_none() && !text.contains([':', '/'])
+    !text.contains([':', '/'])
+        && (text.split_whitespace().nth(MAX_TYPED_TOKENS).is_none() || grouped_id_shape(text))
+}
+
+/// Whether a text of more than [`MAX_TYPED_TOKENS`] tokens is still one ID in
+/// smaller groups (`qf3v pdjw …`, as `TornectId::from_str` reads it): only ASCII
+/// letters, digits, hyphens and whitespace, with one optional `.onion` at the
+/// end, and exactly 56 letters and digits. A sentence almost never has that
+/// count, so its reading stays step 6's, with step 6's problem (`NoId` or a
+/// candidate's), not a typed length.
+fn grouped_id_shape(text: &str) -> bool {
+    let body = strip_suffix_ignore_case(text, ONION).unwrap_or(text);
+    let mut count = 0usize;
+    for c in body.chars() {
+        if c.is_whitespace() || c == '-' {
+            continue;
+        }
+        if !c.is_ascii_alphanumeric() {
+            return false;
+        }
+        count += 1;
+    }
+    count == ONION_V3_ADDR_LEN
 }
 
 /// Step 5: the text as one typed ID.
@@ -588,9 +615,67 @@ mod tests {
             format!("  {groups}\n"),
             format!("{groups}.onion"),
             format!("{}\n{}", &body[..28], &body[28..]),
+            grouped(&body, 4, " "),
+            grouped(&body, 4, "-"),
+            grouped(&body, 4, " - "),
+            format!("{}.onion", grouped(&body, 4, " ")),
+            format!("{} .ONION", grouped(&body.to_ascii_uppercase(), 4, " ")),
+            grouped(&body, 2, " "),
+            grouped(&body, 1, "\n"),
         ] {
             assert_eq!(find_id(&input), typed(id, false), "{input:?}");
         }
+    }
+
+    /// `body` in groups of `size`, joined by `sep`.
+    fn grouped(body: &str, size: usize, sep: &str) -> String {
+        body.as_bytes()
+            .chunks(size)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join(sep)
+    }
+
+    /// More than eight tokens are a typed ID only when they are nothing but 56
+    /// letters and digits (an ID in smaller groups): its problems are then the
+    /// typed reading's; any other count leaves the reading to the free-text
+    /// search, as a sentence's.
+    #[test]
+    fn find_id_reads_an_id_in_small_groups_as_typed() {
+        use IdProblem::*;
+        let id = a();
+        let body = id.base32();
+        let fours = |s: &str| grouped(s, 4, " ");
+        let zero = format!("{}0{}", &body[..5], &body[6..]);
+        let cases: Vec<(String, IdProblem)> = vec![
+            (fours(&checksum_typo(&id)), Checksum),
+            (fours(&version_2(&id)), Version),
+            (fours(&not_a_key().base32()), NotAKey),
+            (fours(&zero), NeverDigit),
+            // 55 or 57 characters, or a stray character: not an ID's shape, so
+            // the text is searched, and holds none.
+            (fours(&body[..55]), NoId),
+            (fours(&format!("{body}a")), NoId),
+            (fours(&format!("{}!{}", &body[..20], &body[21..])), NoId),
+        ];
+        for (input, problem) in cases {
+            assert!(input.split_whitespace().count() > MAX_TYPED_TOKENS);
+            assert_eq!(find_id(&input), Err(problem), "{input:?}");
+        }
+        // A sentence of exactly 56 letters is read as typed, and then searched.
+        let sentence = "please do connect to my computer when you can my friends thanks a lot";
+        assert_eq!(
+            sentence.chars().filter(char::is_ascii_alphanumeric).count(),
+            56
+        );
+        assert!(matches!(
+            find_id(sentence),
+            Err(Version | Checksum | NotAKey)
+        ));
+        assert_eq!(
+            find_id(&format!("{sentence} {}", id.display_groups())),
+            text(id)
+        );
     }
 
     #[test]
@@ -719,6 +804,23 @@ mod tests {
         assert_eq!(find_id(&broken), Err(LinkExtras));
         let foreign = invitation(&ida).replace(&link(&ida), "tornect://abc");
         assert_eq!(find_id(&foreign), Err(Short { found: 3 }));
+        // A bare scheme word is a link of no characters, and fails the text
+        // around a valid ID with it (§4.2 step 6a): the counter a link being
+        // typed shows, kept as the design words it.
+        let body = ida.base32();
+        assert_eq!(
+            find_id(&format!("tornect: {body}")),
+            Err(Short { found: 0 })
+        );
+        assert_eq!(
+            find_id(&format!("my Tornect: {}", ida.display_groups())),
+            Err(Short { found: 0 })
+        );
+        // A Markdown link is one token, longer than any link.
+        assert_eq!(
+            find_id(&format!("[tornect://{body}](tornect://{body})")),
+            Err(LinkExtras)
+        );
     }
 
     #[test]
@@ -937,6 +1039,11 @@ mod tests {
                 found(Source::Typed, false),
             ),
             (
+                seed!("grouped-fours.txt"),
+                Err(NotALink),
+                found(Source::Typed, false),
+            ),
+            (
                 seed!("onion.txt"),
                 Err(NotALink),
                 found(Source::Typed, false),
@@ -987,6 +1094,7 @@ mod tests {
         assert_eq!(seed!("invitation.txt").1, invitation(&a()));
         assert_eq!(seed!("link.txt").1, link(&a()));
         assert_eq!(seed!("grouped.txt").1, a().display_groups());
+        assert_eq!(seed!("grouped-fours.txt").1, grouped(&a().base32(), 4, " "));
         assert_eq!(seed!("not-a-key.txt").1, not_a_key().display_groups());
         assert_eq!(seed!("version-2.txt").1, version_2(&a()));
         assert_eq!(seed!("checksum.txt").1, checksum_typo(&a()));
@@ -1073,6 +1181,19 @@ mod tests {
         fn groups_are_a_typed_id(id in valid_id()) {
             prop_assert_eq!(find_id(&id.display_groups()), typed(id, false));
             prop_assert_eq!(find_id(&id.onion_address()), typed(id, false));
+        }
+
+        /// An ID in groups of any size, joined by whitespace or hyphens, is a
+        /// typed ID, as `TornectId::from_str` reads it.
+        #[test]
+        fn any_grouping_is_a_typed_id(
+            id in valid_id(),
+            size in 1..=56usize,
+            sep in proptest::sample::select(vec![" ", "-", "  ", " - ", "\n", "\u{a0}"]),
+        ) {
+            let input = grouped(&id.base32(), size, sep);
+            prop_assert_eq!(input.parse::<TornectId>(), Ok(id));
+            prop_assert_eq!(find_id(&input), typed(id, false));
         }
 
         /// Arbitrary text up to 8 KiB (2048 characters of up to four bytes).
