@@ -562,8 +562,10 @@ impl AttemptLimiter {
     /// Settle the pending charge. `Ok`: revert the own charge, snapshot the
     /// [`FailSummary`] (`None` when zero prior failures), reset `consecutive`, clear the
     /// lock (and the hard lock this very charge armed while `since_unlock < 60`), set
-    /// `last_used`, auto-renew the expiry. `Fail`: `pending = false`, counters kept,
-    /// both anchors `:= max(stored, now)`.
+    /// `last_used` — unless the reconnect cooldown of the session it records is still
+    /// running, which [`Self::post_f2`] then answers `COOLDOWN` — auto-renew the
+    /// expiry. `Fail`: `pending = false`, counters kept, both anchors `:= max(stored,
+    /// now)`.
     pub fn settle(
         &self,
         device: &DeviceId,
@@ -609,12 +611,18 @@ impl AttemptLimiter {
                         g.fail.hard_locked = false;
                     }
                     rt.armed_hard_lock = false;
-                    let transport = g.last_used.map_or(TransportKind::TorRelay, |l| l.transport);
-                    g.last_used = Some(LastUsed {
-                        at: now,
-                        transport,
-                        duration_secs: 0,
-                    });
+                    // The reconnect cooldown (§B.8.6.4) is judged after this, post-F2,
+                    // on `last_used`: while it runs, the full-length session it records
+                    // must still be there, or the cooldown could never refuse.
+                    if reconnect_cooldown(g, now).is_none() {
+                        let transport =
+                            g.last_used.map_or(TransportKind::TorRelay, |l| l.transport);
+                        g.last_used = Some(LastUsed {
+                            at: now,
+                            transport,
+                            duration_secs: 0,
+                        });
+                    }
                     if g.auto_renew
                         && let (Some(exp), Some(span)) = (g.expires_at, g.renew_span_s())
                     {

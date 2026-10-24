@@ -2688,6 +2688,79 @@ fn post_f2_helpers_compute_schedule_cooldown_and_ends_at() {
     assert_eq!(g.transport_policy(true, true), Err(TransportConflict));
 }
 
+/// B12: the reconnect cooldown of §B.8.6.4 on the real sequence of calls — charge,
+/// settle(Ok), the session's start and end on the grant, then the next charge,
+/// settle(Ok) and the limiter's own `post_f2`. `settle(Ok)` used to rewrite
+/// `last_used` with a zero duration before `post_f2` read it, so the cooldown could
+/// never refuse; a short session still leaves no cooldown.
+#[test]
+fn b12_a_full_length_session_is_followed_by_the_reconnect_cooldown() {
+    let env = Env::new();
+    let store = env.open();
+    let d = dev(1);
+    let _guard = enable(&env, &store, d, Preset::HelpingSomeone);
+    let utc = FixedOffset::utc();
+    let lim = AttemptLimiter::new(store.clone());
+    let g = store.grant(&d).unwrap();
+    assert_eq!(
+        (g.max_session_secs, g.reconnect_cooldown_s),
+        (Some(4 * 3600), 600)
+    );
+    env.advance(13 * H); // past the 12 h cooling-off
+    let connect = || {
+        lim.charge(&d).unwrap();
+        lim.settle(&d, Settle::Ok).unwrap();
+        lim.post_f2(&d, &utc, HostTransport::default())
+    };
+
+    // A session that runs the full four hours.
+    assert!(connect().is_ok());
+    let started = env.clock.wall();
+    store
+        .record_session_start(&d, TransportKind::TorRelay)
+        .unwrap();
+    env.advance(4 * H);
+    store
+        .record_session_end(&d, TransportKind::TorRelay, 4 * 3600)
+        .unwrap();
+    let last = store.grant(&d).unwrap().last_used.unwrap();
+    assert_eq!((last.at, last.duration_secs), (started, 4 * 3600));
+
+    // At once, and halfway through: refused, with the time left.
+    assert_eq!(
+        connect(),
+        Err(PostF2Reject::Cooldown { retry_after_s: 600 })
+    );
+    env.advance(300);
+    assert_eq!(
+        connect(),
+        Err(PostF2Reject::Cooldown { retry_after_s: 300 })
+    );
+    assert_eq!(
+        store.grant(&d).unwrap().last_used,
+        Some(last),
+        "a success refused by the cooldown leaves the session it was refused for"
+    );
+    assert_eq!(fail_of(&store, &d).consecutive, 0, "the password was right");
+
+    // Once it has run out, the next session goes through and is the one recorded.
+    env.advance(300);
+    assert!(connect().is_ok());
+    let resumed = env.clock.wall();
+    assert_eq!(
+        store.grant(&d).unwrap().last_used.map(|l| l.at),
+        Some(resumed)
+    );
+    store
+        .record_session_start(&d, TransportKind::TorRelay)
+        .unwrap();
+    env.advance(H);
+    store
+        .record_session_end(&d, TransportKind::TorRelay, 3600)
+        .unwrap();
+    assert!(connect().is_ok(), "a one-hour session leaves no cooldown");
+}
+
 #[test]
 fn status_report_and_wipe_all() {
     let env = Env::new();
