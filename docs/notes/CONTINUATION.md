@@ -123,8 +123,8 @@ and the two live Tor tests.
    readiness (`systemctl --user show -p LoadState` and the target's state); slice-F P-1 (a cool-down read from
    `sessions.log`); F1-2's residuals (a DACL and a held handle, or COM registration with no file); N-2 (ACLs and
    junctions in the location checks); N-3's extras (the trigger's `<UserId>`; only a SID or a qualified name as the
-   principal); slice-E P-1 (CFG and CET); E3-2; **E3-4 before 2026-10-26** (bound `EXPKEYSIG` by the signature's
-   date; refresh the key file with the next Tor Browser bump); E3-5; P3-I1 … P3-I3.
+   principal); slice-E P-1 (CFG and CET); E3-2; E3-4 (done 2026-10-24: `EXPKEYSIG` is bounded by the signature's
+   creation time; refresh the key file with the next Tor Browser bump); E3-5; P3-I1 … P3-I3.
 7. **The unattended client CLI** (`tornect connect --unattended`: a password prompt and a `hosts.toml`-backed
    `ServerKeyPin`); the §B.8.14 M1 acceptance needs it. Before unattended connects are wired on Wayland (Security
    §10, M1-48): the §B.8.8 budget (a 5 s dialog, and no dialog at all without a valid token: `HOST_NOT_READY`),

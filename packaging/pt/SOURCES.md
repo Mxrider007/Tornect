@@ -60,7 +60,11 @@ recipe below for one Tor Browser version, with every value above compiled into `
 3. The detached signature (`.asc`) is checked with the key file above alone: `gpg --dearmor`, then
    `gpgv --status-fd` in an empty home directory. Accepted: gpgv's success, a `VALIDSIG` whose
    primary key is `EF6E…8290`, and `GOODSIG`, or `EXPKEYSIG` for a signature made while the signing
-   subkey was valid. `BADSIG`, `ERRSIG`, `NO_PUBKEY`, `REVKEYSIG` and `EXPSIG` refuse. Without `gpg`
+   subkey was valid: gpgv says `EXPKEYSIG` for any signature by a key expired now, so pt-fetch reads
+   each key's expiry from the key file (`gpg --show-keys --with-colons`) and accepts it only when
+   the signature's creation time (`VALIDSIG`) is before the expiry of the signing subkey and of its
+   primary key (review finding E3-4). `BADSIG`, `ERRSIG`, `NO_PUBKEY`, `REVKEYSIG` and `EXPSIG`
+   refuse. Without `gpg`
    and `gpgv` on `PATH` the run prints "signature NOT CHECKED" and relies on the SHA-256 pins.
 4. `tar` extracts only the two members into a scratch directory; each must match its pin, and the
    copy placed under `target/pt/<os>/` (at the member's path in the tarball, mode 0755 or 0644) is
