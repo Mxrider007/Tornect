@@ -37,6 +37,9 @@ particular:
   account (`docs/PLAN.md` §B.8.2, T9);
 - the signaling and media protocols and their parsers, the encrypted stores, `sessions.log`;
 - capture and input injection (what a viewer can see or do beyond what was granted);
+- `tornect:` links and invitations: a link or a pasted text that connects, pairs, answers or
+  starts hosting by itself, and the link registrations `tornect install` writes
+  (`docs/PLAN.md` §B.6, *Links never act*);
 - the release tooling's checks (`xtask`: the lyrebird signature and SHA-256 pins, the build
   record).
 
@@ -55,6 +58,13 @@ The design these protect is in [`docs/PLAN.md`](docs/PLAN.md) §B.6 and §B.8.
 - A person at the host who accepts a session on purpose.
 - The plain IP address a peer learns in a mode that sends media directly, which the design
   documents (no such mode is built yet).
+
+## Where Tornect comes from
+
+Tornect's release zips and their `SHA256SUMS` are published only at
+<https://github.com/Mxrider007/Tornect/releases>, the download location an invitation names. A
+copy offered anywhere else, or an invitation whose download link points anywhere else, may not
+be Tornect.
 
 ## No bug bounty
 
