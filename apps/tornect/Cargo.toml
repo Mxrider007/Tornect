@@ -1,6 +1,6 @@
 [package]
 name = "tornect"
-description = "Tornect — decentralized remote desktop & game streaming over Tor rendezvous + direct QUIC"
+description = "Tornect — remote desktop over Tor onion services: no servers, no accounts, no port forwarding"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

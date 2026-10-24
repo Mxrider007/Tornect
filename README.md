@@ -10,10 +10,14 @@ channel. Tor is used only for the handshake — media then flows over a direct,
 hole-punched QUIC connection. When punching fails, Tornect streams through Tor
 itself: slower, but it *always* connects.
 
-> **Status: pre-alpha, under active development.** Milestone 0 (bootstrap) is
-> complete; the Tor signaling layer (M1) is next. Nothing here streams pixels yet.
-> See the roadmap below and [`docs/VERIFICATION.md`](docs/VERIFICATION.md) for what
-> has actually been verified on real hardware.
+> **Status: pre-alpha, under active development; no one has audited it.** Today's
+> build is the vertical slice: pairing with a code to compare, the consent question,
+> screen sharing with remote control (software H.264), the window with its sharing
+> banner and Stop, unattended access, and Linux and Windows builds. **Everything,
+> the pictures included, travels over the Tor circuit**: the direct QUIC path this
+> page describes is milestone M2 and not built yet. See the roadmap below and
+> [`docs/VERIFICATION.md`](docs/VERIFICATION.md) for what has actually been verified,
+> and on which machines.
 
 ## Why
 
@@ -94,7 +98,7 @@ one directory — handy for running a host and a client on the same machine.
 | Milestone | Scope | Status |
 |---|---|---|
 | M0 | Workspace, identities, config, keystore, CI, Claude Code kit | ✅ done |
-| M1 | Signaling over Tor: embedded Arti onion service, pairing with SAS, unattended PAKE auth | 🔜 |
+| M1 | Signaling over Tor: embedded Arti onion service, pairing with SAS, unattended PAKE auth | in progress: built, acceptance runs open |
 | M2 | Direct connectivity: candidates, UPnP/NAT-PMP/PCP, STUN, hole punch, key-pinned QUIC, Tor fallback | |
 | M3 | Video pipeline on Linux/Wayland: capture, codecs, packetizer/FEC/jitter/pacer, wgpu render, loopback demo | |
 | M4 | End-to-end streaming between two machines with the minimal GUI | |
@@ -102,6 +106,9 @@ one directory — handy for running a host and a client on the same machine.
 | M6 | Windows and macOS parity | |
 | M7 | Resilience & performance hardening (netem suite, ABR tuning, HDR) | |
 | M8 | Product polish, unattended-access UI, packaging, v0.1 release | |
+
+The vertical slice built parts of M3–M5 (capture, software video, the window, input) ahead of
+M2, so that two machines hold a real session over Tor first; only `m0` is tagged so far.
 
 ## Security
 
