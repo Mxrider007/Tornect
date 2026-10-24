@@ -6,6 +6,7 @@
 mod address_book;
 mod gallery;
 mod home;
+mod id_field;
 mod sessions;
 mod settings;
 pub(super) mod viewer;
@@ -144,7 +145,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use egui::accesskit::{Node, Role};
-    use tornect_core::TornectId;
+    use tornect_core::{TornectId, invite};
     use tornect_signal::pairing::SessionDecision;
 
     use super::super::model::{Check, Hosting, Popup, PopupKind, Setup, TorState};
@@ -728,7 +729,8 @@ mod tests {
     }
 
     /// Add computer takes an ID only once it is one, not this computer's
-    /// own, and saves it with the name typed.
+    /// own, and saves it with the name typed. What is wrong is said with the
+    /// shared field's specific words (design `invite` §2.3).
     #[test]
     fn add_checks_the_id_before_saving() {
         let mut model = with_book(false);
@@ -741,7 +743,7 @@ mod tests {
         let key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]).verifying_key();
         let valid = TornectId::from_public_key(&key);
         for (typed, says) in [
-            ("not an id".to_owned(), Some("That is not a Tornect ID")),
+            ("not an id".to_owned(), Some("7 of 56 characters.")),
             (own.clone(), Some("That is this computer's own ID")),
             (valid.display_groups(), None),
         ] {
@@ -787,7 +789,7 @@ mod tests {
             window.form.connect_to = typed.clone();
             window.pass(Vec::new());
             window.pass(Vec::new());
-            assert!(has_text(&window, home::OWN_ID), "{typed}");
+            assert!(has_text(&window, id_field::OWN_ID), "{typed}");
             assert!(!has_text(&window, "Looks like"), "{typed}");
             assert!(
                 !window.controls().iter().any(|c| c == "Connect anyway"),
@@ -814,9 +816,165 @@ mod tests {
         );
         window.form.connect_to = other.display_groups();
         window.pass(Vec::new());
-        assert!(!has_text(&window, home::OWN_ID));
+        assert!(!has_text(&window, id_field::OWN_ID));
         let connect = window.center("Connect");
         assert_eq!(window.click(connect), vec![Action::Connect(other)]);
+    }
+
+    /// An ID from the key of seed `seed`.
+    fn key_id(seed: u8) -> TornectId {
+        TornectId::from_public_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key(),
+        )
+    }
+
+    /// The right shape and checksum, but 32 bytes that decode to no curve
+    /// point.
+    fn not_a_key() -> TornectId {
+        (0..=u8::MAX)
+            .map(|i| TornectId::from_bytes([i; 32]))
+            .find(|id| id.verifying_key().is_err())
+            .expect("some repeated byte is no curve point")
+    }
+
+    /// The middle of the text field labelled `label`, or of the first text
+    /// field.
+    fn field_at(window: &Window, label: Option<&str>) -> egui::Pos2 {
+        let b = window
+            .nodes
+            .iter()
+            .filter(|n| n.role() == Role::TextInput)
+            .find(|n| label.is_none() || n.label() == label)
+            .and_then(Node::bounds)
+            .expect("the field");
+        egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32)
+    }
+
+    /// Click into the field at `at` and paste `text` there, as a user does.
+    fn paste(window: &mut Window, at: egui::Pos2, text: &str) -> Vec<Action> {
+        let mut actions = window.click(at);
+        actions.extend(window.pass(vec![egui::Event::Paste(text.to_owned())]));
+        actions.extend(window.pass(Vec::new()));
+        actions
+    }
+
+    /// Design `invite` §2.2–§2.3: a whole invitation (its line breaks, as
+    /// egui's single-line paste turns them into spaces) or a link pasted into
+    /// the connect field becomes the ID's groups, which is what Connect then
+    /// dials; the same in Add a computer, whose Save then saves that ID. The
+    /// paste itself asks for nothing.
+    #[test]
+    fn a_pasted_invitation_becomes_its_id() {
+        let id = key_id(7);
+        for text in [invite::invitation(&id), invite::link(&id)] {
+            let mut window = Window::new(at_rest(), Page::Home, egui::Theme::Dark, WIDE);
+            let at = field_at(&window, None);
+            assert!(paste(&mut window, at, &text).is_empty(), "{text}");
+            assert_eq!(window.form.connect_to, id.display_groups(), "{text}");
+            assert!(!window.node("Connect").is_disabled(), "{text}");
+            let connect = window.center("Connect");
+            assert_eq!(window.click(connect), vec![Action::Connect(id)], "{text}");
+        }
+
+        let mut book = Window::new(with_book(false), Page::AddressBook, egui::Theme::Dark, WIDE);
+        let add = book.center("Add computer");
+        assert!(book.click(add).is_empty());
+        book.form.book.adding = Some((String::new(), "Desk".to_owned()));
+        book.pass(Vec::new());
+        let at = field_at(&book, Some("Tornect ID"));
+        assert!(paste(&mut book, at, &invite::invitation(&id)).is_empty());
+        let typed = book
+            .form
+            .book
+            .adding
+            .as_ref()
+            .map(|(typed, _)| typed.clone());
+        assert_eq!(typed, Some(id.display_groups()));
+        let save = book.center("Save");
+        assert_eq!(
+            book.click(save),
+            vec![Action::SaveEntry(id, "Desk".to_owned())]
+        );
+    }
+
+    /// A pasted ID with a zero-width space a chat inserted is rewritten to
+    /// the groups (so the field shows what will be dialled); one pasted
+    /// cleanly stays as it was pasted.
+    #[test]
+    fn a_pasted_id_with_a_zero_width_space_is_rewritten() {
+        let id = key_id(7);
+        let bare = id.to_string();
+        let (head, tail) = bare.split_at(20);
+        for (text, shown) in [
+            (format!("{head}\u{200B}{tail}"), id.display_groups()),
+            (bare.clone(), bare.clone()),
+        ] {
+            let mut window = Window::new(at_rest(), Page::Home, egui::Theme::Light, WIDE);
+            let at = field_at(&window, None);
+            assert!(paste(&mut window, at, &text).is_empty());
+            assert_eq!(window.form.connect_to, shown);
+            let connect = window.center("Connect");
+            assert_eq!(window.click(connect), vec![Action::Connect(id)]);
+        }
+    }
+
+    /// Design `invite` §2.2–§2.3, §3: Home and the address book say what is
+    /// wrong with an ID with the same specific words, and neither takes it:
+    /// a short ID, a digit base32 never has, a link with more than the ID,
+    /// two IDs, an ID that is no key (new on Home) and this computer's own.
+    #[test]
+    fn id_problems_on_home_and_in_the_book() {
+        let mut model = with_book(false);
+        let own = key_id(6);
+        model.id = Some(own.display_groups());
+        let (a, b) = (key_id(7), key_id(8));
+        let zero = format!("{}0", &a.to_string()[..55]);
+        let rows = [
+            ("abcdefgh".to_owned(), "8 of 56 characters.".to_owned()),
+            (
+                zero,
+                "IDs never contain 0, 1, 8 or 9 (perhaps the letter o, i, l, b or g).".to_owned(),
+            ),
+            (
+                format!("{}?x=1", invite::link(&a)),
+                "That link holds more than a Tornect ID; Tornect takes only tornect://<ID>."
+                    .to_owned(),
+            ),
+            (
+                format!("{} {}", invite::link(&a), invite::link(&b)),
+                "That text holds more than one Tornect ID: paste only the one you want.".to_owned(),
+            ),
+            (
+                not_a_key().display_groups(),
+                "That ID has the right shape but is no computer's key: check for a typo."
+                    .to_owned(),
+            ),
+            (own.display_groups(), id_field::OWN_ID.to_owned()),
+        ];
+        let mut home = Window::new(model.clone(), Page::Home, egui::Theme::Dark, WIDE);
+        let mut book = Window::new(model, Page::AddressBook, egui::Theme::Dark, NARROW);
+        let add = book.center("Add computer");
+        assert!(book.click(add).is_empty());
+        for (typed, says) in &rows {
+            home.form.connect_to = typed.clone();
+            book.form.book.adding = Some((typed.clone(), "Desk".to_owned()));
+            for window in [&mut home, &mut book] {
+                window.pass(Vec::new());
+                window.pass(Vec::new());
+                assert!(has_text(window, says), "{typed}: {says}");
+            }
+            assert!(home.node("Connect").is_disabled(), "{typed}");
+            let connect = home.center("Connect");
+            assert!(home.click(connect).is_empty(), "{typed}");
+            assert!(book.node("Save").is_disabled(), "{typed}");
+            let save = book.center("Save");
+            assert!(book.click(save).is_empty(), "{typed}");
+            assert_eq!(home.form.connect_to, *typed, "a refusal is never rewritten");
+        }
+        // The empty field says nothing at all.
+        home.form.connect_to.clear();
+        home.pass(Vec::new());
+        assert!(!has_text(&home, "No Tornect ID was given"));
     }
 
     /// Rename starts from the saved name and saves what was typed.

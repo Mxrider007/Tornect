@@ -7,7 +7,6 @@
 use std::time::{Duration, Instant};
 
 use egui::{Align, Layout, Margin, RichText, Stroke, Ui, vec2};
-use tornect_core::TornectId;
 
 use super::super::icons::{self, Icon};
 use super::super::model::{ClientStage, Computer, Failure, Hosting, Model, Setup, TorState};
@@ -15,7 +14,7 @@ use super::super::nav::Page;
 use super::super::theme::{self, Face, Tokens};
 use super::super::view::{Action, Form, SAS_SIZE};
 use super::super::widgets::{self, Button, Kind, Tone};
-use super::{day_in_sentence, day_text};
+use super::{day_in_sentence, day_text, id_field};
 
 /// Home's first-run line: history is off until switched on, and the
 /// session log is kept either way (F4-M1): the host side records every
@@ -28,10 +27,6 @@ pub(super) const HISTORY_NOTICE: &str = "Tornect keeps no list of your recent co
 /// The first run's question (the redesign's First run), asked before
 /// anything sends this computer's name.
 pub(super) const NAME_QUESTION: &str = "What should other devices call this computer?";
-
-/// What the connect field says of this computer's own ID (B26), as Add
-/// computer does.
-pub(super) const OWN_ID: &str = "That is this computer's own ID.";
 
 /// Home's sticky badge while a readiness row is not green and unattended
 /// access is on (§B.8.7.1 ⑥).
@@ -493,43 +488,37 @@ fn connect_card(
         let top = ui.cursor().top();
         ui.set_min_height((min_height - CARD_FRAME_HEIGHT).max(0.0));
         widgets::section_header(ui, "Connect to a computer");
-        ui.label(
-            RichText::new("Its Tornect ID (56 characters; “.onion” is optional)")
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Its Tornect ID or a tornect:// link (a whole invitation can be pasted)",
+                )
                 .font(theme::font(ui.ctx(), Face::Regular, 12.0))
                 .color(t.text_muted),
+            )
+            .wrap(),
         );
         let idle = matches!(model.client, ClientStage::Idle | ClientStage::Ended(_));
         let field = widgets::text_field(
             ui,
             &mut form.connect_to,
-            "Paste a Tornect ID",
+            "Paste a Tornect ID or an invitation",
             true,
             ui.available_width(),
         );
-        let parsed = form.connect_to.trim().parse::<TornectId>();
-        // This computer's own ID connects nowhere (B26): it would ask this
-        // computer for a session with itself.
-        let own = model
-            .id
-            .as_deref()
-            .and_then(|groups| groups.parse::<TornectId>().ok());
-        let is_own = parsed.as_ref().is_ok_and(|id| Some(*id) == own);
-        let ready = model.tor.is_ready() && idle && parsed.is_ok() && !is_own;
-        let problem = if form.connect_to.trim().is_empty() {
-            None
-        } else if parsed.is_err() {
-            Some("That is not a Tornect ID: 56 letters a–z and digits 2–7.")
-        } else if is_own {
-            Some(OWN_ID)
-        } else {
-            None
-        };
-        if let Some(problem) = problem {
-            ui.label(
-                RichText::new(problem)
-                    .font(theme::font(ui.ctx(), Face::Regular, 12.0))
-                    .color(t.danger_text),
-            );
+        // The ID in any written form, a link or a whole invitation (design
+        // `invite` §2.2); this computer's own ID connects nowhere (B26): it
+        // would ask this computer for a session with itself.
+        let own = model.own_id();
+        let mut checked = id_field::check(&form.connect_to, own);
+        if id_field::normalize(&mut form.connect_to, &checked, field.changed()) {
+            checked = id_field::check(&form.connect_to, own);
+        }
+        let parsed = checked.as_ref().ok().map(|found| found.id);
+        let is_own = checked == Err(id_field::Problem::Own);
+        let ready = model.tor.is_ready() && idle && parsed.is_some();
+        if let Err(problem) = &checked {
+            id_field::problem_line(ui, t, problem);
         }
         let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         // The look-alike warning for the ID in the field (§B.6.1 item 4):
@@ -538,11 +527,11 @@ fn connect_card(
         let warned = model
             .connect_warning
             .as_ref()
-            .filter(|w| !is_own && parsed.as_ref().is_ok_and(|id| *id == w.id));
+            .filter(|w| !is_own && parsed == Some(w.id));
         // Or it could not be compared with every saved ID (F-4).
         let unchecked = model
             .connect_unchecked
-            .filter(|u| !is_own && parsed.as_ref().is_ok_and(|id| id == u));
+            .filter(|u| !is_own && parsed == Some(*u));
         let second_click = warned.map(|w| w.id).or(unchecked);
         if let Some(warning) = warned {
             // Never the saved name while this screen may be in a picture
@@ -593,9 +582,9 @@ fn connect_card(
                     .show(ui)
                     .clicked();
                 if (clicked || (entered && ready))
-                    && let Ok(id) = &parsed
+                    && let Some(id) = parsed
                 {
-                    actions.push(Action::Connect(*id));
+                    actions.push(Action::Connect(id));
                 }
             }
             if !model.tor.is_ready() {

@@ -258,6 +258,14 @@ pub struct Model {
 }
 
 impl Model {
+    /// This computer's own ID, read from [`Model::id`]'s groups; `None`
+    /// before it is known. The ID fields refuse it (B26) and Copy
+    /// invitation copies it.
+    #[must_use]
+    pub fn own_id(&self) -> Option<TornectId> {
+        self.id.as_deref().and_then(|groups| groups.parse().ok())
+    }
+
     /// The host's notice code as the stream window may use it: in a control
     /// session only, so a view-only window shows nothing a host sends.
     #[must_use]
@@ -1521,5 +1529,20 @@ mod tests {
         model.end_notices();
         assert_eq!(model.host_notice, None);
         assert_eq!(model.viewer_notice(), None);
+    }
+
+    /// The own ID is read from the groups the window shows; none before it
+    /// is known, and none from text that is no ID.
+    #[test]
+    fn the_own_id_is_read_from_its_groups() {
+        let id = TornectId::from_public_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[6; 32]).verifying_key(),
+        );
+        let mut model = Model::default();
+        assert_eq!(model.own_id(), None);
+        model.id = Some(id.display_groups());
+        assert_eq!(model.own_id(), Some(id));
+        model.id = Some("not created yet".to_owned());
+        assert_eq!(model.own_id(), None);
     }
 }

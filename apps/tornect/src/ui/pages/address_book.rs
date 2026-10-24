@@ -16,7 +16,7 @@ use super::super::nav::Page;
 use super::super::theme::{self, Face, Tokens};
 use super::super::view::{Action, Form};
 use super::super::widgets::{self, Button, Kind, Tone};
-use super::{day_in_sentence, day_text};
+use super::{day_in_sentence, day_text, id_field};
 use crate::ua_client::AdminAction;
 
 /// The page's tabs.
@@ -871,12 +871,11 @@ fn forget_row(
     }
 }
 
-/// The Add computer form: an ID (checked as it is typed) and a name.
+/// The Add computer form: an ID (checked as it is typed, read as Home's
+/// connect field reads it: any written form, a link or a whole invitation,
+/// never this computer's own) and a name. Links never fill it.
 fn add_card(ui: &mut Ui, t: &Tokens, model: &Model, form: &mut Form, actions: &mut Vec<Action>) {
-    let own = model
-        .id
-        .as_deref()
-        .and_then(|groups| groups.parse::<TornectId>().ok());
+    let own = model.own_id();
     let mut done = None;
     widgets::card(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -890,32 +889,25 @@ fn add_card(ui: &mut Ui, t: &Tokens, model: &Model, form: &mut Form, actions: &m
             "Saved on this computer only. The first connection to it still compares a 6-digit \
              code on both screens.",
         );
-        let field = widgets::text_field(ui, id_text, "Its Tornect ID", true, ui.available_width());
+        let field = widgets::text_field(
+            ui,
+            id_text,
+            "Its Tornect ID or invitation",
+            true,
+            ui.available_width(),
+        );
         field.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Tornect ID"));
-        let parsed = id_text.trim().parse::<TornectId>();
-        let problem = match &parsed {
-            _ if id_text.trim().is_empty() => None,
-            Err(_) => Some("That is not a Tornect ID: 56 letters a–z and digits 2–7."),
-            Ok(id) if id.verifying_key().is_err() => {
-                Some("That ID has the right shape but is no computer's key: check for a typo.")
-            }
-            Ok(id) if Some(*id) == own => Some("That is this computer's own ID."),
-            Ok(_) => None,
-        };
-        if let Some(problem) = problem {
-            ui.label(
-                RichText::new(problem)
-                    .font(theme::font(ui.ctx(), Face::Regular, 12.0))
-                    .color(t.danger_text),
-            );
+        let mut checked = id_field::check(id_text, own);
+        if id_field::normalize(id_text, &checked, field.changed()) {
+            checked = id_field::check(id_text, own);
+        }
+        if let Err(problem) = &checked {
+            id_field::problem_line(ui, t, problem);
         }
         let name_field =
             widgets::text_field(ui, name, "A name for it", false, ui.available_width());
         name_field.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Name"));
-        let valid = parsed
-            .as_ref()
-            .ok()
-            .filter(|_| problem.is_none() && !id_text.trim().is_empty());
+        let valid = checked.ok().map(|found| found.id);
         ui.horizontal(|ui| {
             if Button::new(Kind::Primary, "Save")
                 .enabled(valid.is_some())
@@ -923,7 +915,7 @@ fn add_card(ui: &mut Ui, t: &Tokens, model: &Model, form: &mut Form, actions: &m
                 .clicked()
                 && let Some(id) = valid
             {
-                done = Some(Some((*id, name.trim().to_owned())));
+                done = Some(Some((id, name.trim().to_owned())));
             }
             if Button::new(Kind::Ghost, "Cancel").show(ui).clicked() {
                 done = Some(None);
