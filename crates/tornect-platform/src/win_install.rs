@@ -11,7 +11,9 @@
 //! written only where `RegCreateKeyExW` created the key, deleted with
 //! `RegDeleteTreeW` and `RegDeleteKeyW`), and each elevated step through
 //! Windows' prompt with the program and parameters of [`elevated_command`].
-//! Type-checked only: NEEDS-DEVICE(windows).
+//! The registration's calls run in this crate's Windows tests (under Wine
+//! here, on a key of the test's own); the rest is type-checked only:
+//! NEEDS-DEVICE(windows).
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
@@ -981,4 +983,175 @@ pub fn show_message(text: &str, warning: bool) {
             MB_OK | icon | MB_SETFOREGROUND,
         )
     };
+}
+
+/// The link registration's calls on real registry keys (run under Wine here,
+/// and on Windows), each test on a key of its own under
+/// `HKEY_CURRENT_USER\Software\TornectTest`, never on a registration of
+/// `tornect:` links; what a test leaves is deleted when it ends.
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::System::Registry::{REG_DWORD, REG_EXPAND_SZ, REG_VALUE_TYPE};
+
+    use super::*;
+
+    /// Where every test key is.
+    const TEST_ROOT: &str = "Software\\TornectTest";
+
+    /// A key of the test's own, `<TEST_ROOT>\<pid>-<name>\tornect`, and its
+    /// parent, deleted with what it holds before the test and after it.
+    struct TestKey {
+        parent: String,
+        path: String,
+    }
+
+    impl TestKey {
+        fn new(name: &str) -> Self {
+            let parent = format!("{TEST_ROOT}\\{}-{name}", std::process::id());
+            let _ = delete_key_tree_at(&parent);
+            Self {
+                path: format!("{parent}\\tornect"),
+                parent,
+            }
+        }
+
+        fn command_key(&self) -> String {
+            format!("{}\\{URL_COMMAND_KEY}", self.path)
+        }
+    }
+
+    impl Drop for TestKey {
+        fn drop(&mut self) {
+            let _ = delete_key_tree_at(&self.parent);
+            let root = wide(TEST_ROOT);
+            // SAFETY: a predefined key and a NUL-terminated name; the root
+            // goes only once no other test holds a key under it (else the
+            // call fails, and the result is not needed).
+            unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, root.as_ptr()) };
+        }
+    }
+
+    /// The string value `name` (`None`: the default value) of `HKCU\<path>`,
+    /// without its trailing NULs; `None` when it cannot be read.
+    fn read_string(path: &str, name: Option<&str>) -> Option<String> {
+        let path = wide(path);
+        let name = name.map(wide);
+        let mut units = vec![0u16; 1024];
+        let mut size = u32::try_from(units.len() * 2).unwrap();
+        // SAFETY: a predefined key; the path NUL-terminated, the name
+        // NUL-terminated or null; `units` is writable for `size` bytes.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                path.as_ptr(),
+                name.as_ref().map_or(null(), |n| n.as_ptr()),
+                RRF_RT_REG_SZ,
+                null_mut(),
+                units.as_mut_ptr().cast::<c_void>(),
+                &mut size,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+        units.truncate(size as usize / 2);
+        while units.last() == Some(&0) {
+            units.pop();
+        }
+        Some(String::from_utf16(&units).unwrap())
+    }
+
+    /// Set the default value of `key` to `data` as type `kind`.
+    fn set_raw(key: &Key, kind: REG_VALUE_TYPE, data: &[u8]) {
+        // SAFETY: `key` is open with KEY_SET_VALUE; `data` is `data.len()`
+        // bytes; the default value (no name).
+        let status = unsafe {
+            RegSetValueExW(
+                key.0,
+                null(),
+                0,
+                kind,
+                data.as_ptr(),
+                u32::try_from(data.len()).unwrap(),
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+    }
+
+    /// `text` as a NUL-terminated UTF-16 value, in bytes.
+    fn utf16_bytes(text: &str) -> Vec<u8> {
+        wide(text)
+            .iter()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect()
+    }
+
+    /// Design `invite` §4.5: an absent key reads `Absent`; a write creates
+    /// it with exactly its name, an empty `URL Protocol` and the command,
+    /// which reads back as it was written; a second write finds the key there
+    /// and writes nothing (the `REG_OPENED_EXISTING_KEY` refusal); the delete
+    /// takes the key with all it holds, and a second delete is no error.
+    #[test]
+    fn a_link_registration_is_written_read_and_deleted() {
+        let key = TestKey::new("roundtrip");
+        assert_eq!(url_key_at(&key.path).unwrap(), UrlKey::Absent);
+        let command = "\"C:\\Program Files\\Tornect\\tornect.exe\" open-link -- \"%1\"";
+        write_url_key_at(&key.path, command).unwrap();
+        assert_eq!(
+            url_key_at(&key.path).unwrap(),
+            UrlKey::Command(command.to_owned())
+        );
+        assert_eq!(
+            read_string(&key.path, None).as_deref(),
+            Some("URL:Tornect link")
+        );
+        assert_eq!(
+            read_string(&key.path, Some("URL Protocol")).as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            read_string(&key.command_key(), None).as_deref(),
+            Some(command)
+        );
+        match write_url_key_at(&key.path, "\"C:\\Other\\other.exe\" \"%1\"") {
+            Err(InstallError::Refused(why)) => assert_eq!(why, URL_KEY_APPEARED),
+            other => panic!("written over: {other:?}"),
+        }
+        assert_eq!(
+            url_key_at(&key.path).unwrap(),
+            UrlKey::Command(command.to_owned())
+        );
+        delete_key_tree_at(&key.path).unwrap();
+        assert_eq!(url_key_at(&key.path).unwrap(), UrlKey::Absent);
+        assert_eq!(read_string(&key.path, None), None);
+        delete_key_tree_at(&key.path).unwrap();
+    }
+
+    /// A key whose command cannot be read as one is `Other`, a registration
+    /// left as it is: no `shell\open\command`, one without a default value,
+    /// a `REG_EXPAND_SZ` command (never expanded, so never mistaken for
+    /// Tornect's), a `REG_DWORD`, and a command longer than 4 KiB; a long
+    /// command within the bound reads whole.
+    #[test]
+    fn a_key_without_a_readable_command_is_other() {
+        let key = TestKey::new("other");
+        let _ = create_key(HKEY_CURRENT_USER, &key.path, KEY_SET_VALUE).unwrap();
+        assert_eq!(url_key_at(&key.path).unwrap(), UrlKey::Other);
+        let (command, _) =
+            create_key(HKEY_CURRENT_USER, &key.command_key(), KEY_SET_VALUE).unwrap();
+        assert_eq!(url_key_at(&key.path).unwrap(), UrlKey::Other);
+        set_raw(
+            &command,
+            REG_EXPAND_SZ,
+            &utf16_bytes("\"%ProgramFiles%\\Tornect\\tornect.exe\" open-link -- \"%1\""),
+        );
+        assert_eq!(url_key_at(&key.path).unwrap(), UrlKey::Other);
+        set_raw(&command, REG_DWORD, &1u32.to_le_bytes());
+        assert_eq!(url_key_at(&key.path).unwrap(), UrlKey::Other);
+        set_string(&command, None, &"x".repeat(3000)).unwrap();
+        assert_eq!(url_key_at(&key.path).unwrap(), UrlKey::Other);
+        let long = "x".repeat(1500);
+        set_string(&command, None, &long).unwrap();
+        assert_eq!(url_key_at(&key.path).unwrap(), UrlKey::Command(long));
+    }
 }
