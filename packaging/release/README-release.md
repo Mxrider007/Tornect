@@ -24,6 +24,11 @@ compiled into Tornect.
 
 ## Check the download first
 
+Download Tornect only from https://github.com/Mxrider007/Tornect/releases, the
+one place its zips and `SHA256SUMS` are published, and the one an invitation
+names. A copy offered anywhere else, or a download link someone sends with a
+Tornect ID, may not be Tornect.
+
 The release page lists each zip's SHA-256 in `SHA256SUMS`. With the zip and
 `SHA256SUMS` in one folder:
 

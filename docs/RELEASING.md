@@ -28,6 +28,12 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
    distribution: `LICENSE`, `THIRD_PARTY_NOTICES.md`, lyrebird's notice (`pt/lyrebird.txt`) and
    `THIRD_PARTY_LICENSES.txt`, which `dist` generates per platform (step 2; met since `594711b`,
    `docs/VERIFICATION.md`, *Release tooling*).
+8. The release notes and the zipped `README-release.md` name the one download location,
+   `<repository>/releases` from the workspace `repository` field
+   (https://github.com/Mxrider007/Tornect/releases), the location invitations name (decision
+   M1-73; `docs/PLAN.md` Part E, "Fake or altered invitations"). The xtask test
+   `the_release_docs_name_the_download_location` checks the committed files; a notes file written
+   for a later release keeps the sentence.
 
 ## Steps
 

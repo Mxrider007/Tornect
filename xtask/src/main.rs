@@ -861,6 +861,33 @@ mod tests {
         );
     }
 
+    /// Decision M1-73, Part E "Fake or altered invitations": the zipped
+    /// README and the release notes name the one download location, the
+    /// workspace `repository` field's releases page, which is also what an
+    /// invitation names (`tornect_core::invite::DOWNLOAD_URL`).
+    #[test]
+    fn the_release_docs_name_the_download_location() {
+        let root = workspace_root().unwrap();
+        let read = |rel: &str| std::fs::read_to_string(root.join(rel)).unwrap();
+        let manifest = read("Cargo.toml");
+        let repository = manifest
+            .lines()
+            .find_map(|l| l.strip_prefix("repository = \""))
+            .and_then(|l| l.strip_suffix('"'))
+            .expect("the workspace repository field");
+        assert_eq!(repository, "https://github.com/Mxrider007/Tornect");
+        let location = format!("Download Tornect only from {repository}/releases, the one place");
+        for doc in [
+            "packaging/release/README-release.md",
+            "packaging/release/NOTES-v0.1.0-slice.1.md",
+            "README.md",
+        ] {
+            // Sentences wrap in the files; compare with every run of white space as one space.
+            let text = read(doc).split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(text.contains(&location), "{doc} lacks `{location}`");
+        }
+    }
+
     /// E3-3: the database's commit and date come from its `git log` line.
     #[test]
     fn the_advisory_database_is_named_by_commit_and_date() {

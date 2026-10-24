@@ -86,6 +86,10 @@ Tornect homes on that machine talked to each other over the real Tor network; no
 
 ## Files and checks
 
+Download Tornect only from https://github.com/Mxrider007/Tornect/releases, the one place its zips and
+`SHA256SUMS` are published, and the one an invitation names. A copy offered anywhere else, or a download link
+someone sends with a Tornect ID, may not be Tornect.
+
 | File | Bytes | SHA-256 |
 |---|---|---|
 | `tornect-0.1.0-linux-x86_64.zip` | @@SIZE_LINUX@@ | `@@SHA256_LINUX@@` |
