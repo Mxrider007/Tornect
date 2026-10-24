@@ -1065,7 +1065,8 @@ impl SessionLog {
     ///   a pre-chain (M0) line, or a chained line with `prev = null`. Deleting a prefix
     ///   of the log is therefore "log truncated at the front"; once rotation has
     ///   discarded files the check is bounded to the retained window (10 × 10 MiB).
-    /// * **Torn lines.** A members-less line that is not a complete JSON object is a
+    /// * **Torn lines.** A members-less line that is not a complete JSON object (or
+    ///   not UTF-8 at all: the cut fell inside a multi-byte character) is a
     ///   fragment torn by a crash between `write_all` and `sync_all`. It is tolerated —
     ///   counted in [`ChainReport::torn_lines`] — when the next line is chained and links
     ///   to it (the keyed writer vouched for it by hashing it into `prev`; [`Self::append_chained`]
@@ -1111,14 +1112,32 @@ impl SessionLog {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            for (n, line) in std::io::BufReader::new(f).lines().enumerate() {
-                let line = line?;
-                if line.trim().is_empty() {
+            let mut reader = std::io::BufReader::new(f);
+            let mut raw = Vec::new();
+            for n in 0usize.. {
+                raw.clear();
+                if reader.read_until(b'\n', &mut raw)? == 0 {
+                    break;
+                }
+                // The framing of `BufRead::lines`: the newline, and a CR before it,
+                // are not part of the line.
+                if raw.last() == Some(&b'\n') {
+                    raw.pop();
+                    if raw.last() == Some(&b'\r') {
+                        raw.pop();
+                    }
+                }
+                // A crash mid-append can cut a multi-byte character: such a fragment
+                // is not UTF-8, cannot be a JSON object, and is judged as a torn line
+                // below (hashed as the bytes the next append links to), not an error
+                // that would fail every later start.
+                let text = std::str::from_utf8(&raw).ok();
+                if text.is_some_and(|t| t.trim().is_empty()) {
                     continue;
                 }
                 w.total += 1;
-                let hash = line_hash(line.as_bytes());
-                let parsed = parse_line_chain(&line);
+                let hash = line_hash(&raw);
+                let parsed = text.and_then(parse_line_chain);
                 if let Some((tf, tl)) = pending_torn.take() {
                     let vouched = parsed.as_ref().is_some_and(|c| c.prev == w.prev_hash);
                     if !vouched {
@@ -1130,7 +1149,7 @@ impl SessionLog {
                 match &parsed {
                     None => {
                         if chained_seen {
-                            if is_json_object(&line) {
+                            if text.is_some_and(is_json_object) {
                                 return Ok(w.broken(&name, n + 1, "line without chain members"));
                             }
                             // Torn by a crash mid-append: the next line must link to it.
@@ -1742,6 +1761,68 @@ mod tests {
             .unwrap()
             .write_all(b"{\"ts\":\"x\",\"event\":\"session_ended\"}\n")
             .unwrap();
+        let rep = log2.verify_chain(Some(&h3), None).unwrap();
+        assert!(
+            matches!(rep.status, ChainStatus::Broken { line: 4, .. }),
+            "{rep:?}"
+        );
+    }
+
+    /// B13: a crash that cuts the last line inside a multi-byte character leaves
+    /// bytes that are not UTF-8. The verifier read lines as text and failed with an
+    /// I/O error, which, run at every host start, would have failed every start
+    /// after it; the fragment is now a torn line like any other, tolerated at the
+    /// end and once the next append links to it, and the chain still verifies.
+    #[test]
+    fn a_line_cut_inside_a_character_is_a_torn_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.log");
+        let log = SessionLog::new(&path);
+        log.set_log_key(Some(Zeroizing::new([4u8; 32])));
+        let h1 = log
+            .append_chained(&SessionRecord::now(SessionEvent::GrantCreated))
+            .unwrap();
+        log.append_chained(
+            &SessionRecord::now(SessionEvent::GrantChanged).detail("Zoë's laptop, 東京"),
+        )
+        .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let cut = bytes.windows(2).rposition(|w| w == "ë".as_bytes()).unwrap() + 1;
+        std::fs::write(&path, &bytes[..cut]).unwrap();
+        let fragment =
+            bytes[bytes[..cut].iter().rposition(|b| *b == b'\n').unwrap() + 1..cut].to_vec();
+        assert!(std::str::from_utf8(&fragment).is_err(), "cut inside the ë");
+
+        let rep = log.verify_chain(Some(&h1), None).unwrap();
+        assert_eq!(rep.status, ChainStatus::Valid, "{rep:?}");
+        assert_eq!((rep.lines, rep.torn_lines), (2, 1));
+        assert_eq!(rep.last_hash, Some(line_hash(&fragment)));
+
+        let log2 = SessionLog::new(&path);
+        log2.set_log_key(Some(Zeroizing::new([4u8; 32])));
+        let h3 = log2
+            .append_chained(&SessionRecord::now(SessionEvent::GrantRevoked))
+            .unwrap();
+        let rep = log2.verify_chain(Some(&h1), None).unwrap();
+        assert_eq!(rep.status, ChainStatus::Valid, "{rep:?}");
+        assert_eq!(
+            (rep.lines, rep.torn_lines, rep.tagged_beyond_head),
+            (3, 1, 1)
+        );
+        assert_eq!(rep.last_hash, Some(h3));
+        assert_eq!(
+            log2.read_all().unwrap().len(),
+            2,
+            "readers skip the fragment"
+        );
+
+        // Bytes that are not UTF-8 and that no chained line vouches for still break it.
+        let mut forged = std::fs::read(&path).unwrap();
+        forged.extend_from_slice(b"\xff\xfe{\n");
+        forged.extend_from_slice(
+            b"{\"ts\":\"x\",\"event\":\"grant_created\",\"prev\":null,\"tag\":null}\n",
+        );
+        std::fs::write(&path, &forged).unwrap();
         let rep = log2.verify_chain(Some(&h3), None).unwrap();
         assert!(
             matches!(rep.status, ChainStatus::Broken { line: 4, .. }),

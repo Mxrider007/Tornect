@@ -124,10 +124,14 @@ pub struct ReadinessSnapshot {
     /// The administrator helper registered (r7, Windows, while an admin grant
     /// exists).
     pub admin_helper: Probe,
+    /// `sessions.log` as the host's start-up verifier found it (§B.8.13): a
+    /// warning without a stored head, a failure ("log modified or truncated at
+    /// line N") for a broken chain. Badge only, never `HOST_NOT_READY`.
+    pub session_log: Probe,
 }
 
 /// Field names in wire order (also the CBOR map keys).
-pub const FIELD_NAMES: [&str; 13] = [
+pub const FIELD_NAMES: [&str; 14] = [
     "capture",
     "input",
     "autostart",
@@ -141,6 +145,7 @@ pub const FIELD_NAMES: [&str; 13] = [
     "panic_key",
     "consent_indicator",
     "admin_helper",
+    "session_log",
 ];
 
 /// What each row is called where people read it (§B.8.7.1 ⑥, §B.8.7.4), by
@@ -161,6 +166,7 @@ pub fn row_title(field: &str) -> &'static str {
         "panic_key" => "Panic key",
         "consent_indicator" => "Indicator shown",
         "admin_helper" => "Administrator helper registered",
+        "session_log" => "Session log intact",
         _ => "Unknown row",
     }
 }
@@ -174,7 +180,7 @@ impl ReadinessSnapshot {
 
     /// The rows in wire order.
     #[must_use]
-    pub fn fields(&self) -> [(&'static str, &Probe); 13] {
+    pub fn fields(&self) -> [(&'static str, &Probe); 14] {
         [
             ("capture", &self.capture),
             ("input", &self.input),
@@ -189,6 +195,7 @@ impl ReadinessSnapshot {
             ("panic_key", &self.panic_key),
             ("consent_indicator", &self.consent_indicator),
             ("admin_helper", &self.admin_helper),
+            ("session_log", &self.session_log),
         ]
     }
 
@@ -207,6 +214,7 @@ impl ReadinessSnapshot {
             "panic_key" => &mut self.panic_key,
             "consent_indicator" => &mut self.consent_indicator,
             "admin_helper" => &mut self.admin_helper,
+            "session_log" => &mut self.session_log,
             _ => return None,
         })
     }
@@ -240,7 +248,7 @@ impl<C> minicbor::Encode<C> for ReadinessSnapshot {
         e: &mut Encoder<W>,
         ctx: &mut C,
     ) -> Result<(), minicbor::encode::Error<W::Error>> {
-        e.map(13)?;
+        e.map(FIELD_NAMES.len() as u64)?;
         for (name, probe) in self.fields() {
             e.str(name)?;
             probe.encode(e, ctx)?;
@@ -271,6 +279,38 @@ impl<'b, C> minicbor::Decode<'b, C> for ReadinessSnapshot {
             }
         }
         Ok(out)
+    }
+}
+
+/// The row "Session log intact" from the start-up verifier's answer
+/// ([`GrantStore::verify_log`](super::store::GrantStore::verify_log), §B.8.13).
+/// A broken chain fails ("log modified or truncated at line N", the file named
+/// when the break is inside one); a valid chain without a stored head warns
+/// where a store exists to keep one (`head_expected`: loaded, or failed closed
+/// and so unread) and is fine where none does (an attended-only host keeps no
+/// head); a log that could not be read warns.
+#[must_use]
+pub fn session_log_row(
+    verdict: &Result<crate::session_log::ChainReport, super::store::StoreError>,
+    head_expected: bool,
+) -> Probe {
+    use crate::session_log::ChainStatus;
+    match verdict {
+        Ok(report) => match &report.status {
+            ChainStatus::Valid => Probe::Ok,
+            ChainStatus::MissingHead if head_expected => Probe::Warn(
+                "the log's links hold, but no stored head was there to check its end against"
+                    .to_owned(),
+            ),
+            ChainStatus::MissingHead => Probe::Ok,
+            ChainStatus::Broken { file, line, reason } if file.is_empty() => Probe::Fail(format!(
+                "log modified or truncated at line {line}: {reason}"
+            )),
+            ChainStatus::Broken { file, line, reason } => Probe::Fail(format!(
+                "log modified or truncated at line {line} of {file}: {reason}"
+            )),
+        },
+        Err(e) => Probe::Warn(format!("the log could not be checked: {e}")),
     }
 }
 
@@ -382,6 +422,80 @@ mod tests {
         let bytes = minicbor::to_vec(&long).unwrap();
         let back: Probe = minicbor::decode(&bytes).unwrap();
         assert_eq!(back, Probe::Fail("x".repeat(MAX_PROBE_MESSAGE)));
+    }
+
+    /// B13: the start-up verifier's verdict is the row "Session log intact",
+    /// one more named key (a decoder of the thirteen rows ignores it), badge
+    /// only: a broken chain names the line, never `HOST_NOT_READY`.
+    #[test]
+    fn the_session_log_row_says_where_the_log_broke() {
+        use crate::session_log::{ChainReport, ChainStatus};
+        let report = |status| ChainReport {
+            status,
+            lines: 9,
+            last_hash: None,
+            tagged_beyond_head: 0,
+            previous_epoch_lines: 0,
+            torn_lines: 0,
+        };
+        assert_eq!(
+            session_log_row(&Ok(report(ChainStatus::Valid)), true),
+            Probe::Ok
+        );
+        assert!(matches!(
+            session_log_row(&Ok(report(ChainStatus::MissingHead)), true),
+            Probe::Warn(_)
+        ));
+        assert_eq!(
+            session_log_row(&Ok(report(ChainStatus::MissingHead)), false),
+            Probe::Ok,
+            "an attended-only host keeps no head"
+        );
+        let broken = ChainStatus::Broken {
+            file: "sessions.log".into(),
+            line: 7,
+            reason: "prev link does not match the previous line".into(),
+        };
+        assert_eq!(
+            session_log_row(&Ok(report(broken)), false),
+            Probe::Fail(
+                "log modified or truncated at line 7 of sessions.log: prev link does not \
+                 match the previous line"
+                    .into()
+            )
+        );
+        let cut = ChainStatus::Broken {
+            file: String::new(),
+            line: 9,
+            reason: "stored head matches no line (truncated log)".into(),
+        };
+        assert_eq!(
+            session_log_row(&Ok(report(cut)), true),
+            Probe::Fail(
+                "log modified or truncated at line 9: stored head matches no line (truncated log)"
+                    .into()
+            )
+        );
+        assert!(matches!(
+            session_log_row(
+                &Err(super::super::store::StoreError::Invalid("x".into())),
+                true
+            ),
+            Probe::Warn(_)
+        ));
+
+        let mut s = ReadinessSnapshot::unknown();
+        s.session_log = Probe::Fail("log modified or truncated at line 7".into());
+        assert_eq!(s.host_not_ready_cause(), None, "badge only");
+        assert!(s.badge());
+        let bytes = minicbor::to_vec(&s).unwrap();
+        assert!(bytes.windows(11).any(|w| w == b"session_log"));
+        let back: ReadinessSnapshot = minicbor::decode(&bytes).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(row_title("session_log"), "Session log intact");
+        assert_eq!(FIELD_NAMES.last(), Some(&"session_log"));
+        let names: Vec<&str> = s.fields().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, FIELD_NAMES);
     }
 
     /// The administrator helper's row (r7) travels as one more named key, which
