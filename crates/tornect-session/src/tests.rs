@@ -828,6 +828,342 @@ async fn a_viewer_that_bursts_then_goes_quiet_while_a_write_waits_is_let_go_afte
     tokio::time::timeout(WAIT, served).await.unwrap().unwrap();
 }
 
+/// A session of `mode` over a [`connect_narrow`] pipe whose viewer binds and
+/// then reads nothing more: the host's first picture write waits for good, so
+/// everything the viewer sends from then on reaches the host while a write
+/// waits (and `report.frames_sent` stays 0 to prove it).
+async fn bind_then_stop_reading(
+    rig: &Rig,
+    seed: u8,
+    mode: SessionMode,
+) -> (String, NarrowPipe, JoinHandle<MediaOutcome>) {
+    let (session_id, binding) = start(&rig.host, seed, mode);
+    let (mut client, served) = connect_narrow(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    (session_id, client, served)
+}
+
+/// Wait until the injector has received `n` events; return them.
+async fn injected(rig: &Rig, n: usize) -> Vec<InputEvent> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let events = rig.backend.recorder.events();
+        if events.len() >= n {
+            return events;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "only {events:?} injected"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// What a viewer that stopped reading finds in the pipe once the host is done:
+/// asserts that it is a single picture cut short, so that nothing, not even a
+/// `Close`, was written after the write that waited.
+async fn only_a_cut_short_picture(client: &mut NarrowPipe) {
+    let mut rest = Vec::new();
+    tokio::time::timeout(WAIT, client.read_to_end(&mut rest))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(rest.len() > 5, "{rest:?}");
+    let video = Msg::Video {
+        seq: 0,
+        flags: 0,
+        ts_ms: 0,
+        data: Vec::new(),
+    }
+    .encode()[4];
+    assert_eq!(rest[4], video, "not a picture: {rest:?}");
+    let announced = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+    assert!(
+        4 + announced > rest.len(),
+        "a whole picture, then more: {rest:?}"
+    );
+}
+
+/// The next frame from the host.
+async fn next_msg(client: &mut NarrowPipe) -> Option<Msg> {
+    tokio::time::timeout(WAIT, read_msg(client))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// PR-A test 1 (quality design §8): input sent while the host's picture write
+/// waits on flow control is injected then, under the token bucket, and the
+/// releases at the end of it are never budgeted. Before, the input waited
+/// behind the write, which over Tor lasts until the viewer reads or the 30 s
+/// stall timer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_sent_while_a_picture_write_waits_is_injected_within_its_budget() {
+    // A bucket of four that never refills.
+    let rig = rig(MediaLimits {
+        input_rate: 0,
+        input_burst: 4,
+        ..MediaLimits::default()
+    });
+    let (session_id, mut client, served) =
+        bind_then_stop_reading(&rig, 40, SessionMode::Control).await;
+    let key = |pressed| InputEvent::Key {
+        usb: KEY_A,
+        pressed,
+    };
+    let button = |pressed| InputEvent::PointerButton {
+        button: Button::Left,
+        pressed,
+    };
+    let mut burst = vec![key(true), button(true)];
+    burst.extend((0..20u16).map(|i| InputEvent::PointerMove { x: i, y: i }));
+    burst.extend([button(false), key(false)]);
+    for event in &burst {
+        write_msg(&mut client, &Msg::Input(event.encode()))
+            .await
+            .unwrap();
+    }
+    let want = [
+        key(true),
+        button(true),
+        InputEvent::PointerMove { x: 0, y: 0 },
+        InputEvent::PointerMove { x: 1, y: 1 },
+        button(false),
+        key(false),
+    ];
+    assert_eq!(injected(&rig, want.len()).await, want);
+    assert!(!served.is_finished(), "the session goes on");
+    rig.host
+        .on_end(&session_id, Some(&SessionEnd::Killed(bye::PANIC)));
+    let MediaOutcome::Served { report, end, .. } =
+        tokio::time::timeout(WAIT, served).await.unwrap().unwrap()
+    else {
+        panic!("not served");
+    };
+    assert_eq!(end, MediaEnd::SessionOver(reason::ENDED_BY_HOST));
+    assert_eq!(
+        report.frames_sent, 0,
+        "all of it while the first picture's write waited"
+    );
+    assert_eq!((report.input_injected, report.input_dropped), (6, 18));
+    assert_eq!(
+        rig.backend.recorder.events().len(),
+        6,
+        "nothing was left held for the end to release"
+    );
+}
+
+/// PR-A test 2: in a view-only session, input sent while the host's write
+/// waits is still dropped undecoded: bytes no decoder accepts end nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_only_input_sent_while_a_picture_write_waits_is_dropped_undecoded() {
+    let rig = rig(MediaLimits::default());
+    let (_, mut client, served) = bind_then_stop_reading(&rig, 41, SessionMode::ViewOnly).await;
+    let key = InputEvent::Key {
+        usb: KEY_A,
+        pressed: true,
+    };
+    for i in 0..10 {
+        let bytes = if i % 2 == 0 { key.encode() } else { [0xff; 16] };
+        write_msg(&mut client, &Msg::Input(bytes)).await.unwrap();
+    }
+    write_msg(
+        &mut client,
+        &Msg::Close {
+            reason: reason::ENDED_BY_VIEWER,
+        },
+    )
+    .await
+    .unwrap();
+    let MediaOutcome::Served { report, end, .. } =
+        tokio::time::timeout(WAIT, served).await.unwrap().unwrap()
+    else {
+        panic!("not served");
+    };
+    assert_eq!(
+        end,
+        MediaEnd::ViewerLeft,
+        "no protocol error: nothing was decoded"
+    );
+    assert_eq!(report.frames_sent, 0, "all of it while the write waited");
+    assert_eq!((report.input_injected, report.input_dropped), (0, 10));
+    assert_eq!(rig.backend.injectors.load(Ordering::SeqCst), 0);
+    assert!(rig.backend.recorder.events().is_empty());
+}
+
+/// What the injector had received, and whether the source was closed, when
+/// the host reported capture stopped.
+struct AtStop {
+    recorder: Recorder,
+    closed: Arc<AtomicBool>,
+    seen: Mutex<Option<(Vec<InputEvent>, bool)>>,
+}
+
+impl MediaObserver for AtStop {
+    fn capture_started(&self, _: &CaptureStarted<'_>) {}
+
+    fn capture_stopped(&self, _: &str, _: &MediaReport, _: &MediaEnd) {
+        *self.seen.lock().unwrap() =
+            Some((self.recorder.events(), self.closed.load(Ordering::SeqCst)));
+    }
+}
+
+/// PR-A test 3: a `Close` sent while the host's write waits ends the stream
+/// then (`ViewerLeft`), with the teardown order kept: what the viewer held is
+/// released and capture is closed before `capture_stopped`, and nothing is
+/// written after the picture cut short.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_while_a_picture_write_waits_releases_before_capture_stops() {
+    let backend = Arc::new(TestBackend::default());
+    let observer = Arc::new(AtStop {
+        recorder: backend.recorder.clone(),
+        closed: Arc::clone(&backend.closed),
+        seen: Mutex::new(None),
+    });
+    let rig = Rig {
+        host: Arc::new(MediaHost::new(
+            backend.clone(),
+            observer.clone(),
+            MediaLimits::default(),
+        )),
+        backend,
+        seen: Arc::new(Seen::default()),
+    };
+    let (_, mut client, served) = bind_then_stop_reading(&rig, 42, SessionMode::Control).await;
+    let press = InputEvent::Key {
+        usb: KEY_A,
+        pressed: true,
+    };
+    write_msg(&mut client, &Msg::Input(press.encode()))
+        .await
+        .unwrap();
+    assert_eq!(injected(&rig, 1).await, [press]);
+    write_msg(
+        &mut client,
+        &Msg::Close {
+            reason: reason::ENDED_BY_VIEWER,
+        },
+    )
+    .await
+    .unwrap();
+    let MediaOutcome::Served { report, end, .. } =
+        tokio::time::timeout(WAIT, served).await.unwrap().unwrap()
+    else {
+        panic!("not served");
+    };
+    assert_eq!(end, MediaEnd::ViewerLeft);
+    assert_eq!(report.frames_sent, 0);
+    let release = InputEvent::Key {
+        usb: KEY_A,
+        pressed: false,
+    };
+    assert_eq!(
+        *observer.seen.lock().unwrap(),
+        Some((vec![press, release], true)),
+        "released, and capture closed, before capture_stopped"
+    );
+    only_a_cut_short_picture(&mut client).await;
+}
+
+/// PR-A test 4: the panic key ends a session at once while the host's write
+/// waits and the viewer keeps sending: capture stops, what the viewer held is
+/// released, and no `Close` follows the picture cut short.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_while_a_picture_write_waits_ends_the_session_at_once() {
+    let rig = rig(MediaLimits::default());
+    let kill = tornect_signal::fsm::host::KillSwitch::new();
+    let watcher = rig.host.watch_kill(kill.clone());
+    let (_, mut client, served) = bind_then_stop_reading(&rig, 43, SessionMode::Control).await;
+    let press = InputEvent::Key {
+        usb: KEY_A,
+        pressed: true,
+    };
+    write_msg(&mut client, &Msg::Input(press.encode()))
+        .await
+        .unwrap();
+    assert_eq!(injected(&rig, 1).await, [press]);
+    // More input on its way while the kill lands.
+    for i in 0..200u16 {
+        let moved = InputEvent::PointerMove { x: i, y: i };
+        write_msg(&mut client, &Msg::Input(moved.encode()))
+            .await
+            .unwrap();
+    }
+    let killed = std::time::Instant::now();
+    kill.kill(bye::PANIC);
+    let MediaOutcome::Served { report, end, .. } =
+        tokio::time::timeout(Duration::from_secs(2), served)
+            .await
+            .expect("the kill waited behind the write")
+            .unwrap()
+    else {
+        panic!("not served");
+    };
+    assert!(
+        killed.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        killed.elapsed()
+    );
+    assert_eq!(end, MediaEnd::SessionOver(reason::ENDED_BY_HOST));
+    assert_eq!(report.frames_sent, 0);
+    assert!(rig.backend.closed.load(Ordering::SeqCst), "capture stopped");
+    let events = rig.backend.recorder.events();
+    assert_eq!(
+        events.last(),
+        Some(&InputEvent::Key {
+            usb: KEY_A,
+            pressed: false
+        }),
+        "the held key is released: {events:?}"
+    );
+    only_a_cut_short_picture(&mut client).await;
+    watcher.abort();
+}
+
+/// PR-A test 5: a `Ping` read while the host's write waits is answered right
+/// after that write, and two in one wait get one `Pong`, for the latest nonce
+/// (the viewer's pings are liveness probes; it ignores `Pong`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pings_while_a_picture_write_waits_get_one_pong_after_it() {
+    let rig = rig(MediaLimits::default());
+    let (session_id, mut client, served) =
+        bind_then_stop_reading(&rig, 44, SessionMode::Control).await;
+    let press = InputEvent::Key {
+        usb: KEY_A,
+        pressed: true,
+    };
+    write_msg(&mut client, &Msg::Ping { nonce: 1 })
+        .await
+        .unwrap();
+    write_msg(&mut client, &Msg::Ping { nonce: 2 })
+        .await
+        .unwrap();
+    write_msg(&mut client, &Msg::Input(press.encode()))
+        .await
+        .unwrap();
+    // Frames are handled in order: with the press injected, both pings were
+    // taken, while the write still waits.
+    assert_eq!(injected(&rig, 1).await, [press]);
+
+    assert!(
+        matches!(next_msg(&mut client).await, Some(Msg::Video { seq: 0, .. })),
+        "the picture whose write waited comes first"
+    );
+    assert_eq!(
+        next_msg(&mut client).await,
+        Some(Msg::Pong { nonce: 2 }),
+        "then one Pong, for the latest nonce"
+    );
+    // And no other: the next frames are pictures (the window holds 20).
+    for _ in 0..3 {
+        let msg = next_msg(&mut client).await;
+        assert!(matches!(msg, Some(Msg::Video { .. })), "{msg:?}");
+    }
+    rig.host
+        .on_end(&session_id, Some(&SessionEnd::Killed(bye::PANIC)));
+    tokio::time::timeout(WAIT, served).await.unwrap().unwrap();
+}
+
 /// SLICE-C1 C1-3: a viewer with nothing else to say pings, so that the host can
 /// tell a quiet viewer from a gone one, also when the host's screen is still
 /// and no picture needs acknowledging.
