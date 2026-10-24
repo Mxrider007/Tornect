@@ -262,7 +262,12 @@ mod tests {
         assert!(!write_rgba8((y, u, v), (w, h), (w - 1, *su, *sv), &mut out));
         assert!(!write_rgba8((y, u, v), (w, h), (*sy, 4, *sv), &mut out));
         assert!(!write_rgba8((y, u, v), (w, h), strides, &mut out[4..]));
-        assert!(!write_rgba8((y, u, v), (w, h), (usize::MAX, *su, *sv), &mut out));
+        assert!(!write_rgba8(
+            (y, u, v),
+            (w, h),
+            (usize::MAX, *su, *sv),
+            &mut out
+        ));
         assert!(out.iter().all(|&b| b == 7));
         assert!(write_rgba8((y, u, v), (0, h), strides, &mut []));
         assert!(write_rgba8((y, u, v), (w, 0), strides, &mut []));
