@@ -115,6 +115,13 @@ pub fn dist(root: &Path, args: &[String]) -> anyhow::Result<()> {
         cfg!(all(target_os = "linux", target_arch = "x86_64")),
         "dist runs on a Linux x86_64 host (it cross-builds Windows with llvm-mingw)"
     );
+    let overrides = release_profile_overrides(std::env::vars_os().map(|(name, _)| name));
+    ensure!(
+        overrides.is_empty(),
+        "{} set: they would change the release build, and BUILD-INFO.txt records Cargo.toml's \
+         [profile.release] alone (audit finding B30). Unset them",
+        overrides.join(", ")
+    );
     let version = env!("CARGO_PKG_VERSION");
     let git = Git::read(root)?;
     if git.dirty {
@@ -184,6 +191,56 @@ pub fn dist(root: &Path, args: &[String]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The `CARGO_PROFILE_RELEASE_*` variables among `names`: cargo lets each
+/// override a `[profile.release]` key, so with one set BUILD-INFO.txt's
+/// profile line, read from Cargo.toml, would not describe the build.
+fn release_profile_overrides(names: impl Iterator<Item = std::ffi::OsString>) -> Vec<String> {
+    let mut found: Vec<String> = names
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("CARGO_PROFILE_RELEASE_"))
+        .collect();
+    found.sort();
+    found
+}
+
+/// `[profile.release]` of the workspace's `Cargo.toml` and its sub-tables
+/// (`[profile.release.package.…]`, `[profile.release.build-override]`), as
+/// BUILD-INFO.txt shows them: `opt-level 3, lto "thin", …`. Read from the
+/// file, so the record follows an edit there (audit finding B30).
+fn release_profile(cargo_toml: &str) -> anyhow::Result<String> {
+    const TABLE: &str = "[profile.release]";
+    let mut prefix: Option<String> = None;
+    let mut keys = Vec::new();
+    for line in cargo_toml.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            prefix = if line == TABLE {
+                Some(String::new())
+            } else {
+                line.strip_prefix("[profile.release.")
+                    .and_then(|rest| rest.strip_suffix(']'))
+                    .map(|sub| format!("{sub}."))
+            };
+            continue;
+        }
+        let Some(prefix) = &prefix else {
+            continue;
+        };
+        let (key, value) = line
+            .split_once('=')
+            .with_context(|| format!("Cargo.toml's {TABLE}: `{line}` is not `key = value`"))?;
+        ensure!(
+            !value.contains('#'),
+            "Cargo.toml's {TABLE}: write `{line}` without a comment after the value"
+        );
+        keys.push(format!("{prefix}{} {}", key.trim(), value.trim()));
+    }
+    ensure!(!keys.is_empty(), "Cargo.toml has no {TABLE} table");
+    Ok(keys.join(", "))
 }
 
 /// What `dist` checked before building, for BUILD-INFO.txt.
@@ -911,10 +968,11 @@ fn build_info(b: &BuildInfo<'_>) -> anyhow::Result<String> {
         "  command       cargo build --locked --release --target {} -p tornect",
         p.triple
     );
+    let cargo_toml = fs::read_to_string(b.root.join("Cargo.toml")).context("reading Cargo.toml")?;
     let _ = writeln!(
         s,
-        "  profile       release (Cargo.toml): opt-level 3, lto \"thin\", codegen-units 1, \
-         debug \"line-tables-only\""
+        "  profile       release (Cargo.toml): {}",
+        release_profile(&cargo_toml)?
     );
     let _ = writeln!(s, "  rustflags     added by dist: {}", b.flags);
     let _ = writeln!(
@@ -1111,6 +1169,53 @@ mod tests {
         assert!(
             lines.contains("\nignored       RUSTSEC-2023-0071: "),
             "{lines}"
+        );
+    }
+
+    /// B30: the profile line is read from Cargo.toml (today's file gives the
+    /// line BUILD-INFO.txt carried before), follows an edit there, and no
+    /// profile beside `release` suggests that dist builds with another.
+    #[test]
+    fn the_profile_line_is_read_from_cargo_toml() {
+        let root = crate::workspace_root().unwrap();
+        let cargo_toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert_eq!(
+            release_profile(&cargo_toml).unwrap(),
+            "opt-level 3, lto \"thin\", codegen-units 1, debug \"line-tables-only\""
+        );
+        assert!(
+            !cargo_toml.contains("[profile.dist"),
+            "dist builds with --release: a [profile.dist] would go unused"
+        );
+
+        let edited = "[profile.dev]\nopt-level = 1\n\n[profile.release]\n# fat now\nlto = \"fat\"\n\
+                      strip = \"symbols\"\n\n[profile.release.package.\"*\"]\nopt-level = 2\n\n\
+                      [workspace.lints.rust]\nunsafe_code = \"warn\"\n";
+        assert_eq!(
+            release_profile(edited).unwrap(),
+            "lto \"fat\", strip \"symbols\", package.\"*\".opt-level 2"
+        );
+        assert!(release_profile("[profile.dev]\nopt-level = 1\n").is_err());
+        assert!(release_profile("[profile.release]\nlto = \"fat\" # comment\n").is_err());
+    }
+
+    /// B30: a `CARGO_PROFILE_RELEASE_*` variable changes the build behind the
+    /// profile line's back, so dist names it and stops.
+    #[test]
+    fn release_profile_variables_are_found() {
+        let names = [
+            "CARGO_BUILD_JOBS",
+            "CARGO_PROFILE_RELEASE_LTO",
+            "CARGO_PROFILE_DEV_OPT_LEVEL",
+            "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_OPT_LEVEL",
+        ]
+        .map(std::ffi::OsString::from);
+        assert_eq!(
+            release_profile_overrides(names.into_iter()),
+            [
+                "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_OPT_LEVEL",
+                "CARGO_PROFILE_RELEASE_LTO"
+            ]
         );
     }
 
