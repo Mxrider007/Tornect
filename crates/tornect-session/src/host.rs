@@ -1732,10 +1732,12 @@ fn pace(due: Instant, stop: &AtomicBool) -> bool {
 ///
 /// The last fresh picture is kept: a quality change, taken on every [`POLL`]
 /// turn while the thread waits for a picture, builds a new encoder and, on a
-/// still screen, encodes that picture again at once (the design's §6.6). Its
-/// buffer goes back to the source (`VideoSource::recycle`) when a newer
-/// picture replaces it. A keyframe request still waits for the next picture,
-/// as before.
+/// still screen, encodes that picture again at once (the design's §6.6). The
+/// repeat is fitted again from the full capture, so after a change to a
+/// larger preset it can show the viewer's last picture sharper than it was
+/// sent, though never a newer one (decision M1-74 (6)). Its buffer goes back
+/// to the source (`VideoSource::recycle`) when a newer picture replaces it.
+/// A keyframe request still waits for the next picture, as before.
 fn encode_loop(
     mut source: Box<dyn VideoSource>,
     mut settings: Settings,
