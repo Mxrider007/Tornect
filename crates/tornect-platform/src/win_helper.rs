@@ -598,11 +598,6 @@ pub(crate) fn start_elevated(exe: &Path, params: &str) -> Result<Launched, Launc
     Ok(Launched { process, pid })
 }
 
-thread_local! {
-    /// The panic chord's modifiers as the hook saw them. A low-level hook
-    /// runs on the thread that set it, so only that thread touches this.
-    static CHORD: std::cell::Cell<Modifiers> = const { std::cell::Cell::new(Modifiers::NONE) };
-}
 /// Told once when the chord is pressed.
 static PANIC: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
@@ -611,8 +606,9 @@ static PANIC: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 /// thread, run by the elevated helper so that it sees keys while an elevated
 /// window has focus. It ignores injected events, matches only the chord and
 /// keeps no keystroke (the modifiers' state only); a modifier counts only
-/// while the system's key state still has it down, as in the host's own
-/// hook ([`Modifiers`]). `pressed` is called once.
+/// while the system's key state still has it down, and every switch of the
+/// input desktop forgets them, as in the host's own hook ([`Modifiers`]).
+/// `pressed` is called once.
 pub(crate) fn watch_panic_chord(pressed: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
     *PANIC.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(pressed));
     let (set, hooked) = std::sync::mpsc::channel();
@@ -631,6 +627,7 @@ pub(crate) fn watch_panic_chord(pressed: impl FnOnce() + Send + 'static) -> std:
                 let _ = set.send(Err(std::io::Error::last_os_error()));
                 return;
             }
+            crate::hotkey::win::forget_on_desktop_switch();
             let _ = set.send(Ok(()));
             // SAFETY: all-zero is a valid MSG to fill.
             let mut msg: MSG = unsafe { std::mem::zeroed() };
@@ -649,7 +646,7 @@ unsafe extern "system" fn chord_hook(code: i32, wparam: usize, lparam: isize) ->
         // SAFETY: for `HC_ACTION` a low-level keyboard hook's `lparam` points
         // to a KBDLLHOOKSTRUCT valid during this call.
         let key = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-        let held = CHORD
+        let held = crate::hotkey::win::MODS
             .try_with(|mods| crate::hotkey::win::chord_event(mods, key, wparam, VK_END))
             .ok()
             .flatten();
