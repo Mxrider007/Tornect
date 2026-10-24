@@ -147,7 +147,7 @@ converted picture *n* (one in-process clock). `encode p50` is the median of the 
 times; B7 `convert+encode` is the host's scale + convert + encode per picture sent; `capture` is the card's own
 paint per fresh picture; `lost` is pictures sent minus pictures decoded.
 
-**Where it ran:** not the dev VM of `CLAUDE.md`: this build container (4 vCPU "Intel(R) Xeon(R) Processor @
+**Where it ran:** not the dev VM (GNOME, VMware): this build container (4 vCPU "Intel(R) Xeon(R) Processor @
 2.10GHz", x86_64, no GPU, no display), as root (the demo serves nobody, so the host's root refusal of M1-67
 does not apply to it). Binary: `cargo build --release -p tornect` (thin LTO, codegen-units 1) of the working tree
 during this work: before the pre-bind log budget (`f9ad35ad`) and the demo's last edit (`0e2aa6bf`'s error
