@@ -1048,6 +1048,51 @@ mod tests {
         );
     }
 
+    /// L-4 (MUST): a fill takes the keyboard focus from the connect field,
+    /// so that keys typed for another program, or for the user's own ID,
+    /// never reach it. With the field focused (being typed into) when a
+    /// link comes, the next pass leaves nothing focused; once Connect has
+    /// armed, Enter dials nothing and typed text changes nothing.
+    #[test]
+    fn a_link_fill_takes_the_focus_from_the_field() {
+        let id = key_id(7);
+        let mut window = Window::new(at_rest(), Page::Home, egui::Theme::Dark, WIDE);
+        let at = field_at(&window, None);
+        assert!(window.click(at).is_empty());
+        let field = window.ctx.memory(|m| m.focused());
+        assert!(field.is_some(), "the field has the focus");
+        assert!(
+            window
+                .pass(vec![egui::Event::Text("abc".to_owned())])
+                .is_empty()
+        );
+        assert_eq!(window.form.connect_to, "abc", "typed into the field");
+        let own = window.model.own_id();
+        window.form.link_arrived(ShownLink::Fill(id), own);
+        assert_eq!(window.ctx.memory(|m| m.focused()), field, "until a pass");
+        assert!(window.pass(Vec::new()).is_empty());
+        assert_eq!(
+            window.ctx.memory(|m| m.focused()),
+            None,
+            "the fill took the focus"
+        );
+        window.later += Duration::from_secs(1);
+        assert!(window.pass(Vec::new()).is_empty());
+        assert!(!window.node("Connect").is_disabled(), "armed");
+        assert!(
+            window.key(egui::Key::Enter).is_empty(),
+            "Enter dials nothing"
+        );
+        assert!(
+            window
+                .pass(vec![egui::Event::Text("x".to_owned())])
+                .is_empty()
+        );
+        assert!(window.pass(Vec::new()).is_empty());
+        assert_eq!(window.form.connect_to, id.display_groups());
+        assert_eq!(window.ctx.memory(|m| m.focused()), None);
+    }
+
     /// The arming second starts at the first pass that draws the Connect
     /// row, not at the fill: a window first drawn five seconds after the
     /// link came still waits its second.
