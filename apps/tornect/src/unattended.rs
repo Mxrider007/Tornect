@@ -1329,22 +1329,32 @@ async fn resolve_device(paths: &Paths, route: &Route, arg: &str) -> anyhow::Resu
     match_device(arg, &known)
 }
 
+/// The fewest characters (dashes and spaces aside) a fingerprint or device
+/// ID prefix takes in [`match_device`]: a shorter argument names a device by
+/// its label only. One or two characters are a fingerprint prefix of about
+/// one device in 16 or 256, so a short or mistyped label (`da` for "Dad")
+/// could otherwise name another paired device, with no ambiguity to refuse,
+/// for a command that gives access (`grant`).
+const MIN_PREFIX: usize = 4;
+
 /// [`resolve_device`]'s match of `arg` among `known` (device, pinned label)
 /// pairs, where one device may come twice (its grant's label and its
 /// pairing's): a label in any case, a prefix of the fingerprint with or
-/// without its dashes, or a prefix of the device ID. More than one device
-/// matching is refused, never guessed.
+/// without its dashes, or a prefix of the device ID, either at least
+/// [`MIN_PREFIX`] characters. More than one device matching is refused,
+/// never guessed.
 fn match_device(arg: &str, known: &[(DeviceId, String)]) -> anyhow::Result<DeviceId> {
     let needle = arg.trim().to_lowercase();
-    // An empty prefix would match every device.
+    // An empty prefix would match every device, a short one any of many.
     let prefix: String = needle
         .chars()
         .filter(|c| *c != '-' && !c.is_whitespace())
         .collect();
+    let long_enough = prefix.chars().count() >= MIN_PREFIX;
     let mut matches: Vec<(DeviceId, &str)> = Vec::new();
     for (device, label) in known {
         let hit = label.to_lowercase() == needle
-            || (!prefix.is_empty()
+            || (long_enough
                 && (device.fingerprint().replace('-', "").starts_with(&prefix)
                     || device.to_string().starts_with(&prefix)));
         if hit && !matches.iter().any(|(seen, _)| seen == device) {
@@ -1353,6 +1363,11 @@ fn match_device(arg: &str, known: &[(DeviceId, String)]) -> anyhow::Result<Devic
     }
     match matches.as_slice() {
         [(one, _)] => Ok(*one),
+        [] if !prefix.is_empty() && !long_enough => anyhow::bail!(
+            "no device is named {arg:?}, and a fingerprint or device ID takes at least \
+             {MIN_PREFIX} characters; `tornect devices` lists the paired devices with their \
+             fingerprints and IDs"
+        ),
         [] => anyhow::bail!(
             "no device matches {arg:?}; `tornect devices` lists the paired devices with their \
              fingerprints and IDs"
@@ -4144,14 +4159,62 @@ mod tests {
         let both = [(paired, "Laptop".to_owned()), (paired, "Laptop".to_owned())];
         assert_eq!(match_device("laptop", &both).unwrap(), paired);
         // Two devices behind one prefix: refused, never guessed.
-        let prefix = &paired.fingerprint()[..1];
-        let alike = (65..=255)
-            .map(device)
-            .find(|d| d.fingerprint().starts_with(prefix))
+        let prefix = &paired.fingerprint()[..MIN_PREFIX];
+        let alike = (0..u32::MAX)
+            .map(|n| {
+                let mut key = [0x5a; 32];
+                key[..4].copy_from_slice(&n.to_le_bytes());
+                DeviceId::from_bytes(key)
+            })
+            .find(|d| *d != paired && d.fingerprint().starts_with(prefix))
             .expect("a fingerprint that starts alike");
         let two = [(paired, "A".to_owned()), (alike, "B".to_owned())];
         let refused = match_device(prefix, &two).unwrap_err().to_string();
         assert!(refused.contains("matches 2 devices (A, B)"), "{refused}");
+    }
+
+    /// B19 review: a fingerprint or device ID prefix counts from
+    /// [`MIN_PREFIX`] characters. A shorter argument is a label or nothing:
+    /// `da`, typed for "Dad", never names "Mom" because her fingerprint or ID
+    /// starts with it, which `grant` would have given access to. Four
+    /// characters, dashes and spaces aside, still name her.
+    #[test]
+    fn a_short_argument_names_a_device_by_its_label_only() {
+        let dad = device(71);
+        let mom = device(72);
+        let known = [(dad, "Dad".to_owned()), (mom, "Mom".to_owned())];
+        let fingerprint = mom.fingerprint();
+        let id = mom.to_string();
+        assert_ne!(
+            dad.fingerprint()[..4],
+            fingerprint[..4],
+            "the devices differ early"
+        );
+        assert_ne!(dad.to_string()[..4], id[..4], "the devices differ early");
+        for short in [
+            &fingerprint[..1],
+            &fingerprint[..2],
+            &fingerprint[..3],
+            &id[..3],
+        ] {
+            let refused = match_device(short, &known).unwrap_err().to_string();
+            assert!(
+                refused.contains("at least 4 characters"),
+                "{short:?}: {refused}"
+            );
+        }
+        // Dashes and spaces do not count.
+        let dashed = format!("{}-{}", &fingerprint[..2], &fingerprint[2..3]);
+        assert!(match_device(&dashed, &known).is_err(), "{dashed:?}");
+        assert_eq!(match_device(&fingerprint[..4], &known).unwrap(), mom);
+        assert_eq!(match_device(&fingerprint[..5], &known).unwrap(), mom);
+        assert_eq!(match_device(&id[..4], &known).unwrap(), mom);
+        let refused = match_device("da", &known).unwrap_err().to_string();
+        assert!(refused.contains("\"da\""), "{refused}");
+        assert_eq!(match_device("DAD", &known).unwrap(), dad);
+        // A short label is still a label.
+        let short = [(dad, "Al".to_owned()), (mom, "Mom".to_owned())];
+        assert_eq!(match_device("al", &short).unwrap(), dad);
     }
 
     /// B23: the terminal block window's line after a Block gives a resume
