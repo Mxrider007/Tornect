@@ -344,9 +344,15 @@ impl<'b, C> minicbor::Decode<'b, C> for TornectId {
     }
 }
 
+/// `s` without a case-insensitive ASCII `suffix`. Typed or pasted text can hold any
+/// character, so the cut point may fall inside a multi-byte one: `get` answers `None`
+/// there instead of the panic a range index would raise (such a tail cannot equal an
+/// ASCII suffix anyway).
 fn strip_suffix_ignore_case<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
-    if s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix) {
-        Some(&s[..s.len() - suffix.len()])
+    let cut = s.len().checked_sub(suffix.len())?;
+    let tail = s.get(cut..)?;
+    if tail.eq_ignore_ascii_case(suffix) {
+        s.get(..cut)
     } else {
         None
     }
@@ -455,7 +461,62 @@ mod tests {
         assert!(minicbor::decode::<TornectId>(&short).is_err());
     }
 
+    /// A field is parsed on every frame while someone types into it, so each prefix
+    /// of a name with a two- or three-byte character reaches the parser; the six
+    /// bytes before the end used to be sliced without a char-boundary check.
+    #[test]
+    fn non_ascii_text_is_an_error_not_a_panic() {
+        for text in [
+            "é12345",
+            "Zoë's lap",
+            "Joãoport",
+            "東京のパソコン",
+            "x東京.onion",
+            "ë.onion",
+        ] {
+            assert!(text.parse::<TornectId>().is_err(), "{text}");
+            assert!(text.parse::<DeviceId>().is_err(), "{text}");
+        }
+        for typed in ["Zoë's laptop", "João-portátil", "東京のパソコン-1"] {
+            let mut prefix = String::new();
+            for c in typed.chars() {
+                prefix.push(c);
+                assert!(prefix.parse::<TornectId>().is_err(), "{prefix}");
+                assert!(prefix.parse::<DeviceId>().is_err(), "{prefix}");
+            }
+        }
+        assert_eq!(strip_suffix_ignore_case("é12345", ONION_SUFFIX), None);
+        assert_eq!(
+            strip_suffix_ignore_case("ab.ONION", ONION_SUFFIX),
+            Some("ab")
+        );
+        assert_eq!(strip_suffix_ignore_case("ë.onion", ONION_SUFFIX), Some("ë"));
+        assert_eq!(strip_suffix_ignore_case("onion", ONION_SUFFIX), None);
+    }
+
     proptest! {
+        /// Any text a field can hold is answered, never a panic (B05).
+        #[test]
+        fn from_str_never_panics(s in any::<String>()) {
+            let _ = s.parse::<TornectId>();
+            let _ = s.parse::<DeviceId>();
+        }
+
+        /// The same with the suffix appended and a real ID's body mixed in, so the
+        /// strip and the length checks see non-ASCII next to the cut point.
+        #[test]
+        fn from_str_never_panics_near_the_suffix(
+            head in "\\PC{0,8}",
+            pk in any::<[u8; 32]>(),
+            tail in "\\PC{0,3}",
+        ) {
+            let body = TornectId::from_bytes(pk).base32();
+            let _ = format!("{head}{tail}.onion").parse::<TornectId>();
+            let _ = format!("{head}{body}{tail}").parse::<TornectId>();
+            let _ = format!("{tail}{body}.onion").parse::<TornectId>();
+            let _ = format!("{head}{}", &body[..52]).parse::<DeviceId>();
+        }
+
         #[test]
         fn tornect_id_roundtrips(pk in any::<[u8; 32]>()) {
             let id = TornectId::from_bytes(pk);
