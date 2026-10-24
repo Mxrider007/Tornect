@@ -6780,14 +6780,16 @@ mod tests {
             (true, NO_PASSWORD),
         ] {
             for (went_live, failed) in [(true, None), (false, Some((Failure::Denied, 3)))] {
-                let mut m = Model::default();
-                m.dial = Dial {
-                    id: Some(before),
-                    since: Some(Instant::now()),
-                    paired_now: true,
-                    failed,
-                    unattended: !unattended,
-                    went_live,
+                let mut m = Model {
+                    dial: Dial {
+                        id: Some(before),
+                        since: Some(Instant::now()),
+                        paired_now: true,
+                        failed,
+                        unattended: !unattended,
+                        went_live,
+                    },
+                    ..Model::default()
                 };
                 not_dialled(&mut m, now, unattended, why);
                 assert!(matches!(&m.client, ClientStage::Ended(w) if w == why));
