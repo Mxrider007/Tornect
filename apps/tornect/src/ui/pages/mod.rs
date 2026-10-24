@@ -496,7 +496,7 @@ mod tests {
         published.tor = TorState::Ready { via: "direct Tor" };
         published.hosting = Hosting::Off(PUBLISH_FAILED.to_owned());
         published.tor_retry = Some(Instant::now() + Duration::from_secs(40));
-        let mut window = Window::new(published, Page::Home, egui::Theme::Dark, WIDE);
+        let mut window = Window::new(published.clone(), Page::Home, egui::Theme::Dark, WIDE);
         assert!(has_text(
             &window,
             "Incoming requests: off (this ID could not be published); trying again in"
@@ -504,6 +504,13 @@ mod tests {
         assert!(!has_text(&window, "Trying again in"), "Tor is up");
         let now = window.center(home::RETRY);
         assert_eq!(window.click(now), vec![Action::RetryTor]);
+        // Settings, Connection is about Tor, which is up: no Try again
+        // under "Tor: connected", with nothing saying what it would retry.
+        let mut settings = Window::new(published, Page::Settings, egui::Theme::Light, WIDE);
+        settings.form.settings.section = settings::Section::Connection;
+        settings.pass(Vec::new());
+        assert!(has_text(&settings, "Tor: connected"));
+        assert!(!settings.controls().iter().any(|c| c == home::RETRY));
 
         model.tor_retry = None;
         let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);

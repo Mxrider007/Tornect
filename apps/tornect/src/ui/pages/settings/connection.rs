@@ -69,7 +69,11 @@ pub(super) fn section(
             )
             .wrap(),
         );
-        super::super::home::retry_button(ui, model, actions);
+        // Tor's try only: with Tor up, the try that waits is the publishing
+        // of this ID, which this card does not mention (Home does).
+        if !model.tor.is_ready() {
+            super::super::home::retry_button(ui, model, actions);
+        }
     });
     ui.add_space(16.0);
     widgets::section_header(ui, "How to reach Tor");

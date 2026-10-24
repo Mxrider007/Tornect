@@ -1854,6 +1854,12 @@ pub(super) const PUBLISH_FAILED: &str = "this ID could not be published";
 /// The hosting line's words when the published ID stopped being served.
 pub(super) const SERVICE_STOPPED: &str = "this ID stopped being served";
 
+/// How long a start that worked must stay up before its failure counts as
+/// the first in a row again: a service that stops at once after each
+/// publish is a failure in a row, not one that worked, so its tries keep
+/// doubling instead of coming every 30 s for good.
+const STAYED_UP: Duration = RETRY_MOST;
+
 /// The wait before the automatic try that follows `failures` failures in a
 /// row: [`RETRY_FIRST`] after the first, twice as long after each next
 /// one, at most [`RETRY_MOST`].
@@ -1872,8 +1878,11 @@ fn retry_after(failures: u32) -> Duration {
 struct Restarting<T> {
     /// The start running now.
     task: Option<JoinHandle<anyhow::Result<T>>>,
-    /// Failures in a row since the last start that worked.
+    /// Failures in a row since a start that worked stayed up
+    /// [`STAYED_UP`].
     failures: u32,
+    /// When the last start that worked returned, until a failure.
+    up_since: Option<tokio::time::Instant>,
     /// The next try's time, after a failure.
     due: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
 }
@@ -1894,6 +1903,7 @@ impl<T> Restarting<T> {
         Self {
             task: None,
             failures: 0,
+            up_since: None,
             due: None,
         }
     }
@@ -1910,8 +1920,16 @@ impl<T> Restarting<T> {
     }
 
     /// A failure, the start's own or one seen elsewhere (a listener that
-    /// closed): the next try is armed. Returns its wait.
+    /// closed): the next try is armed. Returns its wait. It is the first in
+    /// a row again only after a start that stayed up [`STAYED_UP`].
     fn failed(&mut self) -> Duration {
+        if self
+            .up_since
+            .take()
+            .is_some_and(|since| since.elapsed() >= STAYED_UP)
+        {
+            self.failures = 0;
+        }
         self.failures = self.failures.saturating_add(1);
         let wait = retry_after(self.failures);
         self.due = Some(Box::pin(tokio::time::sleep(wait)));
@@ -1939,7 +1957,7 @@ impl<T> Restarting<T> {
             self.task = None;
             match out {
                 Ok(Ok(started)) => {
-                    self.failures = 0;
+                    self.up_since = Some(tokio::time::Instant::now());
                     Restart::Started(started)
                 }
                 Ok(Err(e)) => Restart::Failed(e, self.failed()),
@@ -6561,9 +6579,9 @@ mod tests {
 
     /// B02: a start that fails is not the end. Its failure arms the next
     /// try, which comes due after the wait and no sooner; a second failure in
-    /// a row waits twice as long; a start that works resets the count, so the
-    /// next failure waits 30 s again. Before the fix the first failure was
-    /// final: nothing ever started Tor again.
+    /// a row waits twice as long; a start that works and stays up 5 min
+    /// resets the count, so the next failure waits 30 s again. Before the fix
+    /// the first failure was final: nothing ever started Tor again.
     #[tokio::test(start_paused = true)]
     async fn a_failed_start_is_tried_again_after_its_wait() {
         let fails = || tokio::spawn(async { Err::<u32, _>(anyhow::anyhow!("offline")) });
@@ -6595,6 +6613,7 @@ mod tests {
         tor.start(tokio::spawn(async { Ok(7) }));
         assert!(matches!(tor.next().await, Restart::Started(7)));
         assert!(!tor.pending());
+        tokio::time::advance(STAYED_UP).await;
         tor.start(fails());
         let Restart::Failed(_, wait) = tor.next().await else {
             panic!("failed after working");
@@ -6609,6 +6628,35 @@ mod tests {
         panics.start(tokio::spawn(async { boom() }));
         assert!(matches!(panics.next().await, Restart::Failed(..)));
         assert!(panics.pending());
+    }
+
+    /// B02 review: a service that stops right after each publish that
+    /// worked is a failure in a row: the tries keep doubling up to 5 min
+    /// instead of coming every 30 s for good. One that stayed up 5 min
+    /// worked: its stop is the first failure again.
+    #[tokio::test(start_paused = true)]
+    async fn a_publish_that_stops_at_once_keeps_backing_off() {
+        let mut publish: Restarting<u32> = Restarting::idle();
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            publish.start(tokio::spawn(async { Ok(1) }));
+            assert!(matches!(publish.next().await, Restart::Started(1)));
+            tokio::time::advance(Duration::from_secs(1)).await;
+            // The listener closed.
+            waits.push(publish.failed().as_secs());
+            assert!(matches!(publish.next().await, Restart::Due));
+        }
+        assert_eq!(waits, [30, 60, 120, 240, 300, 300]);
+
+        publish.start(tokio::spawn(async { Ok(1) }));
+        assert!(matches!(publish.next().await, Restart::Started(1)));
+        tokio::time::advance(STAYED_UP - Duration::from_secs(1)).await;
+        assert_eq!(publish.failed(), RETRY_MOST, "not up long enough");
+        assert!(matches!(publish.next().await, Restart::Due));
+        publish.start(tokio::spawn(async { Ok(1) }));
+        assert!(matches!(publish.next().await, Restart::Started(1)));
+        tokio::time::advance(STAYED_UP).await;
+        assert_eq!(publish.failed(), RETRY_FIRST, "it stayed up: worked");
     }
 
     /// B02: Try again starts the waiting try at once, and only that: while a
