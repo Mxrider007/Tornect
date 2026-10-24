@@ -164,6 +164,35 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Replace `path` with `bytes` so that a crash or a kill leaves either the old file
+/// or the new one, never a truncated mix: the bytes go to `<name>.tmp` beside it
+/// through [`write_private_file`] (`0600` on Unix, synced), which is then renamed
+/// over `path`; on Unix the directory is synced too, so the rename itself survives a
+/// power loss. A stale `.tmp` from an earlier crash is overwritten.
+pub fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut name = path.file_name().map(ToOwned::to_owned).ok_or_else(|| {
+        CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} names no file", path.display()),
+        ))
+    })?;
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
+    write_private_file(&tmp, bytes)?;
+    fs_err::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent()
+        && let Ok(d) = std::fs::File::open(if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        })
+    {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
 fn seed_from(store: &dyn SecretStore, name: &str) -> Result<Option<Zeroizing<[u8; 32]>>> {
     let Some(bytes) = store.get(name)? else {
         return Ok(None);

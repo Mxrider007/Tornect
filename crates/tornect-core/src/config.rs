@@ -381,7 +381,11 @@ impl Config {
         }
     }
 
-    /// Serialize to `path` (creating parent directories).
+    /// Serialize to `path` (creating parent directories). The file is replaced
+    /// atomically ([`crate::keystore::write_private_file_atomic`]): every settings
+    /// change rewrites the whole file, and one cut short by a crash or a kill would
+    /// otherwise leave it empty (every setting, the bridges included, silently back
+    /// to its default) or unparseable (the window refuses to start).
     pub fn save(&self, path: &Path) -> Result<()> {
         self.validate()?;
         if let Some(parent) = path.parent() {
@@ -391,7 +395,7 @@ impl Config {
         let text = format!(
             "# Tornect configuration — https://github.com/Mxrider420z/Tornect\n# Every key is optional; delete a key to restore its default.\n\n{body}"
         );
-        crate::keystore::write_private_file(path, text.as_bytes())?;
+        crate::keystore::write_private_file_atomic(path, text.as_bytes())?;
         Ok(())
     }
 
@@ -506,6 +510,61 @@ panic_key = "Ctrl+Alt+End"
         assert_eq!(cfg2, cfg);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("# Tornect configuration"));
+    }
+
+    /// B14: a save replaces the file whole. Until the new text is complete and
+    /// synced, `config.toml` keeps the old one: a save that fails before its
+    /// rename (here the temporary path is taken by a directory) leaves it
+    /// byte-identical and loadable, where the old in-place write had already
+    /// truncated it. A save that goes through leaves no temporary file, keeps
+    /// the file owner-only and, on Unix, is a new file (a rename), never the
+    /// old one rewritten.
+    #[test]
+    fn a_save_replaces_the_file_whole_or_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg").join("config.toml");
+        let mut cfg = Config::default();
+        cfg.general.device_name = "Before".to_owned();
+        cfg.save(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let tmp = path.with_file_name("config.toml.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let mut changed = cfg.clone();
+        changed.general.device_name = "After".to_owned();
+        assert!(
+            changed.save(&path).is_err(),
+            "the temporary file cannot be written"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the old file is untouched"
+        );
+        assert_eq!(Config::load(&path).unwrap(), cfg);
+        std::fs::remove_dir(&tmp).unwrap();
+
+        // A stale temporary file of an earlier crash is simply overwritten.
+        std::fs::write(&tmp, "half a sett").unwrap();
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(&path).unwrap().ino()
+        };
+        changed.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), changed);
+        assert!(!tmp.exists(), "no temporary file is left");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            let meta = std::fs::metadata(&path).unwrap();
+            assert_ne!(
+                meta.ino(),
+                inode,
+                "replaced by a rename, not rewritten in place"
+            );
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
     }
 
     #[test]
