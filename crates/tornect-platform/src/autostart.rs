@@ -973,8 +973,9 @@ fn desktop_bare(item: &str) -> bool {
 }
 
 /// The `Exec=` value of a desktop entry that runs `exe` with `args`, each item
-/// bare where [`desktop_bare`] allows it and otherwise quoted as
-/// [`desktop_exec`] quotes it, with the same refusals. For an entry that
+/// bare when it is not empty and holds only letters and digits (of any
+/// script) and `/ . _ - + , : @ =`, and otherwise quoted as [`desktop_exec`]
+/// quotes it, with the same refusals. For an entry that
 /// generic `xdg-open` runs (the link entry of `tornect install`): its generic
 /// path splits the value at spaces without reading quotes, so a quoted
 /// program never runs there (`docs/research/links.md` finding 1). GIO and
