@@ -1,0 +1,7 @@
+Connect to my computer with Tornect.
+
+My Tornect ID: rkeohxlu bhyzl7ks 3mwtzos5 olfgocn7 dwkbeg7t oseadnap n5optfad
+Link: tornect://qe4xodvipulv6vvdkrtmgtd6ztfy3curwtxdpis56yhvxd6jwokbr4qd
+
+No Tornect yet? Get it for Linux or Windows: https://github.com/Mxrider007/Tornect/releases
+The first time you connect, both screens show a 6-digit code: go on only if they match.

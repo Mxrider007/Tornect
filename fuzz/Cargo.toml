@@ -55,5 +55,14 @@ test = false
 doc = false
 bench = false
 
+# Invitation links (design `invite` §4.1–§4.2): `tornect-core::invite::{parse_link, find_id}`
+# and `TornectId::from_str` over arbitrary text; seeds in `seeds/invite/`.
+[[bin]]
+name = "invite"
+path = "fuzz_targets/invite.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

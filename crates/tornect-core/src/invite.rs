@@ -405,6 +405,8 @@ mod tests {
     use super::*;
     use data_encoding::BASE32_NOPAD;
     use ed25519_dalek::SigningKey;
+    use proptest::prelude::*;
+    use proptest::test_runner::TestCaseError;
 
     /// The ID of the ed25519 key with this seed: always a valid curve point.
     fn key_id(seed: [u8; 32]) -> TornectId {
@@ -792,5 +794,340 @@ mod tests {
         assert_eq!(invitation(&id), expected);
         assert_eq!(invitation(&id).lines().count(), 7);
         assert!(!invitation(&id).contains('\r'));
+    }
+
+    /// The design's table (§3): every message, every log name, and the single
+    /// character `NotAlphabet` may echo.
+    #[test]
+    fn every_problem_has_its_message_and_log_name() {
+        use IdProblem::*;
+        let table = [
+            (Empty, "empty", "No Tornect ID was given"),
+            (Short { found: 12 }, "short", "12 of 56 characters"),
+            (
+                Long { found: 60 },
+                "long",
+                "60 of 56 characters: 4 too many",
+            ),
+            (
+                NeverDigit,
+                "never_digit",
+                "IDs never contain 0, 1, 8 or 9 (perhaps the letter o, i, l, b or g)",
+            ),
+            (
+                NotAlphabet(Some('$')),
+                "not_alphabet",
+                "IDs hold only the letters a–z and the digits 2–7, never “$”",
+            ),
+            (
+                NotAlphabet(None),
+                "not_alphabet",
+                "IDs hold only the letters a–z and the digits 2–7",
+            ),
+            (
+                Version,
+                "version",
+                "That is an onion address of another version, not a Tornect ID",
+            ),
+            (
+                Checksum,
+                "checksum",
+                "A character is wrong somewhere: compare the ID again, character by character",
+            ),
+            (
+                NotAKey,
+                "not_a_key",
+                "That ID has the right shape but is no computer's key: check for a typo",
+            ),
+            (NotALink, "not_a_link", "That is not a tornect:// link"),
+            (
+                LinkExtras,
+                "link_extras",
+                "That link holds more than a Tornect ID; Tornect takes only tornect://<ID>",
+            ),
+            (
+                Several,
+                "several",
+                "That text holds more than one Tornect ID: paste only the one you want",
+            ),
+            (NoId, "no_id", "No Tornect ID in that text"),
+            (
+                TooLong,
+                "too_long",
+                "That text is too long to hold an invitation",
+            ),
+        ];
+        for (problem, name, message) in table {
+            assert_eq!(problem.to_string(), message, "{problem:?}");
+            assert_eq!(problem.name(), name, "{problem:?}");
+        }
+        let mut names: Vec<&str> = table.iter().map(|(p, ..)| p.name()).collect();
+        names.dedup();
+        assert_eq!(names.len(), 13, "one name per variant");
+        assert!(
+            names
+                .iter()
+                .all(|n| n.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+        );
+        assert_eq!(Short { found: 0 }.to_string(), "0 of 56 characters");
+        assert_eq!(
+            Long { found: 4096 }.to_string(),
+            "4096 of 56 characters: 4040 too many"
+        );
+        let bare = NotAlphabet(None).to_string();
+        for hidden in ['\u{202e}', '\u{200b}', '\0', '\n', ' ', 'é', '€', '“'] {
+            assert_eq!(NotAlphabet(Some(hidden)).to_string(), bare, "{hidden:?}");
+        }
+    }
+
+    /// One source for the download location (design §6 prerequisite): the
+    /// workspace `repository` field, which this pins.
+    #[test]
+    fn the_download_url_is_the_canonical_releases_page() {
+        assert_eq!(
+            DOWNLOAD_URL,
+            "https://github.com/Mxrider007/Tornect/releases"
+        );
+        assert_eq!(
+            DOWNLOAD_URL,
+            format!("{}/releases", env!("CARGO_PKG_REPOSITORY"))
+        );
+        assert!(invitation(&a()).contains(&format!(": {DOWNLOAD_URL}\n")));
+    }
+
+    /// The committed seeds of the `invite` fuzz target (`fuzz/seeds/invite/`, the
+    /// corpus policy of decision M1-36), embedded at compile time so this test needs
+    /// no path at run time, and what each one gives.
+    #[test]
+    fn the_fuzz_seeds_answer_as_recorded() {
+        use IdProblem::*;
+        macro_rules! seed {
+            ($name:literal) => {
+                (
+                    $name,
+                    include_str!(concat!("../../../fuzz/seeds/invite/", $name)),
+                )
+            };
+        }
+        let found = |source, stripped| {
+            Ok(Found {
+                id: a(),
+                source,
+                stripped,
+            })
+        };
+        let seeds = [
+            (seed!("link.txt"), Ok(a()), found(Source::Link, false)),
+            (seed!("link-upper.txt"), Ok(a()), found(Source::Link, false)),
+            (seed!("link-params.txt"), Err(LinkExtras), Err(LinkExtras)),
+            // Over the link bound by its padding alone; a field trims it.
+            (
+                seed!("link-too-long.txt"),
+                Err(LinkExtras),
+                found(Source::Link, false),
+            ),
+            (
+                seed!("grouped.txt"),
+                Err(NotALink),
+                found(Source::Typed, false),
+            ),
+            (
+                seed!("hyphenated.txt"),
+                Err(NotALink),
+                found(Source::Typed, false),
+            ),
+            (
+                seed!("onion.txt"),
+                Err(NotALink),
+                found(Source::Typed, false),
+            ),
+            (
+                seed!("sentence.txt"),
+                Err(NotALink),
+                found(Source::Text, false),
+            ),
+            (
+                seed!("invitation.txt"),
+                Err(LinkExtras),
+                found(Source::Text, false),
+            ),
+            (
+                seed!("invitation-two-ids.txt"),
+                Err(LinkExtras),
+                Err(Several),
+            ),
+            (
+                seed!("invitation-link-params.txt"),
+                Err(LinkExtras),
+                Err(LinkExtras),
+            ),
+            (
+                seed!("zero-width-space.txt"),
+                Err(NotALink),
+                found(Source::Typed, true),
+            ),
+            (
+                seed!("bidi-override.txt"),
+                Err(NotALink),
+                Err(NotAlphabet(None)),
+            ),
+            (seed!("not-a-key.txt"), Err(NotALink), Err(NotAKey)),
+            (seed!("checksum.txt"), Err(NotALink), Err(Checksum)),
+            (seed!("version-2.txt"), Err(NotALink), Err(Version)),
+            (
+                seed!("cut-inside-a-character.txt"),
+                Err(NotALink),
+                Err(NotAlphabet(None)),
+            ),
+        ];
+        for ((name, text), link, field) in seeds {
+            assert_eq!(parse_link(text), link, "{name}");
+            assert_eq!(find_id(text), field, "{name}");
+        }
+        assert_eq!(seed!("invitation.txt").1, invitation(&a()));
+        assert_eq!(seed!("link.txt").1, link(&a()));
+        assert_eq!(seed!("grouped.txt").1, a().display_groups());
+        assert_eq!(seed!("not-a-key.txt").1, not_a_key().display_groups());
+        assert_eq!(seed!("version-2.txt").1, version_2(&a()));
+        assert_eq!(seed!("checksum.txt").1, checksum_typo(&a()));
+        assert_eq!(
+            seed!("invitation-two-ids.txt").1,
+            invitation(&a()).replace(&link(&a()), &link(&b()))
+        );
+    }
+
+    /// What holds for every input, whatever it is: an answer, never a panic; a
+    /// found ID is a usable key; a link that parses is what a field reads too; the
+    /// size bounds come first; no message renders a character of the input other
+    /// than one printable ASCII character.
+    fn answered(text: &str) -> Result<(), TestCaseError> {
+        let link = parse_link(text);
+        let field = find_id(text);
+        let _ = text.parse::<TornectId>();
+        if let Ok(id) = link {
+            prop_assert!(id.verifying_key().is_ok());
+            prop_assert_eq!(field, linked(id));
+        }
+        if let Ok(found) = field {
+            prop_assert!(found.id.verifying_key().is_ok());
+        }
+        if text.len() > MAX_LINK {
+            prop_assert_eq!(link, Err(IdProblem::LinkExtras));
+        }
+        if text.len() > MAX_TEXT {
+            prop_assert_eq!(field, Err(IdProblem::TooLong));
+        }
+        for problem in [link.err(), field.err()].into_iter().flatten() {
+            let shown = problem.to_string();
+            prop_assert!(
+                shown
+                    .chars()
+                    .all(|c| c.is_ascii_graphic() || matches!(c, ' ' | '–' | '“' | '”')),
+                "{:?}",
+                shown
+            );
+        }
+        Ok(())
+    }
+
+    fn valid_id() -> impl Strategy<Value = TornectId> {
+        any::<[u8; 32]>().prop_map(key_id)
+    }
+
+    /// Pieces of text that reach every reading: IDs, groups and links (valid ones),
+    /// alphabet runs of a group's length, the scheme and suffix, URL punctuation,
+    /// whitespace, invisible and bidi characters, any character.
+    fn piece() -> impl Strategy<Value = String> {
+        prop_oneof![
+            valid_id().prop_map(|id| id.base32()),
+            valid_id().prop_map(|id| id.display_groups()),
+            valid_id().prop_map(|id| link(&id)),
+            "[a-z2-7]{8}",
+            "[a-zA-Z0-9]{1,60}",
+            Just("tornect:".to_owned()),
+            Just("TORNECT://".to_owned()),
+            Just(".onion".to_owned()),
+            "[ \t\n\u{a0}\u{200b}\u{feff}\u{202e}.,:/?#@%&=;+()<>“”«-]{1,3}",
+            any::<char>().prop_map(String::from),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn a_link_reads_back_as_its_id(id in valid_id(), pk in any::<[u8; 32]>()) {
+            prop_assert_eq!(parse_link(&link(&id)), Ok(id));
+            prop_assert_eq!(find_id(&link(&id)), linked(id));
+            // Any 32 bytes: the link reads back exactly when they are a key.
+            let raw = TornectId::from_bytes(pk);
+            let expected = raw.verifying_key().map(|_| raw).map_err(|_| IdProblem::NotAKey);
+            prop_assert_eq!(parse_link(&link(&raw)), expected);
+        }
+
+        #[test]
+        fn an_invitation_gives_its_id(id in valid_id()) {
+            prop_assert_eq!(find_id(&invitation(&id)), text(id));
+            prop_assert_eq!(find_id(&invitation(&id).replace('\n', "\r\n")), text(id));
+        }
+
+        #[test]
+        fn groups_are_a_typed_id(id in valid_id()) {
+            prop_assert_eq!(find_id(&id.display_groups()), typed(id, false));
+            prop_assert_eq!(find_id(&id.onion_address()), typed(id, false));
+        }
+
+        /// Arbitrary text up to 8 KiB (2048 characters of up to four bytes).
+        #[test]
+        fn any_text_is_answered(chars in proptest::collection::vec(any::<char>(), 0..2048)) {
+            answered(&String::from_iter(chars))?;
+        }
+
+        /// Text built from pieces that reach the link, typed and free-text readings,
+        /// mostly under the 4096-byte bound.
+        #[test]
+        fn token_soups_are_answered(pieces in proptest::collection::vec(piece(), 0..40)) {
+            answered(&pieces.concat())?;
+        }
+
+        /// Arbitrary bytes up to 8 KiB, read as the fuzz target reads them.
+        #[test]
+        fn any_bytes_are_answered(bytes in proptest::collection::vec(any::<u8>(), 0..8192)) {
+            answered(&String::from_utf8_lossy(&bytes))?;
+        }
+
+        /// A valid link, grouped ID or invitation with one character inserted
+        /// anywhere: the inputs closest to the accepting paths.
+        #[test]
+        fn near_misses_are_answered(
+            id in valid_id(),
+            form in 0..3usize,
+            at in any::<proptest::sample::Index>(),
+            c in prop_oneof![
+                any::<char>(),
+                proptest::sample::select(vec![
+                    ' ', '/', '.', '-', '?', ':', '0', '\u{200b}', '\u{202e}', '€', '"',
+                ]),
+            ],
+        ) {
+            let base = match form {
+                0 => link(&id),
+                1 => id.display_groups(),
+                _ => invitation(&id),
+            };
+            let mut chars: Vec<char> = base.chars().collect();
+            chars.insert(at.index(chars.len() + 1), c);
+            answered(&String::from_iter(chars))?;
+        }
+
+        /// `NotAlphabet` renders its character exactly when it is printable ASCII.
+        #[test]
+        fn a_problem_never_renders_a_hidden_character(c in any::<char>()) {
+            let bare = IdProblem::NotAlphabet(None).to_string();
+            let expected = if c.is_ascii_graphic() {
+                format!("{bare}, never “{c}”")
+            } else {
+                bare
+            };
+            prop_assert_eq!(IdProblem::NotAlphabet(Some(c)).to_string(), expected);
+        }
     }
 }
