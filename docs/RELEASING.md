@@ -44,7 +44,10 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
    network the first time (the tor-expert-bundles). First it runs the gate's `cargo deny
    --offline check` and refuses to go on without an advisory database, or with one more than 7
    days old (review note I-2; `--allow-old-advisory-db` overrides that, and the release notes
-   must then say so); it prints the database's age.
+   must then say so); it prints the database's age. It refuses to run with a
+   `CARGO_PROFILE_RELEASE_*` variable set: `BUILD-INFO.txt`'s profile line is read from
+   `Cargo.toml`'s `[profile.release]`, and such a variable would change the build behind it (audit
+   finding B30).
    Per platform it:
    - fetches or re-checks lyrebird (`cargo xtask pt-fetch`, `packaging/pt/SOURCES.md`);
    - runs `cargo build --locked --release --target <triple> -p tornect` into `target/dist/cargo/`
