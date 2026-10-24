@@ -2684,6 +2684,575 @@ async fn stats_come_about_once_per_period_with_the_stages_means() {
     );
 }
 
+/// Read, acknowledging every `Video`, until the host has said nothing for
+/// `quiet`: what it said meanwhile.
+async fn drain(client: &mut DuplexStream, quiet: Duration) -> Vec<Msg> {
+    let mut said = Vec::new();
+    while let Ok(msg) = tokio::time::timeout(quiet, read_msg(client)).await {
+        let msg = msg.unwrap().expect("the stream is open");
+        if let Msg::Video { seq, .. } = msg {
+            write_msg(client, &Msg::VideoAck { seq }).await.unwrap();
+        }
+        said.push(msg);
+    }
+    said
+}
+
+/// A raw viewer's decoder, fed every picture in order.
+struct Decoded(H264Decoder);
+
+impl Decoded {
+    fn new() -> Self {
+        Self(H264Decoder::new().unwrap())
+    }
+
+    /// Decode `data`: the picture's card index and size.
+    fn picture(&mut self, data: &[u8]) -> (Option<u32>, (u32, u32)) {
+        let frame = self.0.decode(data).unwrap().expect("a picture");
+        (
+            TestCard::read_index(&frame.rgba, frame.width, frame.height),
+            (frame.width, frame.height),
+        )
+    }
+}
+
+/// Three pictures, then the card held still (as GDI is while a secure screen
+/// shows) and what was on its way read, acknowledged and decoded: the card
+/// index of the last picture, the one a quality change encodes again.
+async fn go_still(rig: &Rig, client: &mut DuplexStream, decoded: &mut Decoded) -> u32 {
+    let mut last = None;
+    let mut pictures = 0;
+    let since = tokio::time::Instant::now();
+    while pictures < 3 {
+        in_time(since, "three pictures");
+        if let Msg::Video { data, .. } = next_acking(client).await {
+            last = decoded.picture(&data).0;
+            pictures += 1;
+        }
+    }
+    rig.backend.stalled.store(true, Ordering::SeqCst);
+    for msg in drain(client, Duration::from_millis(500)).await {
+        if let Msg::Video { data, .. } = msg {
+            last = decoded.picture(&data).0;
+        }
+    }
+    last.expect("the card's index")
+}
+
+/// The host's answer to a pick: its `Quality`, then the picture after it
+/// (`Stats` may go out between), acknowledged: the `Quality`, the picture's
+/// flags and its access unit.
+async fn answer(client: &mut DuplexStream) -> (Msg, u8, Vec<u8>) {
+    let since = tokio::time::Instant::now();
+    let said = loop {
+        in_time(since, "the Quality");
+        match next_acking(client).await {
+            msg @ Msg::Quality { .. } => break msg,
+            Msg::Stats(_) => {}
+            other => panic!("before the Quality: {other:?}"),
+        }
+    };
+    loop {
+        in_time(since, "the picture after the Quality");
+        match next_acking(client).await {
+            Msg::Video { flags, data, .. } => return (said, flags, data),
+            Msg::Stats(_) => {}
+            other => panic!("after the Quality: {other:?}"),
+        }
+    }
+}
+
+/// Close the stream as a viewer does and return the host's report.
+async fn close_and_report(
+    client: &mut DuplexStream,
+    served: JoinHandle<MediaOutcome>,
+) -> MediaReport {
+    write_msg(
+        client,
+        &Msg::Close {
+            reason: reason::ENDED_BY_VIEWER,
+        },
+    )
+    .await
+    .unwrap();
+    let MediaOutcome::Served { report, end, .. } =
+        tokio::time::timeout(WAIT, served).await.unwrap().unwrap()
+    else {
+        panic!("not served");
+    };
+    assert_eq!(end, MediaEnd::ViewerLeft);
+    report
+}
+
+/// The quality design §8 host test 5: on a still screen a `SetQuality` is
+/// answered at once, without anything moving on the desktop: a `Quality`
+/// naming the new preset and an IDR of the last picture again (the same card
+/// index), within a poll of the capture thread and 200 ms. Nothing more
+/// comes while the screen stays still.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quality_change_on_a_still_screen_is_answered_within_a_poll() {
+    let rig = rig(MediaLimits::default());
+    let (_, binding) = start(&rig.host, 70, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    let mut decoded = Decoded::new();
+    let last = go_still(&rig, &mut client, &mut decoded).await;
+
+    let asked = std::time::Instant::now();
+    write_msg(
+        &mut client,
+        &Msg::SetQuality {
+            quality: quality::BEST_PERFORMANCE,
+        },
+    )
+    .await
+    .unwrap();
+    let (said, flags, data) = answer(&mut client).await;
+    let took = asked.elapsed();
+    assert_eq!(
+        said,
+        Msg::Quality {
+            width: 256,
+            height: 96,
+            quality: BEST_PERFORMANCE,
+        }
+    );
+    assert!(
+        took <= host::POLL + Duration::from_millis(200),
+        "answered after {took:?}"
+    );
+    assert_ne!(flags & video_flags::KEYFRAME, 0, "an IDR");
+    assert_eq!(
+        decoded.picture(&data),
+        (Some(last), (256, 96)),
+        "the last picture again"
+    );
+    let after = drain(&mut client, Duration::from_millis(400)).await;
+    assert!(
+        !after.iter().any(|msg| matches!(msg, Msg::Video { .. })),
+        "the screen is still: {after:?}"
+    );
+    let report = close_and_report(&mut client, served).await;
+    assert_eq!(
+        (
+            report.repeats,
+            report.quality_changes,
+            report.keyframes_forced
+        ),
+        (1, 1, 0)
+    );
+}
+
+/// Host test 6: on a still screen, a second pick 100 ms after the first is
+/// answered once the gate's interval since the first is over, not sooner,
+/// and again with the last picture (no new capture).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_pick_within_the_interval_is_answered_when_it_is_over() {
+    let interval = Duration::from_millis(300);
+    let rig = rig(MediaLimits {
+        quality_interval: interval,
+        keyframe_interval: interval,
+        ..MediaLimits::default()
+    });
+    let (_, binding) = start(&rig.host, 71, SessionMode::ViewOnly);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    let mut decoded = Decoded::new();
+    let last = go_still(&rig, &mut client, &mut decoded).await;
+
+    let asked = std::time::Instant::now();
+    for (quality, wait) in [
+        (quality::BEST_PERFORMANCE, Duration::from_millis(100)),
+        (quality::BEST_QUALITY, Duration::ZERO),
+    ] {
+        write_msg(&mut client, &Msg::SetQuality { quality })
+            .await
+            .unwrap();
+        tokio::time::sleep(wait).await;
+    }
+    let (said, flags, data) = answer(&mut client).await;
+    assert!(
+        matches!(
+            said,
+            Msg::Quality {
+                quality: BEST_PERFORMANCE,
+                ..
+            }
+        ),
+        "{said:?}"
+    );
+    assert_ne!(flags & video_flags::KEYFRAME, 0);
+    assert_eq!(decoded.picture(&data).0, Some(last));
+
+    let (said, flags, data) = answer(&mut client).await;
+    let took = asked.elapsed();
+    assert_eq!(
+        said,
+        Msg::Quality {
+            width: 256,
+            height: 96,
+            quality: BEST_QUALITY,
+        }
+    );
+    // The first action came after `asked`, and the next one an interval
+    // after it at the soonest.
+    assert!(took >= interval, "answered after {took:?}");
+    assert!(
+        took <= interval + host::POLL + Duration::from_millis(400),
+        "answered after {took:?}"
+    );
+    assert_ne!(flags & video_flags::KEYFRAME, 0);
+    assert_eq!(
+        decoded.picture(&data).0,
+        Some(last),
+        "no new picture was captured"
+    );
+    let report = close_and_report(&mut client, served).await;
+    assert_eq!(
+        (
+            report.quality_requests,
+            report.quality_changes,
+            report.repeats
+        ),
+        (2, 2, 2)
+    );
+}
+
+/// `picks` (cycled) sent every 5 ms for `flood` to a host serving a still
+/// screen, with what the host wrote meanwhile read on another task, stamped
+/// from just before the first pick; then a `Close` after one more `wait`.
+/// Returns the stamped frames, the picks sent and the host's report.
+async fn flood_of_picks(
+    rig: &Rig,
+    seed: u8,
+    picks: &[u8],
+    flood: Duration,
+    wait: Duration,
+) -> (Vec<(Duration, Msg)>, u64, MediaReport) {
+    let (_, binding) = start(&rig.host, seed, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    go_still(rig, &mut client, &mut Decoded::new()).await;
+    let (mut rd, mut wr) = tokio::io::split(client);
+    let started = std::time::Instant::now();
+    let reader = tokio::spawn(async move {
+        let mut said = Vec::new();
+        while let Some(msg) = read_msg(&mut rd).await.unwrap() {
+            said.push((started.elapsed(), msg));
+        }
+        said
+    });
+    let mut sent = 0u64;
+    for &quality in picks.iter().cycle() {
+        if started.elapsed() >= flood {
+            break;
+        }
+        write_msg(&mut wr, &Msg::SetQuality { quality })
+            .await
+            .unwrap();
+        sent += 1;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The last pick may wait one more turn of the gate.
+    tokio::time::sleep(wait).await;
+    write_msg(
+        &mut wr,
+        &Msg::Close {
+            reason: reason::ENDED_BY_VIEWER,
+        },
+    )
+    .await
+    .unwrap();
+    let said = tokio::time::timeout(WAIT, reader).await.unwrap().unwrap();
+    let MediaOutcome::Served { report, end, .. } =
+        tokio::time::timeout(WAIT, served).await.unwrap().unwrap()
+    else {
+        panic!("not served");
+    };
+    assert_eq!(end, MediaEnd::ViewerLeft);
+    (said, sent, report)
+}
+
+/// The quality design §5.3 and §8 host test 7: a flood of picks of the
+/// preset in force on a still screen costs a count each and is answered at
+/// most once per interval, with a `Quality` and no encoder work: no
+/// `Video` at all, no change. Within the flood's 3 s, at most
+/// ceil(3 s / 300 ms) + 1 answers; one more may come for the last pick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flood_of_picks_of_the_preset_in_force_is_answered_once_per_interval() {
+    let interval = Duration::from_millis(300);
+    let flood = Duration::from_secs(3);
+    let rig = rig(MediaLimits {
+        quality_interval: interval,
+        ..MediaLimits::default()
+    });
+    let (said, sent, report) = flood_of_picks(
+        &rig,
+        72,
+        &[quality::BALANCED],
+        flood,
+        interval + Duration::from_millis(200),
+    )
+    .await;
+    let mut answers = Vec::new();
+    for (at, msg) in said {
+        match msg {
+            Msg::Quality { .. } => {
+                assert_eq!(
+                    msg,
+                    Msg::Quality {
+                        width: 256,
+                        height: 96,
+                        quality: APPLIED,
+                    }
+                );
+                answers.push(at);
+            }
+            Msg::Close { .. } => {}
+            other => panic!("only answers, never a picture: {other:?}"),
+        }
+    }
+    let most = flood.as_millis().div_ceil(interval.as_millis()) as usize + 1;
+    let within = answers.iter().filter(|&&at| at <= flood).count();
+    assert!(
+        within <= most,
+        "{within} answers within the flood: {answers:?}"
+    );
+    assert!(answers.len() <= most + 1, "{answers:?}");
+    assert!(answers.len() >= 5, "answered at every turn: {answers:?}");
+    assert_eq!(report.quality_requests, sent);
+    assert!(sent > 100, "a flood: {sent}");
+    assert_eq!(
+        (
+            report.quality_changes,
+            report.repeats,
+            report.keyframes_forced
+        ),
+        (0, 0, 0)
+    );
+}
+
+/// Host test 8: a flood alternating between two presets on a still screen
+/// rebuilds the encoder (an IDR of the last picture each time) at most once
+/// per keyframe interval, the longer of the two bounds here: within the
+/// flood's 3 s, at most ceil(3 s / 1 s) + 1; one more may come for the last
+/// pick. Each rebuild is said in a `Quality` before its picture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_alternating_flood_rebuilds_at_most_once_per_keyframe_interval() {
+    let interval = Duration::from_millis(300);
+    let flood = Duration::from_secs(3);
+    let limits = MediaLimits {
+        quality_interval: interval,
+        ..MediaLimits::default()
+    };
+    let turn = limits.keyframe_interval.max(interval);
+    let rig = rig(limits);
+    let (said, sent, report) = flood_of_picks(
+        &rig,
+        73,
+        &[quality::BEST_PERFORMANCE, quality::BEST_QUALITY],
+        flood,
+        turn + Duration::from_millis(300),
+    )
+    .await;
+    let mut rebuilds = Vec::new();
+    let mut said_before = false;
+    for (at, msg) in said {
+        match msg {
+            Msg::Quality { .. } => said_before = true,
+            Msg::Video { flags, .. } => {
+                assert!(said_before, "a rebuild's picture after its Quality");
+                assert_ne!(flags & video_flags::KEYFRAME, 0, "an IDR");
+                said_before = false;
+                rebuilds.push(at);
+            }
+            Msg::Stats(_) | Msg::Close { .. } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    let most = flood.as_millis().div_ceil(turn.as_millis()) as usize + 1;
+    let within = rebuilds.iter().filter(|&&at| at <= flood).count();
+    assert!(
+        within <= most,
+        "{within} rebuilds within the flood: {rebuilds:?}"
+    );
+    assert!(rebuilds.len() <= most + 1, "{rebuilds:?}");
+    assert!(rebuilds.len() >= 2, "rebuilt at every turn: {rebuilds:?}");
+    assert_eq!(report.quality_requests, sent);
+    assert_eq!(report.repeats, rebuilds.len() as u64);
+    assert!(
+        (1..=report.repeats).contains(&report.quality_changes),
+        "{report:?}"
+    );
+    assert_eq!(report.keyframes_forced, 0);
+}
+
+/// Host test 9: a rebuild for a quality change and a `KeyframeRequest`
+/// share one keyframe limiter. A request right after a rebuild forces
+/// nothing; a request a turn later forces an IDR, and a pick of another
+/// preset right after it waits for the limiter's next turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuilds_and_keyframe_requests_share_the_keyframe_limiter() {
+    let turn = Duration::from_millis(600);
+    let rig = rig(MediaLimits {
+        keyframe_interval: turn,
+        quality_interval: Duration::from_millis(300),
+        ..MediaLimits::default()
+    });
+    let (_, binding) = start(&rig.host, 74, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    write_msg(
+        &mut client,
+        &Msg::SetQuality {
+            quality: quality::BEST_PERFORMANCE,
+        },
+    )
+    .await
+    .unwrap();
+    // The card moves: pictures on their way come before the answer.
+    let since = tokio::time::Instant::now();
+    loop {
+        in_time(since, "the Quality for Best performance");
+        if let Msg::Quality {
+            quality: BEST_PERFORMANCE,
+            ..
+        } = next_acking(&mut client).await
+        {
+            break;
+        }
+    }
+    let flags = loop {
+        in_time(since, "the rebuild's picture");
+        match next_acking(&mut client).await {
+            Msg::Video { flags, .. } => break flags,
+            Msg::Stats(_) => {}
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_ne!(flags & video_flags::KEYFRAME, 0);
+    // Right after the rebuild: counted, not forced.
+    write_msg(&mut client, &Msg::KeyframeRequest).await.unwrap();
+    tokio::time::sleep(turn + Duration::from_millis(100)).await;
+
+    // A turn later: forced; and the pick after it waits a turn.
+    let asked = std::time::Instant::now();
+    write_msg(&mut client, &Msg::KeyframeRequest).await.unwrap();
+    write_msg(
+        &mut client,
+        &Msg::SetQuality {
+            quality: quality::BEST_QUALITY,
+        },
+    )
+    .await
+    .unwrap();
+    let mut forced = false;
+    let since = tokio::time::Instant::now();
+    loop {
+        in_time(since, "the Quality for Best quality");
+        match next_acking(&mut client).await {
+            Msg::Quality {
+                quality: BEST_QUALITY,
+                ..
+            } => break,
+            // Pictures the window let out meanwhile, then the forced IDR.
+            Msg::Video { flags, .. } => {
+                forced |= asked.elapsed() < turn && flags & video_flags::KEYFRAME != 0;
+            }
+            Msg::Stats(_) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    let took = asked.elapsed();
+    assert!(took >= turn, "the rebuild came after {took:?}");
+    assert!(forced, "the request a turn later forced an IDR");
+    let report = close_and_report(&mut client, served).await;
+    assert_eq!(
+        (report.keyframe_requests, report.keyframes_forced),
+        (2, 1),
+        "the request right after the rebuild forced nothing"
+    );
+    assert_eq!((report.quality_changes, report.repeats), (2, 2));
+}
+
+/// A desktop whose size changes: a card of one size for its first `after`
+/// pictures, then a card of another.
+struct Resizing {
+    small: TestCard,
+    large: TestCard,
+    after: u32,
+}
+
+impl VideoSource for Resizing {
+    fn name(&self) -> &'static str {
+        "resizing"
+    }
+
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+        if self.after == 0 {
+            return self.large.next_frame(timeout);
+        }
+        let frame = self.small.next_frame(timeout)?;
+        self.after -= u32::from(frame.is_some());
+        Ok(frame)
+    }
+}
+
+/// The quality design §4.1 and §8 host test 15: a source that changes size
+/// (640×360, then 800×600) is said in a `Quality` with the new size before
+/// the first picture at that size, an IDR; every picture decodes at the size
+/// last announced (`BindOk`, then the `Quality`), so a viewer counting
+/// mismatches counts none; the preset stays, so no change is counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_resize_is_said_before_its_first_picture() {
+    let backend = TestBackend {
+        desktop: Mutex::new(Some(Box::new(Resizing {
+            small: TestCard::new(640, 360, 60),
+            large: TestCard::new(800, 600, 60),
+            after: 5,
+        }))),
+        ..TestBackend::default()
+    };
+    let rig = rig_with(backend, MediaLimits::default());
+    let (_, binding) = start(&rig.host, 75, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    let (width, height, info) = bind_preset(&mut client, &binding, quality::BALANCED).await;
+    assert_eq!((width, height, info), (640, 360, APPLIED));
+    let mut announced = (width, height);
+    let mut unannounced = 0;
+    let mut said = Vec::new();
+    let mut sizes = Vec::new();
+    let mut decoded = Decoded::new();
+    let since = tokio::time::Instant::now();
+    while sizes.iter().filter(|(size, _)| *size == (800, 600)).count() < 5 {
+        in_time(since, "five pictures at the new size");
+        match next_acking(&mut client).await {
+            Msg::Quality {
+                width,
+                height,
+                quality,
+            } => {
+                announced = (width, height);
+                said.push((width, height, quality));
+            }
+            Msg::Video { flags, data, .. } => {
+                let (_, size) = decoded.picture(&data);
+                unannounced += usize::from(size != announced);
+                sizes.push((size, flags & video_flags::KEYFRAME != 0));
+            }
+            Msg::Stats(_) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(unannounced, 0, "{sizes:?}");
+    assert_eq!(said, [(800, 600, APPLIED)]);
+    let first_large = sizes.iter().position(|(size, _)| *size == (800, 600));
+    assert_eq!(first_large, Some(5), "{sizes:?}");
+    assert!(sizes[5].1, "the first picture at the new size is an IDR");
+    let report = close_and_report(&mut client, served).await;
+    assert_eq!((report.quality_changes, report.repeats), (0, 0));
+}
+
 /// The quality design §8 host test 14: a viewer's `Quality` or `Stats`, the
 /// host's own messages, ends the stream as a protocol error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
