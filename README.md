@@ -113,9 +113,9 @@ M2, so that two machines hold a real session over Tor first; only `m0` is tagged
 ## Security
 
 Threat model, consent architecture and the unattended-access design are specified
-in `docs/PLAN.md` §B.6 and §B.8. Until a `SECURITY.md` with a disclosure process
-exists (planned for M8), please report security issues privately to the repository
-owner rather than in public issues.
+in `docs/PLAN.md` §B.6 and §B.8. To report a vulnerability, use GitHub's private
+vulnerability reporting, never a public issue: [`SECURITY.md`](SECURITY.md) says how,
+and what is in scope. There is no bug bounty.
 
 ## Development with Claude Code
 
