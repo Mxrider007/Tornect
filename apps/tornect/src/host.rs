@@ -1090,11 +1090,19 @@ const MAX_LEAD: u64 = 15 * 60;
 /// §B.8.5.1), and the length written at the end counts from it: `at +
 /// duration_secs` is then the session's end, and a session cut at its signed
 /// `ends_at` (reckoned post-F2, before the block window) counts as full
-/// length. Should `last_used` hold an earlier session's end at the start (that
-/// session's cooldown ran out between the PAKE and the post-F2 check), the
-/// start is recorded first. Only a device's latest session writes its end, so
-/// an older one ending after a newer one of the same device started
-/// (`BYE{REPLACED}`) leaves the newer one's record alone.
+/// length: the length is counted in the wall clock's whole seconds, as `at`
+/// and `ends_at` are, so such a session ends exactly at `at + max_session_secs`
+/// or later (the monotonic time alone, rounded down twice, read it a second
+/// short of the maximum, which leaves no cooldown). The monotonic time counts
+/// where it is the longer, when the wall went back during the session; a wall
+/// that jumped forward makes a session longer, never shorter, so no session
+/// that ran its maximum escapes the cooldown. Should `last_used` hold an earlier
+/// session's end at the start (that session's cooldown ran out between the
+/// PAKE and the post-F2 check), the start is recorded first. Only a device's
+/// latest session writes its end, so an older one ending after a newer one of
+/// the same device started (`BYE{REPLACED}`) leaves the newer one's record
+/// alone. A session whose host process ends without the session's end (killed,
+/// crashed) records no length, and so no cooldown follows it.
 pub struct UnattendedUse {
     inner: Arc<dyn SessionSink>,
     store: tornect_core::unattended::store::GrantStore,
@@ -1112,7 +1120,9 @@ struct UseState {
 
 struct UseStart {
     device: tornect_core::DeviceId,
-    /// The store clock's monotonic reading at the start.
+    /// The store clock's wall reading at the start (unix seconds).
+    wall: u64,
+    /// Its monotonic reading, just after.
     mono: Duration,
     /// Seconds from the PAKE success to the start.
     lead: u64,
@@ -1158,7 +1168,11 @@ impl UnattendedUse {
         }
         let device = session.device;
         let clock = Arc::clone(self.store.clock());
-        let (wall, mono) = (clock.wall(), clock.mono());
+        // The wall first, the monotonic reading after it, and the other way round
+        // at the end: the monotonic span then never exceeds the wall's where the
+        // two clocks agree ([`session_secs`]).
+        let wall = clock.wall();
+        let mono = clock.mono();
         let lead = match self.store.grant(&device).and_then(|g| g.last_used) {
             // This session's own PAKE success: `settle(Ok)` writes no length.
             Some(last) if last.duration_secs == 0 && last.at <= wall => {
@@ -1179,6 +1193,7 @@ impl UnattendedUse {
             session.session_id.to_owned(),
             UseStart {
                 device,
+                wall,
                 mono,
                 lead,
                 seq,
@@ -1198,13 +1213,10 @@ impl UnattendedUse {
             st.latest.remove(&start.device);
             start
         };
-        let ran = self
-            .store
-            .clock()
-            .mono()
-            .saturating_sub(start.mono)
-            .as_secs()
-            .saturating_add(start.lead);
+        let clock = self.store.clock();
+        let mono = clock.mono();
+        let wall = clock.wall();
+        let ran = session_secs((start.wall, start.mono), (wall, mono)).saturating_add(start.lead);
         let secs = u32::try_from(ran).unwrap_or(u32::MAX);
         if let Err(e) = self
             .store
@@ -1213,6 +1225,17 @@ impl UnattendedUse {
             not_recorded(&start.device, &e, "length");
         }
     }
+}
+
+/// How long a session ran from `start` to `end` (each a wall reading in unix
+/// seconds and a monotonic reading), in whole seconds: the wall's span, which
+/// `last_used.at` and the signed `ends_at` count in, or the monotonic span
+/// rounded down where that is longer (the wall went back meanwhile). Where the
+/// clocks agree the monotonic span, rounded down, is never the longer, so the
+/// wall's counts exactly.
+fn session_secs(start: (u64, Duration), end: (u64, Duration)) -> u64 {
+    let wall = end.0.saturating_sub(start.0);
+    wall.max(end.1.saturating_sub(start.1).as_secs())
 }
 
 /// A session's `what` that did not reach its grant: expected when the grant
@@ -3374,6 +3397,153 @@ mod tests {
         let generation = store.generation();
         assert_eq!(periodic_upkeep(&store, Probe::Ok), Probe::Ok);
         assert_eq!(store.generation(), generation);
+    }
+
+    /// B12 review: a session cut at its signed `ends_at` counts as full length
+    /// whatever the sub-second phases of the PAKE, the start and the cut, so the
+    /// device's next request is refused `COOLDOWN`. Both parts of the length
+    /// were rounded down: such a session read `max_session_secs - 1`, and no
+    /// cooldown followed it.
+    #[test]
+    fn a_session_cut_at_its_signed_end_is_followed_by_the_cooldown() {
+        use tornect_core::keystore::FileSecretStore;
+        use tornect_core::session_log::Actor;
+        use tornect_core::unattended::clock::{Clock as _, FakeClock};
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{
+            AllowAllPaired, AllowAllReAuth, MutationGuard, NoSessionActivity,
+            RandomServerSetupSource,
+        };
+        use tornect_core::unattended::ipc::GrantOptions;
+        use tornect_core::unattended::limiter::{PostF2Reject, Settle};
+        use tornect_core::unattended::store::GrantStore;
+        use tornect_signal::consent::SessionToken;
+
+        const BASE: u64 = 1_787_961_600;
+        let env = env();
+        let clock = Arc::new(FakeClock::at(BASE));
+        let store = GrantStore::open(
+            &env.paths,
+            Arc::new(FileSecretStore::open(env.paths.keys_dir()).unwrap()),
+            clock.clone(),
+            SessionLog::new(env.paths.sessions_log()),
+        )
+        .unwrap();
+        let guard = MutationGuard::new(
+            store.clone(),
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            Arc::new(tornect_core::levels::FixedFacts::linux()),
+        )
+        .with_paired_devices(Arc::new(AllowAllPaired))
+        .with_server_setup_source(Arc::new(RandomServerSetupSource));
+        guard.master_on(Actor::Cli, &[9; 32]).unwrap();
+        let device = DeviceId::from_bytes([3; 32]);
+        guard
+            .create_grant(
+                Actor::Cli,
+                &device,
+                Preset::HelpingSomeone,
+                &GrantOptions {
+                    waive_attended_precondition: true,
+                    ..GrantOptions::default()
+                },
+                &[0u8; 192],
+                false,
+            )
+            .unwrap();
+        let grant = store.grant(&device).unwrap();
+        let max = grant.max_session_secs.unwrap();
+        assert_eq!(grant.reconnect_cooldown_s, 600);
+        let limiter = AttemptLimiter::new(store.clone());
+        let utc = FixedOffset::utc();
+        let request = || {
+            limiter.charge(&device).unwrap();
+            limiter.settle(&device, Settle::Ok).unwrap();
+            limiter.post_f2(&device, &utc, HostTransport::default())
+        };
+        // Time since BASE in milliseconds: the wall reads its whole seconds,
+        // the monotonic clock all of it.
+        let to = |ms: u64| {
+            let real = Duration::from_millis(ms);
+            clock.set_wall(BASE + real.as_secs());
+            clock.advance_mono(real.saturating_sub(clock.mono()));
+        };
+        let sink = UnattendedUse::new(Arc::new(LiveSessions::new()), store.clone());
+        let token = SessionToken::new([1; 32]);
+
+        // (the PAKE's, the start's, the cut's milliseconds into their seconds)
+        let phases = [
+            (100, 600, 5),
+            (900, 100, 1),
+            (0, 0, 0),
+            (999, 999, 0),
+            (500, 0, 999),
+        ];
+        // Past the 12-hour cooling-off of *Helping someone*.
+        let mut second = 13 * 3600;
+        for (n, (pake, start, cut)) in phases.into_iter().enumerate() {
+            to(second * 1000 + pake);
+            let ends_at = request().expect("a session").ends_at.expect("its maximum");
+            // A ten-second block window, then the session.
+            to((second + 10) * 1000 + start);
+            let id = format!("s{n}");
+            sink.on_start(&LiveSession {
+                device,
+                label: "Laptop",
+                session_id: &id,
+                token: &token,
+                th_final: [0; 32],
+                mode: SessionMode::ViewOnly,
+                elevation: tornect_core::levels::Elevation::None,
+                unattended: true,
+            });
+            // Cut at the first wall reading of its end.
+            to((ends_at - BASE) * 1000 + cut);
+            sink.on_end(&id, None);
+            let last = store.grant(&device).unwrap().last_used.unwrap();
+            assert_eq!(
+                last.at + u64::from(last.duration_secs),
+                ends_at,
+                "{:?}: {} s of {max}",
+                (pake, start, cut),
+                last.duration_secs
+            );
+            assert_eq!(
+                request(),
+                Err(PostF2Reject::Cooldown { retry_after_s: 600 }),
+                "{:?}: the request at once",
+                (pake, start, cut)
+            );
+            second = ends_at - BASE + 601;
+        }
+
+        // The wall set back an hour during a session that then runs its maximum
+        // by the monotonic clock: that counts it full.
+        to(second * 1000 + 300);
+        request().expect("a session");
+        let pake = store.grant(&device).unwrap().last_used.unwrap().at;
+        to((second + 10) * 1000 + 700);
+        sink.on_start(&LiveSession {
+            device,
+            label: "Laptop",
+            session_id: "back",
+            token: &token,
+            th_final: [0; 32],
+            mode: SessionMode::ViewOnly,
+            elevation: tornect_core::levels::Elevation::None,
+            unattended: true,
+        });
+        clock.set_wall(clock.wall() - 3600);
+        clock.advance_mono(Duration::from_secs(u64::from(max) - 10));
+        sink.on_end("back", None);
+        let last = store.grant(&device).unwrap().last_used.unwrap();
+        assert_eq!(last.at, pake);
+        assert!(
+            last.duration_secs >= max,
+            "{} s of {max}",
+            last.duration_secs
+        );
     }
 
     /// Both protocols answer on the one port: a ping stream is served by the
