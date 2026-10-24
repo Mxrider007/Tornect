@@ -593,6 +593,7 @@ mod tests {
             ((1921, 1081), (1920, 1080)),
             ((7680, 2160), (3840, 1080)),
             ((5120, 2880), (3840, 2160)),
+            ((5120, 1440), (3840, 1080)),
             ((1440, 2560), (1440, 2560)),
             ((2160, 3840), (2160, 3840)),
             ((1081, 2561), (1080, 2560)),
@@ -617,6 +618,67 @@ mod tests {
             assert!(au.keyframe, "{w}x{h}: a new size starts with an IDR");
             let frame = dec.decode(&au.data).unwrap().expect("a picture");
             assert_eq!((frame.width, frame.height), (w, h));
+        }
+    }
+
+    /// A BGRx desktop of `screens` side by side, each `w`×`h`, painted in
+    /// turn blue, red, green: the "All screens" picture of a multi-monitor
+    /// host.
+    fn screens(w: u32, h: u32, screens: u32) -> Vec<u8> {
+        const PAINT: [[u8; 4]; 3] = [[255, 0, 0, 255], [0, 0, 255, 255], [0, 255, 0, 255]];
+        let mut out = Vec::with_capacity((w * screens * h * 4) as usize);
+        for _ in 0..h {
+            for screen in 0..screens {
+                for _ in 0..w {
+                    out.extend_from_slice(&PAINT[screen as usize % 3]);
+                }
+            }
+        }
+        out
+    }
+
+    /// The RGBA pixel at `(x, y)` is mostly `channel` (0 red, 2 blue).
+    fn mostly(frame: &DecodedFrame, x: u32, y: u32, channel: usize) -> bool {
+        let at = ((y * frame.width + x) * 4) as usize;
+        let px = &frame.rgba[at..at + 3];
+        (0..3).all(|c| {
+            if c == channel {
+                px[c] > 150
+            } else {
+                px[c] < 90
+            }
+        })
+    }
+
+    /// Monitor design §7 (codec), decision M1-75 (4): "All screens" of
+    /// two 3840×2160 screens (7680×2160) or two 2560×1440 screens
+    /// (5120×1440) is scaled whole to 3840×1080, then encoded and decoded
+    /// at that size. The second screen reaches the picture's right edge:
+    /// at x = 0.9·3840 the picture is red, where the old crop to the
+    /// top-left 3840 columns showed only the blue first screen.
+    #[test]
+    fn all_screens_wider_than_the_codec_are_scaled_whole_not_cropped() {
+        let mut scaler = Scaler::default();
+        for (w, h) in [(3840, 2160), (2560, 1440)] {
+            let desktop = screens(w, h, 2);
+            let fitted = scaler
+                .fit(&desktop, 2 * w, h, ResolutionCap::CODEC)
+                .unwrap();
+            assert_eq!((fitted.width, fitted.height), (3840, 1080), "{w}x{h}");
+            assert!(fitted.scaled);
+            let mut enc = H264Encoder::new(EncoderSettings::default()).unwrap();
+            let au = enc
+                .encode(fitted.bgrx, fitted.width, fitted.height)
+                .unwrap();
+            let mut dec = H264Decoder::new().unwrap();
+            let frame = dec.decode(&au.data).unwrap().expect("a picture");
+            assert_eq!((frame.width, frame.height), (3840, 1080), "{w}x{h}");
+            for y in [0, 540, 1079] {
+                assert!(mostly(frame, 0, y, 2), "{w}x{h}: blue at the left edge");
+                assert!(mostly(frame, 384, y, 2), "{w}x{h}: blue at 0.1");
+                assert!(mostly(frame, 3456, y, 0), "{w}x{h}: red at 0.9, row {y}");
+                assert!(mostly(frame, 3839, y, 0), "{w}x{h}: red at the right edge");
+            }
         }
     }
 

@@ -859,6 +859,51 @@ mod tests {
         assert!(scaler.out.is_empty(), "no bilinear pass and no crop");
     }
 
+    /// Monitor design §5.1: "All screens" of two 3840×2160 screens under
+    /// the codec's own cap is exactly one box pass to 3840×1080 and
+    /// nothing else: no bilinear pass and no crop, and the picture is that
+    /// pass's buffer.
+    #[test]
+    fn fit_halves_two_4k_screens_to_the_codec_cap_in_one_box_pass() {
+        let mut scaler = Scaler::default();
+        let src = picture(7680, 2160, |x, y| {
+            [(x / 30) as u8, (y * 7) as u8, (x ^ y) as u8]
+        });
+        let mut want = Vec::new();
+        assert_eq!(halve(&src, 7680, 2160, 7680 * 4, &mut want), (3840, 1080));
+        let fitted = scaler.fit(&src, 7680, 2160, ResolutionCap::CODEC).unwrap();
+        assert_eq!(
+            (fitted.width, fitted.height, fitted.scaled),
+            (3840, 1080, true)
+        );
+        assert!(fitted.bgrx == want.as_slice());
+        assert_eq!(fitted.bgrx.as_ptr(), scaler.a.as_ptr());
+        assert!(
+            scaler.b.is_empty() && scaler.out.is_empty(),
+            "one pass only"
+        );
+    }
+
+    /// Monitor design §5.1: "All screens" of two 2560×1440 screens under the
+    /// codec's cap is 4:3, under 2:1 either way, so no box pass runs: the
+    /// one bilinear pass reads the input's region itself.
+    #[test]
+    fn fit_scales_two_1440p_screens_to_the_codec_cap_by_bilinear_alone() {
+        let mut scaler = Scaler::default();
+        let src = picture(5120, 1440, |x, y| {
+            [(x / 20) as u8, (y / 6) as u8, (x ^ y) as u8]
+        });
+        let want = resample(&src, (5120, 1440), (3840, 1080));
+        let fitted = scaler.fit(&src, 5120, 1440, ResolutionCap::CODEC).unwrap();
+        assert_eq!(
+            (fitted.width, fitted.height, fitted.scaled),
+            (3840, 1080, true)
+        );
+        assert!(fitted.bgrx == want.as_slice());
+        assert_eq!(fitted.bgrx.as_ptr(), scaler.out.as_ptr());
+        assert!(scaler.a.is_empty(), "no box pass");
+    }
+
     /// §8: 5120×2880 to 1920×1080 is a box pass (to 2560×1440), then one
     /// bilinear pass.
     #[test]
