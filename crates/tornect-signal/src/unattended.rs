@@ -61,16 +61,62 @@ mod budget {
     pub const HARD_LOCK_QUIET_S: u64 = 60;
 }
 
+/// A one-way flag a task can wait on. Level-triggered: once set it stays set, so
+/// a waiter that starts after [`Latch::set`] returns at once. A bare
+/// `Notify::notify_waiters` wakes only the waiters already registered, and a
+/// pre-emption that landed between the charge and the first poll of the
+/// `AwaitKe3` race was lost (the stale handshake then ran its full 30 s).
+#[derive(Debug, Default)]
+struct Latch {
+    set: AtomicBool,
+    notify: Notify,
+}
+
+impl Latch {
+    fn set(&self) {
+        self.set.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn is_set(&self) -> bool {
+        self.set.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once [`Self::set`] was called, before or after this call.
+    async fn wait(&self) {
+        loop {
+            let mut notified = std::pin::pin!(self.notify.notified());
+            // Registered before the flag is read: a `set` between the read and
+            // the await still wakes this waiter.
+            notified.as_mut().enable();
+            if self.is_set() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// How long a pre-empting stream waits for the stale handshake's charge to be
+/// settled before it charges its own (§B.8.4.5). The stale one settles as soon
+/// as it runs again; past this bound the newer one is answered `UA_BUSY`.
+const PREEMPT_SETTLE: Duration = Duration::from_secs(5);
+
 /// One device's in-flight `AwaitKe3` handshake, as the budget table sees it.
 #[derive(Debug)]
 struct Slot {
-    /// Fired when a newer, freshly signed `SESSION_REQUEST` pre-empts this
+    /// Set when a newer, freshly signed `SESSION_REQUEST` pre-empts this
     /// handshake (§B.8.4.5).
-    cancel: Arc<Notify>,
+    cancel: Arc<Latch>,
     /// Set once the charge is on disk and KE2 is about to go out. Until then the
     /// stream is "between F1 and KE2 written" and a newer one is answered
     /// `UA_BUSY` instead of pre-empting it (§B.8.4.5).
     charged: Arc<AtomicBool>,
+    /// Set once this handshake's charge is settled, or once its handler is gone:
+    /// what a pre-empting stream waits for before it charges. The limiter takes
+    /// one charge per device at a time, so a charge on top of this one's would
+    /// be refused.
+    settled: Arc<Latch>,
     /// When the slot was taken.
     since: Instant,
 }
@@ -116,8 +162,10 @@ const STALE_SLOT: Duration = Duration::from_secs(60);
 struct InFlight {
     device: DeviceId,
     budgets: Arc<Mutex<Budgets>>,
-    cancel: Arc<Notify>,
+    limiter: AttemptLimiter,
+    cancel: Arc<Latch>,
     charged: Arc<AtomicBool>,
+    settled: Arc<Latch>,
 }
 
 impl InFlight {
@@ -126,14 +174,38 @@ impl InFlight {
         self.charged.store(true, Ordering::SeqCst);
     }
 
-    /// Resolves when a newer, freshly signed `SESSION_REQUEST` pre-empts us.
+    /// Settle this handshake's charge, then let a pre-empting stream charge.
+    fn settle(
+        &self,
+        outcome: Settle,
+    ) -> Result<Option<tornect_core::unattended::grant::FailSummary>, LimiterError> {
+        let settled = self.limiter.settle(&self.device, outcome);
+        self.settled.set();
+        settled
+    }
+
+    /// Resolves when a newer, freshly signed `SESSION_REQUEST` pre-empts us,
+    /// also when that happened before this call.
     async fn cancelled(&self) {
-        self.cancel.notified().await;
+        self.cancel.wait().await;
     }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
+        // A handler that goes away charged and unsettled (its task cancelled or
+        // unwinding in `AwaitKe3`) settles here as a lost stream; left pending,
+        // the charge would refuse every request of this device until the next
+        // load settles it (§B.8.5.1).
+        if self.charged.load(Ordering::SeqCst)
+            && !self.settled.is_set()
+            && let Err(e) = self
+                .limiter
+                .settle(&self.device, Settle::Fail(FailKind::Disconnected))
+        {
+            tracing::warn!(peer = ?self.device, error = %e, "an abandoned handshake's charge could not be settled");
+        }
+        self.settled.set();
         if let Ok(mut b) = self.budgets.lock() {
             // Only clear the entry if it is still ours: a pre-empting stream has
             // already installed its own.
@@ -149,8 +221,13 @@ impl Drop for InFlight {
 
 /// What the budget check decided.
 enum Admit {
-    /// Proceed; hold this slot until the handshake ends.
-    Ok(InFlight),
+    /// Proceed; hold `slot` until the handshake ends. `preempted` is the stale
+    /// handshake this request cancelled: its charge must be settled before
+    /// this one charges.
+    Ok {
+        slot: InFlight,
+        preempted: Option<Arc<Latch>>,
+    },
     /// Answer `UA_BUSY`.
     Busy,
     /// Answer nothing at all and close: a hard-locked pk already answered
@@ -532,33 +609,42 @@ impl UnattendedAuth {
         // otherwise a client whose circuit died is locked out for the full 30 s
         // `AwaitKe3` timeout. Only while the older charge is still being
         // persisted is the newer one answered `UA_BUSY`.
+        let mut preempted = None;
         if let Some(existing) = b.in_flight.get(device) {
             if !existing.charged.load(Ordering::SeqCst) {
                 return Admit::Busy;
             }
-            existing.cancel.notify_waiters();
+            existing.cancel.set();
+            preempted = Some(Arc::clone(&existing.settled));
         } else if b.in_flight.len() >= budget::MAX_IN_FLIGHT
             || b.challenges.len() >= budget::MAX_PER_MINUTE
         {
             return Admit::Busy;
         }
-        let cancel = Arc::new(Notify::new());
+        let cancel = Arc::new(Latch::default());
         let charged = Arc::new(AtomicBool::new(false));
+        let settled = Arc::new(Latch::default());
         b.in_flight.insert(
             *device,
             Slot {
                 cancel: Arc::clone(&cancel),
                 charged: Arc::clone(&charged),
+                settled: Arc::clone(&settled),
                 since: now,
             },
         );
         b.challenges.push(now);
-        Admit::Ok(InFlight {
-            device: *device,
-            budgets: Arc::clone(&self.budgets),
-            cancel,
-            charged,
-        })
+        Admit::Ok {
+            slot: InFlight {
+                device: *device,
+                budgets: Arc::clone(&self.budgets),
+                limiter: self.limiter.clone(),
+                cancel,
+                charged,
+                settled,
+            },
+            preempted,
+        }
     }
 
     /// The readiness gate of §B.8.14: `Unknown` never blocks in M1 (fail-open
@@ -752,14 +838,27 @@ impl UnattendedAuth {
         };
 
         // ---- host-wide budgets (§B.8.5.2) ----
-        let slot = match self.admit(&device, false) {
-            Admit::Ok(slot) => slot,
+        let (slot, preempted) = match self.admit(&device, false) {
+            Admit::Ok { slot, preempted } => (slot, preempted),
             Admit::Busy | Admit::Silent => {
                 return Ok(UnattendedVerdict::Reject(SessionReject::new(
                     reject::UA_BUSY,
                 )));
             }
         };
+        // §B.8.4.5: the cancelled handshake is settled as a failure and this
+        // stream continues. Until it is settled its charge is pending, and the
+        // limiter refuses a second one; so wait for it, bounded, and answer the
+        // retryable `UA_BUSY` should it not settle in time.
+        if let Some(settled) = preempted
+            && tokio::time::timeout(PREEMPT_SETTLE, settled.wait())
+                .await
+                .is_err()
+        {
+            return Ok(UnattendedVerdict::Reject(SessionReject::new(
+                reject::UA_BUSY,
+            )));
+        }
 
         // ---- material for the PAKE, read before anything is charged ----
         let Some(setup_bytes) = self.limiter.store().server_setup() else {
@@ -805,25 +904,33 @@ impl UnattendedAuth {
         // ---- charge (write-ahead, fsynced) — only then may KE2 be written ----
         let charged = match self.limiter.charge(&device) {
             Ok(c) => c,
-            Err(LimiterError::Refused(r) | LimiterError::Locked(r)) => {
-                return Ok(UnattendedVerdict::Reject(gate_reject(r)));
-            }
-            Err(_) => {
-                return Ok(UnattendedVerdict::Reject(SessionReject::new(
-                    reject::NOT_GRANTED,
-                )));
+            Err(e) => {
+                // A gate refusal is answered as the gate answers it. A charge
+                // still pending (another handshake of this device not settled)
+                // or one that could not be written is the host's state, not
+                // the grant's: the retryable `UA_BUSY`, never `NOT_GRANTED`,
+                // which tells the client that access was never given.
+                let rej = match e.reject() {
+                    Some(r) => gate_reject(r),
+                    None => {
+                        tracing::warn!(peer = ?device, error = %e, "the charge was not taken; answered busy");
+                        SessionReject::new(reject::UA_BUSY)
+                    }
+                };
+                return Ok(UnattendedVerdict::Reject(rej));
             }
         };
-        debug_assert_eq!(charged.grant_id, gate.grant_id);
         // The charge is on disk: from here a newer verified `SESSION_REQUEST`
-        // from this pk pre-empts us rather than being answered `UA_BUSY`.
+        // from this pk pre-empts us rather than being answered `UA_BUSY`, and a
+        // handler dropped before its settlement settles it on the way out.
         slot.mark_charged();
+        debug_assert_eq!(charged.grant_id, gate.grant_id);
 
         let (host_login, ke2) =
             match auth::HostLogin::start(&setup, &stored, ke1, &device_pk, &ctx_bytes, ids) {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = self.limiter.settle(&device, Settle::Fail(FailKind::BadKe3));
+                    let _ = slot.settle(Settle::Fail(FailKind::BadKe3));
                     tracing::warn!(peer = ?device, error = %e, "ServerLogin::start failed");
                     return Ok(UnattendedVerdict::Reject(SessionReject::new(
                         reject::AUTH_FAILED,
@@ -845,9 +952,7 @@ impl UnattendedAuth {
         let (response, th_after_response) = tokio::select! {
             biased;
             () = slot.cancelled() => {
-                let _ = self
-                    .limiter
-                    .settle(&device, Settle::Fail(FailKind::Preempted));
+                let _ = slot.settle(Settle::Fail(FailKind::Preempted));
                 return Ok(UnattendedVerdict::Reject(SessionReject::new(
                     reject::PREEMPTED,
                 )));
@@ -857,14 +962,14 @@ impl UnattendedAuth {
                 Err(e) => {
                     // Settle first, then hand the transport error back unchanged so
                     // `serve_host` reports the code §B.8.4.5 documents.
-                    let _ = self.limiter.settle(&device, Settle::Fail(fail_kind(&e)));
+                    let _ = slot.settle(Settle::Fail(fail_kind(&e)));
                     return Err(e);
                 }
             },
         };
 
         let Some(ke3) = response.ke3.as_ref() else {
-            let _ = self.limiter.settle(&device, Settle::Fail(FailKind::BadKe3));
+            let _ = slot.settle(Settle::Fail(FailKind::BadKe3));
             return Ok(UnattendedVerdict::Reject(SessionReject::new(
                 reject::AUTH_FAILED,
             )));
@@ -873,7 +978,7 @@ impl UnattendedAuth {
         let session_key = match host_login.finish(ke3, &ctx_bytes, ids) {
             Ok(k) => k,
             Err(_) => {
-                let _ = self.limiter.settle(&device, Settle::Fail(FailKind::BadKe3));
+                let _ = slot.settle(Settle::Fail(FailKind::BadKe3));
                 return Ok(UnattendedVerdict::Reject(SessionReject::new(
                     reject::AUTH_FAILED,
                 )));
@@ -881,7 +986,7 @@ impl UnattendedAuth {
         };
 
         // ---- F2 reached: settle, then the post-PAKE policy checks ----
-        let fail_summary = self.limiter.settle(&device, Settle::Ok).unwrap_or(None);
+        let fail_summary = slot.settle(Settle::Ok).unwrap_or(None);
         // §B.8.5.2 counts charged `AwaitKe3` streams only: release the host-wide
         // slot now, so the popup and block window below do not occupy one of the
         // four for up to another 90 s.
@@ -2030,11 +2135,10 @@ mod tests {
                 .await
         };
 
-        let (verdict, ()) = tokio::join!(first, async {
+        let (verdict, second) = tokio::join!(first, async {
             // Once stream 1 is charged and waiting, stream 2 arrives.
             wait_entered.await;
-            let (_, second) = run(&env, PW, &TimerOnlyWindow, &DenyAll).await;
-            let _ = second;
+            run(&env, PW, &TimerOnlyWindow, &DenyAll).await.0
         });
 
         let UnattendedVerdict::Reject(r) = verdict.unwrap() else {
@@ -2045,7 +2149,193 @@ mod tests {
             reject::PREEMPTED,
             "a newer verified SESSION_REQUEST must cancel the stale one"
         );
+        // §B.8.4.5: "this stream continues through the gate above". The newer
+        // stream used to be refused `NOT_GRANTED`, its charge landing on the
+        // stale one's while that one had not yet been settled.
+        assert_accepted(second, "the pre-empting request");
         release.notify_waiters();
+    }
+
+    /// Panics unless `verdict` is an accept, naming the refusal otherwise.
+    fn assert_accepted(verdict: Result<UnattendedVerdict, HandshakeError>, what: &str) {
+        match verdict {
+            Ok(UnattendedVerdict::Accept { .. }) => {}
+            Ok(UnattendedVerdict::Reject(r)) => {
+                panic!("{what} was refused with 0x{:04x}", r.reason)
+            }
+            Ok(UnattendedVerdict::Admin { .. }) => panic!("{what} got an admin result"),
+            Err(e) => panic!("{what} failed: {e}"),
+        }
+    }
+
+    /// The same pre-emption with each stream on its own worker thread, as the
+    /// host runs them (a task per onion stream on a multi-thread runtime):
+    /// the newer stream must not charge on top of the stale one's pending
+    /// charge, whichever thread gets there first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemption_across_worker_threads_lets_the_newer_request_in() {
+        let env = Arc::new(env(PW));
+        let entered = Arc::new(Notify::new());
+
+        /// Signals once it reaches AwaitKe3, then waits (bounded) for nothing.
+        struct Stalled(Arc<Notify>);
+        impl crate::fsm::AuthExchange for Stalled {
+            fn challenge<'a>(
+                &'a mut self,
+                _: AuthChallenge,
+            ) -> BoxFuture<'a, Result<(AuthResponse, [u8; 32]), HandshakeError>> {
+                Box::pin(async move {
+                    self.0.notify_one();
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    Err(HandshakeError::Timeout("AUTH_RESPONSE"))
+                })
+            }
+        }
+
+        let first = tokio::spawn({
+            let env = Arc::clone(&env);
+            let entered = Arc::clone(&entered);
+            async move {
+                let caps = Caps::default();
+                let (_, ke1) = auth::ClientLogin::start(PW).unwrap();
+                let req = request(auth::SUITE_OPAQUE, Some(ke1));
+                let mut ex = Stalled(entered);
+                let verdict = env
+                    .auth
+                    .handle(UnattendedContext {
+                        device: env.device,
+                        label: "Laptop",
+                        request: &req,
+                        th_after_request: TH_REQ,
+                        host_pk: HOST_PK,
+                        host_caps: &caps,
+                        exchange: &mut ex,
+                        block_window: &TimerOnlyWindow,
+                        local_allow: &DenyAll,
+                        activity: &crate::fsm::host::NoSession,
+                        audit: &crate::fsm::NoAudit,
+                    })
+                    .await;
+                match verdict {
+                    Ok(UnattendedVerdict::Reject(r)) => Some(r.reason),
+                    _ => None,
+                }
+            }
+        });
+        entered.notified().await;
+        let second = tokio::spawn({
+            let env = Arc::clone(&env);
+            async move { run(&env, PW, &TimerOnlyWindow, &DenyAll).await.0 }
+        })
+        .await
+        .unwrap();
+        assert_accepted(second, "the pre-empting request");
+        assert_eq!(first.await.unwrap(), Some(reject::PREEMPTED));
+    }
+
+    /// The cancel is level-triggered: a newer request that pre-empts the stale
+    /// handshake after its charge but before it starts waiting in `AwaitKe3`
+    /// (on another worker thread, between `mark_charged` and the first poll of
+    /// the race) still cancels it. A bare `Notify::notify_waiters` was lost
+    /// there, and the stale handshake held the device for its full 30 s.
+    #[tokio::test]
+    async fn a_preemption_before_the_stale_handshake_waits_still_cancels_it() {
+        let env = env(PW);
+        let Admit::Ok { slot: stale, .. } = env.auth.admit(&env.device, false) else {
+            panic!("the first request is admitted");
+        };
+        stale.mark_charged();
+        let Admit::Ok {
+            slot: _newer,
+            preempted,
+        } = env.auth.admit(&env.device, false)
+        else {
+            panic!("a newer request pre-empts a charged handshake");
+        };
+        assert!(preempted.is_some());
+        tokio::time::timeout(Duration::from_secs(1), stale.cancelled())
+            .await
+            .expect("a cancel set before the wait is not lost");
+    }
+
+    /// A charge still pending for the device (another handshake of it not
+    /// yet settled) is the retryable `UA_BUSY`, never `NOT_GRANTED`: that
+    /// answer tells the client that unattended access was never given.
+    #[tokio::test]
+    async fn a_charge_still_pending_is_answered_busy_never_not_granted() {
+        let env = env(PW);
+        env.auth.limiter.charge(&env.device).expect("charge");
+        let (verdict, _) = run(&env, PW, &TimerOnlyWindow, &DenyAll).await;
+        let UnattendedVerdict::Reject(r) = verdict.unwrap() else {
+            panic!("a second charge on top of a pending one must not run the PAKE");
+        };
+        assert_eq!(r.reason, reject::UA_BUSY);
+    }
+
+    /// A handshake whose task goes away while it is charged (the stream's
+    /// task cancelled, hosting stopped) settles its charge as a failure when
+    /// it is dropped. Its charge used to stay pending until the host
+    /// restarted, and every later request of the device was refused.
+    #[tokio::test]
+    async fn a_handshake_dropped_while_charged_settles_its_charge() {
+        use tornect_core::session_log::SessionEvent;
+        let env = env(PW);
+
+        /// Signals once it reaches AwaitKe3, then never answers.
+        struct Hangs(Arc<Notify>);
+        impl crate::fsm::AuthExchange for Hangs {
+            fn challenge<'a>(
+                &'a mut self,
+                _: AuthChallenge,
+            ) -> BoxFuture<'a, Result<(AuthResponse, [u8; 32]), HandshakeError>> {
+                Box::pin(async move {
+                    self.0.notify_one();
+                    std::future::pending().await
+                })
+            }
+        }
+
+        let entered = Arc::new(Notify::new());
+        let caps = Caps::default();
+        let (_, ke1) = auth::ClientLogin::start(PW).unwrap();
+        let req = request(auth::SUITE_OPAQUE, Some(ke1));
+        let mut ex = Hangs(Arc::clone(&entered));
+        let handshake = env.auth.handle(UnattendedContext {
+            device: env.device,
+            label: "Laptop",
+            request: &req,
+            th_after_request: TH_REQ,
+            host_pk: HOST_PK,
+            host_caps: &caps,
+            exchange: &mut ex,
+            block_window: &TimerOnlyWindow,
+            local_allow: &DenyAll,
+            activity: &crate::fsm::host::NoSession,
+            audit: &crate::fsm::NoAudit,
+        });
+        tokio::select! {
+            _ = handshake => panic!("the hanging exchange cannot end the handshake"),
+            () = entered.notified() => {}
+        }
+        // `handshake` is dropped here, charged and in AwaitKe3.
+        let grant = env.guard.store().grant(&env.device).unwrap();
+        assert!(
+            !grant.fail.pending,
+            "the dropped handshake's charge is settled"
+        );
+        let failed: Vec<_> = env
+            .guard
+            .store()
+            .log()
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event == SessionEvent::UnattendedAuthFailed)
+            .map(|r| r.reason)
+            .collect();
+        assert_eq!(failed, vec![Some("disconnected".to_owned())]);
+        let (verdict, _) = run(&env, PW, &TimerOnlyWindow, &DenyAll).await;
+        assert_accepted(verdict, "the next request");
     }
 
     /// §B.8.5.2 counts "charged `AwaitKe3` streams only". If the slot were held
