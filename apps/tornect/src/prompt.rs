@@ -31,6 +31,20 @@ use crate::ui::recognize::{GoneOnDrop, Recognizer};
 /// still has to cross Tor.
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(50);
 
+/// How long after a question is shown before a line can answer it.
+///
+/// A line reaches the program only at Enter, so a line that comes sooner was
+/// typed, at least in part, before the question was there: most likely for a
+/// question that closed just before (its time ran out), whose half-typed `a`
+/// would otherwise allow the next request (audit B22). Such a line is
+/// ignored, and the terminal says so. The window's sheets arm after the same
+/// second (`ui::view`'s `ARM_AFTER`).
+pub(crate) const ARM_AFTER: Duration = Duration::from_secs(1);
+
+/// What the terminal says of a line that came before [`ARM_AFTER`].
+pub(crate) const TOO_SOON: &str = "That answer came less than a second after the question, so \
+     it may have been typed for an earlier one: it was ignored. Answer again:";
+
 /// Lines typed on stdin, answered one question at a time.
 ///
 /// One thread reads stdin for the life of the process, because a blocking read
@@ -39,8 +53,9 @@ const CONFIRM_TIMEOUT: Duration = Duration::from_secs(50);
 /// question, not before, so a host that only ever answers pings never touches
 /// the terminal (a background job that reads it would be stopped by the shell).
 /// Lines typed before a question is shown are discarded, so a stale answer
-/// never counts for a new question. A block window goes before every question
-/// ([`Prompter::priority`]).
+/// never counts for a new question, and a line that comes within
+/// [`ARM_AFTER`] of it is ignored too. A block window goes before every
+/// question ([`Prompter::priority`]).
 pub struct Prompter {
     lines: Mutex<Option<mpsc::Receiver<String>>>,
     source: Source,
@@ -51,6 +66,9 @@ pub struct Prompter {
     /// How many times `block` was typed in a block window: each time blocks
     /// every window open then ([`Priority::block_every_open_window`]).
     blocks: watch::Sender<u64>,
+    /// What the questions showed, in order ([`Prompter::scripted`] only).
+    #[cfg(test)]
+    shown: std::sync::Mutex<Vec<String>>,
 }
 
 /// Whether the terminal asks the questions: only when both its input and
@@ -81,17 +99,32 @@ impl Prompter {
                 source: Source::Stdin,
                 blocking: watch::channel(0).0,
                 blocks: watch::channel(0).0,
+                #[cfg(test)]
+                shown: std::sync::Mutex::default(),
             })
         })
     }
 
     /// Show `question` and wait for the next line typed after it; `None` once
-    /// stdin is closed. Questions queue behind one another. A block window
-    /// goes before them all ([`Prompter::priority`]): while one holds the
-    /// terminal, the open question's wait ends with `None` and a question
-    /// queued behind it is not shown (`None` too), which every question
-    /// answers as a closed terminal does, a refusal.
+    /// stdin is closed. A line that comes within [`ARM_AFTER`] of the
+    /// question is ignored, with [`TOO_SOON`]. Questions queue behind one
+    /// another. A block window goes before them all ([`Prompter::priority`]):
+    /// while one holds the terminal, the open question's wait ends with
+    /// `None` and a question queued behind it is not shown (`None` too),
+    /// which every question answers as a closed terminal does, a refusal.
     pub async fn ask(&self, question: &str) -> Option<String> {
+        self.ask_then(question, None).await
+    }
+
+    /// [`Prompter::ask`], and when the wait is dropped before an answer
+    /// (the request's time ran out, or it went away), `closed` is printed
+    /// before the terminal is let go, so before the next question shows
+    /// (audit B22).
+    pub async fn ask_about(&self, question: &str, closed: &str) -> Option<String> {
+        self.ask_then(question, Some(closed)).await
+    }
+
+    async fn ask_then(&self, question: &str, closed: Option<&str>) -> Option<String> {
         let mut lines = self.lines.lock().await;
         if self.block_window_open() {
             return None;
@@ -101,15 +134,56 @@ impl Prompter {
         }
         let rx = lines.as_mut()?;
         while rx.try_recv().is_ok() {}
-        eprintln!("{question}");
+        self.say(question);
+        // Declared after the lock, so dropped before it: its line shows
+        // before a question queued behind this one.
+        let mut open = Unanswered {
+            prompter: self,
+            closed,
+        };
+        let armed = tokio::time::Instant::now() + ARM_AFTER;
         let mut blocking = self.blocking.subscribe();
-        tokio::select! {
-            // Checked first: a line typed for the block window is never this
-            // question's answer.
-            biased;
-            _ = blocking.wait_for(|open| *open > 0) => None,
-            line = rx.recv() => line,
+        let answer = loop {
+            let line = tokio::select! {
+                // Checked first: a line typed for the block window is never
+                // this question's answer.
+                biased;
+                _ = blocking.wait_for(|open| *open > 0) => break None,
+                line = rx.recv() => line,
+            };
+            match line {
+                Some(_) if tokio::time::Instant::now() < armed => self.say(TOO_SOON),
+                line => break line,
+            }
+        };
+        open.closed = None;
+        answer
+    }
+
+    /// One line on stderr, where the questions go; a line that cannot be
+    /// written is lost, and the question then runs out its time, a refusal.
+    fn say(&self, line: &str) {
+        match self.source {
+            Source::Stdin => {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr().lock(), "{line}");
+            }
+            #[cfg(test)]
+            Source::Scripted => self
+                .shown
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(line.to_owned()),
         }
+    }
+
+    /// What the questions showed so far.
+    #[cfg(test)]
+    pub(crate) fn shown(&self) -> Vec<String> {
+        self.shown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The terminal for a block window (§B.8.6.3), taken ahead of every
@@ -169,8 +243,24 @@ impl Prompter {
             source: Source::Scripted,
             blocking: watch::channel(0).0,
             blocks: watch::channel(0).0,
+            shown: std::sync::Mutex::default(),
         });
         (prompter, tx)
+    }
+}
+
+/// A shown question not answered yet: dropped so (its wait was dropped),
+/// it says `closed`.
+struct Unanswered<'a> {
+    prompter: &'a Prompter,
+    closed: Option<&'a str>,
+}
+
+impl Drop for Unanswered<'_> {
+    fn drop(&mut self) {
+        if let Some(line) = self.closed {
+            self.prompter.say(line);
+        }
     }
 }
 
@@ -296,9 +386,13 @@ impl Consent for CliConsent {
                 }
             };
             let typed = seen.as_ref().is_some_and(Recognition::typed_only);
+            let who = peer.pinned_label.as_deref().unwrap_or(&peer.name);
             match self
                 .prompter
-                .ask(&pairing_question(peer, sas, seen.as_ref()))
+                .ask_about(
+                    &pairing_question(peer, sas, seen.as_ref()),
+                    &closed_line(who),
+                )
                 .await
             {
                 Some(answer) if typed => parse_typed(&answer, sas),
@@ -314,7 +408,11 @@ impl Consent for CliConsent {
         _: &'a SessionRequestSummary,
     ) -> BoxFuture<'a, SessionDecision> {
         Box::pin(async move {
-            match self.prompter.ask(&session_question(peer)).await {
+            match self
+                .prompter
+                .ask_about(&session_question(peer), &closed_line(&peer.label))
+                .await
+            {
                 Some(answer) => parse_session(&answer),
                 None => SessionDecision::Deny,
             }
@@ -328,7 +426,14 @@ impl Consent for CliConsent {
         levels: &'a Availability,
     ) -> BoxFuture<'a, SessionDecision> {
         Box::pin(async move {
-            match self.prompter.ask(&session_question_at(peer, levels)).await {
+            match self
+                .prompter
+                .ask_about(
+                    &session_question_at(peer, levels),
+                    &closed_line(&peer.label),
+                )
+                .await
+            {
                 Some(answer) => parse_session_at(&answer, levels.offered()),
                 None => SessionDecision::Deny,
             }
@@ -347,12 +452,25 @@ impl Consent for CliConsent {
                 "\n{}{}",
                 SENTENCE_ADMIN_NOT_GIVEN, ": the other answers are still open.",
             ) + &session_question_at(peer, levels);
-            match self.prompter.ask(&question).await {
+            match self
+                .prompter
+                .ask_about(&question, &closed_line(&peer.label))
+                .await
+            {
                 Some(answer) => parse_session_at(&answer, levels.offered()),
                 None => SessionDecision::Deny,
             }
         })
     }
+}
+
+/// What the terminal says when `who`'s pairing or session question closes
+/// unanswered, before the next question shows (B22).
+fn closed_line(who: &str) -> String {
+    format!(
+        "The request from \"{who}\" closed without an answer (its time ran out, or the device \
+         went away), so it is refused."
+    )
 }
 
 /// The session question of a host in the row `levels` (§B.2.1): only the
@@ -610,7 +728,7 @@ mod tests {
     }
 
     /// A line typed before the question was shown is not its answer.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stale_lines_never_answer_a_new_question() {
         let (prompter, tx) = Prompter::scripted();
         tx.send("yes".to_owned()).await.unwrap();
@@ -618,15 +736,15 @@ mod tests {
             let prompter = Arc::clone(&prompter);
             tokio::spawn(async move { prompter.ask("q?").await })
         };
-        // Let the question drain the stale line and start waiting.
+        // Let the question drain the stale line and start waiting, armed.
         tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(ARM_AFTER + Duration::from_millis(20)).await;
         tx.send("no".to_owned()).await.unwrap();
         assert_eq!(asking.await.unwrap().as_deref(), Some("no"));
     }
 
     /// Questions are asked one at a time, each answered by its own line.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn questions_queue_and_closed_input_answers_none() {
         let (prompter, tx) = Prompter::scripted();
         let first = prompter.ask("first?");
@@ -635,12 +753,76 @@ mod tests {
         tokio::select! {
             biased;
             _ = &mut first => panic!("answered before a line arrived"),
-            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            () = tokio::time::sleep(ARM_AFTER + Duration::from_millis(10)) => {}
         }
         tx.send("one".to_owned()).await.unwrap();
         assert_eq!(first.await.as_deref(), Some("one"));
         drop(tx);
         assert_eq!(prompter.ask("second?").await, None);
+    }
+
+    /// B22: device A's session question runs out of time while the person
+    /// is typing `a` for it, and B's question, queued behind, shows at once.
+    /// The line that comes with the Enter, 10 ms after B's question, is not
+    /// B's answer: it is ignored, with a word, and B waits for its own. A's
+    /// question says it closed before B's shows. Failed before the fix: B
+    /// took the `a`, an attended Control session nobody meant to allow.
+    #[tokio::test(start_paused = true)]
+    async fn a_line_typed_for_a_question_that_closed_never_answers_the_next() {
+        let (prompter, tx) = Prompter::scripted();
+        let first = {
+            let prompter = Arc::clone(&prompter);
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    prompter.ask_about("SESSION REQUEST: \"A\"", &closed_line("A")),
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let second = {
+            let prompter = Arc::clone(&prompter);
+            tokio::spawn(async move {
+                prompter
+                    .ask_about("SESSION REQUEST: \"B\"", &closed_line("B"))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(first.await.unwrap().is_err(), "A's time ran out");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        tx.send("a".to_owned()).await.unwrap();
+        tokio::time::sleep(ARM_AFTER).await;
+        assert!(!second.is_finished(), "the early line did not answer B");
+        tx.send("v".to_owned()).await.unwrap();
+        assert_eq!(second.await.unwrap().as_deref(), Some("v"));
+        assert_eq!(
+            prompter.shown(),
+            [
+                "SESSION REQUEST: \"A\"".to_owned(),
+                closed_line("A"),
+                "SESSION REQUEST: \"B\"".to_owned(),
+                TOO_SOON.to_owned(),
+            ]
+        );
+    }
+
+    /// B22: an answer, or a refusal, says nothing more; only a question
+    /// dropped unanswered says it closed.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_question_dropped_unanswered_says_it_closed() {
+        let (prompter, tx) = Prompter::scripted();
+        let asking = {
+            let prompter = Arc::clone(&prompter);
+            tokio::spawn(async move { prompter.ask_about("q?", "closed").await })
+        };
+        tokio::time::sleep(ARM_AFTER).await;
+        tx.send("no".to_owned()).await.unwrap();
+        assert_eq!(asking.await.unwrap().as_deref(), Some("no"));
+        drop(tx);
+        assert_eq!(prompter.ask_about("again?", "closed").await, None);
+        assert_eq!(prompter.shown(), ["q?", "again?"]);
     }
 
     /// §B.6.1 on the terminal: an unpinned key is named by its device words
