@@ -3399,6 +3399,81 @@ mod tests {
         assert_eq!(store.generation(), generation);
     }
 
+    /// A host start over `env`'s home, as `wire()` makes it for the terminal.
+    fn start_host(env: &Env) -> HostWiring {
+        wire(
+            &env.paths,
+            &Config::default(),
+            Arc::clone(&env.identity),
+            [0x33; 32],
+            Arc::new(ScriptedConsent::new()),
+            media(),
+            ControlChannel::default(),
+        )
+        .unwrap()
+    }
+
+    /// B13 review: this device's own lines for its unattended connects (the
+    /// client's `UnattendedConnect`) keep `sessions.log` intact in a home whose
+    /// host has unattended access on: the window's go through its host role's
+    /// store, a terminal's `tornect connect` keys its own handle with the
+    /// home's `K_log`, so every one carries the tag the verifier checks. They
+    /// were written untagged, and every later start read "log modified or
+    /// truncated" at the first of them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn this_devices_connect_lines_keep_the_log_intact() {
+        use crate::ua_client::{Logged, log_attempt, log_attempt_via};
+        use tornect_core::trusted::KnownHost;
+        use tornect_core::unattended::readiness::Probe;
+
+        let env = env();
+        grant_unattended(&env, &DeviceId::from_bytes([3; 32]), "quiet verdant otter");
+        let known = KnownHost {
+            label: "Desk".to_owned(),
+            host_device_pk: [7; 32],
+            paired_at: 1,
+            last_seen: 1,
+        };
+        let row = |wiring: &HostWiring| wiring.ctx.as_ref().unwrap().readiness.get().session_log;
+        // No host runs: `tornect connect --unattended` from a terminal.
+        log_attempt(&env.paths, &known, &Logged::Ended("unreachable"));
+        let wiring = start_host(&env);
+        assert_eq!(row(&wiring), Probe::Ok);
+
+        // The window: its host role's store writes the line and moves the head.
+        let store = wiring.ctx.as_ref().unwrap().guard.store().clone();
+        log_attempt_via(
+            Some(&store),
+            &env.paths,
+            &known,
+            &Logged::Admin {
+                op: "unlock",
+                ok: true,
+            },
+        );
+        let report = store.verify_log().unwrap();
+        assert_eq!(
+            (report.tagged_beyond_head, report.status),
+            (0, tornect_core::session_log::ChainStatus::Valid)
+        );
+        // A terminal's while that host runs.
+        log_attempt(&env.paths, &known, &Logged::Ended("cancelled"));
+        drop((store, wiring));
+
+        let wiring = start_host(&env);
+        assert_eq!(row(&wiring), Probe::Ok);
+        let text = std::fs::read_to_string(env.paths.sessions_log()).unwrap();
+        let mine: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains(r#""event":"unattended_connect""#))
+            .collect();
+        assert_eq!(mine.len(), 3, "{text}");
+        for line in mine {
+            let chain = tornect_core::session_log::parse_line_chain(line).unwrap();
+            assert!(chain.tag.is_some(), "{line}");
+        }
+    }
+
     /// B12 review: a session cut at its signed `ends_at` counts as full length
     /// whatever the sub-second phases of the PAKE, the start and the cut, so the
     /// device's next request is refused `COOLDOWN`. Both parts of the length

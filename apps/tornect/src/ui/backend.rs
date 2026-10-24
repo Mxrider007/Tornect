@@ -244,6 +244,20 @@ pub struct Backend {
     /// readiness row and its gate on unattended sessions read. `None` for a
     /// window started by hand.
     pub background: Option<crate::host::IndicatorShown>,
+    /// The unattended store of this window's host role, once wired with one:
+    /// this device's own lines for its unattended connects go through it
+    /// ([`Self::log_attempt`]), so that `sessions.log` has one writer in this
+    /// process and the lines carry the tag the host's verifier checks.
+    pub hosted_store: std::sync::OnceLock<tornect_core::unattended::store::GrantStore>,
+}
+
+impl Backend {
+    /// This device's `sessions.log` line for one unattended attempt at `known`
+    /// (§B.8.13): through the store of this window's host role, else keyed as
+    /// that store would key it ([`ua_client::log_attempt_via`]).
+    fn log_attempt(&self, known: &tornect_core::trusted::KnownHost, logged: &Logged<'_>) {
+        ua_client::log_attempt_via(self.hosted_store.get(), &self.paths, known, logged);
+    }
 }
 
 /// The marker the window's first run leaves in the state directory of the
@@ -1686,6 +1700,10 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
     .map_err(|e| format!("{e:#}"))?;
     helpers.wire(deps.kill.clone(), audit.clone(), cfg.levels);
     deps.admin_helper = helpers;
+    if let Ok(c) = &ctx {
+        // A window takes its host role once.
+        let _ = b.hosted_store.set(c.guard.store().clone());
+    }
     // The window says it, on Home and under the banner.
     let shared = Arc::clone(&b.shared);
     polkit.tell_through(Arc::new(move |line: &str| {
@@ -3145,7 +3163,7 @@ async fn admin_command(
     {
         Err(_) => {
             let ended = ua_client::unreachable(&host);
-            ua_client::log_attempt(&b.paths, &known, &Logged::Ended(&ended.reason));
+            b.log_attempt(&known, &Logged::Ended(&ended.reason));
             ended.text
         }
         Ok(stream) => {
@@ -3173,8 +3191,7 @@ async fn admin_command(
                         Ok(after) => notes = after,
                         Err(e) => notes.push(format!("hosts.toml could not be updated: {e:#}")),
                     }
-                    ua_client::log_attempt(
-                        &b.paths,
+                    b.log_attempt(
                         &known,
                         &Logged::Admin {
                             op: action.name(),
@@ -3208,7 +3225,7 @@ async fn admin_command(
                             tracing::warn!(error = %format!("{err:#}"), "hosts.toml could not be updated");
                         }
                     }
-                    ua_client::log_attempt(&b.paths, &known, &Logged::Ended(&ended.reason));
+                    b.log_attempt(&known, &Logged::Ended(&ended.reason));
                     if ended.blocks {
                         b.shared.update(|m| {
                             m.setup_changed.insert(id);
@@ -3336,7 +3353,7 @@ async fn viewed(
         failed(b, Failure::Unreachable);
         if let (Some(_), Some(known)) = (&ua, &known) {
             let ended = ua_client::unreachable(&known.label);
-            ua_client::log_attempt(&b.paths, known, &Logged::Ended(&ended.reason));
+            b.log_attempt(known, &Logged::Ended(&ended.reason));
             return Err(anyhow::Error::msg(ended.text));
         }
     }
@@ -3377,7 +3394,7 @@ async fn viewed(
     let Some(outcome) = outcome else {
         failed(b, Failure::Cancelled);
         if let (Some(_), Some(known)) = (&ua, &known) {
-            ua_client::log_attempt(&b.paths, known, &Logged::Ended("cancelled"));
+            b.log_attempt(known, &Logged::Ended("cancelled"));
         }
         return Ok("Cancelled before the session started.".to_owned());
     };
@@ -3405,7 +3422,7 @@ async fn viewed(
                 m.note(note);
             }
         });
-        ua_client::log_attempt(&b.paths, known, &Logged::Ended(&ended.reason));
+        b.log_attempt(known, &Logged::Ended(&ended.reason));
         let (why, step) = ua_failure(e, &ended);
         b.shared.update(|m| {
             m.dial.failed = Some((why, step));
@@ -3477,8 +3494,7 @@ async fn viewed(
         if let Err(e) = ua_client::note_mode(&b.paths, &id, control) {
             tracing::warn!(error = %format!("{e:#}"), "hosts.toml could not be updated");
         }
-        ua_client::log_attempt(
-            &b.paths,
+        b.log_attempt(
             known,
             &Logged::Session {
                 id: &sid,
@@ -5139,6 +5155,7 @@ mod tests {
             device_pk,
             words,
             background: Some(shown.clone()),
+            hosted_store: std::sync::OnceLock::new(),
         };
         let hosted = host_role(&b).await.expect("the window host is wired");
         assert_eq!(
@@ -6049,6 +6066,7 @@ mod tests {
             device_pk,
             words,
             background: None,
+            hosted_store: std::sync::OnceLock::new(),
         };
         (b, shared, paths)
     }
@@ -6091,6 +6109,38 @@ mod tests {
         );
         let hosted = host_role(&b).await.expect("the window host is wired");
         assert_eq!(hosted.serving.0.host_name, "Desk by the window");
+        if let Some(ipc) = &hosted.ipc {
+            ipc.abort();
+        }
+    }
+
+    /// B13 review: the window's own lines for its unattended connects go
+    /// through its host role's store (one writer on `sessions.log` in this
+    /// process; the store tags them once unattended access is on), not
+    /// through a handle of their own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_window_logs_its_connects_through_its_host_role() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (b, _shared, paths) = first_start(&tmp);
+        assert!(b.hosted_store.get().is_none(), "no host role yet");
+        let hosted = host_role(&b).await.expect("the window host is wired");
+        let store = b.hosted_store.get().expect("the host role's store");
+        assert_eq!(store.path(), paths.unattended_store().as_path());
+        let watch = hosted.manager.as_ref().expect("a host with its store");
+        let before = watch.ctx.log.read_all().unwrap().len();
+        let known = tornect_core::trusted::KnownHost {
+            label: "Desk".to_owned(),
+            host_device_pk: [7; 32],
+            paired_at: 1,
+            last_seen: 1,
+        };
+        b.log_attempt(&known, &Logged::Ended("cancelled"));
+        let logged = watch.ctx.log.read_all().unwrap();
+        assert_eq!(logged.len(), before + 1);
+        assert_eq!(
+            logged.last().map(|r| r.event),
+            Some(tornect_core::session_log::SessionEvent::UnattendedConnect)
+        );
         if let Some(ipc) = &hosted.ipc {
             ipc.abort();
         }
