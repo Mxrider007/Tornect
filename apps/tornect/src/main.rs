@@ -432,6 +432,8 @@ enum SheetArg {
     ForgetAsk,
     /// The Unlock confirmation with the typed device's words.
     UaUnlock,
+    /// The connect field filled from a link, with its note.
+    LinkFilled,
 }
 
 impl From<SheetArg> for ui::preview::Sheet {
@@ -465,6 +467,7 @@ impl From<SheetArg> for ui::preview::Sheet {
             SheetArg::HistoryOff => Self::HistoryOff,
             SheetArg::ForgetAsk => Self::ForgetAsk,
             SheetArg::UaUnlock => Self::UaUnlock,
+            SheetArg::LinkFilled => Self::LinkFilled,
         }
     }
 }

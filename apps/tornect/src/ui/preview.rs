@@ -145,6 +145,9 @@ pub enum Sheet {
     ForgetAsk,
     /// The Unlock confirmation with the typed device's words (F4-4).
     UaUnlock,
+    /// The connect field filled from a `tornect:` link (design `invite`
+    /// §2.2): its note, and Connect waiting a second after it is seen.
+    LinkFilled,
 }
 
 /// Put one host sheet of `sheet`'s kind on screen, with invented words.
@@ -385,7 +388,8 @@ fn unattended(m: &mut Model, sheet: Sheet) -> bool {
     true
 }
 
-/// The address book's states for `--sheet history-off` and `forget-ask`;
+/// The address book's states for `--sheet history-off` and `forget-ask`
+/// (and `link-filled`, whose fill is the window's own);
 /// `false` for any other sheet.
 fn book(m: &mut Model, sheet: Sheet) -> bool {
     match sheet {
@@ -394,7 +398,7 @@ fn book(m: &mut Model, sheet: Sheet) -> bool {
             m.book.history = false;
             m.book.recent.clear();
         }
-        Sheet::ForgetAsk => {}
+        Sheet::ForgetAsk | Sheet::LinkFilled => {}
         _ => return false,
     }
     true
@@ -405,9 +409,22 @@ fn unlock_device() -> tornect_core::DeviceId {
     tornect_core::DeviceIdentity::from_seed(&[0x5a; 32]).id()
 }
 
-/// What `--sheet` opens in the window itself (a tab, a confirmation), on the
-/// made-up book's first computer `first`.
+/// The ID `--sheet link-filled` fills in: a made-up key's, whose seed is
+/// no machine's.
+fn link_id() -> TornectId {
+    tornect_core::HostIdentity::from_seed(&[0x4c; 32]).id()
+}
+
+/// What `--sheet` opens in the window itself (a tab, a confirmation, a
+/// link's fill), on the made-up book's first computer `first`.
 pub fn form(form: &mut super::view::Form, sheet: Sheet, first: Option<TornectId>) {
+    if sheet == Sheet::LinkFilled {
+        form.link_arrived(
+            tornect_core::unattended::ipc::ShownLink::Fill(link_id()),
+            Some(synthetic_id()),
+        );
+        return;
+    }
     let Some(first) = first else {
         return;
     };
@@ -760,6 +777,27 @@ mod tests {
             "the window's set-up makes its home"
         );
         assert_ne!(real.model.id.as_deref(), Some(made_up.as_str()));
+    }
+
+    /// `--sheet link-filled` fills the connect field from a made-up link
+    /// as a real link does (its note, Home), with or without a made-up
+    /// book, and adds no question or stage to the model.
+    #[test]
+    fn the_link_sheet_fills_the_field_as_a_link_does() {
+        let first = model(false, false).book.computers.first().map(|c| c.id);
+        for first in [first, None] {
+            let mut filled = super::super::view::Form::default();
+            form(&mut filled, Sheet::LinkFilled, first);
+            assert_eq!(filled.connect_to, link_id().display_groups());
+            assert_eq!(
+                filled.link,
+                Some(super::super::view::LinkNote::Filled(link_id()))
+            );
+        }
+        let mut book = model(false, false);
+        let before = format!("{book:?}");
+        sheet(&mut book, Sheet::LinkFilled);
+        assert_eq!(format!("{book:?}"), before, "no question, no stage");
     }
 
     /// The preview draws in the theme its command line names (the settings

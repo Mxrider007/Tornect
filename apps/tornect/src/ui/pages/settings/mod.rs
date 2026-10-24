@@ -140,6 +140,14 @@ impl SettingsForm {
         }
         wizard::forget_fields(ctx, true);
     }
+
+    /// Whether the grant wizard is open: a `tornect:` link then leaves the
+    /// window on Settings (design `invite` §2.4), so that a wizard in
+    /// progress is never closed and its passwords never wiped.
+    #[must_use]
+    pub fn wizard_open(&self) -> bool {
+        self.wizard.is_some()
+    }
 }
 
 /// Below this page width (points) the section list uses its short names.

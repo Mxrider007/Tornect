@@ -1,5 +1,6 @@
 //! Home (the redesign's §4, as far as it works today): this computer's ID
-//! with Copy and its QR code, the name others see, the connect field, the
+//! with Copy, Copy invitation and its QR code, the name others see, the
+//! connect field (which a `tornect:` link can fill, never dial), the
 //! Tor and hosting lines, the desktop's screen-sharing grant, the client's
 //! stage, the saved computers, the recent connections and what happened
 //! since the window opened.
@@ -7,12 +8,13 @@
 use std::time::{Duration, Instant};
 
 use egui::{Align, Layout, Margin, RichText, Stroke, Ui, vec2};
+use tornect_core::invite;
 
 use super::super::icons::{self, Icon};
 use super::super::model::{ClientStage, Computer, Failure, Hosting, Model, Setup, TorState};
 use super::super::nav::Page;
 use super::super::theme::{self, Face, Tokens};
-use super::super::view::{Action, Form, SAS_SIZE};
+use super::super::view::{Action, Form, LinkNote, SAS_SIZE};
 use super::super::widgets::{self, Button, Kind, Tone};
 use super::{day_in_sentence, day_text, id_field};
 
@@ -40,7 +42,7 @@ fn without_asking(devices: usize) -> String {
     }
 }
 
-/// How long "Copied" shows after Copy ID.
+/// How long "Copied" shows after Copy ID or Copy invitation.
 const COPIED_FOR: Duration = Duration::from_secs(2);
 /// From this content width on, the ID and connect cards sit side by side.
 const TWO_COLUMNS_FROM: f32 = 720.0;
@@ -160,6 +162,7 @@ pub(super) fn home(
                     t,
                     model,
                     form,
+                    now,
                     (min, model.screen_shared(now)),
                     actions,
                 ));
@@ -172,7 +175,15 @@ pub(super) fn home(
     } else {
         id_card(ui, t, model, form, now, 0.0, actions);
         ui.add_space(GAP - 8.0);
-        connect_card(ui, t, model, form, (0.0, model.screen_shared(now)), actions);
+        connect_card(
+            ui,
+            t,
+            model,
+            form,
+            now,
+            (0.0, model.screen_shared(now)),
+            actions,
+        );
     }
 
     let shared = model.screen_shared(now);
@@ -315,6 +326,30 @@ fn id_card(
                 {
                     actions.push(Action::CopyId);
                     form.copied = Some(now);
+                    ui.ctx().request_repaint_after(COPIED_FOR);
+                }
+                // The text to send someone (design `invite` §2.1): the ID in
+                // groups, its link and the one download location, and nothing
+                // of this computer's name or words.
+                let own = model.own_id();
+                let invited = form
+                    .invited
+                    .is_some_and(|at| now.saturating_duration_since(at) < COPIED_FOR);
+                let (label, icon) = if invited {
+                    ("Copied", Icon::Check)
+                } else {
+                    ("Copy invitation", Icon::Copy)
+                };
+                if Button::new(Kind::Secondary, label)
+                    .icon(icon)
+                    .small()
+                    .enabled(own.is_some())
+                    .show(ui)
+                    .clicked()
+                    && let Some(id) = own
+                {
+                    actions.push(Action::Copy(invite::invitation(&id)));
+                    form.invited = Some(now);
                     ui.ctx().request_repaint_after(COPIED_FOR);
                 }
                 let qr = if form.qr {
@@ -473,12 +508,15 @@ fn reachability(hosting: &Hosting) -> (Tone, &'static str) {
 }
 
 /// The connect card: the ID field, Connect, and what pairing looks like. At
-/// least `min_height` tall; returns the height its content needs.
+/// least `min_height` tall; returns the height its content needs. A link's
+/// fill (design `invite` §2.2) only puts an ID in the field and says so:
+/// Connect waits until its row has been seen, still, for a second.
 fn connect_card(
     ui: &mut Ui,
     t: &Tokens,
     model: &Model,
     form: &mut Form,
+    now: Instant,
     (min_height, shared): (f32, bool),
     actions: &mut Vec<Action>,
 ) -> f32 {
@@ -516,9 +554,18 @@ fn connect_card(
         }
         let parsed = checked.as_ref().ok().map(|found| found.id);
         let is_own = checked == Err(id_field::Problem::Own);
+        form.link_seen(parsed, field.changed());
+        // A link filled the field: the keyboard focus goes, so that keys
+        // typed for another program never reach it (L-4).
+        if std::mem::take(&mut form.unfocus_connect) {
+            field.surrender_focus();
+        }
         let ready = model.tor.is_ready() && idle && parsed.is_some();
         if let Err(problem) = &checked {
             id_field::problem_line(ui, t, problem);
+        }
+        if let Some(note) = form.link {
+            link_note(ui, t, note);
         }
         let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         // The look-alike warning for the ID in the field (§B.6.1 item 4):
@@ -566,6 +613,9 @@ fn connect_card(
             );
         }
         ui.horizontal(|ui| {
+            // After a link's fill, Connect, Connect anyway and Enter wait
+            // until this row has been on screen, still, for a second (L-1).
+            let ready = ready && form.link_armed(ui, now);
             if let Some(id) = second_click {
                 if Button::new(Kind::Danger, "Connect anyway")
                     .icon(Icon::ArrowRight)
@@ -613,6 +663,40 @@ fn connect_card(
     });
     needs
 }
+
+/// What a link did to the connect field, under it (design `invite` §2.2):
+/// never the ID itself.
+fn link_note(ui: &mut Ui, t: &Tokens, note: LinkNote) {
+    let text = match note {
+        LinkNote::Filled(_) => LINK_FILLED,
+        LinkNote::Refused => LINK_REFUSED,
+        LinkNote::Own => LINK_OWN,
+    };
+    ui.horizontal_top(|ui| {
+        icons::show(ui, Icon::Info, 15.0, t.info);
+        ui.add(
+            egui::Label::new(
+                RichText::new(text)
+                    .font(theme::font(ui.ctx(), Face::Regular, 12.0))
+                    .color(t.text_secondary),
+            )
+            .wrap(),
+        );
+    });
+}
+
+/// The note under the connect field after a link filled it.
+pub(super) const LINK_FILLED: &str =
+    "Filled in from a link: nothing connects until you press Connect.";
+
+/// The note under the connect field after a link without a valid ID.
+pub(super) const LINK_REFUSED: &str = "A tornect:// link was opened, but it held no valid \
+    Tornect ID, so nothing was filled in.";
+
+/// The note under the connect field after a link holding this computer's
+/// own ID.
+pub(super) const LINK_OWN: &str =
+    "A tornect:// link held this computer's own ID, so nothing was filled in.";
 
 /// The first run's question, the saved name filled in (on a fresh home the
 /// neutral default), with Save and Skip.

@@ -145,6 +145,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use egui::accesskit::{Node, Role};
+    use tornect_core::unattended::ipc::ShownLink;
     use tornect_core::{TornectId, invite};
     use tornect_signal::pairing::SessionDecision;
 
@@ -975,6 +976,264 @@ mod tests {
         home.form.connect_to.clear();
         home.pass(Vec::new());
         assert!(!has_text(&home, "No Tornect ID was given"));
+    }
+
+    /// The main window as `on_show` sees it, not minimised, recording what
+    /// is asked of it: the raise of a second launch or a link.
+    #[derive(Default)]
+    struct Raise(std::cell::RefCell<Vec<&'static str>>);
+
+    impl super::super::app::Attention for Raise {
+        fn is_minimized(&self) -> Option<bool> {
+            Some(false)
+        }
+
+        fn set_minimized(&self, _minimized: bool) {
+            self.0.borrow_mut().push("restore");
+        }
+
+        fn request_user_attention(&self, kind: Option<winit::window::UserAttentionType>) {
+            assert_eq!(kind, Some(winit::window::UserAttentionType::Critical));
+            self.0.borrow_mut().push("attention");
+        }
+    }
+
+    /// Design `invite` §2.2, §2.4, L-1: a link's fill puts the ID in the
+    /// connect field, says so, and opens Home (from any page; the address
+    /// book's Add field is never filled), and nothing more: no pass asks
+    /// for anything; within a second of the row's first draw Connect is
+    /// disabled, and neither its click nor Enter in the field dials; a
+    /// second after, a click dials the filled ID.
+    #[test]
+    fn a_link_fill_never_connects() {
+        let id = key_id(7);
+        let mut window = Window::new(at_rest(), Page::AddressBook, egui::Theme::Dark, WIDE);
+        window.form.book.adding = Some((String::new(), String::new()));
+        let own = window.model.own_id();
+        window.form.link_arrived(ShownLink::Fill(id), own);
+        assert_eq!(window.form.page, Page::Home);
+        assert_eq!(
+            window.form.book.adding,
+            Some((String::new(), String::new())),
+            "links never fill the address book"
+        );
+        for _ in 0..3 {
+            assert!(window.pass(Vec::new()).is_empty());
+        }
+        assert_eq!(window.form.connect_to, id.display_groups());
+        assert!(has_text(&window, home::LINK_FILLED));
+        assert!(window.node("Connect").is_disabled());
+        let connect = window.center("Connect");
+        assert!(window.click(connect).is_empty());
+        let at = field_at(&window, None);
+        assert!(
+            window.click(at).is_empty(),
+            "a click only focuses the field"
+        );
+        assert!(
+            window.key(egui::Key::Enter).is_empty(),
+            "Enter dials nothing"
+        );
+        window.later += Duration::from_millis(900);
+        assert!(window.pass(Vec::new()).is_empty());
+        assert!(window.node("Connect").is_disabled());
+        assert!(window.click(connect).is_empty());
+        window.later += Duration::from_millis(100);
+        assert!(window.pass(Vec::new()).is_empty());
+        assert!(!window.node("Connect").is_disabled());
+        assert_eq!(window.click(connect), vec![Action::Connect(id)]);
+        assert!(
+            has_text(&window, home::LINK_FILLED),
+            "the field still has it"
+        );
+    }
+
+    /// The arming second starts at the first pass that draws the Connect
+    /// row, not at the fill: a window first drawn five seconds after the
+    /// link came still waits its second.
+    #[test]
+    fn a_link_fill_arms_when_seen() {
+        let id = key_id(7);
+        let mut window = Window::new(at_rest(), Page::Home, egui::Theme::Light, WIDE);
+        let own = window.model.own_id();
+        window.form.link_arrived(ShownLink::Fill(id), own);
+        window.later += Duration::from_secs(5);
+        assert!(window.pass(Vec::new()).is_empty());
+        assert!(window.node("Connect").is_disabled());
+        window.later += Duration::from_millis(900);
+        assert!(window.pass(Vec::new()).is_empty());
+        assert!(window.node("Connect").is_disabled(), "at +0.9 s");
+        window.later += Duration::from_millis(100);
+        assert!(window.pass(Vec::new()).is_empty());
+        assert!(!window.node("Connect").is_disabled(), "at +1 s");
+    }
+
+    /// L-4: an armed fill disarms for another second whenever the window
+    /// comes back into view (`window_came_back`, which the event loop runs
+    /// for `Focused(true)`, `Occluded(false)` and the `Show` raise), and
+    /// whenever another link arrives, a refused one included: the fill
+    /// stays, its Connect waits again.
+    #[test]
+    fn a_link_fill_arms_again_after_a_return() {
+        let id = key_id(7);
+        let mut window = Window::new(at_rest(), Page::Home, egui::Theme::Dark, WIDE);
+        let own = window.model.own_id();
+        window.form.link_arrived(ShownLink::Fill(id), own);
+        window.pass(Vec::new());
+        window.later += Duration::from_secs(1);
+        window.pass(Vec::new());
+        assert!(!window.node("Connect").is_disabled(), "armed");
+        let connect = window.center("Connect");
+
+        window.form.window_came_back();
+        assert!(window.pass(Vec::new()).is_empty());
+        assert!(window.node("Connect").is_disabled(), "back in view");
+        assert!(window.click(connect).is_empty());
+        window.later += Duration::from_secs(1);
+        assert!(window.pass(Vec::new()).is_empty());
+        assert!(!window.node("Connect").is_disabled());
+
+        window.form.link_arrived(ShownLink::Refused, own);
+        assert!(window.pass(Vec::new()).is_empty());
+        assert_eq!(window.form.connect_to, id.display_groups());
+        assert!(has_text(&window, home::LINK_REFUSED));
+        assert!(!has_text(&window, home::LINK_FILLED));
+        assert!(window.node("Connect").is_disabled(), "another link came");
+        let connect = window.center("Connect");
+        assert!(window.click(connect).is_empty());
+        window.later += Duration::from_secs(1);
+        assert!(window.pass(Vec::new()).is_empty());
+        assert_eq!(window.click(connect), vec![Action::Connect(id)]);
+    }
+
+    /// L-4: with a pairing and a session question open, a link's raise and
+    /// fill answer, dismiss and re-order no question and ask for nothing;
+    /// the raise arms the open card again and only asks for attention,
+    /// never the focus (the window is not minimised, so nothing is
+    /// restored either).
+    #[test]
+    fn a_link_fill_reaches_no_sheet() {
+        let mut model = at_rest();
+        model.popups = vec![session_question(1, "Laptop"), pairing_question(2)];
+        let before = format!("{:?}", model.popups);
+        let mut window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        window.later += Duration::from_secs(2);
+        assert!(window.pass(Vec::new()).is_empty());
+        assert!(!window.node("Allow control").is_disabled(), "armed");
+        let allow = window.center("Allow control");
+
+        let raise = Raise::default();
+        super::super::app::on_show(&raise, &mut window.form);
+        let own = window.model.own_id();
+        window.form.link_arrived(ShownLink::Fill(key_id(7)), own);
+        let mut asked = Vec::new();
+        for _ in 0..3 {
+            asked.extend(window.pass(Vec::new()));
+        }
+        assert!(asked.is_empty(), "{asked:?}");
+        assert_eq!(format!("{:?}", window.model.popups), before);
+        assert!(has_text(&window, "1 more waiting"));
+        assert!(window.node("Allow control").is_disabled(), "armed again");
+        assert!(window.click(allow).is_empty());
+        assert_eq!(raise.0.into_inner(), vec!["attention"]);
+        assert_eq!(window.form.connect_to, key_id(7).display_groups());
+    }
+
+    /// A refused link, a fill whose bytes are no key (what IPC can carry)
+    /// and a fill of this computer's own ID fill nothing: the field keeps
+    /// what it held, Home says why, and nothing is asked. The note goes
+    /// when the field is edited, or when another link comes.
+    #[test]
+    fn a_bad_or_own_link_fills_nothing_and_says_why() {
+        let own = key_id(6);
+        let mut model = at_rest();
+        model.id = Some(own.display_groups());
+        for (link, says) in [
+            (ShownLink::Refused, home::LINK_REFUSED),
+            (ShownLink::Fill(not_a_key()), home::LINK_REFUSED),
+            (ShownLink::Fill(own), home::LINK_OWN),
+        ] {
+            let case = format!("{link:?} {says}");
+            let mut window = Window::new(model.clone(), Page::Sessions, egui::Theme::Dark, WIDE);
+            window.form.connect_to = "abc".to_owned();
+            window.form.link_arrived(link, Some(own));
+            assert_eq!(window.form.page, Page::Home, "{case}");
+            for _ in 0..3 {
+                assert!(window.pass(Vec::new()).is_empty(), "{case}");
+            }
+            assert_eq!(window.form.connect_to, "abc", "{case}");
+            assert!(has_text(&window, says), "{case}");
+            assert!(!has_text(&window, home::LINK_FILLED), "{case}");
+            for label in [home::LINK_REFUSED, home::LINK_OWN] {
+                assert_eq!(has_text(&window, label), label == says, "{case}");
+            }
+            // Typing in the field takes the note away.
+            let at = field_at(&window, None);
+            assert!(window.click(at).is_empty(), "{case}");
+            assert!(has_text(&window, says), "a click is no edit: {case}");
+            window.pass(vec![egui::Event::Text("d".to_owned())]);
+            window.pass(Vec::new());
+            assert_eq!(window.form.connect_to, "abcd", "{case}");
+            assert!(!has_text(&window, says), "{case}");
+            // Another link replaces it.
+            window.form.link_arrived(link, Some(own));
+            window
+                .form
+                .link_arrived(ShownLink::Fill(key_id(7)), Some(own));
+            window.pass(Vec::new());
+            assert!(has_text(&window, home::LINK_FILLED), "{case}");
+            assert!(!has_text(&window, says), "{case}");
+        }
+    }
+
+    /// Design `invite` §2.1: Copy invitation asks for the invitation of
+    /// this computer's ID to be copied (`Action::Copy`, no action of its
+    /// own) and says "Copied" for two seconds; Copy ID keeps its words.
+    /// The three buttons fit the ID card at both widths. Without an ID it
+    /// is disabled.
+    #[test]
+    fn copy_invitation_copies_it() {
+        let own = key_id(6);
+        for size in [WIDE, NARROW] {
+            let mut model = at_rest();
+            model.id = Some(own.display_groups());
+            let mut window = Window::new(model, Page::Home, egui::Theme::Dark, size);
+            for label in ["Copy ID", "Copy invitation", "Show QR code"] {
+                let b = window.node(label).bounds().expect("bounds");
+                assert!(
+                    b.x0 >= 0.0 && b.x1 <= f64::from(size.0),
+                    "{size:?}: {label} at {b:?}"
+                );
+            }
+            assert!(!window.node("Copy invitation").is_disabled());
+            let copy = window.center("Copy invitation");
+            assert_eq!(
+                window.click(copy),
+                vec![Action::Copy(invite::invitation(&own))],
+                "{size:?}"
+            );
+            window.pass(Vec::new());
+            assert!(window.nodes.iter().any(|n| n.label() == Some("Copied")));
+            assert!(window.nodes.iter().any(|n| n.label() == Some("Copy ID")));
+            assert!(
+                !window
+                    .nodes
+                    .iter()
+                    .any(|n| n.label() == Some("Copy invitation"))
+            );
+            window.later += Duration::from_secs(2);
+            window.pass(Vec::new());
+            assert!(
+                window
+                    .nodes
+                    .iter()
+                    .any(|n| n.label() == Some("Copy invitation"))
+            );
+        }
+        let mut model = at_rest();
+        model.id = None;
+        let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
+        assert!(window.node("Copy invitation").is_disabled());
     }
 
     /// Rename starts from the saved name and saves what was typed.

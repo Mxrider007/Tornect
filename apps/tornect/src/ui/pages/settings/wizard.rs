@@ -2424,6 +2424,38 @@ mod tests {
         model
     }
 
+    /// Design `invite` §2.4: a `tornect:` link while the grant wizard is
+    /// open fills the connect field but leaves the window on Settings, so
+    /// the wizard stays at its step with its passphrase (leaving Settings
+    /// would close it and wipe it); nothing is asked. With the wizard
+    /// closed, the same link opens Home.
+    #[test]
+    fn a_link_fill_keeps_the_wizard() {
+        use tornect_core::unattended::ipc::ShownLink;
+        let id = tornect_core::TornectId::from_public_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key(),
+        );
+        let mut window = at_password(WIDE, Some(false));
+        let phrase = window.phrase();
+        let own = window.model.own_id();
+        window.form.link_arrived(ShownLink::Fill(id), own);
+        for _ in 0..3 {
+            assert!(window.pass(Vec::new()).is_empty());
+        }
+        assert_eq!(window.form.page, Page::Settings);
+        assert_eq!(window.form.settings.section, Section::Security);
+        assert!(window.form.settings.wizard_open());
+        assert_eq!(window.step(), Some(Step::Password));
+        assert_eq!(window.phrase(), phrase, "the passphrase is kept");
+        assert_eq!(window.form.connect_to, id.display_groups());
+
+        let mut closed = Window::new(model(true), WIDE);
+        assert!(!closed.form.settings.wizard_open());
+        closed.form.link_arrived(ShownLink::Refused, own);
+        assert_eq!(closed.form.page, Page::Home);
+        assert!(closed.form.connect_to.is_empty());
+    }
+
     /// The change from the manager that registers the password only.
     fn no_change() -> WizardChoice {
         WizardChoice {

@@ -11,6 +11,7 @@ use tornect_core::levels::{
     ADMIN_LINE, ADMIN_LINE_NO_PROMPT, AdminPath, Answers, LINE_VIEW_ONLY, SENTENCE_ADMIN_NOT_GIVEN,
     SENTENCE_SECURE_DESKTOP_OFF,
 };
+use tornect_core::unattended::ipc::ShownLink;
 use tornect_core::words::{Identicon, label_refusal};
 use tornect_signal::fsm::timeouts;
 use tornect_signal::pairing::{PairDecision, SessionDecision};
@@ -305,6 +306,20 @@ pub struct Form {
     pub page: Page,
     /// When Copy ID was last pressed (the button says "Copied" for a while).
     pub copied: Option<Instant>,
+    /// When Copy invitation was last pressed (its button says "Copied" for
+    /// a while).
+    pub invited: Option<Instant>,
+    /// What the last `tornect:` link said under the connect field (design
+    /// `invite` §2.2).
+    pub(super) link: Option<LinkNote>,
+    /// The ID a link filled into the connect field, while the field still
+    /// yields it, and its Connect row's arming: counted from the first pass
+    /// that draws the row, again after every return of the window and every
+    /// later link (L-1, L-4).
+    link_fill: Option<(TornectId, Option<Card>)>,
+    /// The connect field gives up the keyboard focus at its next pass: a
+    /// link filled it.
+    pub(super) unfocus_connect: bool,
     /// Home shows this computer's ID as a QR code.
     pub qr: bool,
     /// The address book page's own state.
@@ -337,7 +352,81 @@ impl Form {
     /// program the window now covers.
     pub fn window_came_back(&mut self) {
         self.cards.clear();
+        if let Some((_, card)) = &mut self.link_fill {
+            *card = None;
+        }
     }
+
+    /// A `tornect:` link reached this window (design `invite` §2.4): the
+    /// one it was opened for, or one a later launch sent with `Show`. It
+    /// at most fills the connect field: it sends nothing, answers and
+    /// touches no card, prompt, dial or saved entry (L-1, L-4). The ID is
+    /// checked again here, since what came over IPC may be any 32 bytes:
+    /// one that is no key is a refused link, this computer's own (`own`) is
+    /// said so; neither fills anything. A fill takes the keyboard focus from
+    /// the field and leaves Connect disarmed until its row has been seen,
+    /// still, for a second; any link restarts that second for a fill still
+    /// in the field. The window shows Home, unless the grant wizard is open
+    /// (leaving Settings would close it and wipe its passwords).
+    pub fn link_arrived(&mut self, link: ShownLink, own: Option<TornectId>) {
+        if let Some((_, card)) = &mut self.link_fill {
+            *card = None;
+        }
+        self.link = Some(match link {
+            ShownLink::Fill(id) if id.verifying_key().is_err() => LinkNote::Refused,
+            ShownLink::Fill(id) if Some(id) == own => LinkNote::Own,
+            ShownLink::Fill(id) => {
+                self.connect_to = id.display_groups();
+                self.link_fill = Some((id, None));
+                self.unfocus_connect = true;
+                LinkNote::Filled(id)
+            }
+            ShownLink::Refused => LinkNote::Refused,
+        });
+        if !self.settings.wizard_open() {
+            self.page = Page::Home;
+        }
+    }
+
+    /// Whether the Connect row, whose start is the cursor of `ui`, may dial
+    /// at `now`: always, unless a link filled the field, whose row then
+    /// arms as a card's answers do.
+    pub(super) fn link_armed(&mut self, ui: &egui::Ui, now: Instant) -> bool {
+        match &mut self.link_fill {
+            Some((_, card)) => arm_card(ui, card, now),
+            None => true,
+        }
+    }
+
+    /// The connect field now yields `field_id`, and was edited this pass
+    /// when `changed`: a fill and its note go once the field no longer
+    /// yields the filled ID; a refused or own-ID note goes with an edit.
+    pub(super) fn link_seen(&mut self, field_id: Option<TornectId>, changed: bool) {
+        if self
+            .link_fill
+            .is_some_and(|(filled, _)| field_id != Some(filled))
+        {
+            self.link_fill = None;
+        }
+        match self.link {
+            Some(LinkNote::Filled(filled)) if field_id != Some(filled) => self.link = None,
+            Some(LinkNote::Refused | LinkNote::Own) if changed => self.link = None,
+            _ => {}
+        }
+    }
+}
+
+/// What a `tornect:` link said under the connect field (design `invite`
+/// §2.2). None of the notes names the ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LinkNote {
+    /// It filled in this ID; shown while the field still yields it.
+    Filled(TornectId),
+    /// It held no valid Tornect ID; shown until the field is edited or
+    /// another link arrives.
+    Refused,
+    /// It held this computer's own ID; shown as long as a refusal is.
+    Own,
 }
 
 /// A card's answer row as the window remembers it from pass to pass.
@@ -353,8 +442,19 @@ struct Card {
 /// and say whether its accepts may answer now: once the row has been still
 /// for [`ARM_AFTER`].
 fn arm(ui: &egui::Ui, cards: &mut HashMap<u64, Card>, id: u64, now: Instant) -> bool {
+    let mut card = cards.get(&id).copied();
+    let armed = arm_card(ui, &mut card, now);
+    if let Some(card) = card {
+        cards.insert(id, card);
+    }
+    armed
+}
+
+/// [`arm`] for one row remembered in `card` (`None`: not drawn yet, so the
+/// second starts now).
+fn arm_card(ui: &egui::Ui, card: &mut Option<Card>, now: Instant) -> bool {
     let at = ui.cursor().min;
-    let card = cards.entry(id).or_insert(Card { since: now, at });
+    let card = card.get_or_insert(Card { since: now, at });
     if card.at.distance(at) > MOVE_TOLERANCE {
         card.since = now;
         card.at = at;

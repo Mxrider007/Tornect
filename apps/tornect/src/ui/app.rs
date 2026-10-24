@@ -20,6 +20,7 @@ use egui_wgpu::{
 };
 use tokio::sync::mpsc;
 use tornect_core::levels::AdminPath;
+use tornect_core::unattended::ipc::ShownLink;
 use tornect_input::Button;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -32,7 +33,7 @@ use super::block;
 use super::consent::Popups;
 use super::indicator::{self, Change, Indicator};
 use super::keys;
-use super::model::{ClientStage, Shared, Viewing, Wake};
+use super::model::{ClientStage, Model, Shared, Viewing, Wake};
 use super::nav::Page;
 use super::pages::viewer::{Combo, ViewerAction, ViewerState};
 use super::stream::{Forwarder, Picture, PictureRect, VideoTexture, button};
@@ -725,6 +726,29 @@ impl App {
         &mut self.form
     }
 
+    /// A `tornect:` link this window was opened for, or one a later launch
+    /// sent (design `invite` §2.4): at most an ID in the connect field,
+    /// checked again against this computer's own (`Form::link_arrived`).
+    /// It sends no command and changes nothing of the model.
+    pub fn link_arrived(&mut self, link: ShownLink) {
+        let own = self.shared.read(Model::own_id);
+        self.form.link_arrived(link, own);
+    }
+
+    /// `Wake::Show` (a second launch, §B.1.1, or an opened link): the raise
+    /// of [`on_show`] when the main window is up, every open card armed
+    /// again; then the link, if one came, which the window takes whether or
+    /// not it is up yet.
+    fn show(&mut self, link: Option<ShownLink>) {
+        if let Some(main) = &self.main {
+            on_show(&*main.window, &mut self.form);
+            main.window.request_redraw();
+        }
+        if let Some(link) = link {
+            self.link_arrived(link);
+        }
+    }
+
     fn command(&self, command: Command) {
         // The tokio side outlives the window; a send can only fail after it
         // has shut down, when nothing is left to do anyway.
@@ -1163,7 +1187,7 @@ impl App {
         view.viewer.sharing = self.shared.read(|m| !m.sharing.is_empty());
         view.viewer.input_paused = view.forwarder.is_paused();
         view.viewer.screenshots = self.screenshots;
-        view.viewer.host_notice = self.shared.read(super::model::Model::viewer_notice);
+        view.viewer.host_notice = self.shared.read(Model::viewer_notice);
         let picture = view.video.id().zip(view.video.size());
         let mut actions = Vec::new();
         let mut drawn = None;
@@ -1572,15 +1596,7 @@ impl ApplicationHandler<UserEvent> for App {
                     view.surface.window.request_redraw();
                 }
             }
-            // A link (design `invite` §2.4) raises like a second launch; it
-            // fills nothing here. Its fill is the connect field's, which
-            // checks the ID again and keeps Connect disarmed until seen.
-            Wake::Show(_link) => {
-                if let Some(main) = &self.main {
-                    on_show(&*main.window, &mut self.form);
-                    main.window.request_redraw();
-                }
-            }
+            Wake::Show(link) => self.show(link),
             Wake::Quit => {
                 tracing::info!("asked to quit by a signal: ending every session");
                 self.quit(el);
@@ -2491,6 +2507,59 @@ mod tests {
         assert_eq!(app.title, "Tornect");
         assert_eq!(STREAM_TITLE, "Tornect: remote screen");
         assert_eq!(indicator::TITLE, "Tornect: sharing");
+    }
+
+    /// Design `invite` §2.4, L-1: a link the window takes, the one it was
+    /// opened for or one `Show` brings (here before the main window is up),
+    /// at most fills the connect field: no command reaches the tokio side
+    /// and the model is unchanged. The fill is checked against this
+    /// computer's own ID and the key's validity again; a plain `Show`
+    /// changes nothing of the field.
+    #[test]
+    fn a_link_only_fills_the_connect_field() {
+        let key = |seed: u8| {
+            tornect_core::TornectId::from_public_key(
+                &ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key(),
+            )
+        };
+        let (own, id) = (key(6), key(7));
+        let not_a_key = (0..=u8::MAX)
+            .map(|i| tornect_core::TornectId::from_bytes([i; 32]))
+            .find(|id| id.verifying_key().is_err())
+            .expect("some repeated byte is no curve point");
+        let model = Model {
+            id: Some(own.display_groups()),
+            ..Model::default()
+        };
+        let shared = Shared::new(model, Arc::new(|_| {}));
+        let before = shared.read(|m| format!("{m:?}"));
+        let popups = Popups::new(Arc::clone(&shared));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(
+            Arc::clone(&shared),
+            popups,
+            Arc::new(StreamLink::default()),
+            tx,
+        );
+        app.open_page(Page::Sessions);
+        app.show(Some(ShownLink::Fill(id)));
+        assert_eq!(app.form.connect_to, id.display_groups());
+        assert_eq!(app.form.page, Page::Home);
+        assert_eq!(app.form.link, Some(view::LinkNote::Filled(id)));
+        for (link, note) in [
+            (ShownLink::Fill(own), view::LinkNote::Own),
+            (ShownLink::Fill(not_a_key), view::LinkNote::Refused),
+            (ShownLink::Refused, view::LinkNote::Refused),
+        ] {
+            app.link_arrived(link);
+            assert_eq!(app.form.connect_to, id.display_groups(), "{link:?}");
+            assert_eq!(app.form.link, Some(note), "{link:?}");
+        }
+        app.show(None);
+        assert_eq!(app.form.link, Some(view::LinkNote::Refused));
+        assert_eq!(app.form.connect_to, id.display_groups());
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(shared.read(|m| format!("{m:?}")), before);
     }
 
     /// The indicator's Stop asks the tokio side to stop sharing, as the

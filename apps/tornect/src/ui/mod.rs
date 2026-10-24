@@ -312,6 +312,12 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
     ));
 
     let mut app = App::new(shared, popups, link, commands);
+    // The link this window was opened for (design `invite` §2.4): at most an
+    // ID in the connect field, which Connect dials only once its row has been
+    // seen, still, for a second, and only on a click.
+    if let Some(shown) = opts.link {
+        app.link_arrived(shown);
+    }
     app.screenshots = true;
     app.background = probe_fact;
     if !opts.host {
