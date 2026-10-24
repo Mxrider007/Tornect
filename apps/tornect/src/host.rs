@@ -430,7 +430,9 @@ fn probe_readiness(
 }
 
 /// Probe the readiness rows again every 10 min into `feed` (§B.8.7.1 ⑥: a
-/// screen-sharing grant lost, the panic key's portal gone).
+/// screen-sharing grant lost, the panic key's portal gone), with the store's
+/// upkeep of [`periodic_upkeep`]; the row "Session log intact" keeps the
+/// verifier's verdict.
 fn reprobe_readiness(
     paths: &Paths,
     guard: Arc<tornect_core::unattended::guard::MutationGuard>,
@@ -442,8 +444,12 @@ fn reprobe_readiness(
         loop {
             tokio::time::sleep(tornect_core::unattended::readiness::REPROBE_EVERY).await;
             let (paths, guard, indicator) = (paths.clone(), Arc::clone(&guard), indicator.clone());
+            let log_row = feed.get().session_log;
             match tokio::task::spawn_blocking(move || {
-                probe_readiness(&paths, &guard, indicator.as_ref())
+                let log_row = periodic_upkeep(guard.store(), log_row);
+                let mut snapshot = probe_readiness(&paths, &guard, indicator.as_ref());
+                snapshot.session_log = log_row;
+                snapshot
             })
             .await
             {
@@ -452,6 +458,71 @@ fn reprobe_readiness(
             }
         }
     });
+}
+
+/// What a host does with its unattended store at its start: the
+/// `sessions.log` verifier (§B.8.13), whose verdict is the readiness row
+/// "Session log intact", then the housekeeping (a `GrantExpired` line for each
+/// grant that expired since, auth records pruned 30 days after expiry,
+/// §B.8.6.1). The verifier goes first, so it judges the log as the host found
+/// it.
+fn start_upkeep(
+    store: &tornect_core::unattended::store::GrantStore,
+) -> tornect_core::unattended::readiness::Probe {
+    let row = check_log(store);
+    housekeep(store);
+    row
+}
+
+/// What a host does with its store every 10 min, with its readiness probe:
+/// while the keystore could not be read, the one recovery load (§B.8.9: the
+/// `keystore_locked → readable` transition; a loaded store is never re-read),
+/// after which the log is verified as at a start; then the housekeeping.
+/// `row` is the row "Session log intact" as it stands, kept otherwise.
+fn periodic_upkeep(
+    store: &tornect_core::unattended::store::GrantStore,
+    row: tornect_core::unattended::readiness::Probe,
+) -> tornect_core::unattended::readiness::Probe {
+    use tornect_core::unattended::codec::StoreLoadError;
+    use tornect_core::unattended::store::StoreStatus;
+    let locked = matches!(
+        store.status(),
+        StoreStatus::FailedClosed(StoreLoadError::KeystoreLocked(_))
+    );
+    let row = if locked && store.retry_load() == StoreStatus::Loaded {
+        tracing::info!("the keystore can be read again: unattended access's store is loaded");
+        check_log(store)
+    } else {
+        row
+    };
+    housekeep(store);
+    row
+}
+
+/// The verifier's verdict on `sessions.log`, as its readiness row; anything
+/// but a valid chain is also said on stderr.
+fn check_log(
+    store: &tornect_core::unattended::store::GrantStore,
+) -> tornect_core::unattended::readiness::Probe {
+    use tornect_core::unattended::readiness::{Probe, session_log_row};
+    use tornect_core::unattended::store::StoreStatus;
+    // A store loaded, or one that exists but could not be read, keeps a head.
+    let head_expected = matches!(
+        store.status(),
+        StoreStatus::Loaded | StoreStatus::FailedClosed(_)
+    );
+    let row = session_log_row(&store.verify_log(), head_expected);
+    if let Probe::Fail(why) | Probe::Warn(why) = &row {
+        tracing::warn!(%why, "sessions.log");
+        eprintln!("warning: sessions.log: {why}");
+    }
+    row
+}
+
+fn housekeep(store: &tornect_core::unattended::store::GrantStore) {
+    if let Err(e) = store.housekeeping() {
+        tracing::warn!(error = %e, "the unattended store's housekeeping failed");
+    }
 }
 
 /// Everything `tornect host` serves its signaling streams with.
@@ -578,8 +649,10 @@ pub fn wire_window(
     host_cfg.levels = levels;
 
     if let Ok(ctx) = &ctx {
-        ctx.readiness
-            .set(probe_readiness(paths, &ctx.guard, ctx.indicator.as_ref()));
+        let log_row = start_upkeep(ctx.guard.store());
+        let mut snapshot = probe_readiness(paths, &ctx.guard, ctx.indicator.as_ref());
+        snapshot.session_log = log_row;
+        ctx.readiness.set(snapshot);
         deps.stop_token = Arc::new(EmergencyStop::new(Arc::clone(&ctx.guard), kill));
         // M1 has no local-zone source (decision M1-15; a tzdb-backed zone is
         // M6). The zone only matters for grant schedules, and no path in this
@@ -3116,6 +3189,191 @@ mod tests {
         sink.on_end("b", None);
         assert_eq!((last().at, last().duration_secs), (second, 65));
         assert_ne!(first, second);
+    }
+
+    /// B13 (§B.8.13): a host's start runs the `sessions.log` verifier, and its
+    /// verdict is the readiness row "Session log intact" that the gate, the
+    /// control channel and the window read. A log edited between two starts
+    /// fails the row with the line, which nothing checked before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tampered_session_log_is_reported_at_the_start() {
+        use tornect_core::unattended::readiness::Probe;
+
+        let env = env();
+        grant_unattended(&env, &DeviceId::from_bytes([3; 32]), "quiet verdant otter");
+        let start = || {
+            wire(
+                &env.paths,
+                &Config::default(),
+                Arc::clone(&env.identity),
+                [0x33; 32],
+                Arc::new(ScriptedConsent::new()),
+                media(),
+                ControlChannel::default(),
+            )
+            .unwrap()
+        };
+        let wiring = start();
+        let row = wiring.ctx.as_ref().unwrap().readiness.get().session_log;
+        assert_eq!(row, Probe::Ok);
+        drop(wiring);
+
+        // Someone without the log key edits the second line.
+        let text = std::fs::read_to_string(env.paths.sessions_log()).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        assert!(lines.len() >= 3, "{lines:?}");
+        lines[1] = lines[1].replacen("\"ts\":\"20", "\"ts\":\"19", 1);
+        std::fs::write(env.paths.sessions_log(), lines.join("\n") + "\n").unwrap();
+
+        let wiring = start();
+        let ctx = wiring.ctx.as_ref().unwrap();
+        match ctx.readiness.get().session_log {
+            Probe::Fail(why) => assert!(
+                why.starts_with("log modified or truncated at line 2 of sessions.log"),
+                "{why}"
+            ),
+            other => panic!("a tampered log read {other:?}"),
+        }
+        assert_eq!(
+            ctx.readiness_now().session_log,
+            ctx.readiness.get().session_log,
+            "the control channel's report carries it"
+        );
+    }
+
+    /// B13 (§B.8.6.1): a host's start runs the housekeeping, which before
+    /// ran nowhere: a grant that expired while no host ran gets its
+    /// `GrantExpired` line, and one expired more than 30 days ago has its
+    /// auth record pruned (`GrantPruned`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_start_logs_expired_grants_and_prunes_them() {
+        use tornect_core::session_log::SessionEvent;
+        use tornect_core::unattended::grant::AuthRecord;
+
+        let env = env();
+        let device = DeviceId::from_bytes([3; 32]);
+        grant_unattended(&env, &device, "quiet verdant otter");
+        let events = || -> Vec<SessionEvent> {
+            SessionLog::new(env.paths.sessions_log())
+                .read_all()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.event)
+                .collect()
+        };
+        let start = || {
+            wire(
+                &env.paths,
+                &Config::default(),
+                Arc::clone(&env.identity),
+                [0x33; 32],
+                Arc::new(ScriptedConsent::new()),
+                media(),
+                ControlChannel::default(),
+            )
+            .unwrap()
+        };
+        let now = tornect_core::trusted::unix_now();
+        edit_grant_on_disk(&env.paths, &device, |g| g.expires_at = Some(now + 2));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let wiring = start();
+        let seen = events();
+        assert_eq!(
+            seen.iter()
+                .filter(|e| **e == SessionEvent::GrantExpired)
+                .count(),
+            1,
+            "{seen:?}"
+        );
+        assert!(!seen.contains(&SessionEvent::GrantPruned), "{seen:?}");
+        assert_eq!(
+            wiring.ctx.as_ref().unwrap().readiness.get().session_log,
+            tornect_core::unattended::readiness::Probe::Ok,
+            "the verifier ran before the housekeeping's line"
+        );
+        drop(wiring);
+
+        edit_grant_on_disk(&env.paths, &device, |g| {
+            g.expires_at = Some(now - 31 * 86_400);
+        });
+        let wiring = start();
+        let seen = events();
+        assert!(seen.contains(&SessionEvent::GrantPruned), "{seen:?}");
+        let store = wiring.ctx.as_ref().unwrap().guard.store();
+        assert_eq!(store.grant(&device).unwrap().auth, AuthRecord::Pruned);
+    }
+
+    /// B13 (§B.8.9): a store that opened failed closed because its key could
+    /// not be read is loaded again by the 10-minute upkeep once the key can be
+    /// read (the one recovery load), and its log is then verified; until then
+    /// the upkeep changes nothing and the row keeps its verdict.
+    #[test]
+    fn the_upkeep_loads_a_store_whose_keystore_was_locked() {
+        use std::sync::atomic::AtomicBool;
+        use tornect_core::keystore::{FileSecretStore, SecretStore};
+        use tornect_core::unattended::clock::SystemClock;
+        use tornect_core::unattended::codec::StoreLoadError;
+        use tornect_core::unattended::readiness::Probe;
+        use tornect_core::unattended::store::{GrantStore, StoreStatus};
+
+        /// A keystore whose reads fail while `locked`.
+        struct Locked {
+            inner: FileSecretStore,
+            locked: AtomicBool,
+        }
+        impl SecretStore for Locked {
+            fn get(&self, name: &str) -> tornect_core::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
+                if self.locked.load(Ordering::SeqCst) {
+                    return Err(tornect_core::CoreError::KeychainLocked(
+                        "collection locked".into(),
+                    ));
+                }
+                self.inner.get(name)
+            }
+            fn put(&self, name: &str, secret: &[u8]) -> tornect_core::Result<()> {
+                self.inner.put(name, secret)
+            }
+            fn delete(&self, name: &str) -> tornect_core::Result<bool> {
+                self.inner.delete(name)
+            }
+        }
+
+        let env = env();
+        let device = DeviceId::from_bytes([3; 32]);
+        grant_unattended(&env, &device, "quiet verdant otter");
+        let secrets = Arc::new(Locked {
+            inner: FileSecretStore::open(env.paths.keys_dir()).unwrap(),
+            locked: AtomicBool::new(true),
+        });
+        let store = GrantStore::open(
+            &env.paths,
+            secrets.clone(),
+            Arc::new(SystemClock::default()),
+            SessionLog::new(env.paths.sessions_log()),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.status(),
+            StoreStatus::FailedClosed(StoreLoadError::KeystoreLocked(_))
+        ));
+        let row = start_upkeep(&store);
+        assert!(
+            matches!(row, Probe::Warn(_)),
+            "unread, so unchecked: {row:?}"
+        );
+        let row = periodic_upkeep(&store, row);
+        assert!(matches!(row, Probe::Warn(_)), "{row:?}");
+        assert!(!store.is_loaded());
+
+        secrets.locked.store(false, Ordering::SeqCst);
+        let row = periodic_upkeep(&store, row);
+        assert_eq!(store.status(), StoreStatus::Loaded);
+        assert_eq!(row, Probe::Ok, "verified once loaded");
+        assert!(store.grant(&device).is_some());
+        // A loaded store is never loaded again; the row stays.
+        let generation = store.generation();
+        assert_eq!(periodic_upkeep(&store, Probe::Ok), Probe::Ok);
+        assert_eq!(store.generation(), generation);
     }
 
     /// Both protocols answer on the one port: a ping stream is served by the
