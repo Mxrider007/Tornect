@@ -204,7 +204,8 @@ impl SystemBackend {
     /// Opens the portal session: the desktop's dialog, unless the restore
     /// token still holds, until `cancel` turns `true`. The stream asks the
     /// compositor for at most `request`'s rate, which comes from the host's
-    /// config and never from the viewer.
+    /// config and never from the viewer; a desktop that fails the stream
+    /// with that cap gets it once more without (`WaylandOptions::max_fps`).
     fn wayland_source(
         &self,
         request: SourceRequest,

@@ -74,6 +74,9 @@ pub(crate) struct Setup {
     pub(crate) dialog_wait: Duration,
     /// Turns `true` when the session this is for is over before it started.
     pub(crate) cancel: Option<watch::Receiver<bool>>,
+    /// Also open a second PipeWire remote ([`Opened::spare`]), for a stream
+    /// that must be connected once more.
+    pub(crate) spare_remote: bool,
 }
 
 /// A started session, as the capture side needs it.
@@ -88,6 +91,9 @@ pub(crate) struct Opened {
     pub(crate) input: bool,
     /// The PipeWire remote the node is reachable on.
     pub(crate) fd: OwnedFd,
+    /// A second remote to the same node, when [`Setup::spare_remote`] asked
+    /// for one and the portal gave it.
+    pub(crate) spare: Option<OwnedFd>,
 }
 
 /// The screen cast the portal started, before it is checked.
@@ -219,8 +225,9 @@ impl Portal {
         let over = Arc::new(AtomicBool::new(false));
         let closing = Arc::new(AtomicBool::new(false));
         // Every step on the thread is bounded, so this only guards against a
-        // thread that is stuck anyway.
-        let wait = setup.dialog_wait + STEP_WAIT * (STEPS + 1);
+        // thread that is stuck anyway: the steps before the dialog, then one
+        // `OpenPipeWireRemote` or two.
+        let wait = setup.dialog_wait + STEP_WAIT * (STEPS + 1 + u32::from(setup.spare_remote));
         let thread = std::thread::Builder::new()
             .name("tornect-portal".to_owned())
             .spawn({
@@ -700,6 +707,19 @@ async fn negotiate(
         screencast.open_pipe_wire_remote(session, OpenPipeWireRemoteOptions::default()),
     )
     .await?;
+    // Best effort: without a spare, a stream the desktop refuses fails the
+    // cast as it would have anyway.
+    let spare = if setup.spare_remote {
+        step(
+            "OpenPipeWireRemote",
+            screencast.open_pipe_wire_remote(session, OpenPipeWireRemoteOptions::default()),
+        )
+        .await
+        .inspect_err(|e| tracing::debug!(error = %e, "no second PipeWire remote"))
+        .ok()
+    } else {
+        None
+    };
     tracing::info!(
         node = stream.node_id,
         logical = ?stream.logical,
@@ -712,6 +732,7 @@ async fn negotiate(
         logical: stream.logical,
         input,
         fd,
+        spare,
     })
 }
 
@@ -903,6 +924,7 @@ mod tests {
             token_file: None,
             dialog_wait: Duration::from_secs(1),
             cancel: None,
+            spare_remote: true,
         };
         match Portal::open(setup) {
             Err(CaptureError::Unavailable(why)) => assert!(why.contains("D-Bus"), "{why}"),

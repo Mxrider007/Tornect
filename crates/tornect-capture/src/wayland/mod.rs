@@ -29,7 +29,7 @@ use tornect_input::{
 
 use self::pipewire::{PwCapture, Shared};
 pub use self::portal::Bus;
-use self::portal::{Call, Portal, ScrollAxis, Setup};
+use self::portal::{Call, Opened, Portal, ScrollAxis, Setup};
 use crate::{CaptureError, Frame, VideoSource};
 
 /// How long [`WaylandOptions::new`] gives the user to answer the dialog: about
@@ -57,7 +57,9 @@ pub struct WaylandOptions {
     /// The most pictures a second the stream asks the compositor for (its
     /// `maxFramerate`, held to 1 to 120), so that the PipeWire thread copies
     /// no picture the encoder would drop. `None` asks for no cap: the
-    /// compositor delivers at its own rate.
+    /// compositor delivers at its own rate. A desktop that fails the stream
+    /// with the cap gets it once more without (on a second PipeWire remote
+    /// the portal opens for that), so a cap never costs the picture.
     pub max_fps: Option<u32>,
 }
 
@@ -108,26 +110,65 @@ impl WaylandSource {
             token_file: options.restore_token.clone(),
             dialog_wait: options.dialog_wait,
             cancel: options.cancel.clone(),
+            spare_remote: options.max_fps.is_some(),
         })?;
         let portal = Arc::new(portal);
-        let capture = PwCapture::connect(opened.fd, opened.node_id, options.max_fps)?;
-        let format = capture.shared().wait_negotiated(NEGOTIATE_WAIT)?;
+        let Opened {
+            node_id,
+            logical,
+            input,
+            fd,
+            spare,
+        } = opened;
+        let cancelled = || options.cancel.as_ref().is_some_and(|c| *c.borrow());
+        let (capture, format) =
+            connect_capped(options.max_fps, fd, spare, cancelled, |fd, max_fps| {
+                let capture = PwCapture::connect(fd, node_id, max_fps)?;
+                let format = capture.shared().wait_negotiated(NEGOTIATE_WAIT)?;
+                Ok((capture, format))
+            })?;
         tracing::info!(
-            node = opened.node_id,
+            node = node_id,
             width = format.width,
             height = format.height,
             max_framerate = ?format.max_framerate,
-            logical = ?opened.logical,
-            input = opened.input,
+            logical = ?logical,
+            input,
             "Wayland screen cast negotiated"
         );
         let input = WaylandInput {
             portal: Arc::downgrade(&portal),
             shared: Arc::clone(capture.shared()),
-            logical: opened.logical,
-            granted: opened.input,
+            logical,
+            granted: input,
         };
         Ok((Self { capture, portal }, input))
+    }
+}
+
+/// Connects the cast's stream on `fd` asking for at most `max_fps`
+/// pictures a second. If that fails with a cap asked for, a `spare` remote
+/// at hand and the session not over (`cancelled`), it is connected once
+/// more, on the spare, with no cap: a desktop that refuses the property
+/// (the quality design's R2) still shares, at its own rate, which the
+/// encoder paces anyway. The spare goes unused otherwise.
+fn connect_capped<Fd, T>(
+    max_fps: Option<u32>,
+    fd: Fd,
+    spare: Option<Fd>,
+    cancelled: impl Fn() -> bool,
+    mut connect: impl FnMut(Fd, Option<u32>) -> Result<T, CaptureError>,
+) -> Result<T, CaptureError> {
+    match (connect(fd, max_fps), spare) {
+        (Err(e), Some(spare)) if max_fps.is_some() && !cancelled() => {
+            tracing::warn!(
+                error = %e,
+                ?max_fps,
+                "the screen cast did not start with a frame-rate cap; trying once without it"
+            );
+            connect(spare, None)
+        }
+        (result, _) => result,
     }
 }
 
@@ -161,6 +202,7 @@ pub fn grant(options: &WaylandOptions) -> Result<Granted, CaptureError> {
         token_file: options.restore_token.clone(),
         dialog_wait: options.dialog_wait,
         cancel: options.cancel.clone(),
+        spare_remote: false,
     })?;
     let input = opened.input;
     // The PipeWire remote goes first, then the session: no picture is taken.
@@ -424,6 +466,9 @@ fn translate(
 #[cfg(test)]
 #[allow(clippy::print_stderr)] // the live test reports what it saw
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::*;
 
     /// `tornect_codec::scale::shown_region`, which the session layer passes
@@ -453,6 +498,85 @@ mod tests {
             ..WaylandOptions::new(None)
         };
         assert_eq!(pipewire::enum_format_pod(capped.max_fps).bytes().len(), 288);
+    }
+
+    /// A remote that records when it is let go of.
+    struct Remote(&'static str, Rc<RefCell<Vec<String>>>);
+
+    impl Drop for Remote {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(format!("closed {}", self.0));
+        }
+    }
+
+    /// The stream is connected with the cap first; only when that fails, a
+    /// spare is at hand and the session goes on, once more on the spare
+    /// without it. Whatever is not used is let go of, and the result is the
+    /// last attempt's.
+    #[test]
+    fn a_refused_frame_rate_cap_is_retried_once_without_it_on_the_spare() {
+        type Script = Vec<Result<&'static str, &'static str>>;
+        let run = |max_fps: Option<u32>, spare: bool, cancelled: bool, mut script: Script| {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let fd = Remote("first", Rc::clone(&log));
+            let spare = spare.then(|| Remote("spare", Rc::clone(&log)));
+            let result = connect_capped(
+                max_fps,
+                fd,
+                spare,
+                || cancelled,
+                |remote: Remote, fps: Option<u32>| {
+                    log.borrow_mut()
+                        .push(format!("connect {} {fps:?}", remote.0));
+                    drop(remote);
+                    script
+                        .remove(0)
+                        .map_err(|why| CaptureError::Unavailable(why.to_owned()))
+                },
+            );
+            let result = result.map_err(|e| e.to_string());
+            let log = log.borrow().clone();
+            (result, log)
+        };
+        let failed = |why: &str| Err(format!("capture unavailable: {why}"));
+
+        let (result, log) = run(Some(20), true, false, vec![Ok("capped")]);
+        assert_eq!(result, Ok("capped"));
+        assert_eq!(
+            log,
+            ["connect first Some(20)", "closed first", "closed spare"]
+        );
+
+        let (result, log) = run(Some(20), true, false, vec![Err("refused"), Ok("uncapped")]);
+        assert_eq!(result, Ok("uncapped"));
+        assert_eq!(
+            log,
+            [
+                "connect first Some(20)",
+                "closed first",
+                "connect spare None",
+                "closed spare"
+            ]
+        );
+
+        let (result, log) = run(Some(20), true, false, vec![Err("refused"), Err("again")]);
+        assert_eq!(result, failed("again"), "the last attempt's error");
+        assert_eq!(log.len(), 4);
+
+        // No cap asked for, no spare, or a session already over: one try.
+        for (max_fps, spare, cancelled) in [
+            (None, true, false),
+            (Some(20), false, false),
+            (Some(20), true, true),
+        ] {
+            let (result, log) = run(max_fps, spare, cancelled, vec![Err("refused")]);
+            assert_eq!(result, failed("refused"), "{max_fps:?} {spare} {cancelled}");
+            assert_eq!(log[0], format!("connect first {max_fps:?}"));
+            assert!(
+                !log.iter().any(|line| line.starts_with("connect spare")),
+                "{log:?}"
+            );
+        }
     }
 
     #[test]
