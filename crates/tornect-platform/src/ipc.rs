@@ -422,6 +422,77 @@ where
     Ok(decode_response(&frame)?)
 }
 
+/// The pause before the endpoint tries again after a failure that leaves it
+/// standing (audit B17): an `accept` that failed (the descriptor limit, a
+/// passing shortage of memory or buffers, a connection aborted before it was
+/// taken), or a Windows pipe instance that could not be made or freed. 50 ms,
+/// doubling to at most 1 s; back to 50 ms once a connection is accepted. One
+/// such failure used to end the endpoint, and with it `tornect panic`, the
+/// second launch's Show and every `tornect unattended` command, until the
+/// host restarted.
+#[derive(Debug)]
+struct Backoff {
+    next: Duration,
+}
+
+impl Backoff {
+    const FIRST: Duration = Duration::from_millis(50);
+    const MAX: Duration = Duration::from_secs(1);
+
+    fn new() -> Self {
+        Self { next: Self::FIRST }
+    }
+
+    /// The pause after one more failure.
+    fn failed(&mut self) -> Duration {
+        let pause = self.next;
+        self.next = (self.next * 2).min(Self::MAX);
+        pause
+    }
+
+    /// A connection was accepted: the next failure pauses briefly again.
+    #[cfg(any(unix, test))]
+    fn succeeded(&mut self) {
+        self.next = Self::FIRST;
+    }
+}
+
+/// `make`, tried until it works, with a [`Backoff`] pause after each failure
+/// (logged as `what`): the Windows endpoint's next pipe instance, made while
+/// the caller still holds one, so the pipe's name never lapses while it waits.
+#[cfg(any(windows, test))]
+async fn until_made<T, E: fmt::Display>(what: &str, mut make: impl FnMut() -> Result<T, E>) -> T {
+    let mut backoff = Backoff::new();
+    loop {
+        match make() {
+            Ok(made) => return made,
+            Err(e) => {
+                let pause = backoff.failed();
+                tracing::warn!(error = %e, retry_in = ?pause, "{what} failed; trying again");
+                tokio::time::sleep(pause).await;
+            }
+        }
+    }
+}
+
+/// Whether an `accept` error means the listening socket itself is unusable
+/// (`EBADF`, `EINVAL`, `ENOTSOCK`), which ends the endpoint. Every other one
+/// is about one connection or a passing shortage (`EMFILE` and `ENFILE` at
+/// the descriptor limit, `ENOBUFS`, `ENOMEM`, `ECONNABORTED`, `EINTR`,
+/// `EPERM`, `EPROTO`): the endpoint pauses ([`Backoff`]) and accepts again.
+/// The numbers are the kernel's (no `libc` here): the same on Linux, macOS
+/// and the BSDs but for `ENOTSOCK`.
+#[cfg(unix)]
+fn listener_is_gone(e: &std::io::Error) -> bool {
+    const EBADF: i32 = 9;
+    const EINVAL: i32 = 22;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const ENOTSOCK: i32 = 88;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const ENOTSOCK: i32 = 38;
+    matches!(e.raw_os_error(), Some(EBADF | EINVAL | ENOTSOCK))
+}
+
 /// `ERROR_ACCESS_DENIED`: what `FILE_FLAG_FIRST_PIPE_INSTANCE` fails with when
 /// the pipe exists.
 #[cfg(any(windows, test))]
@@ -488,8 +559,8 @@ mod imp {
     use tokio::net::{UnixListener, UnixStream};
 
     use super::{
-        IpcError, IpcRequest, IpcResponse, MAX_CONNECTIONS, Path, PathBuf, Reply, exchange,
-        serve_frames, socket_path,
+        Backoff, IpcError, IpcRequest, IpcResponse, MAX_CONNECTIONS, Path, PathBuf, Reply,
+        exchange, listener_is_gone, serve_frames, socket_path,
     };
 
     /// A bound, owner-only endpoint.
@@ -553,34 +624,82 @@ mod imp {
         /// store's own lock does that, and the guard runs the dialog without
         /// holding it. One dialog at a time is the re-auth backend's rule, not
         /// the endpoint's.
+        ///
+        /// An `accept` that fails pauses the loop and is tried again
+        /// ([`Backoff`], audit B17); only a listening socket that is itself
+        /// unusable ends it, with that error.
         pub async fn serve<F, Fut, R>(&self, handler: F) -> Result<(), IpcError>
         where
             F: Fn(IpcRequest) -> Fut + Clone + Send + Sync + 'static,
             Fut: Future<Output = R> + Send + 'static,
             R: Into<Reply> + Send + 'static,
         {
-            let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
-            loop {
-                let (stream, _) = self.listener.accept().await?;
-                let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
-                    // Refusing is safe: the CLI sees the connection close and
-                    // reports it; nothing was run.
+            accept_loop(&self.listener, self.owner_uid, handler).await
+        }
+    }
+
+    /// Where connections come from: the endpoint's listener, or a test's.
+    pub(super) trait Accept {
+        /// The next connection.
+        fn next_connection(&self) -> impl Future<Output = std::io::Result<UnixStream>> + Send;
+    }
+
+    impl Accept for UnixListener {
+        async fn next_connection(&self) -> std::io::Result<UnixStream> {
+            self.accept().await.map(|(stream, _)| stream)
+        }
+    }
+
+    /// [`Endpoint::serve`]'s loop over `listener`, whose socket file
+    /// `owner_uid` owns.
+    pub(super) async fn accept_loop<L, F, Fut, R>(
+        listener: &L,
+        owner_uid: u32,
+        handler: F,
+    ) -> Result<(), IpcError>
+    where
+        L: Accept + Sync,
+        F: Fn(IpcRequest) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Into<Reply> + Send + 'static,
+    {
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+        let mut backoff = Backoff::new();
+        loop {
+            let stream = match listener.next_connection().await {
+                Ok(stream) => {
+                    backoff.succeeded();
+                    stream
+                }
+                Err(e) if listener_is_gone(&e) => return Err(e.into()),
+                Err(e) => {
+                    let pause = backoff.failed();
                     tracing::warn!(
-                        max = MAX_CONNECTIONS,
-                        "IPC endpoint at its connection limit; refused one"
+                        error = %e,
+                        retry_in = ?pause,
+                        "the IPC endpoint could not accept a connection; trying again"
                     );
+                    tokio::time::sleep(pause).await;
                     continue;
-                };
-                let handler = handler.clone();
-                let owner_uid = self.owner_uid;
-                tokio::spawn(async move {
-                    let _slot = slot;
-                    if let Err(e) = serve_one(stream, owner_uid, &handler).await {
-                        // One bad client must never take the endpoint down.
-                        tracing::warn!(error = %e, "IPC connection dropped");
-                    }
-                });
-            }
+                }
+            };
+            let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+                // Refusing is safe: the CLI sees the connection close and
+                // reports it; nothing was run.
+                tracing::warn!(
+                    max = MAX_CONNECTIONS,
+                    "IPC endpoint at its connection limit; refused one"
+                );
+                continue;
+            };
+            let handler = handler.clone();
+            tokio::spawn(async move {
+                let _slot = slot;
+                if let Err(e) = serve_one(stream, owner_uid, &handler).await {
+                    // One bad client must never take the endpoint down.
+                    tracing::warn!(error = %e, "IPC connection dropped");
+                }
+            });
         }
     }
 
@@ -661,7 +780,7 @@ mod imp {
     use super::{
         IDLE_TIMEOUT, IpcError, IpcRequest, IpcResponse, MAX_CONNECTIONS, Path, PathBuf, Reply,
         bind_steps, check_account, exchange, new_control_pipe_name, read_pipe_name,
-        remove_pipe_name, running, serve_frames,
+        remove_pipe_name, running, serve_frames, until_made,
     };
     use crate::win::{OwnedHandle, current_user_sid, sid_of, sid_string, token_user, wide};
 
@@ -884,7 +1003,12 @@ mod imp {
         /// [`MAX_CONNECTIONS`] at once, as the Unix endpoint does (track D S6:
         /// `off`, `revoke` and `panic` never wait behind another request's
         /// re-authentication dialog). The next instance is created before a
-        /// connected one is handed over, so the name never lapses.
+        /// connected one is handed over, so the name never lapses; one that
+        /// cannot be made yet (every instance taken while a finished
+        /// connection's handle is still closing, a passing shortage of
+        /// resources) is tried again after a pause while the connected one
+        /// waits, and an instance that cannot be freed after a refusal is
+        /// replaced the same way (audit B17): neither ends the endpoint.
         pub async fn serve<F, Fut, R>(&self, handler: F) -> Result<(), IpcError>
         where
             F: Fn(IpcRequest) -> Fut + Clone + Send + Sync + 'static,
@@ -914,11 +1038,14 @@ mod imp {
                         max = MAX_CONNECTIONS,
                         "IPC endpoint at its connection limit; refused one"
                     );
-                    waiting.disconnect()?;
+                    if let Err(e) = waiting.disconnect() {
+                        // Made before the old one is dropped: the name stays.
+                        tracing::warn!(error = %e, "an IPC pipe instance could not be freed");
+                        waiting = self.next_instance().await;
+                    }
                     continue;
                 };
-                let connected =
-                    std::mem::replace(&mut waiting, instance(&self.name, &self.descriptor, false)?);
+                let connected = std::mem::replace(&mut waiting, self.next_instance().await);
                 let handler = handler.clone();
                 let account = self.account.clone();
                 tokio::spawn(async move {
@@ -929,6 +1056,17 @@ mod imp {
                     }
                 });
             }
+        }
+    }
+
+    impl Endpoint {
+        /// A new waiting instance, tried until it is made; the caller holds
+        /// an instance meanwhile, so the name never lapses.
+        async fn next_instance(&self) -> NamedPipeServer {
+            until_made("making the IPC pipe's next instance", || {
+                instance(&self.name, &self.descriptor, false)
+            })
+            .await
         }
     }
 
@@ -1004,6 +1142,45 @@ pub use imp::{Endpoint, is_running, request};
 #[cfg(test)]
 mod pipe_rules {
     use super::*;
+
+    /// Audit B17: the pause after each failure the endpoint outlives: 50 ms,
+    /// doubling to at most 1 s, and 50 ms again after an accepted connection.
+    #[test]
+    fn a_failure_the_endpoint_outlives_pauses_it_briefly() {
+        let mut backoff = Backoff::new();
+        let pauses: Vec<Duration> = (0..7).map(|_| backoff.failed()).collect();
+        assert_eq!(
+            pauses,
+            [50, 100, 200, 400, 800, 1000, 1000].map(Duration::from_millis)
+        );
+        backoff.succeeded();
+        assert_eq!(backoff.failed(), Duration::from_millis(50));
+    }
+
+    /// Audit B17 (Windows): a next pipe instance that cannot be made yet
+    /// (every instance taken, `ERROR_PIPE_BUSY`, while a finished
+    /// connection's handle is still closing; `ERROR_NO_SYSTEM_RESOURCES`) is
+    /// tried again after a pause until it is made. It used to end the
+    /// endpoint, and the control channel was gone until the host restarted.
+    #[tokio::test(start_paused = true)]
+    async fn a_pipe_instance_that_cannot_be_made_yet_is_tried_again() {
+        const NO_SYSTEM_RESOURCES: i32 = 1450;
+        let started = tokio::time::Instant::now();
+        let mut failures = vec![
+            std::io::Error::from_raw_os_error(NO_SYSTEM_RESOURCES),
+            std::io::Error::from_raw_os_error(PIPE_FULL),
+            std::io::Error::from_raw_os_error(PIPE_FULL),
+        ];
+        let mut tries = 0;
+        let made = until_made("making the next instance", || {
+            tries += 1;
+            failures.pop().map_or(Ok("the instance"), Err)
+        })
+        .await;
+        assert_eq!(made, "the instance");
+        assert_eq!(tries, 4);
+        assert_eq!(started.elapsed(), Duration::from_millis(50 + 100 + 200));
+    }
 
     /// A second server, finding the pipe made already (`FILE_FLAG_FIRST_PIPE_INSTANCE`
     /// fails, or every instance is taken), gets no endpoint and so serves nothing;
@@ -1516,6 +1693,130 @@ mod tests {
             "the pending op still completes"
         );
         server.abort();
+    }
+
+    /// A listener whose next accepts fail with `errors` (the last one first),
+    /// then the real one's.
+    struct Flaky {
+        inner: tokio::net::UnixListener,
+        errors: std::sync::Mutex<Vec<std::io::Error>>,
+    }
+
+    impl imp::Accept for Flaky {
+        fn next_connection(
+            &self,
+        ) -> impl Future<Output = std::io::Result<tokio::net::UnixStream>> + Send {
+            let failure = self.errors.lock().unwrap().pop();
+            async move {
+                match failure {
+                    Some(e) => Err(e),
+                    None => self.inner.accept().await.map(|(stream, _)| stream),
+                }
+            }
+        }
+    }
+
+    /// A [`Flaky`] listener bound at `dir`'s socket, and the uid owning it.
+    fn flaky(dir: &Path, errors: Vec<std::io::Error>) -> (Flaky, u32) {
+        use std::os::unix::fs::MetadataExt as _;
+        let path = socket_path(dir);
+        let inner = tokio::net::UnixListener::bind(&path).unwrap();
+        let owner = fs_err::metadata(&path).unwrap().uid();
+        let errors = std::sync::Mutex::new(errors);
+        (Flaky { inner, errors }, owner)
+    }
+
+    /// Audit B17: an `accept` that fails (the descriptor limit, `EMFILE` or
+    /// `ENFILE`; a connection aborted before it was taken; an interrupted
+    /// call) pauses the endpoint, which then answers as before. It used to
+    /// end it: `tornect panic`, the second launch's Show and every `tornect
+    /// unattended` command failed until the host restarted.
+    #[tokio::test]
+    async fn an_accept_that_fails_does_not_end_the_endpoint() {
+        const ENFILE: i32 = 23;
+        const EMFILE: i32 = 24;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = state_dir(&tmp);
+        let (listener, owner) = flaky(
+            &dir,
+            vec![
+                std::io::Error::from(ErrorKind::Interrupted),
+                std::io::Error::from(ErrorKind::ConnectionAborted),
+                std::io::Error::from_raw_os_error(ENFILE),
+                std::io::Error::from_raw_os_error(EMFILE),
+            ],
+        );
+        let server = tokio::spawn(async move {
+            imp::accept_loop(&listener, owner, |req: IpcRequest| async move {
+                IpcResponse::ok(req.id)
+            })
+            .await
+        });
+        for id in [1, 2] {
+            let resp = tokio::time::timeout(
+                Duration::from_secs(10),
+                request(
+                    &dir,
+                    &IpcRequest {
+                        id,
+                        op: IpcOp::Status,
+                    },
+                ),
+            )
+            .await
+            .expect("the endpoint answers after the failures")
+            .unwrap();
+            assert!(resp.ok);
+            assert_eq!(resp.id, id);
+        }
+        assert!(!server.is_finished(), "the endpoint ended");
+        server.abort();
+    }
+
+    /// Only a listening socket that is itself unusable ends the endpoint,
+    /// with its error.
+    #[tokio::test]
+    async fn an_unusable_listener_ends_the_endpoint() {
+        const EBADF: i32 = 9;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = state_dir(&tmp);
+        let (listener, owner) = flaky(&dir, vec![std::io::Error::from_raw_os_error(EBADF)]);
+        let ended = tokio::time::timeout(
+            Duration::from_secs(10),
+            imp::accept_loop(&listener, owner, |req: IpcRequest| async move {
+                IpcResponse::ok(req.id)
+            }),
+        )
+        .await
+        .expect("an unusable listener ends the loop");
+        match ended {
+            Err(IpcError::Io(e)) => assert_eq!(e.raw_os_error(), Some(EBADF)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Which `accept` errors end the endpoint (the listening socket is
+    /// unusable) and which it outlives.
+    #[test]
+    fn only_an_unusable_listener_ends_the_endpoint() {
+        let errno = std::io::Error::from_raw_os_error;
+        for gone in [9, 22] {
+            assert!(listener_is_gone(&errno(gone)), "{gone}");
+        }
+        for passing in [1, 4, 12, 23, 24] {
+            assert!(!listener_is_gone(&errno(passing)), "{passing}");
+        }
+        assert!(!listener_is_gone(&std::io::Error::from(
+            ErrorKind::ConnectionAborted
+        )));
+        #[cfg(target_os = "linux")]
+        {
+            // ENOTSOCK; ENOBUFS, ECONNABORTED, EPROTO.
+            assert!(listener_is_gone(&errno(88)));
+            for passing in [105, 103, 71] {
+                assert!(!listener_is_gone(&errno(passing)), "{passing}");
+            }
+        }
     }
 
     /// A frame that does not decode is answered, not dropped: a version-skewed
