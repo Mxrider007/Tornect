@@ -2471,7 +2471,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     }
                     Command::Connect(id) | Command::ConnectAnyway(id) => {
                         let Some(node) = node.clone() else {
-                            b.shared.update(|m| m.client = ClientStage::Ended("Tor is not connected yet.".to_owned()));
+                            b.shared.update(|m| not_dialled(m, id, false, TOR_NOT_YET));
                             continue;
                         };
                         if viewing.as_ref().is_some_and(|(_, task)| !task.is_finished()) {
@@ -2678,7 +2678,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     }
                     Command::ConnectUnattended(id, choice) => {
                         let Some(node) = node.clone() else {
-                            b.shared.update(|m| m.client = ClientStage::Ended("Tor is not connected yet.".to_owned()));
+                            b.shared.update(|m| not_dialled(m, id, true, TOR_NOT_YET));
                             continue;
                         };
                         if viewing.as_ref().is_some_and(|(_, task)| !task.is_finished())
@@ -2697,12 +2697,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                                 continue;
                             }
                             Err(NoPassword::None) => {
-                                b.shared.update(|m| {
-                                    m.client = ClientStage::Ended(
-                                        "No password: none was typed and none is remembered."
-                                            .to_owned(),
-                                    );
-                                });
+                                b.shared.update(|m| not_dialled(m, id, true, NO_PASSWORD));
                                 continue;
                             }
                         };
@@ -3626,6 +3621,25 @@ fn own_id_refused(m: &mut super::model::Model) {
 
 /// What a connect to this computer's own ID ends with.
 const OWN_ID: &str = "That is this computer's own ID: there is nothing to connect to.";
+
+/// A connect to `id` that ends before anything is dialled, for `why`: a
+/// dial of its own, so the stepper shows no step done and none failed
+/// rather than the previous dial's (every step ticked under "The session
+/// ended", or its failure; B25), and Try again dials this ID.
+fn not_dialled(m: &mut super::model::Model, id: TornectId, unattended: bool, why: &str) {
+    m.dial = Dial {
+        id: Some(id),
+        unattended,
+        ..Dial::default()
+    };
+    m.client = ClientStage::Ended(why.to_owned());
+}
+
+/// What a connect asked for before Tor is up ends with.
+const TOR_NOT_YET: &str = "Tor is not connected yet.";
+
+/// What an unattended connect with no password ends with.
+const NO_PASSWORD: &str = "No password: none was typed and none is remembered.";
 
 /// Record why the connection ended without a session, at the step it had
 /// reached.
@@ -6702,6 +6716,39 @@ mod tests {
         assert!(m.connect_warning.is_none() && m.connect_unchecked.is_none());
         assert_eq!(m.dial.id, None);
         assert!(!m.dial.went_live && m.dial.failed.is_none());
+    }
+
+    /// B25 review: a connect that ends before anything is dialled (Tor not
+    /// up yet, no password) is a dial of its own: after a session that went
+    /// live, or a dial that failed, the stepper shows no step done and none
+    /// failed, with this ID for Try again.
+    #[test]
+    fn a_connect_that_dials_nothing_forgets_the_last_dial() {
+        let before = HostIdentity::from_seed(&[0x31; 32]).id();
+        let now = HostIdentity::from_seed(&[0x32; 32]).id();
+        for (unattended, why) in [
+            (false, TOR_NOT_YET),
+            (true, TOR_NOT_YET),
+            (true, NO_PASSWORD),
+        ] {
+            for (went_live, failed) in [(true, None), (false, Some((Failure::Denied, 3)))] {
+                let mut m = Model::default();
+                m.dial = Dial {
+                    id: Some(before),
+                    since: Some(Instant::now()),
+                    paired_now: true,
+                    failed,
+                    unattended: !unattended,
+                    went_live,
+                };
+                not_dialled(&mut m, now, unattended, why);
+                assert!(matches!(&m.client, ClientStage::Ended(w) if w == why));
+                assert_eq!(m.dial.id, Some(now));
+                assert_eq!(m.dial.unattended, unattended);
+                assert!(!m.dial.went_live && m.dial.failed.is_none() && !m.dial.paired_now);
+                assert!(m.dial.since.is_none());
+            }
+        }
     }
 
     /// B02: the window's words for a Tor that did not start name no command,
