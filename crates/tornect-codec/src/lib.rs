@@ -21,6 +21,7 @@ use openh264::encoder::{
 };
 use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSource as _};
 
+mod rgba;
 pub mod scale;
 
 /// The longest side OpenH264 encodes: 3840 wide, or 3840 tall when the
@@ -371,10 +372,24 @@ impl H264Decoder {
                 h: height,
             });
         }
-        // `write_rgba8` wants exactly w·h·4 bytes; resizing keeps the
-        // allocation, so equal sizes never allocate again.
+        // Exactly w·h·4 bytes, which both converters want; resizing keeps
+        // the allocation, so equal sizes never allocate again.
         self.frame.rgba.resize(w * h * 4, 0);
-        yuv.write_rgba8(&mut self.frame.rgba);
+        // `openh264` converts eight pixels at a time only for a width that
+        // is a multiple of 8 (every scaled picture); any other width (an
+        // unscaled 1366- or 3538-wide desktop) would take its scalar loop,
+        // 12–19× slower, so this crate's own converter takes it.
+        let simd = w % 8 == 0 && h >= 2;
+        if simd
+            || !rgba::write_rgba8(
+                (yuv.y(), yuv.u(), yuv.v()),
+                (w, h),
+                yuv.strides(),
+                &mut self.frame.rgba,
+            )
+        {
+            yuv.write_rgba8(&mut self.frame.rgba);
+        }
         self.frame.width = width;
         self.frame.height = height;
         self.frame.timing = DecodeTiming {
@@ -876,6 +891,37 @@ mod tests {
         let frame = dec.decode(&au.data).unwrap().expect("a picture");
         assert!(frame.timing.decode > Duration::ZERO, "{:?}", frame.timing);
         assert!(frame.timing.convert > Duration::ZERO, "{:?}", frame.timing);
+    }
+
+    /// A picture whose width is not a multiple of 8 (an unscaled 1366-wide
+    /// desktop, a 330-wide one) comes out of this crate's converter within 1
+    /// of `openh264`'s own scalar conversion in every channel, and equal in
+    /// nearly every byte; a multiple of 8 still takes `openh264`'s, byte for
+    /// byte.
+    #[test]
+    fn any_width_decodes_to_openh264s_colours() {
+        for (w, h) in [(1366, 768), (330, 240), (1368, 768)] {
+            let mut enc = H264Encoder::new(EncoderSettings::default()).unwrap();
+            let au = enc.encode(&noise(w, h, 7), w, h).unwrap();
+            let mut ours = H264Decoder::new().unwrap();
+            let frame = ours.decode(&au.data).unwrap().expect("a picture");
+            assert_eq!((frame.width, frame.height), (w, h));
+            let mut theirs = Decoder::new().unwrap();
+            let yuv = theirs.decode(&au.data).unwrap().expect("a picture");
+            let mut want = vec![0; (w * h * 4) as usize];
+            yuv.write_rgba8(&mut want);
+            if w % 8 == 0 {
+                assert!(frame.rgba == want, "{w}x{h}");
+                continue;
+            }
+            assert_eq!(frame.rgba.len(), want.len());
+            let mut differ = 0;
+            for (i, (a, b)) in frame.rgba.iter().zip(&want).enumerate() {
+                assert!(a.abs_diff(*b) <= 1, "{w}x{h} byte {i}: {a} against {b}");
+                differ += usize::from(a != b);
+            }
+            assert!(differ * 1000 < want.len(), "{w}x{h}: {differ} bytes differ");
+        }
     }
 
     /// The viewer's bound is the host's: up to 3840×2160 either way up.
