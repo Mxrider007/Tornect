@@ -271,8 +271,8 @@ enum Command {
         #[arg(long)]
         no_video: bool,
         /// The picture quality to ask for: best-quality, balanced or
-        /// best-performance (default: [viewer] quality in config.toml, itself
-        /// balanced). The host fits it to its own limits.
+        /// best-performance (default: the viewer's quality in config.toml,
+        /// itself balanced). The host fits it to its own limits.
         #[arg(long, value_name = "PRESET")]
         quality: Option<QualityPreset>,
         /// Connect without asking: this device's unattended access at the host

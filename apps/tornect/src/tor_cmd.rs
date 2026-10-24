@@ -1148,7 +1148,7 @@ pub(crate) enum End {
     NoPicture(anyhow::Error),
 }
 
-/// How [`watch`] receives the screen.
+/// How [`watch()`] receives the screen.
 #[derive(Default)]
 pub(crate) struct WatchOptions<'a> {
     /// End the session after this many pings; `None` keeps it until the user
