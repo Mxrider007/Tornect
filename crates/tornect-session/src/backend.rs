@@ -163,8 +163,8 @@ impl SystemBackend {
             Desktop::Wayland => self.wayland_injector(),
             // XTEST reaches only X11 clients under Xwayland, so input is
             // injected only where capture shows the X11 desktop, and over the
-            // part of it the encoder sends (SLICE-C1 C1-2); never into another
-            // machine's display (SLICE-C3 C3-3).
+            // part of it the picture shows (SLICE-C1 C1-2, decision M1-74);
+            // never into another machine's display (SLICE-C3 C3-3).
             Desktop::X11 if session.as_deref() == Some("x11") => {
                 let display = std::env::var("DISPLAY").ok();
                 if !tornect_capture::x11::display_is_local(display.as_deref()) {
@@ -174,7 +174,7 @@ impl SystemBackend {
                     return None;
                 }
                 match tornect_input::x11::XTestSink::connect() {
-                    Ok(sink) => Some(Box::new(sink.over(tornect_codec::encoded_size))),
+                    Ok(sink) => Some(Box::new(sink.over(tornect_codec::scale::shown_region))),
                     Err(e) => {
                         tracing::warn!(error = %e, "XTEST is unavailable: the viewer's input is dropped");
                         None
@@ -210,14 +210,15 @@ impl SystemBackend {
     }
 
     /// The injector into the session `wayland_source` opened, mapping the
-    /// viewer's pointer over what the encoder sends (SLICE-C1 C1-2).
+    /// viewer's pointer over the part of the desktop the picture shows
+    /// (SLICE-C1 C1-2, decision M1-74).
     fn wayland_injector(&self) -> Option<Box<dyn InputSink>> {
         let input = self
             .wayland_input
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()?;
-        match input.injector(tornect_codec::encoded_size) {
+        match input.injector(tornect_codec::scale::shown_region) {
             Ok(injector) => Some(Box::new(injector)),
             Err(e) => {
                 tracing::warn!(error = %e, "the viewer's input is dropped");
@@ -252,10 +253,11 @@ impl SystemBackend {
         Ok(Box::new(tornect_capture::gdi::GdiCapture::open()?))
     }
 
-    /// Over the part of the virtual desktop the encoder sends (SLICE-C1 C1-2).
+    /// Over the part of the virtual desktop the picture shows (SLICE-C1 C1-2,
+    /// decision M1-74).
     fn desktop_injector(&self) -> Option<Box<dyn InputSink>> {
         Some(Box::new(
-            tornect_input::windows::SendInputSink::new().over(tornect_codec::encoded_size),
+            tornect_input::windows::SendInputSink::new().over(tornect_codec::scale::shown_region),
         ))
     }
 }

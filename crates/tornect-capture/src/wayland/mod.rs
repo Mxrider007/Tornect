@@ -8,8 +8,9 @@
 //!   by the compositor.
 //! - [`WaylandInjector`] is the `InputSink`, built from the [`WaylandInput`]
 //!   the source hands out. It maps the viewer's pointer over the part of the
-//!   picture the encoder sends, never over the whole desktop (SLICE-C1 C1-2),
-//!   and speaks evdev codes to the portal's `Notify*` methods.
+//!   desktop the picture shows (SLICE-C1 C1-2): all of it but an odd last
+//!   column or row, which the host scales into the picture (decision M1-74).
+//!   It speaks evdev codes to the portal's `Notify*` methods.
 //! - The session's restore token, kept in a 0600 file, lets later sessions
 //!   start without the dialog until the user revokes the permission.
 //!
@@ -207,9 +208,10 @@ impl std::fmt::Debug for WaylandInput {
 
 impl WaylandInput {
     /// An injector into the source's session. `region` gives, for a picture of
-    /// the source's size, the part the encoder sends (its top-left crop); the
-    /// viewer's pointer is mapped over that part, which is exactly what the
-    /// viewer sees, even when the desktop is larger than the encoder allows.
+    /// the source's size, the part of it the viewer's picture shows (the
+    /// session layer passes `tornect_codec::scale::shown_region`); the viewer's
+    /// pointer is mapped over that part, which is exactly what the viewer sees,
+    /// scaled down or not.
     ///
     /// Refused when the source is gone, when the desktop did not grant input
     /// (the dialog's remote-control switch), or when the portal gave no
@@ -316,8 +318,8 @@ impl PointerMap {
         })
     }
 
-    /// Where `(x, y)`, normalized over the encoded region of a `pixels`-sized
-    /// picture, lies in logical coordinates. The region is the picture's
+    /// Where `(x, y)`, normalized over the shown region of a `pixels`-sized
+    /// desktop, lies in logical coordinates. The region is the desktop's
     /// top-left `region(pixels)`; the result stays strictly inside the screen's
     /// logical size (`0 <= x < width`), as the portal requires.
     fn place(
@@ -411,15 +413,11 @@ fn translate(
 mod tests {
     use super::*;
 
-    /// `tornect_codec::encoded_size`, which the session layer passes in: even
-    /// sizes, at most 3840×2160 wide and 2160×3840 upright.
-    fn encoded(w: u32, h: u32) -> (u32, u32) {
-        let (w, h) = (w & !1, h & !1);
-        if h > w {
-            (w.min(2160), h.min(3840))
-        } else {
-            (w.min(3840), h.min(2160))
-        }
+    /// `tornect_codec::scale::shown_region`, which the session layer passes
+    /// in: the desktop but for an odd last column or row, scaled whole into
+    /// the picture at any size (decision M1-74).
+    fn shown_region(w: u32, h: u32) -> (u32, u32) {
+        (w & !1, h & !1)
     }
 
     fn whole(w: u32, h: u32) -> (u32, u32) {
@@ -520,41 +518,44 @@ mod tests {
         );
     }
 
-    /// SLICE-C1 C1-2: the viewer sees the encoder's crop, so its corners are
-    /// the crop's corners, not the desktop's.
+    /// SLICE-C1 C1-2: the viewer sees the shown region, so its corners are
+    /// that region's corners, not the desktop's when an odd edge is dropped.
     #[test]
-    fn the_pointer_spans_the_encoded_region_edge_to_edge() {
+    fn the_pointer_spans_the_shown_region_edge_to_edge() {
         // A 5K desktop at 200 %: 5120×2880 pixels, 2560×1440 logical; the
-        // encoder sends the top-left 3840×2160.
+        // host scales all of it into the picture, so the far corner is the
+        // desktop's own.
         let map = PointerMap::new((2560, 1440), (5120, 2880)).unwrap();
-        let place = |x, y| map.place(x, y, (5120, 2880), encoded).unwrap();
+        let place = |x, y| map.place(x, y, (5120, 2880), shown_region).unwrap();
         assert_eq!(place(0, 0), (0.0, 0.0));
-        assert_eq!(place(65535, 65535), (3839.0 * 0.5, 2159.0 * 0.5));
+        assert_eq!(place(65535, 65535), (5119.0 * 0.5, 2879.0 * 0.5));
         let (x, y) = place(32768, 32768);
         assert!(
-            (x - 960.0).abs() <= 0.5 && (y - 540.0).abs() <= 0.5,
+            (x - 1280.0).abs() <= 0.5 && (y - 720.0).abs() <= 0.5,
             "{x} {y}"
         );
-        // Mapped over the whole desktop instead, the far corner would land
-        // outside what the viewer sees.
-        assert!(map.place(65535, 65535, (5120, 2880), whole).unwrap().0 > 1919.5);
-        // Unscaled, odd-sized: 1921×1081 is encoded 1920×1080, and the far
-        // corner is the last pixel the viewer sees.
+        // Odd-sized: 1921×1081 shows 1920×1080, and the far corner is the
+        // last pixel the viewer sees; mapped over the whole desktop instead,
+        // it would land on the dropped column and row, outside the picture.
         let map = PointerMap::new((1921, 1081), (1921, 1081)).unwrap();
         assert_eq!(
-            map.place(65535, 65535, (1921, 1081), encoded),
+            map.place(65535, 65535, (1921, 1081), shown_region),
             Some((1919.0, 1079.0))
+        );
+        assert_eq!(
+            map.place(65535, 65535, (1921, 1081), whole),
+            Some((1920.0, 1080.0))
         );
         // A rotated 4K monitor at 200 %: 2160×3840 pixels, 1080×1920
         // logical, sent whole, so the far corner is the screen's own.
         let map = PointerMap::new((1080, 1920), (2160, 3840)).unwrap();
         assert_eq!(
-            map.place(65535, 65535, (2160, 3840), encoded),
+            map.place(65535, 65535, (2160, 3840), shown_region),
             Some((2159.0 * 0.5, 3839.0 * 0.5))
         );
         // Fractional scaling (125 %): 2560×1600 pixels, 2048×1280 logical.
         let map = PointerMap::new((2048, 1280), (2560, 1600)).unwrap();
-        let (x, y) = map.place(65535, 65535, (2560, 1600), encoded).unwrap();
+        let (x, y) = map.place(65535, 65535, (2560, 1600), shown_region).unwrap();
         assert!((x - 2559.0 * 0.8).abs() < 1e-9 && (y - 1599.0 * 0.8).abs() < 1e-9);
         // Every position is strictly inside the logical screen, at any size.
         for (logical, pixels) in [
@@ -567,7 +568,7 @@ mod tests {
         ] {
             let map = PointerMap::new(logical, pixels).unwrap();
             for (x, y) in [(0, 0), (65535, 65535), (65535, 0), (12345, 54321)] {
-                let (lx, ly) = map.place(x, y, pixels, encoded).unwrap();
+                let (lx, ly) = map.place(x, y, pixels, shown_region).unwrap();
                 assert!(
                     (0.0..f64::from(logical.0)).contains(&lx),
                     "{logical:?} {pixels:?} x {lx}"
@@ -583,9 +584,9 @@ mod tests {
         assert_eq!(PointerMap::new((1920, 1080), (1920, 0)), None);
         let map = PointerMap::new((1920, 1080), (1920, 1080)).unwrap();
         assert_eq!(
-            map.place(1, 1, (1, 1), encoded),
+            map.place(1, 1, (1, 1), shown_region),
             None,
-            "a 1×1 picture encodes to nothing"
+            "a 1×1 desktop shows nothing"
         );
     }
 
@@ -613,7 +614,7 @@ mod tests {
     fn an_injector_is_refused_unless_every_fact_it_needs_is_known() {
         let (portal, mut rx) = fake_portal();
         let shared = Arc::new(Shared::new());
-        let refused = |input: &WaylandInput| match input.injector(encoded) {
+        let refused = |input: &WaylandInput| match input.injector(shown_region) {
             Err(CaptureError::Unavailable(why)) => why,
             Ok(_) => panic!("built"),
             Err(e) => panic!("{e}"),
@@ -634,7 +635,7 @@ mod tests {
         assert!(refused(&input(&portal, &shared, None, true)).contains("logical size"));
         // Everything known: the injector maps and queues.
         let mut injector = input(&portal, &shared, Some((1280, 800)), true)
-            .injector(encoded)
+            .injector(shown_region)
             .unwrap();
         injector
             .inject(&InputEvent::PointerMove { x: 65535, y: 0 })
@@ -681,7 +682,7 @@ mod tests {
         })));
         let mut viewer = tornect_input::Tracked::new(
             input(&portal, &shared, Some((1280, 800)), true)
-                .injector(encoded)
+                .injector(shown_region)
                 .unwrap(),
         );
         let key = |pressed| Call::Key { code: 30, pressed };
@@ -785,7 +786,7 @@ mod tests {
         let quiet = count(&mut source, Duration::from_secs(5));
         eprintln!("pictures in 5 s with nothing moved: {quiet}");
         let injector = input
-            .injector(encoded)
+            .injector(shown_region)
             .expect("an injector (allow remote interaction in the dialog)");
         let mut injector = tornect_input::Tracked::new(injector);
         let mut moved = 0;

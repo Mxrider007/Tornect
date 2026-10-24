@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Notify, Semaphore, mpsc, watch};
 use tornect_capture::{CaptureError, VideoSource};
+use tornect_codec::scale::{ResolutionCap, Scaler};
 use tornect_codec::{EncoderSettings, H264Encoder};
 use tornect_core::levels::Elevation;
 use tornect_core::session_log::SessionMode;
@@ -1244,7 +1245,10 @@ impl Drop for Pipeline {
 }
 
 /// The capture thread: one picture per credit, paced to the encoder's frame
-/// rate, until told to stop or its channels close.
+/// rate, until told to stop or its channels close. Each desktop is fitted
+/// under the codec's maximum before it is encoded: scaled whole when it is
+/// larger, never cropped, so the picture shows the `shown_region` the
+/// injectors map the viewer's pointer over (`backend.rs`).
 fn encode_loop(
     mut source: Box<dyn VideoSource>,
     settings: EncoderSettings,
@@ -1259,6 +1263,7 @@ fn encode_loop(
             return;
         }
     };
+    let mut scaler = Scaler::default();
     let interval = Duration::from_secs_f32(1.0 / settings.max_fps.max(1.0));
     let mut last: Option<Instant> = None;
     loop {
@@ -1296,8 +1301,9 @@ fn encode_loop(
         if control.keyframe.swap(false, Ordering::SeqCst) {
             encoder.force_keyframe();
         }
-        let encoded = encoder
-            .encode(&frame.bgrx, frame.width, frame.height)
+        let encoded = scaler
+            .fit(&frame.bgrx, frame.width, frame.height, ResolutionCap::CODEC)
+            .and_then(|fitted| encoder.encode(fitted.bgrx, fitted.width, fitted.height))
             .map(|au| {
                 let (width, height) = encoder.size();
                 Encoded {

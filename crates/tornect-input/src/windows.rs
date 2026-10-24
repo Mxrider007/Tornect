@@ -2,10 +2,10 @@
 //!
 //! Positions arrive normalized over the shared picture. The GDI capture takes
 //! it from the whole virtual desktop, the space
-//! `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK` addresses, but the encoder
-//! sends only its top-left crop (at most 3840×2160, or 2160×3840 upright), so
-//! a position is mapped over that crop first ([`SendInputSink::over`],
-//! SLICE-C1 C1-2). Keys are injected by scancode (`KEYEVENTF_SCANCODE`),
+//! `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK` addresses, and the host
+//! scales that desktop whole into the picture, without an odd last column or
+//! row (`tornect_codec::scale::shown_region`, decision M1-74), so a position is
+//! mapped over that region first ([`SendInputSink::over`], SLICE-C1 C1-2). Keys are injected by scancode (`KEYEVENTF_SCANCODE`),
 //! independent of the host's keyboard layout, except Pause and NumLock, whose
 //! scancodes are irregular and go by virtual-key code.
 //!

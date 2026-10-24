@@ -173,7 +173,7 @@ mod tests {
     use super::*;
 
     /// SLICE-C1 C1-2: the viewer's pointer covers the part of the screen it
-    /// sees, the top-left crop the encoder sends, and not the whole root. Runs
+    /// sees, the region it is given, and not the whole root. Runs
     /// only on an X11 session, so never against a live Xwayland desktop:
     /// `xvfb-run -a -s "-screen 0 1280x720x24" env XDG_SESSION_TYPE=x11 cargo
     /// test --workspace -- x11::tests`.
@@ -258,7 +258,7 @@ mod tests {
             (500, 300),
             "after the root shrank to 1000x600"
         );
-        // Over a crop too: a root shrunk below the region the encoder sends.
+        // Over a smaller region too: a root shrunk below the region given.
         injector.region = |w, h| (w.min(1000), h.min(600));
         injector.server.size = (800, 500);
         assert_eq!(

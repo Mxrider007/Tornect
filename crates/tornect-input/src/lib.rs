@@ -385,8 +385,11 @@ impl WheelAccumulator {
 }
 
 /// The part of a `width`×`height` screen the viewer sees, as the size of its
-/// top-left corner: the encoder's crop (`tornect_codec::encoded_size`), which
-/// the session layer passes in, since this crate does not see the codec.
+/// top-left corner: `tornect_codec::scale::shown_region`, the whole screen
+/// but for an odd last column or row, which the session layer passes in,
+/// since this crate does not see the codec. The picture is that region scaled
+/// uniformly (decision M1-74), so a position normalized over the picture is
+/// the same position normalized over the region.
 pub type Region = fn(u32, u32) -> (u32, u32);
 
 /// The whole screen: the [`Region`] of a picture that is not cropped.
@@ -396,8 +399,8 @@ pub fn whole(width: u32, height: u32) -> (u32, u32) {
 }
 
 /// The pixel of a `size` screen that a position normalized over its visible
-/// `region` points at, so that the viewer's pointer covers what it sees and not
-/// a desktop wider than the encoder sends (SLICE-C1 C1-2).
+/// `region` points at, so that the viewer's pointer covers what it sees and
+/// nothing outside it (SLICE-C1 C1-2).
 #[must_use]
 pub fn place(x: u16, y: u16, size: (u32, u32), region: Region) -> (u32, u32) {
     let (width, height) = region(size.0, size.1);
@@ -739,30 +742,30 @@ mod tests {
 
     #[test]
     fn a_position_over_the_visible_region_lands_inside_it() {
-        // `tornect_codec::encoded_size`: even sizes, at most 3840x2160 wide
-        // and 2160x3840 upright.
-        let crop = |w: u32, h: u32| {
-            let (w, h) = (w & !1, h & !1);
-            if h > w {
-                (w.min(2160), h.min(3840))
-            } else {
-                (w.min(3840), h.min(2160))
-            }
-        };
-        // Two 4K screens side by side: the viewer sees the left 3840x2160.
-        assert_eq!(place(65535, 65535, (7680, 2160), crop), (3839, 2159));
-        assert_eq!(place(0, 0, (7680, 2160), crop), (0, 0));
-        assert_eq!(place(32768, 0, (7680, 2160), crop), (1920, 0));
+        // `tornect_codec::scale::shown_region`: the whole screen but for an
+        // odd last column or row. The picture is that region scaled whole
+        // (decision M1-74), at any size.
+        let shown = |w: u32, h: u32| (w & !1, h & !1);
+        // Two 4K screens side by side are scaled into one picture: the
+        // viewer's far corner is the right screen's, its middle the seam.
+        assert_eq!(place(65535, 65535, (7680, 2160), shown), (7679, 2159));
+        assert_eq!(place(0, 0, (7680, 2160), shown), (0, 0));
+        assert_eq!(place(32768, 0, (7680, 2160), shown), (3840, 0));
         // An upright screen is sent whole: its bottom row (a Windows taskbar)
-        // is in reach.
-        assert_eq!(place(65535, 65535, (1440, 2560), crop), (1439, 2559));
-        assert_eq!(place(65535, 65535, (2160, 3840), crop), (2159, 3839));
-        // Beyond the upright maximum, the top-left 2160x3840 and no more.
-        assert_eq!(place(65535, 65535, (2400, 4000), crop), (2159, 3839));
-        assert_eq!(place(65535, 65535, (2400, 3000), crop), (2159, 2999));
-        // An odd screen loses its last column and row, as the encoder does.
-        assert_eq!(place(65535, 65535, (1921, 1081), crop), (1919, 1079));
+        // is in reach, beyond the codec's upright maximum too.
+        assert_eq!(place(65535, 65535, (1440, 2560), shown), (1439, 2559));
+        assert_eq!(place(65535, 65535, (2160, 3840), shown), (2159, 3839));
+        assert_eq!(place(65535, 65535, (2400, 4000), shown), (2399, 3999));
+        // An odd screen loses its last column and row, as the picture does:
+        // nothing outside the captured region can be addressed.
+        assert_eq!(place(65535, 65535, (1921, 1081), shown), (1919, 1079));
+        assert_eq!(place(65535, 65535, (2401, 3001), shown), (2399, 2999));
         assert_eq!(place(65535, 65535, (1920, 1080), whole), (1919, 1079));
+        // A region smaller than the screen still bounds the pointer.
+        assert_eq!(
+            place(65535, 65535, (7680, 2160), |w, h| (w.min(3840), h)),
+            (3839, 2159)
+        );
         // A region larger than the screen is the screen.
         assert_eq!(
             place(65535, 65535, (800, 600), |_, _| (4000, 4000)),

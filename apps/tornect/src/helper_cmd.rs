@@ -104,9 +104,10 @@ fn serve(args: &HelperArgs) -> Exit {
             return Exit::PipeClosed;
         }
     }
-    // The same mapping as the host's own injector: the viewer's pointer over
-    // the part of the desktop it sees.
-    let sink = tornect_input::windows::SendInputSink::new().over(tornect_codec::encoded_size);
+    // The same mapping as the host's own injector (`tornect-session`'s
+    // `backend.rs`): the viewer's pointer over the part of the desktop it sees.
+    let sink =
+        tornect_input::windows::SendInputSink::new().over(tornect_codec::scale::shown_region);
     let exit = run_helper(
         sink,
         &events,

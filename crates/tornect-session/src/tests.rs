@@ -103,6 +103,9 @@ struct TestBackend {
     /// The open keeps nothing to build an injector from, as on a Wayland
     /// host whose dialog left remote interaction off.
     no_injector: bool,
+    /// The source the open returns instead of the card, taken by the first
+    /// open.
+    desktop: Mutex<Option<Box<dyn VideoSource>>>,
 }
 
 /// The desktop's dialog: up until `cancel` turns `true` (then `true`), or for
@@ -133,6 +136,9 @@ impl MediaBackend for TestBackend {
         }
         if !self.no_injector {
             *self.input.lock().unwrap() = Some(self.recorder.clone());
+        }
+        if let Some(desktop) = self.desktop.lock().unwrap().take() {
+            return Ok(desktop);
         }
         Ok(Box::new(Card {
             // Faster than the encoder's 15 fps, so the encoder sets the pace.
@@ -390,6 +396,136 @@ async fn the_test_card_reaches_the_viewer_in_order() {
         rig.seen.lines(),
         [
             "started card 256x96 Control input=true",
+            "stopped ViewerLeft"
+        ]
+    );
+}
+
+/// Two side-by-side 4K screens, 7681×2161 with an odd last column and row:
+/// the left screen blue, the right one red, the odd column and row white.
+/// One picture, then a still screen.
+struct TwoScreens(bool);
+
+impl TwoScreens {
+    const SIZE: (u32, u32) = (7681, 2161);
+}
+
+impl VideoSource for TwoScreens {
+    fn name(&self) -> &'static str {
+        "two screens"
+    }
+
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+        if std::mem::replace(&mut self.0, true) {
+            std::thread::sleep(timeout);
+            return Ok(None);
+        }
+        let (w, h) = Self::SIZE;
+        let mut bgrx = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let px: [u8; 4] = if x == w - 1 || y == h - 1 {
+                    [255, 255, 255, 255]
+                } else if x < w / 2 {
+                    [200, 40, 40, 255]
+                } else {
+                    [40, 40, 200, 255]
+                };
+                bgrx.extend_from_slice(&px);
+            }
+        }
+        Ok(Some(Frame {
+            width: w,
+            height: h,
+            bgrx,
+            captured_at: std::time::Instant::now(),
+        }))
+    }
+}
+
+/// Keeps the first decoded picture.
+struct FirstPicture(Option<DecodedFrame>, Option<oneshot::Sender<()>>);
+
+impl FrameSink for FirstPicture {
+    fn picture(&mut self, _seq: u32, frame: &DecodedFrame) {
+        if self.0.is_none() {
+            self.0 = Some(frame.clone());
+            if let Some(done) = self.1.take() {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
+/// Decision M1-74 (3): a desktop above the codec's maximum is scaled whole
+/// into the picture instead of cropped to its top-left 3840×2160, so the
+/// picture shows exactly the `shown_region` the injectors map the pointer
+/// over: the right screen reaches the picture's right edge, and the odd last
+/// column and row never reach it. `BindOk` and the sharing indicator give
+/// the scaled size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_desktop_above_the_codec_maximum_is_scaled_whole() {
+    let backend = TestBackend {
+        desktop: Mutex::new(Some(Box::new(TwoScreens(false)))),
+        ..TestBackend::default()
+    };
+    let rig = rig_with(backend, MediaLimits::default());
+    let (_, binding) = start(&rig.host, 51, SessionMode::ViewOnly);
+    let (client, served) = connect(&rig.host);
+    let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
+    let (rw, rh) = tornect_codec::scale::shown_region(TwoScreens::SIZE.0, TwoScreens::SIZE.1);
+    assert_eq!((rw, rh), (7680, 2160));
+    let picture =
+        tornect_codec::scale::picture_size((rw, rh), tornect_codec::scale::ResolutionCap::CODEC);
+    assert_eq!(picture, (3840, 1080), "half of the region either way");
+    assert_eq!(
+        (viewer.bound().width, viewer.bound().height),
+        picture,
+        "BindOk gives the scaled size"
+    );
+
+    let (tx, rx) = oneshot::channel();
+    let mut first = FirstPicture(None, Some(tx));
+    let mut stats = ViewerStats::default();
+    let end = viewer
+        .run(&mut first, &mut stats, async {
+            let _ = rx.await;
+        })
+        .await
+        .unwrap();
+    assert_eq!(end, ViewerEnd::Stopped);
+    let frame = first.0.expect("a picture");
+    assert_eq!((frame.width, frame.height), picture);
+    let rgba = |x: u32, y: u32| {
+        let at = ((y * frame.width + x) * 4) as usize;
+        [frame.rgba[at], frame.rgba[at + 1], frame.rgba[at + 2]]
+    };
+    let blue = |[r, g, b]: [u8; 3]| b > 150 && r < 90 && g < 90;
+    let red = |[r, g, b]: [u8; 3]| r > 150 && g < 90 && b < 90;
+    let (w, h) = picture;
+    for y in [0, h / 2, h - 1] {
+        assert!(blue(rgba(0, y)), "left edge, row {y}: {:?}", rgba(0, y));
+        assert!(blue(rgba(w / 2 - 8, y)), "left screen, row {y}");
+        assert!(red(rgba(w / 2 + 8, y)), "right screen, row {y}");
+        assert!(
+            red(rgba(w - 1, y)),
+            "the right screen reaches the right edge, with no white: {:?}",
+            rgba(w - 1, y)
+        );
+    }
+    for x in [0, w / 4, w - 1] {
+        let px = rgba(x, h - 1);
+        assert!(blue(px) || red(px), "no white in the last row: {px:?}");
+    }
+
+    let MediaOutcome::Served { end, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!(end, MediaEnd::ViewerLeft);
+    assert_eq!(
+        rig.seen.lines(),
+        [
+            "started two screens 3840x1080 ViewOnly input=false",
             "stopped ViewerLeft"
         ]
     );
