@@ -406,7 +406,8 @@ async fn the_test_card_reaches_the_viewer_in_order() {
         BoundStream {
             width: 256,
             height: 96,
-            mode: SessionMode::Control
+            mode: SessionMode::Control,
+            quality: APPLIED,
         }
     );
     let (mut pictures, done) = Pictures::wanting(10);
@@ -1593,6 +1594,505 @@ async fn a_viewer_reads_on_past_quality_and_stats_and_refuses_a_host_set_quality
         matches!(end, Err(ViewerError::Unexpected("SetQuality"))),
         "{end:?}"
     );
+}
+
+/// What a viewer's sink was told, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hook {
+    Quality(u32, u32, QualityInfo),
+    Stats(HostStats),
+    Picture(u32, u32),
+}
+
+/// A sink that says each call as a [`Hook`].
+struct Hooks(tokio::sync::mpsc::UnboundedSender<Hook>);
+
+impl FrameSink for Hooks {
+    fn picture(&mut self, _: u32, frame: &DecodedFrame) {
+        let _ = self.0.send(Hook::Picture(frame.width, frame.height));
+    }
+
+    fn quality(&mut self, width: u32, height: u32, quality: &QualityInfo) {
+        let _ = self.0.send(Hook::Quality(width, height, *quality));
+    }
+
+    fn host_stats(&mut self, stats: &HostStats) {
+        let _ = self.0.send(Hook::Stats(*stats));
+    }
+}
+
+/// The next hook, within [`WAIT`] of `since`.
+async fn next_hook(
+    hooks: &mut tokio::sync::mpsc::UnboundedReceiver<Hook>,
+    since: tokio::time::Instant,
+) -> Hook {
+    in_time(since, "the hook");
+    tokio::time::timeout(WAIT, hooks.recv())
+        .await
+        .expect("a hook in time")
+        .expect("the viewer runs")
+}
+
+/// Every hook said so far.
+fn hooks_so_far(hooks: &mut tokio::sync::mpsc::UnboundedReceiver<Hook>) -> Vec<Hook> {
+    std::iter::from_fn(|| hooks.try_recv().ok()).collect()
+}
+
+/// A viewer's run, with what it received.
+type ViewerRun = JoinHandle<(Result<ViewerEnd, ViewerError>, ViewerStats)>;
+
+/// Bind a viewer over a pipe to a scripted host that answers `BindOk`
+/// 1280×720 with [`APPLIED`], and run it into [`Hooks`] with `picks` and no
+/// input (as a view-only session): the host's end past `BindOk`, the hooks
+/// and the run.
+async fn run_viewer_hooked(
+    picks: Option<tokio::sync::watch::Receiver<QualityPreset>>,
+) -> (
+    DuplexStream,
+    tokio::sync::mpsc::UnboundedReceiver<Hook>,
+    ViewerRun,
+) {
+    let binding = Binding::new(&SessionToken::new([8; 32]), &[8; 32]);
+    let (client, mut host) = duplex(1 << 16);
+    let (tx, hooks) = tokio::sync::mpsc::unbounded_channel();
+    let viewer = tokio::spawn(async move {
+        let mut viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
+        if let Some(picks) = picks {
+            viewer = viewer.with_quality(picks);
+        }
+        let (mut sink, mut stats) = (Hooks(tx), ViewerStats::default());
+        let end = viewer
+            .run(&mut sink, &mut stats, std::future::pending())
+            .await;
+        (end, stats)
+    });
+    assert!(matches!(
+        read_msg(&mut host).await.unwrap(),
+        Some(Msg::Bind { .. })
+    ));
+    let bind_ok = Msg::BindOk {
+        width: 1280,
+        height: 720,
+        codec: codec::H264,
+        mode: 1,
+        quality: APPLIED,
+    };
+    write_msg(&mut host, &bind_ok).await.unwrap();
+    (host, hooks, viewer)
+}
+
+/// The next `SetQuality` the viewer wrote to the scripted host `host`, past
+/// its pings: the preset's code. Anything else is a failure.
+async fn next_set_quality(host: &mut DuplexStream) -> u8 {
+    loop {
+        match tokio::time::timeout(WAIT, read_msg(host))
+            .await
+            .expect("a frame in time")
+            .unwrap()
+        {
+            Some(Msg::Ping { .. }) => {}
+            Some(Msg::SetQuality { quality: code }) => return code,
+            other => panic!("expected SetQuality, got {other:?}"),
+        }
+    }
+}
+
+/// The quality design §4.1 and §6.6: a `Binding` asks for Balanced unless
+/// told otherwise, and `with_quality` names the preset in the `Bind`'s last
+/// byte, outside the MAC (the bind MAC is the same for every preset), in a
+/// 50-byte frame.
+#[test]
+fn a_binding_names_its_preset_outside_the_mac() {
+    let plain = Binding::new(&SessionToken::new([9; 32]), &[3; 32]);
+    assert_eq!(plain.quality(), QualityPreset::Balanced);
+    let Msg::Bind {
+        session_id,
+        mac,
+        quality: code,
+    } = plain.msg()
+    else {
+        unreachable!("a binding's message is a Bind");
+    };
+    assert_eq!(code, quality::BALANCED);
+    for preset in QualityPreset::ALL {
+        let binding = plain.clone().with_quality(preset);
+        assert_eq!(binding.quality(), preset);
+        assert_eq!(
+            binding.msg(),
+            Msg::Bind {
+                session_id: session_id.clone(),
+                mac,
+                quality: crate::quality::code(preset),
+            }
+        );
+        let frame = binding.msg().encode();
+        assert_eq!(frame.len(), 4 + 50);
+        assert_eq!(frame[53], crate::quality::code(preset));
+    }
+}
+
+/// The quality design §6.6 and §8 (viewer): each change of the viewer's
+/// pick goes to the host as one `SetQuality` with the value held then (two
+/// picks before the run give one frame, the latest), a value set again
+/// without a change (`send_if_modified`, as the window sends) sends
+/// nothing, picks need no input channel (view-only), and once the sender is
+/// gone the viewer goes on without them.
+#[tokio::test(start_paused = true)]
+async fn a_viewers_picks_reach_the_host_as_set_quality() {
+    let (picker, picks) = tokio::sync::watch::channel(QualityPreset::Balanced);
+    picker.send(QualityPreset::BestQuality).unwrap();
+    picker.send(QualityPreset::BestPerformance).unwrap();
+    let (mut host, _hooks, viewer) = run_viewer_hooked(Some(picks)).await;
+    assert_eq!(
+        next_set_quality(&mut host).await,
+        quality::BEST_PERFORMANCE,
+        "the latest of two picks made before the run, once"
+    );
+    let changed = picker.send_if_modified(|held| {
+        let changed = *held != QualityPreset::BestPerformance;
+        *held = QualityPreset::BestPerformance;
+        changed
+    });
+    assert!(!changed);
+    picker.send(QualityPreset::BestQuality).unwrap();
+    assert_eq!(
+        next_set_quality(&mut host).await,
+        quality::BEST_QUALITY,
+        "the next frame after the first pick is the next pick"
+    );
+    drop(picker);
+    // No sender: the viewer keeps going, with its pings and nothing else.
+    for _ in 0..3 {
+        let msg = tokio::time::timeout(Duration::from_secs(5), read_msg(&mut host))
+            .await
+            .expect("the viewer said nothing for 5 s");
+        assert!(matches!(msg, Ok(Some(Msg::Ping { .. }))), "{msg:?}");
+    }
+    let close = Msg::Close {
+        reason: reason::ENDED_BY_HOST,
+    };
+    write_msg(&mut host, &close).await.unwrap();
+    let (end, stats) = viewer.await.unwrap();
+    assert!(
+        matches!(end, Ok(ViewerEnd::Host(r)) if r == reason::ENDED_BY_HOST),
+        "{end:?}"
+    );
+    assert_eq!(stats.input_sent, 0);
+}
+
+/// The quality design §5.12 and §8 (viewer): what the host says it applies
+/// reaches the sink first from `BindOk`, then only when a `Quality` changes
+/// something (the same again is not said twice); the host's `Stats` reach it
+/// at most once per 900 ms of the viewer's clock (ten within 100 ms give one
+/// call, and the rest are counted), the last one always kept in the stats.
+#[tokio::test(start_paused = true)]
+async fn the_hosts_quality_and_stats_reach_the_sink_without_a_flood() {
+    let (mut host, mut hooks, viewer) = run_viewer_hooked(None).await;
+    let smaller = Msg::Quality {
+        width: 1280,
+        height: 694,
+        quality: BEST_PERFORMANCE,
+    };
+    let same = Msg::Quality {
+        width: 1280,
+        height: 720,
+        quality: APPLIED,
+    };
+    for msg in [&same, &smaller, &smaller] {
+        write_msg(&mut host, msg).await.unwrap();
+    }
+    let means = |frames: u16| HostStats {
+        source_width: 2560,
+        source_height: 1440,
+        frames,
+        window_ms: 1000,
+        encode_us: 9800,
+        ..HostStats::default()
+    };
+    let first = tokio::time::Instant::now();
+    for frames in 1..=10 {
+        if frames > 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        write_msg(&mut host, &Msg::Stats(means(frames)))
+            .await
+            .unwrap();
+    }
+    assert!(first.elapsed() < Duration::from_millis(100));
+    tokio::time::sleep_until(first + Duration::from_millis(900)).await;
+    write_msg(&mut host, &Msg::Stats(means(11))).await.unwrap();
+    let close = Msg::Close {
+        reason: reason::ENDED_BY_HOST,
+    };
+    write_msg(&mut host, &close).await.unwrap();
+    let (end, stats) = viewer.await.unwrap();
+    assert!(matches!(end, Ok(ViewerEnd::Host(_))), "{end:?}");
+    assert_eq!(
+        hooks_so_far(&mut hooks),
+        [
+            Hook::Quality(1280, 720, APPLIED),
+            Hook::Quality(1280, 694, BEST_PERFORMANCE),
+            Hook::Stats(means(1)),
+            Hook::Stats(means(11)),
+        ]
+    );
+    assert_eq!(stats.stats_coalesced, 9);
+    assert_eq!(stats.host, Some(means(11)));
+    assert_eq!(stats.quality, Some(BEST_PERFORMANCE));
+}
+
+/// The quality design §4.1: the viewer still sizes every picture from what
+/// it decodes, and counts one decoded at a size the host did not announce
+/// (`BindOk`, then each `Quality`); one announced first is not counted.
+#[tokio::test(start_paused = true)]
+async fn a_picture_of_a_size_not_announced_is_counted() {
+    let mut encoder = H264Encoder::new(EncoderSettings::default()).unwrap();
+    let idr = encoder
+        .encode(&TestCard::render(64, 48, 0), 64, 48)
+        .unwrap();
+    let next = encoder
+        .encode(&TestCard::render(64, 48, 1), 64, 48)
+        .unwrap();
+    let (mut host, mut hooks, viewer) = run_viewer_hooked(None).await;
+    let video = |seq, data| Msg::Video {
+        seq,
+        flags: 0,
+        ts_ms: 0,
+        data,
+    };
+    // Announced 1280×720 in `BindOk`: this 64×48 picture was not.
+    write_msg(&mut host, &video(0, idr.data)).await.unwrap();
+    let announced = Msg::Quality {
+        width: 64,
+        height: 48,
+        quality: APPLIED,
+    };
+    write_msg(&mut host, &announced).await.unwrap();
+    write_msg(&mut host, &video(1, next.data)).await.unwrap();
+    let close = Msg::Close {
+        reason: reason::ENDED_BY_HOST,
+    };
+    write_msg(&mut host, &close).await.unwrap();
+    let (end, stats) = viewer.await.unwrap();
+    assert!(matches!(end, Ok(ViewerEnd::Host(_))), "{end:?}");
+    assert_eq!((stats.decoded, stats.unannounced), (2, 1));
+    assert_eq!(
+        hooks_so_far(&mut hooks),
+        [
+            Hook::Quality(1280, 720, APPLIED),
+            Hook::Picture(64, 48),
+            Hook::Quality(64, 48, APPLIED),
+            Hook::Picture(64, 48),
+        ]
+    );
+}
+
+/// The quality design §4.7 and §8 (viewer): a host of another version is
+/// told apart from a refusal. It refuses this version's 50-byte `Bind` as
+/// malformed (`BindRefused{PROTOCOL}`), or answers with the 10-byte `BindOk`
+/// of the version before: both are `ViewerError::Version`, which says what
+/// to do. Any other refusal stays a refusal.
+#[tokio::test(start_paused = true)]
+async fn a_host_of_another_version_is_said_to_be_one() {
+    let mut old_bind_ok = vec![0, 0, 0, 11, 0x02];
+    old_bind_ok.extend_from_slice(&[0, 0, 5, 0, 0, 0, 2, 0xd0, codec::H264, 0]);
+    let answers: [(Vec<u8>, &str); 3] = [
+        (
+            Msg::BindRefused {
+                reason: reason::PROTOCOL,
+            }
+            .encode(),
+            "Version",
+        ),
+        (old_bind_ok, "Version"),
+        (
+            Msg::BindRefused {
+                reason: reason::BAD_BIND,
+            }
+            .encode(),
+            "Refused",
+        ),
+    ];
+    for (answer, want) in answers {
+        let binding = Binding::new(&SessionToken::new([8; 32]), &[8; 32]);
+        let (client, mut host) = duplex(1 << 16);
+        let bound = tokio::spawn(async move { MediaViewer::bind(client, &binding, WAIT).await });
+        assert!(matches!(
+            read_msg(&mut host).await.unwrap(),
+            Some(Msg::Bind { .. })
+        ));
+        host.write_all(&answer).await.unwrap();
+        let err = bound.await.unwrap().unwrap_err();
+        match want {
+            "Version" => {
+                assert!(matches!(err, ViewerError::Version), "{err:?}");
+                assert_eq!(
+                    err.to_string(),
+                    "the other computer runs a different version of Tornect; use the same \
+                     version on both"
+                );
+            }
+            _ => assert!(
+                matches!(err, ViewerError::Refused(r) if r == reason::BAD_BIND),
+                "{err:?}"
+            ),
+        }
+    }
+}
+
+/// The quality design §6.6 and §8 (viewer), end to end with the real host:
+/// a viewer bound with Best performance is told so in `BindOk` (a 1600×900
+/// desktop fitted to 1280×720); a pick of Balanced from its watch channel,
+/// in a view-only session, gets a `Quality` with the new exact size before
+/// the first picture at that size, so no picture is unannounced; the host's
+/// means reach the sink; decoding is timed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_viewers_pick_changes_what_the_real_host_sends() {
+    let backend = TestBackend {
+        card: Some((1600, 900)),
+        ..TestBackend::default()
+    };
+    let rig = rig_with(
+        backend,
+        MediaLimits {
+            quality_interval: Duration::from_millis(300),
+            stats_every: Duration::from_millis(200),
+            ..MediaLimits::default()
+        },
+    );
+    let (_, binding) = start(&rig.host, 80, SessionMode::ViewOnly);
+    let binding = binding.with_quality(QualityPreset::BestPerformance);
+    let (client, served) = connect(&rig.host);
+    let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
+    assert_eq!(
+        *viewer.bound(),
+        BoundStream {
+            width: 1280,
+            height: 720,
+            mode: SessionMode::ViewOnly,
+            quality: BEST_PERFORMANCE,
+        }
+    );
+    let (picker, picks) = tokio::sync::watch::channel(QualityPreset::BestPerformance);
+    let (tx, mut hooks) = tokio::sync::mpsc::unbounded_channel();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let run = tokio::spawn(async move {
+        let (mut sink, mut stats) = (Hooks(tx), ViewerStats::default());
+        let end = viewer
+            .with_quality(picks)
+            .run(&mut sink, &mut stats, async {
+                let _ = stopped.await;
+            })
+            .await;
+        (end, stats)
+    });
+    let mut seen = Vec::new();
+    let since = tokio::time::Instant::now();
+    while seen
+        .iter()
+        .filter(|h| **h == Hook::Picture(1280, 720))
+        .count()
+        < 3
+    {
+        seen.push(next_hook(&mut hooks, since).await);
+    }
+    picker.send(QualityPreset::Balanced).unwrap();
+    while seen
+        .iter()
+        .filter(|h| **h == Hook::Picture(1600, 900))
+        .count()
+        < 3
+    {
+        seen.push(next_hook(&mut hooks, since).await);
+    }
+    stop.send(()).unwrap();
+    let (end, stats) = run.await.unwrap();
+    assert_eq!(end.unwrap(), ViewerEnd::Stopped);
+
+    assert_eq!(seen[0], Hook::Quality(1280, 720, BEST_PERFORMANCE));
+    let said: Vec<usize> = (0..seen.len())
+        .filter(|&i| matches!(seen[i], Hook::Quality(..)))
+        .collect();
+    assert_eq!(said.len(), 2, "{seen:?}");
+    assert_eq!(seen[said[1]], Hook::Quality(1600, 900, APPLIED));
+    let first_large = seen.iter().position(|h| *h == Hook::Picture(1600, 900));
+    assert!(first_large > Some(said[1]), "{seen:?}");
+    assert!(
+        seen.iter()
+            .any(|h| matches!(h, Hook::Stats(s) if s.frames > 0))
+    );
+    assert_eq!(stats.unannounced, 0, "{seen:?}");
+    assert_eq!(stats.quality, Some(APPLIED));
+    assert!(stats.host.is_some());
+    assert!(stats.decode_us > 0 && stats.convert_us > 0, "{stats:?}");
+
+    let MediaOutcome::Served { report, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!((report.quality_requests, report.quality_changes), (1, 1));
+}
+
+/// The quality design §8 host test 15, from the real viewer: across a source
+/// resize (640×360, then 800×600) every picture decodes at the size last
+/// announced, so the viewer counts no unannounced picture, and its sink is
+/// told the new size before the first picture at it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_viewer_counts_no_unannounced_picture_across_a_source_resize() {
+    let backend = TestBackend {
+        desktop: Mutex::new(Some(Box::new(Resizing {
+            small: TestCard::new(640, 360, 60),
+            large: TestCard::new(800, 600, 60),
+            after: 5,
+        }))),
+        ..TestBackend::default()
+    };
+    let rig = rig_with(backend, MediaLimits::default());
+    let (_, binding) = start(&rig.host, 81, SessionMode::Control);
+    let (client, served) = connect(&rig.host);
+    let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
+    let (tx, mut hooks) = tokio::sync::mpsc::unbounded_channel();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let run = tokio::spawn(async move {
+        let (mut sink, mut stats) = (Hooks(tx), ViewerStats::default());
+        let end = viewer
+            .run(&mut sink, &mut stats, async {
+                let _ = stopped.await;
+            })
+            .await;
+        (end, stats)
+    });
+    let mut seen = Vec::new();
+    let since = tokio::time::Instant::now();
+    while seen
+        .iter()
+        .filter(|h| **h == Hook::Picture(800, 600))
+        .count()
+        < 3
+    {
+        seen.push(next_hook(&mut hooks, since).await);
+    }
+    stop.send(()).unwrap();
+    let (end, stats) = run.await.unwrap();
+    assert_eq!(end.unwrap(), ViewerEnd::Stopped);
+    let said: Vec<Hook> = seen
+        .iter()
+        .copied()
+        .filter(|h| matches!(h, Hook::Quality(..)))
+        .collect();
+    assert_eq!(
+        said,
+        [
+            Hook::Quality(640, 360, APPLIED),
+            Hook::Quality(800, 600, APPLIED)
+        ]
+    );
+    let told = seen
+        .iter()
+        .position(|h| *h == Hook::Quality(800, 600, APPLIED));
+    let first_large = seen.iter().position(|h| *h == Hook::Picture(800, 600));
+    assert!(told < first_large, "{seen:?}");
+    assert_eq!(stats.unannounced, 0, "{seen:?}");
+    drop(served);
 }
 
 /// Addendum Q3: a session that ends while its source is still opening (on

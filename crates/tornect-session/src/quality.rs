@@ -506,6 +506,107 @@ mod tests {
         }
     }
 
+    /// The halvings `tornect_codec::scale::Scaler::fit` makes of a `region`
+    /// before its bilinear pass to `picture`: 2:1 box passes while the
+    /// picture is at most half of what is left both ways.
+    fn halvings(region: (u32, u32), picture: (u32, u32)) -> u32 {
+        let (mut w, mut h, mut k) = (region.0, region.1, 0);
+        while 2 * picture.0 <= w && 2 * picture.1 <= h {
+            (w, h, k) = (w / 2, h / 2, k + 1);
+        }
+        k
+    }
+
+    /// Where in the shown region the scaler samples picture column (or row)
+    /// `x` of `to`, from `from` region pixels after `k` halvings, in region
+    /// pixels: the bilinear pass samples `(x + ½)·from/to − ½` of what the
+    /// box passes left (`scale.rs`: `((2x+1)·from·128)/to − 128` in Q8,
+    /// held to the input), and a pixel left by `k` halvings is the mean of
+    /// `2^k` region pixels, whose centre is `(2^k − 1)/2` past its first.
+    fn sample_centre(x: u32, from: u32, to: u32, k: u32) -> f64 {
+        let left = i64::from(from >> k);
+        let p =
+            ((2 * i64::from(x) + 1) * left * 128 / i64::from(to) - 128).clamp(0, (left - 1) * 256);
+        let block = f64::from(1u32 << k);
+        p as f64 / 256.0 * block + (block - 1.0) / 2.0
+    }
+
+    /// The quality design §5 rule 8 and §8 "pointer versus scale": a pointer
+    /// over the viewer's picture, normalized over the picture as the viewer
+    /// does (`tornect_input::normalize`), lands through the injectors'
+    /// mapping (`tornect_input::place` over `shown_region`) within
+    /// `ceil(region / picture)` desktop pixels of the pixels the scaler
+    /// sampled for it, at the corners, the centre and 64 seeded points; the
+    /// corners land on the region's corners, and nothing outside the region
+    /// is reached. For a 2560×1440 desktop under Balanced, 5120×2880 under
+    /// the codec's cap, and (box passes before the bilinear one, an odd
+    /// edge, an upright screen) 5120×2880 and 3538×1919 under Balanced and
+    /// 1080×1920 under Best performance.
+    #[test]
+    fn a_pointer_over_the_picture_lands_on_the_desktop_it_shows() {
+        use tornect_codec::scale::{picture_size, shown_region};
+        use tornect_input::{normalize, place};
+
+        let caps = QualityCaps::default();
+        let cap = |preset| settings(preset, Route::Tor, &caps).cap;
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            // xorshift64: the same 64 points on every run.
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for (desktop, cap, want) in [
+            ((2560, 1440), cap(BAL), (1920, 1080)),
+            ((5120, 2880), ResolutionCap::CODEC, (3840, 2160)),
+            ((5120, 2880), cap(BAL), (1920, 1080)),
+            ((3538, 1919), cap(BAL), (1920, 1040)),
+            ((1080, 1920), cap(BP), (720, 1280)),
+        ] {
+            let region = shown_region(desktop.0, desktop.1);
+            let picture = picture_size(region, cap);
+            assert_eq!(picture, want, "{desktop:?}");
+            let k = halvings(region, picture);
+            let (pw, ph) = picture;
+            let mut points = vec![(0, 0), (pw - 1, 0), (0, ph - 1), (pw - 1, ph - 1)];
+            points.push((pw / 2, ph / 2));
+            points.extend((0..64).map(|_| {
+                let r = next();
+                ((r as u32) % pw, ((r >> 32) as u32) % ph)
+            }));
+            let slack = (
+                f64::from(region.0.div_ceil(pw)),
+                f64::from(region.1.div_ceil(ph)),
+            );
+            for (px, py) in points {
+                let x = normalize(f64::from(px), f64::from(pw));
+                let y = normalize(f64::from(py), f64::from(ph));
+                let (sx, sy) = place(x, y, desktop, shown_region);
+                assert!(sx < region.0 && sy < region.1, "{desktop:?} ({px}, {py})");
+                let centre = (
+                    sample_centre(px, region.0, pw, k),
+                    sample_centre(py, region.1, ph, k),
+                );
+                assert!(
+                    (f64::from(sx) - centre.0).abs() <= slack.0
+                        && (f64::from(sy) - centre.1).abs() <= slack.1,
+                    "{desktop:?}: picture ({px}, {py}) lands on ({sx}, {sy}), sampled at \
+                     {centre:?}"
+                );
+            }
+            let corner = |px: u32, py: u32| {
+                let x = normalize(f64::from(px), f64::from(pw));
+                let y = normalize(f64::from(py), f64::from(ph));
+                place(x, y, desktop, shown_region)
+            };
+            assert_eq!(corner(0, 0), (0, 0));
+            assert_eq!(corner(pw - 1, ph - 1), (region.0 - 1, region.1 - 1));
+            assert_eq!(corner(pw - 1, 0), (region.0 - 1, 0));
+            assert_eq!(corner(0, ph - 1), (0, region.1 - 1));
+        }
+    }
+
     /// What the host says it applies: the preset's code, frame rate,
     /// bitrate and cap, as the design's golden `BindOk` has it for Balanced.
     #[test]

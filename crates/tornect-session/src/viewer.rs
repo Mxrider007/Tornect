@@ -4,16 +4,19 @@
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadHalf, WriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tornect_codec::{DecodedFrame, H264Decoder};
+use tornect_core::config::QualityPreset;
 use tornect_core::session_log::SessionMode;
 use tornect_input::InputEvent;
 use tornect_proto::{
-    Msg, ProtoError, bind_mac, codec, quality, read_msg, reason, video_flags, write_msg,
+    HostStats, Msg, ProtoError, QualityInfo, bind_mac, codec, read_msg, reason, video_flags,
+    write_msg,
 };
 use tornect_signal::consent::{SessionToken, mode_from_code};
 
 use crate::flow::KeyframeLimiter;
+use crate::quality;
 
 /// Least time between two keyframe requests from a viewer (the host keeps its
 /// own, longer limit).
@@ -24,6 +27,11 @@ const LAST_WRITE: Duration = Duration::from_secs(5);
 /// silence means it is gone: the host lets go of held keys after a few seconds
 /// of it (`MediaLimits::viewer_quiet`, SLICE-C1 C1-3).
 const PING_EVERY: Duration = Duration::from_secs(1);
+/// Least time, on this viewer's clock, between two of the host's `Stats`
+/// handed to the [`FrameSink`] (the quality design §5.12): the host sends
+/// them about once a second, and one that sends more cannot make the
+/// display redraw or the terminal print faster than this.
+const HOST_STATS_EVERY: Duration = Duration::from_millis(900);
 
 /// What proves a media stream belongs to a session: the session id and the
 /// bind MAC (decisions M1-39, M1-41). Both come from the handshake; the token
@@ -32,6 +40,7 @@ const PING_EVERY: Duration = Duration::from_secs(1);
 pub struct Binding {
     session_id: String,
     mac: [u8; 32],
+    quality: QualityPreset,
 }
 
 impl Binding {
@@ -42,7 +51,24 @@ impl Binding {
         Self {
             session_id: token.session_id(),
             mac: bind_mac(token.bytes(), th_final),
+            quality: QualityPreset::default(),
         }
+    }
+
+    /// Ask for `preset` in the `Bind` (Balanced by default). The host maps it
+    /// to its own table, bounded by its `[media]`; the byte is outside the
+    /// bind MAC and can raise nothing beyond the host's caps (the quality
+    /// design §4.1).
+    #[must_use]
+    pub fn with_quality(mut self, preset: QualityPreset) -> Self {
+        self.quality = preset;
+        self
+    }
+
+    /// The preset the `Bind` asks for.
+    #[must_use]
+    pub fn quality(&self) -> QualityPreset {
+        self.quality
     }
 
     /// The session id.
@@ -51,12 +77,12 @@ impl Binding {
         &self.session_id
     }
 
-    /// The `Bind` frame, which asks for the Balanced preset.
+    /// The `Bind` frame, which asks for [`Binding::quality`].
     pub(crate) fn msg(&self) -> Msg {
         Msg::Bind {
             session_id: self.session_id.clone(),
             mac: self.mac,
-            quality: quality::BALANCED,
+            quality: quality::code(self.quality),
         }
     }
 }
@@ -65,6 +91,7 @@ impl std::fmt::Debug for Binding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Binding")
             .field("session_id", &self.session_id)
+            .field("quality", &self.quality)
             .finish_non_exhaustive()
     }
 }
@@ -72,13 +99,18 @@ impl std::fmt::Debug for Binding {
 /// What the host's `BindOk` announced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundStream {
-    /// Width of the first picture, as the host announced it. Display-only:
-    /// each picture is sized from what it decodes (SLICE-A2 A2-4).
+    /// Width of the first picture, exactly as the host encodes it. Still
+    /// display-only: each picture is sized from what it decodes (SLICE-A2
+    /// A2-4); a picture of another size is counted
+    /// ([`ViewerStats::unannounced`]).
     pub width: u32,
-    /// Height of the first picture, as the host announced it. Display-only.
+    /// Height of the first picture, exactly. Display-only.
     pub height: u32,
     /// Control or view-only.
     pub mode: SessionMode,
+    /// The preset the host applies, with its frame-rate cap, bitrate and
+    /// picture cap. Display-only.
+    pub quality: QualityInfo,
 }
 
 /// Where decoded pictures go.
@@ -87,6 +119,17 @@ pub trait FrameSink: Send {
     /// host may change resolution at any access unit, and the sizes it
     /// announces are display-only (SLICE-A2 A2-4).
     fn picture(&mut self, seq: u32, frame: &DecodedFrame);
+
+    /// What the host applies: the exact `width`×`height` of the pictures
+    /// from here on and the preset `quality`. Called once with `BindOk`'s
+    /// before the first picture, then whenever a host `Quality` changes any
+    /// of them. Display-only: never size a buffer from it.
+    fn quality(&mut self, _width: u32, _height: u32, _quality: &QualityInfo) {}
+
+    /// The host's per-stage means, at most once per 900 ms of this viewer's
+    /// clock (more frequent ones are counted in
+    /// [`ViewerStats::stats_coalesced`]). Display-only; every value saturates.
+    fn host_stats(&mut self, _stats: &HostStats) {}
 }
 
 /// What a viewer received.
@@ -106,6 +149,21 @@ pub struct ViewerStats {
     pub keyframe_requests: u64,
     /// `Input` frames sent.
     pub input_sent: u64,
+    /// What the host last said it applies (`BindOk`, then each `Quality`).
+    pub quality: Option<QualityInfo>,
+    /// The host's last per-stage means (`Stats`).
+    pub host: Option<HostStats>,
+    /// Sum of the decodes of the pictures decoded, µs.
+    pub decode_us: u64,
+    /// Sum of their I420 → RGBA conversions, µs.
+    pub convert_us: u64,
+    /// Pictures decoded at a size other than the one last announced
+    /// (`BindOk`, then each `Quality`). The host announces every size
+    /// before its first picture, so this stays 0 with an honest host.
+    pub unannounced: u64,
+    /// Host `Stats` that came within 900 ms of the last one handed to the
+    /// sink, and were kept in [`ViewerStats::host`] only.
+    pub stats_coalesced: u64,
 }
 
 /// How a bound media stream ended, seen from the viewer.
@@ -149,6 +207,11 @@ pub enum ViewerError {
     /// The decoder could not start.
     #[error("H.264 decoder: {0}")]
     Decoder(String),
+    /// The host speaks another version of the media stream: it refused this
+    /// viewer's `Bind` as malformed (`BindRefused{PROTOCOL}`), or its
+    /// `BindOk` is not this version's (the quality design §4.7).
+    #[error("the other computer runs a different version of Tornect; use the same version on both")]
+    Version,
 }
 
 /// A bound media stream.
@@ -158,6 +221,8 @@ pub struct MediaViewer<S> {
     decoder: H264Decoder,
     bound: BoundStream,
     keyframes: KeyframeLimiter,
+    /// The viewer's picks, sent as `SetQuality` as they change.
+    picks: Option<watch::Receiver<QualityPreset>>,
 }
 
 impl<S> std::fmt::Debug for MediaViewer<S> {
@@ -173,27 +238,39 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     /// Send the `Bind` on `stream` and wait up to `wait` for the answer.
+    ///
+    /// A host of another version refuses this version's `Bind` as malformed,
+    /// or answers with a `BindOk` this version cannot read: both are
+    /// [`ViewerError::Version`], which says what to do about it.
     pub async fn bind(stream: S, binding: &Binding, wait: Duration) -> Result<Self, ViewerError> {
         let (mut rd, mut wr) = tokio::io::split(stream);
         write_msg(&mut wr, &binding.msg()).await?;
-        let answer = tokio::time::timeout(wait, read_msg(&mut rd))
-            .await
-            .map_err(|_| ViewerError::Timeout(wait))??;
+        let answer = match tokio::time::timeout(wait, read_msg(&mut rd)).await {
+            Err(_) => return Err(ViewerError::Timeout(wait)),
+            Ok(Err(ProtoError::Malformed("BindOk"))) => return Err(ViewerError::Version),
+            Ok(answer) => answer?,
+        };
         let bound = match answer {
             Some(Msg::BindOk {
                 width,
                 height,
                 codec,
                 mode,
-                ..
+                quality,
             }) => match (codec, mode_from_code(mode)) {
                 (codec::H264, Some(mode)) => BoundStream {
                     width,
                     height,
                     mode,
+                    quality,
                 },
                 _ => return Err(ViewerError::Unsupported { codec, mode }),
             },
+            // A well-formed `Bind` is refused as malformed only by a host
+            // that reads another length or layout.
+            Some(Msg::BindRefused {
+                reason: reason::PROTOCOL,
+            }) => return Err(ViewerError::Version),
             Some(Msg::BindRefused { reason } | Msg::Close { reason }) => {
                 return Err(ViewerError::Refused(reason));
             }
@@ -207,7 +284,18 @@ where
             decoder,
             bound,
             keyframes: KeyframeLimiter::new(KEYFRAME_REQUEST_EVERY),
+            picks: None,
         })
+    }
+
+    /// Send the host a `SetQuality` each time `picks` changes, with the value
+    /// it holds then (the latest pick wins; the one it holds now counts as
+    /// seen). Choosing quality never touches input: a view-only session may
+    /// pick too. Once every sender is gone, nothing more is sent.
+    #[must_use]
+    pub fn with_quality(mut self, picks: watch::Receiver<QualityPreset>) -> Self {
+        self.picks = Some(picks);
+        self
     }
 
     /// What `BindOk` announced.
@@ -226,6 +314,10 @@ where
     /// host that stalls one cannot hold a stop back (SLICE-C2 C2-2 (b)). With
     /// nothing written for a second it pings, so that its silence tells the
     /// host it is gone (SLICE-C1 C1-3).
+    ///
+    /// What the host says it applies (`BindOk`, then each `Quality` that
+    /// changes it) and its per-stage means (`Stats`, at most one per 900 ms)
+    /// go to the sink's display-only hooks; neither sizes a buffer.
     pub async fn run<F>(
         self,
         sink: &mut dyn FrameSink,
@@ -240,7 +332,9 @@ where
 
     /// [`run`](Self::run), also sending each event `input` yields to the host
     /// as an `Input` frame (its 16-byte form), ahead of reading the next
-    /// picture, until the channel closes.
+    /// picture, until the channel closes. A change of the viewer's pick
+    /// ([`with_quality`](Self::with_quality)) goes out as a `SetQuality` after
+    /// the input waiting and before the next read.
     ///
     /// Whether a session has an input channel at all is the caller's decision,
     /// and it must be taken from the mode of the signed `SESSION_ACCEPT`
@@ -263,8 +357,17 @@ where
             mut wr,
             mut decoder,
             mut keyframes,
-            ..
+            bound,
+            mut picks,
         } = self;
+        // What the host last said, and the size every picture should have.
+        let mut said = (bound.width, bound.height, bound.quality);
+        let mut announced = (bound.width, bound.height);
+        stats.quality = Some(bound.quality);
+        sink.quality(bound.width, bound.height, &bound.quality);
+        let mut stats_handed: Option<tokio::time::Instant> = None;
+        // One debug line per stream for pictures of a size not announced.
+        let mut unannounced_said = false;
         // The read owns the reader, so it stays pending across rounds that the
         // ping timer wins, and a frame is never cut short.
         let mut read = Box::pin(read_owned(rd));
@@ -287,6 +390,21 @@ where
                         return Ok(ViewerEnd::Stopped);
                     }
                     stats.input_sent += 1;
+                    next_ping = tokio::time::Instant::now() + PING_EVERY;
+                    continue;
+                }
+                pick = next_pick(&mut picks) => {
+                    let Some(preset) = pick else {
+                        // Every sender is gone: no more picks.
+                        picks = None;
+                        continue;
+                    };
+                    let set = Msg::SetQuality {
+                        quality: quality::code(preset),
+                    };
+                    if !write_unless_stopped(&mut wr, &set, stop.as_mut()).await? {
+                        return Ok(ViewerEnd::Stopped);
+                    }
                     next_ping = tokio::time::Instant::now() + PING_EVERY;
                     continue;
                 }
@@ -322,6 +440,24 @@ where
                     match decoder.decode(&data) {
                         Ok(Some(frame)) => {
                             stats.decoded += 1;
+                            stats.decode_us =
+                                stats.decode_us.saturating_add(micros(frame.timing.decode));
+                            stats.convert_us = stats
+                                .convert_us
+                                .saturating_add(micros(frame.timing.convert));
+                            if (frame.width, frame.height) != announced {
+                                if !unannounced_said {
+                                    unannounced_said = true;
+                                    tracing::debug!(
+                                        width = frame.width,
+                                        height = frame.height,
+                                        announced_width = announced.0,
+                                        announced_height = announced.1,
+                                        "a picture of a size the host did not announce"
+                                    );
+                                }
+                                stats.unannounced += 1;
+                            }
                             sink.picture(seq, frame);
                         }
                         // The decoder is buffering.
@@ -352,9 +488,32 @@ where
                     next_ping = tokio::time::Instant::now() + PING_EVERY;
                 }
                 Some(Msg::Pong { .. }) => {}
-                // Display-only (the quality design, §4.6): neither sizes a
-                // buffer nor ends the stream.
-                Some(Msg::Quality { .. } | Msg::Stats(_)) => {}
+                // Display-only (the quality design §4.6, §5.12): neither sizes
+                // a buffer nor ends the stream, and a host that repeats them
+                // cannot make the sink do more than say what changed, or more
+                // than one `Stats` per `HOST_STATS_EVERY`.
+                Some(Msg::Quality {
+                    width,
+                    height,
+                    quality,
+                }) => {
+                    stats.quality = Some(quality);
+                    announced = (width, height);
+                    if said != (width, height, quality) {
+                        said = (width, height, quality);
+                        sink.quality(width, height, &quality);
+                    }
+                }
+                Some(Msg::Stats(host)) => {
+                    stats.host = Some(host);
+                    let now = tokio::time::Instant::now();
+                    if stats_handed.is_some_and(|at| now.duration_since(at) < HOST_STATS_EVERY) {
+                        stats.stats_coalesced += 1;
+                    } else {
+                        stats_handed = Some(now);
+                        sink.host_stats(&host);
+                    }
+                }
                 Some(Msg::Close { reason }) => return Ok(ViewerEnd::Host(reason)),
                 Some(other) => return Err(ViewerError::Unexpected(kind(&other))),
                 None => return Ok(ViewerEnd::Closed),
@@ -370,6 +529,23 @@ async fn next_input(input: &mut Option<mpsc::Receiver<InputEvent>>) -> Option<In
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// The viewer's next pick from `picks`; `None` once every sender is gone;
+/// never without `picks`.
+async fn next_pick(picks: &mut Option<watch::Receiver<QualityPreset>>) -> Option<QualityPreset> {
+    match picks {
+        Some(rx) => match rx.changed().await {
+            Ok(()) => Some(*rx.borrow_and_update()),
+            Err(_) => None,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// `d` in whole microseconds, saturating.
+fn micros(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Read one message and hand the reader back.
