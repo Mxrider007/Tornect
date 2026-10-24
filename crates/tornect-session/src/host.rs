@@ -20,10 +20,20 @@
 //!    ack window, so nothing is captured that could not be sent.
 //! 3. **Serve**, until the session ends (the FSM's `on_end`: `BYE`, the kill
 //!    switch, a timeout), the viewer leaves, or something breaks. The viewer's
-//!    frames (input, acks, pings, `Close`) are handled by one code path, also
-//!    while a write to the viewer waits on flow control. Every exit path stops
-//!    capture and drops the injector, which releases whatever the viewer
-//!    still holds.
+//!    frames (input, acks, pings, quality picks, `Close`) are handled by one
+//!    code path, also while a write to the viewer waits on flow control. Every
+//!    exit path stops capture and drops the injector, which releases whatever
+//!    the viewer still holds.
+//!
+//! The stream runs the preset its `Bind` names ([`quality::settings`], every
+//! number from the host's table under its `[media]` caps), and the viewer may
+//! pick another with `SetQuality` at any time. A pick costs a store; the host
+//! acts on the latest at most once per [`MediaLimits::quality_interval`]
+//! ([`QualityGate`]), and a rebuild of the encoder, an IDR, also spends the
+//! turn of the keyframe limiter that `KeyframeRequest` uses. Each change of
+//! settings or of picture size is said in a `Quality` before the first picture
+//! it covers, and the per-stage means go out in a `Stats` about once per
+//! [`MediaLimits::stats_every`], before a picture (the quality design §6.6).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -48,11 +58,12 @@ use tornect_signal::consent::{SessionToken, mode_code};
 use tornect_signal::fsm::host::{KillSwitch, LiveSession, SessionEnd, SessionSink};
 use tornect_signal::messages::notice;
 
-use crate::flow::{AckWindow, KeyframeLimiter, StageTimes, TokenBucket};
+use crate::flow::{AckWindow, KeyframeLimiter, QualityGate, StageTimes, StatsWindow, TokenBucket};
 use crate::quality::{self, QualityCaps, Route, StreamSettings};
 
-/// How often the capture thread checks its stop flag while it waits.
-const POLL: Duration = Duration::from_millis(100);
+/// How often the capture thread checks its stop flag, and a quality change,
+/// while it waits.
+pub(crate) const POLL: Duration = Duration::from_millis(100);
 /// How long the host waits, at the end, for the capture thread to exit.
 const STOP_WAIT: Duration = Duration::from_secs(5);
 /// Bound on the last frame (a refusal, a `Close`) written to a peer that may
@@ -283,6 +294,31 @@ pub struct MediaReport {
     pub input_injected: u64,
     /// Input events dropped: view-only, over the rate, no injector, or refused.
     pub input_dropped: u64,
+    /// `SetQuality`s received.
+    pub quality_requests: u64,
+    /// Changes of preset that reached the viewer (a `Quality` naming another
+    /// preset than the pictures before it).
+    pub quality_changes: u64,
+    /// Pictures among those sent that encode the last one again after a
+    /// quality change (nothing new was captured for them).
+    pub repeats: u64,
+    /// `VideoAck`s that acknowledged a picture in flight.
+    pub acks: u64,
+    /// Sum of the source's own cost to produce each fresh picture sent
+    /// (`Frame.grab`), µs; repeats have none.
+    pub grab_us: u64,
+    /// Sum of the time each picture sent took to fit under its cap, µs.
+    pub scale_us: u64,
+    /// Sum of each picture's BGRx → I420 conversion, µs.
+    pub convert_us: u64,
+    /// Sum of each picture's encode, µs.
+    pub encode_us: u64,
+    /// Sum, over the pictures sent, of the time from encoded to fully
+    /// written (the queue and the stream's flow control), µs.
+    pub send_us: u64,
+    /// Sum, over the acks, of the time from a picture fully written to its
+    /// `VideoAck`, µs.
+    pub ack_us: u64,
 }
 
 /// Why a bound media stream ended.
@@ -469,10 +505,8 @@ impl MediaHost {
         let (mut rd, mut wr) = tokio::io::split(stream);
         let deadline = tokio::time::Instant::now() + self.limits.bind_deadline;
         // The viewer's preset is read, and a code this version does not know
-        // refused with the malformed binds below, before any look-up. It is
-        // not applied yet: every stream runs Balanced (the design's step 12
-        // applies it).
-        let (session_id, mac, _preset) = match tokio::time::timeout_at(deadline, read_bind(&mut rd))
+        // refused with the malformed binds below, before any look-up.
+        let (session_id, mac, preset) = match tokio::time::timeout_at(deadline, read_bind(&mut rd))
             .await
         {
             Ok(Ok(bind)) => bind,
@@ -516,7 +550,8 @@ impl MediaHost {
             refuse(&mut wr, reason::BAD_BIND).await;
             return MediaOutcome::NotBound;
         };
-        self.run(session_id, claimed, route, rd, wr).await
+        self.run(session_id, claimed, Stream { route, preset }, rd, wr)
+            .await
     }
 
     /// Bind `session_id` with `mac`. A session the FSM has not registered yet
@@ -565,7 +600,7 @@ impl MediaHost {
         &self,
         session_id: String,
         claimed: Claimed,
-        route: Route,
+        stream: Stream,
         rd: R,
         mut wr: W,
     ) -> MediaOutcome
@@ -579,6 +614,7 @@ impl MediaHost {
             label,
             mut end,
         } = claimed;
+        let Stream { route, preset } = stream;
 
         // Capture starts here, after a verified bind (§B.6, decision M1-39).
         // The open's cancel is made before the open, and belongs to it alone:
@@ -620,14 +656,9 @@ impl MediaHost {
             self.backend.view_only();
         }
         let source_name = source.name();
-        // Every stream runs Balanced until the design's step 12 applies the
-        // viewer's preset; its numbers are the host's table under its caps.
-        let initial = quality::settings(QualityPreset::Balanced, route, &caps);
-        let (window_frames, window_bytes) = quality::window(
-            &initial,
-            self.limits.window_frames,
-            self.limits.window_bytes,
-        );
+        // The preset the viewer bound with, every number from this host's
+        // table under its caps.
+        let initial = quality::settings(preset, route, &caps);
         let mut pipeline = Pipeline::start(source, initial, route, caps, self.limits.window_frames);
         pipeline.credit();
         let first = tokio::select! {
@@ -637,7 +668,7 @@ impl MediaHost {
                 First::Frame(first.ok().flatten())
             }
         };
-        let first = match first {
+        let mut first = match first {
             First::Frame(Some(Ok(frame))) => frame,
             First::Ended => {
                 pipeline.stop().await;
@@ -655,12 +686,17 @@ impl MediaHost {
             }
         };
 
+        // `BindOk` says what the first picture was encoded with, and its exact
+        // size: the bind's preset, unless a change was taken before that
+        // picture (its announcement, which `BindOk` then says instead of a
+        // `Quality`).
+        let applied = first.announce.take().map_or(initial, |a| a.settings);
         let bind_ok = Msg::BindOk {
             width: first.width,
             height: first.height,
             codec: codec::H264,
             mode: mode_code(mode),
-            quality: initial.info(),
+            quality: applied.info(),
         };
         if let Err(stop) = send(&mut wr, &bind_ok, &mut end, None).await {
             pipeline.stop().await;
@@ -705,6 +741,8 @@ impl MediaHost {
         let (heard_tx, heard) = watch::channel(tokio::time::Instant::now());
         let reader = tokio::spawn(read_client(rd, inbound_tx, heard_tx));
         let epoch = Instant::now();
+        let window_caps = (self.limits.window_frames, self.limits.window_bytes);
+        let (window_frames, window_bytes) = quality::window(&applied, window_caps.0, window_caps.1);
         let mut served = Served {
             injector,
             quiet: Quiet::new(self.limits.viewer_quiet, heard),
@@ -714,6 +752,14 @@ impl MediaHost {
             keyframes: KeyframeLimiter::new(self.limits.keyframe_interval),
             pipeline: &mut pipeline,
             window: AckWindow::new(window_frames, window_bytes),
+            window_caps,
+            quality: QualityState {
+                gate: QualityGate::new(self.limits.quality_interval),
+                target: applied.preset,
+                applied,
+                size: (first.width, first.height),
+            },
+            stats: StatsWindow::new(self.limits.stats_every, epoch),
             report: MediaReport::default(),
             pong_owed: None,
             session_id: &session_id,
@@ -724,20 +770,36 @@ impl MediaHost {
 
         let ended = 'serve: loop {
             if let Some(frame) = pending.take() {
-                let len = frame.data.len();
+                // Said before the picture it covers: a change of settings or
+                // of size (the quality design §4.1), then the means, when due.
+                let quality = served.announce(&frame);
+                let now = Instant::now();
+                let stats = served
+                    .stats
+                    .due(now)
+                    .then(|| Msg::Stats(served.stats.take(now, frame.source)));
+                for msg in [quality, stats].into_iter().flatten() {
+                    if let Err(stop) = send(&mut wr, &msg, &mut end, Some(&mut served)).await {
+                        torn = stop.torn;
+                        break 'serve stop.end;
+                    }
+                }
+                let Encoded {
+                    data,
+                    keyframe,
+                    captured_at,
+                    times,
+                    ready_at,
+                    repeat,
+                    ..
+                } = frame;
+                let len = data.len();
                 let msg = Msg::Video {
                     seq,
-                    flags: if frame.keyframe {
-                        video_flags::KEYFRAME
-                    } else {
-                        0
-                    },
+                    flags: if keyframe { video_flags::KEYFRAME } else { 0 },
                     // A wrapping millisecond clock (the wire field is 32 bits).
-                    ts_ms: frame
-                        .captured_at
-                        .saturating_duration_since(epoch)
-                        .as_millis() as u32,
-                    data: frame.data,
+                    ts_ms: captured_at.saturating_duration_since(epoch).as_millis() as u32,
+                    data,
                 };
                 // In flight from the start of its write: the viewer's acks are
                 // taken while the write waits and may credit the next picture,
@@ -748,9 +810,14 @@ impl MediaHost {
                     torn = stop.torn;
                     break stop.end;
                 }
+                let written = Instant::now();
+                // Its round trip counts from here: the viewer can acknowledge
+                // it only once it has all of it.
+                served.window.written(seq, written);
                 served.report.frames_sent += 1;
                 served.report.bytes_sent += len as u64;
-                served.report.keyframes_sent += u64::from(frame.keyframe);
+                served.report.keyframes_sent += u64::from(keyframe);
+                served.picture_sent(&times, repeat, written.saturating_duration_since(ready_at));
                 seq = seq.wrapping_add(1);
                 if served.window.has_room() {
                     served.pipeline.credit();
@@ -768,6 +835,7 @@ impl MediaHost {
             }
 
             let quiet_at = served.quiet_deadline();
+            let quality_at = served.quality_deadline();
             let event = tokio::select! {
                 biased;
                 _ = end.changed() => Event::Ended,
@@ -775,6 +843,8 @@ impl MediaHost {
                 frame = served.pipeline.next() => Event::Frame(frame),
                 () = tokio::time::sleep_until(quiet_at.unwrap_or_else(tokio::time::Instant::now)),
                     if quiet_at.is_some() => Event::Quiet,
+                () = tokio::time::sleep_until(quality_at.unwrap_or_else(tokio::time::Instant::now)),
+                    if quality_at.is_some() => Event::Quality,
             };
             match event {
                 Event::Ended => break MediaEnd::SessionOver(end_reason(&end)),
@@ -784,6 +854,16 @@ impl MediaHost {
                 Event::Quiet => {
                     if served.lapse() {
                         tracing::debug!(session = %session_id, "viewer quiet: released what it held");
+                    }
+                }
+                // The viewer's latest pick, at the gate's turn: a rebuild, or
+                // the answer that the preset it named already applies.
+                Event::Quality => {
+                    if let Some(answer) = served.quality_due(Instant::now())
+                        && let Err(stop) = send(&mut wr, &answer, &mut end, Some(&mut served)).await
+                    {
+                        torn = stop.torn;
+                        break stop.end;
                     }
                 }
                 Event::Frame(Some(Ok(frame))) => pending = Some(frame),
@@ -860,12 +940,20 @@ impl SessionSink for MediaHost {
 }
 
 /// What a `Bind` carries: the session id, the MAC and the viewer's preset.
-type Bound = (String, [u8; 32], u8);
+type Bound = (String, [u8; 32], QualityPreset);
+
+/// How a bound stream is served: the route its listener says, and the preset
+/// its `Bind` names.
+#[derive(Debug, Clone, Copy)]
+struct Stream {
+    route: Route,
+    preset: QualityPreset,
+}
 
 /// The first frame of a media stream, read without trusting its length prefix:
 /// a `Bind` is exactly [`BIND_LEN`] bytes, so that is all an unbound peer can
 /// make the host read. Returns the session id, the MAC and the viewer's
-/// preset code (one `tornect_proto::quality` knows; any other is malformed).
+/// preset (a code `tornect_proto::quality` does not know is malformed).
 async fn read_bind<R: AsyncRead + Unpin>(r: &mut R) -> Result<Bound, ProtoError> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
@@ -894,7 +982,9 @@ async fn read_bind<R: AsyncRead + Unpin>(r: &mut R) -> Result<Bound, ProtoError>
             session_id,
             mac,
             quality,
-        } => Ok((session_id, mac, quality)),
+        } => quality::preset(quality)
+            .map(|preset| (session_id, mac, preset))
+            .ok_or(ProtoError::Malformed("Bind")),
         _ => Err(ProtoError::Malformed("Bind")),
     }
 }
@@ -1055,6 +1145,8 @@ enum Event {
     Frame(Option<Result<Encoded, PipelineError>>),
     /// The viewer has said nothing for [`MediaLimits::viewer_quiet`].
     Quiet,
+    /// The quality gate may act on the viewer's latest pick.
+    Quality,
 }
 
 /// The quiet release's clock (SLICE-C1 C1-3). The viewer counts as heard when
@@ -1144,6 +1236,11 @@ struct Served<'a> {
     keyframes: KeyframeLimiter,
     pipeline: &'a mut Pipeline,
     window: AckWindow,
+    /// The host's caps on every preset's window (`MediaLimits::window_frames`
+    /// and `window_bytes`).
+    window_caps: (usize, usize),
+    quality: QualityState,
+    stats: StatsWindow,
     report: MediaReport,
     /// The nonce of a `Ping` taken and not answered yet: the main loop writes
     /// its `Pong` once the write under way is done. Pings are coalesced while a
@@ -1152,6 +1249,18 @@ struct Served<'a> {
     /// `sync` sends one ping at a time.
     pong_owed: Option<u64>,
     session_id: &'a str,
+}
+
+/// Where the viewer's quality picks stand (the quality design §6.6).
+struct QualityState {
+    /// The viewer's latest pick not acted on yet, and the bound on actions.
+    gate: QualityGate,
+    /// The preset last handed to the pipeline (at first, the bind's).
+    target: QualityPreset,
+    /// What the pictures written last were encoded with.
+    applied: StreamSettings,
+    /// The size of the picture written last.
+    size: (u32, u32),
 }
 
 /// What [`Served::on_client`] made of a frame.
@@ -1178,8 +1287,13 @@ impl Served<'_> {
         };
         match msg {
             Msg::VideoAck { seq } => {
-                if self.window.ack(seq, now).is_some() && self.window.has_room() {
-                    self.pipeline.credit();
+                if let Some(rtt) = self.window.ack(seq, now) {
+                    self.stats.acked(rtt);
+                    self.report.acks += 1;
+                    add_us(&mut self.report.ack_us, rtt);
+                    if self.window.has_room() {
+                        self.pipeline.credit();
+                    }
                 }
             }
             Msg::Input(bytes) => {
@@ -1221,11 +1335,13 @@ impl Served<'_> {
                 }
             }
             Msg::Pong { .. } => {}
-            // Legal in control and view-only sessions alike, and it costs
-            // nothing here: every stream runs Balanced until the design's
-            // step 12 applies the viewer's pick through the gate. Never
-            // logged per message.
-            Msg::SetQuality { .. } => {}
+            // Legal in control and view-only sessions alike, and it costs a
+            // count and a store: the gate acts on the latest pick in its own
+            // time ([`Self::quality_due`]). Never logged per message.
+            Msg::SetQuality { quality } => {
+                self.report.quality_requests += 1;
+                self.quality.gate.request(quality);
+            }
             Msg::Close { .. } => return Handled::End(MediaEnd::ViewerLeft),
             Msg::Bind { .. }
             | Msg::BindOk { .. }
@@ -1244,6 +1360,94 @@ impl Served<'_> {
         self.quiet.deadline(self.injector.is_some())
     }
 
+    /// When the gate may act on the viewer's latest pick; `None` with no
+    /// pick waiting. A pick of another preset than the one the pipeline was
+    /// last given is a rebuild, an IDR, so it also waits for the keyframe
+    /// limiter's turn: forced keyframes from both stay at one per
+    /// [`MediaLimits::keyframe_interval`] (the quality design §5.3).
+    fn quality_deadline(&self) -> Option<tokio::time::Instant> {
+        let wanted = self.quality.gate.wanted()?;
+        let mut at = self.quality.gate.ready_at();
+        if wanted != quality::code(self.quality.target) {
+            // `None` is "now", which `Option`'s order puts first.
+            at = at.max(self.keyframes.ready_at());
+        }
+        Some(at.map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std))
+    }
+
+    /// The gate's turn at `now` (see [`Self::quality_deadline`]): act on the
+    /// viewer's latest pick, at most once per interval. Another preset than
+    /// the pipeline's is handed to it, spending the keyframe limiter's turn,
+    /// and its first picture is announced ([`Self::announce`]). The preset
+    /// in force is answered with a `Quality` saying so, returned for the
+    /// caller to write, with no encoder work. The one on its way to the
+    /// pipeline is left to that change's announcement. Before the turn,
+    /// nothing changes.
+    fn quality_due(&mut self, now: Instant) -> Option<Msg> {
+        let wanted = self.quality.gate.wanted()?;
+        if self.quality.gate.ready_at().is_some_and(|at| now < at) {
+            return None;
+        }
+        let Some(preset) = quality::preset(wanted) else {
+            // `SetQuality` decodes only the codes of a preset.
+            self.quality.gate.take(now);
+            return None;
+        };
+        if preset != self.quality.target {
+            if !self.keyframes.allow(now) {
+                return None;
+            }
+            self.quality.gate.take(now);
+            self.pipeline.set_quality(wanted);
+            self.quality.target = preset;
+            tracing::debug!(session = %self.session_id, %preset, "quality change");
+            return None;
+        }
+        self.quality.gate.take(now);
+        (preset == self.quality.applied.preset).then(|| Msg::Quality {
+            width: self.quality.size.0,
+            height: self.quality.size.1,
+            quality: self.quality.applied.info(),
+        })
+    }
+
+    /// `frame` is next to be written: the `Quality` to write before it when
+    /// its settings or its size changed since the picture before. A change
+    /// of preset resizes the ack window to the new preset's; a smaller one
+    /// admits nothing until acks drain it.
+    fn announce(&mut self, frame: &Encoded) -> Option<Msg> {
+        self.quality.size = (frame.width, frame.height);
+        let settings = frame.announce?.settings;
+        if settings.preset != self.quality.applied.preset {
+            self.report.quality_changes += 1;
+            let (frames, bytes) =
+                quality::window(&settings, self.window_caps.0, self.window_caps.1);
+            self.window.set_limits(frames, bytes);
+        }
+        self.quality.applied = settings;
+        Some(Msg::Quality {
+            width: frame.width,
+            height: frame.height,
+            quality: settings.info(),
+        })
+    }
+
+    /// A picture whose stages took `times` went out, `send` after it was
+    /// encoded; `repeat` when it encodes the last one again (no grab).
+    fn picture_sent(&mut self, times: &StageTimes, repeat: bool, send: Duration) {
+        self.stats.sent(send);
+        self.stats.frame(times, !repeat);
+        let report = &mut self.report;
+        report.repeats += u64::from(repeat);
+        if !repeat {
+            add_us(&mut report.grab_us, times.grab);
+        }
+        add_us(&mut report.scale_us, times.scale);
+        add_us(&mut report.convert_us, times.convert);
+        add_us(&mut report.encode_us, times.encode);
+        add_us(&mut report.send_us, send);
+    }
+
     /// The deadline came: let go of what the viewer holds, if it is due.
     /// Whether it let go.
     fn lapse(&mut self) -> bool {
@@ -1256,6 +1460,11 @@ impl Served<'_> {
         sink.release_all();
         true
     }
+}
+
+/// Add `d` to `sum` in microseconds, saturating.
+fn add_us(sum: &mut u64, d: Duration) {
+    *sum = sum.saturating_add(u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
 }
 
 /// `Tracked` wants a sized sink.
@@ -1275,30 +1484,24 @@ struct Encoded {
     height: u32,
     captured_at: Instant,
     /// The captured picture's size, before it was fitted.
-    #[allow(dead_code)] // read by the main loop from the design's step 12
     source: (u32, u32),
     /// What each stage took; a repeat has no grab and no age.
-    #[allow(dead_code)] // read by the main loop from the design's step 12
     times: StageTimes,
     /// When the encode was done.
-    #[allow(dead_code)] // read by the main loop from the design's step 12
     ready_at: Instant,
     /// The last picture encoded again after a quality change: the viewer
     /// already has it, at another size.
-    #[allow(dead_code)] // read by the main loop from the design's step 12
     repeat: bool,
     /// What to say before this picture (`Quality`): set when the settings or
     /// the encoded size changed since the picture before it. The first
     /// picture has none unless the settings changed before it (`BindOk`
     /// says the rest).
-    #[allow(dead_code)] // read by the main loop from the design's step 12
     announce: Option<Announce>,
 }
 
 /// The settings a picture and those after it are encoded with; its size is
 /// the picture's.
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)] // read by the main loop from the design's step 12
 struct Announce {
     settings: StreamSettings,
 }
@@ -1403,7 +1606,6 @@ impl Pipeline {
     /// whose first picture is an IDR, and on a still screen the last picture
     /// encoded again. The caller bounds how often (the quality gate and the
     /// keyframe limiter).
-    #[allow(dead_code)] // called by the main loop from the design's step 12
     fn set_quality(&self, code: u8) {
         self.control.quality.store(code, Ordering::SeqCst);
     }
@@ -1695,17 +1897,23 @@ mod tests {
     /// malformed bind, refused like any other before a look-up.
     #[test]
     fn a_bind_carries_the_viewers_preset() {
-        for code in [
-            tornect_proto::quality::BEST_QUALITY,
-            tornect_proto::quality::BALANCED,
-            tornect_proto::quality::BEST_PERFORMANCE,
+        for (code, preset) in [
+            (
+                tornect_proto::quality::BEST_QUALITY,
+                QualityPreset::BestQuality,
+            ),
+            (tornect_proto::quality::BALANCED, QualityPreset::Balanced),
+            (
+                tornect_proto::quality::BEST_PERFORMANCE,
+                QualityPreset::BestPerformance,
+            ),
         ] {
             let frame = bind(code).encode();
             assert_eq!(frame.len(), 4 + BIND_LEN);
             let (read, lines, at) = read_bind_of(&frame);
             assert_eq!(
                 read.unwrap(),
-                ("0123456789abcdef".to_owned(), [7; 32], code)
+                ("0123456789abcdef".to_owned(), [7; 32], preset)
             );
             assert!(lines.is_empty(), "{lines:?}");
             assert_eq!(at, frame.len() as u64);

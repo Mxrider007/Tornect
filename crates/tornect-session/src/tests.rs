@@ -13,7 +13,9 @@ use tokio::io::{
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tornect_capture::{CaptureError, Frame, TestCard, VideoSource};
-use tornect_codec::{DecodedFrame, EncoderSettings, H264Encoder};
+use tornect_codec::scale::{ResolutionCap, picture_size, shown_region};
+use tornect_codec::{DecodedFrame, EncoderSettings, H264Decoder, H264Encoder};
+use tornect_core::config::QualityPreset;
 use tornect_core::session_log::SessionMode;
 use tornect_core::{DeviceId, DeviceIdentity, HostIdentity};
 use tornect_input::{Button, InputError, InputEvent, InputSink};
@@ -38,16 +40,34 @@ use crate::*;
 
 const WAIT: Duration = Duration::from_secs(10);
 const KEY_A: u32 = 0x07_0004;
-/// What a host applies to every stream until the design's step 12 applies
-/// the viewer's pick (Balanced from the table under the default caps: the
-/// 1080p cap, 15 fps, 1500 kbit/s), and what the scripted hosts here say in
-/// their `BindOk`.
+/// What a host applies to a stream bound with Balanced, the preset a
+/// `Binding` asks for (the table under the default caps: the 1080p cap,
+/// 15 fps, 1500 kbit/s), and what the scripted hosts here say in their
+/// `BindOk`.
 const APPLIED: QualityInfo = QualityInfo {
     preset: quality::BALANCED,
     max_fps: 15,
     kbps: 1500,
     max_long: 1920,
     max_short: 1080,
+};
+/// Best quality under the default caps: the codec's cap, 12 fps, the Tor
+/// bitrate (4000 kbit/s).
+const BEST_QUALITY: QualityInfo = QualityInfo {
+    preset: quality::BEST_QUALITY,
+    max_fps: 12,
+    kbps: 4000,
+    max_long: 3840,
+    max_short: 2160,
+};
+/// Best performance under the default caps: the 720p cap, 20 fps,
+/// 1000 kbit/s.
+const BEST_PERFORMANCE: QualityInfo = QualityInfo {
+    preset: quality::BEST_PERFORMANCE,
+    max_fps: 20,
+    kbps: 1000,
+    max_long: 1280,
+    max_short: 720,
 };
 
 /// A test card that says when it was closed.
@@ -130,6 +150,8 @@ struct TestBackend {
     desktop: Mutex<Option<Box<dyn VideoSource>>>,
     /// What each open was asked for, in order.
     requests: Mutex<Vec<SourceRequest>>,
+    /// The card's size; `None` for 256×96.
+    card: Option<(u32, u32)>,
 }
 
 /// The desktop's dialog: up until `cancel` turns `true` (then `true`), or for
@@ -166,9 +188,10 @@ impl MediaBackend for TestBackend {
         if let Some(desktop) = self.desktop.lock().unwrap().take() {
             return Ok(desktop);
         }
+        let (width, height) = self.card.unwrap_or((256, 96));
         Ok(Box::new(Card {
-            // Faster than the encoder's 15 fps, so the encoder sets the pace.
-            inner: TestCard::new(256, 96, 60),
+            // Faster than any preset's rate, so the encoder sets the pace.
+            inner: TestCard::new(width, height, 60),
             closed: Arc::clone(&self.closed),
             stalled: Arc::clone(&self.stalled),
             recycled: Arc::clone(&self.recycled),
@@ -516,49 +539,10 @@ impl FrameSink for FirstPicture {
     }
 }
 
-/// Decision M1-74 (3): a desktop above the codec's maximum is scaled whole
-/// into the picture instead of cropped to its top-left 3840×2160, so the
-/// picture shows exactly the `shown_region` the injectors map the pointer
-/// over: the right screen reaches the picture's right edge, and the odd last
-/// column and row never reach it. `BindOk` and the sharing indicator give
-/// the scaled size. The stream runs Balanced until the design's step 12
-/// applies the viewer's pick, so the cap is Balanced's 1920×1080 (Best
-/// quality's is the codec's own).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_desktop_above_the_codec_maximum_is_scaled_whole() {
-    let backend = TestBackend {
-        desktop: Mutex::new(Some(Box::new(TwoScreens(false)))),
-        ..TestBackend::default()
-    };
-    let rig = rig_with(backend, MediaLimits::default());
-    let (_, binding) = start(&rig.host, 51, SessionMode::ViewOnly);
-    let (client, served) = connect(&rig.host);
-    let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
-    let (rw, rh) = tornect_codec::scale::shown_region(TwoScreens::SIZE.0, TwoScreens::SIZE.1);
-    assert_eq!((rw, rh), (7680, 2160));
-    let cap = tornect_codec::scale::ResolutionCap::new(
-        u32::from(APPLIED.max_long),
-        u32::from(APPLIED.max_short),
-    );
-    let picture = tornect_codec::scale::picture_size((rw, rh), cap);
-    assert_eq!(picture, (1920, 540), "a quarter of the region either way");
-    assert_eq!(
-        (viewer.bound().width, viewer.bound().height),
-        picture,
-        "BindOk gives the scaled size"
-    );
-
-    let (tx, rx) = oneshot::channel();
-    let mut first = FirstPicture(None, Some(tx));
-    let mut stats = ViewerStats::default();
-    let end = viewer
-        .run(&mut first, &mut stats, async {
-            let _ = rx.await;
-        })
-        .await
-        .unwrap();
-    assert_eq!(end, ViewerEnd::Stopped);
-    let frame = first.0.expect("a picture");
+/// Asserts that `frame` shows [`TwoScreens`] whole, at `picture`: the left
+/// screen from the left edge, the right one up to the right edge, and none of
+/// the odd last column and row (white), which the shown region leaves out.
+fn assert_two_screens_whole(frame: &DecodedFrame, picture: (u32, u32)) {
     assert_eq!((frame.width, frame.height), picture);
     let rgba = |x: u32, y: u32| {
         let at = ((y * frame.width + x) * 4) as usize;
@@ -581,6 +565,50 @@ async fn a_desktop_above_the_codec_maximum_is_scaled_whole() {
         let px = rgba(x, h - 1);
         assert!(blue(px) || red(px), "no white in the last row: {px:?}");
     }
+}
+
+/// Decision M1-74 (3): a desktop above the codec's maximum is scaled whole
+/// into the picture instead of cropped to its top-left 3840×2160, so the
+/// picture shows exactly the `shown_region` the injectors map the pointer
+/// over: the right screen reaches the picture's right edge, and the odd last
+/// column and row never reach it. `BindOk` and the sharing indicator give
+/// the scaled size. Under Best quality the cap is the codec's own (3840×1080
+/// here, as before the presets); under Balanced, which a `Binding` asks for,
+/// it is 1920×1080 (1920×540 here).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_desktop_above_the_codec_maximum_is_scaled_whole() {
+    let two_screens = || TestBackend {
+        desktop: Mutex::new(Some(Box::new(TwoScreens(false)))),
+        ..TestBackend::default()
+    };
+    let (rw, rh) = shown_region(TwoScreens::SIZE.0, TwoScreens::SIZE.1);
+    assert_eq!((rw, rh), (7680, 2160));
+
+    // Balanced, through the viewer.
+    let rig = rig_with(two_screens(), MediaLimits::default());
+    let (_, binding) = start(&rig.host, 51, SessionMode::ViewOnly);
+    let (client, served) = connect(&rig.host);
+    let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
+    let cap = ResolutionCap::new(u32::from(APPLIED.max_long), u32::from(APPLIED.max_short));
+    let picture = picture_size((rw, rh), cap);
+    assert_eq!(picture, (1920, 540), "a quarter of the region either way");
+    assert_eq!(
+        (viewer.bound().width, viewer.bound().height),
+        picture,
+        "BindOk gives the scaled size"
+    );
+
+    let (tx, rx) = oneshot::channel();
+    let mut first = FirstPicture(None, Some(tx));
+    let mut stats = ViewerStats::default();
+    let end = viewer
+        .run(&mut first, &mut stats, async {
+            let _ = rx.await;
+        })
+        .await
+        .unwrap();
+    assert_eq!(end, ViewerEnd::Stopped);
+    assert_two_screens_whole(&first.0.expect("a picture"), picture);
 
     let MediaOutcome::Served { end, .. } = served.await.unwrap() else {
         panic!("not served");
@@ -592,6 +620,30 @@ async fn a_desktop_above_the_codec_maximum_is_scaled_whole() {
             "started two screens 1920x540 ViewOnly input=false",
             "stopped ViewerLeft"
         ]
+    );
+
+    // Best quality, bound by hand: the codec's own cap.
+    let rig = rig_with(two_screens(), MediaLimits::default());
+    let (_, binding) = start(&rig.host, 52, SessionMode::ViewOnly);
+    let (mut client, served) = connect(&rig.host);
+    let picture = picture_size((rw, rh), ResolutionCap::CODEC);
+    assert_eq!(picture, (3840, 1080), "half the region either way");
+    let (width, height, info) = bind_preset(&mut client, &binding, quality::BEST_QUALITY).await;
+    assert_eq!((width, height, info), (3840, 1080, BEST_QUALITY));
+    let mut decoder = H264Decoder::new().unwrap();
+    let since = tokio::time::Instant::now();
+    let frame = loop {
+        in_time(since, "a picture");
+        if let Msg::Video { data, .. } = next_acking(&mut client).await {
+            break decoder.decode(&data).unwrap().expect("a picture").clone();
+        }
+    };
+    assert_two_screens_whole(&frame, picture);
+    drop(client);
+    assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
+    assert_eq!(
+        rig.seen.lines()[0],
+        "started two screens 3840x1080 ViewOnly input=false"
     );
 }
 
@@ -1357,10 +1409,15 @@ async fn pings_while_a_picture_write_waits_get_one_pong_after_it() {
         Some(Msg::Pong { nonce: 2 }),
         "then one Pong, for the latest nonce"
     );
-    // And no other: the next frames are pictures (the window holds 20).
-    for _ in 0..3 {
-        let msg = next_msg(&mut client).await;
-        assert!(matches!(msg, Some(Msg::Video { .. })), "{msg:?}");
+    // And no other: the next frames are pictures (the window holds 23), or
+    // the means that may go out before one.
+    let mut pictures = 0;
+    while pictures < 3 {
+        match next_msg(&mut client).await {
+            Some(Msg::Video { .. }) => pictures += 1,
+            Some(Msg::Stats(_)) => {}
+            msg => panic!("{msg:?}"),
+        }
     }
     rig.host
         .on_end(&session_id, Some(&SessionEnd::Killed(bye::PANIC)));
@@ -2016,13 +2073,15 @@ async fn a_source_with_no_picture_for_a_while_keeps_the_session() {
         .await
         .unwrap();
     rig.backend.stalled.store(true, Ordering::SeqCst);
-    // A picture already on its way may still come; then nothing does.
+    // A picture already on its way may still come, after the means that may
+    // go out before it (`Stats`); then nothing does.
     loop {
         match tokio::time::timeout(Duration::from_millis(500), read_msg(&mut client)).await {
             Err(_) => break,
             Ok(Ok(Some(Msg::Video { seq, .. }))) => write_msg(&mut client, &Msg::VideoAck { seq })
                 .await
                 .unwrap(),
+            Ok(Ok(Some(Msg::Stats(_) | Msg::Quality { .. }))) => {}
             Ok(other) => panic!("during the pause: {other:?}"),
         }
     }
@@ -2077,43 +2136,289 @@ fn bind_with(binding: &Binding, preset: u8) -> Msg {
     }
 }
 
-/// The quality design §4.1: whichever preset the viewer's `Bind` names,
-/// `BindOk` gives the exact size of the first picture and what the stream
-/// applies, the same for every preset at this step.
+/// Bind with `preset` by hand: `BindOk`'s picture size and quality.
+async fn bind_preset(
+    client: &mut DuplexStream,
+    binding: &Binding,
+    preset: u8,
+) -> (u32, u32, QualityInfo) {
+    write_msg(client, &bind_with(binding, preset))
+        .await
+        .unwrap();
+    match tokio::time::timeout(WAIT, read_msg(client))
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        Some(Msg::BindOk {
+            width,
+            height,
+            quality,
+            ..
+        }) => (width, height, quality),
+        other => panic!("expected BindOk, got {other:?}"),
+    }
+}
+
+/// Panics once [`WAIT`] has passed since `since`, naming what was awaited: a
+/// loop that reads past the frames it does not want must still end when what
+/// it wants never comes.
+fn in_time(since: tokio::time::Instant, what: &str) {
+    assert!(since.elapsed() < WAIT, "{what} never came");
+}
+
+/// The host's next frame, within [`WAIT`]; a `Video` is acknowledged as it
+/// is read, as a viewer does.
+async fn next_acking(client: &mut DuplexStream) -> Msg {
+    let msg = tokio::time::timeout(WAIT, read_msg(client))
+        .await
+        .expect("a frame in time")
+        .unwrap()
+        .expect("the stream is open");
+    if let Msg::Video { seq, .. } = msg {
+        write_msg(client, &Msg::VideoAck { seq }).await.unwrap();
+    }
+    msg
+}
+
+/// The size `preset` fits a `width`×`height` desktop to under the default
+/// caps.
+fn fitted(preset: QualityPreset, width: u32, height: u32) -> (u32, u32) {
+    let settings = crate::quality::settings(
+        preset,
+        crate::quality::Route::Tor,
+        &MediaLimits::default().caps,
+    );
+    picture_size(shown_region(width, height), settings.cap)
+}
+
+/// The quality design §8 host test 1: a `Bind` naming each preset gets a
+/// `BindOk` carrying that preset's `QualityInfo` from the host's table, and
+/// the exact size of the first picture: the card fitted under that preset's
+/// cap, which the first `Video`, an IDR, decodes at.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bind_of_each_preset_gets_what_the_stream_applies() {
-    let rig = rig(MediaLimits::default());
-    for (seed, preset) in [
-        (40, quality::BEST_QUALITY),
-        (41, quality::BALANCED),
-        (42, quality::BEST_PERFORMANCE),
+    // Wider than Balanced's and Best performance's caps, under Best quality's.
+    const CARD: (u32, u32) = (2000, 240);
+    let rig = rig_with(
+        TestBackend {
+            card: Some(CARD),
+            ..TestBackend::default()
+        },
+        MediaLimits::default(),
+    );
+    for (seed, preset, info, size) in [
+        (40, QualityPreset::BestQuality, BEST_QUALITY, (2000, 240)),
+        (41, QualityPreset::Balanced, APPLIED, (1920, 230)),
+        (
+            42,
+            QualityPreset::BestPerformance,
+            BEST_PERFORMANCE,
+            (1280, 152),
+        ),
     ] {
+        assert_eq!(fitted(preset, CARD.0, CARD.1), size);
         let (_, binding) = start(&rig.host, seed, SessionMode::ViewOnly);
         let (mut client, served) = connect(&rig.host);
-        write_msg(&mut client, &bind_with(&binding, preset))
-            .await
-            .unwrap();
+        write_msg(
+            &mut client,
+            &bind_with(&binding, crate::quality::code(preset)),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             read_msg(&mut client).await.unwrap(),
             Some(Msg::BindOk {
-                width: 256,
-                height: 96,
+                width: size.0,
+                height: size.1,
                 codec: codec::H264,
                 mode: 1,
-                quality: APPLIED,
+                quality: info,
             }),
-            "preset {preset}"
+            "{preset}"
         );
+        let Msg::Video { flags, data, .. } = next_acking(&mut client).await else {
+            panic!("{preset}: the first picture comes first");
+        };
+        assert_ne!(flags & video_flags::KEYFRAME, 0, "{preset}");
+        let mut decoder = H264Decoder::new().unwrap();
+        let frame = decoder.decode(&data).unwrap().expect("a picture");
+        assert_eq!((frame.width, frame.height), size, "{preset}");
         drop(client);
         assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
     }
     assert_eq!(rig.backend.sources.load(Ordering::SeqCst), 3);
 }
 
-/// The quality design §5 rule 1 (step 11): a source is opened for the
-/// fastest preset's rate on the route, held to the host's `max_fps`: from
+/// Host test 4: a `SetQuality` mid-stream is said in a `Quality` before the
+/// first `Video` encoded with it. The `Quality` carries the card fitted under
+/// the new preset's cap and the preset's `QualityInfo`; the `Video` after it
+/// is an IDR, and decodes at that size; every picture before it, already on
+/// its way, decodes at the size before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quality_change_mid_stream_is_said_before_its_first_picture() {
+    const CARD: (u32, u32) = (2000, 240);
+    let rig = rig_with(
+        TestBackend {
+            card: Some(CARD),
+            ..TestBackend::default()
+        },
+        MediaLimits::default(),
+    );
+    let (_, binding) = start(&rig.host, 60, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    let before = fitted(QualityPreset::Balanced, CARD.0, CARD.1);
+    let after = fitted(QualityPreset::BestPerformance, CARD.0, CARD.1);
+    assert_eq!((before, after), ((1920, 230), (1280, 152)));
+    let (width, height, info) = bind_preset(&mut client, &binding, quality::BALANCED).await;
+    assert_eq!((width, height, info), (before.0, before.1, APPLIED));
+
+    let mut decoder = H264Decoder::new().unwrap();
+    let mut decoded = |data: &[u8]| {
+        let frame = decoder.decode(data).unwrap().expect("a picture");
+        (frame.width, frame.height)
+    };
+    let mut pictures = 0;
+    let since = tokio::time::Instant::now();
+    while pictures < 3 {
+        in_time(since, "three pictures");
+        match next_acking(&mut client).await {
+            Msg::Video { data, .. } => {
+                assert_eq!(decoded(&data), before);
+                pictures += 1;
+            }
+            Msg::Stats(_) => {}
+            other => panic!("before the change: {other:?}"),
+        }
+    }
+    write_msg(
+        &mut client,
+        &Msg::SetQuality {
+            quality: quality::BEST_PERFORMANCE,
+        },
+    )
+    .await
+    .unwrap();
+    let since = tokio::time::Instant::now();
+    let said = loop {
+        in_time(since, "the Quality");
+        match next_acking(&mut client).await {
+            Msg::Video { data, .. } => assert_eq!(decoded(&data), before, "already on its way"),
+            Msg::Stats(_) => {}
+            Msg::Quality {
+                width,
+                height,
+                quality,
+            } => break (width, height, quality),
+            other => panic!("before the Quality: {other:?}"),
+        }
+    };
+    assert_eq!(said, (after.0, after.1, BEST_PERFORMANCE));
+    let (flags, data) = loop {
+        in_time(since, "the picture after the Quality");
+        match next_acking(&mut client).await {
+            Msg::Video { flags, data, .. } => break (flags, data),
+            Msg::Stats(_) => {}
+            other => panic!("after the Quality: {other:?}"),
+        }
+    };
+    assert_ne!(flags & video_flags::KEYFRAME, 0, "an IDR at the new size");
+    assert_eq!(decoded(&data), after);
+    write_msg(
+        &mut client,
+        &Msg::Close {
+            reason: reason::ENDED_BY_VIEWER,
+        },
+    )
+    .await
+    .unwrap();
+    let MediaOutcome::Served { report, end, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!(end, MediaEnd::ViewerLeft);
+    assert_eq!(
+        (
+            report.quality_requests,
+            report.quality_changes,
+            report.repeats
+        ),
+        (1, 1, 1),
+        "the change encodes the last picture again"
+    );
+    assert_eq!(rig.backend.sources.load(Ordering::SeqCst), 1);
+}
+
+/// The window follows the preset (the quality design §3.1): a stream bound
+/// with Balanced has 23 pictures in flight at most before an ack, and once
+/// Best performance applies, 30 (the caps here are far above both).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_preset_change_resizes_the_ack_window() {
+    let rig = rig(MediaLimits {
+        window_frames: 10_000,
+        window_bytes: 1 << 30,
+        ..MediaLimits::default()
+    });
+    let (_, binding) = start(&rig.host, 61, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    // Read without acknowledging until nothing more comes.
+    let unacked = |said: Vec<Msg>| {
+        said.into_iter()
+            .filter_map(|msg| match msg {
+                Msg::Video { seq, .. } => Some(seq),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut said = Vec::new();
+    while let Ok(msg) =
+        tokio::time::timeout(Duration::from_millis(500), read_msg(&mut client)).await
+    {
+        said.push(msg.unwrap().unwrap());
+    }
+    let videos = unacked(said);
+    assert_eq!(videos.len(), 23, "Balanced's window: {videos:?}");
+
+    write_msg(
+        &mut client,
+        &Msg::SetQuality {
+            quality: quality::BEST_PERFORMANCE,
+        },
+    )
+    .await
+    .unwrap();
+    write_msg(&mut client, &Msg::VideoAck { seq: videos[22] })
+        .await
+        .unwrap();
+    let mut said = Vec::new();
+    while let Ok(msg) =
+        tokio::time::timeout(Duration::from_millis(500), read_msg(&mut client)).await
+    {
+        said.push(msg.unwrap().unwrap());
+    }
+    assert!(
+        said.iter().any(|msg| matches!(
+            msg,
+            Msg::Quality {
+                quality: BEST_PERFORMANCE,
+                ..
+            }
+        )),
+        "{said:?}"
+    );
+    assert_eq!(unacked(said).len(), 30, "Best performance's window");
+    drop(client);
+    let MediaOutcome::Served { report, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!((report.frames_sent, report.quality_changes), (53, 1));
+}
+
+/// The quality design §5 rule 1 and §8 host test 3: a source is opened for
+/// the fastest preset's rate on the route, held to the host's `max_fps`: from
 /// the host's config and the route alone, so binds naming different presets
-/// make identical requests. `serve_on` with the Tor route serves as `serve`.
+/// make identical requests. Five `SetQuality`s change the preset twice and
+/// never open capture again. `serve_on` with the Tor route serves as `serve`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_source_is_opened_at_the_hosts_capture_rate_whatever_the_preset() {
     for (max_fps, want) in [(60, 20), (10, 10)] {
@@ -2122,9 +2427,14 @@ async fn the_source_is_opened_at_the_hosts_capture_rate_whatever_the_preset() {
                 max_fps,
                 ..crate::quality::QualityCaps::default()
             },
+            quality_interval: Duration::from_millis(300),
+            keyframe_interval: Duration::from_millis(300),
             ..MediaLimits::default()
         });
-        for (seed, preset) in [(45, quality::BEST_QUALITY), (46, quality::BEST_PERFORMANCE)] {
+        for (seed, bound, other) in [
+            (45, quality::BEST_QUALITY, quality::BEST_PERFORMANCE),
+            (46, quality::BEST_PERFORMANCE, quality::BEST_QUALITY),
+        ] {
             let (_, binding) = start(&rig.host, seed, SessionMode::Control);
             let (mut client, server) = duplex(1 << 20);
             let host = Arc::clone(&rig.host);
@@ -2132,21 +2442,37 @@ async fn the_source_is_opened_at_the_hosts_capture_rate_whatever_the_preset() {
                 tokio::spawn(
                     async move { host.serve_on(server, crate::quality::Route::Tor).await },
                 );
-            write_msg(&mut client, &bind_with(&binding, preset))
-                .await
-                .unwrap();
-            assert!(matches!(
-                read_msg(&mut client).await.unwrap(),
-                Some(Msg::BindOk { .. })
-            ));
+            let (.., info) = bind_preset(&mut client, &binding, bound).await;
+            assert_eq!(info.preset, bound);
+            // Only the last of them names `other`.
+            let picks = [quality::BALANCED, bound, quality::BALANCED, bound, other];
+            for quality in picks {
+                write_msg(&mut client, &Msg::SetQuality { quality })
+                    .await
+                    .unwrap();
+            }
+            let since = tokio::time::Instant::now();
+            loop {
+                in_time(since, "a Quality naming the last pick");
+                if let Msg::Quality { quality, .. } = next_acking(&mut client).await
+                    && quality.preset == other
+                {
+                    break;
+                }
+            }
             drop(client);
-            assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
+            let MediaOutcome::Served { report, .. } = served.await.unwrap() else {
+                panic!("not served");
+            };
+            assert_eq!(report.quality_requests, 5);
+            assert!(report.quality_changes >= 1, "{report:?}");
         }
         assert_eq!(
             *rig.backend.requests.lock().unwrap(),
             [SourceRequest::new(want); 2],
-            "max_fps {max_fps}"
+            "max_fps {max_fps}: one open per stream, whatever was picked"
         );
+        assert_eq!(rig.backend.sources.load(Ordering::SeqCst), 2);
     }
 }
 
@@ -2199,26 +2525,27 @@ async fn a_bind_of_the_previous_version_is_refused() {
     assert_eq!(rig.backend.sources.load(Ordering::SeqCst), 0);
 }
 
-/// The quality design §4.6: `SetQuality` is legal in control and view-only
-/// sessions alike and changes nothing yet: pictures keep coming, input is
-/// still injected in control and still dropped undecoded in view-only.
+/// The quality design §4.6 and §8 host test 12: `SetQuality` is legal in
+/// control and view-only sessions alike, and honoured in both: the host says
+/// the new preset in a `Quality` (the card is under every cap, so the size
+/// stays), and the picture after it is an IDR. Input is still injected in
+/// control, and still dropped undecoded in view-only: bytes no decoder
+/// accepts end nothing there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn set_quality_is_taken_in_either_mode() {
+async fn set_quality_is_honoured_in_either_mode() {
     for (seed, mode) in [(45, SessionMode::Control), (46, SessionMode::ViewOnly)] {
         let rig = rig(MediaLimits::default());
         let (_, binding) = start(&rig.host, seed, mode);
         let (mut client, served) = connect(&rig.host);
         bind_raw(&mut client, &binding).await;
-        for preset in [
-            quality::BEST_PERFORMANCE,
-            quality::BEST_QUALITY,
-            quality::BALANCED,
-            quality::BALANCED,
-        ] {
-            write_msg(&mut client, &Msg::SetQuality { quality: preset })
-                .await
-                .unwrap();
-        }
+        write_msg(
+            &mut client,
+            &Msg::SetQuality {
+                quality: quality::BEST_PERFORMANCE,
+            },
+        )
+        .await
+        .unwrap();
         let key = InputEvent::Key {
             usb: KEY_A,
             pressed: true,
@@ -2226,12 +2553,37 @@ async fn set_quality_is_taken_in_either_mode() {
         write_msg(&mut client, &Msg::Input(key.encode()))
             .await
             .unwrap();
+        if matches!(mode, SessionMode::ViewOnly) {
+            write_msg(&mut client, &Msg::Input([0xff; 16]))
+                .await
+                .unwrap();
+        }
+        let since = tokio::time::Instant::now();
+        let said = loop {
+            in_time(since, "the Quality");
+            if let msg @ Msg::Quality { .. } = next_acking(&mut client).await {
+                break msg;
+            }
+        };
+        assert_eq!(
+            said,
+            Msg::Quality {
+                width: 256,
+                height: 96,
+                quality: BEST_PERFORMANCE,
+            },
+            "{mode:?}"
+        );
+        let flags = loop {
+            in_time(since, "the picture after the Quality");
+            match next_acking(&mut client).await {
+                Msg::Video { flags, .. } => break flags,
+                Msg::Stats(_) | Msg::Pong { .. } => {}
+                other => panic!("{mode:?}: after the Quality: {other:?}"),
+            }
+        };
+        assert_ne!(flags & video_flags::KEYFRAME, 0, "{mode:?}");
         sync(&mut client, 7).await;
-        let (first, _) = next_video(&mut client).await;
-        write_msg(&mut client, &Msg::VideoAck { seq: first })
-            .await
-            .unwrap();
-        next_video(&mut client).await;
         write_msg(
             &mut client,
             &Msg::Close {
@@ -2244,14 +2596,92 @@ async fn set_quality_is_taken_in_either_mode() {
             panic!("not served");
         };
         assert_eq!(end, MediaEnd::ViewerLeft, "{mode:?}");
+        assert_eq!(
+            (report.quality_requests, report.quality_changes),
+            (1, 1),
+            "{mode:?}"
+        );
         if matches!(mode, SessionMode::Control) {
             assert_eq!(report.input_injected, 1);
             assert_eq!(rig.backend.recorder.events()[0], key);
         } else {
-            assert_eq!((report.input_injected, report.input_dropped), (0, 1));
+            assert_eq!((report.input_injected, report.input_dropped), (0, 2));
+            assert!(rig.backend.recorder.events().is_empty());
         }
         assert_eq!(rig.backend.sources.load(Ordering::SeqCst), 1, "{mode:?}");
     }
+}
+
+/// The quality design §8 host test 13: `Stats` come about once per
+/// `stats_every`, each just before a picture, each with pictures in its
+/// window and the card's size as the source, and with the stages' means;
+/// the report sums the same stages over the whole stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stats_come_about_once_per_period_with_the_stages_means() {
+    let every = Duration::from_millis(200);
+    let rig = rig(MediaLimits {
+        stats_every: every,
+        ..MediaLimits::default()
+    });
+    let (_, binding) = start(&rig.host, 62, SessionMode::ViewOnly);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    let run = Duration::from_millis(1500);
+    let started = std::time::Instant::now();
+    let mut stats = Vec::new();
+    let mut after_stats = false;
+    while started.elapsed() < run {
+        match next_acking(&mut client).await {
+            Msg::Stats(s) => {
+                assert!(!after_stats, "two Stats with no picture between");
+                stats.push(s);
+                after_stats = true;
+            }
+            Msg::Video { .. } => after_stats = false,
+            other => panic!("{other:?}"),
+        }
+    }
+    // A window opens when the last closes, and closes at the first picture
+    // after `every`: at most one per period, and at 15 fps not much later.
+    let most = run.as_millis().div_ceil(every.as_millis()) as usize;
+    assert!(
+        (3..=most).contains(&stats.len()),
+        "{} Stats in {run:?}",
+        stats.len()
+    );
+    for s in &stats {
+        assert_eq!((s.source_width, s.source_height), (256, 96), "{s:?}");
+        assert!(s.frames > 0, "{s:?}");
+        assert!(u128::from(s.window_ms) >= every.as_millis(), "{s:?}");
+        assert!(
+            s.grab_us > 0 && s.encode_us > 0 && s.convert_us > 0,
+            "{s:?}"
+        );
+    }
+    assert!(
+        stats.iter().any(|s| s.ack_us > 0),
+        "acknowledged pictures have a round trip: {stats:?}"
+    );
+    drop(client);
+    let MediaOutcome::Served { report, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    let in_windows: u64 = stats.iter().map(|s| u64::from(s.frames)).sum();
+    assert!(in_windows <= report.frames_sent, "{report:?}");
+    assert!(
+        report.acks > 0 && report.acks <= report.frames_sent,
+        "{report:?}"
+    );
+    assert!(report.grab_us > 0 && report.encode_us > 0 && report.convert_us > 0);
+    assert!(report.ack_us > 0, "{report:?}");
+    assert_eq!(
+        (
+            report.repeats,
+            report.quality_requests,
+            report.quality_changes
+        ),
+        (0, 0, 0)
+    );
 }
 
 /// The quality design §8 host test 14: a viewer's `Quality` or `Stats`, the
