@@ -232,7 +232,10 @@ pub enum UnattendedVerdict {
 /// (timeout, `E_BAD_STATE` for a `PING` in `AwaitKe3`, peer `BYE` / `ERROR`,
 /// EOF) is returned as is — after the handler settled its charge as a
 /// failure — so [`serve_host`] reports the code that P1 and the §B.8.4.5
-/// table describe instead of a synthetic reject on a dead stream.
+/// table describe instead of a synthetic reject on a dead stream. So is the
+/// requester leaving while the `ask_before_start` popup or the block window is
+/// open ([`AuthExchange::departed`]), which the handler logs as
+/// [`AuditEvent::RequesterLeft`].
 pub trait UnattendedHook: Send + Sync {
     /// Decide on an unattended request.
     fn handle<'a>(
@@ -1357,9 +1360,18 @@ where
             } else {
                 deps.consent.session_at(&peer, &summary, &cfg.levels)
             };
+            // Raced against the requester leaving (B04): its card goes at
+            // once, so an Allow cannot accept into a dead stream, and the
+            // device's popup slot is free for its next request.
             let decision = {
                 let _pending = Counted::new(&deps.stats.consent_pending);
-                tokio::time::timeout_at(deadline, asking).await
+                tokio::select! {
+                    biased;
+                    gone = chan.departure() => {
+                        return Err(requester_left(deps, device, Some(&label), SuppressedPopup::Session, gone));
+                    }
+                    decision = tokio::time::timeout_at(deadline, asking) => decision,
+                }
             };
             let choice = match decision {
                 Err(_) => {
@@ -1383,9 +1395,13 @@ where
             // Between the answer and the accept (§B.8.7.5): Windows' prompt
             // and the helper's start run here while the popup's time keeps
             // running; a helper not ready in time is never attached.
-            let started =
-                tokio::time::timeout_at(deadline, Arc::clone(&deps.admin_helper).start(&peer))
-                    .await;
+            let started = tokio::select! {
+                biased;
+                gone = chan.departure() => {
+                    return Err(requester_left(deps, device, Some(&label), SuppressedPopup::Session, gone));
+                }
+                started = tokio::time::timeout_at(deadline, Arc::clone(&deps.admin_helper).start(&peer)) => started,
+            };
             match started {
                 Err(_) => {
                     return reject_session(&mut chan, deps, &peer, messages::reject::POPUP_TIMEOUT)
@@ -1721,6 +1737,24 @@ fn without_elevation(proof: ConsentProof) -> ConsentProof {
     }
 }
 
+/// The requester of `device` left while its request waited on `popup` (B04):
+/// logged ([`AuditEvent::RequesterLeft`]), and `gone` is what ends the stream.
+fn requester_left(
+    deps: &HostDeps,
+    device: DeviceId,
+    label: Option<&str>,
+    popup: SuppressedPopup,
+    gone: HandshakeError,
+) -> HandshakeError {
+    tracing::info!(peer = ?device, popup = popup.name(), error = %gone, "the requester left before the answer");
+    deps.audit.record(AuditEvent::RequesterLeft {
+        device,
+        label: label.map(str::to_owned),
+        popup,
+    });
+    gone
+}
+
 /// Fixed text for a session that ended in an error (never peer-controlled).
 fn end_detail(err: &HandshakeError) -> String {
     match err {
@@ -1841,9 +1875,19 @@ where
         fingerprint: device.fingerprint(),
         pinned_label: pinned.map(str::to_owned),
     };
+    let sas = sas.render();
+    // Raced against the requester leaving (B04): its card goes at once, so an
+    // Allow cannot pin a device that left, the leave is no reject toward the
+    // temp-ban, and the in-flight slot is free for the device's next request.
     let decision = {
         let _pending = Counted::new(&deps.stats.pair_pending);
-        tokio::time::timeout(timeouts::POPUP, deps.consent.pairing(&peer, &sas.render())).await
+        tokio::select! {
+            biased;
+            gone = chan.departure() => {
+                return Err(requester_left(deps, *device, None, SuppressedPopup::Pairing, gone));
+            }
+            decision = tokio::time::timeout(timeouts::POPUP, deps.consent.pairing(&peer, &sas)) => decision,
+        }
     };
     match decision {
         Err(_) => {

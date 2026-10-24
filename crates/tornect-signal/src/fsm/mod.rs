@@ -26,7 +26,7 @@ pub mod vectors;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tornect_core::DeviceId;
 use tornect_core::session_log::{
     AggregatedReject, RejectAggregator, SessionEvent, SessionLog, SessionMode, SessionRecord,
@@ -36,7 +36,7 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 pub use crate::consent::SessionToken;
 use crate::envelope::{Envelope, EnvelopeError, Kind, codes};
-use crate::framing::{FrameError, MAX_FRAME_LEN, read_frame_max, write_frame};
+use crate::framing::{FrameError, HEADER_LEN, MAX_FRAME_LEN, read_frame_max, write_frame};
 use crate::messages::{self, Body, BodyError, decode_body, encode_body};
 use crate::pairing::{BoxFuture, lock};
 use crate::transcript::{HostSigner, Transcript, sign_envelope, wire_bytes};
@@ -342,6 +342,21 @@ pub enum AuditEvent {
         /// How (fixed text, never peer-controlled).
         detail: String,
     },
+    /// The requester left (its stream closed or broken) while its request
+    /// waited for this host: a pairing or session card, the block window, or
+    /// the answer that could not be written. The card was taken down; nothing
+    /// was pinned or started.
+    /// Logged as a `pair_rejected` or `session_denied` line with the detail
+    /// [`REQUESTER_LEFT`].
+    RequesterLeft {
+        /// The peer.
+        device: DeviceId,
+        /// The pinned label for a session request; none for a pairing request
+        /// (a declared name is never logged).
+        label: Option<String>,
+        /// Which card it was waiting on.
+        popup: SuppressedPopup,
+    },
     /// A consent popup was not shown because a remote session is live
     /// (§B.8.6.2: answered `BUSY`, `popup_suppressed_remote_session` logged,
     /// the owner notified afterwards).
@@ -355,7 +370,12 @@ pub enum AuditEvent {
     },
 }
 
-/// Which consent popup [`AuditEvent::PopupSuppressed`] refers to.
+/// The `detail` of the log line of [`AuditEvent::RequesterLeft`]: not a wire
+/// code, nothing was sent.
+pub const REQUESTER_LEFT: &str = "REQUESTER_LEFT";
+
+/// Which consent popup [`AuditEvent::PopupSuppressed`] or
+/// [`AuditEvent::RequesterLeft`] refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuppressedPopup {
     /// The pairing popup (`PAIR_REJECT{BUSY}`).
@@ -602,6 +622,21 @@ impl HandshakeAudit for HostAudit {
                 .peer(device, label)
                 .session(session_id)
                 .detail(detail),
+            AuditEvent::RequesterLeft {
+                device,
+                label,
+                popup,
+            } => {
+                let record = SessionRecord::now(match popup {
+                    SuppressedPopup::Pairing => SessionEvent::PairRejected,
+                    SuppressedPopup::Session => SessionEvent::SessionDenied,
+                })
+                .detail(REQUESTER_LEFT);
+                match label {
+                    Some(label) => record.peer(device, label),
+                    None => record.device(device),
+                }
+            }
             AuditEvent::PopupSuppressed {
                 device,
                 label,
@@ -672,6 +707,8 @@ impl Drop for Received {
 #[derive(Debug)]
 pub struct Channel<S> {
     stream: S,
+    /// What the peer sent while [`Channel::departure`] watched; read first.
+    early: Early,
     tx_next: u64,
     rx_next: u64,
     version: u8,
@@ -690,6 +727,7 @@ where
     pub fn new(stream: S, host_onion_pk: &[u8; 32]) -> Self {
         Self {
             stream,
+            early: Early::default(),
             tx_next: 1,
             rx_next: 1,
             version: tornect_core::PROTOCOL_VERSION,
@@ -731,7 +769,10 @@ where
         self.closing
     }
 
-    /// Take the stream back (after the handshake, for the session layer).
+    /// Take the stream back (after the handshake, for the session layer). Bytes
+    /// [`Channel::departure`] read and no read took since go with the channel;
+    /// only the host's handshake watches, and it reads again before it hands
+    /// anything on.
     pub fn into_stream(self) -> S {
         self.stream
     }
@@ -816,8 +857,11 @@ where
         if self.closing {
             return Err(HandshakeError::Aborted("channel is closing"));
         }
-        let read =
-            tokio::time::timeout(timeout, read_frame_max(&mut self.stream, self.frame_cap)).await;
+        let mut reader = EarlyFirst {
+            early: &mut self.early,
+            stream: &mut self.stream,
+        };
+        let read = tokio::time::timeout(timeout, read_frame_max(&mut reader, self.frame_cap)).await;
         let payload = match read {
             Err(_) => return Err(HandshakeError::Timeout(what)),
             Ok(Ok(Some(p))) => Zeroizing::new(p),
@@ -946,6 +990,36 @@ where
         }
     }
 
+    /// Resolves only when the peer leaves while this side decides (a popup,
+    /// the block window): the stream closed ([`HandshakeError::Closed`]) or
+    /// broken ([`HandshakeError::Io`]). The peer owes silence then (strict
+    /// alternation, §B.3); what it sends anyway is kept, up to one frame, and
+    /// handed to the next [`Channel::recv`], which judges it as it would have
+    /// without this watch. Cancel safe: the caller drops this future once it
+    /// decided, and no byte read by then is lost.
+    pub async fn departure(&mut self) -> HandshakeError {
+        if self.closing {
+            return HandshakeError::Aborted("channel is closing");
+        }
+        let cap = HEADER_LEN + self.frame_cap;
+        // Reserved while empty, so growing it never leaves a copy behind.
+        if self.early.0.is_empty() {
+            self.early.0.reserve_exact(cap);
+        }
+        let mut chunk = Zeroizing::new([0u8; 1024]);
+        while self.early.0.len() < cap {
+            let room = (cap - self.early.0.len()).min(chunk.len());
+            match self.stream.read(&mut chunk[..room]).await {
+                Ok(0) => return HandshakeError::Closed,
+                // Kept before the next await: a drop of this future cannot lose them.
+                Ok(n) => self.early.0.extend_from_slice(&chunk[..n]),
+                Err(e) => return HandshakeError::Io(e),
+            }
+        }
+        // A whole frame came early: the next read judges it.
+        std::future::pending().await
+    }
+
     /// Send `BYE{reason}` and close.
     pub async fn bye(&mut self, reason: u16) -> Result<(), HandshakeError> {
         if self.closing {
@@ -965,6 +1039,47 @@ where
     pub async fn close(&mut self) {
         self.closing = true;
         let _ = self.stream.shutdown().await;
+    }
+}
+
+/// Bytes the peer sent while [`Channel::departure`] watched: wiped once read
+/// and on drop, never printed (a client frame of the handshake may carry KE3).
+#[derive(Default)]
+struct Early(Zeroizing<Vec<u8>>);
+
+impl core::fmt::Debug for Early {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "<{} early bytes>", self.0.len())
+    }
+}
+
+/// The channel's stream with the bytes read early in front of it.
+struct EarlyFirst<'a, S> {
+    early: &'a mut Early,
+    stream: &'a mut S,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for EarlyFirst<'_, S> {
+    // Qualified paths: importing these here would reach `fsm::tests` through
+    // its glob import.
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let early = &mut this.early.0;
+        if early.is_empty() {
+            return std::pin::Pin::new(&mut *this.stream).poll_read(cx, buf);
+        }
+        let n = early.len().min(buf.remaining());
+        buf.put_slice(&early[..n]);
+        early.drain(..n);
+        if early.is_empty() {
+            // Wipes the spare capacity the drained bytes were left in.
+            early.zeroize();
+        }
+        std::task::Poll::Ready(Ok(()))
     }
 }
 
@@ -998,6 +1113,13 @@ pub trait AuthExchange: Send {
         &'a mut self,
         challenge: messages::AuthChallenge,
     ) -> BoxFuture<'a, Result<(messages::AuthResponse, [u8; 32]), HandshakeError>>;
+
+    /// Resolves when the requester leaves while the host decides after the
+    /// PAKE (the `ask_before_start` popup, the block window), with why
+    /// ([`Channel::departure`]). The default never resolves.
+    fn departed<'a>(&'a mut self) -> BoxFuture<'a, HandshakeError> {
+        Box::pin(std::future::pending())
+    }
 }
 
 impl<S> AuthExchange for Channel<S>
@@ -1021,6 +1143,10 @@ where
             self.absorb(&rx);
             Ok((response, self.th()))
         })
+    }
+
+    fn departed<'a>(&'a mut self) -> BoxFuture<'a, HandshakeError> {
+        Box::pin(self.departure())
     }
 }
 

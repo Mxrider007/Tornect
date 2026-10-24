@@ -719,6 +719,18 @@ fn post_f2_reject(r: PostF2Reject) -> SessionReject {
     out
 }
 
+/// The requester left while its request waited on the `ask_before_start` popup
+/// or the block window (B04): logged, and `gone` is what ends the stream.
+fn requester_left(ctx: &UnattendedContext<'_>, gone: HandshakeError) -> HandshakeError {
+    tracing::info!(peer = ?ctx.device, error = %gone, "the requester left before the answer");
+    ctx.audit.record(AuditEvent::RequesterLeft {
+        device: ctx.device,
+        label: Some(ctx.label.to_owned()),
+        popup: SuppressedPopup::Session,
+    });
+    gone
+}
+
 /// Classify a transport failure during `AwaitKe3` for the settlement log.
 fn fail_kind(e: &HandshakeError) -> FailKind {
     match e {
@@ -1051,22 +1063,27 @@ impl UnattendedAuth {
         } else {
             Elevation::None
         };
-        if grant.ask_before_start
-            && !ctx
-                .local_allow
-                .ask_at(&grant.id, label, asked_level, Duration::from_secs(60))
-                .await
-        {
-            return Ok(UnattendedVerdict::Reject(SessionReject::new(
-                reject::DENIED,
-            )));
+        // Both raced against the requester leaving (B04): the card or the block
+        // window goes at once, and nothing is accepted into a dead stream.
+        if grant.ask_before_start {
+            let allowed = tokio::select! {
+                biased;
+                gone = ctx.exchange.departed() => return Err(requester_left(&ctx, gone)),
+                allowed = ctx.local_allow.ask_at(&grant.id, label, asked_level, Duration::from_secs(60)) => allowed,
+            };
+            if !allowed {
+                return Ok(UnattendedVerdict::Reject(SessionReject::new(
+                    reject::DENIED,
+                )));
+            }
         }
 
-        let block = match ctx
-            .block_window
-            .run(grant.block_window_s, &grant.id, label)
-            .await
-        {
+        let outcome = tokio::select! {
+            biased;
+            gone = ctx.exchange.departed() => return Err(requester_left(&ctx, gone)),
+            outcome = ctx.block_window.run(grant.block_window_s, &grant.id, label) => outcome,
+        };
+        let block = match outcome {
             BlockOutcome::Passed(w) => w,
             BlockOutcome::Blocked => {
                 // §B.8.6.3: Block ⇒ `BLOCKED_BY_LOCAL_USER` and the grant
@@ -2231,6 +2248,163 @@ mod tests {
         .unwrap();
         assert_accepted(second, "the pre-empting request");
         assert_eq!(first.await.unwrap(), Some(reject::PREEMPTED));
+    }
+
+    /// Records every audit event, for assertions.
+    #[derive(Default)]
+    struct Recorded(Mutex<Vec<AuditEvent>>);
+    impl crate::fsm::HandshakeAudit for Recorded {
+        fn record(&self, event: AuditEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    /// Sets its flag when dropped: a card or block window taken down.
+    struct Gone(Arc<AtomicBool>);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A block window and an `ask_before_start` popup held open until they are
+    /// taken down, saying when one opened.
+    #[derive(Default)]
+    struct HeldOpen {
+        opened: Arc<Notify>,
+        gone: Arc<AtomicBool>,
+    }
+    impl crate::consent::BlockWindow for HeldOpen {
+        fn run<'a>(&'a self, _: u8, _: &'a GrantId, _: &'a str) -> BoxFuture<'a, BlockOutcome> {
+            Box::pin(async move {
+                let _shown = Gone(Arc::clone(&self.gone));
+                self.opened.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+    impl crate::consent::LocalAllow for HeldOpen {
+        fn ask_at<'a>(
+            &'a self,
+            _: &'a GrantId,
+            _: &'a str,
+            _: Elevation,
+            _: Duration,
+        ) -> BoxFuture<'a, bool> {
+            Box::pin(async move {
+                let _shown = Gone(Arc::clone(&self.gone));
+                self.opened.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+
+    /// A real client whose requester leaves once `leave` fires.
+    struct Leaving {
+        client: RealClient,
+        leave: Arc<Notify>,
+    }
+    impl crate::fsm::AuthExchange for Leaving {
+        fn challenge<'a>(
+            &'a mut self,
+            challenge: AuthChallenge,
+        ) -> BoxFuture<'a, Result<(AuthResponse, [u8; 32]), HandshakeError>> {
+            self.client.challenge(challenge)
+        }
+
+        fn departed<'a>(&'a mut self) -> BoxFuture<'a, HandshakeError> {
+            Box::pin(async move {
+                self.leave.notified().await;
+                HandshakeError::Closed
+            })
+        }
+    }
+
+    /// B04: a requester that leaves after its PAKE while the block window or
+    /// the `ask_before_start` popup is up takes it down at once. The window
+    /// used to run out and the session be accepted into the dead stream; the
+    /// popup stayed until answered. The leave is logged, nothing is
+    /// suspended, and the grant is left as it was.
+    #[tokio::test]
+    async fn a_requester_that_leaves_takes_the_block_window_and_the_popup_down() {
+        use tornect_core::unattended::grant::GrantState;
+        for ask_before_start in [false, true] {
+            let env = env_with(
+                PW,
+                Preset::HeadlessBox,
+                &GrantOptions {
+                    ask_before_start: Some(ask_before_start),
+                    ..GrantOptions::default()
+                },
+            );
+            assert_eq!(
+                env.guard
+                    .store()
+                    .grant(&env.device)
+                    .unwrap()
+                    .ask_before_start,
+                ask_before_start
+            );
+            let held = HeldOpen::default();
+            let leave = Arc::new(Notify::new());
+            let audit = Recorded::default();
+            let (state, ke1) = auth::ClientLogin::start(PW).unwrap();
+            let mut exchange = Leaving {
+                client: RealClient {
+                    password: PW.to_owned(),
+                    th_after_response: [0x44; 32],
+                    client_key: Arc::new(Mutex::new(None)),
+                    state: Some(state),
+                    ctx: auth::context(&TH_REQ, auth::SUITE_OPAQUE, intent::SESSION),
+                    device_pk: *env.device.public_key_bytes(),
+                },
+                leave: Arc::clone(&leave),
+            };
+            let req = request(auth::SUITE_OPAQUE, Some(ke1));
+            let caps = Caps::default();
+            let handshake = env.auth.handle(UnattendedContext {
+                device: env.device,
+                label: "Laptop",
+                request: &req,
+                th_after_request: TH_REQ,
+                host_pk: HOST_PK,
+                host_caps: &caps,
+                exchange: &mut exchange,
+                block_window: &held,
+                local_allow: &held,
+                activity: &crate::fsm::host::NoSession,
+                audit: &audit,
+            });
+            // Bounded: without the watch the held window never ends.
+            let (verdict, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(handshake, async {
+                    held.opened.notified().await;
+                    leave.notify_one();
+                })
+            })
+            .await
+            .expect("the requester's leaving ended the handshake");
+            assert!(
+                matches!(verdict, Err(HandshakeError::Closed)),
+                "ask_before_start = {ask_before_start}: {:?}",
+                verdict.err()
+            );
+            assert!(held.gone.load(Ordering::SeqCst), "taken down");
+            let events = audit.0.lock().unwrap();
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    AuditEvent::RequesterLeft {
+                        label: Some(label),
+                        popup: SuppressedPopup::Session,
+                        ..
+                    } if label == "Laptop"
+                )),
+                "{events:?}"
+            );
+            let state = env.guard.store().grant(&env.device).unwrap().state;
+            assert!(matches!(state, GrantState::Active), "{state:?}");
+        }
     }
 
     /// The cancel is level-triggered: a newer request that pre-empts the stale
