@@ -6,7 +6,10 @@
 //! Drawn from the session's `Viewing` and the window's own [`ViewerState`],
 //! which lives in the app's stream window of one session and dies with it,
 //! so nothing in it outlives the session. What the user asks for comes back
-//! as actions; nothing here sends input.
+//! as actions; nothing here sends input. The Quality menu (the quality
+//! design §3.2) asks the host for a preset in control and view-only
+//! sessions alike; the badge and the details say what the host applies and
+//! how long each stage takes (§3.3), all of it display only.
 
 use std::collections::VecDeque;
 use std::io;
@@ -16,12 +19,13 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, CornerRadius, RichText, Stroke, vec2};
 
-use tornect_core::config::{Picture, ToolbarHides, Viewer};
+use tornect_core::config::{Picture, QualityPreset, ToolbarHides, Viewer};
+use tornect_proto::{HostStats, QualityInfo};
 use tornect_signal::messages::notice;
 
-use super::super::model::Viewing;
+use super::super::model::{Ewma, Viewing};
 use super::super::screenshot;
-use super::super::theme::{self, Tokens};
+use super::super::theme::{self, Face, Tokens};
 use super::super::view::{Action, clock};
 use super::super::widgets;
 
@@ -69,6 +73,42 @@ const NOT_ON_WINDOWS: &str = "not possible on Windows computers";
 /// The Fullscreen button's name, for the accessibility tree.
 const FULLSCREEN: &str = "Fullscreen";
 
+/// The Quality button's words.
+const QUALITY: &str = "Quality";
+
+/// Under a pick on its way to the host, in the Quality menu.
+const CHANGING: &str = "Changing…";
+
+/// How long "Changing…" waits for the host to say it applies the pick: the
+/// gate's interval (at most 2 s), the pictures already on their way (about
+/// one Tor round trip) and one encode, with room to spare.
+const CHANGING_FOR: Duration = Duration::from_secs(10);
+
+/// A timing line before the host's first means (or this computer's first
+/// picture).
+const MEASURING: &str = "Measuring…";
+
+/// A preset's name: in the Quality menu, the badge, the details, the toast
+/// and Settings, Display and quality.
+#[must_use]
+pub const fn quality_name(preset: QualityPreset) -> &'static str {
+    match preset {
+        QualityPreset::BestQuality => "Best quality",
+        QualityPreset::Balanced => "Balanced",
+        QualityPreset::BestPerformance => "Best performance",
+    }
+}
+
+/// A preset's hint under its name in the Quality menu.
+#[must_use]
+pub fn quality_hint(preset: QualityPreset) -> &'static str {
+    match preset {
+        QualityPreset::BestQuality => "The sharpest picture; needs the fastest link",
+        QualityPreset::Balanced => "A sharp picture at a steady pace",
+        QualityPreset::BestPerformance => "The quickest response; a smaller picture",
+    }
+}
+
 /// How a screenshot's thread says it went: where the file is, or why not.
 type Saved = io::Result<PathBuf>;
 
@@ -86,6 +126,8 @@ enum Toast {
     Fullscreen,
     /// The window left full screen.
     Windowed,
+    /// The host applies the preset this viewer picked.
+    Quality(QualityPreset),
 }
 
 impl Toast {
@@ -96,6 +138,9 @@ impl Toast {
             Self::SecureScreenGone => crate::secure_screen::NOTICE_GONE,
             Self::Fullscreen => "Fullscreen. Move the pointer to the top edge for this bar.",
             Self::Windowed => "Back to a window",
+            Self::Quality(QualityPreset::BestQuality) => "Quality: Best quality",
+            Self::Quality(QualityPreset::Balanced) => "Quality: Balanced",
+            Self::Quality(QualityPreset::BestPerformance) => "Quality: Best performance",
         }
     }
 }
@@ -120,6 +165,11 @@ pub enum ViewerAction {
     Screenshot,
     /// Show the window full screen (`true`), or as a window again.
     Fullscreen(bool),
+    /// The Quality menu: open it (`true`) or close it.
+    QualityMenu(bool),
+    /// Ask the host for this preset: in control and view-only sessions
+    /// alike, and nothing of the input path changes.
+    Quality(QualityPreset),
 }
 
 /// A key combination the Send keys menu sends, in a control session only.
@@ -205,6 +255,12 @@ pub struct ViewerState {
     pub details: bool,
     /// The Send keys menu is open.
     pub keys_menu: bool,
+    /// The Quality menu is open.
+    pub quality_menu: bool,
+    /// The preset this viewer picked that the host has not said it applies
+    /// yet, and when: the menu says "Changing…" under it until the host
+    /// says so, or for [`CHANGING_FOR`]. Never set when the window opens.
+    quality_wanted: Option<(QualityPreset, Instant)>,
     /// The picture at its own size with scroll bars, not fitted.
     pub one_to_one: bool,
     /// At its own size, the part of the window that shows the picture in
@@ -248,6 +304,9 @@ pub struct ViewerState {
     toast: Option<(Toast, Instant)>,
     /// Where screenshot threads say how they went, read at the next frame.
     saved: Option<(mpsc::Sender<Saved>, mpsc::Receiver<Saved>)>,
+    /// How long writing a picture into the texture takes, in milliseconds
+    /// (the details' "upload"): `draw_stream` times each.
+    pub upload_ms: Ewma,
 }
 
 impl ViewerState {
@@ -328,6 +387,47 @@ impl ViewerState {
         self.fullscreen = false;
     }
 
+    /// The viewer picked `preset` while the host applies `applied`: the
+    /// menu closes, and a preset other than the applied one is on its way
+    /// ("Changing…") from `now`. Picking the applied one leaves nothing on
+    /// its way.
+    pub fn pick_quality(
+        &mut self,
+        preset: QualityPreset,
+        applied: Option<QualityPreset>,
+        now: Instant,
+    ) {
+        self.quality_menu = false;
+        self.quality_wanted = (applied != Some(preset)).then_some((preset, now));
+    }
+
+    /// The preset on its way to the host, if one is.
+    #[must_use]
+    pub fn changing(&self) -> Option<QualityPreset> {
+        self.quality_wanted.map(|(preset, _)| preset)
+    }
+
+    /// Follow what the host applies, every frame: once it says it applies
+    /// the pick on its way, the toast names the preset; one the host has not
+    /// applied after [`CHANGING_FOR`] is dropped, quietly (the check mark
+    /// follows the applied preset all along). While one is on its way, how
+    /// long until it would be dropped.
+    fn follow_quality(&mut self, applied: Option<QualityPreset>, now: Instant) -> Option<Duration> {
+        let (wanted, at) = self.quality_wanted?;
+        if applied == Some(wanted) {
+            self.quality_wanted = None;
+            self.toast = Some((Toast::Quality(wanted), now));
+            return None;
+        }
+        let left = (at + CHANGING_FOR)
+            .checked_duration_since(now)
+            .filter(|left| !left.is_zero());
+        if left.is_none() {
+            self.quality_wanted = None;
+        }
+        left
+    }
+
     /// Say it when the window goes full screen or comes back.
     fn follow_fullscreen(&mut self, now: Instant) {
         if self.fullscreen != self.was_fullscreen {
@@ -404,7 +504,7 @@ impl ViewerState {
         if self.hidden {
             return None;
         }
-        if self.pinned || self.details || self.keys_menu {
+        if self.pinned || self.details || self.keys_menu || self.quality_menu {
             self.active_at = Some(now);
             return None;
         }
@@ -508,6 +608,110 @@ pub fn chip_text(v: &Viewing) -> &'static str {
     }
 }
 
+/// The badge: the route, the preset the host applies once it said (from
+/// `BindOk` on), the frame rate measured here and the decoded picture's
+/// size: `Tor relay · Balanced · 30 fps · 1600×900`.
+#[must_use]
+pub fn badge_text(v: &Viewing, rate: u64) -> String {
+    let (w, h) = v.size;
+    match v.stream.applied_preset() {
+        Some(preset) => format!(
+            "Tor relay · {} · {rate} fps · {w}×{h}",
+            quality_name(preset)
+        ),
+        None => format!("Tor relay · {rate} fps · {w}×{h}"),
+    }
+}
+
+/// The details' Quality line: what the host applies, `Balanced · up to 15
+/// fps · 1.5 Mbit/s`.
+#[must_use]
+pub fn quality_text(info: &QualityInfo) -> String {
+    let name = tornect_session::quality::preset(info.preset).map(quality_name);
+    format!(
+        "{} · up to {} fps · {}",
+        name.unwrap_or("Another preset"),
+        info.max_fps,
+        bitrate_text(info.kbps)
+    )
+}
+
+/// A bitrate as people read it: from 1000 kbit/s in Mbit/s with one
+/// decimal (`1.5 Mbit/s`), below that in kbit/s (`800 kbit/s`).
+#[must_use]
+pub fn bitrate_text(kbps: u32) -> String {
+    if kbps >= 1000 {
+        let tenths = (u64::from(kbps) + 50) / 100;
+        format!("{}.{} Mbit/s", tenths / 10, tenths % 10)
+    } else {
+        format!("{kbps} kbit/s")
+    }
+}
+
+/// The details' second Quality line, when the host's desktop (its last
+/// `Stats`) is larger than the picture: `Scaled down from 2560×1440`. A
+/// desktop that only lost an odd last column or row is not scaled.
+#[must_use]
+pub fn scaled_text(host: Option<&HostStats>, picture: (u32, u32)) -> Option<String> {
+    let host = host?;
+    let (w, h) = (u32::from(host.source_width), u32::from(host.source_height));
+    let (shown_w, shown_h) = tornect_codec::scale::shown_region(w, h);
+    let scaled = picture.0 > 0 && picture.1 > 0 && (shown_w > picture.0 || shown_h > picture.1);
+    scaled.then(|| format!("Scaled down from {w}×{h}"))
+}
+
+/// The Timing row's first line: this computer's own means, `This
+/// computer: decode 3.1 ms · convert 1.2 ms · upload 0.8 ms`.
+#[must_use]
+pub fn local_timing(decode: Ewma, convert: Ewma, upload: Ewma) -> String {
+    match (decode.micros(), convert.micros(), upload.micros()) {
+        (Some(decode), Some(convert), Some(upload)) => format!(
+            "This computer: decode {} · convert {} · upload {}",
+            duration_text(decode),
+            duration_text(convert),
+            duration_text(upload)
+        ),
+        _ => format!("This computer: {MEASURING}"),
+    }
+}
+
+/// The Timing row's second line: the host's means from its last `Stats`,
+/// `Remote computer: capture 4.0 ms · scale 2.1 ms · convert 1.5 ms ·
+/// encode 9.8 ms · send 120 ms`; "Measuring…" before the first.
+#[must_use]
+pub fn remote_timing(host: Option<&HostStats>) -> String {
+    let Some(s) = host else {
+        return format!("Remote computer: {MEASURING}");
+    };
+    let d = |us: u32| duration_text(u64::from(us));
+    format!(
+        "Remote computer: capture {} · scale {} · convert {} · encode {} · send {}",
+        d(s.grab_us),
+        d(s.scale_us),
+        d(s.convert_us),
+        d(s.encode_us),
+        d(s.send_us)
+    )
+}
+
+/// The Timing row's third line: the host's mean from a picture written to
+/// its acknowledgement, `Round trip: 1.1 s`; "Measuring…" before the first
+/// `Stats`, and while the host's last one counted no acknowledgement.
+#[must_use]
+pub fn round_trip_text(host: Option<&HostStats>) -> String {
+    match host {
+        Some(s) if s.ack_us > 0 => {
+            format!("Round trip: {}", duration_text(u64::from(s.ack_us)))
+        }
+        _ => format!("Round trip: {MEASURING}"),
+    }
+}
+
+/// A time in µs as the details say it (the quality design §3.3).
+fn duration_text(us: u64) -> String {
+    crate::host::duration_text(us)
+}
+
 /// The level chip's colour, from the same signed level.
 fn chip_color(v: &Viewing, t: &Tokens) -> Color32 {
     if v.control && v.administrator {
@@ -539,6 +743,11 @@ pub fn stream_window(
     viewer.collect_screenshots(now);
     viewer.follow_notice(viewing.is_some_and(|v| v.control), now);
     viewer.follow_fullscreen(now);
+    let applied = viewing.and_then(|v| v.stream.applied_preset());
+    if let Some(left) = viewer.follow_quality(applied, now) {
+        // "Changing…" goes after its time with no picture coming either.
+        ui.ctx().request_repaint_after(left);
+    }
     let sharing = viewer.sharing;
     // Outside the picture, so no press there reaches the remote computer;
     // shown whether or not the toolbar is, and in full screen.
@@ -750,6 +959,7 @@ fn toolbar(
     let rate = fps(&viewer.samples, now);
     let mut badge_clicked = false;
     let (mut keys_clicked, mut keys_at) = (false, None);
+    let (mut quality_clicked, mut quality_at) = (false, None);
     let area = egui::Area::new(egui::Id::new("viewer-toolbar"))
         .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 8.0))
         .order(egui::Order::Foreground)
@@ -766,8 +976,7 @@ fn toolbar(
                             ui.label(RichText::new(&v.host).strong());
                         }
                         if !viewer.badge_off {
-                            let badge =
-                                format!("Tor relay · {rate} fps · {}×{}", v.size.0, v.size.1);
+                            let badge = badge_text(v, rate);
                             let badge = ui.add(
                                 egui::Label::new(RichText::new(badge).small().color(t.warn))
                                     .sense(egui::Sense::click()),
@@ -808,6 +1017,14 @@ fn toolbar(
                             let on = !viewer.fullscreen;
                             actions.push(Action::Viewer(ViewerAction::Fullscreen(on)));
                         }
+                        // In control and view-only sessions alike.
+                        let quality = ui.button(QUALITY);
+                        if quality.clicked() {
+                            quality_clicked = true;
+                            let open = !viewer.quality_menu;
+                            actions.push(Action::Viewer(ViewerAction::QualityMenu(open)));
+                        }
+                        quality_at = Some(quality.rect.left());
                         if v.control {
                             let send = ui.button("Send keys");
                             if send.clicked() {
@@ -886,7 +1103,12 @@ fn toolbar(
             no_input,
             admin_windows,
         };
-        let open = details(ctx, v, input_sent, rate, now, at, lines);
+        let counts = Counts {
+            input_sent,
+            rate,
+            upload: viewer.upload_ms,
+        };
+        let open = details(ctx, v, counts, now, at, lines);
         viewer.areas.push(open.response.rect);
         below = open.response.rect.bottom() + 4.0;
         // A press anywhere else closes them (the badge toggles them itself).
@@ -901,6 +1123,16 @@ fn toolbar(
         viewer.areas.push(menu.response.rect);
         if menu.response.clicked_elsewhere() && !keys_clicked {
             actions.push(Action::Viewer(ViewerAction::KeysMenu(false)));
+        }
+    }
+    if viewer.quality_menu
+        && let Some(left) = quality_at
+    {
+        let applied = v.stream.applied_preset();
+        let menu = quality_menu(ctx, viewer, applied, egui::pos2(left, below), actions, t);
+        viewer.areas.push(menu.response.rect);
+        if menu.response.clicked_elsewhere() && !quality_clicked {
+            actions.push(Action::Viewer(ViewerAction::QualityMenu(false)));
         }
     }
 }
@@ -967,6 +1199,83 @@ fn keys_menu(
         })
 }
 
+/// The Quality menu at `at`: the three presets, the one the host applies
+/// checked (`applied`), each with its hint; a pick on its way says
+/// "Changing…" under it. A pick goes to the host and touches nothing of
+/// the input path.
+fn quality_menu(
+    ctx: &egui::Context,
+    viewer: &ViewerState,
+    applied: Option<QualityPreset>,
+    at: egui::Pos2,
+    actions: &mut Vec<Action>,
+    t: &Tokens,
+) -> egui::InnerResponse<()> {
+    egui::Area::new(egui::Id::new("viewer-quality"))
+        .fixed_pos(at)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(t.surface_overlay)
+                .stroke(Stroke::new(1.0, t.border_subtle))
+                .corner_radius(CornerRadius::same(8))
+                .shadow(t.popup_shadow)
+                .inner_margin(egui::Margin::same(6))
+                .show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        for preset in QualityPreset::ALL {
+                            let on = applied == Some(preset);
+                            ui.horizontal_top(|ui| {
+                                // The check mark's column, empty but for the
+                                // applied preset.
+                                let (mark, _) =
+                                    ui.allocate_exact_size(vec2(16.0, 20.0), egui::Sense::hover());
+                                if on {
+                                    ui.painter().text(
+                                        mark.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "✓",
+                                        theme::font(ui.ctx(), Face::MonoSemibold, 13.0),
+                                        t.ok,
+                                    );
+                                }
+                                ui.vertical(|ui| {
+                                    let item = egui::Button::new(quality_name(preset))
+                                        .frame(false)
+                                        .selected(on);
+                                    if ui.add(item).clicked() {
+                                        actions.push(Action::Viewer(ViewerAction::Quality(preset)));
+                                    }
+                                    ui.label(
+                                        RichText::new(quality_hint(preset))
+                                            .small()
+                                            .color(t.text_muted),
+                                    );
+                                    if !on && viewer.changing() == Some(preset) {
+                                        ui.label(
+                                            RichText::new(CHANGING).small().color(t.text_muted),
+                                        );
+                                    }
+                                });
+                            });
+                        }
+                    });
+                });
+        })
+}
+
+/// What the details count: the input sent, the frame rate measured here,
+/// and this computer's mean upload of a picture.
+#[derive(Debug, Clone, Copy)]
+struct Counts {
+    /// Input events sent (a control session's).
+    input_sent: u64,
+    /// The frame rate over the last second.
+    rate: u64,
+    /// The mean texture upload.
+    upload: Ewma,
+}
+
 /// The lines the details say under the level, each when the host said it.
 #[derive(Debug, Clone, Copy)]
 struct ModeLines {
@@ -977,18 +1286,24 @@ struct ModeLines {
 }
 
 /// The connection's details, under the toolbar at `at`: the route, the
-/// picture, the level (with the no-input and administrator-windows lines
-/// when the host said them, `lines`), the session's clock and, in a control
-/// session, the input sent. Nothing in them names the host.
+/// picture, what the host applies and each stage's time (the quality
+/// design §3.3; display only), the level (with the no-input and
+/// administrator-windows lines when the host said them, `lines`), the
+/// session's clock and, in a control session, the input sent. Nothing in
+/// them names the host.
 fn details(
     ctx: &egui::Context,
     v: &Viewing,
-    input_sent: u64,
-    rate: u64,
+    counts: Counts,
     now: Instant,
     at: egui::Pos2,
     lines: ModeLines,
 ) -> egui::InnerResponse<()> {
+    let Counts {
+        input_sent,
+        rate,
+        upload,
+    } = counts;
     let t = theme::tokens(ctx);
     let muted = |text: &str| RichText::new(text).color(t.text_muted);
     egui::Area::new(egui::Id::new("viewer-details"))
@@ -1015,6 +1330,33 @@ fn details(
                             ui.end_row();
                             ui.label(muted("Picture"));
                             ui.label(format!("{}×{} · {rate} fps", v.size.0, v.size.1));
+                            ui.end_row();
+                            let host = v.stream.host.as_ref();
+                            if let Some(applied) = &v.stream.applied {
+                                ui.label(muted("Quality"));
+                                ui.vertical(|ui| {
+                                    ui.label(quality_text(applied));
+                                    if let Some(scaled) = scaled_text(host, v.size) {
+                                        ui.label(muted(&scaled).small());
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                            ui.label(muted("Timing"));
+                            ui.vertical(|ui| {
+                                // One line each: the panel takes their width,
+                                // rather than growing tall with wrapped lines.
+                                let line = |ui: &mut egui::Ui, text: String| {
+                                    ui.add(
+                                        egui::Label::new(text)
+                                            .wrap_mode(egui::TextWrapMode::Extend),
+                                    );
+                                };
+                                let (decode, convert) = (v.stream.decode_ms, v.stream.convert_ms);
+                                line(ui, local_timing(decode, convert, upload));
+                                line(ui, remote_timing(host));
+                                line(ui, round_trip_text(host));
+                            });
                             ui.end_row();
                             ui.label(muted("Mode"));
                             ui.vertical(|ui| {
@@ -1135,7 +1477,7 @@ pub(crate) mod testing {
     use std::time::{Duration, Instant};
 
     use super::{ViewerState, stream_window};
-    use crate::ui::model::Viewing;
+    use crate::ui::model::{StreamInfo, Viewing};
     use crate::ui::view::Action;
 
     /// One stream window.
@@ -1167,6 +1509,7 @@ pub(crate) mod testing {
                     since: start,
                     pictures: 1,
                     size: (1600, 900),
+                    stream: StreamInfo::default(),
                 },
                 viewer: ViewerState::default(),
                 input_sent: 0,
@@ -1226,6 +1569,16 @@ pub(crate) mod testing {
             self.nodes
                 .iter()
                 .any(|n| n.label() == Some(text) || n.value() == Some(text))
+        }
+
+        /// Whether the widget named `text` was shown as on (a toggle's
+        /// state) in the last pass; `None` for one that is no toggle.
+        pub(crate) fn toggled(&self, text: &str) -> Option<egui::accesskit::Toggled> {
+            self.nodes
+                .iter()
+                .find(|n| n.label() == Some(text))
+                .unwrap_or_else(|| panic!("no \"{text}\" on screen"))
+                .toggled()
         }
 
         /// Whether the widget named `text` was disabled in the last pass.
@@ -2019,7 +2372,7 @@ mod tests {
             fullscreen_at_open: true,
             toolbar_hides: ToolbarHides::Never,
             show_badge: false,
-            quality: tornect_core::config::QualityPreset::BestPerformance,
+            quality: QualityPreset::BestPerformance,
         });
         assert!(w.viewer.one_to_one && w.viewer.fullscreen);
         for at in [0, 3_000, 10_000, 60_000] {
@@ -2031,5 +2384,383 @@ mod tests {
             );
         }
         assert!(w.viewer.visible().is_some(), "at its own size");
+    }
+
+    /// What the host applies under each preset with the default caps (the
+    /// quality design §3.1).
+    fn applied(preset: QualityPreset) -> QualityInfo {
+        let (code, max_fps, kbps, max_long, max_short) = match preset {
+            QualityPreset::BestQuality => (1, 12, 4000, 3840, 2160),
+            QualityPreset::Balanced => (2, 15, 1500, 1920, 1080),
+            QualityPreset::BestPerformance => (3, 20, 1000, 1280, 720),
+        };
+        QualityInfo {
+            preset: code,
+            max_fps,
+            kbps,
+            max_long,
+            max_short,
+        }
+    }
+
+    /// The quality design §4.4's `Stats`.
+    fn host_stats() -> HostStats {
+        HostStats {
+            source_width: 2560,
+            source_height: 1440,
+            frames: 15,
+            window_ms: 1000,
+            grab_us: 4000,
+            age_us: 6200,
+            scale_us: 2100,
+            convert_us: 1500,
+            encode_us: 9800,
+            send_us: 120_000,
+            ack_us: 1_100_000,
+        }
+    }
+
+    /// The quality design §3.2: the Quality button is in the toolbar of a
+    /// control and a view-only session alike, after the fullscreen corners
+    /// and (in control) before Send keys; a click asks for its menu, and a
+    /// second one closes it.
+    #[test]
+    fn the_quality_button_is_offered_in_control_and_view_only() {
+        for control in [false, true] {
+            let mut w = Window::new(control);
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(0), Vec::new());
+            assert!(w.has(QUALITY), "{control}: {:?}", w.texts());
+            let quality = w.centre(QUALITY);
+            assert!(quality.x > w.centre(FULLSCREEN).x, "{control}");
+            if control {
+                assert!(w.centre("Send keys").x > quality.x);
+            }
+            assert_eq!(
+                w.click(ms(100), QUALITY),
+                vec![Action::Viewer(ViewerAction::QualityMenu(true))],
+                "{control}"
+            );
+            w.viewer.quality_menu = true;
+            w.pass(ms(200), Vec::new());
+            assert_eq!(
+                w.click(ms(300), QUALITY),
+                vec![Action::Viewer(ViewerAction::QualityMenu(false))],
+                "{control}: the button toggles, the press is not one elsewhere"
+            );
+        }
+    }
+
+    /// The menu: the three presets in the design's words, each with its
+    /// hint, the one the host applies checked (none before it said); a
+    /// click on one asks for it, in both modes. The open menu keeps the
+    /// toolbar, is the window's own area (no press there reaches the host),
+    /// and a press elsewhere closes it.
+    #[test]
+    fn the_quality_menu_offers_three_presets_and_checks_the_applied_one() {
+        use egui::accesskit::Toggled;
+        let items = [
+            (
+                QualityPreset::BestQuality,
+                "Best quality",
+                "The sharpest picture; needs the fastest link",
+            ),
+            (
+                QualityPreset::Balanced,
+                "Balanced",
+                "A sharp picture at a steady pace",
+            ),
+            (
+                QualityPreset::BestPerformance,
+                "Best performance",
+                "The quickest response; a smaller picture",
+            ),
+        ];
+        for (preset, name, hint) in items {
+            assert_eq!((quality_name(preset), quality_hint(preset)), (name, hint));
+        }
+        for control in [false, true] {
+            let mut w = Window::new(control);
+            w.viewer.quality_menu = true;
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(0), Vec::new());
+            for (_, name, hint) in items {
+                assert!(w.has(name) && w.has(hint), "{name}: {:?}", w.texts());
+                assert_eq!(w.toggled(name), Some(Toggled::False), "nothing said yet");
+            }
+            w.viewing.stream.applied = Some(applied(QualityPreset::Balanced));
+            for at in [100, 2600, 9000] {
+                w.pass(ms(at), Vec::new());
+                w.pass(ms(at), Vec::new());
+                assert!(w.has("End session"), "{at} ms: the toolbar stays");
+                for (preset, name, _) in items {
+                    let on = if preset == QualityPreset::Balanced {
+                        Toggled::True
+                    } else {
+                        Toggled::False
+                    };
+                    assert_eq!(w.toggled(name), Some(on), "{control}, {at} ms: {name}");
+                }
+            }
+            assert!(!w.has(CHANGING));
+            for (_, name, _) in items {
+                let at = w.centre(name);
+                assert!(w.viewer.areas().iter().any(|r| r.contains(at)), "{name}");
+            }
+            assert_eq!(
+                w.click(ms(9100), "Best performance"),
+                vec![Action::Viewer(ViewerAction::Quality(
+                    QualityPreset::BestPerformance
+                ))],
+                "{control}"
+            );
+            let away = egui::pos2(640.0, 600.0);
+            let press = |pressed| egui::Event::PointerButton {
+                pos: away,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let mut asked = w.pass(ms(9200), vec![egui::Event::PointerMoved(away), press(true)]);
+            asked.extend(w.pass(ms(9200), vec![press(false)]));
+            assert_eq!(
+                asked,
+                vec![Action::Viewer(ViewerAction::QualityMenu(false))],
+                "{control}"
+            );
+        }
+    }
+
+    /// "Changing…" stays under a pick other than the applied preset until
+    /// the host says it applies it, when the toast names it (once, for
+    /// 3.5 s), or for 10 s, after which it goes quietly; the check mark
+    /// follows the applied preset throughout, and a pick of the applied
+    /// preset puts nothing on its way. The window opens with none.
+    #[test]
+    fn changing_shows_until_the_host_applies_the_pick_or_ten_seconds_pass() {
+        use egui::accesskit::Toggled;
+        use tornect_core::config::QualityPreset::{Balanced, BestPerformance, BestQuality};
+        assert_eq!(ViewerState::opened(&Viewer::default()).changing(), None);
+        let mut w = Window::new(false);
+        w.viewing.stream.applied = Some(applied(Balanced));
+        w.pass(ms(0), Vec::new());
+        // As the window applies the pick; the menu opened again to look.
+        w.viewer.quality_menu = true;
+        w.viewer
+            .pick_quality(BestPerformance, Some(Balanced), w.start + ms(100));
+        assert!(!w.viewer.quality_menu, "a pick closes the menu");
+        assert_eq!(w.viewer.changing(), Some(BestPerformance));
+        w.viewer.quality_menu = true;
+        for at in [200, 10_000] {
+            w.pass(ms(at), Vec::new());
+            w.pass(ms(at), Vec::new());
+            assert!(w.has(CHANGING), "{at} ms: {:?}", w.texts());
+            let (under, changing) = (w.centre("Best performance"), w.centre(CHANGING));
+            assert!(
+                changing.y > under.y && changing.y - under.y < 60.0,
+                "under its item"
+            );
+            assert_eq!(w.toggled("Balanced"), Some(Toggled::True));
+            assert_eq!(w.toggled("Best performance"), Some(Toggled::False));
+        }
+        w.pass(ms(10_200), Vec::new());
+        w.pass(ms(10_200), Vec::new());
+        assert!(!w.has(CHANGING), "10.1 s after the pick: {:?}", w.texts());
+        assert_eq!(w.viewer.changing(), None);
+        assert!(
+            !w.texts().iter().any(|t| t.starts_with("Quality:")),
+            "no toast"
+        );
+        // A pick the host applies.
+        w.viewer
+            .pick_quality(BestPerformance, Some(Balanced), w.start + ms(11_000));
+        w.viewer.quality_menu = true;
+        w.pass(ms(11_100), Vec::new());
+        w.pass(ms(11_100), Vec::new());
+        assert!(w.has(CHANGING));
+        w.viewing.stream.applied = Some(applied(BestPerformance));
+        w.pass(ms(12_000), Vec::new());
+        w.pass(ms(12_000), Vec::new());
+        assert!(!w.has(CHANGING), "{:?}", w.texts());
+        assert!(w.has("Quality: Best performance"), "{:?}", w.texts());
+        assert_eq!(w.toggled("Best performance"), Some(Toggled::True));
+        assert_eq!(w.toggled("Balanced"), Some(Toggled::False));
+        w.pass(ms(15_400), Vec::new());
+        assert!(w.has("Quality: Best performance"), "3.4 s");
+        w.pass(ms(15_600), Vec::new());
+        assert!(!w.has("Quality: Best performance"), "3.6 s");
+        // The applied preset again: nothing on its way, no toast.
+        w.viewer
+            .pick_quality(BestPerformance, Some(BestPerformance), w.start + ms(16_000));
+        assert_eq!(w.viewer.changing(), None);
+        w.pass(ms(16_100), Vec::new());
+        assert!(!w.texts().iter().any(|t| t.starts_with("Quality:")));
+        // A pick before the host said anything is on its way too.
+        w.viewer
+            .pick_quality(BestQuality, None, w.start + ms(17_000));
+        assert_eq!(w.viewer.changing(), Some(BestQuality));
+        for (preset, toast) in [
+            (BestQuality, "Quality: Best quality"),
+            (Balanced, "Quality: Balanced"),
+            (BestPerformance, "Quality: Best performance"),
+        ] {
+            assert_eq!(Toast::Quality(preset).text(), toast);
+        }
+    }
+
+    /// The quality design §3.3: once the host said what it applies, the
+    /// badge names the preset between the route and the frame rate; until
+    /// then it reads as before.
+    #[test]
+    fn the_badge_names_the_applied_preset_once_the_host_said() {
+        let mut w = Window::new(true);
+        assert_eq!(badge_text(&w.viewing, 30), "Tor relay · 30 fps · 1600×900");
+        w.viewing.stream.applied = Some(applied(QualityPreset::Balanced));
+        for k in 0..=10u64 {
+            w.viewing.pictures = 1 + 3 * k;
+            w.pass(ms(100 * k), Vec::new());
+        }
+        assert!(
+            w.has("Tor relay · Balanced · 30 fps · 1600×900"),
+            "{:?}",
+            w.texts()
+        );
+        // A click on it still opens the details.
+        assert_eq!(
+            w.click(ms(1100), "Tor relay"),
+            vec![Action::Viewer(ViewerAction::Details(true))]
+        );
+    }
+
+    /// The details' Quality and Timing rows (the quality design §3.3):
+    /// before anything is known there is no Quality row and every Timing
+    /// line reads "Measuring…"; then what the host applies, the desktop it
+    /// scaled from, this computer's means and the host's, in the design's
+    /// number format. Nothing in them names the host.
+    #[test]
+    fn the_details_say_the_quality_and_each_stages_time() {
+        let mut w = Window::new(false);
+        w.viewer.shared = true;
+        w.viewer.details = true;
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        let button_only = times(&w, "Quality");
+        for text in [
+            "Timing",
+            "This computer: Measuring…",
+            "Remote computer: Measuring…",
+            "Round trip: Measuring…",
+        ] {
+            assert!(w.has(text), "{text}: {:?}", w.texts());
+        }
+        w.viewing.size = (1920, 1080);
+        w.viewing.stream.applied = Some(applied(QualityPreset::Balanced));
+        w.viewing.stream.decode_ms.add(3.1);
+        w.viewing.stream.convert_ms.add(1.2);
+        w.viewer.upload_ms.add(0.8);
+        w.viewing.stream.host = Some(host_stats());
+        w.pass(ms(100), Vec::new());
+        w.pass(ms(100), Vec::new());
+        assert!(times(&w, "Quality") > button_only, "the button and the row");
+        for text in [
+            "Balanced · up to 15 fps · 1.5 Mbit/s",
+            "Scaled down from 2560×1440",
+            "This computer: decode 3.1 ms · convert 1.2 ms · upload 0.8 ms",
+            "Remote computer: capture 4.0 ms · scale 2.1 ms · convert 1.5 ms · encode 9.8 ms · \
+             send 120 ms",
+            "Round trip: 1.1 s",
+        ] {
+            assert!(w.has(text), "{text}: {:?}", w.texts());
+        }
+        let texts = w.texts();
+        assert!(!texts.iter().any(|t| t.contains("Measuring")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Desk")), "{texts:?}");
+        // A desktop the picture shows whole: nothing was scaled.
+        w.viewing.stream.host = Some(HostStats {
+            source_width: 1921,
+            source_height: 1081,
+            ..host_stats()
+        });
+        w.pass(ms(200), Vec::new());
+        w.pass(ms(200), Vec::new());
+        assert!(
+            !w.texts().iter().any(|t| t.starts_with("Scaled down")),
+            "{:?}",
+            w.texts()
+        );
+    }
+
+    /// The details' numbers (the quality design §3.3): bitrates from
+    /// 1000 kbit/s in Mbit/s with one decimal, below in kbit/s; times under
+    /// 10 ms with one decimal, then whole milliseconds, then seconds with
+    /// one decimal; every value from the wire saturates.
+    #[test]
+    fn the_details_numbers_read_as_the_design_words_them() {
+        for (kbps, text) in [
+            (1500, "1.5 Mbit/s"),
+            (1000, "1.0 Mbit/s"),
+            (4000, "4.0 Mbit/s"),
+            (1049, "1.0 Mbit/s"),
+            (1050, "1.1 Mbit/s"),
+            (999, "999 kbit/s"),
+            (800, "800 kbit/s"),
+            (1, "1 kbit/s"),
+            (u32::MAX, "4294967.3 Mbit/s"),
+        ] {
+            assert_eq!(bitrate_text(kbps), text, "{kbps}");
+        }
+        assert_eq!(
+            quality_text(&applied(QualityPreset::BestQuality)),
+            "Best quality · up to 12 fps · 4.0 Mbit/s"
+        );
+        assert_eq!(
+            quality_text(&applied(QualityPreset::BestPerformance)),
+            "Best performance · up to 20 fps · 1.0 Mbit/s"
+        );
+        let most = HostStats {
+            grab_us: u32::MAX,
+            scale_us: u32::MAX,
+            convert_us: u32::MAX,
+            encode_us: u32::MAX,
+            send_us: u32::MAX,
+            ack_us: u32::MAX,
+            ..host_stats()
+        };
+        assert_eq!(
+            remote_timing(Some(&most)),
+            "Remote computer: capture 4295.0 s · scale 4295.0 s · convert 4295.0 s · encode \
+             4295.0 s · send 4295.0 s"
+        );
+        assert_eq!(round_trip_text(Some(&most)), "Round trip: 4295.0 s");
+        let none_acked = HostStats {
+            ack_us: 0,
+            ..host_stats()
+        };
+        assert_eq!(round_trip_text(Some(&none_acked)), "Round trip: Measuring…");
+        let mut some = Ewma::default();
+        some.add(12.0);
+        assert_eq!(
+            local_timing(some, some, Ewma::default()),
+            "This computer: Measuring…"
+        );
+        some.add(999.6);
+        assert_eq!(
+            local_timing(some, some, some),
+            "This computer: decode 210 ms · convert 210 ms · upload 210 ms"
+        );
+        let stats = host_stats();
+        for (picture, scaled) in [
+            ((1920, 1080), true),
+            ((2560, 1440), false),
+            ((2560, 1080), true),
+            ((0, 0), false),
+        ] {
+            assert_eq!(
+                scaled_text(Some(&stats), picture).is_some(),
+                scaled,
+                "{picture:?}"
+            );
+        }
+        assert_eq!(scaled_text(None, (1920, 1080)), None);
     }
 }

@@ -21,7 +21,7 @@ use super::model::{
     SettingsChange, Sharing, SheetLevels,
 };
 #[cfg(test)]
-use super::model::{ClientStage, Hosting, Setup, TorState, Viewing};
+use super::model::{ClientStage, Hosting, Setup, StreamInfo, TorState, Viewing};
 use super::nav::{self, Page};
 use super::pages;
 use super::pages::viewer::ViewerAction;
@@ -2865,6 +2865,7 @@ mod tests {
                 since: now,
                 pictures: 3,
                 size: (640, 480),
+                stream: StreamInfo::default(),
             }),
             ClientStage::Ended("SESSION ENDED by the host".to_owned()),
         ] {
@@ -2892,6 +2893,7 @@ mod tests {
             since: Instant::now(),
             pictures: 1,
             size: (1600, 900),
+            stream: StreamInfo::default(),
         };
         let mut actions = Vec::new();
         let mut drawn = None;
@@ -3144,6 +3146,7 @@ mod tests {
                 since: Instant::now(),
                 pictures: 1,
                 size: (1600, 900),
+                stream: StreamInfo::default(),
             };
             let mut nodes = Vec::new();
             for _ in 0..2 {
@@ -3217,6 +3220,7 @@ mod tests {
             since: Instant::now(),
             pictures: 1,
             size: (1600, 900),
+            stream: StreamInfo::default(),
         };
         for shared in [false, true] {
             let mut viewer = ViewerState::default();

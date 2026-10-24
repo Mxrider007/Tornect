@@ -509,10 +509,10 @@ fn close_ends_session(
 
 /// A pointer button of the stream window: a press that goes to the host
 /// also gives it the keyboard back. A press while the details or the Send
-/// keys menu are open only closes them: it goes nowhere, nor does its
-/// release, which finds nothing held.
+/// keys menu or the Quality menu are open only closes them: it goes
+/// nowhere, nor does its release, which finds nothing held.
 fn on_button(forwarder: &mut Forwarder, viewer: &mut ViewerState, button: Button, pressed: bool) {
-    if pressed && (viewer.details || viewer.keys_menu) {
+    if pressed && (viewer.details || viewer.keys_menu || viewer.quality_menu) {
         return;
     }
     if pressed && forwarder.counts_press() {
@@ -522,9 +522,11 @@ fn on_button(forwarder: &mut Forwarder, viewer: &mut ViewerState, button: Button
 }
 
 /// What one of the viewer's actions does (decision M1-70). The toolbar's
-/// controls change only the window's own state; End session is the one that
-/// asks the tokio side for anything. `viewing`, the signed level, is only
-/// read: no action raises the level or opens a closed forwarder.
+/// controls change only the window's own state; End session and a pick in
+/// the Quality menu (a preset for the host, in control and view-only
+/// sessions alike) are the ones that ask the tokio side for anything.
+/// `viewing`, the signed level, is only read: no action raises the level or
+/// opens a closed forwarder, and a pick never touches the forwarder.
 fn apply_viewer_action(
     forwarder: &mut Forwarder,
     viewer: &mut ViewerState,
@@ -543,7 +545,21 @@ fn apply_viewer_action(
         }
         Action::Viewer(ViewerAction::KeysMenu(open)) => {
             viewer.keys_menu = *open;
+            // One menu at a time.
+            viewer.quality_menu &= !*open;
             None
+        }
+        Action::Viewer(ViewerAction::QualityMenu(open)) => {
+            viewer.quality_menu = *open;
+            viewer.keys_menu &= !*open;
+            None
+        }
+        // To the host of the session being viewed, if one is; the menu
+        // closes and says "Changing…" until the host applies it.
+        Action::Viewer(ViewerAction::Quality(preset)) => {
+            let applied = viewing.and_then(|v| v.stream.applied_preset());
+            viewer.pick_quality(*preset, applied, Instant::now());
+            viewing.map(|_| Command::Quality(*preset))
         }
         // In a control session only; Ctrl+Alt+Del only to a host that said
         // it does not run Windows, never into a silent loss.
@@ -1191,8 +1207,11 @@ impl App {
             && let Some(rs) = view.surface.painter.render_state()
         {
             let mut renderer = rs.renderer.write();
+            // The details' "upload": this picture's write into the texture.
+            let started = Instant::now();
             view.video
                 .upload(&rs.device, &rs.queue, &mut renderer, &view.picture);
+            view.viewer.upload_ms.add_duration(started.elapsed());
         }
         let viewing = self.shared.read(|m| match &m.client {
             ClientStage::Live(v) => Some(v.clone()),
@@ -3179,9 +3198,11 @@ mod tests {
 
     /// Every action of the viewer, at every signed level, on a closed and an
     /// open forwarder: the forwarder stays as it was built, a closed one
-    /// sends nothing, and the only command any of them gives is End.
+    /// sends nothing, and the only commands any of them gives are End and,
+    /// for a pick in the Quality menu, that preset (at every level alike).
     #[test]
     fn no_toolbar_action_raises_the_level_or_opens_input() {
+        use tornect_core::config::QualityPreset;
         let all = [
             Action::EndViewing,
             Action::Viewer(ViewerAction::Pin(true)),
@@ -3199,6 +3220,11 @@ mod tests {
             Action::Viewer(ViewerAction::SendKeys(Combo::AltF4)),
             Action::Viewer(ViewerAction::OneToOne(true)),
             Action::Viewer(ViewerAction::OneToOne(false)),
+            Action::Viewer(ViewerAction::QualityMenu(true)),
+            Action::Viewer(ViewerAction::QualityMenu(false)),
+            Action::Viewer(ViewerAction::Quality(QualityPreset::BestQuality)),
+            Action::Viewer(ViewerAction::Quality(QualityPreset::Balanced)),
+            Action::Viewer(ViewerAction::Quality(QualityPreset::BestPerformance)),
         ];
         let w = Window::new(true);
         for open in [false, true] {
@@ -3227,18 +3253,124 @@ mod tests {
                             forwarder.flush();
                             assert!(forwarder.drain().is_empty(), "{action:?}");
                         }
-                        let end = *action == Action::EndViewing;
-                        assert_eq!(command, end.then_some(Command::EndViewing), "{action:?}");
+                        let asks = match action {
+                            Action::EndViewing => Some(Command::EndViewing),
+                            Action::Viewer(ViewerAction::Quality(p)) => Some(Command::Quality(*p)),
+                            _ => None,
+                        };
+                        assert_eq!(command, asks, "{action:?}");
                     }
                 }
             }
         }
+        // With no session viewed, a pick asks for nothing either.
         let (mut app, mut commands) = app();
         for action in all {
             app.act(action, None);
         }
         assert_eq!(commands.try_recv(), Ok(Command::EndViewing));
         assert_eq!(commands.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// The quality design §3.2: a pick in the Quality menu, in a control and
+    /// a view-only session alike, goes to the tokio side as that preset,
+    /// closes the menu and leaves "Changing…" for a preset the host does not
+    /// apply yet; it sends nothing through the forwarder, open or closed,
+    /// and pauses nothing. One menu at a time: the Quality menu closes the
+    /// Send keys menu and the other way round; while it is open a press only
+    /// closes it, and reaches nothing on the host.
+    #[test]
+    fn a_quality_pick_asks_for_the_preset_and_touches_no_input() {
+        use super::super::model::StreamInfo;
+        use tornect_core::config::QualityPreset::{Balanced, BestPerformance};
+        let w = Window::new(true);
+        for control in [false, true] {
+            let viewing = Viewing {
+                control,
+                stream: StreamInfo {
+                    applied: Some(tornect_proto::QualityInfo {
+                        preset: 2,
+                        max_fps: 15,
+                        kbps: 1500,
+                        max_long: 1920,
+                        max_short: 1080,
+                    }),
+                    ..StreamInfo::default()
+                },
+                ..w.viewing.clone()
+            };
+            for open in [false, true] {
+                let mut forwarder = Forwarder::new(open);
+                forwarder.set_picture(Some(PictureRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1280.0,
+                    height: 720.0,
+                }));
+                forwarder.moved((640.0, 400.0));
+                forwarder.flush();
+                forwarder.drain();
+                let mut state = ViewerState::default();
+                state.quality_menu = true;
+                let pick = Action::Viewer(ViewerAction::Quality(BestPerformance));
+                assert_eq!(
+                    apply_viewer_action(&mut forwarder, &mut state, Some(&viewing), &pick),
+                    Some(Command::Quality(BestPerformance)),
+                    "{control}, {open}"
+                );
+                assert!(!state.quality_menu);
+                assert_eq!(state.changing(), Some(BestPerformance));
+                let same = Action::Viewer(ViewerAction::Quality(Balanced));
+                assert_eq!(
+                    apply_viewer_action(&mut forwarder, &mut state, Some(&viewing), &same),
+                    Some(Command::Quality(Balanced)),
+                    "the applied preset still goes (it may undo a pick on its way)"
+                );
+                assert_eq!(state.changing(), None);
+                forwarder.flush();
+                assert!(forwarder.drain().is_empty(), "{control}, {open}");
+                assert!(!forwarder.is_paused());
+                assert_eq!(forwarder.is_open(), open);
+            }
+        }
+        let mut forwarder = Forwarder::new(true);
+        let mut state = ViewerState::default();
+        let viewing = w.viewing.clone();
+        let mut act = |state: &mut ViewerState, action: ViewerAction| {
+            apply_viewer_action(
+                &mut forwarder,
+                state,
+                Some(&viewing),
+                &Action::Viewer(action),
+            )
+        };
+        act(&mut state, ViewerAction::KeysMenu(true));
+        act(&mut state, ViewerAction::QualityMenu(true));
+        assert!(state.quality_menu && !state.keys_menu);
+        act(&mut state, ViewerAction::KeysMenu(true));
+        assert!(state.keys_menu && !state.quality_menu);
+        act(&mut state, ViewerAction::QualityMenu(true));
+        act(&mut state, ViewerAction::QualityMenu(false));
+        assert!(!state.quality_menu && !state.keys_menu);
+        // A press while the Quality menu is open goes nowhere.
+        let mut forwarder = Forwarder::new(true);
+        forwarder.set_picture(Some(PictureRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1280.0,
+            height: 720.0,
+        }));
+        forwarder.moved((640.0, 400.0));
+        forwarder.flush();
+        forwarder.drain();
+        let mut state = ViewerState::default();
+        state.quality_menu = true;
+        state.keyboard_local = true;
+        on_button(&mut forwarder, &mut state, Button::Left, true);
+        on_button(&mut forwarder, &mut state, Button::Left, false);
+        forwarder.flush();
+        assert!(forwarder.drain().is_empty());
+        assert!(state.keyboard_local, "the keyboard stays here");
     }
 
     /// The actions' own check of the signed level: through a forwarder left

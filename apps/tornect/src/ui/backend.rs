@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
+use tornect_core::config::QualityPreset;
 use tornect_core::levels::Elevation;
 use tornect_core::session_log::SessionMode;
 use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
@@ -39,7 +40,7 @@ use super::consent::{CodeCheck, GuiConsent, GuiPairingUi, Popups, Withdraw};
 use super::model::{
     Candidate, CaptureNote, Check, ClientStage, DeviceCard, Dial, Failure, GrantLevel,
     GrantRequest, GrantRow, HostSetting, Hosting, Manager, ManagerOp, NewPassword, PauseEnd,
-    PolicyInputs, RotateFailed, Settings, SettingsChange, Shared, Sharing, TorState,
+    PolicyInputs, RotateFailed, Settings, SettingsChange, Shared, Sharing, StreamInfo, TorState,
     UnattendedBanner, ViewOnly, Viewing, Wake, WizardAnswer, WizardChoice, WizardView,
 };
 use super::recognize::Lookalike;
@@ -121,6 +122,10 @@ pub enum Command {
     /// Try Tor, or the publishing of this computer's ID, again now, rather
     /// than when the automatic try after its failure is due (B02).
     RetryTor,
+    /// The viewer picked this preset in the stream window's Quality menu:
+    /// sent to the host of the session being viewed, if it changes anything
+    /// (the quality design §3.2).
+    Quality(QualityPreset),
     /// Shut down.
     Quit,
 }
@@ -149,13 +154,18 @@ pub struct UaChoice {
     pub administrator: bool,
 }
 
-/// What the viewer and the stream window share: the newest picture, and while
-/// a control session runs, the way to the host for input.
+/// What the viewer and the stream window share: the newest picture, while
+/// a control session runs the way to the host for input, and while any
+/// session runs the way to it for the viewer's quality picks.
 #[derive(Debug, Default)]
 pub struct StreamLink {
     /// The newest picture.
     pub slot: Arc<FrameSlot>,
     input: Mutex<Input>,
+    /// The picks of the session being viewed (`MediaViewer::with_quality`
+    /// sends each change as one `SetQuality`): a new channel for every
+    /// session, so no pick of an earlier one reaches a later one.
+    quality: Mutex<Option<watch::Sender<QualityPreset>>>,
 }
 
 /// The way to the host for input, while a control session runs.
@@ -171,6 +181,36 @@ struct Input {
 impl StreamLink {
     fn set_input(&self, tx: Option<mpsc::Sender<InputEvent>>) {
         *self.input.lock().unwrap_or_else(PoisonError::into_inner) = Input { tx, owed: false };
+    }
+
+    /// A session starts with `initial` (the settings' preset): a fresh
+    /// channel for its picks, whose receiver goes to its viewer.
+    fn start_quality(&self, initial: QualityPreset) -> watch::Receiver<QualityPreset> {
+        let (tx, rx) = watch::channel(initial);
+        self.set_quality(Some(tx));
+        rx
+    }
+
+    /// The channel of the session's picks; `None` at its end.
+    fn set_quality(&self, tx: Option<watch::Sender<QualityPreset>>) {
+        *self.quality.lock().unwrap_or_else(PoisonError::into_inner) = tx;
+    }
+
+    /// The viewer picked `preset` in the toolbar: it goes to the host only
+    /// if it differs from the last pick (or the session's first preset),
+    /// and only while a session runs. Whether it goes.
+    pub fn request_quality(&self, preset: QualityPreset) -> bool {
+        self.quality
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|tx| {
+                tx.send_if_modified(|held| {
+                    let changed = *held != preset;
+                    *held = preset;
+                    changed
+                })
+            })
     }
 
     /// Queue `event` for the host; `false` when there is no control session
@@ -2525,6 +2565,9 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                             let _ = stop.send(true);
                         }
                     }
+                    Command::Quality(preset) => {
+                        b.link.request_quality(preset);
+                    }
                     Command::StopSharing => {
                         if let Some(hosted) = &hosted {
                             stop_sharing(&hosted.serving.1.kill, &b.shared);
@@ -3303,6 +3346,7 @@ async fn view_session(
     let mut live = None;
     let ended = viewed(&b, &node, id, &stop, &mut live, ua).await;
     b.link.set_input(None);
+    b.link.set_quality(None);
     let message = match ended {
         Ok(message) => message,
         Err(e) => format!("{e:#}"),
@@ -3528,6 +3572,10 @@ async fn viewed(
         refresh_book(b, None);
     }
     *live = Some(sid);
+    // The session's own channel for the picks, before its window opens: a
+    // pick made in it can only go to this session.
+    let quality = b.shared.read(|m| m.settings.viewer.quality);
+    let picks = b.link.start_quality(quality);
     b.shared.update(|m| {
         m.go_live(Viewing {
             host: host.clone(),
@@ -3537,6 +3585,7 @@ async fn viewed(
             since: Instant::now(),
             pictures: 0,
             size: (0, 0),
+            stream: StreamInfo::default(),
         });
     });
     // The day of the visit, if history is kept; nothing otherwise.
@@ -3569,7 +3618,8 @@ async fn viewed(
     let watching = crate::tor_cmd::WatchOptions {
         input,
         forward: Some(&mut sink),
-        quality: b.shared.read(|m| m.settings.viewer.quality),
+        quality,
+        quality_rx: Some(picks),
         ..crate::tor_cmd::WatchOptions::default()
     };
     let end = crate::tor_cmd::watch(node, &id, &isolation, &mut session, stop, watching).await;
@@ -3578,6 +3628,7 @@ async fn viewed(
     let _ = notices_task.await;
     b.shared.update(super::model::Model::end_notices);
     b.link.set_input(None);
+    b.link.set_quality(None);
     Ok(match end? {
         End::You => {
             if let Err(e) = session.bye(bye::USER).await {
@@ -5652,6 +5703,36 @@ mod tests {
         assert!(waiting, "the viewed session got no time for its goodbye");
     }
 
+    /// The quality design §6.7: each viewed session gets its own channel of
+    /// picks, starting at the settings' preset; a pick goes only when it
+    /// changes something and only while a session runs, and a second
+    /// session's viewer starts from the settings' preset again, never from
+    /// the last session's pick.
+    #[test]
+    fn each_session_starts_its_quality_picks_from_the_settings() {
+        use tornect_core::config::QualityPreset::{Balanced, BestPerformance, BestQuality};
+        let link = StreamLink::default();
+        assert!(!link.request_quality(BestQuality), "no session");
+        let mut first = link.start_quality(Balanced);
+        assert_eq!(*first.borrow_and_update(), Balanced);
+        assert!(!link.request_quality(Balanced), "the session's own preset");
+        assert!(!first.has_changed().unwrap());
+        assert!(link.request_quality(BestPerformance));
+        assert!(first.has_changed().unwrap());
+        assert_eq!(*first.borrow_and_update(), BestPerformance);
+        assert!(!link.request_quality(BestPerformance), "picked already");
+        // The session ends: no pick goes anywhere, and the old receiver
+        // hears that its sender went.
+        link.set_quality(None);
+        assert!(!link.request_quality(BestQuality));
+        assert!(first.has_changed().is_err());
+        // The next session, with the settings at Balanced.
+        let mut second = link.start_quality(Balanced);
+        assert_eq!(*second.borrow_and_update(), Balanced, "not the last pick");
+        assert!(link.request_quality(BestQuality));
+        assert_eq!(*second.borrow_and_update(), BestQuality);
+    }
+
     /// SLICE-E E1-6: a release that finds the input queue full (a Tor stall
     /// with the pointer moving) is not lost: once there is room, a
     /// `ReleaseAll` goes out before anything else, so no key or button stays
@@ -5755,6 +5836,7 @@ mod tests {
                 since: Instant::now(),
                 pictures: 0,
                 size: (0, 0),
+                stream: StreamInfo::default(),
             });
         });
         let popups = Popups::new(Arc::clone(&shared));

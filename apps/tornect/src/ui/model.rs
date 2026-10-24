@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use tornect_core::address_book::{Day, mixes_scripts};
-use tornect_core::config::{BridgeMode, Theme, Viewer};
+use tornect_core::config::{BridgeMode, QualityPreset, Theme, Viewer};
 use tornect_core::levels::{Answers, Availability};
 use tornect_core::session_log::{Actor, SessionMode};
 use tornect_core::unattended::credentials::RememberOffer;
@@ -17,6 +17,7 @@ use tornect_core::unattended::grant::Preset;
 use tornect_core::unattended::ipc::{GrantOptions, ShownLink};
 use tornect_core::unattended::readiness::Probe;
 use tornect_core::{DeviceId, TornectId};
+use tornect_proto::{HostStats, QualityInfo};
 
 use super::backend::Secret;
 use crate::ua_client::AdminAction;
@@ -845,6 +846,78 @@ pub struct Viewing {
     pub pictures: u64,
     /// Size of the last picture.
     pub size: (u32, u32),
+    /// What the host says it applies and how long each stage takes: the
+    /// badge and the details read it (the quality design §3.3).
+    pub stream: StreamInfo,
+}
+
+/// What the host says of the stream it sends, and this viewer's own
+/// timings (the quality design §3.3). Everything the host sent is display
+/// only: no picture is sized from it, and the viewer writes it into the
+/// model quietly, without waking the window (§5 rule 12).
+#[derive(Debug, Clone, Default)]
+pub struct StreamInfo {
+    /// What the host applies: `BindOk`'s first, then each `Quality` that
+    /// changed something.
+    pub applied: Option<QualityInfo>,
+    /// The exact size the host last announced.
+    pub announced: (u32, u32),
+    /// The host's last means (`Stats`, at most one a second).
+    pub host: Option<HostStats>,
+    /// This viewer's decode of a picture, in milliseconds.
+    pub decode_ms: Ewma,
+    /// Its conversion to RGBA, in milliseconds.
+    pub convert_ms: Ewma,
+}
+
+impl StreamInfo {
+    /// The preset the host applies, once it said.
+    #[must_use]
+    pub fn applied_preset(&self) -> Option<QualityPreset> {
+        self.applied
+            .and_then(|q| tornect_session::quality::preset(q.preset))
+    }
+}
+
+/// An exponentially weighted mean of a time in milliseconds, each new
+/// sample weighing [`Ewma::ALPHA`]; nothing before the first sample.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Ewma(Option<f64>);
+
+impl Ewma {
+    /// The weight of a new sample.
+    pub const ALPHA: f64 = 0.2;
+
+    /// Take a sample of `ms` milliseconds (one that is not a finite,
+    /// non-negative number is ignored).
+    pub fn add(&mut self, ms: f64) {
+        if !ms.is_finite() || ms < 0.0 {
+            return;
+        }
+        self.0 = Some(match self.0 {
+            Some(mean) => mean + Self::ALPHA * (ms - mean),
+            None => ms,
+        });
+    }
+
+    /// Take a sample of `took`.
+    pub fn add_duration(&mut self, took: Duration) {
+        self.add(took.as_secs_f64() * 1000.0);
+    }
+
+    /// The mean in milliseconds, once there is one.
+    #[cfg(test)]
+    #[must_use]
+    pub fn ms(self) -> Option<f64> {
+        self.0
+    }
+
+    /// The mean in whole microseconds, once there is one.
+    #[must_use]
+    pub fn micros(self) -> Option<u64> {
+        // `as` saturates; the mean is finite and non-negative.
+        self.0.map(|ms| (ms * 1000.0).round() as u64)
+    }
 }
 
 /// The address book as the pages show it: read from the files by the tokio
@@ -1516,6 +1589,7 @@ mod tests {
             since: Instant::now(),
             pictures: 0,
             size: (0, 0),
+            stream: StreamInfo::default(),
         };
         let mut model = Model {
             host_notice: Some(0x07),

@@ -22,7 +22,7 @@ use tornect_session::FrameSink as _;
 use super::model::{
     Book, CaptureNote, ClientStage, Computer, Confirm, Device, Dial, Failure, Hosting, Model,
     MyWords, Popup, PopupKind, Recognition, Settings, Setup, Shared, Sharing, SheetLevels,
-    TorState, UaRecord, Viewing,
+    StreamInfo, TorState, UaRecord, Viewing,
 };
 use super::stream::{FrameSlot, SlotSink};
 
@@ -380,6 +380,7 @@ fn unattended(m: &mut Model, sheet: Sheet) -> bool {
                     since: now,
                     pictures: 1,
                     size: (1920, 1080),
+                    stream: StreamInfo::default(),
                 })
             };
         }
@@ -483,6 +484,7 @@ fn stage(m: &mut Model, sheet: Sheet) -> bool {
             since: now,
             pictures: 1,
             size: (1920, 1080),
+            stream: StreamInfo::default(),
         }),
         Sheet::StageUnreachable => ClientStage::Ended(
             "The host is offline or has not finished publishing its Tornect ID.".to_owned(),
@@ -670,6 +672,7 @@ fn fill(m: &mut Model) {
         since: now,
         pictures: 0,
         size: (0, 0),
+        stream: StreamInfo::default(),
     });
     m.note("preview: nothing here is real");
     // Nothing to shut down: closing the window quits at once.

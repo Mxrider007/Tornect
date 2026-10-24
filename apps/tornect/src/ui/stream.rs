@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tornect_codec::DecodedFrame;
 use tornect_input::{Button, InputEvent, WHEEL_NOTCH, normalize};
+use tornect_proto::{HostStats, QualityInfo};
 use tornect_session::FrameSink;
 
 use super::model::{ClientStage, Shared, Wake};
@@ -99,14 +100,40 @@ impl FrameSink for SlotSink {
         self.slot.put(frame);
         // The counters change on every picture; the model lock is cheap, and
         // `Wake::Frame` redraws only the stream window.
-        let (pictures, size) = (self.pictures, (frame.width, frame.height));
+        let (pictures, size, timing) = (self.pictures, (frame.width, frame.height), frame.timing);
         self.shared.update_quiet(|m| {
             if let ClientStage::Live(v) = &mut m.client {
                 v.pictures = pictures;
                 v.size = size;
+                v.stream.decode_ms.add_duration(timing.decode);
+                v.stream.convert_ms.add_duration(timing.convert);
             }
         });
         self.shared.wake(Wake::Frame);
+    }
+
+    /// What the host applies, display only: written without a wake, so a
+    /// host cannot make the window redraw (the quality design §5 rule 12);
+    /// the next picture, which follows it, shows it.
+    fn quality(&mut self, width: u32, height: u32, quality: &QualityInfo) {
+        let applied = *quality;
+        self.shared.update_quiet(|m| {
+            if let ClientStage::Live(v) = &mut m.client {
+                v.stream.applied = Some(applied);
+                v.stream.announced = (width, height);
+            }
+        });
+    }
+
+    /// The host's means (at most one call a second, the viewer's
+    /// coalescing), display only and without a wake, as [`Self::quality`].
+    fn host_stats(&mut self, stats: &HostStats) {
+        let stats = *stats;
+        self.shared.update_quiet(|m| {
+            if let ClientStage::Live(v) = &mut m.client {
+                v.stream.host = Some(stats);
+            }
+        });
     }
 }
 
@@ -965,6 +992,129 @@ mod tests {
         let _sink = SlotSink::new(Arc::clone(&slot), shared);
         let mut mine = Picture::default();
         assert!(!slot.take(&mut mine), "the old picture was handed over");
+    }
+
+    /// The quality design §5 rule 12: what the host says of the stream
+    /// (`Quality`, `Stats`) reaches the live session's `StreamInfo` without
+    /// a wake, so a host cannot make the window redraw; each picture's
+    /// decode and conversion times feed the means, and the picture alone
+    /// wakes (the stream window only). Outside a live session nothing is
+    /// written.
+    #[test]
+    fn the_hosts_words_reach_the_model_quietly_and_pictures_feed_the_means() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        use super::super::model::{Model, StreamInfo, Viewing};
+
+        let wakes = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&wakes);
+        let live = Model {
+            client: ClientStage::Live(Viewing {
+                host: "Desk".to_owned(),
+                control: false,
+                administrator: false,
+                unattended: false,
+                since: Instant::now(),
+                pictures: 0,
+                size: (0, 0),
+                stream: StreamInfo::default(),
+            }),
+            ..Model::default()
+        };
+        let shared = Shared::new(live, Arc::new(move |why| seen.lock().unwrap().push(why)));
+        let mut sink = SlotSink::new(Arc::new(FrameSlot::default()), Arc::clone(&shared));
+        let balanced = QualityInfo {
+            preset: 2,
+            max_fps: 15,
+            kbps: 1500,
+            max_long: 1920,
+            max_short: 1080,
+        };
+        let stats = HostStats {
+            source_width: 2560,
+            source_height: 1440,
+            frames: 15,
+            window_ms: 1000,
+            grab_us: 4000,
+            ..HostStats::default()
+        };
+        for _ in 0..100 {
+            sink.quality(1920, 1080, &balanced);
+            sink.host_stats(&stats);
+        }
+        assert!(
+            wakes.lock().unwrap().is_empty(),
+            "no wake for the host's words"
+        );
+        let read = |shared: &Shared| {
+            shared.read(|m| match &m.client {
+                ClientStage::Live(v) => v.stream.clone(),
+                _ => panic!("not live"),
+            })
+        };
+        let info = read(&shared);
+        assert_eq!(info.applied, Some(balanced));
+        assert_eq!(info.announced, (1920, 1080));
+        assert_eq!(info.host, Some(stats));
+        assert_eq!(info.decode_ms.ms(), None, "no picture yet");
+        let ms = Duration::from_millis;
+        let mut frame = |decode, convert| {
+            sink.picture(
+                1,
+                &DecodedFrame {
+                    width: 2,
+                    height: 2,
+                    rgba: vec![0; 16],
+                    timing: DecodeTiming {
+                        decode: ms(decode),
+                        convert: ms(convert),
+                    },
+                },
+            );
+        };
+        frame(10, 4);
+        frame(20, 4);
+        let info = read(&shared);
+        // 10, then 10 + 0.2 · (20 − 10).
+        assert!((info.decode_ms.ms().unwrap() - 12.0).abs() < 1e-9);
+        assert!((info.convert_ms.ms().unwrap() - 4.0).abs() < 1e-9);
+        assert_eq!(*wakes.lock().unwrap(), vec![Wake::Frame, Wake::Frame]);
+        // No live session: nothing is written.
+        let counted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&counted);
+        let idle = Shared::new(
+            Model::default(),
+            Arc::new(move |_| {
+                count.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        let mut sink = SlotSink::new(Arc::new(FrameSlot::default()), Arc::clone(&idle));
+        sink.quality(1920, 1080, &balanced);
+        sink.host_stats(&stats);
+        assert!(idle.read(|m| matches!(m.client, ClientStage::Idle)));
+        assert_eq!(counted.load(Ordering::Relaxed), 0);
+    }
+
+    /// The means weigh each new sample 0.2, start at the first sample, and
+    /// ignore what is no time.
+    #[test]
+    fn a_mean_weighs_each_new_sample_a_fifth() {
+        use super::super::model::Ewma;
+        let mut e = Ewma::default();
+        assert_eq!(e.ms(), None);
+        assert_eq!(e.micros(), None);
+        e.add(5.0);
+        assert_eq!(e.ms(), Some(5.0));
+        e.add(10.0);
+        assert!((e.ms().unwrap() - 6.0).abs() < 1e-9);
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            e.add(bad);
+            assert!((e.ms().unwrap() - 6.0).abs() < 1e-9, "{bad}");
+        }
+        assert_eq!(e.micros(), Some(6000));
+        e.add_duration(std::time::Duration::from_micros(16_000));
+        assert_eq!(e.micros(), Some(8000));
     }
 
     /// The picture keeps its aspect inside the window, centred.

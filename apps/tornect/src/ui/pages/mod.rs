@@ -1971,7 +1971,7 @@ mod tests {
     /// the withheld level, naming the computer only while not shared.
     #[test]
     fn the_unattended_stepper_and_badge() {
-        use super::super::model::{ClientStage, Dial, UaLive, Viewing};
+        use super::super::model::{ClientStage, Dial, StreamInfo, UaLive, Viewing};
         let mut model = with_book(false);
         let id = office(&model);
         model.dial = Dial {
@@ -1999,6 +1999,7 @@ mod tests {
             since: Instant::now(),
             pictures: 0,
             size: (0, 0),
+            stream: StreamInfo::default(),
         });
         model.ua_live = Some(UaLive {
             withheld: true,
@@ -2512,7 +2513,7 @@ mod tests {
     /// screen is shared, nor a host's name.
     #[test]
     fn the_connect_stepper_says_where_it_is_and_why_it_stopped() {
-        use super::super::model::{ClientStage, Dial, Failure, Viewing};
+        use super::super::model::{ClientStage, Dial, Failure, StreamInfo, Viewing};
         let id = TornectId::from_bytes([0x42; 32]);
         let dial = |failed| Dial {
             id: Some(id),
@@ -2560,6 +2561,7 @@ mod tests {
             since: Instant::now(),
             pictures: 1,
             size: (1280, 720),
+            stream: StreamInfo::default(),
         });
         live.dial = dial(None);
         let window = Window::new(live.clone(), Page::Home, egui::Theme::Dark, WIDE);
