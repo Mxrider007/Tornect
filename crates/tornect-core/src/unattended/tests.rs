@@ -1435,6 +1435,7 @@ fn b13_a_store_that_failed_closed_checks_the_links_of_a_log_across_key_epochs() 
         store.status()
     );
     assert!(store.log().has_log_key(), "K_master can be read");
+    assert!(store.take_found_log().is_none(), "no store was decoded");
     let report = store.verify_log().unwrap();
     assert_eq!(report.status, ChainStatus::MissingHead, "{report:?}");
     assert_eq!(report.previous_epoch_lines, 0, "no tag was looked at");
@@ -1448,6 +1449,64 @@ fn b13_a_store_that_failed_closed_checks_the_links_of_a_log_across_key_epochs() 
         matches!(&report.status, ChainStatus::Broken { reason, .. } if reason.contains("prev")),
         "{report:?}"
     );
+}
+
+/// B13 review: the host load verifies the log against the head it decoded before it
+/// appends its first line. A tail cut while no host ran, the stored head with it, is
+/// found there, although the load's own line (an abandoned charge settled) links to the
+/// cut tail and becomes the head, after which the chain reads whole again.
+#[test]
+fn b13_the_host_load_judges_the_log_before_its_own_lines() {
+    let env = Env::new();
+    let store = env.open();
+    assert!(store.take_found_log().is_none(), "no store to decode yet");
+    let d = dev(1);
+    drop(enable(&env, &store, d, Preset::MyMachines));
+    drop(store);
+    let store = env.open();
+    let found = store.take_found_log();
+    assert!(
+        matches!(&found, Some(Ok(r)) if r.status == ChainStatus::Valid),
+        "{found:?}"
+    );
+    assert!(store.take_found_log().is_none(), "taken once");
+    let lim = AttemptLimiter::new(store.clone());
+    lim.charge(&d).unwrap();
+    let head = store.read(UnattendedStore::chain_head).unwrap().unwrap();
+    drop((lim, store)); // kill -9 before the settle
+
+    // The tail is cut, the line the stored head names with it.
+    let text = std::fs::read_to_string(env.paths.sessions_log()).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        crate::session_log::line_hash(lines.last().unwrap().as_bytes()),
+        head,
+        "the head is the last line"
+    );
+    let cut = lines[..lines.len() - 1].join("\n") + "\n";
+    std::fs::write(env.paths.sessions_log(), cut).unwrap();
+
+    let store = env.open();
+    assert!(
+        env.has_event(SessionEvent::UnattendedAuthFailed),
+        "the load's own line"
+    );
+    match store.take_found_log() {
+        Some(Ok(crate::session_log::ChainReport {
+            status: ChainStatus::Broken { reason, .. },
+            ..
+        })) => assert!(reason.contains("stored head matches no line"), "{reason}"),
+        other => panic!("the cut tail was not found: {other:?}"),
+    }
+    assert_eq!(
+        store.verify_log().unwrap().status,
+        ChainStatus::Valid,
+        "what the load's line hides from a later walk"
+    );
+
+    // An offline load appends nothing at load and judges nothing.
+    drop(store);
+    assert!(env.open_offline().take_found_log().is_none());
 }
 
 use std::io::Write as _;

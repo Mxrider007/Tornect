@@ -165,6 +165,13 @@ pub(crate) struct State {
     /// Records dropped after `pending_log` hit `MAX_PENDING_LOG`; reported on flush so
     /// the gap is visible in the log rather than silent.
     pending_log_dropped: u32,
+    /// The §B.8.13 verifier's verdict on `sessions.log` as the last host load found it,
+    /// against the head and key epoch it decoded and before any line that load
+    /// appended (a buffered record, an abandoned charge, a machine-id change, a clock
+    /// anomaly): each such line links to the file's tail and becomes the head, so a
+    /// tail cut while no host ran would otherwise read as a valid chain. Taken once by
+    /// [`GrantStore::take_found_log`].
+    found_log: Option<Result<ChainReport, StoreError>>,
 }
 
 /// Cap on `State::pending_log`: a locked keychain must not grow memory without bound.
@@ -327,6 +334,7 @@ impl GrantStore {
                 anomaly_pending: 0,
                 pending_log: Vec::new(),
                 pending_log_dropped: 0,
+                found_log: None,
             }),
             #[cfg(test)]
             fail_next_write: Mutex::new(None),
@@ -639,6 +647,18 @@ impl GrantStore {
             }
             Ok(Some((master, generation, mut store))) => {
                 self.inner.log.set_log_key(Some(master.k_log()));
+                if st.mode == LoadMode::Host {
+                    // The log as this load found it, before the first line it appends.
+                    st.found_log = Some(
+                        self.inner
+                            .log
+                            .verify_chain(
+                                store.chain_head().as_ref(),
+                                store.log_chain_epoch.as_ref(),
+                            )
+                            .map_err(StoreError::from),
+                    );
+                }
                 // The keystore_locked -> readable recovery load (§B.8.9): everything
                 // buffered while the key was unreadable is appended tagged, before any
                 // record this load produces, preserving log order.
@@ -1333,6 +1353,15 @@ impl GrantStore {
             }
         }
         Ok(report)
+    }
+
+    /// The verifier's verdict on `sessions.log` as the last host load found it, before
+    /// any line that load appended (`None` once taken, and for an offline load or one
+    /// that decoded no store). A host's start reports a break found there even when
+    /// [`Self::verify_log`] now finds the chain whole again: a line the load appended
+    /// links to the file's tail as it found it, a cut tail included.
+    pub fn take_found_log(&self) -> Option<Result<ChainReport, StoreError>> {
+        self.inner.state.lock().found_log.take()
     }
 
     // ----------------------------------------------------------------- clock anomalies

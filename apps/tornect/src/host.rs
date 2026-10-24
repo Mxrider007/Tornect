@@ -464,8 +464,9 @@ fn reprobe_readiness(
 /// `sessions.log` verifier (§B.8.13), whose verdict is the readiness row
 /// "Session log intact", then the housekeeping (a `GrantExpired` line for each
 /// grant that expired since, auth records pruned 30 days after expiry,
-/// §B.8.6.1). The verifier goes first, so it judges the log as the host found
-/// it.
+/// §B.8.6.1). The verdict is on the log as the host found it: a break the
+/// store's load found before the lines it appended itself ([`check_log`]),
+/// else the verifier's walk, which runs before the housekeeping's lines.
 fn start_upkeep(
     store: &tornect_core::unattended::store::GrantStore,
 ) -> tornect_core::unattended::readiness::Probe {
@@ -500,12 +501,23 @@ fn periodic_upkeep(
 }
 
 /// The verifier's verdict on `sessions.log`, as its readiness row; anything
-/// but a valid chain is also said on stderr.
+/// but a valid chain is also said on stderr. A break that the store's last
+/// load found, before the first line it appended (an abandoned charge
+/// settled, a machine-id change, a clock anomaly, the lines held while the
+/// keystore was locked), is the verdict: each such line links to the file's
+/// tail as the load found it, so a tail cut while no host ran would read as
+/// a whole chain afterwards. Otherwise the verifier walks the log now, which
+/// also accepts the validly tagged lines beyond the stored head.
 fn check_log(
     store: &tornect_core::unattended::store::GrantStore,
 ) -> tornect_core::unattended::readiness::Probe {
+    use tornect_core::session_log::ChainStatus;
     use tornect_core::unattended::readiness::{Probe, session_log_row};
-    let row = session_log_row(&store.verify_log(), &store.status());
+    let verdict = match store.take_found_log() {
+        Some(Ok(found)) if matches!(found.status, ChainStatus::Broken { .. }) => Ok(found),
+        _ => store.verify_log(),
+    };
+    let row = session_log_row(&verdict, &store.status());
     if let Probe::Fail(why) | Probe::Warn(why) = &row {
         tracing::warn!(%why, "sessions.log");
         eprintln!("warning: sessions.log: {why}");
@@ -3465,6 +3477,51 @@ mod tests {
         for line in mine {
             let chain = tornect_core::session_log::parse_line_chain(line).unwrap();
             assert!(chain.tag.is_some(), "{line}");
+        }
+    }
+
+    /// B13 review: a start reports a tail cut while no host ran, the stored head
+    /// with it, although the store's load appends a line first (the outcome of a
+    /// charge that a killed host left pending): that line links to the cut tail
+    /// and becomes the head, after which a walk of the log finds it whole. The
+    /// verdict is the load's own, taken before its first line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_tail_is_reported_although_the_load_appends_first() {
+        use tornect_core::session_log::SessionEvent;
+        use tornect_core::unattended::readiness::Probe;
+
+        let env = env();
+        let device = DeviceId::from_bytes([3; 32]);
+        grant_unattended(&env, &device, "quiet verdant otter");
+        let wiring = start_host(&env);
+        assert_eq!(
+            wiring.ctx.as_ref().unwrap().readiness.get().session_log,
+            Probe::Ok
+        );
+        drop(wiring);
+        // A host killed between a charge and its settlement.
+        edit_grant_on_disk(&env.paths, &device, |g| g.fail.pending = true);
+        let text = std::fs::read_to_string(env.paths.sessions_log()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        std::fs::write(
+            env.paths.sessions_log(),
+            lines[..lines.len() - 1].join("\n") + "\n",
+        )
+        .unwrap();
+
+        let wiring = start_host(&env);
+        let settled = SessionLog::new(env.paths.sessions_log())
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .any(|r| {
+                r.event == SessionEvent::UnattendedAuthFailed
+                    && r.reason.as_deref() == Some("abandoned")
+            });
+        assert!(settled, "the load appended its line");
+        match wiring.ctx.as_ref().unwrap().readiness.get().session_log {
+            Probe::Fail(why) => assert!(why.contains("stored head matches no line"), "{why}"),
+            other => panic!("the cut tail read {other:?}"),
         }
     }
 
