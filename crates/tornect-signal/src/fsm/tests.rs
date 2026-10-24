@@ -8925,3 +8925,413 @@ fn the_notice_is_forgotten_when_the_session_ends() {
     live.set_notice(&id, 1);
     assert_eq!(live.notice(&id), None, "ended");
 }
+
+/// A pairing or session card held open until the test answers it (Allow),
+/// saying when it opened and counting the cards taken down unanswered.
+#[derive(Default)]
+struct HeldCard {
+    opened: Arc<tokio::sync::Notify>,
+    answer: Arc<tokio::sync::Notify>,
+    withdrawn: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// One card on screen, counted as withdrawn when it goes unanswered (its
+/// future dropped).
+struct CardOnScreen {
+    withdrawn: Arc<std::sync::atomic::AtomicUsize>,
+    answered: bool,
+}
+
+impl Drop for CardOnScreen {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.withdrawn.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl HeldCard {
+    async fn held(&self) {
+        let mut card = CardOnScreen {
+            withdrawn: Arc::clone(&self.withdrawn),
+            answered: false,
+        };
+        self.opened.notify_one();
+        self.answer.notified().await;
+        card.answered = true;
+    }
+}
+
+impl crate::pairing::Consent for HeldCard {
+    fn pairing<'a>(
+        &'a self,
+        _: &'a crate::pairing::PairingPeer,
+        _: &'a str,
+    ) -> BoxFuture<'a, PairDecision> {
+        Box::pin(async move {
+            self.held().await;
+            PairDecision::Accept { label: None }
+        })
+    }
+
+    fn session<'a>(
+        &'a self,
+        _: &'a crate::pairing::TrustedPeer,
+        _: &'a crate::pairing::SessionRequestSummary,
+    ) -> BoxFuture<'a, SessionDecision> {
+        Box::pin(async move {
+            self.held().await;
+            SessionDecision::AllowOnce
+        })
+    }
+}
+
+/// Awaits the host task of a requester that left, bounded: the host used to
+/// keep the card up for the whole 60 s popup timeout.
+async fn host_noticed(
+    task: tokio::task::JoinHandle<Result<HostOutcome, HandshakeError>>,
+) -> Result<HostOutcome, HandshakeError> {
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the host noticed that the requester left")
+        .unwrap()
+}
+
+/// B04: a requester that leaves (Cancel, a dropped circuit) while its pairing
+/// card is open takes the card down at once. An Allow given after it can no
+/// longer pin the departed device; the leave is logged and does not count
+/// toward the temp-ban; the device's next request opens a new card instead of
+/// `IN_FLIGHT`.
+#[tokio::test]
+async fn a_requester_that_leaves_takes_its_pairing_card_down() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let card = Arc::new(HeldCard::default());
+    host.deps.consent = card.clone();
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    let device = DeviceIdentity::from_seed(&CLIENT_SEED).id();
+
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    raw.chan.send(&raw_pair_request(), None).await.unwrap();
+    card.opened.notified().await;
+    // The requester leaves; the owner clicks Allow right after.
+    drop(raw);
+    card.answer.notify_one();
+    let outcome = host_noticed(task).await;
+    assert!(
+        matches!(outcome, Err(HandshakeError::Closed)),
+        "{outcome:?}"
+    );
+    assert_eq!(card.withdrawn.load(Ordering::SeqCst), 1, "the card went");
+    assert!(host.trusted.get(&device).is_none(), "nothing was pinned");
+    assert_eq!(host.trusted.banned_until(&device), None);
+    {
+        let events = audit.0.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AuditEvent::RequesterLeft {
+                    device: d,
+                    label: None,
+                    popup: SuppressedPopup::Pairing,
+                } if *d == device
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                AuditEvent::PairAccepted { .. } | AuditEvent::PairRejected { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    // The in-flight slot went with the card.
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    raw.chan.send(&raw_pair_request(), None).await.unwrap();
+    card.opened.notified().await;
+    card.answer.notify_one();
+    let answer = raw.recv().await.unwrap();
+    assert_eq!(answer.env.kind, Kind::PairAccept);
+    assert!(host.trusted.get(&device).is_some());
+    drop(raw);
+    let _ = task.await;
+}
+
+/// B04: the same for the attended session card. An Allow given after the
+/// requester left used to accept into the dead stream and start sharing
+/// (`on_start`) for a session with no viewer.
+#[tokio::test]
+async fn a_requester_that_leaves_takes_its_session_card_down() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let card = Arc::new(HeldCard::default());
+    host.deps.consent = card.clone();
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    let sink = Arc::new(CountingSink::default());
+    host.deps.sessions = sink.clone();
+    host.deps.activity = sink.live.clone();
+    let device = DeviceIdentity::from_seed(&CLIENT_SEED).id();
+    host.trusted.pin(device, "Paired").unwrap();
+
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    let request = SessionRequest {
+        caps: Caps::default(),
+        unattended: None,
+    };
+    raw.chan.send(&request, Some(&raw.identity)).await.unwrap();
+    card.opened.notified().await;
+    drop(raw);
+    card.answer.notify_one();
+    let outcome = host_noticed(task).await;
+    assert!(
+        matches!(outcome, Err(HandshakeError::Closed)),
+        "{outcome:?}"
+    );
+    assert_eq!(card.withdrawn.load(Ordering::SeqCst), 1, "the card went");
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0, "no on_start");
+    {
+        let events = audit.0.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AuditEvent::RequesterLeft {
+                    device: d,
+                    label: Some(label),
+                    popup: SuppressedPopup::Session,
+                } if *d == device && label == "Paired"
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                AuditEvent::SessionStarted { .. } | AuditEvent::SessionDenied { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    // The per-device popup slot went with the card: a new card, not BUSY.
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    let asked = tokio::spawn(async move {
+        let answer = raw.request_session().await;
+        (raw, answer)
+    });
+    card.opened.notified().await;
+    card.answer.notify_one();
+    let (mut raw, answer) = asked.await.unwrap();
+    assert_eq!(answer.env.kind, Kind::SessionAccept);
+    raw.chan.absorb(&answer);
+    raw.chan.bye(bye::USER).await.unwrap();
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        HostOutcome::Session { .. }
+    ));
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 1);
+}
+
+/// B04: the requester owes silence while a card waits for the owner (strict
+/// alternation, §B.3), but what it sends anyway is not lost to the watch for
+/// its leaving: the bytes the watch read are handed to the next read, which
+/// judges them as before. Here a `PING` split across the watch arrives whole
+/// once the session is up and is answered.
+#[tokio::test]
+async fn bytes_the_requester_sends_during_the_card_reach_the_next_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let card = Arc::new(HeldCard::default());
+    host.deps.consent = card.clone();
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    let request = SessionRequest {
+        caps: Caps::default(),
+        unattended: None,
+    };
+    raw.chan.send(&request, Some(&raw.identity)).await.unwrap();
+    card.opened.notified().await;
+    let ping = Envelope::new(
+        raw.chan.version(),
+        raw.chan.next_tx_id(),
+        Kind::Ping,
+        encode_body(&Ping { nonce: 7 }),
+    )
+    .encode();
+    let mut frame = u32::try_from(ping.len()).unwrap().to_be_bytes().to_vec();
+    frame.extend_from_slice(&ping);
+    let mut stream = raw.chan.into_stream();
+    // Half the frame while the card is up, read by the watch...
+    stream.write_all(&frame[..3]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // ...the rest just before the owner answers.
+    stream.write_all(&frame[3..]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    card.answer.notify_one();
+    let mut kinds = Vec::new();
+    loop {
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::framing::read_frame(&mut stream),
+        )
+        .await
+        .expect("the host answers");
+        let Ok(Some(payload)) = read else { break };
+        let env = Envelope::decode(&payload).unwrap();
+        kinds.push(env.kind);
+        if env.kind == Kind::Pong {
+            let pong: Pong = decode_body(&env.body).unwrap();
+            assert_eq!(pong.nonce, 7, "the early PING arrived whole");
+            break;
+        }
+    }
+    assert_eq!(kinds, vec![Kind::SessionAccept, Kind::Pong]);
+    assert_eq!(
+        card.withdrawn.load(Ordering::SeqCst),
+        0,
+        "answered, not withdrawn"
+    );
+    drop(stream);
+    let _ = task.await;
+}
+
+/// A block window held open until it is taken down, saying when it opened.
+#[derive(Default)]
+struct HeldWindow {
+    opened: Arc<tokio::sync::Notify>,
+    withdrawn: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::consent::BlockWindow for HeldWindow {
+    fn run<'a>(
+        &'a self,
+        _: u8,
+        _: &'a tornect_core::unattended::grant::GrantId,
+        _: &'a str,
+    ) -> BoxFuture<'a, BlockOutcome> {
+        Box::pin(async move {
+            // Never answered: only a drop ends it.
+            let _shown = CardOnScreen {
+                withdrawn: Arc::clone(&self.withdrawn),
+                answered: false,
+            };
+            self.opened.notify_one();
+            std::future::pending().await
+        })
+    }
+}
+
+/// B04, end to end: the real client's unattended request through the real
+/// hook, and the requester leaving (its task gone, its stream with it) while
+/// the block window is up. The host's channel notices at once, the window is
+/// taken down, and nothing is accepted into the dead stream; the window used
+/// to run its course and the accept go out to nobody.
+#[tokio::test]
+async fn an_unattended_requester_that_leaves_takes_the_block_window_down() {
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client) = unattended_pair(tmp.path(), PW);
+    let window = Arc::new(HeldWindow::default());
+    host.deps.block_window = window.clone();
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    let sink = Arc::new(CountingSink::default());
+    host.deps.sessions = sink.clone();
+    host.deps.activity = sink.live.clone();
+    let device = client.identity.id();
+
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let dialing = tokio::spawn(async move {
+        connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            unattended_intent(PW, messages::mode::CONTROL, false),
+        )
+        .await
+    });
+    window.opened.notified().await;
+    dialing.abort();
+    let outcome = host_noticed(task).await;
+    assert!(
+        matches!(outcome, Err(HandshakeError::Closed)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        window.withdrawn.load(Ordering::SeqCst),
+        1,
+        "the window went"
+    );
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0, "no on_start");
+    let events = audit.0.lock().unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AuditEvent::RequesterLeft {
+                device: d,
+                label: Some(label),
+                popup: SuppressedPopup::Session,
+            } if *d == device && label == "Laptop of Ana"
+        )),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AuditEvent::SessionStarted { .. })),
+        "{events:?}"
+    );
+}
+
+/// B04: a requester that left is logged as the refusal of what it asked for,
+/// with the fixed detail `REQUESTER_LEFT` (no wire code was sent): a pairing
+/// request's line carries the device only, a session request's the pinned
+/// label too.
+#[test]
+fn a_requester_that_left_is_logged_as_a_refusal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let audit = HostAudit::new(Arc::new(SessionLog::new(tmp.path().join("sessions.log"))));
+    let device = DeviceId::from_bytes([3u8; 32]);
+    audit.record(AuditEvent::RequesterLeft {
+        device,
+        label: None,
+        popup: SuppressedPopup::Pairing,
+    });
+    audit.record(AuditEvent::RequesterLeft {
+        device,
+        label: Some("Paired".into()),
+        popup: SuppressedPopup::Session,
+    });
+    let records = audit.log().read_all().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].event, LogEvent::PairRejected);
+    assert_eq!(records[0].peer_device, Some(device));
+    assert_eq!(records[0].peer_name, None);
+    assert_eq!(records[0].detail.as_deref(), Some(REQUESTER_LEFT));
+    assert_eq!(records[1].event, LogEvent::SessionDenied);
+    assert_eq!(records[1].peer_device, Some(device));
+    assert_eq!(records[1].peer_name.as_deref(), Some("Paired"));
+    assert_eq!(records[1].detail.as_deref(), Some(REQUESTER_LEFT));
+}
