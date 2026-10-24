@@ -9061,9 +9061,12 @@ async fn a_requester_that_leaves_takes_its_pairing_card_down() {
     card.answer.notify_one();
     let answer = raw.recv().await.unwrap();
     assert_eq!(answer.env.kind, Kind::PairAccept);
-    assert!(host.trusted.get(&device).is_some());
     drop(raw);
-    let _ = task.await;
+    assert!(matches!(
+        host_noticed(task).await,
+        Ok(HostOutcome::PairedOnly { .. })
+    ));
+    assert!(host.trusted.get(&device).is_some());
 }
 
 /// B04: the same for the attended session card. An Allow given after the
@@ -9334,4 +9337,338 @@ fn a_requester_that_left_is_logged_as_a_refusal() {
     assert_eq!(records[1].peer_device, Some(device));
     assert_eq!(records[1].peer_name.as_deref(), Some("Paired"));
     assert_eq!(records[1].detail.as_deref(), Some(REQUESTER_LEFT));
+}
+
+/// A host stream whose writes fail once `broken` is set (the requester's
+/// circuit collapsed while the host decided); reads go on as before.
+struct BreakableWrites {
+    inner: DuplexStream,
+    broken: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BreakableWrites {
+    fn check(&self) -> std::io::Result<()> {
+        if self.broken.load(Ordering::SeqCst) {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl AsyncRead for BreakableWrites {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for BreakableWrites {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if let Err(e) = this.check() {
+            return std::task::Poll::Ready(Err(e));
+        }
+        std::pin::Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if let Err(e) = this.check() {
+            return std::task::Poll::Ready(Err(e));
+        }
+        std::pin::Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Answers every card as told, breaking the host's writes first: the
+/// requester's stream dies between the owner's answer and the host's reply.
+struct BreaksThenAnswers {
+    broken: Arc<std::sync::atomic::AtomicBool>,
+    pair: PairDecision,
+    session: SessionDecision,
+}
+
+impl crate::pairing::Consent for BreaksThenAnswers {
+    fn pairing<'a>(
+        &'a self,
+        _: &'a crate::pairing::PairingPeer,
+        _: &'a str,
+    ) -> BoxFuture<'a, PairDecision> {
+        Box::pin(async move {
+            self.broken.store(true, Ordering::SeqCst);
+            self.pair.clone()
+        })
+    }
+
+    fn session<'a>(
+        &'a self,
+        _: &'a crate::pairing::TrustedPeer,
+        _: &'a crate::pairing::SessionRequestSummary,
+    ) -> BoxFuture<'a, SessionDecision> {
+        Box::pin(async move {
+            self.broken.store(true, Ordering::SeqCst);
+            self.session
+        })
+    }
+}
+
+/// Refuses every unattended request, breaking the host's writes first.
+struct BreaksThenRejects(Arc<std::sync::atomic::AtomicBool>);
+
+impl UnattendedHook for BreaksThenRejects {
+    fn reserved<'a>(
+        &'a self,
+        _: &'a DeviceId,
+        proof: ConsentProof,
+    ) -> BoxFuture<'a, Result<ConsentProof, messages::SessionReject>> {
+        Box::pin(async move { Ok(proof) })
+    }
+
+    fn handle<'a>(
+        &'a self,
+        _: UnattendedContext<'a>,
+    ) -> BoxFuture<'a, Result<UnattendedVerdict, HandshakeError>> {
+        Box::pin(async move {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(UnattendedVerdict::Reject(messages::SessionReject::new(
+                reject::NOT_GRANTED,
+            )))
+        })
+    }
+}
+
+/// A host on `side` whose writes break when `broken` is set, with every
+/// audit event recorded; and the client's end of the pipe.
+fn breakable_host(
+    side: &HostSide,
+    broken: &Arc<std::sync::atomic::AtomicBool>,
+) -> (
+    tokio::task::JoinHandle<Result<HostOutcome, HandshakeError>>,
+    DuplexStream,
+) {
+    let (a, b) = pipe();
+    let stream = BreakableWrites {
+        inner: a,
+        broken: Arc::clone(broken),
+    };
+    let cfg = side.cfg.clone();
+    let deps = side.deps.clone();
+    (
+        tokio::spawn(async move { serve_host(stream, &cfg, &deps).await }),
+        b,
+    )
+}
+
+/// B11: an owner's Allow whose `PAIR_ACCEPT` cannot be written (the
+/// requester's circuit collapsed between the card and the answer) pins
+/// nothing, and the requester's leaving is logged. The device used to be
+/// pinned first and the write's error then skipped `PairAccepted`: the
+/// trusted list had a device that `sessions.log` never said was paired.
+#[tokio::test]
+async fn a_pairing_accept_that_cannot_be_written_pins_nothing_and_is_logged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    host.deps.consent = Arc::new(BreaksThenAnswers {
+        broken: Arc::clone(&broken),
+        pair: PairDecision::Accept { label: None },
+        session: SessionDecision::Deny,
+    });
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    let device = DeviceIdentity::from_seed(&CLIENT_SEED).id();
+
+    let (task, b) = breakable_host(&host, &broken);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    raw.chan.send(&raw_pair_request(), None).await.unwrap();
+    let outcome = host_noticed(task).await;
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert!(
+        host.trusted.get(&device).is_none(),
+        "a device never told it was paired is not pinned"
+    );
+    let events = audit.0.lock().unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AuditEvent::RequesterLeft {
+                device: d,
+                label: None,
+                popup: SuppressedPopup::Pairing,
+            } if *d == device
+        )),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AuditEvent::PairAccepted { .. })),
+        "{events:?}"
+    );
+}
+
+/// B11: a refusal is logged even when it cannot be written: the owner's Deny
+/// of a pairing and of a session, and an unattended reject. Each line used
+/// to be written only after a successful send, so a requester that had gone
+/// left `PairRequested` or `SessionRequested` with no decision after it.
+#[tokio::test]
+async fn a_refusal_that_cannot_be_written_is_still_logged() {
+    let device = DeviceIdentity::from_seed(&CLIENT_SEED).id();
+    let session_request = SessionRequest {
+        caps: Caps::default(),
+        unattended: None,
+    };
+
+    // The pairing card's Deny.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    host.deps.consent = Arc::new(BreaksThenAnswers {
+        broken: Arc::clone(&broken),
+        pair: PairDecision::Reject,
+        session: SessionDecision::Deny,
+    });
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    let (task, b) = breakable_host(&host, &broken);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    raw.chan.send(&raw_pair_request(), None).await.unwrap();
+    let outcome = host_noticed(task).await;
+    assert!(outcome.is_err(), "pairing: {outcome:?}");
+    assert!(
+        audit.0.lock().unwrap().iter().any(|e| matches!(
+            e,
+            AuditEvent::PairRejected { device: d, reason: pair_reject::DENIED, .. } if *d == device
+        )),
+        "pairing: {:?}",
+        audit.0.lock().unwrap()
+    );
+    drop(raw);
+
+    // The session card's Deny.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    host.trusted.pin(device, "Paired").unwrap();
+    let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    host.deps.consent = Arc::new(BreaksThenAnswers {
+        broken: Arc::clone(&broken),
+        pair: PairDecision::Reject,
+        session: SessionDecision::Deny,
+    });
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    let (task, b) = breakable_host(&host, &broken);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    raw.chan
+        .send(&session_request, Some(&raw.identity))
+        .await
+        .unwrap();
+    let outcome = host_noticed(task).await;
+    assert!(outcome.is_err(), "session: {outcome:?}");
+    assert!(
+        audit.0.lock().unwrap().iter().any(|e| matches!(
+            e,
+            AuditEvent::SessionDenied { device: d, label, reason: reject::DENIED }
+                if *d == device && label == "Paired"
+        )),
+        "session: {:?}",
+        audit.0.lock().unwrap()
+    );
+    drop(raw);
+
+    // An unattended reject.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    host.trusted.pin(device, "Paired").unwrap();
+    let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    host.deps.unattended = Arc::new(BreaksThenRejects(Arc::clone(&broken)));
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    let (task, b) = breakable_host(&host, &broken);
+    let _raw = raw_unattended_request(&host, CLIENT_SEED, b).await;
+    let outcome = host_noticed(task).await;
+    assert!(outcome.is_err(), "unattended: {outcome:?}");
+    assert!(
+        audit.0.lock().unwrap().iter().any(|e| matches!(
+            e,
+            AuditEvent::SessionDenied { device: d, label, reason: reject::NOT_GRANTED }
+                if *d == device && label == "Paired"
+        )),
+        "unattended: {:?}",
+        audit.0.lock().unwrap()
+    );
+}
+
+/// B11: an Allow whose `SESSION_ACCEPT` cannot be written starts nothing,
+/// and the requester's leaving is logged; nothing used to follow
+/// `SessionRequested` in the log.
+#[tokio::test]
+async fn a_session_accept_that_cannot_be_written_starts_nothing_and_is_logged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let device = DeviceIdentity::from_seed(&CLIENT_SEED).id();
+    host.trusted.pin(device, "Paired").unwrap();
+    let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    host.deps.consent = Arc::new(BreaksThenAnswers {
+        broken: Arc::clone(&broken),
+        pair: PairDecision::Reject,
+        session: SessionDecision::AllowOnce,
+    });
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    let sink = Arc::new(CountingSink::default());
+    host.deps.sessions = sink.clone();
+    host.deps.activity = sink.live.clone();
+
+    let (task, b) = breakable_host(&host, &broken);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    let request = SessionRequest {
+        caps: Caps::default(),
+        unattended: None,
+    };
+    raw.chan.send(&request, Some(&raw.identity)).await.unwrap();
+    let outcome = host_noticed(task).await;
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert_eq!(sink.starts.load(Ordering::SeqCst), 0, "no on_start");
+    assert!(!sink.live.session_live(), "nothing reserved or live");
+    let events = audit.0.lock().unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AuditEvent::RequesterLeft {
+                device: d,
+                label: Some(label),
+                popup: SuppressedPopup::Session,
+            } if *d == device && label == "Paired"
+        )),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AuditEvent::SessionStarted { .. })),
+        "{events:?}"
+    );
 }

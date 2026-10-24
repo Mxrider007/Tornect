@@ -354,7 +354,7 @@ pub enum AuditEvent {
         /// The pinned label for a session request; none for a pairing request
         /// (a declared name is never logged).
         label: Option<String>,
-        /// Which card it was waiting on.
+        /// Which card it was waiting on: what it asked for.
         popup: SuppressedPopup,
     },
     /// A consent popup was not shown because a remote session is live

@@ -1252,16 +1252,17 @@ where
                 let reason = reject.reason;
                 // §B.8.4.5 `AwaitKe3`: the reject goes out only if the stream
                 // is still alive (a violation already answered `ERROR` and
-                // closed); it is logged either way.
-                if !chan.is_closing() {
-                    chan.send(&reject, None).await?;
-                    chan.close().await;
-                }
+                // closed); it is logged either way, also when it cannot be
+                // written (B11), so logged first.
                 deps.audit.record(AuditEvent::SessionDenied {
                     device,
                     label: label.clone(),
                     reason,
                 });
+                if !chan.is_closing() {
+                    chan.send(&reject, None).await?;
+                    chan.close().await;
+                }
                 return Ok(HostOutcome::SessionRejected {
                     device,
                     label,
@@ -1546,7 +1547,18 @@ where
     let elevation = Level::new(mode, accept.elevation()).elevation();
     // At the level, a lowering of the grant since the reservation ends it too (D6).
     kill.at_the_level(elevation == Elevation::Admin);
-    chan.send(&accept, Some(&*deps.signer)).await?;
+    // An accept that cannot be written starts nothing (B11): the requester
+    // left between the decision and the answer, and that is logged; the
+    // reservation and any helper go with this return.
+    if let Err(e) = chan.send(&accept, Some(&*deps.signer)).await {
+        return Err(requester_left(
+            deps,
+            device,
+            Some(&label),
+            SuppressedPopup::Session,
+            e,
+        ));
+    }
     deps.stats.accepted_total.fetch_add(1, Ordering::SeqCst);
     deps.audit.record(AuditEvent::SessionStarted {
         device,
@@ -1737,8 +1749,9 @@ fn without_elevation(proof: ConsentProof) -> ConsentProof {
     }
 }
 
-/// The requester of `device` left while its request waited on `popup` (B04):
-/// logged ([`AuditEvent::RequesterLeft`]), and `gone` is what ends the stream.
+/// The requester of `device` left while its request waited on `popup` (B04),
+/// or before the accept could be written (B11): logged
+/// ([`AuditEvent::RequesterLeft`]), and `gone` is what ends the stream.
 fn requester_left(
     deps: &HostDeps,
     device: DeviceId,
@@ -1776,13 +1789,15 @@ async fn reject_session<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    chan.send(&SessionReject::new(reason), None).await?;
-    chan.close().await;
+    // Logged before it is answered (B11): a requester whose stream broke
+    // cannot take the host's decision out of the log by failing the write.
     deps.audit.record(AuditEvent::SessionDenied {
         device: peer.device,
         label: peer.label.clone(),
         reason,
     });
+    chan.send(&SessionReject::new(reason), None).await?;
+    chan.close().await;
     Ok(HostOutcome::SessionRejected {
         device: peer.device,
         label: peer.label.clone(),
@@ -1827,18 +1842,19 @@ where
     chan.absorb(rx);
     let sas = crate::pairing::Sas::derive(sas.th_hello_ack, &request.sas_nonce);
 
-    let refuse = |reason: u16| -> Result<Result<String, u16>, HandshakeError> {
+    // Logged before it is answered (B11): a requester whose stream broke
+    // cannot take the host's decision out of the log by failing the write.
+    let refuse = |reason: u16| -> u16 {
         deps.audit.record(AuditEvent::PairRejected {
             device: *device,
             declared_name: declared_name.to_owned(),
             reason,
         });
-        Ok(Err(reason))
+        reason
     };
     if let Some(until) = deps.trusted.banned_until(device) {
         tracing::info!(peer = ?device, until, "pairing refused: temp-banned");
-        send_pair_reject(chan, messages::pair_reject::BANNED).await?;
-        return refuse(messages::pair_reject::BANNED);
+        return pair_refused(chan, refuse(messages::pair_reject::BANNED)).await;
     }
     // The limiter comes before anything the answer could disclose (decision
     // M1-9, amended): a BUSY answer costs a per-peer and a host-wide token
@@ -1847,12 +1863,10 @@ where
     let _in_flight = match deps.policy.admit(*device.public_key_bytes()) {
         Ok(guard) => guard,
         Err(PairRefusal::InFlight) => {
-            send_pair_reject(chan, messages::pair_reject::IN_FLIGHT).await?;
-            return refuse(messages::pair_reject::IN_FLIGHT);
+            return pair_refused(chan, refuse(messages::pair_reject::IN_FLIGHT)).await;
         }
         Err(PairRefusal::RateLimited) => {
-            send_pair_reject(chan, messages::pair_reject::RATE_LIMITED).await?;
-            return refuse(messages::pair_reject::RATE_LIMITED);
+            return pair_refused(chan, refuse(messages::pair_reject::RATE_LIMITED)).await;
         }
     };
     if deps.activity.session_live() {
@@ -1861,8 +1875,7 @@ where
             label: pinned.map(str::to_owned),
             popup: SuppressedPopup::Pairing,
         });
-        send_pair_reject(chan, messages::pair_reject::BUSY).await?;
-        return refuse(messages::pair_reject::BUSY);
+        return pair_refused(chan, refuse(messages::pair_reject::BUSY)).await;
     }
 
     deps.audit.record(AuditEvent::PairRequested {
@@ -1890,10 +1903,7 @@ where
         }
     };
     match decision {
-        Err(_) => {
-            send_pair_reject(chan, messages::pair_reject::TIMEOUT).await?;
-            refuse(messages::pair_reject::TIMEOUT)
-        }
+        Err(_) => pair_refused(chan, refuse(messages::pair_reject::TIMEOUT)).await,
         Ok(PairDecision::Reject) => {
             if pinned.is_none() {
                 let until = deps
@@ -1903,21 +1913,33 @@ where
                     tracing::info!(peer = ?device, until, "peer temp-banned after repeated rejects");
                 }
             }
-            send_pair_reject(chan, messages::pair_reject::DENIED).await?;
-            refuse(messages::pair_reject::DENIED)
+            pair_refused(chan, refuse(messages::pair_reject::DENIED)).await
         }
         Ok(PairDecision::Accept { label }) => {
             let wanted = match label {
                 Some(l) => normalize_label(&l),
                 None => declared_name.to_owned(),
             };
-            // An already pinned device keeps its label (re-pair).
-            let pinned = deps.trusted.pin(*device, &wanted)?;
             let accept = PairAccept {
                 host_device_pk: cfg.host_device_pk,
                 host_name: normalize_label(&cfg.host_name),
             };
-            chan.send(&accept, None).await?;
+            // The answer is written before the device is pinned (B11): a
+            // requester whose stream broke between the card and the answer
+            // is never pinned, and its leaving is logged, so the trusted list
+            // and the log agree. A write that went out still proves no
+            // delivery; that half-paired state is decision M1-55's.
+            if let Err(e) = chan.send(&accept, None).await {
+                return Err(requester_left(
+                    deps,
+                    *device,
+                    None,
+                    SuppressedPopup::Pairing,
+                    e,
+                ));
+            }
+            // An already pinned device keeps its label (re-pair).
+            let pinned = deps.trusted.pin(*device, &wanted)?;
             deps.audit.record(AuditEvent::PairAccepted {
                 device: *device,
                 label: pinned.clone(),
@@ -1926,6 +1948,19 @@ where
             Ok(Ok(pinned))
         }
     }
+}
+
+/// Answer the pairing refusal `reason`, already logged, and close: what
+/// [`pair`] returns for it.
+async fn pair_refused<S>(
+    chan: &mut Channel<S>,
+    reason: u16,
+) -> Result<Result<String, u16>, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    send_pair_reject(chan, reason).await?;
+    Ok(Err(reason))
 }
 
 async fn send_pair_reject<S>(chan: &mut Channel<S>, reason: u16) -> Result<(), HandshakeError>
