@@ -37,6 +37,9 @@ pub fn draw(
     if let Some(banner) = &model.unattended_banner {
         unattended_banner(ui, banner, actions);
     }
+    if page != Page::Home {
+        form.left_home();
+    }
     match page {
         Page::Home => home::home(ui, model, form, now, actions),
         Page::AddressBook => address_book::page(ui, model, form, model.screen_shared(now), actions),
@@ -1282,6 +1285,169 @@ mod tests {
             window.pass(Vec::new());
             assert!(has_text(&window, home::LINK_FILLED), "{case}");
             assert!(!has_text(&window, says), "{case}");
+        }
+    }
+
+    /// L-1 (review): while the field holds a link's fill, Connect answers
+    /// only a click of the pointer. Connect focused from the keyboard before
+    /// the link (Space then dials what the user typed), then filled by a
+    /// link: once armed, Space and Enter dial nothing, and a click dials the
+    /// fill. Reached by Tab after the fill, Connect is skipped, so Space and
+    /// Enter there dial nothing either.
+    #[test]
+    fn a_link_fill_is_never_dialled_from_the_keyboard() {
+        let (typed, filled) = (key_id(7), key_id(8));
+        let dials = |actions: &[Action]| {
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Connect(_) | Action::ConnectAnyway(_)))
+        };
+        let mut window = Window::new(at_rest(), Page::Home, egui::Theme::Dark, WIDE);
+        window.form.connect_to = typed.display_groups();
+        window.pass(Vec::new());
+        let at = field_at(&window, None);
+        assert!(window.click(at).is_empty());
+        assert!(window.key(egui::Key::Tab).is_empty());
+        let focused = window.ctx.memory(|m| m.focused());
+        assert!(focused.is_some(), "Tab reached Connect");
+        assert_eq!(
+            window.key(egui::Key::Space),
+            vec![Action::Connect(typed)],
+            "the keyboard presses Connect without a link"
+        );
+        assert_eq!(window.ctx.memory(|m| m.focused()), focused);
+
+        let own = window.model.own_id();
+        window.form.link_arrived(ShownLink::Fill(filled), own);
+        assert!(window.pass(Vec::new()).is_empty());
+        window.later += Duration::from_secs(1);
+        assert!(window.pass(Vec::new()).is_empty());
+        assert!(!window.node("Connect").is_disabled(), "armed");
+        assert_eq!(
+            window.ctx.memory(|m| m.focused()),
+            None,
+            "Connect gave up the focus"
+        );
+        for key in [egui::Key::Space, egui::Key::Enter] {
+            assert!(window.key(key).is_empty(), "{key:?}");
+        }
+
+        let at = field_at(&window, None);
+        assert!(window.click(at).is_empty());
+        let mut pressed = window.key(egui::Key::Tab);
+        assert_ne!(
+            window.ctx.memory(|m| m.focused()),
+            focused,
+            "Tab skips Connect while the fill is there"
+        );
+        for key in [egui::Key::Space, egui::Key::Enter] {
+            pressed.extend(window.key(key));
+        }
+        assert!(!dials(&pressed), "{pressed:?}");
+
+        let mut window = Window::new(at_rest(), Page::Home, egui::Theme::Dark, WIDE);
+        window.form.link_arrived(ShownLink::Fill(filled), own);
+        window.pass(Vec::new());
+        window.later += Duration::from_secs(1);
+        window.pass(Vec::new());
+        let connect = window.center("Connect");
+        assert_eq!(window.click(connect), vec![Action::Connect(filled)]);
+    }
+
+    /// L-1, L-4 (review): a link that brings the window to Home arms Home's
+    /// rows that dial, whatever it said: each saved computer's actions and
+    /// the Connect row with what the user typed earlier wait until they have
+    /// been in view, still, for a second, and again after every return of
+    /// the window, so a click aimed at the page the user was on never lands
+    /// on them. A later return to Home by the user's own choice is not
+    /// armed.
+    #[test]
+    fn a_link_arms_homes_saved_computers_and_connect() {
+        /// The first saved computer's Knock (the top left one), and whether
+        /// every Knock on Home is disabled.
+        fn knock(window: &Window) -> (egui::Pos2, bool) {
+            let knocks: Vec<&Node> = window
+                .nodes
+                .iter()
+                .filter(|n| n.label() == Some("Knock"))
+                .collect();
+            let first = knocks
+                .iter()
+                .filter_map(|n| n.bounds())
+                .min_by(|a, b| (a.y0, a.x0).partial_cmp(&(b.y0, b.x0)).unwrap())
+                .expect("a Knock on Home");
+            let at = egui::pos2(
+                ((first.x0 + first.x1) / 2.0) as f32,
+                ((first.y0 + first.y1) / 2.0) as f32,
+            );
+            (at, knocks.iter().all(|n| n.is_disabled()))
+        }
+        let model = with_book(false);
+        let office = office(&model);
+        let typed = key_id(7);
+        // Tall enough for the saved computers' cards to be in view.
+        let mut probe = Window::new(model.clone(), Page::Home, egui::Theme::Dark, TALL);
+        let (at, disabled) = knock(&probe);
+        assert!(!disabled);
+        assert_eq!(
+            probe.click(at),
+            vec![Action::Connect(office)],
+            "without a link, Knock answers at once"
+        );
+
+        for link in [ShownLink::Refused, ShownLink::Fill(key_id(8))] {
+            let case = format!("{link:?}");
+            let mut window = Window::new(model.clone(), Page::AddressBook, egui::Theme::Dark, TALL);
+            if link == ShownLink::Refused {
+                window.form.connect_to = typed.display_groups();
+            }
+            let own = window.model.own_id();
+            window.form.link_arrived(link, own);
+            assert_eq!(window.form.page, Page::Home, "{case}");
+            assert!(window.pass(Vec::new()).is_empty(), "{case}");
+            let (at, disabled) = knock(&window);
+            let connect = window.center("Connect");
+            assert!(disabled, "{case}");
+            assert!(
+                window.node("Connect without asking").is_disabled(),
+                "{case}"
+            );
+            assert!(window.node("Connect").is_disabled(), "{case}");
+            for at in [at, connect] {
+                assert!(window.click(at).is_empty(), "{case}");
+            }
+            window.later += Duration::from_millis(900);
+            assert!(window.pass(Vec::new()).is_empty(), "{case}");
+            assert!(window.click(at).is_empty(), "{case}: at +0.9 s");
+            window.later += Duration::from_millis(100);
+            assert!(window.pass(Vec::new()).is_empty(), "{case}");
+            assert!(!knock(&window).1, "{case}");
+            assert_eq!(window.click(at), vec![Action::Connect(office)], "{case}");
+            if link == ShownLink::Refused {
+                assert_eq!(
+                    window.click(connect),
+                    vec![Action::Connect(typed)],
+                    "{case}"
+                );
+            }
+
+            window.form.window_came_back();
+            assert!(window.pass(Vec::new()).is_empty(), "{case}");
+            assert!(knock(&window).1, "{case}: back in view");
+            assert!(window.click(at).is_empty(), "{case}");
+            window.later += Duration::from_secs(1);
+            assert!(window.pass(Vec::new()).is_empty(), "{case}");
+            assert!(!knock(&window).1, "{case}");
+
+            // The user picks another page, then Home again.
+            window.form.page = Page::Sessions;
+            assert!(window.pass(Vec::new()).is_empty(), "{case}");
+            window.form.page = Page::Home;
+            assert!(window.pass(Vec::new()).is_empty(), "{case}");
+            window.form.window_came_back();
+            assert!(window.pass(Vec::new()).is_empty(), "{case}");
+            assert!(!knock(&window).1, "{case}: not armed");
+            assert_eq!(window.click(at), vec![Action::Connect(office)], "{case}");
         }
     }
 

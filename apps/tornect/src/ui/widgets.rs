@@ -35,6 +35,7 @@ pub struct Button<'a> {
     icon: Option<Icon>,
     small: bool,
     enabled: bool,
+    pointer_only: bool,
 }
 
 impl<'a> Button<'a> {
@@ -47,6 +48,7 @@ impl<'a> Button<'a> {
             icon: None,
             small: false,
             enabled: true,
+            pointer_only: false,
         }
     }
 
@@ -72,7 +74,31 @@ impl<'a> Button<'a> {
         self
     }
 
-    /// Draw it; `clicked()` on the response is the press.
+    /// With `pointer_only`, never in the Tab order (`Sense::CLICK`, not
+    /// focusable) and giving up the keyboard focus if it held it, so that
+    /// Space or Enter never press it: [`Button::pressed`] then counts only a
+    /// primary click of the pointer.
+    #[must_use]
+    pub fn pointer_only(mut self, pointer_only: bool) -> Self {
+        self.pointer_only = pointer_only;
+        self
+    }
+
+    /// Draw it, and say whether it was pressed: clicked, or, unless it is
+    /// [`Button::pointer_only`], pressed from the keyboard while focused.
+    pub fn pressed(self, ui: &mut Ui) -> bool {
+        let pointer_only = self.pointer_only;
+        let response = self.show(ui);
+        if pointer_only {
+            response.clicked_by(egui::PointerButton::Primary)
+        } else {
+            response.clicked()
+        }
+    }
+
+    /// Draw it; `clicked()` on the response is the press (for a
+    /// [`Button::pointer_only`] one, `clicked_by` the primary button, or
+    /// [`Button::pressed`]).
     pub fn show(self, ui: &mut Ui) -> Response {
         let t = theme::tokens(ui.ctx());
         let (text_size, height, pad) = if self.small {
@@ -87,12 +113,15 @@ impl<'a> Button<'a> {
         let icon_size = text_size + 2.0;
         let icon_room = self.icon.map_or(0.0, |_| icon_size + 8.0);
         let size = vec2(pad * 2.0 + icon_room + galley.size().x, height);
-        let sense = if self.enabled {
-            Sense::click()
-        } else {
-            Sense::hover()
+        let sense = match (self.enabled, self.pointer_only) {
+            (true, false) => Sense::click(),
+            (true, true) => Sense::CLICK,
+            (false, _) => Sense::hover(),
         };
         let (rect, response) = ui.allocate_exact_size(size, sense);
+        if self.pointer_only && response.has_focus() {
+            response.surrender_focus();
+        }
         let (label, enabled) = (self.label, self.enabled);
         response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
         if !ui.is_rect_visible(rect) {

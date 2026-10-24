@@ -14,7 +14,7 @@ use super::super::icons::{self, Icon};
 use super::super::model::{ClientStage, Computer, Failure, Hosting, Model, Setup, TorState};
 use super::super::nav::Page;
 use super::super::theme::{self, Face, Tokens};
-use super::super::view::{Action, Form, LinkNote, SAS_SIZE};
+use super::super::view::{Action, Form, LinkNote, LinkRow, SAS_SIZE};
 use super::super::widgets::{self, Button, Kind, Tone};
 use super::{day_in_sentence, day_text, id_field};
 
@@ -207,7 +207,7 @@ pub(super) fn home(
         ui.add_space(8.0);
         return;
     }
-    saved(ui, t, model, form, actions);
+    saved(ui, t, model, form, now, actions);
     ui.add_space(GAP);
     recent(ui, t, model);
 
@@ -613,15 +613,19 @@ fn connect_card(
             );
         }
         ui.horizontal(|ui| {
-            // After a link's fill, Connect, Connect anyway and Enter wait
-            // until this row has been on screen, still, for a second (L-1).
+            // After a link's fill, or a link that brought the window here,
+            // Connect, Connect anyway and Enter wait until this row has been
+            // on screen, still, for a second (L-1). While the field holds a
+            // fill, only a click of the pointer presses them: a button
+            // focused before the link never dials it on Space or Enter.
             let ready = ready && form.link_armed(ui, now);
+            let pointer_only = form.link_filled();
             if let Some(id) = second_click {
                 if Button::new(Kind::Danger, "Connect anyway")
                     .icon(Icon::ArrowRight)
                     .enabled(ready)
-                    .show(ui)
-                    .clicked()
+                    .pointer_only(pointer_only)
+                    .pressed(ui)
                 {
                     actions.push(Action::ConnectAnyway(id));
                 }
@@ -629,8 +633,8 @@ fn connect_card(
                 let clicked = Button::new(Kind::Primary, "Connect")
                     .icon(Icon::ArrowRight)
                     .enabled(ready)
-                    .show(ui)
-                    .clicked();
+                    .pointer_only(pointer_only)
+                    .pressed(ui);
                 if (clicked || (entered && ready))
                     && let Some(id) = parsed
                 {
@@ -1246,7 +1250,14 @@ fn connect_stepper(
 
 /// "Saved computers": the most recently seen few, each with Connect, and a
 /// way to the address book; or how a computer gets there.
-fn saved(ui: &mut Ui, t: &Tokens, model: &Model, form: &mut Form, actions: &mut Vec<Action>) {
+fn saved(
+    ui: &mut Ui,
+    t: &Tokens,
+    model: &Model,
+    form: &mut Form,
+    now: Instant,
+    actions: &mut Vec<Action>,
+) {
     let book = &model.book;
     ui.horizontal(|ui| {
         widgets::section_header(ui, "Saved computers");
@@ -1303,7 +1314,7 @@ fn saved(ui: &mut Ui, t: &Tokens, model: &Model, form: &mut Form, actions: &mut 
                     vec2(card_width, 0.0),
                     Layout::top_down(Align::Min),
                     |ui| {
-                        saved_card(ui, t, model, computer, ready, actions);
+                        saved_card(ui, t, model, form, computer, (ready, now), actions);
                     },
                 );
             }
@@ -1313,13 +1324,16 @@ fn saved(ui: &mut Ui, t: &Tokens, model: &Model, form: &mut Form, actions: &mut 
 }
 
 /// One saved computer: its name, the start of its ID, when it was last
-/// connected, and Connect.
+/// connected, and Connect. After a link brought the window to Home, its
+/// actions wait until they have been in view, still, for a second (L-1,
+/// [`Form::link_row_armed`]).
 fn saved_card(
     ui: &mut Ui,
     t: &Tokens,
     model: &Model,
+    form: &mut Form,
     computer: &Computer,
-    ready: bool,
+    (ready, now): (bool, Instant),
     actions: &mut Vec<Action>,
 ) {
     widgets::card_frame(t, 14, Margin::symmetric(16, 14)).show(ui, |ui| {
@@ -1356,6 +1370,7 @@ fn saved_card(
                 .color(t.text_secondary),
         );
         ui.horizontal_wrapped(|ui| {
+            let ready = ready && form.link_row_armed(ui, LinkRow::Saved(computer.id), now);
             host_actions(ui, model, computer, ready, true, actions);
         });
     });

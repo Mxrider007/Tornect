@@ -319,6 +319,13 @@ pub struct Form {
     /// `Own`, never `Filled`. Shown under the note of a fill still in the
     /// field, until the field is edited or another link arrives.
     link_refusal: Option<LinkNote>,
+    /// Since a link last brought the window to Home, and until the user
+    /// picks another page: each of Home's rows that dial (the Connect row,
+    /// each saved computer's actions) arms as a card's answers do, from its
+    /// first sight and again after every return of the window and every
+    /// later link, so that a click aimed at what was there before the link
+    /// never lands on one (L-1, L-4).
+    link_rows: Option<HashMap<LinkRow, Card>>,
     /// The connect field gives up the keyboard focus at its next pass: a
     /// link filled it.
     pub(super) unfocus_connect: bool,
@@ -357,6 +364,9 @@ impl Form {
         if let Some((_, card)) = &mut self.link_fill {
             *card = None;
         }
+        if let Some(rows) = &mut self.link_rows {
+            rows.clear();
+        }
     }
 
     /// A `tornect:` link reached this window (design `invite` §2.4): the
@@ -371,7 +381,8 @@ impl Form {
     /// its row has been seen, still, for a second; any link restarts that
     /// second for a fill still in the field. The window shows Home, unless
     /// the grant wizard is open (leaving Settings would close it and wipe its
-    /// passwords).
+    /// passwords), and Home's rows that dial arm again, each from its first
+    /// sight, whatever the link said ([`Form::link_row_armed`]).
     pub fn link_arrived(&mut self, link: ShownLink, own: Option<TornectId>) {
         if let Some((_, card)) = &mut self.link_fill {
             *card = None;
@@ -389,17 +400,45 @@ impl Form {
         };
         if !self.settings.wizard_open() {
             self.page = Page::Home;
+            self.link_rows = Some(HashMap::new());
         }
     }
 
     /// Whether the Connect row, whose start is the cursor of `ui`, may dial
-    /// at `now`: always, unless a link filled the field, whose row then
-    /// arms as a card's answers do.
+    /// at `now`: always, unless a link filled the field or brought the
+    /// window to Home, after which the row arms as a card's answers do.
     pub(super) fn link_armed(&mut self, ui: &egui::Ui, now: Instant) -> bool {
-        match &mut self.link_fill {
+        let filled = match &mut self.link_fill {
             Some((_, card)) => arm_card(ui, card, now),
             None => true,
+        };
+        // Both are kept from the same pass, so that both seconds start at
+        // the row's first sight.
+        let shown = self.link_row_armed(ui, LinkRow::Connect, now);
+        filled && shown
+    }
+
+    /// Whether Home's row `row`, whose start is the cursor of `ui`, may dial
+    /// at `now`: always, unless a link brought the window to Home since the
+    /// user last picked another page; then once the row has been still, in
+    /// view, for a second (`link_rows`).
+    pub(super) fn link_row_armed(&mut self, ui: &egui::Ui, row: LinkRow, now: Instant) -> bool {
+        match &mut self.link_rows {
+            Some(rows) => arm(ui, rows, row, now),
+            None => true,
         }
+    }
+
+    /// The user is on another page than Home: what a link's page change
+    /// armed is over (a later return to Home is the user's own).
+    pub(super) fn left_home(&mut self) {
+        self.link_rows = None;
+    }
+
+    /// Whether the connect field holds what a link filled in: its Connect
+    /// row then answers only a primary click of the pointer.
+    pub(super) fn link_filled(&self) -> bool {
+        self.link_fill.is_some()
     }
 
     /// The connect field now yields `field_id`, and was edited this pass
@@ -428,6 +467,17 @@ impl Form {
     }
 }
 
+/// One of Home's rows that dial, as [`Form::link_row_armed`] arms it after a
+/// link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum LinkRow {
+    /// Connect (or Connect anyway) under the connect field.
+    Connect,
+    /// A saved computer's card's actions (Knock, Connect, Connect without
+    /// asking).
+    Saved(TornectId),
+}
+
 /// What a `tornect:` link said under the connect field (design `invite`
 /// §2.2). None of the notes names the ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -454,7 +504,12 @@ struct Card {
 /// Remember where the answer row of card `id` starts (the cursor of `ui`),
 /// and say whether its accepts may answer now: once the row has been still
 /// for [`ARM_AFTER`].
-fn arm(ui: &egui::Ui, cards: &mut HashMap<u64, Card>, id: u64, now: Instant) -> bool {
+fn arm<K: std::hash::Hash + Eq>(
+    ui: &egui::Ui,
+    cards: &mut HashMap<K, Card>,
+    id: K,
+    now: Instant,
+) -> bool {
     let mut card = cards.get(&id).copied();
     let armed = arm_card(ui, &mut card, now);
     if let Some(card) = card {
