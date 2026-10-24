@@ -97,6 +97,9 @@ mod ty {
     pub const KEYFRAME_REQUEST: u8 = 0x30;
     pub const PING: u8 = 0x40;
     pub const PONG: u8 = 0x41;
+    // 0x50 `SetQuality`, 0x51 `Quality` and 0x52 `Stats` are reserved for the
+    // quality presets (decision M1-74); another new message takes the next
+    // free code.
     pub const CLOSE: u8 = 0x7f;
 }
 
