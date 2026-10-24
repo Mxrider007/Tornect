@@ -24,7 +24,7 @@ use anyhow::Context as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tornect_core::session_log::{SessionLog, SessionMode};
+use tornect_core::session_log::{SessionLog, SessionMode, TransportKind};
 use tornect_core::unattended::limiter::{AttemptLimiter, HostTransport};
 use tornect_core::unattended::schedule::FixedOffset;
 use tornect_core::{Config, HostIdentity, Paths};
@@ -560,12 +560,15 @@ pub fn wire_window(
     let mut deps = HostDeps::headless(identity, trusted);
     deps.consent = consent;
     deps.audit = audit.clone();
-    deps.sessions = Arc::new(CliSessions {
-        live: Arc::clone(&live),
-        polkit: Arc::clone(&polkit),
-        media,
-        control,
-    });
+    deps.sessions = UnattendedUse::wrap(
+        &ctx,
+        Arc::new(CliSessions {
+            live: Arc::clone(&live),
+            polkit: Arc::clone(&polkit),
+            media,
+            control,
+        }),
+    );
     deps.activity = live.clone();
     deps.kill = kill.clone();
 
@@ -992,6 +995,186 @@ impl SessionSink for CliSessions {
             "session ended: {}",
             end.map_or_else(|| "protocol error".to_owned(), describe_end)
         ));
+    }
+}
+
+/// The transport of this build's sessions: their media goes over the Tor
+/// stream (decision M1-43).
+const SESSION_TRANSPORT: TransportKind = TransportKind::TorRelay;
+
+/// The longest gap between a PAKE success and its session's start that counts
+/// towards the session's length: the block window and an "Ask before
+/// starting" card are bounded far below it.
+const MAX_LEAD: u64 = 15 * 60;
+
+/// Each unattended session's length, on its grant's `last_used` (§B.8.6.4):
+/// the reconnect cooldown after a session that ran the full
+/// `max_session_secs` is judged post-F2 from it, so every host serves its
+/// sessions through this sink, around its own ([`CliSessions`], the
+/// window's). Attended sessions pass through untouched.
+///
+/// `last_used.at` is the PAKE success that let the session in (`settle(Ok)`,
+/// §B.8.5.1), and the length written at the end counts from it: `at +
+/// duration_secs` is then the session's end, and a session cut at its signed
+/// `ends_at` (reckoned post-F2, before the block window) counts as full
+/// length. Should `last_used` hold an earlier session's end at the start (that
+/// session's cooldown ran out between the PAKE and the post-F2 check), the
+/// start is recorded first. Only a device's latest session writes its end, so
+/// an older one ending after a newer one of the same device started
+/// (`BYE{REPLACED}`) leaves the newer one's record alone.
+pub struct UnattendedUse {
+    inner: Arc<dyn SessionSink>,
+    store: tornect_core::unattended::store::GrantStore,
+    state: std::sync::Mutex<UseState>,
+}
+
+#[derive(Default)]
+struct UseState {
+    next: u64,
+    /// The live unattended sessions, by session id.
+    live: std::collections::HashMap<String, UseStart>,
+    /// Each device's latest start.
+    latest: std::collections::HashMap<tornect_core::DeviceId, u64>,
+}
+
+struct UseStart {
+    device: tornect_core::DeviceId,
+    /// The store clock's monotonic reading at the start.
+    mono: Duration,
+    /// Seconds from the PAKE success to the start.
+    lead: u64,
+    /// Which start of this host it was.
+    seq: u64,
+}
+
+impl UnattendedUse {
+    /// `inner`, recording unattended sessions on the grants of `ctx`'s store;
+    /// `inner` itself when the store did not open (no unattended session can
+    /// start then).
+    #[must_use]
+    pub fn wrap(
+        ctx: &Result<HostContext, String>,
+        inner: Arc<dyn SessionSink>,
+    ) -> Arc<dyn SessionSink> {
+        match ctx {
+            Ok(ctx) => Arc::new(Self::new(inner, ctx.guard.store().clone())),
+            Err(_) => inner,
+        }
+    }
+
+    fn new(
+        inner: Arc<dyn SessionSink>,
+        store: tornect_core::unattended::store::GrantStore,
+    ) -> Self {
+        Self {
+            inner,
+            store,
+            state: std::sync::Mutex::new(UseState::default()),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, UseState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn started(&self, session: &LiveSession<'_>) {
+        if !session.unattended {
+            return;
+        }
+        let device = session.device;
+        let clock = Arc::clone(self.store.clock());
+        let (wall, mono) = (clock.wall(), clock.mono());
+        let lead = match self.store.grant(&device).and_then(|g| g.last_used) {
+            // This session's own PAKE success: `settle(Ok)` writes no length.
+            Some(last) if last.duration_secs == 0 && last.at <= wall => {
+                (wall - last.at).min(MAX_LEAD)
+            }
+            _ => {
+                if let Err(e) = self.store.record_session_start(&device, SESSION_TRANSPORT) {
+                    not_recorded(&device, &e, "start");
+                }
+                0
+            }
+        };
+        let mut st = self.state();
+        st.next += 1;
+        let seq = st.next;
+        st.latest.insert(device, seq);
+        st.live.insert(
+            session.session_id.to_owned(),
+            UseStart {
+                device,
+                mono,
+                lead,
+                seq,
+            },
+        );
+    }
+
+    fn ended(&self, session_id: &str) {
+        let start = {
+            let mut st = self.state();
+            let Some(start) = st.live.remove(session_id) else {
+                return;
+            };
+            if st.latest.get(&start.device) != Some(&start.seq) {
+                return;
+            }
+            st.latest.remove(&start.device);
+            start
+        };
+        let ran = self
+            .store
+            .clock()
+            .mono()
+            .saturating_sub(start.mono)
+            .as_secs()
+            .saturating_add(start.lead);
+        let secs = u32::try_from(ran).unwrap_or(u32::MAX);
+        if let Err(e) = self
+            .store
+            .record_session_end(&start.device, SESSION_TRANSPORT, secs)
+        {
+            not_recorded(&start.device, &e, "length");
+        }
+    }
+}
+
+/// A session's `what` that did not reach its grant: expected when the grant
+/// went during the session (a revoke ends it), a fault otherwise.
+fn not_recorded(
+    device: &tornect_core::DeviceId,
+    e: &tornect_core::unattended::store::StoreError,
+    what: &str,
+) {
+    use tornect_core::unattended::store::StoreError;
+    match e {
+        StoreError::NoGrant | StoreError::NotLoaded(_) => {
+            tracing::debug!(peer = ?device, error = %e, what, "no grant to record the session on");
+        }
+        _ => {
+            tracing::warn!(peer = ?device, error = %e, what, "the session could not be recorded on its grant")
+        }
+    }
+}
+
+impl SessionSink for UnattendedUse {
+    fn on_start(&self, session: &LiveSession<'_>) {
+        // The sink's own start first: the tracker and the indicator.
+        self.inner.on_start(session);
+        self.started(session);
+    }
+
+    fn notice(&self, session_id: &str) -> Option<u8> {
+        self.inner.notice(session_id)
+    }
+
+    fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
+        // The sink's own end first: that is what stops capture.
+        self.inner.on_end(session_id, end);
+        self.ended(session_id);
     }
 }
 
@@ -2749,6 +2932,190 @@ mod tests {
             other => panic!("a suspended grant answered {other:?}"),
         }
         let _ = host_task.await;
+    }
+
+    /// B12 (§B.8.6.4) through a real host: an unattended session that ran its
+    /// grant's `max_session_secs` is followed by the reconnect cooldown, so the
+    /// device's next request, with the right password, is refused `COOLDOWN`
+    /// with the time left. Before, `settle(Ok)` zeroed `last_used`'s length and
+    /// nothing wrote a session's end, so the second request was served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_that_ran_its_maximum_is_followed_by_the_cooldown() {
+        use tornect_signal::fsm::HandshakeError;
+        use tornect_signal::fsm::client::UnattendedIntent;
+
+        const PASSWORD: &str = "quiet verdant otter lantern zephyr";
+        let env = env();
+        let host_device_pk = HostSigner::public_key(&DeviceIdentity::from_seed(&[0x33; 32]));
+        let (identity, ccfg, cdeps) = client(&env);
+        let device = identity.id();
+        TrustedDeviceStore::open(env.paths.trusted_devices_file())
+            .unwrap()
+            .pin(device, "Laptop")
+            .unwrap();
+        cdeps
+            .known_hosts
+            .pin(env.identity.id(), "Desk", host_device_pk)
+            .unwrap();
+        grant_unattended(&env, &device, PASSWORD);
+        // A one-second maximum with the ten-minute cooldown of *Helping
+        // someone*, whose twelve-hour cooling-off a test cannot wait out.
+        edit_grant_on_disk(&env.paths, &device, |g| {
+            g.max_session_secs = Some(1);
+            g.reconnect_cooldown_s = 600;
+        });
+        let unattended = || {
+            Intent::Unattended(UnattendedIntent {
+                password: zeroize::Zeroizing::new(PASSWORD.to_owned()),
+                want_mode: messages::mode::CONTROL,
+                want_elevation: tornect_core::levels::Elevation::None,
+            })
+        };
+        let wiring = wire(
+            &env.paths,
+            &Config::default(),
+            Arc::clone(&env.identity),
+            host_device_pk,
+            Arc::new(ScriptedConsent::new()),
+            media(),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        let store = wiring.ctx.as_ref().unwrap().guard.store().clone();
+        let (client_end, host_end) = duplex(64 * 1024);
+        let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+        let host_task =
+            tokio::spawn(async move { serve_signaling(host_end, &cfg, &deps, |_| {}).await });
+        let mut session = match connect(client_end, &ccfg, &identity, &cdeps, unattended()).await {
+            Ok(ClientOutcome::Session(s)) => s,
+            other => panic!("no unattended session: {other:?}"),
+        };
+        session.send_tor_fallback().await.unwrap();
+        session.ping().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        session.bye(bye::USER).await.unwrap();
+        assert_eq!(host_task.await.unwrap(), Served::Session);
+        let last = store.grant(&device).unwrap().last_used.unwrap();
+        assert!(last.duration_secs >= 1, "{last:?}");
+        assert_eq!(last.transport, TransportKind::TorRelay);
+
+        let (client_end, host_end) = duplex(64 * 1024);
+        let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+        let host_task =
+            tokio::spawn(async move { serve_signaling(host_end, &cfg, &deps, |_| {}).await });
+        match connect(client_end, &ccfg, &identity, &cdeps, unattended()).await {
+            Err(HandshakeError::SessionRejected { reject: why }) => {
+                assert_eq!(why.reason, reject::COOLDOWN, "{why:?}");
+                let left = why.retry_after_s.expect("the time left");
+                assert!((590..=600).contains(&left), "{left}");
+            }
+            other => panic!("the request right after a full-length session got {other:?}"),
+        }
+        let _ = host_task.await;
+        assert_eq!(
+            store.grant(&device).unwrap().last_used,
+            Some(last),
+            "the refused request leaves the session it was refused for"
+        );
+        assert_eq!(wiring.live.count(), 0);
+    }
+
+    /// The sink records only unattended sessions, and an older session of a
+    /// device that ends after a newer one of the same device started leaves
+    /// the newer one's record alone; the length counts from the PAKE success.
+    #[test]
+    fn the_use_sink_records_the_latest_unattended_session_only() {
+        use tornect_core::keystore::FileSecretStore;
+        use tornect_core::session_log::Actor;
+        use tornect_core::unattended::clock::FakeClock;
+        use tornect_core::unattended::grant::Preset;
+        use tornect_core::unattended::guard::{
+            AllowAllPaired, AllowAllReAuth, MutationGuard, NoSessionActivity,
+            RandomServerSetupSource,
+        };
+        use tornect_core::unattended::ipc::GrantOptions;
+        use tornect_core::unattended::limiter::Settle;
+        use tornect_core::unattended::store::GrantStore;
+        use tornect_signal::consent::SessionToken;
+
+        let env = env();
+        let clock = Arc::new(FakeClock::at(1_787_961_600));
+        let store = GrantStore::open(
+            &env.paths,
+            Arc::new(FileSecretStore::open(env.paths.keys_dir()).unwrap()),
+            clock.clone(),
+            SessionLog::new(env.paths.sessions_log()),
+        )
+        .unwrap();
+        let guard = MutationGuard::new(
+            store.clone(),
+            Arc::new(AllowAllReAuth::default()),
+            Arc::new(NoSessionActivity),
+            Arc::new(tornect_core::levels::FixedFacts::linux()),
+        )
+        .with_paired_devices(Arc::new(AllowAllPaired))
+        .with_server_setup_source(Arc::new(RandomServerSetupSource));
+        guard.master_on(Actor::Cli, &[9; 32]).unwrap();
+        let device = DeviceId::from_bytes([3; 32]);
+        guard
+            .create_grant(
+                Actor::Cli,
+                &device,
+                Preset::HeadlessBox,
+                &GrantOptions::default(),
+                &[0u8; 192],
+                false,
+            )
+            .unwrap();
+        let limiter = AttemptLimiter::new(store.clone());
+        let auth = || {
+            limiter.charge(&device).unwrap();
+            limiter.settle(&device, Settle::Ok).unwrap();
+        };
+        let sink = UnattendedUse::new(Arc::new(LiveSessions::new()), store.clone());
+        let token = SessionToken::new([1; 32]);
+        let live = |id: &'static str, unattended: bool| LiveSession {
+            device,
+            label: "Laptop",
+            session_id: id,
+            token: &token,
+            th_final: [0; 32],
+            mode: SessionMode::Control,
+            elevation: tornect_core::levels::Elevation::None,
+            unattended,
+        };
+        let advance = |secs: u64| clock.advance(Duration::from_secs(secs));
+        let last = || store.grant(&device).unwrap().last_used.unwrap();
+
+        // An attended session is not a use of the grant.
+        auth();
+        let authed = last();
+        sink.on_start(&live("attended", false));
+        advance(500);
+        sink.on_end("attended", None);
+        assert_eq!(last(), authed);
+
+        // Ten seconds of block window, then 100 s of session: 110 s from the PAKE.
+        auth();
+        let first = last().at;
+        advance(10);
+        sink.on_start(&live("a", true));
+        advance(100);
+        // The same device again (BYE{REPLACED} ends the older one later).
+        auth();
+        let second = last().at;
+        advance(5);
+        sink.on_start(&live("b", true));
+        sink.on_end("a", None);
+        assert_eq!(
+            (last().at, last().duration_secs),
+            (second, 0),
+            "the older session's end leaves the newer one's start"
+        );
+        advance(60);
+        sink.on_end("b", None);
+        assert_eq!((last().at, last().duration_secs), (second, 65));
+        assert_ne!(first, second);
     }
 
     /// Both protocols answer on the one port: a ping stream is served by the
