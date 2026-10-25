@@ -53,6 +53,13 @@ pub struct SystemBackend {
         allow(dead_code)
     )]
     restore_token: Option<PathBuf>,
+    /// Ask the Wayland portal for the desktop's clipboard too
+    /// (`[services] wayland_clipboard`).
+    #[cfg_attr(
+        not(all(target_os = "linux", target_pointer_width = "64")),
+        allow(dead_code)
+    )]
+    wayland_clipboard: bool,
     /// What an injector into the last Wayland source's portal session is
     /// built from. `open_injector` has no other way to reach the session
     /// `open_source` opened; the media host asks the two in that order for
@@ -73,9 +80,23 @@ impl SystemBackend {
         Self {
             source,
             restore_token: None,
+            wayland_clipboard: false,
             #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
             wayland_input: Mutex::new(None),
         }
+    }
+
+    /// The Wayland portal request this host makes, and its restore token:
+    /// with `clipboard` (`[services] wayland_clipboard`) every portal session
+    /// asks for the desktop's clipboard too and keeps its grant in a file of
+    /// its own, since a token restores only the request that made it; without
+    /// it, the request and the file are the ones from before the switch
+    /// ([`tornect_core::Paths::portal_restore_token_for`]).
+    #[must_use]
+    pub fn with_portal(mut self, paths: &tornect_core::Paths, clipboard: bool) -> Self {
+        self.restore_token = Some(paths.portal_restore_token_for(clipboard));
+        self.wayland_clipboard = clipboard;
+        self
     }
 
     /// Keep the Wayland portal's restore token in `file`
@@ -221,11 +242,8 @@ impl SystemBackend {
         request: SourceRequest,
         cancel: watch::Receiver<bool>,
     ) -> Result<Box<dyn VideoSource>, CaptureError> {
-        use tornect_capture::wayland::{WaylandOptions, WaylandSource};
-        let mut options = WaylandOptions::new(self.restore_token.clone());
-        options.cancel = Some(cancel.clone());
-        options.max_fps = Some(request.max_fps);
-        let (source, input) = WaylandSource::open(&options)?;
+        let options = self.wayland_options(request, cancel.clone());
+        let (source, input) = tornect_capture::wayland::WaylandSource::open(&options)?;
         // A session that ended while the open finished gets nothing kept: its
         // source is dropped unread, and `session_ended` may have run already.
         if !*cancel.borrow() {
@@ -235,6 +253,19 @@ impl SystemBackend {
                 .unwrap_or_else(PoisonError::into_inner) = Some(input);
         }
         Ok(Box::new(source))
+    }
+
+    /// What a portal session is opened with.
+    fn wayland_options(
+        &self,
+        request: SourceRequest,
+        cancel: watch::Receiver<bool>,
+    ) -> tornect_capture::wayland::WaylandOptions {
+        let mut options = tornect_capture::wayland::WaylandOptions::new(self.restore_token.clone());
+        options.cancel = Some(cancel);
+        options.max_fps = Some(request.max_fps);
+        options.clipboard = self.wayland_clipboard;
+        options
     }
 
     /// The injector into the session `wayland_source` opened, mapping the
@@ -535,6 +566,38 @@ mod tests {
             Err(CaptureError::Unavailable(why)) => assert!(!why.is_empty()),
             Err(e) => panic!("{e}"),
         }
+    }
+
+    /// The portal request follows `[services] wayland_clipboard`: off (the
+    /// default, and a backend built without `with_portal`), no clipboard is
+    /// asked for and the restore token is the file from before the switch;
+    /// on, the clipboard is asked for and its grant kept apart.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn the_portal_asks_for_the_clipboard_only_with_the_switch() {
+        let paths = tornect_core::Paths::from_home(PathBuf::from("/nonexistent/tornect-home"));
+        let cancel = watch::channel(false).1;
+        let options = SystemBackend::new(Source::Desktop)
+            .wayland_options(SourceRequest::new(20), cancel.clone());
+        assert!(!options.clipboard);
+        assert_eq!(options.restore_token, None);
+        let off = tornect_core::Config::default().services.wayland_clipboard;
+        assert!(!off, "the switch is off by default");
+        let options = SystemBackend::new(Source::Desktop)
+            .with_portal(&paths, off)
+            .wayland_options(SourceRequest::new(20), cancel.clone());
+        assert!(!options.clipboard);
+        assert_eq!(options.restore_token, Some(paths.portal_restore_token()));
+        assert_eq!(options.max_fps, Some(20));
+        let options = SystemBackend::new(Source::Desktop)
+            .with_portal(&paths, true)
+            .wayland_options(SourceRequest::new(20), cancel);
+        assert!(options.clipboard);
+        assert_eq!(
+            options.restore_token,
+            Some(paths.portal_restore_token_for(true))
+        );
+        assert_ne!(options.restore_token, Some(paths.portal_restore_token()));
     }
 
     /// No Wayland source was opened, so there is no session to inject into.
