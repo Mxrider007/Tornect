@@ -5,11 +5,14 @@
 //! Positions are placed over the root as it is at each move (slice-G G2-2).
 //! Once retargeted ([`InputSink::retarget`]) they arrive normalized over the
 //! whole root, since the session's [`Viewport`](crate::Viewport) has placed
-//! the viewer's pointer onto the monitor the picture shows (decision M1-75),
-//! and a move onto a root of another size than the view's is refused until
-//! the next picture brings a new view. Before any retarget the picture shows
-//! the whole root but for an odd last column or row (decision M1-74), and
-//! positions are placed over that part.
+//! the viewer's pointer onto the monitor the picture shows (decision M1-75).
+//! Every event that acts where the pointer is (a move, a wheel turn, a press)
+//! is then refused while the root has another size than the view's, since
+//! the X server may have moved the pointer onto a monitor the viewer was not
+//! shown, until the next picture brings a new view; wheels and presses then
+//! wait for a move to place the pointer again. Keys and releases always go.
+//! Before any retarget the picture shows the whole root but for an odd last
+//! column or row (decision M1-74), and positions are placed over that part.
 
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
@@ -103,6 +106,10 @@ struct Injector<S> {
     server: S,
     /// The root's size the session's view addresses, once retargeted.
     expected_root: Option<(u32, u32)>,
+    /// An event was refused because the root changed, and no move has been
+    /// injected since: the pointer is wherever the X server put it, which no
+    /// picture showed the viewer, so a wheel turn or a press waits for a move.
+    unplaced: bool,
     wheel: WheelAccumulator,
 }
 
@@ -111,8 +118,36 @@ impl<S: Server> Injector<S> {
         Self {
             server,
             expected_root: None,
+            unplaced: false,
             wheel: WheelAccumulator::default(),
         }
+    }
+
+    /// Whether `event` may go now; the root's size when it was read (always
+    /// for a move). Once retargeted, nothing that acts where the pointer is
+    /// goes onto a root of another size than the view's: the viewer's
+    /// positions are normalized over a root that is gone, and the X server
+    /// may have moved the pointer onto a monitor the viewer was not shown,
+    /// where a press or a wheel turn would act. Keys and releases always go,
+    /// so nothing stays held.
+    fn check(&mut self, event: &InputEvent) -> Result<Option<(u32, u32)>, InputError> {
+        let moving = matches!(event, InputEvent::PointerMove { .. });
+        if !event.lands_at_pointer() || (self.expected_root.is_none() && !moving) {
+            return Ok(None);
+        }
+        let root = self.server.root_size()?;
+        if self.expected_root.is_some_and(|expected| expected != root) {
+            self.unplaced = true;
+            return Err(InputError::Inject(
+                "the screen's size changed; the pointer waits for the next picture".to_owned(),
+            ));
+        }
+        if self.unplaced && !moving {
+            return Err(InputError::Inject(
+                "the screen changed since the pointer was placed; a move goes first".to_owned(),
+            ));
+        }
+        Ok(Some(root))
     }
 
     fn click(&mut self, detail: u8, times: i32) -> Result<(), InputError> {
@@ -127,15 +162,14 @@ impl<S: Server> Injector<S> {
 
 impl<S: Server + Send> InputSink for Injector<S> {
     fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+        let root = self.check(event)?;
         match *event {
             InputEvent::PointerMove { x, y } => {
-                let (width, height) = self.server.root_size()?;
+                let (width, height) = match root {
+                    Some(root) => root,
+                    None => self.server.root_size()?,
+                };
                 let (x, y) = match self.expected_root {
-                    Some(expected) if expected != (width, height) => {
-                        return Err(InputError::Inject(
-                            "the screen's size changed; moves wait for the next picture".to_owned(),
-                        ));
-                    }
                     Some(_) => (x, y),
                     None => over_even_part(x, y, Rect::new(0, 0, width, height)),
                 };
@@ -143,6 +177,7 @@ impl<S: Server + Send> InputSink for Injector<S> {
                 let px = i16::try_from(px).unwrap_or(i16::MAX);
                 let py = i16::try_from(py).unwrap_or(i16::MAX);
                 self.server.fake(xproto::MOTION_NOTIFY_EVENT, 0, px, py)?;
+                self.unplaced = false;
             }
             InputEvent::PointerButton { button, pressed } => {
                 let detail = match button {
@@ -185,8 +220,9 @@ impl<S: Server + Send> InputSink for Injector<S> {
         self.server.flush()
     }
 
-    /// Keeps the root's size a rectangle view addresses, for the check at
-    /// every move; the mapping itself is the `Viewport`'s. The root always
+    /// Keeps the root's size a rectangle view addresses, for the check
+    /// before every event that acts where the pointer is; the mapping itself
+    /// is the `Viewport`'s. The root always
     /// starts at 0, 0, so a space that does not is not this display's.
     fn retarget(&mut self, view: &View) -> Result<(), InputError> {
         match view {
@@ -203,7 +239,7 @@ impl<S: Server + Send> InputSink for Injector<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Viewport;
+    use crate::{Tracked, Viewport};
 
     /// SLICE-C1 C1-2, now through a `Viewport` (decision M1-75): the viewer's
     /// pointer covers the rectangle the picture shows, here the root's top-left
@@ -348,35 +384,102 @@ mod tests {
         assert_eq!(last_motion(&sink.inner), (1279, 719));
     }
 
-    /// Decision M1-75 (the design's §4): once retargeted, a root resized
-    /// after the view was taken (`xrandr --output X --off`) refuses moves
-    /// until the next picture's retarget; keys and buttons still go. A view
-    /// of a space not at 0, 0 or of a stream is not this display's.
+    /// Decision M1-75 (the design's §4, as amended at the review of steps 4
+    /// and 5): once retargeted, a root resized after the view was taken
+    /// (`xrandr --output X --off`) refuses every event that acts where the
+    /// pointer is until the next picture's retarget: the X server may have
+    /// moved the pointer onto the monitor still shown, and a press or a wheel
+    /// turn there would act on a screen the viewer was not shown. Keys and
+    /// releases go. A wheel turn or a press then waits for a move to place
+    /// the pointer, also when the root comes back as it was. A view of a space
+    /// not at 0, 0 or of a stream is not this display's.
     #[test]
-    fn a_resized_root_refuses_moves_until_the_next_retarget() {
-        let mut sink = Viewport::new(resizable(2304, 768));
+    fn a_resized_root_refuses_positional_events_until_the_next_retarget() {
+        let press = InputEvent::PointerButton {
+            button: Button::Left,
+            pressed: true,
+        };
+        let release = InputEvent::PointerButton {
+            button: Button::Left,
+            pressed: false,
+        };
+        let wheel = InputEvent::Wheel { dx: 0, dy: 120 };
+        let key = |pressed| InputEvent::Key {
+            usb: 0x07_0004,
+            pressed,
+        };
+        let mut sink = Tracked::new(Viewport::new(resizable(2304, 768)));
         let view = |w, h| View::Rect {
             shown: Rect::new(0, 0, 1024, 600),
             space: Rect::new(0, 0, w, h),
         };
+        let server = |sink: &Tracked<Viewport<Injector<Resizable>>>| -> Vec<(u8, u8, i16, i16)> {
+            sink.inner.inner.server.sent.clone()
+        };
         sink.retarget(&view(2304, 768)).unwrap();
-        sink.inner.server.size = (1280, 720);
-        let refused = sink.inject(&InputEvent::PointerMove { x: 1, y: 1 });
-        assert!(
-            matches!(&refused, Err(InputError::Inject(why)) if why.contains("size changed")),
-            "{refused:?}"
+        sink.inner.inner.server.size = (1280, 720);
+        for event in [InputEvent::PointerMove { x: 1, y: 1 }, press, wheel] {
+            let refused = sink.inject(&event);
+            assert!(
+                matches!(&refused, Err(InputError::Inject(why)) if why.contains("size changed")),
+                "{event:?}: {refused:?}"
+            );
+        }
+        assert!(server(&sink).is_empty(), "nothing faked");
+        // `Tracked` counted the refused press as held, so the viewer's
+        // button-up reaches the server for a button that is up: XTEST takes
+        // it, and it holds nothing. The key goes down and up.
+        for event in [release, key(true), key(false)] {
+            sink.inject(&event).unwrap();
+        }
+        let a = u8::try_from(keymap::by_usb(0x07_0004).unwrap().evdev + 8).unwrap();
+        assert_eq!(
+            server(&sink),
+            [
+                (xproto::BUTTON_RELEASE_EVENT, 1, 0, 0),
+                (xproto::KEY_PRESS_EVENT, a, 0, 0),
+                (xproto::KEY_RELEASE_EVENT, a, 0, 0),
+            ]
         );
-        assert!(sink.inner.server.sent.is_empty(), "nothing faked");
-        sink.inject(&InputEvent::PointerButton {
-            button: Button::Left,
-            pressed: true,
-        })
-        .unwrap();
-        assert_eq!(sink.inner.server.sent.len(), 1);
-        sink.retarget(&view(1280, 720)).unwrap();
+
+        // The root comes back as it was, with no new view: the pointer is
+        // still where the server put it, so a press or a wheel turn waits for
+        // a move to place it.
+        sink.inner.inner.server.size = (2304, 768);
+        sink.inner.inner.server.sent.clear();
+        for event in [press, wheel] {
+            let refused = sink.inject(&event);
+            assert!(
+                matches!(&refused, Err(InputError::Inject(why)) if why.contains("a move goes first")),
+                "{event:?}: {refused:?}"
+            );
+        }
+        assert!(server(&sink).is_empty());
         sink.inject(&InputEvent::PointerMove { x: 65535, y: 65535 })
             .unwrap();
-        assert_eq!(last_motion(&sink.inner), (1023, 599));
+        assert_eq!(last_motion(&sink.inner.inner), (1023, 599));
+        sink.inject(&press).unwrap();
+        sink.inject(&release).unwrap();
+        sink.inject(&wheel).unwrap();
+        assert_eq!(
+            server(&sink).len(),
+            1 + 2 + 2,
+            "move, press and release, a notch"
+        );
+
+        // Resized again, then the next picture's retarget: moves map, and a
+        // press still waits for one.
+        sink.inner.inner.server.size = (1280, 720);
+        assert!(sink.inject(&press).is_err());
+        sink.retarget(&view(1280, 720)).unwrap();
+        sink.inner.inner.server.sent.clear();
+        assert!(sink.inject(&press).is_err());
+        assert!(server(&sink).is_empty());
+        sink.inject(&InputEvent::PointerMove { x: 65535, y: 65535 })
+            .unwrap();
+        assert_eq!(last_motion(&sink.inner.inner), (1023, 599));
+        sink.inject(&press).unwrap();
+        assert_eq!(server(&sink).len(), 2);
 
         let mut injector = resizable(2304, 768);
         let offset = View::Rect {

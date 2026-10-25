@@ -595,8 +595,11 @@ pub(crate) fn normalize_pixel(pos: u32, size: u32) -> u16 {
 /// sink's to map, so nothing is rewritten.
 ///
 /// A view is kept only once the inner sink took it. After a refused
-/// [`InputSink::retarget`] the picture shows what no view here describes, so
-/// moves are refused until a retarget succeeds; keys and buttons still go.
+/// [`InputSink::retarget`] the picture shows what no view here describes, and
+/// the host's pointer is on no screen the viewer was shown, so every event
+/// that acts where the pointer is ([`InputEvent::lands_at_pointer`]: moves,
+/// wheel turns, presses) is refused until a retarget succeeds; keys and
+/// releases still go, so nothing stays held.
 pub struct Viewport<S: InputSink> {
     inner: S,
     target: Target,
@@ -657,7 +660,7 @@ impl<S: InputSink> InputSink for Viewport<S> {
                 let (x, y) = remap(x, y, shown, space);
                 self.inner.inject(&InputEvent::PointerMove { x, y })
             }
-            (Target::Lost, InputEvent::PointerMove { .. }) => Err(InputError::Inject(
+            (Target::Lost, event) if event.lands_at_pointer() => Err(InputError::Inject(
                 "the pointer could not follow the picture to its screen".to_owned(),
             )),
             _ => self.inner.inject(event),
@@ -1233,11 +1236,63 @@ mod tests {
         assert_eq!(viewport.inner.seen, [corner]);
     }
 
+    /// Everything a viewer sends, a release of each kind included.
+    fn every_kind() -> [InputEvent; 7] {
+        [
+            InputEvent::PointerMove { x: 1, y: 1 },
+            InputEvent::PointerButton {
+                button: Button::Left,
+                pressed: true,
+            },
+            InputEvent::Wheel { dx: 0, dy: 120 },
+            InputEvent::PointerButton {
+                button: Button::Left,
+                pressed: false,
+            },
+            InputEvent::Key {
+                usb: 0x07_0004,
+                pressed: true,
+            },
+            InputEvent::Key {
+                usb: 0x07_0004,
+                pressed: false,
+            },
+            InputEvent::ReleaseAll,
+        ]
+    }
+
+    /// After a refused retarget: what acts where the pointer is (a move, a
+    /// wheel turn, a press) is refused, since the host's pointer is on no
+    /// screen the viewer was shown; keys and releases go. What reached
+    /// `sink` is exactly the latter.
+    fn only_keys_and_releases_go<S: InputSink>(
+        viewport: &mut Viewport<S>,
+        seen: impl Fn(&S) -> Vec<InputEvent>,
+    ) {
+        for event in every_kind() {
+            let sent = viewport.inject(&event);
+            assert_eq!(
+                sent.is_err(),
+                event.lands_at_pointer(),
+                "{event:?}: {sent:?}"
+            );
+        }
+        let kept: Vec<_> = every_kind()
+            .into_iter()
+            .filter(|event| !event.lands_at_pointer())
+            .collect();
+        assert_eq!(
+            seen(&viewport.inner),
+            kept,
+            "no move, wheel or press reached the sink"
+        );
+    }
+
     /// A view no position can be mapped onto is refused before the inner
     /// sink hears of it, and so is one the inner sink refuses. Neither is
     /// kept, and the view before it is dropped too, since the picture no
-    /// longer shows it: moves are refused until a retarget succeeds, while
-    /// keys and buttons still go.
+    /// longer shows it: moves, wheel turns and presses are refused until a
+    /// retarget succeeds, while keys and releases still go.
     #[test]
     fn a_viewport_keeps_no_view_it_or_its_sink_refused() {
         let bad = [
@@ -1260,15 +1315,7 @@ mod tests {
             );
             assert_eq!(viewport.inner.views, [ON_SECOND], "never forwarded");
             assert_eq!(viewport.view(), None, "{shown:?} in {space:?}");
-            assert!(
-                viewport
-                    .inject(&InputEvent::PointerMove { x: 1, y: 1 })
-                    .is_err()
-            );
-            for event in others() {
-                viewport.inject(&event).unwrap();
-            }
-            assert_eq!(viewport.inner.seen, others(), "no move reached the sink");
+            only_keys_and_releases_go(&mut viewport, |log| log.seen.clone());
         }
         // The largest space there is maps.
         let mut viewport = Viewport::new(Log::default());
@@ -1290,14 +1337,11 @@ mod tests {
         };
         assert!(viewport.retarget(&first).is_err());
         assert_eq!(viewport.view(), None);
-        assert!(
-            viewport
-                .inject(&InputEvent::PointerMove { x: 0, y: 0 })
-                .is_err(),
-            "not mapped onto the second screen any more"
-        );
-        // Taken the next time: moves map again.
+        // Not mapped onto the second screen any more, and no click there.
+        only_keys_and_releases_go(&mut viewport, |log| log.seen.clone());
+        // Taken the next time: moves map again, and presses go.
         viewport.inner.refuse_views = false;
+        viewport.inner.seen.clear();
         viewport.retarget(&first).unwrap();
         assert_eq!(viewport.view(), Some(&first));
         viewport
@@ -1307,6 +1351,12 @@ mod tests {
             panic!("{:?}", viewport.inner.seen);
         };
         assert_eq!((denormalize(x, 2304), denormalize(y, 768)), (1279, 719));
+        let press = InputEvent::PointerButton {
+            button: Button::Left,
+            pressed: true,
+        };
+        viewport.inject(&press).unwrap();
+        assert_eq!(viewport.inner.seen[1..], [press]);
     }
 
     /// The default `retarget`, for a sink that addresses a whole space behind
