@@ -24,7 +24,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use tornect_input::{
-    Button, InputError, InputEvent, InputSink, WheelAccumulator, denormalize, keymap,
+    Button, InputError, InputEvent, InputSink, View, WheelAccumulator, denormalize, keymap,
 };
 
 use self::pipewire::{PwCapture, Shared};
@@ -262,19 +262,14 @@ impl std::fmt::Debug for WaylandInput {
 }
 
 impl WaylandInput {
-    /// An injector into the source's session. `region` gives, for a picture of
-    /// the source's size, the part of it the viewer's picture shows (the
-    /// session layer passes `tornect_codec::scale::shown_region`); the viewer's
-    /// pointer is mapped over that part, which is exactly what the viewer sees,
-    /// scaled down or not.
+    /// An injector into the source's session. The viewer's pointer is mapped
+    /// over the part of the stream the picture shows, the whole of it but for
+    /// an odd last column or row (decision M1-74), scaled down or not.
     ///
     /// Refused when the source is gone, when the desktop did not grant input
     /// (the dialog's remote-control switch), or when the portal gave no
     /// logical size, without which no position could be placed exactly.
-    pub fn injector(
-        &self,
-        region: fn(u32, u32) -> (u32, u32),
-    ) -> Result<WaylandInjector, CaptureError> {
+    pub fn injector(&self) -> Result<WaylandInjector, CaptureError> {
         let portal = self
             .portal
             .upgrade()
@@ -309,7 +304,6 @@ impl WaylandInput {
             portal,
             shared: Arc::clone(&self.shared),
             map,
-            region,
             wheel: WheelAccumulator::default(),
         })
     }
@@ -326,7 +320,6 @@ pub struct WaylandInjector {
     portal: Arc<Portal>,
     shared: Arc<Shared>,
     map: PointerMap,
-    region: fn(u32, u32) -> (u32, u32),
     wheel: WheelAccumulator,
 }
 
@@ -340,15 +333,28 @@ impl std::fmt::Debug for WaylandInjector {
 
 impl InputSink for WaylandInjector {
     fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
-        let (map, region) = (self.map, self.region);
+        let map = self.map;
         let pixels = self.shared.pixel_size();
-        let calls = translate(event, &mut self.wheel, |x, y| {
-            map.place(x, y, pixels?, region)
-        })?;
+        let calls = translate(event, &mut self.wheel, |x, y| map.place(x, y, pixels?))?;
         for call in calls.into_iter().flatten() {
             self.portal.send(call)?;
         }
         Ok(())
+    }
+
+    /// The injector addresses the one stream this source shows, at its live
+    /// size, and no rectangle of a desktop: a [`View::Rect`] would have a
+    /// `Viewport` place positions over a space the portal does not take. The
+    /// source describes no layout until the design's Part 2 (decision M1-75),
+    /// which follows a [`View::Stream`] here; until then every view is
+    /// refused, and the host ends input rather than mis-map a click.
+    fn retarget(&mut self, view: &View) -> Result<(), InputError> {
+        Err(InputError::Inject(match view {
+            View::Rect { .. } => "the portal session takes no desktop rectangle".to_owned(),
+            View::Stream { .. } => {
+                "this injector cannot follow the picture to another screen".to_owned()
+            }
+        }))
     }
 }
 
@@ -373,19 +379,14 @@ impl PointerMap {
         })
     }
 
-    /// Where `(x, y)`, normalized over the shown region of a `pixels`-sized
-    /// desktop, lies in logical coordinates. The region is the desktop's
-    /// top-left `region(pixels)`; the result stays strictly inside the screen's
-    /// logical size (`0 <= x < width`), as the portal requires.
-    fn place(
-        &self,
-        x: u16,
-        y: u16,
-        pixels: (u32, u32),
-        region: fn(u32, u32) -> (u32, u32),
-    ) -> Option<(f64, f64)> {
-        let (width, height) = region(pixels.0, pixels.1);
-        let (width, height) = (width.min(pixels.0), height.min(pixels.1));
+    /// Where `(x, y)`, normalized over the picture of a `pixels`-sized stream,
+    /// lies in logical coordinates. The picture shows the stream's even part,
+    /// all of it but for an odd last column or row (decision M1-74), so the
+    /// pointer never reaches what no picture shows; the result stays strictly
+    /// inside the screen's logical size (`0 <= x < width`), as the portal
+    /// requires.
+    fn place(&self, x: u16, y: u16, pixels: (u32, u32)) -> Option<(f64, f64)> {
+        let (width, height) = (pixels.0 & !1, pixels.1 & !1);
         if width == 0 || height == 0 {
             return None;
         }
@@ -470,17 +471,6 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-
-    /// `tornect_codec::scale::shown_region`, which the session layer passes
-    /// in: the desktop but for an odd last column or row, scaled whole into
-    /// the picture at any size (decision M1-74).
-    fn shown_region(w: u32, h: u32) -> (u32, u32) {
-        (w & !1, h & !1)
-    }
-
-    fn whole(w: u32, h: u32) -> (u32, u32) {
-        (w, h)
-    }
 
     /// The options a caller does not set ask the compositor for no frame-rate
     /// cap: the stream's pod is then the report's, byte for byte
@@ -673,15 +663,16 @@ mod tests {
         );
     }
 
-    /// SLICE-C1 C1-2: the viewer sees the shown region, so its corners are
-    /// that region's corners, not the desktop's when an odd edge is dropped.
+    /// SLICE-C1 C1-2, decision M1-74: the picture shows the stream's even
+    /// part, so its corners are that part's corners, and an odd last column
+    /// or row, which no picture shows, is never reached.
     #[test]
-    fn the_pointer_spans_the_shown_region_edge_to_edge() {
+    fn the_pointer_spans_the_even_part_edge_to_edge() {
         // A 5K desktop at 200 %: 5120×2880 pixels, 2560×1440 logical; the
         // host scales all of it into the picture, so the far corner is the
         // desktop's own.
         let map = PointerMap::new((2560, 1440), (5120, 2880)).unwrap();
-        let place = |x, y| map.place(x, y, (5120, 2880), shown_region).unwrap();
+        let place = |x, y| map.place(x, y, (5120, 2880)).unwrap();
         assert_eq!(place(0, 0), (0.0, 0.0));
         assert_eq!(place(65535, 65535), (5119.0 * 0.5, 2879.0 * 0.5));
         let (x, y) = place(32768, 32768);
@@ -690,27 +681,29 @@ mod tests {
             "{x} {y}"
         );
         // Odd-sized: 1921×1081 shows 1920×1080, and the far corner is the
-        // last pixel the viewer sees; mapped over the whole desktop instead,
-        // it would land on the dropped column and row, outside the picture.
+        // last pixel the viewer sees, not the dropped column and row.
         let map = PointerMap::new((1921, 1081), (1921, 1081)).unwrap();
         assert_eq!(
-            map.place(65535, 65535, (1921, 1081), shown_region),
+            map.place(65535, 65535, (1921, 1081)),
             Some((1919.0, 1079.0))
         );
+        // An odd height only: 3538×1919 shows 3538×1918.
+        let map = PointerMap::new((3538, 1919), (3538, 1919)).unwrap();
         assert_eq!(
-            map.place(65535, 65535, (1921, 1081), whole),
-            Some((1920.0, 1080.0))
+            map.place(65535, 65535, (3538, 1919)),
+            Some((3537.0, 1917.0))
         );
+        assert_eq!(map.place(0, 0, (3538, 1919)), Some((0.0, 0.0)));
         // A rotated 4K monitor at 200 %: 2160×3840 pixels, 1080×1920
         // logical, sent whole, so the far corner is the screen's own.
         let map = PointerMap::new((1080, 1920), (2160, 3840)).unwrap();
         assert_eq!(
-            map.place(65535, 65535, (2160, 3840), shown_region),
+            map.place(65535, 65535, (2160, 3840)),
             Some((2159.0 * 0.5, 3839.0 * 0.5))
         );
         // Fractional scaling (125 %): 2560×1600 pixels, 2048×1280 logical.
         let map = PointerMap::new((2048, 1280), (2560, 1600)).unwrap();
-        let (x, y) = map.place(65535, 65535, (2560, 1600), shown_region).unwrap();
+        let (x, y) = map.place(65535, 65535, (2560, 1600)).unwrap();
         assert!((x - 2559.0 * 0.8).abs() < 1e-9 && (y - 1599.0 * 0.8).abs() < 1e-9);
         // Every position is strictly inside the logical screen, at any size.
         for (logical, pixels) in [
@@ -720,10 +713,11 @@ mod tests {
             ((3000, 2000), (2000, 1000)),
             ((1440, 2560), (1440, 2560)),
             ((1440, 2560), (2880, 5120)),
+            ((3538, 1919), (3538, 1919)),
         ] {
             let map = PointerMap::new(logical, pixels).unwrap();
             for (x, y) in [(0, 0), (65535, 65535), (65535, 0), (12345, 54321)] {
-                let (lx, ly) = map.place(x, y, pixels, shown_region).unwrap();
+                let (lx, ly) = map.place(x, y, pixels).unwrap();
                 assert!(
                     (0.0..f64::from(logical.0)).contains(&lx),
                     "{logical:?} {pixels:?} x {lx}"
@@ -738,11 +732,7 @@ mod tests {
         assert_eq!(PointerMap::new((0, 1080), (1920, 1080)), None);
         assert_eq!(PointerMap::new((1920, 1080), (1920, 0)), None);
         let map = PointerMap::new((1920, 1080), (1920, 1080)).unwrap();
-        assert_eq!(
-            map.place(1, 1, (1, 1), shown_region),
-            None,
-            "a 1×1 desktop shows nothing"
-        );
+        assert_eq!(map.place(1, 1, (1, 1)), None, "a 1×1 desktop shows nothing");
     }
 
     fn input(
@@ -769,7 +759,7 @@ mod tests {
     fn an_injector_is_refused_unless_every_fact_it_needs_is_known() {
         let (portal, mut rx) = fake_portal();
         let shared = Arc::new(Shared::new());
-        let refused = |input: &WaylandInput| match input.injector(shown_region) {
+        let refused = |input: &WaylandInput| match input.injector() {
             Err(CaptureError::Unavailable(why)) => why,
             Ok(_) => panic!("built"),
             Err(e) => panic!("{e}"),
@@ -791,7 +781,7 @@ mod tests {
         assert!(refused(&input(&portal, &shared, None, true)).contains("logical size"));
         // Everything known: the injector maps and queues.
         let mut injector = input(&portal, &shared, Some((1280, 800)), true)
-            .injector(shown_region)
+            .injector()
             .unwrap();
         injector
             .inject(&InputEvent::PointerMove { x: 65535, y: 0 })
@@ -817,6 +807,72 @@ mod tests {
         assert!(refused(&weak).contains("ended"));
     }
 
+    /// Decision M1-74: the injector maps over the even part of the stream's
+    /// live size, here an odd 3538×1919 stream at 100 % and then the same
+    /// monitor after a mode change to an odd 7077×3839 (logical units per
+    /// pixel, measured once, hold across a mode change). Decision M1-75: it
+    /// follows no view in this build, neither a desktop rectangle nor a
+    /// stream, so the host ends input rather than mis-map a click.
+    #[test]
+    fn the_injector_maps_over_the_live_even_part_and_follows_no_view() {
+        let (portal, mut rx) = fake_portal();
+        let shared = Arc::new(Shared::new());
+        let format = |width, height| {
+            Ok(Some(pipewire::VideoFormat {
+                pixel: pipewire::PixelFormat::Bgrx,
+                width,
+                height,
+                max_framerate: None,
+            }))
+        };
+        shared.set_format(format(3538, 1919));
+        let mut injector = input(&portal, &shared, Some((3538, 1919)), true)
+            .injector()
+            .unwrap();
+        let corner = InputEvent::PointerMove { x: 65535, y: 65535 };
+        injector.inject(&corner).unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Call::Motion {
+                x: 3537.0,
+                y: 1917.0
+            }
+        );
+        shared.set_format(format(7077, 3839));
+        injector.inject(&corner).unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Call::Motion {
+                x: 7075.0,
+                y: 3837.0
+            },
+            "the far corner of the new mode's even part"
+        );
+
+        let rect = tornect_input::Rect::new(0, 0, 3538, 1918);
+        for view in [
+            View::Rect {
+                shown: rect,
+                space: rect,
+            },
+            View::Stream {
+                node: 7,
+                pixels: (3538, 1919),
+                ratio: None,
+            },
+        ] {
+            assert!(injector.retarget(&view).is_err(), "{view:?}");
+            let mut viewport = tornect_input::Viewport::new(
+                input(&portal, &shared, Some((3538, 1919)), true)
+                    .injector()
+                    .unwrap(),
+            );
+            assert!(viewport.retarget(&view).is_err(), "{view:?}");
+            assert!(viewport.inject(&corner).is_err(), "no move after a refusal");
+        }
+        assert!(rx.try_recv().is_err(), "nothing more was sent");
+    }
+
     /// Slice-G G1-4: a kill during a portal stall lets go of what the portal
     /// session holds, and makes nothing the viewer queued. The injector's own
     /// releases (`Tracked`'s drop) find the queue full then, so the thread
@@ -839,7 +895,7 @@ mod tests {
         })));
         let mut viewer = tornect_input::Tracked::new(
             input(&portal, &shared, Some((1280, 800)), true)
-                .injector(shown_region)
+                .injector()
                 .unwrap(),
         );
         let key = |pressed| Call::Key { code: 30, pressed };
@@ -943,7 +999,7 @@ mod tests {
         let quiet = count(&mut source, Duration::from_secs(5));
         eprintln!("pictures in 5 s with nothing moved: {quiet}");
         let injector = input
-            .injector(shown_region)
+            .injector()
             .expect("an injector (allow remote interaction in the dialog)");
         let mut injector = tornect_input::Tracked::new(injector);
         let mut moved = 0;

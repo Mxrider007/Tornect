@@ -229,7 +229,7 @@ impl SystemBackend {
     }
 
     /// The injector into the session `wayland_source` opened, mapping the
-    /// viewer's pointer over the part of the desktop the picture shows
+    /// viewer's pointer over the part of the stream the picture shows
     /// (SLICE-C1 C1-2, decision M1-74).
     fn wayland_injector(&self) -> Option<Box<dyn InputSink>> {
         let input = self
@@ -237,7 +237,7 @@ impl SystemBackend {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()?;
-        match input.injector(tornect_codec::scale::shown_region) {
+        match input.injector() {
             Ok(injector) => Some(Box::new(injector)),
             Err(e) => {
                 tracing::warn!(error = %e, "the viewer's input is dropped");
