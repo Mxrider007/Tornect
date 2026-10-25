@@ -27,10 +27,14 @@
 //!    `Close{ENDED_BY_HOST}`), capture stops (`Close{CAPTURE_STOPPED}`), the
 //!    viewer closes or breaks the protocol (`Close{PROTOCOL}`, or the
 //!    reader's `Close{NOT_OFFERED}` for a frame never granted), or the
-//!    stream fails. When the viewer's input is lost mid-session the
-//!    clipboard and files are turned off for good (`Caps`, the link
-//!    dropped), and a stream left with nothing ends with
-//!    `Close{NOT_OFFERED}`.
+//!    stream fails. Chat and uploads into the inbox are served (the upload
+//!    protocol: [`super::upload`]). When the viewer's input is lost
+//!    mid-session the clipboard and files are turned off for good (running
+//!    uploads get `Cancel{TURNED_OFF}`, then `Caps`; the link is dropped),
+//!    and a stream left with nothing ends with `Close{NOT_OFFERED}`.
+//! 5. **End.** Every upload's worker is stopped, `Close` is written, and the
+//!    workers are waited for (within 5 s): once `serve` returns, no partial
+//!    file of the stream is left, whatever ended it.
 //!
 //! The services stream ending never ends the session.
 //!
@@ -53,6 +57,8 @@ use tornect_signal::fsm::host::LiveSession;
 
 use super::chat::{self, ChatGate, ChatText, sanitize_peer_text};
 use super::reader::{CapState, Inbound, ReadEnd, ReaderCounts, read_frames};
+use super::store::{Inbox, InboxLimits};
+use super::upload::{HostUploads, WORKERS_WAIT};
 use super::writer::{LAST_WRITE, Outbox, spawn_writer};
 use super::{
     HostEvent, ServicesEnv, ServicesLimits, ServicesObserver, ServicesPolicy, ServicesSummary,
@@ -101,6 +107,8 @@ pub enum ServicesOutcome {
 enum HostOp {
     /// Write to the viewer.
     Chat(ChatText),
+    /// Stop transfer `xfer` (`Cancel{BY_HOST}`).
+    Cancel(u32),
 }
 
 /// The host's end of the services streams of every session (the services
@@ -160,6 +168,8 @@ struct Opened {
     link: Option<ClipboardLink>,
     clipboard_refused: bool,
     welcome: Welcome,
+    /// Where uploads land, with `UPLOAD`.
+    inbox: Option<Inbox>,
 }
 
 impl ServicesHost {
@@ -211,9 +221,21 @@ impl ServicesHost {
     /// Write `text` to the viewer of session `session_id`; `false` when it
     /// has no services stream open.
     pub fn send_chat(&self, session_id: &str, text: ChatText) -> bool {
+        self.op(session_id, HostOp::Chat(text))
+    }
+
+    /// Stop transfer `xfer` of session `session_id`, as the host's user asks
+    /// (`Cancel{BY_HOST}`; what was received of it is deleted); `false` when
+    /// the session has no services stream open. A transfer that already
+    /// ended is left as it is.
+    pub fn cancel(&self, session_id: &str, xfer: u32) -> bool {
+        self.op(session_id, HostOp::Cancel(xfer))
+    }
+
+    fn op(&self, session_id: &str, op: HostOp) -> bool {
         lock(&self.controls)
             .get(session_id)
-            .is_some_and(|ops| ops.try_send(HostOp::Chat(text)).is_ok())
+            .is_some_and(|ops| ops.try_send(op).is_ok())
     }
 
     /// Serve one stream accepted on the onion service's services port, from
@@ -353,6 +375,22 @@ impl ServicesHost {
         if caps == 0 {
             return Err(reason::NOT_OFFERED);
         }
+        let welcome = self.welcome(caps, &policy);
+        let inbox = match &self.env.inbox {
+            Some(dir) if caps & caps::UPLOAD != 0 => Some(Inbox::new(
+                dir.clone(),
+                InboxLimits {
+                    max_file: welcome.file_max,
+                    quota: policy.session_quota,
+                    files: u32::from(self.limits.session_files),
+                    keep_free: policy.keep_free,
+                    min_charge: self.limits.min_file_charge,
+                    recheck_every: self.limits.recheck_free_every,
+                },
+                Arc::clone(&self.env.free_space),
+            )),
+            _ => None,
+        };
         Ok(Opened {
             end,
             capture,
@@ -360,7 +398,8 @@ impl ServicesHost {
             caps,
             clipboard_refused: eligible & caps::CLIP != 0 && link.is_none(),
             link,
-            welcome: self.welcome(caps, &policy),
+            welcome,
+            inbox,
         })
     }
 
@@ -446,9 +485,18 @@ impl ServicesHost {
             mut link,
             clipboard_refused,
             welcome,
+            inbox,
         } = opened;
         let state = Arc::new(CapState::new(caps));
         let (outbox, mut writer) = spawn_writer(wr);
+        let (uploads, mut reports) = HostUploads::new(
+            &session_id,
+            inbox,
+            Arc::clone(&self.observer),
+            outbox.clone(),
+            welcome.bulk_window,
+            &self.limits,
+        );
         // The first frame: nothing else is queued yet.
         outbox.ctrl(SvcMsg::Welcome(welcome));
         let (tx, mut inbound) = mpsc::channel(self.limits.inbound_depth.max(1));
@@ -472,6 +520,7 @@ impl ServicesHost {
             outbox: &outbox,
             chat: ChatGate::new(chat::now()),
             summary: ServicesSummary::default(),
+            uploads,
         };
         // The `Close` reason, and whether to write it (not to a viewer that
         // closed, nor on a stream that failed).
@@ -496,6 +545,11 @@ impl ServicesHost {
                     }
                 }
                 _ = writer.stopped() => break (reason::IO, false),
+                Some(report) = reports.recv() => {
+                    if let Err(code) = served.uploads.on_worker(report) {
+                        break (code, true);
+                    }
+                }
                 Some(op) = ops.recv() => {
                     if let Some(code) = served.on_op(op) {
                         break (code, true);
@@ -513,18 +567,30 @@ impl ServicesHost {
                 },
             }
         };
-        let summary = served.summary;
+        let Served {
+            mut summary,
+            mut uploads,
+            ..
+        } = served;
+        summary.files_in = uploads.files_in;
+        summary.bytes_in = uploads.bytes_in;
 
         lock(&self.controls).remove(&session_id);
+        // Every worker stops first: each deletes what it wrote.
+        uploads.stop();
         drop(link);
         reader.abort();
         let _ = writer.close(write_close.then_some(code)).await;
+        uploads.join(WORKERS_WAIT).await;
+        drop(reports);
         let frames = state.counts();
         tracing::info!(
             session = %session_id,
             reason = code,
             chat_in = summary.chat_in,
             chat_out = summary.chat_out,
+            files_in = summary.files_in,
+            bytes_in = summary.bytes_in,
             dropped = summary.dropped,
             decoded = frames.decoded,
             skipped = frames.skipped,
@@ -560,6 +626,7 @@ struct Served<'a> {
     outbox: &'a Outbox,
     chat: ChatGate,
     summary: ServicesSummary,
+    uploads: HostUploads,
 }
 
 impl Served<'_> {
@@ -583,9 +650,48 @@ impl Served<'_> {
             }
             // The viewer ends the stream: nothing more is written to it.
             SvcMsg::Close { reason } => Some((reason, false)),
-            // The clipboard, uploads, browsing and downloads are served from
-            // the design's steps 14–19 on; until then a granted frame of
-            // theirs is read and left unanswered.
+            SvcMsg::Offer(offer) => {
+                let paused = self.state.paused() & caps::UPLOAD != 0;
+                self.uploads
+                    .offer(offer, paused)
+                    .err()
+                    .map(|code| (code, true))
+            }
+            SvcMsg::Data {
+                xfer,
+                offset,
+                bytes,
+            } => self
+                .uploads
+                .data(xfer, offset, bytes)
+                .err()
+                .map(|code| (code, true)),
+            SvcMsg::Done(done) => self.uploads.done(done).err().map(|code| (code, true)),
+            SvcMsg::Cancel(cancel) => match self.uploads.cancelled(cancel) {
+                Ok(true) => None,
+                // A download's (not served yet) or one that ended.
+                Ok(false) => self
+                    .uploads
+                    .late(cancel.xfer)
+                    .err()
+                    .map(|code| (code, true)),
+                Err(code) => Some((code, true)),
+            },
+            // Downloads are served from the design's step 17 on: a `Get`
+            // takes its id, and is left unanswered until then.
+            SvcMsg::Get(get) => {
+                if let Err(code) = self.uploads.unserved(get.xfer) {
+                    return Some((code, true));
+                }
+                tracing::trace!(
+                    session = %self.session_id,
+                    "services download not served by this build"
+                );
+                None
+            }
+            // The clipboard, listings and the rest of downloads are served
+            // from the design's steps 16–19 on; until then a granted frame
+            // of theirs is read and left unanswered.
             other => {
                 tracing::trace!(
                     session = %self.session_id,
@@ -615,6 +721,7 @@ impl Served<'_> {
                 self.summary.chat_out = self.summary.chat_out.saturating_add(1);
                 None
             }
+            HostOp::Cancel(xfer) => self.uploads.cancel(xfer, reason::BY_HOST).err(),
         }
     }
 
@@ -632,6 +739,11 @@ impl Served<'_> {
         );
         if left == before {
             return None;
+        }
+        // Running uploads end before the viewer hears the caps, so that each
+        // gets its own reason.
+        if let Err(code) = self.uploads.cancel_all(reason::TURNED_OFF) {
+            return Some(code);
         }
         if left == 0 {
             return Some(reason::NOT_OFFERED);

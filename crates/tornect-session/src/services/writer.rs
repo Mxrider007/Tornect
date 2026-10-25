@@ -5,12 +5,13 @@
 //! 1. `close`: the stream's end, which drops whatever is still queued;
 //! 2. `ctrl` ([`CTRL_DEPTH`], never awaited: a full queue means the peer
 //!    stopped reading, and the stream ends with `Close{PROTOCOL}`):
-//!    `Welcome`, `Refused`, `Caps`, `Chat`, `Accepted`, `Sending`, `Done`,
+//!    `Welcome`, `Refused`, `Caps`, `Chat`, `Offer`, `Accepted`, `Sending`,
 //!    `Complete`, `Cancel`, `Credit`, `ListFailed`;
 //! 3. `list` ([`LIST_DEPTH`], awaited): `Listing` pages, one at a time;
 //! 4. `clip` and `data` ([`BULK_DEPTH`] each, awaited): `ClipStart`,
 //!    `ClipChunk` and `Data`, which a sender queues only once its bulk window
-//!    lets it.
+//!    lets it, and a file's `Done`, queued behind its last `Data` so that it
+//!    never overtakes it.
 //!
 //! A frame being written is not interrupted by a queued one; it is by the
 //! stream's end, which then writes nothing more (a frame cut short leaves
@@ -37,13 +38,12 @@ pub(crate) const LAST_WRITE: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub(crate) struct Outbox {
     ctrl: mpsc::Sender<SvcMsg>,
-    // The listing, clipboard and file queues are fed by the later services
-    // steps (the design's steps 15–18); the writer drains them already.
+    // The listing and clipboard queues are fed by the later services steps
+    // (the design's steps 17–18); the writer drains them already.
     #[cfg_attr(not(test), allow(dead_code))]
     list: mpsc::Sender<SvcMsg>,
     #[cfg_attr(not(test), allow(dead_code))]
     clip: mpsc::Sender<SvcMsg>,
-    #[cfg_attr(not(test), allow(dead_code))]
     data: mpsc::Sender<SvcMsg>,
 }
 
@@ -66,8 +66,8 @@ impl Outbox {
         self.clip.send(msg).await.is_ok()
     }
 
-    /// Queue a `Data` frame, waiting for room.
-    #[cfg(test)]
+    /// Queue a `Data` frame (or the `Done` behind a file's last one),
+    /// waiting for room.
     pub(crate) async fn data(&self, msg: SvcMsg) -> bool {
         self.data.send(msg).await.is_ok()
     }

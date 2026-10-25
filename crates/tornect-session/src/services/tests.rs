@@ -1,15 +1,18 @@
 //! The services streams end to end over in-process pipes (the services
-//! design §10, tests 1, 2, 10 and 15 and the close paths of step 12): a real
-//! [`MediaHost`] registry, its capture state driven by hand or by a real
-//! media stream, a fake desktop clipboard, and a temporary inbox.
+//! design §10, tests 1, 2, 4, 5, 6, 10, 12 and 15 and the close paths of
+//! step 12): a real [`MediaHost`] registry, its capture state driven by hand
+//! or by a real media stream, a fake desktop clipboard, a temporary inbox
+//! and a fake reading of its disk's free space.
 
+use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, DuplexStream, ReadBuf, duplex};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -20,7 +23,7 @@ use tornect_core::session_log::SessionMode;
 use tornect_input::clipboard::{ClipboardLink, DesktopEnds};
 use tornect_input::{InputError, InputEvent, InputSink};
 use tornect_proto::services::{
-    Bind, CHUNK, Cancel, Caps, Chat, ClipStart, ClipSwitch, Complete, Done, Get, List,
+    Accepted, Bind, CHUNK, Cancel, Caps, Chat, ClipStart, ClipSwitch, Complete, Done, Get, List,
     MAX_CHAT_BYTES, MAX_CLIP, MAX_SERVICES_FRAME, Offer, SvcMsg, Welcome, caps, read_body_max,
     read_header, reason, services_bind_mac, ty, write_msg,
 };
@@ -143,6 +146,13 @@ struct Rig {
     policy: watch::Sender<ServicesPolicy>,
     /// Holds the inbox, `Tornect` in it.
     home: tempfile::TempDir,
+    /// What the inbox's disk has free.
+    free: Arc<AtomicU64>,
+    /// While set, a reading of the free space waits: the upload worker
+    /// reading it stalls.
+    stall: Arc<AtomicBool>,
+    /// Readings that waited on [`Rig::stall`].
+    stalled: Arc<AtomicUsize>,
 }
 
 impl Rig {
@@ -216,10 +226,25 @@ fn rig_on(
     let home = tempfile::tempdir().unwrap();
     let (tx, heard) = mpsc::unbounded_channel();
     let (policy, policy_rx) = watch::channel(policy);
+    let free = Arc::new(AtomicU64::new(u64::MAX / 2));
+    let stall = Arc::new(AtomicBool::new(false));
+    let stalled = Arc::new(AtomicUsize::new(0));
+    let free_space: FreeSpaceFn = {
+        let (free, stall, stalled) = (Arc::clone(&free), Arc::clone(&stall), Arc::clone(&stalled));
+        Arc::new(move |_: &std::path::Path| {
+            if stall.load(Ordering::SeqCst) {
+                stalled.fetch_add(1, Ordering::SeqCst);
+                while stall.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(free.load(Ordering::SeqCst))
+        })
+    };
     let env = ServicesEnv {
         inbox: inbox.then(|| home.path().join("Tornect")),
         inbox_words: INBOX_WORDS.to_owned(),
-        free_space: Arc::new(|_: &std::path::Path| Ok(u64::MAX / 2)),
+        free_space,
     };
     let services = Arc::new(ServicesHost::new(
         Arc::clone(&media),
@@ -235,6 +260,9 @@ fn rig_on(
         heard,
         policy,
         home,
+        free,
+        stall,
+        stalled,
     }
 }
 
@@ -1586,6 +1614,847 @@ async fn the_viewer_follows_and_polices_the_host() {
         assert_eq!(r.events.recv().await, Some(ViewerEvent::Closed(code)));
         assert_eq!(r.task.await.unwrap(), ViewerServicesEnd::Refused(code));
     }
+}
+
+// --- Tests 4, 5, 6 and 12: uploads ------------------------------------------
+
+/// How long a sender that waits on its window is watched to send nothing.
+const QUIET: Duration = Duration::from_millis(300);
+
+impl Rig {
+    /// The next transfer row of session `id`.
+    async fn row(&mut self, id: &str) -> TransferRow {
+        match self.event(id).await {
+            HostEvent::Transfer(row) => row,
+            other => panic!("expected a transfer row, got {other:?}"),
+        }
+    }
+
+    /// Wait until some reading of the free space waits on [`Rig::stall`].
+    async fn stalled(&self) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while self.stalled.load(Ordering::SeqCst) == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "no worker stalled");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+}
+
+/// The names in the inbox, sorted; none when it does not exist.
+fn inbox_names(rig: &Rig) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(rig.inbox())
+        .map(|dir| {
+            dir.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Wait until the inbox holds exactly `names`: an upload's worker deletes
+/// its files once the stream's loop let it go.
+async fn inbox_settles(rig: &Rig, names: &[&str]) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let got = inbox_names(rig);
+        if got == names {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the inbox holds {got:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn offer(xfer: u32, name: &str, size: u64) -> SvcMsg {
+    SvcMsg::Offer(Offer {
+        xfer,
+        name: name.into(),
+        size,
+    })
+}
+
+fn accepted(xfer: u32, name: &str) -> SvcMsg {
+    SvcMsg::Accepted(Accepted {
+        xfer,
+        name: name.into(),
+    })
+}
+
+fn cancel(xfer: u32, reason: u16) -> SvcMsg {
+    SvcMsg::Cancel(Cancel { xfer, reason })
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+/// Send `bytes` of transfer `xfer` from `offset`, a chunk a frame.
+async fn send_data(client: &mut DuplexStream, xfer: u32, offset: u64, bytes: &[u8]) {
+    let mut at = offset;
+    for piece in bytes.chunks(CHUNK) {
+        write_msg(
+            client,
+            &SvcMsg::Data {
+                xfer,
+                offset: at,
+                bytes: piece.to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        at += piece.len() as u64;
+    }
+}
+
+/// Upload `content` (within the window) as transfer `xfer` named `name`
+/// from a raw viewer, through to `Complete`: the name the host stored it
+/// under.
+async fn upload(client: &mut DuplexStream, xfer: u32, name: &str, content: &[u8]) -> String {
+    assert!(content.len() <= 256 * 1024);
+    write_msg(client, &offer(xfer, name, content.len() as u64))
+        .await
+        .unwrap();
+    let Some(SvcMsg::Accepted(took)) = next(client).await else {
+        panic!("expected Accepted");
+    };
+    assert_eq!(took.xfer, xfer);
+    send_data(client, xfer, 0, content).await;
+    write_msg(
+        client,
+        &SvcMsg::Done(Done {
+            xfer,
+            sha256: sha256(content),
+        }),
+    )
+    .await
+    .unwrap();
+    loop {
+        match next(client).await {
+            Some(SvcMsg::Credit { xfer: x, .. }) if x == xfer => {}
+            Some(SvcMsg::Complete(Complete { xfer: x })) if x == xfer => return took.name,
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+}
+
+/// A [`ServicesViewer`]'s loop, running.
+struct Running {
+    ops: mpsc::Sender<ViewerOp>,
+    events: mpsc::Receiver<ViewerEvent>,
+    task: JoinHandle<ViewerServicesEnd>,
+    stop: tokio::sync::oneshot::Sender<()>,
+}
+
+fn run_viewer(viewer: ServicesViewer<DuplexStream>) -> Running {
+    let (ops, ops_rx) = mpsc::channel(8);
+    let (events_tx, events) = mpsc::channel(1024);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(viewer.run(ops_rx, events_tx, async {
+        let _ = stopped.await;
+    }));
+    Running {
+        ops,
+        events,
+        task,
+        stop,
+    }
+}
+
+/// A [`ServicesViewer`] bound to `rig`'s host for `session` and running,
+/// its `Welcome`, and the host's end.
+async fn viewing(rig: &Rig, session: &Session) -> (Running, Welcome, JoinHandle<ServicesOutcome>) {
+    let (client, host) = open(&rig.services);
+    let (viewer, welcome) = ServicesViewer::bind(client, &session.binding, WAIT)
+        .await
+        .unwrap();
+    (run_viewer(viewer), welcome, host)
+}
+
+/// The viewer's next event, which must be a transfer row.
+async fn transfer(events: &mut mpsc::Receiver<ViewerEvent>) -> TransferRow {
+    match tokio::time::timeout(WAIT, events.recv()).await {
+        Ok(Some(ViewerEvent::Transfer(row))) => row,
+        other => panic!("expected a transfer row, got {other:?}"),
+    }
+}
+
+/// The services design's test 4: files sent through [`ServicesViewer`] land
+/// in the inbox under their sanitised names, a taken name gets ` (2)`, each
+/// is its owner's only, its hash is checked, and both ends see it `Done`
+/// under the stored name (the row the app's `file_received` record takes).
+/// A file beyond the window moves as the host credits it; a third file
+/// waits for one of the two places.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uploads_land_in_the_inbox_under_sanitised_names() {
+    let mut rig = rig();
+    let session = start(&rig, 200, SessionMode::Control);
+    session.live(true);
+    let (mut v, got, host) = viewing(&rig, &session).await;
+    assert_eq!(got.caps, caps::ALL);
+    assert_eq!(got.bulk_window, 256 * 1024);
+    rig.event(&session.id).await;
+
+    let local = tempfile::tempdir().unwrap();
+    let big: Vec<u8> = (0..300 * 1024 + 123).map(|n| (n % 251) as u8).collect();
+    let tricky = local.path().join("my\u{202e}report.txt");
+    std::fs::write(&tricky, &big).unwrap();
+    let small = local.path().join("notes.txt");
+    std::fs::write(&small, b"hello").unwrap();
+    for path in [&tricky, &tricky, &small] {
+        v.ops
+            .send(ViewerOp::UploadPath(path.clone()))
+            .await
+            .unwrap();
+    }
+
+    // The viewer's rows, in order, until all three ended.
+    let mut rows = Vec::new();
+    let mut ended = HashMap::new();
+    while ended.len() < 3 {
+        let row = transfer(&mut v.events).await;
+        assert_eq!(row.dir, Direction::ToHost);
+        if !matches!(row.state, TransferState::Queued | TransferState::Running) {
+            ended.insert(row.xfer, row.clone());
+        }
+        rows.push(row);
+    }
+    let stored = |row: &TransferRow| match &row.state {
+        TransferState::Done { stored } => stored.as_str().to_owned(),
+        other => panic!("not done: {other:?}"),
+    };
+    let mut twins = vec![stored(&ended[&1]), stored(&ended[&2])];
+    twins.sort();
+    assert_eq!(twins, ["myreport (2).txt", "myreport.txt"]);
+    assert_eq!(stored(&ended[&3]), "notes.txt");
+    for id in [1, 2] {
+        assert_eq!(ended[&id].name.as_str(), "myreport.txt");
+        assert_eq!(
+            (ended[&id].size, ended[&id].done),
+            (big.len() as u64, big.len() as u64)
+        );
+    }
+    assert!(
+        rows.iter().any(|row| row.state == TransferState::Running
+            && row.done > 0
+            && row.done < big.len() as u64),
+        "credits came while the file moved"
+    );
+    let first_end = rows
+        .iter()
+        .position(|row| row.xfer != 3 && matches!(row.state, TransferState::Done { .. }))
+        .unwrap();
+    let third_runs = rows
+        .iter()
+        .position(|row| row.xfer == 3 && row.state == TransferState::Running)
+        .unwrap();
+    assert!(first_end < third_runs, "the third file waited for a place");
+
+    // The host's rows say the same, under the stored names.
+    let mut host_done = Vec::new();
+    while host_done.len() < 3 {
+        let row = rig.row(&session.id).await;
+        assert_eq!(row.dir, Direction::ToHost);
+        match row.state {
+            TransferState::Running => {}
+            TransferState::Done { ref stored } => {
+                assert_eq!(row.name, *stored);
+                assert_eq!(row.done, row.size);
+                host_done.push(stored.as_str().to_owned());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    host_done.sort();
+    assert_eq!(host_done, ["myreport (2).txt", "myreport.txt", "notes.txt"]);
+
+    assert_eq!(
+        inbox_names(&rig),
+        ["myreport (2).txt", "myreport.txt", "notes.txt"],
+        "no part file is left"
+    );
+    for name in ["myreport (2).txt", "myreport.txt"] {
+        assert_eq!(std::fs::read(rig.inbox().join(name)).unwrap(), big);
+    }
+    assert_eq!(
+        std::fs::read(rig.inbox().join("notes.txt")).unwrap(),
+        b"hello"
+    );
+    #[cfg(unix)]
+    for name in inbox_names(&rig) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(rig.inbox().join(&name))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "{name}");
+    }
+
+    v.stop.send(()).unwrap();
+    assert_eq!(v.task.await.unwrap(), ViewerServicesEnd::Stopped);
+    let (code, summary, _) = served(host).await;
+    assert_eq!(code, reason::SESSION_OVER);
+    assert_eq!(summary.files_in, 3);
+    assert_eq!(summary.bytes_in, 2 * big.len() as u64 + 5);
+    let HostEvent::Closed { summary, .. } = rig.event(&session.id).await else {
+        panic!("expected Closed");
+    };
+    assert_eq!(summary.files_in, 3);
+
+    // A file whose hash does not match, or that is cut short, is refused
+    // `CORRUPT` and deleted.
+    let session = start(&rig, 201, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    welcome(&mut client, &session).await;
+    rig.event(&session.id).await;
+    write_msg(&mut client, &offer(1, "bad.bin", 10))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut client).await, Some(accepted(1, "bad.bin")));
+    send_data(&mut client, 1, 0, &[1; 10]).await;
+    write_msg(
+        &mut client,
+        &SvcMsg::Done(Done {
+            xfer: 1,
+            sha256: sha256(&[2; 10]),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Credit { xfer: 1, upto: 10 })
+    );
+    assert_eq!(next(&mut client).await, Some(cancel(1, reason::CORRUPT)));
+    write_msg(&mut client, &offer(2, "short.bin", 10))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut client).await, Some(accepted(2, "short.bin")));
+    send_data(&mut client, 2, 0, &[1; 5]).await;
+    write_msg(
+        &mut client,
+        &SvcMsg::Done(Done {
+            xfer: 2,
+            sha256: sha256(&[1; 5]),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut client).await, Some(cancel(2, reason::CORRUPT)));
+    assert_eq!(
+        inbox_names(&rig),
+        ["myreport (2).txt", "myreport.txt", "notes.txt"]
+    );
+    let mut ends = Vec::new();
+    while ends.len() < 2 {
+        let row = rig.row(&session.id).await;
+        if row.state != TransferState::Running {
+            ends.push((row.name.as_str().to_owned(), row.state));
+        }
+    }
+    assert_eq!(
+        ends,
+        [
+            ("bad.bin".to_owned(), TransferState::Failed(reason::CORRUPT)),
+            (
+                "short.bin".to_owned(),
+                TransferState::Failed(reason::CORRUPT)
+            ),
+        ]
+    );
+    drop(client);
+    let (_, summary, _) = served(task).await;
+    assert_eq!(summary.files_in, 0);
+}
+
+/// A raw viewer that has sent the first 64 KiB of a 1 MiB file as transfer
+/// 1 to a new session of `rig`, which the host wrote and credited: its part
+/// file and its reservation are in the inbox.
+async fn midway(rig: &mut Rig, seed: u8) -> (Session, DuplexStream, JoinHandle<ServicesOutcome>) {
+    let session = start(rig, seed, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    welcome(&mut client, &session).await;
+    rig.event(&session.id).await;
+    write_msg(&mut client, &offer(1, "big.bin", 1 << 20))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut client).await, Some(accepted(1, "big.bin")));
+    send_data(&mut client, 1, 0, &vec![7; 64 * 1024]).await;
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Credit {
+            xfer: 1,
+            upto: 64 * 1024
+        })
+    );
+    assert_eq!(rig.row(&session.id).await.done, 0);
+    assert_eq!(rig.row(&session.id).await.done, 64 * 1024);
+    assert_eq!(inbox_names(rig), ["big.bin", "big.bin.tornect-part"]);
+    (session, client, task)
+}
+
+/// The services design's test 5: whatever ends an upload midway (a cancel
+/// by either side, a protocol error, the session's end, capture stopping,
+/// lost input, the viewer leaving, the kill switch) leaves neither its part
+/// file nor its reservation; on the stream's end, none is left once
+/// `serve` returned. The kill switch's `Close` goes out within 100 ms even
+/// while a worker is stuck in a write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_end_of_an_upload_leaves_nothing_in_the_inbox() {
+    let mut rig = rig_with(Build {
+        limits: ServicesLimits {
+            recheck_free_every: CHUNK as u64,
+            ..ServicesLimits::default()
+        },
+        ..Build::default()
+    });
+    let kill = KillSwitch::new();
+    let watcher = rig.media.watch_kill(kill.clone());
+
+    // The viewer stops it; its data still in flight is dropped, and the
+    // stream goes on.
+    let (session, mut client, task) = midway(&mut rig, 210).await;
+    write_msg(&mut client, &cancel(1, reason::BY_VIEWER))
+        .await
+        .unwrap();
+    send_data(&mut client, 1, 64 * 1024, &[7; 100]).await;
+    assert_eq!(
+        rig.row(&session.id).await.state,
+        TransferState::Cancelled(reason::BY_VIEWER)
+    );
+    inbox_settles(&rig, &[]).await;
+    write_msg(&mut client, &chat("still here")).await.unwrap();
+    assert!(matches!(rig.event(&session.id).await, HostEvent::Chat(_)));
+    drop(client);
+    assert_eq!(served(task).await.0, reason::BY_VIEWER);
+
+    // The host's user stops it.
+    let (session, mut client, task) = midway(&mut rig, 211).await;
+    assert!(rig.services.cancel(&session.id, 1));
+    assert_eq!(next(&mut client).await, Some(cancel(1, reason::BY_HOST)));
+    assert_eq!(
+        rig.row(&session.id).await.state,
+        TransferState::Cancelled(reason::BY_HOST)
+    );
+    inbox_settles(&rig, &[]).await;
+    assert!(rig.services.cancel(&session.id, 1), "ended: left as it is");
+    write_msg(&mut client, &chat("still here")).await.unwrap();
+    assert!(matches!(rig.event(&session.id).await, HostEvent::Chat(_)));
+    drop(client);
+    served(task).await;
+
+    // A protocol error: bytes out of order.
+    let (_, mut client, task) = midway(&mut rig, 212).await;
+    send_data(&mut client, 1, 0, &[7; 10]).await;
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Close {
+            reason: reason::PROTOCOL
+        })
+    );
+    assert_eq!(served(task).await.0, reason::PROTOCOL);
+    assert_eq!(inbox_names(&rig), Vec::<String>::new());
+
+    // The session ends.
+    let (session, mut client, task) = midway(&mut rig, 213).await;
+    rig.media.on_end(&session.id, None);
+    rig.services.on_end(&session.id);
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Close {
+            reason: reason::SESSION_OVER
+        })
+    );
+    assert_eq!(served(task).await.0, reason::SESSION_OVER);
+    assert_eq!(inbox_names(&rig), Vec::<String>::new());
+
+    // Capture stops.
+    let (session, mut client, task) = midway(&mut rig, 214).await;
+    session.capture.send_replace(CaptureState::Stopped);
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Close {
+            reason: reason::CAPTURE_STOPPED
+        })
+    );
+    assert_eq!(served(task).await.0, reason::CAPTURE_STOPPED);
+    assert_eq!(inbox_names(&rig), Vec::<String>::new());
+
+    // The viewer's input is lost: uploads are turned off, each running one
+    // cancelled before the viewer hears the caps.
+    let (session, mut client, task) = midway(&mut rig, 215).await;
+    session.live(false);
+    assert_eq!(next(&mut client).await, Some(cancel(1, reason::TURNED_OFF)));
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Caps(Caps {
+            caps: caps::CHAT,
+            paused: 0
+        }))
+    );
+    assert_eq!(
+        rig.row(&session.id).await.state,
+        TransferState::Cancelled(reason::TURNED_OFF)
+    );
+    inbox_settles(&rig, &[]).await;
+    drop(client);
+    served(task).await;
+
+    // The viewer leaves.
+    let (_, client, task) = midway(&mut rig, 216).await;
+    drop(client);
+    assert_eq!(served(task).await.0, reason::BY_VIEWER);
+    assert_eq!(inbox_names(&rig), Vec::<String>::new());
+
+    // The kill switch, while the worker is stuck in a write.
+    let (_, mut client, task) = midway(&mut rig, 217).await;
+    rig.stall.store(true, Ordering::SeqCst);
+    send_data(&mut client, 1, 64 * 1024, &vec![7; CHUNK]).await;
+    rig.stalled().await;
+    let killed = tokio::time::Instant::now();
+    kill.kill(bye::PANIC);
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Close {
+            reason: reason::ENDED_BY_HOST
+        })
+    );
+    let took = killed.elapsed();
+    assert!(took < Duration::from_millis(100), "Close took {took:?}");
+    assert_eq!(
+        inbox_names(&rig),
+        ["big.bin", "big.bin.tornect-part"],
+        "the stuck worker still holds its files"
+    );
+    rig.stall.store(false, Ordering::SeqCst);
+    assert_eq!(served(task).await.0, reason::ENDED_BY_HOST);
+    assert_eq!(inbox_names(&rig), Vec::<String>::new());
+    watcher.abort();
+}
+
+/// The services design's test 6: an offer the host cannot take is refused
+/// before a byte of it is written, with no row: over the largest file
+/// (`TOO_LARGE`), a name with nothing left (`BAD_NAME`), beyond the
+/// session's quota with tiny files counted at 4 KiB each (`QUOTA`), a disk
+/// that would keep less than its reserve free (`NO_SPACE`), and a third
+/// upload while two run (`BUSY`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uploads_are_refused_before_any_byte_is_written() {
+    const KEEP_FREE: u64 = 1 << 20;
+    let mut rig = rig_with(Build {
+        policy: ServicesPolicy {
+            max_file: 1 << 20,
+            session_quota: 2 * 4096,
+            keep_free: KEEP_FREE,
+            ..ServicesPolicy::default()
+        },
+        ..Build::default()
+    });
+    let session = start(&rig, 220, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    let got = welcome(&mut client, &session).await;
+    assert_eq!((got.file_max, got.session_quota), (1 << 20, 2 * 4096));
+    rig.event(&session.id).await;
+
+    write_msg(&mut client, &offer(1, "huge.bin", (1 << 20) + 1))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut client).await, Some(cancel(1, reason::TOO_LARGE)));
+    write_msg(&mut client, &offer(2, "..", 10)).await.unwrap();
+    assert_eq!(next(&mut client).await, Some(cancel(2, reason::BAD_NAME)));
+    // Two files of 10 bytes spend the quota of 8 KiB.
+    assert_eq!(
+        upload(&mut client, 3, "a.txt", b"0123456789").await,
+        "a.txt"
+    );
+    assert_eq!(
+        upload(&mut client, 4, "b.txt", b"0123456789").await,
+        "b.txt"
+    );
+    write_msg(&mut client, &offer(5, "c.txt", 1)).await.unwrap();
+    assert_eq!(next(&mut client).await, Some(cancel(5, reason::QUOTA)));
+    // Data of a refused offer, in flight, is dropped.
+    send_data(&mut client, 5, 0, &[1]).await;
+    assert_eq!(inbox_names(&rig), ["a.txt", "b.txt"]);
+    drop(client);
+    let (_, summary, _) = served(task).await;
+    assert_eq!((summary.files_in, summary.bytes_in), (2, 20));
+
+    // A later session, with a quota to spare, on a disk nearly full.
+    rig.policy
+        .send_modify(|policy| policy.session_quota = 1 << 30);
+    let session = start(&rig, 221, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    welcome(&mut client, &session).await;
+    rig.free.store(KEEP_FREE + 99, Ordering::SeqCst);
+    write_msg(&mut client, &offer(1, "d.bin", 100))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut client).await, Some(cancel(1, reason::NO_SPACE)));
+    rig.free.store(KEEP_FREE + 100, Ordering::SeqCst);
+    assert_eq!(upload(&mut client, 2, "d.bin", &[1; 100]).await, "d.bin");
+    rig.free.store(u64::MAX / 2, Ordering::SeqCst);
+    // Two run; a third is busy.
+    write_msg(&mut client, &offer(3, "e1.bin", 10))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut client).await, Some(accepted(3, "e1.bin")));
+    write_msg(&mut client, &offer(4, "e2.bin", 10))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut client).await, Some(accepted(4, "e2.bin")));
+    write_msg(&mut client, &offer(5, "e3.bin", 10))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut client).await, Some(cancel(5, reason::BUSY)));
+    for xfer in [3, 4] {
+        write_msg(&mut client, &cancel(xfer, reason::BY_VIEWER))
+            .await
+            .unwrap();
+    }
+    inbox_settles(&rig, &["a.txt", "b.txt", "d.bin"]).await;
+    // An id used once is never used again, refused or not.
+    write_msg(&mut client, &offer(5, "again.bin", 10))
+        .await
+        .unwrap();
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Close {
+            reason: reason::PROTOCOL
+        })
+    );
+    served(task).await;
+
+    // Only files the inbox took have rows.
+    let mut named = Vec::new();
+    while let Ok((_, event)) = rig.heard.try_recv() {
+        if let HostEvent::Transfer(row) = event {
+            named.push(row.name.as_str().to_owned());
+        }
+    }
+    named.sort();
+    named.dedup();
+    assert_eq!(named, ["a.txt", "b.txt", "d.bin", "e1.bin", "e2.bin"]);
+}
+
+/// Test 6: a session takes 1000 files, however small, each counted 4 KiB
+/// toward its quota: the 1001st is refused `QUOTA`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_takes_a_thousand_files_at_most() {
+    let rig = rig();
+    let session = start(&rig, 230, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    assert_eq!(welcome(&mut client, &session).await.session_files, 1000);
+    for n in 1..=1000u32 {
+        upload(&mut client, n, &format!("t{n}"), &[1]).await;
+    }
+    write_msg(&mut client, &offer(1001, "t1001", 1))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut client).await, Some(cancel(1001, reason::QUOTA)));
+    assert_eq!(inbox_names(&rig).len(), 1000);
+    drop(client);
+    let (_, summary, _) = served(task).await;
+    assert_eq!((summary.files_in, summary.bytes_in), (1000, 1000));
+}
+
+/// Read the `Data` of `xfer` from `offset` until nothing comes for
+/// [`QUIET`]: the bytes read.
+async fn data_until_quiet(host: &mut DuplexStream, xfer: u32, offset: u64) -> u64 {
+    let mut got = 0;
+    loop {
+        let Ok(header) = tokio::time::timeout(QUIET, read_header(host)).await else {
+            return got;
+        };
+        let header = header.unwrap().expect("a frame");
+        let body = read_body_max(host, header, MAX_SERVICES_FRAME)
+            .await
+            .unwrap();
+        match SvcMsg::decode(header.ty, &body).unwrap() {
+            SvcMsg::Data {
+                xfer: x,
+                offset: at,
+                bytes,
+            } if x == xfer && at == offset + got => got += bytes.len() as u64,
+            other => panic!("expected Data, got {other:?}"),
+        }
+    }
+}
+
+/// The services design's test 12: a sender keeps at most the bulk window
+/// beyond what its receiver credited. The viewer, sending to a host that
+/// withholds `Credit`, stops at 256 KiB, and sends exactly what a credit
+/// frees; a credit beyond what it sent ends the stream, and the upload
+/// with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sender_keeps_to_the_bulk_window() {
+    let mut granted = test_welcome(caps::CHAT | caps::UPLOAD);
+    granted.bulk_window = 256 * 1024;
+    let (mut host, bound) = raw_host(Some(SvcMsg::Welcome(granted)), WAIT).await;
+    let mut v = run_viewer(bound.unwrap().0);
+    let local = tempfile::tempdir().unwrap();
+    let path = local.path().join("f.bin");
+    std::fs::write(&path, vec![5u8; 1 << 20]).unwrap();
+    v.ops.send(ViewerOp::UploadPath(path)).await.unwrap();
+    assert_eq!(next(&mut host).await, Some(offer(1, "f.bin", 1 << 20)));
+    write_msg(&mut host, &accepted(1, "f.bin")).await.unwrap();
+
+    let mut sent = data_until_quiet(&mut host, 1, 0).await;
+    assert_eq!(sent, 256 * 1024, "one window, then nothing");
+    write_msg(
+        &mut host,
+        &SvcMsg::Credit {
+            xfer: 1,
+            upto: 64 * 1024,
+        },
+    )
+    .await
+    .unwrap();
+    sent += data_until_quiet(&mut host, 1, sent).await;
+    assert_eq!(sent, 320 * 1024, "exactly what the credit freed");
+
+    // A credit of clipboard bytes, none of which were sent.
+    write_msg(&mut host, &SvcMsg::Credit { xfer: 0, upto: 1 })
+        .await
+        .unwrap();
+    assert_eq!(
+        next(&mut host).await,
+        Some(SvcMsg::Close {
+            reason: reason::PROTOCOL
+        })
+    );
+    assert_eq!(
+        v.task.await.unwrap(),
+        ViewerServicesEnd::Refused(reason::PROTOCOL)
+    );
+    let mut last = None;
+    while let Some(event) = v.events.recv().await {
+        match event {
+            ViewerEvent::Transfer(row) => last = Some(row),
+            ViewerEvent::Closed(code) => {
+                assert_eq!(code, reason::PROTOCOL);
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let last = last.unwrap();
+    assert_eq!(last.state, TransferState::Failed(reason::PROTOCOL));
+    assert_eq!(last.done, 64 * 1024, "what the host credited");
+}
+
+/// Test 12, the host's side: a viewer that keeps to the window is never
+/// refused, even while the host's disk is slow and it credits nothing; one
+/// byte beyond the window ends the stream with `Close{PROTOCOL}`, and
+/// nothing of the file is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_host_holds_the_viewer_to_the_bulk_window() {
+    let mut rig = rig_with(Build {
+        limits: ServicesLimits {
+            recheck_free_every: CHUNK as u64,
+            ..ServicesLimits::default()
+        },
+        ..Build::default()
+    });
+    let session = start(&rig, 240, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    assert_eq!(welcome(&mut client, &session).await.bulk_window, 256 * 1024);
+    rig.event(&session.id).await;
+    write_msg(&mut client, &offer(1, "w.bin", 1 << 20))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut client).await, Some(accepted(1, "w.bin")));
+    assert_eq!(rig.row(&session.id).await.state, TransferState::Running);
+    rig.stall.store(true, Ordering::SeqCst);
+    send_data(&mut client, 1, 0, &vec![3; CHUNK]).await;
+    rig.stalled().await;
+    send_data(&mut client, 1, CHUNK as u64, &vec![3; 256 * 1024 - CHUNK]).await;
+    write_msg(&mut client, &chat("still here")).await.unwrap();
+    assert!(
+        matches!(rig.event(&session.id).await, HostEvent::Chat(_)),
+        "a full window, no credit, no refusal"
+    );
+    send_data(&mut client, 1, 256 * 1024, &[3]).await;
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Close {
+            reason: reason::PROTOCOL
+        })
+    );
+    rig.stall.store(false, Ordering::SeqCst);
+    assert_eq!(served(task).await.0, reason::PROTOCOL);
+    assert_eq!(inbox_names(&rig), Vec::<String>::new());
+}
+
+/// The viewer refuses, with nothing sent, what it cannot send: a folder
+/// (`NOT_A_FILE`), a missing file (`NOT_FOUND`), a file over the host's
+/// largest (`TOO_LARGE`), and anything once the host turned uploads off
+/// (`NOT_OFFERED`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_viewer_refuses_what_it_cannot_send() {
+    let (mut host, bound) = raw_host(
+        Some(SvcMsg::Welcome(test_welcome(caps::CHAT | caps::UPLOAD))),
+        WAIT,
+    )
+    .await;
+    let mut v = run_viewer(bound.unwrap().0);
+    let local = tempfile::tempdir().unwrap();
+    let big = local.path().join("big.bin");
+    std::fs::write(&big, vec![0u8; (1 << 20) + 1]).unwrap();
+    for (path, code) in [
+        (local.path().to_path_buf(), reason::NOT_A_FILE),
+        (local.path().join("missing"), reason::NOT_FOUND),
+        (big, reason::TOO_LARGE),
+    ] {
+        v.ops.send(ViewerOp::UploadPath(path)).await.unwrap();
+        assert_eq!(transfer(&mut v.events).await.state, TransferState::Queued);
+        assert_eq!(
+            transfer(&mut v.events).await.state,
+            TransferState::Failed(code)
+        );
+    }
+    v.ops
+        .send(ViewerOp::Chat(sanitize_peer_text("x").unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut host).await, Some(chat("x")), "no offer went out");
+
+    write_msg(
+        &mut host,
+        &SvcMsg::Caps(Caps {
+            caps: caps::CHAT,
+            paused: 0,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        v.events.recv().await,
+        Some(ViewerEvent::Caps { .. })
+    ));
+    let small = local.path().join("small.txt");
+    std::fs::write(&small, b"hi").unwrap();
+    v.ops.send(ViewerOp::UploadPath(small)).await.unwrap();
+    assert_eq!(
+        transfer(&mut v.events).await.state,
+        TransferState::Failed(reason::NOT_OFFERED)
+    );
+    v.ops
+        .send(ViewerOp::Chat(sanitize_peer_text("y").unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut host).await, Some(chat("y")), "no offer went out");
+    v.stop.send(()).unwrap();
+    assert_eq!(v.task.await.unwrap(), ViewerServicesEnd::Stopped);
 }
 
 // --- Test 15: eligible and granted ------------------------------------------

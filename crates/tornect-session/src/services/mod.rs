@@ -25,12 +25,22 @@
 //! Nothing here logs peer text, clipboard text, file names or host paths:
 //! only kinds, counts, byte totals and reason codes (§2.5).
 //!
+//! Files the viewer sends land in the host's inbox, `<Downloads>/Tornect`
+//! (the upload protocol, §3.5): each is written beside its reserved final
+//! name as a private `.tornect-part` file on a blocking worker, within the
+//! session's file count, byte quota and the disk's free space, checked
+//! against the sender's SHA-256 and renamed into place; whatever ends a
+//! transfer before that (a cancel, a protocol error, the session's end, the
+//! kill switch, capture stopping, lost input) deletes what was written. A
+//! sender keeps at most the bulk window of file bytes beyond what the
+//! receiver credited, and the receiver holds it to that.
+//!
 //! The stream is built in the design's steps: this build has the bind, the
-//! live wait, the caps, chat both ways and the close paths. The clipboard,
-//! uploads, browsing and downloads, the bulk window and the lock pause come
-//! with the design's steps 14–19; until then their frames, when granted,
-//! are read and left unanswered, and a granted clipboard link is held
-//! inactive, so the backend reads and sets nothing.
+//! live wait, the caps, chat both ways, uploads and the close paths.
+//! Browsing, downloads, the clipboard and the lock pause come with the
+//! design's steps 16–19; until then their frames, when granted, are read and
+//! left unanswered, and a granted clipboard link is held inactive, so the
+//! backend reads and sets nothing.
 //!
 //! [`MediaHost`]: crate::MediaHost
 
@@ -44,7 +54,10 @@ pub mod chat;
 mod host;
 mod reader;
 mod store;
+mod transfer;
+mod upload;
 mod viewer;
+mod window;
 mod writer;
 
 #[cfg(test)]
@@ -54,6 +67,7 @@ pub use chat::{CHAT_BURST, CHAT_RATE, ChatText, sanitize_peer_text};
 pub use host::{ServicesHost, ServicesOutcome, refuse};
 pub use reader::ReaderCounts;
 pub use store::{FreeSpaceFn, RECHECK_FREE_EVERY};
+pub use transfer::{Direction, MAX_UPLOADS, TransferRow, TransferState, Untrusted};
 pub use viewer::{
     ServicesBindError, ServicesBinding, ServicesViewer, ViewerEvent, ViewerOp, ViewerServicesEnd,
 };
@@ -130,6 +144,9 @@ pub struct ServicesLimits {
     pub session_files: u16,
     /// What each received file counts toward the session's quota at least.
     pub min_file_charge: u64,
+    /// Bytes of a received file written between two readings of the disk's
+    /// free space.
+    pub recheck_free_every: u64,
 }
 
 impl Default for ServicesLimits {
@@ -147,6 +164,7 @@ impl Default for ServicesLimits {
             max_handles: 65_536,
             session_files: 1000,
             min_file_charge: 4096,
+            recheck_free_every: RECHECK_FREE_EVERY,
         }
     }
 }
@@ -265,6 +283,11 @@ pub enum HostEvent {
     },
     /// The viewer wrote, sanitised ([`sanitize_peer_text`]).
     Chat(ChatText),
+    /// A transfer started, moved on or ended. An upload is told once the
+    /// inbox took it (refusals before that are not), at each credit, and at
+    /// its end; its `Done` carries the stored, sanitised name, the one
+    /// `sessions.log`'s `file_received` records.
+    Transfer(TransferRow),
     /// The stream ended.
     Closed {
         /// The `Close` reason written or received

@@ -28,10 +28,6 @@
 //! that owns its [`Incoming`] and is fed through a bounded channel. Nothing
 //! here logs a name or a path.
 
-// The upload protocol (the design's step 15) drives the inbox and its
-// workers; until then only the tests do.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Write as _};
@@ -66,6 +62,7 @@ const MAX_NTH: u32 = 999;
 /// What a Windows Explorer download writes into a file's `Zone.Identifier`
 /// stream: zone 3, the Internet. SmartScreen and Office's Protected View
 /// read it.
+#[cfg(any(windows, test))]
 pub(crate) const ZONE_IDENTIFIER: &[u8] = b"[ZoneTransfer]\r\nZoneId=3\r\n";
 
 /// What an inbox takes (design §2.6, §3.4).
@@ -276,6 +273,7 @@ fn reserve(dir: &Path, name: &str) -> Result<(PathBuf, PathBuf, File), u16> {
 
 /// Where Windows keeps a file's mark of origin: its `Zone.Identifier`
 /// alternate data stream.
+#[cfg(any(windows, test))]
 pub(crate) fn zone_stream(part: &Path) -> PathBuf {
     let mut stream = part.as_os_str().to_os_string();
     stream.push(":Zone.Identifier");

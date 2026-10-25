@@ -11,25 +11,39 @@
 //! the viewer sends ends the stream with `Close{PROTOCOL}`, one for a cap
 //! never granted with `Close{NOT_OFFERED}`, both before the body is read. A
 //! `Caps` may only take caps away; one that adds any is a protocol error.
+//!
+//! Files go to the host through [`ViewerOp::UploadPath`] (the upload
+//! protocol, §3.5): at most [`MAX_UPLOADS`](super::MAX_UPLOADS) are offered at
+//! once and the others wait, in order; each is read on a blocking worker and
+//! sent within the host's bulk window, and reported as
+//! [`ViewerEvent::Transfer`] rows under ids of their own.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
 use tornect_proto::services::{
-    Bind, Chat, Side, SvcError, SvcMsg, Welcome, caps, read_body_max, read_header, reason,
+    Bind, CHUNK, Chat, Side, SvcError, SvcMsg, Welcome, caps, read_body_max, read_header, reason,
     services_bind_mac, ty, write_msg,
 };
 use tornect_signal::consent::SessionToken;
 
 use super::chat::{self, ChatGate, ChatText, sanitize_peer_text};
 use super::reader::{CapState, Inbound, ReadEnd, read_frames};
+use super::transfer::TransferRow;
+use super::upload::ViewerUploads;
+use super::window::{CLIPBOARD, Window};
 use super::writer::spawn_writer;
 
 /// Decoded frames held between the viewer's reader and its loop.
 const INBOUND_DEPTH: usize = 8;
+
+/// Bound on each chunk read from a file being sent: a read that takes longer
+/// cancels the transfer with `IO` (the host's `read_timeout`, design §3.5).
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What the viewer binds its services stream with: the session's id and the
 /// services MAC over the handshake's final transcript (§3.3). Its `Debug`
@@ -98,6 +112,12 @@ pub enum ServicesBindError {
 pub enum ViewerOp {
     /// Write to the host's user.
     Chat(ChatText),
+    /// Send the file at this path to the host's inbox. It is reported as a
+    /// [`ViewerEvent::Transfer`] row under an id of its own; without
+    /// `UPLOAD` the row fails at once with `NOT_OFFERED`.
+    UploadPath(PathBuf),
+    /// Stop the transfer whose row has this id.
+    Cancel(u32),
 }
 
 /// What [`ServicesViewer::run`] reports.
@@ -112,6 +132,9 @@ pub enum ViewerEvent {
     },
     /// The host's user wrote, sanitised ([`sanitize_peer_text`]).
     Chat(ChatText),
+    /// A transfer was asked for, moved on or ended. Its `xfer` is the row's
+    /// id ([`ViewerOp::Cancel`] takes it), not the wire's.
+    Transfer(TransferRow),
     /// The stream ended with this [`reason`] code: the host's `Close`, or the
     /// viewer's own (`PROTOCOL`, `IO`). Not sent when the viewer stopped it.
     Closed(u16),
@@ -194,7 +217,8 @@ where
     /// `Close{SESSION_OVER}` is sent: the viewer's session is over), or it
     /// breaks: the user's requests come on `ops`, and what happens goes out
     /// on `events` (dropped while `events` is full: its reader is stuck,
-    /// and the end is also returned).
+    /// and the end is also returned). Transfers still running at the end
+    /// are reported ended with the stream's reason.
     pub async fn run<F>(
         self,
         mut ops: mpsc::Receiver<ViewerOp>,
@@ -210,6 +234,15 @@ where
         let (tx, mut inbound) = mpsc::channel(INBOUND_DEPTH);
         let reader = tokio::spawn(read_frames(rd, Side::Host, Arc::clone(&state), tx));
         let mut chat_gate = ChatGate::new(chat::now());
+        let window = Arc::new(Window::new(welcome.bulk_window));
+        let (mut uploads, mut reports) = ViewerUploads::new(
+            outbox.clone(),
+            events.clone(),
+            Arc::clone(&window),
+            &welcome,
+            CHUNK,
+            READ_TIMEOUT,
+        );
         let emit = |event: ViewerEvent| {
             if events.try_send(event).is_err() {
                 tracing::debug!("a services event was dropped: nothing reads them");
@@ -217,7 +250,8 @@ where
         };
         tokio::pin!(stop);
         let (end, close) = loop {
-            tokio::select! {
+            // `Err(code)`: the stream ends with `Close{code}`.
+            let step: Result<(), u16> = tokio::select! {
                 biased;
                 () = &mut stop => break (ViewerServicesEnd::Stopped, Some(reason::SESSION_OVER)),
                 _ = writer.stopped() => break (ViewerServicesEnd::Io, None),
@@ -235,28 +269,55 @@ where
                             );
                         }
                         state.turn_off(!news.caps);
+                        if news.caps & caps::UPLOAD == 0 {
+                            uploads.turned_off();
+                        }
                         emit(ViewerEvent::Caps {
                             caps: news.caps,
                             paused: news.paused,
                         });
+                        Ok(())
                     }
                     Inbound::Frame(SvcMsg::Chat(Chat { text })) => {
-                        if !chat_gate.admit(chat::now()) {
-                            continue;
-                        }
-                        if let Some(text) = sanitize_peer_text(&text) {
+                        if chat_gate.admit(chat::now())
+                            && let Some(text) = sanitize_peer_text(&text)
+                        {
                             emit(ViewerEvent::Chat(text));
                         }
+                        Ok(())
                     }
-                    // Served from the design's steps 14–19 on.
+                    Inbound::Frame(SvcMsg::Accepted(accepted)) => uploads.accepted(accepted),
+                    Inbound::Frame(SvcMsg::Credit { xfer, upto }) => {
+                        if xfer == CLIPBOARD {
+                            // The viewer's clipboard text (the design's step
+                            // 18): nothing of it is sent yet, so only a
+                            // credit of nothing is in range.
+                            window.credit(CLIPBOARD, upto).map_err(|_| reason::PROTOCOL)
+                        } else {
+                            uploads.credit(xfer, upto)
+                        }
+                    }
+                    Inbound::Frame(SvcMsg::Complete(complete)) => uploads.complete(complete),
+                    Inbound::Frame(SvcMsg::Cancel(cancel)) => {
+                        let xfer = cancel.xfer;
+                        match uploads.cancelled(cancel) {
+                            // Downloads come with the design's step 17.
+                            Ok(false) => uploads.late(xfer),
+                            other => other.map(|_| ()),
+                        }
+                    }
+                    // Served from the design's steps 16–19 on.
                     Inbound::Frame(other) => {
                         tracing::trace!(ty = other.ty(), "services frame not served by this build");
+                        Ok(())
                     }
                     Inbound::End(ReadEnd::Eof | ReadEnd::Io) => break (ViewerServicesEnd::Io, None),
                     Inbound::End(ReadEnd::Refuse(code)) => {
                         break (ViewerServicesEnd::Refused(code), Some(code));
                     }
                 },
+                Some(job) = reports.jobs.recv() => uploads.on_job(job),
+                Some(failed) = reports.failed.recv() => uploads.send_failed(failed),
                 Some(op) = ops.recv() => match op {
                     ViewerOp::Chat(text) => {
                         if state.left() & caps::CHAT == 0 {
@@ -265,27 +326,39 @@ where
                         let Some(text) = text.within(usize::from(welcome.chat_max)) else {
                             continue;
                         };
-                        if !outbox.ctrl(SvcMsg::Chat(Chat {
+                        if outbox.ctrl(SvcMsg::Chat(Chat {
                             text: text.as_str().to_owned(),
                         })) {
+                            Ok(())
+                        } else {
                             // The host stopped reading (§3.4).
-                            break (
-                                ViewerServicesEnd::Refused(reason::PROTOCOL),
-                                Some(reason::PROTOCOL),
-                            );
+                            Err(reason::PROTOCOL)
                         }
                     }
+                    ViewerOp::UploadPath(path) => {
+                        uploads.upload_path(path, state.left() & caps::UPLOAD != 0);
+                        Ok(())
+                    }
+                    ViewerOp::Cancel(id) => uploads.cancel(id),
                 },
+            };
+            if let Err(code) = step {
+                break (ViewerServicesEnd::Refused(code), Some(code));
             }
         };
         reader.abort();
+        let ended = match end {
+            ViewerServicesEnd::Stopped => reason::SESSION_OVER,
+            ViewerServicesEnd::Closed(code) | ViewerServicesEnd::Refused(code) => code,
+            ViewerServicesEnd::Io => reason::IO,
+        };
+        // Stops every sending task before the writer's end drops their
+        // queued data.
+        uploads.end_all(ended);
+        drop(uploads);
         let _ = writer.close(close).await;
-        match end {
-            ViewerServicesEnd::Stopped => {}
-            ViewerServicesEnd::Closed(code) | ViewerServicesEnd::Refused(code) => {
-                emit(ViewerEvent::Closed(code));
-            }
-            ViewerServicesEnd::Io => emit(ViewerEvent::Closed(reason::IO)),
+        if end != ViewerServicesEnd::Stopped {
+            emit(ViewerEvent::Closed(ended));
         }
         end
     }
