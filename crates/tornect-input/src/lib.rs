@@ -20,6 +20,13 @@
 //! reach an injector (`tornect-session` drops input frames before decoding
 //! them), and every injector is wrapped in [`Tracked`], which releases whatever
 //! the viewer still holds when the session ends.
+//!
+//! **Where a position lands** (decision M1-75): a desktop injector addresses
+//! its whole space (the Windows virtual desktop, the X11 root), and a
+//! [`Viewport`] in front of it rewrites each position, normalized over the
+//! picture, onto the rectangle that picture shows ([`View::Rect`], [`remap`]).
+//! When the picture moves to another screen the host retargets the chain
+//! ([`InputSink::retarget`]) before it handles any later input.
 
 #![warn(missing_docs)]
 
@@ -135,6 +142,9 @@ pub enum InputError {
     /// A key the host never injects ([`SYSTEM_KEYS`]).
     #[error("key usage 0x{0:06x} is a system power key and is not injected")]
     Refused(u32),
+    /// A [`View`] no position can be mapped onto ([`Viewport`]).
+    #[error("the picture cannot be mapped onto the desktop: {0}")]
+    BadView(&'static str),
 }
 
 impl InputEvent {
@@ -149,6 +159,21 @@ impl InputEvent {
             Self::Key { pressed: false, .. }
                 | Self::PointerButton { pressed: false, .. }
                 | Self::ReleaseAll
+        )
+    }
+
+    /// Whether this acts where the host's pointer is: a move, a wheel turn or
+    /// a button press. Across a change of the shown screen such an event can
+    /// land on a screen the viewer was not shown, so the host holds these back
+    /// at its barrier (decision M1-75); a release never acts at a new place
+    /// and always goes through.
+    #[must_use]
+    pub fn lands_at_pointer(&self) -> bool {
+        matches!(
+            self,
+            Self::PointerMove { .. }
+                | Self::Wheel { .. }
+                | Self::PointerButton { pressed: true, .. }
         )
     }
 
@@ -221,6 +246,22 @@ pub trait InputSink: Send {
     /// Inject one event. [`InputEvent::ReleaseAll`] is handled by [`Tracked`]
     /// and never reaches an inner sink.
     fn inject(&mut self, event: &InputEvent) -> Result<(), InputError>;
+
+    /// Follow the picture to what `view` shows; every later event is meant for
+    /// it. A sink that cannot must refuse, and the host then ends the
+    /// session's input rather than mis-map a click (decision M1-75).
+    ///
+    /// The default suits a sink that addresses a whole [`View::Rect`] space
+    /// and is fed by a [`Viewport`], which does the mapping: it accepts any
+    /// [`View::Rect`] and refuses a [`View::Stream`], which it cannot address.
+    fn retarget(&mut self, view: &View) -> Result<(), InputError> {
+        match view {
+            View::Rect { .. } => Ok(()),
+            View::Stream { .. } => Err(InputError::Inject(
+                "this injector cannot follow the picture to another screen".to_owned(),
+            )),
+        }
+    }
 }
 
 /// Wraps an injector and remembers what is held down, so that
@@ -355,6 +396,18 @@ impl<S: InputSink> InputSink for Tracked<S> {
         }
         self.inner.inject(event)
     }
+
+    /// Settles what is owed and lets go of every held button before the
+    /// picture moves, so no drag carries over to another screen; a button-up
+    /// the injector refuses stays owed, as at any release. Held keys stay
+    /// down, so a modifier the viewer holds survives the switch.
+    fn retarget(&mut self, view: &View) -> Result<(), InputError> {
+        self.settle();
+        for button in std::mem::take(&mut self.buttons) {
+            let _ = self.release_button(button);
+        }
+        self.inner.retarget(view)
+    }
 }
 
 impl<S: InputSink> Drop for Tracked<S> {
@@ -381,6 +434,234 @@ impl WheelAccumulator {
         self.dx -= nx * WHEEL_NOTCH;
         self.dy -= ny * WHEEL_NOTCH;
         (nx, ny)
+    }
+}
+
+/// The largest side of a [`View::Rect`] space, in pixels: up to it a pixel
+/// survives being normalized and placed again exactly ([`remap`]).
+pub const MAX_SPACE: u32 = 65_536;
+
+/// A rectangle of a desktop, in the desktop's own units: physical pixels of
+/// the Windows virtual desktop (per-monitor v2 awareness), pixels of the X11
+/// root. `x` and `y` can be negative (a Windows monitor left of the primary).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Rect {
+    /// Left edge.
+    pub x: i32,
+    /// Top edge.
+    pub y: i32,
+    /// Width; the right edge is `x + width`, exclusive.
+    pub width: u32,
+    /// Height; the bottom edge is `y + height`, exclusive.
+    pub height: u32,
+}
+
+impl Rect {
+    /// The rectangle at `(x, y)` of `width`×`height`.
+    #[must_use]
+    pub const fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// Whether `other` lies wholly inside this rectangle.
+    #[must_use]
+    pub fn contains(&self, other: &Rect) -> bool {
+        let (left, top, right, bottom) = self.edges();
+        let (o_left, o_top, o_right, o_bottom) = other.edges();
+        o_left >= left && o_top >= top && o_right <= right && o_bottom <= bottom
+    }
+
+    /// The area this rectangle shares with `other`; 0 when they only touch or
+    /// do not meet.
+    #[must_use]
+    pub fn area_overlap(&self, other: &Rect) -> u64 {
+        let (left, top, right, bottom) = self.edges();
+        let (o_left, o_top, o_right, o_bottom) = other.edges();
+        let width = right.min(o_right) - left.max(o_left);
+        let height = bottom.min(o_bottom) - top.max(o_top);
+        match (u64::try_from(width), u64::try_from(height)) {
+            (Ok(width), Ok(height)) => width.saturating_mul(height),
+            _ => 0,
+        }
+    }
+
+    /// Left, top, right and bottom, exclusive, without overflow.
+    fn edges(&self) -> (i64, i64, i64, i64) {
+        let (x, y) = (i64::from(self.x), i64::from(self.y));
+        (x, y, x + i64::from(self.width), y + i64::from(self.height))
+    }
+}
+
+/// How a Wayland stream's pixels relate to the compositor's logical units,
+/// measured once, at the stream's first negotiation (decision M1-75, the
+/// design's Part 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ratio {
+    /// The stream's logical size, as the portal gave it.
+    pub logical: (u32, u32),
+    /// The pixel size first negotiated for it.
+    pub pixels: (u32, u32),
+}
+
+/// What the picture shows, as an injector must address it (decision M1-75).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    /// A rectangle of a desktop the injector addresses whole: a [`Viewport`]
+    /// maps every position onto `shown`, normalized over `space`.
+    Rect {
+        /// The rectangle the picture shows, inside `space`; capture makes its
+        /// width and height even.
+        shown: Rect,
+        /// What the injector addresses: the Windows virtual desktop in
+        /// physical pixels, the X11 root.
+        space: Rect,
+    },
+    /// A Wayland portal stream (the design's Part 2), at the picture's size.
+    Stream {
+        /// The stream's PipeWire node.
+        node: u32,
+        /// The picture's size in pixels.
+        pixels: (u32, u32),
+        /// Logical units per pixel; `None` when they could not be measured,
+        /// and moves on this stream are refused.
+        ratio: Option<Ratio>,
+    },
+}
+
+/// A position normalized over the picture, as the same pixel normalized over
+/// `space`: the picture shows `shown`, which lies inside `space`. The pixel is
+/// clamped into `space`; for a `shown` inside it nothing is clamped, so the
+/// position lands inside `shown`.
+///
+/// Exact for spaces up to [`MAX_SPACE`] on a side: the injector's
+/// `denormalize(remap(..), space)` is `shown`'s pixel under the pointer,
+/// offset from `space`'s corner (`remap_is_exact`).
+#[must_use]
+pub fn remap(x: u16, y: u16, shown: Rect, space: Rect) -> (u16, u16) {
+    (
+        remap_axis(x, shown.x, shown.width, space.x, space.width),
+        remap_axis(y, shown.y, shown.height, space.y, space.height),
+    )
+}
+
+/// [`remap`] along one axis.
+fn remap_axis(v: u16, shown_at: i32, shown_len: u32, space_at: i32, space_len: u32) -> u16 {
+    if space_len <= 1 {
+        return 0;
+    }
+    let pixel = i64::from(shown_at) - i64::from(space_at) + i64::from(denormalize(v, shown_len));
+    let pixel = pixel.clamp(0, i64::from(space_len - 1));
+    normalize_pixel(u32::try_from(pixel).unwrap_or(0), space_len)
+}
+
+/// Pixel `pos` of `0..size` as the normalized `0..=65535` the injectors take,
+/// rounded to the nearest: the integer counterpart of [`normalize`], so the
+/// host's mapping uses no floating point.
+pub(crate) fn normalize_pixel(pos: u32, size: u32) -> u16 {
+    if size <= 1 {
+        return 0;
+    }
+    let last = u64::from(size - 1);
+    let n = (u64::from(pos).min(last) * 65_535 + last / 2) / last;
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+/// Maps the viewer's pointer onto what the picture shows, in front of an
+/// injector that addresses a whole space (decision M1-75; this replaces the
+/// SLICE-C1 C1-2 crop mapping, since the picture now shows the whole even
+/// part of what capture grabbed).
+///
+/// Without a view it passes every event through. With a [`View::Rect`] it
+/// rewrites each [`InputEvent::PointerMove`] with [`remap`]; other events
+/// carry no position and pass unchanged. A [`View::Stream`] is the inner
+/// sink's to map, so nothing is rewritten.
+///
+/// A view is kept only once the inner sink took it. After a refused
+/// [`InputSink::retarget`] the picture shows what no view here describes, so
+/// moves are refused until a retarget succeeds; keys and buttons still go.
+pub struct Viewport<S: InputSink> {
+    inner: S,
+    target: Target,
+}
+
+/// What a [`Viewport`] maps onto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    /// Never retargeted: positions pass through.
+    Whole,
+    /// The view the inner sink last took.
+    View(View),
+    /// The last retarget was refused.
+    Lost,
+}
+
+impl<S: InputSink> Viewport<S> {
+    /// A viewport with no view in front of `inner`.
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            target: Target::Whole,
+        }
+    }
+
+    /// The view moves are mapped onto, if one was taken and still holds.
+    #[must_use]
+    pub fn view(&self) -> Option<&View> {
+        match &self.target {
+            Target::View(view) => Some(view),
+            Target::Whole | Target::Lost => None,
+        }
+    }
+
+    /// Why a [`View::Rect`] cannot be mapped onto, if it cannot.
+    fn check(shown: &Rect, space: &Rect) -> Result<(), InputError> {
+        if shown.width == 0 || shown.height == 0 || space.width == 0 || space.height == 0 {
+            return Err(InputError::BadView("an empty rectangle"));
+        }
+        if space.width > MAX_SPACE || space.height > MAX_SPACE {
+            return Err(InputError::BadView(
+                "the desktop is wider or taller than 65536 pixels",
+            ));
+        }
+        if !space.contains(shown) {
+            return Err(InputError::BadView(
+                "the picture shows a rectangle outside the desktop",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<S: InputSink> InputSink for Viewport<S> {
+    fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+        match (self.target, *event) {
+            (Target::View(View::Rect { shown, space }), InputEvent::PointerMove { x, y }) => {
+                let (x, y) = remap(x, y, shown, space);
+                self.inner.inject(&InputEvent::PointerMove { x, y })
+            }
+            (Target::Lost, InputEvent::PointerMove { .. }) => Err(InputError::Inject(
+                "the pointer could not follow the picture to its screen".to_owned(),
+            )),
+            _ => self.inner.inject(event),
+        }
+    }
+
+    fn retarget(&mut self, view: &View) -> Result<(), InputError> {
+        let taken = match view {
+            View::Rect { shown, space } => Self::check(shown, space),
+            View::Stream { .. } => Ok(()),
+        }
+        .and_then(|()| self.inner.retarget(view));
+        self.target = match taken {
+            Ok(()) => Target::View(*view),
+            Err(_) => Target::Lost,
+        };
+        taken
     }
 }
 
@@ -783,5 +1064,462 @@ mod tests {
         assert_eq!(normalize(f64::NAN, 1920.0), 0);
         let mid = normalize(959.5, 1920.0);
         assert!((denormalize(mid, 1920) as i64 - 960).abs() <= 1);
+    }
+
+    /// Where a position lands on the desktop: what `remap` gives, placed
+    /// over `space` as a desktop injector places it.
+    fn lands(x: u16, y: u16, shown: Rect, space: Rect) -> (i64, i64) {
+        let (x, y) = remap(x, y, shown, space);
+        (
+            i64::from(space.x) + i64::from(denormalize(x, space.width)),
+            i64::from(space.y) + i64::from(denormalize(y, space.height)),
+        )
+    }
+
+    /// Decision M1-75: a position normalized over the picture lands on the
+    /// pixel of the shown rectangle under the viewer's pointer, in the
+    /// desktop's own coordinates, whatever part of the space that is.
+    #[test]
+    fn a_position_lands_on_the_screen_the_picture_shows() {
+        // Two screens side by side, 1280×720 (main) and 1024×768.
+        let space = Rect::new(0, 0, 2304, 768);
+        let second = Rect::new(1280, 0, 1024, 768);
+        assert_eq!(lands(0, 0, second, space), (1280, 0));
+        assert_eq!(lands(65535, 65535, second, space), (2303, 767));
+        assert_eq!(lands(32768, 32768, second, space), (1280 + 512, 384));
+        let first = Rect::new(0, 0, 1280, 720);
+        assert_eq!(lands(65535, 65535, first, space), (1279, 719));
+        // A Windows monitor left of the primary has negative coordinates;
+        // the virtual desktop starts at its left edge.
+        let space = Rect::new(-1920, 0, 1920 + 2560, 1440);
+        let left = Rect::new(-1920, 0, 1920, 1080);
+        let primary = Rect::new(0, 0, 2560, 1440);
+        assert_eq!(lands(0, 0, primary, space), (0, 0));
+        assert_eq!(lands(65535, 65535, primary, space), (2559, 1439));
+        assert_eq!(lands(0, 0, left, space), (-1920, 0));
+        assert_eq!(lands(65535, 65535, left, space), (-1, 1079));
+    }
+
+    /// The property the SLICE-C1 C1-2 crop mapping protected, kept by
+    /// `remap` (decision M1-75): nothing outside what the picture shows can
+    /// be addressed. The picture shows the whole even part of the desktop,
+    /// scaled down when it is large (decision M1-74).
+    #[test]
+    fn a_position_never_leaves_the_shown_rectangle() {
+        let whole = |w, h| Rect::new(0, 0, w, h);
+        let even = |w: u32, h: u32| Rect::new(0, 0, w & !1, h & !1);
+        // Two 4K screens shown together: the far corner is the right screen's,
+        // the middle the seam.
+        let space = whole(7680, 2160);
+        assert_eq!(lands(65535, 65535, even(7680, 2160), space), (7679, 2159));
+        assert_eq!(lands(0, 0, even(7680, 2160), space), (0, 0));
+        assert_eq!(lands(32768, 0, even(7680, 2160), space), (3840, 0));
+        // An upright screen is shown whole: its bottom row is in reach.
+        for (w, h) in [(1440, 2560), (2160, 3840), (2400, 4000)] {
+            let far = (i64::from(w) - 1, i64::from(h) - 1);
+            assert_eq!(lands(65535, 65535, even(w, h), whole(w, h)), far);
+        }
+        // An odd desktop loses its last column and row, as the picture does.
+        assert_eq!(
+            lands(65535, 65535, even(1921, 1081), whole(1921, 1081)),
+            (1919, 1079)
+        );
+        assert_eq!(
+            lands(65535, 65535, even(2401, 3001), whole(2401, 3001)),
+            (2399, 2999)
+        );
+        // A rectangle reaching past the space is clamped into it.
+        assert_eq!(
+            lands(
+                65535,
+                65535,
+                Rect::new(1000, 500, 4000, 4000),
+                whole(1920, 1080)
+            ),
+            (1919, 1079)
+        );
+        // A space of one pixel has only that pixel.
+        assert_eq!(remap(65535, 65535, whole(1, 1), whole(1, 1)), (0, 0));
+    }
+
+    #[test]
+    fn rectangles_contain_and_overlap() {
+        let space = Rect::new(-1920, 0, 4480, 1440);
+        assert!(space.contains(&Rect::new(-1920, 0, 1920, 1080)));
+        assert!(space.contains(&space));
+        assert!(!space.contains(&Rect::new(-1921, 0, 10, 10)));
+        assert!(!space.contains(&Rect::new(2550, 0, 11, 10)));
+        assert!(!space.contains(&Rect::new(0, 1439, 10, 2)));
+        let primary = Rect::new(0, 0, 2560, 1440);
+        let left = Rect::new(-1920, 0, 1920, 1080);
+        assert_eq!(primary.area_overlap(&left), 0, "touching edges");
+        assert_eq!(
+            Rect::new(-100, -100, 200, 200).area_overlap(&primary),
+            100 * 100
+        );
+        assert_eq!(primary.area_overlap(&primary), 2560 * 1440);
+        assert_eq!(primary.area_overlap(&Rect::new(5000, 5000, 1, 1)), 0);
+        let huge = Rect::new(i32::MIN, i32::MIN, u32::MAX, u32::MAX);
+        assert_eq!(huge.area_overlap(&huge), u64::from(u32::MAX).pow(2));
+    }
+
+    /// Records what reaches it, takes or refuses views, and remembers them.
+    #[derive(Default)]
+    struct Log {
+        seen: Vec<InputEvent>,
+        views: Vec<View>,
+        refuse_views: bool,
+    }
+
+    impl InputSink for Log {
+        fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+            self.seen.push(*event);
+            Ok(())
+        }
+
+        fn retarget(&mut self, view: &View) -> Result<(), InputError> {
+            if self.refuse_views {
+                return Err(InputError::Inject("no".to_owned()));
+            }
+            self.views.push(*view);
+            Ok(())
+        }
+    }
+
+    const SPACE: Rect = Rect::new(0, 0, 2304, 768);
+    const SECOND: Rect = Rect::new(1280, 0, 1024, 768);
+    const ON_SECOND: View = View::Rect {
+        shown: SECOND,
+        space: SPACE,
+    };
+    const STREAM: View = View::Stream {
+        node: 42,
+        pixels: (1920, 1080),
+        ratio: None,
+    };
+
+    fn others() -> [InputEvent; 4] {
+        [
+            InputEvent::PointerButton {
+                button: Button::Left,
+                pressed: true,
+            },
+            InputEvent::Wheel { dx: 0, dy: 120 },
+            InputEvent::Key {
+                usb: 0x07_0004,
+                pressed: true,
+            },
+            InputEvent::ReleaseAll,
+        ]
+    }
+
+    #[test]
+    fn a_viewport_rewrites_moves_only_and_only_under_a_rect_view() {
+        let corner = InputEvent::PointerMove { x: 65535, y: 65535 };
+        // No view: everything passes as it came.
+        let mut viewport = Viewport::new(Log::default());
+        assert_eq!(viewport.view(), None);
+        viewport.inject(&corner).unwrap();
+        for event in others() {
+            viewport.inject(&event).unwrap();
+        }
+        let mut want = vec![corner];
+        want.extend(others());
+        assert_eq!(viewport.inner.seen, want);
+
+        // Onto the second screen: the move is rewritten onto its corner, and
+        // nothing else changes.
+        let mut viewport = Viewport::new(Log::default());
+        viewport.retarget(&ON_SECOND).unwrap();
+        assert_eq!(viewport.inner.views, [ON_SECOND], "the inner sink is told");
+        assert_eq!(viewport.view(), Some(&ON_SECOND));
+        viewport.inject(&corner).unwrap();
+        for event in others() {
+            viewport.inject(&event).unwrap();
+        }
+        let InputEvent::PointerMove { x, y } = viewport.inner.seen[0] else {
+            panic!("{:?}", viewport.inner.seen[0]);
+        };
+        assert_eq!((denormalize(x, 2304), denormalize(y, 768)), (2303, 767));
+        assert_eq!(viewport.inner.seen[1..], others());
+
+        // A stream is the inner sink's to map: forwarded, kept, not rewritten.
+        let mut viewport = Viewport::new(Log::default());
+        viewport.retarget(&STREAM).unwrap();
+        assert_eq!(viewport.inner.views, [STREAM]);
+        assert_eq!(viewport.view(), Some(&STREAM));
+        viewport.inject(&corner).unwrap();
+        assert_eq!(viewport.inner.seen, [corner]);
+    }
+
+    /// A view no position can be mapped onto is refused before the inner
+    /// sink hears of it, and so is one the inner sink refuses. Neither is
+    /// kept, and the view before it is dropped too, since the picture no
+    /// longer shows it: moves are refused until a retarget succeeds, while
+    /// keys and buttons still go.
+    #[test]
+    fn a_viewport_keeps_no_view_it_or_its_sink_refused() {
+        let bad = [
+            (Rect::new(1281, 0, 1024, 768), SPACE),
+            (Rect::new(1280, -1, 1024, 768), SPACE),
+            (Rect::new(-4, 0, 8, 8), SPACE),
+            (Rect::new(0, 0, 0, 768), SPACE),
+            (Rect::new(0, 0, 8, 0), SPACE),
+            (Rect::new(0, 0, 8, 8), Rect::new(0, 0, 0, 0)),
+            (Rect::new(0, 0, 8, 8), Rect::new(0, 0, MAX_SPACE + 1, 8)),
+            (Rect::new(0, 0, 8, 8), Rect::new(0, 0, 8, MAX_SPACE + 1)),
+        ];
+        for (shown, space) in bad {
+            let mut viewport = Viewport::new(Log::default());
+            viewport.retarget(&ON_SECOND).unwrap();
+            let refused = viewport.retarget(&View::Rect { shown, space });
+            assert!(
+                matches!(refused, Err(InputError::BadView(_))),
+                "{shown:?} in {space:?}: {refused:?}"
+            );
+            assert_eq!(viewport.inner.views, [ON_SECOND], "never forwarded");
+            assert_eq!(viewport.view(), None, "{shown:?} in {space:?}");
+            assert!(
+                viewport
+                    .inject(&InputEvent::PointerMove { x: 1, y: 1 })
+                    .is_err()
+            );
+            for event in others() {
+                viewport.inject(&event).unwrap();
+            }
+            assert_eq!(viewport.inner.seen, others(), "no move reached the sink");
+        }
+        // The largest space there is maps.
+        let mut viewport = Viewport::new(Log::default());
+        let largest = Rect::new(0, 0, MAX_SPACE, MAX_SPACE);
+        viewport
+            .retarget(&View::Rect {
+                shown: largest,
+                space: largest,
+            })
+            .unwrap();
+
+        // The inner sink refuses: not kept either.
+        let mut viewport = Viewport::new(Log::default());
+        viewport.retarget(&ON_SECOND).unwrap();
+        viewport.inner.refuse_views = true;
+        let first = View::Rect {
+            shown: Rect::new(0, 0, 1280, 720),
+            space: SPACE,
+        };
+        assert!(viewport.retarget(&first).is_err());
+        assert_eq!(viewport.view(), None);
+        assert!(
+            viewport
+                .inject(&InputEvent::PointerMove { x: 0, y: 0 })
+                .is_err(),
+            "not mapped onto the second screen any more"
+        );
+        // Taken the next time: moves map again.
+        viewport.inner.refuse_views = false;
+        viewport.retarget(&first).unwrap();
+        assert_eq!(viewport.view(), Some(&first));
+        viewport
+            .inject(&InputEvent::PointerMove { x: 65535, y: 65535 })
+            .unwrap();
+        let InputEvent::PointerMove { x, y } = viewport.inner.seen[0] else {
+            panic!("{:?}", viewport.inner.seen);
+        };
+        assert_eq!((denormalize(x, 2304), denormalize(y, 768)), (1279, 719));
+    }
+
+    /// The default `retarget`, for a sink that addresses a whole space behind
+    /// a `Viewport`: it takes any rectangle and refuses a stream.
+    #[test]
+    fn the_default_retarget_takes_a_rect_and_refuses_a_stream() {
+        let mut sink = Recorder(Vec::new());
+        sink.retarget(&ON_SECOND).unwrap();
+        assert!(matches!(
+            sink.retarget(&STREAM),
+            Err(InputError::Inject(why)) if why.contains("cannot follow")
+        ));
+        let mut viewport = Viewport::new(Recorder(Vec::new()));
+        assert!(viewport.retarget(&STREAM).is_err());
+        assert_eq!(viewport.view(), None);
+    }
+
+    /// Decision M1-75: no drag carries over to another screen. A retarget
+    /// first sends what is owed, then lets go of every held button, and only
+    /// then moves the injector; held keys stay down, so a modifier survives.
+    #[test]
+    fn a_retarget_lets_go_of_buttons_and_keeps_keys() {
+        let ctrl = |pressed| InputEvent::Key {
+            usb: 0x07_00e0,
+            pressed,
+        };
+        let button = |button, pressed| InputEvent::PointerButton { button, pressed };
+        let mut t = Tracked::new(Log::default());
+        t.inject(&ctrl(true)).unwrap();
+        t.inject(&button(Button::Right, true)).unwrap();
+        t.inject(&button(Button::Left, true)).unwrap();
+        t.retarget(&ON_SECOND).unwrap();
+        assert_eq!(t.inner.views, [ON_SECOND]);
+        assert_eq!(
+            t.inner.seen[3..],
+            [button(Button::Left, false), button(Button::Right, false)]
+        );
+        // The viewer's own button-up later is not sent twice; its Ctrl-up is.
+        t.inject(&button(Button::Left, false)).unwrap();
+        t.inject(&ctrl(false)).unwrap();
+        assert_eq!(t.inner.seen[5..], [ctrl(false)]);
+
+        // A release owed from before goes out first.
+        let key = |pressed| InputEvent::Key {
+            usb: 0x07_0004,
+            pressed,
+        };
+        let mut t = Tracked::new(RefusesOneRelease::default());
+        t.inject(&key(true)).unwrap();
+        t.inject(&button(Button::Left, true)).unwrap();
+        assert!(t.inject(&key(false)).is_err());
+        t.retarget(&ON_SECOND).unwrap();
+        assert_eq!(
+            t.inner.seen,
+            [
+                key(true),
+                button(Button::Left, true),
+                key(false),
+                button(Button::Left, false)
+            ]
+        );
+
+        // A button-up the injector refuses during the retarget stays owed.
+        let mut t = Tracked::new(Stalls::default());
+        t.inject(&button(Button::Middle, true)).unwrap();
+        t.inner.full = true;
+        t.retarget(&ON_SECOND).unwrap();
+        t.inner.full = false;
+        let moved = InputEvent::PointerMove { x: 1, y: 2 };
+        t.inject(&moved).unwrap();
+        assert_eq!(
+            t.inner.seen,
+            [
+                button(Button::Middle, true),
+                button(Button::Middle, false),
+                moved
+            ]
+        );
+
+        // A refused retarget is the caller's to act on.
+        let mut t = Tracked::new(Log {
+            refuse_views: true,
+            ..Log::default()
+        });
+        assert!(t.retarget(&ON_SECOND).is_err());
+    }
+
+    /// What the host holds back at its barrier (decision M1-75): what acts
+    /// where the pointer is. Releases never are.
+    #[test]
+    fn moves_wheels_and_presses_land_at_the_pointer() {
+        let lands = [
+            InputEvent::PointerMove { x: 1, y: 2 },
+            InputEvent::Wheel { dx: 0, dy: -120 },
+            InputEvent::PointerButton {
+                button: Button::Back,
+                pressed: true,
+            },
+        ];
+        let not = [
+            InputEvent::PointerButton {
+                button: Button::Back,
+                pressed: false,
+            },
+            InputEvent::Key {
+                usb: 0x07_0004,
+                pressed: true,
+            },
+            InputEvent::Key {
+                usb: 0x07_0004,
+                pressed: false,
+            },
+            InputEvent::ReleaseAll,
+        ];
+        assert!(lands.iter().all(InputEvent::lands_at_pointer));
+        assert!(!not.iter().any(InputEvent::lands_at_pointer));
+    }
+
+    /// The bounds of the exactness below: the largest spaces, every pixel.
+    #[test]
+    fn every_pixel_of_the_largest_spaces_survives_normalizing() {
+        for size in [MAX_SPACE, MAX_SPACE - 1, MAX_SPACE - 2, 2, 1] {
+            for pos in 0..size {
+                assert_eq!(denormalize(normalize_pixel(pos, size), size), pos, "{size}");
+                assert_eq!(
+                    denormalize(normalize(f64::from(pos), f64::from(size)), size),
+                    pos,
+                    "{size}"
+                );
+            }
+        }
+    }
+
+    mod props {
+        use proptest::prelude::*;
+
+        use super::super::{MAX_SPACE, Rect, denormalize, normalize, normalize_pixel, remap};
+
+        /// A space up to `MAX_SPACE` on a side and a non-empty rectangle
+        /// inside it.
+        fn shown_in_space() -> impl Strategy<Value = (Rect, Rect)> {
+            (
+                -1_000_000i32..1_000_000,
+                -1_000_000i32..1_000_000,
+                1u32..=MAX_SPACE,
+                1u32..=MAX_SPACE,
+            )
+                .prop_flat_map(|(x, y, w, h)| (Just(Rect::new(x, y, w, h)), 0..w, 0..h))
+                .prop_flat_map(|(space, dx, dy)| {
+                    (
+                        Just(space),
+                        Just((dx, dy)),
+                        1..=space.width - dx,
+                        1..=space.height - dy,
+                    )
+                })
+                .prop_map(|(space, (dx, dy), w, h)| {
+                    let shown = Rect::new(
+                        space.x + i32::try_from(dx).unwrap(),
+                        space.y + i32::try_from(dy).unwrap(),
+                        w,
+                        h,
+                    );
+                    (shown, space)
+                })
+        }
+
+        proptest! {
+            /// Decision M1-75: through `remap`, an injector over `space`
+            /// reaches exactly the pixel of `shown` the position points at.
+            #[test]
+            fn remap_is_exact((shown, space) in shown_in_space(), x: u16, y: u16) {
+                prop_assert!(space.contains(&shown));
+                let (rx, ry) = remap(x, y, shown, space);
+                let want_x = i64::from(shown.x) - i64::from(space.x)
+                    + i64::from(denormalize(x, shown.width));
+                let want_y = i64::from(shown.y) - i64::from(space.y)
+                    + i64::from(denormalize(y, shown.height));
+                prop_assert_eq!(i64::from(denormalize(rx, space.width)), want_x);
+                prop_assert_eq!(i64::from(denormalize(ry, space.height)), want_y);
+            }
+
+            /// A pixel normalized over a space up to `MAX_SPACE` and placed
+            /// again is the same pixel, by the host's integer mapping and by
+            /// the viewer's floating-point one.
+            #[test]
+            fn a_pixel_survives_normalizing(size in 1u32..=MAX_SPACE, at in 0.0f64..1.0) {
+                let pos = (f64::from(size - 1) * at) as u32;
+                prop_assert_eq!(denormalize(normalize_pixel(pos, size), size), pos);
+                prop_assert_eq!(
+                    denormalize(normalize(f64::from(pos), f64::from(size)), size),
+                    pos
+                );
+            }
+        }
     }
 }

@@ -7395,6 +7395,7 @@ dependencies = [
 name = "tornect-input"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "thiserror 2.0.20",
  "tracing",
  "windows-sys 0.61.2",
