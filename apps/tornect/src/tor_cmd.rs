@@ -20,11 +20,10 @@ use tornect_core::keystore::{
 };
 use tornect_core::session_log::SessionMode;
 use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
-use tornect_input::InputEvent;
-use tornect_proto::{HostStats, ProtoError, QualityInfo};
+use tornect_proto::{ALL_MONITORS, HostStats, ProtoError, QualityInfo, monitor_status};
 use tornect_session::{
-    Binding, DesktopBackend, FrameSink, MediaHost, MediaLimits, MediaViewer, Source, SystemBackend,
-    ViewerEnd, ViewerError, ViewerStats,
+    Binding, DesktopBackend, FrameSink, MediaHost, MediaLimits, MediaViewer, Screens, ScreensNews,
+    Source, SystemBackend, ViewerChannels, ViewerEnd, ViewerError, ViewerRequest, ViewerStats,
 };
 use tornect_signal::framing::FrameError;
 use tornect_signal::fsm::client::{
@@ -177,6 +176,49 @@ pub(crate) fn capture_lines(paths: &Paths, desktop: &DesktopBackend) -> Vec<Stri
         ));
     }
     lines
+}
+
+/// `tornect doctor`'s `screens:` line: the monitors a session on this
+/// desktop could switch between, numbered as a session lists them, in the
+/// desktop's units (physical pixels on Windows and X11). `None` where
+/// capture lists none: on Wayland the desktop's dialog chooses the screen.
+pub(crate) fn screens_line(desktop: &DesktopBackend) -> Option<String> {
+    let listed = match desktop {
+        #[cfg(target_os = "linux")]
+        DesktopBackend::X11 => tornect_capture::x11::desktop_monitors(),
+        #[cfg(windows)]
+        DesktopBackend::Gdi => tornect_capture::gdi::desktop_monitors(),
+        _ => return None,
+    };
+    Some(screens_text(&listed))
+}
+
+/// `listed` as the `screens:` line says it: `screens: 2 (1 2560x1440+0+0
+/// main, 2 1920x1080+2560+0)`, a monitor left of or above the primary at a
+/// negative offset (`1920x1080-1920+0`).
+fn screens_text(
+    listed: &Result<Vec<tornect_capture::Monitor>, tornect_capture::CaptureError>,
+) -> String {
+    match listed {
+        Ok(monitors) => {
+            let each: Vec<String> = monitors
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{} {}x{}{:+}{:+}{}",
+                        m.id,
+                        m.rect.width,
+                        m.rect.height,
+                        m.rect.x,
+                        m.rect.y,
+                        if m.primary { " main" } else { "" }
+                    )
+                })
+                .collect();
+            format!("screens: {} ({})", monitors.len(), each.join(", "))
+        }
+        Err(e) => format!("screens: unknown ({e})"),
+    }
 }
 
 /// `tornect tor-check [--bridges …]`: reach the Tor network the way `host` and
@@ -545,6 +587,9 @@ pub struct ConnectOpts {
     pub video: bool,
     /// The picture quality to ask for; `None` asks for `[viewer] quality`.
     pub quality: Option<QualityPreset>,
+    /// The host's screen to show, asked for once the host lists its
+    /// screens: a monitor's id, or [`ALL_MONITORS`]; `None` asks nothing.
+    pub screen: Option<u8>,
     /// Connect without asking, on this device's unattended grant.
     pub unattended: Option<UnattendedOpts>,
 }
@@ -1060,6 +1105,10 @@ async fn connect_session(
         let watching = WatchOptions {
             pings: opts.pings,
             quality: opts.quality.unwrap_or(cfg.viewer.quality),
+            channels: ViewerChannels {
+                input: None,
+                requests: screen_requests(opts.screen),
+            },
             ..WatchOptions::default()
         };
         watch(
@@ -1100,6 +1149,17 @@ async fn connect_session(
         }
     }
     Ok(())
+}
+
+/// `connect --screen`'s request, already waiting in a channel of its own:
+/// the viewer sends it once the host has listed its screens, and never if
+/// the host lists none. The sender is gone, so nothing follows it.
+fn screen_requests(screen: Option<u8>) -> Option<mpsc::Receiver<ViewerRequest>> {
+    let screen = screen?;
+    let (requests, rx) = mpsc::channel(1);
+    // A new channel of one has room for it.
+    let _ = requests.try_send(ViewerRequest::ShowScreen(screen));
+    Some(rx)
 }
 
 /// Ctrl-C for a live session, heard on a task of its own so that nothing the
@@ -1161,9 +1221,11 @@ pub(crate) struct WatchOptions<'a> {
     /// End the session after this many pings; `None` keeps it until the user
     /// ends it.
     pub pings: Option<u32>,
-    /// Each event goes to the host: the caller passes one only for a control
-    /// session, by the signed `SESSION_ACCEPT`'s mode (SLICE-C2 C2-6).
-    pub input: Option<mpsc::Receiver<InputEvent>>,
+    /// What the viewer sends besides its acks: input events, which the
+    /// caller passes only for a control session, by the signed
+    /// `SESSION_ACCEPT`'s mode (SLICE-C2 C2-6), and screen requests, legal
+    /// in either mode.
+    pub channels: ViewerChannels,
     /// Every picture, and what the host says about them, also go here (the
     /// window's).
     pub forward: Option<&'a mut dyn FrameSink>,
@@ -1191,7 +1253,7 @@ where
 {
     let WatchOptions {
         pings,
-        input,
+        channels,
         forward,
         quality,
         quality_rx,
@@ -1233,7 +1295,7 @@ where
         interrupted,
         &mut pictures,
         &mut stats,
-        input,
+        channels,
     )
     .await;
     pictures.report(&stats);
@@ -1277,7 +1339,7 @@ async fn view<M, S>(
     interrupted: &watch::Receiver<bool>,
     pictures: &mut dyn FrameSink,
     stats: &mut ViewerStats,
-    input: Option<mpsc::Receiver<InputEvent>>,
+    channels: ViewerChannels,
 ) -> (Result<ViewerEnd, ViewerError>, anyhow::Result<End>)
 where
     M: AsyncRead + AsyncWrite + Unpin + Send,
@@ -1294,7 +1356,7 @@ where
                 () = pressed(interrupted.clone()) => {}
             }
         };
-        let viewed = viewer.run_with_input(pictures, stats, input, stop).await;
+        let viewed = viewer.run_with(pictures, stats, channels, stop).await;
         let _ = media_done.send(host_may_have_ended(&viewed));
         viewed
     };
@@ -1385,6 +1447,10 @@ struct CliPictures<'a> {
     decode_us: u64,
     convert_us: u64,
     timed: u64,
+    /// This viewer's screen requests the stream has said something about:
+    /// the number of the last one (the viewer numbers them on the wire alike,
+    /// from 1, and `connect` makes at most one).
+    screen_requests: u16,
 }
 
 impl<'a> CliPictures<'a> {
@@ -1405,6 +1471,7 @@ impl<'a> CliPictures<'a> {
             decode_us: 0,
             convert_us: 0,
             timed: 0,
+            screen_requests: 0,
         }
     }
 
@@ -1476,6 +1543,26 @@ impl<'a> CliPictures<'a> {
         Some(quality_line(width, height, quality))
     }
 
+    /// The host's screens arrived, or this viewer's request for one ended
+    /// (`FrameSink::screens`): the `MEDIA SCREENS` line, one for each. The
+    /// host's own news is request 0; a request that got no answer, or was
+    /// not sent, says so and nothing else.
+    fn screens_at(&mut self, screens: &Screens, news: ScreensNews) -> String {
+        let status = match news {
+            ScreensNews::Layout => return media_screens_line(0, monitor_status::OK, screens),
+            ScreensNews::Answer { status, .. } => status,
+            ScreensNews::NoAnswer { .. } | ScreensNews::NotSent { .. } => {
+                self.screen_requests = self.screen_requests.wrapping_add(1);
+                return format!(
+                    "MEDIA SCREENS request={} status=no-answer",
+                    self.screen_requests
+                );
+            }
+        };
+        self.screen_requests = self.screen_requests.wrapping_add(1);
+        media_screens_line(self.screen_requests, status, screens)
+    }
+
     /// The host's means arrived (`FrameSink::host_stats`): the `MEDIA
     /// TIMING` line to print now, with this viewer's own means since the
     /// last one, at most once a second.
@@ -1495,6 +1582,49 @@ impl<'a> CliPictures<'a> {
         (self.decode_us, self.convert_us, self.timed) = (0, 0, 0);
         Some(line)
     }
+}
+
+/// The `MEDIA SCREENS` line of `screens`, said for `request` with
+/// `status`: `MEDIA SCREENS request=1 status=ok shown=2 all=yes list=0
+/// seq=41 remapped=yes 1:1280x720+0+0:main 2:1024x768+1280+0`. Each monitor
+/// is `id:WxH±X±Y`, `:main` on the primary; `shown=all` when the pictures
+/// show every monitor at once. Geometry only: a host's monitors carry no
+/// names.
+fn media_screens_line(request: u16, status: u8, screens: &Screens) -> String {
+    use std::fmt::Write as _;
+    let yes = |b: bool| if b { "yes" } else { "no" };
+    let status = match status {
+        monitor_status::OK => "ok".to_owned(),
+        monitor_status::UNKNOWN => "unknown".to_owned(),
+        monitor_status::FAILED => "failed".to_owned(),
+        monitor_status::BUSY => "busy".to_owned(),
+        other => format!("code-{other}"),
+    };
+    let shown = match screens.shown {
+        ALL_MONITORS if screens.all => "all".to_owned(),
+        id => id.to_string(),
+    };
+    let mut line = format!(
+        "MEDIA SCREENS request={request} status={status} shown={shown} all={} list={} seq={} \
+         remapped={}",
+        yes(screens.all),
+        screens.list,
+        screens.seq,
+        yes(screens.remapped)
+    );
+    for (index, m) in screens.monitors.iter().enumerate() {
+        let _ = write!(
+            line,
+            " {}:{}x{}{:+}{:+}{}",
+            index + 1,
+            m.width,
+            m.height,
+            m.x,
+            m.y,
+            if m.primary { ":main" } else { "" }
+        );
+    }
+    line
 }
 
 /// `sum` over `n`, 0 for none.
@@ -1601,6 +1731,13 @@ impl FrameSink for CliPictures<'_> {
         if let Some(line) = self.host_stats_at(stats, Instant::now()) {
             println!("{line}");
         }
+    }
+
+    fn screens(&mut self, screens: &Screens, news: ScreensNews) {
+        if let Some(forward) = self.forward.as_deref_mut() {
+            forward.screens(screens, news);
+        }
+        println!("{}", self.screens_at(screens, news));
     }
 
     fn picture(&mut self, seq: u32, frame: &DecodedFrame) {
@@ -2427,7 +2564,7 @@ mod tests {
             &interrupted,
             &mut pictures,
             &mut stats,
-            None,
+            ViewerChannels::default(),
         )
         .await;
         let end = end.unwrap();
@@ -2440,6 +2577,500 @@ mod tests {
             "{end:?}"
         );
         host.await.unwrap().unwrap();
+    }
+
+    /// What a viewer's sink heard of the host's screens, and why.
+    #[derive(Default)]
+    struct HeardScreens(Vec<(Screens, ScreensNews)>);
+
+    impl FrameSink for HeardScreens {
+        fn picture(&mut self, _seq: u32, _frame: &DecodedFrame) {}
+
+        fn screens(&mut self, screens: &Screens, news: ScreensNews) {
+            self.0.push((screens.clone(), news));
+        }
+    }
+
+    /// The host's `SHARING VIEW` lines, as `tornect host` prints them.
+    #[derive(Default)]
+    struct Views(std::sync::Mutex<Vec<String>>);
+
+    impl tornect_session::MediaObserver for Views {
+        fn capture_started(&self, _: &tornect_session::CaptureStarted<'_>) {}
+
+        fn capture_changed(&self, changed: &tornect_session::CaptureChanged<'_>) {
+            let line = crate::host::view_line(changed);
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(line);
+        }
+
+        fn capture_stopped(
+            &self,
+            _: &str,
+            _: &tornect_session::MediaReport,
+            _: &tornect_session::MediaEnd,
+        ) {
+        }
+    }
+
+    /// The design's runtime demo (§7) in one process, without Tor: a real
+    /// host sharing `--capture test-screens` with a view-only session, and
+    /// `connect --screen N`'s viewer and lines. The first `MEDIA SCREENS`
+    /// line lists both screens with screen 1 (main) shown; the answer is
+    /// request 1, `status=ok`, the screen asked for, `remapped=yes`; the
+    /// pictures end at its size with the card's index in order across the
+    /// switch; the host says `SHARING VIEW` for the first screen and the
+    /// one asked for. "All screens" (2304×768) is asked under Best quality,
+    /// whose cap takes it whole; Balanced's (1920×1080) fits it to 1920×640.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::print_stderr)] // reports the lines a live run prints
+    async fn the_test_screens_switch_as_connect_asks() {
+        use tornect_core::DeviceId;
+        use tornect_core::levels::Elevation;
+        use tornect_signal::consent::SessionToken;
+        use tornect_signal::fsm::host::{LiveSession, SessionSink as _};
+
+        let [(w1, h1), (w2, h2)] = tornect_session::TEST_SCREENS;
+        for (asked, preset, size) in [
+            (2, QualityPreset::Balanced, (w2, h2)),
+            (
+                ALL_MONITORS,
+                QualityPreset::BestQuality,
+                (w1 + w2, h1.max(h2)),
+            ),
+        ] {
+            let views = Arc::new(Views::default());
+            let host = Arc::new(MediaHost::new(
+                Arc::new(SystemBackend::new(Source::TestScreens)),
+                Arc::clone(&views) as Arc<dyn tornect_session::MediaObserver>,
+                MediaLimits::default(),
+            ));
+            let token = SessionToken::new([0x42; 32]);
+            let session_id = token.session_id();
+            let th_final = [7; 32];
+            host.on_start(&LiveSession {
+                device: DeviceId::from_bytes([0; 32]),
+                label: "screens",
+                session_id: &session_id,
+                token: &token,
+                th_final,
+                mode: SessionMode::ViewOnly,
+                elevation: Elevation::None,
+                unattended: false,
+            });
+            let binding = Binding::new(&token, &th_final).with_quality(preset);
+            let (client, server) = duplex(1 << 22);
+            let served = tokio::spawn({
+                let host = Arc::clone(&host);
+                async move { host.serve(server).await }
+            });
+            let viewer = MediaViewer::bind(client, &binding, MEDIA_BIND_WAIT)
+                .await
+                .unwrap();
+            let ender = tokio::spawn({
+                let host = Arc::clone(&host);
+                let session_id = session_id.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    host.on_end(&session_id, None);
+                }
+            });
+            let mut heard = HeardScreens::default();
+            let mut stats = ViewerStats::default();
+            let mut pictures = CliPictures::new(Some(&mut heard));
+            let channels = ViewerChannels {
+                input: None,
+                requests: screen_requests(Some(asked)),
+            };
+            let viewed =
+                pictures_until_host_ends(viewer, &mut pictures, &mut stats, channels).await;
+            let report = pictures.report_lines(&stats);
+            ender.await.unwrap();
+            served.await.unwrap();
+            assert!(matches!(viewed, Ok(ViewerEnd::Host(_))), "{viewed:?}");
+            let mut replay = CliPictures::new(None);
+            let lines: Vec<String> = heard
+                .0
+                .iter()
+                .map(|(screens, news)| replay.screens_at(screens, *news))
+                .collect();
+            let views = views
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            for line in lines.iter().chain(&report).chain(&views) {
+                eprintln!("{line}");
+            }
+            assert_eq!(
+                lines[0],
+                format!(
+                    "MEDIA SCREENS request=0 status=ok shown=1 all=yes list=0 seq=0 \
+                     remapped=no 1:{w1}x{h1}+0+0:main 2:{w2}x{h2}+{w1}+0"
+                )
+            );
+            let shown = if asked == ALL_MONITORS {
+                "all".to_owned()
+            } else {
+                asked.to_string()
+            };
+            assert!(
+                lines[1].starts_with(&format!(
+                    "MEDIA SCREENS request=1 status=ok shown={shown} all=yes list=0 seq="
+                )) && lines[1].contains(" remapped=yes "),
+                "{lines:?}"
+            );
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(
+                report[0].starts_with("MEDIA OK ")
+                    && report[0].contains(&format!(" size={}x{} ", size.0, size.1)),
+                "{report:?}"
+            );
+            assert!(
+                report
+                    .iter()
+                    .any(|l| l.starts_with("MEDIA CARD ") && l.ends_with(" in-order")),
+                "{report:?}"
+            );
+            assert_eq!(
+                views,
+                [
+                    format!("SHARING VIEW {session_id} screen=1 of=2"),
+                    format!("SHARING VIEW {session_id} screen={shown} of=2"),
+                ]
+            );
+            assert_eq!((stats.monitor_requests, stats.screens_received), (1, 2));
+        }
+    }
+
+    /// Run `viewer` into `pictures` until the host ends the stream, or 20 s.
+    async fn pictures_until_host_ends(
+        viewer: MediaViewer<DuplexStream>,
+        pictures: &mut dyn FrameSink,
+        stats: &mut ViewerStats,
+        channels: ViewerChannels,
+    ) -> Result<ViewerEnd, ViewerError> {
+        viewer
+            .run_with(
+                pictures,
+                stats,
+                channels,
+                tokio::time::sleep(Duration::from_secs(20)),
+            )
+            .await
+    }
+
+    /// The monitors design §2, `connect --screen 2`: the request waits in
+    /// its channel while the host has listed nothing (only pings reach it,
+    /// for five seconds), goes as one `SelectMonitor` for screen 2 naming
+    /// the list the host's first `Monitors` gave, and the host's answer
+    /// reaches the sink (the window's, when there is one) as the answer;
+    /// nothing else is asked.
+    #[tokio::test(start_paused = true)]
+    async fn connect_asks_for_its_screen_once_the_host_lists_them() {
+        use tornect_proto::{
+            MonitorEntry, Msg, QualityInfo, codec, quality, read_msg, reason, write_msg,
+        };
+        let Live {
+            mut session,
+            kill,
+            host,
+            ..
+        } = live().await;
+        let binding = Binding::new(session.session_token(), &session.th());
+        let (client_media, mut host_media) = duplex(1 << 16);
+        let entry = |primary, x, width, height| MonitorEntry {
+            primary,
+            x,
+            y: 0,
+            width,
+            height,
+        };
+        let listed = vec![entry(true, 0, 1280, 720), entry(false, 1280, 1024, 768)];
+        let media_host = tokio::spawn(async move {
+            let bind = read_msg(&mut host_media).await.unwrap();
+            assert!(matches!(bind, Some(Msg::Bind { .. })), "{bind:?}");
+            let ok = Msg::BindOk {
+                width: 1280,
+                height: 720,
+                codec: codec::H264,
+                mode: 1,
+                quality: QualityInfo {
+                    preset: quality::BALANCED,
+                    max_fps: 15,
+                    kbps: 1500,
+                    max_long: 3840,
+                    max_short: 2160,
+                },
+            };
+            write_msg(&mut host_media, &ok).await.unwrap();
+            let unlisted = tokio::time::Instant::now() + Duration::from_secs(5);
+            while let Ok(msg) = tokio::time::timeout_at(unlisted, read_msg(&mut host_media)).await {
+                let msg = msg.unwrap().expect("the stream is open");
+                assert!(matches!(msg, Msg::Ping { .. }), "before a list: {msg:?}");
+            }
+            let monitors = |request, shown, remapped, seq| Msg::Monitors {
+                request,
+                status: monitor_status::OK,
+                shown,
+                all: true,
+                remapped,
+                list: 7,
+                seq,
+                monitors: listed.clone(),
+            };
+            write_msg(&mut host_media, &monitors(0, 1, false, 0))
+                .await
+                .unwrap();
+            let asked = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match read_msg(&mut host_media).await.unwrap().unwrap() {
+                        Msg::Ping { .. } => {}
+                        other => break other,
+                    }
+                }
+            })
+            .await
+            .expect("the viewer asks once the host lists its screens");
+            assert_eq!(
+                asked,
+                Msg::SelectMonitor {
+                    request: 1,
+                    list: 7,
+                    monitor: 2
+                }
+            );
+            write_msg(&mut host_media, &monitors(1, 2, true, 41))
+                .await
+                .unwrap();
+            let after = tokio::time::Instant::now() + Duration::from_secs(5);
+            while let Ok(msg) = tokio::time::timeout_at(after, read_msg(&mut host_media)).await {
+                let msg = msg.unwrap().expect("the stream is open");
+                assert!(matches!(msg, Msg::Ping { .. }), "after the answer: {msg:?}");
+            }
+            let close = Msg::Close {
+                reason: reason::ENDED_BY_HOST,
+            };
+            write_msg(&mut host_media, &close).await.unwrap();
+            host_media
+        });
+        let viewer = MediaViewer::bind(client_media, &binding, MEDIA_BIND_WAIT)
+            .await
+            .unwrap();
+        let (_ctrl_c, interrupted) = watch::channel(false);
+        let mut heard = HeardScreens::default();
+        let mut stats = ViewerStats::default();
+        let mut pictures = CliPictures::new(Some(&mut heard));
+        let channels = ViewerChannels {
+            input: None,
+            requests: screen_requests(Some(2)),
+        };
+        let (viewed, end) = view(
+            viewer,
+            &mut session,
+            None,
+            &interrupted,
+            &mut pictures,
+            &mut stats,
+            channels,
+        )
+        .await;
+        assert_eq!(pictures.screen_requests, 1);
+        let _host_media = media_host.await.unwrap();
+        assert!(
+            matches!(viewed, Ok(ViewerEnd::Host(r)) if r == reason::ENDED_BY_HOST),
+            "{viewed:?}"
+        );
+        assert!(matches!(end, Ok(End::You)), "{end:?}");
+        let said: Vec<(u8, ScreensNews)> = heard
+            .0
+            .iter()
+            .map(|(screens, news)| (screens.shown, *news))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                (1, ScreensNews::Layout),
+                (
+                    2,
+                    ScreensNews::Answer {
+                        asked: 2,
+                        status: monitor_status::OK
+                    }
+                ),
+            ]
+        );
+        assert_eq!((stats.monitor_requests, stats.screens_received), (1, 2));
+        kill.kill(bye::USER);
+        host.await.unwrap().unwrap();
+    }
+
+    /// `connect --screen N`'s request waits alone in a channel whose sender
+    /// is gone, so the viewer sends it once and then hears that no more
+    /// follow; without `--screen` there is no channel.
+    #[tokio::test]
+    async fn a_screen_request_waits_alone_in_its_channel() {
+        assert!(screen_requests(None).is_none());
+        let mut rx = screen_requests(Some(ALL_MONITORS)).unwrap();
+        assert_eq!(
+            rx.recv().await,
+            Some(ViewerRequest::ShowScreen(ALL_MONITORS))
+        );
+        assert_eq!(rx.recv().await, None);
+    }
+
+    /// The monitors design §2: one `MEDIA SCREENS` line per `Monitors`, the
+    /// host's news as request 0, an answer under the request's number with
+    /// its status, a request given up or not sent as `status=no-answer`;
+    /// each monitor `id:WxH±X±Y`, `:main` on the primary, `shown=all` for
+    /// all of them at once.
+    #[test]
+    fn the_screens_lines_say_each_list_and_answer() {
+        use tornect_proto::MonitorEntry;
+        let entry = |primary, x, width, height| MonitorEntry {
+            primary,
+            x,
+            y: 0,
+            width,
+            height,
+        };
+        let mut screens = Screens {
+            monitors: vec![entry(true, 0, 1280, 720), entry(false, 1280, 1024, 768)],
+            all: true,
+            shown: 1,
+            list: 0,
+            seq: 0,
+            remapped: false,
+        };
+        let mut pictures = CliPictures::new(None);
+        assert_eq!(
+            pictures.screens_at(&screens, ScreensNews::Layout),
+            "MEDIA SCREENS request=0 status=ok shown=1 all=yes list=0 seq=0 remapped=no \
+             1:1280x720+0+0:main 2:1024x768+1280+0"
+        );
+        (screens.shown, screens.seq, screens.remapped) = (2, 41, true);
+        let answer = ScreensNews::Answer {
+            asked: 2,
+            status: monitor_status::OK,
+        };
+        assert_eq!(
+            pictures.screens_at(&screens, answer),
+            "MEDIA SCREENS request=1 status=ok shown=2 all=yes list=0 seq=41 remapped=yes \
+             1:1280x720+0+0:main 2:1024x768+1280+0"
+        );
+        for news in [
+            ScreensNews::NoAnswer { asked: 1 },
+            ScreensNews::NotSent { asked: 1 },
+        ] {
+            let line = pictures.screens_at(&screens, news);
+            assert_eq!(
+                line,
+                format!(
+                    "MEDIA SCREENS request={} status=no-answer",
+                    pictures.screen_requests
+                )
+            );
+        }
+        assert_eq!(pictures.screen_requests, 3);
+        let busy = ScreensNews::Answer {
+            asked: 0,
+            status: monitor_status::BUSY,
+        };
+        assert!(
+            pictures
+                .screens_at(&screens, busy)
+                .starts_with("MEDIA SCREENS request=4 status=busy shown=2 ")
+        );
+        // All screens at once; a monitor left of the primary; a size the
+        // host does not know; a host with nothing to choose.
+        screens = Screens {
+            monitors: vec![entry(false, -1920, 1920, 1080), entry(true, 0, 0, 0)],
+            all: true,
+            shown: ALL_MONITORS,
+            list: 3,
+            seq: 9,
+            remapped: true,
+        };
+        assert_eq!(
+            pictures.screens_at(&screens, ScreensNews::Layout),
+            "MEDIA SCREENS request=0 status=ok shown=all all=yes list=3 seq=9 remapped=yes \
+             1:1920x1080-1920+0 2:0x0+0+0:main"
+        );
+        let none = Screens {
+            monitors: Vec::new(),
+            all: false,
+            shown: 0,
+            list: 0,
+            seq: 0,
+            remapped: false,
+        };
+        assert_eq!(
+            pictures.screens_at(&none, ScreensNews::Layout),
+            "MEDIA SCREENS request=0 status=ok shown=0 all=no list=0 seq=0 remapped=no"
+        );
+        for (code, name) in [
+            (monitor_status::UNKNOWN, "unknown"),
+            (monitor_status::FAILED, "failed"),
+            (9, "code-9"),
+        ] {
+            assert!(
+                media_screens_line(5, code, &none).contains(&format!(" status={name} ")),
+                "{code}"
+            );
+        }
+    }
+
+    /// The monitors design §2: `doctor`'s `screens:` line lists a desktop's
+    /// monitors by number, size and place (a negative offset left of the
+    /// primary), `main` on the primary, and says why when they cannot be
+    /// listed; a desktop whose capture lists none (Wayland, none at all)
+    /// has no such line.
+    #[test]
+    #[allow(clippy::print_stderr)] // reports this machine's line
+    fn doctor_lists_the_screens_a_session_can_switch_between() {
+        use tornect_capture::{CaptureError, Monitor, Rect};
+        let listed = Ok(vec![
+            Monitor {
+                id: 1,
+                primary: true,
+                rect: Rect::new(0, 0, 2560, 1440),
+            },
+            Monitor {
+                id: 2,
+                primary: false,
+                rect: Rect::new(2560, 0, 1920, 1080),
+            },
+        ]);
+        assert_eq!(
+            screens_text(&listed),
+            "screens: 2 (1 2560x1440+0+0 main, 2 1920x1080+2560+0)"
+        );
+        let left = Ok(vec![Monitor {
+            id: 1,
+            primary: false,
+            rect: Rect::new(-1920, -120, 1920, 1080),
+        }]);
+        assert_eq!(screens_text(&left), "screens: 1 (1 1920x1080-1920-120)");
+        let refused = Err(CaptureError::Unavailable("not an X11 session".to_owned()));
+        assert_eq!(
+            screens_text(&refused),
+            "screens: unknown (capture unavailable: not an X11 session)"
+        );
+        assert_eq!(screens_line(&DesktopBackend::Wayland), None);
+        assert_eq!(
+            screens_line(&DesktopBackend::Unavailable("no seat".into())),
+            None
+        );
+        // This machine's own X11 desktop, if any, or why not: under
+        // `xvfb-run` with `XDG_SESSION_TYPE=x11`, the line of a real listing.
+        #[cfg(target_os = "linux")]
+        {
+            let line = screens_line(&DesktopBackend::X11).expect("a line on X11");
+            eprintln!("{line}");
+            assert!(line.starts_with("screens: "), "{line}");
+        }
     }
 
     /// C11 (decision M1-67): `--remember` is refused before dialing where

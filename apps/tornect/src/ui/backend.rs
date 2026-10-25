@@ -3616,7 +3616,10 @@ async fn viewed(
         }
     });
     let watching = crate::tor_cmd::WatchOptions {
-        input,
+        channels: tornect_session::ViewerChannels {
+            input,
+            requests: None,
+        },
         forward: Some(&mut sink),
         quality,
         quality_rx: Some(picks),

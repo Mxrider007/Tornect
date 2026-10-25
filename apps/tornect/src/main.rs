@@ -113,7 +113,8 @@ enum Command {
     /// connect to another computer, and answer pairing and session requests in
     /// popups, with a banner and Stop while the screen is shared.
     Gui {
-        /// What a session shares: `desktop` or `test-card` (see `host`).
+        /// What a session shares: `desktop`, `test-card` or `test-screens`
+        /// (see `host`).
         #[arg(long, value_enum, default_value_t = CaptureArg::Desktop)]
         capture: CaptureArg,
         /// Only connect to others: publish no ID and answer no requests.
@@ -182,8 +183,10 @@ enum Command {
         no_pow: bool,
         /// What a session shares: `desktop` (the RemoteDesktop portal and
         /// PipeWire on a Wayland session, X11 on an X11 session, GDI on
-        /// Windows) or `test-card` (a synthetic picture; the viewer's input
-        /// goes nowhere).
+        /// Windows), `test-card` (a synthetic picture; the viewer's input
+        /// goes nowhere) or `test-screens` (two synthetic screens side by
+        /// side, 1280x720 (main) and 1024x768, for switching between; the
+        /// viewer's input goes nowhere).
         #[arg(long, value_enum, default_value_t = CaptureArg::Desktop)]
         capture: CaptureArg,
     },
@@ -278,6 +281,16 @@ enum Command {
         /// itself balanced). The host fits it to its own limits.
         #[arg(long, value_name = "PRESET")]
         quality: Option<QualityPreset>,
+        /// The host's screen to show: 1 to 16, or all (every screen at once,
+        /// where the host offers it). Asked for as soon as the host lists its
+        /// screens; a host that lists none is not asked.
+        #[arg(
+            long,
+            value_name = "SCREEN",
+            value_parser = parse_screen,
+            conflicts_with_all = ["pair_only", "no_video"]
+        )]
+        screen: Option<u8>,
         /// Connect without asking: this device's unattended access at the host
         /// (a paired host whose owner gave it). The password is asked on this
         /// terminal, never taken from the command line or the environment; one
@@ -534,6 +547,22 @@ enum CaptureArg {
     Desktop,
     /// A synthetic test card.
     TestCard,
+    /// Two synthetic screens side by side, to switch between.
+    TestScreens,
+}
+
+/// `tornect connect --screen`: a screen's number, `1` to `16`, or `all`
+/// (any case) for every screen at once, which the media stream calls 0
+/// ([`tornect_proto::ALL_MONITORS`]).
+fn parse_screen(given: &str) -> Result<u8, String> {
+    if given.eq_ignore_ascii_case("all") {
+        return Ok(tornect_proto::ALL_MONITORS);
+    }
+    given
+        .parse::<u8>()
+        .ok()
+        .filter(|&n| (1..=tornect_proto::MAX_MONITORS).contains(&usize::from(n)))
+        .ok_or_else(|| "a screen is a number from 1 to 16, or all".to_owned())
 }
 
 impl From<CaptureArg> for tornect_session::Source {
@@ -541,6 +570,7 @@ impl From<CaptureArg> for tornect_session::Source {
         match arg {
             CaptureArg::Desktop => Self::Desktop,
             CaptureArg::TestCard => Self::TestCard,
+            CaptureArg::TestScreens => Self::TestScreens,
         }
     }
 }
@@ -766,6 +796,7 @@ fn main() -> anyhow::Result<()> {
             pings,
             no_video,
             quality,
+            screen,
             unattended,
             view_only,
             remember,
@@ -782,6 +813,7 @@ fn main() -> anyhow::Result<()> {
                     pings,
                     video: !no_video,
                     quality,
+                    screen,
                     unattended: unattended.then_some(tor_cmd::UnattendedOpts {
                         view_only,
                         remember,
@@ -1183,7 +1215,11 @@ fn cmd_doctor(paths: &Paths) -> anyhow::Result<()> {
         let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".into());
         println!("session: {session} ({desktop})");
     }
-    for line in tor_cmd::capture_lines(paths, &tornect_session::DesktopBackend::detect()) {
+    let desktop = tornect_session::DesktopBackend::detect();
+    for line in tor_cmd::capture_lines(paths, &desktop) {
+        println!("{line}");
+    }
+    if let Some(line) = tor_cmd::screens_line(&desktop) {
         println!("{line}");
     }
     println!("directories:");
@@ -1260,6 +1296,84 @@ mod tests {
     use tornect_core::unattended::ipc::{IpcRequest, IpcResponse, ShownLink};
 
     const ID: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwd";
+
+    /// The monitors design §2: `tornect connect <id> --screen N` takes a
+    /// screen's number from 1 to 16, or `all` (the media stream's 0), and
+    /// refuses anything else, naming the range; it asks for a picture, so
+    /// it does not go with `--no-video` or `--pair-only`.
+    #[test]
+    fn connect_takes_a_screen_by_number_or_all() {
+        let parse = |args: &[&str]| {
+            super::Cli::try_parse_from(["tornect", "connect", ID].iter().chain(args))
+        };
+        let screen_of = |args: &[&str]| {
+            let Some(super::Command::Connect { screen, .. }) = parse(args).unwrap().command else {
+                panic!("not connect");
+            };
+            screen
+        };
+        assert_eq!(screen_of(&[]), None, "nothing is asked then");
+        assert_eq!(screen_of(&["--screen", "2"]), Some(2));
+        assert_eq!(screen_of(&["--screen=1"]), Some(1));
+        assert_eq!(screen_of(&["--screen", "16"]), Some(16));
+        for all in ["all", "All", "ALL"] {
+            assert_eq!(
+                screen_of(&["--screen", all]),
+                Some(tornect_proto::ALL_MONITORS)
+            );
+        }
+        for wrong in ["0", "17", "256", "-1", "two", "", "2.5", "1,2", " 2"] {
+            let given = format!("--screen={wrong}");
+            let err = parse(&[&given]).unwrap_err().to_string();
+            assert!(
+                err.contains("a screen is a number from 1 to 16, or all"),
+                "{wrong:?}: {err}"
+            );
+        }
+        for alone in [["--no-video"], ["--pair-only"]] {
+            let args = [alone[0], "--screen", "2"];
+            let err = parse(&args).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{args:?}"
+            );
+        }
+        let help = super::Cli::command()
+            .find_subcommand_mut("connect")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--screen <SCREEN>"), "{help}");
+        assert!(help.contains("1 to 16, or all"), "{help}");
+    }
+
+    /// The monitors design §2: `--capture test-screens` on `host` and `gui`
+    /// shares the session layer's two synthetic screens.
+    #[test]
+    fn host_and_gui_share_the_test_screens() {
+        for command in ["host", "gui"] {
+            let cli = super::Cli::try_parse_from(["tornect", command, "--capture", "test-screens"])
+                .unwrap();
+            let capture = match cli.command {
+                Some(
+                    super::Command::Host { capture, .. } | super::Command::Gui { capture, .. },
+                ) => capture,
+                other => panic!("{command}: {other:?}"),
+            };
+            assert_eq!(capture, super::CaptureArg::TestScreens, "{command}");
+            assert!(matches!(
+                tornect_session::Source::from(capture),
+                tornect_session::Source::TestScreens
+            ));
+        }
+        let help = super::Cli::command()
+            .find_subcommand_mut("host")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("test-screens"), "{help}");
+    }
 
     /// The quality design §3.5: `tornect connect <id> --quality P` takes the
     /// three presets by their config names and nothing else (the refusal

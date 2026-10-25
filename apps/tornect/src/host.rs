@@ -30,7 +30,7 @@ use tornect_core::unattended::schedule::FixedOffset;
 use tornect_core::{Config, HostIdentity, Paths};
 use tornect_platform::ipc::{Endpoint, IpcError};
 use tornect_session::{
-    CaptureStarted, MediaEnd, MediaHost, MediaObserver, MediaOutcome, MediaReport,
+    CaptureChanged, CaptureStarted, MediaEnd, MediaHost, MediaObserver, MediaOutcome, MediaReport,
 };
 use tornect_signal::consent::TransportPolicy;
 use tornect_signal::dispatch::{FIRST_FRAME_DEADLINE, FirstFrame, first_frame};
@@ -1317,6 +1317,10 @@ impl MediaObserver for CliMedia {
         ));
     }
 
+    fn capture_changed(&self, changed: &CaptureChanged<'_>) {
+        say(format_args!("{}", view_line(changed)));
+    }
+
     fn capture_stopped(&self, session_id: &str, report: &MediaReport, end: &MediaEnd) {
         say(format_args!("SHARING STOPPED {session_id}"));
         note(format_args!(
@@ -1327,6 +1331,23 @@ impl MediaObserver for CliMedia {
             stage_means(report)
         ));
     }
+}
+
+/// The host's line for what a session's pictures show (the monitors design
+/// §2), at its first picture of a desktop with monitors to choose from and
+/// whenever they show another part of it: `SHARING VIEW <session> screen=2
+/// of=3`, or `screen=all of=3`. Numbers only: a monitor's name never goes
+/// out.
+pub(crate) fn view_line(changed: &CaptureChanged<'_>) -> String {
+    let screen = if changed.all {
+        "all".to_owned()
+    } else {
+        changed.screen.to_string()
+    };
+    format!(
+        "SHARING VIEW {} screen={screen} of={}",
+        changed.session_id, changed.of
+    )
 }
 
 /// The means of a served stream's stages, for the host's stop line (the
@@ -1677,6 +1698,28 @@ mod tests {
     };
 
     use super::*;
+
+    /// The monitors design §2: the host's `SHARING VIEW` line names the
+    /// session and the screen its pictures show by number, `all` for every
+    /// screen at once, out of how many; nothing else about the monitors.
+    #[test]
+    fn the_view_line_says_the_screen_shown_by_number() {
+        let mut changed = CaptureChanged {
+            session_id: "4f1c9a",
+            shown: Some(tornect_input::Rect::new(1280, 0, 1024, 768)),
+            all: false,
+            screen: 2,
+            of: 3,
+            input: true,
+        };
+        assert_eq!(view_line(&changed), "SHARING VIEW 4f1c9a screen=2 of=3");
+        changed.all = true;
+        changed.screen = tornect_proto::ALL_MONITORS;
+        changed.shown = Some(tornect_input::Rect::new(0, 0, 3328, 768));
+        assert_eq!(view_line(&changed), "SHARING VIEW 4f1c9a screen=all of=3");
+        changed.input = false;
+        assert_eq!(view_line(&changed), "SHARING VIEW 4f1c9a screen=all of=3");
+    }
 
     /// The quality design §3.5: the host's stop line (the terminal's and the
     /// window's) ends with the stream's stage means, in §3.3's format: one
