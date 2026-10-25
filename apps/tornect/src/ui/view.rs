@@ -2847,6 +2847,8 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 input: false,
+                shown: None,
+                all: false,
             }),
         }];
         for stage in [

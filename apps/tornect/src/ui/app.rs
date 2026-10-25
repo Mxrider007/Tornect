@@ -23,7 +23,7 @@ use tornect_core::levels::AdminPath;
 use tornect_core::unattended::ipc::ShownLink;
 use tornect_input::Button;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{UserAttentionType, Window, WindowAttributes, WindowId};
@@ -671,6 +671,10 @@ pub struct App {
     shown: Indicator,
     /// The indicator is a see-through pill (the desktop composites it).
     indicator_rounded: bool,
+    /// Where the indicator window was last placed (not Wayland): it moves
+    /// again only when the monitor it belongs on changes, so a window the
+    /// person dragged elsewhere stays there until then.
+    indicator_at: Option<PhysicalPosition<i32>>,
     /// The indicator probe of a start in background mode (§B.1.1): the
     /// indicator's window, opened once right after the main window and closed
     /// at its first frame, and where it stands.
@@ -740,6 +744,7 @@ impl App {
             indicator: None,
             shown: Indicator::default(),
             indicator_rounded: false,
+            indicator_at: None,
             probe: None,
             notices: super::notice::Notices::default(),
             blocks: Vec::new(),
@@ -884,7 +889,7 @@ impl App {
                     .with_title(STREAM_TITLE)
                     .with_inner_size(LogicalSize::new(1280.0, 760.0));
                 if let Some((x, y)) = self.stream_at {
-                    attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
+                    attrs = attrs.with_position(PhysicalPosition::new(x, y));
                 }
                 match Surface::new(el, attrs, setup, self.theme, false) {
                     Ok(surface) => {
@@ -936,27 +941,46 @@ impl App {
             )
     }
 
-    /// A new indicator window for `rows` sessions.
-    fn open_indicator(&mut self, el: &ActiveEventLoop, rows: usize) -> anyhow::Result<Surface> {
-        // Top-right of the primary monitor where the desktop has one and lets
-        // a client place its window (not Wayland).
-        let position = el
+    /// Where the indicator window of `rows` sessions belongs now
+    /// (`indicator::place`): the top-right of the monitor the newest shared
+    /// session's pictures show, else of the primary monitor (else the first
+    /// one listed). The desktop honours it where it lets a client place its
+    /// window (not Wayland).
+    fn indicator_position(
+        &self,
+        el: &ActiveEventLoop,
+        rows: usize,
+    ) -> Option<PhysicalPosition<i32>> {
+        let handles: Vec<_> = el.available_monitors().collect();
+        let primary = el
             .primary_monitor()
-            .or_else(|| el.available_monitors().next())
-            .map(|m| {
-                indicator::top_right(
-                    m.position(),
-                    m.size(),
-                    m.scale_factor(),
-                    indicator::size(rows),
-                )
-            });
+            .and_then(|p| handles.iter().position(|m| *m == p));
+        let monitors: Vec<_> = handles
+            .iter()
+            .map(|m| indicator::Monitor {
+                position: m.position(),
+                size: m.size(),
+                scale: m.scale_factor(),
+            })
+            .collect();
+        let sharing = self.shared.read(|m| m.sharing.clone());
+        indicator::place(&sharing, &monitors, primary, rows)
+    }
+
+    /// A new indicator window for `rows` sessions, and where it was put.
+    fn open_indicator(
+        &mut self,
+        el: &ActiveEventLoop,
+        rows: usize,
+    ) -> anyhow::Result<(Surface, Option<PhysicalPosition<i32>>)> {
+        let position = self.indicator_position(el, rows);
         let setup = self.main_device(el);
         // A pill where the desktop composites transparent windows, a square
         // elsewhere.
         self.indicator_rounded = indicator::rounded_here(wayland(el));
         let attrs = indicator::attributes(rows, position).with_transparent(self.indicator_rounded);
         Surface::new(el, attrs, setup, self.theme, self.indicator_rounded)
+            .map(|surface| (surface, position))
     }
 
     /// The indicator probe of a start in background mode (§B.1.1): the
@@ -970,7 +994,7 @@ impl App {
             return;
         }
         match self.open_indicator(el, 1) {
-            Ok(surface) => {
+            Ok((surface, _)) => {
                 let state = ProbeState::opened(surface.window.id(), Instant::now());
                 self.probe = Some((surface, state));
             }
@@ -1053,7 +1077,10 @@ impl App {
         match self.shown.sync(&sharing) {
             Change::Keep => {}
             Change::Open => match self.open_indicator(el, self.shown.rows()) {
-                Ok(surface) => self.indicator = Some(surface),
+                Ok((surface, at)) => {
+                    self.indicator = Some(surface);
+                    self.indicator_at = at;
+                }
                 Err(e) => {
                     // The banner in the main window still shows the session
                     // (brought up first in background mode); the next session
@@ -1078,7 +1105,21 @@ impl App {
                     surface.window.request_redraw();
                 }
             }
-            Change::Close => self.indicator = None,
+            Change::Close => {
+                self.indicator = None;
+                self.indicator_at = None;
+            }
+        }
+        // The monitor the session shows changed (the monitors design §4):
+        // the window moves to it. Wayland places windows itself.
+        if self.indicator.is_some() && !wayland(el) {
+            let at = self.indicator_position(el, self.shown.rows());
+            if let (Some(surface), Some(pos)) = (&self.indicator, at)
+                && at != self.indicator_at
+            {
+                surface.window.set_outer_position(pos);
+                self.indicator_at = at;
+            }
         }
     }
 

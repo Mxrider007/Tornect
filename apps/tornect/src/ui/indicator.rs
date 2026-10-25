@@ -17,12 +17,20 @@
 //! portal stream runs. Placement is ignored on Wayland too (the compositor
 //! places toplevels); a press on the window moves it on every desktop.
 //!
+//! Placement follows the session: the window sits at the top-right of the
+//! monitor the newest session's pictures show, and of the primary when they
+//! show all monitors or capture has not placed them (the monitors design §4,
+//! [`place`]). Only where the desktop lets a client place its window: not
+//! on Wayland, where the compositor's own screen-sharing indicator is relied
+//! on. One indicator per captured monitor stays open in the plan.
+//!
 //! Focus: the window asks not to be activated when it opens
 //! (`with_active(false)`), which Windows (and macOS) honour. winit has no such
 //! request on X11 or Wayland: on X11 the window is a utility window, which
 //! mutter does not focus when it maps; elsewhere the desktop's
 //! focus-stealing prevention decides.
 
+use tornect_input::Rect;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::window::{Window, WindowAttributes, WindowLevel};
 
@@ -135,6 +143,78 @@ pub fn top_right(
     PhysicalPosition::new((x.round() as i32).max(origin.x), y.round() as i32)
 }
 
+/// One monitor of this desktop as the window system lists it: where it is
+/// and how large, in the desktop's physical pixels (on Windows and X11 the
+/// rectangles capture reports, research `monitors` §4), and its scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Monitor {
+    /// Its top-left corner.
+    pub position: PhysicalPosition<i32>,
+    /// Its size.
+    pub size: PhysicalSize<u32>,
+    /// Its scale factor.
+    pub scale: f64,
+}
+
+/// Which of `monitors` (each its position and size) the indicator sits on
+/// for a session whose pictures show `shown` (`all`: every monitor at once):
+/// the primary (`primary`) for all monitors or nothing shown; otherwise the
+/// monitor that overlaps `shown` most, the first of equals; the primary
+/// again where none overlaps it.
+#[must_use]
+pub fn monitor_for(
+    shown: Option<Rect>,
+    all: bool,
+    monitors: &[(PhysicalPosition<i32>, PhysicalSize<u32>)],
+    primary: Option<usize>,
+) -> Option<usize> {
+    let Some(shown) = shown.filter(|_| !all) else {
+        return primary;
+    };
+    monitors
+        .iter()
+        .enumerate()
+        .map(|(i, (at, size))| {
+            let rect = Rect::new(at.x, at.y, size.width, size.height);
+            (i, rect.area_overlap(&shown))
+        })
+        .filter(|(_, overlap)| *overlap > 0)
+        .fold(None::<(usize, u64)>, |best, (i, overlap)| match best {
+            Some((_, most)) if most >= overlap => best,
+            _ => Some((i, overlap)),
+        })
+        .map(|(i, _)| i)
+        .or(primary)
+}
+
+/// Where the indicator of `rows` sessions goes, its window's outer position:
+/// the top-right of the monitor the newest of `sharing` shows
+/// ([`monitor_for`]), or of `primary` (else the first monitor) before
+/// capture said what it shows. `None` when the window system lists no
+/// monitor.
+#[must_use]
+pub fn place(
+    sharing: &[Sharing],
+    monitors: &[Monitor],
+    primary: Option<usize>,
+    rows: usize,
+) -> Option<PhysicalPosition<i32>> {
+    let primary = primary.filter(|&i| i < monitors.len()).or_else(|| {
+        // The first monitor where none is primary.
+        (!monitors.is_empty()).then_some(0)
+    });
+    let capture = sharing.last().and_then(|s| s.capture.as_ref());
+    let rects: Vec<_> = monitors.iter().map(|m| (m.position, m.size)).collect();
+    let on = monitor_for(
+        capture.and_then(|c| c.shown),
+        capture.is_some_and(|c| c.all),
+        &rects,
+        primary,
+    )?;
+    let m = monitors.get(on)?;
+    Some(top_right(m.position, m.size, m.scale, size(rows)))
+}
+
 /// Whether the indicator is drawn as a see-through pill: where the desktop
 /// composites transparent windows (Windows, macOS, Wayland); on X11 a
 /// compositor may be missing, so there it is a square.
@@ -196,6 +276,8 @@ mod tests {
             width: 1920,
             height: 1080,
             input,
+            shown: None,
+            all: false,
         });
         s
     }
@@ -553,5 +635,115 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The monitors design §4: the indicator sits on the monitor that holds
+    /// most of what the session's pictures show, left of and above the
+    /// primary one too (negative coordinates); the first of two that hold
+    /// as much; the primary one for all monitors, before capture said what
+    /// it shows (Wayland never says) and for a rectangle no monitor holds.
+    #[test]
+    fn the_indicator_sits_on_the_monitor_the_session_shows() {
+        let monitors = [
+            (PhysicalPosition::new(0, 0), PhysicalSize::new(2560, 1440)),
+            (
+                PhysicalPosition::new(2560, 0),
+                PhysicalSize::new(1920, 1080),
+            ),
+            (
+                PhysicalPosition::new(-1280, 200),
+                PhysicalSize::new(1280, 1024),
+            ),
+        ];
+        let shown = |x, y, w, h| Some(Rect::new(x, y, w, h));
+        for (rect, all, primary, want) in [
+            (shown(2560, 0, 1920, 1080), false, Some(0), Some(1)),
+            (shown(-1280, 200, 1280, 1024), false, Some(0), Some(2)),
+            (shown(0, 0, 2560, 1440), false, Some(1), Some(0)),
+            // 560 columns on the first, 1360 on the second.
+            (shown(2000, 0, 1920, 1080), false, Some(0), Some(1)),
+            // As much on each: the first listed.
+            (shown(2060, 0, 1000, 1000), false, Some(1), Some(0)),
+            (shown(-1280, 0, 6000, 1440), true, Some(0), Some(0)),
+            (shown(2560, 0, 1920, 1080), true, Some(2), Some(2)),
+            (None, false, Some(1), Some(1)),
+            (None, true, None, None),
+            (shown(10_000, 10_000, 100, 100), false, Some(0), Some(0)),
+            (shown(10_000, 10_000, 100, 100), false, None, None),
+        ] {
+            assert_eq!(
+                monitor_for(rect, all, &monitors, primary),
+                want,
+                "{rect:?}, all {all}, primary {primary:?}"
+            );
+        }
+        assert_eq!(monitor_for(shown(0, 0, 10, 10), false, &[], None), None);
+    }
+
+    /// The indicator's window goes to the top-right of the monitor the
+    /// newest session shows, at that monitor's scale; before capture said
+    /// what it shows, or for all monitors, to the primary monitor's (the
+    /// first one's where none is primary); nowhere when the window system
+    /// lists no monitor.
+    #[test]
+    fn the_indicator_is_placed_on_the_newest_sessions_monitor() {
+        let monitors = [
+            Monitor {
+                position: PhysicalPosition::new(0, 0),
+                size: PhysicalSize::new(2560, 1440),
+                scale: 1.0,
+            },
+            Monitor {
+                position: PhysicalPosition::new(2560, 0),
+                size: PhysicalSize::new(1920, 1080),
+                scale: 2.0,
+            },
+        ];
+        let corner = |m: &Monitor, rows| top_right(m.position, m.size, m.scale, size(rows));
+        let showing = |s: Sharing, shown: Option<Rect>, all: bool| {
+            let mut s = captured(s, true);
+            if let Some(c) = s.capture.as_mut() {
+                c.shown = shown;
+                c.all = all;
+            }
+            s
+        };
+        let older = session("s-1", "Laptop", true);
+        let newer = session("s-2", "Tablet", false);
+        assert_eq!(place(std::slice::from_ref(&older), &[], Some(0), 1), None);
+        for (primary, on) in [(Some(1), 1), (None, 0), (Some(7), 0)] {
+            assert_eq!(
+                place(std::slice::from_ref(&older), &monitors, primary, 1),
+                Some(corner(&monitors[on], 1)),
+                "{primary:?}"
+            );
+        }
+        let right = Some(Rect::new(2560, 0, 1920, 1080));
+        let left = Some(Rect::new(0, 0, 2560, 1440));
+        let sessions = [
+            showing(older.clone(), left, false),
+            showing(newer.clone(), right, false),
+        ];
+        let at = place(&sessions, &monitors, Some(0), 2).unwrap();
+        assert_eq!(at, corner(&monitors[1], 2));
+        assert!(
+            (2560..4480).contains(&at.x) && (0..1080).contains(&at.y),
+            "{at:?}"
+        );
+        let sessions = [
+            showing(newer.clone(), right, false),
+            showing(older.clone(), left, false),
+        ];
+        assert_eq!(
+            place(&sessions, &monitors, Some(1), 2),
+            Some(corner(&monitors[0], 2)),
+            "the newest session's"
+        );
+        let sessions = [showing(newer, right, true)];
+        assert_eq!(
+            place(&sessions, &monitors, Some(0), 1),
+            Some(corner(&monitors[0], 1)),
+            "all monitors: the primary"
+        );
     }
 }

@@ -17,6 +17,7 @@ use tornect_core::unattended::grant::Preset;
 use tornect_core::unattended::ipc::{GrantOptions, ShownLink};
 use tornect_core::unattended::readiness::Probe;
 use tornect_core::{DeviceId, TornectId};
+use tornect_input::Rect;
 use tornect_proto::{HostStats, MonitorEntry, QualityInfo};
 
 use super::backend::Secret;
@@ -684,8 +685,18 @@ pub struct CaptureNote {
     pub width: u32,
     /// Size of the first picture.
     pub height: u32,
-    /// Whether the viewer's input reaches this machine.
+    /// Whether the viewer's input reaches this machine: what capture said
+    /// at its start, then what it says when the session's input ends
+    /// (`MediaObserver::capture_changed`, `input: false`).
     pub input: bool,
+    /// The rectangle of this desktop the pictures show, in its units
+    /// (physical pixels on Windows and X11), once capture said it; `None`
+    /// before, and for a source that does not place it on the desktop. The
+    /// indicator sits on the monitor under it (the monitors design §4).
+    pub shown: Option<Rect>,
+    /// The pictures show all of this desktop's monitors at once: the
+    /// indicator sits on the primary.
+    pub all: bool,
 }
 
 /// The connection this computer last asked for, as the connect stepper

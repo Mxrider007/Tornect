@@ -796,6 +796,8 @@ fn fill(m: &mut Model) {
             width: 1920,
             height: 1080,
             input: true,
+            shown: None,
+            all: false,
         }),
     }];
     m.client = ClientStage::Live(viewed(now));

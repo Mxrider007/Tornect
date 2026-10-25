@@ -16,8 +16,8 @@ use tornect_core::session_log::SessionMode;
 use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
 use tornect_input::InputEvent;
 use tornect_session::{
-    CaptureStarted, MediaEnd, MediaHost, MediaLimits, MediaObserver, MediaReport, Source,
-    SystemBackend, ViewerRequest,
+    CaptureChanged, CaptureStarted, MediaEnd, MediaHost, MediaLimits, MediaObserver, MediaReport,
+    Source, SystemBackend, ViewerRequest,
 };
 use tornect_signal::fsm::client::{
     self, ClientConfig, ClientDeps, ClientOutcome, Intent, NoServerKeyPin,
@@ -1697,6 +1697,8 @@ impl MediaObserver for GuiMedia {
             width: s.width,
             height: s.height,
             input: s.input,
+            shown: None,
+            all: false,
         };
         self.shared.update(|m| {
             if let Some(sharing) = m.sharing.iter_mut().find(|x| x.session_id == s.session_id) {
@@ -1712,6 +1714,25 @@ impl MediaObserver for GuiMedia {
             s.height,
             if s.input { "injected" } else { "not injected" }
         ));
+    }
+
+    /// What the session's pictures show moved, or its input ended (the
+    /// monitors design §4): the indicator follows the monitor shown and
+    /// stops claiming control; the evidence line is `tornect host`'s.
+    fn capture_changed(&self, changed: &CaptureChanged<'_>) {
+        self.shared.update(|m| {
+            if let Some(capture) = m
+                .sharing
+                .iter_mut()
+                .find(|x| x.session_id == changed.session_id)
+                .and_then(|x| x.capture.as_mut())
+            {
+                capture.shown = changed.shown;
+                capture.all = changed.all;
+                capture.input = changed.input;
+            }
+        });
+        say(format_args!("{}", crate::host::view_line(changed)));
     }
 
     fn capture_stopped(&self, session_id: &str, report: &MediaReport, end: &MediaEnd) {
@@ -8805,5 +8826,91 @@ mod tests {
         shared.update(|m| m.client = live(true, Some(listed())));
         show_screen(&shared, &link, 2);
         assert_eq!(switching(&shared), None);
+    }
+
+    /// The monitors design §4: what capture says later of a shared session
+    /// (the rectangle shown, all monitors, its input ended) reaches that
+    /// session's note for the indicator, and no other session's.
+    #[test]
+    fn what_capture_says_later_reaches_the_sessions_note() {
+        use tornect_input::Rect;
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let sharing = |id: &str| Sharing {
+            session_id: id.to_owned(),
+            label: "Laptop".to_owned(),
+            control: true,
+            unattended: false,
+            since: Instant::now(),
+            capture: None,
+        };
+        shared.update(|m| m.sharing = vec![sharing("s-1"), sharing("s-2")]);
+        let media = GuiMedia {
+            shared: Arc::clone(&shared),
+        };
+        let started = |id| CaptureStarted {
+            session_id: id,
+            label: "Laptop",
+            source: "test-screens",
+            width: 1920,
+            height: 1080,
+            mode: SessionMode::Control,
+            input: true,
+        };
+        media.capture_started(&started("s-1"));
+        media.capture_started(&started("s-2"));
+        let note = |id: &str| {
+            shared.read(|m| {
+                m.sharing
+                    .iter()
+                    .find(|s| s.session_id == id)
+                    .and_then(|s| s.capture.clone())
+                    .unwrap()
+            })
+        };
+        assert_eq!((note("s-1").shown, note("s-1").all), (None, false));
+        let right = Rect::new(2560, 0, 1920, 1080);
+        media.capture_changed(&CaptureChanged {
+            session_id: "s-1",
+            shown: Some(right),
+            all: false,
+            screen: 2,
+            of: 2,
+            input: false,
+        });
+        let first = note("s-1");
+        assert_eq!(
+            (first.shown, first.all, first.input),
+            (Some(right), false, false)
+        );
+        assert_eq!(
+            (first.source, first.width, first.height),
+            ("test-screens", 1920, 1080)
+        );
+        let second = note("s-2");
+        assert_eq!(
+            (second.shown, second.all, second.input),
+            (None, false, true)
+        );
+        let whole = Rect::new(0, 0, 4480, 1440);
+        media.capture_changed(&CaptureChanged {
+            session_id: "s-2",
+            shown: Some(whole),
+            all: true,
+            screen: 0,
+            of: 2,
+            input: true,
+        });
+        assert_eq!(note("s-2").shown, Some(whole));
+        assert!(note("s-2").all);
+        // A session the model does not hold changes nothing.
+        media.capture_changed(&CaptureChanged {
+            session_id: "s-9",
+            shown: None,
+            all: false,
+            screen: 1,
+            of: 2,
+            input: false,
+        });
+        assert_eq!(note("s-1"), first);
     }
 }
