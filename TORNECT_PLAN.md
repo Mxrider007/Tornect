@@ -637,12 +637,15 @@ and before `Video` 0, and every later change of the list, of what is shown or of
 before the first `Video` that shows it; the injector follows the new view before anything more of the viewer's is
 handled. Each `SelectMonitor` within the budget (2 a second, burst 4; beyond it read and not answered), in control
 and view-only sessions alike, gets exactly one `Monitors` with its request: UNKNOWN (no layout, a stale list, no such
-id, all where it is not offered), a no-op OK for what is shown, or BUSY (a switch under way, or the last accepted one
+id, all where it is not offered; capture checks the list again as it takes the request, against the monitors its
+source lists then, so a change in between never shows another monitor than the one chosen), a no-op OK for what is
+shown, or BUSY (a switch under way, or the last accepted one
 under 1 s ago) at once; otherwise OK right before the first picture of the new selection, a keyframe, or FAILED when
 the source refused or gave no picture within 15 s (a later picture is the host's news). **The barrier:** after a
 REMAPPED `Monitors` at seq S the host drops moves, wheel turns and presses until it reads a `VideoAck` that reaches S
 (`seq_reached`: at most 2³¹ − 1 past it, wrapping), then wheel turns and presses until a move has been injected;
-releases, keys and `ReleaseAll` always go. **Viewer:** a `SelectMonitor` only after a `Monitors`, echoing its
+a session whose first layout shows part of the desktop starts the same way, its wheel turns and presses waiting for
+its first injected move; releases, keys and `ReleaseAll` always go. **Viewer:** a `SelectMonitor` only after a `Monitors`, echoing its
 `list`, one at a time, ids counting from 1 and skipping 0; no answer within 25 s gives it up, and a late answer is
 news; the stream window also sends no move, wheel turn or press made against a picture before S, and sends the
 pointer's position again once picture S is on screen. An injector that cannot follow a change ends the session's
@@ -810,7 +813,10 @@ scancode for games, keysym for typing (per-app heuristic toggle in HUD).
 - **Screens** (decision M1-75; §B.4): on Windows and X11 a viewer can show another monitor, or all of them at
   once (scaled whole to the codec's limit, never cropped, M1-74), so the whole desktop that capture grabs is
   reachable under the consent already given for "the screen" (the attended popup, or the unattended grant of
-  §B.8): the crop above 3840×2160 was a codec limit, not a consent boundary. A session opens on the primary of two
+  §B.8): the crop above 3840×2160 was a codec limit, not a consent boundary. Where capture lists two or more
+  monitors the window says so: its session sheet asks for "this computer's N screens" and its sharing banner
+  says "this computer's screens" (the §B.2.1 level lines and the terminal's question, which asks to connect to
+  "this computer", are unchanged). A session opens on the primary of two
   or more monitors, so a multi-monitor host shows less by default than before. Choosing a screen is a viewing
   choice: legal in view-only sessions, read only on a bound stream, and it never opens a dialog, starts capture or
   creates an injector. Input lands only on what the viewer saw: the host's `Viewport` clamps every position into
