@@ -408,6 +408,15 @@ impl HostClip {
         self.sync();
     }
 
+    /// The host was locked (`true`, §2.3): the link goes inactive, the text
+    /// being sent is abandoned and the one arriving dropped. Or unlocked: the
+    /// link is active again while the viewer's switch is on, which
+    /// re-baselines it (the text copied meanwhile is not sent).
+    pub(crate) fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+        self.sync();
+    }
+
     /// The clipboard goes for the rest of the stream: the link is dropped
     /// (its backend stops, and clears the clipboard if it still holds the
     /// text it set), the text being sent is abandoned.
@@ -596,6 +605,24 @@ impl ViewerClipSync {
             self.quiet();
         }
         self.tell()
+    }
+
+    /// The host paused the clipboard (it is locked): nothing goes either
+    /// way, and the switch last sent may not have been heard (the host skips
+    /// `ClipSwitch` while paused). Or it resumed it: the `ClipSwitch` to
+    /// send, so that the host hears the switch as it is now.
+    pub(crate) fn set_paused(&mut self, paused: bool) -> Option<SvcMsg> {
+        if paused == self.paused {
+            return None;
+        }
+        self.paused = paused;
+        if paused {
+            self.told = None;
+            self.quiet();
+            None
+        } else {
+            self.tell()
+        }
     }
 
     /// The host turned the clipboard off: nothing more goes either way.

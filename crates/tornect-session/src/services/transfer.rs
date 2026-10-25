@@ -137,6 +137,9 @@ pub enum TransferState {
     Queued,
     /// Offered, or moving.
     Running,
+    /// Under way, and held while the host is locked (§2.3): no more bytes
+    /// move until it is unlocked, and then it goes on (`Running`).
+    Stalled,
     /// In place on the receiving side, under this name: the receiver's
     /// stored, sanitised name (the host's for an upload, the viewer's for a
     /// download; the host's own row of a download names the file it sent).
@@ -161,6 +164,12 @@ impl TransferState {
             reason::BY_VIEWER | reason::BY_HOST | reason::TURNED_OFF => Self::Cancelled(code),
             _ => Self::Failed(code),
         }
+    }
+
+    /// A transfer under way: `Stalled` while the host is locked (`paused`),
+    /// `Running` otherwise.
+    pub(crate) fn moving(paused: bool) -> Self {
+        if paused { Self::Stalled } else { Self::Running }
     }
 }
 
@@ -273,6 +282,34 @@ pub(crate) struct ViewerShared {
     pub(crate) rows: RowIds,
     /// The wire ids.
     pub(crate) ids: Ids,
+}
+
+/// The requests (`Offer`, `Get`, `List`) the viewer gave up when the host
+/// paused them (§2.3) while it waited for their answers: the host may have
+/// skipped them unread, or may still answer. The last [`ENDED_KEPT`] are
+/// kept; each is forgotten once its answer came.
+#[derive(Debug, Default)]
+pub(crate) struct Abandoned(VecDeque<u32>);
+
+impl Abandoned {
+    /// Request `id` was given up.
+    pub(crate) fn add(&mut self, id: u32) {
+        if self.0.len() == ENDED_KEPT {
+            self.0.pop_front();
+        }
+        self.0.push_back(id);
+    }
+
+    /// Whether `id` was given up; its answer came, so it is forgotten.
+    pub(crate) fn answered(&mut self, id: u32) -> bool {
+        match self.0.iter().position(|&given_up| given_up == id) {
+            Some(at) => {
+                self.0.remove(at);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// What a frame for transfer `xfer`, which no running transfer of a kind
@@ -515,6 +552,27 @@ mod tests {
 
         let rows = RowIds::default();
         assert_eq!((rows.next(), rows.clone().next()), (Some(1), Some(2)));
+    }
+
+    /// Requests given up are known until their answer came, the last 64 of
+    /// them; a lock's `Stalled` is no end.
+    #[test]
+    fn abandoned_requests_are_known_until_answered() {
+        let mut abandoned = Abandoned::default();
+        abandoned.add(3);
+        abandoned.add(4);
+        assert!(abandoned.answered(4));
+        assert!(!abandoned.answered(4), "answered once");
+        assert!(!abandoned.answered(5), "never given up");
+        for n in 10..10 + ENDED_KEPT as u32 {
+            abandoned.add(n);
+        }
+        assert!(!abandoned.answered(3), "given up too long ago");
+        assert!(abandoned.answered(10));
+        assert_eq!(
+            TransferState::ended(reason::LOCKED),
+            TransferState::Failed(reason::LOCKED)
+        );
     }
 
     async fn next_msg(rd: &mut tokio::io::DuplexStream) -> Option<SvcMsg> {

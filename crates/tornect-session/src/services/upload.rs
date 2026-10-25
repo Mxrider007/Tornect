@@ -17,6 +17,15 @@
 //!    `Complete`, or `Cancel{CORRUPT}` and deletes it.
 //! 4. Either end may `Cancel` at any point; the host deletes what it wrote.
 //!
+//! While the host is locked (§2.3) uploads stall instead of failing: the
+//! host sends no `Credit` (what it writes meanwhile is credited when it is
+//! unlocked), so the viewer runs out of window; their rows say `Stalled`.
+//! The host refuses an offer it took before the lock once its file is
+//! reserved (`Cancel{LOCKED}`), and the viewer fails its offers still
+//! unanswered with `LOCKED` (the host may have skipped them unread),
+//! answers an `Accepted` that still comes for one of them with `Cancel`,
+//! and holds its queued files until the host is unlocked.
+//!
 //! The viewer runs at most [`MAX_UPLOADS`] uploads and queues the others.
 //! It gives each upload two ids: the row's, from the moment it is asked for
 //! (what [`ViewerOp::Cancel`](super::ViewerOp::Cancel) names), and the wire
@@ -42,8 +51,8 @@ use tornect_proto::services::{
 use super::browse::{Access, open_file};
 use super::store::{Fed, Inbox, Receiving, Work, Worked, WorkerEvent, spawn_receiver};
 use super::transfer::{
-    Direction, Ids, MAX_UPLOADS, Outgoing, RowIds, SendFailed, TransferRow, TransferState,
-    Untrusted, ViewerShared, late,
+    Abandoned, Direction, Ids, MAX_UPLOADS, Outgoing, RowIds, SendFailed, TransferRow,
+    TransferState, Untrusted, ViewerShared, late,
 };
 use super::window::{Inflow, Window};
 use super::writer::Outbox;
@@ -63,6 +72,8 @@ struct Upload {
     buffered: Vec<u8>,
     /// Bytes credited.
     credited: u64,
+    /// Bytes the worker wrote: credited, but while the host is locked.
+    written: u64,
     /// `Done` arrived.
     done: bool,
 }
@@ -86,6 +97,8 @@ pub(crate) struct HostUploads {
     ids: Ids,
     workers: JoinSet<()>,
     events: mpsc::UnboundedSender<WorkerEvent>,
+    /// The host is locked: no `Credit` goes out.
+    paused: bool,
     /// Files put in place, and their bytes.
     pub(crate) files_in: u32,
     pub(crate) bytes_in: u64,
@@ -122,6 +135,7 @@ impl HostUploads {
                 ids,
                 workers: JoinSet::new(),
                 events,
+                paused: false,
                 files_in: 0,
                 bytes_in: 0,
             },
@@ -171,6 +185,7 @@ impl HostUploads {
                 arrived: 0,
                 buffered: Vec::new(),
                 credited: 0,
+                written: 0,
                 done: false,
             },
         );
@@ -304,6 +319,21 @@ impl HostUploads {
             return Ok(());
         };
         match what {
+            Worked::Began(Ok(_)) if self.paused => {
+                // Offered before a lock, which the viewer gave up: the inbox
+                // takes nothing while the host is locked. The worker deletes
+                // what it reserved; no row.
+                self.take(xfer);
+                tracing::debug!(
+                    session = %self.session_id,
+                    reason = reason::LOCKED,
+                    "an upload was refused"
+                );
+                self.ctrl(SvcMsg::Cancel(Cancel {
+                    xfer,
+                    reason: reason::LOCKED,
+                }))?;
+            }
             Worked::Began(Ok(stored)) => {
                 up.stored = Some(stored.clone());
                 let row = row(xfer, up, TransferState::Running);
@@ -318,7 +348,10 @@ impl HostUploads {
                 self.ctrl(SvcMsg::Cancel(Cancel { xfer, reason: code }))?;
             }
             Worked::Written(upto) => {
-                if self.inflow.due(upto, up.credited, up.size) {
+                up.written = upto;
+                // Withheld while the host is locked: the viewer runs out of
+                // window, and the upload stalls.
+                if !self.paused && self.inflow.due(upto, up.credited, up.size) {
                     up.credited = upto;
                     let row = row(xfer, up, TransferState::Running);
                     self.ctrl(SvcMsg::Credit { xfer, upto })?;
@@ -347,6 +380,34 @@ impl HostUploads {
                 self.ended(xfer, &up, code);
                 self.ctrl(SvcMsg::Cancel(Cancel { xfer, reason: code }))?;
             }
+        }
+        Ok(())
+    }
+
+    /// The host is locked (`true`): no `Credit` goes out, and the rows of
+    /// the uploads under way say `Stalled`; or unlocked: what was written
+    /// meanwhile is credited, and they say `Running` again.
+    pub(crate) fn set_paused(&mut self, paused: bool) -> Result<(), u16> {
+        if self.paused == paused {
+            return Ok(());
+        }
+        self.paused = paused;
+        let mut xfers: Vec<u32> = self.running.keys().copied().collect();
+        xfers.sort_unstable();
+        for xfer in xfers {
+            let Some(up) = self.running.get_mut(&xfer) else {
+                continue;
+            };
+            if up.stored.is_none() {
+                continue;
+            }
+            if !paused && up.written > up.credited {
+                up.credited = up.written;
+                let upto = up.credited;
+                self.ctrl(SvcMsg::Credit { xfer, upto })?;
+            }
+            let up = &self.running[&xfer];
+            self.tell(row(xfer, up, TransferState::moving(paused)));
         }
         Ok(())
     }
@@ -562,6 +623,10 @@ pub(crate) struct ViewerUploads {
     wire: HashMap<u32, u32>,
     jobs: mpsc::UnboundedSender<Job>,
     failed: mpsc::UnboundedSender<SendFailed>,
+    /// The host is locked: nothing is offered.
+    paused: bool,
+    /// Offers given up at a lock whose answer may still come.
+    abandoned: Abandoned,
 }
 
 impl ViewerUploads {
@@ -600,6 +665,8 @@ impl ViewerUploads {
                 wire: HashMap::new(),
                 jobs,
                 failed,
+                paused: false,
+                abandoned: Abandoned::default(),
             },
             ViewerReports {
                 jobs: jobs_rx,
@@ -692,7 +759,8 @@ impl ViewerUploads {
     /// than [`MAX_UPLOADS`] run; a file still opening holds the ones behind
     /// it, so that offers go out in order.
     fn pump(&mut self) -> Result<(), u16> {
-        while self.active() < MAX_UPLOADS {
+        // The host skips offers while it is locked.
+        while !self.paused && self.active() < MAX_UPLOADS {
             let Some(&id) = self.queue.front() else {
                 return Ok(());
             };
@@ -739,8 +807,15 @@ impl ViewerUploads {
         }
     }
 
-    /// The host's `Accepted`: send the file.
+    /// The host's `Accepted`: send the file; or, for an offer given up at a
+    /// lock, stop it.
     pub(crate) fn accepted(&mut self, accepted: Accepted) -> Result<(), u16> {
+        if self.abandoned.answered(accepted.xfer) {
+            return self.ctrl(SvcMsg::Cancel(Cancel {
+                xfer: accepted.xfer,
+                reason: reason::BY_VIEWER,
+            }));
+        }
         let Some(id) = self.by_wire(accepted.xfer)? else {
             return Ok(());
         };
@@ -781,7 +856,7 @@ impl ViewerUploads {
             .credit(xfer, upto)
             .map_err(|_| reason::PROTOCOL)?;
         up.credited = upto;
-        let row = row_of(id, up, TransferState::Running);
+        let row = row_of(id, up, TransferState::moving(self.paused));
         self.emit(row);
         Ok(())
     }
@@ -806,6 +881,9 @@ impl ViewerUploads {
 
     /// The host's `Cancel` of an upload; `Ok(false)` when it names none.
     pub(crate) fn cancelled(&mut self, cancel: Cancel) -> Result<bool, u16> {
+        if self.abandoned.answered(cancel.xfer) {
+            return Ok(true);
+        }
         let Some(&id) = self.wire.get(&cancel.xfer) else {
             return Ok(false);
         };
@@ -853,6 +931,35 @@ impl ViewerUploads {
                 if let Some(up) = self.uploads.remove(&id) {
                     self.emit(row_of(id, &up, TransferState::Cancelled(reason::BY_VIEWER)));
                 }
+            }
+        }
+        self.pump()
+    }
+
+    /// The host paused uploads (it is locked): offers still unanswered fail
+    /// with `LOCKED` and are given up (the host may have skipped them; an
+    /// `Accepted` that comes for one is answered with `Cancel`), files being
+    /// sent stall (the host credits nothing meanwhile), and queued files
+    /// wait. Or it resumed them: they move again, and queued files are
+    /// offered.
+    pub(crate) fn set_paused(&mut self, paused: bool) -> Result<(), u16> {
+        if self.paused == paused {
+            return Ok(());
+        }
+        self.paused = paused;
+        let mut ids: Vec<u32> = self.uploads.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let Some(up) = self.uploads.get(&id) else {
+                continue;
+            };
+            match up.phase {
+                Phase::Offered(xfer, _) if paused => {
+                    self.abandoned.add(xfer);
+                    self.finish(id, xfer, TransferState::Failed(reason::LOCKED));
+                }
+                Phase::Sending(..) => self.emit(row_of(id, up, TransferState::moving(paused))),
+                Phase::Opening | Phase::Queued(_) | Phase::Offered(..) => {}
             }
         }
         self.pump()

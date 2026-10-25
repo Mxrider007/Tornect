@@ -1,5 +1,5 @@
 //! The services streams end to end over in-process pipes (the services
-//! design §10, tests 1, 2, 4 to 10, 12, 15 and 17 and the close paths
+//! design §10, tests 1, 2, 4 to 10, 12 to 15 and 17 and the close paths
 //! of step 12, and the review of steps 14 and 15): a real [`MediaHost`]
 //! registry, its capture state driven by hand or by a real media stream, a
 //! fake desktop clipboard, a temporary inbox, a fake reading of its disk's
@@ -5180,4 +5180,772 @@ async fn clipboard_text_crosses_between_a_real_viewer_and_host() {
     let (code, summary, _) = served(task).await;
     assert_eq!(code, reason::SESSION_OVER);
     assert_eq!((summary.clip_in, summary.clip_out), (1, 1));
+}
+
+// --- Tests 13 and 14: the host user's turn-off, and the lock ------------------
+
+/// Read the host's frames up to its `Caps`, dropping the `Data` of `xfer`
+/// that were on their way: the other frames before it, and the `Caps`.
+async fn until_caps(client: &mut DuplexStream, xfer: u32) -> (Vec<SvcMsg>, Caps) {
+    let mut before = Vec::new();
+    loop {
+        match next(client).await {
+            Some(SvcMsg::Data { xfer: x, .. }) if x == xfer => {}
+            Some(SvcMsg::Caps(caps)) => return (before, caps),
+            Some(other) => before.push(other),
+            None => panic!("the stream ended before its Caps"),
+        }
+    }
+}
+
+/// The host's events of session `id` up to its `Caps`: the last row of each
+/// transfer told before it, and the `Caps`.
+async fn rows_until_caps(rig: &mut Rig, id: &str) -> (HashMap<u32, TransferRow>, (u16, u16)) {
+    let mut rows = HashMap::new();
+    loop {
+        match rig.event(id).await {
+            HostEvent::Transfer(row) => {
+                rows.insert(row.xfer, row);
+            }
+            HostEvent::Caps { caps, paused } => return (rows, (caps, paused)),
+            other => panic!("expected rows up to Caps, got {other:?}"),
+        }
+    }
+}
+
+/// Wait until the inbox's part file `name` holds `len` bytes: its worker
+/// wrote them (and reports it right after).
+async fn part_reaches(rig: &Rig, name: &str, len: u64) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while std::fs::metadata(rig.inbox().join(name)).map_or(0, |m| m.len()) != len {
+        assert!(tokio::time::Instant::now() < deadline, "{name} is short");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// The handle of the file `name` in the host's one place, listed from the
+/// places (`req` counts the `List`s).
+async fn file_handle(client: &mut DuplexStream, req: &mut u32, name: &str) -> u32 {
+    let places = list_all(client, req, 0).await;
+    let files = entry(&places[0], "Files").handle;
+    let listed = list_all(client, req, files).await;
+    entry(&listed[0], name).handle
+}
+
+/// The services design's test 13: the host's user turns services off for
+/// the rest of a session. The clipboard alone first: the viewer hears
+/// `Caps`, the link is dropped, and the upload under way goes on. Then
+/// uploads and browsing: the running upload and download get
+/// `Cancel{TURNED_OFF}` before the `Caps`, their rows say so, and nothing of
+/// the upload is left in the inbox. Every frame for those caps is then
+/// skipped unread (not an error) while chat goes on; a lock and its end
+/// bring nothing back; turning chat off too leaves nothing, and the stream
+/// ends with `Close{TURNED_OFF}`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_host_users_turn_off_ends_what_it_names_for_good() {
+    let mut rig = rig();
+    let content = vec![3u8; 600 * 1024];
+    std::fs::write(rig.files.path().join("big.dat"), &content).unwrap();
+    assert!(!rig.services.turn_off("no such session", caps::ALL));
+    let (session, mut client, task) = midway(&mut rig, 220).await;
+    write_msg(&mut client, &SvcMsg::ClipSwitch(ClipSwitch { on: true }))
+        .await
+        .unwrap();
+    let mut ends = desk_ends(&rig);
+    active_is(&mut ends, true).await;
+
+    // The clipboard alone.
+    assert!(rig.services.turn_off(&session.id, caps::CLIP));
+    let rest = caps::CHAT | caps::UPLOAD | caps::BROWSE;
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Caps(Caps {
+            caps: rest,
+            paused: 0
+        }))
+    );
+    assert_eq!(
+        rig.event(&session.id).await,
+        HostEvent::Caps {
+            caps: rest,
+            paused: 0
+        }
+    );
+    assert!(
+        ends.to_desktop.has_changed().is_err(),
+        "the link is dropped"
+    );
+    send_data(&mut client, 1, 64 * 1024, &vec![7; 64 * 1024]).await;
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Credit {
+            xfer: 1,
+            upto: 128 * 1024
+        }),
+        "the upload goes on"
+    );
+
+    // A download under way, its window full.
+    let mut req = 0;
+    let handle = file_handle(&mut client, &mut req, "big.dat").await;
+    write_msg(&mut client, &get(2, handle)).await.unwrap();
+    assert!(matches!(
+        next(&mut client).await,
+        Some(SvcMsg::Sending(Sending { xfer: 2, .. }))
+    ));
+    assert_eq!(data_until_quiet(&mut client, 2, 0).await, 256 * 1024);
+
+    // Uploads and browsing (the clipboard named again changes nothing).
+    assert!(
+        rig.services
+            .turn_off(&session.id, caps::UPLOAD | caps::BROWSE | caps::CLIP)
+    );
+    let (before, news) = until_caps(&mut client, 2).await;
+    assert_eq!(
+        before,
+        [cancel(1, reason::TURNED_OFF), cancel(2, reason::TURNED_OFF)]
+    );
+    assert_eq!(
+        news,
+        Caps {
+            caps: caps::CHAT,
+            paused: 0
+        }
+    );
+    let (rows, news) = rows_until_caps(&mut rig, &session.id).await;
+    assert_eq!(news, (caps::CHAT, 0));
+    for xfer in [1, 2] {
+        assert_eq!(
+            rows[&xfer].state,
+            TransferState::Cancelled(reason::TURNED_OFF)
+        );
+    }
+    inbox_settles(&rig, &[]).await;
+
+    // Frames for those caps are skipped from now on; chat goes on.
+    for frame in beyond_chat() {
+        write_msg(&mut client, &frame).await.unwrap();
+    }
+    write_msg(&mut client, &chat("still here")).await.unwrap();
+    assert_eq!(
+        rig.event(&session.id).await,
+        HostEvent::Chat(sanitize_peer_text("still here").unwrap())
+    );
+    // A lock has nothing left to pause, and its end brings nothing back.
+    rig.services.set_locked(true);
+    rig.services.set_locked(false);
+    write_msg(&mut client, &get(5, handle)).await.unwrap();
+    write_msg(&mut client, &chat("and here")).await.unwrap();
+    assert_eq!(
+        rig.event(&session.id).await,
+        HostEvent::Chat(sanitize_peer_text("and here").unwrap())
+    );
+    assert!(quiet(&mut client).await, "no Caps, no answer");
+
+    // Nothing left.
+    assert!(rig.services.turn_off(&session.id, caps::CHAT));
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Close {
+            reason: reason::TURNED_OFF
+        })
+    );
+    let (code, _, frames) = served(task).await;
+    assert_eq!(code, reason::TURNED_OFF);
+    assert_eq!(frames.skipped, 12, "every frame for a cap turned off");
+    assert!(matches!(
+        rig.event(&session.id).await,
+        HostEvent::Closed {
+            reason: reason::TURNED_OFF,
+            ..
+        }
+    ));
+    assert!(!rig.services.turn_off(&session.id, caps::ALL), "it ended");
+}
+
+/// The services design's test 14: while the host is locked, the clipboard
+/// and files are paused. The viewer hears `Caps` with `paused`; the upload
+/// under way gets no `Credit` for what it still sends, the download no
+/// `Data` for what the viewer credits, and both rows say `Stalled`; new
+/// requests (`Offer`, `Get`, `List`) and the clipboard's frames (its switch
+/// included) are skipped unread; the link goes inactive and a copy made
+/// meanwhile is never sent; chat goes on. At its end the viewer hears `Caps`
+/// with nothing paused, the credits withheld go out (the clipboard's too),
+/// both transfers resume to `Complete`, and the link is active again (a
+/// fresh baseline).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lock_pauses_the_clipboard_and_files_until_it_ends() {
+    let mut rig = rig();
+    let content: Vec<u8> = (0..600 * 1024).map(|n| (n % 251) as u8).collect();
+    std::fs::write(rig.files.path().join("big.dat"), &content).unwrap();
+    let upload = vec![9u8; 384 * 1024];
+    let (session, mut client, task) = browsing(&mut rig, 221).await;
+    write_msg(&mut client, &SvcMsg::ClipSwitch(ClipSwitch { on: true }))
+        .await
+        .unwrap();
+    let mut ends = desk_ends(&rig);
+    active_is(&mut ends, true).await;
+
+    // An upload a quarter written, and a download with its window full.
+    write_msg(&mut client, &offer(1, "up.bin", upload.len() as u64))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut client).await, Some(accepted(1, "up.bin")));
+    send_data(&mut client, 1, 0, &upload[..64 * 1024]).await;
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Credit {
+            xfer: 1,
+            upto: 64 * 1024
+        })
+    );
+    let mut req = 0;
+    let handle = file_handle(&mut client, &mut req, "big.dat").await;
+    write_msg(&mut client, &get(2, handle)).await.unwrap();
+    assert!(matches!(
+        next(&mut client).await,
+        Some(SvcMsg::Sending(Sending { xfer: 2, .. }))
+    ));
+    let mut got = data_until_quiet(&mut client, 2, 0).await;
+    assert_eq!(got, 256 * 1024);
+
+    rig.services.set_locked(true);
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Caps(Caps {
+            caps: caps::ALL,
+            paused: caps::PAUSABLE
+        }))
+    );
+    let (rows, news) = rows_until_caps(&mut rig, &session.id).await;
+    assert_eq!(news, (caps::ALL, caps::PAUSABLE));
+    for xfer in [1, 2] {
+        assert_eq!(rows[&xfer].state, TransferState::Stalled);
+    }
+    active_is(&mut ends, false).await;
+
+    // While locked: more of the upload (written, not credited), and room
+    // for the download.
+    send_data(&mut client, 1, 64 * 1024, &upload[64 * 1024..128 * 1024]).await;
+    part_reaches(&rig, "up.bin.tornect-part", 128 * 1024).await;
+    write_msg(&mut client, &SvcMsg::Credit { xfer: 2, upto: got })
+        .await
+        .unwrap();
+    // New requests and the clipboard's frames, skipped.
+    write_msg(&mut client, &offer(3, "new.bin", 10))
+        .await
+        .unwrap();
+    write_msg(&mut client, &get(4, handle)).await.unwrap();
+    req += 1;
+    write_msg(&mut client, &list(req, 0, 0)).await.unwrap();
+    send_clip(&mut client, 1, b"hello").await;
+    write_msg(&mut client, &SvcMsg::ClipSwitch(ClipSwitch { on: false }))
+        .await
+        .unwrap();
+    ends.from_desktop
+        .send_replace(Some(clip_text("copied while locked")));
+    write_msg(&mut client, &chat("while locked")).await.unwrap();
+    let mut stalled_credit = false;
+    loop {
+        match rig.event(&session.id).await {
+            HostEvent::Chat(_) => break,
+            HostEvent::Transfer(row) => {
+                assert_eq!((row.xfer, &row.state), (2, &TransferState::Stalled));
+                stalled_credit |= row.done == got;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(stalled_credit, "the credit is told, the download stalled");
+    assert!(
+        quiet(&mut client).await,
+        "no Credit, no Data, no answer to the requests, no clipboard text"
+    );
+    assert!(!ends.to_desktop.has_changed().unwrap(), "nothing set");
+
+    rig.services.set_locked(false);
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Caps(Caps {
+            caps: caps::ALL,
+            paused: 0
+        }))
+    );
+    assert_eq!(
+        rig.event(&session.id).await,
+        HostEvent::Caps {
+            caps: caps::ALL,
+            paused: 0
+        }
+    );
+    for (xfer, done) in [(1, 128 * 1024), (2, got)] {
+        let row = rig.row(&session.id).await;
+        assert_eq!(
+            (row.xfer, row.done, row.state),
+            (xfer, done, TransferState::Running)
+        );
+    }
+    active_is(&mut ends, true).await;
+
+    // Both to their end.
+    send_data(&mut client, 1, 128 * 1024, &upload[128 * 1024..]).await;
+    write_msg(&mut client, &done(1, &upload)).await.unwrap();
+    let (mut withheld, mut clip_credited, mut uploaded, mut downloaded) =
+        (false, false, false, false);
+    while !(uploaded && downloaded) {
+        match next(&mut client).await {
+            Some(SvcMsg::Data {
+                xfer: 2,
+                offset,
+                bytes,
+            }) => {
+                assert_eq!(offset, got);
+                got += bytes.len() as u64;
+                write_msg(&mut client, &SvcMsg::Credit { xfer: 2, upto: got })
+                    .await
+                    .unwrap();
+            }
+            Some(SvcMsg::Done(sent)) if sent.xfer == 2 => {
+                assert_eq!(got, content.len() as u64);
+                assert_eq!(sent.sha256, sha256(&content));
+                write_msg(&mut client, &SvcMsg::Complete(Complete { xfer: 2 }))
+                    .await
+                    .unwrap();
+                downloaded = true;
+            }
+            Some(SvcMsg::Credit { xfer: 1, upto }) => withheld |= upto == 128 * 1024,
+            Some(SvcMsg::Credit { xfer: 0, upto }) => {
+                assert_eq!(upto, 5, "the skipped chunk's bytes");
+                clip_credited = true;
+            }
+            Some(SvcMsg::Complete(Complete { xfer: 1 })) => uploaded = true,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(withheld, "what was written while locked is credited");
+    assert!(clip_credited);
+    assert!(
+        quiet(&mut client).await,
+        "the copy made while locked is never sent"
+    );
+    assert_eq!(inbox_names(&rig), ["up.bin"]);
+
+    rig.media.on_end(&session.id, None);
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Close {
+            reason: reason::SESSION_OVER
+        })
+    );
+    let (_, summary, frames) = served(task).await;
+    assert_eq!((summary.files_in, summary.files_out), (1, 1));
+    assert_eq!(summary.clip_out, 0);
+    assert_eq!(
+        frames.skipped, 6,
+        "Offer, Get, List, ClipStart, ClipChunk and ClipSwitch"
+    );
+}
+
+/// Test 14: a stream opened while the host is locked starts paused: `Caps`
+/// with `paused` follows `Welcome` at once, and its requests are skipped
+/// from its first frame, the viewer's clipboard switch included; a lock
+/// said twice changes nothing. At its end the viewer hears `Caps` with
+/// nothing paused; the link waits for the viewer's next switch, and
+/// requests are answered again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_opened_while_locked_starts_paused() {
+    let mut rig = rig();
+    rig.services.set_locked(true);
+    let session = start(&rig, 222, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    assert_eq!(welcome(&mut client, &session).await.caps, caps::ALL);
+    let paused = SvcMsg::Caps(Caps {
+        caps: caps::ALL,
+        paused: caps::PAUSABLE,
+    });
+    assert_eq!(next(&mut client).await, Some(paused));
+    assert!(matches!(
+        rig.event(&session.id).await,
+        HostEvent::Opened { .. }
+    ));
+    assert_eq!(
+        rig.event(&session.id).await,
+        HostEvent::Caps {
+            caps: caps::ALL,
+            paused: caps::PAUSABLE
+        }
+    );
+    let mut ends = desk_ends(&rig);
+
+    write_msg(&mut client, &SvcMsg::ClipSwitch(ClipSwitch { on: true }))
+        .await
+        .unwrap();
+    write_msg(&mut client, &offer(1, "a.txt", 3)).await.unwrap();
+    write_msg(&mut client, &list(1, 0, 0)).await.unwrap();
+    rig.services.set_locked(true);
+    write_msg(&mut client, &chat("hi")).await.unwrap();
+    assert!(matches!(rig.event(&session.id).await, HostEvent::Chat(_)));
+    assert!(quiet(&mut client).await, "nothing answered, no second Caps");
+    assert!(!ends.active.has_changed().unwrap(), "never active");
+
+    rig.services.set_locked(false);
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Caps(Caps {
+            caps: caps::ALL,
+            paused: 0
+        }))
+    );
+    assert_eq!(
+        rig.event(&session.id).await,
+        HostEvent::Caps {
+            caps: caps::ALL,
+            paused: 0
+        }
+    );
+    write_msg(&mut client, &chat("unlocked")).await.unwrap();
+    assert!(matches!(rig.event(&session.id).await, HostEvent::Chat(_)));
+    assert!(
+        !ends.active.has_changed().unwrap(),
+        "the switch sent while locked was skipped"
+    );
+    write_msg(&mut client, &SvcMsg::ClipSwitch(ClipSwitch { on: true }))
+        .await
+        .unwrap();
+    active_is(&mut ends, true).await;
+    write_msg(&mut client, &offer(2, "a.txt", 3)).await.unwrap();
+    assert_eq!(next(&mut client).await, Some(accepted(2, "a.txt")));
+
+    rig.media.on_end(&session.id, None);
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Close {
+            reason: reason::SESSION_OVER
+        })
+    );
+    let (_, _, frames) = served(task).await;
+    assert_eq!(frames.skipped, 3, "the switch, the Offer and the List");
+}
+
+/// Test 14 on the viewer, against a raw host: at `Caps` with `paused` it
+/// fails what the host may have skipped with `LOCKED` (the offers and the
+/// `Get` unanswered, the `List` outstanding), stalls the download arriving,
+/// and sends nothing more while paused: files asked for wait in its queue,
+/// a folder opened fails at once, its clipboard switch waits. Answers that
+/// still come for what it gave up are not errors: an `Accepted` or a
+/// `Sending` is answered with `Cancel{BY_VIEWER}`, a `Cancel` and a page
+/// are dropped. At the resume it tells its switch, offers and asks for what
+/// waited, and the stalled download goes on to its end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_viewer_gives_up_what_a_lock_skips_and_waits_for_its_end() {
+    let downloads = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let path = |name: &str, bytes: &[u8]| {
+        let path = local.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+    let (first, third, second) = (
+        path("first.bin", b"first"),
+        path("third.bin", b"third"),
+        path("second.bin", b"second"),
+    );
+    let (mut host, bound) = raw_host(Some(SvcMsg::Welcome(test_welcome(caps::ALL))), WAIT).await;
+    let (clip, window) = window_clip(true);
+    let mut v = run_viewer_with(
+        bound.unwrap().0,
+        ViewerLocal {
+            clip: Some(clip),
+            ..downloading_local(downloads.path())
+        },
+    );
+    assert_eq!(
+        next(&mut host).await,
+        Some(SvcMsg::ClipSwitch(ClipSwitch { on: true }))
+    );
+
+    // A download arriving (row 1), two offers (rows 2, 3) and a `Get`
+    // (row 4) unanswered, a `List` outstanding.
+    v.ops.send(ViewerOp::Download(7)).await.unwrap();
+    assert_eq!(next(&mut host).await, Some(get(1, 7)));
+    let sending = |xfer, name: &str, size| {
+        SvcMsg::Sending(Sending {
+            xfer,
+            name: name.into(),
+            size,
+        })
+    };
+    write_msg(&mut host, &sending(1, "a.txt", 5)).await.unwrap();
+    loop {
+        let row = transfer(&mut v.events).await;
+        if row.size == 5 {
+            assert_eq!(row.state, TransferState::Running);
+            break;
+        }
+    }
+    v.ops.send(ViewerOp::UploadPath(first)).await.unwrap();
+    assert_eq!(next(&mut host).await, Some(offer(2, "first.bin", 5)));
+    v.ops.send(ViewerOp::UploadPath(third)).await.unwrap();
+    assert_eq!(next(&mut host).await, Some(offer(3, "third.bin", 5)));
+    v.ops.send(ViewerOp::Download(8)).await.unwrap();
+    assert_eq!(next(&mut host).await, Some(get(4, 8)));
+    v.ops.send(ViewerOp::OpenRemote(0)).await.unwrap();
+    assert_eq!(next(&mut host).await, Some(list(1, 0, 0)));
+    while v.events.try_recv().is_ok() {}
+
+    write_msg(
+        &mut host,
+        &SvcMsg::Caps(Caps {
+            caps: caps::ALL,
+            paused: caps::PAUSABLE,
+        }),
+    )
+    .await
+    .unwrap();
+    let mut said = Vec::new();
+    for _ in 0..6 {
+        said.push(
+            tokio::time::timeout(WAIT, v.events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    let states: Vec<Option<(u32, TransferState)>> = said[..4]
+        .iter()
+        .map(|event| match event {
+            ViewerEvent::Transfer(row) => Some((row.xfer, row.state.clone())),
+            _ => None,
+        })
+        .collect();
+    let locked = TransferState::Failed(reason::LOCKED);
+    assert_eq!(
+        states,
+        [
+            Some((2, locked.clone())),
+            Some((3, locked.clone())),
+            Some((1, TransferState::Stalled)),
+            Some((4, locked)),
+        ]
+    );
+    assert_eq!(
+        said[4..],
+        [
+            ViewerEvent::Caps {
+                caps: caps::ALL,
+                paused: caps::PAUSABLE
+            },
+            ViewerEvent::ListFailed {
+                remote: true,
+                reason: reason::LOCKED
+            }
+        ]
+    );
+
+    // Nothing more goes while paused.
+    v.ops.send(ViewerOp::UploadPath(second)).await.unwrap();
+    v.ops.send(ViewerOp::Download(9)).await.unwrap();
+    v.ops.send(ViewerOp::OpenRemote(0)).await.unwrap();
+    v.ops.send(ViewerOp::ClipSwitch(false)).await.unwrap();
+    window
+        .copied
+        .send_replace(Some(clip_text("copied while locked")));
+    let mut queued = 0;
+    loop {
+        match tokio::time::timeout(WAIT, v.events.recv()).await.unwrap() {
+            Some(ViewerEvent::Transfer(row)) => {
+                assert_eq!(row.state, TransferState::Queued);
+                queued += 1;
+            }
+            Some(ViewerEvent::ListFailed {
+                remote: true,
+                reason: reason::LOCKED,
+            }) => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    // The upload as it opens and once open, and the download.
+    while queued < 3 {
+        assert_eq!(transfer(&mut v.events).await.state, TransferState::Queued);
+        queued += 1;
+    }
+    assert!(quiet(&mut host).await, "nothing sent while paused");
+
+    // Late answers to what was given up.
+    write_msg(&mut host, &accepted(2, "first.bin"))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut host).await, Some(cancel(2, reason::BY_VIEWER)));
+    write_msg(&mut host, &cancel(3, reason::LOCKED))
+        .await
+        .unwrap();
+    write_msg(&mut host, &sending(4, "b.txt", 1)).await.unwrap();
+    assert_eq!(next(&mut host).await, Some(cancel(4, reason::BY_VIEWER)));
+    write_msg(
+        &mut host,
+        &SvcMsg::Listing(Listing {
+            req: 1,
+            folder: 0,
+            title: String::new(),
+            parent: None,
+            entries: Vec::new(),
+            next: None,
+            truncated: false,
+        }),
+    )
+    .await
+    .unwrap();
+    write_msg(&mut host, &cancel(2, reason::LOCKED))
+        .await
+        .unwrap();
+    assert!(quiet(&mut host).await, "dropped, not an error");
+    assert!(v.events.try_recv().is_err(), "and nothing to tell");
+
+    write_msg(
+        &mut host,
+        &SvcMsg::Caps(Caps {
+            caps: caps::ALL,
+            paused: 0,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        next(&mut host).await,
+        Some(SvcMsg::ClipSwitch(ClipSwitch { on: false }))
+    );
+    assert_eq!(next(&mut host).await, Some(offer(5, "second.bin", 6)));
+    assert_eq!(next(&mut host).await, Some(get(6, 9)));
+    let mut resumed = Vec::new();
+    loop {
+        match tokio::time::timeout(WAIT, v.events.recv()).await.unwrap() {
+            Some(ViewerEvent::Transfer(row)) => resumed.push((row.xfer, row.state)),
+            Some(ViewerEvent::Caps { caps, paused }) => {
+                assert_eq!((caps, paused), (caps::ALL, 0));
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    resumed.sort_by_key(|(xfer, _)| *xfer);
+    assert_eq!(
+        resumed,
+        [
+            (1, TransferState::Running),
+            (5, TransferState::Running),
+            (6, TransferState::Running)
+        ]
+    );
+    write_msg(
+        &mut host,
+        &SvcMsg::Data {
+            xfer: 1,
+            offset: 0,
+            bytes: b"hello".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    write_msg(&mut host, &done(1, b"hello")).await.unwrap();
+    assert_eq!(
+        next(&mut host).await,
+        Some(SvcMsg::Credit { xfer: 1, upto: 5 })
+    );
+    assert_eq!(
+        next(&mut host).await,
+        Some(SvcMsg::Complete(Complete { xfer: 1 }))
+    );
+    loop {
+        let row = transfer(&mut v.events).await;
+        if let TransferState::Done { stored } = row.state {
+            assert_eq!((row.xfer, stored.as_str()), (1, "a.txt"));
+            break;
+        }
+    }
+    assert_eq!(
+        std::fs::read(downloads.path().join("a.txt")).unwrap(),
+        b"hello"
+    );
+    write_msg(
+        &mut host,
+        &SvcMsg::Close {
+            reason: reason::SESSION_OVER,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v.task.await.unwrap(),
+        ViewerServicesEnd::Closed(reason::SESSION_OVER)
+    );
+}
+
+/// Test 14 end to end: a real viewer hears the lock and its end; a folder
+/// opened while locked fails with `LOCKED` and lists once it ended, and the
+/// viewer's switch is told again, so that the host's link is active again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lock_and_its_end_reach_a_real_viewer() {
+    let mut rig = rig();
+    let session = start(&rig, 223, SessionMode::Control);
+    session.live(true);
+    let (client, task) = open(&rig.services);
+    let (viewer, welcome) = ServicesViewer::bind(client, &session.binding, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(welcome.caps, caps::ALL);
+    let (clip, _window) = window_clip(true);
+    let mut v = run_viewer_with(
+        viewer,
+        ViewerLocal {
+            clip: Some(clip),
+            ..temp_local()
+        },
+    );
+    rig.event(&session.id).await;
+    let mut ends = desk_ends(&rig);
+    active_is(&mut ends, true).await;
+
+    rig.services.set_locked(true);
+    let said = tokio::time::timeout(WAIT, v.events.recv()).await.unwrap();
+    assert_eq!(
+        said,
+        Some(ViewerEvent::Caps {
+            caps: caps::ALL,
+            paused: caps::PAUSABLE
+        })
+    );
+    active_is(&mut ends, false).await;
+    v.ops.send(ViewerOp::OpenRemote(0)).await.unwrap();
+    let said = tokio::time::timeout(WAIT, v.events.recv()).await.unwrap();
+    assert_eq!(
+        said,
+        Some(ViewerEvent::ListFailed {
+            remote: true,
+            reason: reason::LOCKED
+        })
+    );
+
+    rig.services.set_locked(false);
+    let said = tokio::time::timeout(WAIT, v.events.recv()).await.unwrap();
+    assert_eq!(
+        said,
+        Some(ViewerEvent::Caps {
+            caps: caps::ALL,
+            paused: 0
+        })
+    );
+    active_is(&mut ends, true).await;
+    v.ops.send(ViewerOp::OpenRemote(0)).await.unwrap();
+    assert_eq!(
+        remote_listing(&mut v.events).await.entries.len(),
+        1,
+        "the host's one place"
+    );
+
+    v.stop.send(()).unwrap();
+    assert_eq!(v.task.await.unwrap(), ViewerServicesEnd::Stopped);
+    let (code, _, frames) = served(task).await;
+    assert_eq!(code, reason::SESSION_OVER);
+    assert_eq!(frames.skipped, 0, "the viewer sent nothing while locked");
 }

@@ -12,6 +12,13 @@
 //! never granted with `Close{NOT_OFFERED}`, both before the body is read. A
 //! `Caps` may only take caps away; one that adds any is a protocol error.
 //!
+//! A `Caps` with `paused` says the host is locked (§2.3): it skips new
+//! requests for those caps unread, so the viewer fails its own unanswered
+//! ones with `LOCKED` (offers, `Get`s, the `List` outstanding) and sends no
+//! more until a `Caps` resumes them; its queued files wait, and the files
+//! under way stall. Its clipboard stops both ways, and its switch is told
+//! again at the resume.
+//!
 //! Files go to the host through [`ViewerOp::UploadPath`] (the upload
 //! protocol, §3.5): at most [`MAX_UPLOADS`](super::MAX_UPLOADS) are offered at
 //! once and the others wait, in order; each is read on a blocking worker and
@@ -200,14 +207,16 @@ pub enum ViewerOp {
     /// pages come as [`ViewerEvent::Listing`] with `remote` true, each next
     /// one asked for without a word from the user, or a
     /// [`ViewerEvent::ListFailed`]. A folder opened while another is being
-    /// listed replaces it: only the last one opened is shown.
+    /// listed replaces it: only the last one opened is shown. While the host
+    /// is locked it fails at once with `LOCKED`, nothing sent.
     OpenRemote(u32),
     /// Copy the host's file with this handle into [`ViewerLocal::downloads`],
     /// reported as [`ViewerEvent::Transfer`] rows (`Direction::FromHost`)
     /// under an id of its own. At most
     /// [`MAX_DOWNLOADS`](super::MAX_DOWNLOADS) are asked for at once and the
-    /// others wait, in order. Without `BROWSE` the row fails at once with
-    /// `NOT_OFFERED`, and without a downloads folder with `IO`.
+    /// others wait, in order (and all of them while the host is locked).
+    /// Without `BROWSE` the row fails at once with `NOT_OFFERED`, and
+    /// without a downloads folder with `IO`.
     Download(u32),
     /// Stop the transfer whose row has this id.
     Cancel(u32),
@@ -238,7 +247,9 @@ pub enum ViewerEvent {
     },
     /// A folder could not be listed, with this [`reason`] code: `NOT_FOUND`
     /// (gone, or a handle too old: list again), `DENIED` (Tornect's own
-    /// folders, or not readable), `IO`, `BUSY`.
+    /// folders, or not readable), `IO`, `BUSY`; for the other computer's
+    /// also `NOT_OFFERED`, `TURNED_OFF` (browsing went) and `LOCKED` (it is
+    /// locked: list again once it is not).
     ListFailed {
         /// Whether it was the other computer's folder.
         remote: bool,
@@ -436,27 +447,43 @@ where
                             );
                         }
                         state.turn_off(!news.caps);
+                        let paused = state.set_paused(news.paused);
+                        let mut step = Ok(());
+                        let mut listing = None;
                         if news.caps & caps::CLIP == 0 {
                             clip.turned_off();
+                        } else if let Some(msg) = clip.set_paused(paused & caps::CLIP != 0)
+                            && !outbox.ctrl(msg)
+                        {
+                            // The host stopped reading (§3.4).
+                            step = Err(reason::PROTOCOL);
                         }
                         if news.caps & caps::UPLOAD == 0 {
                             uploads.turned_off();
+                        } else {
+                            step = step.and(uploads.set_paused(paused & caps::UPLOAD != 0));
                         }
-                        let listing = news.caps & caps::BROWSE == 0 && remote.turned_off();
                         if news.caps & caps::BROWSE == 0 {
                             downloads.turned_off();
+                            listing = remote.turned_off().then_some(reason::TURNED_OFF);
+                        } else {
+                            let pause = paused & caps::BROWSE != 0;
+                            step = step.and(downloads.set_paused(pause));
+                            if pause && remote.pause() {
+                                listing = Some(reason::LOCKED);
+                            }
                         }
                         emit(ViewerEvent::Caps {
                             caps: news.caps,
-                            paused: news.paused,
+                            paused,
                         });
-                        if listing {
+                        if let Some(reason) = listing {
                             emit(ViewerEvent::ListFailed {
                                 remote: true,
-                                reason: reason::TURNED_OFF,
+                                reason,
                             });
                         }
-                        Ok(())
+                        step
                     }
                     Inbound::Frame(SvcMsg::Chat(Chat { text })) => {
                         if chat_gate.admit(chat::now())
@@ -604,14 +631,23 @@ where
                         Ok(())
                     }
                     ViewerOp::OpenRemote(folder) => {
-                        if state.left() & caps::BROWSE == 0 {
-                            emit(ViewerEvent::ListFailed {
-                                remote: true,
-                                reason: reason::NOT_OFFERED,
-                            });
-                            Ok(())
+                        // The host skips a `List` while it is locked.
+                        let refused = if state.left() & caps::BROWSE == 0 {
+                            Some(reason::NOT_OFFERED)
+                        } else if state.paused() & caps::BROWSE != 0 {
+                            Some(reason::LOCKED)
                         } else {
-                            remote.open(folder)
+                            None
+                        };
+                        match refused {
+                            Some(reason) => {
+                                emit(ViewerEvent::ListFailed {
+                                    remote: true,
+                                    reason,
+                                });
+                                Ok(())
+                            }
+                            None => remote.open(folder),
                         }
                     }
                     ViewerOp::Download(handle) => downloads.download(

@@ -30,11 +30,20 @@
 //!    stream fails. Chat, the clipboard (its link active only while the
 //!    viewer's switch is on: [`super::clip`]), uploads into the inbox (the
 //!    upload protocol: [`super::upload`]), listings and downloads are
-//!    served. When the viewer's input is lost
-//!    mid-session the clipboard and files are turned off for good (running
-//!    uploads get `Cancel{TURNED_OFF}`, then `Caps`; the link is dropped;
-//!    their frames decoded before that are dropped, an `Offer` included),
-//!    and a stream left with nothing ends with `Close{NOT_OFFERED}`.
+//!    served. When the viewer's input is lost mid-session the clipboard and
+//!    files are turned off for good, and when the host's user turns
+//!    services off ([`ServicesHost::turn_off`]) those named: running
+//!    transfers of those caps get `Cancel{TURNED_OFF}` (what was received
+//!    of them is deleted), then `Caps`; the link is dropped; frames for them
+//!    are skipped unread from then on, and those decoded before are dropped,
+//!    an `Offer` included. A stream left with nothing ends with
+//!    `Close{NOT_OFFERED}` (lost input) or `Close{TURNED_OFF}`.
+//!    While the host is locked ([`ServicesHost::set_locked`], §2.3) the
+//!    clipboard, uploads and browsing are paused (`Caps` with `paused`): new
+//!    requests for them are skipped unread, uploads get no `Credit` and
+//!    downloads no `Data` (both stall), a listing being read stops and the
+//!    link goes inactive; chat goes on. Its end resumes them (`Caps` with
+//!    nothing paused), and the link takes a fresh baseline.
 //! 5. **End.** Every upload's worker is stopped, `Close` is written, and the
 //!    workers are waited for, within [`ServicesLimits::workers_wait`] (5 s):
 //!    once `serve` returns, no partial file of the stream is left, whatever
@@ -125,6 +134,8 @@ enum HostOp {
     Chat(ChatText),
     /// Stop transfer `xfer` (`Cancel{BY_HOST}`).
     Cancel(u32),
+    /// Turn these caps off for the rest of the stream.
+    TurnOff(u16),
 }
 
 /// The host's end of the services streams of every session (the services
@@ -144,6 +155,9 @@ pub struct ServicesHost {
     limits: ServicesLimits,
     /// Each open stream's queue of the host user's requests.
     controls: Mutex<HashMap<String, mpsc::Sender<HostOp>>>,
+    /// The host is locked or shows a secure screen (§2.3): every stream
+    /// reads it.
+    locked: watch::Sender<bool>,
     /// Streams bound and not yet ended.
     open: Arc<AtomicUsize>,
     /// The lines streams without a bound session can cause.
@@ -208,6 +222,7 @@ impl ServicesHost {
             env,
             limits,
             controls: Mutex::new(HashMap::new()),
+            locked: watch::Sender::new(false),
             open: Arc::new(AtomicUsize::new(0)),
             pre_bind: Mutex::new(LineBudget::new(PRE_BIND_WINDOW, PRE_BIND_LINES)),
         }
@@ -246,6 +261,31 @@ impl ServicesHost {
     /// ended is left as it is.
     pub fn cancel(&self, session_id: &str, xfer: u32) -> bool {
         self.op(session_id, HostOp::Cancel(xfer))
+    }
+
+    /// Turn `caps` (`tornect_proto::services::caps` bits) off for the rest
+    /// of session `session_id`, as the host's user asks: running transfers
+    /// of those caps end with `Cancel{TURNED_OFF}` (what was received of them
+    /// is deleted), the viewer hears the caps left in a `Caps`, and a stream
+    /// left with nothing closes (`Close{TURNED_OFF}`). They never come back
+    /// in that session. `false` when the session has no services stream
+    /// open.
+    pub fn turn_off(&self, session_id: &str, caps: u16) -> bool {
+        self.op(session_id, HostOp::TurnOff(caps))
+    }
+
+    /// The host is locked or shows a secure screen (`true`), or no longer
+    /// (§2.3), for every stream, those opened while it lasts included: the
+    /// clipboard, uploads and browsing pause (transfers stall, nothing is
+    /// read or set on the clipboard, new requests are skipped) and resume
+    /// when it ends; chat goes on. A host starts unlocked; the same state
+    /// twice changes nothing.
+    pub fn set_locked(&self, locked: bool) {
+        self.locked.send_if_modified(|now| {
+            let changed = *now != locked;
+            *now = locked;
+            changed
+        });
     }
 
     fn op(&self, session_id: &str, op: HostOp) -> bool {
@@ -546,6 +586,14 @@ impl ServicesHost {
         let clip = HostClip::new(link, sender, ClipInflow::new(welcome.clip_max, chat::now()));
         #[cfg(test)]
         let listings = listings.with_hook(self.env.list_hook.clone());
+        let mut locked = self.locked.subscribe();
+        if *locked.borrow_and_update() {
+            // Opened while the host is locked: the reader skips new requests
+            // from the first frame, and the loop pauses the rest and tells
+            // the viewer at once (after `Welcome`).
+            state.set_paused(caps::PAUSABLE);
+            locked.mark_changed();
+        }
         // The first frame: nothing else is queued yet.
         outbox.ctrl(SvcMsg::Welcome(welcome));
         let (tx, mut inbound) = mpsc::channel(self.limits.inbound_depth.max(1));
@@ -575,6 +623,7 @@ impl ServicesHost {
             downloads,
             listings,
             clip,
+            locked: false,
         };
         // The `Close` reason, and whether to write it (not to a viewer that
         // closed, nor on a stream that failed).
@@ -594,6 +643,12 @@ impl ServicesHost {
                         Ok(CaptureState::Pending | CaptureState::Stopped) | Err(_) => {
                             break (reason::CAPTURE_STOPPED, true);
                         }
+                    }
+                }
+                Ok(()) = locked.changed() => {
+                    let now = *locked.borrow_and_update();
+                    if let Some(code) = served.lock(now) {
+                        break (code, true);
                     }
                 }
                 _ = writer.stopped() => break (reason::IO, false),
@@ -733,6 +788,8 @@ struct Served<'a> {
     listings: HostListings,
     /// The desktop's clipboard, and the viewer's texts arriving.
     clip: HostClip,
+    /// The host is locked: the clipboard and files are paused.
+    locked: bool,
 }
 
 impl Served<'_> {
@@ -949,7 +1006,82 @@ impl Served<'_> {
                 Ok(false) => self.downloads.cancel(xfer, reason::BY_HOST).err(),
                 other => other.err(),
             },
+            HostOp::TurnOff(off) => {
+                tracing::info!(
+                    session = %self.session_id,
+                    caps = off,
+                    "the host's user turned services off"
+                );
+                self.turn_off(off, reason::TURNED_OFF)
+            }
         }
+    }
+
+    /// The host was locked (`true`) or unlocked (§2.3). A lock pauses the
+    /// clipboard, uploads and browsing: the reader skips new requests for
+    /// them from now on, the window takes no more bytes (downloads and the
+    /// clipboard's text stall), uploads get no `Credit` (withheld until the
+    /// end, like the clipboard's), a listing being read stops and the link
+    /// goes inactive; then the viewer hears `Caps` with `paused`. Its end
+    /// tells the viewer first (`Caps` with nothing paused), then resumes
+    /// them all: the credits withheld go out, and the link takes a fresh
+    /// baseline. `Some` with the `Close` reason when the viewer stopped
+    /// reading.
+    fn lock(&mut self, locked: bool) -> Option<u16> {
+        if self.locked == locked {
+            return None;
+        }
+        self.locked = locked;
+        let left = self.state.left();
+        if locked {
+            let paused = self.state.set_paused(left);
+            self.window.set_paused(true);
+            self.clip.set_paused(true);
+            if let Err(code) = self.uploads.set_paused(true) {
+                return Some(code);
+            }
+            self.downloads.set_paused(true);
+            self.listings.stop();
+            tracing::info!(
+                session = %self.session_id,
+                paused,
+                "the host is locked: the clipboard and files are paused"
+            );
+            if paused == 0 {
+                return None;
+            }
+            return self.caps(left, paused);
+        }
+        let was = self.state.paused();
+        self.state.set_paused(0);
+        if was != 0
+            && let Some(code) = self.caps(left, 0)
+        {
+            return Some(code);
+        }
+        self.window.set_paused(false);
+        self.clip.set_paused(false);
+        if let Err(code) = self.uploads.set_paused(false) {
+            return Some(code);
+        }
+        self.downloads.set_paused(false);
+        tracing::info!(
+            session = %self.session_id,
+            "the host is unlocked: the clipboard and files resume"
+        );
+        self.credit_clip().err()
+    }
+
+    /// Tell the viewer the caps `left` and those `paused` (`Caps`), and the
+    /// host's user; `Some(PROTOCOL)` when the viewer stopped reading.
+    fn caps(&self, left: u16, paused: u16) -> Option<u16> {
+        if !self.outbox.ctrl(SvcMsg::Caps(Caps { caps: left, paused })) {
+            // The viewer stopped reading (§3.4).
+            return Some(reason::PROTOCOL);
+        }
+        self.observer
+            .event(self.session_id, HostEvent::Caps { caps: left, paused });
+        None
     }
 
     /// The viewer's input no longer reaches the desktop (`INPUT_LOST`): the
@@ -957,37 +1089,49 @@ impl Served<'_> {
     /// the viewer hears in a `Caps`. `Some` with the `Close` reason when
     /// nothing is left, or the viewer stopped reading.
     fn input_lost(&mut self) -> Option<u16> {
-        // The clipboard goes with the viewer's input: the link is dropped.
-        self.clip.turn_off();
-        let before = self.state.left();
-        let left = self.state.turn_off(caps::PAUSABLE);
         tracing::info!(
             session = %self.session_id,
-            caps = left,
+            caps = self.state.left() & !caps::PAUSABLE,
             "the viewer's input was lost: the clipboard and files are off"
         );
-        if left == before {
+        self.turn_off(caps::PAUSABLE, reason::NOT_OFFERED)
+    }
+
+    /// Turn `off` off for the rest of the stream (the host user's turn-off,
+    /// or the viewer's input lost): the clipboard's link is dropped, running
+    /// transfers of those caps end with `Cancel{TURNED_OFF}` (what was
+    /// received of them is deleted), a listing being read stops, and the
+    /// viewer hears the caps left in a `Caps` (a pause stands for those
+    /// left). Frames for them are skipped from now on. `Some` with the
+    /// `Close` reason: `close` when nothing is left, `PROTOCOL` when the
+    /// viewer stopped reading.
+    fn turn_off(&mut self, off: u16, close: u16) -> Option<u16> {
+        let off = off & self.state.left();
+        if off == 0 {
             return None;
         }
+        if off & caps::CLIP != 0 {
+            // Its backend stops, and clears what it set.
+            self.clip.turn_off();
+        }
+        let left = self.state.turn_off(off);
         // Running transfers end before the viewer hears the caps, so that
-        // each gets its own reason; a listing being read stops.
-        if let Err(code) = self.uploads.cancel_all(reason::TURNED_OFF) {
+        // each gets its own reason.
+        if off & caps::UPLOAD != 0
+            && let Err(code) = self.uploads.cancel_all(reason::TURNED_OFF)
+        {
             return Some(code);
         }
-        if let Err(code) = self.downloads.cancel_all(reason::TURNED_OFF) {
-            return Some(code);
+        if off & caps::BROWSE != 0 {
+            if let Err(code) = self.downloads.cancel_all(reason::TURNED_OFF) {
+                return Some(code);
+            }
+            self.listings.stop();
         }
-        self.listings.stop();
         if left == 0 {
-            return Some(reason::NOT_OFFERED);
+            return Some(close);
         }
-        let paused = self.state.paused() & left;
-        if !self.outbox.ctrl(SvcMsg::Caps(Caps { caps: left, paused })) {
-            return Some(reason::PROTOCOL);
-        }
-        self.observer
-            .event(self.session_id, HostEvent::Caps { caps: left, paused });
-        None
+        self.caps(left, self.state.paused() & left)
     }
 }
 

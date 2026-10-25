@@ -65,11 +65,20 @@
 //! becomes clipboard text only through `ClipText::from_peer`, and neither end
 //! sends again the text it sent or applied last.
 //!
+//! While the host is locked or shows a secure screen
+//! ([`ServicesHost::set_locked`], §2.3) the clipboard, uploads and browsing
+//! are paused for every stream: new requests for them are skipped unread
+//! (the viewer fails its own unanswered ones with `LOCKED`), transfers stall
+//! instead of failing (no `Credit` for uploads, no `Data` for downloads),
+//! and the clipboard's link is inactive; chat goes on. The host's user can
+//! turn services off for the rest of a session ([`ServicesHost::turn_off`]):
+//! their transfers end with `TURNED_OFF`, and they never come back.
+//!
 //! The stream is built in the design's steps: this build has the bind, the
 //! live wait, the caps, chat both ways, the clipboard, uploads, browsing the
-//! host's files and downloads, the viewer's own file browser and the close
-//! paths. The lock pause and the host user's turn-off come with the
-//! design's step 19.
+//! host's files and downloads, the viewer's own file browser, the lock
+//! pause, the host user's turn-off and the close paths; the app wires them
+//! in the design's steps 20 and 21.
 //!
 //! [`MediaHost`]: crate::MediaHost
 
@@ -343,8 +352,8 @@ pub enum HostEvent {
         clipboard_refused: bool,
     },
     /// The caps left, or the ones paused, changed (`Caps` was queued): the
-    /// viewer's input was lost, the host user turned services off, or a lock
-    /// paused them.
+    /// viewer's input was lost, the host user turned services off, a lock
+    /// paused them, or its end resumed them.
     Caps {
         /// The caps left.
         caps: u16,

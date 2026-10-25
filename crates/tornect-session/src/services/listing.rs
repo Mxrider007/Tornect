@@ -28,6 +28,11 @@
 //! a `ListFailed` that answers no outstanding `List`, or whose `next` does
 //! not follow its entries, ends the stream with `Close{PROTOCOL}`.
 //!
+//! **A lock** (§2.3): the host stops the listing it is reading and skips
+//! every `List` until it is unlocked; the viewer gives up the `List` it has
+//! outstanding (its user hears `LOCKED`), and drops an answer that still
+//! comes for it.
+//!
 //! Nothing here logs a name or a path.
 
 use std::collections::HashMap;
@@ -43,7 +48,7 @@ use tornect_proto::services::{
 
 use super::ServicesLimits;
 use super::browse::{Access, Folder, Handles, ListingView, page, read_folder};
-use super::transfer::Untrusted;
+use super::transfer::{Abandoned, Untrusted};
 use super::writer::Outbox;
 use crate::flow::TokenBucket;
 
@@ -278,8 +283,9 @@ impl HostListings {
         }
     }
 
-    /// Browsing went (the viewer's input was lost), or the stream ends: a
-    /// running worker stops at its next entry, and nothing more is answered.
+    /// Browsing went (turned off, or the viewer's input was lost), a lock
+    /// paused it, or the stream ends: a running worker stops at its next
+    /// entry, and nothing more is answered.
     pub(crate) fn stop(&mut self) {
         if let Some(reading) = self.reading.take() {
             reading.cancel.store(true, Ordering::SeqCst);
@@ -308,6 +314,8 @@ pub(crate) struct ViewerListings {
     /// The files of the folder shown, by handle: their names and sizes, for
     /// the rows of their downloads.
     files: HashMap<u32, (Untrusted, u64)>,
+    /// `List`s given up at a lock whose answer may still come.
+    abandoned: Abandoned,
 }
 
 /// What a host's answer to a `List` gives the viewer's user.
@@ -331,6 +339,7 @@ impl ViewerListings {
             wanted: None,
             max_entries: max_entries.max(1),
             files: HashMap::new(),
+            abandoned: Abandoned::default(),
         }
     }
 
@@ -372,6 +381,9 @@ impl ViewerListings {
     /// folder holds more than this viewer lists (then the page says
     /// `truncated`).
     pub(crate) fn listing(&mut self, listing: &Listing) -> Result<Answer, u16> {
+        if self.abandoned.answered(listing.req) {
+            return Ok(Answer::Stale);
+        }
         let asked = self.answered(listing.req)?;
         let count = u32::try_from(listing.entries.len()).unwrap_or(u32::MAX);
         let follows = asked.from.checked_add(count);
@@ -409,6 +421,9 @@ impl ViewerListings {
 
     /// The host's `ListFailed`.
     pub(crate) fn failed(&mut self, failed: ListFailed) -> Result<Answer, u16> {
+        if self.abandoned.answered(failed.req) {
+            return Ok(Answer::Stale);
+        }
         self.answered(failed.req)?;
         if let Some(folder) = self.wanted.take() {
             self.ask(folder, 0)?;
@@ -420,6 +435,21 @@ impl ViewerListings {
     /// The name and size of file `handle` of the folder shown, if it is one.
     pub(crate) fn file(&self, handle: u32) -> Option<&(Untrusted, u64)> {
         self.files.get(&handle)
+    }
+
+    /// The host paused browsing (it is locked): the `List` outstanding is
+    /// given up (the host may have skipped it; an answer that comes for it
+    /// is dropped), and a folder opened meanwhile is forgotten; `true` when
+    /// something was outstanding.
+    pub(crate) fn pause(&mut self) -> bool {
+        self.wanted = None;
+        match self.asked.take() {
+            Some(asked) => {
+                self.abandoned.add(asked.req);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The host turned browsing off: nothing is outstanding any more (its

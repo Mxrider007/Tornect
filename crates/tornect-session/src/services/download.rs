@@ -27,6 +27,14 @@
 //! 4. Either end may `Cancel` at any point; the viewer deletes what it
 //!    wrote.
 //!
+//! While the host is locked (§2.3) downloads stall instead of failing: its
+//! window is paused, so no more `Data` goes out until it is unlocked; their
+//! rows say `Stalled`. A file still opening at the lock is refused once
+//! open (`Cancel{LOCKED}`). The viewer fails the `Get`s still unanswered
+//! with `LOCKED` (the host may have skipped them unread), answers a
+//! `Sending` that still comes for one of them with `Cancel`, and holds its
+//! queued files until the host is unlocked.
+//!
 //! An open abandoned at its timeout (a path swapped for a pipe between the
 //! check and the open, design §5.2) holds its place until its thread
 //! returns. The viewer runs at most [`MAX_DOWNLOADS`] downloads and queues
@@ -46,8 +54,8 @@ use tornect_proto::services::{Cancel, Complete, Done, Get, Sending, SvcMsg, reas
 use super::browse::{Access, open_file};
 use super::store::{Fed, Inbox, Receiving, Work, Worked, WorkerEvent, spawn_receiver};
 use super::transfer::{
-    Direction, HostPath, Ids, MAX_DOWNLOADS, Outgoing, SendFailed, TransferRow, TransferState,
-    Untrusted, ViewerShared, late,
+    Abandoned, Direction, HostPath, Ids, MAX_DOWNLOADS, Outgoing, SendFailed, TransferRow,
+    TransferState, Untrusted, ViewerShared, late,
 };
 use super::window::{Inflow, Window};
 use super::writer::Outbox;
@@ -163,6 +171,8 @@ pub(crate) struct HostDownloads {
     abandoned: Arc<AtomicUsize>,
     opened: mpsc::UnboundedSender<Opened>,
     failed: mpsc::UnboundedSender<SendFailed>,
+    /// The host is locked: its window is paused.
+    paused: bool,
     #[cfg(test)]
     hook: Option<OpenHook>,
     /// Files the viewer completed, and their bytes.
@@ -223,6 +233,7 @@ impl HostDownloads {
                 abandoned: Arc::new(AtomicUsize::new(0)),
                 opened,
                 failed,
+                paused: false,
                 #[cfg(test)]
                 hook,
                 files_out: 0,
@@ -321,6 +332,9 @@ impl HostDownloads {
             return Ok(());
         }
         let opened = match result {
+            // Asked for before a lock, which the viewer gave up: nothing is
+            // sent while the host is locked.
+            Ok(_) if self.paused => Err(reason::LOCKED),
             Ok((_, size, _)) if size > self.file_max => Err(reason::TOO_LARGE),
             other => other,
         };
@@ -378,9 +392,27 @@ impl HostDownloads {
             .credit(xfer, upto)
             .map_err(|_| reason::PROTOCOL)?;
         down.credited = upto;
-        let row = row(xfer, down, TransferState::Running);
+        let row = row(xfer, down, TransferState::moving(self.paused));
         self.tell(row);
         Ok(())
+    }
+
+    /// The host is locked (`true`; the stream pauses its window, so no more
+    /// `Data` goes out) or unlocked: the rows of the files being sent say
+    /// `Stalled`, or `Running` again.
+    pub(crate) fn set_paused(&mut self, paused: bool) {
+        if self.paused == paused {
+            return;
+        }
+        self.paused = paused;
+        let mut xfers: Vec<u32> = self.running.keys().copied().collect();
+        xfers.sort_unstable();
+        for xfer in xfers {
+            let down = &self.running[&xfer];
+            if matches!(down.phase, Phase::Sending { .. }) {
+                self.tell(row(xfer, down, TransferState::moving(paused)));
+            }
+        }
     }
 
     /// The viewer's `Complete`: the file is in place there. Only a file the
@@ -588,6 +620,10 @@ pub(crate) struct ViewerDownloads {
     reports: mpsc::UnboundedSender<WorkerEvent>,
     /// The downloads folder's stale partial files were swept.
     swept: bool,
+    /// The host is locked: nothing is asked for.
+    paused: bool,
+    /// `Get`s given up at a lock whose answer may still come.
+    abandoned: Abandoned,
 }
 
 impl ViewerDownloads {
@@ -616,6 +652,8 @@ impl ViewerDownloads {
                 workers: JoinSet::new(),
                 reports,
                 swept: false,
+                paused: false,
+                abandoned: Abandoned::default(),
             },
             reports_rx,
         )
@@ -684,7 +722,8 @@ impl ViewerDownloads {
     /// Ask for queued files, in order, while fewer than [`MAX_DOWNLOADS`]
     /// are asked for or arriving.
     fn pump(&mut self) -> Result<(), u16> {
-        while self.active() < MAX_DOWNLOADS {
+        // The host skips `Get`s while it is locked.
+        while !self.paused && self.active() < MAX_DOWNLOADS {
             let Some(id) = self.queue.pop_front() else {
                 return Ok(());
             };
@@ -723,9 +762,16 @@ impl ViewerDownloads {
     }
 
     /// The host's `Sending`: the file starts arriving, on a receiving worker
-    /// that takes it into the downloads folder (or refuses it: `Cancel`).
+    /// that takes it into the downloads folder (or refuses it: `Cancel`); or,
+    /// for a `Get` given up at a lock, it is stopped.
     pub(crate) fn sending(&mut self, sending: Sending) -> Result<(), u16> {
         let Sending { xfer, name, size } = sending;
+        if self.abandoned.answered(xfer) {
+            return self.ctrl(SvcMsg::Cancel(Cancel {
+                xfer,
+                reason: reason::BY_VIEWER,
+            }));
+        }
         let Some(id) = self.by_wire(xfer)? else {
             return Ok(());
         };
@@ -756,7 +802,7 @@ impl ViewerDownloads {
                 done: false,
             }),
         );
-        let row = row_of(id, dl, TransferState::Running);
+        let row = row_of(id, dl, TransferState::moving(self.paused));
         self.emit(row);
         Ok(())
     }
@@ -879,7 +925,7 @@ impl ViewerDownloads {
             Worked::Written(upto) => {
                 if self.inflow.due(upto, dl.credited, dl.size) {
                     dl.credited = upto;
-                    let row = row_of(id, dl, TransferState::Running);
+                    let row = row_of(id, dl, TransferState::moving(self.paused));
                     self.ctrl(SvcMsg::Credit { xfer, upto })?;
                     self.emit(row);
                 }
@@ -897,6 +943,9 @@ impl ViewerDownloads {
     /// The host's `Cancel` of a download; `Ok(false)` when it names none. A
     /// file already being put in place lands all the same.
     pub(crate) fn cancelled(&mut self, cancel: Cancel) -> Result<bool, u16> {
+        if self.abandoned.answered(cancel.xfer) {
+            return Ok(true);
+        }
         let Some(&id) = self.wire.get(&cancel.xfer) else {
             return Ok(false);
         };
@@ -941,6 +990,35 @@ impl ViewerDownloads {
             Some(Fetch::Receiving(_, incoming)) => incoming.receiving.cancel(),
             _ => true,
         }
+    }
+
+    /// The host paused browsing (it is locked): `Get`s still unanswered
+    /// fail with `LOCKED` and are given up (the host may have skipped them;
+    /// a `Sending` that comes for one is answered with `Cancel`), files
+    /// arriving stall (the host sends nothing meanwhile), and queued files
+    /// wait. Or it resumed it: they move again, and queued files are asked
+    /// for.
+    pub(crate) fn set_paused(&mut self, paused: bool) -> Result<(), u16> {
+        if self.paused == paused {
+            return Ok(());
+        }
+        self.paused = paused;
+        let mut ids: Vec<u32> = self.downloads.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let Some(dl) = self.downloads.get(&id) else {
+                continue;
+            };
+            match dl.fetch {
+                Fetch::Asked(xfer) if paused => {
+                    self.abandoned.add(xfer);
+                    self.finish(id, xfer, TransferState::Failed(reason::LOCKED));
+                }
+                Fetch::Receiving(..) => self.emit(row_of(id, dl, TransferState::moving(paused))),
+                Fetch::Queued | Fetch::Asked(_) => {}
+            }
+        }
+        self.pump()
     }
 
     /// The host turned browsing off (`Caps` without `BROWSE`): every

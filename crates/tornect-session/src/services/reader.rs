@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use tornect_proto::services::{
-    Side, SvcError, SvcMsg, read_body_max, read_header, reason, skip_body, ty,
+    Side, SvcError, SvcMsg, caps, read_body_max, read_header, reason, skip_body, ty,
 };
 
 /// What the bodies of skipped frames are read through, and wiped after.
@@ -72,10 +72,22 @@ impl CapState {
         self.paused.load(Ordering::SeqCst)
     }
 
+    /// A lock pauses `caps` (within those left and pausable), or its end
+    /// resumes them (`0`): from now on the reader skips new requests that
+    /// need only paused caps (`Offer`, `Get`, `List` and the clipboard's
+    /// frames, §2.3). Returns the caps paused now.
+    pub(crate) fn set_paused(&self, caps: u16) -> u16 {
+        let paused = caps & self.left() & caps::PAUSABLE;
+        self.paused.store(paused, Ordering::SeqCst);
+        paused
+    }
+
     /// Turn `caps` off for the rest of the stream: frames that need only
-    /// caps turned off are skipped from now on. Returns the caps left.
+    /// caps turned off are skipped from now on, and a cap turned off is no
+    /// longer paused. Returns the caps left.
     pub(crate) fn turn_off(&self, caps: u16) -> u16 {
         self.off.fetch_or(caps & self.granted, Ordering::SeqCst);
+        self.paused.fetch_and(!caps, Ordering::SeqCst);
         self.left()
     }
 

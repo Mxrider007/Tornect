@@ -13,6 +13,9 @@
 //!   the sender's own count says arrived, so a sender that keeps to its
 //!   window is never refused.
 //!
+//! - While the host is locked (§2.3) its window is paused: nothing more is
+//!   taken until it is unlocked, so downloads stall instead of failing.
+//!
 //! The window bounds the receiver's buffering and the delay a chat line or a
 //! `Cancel` can meet behind bulk bytes (Arti already schedules the streams of
 //! a circuit round-robin), and makes the progress the sender shows true
@@ -56,6 +59,8 @@ struct Flight {
 struct Flights {
     in_flight: u64,
     flights: HashMap<u32, Flight>,
+    /// Nothing is taken while set.
+    paused: bool,
 }
 
 /// The sender's window, shared by the stream's loop (credits, releases) and
@@ -97,9 +102,10 @@ impl Window {
         self.lock().flights.entry(xfer).or_default();
     }
 
-    /// Wait until `n` more bytes of `xfer` fit in the window, and count them
-    /// as sent: `false` when `xfer` was released meanwhile (or never opened),
-    /// and then nothing is counted. Cancel-safe.
+    /// Wait until `n` more bytes of `xfer` fit in the window and it is not
+    /// paused, and count them as sent: `false` when `xfer` was released
+    /// meanwhile (or never opened), and then nothing is counted.
+    /// Cancel-safe.
     pub(crate) async fn take(&self, xfer: u32, n: u64) -> bool {
         loop {
             let room = self.room.notified();
@@ -111,13 +117,22 @@ impl Window {
                 let Some(flight) = flights.flights.get_mut(&xfer) else {
                     return false;
                 };
-                if flights.in_flight + n <= self.limit {
+                if !flights.paused && flights.in_flight + n <= self.limit {
                     flight.sent += n;
                     flights.in_flight += n;
                     return true;
                 }
             }
             room.await;
+        }
+    }
+
+    /// Pause the window (the host is locked): nothing more is taken until it
+    /// is resumed. What was taken already is sent.
+    pub(crate) fn set_paused(&self, paused: bool) {
+        self.lock().paused = paused;
+        if !paused {
+            self.room.notify_waiters();
         }
     }
 
@@ -250,6 +265,35 @@ mod tests {
             window.take(CLIPBOARD, 10).await,
             "the clipboard's flight stays"
         );
+    }
+
+    /// A paused window takes nothing, room or not, until it is resumed; a
+    /// transfer released while paused still hears `false`.
+    #[tokio::test]
+    async fn a_paused_window_takes_nothing_until_it_resumes() {
+        let window = Arc::new(Window::new(64 * 1024));
+        window.open(1);
+        window.open(2);
+        assert!(window.take(1, 1024).await);
+        window.set_paused(true);
+        let waiting = tokio::spawn({
+            let window = Arc::clone(&window);
+            async move { window.take(1, 1024).await }
+        });
+        let released = tokio::spawn({
+            let window = Arc::clone(&window);
+            async move { window.take(2, 1024).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished(), "paused, with room to spare");
+        window.credit(1, 1024).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished(), "a credit does not resume it");
+        window.release(2);
+        assert!(!released.await.unwrap());
+        window.set_paused(false);
+        assert!(waiting.await.unwrap());
+        assert_eq!(window.in_flight(), 1024);
     }
 
     /// A released transfer's bytes no longer count, and a task waiting to
