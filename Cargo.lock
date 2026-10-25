@@ -7470,6 +7470,7 @@ dependencies = [
  "tornect-proto",
  "tornect-signal",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

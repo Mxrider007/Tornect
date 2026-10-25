@@ -102,6 +102,15 @@ impl CapState {
 pub(crate) enum Inbound {
     /// A decoded frame the stream's caps let through.
     Frame(SvcMsg),
+    /// A clipboard frame (`ClipStart`, `ClipChunk`) of type `ty` whose body
+    /// of `len` bytes was skipped: the text it belonged to is dropped, and a
+    /// chunk's bytes still count against the peer's window until credited.
+    Skipped {
+        /// The frame's type.
+        ty: u8,
+        /// Its body's length.
+        len: usize,
+    },
     /// The last thing the reader says: it stopped reading.
     End(ReadEnd),
 }
@@ -126,7 +135,9 @@ pub(crate) enum ReadEnd {
 /// 2. a frame for a cap never granted: `Close{NOT_OFFERED}`, the body unread;
 /// 3. a frame whose caps were all turned off, or (from the viewer) a new
 ///    request whose cap is paused: read through a fixed scratch buffer and
-///    dropped, undecoded and without error;
+///    dropped, undecoded and without error; a clipboard frame skipped is
+///    told ([`Inbound::Skipped`]), so that the loop drops the text it
+///    belonged to and credits its bytes;
 /// 4. anything else is decoded, and a body that does not decode is
 ///    `Close{PROTOCOL}`.
 ///
@@ -160,6 +171,15 @@ pub(crate) async fn read_frames<R: AsyncRead + Unpin>(
                     break ReadEnd::Io;
                 }
                 caps.skipped.fetch_add(1, Ordering::SeqCst);
+                if matches!(header.ty, ty::CLIP_START | ty::CLIP_CHUNK) {
+                    let skipped = Inbound::Skipped {
+                        ty: header.ty,
+                        len: header.len,
+                    };
+                    if tx.send(skipped).await.is_err() {
+                        return;
+                    }
+                }
             }
             ty::Gate::Decode => {
                 let body = match read_body_max(&mut rd, header, max).await {

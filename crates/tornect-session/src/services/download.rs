@@ -772,9 +772,34 @@ impl ViewerDownloads {
         }
     }
 
+    /// Whether the host keeps to its window with `extra` bytes of its
+    /// clipboard text in flight beside its downloads'.
+    pub(crate) fn admits(&self, extra: u64) -> bool {
+        self.inflow.admits(self.in_flight().saturating_add(extra))
+    }
+
+    /// Bytes of downloads that arrived and were not yet credited: what the
+    /// host holds in its window for them.
+    fn in_flight(&self) -> u64 {
+        self.downloads
+            .values()
+            .map(|dl| match &dl.fetch {
+                Fetch::Receiving(_, incoming) => incoming.arrived - dl.credited,
+                _ => 0,
+            })
+            .sum()
+    }
+
     /// The host's `Data`: bytes in order, never past the size, within the
-    /// window.
-    pub(crate) fn data(&mut self, xfer: u32, offset: u64, bytes: Vec<u8>) -> Result<(), u16> {
+    /// window, in which `extra` bytes of the host's clipboard text are as
+    /// well.
+    pub(crate) fn data(
+        &mut self,
+        xfer: u32,
+        offset: u64,
+        bytes: Vec<u8>,
+        extra: u64,
+    ) -> Result<(), u16> {
         let Some(id) = self.by_wire(xfer)? else {
             return Ok(());
         };
@@ -789,15 +814,7 @@ impl ViewerDownloads {
         }
         incoming.arrived += len;
         let last = incoming.arrived == size;
-        let in_flight: u64 = self
-            .downloads
-            .values()
-            .map(|dl| match &dl.fetch {
-                Fetch::Receiving(_, incoming) => incoming.arrived - dl.credited,
-                _ => 0,
-            })
-            .sum();
-        if !self.inflow.admits(in_flight) {
+        if !self.admits(extra) {
             return Err(reason::PROTOCOL);
         }
         let Some(incoming) = self.incoming(xfer)? else {

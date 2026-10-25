@@ -1,5 +1,5 @@
 //! The services streams end to end over in-process pipes (the services
-//! design §10, tests 1, 2, 4 to 8, 10, 12, 15 and 17 and the close paths
+//! design §10, tests 1, 2, 4 to 10, 12, 15 and 17 and the close paths
 //! of step 12, and the review of steps 14 and 15): a real [`MediaHost`]
 //! registry, its capture state driven by hand or by a real media stream, a
 //! fake desktop clipboard, a temporary inbox, a fake reading of its disk's
@@ -23,7 +23,7 @@ use tornect_capture::{CaptureError, TestCard, VideoSource};
 use tornect_core::DeviceId;
 use tornect_core::levels::Elevation;
 use tornect_core::session_log::SessionMode;
-use tornect_input::clipboard::{ClipboardLink, DesktopEnds};
+use tornect_input::clipboard::{ClipText, ClipboardLink, DesktopEnds};
 use tornect_input::{InputError, InputEvent, InputSink};
 use tornect_proto::services::{
     Accepted, Bind, CHUNK, Cancel, Caps, Chat, ClipStart, ClipSwitch, Complete, Done, Get, List,
@@ -4600,4 +4600,584 @@ fn eligible_and_granted_follow_the_table() {
     }
     let may = eligible(&all_on, SessionMode::Control, true);
     assert_eq!(granted(may, true, true), caps::ALL);
+}
+
+// --- Test 9: the clipboard ------------------------------------------------
+
+fn clip_text(text: &str) -> ClipText {
+    ClipText::new(text.to_owned()).unwrap()
+}
+
+/// The far ends of the clipboard link the rig's desktop gave out last.
+fn desk_ends(rig: &Rig) -> DesktopEnds {
+    rig.desk
+        .ends
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("a link was given out")
+}
+
+/// Wait until the host's link is `on`, as its backend sees it.
+async fn active_is(ends: &mut DesktopEnds, on: bool) {
+    tokio::time::timeout(WAIT, ends.active.wait_for(|active| *active == on))
+        .await
+        .expect("in time")
+        .expect("the link is there");
+}
+
+/// The next text the host put on the desktop's clipboard.
+async fn set_on_desktop(ends: &mut DesktopEnds) -> String {
+    tokio::time::timeout(WAIT, ends.to_desktop.changed())
+        .await
+        .expect("in time")
+        .expect("the link is there");
+    let text = ends.to_desktop.borrow_and_update();
+    text.as_ref().expect("text").as_str().to_owned()
+}
+
+/// Send `bytes` as clipboard text `seq`, a chunk a frame.
+async fn send_clip(peer: &mut DuplexStream, seq: u32, bytes: &[u8]) {
+    let len = u32::try_from(bytes.len()).unwrap();
+    write_msg(peer, &SvcMsg::ClipStart(ClipStart { seq, len }))
+        .await
+        .unwrap();
+    for (n, piece) in bytes.chunks(CHUNK).enumerate() {
+        let msg = SvcMsg::ClipChunk {
+            seq,
+            offset: u32::try_from(n * CHUNK).unwrap(),
+            bytes: piece.to_vec().into(),
+        };
+        write_msg(peer, &msg).await.unwrap();
+    }
+}
+
+/// The next clipboard text the peer sends, whole: its `seq` and bytes.
+async fn clip_from(peer: &mut DuplexStream) -> (u32, Vec<u8>) {
+    let Some(SvcMsg::ClipStart(ClipStart { seq, len })) = next(peer).await else {
+        panic!("expected a ClipStart");
+    };
+    let mut got = Vec::new();
+    while got.len() < len as usize {
+        match next(peer).await {
+            Some(SvcMsg::ClipChunk {
+                seq: s,
+                offset,
+                bytes,
+            }) if s == seq && offset as usize == got.len() => got.extend_from_slice(&bytes),
+            other => panic!("expected chunk {} of text {seq}, got {other:?}", got.len()),
+        }
+    }
+    (seq, got)
+}
+
+fn clip_credit(upto: u64) -> SvcMsg {
+    SvcMsg::Credit { xfer: 0, upto }
+}
+
+/// The services design's test 9, on the host: the desktop's link is active
+/// only while the viewer's switch is on, and `active` is sent on only when
+/// that changes; a copy is sent once, and the same text again (CRLF or LF)
+/// is not; the viewer's text is put on the desktop once, credited with
+/// `Credit{0}`, and the desktop reflecting it sends nothing back; with the
+/// switch off neither direction goes, though the viewer's bytes are still
+/// credited. Both are counted and told, never their text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clipboard_text_crosses_each_way_once_while_the_viewer_shares_it() {
+    let mut rig = rig();
+    let session = start(&rig, 200, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    assert_eq!(welcome(&mut client, &session).await.caps, caps::ALL);
+    rig.event(&session.id).await;
+    let mut ends = desk_ends(&rig);
+
+    // Inactive until the viewer's switch: a copy meanwhile is not sent.
+    assert!(!*ends.active.borrow_and_update());
+    ends.from_desktop.send_replace(Some(clip_text("before")));
+    assert!(quiet(&mut client).await);
+    write_msg(&mut client, &SvcMsg::ClipSwitch(ClipSwitch { on: true }))
+        .await
+        .unwrap();
+    active_is(&mut ends, true).await;
+
+    // Host → viewer, once.
+    ends.from_desktop
+        .send_replace(Some(clip_text("one\r\ntwo")));
+    assert_eq!(clip_from(&mut client).await, (1, b"one\r\ntwo".to_vec()));
+    assert_eq!(
+        rig.event(&session.id).await,
+        HostEvent::ClipOut { chars: 8 }
+    );
+    write_msg(&mut client, &clip_credit(8)).await.unwrap();
+    ends.from_desktop.send_replace(Some(clip_text("one\ntwo")));
+    assert!(quiet(&mut client).await, "the same text is not sent again");
+
+    // Viewer → host, once; the desktop reflecting it sends nothing back.
+    send_clip(&mut client, 1, b"from the viewer").await;
+    assert_eq!(next(&mut client).await, Some(clip_credit(15)));
+    assert_eq!(set_on_desktop(&mut ends).await, "from the viewer");
+    assert_eq!(
+        rig.event(&session.id).await,
+        HostEvent::ClipIn { chars: 15 }
+    );
+    ends.from_desktop
+        .send_replace(Some(clip_text("from the viewer")));
+    assert!(quiet(&mut client).await, "no echo");
+
+    // A switch repeated changes nothing on the link.
+    write_msg(&mut client, &SvcMsg::ClipSwitch(ClipSwitch { on: true }))
+        .await
+        .unwrap();
+    write_msg(&mut client, &chat("after the switch"))
+        .await
+        .unwrap();
+    assert!(matches!(rig.event(&session.id).await, HostEvent::Chat(_)));
+    assert!(
+        !ends.active.has_changed().unwrap(),
+        "`active` is sent on only when it changes"
+    );
+
+    // Off: neither direction, the viewer's bytes credited all the same.
+    write_msg(&mut client, &SvcMsg::ClipSwitch(ClipSwitch { on: false }))
+        .await
+        .unwrap();
+    active_is(&mut ends, false).await;
+    ends.from_desktop
+        .send_replace(Some(clip_text("copied while off")));
+    send_clip(&mut client, 2, b"sent while off").await;
+    assert_eq!(next(&mut client).await, Some(clip_credit(29)));
+    assert!(quiet(&mut client).await, "nothing sent while off");
+    assert!(
+        !ends.to_desktop.has_changed().unwrap(),
+        "nothing set while off"
+    );
+
+    rig.media.on_end(&session.id, None);
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Close {
+            reason: reason::SESSION_OVER
+        })
+    );
+    let (code, summary, _) = served(task).await;
+    assert_eq!(code, reason::SESSION_OVER);
+    assert_eq!(
+        (summary.clip_in, summary.clip_out, summary.dropped),
+        (1, 1, 0)
+    );
+    assert!(
+        ends.to_desktop.has_changed().is_err(),
+        "the link is dropped at the end"
+    );
+    let HostEvent::Closed { .. } = rig.event(&session.id).await else {
+        panic!("expected Closed");
+    };
+}
+
+/// Test 9, what the host takes from the viewer: text becomes clipboard
+/// text only through `ClipText::from_peer` (control characters removed);
+/// text with a NUL, text that is not UTF-8 and text that is only control
+/// characters are dropped and counted, as is a text over the rate (two at
+/// once, two a second); a start out of order ends the stream with
+/// `Close{PROTOCOL}` (one over the cap: the viewer's test below).
+#[tokio::test(start_paused = true)]
+async fn clipboard_text_from_the_viewer_is_checked_and_rated() {
+    let mut rig = rig();
+    let session = start(&rig, 201, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    assert_eq!(welcome(&mut client, &session).await.caps, caps::ALL);
+    rig.event(&session.id).await;
+    let mut ends = desk_ends(&rig);
+    write_msg(&mut client, &SvcMsg::ClipSwitch(ClipSwitch { on: true }))
+        .await
+        .unwrap();
+    active_is(&mut ends, true).await;
+
+    let mut credited = 0;
+    let mut sent = async |client: &mut DuplexStream, seq: u32, bytes: &[u8]| {
+        send_clip(client, seq, bytes).await;
+        credited += bytes.len() as u64;
+        assert_eq!(next(client).await, Some(clip_credit(credited)));
+    };
+    // The end of a bracketed paste and a bell are removed.
+    sent(&mut client, 1, b"a\x1b[201~b\x07").await;
+    assert_eq!(set_on_desktop(&mut ends).await, "a[201~b");
+    assert_eq!(rig.event(&session.id).await, HostEvent::ClipIn { chars: 7 });
+    sent(&mut client, 2, b"a\0b").await;
+    // The burst is spent.
+    sent(&mut client, 3, b"over the rate").await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    sent(&mut client, 4, &[b'a', 0xff, 0xfe]).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    sent(&mut client, 5, b"\x1b\x07\x7f").await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    sent(&mut client, 6, b"fine").await;
+    assert_eq!(set_on_desktop(&mut ends).await, "fine");
+    assert_eq!(rig.event(&session.id).await, HostEvent::ClipIn { chars: 4 });
+    write_msg(
+        &mut client,
+        &SvcMsg::ClipStart(ClipStart { seq: 6, len: 1 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Close {
+            reason: reason::PROTOCOL
+        })
+    );
+    let (code, summary, _) = served(task).await;
+    assert_eq!(code, reason::PROTOCOL);
+    assert_eq!((summary.clip_in, summary.dropped), (2, 4));
+}
+
+/// Test 9: the newest of five copies made in quick succession wins. The
+/// first goes at once; the host then waits `CLIP_EVERY` after its start,
+/// and sends only the newest of those copied meanwhile.
+#[tokio::test(start_paused = true)]
+async fn the_newest_of_rapid_copies_wins() {
+    let mut rig = rig();
+    let session = start(&rig, 203, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    welcome(&mut client, &session).await;
+    rig.event(&session.id).await;
+    let mut ends = desk_ends(&rig);
+    write_msg(&mut client, &SvcMsg::ClipSwitch(ClipSwitch { on: true }))
+        .await
+        .unwrap();
+    active_is(&mut ends, true).await;
+    let at = tokio::time::Instant::now();
+    for n in 1..=5 {
+        ends.from_desktop
+            .send_replace(Some(clip_text(&format!("copy {n}"))));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(clip_from(&mut client).await, (1, b"copy 1".to_vec()));
+    assert_eq!(clip_from(&mut client).await, (2, b"copy 5".to_vec()));
+    assert!(at.elapsed() >= CLIP_EVERY);
+    write_msg(&mut client, &clip_credit(12)).await.unwrap();
+    assert!(quiet(&mut client).await, "two texts crossed");
+    for _ in 0..2 {
+        assert_eq!(
+            rig.event(&session.id).await,
+            HostEvent::ClipOut { chars: 6 }
+        );
+    }
+    drop(client);
+    let (_, summary, _) = served(task).await;
+    assert_eq!(summary.clip_out, 2);
+}
+
+/// Test 9: clipboard text counts against the bulk window, credited with
+/// `Credit{0}`. The host sends no more than the window of a long text until
+/// the viewer credits it; and holds the viewer's clipboard bytes to the
+/// window it shares with its uploads: one byte of text beyond an upload
+/// that fills it ends the stream with `Close{PROTOCOL}`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clipboard_bytes_count_against_the_bulk_window() {
+    let mut rig = rig_with(Build {
+        limits: ServicesLimits {
+            bulk_window: u32::try_from(CHUNK).unwrap(),
+            recheck_free_every: CHUNK as u64,
+            ..ServicesLimits::default()
+        },
+        ..Build::default()
+    });
+    let session = start(&rig, 204, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    let window = welcome(&mut client, &session).await.bulk_window;
+    assert_eq!(window as usize, CHUNK);
+    rig.event(&session.id).await;
+    let mut ends = desk_ends(&rig);
+    write_msg(&mut client, &SvcMsg::ClipSwitch(ClipSwitch { on: true }))
+        .await
+        .unwrap();
+    active_is(&mut ends, true).await;
+
+    let long = "x".repeat(CHUNK + 100);
+    ends.from_desktop.send_replace(Some(clip_text(&long)));
+    let len = u32::try_from(long.len()).unwrap();
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::ClipStart(ClipStart { seq: 1, len }))
+    );
+    let Some(SvcMsg::ClipChunk { bytes, .. }) = next(&mut client).await else {
+        panic!("expected a chunk");
+    };
+    assert_eq!(bytes.len(), CHUNK);
+    assert!(quiet(&mut client).await, "one window, then nothing");
+    write_msg(&mut client, &clip_credit(CHUNK as u64))
+        .await
+        .unwrap();
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::ClipChunk {
+            seq: 1,
+            offset: u32::try_from(CHUNK).unwrap(),
+            bytes: vec![b'x'; 100].into(),
+        })
+    );
+    assert_eq!(
+        rig.event(&session.id).await,
+        HostEvent::ClipOut { chars: CHUNK + 100 }
+    );
+
+    // The viewer's side of the window: an upload stalled on the host's
+    // disk fills it, uncredited; one byte of clipboard text more is too
+    // much.
+    write_msg(&mut client, &offer(1, "w.bin", 1 << 20))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut client).await, Some(accepted(1, "w.bin")));
+    assert_eq!(rig.row(&session.id).await.state, TransferState::Running);
+    rig.stall.store(true, Ordering::SeqCst);
+    send_data(&mut client, 1, 0, &vec![3; CHUNK]).await;
+    rig.stalled().await;
+    write_msg(&mut client, &chat("still here")).await.unwrap();
+    assert!(
+        matches!(rig.event(&session.id).await, HostEvent::Chat(_)),
+        "a full window, no refusal"
+    );
+    send_clip(&mut client, 1, b"x").await;
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Close {
+            reason: reason::PROTOCOL
+        })
+    );
+    rig.stall.store(false, Ordering::SeqCst);
+    assert_eq!(served(task).await.0, reason::PROTOCOL);
+}
+
+/// The test's viewer window, as its clipboard: what it read, what it was
+/// given to set.
+struct WindowSide {
+    copied: watch::Sender<Option<ClipText>>,
+    pasted: watch::Receiver<Option<ClipText>>,
+}
+
+/// A window's clipboard for a [`ViewerLocal`], its switch `on`.
+fn window_clip(on: bool) -> (ViewerClip, WindowSide) {
+    let (copied, outbound) = watch::channel(None);
+    let (inbound, pasted) = watch::channel(None);
+    (
+        ViewerClip {
+            outbound,
+            inbound,
+            on,
+        },
+        WindowSide { copied, pasted },
+    )
+}
+
+/// The next text the viewer gave its window to set.
+async fn pasted(window: &mut WindowSide) -> String {
+    tokio::time::timeout(WAIT, window.pasted.changed())
+        .await
+        .expect("in time")
+        .expect("the viewer is there");
+    let text = window.pasted.borrow_and_update();
+    text.as_ref().expect("text").as_str().to_owned()
+}
+
+/// A [`ServicesViewer`] welcomed with `welcome` by a raw host, sharing a
+/// window's clipboard whose switch is `on`.
+async fn viewer_with_clip(welcome: Welcome, on: bool) -> (DuplexStream, Running, WindowSide) {
+    let (host, bound) = raw_host(Some(SvcMsg::Welcome(welcome)), WAIT).await;
+    let (clip, window) = window_clip(on);
+    let running = run_viewer_with(
+        bound.unwrap().0,
+        ViewerLocal {
+            clip: Some(clip),
+            ..temp_local()
+        },
+    );
+    (host, running, window)
+}
+
+/// Test 9, on the viewer: it tells the host its switch at the start and at
+/// each change, and only then; it sends what its window read while the
+/// switch is on, never the same text twice nor one over the host's cap; it
+/// gives its window the host's text only through `ClipText::from_peer`, and
+/// only while the switch is on, and credits every byte of it either way; a
+/// text over the cap it was welcomed with ends the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_viewer_shares_its_windows_clipboard_while_its_switch_is_on() {
+    let mut granted = test_welcome(caps::CHAT | caps::CLIP);
+    granted.clip_max = 64;
+    let (mut host, v, mut window) = viewer_with_clip(granted, true).await;
+    assert_eq!(
+        next(&mut host).await,
+        Some(SvcMsg::ClipSwitch(ClipSwitch { on: true }))
+    );
+    window.copied.send_replace(Some(clip_text("copied here")));
+    assert_eq!(clip_from(&mut host).await, (1, b"copied here".to_vec()));
+    write_msg(&mut host, &clip_credit(11)).await.unwrap();
+    window.copied.send_replace(Some(clip_text("copied here")));
+    window.copied.send_replace(Some(clip_text(&"z".repeat(65))));
+    assert!(
+        quiet(&mut host).await,
+        "the same text, and one over the cap"
+    );
+
+    // An OSC 52 sequence and a bell are removed.
+    send_clip(&mut host, 1, b"\x1b]52;c;evil\x07x").await;
+    assert_eq!(next(&mut host).await, Some(clip_credit(13)));
+    assert_eq!(pasted(&mut window).await, "]52;c;evilx");
+
+    v.ops.send(ViewerOp::ClipSwitch(false)).await.unwrap();
+    assert_eq!(
+        next(&mut host).await,
+        Some(SvcMsg::ClipSwitch(ClipSwitch { on: false }))
+    );
+    v.ops.send(ViewerOp::ClipSwitch(false)).await.unwrap();
+    window.copied.send_replace(Some(clip_text("while off")));
+    send_clip(&mut host, 2, b"not taken").await;
+    assert_eq!(next(&mut host).await, Some(clip_credit(22)));
+    assert!(quiet(&mut host).await, "nothing goes while off");
+    assert!(
+        !window.pasted.has_changed().unwrap(),
+        "nothing set while off"
+    );
+    v.ops.send(ViewerOp::ClipSwitch(true)).await.unwrap();
+    assert_eq!(
+        next(&mut host).await,
+        Some(SvcMsg::ClipSwitch(ClipSwitch { on: true }))
+    );
+
+    write_msg(&mut host, &SvcMsg::ClipStart(ClipStart { seq: 3, len: 65 }))
+        .await
+        .unwrap();
+    assert_eq!(
+        next(&mut host).await,
+        Some(SvcMsg::Close {
+            reason: reason::PROTOCOL
+        })
+    );
+    assert_eq!(
+        v.task.await.unwrap(),
+        ViewerServicesEnd::Refused(reason::PROTOCOL)
+    );
+}
+
+/// Test 9, the viewer's window: its text goes no faster than the host
+/// credits it (`Credit{0}`); once the host turns the clipboard off its
+/// switch is no longer told, nothing more is sent, and clipboard frames
+/// still on their way are skipped, not refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_viewers_text_keeps_to_the_window_and_stops_when_turned_off() {
+    let (mut host, mut v, window) =
+        viewer_with_clip(test_welcome(caps::CHAT | caps::CLIP), true).await;
+    assert_eq!(
+        next(&mut host).await,
+        Some(SvcMsg::ClipSwitch(ClipSwitch { on: true }))
+    );
+    let long = "y".repeat(CHUNK + 10);
+    window.copied.send_replace(Some(clip_text(&long)));
+    let len = u32::try_from(long.len()).unwrap();
+    assert_eq!(
+        next(&mut host).await,
+        Some(SvcMsg::ClipStart(ClipStart { seq: 1, len }))
+    );
+    let Some(SvcMsg::ClipChunk { bytes, .. }) = next(&mut host).await else {
+        panic!("expected a chunk");
+    };
+    assert_eq!(bytes.len(), CHUNK, "the window: 16 KiB");
+    assert!(quiet(&mut host).await);
+    write_msg(&mut host, &clip_credit(CHUNK as u64))
+        .await
+        .unwrap();
+    assert_eq!(
+        next(&mut host).await,
+        Some(SvcMsg::ClipChunk {
+            seq: 1,
+            offset: u32::try_from(CHUNK).unwrap(),
+            bytes: vec![b'y'; 10].into(),
+        })
+    );
+
+    write_msg(
+        &mut host,
+        &SvcMsg::Caps(Caps {
+            caps: caps::CHAT,
+            paused: 0,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v.events.recv().await,
+        Some(ViewerEvent::Caps {
+            caps: caps::CHAT,
+            paused: 0
+        })
+    );
+    v.ops.send(ViewerOp::ClipSwitch(false)).await.unwrap();
+    window.copied.send_replace(Some(clip_text("after")));
+    send_clip(&mut host, 1, b"on its way").await;
+    write_msg(&mut host, &chat("still here")).await.unwrap();
+    assert_eq!(
+        v.events.recv().await,
+        Some(ViewerEvent::Chat(sanitize_peer_text("still here").unwrap()))
+    );
+    assert!(
+        quiet(&mut host).await,
+        "nothing more goes, no credit either"
+    );
+    v.stop.send(()).unwrap();
+    assert_eq!(v.task.await.unwrap(), ViewerServicesEnd::Stopped);
+}
+
+/// Test 9 end to end: a real viewer and host share the clipboard both
+/// ways, once each, and the viewer's switch turns the host's link off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clipboard_text_crosses_between_a_real_viewer_and_host() {
+    let mut rig = rig();
+    let session = start(&rig, 205, SessionMode::Control);
+    session.live(true);
+    let (client, task) = open(&rig.services);
+    let (viewer, welcome) = ServicesViewer::bind(client, &session.binding, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(welcome.caps, caps::ALL);
+    let (clip, mut window) = window_clip(true);
+    let v = run_viewer_with(
+        viewer,
+        ViewerLocal {
+            clip: Some(clip),
+            ..temp_local()
+        },
+    );
+    rig.event(&session.id).await;
+    let mut ends = desk_ends(&rig);
+    active_is(&mut ends, true).await;
+
+    window.copied.send_replace(Some(clip_text("to the host")));
+    assert_eq!(set_on_desktop(&mut ends).await, "to the host");
+    assert_eq!(
+        rig.event(&session.id).await,
+        HostEvent::ClipIn { chars: 11 }
+    );
+    // The desktop reflects it: nothing comes back.
+    ends.from_desktop
+        .send_replace(Some(clip_text("to the host")));
+    ends.from_desktop
+        .send_replace(Some(clip_text("to the viewer")));
+    assert_eq!(pasted(&mut window).await, "to the viewer");
+    assert_eq!(
+        rig.event(&session.id).await,
+        HostEvent::ClipOut { chars: 13 }
+    );
+    v.ops.send(ViewerOp::ClipSwitch(false)).await.unwrap();
+    active_is(&mut ends, false).await;
+
+    v.stop.send(()).unwrap();
+    assert_eq!(v.task.await.unwrap(), ViewerServicesEnd::Stopped);
+    let (code, summary, _) = served(task).await;
+    assert_eq!(code, reason::SESSION_OVER);
+    assert_eq!((summary.clip_in, summary.clip_out), (1, 1));
 }

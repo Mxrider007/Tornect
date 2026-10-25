@@ -56,13 +56,20 @@
 //! `Complete` once the file is in place; the host is told the file sent only
 //! then. At most [`MAX_DOWNLOADS`] files are sent at once per stream.
 //!
+//! Clipboard text crosses both ways (§3.4, §4): each end sends its newest
+//! text as a `ClipStart` and `ClipChunk`s within the same bulk window as
+//! files (the clipboard's flight, credited with `Credit{0}`), at most one
+//! start every [`CLIP_EVERY`], and takes the peer's at most [`CLIP_RATE`] a
+//! second. The host's clipboard link is active only while the viewer's
+//! switch is on (`ClipSwitch`) and the host is not locked; text received
+//! becomes clipboard text only through `ClipText::from_peer`, and neither end
+//! sends again the text it sent or applied last.
+//!
 //! The stream is built in the design's steps: this build has the bind, the
-//! live wait, the caps, chat both ways, uploads, browsing the host's files
-//! and downloads, the viewer's own file browser and the close paths. The
-//! clipboard and the lock pause come with the design's steps 18 and 19;
-//! until then clipboard frames, when granted, are read and left unanswered,
-//! and a granted clipboard link is held inactive, so the backend reads and
-//! sets nothing.
+//! live wait, the caps, chat both ways, the clipboard, uploads, browsing the
+//! host's files and downloads, the viewer's own file browser and the close
+//! paths. The lock pause and the host user's turn-off come with the
+//! design's step 19.
 //!
 //! [`MediaHost`]: crate::MediaHost
 
@@ -75,6 +82,7 @@ use tornect_proto::services::caps;
 
 pub mod browse;
 pub mod chat;
+mod clip;
 mod download;
 mod host;
 mod listing;
@@ -93,6 +101,7 @@ pub use browse::{
     Access, EntryKind, EntryView, ListingView, system_denied, tornect_denied, windows_drive_root,
 };
 pub use chat::{CHAT_BURST, CHAT_RATE, ChatText, sanitize_peer_text};
+pub use clip::{CLIP_BURST, CLIP_EVERY, CLIP_RATE, ViewerClip};
 pub use host::{ServicesHost, ServicesOutcome, refuse};
 pub use listing::LIST_RATE;
 pub use reader::ReaderCounts;
@@ -344,6 +353,18 @@ pub enum HostEvent {
     },
     /// The viewer wrote, sanitised ([`sanitize_peer_text`]).
     Chat(ChatText),
+    /// The viewer put text on this computer's clipboard: "They put text on
+    /// this computer's clipboard (`chars` characters)". Never the text.
+    ClipIn {
+        /// Its length in characters.
+        chars: usize,
+    },
+    /// Text copied on this computer went to the viewer: "Copied text was
+    /// sent to them (`chars` characters)". Never the text.
+    ClipOut {
+        /// Its length in characters.
+        chars: usize,
+    },
     /// A transfer started, moved on or ended. An upload is told once the
     /// inbox took it (refusals before that are not), at each credit, and at
     /// its end; its `Done` carries the stored, sanitised name, the one
@@ -397,7 +418,8 @@ pub struct ServicesSummary {
     pub chat_in: u32,
     /// Chat messages sent.
     pub chat_out: u32,
-    /// Messages from the viewer dropped: over a rate, or with nothing to
-    /// show once sanitised.
+    /// Messages and clipboard texts from the viewer dropped: over a rate,
+    /// or with nothing to show or apply once checked (a clipboard text that
+    /// is not UTF-8, holds a NUL, or holds only control characters).
     pub dropped: u32,
 }

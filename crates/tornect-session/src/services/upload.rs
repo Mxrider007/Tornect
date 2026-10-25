@@ -177,8 +177,27 @@ impl HostUploads {
         Ok(())
     }
 
-    /// The viewer's `Data`.
-    pub(crate) fn data(&mut self, xfer: u32, offset: u64, bytes: Vec<u8>) -> Result<(), u16> {
+    /// Bytes of uploads that arrived and were not yet credited: what the
+    /// viewer holds in its window for them.
+    fn in_flight(&self) -> u64 {
+        self.running.values().map(|u| u.arrived - u.credited).sum()
+    }
+
+    /// Whether the viewer keeps to its window with `extra` bytes of its
+    /// clipboard text in flight beside its uploads'.
+    pub(crate) fn admits(&self, extra: u64) -> bool {
+        self.inflow.admits(self.in_flight().saturating_add(extra))
+    }
+
+    /// The viewer's `Data`; `extra` bytes of its clipboard text are in its
+    /// window as well.
+    pub(crate) fn data(
+        &mut self,
+        xfer: u32,
+        offset: u64,
+        bytes: Vec<u8>,
+        extra: u64,
+    ) -> Result<(), u16> {
         let Some(up) = self.running.get_mut(&xfer) else {
             return late(&self.ids, xfer);
         };
@@ -187,8 +206,7 @@ impl HostUploads {
             return Err(reason::PROTOCOL);
         }
         up.arrived += len;
-        let arrived: u64 = self.running.values().map(|u| u.arrived - u.credited).sum();
-        if !self.inflow.admits(arrived) {
+        if !self.admits(extra) {
             return Err(reason::PROTOCOL);
         }
         let chunk = self.chunk;

@@ -19,7 +19,7 @@ The library crates (`arti-client`, `tor-hsservice`, …) use their own 0.x numbe
 | `hmac` / `hkdf` | 0.13.0 | — | Key derivation for M1/M2 (digest 0.11 line). | none | 2026-08-28 | crates.io |
 | `data-encoding` | 2.11.1 | — | RFC 4648 base32 for onion addresses and device IDs. | none | 2026-08-28 | crates.io |
 | `getrandom` | 0.4.3 | `std`, `sys_rng` | OS RNG for key seeds (`getrandom::fill`). `sys_rng` selects the platform backend in 0.4. | none | 2026-08-28 | crate source `src/lib.rs` |
-| `zeroize` | 1.9.0 | `derive` | Wipe seeds/secrets on drop; also clipboard text (`tornect-input`'s `ClipText`, and since 2026-10-25 `tornect-capture`'s portal clipboard read buffer on Linux). | none | 2026-08-28 | crates.io |
+| `zeroize` | 1.9.0 | `derive` | Wipe seeds/secrets on drop; also clipboard text (`tornect-input`'s `ClipText`, and since 2026-10-25 `tornect-capture`'s portal clipboard read buffer on Linux and `tornect-session`'s services stream, whose clipboard text arriving is held and wiped in `Zeroizing` buffers: one more edge, no package added). | none | 2026-08-28 | crates.io |
 | `subtle` | 2.6.1 | — | Constant-time comparisons for pinned keys / proofs. | none | 2026-08-28 | crates.io |
 | `serde` / `serde_json` | 1.0.229 / 1.0.151 | `derive` | Config, session log, JSON CLI output. | none | 2026-08-28 | crates.io |
 | `toml` | 1.1.4 | — | `config.toml`, trusted-devices file. | none | 2026-08-28 | crates.io |

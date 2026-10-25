@@ -27,8 +27,10 @@
 //!    `Close{ENDED_BY_HOST}`), capture stops (`Close{CAPTURE_STOPPED}`), the
 //!    viewer closes or breaks the protocol (`Close{PROTOCOL}`, or the
 //!    reader's `Close{NOT_OFFERED}` for a frame never granted), or the
-//!    stream fails. Chat and uploads into the inbox are served (the upload
-//!    protocol: [`super::upload`]). When the viewer's input is lost
+//!    stream fails. Chat, the clipboard (its link active only while the
+//!    viewer's switch is on: [`super::clip`]), uploads into the inbox (the
+//!    upload protocol: [`super::upload`]), listings and downloads are
+//!    served. When the viewer's input is lost
 //!    mid-session the clipboard and files are turned off for good (running
 //!    uploads get `Cancel{TURNED_OFF}`, then `Caps`; the link is dropped;
 //!    their frames decoded before that are dropped, an `Offer` included),
@@ -58,12 +60,14 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{mpsc, watch};
 use tornect_input::clipboard::ClipboardLink;
 use tornect_proto::services::{
-    CHUNK, Caps, Chat, MAX_BULK_WINDOW, MAX_CHAT_BYTES, MAX_CLIP, MAX_FILE, MAX_INBOX_CHARS, Side,
-    SvcError, SvcMsg, Welcome, caps, read_bind, reason, write_msg,
+    CHUNK, CLIP_CHUNK_HEAD, Caps, Chat, ClipSwitch, MAX_BULK_WINDOW, MAX_CHAT_BYTES, MAX_CLIP,
+    MAX_FILE, MAX_INBOX_CHARS, Side, SvcError, SvcMsg, Welcome, caps, read_bind, reason, ty,
+    write_msg,
 };
 use tornect_signal::fsm::host::LiveSession;
 
 use super::chat::{self, ChatGate, ChatText, sanitize_peer_text};
+use super::clip::{ClipInflow, ClipSender, HostClip, Started, text_of};
 use super::download::{HostDownloadParts, HostDownloads};
 use super::listing::HostListings;
 use super::reader::{CapState, Inbound, ReadEnd, ReaderCounts, read_frames};
@@ -496,7 +500,7 @@ impl ServicesHost {
             mut capture,
             mut input,
             caps,
-            mut link,
+            link,
             clipboard_refused,
             welcome,
             inbox,
@@ -529,6 +533,17 @@ impl ServicesHost {
         });
         let (listings, mut listed) =
             HostListings::new(Arc::clone(&self.env.access), outbox.clone(), &self.limits);
+        // The clipboard's texts go within the same window as the downloads.
+        let (clip_sent_tx, mut clip_sent) = mpsc::unbounded_channel();
+        let sender = link.as_ref().map(|_| {
+            ClipSender::spawn(
+                Arc::clone(&window),
+                outbox.clone(),
+                self.limits.chunk.clamp(1, CHUNK),
+                Some(clip_sent_tx),
+            )
+        });
+        let clip = HostClip::new(link, sender, ClipInflow::new(welcome.clip_max, chat::now()));
         #[cfg(test)]
         let listings = listings.with_hook(self.env.list_hook.clone());
         // The first frame: nothing else is queued yet.
@@ -559,6 +574,7 @@ impl ServicesHost {
             uploads,
             downloads,
             listings,
+            clip,
         };
         // The `Close` reason, and whether to write it (not to a viewer that
         // closed, nor on a stream that failed).
@@ -570,8 +586,6 @@ impl ServicesHost {
                     match changed.map(|()| *capture.borrow_and_update()) {
                         Ok(CaptureState::Live { input: false }) if input => {
                             input = false;
-                            // The clipboard goes with the viewer's input.
-                            link = None;
                             if let Some(code) = served.input_lost() {
                                 break (code, true);
                             }
@@ -608,10 +622,21 @@ impl ServicesHost {
                         break (code, true);
                     }
                 }
+                text = served.clip.desktop() => served.clip.copied(text),
+                Some(chars) = clip_sent.recv() => {
+                    served.summary.clip_out = served.summary.clip_out.saturating_add(1);
+                    self.observer.event(&session_id, HostEvent::ClipOut { chars });
+                }
                 Some(inbound) = inbound.recv() => match inbound {
                     Inbound::Frame(msg) => {
                         if let Some(ended) = served.on_frame(msg) {
                             break ended;
+                        }
+                    }
+                    Inbound::Skipped { ty, len } => {
+                        served.clip.inflow.skipped(ty, len);
+                        if let Err(code) = served.clip_read() {
+                            break (code, true);
                         }
                     }
                     Inbound::End(ReadEnd::Eof) => break (reason::BY_VIEWER, false),
@@ -625,6 +650,7 @@ impl ServicesHost {
             mut uploads,
             mut downloads,
             mut listings,
+            clip,
             ..
         } = served;
 
@@ -636,7 +662,9 @@ impl ServicesHost {
         uploads.stop();
         downloads.stop(code);
         listings.stop();
-        drop(link);
+        // The link goes (its backend stops, and clears what it set), and
+        // with its sender the task sending the clipboard's text.
+        drop(clip);
         reader.abort();
         let _ = writer.close(write_close.then_some(code)).await;
         let settled = uploads.join(&mut reports, self.limits.workers_wait).await;
@@ -650,6 +678,8 @@ impl ServicesHost {
             reason = code,
             chat_in = summary.chat_in,
             chat_out = summary.chat_out,
+            clip_in = summary.clip_in,
+            clip_out = summary.clip_out,
             files_in = summary.files_in,
             bytes_in = summary.bytes_in,
             files_out = summary.files_out,
@@ -701,6 +731,8 @@ struct Served<'a> {
     uploads: HostUploads,
     downloads: HostDownloads,
     listings: HostListings,
+    /// The desktop's clipboard, and the viewer's texts arriving.
+    clip: HostClip,
 }
 
 impl Served<'_> {
@@ -711,13 +743,25 @@ impl Served<'_> {
             // Decoded before its caps were turned off (the viewer's input
             // was lost), and queued: dropped, as the reader now skips it. A
             // dropped `Offer` takes no id and starts nothing; the viewer
-            // ended its uploads when it heard the caps.
+            // ended its uploads when it heard the caps. A clipboard frame
+            // counts as skipped, so that its bytes are still credited.
             tracing::trace!(
                 session = %self.session_id,
                 ty = msg.ty(),
                 "a services frame queued before its caps were turned off was dropped"
             );
-            return None;
+            return match &msg {
+                SvcMsg::ClipStart(_) => {
+                    self.clip.inflow.skipped(ty::CLIP_START, 0);
+                    None
+                }
+                SvcMsg::ClipChunk { bytes, .. } => {
+                    let len = CLIP_CHUNK_HEAD + bytes.len();
+                    self.clip.inflow.skipped(ty::CLIP_CHUNK, len);
+                    self.clip_read().err().map(|code| (code, true))
+                }
+                _ => None,
+            };
         }
         match msg {
             SvcMsg::Chat(Chat { text }) => {
@@ -749,7 +793,7 @@ impl Served<'_> {
                 bytes,
             } => self
                 .uploads
-                .data(xfer, offset, bytes)
+                .data(xfer, offset, bytes, self.clip.inflow.owed())
                 .err()
                 .map(|code| (code, true)),
             SvcMsg::Done(done) => self.uploads.done(done).err().map(|code| (code, true)),
@@ -774,9 +818,7 @@ impl Served<'_> {
             }
             SvcMsg::Credit { xfer, upto } => {
                 let credited = if xfer == CLIPBOARD {
-                    // The host's clipboard text (the design's step 18):
-                    // nothing of it is sent yet, so only a credit of nothing
-                    // is in range.
+                    // The host's clipboard text.
                     self.window
                         .credit(CLIPBOARD, upto)
                         .map_err(|_| reason::PROTOCOL)
@@ -797,16 +839,91 @@ impl Served<'_> {
                     .err()
                     .map(|code| (code, true))
             }
-            // The clipboard is served from the design's step 18 on; until
-            // then a granted frame of its is read and left unanswered.
+            SvcMsg::ClipSwitch(ClipSwitch { on }) => {
+                self.clip.switch(on);
+                None
+            }
+            SvcMsg::ClipStart(start) => {
+                match self
+                    .clip
+                    .inflow
+                    .start(start, self.clip.active(), chat::now())
+                {
+                    Ok(Started::OverRate) => {
+                        self.summary.dropped = self.summary.dropped.saturating_add(1);
+                        None
+                    }
+                    Ok(Started::Taken | Started::NotWanted) => None,
+                    Err(code) => Some((code, true)),
+                }
+            }
+            SvcMsg::ClipChunk { seq, offset, bytes } => {
+                let whole = match self.clip.inflow.chunk(seq, offset, &bytes) {
+                    Ok(whole) => whole,
+                    Err(code) => return Some((code, true)),
+                };
+                if let Err(code) = self.clip_read() {
+                    return Some((code, true));
+                }
+                if let Some(whole) = whole {
+                    match text_of(whole) {
+                        Some(text) => {
+                            if let Some(chars) = self.clip.apply(text) {
+                                self.summary.clip_in = self.summary.clip_in.saturating_add(1);
+                                self.observer
+                                    .event(self.session_id, HostEvent::ClipIn { chars });
+                            }
+                        }
+                        None => self.summary.dropped = self.summary.dropped.saturating_add(1),
+                    }
+                }
+                None
+            }
+            // Frames only the host sends never get here: the reader ends the
+            // stream at their header.
             other => {
                 tracing::trace!(
                     session = %self.session_id,
                     ty = other.ty(),
-                    "services frame not served by this build"
+                    "services frame not served"
                 );
                 None
             }
+        }
+    }
+
+    /// The viewer's clipboard bytes were read (decoded or skipped): they
+    /// must be within its window beside its uploads', and are credited
+    /// (`Credit{0}`) unless a lock withholds every credit until it ends, or
+    /// the viewer can no longer read a credit (its clipboard and uploads
+    /// turned off), when they are written off.
+    fn clip_read(&mut self) -> Result<(), u16> {
+        if !self.uploads.admits(self.clip.inflow.owed()) {
+            return Err(reason::PROTOCOL);
+        }
+        self.credit_clip()
+    }
+
+    /// Credit the viewer's clipboard bytes read, unless a lock withholds
+    /// credits; written off when the viewer can no longer read a credit.
+    fn credit_clip(&mut self) -> Result<(), u16> {
+        if self.state.paused() != 0 {
+            return Ok(());
+        }
+        let readable = self.state.left() & (caps::CLIP | caps::UPLOAD) != 0;
+        match self.clip.inflow.credit() {
+            Some(upto) if readable => {
+                if self.outbox.ctrl(SvcMsg::Credit {
+                    xfer: CLIPBOARD,
+                    upto,
+                }) {
+                    Ok(())
+                } else {
+                    // The viewer stopped reading (§3.4).
+                    Err(reason::PROTOCOL)
+                }
+            }
+            _ => Ok(()),
         }
     }
 
@@ -840,6 +957,8 @@ impl Served<'_> {
     /// the viewer hears in a `Caps`. `Some` with the `Close` reason when
     /// nothing is left, or the viewer stopped reading.
     fn input_lost(&mut self) -> Option<u16> {
+        // The clipboard goes with the viewer's input: the link is dropped.
+        self.clip.turn_off();
         let before = self.state.left();
         let left = self.state.turn_off(caps::PAUSABLE);
         tracing::info!(

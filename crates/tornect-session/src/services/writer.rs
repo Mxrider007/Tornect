@@ -5,8 +5,9 @@
 //! 1. `close`: the stream's end, which drops whatever is still queued;
 //! 2. `ctrl` ([`CTRL_DEPTH`], never awaited: a full queue means the peer
 //!    stopped reading, and the stream ends with `Close{PROTOCOL}`):
-//!    `Welcome`, `Refused`, `Caps`, `Chat`, `Offer`, `Accepted`, `Sending`,
-//!    `Complete`, `Cancel`, `Credit`, `ListFailed`;
+//!    `Welcome`, `Refused`, `Caps`, `Chat`, `ClipSwitch`, `Offer`,
+//!    `Accepted`, `Sending`, `Complete`, `Cancel`, `Credit`, `Get`, `List`,
+//!    `ListFailed`;
 //! 3. `list` ([`LIST_DEPTH`], awaited): `Listing` pages, one at a time;
 //! 4. `clip` and `data` ([`BULK_DEPTH`] each, awaited): `ClipStart`,
 //!    `ClipChunk` and `Data`, which a sender queues only once its bulk window
@@ -39,9 +40,6 @@ pub(crate) const LAST_WRITE: Duration = Duration::from_secs(5);
 pub(crate) struct Outbox {
     ctrl: mpsc::Sender<SvcMsg>,
     list: mpsc::Sender<SvcMsg>,
-    // The clipboard queue is fed by the design's step 18; the writer drains
-    // it already.
-    #[cfg_attr(not(test), allow(dead_code))]
     clip: mpsc::Sender<SvcMsg>,
     data: mpsc::Sender<SvcMsg>,
 }
@@ -60,8 +58,8 @@ impl Outbox {
         self.list.try_send(msg).is_ok()
     }
 
-    /// Queue a clipboard frame, waiting for room.
-    #[cfg(test)]
+    /// Queue a clipboard frame, waiting for room; `false` when the writer
+    /// is gone.
     pub(crate) async fn clip(&self, msg: SvcMsg) -> bool {
         self.clip.send(msg).await.is_ok()
     }

@@ -39,6 +39,7 @@ use tornect_signal::consent::SessionToken;
 
 use super::browse::{Access, ListingView, LocalFiles};
 use super::chat::{self, ChatGate, ChatText, sanitize_peer_text};
+use super::clip::{ClipInflow, ClipSender, ViewerClip, ViewerClipSync, text_of};
 use super::download::{DownloadsFolder, ViewerDownloads};
 use super::listing::{Answer, ViewerListings};
 use super::reader::{CapState, Inbound, ReadEnd, read_frames};
@@ -46,7 +47,7 @@ use super::store::{FreeSpaceFn, Inbox, InboxLimits, unknown_free_space};
 use super::transfer::{Ids, RowIds, TransferRow, ViewerShared, late};
 use super::upload::ViewerUploads;
 use super::window::{CLIPBOARD, Window};
-use super::writer::spawn_writer;
+use super::writer::{Outbox, spawn_writer};
 use super::{ServicesLimits, ServicesPolicy};
 
 /// Decoded frames held between the viewer's reader and its loop.
@@ -76,6 +77,9 @@ pub struct ViewerLocal {
     /// `read_timeout`, `max_entries`, `list_timeout`, `max_handles`,
     /// `recheck_free_every` and `workers_wait` count here.
     pub limits: ServicesLimits,
+    /// The window's clipboard (§4.3); `None`: this window shares no
+    /// clipboard, and the host is never asked to.
+    pub clip: Option<ViewerClip>,
 }
 
 impl Default for ViewerLocal {
@@ -91,6 +95,7 @@ impl Default for ViewerLocal {
             max_file: policy.max_file,
             keep_free: policy.keep_free,
             limits: ServicesLimits::default(),
+            clip: None,
         }
     }
 }
@@ -102,6 +107,7 @@ impl std::fmt::Debug for ViewerLocal {
             .field("access", &self.access)
             .field("max_file", &self.max_file)
             .field("keep_free", &self.keep_free)
+            .field("clip", &self.clip)
             .finish_non_exhaustive()
     }
 }
@@ -173,6 +179,9 @@ pub enum ServicesBindError {
 pub enum ViewerOp {
     /// Write to the host's user.
     Chat(ChatText),
+    /// The window's "Clipboard" switch: off means neither direction (the
+    /// host deactivates its link), on shares it again.
+    ClipSwitch(bool),
     /// Send the file at this path to the host's inbox (a file dropped on
     /// the window). It is reported as a [`ViewerEvent::Transfer`] row under
     /// an id of its own; without `UPLOAD` the row fails at once with
@@ -339,6 +348,7 @@ where
             max_file,
             keep_free,
             limits,
+            clip: window_clip,
         } = local;
         let state = Arc::new(CapState::new(welcome.caps));
         let (outbox, mut writer) = spawn_writer(wr);
@@ -384,6 +394,15 @@ where
             welcome.bulk_window,
         );
         let mut remote = ViewerListings::new(outbox.clone(), limits.max_entries);
+        let clip_granted = welcome.caps & caps::CLIP != 0;
+        let sender = (clip_granted && window_clip.is_some())
+            .then(|| ClipSender::spawn(Arc::clone(&window), outbox.clone(), chunk, None));
+        let mut clip = ViewerClipSync::new(
+            window_clip,
+            clip_granted,
+            sender,
+            ClipInflow::new(welcome.clip_max, chat::now()),
+        );
         let ids = shared.ids;
         let emit = |event: ViewerEvent| {
             if events.try_send(event).is_err() {
@@ -391,6 +410,12 @@ where
             }
         };
         tokio::pin!(stop);
+        // The window's switch, which the host waits for before its link
+        // goes active. The control queue is empty yet, so it takes it unless
+        // the writer is gone already, which ends the loop at once.
+        if let Some(msg) = clip.first() {
+            let _ = outbox.ctrl(msg);
+        }
         let (end, close) = loop {
             // `Err(code)`: the stream ends with `Close{code}`.
             let step: Result<(), u16> = tokio::select! {
@@ -411,6 +436,9 @@ where
                             );
                         }
                         state.turn_off(!news.caps);
+                        if news.caps & caps::CLIP == 0 {
+                            clip.turned_off();
+                        }
                         if news.caps & caps::UPLOAD == 0 {
                             uploads.turned_off();
                         }
@@ -441,9 +469,7 @@ where
                     Inbound::Frame(SvcMsg::Accepted(accepted)) => uploads.accepted(accepted),
                     Inbound::Frame(SvcMsg::Credit { xfer, upto }) => {
                         if xfer == CLIPBOARD {
-                            // The viewer's clipboard text (the design's step
-                            // 18): nothing of it is sent yet, so only a
-                            // credit of nothing is in range.
+                            // The viewer's clipboard text.
                             window.credit(CLIPBOARD, upto).map_err(|_| reason::PROTOCOL)
                         } else {
                             uploads.credit(xfer, upto)
@@ -463,7 +489,7 @@ where
                         xfer,
                         offset,
                         bytes,
-                    }) => downloads.data(xfer, offset, bytes),
+                    }) => downloads.data(xfer, offset, bytes, clip.inflow.owed()),
                     Inbound::Frame(SvcMsg::Done(done)) => downloads.done(done),
                     Inbound::Frame(SvcMsg::Listing(listing)) => {
                         remote.listing(&listing).map(|answer| match answer {
@@ -482,9 +508,29 @@ where
                             Answer::Page(_) | Answer::Stale => {}
                         })
                     }
-                    // The clipboard is served from the design's step 18 on.
+                    Inbound::Frame(SvcMsg::ClipStart(start)) => clip
+                        .inflow
+                        .start(start, clip.wants(), chat::now())
+                        .map(drop),
+                    Inbound::Frame(SvcMsg::ClipChunk { seq, offset, bytes }) => {
+                        match clip.inflow.chunk(seq, offset, &bytes) {
+                            Ok(whole) => clip_read(&mut clip, &downloads, state.left(), &outbox)
+                                .map(|()| {
+                                    if let Some(text) = whole.and_then(text_of) {
+                                        clip.apply(text);
+                                    }
+                                }),
+                            Err(code) => Err(code),
+                        }
+                    }
+                    Inbound::Skipped { ty, len } => {
+                        clip.inflow.skipped(ty, len);
+                        clip_read(&mut clip, &downloads, state.left(), &outbox)
+                    }
+                    // Frames only the viewer sends never get here: the reader
+                    // ends the stream at their header.
                     Inbound::Frame(other) => {
-                        tracing::trace!(ty = other.ty(), "services frame not served by this build");
+                        tracing::trace!(ty = other.ty(), "services frame not served");
                         Ok(())
                     }
                     Inbound::End(ReadEnd::Eof | ReadEnd::Io) => break (ViewerServicesEnd::Io, None),
@@ -504,6 +550,10 @@ where
                         }),
                         None => {}
                     }
+                    Ok(())
+                }
+                text = clip.window() => {
+                    clip.copied(text);
                     Ok(())
                 }
                 Some(job) = reports.jobs.recv() => uploads.on_job(job),
@@ -526,6 +576,11 @@ where
                             Err(reason::PROTOCOL)
                         }
                     }
+                    ViewerOp::ClipSwitch(on) => match clip.switch(on) {
+                        // The host stopped reading (§3.4).
+                        Some(msg) => outbox.ctrl(msg).then_some(()).ok_or(reason::PROTOCOL),
+                        None => Ok(()),
+                    },
                     ViewerOp::UploadPath(path) => {
                         uploads.upload_path(path, state.left() & caps::UPLOAD != 0);
                         Ok(())
@@ -593,6 +648,35 @@ where
             emit(ViewerEvent::Closed(ended));
         }
         end
+    }
+}
+
+/// The host's clipboard bytes were read (decoded or skipped): they must be
+/// within its window beside its downloads', and are credited (`Credit{0}`),
+/// or written off when the host can no longer read a credit (`left` holds
+/// neither the clipboard nor browsing).
+fn clip_read(
+    clip: &mut ViewerClipSync,
+    downloads: &ViewerDownloads,
+    left: u16,
+    outbox: &Outbox,
+) -> Result<(), u16> {
+    if !downloads.admits(clip.inflow.owed()) {
+        return Err(reason::PROTOCOL);
+    }
+    match clip.inflow.credit() {
+        Some(upto) if left & (caps::CLIP | caps::BROWSE) != 0 => {
+            if outbox.ctrl(SvcMsg::Credit {
+                xfer: CLIPBOARD,
+                upto,
+            }) {
+                Ok(())
+            } else {
+                // The host stopped reading (§3.4).
+                Err(reason::PROTOCOL)
+            }
+        }
+        _ => Ok(()),
     }
 }
 
