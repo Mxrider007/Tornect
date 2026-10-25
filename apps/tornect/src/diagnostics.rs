@@ -4,7 +4,8 @@
 //! device name, no path, no onion address, no label, no host or account
 //! name: it is given neither of the last two, and it keeps no path of the
 //! home it reads); [`report`] writes them as lines. `tornect doctor` stays as
-//! it is.
+//! it is. The monitors are said by number, size and place only (the
+//! monitors design §2): never a monitor's name.
 
 use tornect_core::keystore::{FileSecretStore, KeystoreKind, SecretStore};
 use tornect_core::session_log::SessionLog;
@@ -24,6 +25,10 @@ pub struct Facts {
     pub session: Option<(&'static str, Vec<&'static str>)>,
     /// How a shared session would capture this screen.
     pub capture: &'static str,
+    /// The monitors a session could switch between, as `tornect doctor`
+    /// lists them; `None` where capture lists none (Wayland, where the
+    /// desktop's dialog chooses the screen, and no capture at all).
+    pub screens: Option<Screens>,
     /// How the Tor client reaches the network.
     pub bridges: &'static str,
     /// The way into the Tor network that worked last ("none" before one did).
@@ -38,6 +43,16 @@ pub struct Facts {
     pub keystore: &'static str,
     /// How many lines the session log holds; `None`: it could not be read.
     pub log_lines: Option<usize>,
+}
+
+/// The monitors of this desktop as the report says them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Screens {
+    /// Listed: each one's number, size, place and whether it is the main one.
+    Listed(Vec<tornect_capture::Monitor>),
+    /// They could not be listed. Why is left out: the reason may name the
+    /// display.
+    Unknown,
 }
 
 /// The session types the report names.
@@ -72,12 +87,17 @@ pub fn gather(paths: &Paths, cfg: &Config) -> Facts {
                 .collect(),
         )
     });
-    let capture = match tornect_session::DesktopBackend::detect() {
+    let desktop = tornect_session::DesktopBackend::detect();
+    let capture = match desktop {
         tornect_session::DesktopBackend::Wayland => "the desktop portal and PipeWire",
         tornect_session::DesktopBackend::X11 => "X11",
         tornect_session::DesktopBackend::Gdi => "GDI",
         tornect_session::DesktopBackend::Unavailable(_) => "unavailable",
     };
+    let screens = crate::tor_cmd::desktop_monitors(&desktop).map(|listed| match listed {
+        Ok(monitors) => Screens::Listed(monitors),
+        Err(_) => Screens::Unknown,
+    });
     let bridges = match cfg.tor.bridges {
         tornect_core::config::BridgeMode::Auto => "automatic",
         tornect_core::config::BridgeMode::Off => "direct only",
@@ -101,6 +121,7 @@ pub fn gather(paths: &Paths, cfg: &Config) -> Facts {
         system: (std::env::consts::OS, std::env::consts::ARCH),
         session,
         capture,
+        screens,
         bridges,
         worked_last: tornect_signal::tor::last_good(paths).map_or("none", |r| r.as_str()),
         lyrebird: tornect_signal::tor::find_lyrebird(cfg.tor.pt_path.as_deref()).is_ok(),
@@ -134,8 +155,16 @@ pub fn report(facts: &Facts) -> String {
         };
         lines.push(format!("Desktop session: {kind}; desktop: {desktops}"));
     }
+    lines.push(format!("Screen capture: {}", facts.capture));
+    match &facts.screens {
+        Some(Screens::Listed(monitors)) => lines.push(format!(
+            "Screens: {}",
+            crate::tor_cmd::monitors_text(monitors)
+        )),
+        Some(Screens::Unknown) => lines.push("Screens: unknown".to_owned()),
+        None => {}
+    }
     lines.extend([
-        format!("Screen capture: {}", facts.capture),
         format!("Tor bridges: {}", facts.bridges),
         format!("Worked last: {}", facts.worked_last),
         format!(
@@ -228,5 +257,61 @@ mod tests {
         ] {
             assert!(!code.contains(asked), "the report's code reads {asked}");
         }
+    }
+
+    /// The monitors design §2: after the capture line the report says the
+    /// monitors a session could switch between by number, size and place,
+    /// as `tornect doctor` does, or that they could not be listed (never
+    /// why: the reason may name the display); nothing where capture lists
+    /// none (Wayland, where the desktop's dialog chooses).
+    #[test]
+    fn the_report_says_the_screens_by_number_size_and_place() {
+        use tornect_capture::Monitor;
+        use tornect_input::Rect;
+        let facts = Facts {
+            version: "0.1.0",
+            protocol: 1,
+            system: ("linux", "x86_64"),
+            session: None,
+            capture: "X11",
+            screens: None,
+            bridges: "automatic",
+            worked_last: "none",
+            lyrebird: false,
+            host_identity: false,
+            device_identity: false,
+            keystore: "none",
+            log_lines: Some(0),
+        };
+        assert!(!report(&facts).contains("Screens"), "{}", report(&facts));
+        let listed = Facts {
+            screens: Some(Screens::Listed(vec![
+                Monitor {
+                    id: 1,
+                    primary: false,
+                    rect: Rect::new(-1920, 0, 1920, 1080),
+                },
+                Monitor {
+                    id: 2,
+                    primary: true,
+                    rect: Rect::new(0, 0, 2560, 1440),
+                },
+            ])),
+            ..facts.clone()
+        };
+        let text = report(&listed);
+        assert!(
+            text.contains(
+                "Screen capture: X11\nScreens: 2 (1 1920x1080-1920+0, 2 2560x1440+0+0 main)\nTor \
+                 bridges"
+            ),
+            "{text}"
+        );
+        let unknown = Facts {
+            screens: Some(Screens::Unknown),
+            ..facts
+        };
+        let text = report(&unknown);
+        assert!(text.contains("\nScreens: unknown\n"), "{text}");
     }
 }

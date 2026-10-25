@@ -183,14 +183,22 @@ pub(crate) fn capture_lines(paths: &Paths, desktop: &DesktopBackend) -> Vec<Stri
 /// desktop's units (physical pixels on Windows and X11). `None` where
 /// capture lists none: on Wayland the desktop's dialog chooses the screen.
 pub(crate) fn screens_line(desktop: &DesktopBackend) -> Option<String> {
-    let listed = match desktop {
+    desktop_monitors(desktop).map(|listed| screens_text(&listed))
+}
+
+/// The monitors of this desktop as a session would number them, on X11 and
+/// Windows; `None` where capture lists none (Wayland: the desktop's dialog
+/// chooses the screen).
+pub(crate) fn desktop_monitors(
+    desktop: &DesktopBackend,
+) -> Option<Result<Vec<tornect_capture::Monitor>, tornect_capture::CaptureError>> {
+    match desktop {
         #[cfg(target_os = "linux")]
-        DesktopBackend::X11 => tornect_capture::x11::desktop_monitors(),
+        DesktopBackend::X11 => Some(tornect_capture::x11::desktop_monitors()),
         #[cfg(windows)]
-        DesktopBackend::Gdi => tornect_capture::gdi::desktop_monitors(),
-        _ => return None,
-    };
-    Some(screens_text(&listed))
+        DesktopBackend::Gdi => Some(tornect_capture::gdi::desktop_monitors()),
+        _ => None,
+    }
 }
 
 /// `listed` as the `screens:` line says it: `screens: 2 (1 2560x1440+0+0
@@ -200,25 +208,29 @@ fn screens_text(
     listed: &Result<Vec<tornect_capture::Monitor>, tornect_capture::CaptureError>,
 ) -> String {
     match listed {
-        Ok(monitors) => {
-            let each: Vec<String> = monitors
-                .iter()
-                .map(|m| {
-                    format!(
-                        "{} {}x{}{:+}{:+}{}",
-                        m.id,
-                        m.rect.width,
-                        m.rect.height,
-                        m.rect.x,
-                        m.rect.y,
-                        if m.primary { " main" } else { "" }
-                    )
-                })
-                .collect();
-            format!("screens: {} ({})", monitors.len(), each.join(", "))
-        }
+        Ok(monitors) => format!("screens: {}", monitors_text(monitors)),
         Err(e) => format!("screens: unknown ({e})"),
     }
+}
+
+/// `monitors` by number, size and place: `2 (1 2560x1440+0+0 main, 2
+/// 1920x1080+2560+0)`. Never a monitor's name.
+pub(crate) fn monitors_text(monitors: &[tornect_capture::Monitor]) -> String {
+    let each: Vec<String> = monitors
+        .iter()
+        .map(|m| {
+            format!(
+                "{} {}x{}{:+}{:+}{}",
+                m.id,
+                m.rect.width,
+                m.rect.height,
+                m.rect.x,
+                m.rect.y,
+                if m.primary { " main" } else { "" }
+            )
+        })
+        .collect();
+    format!("{} ({})", monitors.len(), each.join(", "))
 }
 
 /// `tornect tor-check [--bridges …]`: reach the Tor network the way `host` and
