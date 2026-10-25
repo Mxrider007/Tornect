@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use directories::{BaseDirs, UserDirs};
 
 use crate::error::{CoreError, Result};
+use crate::files;
 use crate::keystore::create_private_dir;
 
 /// Environment variable that overrides every directory with one root.
@@ -173,9 +174,42 @@ impl Paths {
     /// persisted "until revoked"). With it, a later session shares the screen
     /// and takes input without the desktop asking again, so it is a 0600 file
     /// here and never logged; deleting it makes the desktop ask again.
+    ///
+    /// This is the token of the request without the portal clipboard, the
+    /// request every host makes while `[services] wayland_clipboard` is off
+    /// (the default); [`Paths::portal_restore_token_for`] picks the file for
+    /// either request.
     #[must_use]
     pub fn portal_restore_token(&self) -> PathBuf {
         self.state_dir.join("portal-restore-token")
+    }
+
+    /// The restore token of the portal request this host makes: with the
+    /// clipboard (`[services] wayland_clipboard` on; design `services` §4.2)
+    /// a token of its own, `portal-restore-token-2`, because a token made
+    /// without `RequestClipboard` does not cover a request with it; without
+    /// it, [`Paths::portal_restore_token`] unchanged. One file per request,
+    /// so a token is only ever restored for the request that made it.
+    #[must_use]
+    pub fn portal_restore_token_for(&self, clipboard: bool) -> PathBuf {
+        if clipboard {
+            self.state_dir.join("portal-restore-token-2")
+        } else {
+            self.portal_restore_token()
+        }
+    }
+
+    /// Restore tokens the request this host makes never restores, deleted at
+    /// host start so no unused grant stays on disk: with the clipboard, the
+    /// token of the request without it; without the clipboard, none, so a
+    /// host with the switch off keeps and uses its token as before.
+    #[must_use]
+    pub fn retired_portal_tokens(&self, clipboard: bool) -> Vec<PathBuf> {
+        if clipboard {
+            vec![self.portal_restore_token()]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Append-only local audit log of session events.
@@ -184,7 +218,11 @@ impl Paths {
         self.log_dir.join("sessions.log")
     }
 
-    /// Create every directory with private permissions.
+    /// Create every directory with private permissions, and mark each of
+    /// the four as Tornect's own with [`files::PRIVATE_MARKER`] (an empty
+    /// `0600` file, written once and then left as it is), so a host never
+    /// lists or serves any Tornect home, another `TORNECT_HOME` included
+    /// (design `services` §5.2).
     pub fn ensure(&self) -> Result<()> {
         for dir in [
             &self.config_dir,
@@ -193,6 +231,7 @@ impl Paths {
             &self.log_dir,
         ] {
             create_private_dir(dir)?;
+            files::mark_private(dir)?;
         }
         create_private_dir(&self.keys_dir())?;
         Ok(())
@@ -247,9 +286,31 @@ mod tests {
             PathBuf::from("/tmp/tornect-test/state/portal-restore-token")
         );
         assert_eq!(
+            p.portal_restore_token_for(true),
+            PathBuf::from("/tmp/tornect-test/state/portal-restore-token-2")
+        );
+        assert_eq!(
             p.arti_cache_dir(),
             PathBuf::from("/tmp/tornect-test/cache/arti")
         );
+    }
+
+    /// With `[services] wayland_clipboard` off (the default) the restore
+    /// token is the file and path it always was, and nothing is retired;
+    /// with it on, the request with the clipboard has its own file and
+    /// retires the old one, never its own.
+    #[test]
+    fn the_restore_token_is_unchanged_while_the_clipboard_switch_is_off() {
+        let p = Paths::from_home("/tmp/tornect-test");
+        let today = PathBuf::from("/tmp/tornect-test/state/portal-restore-token");
+        assert_eq!(p.portal_restore_token(), today);
+        assert_eq!(p.portal_restore_token_for(false), today);
+        assert!(p.retired_portal_tokens(false).is_empty());
+        let with_clipboard = p.portal_restore_token_for(true);
+        assert_ne!(with_clipboard, today);
+        assert_eq!(with_clipboard.parent(), today.parent());
+        assert_eq!(p.retired_portal_tokens(true), [today]);
+        assert!(!p.retired_portal_tokens(true).contains(&with_clipboard));
     }
 
     #[test]
@@ -269,6 +330,25 @@ mod tests {
         p.ensure().unwrap();
         assert!(p.keys_dir().is_dir());
         assert!(p.log_dir.is_dir());
+        for (_, dir) in p.all() {
+            let marker = dir.join(files::PRIVATE_MARKER);
+            assert_eq!(std::fs::read(&marker).unwrap(), b"", "{}", marker.display());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(&marker).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600);
+            }
+        }
+        assert!(!p.keys_dir().join(files::PRIVATE_MARKER).exists());
+        // Every start: a marker already there is left as it is.
+        let marker = p.state_dir.join(files::PRIVATE_MARKER);
+        let at = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        p.ensure().unwrap();
+        assert_eq!(std::fs::metadata(&marker).unwrap().modified().unwrap(), at);
+        std::fs::remove_file(&marker).unwrap();
+        p.ensure().unwrap();
+        assert!(marker.is_file(), "written again at the next start");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

@@ -1,8 +1,9 @@
 //! Tornect core: identities, keys, configuration, keystore and telemetry.
 //!
 //! This crate performs no networking and no `unsafe`; its only I/O is the local
-//! state directory. Every other Tornect crate depends on it and it depends on
-//! none of them (see `docs/PLAN.md` §B.1).
+//! state directory and the user's folders that [`files`] writes into. Every
+//! other Tornect crate depends on it and it depends on none of them (see
+//! `docs/PLAN.md` §B.1).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -10,6 +11,7 @@
 pub mod address_book;
 pub mod config;
 pub mod error;
+pub mod files;
 pub mod id;
 pub mod invite;
 pub mod keys;
