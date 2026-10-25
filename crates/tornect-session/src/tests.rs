@@ -1699,6 +1699,13 @@ async fn next_set_quality(host: &mut DuplexStream) -> u8 {
     }
 }
 
+/// The monitors design §5.4.2: a source lists as many monitors as the
+/// media stream's `Monitors` can carry.
+#[test]
+fn a_layout_lists_as_many_monitors_as_the_stream_carries() {
+    assert_eq!(tornect_capture::MAX_MONITORS, tornect_proto::MAX_MONITORS);
+}
+
 /// The quality design §4.1 and §6.6: a `Binding` asks for Balanced unless
 /// told otherwise, and `with_quality` names the preset in the `Bind`'s last
 /// byte, outside the MAC (the bind MAC is the same for every preset), in a

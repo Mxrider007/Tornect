@@ -7,10 +7,17 @@
 //! Every source hands out tightly packed BGRx pictures, the format
 //! `tornect-codec` encodes without a conversion. `unsafe` is allowed only at
 //! FFI edges, each block with a `// SAFETY:` comment.
+//!
+//! A source that can show one of several monitors describes them in a
+//! [`Layout`] and switches with [`VideoSource::select`] (decision M1-75, the
+//! monitors design §5.4): the layout says which monitor the picture shows,
+//! and its [`View`] where that picture lies on the desktop the injector
+//! addresses, so the host maps the viewer's pointer onto exactly that.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 // Only the X11 grab lacks a cursor; GDI draws its own with `DrawIconEx`.
@@ -18,6 +25,10 @@ use std::time::{Duration, Instant};
 mod cursor;
 #[cfg(windows)]
 pub mod gdi;
+// Which monitor a desktop source shows; pure logic, tested on every system.
+// Unused outside its tests until a source chooses a monitor with it.
+#[cfg_attr(not(test), allow(dead_code))]
+mod monitors;
 // GDI's way through a secure Windows screen; tested on every system.
 #[cfg(any(windows, test))]
 mod outage;
@@ -29,6 +40,47 @@ pub mod wayland;
 pub mod x11;
 
 pub use synthetic::TestCard;
+pub use tornect_input::{Ratio, Rect, View};
+
+/// The most monitors a [`Layout`] lists (the media stream's
+/// `tornect_proto::MAX_MONITORS`).
+pub const MAX_MONITORS: usize = 16;
+
+/// One monitor a source can show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Monitor {
+    /// `1..=n`, in the order of the layout: by x, then by y.
+    pub id: u8,
+    /// The desktop's primary monitor (at most one in a layout).
+    pub primary: bool,
+    /// Where it lies on the desktop, in the desktop's units: physical pixels
+    /// of the Windows virtual desktop, pixels of the X11 root, logical
+    /// pixels on Wayland (a size of 0×0 when it is not known).
+    pub rect: Rect,
+}
+
+/// What a source is asked to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    /// Every monitor at once, in one picture.
+    All,
+    /// The monitor with this [`Monitor::id`].
+    Monitor(u8),
+}
+
+/// What a source's monitors are and what its picture shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layout {
+    /// The monitors, numbered 1..n by position; at most [`MAX_MONITORS`].
+    pub monitors: Vec<Monitor>,
+    /// The source can show all of them at once (only with two or more).
+    pub all: bool,
+    /// What the picture shows.
+    pub shown: Selection,
+    /// Where that picture lies, for the injector: on GDI and X11 a
+    /// [`View::Rect`] whose `shown` is the even rectangle the picture shows.
+    pub view: View,
+}
 
 /// One captured picture: tightly packed BGRx rows, `4 × width × height` bytes.
 #[derive(Clone, PartialEq, Eq)]
@@ -67,6 +119,10 @@ pub enum CaptureError {
     /// The source failed while running.
     #[error("capture failed: {0}")]
     Failed(String),
+    /// A selection named a monitor the source does not have, or all of them
+    /// (0) where it cannot show them at once.
+    #[error("no monitor {0} to show (0 stands for all of them)")]
+    NoMonitor(u8),
 }
 
 /// A source of screen pictures.
@@ -86,4 +142,22 @@ pub trait VideoSource: Send {
     /// gave out: a source may keep it to put a later picture in, rather than
     /// allocate one per picture. The default lets go of it.
     fn recycle(&mut self, _bgrx: Vec<u8>) {}
+
+    /// The monitors, and what the picture [`Self::next_frame`] returned last
+    /// shows; `None` for a source with nothing to choose (the default).
+    fn layout(&self) -> Option<Layout> {
+        None
+    }
+
+    /// Show `selection` from the next picture on: after `Ok`, the next
+    /// picture [`Self::next_frame`] returns is of the new selection.
+    /// [`CaptureError::NoMonitor`] for a monitor the last layout does not
+    /// list, or all of them where it does not offer that. It may block, at
+    /// most 10 s, and returns within 100 ms of `stop` being set. The default
+    /// refuses: the source shows one picture.
+    fn select(&mut self, _selection: Selection, _stop: &AtomicBool) -> Result<(), CaptureError> {
+        Err(CaptureError::Unavailable(
+            "this source shows one picture".to_owned(),
+        ))
+    }
 }
