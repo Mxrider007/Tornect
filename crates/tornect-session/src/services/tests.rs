@@ -219,6 +219,7 @@ fn rig_on(
     let env = ServicesEnv {
         inbox: inbox.then(|| home.path().join("Tornect")),
         inbox_words: INBOX_WORDS.to_owned(),
+        free_space: Arc::new(|_: &std::path::Path| Ok(u64::MAX / 2)),
     };
     let services = Arc::new(ServicesHost::new(
         Arc::clone(&media),

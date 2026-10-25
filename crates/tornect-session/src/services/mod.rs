@@ -43,6 +43,7 @@ use tornect_proto::services::caps;
 pub mod chat;
 mod host;
 mod reader;
+mod store;
 mod viewer;
 mod writer;
 
@@ -52,6 +53,7 @@ mod tests;
 pub use chat::{CHAT_BURST, CHAT_RATE, ChatText, sanitize_peer_text};
 pub use host::{ServicesHost, ServicesOutcome, refuse};
 pub use reader::ReaderCounts;
+pub use store::{FreeSpaceFn, RECHECK_FREE_EVERY};
 pub use viewer::{
     ServicesBindError, ServicesBinding, ServicesViewer, ViewerEvent, ViewerOp, ViewerServicesEnd,
 };
@@ -150,7 +152,7 @@ impl Default for ServicesLimits {
 }
 
 /// Where the host's services act (§6.1).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct ServicesEnv {
     /// The folder uploads land in (`<Downloads>/Tornect`,
     /// `tornect_core::files::downloads_dir`); `None` when this computer has
@@ -159,6 +161,29 @@ pub struct ServicesEnv {
     /// The inbox in display words, such as "Downloads › Tornect"
     /// (`Welcome.inbox`): never a path.
     pub inbox_words: String,
+    /// The free space of the inbox's disk (`tornect_platform::disk::available`
+    /// on a real host). A file is taken only when the free space can be read.
+    pub free_space: FreeSpaceFn,
+}
+
+impl Default for ServicesEnv {
+    /// No inbox, and no free space known.
+    fn default() -> Self {
+        Self {
+            inbox: None,
+            inbox_words: String::new(),
+            free_space: store::unknown_free_space(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ServicesEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServicesEnv")
+            .field("inbox", &self.inbox.is_some())
+            .field("inbox_words", &self.inbox_words)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What a session may use before the desktop is asked (§2.1): chat when the

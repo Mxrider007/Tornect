@@ -17,6 +17,7 @@ tornect-capture.workspace = true
 tornect-codec.workspace = true
 tornect-audio.workspace = true
 tornect-input.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
