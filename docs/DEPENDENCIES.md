@@ -176,6 +176,12 @@ encrypted store and the IPC message set are `#[cbor(map)]` structs with integer 
 |---|---|---|---|---|---|---|
 | `png` | =0.18.1 | none declared (the crate has no default features) | The stream window's screenshot (`apps/tornect/src/ui/screenshot.rs`): `Encoder::new`, `set_color(Rgba)`, `set_depth(Eight)`, `write_header`, `write_image_data`, `finish`, which write the signature, IHDR, IDAT and IEND and no other chunk unless one is asked for (no text, time or Exif). Already in the tree at this version through egui-winit's clipboard (arboard → image → png): the direct dependency adds one edge to the `tornect` package and no package. MIT OR Apache-2.0 | none | 2026-10-08 on the build VM: `ui::screenshot::tests` read the written file back with the crate's own decoder; `cargo tree --workspace --target all -i png` lists the app | `png-0.18.1/Cargo.toml`, `src/encoder.rs` (`encode_header`); `Cargo.lock` |
 
+## Session services (design `services`, decision M1-76; from 2026-10-25)
+
+| Crate | Version | Features | Why | Build requirements | Verified | Source |
+|---|---|---|---|---|---|---|
+| `minicbor` (existing pin, now also in `tornect-proto`) | =2.3.0 | `std`, `derive` (workspace) | The CBOR bodies of the services stream (`tornect_proto::services`: `Welcome`, `Caps`, `Chat`, the transfer and listing messages) as `#[cbor(map)]` structs with `#[n(k)]` keys, as in `tornect-signal`'s messages: unknown keys skipped, absent `Option`s `None`, `#[cbor(skip_if)]` leaves `Entry.lossy` out when false, `#[cbor(decode_with)]` stops a `Listing` at 1025 entries while decoding, `minicbor::len` (derived `CborLen`) sizes an entry for page cutting, `Decoder::position` refuses trailing bytes. No new crate in the lock: the line it adds to `Cargo.lock` is `tornect-proto`'s dependency list. BlueOak-1.0.0 (allowed in `deny.toml`, decision M1-7) | none | 2026-10-25 (the crate source in `~/.cargo/registry`: `minicbor-derive-0.19.5/src/lib.rs` docs of `skip_if`, `decode_with`, map encoding; `minicbor-2.3.0/src/decode.rs` 428–451, `Vec` decoding pushes without preallocating) | — |
+
 ## Milestone 2+ (verified pins land here as each milestone starts)
 
 See `docs/research/*.md` for the sourced API notes; the consolidated pin table is

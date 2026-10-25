@@ -11,6 +11,8 @@ publish.workspace = true
 [dependencies]
 hkdf.workspace = true
 hmac.workspace = true
+# CBOR bodies of the services stream (`services`), as `tornect-signal`'s messages.
+minicbor.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true

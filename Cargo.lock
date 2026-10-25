@@ -7438,6 +7438,7 @@ version = "0.1.0"
 dependencies = [
  "hkdf 0.13.0",
  "hmac 0.13.0",
+ "minicbor",
  "proptest",
  "sha2 0.11.0",
  "subtle",

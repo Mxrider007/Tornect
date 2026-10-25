@@ -47,6 +47,7 @@
 
 use std::fmt;
 
+use minicbor::{CborLen, Decode, Encode};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use zeroize::{Zeroize as _, Zeroizing};
 
@@ -66,6 +67,43 @@ pub const MAX_CLIP: u32 = 262_144;
 /// The `Bind` frame's length prefix: the type byte, the session id and the
 /// MAC. The host reads exactly this much from an unbound stream.
 pub const BIND_LEN: usize = 1 + SESSION_ID_LEN + 32;
+
+/// Longest chat message, in characters.
+pub const MAX_CHAT_CHARS: usize = 2000;
+
+/// Most lines in a chat message (newlines plus one).
+pub const MAX_CHAT_LINES: usize = 40;
+
+/// Largest `Welcome.chat_max`: [`MAX_CHAT_CHARS`] characters of at most four
+/// UTF-8 bytes each.
+pub const MAX_CHAT_BYTES: usize = 4 * MAX_CHAT_CHARS;
+
+/// Longest file or entry name on the wire, in UTF-8 bytes (display only).
+pub const MAX_NAME_BYTES: usize = 255;
+
+/// Longest `Listing.title`, in UTF-8 bytes (display only; the host cuts a
+/// longer path at the front).
+pub const MAX_TITLE_BYTES: usize = 1024;
+
+/// Longest `Welcome.inbox`, in characters (display words, never a path).
+pub const MAX_INBOX_CHARS: usize = 64;
+
+/// Most entries in one `Listing` page.
+pub const MAX_ENTRIES: usize = 1024;
+
+/// Largest `Welcome.file_max`: 1 TiB, the top of `[services] max_file_mib`.
+pub const MAX_FILE: u64 = 1 << 40;
+
+/// Largest `Welcome.bulk_window` (64 MiB); at least [`CHUNK`].
+pub const MAX_BULK_WINDOW: u32 = 64 << 20;
+
+/// The most a `Listing` body encodes to outside its entries: every field at
+/// its largest and the entries' array header.
+pub const LISTING_HEAD_MAX: usize = 1059;
+
+/// The most bytes a page's entries may encode to ([`encoded_entry_len`]
+/// summed) and the page still fit one frame.
+pub const MAX_PAGE_ENTRIES_BYTES: usize = MAX_SERVICES_FRAME - 1 - LISTING_HEAD_MAX;
 
 /// Which end of the stream sent a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,7 +147,8 @@ pub mod caps {
     pub const UPLOAD: u16 = 0x04;
     /// The viewer lists the host's folders and downloads files.
     pub const BROWSE: u16 = 0x08;
-    /// Every bit this version knows; any other bit is a malformed frame.
+    /// Every bit this version knows; any other bit is a malformed frame, so
+    /// a later host sets a new bit only for a viewer that said it reads it.
     pub const ALL: u16 = CHAT | CLIP | UPLOAD | BROWSE;
     /// What a locked host pauses and what its user can turn off: everything
     /// but chat (design §2.3, §2.5).
@@ -169,6 +208,16 @@ pub mod reason {
     pub const fn known(code: u16) -> bool {
         matches!(code, BAD_BIND..=NOT_LIVE)
     }
+}
+
+/// What an [`Entry`] of a `Listing` is.
+pub mod kind {
+    /// A folder: the viewer can list it.
+    pub const FOLDER: u8 = 1;
+    /// A regular file: it has a size and the viewer can download it.
+    pub const FILE: u8 = 2;
+    /// Anything else, or an entry whose metadata could not be read.
+    pub const OTHER: u8 = 3;
 }
 
 /// Frame types, who sends each one, what each one needs, and the reader's
@@ -407,16 +456,557 @@ impl Bind {
     }
 }
 
+/// Shows the length of a value that must not be printed.
+struct Len(usize);
+
+impl fmt::Debug for Len {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{} bytes>", self.0)
+    }
+}
+
+/// `Ok` if `ok`, else a malformed frame of type `t`.
+fn check(t: u8, ok: bool) -> Result<(), SvcError> {
+    if ok {
+        Ok(())
+    } else {
+        Err(SvcError::Malformed(name(t)))
+    }
+}
+
+/// The host's answer to a good `Bind` once capture is live: what this session
+/// may use, and the limits that apply.
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct Welcome {
+    /// key 0: the granted [`caps`], never 0, only known bits.
+    #[n(0)]
+    pub caps: u16,
+    /// key 1: the longest clipboard text either side sends, at most
+    /// [`MAX_CLIP`]; at least 1 with `CLIP`.
+    #[n(1)]
+    pub clip_max: u32,
+    /// key 2: the largest file in either direction, at most [`MAX_FILE`];
+    /// at least 1 with `UPLOAD` or `BROWSE`.
+    #[n(2)]
+    pub file_max: u64,
+    /// key 3: the bytes the host takes in this session.
+    #[n(3)]
+    pub session_quota: u64,
+    /// key 4: the files the host takes in this session.
+    #[n(4)]
+    pub session_files: u16,
+    /// key 5: the longest chat message in bytes, at most [`MAX_CHAT_BYTES`];
+    /// at least 1 with `CHAT`.
+    #[n(5)]
+    pub chat_max: u16,
+    /// key 6: the bulk window of each direction, `CHUNK..=MAX_BULK_WINDOW`.
+    #[n(6)]
+    pub bulk_window: u32,
+    /// key 7: where uploads land, as display words such as
+    /// "Downloads › Tornect" (never a path), at most [`MAX_INBOX_CHARS`].
+    #[n(7)]
+    pub inbox: String,
+}
+
+impl fmt::Debug for Welcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Welcome")
+            .field("caps", &self.caps)
+            .field("clip_max", &self.clip_max)
+            .field("file_max", &self.file_max)
+            .field("session_quota", &self.session_quota)
+            .field("session_files", &self.session_files)
+            .field("chat_max", &self.chat_max)
+            .field("bulk_window", &self.bulk_window)
+            .field("inbox", &Len(self.inbox.len()))
+            .finish()
+    }
+}
+
+impl Welcome {
+    /// Check the bounds of the design's §3.1.
+    pub fn validate(&self) -> Result<(), SvcError> {
+        let has = |cap: u16| self.caps & cap != 0;
+        check(
+            ty::WELCOME,
+            self.caps != 0
+                && self.caps & !caps::ALL == 0
+                && self.clip_max <= MAX_CLIP
+                && (!has(caps::CLIP) || self.clip_max >= 1)
+                && self.file_max <= MAX_FILE
+                && (!has(caps::UPLOAD | caps::BROWSE) || self.file_max >= 1)
+                && usize::from(self.chat_max) <= MAX_CHAT_BYTES
+                && (!has(caps::CHAT) || self.chat_max >= 1)
+                && (CHUNK as u32..=MAX_BULK_WINDOW).contains(&self.bulk_window)
+                && self.inbox.chars().count() <= MAX_INBOX_CHARS,
+        )
+    }
+}
+
+/// The caps left in this session and the ones a lock pauses now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct Caps {
+    /// key 0: the caps left, only known bits; within `Welcome.caps` and only
+    /// ever fewer (checked by the session).
+    #[n(0)]
+    pub caps: u16,
+    /// key 1: the caps paused, within `caps` and [`caps::PAUSABLE`].
+    #[n(1)]
+    pub paused: u16,
+}
+
+impl Caps {
+    /// Check the bounds of the design's §3.1.
+    pub fn validate(&self) -> Result<(), SvcError> {
+        check(
+            ty::CAPS,
+            self.caps & !caps::ALL == 0 && self.paused & !(self.caps & caps::PAUSABLE) == 0,
+        )
+    }
+}
+
+/// The viewer's clipboard switch: off means neither direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct ClipSwitch {
+    /// key 0: share the clipboard.
+    #[n(0)]
+    pub on: bool,
+}
+
+/// A chat message, plain text; the session sanitises it on receipt and
+/// again before display.
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct Chat {
+    /// key 0: at most [`MAX_CHAT_CHARS`] characters and [`MAX_CHAT_LINES`]
+    /// lines (the session also holds it to `Welcome.chat_max` bytes).
+    #[n(0)]
+    pub text: String,
+}
+
+impl fmt::Debug for Chat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Chat")
+            .field("text", &Len(self.text.len()))
+            .finish()
+    }
+}
+
+impl Chat {
+    /// Check the bounds of the design's §3.1.
+    pub fn validate(&self) -> Result<(), SvcError> {
+        check(
+            ty::CHAT,
+            self.text.len() <= MAX_CHAT_BYTES
+                && self.text.chars().count() <= MAX_CHAT_CHARS
+                && self.text.matches('\n').count() < MAX_CHAT_LINES,
+        )
+    }
+}
+
+/// A clipboard text starts; its `ClipChunk`s follow. A higher `seq` abandons
+/// an unfinished one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct ClipStart {
+    /// key 0: the text's number.
+    #[n(0)]
+    pub seq: u32,
+    /// key 1: its length in UTF-8 bytes, `1..=MAX_CLIP` (and at most
+    /// `Welcome.clip_max`, checked by the session).
+    #[n(1)]
+    pub len: u32,
+}
+
+impl ClipStart {
+    /// Check the bounds of the design's §3.1.
+    pub fn validate(&self) -> Result<(), SvcError> {
+        check(ty::CLIP_START, (1..=MAX_CLIP).contains(&self.len))
+    }
+}
+
+/// The viewer offers a file for the host's inbox.
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct Offer {
+    /// key 0: the transfer, never 0.
+    #[n(0)]
+    pub xfer: u32,
+    /// key 1: the file's name as the viewer has it, at most
+    /// [`MAX_NAME_BYTES`]; the host sanitises it (an empty result is
+    /// `BAD_NAME`, an answer, not a malformed frame).
+    #[n(1)]
+    pub name: String,
+    /// key 2: the exact number of bytes that follow.
+    #[n(2)]
+    pub size: u64,
+}
+
+impl fmt::Debug for Offer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Offer")
+            .field("xfer", &self.xfer)
+            .field("name", &Len(self.name.len()))
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
+impl Offer {
+    /// Check the bounds of the design's §3.1.
+    pub fn validate(&self) -> Result<(), SvcError> {
+        check(
+            ty::OFFER,
+            self.xfer != 0 && self.name.len() <= MAX_NAME_BYTES,
+        )
+    }
+}
+
+/// The host takes an offered file.
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct Accepted {
+    /// key 0: the offer's transfer.
+    #[n(0)]
+    pub xfer: u32,
+    /// key 1: the name the file is stored under, at most [`MAX_NAME_BYTES`].
+    #[n(1)]
+    pub name: String,
+}
+
+impl fmt::Debug for Accepted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Accepted")
+            .field("xfer", &self.xfer)
+            .field("name", &Len(self.name.len()))
+            .finish()
+    }
+}
+
+impl Accepted {
+    /// Check the bounds of the design's §3.1.
+    pub fn validate(&self) -> Result<(), SvcError> {
+        check(
+            ty::ACCEPTED,
+            self.xfer != 0 && self.name.len() <= MAX_NAME_BYTES,
+        )
+    }
+}
+
+/// The viewer asks for a file by a handle a `Listing` gave it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct Get {
+    /// key 0: the transfer, never 0.
+    #[n(0)]
+    pub xfer: u32,
+    /// key 1: the file's handle.
+    #[n(1)]
+    pub handle: u32,
+}
+
+impl Get {
+    /// Check the bounds of the design's §3.1.
+    pub fn validate(&self) -> Result<(), SvcError> {
+        check(ty::GET, self.xfer != 0)
+    }
+}
+
+/// The host sends an asked-for file.
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct Sending {
+    /// key 0: the `Get`'s transfer.
+    #[n(0)]
+    pub xfer: u32,
+    /// key 1: the file's name, at most [`MAX_NAME_BYTES`] (display only).
+    #[n(1)]
+    pub name: String,
+    /// key 2: the exact number of bytes that follow.
+    #[n(2)]
+    pub size: u64,
+}
+
+impl fmt::Debug for Sending {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sending")
+            .field("xfer", &self.xfer)
+            .field("name", &Len(self.name.len()))
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
+impl Sending {
+    /// Check the bounds of the design's §3.1.
+    pub fn validate(&self) -> Result<(), SvcError> {
+        check(
+            ty::SENDING,
+            self.xfer != 0 && self.name.len() <= MAX_NAME_BYTES,
+        )
+    }
+}
+
+/// The sender sent exactly the announced size.
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct Done {
+    /// key 0: the transfer, never 0.
+    #[n(0)]
+    pub xfer: u32,
+    /// key 1: SHA-256 of the bytes sent.
+    #[n(1)]
+    #[cbor(with = "minicbor::bytes")]
+    pub sha256: [u8; 32],
+}
+
+impl fmt::Debug for Done {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Done")
+            .field("xfer", &self.xfer)
+            .field("sha256", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Done {
+    /// Check the bounds of the design's §3.1.
+    pub fn validate(&self) -> Result<(), SvcError> {
+        check(ty::DONE, self.xfer != 0)
+    }
+}
+
+/// The receiver verified the file and put it in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct Complete {
+    /// key 0: the transfer, never 0.
+    #[n(0)]
+    pub xfer: u32,
+}
+
+impl Complete {
+    /// Check the bounds of the design's §3.1.
+    pub fn validate(&self) -> Result<(), SvcError> {
+        check(ty::COMPLETE, self.xfer != 0)
+    }
+}
+
+/// Either end stops a transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct Cancel {
+    /// key 0: the transfer, never 0.
+    #[n(0)]
+    pub xfer: u32,
+    /// key 1: a [`reason`] code.
+    #[n(1)]
+    pub reason: u16,
+}
+
+impl Cancel {
+    /// Check the bounds of the design's §3.1.
+    pub fn validate(&self) -> Result<(), SvcError> {
+        check(ty::CANCEL, self.xfer != 0)
+    }
+}
+
+/// The viewer asks for one page of a folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct List {
+    /// key 0: the request, echoed in the answer.
+    #[n(0)]
+    pub req: u32,
+    /// key 1: the folder's handle; 0 is the places.
+    #[n(1)]
+    pub folder: u32,
+    /// key 2: the index of the page's first entry; 0 for the first page.
+    #[n(2)]
+    pub from: u32,
+}
+
+/// One page of a folder, cut by encoded size ([`encoded_entry_len`]).
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct Listing {
+    /// key 0: the `List`'s request.
+    #[n(0)]
+    pub req: u32,
+    /// key 1: the folder's handle; 0 is the places.
+    #[n(1)]
+    pub folder: u32,
+    /// key 2: the folder for display only, at most [`MAX_TITLE_BYTES`].
+    #[n(2)]
+    pub title: String,
+    /// key 3: the handle of the folder above; absent at the places.
+    #[n(3)]
+    pub parent: Option<u32>,
+    /// key 4: at most [`MAX_ENTRIES`] entries, refused past that while
+    /// decoding.
+    #[n(4)]
+    #[cbor(decode_with = "decode_entries")]
+    pub entries: Vec<Entry>,
+    /// key 5: the index of the next page's first entry; absent on the last
+    /// page. With it the page has entries and `next` counts past them.
+    #[n(5)]
+    pub next: Option<u32>,
+    /// key 6: the folder holds more entries than the host lists.
+    #[n(6)]
+    pub truncated: bool,
+}
+
+impl fmt::Debug for Listing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Listing")
+            .field("req", &self.req)
+            .field("folder", &self.folder)
+            .field("title", &Len(self.title.len()))
+            .field("parent", &self.parent)
+            .field("entries", &self.entries)
+            .field("next", &self.next)
+            .field("truncated", &self.truncated)
+            .finish()
+    }
+}
+
+impl Listing {
+    /// Check the bounds of the design's §3.1, its entries' included.
+    pub fn validate(&self) -> Result<(), SvcError> {
+        let next_ok = self
+            .next
+            .is_none_or(|next| !self.entries.is_empty() && next as usize >= self.entries.len());
+        check(
+            ty::LISTING,
+            self.title.len() <= MAX_TITLE_BYTES
+                && self.entries.len() <= MAX_ENTRIES
+                && (self.folder != 0 || self.parent.is_none())
+                && next_ok
+                && self.entries.iter().all(Entry::valid),
+        )
+    }
+}
+
+/// Decode a `Listing`'s entries, refusing more than [`MAX_ENTRIES`] as soon
+/// as the next one starts.
+fn decode_entries<Ctx>(
+    d: &mut minicbor::Decoder<'_>,
+    _: &mut Ctx,
+) -> Result<Vec<Entry>, minicbor::decode::Error> {
+    let mut entries = Vec::new();
+    for entry in d.array_iter::<Entry>()? {
+        if entries.len() == MAX_ENTRIES {
+            return Err(minicbor::decode::Error::message("too many entries"));
+        }
+        entries.push(entry?);
+    }
+    Ok(entries)
+}
+
+/// One entry of a `Listing`.
+#[derive(Clone, PartialEq, Eq, Encode, Decode, CborLen)]
+#[cbor(map)]
+pub struct Entry {
+    /// key 0: the name for display only, at most [`MAX_NAME_BYTES`]; the
+    /// handle names the real path.
+    #[n(0)]
+    pub name: String,
+    /// key 1: the entry's handle, never 0 (the places).
+    #[n(1)]
+    pub handle: u32,
+    /// key 2: a [`kind`] code.
+    #[n(2)]
+    pub kind: u8,
+    /// key 3: the size in bytes, exactly for a [`kind::FILE`].
+    #[n(3)]
+    pub size: Option<u64>,
+    /// key 4: modified, in seconds since 1970 UTC, when known.
+    #[n(4)]
+    pub mtime: Option<i64>,
+    /// key 5: the name was not valid Unicode and is shown approximately;
+    /// absent when false.
+    #[n(5)]
+    #[cbor(skip_if = "is_false")]
+    pub lossy: bool,
+}
+
+impl fmt::Debug for Entry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Entry")
+            .field("name", &Len(self.name.len()))
+            .field("handle", &self.handle)
+            .field("kind", &self.kind)
+            .field("size", &self.size)
+            .field("mtime", &self.mtime)
+            .field("lossy", &self.lossy)
+            .finish()
+    }
+}
+
+impl Entry {
+    /// Check the bounds of the design's §3.1 (a broken entry makes its
+    /// `Listing` malformed).
+    pub fn validate(&self) -> Result<(), SvcError> {
+        check(ty::LISTING, self.valid())
+    }
+
+    fn valid(&self) -> bool {
+        self.name.len() <= MAX_NAME_BYTES
+            && self.handle != 0
+            && matches!(self.kind, kind::FOLDER | kind::FILE | kind::OTHER)
+            && self.size.is_some() == (self.kind == kind::FILE)
+    }
+}
+
+/// `skip_if` for flags that are absent when false (minicbor passes the
+/// field by reference).
+const fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// The bytes `entry` adds to a `Listing` body: the host cuts pages so that
+/// the entries' sum stays within its page budget (at most
+/// [`MAX_PAGE_ENTRIES_BYTES`]).
+#[must_use]
+pub fn encoded_entry_len(entry: &Entry) -> usize {
+    minicbor::len(entry)
+}
+
+/// A folder could not be listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct ListFailed {
+    /// key 0: the `List`'s request.
+    #[n(0)]
+    pub req: u32,
+    /// key 1: a [`reason`] code.
+    #[n(1)]
+    pub reason: u16,
+}
+
 /// One services message.
 #[derive(Clone, PartialEq, Eq)]
 pub enum SvcMsg {
     /// The viewer binds the stream to a session.
     Bind(Bind),
+    /// What the session may use.
+    Welcome(Welcome),
     /// The host refuses the bind or the services; it closes after this.
     Refused {
         /// A [`reason`] code.
         reason: u16,
     },
+    /// The caps left, and the ones paused.
+    Caps(Caps),
+    /// The viewer's clipboard switch.
+    ClipSwitch(ClipSwitch),
+    /// A chat message.
+    Chat(Chat),
+    /// A clipboard text starts.
+    ClipStart(ClipStart),
     /// Bytes of clipboard text `seq`, contiguous from 0; the text is complete
     /// when `offset` plus the bytes reach its `ClipStart.len`.
     ClipChunk {
@@ -427,6 +1017,14 @@ pub enum SvcMsg {
         /// `1..=CHUNK` bytes, ending at most at [`MAX_CLIP`]; wiped on drop.
         bytes: Zeroizing<Vec<u8>>,
     },
+    /// The viewer offers a file.
+    Offer(Offer),
+    /// The host takes an offered file.
+    Accepted(Accepted),
+    /// The viewer asks for a file.
+    Get(Get),
+    /// The host sends an asked-for file.
+    Sending(Sending),
     /// Bytes of a file, contiguous from 0.
     Data {
         /// The transfer, never 0.
@@ -444,6 +1042,18 @@ pub enum SvcMsg {
         /// Bytes written so far.
         upto: u64,
     },
+    /// The sender sent every byte.
+    Done(Done),
+    /// The receiver verified the file and put it in place.
+    Complete(Complete),
+    /// Either end stops a transfer.
+    Cancel(Cancel),
+    /// The viewer asks for one page of a folder.
+    List(List),
+    /// One page of a folder.
+    Listing(Listing),
+    /// A folder could not be listed.
+    ListFailed(ListFailed),
     /// Orderly end of the stream.
     Close {
         /// A [`reason`] code.
@@ -457,13 +1067,22 @@ impl fmt::Debug for SvcMsg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Bind(bind) => fmt::Debug::fmt(bind, f),
+            Self::Welcome(m) => fmt::Debug::fmt(m, f),
             Self::Refused { reason } => f.debug_struct("Refused").field("reason", reason).finish(),
+            Self::Caps(m) => fmt::Debug::fmt(m, f),
+            Self::ClipSwitch(m) => fmt::Debug::fmt(m, f),
+            Self::Chat(m) => fmt::Debug::fmt(m, f),
+            Self::ClipStart(m) => fmt::Debug::fmt(m, f),
             Self::ClipChunk { seq, offset, bytes } => f
                 .debug_struct("ClipChunk")
                 .field("seq", seq)
                 .field("offset", offset)
-                .field("bytes", &bytes.len())
+                .field("bytes", &Len(bytes.len()))
                 .finish(),
+            Self::Offer(m) => fmt::Debug::fmt(m, f),
+            Self::Accepted(m) => fmt::Debug::fmt(m, f),
+            Self::Get(m) => fmt::Debug::fmt(m, f),
+            Self::Sending(m) => fmt::Debug::fmt(m, f),
             Self::Data {
                 xfer,
                 offset,
@@ -472,13 +1091,19 @@ impl fmt::Debug for SvcMsg {
                 .debug_struct("Data")
                 .field("xfer", xfer)
                 .field("offset", offset)
-                .field("bytes", &bytes.len())
+                .field("bytes", &Len(bytes.len()))
                 .finish(),
             Self::Credit { xfer, upto } => f
                 .debug_struct("Credit")
                 .field("xfer", xfer)
                 .field("upto", upto)
                 .finish(),
+            Self::Done(m) => fmt::Debug::fmt(m, f),
+            Self::Complete(m) => fmt::Debug::fmt(m, f),
+            Self::Cancel(m) => fmt::Debug::fmt(m, f),
+            Self::List(m) => fmt::Debug::fmt(m, f),
+            Self::Listing(m) => fmt::Debug::fmt(m, f),
+            Self::ListFailed(m) => fmt::Debug::fmt(m, f),
             Self::Close { reason } => f.debug_struct("Close").field("reason", reason).finish(),
         }
     }
@@ -490,10 +1115,25 @@ impl SvcMsg {
     pub const fn ty(&self) -> u8 {
         match self {
             Self::Bind(_) => ty::BIND,
+            Self::Welcome(_) => ty::WELCOME,
             Self::Refused { .. } => ty::REFUSED,
+            Self::Caps(_) => ty::CAPS,
+            Self::ClipSwitch(_) => ty::CLIP_SWITCH,
+            Self::Chat(_) => ty::CHAT,
+            Self::ClipStart(_) => ty::CLIP_START,
             Self::ClipChunk { .. } => ty::CLIP_CHUNK,
+            Self::Offer(_) => ty::OFFER,
+            Self::Accepted(_) => ty::ACCEPTED,
+            Self::Get(_) => ty::GET,
+            Self::Sending(_) => ty::SENDING,
             Self::Data { .. } => ty::DATA,
             Self::Credit { .. } => ty::CREDIT,
+            Self::Done(_) => ty::DONE,
+            Self::Complete(_) => ty::COMPLETE,
+            Self::Cancel(_) => ty::CANCEL,
+            Self::List(_) => ty::LIST,
+            Self::Listing(_) => ty::LISTING,
+            Self::ListFailed(_) => ty::LIST_FAILED,
             Self::Close { .. } => ty::CLOSE,
         }
     }
@@ -501,36 +1141,46 @@ impl SvcMsg {
     /// Check every bound of the message's frame (design §3.1); [`Self::decode`]
     /// returns only messages that pass.
     pub fn validate(&self) -> Result<(), SvcError> {
-        let ok = match self {
-            Self::Bind(bind) => {
+        match self {
+            Self::Bind(bind) => check(
+                ty::BIND,
                 bind.session_id.len() == SESSION_ID_LEN
-                    && bind.session_id.bytes().all(|b| b.is_ascii_hexdigit())
-            }
-            Self::ClipChunk { offset, bytes, .. } => {
+                    && bind.session_id.bytes().all(|b| b.is_ascii_hexdigit()),
+            ),
+            Self::Welcome(m) => m.validate(),
+            Self::Caps(m) => m.validate(),
+            Self::Chat(m) => m.validate(),
+            Self::ClipStart(m) => m.validate(),
+            Self::ClipChunk { offset, bytes, .. } => check(
+                ty::CLIP_CHUNK,
                 (1..=CHUNK).contains(&bytes.len())
-                    && u64::from(*offset) + bytes.len() as u64 <= u64::from(MAX_CLIP)
-            }
+                    && u64::from(*offset) + bytes.len() as u64 <= u64::from(MAX_CLIP),
+            ),
+            Self::Offer(m) => m.validate(),
+            Self::Accepted(m) => m.validate(),
+            Self::Get(m) => m.validate(),
+            Self::Sending(m) => m.validate(),
             Self::Data {
                 xfer,
                 offset,
                 bytes,
-            } => {
+            } => check(
+                ty::DATA,
                 *xfer != 0
                     && (1..=CHUNK).contains(&bytes.len())
-                    && offset.checked_add(bytes.len() as u64).is_some()
-            }
-            Self::Refused { .. } | Self::Credit { .. } | Self::Close { .. } => true,
-        };
-        if ok {
-            Ok(())
-        } else {
-            Err(SvcError::Malformed(self.name()))
+                    && offset.checked_add(bytes.len() as u64).is_some(),
+            ),
+            Self::Done(m) => m.validate(),
+            Self::Complete(m) => m.validate(),
+            Self::Cancel(m) => m.validate(),
+            Self::Listing(m) => m.validate(),
+            Self::Refused { .. }
+            | Self::ClipSwitch(_)
+            | Self::Credit { .. }
+            | Self::List(_)
+            | Self::ListFailed(_)
+            | Self::Close { .. } => Ok(()),
         }
-    }
-
-    /// The message's name in errors.
-    const fn name(&self) -> &'static str {
-        name(self.ty())
     }
 
     /// Encode to one frame, length prefix included.
@@ -571,7 +1221,25 @@ impl SvcMsg {
                 out.extend_from_slice(&xfer.to_be_bytes());
                 out.extend_from_slice(&upto.to_be_bytes());
             }
+            Self::Welcome(m) => cbor_into(m, &mut out),
+            Self::Caps(m) => cbor_into(m, &mut out),
+            Self::ClipSwitch(m) => cbor_into(m, &mut out),
+            Self::Chat(m) => cbor_into(m, &mut out),
+            Self::ClipStart(m) => cbor_into(m, &mut out),
+            Self::Offer(m) => cbor_into(m, &mut out),
+            Self::Accepted(m) => cbor_into(m, &mut out),
+            Self::Get(m) => cbor_into(m, &mut out),
+            Self::Sending(m) => cbor_into(m, &mut out),
+            Self::Done(m) => cbor_into(m, &mut out),
+            Self::Complete(m) => cbor_into(m, &mut out),
+            Self::Cancel(m) => cbor_into(m, &mut out),
+            Self::List(m) => cbor_into(m, &mut out),
+            Self::Listing(m) => cbor_into(m, &mut out),
+            Self::ListFailed(m) => cbor_into(m, &mut out),
         }
+        // A sender builds pages within the frame (`encoded_entry_len`); a
+        // larger frame is a caller bug, caught here rather than refused by
+        // the peer.
         debug_assert!(
             out.len() - 4 <= MAX_SERVICES_FRAME,
             "services frame over MAX_SERVICES_FRAME"
@@ -594,12 +1262,17 @@ impl SvcMsg {
         };
         let msg = match t {
             ty::BIND => Self::Bind(Bind::get(body).ok_or_else(malformed)?),
+            ty::WELCOME => Self::Welcome(cbor(t, body)?),
             ty::REFUSED => {
                 exact(2)?;
                 Self::Refused {
                     reason: be_u16(body),
                 }
             }
+            ty::CAPS => Self::Caps(cbor(t, body)?),
+            ty::CLIP_SWITCH => Self::ClipSwitch(cbor(t, body)?),
+            ty::CHAT => Self::Chat(cbor(t, body)?),
+            ty::CLIP_START => Self::ClipStart(cbor(t, body)?),
             ty::CLIP_CHUNK => {
                 let (head, bytes) = body.split_at_checked(8).ok_or_else(malformed)?;
                 Self::ClipChunk {
@@ -608,6 +1281,10 @@ impl SvcMsg {
                     bytes: Zeroizing::new(bytes.to_vec()),
                 }
             }
+            ty::OFFER => Self::Offer(cbor(t, body)?),
+            ty::ACCEPTED => Self::Accepted(cbor(t, body)?),
+            ty::GET => Self::Get(cbor(t, body)?),
+            ty::SENDING => Self::Sending(cbor(t, body)?),
             ty::DATA => {
                 let (head, bytes) = body.split_at_checked(12).ok_or_else(malformed)?;
                 Self::Data {
@@ -623,18 +1300,39 @@ impl SvcMsg {
                     upto: be_u64(&body[4..]),
                 }
             }
+            ty::DONE => Self::Done(cbor(t, body)?),
+            ty::COMPLETE => Self::Complete(cbor(t, body)?),
+            ty::CANCEL => Self::Cancel(cbor(t, body)?),
+            ty::LIST => Self::List(cbor(t, body)?),
+            ty::LISTING => Self::Listing(cbor(t, body)?),
+            ty::LIST_FAILED => Self::ListFailed(cbor(t, body)?),
             ty::CLOSE => {
                 exact(2)?;
                 Self::Close {
                     reason: be_u16(body),
                 }
             }
-            other if ty::direction(other).is_some() => return Err(malformed()),
             other => return Err(SvcError::UnknownType(other)),
         };
         msg.validate()?;
         Ok(msg)
     }
+}
+
+/// Append the CBOR of `body` to `out`.
+fn cbor_into<T: Encode<()>>(body: &T, out: &mut Vec<u8>) {
+    minicbor::encode(body, out)
+        .unwrap_or_else(|_| unreachable!("the derived encoders into a Vec cannot fail"));
+}
+
+/// Decode a CBOR body of type `t` that fills `body` exactly; whatever fails,
+/// a malformed frame of that type (the decoder's message, which could quote
+/// the body, is dropped).
+fn cbor<'b, T: Decode<'b, ()>>(t: u8, body: &'b [u8]) -> Result<T, SvcError> {
+    let mut d = minicbor::Decoder::new(body);
+    let value = d.decode().map_err(|_| SvcError::Malformed(name(t)))?;
+    check(t, d.position() == body.len())?;
+    Ok(value)
 }
 
 /// The name of frame type `t` in errors.
@@ -783,7 +1481,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    pub(super) fn hex(s: &str) -> Vec<u8> {
+    fn hex(s: &str) -> Vec<u8> {
         let s: String = s.split_whitespace().collect();
         (0..s.len())
             .step_by(2)
@@ -799,7 +1497,7 @@ mod tests {
     }
 
     /// One message of each kind, with the bounds at their limits.
-    pub(super) fn samples() -> Vec<SvcMsg> {
+    fn samples() -> Vec<SvcMsg> {
         vec![
             bind(),
             SvcMsg::Refused {
@@ -833,13 +1531,103 @@ mod tests {
             SvcMsg::Close {
                 reason: reason::CAPTURE_STOPPED,
             },
+            SvcMsg::Welcome(welcome()),
+            SvcMsg::Caps(Caps {
+                caps: caps::ALL,
+                paused: caps::PAUSABLE,
+            }),
+            SvcMsg::ClipSwitch(ClipSwitch { on: true }),
+            SvcMsg::Chat(Chat { text: "hi".into() }),
+            SvcMsg::ClipStart(ClipStart { seq: 1, len: 300 }),
+            SvcMsg::Offer(Offer {
+                xfer: 1,
+                name: "a.txt".into(),
+                size: 12,
+            }),
+            SvcMsg::Accepted(Accepted {
+                xfer: 1,
+                name: "a (2).txt".into(),
+            }),
+            SvcMsg::Get(Get {
+                xfer: 2,
+                handle: 70_000,
+            }),
+            SvcMsg::Sending(Sending {
+                xfer: 2,
+                name: "b.bin".into(),
+                size: 1 << 32,
+            }),
+            SvcMsg::Done(Done {
+                xfer: 1,
+                sha256: [0xab; 32],
+            }),
+            SvcMsg::Complete(Complete { xfer: 2 }),
+            SvcMsg::Cancel(Cancel {
+                xfer: 3,
+                reason: reason::TURNED_OFF,
+            }),
+            SvcMsg::List(List {
+                req: 7,
+                folder: 0,
+                from: 0,
+            }),
+            SvcMsg::Listing(listing()),
+            SvcMsg::ListFailed(ListFailed {
+                req: 7,
+                reason: reason::DENIED,
+            }),
         ]
     }
 
+    /// The design's defaults: all four services, 256 KiB of clipboard, 2 GiB
+    /// per file, 8 GiB and 1000 files a session, 8000-byte chat, a 256 KiB
+    /// window.
+    fn welcome() -> Welcome {
+        Welcome {
+            caps: caps::ALL,
+            clip_max: MAX_CLIP,
+            file_max: 2 << 30,
+            session_quota: 8 << 30,
+            session_files: 1000,
+            chat_max: 8000,
+            bulk_window: 256 << 10,
+            inbox: "Downloads › Tornect".into(),
+        }
+    }
+
+    /// A first page of two entries: a folder, and a file whose name was not
+    /// valid Unicode, modified before 1970.
+    fn listing() -> Listing {
+        Listing {
+            req: 7,
+            folder: 5,
+            title: "/home/u".into(),
+            parent: Some(0),
+            entries: vec![
+                Entry {
+                    name: "Docs".into(),
+                    handle: 6,
+                    kind: kind::FOLDER,
+                    size: None,
+                    mtime: None,
+                    lossy: false,
+                },
+                Entry {
+                    name: "r\u{fffd}.txt".into(),
+                    handle: 7,
+                    kind: kind::FILE,
+                    size: Some(10),
+                    mtime: Some(-1),
+                    lossy: true,
+                },
+            ],
+            next: Some(2),
+            truncated: false,
+        }
+    }
+
     /// Read one frame back the way a reader does, ungated.
-    pub(super) async fn read_one<R: AsyncRead + Unpin>(
-        r: &mut R,
-    ) -> Result<Option<SvcMsg>, SvcError> {
+    async fn read_one<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<SvcMsg>, SvcError> {
         let Some(header) = read_header(r).await? else {
             return Ok(None);
         };
@@ -1369,17 +2157,704 @@ mod tests {
             bytes: Zeroizing::new(b"hunter2-secret".to_vec()),
         };
         let printed = format!("{chunk:?}");
-        assert_eq!(printed, "ClipChunk { seq: 1, offset: 0, bytes: 14 }");
+        assert_eq!(
+            printed,
+            "ClipChunk { seq: 1, offset: 0, bytes: <14 bytes> }"
+        );
         let data = SvcMsg::Data {
             xfer: 2,
             offset: 5,
             bytes: b"PRIVATE".to_vec(),
         };
-        assert_eq!(format!("{data:?}"), "Data { xfer: 2, offset: 5, bytes: 7 }");
+        assert_eq!(
+            format!("{data:?}"),
+            "Data { xfer: 2, offset: 5, bytes: <7 bytes> }"
+        );
         let printed = format!("{:?}", bind());
         assert!(!printed.contains("[7, 7"), "{printed}");
         assert!(!printed.contains("07070707"), "{printed}");
         assert!(printed.contains("<redacted>"));
+    }
+
+    /// The CBOR frames byte for byte, recomputed apart from this code by a
+    /// small Python CBOR encoder (definite lengths, shortest integers, keys
+    /// in order): the design's §3.1 table with the defaults of §2.6.
+    #[test]
+    fn the_cbor_frames_match_the_golden_vectors() {
+        let samples = samples();
+        let vectors: [(&SvcMsg, &str); 15] = [
+            (
+                &samples[9],
+                "0000003f 02 a8 000f 011a00040000 021a80000000 031b0000000200000000 \
+                 041903e8 05191f40 061a00040000 0775446f776e6c6f61647320e280ba20546f726e656374",
+            ),
+            (&samples[10], "00000006 04 a2000f010e"),
+            (&samples[11], "00000004 05 a100f5"),
+            (&samples[12], "00000006 10 a100626869"),
+            (&samples[13], "00000008 20 a200010119012c"),
+            (&samples[14], "0000000d 30 a300010165612e747874020c"),
+            (&samples[15], "0000000f 31 a20001016961202832292e747874"),
+            (&samples[16], "0000000a 32 a20002011a00011170"),
+            (
+                &samples[17],
+                "00000015 33 a300020165622e62696e021b0000000100000000",
+            ),
+            (
+                &samples[18],
+                "00000027 36 a20001015820 abababababababababababababababab\
+                 abababababababababababababababab",
+            ),
+            (&samples[19], "00000004 37 a10002"),
+            (&samples[20], "00000006 38 a200030112"),
+            (&samples[21], "00000008 40 a3000701000200"),
+            (
+                &samples[22],
+                "00000037 41 a7 0007 0105 02672f686f6d652f75 0300 0482 \
+                 a30064446f637301060201 \
+                 a6006872efbfbd2e747874 0107 0202 030a 0420 05f5 0502 06f4",
+            ),
+            (&samples[23], "00000006 42 a200070109"),
+        ];
+        for (msg, bytes) in vectors {
+            let bytes = hex(bytes);
+            assert_eq!(msg.encode(), bytes, "{msg:?}");
+            assert_eq!(&SvcMsg::decode(bytes[4], &bytes[5..]).unwrap(), msg);
+        }
+    }
+
+    /// A CBOR body built by hand, for the malformed cases a valid message
+    /// cannot encode.
+    fn cbor_of<T: Encode<()>>(value: &T) -> Vec<u8> {
+        minicbor::to_vec(value).unwrap()
+    }
+
+    /// `body` decodes as a malformed frame of type `t`.
+    #[track_caller]
+    fn assert_malformed(t: u8, body: &[u8]) {
+        let got = SvcMsg::decode(t, body);
+        assert!(
+            matches!(got, Err(SvcError::Malformed(n)) if n == name(t)),
+            "{}: {body:02x?} gave {got:?}",
+            name(t)
+        );
+    }
+
+    /// Every bound of a CBOR body (design §3.1) makes a frame that breaks it
+    /// malformed; each one's limit itself is accepted.
+    #[test]
+    fn the_cbor_bounds_are_checked_when_decoding() {
+        let base = welcome();
+        let broken = [
+            Welcome {
+                caps: 0,
+                ..base.clone()
+            },
+            Welcome {
+                caps: 0x10,
+                ..base.clone()
+            },
+            Welcome {
+                caps: 0x8001,
+                ..base.clone()
+            },
+            Welcome {
+                clip_max: MAX_CLIP + 1,
+                ..base.clone()
+            },
+            Welcome {
+                clip_max: 0,
+                ..base.clone()
+            },
+            Welcome {
+                file_max: MAX_FILE + 1,
+                ..base.clone()
+            },
+            Welcome {
+                file_max: 0,
+                ..base.clone()
+            },
+            Welcome {
+                chat_max: 8001,
+                ..base.clone()
+            },
+            Welcome {
+                chat_max: 0,
+                ..base.clone()
+            },
+            Welcome {
+                bulk_window: CHUNK as u32 - 1,
+                ..base.clone()
+            },
+            Welcome {
+                bulk_window: MAX_BULK_WINDOW + 1,
+                ..base.clone()
+            },
+            Welcome {
+                inbox: "x".repeat(65),
+                ..base.clone()
+            },
+        ];
+        for welcome in &broken {
+            assert_malformed(ty::WELCOME, &cbor_of(welcome));
+            assert!(welcome.validate().is_err());
+        }
+        // A limit is not needed for a cap that is not granted; the limits
+        // themselves are accepted.
+        let fine = [
+            Welcome {
+                caps: caps::CHAT,
+                clip_max: 0,
+                file_max: 0,
+                ..base.clone()
+            },
+            Welcome {
+                caps: caps::CLIP,
+                chat_max: 0,
+                ..base.clone()
+            },
+            Welcome {
+                file_max: MAX_FILE,
+                chat_max: 8000,
+                inbox: "›".repeat(64),
+                ..base.clone()
+            },
+            Welcome {
+                bulk_window: CHUNK as u32,
+                clip_max: 1,
+                ..base.clone()
+            },
+            Welcome {
+                bulk_window: MAX_BULK_WINDOW,
+                inbox: String::new(),
+                ..base
+            },
+        ];
+        for welcome in fine {
+            let msg = SvcMsg::Welcome(welcome);
+            assert_eq!(
+                SvcMsg::decode(ty::WELCOME, &msg.encode()[5..]).unwrap(),
+                msg
+            );
+        }
+
+        for (caps, paused) in [
+            (0x10, 0),
+            (caps::ALL, caps::CHAT),
+            (caps::CHAT | caps::CLIP, caps::UPLOAD),
+            (0, caps::CLIP),
+        ] {
+            assert_malformed(ty::CAPS, &cbor_of(&Caps { caps, paused }));
+        }
+        for (caps, paused) in [
+            (0, 0),
+            (caps::CLIP, caps::CLIP),
+            (caps::ALL, caps::PAUSABLE),
+        ] {
+            let msg = SvcMsg::Caps(Caps { caps, paused });
+            assert_eq!(SvcMsg::decode(ty::CAPS, &msg.encode()[5..]).unwrap(), msg);
+        }
+
+        let long = Chat {
+            text: "é".repeat(MAX_CHAT_CHARS + 1),
+        };
+        let lines = Chat {
+            text: "a\n".repeat(MAX_CHAT_LINES),
+        };
+        assert_malformed(ty::CHAT, &cbor_of(&long));
+        assert_malformed(ty::CHAT, &cbor_of(&lines));
+        for text in [
+            "😀".repeat(MAX_CHAT_CHARS),
+            format!("{}a", "a\n".repeat(MAX_CHAT_LINES - 1)),
+            String::new(),
+        ] {
+            let msg = SvcMsg::Chat(Chat { text });
+            assert_eq!(SvcMsg::decode(ty::CHAT, &msg.encode()[5..]).unwrap(), msg);
+        }
+        assert_eq!(MAX_CHAT_CHARS * 4, MAX_CHAT_BYTES);
+
+        for len in [0, MAX_CLIP + 1, u32::MAX] {
+            assert_malformed(ty::CLIP_START, &cbor_of(&ClipStart { seq: 1, len }));
+        }
+        let name = "n".repeat(MAX_NAME_BYTES + 1);
+        assert_malformed(
+            ty::OFFER,
+            &cbor_of(&Offer {
+                xfer: 0,
+                name: "a".into(),
+                size: 1,
+            }),
+        );
+        assert_malformed(
+            ty::OFFER,
+            &cbor_of(&Offer {
+                xfer: 1,
+                name: name.clone(),
+                size: 1,
+            }),
+        );
+        assert_malformed(
+            ty::ACCEPTED,
+            &cbor_of(&Accepted {
+                xfer: 0,
+                name: "a".into(),
+            }),
+        );
+        assert_malformed(
+            ty::ACCEPTED,
+            &cbor_of(&Accepted {
+                xfer: 1,
+                name: name.clone(),
+            }),
+        );
+        assert_malformed(
+            ty::SENDING,
+            &cbor_of(&Sending {
+                xfer: 0,
+                name: "a".into(),
+                size: 1,
+            }),
+        );
+        assert_malformed(
+            ty::SENDING,
+            &cbor_of(&Sending {
+                xfer: 1,
+                name: name.clone(),
+                size: 1,
+            }),
+        );
+        assert_malformed(ty::GET, &cbor_of(&Get { xfer: 0, handle: 1 }));
+        assert_malformed(
+            ty::DONE,
+            &cbor_of(&Done {
+                xfer: 0,
+                sha256: [0; 32],
+            }),
+        );
+        assert_malformed(ty::COMPLETE, &cbor_of(&Complete { xfer: 0 }));
+        assert_malformed(ty::CANCEL, &cbor_of(&Cancel { xfer: 0, reason: 1 }));
+        // An offer's name that sanitises to nothing is the host's `BAD_NAME`
+        // answer, not a malformed frame; 255 bytes is the limit.
+        for name in [String::new(), "../".into(), "é".repeat(127) + "x"] {
+            let msg = SvcMsg::Offer(Offer {
+                xfer: 1,
+                name,
+                size: 0,
+            });
+            assert_eq!(SvcMsg::decode(ty::OFFER, &msg.encode()[5..]).unwrap(), msg);
+        }
+    }
+
+    /// The bounds of a `Listing` and of its entries.
+    #[test]
+    fn the_listing_bounds_are_checked_when_decoding() {
+        let base = listing();
+        let entry = base.entries[1].clone();
+        let broken_entries = [
+            Entry {
+                handle: 0,
+                ..entry.clone()
+            },
+            Entry {
+                kind: 0,
+                ..entry.clone()
+            },
+            Entry {
+                kind: 4,
+                ..entry.clone()
+            },
+            Entry {
+                size: None,
+                ..entry.clone()
+            },
+            Entry {
+                kind: kind::FOLDER,
+                ..entry.clone()
+            },
+            Entry {
+                kind: kind::OTHER,
+                ..entry.clone()
+            },
+            Entry {
+                name: "n".repeat(MAX_NAME_BYTES + 1),
+                ..entry.clone()
+            },
+        ];
+        for broken in broken_entries {
+            assert!(broken.validate().is_err(), "{broken:?}");
+            let listing = Listing {
+                entries: vec![broken],
+                next: None,
+                ..base.clone()
+            };
+            assert_malformed(ty::LISTING, &cbor_of(&listing));
+        }
+        let broken = [
+            Listing {
+                title: "t".repeat(MAX_TITLE_BYTES + 1),
+                ..base.clone()
+            },
+            // The places have no parent.
+            Listing {
+                folder: 0,
+                parent: Some(0),
+                ..base.clone()
+            },
+            // A next page after an empty page, or before this one's end.
+            Listing {
+                entries: Vec::new(),
+                next: Some(5),
+                ..base.clone()
+            },
+            Listing {
+                next: Some(1),
+                ..base.clone()
+            },
+            Listing {
+                next: Some(0),
+                ..base.clone()
+            },
+        ];
+        for listing in broken {
+            assert_malformed(ty::LISTING, &cbor_of(&listing));
+        }
+        // 1025 entries are refused while decoding; 1024 are fine.
+        let small = Entry {
+            name: String::new(),
+            handle: 1,
+            kind: kind::OTHER,
+            size: None,
+            mtime: None,
+            lossy: false,
+        };
+        let mut many = Listing {
+            entries: vec![small; MAX_ENTRIES + 1],
+            next: None,
+            ..base.clone()
+        };
+        assert_malformed(ty::LISTING, &cbor_of(&many));
+        many.entries.pop();
+        let msg = SvcMsg::Listing(many);
+        assert_eq!(
+            SvcMsg::decode(ty::LISTING, &msg.encode()[5..]).unwrap(),
+            msg
+        );
+        // The places themselves, the last page of a folder, an empty folder.
+        for listing in [
+            Listing {
+                folder: 0,
+                parent: None,
+                next: None,
+                ..base.clone()
+            },
+            Listing {
+                next: None,
+                truncated: true,
+                ..base.clone()
+            },
+            Listing {
+                entries: Vec::new(),
+                next: None,
+                ..base
+            },
+        ] {
+            let msg = SvcMsg::Listing(listing);
+            assert_eq!(
+                SvcMsg::decode(ty::LISTING, &msg.encode()[5..]).unwrap(),
+                msg
+            );
+        }
+    }
+
+    /// CBOR that is not exactly one map of the right fields is malformed:
+    /// trailing bytes, a missing field, a wrong type, an integer too wide for
+    /// its field, a byte string of the wrong length, an array, nothing. Unknown
+    /// keys are skipped.
+    #[test]
+    fn malformed_cbor_is_refused_and_unknown_keys_are_skipped() {
+        let offer = hex("a3 0001 0165612e747874 020c");
+        assert!(SvcMsg::decode(ty::OFFER, &offer).is_ok());
+        let cases: [(u8, &str); 11] = [
+            (ty::OFFER, "a3 0001 0165612e747874 020c 00"),
+            (ty::OFFER, "a2 0001 0165612e747874"),
+            (ty::OFFER, "a3 0001 0101 020c"),
+            (ty::OFFER, "a3 0001 0165612e747874 0220"),
+            (ty::OFFER, "83 01 65612e747874 0c"),
+            (ty::OFFER, ""),
+            (ty::CAPS, "a2 001a00010000 0100"),
+            (ty::LIST_FAILED, "a2 0007 011a00010000"),
+            (ty::CLIP_SWITCH, "a1 0001"),
+            (ty::CHAT, "a1 00 62 ff ff"),
+            (ty::LISTING, "a7 0007 0105 0260 0300 0481 a0 0502 06f4"),
+        ];
+        for (t, body) in cases {
+            assert_malformed(t, &hex(body));
+        }
+        // A digest of 31 or 33 bytes.
+        for n in [31u8, 33] {
+            let mut done = hex("a2 0001 0158");
+            done.push(n);
+            done.extend(std::iter::repeat_n(0xab, n.into()));
+            assert_malformed(ty::DONE, &done);
+        }
+        // Keys a later version adds are skipped, before, between and after
+        // the known ones, with any value, as are absent optional keys.
+        let extended = hex("a5 18ff 83010203 0001 0165612e747874 0a 6378797a 020c");
+        assert_eq!(
+            SvcMsg::decode(ty::OFFER, &extended).unwrap(),
+            SvcMsg::decode(ty::OFFER, &offer).unwrap()
+        );
+        let indefinite = hex("bf 0001 0165612e747874 020c ff");
+        assert!(SvcMsg::decode(ty::OFFER, &indefinite).is_ok());
+    }
+
+    /// The largest page fits a frame: the entries of a page cut at
+    /// [`MAX_PAGE_ENTRIES_BYTES`] plus every head field at its largest; the
+    /// design's page budget (60 KiB) is within it; an entry with `lossy` set
+    /// round-trips, and `lossy` unset costs nothing.
+    #[test]
+    fn a_maximum_size_listing_page_round_trips() {
+        const { assert!(60 * 1024 <= MAX_PAGE_ENTRIES_BYTES) };
+        let long = |i: usize| Entry {
+            name: format!("{i:05}{}", "ñ".repeat(125)),
+            handle: u32::MAX - i as u32,
+            kind: kind::FILE,
+            size: Some(u64::MAX),
+            mtime: Some(i64::MIN),
+            lossy: i.is_multiple_of(2),
+        };
+        let mut entries = Vec::new();
+        let mut used = 0;
+        for i in 0.. {
+            let entry = long(i);
+            let n = encoded_entry_len(&entry);
+            assert_eq!(n, cbor_of(&entry).len());
+            if used + n > MAX_PAGE_ENTRIES_BYTES {
+                break;
+            }
+            used += n;
+            entries.push(entry);
+        }
+        let page = Listing {
+            req: u32::MAX,
+            folder: u32::MAX,
+            title: "…".to_owned() + &"t".repeat(MAX_TITLE_BYTES - 3),
+            parent: Some(u32::MAX),
+            next: Some(u32::MAX),
+            truncated: true,
+            entries,
+        };
+        let msg = SvcMsg::Listing(page);
+        let bytes = msg.encode();
+        assert!(
+            bytes.len() - 4 <= MAX_SERVICES_FRAME,
+            "{} bytes",
+            bytes.len()
+        );
+        assert!(bytes.len() - 5 - used <= LISTING_HEAD_MAX);
+        assert_eq!(SvcMsg::decode(ty::LISTING, &bytes[5..]).unwrap(), msg);
+        // LISTING_HEAD_MAX is exact: every head field at its largest and an
+        // entries array header of three bytes (more than 255 entries).
+        let tiny = Entry {
+            name: String::new(),
+            handle: 1,
+            kind: kind::OTHER,
+            size: None,
+            mtime: None,
+            lossy: false,
+        };
+        let SvcMsg::Listing(mut page) = msg else {
+            unreachable!()
+        };
+        page.entries = vec![tiny.clone(); MAX_ENTRIES];
+        let body = cbor_of(&page);
+        assert_eq!(
+            body.len() - MAX_ENTRIES * encoded_entry_len(&tiny),
+            LISTING_HEAD_MAX
+        );
+        // `lossy` false is left out.
+        let shown = Entry {
+            lossy: true,
+            ..tiny.clone()
+        };
+        assert_eq!(encoded_entry_len(&shown), encoded_entry_len(&tiny) + 2);
+    }
+
+    /// `Debug` of every message holds none of its text, its bytes or a
+    /// digest.
+    #[test]
+    fn no_message_debug_holds_its_text() {
+        const SECRET: &str = "SeCrEt";
+        let entry = Entry {
+            name: format!("{SECRET}.txt"),
+            handle: 1,
+            kind: kind::FILE,
+            size: Some(1),
+            mtime: None,
+            lossy: false,
+        };
+        let messages = [
+            SvcMsg::Welcome(Welcome {
+                inbox: SECRET.into(),
+                ..welcome()
+            }),
+            SvcMsg::Chat(Chat {
+                text: SECRET.into(),
+            }),
+            SvcMsg::ClipChunk {
+                seq: 1,
+                offset: 0,
+                bytes: Zeroizing::new(SECRET.into()),
+            },
+            SvcMsg::Offer(Offer {
+                xfer: 1,
+                name: SECRET.into(),
+                size: 1,
+            }),
+            SvcMsg::Accepted(Accepted {
+                xfer: 1,
+                name: SECRET.into(),
+            }),
+            SvcMsg::Sending(Sending {
+                xfer: 1,
+                name: SECRET.into(),
+                size: 1,
+            }),
+            SvcMsg::Data {
+                xfer: 1,
+                offset: 0,
+                bytes: SECRET.into(),
+            },
+            SvcMsg::Done(Done {
+                xfer: 1,
+                sha256: [0xab; 32],
+            }),
+            SvcMsg::Listing(Listing {
+                title: SECRET.into(),
+                entries: vec![entry],
+                next: None,
+                ..listing()
+            }),
+        ];
+        for msg in messages {
+            let printed = format!("{msg:?} {msg:#?}");
+            for leak in [SECRET, "171", "ab, ab", "abab"] {
+                assert!(!printed.contains(leak), "{printed}");
+            }
+            assert!(
+                printed.contains("bytes>") || printed.contains("<redacted>"),
+                "{printed}"
+            );
+        }
+    }
+
+    /// Any valid message of every kind.
+    fn valid_msg() -> impl Strategy<Value = SvcMsg> {
+        let name = || "\\PC{0,40}";
+        let caps_pair = (0..=caps::ALL, 0..=caps::PAUSABLE).prop_map(|(left, paused)| {
+            SvcMsg::Caps(Caps {
+                caps: left,
+                paused: paused & left & caps::PAUSABLE,
+            })
+        });
+        let welcome = (
+            1..=caps::ALL,
+            1..=MAX_CLIP,
+            1..=MAX_FILE,
+            any::<u64>(),
+            any::<u16>(),
+            1..=MAX_CHAT_BYTES as u16,
+            CHUNK as u32..=MAX_BULK_WINDOW,
+            "\\PC{0,64}",
+        )
+            .prop_map(
+                |(
+                    caps,
+                    clip_max,
+                    file_max,
+                    session_quota,
+                    session_files,
+                    chat_max,
+                    bulk_window,
+                    inbox,
+                )| {
+                    SvcMsg::Welcome(Welcome {
+                        caps,
+                        clip_max,
+                        file_max,
+                        session_quota,
+                        session_files,
+                        chat_max,
+                        bulk_window,
+                        inbox,
+                    })
+                },
+            );
+        let entry = (
+            name(),
+            1u32..,
+            1u8..=3,
+            any::<u64>(),
+            any::<Option<i64>>(),
+            any::<bool>(),
+        )
+            .prop_map(|(name, handle, k, size, mtime, lossy)| Entry {
+                name,
+                handle,
+                kind: k,
+                size: (k == kind::FILE).then_some(size),
+                mtime,
+                lossy,
+            });
+        let listing = (
+            any::<u32>(),
+            any::<u32>(),
+            "\\PC{0,64}",
+            any::<Option<u32>>(),
+            proptest::collection::vec(entry, 0..8),
+            any::<Option<u32>>(),
+            any::<bool>(),
+        )
+            .prop_map(|(req, folder, title, parent, entries, next, truncated)| {
+                SvcMsg::Listing(Listing {
+                    req,
+                    folder,
+                    title,
+                    parent: parent.filter(|_| folder != 0),
+                    next: next
+                        .filter(|_| !entries.is_empty())
+                        .map(|n| n.max(entries.len() as u32)),
+                    entries,
+                    truncated,
+                })
+            });
+        prop_oneof![
+            valid_packed(),
+            welcome,
+            caps_pair,
+            any::<bool>().prop_map(|on| SvcMsg::ClipSwitch(ClipSwitch { on })),
+            "\\PC{0,200}".prop_map(|text| SvcMsg::Chat(Chat { text })),
+            (any::<u32>(), 1..=MAX_CLIP)
+                .prop_map(|(seq, len)| SvcMsg::ClipStart(ClipStart { seq, len })),
+            (1u32.., name(), any::<u64>()).prop_map(|(xfer, name, size)| SvcMsg::Offer(Offer {
+                xfer,
+                name,
+                size
+            })),
+            (1u32.., name()).prop_map(|(xfer, name)| SvcMsg::Accepted(Accepted { xfer, name })),
+            (1u32.., any::<u32>()).prop_map(|(xfer, handle)| SvcMsg::Get(Get { xfer, handle })),
+            (1u32.., name(), any::<u64>())
+                .prop_map(|(xfer, name, size)| SvcMsg::Sending(Sending { xfer, name, size })),
+            (1u32.., any::<[u8; 32]>())
+                .prop_map(|(xfer, sha256)| SvcMsg::Done(Done { xfer, sha256 })),
+            (1u32..).prop_map(|xfer| SvcMsg::Complete(Complete { xfer })),
+            (1u32.., any::<u16>())
+                .prop_map(|(xfer, reason)| SvcMsg::Cancel(Cancel { xfer, reason })),
+            (any::<u32>(), any::<u32>(), any::<u32>())
+                .prop_map(|(req, folder, from)| SvcMsg::List(List { req, folder, from })),
+            listing,
+            (any::<u32>(), any::<u16>())
+                .prop_map(|(req, reason)| SvcMsg::ListFailed(ListFailed { req, reason })),
+        ]
     }
 
     /// Any valid hand-packed message.
@@ -1413,9 +2888,17 @@ mod tests {
         ]
     }
 
+    /// Whether a frame type's body is hand-packed (its bytes are canonical).
+    fn packed(t: u8) -> bool {
+        matches!(
+            t,
+            ty::BIND | ty::REFUSED | ty::CLIP_CHUNK | ty::DATA | ty::CREDIT | ty::CLOSE
+        )
+    }
+
     proptest! {
-        /// A valid message decodes back to itself behind a prefix that counts
-        /// its type byte and body.
+        /// A valid hand-packed message decodes back to itself behind a prefix
+        /// that counts its type byte and body.
         #[test]
         fn valid_packed_messages_round_trip(msg in valid_packed()) {
             let bytes = msg.encode();
@@ -1424,16 +2907,56 @@ mod tests {
             prop_assert_eq!(SvcMsg::decode(bytes[4], &bytes[5..]).unwrap(), msg);
         }
 
-        /// `decode` of any type and body returns, never panics; a hand-packed
-        /// frame it accepts encodes back to exactly its bytes.
+        /// A valid message of any kind decodes back to itself behind a prefix
+        /// that counts its type byte and body, within its type's largest body.
+        #[test]
+        fn valid_messages_round_trip(msg in valid_msg()) {
+            let bytes = msg.encode();
+            let len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+            prop_assert_eq!(len, bytes.len() - 4);
+            prop_assert!(len - 1 <= ty::max_body(msg.ty()).unwrap());
+            prop_assert_eq!(SvcMsg::decode(bytes[4], &bytes[5..]).unwrap(), msg);
+        }
+
+        /// `decode` of any type and body returns, never panics. What it
+        /// accepts is valid and decodes back to itself once re-encoded; a
+        /// hand-packed body re-encodes to exactly its bytes.
         #[test]
         fn decoding_any_body_never_panics(
             t in any::<u8>(),
             body in proptest::collection::vec(any::<u8>(), 0..=96),
         ) {
             if let Ok(msg) = SvcMsg::decode(t, &body) {
-                prop_assert_eq!(&msg.encode()[5..], &body[..]);
                 prop_assert!(msg.validate().is_ok());
+                let bytes = msg.encode();
+                if packed(t) {
+                    prop_assert_eq!(&bytes[5..], &body[..]);
+                }
+                prop_assert_eq!(SvcMsg::decode(t, &bytes[5..]).unwrap(), msg);
+            }
+        }
+
+        /// A valid frame with one byte changed, cut or extended decodes to an
+        /// answer, never a panic, and what it accepts is valid.
+        #[test]
+        fn a_damaged_valid_frame_never_panics(
+            msg in valid_msg(),
+            at in any::<proptest::sample::Index>(),
+            byte in any::<u8>(),
+            how in 0u8..3,
+        ) {
+            let mut body = msg.encode().split_off(5);
+            if !body.is_empty() {
+                let i = at.index(body.len());
+                match how {
+                    0 => body[i] = byte,
+                    1 => body.truncate(i),
+                    _ => body.insert(i, byte),
+                }
+            }
+            if let Ok(back) = SvcMsg::decode(msg.ty(), &body) {
+                prop_assert!(back.validate().is_ok());
+                prop_assert_eq!(SvcMsg::decode(back.ty(), &back.encode()[5..]).unwrap(), back);
             }
         }
     }
