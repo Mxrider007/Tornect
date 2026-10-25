@@ -1,10 +1,21 @@
 //! Windows capture through GDI (`docs/research/slice.md` §6): `BitBlt` of the
-//! whole virtual desktop into a top-down 32-bit DIB section, with the cursor
-//! drawn by `DrawIconEx`. DXGI Desktop Duplication is the step after the slice.
+//! monitor shown, or of all of them, out of the virtual desktop into a
+//! top-down 32-bit DIB section, with the cursor drawn by `DrawIconEx`. DXGI
+//! Desktop Duplication is the step after the slice.
 //!
-//! The picture spans the virtual desktop from `SM_XVIRTUALSCREEN` /
-//! `SM_YVIRTUALSCREEN`, the space `tornect-input`'s `SendInput` addresses with
-//! `MOUSEEVENTF_VIRTUALDESK`, so normalized positions pass through unchanged.
+//! **Monitors** (decision M1-75, the monitors design §5.4.6). Every grab
+//! lists the desktop's monitors (`EnumDisplayMonitors`, `GetMonitorInfoW`'s
+//! `rcMonitor`, virtual-screen coordinates, physical pixels once the process
+//! is per-monitor aware) and grabs only the even rectangle of the one shown,
+//! or the monitors' bounding box for all of them; a session opens on the
+//! primary of two or more. A monitor is held by its device name (`szDevice`,
+//! `\\.\DISPLAY1`), which stays in memory: it is never logged or sent.
+//!
+//! The picture's [`View`](crate::View) places that rectangle on the virtual
+//! desktop from `SM_XVIRTUALSCREEN` / `SM_YVIRTUALSCREEN`, the space
+//! `tornect-input`'s `SendInput` addresses with `MOUSEEVENTF_VIRTUALDESK`, so
+//! the host's `Viewport` maps the viewer's pointer onto exactly the monitor
+//! the picture shows.
 //!
 //! Every GDI object is created and released inside one `next_frame` call: GDI
 //! handles are raw pointers (not `Send`), and a capture that owns none across
@@ -18,28 +29,61 @@
 //! screen stays unreadable for a minute.
 #![allow(unsafe_code)]
 
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+use windows_sys::Win32::Foundation::{LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, HBITMAP, HDC, HGDIOBJ, ROP_CODE,
-    ReleaseDC, SRCCOPY, SelectObject,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, EnumDisplayMonitors, GdiFlush, GetDC, GetMonitorInfoW,
+    HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFO, MONITORINFOEXW, ROP_CODE, ReleaseDC, SRCCOPY,
+    SelectObject,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSORINFO, DI_NORMAL, DrawIconEx, GetCursorInfo, GetIconInfo,
-    GetSystemMetrics, ICONINFO, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN,
+    GetSystemMetrics, ICONINFO, MONITORINFOF_PRIMARY, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
+use windows_sys::core::BOOL;
 
+use crate::monitors::{Chooser, Found, Resolved, listed};
 use crate::outage::Outage;
-use crate::{CaptureError, Frame, VideoSource};
+use crate::{CaptureError, Frame, Layout, MAX_MONITORS, Monitor, Rect, Selection, VideoSource};
 
-/// Grabs the virtual desktop of this user session.
-#[derive(Debug, Default)]
+/// A monitor's device name (`MONITORINFOEXW::szDevice`, `\\.\DISPLAY1`,
+/// NUL-padded): what the viewer's choice is held by. In memory only.
+type Device = [u16; 32];
+
+/// The most monitors one enumeration collects. Above [`MAX_MONITORS`], so
+/// that on a desktop of more the chooser keeps the first 16 by position, as
+/// a layout promises, whatever order Windows enumerates them in; bounded,
+/// so the callback's list stays small whatever the enumeration does.
+const MAX_FOUND: usize = 4 * MAX_MONITORS;
+
+/// Grabs the monitor of this user session's desktop the viewer chose, or
+/// all of them.
+#[derive(Default)]
 pub struct GdiCapture {
     /// The spell of failed grabs under way, if any.
     outage: Outage,
+    /// The viewer's choice, held by device name.
+    chooser: Chooser<Device>,
+    /// The monitors of the latest picture and what it showed: what a
+    /// selection is taken against.
+    resolved: Option<Resolved<Device>>,
+    /// What the picture returned last shows.
+    layout: Option<Layout>,
+}
+
+impl std::fmt::Debug for GdiCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `Resolved`'s own `Debug` leaves the device names out.
+        f.debug_struct("GdiCapture")
+            .field("outage", &self.outage)
+            .field("resolved", &self.resolved)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The raster operation of every grab: a plain copy, without `CAPTUREBLT`.
@@ -52,17 +96,141 @@ pub struct GdiCapture {
 /// either way: a blit never copies it.
 const RASTER_OP: ROP_CODE = SRCCOPY;
 
-/// The virtual desktop's origin and size, in physical pixels.
-fn virtual_desktop() -> (i32, i32, i32, i32) {
+/// The virtual desktop: its origin and size, in physical pixels under
+/// per-monitor awareness. What every grab is cut from and the injector
+/// addresses; `None` when it has no size (a service session has no desktop).
+fn virtual_desktop() -> Option<Rect> {
     // SAFETY: `GetSystemMetrics` has no preconditions and only reads.
-    unsafe {
+    let (x, y, width, height) = unsafe {
         (
             GetSystemMetrics(SM_XVIRTUALSCREEN),
             GetSystemMetrics(SM_YVIRTUALSCREEN),
             GetSystemMetrics(SM_CXVIRTUALSCREEN),
             GetSystemMetrics(SM_CYVIRTUALSCREEN),
         )
+    };
+    desktop_rect(x, y, width, height)
+}
+
+/// The rectangle of a virtual desktop whose metrics read `x`, `y`, `width`
+/// and `height`; `None` for a size that is not above zero.
+fn desktop_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> {
+    let width = u32::try_from(width).ok().filter(|&w| w > 0)?;
+    let height = u32::try_from(height).ok().filter(|&h| h > 0)?;
+    Some(Rect::new(x, y, width, height))
+}
+
+/// The desktop's monitors as Windows lists them, keyed by device name, in
+/// the order of the enumeration (the chooser sorts them), at most
+/// [`MAX_FOUND`]. None when the enumeration fails: the virtual desktop is
+/// then the one monitor.
+fn monitors() -> Vec<Found<Device>> {
+    let mut found: Vec<Found<Device>> = Vec::with_capacity(MAX_FOUND);
+    // SAFETY: a null DC and a null clip rectangle enumerate every monitor of
+    // the virtual desktop. `collect` runs only inside this call, on this
+    // thread, with `data` the address of `found`, which outlives the call
+    // and is not otherwise touched until it returns.
+    let enumerated = unsafe {
+        EnumDisplayMonitors(
+            null_mut(),
+            null(),
+            Some(collect),
+            (&raw mut found) as LPARAM,
+        )
+    };
+    if enumerated == 0 {
+        tracing::debug!(
+            error = %std::io::Error::last_os_error(),
+            "EnumDisplayMonitors failed: the virtual desktop is the one monitor"
+        );
+        found.clear();
     }
+    found
+}
+
+/// `EnumDisplayMonitors`' callback: reads one monitor into the list `data`
+/// points at, and says whether to go on.
+///
+/// # Safety
+/// `data` is the address of a live `Vec<Found<Device>>` that nothing else
+/// borrows while the enumeration runs (`monitors` passes its own list).
+unsafe extern "system" fn collect(
+    monitor: HMONITOR,
+    _dc: HDC,
+    _rect: *mut RECT,
+    data: LPARAM,
+) -> BOOL {
+    // SAFETY: per this function's contract `data` is the address of a live
+    // vector borrowed by nothing else until `EnumDisplayMonitors` returns,
+    // which calls this function only before it does.
+    let found = unsafe { &mut *(data as *mut Vec<Found<Device>>) };
+    let mut info = MONITORINFOEXW {
+        monitorInfo: MONITORINFO {
+            cbSize: size_of::<MONITORINFOEXW>() as u32,
+            ..Default::default()
+        },
+        szDevice: [0; 32],
+    };
+    // SAFETY: `monitor` is the handle the enumeration hands this callback;
+    // `info` is a writable `MONITORINFOEXW` whose `cbSize` says so, which
+    // `GetMonitorInfoW` takes through a pointer to its first field and fills
+    // with the device name too.
+    let read = unsafe { GetMonitorInfoW(monitor, (&raw mut info).cast::<MONITORINFO>()) } != 0;
+    BOOL::from(gather(found, read.then_some(&info)))
+}
+
+/// Adds the monitor `info` describes (`None`: one that could not be read,
+/// such as one unplugged during the enumeration) to `found`, and says
+/// whether the enumeration goes on: until `found` holds [`MAX_FOUND`].
+fn gather(found: &mut Vec<Found<Device>>, info: Option<&MONITORINFOEXW>) -> bool {
+    if found.len() < MAX_FOUND
+        && let Some(monitor) = info.and_then(found_of)
+    {
+        found.push(monitor);
+    }
+    found.len() < MAX_FOUND
+}
+
+/// The monitor `info` describes: `rcMonitor` (virtual-screen coordinates,
+/// negative left of or above the primary), the primary flag and the device
+/// name; `None` for a rectangle with no area.
+fn found_of(info: &MONITORINFOEXW) -> Option<Found<Device>> {
+    let r = info.monitorInfo.rcMonitor;
+    let side = |from: i32, to: i32| {
+        u32::try_from(i64::from(to) - i64::from(from))
+            .ok()
+            .filter(|&len| len > 0)
+    };
+    Some(Found {
+        key: info.szDevice,
+        rect: Rect::new(
+            r.left,
+            r.top,
+            side(r.left, r.right)?,
+            side(r.top, r.bottom)?,
+        ),
+        primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+    })
+}
+
+/// The monitors of this Windows desktop, numbered as a session's layout
+/// lists them (`tornect doctor`): every monitor `EnumDisplayMonitors`
+/// lists, cut to the virtual desktop. Makes the process per-monitor aware
+/// first, so a process with no window reads physical pixels, as the
+/// capture and the injector do; one that cannot be says so in its log.
+pub fn desktop_monitors() -> Result<Vec<Monitor>, CaptureError> {
+    if !tornect_input::windows::become_dpi_aware() {
+        tracing::warn!(
+            "this process is not per-monitor DPI aware: on a high-DPI desktop the monitors \
+             are listed in scaled units"
+        );
+    }
+    let space = virtual_desktop().ok_or_else(no_desktop)?;
+    Ok(listed(monitors(), space))
+}
+
+fn no_desktop() -> CaptureError {
+    CaptureError::Unavailable("no desktop to capture (a service session has none)".to_owned())
 }
 
 impl GdiCapture {
@@ -79,12 +247,7 @@ impl GdiCapture {
                  picture can be scaled or partial"
             );
         }
-        let (_, _, w, h) = virtual_desktop();
-        if w <= 0 || h <= 0 {
-            return Err(CaptureError::Unavailable(
-                "no desktop to capture (a service session has none)".to_owned(),
-            ));
-        }
+        virtual_desktop().ok_or_else(no_desktop)?;
         Ok(Self::default())
     }
 }
@@ -126,12 +289,18 @@ fn gdi_failed(what: &str) -> CaptureError {
     ))
 }
 
-fn grab() -> Result<Frame, CaptureError> {
-    let (x, y, w, h) = virtual_desktop();
+/// A picture of `rect` of the virtual desktop (a monitor's even rectangle,
+/// or the bounding box of all of them), the cursor drawn in.
+fn grab(rect: Rect) -> Result<Frame, CaptureError> {
+    let (x, y, width, height) = (rect.x, rect.y, rect.width, rect.height);
+    let (Ok(w), Ok(h)) = (i32::try_from(width), i32::try_from(height)) else {
+        return Err(CaptureError::Failed(format!(
+            "a grab of {width}x{height} is out of range"
+        )));
+    };
     if w <= 0 || h <= 0 {
         return Err(CaptureError::Failed("the desktop has no size".to_owned()));
     }
-    let (width, height) = (w as u32, h as u32);
     let mut gdi = Gdi {
         screen: null_mut(),
         memory: null_mut(),
@@ -246,30 +415,286 @@ impl VideoSource for GdiCapture {
         "gdi"
     }
 
-    /// Polls: every call copies the whole virtual desktop. A copy that fails
-    /// (a secure screen shows) waits `timeout` and answers `Ok(None)`, for up
-    /// to a minute in a row.
+    /// Polls: every call lists the monitors and copies the one shown, or
+    /// all of them. A copy that fails (a secure screen shows) waits
+    /// `timeout` and answers `Ok(None)`, for up to a minute in a row; the
+    /// layout then stays the last picture's.
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
-        self.outage.poll(timeout, grab)
+        let chooser = &mut self.chooser;
+        let mut shown = None;
+        let frame = self.outage.poll(timeout, || {
+            // Asked every time: a monitor can be plugged, unplugged, moved or
+            // given another mode between two pictures.
+            let space = virtual_desktop()
+                .ok_or_else(|| CaptureError::Failed("the desktop has no size".to_owned()))?;
+            let resolved = chooser.resolve(monitors(), space);
+            let frame = grab(resolved.grab)?;
+            shown = Some(resolved);
+            Ok(frame)
+        })?;
+        if let Some(resolved) = shown {
+            self.layout = Some(resolved.layout());
+            self.resolved = Some(resolved);
+        }
+        Ok(frame)
+    }
+
+    fn layout(&self) -> Option<Layout> {
+        self.layout.clone()
+    }
+
+    /// Instant: the next grab shows `selection`, taken against the monitors
+    /// of the latest picture (none before the first).
+    fn select(&mut self, selection: Selection, _stop: &AtomicBool) -> Result<(), CaptureError> {
+        match &self.resolved {
+            Some(last) => self.chooser.select(selection, last),
+            None => Err(CaptureError::NoMonitor(match selection {
+                Selection::All => 0,
+                Selection::Monitor(id) => id,
+            })),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::View;
 
-    /// Runs only on Windows. Cross-build the binary with
-    /// `cargo test --target x86_64-pc-windows-gnullvm -p tornect-capture --no-run`
-    /// and run it on a Windows desktop.
+    /// `name` as `szDevice` holds it: UTF-16, NUL-padded.
+    fn device(name: &str) -> Device {
+        let mut device = [0; 32];
+        for (slot, unit) in device.iter_mut().zip(name.encode_utf16()) {
+            *slot = unit;
+        }
+        device
+    }
+
+    /// What `GetMonitorInfoW` fills in for a monitor at `rcMonitor`
+    /// `(left, top, right, bottom)` named `name`, with a taskbar 40 px high
+    /// cut from its work area.
+    fn info(rc: (i32, i32, i32, i32), primary: bool, name: &str) -> MONITORINFOEXW {
+        let (left, top, right, bottom) = rc;
+        MONITORINFOEXW {
+            monitorInfo: MONITORINFO {
+                cbSize: size_of::<MONITORINFOEXW>() as u32,
+                rcMonitor: RECT {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                },
+                rcWork: RECT {
+                    left,
+                    top,
+                    right,
+                    bottom: bottom.saturating_sub(40),
+                },
+                dwFlags: if primary { MONITORINFOF_PRIMARY } else { 0 },
+            },
+            szDevice: device(name),
+        }
+    }
+
+    /// A monitor is its whole `rcMonitor` (not the work area), at a
+    /// negative x when it lies left of the primary, with the primary flag
+    /// and the device name as its key; a rectangle with no area is none.
     #[test]
-    fn grabs_the_virtual_desktop() {
+    fn a_monitor_is_read_from_its_rectangle_flag_and_name() {
+        let left = found_of(&info((-1920, 0, 0, 1080), false, r"\\.\DISPLAY2")).unwrap();
+        assert_eq!(left.rect, Rect::new(-1920, 0, 1920, 1080));
+        assert!(!left.primary);
+        assert_eq!(left.key, device(r"\\.\DISPLAY2"));
+        let main = found_of(&info((0, 0, 2560, 1440), true, r"\\.\DISPLAY1")).unwrap();
+        assert_eq!(main.rect, Rect::new(0, 0, 2560, 1440));
+        assert!(main.primary);
+        assert_ne!(main.key, left.key);
+        for rc in [
+            (0, 0, 0, 1080),
+            (0, 0, 1920, 0),
+            (100, 0, 0, 1080),
+            (0, 100, 1920, 0),
+        ] {
+            assert!(found_of(&info(rc, false, "none")).is_none(), "{rc:?}");
+        }
+        // The widest rectangle a RECT holds is measured, not wrapped (the
+        // chooser cuts it to the virtual desktop).
+        let widest = found_of(&info((i32::MIN, i32::MIN, i32::MAX, i32::MAX), false, "w")).unwrap();
+        assert_eq!(
+            widest.rect,
+            Rect::new(i32::MIN, i32::MIN, u32::MAX, u32::MAX)
+        );
+    }
+
+    /// One enumeration collects monitors until it holds [`MAX_FOUND`] and
+    /// then stops, skipping one that could not be read; of those the
+    /// layout lists the first 16 by position, whatever order Windows
+    /// enumerated them in.
+    #[test]
+    fn the_enumeration_stops_once_its_list_is_full() {
+        let mut found = Vec::new();
+        assert!(gather(&mut found, None));
+        assert!(found.is_empty());
+        let count = MAX_FOUND as i32 + 5;
+        let infos: Vec<MONITORINFOEXW> = (0..count)
+            .rev()
+            .map(|i| info((i * 100, 0, i * 100 + 100, 100), false, "m"))
+            .collect();
+        let went_on: Vec<bool> = infos.iter().map(|i| gather(&mut found, Some(i))).collect();
+        assert_eq!(found.len(), MAX_FOUND);
+        assert!(went_on[..MAX_FOUND - 1].iter().all(|&on| on));
+        assert!(went_on[MAX_FOUND - 1..].iter().all(|&on| !on));
+        let list = listed(found, Rect::new(0, 0, 100 * count as u32, 100));
+        assert_eq!(list.len(), MAX_MONITORS);
+        // Collected: x from 100 · (count - 1) down to 500; listed: from 500 on.
+        assert_eq!(list[0].rect, Rect::new(500, 0, 100, 100));
+        assert_eq!(list[15].rect, Rect::new(2000, 0, 100, 100));
+    }
+
+    /// A virtual desktop is one with a size above zero, at any origin.
+    #[test]
+    fn a_virtual_desktop_needs_a_size() {
+        assert_eq!(
+            desktop_rect(-1920, -200, 4480, 1440),
+            Some(Rect::new(-1920, -200, 4480, 1440))
+        );
+        for (w, h) in [(0, 1080), (1920, 0), (-1, 1080), (1920, -5)] {
+            assert_eq!(desktop_rect(0, 0, w, h), None, "{w}x{h}");
+        }
+    }
+
+    /// Before its first picture a capture lists no monitors, so every
+    /// selection names a monitor it does not have; after it, a selection is
+    /// taken against that picture's monitors.
+    #[test]
+    fn a_selection_is_taken_against_the_last_pictures_monitors() {
+        let stop = AtomicBool::new(false);
+        let mut capture = GdiCapture::default();
+        assert!(matches!(
+            capture.select(Selection::Monitor(1), &stop),
+            Err(CaptureError::NoMonitor(1))
+        ));
+        assert!(matches!(
+            capture.select(Selection::All, &stop),
+            Err(CaptureError::NoMonitor(0))
+        ));
+        let found = vec![
+            found_of(&info((0, 0, 1920, 1080), true, r"\\.\DISPLAY1")).unwrap(),
+            found_of(&info((-1280, 0, 0, 1024), false, r"\\.\DISPLAY2")).unwrap(),
+        ];
+        let space = Rect::new(-1280, 0, 3200, 1080);
+        let resolved = capture.chooser.resolve(found.clone(), space);
+        assert_eq!(resolved.shown, Selection::Monitor(2));
+        capture.resolved = Some(resolved);
+        capture.select(Selection::Monitor(1), &stop).unwrap();
+        assert!(matches!(
+            capture.select(Selection::Monitor(3), &stop),
+            Err(CaptureError::NoMonitor(3))
+        ));
+        let next = capture.chooser.resolve(found, space);
+        assert_eq!(next.shown, Selection::Monitor(1));
+        assert_eq!(next.grab, Rect::new(-1280, 0, 1280, 1024));
+    }
+
+    /// The device names stay out of `Debug`: a capture's description never
+    /// carries one into a log.
+    #[test]
+    fn the_device_names_stay_out_of_debug() {
+        let mut capture = GdiCapture::default();
+        let found = vec![
+            found_of(&info((0, 0, 1920, 1080), true, r"\\.\DISPLAY1")).unwrap(),
+            found_of(&info((1920, 0, 3840, 1080), false, r"\\.\DISPLAY2")).unwrap(),
+        ];
+        capture.resolved = Some(capture.chooser.resolve(found, Rect::new(0, 0, 3840, 1080)));
+        let shown = format!("{capture:?}");
+        // `\\.\DI`, as `Debug` of the key's code units would print it.
+        assert!(!shown.contains("92, 92, 46, 92, 68, 73"), "{shown}");
+        assert!(shown.contains("grab"), "{shown}");
+    }
+
+    /// Runs only on Windows, with a desktop (Wine's will do). Cross-build
+    /// the binary with
+    /// `cargo test --target x86_64-pc-windows-gnullvm -p tornect-capture --no-run`
+    /// and run it on a Windows desktop, or under Wine.
+    ///
+    /// The first picture shows the primary of two or more (else monitor 1),
+    /// over its even rectangle on the virtual desktop; each monitor in turn
+    /// and all of them are grabbed at their size; `doctor`'s listing is the
+    /// layout's. With `--nocapture` it reports the layout it saw.
+    #[test]
+    #[allow(clippy::print_stderr)] // the live test reports what it saw
+    fn grabs_the_monitor_it_shows() {
         let mut capture = GdiCapture::open().unwrap();
-        let (_, _, w, h) = virtual_desktop();
+        assert_eq!(capture.name(), "gdi");
+        assert_eq!(capture.layout(), None);
         let frame = capture.next_frame(Duration::ZERO).unwrap().unwrap();
-        assert_eq!((frame.width, frame.height), (w as u32, h as u32));
+        let layout = capture.layout().unwrap();
+        // Rectangles only: the device names stay out of a layout.
+        eprintln!("GDI layout of the first picture: {layout:?}");
+        let View::Rect { shown, space } = layout.view else {
+            panic!("a GDI picture lies on the virtual desktop: {layout:?}");
+        };
+        assert_eq!(Some(space), virtual_desktop());
+        assert!(space.contains(&shown), "{shown:?} in {space:?}");
+        assert_eq!((frame.width, frame.height), (shown.width, shown.height));
         assert_eq!(frame.bgrx.len(), (frame.width * frame.height * 4) as usize);
         assert!(frame.bgrx.chunks_exact(4).all(|p| p[3] == 0xff));
-        assert_eq!(capture.name(), "gdi");
+        assert_eq!(layout.monitors, desktop_monitors().unwrap());
+        let ids: Vec<u8> = layout.monitors.iter().map(|m| m.id).collect();
+        assert_eq!(ids, (1..=layout.monitors.len() as u8).collect::<Vec<_>>());
+        assert!(layout.monitors.iter().filter(|m| m.primary).count() <= 1);
+        assert_eq!(layout.all, layout.monitors.len() >= 2);
+        let default = match &layout.monitors[..] {
+            [_, _, ..] => layout
+                .monitors
+                .iter()
+                .find(|m| m.primary)
+                .map_or(1, |m| m.id),
+            _ => 1,
+        };
+        assert_eq!(layout.shown, Selection::Monitor(default));
+
+        let even = |r: Rect| Rect::new(r.x, r.y, r.width & !1, r.height & !1);
+        let stop = AtomicBool::new(false);
+        for monitor in &layout.monitors {
+            capture
+                .select(Selection::Monitor(monitor.id), &stop)
+                .unwrap();
+            let frame = capture.next_frame(Duration::ZERO).unwrap().unwrap();
+            let now = capture.layout().unwrap();
+            assert_eq!(now.shown, Selection::Monitor(monitor.id));
+            assert_eq!(
+                now.view,
+                View::Rect {
+                    shown: even(monitor.rect),
+                    space,
+                }
+            );
+            assert_eq!(
+                (frame.width, frame.height),
+                (monitor.rect.width & !1, monitor.rect.height & !1)
+            );
+        }
+        match capture.select(Selection::All, &stop) {
+            Ok(()) => {
+                assert!(layout.all);
+                capture.next_frame(Duration::ZERO).unwrap().unwrap();
+                let now = capture.layout().unwrap();
+                assert_eq!(now.shown, Selection::All);
+                let View::Rect { shown, .. } = now.view else {
+                    panic!("{now:?}");
+                };
+                for monitor in &now.monitors {
+                    assert!(shown.width >= monitor.rect.width & !1, "{monitor:?}");
+                }
+            }
+            Err(CaptureError::NoMonitor(0)) => assert!(!layout.all),
+            Err(e) => panic!("{e}"),
+        }
+        assert!(matches!(
+            capture.select(Selection::Monitor(17), &stop),
+            Err(CaptureError::NoMonitor(17))
+        ));
     }
 
     /// Every grab is a plain copy: `CAPTUREBLT` would make the host's own

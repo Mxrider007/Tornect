@@ -193,8 +193,8 @@ impl<K: Clone + Eq> Chooser<K> {
 /// then y, at most [`MAX_MONITORS`], numbered 1..n, one primary; the whole
 /// space when nothing is found), without choosing one: what a desktop
 /// reports outside a session (`tornect doctor`).
-// Only the X11 backend lists a desktop so far; GDI will (the design's step 15).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// The X11 and GDI backends list a desktop; macOS has no desktop backend yet.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub(crate) fn listed<K>(found: Vec<Found<K>>, space: Rect) -> Vec<Monitor> {
     numbered(found, space).0
 }
