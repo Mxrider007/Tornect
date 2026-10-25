@@ -534,7 +534,8 @@ mod tests {
     /// The quality design §5 rule 8 and §8 "pointer versus scale": a pointer
     /// over the viewer's picture, normalized over the picture as the viewer
     /// does (`tornect_input::normalize`), lands through the injectors'
-    /// mapping (`tornect_input::place` over `shown_region`) within
+    /// mapping (a `Viewport` over the `shown_region` of the desktop, then a
+    /// sink that places over the whole desktop; decision M1-75) within
     /// `ceil(region / picture)` desktop pixels of the pixels the scaler
     /// sampled for it, at the corners, the centre and 64 seeded points; the
     /// corners land on the region's corners, and nothing outside the region
@@ -545,7 +546,16 @@ mod tests {
     #[test]
     fn a_pointer_over_the_picture_lands_on_the_desktop_it_shows() {
         use tornect_codec::scale::{picture_size, shown_region};
-        use tornect_input::{normalize, place};
+        use tornect_input::{Rect, denormalize, normalize, remap};
+
+        // The host's chain: the `Viewport` remaps onto the shown region, and
+        // the desktop sink places over the whole desktop.
+        let place = |x, y, desktop: (u32, u32)| {
+            let region = shown_region(desktop.0, desktop.1);
+            let space = Rect::new(0, 0, desktop.0, desktop.1);
+            let (x, y) = remap(x, y, Rect::new(0, 0, region.0, region.1), space);
+            (denormalize(x, desktop.0), denormalize(y, desktop.1))
+        };
 
         let caps = QualityCaps::default();
         let cap = |preset| settings(preset, Route::Tor, &caps).cap;
@@ -582,7 +592,7 @@ mod tests {
             for (px, py) in points {
                 let x = normalize(f64::from(px), f64::from(pw));
                 let y = normalize(f64::from(py), f64::from(ph));
-                let (sx, sy) = place(x, y, desktop, shown_region);
+                let (sx, sy) = place(x, y, desktop);
                 assert!(sx < region.0 && sy < region.1, "{desktop:?} ({px}, {py})");
                 let centre = (
                     sample_centre(px, region.0, pw, k),
@@ -598,7 +608,7 @@ mod tests {
             let corner = |px: u32, py: u32| {
                 let x = normalize(f64::from(px), f64::from(pw));
                 let y = normalize(f64::from(py), f64::from(ph));
-                place(x, y, desktop, shown_region)
+                place(x, y, desktop)
             };
             assert_eq!(corner(0, 0), (0, 0));
             assert_eq!(corner(pw - 1, ph - 1), (region.0 - 1, region.1 - 1));

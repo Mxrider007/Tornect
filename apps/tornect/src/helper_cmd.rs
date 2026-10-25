@@ -104,10 +104,14 @@ fn serve(args: &HelperArgs) -> Exit {
             return Exit::PipeClosed;
         }
     }
-    // The same mapping as the host's own injector (`tornect-session`'s
-    // `backend.rs`): the viewer's pointer over the part of the desktop it sees.
-    let sink =
-        tornect_input::windows::SendInputSink::new().over(tornect_codec::scale::shown_region);
+    // Per-monitor v2 before the sink reads the virtual desktop or injects, as
+    // the host's capture is: otherwise Windows virtualizes the desktop on a
+    // mixed-DPI machine and the host's mapping lands off the pixel
+    // (`docs/research/monitors.md` §2). The sink addresses the whole virtual
+    // desktop; the host's `Viewport` placed every move before it was sent
+    // (decision M1-75).
+    tornect_input::windows::become_dpi_aware();
+    let sink = tornect_input::windows::SendInputSink::placed();
     let exit = run_helper(
         sink,
         &events,

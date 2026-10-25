@@ -257,11 +257,14 @@ pub trait InputSink: Send {
     fn retarget(&mut self, view: &View) -> Result<(), InputError> {
         match view {
             View::Rect { .. } => Ok(()),
-            View::Stream { .. } => Err(InputError::Inject(
-                "this injector cannot follow the picture to another screen".to_owned(),
-            )),
+            View::Stream { .. } => Err(cannot_follow()),
         }
     }
+}
+
+/// What a sink answers to a [`View`] it cannot address.
+pub(crate) fn cannot_follow() -> InputError {
+    InputError::Inject("this injector cannot follow the picture to another screen".to_owned())
 }
 
 /// Wraps an injector and remembers what is held down, so that
@@ -559,6 +562,16 @@ fn remap_axis(v: u16, shown_at: i32, shown_len: u32, space_at: i32, space_len: u
     normalize_pixel(u32::try_from(pixel).unwrap_or(0), space_len)
 }
 
+/// A position normalized over a picture that shows `space` whole, as the same
+/// pixel normalized over `space`: what a desktop sink does before any
+/// retarget. The picture then shows the whole even part of the desktop
+/// (decision M1-74), so the odd last column or row, which no picture shows,
+/// is never reached (SLICE-C1 C1-2).
+pub(crate) fn over_even_part(x: u16, y: u16, space: Rect) -> (u16, u16) {
+    let shown = Rect::new(space.x, space.y, space.width & !1, space.height & !1);
+    remap(x, y, shown, space)
+}
+
 /// Pixel `pos` of `0..size` as the normalized `0..=65535` the injectors take,
 /// rounded to the nearest: the integer counterpart of [`normalize`], so the
 /// host's mapping uses no floating point.
@@ -663,32 +676,6 @@ impl<S: InputSink> InputSink for Viewport<S> {
         };
         taken
     }
-}
-
-/// The part of a `width`×`height` screen the viewer sees, as the size of its
-/// top-left corner: `tornect_codec::scale::shown_region`, the whole screen
-/// but for an odd last column or row, which the session layer passes in,
-/// since this crate does not see the codec. The picture is that region scaled
-/// uniformly (decision M1-74), so a position normalized over the picture is
-/// the same position normalized over the region.
-pub type Region = fn(u32, u32) -> (u32, u32);
-
-/// The whole screen: the [`Region`] of a picture that is not cropped.
-#[must_use]
-pub fn whole(width: u32, height: u32) -> (u32, u32) {
-    (width, height)
-}
-
-/// The pixel of a `size` screen that a position normalized over its visible
-/// `region` points at, so that the viewer's pointer covers what it sees and
-/// nothing outside it (SLICE-C1 C1-2).
-#[must_use]
-pub fn place(x: u16, y: u16, size: (u32, u32), region: Region) -> (u32, u32) {
-    let (width, height) = region(size.0, size.1);
-    (
-        denormalize(x, width.min(size.0)),
-        denormalize(y, height.min(size.1)),
-    )
 }
 
 /// Map a normalized `0..=65535` coordinate onto `0..size` pixels.
@@ -1022,39 +1009,6 @@ mod tests {
     }
 
     #[test]
-    fn a_position_over_the_visible_region_lands_inside_it() {
-        // `tornect_codec::scale::shown_region`: the whole screen but for an
-        // odd last column or row. The picture is that region scaled whole
-        // (decision M1-74), at any size.
-        let shown = |w: u32, h: u32| (w & !1, h & !1);
-        // Two 4K screens side by side are scaled into one picture: the
-        // viewer's far corner is the right screen's, its middle the seam.
-        assert_eq!(place(65535, 65535, (7680, 2160), shown), (7679, 2159));
-        assert_eq!(place(0, 0, (7680, 2160), shown), (0, 0));
-        assert_eq!(place(32768, 0, (7680, 2160), shown), (3840, 0));
-        // An upright screen is sent whole: its bottom row (a Windows taskbar)
-        // is in reach, beyond the codec's upright maximum too.
-        assert_eq!(place(65535, 65535, (1440, 2560), shown), (1439, 2559));
-        assert_eq!(place(65535, 65535, (2160, 3840), shown), (2159, 3839));
-        assert_eq!(place(65535, 65535, (2400, 4000), shown), (2399, 3999));
-        // An odd screen loses its last column and row, as the picture does:
-        // nothing outside the captured region can be addressed.
-        assert_eq!(place(65535, 65535, (1921, 1081), shown), (1919, 1079));
-        assert_eq!(place(65535, 65535, (2401, 3001), shown), (2399, 2999));
-        assert_eq!(place(65535, 65535, (1920, 1080), whole), (1919, 1079));
-        // A region smaller than the screen still bounds the pointer.
-        assert_eq!(
-            place(65535, 65535, (7680, 2160), |w, h| (w.min(3840), h)),
-            (3839, 2159)
-        );
-        // A region larger than the screen is the screen.
-        assert_eq!(
-            place(65535, 65535, (800, 600), |_, _| (4000, 4000)),
-            (799, 599)
-        );
-    }
-
-    #[test]
     fn coordinates_map_edge_to_edge() {
         assert_eq!(denormalize(0, 1920), 0);
         assert_eq!(denormalize(65535, 1920), 1919);
@@ -1128,18 +1082,45 @@ mod tests {
             lands(65535, 65535, even(2401, 3001), whole(2401, 3001)),
             (2399, 2999)
         );
-        // A rectangle reaching past the space is clamped into it.
-        assert_eq!(
-            lands(
-                65535,
-                65535,
-                Rect::new(1000, 500, 4000, 4000),
-                whole(1920, 1080)
-            ),
-            (1919, 1079)
-        );
+        // A rectangle smaller than the space still bounds the pointer.
+        let half = Rect::new(0, 0, 3840, 2160);
+        assert_eq!(lands(65535, 65535, half, space), (3839, 2159));
+        // A rectangle reaching past the space (which a `Viewport` refuses) is
+        // clamped into it.
+        let past = Rect::new(1000, 500, 4000, 4000);
+        assert_eq!(lands(65535, 65535, past, whole(1920, 1080)), (1919, 1079));
+        let past = Rect::new(0, 0, 4000, 4000);
+        assert_eq!(lands(65535, 65535, past, whole(800, 600)), (799, 599));
         // A space of one pixel has only that pixel.
         assert_eq!(remap(65535, 65535, whole(1, 1), whole(1, 1)), (0, 0));
+    }
+
+    /// Before any retarget a desktop sink places a position over the whole
+    /// even part of its space, as the picture shows it (decision M1-74): the
+    /// odd last column and row are never reached.
+    #[test]
+    fn without_a_view_a_position_stays_on_the_even_part() {
+        let placed = |x, y, space: Rect| {
+            let (x, y) = over_even_part(x, y, space);
+            (denormalize(x, space.width), denormalize(y, space.height))
+        };
+        let odd = Rect::new(-1921, 0, 1921 + 2560, 1081);
+        assert_eq!(placed(65535, 65535, odd), (4479, 1079));
+        assert_eq!(placed(0, 0, odd), (0, 0));
+        let even = Rect::new(0, 0, 1280, 720);
+        assert_eq!(placed(65535, 65535, even), (1279, 719));
+        assert_eq!(placed(32768, 32768, even), (640, 360));
+        // Degenerate spaces have only their first pixel.
+        assert_eq!(placed(65535, 65535, Rect::new(0, 0, 1, 1)), (0, 0));
+        assert_eq!(placed(65535, 65535, Rect::new(0, 0, 0, 0)), (0, 0));
+        for width in 1..300 {
+            let space = Rect::new(0, 0, width, 1);
+            assert_eq!(
+                placed(65535, 0, space).0,
+                (width & !1).saturating_sub(1),
+                "{width}"
+            );
+        }
     }
 
     #[test]

@@ -19,16 +19,12 @@
 #![allow(unsafe_code)]
 
 use std::ptr::null_mut;
-use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
     DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, HBITMAP, HDC, HGDIOBJ, ROP_CODE,
     ReleaseDC, SRCCOPY, SelectObject,
-};
-use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSORINFO, DI_NORMAL, DrawIconEx, GetCursorInfo, GetIconInfo,
@@ -46,8 +42,6 @@ pub struct GdiCapture {
     outage: Outage,
 }
 
-static DPI_AWARE: Once = Once::new();
-
 /// The raster operation of every grab: a plain copy, without `CAPTUREBLT`.
 /// With that flag Windows hides the pointer and shows it again around each
 /// blit, so the host's own pointer flickers at the capture rate for as long
@@ -57,17 +51,6 @@ static DPI_AWARE: Once = Once::new();
 /// them into the screen DC already. The cursor is drawn by `DrawIconEx`
 /// either way: a blit never copies it.
 const RASTER_OP: ROP_CODE = SRCCOPY;
-
-/// Measure in physical pixels. Without per-monitor awareness Windows reports a
-/// scaled desktop and `BitBlt` copies a scaled, partial picture on a high-DPI
-/// monitor. winit sets this for GUI processes; the CLI host has no window.
-fn become_dpi_aware() {
-    DPI_AWARE.call_once(|| {
-        // SAFETY: plain call with a documented constant. It fails (FALSE) when
-        // the awareness was already set, by a manifest or by winit, which is fine.
-        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-    });
-}
 
 /// The virtual desktop's origin and size, in physical pixels.
 fn virtual_desktop() -> (i32, i32, i32, i32) {
@@ -85,7 +68,10 @@ fn virtual_desktop() -> (i32, i32, i32, i32) {
 impl GdiCapture {
     /// A capture of the interactive desktop.
     pub fn open() -> Result<Self, CaptureError> {
-        become_dpi_aware();
+        // Measure in physical pixels, as the injector addresses them: without
+        // per-monitor awareness Windows reports a scaled desktop and `BitBlt`
+        // copies a scaled, partial picture on a high-DPI monitor.
+        tornect_input::windows::become_dpi_aware();
         let (_, _, w, h) = virtual_desktop();
         if w <= 0 || h <= 0 {
             return Err(CaptureError::Unavailable(

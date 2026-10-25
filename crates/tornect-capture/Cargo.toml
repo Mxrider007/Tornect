@@ -10,20 +10,23 @@ publish.workspace = true
 
 [dependencies]
 tornect-core.workspace = true
+# The input event the Wayland portal session injects (the portal session is
+# shared by capture and input), the view types a source describes its picture
+# with, and on Windows the DPI awareness capture and injection share
+# (decision M1-75).
+tornect-input.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb.workspace = true
 # Wayland (docs/research/slice.md §4): the RemoteDesktop + ScreenCast portal
-# over zbus (ashpd, driven on a tokio runtime of its own), PipeWire through
-# dlopen (libloading; no headers or libclang needed), and the input event the
-# portal session injects (the portal session is shared by capture and input).
+# over zbus (ashpd, driven on a tokio runtime of its own) and PipeWire through
+# dlopen (libloading; no headers or libclang needed).
 ashpd.workspace = true
 libloading.workspace = true
 tokio.workspace = true
 futures.workspace = true
-tornect-input.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
