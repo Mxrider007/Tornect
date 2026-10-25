@@ -21,9 +21,22 @@ and is a NEEDS-DEVICE(windows) row of `docs/VERIFICATION.md`.
   returns zero without `WINSTA_ACCESSCLIPBOARD` access
   ([GetClipboardSequenceNumber](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclipboardsequencenumber)).
 - Consequences for the host backend: a change is "the number differs from the one seen last"; the activation
-  baseline is the number at activation; our own set is recognised by reading the number right after the set
+  baseline is the number at activation (and, since step 7's review, the text's fingerprint: see below); our own set is recognised by reading the number right after the set
   returns (arboard closes the clipboard before it returns, so every format of that set is counted). A zero
   reading means no access: the backend treats the clipboard as unavailable.
+- **Delayed rendering (added at step 7's review).** An owner may announce a format with no data and render it
+  only when asked: `WM_RENDERFORMAT` is "sent to the clipboard owner if it has delayed rendering a specific
+  clipboard format and if an application has requested data in that format", and `WM_RENDERALLFORMATS` is "sent
+  to the clipboard owner before it is destroyed, if the clipboard owner has delayed rendering one or more
+  clipboard formats" ([WM_RENDERFORMAT](https://learn.microsoft.com/en-us/windows/win32/dataxchg/wm-renderformat),
+  [WM_RENDERALLFORMATS](https://learn.microsoft.com/en-us/windows/win32/dataxchg/wm-renderallformats)). With the
+  sentence quoted above, the number then moves although the content did not: when the text from before the
+  session is first pasted, or when its owner quits. So a number change is not new text, and the activation
+  baseline keeps the text's fingerprint as well: in one opening, the private formats are checked and, unless they
+  mark it, `GetClipboardData(CF_UNICODETEXT)` is read (which has the owner render it now) and fingerprinted; the
+  number is read after closing. The fingerprint decodes the block as arboard's read does (`WideCharToMultiByte`
+  to UTF-8, up to the first NUL, `clipboard-win-5.4.1/src/raw.rs` 526–553), so a later read of the same text
+  matches.
 - **Read races.** The exclusion check (R2.2) and the text read are two clipboard openings (arboard opens the
   clipboard itself for `get_text`, `arboard-3.6.1/src/platform/windows.rs` 539–568, 585–607). A password manager can copy
   between them, so a read is kept only when the sequence number before the check equals the one after the read;
@@ -108,7 +121,10 @@ Windows formats password managers set, together with the three above
 - **X11 reads.** `get_text` asks a foreign owner over a fresh connection and waits up to 4 s
   (`LONG_TIMEOUT_DUR`, `x11.rs` 101, 313–410), trying `UTF8_STRING`, `text/plain;charset=utf-8`,
   `text/plain;charset=UTF-8`, `STRING` (Latin-1), `TEXT`, `text/plain`. It reads the whole selection (INCR
-  included) before the caller can apply a cap; the cap is applied after (a local owner is trusted, PLAN §B.6).
+  included) before the caller can apply a cap. Since step 7's review the backend does not read through it: it
+  converts `CLIPBOARD` to `UTF8_STRING` itself on its own connection (R2.4), once, within 2 s, and takes one
+  property of at most 256 KiB. arboard serves what it set in one property, never with `INCR`
+  (`handle_selection_request`, `x11.rs` 592–700), so the backend's own text reads back that way too.
 - **X11 clear.** `Clear` sets the owner to `None` at `CurrentTime` without checking who owns the selection
   (`x11.rs` 222–236), so it could clear another application's selection. The backend does not use it (R2.4).
 - **Copies of the text.** arboard keeps a copy of set text in its store (X11) and Windows keeps it in the
@@ -127,10 +143,22 @@ Windows formats password managers set, together with the three above
 - **The hint on X11.** KeePassXC sets `x-kde-passwordManagerHint` on X11 too (R2.2), and so does Bitwarden through
   arboard. The design lists the hint for the Wayland portal only; the X11 backend checks it as well: before
   reading, it converts `CLIPBOARD` to `TARGETS` on its own window (`ConvertSelection`, then the
-  `SelectionNotify`, then `GetProperty` with delete) and skips the change when the list holds the hint, when the
+  `SelectionNotify`, then `GetProperty`; the window and its property are destroyed after) and skips the change when the list holds the hint, when the
   owner refuses `TARGETS` or when the list does not fit 1024 atoms (fail closed). ICCCM §2.6.2 makes `TARGETS`
   mandatory for owners.
-- **Read races.** An owner change between the `TARGETS` check and arboard's read shows up as another
+- **Content baseline (added at step 7's review).** Owner changes are not content: a clipboard manager that takes
+  the selection over from an owner that quits (a `SAVE_TARGETS` handover, or a manager that re-owns what it saw)
+  raises an owner change with the same text. At each activation the backend therefore also reads the text, unless
+  the `TARGETS` mark it private, cannot be had or do not list `UTF8_STRING`, and keeps its fingerprint; the
+  engine never reports that text while the activation lasts.
+- **Bounded reads (added at step 7's review).** Each `ConvertSelection` (`TARGETS`, then `UTF8_STRING`) goes to a
+  window made for it and waits at most 2 s, the deadline checked on every pass, so a client that sets the
+  selection again and again cannot hold the thread. The text property is read with `GetProperty` `long_length` =
+  65 537 units (256 KiB and one unit) and not deleted: `bytes_after` ≠ 0 means over the cap; an `INCR` reply
+  (its value is "a lower bound" of the size, and the requestor starts the transfer when it deletes the property,
+  ICCCM §2.5 and §2.7.2, as summed up in [Making use of the ICCCM](https://cscene.sourceforge.net/CS7/CS7-06.html))
+  is not followed.
+- **Read races.** An owner change between the `TARGETS` check and the text read shows up as another
   `XfixesSelectionNotify`; after the read the backend syncs and, if one arrived, drops what it read and reads
   again at the next turn.
 - **Release.** At the end the backend clears the selection only when it still holds our text (the hint is
