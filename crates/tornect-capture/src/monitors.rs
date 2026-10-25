@@ -110,32 +110,7 @@ impl<K: Clone + Eq> Chooser<K> {
     /// the first), and all of them to the first when one is left; either way
     /// the choice then holds the monitor shown.
     pub(crate) fn resolve(&mut self, found: Vec<Found<K>>, space: Rect) -> Resolved<K> {
-        let mut found: Vec<(Rect, bool, K)> = found
-            .into_iter()
-            .filter_map(|f| clamped(f.rect, space).map(|rect| (rect, f.primary, f.key)))
-            .collect();
-        found.sort_by_key(|(rect, ..)| (rect.x, rect.y));
-        found.truncate(MAX_MONITORS);
-        let mut monitors = Vec::with_capacity(found.len().max(1));
-        let mut keys = Vec::with_capacity(found.len());
-        let mut primary_seen = false;
-        for (index, (rect, primary, key)) in found.into_iter().enumerate() {
-            let primary = primary && !primary_seen;
-            primary_seen |= primary;
-            monitors.push(Monitor {
-                id: id_of(index),
-                primary,
-                rect,
-            });
-            keys.push(key);
-        }
-        if monitors.is_empty() {
-            monitors.push(Monitor {
-                id: 1,
-                primary: false,
-                rect: space,
-            });
-        }
+        let (monitors, keys) = numbered(found, space);
         let n = monitors.len();
         let all = n >= 2;
         let default = if all {
@@ -211,6 +186,49 @@ impl<K: Clone + Eq> Chooser<K> {
         };
         Ok(())
     }
+}
+
+/// The monitors `found` on a desktop that spans `space`, as a [`Layout`]
+/// lists them ([`Chooser::resolve`]'s rules: cut to the space, sorted by x
+/// then y, at most [`MAX_MONITORS`], numbered 1..n, one primary; the whole
+/// space when nothing is found), without choosing one: what a desktop
+/// reports outside a session (`tornect doctor`).
+// Only the X11 backend lists a desktop so far; GDI will (the design's step 15).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn listed<K>(found: Vec<Found<K>>, space: Rect) -> Vec<Monitor> {
+    numbered(found, space).0
+}
+
+/// [`listed`], with the backend's key of each monitor found, in the same
+/// order (none when the whole space stands for the one monitor).
+fn numbered<K>(found: Vec<Found<K>>, space: Rect) -> (Vec<Monitor>, Vec<K>) {
+    let mut found: Vec<(Rect, bool, K)> = found
+        .into_iter()
+        .filter_map(|f| clamped(f.rect, space).map(|rect| (rect, f.primary, f.key)))
+        .collect();
+    found.sort_by_key(|(rect, ..)| (rect.x, rect.y));
+    found.truncate(MAX_MONITORS);
+    let mut monitors = Vec::with_capacity(found.len().max(1));
+    let mut keys = Vec::with_capacity(found.len());
+    let mut primary_seen = false;
+    for (index, (rect, primary, key)) in found.into_iter().enumerate() {
+        let primary = primary && !primary_seen;
+        primary_seen |= primary;
+        monitors.push(Monitor {
+            id: id_of(index),
+            primary,
+            rect,
+        });
+        keys.push(key);
+    }
+    if monitors.is_empty() {
+        monitors.push(Monitor {
+            id: 1,
+            primary: false,
+            rect: space,
+        });
+    }
+    (monitors, keys)
 }
 
 /// The id of the monitor at `index` (from 0) of a list.
@@ -324,6 +342,29 @@ mod tests {
         assert_eq!(r.keys, ["left", "main", "below", "right"]);
         assert!(r.all);
         assert_eq!(r.space, space);
+    }
+
+    /// What a desktop reports outside a session is the list a layout of
+    /// the same monitors has, cut, sorted and numbered alike, and the whole
+    /// space when nothing is found.
+    #[test]
+    fn a_listing_numbers_the_monitors_as_a_layout_does() {
+        let space = Rect::new(-1920, 0, 5120, 1080);
+        let mut list = three();
+        list.push(found("away", 9000, 0, 1920, 1080));
+        assert_eq!(
+            listed(list.clone(), space),
+            Chooser::default().resolve(list, space).monitors
+        );
+        let whole = Rect::new(0, 0, 1280, 720);
+        assert_eq!(
+            listed(Vec::<Found<&str>>::new(), whole),
+            [Monitor {
+                id: 1,
+                primary: false,
+                rect: whole,
+            }]
+        );
     }
 
     /// Of two or more, the primary is shown first, wherever it lies.

@@ -165,7 +165,10 @@ openh264 = { version = "=0.9.8", default-features = false, features = ["source"]
 # PipeWire through dlopen (no headers on the dev VM), X11 fallback.
 ashpd = { version = "=0.13.13", default-features = false, features = ["tokio", "screencast", "remote_desktop", "global_shortcuts"] }
 libloading = "=0.8.9"
-x11rb = { version = "=0.13.2", default-features = false, features = ["xtest", "xfixes"] }
+# `randr` (pulls in `render`): the X11 capture lists the root's monitors with
+# RandR 1.5 `GetMonitors` and grabs the one shown (decision M1-75); the app's
+# tree already enables both through winit.
+x11rb = { version = "=0.13.2", default-features = false, features = ["xtest", "xfixes", "randr"] }
 # Windows host: GDI capture + SendInput (plain Win32, no COM); tornect-platform's
 # start-at-logon task (`schtasks.exe` from the system directory, the user's SID,
 # `ShellExecuteExW` "runas" for the opt-in elevated task) and OS re-authentication
