@@ -97,6 +97,12 @@ pub mod notice {
     /// the signed accept whether it sends input (SLICE-C2 C2-6); this only
     /// lets it say why nothing happens.
     pub const NO_INPUT: u8 = 0x08;
+    /// The Control session's input ended during the session, because the
+    /// injector could not follow a change of the shown screen (decision
+    /// M1-75): the host let go of everything held and dropped the injector
+    /// rather than mis-map a click. The viewer can still watch. An older
+    /// viewer ignores the bit, as every reserved one.
+    pub const INPUT_LOST: u8 = 0x10;
 }
 
 /// `SESSION_ACCEPT.session_type`.

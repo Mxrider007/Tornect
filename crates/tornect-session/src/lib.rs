@@ -31,6 +31,7 @@
 //! | the viewer's quality picks are bounded by the host's table and cannot multiply its work (the quality design §5) | [`quality::settings`], [`flow::QualityGate`] and the [`flow::KeyframeLimiter`] that `KeyframeRequest` shares |
 //! | what the host says it applies and its means are display-only, and a host that repeats them cannot flood the viewer's display (the quality design §5.12) | [`FrameSink::quality`] (only changes), [`FrameSink::host_stats`] (at most one per 900 ms) |
 //! | a host of another version is said to be one (the quality design §4.7) | [`ViewerError::Version`] |
+//! | input made against an earlier picture never lands on a remapped screen (the monitors design's H5) | the `VideoAck` barrier in [`MediaHost`]; an injector that cannot follow the picture ends the session's input (`notice::INPUT_LOST`) |
 //!
 //! Consent gating is structural. A media stream is served only for a session
 //! the FSM accepted, and only to a peer that holds that session's token.
@@ -46,8 +47,8 @@ pub mod viewer;
 
 pub use backend::{DesktopBackend, Source, SystemBackend, TEST_SCREENS};
 pub use host::{
-    CaptureStarted, MediaBackend, MediaEnd, MediaHost, MediaLimits, MediaObserver, MediaOutcome,
-    MediaReport, NoObserver, SourceRequest,
+    CaptureChanged, CaptureStarted, MediaBackend, MediaEnd, MediaHost, MediaLimits, MediaObserver,
+    MediaOutcome, MediaReport, NoObserver, SourceRequest,
 };
 pub use viewer::{
     Binding, BoundStream, FrameSink, MediaViewer, ViewerEnd, ViewerError, ViewerStats,

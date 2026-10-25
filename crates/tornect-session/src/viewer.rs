@@ -514,6 +514,11 @@ where
                         sink.host_stats(&host);
                     }
                 }
+                // The host's monitors (the monitors design's H1 and H3):
+                // read past until the viewer follows them (its step 13). They
+                // size nothing; a `SelectMonitor` is the viewer's own frame
+                // and ends the stream below (V4).
+                Some(Msg::Monitors { .. }) => {}
                 Some(Msg::Close { reason }) => return Ok(ViewerEnd::Host(reason)),
                 Some(other) => return Err(ViewerError::Unexpected(kind(&other))),
                 None => return Ok(ViewerEnd::Closed),

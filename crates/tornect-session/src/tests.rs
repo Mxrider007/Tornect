@@ -12,13 +12,15 @@ use tokio::io::{
 };
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tornect_capture::{CaptureError, Frame, TestCard, VideoSource};
+use tornect_capture::{
+    CaptureError, Frame, Layout, Monitor, Rect, Selection, TestCard, TestScreens, VideoSource, View,
+};
 use tornect_codec::scale::{ResolutionCap, picture_size, shown_region};
 use tornect_codec::{DecodedFrame, EncoderSettings, H264Decoder, H264Encoder};
 use tornect_core::config::QualityPreset;
 use tornect_core::session_log::SessionMode;
 use tornect_core::{DeviceId, DeviceIdentity, HostIdentity};
-use tornect_input::{Button, InputError, InputEvent, InputSink};
+use tornect_input::{Button, InputError, InputEvent, InputSink, denormalize, remap};
 use tornect_proto::{
     HostStats, Msg, QualityInfo, codec, quality, read_msg, reason, video_flags, write_msg,
 };
@@ -106,19 +108,41 @@ impl Drop for Card {
     }
 }
 
-/// Records what is injected.
+/// Records what is injected, and each view the injector is told to follow.
 #[derive(Clone, Default)]
-struct Recorder(Arc<Mutex<Vec<InputEvent>>>);
+struct Recorder {
+    events: Arc<Mutex<Vec<InputEvent>>>,
+    /// Each view received, with how many events had been injected before it.
+    views: Arc<Mutex<Vec<(usize, View)>>>,
+    /// Refuse every view, as an injector that cannot follow the picture to
+    /// another screen.
+    refuses: Arc<AtomicBool>,
+}
 
 impl Recorder {
     fn events(&self) -> Vec<InputEvent> {
-        self.0.lock().unwrap().clone()
+        self.events.lock().unwrap().clone()
+    }
+
+    fn views(&self) -> Vec<(usize, View)> {
+        self.views.lock().unwrap().clone()
     }
 }
 
 impl InputSink for Recorder {
     fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
-        self.0.lock().unwrap().push(*event);
+        self.events.lock().unwrap().push(*event);
+        Ok(())
+    }
+
+    fn retarget(&mut self, view: &View) -> Result<(), InputError> {
+        let injected = self.events.lock().unwrap().len();
+        self.views.lock().unwrap().push((injected, *view));
+        if self.refuses.load(Ordering::SeqCst) {
+            return Err(InputError::Inject(
+                "this injector cannot follow the picture".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -223,6 +247,17 @@ impl MediaObserver for Seen {
         self.0.lock().unwrap().push(format!(
             "started {} {}x{} {:?} input={}",
             s.source, s.width, s.height, s.mode, s.input
+        ));
+    }
+
+    fn capture_changed(&self, c: &CaptureChanged<'_>) {
+        let shown = c.shown.map_or_else(
+            || "none".to_owned(),
+            |r| format!("{}x{}+{}+{}", r.width, r.height, r.x, r.y),
+        );
+        self.0.lock().unwrap().push(format!(
+            "changed screen={} of={} all={} shown={shown} input={}",
+            c.screen, c.of, c.all, c.input
         ));
     }
 
@@ -4088,6 +4123,629 @@ async fn a_viewers_monitors_or_a_malformed_select_monitor_is_a_protocol_error() 
         assert_eq!(end, MediaEnd::Protocol, "{frame:02x?}");
         assert_eq!(until_close(&mut client).await, Some(reason::PROTOCOL));
     }
+}
+
+/// A desktop whose monitors the test changes under the session, as a
+/// hotplug or a change of the primary does: about every 20 ms a test card
+/// of what `layout` shows at that moment, described by it.
+struct Shifting {
+    layout: Arc<Mutex<Layout>>,
+    last: Option<Layout>,
+    index: u32,
+}
+
+impl VideoSource for Shifting {
+    fn name(&self) -> &'static str {
+        "desk"
+    }
+
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+        std::thread::sleep(timeout.min(Duration::from_millis(20)));
+        let layout = self.layout.lock().unwrap().clone();
+        let View::Rect { shown, .. } = layout.view else {
+            unreachable!("the test desktop shows rectangles")
+        };
+        self.last = Some(layout);
+        self.index += 1;
+        Ok(Some(Frame {
+            width: shown.width,
+            height: shown.height,
+            bgrx: TestCard::render(shown.width, shown.height, self.index),
+            captured_at: std::time::Instant::now(),
+            grab: Duration::ZERO,
+        }))
+    }
+
+    fn layout(&self) -> Option<Layout> {
+        self.last.clone()
+    }
+}
+
+/// The test screens' desktop: 1280×720 (primary) and 1024×768 side by side
+/// on a 2304×768 desktop, showing `shown`.
+fn two_screens(shown: Selection) -> Layout {
+    let space = Rect::new(0, 0, 2304, 768);
+    let monitors = vec![
+        Monitor {
+            id: 1,
+            primary: true,
+            rect: Rect::new(0, 0, 1280, 720),
+        },
+        Monitor {
+            id: 2,
+            primary: false,
+            rect: Rect::new(1280, 0, 1024, 768),
+        },
+    ];
+    let rect = match shown {
+        Selection::All => space,
+        Selection::Monitor(id) => monitors[usize::from(id) - 1].rect,
+    };
+    Layout {
+        monitors,
+        all: true,
+        shown,
+        view: View::Rect { shown: rect, space },
+    }
+}
+
+/// [`two_screens`] once its first monitor is unplugged: the 1024×768 one
+/// alone, made primary, at the corner of a desktop of its size.
+fn one_screen() -> Layout {
+    let rect = Rect::new(0, 0, 1024, 768);
+    Layout {
+        monitors: vec![Monitor {
+            id: 1,
+            primary: true,
+            rect,
+        }],
+        all: false,
+        shown: Selection::Monitor(1),
+        view: View::Rect {
+            shown: rect,
+            space: rect,
+        },
+    }
+}
+
+/// A rig whose source is a [`Shifting`] desktop that starts at `layout`,
+/// and the handle that changes it.
+fn shifting_rig(layout: Layout) -> (Rig, Arc<Mutex<Layout>>) {
+    let shared = Arc::new(Mutex::new(layout));
+    let source = Shifting {
+        layout: Arc::clone(&shared),
+        last: None,
+        index: 0,
+    };
+    let rig = rig_with(
+        TestBackend {
+            desktop: Mutex::new(Some(Box::new(source))),
+            ..TestBackend::default()
+        },
+        MediaLimits::default(),
+    );
+    (rig, shared)
+}
+
+/// A `PointerMove` to `(x, y)` over the picture, as the injector behind the
+/// host's viewport receives it under `view`.
+fn moved_over(x: u16, y: u16, view: View) -> InputEvent {
+    let View::Rect { shown, space } = view else {
+        unreachable!("a rectangle")
+    };
+    let (x, y) = remap(x, y, shown, space);
+    InputEvent::PointerMove { x, y }
+}
+
+/// Send each of `events` as an `Input` frame.
+async fn send_input(client: &mut DuplexStream, events: &[InputEvent]) {
+    for event in events {
+        write_msg(client, &Msg::Input(event.encode()))
+            .await
+            .unwrap();
+    }
+}
+
+/// Read, acknowledging every `Video`, up to the next `Monitors`.
+async fn next_monitors(client: &mut DuplexStream) -> Msg {
+    let since = tokio::time::Instant::now();
+    loop {
+        in_time(since, "a Monitors");
+        let msg = next_acking(client).await;
+        if matches!(msg, Msg::Monitors { .. }) {
+            return msg;
+        }
+    }
+}
+
+const LEFT_DOWN: InputEvent = InputEvent::PointerButton {
+    button: Button::Left,
+    pressed: true,
+};
+const LEFT_UP: InputEvent = InputEvent::PointerButton {
+    button: Button::Left,
+    pressed: false,
+};
+const A_DOWN: InputEvent = InputEvent::Key {
+    usb: KEY_A,
+    pressed: true,
+};
+const A_UP: InputEvent = InputEvent::Key {
+    usb: KEY_A,
+    pressed: false,
+};
+
+/// The monitors design's H1 (and the injector test step 10 owed): a source
+/// with monitors to choose from has them said in one `Monitors` (request 0,
+/// REMAPPED clear, list 0, seq 0) after `BindOk` and right before `Video` 0,
+/// and the injector took that picture's view before any input was handled,
+/// so the viewer's pointer lands on the screen shown: its bottom-right
+/// corner on monitor 1's last pixel, not on the desktop's. The indicator
+/// hears where the picture lies. A source with nothing to choose says
+/// nothing, and its injector is never retargeted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_layout_is_said_before_the_first_picture_and_the_injector_follows_it() {
+    let (rig, _) = shifting_rig(two_screens(Selection::Monitor(1)));
+    let (_, binding) = start(&rig.host, 61, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    assert_eq!(
+        next_acking(&mut client).await,
+        Msg::Monitors {
+            request: 0,
+            status: tornect_proto::monitor_status::OK,
+            shown: 1,
+            all: true,
+            remapped: false,
+            list: 0,
+            seq: 0,
+            monitors: vec![
+                tornect_proto::MonitorEntry::saturating(true, 0, 0, 1280, 720),
+                tornect_proto::MonitorEntry::saturating(false, 1280, 0, 1024, 768),
+            ],
+        }
+    );
+    let Msg::Video { seq, flags, .. } = next_acking(&mut client).await else {
+        panic!("the Monitors is right before the first picture");
+    };
+    assert_eq!(
+        (seq, flags & video_flags::KEYFRAME),
+        (0, video_flags::KEYFRAME)
+    );
+    let view = two_screens(Selection::Monitor(1)).view;
+    assert_eq!(
+        rig.backend.recorder.views(),
+        [(0, view)],
+        "the first view, before any input"
+    );
+
+    send_input(
+        &mut client,
+        &[InputEvent::PointerMove { x: 65535, y: 65535 }],
+    )
+    .await;
+    sync(&mut client, 1).await;
+    let corner = moved_over(65535, 65535, view);
+    assert_eq!(rig.backend.recorder.events(), [corner]);
+    let InputEvent::PointerMove { x, y } = corner else {
+        unreachable!()
+    };
+    assert_eq!(
+        (denormalize(x, 2304), denormalize(y, 768)),
+        (1279, 719),
+        "monitor 1's last pixel"
+    );
+    drop(client);
+    let MediaOutcome::Served { report, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!(report.input_held_back, 0);
+    assert_eq!(
+        rig.seen.lines(),
+        [
+            "started desk 1280x720 Control input=true",
+            "changed screen=1 of=2 all=false shown=1280x720+0+0 input=true",
+            "stopped ViewerLeft",
+        ]
+    );
+
+    // The card has nothing to choose: its first picture comes right after
+    // `BindOk`, and the injector keeps passing positions through.
+    let rig = rig_with(TestBackend::default(), MediaLimits::default());
+    let (_, binding) = start(&rig.host, 62, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    assert!(
+        matches!(next_acking(&mut client).await, Msg::Video { seq: 0, .. }),
+        "no Monitors"
+    );
+    let middle = InputEvent::PointerMove { x: 30000, y: 20000 };
+    send_input(&mut client, &[middle]).await;
+    sync(&mut client, 2).await;
+    assert_eq!(rig.backend.recorder.events(), [middle]);
+    assert!(rig.backend.recorder.views().is_empty());
+    drop(client);
+    served.await.unwrap();
+}
+
+/// The monitors design's H3, H4 and H5: when the desktop changes under the
+/// session (monitor 1 unplugged, monitor 2 shown alone), the change is said
+/// as news (request 0, REMAPPED, a new list) right before the first picture
+/// that shows it, a keyframe; the injector follows it first, letting go of
+/// the button held (no drag across screens) and keeping the key. Moves,
+/// wheel turns and presses made before the viewer acknowledged that picture
+/// are held back, and after it wheel turns and presses until a move placed
+/// the pointer; keys and releases always go. The indicator hears the new
+/// screen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_of_screen_is_said_before_its_picture_and_earlier_input_waits_for_its_ack() {
+    let (rig, layout) = shifting_rig(two_screens(Selection::Monitor(1)));
+    let (_, binding) = start(&rig.host, 63, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    assert!(matches!(
+        next_acking(&mut client).await,
+        Msg::Monitors { list: 0, .. }
+    ));
+    let first = two_screens(Selection::Monitor(1)).view;
+    let start_drag = moved_over(1000, 1000, first);
+    send_input(
+        &mut client,
+        &[
+            InputEvent::PointerMove { x: 1000, y: 1000 },
+            LEFT_DOWN,
+            A_DOWN,
+        ],
+    )
+    .await;
+    sync(&mut client, 1).await;
+    assert_eq!(
+        rig.backend.recorder.events(),
+        [start_drag, LEFT_DOWN, A_DOWN]
+    );
+
+    *layout.lock().unwrap() = one_screen();
+    let news = next_monitors(&mut client).await;
+    let Msg::Monitors { seq: at, .. } = news else {
+        unreachable!()
+    };
+    assert_eq!(
+        news,
+        Msg::Monitors {
+            request: 0,
+            status: tornect_proto::monitor_status::OK,
+            shown: 1,
+            all: false,
+            remapped: true,
+            list: 1,
+            seq: at,
+            monitors: vec![tornect_proto::MonitorEntry::saturating(
+                true, 0, 0, 1024, 768
+            )],
+        }
+    );
+    // The picture it describes comes next, unacknowledged for now.
+    match tokio::time::timeout(WAIT, read_msg(&mut client))
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        Some(Msg::Video { seq, flags, .. }) => {
+            assert_eq!(seq, at);
+            assert_ne!(flags & video_flags::KEYFRAME, 0, "a keyframe");
+        }
+        other => panic!("expected the Video the Monitors describes, got {other:?}"),
+    }
+    let second = one_screen().view;
+    assert_eq!(
+        rig.backend.recorder.views(),
+        [(0, first), (4, second)],
+        "followed once, before the picture, after letting go of the button"
+    );
+    assert_eq!(
+        rig.backend.recorder.events(),
+        [start_drag, LEFT_DOWN, A_DOWN, LEFT_UP],
+        "the drag ends at the switch; the key stays down"
+    );
+
+    // Made against the pictures before `at`: only the key goes. An ack of
+    // an earlier picture leaves the barrier up.
+    let corner = InputEvent::PointerMove { x: 65535, y: 65535 };
+    let wheel = InputEvent::Wheel { dx: 0, dy: 120 };
+    write_msg(
+        &mut client,
+        &Msg::VideoAck {
+            seq: at.wrapping_sub(1),
+        },
+    )
+    .await
+    .unwrap();
+    send_input(&mut client, &[corner, wheel, LEFT_DOWN, LEFT_UP, A_UP]).await;
+    sync(&mut client, 2).await;
+    assert_eq!(
+        rig.backend.recorder.events(),
+        [start_drag, LEFT_DOWN, A_DOWN, LEFT_UP, A_UP]
+    );
+
+    // The viewer has the picture: a press or a wheel turn still waits for a
+    // move to place the pointer on the new screen.
+    write_msg(&mut client, &Msg::VideoAck { seq: at })
+        .await
+        .unwrap();
+    send_input(
+        &mut client,
+        &[LEFT_DOWN, wheel, corner, LEFT_DOWN, wheel, LEFT_UP],
+    )
+    .await;
+    sync(&mut client, 3).await;
+    let placed = moved_over(65535, 65535, second);
+    assert_eq!(
+        placed,
+        InputEvent::PointerMove { x: 65535, y: 65535 },
+        "the whole of the new desktop is shown"
+    );
+    assert_eq!(
+        rig.backend.recorder.events(),
+        [
+            start_drag, LEFT_DOWN, A_DOWN, LEFT_UP, A_UP, placed, LEFT_DOWN, wheel, LEFT_UP
+        ]
+    );
+    write_msg(
+        &mut client,
+        &Msg::Close {
+            reason: reason::ENDED_BY_VIEWER,
+        },
+    )
+    .await
+    .unwrap();
+    let MediaOutcome::Served { report, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!(report.input_held_back, 5, "three before the ack, two after");
+    assert!(report.input_dropped >= 5);
+    assert_eq!(
+        rig.seen.lines(),
+        [
+            "started desk 1280x720 Control input=true",
+            "changed screen=1 of=2 all=false shown=1280x720+0+0 input=true",
+            "changed screen=1 of=1 all=false shown=1024x768+0+0 input=true",
+            "stopped ViewerLeft",
+        ]
+    );
+}
+
+/// A change of the monitor list that moves nothing (the primary is now
+/// monitor 2, and monitor 1 is still shown) is said with a new list and
+/// REMAPPED clear: the injector keeps its view, a drag goes on, nothing is
+/// held back, and the indicator stays where it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_list_that_moves_nothing_holds_nothing_back() {
+    let (rig, layout) = shifting_rig(two_screens(Selection::Monitor(1)));
+    let (_, binding) = start(&rig.host, 64, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    assert!(matches!(
+        next_monitors(&mut client).await,
+        Msg::Monitors { list: 0, .. }
+    ));
+    send_input(&mut client, &[LEFT_DOWN]).await;
+    sync(&mut client, 1).await;
+
+    let mut new_primary = two_screens(Selection::Monitor(1));
+    new_primary.monitors[0].primary = false;
+    new_primary.monitors[1].primary = true;
+    *layout.lock().unwrap() = new_primary;
+    let news = next_monitors(&mut client).await;
+    assert!(
+        matches!(
+            &news,
+            Msg::Monitors { list: 1, remapped: false, shown: 1, monitors, .. }
+                if !monitors[0].primary && monitors[1].primary
+        ),
+        "{news:?}"
+    );
+    let corner = InputEvent::PointerMove { x: 65535, y: 65535 };
+    send_input(&mut client, &[corner, LEFT_UP]).await;
+    sync(&mut client, 2).await;
+    let view = two_screens(Selection::Monitor(1)).view;
+    assert_eq!(rig.backend.recorder.views(), [(0, view)]);
+    assert_eq!(
+        rig.backend.recorder.events(),
+        [LEFT_DOWN, moved_over(65535, 65535, view), LEFT_UP]
+    );
+    drop(client);
+    let MediaOutcome::Served { report, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!(report.input_held_back, 0);
+    assert_eq!(
+        rig.seen.lines(),
+        [
+            "started desk 1280x720 Control input=true",
+            "changed screen=1 of=2 all=false shown=1280x720+0+0 input=true",
+            "stopped ViewerLeft",
+        ]
+    );
+}
+
+/// The safety net of the monitors design §4 (and the second host test step
+/// 10 owed): an injector that refuses the view ends the session's input
+/// rather than mis-map a click. Mid-session: everything held is let go of
+/// (the button by the retarget, the key when the injector is dropped), the
+/// notice gains `INPUT_LOST` (not `NO_INPUT`), the indicator hears
+/// `input: false`, and later input reaches nothing. At the first picture:
+/// the same, before any input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_injector_that_cannot_follow_the_picture_ends_the_sessions_input() {
+    use tornect_signal::messages::notice;
+    let (rig, layout) = shifting_rig(two_screens(Selection::Monitor(1)));
+    let (id, binding) = start(&rig.host, 65, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    next_monitors(&mut client).await;
+    send_input(&mut client, &[A_DOWN, LEFT_DOWN]).await;
+    sync(&mut client, 1).await;
+    assert_eq!(rig.host.viewer_notice(&id, Some(0)), Some(0));
+
+    rig.backend.recorder.refuses.store(true, Ordering::SeqCst);
+    *layout.lock().unwrap() = two_screens(Selection::Monitor(2));
+    assert!(matches!(
+        next_monitors(&mut client).await,
+        Msg::Monitors {
+            shown: 2,
+            remapped: true,
+            list: 0,
+            ..
+        }
+    ));
+    assert_eq!(
+        rig.backend.recorder.events(),
+        [A_DOWN, LEFT_DOWN, LEFT_UP, A_UP],
+        "everything held let go of"
+    );
+    assert_eq!(
+        rig.host.viewer_notice(&id, Some(0)),
+        Some(notice::INPUT_LOST)
+    );
+    assert_eq!(
+        rig.host.viewer_notice(&id, Some(notice::WINDOWS)),
+        Some(notice::WINDOWS | notice::INPUT_LOST)
+    );
+    assert_eq!(rig.host.viewer_notice(&id, None), None);
+    send_input(
+        &mut client,
+        &[A_DOWN, InputEvent::PointerMove { x: 9, y: 9 }],
+    )
+    .await;
+    sync(&mut client, 2).await;
+    assert_eq!(rig.backend.recorder.events().len(), 4, "nothing more");
+    drop(client);
+    let MediaOutcome::Served { report, .. } = served.await.unwrap() else {
+        panic!("not served");
+    };
+    assert_eq!(report.input_dropped, 2);
+    assert_eq!(
+        rig.seen.lines(),
+        [
+            "started desk 1280x720 Control input=true",
+            "changed screen=1 of=2 all=false shown=1280x720+0+0 input=true",
+            "changed screen=2 of=2 all=false shown=1024x768+1280+0 input=false",
+            "stopped ViewerLeft",
+        ]
+    );
+
+    // Refused at the first view.
+    let (rig, _) = shifting_rig(two_screens(Selection::Monitor(1)));
+    rig.backend.recorder.refuses.store(true, Ordering::SeqCst);
+    let (id, binding) = start(&rig.host, 66, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    assert!(matches!(
+        next_acking(&mut client).await,
+        Msg::Monitors { seq: 0, .. }
+    ));
+    send_input(&mut client, &[A_DOWN]).await;
+    sync(&mut client, 3).await;
+    assert!(rig.backend.recorder.events().is_empty());
+    assert_eq!(
+        rig.host.viewer_notice(&id, Some(0)),
+        Some(notice::INPUT_LOST)
+    );
+    drop(client);
+    served.await.unwrap();
+    assert_eq!(
+        rig.seen.lines()[..2],
+        [
+            "started desk 1280x720 Control input=true",
+            "changed screen=1 of=2 all=false shown=1280x720+0+0 input=false",
+        ]
+    );
+}
+
+/// A viewer reads past the `Monitors` of a host whose source has monitors
+/// to choose from (the test screens, view-only: a view-only session hears
+/// its monitors too), and decodes every picture in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_viewer_reads_past_the_monitors_of_a_host_with_screens() {
+    let rig = rig_with(
+        TestBackend {
+            desktop: Mutex::new(Some(Box::new(TestScreens::new(&TEST_SCREENS, 30)))),
+            ..TestBackend::default()
+        },
+        MediaLimits::default(),
+    );
+    let (_, binding) = start(&rig.host, 67, SessionMode::ViewOnly);
+    let (client, served) = connect(&rig.host);
+    let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
+    let (mut pictures, done) = Pictures::wanting(5);
+    let mut stats = ViewerStats::default();
+    let end = viewer
+        .run(&mut pictures, &mut stats, async {
+            let _ = done.await;
+        })
+        .await
+        .unwrap();
+    assert_eq!(end, ViewerEnd::Stopped);
+    assert!(pictures.indices.len() >= 5, "{:?}", pictures.indices);
+    for pair in pictures.indices.windows(2) {
+        assert_eq!(pair[1], pair[0] + 1, "{:?}", pictures.indices);
+    }
+    assert!(pictures.sizes.iter().all(|&size| size == (1280, 720)));
+    served.await.unwrap();
+    assert_eq!(
+        rig.seen.lines(),
+        [
+            "started synthetic screens 1280x720 ViewOnly input=false",
+            "changed screen=1 of=2 all=false shown=1280x720+0+0 input=false",
+            "stopped ViewerLeft",
+        ]
+    );
+}
+
+/// From the viewer's side (the monitors design's V4, until its step 13):
+/// a host's `Monitors` is read past, and a `SelectMonitor`, the viewer's own
+/// frame, ends the stream.
+#[tokio::test(start_paused = true)]
+async fn a_viewer_reads_past_monitors_and_refuses_a_hosts_select_monitor() {
+    let (mut host, viewer) = run_viewer_with(None).await;
+    for msg in [
+        Msg::Monitors {
+            request: 0,
+            status: tornect_proto::monitor_status::OK,
+            shown: 2,
+            all: true,
+            remapped: true,
+            list: 3,
+            seq: 0,
+            monitors: vec![
+                tornect_proto::MonitorEntry::saturating(true, 0, 0, 1280, 720),
+                tornect_proto::MonitorEntry::saturating(false, 1280, 0, 0, 0),
+            ],
+        },
+        Msg::Close {
+            reason: reason::ENDED_BY_HOST,
+        },
+    ] {
+        write_msg(&mut host, &msg).await.unwrap();
+    }
+    let (end, _) = viewer.await.unwrap();
+    assert!(
+        matches!(end, Ok(ViewerEnd::Host(r)) if r == reason::ENDED_BY_HOST),
+        "{end:?}"
+    );
+
+    let (mut host, viewer) = run_viewer_with(None).await;
+    let select = Msg::SelectMonitor {
+        request: 1,
+        list: 0,
+        monitor: 2,
+    };
+    write_msg(&mut host, &select).await.unwrap();
+    let (end, _) = viewer.await.unwrap();
+    assert!(
+        matches!(end, Err(ViewerError::Unexpected("SelectMonitor"))),
+        "{end:?}"
+    );
 }
 
 /// Capture that cannot start refuses the bind, says why, and starts nothing.

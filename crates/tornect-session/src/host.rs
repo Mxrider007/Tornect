@@ -34,6 +34,18 @@
 //! settings or of picture size is said in a `Quality` before the first picture
 //! it covers, and the per-stage means go out in a `Stats` about once per
 //! [`MediaLimits::stats_every`], before a picture (the quality design §6.6).
+//!
+//! A source that shows one of several monitors ([`VideoSource::layout`])
+//! has its monitors said in a `Monitors` just before the first picture, and
+//! again before the first picture of every change (the monitors design's H1
+//! and H3, decision M1-75). The injector, a [`Viewport`] in front of the
+//! backend's sink, follows what the picture shows before anything more of
+//! the viewer's is handled (H4). When the picture comes to show another part
+//! of the desktop (`REMAPPED`), input that acts where the pointer is waits
+//! for the viewer's `VideoAck` of that picture, so input made against an
+//! earlier picture never lands on the new screen (H5); an injector that
+//! cannot follow ends the session's input instead
+//! ([`notice::INPUT_LOST`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -43,16 +55,17 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Notify, Semaphore, mpsc, watch};
-use tornect_capture::{CaptureError, Frame, Layout, Selection, VideoSource};
+use tornect_capture::{CaptureError, Frame, Layout, Rect, Selection, VideoSource, View};
 use tornect_codec::H264Encoder;
 use tornect_codec::scale::Scaler;
 use tornect_core::config::{Media, QualityPreset};
 use tornect_core::levels::Elevation;
 use tornect_core::session_log::SessionMode;
-use tornect_input::{InputEvent, InputSink, Tracked};
+use tornect_input::{InputEvent, InputSink, Tracked, Viewport};
 use tornect_proto::{
-    BIND_TYPE, MAX_CLIENT_FRAME, MAX_FRAME, Msg, ProtoError, SESSION_ID_LEN, codec, monitor_status,
-    read_msg_max, reason, video_flags, write_msg,
+    ALL_MONITORS, BIND_TYPE, MAX_CLIENT_FRAME, MAX_FRAME, MAX_MONITORS, MonitorEntry, Msg,
+    ProtoError, SESSION_ID_LEN, codec, monitor_status, read_msg_max, reason, seq_reached,
+    video_flags, write_msg,
 };
 use tornect_signal::consent::{SessionToken, mode_code};
 use tornect_signal::fsm::host::{KillSwitch, LiveSession, SessionEnd, SessionSink};
@@ -247,6 +260,16 @@ pub trait MediaObserver: Send + Sync {
     /// The first picture of a session went out.
     fn capture_started(&self, started: &CaptureStarted<'_>);
 
+    /// What a session's pictures show changed, or its input ended: said for
+    /// the first picture of a source that has monitors to choose from, for
+    /// each picture that shows another part of the desktop (`REMAPPED`), and
+    /// when the injector could not follow (`input: false`), so that the
+    /// sharing indicator sits on the monitor shown and stops claiming control
+    /// (the monitors design §4). The default ignores it.
+    fn capture_changed(&self, changed: &CaptureChanged<'_>) {
+        let _ = changed;
+    }
+
     /// Capture has stopped and the source is closed.
     fn capture_stopped(&self, session_id: &str, report: &MediaReport, end: &MediaEnd);
 }
@@ -279,6 +302,25 @@ pub struct CaptureStarted<'a> {
     pub input: bool,
 }
 
+/// What [`MediaObserver::capture_changed`] is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureChanged<'a> {
+    /// The session.
+    pub session_id: &'a str,
+    /// The rectangle of the desktop the pictures show, in the desktop's
+    /// units (physical pixels on Windows and X11); `None` when the source
+    /// does not place it on a desktop (a Wayland stream).
+    pub shown: Option<Rect>,
+    /// The pictures show all monitors at once.
+    pub all: bool,
+    /// The monitor shown, `1..=of`; 0 with `all`.
+    pub screen: u8,
+    /// How many monitors the source lists.
+    pub of: u8,
+    /// Whether the viewer's input reaches this machine.
+    pub input: bool,
+}
+
 /// What one media stream did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MediaReport {
@@ -294,8 +336,14 @@ pub struct MediaReport {
     pub keyframes_forced: u64,
     /// Input events injected.
     pub input_injected: u64,
-    /// Input events dropped: view-only, over the rate, no injector, or refused.
+    /// Input events dropped: view-only, over the rate, no injector, held
+    /// back, or refused.
     pub input_dropped: u64,
+    /// Input events held back at the remap barrier (among those dropped):
+    /// moves, wheel turns and presses made against a picture from before the
+    /// screen shown changed, and wheel turns and presses before the first
+    /// move after it (the monitors design's H5).
+    pub input_held_back: u64,
     /// `SetQuality`s received.
     pub quality_requests: u64,
     /// Changes of preset that reached the viewer (a `Quality` naming another
@@ -373,6 +421,9 @@ struct Registered {
     /// A control session whose stream is served with no injector: its
     /// viewer's input reaches nothing here.
     no_input: bool,
+    /// A control session whose injector could not follow a change of the
+    /// screen shown, and was dropped: its viewer's input ended.
+    input_lost: bool,
     /// Set to the `Close` reason when the session ends.
     end: watch::Sender<Option<u16>>,
 }
@@ -482,19 +533,27 @@ impl MediaHost {
     /// `code`, the notice code the host tells the viewer of session
     /// `session_id` (decision M1-70, §B.8.4.1), with what the media layer
     /// knows added: [`notice::NO_INPUT`] once the session's control stream is
-    /// served with nothing to inject into. A session told nothing (`None`, a
-    /// view-only one) stays told nothing. The hosts' session sinks answer
-    /// [`SessionSink::notice`] with it, so the viewer of a control session
-    /// whose clicks go nowhere hears why at its next `PING`.
+    /// served with nothing to inject into, and [`notice::INPUT_LOST`] once
+    /// its injector could not follow a change of the screen shown (decision
+    /// M1-75). A session told nothing (`None`, a view-only one) stays told
+    /// nothing. The hosts' session sinks answer [`SessionSink::notice`] with
+    /// it, so the viewer of a control session whose clicks go nowhere hears
+    /// why at its next `PING`.
     #[must_use]
     pub fn viewer_notice(&self, session_id: &str, code: Option<u8>) -> Option<u8> {
         let code = code?;
-        let no_input = self.lock().get(session_id).is_some_and(|s| s.no_input);
-        Some(if no_input {
-            code | notice::NO_INPUT
-        } else {
-            code
-        })
+        let (no_input, input_lost) = self
+            .lock()
+            .get(session_id)
+            .map_or((false, false), |s| (s.no_input, s.input_lost));
+        let mut code = code;
+        if no_input {
+            code |= notice::NO_INPUT;
+        }
+        if input_lost {
+            code |= notice::INPUT_LOST;
+        }
+        Some(code)
     }
 
     /// Serve one stream accepted on the onion service's media port, from its
@@ -745,7 +804,10 @@ impl MediaHost {
         } else {
             None
         };
-        let injector = injector.map(Tracked::new);
+        // The viewport maps the viewer's pointer onto what the picture shows
+        // once the first layout is said (H1); until then, and for a source
+        // with nothing to choose, it passes positions through.
+        let injector: Option<Injector> = injector.map(|sink| Tracked::new(Viewport::new(sink)));
         // A control session left without an injector says so to its viewer,
         // which still sends what the signed accept allows (SLICE-C2 C2-6).
         if matches!(mode, SessionMode::Control) && injector.is_none() {
@@ -793,6 +855,7 @@ impl MediaHost {
             report: MediaReport::default(),
             pong_owed: None,
             session_id: &session_id,
+            screens: Screens::new(),
         };
         let mut seq: u32 = 0;
         let mut pending = Some(first);
@@ -823,7 +886,22 @@ impl MediaHost {
                 torn = stop.torn;
                 break stop.end;
             }
-            if let Some(frame) = pending.take() {
+            if let Some(mut frame) = pending.take() {
+                // What this picture shows, when it changed: the injector
+                // follows it now, before anything more of the viewer's is
+                // handled (H4), and it is said last, just before the picture
+                // (H1, H3).
+                let monitors = match frame.layout.take() {
+                    Some(layout) => Some(self.follow(&mut served, *layout, frame.answers, seq)),
+                    // No switch waits for an answer yet (the design's step
+                    // 11), and nothing changed: nothing to say.
+                    None => {
+                        if let Some(request) = frame.answers {
+                            tracing::debug!(request, "a switch answered with nothing changed");
+                        }
+                        None
+                    }
+                };
                 // Said before the picture it covers: a change of settings or
                 // of size (the quality design §4.1), then the means, when due.
                 let quality = served.announce(&frame);
@@ -832,7 +910,7 @@ impl MediaHost {
                     .stats
                     .due(now)
                     .then(|| Msg::Stats(served.stats.take(now, frame.source)));
-                for msg in [quality, stats].into_iter().flatten() {
+                for msg in [quality, stats, monitors].into_iter().flatten() {
                     if let Err(stop) = send(&mut wr, &msg, &mut end, Some(&mut served)).await {
                         torn = stop.torn;
                         break 'serve stop.end;
@@ -964,6 +1042,108 @@ impl MediaHost {
     }
 }
 
+impl MediaHost {
+    /// `layout` comes with the picture about to be written as `seq` (the
+    /// design's H1 and H3): the injector follows its view, before anything
+    /// more of the viewer's is handled (H4); when the picture shows another
+    /// part of the desktop than the one before, input that acts where the
+    /// pointer is waits for the viewer's `VideoAck` of `seq` (H5); and the
+    /// `Monitors` that says it is returned, to be written just before the
+    /// picture. `answers` is the request the picture answers; none waits for
+    /// one before the design's step 11, so a `Monitors` is the host's own
+    /// news (request 0).
+    ///
+    /// An injector that refuses the view is dropped, which lets go of all it
+    /// holds, and the session's input ends ([`notice::INPUT_LOST`], the
+    /// observer told `input: false`): a click is never mapped onto a screen
+    /// the viewer was not shown.
+    fn follow(
+        &self,
+        served: &mut Served<'_>,
+        layout: Layout,
+        answers: Option<u16>,
+        seq: u32,
+    ) -> Msg {
+        if let Some(request) = answers {
+            tracing::debug!(request, "a switch answered with none waiting: said as news");
+        }
+        let screens = &mut served.screens;
+        let previous = screens.layout.take();
+        if previous
+            .as_ref()
+            .is_some_and(|p| p.monitors != layout.monitors)
+        {
+            screens.list = screens.list.wrapping_add(1);
+        }
+        let remapped = previous
+            .as_ref()
+            .is_some_and(|p| p.shown != layout.shown || p.view != layout.view);
+        // The first view, and every change of it; a picture that shows the
+        // same as before keeps the view, and a held drag goes on.
+        let moved = previous.as_ref().is_none_or(|p| p.view != layout.view);
+        let mut lost = false;
+        if moved
+            && let Some(injector) = served.injector.as_mut()
+            && let Err(e) = injector.retarget(&layout.view)
+        {
+            // Dropped first: `Tracked` lets go of every key and button held.
+            served.injector = None;
+            lost = true;
+            tracing::warn!(
+                session = %served.session_id,
+                error = %e,
+                "the injector could not follow the picture to another screen: \
+                 the viewer's input ends"
+            );
+            if let Some(session) = self.lock().get_mut(served.session_id) {
+                session.input_lost = true;
+            }
+        }
+        let screens = &mut served.screens;
+        if remapped {
+            screens.barrier = Some(seq);
+            screens.placed = false;
+        }
+        let msg = monitors_msg(
+            0,
+            monitor_status::OK,
+            Some(&layout),
+            screens.list,
+            seq,
+            remapped,
+        );
+        if let Msg::Monitors {
+            shown, monitors, ..
+        } = &msg
+        {
+            tracing::debug!(
+                session = %served.session_id,
+                screen = shown,
+                of = monitors.len(),
+                remapped,
+                list = screens.list,
+                seq,
+                "monitors said"
+            );
+            if previous.is_none() || remapped || lost {
+                self.observer.capture_changed(&CaptureChanged {
+                    session_id: served.session_id,
+                    shown: match layout.view {
+                        View::Rect { shown, .. } => Some(shown),
+                        View::Stream { .. } => None,
+                    },
+                    all: *shown == ALL_MONITORS,
+                    screen: *shown,
+                    of: u8::try_from(monitors.len()).unwrap_or(u8::MAX),
+                    input: served.injector.is_some(),
+                });
+            }
+        }
+        served.screens.layout = Some(layout);
+        msg
+    }
+}
+
 impl SessionSink for MediaHost {
     fn on_start(&self, session: &LiveSession<'_>) {
         let (end, _) = watch::channel(None);
@@ -977,6 +1157,7 @@ impl SessionSink for MediaHost {
                 label: session.label.to_owned(),
                 bound: false,
                 no_input: false,
+                input_lost: false,
                 end,
             },
         );
@@ -1300,9 +1481,10 @@ impl Quiet {
 /// so that [`Served::on_client`] is the one code path for every frame the
 /// viewer sends, whether the host is idle or stuck writing to it.
 struct Served<'a> {
-    /// `None`: a view-only session, or a control session with nothing to
-    /// inject into. Dropped first at the end, which releases what it holds.
-    injector: Option<Tracked<Box<dyn InputSink>>>,
+    /// `None`: a view-only session, a control session with nothing to
+    /// inject into, or one whose injector could not follow the picture.
+    /// Dropped first at the end, which releases what it holds.
+    injector: Option<Injector>,
     quiet: Quiet,
     inbound: &'a mut mpsc::Receiver<Result<Msg, ProtoError>>,
     inputs: TokenBucket,
@@ -1323,6 +1505,60 @@ struct Served<'a> {
     /// `sync` sends one ping at a time.
     pong_owed: Option<u64>,
     session_id: &'a str,
+    /// What the pictures show, and the remap barrier.
+    screens: Screens,
+}
+
+/// A control session's injector: the backend's sink behind a [`Viewport`]
+/// that maps the viewer's pointer onto what the picture shows, behind the
+/// [`Tracked`] that lets go of whatever is held, also at every retarget for
+/// the buttons (no drag carries across screens).
+type Injector = Tracked<Viewport<Box<dyn InputSink>>>;
+
+/// What the stream's pictures show (the monitors design's H1, H3 and H5).
+struct Screens {
+    /// The layout said last; `None` for a source with nothing to choose, or
+    /// before its first picture.
+    layout: Option<Layout>,
+    /// The generation of the monitor list said, bumped (wrapping) at each
+    /// change of the monitors (ids, rectangles, primary).
+    list: u16,
+    /// The seq of the first picture that shows another part of the desktop,
+    /// until the viewer acknowledges it: until then every event that acts
+    /// where the pointer is was made against an earlier picture, and is held
+    /// back.
+    barrier: Option<u32>,
+    /// A move has been injected since the barrier was set: the host's
+    /// pointer is on the screen shown. Until then wheel turns and presses
+    /// would act where the pointer was, on the screen shown before, and are
+    /// held back too.
+    placed: bool,
+}
+
+impl Screens {
+    fn new() -> Self {
+        Self {
+            layout: None,
+            list: 0,
+            barrier: None,
+            placed: true,
+        }
+    }
+
+    /// Whether `event` is held back at the barrier (H5): a move, a wheel
+    /// turn or a press while the viewer has not acknowledged the first
+    /// picture of the new screen; a wheel turn or a press after that until a
+    /// move has placed the pointer. Releases and keys always go.
+    fn holds(&self, event: &InputEvent) -> bool {
+        if self.barrier.is_some() {
+            return event.lands_at_pointer();
+        }
+        !self.placed
+            && matches!(
+                event,
+                InputEvent::Wheel { .. } | InputEvent::PointerButton { pressed: true, .. }
+            )
+    }
 }
 
 /// Where the viewer's quality picks stand (the quality design §6.6).
@@ -1361,6 +1597,15 @@ impl Served<'_> {
         };
         match msg {
             Msg::VideoAck { seq } => {
+                // The viewer has the first picture of the new screen: what it
+                // sends from here on was made against it (H5).
+                if self
+                    .screens
+                    .barrier
+                    .is_some_and(|barrier| seq_reached(seq, barrier))
+                {
+                    self.screens.barrier = None;
+                }
                 if let Some(rtt) = self.window.ack(seq, now) {
                     self.stats.acked(rtt);
                     self.report.acks += 1;
@@ -1380,6 +1625,14 @@ impl Served<'_> {
                 let Ok(event) = InputEvent::decode(&bytes) else {
                     return Handled::End(MediaEnd::Protocol);
                 };
+                // Made against a picture of another screen, or before the
+                // pointer was placed on this one (H5): held back, before it
+                // spends any budget.
+                if self.screens.holds(&event) {
+                    self.report.input_held_back += 1;
+                    self.report.input_dropped += 1;
+                    return Handled::Continue;
+                }
                 // A release never spends the budget, so it is never dropped: a
                 // lost key-up would leave the key down on this desktop
                 // (SLICE-E E1-6). `Tracked` injects one only for what it holds,
@@ -1389,7 +1642,12 @@ impl Served<'_> {
                     return Handled::Continue;
                 }
                 match sink.inject(&event) {
-                    Ok(()) => self.report.input_injected += 1,
+                    Ok(()) => {
+                        self.report.input_injected += 1;
+                        if matches!(event, InputEvent::PointerMove { .. }) {
+                            self.screens.placed = true;
+                        }
+                    }
                     Err(e) => {
                         self.report.input_dropped += 1;
                         tracing::debug!(error = %e, "input event not injected");
@@ -1541,6 +1799,78 @@ impl Served<'_> {
     }
 }
 
+/// A `Monitors` that says `layout` (`None`: nothing to choose) under list
+/// generation `list`, for the pictures from `seq` on: the answer `status` to
+/// `request`, or the host's news (request 0, then always OK). It keeps every
+/// rule of the wire whatever the source measured (the design's §3): at most
+/// [`MAX_MONITORS`] entries, each made in range by
+/// [`MonitorEntry::saturating`], one primary at most, "all" offered only
+/// with two or more, `shown` one of those listed (by id), `REMAPPED` only on
+/// an OK that lists a monitor. Nothing but numbers goes out: no name, model
+/// or serial.
+fn monitors_msg(
+    request: u16,
+    status: u8,
+    layout: Option<&Layout>,
+    list: u16,
+    seq: u32,
+    remapped: bool,
+) -> Msg {
+    let status = if request == 0 {
+        monitor_status::OK
+    } else {
+        status
+    };
+    let listed = layout.map_or(&[][..], |l| {
+        &l.monitors[..l.monitors.len().min(MAX_MONITORS)]
+    });
+    let mut primary = false;
+    let monitors: Vec<MonitorEntry> = listed
+        .iter()
+        .map(|m| {
+            MonitorEntry::saturating(
+                m.primary && !std::mem::replace(&mut primary, true),
+                i64::from(m.rect.x),
+                i64::from(m.rect.y),
+                u64::from(m.rect.width),
+                u64::from(m.rect.height),
+            )
+        })
+        .collect();
+    let n = monitors.len();
+    let all = layout.is_some_and(|l| l.all) && n >= 2;
+    let position = |id: u8| {
+        listed
+            .iter()
+            .position(|m| m.id == id)
+            .and_then(|i| u8::try_from(i + 1).ok())
+    };
+    let shown = match layout.map(|l| l.shown) {
+        Some(Selection::All) if all => Some(ALL_MONITORS),
+        Some(Selection::Monitor(id)) => position(id),
+        _ => None,
+    };
+    let shown = shown.unwrap_or_else(|| {
+        if n > 0 {
+            tracing::warn!(
+                of = n,
+                "the source's layout shows a monitor it does not list: said as monitor 1"
+            );
+        }
+        u8::from(n > 0)
+    });
+    Msg::Monitors {
+        request,
+        status,
+        shown,
+        all,
+        remapped: remapped && status == monitor_status::OK && n > 0,
+        list,
+        seq,
+        monitors,
+    }
+}
+
 /// Add `d` to `sum` in microseconds, saturating.
 fn add_us(sum: &mut u64, d: Duration) {
     *sum = sum.saturating_add(u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
@@ -1574,24 +1904,10 @@ struct Encoded {
     /// new one. The host says it in a `Monitors` just before this picture (the
     /// monitors design's H1 and H3). A repeat never carries one. Boxed: it
     /// comes with few pictures, and every picture moves through a channel.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by the host's loop from the monitors design's step 10"
-        )
-    )]
     layout: Option<Box<Layout>>,
     /// The `SelectMonitor` this picture answers: the first picture captured
     /// after the source switched to the selection it asked for, a keyframe.
     /// A repeat never answers one.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by the host's loop from the monitors design's step 10"
-        )
-    )]
     answers: Option<u16>,
 }
 
@@ -2834,6 +3150,7 @@ mod tests {
             report: MediaReport::default(),
             pong_owed: None,
             session_id: "s",
+            screens: Screens::new(),
         };
         let fast = tornect_proto::quality::BEST_PERFORMANCE;
         served.quality.gate.request(fast);
@@ -2896,6 +3213,7 @@ mod tests {
             report: MediaReport::default(),
             pong_owed: None,
             session_id: "s",
+            screens: Screens::new(),
         };
         let code = tornect_proto::quality::BEST_PERFORMANCE;
 
@@ -3010,7 +3328,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, &(width, height))| {
-                    let rect = tornect_capture::Rect::new(x, 0, width, height);
+                    let rect = Rect::new(x, 0, width, height);
                     x += i32::try_from(width).unwrap();
                     tornect_capture::Monitor {
                         id: u8::try_from(i + 1).unwrap(),
@@ -3019,7 +3337,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let space = tornect_capture::Rect::new(
+            let space = Rect::new(
                 0,
                 0,
                 self.sizes.iter().map(|s| s.0).sum(),
@@ -3033,7 +3351,7 @@ mod tests {
                 all: monitors.len() >= 2,
                 monitors,
                 shown: self.shown,
-                view: tornect_capture::View::Rect { shown, space },
+                view: View::Rect { shown, space },
             }
         }
 
@@ -3064,7 +3382,7 @@ mod tests {
                 return Ok(None);
             }
             let layout = self.now();
-            let tornect_capture::View::Rect { shown, .. } = layout.view else {
+            let View::Rect { shown, .. } = layout.view else {
                 unreachable!("a desk shows rectangles")
             };
             self.last = Some(layout);
@@ -3192,7 +3510,6 @@ mod tests {
     /// picture of their union.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_selection_is_taken_while_the_thread_waits_for_a_credit() {
-        use tornect_capture::{Rect, View};
         let (mut pipeline, desk) = desk(&[(320, 192), (256, 128)], 1);
         let space = Rect::new(0, 0, 576, 192);
         let first = picture(&mut pipeline).await;
@@ -3399,5 +3716,210 @@ mod tests {
             stopping.elapsed()
         );
         assert!(desk.closed.load(Ordering::SeqCst), "the source is closed");
+    }
+
+    /// `monitors_msg` keeps every rule of the wire whatever a source says
+    /// (the design's §3), so the encoder's check never fires and a viewer
+    /// never reads a malformed `Monitors`: at most 16 entries, one primary,
+    /// sides and corners in range, "all" only with two or more, `shown` one
+    /// of those listed, REMAPPED only on an OK with a monitor, news always
+    /// OK; nothing to choose is an empty list showing 0.
+    #[test]
+    fn a_monitors_message_keeps_the_wire_rules_whatever_the_source_says() {
+        use tornect_capture::Monitor;
+        let monitor = |id: u8, primary: bool, rect: Rect| Monitor { id, primary, rect };
+        let decodes = |msg: &Msg| {
+            let decoded = Msg::decode(&msg.encode()[4..]).expect("a valid Monitors");
+            assert_eq!(&decoded, msg);
+            decoded
+        };
+        // 20 monitors, every one primary, corners out of range, the first
+        // wider than a side can be.
+        let many: Vec<Monitor> = (1..=20u8)
+            .map(|id| {
+                let x = i32::from(id) * 40_000 - 400_000;
+                let width = if id == 1 { 40_000 } else { 30_000 };
+                monitor(id, true, Rect::new(x, -70_000, width, u32::from(id) * 1000))
+            })
+            .collect();
+        let space = Rect::new(-400_000, -70_000, 800_000, 20_000);
+        let layout = Layout {
+            monitors: many,
+            all: true,
+            shown: Selection::Monitor(3),
+            view: View::Rect {
+                shown: Rect::new(0, 0, 2, 2),
+                space,
+            },
+        };
+        let Msg::Monitors {
+            request,
+            status,
+            shown,
+            all,
+            remapped,
+            list,
+            seq,
+            monitors,
+        } = decodes(&monitors_msg(
+            0,
+            monitor_status::FAILED,
+            Some(&layout),
+            9,
+            77,
+            true,
+        ))
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (request, status, shown, all, remapped, list, seq),
+            (0, 0, 3, true, true, 9, 77)
+        );
+        assert_eq!(monitors.len(), MAX_MONITORS);
+        assert_eq!(monitors.iter().filter(|m| m.primary).count(), 1);
+        assert!(monitors[0].primary);
+        assert_eq!(
+            (
+                monitors[0].x,
+                monitors[0].y,
+                monitors[0].width,
+                monitors[0].height
+            ),
+            (MonitorEntry::MIN_COORD, MonitorEntry::MIN_COORD, 0, 0),
+            "a side above 32768 is said as unknown"
+        );
+        assert_eq!(monitors[2].height, 3000);
+
+        // A monitor past the 16 listed, or one not listed at all, is said as
+        // monitor 1; "all" with one monitor is no "all".
+        for shown in [Selection::Monitor(17), Selection::Monitor(0)] {
+            let layout = Layout {
+                shown,
+                ..layout.clone()
+            };
+            let msg = decodes(&monitors_msg(0, 0, Some(&layout), 0, 0, false));
+            assert!(matches!(msg, Msg::Monitors { shown: 1, .. }), "{msg:?}");
+        }
+        let one = Layout {
+            monitors: vec![monitor(1, false, Rect::new(0, 0, 640, 480))],
+            all: true,
+            shown: Selection::All,
+            view: View::Rect {
+                shown: Rect::new(0, 0, 640, 480),
+                space: Rect::new(0, 0, 640, 480),
+            },
+        };
+        let msg = decodes(&monitors_msg(0, 0, Some(&one), 0, 0, true));
+        assert!(
+            matches!(
+                msg,
+                Msg::Monitors {
+                    shown: 1,
+                    all: false,
+                    remapped: true,
+                    ..
+                }
+            ),
+            "{msg:?}"
+        );
+        let msg = decodes(&monitors_msg(0, 0, Some(&layout), 0, 0, false));
+        let all = Layout {
+            shown: Selection::All,
+            ..layout.clone()
+        };
+        assert!(matches!(
+            msg,
+            Msg::Monitors {
+                shown: 3,
+                all: true,
+                ..
+            }
+        ));
+        let msg = decodes(&monitors_msg(0, 0, Some(&all), 0, 0, false));
+        assert!(matches!(
+            msg,
+            Msg::Monitors {
+                shown: 0,
+                all: true,
+                ..
+            }
+        ));
+
+        // An answer keeps its status; only an OK says REMAPPED.
+        let msg = decodes(&monitors_msg(
+            5,
+            monitor_status::BUSY,
+            Some(&layout),
+            1,
+            2,
+            true,
+        ));
+        assert!(matches!(
+            msg,
+            Msg::Monitors {
+                request: 5,
+                status: monitor_status::BUSY,
+                remapped: false,
+                ..
+            }
+        ));
+        // Nothing to choose.
+        let msg = decodes(&monitors_msg(6, monitor_status::UNKNOWN, None, 0, 3, true));
+        assert_eq!(
+            msg,
+            Msg::Monitors {
+                request: 6,
+                status: monitor_status::UNKNOWN,
+                shown: 0,
+                all: false,
+                remapped: false,
+                list: 0,
+                seq: 3,
+                monitors: Vec::new(),
+            }
+        );
+    }
+
+    /// The barrier's rule (H5) on its own: with the barrier up, moves, wheel
+    /// turns and presses are held back; once it is down and until a move
+    /// placed the pointer, wheel turns and presses; keys and releases never.
+    #[test]
+    fn the_barrier_holds_back_what_acts_where_the_pointer_is() {
+        let left = |pressed| InputEvent::PointerButton {
+            button: tornect_input::Button::Left,
+            pressed,
+        };
+        let events = [
+            InputEvent::PointerMove { x: 1, y: 2 },
+            InputEvent::Wheel { dx: 0, dy: 120 },
+            left(true),
+            left(false),
+            InputEvent::Key {
+                usb: 0x07_0004,
+                pressed: true,
+            },
+            InputEvent::Key {
+                usb: 0x07_0004,
+                pressed: false,
+            },
+            InputEvent::ReleaseAll,
+        ];
+        let held = |screens: &Screens| events.map(|e| screens.holds(&e));
+        let mut screens = Screens::new();
+        assert_eq!(held(&screens), [false; 7], "no barrier at the start");
+        screens.barrier = Some(4);
+        screens.placed = false;
+        assert_eq!(
+            held(&screens),
+            [true, true, true, false, false, false, false]
+        );
+        screens.barrier = None;
+        assert_eq!(
+            held(&screens),
+            [false, true, true, false, false, false, false]
+        );
+        screens.placed = true;
+        assert_eq!(held(&screens), [false; 7]);
     }
 }
