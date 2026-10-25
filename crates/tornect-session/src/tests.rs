@@ -4518,7 +4518,9 @@ async fn a_change_of_screen_is_said_before_its_picture_and_earlier_input_waits_f
 /// A change of the monitor list that moves nothing (the primary is now
 /// monitor 2, and monitor 1 is still shown) is said with a new list and
 /// REMAPPED clear: the injector keeps its view, a drag goes on, nothing is
-/// held back, and the indicator stays where it is.
+/// held back, and the indicator stays where it is. (The drag starts with a
+/// move: the session opens on one of two screens, so a press waits for the
+/// pointer to be placed.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_list_that_moves_nothing_holds_nothing_back() {
     let (rig, layout) = shifting_rig(two_screens(Selection::Monitor(1)));
@@ -4529,7 +4531,8 @@ async fn a_new_list_that_moves_nothing_holds_nothing_back() {
         next_monitors(&mut client).await,
         Msg::Monitors { list: 0, .. }
     ));
-    send_input(&mut client, &[LEFT_DOWN]).await;
+    let start_at = InputEvent::PointerMove { x: 100, y: 100 };
+    send_input(&mut client, &[start_at, LEFT_DOWN]).await;
     sync(&mut client, 1).await;
 
     let mut new_primary = two_screens(Selection::Monitor(1));
@@ -4552,7 +4555,12 @@ async fn a_new_list_that_moves_nothing_holds_nothing_back() {
     assert_eq!(rig.backend.recorder.views(), [(0, view)]);
     assert_eq!(
         rig.backend.recorder.events(),
-        [LEFT_DOWN, moved_over(65535, 65535, view), LEFT_UP]
+        [
+            moved_over(100, 100, view),
+            LEFT_DOWN,
+            moved_over(65535, 65535, view),
+            LEFT_UP
+        ]
     );
     drop(client);
     let MediaOutcome::Served { report, .. } = served.await.unwrap() else {
@@ -4575,7 +4583,8 @@ async fn a_new_list_that_moves_nothing_holds_nothing_back() {
 /// (the button by the retarget, the key when the injector is dropped), the
 /// notice gains `INPUT_LOST` (not `NO_INPUT`), the indicator hears
 /// `input: false`, and later input reaches nothing. At the first picture:
-/// the same, before any input.
+/// the same, before any input. (The press follows a move: the session opens
+/// on one of two screens, so a press waits for the pointer to be placed.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_injector_that_cannot_follow_the_picture_ends_the_sessions_input() {
     use tornect_signal::messages::notice;
@@ -4584,7 +4593,8 @@ async fn an_injector_that_cannot_follow_the_picture_ends_the_sessions_input() {
     let (mut client, served) = connect(&rig.host);
     bind_raw(&mut client, &binding).await;
     next_monitors(&mut client).await;
-    send_input(&mut client, &[A_DOWN, LEFT_DOWN]).await;
+    let placed = InputEvent::PointerMove { x: 100, y: 100 };
+    send_input(&mut client, &[A_DOWN, placed, LEFT_DOWN]).await;
     sync(&mut client, 1).await;
     assert_eq!(rig.host.viewer_notice(&id, Some(0)), Some(0));
 
@@ -4599,9 +4609,10 @@ async fn an_injector_that_cannot_follow_the_picture_ends_the_sessions_input() {
             ..
         }
     ));
+    let placed = moved_over(100, 100, two_screens(Selection::Monitor(1)).view);
     assert_eq!(
         rig.backend.recorder.events(),
-        [A_DOWN, LEFT_DOWN, LEFT_UP, A_UP],
+        [A_DOWN, placed, LEFT_DOWN, LEFT_UP, A_UP],
         "everything held let go of"
     );
     assert_eq!(
@@ -4619,7 +4630,7 @@ async fn an_injector_that_cannot_follow_the_picture_ends_the_sessions_input() {
     )
     .await;
     sync(&mut client, 2).await;
-    assert_eq!(rig.backend.recorder.events().len(), 4, "nothing more");
+    assert_eq!(rig.backend.recorder.events().len(), 5, "nothing more");
     drop(client);
     let MediaOutcome::Served { report, .. } = served.await.unwrap() else {
         panic!("not served");
@@ -5520,6 +5531,55 @@ async fn input_follows_the_screen_asked_for_once_its_picture_is_acknowledged() {
         "three before the ack, a press after"
     );
     assert_eq!(report.monitor_switches, 1);
+}
+
+/// The final review of the monitors feature: a session that opens on one
+/// monitor of several (the primary) holds back wheel turns and presses until
+/// the viewer's first move has placed the host's pointer on it, as after a
+/// remap (H5): the pointer may sit on a monitor the viewer is not shown.
+/// Keys go. A session whose first picture shows the whole desktop holds
+/// nothing back, as before monitors could be chosen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_opening_on_one_of_several_screens_waits_for_a_move_before_a_click() {
+    let wheel = InputEvent::Wheel { dx: 0, dy: -120 };
+    let rig = screens_rig(&TEST_SCREENS, 30, MediaLimits::default());
+    let (_, binding) = start(&rig.host, 86, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    next_monitors(&mut client).await;
+    send_input(&mut client, &[wheel, LEFT_DOWN, A_DOWN, A_UP]).await;
+    sync(&mut client, 1).await;
+    assert_eq!(
+        rig.backend.recorder.events(),
+        [A_DOWN, A_UP],
+        "before a move only the key goes"
+    );
+    let middle = InputEvent::PointerMove { x: 32768, y: 32768 };
+    send_input(&mut client, &[middle, wheel, LEFT_DOWN, LEFT_UP]).await;
+    sync(&mut client, 2).await;
+    let placed = moved_over(32768, 32768, two_screens(Selection::Monitor(1)).view);
+    assert_eq!(
+        rig.backend.recorder.events(),
+        [A_DOWN, A_UP, placed, wheel, LEFT_DOWN, LEFT_UP]
+    );
+    let report = close_and_report(&mut client, served).await;
+    assert_eq!(report.input_held_back, 2, "the wheel turn and the press");
+
+    let rig = screens_rig(&[(640, 360)], 30, MediaLimits::default());
+    let (_, binding) = start(&rig.host, 87, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    let (first, _) = said(&next_monitors(&mut client).await);
+    assert_eq!((first.shown, first.n), (1, 1));
+    send_input(&mut client, &[wheel, LEFT_DOWN, LEFT_UP]).await;
+    sync(&mut client, 3).await;
+    assert_eq!(
+        rig.backend.recorder.events(),
+        [wheel, LEFT_DOWN, LEFT_UP],
+        "the whole desktop is shown, the pointer on it"
+    );
+    let report = close_and_report(&mut client, served).await;
+    assert_eq!(report.input_held_back, 0);
 }
 
 /// Session test 6: a view-only viewer may switch (a viewing choice): its

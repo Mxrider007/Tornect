@@ -1152,6 +1152,16 @@ impl MediaHost {
             screens.barrier = Some(seq);
             screens.placed = false;
         }
+        // The first picture shows one part of the desktop (the primary of
+        // several monitors): the host's pointer may be on another, which the
+        // viewer was never shown, so wheel turns and presses wait for the
+        // first move, as after a remap (H5). No input has been read yet, so
+        // there is nothing for a barrier to hold.
+        if previous.is_none()
+            && matches!(layout.view, View::Rect { shown, space } if shown != space)
+        {
+            screens.placed = false;
+        }
         let msg = monitors_msg(
             answer.unwrap_or(0),
             monitor_status::OK,
@@ -1580,10 +1590,11 @@ struct Screens {
     /// where the pointer is was made against an earlier picture, and is held
     /// back.
     barrier: Option<u32>,
-    /// A move has been injected since the barrier was set: the host's
+    /// A move has been injected since the barrier was set, or since the
+    /// first picture when that shows only part of the desktop: the host's
     /// pointer is on the screen shown. Until then wheel turns and presses
-    /// would act where the pointer was, on the screen shown before, and are
-    /// held back too.
+    /// would act where the pointer was, on a screen the viewer is not shown,
+    /// and are held back too.
     placed: bool,
     /// The switch handed to the pipeline for a viewer's `SelectMonitor`,
     /// until it is answered: one at a time (H2).
