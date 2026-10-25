@@ -681,6 +681,27 @@ impl<S: InputSink> InputSink for Viewport<S> {
     }
 }
 
+/// Pixel `pos` of a `size`-pixel axis of the Windows virtual desktop, as the
+/// coordinate `SendInput` takes with `MOUSEEVENTF_ABSOLUTE |
+/// MOUSEEVENTF_VIRTUALDESK`.
+///
+/// Windows does not document how it turns that coordinate into a pixel. Both
+/// Microsoft's UI Automation proxies and Chromium encode for `pixel =
+/// floor(d · size / 65536)`, a cell of `65536 / size` per pixel, not for the
+/// `0 = first, 65535 = last` scale [`denormalize`] inverts, which under that
+/// rule lands a pixel near the left or top one short, onto the neighbouring
+/// monitor at a seam (`docs/research/monitors.md` §2). This takes the centre of
+/// the pixel's cell, rounded so that the rule gives `pos` back for every size
+/// up to 65 535 and for every pixel of 65 536 but the first; it is never 0,
+/// which Windows 10 1709 and later no longer move the pointer to.
+#[cfg(any(windows, test))]
+pub(crate) fn virtual_desk_coordinate(pos: u32, size: u32) -> i32 {
+    let size = u64::from(size.max(1));
+    let pos = u64::from(pos).min(size - 1);
+    let centre = ((2 * pos + 1) * 32_768 + (size - 1) / 2) / size;
+    i32::try_from(centre.clamp(1, 65_535)).unwrap_or(65_535)
+}
+
 /// Map a normalized `0..=65535` coordinate onto `0..size` pixels.
 #[must_use]
 pub fn denormalize(v: u16, size: u32) -> u32 {
@@ -1475,6 +1496,87 @@ mod tests {
         assert!(!not.iter().any(InputEvent::lands_at_pointer));
     }
 
+    /// The pixel Windows moves the pointer to for virtual-desk coordinate
+    /// `d` on a `size`-pixel axis, under the rule Microsoft's UI Automation
+    /// proxies and Chromium encode for (`docs/research/monitors.md` §2).
+    pub(crate) fn windows_pixel(d: i32, size: u32) -> u32 {
+        let d = u64::try_from(d).expect("a coordinate SendInput takes");
+        u32::try_from(d * u64::from(size) / 65_536).unwrap()
+    }
+
+    /// Every pixel of a virtual desktop up to 65 535 wide is reached exactly
+    /// under Windows' rule, and never through coordinate 0. Every width up to
+    /// 4096 and the wide layouts below are checked whole here; every width up
+    /// to 65 536 was checked whole once (docs/VERIFICATION.md).
+    #[test]
+    fn every_pixel_of_the_virtual_desk_is_reached() {
+        let widths = (1..=4096).chain([
+            4480, 7680, 12_400, 15_360, 17_408, 23_040, 32_767, 32_768, 32_769, 65_534, 65_535,
+        ]);
+        for size in widths {
+            for pos in 0..size {
+                let d = virtual_desk_coordinate(pos, size);
+                assert!((1..=65_535).contains(&d), "{pos} of {size}: {d}");
+                assert_eq!(windows_pixel(d, size), pos, "{pos} of {size}");
+            }
+        }
+        // 65 536 wide: every pixel but the first, which only coordinate 0
+        // reaches, and Windows no longer moves there; its neighbour is next.
+        for pos in 1..MAX_SPACE {
+            assert_eq!(
+                windows_pixel(virtual_desk_coordinate(pos, MAX_SPACE), MAX_SPACE),
+                pos
+            );
+        }
+        assert_eq!(virtual_desk_coordinate(0, MAX_SPACE), 1);
+        // Past the axis is its last pixel; an empty axis has only pixel 0.
+        assert_eq!(
+            windows_pixel(virtual_desk_coordinate(5000, 1920), 1920),
+            1919
+        );
+        assert_eq!(windows_pixel(virtual_desk_coordinate(3, 0), 1), 0);
+    }
+
+    /// The rounding this replaces: `normalize_pixel`'s 0-to-65535 scale, which
+    /// `denormalize` inverts, lands a pixel near the left edge one short under
+    /// Windows' rule, so Screen 2's first column at a seam was Screen 1's
+    /// last. The cases the review found, then the same seams through the
+    /// whole chain (`remap` onto each monitor, the sink's coordinate), every
+    /// column of every monitor of two wide layouts.
+    #[test]
+    fn a_seam_column_lands_on_its_own_monitor() {
+        let old = |pos, size| windows_pixel(i32::from(normalize_pixel(pos, size)), size);
+        assert_eq!(old(1280, 12_400), 1279, "1280 + 3440 + 7680");
+        assert_eq!(old(1024, 17_408), 1023, "1024 + 1024 + 7680 + 7680");
+        assert_eq!(old(2048, 17_408), 2047);
+        for (pos, size) in [(1280, 12_400), (1024, 17_408), (2048, 17_408)] {
+            assert_eq!(windows_pixel(virtual_desk_coordinate(pos, size), size), pos);
+        }
+
+        for widths in [&[1280, 3440, 7680][..], &[1024, 1024, 7680, 7680]] {
+            // Side by side, the leftmost one left of the primary.
+            let total: u32 = widths.iter().sum();
+            let space = Rect::new(-i32::try_from(widths[0]).unwrap(), 0, total, 2160);
+            let mut x = space.x;
+            for &width in widths {
+                let shown = Rect::new(x, 0, width, 2160);
+                for column in 0..width {
+                    let at = normalize_pixel(column, width);
+                    let (sx, _) = remap(at, 0, shown, space);
+                    let px = denormalize(sx, space.width);
+                    let landed =
+                        windows_pixel(virtual_desk_coordinate(px, space.width), space.width);
+                    assert_eq!(
+                        i64::from(space.x) + i64::from(landed),
+                        i64::from(x) + i64::from(column),
+                        "column {column} of the monitor at {x} in {widths:?}"
+                    );
+                }
+                x += i32::try_from(width).unwrap();
+            }
+        }
+    }
+
     /// The bounds of the exactness below: the largest spaces, every pixel.
     #[test]
     fn every_pixel_of_the_largest_spaces_survives_normalizing() {
@@ -1493,7 +1595,10 @@ mod tests {
     mod props {
         use proptest::prelude::*;
 
-        use super::super::{MAX_SPACE, Rect, denormalize, normalize, normalize_pixel, remap};
+        use super::super::{
+            MAX_SPACE, Rect, denormalize, normalize, normalize_pixel, remap,
+            virtual_desk_coordinate,
+        };
 
         /// A space up to `MAX_SPACE` on a side and a non-empty rectangle
         /// inside it.
@@ -1537,6 +1642,23 @@ mod tests {
                     + i64::from(denormalize(y, shown.height));
                 prop_assert_eq!(i64::from(denormalize(rx, space.width)), want_x);
                 prop_assert_eq!(i64::from(denormalize(ry, space.height)), want_y);
+            }
+
+            /// Through the Windows sink's coordinate, `SendInput` reaches the
+            /// pixel `remap` meant, under Windows' rule, on any virtual
+            /// desktop up to 65 535 wide (the first pixel of a 65 536-wide
+            /// one is the test above's).
+            #[test]
+            fn the_virtual_desk_reaches_the_shown_pixel(
+                (shown, space) in shown_in_space(),
+                x: u16,
+            ) {
+                prop_assume!(space.width < MAX_SPACE);
+                let (rx, _) = remap(x, 0, shown, space);
+                let px = denormalize(rx, space.width);
+                let d = virtual_desk_coordinate(px, space.width);
+                prop_assert!((1..=65_535).contains(&d));
+                prop_assert_eq!(super::windows_pixel(d, space.width), px);
             }
 
             /// A pixel normalized over a space up to `MAX_SPACE` and placed
