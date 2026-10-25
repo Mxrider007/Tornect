@@ -16,7 +16,13 @@
 //! protocol, §3.5): at most [`MAX_UPLOADS`](super::MAX_UPLOADS) are offered at
 //! once and the others wait, in order; each is read on a blocking worker and
 //! sent within the host's bulk window, and reported as
-//! [`ViewerEvent::Transfer`] rows under ids of their own.
+//! [`ViewerEvent::Transfer`] rows under ids of their own. Every file sent,
+//! a dropped one included, first passes the viewer's own
+//! [`Access`](super::Access) ([`ViewerLocal::access`]): a slip never offers
+//! Tornect's own files, and nothing goes to the host for a file refused
+//! there. "Send files" browses the viewer's own folders through the same
+//! rules ([`ViewerOp::OpenLocal`], [`ViewerOp::UploadLocal`]), with handles
+//! of its own.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -31,19 +37,72 @@ use tornect_proto::services::{
 };
 use tornect_signal::consent::SessionToken;
 
+use super::browse::{Access, ListingView, LocalFiles};
 use super::chat::{self, ChatGate, ChatText, sanitize_peer_text};
 use super::reader::{CapState, Inbound, ReadEnd, read_frames};
+use super::store::{FreeSpaceFn, unknown_free_space};
 use super::transfer::TransferRow;
 use super::upload::ViewerUploads;
 use super::window::{CLIPBOARD, Window};
 use super::writer::spawn_writer;
+use super::{ServicesLimits, ServicesPolicy};
 
 /// Decoded frames held between the viewer's reader and its loop.
 const INBOUND_DEPTH: usize = 8;
 
-/// Bound on each chunk read from a file being sent: a read that takes longer
-/// cancels the transfer with `IO` (the host's `read_timeout`, design §3.5).
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// What the viewer's end of a services stream works with on its own
+/// computer (the design's §5.1, §5.2, §6.1).
+pub struct ViewerLocal {
+    /// Where downloads land: `<Downloads>/Tornect`
+    /// (`tornect_core::files::downloads_dir`); `None` when this computer
+    /// has no Downloads folder.
+    pub downloads: Option<PathBuf>,
+    /// What may be sent, and what "Send files" lists: this computer's own
+    /// places and deny-list (its Tornect folders, both `TORNECT_HOME`'s and
+    /// the platform's, and on Linux the system folders).
+    pub access: Arc<Access>,
+    /// The free space of the downloads folder's disk
+    /// (`tornect_platform::disk::available`).
+    pub free_space: FreeSpaceFn,
+    /// The largest file downloaded, in bytes (this computer's own
+    /// `[services] max_file_mib`).
+    pub max_file: u64,
+    /// Downloading stops before the disk has less than this free, in bytes
+    /// (`[services] keep_free_mib`).
+    pub keep_free: u64,
+    /// The bounds of the local listing and of the transfers: `chunk`,
+    /// `read_timeout`, `max_entries`, `list_timeout`, `max_handles`,
+    /// `recheck_free_every` and `workers_wait` count here.
+    pub limits: ServicesLimits,
+}
+
+impl Default for ViewerLocal {
+    /// Nothing to send and nowhere to download to: an [`Access`] that
+    /// refuses every path, no Downloads folder, no free space known, and
+    /// the default policy's limits.
+    fn default() -> Self {
+        let policy = ServicesPolicy::default();
+        Self {
+            downloads: None,
+            access: Arc::new(Access::none()),
+            free_space: unknown_free_space(),
+            max_file: policy.max_file,
+            keep_free: policy.keep_free,
+            limits: ServicesLimits::default(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ViewerLocal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ViewerLocal")
+            .field("downloads", &self.downloads.is_some())
+            .field("access", &self.access)
+            .field("max_file", &self.max_file)
+            .field("keep_free", &self.keep_free)
+            .finish_non_exhaustive()
+    }
+}
 
 /// What the viewer binds its services stream with: the session's id and the
 /// services MAC over the handshake's final transcript (§3.3). Its `Debug`
@@ -112,10 +171,20 @@ pub enum ServicesBindError {
 pub enum ViewerOp {
     /// Write to the host's user.
     Chat(ChatText),
-    /// Send the file at this path to the host's inbox. It is reported as a
-    /// [`ViewerEvent::Transfer`] row under an id of its own; without
-    /// `UPLOAD` the row fails at once with `NOT_OFFERED`.
+    /// Send the file at this path to the host's inbox (a file dropped on
+    /// the window). It is reported as a [`ViewerEvent::Transfer`] row under
+    /// an id of its own; without `UPLOAD` the row fails at once with
+    /// `NOT_OFFERED`, and a file [`ViewerLocal::access`] refuses fails with
+    /// its reason (`DENIED`, `NOT_FOUND`), nothing sent.
     UploadPath(PathBuf),
+    /// List this computer's folder with this local handle ("Send files"; 0:
+    /// this computer's places): a [`ViewerEvent::Listing`] with `remote`
+    /// false, or a [`ViewerEvent::ListFailed`].
+    OpenLocal(u32),
+    /// Send this computer's file with this local handle, as
+    /// [`ViewerOp::UploadPath`] does; an unknown handle fails its row with
+    /// `NOT_FOUND`.
+    UploadLocal(u32),
     /// Stop the transfer whose row has this id.
     Cancel(u32),
 }
@@ -135,6 +204,23 @@ pub enum ViewerEvent {
     /// A transfer was asked for, moved on or ended. Its `xfer` is the row's
     /// id ([`ViewerOp::Cancel`] takes it), not the wire's.
     Transfer(TransferRow),
+    /// A page of a folder's listing: the other computer's (`remote`), or
+    /// this computer's own for "Send files".
+    Listing {
+        /// Whether it is the other computer's folder.
+        remote: bool,
+        /// The page.
+        view: ListingView,
+    },
+    /// A folder could not be listed, with this [`reason`] code: `NOT_FOUND`
+    /// (gone, or a handle too old: list again), `DENIED` (Tornect's own
+    /// folders, or not readable), `IO`, `BUSY`.
+    ListFailed {
+        /// Whether it was the other computer's folder.
+        remote: bool,
+        /// Why.
+        reason: u16,
+    },
     /// The stream ended with this [`reason`] code: the host's `Close`, or the
     /// viewer's own (`PROTOCOL`, `IO`). Not sent when the viewer stopped it.
     Closed(u16),
@@ -217,31 +303,36 @@ where
     /// `Close{SESSION_OVER}` is sent: the viewer's session is over), or it
     /// breaks: the user's requests come on `ops`, and what happens goes out
     /// on `events` (dropped while `events` is full: its reader is stuck,
-    /// and the end is also returned). Transfers still running at the end
-    /// are reported ended with the stream's reason.
+    /// and the end is also returned); `local` is what it works with on this
+    /// computer. Transfers still running at the end are reported ended with
+    /// the stream's reason.
     pub async fn run<F>(
         self,
         mut ops: mpsc::Receiver<ViewerOp>,
         events: mpsc::Sender<ViewerEvent>,
+        local: ViewerLocal,
         stop: F,
     ) -> ViewerServicesEnd
     where
         F: Future<Output = ()>,
     {
         let Self { rd, wr, welcome } = self;
+        let ViewerLocal { access, limits, .. } = local;
         let state = Arc::new(CapState::new(welcome.caps));
         let (outbox, mut writer) = spawn_writer(wr);
         let (tx, mut inbound) = mpsc::channel(INBOUND_DEPTH);
         let reader = tokio::spawn(read_frames(rd, Side::Host, Arc::clone(&state), tx));
         let mut chat_gate = ChatGate::new(chat::now());
         let window = Arc::new(Window::new(welcome.bulk_window));
+        let (mut files, mut local_done) = LocalFiles::new(Arc::clone(&access), &limits);
         let (mut uploads, mut reports) = ViewerUploads::new(
             outbox.clone(),
             events.clone(),
             Arc::clone(&window),
+            access,
             &welcome,
-            CHUNK,
-            READ_TIMEOUT,
+            limits.chunk.clamp(1, CHUNK),
+            limits.read_timeout,
         );
         let emit = |event: ViewerEvent| {
             if events.try_send(event).is_err() {
@@ -316,6 +407,20 @@ where
                         break (ViewerServicesEnd::Refused(code), Some(code));
                     }
                 },
+                Some(done) = local_done.recv() => {
+                    match files.done(done) {
+                        Some(Ok(view)) => emit(ViewerEvent::Listing {
+                            remote: false,
+                            view,
+                        }),
+                        Some(Err(reason)) => emit(ViewerEvent::ListFailed {
+                            remote: false,
+                            reason,
+                        }),
+                        None => {}
+                    }
+                    Ok(())
+                }
                 Some(job) = reports.jobs.recv() => uploads.on_job(job),
                 Some(failed) = reports.failed.recv() => uploads.send_failed(failed),
                 Some(op) = ops.recv() => match op {
@@ -337,6 +442,24 @@ where
                     }
                     ViewerOp::UploadPath(path) => {
                         uploads.upload_path(path, state.left() & caps::UPLOAD != 0);
+                        Ok(())
+                    }
+                    ViewerOp::OpenLocal(handle) => {
+                        if let Err(reason) = files.open(handle) {
+                            emit(ViewerEvent::ListFailed {
+                                remote: false,
+                                reason,
+                            });
+                        }
+                        Ok(())
+                    }
+                    ViewerOp::UploadLocal(handle) => {
+                        match files.path_of(handle) {
+                            Some(path) => {
+                                uploads.upload_path(path, state.left() & caps::UPLOAD != 0);
+                            }
+                            None => uploads.refuse(reason::NOT_FOUND),
+                        }
                         Ok(())
                     }
                     ViewerOp::Cancel(id) => uploads.cancel(id),

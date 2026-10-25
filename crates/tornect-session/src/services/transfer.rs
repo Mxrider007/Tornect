@@ -20,6 +20,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tornect_core::files::sanitize_name;
+use tornect_core::trusted::is_invisible_or_control;
 use tornect_proto::services::{Done, SvcMsg, reason};
 
 use super::window::Window;
@@ -36,10 +37,11 @@ pub const MAX_UPLOADS: usize = 2;
 const NO_NAME: &str = "file";
 
 /// A name from a file system or the other computer, fit to show: built only
-/// through `tornect_core::files::sanitize_name`, so it holds no folder, no
-/// control or invisible character and at most 200 bytes. Shown as plain text;
-/// its `Debug` prints its length only (design §2.5: `tracing` never carries
-/// a file name).
+/// through `tornect_core::files::sanitize_name` ([`Untrusted::file_name`]:
+/// no folder, no control or invisible character, at most 200 bytes) or
+/// [`Untrusted::shown`] (no control or invisible character, cut to a
+/// bound). Shown as plain text; its `Debug` prints its length only (design
+/// §2.5: `tracing` never carries a file name).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Untrusted(String);
 
@@ -49,6 +51,24 @@ impl Untrusted {
     #[must_use]
     pub fn file_name(raw: &str) -> Self {
         Self(sanitize_name(raw).unwrap_or_else(|| NO_NAME.to_owned()))
+    }
+
+    /// `raw` (a name or a folder's path from the other computer, or from a
+    /// file system) made fit to show as one line of plain text: every
+    /// character `tornect_core::trusted::is_invisible_or_control` matches is
+    /// dropped (controls, line breaks, bidirectional overrides, zero-width
+    /// characters), and the rest is cut to at most `max` bytes on a
+    /// character boundary. It may be empty.
+    #[must_use]
+    pub fn shown(raw: &str, max: usize) -> Self {
+        let mut kept = String::with_capacity(raw.len().min(max));
+        for c in raw.chars().filter(|c| !is_invisible_or_control(*c)) {
+            if kept.len() + c.len_utf8() > max {
+                break;
+            }
+            kept.push(c);
+        }
+        Self(kept)
     }
 
     /// The name, plain.
@@ -366,6 +386,10 @@ mod tests {
         assert_eq!(name.as_str(), "secretfdp.exe");
         assert_eq!(format!("{name:?}"), "Untrusted(<13 chars>)");
         assert_eq!(Untrusted::file_name("..").as_str(), "file");
+        let shown = Untrusted::shown("/home/\u{202e}b\nob/\u{200b}x\u{7}", 64);
+        assert_eq!(shown.as_str(), "/home/bob/x");
+        assert_eq!(Untrusted::shown("ééé", 5).as_str(), "éé");
+        assert_eq!(Untrusted::shown("..", 5).as_str(), "..", "dots are shown");
         assert_eq!(
             TransferState::ended(reason::BY_HOST),
             TransferState::Cancelled(reason::BY_HOST)

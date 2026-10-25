@@ -1,6 +1,6 @@
 //! The services streams end to end over in-process pipes (the services
-//! design §10, tests 1, 2, 4, 5, 6, 10, 12 and 15 and the close paths of
-//! step 12, and the review of steps 14 and 15): a real [`MediaHost`]
+//! design §10, tests 1, 2, 4, 5, 6, 10, 12, 15 and 17 and the close paths
+//! of step 12, and the review of steps 14 and 15): a real [`MediaHost`]
 //! registry, its capture state driven by hand or by a real media stream, a
 //! fake desktop clipboard, a temporary inbox, a fake reading of its disk's
 //! free space, and a hook that holds an upload worker as it finishes a file.
@@ -1251,9 +1251,11 @@ async fn chat_goes_both_ways_sanitised() {
     let (ops, ops_rx) = mpsc::channel(8);
     let (events_tx, mut events) = mpsc::channel(8);
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let viewer = tokio::spawn(viewer.run(ops_rx, events_tx, async {
-        let _ = stopped.await;
-    }));
+    let viewer = tokio::spawn(
+        viewer.run(ops_rx, events_tx, ViewerLocal::default(), async {
+            let _ = stopped.await;
+        }),
+    );
 
     ops.send(ViewerOp::Chat(
         sanitize_peer_text("hello \u{202e}there").unwrap(),
@@ -1343,9 +1345,11 @@ async fn the_ninth_chat_line_of_a_burst_is_dropped_on_both_sides() {
     let (_ops, ops_rx) = mpsc::channel(1);
     let (events_tx, mut events) = mpsc::channel(32);
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let viewer = tokio::spawn(viewer.run(ops_rx, events_tx, async {
-        let _ = stopped.await;
-    }));
+    let viewer = tokio::spawn(
+        viewer.run(ops_rx, events_tx, ViewerLocal::default(), async {
+            let _ = stopped.await;
+        }),
+    );
     for n in 0..9 {
         let text = sanitize_peer_text(&format!("host {n}")).unwrap();
         assert!(rig.services.send_chat(&session.id, text));
@@ -1425,9 +1429,11 @@ async fn without_chat_a_chat_line_is_never_decoded() {
     let (ops, ops_rx) = mpsc::channel(1);
     let (events_tx, _events) = mpsc::channel(8);
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let viewer = tokio::spawn(viewer.run(ops_rx, events_tx, async {
-        let _ = stopped.await;
-    }));
+    let viewer = tokio::spawn(
+        viewer.run(ops_rx, events_tx, ViewerLocal::default(), async {
+            let _ = stopped.await;
+        }),
+    );
     ops.send(ViewerOp::Chat(sanitize_peer_text("x").unwrap()))
         .await
         .unwrap();
@@ -1544,7 +1550,7 @@ async fn the_viewer_follows_and_polices_the_host() {
         let (ops, ops_rx) = mpsc::channel(8);
         let (events_tx, events) = mpsc::channel(8);
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(viewer.run(ops_rx, events_tx, async {
+        let task = tokio::spawn(viewer.run(ops_rx, events_tx, temp_local(), async {
             let _ = stopped.await;
         }));
         Run {
@@ -1778,6 +1784,18 @@ async fn upload(client: &mut DuplexStream, xfer: u32, name: &str, content: &[u8]
     }
 }
 
+/// What a test viewer works with: the temporary folder (where the tests
+/// make the files they send) is its one place, nothing denied.
+fn temp_local() -> ViewerLocal {
+    ViewerLocal {
+        access: Arc::new(Access::new(
+            vec![("Temp".to_owned(), std::env::temp_dir())],
+            Vec::new(),
+        )),
+        ..ViewerLocal::default()
+    }
+}
+
 /// A [`ServicesViewer`]'s loop, running.
 struct Running {
     ops: mpsc::Sender<ViewerOp>,
@@ -1790,7 +1808,7 @@ fn run_viewer(viewer: ServicesViewer<DuplexStream>) -> Running {
     let (ops, ops_rx) = mpsc::channel(8);
     let (events_tx, events) = mpsc::channel(1024);
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let task = tokio::spawn(viewer.run(ops_rx, events_tx, async {
+    let task = tokio::spawn(viewer.run(ops_rx, events_tx, temp_local(), async {
         let _ = stopped.await;
     }));
     Running {
@@ -2492,6 +2510,165 @@ async fn the_viewer_refuses_what_it_cannot_send() {
     assert_eq!(next(&mut host).await, Some(chat("y")), "no offer went out");
     v.stop.send(()).unwrap();
     assert_eq!(v.task.await.unwrap(), ViewerServicesEnd::Stopped);
+}
+
+// --- Test 17: the viewer's own rules ---------------------------------------
+
+/// The viewer's next event, which must be a page of one of its own folders.
+async fn local_listing(events: &mut mpsc::Receiver<ViewerEvent>) -> ListingView {
+    match tokio::time::timeout(WAIT, events.recv()).await {
+        Ok(Some(ViewerEvent::Listing {
+            remote: false,
+            view,
+        })) => view,
+        other => panic!("expected a local listing, got {other:?}"),
+    }
+}
+
+/// The handle of the entry named `name` in `view`.
+fn handle_of(view: &ListingView, name: &str) -> u32 {
+    view.entries
+        .iter()
+        .find(|entry| entry.name.as_str() == name)
+        .unwrap_or_else(|| panic!("{name} is not listed"))
+        .handle
+}
+
+/// The names `view` lists.
+fn names_of(view: &ListingView) -> Vec<&str> {
+    view.entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect()
+}
+
+/// Test 17: every file the viewer sends passes its own [`Access`] first,
+/// and nothing goes to the host for one refused there: a file of its own
+/// state folder, one of another Tornect home (its marker), a link into its
+/// state folder, a part file and a file outside its places are `DENIED`, a
+/// folder is `NOT_A_FILE`. "Send files" lists through the same rules: the
+/// places, a folder without the Tornect homes, part files and links into
+/// them; a file listed is sent by its handle, and an unknown handle fails
+/// its row with `NOT_FOUND`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_viewer_sends_nothing_its_own_rules_refuse() {
+    let root = tempfile::tempdir().unwrap();
+    let own = tornect_core::Paths::from_home(root.path().join("own"));
+    own.ensure().unwrap();
+    let key = own.state_dir.join("device.key");
+    std::fs::write(&key, b"secret").unwrap();
+    let other = tornect_core::Paths::from_home(root.path().join("elsewhere"));
+    other.ensure().unwrap();
+    let other_key = other.state_dir.join("device.key");
+    std::fs::write(&other_key, b"secret").unwrap();
+    let docs = root.path().join("docs");
+    std::fs::create_dir(&docs).unwrap();
+    std::fs::write(docs.join("a.txt"), b"hello").unwrap();
+    let part = docs.join("b.txt.tornect-part");
+    std::fs::write(&part, b"half").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let stranger = outside.path().join("c.txt");
+    std::fs::write(&stranger, b"far").unwrap();
+    let refused = vec![
+        (key.clone(), reason::DENIED),
+        (other_key, reason::DENIED),
+        (part, reason::DENIED),
+        (stranger, reason::DENIED),
+        (own.state_dir.clone(), reason::DENIED),
+        (docs.clone(), reason::NOT_A_FILE),
+    ];
+    #[cfg(unix)]
+    let refused = {
+        let link = docs.join("link.key");
+        std::os::unix::fs::symlink(&key, &link).unwrap();
+        let mut refused = refused;
+        refused.push((link, reason::DENIED));
+        refused
+    };
+
+    let (mut host, bound) = raw_host(
+        Some(SvcMsg::Welcome(test_welcome(caps::CHAT | caps::UPLOAD))),
+        WAIT,
+    )
+    .await;
+    let (viewer, _) = bound.unwrap();
+    let (ops, ops_rx) = mpsc::channel(8);
+    let (events_tx, mut events) = mpsc::channel(64);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let local = ViewerLocal {
+        access: Arc::new(Access::new(
+            vec![("Home".to_owned(), root.path().to_path_buf())],
+            tornect_denied(&own),
+        )),
+        ..ViewerLocal::default()
+    };
+    let task = tokio::spawn(viewer.run(ops_rx, events_tx, local, async {
+        let _ = stopped.await;
+    }));
+
+    for (path, code) in refused {
+        ops.send(ViewerOp::UploadPath(path)).await.unwrap();
+        assert_eq!(transfer(&mut events).await.state, TransferState::Queued);
+        assert_eq!(
+            transfer(&mut events).await.state,
+            TransferState::Failed(code)
+        );
+    }
+    ops.send(ViewerOp::Chat(sanitize_peer_text("x").unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut host).await, Some(chat("x")), "no offer went out");
+
+    // "Send files": the places, then the place, then a folder in it.
+    ops.send(ViewerOp::OpenLocal(0)).await.unwrap();
+    let places = local_listing(&mut events).await;
+    assert_eq!((places.folder, places.parent), (0, None));
+    assert_eq!(names_of(&places), ["Home"]);
+    assert_eq!(places.entries[0].kind, EntryKind::Folder);
+    ops.send(ViewerOp::OpenLocal(handle_of(&places, "Home")))
+        .await
+        .unwrap();
+    let home = local_listing(&mut events).await;
+    assert_eq!(home.parent, Some(0));
+    assert_eq!(
+        names_of(&home),
+        ["docs"],
+        "the Tornect homes are not listed"
+    );
+    ops.send(ViewerOp::OpenLocal(handle_of(&home, "docs")))
+        .await
+        .unwrap();
+    let listed = local_listing(&mut events).await;
+    assert_eq!(listed.parent, Some(handle_of(&places, "Home")));
+    assert_eq!(names_of(&listed), ["a.txt"]);
+    assert_eq!(listed.entries[0].kind, EntryKind::File);
+    assert_eq!(listed.entries[0].size, Some(5));
+    assert!(!format!("{listed:?}").contains("a.txt"));
+
+    // A file listed goes by its handle; an unknown handle sends nothing.
+    ops.send(ViewerOp::UploadLocal(999_999)).await.unwrap();
+    assert_eq!(
+        transfer(&mut events).await.state,
+        TransferState::Failed(reason::NOT_FOUND)
+    );
+    ops.send(ViewerOp::OpenLocal(999_999)).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(WAIT, events.recv()).await,
+        Ok(Some(ViewerEvent::ListFailed {
+            remote: false,
+            reason: reason::NOT_FOUND
+        }))
+    ));
+    ops.send(ViewerOp::UploadLocal(handle_of(&listed, "a.txt")))
+        .await
+        .unwrap();
+    assert_eq!(transfer(&mut events).await.state, TransferState::Queued);
+    let Some(SvcMsg::Offer(offer)) = next(&mut host).await else {
+        panic!("expected the Offer");
+    };
+    assert_eq!((offer.name.as_str(), offer.size), ("a.txt", 5));
+    stop.send(()).unwrap();
+    assert_eq!(task.await.unwrap(), ViewerServicesEnd::Stopped);
 }
 
 // --- The review of steps 14 and 15: an upload's end races its worker ------

@@ -35,12 +35,20 @@
 //! sender keeps at most the bulk window of file bytes beyond what the
 //! receiver credited, and the receiver holds it to that.
 //!
+//! What a stream may show or send of a computer's files is decided by that
+//! computer's [`Access`] (§5.2): a place allowlist, a deny-list of Tornect's
+//! own folders (and Linux's system ones), the private marker every Tornect
+//! home holds, and part files, all judged on the canonical path, which is
+//! the one opened. The viewer judges each file it sends by its own
+//! [`Access`] before anything goes out.
+//!
 //! The stream is built in the design's steps: this build has the bind, the
-//! live wait, the caps, chat both ways, uploads and the close paths.
-//! Browsing, downloads, the clipboard and the lock pause come with the
-//! design's steps 16–19; until then their frames, when granted, are read and
-//! left unanswered, and a granted clipboard link is held inactive, so the
-//! backend reads and sets nothing.
+//! live wait, the caps, chat both ways, uploads, the viewer's own file
+//! browser and the close paths. Browsing the host's files, downloads, the
+//! clipboard and the lock pause come with the design's steps 17–19; until
+//! then their frames, when granted, are read and left unanswered, and a
+//! granted clipboard link is held inactive, so the backend reads and sets
+//! nothing.
 //!
 //! [`MediaHost`]: crate::MediaHost
 
@@ -50,6 +58,7 @@ use std::time::Duration;
 use tornect_core::session_log::SessionMode;
 use tornect_proto::services::caps;
 
+pub mod browse;
 pub mod chat;
 mod host;
 mod reader;
@@ -63,13 +72,17 @@ mod writer;
 #[cfg(test)]
 mod tests;
 
+pub use browse::{
+    Access, EntryKind, EntryView, ListingView, system_denied, tornect_denied, windows_drive_root,
+};
 pub use chat::{CHAT_BURST, CHAT_RATE, ChatText, sanitize_peer_text};
 pub use host::{ServicesHost, ServicesOutcome, refuse};
 pub use reader::ReaderCounts;
 pub use store::{FreeSpaceFn, RECHECK_FREE_EVERY};
 pub use transfer::{Direction, MAX_UPLOADS, TransferRow, TransferState, Untrusted};
 pub use viewer::{
-    ServicesBindError, ServicesBinding, ServicesViewer, ViewerEvent, ViewerOp, ViewerServicesEnd,
+    ServicesBindError, ServicesBinding, ServicesViewer, ViewerEvent, ViewerLocal, ViewerOp,
+    ViewerServicesEnd,
 };
 
 /// What the host lets a session use (`config.toml [services]`), as a session

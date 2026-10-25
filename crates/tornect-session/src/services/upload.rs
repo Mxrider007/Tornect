@@ -40,6 +40,7 @@ use tornect_proto::services::{
     Accepted, Cancel, Complete, Done, MAX_NAME_BYTES, Offer, SvcMsg, Welcome, reason,
 };
 
+use super::browse::{Access, code_of};
 use super::store::{Fed, Inbox, Receiving, Work, Worked, WorkerEvent, spawn_receiver};
 use super::transfer::{
     Direction, Ids, Known, MAX_UPLOADS, Outgoing, SendFailed, TransferRow, TransferState, Untrusted,
@@ -551,6 +552,8 @@ pub(crate) struct ViewerUploads {
     outbox: Outbox,
     events: mpsc::Sender<ViewerEvent>,
     window: Arc<Window>,
+    /// What may be sent: every file passes it before it is opened.
+    access: Arc<Access>,
     file_max: u64,
     chunk: usize,
     read_timeout: Duration,
@@ -568,13 +571,14 @@ pub(crate) struct ViewerUploads {
 }
 
 impl ViewerUploads {
-    /// The uploads of a stream the host welcomed with `welcome`; what the
-    /// blocking work and the sending tasks report comes on the receivers
-    /// returned.
+    /// The uploads of a stream the host welcomed with `welcome`, of files
+    /// `access` lets through; what the blocking work and the sending tasks
+    /// report comes on the receivers returned.
     pub(crate) fn new(
         outbox: Outbox,
         events: mpsc::Sender<ViewerEvent>,
         window: Arc<Window>,
+        access: Arc<Access>,
         welcome: &Welcome,
         chunk: usize,
         read_timeout: Duration,
@@ -586,6 +590,7 @@ impl ViewerUploads {
                 outbox,
                 events,
                 window,
+                access,
                 file_max: welcome.file_max,
                 chunk: chunk.max(1),
                 read_timeout,
@@ -604,9 +609,11 @@ impl ViewerUploads {
         )
     }
 
-    /// Send the file at `path`: it is opened on a blocking thread, must be a
-    /// regular file within the host's largest file, and waits for a place.
-    /// Without `UPLOAD` (`allowed` false) the row fails at once.
+    /// Send the file at `path`: on a blocking thread it must pass the
+    /// viewer's [`Access`] (so that a slip never offers Tornect's own files),
+    /// be a regular file within the host's largest file, and open; then it
+    /// waits for a place. Without `UPLOAD` (`allowed` false) the row fails at
+    /// once. Nothing goes to the host for a file refused here.
     pub(crate) fn upload_path(&mut self, path: PathBuf, allowed: bool) {
         let Some(id) = self.next_id.checked_add(1) else {
             return;
@@ -630,10 +637,27 @@ impl ViewerUploads {
         self.uploads.insert(id, up);
         self.queue.push_back(id);
         let jobs = self.jobs.clone();
+        let access = Arc::clone(&self.access);
         tokio::task::spawn_blocking(move || {
-            let result = open_upload(&path);
+            let result = open_upload(&access, &path);
             let _ = jobs.send(Job::Opened { id, result });
         });
+    }
+
+    /// A file to send that cannot be named (a local handle that is unknown
+    /// or evicted): its row fails at once with `code`, and nothing is sent.
+    pub(crate) fn refuse(&mut self, code: u16) {
+        let Some(id) = self.next_id.checked_add(1) else {
+            return;
+        };
+        self.next_id = id;
+        let up = Up {
+            name: Untrusted::file_name(""),
+            size: 0,
+            credited: 0,
+            phase: Phase::Opening,
+        };
+        self.emit(row_of(id, &up, TransferState::Failed(code)));
     }
 
     /// What the blocking work reports.
@@ -915,20 +939,18 @@ fn row_of(id: u32, up: &Up, state: TransferState) -> TransferRow {
     }
 }
 
-/// Open the file at `path` to send it: a regular file (checked before the
-/// open, so that a pipe never blocks it, and again on the open file), and
-/// its size; a name over the wire's bound is cut later by the name's
-/// sanitising.
-fn open_upload(path: &Path) -> Result<(File, u64), u16> {
-    let code = |e: io::Error| match e.kind() {
-        io::ErrorKind::NotFound => reason::NOT_FOUND,
-        io::ErrorKind::PermissionDenied => reason::DENIED,
-        _ => reason::IO,
-    };
-    if !std::fs::metadata(path).map_err(code)?.is_file() {
+/// Open the file at `path` to send it: it must pass `access` (the design's
+/// §5.2 rules: `NOT_FOUND`, `DENIED`), and the canonical path that passed is
+/// the one opened: a regular file (checked before the open, so that a pipe
+/// never blocks it, and again on the open file), and its size; a name over
+/// the wire's bound is cut later by the name's sanitising.
+fn open_upload(access: &Access, path: &Path) -> Result<(File, u64), u16> {
+    let code = |e: io::Error| code_of(&e);
+    let canonical = access.check(path)?;
+    if !std::fs::metadata(&canonical).map_err(code)?.is_file() {
         return Err(reason::NOT_A_FILE);
     }
-    let file = File::open(path).map_err(code)?;
+    let file = File::open(&canonical).map_err(code)?;
     let meta = file.metadata().map_err(code)?;
     if !meta.is_file() {
         return Err(reason::NOT_A_FILE);
