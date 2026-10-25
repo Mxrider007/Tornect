@@ -1008,6 +1008,160 @@ mod tests {
         assert_eq!(table, scaler.xt.idx.as_ptr());
     }
 
+    /// A seeded BGRx picture of `w`×`h`, different for every size and seed.
+    fn seeded(w: u32, h: u32, seed: u64) -> Vec<u8> {
+        let mut state = (seed ^ (u64::from(w) << 32) ^ u64::from(h)) | 1;
+        (0..w as usize * h as usize * 4)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    /// Monitor design §5.1 and §7 (codec): one host keeps one scaler while
+    /// the viewer switches screens, so the desktop's size changes under it
+    /// from picture to picture: Screen 1 (2560×1440, borrowed), "All
+    /// screens" (5120×1440, one bilinear pass), Screen 2 (1920×1080), two
+    /// 4K screens (7680×2160, one box pass), an odd screen (2561×1441,
+    /// cropped), and back. Each picture is exactly what a fresh scaler
+    /// makes of it: nothing left from an earlier size reaches it.
+    #[test]
+    fn a_scaler_kept_across_screen_switches_gives_what_a_fresh_one_gives() {
+        let mut kept = Scaler::default();
+        let switches = [
+            (2560, 1440),
+            (5120, 1440),
+            (1920, 1080),
+            (7680, 2160),
+            (5120, 1440),
+            (2561, 1441),
+            (5120, 1440),
+            (2560, 1440),
+        ];
+        for (i, (w, h)) in switches.into_iter().enumerate() {
+            let src = seeded(w, h, i as u64);
+            let mut fresh = Scaler::default();
+            let want = fresh.fit(&src, w, h, ResolutionCap::CODEC).unwrap();
+            let got = kept.fit(&src, w, h, ResolutionCap::CODEC).unwrap();
+            assert_eq!(
+                (got.width, got.height, got.scaled),
+                (want.width, want.height, want.scaled),
+                "switch {i} to {w}x{h}"
+            );
+            assert!(got.bgrx == want.bgrx, "switch {i} to {w}x{h}");
+        }
+        // The last bilinear size's tables are still the kept scaler's own:
+        // 5120 → 3840 across, 1440 → 1080 down.
+        assert_eq!((kept.xt.from, kept.xt.to), (5120, 3840));
+        assert_eq!((kept.yt.from, kept.yt.to), (1440, 1080));
+    }
+
+    /// Each output pixel's sum, over one row (`across`) or one column, of a
+    /// 1 px white line on black at source position `at`, scaled `from` →
+    /// `to` along that axis and kept 2 px on the other (where the table is
+    /// the identity), for channel B.
+    fn line_energy(from: u32, to: u32, at: u32, across: bool) -> u32 {
+        let (fw, fh, tw, th) = if across {
+            (from, 2, to, 2)
+        } else {
+            (2, from, 2, to)
+        };
+        let src = picture(fw, fh, |x, y| {
+            let on = if across { x == at } else { y == at };
+            if on { [255, 255, 255] } else { [0, 0, 0] }
+        });
+        let out = resample(&src, (fw, fh), (tw, th));
+        // One row (across) or one column (down) of the output.
+        (0..to)
+            .map(|i| {
+                let (x, y) = if across { (i, 0) } else { (0, i) };
+                u32::from(px(&out, tw, x, y)[0])
+            })
+            .sum()
+    }
+
+    /// The smallest and largest [`line_energy`] over every source position
+    /// of the axis, as fractions of the exact share `255·to/from`.
+    fn line_energy_range(from: u32, to: u32, across: bool) -> (f64, f64) {
+        let exact = 255.0 * f64::from(to) / f64::from(from);
+        (0..from)
+            .map(|at| f64::from(line_energy(from, to, at, across)) / exact)
+            .fold((f64::MAX, f64::MIN), |(lo, hi), e| (lo.min(e), hi.max(e)))
+    }
+
+    /// Monitor design §7 (codec), adapted to the bilinear pass decision
+    /// M1-74 landed (decision M1-75 (4)): a 1 px line on black, at every
+    /// source position, scaled at the "All screens" ratios 4:3 (two
+    /// 2560×1440 screens to 3840×1080) and 3:2 (three 1920×1080 screens to
+    /// 3840×720), along either axis, never vanishes and keeps between 3/4
+    /// and 9/8 of its exact share of the picture. Area averaging, which the
+    /// design asked for, would keep the share exactly at every phase; the
+    /// bilinear tent gives a source pixel a total weight of 2/3 to 5/6 at
+    /// 4:3 (exact 3/4) and 1/2 to 3/4 at 3:2 (exact 2/3), so the bounds are
+    /// 8/9 to 10/9 and 3/4 to 9/8, each held to within the Q8 rounding.
+    #[test]
+    fn a_thin_line_keeps_most_of_its_energy_at_the_all_screens_ratios() {
+        for (from, to, across, lo, hi) in [
+            (5120, 3840, true, 8.0 / 9.0, 10.0 / 9.0),
+            (1440, 1080, false, 8.0 / 9.0, 10.0 / 9.0),
+            (5760, 3840, true, 0.75, 1.125),
+            (1080, 720, false, 0.75, 1.125),
+        ] {
+            let (min, max) = line_energy_range(from, to, across);
+            // Two output pixels' rounding and the Q8 positions: 3 levels.
+            let slack = 3.0 * f64::from(from) / (255.0 * f64::from(to));
+            assert!(min >= lo - slack, "{from} → {to}: {min} below {lo}");
+            assert!(max <= hi + slack, "{from} → {to}: {max} above {hi}");
+        }
+    }
+
+    /// Monitor design §5.1's timing target, for the record: at most 15 ms
+    /// for 7680×2160 → 3840×1080 and for 5120×1440 → 3840×1080, one thread,
+    /// release build. Run with `cargo test --release -p tornect-codec --lib
+    /// scale::tests::the_scaler_s_time_at_the_all_screens_sizes -- --ignored
+    /// --nocapture`; the numbers go into `docs/VERIFICATION.md`.
+    #[test]
+    #[ignore = "a timing bench: run in release and record its numbers"]
+    #[allow(clippy::print_stderr)] // the bench reports what it measured
+    fn the_scaler_s_time_at_the_all_screens_sizes() {
+        for (w, h) in [(7680, 2160), (5120, 1440), (5760, 1080)] {
+            let src = seeded(w, h, 1);
+            let mut scaler = Scaler::default();
+            for _ in 0..3 {
+                scaler.fit(&src, w, h, ResolutionCap::CODEC).unwrap();
+            }
+            let mut took: Vec<Duration> = (0..30)
+                .map(|_| {
+                    let start = Instant::now();
+                    let fitted = scaler.fit(&src, w, h, ResolutionCap::CODEC).unwrap();
+                    std::hint::black_box(fitted.bgrx);
+                    start.elapsed()
+                })
+                .collect();
+            took.sort();
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            let (pw, ph) = picture_size(shown_region(w, h), ResolutionCap::CODEC);
+            eprintln!(
+                "SCALE {w}x{h} -> {pw}x{ph}: min {:.2} ms, median {:.2} ms, max {:.2} ms (30 runs)",
+                ms(took[0]),
+                ms(took[15]),
+                ms(took[29])
+            );
+        }
+        for (from, to, across) in [
+            (5120, 3840, true),
+            (1440, 1080, false),
+            (5760, 3840, true),
+            (1080, 720, false),
+        ] {
+            let (lo, hi) = line_energy_range(from, to, across);
+            eprintln!("LINE {from} -> {to}: energy {lo:.3} to {hi:.3} of the exact share");
+        }
+    }
+
     /// §8: a buffer of the wrong length is `Geometry`; a region under 2×2
     /// is `PictureSize`.
     #[test]
