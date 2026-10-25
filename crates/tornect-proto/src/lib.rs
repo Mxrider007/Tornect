@@ -63,9 +63,16 @@
 //! ([`bind_mac`], decision M1-41); the host answers only after checking it in
 //! constant time against a session it accepted on the signaling stream.
 //! Nothing is captured before that (§B.6).
+//!
+//! **Services** ([`services`], decision M1-76, the services design §0, §3).
+//! Chat, clipboard text and files ride a session's third stream in their own
+//! frames under the same envelope, bound by their own `Bind` MAC; this
+//! stream's caps and readers stay as they are.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+pub mod services;
 
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::Sha256;
