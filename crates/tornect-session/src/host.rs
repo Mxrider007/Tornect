@@ -62,7 +62,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Notify, Semaphore, mpsc, watch};
-use tornect_capture::{CaptureError, Frame, Layout, Rect, Selection, VideoSource, View};
+use tornect_capture::{CaptureError, Frame, Layout, Monitor, Rect, Selection, VideoSource, View};
 use tornect_codec::H264Encoder;
 use tornect_codec::scale::Scaler;
 use tornect_core::config::{Media, QualityPreset};
@@ -1627,12 +1627,19 @@ impl Screens {
     }
 
     /// What to do with the viewer's `SelectMonitor` (H2), read at `now`:
-    /// the selection to hand to the pipeline, after which the switch waits
-    /// for its picture; or nothing, with the answer owed at once (`UNKNOWN`,
-    /// a no-op `OK`, `BUSY`) or with none at all (over the budget). Checked
-    /// in the design's order: what cannot be followed, then what is shown
-    /// already, then a switch under way or too soon after the last.
-    fn select(&mut self, request: u16, list: u16, monitor: u8, now: Instant) -> Option<Selection> {
+    /// the selection to hand to the pipeline, with the monitor list it was
+    /// checked against, after which the switch waits for its picture; or
+    /// nothing, with the answer owed at once (`UNKNOWN`, a no-op `OK`,
+    /// `BUSY`) or with none at all (over the budget). Checked in the design's
+    /// order: what cannot be followed, then what is shown already, then a
+    /// switch under way or too soon after the last.
+    fn select(
+        &mut self,
+        request: u16,
+        list: u16,
+        monitor: u8,
+        now: Instant,
+    ) -> Option<(Selection, Vec<Monitor>)> {
         if self.owed.len() >= OWED_ANSWERS || !self.selects.take(now) {
             return None;
         }
@@ -1650,7 +1657,7 @@ impl Screens {
                         request,
                         deadline: tokio::time::Instant::from_std(now) + self.answer_within,
                     });
-                    return Some(selection);
+                    return Some((selection, layout.monitors.clone()));
                 }
             },
         };
@@ -1827,8 +1834,9 @@ impl Served<'_> {
                 monitor,
             } => {
                 self.report.monitor_requests += 1;
-                if let Some(selection) = self.screens.select(request, list, monitor, now) {
-                    self.pipeline.select(selection, request);
+                if let Some((selection, against)) = self.screens.select(request, list, monitor, now)
+                {
+                    self.pipeline.select(selection, request, against);
                 }
             }
             Msg::Close { .. } => return Handled::End(MediaEnd::ViewerLeft),
@@ -2145,14 +2153,24 @@ struct Control {
     /// The preset code to change to (`tornect_proto::quality`); 0 for none.
     /// The latest wins.
     quality: AtomicU8,
-    /// The selection to show, and the `SelectMonitor` request it answers,
-    /// until the capture thread takes it ([`Pipeline::select`]).
-    select: Mutex<Option<(Selection, u16)>>,
+    /// The selection to show, until the capture thread takes it
+    /// ([`Pipeline::select`]).
+    select: Mutex<Option<Handed>>,
+}
+
+/// A viewer's selection, handed to the capture thread.
+struct Handed {
+    selection: Selection,
+    /// The `SelectMonitor` it answers.
+    request: u16,
+    /// The monitors the host checked the viewer's choice against: the list
+    /// it said last, which the viewer chose from.
+    against: Vec<Monitor>,
 }
 
 impl Control {
     /// The selection handed over and not taken yet, taken now.
-    fn take_select(&self) -> Option<(Selection, u16)> {
+    fn take_select(&self) -> Option<Handed> {
         self.select
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -2256,12 +2274,23 @@ impl Pipeline {
     /// ([`Encoded::answers`]); a source that cannot switch is answered with a
     /// [`Produced::Refused`] at once. One handed over and not taken yet is
     /// replaced. The caller keeps one switch at a time (the design's H2).
-    fn select(&self, selection: Selection, request: u16) {
+    ///
+    /// `against` is the monitor list the host checked the selection against,
+    /// the one it said last. The source may be a picture ahead of it (a grab
+    /// whose picture is still on its way), and when that grab found another
+    /// list, an id may name another monitor there: the selection is then
+    /// refused `UNKNOWN`, as a stale list is, and never reaches the source
+    /// ([`take_select`]).
+    fn select(&self, selection: Selection, request: u16, against: Vec<Monitor>) {
         *self
             .control
             .select
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some((selection, request));
+            .unwrap_or_else(PoisonError::into_inner) = Some(Handed {
+            selection,
+            request,
+            against,
+        });
     }
 
     /// Take back the selection for `request` if the capture thread has not
@@ -2273,7 +2302,7 @@ impl Pipeline {
             .select
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if select.is_some_and(|(_, r)| r == request) {
+        if select.as_ref().is_some_and(|h| h.request == request) {
             *select = None;
             true
         } else {
@@ -2537,6 +2566,13 @@ fn encode_loop(
 /// refusal is said at once, `UNKNOWN` for a monitor the source does not have
 /// and `FAILED` for anything else, and changes nothing: the screen shown,
 /// and the answer a switch taken earlier still owes, stay.
+///
+/// The source resolves an id against its latest grab, which can be a picture
+/// ahead of the list the host checked the request against (a picture grabbed
+/// and not written yet). When that grab found another monitor list, the id
+/// the viewer chose may name another monitor there: the selection is refused
+/// `UNKNOWN` without reaching the source, as a stale list is (the design's
+/// §9, item 8), and the viewer has the new list with that picture.
 fn take_select(
     source: &mut dyn VideoSource,
     encoder: &mut H264Encoder,
@@ -2545,9 +2581,26 @@ fn take_select(
     answer: &mut Option<u16>,
     last: &mut Option<Frame>,
 ) -> bool {
-    let Some((selection, request)) = control.take_select() else {
+    let Some(Handed {
+        selection,
+        request,
+        against,
+    }) = control.take_select()
+    else {
         return true;
     };
+    if source.layout().map(|layout| layout.monitors).as_ref() != Some(&against) {
+        tracing::debug!(
+            request,
+            "the monitors changed since the list the viewer chose from"
+        );
+        return out
+            .blocking_send(Ok(Produced::Refused {
+                request,
+                status: monitor_status::UNKNOWN,
+            }))
+            .is_ok();
+    }
     match source.select(selection, &control.stop) {
         Ok(()) => {
             encoder.force_keyframe();
@@ -3508,7 +3561,7 @@ mod tests {
                 .map(|(i, &(width, height))| {
                     let rect = Rect::new(x, 0, width, height);
                     x += i32::try_from(width).unwrap();
-                    tornect_capture::Monitor {
+                    Monitor {
                         id: u8::try_from(i + 1).unwrap(),
                         primary: i == 0,
                         rect,
@@ -3705,7 +3758,7 @@ mod tests {
 
         // No credit is given: the thread waits for one.
         let asked = Instant::now();
-        pipeline.select(Selection::Monitor(2), 7);
+        pipeline.select(Selection::Monitor(2), 7, one.monitors.clone());
         asked_within_a_poll(&desk, 1, asked).await;
         assert!(!pipeline.withdraw(7), "taken: too late to take back");
         desk.pictures.fetch_add(2, Ordering::SeqCst);
@@ -3732,7 +3785,7 @@ mod tests {
         );
 
         let asked = Instant::now();
-        pipeline.select(Selection::All, 8);
+        pipeline.select(Selection::All, 8, one.monitors.clone());
         asked_within_a_poll(&desk, 2, asked).await;
         desk.pictures.fetch_add(1, Ordering::SeqCst);
         let all = picture(&mut pipeline).await;
@@ -3761,11 +3814,12 @@ mod tests {
         let (mut pipeline, desk) = desk(&[(256, 128), (256, 128)], 1);
         let first = picture(&mut pipeline).await;
         assert!(first.keyframe);
+        let said = first.layout.expect("a layout").monitors;
         pipeline.credit();
         // The thread waits for a picture that does not come.
         tokio::time::sleep(POLL * 2).await;
         let asked = Instant::now();
-        pipeline.select(Selection::Monitor(2), 9);
+        pipeline.select(Selection::Monitor(2), 9, said.clone());
         asked_within_a_poll(&desk, 1, asked).await;
         assert_eq!(*desk.recycled.lock().unwrap(), [256 * 128 * 4]);
         desk.pictures.fetch_add(1, Ordering::SeqCst);
@@ -3785,7 +3839,7 @@ mod tests {
         // its picture comes: nothing is encoded again.
         pipeline.credit();
         let asked = Instant::now();
-        pipeline.select(Selection::Monitor(1), 10);
+        pipeline.select(Selection::Monitor(1), 10, said);
         asked_within_a_poll(&desk, 2, asked).await;
         pipeline.set_quality(tornect_proto::quality::BEST_PERFORMANCE);
         assert!(
@@ -3814,10 +3868,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_selection_is_said_at_once_and_changes_nothing() {
         let (mut pipeline, desk) = desk(&[(320, 192), (256, 128)], 1);
-        picture(&mut pipeline).await;
+        let said = picture(&mut pipeline)
+            .await
+            .layout
+            .expect("a layout")
+            .monitors;
 
         let asked = Instant::now();
-        pipeline.select(Selection::Monitor(5), 3);
+        pipeline.select(Selection::Monitor(5), 3, said.clone());
         assert_eq!(
             next_refusal(&mut pipeline).await,
             (3, monitor_status::UNKNOWN)
@@ -3827,7 +3885,7 @@ mod tests {
         *desk.on_select.lock().unwrap() = OnSelect::Fail;
         pipeline.credit();
         let asked = Instant::now();
-        pipeline.select(Selection::Monitor(2), 4);
+        pipeline.select(Selection::Monitor(2), 4, said);
         assert_eq!(
             next_refusal(&mut pipeline).await,
             (4, monitor_status::FAILED)
@@ -3846,6 +3904,39 @@ mod tests {
         pipeline.stop().await;
     }
 
+    /// A selection the host checked against a monitor list other than the
+    /// one the source's last picture has is refused `UNKNOWN` within a poll
+    /// and never reaches the source: the id may name another monitor there.
+    /// Against the source's own list it switches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_selection_checked_against_another_list_never_reaches_the_source() {
+        let (mut pipeline, desk) = desk(&[(320, 192), (256, 128)], 1);
+        let said = picture(&mut pipeline)
+            .await
+            .layout
+            .expect("a layout")
+            .monitors;
+        let mut older = said.clone();
+        older[1].rect = Rect::new(320, 0, 128, 128);
+
+        let asked = Instant::now();
+        pipeline.select(Selection::Monitor(2), 5, older);
+        assert_eq!(
+            next_refusal(&mut pipeline).await,
+            (5, monitor_status::UNKNOWN)
+        );
+        assert!(asked.elapsed() < POLL + Duration::from_millis(400));
+        assert!(desk.asked.lock().unwrap().is_empty(), "never asked");
+
+        pipeline.select(Selection::Monitor(2), 6, said);
+        asked_within_a_poll(&desk, 1, Instant::now()).await;
+        desk.pictures.fetch_add(1, Ordering::SeqCst);
+        let switched = picture(&mut pipeline).await;
+        assert_eq!(switched.answers, Some(6));
+        assert_eq!((switched.width, switched.height), (256, 128));
+        pipeline.stop().await;
+    }
+
     /// A selection handed over while the thread is busy (here inside another
     /// one's switch) can be taken back before the thread takes it, and then
     /// never reaches the source; only by its own request, once. The one the
@@ -3853,13 +3944,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_withdrawn_selection_never_reaches_the_source() {
         let (mut pipeline, desk) = desk(&[(320, 192), (256, 128)], 1);
-        picture(&mut pipeline).await;
+        let said = picture(&mut pipeline)
+            .await
+            .layout
+            .expect("a layout")
+            .monitors;
         *desk.on_select.lock().unwrap() = OnSelect::Hold;
         let asked = Instant::now();
-        pipeline.select(Selection::Monitor(2), 1);
+        pipeline.select(Selection::Monitor(2), 1, said.clone());
         asked_within_a_poll(&desk, 1, asked).await;
 
-        pipeline.select(Selection::All, 2);
+        pipeline.select(Selection::All, 2, said);
         assert!(!pipeline.withdraw(3), "another request");
         assert!(pipeline.withdraw(2));
         assert!(!pipeline.withdraw(2), "once");
@@ -3881,10 +3976,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stop_while_the_source_switches_closes_it_within_a_poll() {
         let (mut pipeline, desk) = desk(&[(320, 192), (256, 128)], 1);
-        picture(&mut pipeline).await;
+        let said = picture(&mut pipeline)
+            .await
+            .layout
+            .expect("a layout")
+            .monitors;
         *desk.on_select.lock().unwrap() = OnSelect::Hold;
         let asked = Instant::now();
-        pipeline.select(Selection::Monitor(2), 1);
+        pipeline.select(Selection::Monitor(2), 1, said);
         asked_within_a_poll(&desk, 1, asked).await;
         let stopping = Instant::now();
         pipeline.stop().await;

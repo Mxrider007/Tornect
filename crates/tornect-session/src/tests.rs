@@ -5733,6 +5733,173 @@ async fn a_monitor_unplugged_falls_back_and_holds_back_input_in_flight() {
     assert_eq!((report.monitor_requests, report.monitor_switches), (1, 0));
 }
 
+/// The final review of the monitors feature: the source resolves an id
+/// against its latest grab, which can be a picture ahead of the list the host
+/// said, the grab's picture still on its way while the host's write waits.
+/// Here a monitor is plugged in between the two the viewer was told of, so
+/// in the source's newer list "Screen 2" is the new monitor. A request for
+/// Screen 2 of the list the viewer has passes the host's check (the host has
+/// said no other list yet), and the capture thread refuses it `UNKNOWN`
+/// without asking the source: the viewer hears the new list with its
+/// picture, then the refusal, and a request from the new list goes through.
+/// Without the check the source would show the new monitor as the answer to
+/// a request for the one that moved to Screen 3 (the design's §9, item 8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_from_a_list_the_source_has_moved_past_is_unknown() {
+    let interval = Duration::from_secs(2);
+    let (rig, desk) = desk_rig(
+        &[(320, 192), (256, 128)],
+        MediaLimits {
+            switch_interval: interval,
+            ..MediaLimits::default()
+        },
+    );
+    // One picture to open with, then a still screen; a switch brings one
+    // picture of the new screen, as a damage-driven source's does.
+    desk.damage(1);
+    desk.first_after_switch.store(true, Ordering::SeqCst);
+    let (_, binding) = start(&rig.host, 85, SessionMode::Control);
+    let (mut client, served) = connect_narrow(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    let first = next_msg(&mut client).await.expect("the first Monitors");
+    let (said_first, _) = said(&first);
+    assert_eq!((said_first.list, said_first.shown, said_first.n), (0, 1, 2));
+    // The viewer reads nothing more for now: the host's write of picture 0
+    // waits, and what the viewer sends is handled meanwhile.
+
+    // A monitor plugged in at x 320: the 256×128 one moves to Screen 3.
+    *desk.sizes.lock().unwrap() = vec![(320, 192), (128, 128), (256, 128)];
+    desk.damage(1);
+    // The ack credits the next picture, which the source grabs with the new
+    // list; that picture waits behind the write.
+    write_msg(&mut client, &Msg::VideoAck { seq: 0 })
+        .await
+        .unwrap();
+    let since = tokio::time::Instant::now();
+    while *desk.pictures.lock().unwrap() != Some(0) {
+        in_time(since, "the grab of the new list");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    write_msg(
+        &mut client,
+        &Msg::SelectMonitor {
+            request: 1,
+            list: 0,
+            monitor: 2,
+        },
+    )
+    .await
+    .unwrap();
+    // The host handles it while its write still waits.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut order = Vec::new();
+    let since = tokio::time::Instant::now();
+    let refused = loop {
+        in_time(since, "the answer");
+        match next_msg(&mut client).await.expect("the stream is open") {
+            Msg::Video { seq, .. } => order.push(format!("video {seq}")),
+            msg @ Msg::Monitors { .. } => {
+                let (s, _) = said(&msg);
+                if s.request == 1 {
+                    break s;
+                }
+                order.push(format!("news list={} n={}", s.list, s.n));
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(order, ["video 0", "news list=1 n=3", "video 1"]);
+    assert_eq!(
+        refused,
+        Said {
+            request: 1,
+            status: UNKNOWN,
+            shown: 1,
+            all: true,
+            remapped: false,
+            list: 1,
+            n: 3
+        },
+        "refused against the list the source has, said with it"
+    );
+    assert!(desk.asked().is_empty(), "the source was never asked");
+    // The host accepted the request, so its switch interval runs: proof that
+    // the capture thread, not the host's own list check, refused it.
+    write_msg(
+        &mut client,
+        &Msg::SelectMonitor {
+            request: 2,
+            list: 1,
+            monitor: 3,
+        },
+    )
+    .await
+    .unwrap();
+    let busy = loop {
+        in_time(since, "the second answer");
+        if let Some(msg @ Msg::Monitors { .. }) = next_msg(&mut client).await {
+            break said(&msg).0;
+        }
+    };
+    assert_eq!((busy.request, busy.status), (2, BUSY));
+
+    // From the new list, after the interval: the monitor asked for.
+    tokio::time::sleep(interval).await;
+    write_msg(
+        &mut client,
+        &Msg::SelectMonitor {
+            request: 3,
+            list: 1,
+            monitor: 3,
+        },
+    )
+    .await
+    .unwrap();
+    let since = tokio::time::Instant::now();
+    let (switched, at) = loop {
+        in_time(since, "the third answer");
+        if let Some(msg @ Msg::Monitors { .. }) = next_msg(&mut client).await {
+            let (s, at) = said(&msg);
+            if s.request == 3 {
+                break (s, at);
+            }
+        }
+    };
+    assert_eq!(
+        (switched.status, switched.shown, switched.remapped),
+        (OK, 3, true)
+    );
+    match next_msg(&mut client).await {
+        Some(Msg::Video { seq, .. }) => assert_eq!(seq, at),
+        other => panic!("expected the answer's picture, got {other:?}"),
+    }
+    assert_eq!(desk.asked(), [Selection::Monitor(3)]);
+    assert_eq!(
+        rig.backend.recorder.views().last().map(|v| v.1),
+        Some(View::Rect {
+            shown: Rect::new(448, 0, 256, 128),
+            space: Rect::new(0, 0, 704, 192),
+        }),
+        "the monitor that moved to Screen 3"
+    );
+
+    write_msg(
+        &mut client,
+        &Msg::Close {
+            reason: reason::ENDED_BY_VIEWER,
+        },
+    )
+    .await
+    .unwrap();
+    let MediaOutcome::Served { report, .. } =
+        tokio::time::timeout(WAIT, served).await.unwrap().unwrap()
+    else {
+        panic!("not served");
+    };
+    assert_eq!((report.monitor_requests, report.monitor_switches), (3, 1));
+}
+
 /// Session test 9: a kill while the source is inside a blocking switch (a
 /// Wayland switch may block for up to 10 s) stops capture well within the
 /// host's stop wait (`STOP_WAIT`, 5 s): the source checks the stop flag, the
