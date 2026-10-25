@@ -183,9 +183,19 @@ fn follow_screens(view: &mut ScreensView, screens: &Screens, news: ScreensNews) 
                     shown: screens.shown,
                 })
         }
-        ScreensNews::Answer { asked, status } => {
+        ScreensNews::Answer { asked, status } if status != monitor_status::OK => {
             view.switching = None;
-            (status != monitor_status::OK).then_some(ScreenNote::Refused { asked, status })
+            Some(ScreenNote::Refused { asked, status })
+        }
+        // An `OK` that shows another screen than the one asked for: the
+        // monitor asked for went before the host switched, and it fell back.
+        // Said as the host's change, so the window does not show one screen
+        // under the name of another unannounced.
+        ScreensNews::Answer { asked, .. } => {
+            view.switching = None;
+            (screens.shown != asked).then_some(ScreenNote::Changed {
+                shown: screens.shown,
+            })
         }
         ScreensNews::NoAnswer { asked } => {
             view.switching = None;
@@ -1401,6 +1411,57 @@ mod tests {
         let mut sink = SlotSink::new(Arc::new(FrameSlot::default()), Arc::clone(&idle));
         sink.screens(&two_screens(1, 0, false), ScreensNews::Layout);
         assert!(idle.read(|m| matches!(m.client, ClientStage::Idle)));
+    }
+
+    /// The final review of the monitors feature: an `OK` answer that shows
+    /// another screen than the one asked for (the monitor asked for went
+    /// before the host switched, and it fell back to the default) ends the
+    /// switch and says what is shown, as the host's own change does; one
+    /// that shows what was asked, all screens included, says nothing.
+    #[test]
+    fn an_answer_that_shows_another_screen_says_which() {
+        use tornect_proto::monitor_status;
+
+        let (shared, _) = live_shared();
+        let mut sink = SlotSink::new(Arc::new(FrameSlot::default()), Arc::clone(&shared));
+        let read = |shared: &Shared| {
+            shared.read(|m| match &m.client {
+                ClientStage::Live(v) => v.screens.clone().unwrap(),
+                _ => panic!("not live"),
+            })
+        };
+        let switching = |shared: &Shared, to: u8| {
+            shared.update_quiet(|m| {
+                if let ClientStage::Live(v) = &mut m.client {
+                    v.screens.as_mut().unwrap().switching = Some(to);
+                }
+            });
+        };
+        sink.screens(&two_screens(1, 0, false), ScreensNews::Layout);
+        switching(&shared, 2);
+        sink.screens(
+            &two_screens(1, 30, false),
+            ScreensNews::Answer {
+                asked: 2,
+                status: monitor_status::OK,
+            },
+        );
+        let view = read(&shared);
+        assert_eq!(view.switching, None);
+        assert_eq!(view.last, Some(ScreenNote::Changed { shown: 1 }));
+        assert_eq!(view.shown, 1);
+
+        switching(&shared, 0);
+        sink.screens(
+            &two_screens(0, 40, true),
+            ScreensNews::Answer {
+                asked: 0,
+                status: monitor_status::OK,
+            },
+        );
+        let view = read(&shared);
+        assert_eq!((view.switching, view.last), (None, None), "all, as asked");
+        assert_eq!(view.hold_from, Some(40));
     }
 
     /// The monitors design's V5: from a `REMAPPED` list's seq until a

@@ -906,7 +906,8 @@ pub enum ScreenNote {
         /// The host's status.
         status: u8,
     },
-    /// The host's own news changed what the pictures show.
+    /// The host's own news changed what the pictures show, or its answer
+    /// shows another screen than the one asked for.
     Changed {
         /// What they show now (0: all screens).
         shown: u8,

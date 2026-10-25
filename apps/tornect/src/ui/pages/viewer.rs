@@ -831,7 +831,8 @@ pub fn screen_detail(view: &ScreensView) -> String {
 
 /// What the newest of the host's screens' news says, as a toast (the
 /// monitors design §2): a refusal, a request given up or not sent, or the
-/// host's own change of what it shows. An answer that shows the screen
+/// host's own change of what it shows, which includes an answer that shows
+/// another screen than the one asked for. An answer that shows the screen
 /// asked for, and news that changes nothing shown, say nothing: the button
 /// already reads the screen.
 fn screen_toast(view: &ScreensView) -> Option<Toast> {
