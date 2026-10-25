@@ -410,25 +410,29 @@ unsafe fn draw_cursor(dc: HDC, x: i32, y: i32) {
     }
 }
 
-impl VideoSource for GdiCapture {
-    fn name(&self) -> &'static str {
-        "gdi"
-    }
-
-    /// Polls: every call lists the monitors and copies the one shown, or
-    /// all of them. A copy that fails (a secure screen shows) waits
-    /// `timeout` and answers `Ok(None)`, for up to a minute in a row; the
-    /// layout then stays the last picture's.
-    fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+impl GdiCapture {
+    /// One poll of the desktop ([`VideoSource::next_frame`]): `space` reads
+    /// the virtual desktop, `found` lists its monitors and `grab` copies a
+    /// rectangle of it, each asked every time, since a monitor can be
+    /// plugged, unplugged, moved or given another mode between two pictures.
+    /// Only a picture changes what the capture holds: the viewer's choice,
+    /// the monitors a selection is taken against and the layout. A grab that
+    /// fails leaves all three as they were, so a secure screen whose
+    /// enumeration came back empty does not drop the screen chosen, and the
+    /// session shows it again when the desktop can be read.
+    fn poll(
+        &mut self,
+        timeout: Duration,
+        space: impl FnOnce() -> Option<Rect>,
+        found: impl FnOnce() -> Vec<Found<Device>>,
+        grab: impl FnOnce(Rect) -> Result<Frame, CaptureError>,
+    ) -> Result<Option<Frame>, CaptureError> {
         let chooser = &mut self.chooser;
         let mut shown = None;
         let frame = self.outage.poll(timeout, || {
-            // Asked every time: a monitor can be plugged, unplugged, moved or
-            // given another mode between two pictures.
-            let space = virtual_desktop()
+            let space = space()
                 .ok_or_else(|| CaptureError::Failed("the desktop has no size".to_owned()))?;
-            let resolved = chooser.resolve(monitors(), space);
-            let frame = grab(resolved.grab)?;
+            let (frame, resolved) = chooser.resolve_with(found(), space, grab)?;
             shown = Some(resolved);
             Ok(frame)
         })?;
@@ -437,6 +441,21 @@ impl VideoSource for GdiCapture {
             self.resolved = Some(resolved);
         }
         Ok(frame)
+    }
+}
+
+impl VideoSource for GdiCapture {
+    fn name(&self) -> &'static str {
+        "gdi"
+    }
+
+    /// Polls: every call lists the monitors and copies the one shown, or
+    /// all of them. A copy that fails (a secure screen shows) waits
+    /// `timeout` and answers `Ok(None)`, for up to a minute in a row; the
+    /// layout, the monitors a selection is taken against and the viewer's
+    /// choice then stay the last picture's.
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+        self.poll(timeout, virtual_desktop, monitors, grab)
     }
 
     fn layout(&self) -> Option<Layout> {
@@ -594,6 +613,74 @@ mod tests {
         let next = capture.chooser.resolve(found, space);
         assert_eq!(next.shown, Selection::Monitor(1));
         assert_eq!(next.grab, Rect::new(-1280, 0, 1280, 1024));
+    }
+
+    /// A picture of `rect`'s size, for a grab that succeeds.
+    fn picture(rect: Rect) -> Result<Frame, CaptureError> {
+        Ok(Frame {
+            width: rect.width,
+            height: rect.height,
+            bgrx: vec![0xff; rect.width as usize * rect.height as usize * 4],
+            captured_at: Instant::now(),
+            grab: Duration::ZERO,
+        })
+    }
+
+    /// A grab that fails, as one does while a secure screen shows.
+    fn secure_screen(_: Rect) -> Result<Frame, CaptureError> {
+        Err(CaptureError::Failed("a secure screen shows".to_owned()))
+    }
+
+    /// The final review of the monitors feature: a secure-desktop outage
+    /// leaves the viewer's choice, and with it the layout and the monitors a
+    /// selection is taken against, as the last picture had them, also when
+    /// the enumeration comes back empty meanwhile (a list without the
+    /// monitor chosen would otherwise make the chooser fall back to the
+    /// primary). Once the desktop can be read the monitor chosen, held by its
+    /// device name, is shown again.
+    #[test]
+    fn an_outage_with_no_monitors_listed_keeps_the_screen_chosen() {
+        let stop = AtomicBool::new(false);
+        let space = Rect::new(-1280, 0, 3200, 1080);
+        let desk = || Some(space);
+        let both = || {
+            vec![
+                found_of(&info((0, 0, 1920, 1080), true, r"\\.\DISPLAY1")).unwrap(),
+                found_of(&info((-1280, 0, 0, 1024), false, r"\\.\DISPLAY2")).unwrap(),
+            ]
+        };
+        let mut capture = GdiCapture::default();
+        let first = capture.poll(Duration::ZERO, desk, both, picture).unwrap();
+        assert_eq!(first.map(|f| f.width), Some(1920), "the primary");
+        capture.select(Selection::Monitor(1), &stop).unwrap();
+        let chosen = capture.poll(Duration::ZERO, desk, both, picture).unwrap();
+        assert_eq!(chosen.map(|f| f.width), Some(1280), "the one chosen");
+        let before = capture.layout();
+
+        for found in [Vec::new(), both()] {
+            let during = capture
+                .poll(Duration::ZERO, desk, || found, secure_screen)
+                .unwrap();
+            assert!(during.is_none(), "waited out");
+            assert_eq!(capture.layout(), before, "the last picture's layout");
+        }
+        // A selection is still taken against the last picture's monitors.
+        assert!(matches!(
+            capture.select(Selection::Monitor(3), &stop),
+            Err(CaptureError::NoMonitor(3))
+        ));
+
+        let after = capture.poll(Duration::ZERO, desk, both, picture).unwrap();
+        assert_eq!(after.map(|f| f.width), Some(1280), "still the one chosen");
+        let layout = capture.layout().unwrap();
+        assert_eq!(layout.shown, Selection::Monitor(1));
+        assert_eq!(
+            layout.view,
+            View::Rect {
+                shown: Rect::new(-1280, 0, 1280, 1024),
+                space
+            }
+        );
     }
 
     /// The device names stay out of `Debug`: a capture's description never

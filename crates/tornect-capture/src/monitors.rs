@@ -33,6 +33,13 @@ enum Wanted<K> {
     One(K),
 }
 
+/// The choice a [`Chooser::plan`] made, taken by [`Chooser::commit`].
+struct Next<K> {
+    wanted: Wanted<K>,
+    /// Why the monitor shown is not the one chosen, if it is not.
+    why: Option<&'static str>,
+}
+
 /// The monitors of one grab and what it shows.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Resolved<K> {
@@ -110,6 +117,33 @@ impl<K: Clone + Eq> Chooser<K> {
     /// the first), and all of them to the first when one is left; either way
     /// the choice then holds the monitor shown.
     pub(crate) fn resolve(&mut self, found: Vec<Found<K>>, space: Rect) -> Resolved<K> {
+        let (resolved, next) = self.plan(found, space);
+        self.commit(next, &resolved);
+        resolved
+    }
+
+    /// [`Self::resolve`] for a grab that can fail: `grab` copies the
+    /// rectangle the resolve chose, and the choice changes only when it
+    /// succeeds. A grab that fails (a secure Windows screen shows) leaves the
+    /// choice as it was, even when the monitors found meanwhile do not hold
+    /// the one chosen (an enumeration that came back empty): the screen the
+    /// viewer chose is shown again once the desktop can be read.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn resolve_with<T>(
+        &mut self,
+        found: Vec<Found<K>>,
+        space: Rect,
+        grab: impl FnOnce(Rect) -> Result<T, CaptureError>,
+    ) -> Result<(T, Resolved<K>), CaptureError> {
+        let (resolved, next) = self.plan(found, space);
+        let grabbed = grab(resolved.grab)?;
+        self.commit(next, &resolved);
+        Ok((grabbed, resolved))
+    }
+
+    /// What a resolve against `found` in `space` shows, and what the choice
+    /// becomes once it is taken ([`Self::commit`]); changes nothing.
+    fn plan(&self, found: Vec<Found<K>>, space: Rect) -> (Resolved<K>, Next<K>) {
         let (monitors, keys) = numbered(found, space);
         let n = monitors.len();
         let all = n >= 2;
@@ -129,35 +163,46 @@ impl<K: Clone + Eq> Chooser<K> {
                 None => (Some(default), Some("the one shown before is gone")),
             },
         };
-        if let Some(index) = index {
-            self.wanted = keys
+        let wanted = match index {
+            Some(index) => keys
                 .get(index)
                 .cloned()
-                .map_or(Wanted::Default, Wanted::One);
-        }
+                .map_or(Wanted::Default, Wanted::One),
+            None => self.wanted.clone(),
+        };
         let shown = index.map_or(Selection::All, |index| Selection::Monitor(id_of(index)));
         let grab = even(match index {
             Some(index) => monitors[index].rect,
             None => bounding(&monitors),
         });
-        if why.is_some() || self.last != Some((shown, n)) {
+        (
+            Resolved {
+                monitors,
+                keys,
+                all,
+                shown,
+                grab,
+                space,
+            },
+            Next { wanted, why },
+        )
+    }
+
+    /// Take the choice a [`Self::plan`] made for `resolved`, and log what is
+    /// shown when it changed or fell back.
+    fn commit(&mut self, next: Next<K>, resolved: &Resolved<K>) {
+        self.wanted = next.wanted;
+        let (shown, n) = (resolved.shown, resolved.monitors.len());
+        if next.why.is_some() || self.last != Some((shown, n)) {
             let what = match shown {
                 Selection::All => "all".to_owned(),
                 Selection::Monitor(id) => format!("id={id}"),
             };
-            match why {
+            match next.why {
                 Some(why) => tracing::info!("monitor shown {what} of={n} ({why})"),
                 None => tracing::info!("monitor shown {what} of={n}"),
             }
             self.last = Some((shown, n));
-        }
-        Resolved {
-            monitors,
-            keys,
-            all,
-            shown,
-            grab,
-            space,
         }
     }
 
@@ -637,6 +682,48 @@ mod tests {
             Rect::new(0, 0, 3104, 768),
         );
         assert_eq!(r.shown, Selection::Monitor(1));
+    }
+
+    /// A resolve whose grab fails changes nothing: neither an empty list nor
+    /// one without the monitor chosen drops the choice, and the grab was asked
+    /// for what that resolve would show (with nothing found, the whole
+    /// space). A grab that succeeds takes the resolve, a fallback included,
+    /// as [`Chooser::resolve`] does.
+    #[test]
+    fn a_failed_grab_keeps_the_choice() {
+        let failed = || CaptureError::Failed("a secure screen shows".to_owned());
+        let mut chooser = Chooser::default();
+        let r = chooser.resolve(three(), THREE_SPACE);
+        chooser.select(Selection::Monitor(3), &r).unwrap();
+        let mut asked = Vec::new();
+        for list in [Vec::new(), three()[..1].to_vec()] {
+            let r = chooser.resolve_with(list, THREE_SPACE, |rect| {
+                asked.push(rect);
+                Err::<(), _>(failed())
+            });
+            assert!(r.is_err());
+        }
+        assert_eq!(
+            asked,
+            [THREE_SPACE, Rect::new(0, 0, 1920, 1080)],
+            "what each resolve would have shown"
+        );
+        let (grabbed, r) = chooser
+            .resolve_with(three(), THREE_SPACE, Ok::<Rect, CaptureError>)
+            .unwrap();
+        assert_eq!(r.shown, Selection::Monitor(3), "still the one chosen");
+        assert_eq!(grabbed, Rect::new(1920, 0, 1280, 1024));
+
+        // A grab that succeeds without the monitor chosen falls back, and
+        // the fallback holds.
+        let (_, r) = chooser
+            .resolve_with(three()[..1].to_vec(), THREE_SPACE, Ok::<Rect, CaptureError>)
+            .unwrap();
+        assert_eq!(r.shown, Selection::Monitor(1));
+        assert_eq!(
+            chooser.resolve(three(), THREE_SPACE).shown,
+            Selection::Monitor(2)
+        );
     }
 
     /// All screens with one monitor left show it, and keep showing it when a
