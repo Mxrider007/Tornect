@@ -86,6 +86,32 @@ impl ClipText {
         Ok(Self(text))
     }
 
+    /// Text the peer sent, checked as [`ClipText::new`] checks it, with every
+    /// control character removed but TAB, LF and CR: C0, DEL and C1 (Unicode's
+    /// `Cc`, [`char::is_control`]). A host could otherwise put an escape
+    /// sequence on the viewer's clipboard, such as the end of a bracketed
+    /// paste followed by a command, which a terminal that does not filter
+    /// what is pasted would then run. Text received from the services stream
+    /// becomes a `ClipText` only through here, in both directions (decision
+    /// M1-76). Other invisible characters stay: emoji sequences, right-to-left
+    /// text and several scripts need the zero-width joiners and the direction
+    /// marks. Text that held only removed characters is [`Empty`].
+    ///
+    /// [`Empty`]: ClipboardError::Empty
+    pub fn from_peer(text: String) -> Result<Self, ClipboardError> {
+        let text = Self::new(text)?;
+        if !text.0.chars().any(removed_from_peer) {
+            return Ok(text);
+        }
+        // As long as the text, so no reallocation leaves an unwiped copy.
+        let mut kept = Zeroizing::new(String::with_capacity(text.0.len()));
+        kept.extend(text.0.chars().filter(|&c| !removed_from_peer(c)));
+        if kept.is_empty() {
+            return Err(ClipboardError::Empty);
+        }
+        Ok(Self(kept))
+    }
+
     /// The text.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -110,6 +136,12 @@ impl ClipText {
     pub fn fingerprint(&self) -> [u8; 32] {
         fingerprint(&self.0)
     }
+}
+
+/// Whether [`ClipText::from_peer`] removes `c`: a control character other
+/// than TAB, LF and CR. NUL never gets here: the text is refused first.
+fn removed_from_peer(c: char) -> bool {
+    c.is_control() && !matches!(c, '\t' | '\n' | '\r')
 }
 
 impl fmt::Debug for ClipText {
@@ -457,6 +489,49 @@ mod tests {
         assert!(ends.active.has_changed().is_err());
     }
 
+    #[test]
+    fn text_from_the_peer_loses_its_control_characters() {
+        // ESC (the end of a bracketed paste and a command after it), BEL and
+        // the C1 CSI go; TAB, LF and CR stay.
+        let text =
+            ClipText::from_peer("a\u{1b}[201~rm -rf ~\u{7}\tb\r\nc\u{9b}31m".to_owned()).unwrap();
+        assert_eq!(text.as_str(), "a[201~rm -rf ~\tb\r\nc31m");
+        // Every C0 but those three, DEL and every C1.
+        let controls: String = ('\u{1}'..='\u{1f}').chain('\u{7f}'..='\u{9f}').collect();
+        assert_eq!(
+            ClipText::from_peer(format!("x{controls}y"))
+                .unwrap()
+                .as_str(),
+            "x\t\n\ry"
+        );
+        // Format characters that text needs stay: a ZWJ emoji sequence with a
+        // variation selector, a ZWNJ, the direction marks.
+        let kept = "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F468} \u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645} \u{200E}a\u{200F}";
+        assert_eq!(ClipText::from_peer(kept.to_owned()).unwrap().as_str(), kept);
+        // Text without them is kept as it is.
+        assert_eq!(
+            ClipText::from_peer("plain text\n".to_owned())
+                .unwrap()
+                .as_str(),
+            "plain text\n"
+        );
+        // The rules of `new` first: NUL is refused, not removed; so is text
+        // over the cap, counted before the removal.
+        assert_eq!(
+            ClipText::from_peer("a\0b".to_owned()).unwrap_err(),
+            ClipboardError::Nul
+        );
+        assert_eq!(
+            ClipText::from_peer(format!("{}\u{1b}", "x".repeat(CLIP_MAX))).unwrap_err(),
+            ClipboardError::TooLarge
+        );
+        // Nothing left is empty.
+        assert_eq!(
+            ClipText::from_peer("\u{1b}\u{9b}".to_owned()).unwrap_err(),
+            ClipboardError::Empty
+        );
+    }
+
     /// Only an X11 session opens the arboard backend, whatever `$DISPLAY`
     /// names: run under Xvfb too, where a display is there.
     #[cfg(target_os = "linux")]
@@ -556,6 +631,23 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn text_from_the_peer_keeps_all_but_control_characters(
+            text in "\\PC{0,20}|[a\t\n\r\u{1}-\u{1f}\u{7f}-\u{9f}\u{200d}]{1,40}",
+        ) {
+            let expected: String = text
+                .chars()
+                .filter(|&c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+                .collect();
+            match ClipText::from_peer(text.clone()) {
+                Ok(kept) => prop_assert_eq!(kept.as_str(), expected.as_str()),
+                Err(e) => {
+                    prop_assert_eq!(e, ClipboardError::Empty);
+                    prop_assert!(expected.is_empty());
+                }
+            }
+        }
+
         #[test]
         fn the_fingerprint_is_sha256_of_the_text_with_lf_endings(
             text in "[a-c\r\n]{0,40}|\\PC{0,40}",
