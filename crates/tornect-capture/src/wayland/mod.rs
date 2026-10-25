@@ -13,9 +13,15 @@
 //!   It speaks evdev codes to the portal's `Notify*` methods.
 //! - The session's restore token, kept in a 0600 file, lets later sessions
 //!   start without the dialog until the user revokes the permission.
+//! - With [`WaylandOptions::clipboard`] (`[services] wayland_clipboard`) the
+//!   session also asks for the desktop's clipboard, and [`WaylandClipboard`]
+//!   hands out its [`ClipboardLink`] (design `services` §4.2).
 //!
 //! Built for LP64 Linux only: the PipeWire structures are mirrored for it.
 
+mod clip;
+#[cfg(test)]
+mod fake_bus;
 mod pipewire;
 mod portal;
 
@@ -23,6 +29,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use tornect_input::clipboard::ClipboardLink;
 use tornect_input::{
     Button, InputError, InputEvent, InputSink, View, WheelAccumulator, denormalize, keymap,
 };
@@ -61,11 +68,19 @@ pub struct WaylandOptions {
     /// with the cap gets it once more without (on a second PipeWire remote
     /// the portal opens for that), so a cap never costs the picture.
     pub max_fps: Option<u32>,
+    /// Ask the desktop for its clipboard too (`[services] wayland_clipboard`,
+    /// off by default; design `services` §4.2): `RequestClipboard` before
+    /// `Start`, in every session and in [`grant`] alike, so the restore token
+    /// covers what each session asks for. A token restores the request that
+    /// made it, so `restore_token` must be the file of this request
+    /// (`tornect_core::Paths::portal_restore_token_for`). Off, the portal
+    /// request is the one made before the switch existed, call for call.
+    pub clipboard: bool,
 }
 
 impl WaylandOptions {
     /// The session bus and [`DIALOG_WAIT`], keeping the token in
-    /// `restore_token`.
+    /// `restore_token`, without the clipboard.
     #[must_use]
     pub fn new(restore_token: Option<PathBuf>) -> Self {
         Self {
@@ -74,6 +89,19 @@ impl WaylandOptions {
             bus: Bus::Session,
             cancel: None,
             max_fps: None,
+            clipboard: false,
+        }
+    }
+
+    /// What the portal thread is given for these options.
+    fn setup(&self, spare_remote: bool) -> Setup {
+        Setup {
+            bus: self.bus.clone(),
+            token_file: self.restore_token.clone(),
+            dialog_wait: self.dialog_wait,
+            cancel: self.cancel.clone(),
+            spare_remote,
+            clipboard: self.clipboard,
         }
     }
 }
@@ -105,13 +133,7 @@ impl WaylandSource {
     pub fn open(options: &WaylandOptions) -> Result<(Self, WaylandInput), CaptureError> {
         // A machine that could not show the stream is refused before any dialog.
         pipewire::api()?;
-        let (portal, opened) = Portal::open(Setup {
-            bus: options.bus.clone(),
-            token_file: options.restore_token.clone(),
-            dialog_wait: options.dialog_wait,
-            cancel: options.cancel.clone(),
-            spare_remote: options.max_fps.is_some(),
-        })?;
+        let (portal, opened) = Portal::open(options.setup(options.max_fps.is_some()))?;
         let portal = Arc::new(portal);
         let Opened {
             node_id,
@@ -119,6 +141,7 @@ impl WaylandSource {
             input,
             fd,
             spare,
+            clipboard,
         } = opened;
         let cancelled = || options.cancel.as_ref().is_some_and(|c| *c.borrow());
         let (capture, format) =
@@ -141,6 +164,7 @@ impl WaylandSource {
             shared: Arc::clone(capture.shared()),
             logical,
             granted: input,
+            clipboard,
         };
         Ok((Self { capture, portal }, input))
     }
@@ -182,6 +206,9 @@ pub struct Granted {
     /// The desktop returned a restore token, and it is kept in the options'
     /// file: later sessions start without the dialog.
     pub remembered: bool,
+    /// The desktop shares its clipboard under the grant (asked for only with
+    /// [`WaylandOptions::clipboard`]).
+    pub clipboard: bool,
 }
 
 /// The first-run setup step (the operator's decision of 2026-09-23): ask the
@@ -197,14 +224,9 @@ pub struct Granted {
 /// use the grant.
 pub fn grant(options: &WaylandOptions) -> Result<Granted, CaptureError> {
     pipewire::api()?;
-    let (portal, opened) = Portal::open(Setup {
-        bus: options.bus.clone(),
-        token_file: options.restore_token.clone(),
-        dialog_wait: options.dialog_wait,
-        cancel: options.cancel.clone(),
-        spare_remote: false,
-    })?;
+    let (portal, opened) = Portal::open(options.setup(false))?;
     let input = opened.input;
+    let clipboard = opened.clipboard;
     // The PipeWire remote goes first, then the session: no picture is taken.
     drop(opened);
     drop(portal);
@@ -217,7 +239,26 @@ pub fn grant(options: &WaylandOptions) -> Result<Granted, CaptureError> {
         remembered,
         "the desktop's screen-sharing grant was asked for ahead of any session"
     );
-    Ok(Granted { input, remembered })
+    Ok(Granted {
+        input,
+        remembered,
+        clipboard,
+    })
+}
+
+/// Delete the restore tokens the portal request this host makes never
+/// restores (`tornect_core::Paths::retired_portal_tokens`), at host start: a
+/// token is a bearer grant of the screen and input, and one made for another
+/// request is never used again. With the clipboard switch off there are none.
+/// Returns how many there were; the desktop then asks once more, at the
+/// first-run grant or the next session.
+pub fn forget_retired_tokens(paths: &tornect_core::Paths, clipboard: bool) -> usize {
+    paths
+        .retired_portal_tokens(clipboard)
+        .iter()
+        .filter(|file| file.exists())
+        .inspect(|file| portal::forget_token(file))
+        .count()
 }
 
 impl VideoSource for WaylandSource {
@@ -250,6 +291,8 @@ pub struct WaylandInput {
     shared: Arc<Shared>,
     logical: Option<(u32, u32)>,
     granted: bool,
+    /// The session started with the desktop's clipboard.
+    clipboard: bool,
 }
 
 impl std::fmt::Debug for WaylandInput {
@@ -257,11 +300,28 @@ impl std::fmt::Debug for WaylandInput {
         f.debug_struct("WaylandInput")
             .field("logical", &self.logical)
             .field("granted", &self.granted)
+            .field("clipboard", &self.clipboard)
             .finish_non_exhaustive()
     }
 }
 
 impl WaylandInput {
+    /// The session's clipboard: `Some` only when the session asked for it
+    /// ([`WaylandOptions::clipboard`]) and the desktop shares it
+    /// (`clipboard_enabled` in the `Start` results), while the source lives.
+    #[must_use]
+    pub fn clipboard(&self) -> Option<WaylandClipboard> {
+        if !self.clipboard {
+            return None;
+        }
+        self.portal
+            .upgrade()
+            .filter(|p| !p.is_over())
+            .map(|_| WaylandClipboard {
+                portal: Weak::clone(&self.portal),
+            })
+    }
+
     /// An injector into the source's session. The viewer's pointer is mapped
     /// over the part of the stream the picture shows, the whole of it but for
     /// an odd last column or row (decision M1-74), scaled down or not.
@@ -306,6 +366,45 @@ impl WaylandInput {
             map,
             wheel: WheelAccumulator::default(),
         })
+    }
+}
+
+/// The desktop's clipboard on a [`WaylandSource`]'s portal session, held
+/// weakly like [`WaylandInput`]. Its [`ClipboardLink`] keeps the backend
+/// contract of `tornect_input::clipboard`: nothing is read or set while the
+/// link is inactive, text copied before an activation never crosses, nor text
+/// a password manager marks private, and text the link set is cleared from
+/// the clipboard when the session ends.
+#[derive(Debug)]
+pub struct WaylandClipboard {
+    portal: Weak<Portal>,
+}
+
+impl WaylandClipboard {
+    /// The link to the clipboard's loop, once per session: refused when it
+    /// was taken already or the source is gone. Dropping it stops the loop,
+    /// which clears the clipboard if it still holds text the link set.
+    pub fn link(self) -> Result<ClipboardLink, CaptureError> {
+        let portal = self
+            .portal
+            .upgrade()
+            .filter(|p| !p.is_over())
+            .ok_or_else(|| {
+                CaptureError::Unavailable("the screen-sharing session has ended".to_owned())
+            })?;
+        portal.take_clip_link().ok_or_else(|| {
+            CaptureError::Unavailable("the session's clipboard is in use already".to_owned())
+        })
+    }
+
+    /// How long after the desktop's `Start` answer it first announced the
+    /// clipboard's owner, once it has: what gate G2 measures against the
+    /// loop's baseline grace.
+    #[must_use]
+    pub fn announced_after_start(&self) -> Option<Duration> {
+        self.portal
+            .upgrade()
+            .and_then(|portal| portal.announced_after_start())
     }
 }
 
@@ -746,6 +845,81 @@ mod tests {
             shared: Arc::clone(shared),
             logical,
             granted,
+            clipboard: false,
+        }
+    }
+
+    /// The clipboard switch is off unless a caller turns it on, and the
+    /// portal thread is given what the options say. Off, the session's calls
+    /// are the ones made before the switch existed
+    /// (`portal::tests::fake_bus_without_the_switch_no_clipboard_call_is_made`
+    /// checks them on a bus).
+    #[test]
+    fn the_clipboard_is_asked_for_only_with_the_switch_on() {
+        let options = WaylandOptions::new(Some(PathBuf::from("token")));
+        assert!(!options.clipboard);
+        let setup = options.setup(false);
+        assert!(!setup.clipboard);
+        assert_eq!(setup.token_file, Some(PathBuf::from("token")));
+        assert!(!setup.spare_remote);
+        let on = WaylandOptions {
+            clipboard: true,
+            ..WaylandOptions::new(None)
+        };
+        let setup = on.setup(true);
+        assert!(setup.clipboard);
+        assert!(setup.spare_remote);
+    }
+
+    /// At host start the switch on deletes the token made without the
+    /// clipboard (it would restore a grant without it), and keeps its own;
+    /// the switch off deletes nothing.
+    #[test]
+    fn retired_tokens_are_deleted_only_with_the_switch_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = tornect_core::Paths::from_home(dir.path().join("home"));
+        paths.ensure().unwrap();
+        let without = paths.portal_restore_token_for(false);
+        let with = paths.portal_restore_token_for(true);
+        portal::remember_token(&without, Some("without-the-clipboard"));
+        portal::remember_token(&with, Some("with-the-clipboard"));
+        assert_eq!(forget_retired_tokens(&paths, false), 0);
+        assert!(without.exists() && with.exists());
+        assert_eq!(forget_retired_tokens(&paths, true), 1);
+        assert!(!without.exists());
+        assert!(with.exists());
+        assert_eq!(forget_retired_tokens(&paths, true), 0);
+    }
+
+    /// The clipboard is handed out only for a session the desktop shares it
+    /// with, while the source lives, and its link once.
+    #[test]
+    fn the_clipboard_link_is_handed_out_once_and_only_when_shared() {
+        let (portal, _rx) = Portal::detached(8);
+        let (portal, _ends) = portal.with_clip_link();
+        let portal = Arc::new(portal);
+        let shared = Arc::new(Shared::new());
+        let mut shared_input = input(&portal, &shared, None, true);
+        assert!(
+            shared_input.clipboard().is_none(),
+            "the session does not share the clipboard"
+        );
+        shared_input.clipboard = true;
+        let first = shared_input.clipboard().unwrap();
+        let second = shared_input.clipboard().unwrap();
+        assert!(first.announced_after_start().is_none());
+        let link = first.link().unwrap();
+        assert!(!*link.active.borrow(), "a new link is inactive");
+        match second.link() {
+            Err(CaptureError::Unavailable(why)) => assert!(why.contains("in use"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        let late = shared_input.clipboard().unwrap();
+        drop(portal);
+        assert!(shared_input.clipboard().is_none(), "the source is gone");
+        match late.link() {
+            Err(CaptureError::Unavailable(why)) => assert!(why.contains("ended"), "{why}"),
+            other => panic!("{other:?}"),
         }
     }
 
@@ -962,8 +1136,9 @@ mod tests {
     #[test]
     #[ignore = "opens a real portal session: the desktop shows a dialog someone must answer"]
     fn live_portal_session_shares_the_screen_and_takes_the_pointer() {
-        let token = std::env::var_os(tornect_core::paths::HOME_ENV)
-            .map(|home| tornect_core::Paths::from_home(PathBuf::from(home)).portal_restore_token());
+        let token = std::env::var_os(tornect_core::paths::HOME_ENV).map(|home| {
+            tornect_core::Paths::from_home(PathBuf::from(home)).portal_restore_token_for(false)
+        });
         let had_token = token.as_ref().is_some_and(|t| t.exists());
         eprintln!("restore token file: {token:?} (present before: {had_token})");
         let options = WaylandOptions {
@@ -1053,6 +1228,87 @@ mod tests {
         );
         assert!(first.is_some(), "no first picture of a still screen");
         assert!(moved >= 4, "pointer moves produced pictures {moved}/5");
+    }
+
+    /// The live clipboard check (gates G1 and G2, `docs/VERIFICATION.md`): a
+    /// real RemoteDesktop session with the clipboard, on this desktop. **It
+    /// shows the portal dialog** unless the clipboard request's restore token
+    /// (`portal-restore-token-2`) still holds; someone must answer it, copy
+    /// text when asked and paste when asked. Copy some text before the run, so
+    /// the desktop has an owner to announce. Run it twice: the first run asks
+    /// and keeps the token, the second must start with no dialog and the
+    /// clipboard still shared (G1). Each run prints how long after `Start` the
+    /// desktop announced the owner from before the session (G2) and the
+    /// length of what was copied, never the text:
+    ///
+    /// ```text
+    /// TORNECT_HOME=$PWD/target/tornect-test/clip-host \
+    ///   cargo test --workspace -- --ignored --nocapture wayland::tests::live_portal_clipboard
+    /// ```
+    #[test]
+    #[ignore = "opens a real portal session with the clipboard: the desktop shows a dialog someone must answer"]
+    fn live_portal_clipboard_is_shared_restored_and_announced() {
+        use tornect_input::clipboard::ClipText;
+
+        let token = std::env::var_os(tornect_core::paths::HOME_ENV).map(|home| {
+            tornect_core::Paths::from_home(PathBuf::from(home)).portal_restore_token_for(true)
+        });
+        let had_token = token.as_ref().is_some_and(|t| t.exists());
+        eprintln!("clipboard restore token present before: {had_token}");
+        let options = WaylandOptions {
+            dialog_wait: Duration::from_secs(180),
+            clipboard: true,
+            ..WaylandOptions::new(token.clone())
+        };
+        let started = std::time::Instant::now();
+        let (source, input) = WaylandSource::open(&options).expect("the portal session starts");
+        eprintln!(
+            "session started in {:.1} s (a restored grant takes well under 2 s)",
+            started.elapsed().as_secs_f64()
+        );
+        let clipboard = input.clipboard();
+        eprintln!("clipboard_enabled: {}", clipboard.is_some());
+        let clipboard = clipboard.expect("the desktop shares its clipboard (G1)");
+        std::thread::sleep(Duration::from_secs(5));
+        let announced = clipboard.announced_after_start();
+        eprintln!(
+            "the owner from before the session was announced {announced:?} after Start (the \
+             baseline grace is {:?})",
+            clip::BASELINE_GRACE
+        );
+        let mut link = clipboard.link().expect("the clipboard's link");
+        link.active.send_replace(true);
+        eprintln!("COPY some new text on this desktop within 30 s");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut copied = None;
+        while std::time::Instant::now() < deadline {
+            if link.from_desktop.has_changed().unwrap_or(false) {
+                copied = link
+                    .from_desktop
+                    .borrow_and_update()
+                    .as_ref()
+                    .map(ClipText::byte_len);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!("copied text that crossed: {copied:?} bytes");
+        let text = "Tornect clipboard check";
+        link.to_desktop
+            .send_replace(Some(ClipText::new(text.to_owned()).unwrap()));
+        eprintln!("PASTE into an editor within 30 s: it pastes {text:?}");
+        std::thread::sleep(Duration::from_secs(30));
+        drop(link);
+        eprintln!("the link is gone: a paste now gives nothing (the clipboard was cleared)");
+        std::thread::sleep(Duration::from_secs(10));
+        drop(input);
+        drop(source);
+        let kept = token.as_ref().is_some_and(|t| t.exists());
+        eprintln!(
+            "LIVE CLIPBOARD CHECK clipboard_enabled=true announced={announced:?} \
+             copied_bytes={copied:?} token_kept={kept} token_before={had_token}"
+        );
+        assert!(copied.is_some(), "no copied text crossed within 30 s");
     }
 
     fn next(source: &mut WaylandSource, within: Duration) -> Option<Frame> {

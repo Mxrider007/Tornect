@@ -15,15 +15,24 @@
 //! connection of its own (never ashpd's process-wide one, which would outlive
 //! this runtime). Input reaches that thread through a bounded queue, so an
 //! injector never blocks the session's task on a D-Bus round trip.
+//!
+//! With [`Setup::clipboard`] (`[services] wayland_clipboard`, design
+//! `services` §4.2) the session asks for the desktop's clipboard as well:
+//! `RequestClipboard` after `SelectSources` and before `Start`, the only
+//! moment the portal takes it, with the clipboard's signals subscribed first
+//! (`docs/research/services.md` R1). The same thread then serves the
+//! clipboard's loop (`clip.rs`) beside the input calls. Without it, the calls
+//! are the ones above, one for one.
 
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use ashpd::desktop::clipboard::{Clipboard, RequestClipboardOptions};
 use ashpd::desktop::remote_desktop::{
     Axis, DeviceType, KeyState, RemoteDesktop, SelectDevicesOptions, StartOptions,
 };
@@ -36,7 +45,9 @@ use ashpd::zbus;
 use futures::StreamExt as _;
 use tokio::sync::{mpsc, watch};
 use tornect_input::InputError;
+use tornect_input::clipboard::{ClipboardLink, DesktopEnds};
 
+use super::clip::{self, Clip, PortalCalls, Signals};
 use super::pipewire::PW_ID_ANY;
 use crate::CaptureError;
 
@@ -44,6 +55,9 @@ use crate::CaptureError;
 const STEP_WAIT: Duration = Duration::from_secs(10);
 /// Portal calls made before the dialog, each bounded by [`STEP_WAIT`].
 const STEPS: u32 = 6;
+/// The calls the clipboard adds before the dialog: its proxy, the signals'
+/// subscription and `RequestClipboard`.
+const CLIPBOARD_STEPS: u32 = 3;
 /// How long closing the session may take.
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
 /// How long one input call may take before it is given up.
@@ -77,6 +91,9 @@ pub(crate) struct Setup {
     /// Also open a second PipeWire remote ([`Opened::spare`]), for a stream
     /// that must be connected once more.
     pub(crate) spare_remote: bool,
+    /// Ask for the desktop's clipboard too (`RequestClipboard` before
+    /// `Start`). Off, no clipboard call is made at all.
+    pub(crate) clipboard: bool,
 }
 
 /// A started session, as the capture side needs it.
@@ -94,6 +111,10 @@ pub(crate) struct Opened {
     /// A second remote to the same node, when [`Setup::spare_remote`] asked
     /// for one and the portal gave it.
     pub(crate) spare: Option<OwnedFd>,
+    /// The desktop shares its clipboard with the session: [`Setup::clipboard`]
+    /// asked for it and `Start` answered `clipboard_enabled`. The link is then
+    /// [`Portal::take_clip_link`]'s.
+    pub(crate) clipboard: bool,
 }
 
 /// The screen cast the portal started, before it is checked.
@@ -189,10 +210,17 @@ impl Held {
 
 /// A live portal session, owned by its thread. Dropping the last handle ends
 /// it: the thread makes no queued call any more, lets go of the keys and
-/// buttons its calls still hold down, and closes the session, which takes
-/// the desktop's sharing indicator away.
+/// buttons its calls still hold down, clears the clipboard if it still holds
+/// text the session put there, and closes the session, which takes the
+/// desktop's sharing indicator away.
 pub(crate) struct Portal {
     calls: Option<mpsc::Sender<Call>>,
+    /// The session's end of the clipboard's loop, until it is taken; `None`
+    /// for a session that does not share the clipboard.
+    clip_link: Mutex<Option<ClipboardLink>>,
+    /// How long after `Start` returned the desktop first announced the
+    /// clipboard's owner (gate G2).
+    announced: Arc<OnceLock<Duration>>,
     /// Set once the session is over, whoever ended it.
     over: Arc<AtomicBool>,
     /// Set when the last handle goes (a kill, or the session's end), before
@@ -224,31 +252,61 @@ impl Portal {
         let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel::<()>(0);
         let over = Arc::new(AtomicBool::new(false));
         let closing = Arc::new(AtomicBool::new(false));
+        let announced = Arc::new(OnceLock::new());
+        let (clip_link, clip_ends) = if setup.clipboard {
+            let (link, ends) = ClipboardLink::pair();
+            (Some(link), Some(ends))
+        } else {
+            (None, None)
+        };
         // Every step on the thread is bounded, so this only guards against a
         // thread that is stuck anyway: the steps before the dialog, then one
         // `OpenPipeWireRemote` or two.
-        let wait = setup.dialog_wait + STEP_WAIT * (STEPS + 1 + u32::from(setup.spare_remote));
+        let wait = setup.dialog_wait
+            + STEP_WAIT
+                * (STEPS
+                    + 1
+                    + u32::from(setup.spare_remote)
+                    + CLIPBOARD_STEPS * u32::from(setup.clipboard));
         let thread = std::thread::Builder::new()
             .name("tornect-portal".to_owned())
             .spawn({
                 let over = Arc::clone(&over);
                 let closing = Arc::clone(&closing);
+                let announced = Arc::clone(&announced);
                 move || {
                     let _finished = finished_tx;
                     let _over = SetOnDrop(Arc::clone(&over));
-                    run(&setup, &opened_tx, calls_rx, &over, &closing);
+                    let thread = Thread {
+                        calls: calls_rx,
+                        clip_ends,
+                        announced,
+                        over: &over,
+                        closing: &closing,
+                    };
+                    run(&setup, &opened_tx, thread);
                 }
             })
             .map_err(|e| unavailable(format!("cannot start the portal thread: {e}")))?;
         let portal = Self {
             calls: Some(calls_tx),
+            clip_link: Mutex::new(None),
+            announced,
             over,
             closing,
             finished: Mutex::new(Some(finished_rx)),
             thread: Some(thread),
         };
         match opened_rx.recv_timeout(wait) {
-            Ok(Ok(opened)) => Ok((portal, opened)),
+            Ok(Ok(opened)) => {
+                if opened.clipboard {
+                    *portal
+                        .clip_link
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = clip_link;
+                }
+                Ok((portal, opened))
+            }
             Ok(Err(e)) => Err(e),
             Err(RecvTimeoutError::Timeout) => Err(unavailable(format!(
                 "the screen-sharing portal did not answer within {} s",
@@ -263,6 +321,21 @@ impl Portal {
     /// Whether the session is over (closed here, by the desktop, or failed).
     pub(crate) fn is_over(&self) -> bool {
         self.over.load(Ordering::SeqCst)
+    }
+
+    /// The clipboard's link, once: `None` when it was taken already, or the
+    /// session does not share the desktop's clipboard.
+    pub(crate) fn take_clip_link(&self) -> Option<ClipboardLink> {
+        self.clip_link
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// How long after `Start` returned the desktop first announced the
+    /// clipboard's owner, once it has (gate G2).
+    pub(crate) fn announced_after_start(&self) -> Option<Duration> {
+        self.announced.get().copied()
     }
 
     /// Queue one call; never blocks.
@@ -300,9 +373,10 @@ impl Drop for Portal {
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+        // The thread may still clear the clipboard before it closes.
         let done = finished.is_some_and(|f| {
             matches!(
-                f.recv_timeout(CLOSE_WAIT + STEP_WAIT),
+                f.recv_timeout(CLOSE_WAIT + STEP_WAIT + clip::CALL_WAIT),
                 Err(RecvTimeoutError::Disconnected) | Ok(())
             )
         });
@@ -324,6 +398,8 @@ impl Portal {
         let (calls, rx) = mpsc::channel(capacity);
         let portal = Self {
             calls: Some(calls),
+            clip_link: Mutex::new(None),
+            announced: Arc::new(OnceLock::new()),
             over: Arc::new(AtomicBool::new(false)),
             closing: Arc::new(AtomicBool::new(false)),
             finished: Mutex::new(None),
@@ -336,6 +412,17 @@ impl Portal {
     pub(crate) fn closing(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.closing)
     }
+
+    /// Give the handle a clipboard link, as a session the desktop shares its
+    /// clipboard with has; the loop's ends are returned.
+    pub(crate) fn with_clip_link(self) -> (Self, DesktopEnds) {
+        let (link, ends) = ClipboardLink::pair();
+        *self
+            .clip_link
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(link);
+        (self, ends)
+    }
 }
 
 /// Marks the session over when the portal thread ends, however it ends.
@@ -347,15 +434,27 @@ impl Drop for SetOnDrop {
     }
 }
 
+/// What the portal thread keeps beside its [`Setup`].
+struct Thread<'a> {
+    calls: mpsc::Receiver<Call>,
+    /// The clipboard loop's ends, when [`Setup::clipboard`] asked for it.
+    clip_ends: Option<DesktopEnds>,
+    announced: Arc<OnceLock<Duration>>,
+    over: &'a AtomicBool,
+    closing: &'a AtomicBool,
+}
+
 /// The portal thread: start the session, report it, then pass input calls on
-/// until every handle is gone or the desktop closes the session.
-fn run(
-    setup: &Setup,
-    opened: &SyncSender<Result<Opened, CaptureError>>,
-    mut calls: mpsc::Receiver<Call>,
-    over: &AtomicBool,
-    closing: &AtomicBool,
-) {
+/// (and serve the clipboard) until every handle is gone or the desktop closes
+/// the session.
+fn run(setup: &Setup, opened: &SyncSender<Result<Opened, CaptureError>>, thread: Thread<'_>) {
+    let Thread {
+        mut calls,
+        clip_ends,
+        announced,
+        over,
+        closing,
+    } = thread;
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -378,6 +477,7 @@ fn run(
             remote,
             session,
             reply,
+            clip,
         } = started;
         let node_id = reply.node_id;
         let mut closed = match session.receive_closed().await {
@@ -393,14 +493,23 @@ fn run(
             return;
         }
         let (remote, session) = (&remote, &session);
-        let passed = pass_on(&mut calls, closing, &mut closed, move |call| {
-            notify(remote, session, node_id, call)
-        })
-        .await;
+        let mut clip = clip
+            .zip(clip_ends)
+            .map(|(clip, ends)| clip.into_loop(session, ends, announced));
+        let passed = tokio::select! {
+            passed = pass_on(&mut calls, closing, &mut closed, move |call| {
+                notify(remote, session, node_id, call)
+            }) => passed,
+            never = clip::serve(clip.as_mut()) => match never {},
+        };
         over.store(true, Ordering::SeqCst);
         if passed == PassedOn::DesktopEnded {
             tracing::info!("the desktop ended the screen-sharing session");
             return;
+        }
+        // Before the session goes: text it set is not left behind.
+        if let Some(clip) = clip.as_mut() {
+            clip.finish().await;
         }
         close(session).await;
     });
@@ -539,6 +648,50 @@ struct Started {
     remote: RemoteDesktop,
     session: Session<RemoteDesktop>,
     reply: Opened,
+    /// The clipboard, when the desktop shares it with the session.
+    clip: Option<ClipStarted>,
+}
+
+/// The clipboard of a session started with it.
+struct ClipStarted {
+    clipboard: Clipboard,
+    ready: ClipReady,
+}
+
+/// What [`negotiate`] keeps of a clipboard the desktop shares.
+struct ClipReady {
+    /// Subscribed before `Start`.
+    signals: Signals,
+    /// The session's path, as the signals name it.
+    path: String,
+    /// When `Start` returned.
+    started: tokio::time::Instant,
+}
+
+impl ClipStarted {
+    fn into_loop(
+        self,
+        session: &Session<RemoteDesktop>,
+        ends: DesktopEnds,
+        announced: Arc<OnceLock<Duration>>,
+    ) -> Clip<PortalCalls<'_>, Signals> {
+        let ClipReady {
+            signals,
+            path,
+            started,
+        } = self.ready;
+        Clip::new(
+            PortalCalls {
+                clipboard: self.clipboard,
+                session,
+            },
+            signals,
+            ends,
+            path,
+            started,
+            announced,
+        )
+    }
 }
 
 /// A portal call bounded by [`STEP_WAIT`], its errors made `Unavailable`.
@@ -585,17 +738,36 @@ async fn start(setup: &Setup) -> Result<Started, CaptureError> {
         RemoteDesktop::with_connection(connection.clone()),
     )
     .await?;
-    let screencast = step("ScreenCast", Screencast::with_connection(connection)).await?;
+    let screencast = step(
+        "ScreenCast",
+        Screencast::with_connection(connection.clone()),
+    )
+    .await?;
+    // A desktop without the clipboard's portal shares no clipboard; the
+    // session goes on without one.
+    let clipboard = if setup.clipboard {
+        step("Clipboard", Clipboard::with_connection(connection))
+            .await
+            .inspect_err(|e| {
+                tracing::debug!(error = %e, "no clipboard portal; the session shares no clipboard")
+            })
+            .ok()
+    } else {
+        None
+    };
     let session = step(
         "CreateSession",
         remote.create_session(CreateSessionOptions::default()),
     )
     .await?;
-    match negotiate(setup, &remote, &screencast, &session).await {
-        Ok(reply) => Ok(Started {
+    match negotiate(setup, &remote, &screencast, clipboard.as_ref(), &session).await {
+        Ok((reply, ready)) => Ok(Started {
             remote,
             session,
             reply,
+            clip: clipboard
+                .zip(ready)
+                .map(|(clipboard, ready)| ClipStarted { clipboard, ready }),
         }),
         Err(e) => {
             close(&session).await;
@@ -608,8 +780,9 @@ async fn negotiate(
     setup: &Setup,
     remote: &RemoteDesktop,
     screencast: &Screencast,
+    clipboard: Option<&Clipboard>,
     session: &Session<RemoteDesktop>,
-) -> Result<Opened, CaptureError> {
+) -> Result<(Opened, Option<ClipReady>), CaptureError> {
     // Persistence belongs on SelectDevices (RemoteDesktop v2), never on
     // SelectSources for a remote-desktop session (ScreenCast.xml 125–140).
     let token_file = setup
@@ -644,6 +817,10 @@ async fn negotiate(
                 "the screen-sharing portal refused SelectSources: {e}"
             ))
         })?;
+    let clip_requested = match clipboard {
+        Some(clipboard) => request_clipboard(clipboard, session).await,
+        None => None,
+    };
     tracing::info!(
         restore = token.is_some(),
         "asking the desktop to share the screen and take input (a dialog unless it was allowed before)"
@@ -654,6 +831,7 @@ async fn negotiate(
         setup.cancel.as_ref(),
     )
     .await;
+    let start_returned = tokio::time::Instant::now();
     let started = match answer {
         Dialog::Answered(Ok(answer)) => answer.response(),
         Dialog::Answered(Err(e)) => Err(e),
@@ -702,6 +880,19 @@ async fn negotiate(
     let input = started
         .devices()
         .contains(DeviceType::Keyboard | DeviceType::Pointer);
+    let clip = clip_requested
+        .filter(|_| started.is_clipboard_enabled())
+        .map(|(signals, path)| ClipReady {
+            signals,
+            path,
+            started: start_returned,
+        });
+    if setup.clipboard {
+        tracing::info!(
+            shared = clip.is_some(),
+            "asked the desktop to share its clipboard with the session"
+        );
+    }
     let fd = step(
         "OpenPipeWireRemote",
         screencast.open_pipe_wire_remote(session, OpenPipeWireRemoteOptions::default()),
@@ -727,13 +918,55 @@ async fn negotiate(
         remembered = started.restore_token().is_some(),
         "the desktop is shared"
     );
-    Ok(Opened {
-        node_id: stream.node_id,
-        logical: stream.logical,
-        input,
-        fd,
-        spare,
-    })
+    Ok((
+        Opened {
+            node_id: stream.node_id,
+            logical: stream.logical,
+            input,
+            fd,
+            spare,
+            clipboard: clip.is_some(),
+        },
+        clip,
+    ))
+}
+
+/// Subscribe to the clipboard's signals, then ask for the clipboard
+/// (`RequestClipboard`, which the portal takes only between `CreateSession`
+/// and `Start`). Subscribed first, so the owner the desktop announces when it
+/// enables the clipboard is seen (R1.2) and taken as the baseline. Anything
+/// failing leaves the session without a clipboard; it goes on.
+async fn request_clipboard(
+    clipboard: &Clipboard,
+    session: &Session<RemoteDesktop>,
+) -> Option<(Signals, String)> {
+    let Some(path) = clip::session_path(session) else {
+        tracing::debug!("the portal session has no path; no clipboard asked for");
+        return None;
+    };
+    let signals = match tokio::time::timeout(STEP_WAIT, clip::subscribe(clipboard)).await {
+        Ok(Ok(signals)) => signals,
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "cannot watch the clipboard; no clipboard asked for");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!("watching the clipboard timed out; no clipboard asked for");
+            return None;
+        }
+    };
+    match step(
+        "RequestClipboard",
+        clipboard.request(session, RequestClipboardOptions::default()),
+    )
+    .await
+    {
+        Ok(()) => Some((signals, path)),
+        Err(e) => {
+            tracing::debug!(error = %e, "the desktop did not take the clipboard request");
+            None
+        }
+    }
 }
 
 /// How the wait for the desktop's dialog ended.
@@ -879,6 +1112,7 @@ pub(crate) fn forget_token(file: &Path) {
 mod tests {
     use std::time::Instant;
 
+    use super::super::fake_bus::{FRESH_TOKEN, FakeBus, Script};
     use super::*;
 
     #[test]
@@ -925,6 +1159,7 @@ mod tests {
             dialog_wait: Duration::from_secs(1),
             cancel: None,
             spare_remote: true,
+            clipboard: true,
         };
         match Portal::open(setup) {
             Err(CaptureError::Unavailable(why)) => assert!(why.contains("D-Bus"), "{why}"),
@@ -1076,6 +1311,125 @@ mod tests {
         let root = dir.path().display().to_string();
         for line in lines.iter() {
             assert!(!line.contains(&root), "{line}");
+        }
+    }
+
+    fn bus_setup(bus: &FakeBus, token: Option<&Path>, clipboard: bool) -> Setup {
+        Setup {
+            bus: Bus::Address(bus.address.clone()),
+            token_file: token.map(Path::to_owned),
+            dialog_wait: Duration::from_secs(5),
+            cancel: None,
+            spare_remote: false,
+            clipboard,
+        }
+    }
+
+    /// With the switch off (`[services] wayland_clipboard`, the default) a
+    /// session makes the calls it made before the clipboard existed, one for
+    /// one, with the same token file: no `Clipboard` proxy, no
+    /// `RequestClipboard`, no link.
+    #[test]
+    #[ignore = "starts a dbus-daemon: cargo test -p tornect-capture -- --ignored fake_bus"]
+    fn fake_bus_without_the_switch_no_clipboard_call_is_made() {
+        let bus = FakeBus::start(Script::default());
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("portal-restore-token");
+        remember_token(&token, Some("old-token"));
+        let (portal, opened) = Portal::open(bus_setup(&bus, Some(&token), false)).unwrap();
+        assert!(!opened.clipboard);
+        assert!(portal.take_clip_link().is_none());
+        drop(opened);
+        drop(portal);
+        assert_eq!(
+            bus.calls(),
+            [
+                "RemoteDesktop.CreateSession",
+                "RemoteDesktop.SelectDevices restore=Some(\"old-token\")",
+                "ScreenCast.SelectSources",
+                "RemoteDesktop.Start",
+                "ScreenCast.OpenPipeWireRemote",
+                "Session.Close",
+            ]
+        );
+        assert!(!bus.clipboard_proxy(), "a Clipboard proxy was made");
+        assert_eq!(read_token(&token).as_deref(), Some(FRESH_TOKEN));
+    }
+
+    /// With the switch on, `RequestClipboard` comes after `SelectSources` and
+    /// before `Start`, the only moment the portal takes it, and the link is
+    /// handed out once.
+    #[test]
+    #[ignore = "starts a dbus-daemon: cargo test -p tornect-capture -- --ignored fake_bus"]
+    fn fake_bus_the_clipboard_is_asked_for_between_select_sources_and_start() {
+        let bus = FakeBus::start(Script::default());
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("portal-restore-token-2");
+        let (portal, opened) = Portal::open(bus_setup(&bus, Some(&token), true)).unwrap();
+        assert!(opened.clipboard);
+        assert!(bus.clipboard_proxy());
+        let link = portal.take_clip_link();
+        assert!(link.is_some());
+        assert!(
+            portal.take_clip_link().is_none(),
+            "the link is handed out once"
+        );
+        drop(opened);
+        drop(portal);
+        drop(link);
+        assert_eq!(
+            bus.calls(),
+            [
+                "RemoteDesktop.CreateSession",
+                "RemoteDesktop.SelectDevices restore=None",
+                "ScreenCast.SelectSources",
+                "Clipboard.RequestClipboard",
+                "RemoteDesktop.Start",
+                "ScreenCast.OpenPipeWireRemote",
+                // Nothing was set: nothing is cleared.
+                "Session.Close",
+            ]
+        );
+        assert_eq!(read_token(&token).as_deref(), Some(FRESH_TOKEN));
+    }
+
+    /// A desktop that answers `Start` without `clipboard_enabled` (its
+    /// dialog's clipboard choice off, or a token made without the clipboard)
+    /// shares none, and one without the clipboard's portal is not asked; the
+    /// screen is shared either way.
+    #[test]
+    #[ignore = "starts a dbus-daemon: cargo test -p tornect-capture -- --ignored fake_bus"]
+    fn fake_bus_a_desktop_that_shares_no_clipboard_still_shares_the_screen() {
+        for (script, asked) in [
+            (
+                Script {
+                    has_clipboard: true,
+                    clipboard_enabled: false,
+                },
+                true,
+            ),
+            (
+                Script {
+                    has_clipboard: false,
+                    clipboard_enabled: true,
+                },
+                false,
+            ),
+        ] {
+            let bus = FakeBus::start(script.clone());
+            let (portal, opened) = Portal::open(bus_setup(&bus, None, true)).unwrap();
+            assert!(!opened.clipboard, "{script:?}");
+            assert!(portal.take_clip_link().is_none(), "{script:?}");
+            assert_eq!(opened.node_id, 42);
+            drop(opened);
+            drop(portal);
+            let calls = bus.calls();
+            assert_eq!(
+                calls.contains(&"Clipboard.RequestClipboard".to_owned()),
+                asked,
+                "{calls:?}"
+            );
+            assert_eq!(calls.last().map(String::as_str), Some("Session.Close"));
         }
     }
 

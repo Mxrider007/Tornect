@@ -169,7 +169,7 @@ png = "=0.18.1"
 openh264 = { version = "=0.9.8", default-features = false, features = ["source"] }
 # Linux host: RemoteDesktop/ScreenCast portals (pure Rust over zbus/tokio),
 # PipeWire through dlopen (no headers on the dev VM), X11 fallback.
-ashpd = { version = "=0.13.13", default-features = false, features = ["tokio", "screencast", "remote_desktop", "global_shortcuts"] }
+ashpd = { version = "=0.13.13", default-features = false, features = ["tokio", "screencast", "remote_desktop", "global_shortcuts", "clipboard"] }
 libloading = "=0.8.9"
 # `randr` (pulls in `render`): the X11 capture lists the root's monitors with
 # RandR 1.5 `GetMonitors` and grabs the one shown (decision M1-75); the app's

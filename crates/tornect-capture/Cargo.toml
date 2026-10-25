@@ -27,6 +27,9 @@ ashpd.workspace = true
 libloading.workspace = true
 tokio.workspace = true
 futures.workspace = true
+# The portal clipboard's reads (wayland/clip.rs): the buffer a selection is
+# read into is wiped, as `tornect_input::clipboard::ClipText` is.
+zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
