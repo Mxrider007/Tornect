@@ -5343,6 +5343,7 @@ version = "0.1.0"
 dependencies = [
  "hkdf 0.13.0",
  "hmac 0.13.0",
+ "minicbor",
  "sha2 0.11.0",
  "subtle",
  "thiserror 2.0.20",

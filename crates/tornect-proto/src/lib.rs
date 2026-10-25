@@ -977,29 +977,43 @@ pub async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &Msg) -> Result<()
 /// HKDF-SHA256 `info` that derives the bind key from the session token.
 pub const BIND_KEY_INFO: &[u8] = b"tornect/v1/tor-media-bind-key";
 
-/// The key the bind MAC is computed under: `HKDF-SHA256(ikm = session_token,
-/// info = BIND_KEY_INFO)`, never the token itself. The token is also the QUIC
+/// The key a stream's bind MAC is computed under: `HKDF-SHA256(ikm =
+/// session_token, info)`, never the token itself. The token is also the QUIC
 /// `BIND` exporter context (§B.6) and the seed of the session id, and
 /// `tornect-signal`'s key schedule keeps it out of every HMAC key for exactly
 /// that reason (decision M1-39, amended after SLICE-A2 A2-2).
-fn bind_key(session_token: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+fn derived_key(session_token: &[u8; 32], info: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut key = Zeroizing::new([0u8; 32]);
     hkdf::Hkdf::<Sha256>::new(None, session_token)
-        .expand(BIND_KEY_INFO, key.as_mut_slice())
+        .expand(info, key.as_mut_slice())
         .unwrap_or_else(|_| unreachable!("32 bytes is a valid HKDF-SHA256 output length"));
     key
 }
 
-/// `HMAC-SHA256(bind_key(session_token), BIND_LABEL ‖ th_final)` — proves the
-/// media stream belongs to the handshake that produced `th_final`.
-#[must_use]
-pub fn bind_mac(session_token: &[u8; 32], th_final: &[u8; 32]) -> [u8; 32] {
-    let key = bind_key(session_token);
+/// `HMAC-SHA256(derived_key(session_token, info), label ‖ th_final)`: the
+/// bind MAC of one kind of stream. Each kind has its own `info` and `label`
+/// (the media stream's [`BIND_KEY_INFO`] and [`BIND_LABEL`], the services
+/// stream's in [`services`]), so a MAC made for one is refused by the other.
+fn derived_mac(
+    info: &[u8],
+    label: &[u8],
+    session_token: &[u8; 32],
+    th_final: &[u8; 32],
+) -> [u8; 32] {
+    let key = derived_key(session_token, info);
     let mut mac = Hmac::<Sha256>::new_from_slice(key.as_slice())
         .unwrap_or_else(|_| unreachable!("HMAC-SHA256 takes a key of any length"));
-    mac.update(BIND_LABEL);
+    mac.update(label);
     mac.update(th_final);
     mac.finalize().into_bytes().into()
+}
+
+/// `HMAC-SHA256(HKDF-SHA256(session_token, BIND_KEY_INFO), BIND_LABEL ‖
+/// th_final)` — proves the media stream belongs to the handshake that
+/// produced `th_final`.
+#[must_use]
+pub fn bind_mac(session_token: &[u8; 32], th_final: &[u8; 32]) -> [u8; 32] {
+    derived_mac(BIND_KEY_INFO, BIND_LABEL, session_token, th_final)
 }
 
 /// Constant-time check of a received bind MAC.

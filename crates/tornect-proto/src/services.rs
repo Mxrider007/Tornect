@@ -48,6 +48,7 @@
 use std::fmt;
 
 use minicbor::{CborLen, Decode, Encode};
+use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use zeroize::{Zeroize as _, Zeroizing};
 
@@ -67,6 +68,38 @@ pub const MAX_CLIP: u32 = 262_144;
 /// The `Bind` frame's length prefix: the type byte, the session id and the
 /// MAC. The host reads exactly this much from an unbound stream.
 pub const BIND_LEN: usize = 1 + SESSION_ID_LEN + 32;
+
+/// HKDF-SHA256 `info` that derives the services bind key from the session
+/// token (beside the media stream's `BIND_KEY_INFO`).
+pub const SERVICES_BIND_KEY_INFO: &[u8] = b"tornect/v1/tor-services-bind-key";
+
+/// Domain separator of the services bind MAC (beside the media stream's
+/// `BIND_LABEL`).
+pub const SERVICES_BIND_LABEL: &[u8] = b"tornect/v1/tor-services-bind\0";
+
+/// `HMAC-SHA256(HKDF-SHA256(session_token, SERVICES_BIND_KEY_INFO),
+/// SERVICES_BIND_LABEL ‖ th_final)` (design §3.3): proves the services stream
+/// belongs to the handshake that produced `th_final`. Its own key and label,
+/// so the media stream's MAC never binds this stream, nor this MAC that one.
+#[must_use]
+pub fn services_bind_mac(session_token: &[u8; 32], th_final: &[u8; 32]) -> [u8; 32] {
+    crate::derived_mac(
+        SERVICES_BIND_KEY_INFO,
+        SERVICES_BIND_LABEL,
+        session_token,
+        th_final,
+    )
+}
+
+/// Constant-time check of a received services bind MAC.
+#[must_use]
+pub fn services_bind_mac_ok(
+    session_token: &[u8; 32],
+    th_final: &[u8; 32],
+    received: &[u8; 32],
+) -> bool {
+    bool::from(services_bind_mac(session_token, th_final).ct_eq(received))
+}
 
 /// Longest chat message, in characters.
 pub const MAX_CHAT_CHARS: usize = 2000;
@@ -2744,6 +2777,124 @@ mod tests {
                 printed.contains("bytes>") || printed.contains("<redacted>"),
                 "{printed}"
             );
+        }
+    }
+
+    /// The services bind MAC is keyed by its own HKDF subkey of the token
+    /// (design §3.3). The expected value was computed independently (Python
+    /// `hmac`/`hashlib`: RFC 5869 HKDF with an empty salt, then HMAC-SHA256),
+    /// with the same script that reproduces the media MAC's vector.
+    #[test]
+    fn the_services_bind_mac_matches_its_golden_vector() {
+        let (token, th) = ([0x11; 32], [0x22; 32]);
+        let mac = services_bind_mac(&token, &th);
+        let expected: [u8; 32] = [
+            0x0d, 0x5e, 0x8d, 0x78, 0x13, 0xc8, 0x99, 0x9e, 0x1a, 0x5f, 0x89, 0xff, 0x4e, 0x70,
+            0xc1, 0xb8, 0xc0, 0x4b, 0x48, 0x0d, 0x5a, 0x9b, 0x5e, 0x09, 0xbc, 0x6c, 0x0f, 0x78,
+            0x81, 0x27, 0x3c, 0xba,
+        ];
+        assert_eq!(mac, expected);
+        assert!(services_bind_mac_ok(&token, &th, &mac));
+        assert_eq!(SERVICES_BIND_KEY_INFO, b"tornect/v1/tor-services-bind-key");
+        assert_eq!(SERVICES_BIND_LABEL, b"tornect/v1/tor-services-bind\0");
+    }
+
+    /// A media MAC never binds a services stream and a services MAC never
+    /// binds a media stream; the key's `info` and the label each separate
+    /// them on their own.
+    #[test]
+    fn the_bind_macs_are_domain_separated_both_ways() {
+        for (token, th) in [
+            ([0x11; 32], [0x22; 32]),
+            ([0; 32], [0; 32]),
+            ([0xff; 32], [7; 32]),
+        ] {
+            let media = crate::bind_mac(&token, &th);
+            let services = services_bind_mac(&token, &th);
+            assert_ne!(media, services);
+            assert!(!services_bind_mac_ok(&token, &th, &media));
+            assert!(!crate::bind_mac_ok(&token, &th, &services));
+            assert!(crate::bind_mac_ok(&token, &th, &media));
+            assert!(services_bind_mac_ok(&token, &th, &services));
+            let mixed = [
+                crate::derived_mac(SERVICES_BIND_KEY_INFO, crate::BIND_LABEL, &token, &th),
+                crate::derived_mac(crate::BIND_KEY_INFO, SERVICES_BIND_LABEL, &token, &th),
+            ];
+            for other in mixed {
+                assert_ne!(other, media);
+                assert_ne!(other, services);
+            }
+        }
+    }
+
+    #[test]
+    fn the_services_bind_mac_binds_token_and_transcript() {
+        let (token, th) = ([1; 32], [2; 32]);
+        let mac = services_bind_mac(&token, &th);
+        assert!(services_bind_mac_ok(&token, &th, &mac));
+        assert!(!services_bind_mac_ok(&[9; 32], &th, &mac));
+        assert!(!services_bind_mac_ok(&token, &[9; 32], &mac));
+        for bit in [0, 7, 255] {
+            let mut flipped = mac;
+            flipped[bit / 8] ^= 1 << (bit % 8);
+            assert!(!services_bind_mac_ok(&token, &th, &flipped));
+        }
+        // A `Bind` frame carries it as written.
+        let bind = SvcMsg::Bind(Bind {
+            session_id: "00ff00ff00ff00ff".into(),
+            mac,
+        });
+        let SvcMsg::Bind(read) = SvcMsg::decode(ty::BIND, &bind.encode()[5..]).unwrap() else {
+            unreachable!()
+        };
+        assert!(services_bind_mac_ok(&token, &th, &read.mac));
+    }
+
+    /// The committed seeds of the `services` fuzz target
+    /// (`fuzz/seeds/services/`): one whole frame of each of the 21 types,
+    /// length prefix included, each the encoding of the message its name
+    /// says.
+    #[test]
+    fn the_fuzz_seeds_are_one_frame_of_each_message() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fuzz/seeds/services");
+        let samples = samples();
+        let expected: [(&str, &SvcMsg); 21] = [
+            ("bind.bin", &samples[0]),
+            ("refused.bin", &samples[1]),
+            ("clip-chunk.bin", &samples[2]),
+            ("data.bin", &samples[4]),
+            ("credit.bin", &samples[7]),
+            ("close.bin", &samples[8]),
+            ("welcome.bin", &samples[9]),
+            ("caps.bin", &samples[10]),
+            ("clip-switch.bin", &samples[11]),
+            ("chat.bin", &samples[12]),
+            ("clip-start.bin", &samples[13]),
+            ("offer.bin", &samples[14]),
+            ("accepted.bin", &samples[15]),
+            ("get.bin", &samples[16]),
+            ("sending.bin", &samples[17]),
+            ("done.bin", &samples[18]),
+            ("complete.bin", &samples[19]),
+            ("cancel.bin", &samples[20]),
+            ("list.bin", &samples[21]),
+            ("listing.bin", &samples[22]),
+            ("list-failed.bin", &samples[23]),
+        ];
+        let mut types: Vec<u8> = expected.iter().map(|(_, m)| m.ty()).collect();
+        types.sort_unstable();
+        assert_eq!(types, ty::ALL, "one seed per frame type");
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort_unstable();
+        let mut want: Vec<&str> = expected.iter().map(|(n, _)| *n).collect();
+        want.sort_unstable();
+        assert_eq!(names, want);
+        for (name, msg) in expected {
+            let seed = std::fs::read(format!("{dir}/{name}")).unwrap();
+            assert_eq!(seed, msg.encode(), "{name}");
         }
     }
 

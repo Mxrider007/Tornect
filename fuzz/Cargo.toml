@@ -76,5 +76,15 @@ test = false
 doc = false
 bench = false
 
+# The session services stream (decision M1-76, the services design §3):
+# `tornect_proto::services` decode, the gated reader of both sides and the
+# fixed-size bind read; seeds in `seeds/services/`.
+[[bin]]
+name = "services"
+path = "fuzz_targets/services.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
