@@ -2,8 +2,8 @@
 
 The design's research items before its steps: **R1 (GNOME clipboard portal, before step 8)**, **R2 (Windows
 APIs, before step 7)**, R3 (logind `LockedHint`, before step 10) and R4 (Arti flow control on onion-service
-circuits, before step 29). R3 and R4 are not here yet; each lands with its step. Decision: M1-76 (the design
-calls it M1-73; that number and the two after it were taken by earlier features).
+circuits, before step 29). R4 is not here yet; it lands with its step. Decision: M1-76 (the design calls it
+M1-73; that number and the two after it were taken by earlier features).
 
 ## R1. The GNOME clipboard portal (for design steps 8 and 9)
 
@@ -327,3 +327,81 @@ Bitwarden desktop) on the host and by a viewer; `exclude_from_history` (Win+V do
 the end-of-session clear; `GetDiskFreeSpaceExW`, `GetDriveTypeW` on a USB disk; the `canonicalize` forms of a VSS
 snapshot, a share, a mapped drive, a volume mount point and a junction; the Mark-of-the-Web across the rename
 and on FAT/exFAT. Wine runs the clipboard code but is not Windows' clipboard; its runs are smoke tests.
+
+## R3. logind's `LockedHint` (for design step 10)
+
+**Status:** verified 2026-10-25 in the build container (not the dev VM) against source fetched the same day:
+systemd `main` (`man/org.freedesktop.login1.xml`, `src/login/logind-session-dbus.c`, `logind-session.c`,
+`logind-dbus.c`), gnome-shell `gnome-50` and `gnome-46` (`js/ui/screenShield.js`, `js/misc/loginManager.js`),
+kscreenlocker `master` (`ksldapp.cpp`, `logind.cpp`), xscreensaver 6.17 (`driver/xscreensaver-systemd.c`,
+`xscreensaver.c`, `windows.c`, `xscreensaver-gfx.c` from the GitHub mirror `Zygo/xscreensaver`), swaylock
+`master` (`main.c`) and xss-lock (`xdbob/xss-lock` `src/xss-lock.c`). Nothing was run against a desktop here: the
+readings on a locked desktop are NEEDS-DEVICE rows of `docs/VERIFICATION.md`.
+
+### R3.1 What the property is
+
+- `org.freedesktop.login1.Session.LockedHint` (`b`): "shows the locked hint state of this session, as set by the
+  `SetLockedHint()` method"; `SetLockedHint(b)` "is intended to be used by the desktop environment to tell
+  systemd-logind when the session is locked and unlocked" (`org.freedesktop.login1.xml`). It is a hint the
+  session's screen locker sets; logind does not watch the screen.
+- **Who may set it.** `method_set_locked_hint` lets root or the session's owner set it ("Only owner of session
+  may set locked hint", `logind-session-dbus.c` 304–330), and only for a session class that can lock
+  (`SESSION_CLASS_CAN_LOCK`, else `NotSupported`, `logind-session.c` 1254–1268). So any process of the user can
+  set it either way: a remote controller with a terminal it started before the lock could clear it. It is not
+  enforcement; what it guards is the services' extra reach while the desktop is locked, which such a process has
+  anyway.
+- **Change signals.** The property is `SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE` (`logind-session-dbus.c` 1003) and a
+  change is sent only when the value changes (`session_set_locked_hint`), but only on the session's own object:
+  signals are "not [emitted] on the `/org/freedesktop/login1/session/self` or `…/session/auto` convenience
+  objects". The design polls once a second, which needs no subscription.
+- **Which session.** logind's `session/auto` is "the caller's own session if they have one, otherwise their
+  user's display session" (`manager_get_session_from_creds`, `logind-dbus.c` 140–163), the lookup polkit's
+  revocation already makes (`GetSessionByPID`, then `User.Display`). For the lock that is wrong in one case: a
+  host started inside a session that is not graphical (an SSH login: `Type` `tty`) would read that session's
+  hint, which no locker ever sets. The lock probe therefore takes the process's own session only when its `Type`
+  is `x11`, `wayland` or `mir`, and the user's display session otherwise (a host started by the systemd user unit
+  belongs to no session and gets the display session, as with `auto`). gnome-shell sets the hint on the session
+  `XDG_SESSION_ID` names, or on the user's display session when that is unset (`loginManager.js`
+  `getCurrentSessionProxy`), which is the same session.
+
+### R3.2 Which lockers set it
+
+| Desktop | Sets `LockedHint` | Source |
+|---|---|---|
+| GNOME (Wayland; X11 up to GNOME 49, mutter 50 dropped the X11 backend) | yes: `true` in `lock()`, `false` in `deactivate()` | `screenShield.js` `_setLocked` → `SetLockedHintAsync(locked)` (`gnome-50` 166–175, 577–590, 643–666; the same in `gnome-46`) |
+| KDE Plasma (kscreenlocker, X11 and Wayland) | yes: `true` in `lock()`, `false` in `doUnlock()` | `ksldapp.cpp` (`m_logind->setLocked(true/false)`), `logind.cpp` `setLocked` → `SetLockedHint` |
+| xscreensaver 6.17 (X11) | **no** | `xscreensaver-systemd.c` only listens to `PrepareForSleep`, `Lock` and `Unlock` and runs `xscreensaver-command`; no `login1` call in the daemon. A distribution patch sets `IdleHint` only (Gentoo `xscreensaver-6.15-logind-idle-hint.patch`) |
+| xss-lock (X11, runs any locker) | **no** | `src/xss-lock.c` (a branch that would set it was proposed and is not in mainline) |
+| swaylock (wlroots) | **no** | `main.c` has no `login1` call |
+
+Details that matter:
+- **GNOME without a password.** `lock()` sets `true` only when the user has a password
+  (`user.password_mode !== NONE`, or in the greeter): a password-less user's lock screen is not a lock and the
+  hint stays `false`. Services then go on, as the desktop would let anyone in at the keyboard.
+- **GNOME clears the clipboard at lock.** `lock()` sets the clipboard and the primary selection to `""` before
+  the shield shows ("otherwise, its contents may be leaked … by pasting into the unlock dialog's password entry"):
+  a host clipboard backend sees a change to empty text, which `ClipText` refuses (empty), and nothing crosses.
+- **KDE's grace time.** kscreenlocker sets `true` at `lock()`, including during its grace period, in which the
+  lock lifts without a password: services pause during it (the safe direction).
+- **GNOME Wayland is covered structurally anyway**: mutter closes remote-desktop sessions on lock (PLAN §B.8.8,
+  `wayland.md` §7), so capture stops and the services close (design §2.2) whatever the hint says.
+- **Unset ⇒ never paused.** Under xscreensaver, xss-lock with any locker, swaylock and other lockers that do not
+  set it, the hint stays `false` and services run on while locked. Their reach then matches what the viewer's
+  XTEST input could do before the lock (design §12); stated as a residual.
+
+### R3.3 Consequences for `tornect_platform::lock`
+
+- `LockedHint::connect()` finds the session once (R3.1) and keeps its object path; `read()` is one
+  `Properties.Get(Session, LockedHint)`: `Some(bool)`, or `None` when the bus, logind or the session answers
+  nothing or not a boolean.
+- An unreadable reading keeps the last state (design §2.3); the host starts unlocked.
+- Windows: `locked_now()` is `secure_desktop_shown()` (`OpenInputDesktop`), which also reports UAC prompts and
+  Ctrl+Alt+Del as locked (design §14: transfers stall rather than fail for that reason).
+
+### R3.4 Needs a desktop
+
+- GNOME Wayland (the dev VM): `LockedHint` true while locked (Super+L) and false after unlocking, read by the
+  `#[ignore]` live test; the process's session versus the display session for a host started from a terminal of
+  the desktop and from the systemd user unit.
+- GNOME on Xorg (GNOME ≤ 49) and KDE Plasma (X11 and Wayland): the same readings.
+- xscreensaver on X11: the hint stays false while locked (the residual).
