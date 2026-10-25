@@ -4812,6 +4812,12 @@ impl DeskControl {
         *self.pictures.lock().unwrap() = Some(0);
     }
 
+    /// `n` more pictures of a damage-driven desk.
+    fn damage(&self, n: usize) {
+        let mut pictures = self.pictures.lock().unwrap();
+        *pictures = Some(pictures.unwrap_or(0) + n);
+    }
+
     /// Waits until the desk is inside a held `select`.
     async fn until_selecting(&self) {
         let since = tokio::time::Instant::now();
@@ -5723,6 +5729,421 @@ async fn a_monitor_unplugged_falls_back_and_holds_back_input_in_flight() {
     assert_eq!(desk.asked(), [Selection::Monitor(2)]);
     let report = close_and_report(&mut client, served).await;
     assert_eq!((report.monitor_requests, report.monitor_switches), (1, 0));
+}
+
+/// Session test 9: a kill while the source is inside a blocking switch (a
+/// Wayland switch may block for up to 10 s) stops capture well within the
+/// host's stop wait (`STOP_WAIT`, 5 s): the source checks the stop flag, the
+/// stream ends with `Close{ENDED_BY_HOST}`, and the source is closed by the
+/// time the stream is over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_while_the_source_switches_stops_capture_in_time() {
+    let (rig, desk) = desk_rig(&[(320, 192), (256, 128)], MediaLimits::default());
+    let kill = tornect_signal::fsm::host::KillSwitch::new();
+    let watcher = rig.host.watch_kill(kill.clone());
+    let (_, binding) = start(&rig.host, 80, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    next_monitors(&mut client).await;
+    desk.on_select(OnSelect::Hold);
+    ask(&mut client, 1, 0, 2).await;
+    desk.until_selecting().await;
+
+    let killed = tokio::time::Instant::now();
+    kill.kill(bye::PANIC);
+    assert_eq!(until_close(&mut client).await, Some(reason::ENDED_BY_HOST));
+    let outcome = tokio::time::timeout(WAIT, served).await.unwrap().unwrap();
+    assert!(
+        killed.elapsed() < Duration::from_secs(2),
+        "capture stopped {:?} after the kill",
+        killed.elapsed()
+    );
+    assert!(
+        matches!(
+            outcome,
+            MediaOutcome::Served {
+                end: MediaEnd::SessionOver(r),
+                ..
+            } if r == reason::ENDED_BY_HOST
+        ),
+        "{outcome:?}"
+    );
+    assert!(desk.closed.load(Ordering::SeqCst), "the source is closed");
+    assert!(!desk.selecting.load(Ordering::SeqCst), "the switch gave up");
+    assert_eq!(desk.asked(), [Selection::Monitor(2)]);
+    watcher.abort();
+}
+
+/// Session test 10, through a switch the viewer asked for: an injector that
+/// refuses the new screen's view ends the session's input rather than map a
+/// click elsewhere (the design's §4). The switch is still answered `OK` (the
+/// picture shows that screen); the key held is let go of, the notice gains
+/// `INPUT_LOST`, the indicator hears `input: false`, and nothing is
+/// injected after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_switch_the_injector_cannot_follow_ends_the_sessions_input() {
+    use tornect_signal::messages::notice;
+    let rig = screens_rig(&TEST_SCREENS, 30, MediaLimits::default());
+    let (id, binding) = start(&rig.host, 81, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    next_monitors(&mut client).await;
+    send_input(&mut client, &[A_DOWN]).await;
+    sync(&mut client, 1).await;
+    rig.backend.recorder.refuses.store(true, Ordering::SeqCst);
+
+    ask(&mut client, 1, 0, 2).await;
+    let (answer, _) = said(&answer_to(&mut client, 1).await);
+    assert_eq!(
+        (answer.status, answer.shown, answer.remapped),
+        (OK, 2, true)
+    );
+    assert_eq!(rig.backend.recorder.events(), [A_DOWN, A_UP]);
+    assert_eq!(
+        rig.host.viewer_notice(&id, Some(0)),
+        Some(notice::INPUT_LOST)
+    );
+    send_input(
+        &mut client,
+        &[A_DOWN, InputEvent::PointerMove { x: 9, y: 9 }],
+    )
+    .await;
+    sync(&mut client, 2).await;
+    assert_eq!(rig.backend.recorder.events().len(), 2, "nothing more");
+    let report = close_and_report(&mut client, served).await;
+    assert_eq!(report.monitor_switches, 1);
+    assert_eq!(
+        rig.seen.lines(),
+        [
+            "started synthetic screens 1280x720 Control input=true",
+            "changed screen=1 of=2 all=false shown=1280x720+0+0 input=true",
+            "changed screen=2 of=2 all=false shown=1024x768+1280+0 input=false",
+            "stopped ViewerLeft",
+        ]
+    );
+}
+
+/// The views of a [`Desk`] of 320×192 and 256×128 side by side.
+fn desk_view(monitor: u8) -> View {
+    let space = Rect::new(0, 0, 576, 192);
+    let shown = match monitor {
+        1 => Rect::new(0, 0, 320, 192),
+        2 => Rect::new(320, 0, 256, 128),
+        _ => space,
+    };
+    View::Rect { shown, space }
+}
+
+/// Session test 11, a damage-driven desk (pictures only on change, as a
+/// PipeWire stream): a switch completes on a still screen, its answer riding
+/// the new screen's first picture, and nothing more comes; a no-op is
+/// answered at once with no picture, from the next seq on; pointer input made
+/// while a switch is under way keeps landing with the view of the picture the
+/// viewer sees, until the new screen's picture says otherwise. The design
+/// runs it on paused time; here it runs on the real clock with short limits,
+/// as the capture thread is a blocking thread tokio's paused clock does not
+/// see.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_damage_driven_desk_switches_on_a_still_screen() {
+    let limits = MediaLimits {
+        switch_interval: Duration::from_millis(300),
+        switch_answer: WAIT,
+        ..MediaLimits::default()
+    };
+    let (rig, desk) = desk_rig(&[(320, 192), (256, 128)], limits);
+    desk.first_after_switch.store(true, Ordering::SeqCst);
+    desk.still();
+    desk.damage(1);
+    let (_, binding) = start(&rig.host, 82, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    next_monitors(&mut client).await;
+    assert!(matches!(
+        next_acking(&mut client).await,
+        Msg::Video { seq: 0, .. }
+    ));
+
+    let asked = tokio::time::Instant::now();
+    ask(&mut client, 1, 0, 2).await;
+    let (switched, at) = said(&answer_to(&mut client, 1).await);
+    assert_eq!(
+        (switched.status, switched.shown, switched.remapped),
+        (OK, 2, true)
+    );
+    let data = the_picture_at(&mut client, at).await;
+    assert_eq!(Decoded::new().picture(&data).1, (256, 128));
+    write_msg(&mut client, &Msg::VideoAck { seq: at })
+        .await
+        .unwrap();
+    assert!(
+        !drain(&mut client, Duration::from_millis(300))
+            .await
+            .iter()
+            .any(|m| matches!(m, Msg::Video { .. })),
+        "nothing more on a still screen"
+    );
+
+    ask(&mut client, 2, 0, 2).await;
+    let msg = tokio::time::timeout(Duration::from_secs(2), read_msg(&mut client))
+        .await
+        .expect("answered at once, with no picture")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        said(&msg),
+        (
+            Said {
+                request: 2,
+                status: OK,
+                shown: 2,
+                all: true,
+                remapped: false,
+                list: 0,
+                n: 2
+            },
+            at.wrapping_add(1)
+        ),
+        "a no-op, from the next picture on"
+    );
+
+    desk.on_select(OnSelect::Hold);
+    tokio::time::sleep_until(asked + Duration::from_millis(400)).await;
+    ask(&mut client, 3, 0, 1).await;
+    desk.until_selecting().await;
+    let corner = InputEvent::PointerMove { x: 65535, y: 65535 };
+    send_input(&mut client, &[corner]).await;
+    sync(&mut client, 1).await;
+    assert_eq!(
+        rig.backend.recorder.events(),
+        [moved_over(65535, 65535, desk_view(2))],
+        "with the view of the picture the viewer sees: screen 2's corner"
+    );
+    desk.release.store(true, Ordering::SeqCst);
+    let (back, at) = said(&answer_to(&mut client, 3).await);
+    assert_eq!((back.status, back.shown, back.remapped), (OK, 1, true));
+    let data = the_picture_at(&mut client, at).await;
+    assert_eq!(Decoded::new().picture(&data).1, (320, 192));
+    let report = close_and_report(&mut client, served).await;
+    assert_eq!((report.monitor_requests, report.monitor_switches), (3, 2));
+}
+
+/// Session test 11, a source that switches and then gives no picture (a
+/// still Wayland screen whose first picture never comes, GDI while a secure
+/// screen shows): the host answers `FAILED` at `switch_answer`, saying the
+/// screen it still shows, and input keeps that screen's view. When the
+/// picture comes late it is the host's news (request 0, `REMAPPED`) right
+/// before it, and the barrier holds back what was made against the screen
+/// before until the viewer acknowledges it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_switch_with_no_picture_in_time_is_failed_and_its_late_picture_is_news() {
+    let within = Duration::from_millis(500);
+    let limits = MediaLimits {
+        switch_answer: within,
+        ..MediaLimits::default()
+    };
+    let (rig, desk) = desk_rig(&[(320, 192), (256, 128)], limits);
+    desk.still();
+    desk.damage(1);
+    let (_, binding) = start(&rig.host, 83, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    next_monitors(&mut client).await;
+    assert!(matches!(
+        next_acking(&mut client).await,
+        Msg::Video { seq: 0, .. }
+    ));
+
+    let asked = tokio::time::Instant::now();
+    ask(&mut client, 1, 0, 2).await;
+    let (failed, _) = said(&answer_to(&mut client, 1).await);
+    let took = asked.elapsed();
+    assert_eq!(
+        failed,
+        Said {
+            request: 1,
+            status: FAILED,
+            shown: 1,
+            all: true,
+            remapped: false,
+            list: 0,
+            n: 2
+        }
+    );
+    assert!(
+        took >= within && took < within + Duration::from_secs(2),
+        "answered after {took:?}"
+    );
+    assert_eq!(desk.asked(), [Selection::Monitor(2)], "the source took it");
+    let corner = InputEvent::PointerMove { x: 65535, y: 65535 };
+    send_input(&mut client, &[corner]).await;
+    sync(&mut client, 1).await;
+    let before = moved_over(65535, 65535, desk_view(1));
+    assert_eq!(rig.backend.recorder.events(), [before], "screen 1's view");
+
+    desk.damage(1);
+    let (news, at) = said(&next_monitors(&mut client).await);
+    assert_eq!(
+        news,
+        Said {
+            request: 0,
+            status: OK,
+            shown: 2,
+            all: true,
+            remapped: true,
+            list: 0,
+            n: 2
+        },
+        "the late picture is news"
+    );
+    let data = the_picture_at(&mut client, at).await;
+    assert_eq!(Decoded::new().picture(&data).1, (256, 128));
+    send_input(&mut client, &[corner, LEFT_DOWN]).await;
+    sync(&mut client, 2).await;
+    assert_eq!(rig.backend.recorder.events(), [before], "held back");
+    write_msg(&mut client, &Msg::VideoAck { seq: at })
+        .await
+        .unwrap();
+    send_input(&mut client, &[corner]).await;
+    sync(&mut client, 3).await;
+    assert_eq!(
+        rig.backend.recorder.events(),
+        [before, moved_over(65535, 65535, desk_view(2))]
+    );
+    let report = close_and_report(&mut client, served).await;
+    assert_eq!(
+        (
+            report.monitor_requests,
+            report.monitor_switches,
+            report.input_held_back
+        ),
+        (1, 0, 2)
+    );
+}
+
+/// Session test 12: a flood of 100 `SelectMonitor`s gets at most the
+/// budget's answers (burst 4, then 2 a second over the time the host took to
+/// read them): the first is accepted and answered with its picture, the
+/// next few `BUSY`, the rest ignored; pictures keep flowing all the while.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flood_of_select_monitor_gets_at_most_the_budgets_answers() {
+    let rig = screens_rig(&TEST_SCREENS, 30, MediaLimits::default());
+    let (_, binding) = start(&rig.host, 84, SessionMode::ViewOnly);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    next_monitors(&mut client).await;
+
+    let flooded = tokio::time::Instant::now();
+    for request in 1..=100 {
+        ask(&mut client, request, 0, 2).await;
+    }
+    // Its `Pong` comes once the host has handled all 100.
+    write_msg(&mut client, &Msg::Ping { nonce: 7 })
+        .await
+        .unwrap();
+    let until = flooded + Duration::from_millis(1500);
+    let mut answers = Vec::new();
+    let mut handled = None;
+    let mut pictures = 0;
+    loop {
+        let read = tokio::time::timeout_at(until, next_acking(&mut client)).await;
+        match read {
+            Ok(msg @ Msg::Monitors { .. }) if said(&msg).0.request != 0 => {
+                answers.push(said(&msg).0);
+            }
+            Ok(Msg::Video { .. }) => pictures += 1,
+            Ok(Msg::Pong { nonce: 7 }) => handled = Some(flooded.elapsed()),
+            Ok(_) => {}
+            Err(_) if handled.is_some() => break,
+            Err(_) => panic!("the host did not handle the flood in time"),
+        }
+    }
+    let handled = handled.unwrap();
+    let budget = 4 + (2.0 * handled.as_secs_f64()).ceil() as usize;
+    assert!(
+        !answers.is_empty() && answers.len() <= budget,
+        "{} answers for a budget of {budget} (read in {handled:?}): {answers:?}",
+        answers.len()
+    );
+    let mut requests: Vec<u16> = answers.iter().map(|a| a.request).collect();
+    requests.sort_unstable();
+    requests.dedup();
+    assert_eq!(requests.len(), answers.len(), "one answer per request");
+    for answer in &answers {
+        if answer.request == 1 {
+            assert_eq!(
+                (answer.status, answer.shown, answer.remapped),
+                (OK, 2, true)
+            );
+        } else {
+            // BUSY while the first is under way or within the interval; a
+            // request the budget let through after the first was answered
+            // asks for the screen shown, a no-op.
+            assert!(
+                !answer.remapped
+                    && (answer.status == BUSY || (answer.status == OK && answer.shown == 2)),
+                "{answer:?}"
+            );
+        }
+    }
+    assert!(answers.iter().any(|a| a.request == 1), "the first accepted");
+    assert!(pictures >= 8, "pictures kept flowing: {pictures}");
+    let report = close_and_report(&mut client, served).await;
+    assert_eq!((report.monitor_requests, report.monitor_switches), (100, 1));
+}
+
+/// Session test 13: the observer (the sharing indicator) hears where the
+/// pictures lie at the first picture (H1) and at each change of screen the
+/// viewer asks for, with the rectangle shown: screen 2, all screens (the
+/// whole desktop, screen 0), screen 1 again; a no-op says nothing. The
+/// injector follows each view in turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_indicator_hears_each_screen_shown() {
+    let limits = MediaLimits {
+        switch_interval: Duration::from_millis(200),
+        ..MediaLimits::default()
+    };
+    let rig = screens_rig(&TEST_SCREENS, 30, limits);
+    let (_, binding) = start(&rig.host, 85, SessionMode::Control);
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    next_monitors(&mut client).await;
+    for (request, monitor, remapped) in [
+        (1, 2, true),
+        (2, tornect_proto::ALL_MONITORS, true),
+        (3, 1, true),
+        (4, 1, false),
+    ] {
+        ask(&mut client, request, 0, monitor).await;
+        let (answer, _) = said(&answer_to(&mut client, request).await);
+        assert_eq!(
+            (answer.status, answer.shown, answer.remapped),
+            (OK, monitor, remapped)
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let report = close_and_report(&mut client, served).await;
+    assert_eq!((report.monitor_requests, report.monitor_switches), (4, 3));
+    let views: Vec<View> = rig.backend.recorder.views().iter().map(|v| v.1).collect();
+    assert_eq!(
+        views,
+        [
+            two_screens(Selection::Monitor(1)).view,
+            two_screens(Selection::Monitor(2)).view,
+            two_screens(Selection::All).view,
+            two_screens(Selection::Monitor(1)).view,
+        ]
+    );
+    assert_eq!(
+        rig.seen.lines(),
+        [
+            "started synthetic screens 1280x720 Control input=true",
+            "changed screen=1 of=2 all=false shown=1280x720+0+0 input=true",
+            "changed screen=2 of=2 all=false shown=1024x768+1280+0 input=true",
+            "changed screen=0 of=2 all=true shown=2304x768+0+0 input=true",
+            "changed screen=1 of=2 all=false shown=1280x720+0+0 input=true",
+            "stopped ViewerLeft",
+        ]
+    );
 }
 
 /// Capture that cannot start refuses the bind, says why, and starts nothing.
