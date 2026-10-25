@@ -55,7 +55,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tornect_core::Paths;
 use tornect_core::files::{PRIVATE_MARKER, is_part_name};
-use tornect_proto::services::{Entry, MAX_NAME_BYTES, MAX_TITLE_BYTES, kind, reason};
+use tornect_proto::services::{
+    Entry, Listing, MAX_ENTRIES, MAX_NAME_BYTES, MAX_TITLE_BYTES, encoded_entry_len, kind, reason,
+};
 
 use super::ServicesLimits;
 use super::transfer::Untrusted;
@@ -330,6 +332,27 @@ pub(crate) fn code_of(e: &io::Error) -> u16 {
         io::ErrorKind::PermissionDenied => reason::DENIED,
         _ => reason::IO,
     }
+}
+
+/// Open the file at `path` to send it (an upload, or a download the viewer
+/// asked for): it must pass `access`, and the canonical path that passed is
+/// the one opened, read-only; it must be a regular file, checked before the
+/// open (so that a pipe or a device never blocks it) and again on the open
+/// file. The file, its size and its canonical path, or a
+/// `tornect_proto::services::reason` code (`NOT_FOUND`, `DENIED`,
+/// `NOT_A_FILE`, `IO`). Blocking.
+pub(crate) fn open_file(access: &Access, path: &Path) -> Result<(fs::File, u64, PathBuf), u16> {
+    let code = |e: io::Error| code_of(&e);
+    let canonical = access.check(path)?;
+    if !fs::metadata(&canonical).map_err(code)?.is_file() {
+        return Err(reason::NOT_A_FILE);
+    }
+    let file = fs::File::open(&canonical).map_err(code)?;
+    let meta = file.metadata().map_err(code)?;
+    if !meta.is_file() {
+        return Err(reason::NOT_A_FILE);
+    }
+    Ok((file, meta.len(), canonical))
 }
 
 // --- Handles ----------------------------------------------------------------
@@ -694,6 +717,23 @@ pub struct ListingView {
     pub truncated: bool,
 }
 
+impl ListingView {
+    /// A page of the other computer's folder as its `Listing` says it, its
+    /// first entry the folder's `from`th; the names and the title made fit
+    /// to show.
+    pub(crate) fn remote(listing: &Listing, from: u32) -> Self {
+        Self {
+            folder: listing.folder,
+            title: Untrusted::shown(&listing.title, MAX_TITLE_BYTES),
+            parent: listing.parent,
+            from,
+            entries: listing.entries.iter().map(EntryView::of).collect(),
+            more: listing.next.is_some(),
+            truncated: listing.truncated,
+        }
+    }
+}
+
 /// The view of the whole of a local `folder`, its handles issued from
 /// `handles`.
 pub(crate) fn local_view(folder: &Folder, handle: u32, handles: &mut Handles) -> ListingView {
@@ -726,6 +766,40 @@ pub(crate) fn local_view(folder: &Folder, handle: u32, handles: &mut Handles) ->
         more: false,
         truncated: folder.truncated,
     }
+}
+
+/// One page of `folder` from its entry `from`: as many entries as fit
+/// `budget` bytes ([`tornect_proto::services::encoded_entry_len`], each
+/// counted with the longest handle) and [`MAX_ENTRIES`], at least one when
+/// any is left, each with a handle from `handles`; and the index of the next
+/// page's first entry, when there is one.
+pub(crate) fn page(
+    folder: &Folder,
+    from: usize,
+    budget: usize,
+    handles: &mut Handles,
+) -> (Vec<Entry>, Option<u32>) {
+    let mut entries = Vec::new();
+    let mut used = 0usize;
+    for (at, found) in folder.entries.iter().enumerate().skip(from) {
+        let (name, lossy) = found.shown_name();
+        let mut entry = Entry {
+            name,
+            handle: u32::MAX,
+            kind: found.kind,
+            size: found.size,
+            mtime: found.mtime,
+            lossy,
+        };
+        let len = encoded_entry_len(&entry);
+        if entries.len() == MAX_ENTRIES || (!entries.is_empty() && used + len > budget) {
+            return (entries, u32::try_from(at).ok());
+        }
+        used += len;
+        entry.handle = handles.issue(&found.path(folder.path.as_deref()));
+        entries.push(entry);
+    }
+    (entries, None)
 }
 
 // --- The viewer's own files -------------------------------------------------
@@ -1216,6 +1290,73 @@ mod tests {
         let (name, lossy) = long.shown_name();
         assert!(lossy);
         assert_eq!(name.len(), 254, "cut on a character boundary");
+    }
+
+    /// Pages hold what fits the budget, at most 1024 entries, at least one;
+    /// the last page names no next one; a page from past the end is empty.
+    #[test]
+    fn pages_are_cut_by_size_and_count() {
+        let entries: Vec<Found> = (0..3000)
+            .map(|n| Found {
+                raw: OsString::from(format!("{n:04}{}", "x".repeat(150))),
+                at: None,
+                kind: kind::FILE,
+                size: Some(n),
+                mtime: Some(1_700_000_000),
+            })
+            .collect();
+        let folder = Folder {
+            path: Some(PathBuf::from("/f")),
+            title: "/f".into(),
+            parent: None,
+            entries,
+            truncated: false,
+        };
+        let mut handles = Handles::new(10_000);
+        let budget = 60 * 1024;
+        let (mut from, mut pages) = (0usize, 0);
+        loop {
+            let (entries, next) = page(&folder, from, budget, &mut handles);
+            let used: usize = entries.iter().map(encoded_entry_len).sum();
+            assert!(used <= budget, "{used}");
+            assert!(!entries.is_empty());
+            pages += 1;
+            match next {
+                Some(next) => {
+                    assert_eq!(next as usize, from + entries.len());
+                    from = next as usize;
+                }
+                None => {
+                    assert_eq!(from + entries.len(), 3000);
+                    break;
+                }
+            }
+        }
+        assert!(pages > 3, "{pages} pages");
+        assert_eq!(
+            page(&folder, 5000, budget, &mut handles),
+            (Vec::new(), None)
+        );
+
+        // Small entries: 1024 a page, each with the handle of its path.
+        let small = Folder {
+            entries: (0..1500)
+                .map(|n| Found {
+                    raw: OsString::from(n.to_string()),
+                    at: None,
+                    kind: kind::FILE,
+                    size: Some(1),
+                    mtime: None,
+                })
+                .collect(),
+            ..folder
+        };
+        let (entries, next) = page(&small, 0, budget, &mut handles);
+        assert_eq!((entries.len(), next), (MAX_ENTRIES, Some(1024)));
+        assert_eq!(handles.get(entries[0].handle), Some(Path::new("/f/0")));
+        // An entry over the budget still goes, alone.
+        let (entries, next) = page(&small, 0, 1, &mut handles);
+        assert_eq!((entries.len(), next), (1, Some(1)));
     }
 
     /// Titles are cut at the front, names at the end, on character

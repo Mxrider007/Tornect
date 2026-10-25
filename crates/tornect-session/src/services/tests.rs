@@ -1,9 +1,11 @@
 //! The services streams end to end over in-process pipes (the services
-//! design §10, tests 1, 2, 4, 5, 6, 10, 12, 15 and 17 and the close paths
+//! design §10, tests 1, 2, 4 to 8, 10, 12, 15 and 17 and the close paths
 //! of step 12, and the review of steps 14 and 15): a real [`MediaHost`]
 //! registry, its capture state driven by hand or by a real media stream, a
 //! fake desktop clipboard, a temporary inbox, a fake reading of its disk's
-//! free space, and a hook that holds an upload worker as it finishes a file.
+//! free space, a hook that holds an upload worker as it finishes a file, a
+//! temporary place to list and copy files from, and a hook that holds a
+//! listing worker as it starts.
 
 use std::collections::HashMap;
 use std::io;
@@ -25,13 +27,14 @@ use tornect_input::clipboard::{ClipboardLink, DesktopEnds};
 use tornect_input::{InputError, InputEvent, InputSink};
 use tornect_proto::services::{
     Accepted, Bind, CHUNK, Cancel, Caps, Chat, ClipStart, ClipSwitch, Complete, Done, Get, List,
-    MAX_CHAT_BYTES, MAX_CLIP, MAX_SERVICES_FRAME, Offer, SvcMsg, Welcome, caps, read_body_max,
-    read_header, reason, services_bind_mac, ty, write_msg,
+    ListFailed, Listing, MAX_CHAT_BYTES, MAX_CLIP, MAX_SERVICES_FRAME, Offer, Sending, SvcMsg,
+    Welcome, caps, kind, read_body_max, read_header, reason, services_bind_mac, ty, write_msg,
 };
 use tornect_signal::consent::SessionToken;
 use tornect_signal::fsm::host::{KillSwitch, LiveSession, SessionSink as _};
 use tornect_signal::messages::bye;
 
+use super::listing::{LIST_BURST, ListHook};
 use super::store::{FinishHook, Finishing};
 use super::*;
 use crate::{
@@ -146,7 +149,8 @@ struct Rig {
     desk: Arc<Desk>,
     heard: mpsc::UnboundedReceiver<(String, HostEvent)>,
     policy: watch::Sender<ServicesPolicy>,
-    /// Holds the inbox, `Tornect` in it.
+    /// Holds the inbox, `Tornect` in it, and the rig's own Tornect home,
+    /// `own-home`.
     home: tempfile::TempDir,
     /// What the inbox's disk has free.
     free: Arc<AtomicU64>,
@@ -160,6 +164,16 @@ struct Rig {
     /// Workers that waited at [`Rig::hold_at`] and were not yet counted by
     /// [`Rig::held`].
     held: Arc<AtomicUsize>,
+    /// The host's one place, "Files": what a viewer may list and copy.
+    files: tempfile::TempDir,
+    /// While set, a listing worker waits as it starts.
+    list_hold: Arc<AtomicBool>,
+    /// Listing workers that waited on [`Rig::list_hold`].
+    list_held: Arc<AtomicUsize>,
+    /// While set, an open of a file to send waits before it opens it.
+    open_hold: Arc<AtomicBool>,
+    /// Opens that waited on [`Rig::open_hold`].
+    open_held: Arc<AtomicUsize>,
 }
 
 /// A test that fails while a worker waits on [`Rig::stall`] or
@@ -168,6 +182,8 @@ struct Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         self.stall.store(false, Ordering::SeqCst);
+        self.list_hold.store(false, Ordering::SeqCst);
+        self.open_hold.store(false, Ordering::SeqCst);
         *self
             .hold_at
             .lock()
@@ -275,11 +291,29 @@ fn rig_on(
             Ok(free.load(Ordering::SeqCst))
         })
     };
+    let files = tempfile::tempdir().unwrap();
+    // The rig's own Tornect home: denied, as a host's own folders are. Its
+    // name differs from the inbox's in more than case, so that the two stay
+    // apart on a case-insensitive file system.
+    let own = tornect_core::Paths::from_home(home.path().join("own-home"));
+    own.ensure().unwrap();
+    let access = Arc::new(Access::new(
+        vec![("Files".to_owned(), files.path().to_path_buf())],
+        tornect_denied(&own),
+    ));
+    let list_hold = Arc::new(AtomicBool::new(false));
+    let list_held = Arc::new(AtomicUsize::new(0));
+    let list_hook: ListHook = holding(&list_hold, &list_held);
+    let open_hold = Arc::new(AtomicBool::new(false));
+    let open_held = Arc::new(AtomicUsize::new(0));
     let env = ServicesEnv {
         inbox: inbox.then(|| home.path().join("Tornect")),
         inbox_words: INBOX_WORDS.to_owned(),
         free_space,
+        access,
         finishing: Some(finishing),
+        list_hook: Some(list_hook),
+        open_hook: Some(holding(&open_hold, &open_held)),
     };
     let services = Arc::new(ServicesHost::new(
         Arc::clone(&media),
@@ -300,7 +334,25 @@ fn rig_on(
         stalled,
         hold_at,
         held,
+        files,
+        list_hold,
+        list_held,
+        open_hold,
+        open_held,
     }
+}
+
+/// A hook that, while `hold` is set, counts itself in `held` and waits.
+fn holding(hold: &Arc<AtomicBool>, held: &Arc<AtomicUsize>) -> ListHook {
+    let (hold, held) = (Arc::clone(hold), Arc::clone(held));
+    Arc::new(move || {
+        if hold.load(Ordering::SeqCst) {
+            held.fetch_add(1, Ordering::SeqCst);
+            while hold.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    })
 }
 
 /// A session as the FSM starts it (services first, as the app's session sink
@@ -1583,7 +1635,7 @@ async fn the_viewer_follows_and_polices_the_host() {
     // A listing in flight when browsing went: skipped, no error.
     write_msg(
         &mut r.host,
-        &SvcMsg::ListFailed(tornect_proto::services::ListFailed { req: 1, reason: 9 }),
+        &SvcMsg::ListFailed(ListFailed { req: 1, reason: 9 }),
     )
     .await
     .unwrap();
@@ -1805,10 +1857,15 @@ struct Running {
 }
 
 fn run_viewer(viewer: ServicesViewer<DuplexStream>) -> Running {
+    run_viewer_with(viewer, temp_local())
+}
+
+/// A [`ServicesViewer`]'s loop with `local`, running.
+fn run_viewer_with(viewer: ServicesViewer<DuplexStream>, local: ViewerLocal) -> Running {
     let (ops, ops_rx) = mpsc::channel(8);
     let (events_tx, events) = mpsc::channel(1024);
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let task = tokio::spawn(viewer.run(ops_rx, events_tx, temp_local(), async {
+    let task = tokio::spawn(viewer.run(ops_rx, events_tx, local, async {
         let _ = stopped.await;
     }));
     Running {
@@ -2508,6 +2565,1176 @@ async fn the_viewer_refuses_what_it_cannot_send() {
         .await
         .unwrap();
     assert_eq!(next(&mut host).await, Some(chat("y")), "no offer went out");
+    v.stop.send(()).unwrap();
+    assert_eq!(v.task.await.unwrap(), ViewerServicesEnd::Stopped);
+}
+
+// --- Tests 7 and 8: listings and downloads ----------------------------------
+
+fn list(req: u32, folder: u32, from: u32) -> SvcMsg {
+    SvcMsg::List(List { req, folder, from })
+}
+
+fn get(xfer: u32, handle: u32) -> SvcMsg {
+    SvcMsg::Get(Get { xfer, handle })
+}
+
+/// A Control session of `rig`'s with every cap, its stream bound raw, its
+/// `Opened` heard.
+async fn browsing(rig: &mut Rig, seed: u8) -> (Session, DuplexStream, JoinHandle<ServicesOutcome>) {
+    let session = start(rig, seed, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    assert_eq!(welcome(&mut client, &session).await.caps, caps::ALL);
+    assert!(matches!(
+        rig.event(&session.id).await,
+        HostEvent::Opened { .. }
+    ));
+    (session, client, task)
+}
+
+/// The host's next frame, which must be a page.
+async fn page_of(client: &mut DuplexStream) -> Listing {
+    match next(client).await {
+        Some(SvcMsg::Listing(page)) => page,
+        other => panic!("expected a Listing, got {other:?}"),
+    }
+}
+
+/// The host's next frame, which must be `ListFailed`: its request and reason.
+async fn list_failed(client: &mut DuplexStream) -> (u32, u16) {
+    match next(client).await {
+        Some(SvcMsg::ListFailed(failed)) => (failed.req, failed.reason),
+        other => panic!("expected ListFailed, got {other:?}"),
+    }
+}
+
+/// Every page of `folder`, each asked for once the one before arrived.
+async fn list_all(client: &mut DuplexStream, req: &mut u32, folder: u32) -> Vec<Listing> {
+    let mut pages = Vec::new();
+    let mut from = 0;
+    loop {
+        *req += 1;
+        write_msg(client, &list(*req, folder, from)).await.unwrap();
+        let page = page_of(client).await;
+        assert_eq!((page.req, page.folder), (*req, folder));
+        let next = page.next;
+        pages.push(page);
+        match next {
+            Some(next) => from = next,
+            None => return pages,
+        }
+    }
+}
+
+/// The entry named `name` of `page`.
+fn entry<'a>(page: &'a Listing, name: &str) -> &'a tornect_proto::services::Entry {
+    page.entries
+        .iter()
+        .find(|entry| entry.name == name)
+        .unwrap_or_else(|| panic!("{name} is not listed"))
+}
+
+/// The names `page` lists.
+fn listed(page: &Listing) -> Vec<&str> {
+    page.entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect()
+}
+
+/// Copy the file of `handle` as transfer `xfer` over a raw stream, crediting
+/// each chunk as it comes: its name and bytes, or the host's `Cancel`
+/// reason.
+async fn fetch(
+    client: &mut DuplexStream,
+    xfer: u32,
+    handle: u32,
+) -> Result<(String, Vec<u8>), u16> {
+    write_msg(client, &get(xfer, handle)).await.unwrap();
+    let (name, size) = match next(client).await {
+        Some(SvcMsg::Sending(sending)) if sending.xfer == xfer => (sending.name, sending.size),
+        Some(SvcMsg::Cancel(cancel)) if cancel.xfer == xfer => return Err(cancel.reason),
+        other => panic!("expected Sending, got {other:?}"),
+    };
+    let mut got = Vec::new();
+    loop {
+        match next(client).await {
+            Some(SvcMsg::Data {
+                xfer: x,
+                offset,
+                bytes,
+            }) if x == xfer => {
+                assert_eq!(offset, got.len() as u64);
+                got.extend_from_slice(&bytes);
+                write_msg(
+                    client,
+                    &SvcMsg::Credit {
+                        xfer,
+                        upto: got.len() as u64,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            Some(SvcMsg::Done(done)) if done.xfer == xfer => {
+                assert_eq!(got.len() as u64, size);
+                assert_eq!(done.sha256, sha256(&got));
+                write_msg(client, &SvcMsg::Complete(Complete { xfer }))
+                    .await
+                    .unwrap();
+                return Ok((name, got));
+            }
+            Some(SvcMsg::Cancel(cancel)) if cancel.xfer == xfer => return Err(cancel.reason),
+            other => panic!("expected the file, got {other:?}"),
+        }
+    }
+}
+
+/// Whether nothing comes from the host for a while.
+async fn quiet(client: &mut DuplexStream) -> bool {
+    tokio::time::timeout(Duration::from_millis(150), read_header(client))
+        .await
+        .is_err()
+}
+
+/// The services design's test 7, the happy path: the places, a place, a
+/// folder, then a file through its handle: `Sending` with its name and
+/// size, the bytes within the window as the viewer credits them, `Done`
+/// with their hash; the host's rows follow it and, at `Complete`, it is
+/// told sent with its own path (`sessions.log`'s `file_sent`), and counted.
+/// An empty file goes too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_is_listed_then_downloaded_through_its_handle() {
+    let mut rig = rig();
+    let docs = rig.files.path().join("docs");
+    std::fs::create_dir(&docs).unwrap();
+    let content: Vec<u8> = (0..300 * 1024 + 7).map(|n| (n % 253) as u8).collect();
+    std::fs::write(docs.join("report.pdf"), &content).unwrap();
+    std::fs::write(docs.join("Empty.txt"), b"").unwrap();
+    let (session, mut client, task) = browsing(&mut rig, 160).await;
+    let mut req = 0;
+
+    let places = list_all(&mut client, &mut req, 0).await;
+    assert_eq!(places.len(), 1);
+    assert_eq!((places[0].parent, places[0].title.as_str()), (None, ""));
+    assert_eq!(listed(&places[0]), ["Files"]);
+    assert_eq!(places[0].entries[0].kind, kind::FOLDER);
+    let files = entry(&places[0], "Files").handle;
+    let top = &list_all(&mut client, &mut req, files).await[0];
+    assert_eq!(listed(top), ["docs"]);
+    assert_eq!(top.parent, Some(0), "above the place: the places");
+    let docs_handle = entry(top, "docs").handle;
+    let inside = &list_all(&mut client, &mut req, docs_handle).await[0];
+    assert_eq!(listed(inside), ["Empty.txt", "report.pdf"]);
+    assert_eq!(inside.parent, Some(files));
+    assert!(inside.title.ends_with("docs"));
+    let report = entry(inside, "report.pdf");
+    assert_eq!(report.size, Some(content.len() as u64));
+
+    let (name, got) = fetch(&mut client, 1, report.handle).await.unwrap();
+    assert_eq!((name.as_str(), got == content), ("report.pdf", true));
+    let mut rows = Vec::new();
+    let sent = loop {
+        match rig.event(&session.id).await {
+            HostEvent::Transfer(row) => rows.push(row),
+            HostEvent::FileSent { xfer, path, bytes } => break (xfer, path, bytes),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(sent.0, 1);
+    assert_eq!(
+        sent.1.as_path(),
+        docs.join("report.pdf").canonicalize().unwrap()
+    );
+    assert_eq!(sent.2, content.len() as u64);
+    assert_eq!(format!("{:?}", sent.1), "HostPath(<redacted>)");
+    assert!(
+        rows.iter()
+            .all(|row| row.dir == Direction::FromHost && row.xfer == 1)
+    );
+    assert_eq!(rows[0].state, TransferState::Running);
+    assert!(
+        rows.iter()
+            .any(|row| row.done > 0 && row.done < content.len() as u64),
+        "credits came while the file moved"
+    );
+    let last = rows.last().unwrap();
+    assert_eq!(
+        (&last.state, last.done),
+        (
+            &TransferState::Done {
+                stored: Untrusted::file_name("report.pdf")
+            },
+            content.len() as u64
+        )
+    );
+
+    let empty = entry(inside, "Empty.txt").handle;
+    assert_eq!(
+        fetch(&mut client, 2, empty).await,
+        Ok(("Empty.txt".to_owned(), Vec::new()))
+    );
+    loop {
+        if let HostEvent::FileSent { xfer, bytes, .. } = rig.event(&session.id).await {
+            assert_eq!((xfer, bytes), (2, 0));
+            break;
+        }
+    }
+    rig.media.on_end(&session.id, None);
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Close {
+            reason: reason::SESSION_OVER
+        })
+    );
+    let (_, summary, _) = served(task).await;
+    assert_eq!(
+        (summary.files_out, summary.bytes_out),
+        (2, content.len() as u64)
+    );
+}
+
+/// The services design's test 7, what is refused: the places' handle, a
+/// folder and a FIFO are `NOT_A_FILE` (the FIFO at once); an unknown handle
+/// and a file gone since its listing are `NOT_FOUND`; a link re-pointed
+/// into the host's own Tornect folders or into another Tornect home, and
+/// everything below a folder that got the private marker since its
+/// listing, are `DENIED`. A Tornect home and part files are never listed. A
+/// name that is not valid Unicode is listed `lossy` and downloads the right
+/// bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downloads_are_refused_where_the_rules_say() {
+    let mut rig = rig();
+    let files = rig.files.path().to_path_buf();
+    let other = tornect_core::Paths::from_home(files.join("h2"));
+    other.ensure().unwrap();
+    let other_key = other.state_dir.join("device.key");
+    std::fs::write(&other_key, b"theirs").unwrap();
+    let own_key = rig
+        .home
+        .path()
+        .join("own-home")
+        .join("state")
+        .join("device.key");
+    std::fs::write(&own_key, b"ours").unwrap();
+    let docs = files.join("docs");
+    std::fs::create_dir_all(docs.join("sub")).unwrap();
+    std::fs::write(docs.join("a.txt"), b"plain").unwrap();
+    std::fs::write(docs.join("gone.txt"), b"soon gone").unwrap();
+    std::fs::write(docs.join("half.txt.tornect-part"), b"half").unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(docs.join("a.txt"), docs.join("mine")).unwrap();
+        std::os::unix::fs::symlink(docs.join("a.txt"), docs.join("theirs")).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(docs.join("pipe"))
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    #[cfg(target_os = "linux")]
+    let odd = {
+        use std::os::unix::ffi::OsStrExt as _;
+        let odd = docs.join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt"));
+        std::fs::write(&odd, b"odd bytes").unwrap();
+        odd
+    };
+    let (session, mut client, task) = browsing(&mut rig, 161).await;
+    let mut req = 0;
+    let places = list_all(&mut client, &mut req, 0).await;
+    let top = &list_all(&mut client, &mut req, entry(&places[0], "Files").handle).await[0];
+    assert_eq!(listed(top), ["docs"], "another Tornect home is not listed");
+    let docs_handle = entry(top, "docs").handle;
+    let inside = list_all(&mut client, &mut req, docs_handle).await.remove(0);
+    let names = listed(&inside);
+    assert!(
+        !names.iter().any(|name| name.contains("tornect-part")),
+        "{names:?}"
+    );
+    let handle = |name: &str| entry(&inside, name).handle;
+
+    let mut xfer = 0;
+    let mut refused = |handle: u32| {
+        xfer += 1;
+        (xfer, handle)
+    };
+    let (x, h) = refused(0);
+    assert_eq!(fetch(&mut client, x, h).await, Err(reason::NOT_A_FILE));
+    let (x, h) = refused(handle("sub"));
+    assert_eq!(fetch(&mut client, x, h).await, Err(reason::NOT_A_FILE));
+    let (x, h) = refused(999_999);
+    assert_eq!(fetch(&mut client, x, h).await, Err(reason::NOT_FOUND));
+    std::fs::remove_file(docs.join("gone.txt")).unwrap();
+    let (x, h) = refused(handle("gone.txt"));
+    assert_eq!(fetch(&mut client, x, h).await, Err(reason::NOT_FOUND));
+    #[cfg(unix)]
+    {
+        assert_eq!(entry(&inside, "pipe").kind, kind::OTHER);
+        let (x, h) = refused(handle("pipe"));
+        let at = std::time::Instant::now();
+        assert_eq!(fetch(&mut client, x, h).await, Err(reason::NOT_A_FILE));
+        assert!(at.elapsed() < Duration::from_secs(2), "no hang on the FIFO");
+        // Links that pointed at a plain file now point at Tornect's files.
+        std::fs::remove_file(docs.join("mine")).unwrap();
+        std::os::unix::fs::symlink(&own_key, docs.join("mine")).unwrap();
+        std::fs::remove_file(docs.join("theirs")).unwrap();
+        std::os::unix::fs::symlink(&other_key, docs.join("theirs")).unwrap();
+        for name in ["mine", "theirs"] {
+            let (x, h) = refused(handle(name));
+            assert_eq!(
+                fetch(&mut client, x, h).await,
+                Err(reason::DENIED),
+                "{name}"
+            );
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let shown = "caf\u{fffd}.txt";
+        assert!(entry(&inside, shown).lossy);
+        let (x, h) = refused(handle(shown));
+        assert_eq!(
+            fetch(&mut client, x, h).await.map(|(_, bytes)| bytes),
+            Ok(std::fs::read(&odd).unwrap())
+        );
+    }
+    let (x, h) = refused(handle("a.txt"));
+    assert_eq!(
+        fetch(&mut client, x, h).await.map(|(_, bytes)| bytes),
+        Ok(b"plain".to_vec())
+    );
+    // The folder becomes a Tornect home's: nothing in it goes any more.
+    tornect_core::files::mark_private(&docs).unwrap();
+    let (x, h) = refused(handle("a.txt"));
+    assert_eq!(fetch(&mut client, x, h).await, Err(reason::DENIED));
+    req += 1;
+    write_msg(&mut client, &list(req, docs_handle, 0))
+        .await
+        .unwrap();
+    assert_eq!(list_failed(&mut client).await, (req, reason::DENIED));
+
+    rig.media.on_end(&session.id, None);
+    let (code, summary, _) = served(task).await;
+    assert_eq!(code, reason::SESSION_OVER);
+    assert_eq!(
+        summary.files_out,
+        if cfg!(target_os = "linux") { 2 } else { 1 }
+    );
+}
+
+/// The services design's test 7: a file that shrinks while it is sent ends
+/// with `Cancel{CHANGED}`, and its row says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_that_shrinks_while_sent_is_changed() {
+    let mut rig = rig();
+    let path = rig.files.path().join("growing.log");
+    std::fs::write(&path, vec![7u8; 1 << 20]).unwrap();
+    let (session, mut client, task) = browsing(&mut rig, 162).await;
+    let mut req = 0;
+    let places = list_all(&mut client, &mut req, 0).await;
+    let top = &list_all(&mut client, &mut req, entry(&places[0], "Files").handle).await[0];
+    write_msg(&mut client, &get(1, entry(top, "growing.log").handle))
+        .await
+        .unwrap();
+    assert!(matches!(next(&mut client).await, Some(SvcMsg::Sending(_))));
+    // A window's worth arrives uncredited; then the file shrinks.
+    let mut got = data_until_quiet(&mut client, 1, 0).await;
+    assert_eq!(got, 256 * 1024, "the host kept to the window");
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(10)
+        .unwrap();
+    let cancelled = loop {
+        write_msg(&mut client, &SvcMsg::Credit { xfer: 1, upto: got })
+            .await
+            .unwrap();
+        match next(&mut client).await {
+            Some(SvcMsg::Data { bytes, .. }) => got += bytes.len() as u64,
+            Some(SvcMsg::Cancel(cancel)) => break cancel,
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!((cancelled.xfer, cancelled.reason), (1, reason::CHANGED));
+    let last = loop {
+        let row = rig.row(&session.id).await;
+        if row.state != TransferState::Running {
+            break row;
+        }
+    };
+    assert_eq!(last.state, TransferState::Failed(reason::CHANGED));
+    rig.media.on_end(&session.id, None);
+    assert_eq!(served(task).await.1.files_out, 0);
+}
+
+/// The services design's test 7: a handle evicted from a full table is
+/// `NOT_FOUND`, for a `Get` and for a `List`, and the newer ones work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_evicted_handle_is_not_found() {
+    let mut rig = rig_with(Build {
+        limits: ServicesLimits {
+            max_handles: 4,
+            ..ServicesLimits::default()
+        },
+        ..Build::default()
+    });
+    std::fs::create_dir(rig.files.path().join("dir")).unwrap();
+    for n in 0..6 {
+        std::fs::write(rig.files.path().join(format!("f{n}.txt")), [n]).unwrap();
+    }
+    let (_session, mut client, _task) = browsing(&mut rig, 163).await;
+    let mut req = 0;
+    let places = list_all(&mut client, &mut req, 0).await;
+    let top = list_all(&mut client, &mut req, entry(&places[0], "Files").handle)
+        .await
+        .remove(0);
+    assert_eq!(
+        listed(&top),
+        [
+            "dir", "f0.txt", "f1.txt", "f2.txt", "f3.txt", "f4.txt", "f5.txt"
+        ]
+    );
+    assert_eq!(
+        fetch(&mut client, 1, entry(&top, "f0.txt").handle).await,
+        Err(reason::NOT_FOUND)
+    );
+    req += 1;
+    write_msg(&mut client, &list(req, entry(&top, "dir").handle, 0))
+        .await
+        .unwrap();
+    assert_eq!(list_failed(&mut client).await, (req, reason::NOT_FOUND));
+    assert_eq!(
+        fetch(&mut client, 2, entry(&top, "f5.txt").handle)
+            .await
+            .map(|(_, bytes)| bytes),
+        Ok(vec![5])
+    );
+}
+
+/// The services design's test 8: a folder of 3000 long names comes in
+/// several pages, each asked for, each within the page budget, in order;
+/// nothing comes unasked; a Tornect home in it is omitted. A first page asked
+/// for past the rate is `BUSY`; pages that continue a listing are not
+/// counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listings_are_paged_by_size_and_pulled() {
+    let mut rig = rig();
+    let many = rig.files.path().join("many");
+    std::fs::create_dir(&many).unwrap();
+    for n in 0..3000 {
+        std::fs::write(many.join(format!("{n:04}-{}", "n".repeat(180))), b"").unwrap();
+    }
+    tornect_core::Paths::from_home(many.join("h3"))
+        .ensure()
+        .unwrap();
+    let (_session, mut client, _task) = browsing(&mut rig, 164).await;
+    let mut req = 0;
+    let places = list_all(&mut client, &mut req, 0).await;
+    let top = &list_all(&mut client, &mut req, entry(&places[0], "Files").handle).await[0];
+    let folder = entry(top, "many").handle;
+
+    let mut names = Vec::new();
+    let mut from = 0;
+    let mut pages = 0;
+    loop {
+        req += 1;
+        write_msg(&mut client, &list(req, folder, from))
+            .await
+            .unwrap();
+        let page = page_of(&mut client).await;
+        let bytes: usize = page
+            .entries
+            .iter()
+            .map(tornect_proto::services::encoded_entry_len)
+            .sum();
+        assert!(bytes <= 60 * 1024, "{bytes}");
+        assert!(!page.truncated);
+        names.extend(page.entries.iter().map(|entry| entry.name.clone()));
+        pages += 1;
+        assert!(quiet(&mut client).await, "nothing comes unasked");
+        match page.next {
+            Some(next) => {
+                assert_eq!(next as usize, names.len());
+                from = next;
+            }
+            None => break,
+        }
+    }
+    assert!(pages >= 8, "{pages} pages");
+    assert_eq!(names.len(), 3000, "the Tornect home is not listed");
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted);
+
+    // First pages asked for at once: `BUSY` past the burst (a token may
+    // come back meanwhile).
+    let (mut first, mut first_next) = (0, None);
+    loop {
+        req += 1;
+        write_msg(&mut client, &list(req, folder, 0)).await.unwrap();
+        match next(&mut client).await {
+            Some(SvcMsg::Listing(page)) => {
+                first += 1;
+                assert!(first <= LIST_BURST + 1, "{first} first pages served");
+                assert_eq!(page.req, req);
+                first_next = page.next;
+            }
+            Some(SvcMsg::ListFailed(failed)) => {
+                assert_eq!((failed.req, failed.reason), (req, reason::BUSY));
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    // Pages that continue the listing are not counted: each one is served
+    // at once though first pages were just refused.
+    let mut from = first_next;
+    let mut continued = 0;
+    while let Some(at) = from {
+        req += 1;
+        write_msg(&mut client, &list(req, folder, at))
+            .await
+            .unwrap();
+        let page = page_of(&mut client).await;
+        assert_eq!(page.req, req);
+        continued += 1;
+        from = page.next;
+    }
+    assert!(continued > LIST_BURST + 1, "{continued} pages continued");
+}
+
+/// The services design's test 8: truncation. A folder of more entries than
+/// the host lists says so, and lists exactly its bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_folder_past_the_bound_is_truncated() {
+    let mut rig = rig_with(Build {
+        limits: ServicesLimits {
+            max_entries: 50,
+            ..ServicesLimits::default()
+        },
+        ..Build::default()
+    });
+    for n in 0..60 {
+        std::fs::write(rig.files.path().join(format!("{n:02}")), b"").unwrap();
+    }
+    let (_session, mut client, _task) = browsing(&mut rig, 165).await;
+    let mut req = 0;
+    let places = list_all(&mut client, &mut req, 0).await;
+    let pages = list_all(&mut client, &mut req, entry(&places[0], "Files").handle).await;
+    assert_eq!(pages.len(), 1);
+    assert!(pages[0].truncated);
+    assert_eq!(pages[0].entries.len(), 50);
+}
+
+/// The services design's test 8: one `List` at a time (`BUSY`), the
+/// listing's timeout (`IO`), a worker still stuck after it (`BUSY`), and
+/// listing again once it returned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_list_at_a_time_and_a_stuck_worker_is_busy() {
+    let mut rig = rig_with(Build {
+        limits: ServicesLimits {
+            list_timeout: Duration::from_millis(300),
+            ..ServicesLimits::default()
+        },
+        ..Build::default()
+    });
+    let (_session, mut client, task) = browsing(&mut rig, 166).await;
+    rig.list_hold.store(true, Ordering::SeqCst);
+    write_msg(&mut client, &list(1, 0, 0)).await.unwrap();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while rig.list_held.load(Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "no worker started");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    write_msg(&mut client, &list(2, 0, 0)).await.unwrap();
+    assert_eq!(list_failed(&mut client).await, (2, reason::BUSY));
+    assert_eq!(list_failed(&mut client).await, (1, reason::IO));
+    write_msg(&mut client, &list(3, 0, 0)).await.unwrap();
+    assert_eq!(list_failed(&mut client).await, (3, reason::BUSY));
+    rig.list_hold.store(false, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let mut req = 3;
+    loop {
+        req += 1;
+        write_msg(&mut client, &list(req, 0, 0)).await.unwrap();
+        match next(&mut client).await {
+            Some(SvcMsg::Listing(page)) => {
+                assert_eq!(listed(&page), ["Files"]);
+                break;
+            }
+            Some(SvcMsg::ListFailed(failed)) if failed.reason == reason::BUSY => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(tokio::time::Instant::now() < deadline, "still busy");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert!(!task.is_finished(), "services stay open");
+}
+
+/// The services design's step 17, the read timeout of an open: an open of
+/// a file to send that does not return in time is `Cancel{IO}`, and it
+/// holds its place until its thread returns, so two such opens make the
+/// next `Get` `BUSY`; once they return, a file goes again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_past_its_timeout_holds_its_place() {
+    let mut rig = rig_with(Build {
+        limits: ServicesLimits {
+            read_timeout: Duration::from_millis(200),
+            ..ServicesLimits::default()
+        },
+        ..Build::default()
+    });
+    std::fs::write(rig.files.path().join("slow.txt"), b"in the end").unwrap();
+    let (session, mut client, task) = browsing(&mut rig, 169).await;
+    let mut req = 0;
+    let places = list_all(&mut client, &mut req, 0).await;
+    let top = &list_all(&mut client, &mut req, entry(&places[0], "Files").handle).await[0];
+    let slow = entry(top, "slow.txt").handle;
+
+    rig.open_hold.store(true, Ordering::SeqCst);
+    for xfer in [1, 2] {
+        let at = tokio::time::Instant::now();
+        assert_eq!(fetch(&mut client, xfer, slow).await, Err(reason::IO));
+        assert!(at.elapsed() >= Duration::from_millis(200));
+    }
+    assert_eq!(rig.open_held.load(Ordering::SeqCst), 2);
+    assert_eq!(fetch(&mut client, 3, slow).await, Err(reason::BUSY));
+    rig.open_hold.store(false, Ordering::SeqCst);
+    let mut xfer = 3;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let got = loop {
+        xfer += 1;
+        match fetch(&mut client, xfer, slow).await {
+            Err(reason::BUSY) => {
+                assert!(tokio::time::Instant::now() < deadline, "still busy");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            other => break other,
+        }
+    };
+    assert_eq!(got.map(|(_, bytes)| bytes), Ok(b"in the end".to_vec()));
+    // No row for what was refused before a byte went: the first is the
+    // file sent.
+    match rig.event(&session.id).await {
+        HostEvent::Transfer(row) => {
+            assert_eq!((row.xfer, row.state), (xfer, TransferState::Running))
+        }
+        other => panic!("{other:?}"),
+    }
+    loop {
+        if let HostEvent::FileSent { xfer: sent, .. } = rig.event(&session.id).await {
+            assert_eq!(sent, xfer);
+            break;
+        }
+    }
+    rig.media.on_end(&session.id, None);
+    assert_eq!(served(task).await.1.files_out, 1);
+}
+
+/// A services stream to `services` over a pipe of `capacity` bytes.
+fn open_narrow(
+    services: &Arc<ServicesHost>,
+    capacity: usize,
+) -> (DuplexStream, JoinHandle<ServicesOutcome>) {
+    let (client, server) = duplex(capacity);
+    let services = Arc::clone(services);
+    (
+        client,
+        tokio::spawn(async move { services.serve(server).await }),
+    )
+}
+
+/// The services design's test 8: a 10 000-entry listing over a 64 KiB pipe
+/// read slowly, while a file is downloaded beside it, neither closes the
+/// stream nor makes the host send what was not asked for: one page per
+/// `List`, and file bytes within the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_large_listing_over_a_slow_link_stays_open() {
+    let rig = rig();
+    let big = rig.files.path().join("big");
+    std::fs::create_dir(&big).unwrap();
+    for n in 0..10_000 {
+        std::fs::write(big.join(format!("entry-{n:05}-{}", "x".repeat(40))), b"").unwrap();
+    }
+    let content: Vec<u8> = (0..1 << 20).map(|n| (n % 241) as u8).collect();
+    std::fs::write(rig.files.path().join("file.bin"), &content).unwrap();
+    let session = start(&rig, 167, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open_narrow(&rig.services, 64 * 1024);
+    welcome(&mut client, &session).await;
+    let mut req = 0;
+    let places = list_all(&mut client, &mut req, 0).await;
+    let top = &list_all(&mut client, &mut req, entry(&places[0], "Files").handle).await[0];
+    let folder = entry(top, "big").handle;
+    write_msg(&mut client, &get(1, entry(top, "file.bin").handle))
+        .await
+        .unwrap();
+    req += 1;
+    write_msg(&mut client, &list(req, folder, 0)).await.unwrap();
+
+    let (mut entries, mut file, mut credited, mut lists, mut pages) = (0usize, 0u64, 0u64, 1, 0);
+    let mut done = false;
+    while !(done && pages == lists && entries == 10_000) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        match next(&mut client).await {
+            Some(SvcMsg::Sending(_)) => {}
+            Some(SvcMsg::Data { bytes, .. }) => {
+                file += bytes.len() as u64;
+                assert!(file - credited <= 256 * 1024, "within the window");
+                if file - credited >= 64 * 1024 || file == content.len() as u64 {
+                    credited = file;
+                    write_msg(
+                        &mut client,
+                        &SvcMsg::Credit {
+                            xfer: 1,
+                            upto: credited,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            Some(SvcMsg::Done(_)) => {
+                write_msg(&mut client, &SvcMsg::Complete(Complete { xfer: 1 }))
+                    .await
+                    .unwrap();
+                done = true;
+            }
+            Some(SvcMsg::Listing(page)) => {
+                pages += 1;
+                assert_eq!(pages, lists, "one page per List");
+                entries += page.entries.len();
+                assert!(!page.truncated);
+                if let Some(from) = page.next {
+                    req += 1;
+                    lists += 1;
+                    write_msg(&mut client, &list(req, folder, from))
+                        .await
+                        .unwrap();
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(file, content.len() as u64);
+    assert!(pages > 10, "{pages} pages");
+    assert!(!task.is_finished(), "services stay open");
+    rig.media.on_end(&session.id, None);
+    assert_eq!(served(task).await.0, reason::SESSION_OVER);
+}
+
+// --- The viewer's listings and downloads --------------------------------------
+
+/// What a test viewer works with to download: the temporary folder as its
+/// place, and `downloads` with plenty of free space.
+fn downloading_local(downloads: &std::path::Path) -> ViewerLocal {
+    ViewerLocal {
+        downloads: Some(downloads.to_path_buf()),
+        free_space: Arc::new(|_: &std::path::Path| Ok(u64::MAX / 2)),
+        keep_free: 0,
+        ..temp_local()
+    }
+}
+
+/// The viewer's next event, which must be a page of the host's folder.
+async fn remote_listing(events: &mut mpsc::Receiver<ViewerEvent>) -> ListingView {
+    match tokio::time::timeout(WAIT, events.recv()).await {
+        Ok(Some(ViewerEvent::Listing { remote: true, view })) => view,
+        other => panic!("expected a remote listing, got {other:?}"),
+    }
+}
+
+/// The host's folders browsed and its files copied through
+/// [`ServicesViewer`]: pages come as events, each next one pulled by the
+/// viewer itself; three downloads asked for at once run two at a time, the
+/// third waiting for a place; each lands in the viewer's downloads folder
+/// under its sanitised name with the host's bytes, and both ends see it
+/// `Done`; the host is told each one sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_viewer_browses_and_downloads_the_hosts_files() {
+    let mut rig = rig_with(Build {
+        limits: ServicesLimits {
+            page_budget: 2048,
+            ..ServicesLimits::default()
+        },
+        ..Build::default()
+    });
+    let docs = rig.files.path().join("docs");
+    std::fs::create_dir(&docs).unwrap();
+    let contents: Vec<Vec<u8>> = (0..3u8)
+        .map(|n| vec![n; 200 * 1024 + usize::from(n)])
+        .collect();
+    for (n, content) in contents.iter().enumerate() {
+        std::fs::write(docs.join(format!("{n}.bin")), content).unwrap();
+    }
+    for n in 0..40 {
+        std::fs::write(docs.join(format!("z{n:02}-{}", "y".repeat(60))), b"").unwrap();
+    }
+    let session = start(&rig, 168, SessionMode::Control);
+    session.live(true);
+    let (client, host) = open(&rig.services);
+    let (viewer, _) = ServicesViewer::bind(client, &session.binding, WAIT)
+        .await
+        .unwrap();
+    let downloads = tempfile::tempdir().unwrap();
+    let mut v = run_viewer_with(viewer, downloading_local(&downloads.path().join("Tornect")));
+    rig.event(&session.id).await;
+
+    v.ops.send(ViewerOp::OpenRemote(0)).await.unwrap();
+    let places = remote_listing(&mut v.events).await;
+    assert_eq!(
+        (places.folder, places.parent, places.more),
+        (0, None, false)
+    );
+    v.ops
+        .send(ViewerOp::OpenRemote(handle_of(&places, "Files")))
+        .await
+        .unwrap();
+    let top = remote_listing(&mut v.events).await;
+    v.ops
+        .send(ViewerOp::OpenRemote(handle_of(&top, "docs")))
+        .await
+        .unwrap();
+    let mut shown = Vec::new();
+    loop {
+        let page = remote_listing(&mut v.events).await;
+        assert_eq!(page.from as usize, shown.len());
+        shown.extend(page.entries);
+        if !page.more {
+            break;
+        }
+    }
+    assert_eq!(shown.len(), 43, "every page was pulled");
+    for n in 0..3 {
+        let name = format!("{n}.bin");
+        let handle = shown
+            .iter()
+            .find(|e| e.name.as_str() == name)
+            .unwrap()
+            .handle;
+        v.ops.send(ViewerOp::Download(handle)).await.unwrap();
+    }
+
+    let mut rows = Vec::new();
+    let mut ended = HashMap::new();
+    while ended.len() < 3 {
+        let row = transfer(&mut v.events).await;
+        assert_eq!(row.dir, Direction::FromHost);
+        if !matches!(row.state, TransferState::Queued | TransferState::Running) {
+            ended.insert(row.xfer, row.clone());
+        }
+        rows.push(row);
+    }
+    for (n, content) in contents.iter().enumerate() {
+        let row = &ended[&(n as u32 + 1)];
+        let name = format!("{n}.bin");
+        assert_eq!(
+            row.state,
+            TransferState::Done {
+                stored: Untrusted::file_name(&name)
+            }
+        );
+        assert_eq!(
+            (row.size, row.done),
+            (content.len() as u64, content.len() as u64)
+        );
+        assert_eq!(
+            std::fs::read(downloads.path().join("Tornect").join(&name)).unwrap(),
+            *content
+        );
+    }
+    let first_end = rows
+        .iter()
+        .position(|row| row.xfer != 3 && matches!(row.state, TransferState::Done { .. }))
+        .unwrap();
+    let third_runs = rows
+        .iter()
+        .position(|row| row.xfer == 3 && row.state == TransferState::Running)
+        .unwrap();
+    assert!(first_end < third_runs, "the third file waited for a place");
+    let mut sent = 0;
+    while sent < 3 {
+        if let HostEvent::FileSent { .. } = rig.event(&session.id).await {
+            sent += 1;
+        }
+    }
+    let mut left: Vec<_> = std::fs::read_dir(downloads.path().join("Tornect"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["0.bin", "1.bin", "2.bin"], "no part file is left");
+    v.stop.send(()).unwrap();
+    assert_eq!(v.task.await.unwrap(), ViewerServicesEnd::Stopped);
+    assert_eq!(served(host).await.1.files_out, 3);
+}
+
+/// The viewer's remote listings against a raw host: each next page is asked
+/// for once a page arrives; a folder opened while another is being listed
+/// replaces it (the old one's page is dropped); past the viewer's own bound
+/// it stops asking and says the folder is truncated; without `BROWSE` it
+/// asks for nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_viewer_pulls_pages_and_follows_the_last_folder_opened() {
+    let entry = |n: u32| tornect_proto::services::Entry {
+        name: format!("e{n}"),
+        handle: 100 + n,
+        kind: kind::FILE,
+        size: Some(1),
+        mtime: None,
+        lossy: false,
+    };
+    let page = |req: u32, folder: u32, range: std::ops::Range<u32>, next: Option<u32>| {
+        SvcMsg::Listing(Listing {
+            req,
+            folder,
+            title: "/x".into(),
+            parent: (folder != 0).then_some(0),
+            entries: range.map(entry).collect(),
+            next,
+            truncated: false,
+        })
+    };
+    let (mut host, bound) = raw_host(Some(SvcMsg::Welcome(test_welcome(caps::ALL))), WAIT).await;
+    let mut local = temp_local();
+    local.limits.max_entries = 5;
+    let mut v = run_viewer_with(bound.unwrap().0, local);
+
+    v.ops.send(ViewerOp::OpenRemote(7)).await.unwrap();
+    assert_eq!(next(&mut host).await, Some(list(1, 7, 0)));
+    write_msg(&mut host, &page(1, 7, 0..2, Some(2)))
+        .await
+        .unwrap();
+    let first = remote_listing(&mut v.events).await;
+    assert_eq!((first.from, first.more, first.entries.len()), (0, true, 2));
+    assert_eq!(next(&mut host).await, Some(list(2, 7, 2)), "pulled at once");
+    // Another folder is opened meanwhile: the page in flight is dropped.
+    // (Ops are taken in order: once the chat line is out, so is the open.)
+    v.ops.send(ViewerOp::OpenRemote(9)).await.unwrap();
+    v.ops
+        .send(ViewerOp::Chat(sanitize_peer_text("next").unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut host).await, Some(chat("next")));
+    write_msg(&mut host, &page(2, 7, 2..4, Some(4)))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut host).await, Some(list(3, 9, 0)));
+    write_msg(&mut host, &page(3, 9, 0..4, Some(4)))
+        .await
+        .unwrap();
+    let nine = remote_listing(&mut v.events).await;
+    assert_eq!((nine.folder, nine.from, nine.more), (9, 0, true));
+    assert_eq!(next(&mut host).await, Some(list(4, 9, 4)));
+    write_msg(&mut host, &page(4, 9, 4..6, Some(6)))
+        .await
+        .unwrap();
+    let last = remote_listing(&mut v.events).await;
+    assert_eq!((last.from, last.more, last.truncated), (4, false, true));
+    assert!(quiet(&mut host).await, "no page past the viewer's bound");
+
+    // Browsing goes: nothing is asked for any more.
+    write_msg(
+        &mut host,
+        &SvcMsg::Caps(Caps {
+            caps: caps::CHAT,
+            paused: 0,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        v.events.recv().await,
+        Some(ViewerEvent::Caps { .. })
+    ));
+    v.ops.send(ViewerOp::OpenRemote(0)).await.unwrap();
+    assert_eq!(
+        v.events.recv().await,
+        Some(ViewerEvent::ListFailed {
+            remote: true,
+            reason: reason::NOT_OFFERED
+        })
+    );
+    v.ops.send(ViewerOp::Download(101)).await.unwrap();
+    assert_eq!(
+        transfer(&mut v.events).await.state,
+        TransferState::Failed(reason::NOT_OFFERED)
+    );
+    assert!(quiet(&mut host).await);
+    v.stop.send(()).unwrap();
+    assert_eq!(v.task.await.unwrap(), ViewerServicesEnd::Stopped);
+}
+
+/// The viewer's checks of the host's browsing frames, each ending the
+/// stream with `Close{PROTOCOL}`: a `Listing` or a `ListFailed` that answers
+/// no `List`, a `Listing` whose `next` does not follow its entries,
+/// `Sending` or `Data` for a transfer never asked for, and `Data` before
+/// `Sending`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_viewer_refuses_browse_frames_out_of_order() {
+    let listing = |req: u32, next: Option<u32>| {
+        SvcMsg::Listing(Listing {
+            req,
+            folder: 0,
+            title: String::new(),
+            parent: None,
+            entries: vec![tornect_proto::services::Entry {
+                name: "a".into(),
+                handle: 5,
+                kind: kind::FILE,
+                size: Some(1),
+                mtime: None,
+                lossy: false,
+            }],
+            next,
+            truncated: false,
+        })
+    };
+    let data = SvcMsg::Data {
+        xfer: 1,
+        offset: 0,
+        bytes: vec![1],
+    };
+    let sending = SvcMsg::Sending(Sending {
+        xfer: 1,
+        name: "a".into(),
+        size: 1,
+    });
+    let cases = [
+        ("a Listing never asked for", None, listing(1, None)),
+        (
+            "a ListFailed never asked for",
+            None,
+            SvcMsg::ListFailed(ListFailed { req: 1, reason: 9 }),
+        ),
+        (
+            "a next that does not follow",
+            Some(ViewerOp::OpenRemote(0)),
+            listing(1, Some(3)),
+        ),
+        ("Sending never asked for", None, sending.clone()),
+        ("Data never asked for", None, data.clone()),
+        ("Data before Sending", Some(ViewerOp::Download(5)), data),
+    ];
+    for (case, op, frame) in cases {
+        let (mut host, bound) =
+            raw_host(Some(SvcMsg::Welcome(test_welcome(caps::ALL))), WAIT).await;
+        let downloads = tempfile::tempdir().unwrap();
+        let v = run_viewer_with(bound.unwrap().0, downloading_local(downloads.path()));
+        if let Some(op) = op {
+            v.ops.send(op).await.unwrap();
+            assert!(
+                matches!(
+                    next(&mut host).await,
+                    Some(SvcMsg::List(_) | SvcMsg::Get(_))
+                ),
+                "{case}"
+            );
+        }
+        write_msg(&mut host, &frame).await.unwrap();
+        assert_eq!(
+            next(&mut host).await,
+            Some(SvcMsg::Close {
+                reason: reason::PROTOCOL
+            }),
+            "{case}"
+        );
+        assert_eq!(
+            v.task.await.unwrap(),
+            ViewerServicesEnd::Refused(reason::PROTOCOL),
+            "{case}"
+        );
+    }
+}
+
+/// A download that fails on the viewer's side (its hash does not match)
+/// leaves nothing in its downloads folder, and the host hears
+/// `Cancel{CORRUPT}`; one cancelled by the host leaves nothing either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_download_that_fails_leaves_nothing() {
+    let (mut host, bound) = raw_host(Some(SvcMsg::Welcome(test_welcome(caps::ALL))), WAIT).await;
+    let downloads = tempfile::tempdir().unwrap();
+    let folder = downloads.path().join("Tornect");
+    let mut v = run_viewer_with(bound.unwrap().0, downloading_local(&folder));
+    let settled = || async {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let left = std::fs::read_dir(&folder).map_or(0, |dir| dir.count());
+            if left == 0 {
+                return;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{left} files left");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+
+    v.ops.send(ViewerOp::Download(5)).await.unwrap();
+    assert_eq!(next(&mut host).await, Some(get(1, 5)));
+    write_msg(
+        &mut host,
+        &SvcMsg::Sending(Sending {
+            xfer: 1,
+            name: "bad.bin".into(),
+            size: 4,
+        }),
+    )
+    .await
+    .unwrap();
+    send_data(&mut host, 1, 0, b"abcd").await;
+    write_msg(&mut host, &done(1, b"abce")).await.unwrap();
+    loop {
+        match next(&mut host).await {
+            Some(SvcMsg::Credit { xfer: 1, .. }) => {}
+            Some(SvcMsg::Cancel(cancel)) => {
+                assert_eq!((cancel.xfer, cancel.reason), (1, reason::CORRUPT));
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let failed = loop {
+        let row = transfer(&mut v.events).await;
+        if !matches!(row.state, TransferState::Queued | TransferState::Running) {
+            break row;
+        }
+    };
+    assert_eq!(failed.state, TransferState::Failed(reason::CORRUPT));
+    settled().await;
+
+    v.ops.send(ViewerOp::Download(6)).await.unwrap();
+    assert_eq!(next(&mut host).await, Some(get(2, 6)));
+    write_msg(
+        &mut host,
+        &SvcMsg::Sending(Sending {
+            xfer: 2,
+            name: "half.bin".into(),
+            size: 100_000,
+        }),
+    )
+    .await
+    .unwrap();
+    send_data(&mut host, 2, 0, &[3; 10_000]).await;
+    write_msg(
+        &mut host,
+        &SvcMsg::Cancel(Cancel {
+            xfer: 2,
+            reason: reason::BY_HOST,
+        }),
+    )
+    .await
+    .unwrap();
+    let cancelled = loop {
+        let row = transfer(&mut v.events).await;
+        if !matches!(row.state, TransferState::Queued | TransferState::Running) {
+            break row;
+        }
+    };
+    assert_eq!(cancelled.state, TransferState::Cancelled(reason::BY_HOST));
+    settled().await;
     v.stop.send(()).unwrap();
     assert_eq!(v.task.await.unwrap(), ViewerServicesEnd::Stopped);
 }

@@ -64,9 +64,13 @@ use tornect_proto::services::{
 use tornect_signal::fsm::host::LiveSession;
 
 use super::chat::{self, ChatGate, ChatText, sanitize_peer_text};
+use super::download::{HostDownloadParts, HostDownloads};
+use super::listing::HostListings;
 use super::reader::{CapState, Inbound, ReadEnd, ReaderCounts, read_frames};
 use super::store::{Inbox, InboxLimits};
+use super::transfer::{Ids, late};
 use super::upload::HostUploads;
+use super::window::{CLIPBOARD, Window};
 use super::writer::{LAST_WRITE, Outbox, spawn_writer};
 use super::{
     HostEvent, ServicesEnv, ServicesLimits, ServicesObserver, ServicesPolicy, ServicesSummary,
@@ -499,14 +503,34 @@ impl ServicesHost {
         } = opened;
         let state = Arc::new(CapState::new(caps));
         let (outbox, mut writer) = spawn_writer(wr);
+        let ids = Ids::default();
         let (uploads, mut reports) = HostUploads::new(
             &session_id,
             inbox,
             Arc::clone(&self.observer),
             outbox.clone(),
             welcome.bulk_window,
+            ids.clone(),
             &self.limits,
         );
+        let window = Arc::new(Window::new(welcome.bulk_window));
+        let (downloads, mut sends) = HostDownloads::new(HostDownloadParts {
+            session_id: session_id.clone(),
+            access: Arc::clone(&self.env.access),
+            observer: Arc::clone(&self.observer),
+            outbox: outbox.clone(),
+            window: Arc::clone(&window),
+            ids: ids.clone(),
+            file_max: welcome.file_max,
+            chunk: self.limits.chunk.clamp(1, CHUNK),
+            read_timeout: self.limits.read_timeout,
+            #[cfg(test)]
+            hook: self.env.open_hook.clone(),
+        });
+        let (listings, mut listed) =
+            HostListings::new(Arc::clone(&self.env.access), outbox.clone(), &self.limits);
+        #[cfg(test)]
+        let listings = listings.with_hook(self.env.list_hook.clone());
         // The first frame: nothing else is queued yet.
         outbox.ctrl(SvcMsg::Welcome(welcome));
         let (tx, mut inbound) = mpsc::channel(self.limits.inbound_depth.max(1));
@@ -530,7 +554,11 @@ impl ServicesHost {
             outbox: &outbox,
             chat: ChatGate::new(chat::now()),
             summary: ServicesSummary::default(),
+            ids,
+            window,
             uploads,
+            downloads,
+            listings,
         };
         // The `Close` reason, and whether to write it (not to a viewer that
         // closed, nor on a stream that failed).
@@ -560,6 +588,21 @@ impl ServicesHost {
                         break (code, true);
                     }
                 }
+                Some(opened) = sends.opened.recv() => {
+                    if let Err(code) = served.downloads.on_opened(opened) {
+                        break (code, true);
+                    }
+                }
+                Some(failed) = sends.failed.recv() => {
+                    if let Err(code) = served.downloads.send_failed(failed) {
+                        break (code, true);
+                    }
+                }
+                Some(done) = listed.recv() => {
+                    if let Err(code) = served.listings.done(done) {
+                        break (code, true);
+                    }
+                }
                 Some(op) = ops.recv() => {
                     if let Some(code) = served.on_op(op) {
                         break (code, true);
@@ -580,20 +623,27 @@ impl ServicesHost {
         let Served {
             mut summary,
             mut uploads,
+            mut downloads,
+            mut listings,
             ..
         } = served;
 
         lock(&self.controls).remove(&session_id);
         // Every worker stops first: each deletes what it wrote. One that is
         // putting a verified file in place is past stopping: it lands or
-        // fails, and its report is still handled below.
+        // fails, and its report is still handled below. Files being sent
+        // stop at their next chunk, and a listing at its next entry.
         uploads.stop();
+        downloads.stop(code);
+        listings.stop();
         drop(link);
         reader.abort();
         let _ = writer.close(write_close.then_some(code)).await;
         let settled = uploads.join(&mut reports, self.limits.workers_wait).await;
         summary.files_in = uploads.files_in;
         summary.bytes_in = uploads.bytes_in;
+        summary.files_out = downloads.files_out;
+        summary.bytes_out = downloads.bytes_out;
         let frames = state.counts();
         tracing::info!(
             session = %session_id,
@@ -602,6 +652,8 @@ impl ServicesHost {
             chat_out = summary.chat_out,
             files_in = summary.files_in,
             bytes_in = summary.bytes_in,
+            files_out = summary.files_out,
+            bytes_out = summary.bytes_out,
             dropped = summary.dropped,
             decoded = frames.decoded,
             skipped = frames.skipped,
@@ -642,7 +694,13 @@ struct Served<'a> {
     outbox: &'a Outbox,
     chat: ChatGate,
     summary: ServicesSummary,
+    /// The transfer ids, shared by the uploads and the downloads.
+    ids: Ids,
+    /// The host's sending window: downloads (and the clipboard's text).
+    window: Arc<Window>,
     uploads: HostUploads,
+    downloads: HostDownloads,
+    listings: HostListings,
 }
 
 impl Served<'_> {
@@ -695,31 +753,52 @@ impl Served<'_> {
                 .err()
                 .map(|code| (code, true)),
             SvcMsg::Done(done) => self.uploads.done(done).err().map(|code| (code, true)),
-            SvcMsg::Cancel(cancel) => match self.uploads.cancelled(cancel) {
-                Ok(true) => None,
-                // A download's (not served yet) or one that ended.
-                Ok(false) => self
-                    .uploads
-                    .late(cancel.xfer)
-                    .err()
-                    .map(|code| (code, true)),
-                Err(code) => Some((code, true)),
-            },
-            // Downloads are served from the design's step 17 on: a `Get`
-            // takes its id, and is left unanswered until then.
-            SvcMsg::Get(get) => {
-                if let Err(code) = self.uploads.unserved(get.xfer) {
-                    return Some((code, true));
-                }
-                tracing::trace!(
-                    session = %self.session_id,
-                    "services download not served by this build"
-                );
-                None
+            SvcMsg::Cancel(cancel) => {
+                let ended = match self.uploads.cancelled(cancel) {
+                    Ok(false) => match self.downloads.cancelled(cancel) {
+                        // One that ended lately, or none.
+                        Ok(false) => late(&self.ids, cancel.xfer),
+                        other => other.map(drop),
+                    },
+                    other => other.map(drop),
+                };
+                ended.err().map(|code| (code, true))
             }
-            // The clipboard, listings and the rest of downloads are served
-            // from the design's steps 16–19 on; until then a granted frame
-            // of theirs is read and left unanswered.
+            SvcMsg::Get(get) => {
+                let paused = self.state.paused() & caps::BROWSE != 0;
+                let path = self.listings.path_of(get.handle);
+                self.downloads
+                    .get(get, path, paused)
+                    .err()
+                    .map(|code| (code, true))
+            }
+            SvcMsg::Credit { xfer, upto } => {
+                let credited = if xfer == CLIPBOARD {
+                    // The host's clipboard text (the design's step 18):
+                    // nothing of it is sent yet, so only a credit of nothing
+                    // is in range.
+                    self.window
+                        .credit(CLIPBOARD, upto)
+                        .map_err(|_| reason::PROTOCOL)
+                } else {
+                    self.downloads.credit(xfer, upto)
+                };
+                credited.err().map(|code| (code, true))
+            }
+            SvcMsg::Complete(complete) => self
+                .downloads
+                .complete(complete)
+                .err()
+                .map(|code| (code, true)),
+            SvcMsg::List(list) => {
+                let paused = self.state.paused() & caps::BROWSE != 0;
+                self.listings
+                    .list(list, paused)
+                    .err()
+                    .map(|code| (code, true))
+            }
+            // The clipboard is served from the design's step 18 on; until
+            // then a granted frame of its is read and left unanswered.
             other => {
                 tracing::trace!(
                     session = %self.session_id,
@@ -749,7 +828,10 @@ impl Served<'_> {
                 self.summary.chat_out = self.summary.chat_out.saturating_add(1);
                 None
             }
-            HostOp::Cancel(xfer) => self.uploads.cancel(xfer, reason::BY_HOST).err(),
+            HostOp::Cancel(xfer) => match self.uploads.cancel(xfer, reason::BY_HOST) {
+                Ok(false) => self.downloads.cancel(xfer, reason::BY_HOST).err(),
+                other => other.err(),
+            },
         }
     }
 
@@ -768,11 +850,15 @@ impl Served<'_> {
         if left == before {
             return None;
         }
-        // Running uploads end before the viewer hears the caps, so that each
-        // gets its own reason.
+        // Running transfers end before the viewer hears the caps, so that
+        // each gets its own reason; a listing being read stops.
         if let Err(code) = self.uploads.cancel_all(reason::TURNED_OFF) {
             return Some(code);
         }
+        if let Err(code) = self.downloads.cancel_all(reason::TURNED_OFF) {
+            return Some(code);
+        }
+        self.listings.stop();
         if left == 0 {
             return Some(reason::NOT_OFFERED);
         }

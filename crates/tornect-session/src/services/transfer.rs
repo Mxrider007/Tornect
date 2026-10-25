@@ -12,8 +12,9 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read as _};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
@@ -23,6 +24,7 @@ use tornect_core::files::sanitize_name;
 use tornect_core::trusted::is_invisible_or_control;
 use tornect_proto::services::{Done, SvcMsg, reason};
 
+use super::ViewerEvent;
 use super::window::Window;
 use super::writer::Outbox;
 
@@ -32,6 +34,10 @@ pub(crate) const ENDED_KEPT: usize = 64;
 /// Uploads the host runs at once in a session (design §3.4): a third offer
 /// gets `Cancel{BUSY}`, so the viewer keeps further ones queued.
 pub const MAX_UPLOADS: usize = 2;
+
+/// Downloads the host runs at once in a session (design §3.4): a third
+/// `Get` gets `Cancel{BUSY}`, so the viewer keeps further ones queued.
+pub const MAX_DOWNLOADS: usize = 2;
 
 /// What a name shows when nothing of it is left once sanitised.
 const NO_NAME: &str = "file";
@@ -90,6 +96,30 @@ impl fmt::Debug for Untrusted {
     }
 }
 
+/// A path of this computer, for `sessions.log`'s `file_sent` record only
+/// (design §2.5): its `Debug` prints nothing of it, so that `tracing` never
+/// carries it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HostPath(PathBuf);
+
+impl HostPath {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    /// The path.
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl fmt::Debug for HostPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HostPath(<redacted>)")
+    }
+}
+
 /// Which way a file goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -102,13 +132,14 @@ pub enum Direction {
 /// Where a transfer stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferState {
-    /// Waiting on the viewer for one of the host's [`MAX_UPLOADS`] places:
-    /// nothing was sent yet.
+    /// Waiting on the viewer for one of the host's [`MAX_UPLOADS`] (or
+    /// [`MAX_DOWNLOADS`]) places: nothing was sent or asked for yet.
     Queued,
     /// Offered, or moving.
     Running,
-    /// In place on the receiving side, under this name (the host's stored,
-    /// sanitised name for an upload).
+    /// In place on the receiving side, under this name: the receiver's
+    /// stored, sanitised name (the host's for an upload, the viewer's for a
+    /// download; the host's own row of a download names the file it sent).
     Done {
         /// The name it is stored under.
         stored: Untrusted,
@@ -150,9 +181,14 @@ pub struct TransferRow {
     pub state: TransferState,
 }
 
-/// The transfer ids one end has seen, and the ones that ended lately.
+/// The transfer ids one end has seen, and the ones that ended lately. The
+/// viewer gives the ids of both directions from one count, so each end's
+/// uploads and downloads share one: clones share it.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Ids(Arc<Mutex<Seen>>);
+
 #[derive(Debug, Default)]
-pub(crate) struct Ids {
+struct Seen {
     highest: u32,
     ended: VecDeque<u32>,
 }
@@ -168,37 +204,84 @@ pub(crate) enum Known {
 
 impl Ids {
     /// A new transfer under `xfer`, which must be above every id seen.
-    pub(crate) fn fresh(&mut self, xfer: u32) -> bool {
-        if xfer <= self.highest {
+    pub(crate) fn fresh(&self, xfer: u32) -> bool {
+        let mut seen = self.lock();
+        if xfer <= seen.highest {
             return false;
         }
-        self.highest = xfer;
+        seen.highest = xfer;
         true
     }
 
     /// The next id this end gives out (the viewer's); `None` once they ran
     /// out.
-    pub(crate) fn next(&mut self) -> Option<u32> {
-        let next = self.highest.checked_add(1)?;
-        self.highest = next;
+    pub(crate) fn next(&self) -> Option<u32> {
+        let mut seen = self.lock();
+        let next = seen.highest.checked_add(1)?;
+        seen.highest = next;
         Some(next)
     }
 
     /// Transfer `xfer` ended.
-    pub(crate) fn end(&mut self, xfer: u32) {
-        if self.ended.len() == ENDED_KEPT {
-            self.ended.pop_front();
+    pub(crate) fn end(&self, xfer: u32) {
+        let mut seen = self.lock();
+        if seen.ended.len() == ENDED_KEPT {
+            seen.ended.pop_front();
         }
-        self.ended.push_back(xfer);
+        seen.ended.push_back(xfer);
     }
 
     /// What a frame for `xfer`, which no running transfer has, names.
     pub(crate) fn known(&self, xfer: u32) -> Known {
-        if xfer != 0 && xfer <= self.highest && self.ended.contains(&xfer) {
+        let seen = self.lock();
+        if xfer != 0 && xfer <= seen.highest && seen.ended.contains(&xfer) {
             Known::Ended
         } else {
             Known::Unknown
         }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Seen> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The viewer's row ids ([`TransferRow::xfer`] on the viewer, what
+/// [`ViewerOp::Cancel`](super::ViewerOp::Cancel) names), counting up from 1
+/// over its uploads and downloads alike: clones share the count.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct RowIds(Arc<AtomicU32>);
+
+impl RowIds {
+    /// The next row id; `None` once they ran out.
+    pub(crate) fn next(&self) -> Option<u32> {
+        self.0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+            .ok()
+            .map(|n| n + 1)
+    }
+}
+
+/// What the viewer's uploads and downloads on one stream share.
+#[derive(Debug, Clone)]
+pub(crate) struct ViewerShared {
+    /// The stream's writer.
+    pub(crate) outbox: Outbox,
+    /// Where the rows go.
+    pub(crate) events: mpsc::Sender<ViewerEvent>,
+    /// The row ids.
+    pub(crate) rows: RowIds,
+    /// The wire ids.
+    pub(crate) ids: Ids,
+}
+
+/// What a frame for transfer `xfer`, which no running transfer of a kind
+/// has, does: a late frame of one that ended is dropped, anything else is a
+/// protocol error.
+pub(crate) fn late(ids: &Ids, xfer: u32) -> Result<(), u16> {
+    match ids.known(xfer) {
+        Known::Ended => Ok(()),
+        Known::Unknown => Err(reason::PROTOCOL),
     }
 }
 
@@ -404,7 +487,7 @@ mod tests {
     /// known as ended, older ones and unseen ones are not.
     #[test]
     fn ids_count_up_and_remember_the_last_ended_ones() {
-        let mut ids = Ids::default();
+        let ids = Ids::default();
         assert!(ids.fresh(1));
         assert!(!ids.fresh(1));
         assert!(ids.fresh(5));
@@ -421,9 +504,17 @@ mod tests {
         assert_eq!(ids.known(5), Known::Unknown, "ended too long ago");
         assert_eq!(ids.known(6), Known::Ended);
 
-        let mut mine = Ids::default();
+        let mine = Ids::default();
         assert_eq!(mine.next(), Some(1));
         assert_eq!(mine.next(), Some(2));
+        let shared = mine.clone();
+        assert_eq!(shared.next(), Some(3), "clones share the count");
+        assert!(!mine.fresh(3));
+        shared.end(3);
+        assert_eq!(mine.known(3), Known::Ended);
+
+        let rows = RowIds::default();
+        assert_eq!((rows.next(), rows.clone().next()), (Some(1), Some(2)));
     }
 
     async fn next_msg(rd: &mut tokio::io::DuplexStream) -> Option<SvcMsg> {
@@ -511,5 +602,69 @@ mod tests {
                 "{written} bytes announced as {announced}"
             );
         }
+    }
+
+    /// A read that does not return within the read timeout fails the
+    /// transfer with `IO` and sends nothing more; the reader stops once its
+    /// read returns.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_that_stalls_fails_with_io() {
+        /// The bytes the stalled read waits for, written however the test
+        /// ends, so that the runtime's end does not wait on the reader for
+        /// good: one more than the file's size, so that the reader's look
+        /// past the size returns too (its chunk may still be taken, the
+        /// failure's task not yet gone).
+        struct Feed(File);
+        impl Drop for Feed {
+            fn drop(&mut self) {
+                let _ = self.0.write_all(&[9; 9]);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("stalls");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Read and write ends at once (no open blocks): a read waits for
+        // bytes that only the test writes.
+        let file = File::options().read(true).write(true).open(&fifo).unwrap();
+        let feed = Feed(File::options().write(true).open(&fifo).unwrap());
+        let (mut rd, wr) = tokio::io::duplex(1 << 20);
+        let (outbox, _writer) = spawn_writer(wr);
+        let window = Arc::new(Window::new(u32::try_from(CHUNK).unwrap()));
+        window.open(3);
+        let (failed, mut failures) = mpsc::unbounded_channel();
+        let _out = Outgoing::start(
+            3,
+            file,
+            8,
+            CHUNK,
+            Arc::clone(&window),
+            outbox,
+            Duration::from_millis(200),
+            failed,
+        );
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), failures.recv()).await,
+            Ok(Some(SendFailed {
+                xfer: 3,
+                reason: reason::IO
+            }))
+        );
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        // The read returns now; nothing of it is sent.
+        drop(feed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), next_msg(&mut rd))
+                .await
+                .is_err()
+        );
+        assert_eq!(window.in_flight(), 0);
     }
 }

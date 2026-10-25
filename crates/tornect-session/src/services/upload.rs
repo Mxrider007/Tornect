@@ -29,8 +29,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,24 +39,15 @@ use tornect_proto::services::{
     Accepted, Cancel, Complete, Done, MAX_NAME_BYTES, Offer, SvcMsg, Welcome, reason,
 };
 
-use super::browse::{Access, code_of};
+use super::browse::{Access, open_file};
 use super::store::{Fed, Inbox, Receiving, Work, Worked, WorkerEvent, spawn_receiver};
 use super::transfer::{
-    Direction, Ids, Known, MAX_UPLOADS, Outgoing, SendFailed, TransferRow, TransferState, Untrusted,
+    Direction, Ids, MAX_UPLOADS, Outgoing, RowIds, SendFailed, TransferRow, TransferState,
+    Untrusted, ViewerShared, late,
 };
 use super::window::{Inflow, Window};
 use super::writer::Outbox;
 use super::{HostEvent, ServicesLimits, ServicesObserver, ViewerEvent};
-
-/// What a frame for transfer `xfer`, which no running upload has, does: a
-/// late frame of one that ended is dropped, anything else is a protocol
-/// error.
-fn late(ids: &Ids, xfer: u32) -> Result<(), u16> {
-    match ids.known(xfer) {
-        Known::Ended => Ok(()),
-        Known::Unknown => Err(reason::PROTOCOL),
-    }
-}
 
 // --- The host's end ----------------------------------------------------------
 
@@ -103,14 +93,15 @@ pub(crate) struct HostUploads {
 
 impl HostUploads {
     /// The uploads of session `session_id` into `inbox` (`None` without
-    /// `UPLOAD`), whose viewer keeps to `window`; the workers' reports come
-    /// on the receiver returned.
+    /// `UPLOAD`), whose viewer keeps to `window`, under the stream's transfer
+    /// `ids`; the workers' reports come on the receiver returned.
     pub(crate) fn new(
         session_id: &str,
         inbox: Option<Inbox>,
         observer: Arc<dyn ServicesObserver>,
         outbox: Outbox,
         window: u32,
+        ids: Ids,
         limits: &ServicesLimits,
     ) -> (Self, mpsc::UnboundedReceiver<WorkerEvent>) {
         let (events, reports) = mpsc::unbounded_channel();
@@ -128,7 +119,7 @@ impl HostUploads {
                 depth: usize::try_from(window).unwrap_or(usize::MAX) / chunk + 1,
                 running: HashMap::new(),
                 stopping: HashSet::new(),
-                ids: Ids::default(),
+                ids,
                 workers: JoinSet::new(),
                 events,
                 files_in: 0,
@@ -258,21 +249,6 @@ impl HostUploads {
             self.ended(cancel.xfer, &up, code);
         }
         Ok(true)
-    }
-
-    /// Whether `xfer` is an id this end saw end lately, or `Err(PROTOCOL)`.
-    pub(crate) fn late(&self, xfer: u32) -> Result<(), u16> {
-        late(&self.ids, xfer)
-    }
-
-    /// A transfer this build does not serve yet (a download's `Get`) takes
-    /// `xfer`: it must be new, and it ends at once.
-    pub(crate) fn unserved(&mut self, xfer: u32) -> Result<(), u16> {
-        if !self.ids.fresh(xfer) {
-            return Err(reason::PROTOCOL);
-        }
-        self.ids.end(xfer);
-        Ok(())
     }
 
     /// The host's user stops upload `xfer`: `Ok(false)` when no such upload
@@ -557,9 +533,9 @@ pub(crate) struct ViewerUploads {
     file_max: u64,
     chunk: usize,
     read_timeout: Duration,
-    /// Row ids, counting up.
-    next_id: u32,
-    /// Wire ids.
+    /// Row ids, shared with the downloads.
+    rows: RowIds,
+    /// Wire ids, shared with the downloads.
     ids: Ids,
     uploads: HashMap<u32, Up>,
     /// Row ids waiting for a place, in the order they were asked for.
@@ -572,17 +548,22 @@ pub(crate) struct ViewerUploads {
 
 impl ViewerUploads {
     /// The uploads of a stream the host welcomed with `welcome`, of files
-    /// `access` lets through; what the blocking work and the sending tasks
-    /// report comes on the receivers returned.
+    /// `access` lets through, sent within `window`; what the blocking work
+    /// and the sending tasks report comes on the receivers returned.
     pub(crate) fn new(
-        outbox: Outbox,
-        events: mpsc::Sender<ViewerEvent>,
+        shared: ViewerShared,
         window: Arc<Window>,
         access: Arc<Access>,
         welcome: &Welcome,
         chunk: usize,
         read_timeout: Duration,
     ) -> (Self, ViewerReports) {
+        let ViewerShared {
+            outbox,
+            events,
+            rows,
+            ids,
+        } = shared;
         let (jobs, jobs_rx) = mpsc::unbounded_channel();
         let (failed, failed_rx) = mpsc::unbounded_channel();
         (
@@ -594,8 +575,8 @@ impl ViewerUploads {
                 file_max: welcome.file_max,
                 chunk: chunk.max(1),
                 read_timeout,
-                next_id: 0,
-                ids: Ids::default(),
+                rows,
+                ids,
                 uploads: HashMap::new(),
                 queue: VecDeque::new(),
                 wire: HashMap::new(),
@@ -615,10 +596,9 @@ impl ViewerUploads {
     /// waits for a place. Without `UPLOAD` (`allowed` false) the row fails at
     /// once. Nothing goes to the host for a file refused here.
     pub(crate) fn upload_path(&mut self, path: PathBuf, allowed: bool) {
-        let Some(id) = self.next_id.checked_add(1) else {
+        let Some(id) = self.rows.next() else {
             return;
         };
-        self.next_id = id;
         let raw = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -639,7 +619,7 @@ impl ViewerUploads {
         let jobs = self.jobs.clone();
         let access = Arc::clone(&self.access);
         tokio::task::spawn_blocking(move || {
-            let result = open_upload(&access, &path);
+            let result = open_file(&access, &path).map(|(file, size, _)| (file, size));
             let _ = jobs.send(Job::Opened { id, result });
         });
     }
@@ -647,10 +627,9 @@ impl ViewerUploads {
     /// A file to send that cannot be named (a local handle that is unknown
     /// or evicted): its row fails at once with `code`, and nothing is sent.
     pub(crate) fn refuse(&mut self, code: u16) {
-        let Some(id) = self.next_id.checked_add(1) else {
+        let Some(id) = self.rows.next() else {
             return;
         };
-        self.next_id = id;
         let up = Up {
             name: Untrusted::file_name(""),
             size: 0,
@@ -817,11 +796,6 @@ impl ViewerUploads {
         Ok(true)
     }
 
-    /// Whether wire id `xfer` ended lately, or `Err(PROTOCOL)`.
-    pub(crate) fn late(&self, xfer: u32) -> Result<(), u16> {
-        late(&self.ids, xfer)
-    }
-
     /// A sending task failed: the host hears `Cancel` with its reason.
     pub(crate) fn send_failed(&mut self, failed: SendFailed) -> Result<(), u16> {
         let Some(&id) = self.wire.get(&failed.xfer) else {
@@ -937,25 +911,6 @@ fn row_of(id: u32, up: &Up, state: TransferState) -> TransferRow {
         done: up.credited,
         state,
     }
-}
-
-/// Open the file at `path` to send it: it must pass `access` (the design's
-/// §5.2 rules: `NOT_FOUND`, `DENIED`), and the canonical path that passed is
-/// the one opened: a regular file (checked before the open, so that a pipe
-/// never blocks it, and again on the open file), and its size; a name over
-/// the wire's bound is cut later by the name's sanitising.
-fn open_upload(access: &Access, path: &Path) -> Result<(File, u64), u16> {
-    let code = |e: io::Error| code_of(&e);
-    let canonical = access.check(path)?;
-    if !std::fs::metadata(&canonical).map_err(code)?.is_file() {
-        return Err(reason::NOT_A_FILE);
-    }
-    let file = File::open(&canonical).map_err(code)?;
-    let meta = file.metadata().map_err(code)?;
-    if !meta.is_file() {
-        return Err(reason::NOT_A_FILE);
-    }
-    Ok((file, meta.len()))
 }
 
 // The name the viewer offers is its own file's, sanitised: never more than

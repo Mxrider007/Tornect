@@ -222,6 +222,11 @@ impl Inbox {
         }
     }
 
+    /// The folder files land in.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// The same inbox, with `mark` writing each part file's mark of origin.
     #[cfg(test)]
     pub(crate) fn with_mark(mut self, mark: MarkFn) -> Self {

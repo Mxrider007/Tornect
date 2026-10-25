@@ -42,17 +42,32 @@
 //! the one opened. The viewer judges each file it sends by its own
 //! [`Access`] before anything goes out.
 //!
+//! The viewer browses the host's files by handle (§3.5, §5.2): a `List`
+//! names a folder's handle (`0`, the places) and the host answers one page,
+//! within the page budget; the viewer asks for the next page only once it
+//! has the one before, so a large folder never fills the stream. One listing
+//! is read at a time, on a blocking worker bounded in entries and in time,
+//! and at most [`LIST_RATE`] first pages a second; more get
+//! `ListFailed{BUSY}`. A `Get` names a file's handle: the host checks the
+//! path again, opens the canonical one read-only within the read timeout, and
+//! sends `Sending`, the bytes within the bulk window as the viewer credits
+//! them, and `Done` with their SHA-256. The viewer takes them into its own
+//! `<Downloads>/Tornect` the way the host's inbox takes an upload and says
+//! `Complete` once the file is in place; the host is told the file sent only
+//! then. At most [`MAX_DOWNLOADS`] files are sent at once per stream.
+//!
 //! The stream is built in the design's steps: this build has the bind, the
-//! live wait, the caps, chat both ways, uploads, the viewer's own file
-//! browser and the close paths. Browsing the host's files, downloads, the
-//! clipboard and the lock pause come with the design's steps 17–19; until
-//! then their frames, when granted, are read and left unanswered, and a
-//! granted clipboard link is held inactive, so the backend reads and sets
-//! nothing.
+//! live wait, the caps, chat both ways, uploads, browsing the host's files
+//! and downloads, the viewer's own file browser and the close paths. The
+//! clipboard and the lock pause come with the design's steps 18 and 19;
+//! until then clipboard frames, when granted, are read and left unanswered,
+//! and a granted clipboard link is held inactive, so the backend reads and
+//! sets nothing.
 //!
 //! [`MediaHost`]: crate::MediaHost
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tornect_core::session_log::SessionMode;
@@ -60,7 +75,9 @@ use tornect_proto::services::caps;
 
 pub mod browse;
 pub mod chat;
+mod download;
 mod host;
+mod listing;
 mod reader;
 mod store;
 mod transfer;
@@ -77,9 +94,12 @@ pub use browse::{
 };
 pub use chat::{CHAT_BURST, CHAT_RATE, ChatText, sanitize_peer_text};
 pub use host::{ServicesHost, ServicesOutcome, refuse};
+pub use listing::LIST_RATE;
 pub use reader::ReaderCounts;
 pub use store::{FreeSpaceFn, RECHECK_FREE_EVERY};
-pub use transfer::{Direction, MAX_UPLOADS, TransferRow, TransferState, Untrusted};
+pub use transfer::{
+    Direction, HostPath, MAX_DOWNLOADS, MAX_UPLOADS, TransferRow, TransferState, Untrusted,
+};
 pub use viewer::{
     ServicesBindError, ServicesBinding, ServicesViewer, ViewerEvent, ViewerLocal, ViewerOp,
     ViewerServicesEnd,
@@ -200,20 +220,37 @@ pub struct ServicesEnv {
     /// The free space of the inbox's disk (`tornect_platform::disk::available`
     /// on a real host). A file is taken only when the free space can be read.
     pub free_space: FreeSpaceFn,
+    /// What a viewer may list and copy of this computer (§5.2): its places
+    /// (the user's folders, plus `/` on Linux or each fixed drive's root on
+    /// Windows) and its deny-list (Tornect's folders of `Paths::discover()`
+    /// and `Paths::platform()`, plus [`system_denied`]).
+    pub access: Arc<Access>,
     /// Holds the upload workers as they finish a file (tests only).
     #[cfg(test)]
     pub(crate) finishing: Option<store::FinishHook>,
+    /// Called by each listing worker as it starts (tests only).
+    #[cfg(test)]
+    pub(crate) list_hook: Option<listing::ListHook>,
+    /// Called by each open of a file to send before it opens it (tests
+    /// only).
+    #[cfg(test)]
+    pub(crate) open_hook: Option<download::OpenHook>,
 }
 
 impl Default for ServicesEnv {
-    /// No inbox, and no free space known.
+    /// No inbox, no free space known, and nothing to list.
     fn default() -> Self {
         Self {
             inbox: None,
             inbox_words: String::new(),
             free_space: store::unknown_free_space(),
+            access: Arc::new(Access::none()),
             #[cfg(test)]
             finishing: None,
+            #[cfg(test)]
+            list_hook: None,
+            #[cfg(test)]
+            open_hook: None,
         }
     }
 }
@@ -223,6 +260,7 @@ impl std::fmt::Debug for ServicesEnv {
         f.debug_struct("ServicesEnv")
             .field("inbox", &self.inbox.is_some())
             .field("inbox_words", &self.inbox_words)
+            .field("access", &self.access)
             .finish_non_exhaustive()
     }
 }
@@ -316,6 +354,19 @@ pub enum HostEvent {
     /// outlasts that, its `Done` row comes after [`HostEvent::Closed`],
     /// whose summary does not count it.
     Transfer(TransferRow),
+    /// The viewer has a whole copy of a file of this computer: it credited
+    /// every byte and said `Complete` (after the file's `Done` row). For
+    /// `sessions.log`'s `file_sent` record only: `path` is this computer's
+    /// own (canonical) path of it, never shown to anyone else nor logged by
+    /// `tracing`.
+    FileSent {
+        /// The transfer (its rows' id).
+        xfer: u32,
+        /// The file's path on this computer.
+        path: HostPath,
+        /// Its size in bytes.
+        bytes: u64,
+    },
     /// The stream ended.
     Closed {
         /// The `Close` reason written or received

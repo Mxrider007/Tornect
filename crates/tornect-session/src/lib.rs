@@ -41,6 +41,7 @@
 //! | a chat line never waits behind file data, and a viewer that stops reading cannot make the host queue without bound (the services design §3.4) | the services writer's queues |
 //! | chat text is shown plain, without control, bidi or invisible characters, at a bounded rate (the services design §3.4, §6.1) | [`services::sanitize_peer_text`], [`services::CHAT_RATE`] |
 //! | Tornect's own files are never listed or sent, by either end: only files under a place, never under Tornect's folders, another Tornect home (its private marker) or a part file, judged on the canonical path, which is the one opened (the services design §5.2) | [`services::Access`], which the viewer applies to every file it sends |
+//! | the viewer never names a path of the host's: it lists and copies by the handles the host gave out, each judged again by the host's [`services::Access`] at its `List` or `Get`; a folder comes one page per `List` the viewer sent, so a large one cannot fill the stream (the services design §3.5, §5.2) | [`services::ServicesHost`]'s listings and downloads |
 //!
 //! Consent gating is structural. A media stream is served only for a session
 //! the FSM accepted, and only to a peer that holds that session's token.

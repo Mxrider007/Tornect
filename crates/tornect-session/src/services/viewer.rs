@@ -39,9 +39,11 @@ use tornect_signal::consent::SessionToken;
 
 use super::browse::{Access, ListingView, LocalFiles};
 use super::chat::{self, ChatGate, ChatText, sanitize_peer_text};
+use super::download::{DownloadsFolder, ViewerDownloads};
+use super::listing::{Answer, ViewerListings};
 use super::reader::{CapState, Inbound, ReadEnd, read_frames};
-use super::store::{FreeSpaceFn, unknown_free_space};
-use super::transfer::TransferRow;
+use super::store::{FreeSpaceFn, Inbox, InboxLimits, unknown_free_space};
+use super::transfer::{Ids, RowIds, TransferRow, ViewerShared, late};
 use super::upload::ViewerUploads;
 use super::window::{CLIPBOARD, Window};
 use super::writer::spawn_writer;
@@ -185,6 +187,19 @@ pub enum ViewerOp {
     /// [`ViewerOp::UploadPath`] does; an unknown handle fails its row with
     /// `NOT_FOUND`.
     UploadLocal(u32),
+    /// List the host's folder with this handle (0: the host's places): its
+    /// pages come as [`ViewerEvent::Listing`] with `remote` true, each next
+    /// one asked for without a word from the user, or a
+    /// [`ViewerEvent::ListFailed`]. A folder opened while another is being
+    /// listed replaces it: only the last one opened is shown.
+    OpenRemote(u32),
+    /// Copy the host's file with this handle into [`ViewerLocal::downloads`],
+    /// reported as [`ViewerEvent::Transfer`] rows (`Direction::FromHost`)
+    /// under an id of its own. At most
+    /// [`MAX_DOWNLOADS`](super::MAX_DOWNLOADS) are asked for at once and the
+    /// others wait, in order. Without `BROWSE` the row fails at once with
+    /// `NOT_OFFERED`, and without a downloads folder with `IO`.
+    Download(u32),
     /// Stop the transfer whose row has this id.
     Cancel(u32),
 }
@@ -317,23 +332,59 @@ where
         F: Future<Output = ()>,
     {
         let Self { rd, wr, welcome } = self;
-        let ViewerLocal { access, limits, .. } = local;
+        let ViewerLocal {
+            downloads: downloads_dir,
+            access,
+            free_space,
+            max_file,
+            keep_free,
+            limits,
+        } = local;
         let state = Arc::new(CapState::new(welcome.caps));
         let (outbox, mut writer) = spawn_writer(wr);
         let (tx, mut inbound) = mpsc::channel(INBOUND_DEPTH);
         let reader = tokio::spawn(read_frames(rd, Side::Host, Arc::clone(&state), tx));
         let mut chat_gate = ChatGate::new(chat::now());
         let window = Arc::new(Window::new(welcome.bulk_window));
+        let chunk = limits.chunk.clamp(1, CHUNK);
+        let shared = ViewerShared {
+            outbox: outbox.clone(),
+            events: events.clone(),
+            rows: RowIds::default(),
+            ids: Ids::default(),
+        };
         let (mut files, mut local_done) = LocalFiles::new(Arc::clone(&access), &limits);
         let (mut uploads, mut reports) = ViewerUploads::new(
-            outbox.clone(),
-            events.clone(),
+            shared.clone(),
             Arc::clone(&window),
             access,
             &welcome,
-            limits.chunk.clamp(1, CHUNK),
+            chunk,
             limits.read_timeout,
         );
+        let inbox = downloads_dir.map(|dir| {
+            Inbox::new(
+                dir,
+                InboxLimits {
+                    max_file,
+                    // The viewer's user chose each file: only this computer's
+                    // own largest file and free-space floor hold.
+                    quota: u64::MAX,
+                    files: u32::MAX,
+                    keep_free,
+                    min_charge: 0,
+                    recheck_every: limits.recheck_free_every,
+                },
+                free_space,
+            )
+        });
+        let (mut downloads, mut arriving) = ViewerDownloads::new(
+            shared.clone(),
+            DownloadsFolder { inbox, chunk },
+            welcome.bulk_window,
+        );
+        let mut remote = ViewerListings::new(outbox.clone(), limits.max_entries);
+        let ids = shared.ids;
         let emit = |event: ViewerEvent| {
             if events.try_send(event).is_err() {
                 tracing::debug!("a services event was dropped: nothing reads them");
@@ -363,10 +414,20 @@ where
                         if news.caps & caps::UPLOAD == 0 {
                             uploads.turned_off();
                         }
+                        let listing = news.caps & caps::BROWSE == 0 && remote.turned_off();
+                        if news.caps & caps::BROWSE == 0 {
+                            downloads.turned_off();
+                        }
                         emit(ViewerEvent::Caps {
                             caps: news.caps,
                             paused: news.paused,
                         });
+                        if listing {
+                            emit(ViewerEvent::ListFailed {
+                                remote: true,
+                                reason: reason::TURNED_OFF,
+                            });
+                        }
                         Ok(())
                     }
                     Inbound::Frame(SvcMsg::Chat(Chat { text })) => {
@@ -389,15 +450,39 @@ where
                         }
                     }
                     Inbound::Frame(SvcMsg::Complete(complete)) => uploads.complete(complete),
-                    Inbound::Frame(SvcMsg::Cancel(cancel)) => {
-                        let xfer = cancel.xfer;
-                        match uploads.cancelled(cancel) {
-                            // Downloads come with the design's step 17.
-                            Ok(false) => uploads.late(xfer),
-                            other => other.map(|_| ()),
-                        }
+                    Inbound::Frame(SvcMsg::Cancel(cancel)) => match uploads.cancelled(cancel) {
+                        Ok(false) => match downloads.cancelled(cancel) {
+                            // One that ended lately, or none.
+                            Ok(false) => late(&ids, cancel.xfer),
+                            other => other.map(drop),
+                        },
+                        other => other.map(drop),
+                    },
+                    Inbound::Frame(SvcMsg::Sending(sending)) => downloads.sending(sending),
+                    Inbound::Frame(SvcMsg::Data {
+                        xfer,
+                        offset,
+                        bytes,
+                    }) => downloads.data(xfer, offset, bytes),
+                    Inbound::Frame(SvcMsg::Done(done)) => downloads.done(done),
+                    Inbound::Frame(SvcMsg::Listing(listing)) => {
+                        remote.listing(&listing).map(|answer| match answer {
+                            Answer::Page(view) => emit(ViewerEvent::Listing { remote: true, view }),
+                            Answer::Failed(reason) => {
+                                emit(ViewerEvent::ListFailed { remote: true, reason });
+                            }
+                            Answer::Stale => {}
+                        })
                     }
-                    // Served from the design's steps 16–19 on.
+                    Inbound::Frame(SvcMsg::ListFailed(failed)) => {
+                        remote.failed(failed).map(|answer| match answer {
+                            Answer::Failed(reason) => {
+                                emit(ViewerEvent::ListFailed { remote: true, reason });
+                            }
+                            Answer::Page(_) | Answer::Stale => {}
+                        })
+                    }
+                    // The clipboard is served from the design's step 18 on.
                     Inbound::Frame(other) => {
                         tracing::trace!(ty = other.ty(), "services frame not served by this build");
                         Ok(())
@@ -423,6 +508,7 @@ where
                 }
                 Some(job) = reports.jobs.recv() => uploads.on_job(job),
                 Some(failed) = reports.failed.recv() => uploads.send_failed(failed),
+                Some(report) = arriving.recv() => downloads.on_worker(report),
                 Some(op) = ops.recv() => match op {
                     ViewerOp::Chat(text) => {
                         if state.left() & caps::CHAT == 0 {
@@ -462,7 +548,26 @@ where
                         }
                         Ok(())
                     }
-                    ViewerOp::Cancel(id) => uploads.cancel(id),
+                    ViewerOp::OpenRemote(folder) => {
+                        if state.left() & caps::BROWSE == 0 {
+                            emit(ViewerEvent::ListFailed {
+                                remote: true,
+                                reason: reason::NOT_OFFERED,
+                            });
+                            Ok(())
+                        } else {
+                            remote.open(folder)
+                        }
+                    }
+                    ViewerOp::Download(handle) => downloads.download(
+                        handle,
+                        remote.file(handle).cloned(),
+                        state.left() & caps::BROWSE != 0,
+                    ),
+                    // Row ids are shared: one of the two has it.
+                    ViewerOp::Cancel(id) => uploads
+                        .cancel(id)
+                        .and_then(|()| downloads.cancel(id).map(drop)),
                 },
             };
             if let Err(code) = step {
@@ -476,10 +581,14 @@ where
             ViewerServicesEnd::Io => reason::IO,
         };
         // Stops every sending task before the writer's end drops their
-        // queued data.
+        // queued data, and every receiving worker: each deletes what it
+        // wrote, and is waited for, so that no partial file of the stream is
+        // left once `run` returns (a file already being put in place lands).
         uploads.end_all(ended);
         drop(uploads);
+        downloads.end_all(ended);
         let _ = writer.close(close).await;
+        downloads.join(&mut arriving, limits.workers_wait).await;
         if end != ViewerServicesEnd::Stopped {
             emit(ViewerEvent::Closed(ended));
         }

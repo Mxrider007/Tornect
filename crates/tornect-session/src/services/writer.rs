@@ -38,10 +38,9 @@ pub(crate) const LAST_WRITE: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub(crate) struct Outbox {
     ctrl: mpsc::Sender<SvcMsg>,
-    // The listing and clipboard queues are fed by the later services steps
-    // (the design's steps 17–18); the writer drains them already.
-    #[cfg_attr(not(test), allow(dead_code))]
     list: mpsc::Sender<SvcMsg>,
+    // The clipboard queue is fed by the design's step 18; the writer drains
+    // it already.
     #[cfg_attr(not(test), allow(dead_code))]
     clip: mpsc::Sender<SvcMsg>,
     data: mpsc::Sender<SvcMsg>,
@@ -54,10 +53,11 @@ impl Outbox {
         self.ctrl.try_send(msg).is_ok()
     }
 
-    /// Queue a `Listing` page, waiting for the one before it to be written.
-    #[cfg(test)]
-    pub(crate) async fn list(&self, msg: SvcMsg) -> bool {
-        self.list.send(msg).await.is_ok()
+    /// Queue a `Listing` page without waiting; `false` when the page before
+    /// it is still queued (a viewer that pulls each page after it read the
+    /// one before never meets that) or the writer is gone.
+    pub(crate) fn try_list(&self, msg: SvcMsg) -> bool {
+        self.list.try_send(msg).is_ok()
     }
 
     /// Queue a clipboard frame, waiting for room.
@@ -279,14 +279,9 @@ mod tests {
                 }))
                 .await
         );
-        assert!(
-            outbox
-                .list(SvcMsg::ListFailed(tornect_proto::services::ListFailed {
-                    req: 1,
-                    reason: 9
-                }))
-                .await
-        );
+        let page = |req| SvcMsg::ListFailed(tornect_proto::services::ListFailed { req, reason: 9 });
+        assert!(outbox.try_list(page(1)));
+        assert!(!outbox.try_list(page(2)), "one page is queued at a time");
         assert!(outbox.ctrl(SvcMsg::Caps(Caps { caps: 1, paused: 0 })));
         let mut types = Vec::new();
         for _ in 0..4 {
