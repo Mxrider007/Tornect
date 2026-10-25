@@ -13,7 +13,7 @@ mirrors of GNOME's GitLab, branch `gnome-50` (GNOME 50, the dev VM's desktop) an
 day; the portal's interface documentation (`doc-org.freedesktop.portal.Clipboard.html`) fetched the same day. The
 xdg-desktop-portal frontend's source could not be fetched here. Nothing below was run against a desktop: gates G1
 and G2 (design §11) and the rest of §R1.7 are NEEDS-DEVICE(gnome-wayland) rows of `docs/VERIFICATION.md`, and
-the coordinator's switch `[services] wayland_clipboard` (default off) keeps the portal request as it was until
+the switch `[services] wayland_clipboard` (default off, decision M1-76) keeps the portal request as it was until
 they pass.
 
 ### R1.1 The request and the restore token (gate G1, from source)
