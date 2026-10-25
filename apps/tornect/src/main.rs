@@ -1219,7 +1219,10 @@ fn cmd_doctor(paths: &Paths) -> anyhow::Result<()> {
         println!("session: {session} ({desktop})");
     }
     let desktop = tornect_session::DesktopBackend::detect();
-    for line in tor_cmd::capture_lines(paths, &desktop) {
+    // A config that does not load is reported below; its grant lines are
+    // the defaults'.
+    let loaded = Config::load(&paths.config_file()).unwrap_or_default();
+    for line in tor_cmd::capture_lines(paths, &loaded, &desktop) {
         println!("{line}");
     }
     if let Some(line) = tor_cmd::screens_line(&desktop) {

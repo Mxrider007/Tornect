@@ -1792,7 +1792,8 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
     let media = Arc::new(MediaHost::new(
         Arc::new(crate::admin_helper::AdminBackend::new(
             Arc::new(
-                SystemBackend::new(b.source).with_restore_token(b.paths.portal_restore_token()),
+                SystemBackend::new(b.source)
+                    .with_portal(&b.paths, b.cfg.services.wayland_clipboard),
             ),
             Arc::clone(&helpers),
         )),
@@ -2247,11 +2248,14 @@ fn watch_reachability(listener: &OnionListener, shared: Arc<Shared>) -> JoinHand
 }
 
 /// The first-run grant's desktop check: only a Wayland desktop this machine
-/// shares has one.
+/// shares has one. It makes the portal request every session makes, the
+/// clipboard's included with `[services] wayland_clipboard`, and keeps the
+/// grant in that request's file (`token`).
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-fn grant(token: std::path::PathBuf) -> Result<(bool, bool), String> {
+fn grant(token: std::path::PathBuf, clipboard: bool) -> Result<(bool, bool), String> {
     let options = tornect_capture::wayland::WaylandOptions {
         dialog_wait: GRANT_WAIT,
+        clipboard,
         ..tornect_capture::wayland::WaylandOptions::new(Some(token))
     };
     tornect_capture::wayland::grant(&options)
@@ -2260,7 +2264,7 @@ fn grant(token: std::path::PathBuf) -> Result<(bool, bool), String> {
 }
 
 #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
-fn grant(_: std::path::PathBuf) -> Result<(bool, bool), String> {
+fn grant(_: std::path::PathBuf, _: bool) -> Result<(bool, bool), String> {
     Err("this desktop needs no grant".to_owned())
 }
 
@@ -2596,7 +2600,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
             granted = async { granting.as_mut().expect("guarded").await }, if granting.is_some() => {
                 granting = None;
                 let outcome = granted.unwrap_or_else(|e| Err(e.to_string()));
-                let token = b.paths.portal_restore_token();
+                let token = crate::host::portal_token(&b.paths, &b.cfg);
                 b.shared.update(|m| {
                     let Some(setup) = &mut m.setup else { return };
                     setup.busy = false;
@@ -2697,8 +2701,11 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                                     setup.note = None;
                                 }
                             });
-                            let token = b.paths.portal_restore_token();
-                            granting = Some(tokio::task::spawn_blocking(move || grant(token)));
+                            let token = crate::host::portal_token(&b.paths, &b.cfg);
+                            let clipboard = b.cfg.services.wayland_clipboard;
+                            granting = Some(tokio::task::spawn_blocking(move || {
+                                grant(token, clipboard)
+                            }));
                         }
                     }
                     Command::Ping(id) => {
@@ -2898,7 +2905,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                         }
                     }
                     Command::Revoke => {
-                        let token = b.paths.portal_restore_token();
+                        let token = crate::host::portal_token(&b.paths, &b.cfg);
                         let removed = match std::fs::remove_file(&token) {
                             Ok(()) => Ok(()),
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

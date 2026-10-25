@@ -376,6 +376,43 @@ pub fn this_is_the_window_host() {
     WINDOW_HOST.store(true, Ordering::SeqCst);
 }
 
+/// Whether this process's host asks the Wayland portal for the desktop's
+/// clipboard (`[services] wayland_clipboard`), set by [`wire_window`] from its
+/// config: which restore token the readiness row "capture/input" looks for.
+/// One host per process (the host lock), as with the window host's fact.
+static PORTAL_CLIPBOARD: AtomicBool = AtomicBool::new(false);
+
+/// The restore token of the portal request a host with `cfg` makes: with
+/// `[services] wayland_clipboard` the clipboard request's own file, else the
+/// file from before the switch (`Paths::portal_restore_token_for`). Every
+/// place that opens, grants, revokes or reports the desktop's grant names it
+/// through here, so they all agree with the request.
+pub fn portal_token(paths: &Paths, cfg: &Config) -> std::path::PathBuf {
+    paths.portal_restore_token_for(cfg.services.wayland_clipboard)
+}
+
+/// Delete the screen-sharing grants the portal request of a host with `cfg`
+/// never restores (with `[services] wayland_clipboard` on, the one made
+/// without the clipboard), so no unused bearer grant stays on disk; the
+/// desktop then asks once more. With the switch off there are none, and the
+/// grant on disk is used as before.
+fn forget_retired_grants(paths: &Paths, cfg: &Config) {
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    {
+        let retired =
+            tornect_capture::wayland::forget_retired_tokens(paths, cfg.services.wayland_clipboard);
+        if retired > 0 {
+            tracing::info!(
+                retired,
+                "a screen-sharing grant made without the clipboard was deleted; the desktop asks \
+                 once more"
+            );
+        }
+    }
+    #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+    let _ = (paths, cfg);
+}
+
 /// The "indicator shown" fact of a window host started in background mode
 /// (§B.1.1, decision M1-58): set once this process drew its sharing
 /// indicator's window (the probe right after the main window opens), never
@@ -420,7 +457,7 @@ fn probe_readiness(
         .unwrap_or(false);
     let facts = tornect_platform::readiness::facts_now(
         &paths.state_dir,
-        &paths.portal_restore_token(),
+        &paths.portal_restore_token_for(PORTAL_CLIPBOARD.load(Ordering::SeqCst)),
         store.keystore_kind() == KeystoreKind::File,
         WINDOW_HOST.load(Ordering::SeqCst),
         indicator.map(IndicatorShown::is_set),
@@ -602,6 +639,8 @@ pub fn wire_window(
                 .unwrap_or(tornect_core::levels::SENTENCE_STARTED_ELEVATED)
         );
     }
+    PORTAL_CLIPBOARD.store(cfg.services.wayland_clipboard, Ordering::SeqCst);
+    forget_retired_grants(paths, cfg);
     let kill = KillSwitch::new();
     let live = Arc::new(LiveSessions::new());
     let polkit = Arc::new(PolkitRevocation::for_this_host());
@@ -1809,6 +1848,41 @@ mod tests {
             ClientConfig::new(env.identity.id(), "Laptop"),
             deps,
         )
+    }
+
+    /// `[services] wayland_clipboard` off (the default): a host keeps and
+    /// uses the desktop's grant file from before the switch, deletes nothing
+    /// at its start, and its readiness row reads that file, so the portal
+    /// request, the grant and the desktop's dialog are what they were.
+    #[test]
+    fn a_host_with_the_clipboard_switch_off_keeps_the_grant_it_had() {
+        let env = env();
+        let cfg = Config::default();
+        assert!(!cfg.services.wayland_clipboard, "off by default");
+        let today = env.paths.portal_restore_token();
+        assert_eq!(portal_token(&env.paths, &cfg), today);
+        std::fs::write(&today, "a grant from before the switch").unwrap();
+        // A clipboard grant made while the switch was on is not this
+        // request's either, and is left to the switch's next turn.
+        let with = env.paths.portal_restore_token_for(true);
+        std::fs::write(&with, "a grant with the clipboard").unwrap();
+        let wiring = wire(
+            &env.paths,
+            &cfg,
+            Arc::clone(&env.identity),
+            [9; 32],
+            Arc::new(ScriptedConsent::new()),
+            media(),
+            ControlChannel::default(),
+        )
+        .unwrap();
+        assert!(
+            today.exists(),
+            "the grant from before the switch was deleted"
+        );
+        assert!(with.exists());
+        assert!(!PORTAL_CLIPBOARD.load(Ordering::SeqCst));
+        drop(wiring);
     }
 
     /// The FSM audits into the host's `sessions.log`, and a host whose store

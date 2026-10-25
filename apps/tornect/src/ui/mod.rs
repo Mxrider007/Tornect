@@ -179,7 +179,7 @@ fn start(paths: &Paths, opts: &GuiOpts) -> anyhow::Result<Start> {
         && opts.source == Source::Desktop
         && DesktopBackend::detect() == DesktopBackend::Wayland)
         .then(|| {
-            let token_file = paths.portal_restore_token();
+            let token_file = crate::host::portal_token(paths, &cfg);
             Setup {
                 granted: token_file.exists(),
                 token_file,

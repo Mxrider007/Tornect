@@ -155,9 +155,11 @@ fn describe_source(source: Source, desktop: &DesktopBackend) -> String {
 
 /// `tornect doctor`'s lines about capture: the backend a host would share its
 /// desktop with here (SLICE-C3 C3-5), and on Wayland the file that holds the
-/// desktop's remembered grant, whose deletion revokes it. The path is printed
-/// for the owner and never logged.
-pub(crate) fn capture_lines(paths: &Paths, desktop: &DesktopBackend) -> Vec<String> {
+/// desktop's remembered grant, whose deletion revokes it: the file of the
+/// portal request a host with `cfg` makes (`[services] wayland_clipboard`),
+/// with a line saying the clipboard is asked for when it is. The path is
+/// printed for the owner and never logged.
+pub(crate) fn capture_lines(paths: &Paths, cfg: &Config, desktop: &DesktopBackend) -> Vec<String> {
     let mut lines = vec![match desktop {
         DesktopBackend::Wayland => {
             "capture: wayland (the RemoteDesktop portal and PipeWire)".to_owned()
@@ -167,13 +169,19 @@ pub(crate) fn capture_lines(paths: &Paths, desktop: &DesktopBackend) -> Vec<Stri
         DesktopBackend::Unavailable(why) => format!("capture: none ({why})"),
     }];
     if *desktop == DesktopBackend::Wayland {
-        let token = paths.portal_restore_token();
+        let token = crate::host::portal_token(paths, cfg);
         lines.push(format!(
             "  desktop grant: {} [{}]; delete it to revoke the remembered grant, and the \
              desktop asks again at the next session",
             token.display(),
             if token.exists() { "present" } else { "absent" }
         ));
+        if cfg.services.wayland_clipboard {
+            lines.push(
+                "  desktop clipboard: asked for with the screen ([services] wayland_clipboard)"
+                    .to_owned(),
+            );
+        }
     }
     lines
 }
@@ -327,7 +335,7 @@ async fn run_host(
     let helpers = crate::admin_helper::AdminHelpers::new();
     let media = Arc::new(MediaHost::new(
         Arc::new(crate::admin_helper::AdminBackend::new(
-            Arc::new(SystemBackend::new(source).with_restore_token(paths.portal_restore_token())),
+            Arc::new(SystemBackend::new(source).with_portal(paths, cfg.services.wayland_clipboard)),
             Arc::clone(&helpers),
         )),
         Arc::new(CliMedia::new(control.clone())),
@@ -3152,21 +3160,56 @@ mod tests {
     fn doctor_names_the_capture_backend_and_how_to_revoke_the_grant() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(tmp.path());
+        let cfg = Config::default();
         let token = paths.portal_restore_token().display().to_string();
-        let wayland = capture_lines(&paths, &DesktopBackend::Wayland).join("\n");
+        let wayland = capture_lines(&paths, &cfg, &DesktopBackend::Wayland).join("\n");
         assert!(wayland.contains("capture: wayland"), "{wayland}");
         assert!(wayland.contains(&token), "{wayland}");
         assert!(wayland.contains("absent"), "{wayland}");
         assert!(wayland.contains("delete"), "{wayland}");
         std::fs::create_dir_all(&paths.state_dir).unwrap();
         std::fs::write(paths.portal_restore_token(), "t").unwrap();
-        let kept = capture_lines(&paths, &DesktopBackend::Wayland).join("\n");
+        let kept = capture_lines(&paths, &cfg, &DesktopBackend::Wayland).join("\n");
         assert!(kept.contains("present"), "{kept}");
-        let x11 = capture_lines(&paths, &DesktopBackend::X11).join("\n");
+        let x11 = capture_lines(&paths, &cfg, &DesktopBackend::X11).join("\n");
         assert!(x11.contains("capture: x11"), "{x11}");
         assert!(!x11.contains("out of scope"), "{x11}");
-        let none = capture_lines(&paths, &DesktopBackend::Unavailable("no seat".into())).join("\n");
+        let none =
+            capture_lines(&paths, &cfg, &DesktopBackend::Unavailable("no seat".into())).join("\n");
         assert!(none.contains("capture: none (no seat)"), "{none}");
+    }
+
+    /// `[services] wayland_clipboard`: off (the default) `doctor`'s capture
+    /// lines are the two from before the switch, naming the grant file from
+    /// before it; on, they name the clipboard request's own file, which the
+    /// other request's grant never satisfies, and say the clipboard is asked
+    /// for.
+    #[test]
+    fn doctor_names_the_grant_file_of_the_request_the_host_makes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        let mut cfg = Config::default();
+        assert!(!cfg.services.wayland_clipboard, "off by default");
+        let off = capture_lines(&paths, &cfg, &DesktopBackend::Wayland);
+        assert_eq!(off.len(), 2, "{off:?}");
+        assert!(
+            off[1].starts_with(&format!(
+                "  desktop grant: {} [absent]",
+                paths.portal_restore_token().display()
+            )),
+            "{off:?}"
+        );
+        cfg.services.wayland_clipboard = true;
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::write(paths.portal_restore_token(), "made without the clipboard").unwrap();
+        let on = capture_lines(&paths, &cfg, &DesktopBackend::Wayland).join("\n");
+        let with = paths.portal_restore_token_for(true).display().to_string();
+        assert!(on.contains(&format!("{with} [absent]")), "{on}");
+        assert!(on.contains("desktop clipboard: asked for"), "{on}");
+        assert_eq!(
+            crate::host::portal_token(&paths, &cfg),
+            paths.portal_restore_token_for(true)
+        );
     }
 
     /// SLICE-D R2: the first Ctrl-C while the media stream opens and binds
