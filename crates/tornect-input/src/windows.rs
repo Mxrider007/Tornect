@@ -96,8 +96,11 @@ pub fn become_dpi_aware() -> bool {
     awareness == DPI_AWARENESS_PER_MONITOR_AWARE
 }
 
-/// Injects into the interactive desktop of this user session.
-#[derive(Debug, Default)]
+/// Injects into the interactive desktop of this user session. Built only by
+/// [`SendInputSink::new`] and [`SendInputSink::placed`], which both make the
+/// process per-monitor aware first: the mapping is exact only then (decision
+/// M1-75), so there is no `Default`.
+#[derive(Debug)]
 pub struct SendInputSink {
     /// The virtual desktop the session's view addresses, once retargeted.
     expected: Option<Rect>,
@@ -115,6 +118,10 @@ impl SendInputSink {
     /// the part of the virtual desktop the picture shows. Makes the process
     /// per-monitor v2 aware first, whatever ran before; a host that cannot
     /// be says so in its log, since a mixed-DPI desktop then maps inexactly.
+    // No `Default`: building the sink changes the whole process's DPI
+    // awareness, which a `default()` would hide, and a sink that skipped it
+    // would map inexactly on a mixed-DPI desktop.
+    #[allow(clippy::new_without_default)]
     #[must_use]
     pub fn new() -> Self {
         if !become_dpi_aware() {
@@ -123,7 +130,7 @@ impl SendInputSink {
                  differ in scale the pointer can land off the pixel the viewer aims at"
             );
         }
-        Self::default()
+        Self::bare(false)
     }
 
     /// The administrator helper's injector: every position arrives already
@@ -133,9 +140,16 @@ impl SendInputSink {
     #[must_use]
     pub fn placed() -> Self {
         let _ = become_dpi_aware();
+        Self::bare(true)
+    }
+
+    /// A sink of either kind, without the DPI awareness its constructors
+    /// see to: for them, and for the tests that drive the mapping alone.
+    fn bare(placed: bool) -> Self {
         Self {
-            placed: true,
-            ..Self::default()
+            expected: None,
+            placed,
+            unplaced: false,
         }
     }
 
@@ -406,7 +420,7 @@ mod tests {
     }
 
     fn retargeted(space: Rect) -> SendInputSink {
-        let mut sink = SendInputSink::default();
+        let mut sink = SendInputSink::bare(false);
         sink.retarget(&View::Rect {
             shown: space,
             space,
@@ -525,7 +539,7 @@ mod tests {
     fn before_a_retarget_the_host_places_and_the_helper_passes_through() {
         let corner = InputEvent::PointerMove { x: 65535, y: 65535 };
         let odd = Rect::new(-1920, 0, 4481, 1441);
-        let mut host = SendInputSink::default();
+        let mut host = SendInputSink::bare(false);
         let (moved, sent) = drive(&mut host, corner, odd);
         moved.unwrap();
         assert_eq!(landed(&sent, odd), (2559, 1439), "the even part's corner");
@@ -533,10 +547,7 @@ mod tests {
         moved.unwrap();
         assert_eq!(landed(&sent, DESKTOP), (2559, 1439));
 
-        let mut helper = SendInputSink {
-            placed: true,
-            ..SendInputSink::default()
-        };
+        let mut helper = SendInputSink::bare(true);
         let (moved, sent) = drive(&mut helper, corner, odd);
         moved.unwrap();
         assert_eq!(landed(&sent, odd), (2560, 1440), "as the host placed it");
