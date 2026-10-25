@@ -1,6 +1,6 @@
 //! OS session services for Tornect (`docs/PLAN.md` §B.8.8).
 //!
-//! Eleven modules so far:
+//! Fourteen modules so far:
 //!
 //! - [`ipc`] — the owner-only local endpoint of §B.8.7.4 (Unix socket / Windows
 //!   named pipe) that the CLI talks to and the host serves.
@@ -32,10 +32,16 @@
 //!   keyboard hook, the GlobalShortcuts portal on Linux.
 //! - [`readiness`] — the readiness rows of §B.8.7.1 ⑥ that can be read here; the
 //!   others stay `Unknown`.
+//! - [`disk`] — free space for the session services' inbox and the fixed
+//!   drives a Windows host offers to browse (design `services` §5).
+//! - [`lock`] — whether this computer is locked, which pauses the session
+//!   services' files and clipboard (design `services` §2.3): logind's
+//!   `LockedHint` on Linux, the secure-desktop probe on Windows.
+//! - `logind` — Linux: the logind lookups [`polkit`] and [`lock`] share.
 //!
-//! Everything else in §B.8.8 — presence, lock state, keep-awake, wake hooks,
-//! capture-excluded windows and the readiness rows not read yet —
-//! lands at M6. This crate deliberately holds no stubs for them: an absent
+//! Everything else in §B.8.8 — presence, the lock state beyond the services'
+//! pause, keep-awake, wake hooks, capture-excluded windows and the readiness
+//! rows not read yet — lands at M6. This crate deliberately holds no stubs for them: an absent
 //! module is honest, a stub that answers `Ok` is not.
 //!
 //! **Direction.** `tornect-platform` depends on `tornect-core` and never the
@@ -51,12 +57,16 @@
 #![warn(missing_docs)]
 
 pub mod autostart;
+pub mod disk;
 pub mod helper;
 pub mod helper_task;
 pub mod hotkey;
 pub mod install;
 pub mod ipc;
 pub mod levels;
+pub mod lock;
+#[cfg(target_os = "linux")]
+mod logind;
 #[cfg(target_os = "linux")]
 pub mod notify;
 pub mod polkit;

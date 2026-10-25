@@ -873,3 +873,46 @@ impl LogonCheck for LogonUserCheck {
         }
     }
 }
+
+/// The free bytes on the volume that holds `path` which this user may still
+/// write: `GetDiskFreeSpaceExW`'s `lpFreeBytesAvailableToCaller`, which
+/// counts per-user quotas (`docs/research/services.md` R2.5). `path` need
+/// not be a volume's root.
+pub(crate) fn free_bytes_for_caller(path: &Path) -> std::io::Result<u64> {
+    let name = wide(path);
+    if name[..name.len() - 1].contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the path holds a NUL character",
+        ));
+    }
+    let mut free = 0u64;
+    // SAFETY: `name` is NUL-terminated and outlives the call; `free` is a
+    // live `u64` for the call; the two totals are optional (null).
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            name.as_ptr(),
+            &mut free,
+            null_mut(),
+            null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(free)
+}
+
+/// `GetLogicalDrives`: bit 0 is `A:`, bit 25 is `Z:`; 0 on failure.
+pub(crate) fn logical_drives() -> u32 {
+    // SAFETY: plain call.
+    unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() }
+}
+
+/// `GetDriveTypeW` of the root `root` (`C:\`, with its trailing backslash,
+/// as the call requires).
+pub(crate) fn drive_type(root: &str) -> u32 {
+    let name = wide(root);
+    // SAFETY: `name` is NUL-terminated and outlives the call.
+    unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(name.as_ptr()) }
+}

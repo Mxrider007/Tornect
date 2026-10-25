@@ -21,7 +21,8 @@
 //! process: logind's session of this process, or else the user's display
 //! session (what `pkcheck --revoke-temp` resolves when it runs outside a
 //! session: it answered 0 from an SSH-less terminal of the build VM that
-//! belongs to no session). A change is answered by revoking only while
+//! belongs to no session); the lookup is `crate::logind::session_id`, which
+//! the lock probe's shares. A change is answered by revoking only while
 //! remembered approvals exist, so a revocation's own `Changed` never loops.
 
 use std::future::Future;
@@ -158,7 +159,10 @@ impl SystemAuthority {
         let conn = zbus::Connection::system()
             .await
             .map_err(|e| PolkitError(format!("system D-Bus unavailable: {e}")))?;
-        let session_id = session_id(&conn).await?;
+        let session_id =
+            crate::logind::session_id(&conn, std::process::id(), crate::logind::this_uid)
+                .await
+                .map_err(PolkitError)?;
         Ok(Self { conn, session_id })
     }
 
@@ -187,95 +191,6 @@ impl SystemAuthority {
 struct Subject<'a> {
     kind: &'a str,
     details: std::collections::HashMap<&'a str, zbus::zvariant::Value<'a>>,
-}
-
-/// `org.freedesktop.DBus.Properties.Get` of logind object `path`.
-#[cfg(target_os = "linux")]
-async fn logind_property(
-    conn: &zbus::Connection,
-    path: &str,
-    iface: &str,
-    name: &str,
-) -> Result<zbus::zvariant::OwnedValue, PolkitError> {
-    let reply = conn
-        .call_method(
-            Some("org.freedesktop.login1"),
-            path,
-            Some("org.freedesktop.DBus.Properties"),
-            "Get",
-            &(iface, name),
-        )
-        .await
-        .map_err(|e| PolkitError(format!("logind {iface}.{name}: {e}")))?;
-    reply
-        .body()
-        .deserialize::<zbus::zvariant::OwnedValue>()
-        .map_err(|e| PolkitError(format!("logind {iface}.{name}: {e}")))
-}
-
-/// The string inside a property value (a variant of `s`, or a structure
-/// whose first field is one, as `User.Display`'s `(so)`).
-#[cfg(target_os = "linux")]
-fn first_str(value: &zbus::zvariant::Value<'_>) -> Option<String> {
-    use zbus::zvariant::Value;
-    match value {
-        Value::Str(s) => Some(s.to_string()),
-        Value::Value(inner) => first_str(inner),
-        Value::Structure(st) => st.fields().first().and_then(first_str),
-        _ => None,
-    }
-}
-
-#[cfg(target_os = "linux")]
-async fn session_id(conn: &zbus::Connection) -> Result<String, PolkitError> {
-    const LOGIN: &str = "org.freedesktop.login1";
-    const MANAGER_PATH: &str = "/org/freedesktop/login1";
-    const MANAGER: &str = "org.freedesktop.login1.Manager";
-    let by_pid = conn
-        .call_method(
-            Some(LOGIN),
-            MANAGER_PATH,
-            Some(MANAGER),
-            "GetSessionByPID",
-            &(std::process::id(),),
-        )
-        .await;
-    if let Ok(reply) = by_pid
-        && let Ok(path) = reply
-            .body()
-            .deserialize::<zbus::zvariant::OwnedObjectPath>()
-    {
-        let id =
-            logind_property(conn, path.as_str(), "org.freedesktop.login1.Session", "Id").await?;
-        return first_str(&id)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| PolkitError("logind gave no session id".to_owned()));
-    }
-    // Outside a session (a user service, a terminal of no session): the
-    // user's display session, as polkit itself falls back to.
-    let uid = {
-        use std::os::unix::fs::MetadataExt as _;
-        std::fs::metadata("/proc/self")
-            .map_err(|e| PolkitError(format!("reading this process's uid: {e}")))?
-            .uid()
-    };
-    let user = conn
-        .call_method(Some(LOGIN), MANAGER_PATH, Some(MANAGER), "GetUser", &(uid,))
-        .await
-        .map_err(|e| PolkitError(format!("logind GetUser: {e}")))?
-        .body()
-        .deserialize::<zbus::zvariant::OwnedObjectPath>()
-        .map_err(|e| PolkitError(format!("logind GetUser: {e}")))?;
-    let display = logind_property(
-        conn,
-        user.as_str(),
-        "org.freedesktop.login1.User",
-        "Display",
-    )
-    .await?;
-    first_str(&display)
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| PolkitError("this user has no session to revoke approvals in".to_owned()))
 }
 
 #[cfg(target_os = "linux")]
