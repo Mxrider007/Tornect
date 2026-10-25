@@ -55,6 +55,13 @@ fn serve(args: &HelperArgs) -> Exit {
         }
     }
 
+    // Per-monitor v2 before anything else runs here (Windows takes the
+    // setting only before the process has a window), and before the sink
+    // reads the virtual desktop or injects: otherwise Windows virtualizes the
+    // desktop on a mixed-DPI machine and the host's mapping lands off the
+    // pixel, possibly on another monitor (`docs/research/monitors.md` §2).
+    // A helper that is not aware ends before it says it is ready.
+    let dpi_aware = tornect_input::windows::become_dpi_aware();
     let Ok(pipe) = platform::connect_pipe(&args.pipe) else {
         return Exit::NoPipe;
     };
@@ -89,6 +96,12 @@ fn serve(args: &HelperArgs) -> Exit {
         pipe.close();
         return Exit::Unsupported;
     }
+    // The host reads the closed pipe as administrator control not given, at
+    // once; its own injector stays.
+    if !dpi_aware {
+        pipe.close();
+        return Exit::NotDpiAware;
+    }
     if pipe.write_frame(&FromHelper::Ready.encode()).is_err() {
         return Exit::PipeClosed;
     }
@@ -104,13 +117,8 @@ fn serve(args: &HelperArgs) -> Exit {
             return Exit::PipeClosed;
         }
     }
-    // Per-monitor v2 before the sink reads the virtual desktop or injects, as
-    // the host's capture is: otherwise Windows virtualizes the desktop on a
-    // mixed-DPI machine and the host's mapping lands off the pixel
-    // (`docs/research/monitors.md` §2). The sink addresses the whole virtual
-    // desktop; the host's `Viewport` placed every move before it was sent
-    // (decision M1-75).
-    tornect_input::windows::become_dpi_aware();
+    // The sink addresses the whole virtual desktop; the host's `Viewport`
+    // placed every move before it was sent (decision M1-75).
     let sink = tornect_input::windows::SendInputSink::placed();
     let exit = run_helper(
         sink,

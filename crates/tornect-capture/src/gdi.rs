@@ -70,8 +70,15 @@ impl GdiCapture {
     pub fn open() -> Result<Self, CaptureError> {
         // Measure in physical pixels, as the injector addresses them: without
         // per-monitor awareness Windows reports a scaled desktop and `BitBlt`
-        // copies a scaled, partial picture on a high-DPI monitor.
-        tornect_input::windows::become_dpi_aware();
+        // copies a scaled, partial picture on a high-DPI monitor. A process
+        // whose awareness was fixed otherwise still captures; the injector
+        // says so in the log too.
+        if !tornect_input::windows::become_dpi_aware() {
+            tracing::warn!(
+                "this process is not per-monitor DPI aware: on a high-DPI desktop the \
+                 picture can be scaled or partial"
+            );
+        }
         let (_, _, w, h) = virtual_desktop();
         if w <= 0 || h <= 0 {
             return Err(CaptureError::Unavailable(

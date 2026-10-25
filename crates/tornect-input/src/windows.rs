@@ -39,7 +39,9 @@
 use std::sync::Once;
 
 use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_PER_MONITOR_AWARE,
+    GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
+    SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
@@ -66,19 +68,32 @@ const XBUTTON2: i32 = 2;
 
 static DPI_AWARE: Once = Once::new();
 
-/// Make this process per-monitor v2 DPI aware, once. Monitor rectangles, the
-/// virtual desktop's metrics, GDI's blits and `SendInput`'s virtual-desk
-/// coordinates are then all physical pixels; without it Windows virtualizes
-/// them on a high-DPI or mixed-DPI desktop, and the picture, the monitor list
-/// and the pointer disagree (`docs/research/monitors.md` §1–§2). winit sets it
-/// for GUI processes; the CLI host's capture, `doctor` and the administrator
-/// helper have no window and must call this before they measure or inject.
-pub fn become_dpi_aware() {
+/// Make this process per-monitor v2 DPI aware, once, and say whether this
+/// thread is now per-monitor aware. Monitor rectangles, the virtual desktop's
+/// metrics, GDI's blits and `SendInput`'s virtual-desk coordinates are then
+/// all physical pixels; without it Windows virtualizes them on a high-DPI or
+/// mixed-DPI desktop, and the picture, the monitor list and the pointer
+/// disagree (`docs/research/monitors.md` §1–§2). winit sets it for GUI
+/// processes; the CLI host's capture, `doctor`, both injectors and the
+/// administrator helper call this before they measure or inject.
+///
+/// `true` for per-monitor v1 too, which a manifest or an earlier call may
+/// have fixed: it is just as unvirtualized, and only window scaling, which
+/// none of these use, differs. `false` when the awareness was fixed to
+/// unaware or system aware before this call (a manifest, a compatibility
+/// setting, a window created first): the setting call then fails, and only
+/// the check after it tells.
+#[must_use]
+pub fn become_dpi_aware() -> bool {
     DPI_AWARE.call_once(|| {
         // SAFETY: plain call with a documented constant. It fails (FALSE) when
-        // the awareness was already set, by a manifest or by winit, which is fine.
+        // the awareness was already set; the check below tells what it is.
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     });
+    // SAFETY: both calls only read; a context handle is read through the
+    // function Windows provides for it, never by value.
+    let awareness = unsafe { GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) };
+    awareness == DPI_AWARENESS_PER_MONITOR_AWARE
 }
 
 /// Injects into the interactive desktop of this user session.
@@ -97,17 +112,27 @@ pub struct SendInputSink {
 
 impl SendInputSink {
     /// The host's own injector: until a retarget, positions are placed over
-    /// the part of the virtual desktop the picture shows.
+    /// the part of the virtual desktop the picture shows. Makes the process
+    /// per-monitor v2 aware first, whatever ran before; a host that cannot
+    /// be says so in its log, since a mixed-DPI desktop then maps inexactly.
     #[must_use]
     pub fn new() -> Self {
+        if !become_dpi_aware() {
+            tracing::warn!(
+                "this process is not per-monitor DPI aware: on a desktop whose monitors \
+                 differ in scale the pointer can land off the pixel the viewer aims at"
+            );
+        }
         Self::default()
     }
 
     /// The administrator helper's injector: every position arrives already
     /// placed on the whole virtual desktop by the host's `Viewport`, and
-    /// passes through.
+    /// passes through. The helper checks [`become_dpi_aware`] itself, before
+    /// it says it is ready, and ends if it is not aware.
     #[must_use]
     pub fn placed() -> Self {
+        let _ = become_dpi_aware();
         Self {
             placed: true,
             ..Self::default()
@@ -594,5 +619,15 @@ mod tests {
         };
         assert!(sink.retarget(&stream).is_err());
         assert_eq!(sink.expected, Some(DESKTOP));
+    }
+
+    /// The process this test runs in becomes per-monitor aware, and says so
+    /// again on a second call. Wine 10 starts a process per-monitor v1 aware
+    /// and refuses the v2 context (error 87), so here this passes on v1; that
+    /// v2 is taken on Windows is the `rcMonitor` NEEDS-DEVICE row's.
+    #[test]
+    fn the_process_becomes_per_monitor_aware() {
+        assert!(become_dpi_aware());
+        assert!(become_dpi_aware());
     }
 }

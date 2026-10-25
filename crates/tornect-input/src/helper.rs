@@ -148,6 +148,10 @@ pub enum Exit {
     ServerRefused,
     /// This system has no administrator helper.
     Unsupported,
+    /// The helper could not become per-monitor v2 DPI aware, so on a desktop
+    /// whose monitors differ in scale its pointer would land off the pixel
+    /// the host's mapping aims at (decision M1-75).
+    NotDpiAware,
 }
 
 impl Exit {
@@ -166,6 +170,7 @@ impl Exit {
             Self::NoPipe => 21,
             Self::ServerRefused => 22,
             Self::Unsupported => 23,
+            Self::NotDpiAware => 24,
         }
     }
 
@@ -186,6 +191,10 @@ impl Exit {
                 "the process at the other end is not this computer's Tornect host"
             }
             Self::Unsupported => "the administrator helper exists on Windows only",
+            Self::NotDpiAware => {
+                "this process could not become per-monitor DPI aware, so the pointer would \
+                 land off the pixel the viewer aims at"
+            }
         }
     }
 }
@@ -618,6 +627,35 @@ mod tests {
 
     fn frame(f: ToHelper) -> Event {
         Event::Frame(f.encode())
+    }
+
+    /// Each exit has its own code and words, so a console or a crash report
+    /// tells them apart; only a stop by the host is 0.
+    #[test]
+    fn every_exit_has_its_own_code() {
+        let all = [
+            Exit::Stopped,
+            Exit::PipeClosed,
+            Exit::HostExited,
+            Exit::HeartbeatMissed,
+            Exit::HardCap,
+            Exit::Panic,
+            Exit::Foreign,
+            Exit::BadArguments,
+            Exit::NoPipe,
+            Exit::ServerRefused,
+            Exit::Unsupported,
+            Exit::NotDpiAware,
+        ];
+        let codes: std::collections::BTreeSet<_> = all.iter().map(|exit| exit.code()).collect();
+        assert_eq!(codes.len(), all.len());
+        let reasons: std::collections::BTreeSet<_> = all.iter().map(|exit| exit.reason()).collect();
+        assert_eq!(reasons.len(), all.len());
+        assert_eq!(Exit::NotDpiAware.code(), 24);
+        assert!(
+            all.iter()
+                .all(|exit| (exit.code() == 0) == (*exit == Exit::Stopped))
+        );
     }
 
     /// Every exit, each after letting go of everything held: `Stop`, the
