@@ -28,6 +28,12 @@
 //!   clipboard that still holds our text is cleared: the session becomes the
 //!   owner of one Tornect-only type, which mutter's manager does not copy, so
 //!   nothing of the text is left once the session goes.
+//! - **After the link is dropped**, for as long as the session lasts, the
+//!   loop still takes every clipboard signal off the bus: zbus queues 64
+//!   messages per subscription and then stops reading the whole connection,
+//!   which also carries the input calls' answers and the session's `Closed`.
+//!   Nothing is read from the clipboard any more, and a paste of what the
+//!   session set is closed unwritten at once.
 //!
 //! Reads go one at a time (mutter refuses parallel reads); a read given up
 //! closes its pipe at once. Nothing logged names the text, a type or a path.
@@ -376,19 +382,24 @@ impl<C: ClipCalls, S: Stream<Item = Signal> + Unpin> Clip<C, S> {
             return;
         }
         // Owner changes already here count: a copy made after ours is not
-        // cleared.
+        // cleared. Pastes already here stay for [`Clip::drain`], which closes
+        // them unwritten.
         self.collect_ready();
-        while let Some(signal) = self.pending.pop_front() {
-            if let Signal::Owner {
+        let mut ours = self.ours;
+        self.pending.retain(|signal| match signal {
+            Signal::Owner {
                 session,
                 mime_types,
                 session_is_owner,
-            } = signal
-                && session == self.path
-            {
-                self.ours = owner_kind(&mime_types, session_is_owner) == Kind::Ours;
+            } => {
+                if *session == self.path {
+                    ours = owner_kind(mime_types, *session_is_owner) == Kind::Ours;
+                }
+                false
             }
-        }
+            Signal::Transfer { .. } => true,
+        });
+        self.ours = ours;
         self.held = None;
         if !self.ours {
             return;
@@ -637,17 +648,41 @@ impl<C: ClipCalls, S: Stream<Item = Signal> + Unpin> Clip<C, S> {
             tracing::debug!(error = %e, "clipboard: the portal refused the end of a paste");
         }
     }
+
+    /// After [`Clip::finish`], for as long as the session lasts: take every
+    /// signal off the stream, since a subscription nobody reads stops the
+    /// whole connection once zbus's queue for it (64 messages) is full. Owner
+    /// changes are dropped unread; a paste of this session's selection is
+    /// closed unwritten at once (`finish` dropped the text). Never returns.
+    async fn drain(&mut self) -> std::convert::Infallible {
+        debug_assert!(self.finished && self.held.is_none());
+        loop {
+            match next_signal(&mut self.pending, &mut self.signals, self.signals_ended).await {
+                Some(Signal::Transfer {
+                    session,
+                    mime_type,
+                    serial,
+                }) if session == self.path => self.serve(&mime_type, serial).await,
+                Some(_) => {}
+                None => self.signals_ended = true,
+            }
+        }
+    }
 }
 
-/// Serve `clip` until its link is dropped, then nothing: it never returns,
-/// so the portal thread's other work decides when the session ends.
+/// Serve `clip` until its link is dropped, then only drain its signals: it
+/// never returns, so the portal thread's other work decides when the session
+/// ends.
 pub(super) async fn serve<C: ClipCalls, S: Stream<Item = Signal> + Unpin>(
     clip: Option<&mut Clip<C, S>>,
 ) -> std::convert::Infallible {
-    if let Some(clip) = clip {
-        clip.run().await;
+    match clip {
+        Some(clip) => {
+            clip.run().await;
+            clip.drain().await
+        }
+        None => std::future::pending().await,
     }
-    std::future::pending().await
 }
 
 /// The next signal: one taken off early, else the stream's (never, once it
@@ -1379,6 +1414,72 @@ mod tests {
             "{:?}",
             rig.fake.calls()
         );
+    }
+
+    /// After the link is dropped while the session goes on, `serve` keeps
+    /// taking the signals off the stream (an unread zbus subscription stops
+    /// the whole connection once 64 are queued): our text is cleared once,
+    /// nothing is read from the clipboard any more even though the link was
+    /// active and owners keep changing, and every paste (one already waiting
+    /// at the end, and those after it) is closed unwritten and answered
+    /// `false`.
+    #[tokio::test(start_paused = true)]
+    async fn after_the_link_is_dropped_the_signals_are_still_taken_and_nothing_is_read() {
+        let mut rig = rig();
+        rig.past_grace().await;
+        rig.activate().await;
+        rig.link
+            .to_desktop
+            .send_replace(Some(ClipText::new("ours".to_owned()).unwrap()));
+        rig.settle().await;
+        rig.send(ours()).await;
+        let Rig {
+            fake,
+            tx,
+            link,
+            mut clip,
+        } = rig;
+        fake.answer(UTF8, Answer::Bytes(b"copied later".to_vec()));
+        // A paste waiting when the link goes.
+        tx.unbounded_send(transfer(OURS, UTF8, 1)).unwrap();
+        drop(link);
+        let taken = |clip: &mut Clip<Fake, mpsc::UnboundedReceiver<Signal>>| {
+            clip.pending.is_empty() && clip.signals.next().now_or_never().is_none()
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(50), serve(Some(&mut clip))).await;
+        assert!(taken(&mut clip));
+        let cleared = |fake: &Fake| {
+            fake.calls()
+                .iter()
+                .filter(|c| **c == format!("set {CLEARED}"))
+                .count()
+        };
+        assert_eq!(cleared(&fake), 1, "{:?}", fake.calls());
+        for round in 0..3 {
+            for _ in 0..100 {
+                tx.unbounded_send(owner(OURS, &GTK)).unwrap();
+            }
+            tx.unbounded_send(transfer(OURS, UTF8, 2 + round)).unwrap();
+            let _ = tokio::time::timeout(Duration::from_millis(50), serve(Some(&mut clip))).await;
+            assert!(taken(&mut clip), "round {round}: signals left unread");
+        }
+        assert_eq!(fake.reads(), 0, "{:?}", fake.calls());
+        let pasted = wait_pasted(&fake, 4).await;
+        assert_eq!(
+            pasted,
+            [1, 2, 3, 4].map(|serial| (serial, Vec::new())),
+            "nothing is served after the end"
+        );
+        let calls = fake.calls();
+        for serial in 1..=4 {
+            assert!(calls.contains(&format!("done {serial} false")), "{calls:?}");
+        }
+        assert_eq!(cleared(&fake), 1, "{calls:?}");
+        // The stream's end parks the loop; it does not spin.
+        *fake.signals.lock().unwrap() = None;
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_millis(50), serve(Some(&mut clip))).await;
+        assert!(clip.signals_ended);
     }
 
     /// The delay of the first announcement after `Start` is kept (gate G2).

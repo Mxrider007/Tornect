@@ -1433,6 +1433,76 @@ mod tests {
         }
     }
 
+    /// A clipboard link dropped while the session goes on (the services end,
+    /// the screen is still shared) leaves the session working. The loop goes
+    /// on taking the clipboard's signals off the bus, so more owner changes
+    /// than zbus queues for one subscription (64; a full queue stops the
+    /// connection's reader) do not stall the connection: each input call is
+    /// answered before the next is made (an unanswered one would hold the
+    /// next back for `INPUT_WAIT`), `Session.Close` is answered when the
+    /// handle goes (unanswered, the drop would wait `CLOSE_WAIT`), and the
+    /// desktop's own end of the session is seen. Nothing is read from the
+    /// clipboard once the link is gone.
+    #[test]
+    #[ignore = "starts a dbus-daemon: cargo test -p tornect-capture -- --ignored fake_bus"]
+    fn fake_bus_a_dropped_clipboard_link_leaves_the_session_working() {
+        for desktop_ends in [false, true] {
+            let bus = FakeBus::start(Script::default());
+            let (portal, opened) = Portal::open(bus_setup(&bus, None, true)).unwrap();
+            assert!(opened.clipboard);
+            let session = bus.session();
+            let link = portal.take_clip_link().unwrap();
+            link.active.send_replace(true);
+            drop(link);
+            for _ in 0..200 {
+                bus.owner_changed(&session, &[clip::UTF8, clip::PLAIN], false);
+            }
+            let keys = |bus: &FakeBus| {
+                bus.calls()
+                    .iter()
+                    .filter(|c| c.starts_with("RemoteDesktop.NotifyKeyboardKeycode"))
+                    .count()
+            };
+            let sent = Instant::now();
+            for pressed in [true, false, true, false] {
+                portal.send(Call::Key { code: 30, pressed }).unwrap();
+            }
+            bus.wait_for("the input calls", |bus| keys(bus) == 4);
+            assert!(
+                sent.elapsed() < INPUT_WAIT,
+                "{:?}: an input call went unanswered",
+                sent.elapsed()
+            );
+            assert!(
+                !bus.calls()
+                    .iter()
+                    .any(|c| c.starts_with("Clipboard.SelectionRead")),
+                "{:?}",
+                bus.calls()
+            );
+            if desktop_ends {
+                bus.close_session(&session);
+                bus.wait_for("the desktop's end to be seen", |_| portal.is_over());
+                drop(opened);
+                drop(portal);
+                assert!(!bus.calls().contains(&"Session.Close".to_owned()));
+            } else {
+                let dropped = Instant::now();
+                drop(opened);
+                drop(portal);
+                assert!(
+                    dropped.elapsed() < CLOSE_WAIT,
+                    "{:?}: Session.Close went unanswered",
+                    dropped.elapsed()
+                );
+                assert_eq!(
+                    bus.calls().last().map(String::as_str),
+                    Some("Session.Close")
+                );
+            }
+        }
+    }
+
     /// A call queued after the session is over is refused, not lost silently.
     #[test]
     fn input_after_the_session_is_over_is_refused() {

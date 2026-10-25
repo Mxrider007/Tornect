@@ -188,6 +188,20 @@ impl FakeBus {
             .unwrap();
     }
 
+    /// The desktop ends `session` itself (`Session.Closed`).
+    pub(super) fn close_session(&self, session: &str) {
+        let details: HashMap<&str, Value<'_>> = HashMap::new();
+        self.runtime()
+            .block_on(self.connection.emit_signal(
+                None::<&str>,
+                session,
+                "org.freedesktop.portal.Session",
+                "Closed",
+                &details,
+            ))
+            .unwrap();
+    }
+
     /// Someone pastes what `session` set.
     pub(super) fn transfer(&self, session: &str, mime_type: &str, serial: u32) {
         let body = (ObjectPath::try_from(session).unwrap(), mime_type, serial);
@@ -351,6 +365,19 @@ impl Remote {
             );
         }
         respond(connection, &header, &options, results).await
+    }
+
+    fn notify_keyboard_keycode(
+        &self,
+        _session: OwnedObjectPath,
+        _options: HashMap<String, OwnedValue>,
+        keycode: i32,
+        state: u32,
+    ) {
+        note(
+            &self.shared,
+            format!("RemoteDesktop.NotifyKeyboardKeycode {keycode} {state}"),
+        );
     }
 }
 

@@ -382,8 +382,12 @@ pub struct WaylandClipboard {
 
 impl WaylandClipboard {
     /// The link to the clipboard's loop, once per session: refused when it
-    /// was taken already or the source is gone. Dropping it stops the loop,
-    /// which clears the clipboard if it still holds text the link set.
+    /// was taken already or the source is gone. Dropping it ends the sharing
+    /// while the screen may still be shared: the loop clears the clipboard if
+    /// it still holds text the link set, reads nothing from it any more, and
+    /// until the session ends only takes the clipboard's signals off the bus
+    /// (unread, they would stall the session's input), answering a paste
+    /// with nothing.
     pub fn link(self) -> Result<ClipboardLink, CaptureError> {
         let portal = self
             .portal
