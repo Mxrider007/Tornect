@@ -161,10 +161,15 @@ where
         wait: Duration,
     ) -> Result<(Self, Welcome), ServicesBindError> {
         let (mut rd, mut wr) = tokio::io::split(stream);
-        write_msg(&mut wr, &binding.msg()).await.map_err(svc)?;
-        let answer = tokio::time::timeout(wait, read_answer(&mut rd))
-            .await
-            .map_err(|_| ServicesBindError::Timeout)??;
+        // The terminal host answers without reading the `Bind` and closes:
+        // its `Refused` can be waiting when the `Bind` no longer goes out.
+        let sent = write_msg(&mut wr, &binding.msg()).await;
+        let answer = match (sent, tokio::time::timeout(wait, read_answer(&mut rd)).await) {
+            (_, Ok(Ok(answer))) => answer,
+            (Err(e), _) => return Err(svc(e)),
+            (Ok(()), Ok(Err(e))) => return Err(e),
+            (Ok(()), Err(_)) => return Err(ServicesBindError::Timeout),
+        };
         match answer {
             SvcMsg::Welcome(welcome) => Ok((
                 Self {
