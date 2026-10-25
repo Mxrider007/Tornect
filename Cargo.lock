@@ -7456,6 +7456,7 @@ dependencies = [
 name = "tornect-session"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

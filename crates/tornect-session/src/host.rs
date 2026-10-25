@@ -523,18 +523,16 @@ enum StreamKind {
     /// `MEDIA_PORT`: [`tornect_proto::bind_mac`].
     Media,
     /// `SERVICES_PORT`: [`tornect_proto::services::services_bind_mac`].
-    // The services host (the design's step 12) binds with it.
-    #[cfg_attr(not(test), allow(dead_code))]
     Services,
 }
 
 /// A services stream's successful bind ([`MediaHost::claim_services`]).
-// The services host (the design's step 12) is its caller.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ServicesClaim {
     /// Control or view-only, as signed in the accept.
     pub(crate) mode: SessionMode,
-    /// The viewer's pinned label.
+    /// The viewer's pinned label (the host's window names the viewer by its
+    /// session's row, so the services host itself has no use for it).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) label: String,
     /// Set to the `Close` reason when the session ends, as the media
     /// stream's.
@@ -846,8 +844,6 @@ impl MediaHost {
     /// waits: the viewer opens its services stream only after its media
     /// stream's `BindOk`, so an unknown session is refused at once. A wrong
     /// MAC leaves the session's services unbound.
-    // The services host (the design's step 12) is its caller.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn claim_services(&self, session_id: &str, mac: &[u8; 32]) -> Option<ServicesClaim> {
         match self.try_claim(session_id, mac, StreamKind::Services) {
             Lookup::Bound(claimed) => Some(ServicesClaim {
@@ -858,6 +854,27 @@ impl MediaHost {
             }),
             Lookup::Refused | Lookup::Unknown => None,
         }
+    }
+
+    /// The backend sessions are captured with: a services stream opens the
+    /// desktop's clipboard through the same one (the services design §6.4).
+    pub(crate) fn backend(&self) -> Arc<dyn MediaBackend> {
+        Arc::clone(&self.backend)
+    }
+
+    /// How long a new stream has to deliver its `Bind`: the media stream's
+    /// and the services stream's alike.
+    pub(crate) fn bind_deadline(&self) -> Duration {
+        self.limits.bind_deadline
+    }
+
+    /// The capture state session `session_id` publishes, for tests that
+    /// drive a services stream without a media stream.
+    #[cfg(test)]
+    pub(crate) fn capture_of(&self, session_id: &str) -> Option<Arc<watch::Sender<CaptureState>>> {
+        self.lock()
+            .get(session_id)
+            .map(|session| Arc::clone(&session.capture))
     }
 
     /// A bound stream: capture, serve, tear down.

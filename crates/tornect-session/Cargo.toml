@@ -22,6 +22,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 tempfile.workspace = true
 # `start_paused` for the bind-deadline tests.
 tokio = { workspace = true, features = ["test-util"] }
