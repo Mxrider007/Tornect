@@ -17,7 +17,7 @@ use tornect_core::unattended::grant::Preset;
 use tornect_core::unattended::ipc::{GrantOptions, ShownLink};
 use tornect_core::unattended::readiness::Probe;
 use tornect_core::{DeviceId, TornectId};
-use tornect_proto::{HostStats, QualityInfo};
+use tornect_proto::{HostStats, MonitorEntry, QualityInfo};
 
 use super::backend::Secret;
 use crate::ua_client::AdminAction;
@@ -849,6 +849,68 @@ pub struct Viewing {
     /// What the host says it applies and how long each stage takes: the
     /// badge and the details read it (the quality design §3.3).
     pub stream: StreamInfo,
+    /// The host's monitors as its last `Monitors` listed them, and this
+    /// window's request for another (the monitors design §2); `None` until
+    /// the host lists them, and for a host with nothing to choose.
+    pub screens: Option<ScreensView>,
+}
+
+/// The host's monitors as the stream window shows them (the monitors
+/// design §2, §5.7), from the viewer's [`tornect_session::Screens`]. Display
+/// only: the pictures are still sized from what they decode.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScreensView {
+    /// The monitors; monitor `id` is `monitors[id - 1]`, a 0×0 size unknown.
+    pub monitors: Vec<MonitorEntry>,
+    /// The host offers all of them at once.
+    pub all: bool,
+    /// What the pictures show: a monitor's id, or
+    /// [`tornect_proto::ALL_MONITORS`].
+    pub shown: u8,
+    /// The list's generation.
+    pub list: u16,
+    /// The screen this window asked for, until the host answers, the request
+    /// is given up or it is not sent: the button reads "Switching…" and
+    /// takes no click.
+    pub switching: Option<u8>,
+    /// Counts what the viewer said of the screens, so that the window says
+    /// each at most once ([`ScreensView::last`]).
+    pub news: u64,
+    /// What the newest of them asks the window to say, if anything.
+    pub last: Option<ScreenNote>,
+    /// The seq of the first picture that shows another part of the host's
+    /// desktop (`REMAPPED`): input made against an earlier picture is not
+    /// sent (the monitors design's V5).
+    pub hold_from: Option<u32>,
+}
+
+/// What a screens' news asks the stream window to say (its toast).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenNote {
+    /// The host refused the request for `asked` with a
+    /// [`tornect_proto::monitor_status`] other than OK.
+    Refused {
+        /// What was asked for (0: all screens).
+        asked: u8,
+        /// The host's status.
+        status: u8,
+    },
+    /// The host's own news changed what the pictures show.
+    Changed {
+        /// What they show now (0: all screens).
+        shown: u8,
+    },
+    /// The host did not answer the request for `asked` in time.
+    NoAnswer {
+        /// What was asked for.
+        asked: u8,
+    },
+    /// The request for `asked` was not sent: another one waited for its
+    /// answer.
+    NotSent {
+        /// What was asked for.
+        asked: u8,
+    },
 }
 
 /// What the host says of the stream it sends, and this viewer's own
@@ -1590,6 +1652,7 @@ mod tests {
             pictures: 0,
             size: (0, 0),
             stream: StreamInfo::default(),
+            screens: None,
         };
         let mut model = Model {
             host_notice: Some(0x07),

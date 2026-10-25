@@ -9,7 +9,9 @@
 //! as actions; nothing here sends input. The Quality menu (the quality
 //! design §3.2) asks the host for a preset in control and view-only
 //! sessions alike; the badge and the details say what the host applies and
-//! how long each stage takes (§3.3), all of it display only.
+//! how long each stage takes (§3.3), all of it display only. The Screens
+//! menu (the monitors design §2) asks the host for another of its monitors,
+//! in either mode too, once the host listed two or more.
 
 use std::collections::VecDeque;
 use std::io;
@@ -20,10 +22,10 @@ use std::time::{Duration, Instant};
 use egui::{Color32, CornerRadius, RichText, Stroke, vec2};
 
 use tornect_core::config::{Picture, QualityPreset, ToolbarHides, Viewer};
-use tornect_proto::{HostStats, QualityInfo};
+use tornect_proto::{ALL_MONITORS, HostStats, MonitorEntry, QualityInfo, monitor_status};
 use tornect_signal::messages::notice;
 
-use super::super::model::{Ewma, Viewing};
+use super::super::model::{Ewma, ScreenNote, ScreensView, Viewing};
 use super::super::screenshot;
 use super::super::theme::{self, Face, Tokens};
 use super::super::view::{Action, clock};
@@ -66,6 +68,25 @@ const ADMIN_WINDOWS: &str =
 /// Interaction" off), said when the host says so.
 const NO_INPUT_LINE: &str = "The remote computer did not allow control: you can watch, but your \
      mouse and keyboard reach nothing there.";
+
+/// The line of a control session whose input ended when the host's screens
+/// changed (`notice::INPUT_LOST`, the monitors design §2), said when the host
+/// says so, where [`NO_INPUT_LINE`] would be.
+const INPUT_LOST_LINE: &str =
+    "Control stopped when the remote computer's screens changed. You can still watch.";
+
+/// The Screens button's name, for the accessibility tree; it reads the
+/// screen shown.
+const SCREENS: &str = "Screens";
+
+/// The Screens button's hover text.
+const SCREENS_HINT: &str = "Show another screen of the remote computer";
+
+/// The Screens button while a request waits for the host's answer.
+const SWITCHING: &str = "Switching…";
+
+/// The toast of a request refused as busy, or not sent while another waits.
+const STILL_SWITCHING: &str = "Still switching. Try again in a moment.";
 
 /// Why Ctrl+Alt+Del is greyed towards a host that said it runs Windows.
 const NOT_ON_WINDOWS: &str = "not possible on Windows computers";
@@ -128,6 +149,8 @@ enum Toast {
     Windowed,
     /// The host applies the preset this viewer picked.
     Quality(QualityPreset),
+    /// What the host said of its screens ([`screen_toast`]).
+    Screens(String),
 }
 
 impl Toast {
@@ -141,6 +164,7 @@ impl Toast {
             Self::Quality(QualityPreset::BestQuality) => "Quality: Best quality",
             Self::Quality(QualityPreset::Balanced) => "Quality: Balanced",
             Self::Quality(QualityPreset::BestPerformance) => "Quality: Best performance",
+            Self::Screens(text) => text,
         }
     }
 }
@@ -170,6 +194,11 @@ pub enum ViewerAction {
     /// Ask the host for this preset: in control and view-only sessions
     /// alike, and nothing of the input path changes.
     Quality(QualityPreset),
+    /// The Screens menu: open it (`true`) or close it.
+    ScreensMenu(bool),
+    /// Ask the host to show this monitor of its list (0: all of them): in
+    /// control and view-only sessions alike, a viewing choice.
+    ShowScreen(u8),
 }
 
 /// A key combination the Send keys menu sends, in a control session only.
@@ -257,6 +286,14 @@ pub struct ViewerState {
     pub keys_menu: bool,
     /// The Quality menu is open.
     pub quality_menu: bool,
+    /// The Screens menu is open.
+    pub screens_menu: bool,
+    /// The last of the host's screens' news ([`ScreensView::news`]) this
+    /// window took in: each is said at most once.
+    screens_seen: u64,
+    /// The host said, by the last frame, that this session's input ended
+    /// when its screens changed.
+    input_lost_shown: bool,
     /// The preset this viewer picked that the host has not said it applies
     /// yet, and when: the menu says "Changing…" under it until the host
     /// says so, or for [`CHANGING_FOR`]. Never set when the window opens.
@@ -382,6 +419,30 @@ impl ViewerState {
                 .is_some_and(|code| code & notice::NO_INPUT != 0)
     }
 
+    /// The host says this control session's input ended when its screens
+    /// changed.
+    fn input_lost(&self, v: &Viewing) -> bool {
+        v.control
+            && self
+                .host_notice
+                .is_some_and(|code| code & notice::INPUT_LOST != 0)
+    }
+
+    /// Take in what the host said of its screens since the last frame: the
+    /// newest news that asks for words becomes the toast, once.
+    fn follow_screens(&mut self, screens: Option<&ScreensView>, now: Instant) {
+        let Some(view) = screens else {
+            return;
+        };
+        if view.news == self.screens_seen {
+            return;
+        }
+        self.screens_seen = view.news;
+        if let Some(toast) = screen_toast(view) {
+            self.toast = Some((toast, now));
+        }
+    }
+
     /// Leave full screen (the chord does, after its ReleaseAll).
     pub fn leave_fullscreen(&mut self) {
         self.fullscreen = false;
@@ -463,6 +524,14 @@ impl ViewerState {
             self.show_toolbar(now);
         }
         self.no_input_shown = no_input;
+        // Input that ends during the session is said as soon too.
+        let input_lost = self
+            .host_notice
+            .is_some_and(|code| code & notice::INPUT_LOST != 0);
+        if input_lost && !self.input_lost_shown {
+            self.show_toolbar(now);
+        }
+        self.input_lost_shown = input_lost;
     }
 
     /// Where a screenshot's thread says how it went: the window takes it at
@@ -504,7 +573,7 @@ impl ViewerState {
         if self.hidden {
             return None;
         }
-        if self.pinned || self.details || self.keys_menu || self.quality_menu {
+        if self.pinned || self.details || self.keys_menu || self.quality_menu || self.screens_menu {
             self.active_at = Some(now);
             return None;
         }
@@ -707,6 +776,94 @@ pub fn round_trip_text(host: Option<&HostStats>) -> String {
     }
 }
 
+/// A screen as the toolbar and the toasts name it: `Screen 2`, or `All
+/// screens` for [`ALL_MONITORS`].
+#[must_use]
+pub fn screen_name(id: u8) -> String {
+    if id == ALL_MONITORS {
+        "All screens".to_owned()
+    } else {
+        format!("Screen {id}")
+    }
+}
+
+/// A monitor's size as the menu and the details say it, `1920 × 1080`;
+/// `None` when the host sent 0×0 (not known).
+fn monitor_size(m: &MonitorEntry) -> Option<String> {
+    (m.width > 0 && m.height > 0).then(|| format!("{} × {}", m.width, m.height))
+}
+
+/// The Screens menu's row of monitor `id`: `Screen 1 · main · 2560 × 1440`;
+/// "main" only on the monitor the host marked primary, and no size where
+/// it is not known.
+#[must_use]
+pub fn screen_row(id: u8, m: &MonitorEntry) -> String {
+    let mut row = screen_name(id);
+    if m.primary {
+        row.push_str(" · main");
+    }
+    if let Some(size) = monitor_size(m) {
+        row.push_str(" · ");
+        row.push_str(&size);
+    }
+    row
+}
+
+/// The details' Screen row: `Screen 2 of 3 · 1920 × 1080`, or `All 3
+/// screens`.
+#[must_use]
+pub fn screen_detail(view: &ScreensView) -> String {
+    let of = view.monitors.len();
+    if view.shown == ALL_MONITORS {
+        return format!("All {of} screens");
+    }
+    let mut line = format!("Screen {} of {of}", view.shown);
+    if let Some(size) = view
+        .monitors
+        .get(usize::from(view.shown).wrapping_sub(1))
+        .and_then(monitor_size)
+    {
+        line.push_str(" · ");
+        line.push_str(&size);
+    }
+    line
+}
+
+/// What the newest of the host's screens' news says, as a toast (the
+/// monitors design §2): a refusal, a request given up or not sent, or the
+/// host's own change of what it shows. An answer that shows the screen
+/// asked for, and news that changes nothing shown, say nothing: the button
+/// already reads the screen.
+fn screen_toast(view: &ScreensView) -> Option<Toast> {
+    let text = match view.last? {
+        ScreenNote::Refused { status, .. } if status == monitor_status::UNKNOWN => {
+            "That screen is not on the remote computer any more.".to_owned()
+        }
+        ScreenNote::Refused { status, .. } if status == monitor_status::BUSY => {
+            STILL_SWITCHING.to_owned()
+        }
+        ScreenNote::Refused { asked, .. } => {
+            let to = if asked == ALL_MONITORS {
+                "all screens".to_owned()
+            } else {
+                screen_name(asked)
+            };
+            format!("The remote computer could not switch to {to}.")
+        }
+        ScreenNote::NotSent { .. } => STILL_SWITCHING.to_owned(),
+        ScreenNote::NoAnswer { .. } => "The remote computer did not switch screens.".to_owned(),
+        ScreenNote::Changed { shown } => {
+            let showing = if shown == ALL_MONITORS {
+                "all screens".to_owned()
+            } else {
+                screen_name(shown)
+            };
+            format!("The remote computer's screens changed. Showing {showing}.")
+        }
+    };
+    Some(Toast::Screens(text))
+}
+
 /// A time in µs as the details say it (the quality design §3.3).
 fn duration_text(us: u64) -> String {
     crate::host::duration_text(us)
@@ -743,6 +900,7 @@ pub fn stream_window(
     viewer.collect_screenshots(now);
     viewer.follow_notice(viewing.is_some_and(|v| v.control), now);
     viewer.follow_fullscreen(now);
+    viewer.follow_screens(viewing.and_then(|v| v.screens.as_ref()), now);
     let applied = viewing.and_then(|v| v.stream.applied_preset());
     if let Some(left) = viewer.follow_quality(applied, now) {
         // "Changing…" goes after its time with no picture coming either.
@@ -960,6 +1118,10 @@ fn toolbar(
     let mut badge_clicked = false;
     let (mut keys_clicked, mut keys_at) = (false, None);
     let (mut quality_clicked, mut quality_at) = (false, None);
+    let (mut screens_clicked, mut screens_at) = (false, None);
+    // The Screens button: once the host listed two or more monitors.
+    let screens = v.screens.as_ref().filter(|s| s.monitors.len() >= 2);
+    let mut hint = None;
     let area = egui::Area::new(egui::Id::new("viewer-toolbar"))
         .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 8.0))
         .order(egui::Order::Foreground)
@@ -1013,6 +1175,17 @@ fn toolbar(
                                 actions.push(Action::Viewer(ViewerAction::OneToOne(one_to_one)));
                             }
                         }
+                        // In control and view-only sessions alike.
+                        if let Some(screens) = screens {
+                            let button = screens_button(ui, screens);
+                            if button.clicked() {
+                                screens_clicked = true;
+                                let open = !viewer.screens_menu;
+                                actions.push(Action::Viewer(ViewerAction::ScreensMenu(open)));
+                            }
+                            screens_at = Some(button.rect.left());
+                            hint = Some(button);
+                        }
                         if corners(ui, viewer.fullscreen).clicked() {
                             let on = !viewer.fullscreen;
                             actions.push(Action::Viewer(ViewerAction::Fullscreen(on)));
@@ -1052,6 +1225,16 @@ fn toolbar(
         });
     let pill = area.response.rect;
     viewer.areas.push(pill);
+    // The hover text floats over the picture: its area is the window's, so
+    // nothing pressed there reaches the remote computer.
+    if let Some(shown) = hint.and_then(|button| {
+        egui::Tooltip::for_enabled(&button).show(|ui| {
+            ui.set_max_width(ui.spacing().tooltip_width);
+            ui.label(SCREENS_HINT);
+        })
+    }) {
+        viewer.areas.push(shown.response.rect);
+    }
     let mut below = pill.bottom() + 4.0;
     if viewer.secure_screen() {
         let line = under_pill(ctx, "viewer-secure", below, top, |ui| {
@@ -1089,6 +1272,16 @@ fn toolbar(
         viewer.areas.push(line);
         below = line.bottom() + 4.0;
     }
+    // Where the no-input line would be: a control session whose input
+    // ended when the host's screens changed.
+    let input_lost = viewer.input_lost(v);
+    if input_lost {
+        let line = under_pill(ctx, "viewer-input-lost", below, top, |ui| {
+            ui.label(RichText::new(INPUT_LOST_LINE).small().color(t.warn));
+        });
+        viewer.areas.push(line);
+        below = line.bottom() + 4.0;
+    }
     let admin_windows = viewer.no_admin_windows(v);
     if admin_windows {
         let line = under_pill(ctx, "viewer-admin-windows", below, top, |ui| {
@@ -1101,6 +1294,7 @@ fn toolbar(
         let at = egui::pos2(pill.left(), below);
         let lines = ModeLines {
             no_input,
+            input_lost,
             admin_windows,
         };
         let counts = Counts {
@@ -1135,6 +1329,95 @@ fn toolbar(
             actions.push(Action::Viewer(ViewerAction::QualityMenu(false)));
         }
     }
+    if viewer.screens_menu
+        && let (Some(left), Some(listed)) = (screens_at, screens)
+    {
+        let menu = screens_menu(ctx, listed, egui::pos2(left, below), actions, t);
+        viewer.areas.push(menu.response.rect);
+        if menu.response.clicked_elsewhere() && !screens_clicked {
+            actions.push(Action::Viewer(ViewerAction::ScreensMenu(false)));
+        }
+    }
+}
+
+/// The Screens button: the screen shown (`Screen 2`, `All screens`), or
+/// "Switching…" with a spinner, and no click, while a request waits for the
+/// host's answer. Named "Screens" in the accessibility tree, its words as
+/// the value.
+fn screens_button(ui: &mut egui::Ui, screens: &ScreensView) -> egui::Response {
+    let switching = screens.switching.is_some();
+    let text = if switching {
+        SWITCHING.to_owned()
+    } else {
+        screen_name(screens.shown)
+    };
+    if switching {
+        ui.add(egui::Spinner::new());
+    }
+    let button = ui.add_enabled(!switching, egui::Button::new(text.as_str()));
+    button.widget_info(|| {
+        let mut info = egui::WidgetInfo::labeled(egui::WidgetType::Button, !switching, SCREENS);
+        info.current_text_value = Some(text.clone());
+        info
+    });
+    button
+}
+
+/// The Screens menu at `at`: a row a monitor, as the host listed them, the
+/// one shown checked, then "All screens" where the host offers it. A
+/// choice goes to the host and touches nothing of the input path.
+fn screens_menu(
+    ctx: &egui::Context,
+    screens: &ScreensView,
+    at: egui::Pos2,
+    actions: &mut Vec<Action>,
+    t: &Tokens,
+) -> egui::InnerResponse<()> {
+    let ids = 1..=u8::try_from(screens.monitors.len()).unwrap_or(u8::MAX);
+    let mut rows: Vec<(u8, String)> = ids
+        .zip(&screens.monitors)
+        .map(|(id, m)| (id, screen_row(id, m)))
+        .collect();
+    if screens.all {
+        rows.push((ALL_MONITORS, screen_name(ALL_MONITORS)));
+    }
+    egui::Area::new(egui::Id::new("viewer-screens"))
+        .fixed_pos(at)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(t.surface_overlay)
+                .stroke(Stroke::new(1.0, t.border_subtle))
+                .corner_radius(CornerRadius::same(8))
+                .shadow(t.popup_shadow)
+                .inner_margin(egui::Margin::same(6))
+                .show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        for (id, row) in rows {
+                            let on = screens.shown == id;
+                            ui.horizontal(|ui| {
+                                // The check mark's column, empty but for the
+                                // screen shown.
+                                let (mark, _) =
+                                    ui.allocate_exact_size(vec2(16.0, 20.0), egui::Sense::hover());
+                                if on {
+                                    ui.painter().text(
+                                        mark.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "✓",
+                                        theme::font(ui.ctx(), Face::MonoSemibold, 13.0),
+                                        t.ok,
+                                    );
+                                }
+                                let item = egui::Button::new(row).frame(false).selected(on);
+                                if ui.add(item).clicked() {
+                                    actions.push(Action::Viewer(ViewerAction::ShowScreen(id)));
+                                }
+                            });
+                        }
+                    });
+                });
+        })
 }
 
 /// A line under the toolbar, `y` points below the window's `top`, centred,
@@ -1281,14 +1564,18 @@ struct Counts {
 struct ModeLines {
     /// The session's input reaches nothing on the host.
     no_input: bool,
+    /// The session's input ended when the host's screens changed.
+    input_lost: bool,
     /// Its input cannot reach the host's administrator windows.
     admin_windows: bool,
 }
 
 /// The connection's details, under the toolbar at `at`: the route, the
-/// picture, what the host applies and each stage's time (the quality
-/// design §3.3; display only), the level (with the no-input and
-/// administrator-windows lines when the host said them, `lines`), the
+/// picture, the screen shown once the host listed its monitors (the
+/// monitors design §2), what the host applies and each stage's time (the
+/// quality design §3.3; display only), the level (with the no-input, the
+/// input-lost and the administrator-windows lines when the host said them,
+/// `lines`), the
 /// session's clock and, in a control session, the input sent. Nothing in
 /// them names the host.
 fn details(
@@ -1331,6 +1618,13 @@ fn details(
                             ui.label(muted("Picture"));
                             ui.label(format!("{}×{} · {rate} fps", v.size.0, v.size.1));
                             ui.end_row();
+                            if let Some(screens) =
+                                v.screens.as_ref().filter(|s| !s.monitors.is_empty())
+                            {
+                                ui.label(muted("Screen"));
+                                ui.label(screen_detail(screens));
+                                ui.end_row();
+                            }
                             let host = v.stream.host.as_ref();
                             if let Some(applied) = &v.stream.applied {
                                 ui.label(muted("Quality"));
@@ -1363,6 +1657,9 @@ fn details(
                                 ui.label(chip_text(v));
                                 if lines.no_input {
                                     ui.label(RichText::new(NO_INPUT_LINE).small().color(t.warn));
+                                }
+                                if lines.input_lost {
+                                    ui.label(RichText::new(INPUT_LOST_LINE).small().color(t.warn));
                                 }
                                 if lines.admin_windows {
                                     ui.label(RichText::new(ADMIN_WINDOWS).small().color(t.warn));
@@ -1510,6 +1807,7 @@ pub(crate) mod testing {
                     pictures: 1,
                     size: (1600, 900),
                     stream: StreamInfo::default(),
+                    screens: None,
                 },
                 viewer: ViewerState::default(),
                 input_sent: 0,
@@ -2027,6 +2325,7 @@ mod tests {
             width: 2,
             height: 2,
             rgba: vec![9; 16],
+            seq: 0,
             fresh: false,
         };
         let at = std::time::UNIX_EPOCH + Duration::from_secs(1_791_444_605);
@@ -2762,5 +3061,386 @@ mod tests {
             );
         }
         assert_eq!(scaled_text(None, (1920, 1080)), None);
+    }
+
+    /// Two monitors side by side, the first the main one, "all" offered;
+    /// `shown` on show.
+    fn two_screens(shown: u8) -> ScreensView {
+        ScreensView {
+            monitors: vec![
+                MonitorEntry::saturating(true, 0, 0, 2560, 1440),
+                MonitorEntry::saturating(false, 2560, 0, 1920, 1080),
+            ],
+            all: true,
+            shown,
+            list: 1,
+            ..ScreensView::default()
+        }
+    }
+
+    /// The monitors design §2: the Screens button is in the toolbar of a
+    /// control and a view-only session alike once the host listed two or
+    /// more monitors, never before or for one; after Fit and 1:1, before the
+    /// fullscreen corners. It reads the screen shown, says what it does when
+    /// the pointer rests on it (over the picture, in the window's own
+    /// area), a click asks for its menu and a second one closes it.
+    #[test]
+    fn the_screens_button_shows_once_the_host_lists_two_screens() {
+        let one = ScreensView {
+            monitors: vec![MonitorEntry::saturating(true, 0, 0, 1920, 1080)],
+            shown: 1,
+            ..ScreensView::default()
+        };
+        for control in [false, true] {
+            let mut w = Window::new(control);
+            for screens in [None, Some(ScreensView::default()), Some(one.clone())] {
+                w.viewing.screens = screens;
+                w.pass(ms(0), Vec::new());
+                w.pass(ms(0), Vec::new());
+                assert!(w.has("End session"), "{control}");
+                assert!(!w.has(SCREENS), "{control}: {:?}", w.texts());
+            }
+            for (shown, reads) in [(1, "Screen 1"), (2, "Screen 2"), (0, "All screens")] {
+                w.viewing.screens = Some(two_screens(shown));
+                w.pass(ms(0), Vec::new());
+                w.pass(ms(0), Vec::new());
+                assert!(w.has(SCREENS) && w.has(reads), "{control}: {:?}", w.texts());
+                assert!(!w.disabled(SCREENS));
+            }
+            let screens = w.centre(SCREENS);
+            assert!(screens.x > w.centre("1:1").x, "{control}");
+            assert!(screens.x < w.centre(FULLSCREEN).x, "{control}");
+            assert!(!w.has(SCREENS_HINT));
+            w.pass(ms(100), vec![egui::Event::PointerMoved(screens)]);
+            for at in [1000, 1000, 1100] {
+                w.pass(ms(at), Vec::new());
+            }
+            assert!(w.has(SCREENS_HINT), "{control}: {:?}", w.texts());
+            let hint = w.centre(SCREENS_HINT);
+            assert!(w.viewer.areas().iter().any(|r| r.contains(hint)));
+            assert_eq!(
+                w.click(ms(1200), SCREENS),
+                vec![Action::Viewer(ViewerAction::ScreensMenu(true))],
+                "{control}"
+            );
+            w.viewer.screens_menu = true;
+            w.pass(ms(1300), Vec::new());
+            assert_eq!(
+                w.click(ms(1400), SCREENS),
+                vec![Action::Viewer(ViewerAction::ScreensMenu(false))],
+                "{control}: the button toggles, the press is not one elsewhere"
+            );
+        }
+    }
+
+    /// The menu: a row a monitor in the host's order, "main" on the primary
+    /// one and the size where it is known, then "All screens" only where the
+    /// host offers it; the screen shown checked. A click on a row asks for
+    /// that screen, in both modes. The open menu keeps the toolbar, is the
+    /// window's own area (no press there reaches the host), and a press
+    /// elsewhere closes it.
+    #[test]
+    fn the_screens_menu_lists_the_hosts_screens_and_checks_the_one_shown() {
+        use egui::accesskit::Toggled;
+        let main = MonitorEntry::saturating(true, 0, 0, 2560, 1440);
+        let side = MonitorEntry::saturating(false, 2560, 0, 1920, 1080);
+        let unknown = MonitorEntry::saturating(false, 0, 0, 0, 0);
+        assert_eq!(screen_row(1, &main), "Screen 1 · main · 2560 × 1440");
+        assert_eq!(screen_row(2, &side), "Screen 2 · 1920 × 1080");
+        assert_eq!(screen_row(3, &unknown), "Screen 3");
+        assert_eq!(screen_name(ALL_MONITORS), "All screens");
+        let rows = [
+            (1, "Screen 1 · main · 2560 × 1440"),
+            (2, "Screen 2 · 1920 × 1080"),
+            (ALL_MONITORS, "All screens"),
+        ];
+        for control in [false, true] {
+            let mut w = Window::new(control);
+            w.viewing.screens = Some(two_screens(2));
+            w.viewer.screens_menu = true;
+            for at in [0, 2600, 9000] {
+                w.pass(ms(at), Vec::new());
+                w.pass(ms(at), Vec::new());
+                assert!(w.has("End session"), "{at} ms: the toolbar stays");
+                for (id, row) in rows {
+                    let on = if id == 2 {
+                        Toggled::True
+                    } else {
+                        Toggled::False
+                    };
+                    assert_eq!(w.toggled(row), Some(on), "{control}, {at} ms: {row}");
+                }
+            }
+            let ys: Vec<f32> = rows.iter().map(|(_, row)| w.centre(row).y).collect();
+            assert!(
+                ys.is_sorted() && ys[0] < ys[2],
+                "in the host's order: {ys:?}"
+            );
+            for (_, row) in rows {
+                let at = w.centre(row);
+                assert!(w.viewer.areas().iter().any(|r| r.contains(at)), "{row}");
+            }
+            for (id, row) in [(ALL_MONITORS, "All screens"), (1, "Screen 1 ·")] {
+                assert_eq!(
+                    w.click(ms(9100), row),
+                    vec![Action::Viewer(ViewerAction::ShowScreen(id))],
+                    "{control}: {row}"
+                );
+            }
+            let away = egui::pos2(640.0, 600.0);
+            let press = |pressed| egui::Event::PointerButton {
+                pos: away,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let mut asked = w.pass(ms(9200), vec![egui::Event::PointerMoved(away), press(true)]);
+            asked.extend(w.pass(ms(9200), vec![press(false)]));
+            assert_eq!(
+                asked,
+                vec![Action::Viewer(ViewerAction::ScreensMenu(false))],
+                "{control}"
+            );
+            // "All screens" only where the host offers it.
+            w.viewing.screens = Some(ScreensView {
+                all: false,
+                ..two_screens(1)
+            });
+            w.pass(ms(9300), Vec::new());
+            w.pass(ms(9300), Vec::new());
+            assert!(!w.has("All screens"), "{control}: {:?}", w.texts());
+            assert_eq!(w.toggled(rows[0].1), Some(Toggled::True));
+        }
+    }
+
+    /// While a request waits for the host's answer the button reads
+    /// "Switching…" beside a spinner and takes no click; the answer gives
+    /// it back, reading the screen shown.
+    #[test]
+    fn the_screens_button_waits_for_the_hosts_answer() {
+        for control in [false, true] {
+            let mut w = Window::new(control);
+            w.viewing.screens = Some(ScreensView {
+                switching: Some(2),
+                ..two_screens(1)
+            });
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(0), Vec::new());
+            assert!(w.has(SWITCHING), "{control}: {:?}", w.texts());
+            assert!(!w.has("Screen 1"), "{control}");
+            assert!(w.disabled(SCREENS), "{control}");
+            assert_eq!(w.click(ms(100), SCREENS), Vec::new(), "{control}");
+            w.viewing.screens = Some(two_screens(2));
+            w.pass(ms(200), Vec::new());
+            w.pass(ms(200), Vec::new());
+            assert!(!w.has(SWITCHING), "{control}");
+            assert!(w.has("Screen 2") && !w.disabled(SCREENS), "{control}");
+        }
+    }
+
+    /// The monitors design §2's toasts in its words, each said once for the
+    /// news that asks for it: a refusal (the screen gone, a switch under
+    /// way, one that failed), a request not sent or given up, the host's own
+    /// change of what it shows. The session's first list, an answer that
+    /// shows the screen asked for and news that leave the screen shown say
+    /// nothing.
+    #[test]
+    fn the_hosts_screens_news_is_said_once_in_the_designs_words() {
+        use monitor_status::{BUSY, FAILED, UNKNOWN};
+        let said = |last| {
+            screen_toast(&ScreensView {
+                last,
+                ..two_screens(1)
+            })
+            .map(|toast| toast.text().to_owned())
+        };
+        let refused = |asked, status| Some(ScreenNote::Refused { asked, status });
+        for (last, words) in [
+            (None, None),
+            (
+                refused(2, UNKNOWN),
+                Some("That screen is not on the remote computer any more."),
+            ),
+            (refused(2, BUSY), Some(STILL_SWITCHING)),
+            (
+                refused(2, FAILED),
+                Some("The remote computer could not switch to Screen 2."),
+            ),
+            (
+                refused(ALL_MONITORS, FAILED),
+                Some("The remote computer could not switch to all screens."),
+            ),
+            (
+                Some(ScreenNote::NotSent { asked: 2 }),
+                Some(STILL_SWITCHING),
+            ),
+            (
+                Some(ScreenNote::NoAnswer { asked: 2 }),
+                Some("The remote computer did not switch screens."),
+            ),
+            (
+                Some(ScreenNote::Changed { shown: 1 }),
+                Some("The remote computer's screens changed. Showing Screen 1."),
+            ),
+            (
+                Some(ScreenNote::Changed {
+                    shown: ALL_MONITORS,
+                }),
+                Some("The remote computer's screens changed. Showing all screens."),
+            ),
+        ] {
+            assert_eq!(said(last).as_deref(), words, "{last:?}");
+        }
+        assert_eq!(STILL_SWITCHING, "Still switching. Try again in a moment.");
+
+        let gone = "That screen is not on the remote computer any more.";
+        for control in [false, true] {
+            let mut w = Window::new(control);
+            // The first list: news 1, nothing to say.
+            w.viewing.screens = Some(ScreensView {
+                news: 1,
+                ..two_screens(1)
+            });
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(0), Vec::new());
+            assert!(w.viewer.toast.is_none(), "{control}: {:?}", w.viewer.toast);
+            w.viewing.screens = Some(ScreensView {
+                news: 2,
+                last: refused(2, UNKNOWN),
+                ..two_screens(1)
+            });
+            for at in [100, 3000] {
+                w.pass(ms(at), Vec::new());
+                w.pass(ms(at), Vec::new());
+                assert!(w.has(gone), "{control}, {at} ms: {:?}", w.texts());
+            }
+            // Gone after 3.5 s, and not said again for the same news.
+            w.pass(ms(3700), Vec::new());
+            w.pass(ms(3700), Vec::new());
+            assert!(!w.has(gone), "{control}");
+            // The next news says its own words, or none.
+            w.viewing.screens = Some(ScreensView {
+                news: 3,
+                last: None,
+                ..two_screens(2)
+            });
+            w.pass(ms(3800), Vec::new());
+            w.pass(ms(3800), Vec::new());
+            assert!(w.viewer.toast.is_none(), "{control}: {:?}", w.viewer.toast);
+            w.viewing.screens = Some(ScreensView {
+                news: 4,
+                last: Some(ScreenNote::Changed { shown: 1 }),
+                ..two_screens(1)
+            });
+            w.pass(ms(3900), Vec::new());
+            w.pass(ms(3900), Vec::new());
+            assert!(
+                w.has("The remote computer's screens changed. Showing Screen 1."),
+                "{control}: {:?}",
+                w.texts()
+            );
+        }
+    }
+
+    /// The input-lost line (the monitors design §2), under the toolbar and
+    /// in the details: only in a control session, and only when the host
+    /// says the session's input ended when its screens changed. Said after
+    /// the toolbar hid, it brings the toolbar back once, with the line,
+    /// whose area the remote computer never gets.
+    #[test]
+    fn the_input_lost_line_is_said_only_when_the_host_says_so() {
+        assert_eq!(
+            INPUT_LOST_LINE,
+            "Control stopped when the remote computer's screens changed. You can still watch."
+        );
+        assert_eq!(notice::INPUT_LOST, 0x10);
+        for control in [false, true] {
+            for code in [
+                None,
+                Some(0x00),
+                Some(0x08),
+                Some(0x0f),
+                Some(0x10),
+                Some(0x18),
+            ] {
+                let mut w = Window::new(control);
+                w.viewing.screens = Some(two_screens(1));
+                w.viewer.host_notice = code;
+                w.pass(ms(0), Vec::new());
+                w.pass(ms(0), Vec::new());
+                let want = control && code.is_some_and(|c| c & 0x10 != 0);
+                let case = format!("control {control}, {code:?}");
+                assert_eq!(w.has(INPUT_LOST_LINE), want, "{case}: {:?}", w.texts());
+                let under = times(&w, INPUT_LOST_LINE);
+                w.viewer.details = true;
+                w.pass(ms(100), Vec::new());
+                w.pass(ms(100), Vec::new());
+                if want {
+                    assert!(times(&w, INPUT_LOST_LINE) > under, "{case}: in the details");
+                } else {
+                    assert_eq!(times(&w, INPUT_LOST_LINE), 0, "{case}");
+                }
+            }
+        }
+        let mut w = Window::new(true);
+        w.viewer.host_notice = Some(0x00);
+        for at in [0, 3000] {
+            w.pass(ms(at), Vec::new());
+            w.pass(ms(at), Vec::new());
+        }
+        assert!(!w.viewer.toolbar_shown(), "the toolbar hid");
+        w.viewer.host_notice = Some(0x10);
+        w.pass(ms(9000), Vec::new());
+        w.pass(ms(9000), Vec::new());
+        assert!(w.viewer.toolbar_shown(), "the toolbar came back");
+        assert!(w.has(INPUT_LOST_LINE), "{:?}", w.texts());
+        let at = w.centre(INPUT_LOST_LINE);
+        assert!(w.viewer.areas().iter().any(|r| r.contains(at)));
+        w.pass(ms(12000), Vec::new());
+        w.pass(ms(12000), Vec::new());
+        assert!(!w.viewer.toolbar_shown(), "called back once, not for good");
+    }
+
+    /// The details' Screen row (the monitors design §2): the screen shown
+    /// of how many, with its size where it is known, or all of them; none
+    /// before the host listed a monitor. It names no monitor otherwise.
+    #[test]
+    fn the_details_say_the_screen_shown() {
+        assert_eq!(
+            screen_detail(&two_screens(1)),
+            "Screen 1 of 2 · 2560 × 1440"
+        );
+        assert_eq!(
+            screen_detail(&two_screens(2)),
+            "Screen 2 of 2 · 1920 × 1080"
+        );
+        assert_eq!(screen_detail(&two_screens(ALL_MONITORS)), "All 2 screens");
+        let unknown = ScreensView {
+            monitors: vec![MonitorEntry::saturating(false, 0, 0, 0, 0)],
+            shown: 1,
+            ..ScreensView::default()
+        };
+        assert_eq!(screen_detail(&unknown), "Screen 1 of 1");
+        for control in [false, true] {
+            let mut w = Window::new(control);
+            w.viewer.details = true;
+            for screens in [None, Some(ScreensView::default())] {
+                w.viewing.screens = screens;
+                w.pass(ms(0), Vec::new());
+                w.pass(ms(0), Vec::new());
+                assert!(w.has("Round trip: Measuring…"), "the details show");
+                assert!(!w.has("Screen"), "{control}: {:?}", w.texts());
+            }
+            for (view, line) in [
+                (unknown.clone(), "Screen 1 of 1"),
+                (two_screens(2), "Screen 2 of 2 · 1920 × 1080"),
+                (two_screens(ALL_MONITORS), "All 2 screens"),
+            ] {
+                w.viewing.screens = Some(view);
+                w.pass(ms(100), Vec::new());
+                w.pass(ms(100), Vec::new());
+                assert!(w.has("Screen") && w.has(line), "{control}: {:?}", w.texts());
+            }
+        }
     }
 }

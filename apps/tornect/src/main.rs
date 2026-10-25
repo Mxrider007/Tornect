@@ -491,6 +491,8 @@ enum SheetArg {
     ViewerQuality,
     /// The stream window's details with the Quality and Timing rows.
     ViewerDetails,
+    /// The stream window's Screens menu: two screens and "All screens".
+    ViewerScreens,
 }
 
 impl From<SheetArg> for ui::preview::Sheet {
@@ -527,6 +529,7 @@ impl From<SheetArg> for ui::preview::Sheet {
             SheetArg::LinkFilled => Self::LinkFilled,
             SheetArg::ViewerQuality => Self::ViewerQuality,
             SheetArg::ViewerDetails => Self::ViewerDetails,
+            SheetArg::ViewerScreens => Self::ViewerScreens,
         }
     }
 }

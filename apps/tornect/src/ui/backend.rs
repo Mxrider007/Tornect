@@ -17,7 +17,7 @@ use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
 use tornect_input::InputEvent;
 use tornect_session::{
     CaptureStarted, MediaEnd, MediaHost, MediaLimits, MediaObserver, MediaReport, Source,
-    SystemBackend,
+    SystemBackend, ViewerRequest,
 };
 use tornect_signal::fsm::client::{
     self, ClientConfig, ClientDeps, ClientOutcome, Intent, NoServerKeyPin,
@@ -55,6 +55,9 @@ use crate::ua_client::{self, AdminAction, Logged};
 /// Input events queued for the media stream; one beyond that is dropped (the
 /// host's own budget is 250/s with a burst of 500).
 const INPUT_QUEUE: usize = 256;
+/// Screen requests queued for the media stream: the window sends one at a
+/// time (its button waits for the answer), and one more finds it full.
+const SCREEN_REQUESTS: usize = 1;
 /// How long the owner has to answer the desktop's dialog at the setup step:
 /// they are at the desk, having just clicked.
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
@@ -126,6 +129,11 @@ pub enum Command {
     /// sent to the host of the session being viewed, if it changes anything
     /// (the quality design §3.2).
     Quality(QualityPreset),
+    /// The viewer chose this screen in the stream window's Screens menu (0:
+    /// all of them): sent to the host of the session being viewed, in
+    /// control and view-only sessions alike, unless a request waits for its
+    /// answer (the monitors design §2, V1).
+    ShowScreen(u8),
     /// Shut down.
     Quit,
 }
@@ -156,7 +164,8 @@ pub struct UaChoice {
 
 /// What the viewer and the stream window share: the newest picture, while
 /// a control session runs the way to the host for input, and while any
-/// session runs the way to it for the viewer's quality picks.
+/// session runs the way to it for the viewer's quality picks and screen
+/// requests.
 #[derive(Debug, Default)]
 pub struct StreamLink {
     /// The newest picture.
@@ -166,6 +175,11 @@ pub struct StreamLink {
     /// sends each change as one `SetQuality`): a new channel for every
     /// session, so no pick of an earlier one reaches a later one.
     quality: Mutex<Option<watch::Sender<QualityPreset>>>,
+    /// The screen requests of the session being viewed
+    /// (`MediaViewer::run_with` sends each as one `SelectMonitor`), in
+    /// control and view-only sessions alike: a new channel for every
+    /// session, as for the picks.
+    requests: Mutex<Option<mpsc::Sender<ViewerRequest>>>,
 }
 
 /// The way to the host for input, while a control session runs.
@@ -194,6 +208,30 @@ impl StreamLink {
     /// The channel of the session's picks; `None` at its end.
     fn set_quality(&self, tx: Option<watch::Sender<QualityPreset>>) {
         *self.quality.lock().unwrap_or_else(PoisonError::into_inner) = tx;
+    }
+
+    /// A session starts: a fresh channel for its screen requests, whose
+    /// receiver goes to its viewer.
+    fn start_requests(&self) -> mpsc::Receiver<ViewerRequest> {
+        let (tx, rx) = mpsc::channel(SCREEN_REQUESTS);
+        self.set_requests(Some(tx));
+        rx
+    }
+
+    /// The channel of the session's screen requests; `None` at its end.
+    fn set_requests(&self, tx: Option<mpsc::Sender<ViewerRequest>>) {
+        *self.requests.lock().unwrap_or_else(PoisonError::into_inner) = tx;
+    }
+
+    /// Ask the host of the session being viewed to show screen `id` (0: all
+    /// of them); whether the request was queued (never blocks the UI
+    /// thread). `false` with no session, or with the queue full.
+    pub fn show_screen(&self, id: u8) -> bool {
+        self.requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|tx| tx.try_send(ViewerRequest::ShowScreen(id)).is_ok())
     }
 
     /// The viewer picked `preset` in the toolbar: it goes to the host only
@@ -2195,6 +2233,24 @@ fn refresh_diagnostics(b: &Backend) {
     });
 }
 
+/// The viewer chose screen `id` in the stream window (0: all of them): one
+/// request to the viewed session's host, only once the host listed its
+/// monitors and while no other request waits for its answer. The model is
+/// held while the request is queued, so that the viewer's answer, which
+/// clears "Switching…", always comes after it was set, even one said at
+/// once (a request not sent, an id no list holds).
+fn show_screen(shared: &Shared, link: &StreamLink, id: u8) {
+    shared.update(|m| {
+        if let ClientStage::Live(v) = &mut m.client
+            && let Some(screens) = &mut v.screens
+            && screens.switching.is_none()
+            && link.show_screen(id)
+        {
+            screens.switching = Some(id);
+        }
+    });
+}
+
 /// Whether a start asks the first run's question: on the first start of a
 /// home (`first_run`; an upgraded install has its marker and is not asked),
 /// unless the window starts in background mode, with no window shown, where
@@ -2568,6 +2624,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     Command::Quality(preset) => {
                         b.link.request_quality(preset);
                     }
+                    Command::ShowScreen(id) => show_screen(&b.shared, &b.link, id),
                     Command::StopSharing => {
                         if let Some(hosted) = &hosted {
                             stop_sharing(&hosted.serving.1.kill, &b.shared);
@@ -3347,6 +3404,7 @@ async fn view_session(
     let ended = viewed(&b, &node, id, &stop, &mut live, ua).await;
     b.link.set_input(None);
     b.link.set_quality(None);
+    b.link.set_requests(None);
     let message = match ended {
         Ok(message) => message,
         Err(e) => format!("{e:#}"),
@@ -3576,6 +3634,9 @@ async fn viewed(
     // pick made in it can only go to this session.
     let quality = b.shared.read(|m| m.settings.viewer.quality);
     let picks = b.link.start_quality(quality);
+    // Its own channel for screen requests too, in either mode: choosing a
+    // screen is a viewing choice (the monitors design §4).
+    let requests = b.link.start_requests();
     b.shared.update(|m| {
         m.go_live(Viewing {
             host: host.clone(),
@@ -3586,6 +3647,7 @@ async fn viewed(
             pictures: 0,
             size: (0, 0),
             stream: StreamInfo::default(),
+            screens: None,
         });
     });
     // The day of the visit, if history is kept; nothing otherwise.
@@ -3618,7 +3680,7 @@ async fn viewed(
     let watching = crate::tor_cmd::WatchOptions {
         channels: tornect_session::ViewerChannels {
             input,
-            requests: None,
+            requests: Some(requests),
         },
         forward: Some(&mut sink),
         quality,
@@ -3632,6 +3694,7 @@ async fn viewed(
     b.shared.update(super::model::Model::end_notices);
     b.link.set_input(None);
     b.link.set_quality(None);
+    b.link.set_requests(None);
     Ok(match end? {
         End::You => {
             if let Err(e) = session.bye(bye::USER).await {
@@ -5840,6 +5903,7 @@ mod tests {
                 pictures: 0,
                 size: (0, 0),
                 stream: StreamInfo::default(),
+                screens: None,
             });
         });
         let popups = Popups::new(Arc::clone(&shared));
@@ -8650,5 +8714,96 @@ mod tests {
             assert_eq!(m.sessions.as_deref().map(<[_]>::len), Some(0), "no spinner");
             assert!(m.sessions_partial);
         });
+    }
+
+    /// The monitors design §2: each viewed session gets its own channel of
+    /// screen requests; a request is queued without blocking the UI thread,
+    /// at most one waits, none goes without a session, and none of an
+    /// earlier session reaches a later one.
+    #[test]
+    fn each_session_gets_its_own_screen_requests() {
+        use tokio::sync::mpsc::error::TryRecvError;
+        let link = StreamLink::default();
+        assert!(!link.show_screen(2), "no session");
+        let mut first = link.start_requests();
+        assert!(link.show_screen(2));
+        assert!(!link.show_screen(1), "one waits already");
+        assert_eq!(first.try_recv(), Ok(ViewerRequest::ShowScreen(2)));
+        assert!(link.show_screen(tornect_proto::ALL_MONITORS));
+        // The session ends: nothing more goes, and its receiver hears that.
+        link.set_requests(None);
+        assert!(!link.show_screen(1));
+        assert_eq!(first.try_recv(), Ok(ViewerRequest::ShowScreen(0)));
+        assert_eq!(first.try_recv(), Err(TryRecvError::Disconnected));
+        let mut second = link.start_requests();
+        assert_eq!(second.try_recv(), Err(TryRecvError::Empty));
+        assert!(link.show_screen(1));
+        assert_eq!(second.try_recv(), Ok(ViewerRequest::ShowScreen(1)));
+        assert_eq!(first.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
+    /// A choice in the Screens menu marks the session as switching only once
+    /// its request is queued, and does so under the model's lock, so the
+    /// viewer's answer (even one it gives at once, as for a request it
+    /// could not send) always comes after the mark. In control and
+    /// view-only sessions alike; never before the host listed its screens,
+    /// without a session, or while a request waits.
+    #[test]
+    fn a_screen_choice_marks_the_session_switching_once_it_is_queued() {
+        use super::super::model::ScreensView;
+        use tokio::sync::mpsc::error::TryRecvError;
+        let listed = || ScreensView {
+            monitors: vec![
+                tornect_proto::MonitorEntry::saturating(true, 0, 0, 2560, 1440),
+                tornect_proto::MonitorEntry::saturating(false, 2560, 0, 1920, 1080),
+            ],
+            all: true,
+            shown: 1,
+            ..ScreensView::default()
+        };
+        let live = |control, screens| {
+            ClientStage::Live(Viewing {
+                host: "Desk".to_owned(),
+                control,
+                administrator: false,
+                unattended: false,
+                since: Instant::now(),
+                pictures: 0,
+                size: (0, 0),
+                stream: StreamInfo::default(),
+                screens,
+            })
+        };
+        let switching = |shared: &Shared| {
+            shared.read(|m| match &m.client {
+                ClientStage::Live(v) => v.screens.as_ref().and_then(|s| s.switching),
+                _ => None,
+            })
+        };
+        let link = StreamLink::default();
+        let mut rx = link.start_requests();
+        // No session; a session whose host listed nothing yet.
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        show_screen(&shared, &link, 2);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        shared.update(|m| m.client = live(true, None));
+        show_screen(&shared, &link, 2);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        for control in [false, true] {
+            shared.update(|m| m.client = live(control, Some(listed())));
+            show_screen(&shared, &link, 2);
+            assert_eq!(switching(&shared), Some(2), "{control}");
+            // A second choice while the first waits asks for nothing.
+            show_screen(&shared, &link, tornect_proto::ALL_MONITORS);
+            assert_eq!(switching(&shared), Some(2), "{control}");
+            assert_eq!(rx.try_recv(), Ok(ViewerRequest::ShowScreen(2)), "{control}");
+            assert_eq!(rx.try_recv(), Err(TryRecvError::Empty), "{control}");
+        }
+        // The session's channel is gone: the request is not queued, so the
+        // window does not wait for an answer.
+        link.set_requests(None);
+        shared.update(|m| m.client = live(true, Some(listed())));
+        show_screen(&shared, &link, 2);
+        assert_eq!(switching(&shared), None);
     }
 }

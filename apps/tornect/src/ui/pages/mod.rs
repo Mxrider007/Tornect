@@ -2000,6 +2000,7 @@ mod tests {
             pictures: 0,
             size: (0, 0),
             stream: StreamInfo::default(),
+            screens: None,
         });
         model.ua_live = Some(UaLive {
             withheld: true,
@@ -2562,6 +2563,7 @@ mod tests {
             pictures: 1,
             size: (1280, 720),
             stream: StreamInfo::default(),
+            screens: None,
         });
         live.dial = dial(None);
         let window = Window::new(live.clone(), Page::Home, egui::Theme::Dark, WIDE);

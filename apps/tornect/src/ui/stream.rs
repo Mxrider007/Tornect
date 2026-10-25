@@ -3,17 +3,20 @@
 //! [`VideoTexture`] puts it in one registered native `Rgba8Unorm` texture with
 //! `queue.write_texture` (a new texture only when the size changes, never one
 //! per picture), and [`Forwarder`] turns the window's pointer, wheel and keys
-//! into the 16-byte input events, only for a control session.
+//! into the 16-byte input events, only for a control session. The host's
+//! monitors reach the model through the same sink ([`SlotSink::screens`]),
+//! and the forwarder sends no positional input made against a picture from
+//! before the host's screen changed (the monitors design's V5).
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tornect_codec::DecodedFrame;
 use tornect_input::{Button, InputEvent, WHEEL_NOTCH, normalize};
-use tornect_proto::{HostStats, QualityInfo};
-use tornect_session::FrameSink;
+use tornect_proto::{HostStats, QualityInfo, monitor_status, seq_reached};
+use tornect_session::{FrameSink, Screens, ScreensNews};
 
-use super::model::{ClientStage, Shared, Wake};
+use super::model::{ClientStage, ScreenNote, ScreensView, Shared, Wake};
 
 /// The newest decoded picture, from the viewer task to the UI thread. A newer
 /// picture replaces one the window has not drawn yet: the window shows the
@@ -32,14 +35,18 @@ pub struct Picture {
     pub height: u32,
     /// `4 × width × height` bytes.
     pub rgba: Vec<u8>,
+    /// The host's `Video` seq of the picture: what the stream window drew,
+    /// for its input hold (the monitors design's V5).
+    pub seq: u32,
     /// Not drawn yet.
     pub fresh: bool,
 }
 
 impl FrameSlot {
-    /// Put `frame` in the slot, reusing its buffer.
-    pub fn put(&self, frame: &DecodedFrame) {
+    /// Put picture `seq`, `frame`, in the slot, reusing its buffer.
+    pub fn put(&self, seq: u32, frame: &DecodedFrame) {
         let mut slot = self.picture.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.seq = seq;
         slot.width = frame.width;
         slot.height = frame.height;
         slot.rgba.clear();
@@ -95,9 +102,9 @@ impl SlotSink {
 }
 
 impl FrameSink for SlotSink {
-    fn picture(&mut self, _seq: u32, frame: &DecodedFrame) {
+    fn picture(&mut self, seq: u32, frame: &DecodedFrame) {
         self.pictures += 1;
-        self.slot.put(frame);
+        self.slot.put(seq, frame);
         // The counters change on every picture; the model lock is cheap, and
         // `Wake::Frame` redraws only the stream window.
         let (pictures, size, timing) = (self.pictures, (frame.width, frame.height), frame.timing);
@@ -135,6 +142,64 @@ impl FrameSink for SlotSink {
             }
         });
     }
+
+    /// The host's monitors and why the viewer says them now (the monitors
+    /// design §5.7): into the live session's [`ScreensView`], then a wake of
+    /// the stream window only, as a picture's. An answer, a request given
+    /// up or one not sent ends the window's "Switching…"; a `REMAPPED` list
+    /// holds input made against earlier pictures back from its seq (V5).
+    fn screens(&mut self, screens: &Screens, news: ScreensNews) {
+        self.shared.update_quiet(|m| {
+            if let ClientStage::Live(v) = &mut m.client {
+                follow_screens(
+                    v.screens.get_or_insert_with(ScreensView::default),
+                    screens,
+                    news,
+                );
+            }
+        });
+        self.shared.wake(Wake::Frame);
+    }
+}
+
+/// Take the viewer's word on the host's monitors into `view` (the window's
+/// [`ScreensView`]): the list as it stands, what the newest news asks the
+/// window to say ([`ScreensView::last`], counted in
+/// [`ScreensView::news`]), the end of a request on its way, and the hold of
+/// a `REMAPPED` list. `NoAnswer` and `NotSent` repeat the list said last:
+/// they change nothing of it and hold nothing back again.
+fn follow_screens(view: &mut ScreensView, screens: &Screens, news: ScreensNews) {
+    // The first list says nothing: it is the session's start.
+    let before = (view.news > 0 || !view.monitors.is_empty()).then_some(view.shown);
+    view.monitors.clone_from(&screens.monitors);
+    view.all = screens.all;
+    view.shown = screens.shown;
+    view.list = screens.list;
+    view.last = match news {
+        ScreensNews::Layout => {
+            before
+                .is_some_and(|was| was != screens.shown)
+                .then_some(ScreenNote::Changed {
+                    shown: screens.shown,
+                })
+        }
+        ScreensNews::Answer { asked, status } => {
+            view.switching = None;
+            (status != monitor_status::OK).then_some(ScreenNote::Refused { asked, status })
+        }
+        ScreensNews::NoAnswer { asked } => {
+            view.switching = None;
+            Some(ScreenNote::NoAnswer { asked })
+        }
+        ScreensNews::NotSent { asked } => {
+            view.switching = None;
+            Some(ScreenNote::NotSent { asked })
+        }
+    };
+    if screens.remapped && matches!(news, ScreensNews::Layout | ScreensNews::Answer { .. }) {
+        view.hold_from = Some(screens.seq);
+    }
+    view.news = view.news.wrapping_add(1);
 }
 
 /// What to do with a picture's texture.
@@ -425,6 +490,12 @@ pub struct Forwarder {
     pending_move: Option<(u16, u16)>,
     last_move: Option<(u16, u16)>,
     wheel: (f64, f64),
+    /// The seq of the first picture of another part of the host's desktop,
+    /// until a picture at or after it is drawn: no move, wheel turn or
+    /// press goes out meanwhile (the monitors design's V5).
+    hold: Option<u32>,
+    /// The seq of the picture the window drew last.
+    drawn: Option<u32>,
     out: Vec<InputEvent>,
 }
 
@@ -514,10 +585,50 @@ impl Forwarder {
         }
     }
 
+    /// Pictures from `seq` on show another part of the host's desktop (a
+    /// `REMAPPED` list, the monitors design's V5): until one of them is
+    /// drawn, no move, wheel turn or press goes out, since each would be
+    /// made against a picture of the part shown before; a coalesced move or
+    /// wheel turn waiting to go is dropped. Releases and keys still go. A
+    /// picture at or after `seq` already drawn holds nothing back.
+    pub fn hold_from(&mut self, seq: u32) {
+        if self.drawn.is_some_and(|drawn| seq_reached(drawn, seq)) {
+            return;
+        }
+        self.hold = Some(seq);
+        self.pending_move = None;
+        self.wheel = (0.0, 0.0);
+    }
+
+    /// The window drew picture `seq`. The first at or after the hold ends
+    /// it, and the pointer's position goes out again if it is on the
+    /// picture, so the host places it on the part now shown.
+    pub fn drawn(&mut self, seq: u32) {
+        self.drawn = Some(seq);
+        if !self.hold.is_some_and(|hold| seq_reached(seq, hold)) {
+            return;
+        }
+        self.hold = None;
+        self.last_move = None;
+        if self.sends()
+            && self.on_picture()
+            && let (Some(rect), Some(pos)) = (self.picture, self.cursor)
+        {
+            self.pending_move = Some(rect.normalized(pos));
+        }
+    }
+
+    /// Whether input made now would be made against a picture from before
+    /// the host's screen changed ([`hold_from`](Self::hold_from)).
+    #[must_use]
+    pub fn holding(&self) -> bool {
+        self.hold.is_some()
+    }
+
     /// The pointer moved to `pos` (physical pixels in the window).
     pub fn moved(&mut self, pos: (f64, f64)) {
         self.cursor = Some(pos);
-        let Some(rect) = self.picture.filter(|_| self.sends()) else {
+        let Some(rect) = self.picture.filter(|_| self.sends() && !self.holding()) else {
             return;
         };
         // Off the picture, a move is sent only while a button forwarded from
@@ -542,7 +653,7 @@ impl Forwarder {
             return;
         }
         if pressed {
-            if !self.on_picture() {
+            if !self.on_picture() || self.holding() {
                 return;
             }
             self.flush_pending();
@@ -563,7 +674,7 @@ impl Forwarder {
     /// The wheel turned by `lines` (winit's `LineDelta`: `+y` away from the
     /// user, `+x` to the left) or, from a touchpad, by `pixels`.
     pub fn wheel(&mut self, lines: (f64, f64), pixels: (f64, f64)) {
-        if !self.sends() || !self.on_picture() {
+        if !self.sends() || !self.on_picture() || self.holding() {
             return;
         }
         let unit = f64::from(WHEEL_NOTCH);
@@ -609,10 +720,11 @@ impl Forwarder {
     }
 
     /// Whether a press now goes to the host: the session sends input, it is
-    /// not paused, and the pointer is on the picture.
+    /// not paused, the pointer is on the picture, and no picture of another
+    /// part of the host's desktop is awaited ([`hold_from`](Self::hold_from)).
     #[must_use]
     pub fn counts_press(&self) -> bool {
-        self.sends() && self.on_picture()
+        self.sends() && self.on_picture() && !self.holding()
     }
 
     /// A key combination, as USB usages: pressed in order, then released in
@@ -982,12 +1094,15 @@ mod tests {
     #[test]
     fn a_new_session_never_shows_the_last_ones_picture() {
         let slot = Arc::new(FrameSlot::default());
-        slot.put(&DecodedFrame {
-            width: 1,
-            height: 1,
-            rgba: vec![9, 9, 9, 255],
-            timing: DecodeTiming::default(),
-        });
+        slot.put(
+            1,
+            &DecodedFrame {
+                width: 1,
+                height: 1,
+                rgba: vec![9, 9, 9, 255],
+                timing: DecodeTiming::default(),
+            },
+        );
         let shared = Shared::new(super::super::model::Model::default(), Arc::new(|_| {}));
         let _sink = SlotSink::new(Arc::clone(&slot), shared);
         let mut mine = Picture::default();
@@ -1019,6 +1134,7 @@ mod tests {
                 pictures: 0,
                 size: (0, 0),
                 stream: StreamInfo::default(),
+                screens: None,
             }),
             ..Model::default()
         };
@@ -1117,6 +1233,294 @@ mod tests {
         assert_eq!(e.micros(), Some(8000));
     }
 
+    /// A live session's model, with the wakes it gave.
+    fn live_shared() -> (Arc<Shared>, Arc<Mutex<Vec<Wake>>>) {
+        use super::super::model::{Model, StreamInfo, Viewing};
+        let wakes = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&wakes);
+        let live = Model {
+            client: ClientStage::Live(Viewing {
+                host: "Desk".to_owned(),
+                control: true,
+                administrator: false,
+                unattended: false,
+                since: std::time::Instant::now(),
+                pictures: 0,
+                size: (0, 0),
+                stream: StreamInfo::default(),
+                screens: None,
+            }),
+            ..Model::default()
+        };
+        let shared = Shared::new(live, Arc::new(move |why| seen.lock().unwrap().push(why)));
+        (shared, wakes)
+    }
+
+    /// Two monitors side by side, the first the main one, "all" offered:
+    /// what the host's `Monitors` lists, showing `shown` from `seq` on.
+    fn two_screens(shown: u8, seq: u32, remapped: bool) -> Screens {
+        use tornect_proto::MonitorEntry;
+        Screens {
+            monitors: vec![
+                MonitorEntry::saturating(true, 0, 0, 2560, 1440),
+                MonitorEntry::saturating(false, 2560, 0, 1920, 1080),
+            ],
+            all: true,
+            shown,
+            list: 3,
+            seq,
+            remapped,
+        }
+    }
+
+    /// The monitors design §5.7: what the viewer says of the host's
+    /// screens reaches the live session's `ScreensView`, and wakes the
+    /// stream window only. The first list says nothing; an answer, a
+    /// request given up and one not sent end "Switching…", the last two and
+    /// a refusal with words for the toast, an answer that shows the screen
+    /// asked for with none; the host's news says something only when it
+    /// changes the screen shown; a `REMAPPED` list holds input back from its
+    /// seq, and a request given up holds nothing back again. Outside a live
+    /// session nothing is written.
+    #[test]
+    fn the_hosts_screens_reach_the_model_and_end_a_switch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tornect_proto::monitor_status;
+
+        let (shared, wakes) = live_shared();
+        let mut sink = SlotSink::new(Arc::new(FrameSlot::default()), Arc::clone(&shared));
+        let read = |shared: &Shared| {
+            shared.read(|m| match &m.client {
+                ClientStage::Live(v) => v.screens.clone(),
+                _ => panic!("not live"),
+            })
+        };
+        let set_switching = |shared: &Shared, to: Option<u8>| {
+            shared.update_quiet(|m| {
+                if let ClientStage::Live(v) = &mut m.client {
+                    v.screens.as_mut().unwrap().switching = to;
+                }
+            });
+        };
+        assert_eq!(read(&shared), None, "nothing listed yet");
+        sink.screens(&two_screens(1, 0, false), ScreensNews::Layout);
+        let view = read(&shared).expect("listed");
+        assert_eq!(view.monitors, two_screens(1, 0, false).monitors);
+        assert!(view.all);
+        assert_eq!((view.shown, view.list, view.news), (1, 3, 1));
+        assert_eq!(
+            (view.last, view.hold_from, view.switching),
+            (None, None, None)
+        );
+        // An answer that shows the screen asked for.
+        set_switching(&shared, Some(2));
+        sink.screens(
+            &two_screens(2, 41, true),
+            ScreensNews::Answer {
+                asked: 2,
+                status: monitor_status::OK,
+            },
+        );
+        let view = read(&shared).unwrap();
+        assert_eq!((view.shown, view.switching, view.last), (2, None, None));
+        assert_eq!(view.hold_from, Some(41));
+        assert_eq!(view.news, 2);
+        // Refusals, a request given up and one not sent.
+        for (news, note) in [
+            (
+                ScreensNews::Answer {
+                    asked: 0,
+                    status: monitor_status::FAILED,
+                },
+                ScreenNote::Refused {
+                    asked: 0,
+                    status: monitor_status::FAILED,
+                },
+            ),
+            (
+                ScreensNews::Answer {
+                    asked: 1,
+                    status: monitor_status::BUSY,
+                },
+                ScreenNote::Refused {
+                    asked: 1,
+                    status: monitor_status::BUSY,
+                },
+            ),
+            (
+                ScreensNews::NoAnswer { asked: 1 },
+                ScreenNote::NoAnswer { asked: 1 },
+            ),
+            (
+                ScreensNews::NotSent { asked: 0 },
+                ScreenNote::NotSent { asked: 0 },
+            ),
+        ] {
+            set_switching(&shared, Some(1));
+            // The list said last, as the viewer repeats it.
+            sink.screens(&two_screens(2, 41, true), news);
+            let view = read(&shared).unwrap();
+            assert_eq!(view.switching, None, "{news:?}");
+            assert_eq!(view.last, Some(note), "{news:?}");
+            assert_eq!(view.shown, 2, "{news:?}");
+            assert_eq!(view.hold_from, Some(41), "{news:?}");
+        }
+        // A request given up after the hold ended holds nothing back again.
+        shared.update_quiet(|m| {
+            if let ClientStage::Live(v) = &mut m.client {
+                v.screens.as_mut().unwrap().hold_from = None;
+            }
+        });
+        sink.screens(
+            &two_screens(2, 41, true),
+            ScreensNews::NoAnswer { asked: 1 },
+        );
+        assert_eq!(read(&shared).unwrap().hold_from, None);
+        // The host's news: the same screen says nothing, another screen
+        // says which, and a remap holds input back from its seq.
+        set_switching(&shared, Some(1));
+        sink.screens(&two_screens(2, 50, false), ScreensNews::Layout);
+        let view = read(&shared).unwrap();
+        assert_eq!(view.last, None);
+        assert_eq!(view.switching, Some(1), "news is no answer");
+        sink.screens(&two_screens(1, 60, true), ScreensNews::Layout);
+        let view = read(&shared).unwrap();
+        assert_eq!(view.last, Some(ScreenNote::Changed { shown: 1 }));
+        assert_eq!((view.shown, view.hold_from), (1, Some(60)));
+        assert_eq!(view.news, 9);
+        assert_eq!(*wakes.lock().unwrap(), vec![Wake::Frame; 9]);
+        // No live session: nothing is written.
+        let counted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&counted);
+        let idle = Shared::new(
+            super::super::model::Model::default(),
+            Arc::new(move |_| {
+                count.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        let mut sink = SlotSink::new(Arc::new(FrameSlot::default()), Arc::clone(&idle));
+        sink.screens(&two_screens(1, 0, false), ScreensNews::Layout);
+        assert!(idle.read(|m| matches!(m.client, ClientStage::Idle)));
+    }
+
+    /// The monitors design's V5: from a `REMAPPED` list's seq until a
+    /// picture at or after it is drawn, no move, wheel turn or press goes
+    /// out (a coalesced move or wheel turn waiting is dropped), while the
+    /// release of a button held from before, keys and combinations still
+    /// go; the first such picture drawn ends the hold and sends the
+    /// pointer's position again, even unmoved. A picture already drawn
+    /// holds nothing back; the seqs wrap.
+    #[test]
+    fn positional_input_waits_for_the_first_picture_of_another_screen() {
+        let mut f = open();
+        let on = (500.0, 300.0);
+        f.drawn(9);
+        f.moved(on);
+        f.button(Button::Left, true);
+        f.flush();
+        let at = RECT.normalized(on);
+        assert_eq!(
+            f.drain(),
+            vec![
+                InputEvent::PointerMove { x: at.0, y: at.1 },
+                InputEvent::PointerButton {
+                    button: Button::Left,
+                    pressed: true
+                }
+            ]
+        );
+        f.moved((520.0, 310.0));
+        f.wheel((0.0, 2.0), (0.0, 0.0));
+        assert!(f.has_pending());
+        f.hold_from(10);
+        assert!(f.holding());
+        assert!(!f.has_pending(), "what waited is dropped");
+        f.moved((530.0, 320.0));
+        f.wheel((0.0, 1.0), (0.0, 0.0));
+        f.button(Button::Right, true);
+        assert!(!f.counts_press());
+        f.button(Button::Left, false);
+        f.key(0x07_0004, true);
+        f.key(0x07_0004, false);
+        f.send_combo(&[0x07_00e2, 0x07_002b]);
+        f.drawn(9);
+        assert!(f.holding(), "the same picture again");
+        f.flush();
+        assert_eq!(
+            f.drain(),
+            vec![
+                InputEvent::PointerButton {
+                    button: Button::Left,
+                    pressed: false
+                },
+                key_a(true),
+                key_a(false),
+                InputEvent::Key {
+                    usb: 0x07_00e2,
+                    pressed: true
+                },
+                InputEvent::Key {
+                    usb: 0x07_002b,
+                    pressed: true
+                },
+                InputEvent::Key {
+                    usb: 0x07_002b,
+                    pressed: false
+                },
+                InputEvent::Key {
+                    usb: 0x07_00e2,
+                    pressed: false
+                },
+            ],
+            "no move, wheel turn or press"
+        );
+        // The first picture of the new screen: the pointer goes again.
+        f.drawn(10);
+        assert!(!f.holding());
+        assert!(f.counts_press());
+        f.flush();
+        let at = RECT.normalized((530.0, 320.0));
+        assert_eq!(
+            f.drain(),
+            vec![InputEvent::PointerMove { x: at.0, y: at.1 }]
+        );
+        // Unmoved since its last move, it still goes again after a hold.
+        f.hold_from(11);
+        f.drawn(12);
+        f.flush();
+        assert_eq!(
+            f.drain(),
+            vec![InputEvent::PointerMove { x: at.0, y: at.1 }]
+        );
+        // A hold of a picture already drawn holds nothing.
+        f.hold_from(12);
+        assert!(!f.holding());
+        f.hold_from(5);
+        assert!(!f.holding());
+        // Off the picture when the hold ends: nothing goes.
+        f.hold_from(13);
+        f.moved((10.0, 10.0));
+        f.drawn(13);
+        f.flush();
+        assert!(f.drain().is_empty());
+        // Across the wrap of the seqs.
+        f.drawn(u32::MAX - 1);
+        f.hold_from(1);
+        assert!(f.holding(), "1 comes after u32::MAX - 1");
+        f.drawn(u32::MAX);
+        assert!(f.holding());
+        f.drawn(1);
+        assert!(!f.holding());
+        // A view-only forwarder holds and sends nothing either way.
+        let mut closed = Forwarder::new(false);
+        closed.set_picture(Some(RECT));
+        closed.moved(on);
+        closed.hold_from(3);
+        closed.drawn(3);
+        closed.flush();
+        assert!(closed.drain().is_empty());
+    }
+
     /// The picture keeps its aspect inside the window, centred.
     #[test]
     fn the_picture_is_letterboxed() {
@@ -1180,15 +1584,19 @@ mod tests {
         let mut mine = Picture::default();
         assert!(!slot.take(&mut mine));
         for n in 1..=3u8 {
-            slot.put(&DecodedFrame {
-                width: 1,
-                height: 1,
-                rgba: vec![n, n, n, 255],
-                timing: DecodeTiming::default(),
-            });
+            slot.put(
+                u32::from(n) + 40,
+                &DecodedFrame {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![n, n, n, 255],
+                    timing: DecodeTiming::default(),
+                },
+            );
         }
         assert!(slot.take(&mut mine));
         assert_eq!(mine.rgba, vec![3, 3, 3, 255]);
+        assert_eq!(mine.seq, 43, "the seq comes with its picture");
         assert!(!slot.take(&mut mine), "a picture is handed over once");
     }
 
@@ -1214,6 +1622,7 @@ mod tests {
             rgba: (0..w * h * 4)
                 .map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed))
                 .collect(),
+            seq: u32::from(seed),
             fresh: true,
         };
         let first = picture(3, 2, 1);

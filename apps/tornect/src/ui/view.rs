@@ -2866,6 +2866,7 @@ mod tests {
                 pictures: 3,
                 size: (640, 480),
                 stream: StreamInfo::default(),
+                screens: None,
             }),
             ClientStage::Ended("SESSION ENDED by the host".to_owned()),
         ] {
@@ -2894,6 +2895,7 @@ mod tests {
             pictures: 1,
             size: (1600, 900),
             stream: StreamInfo::default(),
+            screens: None,
         };
         let mut actions = Vec::new();
         let mut drawn = None;
@@ -3147,6 +3149,7 @@ mod tests {
                 pictures: 1,
                 size: (1600, 900),
                 stream: StreamInfo::default(),
+                screens: None,
             };
             let mut nodes = Vec::new();
             for _ in 0..2 {
@@ -3221,6 +3224,7 @@ mod tests {
             pictures: 1,
             size: (1600, 900),
             stream: StreamInfo::default(),
+            screens: None,
         };
         for shared in [false, true] {
             let mut viewer = ViewerState::default();

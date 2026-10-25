@@ -439,6 +439,11 @@ struct StreamView {
     chord: keys::Chord,
     /// Whether the window was last told to be full screen.
     fullscreen: bool,
+    /// The seq of the picture in the texture, once one is.
+    drawn: Option<u32>,
+    /// The hold of the host's last `REMAPPED` list the forwarder was given
+    /// (the monitors design's V5).
+    hold: Option<u32>,
 }
 
 /// One key of the stream window at `now`, through the chord first (decision
@@ -509,10 +514,11 @@ fn close_ends_session(
 
 /// A pointer button of the stream window: a press that goes to the host
 /// also gives it the keyboard back. A press while the details or the Send
-/// keys menu or the Quality menu are open only closes them: it goes
+/// keys, Quality or Screens menu are open only closes them: it goes
 /// nowhere, nor does its release, which finds nothing held.
 fn on_button(forwarder: &mut Forwarder, viewer: &mut ViewerState, button: Button, pressed: bool) {
-    if pressed && (viewer.details || viewer.keys_menu || viewer.quality_menu) {
+    if pressed && (viewer.details || viewer.keys_menu || viewer.quality_menu || viewer.screens_menu)
+    {
         return;
     }
     if pressed && forwarder.counts_press() {
@@ -522,11 +528,12 @@ fn on_button(forwarder: &mut Forwarder, viewer: &mut ViewerState, button: Button
 }
 
 /// What one of the viewer's actions does (decision M1-70). The toolbar's
-/// controls change only the window's own state; End session and a pick in
-/// the Quality menu (a preset for the host, in control and view-only
-/// sessions alike) are the ones that ask the tokio side for anything.
-/// `viewing`, the signed level, is only read: no action raises the level or
-/// opens a closed forwarder, and a pick never touches the forwarder.
+/// controls change only the window's own state; End session, a pick in the
+/// Quality menu (a preset for the host) and a choice in the Screens menu (a
+/// monitor for the host), both in control and view-only sessions alike,
+/// are the ones that ask the tokio side for anything. `viewing`, the signed
+/// level, is only read: no action raises the level or opens a closed
+/// forwarder, and neither a pick nor a choice touches the forwarder.
 fn apply_viewer_action(
     forwarder: &mut Forwarder,
     viewer: &mut ViewerState,
@@ -547,12 +554,30 @@ fn apply_viewer_action(
             viewer.keys_menu = *open;
             // One menu at a time.
             viewer.quality_menu &= !*open;
+            viewer.screens_menu &= !*open;
             None
         }
         Action::Viewer(ViewerAction::QualityMenu(open)) => {
             viewer.quality_menu = *open;
             viewer.keys_menu &= !*open;
+            viewer.screens_menu &= !*open;
             None
+        }
+        Action::Viewer(ViewerAction::ScreensMenu(open)) => {
+            viewer.screens_menu = *open;
+            viewer.keys_menu &= !*open;
+            viewer.quality_menu &= !*open;
+            None
+        }
+        // To the host of the session being viewed, once it listed its
+        // monitors; the menu closes, and the screen already shown asks for
+        // nothing.
+        Action::Viewer(ViewerAction::ShowScreen(id)) => {
+            viewer.screens_menu = false;
+            viewing
+                .and_then(|v| v.screens.as_ref())
+                .filter(|s| s.shown != *id)
+                .map(|_| Command::ShowScreen(*id))
         }
         // To the host of the session being viewed, if one is; the menu
         // closes and says "Changing…" until the host applies it.
@@ -590,6 +615,26 @@ fn apply_viewer_action(
         // The window saves the picture it has; nothing goes to the host.
         Action::Viewer(ViewerAction::Screenshot) => None,
         _ => None,
+    }
+}
+
+/// Hand the forwarder the host's hold (`hold`, the seq of a `REMAPPED`
+/// list's first picture) when it is new since the last frame (`seen`), then
+/// the seq of the picture on screen (`drawn`): the monitors design's V5.
+fn follow_hold(
+    forwarder: &mut Forwarder,
+    seen: &mut Option<u32>,
+    hold: Option<u32>,
+    drawn: Option<u32>,
+) {
+    if hold != *seen {
+        *seen = hold;
+        if let Some(seq) = hold {
+            forwarder.hold_from(seq);
+        }
+    }
+    if let Some(seq) = drawn {
+        forwarder.drawn(seq);
     }
 }
 
@@ -858,6 +903,8 @@ impl App {
                             viewer,
                             chord: keys::Chord::default(),
                             fullscreen: false,
+                            drawn: None,
+                            hold: None,
                         });
                     }
                     Err(e) => {
@@ -1217,9 +1264,13 @@ impl App {
             let mut renderer = rs.renderer.write();
             // The details' "upload": this picture's write into the texture.
             let started = Instant::now();
-            view.video
+            let upload = view
+                .video
                 .upload(&rs.device, &rs.queue, &mut renderer, &view.picture);
             view.viewer.upload_ms.add_duration(started.elapsed());
+            if !matches!(upload, super::stream::Upload::Reject(_)) {
+                view.drawn = Some(view.picture.seq);
+            }
         }
         let viewing = self.shared.read(|m| match &m.client {
             ClientStage::Live(v) => Some(v.clone()),
@@ -1256,6 +1307,14 @@ impl App {
         let visible = view.viewer.visible().map(|r| to_pixels(r, ppp));
         view.forwarder
             .set_areas(drawn.map(|r| to_pixels(r, ppp)), visible, blocked.collect());
+        // V5: nothing positional made against a picture from before the
+        // host's screen changed goes out, until a picture of the new one is
+        // on screen; then the pointer's position goes out again.
+        let hold = viewing
+            .as_ref()
+            .and_then(|v| v.screens.as_ref())
+            .and_then(|s| s.hold_from);
+        follow_hold(&mut view.forwarder, &mut view.hold, hold, view.drawn);
         for action in actions {
             self.act(action, None);
         }
@@ -3207,7 +3266,9 @@ mod tests {
     /// Every action of the viewer, at every signed level, on a closed and an
     /// open forwarder: the forwarder stays as it was built, a closed one
     /// sends nothing, and the only commands any of them gives are End and,
-    /// for a pick in the Quality menu, that preset (at every level alike).
+    /// for a pick in the Quality menu, that preset, and for a choice in the
+    /// Screens menu once the host listed its monitors, that screen (at
+    /// every level alike).
     #[test]
     fn no_toolbar_action_raises_the_level_or_opens_input() {
         use tornect_core::config::QualityPreset;
@@ -3233,6 +3294,11 @@ mod tests {
             Action::Viewer(ViewerAction::Quality(QualityPreset::BestQuality)),
             Action::Viewer(ViewerAction::Quality(QualityPreset::Balanced)),
             Action::Viewer(ViewerAction::Quality(QualityPreset::BestPerformance)),
+            Action::Viewer(ViewerAction::ScreensMenu(true)),
+            Action::Viewer(ViewerAction::ScreensMenu(false)),
+            Action::Viewer(ViewerAction::ShowScreen(0)),
+            Action::Viewer(ViewerAction::ShowScreen(1)),
+            Action::Viewer(ViewerAction::ShowScreen(2)),
         ];
         let w = Window::new(true);
         for open in [false, true] {
@@ -3242,6 +3308,7 @@ mod tests {
                         control,
                         administrator,
                         unattended,
+                        screens: Some(listed(1)),
                         ..w.viewing.clone()
                     };
                     for action in &all {
@@ -3264,6 +3331,10 @@ mod tests {
                         let asks = match action {
                             Action::EndViewing => Some(Command::EndViewing),
                             Action::Viewer(ViewerAction::Quality(p)) => Some(Command::Quality(*p)),
+                            // Screen 1 is the one shown.
+                            Action::Viewer(ViewerAction::ShowScreen(id)) if *id != 1 => {
+                                Some(Command::ShowScreen(*id))
+                            }
                             _ => None,
                         };
                         assert_eq!(command, asks, "{action:?}");
@@ -3379,6 +3450,174 @@ mod tests {
         forwarder.flush();
         assert!(forwarder.drain().is_empty());
         assert!(state.keyboard_local, "the keyboard stays here");
+    }
+
+    /// Two monitors side by side as the host listed them, `shown` shown.
+    fn listed(shown: u8) -> super::super::model::ScreensView {
+        super::super::model::ScreensView {
+            monitors: vec![
+                tornect_proto::MonitorEntry::saturating(true, 0, 0, 2560, 1440),
+                tornect_proto::MonitorEntry::saturating(false, 2560, 0, 1920, 1080),
+            ],
+            all: true,
+            shown,
+            ..super::super::model::ScreensView::default()
+        }
+    }
+
+    /// The monitors design §2: a choice in the Screens menu, in a control
+    /// and a view-only session alike, goes to the tokio side as that screen
+    /// (0: all of them) and closes the menu; the screen already shown, a
+    /// host that listed no monitors and no session ask for nothing. It sends
+    /// nothing through the forwarder, open or closed, and pauses nothing.
+    /// One menu at a time: the Screens menu closes the Send keys and Quality
+    /// menus and the other way round; while it is open a press only closes
+    /// it, and reaches nothing on the host.
+    #[test]
+    fn a_screen_choice_asks_for_the_screen_and_touches_no_input() {
+        let w = Window::new(true);
+        for control in [false, true] {
+            let viewing = Viewing {
+                control,
+                screens: Some(listed(1)),
+                ..w.viewing.clone()
+            };
+            for open in [false, true] {
+                let mut forwarder = Forwarder::new(open);
+                forwarder.set_picture(Some(PictureRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1280.0,
+                    height: 720.0,
+                }));
+                forwarder.moved((640.0, 400.0));
+                forwarder.flush();
+                forwarder.drain();
+                let mut state = ViewerState::default();
+                for (id, asks) in [
+                    (2, Some(Command::ShowScreen(2))),
+                    (0, Some(Command::ShowScreen(0))),
+                    (1, None),
+                ] {
+                    state.screens_menu = true;
+                    let choice = Action::Viewer(ViewerAction::ShowScreen(id));
+                    assert_eq!(
+                        apply_viewer_action(&mut forwarder, &mut state, Some(&viewing), &choice),
+                        asks,
+                        "{control}, {open}, {id}"
+                    );
+                    assert!(!state.screens_menu, "a choice closes the menu");
+                }
+                let unlisted = Viewing {
+                    screens: None,
+                    ..viewing.clone()
+                };
+                let choice = Action::Viewer(ViewerAction::ShowScreen(2));
+                assert_eq!(
+                    apply_viewer_action(&mut forwarder, &mut state, Some(&unlisted), &choice),
+                    None
+                );
+                assert_eq!(
+                    apply_viewer_action(&mut forwarder, &mut state, None, &choice),
+                    None
+                );
+                forwarder.flush();
+                assert!(forwarder.drain().is_empty(), "{control}, {open}");
+                assert!(!forwarder.is_paused());
+                assert_eq!(forwarder.is_open(), open);
+            }
+        }
+        let mut forwarder = Forwarder::new(true);
+        let mut state = ViewerState::default();
+        let viewing = w.viewing.clone();
+        let mut act = |state: &mut ViewerState, action: ViewerAction| {
+            apply_viewer_action(
+                &mut forwarder,
+                state,
+                Some(&viewing),
+                &Action::Viewer(action),
+            )
+        };
+        act(&mut state, ViewerAction::KeysMenu(true));
+        act(&mut state, ViewerAction::ScreensMenu(true));
+        assert!(state.screens_menu && !state.keys_menu);
+        act(&mut state, ViewerAction::QualityMenu(true));
+        assert!(state.quality_menu && !state.screens_menu);
+        act(&mut state, ViewerAction::ScreensMenu(true));
+        assert!(state.screens_menu && !state.quality_menu);
+        act(&mut state, ViewerAction::KeysMenu(true));
+        assert!(state.keys_menu && !state.screens_menu);
+        act(&mut state, ViewerAction::ScreensMenu(true));
+        act(&mut state, ViewerAction::ScreensMenu(false));
+        assert!(!state.screens_menu && !state.keys_menu && !state.quality_menu);
+        // The press that closes the open menu goes nowhere.
+        let mut forwarder = Forwarder::new(true);
+        forwarder.set_picture(Some(PictureRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1280.0,
+            height: 720.0,
+        }));
+        forwarder.moved((640.0, 400.0));
+        forwarder.flush();
+        forwarder.drain();
+        state.screens_menu = true;
+        state.keyboard_local = true;
+        on_button(&mut forwarder, &mut state, Button::Left, true);
+        on_button(&mut forwarder, &mut state, Button::Left, false);
+        assert!(forwarder.drain().is_empty());
+        assert!(state.keyboard_local, "the keyboard stays here");
+    }
+
+    /// The window's V5 (the monitors design §5.7): the forwarder hears a
+    /// host's hold once, when it is new, and every frame the seq of the
+    /// picture on screen, so that the first picture at or after the hold
+    /// ends it and sends the pointer's position again.
+    #[test]
+    fn the_window_hands_the_hold_and_the_drawn_picture_to_the_forwarder() {
+        let mut forwarder = Forwarder::new(true);
+        let rect = PictureRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1280.0,
+            height: 720.0,
+        };
+        forwarder.set_picture(Some(rect));
+        forwarder.moved((640.0, 400.0));
+        forwarder.flush();
+        forwarder.drain();
+        let mut seen = None;
+        follow_hold(&mut forwarder, &mut seen, None, Some(40));
+        assert!(!forwarder.holding());
+        // The list that remaps arrives before its picture.
+        follow_hold(&mut forwarder, &mut seen, Some(41), Some(40));
+        assert_eq!(seen, Some(41));
+        assert!(forwarder.holding());
+        forwarder.moved((650.0, 400.0));
+        forwarder.button(Button::Left, true);
+        forwarder.flush();
+        assert!(forwarder.drain().is_empty(), "made against picture 40");
+        follow_hold(&mut forwarder, &mut seen, Some(41), Some(40));
+        assert!(forwarder.holding());
+        // Its picture is drawn: the pointer goes where it is now.
+        follow_hold(&mut forwarder, &mut seen, Some(41), Some(41));
+        assert!(!forwarder.holding());
+        forwarder.flush();
+        let at = rect.normalized((650.0, 400.0));
+        assert_eq!(
+            forwarder.drain(),
+            vec![tornect_input::InputEvent::PointerMove { x: at.0, y: at.1 }]
+        );
+        // The same hold again holds nothing back: it is handed over once.
+        follow_hold(&mut forwarder, &mut seen, Some(41), Some(41));
+        assert!(!forwarder.holding());
+        // The list said before any picture was drawn.
+        let mut fresh = Forwarder::new(true);
+        let mut seen = None;
+        follow_hold(&mut fresh, &mut seen, Some(0), None);
+        assert!(fresh.holding());
+        follow_hold(&mut fresh, &mut seen, Some(0), Some(0));
+        assert!(!fresh.holding());
     }
 
     /// The actions' own check of the signed level: through a forwarder left

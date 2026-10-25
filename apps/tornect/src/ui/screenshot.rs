@@ -208,6 +208,7 @@ mod tests {
             width: 3,
             height: 2,
             rgba: (0..24u8).map(|i| i.wrapping_mul(37)).collect(),
+            seq: 0,
             fresh: false,
         }
     }

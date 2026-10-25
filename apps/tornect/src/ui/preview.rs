@@ -18,13 +18,13 @@ use tornect_core::address_book::Day;
 use tornect_core::config::QualityPreset;
 use tornect_core::levels::{Availability, WindowsFacts};
 use tornect_core::words::{Identicon, Words};
-use tornect_proto::{HostStats, QualityInfo};
+use tornect_proto::{HostStats, MonitorEntry, QualityInfo};
 use tornect_session::FrameSink as _;
 
 use super::model::{
     Book, CaptureNote, ClientStage, Computer, Confirm, Device, Dial, Failure, Hosting, Model,
-    MyWords, Popup, PopupKind, Recognition, Settings, Setup, Shared, Sharing, SheetLevels,
-    StreamInfo, TorState, UaRecord, Viewing,
+    MyWords, Popup, PopupKind, Recognition, ScreensView, Settings, Setup, Shared, Sharing,
+    SheetLevels, StreamInfo, TorState, UaRecord, Viewing,
 };
 use super::pages::viewer::ViewerState;
 use super::stream::{FrameSlot, SlotSink};
@@ -157,6 +157,9 @@ pub enum Sheet {
     /// The stream window's details with the Quality and Timing rows (the
     /// quality design §3.3).
     ViewerDetails,
+    /// The stream window's Screens menu: two screens, the main one shown,
+    /// and "All screens" (the monitors design §2).
+    ViewerScreens,
 }
 
 impl Sheet {
@@ -167,6 +170,7 @@ impl Sheet {
         match self {
             Self::ViewerQuality => Some(StreamSheet::QualityMenu),
             Self::ViewerDetails => Some(StreamSheet::Details),
+            Self::ViewerScreens => Some(StreamSheet::ScreensMenu),
             _ => None,
         }
     }
@@ -179,6 +183,8 @@ pub enum StreamSheet {
     QualityMenu,
     /// The details.
     Details,
+    /// The Screens menu.
+    ScreensMenu,
 }
 
 /// Open the preview's stream window `viewer` as `sheet` shows it, the
@@ -195,6 +201,7 @@ pub fn open_stream(sheet: StreamSheet, viewer: &mut ViewerState, now: Instant) {
             viewer.quality_menu = true;
         }
         StreamSheet::Details => viewer.details = true,
+        StreamSheet::ScreensMenu => viewer.screens_menu = true,
     }
 }
 
@@ -253,6 +260,21 @@ fn viewed(now: Instant) -> Viewing {
         pictures: 0,
         size: (0, 0),
         stream: sample_stream(),
+        screens: Some(sample_screens()),
+    }
+}
+
+/// The preview's host screens: two, side by side, the main one shown, and
+/// "All screens" offered. Invented, as the rest.
+fn sample_screens() -> ScreensView {
+    ScreensView {
+        monitors: vec![
+            MonitorEntry::saturating(true, 0, 0, 2560, 1440),
+            MonitorEntry::saturating(false, 2560, 0, 1920, 1080),
+        ],
+        all: true,
+        shown: 1,
+        ..ScreensView::default()
     }
 }
 
@@ -491,6 +513,7 @@ fn unattended(m: &mut Model, sheet: Sheet) -> bool {
                     pictures: 1,
                     size: (1920, 1080),
                     stream: StreamInfo::default(),
+                    screens: None,
                 })
             };
         }
@@ -595,6 +618,7 @@ fn stage(m: &mut Model, sheet: Sheet) -> bool {
             pictures: 1,
             size: (1920, 1080),
             stream: StreamInfo::default(),
+            screens: None,
         }),
         Sheet::StageUnreachable => ClientStage::Ended(
             "The host is offline or has not finished publishing its Tornect ID.".to_owned(),
@@ -916,7 +940,9 @@ mod tests {
     /// and the stream window opens pinned, with its Quality menu and a pick
     /// of Balanced on its way ("Changing…" under it, the applied Best
     /// performance checked), or with its details and their Quality and
-    /// Timing rows. No other sheet opens the stream window so.
+    /// Timing rows. `--sheet viewer-screens` (the monitors design §2): its
+    /// Screens menu, two screens and all of them, the main one shown. No
+    /// other sheet opens the stream window so.
     #[test]
     fn the_stream_sheets_show_the_quality_menu_and_the_timing_rows() {
         use super::super::pages::viewer::testing::Window;
@@ -935,9 +961,16 @@ mod tests {
              send 120 ms",
             "Round trip: 1.1 s",
         ];
+        let screens: &[&str] = &[
+            "Screen 1",
+            "Screen 1 · main · 2560 × 1440",
+            "Screen 2 · 1920 × 1080",
+            "All screens",
+        ];
         for (which, texts) in [
             (Sheet::ViewerQuality, menu),
             (Sheet::ViewerDetails, details),
+            (Sheet::ViewerScreens, screens),
         ] {
             let mut m = model(false, false);
             sheet(&mut m, which);
