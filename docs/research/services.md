@@ -1,9 +1,135 @@
 # Research: session services (design `services`, revision 2)
 
-The design's research items before its steps: R1 (GNOME clipboard portal, before step 8), **R2 (Windows APIs,
-before step 7; this note)**, R3 (logind `LockedHint`, before step 10) and R4 (Arti flow control on onion-service
-circuits, before step 29). R1, R3 and R4 are not here yet; each lands with its step. Decision: M1-76 (the design
+The design's research items before its steps: **R1 (GNOME clipboard portal, before step 8)**, **R2 (Windows
+APIs, before step 7)**, R3 (logind `LockedHint`, before step 10) and R4 (Arti flow control on onion-service
+circuits, before step 29). R3 and R4 are not here yet; each lands with its step. Decision: M1-76 (the design
 calls it M1-73; that number and the two after it were taken by earlier features).
+
+## R1. The GNOME clipboard portal (for design steps 8 and 9)
+
+**Status:** verified 2026-10-25 in the build container (not the dev VM, which has the desktop) against source:
+ashpd 0.13.13 and zvariant 5.15.0 in the cargo registry; mutter and xdg-desktop-portal-gnome from their GitHub
+mirrors of GNOME's GitLab, branch `gnome-50` (GNOME 50, the dev VM's desktop) and `main` (51), fetched the same
+day; the portal's interface documentation (`doc-org.freedesktop.portal.Clipboard.html`) fetched the same day. The
+xdg-desktop-portal frontend's source could not be fetched here. Nothing below was run against a desktop: gates G1
+and G2 (design §11) and the rest of §R1.7 are NEEDS-DEVICE(gnome-wayland) rows of `docs/VERIFICATION.md`, and
+the coordinator's switch `[services] wayland_clipboard` (default off) keeps the portal request as it was until
+they pass.
+
+### R1.1 The request and the restore token (gate G1, from source)
+
+- **Order.** "This request must be made before the session starts" (RequestClipboard); whether access was
+  granted "is reported in the `clipboard_enabled` result of the session's `Start()` response". Every other
+  method "may only be called if clipboard access was given after starting the session", and the signals reach
+  only such a session. ashpd: `Clipboard::request(&session, RequestClipboardOptions)`; `SelectedDevices::
+  is_clipboard_enabled()` reads `clipboard_enabled` (`remote_desktop.rs` 263–293); `IsClipboardSession for
+  RemoteDesktop` (762–763) behind the feature `clipboard`.
+- **portal-gnome 50.** `handle_request_clipboard` only marks the session `clipboard_requested`
+  (`src/clipboard.c` 107–149). `start_done` (`src/remotedesktop.c` 556–636) calls mutter's `EnableClipboard`
+  only when it was requested (570–600), and answers `clipboard_enabled` from the session's
+  `clipboard.clipboard_enabled`, which is the dialog's choice or, on a restore, the stored one.
+- **The token stores the clipboard choice.** The restore data holds `clipboard_enabled`
+  (`serialize_session_as_restore_data`, 519–553), and `restore_from_data` (738–780) restores it without a dialog,
+  whatever the new request asks. So a token made **without** `RequestClipboard` restores with
+  `clipboard_enabled = false` and no dialog: the clipboard is never offered on it. That is why a host that asks
+  for the clipboard keeps its grant in a file of its own (`Paths::portal_restore_token_for(true)`,
+  `state/portal-restore-token-2`): its first session or grant shows the dialog once, with the clipboard choice,
+  and the token that follows restores that choice. With the switch off the request and the file stay as they
+  were, so no dialog appears that would not have appeared before.
+- **main (51) differs.** `start_done` enables the clipboard whenever the session's (dialog or restored) choice
+  says so, requested or not (`src/remotedesktop.c` 537–561 on `main`). Tornect's request is constant per token
+  file, so both behave the same for it.
+
+### R1.2 The owner already there at enable (gate G2, from source)
+
+- mutter 50 `handle_enable_clipboard` (`src/backends/meta-remote-desktop-session.c` 1353–1420): with no
+  `mime-types` option it emits `SelectionOwnerChanged` for the current owner, if there is one, during the
+  `EnableClipboard` call (`main` moved this to `meta-clipboard-session.c` `meta_clipboard_session_enable`,
+  287–322, unchanged in effect).
+- portal-gnome 50 connects its handlers to mutter's proxy, calls `EnableClipboard` synchronously, then completes
+  `Start` (570–636). GDBus hands a proxy's signal to the main loop only after the synchronous call returns, so the
+  relayed announcement of the owner from before the session leaves portal-gnome **after** the `Start` results;
+  the app sees it shortly after the `Start` response, not before. The design's `BASELINE_GRACE` (2 s after
+  `Start` returned, no owner change reported) covers it unless it is relayed later than that: G2 measures the
+  delay on the desktop (the live test prints it).
+- The app must subscribe to the signals **before** `Start`, or the announcement can be missed; the backend
+  subscribes just before `RequestClipboard`, after `SelectSources` (the design said at `Start`).
+
+### R1.3 The signals
+
+- `SelectionOwnerChanged(o session_handle, a{sv} options)`: `mime_types` (`as`) and `session_is_owner` (`b`).
+  mutter sends both only when there is an owner (`generate_owner_changed_variant`, 1276–1291); when the owner
+  went away it sends an empty dict, which portal-gnome relays as an empty dict (`src/clipboard.c` 42–100).
+  `session_is_owner` is true exactly for the session's own `SetSelection` source (`is_own_source`).
+- `SelectionTransfer(o session_handle, s mime_type, u serial)`: someone pastes what this session set.
+- ashpd's `receive_selection_owner_changed` builds a `Session` proxy for every signal (a property round trip
+  each) and keeps its object path private (`clipboard.rs` 169–210, `session.rs` 87–89). The backend therefore
+  subscribes on the `Clipboard`'s own zbus proxy and compares the signal's object path with its session's path,
+  which the session serialises as (`Serialize for Session`, `session.rs` 92–102).
+
+### R1.4 Reading and writing (the file descriptors)
+
+- **Read.** `SelectionRead(session, mime)` returns the read end of a pipe mutter made with `g_unix_open_pipe`
+  and made non-blocking (1886–1900): a FIFO, which `tokio::net::unix::pipe::Receiver::from_owned_fd` accepts
+  (`tokio-1.53.1` `net/unix/pipe.rs` 967; zvariant's `OwnedFd` converts into `std::os::fd::OwnedFd`,
+  `zvariant-5.15.0` `src/fd.rs` 227). mutter refuses a read of the session's own selection ("Tried to read own
+  selection", 1874) and a read while an earlier read's pipe is still open ("Tried to read in parallel", 1882;
+  `is_pipe_broken` looks for an error on the earlier pipe, 1759–1780). So reads go one at a time, and a read
+  given up closes its end at once.
+- **The read is of the owner at read time.** Nothing ties a read to the owner change that prompted it; an owner
+  change racing a read can be announced after the read's answer (portal-gnome answers mutter's synchronous
+  calls before it relays the signals queued meanwhile). The backend drops a read when a newer owner change is
+  already queued once it returns; a change announced later still is a residual (R1.7).
+- **Write.** A paste of the session's selection arrives as `SelectionTransfer`. `SelectionWrite(session,
+  serial)` returns the write end of a pipe (1639–1700) and completes the paste with its read end, so the pasting
+  application reads what is written until it is closed; `SelectionWriteDone(session, serial, success)` only
+  answers (1733–1757). The interface says "If the request is not handled, the caller should respond by setting
+  `success` to 'false'", but mutter keeps an unanswered paste waiting until its 15 s cleanup
+  (`TRANSFER_REQUEST_CLEANUP_TIMEOUT_MS`, 52). The backend therefore refuses a paste by `SelectionWrite`, closing
+  the pipe unwritten (the application reads nothing at once), and `SelectionWriteDone(false)`.
+- `SetSelection` without `mime_types` drops the session's selection (`reset_current_selection_source`,
+  1586); with them it makes the session the owner of those types.
+
+### R1.5 mutter's own clipboard manager
+
+`src/core/meta-clipboard-manager.c` (the same in `gnome-50` and `main`):
+- on every new owner it drops its saved copy first (111), then copies the new owner's best type of its list
+  (images, then `text/plain`, then `text/plain;charset=utf-8`, text up to 4 MiB; 26–45, 88–150);
+- when the owner goes away it takes the selection over with a memory source that offers **only that one type**
+  (157–175), without the owner's other types.
+
+Consequences for the backend:
+- **The password hint does not survive a takeover.** A KeePassXC copy (`x-kde-passwordManagerHint` offered)
+  whose owner quits comes back as an owner offering only `text/plain;charset=utf-8`. The backend recognises a
+  takeover (an owner with exactly one of those two types announced right after "no owner") and gives it the
+  verdict of the owner before: not read when that one was private, this session's own, from before the
+  activation, or unknown.
+- **Text the session set outlives it.** The manager copies what Tornect sets and serves it after the portal
+  session ends. To clear the clipboard when it still holds our text (the backend contract), the backend makes
+  itself the owner of one Tornect-only type, `application/x-tornect-cleared`: the manager drops its copy (a new
+  owner) and keeps none (no type it copies), so nothing is left when the session goes. A desktop that ends the
+  session itself (a lock) leaves no chance to do this: residual.
+- Received text is set with `text/plain;charset=utf-8`, `text/plain` and `x-kde-passwordManagerHint`
+  (`secret`), as the X11 backend sets it (R2.3), so clipboard managers that honour the hint keep no copy;
+  mutter's own does not look at it.
+
+### R1.6 Version and features
+
+- ashpd feature `clipboard` (`=0.13.13`, no new crate: the module uses only what the enabled features use).
+  Portal interface version 1 on the VM (`docs/research/wayland.md` §2.6).
+- xdg-desktop-portal-gnome 50.0: "Make the Clipboard portal return errors instead of succeeding" (NEWS). A
+  failed `Clipboard` proxy, `RequestClipboard` or subscription leaves the session without a clipboard, never
+  without the screen.
+
+### R1.7 Needs the GNOME desktop
+
+- G1: the dialog's clipboard choice; a restore with `RequestClipboard` starts without a dialog with
+  `clipboard_enabled == true`; a view-only session's restore (the same request) starts without a dialog.
+- G2: the delay between the `Start` response and the announcement of the owner already there.
+- The `SelectionRead`/`SelectionWrite` fds are FIFOs; pastes into Xwayland applications; a KeePassXC copy is not
+  sent, and not after KeePassXC quits; text received is pasteable, not listed by a clipboard extension that
+  honours the hint, and gone after the session ends; the residual race of R1.4 (a copy right after another).
+- KDE (xdg-desktop-portal-kde) is not covered by this note: NEEDS-DEVICE(kde-wayland).
 
 ## R2. Windows APIs, and the arboard clipboard on Windows and X11
 
