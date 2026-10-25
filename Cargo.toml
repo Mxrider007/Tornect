@@ -155,6 +155,12 @@ pollster = "=1.0.1"
 # `default-features = false` drops the `image`, `svg` and `pic` renderers (the
 # window draws the modules itself), which leaves the crate no dependency at all.
 qrcode = { version = "=0.14.1", default-features = false }
+# The host's clipboard on X11 and Windows (session services, design `services`
+# §4.2, decision M1-76): one thread per session owns one `arboard::Clipboard`.
+# Already in the tree through egui-winit's `clipboard` feature (which turns on
+# `image-data` in the app build); without default features tornect-input alone
+# pulls no image code. docs/research/services.md R2.3.
+arboard = { version = "=3.6.1", default-features = false }
 # The stream window's screenshot (a PNG in Pictures/Tornect): its encoder, the
 # version already in the tree through egui-winit's clipboard (arboard -> image ->
 # png), so the crate adds an edge and no package. It has no default features.
@@ -173,7 +179,7 @@ x11rb = { version = "=0.13.2", default-features = false, features = ["xtest", "x
 # start-at-logon task (`schtasks.exe` from the system directory, the user's SID,
 # `ShellExecuteExW` "runas" for the opt-in elevated task) and OS re-authentication
 # (`CredUIPromptForWindowsCredentialsW` on the secure desktop, then `LogonUserW`).
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_System_Com", "Win32_System_Console", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_RemoteDesktop", "Win32_System_StationsAndDesktops", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_Accessibility"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_RemoteDesktop", "Win32_System_StationsAndDesktops", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_Accessibility"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

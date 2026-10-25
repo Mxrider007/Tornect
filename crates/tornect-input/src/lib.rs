@@ -27,9 +27,15 @@
 //! picture, onto the rectangle that picture shows ([`View::Rect`], [`remap`]).
 //! When the picture moves to another screen the host retargets the chain
 //! ([`InputSink::retarget`]) before it handles any later input.
+//!
+//! **Clipboard** ([`clipboard`], decision M1-76): the text a Control session
+//! shares, the contract of every clipboard backend, and the host's backend on
+//! X11 and Windows. It goes where input goes: the session layer offers it only
+//! where an injector was built (design `services` §2.1).
 
 #![warn(missing_docs)]
 
+pub mod clipboard;
 pub mod helper;
 pub mod keymap;
 #[cfg(windows)]
