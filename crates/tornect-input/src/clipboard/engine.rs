@@ -5,23 +5,25 @@
 
 use std::time::{Duration, Instant};
 
+use zeroize::Zeroizing;
+
 use super::{ClipText, ClipboardError, DesktopEnds};
 
 /// How often the thread looks at its link (and, at most this often, at its
 /// desktop).
 pub(crate) const TICK: Duration = Duration::from_millis(100);
 
-/// One look at the clipboard's text. Not `Debug`: it holds the text.
+/// One look at the clipboard's text. Not `Debug`: it holds the text, which
+/// is wiped wherever the look is dropped.
 pub(crate) enum Read {
     /// Text that is not marked private.
-    Text(String),
+    Text(Zeroizing<String>),
     /// A password manager marked it private.
     Private,
     /// Whether it is private could not be checked: not shared either.
     Unchecked,
-    /// Over the cap, found before reading it (Windows sizes the text block
-    /// first; X11 reads it and the cap applies after).
-    #[cfg_attr(all(not(windows), not(test)), allow(dead_code))]
+    /// Over the cap, found before or while reading it (Windows sizes the
+    /// text block first; X11 reads at most the cap and one unit more).
     TooLarge,
     /// No text (empty, an image, no owner) or the read failed.
     Nothing,
@@ -30,10 +32,27 @@ pub(crate) enum Read {
     Raced,
 }
 
+/// What a desktop found on the clipboard at an activation.
+pub(crate) enum Baseline {
+    /// Text, by its [`fingerprint`](super::fingerprint): never reported while
+    /// this activation lasts, whatever owner change brings it back.
+    Text([u8; 32]),
+    /// Nothing that could be reported: no text, or text that is private,
+    /// cannot be checked or is over the cap (and was therefore not read).
+    Nothing,
+    /// The clipboard could not be looked at now (Windows: another program
+    /// held it open). The activation waits and is tried again at the next
+    /// tick; until then nothing is read or set.
+    #[cfg_attr(all(not(windows), not(test)), allow(dead_code))]
+    Busy,
+}
+
 /// What the thread asks of an OS clipboard.
 pub(crate) trait Desktop {
-    /// Forget every change seen so far: the baseline of an activation.
-    fn baseline(&mut self) -> Result<(), ClipboardError>;
+    /// The baseline of an activation: forget every change seen so far, and
+    /// say what text the clipboard holds now. Reports nothing; the text read
+    /// for it stays on this computer. An error ends the backend.
+    fn baseline(&mut self) -> Result<Baseline, ClipboardError>;
     /// Whether the clipboard changed since the last call or the baseline.
     /// Reads no content. An error ends the backend.
     fn changed(&mut self) -> Result<bool, ClipboardError>;
@@ -55,7 +74,12 @@ pub(crate) trait Desktop {
 pub(crate) struct Engine<D> {
     desktop: D,
     ends: DesktopEnds,
+    /// Activated, with a baseline taken: only then is anything read or set.
     active: bool,
+    /// Fingerprint of the text on the clipboard at the latest activation.
+    /// Unlike `reported` it outlives our own sets: the text from before the
+    /// activation never crosses, even when an owner change brings it back.
+    base: Option<[u8; 32]>,
     /// Fingerprint of the text this backend set last.
     own: Option<[u8; 32]>,
     /// Fingerprint of the text reported last: one change read twice (an
@@ -71,6 +95,7 @@ impl<D: Desktop> Engine<D> {
             desktop,
             ends,
             active: false,
+            base: None,
             own: None,
             reported: None,
             poll_every,
@@ -99,27 +124,50 @@ impl<D: Desktop> Engine<D> {
         if self.ends.from_desktop.is_closed() {
             return false;
         }
-        let (Ok(_), Ok(text_changed)) = (
+        // `switched`: a value was sent on `active` since the last tick. Every
+        // value counts, so an off and on again within one tick is seen.
+        let (Ok(switched), Ok(text_changed)) = (
             self.ends.active.has_changed(),
             self.ends.to_desktop.has_changed(),
         ) else {
             return false;
         };
-        let active = *self.ends.active.borrow_and_update();
-        if active && !self.active {
-            if let Err(e) = self.desktop.baseline() {
-                tracing::debug!(error = %e, "clipboard: no baseline; the backend stops");
-                return false;
+        let on = *self.ends.active.borrow_and_update();
+        if !on {
+            self.active = false;
+            self.base = None;
+        } else if switched || !self.active {
+            // An activation, also over an earlier one (a fresh baseline for
+            // each), or one the busy clipboard held back at an earlier tick.
+            self.active = false;
+            match self.desktop.baseline() {
+                Err(e) => {
+                    tracing::debug!(error = %e, "clipboard: no baseline; the backend stops");
+                    return false;
+                }
+                Ok(Baseline::Busy) => {
+                    if switched {
+                        tracing::debug!("clipboard: busy at activation; tried again every tick");
+                    }
+                }
+                Ok(found) => {
+                    self.base = match found {
+                        Baseline::Text(fingerprint) => Some(fingerprint),
+                        Baseline::Nothing | Baseline::Busy => None,
+                    };
+                    self.active = true;
+                    self.reported = None;
+                    self.next_poll = None;
+                }
             }
-            self.reported = None;
-            self.next_poll = None;
         }
-        self.active = active;
 
         if text_changed {
             let text = self.ends.to_desktop.borrow_and_update().clone();
-            // Text sent while off is dropped, not held for later.
-            if let (true, Some(text)) = (active, text) {
+            // Text sent while off, or in a tick that also switched `active`
+            // (it may have been sent before the switch), is dropped, not held
+            // for later.
+            if let (true, false, Some(text)) = (self.active, switched, text) {
                 self.apply(&text);
             }
         }
@@ -135,7 +183,7 @@ impl<D: Desktop> Engine<D> {
             }
             // While off the change detector is only kept current (X11's
             // events drained); nothing is read.
-            Ok(true) if active => {
+            Ok(true) if self.active => {
                 self.look();
                 true
             }
@@ -161,7 +209,7 @@ impl<D: Desktop> Engine<D> {
             return;
         }
         let raw = match self.desktop.read() {
-            Read::Text(raw) => raw,
+            Read::Text(mut raw) => std::mem::take(&mut *raw),
             Read::Private => {
                 tracing::debug!("clipboard: copied text is marked private; not shared");
                 return;
@@ -184,13 +232,18 @@ impl<D: Desktop> Engine<D> {
             }
         };
         let fingerprint = text.fingerprint();
-        // Our own set read back (the second echo guard), or one change seen
-        // twice.
-        if self.own == Some(fingerprint) || self.reported == Some(fingerprint) {
+        // Our own set read back (the second echo guard).
+        if self.own == Some(fingerprint) {
             return;
         }
         // Someone else's text replaced ours.
         self.own = None;
+        // The text from before the activation brought back (a clipboard
+        // manager taking over from an owner that quit, a delayed rendering),
+        // or one change seen twice.
+        if self.base == Some(fingerprint) || self.reported == Some(fingerprint) {
+            return;
+        }
         self.reported = Some(fingerprint);
         tracing::debug!(bytes = text.byte_len(), "clipboard: copied text reported");
         self.ends.from_desktop.send_replace(Some(text));
@@ -222,6 +275,8 @@ mod tests {
         /// What the next reads answer instead of the text.
         refuse: Option<fn() -> Read>,
         fail: bool,
+        /// How many baselines in a row find the clipboard busy.
+        busy: u32,
         reads: u32,
         writes: Vec<String>,
         baselines: u32,
@@ -235,6 +290,13 @@ mod tests {
             self.private = private;
             self.version += 1;
         }
+
+        /// The clipboard changes but its text does not: a delayed rendering
+        /// done (Windows), or a clipboard manager taking the text over from
+        /// an owner that quit (X11).
+        fn bump(&mut self) {
+            self.version += 1;
+        }
     }
 
     struct Fake(Arc<Mutex<State>>);
@@ -246,11 +308,19 @@ mod tests {
     }
 
     impl Desktop for Fake {
-        fn baseline(&mut self) -> Result<(), ClipboardError> {
+        fn baseline(&mut self) -> Result<Baseline, ClipboardError> {
             let mut s = self.state();
             s.baselines += 1;
             s.seen = s.version;
-            Ok(())
+            if s.busy > 0 {
+                s.busy -= 1;
+                return Ok(Baseline::Busy);
+            }
+            // Private text is not read, as the real desktops do.
+            Ok(match (&s.text, s.private) {
+                (Some(text), false) => Baseline::Text(fingerprint(text)),
+                _ => Baseline::Nothing,
+            })
         }
 
         fn changed(&mut self) -> Result<bool, ClipboardError> {
@@ -283,7 +353,7 @@ mod tests {
                 return refuse();
             }
             match &s.text {
-                Some(text) => Read::Text(text.clone()),
+                Some(text) => Read::Text(Zeroizing::new(text.clone())),
                 None => Read::Nothing,
             }
         }
@@ -443,14 +513,143 @@ mod tests {
         rig.s().copy("three", false);
         rig.turn();
         assert_eq!(rig.reported().as_deref(), Some("three"));
-        // Text reported before the pause may be reported again after it.
+        // Text reported before a pause may be reported again after it, once
+        // the clipboard held something else at the re-activation.
         rig.activate(false);
+        rig.turn();
+        rig.s().copy("four, while paused", false);
         rig.turn();
         rig.activate(true);
         rig.turn();
         rig.s().copy("three", false);
         rig.turn();
         assert_eq!(rig.reported().as_deref(), Some("three"));
+        // Still the clipboard's text at a re-activation, it is that
+        // activation's baseline: copying it again does not cross.
+        rig.activate(false);
+        rig.turn();
+        rig.activate(true);
+        rig.turn();
+        rig.s().copy("three", false);
+        rig.turn();
+        assert_eq!(rig.reported(), None);
+        assert_eq!(rig.s().baselines, 4);
+    }
+
+    #[test]
+    fn the_text_from_before_the_activation_never_crosses() {
+        for (knows_own, hint_own) in KINDS {
+            let mut rig = Rig::new(knows_own, hint_own);
+            rig.s().copy("a password from before", false);
+            rig.activate(true);
+            rig.turn();
+            // An owner change that keeps the text (a delayed rendering, a
+            // clipboard manager taking over): read, compared, not reported.
+            rig.s().bump();
+            rig.turn();
+            assert_eq!(rig.s().reads, 1);
+            assert_eq!(rig.reported(), None, "kinds {knows_own} {hint_own}");
+            // Copied again during the session: still the baseline's text.
+            rig.s().copy("a password from before", false);
+            rig.turn();
+            assert_eq!(rig.reported(), None);
+            // Our own set in between does not lift it.
+            rig.send("from the viewer");
+            rig.turn();
+            rig.s().copy("a password from before", false);
+            rig.turn();
+            assert_eq!(rig.reported(), None);
+            // A real copy crosses; the baseline's text after it still does
+            // not.
+            rig.s().copy("copied during the session", false);
+            rig.turn();
+            assert_eq!(rig.reported().as_deref(), Some("copied during the session"));
+            rig.s().copy("a password from before", false);
+            rig.turn();
+            assert_eq!(rig.reported(), None);
+        }
+    }
+
+    #[test]
+    fn text_sent_in_the_tick_of_a_switch_is_dropped() {
+        for (knows_own, hint_own) in KINDS {
+            let mut rig = Rig::new(knows_own, hint_own);
+            // Sent while off, and the link turned on before the next tick.
+            rig.send("sent while off");
+            rig.activate(true);
+            rig.turns(3);
+            assert!(rig.s().writes.is_empty(), "kinds {knows_own} {hint_own}");
+            // Off and on again around a send, within one tick.
+            rig.activate(false);
+            rig.send("sent around a pause");
+            rig.activate(true);
+            rig.turns(2);
+            assert!(rig.s().writes.is_empty(), "kinds {knows_own} {hint_own}");
+            // Sent while on: set.
+            rig.send("sent while on");
+            rig.turn();
+            assert_eq!(rig.s().writes, ["sent while on"]);
+        }
+    }
+
+    #[test]
+    fn off_and_on_within_one_tick_takes_a_fresh_baseline() {
+        for (knows_own, hint_own) in KINDS {
+            let mut rig = Rig::new(knows_own, hint_own);
+            rig.activate(true);
+            rig.turn();
+            assert_eq!(rig.s().baselines, 1);
+            // Off, a copy, and on again, all between two ticks.
+            rig.activate(false);
+            rig.s().copy("copied while off", false);
+            rig.activate(true);
+            rig.turns(2);
+            assert_eq!(rig.s().baselines, 2);
+            assert_eq!(rig.reported(), None, "kinds {knows_own} {hint_own}");
+            // Every `true` sent is an activation, also one sent over an
+            // earlier `true` (the session sends only changes): a copy made
+            // just before it is behind its baseline, the safe direction.
+            rig.s().copy("copied before a repeated on", false);
+            rig.activate(true);
+            rig.turn();
+            assert_eq!(rig.s().baselines, 3);
+            assert_eq!(rig.reported(), None);
+            rig.s().copy("copied after", false);
+            rig.turn();
+            assert_eq!(rig.reported().as_deref(), Some("copied after"));
+            rig.turns(3);
+            assert_eq!(rig.s().baselines, 3);
+        }
+    }
+
+    #[test]
+    fn a_busy_clipboard_holds_the_activation_back() {
+        let mut rig = Rig::new(true, false);
+        rig.s().copy("a password from before", false);
+        rig.s().busy = 2;
+        rig.activate(true);
+        rig.turn();
+        // Held back: nothing read or set; text sent meanwhile is dropped and
+        // a copy meanwhile is not read.
+        rig.s().copy("copied while held back", false);
+        rig.send("sent while held back");
+        rig.turn();
+        assert_eq!(rig.s().baselines, 2);
+        assert_eq!(rig.s().reads, 0);
+        assert!(rig.s().writes.is_empty());
+        assert_eq!(rig.reported(), None);
+        // The third try takes, with the clipboard's text then as the
+        // baseline.
+        rig.turn();
+        assert_eq!(rig.s().baselines, 3);
+        assert_eq!(rig.reported(), None);
+        assert!(rig.s().writes.is_empty());
+        rig.s().copy("copied once on", false);
+        rig.turn();
+        assert_eq!(rig.reported().as_deref(), Some("copied once on"));
+        // No more baselines without a switch.
+        rig.turns(3);
+        assert_eq!(rig.s().baselines, 3);
     }
 
     #[test]
@@ -677,6 +876,13 @@ mod tests {
         let engine = Engine::new(Fake(Arc::clone(&state)), ends, Duration::ZERO);
         let thread = std::thread::spawn(move || engine.run());
         link.active.send_replace(true);
+        // Text sent in the tick that switches the link on is dropped: wait
+        // for the activation first.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.lock().unwrap().baselines == 0 {
+            assert!(Instant::now() < deadline, "the link never turned on");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         link.to_desktop
             .send_replace(Some(ClipText::new("set".to_owned()).unwrap()));
         let deadline = Instant::now() + Duration::from_secs(5);

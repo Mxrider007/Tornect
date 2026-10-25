@@ -3,8 +3,13 @@
 //! history-excluded set, and the host's half of the backend.
 //!
 //! - **Changes** are a sequence number that differs from the one seen last,
-//!   polled every 250 ms; the activation baseline is the number at
-//!   activation, and the number right after our own set marks that set.
+//!   polled every 250 ms, and the number right after our own set marks that
+//!   set. A number is not content: a delayed rendering bumps it when the
+//!   text is first pasted, or when its owner renders everything as it quits,
+//!   so the activation baseline is the text as well (R2.1). In one opening
+//!   the private formats are checked and, unless they mark it, the
+//!   `CF_UNICODETEXT` text is fingerprinted, which renders a delayed text now;
+//!   the number is read after that opening.
 //! - **Private text** is checked before reading, in one opening of the
 //!   clipboard ([`inspect`]); a read counts only when the number before the
 //!   check equals the one after the read, so a password copied in between is
@@ -31,7 +36,7 @@ use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 
 use zeroize::Zeroizing;
 
-use super::engine::Read;
+use super::engine::{Baseline, Read};
 use super::{CLIP_MAX, ClipText, ClipboardError, dword_marks_private, fingerprint};
 
 /// `CF_UNICODETEXT` (winuser.h; standard clipboard formats). Its feature,
@@ -148,8 +153,11 @@ impl Opened {
     }
 
     /// The [`fingerprint`] of the `CF_UNICODETEXT` text, read inside this
-    /// opening; `None` when there is none, or it is over the cap or not
-    /// UTF-16.
+    /// opening (a delayed text is rendered by it); `None` when there is none
+    /// or it is over the cap. Decoded as arboard's read decodes it
+    /// (`WideCharToMultiByte` to UTF-8, which puts U+FFFD for a lone
+    /// surrogate, up to the first NUL), so a text read later through arboard
+    /// has the same fingerprint.
     fn text_fingerprint(&self) -> Option<[u8; 32]> {
         self.locked(CF_UNICODETEXT, |block| {
             if block.len() > MAX_UNICODE_BYTES {
@@ -162,12 +170,22 @@ impl Opened {
             // Three bytes of UTF-8 at most per unit: no reallocation leaves
             // an unwiped copy behind.
             let mut text = Zeroizing::new(String::with_capacity(block.len() / 2 * 3));
-            for c in char::decode_utf16(units) {
-                text.push(c.ok()?);
-            }
+            text.extend(
+                char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)),
+            );
             Some(fingerprint(&text))
         })
         .flatten()
+    }
+
+    /// Whether a password manager marked the clipboard private (R2.2):
+    /// `formats` as [`formats`] gives them.
+    fn private(&self, [exclude, ignore, history, cloud]: [u32; 4]) -> bool {
+        self.has(exclude)
+            || self.has(ignore)
+            || [history, cloud]
+                .into_iter()
+                .any(|format| self.has(format) && dword_marks_private(self.head(format).as_deref()))
     }
 }
 
@@ -197,17 +215,13 @@ pub(super) fn inspect() -> Look {
         unchecked: true,
         too_large: false,
     };
-    let Some([exclude, ignore, history, cloud]) = formats() else {
+    let Some(formats) = formats() else {
         return unchecked;
     };
     let Some(open) = Opened::new() else {
         return unchecked;
     };
-    let private = open.has(exclude)
-        || open.has(ignore)
-        || [history, cloud]
-            .into_iter()
-            .any(|format| open.has(format) && dword_marks_private(open.head(format).as_deref()));
+    let private = open.private(formats);
     let too_large = !private
         && open.has(CF_UNICODETEXT)
         && open
@@ -262,9 +276,23 @@ impl Desktop {
 }
 
 impl super::engine::Desktop for Desktop {
-    fn baseline(&mut self) -> Result<(), ClipboardError> {
+    fn baseline(&mut self) -> Result<Baseline, ClipboardError> {
+        let found = match formats() {
+            // Nothing is ever read without the formats: nothing to keep out.
+            None => Baseline::Nothing,
+            // Up to half a second, as at the end; then the engine tries again
+            // at its next tick.
+            Some(formats) => match Opened::trying(100) {
+                None => Baseline::Busy,
+                Some(open) if open.private(formats) => Baseline::Nothing,
+                Some(open) => open
+                    .text_fingerprint()
+                    .map_or(Baseline::Nothing, Baseline::Text),
+            },
+        };
+        // After the opening: a rendering it caused is not a change.
         self.seen = sequence_number();
-        Ok(())
+        Ok(found)
     }
 
     fn changed(&mut self) -> Result<bool, ClipboardError> {
@@ -293,7 +321,7 @@ impl super::engine::Desktop for Desktop {
         if look.too_large {
             return Read::TooLarge;
         }
-        let mut text = match self.clipboard.get_text() {
+        let text = match self.clipboard.get_text() {
             Ok(text) => Zeroizing::new(text),
             Err(arboard::Error::ContentNotAvailable) => return Read::Nothing,
             Err(e) => {
@@ -306,7 +334,7 @@ impl super::engine::Desktop for Desktop {
         if sequence_number() != before {
             return Read::Raced;
         }
-        Read::Text(std::mem::take(&mut *text))
+        Read::Text(text)
     }
 
     fn write(&mut self, text: &ClipText) -> Result<(), ClipboardError> {
@@ -403,11 +431,15 @@ mod tests {
         assert!(excluded());
         assert!(shareable(current).unwrap().is_none());
 
-        // The host's backend: a copy before activation is never reported.
+        // The host's backend: a copy before activation is never reported,
+        // nor is the same text put back later under a new sequence number
+        // (as a delayed rendering done late bumps it, R2.1).
         let mut link = arboard_link().unwrap();
         set_plain("copied before the session");
         std::thread::sleep(quiet);
         link.active.send_replace(true);
+        assert_eq!(wait_for(&mut link, quiet), None);
+        set_plain("copied before the session");
         assert_eq!(wait_for(&mut link, quiet), None);
         set_plain("copied during the session");
         assert_eq!(

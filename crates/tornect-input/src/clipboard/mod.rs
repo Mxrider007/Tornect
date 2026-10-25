@@ -6,9 +6,15 @@
 //!
 //! **The backend contract.** A backend holds the far ends ([`DesktopEnds`]) of
 //! one [`ClipboardLink`]. On `from_desktop` it reports only text that
-//! - became the selection **after the latest `false → true` edge of `active`**:
-//!   a password copied before the session, or while the link was off, never
-//!   leaves the machine, and every re-activation takes a fresh baseline;
+//! - **changed, as content, after the latest activation**: the text on the
+//!   clipboard when `active` turned true (the baseline, kept by its
+//!   [`fingerprint`]) is never reported while that activation lasts, even
+//!   when an owner change brings it back (a clipboard manager taking it over
+//!   from an owner that quit, a delayed rendering done late), and every
+//!   activation takes a fresh baseline. A password copied before the session,
+//!   or while the link was off, never leaves the machine. Text that is private
+//!   or cannot be checked is not read for the baseline: it is never reported
+//!   anyway;
 //! - it did not set itself (Windows: the clipboard sequence number its set
 //!   left; X11: its own sets carry the private hint below; both: the
 //!   [`fingerprint`] of its last set);
@@ -19,7 +25,13 @@
 //!   with no NUL.
 //!
 //! While `active` is false a backend reads and sets nothing, and text sent on
-//! `to_desktop` meanwhile is dropped, not held for later. Text it sets is kept
+//! `to_desktop` meanwhile is dropped, not held for later. Every value sent on
+//! `active` counts as a switch, even one equal to the last (so an off and on
+//! again shorter than the backend's tick is still seen): a `true` takes a
+//! fresh baseline, and text sent in the tick of a switch is dropped as well,
+//! since it may have been sent before it. The session therefore sends on
+//! `active` only when its state changes, and sends text only while the link
+//! is on (the viewer's next focus sends it again). Text it sets is kept
 //! out of clipboard histories (Windows: the history and cloud exclusions;
 //! X11: the KDE hint, which clipboard managers honour). Dropping the link
 //! stops the backend, which then clears the clipboard if it still holds the
@@ -294,12 +306,37 @@ pub fn sequence_number() -> u32 {
 /// link. It ticks every 100 ms; Windows polls the sequence number every
 /// 250 ms, X11 follows XFixes selection events on its own connection.
 ///
-/// The caller gates it: on Linux only for a session whose X11 injector
-/// exists (`XDG_SESSION_TYPE=x11` and a local `DISPLAY`), never under
-/// Wayland, whose clipboard is the portal's. Waits at most 5 s for the
-/// backend to open.
+/// On Linux it opens only on an X11 session (`XDG_SESSION_TYPE=x11`) and
+/// refuses at once otherwise with [`ClipboardError::Unavailable`]: under
+/// GNOME Wayland `$DISPLAY` names Xwayland, which mirrors the Wayland
+/// clipboard without the portal's grant, and that grant is what a Wayland
+/// host's clipboard needs (design §4.2, `[services] wayland_clipboard`). The
+/// caller gates it as well: only for a session whose X11 injector exists (a
+/// local `DISPLAY`). Waits at most 5 s for the backend to open.
 #[cfg(any(windows, target_os = "linux"))]
 pub fn arboard_link() -> Result<ClipboardLink, ClipboardError> {
+    #[cfg(target_os = "linux")]
+    {
+        link_on(std::env::var_os("XDG_SESSION_TYPE").as_deref())
+    }
+    #[cfg(windows)]
+    {
+        spawn_link()
+    }
+}
+
+/// [`arboard_link`] on a session whose `XDG_SESSION_TYPE` is `session_type`.
+#[cfg(target_os = "linux")]
+fn link_on(session_type: Option<&std::ffi::OsStr>) -> Result<ClipboardLink, ClipboardError> {
+    if session_type != Some(std::ffi::OsStr::new("x11")) {
+        return Err(ClipboardError::Unavailable("not an X11 session"));
+    }
+    spawn_link()
+}
+
+/// The backend's thread, once the session type allows it.
+#[cfg(any(windows, target_os = "linux"))]
+fn spawn_link() -> Result<ClipboardLink, ClipboardError> {
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -418,6 +455,37 @@ mod tests {
         assert!(ends.from_desktop.is_closed());
         assert!(ends.to_desktop.has_changed().is_err());
         assert!(ends.active.has_changed().is_err());
+    }
+
+    /// Only an X11 session opens the arboard backend, whatever `$DISPLAY`
+    /// names: run under Xvfb too, where a display is there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_an_x11_session_opens_the_host_backend() {
+        use std::ffi::OsStr;
+        for session in [
+            Some("wayland"),
+            Some("tty"),
+            Some("X11"),
+            Some(""),
+            Some("x11 "),
+            None,
+        ] {
+            let started = std::time::Instant::now();
+            assert_eq!(
+                link_on(session.map(OsStr::new)).unwrap_err(),
+                ClipboardError::Unavailable("not an X11 session"),
+                "{session:?}"
+            );
+            assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        }
+        // What the process runs under decides `arboard_link` itself.
+        if std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("x11") {
+            assert_eq!(
+                arboard_link().unwrap_err(),
+                ClipboardError::Unavailable("not an X11 session")
+            );
+        }
     }
 
     #[test]
