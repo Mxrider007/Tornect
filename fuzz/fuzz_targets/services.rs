@@ -10,10 +10,14 @@
 //!   nothing but the clipboard): a frame is decoded only when its cap was
 //!   granted, a refused frame's body is never read, and every frame stays
 //!   within its bounds;
-//! - `read_bind`, which reads 53 bytes at most.
+//! - `read_bind`, which reads 53 bytes at most;
+//! - the clipboard assembler (`ClipAssembly`, design step 18) fed the
+//!   clipboard frames each gated reader decodes, and told of the ones it
+//!   skips: it never panics, and a whole text is exactly as long as its
+//!   `ClipStart` said.
 //!
-//! The clipboard assembler and the session's own reader are added here by
-//! the design's later steps (18, 12), which build them.
+//! The session's own reader (`tornect-session`'s, the same gate in a task)
+//! is covered by its unit tests; this crate does not build the session.
 //!
 //! ```text
 //! cargo +nightly fuzz run services target/fuzz-corpus/services fuzz/seeds/services -- -max_total_time=600
@@ -31,8 +35,8 @@ use std::sync::OnceLock;
 use libfuzzer_sys::fuzz_target;
 use tokio::runtime::Runtime;
 use tornect_proto::services::{
-    BIND_LEN, MAX_SERVICES_FRAME, Side, SvcError, SvcMsg, caps, read_bind, read_body_max,
-    read_header, skip_body, ty,
+    BIND_LEN, ClipAssembly, MAX_CLIP, MAX_SERVICES_FRAME, Side, SvcError, SvcMsg, caps, read_bind,
+    read_body_max, read_header, skip_body, ty,
 };
 
 fn runtime() -> &'static Runtime {
@@ -79,6 +83,8 @@ const STATES: [(u16, u16, u16); 5] = [
 async fn gated(data: &[u8], from: Side, (granted, off, paused): (u16, u16, u16)) {
     let mut cursor = std::io::Cursor::new(data);
     let mut scratch = [0u8; 512];
+    let mut clip = ClipAssembly::default();
+    let mut lens = std::collections::HashMap::new();
     loop {
         let header = match read_header(&mut cursor).await {
             Ok(Some(header)) => header,
@@ -107,6 +113,9 @@ async fn gated(data: &[u8], from: Side, (granted, off, paused): (u16, u16, u16))
                     break;
                 }
                 assert_eq!(cursor.position(), at + header.len as u64);
+                if matches!(header.ty, ty::CLIP_START | ty::CLIP_CHUNK) {
+                    clip.ignore_rest();
+                }
             }
             ty::Gate::Decode => {
                 let needs = ty::needs(header.ty, from).expect("a decoded type is expected");
@@ -119,9 +128,35 @@ async fn gated(data: &[u8], from: Side, (granted, off, paused): (u16, u16, u16))
                     Ok(body) => body,
                     Err(_) => break,
                 };
-                match SvcMsg::decode(header.ty, &body) {
-                    Ok(msg) => assert_eq!(msg.ty(), header.ty),
+                let msg = match SvcMsg::decode(header.ty, &body) {
+                    Ok(msg) => msg,
                     Err(_) => break,
+                };
+                assert_eq!(msg.ty(), header.ty);
+                // The session's receiver: a text whose `seq` is odd is not
+                // taken (its rate or its switch), the others are.
+                let assembled = match msg {
+                    SvcMsg::ClipStart(start) => clip
+                        .start(start, start.seq % 2 == 0, MAX_CLIP)
+                        .map(|()| {
+                            lens.insert(start.seq, start.len as usize);
+                        })
+                        .is_ok(),
+                    SvcMsg::ClipChunk { seq, offset, bytes } => {
+                        match clip.chunk(seq, offset, &bytes) {
+                            Ok(Some(whole)) => {
+                                assert_eq!(Some(&whole.len()), lens.get(&seq));
+                                true
+                            }
+                            Ok(None) => true,
+                            Err(_) => false,
+                        }
+                    }
+                    _ => true,
+                };
+                // Out of order: the session ends the stream here.
+                if !assembled {
+                    break;
                 }
             }
         }

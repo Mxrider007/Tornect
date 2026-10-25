@@ -1508,6 +1508,143 @@ pub async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &SvcMsg) -> Result
     Ok(())
 }
 
+/// The bytes of a `ClipChunk` body before its text: `seq` and `offset`.
+pub const CLIP_CHUNK_HEAD: usize = 8;
+
+/// Why a clipboard frame does not fit the texts the peer started: the stream
+/// ends with `Close{PROTOCOL}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ClipError {
+    /// A `ClipStart` whose `seq` is not above every one started before.
+    #[error("a clipboard text started out of order")]
+    Order,
+    /// A `ClipStart` longer than the receiver's `clip_max`.
+    #[error("a clipboard text longer than the receiver takes")]
+    TooLong,
+    /// A `ClipChunk` of no text being received: none started, or the one
+    /// started is whole already.
+    #[error("clipboard bytes of no text being received")]
+    Unstarted,
+    /// A `ClipChunk` of another text than the one being received, not at its
+    /// next byte, or past its length.
+    #[error("clipboard bytes out of place")]
+    OutOfPlace,
+}
+
+/// Clipboard text arriving as a `ClipStart` and its `ClipChunk`s (design
+/// §3.1, §3.5), one text at a time.
+///
+/// - Each `ClipStart` names a `seq` above every one before and a length of at
+///   most the receiver's `clip_max`; it abandons a text still unfinished.
+/// - The text's chunks follow, contiguous from 0 and never past its length;
+///   the text is whole when they reach it ([`ClipAssembly::chunk`] gives its
+///   bytes once).
+/// - A text the receiver does not take ([`ClipAssembly::start`] with `take`
+///   false: its rate, its switch) and a text whose frames the receiver's
+///   reader skipped ([`ClipAssembly::ignore_rest`]: a cap turned off or
+///   paused while it was on its way) are dropped: every chunk is ignored
+///   until the next `ClipStart`. A reader that skipped a `ClipStart` never
+///   learnt its `seq`, so its chunks are taken as ignored whatever `seq` they
+///   name.
+///
+/// The buffer is the text's length, allocated at its start (so that it never
+/// moves, leaving no copy behind), and wiped when dropped.
+#[derive(Default)]
+pub struct ClipAssembly {
+    /// The highest `seq` started (0: none yet).
+    last: u32,
+    /// The text being received.
+    current: Option<PartialClip>,
+    /// Chunks are dropped until the next `ClipStart`.
+    ignoring: bool,
+}
+
+/// A text being received.
+struct PartialClip {
+    seq: u32,
+    len: u32,
+    bytes: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for ClipAssembly {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClipAssembly")
+            .field("last", &self.last)
+            .field(
+                "current",
+                &self.current.as_ref().map(|p| (p.seq, p.bytes.len(), p.len)),
+            )
+            .field("ignoring", &self.ignoring)
+            .finish()
+    }
+}
+
+impl ClipAssembly {
+    /// A text starts: received when `take`, dropped otherwise. The text before
+    /// it, unfinished, is abandoned.
+    pub fn start(&mut self, start: ClipStart, take: bool, clip_max: u32) -> Result<(), ClipError> {
+        if start.seq <= self.last {
+            return Err(ClipError::Order);
+        }
+        if start.len == 0 || start.len > clip_max.min(MAX_CLIP) {
+            return Err(ClipError::TooLong);
+        }
+        self.last = start.seq;
+        self.current = take.then(|| PartialClip {
+            seq: start.seq,
+            len: start.len,
+            bytes: Zeroizing::new(Vec::with_capacity(start.len as usize)),
+        });
+        self.ignoring = !take;
+        Ok(())
+    }
+
+    /// A chunk of the text being received: its bytes once it is whole
+    /// (`Some`), `None` while it is not or when the chunk is ignored.
+    pub fn chunk(
+        &mut self,
+        seq: u32,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, ClipError> {
+        let Some(partial) = self.current.as_mut() else {
+            return if self.ignoring {
+                Ok(None)
+            } else {
+                Err(ClipError::Unstarted)
+            };
+        };
+        let at = partial.bytes.len();
+        if seq != partial.seq
+            || offset as usize != at
+            || bytes.is_empty()
+            || bytes.len() > partial.len as usize - at
+        {
+            return Err(ClipError::OutOfPlace);
+        }
+        partial.bytes.extend_from_slice(bytes);
+        if partial.bytes.len() < partial.len as usize {
+            return Ok(None);
+        }
+        Ok(self.current.take().map(|whole| whole.bytes))
+    }
+
+    /// A clipboard frame was skipped unread, or the receiver stopped taking
+    /// text: the text being received is dropped, and every chunk until the
+    /// next `ClipStart` with it.
+    pub fn ignore_rest(&mut self) {
+        self.current = None;
+        self.ignoring = true;
+    }
+
+    /// Whether a text is being received.
+    #[must_use]
+    pub fn receiving(&self) -> bool {
+        self.current.is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ty::Gate;
@@ -3110,5 +3247,134 @@ mod tests {
                 prop_assert_eq!(SvcMsg::decode(back.ty(), &back.encode()[5..]).unwrap(), back);
             }
         }
+
+        /// A text cut into chunks of any sizes comes back whole, once, from
+        /// its last chunk; any order of starts, chunks and skips never panics,
+        /// and a whole text is always as long as its start said.
+        #[test]
+        fn the_clip_assembly_gives_back_what_was_cut(
+            text in proptest::collection::vec(any::<u8>(), 1..=600),
+            cuts in proptest::collection::vec(1usize..=64, 1..=40),
+        ) {
+            let mut assembly = ClipAssembly::default();
+            let len = u32::try_from(text.len()).unwrap();
+            assembly.start(ClipStart { seq: 3, len }, true, MAX_CLIP).unwrap();
+            let (mut at, mut whole) = (0usize, None);
+            for cut in cuts.iter().cycle() {
+                let end = (at + cut).min(text.len());
+                let got = assembly
+                    .chunk(3, u32::try_from(at).unwrap(), &text[at..end])
+                    .unwrap();
+                at = end;
+                if at == text.len() {
+                    whole = got;
+                    break;
+                }
+                prop_assert!(got.is_none());
+            }
+            prop_assert_eq!(whole.as_deref().map(Vec::as_slice), Some(&text[..]));
+            prop_assert!(!assembly.receiving());
+        }
+
+        #[test]
+        fn the_clip_assembly_never_panics(
+            steps in proptest::collection::vec(
+                (0u8..4, 0u32..6, 0u32..40, 0usize..24, any::<bool>()),
+                0..64,
+            ),
+        ) {
+            let mut assembly = ClipAssembly::default();
+            let mut lens = std::collections::HashMap::new();
+            for (op, seq, n, size, take) in steps {
+                match op {
+                    0 => {
+                        let len = n.max(1);
+                        if assembly.start(ClipStart { seq, len }, take, 32).is_ok() {
+                            lens.insert(seq, len as usize);
+                        }
+                    }
+                    1 | 2 => {
+                        let bytes = vec![7u8; size];
+                        if let Ok(Some(whole)) = assembly.chunk(seq, n, &bytes) {
+                            prop_assert_eq!(Some(&whole.len()), lens.get(&seq));
+                        }
+                    }
+                    _ => assembly.ignore_rest(),
+                }
+            }
+        }
+    }
+
+    /// The clip assembly's rules (design §3.1, §3.5): `seq` only rises, a
+    /// start is at most `clip_max`, chunks follow their start contiguously
+    /// and never past its length, a higher start abandons an unfinished text,
+    /// a text not taken or skipped is dropped chunk by chunk until the next
+    /// start, and bytes after a whole text are refused.
+    #[test]
+    fn the_clip_assembly_keeps_to_the_rules() {
+        let mut a = ClipAssembly::default();
+        assert_eq!(a.chunk(1, 0, b"x").unwrap_err(), ClipError::Unstarted);
+        assert_eq!(
+            a.start(ClipStart { seq: 0, len: 1 }, true, MAX_CLIP),
+            Err(ClipError::Order)
+        );
+        assert_eq!(
+            a.start(ClipStart { seq: 1, len: 9 }, true, 8),
+            Err(ClipError::TooLong)
+        );
+        a.start(ClipStart { seq: 1, len: 5 }, true, MAX_CLIP)
+            .unwrap();
+        assert!(a.receiving());
+        assert_eq!(a.chunk(1, 1, b"b").unwrap_err(), ClipError::OutOfPlace);
+        assert_eq!(a.chunk(2, 0, b"a").unwrap_err(), ClipError::OutOfPlace);
+        assert_eq!(a.chunk(1, 0, b"abc").unwrap(), None);
+        assert_eq!(a.chunk(1, 3, b"def").unwrap_err(), ClipError::OutOfPlace);
+        assert_eq!(
+            a.chunk(1, 3, b"de").unwrap().as_deref().map(Vec::as_slice),
+            Some(&b"abcde"[..])
+        );
+        assert_eq!(a.chunk(1, 5, b"f").unwrap_err(), ClipError::Unstarted);
+        assert_eq!(
+            a.start(ClipStart { seq: 1, len: 1 }, true, MAX_CLIP),
+            Err(ClipError::Order)
+        );
+
+        // A higher start abandons the unfinished text.
+        a.start(ClipStart { seq: 4, len: 4 }, true, MAX_CLIP)
+            .unwrap();
+        assert_eq!(a.chunk(4, 0, b"ab").unwrap(), None);
+        a.start(ClipStart { seq: 6, len: 2 }, true, MAX_CLIP)
+            .unwrap();
+        assert_eq!(a.chunk(4, 2, b"cd").unwrap_err(), ClipError::OutOfPlace);
+        assert_eq!(
+            a.chunk(6, 0, b"zz").unwrap().as_deref().map(Vec::as_slice),
+            Some(&b"zz"[..])
+        );
+
+        // A text not taken: its chunks are dropped, then the next is taken.
+        a.start(ClipStart { seq: 7, len: 3 }, false, MAX_CLIP)
+            .unwrap();
+        assert!(!a.receiving());
+        assert_eq!(a.chunk(7, 0, b"abc").unwrap(), None);
+        a.start(ClipStart { seq: 8, len: 1 }, true, MAX_CLIP)
+            .unwrap();
+        assert_eq!(
+            a.chunk(8, 0, b"q").unwrap().as_deref().map(Vec::as_slice),
+            Some(&b"q"[..])
+        );
+
+        // A skip mid-text: the rest is dropped whatever `seq` it names (the
+        // skipped start's is unknown), until the next start.
+        a.start(ClipStart { seq: 9, len: 4 }, true, MAX_CLIP)
+            .unwrap();
+        assert_eq!(a.chunk(9, 0, b"ab").unwrap(), None);
+        a.ignore_rest();
+        assert_eq!(a.chunk(9, 2, b"cd").unwrap(), None);
+        assert_eq!(a.chunk(12, 0, b"xyz").unwrap(), None);
+        a.start(ClipStart { seq: 13, len: 1 }, true, MAX_CLIP)
+            .unwrap();
+        assert_eq!(a.chunk(12, 0, b"x").unwrap_err(), ClipError::OutOfPlace);
+        let shown = format!("{a:?}");
+        assert!(shown.contains("ClipAssembly"), "{shown}");
     }
 }
