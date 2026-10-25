@@ -22,7 +22,8 @@ use tornect_core::session_log::SessionMode;
 use tornect_core::{DeviceId, DeviceIdentity, HostIdentity};
 use tornect_input::{Button, InputError, InputEvent, InputSink, denormalize, remap};
 use tornect_proto::{
-    HostStats, Msg, QualityInfo, codec, quality, read_msg, reason, video_flags, write_msg,
+    HostStats, Msg, QualityInfo, codec, quality, read_msg, reason, seq_reached, video_flags,
+    write_msg,
 };
 use tornect_signal::consent::SessionToken;
 use tornect_signal::fsm::client::{
@@ -4702,9 +4703,10 @@ async fn a_viewer_reads_past_the_monitors_of_a_host_with_screens() {
     );
 }
 
-/// From the viewer's side (the monitors design's V4, until its step 13):
-/// a host's `Monitors` is read past, and a `SelectMonitor`, the viewer's own
-/// frame, ends the stream.
+/// From the viewer's side (the monitors design's V2 and V4): a host's
+/// `Monitors` is news the stream reads on past, also for a viewer with no
+/// request to make, and a `SelectMonitor`, the viewer's own frame, ends the
+/// stream.
 #[tokio::test(start_paused = true)]
 async fn a_viewer_reads_past_monitors_and_refuses_a_hosts_select_monitor() {
     let (mut host, viewer) = run_viewer_with(None).await;
@@ -6144,6 +6146,477 @@ async fn the_indicator_hears_each_screen_shown() {
             "stopped ViewerLeft",
         ]
     );
+}
+
+/// What a viewer's sink heard, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Heard {
+    /// A picture: its seq, size and test card index.
+    Picture {
+        seq: u32,
+        size: (u32, u32),
+        index: Option<u32>,
+    },
+    /// The host's screens, and why the sink heard them.
+    Screens(Screens, ScreensNews),
+}
+
+/// A sink that says each picture and each screens hook as a [`Heard`].
+struct Hears(tokio::sync::mpsc::UnboundedSender<Heard>);
+
+impl FrameSink for Hears {
+    fn picture(&mut self, seq: u32, frame: &DecodedFrame) {
+        let _ = self.0.send(Heard::Picture {
+            seq,
+            size: (frame.width, frame.height),
+            index: TestCard::read_index(&frame.rgba, frame.width, frame.height),
+        });
+    }
+
+    fn screens(&mut self, screens: &Screens, news: ScreensNews) {
+        let _ = self.0.send(Heard::Screens(screens.clone(), news));
+    }
+}
+
+/// The next screens hook, past any picture, within [`WAIT`].
+async fn next_screens(
+    heard: &mut tokio::sync::mpsc::UnboundedReceiver<Heard>,
+) -> (Screens, ScreensNews) {
+    let since = tokio::time::Instant::now();
+    loop {
+        in_time(since, "a screens hook");
+        match tokio::time::timeout(WAIT, heard.recv())
+            .await
+            .expect("a hook in time")
+            .expect("the viewer runs")
+        {
+            Heard::Screens(screens, news) => return (screens, news),
+            Heard::Picture { .. } => {}
+        }
+    }
+}
+
+/// The test screens as a host lists them: 1280×720 (main) and 1024×768 to
+/// its right.
+fn listed() -> Vec<tornect_proto::MonitorEntry> {
+    vec![
+        tornect_proto::MonitorEntry::saturating(true, 0, 0, 1280, 720),
+        tornect_proto::MonitorEntry::saturating(false, 1280, 0, 1024, 768),
+    ]
+}
+
+/// A scripted host's `Monitors` over [`listed`], with "all" offered.
+fn monitors_msg(request: u16, status: u8, shown: u8, list: u16, seq: u32, remapped: bool) -> Msg {
+    Msg::Monitors {
+        request,
+        status,
+        shown,
+        all: true,
+        remapped,
+        list,
+        seq,
+        monitors: listed(),
+    }
+}
+
+/// What a viewer that heard `msg`, a `Monitors`, knows of the screens.
+fn screens_of(msg: &Msg) -> Screens {
+    let Msg::Monitors {
+        shown,
+        all,
+        remapped,
+        list,
+        seq,
+        monitors,
+        ..
+    } = msg
+    else {
+        panic!("not a Monitors: {msg:?}");
+    };
+    Screens {
+        monitors: monitors.clone(),
+        all: *all,
+        shown: *shown,
+        list: *list,
+        seq: *seq,
+        remapped: *remapped,
+    }
+}
+
+/// Bind a viewer over a pipe to a scripted host and run it with `requests`
+/// and no input, into [`Hears`]: the host's end past `BindOk`, what the sink
+/// hears, and the run.
+async fn run_viewer_asking(
+    requests: tokio::sync::mpsc::Receiver<ViewerRequest>,
+) -> (
+    DuplexStream,
+    tokio::sync::mpsc::UnboundedReceiver<Heard>,
+    ViewerRun,
+) {
+    let binding = Binding::new(&SessionToken::new([9; 32]), &[9; 32]);
+    let (client, mut host) = duplex(1 << 16);
+    let (tx, heard) = tokio::sync::mpsc::unbounded_channel();
+    let viewer = tokio::spawn(async move {
+        let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
+        let (mut sink, mut stats) = (Hears(tx), ViewerStats::default());
+        let channels = ViewerChannels {
+            input: None,
+            requests: Some(requests),
+        };
+        let end = viewer
+            .run_with(&mut sink, &mut stats, channels, std::future::pending())
+            .await;
+        (end, stats)
+    });
+    assert!(matches!(
+        read_msg(&mut host).await.unwrap(),
+        Some(Msg::Bind { .. })
+    ));
+    let bind_ok = Msg::BindOk {
+        width: 1280,
+        height: 720,
+        codec: codec::H264,
+        mode: 1,
+        quality: APPLIED,
+    };
+    write_msg(&mut host, &bind_ok).await.unwrap();
+    (host, heard, viewer)
+}
+
+/// The viewer's next frame to the scripted host `host` past its pings,
+/// within [`WAIT`].
+async fn next_from_viewer(host: &mut DuplexStream) -> Msg {
+    let since = tokio::time::Instant::now();
+    loop {
+        in_time(since, "a frame from the viewer");
+        match tokio::time::timeout(WAIT, read_msg(host))
+            .await
+            .expect("a frame in time")
+            .unwrap()
+            .expect("the viewer's stream is open")
+        {
+            Msg::Ping { .. } => {}
+            other => return other,
+        }
+    }
+}
+
+/// For `quiet`, the viewer writes nothing to the scripted host `host` but
+/// its pings.
+async fn only_pings_for(host: &mut DuplexStream, quiet: Duration) {
+    let until = tokio::time::Instant::now() + quiet;
+    while let Ok(msg) = tokio::time::timeout_at(until, read_msg(host)).await {
+        let msg = msg.unwrap();
+        assert!(matches!(msg, Some(Msg::Ping { .. })), "{msg:?}");
+    }
+}
+
+/// End a scripted host's stream with `Close{ENDED_BY_HOST}`: what the
+/// viewer received.
+async fn close_viewer(mut host: DuplexStream, viewer: ViewerRun) -> ViewerStats {
+    let close = Msg::Close {
+        reason: reason::ENDED_BY_HOST,
+    };
+    write_msg(&mut host, &close).await.unwrap();
+    let (end, stats) = viewer.await.unwrap();
+    assert!(
+        matches!(end, Ok(ViewerEnd::Host(r)) if r == reason::ENDED_BY_HOST),
+        "{end:?}"
+    );
+    stats
+}
+
+/// The monitors design's V1 and test 14: a request made before the host
+/// listed its monitors waits for the first `Monitors` (a host that lists
+/// none is never asked), then goes as a `SelectMonitor` naming that list,
+/// with request id 1. The sink hears the list as the host's news, with its
+/// seq.
+#[tokio::test(start_paused = true)]
+async fn a_viewers_request_waits_for_the_first_monitors_and_names_its_list() {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tx.send(ViewerRequest::ShowScreen(2)).await.unwrap();
+    let (mut host, mut heard, viewer) = run_viewer_asking(rx).await;
+    only_pings_for(&mut host, Duration::from_secs(3)).await;
+    let first = monitors_msg(0, OK, 1, 7, 0, false);
+    write_msg(&mut host, &first).await.unwrap();
+    assert_eq!(
+        next_screens(&mut heard).await,
+        (screens_of(&first), ScreensNews::Layout)
+    );
+    assert_eq!(
+        next_from_viewer(&mut host).await,
+        Msg::SelectMonitor {
+            request: 1,
+            list: 7,
+            monitor: 2,
+        }
+    );
+    let stats = close_viewer(host, viewer).await;
+    assert_eq!((stats.monitor_requests, stats.screens_received), (1, 1));
+}
+
+/// The monitors design's V1, V2 and test 14: one request waits for its
+/// answer at a time, and one made meanwhile is not sent (`NotSent`); the
+/// answer, the `Monitors` that carries the request's id, clears it and
+/// reaches the sink with its status, its seq and REMAPPED; the next request
+/// takes the next id and names the newest list; a refusal is an answer too;
+/// an id no list can hold is answered UNKNOWN unsent.
+#[tokio::test(start_paused = true)]
+async fn one_request_waits_for_its_answer_at_a_time() {
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let (mut host, mut heard, viewer) = run_viewer_asking(rx).await;
+    let first = monitors_msg(0, OK, 1, 7, 0, false);
+    write_msg(&mut host, &first).await.unwrap();
+    assert_eq!(next_screens(&mut heard).await.1, ScreensNews::Layout);
+
+    tx.send(ViewerRequest::ShowScreen(2)).await.unwrap();
+    assert_eq!(
+        next_from_viewer(&mut host).await,
+        Msg::SelectMonitor {
+            request: 1,
+            list: 7,
+            monitor: 2,
+        }
+    );
+    tx.send(ViewerRequest::ShowScreen(tornect_proto::ALL_MONITORS))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_screens(&mut heard).await,
+        (
+            screens_of(&first),
+            ScreensNews::NotSent {
+                asked: tornect_proto::ALL_MONITORS
+            }
+        )
+    );
+    only_pings_for(&mut host, Duration::from_secs(2)).await;
+
+    let answer = monitors_msg(1, OK, 2, 7, 41, true);
+    write_msg(&mut host, &answer).await.unwrap();
+    let (screens, news) = next_screens(&mut heard).await;
+    assert_eq!(
+        news,
+        ScreensNews::Answer {
+            asked: 2,
+            status: OK
+        }
+    );
+    assert_eq!(
+        (screens.shown, screens.seq, screens.remapped),
+        (2, 41, true)
+    );
+    assert_eq!(screens, screens_of(&answer));
+
+    tx.send(ViewerRequest::ShowScreen(tornect_proto::ALL_MONITORS))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_from_viewer(&mut host).await,
+        Msg::SelectMonitor {
+            request: 2,
+            list: 7,
+            monitor: tornect_proto::ALL_MONITORS,
+        }
+    );
+    let busy = monitors_msg(2, tornect_proto::monitor_status::BUSY, 2, 7, 42, false);
+    write_msg(&mut host, &busy).await.unwrap();
+    assert_eq!(
+        next_screens(&mut heard).await,
+        (
+            screens_of(&busy),
+            ScreensNews::Answer {
+                asked: tornect_proto::ALL_MONITORS,
+                status: tornect_proto::monitor_status::BUSY,
+            }
+        )
+    );
+
+    tx.send(ViewerRequest::ShowScreen(17)).await.unwrap();
+    assert_eq!(
+        next_screens(&mut heard).await,
+        (
+            screens_of(&busy),
+            ScreensNews::Answer {
+                asked: 17,
+                status: tornect_proto::monitor_status::UNKNOWN,
+            }
+        )
+    );
+    only_pings_for(&mut host, Duration::from_secs(2)).await;
+
+    let news = monitors_msg(0, OK, 2, 8, 60, false);
+    write_msg(&mut host, &news).await.unwrap();
+    assert_eq!(
+        next_screens(&mut heard).await,
+        (screens_of(&news), ScreensNews::Layout)
+    );
+    tx.send(ViewerRequest::ShowScreen(1)).await.unwrap();
+    assert_eq!(
+        next_from_viewer(&mut host).await,
+        Msg::SelectMonitor {
+            request: 3,
+            list: 8,
+            monitor: 1,
+        }
+    );
+    let stats = close_viewer(host, viewer).await;
+    assert_eq!((stats.monitor_requests, stats.screens_received), (3, 4));
+}
+
+/// The monitors design's V3 and test 14: a request with no answer in
+/// `SWITCH_WAIT` is given up (`NoAnswer`, not a moment before), its late
+/// answer is the host's news, and the next request may go.
+#[tokio::test(start_paused = true)]
+async fn a_request_unanswered_in_switch_wait_is_given_up_and_its_late_answer_is_news() {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let (mut host, mut heard, viewer) = run_viewer_asking(rx).await;
+    let first = monitors_msg(0, OK, 1, 0, 0, false);
+    write_msg(&mut host, &first).await.unwrap();
+    assert_eq!(next_screens(&mut heard).await.1, ScreensNews::Layout);
+    tx.send(ViewerRequest::ShowScreen(2)).await.unwrap();
+    assert!(matches!(
+        next_from_viewer(&mut host).await,
+        Msg::SelectMonitor { request: 1, .. }
+    ));
+    let asked_at = tokio::time::Instant::now();
+    // The viewer pings meanwhile; the pipe holds them all.
+    assert!(
+        tokio::time::timeout(SWITCH_WAIT - Duration::from_millis(100), heard.recv())
+            .await
+            .is_err(),
+        "a hook before SWITCH_WAIT"
+    );
+    assert_eq!(
+        next_screens(&mut heard).await,
+        (screens_of(&first), ScreensNews::NoAnswer { asked: 2 })
+    );
+    assert!(asked_at.elapsed() >= SWITCH_WAIT);
+
+    let late = monitors_msg(1, OK, 2, 0, 400, true);
+    write_msg(&mut host, &late).await.unwrap();
+    assert_eq!(
+        next_screens(&mut heard).await,
+        (screens_of(&late), ScreensNews::Layout)
+    );
+    tx.send(ViewerRequest::ShowScreen(1)).await.unwrap();
+    assert_eq!(
+        next_from_viewer(&mut host).await,
+        Msg::SelectMonitor {
+            request: 2,
+            list: 0,
+            monitor: 1,
+        }
+    );
+    let stats = close_viewer(host, viewer).await;
+    assert_eq!((stats.monitor_requests, stats.screens_received), (2, 2));
+}
+
+/// Test 14 against the real host: a view-only viewer asks for screen 2,
+/// then for all screens, of a host sharing the test screens. Each answer
+/// reaches its sink right before the first picture of the new screen,
+/// REMAPPED, with that picture's seq: every picture before it has the
+/// earlier screen's size, every one from it the new size (all screens
+/// fitted to Balanced), and the card's index counts on across both
+/// switches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_viewer_switches_the_hosts_screens_and_its_pictures_follow() {
+    let limits = MediaLimits {
+        switch_interval: Duration::from_millis(200),
+        ..MediaLimits::default()
+    };
+    let rig = screens_rig(&TEST_SCREENS, 30, limits);
+    let (_, binding) = start(&rig.host, 86, SessionMode::ViewOnly);
+    let (client, served) = connect(&rig.host);
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tx.send(ViewerRequest::ShowScreen(2)).await.unwrap();
+    let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let viewer = tokio::spawn(async move {
+        let viewer = MediaViewer::bind(client, &binding, WAIT).await.unwrap();
+        let (mut sink, mut stats) = (Hears(heard_tx), ViewerStats::default());
+        let channels = ViewerChannels {
+            input: None,
+            requests: Some(rx),
+        };
+        let end = viewer
+            .run_with(&mut sink, &mut stats, channels, async {
+                let _ = stop_rx.await;
+            })
+            .await;
+        (end, stats)
+    });
+
+    let mut seen: Vec<(u32, (u32, u32), Option<u32>)> = Vec::new();
+    let mut answers: Vec<Screens> = Vec::new();
+    let since = tokio::time::Instant::now();
+    while answers.len() < 2
+        || !seen
+            .iter()
+            .any(|&(seq, _, _)| seq_after(seq, answers[1].seq, 3))
+    {
+        in_time(since, "both switches");
+        match tokio::time::timeout(WAIT, heard.recv())
+            .await
+            .expect("a hook in time")
+            .expect("the viewer runs")
+        {
+            Heard::Picture { seq, size, index } => seen.push((seq, size, index)),
+            Heard::Screens(screens, ScreensNews::Layout) => {
+                assert!(answers.is_empty(), "news after a switch: {screens:?}");
+                assert_eq!(
+                    (screens.shown, screens.seq, screens.remapped),
+                    (1, 0, false)
+                );
+                assert_eq!(screens.monitors, listed());
+            }
+            Heard::Screens(screens, ScreensNews::Answer { asked, status }) => {
+                assert_eq!((status, screens.shown, screens.remapped), (OK, asked, true));
+                answers.push(screens);
+                if answers.len() == 1 {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    tx.send(ViewerRequest::ShowScreen(tornect_proto::ALL_MONITORS))
+                        .await
+                        .unwrap();
+                }
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let _ = stop_tx.send(());
+    let (end, stats) = viewer.await.unwrap();
+    assert_eq!(end.unwrap(), ViewerEnd::Stopped);
+    served.await.unwrap();
+    assert_eq!(stats.monitor_requests, 2);
+
+    let all = fitted(QualityPreset::Balanced, 2304, 768);
+    for &(seq, size, _) in &seen {
+        let want = if seq_reached(seq, answers[1].seq) {
+            all
+        } else if seq_reached(seq, answers[0].seq) {
+            (1024, 768)
+        } else {
+            (1280, 720)
+        };
+        assert_eq!(size, want, "picture {seq} of {seen:?}");
+    }
+    for (screens, size) in answers.iter().zip([(1024, 768), all]) {
+        assert!(
+            seen.iter()
+                .any(|&(seq, s, _)| seq == screens.seq && s == size),
+            "no picture {} of {size:?}: {seen:?}",
+            screens.seq
+        );
+    }
+    let indices: Vec<u32> = seen.iter().filter_map(|&(_, _, index)| index).collect();
+    for pair in indices.windows(2) {
+        assert!(pair[1] > pair[0], "{indices:?}");
+    }
+}
+
+/// Whether `seq` is at least `n` past `target`.
+fn seq_after(seq: u32, target: u32, n: u32) -> bool {
+    seq_reached(seq, target.wrapping_add(n))
 }
 
 /// Capture that cannot start refuses the bind, says why, and starts nothing.

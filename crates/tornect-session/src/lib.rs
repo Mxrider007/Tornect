@@ -32,6 +32,7 @@
 //! | what the host says it applies and its means are display-only, and a host that repeats them cannot flood the viewer's display (the quality design §5.12) | [`FrameSink::quality`] (only changes), [`FrameSink::host_stats`] (at most one per 900 ms) |
 //! | a host of another version is said to be one (the quality design §4.7) | [`ViewerError::Version`] |
 //! | input made against an earlier picture never lands on a remapped screen (the monitors design's H5) | the `VideoAck` barrier in [`MediaHost`]; an injector that cannot follow the picture ends the session's input (`notice::INPUT_LOST`) |
+//! | a viewer's choice of screen costs the host one switch at a time, and the viewer never waits on it for good (the monitors design's H2, V1, V3) | the host's budget and `switch_answer`; [`MediaViewer::run_with`] sends one request at a time and gives it up after [`SWITCH_WAIT`] |
 //!
 //! Consent gating is structural. A media stream is served only for a session
 //! the FSM accepted, and only to a peer that holds that session's token.
@@ -51,7 +52,8 @@ pub use host::{
     MediaOutcome, MediaReport, NoObserver, SourceRequest,
 };
 pub use viewer::{
-    Binding, BoundStream, FrameSink, MediaViewer, ViewerEnd, ViewerError, ViewerStats,
+    Binding, BoundStream, FrameSink, MediaViewer, SWITCH_WAIT, Screens, ScreensNews,
+    ViewerChannels, ViewerEnd, ViewerError, ViewerRequest, ViewerStats,
 };
 
 #[cfg(test)]

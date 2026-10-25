@@ -10,8 +10,8 @@ use tornect_core::config::QualityPreset;
 use tornect_core::session_log::SessionMode;
 use tornect_input::InputEvent;
 use tornect_proto::{
-    HostStats, Msg, ProtoError, QualityInfo, bind_mac, codec, read_msg, reason, video_flags,
-    write_msg,
+    HostStats, MAX_MONITORS, MonitorEntry, Msg, ProtoError, QualityInfo, bind_mac, codec,
+    monitor_status, read_msg, reason, video_flags, write_msg,
 };
 use tornect_signal::consent::{SessionToken, mode_from_code};
 
@@ -32,6 +32,11 @@ const PING_EVERY: Duration = Duration::from_secs(1);
 /// them about once a second, and one that sends more cannot make the
 /// display redraw or the terminal print faster than this.
 const HOST_STATS_EVERY: Duration = Duration::from_millis(900);
+/// How long a viewer waits for the answer to its `SelectMonitor` before it
+/// gives the request up (the monitors design's V3). The host answers within
+/// its own `MediaLimits::switch_answer` (15 s), so only a stalled stream
+/// runs this out; an answer that comes later is the host's news.
+pub const SWITCH_WAIT: Duration = Duration::from_secs(25);
 
 /// What proves a media stream belongs to a session: the session id and the
 /// bind MAC (decisions M1-39, M1-41). Both come from the handshake; the token
@@ -130,6 +135,88 @@ pub trait FrameSink: Send {
     /// clock (more frequent ones are counted in
     /// [`ViewerStats::stats_coalesced`]). Display-only; every value saturates.
     fn host_stats(&mut self, _stats: &HostStats) {}
+
+    /// The host's monitors as its last `Monitors` lists them, and why the
+    /// sink hears them now ([`ScreensNews`]). A `Monitors` is the host's
+    /// news or the answer to this viewer's request, and is said once each;
+    /// a request given up or not sent is said with the monitors last listed.
+    /// Display-only: the pictures from [`Screens::seq`] on show
+    /// [`Screens::shown`], and each is still sized from what it decodes.
+    fn screens(&mut self, _screens: &Screens, _news: ScreensNews) {}
+}
+
+/// What the viewer's side hands a media stream besides its pictures' sink
+/// ([`MediaViewer::run_with`]). A channel left `None` carries nothing.
+#[derive(Debug, Default)]
+pub struct ViewerChannels {
+    /// Input events, each sent as an `Input` frame. Only a Control session
+    /// has one: the caller takes that from the signed `SESSION_ACCEPT`,
+    /// never from `BindOk` (SLICE-C2 C2-6).
+    pub input: Option<mpsc::Receiver<InputEvent>>,
+    /// What the viewer asks of the host's capture. Legal in control and
+    /// view-only sessions alike: choosing a screen is a viewing choice.
+    pub requests: Option<mpsc::Receiver<ViewerRequest>>,
+}
+
+/// A viewer's request about what the host shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerRequest {
+    /// Show monitor `id` of the host's last list, or all of them at once
+    /// with [`tornect_proto::ALL_MONITORS`] (0). Sent as a `SelectMonitor`
+    /// once the host has listed its monitors, one at a time (the monitors
+    /// design's V1).
+    ShowScreen(u8),
+}
+
+/// The host's monitors, as its last `Monitors` said them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Screens {
+    /// The monitors; monitor `id` is `monitors[id - 1]`. Geometry in the
+    /// host desktop's units, display-only; a 0×0 size is not known.
+    pub monitors: Vec<MonitorEntry>,
+    /// The host can show all of them at once.
+    pub all: bool,
+    /// What the pictures from [`seq`](Self::seq) on show: a monitor's id, or
+    /// [`tornect_proto::ALL_MONITORS`].
+    pub shown: u8,
+    /// The list's generation, which a request names.
+    pub list: u16,
+    /// The `Video` seq from which this applies.
+    pub seq: u32,
+    /// The pictures from `seq` on show another part of the host's desktop:
+    /// input made against an earlier picture must not be sent (the monitors
+    /// design's V5; the host holds such input back anyway, H5).
+    pub remapped: bool,
+}
+
+/// Why a [`FrameSink`] hears [`Screens`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreensNews {
+    /// The host's own news: its first list, a change of its monitors or of
+    /// what it shows, or the late answer to a request this viewer gave up.
+    Layout,
+    /// The answer to this viewer's request for `asked`: a
+    /// [`tornect_proto::monitor_status`] code. An id no list can hold
+    /// (above [`tornect_proto::MAX_MONITORS`]) is answered `UNKNOWN` here,
+    /// unsent.
+    Answer {
+        /// What was asked for.
+        asked: u8,
+        /// The host's status.
+        status: u8,
+    },
+    /// No answer to the request for `asked` within [`SWITCH_WAIT`]; it is
+    /// given up, and a later answer is [`ScreensNews::Layout`].
+    NoAnswer {
+        /// What was asked for.
+        asked: u8,
+    },
+    /// The request for `asked` was not sent: another one is still waiting
+    /// for its answer.
+    NotSent {
+        /// What was asked for.
+        asked: u8,
+    },
 }
 
 /// What a viewer received.
@@ -164,6 +251,10 @@ pub struct ViewerStats {
     /// Host `Stats` that came within 900 ms of the last one handed to the
     /// sink, and were kept in [`ViewerStats::host`] only.
     pub stats_coalesced: u64,
+    /// `SelectMonitor`s sent.
+    pub monitor_requests: u64,
+    /// `Monitors` received.
+    pub screens_received: u64,
 }
 
 /// How a bound media stream ended, seen from the viewer.
@@ -305,6 +396,40 @@ where
     }
 
     /// Decode and acknowledge until the host closes the stream, or until `stop`
+    /// resolves (then `Close{ENDED_BY_VIEWER}` is sent): [`run_with`](Self::run_with)
+    /// with no input and no requests.
+    pub async fn run<F>(
+        self,
+        sink: &mut dyn FrameSink,
+        stats: &mut ViewerStats,
+        stop: F,
+    ) -> Result<ViewerEnd, ViewerError>
+    where
+        F: Future<Output = ()>,
+    {
+        self.run_with(sink, stats, ViewerChannels::default(), stop)
+            .await
+    }
+
+    /// [`run_with`](Self::run_with) with `input` and no requests.
+    pub async fn run_with_input<F>(
+        self,
+        sink: &mut dyn FrameSink,
+        stats: &mut ViewerStats,
+        input: Option<mpsc::Receiver<InputEvent>>,
+        stop: F,
+    ) -> Result<ViewerEnd, ViewerError>
+    where
+        F: Future<Output = ()>,
+    {
+        let channels = ViewerChannels {
+            input,
+            requests: None,
+        };
+        self.run_with(sink, stats, channels, stop).await
+    }
+
+    /// Decode and acknowledge until the host closes the stream, or until `stop`
     /// resolves (then `Close{ENDED_BY_VIEWER}` is sent). Every access unit is
     /// acknowledged once handled, decoded or not; that is the host's flow
     /// control. A decode error asks for a keyframe. Decoding runs on this task,
@@ -318,34 +443,35 @@ where
     /// What the host says it applies (`BindOk`, then each `Quality` that
     /// changes it) and its per-stage means (`Stats`, at most one per 900 ms)
     /// go to the sink's display-only hooks; neither sizes a buffer.
-    pub async fn run<F>(
-        self,
-        sink: &mut dyn FrameSink,
-        stats: &mut ViewerStats,
-        stop: F,
-    ) -> Result<ViewerEnd, ViewerError>
-    where
-        F: Future<Output = ()>,
-    {
-        self.run_with_input(sink, stats, None, stop).await
-    }
-
-    /// [`run`](Self::run), also sending each event `input` yields to the host
-    /// as an `Input` frame (its 16-byte form), ahead of reading the next
-    /// picture, until the channel closes. A change of the viewer's pick
-    /// ([`with_quality`](Self::with_quality)) goes out as a `SetQuality` after
-    /// the input waiting and before the next read.
     ///
-    /// Whether a session has an input channel at all is the caller's decision,
-    /// and it must be taken from the mode of the signed `SESSION_ACCEPT`
-    /// (`ClientSession::accept().mode()`), never from the `BindOk` of this
-    /// stream (SLICE-C2 C2-6): a view-only session passes `None` and sends no
-    /// input. The host drops a view-only session's input undecoded anyway.
-    pub async fn run_with_input<F>(
+    /// Each event `channels.input` yields goes to the host as an `Input` frame
+    /// (its 16-byte form), ahead of reading the next picture, until the
+    /// channel closes. Whether a session has an input channel at all is the
+    /// caller's decision, and it must be taken from the mode of the signed
+    /// `SESSION_ACCEPT` (`ClientSession::accept().mode()`), never from the
+    /// `BindOk` of this stream (SLICE-C2 C2-6): a view-only session passes
+    /// `None` and sends no input. The host drops a view-only session's input
+    /// undecoded anyway. A change of the viewer's pick
+    /// ([`with_quality`](Self::with_quality)) goes out as a `SetQuality`
+    /// after the input waiting and before the next read.
+    ///
+    /// Each [`ViewerRequest`] `channels.requests` yields is sent once the
+    /// host has listed its monitors, so a request made before waits for the
+    /// first `Monitors` (and is never sent to a host that lists none), as a
+    /// `SelectMonitor` naming the last list (the monitors design's V1). One
+    /// waits for its answer at a time: a request made meanwhile is not sent
+    /// ([`ScreensNews::NotSent`]). An answer is the `Monitors` that carries
+    /// the request's id; every other `Monitors` is the host's news (V2). With
+    /// no answer in [`SWITCH_WAIT`] the request is given up
+    /// ([`ScreensNews::NoAnswer`]), and its late answer is news (V3). A host's
+    /// `SelectMonitor` is [`ViewerError::Unexpected`] (V4). The viewer holds
+    /// no input back across a change of screen: the host's `VideoAck` barrier
+    /// does that (H5), and the window adds its own hold (V5).
+    pub async fn run_with<F>(
         self,
         sink: &mut dyn FrameSink,
         stats: &mut ViewerStats,
-        mut input: Option<mpsc::Receiver<InputEvent>>,
+        channels: ViewerChannels,
         stop: F,
     ) -> Result<ViewerEnd, ViewerError>
     where
@@ -360,6 +486,10 @@ where
             bound,
             mut picks,
         } = self;
+        let ViewerChannels {
+            mut input,
+            mut requests,
+        } = channels;
         // What the host last said, and the size every picture should have.
         let mut said = (bound.width, bound.height, bound.quality);
         let mut announced = (bound.width, bound.height);
@@ -373,7 +503,13 @@ where
         let mut read = Box::pin(read_owned(rd));
         let mut next_ping = tokio::time::Instant::now() + PING_EVERY;
         let mut nonce = 0u64;
+        // What the host last listed; requests wait for its first list.
+        let mut screens: Option<Screens> = None;
+        // The request waiting for its answer, and the last id used.
+        let mut pending: Option<Pending> = None;
+        let mut last_request = 0u16;
         loop {
+            let give_up = pending.as_ref().map(|p| p.deadline);
             let msg = tokio::select! {
                 biased;
                 () = &mut stop => None,
@@ -406,6 +542,60 @@ where
                         return Ok(ViewerEnd::Stopped);
                     }
                     next_ping = tokio::time::Instant::now() + PING_EVERY;
+                    continue;
+                }
+                request = next_request(&mut requests), if screens.is_some() => {
+                    let Some(ViewerRequest::ShowScreen(asked)) = request else {
+                        // Every sender is gone: no more requests.
+                        requests = None;
+                        continue;
+                    };
+                    let Some(listed) = screens.as_ref() else {
+                        continue;
+                    };
+                    if pending.is_some() {
+                        sink.screens(listed, ScreensNews::NotSent { asked });
+                        continue;
+                    }
+                    if usize::from(asked) > MAX_MONITORS {
+                        // No list holds that id; the frame could not carry
+                        // it, and the host would answer UNKNOWN.
+                        let status = monitor_status::UNKNOWN;
+                        sink.screens(listed, ScreensNews::Answer { asked, status });
+                        continue;
+                    }
+                    last_request = following(last_request);
+                    let select = Msg::SelectMonitor {
+                        request: last_request,
+                        list: listed.list,
+                        monitor: asked,
+                    };
+                    if !write_unless_stopped(&mut wr, &select, stop.as_mut()).await? {
+                        return Ok(ViewerEnd::Stopped);
+                    }
+                    stats.monitor_requests += 1;
+                    let now = tokio::time::Instant::now();
+                    pending = Some(Pending {
+                        request: last_request,
+                        asked,
+                        deadline: now + SWITCH_WAIT,
+                    });
+                    next_ping = now + PING_EVERY;
+                    continue;
+                }
+                // Before the read: a host that keeps pictures coming must not
+                // keep a request waiting past its deadline.
+                () = until(give_up) => {
+                    if let Some(given_up) = pending.take() {
+                        tracing::debug!(
+                            request = given_up.request,
+                            "no answer to the screen request in time"
+                        );
+                        if let Some(listed) = screens.as_ref() {
+                            let asked = given_up.asked;
+                            sink.screens(listed, ScreensNews::NoAnswer { asked });
+                        }
+                    }
                     continue;
                 }
                 (rd, msg) = &mut read => {
@@ -514,17 +704,96 @@ where
                         sink.host_stats(&host);
                     }
                 }
-                // The host's monitors (the monitors design's H1 and H3):
-                // read past until the viewer follows them (its step 13). They
-                // size nothing; a `SelectMonitor` is the viewer's own frame
-                // and ends the stream below (V4).
-                Some(Msg::Monitors { .. }) => {}
+                // The host's monitors: the answer to the request waiting for
+                // one (V1), or its news (V2). They size nothing; a
+                // `SelectMonitor` is the viewer's own frame and ends the
+                // stream below (V4).
+                Some(Msg::Monitors {
+                    request,
+                    status,
+                    shown,
+                    all,
+                    remapped,
+                    list,
+                    seq,
+                    monitors,
+                }) => {
+                    stats.screens_received += 1;
+                    let news = match pending {
+                        Some(waiting) if request != 0 && request == waiting.request => {
+                            pending = None;
+                            ScreensNews::Answer {
+                                asked: waiting.asked,
+                                status,
+                            }
+                        }
+                        _ => ScreensNews::Layout,
+                    };
+                    tracing::debug!(
+                        request,
+                        status,
+                        shown,
+                        of = monitors.len(),
+                        remapped,
+                        seq,
+                        "the host's screens"
+                    );
+                    let listed = Screens {
+                        monitors,
+                        all,
+                        shown,
+                        list,
+                        seq,
+                        remapped,
+                    };
+                    sink.screens(&listed, news);
+                    screens = Some(listed);
+                }
                 Some(Msg::Close { reason }) => return Ok(ViewerEnd::Host(reason)),
                 Some(other) => return Err(ViewerError::Unexpected(kind(&other))),
                 None => return Ok(ViewerEnd::Closed),
             }
             tokio::task::yield_now().await;
         }
+    }
+}
+
+/// A `SelectMonitor` waiting for its answer.
+#[derive(Debug, Clone, Copy)]
+struct Pending {
+    /// Its id, which the answer carries.
+    request: u16,
+    /// What it asked for.
+    asked: u8,
+    /// When it is given up ([`SWITCH_WAIT`]).
+    deadline: tokio::time::Instant,
+}
+
+/// The request id after `last`: they count up from 1, wrapping, and skip 0,
+/// which is the host's news.
+fn following(last: u16) -> u16 {
+    match last.wrapping_add(1) {
+        0 => 1,
+        next => next,
+    }
+}
+
+/// Resolves at `deadline`; never without one.
+async fn until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The next request from `requests`; `None` once it is closed; never
+/// without one.
+async fn next_request(
+    requests: &mut Option<mpsc::Receiver<ViewerRequest>>,
+) -> Option<ViewerRequest> {
+    match requests {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -603,5 +872,32 @@ fn kind(msg: &Msg) -> &'static str {
         Msg::SelectMonitor { .. } => "SelectMonitor",
         Msg::Monitors { .. } => "Monitors",
         Msg::Close { .. } => "Close",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The monitors design's V1: request ids count up from 1, wrap, and
+    /// never take 0, the host's news.
+    #[test]
+    fn request_ids_count_from_1_and_skip_0_when_they_wrap() {
+        assert_eq!(following(0), 1);
+        assert_eq!(following(1), 2);
+        assert_eq!(following(u16::MAX - 1), u16::MAX);
+        assert_eq!(following(u16::MAX), 1);
+        let mut id = 0;
+        for _ in 0..=u32::from(u16::MAX) * 2 {
+            id = following(id);
+            assert_ne!(id, 0);
+        }
+    }
+
+    /// The viewer gives a request up only after the host has given it up:
+    /// a host answers within its `switch_answer`.
+    #[test]
+    fn a_viewer_waits_longer_than_the_host_answers() {
+        assert!(crate::MediaLimits::default().switch_answer < SWITCH_WAIT);
     }
 }
