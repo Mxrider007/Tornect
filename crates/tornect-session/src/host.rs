@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Notify, Semaphore, mpsc, watch};
-use tornect_capture::{CaptureError, Frame, VideoSource};
+use tornect_capture::{CaptureError, Frame, Layout, Selection, VideoSource};
 use tornect_codec::H264Encoder;
 use tornect_codec::scale::Scaler;
 use tornect_core::config::{Media, QualityPreset};
@@ -51,8 +51,8 @@ use tornect_core::levels::Elevation;
 use tornect_core::session_log::SessionMode;
 use tornect_input::{InputEvent, InputSink, Tracked};
 use tornect_proto::{
-    BIND_TYPE, MAX_CLIENT_FRAME, MAX_FRAME, Msg, ProtoError, SESSION_ID_LEN, codec, read_msg_max,
-    reason, video_flags, write_msg,
+    BIND_TYPE, MAX_CLIENT_FRAME, MAX_FRAME, Msg, ProtoError, SESSION_ID_LEN, codec, monitor_status,
+    read_msg_max, reason, video_flags, write_msg,
 };
 use tornect_signal::consent::{SessionToken, mode_code};
 use tornect_signal::fsm::host::{KillSwitch, LiveSession, SessionEnd, SessionSink};
@@ -694,7 +694,7 @@ impl MediaHost {
         let first = tokio::select! {
             biased;
             _ = end.changed() => First::Ended,
-            first = tokio::time::timeout(self.limits.first_frame_deadline, pipeline.next()) => {
+            first = tokio::time::timeout(self.limits.first_frame_deadline, pipeline.picture()) => {
                 First::Frame(first.ok().flatten())
             }
         };
@@ -913,7 +913,16 @@ impl MediaHost {
                 // The gate's turn came while nothing else happened: it is
                 // taken at the top of the loop.
                 Event::Quality => turn = quality_at.map(tokio::time::Instant::into_std),
-                Event::Frame(Some(Ok(frame))) => pending = Some(frame),
+                Event::Frame(Some(Ok(Produced::Frame(frame)))) => pending = Some(frame),
+                // No selection is handed to the pipeline yet (the monitors
+                // design's step 11), so no switch waits for this answer.
+                Event::Frame(Some(Ok(Produced::Refused { request, status }))) => {
+                    tracing::debug!(
+                        request,
+                        status,
+                        "a monitor selection refused with none waiting"
+                    );
+                }
                 Event::Frame(Some(Err(e))) => {
                     tracing::warn!(error = %e, session = %session_id, "screen capture stopped");
                     break MediaEnd::Pipeline(e.reason());
@@ -1207,7 +1216,7 @@ enum First {
 enum Event {
     Ended,
     Client(Option<Result<Msg, ProtoError>>),
-    Frame(Option<Result<Encoded, PipelineError>>),
+    Frame(Option<Result<Produced, PipelineError>>),
     /// The viewer has said nothing for [`MediaLimits::viewer_quiet`].
     Quiet,
     /// The quality gate's turn came: the loop wakes to take it at its top.
@@ -1558,6 +1567,43 @@ struct Encoded {
     /// picture has none unless the settings changed before it (`BindOk`
     /// says the rest).
     announce: Option<Announce>,
+    /// The source's monitors and what this picture shows
+    /// ([`VideoSource::layout`]), when they differ from the layout attached to
+    /// an earlier picture: the first picture of a source that has one carries
+    /// it, and a picture after a switch or a change of the desktop carries the
+    /// new one. The host says it in a `Monitors` just before this picture (the
+    /// monitors design's H1 and H3). A repeat never carries one. Boxed: it
+    /// comes with few pictures, and every picture moves through a channel.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read by the host's loop from the monitors design's step 10"
+        )
+    )]
+    layout: Option<Box<Layout>>,
+    /// The `SelectMonitor` this picture answers: the first picture captured
+    /// after the source switched to the selection it asked for, a keyframe.
+    /// A repeat never answers one.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read by the host's loop from the monitors design's step 10"
+        )
+    )]
+    answers: Option<u16>,
+}
+
+/// What the capture thread hands the host's loop.
+enum Produced {
+    /// A picture, for the credit it was asked with.
+    Frame(Encoded),
+    /// The source could not show the selection `request` asked for
+    /// ([`Pipeline::select`]): `status` is `monitor_status::UNKNOWN` for a
+    /// monitor it does not have, `FAILED` for anything else. No credit is
+    /// spent on it.
+    Refused { request: u16, status: u8 },
 }
 
 /// The settings a picture and those after it are encoded with; its size is
@@ -1591,6 +1637,19 @@ struct Control {
     /// The preset code to change to (`tornect_proto::quality`); 0 for none.
     /// The latest wins.
     quality: AtomicU8,
+    /// The selection to show, and the `SelectMonitor` request it answers,
+    /// until the capture thread takes it ([`Pipeline::select`]).
+    select: Mutex<Option<(Selection, u16)>>,
+}
+
+impl Control {
+    /// The selection handed over and not taken yet, taken now.
+    fn take_select(&self) -> Option<(Selection, u16)> {
+        self.select
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
 }
 
 /// Capture and encoding, on a blocking thread that owns the source: when the
@@ -1598,7 +1657,7 @@ struct Control {
 struct Pipeline {
     control: Arc<Control>,
     credits: std::sync::mpsc::Sender<()>,
-    frames: mpsc::Receiver<Result<Encoded, PipelineError>>,
+    frames: mpsc::Receiver<Result<Produced, PipelineError>>,
     thread: Option<tokio::task::JoinHandle<()>>,
     /// A credit given and its picture not received yet (at most one).
     waiting: bool,
@@ -1648,17 +1707,84 @@ impl Pipeline {
         }
     }
 
-    /// The next picture; cancel-safe.
-    async fn next(&mut self) -> Option<Result<Encoded, PipelineError>> {
-        let frame = self.frames.recv().await;
-        if frame.is_some() {
+    /// The next picture or refusal; cancel-safe. Only a picture, or the end,
+    /// answers the credit given: a refusal spends none.
+    async fn next(&mut self) -> Option<Result<Produced, PipelineError>> {
+        let produced = self.frames.recv().await;
+        if !matches!(produced, Some(Ok(Produced::Refused { .. }))) {
             self.waiting = false;
         }
-        frame
+        produced
+    }
+
+    /// The next picture, passing over any refusal; cancel-safe. For the first
+    /// picture, which no selection can come before: the host hands one over
+    /// only on a bound stream it serves.
+    async fn picture(&mut self) -> Option<Result<Encoded, PipelineError>> {
+        loop {
+            match self.next().await? {
+                Ok(Produced::Frame(frame)) => return Some(Ok(frame)),
+                Ok(Produced::Refused { request, status }) => {
+                    tracing::debug!(
+                        request,
+                        status,
+                        "a monitor selection refused before any picture"
+                    );
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
     }
 
     fn force_keyframe(&self) {
         self.control.keyframe.store(true, Ordering::SeqCst);
+    }
+
+    /// Show `selection` from the next picture on, for the `SelectMonitor`
+    /// `request`: the capture thread takes it within [`POLL`], while it waits
+    /// for a credit or for a picture alike (after the pacing wait, at most
+    /// one frame interval, when it is pacing). The source switches before its
+    /// next picture, which is then a keyframe and answers `request`
+    /// ([`Encoded::answers`]); a source that cannot switch is answered with a
+    /// [`Produced::Refused`] at once. One handed over and not taken yet is
+    /// replaced. The caller keeps one switch at a time (the design's H2).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "called by the host's loop from the monitors design's step 11"
+        )
+    )]
+    fn select(&self, selection: Selection, request: u16) {
+        *self
+            .control
+            .select
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((selection, request));
+    }
+
+    /// Take back the selection for `request` if the capture thread has not
+    /// taken it yet: `true` when it never reaches the source. Once taken, it
+    /// is the source's to finish; its answer may come late, with a picture.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "called by the host's loop from the monitors design's step 11"
+        )
+    )]
+    fn withdraw(&self, request: u16) -> bool {
+        let mut select = self
+            .control
+            .select
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if select.is_some_and(|(_, r)| r == request) {
+            *select = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// Change to the preset of wire code `code` (`tornect_proto::quality`;
@@ -1734,11 +1860,17 @@ fn pace(due: Instant, stop: &AtomicBool) -> bool {
 /// sent, though never a newer one (decision M1-74 (6)). Its buffer goes back
 /// to the source (`VideoSource::recycle`) when a newer picture replaces it.
 /// A keyframe request still waits for the next picture, as before.
+///
+/// A selection of the viewer's ([`Pipeline::select`]) is taken on every
+/// [`POLL`] turn too, while the thread waits for a credit or for a picture
+/// ([`take_select`]): the source switches before its next picture, which
+/// answers the request. After each fresh picture the source's layout is read,
+/// and attached to the picture when it changed ([`Encoded::layout`]).
 fn encode_loop(
     mut source: Box<dyn VideoSource>,
     mut settings: Settings,
     credits: &std::sync::mpsc::Receiver<()>,
-    out: &mpsc::Sender<Result<Encoded, PipelineError>>,
+    out: &mpsc::Sender<Result<Produced, PipelineError>>,
     control: &Control,
 ) {
     let mut encoder = match H264Encoder::new(settings.current.encoder) {
@@ -1756,9 +1888,23 @@ fn encode_loop(
     let mut size: Option<(u32, u32)> = None;
     // The settings changed since the last picture encoded.
     let mut changed = false;
+    // The layout attached to a picture last; `None` before the first.
+    let mut attached: Option<Layout> = None;
+    // The request the next fresh picture answers: the source switched to it.
+    let mut answer: Option<u16> = None;
     loop {
         loop {
             if control.stop.load(Ordering::SeqCst) {
+                return;
+            }
+            if !take_select(
+                source.as_mut(),
+                &mut encoder,
+                control,
+                out,
+                &mut answer,
+                &mut last,
+            ) {
                 return;
             }
             match credits.recv_timeout(POLL) {
@@ -1774,6 +1920,16 @@ fn encode_loop(
         }
         let (frame, repeat) = loop {
             if control.stop.load(Ordering::SeqCst) {
+                return;
+            }
+            if !take_select(
+                source.as_mut(),
+                &mut encoder,
+                control,
+                out,
+                &mut answer,
+                &mut last,
+            ) {
                 return;
             }
             if let Some(preset) = quality::preset(control.quality.swap(0, Ordering::SeqCst)) {
@@ -1804,6 +1960,18 @@ fn encode_loop(
         if control.keyframe.swap(false, Ordering::SeqCst) {
             encoder.force_keyframe();
         }
+        // What the picture shows, and the request it answers, ride a fresh
+        // picture only: a repeat encodes the last one again, whose layout is
+        // the one attached last (a switch lets the last picture go).
+        let (layout, answers) = if repeat {
+            (None, None)
+        } else {
+            let layout = source.layout().filter(|now| attached.as_ref() != Some(now));
+            if layout.is_some() {
+                attached.clone_from(&layout);
+            }
+            (layout.map(Box::new), answer.take())
+        };
         let started = Instant::now();
         let fitted = scaler
             .fit(&frame.bgrx, frame.width, frame.height, settings.current.cap)
@@ -1849,6 +2017,8 @@ fn encode_loop(
                     ready_at: Instant::now(),
                     repeat,
                     announce,
+                    layout,
+                    answers,
                 })
             }
         };
@@ -1858,14 +2028,57 @@ fn encode_loop(
             source.recycle(old.bgrx);
         }
         let failed = encoded.is_err();
-        if out.blocking_send(encoded).is_err() || failed {
+        if out.blocking_send(encoded.map(Produced::Frame)).is_err() || failed {
             return;
+        }
+    }
+}
+
+/// Act on the selection the host's loop handed over ([`Pipeline::select`]),
+/// if there is one; `false` once the loop is gone. The source switches before
+/// its next picture is taken, so that picture, made a keyframe, answers the
+/// request. The last picture, of what was shown before, is given back, so a
+/// quality change cannot encode it again as the answer: an answer rides a
+/// picture of the new selection only (the design's §12, response 2). A
+/// refusal is said at once, `UNKNOWN` for a monitor the source does not have
+/// and `FAILED` for anything else, and changes nothing: the screen shown,
+/// and the answer a switch taken earlier still owes, stay.
+fn take_select(
+    source: &mut dyn VideoSource,
+    encoder: &mut H264Encoder,
+    control: &Control,
+    out: &mpsc::Sender<Result<Produced, PipelineError>>,
+    answer: &mut Option<u16>,
+    last: &mut Option<Frame>,
+) -> bool {
+    let Some((selection, request)) = control.take_select() else {
+        return true;
+    };
+    match source.select(selection, &control.stop) {
+        Ok(()) => {
+            encoder.force_keyframe();
+            *answer = Some(request);
+            if let Some(old) = last.take() {
+                source.recycle(old.bgrx);
+            }
+            true
+        }
+        Err(e) => {
+            let status = match e {
+                CaptureError::NoMonitor(_) => monitor_status::UNKNOWN,
+                _ => monitor_status::FAILED,
+            };
+            tracing::debug!(error = %e, request, "the source did not switch screens");
+            out.blocking_send(Ok(Produced::Refused { request, status }))
+                .is_ok()
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     /// `Quiet::due`'s queue-full branch, which PR-A's draining of the queue
@@ -2338,11 +2551,23 @@ mod tests {
     /// The next picture, after a credit.
     async fn picture(pipeline: &mut Pipeline) -> Encoded {
         pipeline.credit();
-        tokio::time::timeout(Duration::from_secs(10), pipeline.next())
+        next_picture(pipeline).await
+    }
+
+    /// The next thing the pipeline hands over, a picture: no refusal comes
+    /// first.
+    async fn next_picture(pipeline: &mut Pipeline) -> Encoded {
+        match tokio::time::timeout(Duration::from_secs(10), pipeline.next())
             .await
             .expect("a picture in time")
             .expect("the pipeline runs")
             .expect("encoded")
+        {
+            Produced::Frame(frame) => frame,
+            Produced::Refused { request, status } => {
+                panic!("a refusal ({request}, {status}) instead of a picture")
+            }
+        }
     }
 
     /// No picture within `wait` of a credit.
@@ -2444,11 +2669,7 @@ mod tests {
         let caps = QualityCaps::default();
         let asked = Instant::now();
         pipeline.set_quality(tornect_proto::quality::BEST_PERFORMANCE);
-        let again = tokio::time::timeout(Duration::from_secs(10), pipeline.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let again = next_picture(&mut pipeline).await;
         assert!(
             asked.elapsed() < POLL + Duration::from_millis(500),
             "taken within a poll: {:?}",
@@ -2497,11 +2718,7 @@ mod tests {
         pipeline.set_quality(tornect_proto::quality::BEST_QUALITY);
         no_picture(&mut pipeline, Duration::from_millis(300)).await;
         queue.lock().unwrap().push_back((640, 360));
-        let first = tokio::time::timeout(Duration::from_secs(10), pipeline.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let first = next_picture(&mut pipeline).await;
         assert!(!first.repeat && first.keyframe);
         assert_eq!(
             first.announce.map(|a| a.settings.preset),
@@ -2521,11 +2738,7 @@ mod tests {
             "a keyframe request on a still screen waits for a picture"
         );
         queue.lock().unwrap().push_back((640, 360));
-        let next = tokio::time::timeout(Duration::from_secs(10), pipeline.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let next = next_picture(&mut pipeline).await;
         assert!(!next.repeat && next.keyframe, "the forced keyframe");
         assert!(next.announce.is_none(), "nothing changed");
         pipeline.stop().await;
@@ -2542,6 +2755,10 @@ mod tests {
         for _ in sizes {
             let p = picture(&mut pipeline).await;
             assert!(!p.repeat);
+            assert!(
+                p.layout.is_none() && p.answers.is_none(),
+                "a source with nothing to choose says no layout"
+            );
             seen.push((
                 (p.width, p.height),
                 p.announce.map(|a| a.settings.preset),
@@ -2719,6 +2936,8 @@ mod tests {
             ready_at: t0,
             repeat: true,
             announce: Some(Announce { settings: fast }),
+            layout: None,
+            answers: None,
         };
         let said = Msg::Quality {
             width: 1280,
@@ -2749,5 +2968,436 @@ mod tests {
         assert_eq!(served.report.quality_changes, 1, "counted when announced");
         drop(served);
         pipeline.stop().await;
+    }
+
+    /// What [`Desk::select`] does when asked.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum OnSelect {
+        /// Show it from the next picture on (a monitor it does not have is
+        /// [`CaptureError::NoMonitor`]).
+        Switch,
+        /// Fail, as a source that could not switch.
+        Fail,
+        /// Wait until [`Desk::release`] is set, then switch; a stop ends the
+        /// wait with a failure, within 10 ms.
+        Hold,
+    }
+
+    /// Monitors side by side from (0, 0), the first primary: one picture per
+    /// token in `pictures`, then a still screen (damage-driven, as a
+    /// PipeWire stream is). Each picture is a test card of what is shown: one
+    /// monitor, or all of them as one card of their union.
+    struct Desk {
+        sizes: Vec<(u32, u32)>,
+        shown: Selection,
+        index: u32,
+        /// What the last picture shows.
+        last: Option<Layout>,
+        pictures: Arc<AtomicUsize>,
+        on_select: Arc<Mutex<OnSelect>>,
+        release: Arc<AtomicBool>,
+        /// Every selection asked of it, in order.
+        asked: Arc<Mutex<Vec<Selection>>>,
+        recycled: Arc<Mutex<Vec<usize>>>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl Desk {
+        fn now(&self) -> Layout {
+            let mut x = 0;
+            let monitors: Vec<_> = self
+                .sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &(width, height))| {
+                    let rect = tornect_capture::Rect::new(x, 0, width, height);
+                    x += i32::try_from(width).unwrap();
+                    tornect_capture::Monitor {
+                        id: u8::try_from(i + 1).unwrap(),
+                        primary: i == 0,
+                        rect,
+                    }
+                })
+                .collect();
+            let space = tornect_capture::Rect::new(
+                0,
+                0,
+                self.sizes.iter().map(|s| s.0).sum(),
+                self.sizes.iter().map(|s| s.1).max().unwrap(),
+            );
+            let shown = match self.shown {
+                Selection::All => space,
+                Selection::Monitor(id) => monitors[usize::from(id) - 1].rect,
+            };
+            Layout {
+                all: monitors.len() >= 2,
+                monitors,
+                shown: self.shown,
+                view: tornect_capture::View::Rect { shown, space },
+            }
+        }
+
+        fn take(&mut self, selection: Selection) -> Result<(), CaptureError> {
+            let n = self.sizes.len();
+            match selection {
+                Selection::Monitor(id) if (1..=n).contains(&usize::from(id)) => {}
+                Selection::All if n >= 2 => {}
+                Selection::Monitor(id) => return Err(CaptureError::NoMonitor(id)),
+                Selection::All => return Err(CaptureError::NoMonitor(0)),
+            }
+            self.shown = selection;
+            Ok(())
+        }
+    }
+
+    impl VideoSource for Desk {
+        fn name(&self) -> &'static str {
+            "desk"
+        }
+
+        fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+            let took = self
+                .pictures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+            if took.is_err() {
+                std::thread::sleep(timeout);
+                return Ok(None);
+            }
+            let layout = self.now();
+            let tornect_capture::View::Rect { shown, .. } = layout.view else {
+                unreachable!("a desk shows rectangles")
+            };
+            self.last = Some(layout);
+            self.index += 1;
+            Ok(Some(Frame {
+                width: shown.width,
+                height: shown.height,
+                bgrx: tornect_capture::TestCard::render(shown.width, shown.height, self.index),
+                captured_at: Instant::now(),
+                grab: Duration::from_micros(300),
+            }))
+        }
+
+        fn recycle(&mut self, bgrx: Vec<u8>) {
+            self.recycled.lock().unwrap().push(bgrx.len());
+        }
+
+        fn layout(&self) -> Option<Layout> {
+            self.last.clone()
+        }
+
+        fn select(&mut self, selection: Selection, stop: &AtomicBool) -> Result<(), CaptureError> {
+            self.asked.lock().unwrap().push(selection);
+            let on_select = *self.on_select.lock().unwrap();
+            match on_select {
+                OnSelect::Switch => self.take(selection),
+                OnSelect::Fail => Err(CaptureError::Failed("the desk could not switch".into())),
+                OnSelect::Hold => {
+                    let asked = Instant::now();
+                    while asked.elapsed() < Duration::from_secs(10) {
+                        if stop.load(Ordering::SeqCst) {
+                            return Err(CaptureError::Failed("stopped".into()));
+                        }
+                        if self.release.load(Ordering::SeqCst) {
+                            return self.take(selection);
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(CaptureError::Failed("held too long".into()))
+                }
+            }
+        }
+    }
+
+    impl Drop for Desk {
+        fn drop(&mut self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// What a test reaches into a [`Desk`] the pipeline owns with.
+    struct DeskHandles {
+        pictures: Arc<AtomicUsize>,
+        on_select: Arc<Mutex<OnSelect>>,
+        release: Arc<AtomicBool>,
+        asked: Arc<Mutex<Vec<Selection>>>,
+        recycled: Arc<Mutex<Vec<usize>>>,
+        closed: Arc<AtomicBool>,
+    }
+
+    /// A pipeline at Balanced over a [`Desk`] of monitors of `sizes` that
+    /// shows monitor 1 and has `pictures` pictures to give.
+    fn desk(sizes: &[(u32, u32)], pictures: usize) -> (Pipeline, DeskHandles) {
+        let handles = DeskHandles {
+            pictures: Arc::new(AtomicUsize::new(pictures)),
+            on_select: Arc::new(Mutex::new(OnSelect::Switch)),
+            release: Arc::default(),
+            asked: Arc::default(),
+            recycled: Arc::default(),
+            closed: Arc::default(),
+        };
+        let source = Desk {
+            sizes: sizes.to_vec(),
+            shown: Selection::Monitor(1),
+            index: 0,
+            last: None,
+            pictures: Arc::clone(&handles.pictures),
+            on_select: Arc::clone(&handles.on_select),
+            release: Arc::clone(&handles.release),
+            asked: Arc::clone(&handles.asked),
+            recycled: Arc::clone(&handles.recycled),
+            closed: Arc::clone(&handles.closed),
+        };
+        let caps = QualityCaps::default();
+        let initial = quality::settings(QualityPreset::Balanced, Route::Tor, &caps);
+        let pipeline = Pipeline::start(Box::new(source), initial, Route::Tor, caps, 4);
+        (pipeline, handles)
+    }
+
+    /// Waits until the desk has been asked `n` selections, which must be
+    /// within a poll of `since`.
+    async fn asked_within_a_poll(desk: &DeskHandles, n: usize, since: Instant) {
+        while desk.asked.lock().unwrap().len() < n {
+            assert!(
+                since.elapsed() < POLL + Duration::from_millis(400),
+                "the selection was not taken within a poll"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The next thing the pipeline hands over, which must be a refusal: its
+    /// request and status.
+    async fn next_refusal(pipeline: &mut Pipeline) -> (u16, u8) {
+        match tokio::time::timeout(Duration::from_secs(10), pipeline.next())
+            .await
+            .expect("an answer in time")
+            .expect("the pipeline runs")
+            .expect("no failure")
+        {
+            Produced::Refused { request, status } => (request, status),
+            Produced::Frame(frame) => panic!(
+                "a picture ({}x{}) instead of a refusal",
+                frame.width, frame.height
+            ),
+        }
+    }
+
+    /// The monitors design's step 9: the capture thread takes a selection
+    /// within a poll while it waits for a credit; the source switches before
+    /// its next picture, which is a keyframe of the new monitor's size,
+    /// answers the request and carries the new layout (the same monitors,
+    /// another view); once taken, a selection cannot be withdrawn. Every
+    /// picture after it carries neither, and all monitors at once is one
+    /// picture of their union.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_selection_is_taken_while_the_thread_waits_for_a_credit() {
+        use tornect_capture::{Rect, View};
+        let (mut pipeline, desk) = desk(&[(320, 192), (256, 128)], 1);
+        let space = Rect::new(0, 0, 576, 192);
+        let first = picture(&mut pipeline).await;
+        assert!(first.keyframe && first.answers.is_none());
+        let one = first.layout.expect("the first picture carries the layout");
+        assert_eq!(one.shown, Selection::Monitor(1));
+        assert!(one.all);
+        assert_eq!(
+            one.view,
+            View::Rect {
+                shown: Rect::new(0, 0, 320, 192),
+                space
+            }
+        );
+
+        // No credit is given: the thread waits for one.
+        let asked = Instant::now();
+        pipeline.select(Selection::Monitor(2), 7);
+        asked_within_a_poll(&desk, 1, asked).await;
+        assert!(!pipeline.withdraw(7), "taken: too late to take back");
+        desk.pictures.fetch_add(2, Ordering::SeqCst);
+        let switched = picture(&mut pipeline).await;
+        assert!(switched.keyframe && !switched.repeat);
+        assert_eq!(switched.answers, Some(7));
+        assert_eq!((switched.width, switched.height), (256, 128));
+        assert_eq!(decoded_size(&switched.data), (256, 128));
+        let two = switched.layout.expect("the new layout");
+        assert_eq!(two.shown, Selection::Monitor(2));
+        assert_eq!(two.monitors, one.monitors, "the same monitors");
+        assert_eq!(
+            two.view,
+            View::Rect {
+                shown: Rect::new(320, 0, 256, 128),
+                space
+            }
+        );
+        let next = picture(&mut pipeline).await;
+        assert!(!next.keyframe, "one keyframe for the switch");
+        assert!(
+            next.answers.is_none() && next.layout.is_none(),
+            "nothing new"
+        );
+
+        let asked = Instant::now();
+        pipeline.select(Selection::All, 8);
+        asked_within_a_poll(&desk, 2, asked).await;
+        desk.pictures.fetch_add(1, Ordering::SeqCst);
+        let all = picture(&mut pipeline).await;
+        assert_eq!((all.width, all.height, all.answers), (576, 192, Some(8)));
+        let all = all.layout.expect("the new layout");
+        assert_eq!(all.shown, Selection::All);
+        assert_eq!(
+            all.view,
+            View::Rect {
+                shown: space,
+                space
+            }
+        );
+        pipeline.stop().await;
+    }
+
+    /// A selection is taken within a poll while the thread waits for a
+    /// picture of a still screen, and is answered by the first picture of the
+    /// new monitor: a keyframe even at the same size (forced, not a rebuild).
+    /// The picture of the monitor shown before is given back at once, so a
+    /// quality change has nothing to encode again: the old screen never rides
+    /// as the answer (the design's §12, response 2); the new monitor's picture
+    /// answers, announced with the new settings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_selection_on_a_still_screen_is_answered_by_the_new_screens_picture() {
+        let (mut pipeline, desk) = desk(&[(256, 128), (256, 128)], 1);
+        let first = picture(&mut pipeline).await;
+        assert!(first.keyframe);
+        pipeline.credit();
+        // The thread waits for a picture that does not come.
+        tokio::time::sleep(POLL * 2).await;
+        let asked = Instant::now();
+        pipeline.select(Selection::Monitor(2), 9);
+        asked_within_a_poll(&desk, 1, asked).await;
+        assert_eq!(*desk.recycled.lock().unwrap(), [256 * 128 * 4]);
+        desk.pictures.fetch_add(1, Ordering::SeqCst);
+        let switched = next_picture(&mut pipeline).await;
+        assert!(switched.keyframe, "forced at the same size");
+        assert!(
+            switched.announce.is_none(),
+            "no rebuild, nothing to announce"
+        );
+        assert_eq!(switched.answers, Some(9));
+        assert_eq!(
+            switched.layout.map(|l| l.shown),
+            Some(Selection::Monitor(2))
+        );
+
+        // Back to monitor 1 on a still screen, then a quality change before
+        // its picture comes: nothing is encoded again.
+        pipeline.credit();
+        let asked = Instant::now();
+        pipeline.select(Selection::Monitor(1), 10);
+        asked_within_a_poll(&desk, 2, asked).await;
+        pipeline.set_quality(tornect_proto::quality::BEST_PERFORMANCE);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), pipeline.next())
+                .await
+                .is_err(),
+            "the screen shown before is not encoded again"
+        );
+        desk.pictures.fetch_add(1, Ordering::SeqCst);
+        let back = next_picture(&mut pipeline).await;
+        assert!(back.keyframe && !back.repeat);
+        assert_eq!(back.answers, Some(10));
+        assert_eq!(
+            back.announce.map(|a| a.settings.preset),
+            Some(QualityPreset::BestPerformance)
+        );
+        assert_eq!(back.layout.map(|l| l.shown), Some(Selection::Monitor(1)));
+        pipeline.stop().await;
+    }
+
+    /// A selection the source cannot show is refused at once, within a poll,
+    /// whether the thread waits for a credit or for a picture: `UNKNOWN` for
+    /// a monitor it does not have, `FAILED` when it could not switch. A
+    /// refusal answers no credit, and changes nothing: the next picture is of
+    /// the monitor shown before, with no answer, no layout and no keyframe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_selection_is_said_at_once_and_changes_nothing() {
+        let (mut pipeline, desk) = desk(&[(320, 192), (256, 128)], 1);
+        picture(&mut pipeline).await;
+
+        let asked = Instant::now();
+        pipeline.select(Selection::Monitor(5), 3);
+        assert_eq!(
+            next_refusal(&mut pipeline).await,
+            (3, monitor_status::UNKNOWN)
+        );
+        assert!(asked.elapsed() < POLL + Duration::from_millis(400));
+
+        *desk.on_select.lock().unwrap() = OnSelect::Fail;
+        pipeline.credit();
+        let asked = Instant::now();
+        pipeline.select(Selection::Monitor(2), 4);
+        assert_eq!(
+            next_refusal(&mut pipeline).await,
+            (4, monitor_status::FAILED)
+        );
+        assert!(asked.elapsed() < POLL + Duration::from_millis(400));
+        assert!(pipeline.waiting, "the credit is still given");
+
+        desk.pictures.fetch_add(1, Ordering::SeqCst);
+        let next = next_picture(&mut pipeline).await;
+        assert_eq!((next.width, next.height), (320, 192), "still monitor 1");
+        assert!(next.answers.is_none() && next.layout.is_none() && !next.keyframe);
+        assert_eq!(
+            *desk.asked.lock().unwrap(),
+            [Selection::Monitor(5), Selection::Monitor(2)]
+        );
+        pipeline.stop().await;
+    }
+
+    /// A selection handed over while the thread is busy (here inside another
+    /// one's switch) can be taken back before the thread takes it, and then
+    /// never reaches the source; only by its own request, once. The one the
+    /// thread already took cannot be, and its answer comes with the picture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_withdrawn_selection_never_reaches_the_source() {
+        let (mut pipeline, desk) = desk(&[(320, 192), (256, 128)], 1);
+        picture(&mut pipeline).await;
+        *desk.on_select.lock().unwrap() = OnSelect::Hold;
+        let asked = Instant::now();
+        pipeline.select(Selection::Monitor(2), 1);
+        asked_within_a_poll(&desk, 1, asked).await;
+
+        pipeline.select(Selection::All, 2);
+        assert!(!pipeline.withdraw(3), "another request");
+        assert!(pipeline.withdraw(2));
+        assert!(!pipeline.withdraw(2), "once");
+        assert!(!pipeline.withdraw(1), "taken already");
+        desk.release.store(true, Ordering::SeqCst);
+        desk.pictures.fetch_add(1, Ordering::SeqCst);
+        let switched = picture(&mut pipeline).await;
+        assert_eq!(switched.answers, Some(1));
+        assert_eq!(
+            switched.layout.map(|l| l.shown),
+            Some(Selection::Monitor(2))
+        );
+        assert_eq!(*desk.asked.lock().unwrap(), [Selection::Monitor(2)]);
+        pipeline.stop().await;
+    }
+
+    /// A stop while the source switches (the Wayland switch blocks for up to
+    /// 10 s) ends the thread, and closes the source, within a poll.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_while_the_source_switches_closes_it_within_a_poll() {
+        let (mut pipeline, desk) = desk(&[(320, 192), (256, 128)], 1);
+        picture(&mut pipeline).await;
+        *desk.on_select.lock().unwrap() = OnSelect::Hold;
+        let asked = Instant::now();
+        pipeline.select(Selection::Monitor(2), 1);
+        asked_within_a_poll(&desk, 1, asked).await;
+        let stopping = Instant::now();
+        pipeline.stop().await;
+        assert!(
+            stopping.elapsed() < POLL + Duration::from_millis(300),
+            "the capture thread let go in {:?}",
+            stopping.elapsed()
+        );
+        assert!(desk.closed.load(Ordering::SeqCst), "the source is closed");
     }
 }
