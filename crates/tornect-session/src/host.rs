@@ -49,7 +49,7 @@ use tornect_codec::scale::Scaler;
 use tornect_core::config::{Media, QualityPreset};
 use tornect_core::levels::Elevation;
 use tornect_core::session_log::SessionMode;
-use tornect_input::{InputError, InputEvent, InputSink, Tracked};
+use tornect_input::{InputEvent, InputSink, Tracked};
 use tornect_proto::{
     BIND_TYPE, MAX_CLIENT_FRAME, MAX_FRAME, Msg, ProtoError, SESSION_ID_LEN, codec, read_msg_max,
     reason, video_flags, write_msg,
@@ -745,7 +745,7 @@ impl MediaHost {
         } else {
             None
         };
-        let injector = injector.map(|sink| Tracked::new(Boxed(sink)));
+        let injector = injector.map(Tracked::new);
         // A control session left without an injector says so to its viewer,
         // which still sends what the signed accept allows (SLICE-C2 C2-6).
         if matches!(mode, SessionMode::Control) && injector.is_none() {
@@ -1293,7 +1293,7 @@ impl Quiet {
 struct Served<'a> {
     /// `None`: a view-only session, or a control session with nothing to
     /// inject into. Dropped first at the end, which releases what it holds.
-    injector: Option<Tracked<Boxed>>,
+    injector: Option<Tracked<Box<dyn InputSink>>>,
     quiet: Quiet,
     inbound: &'a mut mpsc::Receiver<Result<Msg, ProtoError>>,
     inputs: TokenBucket,
@@ -1530,15 +1530,6 @@ impl Served<'_> {
 /// Add `d` to `sum` in microseconds, saturating.
 fn add_us(sum: &mut u64, d: Duration) {
     *sum = sum.saturating_add(u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
-}
-
-/// `Tracked` wants a sized sink.
-struct Boxed(Box<dyn InputSink>);
-
-impl InputSink for Boxed {
-    fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
-        self.0.inject(event)
-    }
 }
 
 /// One encoded picture.

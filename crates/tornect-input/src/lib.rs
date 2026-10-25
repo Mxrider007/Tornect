@@ -262,6 +262,21 @@ pub trait InputSink: Send {
     }
 }
 
+/// A boxed sink is a sink: it forwards both calls, so a wrapper that holds
+/// one (the host's `Tracked<Viewport<Box<dyn InputSink>>>`) never falls back
+/// to the trait's default [`InputSink::retarget`], which would take a view the
+/// boxed sink refuses (the Wayland injector) or never hand one to the live
+/// check that needs it (the Windows and X11 sinks).
+impl<S: InputSink + ?Sized> InputSink for Box<S> {
+    fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+        (**self).inject(event)
+    }
+
+    fn retarget(&mut self, view: &View) -> Result<(), InputError> {
+        (**self).retarget(view)
+    }
+}
+
 /// What a sink answers to a [`View`] it cannot address.
 pub(crate) fn cannot_follow() -> InputError {
     InputError::Inject("this injector cannot follow the picture to another screen".to_owned())
@@ -1378,6 +1393,54 @@ mod tests {
         };
         viewport.inject(&press).unwrap();
         assert_eq!(viewport.inner.seen[1..], [press]);
+    }
+
+    /// Takes every view and shares what it took.
+    struct Shares(std::sync::Arc<std::sync::Mutex<Vec<View>>>);
+
+    impl InputSink for Shares {
+        fn inject(&mut self, _: &InputEvent) -> Result<(), InputError> {
+            Ok(())
+        }
+
+        fn retarget(&mut self, view: &View) -> Result<(), InputError> {
+            self.0.lock().unwrap().push(*view);
+            Ok(())
+        }
+    }
+
+    /// A boxed sink forwards a retarget, so a wrapper over one (the host's
+    /// injector chain) hands every view to the sink inside and hears its
+    /// refusal, rather than the trait's default taking any rectangle.
+    #[test]
+    fn a_boxed_sink_forwards_the_view_and_its_refusal() {
+        let mut boxed: Box<dyn InputSink> = Box::new(Log::default());
+        boxed.retarget(&ON_SECOND).unwrap();
+        boxed.inject(&InputEvent::ReleaseAll).unwrap();
+
+        // A sink that refuses every view, as the Wayland injector does, seen
+        // through the host's chain: the refusal reaches the caller and the
+        // viewport keeps nothing.
+        let refusing: Box<dyn InputSink> = Box::new(Log {
+            refuse_views: true,
+            ..Log::default()
+        });
+        let mut chain = Tracked::new(Viewport::new(refusing));
+        assert!(chain.retarget(&ON_SECOND).is_err());
+        assert_eq!(chain.inner.view(), None);
+        assert!(
+            chain
+                .inject(&InputEvent::PointerMove { x: 1, y: 1 })
+                .is_err()
+        );
+
+        // One that takes it: the view reaches the sink inside the box.
+        let views = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let taking: Box<dyn InputSink> = Box::new(Shares(std::sync::Arc::clone(&views)));
+        let mut chain = Tracked::new(Viewport::new(taking));
+        chain.retarget(&ON_SECOND).unwrap();
+        chain.retarget(&STREAM).unwrap();
+        assert_eq!(*views.lock().unwrap(), [ON_SECOND, STREAM]);
     }
 
     /// The default `retarget`, for a sink that addresses a whole space behind
