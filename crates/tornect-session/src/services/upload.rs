@@ -27,7 +27,7 @@
 //!
 //! [`credit_step`]: super::window::credit_step
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -47,9 +47,6 @@ use super::transfer::{
 use super::window::{Inflow, Window};
 use super::writer::Outbox;
 use super::{HostEvent, ServicesLimits, ServicesObserver, ViewerEvent};
-
-/// How long the host waits for its upload workers at the stream's end.
-pub(crate) const WORKERS_WAIT: Duration = Duration::from_secs(5);
 
 /// What a frame for transfer `xfer`, which no running upload has, does: a
 /// late frame of one that ended is dropped, anything else is a protocol
@@ -88,7 +85,13 @@ pub(crate) struct HostUploads {
     inflow: Inflow,
     chunk: usize,
     depth: usize,
+    /// Uploads offered and not ended, an upload whose file is being put in
+    /// place included (a stop no longer takes it).
     running: HashMap<u32, Upload>,
+    /// The workers of uploads stopped before they ended on their own, until
+    /// they are joined: they count toward [`MAX_UPLOADS`], so that offers
+    /// and cancels sent at stream speed cannot pile workers up.
+    stopping: HashSet<tokio::task::Id>,
     ids: Ids,
     workers: JoinSet<()>,
     events: mpsc::UnboundedSender<WorkerEvent>,
@@ -123,6 +126,7 @@ impl HostUploads {
                 // window's chunks and `Finish`.
                 depth: usize::try_from(window).unwrap_or(usize::MAX) / chunk + 1,
                 running: HashMap::new(),
+                stopping: HashSet::new(),
                 ids: Ids::default(),
                 workers: JoinSet::new(),
                 events,
@@ -140,9 +144,10 @@ impl HostUploads {
         if !self.ids.fresh(xfer) {
             return Err(reason::PROTOCOL);
         }
+        self.reap();
         let refused = if paused {
             Some(reason::LOCKED)
-        } else if self.running.len() >= MAX_UPLOADS {
+        } else if self.running.len() + self.stopping.len() >= MAX_UPLOADS {
             Some(reason::BUSY)
         } else if self.inbox.is_none() {
             Some(reason::NOT_OFFERED)
@@ -235,19 +240,22 @@ impl HostUploads {
     }
 
     /// The viewer's `Cancel` of an upload; `Ok(false)` when it names no
-    /// upload (the stream may know it otherwise).
+    /// upload (the stream may know it otherwise). One that came too late,
+    /// once the file was being put in place, changes nothing: its `Complete`
+    /// follows.
     pub(crate) fn cancelled(&mut self, cancel: Cancel) -> Result<bool, u16> {
-        let Some(up) = self.running.remove(&cancel.xfer) else {
+        if !self.running.contains_key(&cancel.xfer) {
             return Ok(false);
-        };
-        self.ids.end(cancel.xfer);
+        }
         // The viewer's own reasons (it stopped it, its file changed, its
         // read failed); anything else counts as the viewer's stop.
         let code = match cancel.reason {
             reason::CHANGED | reason::IO => cancel.reason,
             _ => reason::BY_VIEWER,
         };
-        self.ended(cancel.xfer, up, code);
+        if let Some(up) = self.take(cancel.xfer) {
+            self.ended(cancel.xfer, &up, code);
+        }
         Ok(true)
     }
 
@@ -267,18 +275,19 @@ impl HostUploads {
     }
 
     /// The host's user stops upload `xfer`: `Ok(false)` when no such upload
-    /// runs.
+    /// runs, or when its file is already being put in place (it is left to
+    /// land, and its row and `Complete` follow).
     pub(crate) fn cancel(&mut self, xfer: u32, code: u16) -> Result<bool, u16> {
-        let Some(up) = self.running.remove(&xfer) else {
+        let Some(up) = self.take(xfer) else {
             return Ok(false);
         };
-        self.ids.end(xfer);
-        self.ended(xfer, up, code);
+        self.ended(xfer, &up, code);
         self.ctrl(SvcMsg::Cancel(Cancel { xfer, reason: code }))?;
         Ok(true)
     }
 
-    /// Stop every upload with `code` (`TURNED_OFF`), telling the viewer.
+    /// Stop every upload with `code` (`TURNED_OFF`), telling the viewer; one
+    /// whose file is being put in place is left to land.
     pub(crate) fn cancel_all(&mut self, code: u16) -> Result<(), u16> {
         let mut xfers: Vec<u32> = self.running.keys().copied().collect();
         xfers.sort_unstable();
@@ -288,12 +297,15 @@ impl HostUploads {
         Ok(())
     }
 
-    /// A worker's report.
+    /// A worker's report. A file put in place is told and counted before its
+    /// `Complete` is queued, so that a stream ending there (its viewer
+    /// stopped reading, or it is closing) still records it.
     pub(crate) fn on_worker(&mut self, event: WorkerEvent) -> Result<(), u16> {
         let WorkerEvent { xfer, what } = event;
-        while self.workers.try_join_next().is_some() {}
+        self.reap();
         let Some(up) = self.running.get_mut(&xfer) else {
-            // Stopped meanwhile: its worker deletes what it wrote.
+            // Stopped meanwhile: its worker deletes what it wrote, and a
+            // stopped worker never puts its file in place.
             return Ok(());
         };
         match what {
@@ -329,47 +341,125 @@ impl HostUploads {
                 let mut done = row(xfer, &up, TransferState::Done { stored });
                 done.done = up.size;
                 tracing::info!(session = %self.session_id, bytes = up.size, "an upload was received");
-                self.ctrl(SvcMsg::Complete(Complete { xfer }))?;
                 self.tell(done);
+                self.ctrl(SvcMsg::Complete(Complete { xfer }))?;
             }
             Worked::Finished(Err(code)) | Worked::Failed(code) => {
                 let Some(up) = self.running.remove(&xfer) else {
                     return Ok(());
                 };
                 self.ids.end(xfer);
-                self.ended(xfer, up, code);
+                self.ended(xfer, &up, code);
                 self.ctrl(SvcMsg::Cancel(Cancel { xfer, reason: code }))?;
             }
         }
         Ok(())
     }
 
-    /// Stop every worker: each deletes what it wrote. Nothing is sent.
+    /// Stop every worker: each deletes what it wrote. Nothing is sent. An
+    /// upload whose file is being put in place is kept, for its report.
     pub(crate) fn stop(&mut self) {
-        for (_, mut up) in self.running.drain() {
-            up.receiving.cancel();
+        let xfers: Vec<u32> = self.running.keys().copied().collect();
+        for xfer in xfers {
+            self.take(xfer);
         }
     }
 
-    /// Wait up to `within` for the workers to end (each has deleted its
-    /// partial files once it ended); a worker stuck in a write is left.
-    pub(crate) async fn join(mut self, within: Duration) {
+    /// Stop every worker, then wait up to `within` for them to end (each has
+    /// deleted its partial files once it ended), handling their `reports`:
+    /// a file that was being put in place lands or fails, and its row says
+    /// which, and counts. Nothing more goes to the viewer. `false` when a
+    /// worker is still running: one stuck in a write, which reports nothing
+    /// more, or one still putting its file in place ([`Self::landing`]).
+    pub(crate) async fn join(
+        &mut self,
+        reports: &mut mpsc::UnboundedReceiver<WorkerEvent>,
+        within: Duration,
+    ) -> bool {
         self.stop();
-        let workers = &mut self.workers;
-        let _ = tokio::time::timeout(within, async {
-            while workers.join_next().await.is_some() {}
-        })
-        .await;
+        let deadline = tokio::time::Instant::now() + within;
+        let settled = loop {
+            tokio::select! {
+                biased;
+                Some(report) = reports.recv() => {
+                    // The writer is closing: a `Complete` no longer goes out.
+                    let _ = self.on_worker(report);
+                }
+                joined = self.workers.join_next() => {
+                    if joined.is_none() {
+                        break true;
+                    }
+                }
+                () = tokio::time::sleep_until(deadline) => break false,
+            }
+        };
+        while let Ok(report) = reports.try_recv() {
+            let _ = self.on_worker(report);
+        }
+        settled
     }
 
-    /// Upload `xfer` ended with `code`: its worker is stopped and the host's
-    /// user is told, if it had begun.
-    fn ended(&mut self, xfer: u32, mut up: Upload, code: u16) {
-        up.receiving.cancel();
+    /// Whether an upload is still putting its file in place after
+    /// [`Self::join`] gave up waiting: its row is still to come.
+    pub(crate) fn landing(&self) -> bool {
+        !self.running.is_empty()
+    }
+
+    /// Wait as long as it takes for the uploads still putting their files
+    /// in place, handling their `reports`, so that a file that lands is told
+    /// even when its rename outlasted [`Self::join`]'s wait. Its row then
+    /// comes after the stream's `Closed`.
+    pub(crate) async fn settle(mut self, mut reports: mpsc::UnboundedReceiver<WorkerEvent>) {
+        while self.landing() {
+            tokio::select! {
+                biased;
+                Some(report) = reports.recv() => {
+                    let _ = self.on_worker(report);
+                }
+                joined = self.workers.join_next() => {
+                    if joined.is_none() {
+                        // A worker that ended without its report panicked.
+                        while let Ok(report) = reports.try_recv() {
+                            let _ = self.on_worker(report);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stop upload `xfer`'s worker and take it off the running ones, its id
+    /// ended: `None` when no such upload runs, or when it is too late (its
+    /// file is being put in place; its worker reports whether it landed).
+    fn take(&mut self, xfer: u32) -> Option<Upload> {
+        if !self.running.get_mut(&xfer)?.receiving.cancel() {
+            return None;
+        }
+        let up = self.running.remove(&xfer)?;
+        self.stopping.insert(up.receiving.worker());
+        self.ids.end(xfer);
+        Some(up)
+    }
+
+    /// Join the workers that ended: a stopped one no longer counts toward
+    /// [`MAX_UPLOADS`].
+    fn reap(&mut self) {
+        while let Some(joined) = self.workers.try_join_next_with_id() {
+            let id = match joined {
+                Ok((id, ())) => id,
+                Err(e) => e.id(),
+            };
+            self.stopping.remove(&id);
+        }
+    }
+
+    /// Upload `xfer` ended with `code`, its worker stopped: the host's user
+    /// is told, if it had begun.
+    fn ended(&self, xfer: u32, up: &Upload, code: u16) {
         tracing::debug!(session = %self.session_id, reason = code, "an upload ended");
         if up.stored.is_some() {
-            let row = row(xfer, &up, TransferState::ended(code));
-            self.tell(row);
+            self.tell(row(xfer, up, TransferState::ended(code)));
         }
     }
 
@@ -713,11 +803,14 @@ impl ViewerUploads {
         let Some(&id) = self.wire.get(&failed.xfer) else {
             return Ok(());
         };
-        self.finish(id, failed.xfer, TransferState::Failed(failed.reason));
+        // Queued before the window is released: the host counts the bytes
+        // in flight until it hears the `Cancel`, so no byte the release lets
+        // another upload send may reach it first.
         self.ctrl(SvcMsg::Cancel(Cancel {
             xfer: failed.xfer,
             reason: failed.reason,
         }))?;
+        self.finish(id, failed.xfer, TransferState::Failed(failed.reason));
         self.pump()
     }
 
@@ -732,11 +825,12 @@ impl ViewerUploads {
         };
         match wire {
             Some(xfer) => {
-                self.finish(id, xfer, TransferState::Cancelled(reason::BY_VIEWER));
+                // Before the window is released, as in `send_failed`.
                 self.ctrl(SvcMsg::Cancel(Cancel {
                     xfer,
                     reason: reason::BY_VIEWER,
                 }))?;
+                self.finish(id, xfer, TransferState::Cancelled(reason::BY_VIEWER));
             }
             None => {
                 self.queue.retain(|q| *q != id);

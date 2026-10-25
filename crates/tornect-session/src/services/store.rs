@@ -12,28 +12,41 @@
 //! - [`Incoming::write`] takes the bytes in order, never past the announced
 //!   size, hashing them; it re-reads the free space every
 //!   [`InboxLimits::recheck_every`] bytes.
-//! - [`Incoming::finish`] syncs the part file, checks its length and SHA-256
-//!   against the sender's, and renames it over the reservation: the rename
-//!   only ever replaces our own empty file.
-//! - An [`Incoming`] dropped unfinished deletes its part file and its
-//!   reservation, whatever ended it (a cancel, a protocol error, the session's
-//!   end, the kill switch, capture stopping, a panic). What a crash leaves is
-//!   swept at the next start (`tornect_core::files::sweep_stale`).
+//! - [`Incoming::verify`] syncs the part file and checks its length and
+//!   SHA-256 against the sender's; [`Verified::put_in_place`] then renames it
+//!   over the reservation: the rename only ever replaces our own empty file.
+//! - An [`Incoming`] (or a [`Verified`]) dropped unfinished deletes its part
+//!   file and its reservation, whatever ended it (a cancel, a protocol error,
+//!   the session's end, the kill switch, capture stopping, a panic). What a
+//!   crash leaves is swept at the next start (`tornect_core::files::sweep_stale`).
+//!
+//! The part file and the reservation are taken by their name, and on Unix
+//! also by their inode: a rename or a deletion that would take a file this
+//! transfer did not make (another instance's, after a sweep) fails instead.
+//! A worker waiting for bytes touches its part file every [`TOUCH_EVERY`], so
+//! that the stale sweep, which takes a part file untouched for ten minutes,
+//! never takes a live one.
 //!
 //! A file's charge against the session's quota and file count is taken at
 //! `begin` and given back when it is not finished: the quota bounds what a
 //! session leaves on this disk.
 //!
 //! Each transfer's file I/O runs on one blocking worker ([`spawn_receiver`])
-//! that owns its [`Incoming`] and is fed through a bounded channel. Nothing
-//! here logs a name or a path.
+//! that owns its [`Incoming`] and is fed through a bounded channel. A stop
+//! ([`Receiving::cancel`]) takes the file until the worker has verified it
+//! and committed to putting it in place; from then on the file lands (or its
+//! rename fails), and the worker's report says which: a transfer the host
+//! stopped never lands, and one that lands is always reported. Nothing here
+//! logs a name or a path.
 
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
@@ -58,6 +71,54 @@ pub const RECHECK_FREE_EVERY: u64 = 64 << 20;
 
 /// The highest `n` tried for a free `name (n).ext`.
 const MAX_NTH: u32 = 999;
+
+/// How often a receiving worker that waits for bytes touches its part file:
+/// well within `tornect_core::files::STALE_AFTER` (ten minutes), after which
+/// the sweep of another instance sharing the inbox would take it for a
+/// crash's leftover. An upload paused by a lock, or whose viewer went quiet,
+/// waits that long.
+pub(crate) const TOUCH_EVERY: Duration = Duration::from_secs(60);
+
+/// What names a file whatever its path: its device and inode. Only Unix has
+/// it in `std`; elsewhere a file is taken at its name (decision M1-76).
+type FileId = (u64, u64);
+
+#[cfg(unix)]
+fn file_id(meta: &fs::Metadata) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_: &fs::Metadata) -> Option<FileId> {
+    None
+}
+
+/// Whether `meta` is of the file `id` names (any file where ids are not
+/// known).
+fn is_same(meta: &fs::Metadata, id: Option<FileId>) -> bool {
+    id.is_none() || file_id(meta) == id
+}
+
+/// Whether `path` still names the regular file `id`, without following a
+/// link, and, with `empty`, whether that file is empty.
+fn still_names(path: &Path, id: Option<FileId>, empty: bool) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|m| m.file_type().is_file() && is_same(&m, id) && (!empty || m.len() == 0))
+}
+
+/// Where a worker finishing a file stands, for a test's hold on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Finishing {
+    /// Synced and its hash checked; a stop still takes it.
+    Verified,
+    /// Committed: it is renamed into place next, whatever happens.
+    Landing,
+}
+
+/// A test's hold on the workers finishing files.
+#[cfg(test)]
+pub(crate) type FinishHook = Arc<dyn Fn(Finishing) + Send + Sync>;
 
 /// What a Windows Explorer download writes into a file's `Zone.Identifier`
 /// stream: zone 3, the Internet. SmartScreen and Office's Protected View
@@ -128,6 +189,10 @@ pub(crate) struct Inbox {
     free_space: FreeSpaceFn,
     tally: Arc<Mutex<Tally>>,
     mark: MarkFn,
+    /// How often a waiting worker touches its part file ([`TOUCH_EVERY`]).
+    touch_every: Duration,
+    #[cfg(test)]
+    finishing: Option<FinishHook>,
 }
 
 impl std::fmt::Debug for Inbox {
@@ -151,6 +216,9 @@ impl Inbox {
             free_space,
             tally: Arc::new(Mutex::new(Tally::default())),
             mark: mark_of_the_web,
+            touch_every: TOUCH_EVERY,
+            #[cfg(test)]
+            finishing: None,
         }
     }
 
@@ -159,6 +227,31 @@ impl Inbox {
     pub(crate) fn with_mark(mut self, mark: MarkFn) -> Self {
         self.mark = mark;
         self
+    }
+
+    /// The same inbox, its waiting workers touching their part files every
+    /// `every`.
+    #[cfg(test)]
+    pub(crate) fn with_touch_every(mut self, every: Duration) -> Self {
+        self.touch_every = every;
+        self
+    }
+
+    /// The same inbox, its workers calling `hook` as they finish a file.
+    #[cfg(test)]
+    pub(crate) fn with_finishing(mut self, hook: Option<FinishHook>) -> Self {
+        self.finishing = hook;
+        self
+    }
+
+    /// A worker finishing a file is at `stage` (a test may hold it there).
+    fn at(&self, stage: Finishing) {
+        #[cfg(test)]
+        if let Some(hook) = &self.finishing {
+            hook(stage);
+        }
+        #[cfg(not(test))]
+        let _ = stage;
     }
 
     /// The session's files and bytes so far (charged ones included).
@@ -218,15 +311,30 @@ impl Inbox {
         let name = sanitize_name(raw_name)
             .filter(|name| !is_part_name(OsStr::new(name)))
             .ok_or(reason::BAD_NAME)?;
-        let (final_path, part, file) = reserve(&self.dir, &name)?;
+        let Reserved {
+            final_path,
+            final_id,
+            reservation,
+            part,
+            file,
+        } = reserve(&self.dir, &name)?;
+        // Kept open on Unix, so that its inode stays its own while the
+        // transfer lives; Windows would refuse the rename over an open file.
+        #[cfg(not(unix))]
+        drop(reservation);
         let stored = final_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let part_id = file.metadata().ok().and_then(|m| file_id(&m));
         let incoming = Incoming {
             file: Some(file),
             part,
+            part_id,
             final_path,
+            final_id,
+            #[cfg(unix)]
+            _reservation: reservation,
             stored,
             size,
             written: 0,
@@ -246,21 +354,42 @@ impl Inbox {
     }
 }
 
+/// A reserved name and the part file beside it.
+struct Reserved {
+    final_path: PathBuf,
+    /// The reservation's id, taken from the file it made.
+    final_id: Option<FileId>,
+    /// The reservation, still open.
+    reservation: File,
+    part: PathBuf,
+    file: File,
+}
+
 /// Reserve the first free name of `name`'s series in `dir` (`name`,
 /// `name (2)`, … `name (999)`) with an empty private file, and create its
-/// part file beside it: the final path, the part path and the part file.
-fn reserve(dir: &Path, name: &str) -> Result<(PathBuf, PathBuf, File), u16> {
+/// part file beside it.
+fn reserve(dir: &Path, name: &str) -> Result<Reserved, u16> {
     for n in 1..=MAX_NTH {
         let final_path = dir.join(nth(name, n));
-        match create_new_private(&final_path) {
-            Ok(reservation) => drop(reservation),
+        let reservation = match create_new_private(&final_path) {
+            Ok(reservation) => reservation,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(_) => return Err(reason::IO),
-        }
+        };
+        let final_id = reservation.metadata().ok().and_then(|m| file_id(&m));
         let part = part_of(&final_path);
         match create_new_private(&part) {
-            Ok(file) => return Ok((final_path, part, file)),
+            Ok(file) => {
+                return Ok(Reserved {
+                    final_path,
+                    final_id,
+                    reservation,
+                    part,
+                    file,
+                });
+            }
             Err(e) => {
+                drop(reservation);
                 let _ = fs::remove_file(&final_path);
                 if e.kind() != io::ErrorKind::AlreadyExists {
                     return Err(reason::IO);
@@ -298,13 +427,21 @@ fn mark_of_the_web(_: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// A file being received: written to its part file in order, then put in
-/// place by [`Incoming::finish`]. Dropped unfinished, it deletes its part
-/// file and its reservation and gives its charge back.
+/// A file being received: written to its part file in order, then checked
+/// ([`Incoming::verify`]) and put in place ([`Verified::put_in_place`]).
+/// Dropped unfinished, it deletes its part file and its reservation (the
+/// files it made, never another's) and gives its charge back.
 pub(crate) struct Incoming {
+    /// The part file, open until it is verified (on Unix until it is in
+    /// place, so that its inode stays its own).
     file: Option<File>,
     part: PathBuf,
+    part_id: Option<FileId>,
     final_path: PathBuf,
+    final_id: Option<FileId>,
+    /// The reservation, open while the transfer lives (Unix).
+    #[cfg(unix)]
+    _reservation: File,
     stored: String,
     size: u64,
     written: u64,
@@ -369,26 +506,41 @@ impl Incoming {
         Ok(self.written)
     }
 
-    /// Put the file in place once the sender said it sent everything with
-    /// this SHA-256: the final path, or `CORRUPT` when the length or the hash
-    /// is not the sender's (the files are deleted), `IO` when the sync or the
-    /// rename fails.
-    pub(crate) fn finish(mut self, sha256: &[u8; 32]) -> Result<PathBuf, u16> {
+    /// Move the part file's modification time to now: a part file whose
+    /// time moves is never taken for a crash's leftover (`sweep_stale`).
+    /// Best effort.
+    fn touch(&self) {
+        if let Some(file) = &self.file {
+            let _ = file.set_modified(SystemTime::now());
+        }
+    }
+
+    /// Once the sender said it sent everything with this SHA-256: sync the
+    /// part file and check its length and hash. `CORRUPT` when either is
+    /// not the sender's, `IO` when the sync fails; the files are deleted
+    /// then.
+    pub(crate) fn verify(mut self, sha256: &[u8; 32]) -> Result<Verified, u16> {
         if self.written != self.size {
             return Err(reason::CORRUPT);
         }
-        let file = self.file.take().ok_or(reason::IO)?;
+        let file = self.file.as_ref().ok_or(reason::IO)?;
         file.sync_all().map_err(|_| reason::IO)?;
-        drop(file);
+        // Windows has no file id to keep: the part file is closed once
+        // synced.
+        #[cfg(not(unix))]
+        drop(self.file.take());
         let hasher = std::mem::take(&mut self.hasher);
         let got: [u8; 32] = hasher.finalize().into();
         if &got != sha256 {
             return Err(reason::CORRUPT);
         }
-        fs::rename(&self.part, &self.final_path).map_err(|_| reason::IO)?;
-        self.finished = true;
-        self.charge.keep();
-        Ok(self.final_path.clone())
+        Ok(Verified(self))
+    }
+
+    /// [`Self::verify`], then [`Verified::put_in_place`].
+    #[cfg(test)]
+    pub(crate) fn finish(self, sha256: &[u8; 32]) -> Result<PathBuf, u16> {
+        self.verify(sha256)?.put_in_place()
     }
 }
 
@@ -397,15 +549,47 @@ impl Drop for Incoming {
         if self.finished {
             return;
         }
-        // Closed first: Windows deletes an open file only once it is closed.
+        // Closed first on Windows, which deletes an open file only once it
+        // is closed. On Unix the files stay open until they are deleted, so
+        // that no other file can take their inodes before the checks.
+        #[cfg(not(unix))]
         drop(self.file.take());
-        let _ = fs::remove_file(&self.part);
-        // Only the empty file this transfer made.
-        if fs::symlink_metadata(&self.final_path)
-            .is_ok_and(|m| m.file_type().is_file() && m.len() == 0)
-        {
+        // Only the files this transfer made: the reservation still empty.
+        if still_names(&self.part, self.part_id, false) {
+            let _ = fs::remove_file(&self.part);
+        }
+        if still_names(&self.final_path, self.final_id, true) {
             let _ = fs::remove_file(&self.final_path);
         }
+    }
+}
+
+/// A file synced, whose length and hash are the sender's. Dropped, it
+/// deletes its files as an unfinished [`Incoming`] does.
+pub(crate) struct Verified(Incoming);
+
+impl std::fmt::Debug for Verified {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Verified").field(&self.0).finish()
+    }
+}
+
+impl Verified {
+    /// Rename the part file over the reservation: the final path, or `IO`
+    /// when the rename fails or either path no longer names the file this
+    /// transfer made (the reservation still empty); the files it made are
+    /// deleted then.
+    pub(crate) fn put_in_place(mut self) -> Result<PathBuf, u16> {
+        let incoming = &mut self.0;
+        if !still_names(&incoming.part, incoming.part_id, false)
+            || !still_names(&incoming.final_path, incoming.final_id, true)
+        {
+            return Err(reason::IO);
+        }
+        fs::rename(&incoming.part, &incoming.final_path).map_err(|_| reason::IO)?;
+        incoming.finished = true;
+        incoming.charge.keep();
+        Ok(incoming.final_path.clone())
     }
 }
 
@@ -441,11 +625,21 @@ pub(crate) enum Worked {
     Failed(u16),
 }
 
+/// A worker runs: a stop takes its file.
+const RUNNING: u8 = 0;
+/// Stopped: the worker writes nothing more and deletes what it wrote.
+const STOPPED: u8 = 1;
+/// Past the point of no return: the worker puts the file in place, and its
+/// report says whether it landed.
+const LANDING: u8 = 2;
+
 /// A receiving worker's handle, kept by the loop.
 #[derive(Debug)]
 pub(crate) struct Receiving {
     feed: Option<std::sync::mpsc::SyncSender<Work>>,
-    cancel: Arc<AtomicBool>,
+    /// [`RUNNING`], [`STOPPED`] or [`LANDING`], shared with the worker.
+    state: Arc<AtomicU8>,
+    worker: tokio::task::Id,
 }
 
 impl Receiving {
@@ -462,10 +656,23 @@ impl Receiving {
     }
 
     /// Stop the worker: it writes at most the chunk it is writing, then drops
-    /// its file, which deletes the partial files.
-    pub(crate) fn cancel(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
+    /// its file, which deletes the partial files; it reports nothing more.
+    /// `false` when it is too late: the worker verified the file and is
+    /// putting it in place, and its `Finished` report says whether it landed.
+    pub(crate) fn cancel(&mut self) -> bool {
         self.feed = None;
+        match self
+            .state
+            .compare_exchange(RUNNING, STOPPED, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => true,
+            Err(now) => now == STOPPED,
+        }
+    }
+
+    /// The worker's task, as its [`tokio::task::JoinSet`] names it.
+    pub(crate) fn worker(&self) -> tokio::task::Id {
+        self.worker
     }
 }
 
@@ -488,8 +695,12 @@ pub(crate) enum Fed {
 /// `size` bytes in `inbox` and reports `Began`, then writes what it is fed
 /// (at most `depth` items queued), reporting `Written` after each write,
 /// until `Finish` (`Finished`), a failure (`Failed`, after the files were
-/// deleted), its cancel, or its feed's end. Spawned on `workers`, so that the
-/// loop can wait for it at its end.
+/// deleted), its stop, or its feed's end. While it waits for work it touches
+/// its part file every [`TOUCH_EVERY`]. On `Finish` it verifies the file,
+/// then commits to putting it in place unless it was stopped meanwhile: from
+/// that point a stop no longer takes the file, and `Finished` is always
+/// reported. Spawned on `workers`, so that the loop can wait for it at its
+/// end.
 pub(crate) fn spawn_receiver(
     workers: &mut tokio::task::JoinSet<()>,
     xfer: u32,
@@ -500,44 +711,70 @@ pub(crate) fn spawn_receiver(
     events: mpsc::UnboundedSender<WorkerEvent>,
 ) -> Receiving {
     let (feed, work) = std::sync::mpsc::sync_channel(depth.max(1));
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancelled = Arc::clone(&cancel);
-    workers.spawn_blocking(move || {
-        let report = |what: Worked| {
-            let _ = events.send(WorkerEvent { xfer, what });
-        };
-        let mut incoming = match inbox.begin(&raw_name, size) {
-            Ok(incoming) => incoming,
-            Err(code) => return report(Worked::Began(Err(code))),
-        };
-        if cancelled.load(Ordering::SeqCst) {
-            return;
-        }
-        report(Worked::Began(Ok(incoming.stored().to_owned())));
-        while let Ok(work) = work.recv() {
-            if cancelled.load(Ordering::SeqCst) {
+    let state = Arc::new(AtomicU8::new(RUNNING));
+    let shared = Arc::clone(&state);
+    let worker = workers
+        .spawn_blocking(move || {
+            let report = |what: Worked| {
+                let _ = events.send(WorkerEvent { xfer, what });
+            };
+            let stopped = || shared.load(Ordering::SeqCst) == STOPPED;
+            let mut incoming = match inbox.begin(&raw_name, size) {
+                Ok(incoming) => incoming,
+                Err(code) => return report(Worked::Began(Err(code))),
+            };
+            if stopped() {
                 return;
             }
-            match work {
-                Work::Write(bytes) => {
-                    let offset = incoming.written;
-                    match incoming.write(offset, &bytes) {
-                        Ok(upto) => report(Worked::Written(upto)),
-                        Err(code) => {
-                            drop(incoming);
-                            return report(Worked::Failed(code));
+            report(Worked::Began(Ok(incoming.stored().to_owned())));
+            loop {
+                let work = match work.recv_timeout(inbox.touch_every) {
+                    Ok(work) => work,
+                    Err(RecvTimeoutError::Timeout) => {
+                        incoming.touch();
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
+                };
+                if stopped() {
+                    return;
+                }
+                match work {
+                    Work::Write(bytes) => {
+                        let offset = incoming.written;
+                        match incoming.write(offset, &bytes) {
+                            Ok(upto) => report(Worked::Written(upto)),
+                            Err(code) => {
+                                drop(incoming);
+                                return report(Worked::Failed(code));
+                            }
                         }
                     }
-                }
-                Work::Finish(sha256) => {
-                    return report(Worked::Finished(incoming.finish(&sha256).map(drop)));
+                    Work::Finish(sha256) => {
+                        let verified = match incoming.verify(&sha256) {
+                            Ok(verified) => verified,
+                            Err(code) => return report(Worked::Finished(Err(code))),
+                        };
+                        inbox.at(Finishing::Verified);
+                        // A stop that came first takes the file: dropped, it
+                        // deletes what it wrote, and nothing is reported.
+                        if shared
+                            .compare_exchange(RUNNING, LANDING, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_err()
+                        {
+                            return;
+                        }
+                        inbox.at(Finishing::Landing);
+                        return report(Worked::Finished(verified.put_in_place().map(drop)));
+                    }
                 }
             }
-        }
-    });
+        })
+        .id();
     Receiving {
         feed: Some(feed),
-        cancel,
+        state,
+        worker,
     }
 }
 
@@ -547,7 +784,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    use tornect_core::files::{STALE_AFTER, sweep_stale};
 
     use super::*;
 
@@ -925,10 +1164,10 @@ mod tests {
                 drop(receiver);
             }
             while workers.try_join_next().is_some() {}
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
             while names(&dir) != ["a.txt"] {
                 assert!(std::time::Instant::now() < deadline, "{:?}", names(&dir));
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }
 
@@ -970,5 +1209,143 @@ mod tests {
         drop(gate_tx);
         while workers.join_next().await.is_some() {}
         assert_eq!(names(&dir), ["a.txt"]);
+    }
+
+    /// A stop takes the file until its worker has verified it and committed
+    /// to putting it in place, and nothing is reported then; once committed,
+    /// the stop says it is too late, the file lands and `Finished` is
+    /// reported, so that the loop never claims a cancel for a file that
+    /// lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_takes_the_file_until_its_worker_commits() {
+        for at in [Finishing::Verified, Finishing::Landing] {
+            let home = tempfile::tempdir().unwrap();
+            let dir = home.path().join("Tornect");
+            let hold = Arc::new(AtomicBool::new(true));
+            let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+            let hook: FinishHook = {
+                let hold = Arc::clone(&hold);
+                Arc::new(move |stage| {
+                    if stage == at {
+                        let _ = entered_tx.send(());
+                        while hold.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                })
+            };
+            let inbox = inbox_in(&home, LIMITS, plenty()).with_finishing(Some(hook));
+            let mut workers = tokio::task::JoinSet::new();
+            let (tx, mut events) = mpsc::unbounded_channel();
+            let mut receiving = spawn_receiver(&mut workers, 1, inbox, "f.txt".into(), 3, 4, tx);
+            assert!(matches!(
+                events.recv().await.unwrap().what,
+                Worked::Began(Ok(_))
+            ));
+            receiving.feed(Work::Write(b"abc".to_vec())).unwrap();
+            receiving.feed(Work::Finish(sha(b"abc"))).unwrap();
+            assert!(matches!(
+                events.recv().await.unwrap().what,
+                Worked::Written(3)
+            ));
+            tokio::task::spawn_blocking(move || entered.recv().unwrap())
+                .await
+                .unwrap();
+            let stopped = receiving.cancel();
+            assert_eq!(stopped, at == Finishing::Verified, "{at:?}");
+            hold.store(false, Ordering::SeqCst);
+            while workers.join_next().await.is_some() {}
+            if stopped {
+                assert!(events.try_recv().is_err(), "nothing reported");
+                assert_eq!(names(&dir), Vec::<String>::new());
+            } else {
+                assert!(matches!(
+                    events.try_recv().unwrap().what,
+                    Worked::Finished(Ok(()))
+                ));
+                assert_eq!(names(&dir), ["f.txt"]);
+                assert_eq!(fs::read(dir.join("f.txt")).unwrap(), b"abc");
+            }
+            assert_eq!(receiving.cancel(), stopped, "a second stop: the same");
+        }
+    }
+
+    /// A worker waiting for bytes touches its part file, so that the stale
+    /// sweep of another instance sharing the inbox never takes it, however
+    /// long the sender is quiet (a lock pauses it, its viewer stalls).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_waiting_worker_keeps_its_part_file_fresh() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("Tornect");
+        let inbox = inbox_in(&home, LIMITS, plenty()).with_touch_every(Duration::from_millis(20));
+        let mut workers = tokio::task::JoinSet::new();
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let receiving = spawn_receiver(&mut workers, 1, inbox, "q.txt".into(), 10, 4, tx);
+        assert!(matches!(
+            events.recv().await.unwrap().what,
+            Worked::Began(Ok(_))
+        ));
+        let part = dir.join("q.txt.tornect-part");
+        // As a sweep would find a part file left an hour ago.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        let fresh = || {
+            fs::metadata(&part)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .elapsed()
+                .is_ok_and(|age| age < Duration::from_secs(60))
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !fresh() {
+            assert!(std::time::Instant::now() < deadline, "never touched");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(sweep_stale(&dir, STALE_AFTER).unwrap(), 0);
+        assert_eq!(names(&dir), ["q.txt", "q.txt.tornect-part"]);
+        drop(receiving);
+        while workers.join_next().await.is_some() {}
+        assert_eq!(names(&dir), Vec::<String>::new());
+    }
+
+    /// The files a transfer made are taken by their inode: once a sweep took
+    /// them and another transfer reserved the same name, the first neither
+    /// renames its file over the other's reservation nor deletes the other's
+    /// files, whether it finishes or is dropped.
+    #[cfg(unix)]
+    #[test]
+    fn a_transfer_takes_only_the_files_it_made() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("Tornect");
+        let inbox = inbox_in(&home, LIMITS, plenty());
+        let sweep = |name: &str| {
+            fs::remove_file(dir.join(format!("{name}.tornect-part"))).unwrap();
+            fs::remove_file(dir.join(name)).unwrap();
+        };
+
+        let mut first = inbox.begin("x.txt", 3).unwrap();
+        first.write(0, b"old").unwrap();
+        sweep("x.txt");
+        let mut second = inbox.begin("x.txt", 3).unwrap();
+        assert_eq!(second.stored(), "x.txt");
+        second.write(0, b"new").unwrap();
+        assert_eq!(first.finish(&sha(b"old")), Err(reason::IO));
+        assert_eq!(names(&dir), ["x.txt", "x.txt.tornect-part"], "left alone");
+        assert_eq!(second.finish(&sha(b"new")).unwrap(), dir.join("x.txt"));
+        assert_eq!(fs::read(dir.join("x.txt")).unwrap(), b"new");
+
+        let third = inbox.begin("y.txt", 1).unwrap();
+        sweep("y.txt");
+        let fourth = inbox.begin("y.txt", 1).unwrap();
+        drop(third);
+        assert_eq!(names(&dir), ["x.txt", "y.txt", "y.txt.tornect-part"]);
+        drop(fourth);
+        assert_eq!(names(&dir), ["x.txt"]);
+        assert_eq!(inbox.tally(), (1, 4096), "only the file in place counts");
     }
 }

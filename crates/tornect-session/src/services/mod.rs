@@ -147,6 +147,10 @@ pub struct ServicesLimits {
     /// Bytes of a received file written between two readings of the disk's
     /// free space.
     pub recheck_free_every: u64,
+    /// How long a stream's end waits for its upload workers (each deletes
+    /// what it wrote, or puts a file it had verified in place) before
+    /// `serve` returns.
+    pub workers_wait: Duration,
 }
 
 impl Default for ServicesLimits {
@@ -165,6 +169,7 @@ impl Default for ServicesLimits {
             session_files: 1000,
             min_file_charge: 4096,
             recheck_free_every: RECHECK_FREE_EVERY,
+            workers_wait: Duration::from_secs(5),
         }
     }
 }
@@ -182,6 +187,9 @@ pub struct ServicesEnv {
     /// The free space of the inbox's disk (`tornect_platform::disk::available`
     /// on a real host). A file is taken only when the free space can be read.
     pub free_space: FreeSpaceFn,
+    /// Holds the upload workers as they finish a file (tests only).
+    #[cfg(test)]
+    pub(crate) finishing: Option<store::FinishHook>,
 }
 
 impl Default for ServicesEnv {
@@ -191,6 +199,8 @@ impl Default for ServicesEnv {
             inbox: None,
             inbox_words: String::new(),
             free_space: store::unknown_free_space(),
+            #[cfg(test)]
+            finishing: None,
         }
     }
 }
@@ -286,7 +296,12 @@ pub enum HostEvent {
     /// A transfer started, moved on or ended. An upload is told once the
     /// inbox took it (refusals before that are not), at each credit, and at
     /// its end; its `Done` carries the stored, sanitised name, the one
-    /// `sessions.log`'s `file_received` records.
+    /// `sessions.log`'s `file_received` records. Every file put in place is
+    /// told so. A stream's end tells no row of an upload it stopped (its
+    /// files are deleted); one whose file was already being put in place is
+    /// waited for up to [`ServicesLimits::workers_wait`], and when its rename
+    /// outlasts that, its `Done` row comes after [`HostEvent::Closed`],
+    /// whose summary does not count it.
     Transfer(TransferRow),
     /// The stream ended.
     Closed {

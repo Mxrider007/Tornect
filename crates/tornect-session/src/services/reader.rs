@@ -79,6 +79,15 @@ impl CapState {
         self.left()
     }
 
+    /// Whether a frame of type `t` from `from` is still served: the
+    /// reader's rule for caps turned off (§3.2) applied again, to a frame it
+    /// decoded before they were and queued. Pauses are not: a new request
+    /// decoded before a pause is answered (`LOCKED`).
+    pub(crate) fn serves(&self, t: u8, from: Side) -> bool {
+        let off = self.granted & !self.left();
+        matches!(ty::gate(t, from, self.granted, off, 0), ty::Gate::Decode)
+    }
+
     /// What the reader did so far.
     pub(crate) fn counts(&self) -> ReaderCounts {
         ReaderCounts {

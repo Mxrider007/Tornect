@@ -30,16 +30,24 @@
 //!    stream fails. Chat and uploads into the inbox are served (the upload
 //!    protocol: [`super::upload`]). When the viewer's input is lost
 //!    mid-session the clipboard and files are turned off for good (running
-//!    uploads get `Cancel{TURNED_OFF}`, then `Caps`; the link is dropped),
+//!    uploads get `Cancel{TURNED_OFF}`, then `Caps`; the link is dropped;
+//!    their frames decoded before that are dropped, an `Offer` included),
 //!    and a stream left with nothing ends with `Close{NOT_OFFERED}`.
 //! 5. **End.** Every upload's worker is stopped, `Close` is written, and the
-//!    workers are waited for (within 5 s): once `serve` returns, no partial
-//!    file of the stream is left, whatever ended it.
+//!    workers are waited for, within [`ServicesLimits::workers_wait`] (5 s):
+//!    once `serve` returns, no partial file of the stream is left, whatever
+//!    ended it, unless a worker is stuck in one write longer (its files go
+//!    when it ends, or with the stale sweep at a later start). An upload
+//!    whose file was verified and was being put in place when the stream
+//!    ended is past stopping: it lands (or its rename fails), and its row
+//!    and the summary's count record it; a rename that outlasts the wait is
+//!    still told when it lands, after `Closed`.
 //!
 //! The services stream ending never ends the session.
 //!
 //! [`ServicesLimits::live_wait`]: super::ServicesLimits::live_wait
 //! [`ServicesLimits::clipboard_wait`]: super::ServicesLimits::clipboard_wait
+//! [`ServicesLimits::workers_wait`]: super::ServicesLimits::workers_wait
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -58,7 +66,7 @@ use tornect_signal::fsm::host::LiveSession;
 use super::chat::{self, ChatGate, ChatText, sanitize_peer_text};
 use super::reader::{CapState, Inbound, ReadEnd, ReaderCounts, read_frames};
 use super::store::{Inbox, InboxLimits};
-use super::upload::{HostUploads, WORKERS_WAIT};
+use super::upload::HostUploads;
 use super::writer::{LAST_WRITE, Outbox, spawn_writer};
 use super::{
     HostEvent, ServicesEnv, ServicesLimits, ServicesObserver, ServicesPolicy, ServicesSummary,
@@ -391,6 +399,8 @@ impl ServicesHost {
             )),
             _ => None,
         };
+        #[cfg(test)]
+        let inbox = inbox.map(|inbox| inbox.with_finishing(self.env.finishing.clone()));
         Ok(Opened {
             end,
             capture,
@@ -572,17 +582,18 @@ impl ServicesHost {
             mut uploads,
             ..
         } = served;
-        summary.files_in = uploads.files_in;
-        summary.bytes_in = uploads.bytes_in;
 
         lock(&self.controls).remove(&session_id);
-        // Every worker stops first: each deletes what it wrote.
+        // Every worker stops first: each deletes what it wrote. One that is
+        // putting a verified file in place is past stopping: it lands or
+        // fails, and its report is still handled below.
         uploads.stop();
         drop(link);
         reader.abort();
         let _ = writer.close(write_close.then_some(code)).await;
-        uploads.join(WORKERS_WAIT).await;
-        drop(reports);
+        let settled = uploads.join(&mut reports, self.limits.workers_wait).await;
+        summary.files_in = uploads.files_in;
+        summary.bytes_in = uploads.bytes_in;
         let frames = state.counts();
         tracing::info!(
             session = %session_id,
@@ -603,6 +614,11 @@ impl ServicesHost {
                 summary,
             },
         );
+        if !settled && uploads.landing() {
+            // A rename that outlasted the wait: the file's row is still
+            // told when it lands, after `Closed`.
+            tokio::spawn(uploads.settle(reports));
+        }
         ServicesOutcome::Served {
             session_id,
             reason: code,
@@ -633,6 +649,18 @@ impl Served<'_> {
     /// A frame from the viewer, which the reader let through: `Some` with
     /// the `Close` reason and whether to write it when the stream ends.
     fn on_frame(&mut self, msg: SvcMsg) -> Option<(u16, bool)> {
+        if !self.state.serves(msg.ty(), Side::Viewer) {
+            // Decoded before its caps were turned off (the viewer's input
+            // was lost), and queued: dropped, as the reader now skips it. A
+            // dropped `Offer` takes no id and starts nothing; the viewer
+            // ended its uploads when it heard the caps.
+            tracing::trace!(
+                session = %self.session_id,
+                ty = msg.ty(),
+                "a services frame queued before its caps were turned off was dropped"
+            );
+            return None;
+        }
         match msg {
             SvcMsg::Chat(Chat { text }) => {
                 if !self.chat.admit(chat::now()) {
