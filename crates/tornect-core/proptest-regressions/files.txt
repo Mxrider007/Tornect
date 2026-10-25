@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6781e6b9cd0819d909548515dfbafc8f5e52b7b5c71d70f9443b37f4bb73c32e # shrinks to raw = "CON\u{3000}. \u{3000}.  \u{a0}..\u{3000}.\u{a0}\u{3000}..\u{a0} ... . \u{a0}...\u{a0}. \u{a0}\u{3000}  \u{3000}.\u{3000}  \u{a0}\u{3000}.\u{a0}.. \u{a0}\u{3000}\u{3000}\u{3000}\u{3000}. \u{3000}\u{3000}  \u{a0}\u{a0}.\u{a0} .\u{a0} \u{a0}\u{3000} . ..  .\u{3000}\u{3000} \u{a0}\u{3000}. .\u{a0} .\u{3000}\u{a0}\u{3000} ....\u{3000} \u{a0}\u{3000}. \u{a0}\u{a0}. ..\u{a0}.\u{a0}\u{a0}.\u{3000}\u{a0}\u{a0}   . \u{a0}.  .\u{a0}..\u{3000}\u{3000}.. ....\u{a0}\u{a0}\u{a0}\u{a0} ..\u{3000}.\u{3000}  \u{a0}aaaaaaaaa"

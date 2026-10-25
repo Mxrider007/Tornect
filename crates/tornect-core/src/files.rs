@@ -358,6 +358,27 @@ fn trimmed(c: char) -> bool {
     c == '.' || c.is_whitespace()
 }
 
+/// `name`, trimmed at both ends already, cut to at most `max` bytes on a
+/// character boundary when it is longer, keeping an extension of at most
+/// [`MAX_EXTENSION_BYTES`], with dots and white space the cut leaves at its
+/// end trimmed. `max` is more than an extension, so the result is never
+/// empty and starts as `name` does.
+fn fit(name: &str, max: usize) -> String {
+    if name.len() <= max {
+        return name.to_owned();
+    }
+    match extension_at(name) {
+        // The stem is longer than the room left, so the cut is inside it,
+        // and the extension's end was trimmed already.
+        Some(at) => {
+            let extension = &name[at..];
+            let stem = cut_at(&name[..at], max - extension.len());
+            format!("{stem}{extension}")
+        }
+        None => cut_at(name, max).trim_end_matches(trimmed).to_owned(),
+    }
+}
+
 /// The name a file sent by the other computer is stored under, or `None`
 /// (the services' `BAD_NAME`) when nothing is left. In this order:
 /// 1. the last part after a `/` or `\`, so no folder of the name is used;
@@ -367,13 +388,17 @@ fn trimmed(c: char) -> bool {
 /// 3. `< > : " | ? *` become `_`;
 /// 4. dots and white space are trimmed at both ends, so no name is hidden,
 ///    `.` or `..`, or aliased by a trailing dot on Windows;
-/// 5. a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`,
-///    `CONOUT$`, `COM0`–`COM9`, `LPT0`–`LPT9`, `COM¹²³`, `LPT¹²³`, any case,
-///    with or without an extension) gets a leading `_`;
-/// 6. a name over [`MAX_NAME_BYTES`] is cut there on a character boundary,
-///    keeping an extension of at most [`MAX_EXTENSION_BYTES`].
+/// 5. a name over [`MAX_NAME_BYTES`] is cut there on a character boundary,
+///    keeping an extension of at most [`MAX_EXTENSION_BYTES`], and dots and
+///    white space the cut leaves at the end are trimmed;
+/// 6. when the cut name is a Windows device name (`CON`, `PRN`, `AUX`,
+///    `NUL`, `CONIN$`, `CONOUT$`, `COM0`–`COM9`, `LPT0`–`LPT9`, `COM¹²³`,
+///    `LPT¹²³`, any case, with or without an extension), the name is cut
+///    one byte shorter instead and gets a leading `_`.
 ///
-/// Applying it to its own result gives that result again.
+/// The device check runs on the cut name because the cut and its trim can
+/// make one: `"CON"`, 300 spaces and `"x"` is cut to `"CON"`. Applying it to
+/// its own result gives that result again.
 #[must_use]
 pub fn sanitize_name(raw: &str) -> Option<String> {
     let last = raw.rsplit(['/', '\\']).next().unwrap_or_default();
@@ -389,27 +414,13 @@ pub fn sanitize_name(raw: &str) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    let name = if reserved_on_windows(name) {
-        format!("_{name}")
-    } else {
-        name.to_owned()
-    };
-    if name.len() <= MAX_NAME_BYTES {
-        return Some(name);
+    let fitted = fit(name, MAX_NAME_BYTES);
+    if !reserved_on_windows(&fitted) {
+        return Some(fitted);
     }
-    let cut = match extension_at(&name) {
-        // The stem is longer than the room left, so the cut is inside it,
-        // and the extension's end was trimmed already.
-        Some(at) => {
-            let extension = &name[at..];
-            let stem = cut_at(&name[..at], MAX_NAME_BYTES - extension.len());
-            format!("{stem}{extension}")
-        }
-        None => cut_at(&name, MAX_NAME_BYTES)
-            .trim_end_matches(trimmed)
-            .to_owned(),
-    };
-    Some(cut)
+    // A name that starts with `_` is never a device name, so the prefixed
+    // result passes again unchanged.
+    Some(format!("_{}", fit(name, MAX_NAME_BYTES - 1)))
 }
 
 #[cfg(test)]
@@ -476,6 +487,44 @@ mod tests {
             ("x/\u{feff}", None),
         ] {
             assert_eq!(sanitize_name(raw).as_deref(), want, "{raw:?}");
+        }
+
+        // A long name the cut and the trim turn into a device name: the
+        // check runs on the cut name, the prefix still fits, and the result
+        // is its own sanitised form.
+        let spaces = |n: usize| " ".repeat(n);
+        for (raw, want) in [
+            (format!("CON{}x", spaces(300)), "_CON".to_owned()),
+            (format!("NUL{}x", spaces(250)), "_NUL".to_owned()),
+            (
+                format!("COM1{}x.thisisaverylongextension", spaces(200)),
+                "_COM1".to_owned(),
+            ),
+            (
+                format!("aux{}{}", spaces(197), "z".repeat(20)),
+                "_aux".to_owned(),
+            ),
+            (format!("CON{}x", "\u{3000}".repeat(100)), "_CON".to_owned()),
+            (
+                format!("CON{}x.txt", spaces(240)),
+                format!("_CON{}.txt", spaces(192)),
+            ),
+            (
+                format!("COM3{}x.log", spaces(200)),
+                format!("_COM3{}.log", spaces(191)),
+            ),
+            (format!("CON{}x", spaces(197)), "_CON".to_owned()),
+            // 200 bytes: not cut, and not a device name as it is.
+            (
+                format!("CON{}x", spaces(196)),
+                format!("CON{}x", spaces(196)),
+            ),
+        ] {
+            let name = sanitize_name(&raw).unwrap();
+            assert_eq!(name, want, "{raw:?}");
+            assert!(name.len() <= MAX_NAME_BYTES, "{name:?}");
+            assert!(!reserved_on_windows(&name), "{name:?}");
+            assert_eq!(sanitize_name(&name), Some(name.clone()), "{name:?}");
         }
     }
 
@@ -785,12 +834,14 @@ mod tests {
     }
 
     /// Names as the other computer might send them: any characters, the
-    /// characters the rules act on, and device names with odd endings.
+    /// characters the rules act on, device names with odd endings, and
+    /// device names padded past the cut.
     fn raw_names() -> impl Strategy<Value = String> {
         prop_oneof![
             prop::collection::vec(any::<char>(), 0..80).prop_map(String::from_iter),
             "[./\\\\ a-zA-Z0-9\u{202e}\u{200b}\u{feff}\u{a0}\n:*<|¹$]{0,300}",
             "(CON|con|COM¹|LPT3|NUL|conin\\$|Aux)[ .]{0,3}(\\.[a-z ]{0,5}){0,2}",
+            "(CON|NUL|COM1|aux|LPT¹)[ \u{3000}\u{a0}.]{150,260}[a-z]{0,30}(\\.[a-z]{1,4})?",
         ]
     }
 
