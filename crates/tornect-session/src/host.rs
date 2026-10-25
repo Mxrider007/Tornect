@@ -45,9 +45,16 @@
 //! for the viewer's `VideoAck` of that picture, so input made against an
 //! earlier picture never lands on the new screen (H5); an injector that
 //! cannot follow ends the session's input instead
-//! ([`notice::INPUT_LOST`]).
+//! ([`notice::INPUT_LOST`]). A viewer, control or view-only, chooses the
+//! screen with `SelectMonitor`, and each one within the budget (2/s, burst
+//! 4) gets exactly one `Monitors` with its request (H2): at once when it
+//! asks for what is shown or cannot be followed (`UNKNOWN`, `BUSY`), else
+//! right before the first picture of the new screen, or `FAILED` when the
+//! source could not switch or gave no picture within
+//! [`MediaLimits::switch_answer`]. One switch at a time, at most one per
+//! [`MediaLimits::switch_interval`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -91,6 +98,17 @@ const INBOUND_DEPTH: usize = 64;
 const PINGS_PER_SEC: u32 = 5;
 /// `Ping`s answered at once.
 const PING_BURST: u32 = 10;
+/// `SelectMonitor`s answered per second on average; more are read and get no
+/// answer (the monitors design's H2). A conforming viewer has one request out
+/// at a time.
+const SELECTS_PER_SEC: u32 = 2;
+/// `SelectMonitor`s answered at once.
+const SELECT_BURST: u32 = 4;
+/// Answers decided at once and not written yet. They are written as soon as
+/// the write under way is done, so they pile up only while a write to the
+/// viewer waits on flow control; a request read while this many wait gets no
+/// answer, as one over the budget.
+const OWED_ANSWERS: usize = 8;
 /// A `Bind` frame: the type byte, the session id, the MAC, the preset.
 const BIND_LEN: usize = 1 + SESSION_ID_LEN + 32 + 1;
 /// What a `Video` frame adds to its access unit: the type byte, `seq`,
@@ -140,6 +158,17 @@ pub struct MediaLimits {
     pub quality_interval: Duration,
     /// How often the host sends the viewer its per-stage means (`Stats`).
     pub stats_every: Duration,
+    /// Least time between two screen switches the host accepts (the monitors
+    /// design's H2): a `SelectMonitor` sooner after the last one accepted is
+    /// answered `BUSY`. A switch makes the source grab another part of the
+    /// desktop and forces a keyframe, so a viewer must not be able to
+    /// multiply that work.
+    pub switch_interval: Duration,
+    /// How long an accepted switch may take to deliver its first picture
+    /// before the host answers `FAILED` (H2): shorter than the viewer's own
+    /// wait (25 s), so a viewer hears the host's answer before it gives up.
+    /// A picture that comes later is said as the host's news (H3).
+    pub switch_answer: Duration,
 }
 
 impl Default for MediaLimits {
@@ -163,6 +192,8 @@ impl Default for MediaLimits {
             caps: QualityCaps::default(),
             quality_interval: Duration::from_secs(2),
             stats_every: Duration::from_secs(1),
+            switch_interval: Duration::from_secs(1),
+            switch_answer: Duration::from_secs(15),
         }
     }
 }
@@ -344,6 +375,12 @@ pub struct MediaReport {
     /// screen shown changed, and wheel turns and presses before the first
     /// move after it (the monitors design's H5).
     pub input_held_back: u64,
+    /// `SelectMonitor`s received, those over the budget among them.
+    pub monitor_requests: u64,
+    /// Switches of screen answered by a picture of the selection asked for
+    /// (`Monitors` with the request and `OK`); a no-op answered at once is
+    /// not one.
+    pub monitor_switches: u64,
     /// `SetQuality`s received.
     pub quality_requests: u64,
     /// Changes of preset that reached the viewer (a `Quality` naming another
@@ -855,7 +892,7 @@ impl MediaHost {
             report: MediaReport::default(),
             pong_owed: None,
             session_id: &session_id,
-            screens: Screens::new(),
+            screens: Screens::new(&self.limits, epoch),
         };
         let mut seq: u32 = 0;
         let mut pending = Some(first);
@@ -886,22 +923,36 @@ impl MediaHost {
                 torn = stop.torn;
                 break stop.end;
             }
+            // The answers to the viewer's `SelectMonitor`s decided since the
+            // last turn (H2): what is shown already, what cannot be
+            // followed, a refusal or a timeout. Each says the layout it was
+            // decided against, from the next picture on; answers decided
+            // while one of these is written are written here too.
+            while let Some((request, status)) = served.screens.owed.pop_front() {
+                let answer = served.screens.answer(request, status, seq);
+                if let Err(stop) = send(&mut wr, &answer, &mut end, Some(&mut served)).await {
+                    torn = stop.torn;
+                    break 'serve stop.end;
+                }
+            }
             if let Some(mut frame) = pending.take() {
+                // The switch this picture answers, when the host still waits
+                // for it; a picture that comes after the host gave up on it
+                // is the host's news (H3).
+                let answer = served.screens.answered_by(frame.answers);
                 // What this picture shows, when it changed: the injector
                 // follows it now, before anything more of the viewer's is
                 // handled (H4), and it is said last, just before the picture
-                // (H1, H3).
+                // (H1, H3). A switch that changed nothing the source
+                // describes is answered all the same, with nothing remapped.
                 let monitors = match frame.layout.take() {
-                    Some(layout) => Some(self.follow(&mut served, *layout, frame.answers, seq)),
-                    // No switch waits for an answer yet (the design's step
-                    // 11), and nothing changed: nothing to say.
-                    None => {
-                        if let Some(request) = frame.answers {
-                            tracing::debug!(request, "a switch answered with nothing changed");
-                        }
-                        None
-                    }
+                    Some(layout) => Some(self.follow(&mut served, *layout, answer, seq)),
+                    None => answer
+                        .map(|request| served.screens.answer(request, monitor_status::OK, seq)),
                 };
+                if answer.is_some() {
+                    served.report.monitor_switches += 1;
+                }
                 // Said before the picture it covers: a change of settings or
                 // of size (the quality design §4.1), then the means, when due.
                 let quality = served.announce(&frame);
@@ -968,6 +1019,7 @@ impl MediaHost {
 
             let quiet_at = served.quiet_deadline();
             let quality_at = served.quality_deadline();
+            let switch_at = served.screens.switching.map(|s| s.deadline);
             let event = tokio::select! {
                 biased;
                 _ = end.changed() => Event::Ended,
@@ -977,6 +1029,8 @@ impl MediaHost {
                     if quiet_at.is_some() => Event::Quiet,
                 () = tokio::time::sleep_until(quality_at.unwrap_or_else(tokio::time::Instant::now)),
                     if quality_at.is_some() => Event::Quality,
+                () = tokio::time::sleep_until(switch_at.unwrap_or_else(tokio::time::Instant::now)),
+                    if switch_at.is_some() => Event::SwitchTimeout,
             };
             match event {
                 Event::Ended => break MediaEnd::SessionOver(end_reason(&end)),
@@ -992,15 +1046,12 @@ impl MediaHost {
                 // taken at the top of the loop.
                 Event::Quality => turn = quality_at.map(tokio::time::Instant::into_std),
                 Event::Frame(Some(Ok(Produced::Frame(frame)))) => pending = Some(frame),
-                // No selection is handed to the pipeline yet (the monitors
-                // design's step 11), so no switch waits for this answer.
+                // The source could not show the selection: its answer is
+                // written at the top of the loop.
                 Event::Frame(Some(Ok(Produced::Refused { request, status }))) => {
-                    tracing::debug!(
-                        request,
-                        status,
-                        "a monitor selection refused with none waiting"
-                    );
+                    served.screens.refused(request, status);
                 }
+                Event::SwitchTimeout => served.switch_timed_out(),
                 Event::Frame(Some(Err(e))) => {
                     tracing::warn!(error = %e, session = %session_id, "screen capture stopped");
                     break MediaEnd::Pipeline(e.reason());
@@ -1049,9 +1100,9 @@ impl MediaHost {
     /// part of the desktop than the one before, input that acts where the
     /// pointer is waits for the viewer's `VideoAck` of `seq` (H5); and the
     /// `Monitors` that says it is returned, to be written just before the
-    /// picture. `answers` is the request the picture answers; none waits for
-    /// one before the design's step 11, so a `Monitors` is the host's own
-    /// news (request 0).
+    /// picture. `answer` is the viewer's request the picture answers, the
+    /// switch the host waited for (H2); without one the `Monitors` is the
+    /// host's own news (request 0).
     ///
     /// An injector that refuses the view is dropped, which lets go of all it
     /// holds, and the session's input ends ([`notice::INPUT_LOST`], the
@@ -1061,12 +1112,9 @@ impl MediaHost {
         &self,
         served: &mut Served<'_>,
         layout: Layout,
-        answers: Option<u16>,
+        answer: Option<u16>,
         seq: u32,
     ) -> Msg {
-        if let Some(request) = answers {
-            tracing::debug!(request, "a switch answered with none waiting: said as news");
-        }
         let screens = &mut served.screens;
         let previous = screens.layout.take();
         if previous
@@ -1105,7 +1153,7 @@ impl MediaHost {
             screens.placed = false;
         }
         let msg = monitors_msg(
-            0,
+            answer.unwrap_or(0),
             monitor_status::OK,
             Some(&layout),
             screens.list,
@@ -1118,6 +1166,7 @@ impl MediaHost {
         {
             tracing::debug!(
                 session = %served.session_id,
+                request = answer.unwrap_or(0),
                 screen = shown,
                 of = monitors.len(),
                 remapped,
@@ -1402,6 +1451,9 @@ enum Event {
     Quiet,
     /// The quality gate's turn came: the loop wakes to take it at its top.
     Quality,
+    /// The switch under way gave no picture within
+    /// [`MediaLimits::switch_answer`].
+    SwitchTimeout,
 }
 
 /// The quiet release's clock (SLICE-C1 C1-3). The viewer counts as heard when
@@ -1533,16 +1585,107 @@ struct Screens {
     /// would act where the pointer was, on the screen shown before, and are
     /// held back too.
     placed: bool,
+    /// The switch handed to the pipeline for a viewer's `SelectMonitor`,
+    /// until it is answered: one at a time (H2).
+    switching: Option<Switching>,
+    /// At most one switch accepted per [`MediaLimits::switch_interval`].
+    switches: KeyframeLimiter,
+    /// The budget of `SelectMonitor`s answered.
+    selects: TokenBucket,
+    /// How long an accepted switch may take ([`MediaLimits::switch_answer`]).
+    answer_within: Duration,
+    /// Answers owed and not written yet, `(request, status)`. They are
+    /// written at the top of the serving loop, before the next picture's own
+    /// messages, with the layout and the next seq of that moment: the layout
+    /// changes only in [`MediaHost::follow`], further down the loop, so an
+    /// answer always says the layout it was decided against.
+    owed: VecDeque<(u16, u8)>,
+}
+
+/// A switch the source makes for a viewer's `SelectMonitor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Switching {
+    /// The `SelectMonitor` it answers.
+    request: u16,
+    /// When to give up on its picture and answer `FAILED`.
+    deadline: tokio::time::Instant,
 }
 
 impl Screens {
-    fn new() -> Self {
+    fn new(limits: &MediaLimits, epoch: Instant) -> Self {
         Self {
             layout: None,
             list: 0,
             barrier: None,
             placed: true,
+            switching: None,
+            switches: KeyframeLimiter::new(limits.switch_interval),
+            selects: TokenBucket::new(SELECTS_PER_SEC, SELECT_BURST, epoch),
+            answer_within: limits.switch_answer,
+            owed: VecDeque::new(),
         }
+    }
+
+    /// What to do with the viewer's `SelectMonitor` (H2), read at `now`:
+    /// the selection to hand to the pipeline, after which the switch waits
+    /// for its picture; or nothing, with the answer owed at once (`UNKNOWN`,
+    /// a no-op `OK`, `BUSY`) or with none at all (over the budget). Checked
+    /// in the design's order: what cannot be followed, then what is shown
+    /// already, then a switch under way or too soon after the last.
+    fn select(&mut self, request: u16, list: u16, monitor: u8, now: Instant) -> Option<Selection> {
+        if self.owed.len() >= OWED_ANSWERS || !self.selects.take(now) {
+            return None;
+        }
+        let status = match self.layout.as_ref() {
+            None => monitor_status::UNKNOWN,
+            Some(_) if list != self.list => monitor_status::UNKNOWN,
+            Some(layout) => match selection_of(monitor, layout) {
+                Err(status) => status,
+                Ok(selection) if selection == layout.shown => monitor_status::OK,
+                Ok(_) if self.switching.is_some() || !self.switches.allow(now) => {
+                    monitor_status::BUSY
+                }
+                Ok(selection) => {
+                    self.switching = Some(Switching {
+                        request,
+                        deadline: tokio::time::Instant::from_std(now) + self.answer_within,
+                    });
+                    return Some(selection);
+                }
+            },
+        };
+        self.owed.push_back((request, status));
+        None
+    }
+
+    /// The switch a picture that answers `answers` ends: the request, when
+    /// the host still waits for it, which clears the wait. Otherwise the
+    /// picture is the host's news (H3): the host gave up on it already.
+    fn answered_by(&mut self, answers: Option<u16>) -> Option<u16> {
+        let request = answers?;
+        if self.switching.is_some_and(|s| s.request == request) {
+            self.switching = None;
+            return Some(request);
+        }
+        tracing::debug!(request, "a switch answered after its time: said as news");
+        None
+    }
+
+    /// The source refused the selection for `request`: its answer is owed,
+    /// when the host still waits for it.
+    fn refused(&mut self, request: u16, status: u8) {
+        if self.switching.is_some_and(|s| s.request == request) {
+            self.switching = None;
+            self.owed.push_back((request, status));
+        } else {
+            tracing::debug!(request, status, "a refused switch answered already");
+        }
+    }
+
+    /// The `Monitors` that answers `request` with `status` and changes
+    /// nothing, for the pictures from `seq` on.
+    fn answer(&self, request: u16, status: u8, seq: u32) -> Msg {
+        monitors_msg(request, status, self.layout.as_ref(), self.list, seq, false)
     }
 
     /// Whether `event` is held back at the barrier (H5): a move, a wheel
@@ -1674,10 +1817,20 @@ impl Served<'_> {
                 self.report.quality_requests += 1;
                 self.quality.gate.request(quality);
             }
-            // Read and left unanswered, as a request over the budget is: this
-            // host sends no `Monitors` yet, and a viewer asks only after it
-            // read one (the monitors design's V1).
-            Msg::SelectMonitor { .. } => {}
+            // Legal in control and view-only sessions alike: which screen to
+            // watch is a viewing choice, and it never builds an injector.
+            // Within the budget it gets exactly one answer (H2); never logged
+            // per message.
+            Msg::SelectMonitor {
+                request,
+                list,
+                monitor,
+            } => {
+                self.report.monitor_requests += 1;
+                if let Some(selection) = self.screens.select(request, list, monitor, now) {
+                    self.pipeline.select(selection, request);
+                }
+            }
             Msg::Close { .. } => return Handled::End(MediaEnd::ViewerLeft),
             Msg::Bind { .. }
             | Msg::BindOk { .. }
@@ -1785,6 +1938,27 @@ impl Served<'_> {
         add_us(&mut report.send_us, send);
     }
 
+    /// The switch under way gave no picture within
+    /// [`MediaLimits::switch_answer`]: it is answered `FAILED` (H2), and
+    /// taken back from the pipeline if the capture thread has not taken it
+    /// yet. A source that switches later has its picture said as the host's
+    /// news (H3), with the barrier when it shows another part of the desktop.
+    fn switch_timed_out(&mut self) {
+        let Some(Switching { request, .. }) = self.screens.switching.take() else {
+            return;
+        };
+        let withdrawn = self.pipeline.withdraw(request);
+        tracing::debug!(
+            session = %self.session_id,
+            request,
+            withdrawn,
+            "no picture of the screen asked for in time: answered FAILED"
+        );
+        self.screens
+            .owed
+            .push_back((request, monitor_status::FAILED));
+    }
+
     /// The deadline came: let go of what the viewer holds, if it is due.
     /// Whether it let go.
     fn lapse(&mut self) -> bool {
@@ -1869,6 +2043,24 @@ fn monitors_msg(
         seq,
         monitors,
     }
+}
+
+/// The selection a viewer's `monitor` names in `layout`, as the `Monitors`
+/// said it ([`monitors_msg`]): 0 is all monitors, offered with two or more
+/// listed; `1..=n` the n-th listed. Anything else is `Err(UNKNOWN)`.
+fn selection_of(monitor: u8, layout: &Layout) -> Result<Selection, u8> {
+    let listed = &layout.monitors[..layout.monitors.len().min(MAX_MONITORS)];
+    if monitor == ALL_MONITORS {
+        return if layout.all && listed.len() >= 2 {
+            Ok(Selection::All)
+        } else {
+            Err(monitor_status::UNKNOWN)
+        };
+    }
+    listed
+        .get(usize::from(monitor) - 1)
+        .map(|m| Selection::Monitor(m.id))
+        .ok_or(monitor_status::UNKNOWN)
 }
 
 /// Add `d` to `sum` in microseconds, saturating.
@@ -2064,13 +2256,6 @@ impl Pipeline {
     /// ([`Encoded::answers`]); a source that cannot switch is answered with a
     /// [`Produced::Refused`] at once. One handed over and not taken yet is
     /// replaced. The caller keeps one switch at a time (the design's H2).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "called by the host's loop from the monitors design's step 11"
-        )
-    )]
     fn select(&self, selection: Selection, request: u16) {
         *self
             .control
@@ -2082,13 +2267,6 @@ impl Pipeline {
     /// Take back the selection for `request` if the capture thread has not
     /// taken it yet: `true` when it never reaches the source. Once taken, it
     /// is the source's to finish; its answer may come late, with a picture.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "called by the host's loop from the monitors design's step 11"
-        )
-    )]
     fn withdraw(&self, request: u16) -> bool {
         let mut select = self
             .control
@@ -2808,7 +2986,7 @@ mod tests {
     /// Pictures of the sizes queued, then nothing (a still screen); counts
     /// the buffers given back.
     struct Script {
-        sizes: Arc<Mutex<std::collections::VecDeque<(u32, u32)>>>,
+        sizes: Arc<Mutex<VecDeque<(u32, u32)>>>,
         index: u32,
         recycled: Arc<Mutex<Vec<usize>>>,
     }
@@ -2842,7 +3020,7 @@ mod tests {
     /// capture, and the lengths of the buffers it gave back.
     type Scripted = (
         Pipeline,
-        Arc<Mutex<std::collections::VecDeque<(u32, u32)>>>,
+        Arc<Mutex<VecDeque<(u32, u32)>>>,
         Arc<Mutex<Vec<usize>>>,
     );
 
@@ -3150,7 +3328,7 @@ mod tests {
             report: MediaReport::default(),
             pong_owed: None,
             session_id: "s",
-            screens: Screens::new(),
+            screens: Screens::new(&MediaLimits::default(), t0),
         };
         let fast = tornect_proto::quality::BEST_PERFORMANCE;
         served.quality.gate.request(fast);
@@ -3213,7 +3391,7 @@ mod tests {
             report: MediaReport::default(),
             pong_owed: None,
             session_id: "s",
-            screens: Screens::new(),
+            screens: Screens::new(&MediaLimits::default(), t0),
         };
         let code = tornect_proto::quality::BEST_PERFORMANCE;
 
@@ -3906,7 +4084,7 @@ mod tests {
             InputEvent::ReleaseAll,
         ];
         let held = |screens: &Screens| events.map(|e| screens.holds(&e));
-        let mut screens = Screens::new();
+        let mut screens = Screens::new(&MediaLimits::default(), Instant::now());
         assert_eq!(held(&screens), [false; 7], "no barrier at the start");
         screens.barrier = Some(4);
         screens.placed = false;
