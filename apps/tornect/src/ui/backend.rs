@@ -2573,6 +2573,9 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     });
                     continue;
                 }
+                // SERVICES_PORT, which the listener also admits, is not
+                // answered yet (design `services` step 20): dropping the stream
+                // closes it and leaves the circuit.
                 if stream.port() != SIGNALING_PORT {
                     continue;
                 }

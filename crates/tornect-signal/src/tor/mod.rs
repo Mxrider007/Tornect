@@ -43,11 +43,11 @@ pub use node::{BootstrapProgress, Isolation, LadderEvent, TorNode, shutdown_runt
 use crate::error::{SignalError, error_chain};
 
 /// Virtual port inside the onion service that carries Tornect signaling
-/// (decision M1-2). Only `BEGIN` requests for this port and [`MEDIA_PORT`] are
-/// accepted; any other request destroys its rendezvous circuit, exactly as
-/// Arti's own reverse proxy does for an unmatched port, so the service is
-/// neither fingerprintable by port probing nor cheaply port-scannable
-/// (docs/research/arti.md §13.13).
+/// (decision M1-2). Only `BEGIN` requests for this port, [`MEDIA_PORT`] and
+/// [`SERVICES_PORT`] are accepted; any other request destroys its rendezvous
+/// circuit, exactly as Arti's own reverse proxy does for an unmatched port, so
+/// the service is neither fingerprintable by port probing nor cheaply
+/// port-scannable (docs/research/arti.md §13.13).
 pub const SIGNALING_PORT: u16 = 4000;
 
 /// Virtual port of a session's Tor media stream (decision M1-39): the second
@@ -56,6 +56,18 @@ pub const SIGNALING_PORT: u16 = 4000;
 /// proves the session token (`tornect-proto` `Bind`); the envelope protocol
 /// stays on [`SIGNALING_PORT`], where the kill switch and `BYE` still apply.
 pub const MEDIA_PORT: u16 = 4001;
+
+/// Virtual port of a session's services stream (chat, clipboard text and files;
+/// decision M1-76): the third stream on the signaling stream's rendezvous
+/// circuit, opened by the viewer after the media stream's `BindOk`, and only
+/// when the host's signed `HELLO_ACK.feats` holds
+/// [`crate::messages::feats::SVC1`] — a host built before this port destroys
+/// the whole circuit, media included, on a `BEGIN` for it. Nothing is served
+/// on it until the peer proves the session token with the services `Bind`
+/// (`tornect-proto` `services`), whose MAC is domain-separated from the media
+/// one. Signaling, media and services make three streams per session, so
+/// [`MAX_STREAMS_PER_CIRCUIT`] (4) leaves one.
+pub const SERVICES_PORT: u16 = 4002;
 
 /// Translate an Arti error into the Tornect error vocabulary using its `ErrorKind`
 /// (docs/research/arti.md §9).

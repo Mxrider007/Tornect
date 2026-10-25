@@ -283,6 +283,9 @@ pub struct ClientSession<S> {
     /// The host's last notice code (decision M1-70): `None` until a `PONG`
     /// that answers this side's `PING` carries one.
     notices: watch::Sender<Option<u8>>,
+    /// `HELLO_ACK.feats` as the host signed it (verified against the dialed
+    /// address before it was kept): what [`ClientSession::host_has`] answers from.
+    host_feats: Vec<String>,
 }
 
 impl<S> ClientSession<S>
@@ -305,6 +308,17 @@ where
     #[must_use]
     pub fn host_label(&self) -> &str {
         &self.host_label
+    }
+
+    /// Whether the host's signed `HELLO_ACK.feats` holds the token `feat` (a
+    /// [`messages::feats`] constant), compared exactly. Only the host's own
+    /// signed list counts, never this side's [`ClientConfig::feats`]: a viewer
+    /// opens [`crate::SERVICES_PORT`] only when this says
+    /// [`messages::feats::SVC1`], since a host built before that port destroys
+    /// the whole circuit on it.
+    #[must_use]
+    pub fn host_has(&self, feat: &str) -> bool {
+        self.host_feats.iter().any(|f| f == feat)
     }
 
     /// Whether the session is unattended (the signed accept's `session_type`).
@@ -583,6 +597,8 @@ struct Greeted<S> {
     /// `th_after(HELLO_ACK)`: the SAS input.
     th_hello_ack: [u8; 32],
     sas_nonce: [u8; 32],
+    /// `HELLO_ACK.feats`, kept only once its signature verified.
+    host_feats: Vec<String>,
 }
 
 /// `HELLO` (signed) → `HELLO_ACK` (verified against the dialed address).
@@ -646,6 +662,7 @@ where
         known,
         th_hello_ack,
         sas_nonce,
+        host_feats: ack.feats,
     })
 }
 
@@ -690,6 +707,7 @@ where
         known,
         th_hello_ack,
         sas_nonce,
+        host_feats,
     } = greet(stream, cfg, identity, deps).await?;
 
     // PAIR path. A host that already trusts this device expects
@@ -728,6 +746,7 @@ where
             host_pk,
             host_label,
             host_device_pk,
+            host_feats,
         )
         .await;
     }
@@ -796,6 +815,7 @@ where
         random: Arc::clone(&deps.random),
         pending: VecDeque::new(),
         notices: watch::Sender::new(None),
+        host_feats,
     })))
 }
 
@@ -1057,6 +1077,7 @@ async fn unattended_session<S>(
     host_pk: VerifyingKey,
     host_label: String,
     host_device_pk: [u8; 32],
+    host_feats: Vec<String>,
 ) -> Result<ClientOutcome<S>, HandshakeError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -1159,5 +1180,6 @@ where
         random: Arc::clone(&deps.random),
         pending: VecDeque::new(),
         notices: watch::Sender::new(None),
+        host_feats,
     })))
 }

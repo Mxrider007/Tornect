@@ -372,6 +372,8 @@ async fn unattended_session_end_to_end_over_a_duplex_pipe() {
         .unwrap();
 
     let mut host = host;
+    // The services token rides HELLO_ACK on this path too (design `services` §0).
+    host.cfg.feats.push(messages::feats::SVC1.into());
     host.deps.unattended = Arc::new(UnattendedAuth::new(
         AttemptLimiter::new(guard.store().clone()),
         Arc::new(FixedOffset::utc()),
@@ -399,6 +401,10 @@ async fn unattended_session_end_to_end_over_a_duplex_pipe() {
         ClientOutcome::Session(s) => s,
         other => panic!("expected a session, got {other:?}"),
     };
+    // The host's signed features, not this side's (`ua1` only).
+    assert!(session.host_has(messages::feats::SVC1));
+    assert!(session.host_has(messages::feats::UA1));
+    assert!(!session.host_has(messages::feats::UA2));
 
     // The host reached Established with the *same* derived token, and no popup
     // ran on either side (that is the whole point of an unattended session).
@@ -2020,10 +2026,15 @@ impl RawHost {
     }
 
     async fn ack(&mut self, signer: &dyn HostSigner) {
+        self.ack_with(signer, vec![]).await;
+    }
+
+    /// A `HELLO_ACK` carrying `feats`, signed by `signer`.
+    async fn ack_with(&mut self, signer: &dyn HostSigner, feats: Vec<String>) {
         let ack = messages::HelloAck {
             v: 1,
             host_nonce: [0x44; 32],
-            feats: vec![],
+            feats,
         };
         self.chan.send(&ack, Some(signer)).await.unwrap();
         self.chan.set_version(1);
@@ -2283,6 +2294,173 @@ async fn client_side_checks_reject_a_forged_host() {
     assert!(matches!(err, HandshakeError::Timeout("HELLO_ACK")), "{err}");
     assert!(started.elapsed() >= timeouts::HELLO_ACK);
     assert!(started.elapsed() < timeouts::HELLO_ACK + Duration::from_secs(1));
+}
+
+/// An attended session with a host both sides already pinned, and the host's
+/// task (it ends once the session is dropped).
+async fn known_host_session(
+    host: &HostSide,
+    client: &ClientSide,
+) -> (
+    Box<client::ClientSession<DuplexStream>>,
+    tokio::task::JoinHandle<Result<HostOutcome, HandshakeError>>,
+) {
+    host.consent
+        .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+    let (a, b) = pipe();
+    let host_task = spawn_host(a, host);
+    let outcome = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        Intent::Session,
+    )
+    .await
+    .unwrap();
+    let ClientOutcome::Session(session) = outcome else {
+        panic!("expected a session")
+    };
+    (session, host_task)
+}
+
+/// Design `services` §0 (step 6): whether the host answers the services
+/// stream is read from its signed `HELLO_ACK.feats` and nothing else — not
+/// this side's own feats, not a list the host's signature does not cover —
+/// because a `BEGIN` on `SERVICES_PORT` makes a host built before it destroy
+/// the whole circuit, media included.
+#[tokio::test]
+async fn the_hosts_features_come_only_from_its_signed_hello_ack() {
+    use crate::messages::feats::{SVC1, UA1, UA2};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut host = host_side(tmp.path(), HOST_SEED);
+    let mut client = client_side(tmp.path(), host.identity.id(), CLIENT_SEED);
+    host.trusted
+        .pin(client.identity.id(), "Laptop of Ana")
+        .unwrap();
+    client
+        .known
+        .pin(host.identity.id(), "Desk of Bob", host_device_pk())
+        .unwrap();
+
+    // A host that advertises the services token: the client sees it, exactly.
+    host.cfg.feats = vec![UA1.into(), SVC1.into()];
+    let (session, host_task) = known_host_session(&host, &client).await;
+    assert!(session.host_has(SVC1));
+    assert!(session.host_has(UA1));
+    for absent in [UA2, "svc", "svc12", "SVC1", " svc1", ""] {
+        assert!(!session.host_has(absent), "{absent:?}");
+    }
+    drop(session);
+    host_task.await.unwrap().unwrap();
+
+    // A host without it, whatever this side's own feats say.
+    host.cfg.feats = vec![UA1.into()];
+    client.cfg.feats = vec![UA1.into(), SVC1.into()];
+    let (session, host_task) = known_host_session(&host, &client).await;
+    assert!(session.host_has(UA1));
+    assert!(!session.host_has(SVC1));
+    drop(session);
+    host_task.await.unwrap().unwrap();
+
+    // A headless host advertises nothing at all.
+    host.cfg.feats = vec![];
+    let (session, host_task) = known_host_session(&host, &client).await;
+    assert!(!session.host_has(SVC1) && !session.host_has(UA1));
+    drop(session);
+    host_task.await.unwrap().unwrap();
+
+    let real_pk = HostSigner::public_key(&*host.identity);
+
+    // A HELLO_ACK the host's key signed with the token is taken as signed.
+    {
+        let (a, b) = pipe();
+        let relay = tokio::spawn(async move {
+            let signer = HostIdentity::from_seed(&HOST_SEED);
+            let mut h = RawHost::new(a, &real_pk);
+            h.take_hello().await;
+            h.ack_with(&signer, vec![SVC1.into()]).await;
+            h.take(Kind::SessionRequest).await;
+            h.chan.send(&genuine_accept(), Some(&signer)).await.unwrap();
+            h.chan
+        });
+        let outcome = connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            Intent::Session,
+        )
+        .await
+        .unwrap();
+        let ClientOutcome::Session(session) = outcome else {
+            panic!("expected a session")
+        };
+        assert!(session.host_has(SVC1));
+        assert!(!session.host_has(UA1));
+        drop(session);
+        drop(relay.await.unwrap());
+    }
+
+    // The token added after signing (the body swapped under a genuine
+    // signature over an empty list): E_BAD_SIG, no session.
+    {
+        let (a, b) = pipe();
+        let relay = tokio::spawn(async move {
+            let mut h = RawHost::new(a, &real_pk);
+            h.take_hello().await;
+            let signed = messages::HelloAck {
+                v: 1,
+                host_nonce: [0x44; 32],
+                feats: vec![],
+            };
+            let mut env = Envelope::new(1, 1, Kind::HelloAck, encode_body(&signed));
+            sign_envelope(&HostIdentity::from_seed(&HOST_SEED), &h.chan.th(), &mut env);
+            env.body = encode_body(&messages::HelloAck {
+                feats: vec![SVC1.into()],
+                ..signed
+            });
+            let mut stream = h.chan.into_stream();
+            write_frame(&mut stream, &env.encode()).await.unwrap();
+            stream
+        });
+        let err = connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            Intent::Session,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.violation_code(), Some(codes::E_BAD_SIG), "{err}");
+        drop(relay.await.unwrap());
+    }
+
+    // The token signed by another key over the right transcript: E_BAD_SIG.
+    {
+        let (a, b) = pipe();
+        let relay = tokio::spawn(async move {
+            let phisher = HostIdentity::from_seed(&[0x99; 32]);
+            let mut h = RawHost::new(a, &real_pk);
+            h.take_hello().await;
+            h.ack_with(&phisher, vec![UA1.into(), SVC1.into()]).await;
+            h.chan.recv(Duration::from_secs(5), "err").await
+        });
+        let err = connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            Intent::Session,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.violation_code(), Some(codes::E_BAD_SIG), "{err}");
+        let seen = relay.await.unwrap().unwrap().unwrap();
+        assert_eq!(seen.env.kind, Kind::Error);
+    }
 }
 
 #[tokio::test(start_paused = true)]

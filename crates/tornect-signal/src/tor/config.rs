@@ -32,10 +32,11 @@ pub const NUM_INTRO_POINTS: u8 = 3;
 pub const INTRO_RATE_LIMIT: (u32, u32) = (25, 200);
 
 /// Streams one rendezvous circuit may hold before Arti tears the circuit down.
-/// Signaling needs one, the Tor media fallback a second; 4 leaves room for a
-/// reconnect in flight while capping one circuit's footprint (each open stream
-/// costs a host-side task and Arti's per-stream buffers) at four times what a
-/// session needs.
+/// Signaling needs one, the Tor media fallback a second and the session
+/// services (`super::SERVICES_PORT`) a third; 4 leaves one for a reconnect in
+/// flight while capping one circuit's footprint (each open stream costs a
+/// host-side task and Arti's per-stream buffers) at what a session needs plus
+/// that one.
 pub const MAX_STREAMS_PER_CIRCUIT: u32 = 4;
 
 /// Introduction requests Arti queues while proof-of-work is being enforced.

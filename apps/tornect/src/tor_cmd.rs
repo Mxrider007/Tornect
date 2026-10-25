@@ -442,7 +442,11 @@ async fn run_host(
                     });
                     continue;
                 }
-                // The listener admits no other port; this only keeps that true here.
+                // The listener admits one more port, SERVICES_PORT, which this
+                // host does not answer yet (design `services` step 20): dropping
+                // the stream closes it, and the circuit with the session's media
+                // stays. Nothing advertises `svc1` before then, so no Tornect
+                // viewer opens it.
                 if stream.port() != SIGNALING_PORT {
                     continue;
                 }

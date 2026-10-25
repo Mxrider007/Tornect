@@ -59,6 +59,14 @@ pub mod feats {
     pub const UA1: &str = "ua1";
     /// Suite 2 supported.
     pub const UA2: &str = "ua2";
+    /// Host only (`HELLO_ACK.feats`): this host answers a session's services
+    /// stream on [`crate::SERVICES_PORT`] (decision M1-76). A viewer opens that
+    /// port only when the host's signed `HELLO_ACK` carries this token
+    /// ([`crate::fsm::client::ClientSession::host_has`]), since a host built
+    /// before it destroys the whole circuit on the port. A host that serves no services still
+    /// advertises it and refuses the stream, so the token does not tell one
+    /// kind of host from another before pairing.
+    pub const SVC1: &str = "svc1";
 }
 
 /// Session modes on the wire (`SESSION_ACCEPT.mode`, `want_mode`).
@@ -512,7 +520,9 @@ pub struct HelloAck {
     #[n(1)]
     #[cbor(with = "minicbor::bytes")]
     pub host_nonce: [u8; 32],
-    /// key 2 — host-wide feature tokens (independent of the peer).
+    /// key 2 — host-wide feature tokens (independent of the peer): the PAKE
+    /// suites, and [`feats::SVC1`] when the host answers the services stream.
+    /// Covered by the signature, so the client trusts only what it verified.
     #[n(2)]
     pub feats: Vec<String>,
 }
@@ -2103,6 +2113,25 @@ mod tests {
             clamp_feats(&vec!["f".to_owned(); MAX_FEATS + 3]).len(),
             MAX_FEATS
         );
+    }
+
+    #[test]
+    fn every_feature_token_fits_the_wire_and_survives_the_clamp() {
+        let all = [feats::UA1, feats::UA2, feats::SVC1];
+        for (i, token) in all.iter().enumerate() {
+            assert!(!token.is_empty() && token.chars().count() <= MAX_FEAT_CHARS);
+            assert!(!all[..i].contains(token), "{token} is listed twice");
+        }
+        let owned: Vec<String> = all.iter().map(|t| (*t).to_owned()).collect();
+        assert_eq!(clamp_feats(&owned), owned);
+        assert!(owned.len() <= MAX_FEATS);
+        // A host's HELLO_ACK with the suite and the services token round-trips.
+        let ack = HelloAck {
+            v: 1,
+            host_nonce: [4u8; 32],
+            feats: vec![feats::UA1.to_owned(), feats::SVC1.to_owned()],
+        };
+        assert_eq!(roundtrip(&ack).feats, ["ua1", "svc1"]);
     }
 
     #[test]

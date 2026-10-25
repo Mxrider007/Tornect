@@ -27,7 +27,8 @@ use tornect_core::{Config, HostIdentity, Paths, TornectId};
 use tornect_signal::ping::{NONCE_LEN, ping, serve};
 use tornect_signal::tor::{Admission, RendezvousLimits};
 use tornect_signal::{
-    OnionStream, SignalError, TorNode, install_crypto_provider, shutdown_runtime,
+    Isolation, MEDIA_PORT, OnionStream, SERVICES_PORT, SIGNALING_PORT, SignalError, TorNode,
+    install_crypto_provider, shutdown_runtime,
 };
 
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(180);
@@ -208,6 +209,113 @@ async fn roundtrip() -> anyhow::Result<()> {
         nodes.elapsed()
     );
 
+    let Nodes { host, client, .. } = nodes;
+    client.shutdown().await;
+    host.shutdown().await;
+    Ok(())
+}
+
+/// The listener's port rule over the live network (design `services` step 6):
+/// a session's three streams — signaling, media, services — open on one
+/// rendezvous circuit (one isolation group) and are each accepted with their
+/// port; a `BEGIN` on any other port then destroys that circuit, which ends
+/// the streams already open on it.
+#[test]
+#[ignore = "needs the live Tor network; run with --ignored"]
+fn live_session_ports() -> anyhow::Result<()> {
+    let rt = runtime()?;
+    let result = rt.block_on(session_ports());
+    shutdown_runtime(rt);
+    result
+}
+
+async fn session_ports() -> anyhow::Result<()> {
+    let nodes = Nodes::start().await?;
+    let mut listener = nodes.host.publish(&nodes.identity).await?;
+    eprintln!(
+        "[{:5.1}s] host launched {}",
+        nodes.elapsed(),
+        listener.onion_address()
+    );
+    // Host: take the three streams and keep them (and the listener) open.
+    let accepted = tokio::spawn(async move {
+        let mut streams = Vec::new();
+        while streams.len() < 3 {
+            streams.push(listener.accept().await.expect("listener alive"));
+        }
+        (listener, streams)
+    });
+
+    nodes.client.wait_ready(BOOTSTRAP_TIMEOUT).await?;
+    eprintln!("[{:5.1}s] client bootstrapped", nodes.elapsed());
+    let id = nodes.identity.id();
+    let isolation = Isolation::new();
+    let deadline = Instant::now() + PUBLISH_DEADLINE;
+    // The signaling stream builds the circuit, once the descriptor is up.
+    let mut signaling = loop {
+        match nodes
+            .client
+            .connect_on(&id, SIGNALING_PORT, &isolation)
+            .await
+        {
+            Ok(stream) => break stream,
+            Err(
+                e @ (SignalError::HostOffline
+                | SignalError::HostNotRunning
+                | SignalError::NotBootstrapped),
+            ) if Instant::now() < deadline => {
+                eprintln!(
+                    "[{:5.1}s] not connectable yet ({e}); retrying",
+                    nodes.elapsed()
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let media = nodes.client.connect_on(&id, MEDIA_PORT, &isolation).await?;
+    let mut services = nodes
+        .client
+        .connect_on(&id, SERVICES_PORT, &isolation)
+        .await?;
+    eprintln!(
+        "[{:5.1}s] signaling, media and services open on one circuit",
+        nodes.elapsed()
+    );
+    let (listener, mut streams) = tokio::time::timeout(Duration::from_secs(60), accepted).await??;
+    let ports: Vec<u16> = streams.iter().map(OnionStream::port).collect();
+    assert_eq!(ports, [SIGNALING_PORT, MEDIA_PORT, SERVICES_PORT]);
+    // The services stream carries bytes both ways.
+    services.write_all(b"svc1").await?;
+    services.flush().await?;
+    let mut got = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(30), streams[2].read_exact(&mut got)).await??;
+    assert_eq!(&got, b"svc1");
+    streams[2].write_all(b"ack1").await?;
+    streams[2].flush().await?;
+    tokio::time::timeout(Duration::from_secs(30), services.read_exact(&mut got)).await??;
+    assert_eq!(&got, b"ack1");
+    eprintln!("[{:5.1}s] services stream carries data", nodes.elapsed());
+
+    // A fourth stream on a port the host does not serve destroys the circuit.
+    let refused = nodes
+        .client
+        .connect_on(&id, SERVICES_PORT + 1, &isolation)
+        .await;
+    assert!(refused.is_err(), "a BEGIN on an unserved port must fail");
+    let mut buf = [0u8; 16];
+    let ended = tokio::time::timeout(Duration::from_secs(60), signaling.read(&mut buf)).await?;
+    assert!(
+        matches!(ended, Ok(0) | Err(_)),
+        "the signaling stream must end with its circuit: {ended:?}"
+    );
+    eprintln!(
+        "[{:5.1}s] port {} destroyed the circuit and its streams",
+        nodes.elapsed(),
+        SERVICES_PORT + 1
+    );
+
+    drop((signaling, media, services, streams, listener));
     let Nodes { host, client, .. } = nodes;
     client.shutdown().await;
     host.shutdown().await;

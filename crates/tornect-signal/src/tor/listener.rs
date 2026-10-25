@@ -13,11 +13,18 @@
 //!   signaling stream for [`CIRCUIT_IDLE_TIMEOUT`] is dropped, which closes it:
 //!   the stream `RendRequest::accept` returns owns the rendezvous tunnel
 //!   (`tor-hsservice-0.45.0/src/req.rs` 233–241).
-//! * A request that is not `BEGIN` on [`SIGNALING_PORT`] destroys its circuit
+//! * A request that is not `BEGIN` on one of the three served ports —
+//!   [`SIGNALING_PORT`], [`MEDIA_PORT`] (a session's media stream) and
+//!   [`SERVICES_PORT`] (its services stream) — destroys its circuit
 //!   (`StreamRequest::shutdown_circuit`), exactly what Arti's own reverse proxy
 //!   does for an unmatched port (`tor-hsrproxy-0.45.0/src/proxy.rs` 225–250).
 //!   Rejected streams never count toward `max_concurrent_streams_per_circuit`, so
-//!   without this one circuit could probe every virtual port.
+//!   without this one circuit could probe every virtual port. The media and
+//!   services ports are accepted like signaling (the listener has no peer
+//!   identity to check): nothing is served on them until the peer proves a
+//!   live session's token in its first frame, within a deadline. A session
+//!   uses all three, which leaves one of the circuit's four streams
+//!   (`super::MAX_STREAMS_PER_CIRCUIT`).
 //! * [`ACCEPT_QUEUE_LEN`] accepted streams waiting for [`OnionListener::accept`].
 //!   When the queue is full a `BEGIN` is refused with `END(DONE)` *before* being
 //!   accepted, which is what the reverse proxy sends when its target is
@@ -158,7 +165,7 @@ use tor_hsservice::{RendRequest, RunningOnionService, StreamRequest};
 use tor_proto::stream::IncomingStreamRequest;
 use tornect_core::TornectId;
 
-use super::{MEDIA_PORT, SIGNALING_PORT};
+use super::{MEDIA_PORT, SERVICES_PORT, SIGNALING_PORT};
 
 /// Rendezvous handshakes completed at once; what a request that finds them all
 /// busy meets is the [`Admission`] policy. The permit is released as soon as
@@ -583,7 +590,8 @@ enum CircuitEnd {
     /// No signaling stream was open for the idle deadline; dropping the request
     /// stream closes the circuit.
     Idle,
-    /// A request that was not `BEGIN` on the signaling port; the circuit was destroyed.
+    /// A request that was not `BEGIN` on a served port ([`admitted_port`]);
+    /// the circuit was destroyed.
     Rejected,
 }
 
@@ -592,7 +600,7 @@ enum CircuitEnd {
 enum StreamOutcome {
     /// Accepted and handed to the listener.
     Accepted,
-    /// Not a signaling request; the circuit has been destroyed.
+    /// Not `BEGIN` on a served port; the circuit has been destroyed.
     Rejected,
     /// Refused with `END(DONE)` (accept queue full), or accepting failed; the
     /// circuit stays.
@@ -684,28 +692,35 @@ impl Drop for StreamGuard {
     }
 }
 
-/// Accept `BEGIN` on [`SIGNALING_PORT`] or [`MEDIA_PORT`]; anything else
-/// destroys the circuit.
+/// The ports a peer may open a stream on: signaling, a session's media
+/// stream and its services stream. Every other port destroys the circuit.
+const SERVED_PORTS: [u16; 3] = [SIGNALING_PORT, MEDIA_PORT, SERVICES_PORT];
+
+/// The port of a stream request the listener accepts: `BEGIN` on one of
+/// [`SERVED_PORTS`]. `None` for anything else (another port, `BEGIN_DIR`,
+/// `RESOLVE`), which destroys the circuit.
+fn admitted_port(request: &IncomingStreamRequest) -> Option<u16> {
+    match request {
+        IncomingStreamRequest::Begin(begin) if SERVED_PORTS.contains(&begin.port()) => {
+            Some(begin.port())
+        }
+        _ => None,
+    }
+}
+
+/// Accept `BEGIN` on a served port ([`admitted_port`]); anything else destroys
+/// the circuit.
 async fn handle_stream_request(
     request: StreamRequest,
     incoming: &mpsc::Sender<OnionStream>,
     live: &Arc<watch::Sender<usize>>,
 ) -> StreamOutcome {
-    let port = match request.request() {
-        IncomingStreamRequest::Begin(begin)
-            if begin.port() == SIGNALING_PORT || begin.port() == MEDIA_PORT =>
-        {
-            begin.port()
+    let Some(port) = admitted_port(request.request()) else {
+        tracing::debug!("stream request is not BEGIN on a served port; destroying circuit");
+        if let Err(e) = request.shutdown_circuit() {
+            tracing::debug!(error = %e, "destroying circuit failed");
         }
-        _ => {
-            tracing::debug!(
-                "stream request is not BEGIN on the signaling or media port; destroying circuit"
-            );
-            if let Err(e) = request.shutdown_circuit() {
-                tracing::debug!(error = %e, "destroying circuit failed");
-            }
-            return StreamOutcome::Rejected;
-        }
+        return StreamOutcome::Rejected;
     };
     // Refuse before accepting when nobody can take the stream: the peer then
     // sees END(DONE), as from Arti's reverse proxy with an unreachable target,
@@ -814,7 +829,7 @@ pub struct OnionStream {
     _guard: Option<StreamGuard>,
     /// The write deadline.
     stall: StallTimer,
-    /// The virtual port: [`SIGNALING_PORT`] or [`MEDIA_PORT`].
+    /// The virtual port: [`SIGNALING_PORT`], [`MEDIA_PORT`] or [`SERVICES_PORT`].
     port: u16,
 }
 
@@ -839,7 +854,10 @@ impl OnionStream {
     }
 
     /// The virtual port this stream was opened on: [`SIGNALING_PORT`] for the
-    /// envelope protocol, [`MEDIA_PORT`] for a session's Tor media stream.
+    /// envelope protocol, [`MEDIA_PORT`] for a session's Tor media stream,
+    /// [`SERVICES_PORT`] for its services stream (chat, clipboard, files). A
+    /// host-side stream is on one of these three; the accept loop dispatches by
+    /// it.
     #[must_use]
     pub fn port(&self) -> u16 {
         self.port
@@ -1050,6 +1068,78 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(end, CircuitEnd::Rejected);
+    }
+
+    fn begin(port: u16) -> IncomingStreamRequest {
+        let flags = tor_cell::relaycell::msg::BeginFlags::from(0_u32);
+        IncomingStreamRequest::Begin(tor_cell::relaycell::msg::Begin::new("", port, flags).unwrap())
+    }
+
+    #[test]
+    fn only_begin_on_the_signaling_media_and_services_ports_is_admitted() {
+        assert_eq!(
+            (SIGNALING_PORT, MEDIA_PORT, SERVICES_PORT),
+            (4000, 4001, 4002)
+        );
+        for port in [SIGNALING_PORT, MEDIA_PORT, SERVICES_PORT] {
+            assert_eq!(admitted_port(&begin(port)), Some(port));
+        }
+        // Every other port destroys the circuit: one more served port would be
+        // one more way to probe, and an old peer's port must stay refused.
+        for port in 0..=u16::MAX {
+            assert_eq!(
+                admitted_port(&begin(port)).is_some(),
+                (4000..=4002).contains(&port),
+                "port {port}"
+            );
+        }
+        // Not BEGIN: refused whatever it names.
+        let dir = IncomingStreamRequest::BeginDir(tor_cell::relaycell::msg::BeginDir::default());
+        assert_eq!(admitted_port(&dir), None);
+        let resolve =
+            IncomingStreamRequest::Resolve(tor_cell::relaycell::msg::Resolve::new("tornect.onion"));
+        assert_eq!(admitted_port(&resolve), None);
+    }
+
+    #[tokio::test]
+    async fn a_sessions_three_streams_keep_the_circuit_and_a_fourth_port_ends_it() {
+        // The decision `handle_stream_request` takes, over one circuit's requests:
+        // signaling, media and services are accepted; a BEGIN on 4003 then
+        // destroys the circuit, and nothing after it is looked at.
+        let (_live_tx, live_rx) = watch::channel(0usize);
+        let (tx, rx) = unbounded::<IncomingStreamRequest>();
+        for port in [
+            SIGNALING_PORT,
+            MEDIA_PORT,
+            SERVICES_PORT,
+            4003,
+            SIGNALING_PORT,
+        ] {
+            tx.unbounded_send(begin(port)).unwrap();
+        }
+        let seen = Mutex::new(Vec::new());
+        let end = tokio::time::timeout(
+            PATIENCE,
+            drive_circuit(rx, Duration::from_secs(3600), live_rx, |request| {
+                let admitted = admitted_port(&request);
+                seen.lock().unwrap().push(admitted);
+                async move {
+                    if admitted.is_some() {
+                        StreamOutcome::Accepted
+                    } else {
+                        StreamOutcome::Rejected
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(end, CircuitEnd::Rejected);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [Some(4000), Some(4001), Some(4002), None]
+        );
+        drop(tx);
     }
 
     #[tokio::test]
