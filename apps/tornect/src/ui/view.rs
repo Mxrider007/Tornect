@@ -996,6 +996,7 @@ fn request_sheet(
                         confirming: model.admin_confirm.contains(&popup.id),
                         admin_not_given: model.admin_not_given.contains(&popup.id),
                         paired_recently: model.paired_recently.contains(&popup.id),
+                        screens: model.sheet_screens.get(&popup.id).copied().unwrap_or(1),
                     };
                     let card = question(ui, |ui| host_popup(ui, popup, sheet, form, now, actions));
                     Some((popup.id, card))
@@ -1178,10 +1179,14 @@ fn sharing_banner(
             );
             // The level the host signed: administrator only from an
             // "Allow as administrator" answer (§B.2.1).
+            let what = match sharing.capture.as_ref().map(|c| c.screens) {
+                Some(n) if n >= 2 => "this computer's screens",
+                _ => "this screen",
+            };
             let mode = match (sharing.control, admin) {
-                (true, true) => "sees and controls this screen as administrator",
-                (true, false) => "sees and controls this screen",
-                (false, _) => "sees this screen (view only)",
+                (true, true) => format!("sees and controls {what} as administrator"),
+                (true, false) => format!("sees and controls {what}"),
+                (false, _) => format!("sees {what} (view only)"),
             };
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.add(
@@ -1408,6 +1413,17 @@ fn whole_code(code: &str) -> bool {
     code.chars().filter(char::is_ascii_digit).count() == 6
 }
 
+/// What a session sheet asks to show: "this screen", or, where the viewer
+/// could switch between two or more monitors or see them all (decision
+/// M1-75 (3)), "this computer's N screens".
+fn what_is_shared(screens: usize) -> String {
+    if screens >= 2 {
+        format!("this computer's {screens} screens")
+    } else {
+        "this screen".to_owned()
+    }
+}
+
 /// What a host sheet shows beside its popup: the key's recognition, the
 /// levels a session sheet offers, and whether its administrator
 /// confirmation is up.
@@ -1420,6 +1436,8 @@ struct Sheet<'a> {
     admin_not_given: bool,
     /// The device was paired moments before: the scam line (T10).
     paired_recently: bool,
+    /// How many screens the session could show (decision M1-75 (3)).
+    screens: usize,
 }
 
 /// The arming card of session sheet `id`'s administrator confirmation: its
@@ -1665,8 +1683,9 @@ fn host_popup(
             );
             ui.add(
                 egui::Label::new(format!(
-                    "\"{label}\" wants to see this screen. Whatever you answer lasts for this \
-                     session only, and \"Stop sharing\" ends it."
+                    "\"{label}\" wants to see {}. Whatever you answer lasts for this session \
+                     only, and \"Stop sharing\" ends it.",
+                    what_is_shared(sheet.screens)
                 ))
                 .wrap()
                 .selectable(false),
@@ -2849,6 +2868,7 @@ mod tests {
                 input: false,
                 shown: None,
                 all: false,
+                screens: 0,
             }),
         }];
         for stage in [
@@ -3566,6 +3586,79 @@ mod tests {
                 "{line}"
             );
             assert_eq!(line.contains("as administrator"), admin, "{line}");
+        }
+    }
+
+    /// Decision M1-75 (3), the final review: where the viewer can switch
+    /// between two or more monitors or see them all, the session sheet asks
+    /// for "this computer's N screens", not for "this screen"; with one
+    /// screen, or no count (Wayland's dialog picks one), it asks for "this
+    /// screen" as before.
+    #[test]
+    fn a_session_sheet_names_the_screens_a_viewer_can_switch_between() {
+        let t0 = Instant::now();
+        for (count, asked) in [
+            (None, "this screen."),
+            (Some(1), "this screen."),
+            (Some(2), "this computer's 2 screens."),
+            (Some(3), "this computer's 3 screens."),
+        ] {
+            let mut model = with_popups(vec![session_popup(7, t0)]);
+            if let Some(count) = count {
+                model.sheet_screens.insert(7, count);
+            }
+            let window = Harness::new(model, t0);
+            let line = window.text("\"Laptop\" wants to see ");
+            assert!(
+                line.starts_with(&format!("\"Laptop\" wants to see {asked} Whatever")),
+                "{count:?}: {line}"
+            );
+        }
+    }
+
+    /// Decision M1-75 (3), the final review: once capture says it lists two
+    /// or more monitors, the banner says "this computer's screens" at every
+    /// level; before it said (0) and with one it says "this screen".
+    #[test]
+    fn the_banner_names_the_screens_of_a_host_with_several() {
+        let t0 = Instant::now();
+        for (screens, control, said) in [
+            (0, true, "SHARING · sees and controls this screen · "),
+            (1, true, "SHARING · sees and controls this screen · "),
+            (
+                2,
+                true,
+                "SHARING · sees and controls this computer's screens · ",
+            ),
+            (
+                3,
+                false,
+                "SHARING · sees this computer's screens (view only) · ",
+            ),
+            (1, false, "SHARING · sees this screen (view only) · "),
+        ] {
+            let model = Model {
+                sharing: vec![Sharing {
+                    session_id: "0011".to_owned(),
+                    label: "Laptop".to_owned(),
+                    control,
+                    unattended: false,
+                    since: t0,
+                    capture: Some(CaptureNote {
+                        source: "gdi",
+                        width: 1920,
+                        height: 1080,
+                        input: control,
+                        shown: None,
+                        all: false,
+                        screens,
+                    }),
+                }],
+                ..with_popups(Vec::new())
+            };
+            let window = Harness::new(model, t0);
+            let line = window.text("SHARING");
+            assert!(line.starts_with(said), "{screens} {control}: {line}");
         }
     }
 

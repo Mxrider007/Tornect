@@ -278,6 +278,7 @@ mod tests {
             input,
             shown: None,
             all: false,
+            screens: 0,
         });
         s
     }

@@ -1699,6 +1699,7 @@ impl MediaObserver for GuiMedia {
             input: s.input,
             shown: None,
             all: false,
+            screens: 0,
         };
         self.shared.update(|m| {
             if let Some(sharing) = m.sharing.iter_mut().find(|x| x.session_id == s.session_id) {
@@ -1730,6 +1731,7 @@ impl MediaObserver for GuiMedia {
                 capture.shown = changed.shown;
                 capture.all = changed.all;
                 capture.input = changed.input;
+                capture.screens = changed.of;
             }
         });
         say(format_args!("{}", crate::host::view_line(changed)));
@@ -1758,6 +1760,23 @@ impl MediaObserver for GuiMedia {
 /// dismiss or re-order a sheet, connect, or write the model.
 fn show_hook(shared: Arc<Shared>) -> crate::unattended::ShowHook {
     Arc::new(move |link| shared.wake(Wake::Show(link)))
+}
+
+/// How many screens a session of `source` could show, for the session
+/// sheet's words (decision M1-75 (3)): the monitors a GDI or X11 desktop
+/// lists now, the test screens' two, else one (the test card; Wayland, whose
+/// dialog picks one screen; a desktop that cannot be listed).
+fn screen_count(source: Source) -> super::consent::ScreenCount {
+    Arc::new(move || match source {
+        Source::TestCard => 1,
+        Source::TestScreens => tornect_session::TEST_SCREENS.len(),
+        Source::Desktop => {
+            match crate::tor_cmd::desktop_monitors(&tornect_session::DesktopBackend::detect()) {
+                Some(Ok(monitors)) => monitors.len().max(1),
+                Some(Err(_)) | None => 1,
+            }
+        }
+    })
 }
 
 /// Wire the host role: the FSM with the window's consent, the media host, and
@@ -1828,7 +1847,8 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
                 live: Arc::new(move || activity.session_live()),
             },
         )
-        .with_words(Arc::clone(&b.words)),
+        .with_words(Arc::clone(&b.words))
+        .with_screens(screen_count(b.source)),
     );
     deps.consent = consent.clone();
     // Before an unattended session (§B.8.6.3): "Ask before starting" on the
@@ -3910,6 +3930,20 @@ mod tests {
     use super::super::indicator::{Change, Indicator};
     use super::super::model::{Model, PopupKind};
     use super::*;
+
+    /// Decision M1-75 (3), the final review: the session sheet of a host
+    /// sharing the test screens asks for both of them, the test card's for
+    /// "this screen"; a desktop counts what its backend lists, at least one
+    /// (this machine's Wayland session, whose dialog picks one, says one).
+    #[test]
+    fn the_session_sheet_counts_what_the_source_could_show() {
+        assert_eq!(screen_count(Source::TestCard)(), 1);
+        assert_eq!(
+            screen_count(Source::TestScreens)(),
+            tornect_session::TEST_SCREENS.len()
+        );
+        assert!(screen_count(Source::Desktop)() >= 1);
+    }
 
     /// §B.1.1, §B.2.1: `IpcOp::Show` reaches the window host as one wake of
     /// its event loop (`Wake::Show`, which raises the window and re-arms the

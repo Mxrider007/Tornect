@@ -188,6 +188,13 @@ pub struct Model {
     /// The session sheets of a device paired moments before: beside the
     /// administrator answer they say the scam line (§B.2.1, T10).
     pub paired_recently: HashSet<u64>,
+    /// How many screens a session asked by each open session sheet could
+    /// show, by popup id, counted as the sheet opened: two or more on a GDI
+    /// or X11 desktop of several monitors (or the test screens), where the
+    /// viewer can switch between them or see them all (decision M1-75 (3)),
+    /// so the sheet asks for "this computer's N screens". A sheet with no
+    /// entry, or one, asks for "this screen" (Wayland's dialog picks one).
+    pub sheet_screens: HashMap<u64, usize>,
     /// When the person here last allowed a session: from that click on, the
     /// screen counts as shared, before the session is live and before any
     /// picture can leave, until [`Model::ACCEPTED_HIDES_FOR`] has passed
@@ -697,6 +704,10 @@ pub struct CaptureNote {
     /// The pictures show all of this desktop's monitors at once: the
     /// indicator sits on the primary.
     pub all: bool,
+    /// How many monitors capture lists, once it said (0 before, and for a
+    /// source with nothing to choose): with two or more the viewer can
+    /// switch between them, and the banner says "this computer's screens".
+    pub screens: u8,
 }
 
 /// The connection this computer last asked for, as the connect stepper

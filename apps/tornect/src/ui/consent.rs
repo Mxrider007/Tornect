@@ -385,6 +385,7 @@ impl Drop for OnScreen<'_> {
             m.admin_confirm.remove(&id);
             m.admin_not_given.remove(&id);
             m.paired_recently.remove(&id);
+            m.sheet_screens.remove(&id);
             m.blocks.retain(|b| b.id != id);
             if m.confirm.as_ref().is_some_and(|c| c.id == id) {
                 m.confirm = None;
@@ -446,6 +447,10 @@ fn same_code(typed: &str, sas: &str) -> bool {
     typed.len() == 6 && typed.bytes().all(|b| b.is_ascii_digit()) && typed == sas
 }
 
+/// Counts the screens a session on this computer could show (see
+/// [`GuiConsent::with_screens`]).
+pub type ScreenCount = Arc<dyn Fn() -> usize + Send + Sync>;
+
 /// The host's popups in the window.
 pub struct GuiConsent {
     popups: Arc<Popups>,
@@ -453,6 +458,9 @@ pub struct GuiConsent {
     /// The device words and the look-alike alarm (§B.6.1); without them the
     /// sheets show neither.
     words: Option<Arc<Recognizer>>,
+    /// Counts the screens a session could show; without it a session sheet
+    /// asks for "this screen".
+    screens: Option<ScreenCount>,
 }
 
 impl GuiConsent {
@@ -463,7 +471,18 @@ impl GuiConsent {
             popups,
             withdraw,
             words: None,
+            screens: None,
         }
+    }
+
+    /// A session sheet counts the screens a session could show with `count`
+    /// as it opens, off the network task (it may ask the X server or
+    /// Windows), and with two or more asks for "this computer's N screens"
+    /// (decision M1-75 (3)): the viewer can switch between them.
+    #[must_use]
+    pub fn with_screens(mut self, count: ScreenCount) -> Self {
+        self.screens = Some(count);
+        self
     }
 
     /// The sheets show device words and run the look-alike alarm: a pairing
@@ -638,6 +657,18 @@ impl GuiConsent {
                 Some((seen, recent)) => (Some(seen), recent),
                 None => (None, false),
             };
+            let screens = match &self.screens {
+                None => None,
+                Some(count) => {
+                    let count = Arc::clone(count);
+                    let counted = tokio::task::spawn_blocking(move || count());
+                    tokio::select! {
+                        biased;
+                        () = &mut withdrawn => return SessionDecision::Deny,
+                        counted = counted => counted.ok(),
+                    }
+                }
+            };
             let (tx, rx) = oneshot::channel();
             let kind = PopupKind::Session {
                 label: peer.label.clone(),
@@ -655,6 +686,9 @@ impl GuiConsent {
                 }
                 if again.is_some() {
                     m.admin_not_given.insert(id);
+                }
+                if let Some(screens) = screens {
+                    m.sheet_screens.insert(id, screens);
                 }
                 m.popups.push(Popup { id, kind, deadline });
             });
@@ -1182,6 +1216,39 @@ mod tests {
             ..WindowsFacts::default()
         }));
         assert_eq!(SheetLevels::of(&prompt).answers.admin, None);
+    }
+
+    /// Decision M1-75 (3), the final review: a session sheet counts the
+    /// screens a session could show as it opens, off the network task, puts
+    /// the count in the model with the popup and takes it away with it;
+    /// without a counter there is no entry, and the sheet asks for "this
+    /// screen".
+    #[tokio::test]
+    async fn a_session_sheet_counts_the_screens_and_drops_the_count() {
+        for counter in [None, Some(3)] {
+            let popups = popups();
+            let (_tx, started) = watch::channel(0);
+            let mut consent =
+                GuiConsent::new(Arc::clone(&popups), withdraw(&KillSwitch::new(), started));
+            if let Some(n) = counter {
+                consent = consent.with_screens(Arc::new(move || n));
+            }
+            let (peer, summary) = (peer(), summary());
+            let asking = consent.session_at(&peer, &summary, &Availability::LINUX);
+            tokio::pin!(asking);
+            let open = tokio::select! {
+                _ = &mut asking => panic!("answered before anyone did"),
+                open = shown(&popups, 1) => open,
+            };
+            let id = open[0].id;
+            assert_eq!(
+                popups.shared().read(|m| m.sheet_screens.get(&id).copied()),
+                counter
+            );
+            assert!(popups.answer_session(id, SessionDecision::Deny));
+            assert_eq!(asking.await, SessionDecision::Deny);
+            assert!(popups.shared().read(|m| m.sheet_screens.is_empty()));
+        }
     }
 
     /// Only a sheet whose look-alike alarm fired takes a typed code: on any
