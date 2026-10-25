@@ -1407,13 +1407,18 @@ impl Served<'_> {
                 self.report.quality_requests += 1;
                 self.quality.gate.request(quality);
             }
+            // Read and left unanswered, as a request over the budget is: this
+            // host sends no `Monitors` yet, and a viewer asks only after it
+            // read one (the monitors design's V1).
+            Msg::SelectMonitor { .. } => {}
             Msg::Close { .. } => return Handled::End(MediaEnd::ViewerLeft),
             Msg::Bind { .. }
             | Msg::BindOk { .. }
             | Msg::BindRefused { .. }
             | Msg::Video { .. }
             | Msg::Quality { .. }
-            | Msg::Stats(_) => {
+            | Msg::Stats(_)
+            | Msg::Monitors { .. } => {
                 return Handled::End(MediaEnd::Protocol);
             }
         }

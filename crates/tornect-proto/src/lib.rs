@@ -24,12 +24,17 @@
 //! client → host   SetQuality      quality u8
 //! host → client   Quality         width u32 · height u32 · QualityInfo
 //! host → client   Stats           HostStats
+//! client → host   SelectMonitor   request u16 · list u16 · monitor u8
+//! host → client   Monitors        request u16 · status u8 · shown u8 · flags u8 · n u8 ·
+//!                                 list u16 · seq u32 · n × MonitorEntry
 //! either          Close           reason u16
 //!
 //! QualityInfo (10 bytes)  preset u8 · max_fps u8 · kbps u32 · max_long u16 · max_short u16
 //! HostStats (36 bytes)    source_width u16 · source_height u16 · frames u16 · window_ms u16 ·
 //!                         grab_us · age_us · scale_us · convert_us · encode_us · send_us ·
 //!                         ack_us (each u32)
+//! MonitorEntry (20 bytes) id u8 · flags u8 · reserved u16 · x i32 · y i32 · width u32 ·
+//!                         height u32
 //! ```
 //!
 //! **Quality.** The viewer names one of three [`quality`] presets in its
@@ -39,6 +44,18 @@
 //! per-stage timings in `Stats` (the quality design, §4). A preset code this
 //! version does not know, and a `QualityInfo` or `HostStats` outside its
 //! ranges, is a malformed frame.
+//!
+//! **Monitors** (decision M1-75, the monitors design §3). A host whose
+//! capture shows one of several monitors lists them in `Monitors`, written
+//! immediately before the first `Video` it describes, whose `seq` it carries;
+//! the viewer picks another with `SelectMonitor`, naming the list it chose
+//! from, and gets exactly one `Monitors` with its `request` in answer. When
+//! the picture from `seq` on shows another part of the desktop
+//! ([`monitor_flags::REMAPPED`]), the host drops input that acts where the
+//! pointer is until it reads the `VideoAck` for `seq` ([`seq_reached`]), so
+//! nothing made against the earlier picture lands on the new one. Geometry is
+//! for display only, in the host desktop's units, and carries no names. Every
+//! rule of §3 is checked when decoding: a frame that breaks one is malformed.
 //!
 //! **Binding.** The first frame on a media stream must be `Bind`, carrying
 //! `HMAC-SHA256(k_bind, "tornect/v1/tor-media-bind\0" ‖ th_final)` with
@@ -127,6 +144,44 @@ pub mod quality {
     }
 }
 
+/// The most monitors a [`Msg::Monitors`] lists, and the highest id a
+/// [`Msg::SelectMonitor`] names.
+pub const MAX_MONITORS: usize = 16;
+
+/// [`Msg::SelectMonitor`]'s `monitor`, and [`Msg::Monitors`]'s `shown`, for
+/// all monitors at once.
+pub const ALL_MONITORS: u8 = 0;
+
+/// [`Msg::Monitors`]'s `status`. A `Monitors` of the host's own (request 0)
+/// is always [`OK`](monitor_status::OK).
+pub mod monitor_status {
+    /// The list, and what the pictures from `seq` on show.
+    pub const OK: u8 = 0;
+    /// Refused: the host has no list, the request named an earlier list or a
+    /// monitor not in it, or all monitors where they are not offered.
+    pub const UNKNOWN: u8 = 1;
+    /// The source could not switch, or no picture of the new choice came in
+    /// time.
+    pub const FAILED: u8 = 2;
+    /// Refused: a switch is under way, or the last one was too recent.
+    pub const BUSY: u8 = 3;
+}
+
+/// [`Msg::Monitors`]'s `flags` bits on the wire ([`Msg::Monitors`]'s `all`
+/// and `remapped`); every other bit is 0.
+pub mod monitor_flags {
+    /// The host can show all monitors at once (only with two or more).
+    pub const ALL: u8 = 1;
+    /// The pictures from `seq` on show another part of the desktop, or
+    /// another size of it; the host drops input that acts where the pointer
+    /// is until it reads the `VideoAck` for `seq`. Only with status OK and at
+    /// least one monitor.
+    pub const REMAPPED: u8 = 2;
+}
+
+/// [`MonitorEntry`]'s flags bit for the primary monitor; every other bit is 0.
+const ENTRY_PRIMARY: u8 = 1;
+
 /// Frame types.
 mod ty {
     pub const BIND: u8 = 0x01;
@@ -143,6 +198,10 @@ mod ty {
     pub const SET_QUALITY: u8 = 0x50;
     pub const QUALITY: u8 = 0x51;
     pub const STATS: u8 = 0x52;
+    // Monitor switching (decision M1-75): the next free pair after the
+    // quality presets'.
+    pub const SELECT_MONITOR: u8 = 0x53;
+    pub const MONITORS: u8 = 0x54;
     pub const CLOSE: u8 = 0x7f;
 }
 
@@ -287,6 +346,113 @@ impl HostStats {
     }
 }
 
+/// One monitor of a [`Msg::Monitors`] list; its id is its position in the
+/// list plus one. Geometry is for display only, in the host desktop's units
+/// (physical pixels on Windows and X11, logical pixels on Wayland); no name,
+/// model or serial is ever sent.
+///
+/// Decoding refuses a field outside its range (a malformed frame); a host
+/// builds every entry with [`MonitorEntry::saturating`], which keeps it in
+/// range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MonitorEntry {
+    /// The desktop's primary monitor (at most one in a list).
+    pub primary: bool,
+    /// Left edge, `-32768..=32767`.
+    pub x: i32,
+    /// Top edge, `-32768..=32767`.
+    pub y: i32,
+    /// Width, `1..=32768`, or 0 with `height` 0: the size is not known.
+    pub width: u32,
+    /// Height, `1..=32768`, or 0 with `width` 0.
+    pub height: u32,
+}
+
+impl MonitorEntry {
+    /// Its size on the wire.
+    pub const LEN: usize = 20;
+    /// The largest width or height.
+    pub const MAX_SIDE: u32 = 32_768;
+    /// The smallest coordinate of a corner.
+    pub const MIN_COORD: i32 = -32_768;
+    /// The largest coordinate of a corner.
+    pub const MAX_COORD: i32 = 32_767;
+
+    /// An entry in range whatever the host measured: `x` and `y` clamped into
+    /// `MIN_COORD..=MAX_COORD`, and a width or height of 0 or above
+    /// [`Self::MAX_SIDE`] made 0×0, "unknown".
+    #[must_use]
+    pub fn saturating(primary: bool, x: i64, y: i64, width: u64, height: u64) -> Self {
+        let coord = |v: i64| {
+            i32::try_from(v.clamp(i64::from(Self::MIN_COORD), i64::from(Self::MAX_COORD)))
+                .unwrap_or(0)
+        };
+        let side = |v: u64| {
+            u32::try_from(v)
+                .ok()
+                .filter(|v| (1..=Self::MAX_SIDE).contains(v))
+        };
+        let (width, height) = match (side(width), side(height)) {
+            (Some(width), Some(height)) => (width, height),
+            _ => (0, 0),
+        };
+        Self {
+            primary,
+            x: coord(x),
+            y: coord(y),
+            width,
+            height,
+        }
+    }
+
+    /// Whether every field is in its range.
+    fn valid(&self) -> bool {
+        let coord = |v: i32| (Self::MIN_COORD..=Self::MAX_COORD).contains(&v);
+        let side = |v: u32| (1..=Self::MAX_SIDE).contains(&v);
+        let size = (self.width == 0 && self.height == 0) || (side(self.width) && side(self.height));
+        coord(self.x) && coord(self.y) && size
+    }
+
+    /// Entry `index` of a list (id `index + 1`).
+    fn put(&self, index: usize, out: &mut Vec<u8>) {
+        out.push(u8::try_from(index + 1).unwrap_or(u8::MAX));
+        out.push(if self.primary { ENTRY_PRIMARY } else { 0 });
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&self.x.to_be_bytes());
+        out.extend_from_slice(&self.y.to_be_bytes());
+        out.extend_from_slice(&self.width.to_be_bytes());
+        out.extend_from_slice(&self.height.to_be_bytes());
+    }
+
+    /// Entry `index` of a list: exactly [`Self::LEN`] bytes, id `index + 1`,
+    /// reserved bytes and bits 0, in range; `None` otherwise.
+    fn get(index: usize, b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN
+            || usize::from(b[0]) != index + 1
+            || b[1] & !ENTRY_PRIMARY != 0
+            || b[2..4] != [0, 0]
+        {
+            return None;
+        }
+        let entry = Self {
+            primary: b[1] & ENTRY_PRIMARY != 0,
+            x: be_i32(&b[4..8]),
+            y: be_i32(&b[8..12]),
+            width: be_u32(&b[12..16]),
+            height: be_u32(&b[16..20]),
+        };
+        entry.valid().then_some(entry)
+    }
+}
+
+/// Whether `seq` is `target` or comes after it on the wrapping `Video`
+/// sequence: at most 2³¹ − 1 past it. The host's input barrier, the viewer
+/// and the window's hold all compare with this.
+#[must_use]
+pub const fn seq_reached(seq: u32, target: u32) -> bool {
+    seq.wrapping_sub(target) < 1 << 31
+}
+
 /// One media-stream message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Msg {
@@ -372,6 +538,41 @@ pub enum Msg {
     },
     /// The host's per-stage timings, at most about once a second.
     Stats(HostStats),
+    /// The viewer asks to see another monitor, or all of them; legal in
+    /// control and view-only sessions alike, and only after a `Monitors`.
+    SelectMonitor {
+        /// `1..=65535`, chosen by the viewer and echoed in the answer.
+        request: u16,
+        /// The `list` of the `Monitors` the id was taken from.
+        list: u16,
+        /// [`ALL_MONITORS`], or an id `1..=16` of that list.
+        monitor: u8,
+    },
+    /// The host's monitors and what the pictures from `seq` on show: in
+    /// answer to a `SelectMonitor`, or the host's own news (request 0),
+    /// written immediately before the `Video` numbered `seq`.
+    Monitors {
+        /// The `SelectMonitor` this answers; 0 for the host's own news.
+        request: u16,
+        /// A [`monitor_status`] code; [`monitor_status::OK`] with request 0.
+        status: u8,
+        /// What the pictures from `seq` on show: an id `1..=n`, or
+        /// [`ALL_MONITORS`] (only with `all`, or with no monitors).
+        shown: u8,
+        /// The host can show all monitors at once (only with two or more).
+        all: bool,
+        /// The pictures from `seq` on show another part of the desktop
+        /// ([`monitor_flags::REMAPPED`]); only with status OK and a monitor.
+        remapped: bool,
+        /// The list's generation; the host bumps it (wrapping) whenever the
+        /// monitors, their rectangles or the primary change.
+        list: u16,
+        /// The `Video` seq from which this applies: the next one the host
+        /// sends.
+        seq: u32,
+        /// At most [`MAX_MONITORS`], ordered by x, then y.
+        monitors: Vec<MonitorEntry>,
+    },
     /// Orderly end.
     Close {
         /// A [`reason`] code.
@@ -479,6 +680,46 @@ impl Msg {
                 stats.put(&mut body);
                 ty::STATS
             }
+            Self::SelectMonitor {
+                request,
+                list,
+                monitor,
+            } => {
+                body.extend_from_slice(&request.to_be_bytes());
+                body.extend_from_slice(&list.to_be_bytes());
+                body.push(*monitor);
+                ty::SELECT_MONITOR
+            }
+            Self::Monitors {
+                request,
+                status,
+                shown,
+                all,
+                remapped,
+                list,
+                seq,
+                monitors,
+            } => {
+                body.reserve(12 + MonitorEntry::LEN * monitors.len());
+                body.extend_from_slice(&request.to_be_bytes());
+                body.push(*status);
+                body.push(*shown);
+                let mut flags = 0;
+                if *all {
+                    flags |= monitor_flags::ALL;
+                }
+                if *remapped {
+                    flags |= monitor_flags::REMAPPED;
+                }
+                body.push(flags);
+                body.push(u8::try_from(monitors.len()).unwrap_or(u8::MAX));
+                body.extend_from_slice(&list.to_be_bytes());
+                body.extend_from_slice(&seq.to_be_bytes());
+                for (index, monitor) in monitors.iter().enumerate() {
+                    monitor.put(index, &mut body);
+                }
+                ty::MONITORS
+            }
             Self::Close { reason } => {
                 body.extend_from_slice(&reason.to_be_bytes());
                 ty::CLOSE
@@ -492,6 +733,13 @@ impl Msg {
         out.extend_from_slice(&len.to_be_bytes());
         out.push(t);
         out.extend_from_slice(&body);
+        // The monitor messages carry rules beyond their fields' types; a
+        // sender that breaks one is caught here, not by the peer's decode.
+        debug_assert!(
+            !matches!(self, Self::SelectMonitor { .. } | Self::Monitors { .. })
+                || Self::decode(&out[4..]).is_ok(),
+            "{self:?} breaks a rule of its frame"
+        );
         out
     }
 
@@ -593,6 +841,20 @@ impl Msg {
                 }
             }
             ty::STATS => Self::Stats(HostStats::get(body).ok_or(ProtoError::Malformed("Stats"))?),
+            ty::SELECT_MONITOR => {
+                fixed("SelectMonitor", 5)?;
+                let request = be_u16(&body[0..2]);
+                let monitor = body[4];
+                if request == 0 || usize::from(monitor) > MAX_MONITORS {
+                    return Err(ProtoError::Malformed("SelectMonitor"));
+                }
+                Self::SelectMonitor {
+                    request,
+                    list: be_u16(&body[2..4]),
+                    monitor,
+                }
+            }
+            ty::MONITORS => monitors(body).ok_or(ProtoError::Malformed("Monitors"))?,
             ty::CLOSE => {
                 fixed("Close", 2)?;
                 Self::Close {
@@ -604,12 +866,66 @@ impl Msg {
     }
 }
 
+/// A `Monitors` body that keeps every rule of the monitors design's §3;
+/// `None` otherwise.
+fn monitors(body: &[u8]) -> Option<Msg> {
+    let (head, entries) = body.split_at_checked(12)?;
+    let n = usize::from(head[5]);
+    if n > MAX_MONITORS || entries.len() != n * MonitorEntry::LEN {
+        return None;
+    }
+    let (request, status, shown, flags) = (be_u16(&head[0..2]), head[2], head[3], head[4]);
+    if flags & !(monitor_flags::ALL | monitor_flags::REMAPPED) != 0 {
+        return None;
+    }
+    let all = flags & monitor_flags::ALL != 0;
+    let remapped = flags & monitor_flags::REMAPPED != 0;
+    let ok = status == monitor_status::OK;
+    if status > monitor_status::BUSY
+        || (request == 0 && !ok)
+        || (all && n < 2)
+        || (remapped && (!ok || n == 0))
+    {
+        return None;
+    }
+    let shown_ok = if shown == ALL_MONITORS {
+        all || n == 0
+    } else {
+        usize::from(shown) <= n
+    };
+    if !shown_ok {
+        return None;
+    }
+    let monitors = entries
+        .chunks_exact(MonitorEntry::LEN)
+        .enumerate()
+        .map(|(index, entry)| MonitorEntry::get(index, entry))
+        .collect::<Option<Vec<_>>>()?;
+    if monitors.iter().filter(|m| m.primary).count() > 1 {
+        return None;
+    }
+    Some(Msg::Monitors {
+        request,
+        status,
+        shown,
+        all,
+        remapped,
+        list: be_u16(&head[6..8]),
+        seq: be_u32(&head[8..12]),
+        monitors,
+    })
+}
+
 fn be_u16(b: &[u8]) -> u16 {
     u16::from_be_bytes([b[0], b[1]])
 }
 
 fn be_u32(b: &[u8]) -> u32 {
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+}
+
+fn be_i32(b: &[u8]) -> i32 {
+    i32::from_be_bytes([b[0], b[1], b[2], b[3]])
 }
 
 fn be_u64(b: &[u8]) -> u64 {
@@ -807,7 +1123,44 @@ mod tests {
             Msg::Close {
                 reason: reason::ENDED_BY_VIEWER,
             },
+            Msg::SelectMonitor {
+                request: 7,
+                list: 0,
+                monitor: 2,
+            },
+            two_screens(),
         ]
+    }
+
+    /// The monitors design's `Monitors` example (§3): the host's news, before
+    /// `Video` 0, of a 1920×1080 primary at (0, 0) and a 1280×1024 monitor
+    /// right of it, showing the first, all offered.
+    fn two_screens() -> Msg {
+        Msg::Monitors {
+            request: 0,
+            status: monitor_status::OK,
+            shown: 1,
+            all: true,
+            remapped: false,
+            list: 0,
+            seq: 0,
+            monitors: vec![
+                MonitorEntry {
+                    primary: true,
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+                MonitorEntry {
+                    primary: false,
+                    x: 1920,
+                    y: 0,
+                    width: 1280,
+                    height: 1024,
+                },
+            ],
+        }
     }
 
     #[test]
@@ -865,10 +1218,21 @@ mod tests {
             Msg::SetQuality {
                 quality: quality::BEST_QUALITY,
             },
+            Msg::SelectMonitor {
+                request: u16::MAX,
+                list: u16::MAX,
+                monitor: MAX_MONITORS as u8,
+            },
             Msg::Close {
                 reason: reason::ENDED_BY_VIEWER,
             },
         ];
+        let select = Msg::SelectMonitor {
+            request: 1,
+            list: 0,
+            monitor: ALL_MONITORS,
+        };
+        assert_eq!(select.encode().len(), 10, "a SelectMonitor frame");
         let (mut a, mut b) = tokio::io::duplex(4096);
         for msg in &client_msgs {
             assert!(msg.encode().len() - 4 <= MAX_CLIENT_FRAME, "{msg:?}");
@@ -902,6 +1266,7 @@ mod tests {
             vec![ty::STATS, 0],
             vec![0x99],
             vec![0x53],
+            vec![0x55],
             Vec::new(),
         ] {
             assert!(Msg::decode(&frame).is_err(), "{frame:?}");
@@ -1204,6 +1569,533 @@ mod tests {
         ));
     }
 
+    /// The monitors design's §3 examples, with this build's codes 0x53 and
+    /// 0x54 (decision M1-75 (2)), and three more answers, written out by hand
+    /// and checked apart from this code with Python's `struct.pack`.
+    #[test]
+    fn the_monitor_messages_match_the_golden_vectors() {
+        let vectors = [
+            (
+                Msg::SelectMonitor {
+                    request: 7,
+                    list: 0,
+                    monitor: 2,
+                },
+                "00000006 53 0007 0000 02",
+            ),
+            (
+                two_screens(),
+                "00000035 54 0000 00 01 01 02 0000 00000000 \
+                 01 01 0000 00000000 00000000 00000780 00000438 \
+                 02 00 0000 00000780 00000000 00000500 00000400",
+            ),
+            // An answer to request 513 that switched to monitor 2 of 3 (the
+            // primary, right of one at negative x), the third's size unknown.
+            (
+                Msg::Monitors {
+                    request: 513,
+                    status: monitor_status::OK,
+                    shown: 2,
+                    all: true,
+                    remapped: true,
+                    list: 0x0102,
+                    seq: 0xffff_fffe,
+                    monitors: vec![
+                        MonitorEntry {
+                            primary: false,
+                            x: -1920,
+                            y: -200,
+                            width: 1920,
+                            height: 1080,
+                        },
+                        MonitorEntry {
+                            primary: true,
+                            x: 0,
+                            y: 0,
+                            width: 2560,
+                            height: 1440,
+                        },
+                        MonitorEntry {
+                            primary: false,
+                            x: 2560,
+                            y: 0,
+                            width: 0,
+                            height: 0,
+                        },
+                    ],
+                },
+                "00000049 54 0201 00 02 03 03 0102 fffffffe \
+                 01 00 0000 fffff880 ffffff38 00000780 00000438 \
+                 02 01 0000 00000000 00000000 00000a00 000005a0 \
+                 03 00 0000 00000a00 00000000 00000000 00000000",
+            ),
+            // BUSY in answer to request 9: no list.
+            (
+                Msg::Monitors {
+                    request: 9,
+                    status: monitor_status::BUSY,
+                    shown: ALL_MONITORS,
+                    all: false,
+                    remapped: false,
+                    list: 5,
+                    seq: 77,
+                    monitors: Vec::new(),
+                },
+                "0000000d 54 0009 03 00 00 00 0005 0000004d",
+            ),
+        ];
+        for (msg, bytes) in vectors {
+            let bytes = hex(bytes);
+            assert_eq!(msg.encode(), bytes, "{msg:?}");
+            assert_eq!(Msg::decode(&bytes[4..]).unwrap(), msg);
+        }
+        assert_eq!((MonitorEntry::LEN, MAX_MONITORS, ALL_MONITORS), (20, 16, 0));
+        assert_eq!((monitor_flags::ALL, monitor_flags::REMAPPED), (1, 2));
+        assert_eq!(
+            [
+                monitor_status::OK,
+                monitor_status::UNKNOWN,
+                monitor_status::FAILED,
+                monitor_status::BUSY
+            ],
+            [0, 1, 2, 3]
+        );
+    }
+
+    /// A list of `n` monitors side by side, 1920×1080 each, the first
+    /// primary.
+    fn row_of(n: usize) -> Vec<MonitorEntry> {
+        (0..n)
+            .map(|i| MonitorEntry {
+                primary: i == 0,
+                x: i32::try_from(i).unwrap() * 1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            })
+            .collect()
+    }
+
+    /// `Monitors` with 0, 1, 2 and 16 monitors round-trip, at every status
+    /// and with the range limits; the largest frame is 337 bytes.
+    #[test]
+    fn the_monitor_messages_round_trip_with_0_1_2_and_16_monitors() {
+        let mut sixteen = row_of(MAX_MONITORS);
+        sixteen[3] = MonitorEntry {
+            primary: false,
+            x: MonitorEntry::MIN_COORD,
+            y: MonitorEntry::MAX_COORD,
+            width: MonitorEntry::MAX_SIDE,
+            height: 1,
+        };
+        sixteen[4] = MonitorEntry::default();
+        let cases = [
+            // A source with nothing to choose, as news and as a refusal.
+            (
+                0,
+                monitor_status::OK,
+                ALL_MONITORS,
+                false,
+                false,
+                Vec::new(),
+            ),
+            (
+                3,
+                monitor_status::UNKNOWN,
+                ALL_MONITORS,
+                false,
+                false,
+                Vec::new(),
+            ),
+            (1, monitor_status::OK, 1, false, true, row_of(1)),
+            (0, monitor_status::OK, 1, false, false, row_of(1)),
+            (2, monitor_status::FAILED, 2, true, false, row_of(2)),
+            (
+                u16::MAX,
+                monitor_status::OK,
+                ALL_MONITORS,
+                true,
+                true,
+                row_of(2),
+            ),
+            (0, monitor_status::OK, 16, true, true, sixteen),
+            (
+                4,
+                monitor_status::BUSY,
+                1,
+                true,
+                false,
+                row_of(MAX_MONITORS),
+            ),
+        ];
+        for (request, status, shown, all, remapped, monitors) in cases {
+            let n = monitors.len();
+            let msg = Msg::Monitors {
+                request,
+                status,
+                shown,
+                all,
+                remapped,
+                list: u16::MAX,
+                seq: u32::MAX,
+                monitors,
+            };
+            let bytes = msg.encode();
+            assert_eq!(bytes.len(), 4 + 1 + 12 + 20 * n, "{msg:?}");
+            assert_eq!(Msg::decode(&bytes[4..]).unwrap(), msg);
+        }
+        let largest = Msg::Monitors {
+            request: 0,
+            status: monitor_status::OK,
+            shown: ALL_MONITORS,
+            all: true,
+            remapped: false,
+            list: 0,
+            seq: 0,
+            monitors: row_of(MAX_MONITORS),
+        };
+        assert_eq!(largest.encode().len(), 337, "the design's largest frame");
+        for monitor in [ALL_MONITORS, 1, 16] {
+            let msg = Msg::SelectMonitor {
+                request: 1,
+                list: 0,
+                monitor,
+            };
+            assert_eq!(Msg::decode(&msg.encode()[4..]).unwrap(), msg);
+        }
+    }
+
+    /// The encoder checks a monitor message against its frame's rules in a
+    /// debug build: a sender that breaks one (here two primaries) is caught
+    /// where it builds the message.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "breaks a rule of its frame")]
+    fn encoding_a_monitors_that_breaks_a_rule_is_caught() {
+        let mut monitors = row_of(2);
+        monitors[1].primary = true;
+        let _ = Msg::Monitors {
+            request: 0,
+            status: monitor_status::OK,
+            shown: 1,
+            all: true,
+            remapped: false,
+            list: 0,
+            seq: 0,
+            monitors,
+        }
+        .encode();
+    }
+
+    /// `frame` is a malformed frame of type `name`.
+    #[track_caller]
+    fn assert_malformed(frame: &[u8], name: &str) {
+        assert!(
+            matches!(Msg::decode(frame), Err(ProtoError::Malformed(n)) if n == name),
+            "{name}: {frame:02x?} gave {:?}",
+            Msg::decode(frame)
+        );
+    }
+
+    /// A `Monitors` frame (type byte first) of `n` monitors side by side,
+    /// shown 1, all offered from two on.
+    fn monitors_frame(n: usize) -> Vec<u8> {
+        Msg::Monitors {
+            request: 0,
+            status: monitor_status::OK,
+            shown: u8::from(n > 0),
+            all: n >= 2,
+            remapped: false,
+            list: 0,
+            seq: 0,
+            monitors: row_of(n),
+        }
+        .encode()
+        .split_off(4)
+    }
+
+    /// Where entry `i`'s bytes start in a `Monitors` frame (type byte first).
+    fn entry_at(i: usize) -> usize {
+        13 + 20 * i
+    }
+
+    /// Rule: exact length. A body shorter than its 12 fixed bytes, or one
+    /// that is not 12 + 20·n bytes for its count n, is malformed.
+    #[test]
+    fn a_monitors_frame_off_its_length_is_malformed() {
+        let two = monitors_frame(2);
+        assert!(Msg::decode(&two).is_ok());
+        for len in 1..13 {
+            assert_malformed(&two[..len], "Monitors");
+        }
+        let mut long = two.clone();
+        long.push(0);
+        assert_malformed(&long, "Monitors");
+        assert_malformed(&two[..two.len() - 1], "Monitors");
+        // The count says one more, or one fewer, than the entries there.
+        let mut more = two.clone();
+        more[6] = 3;
+        assert_malformed(&more, "Monitors");
+        let mut fewer = two.clone();
+        fewer[6] = 1;
+        fewer[5] = 0;
+        assert_malformed(&fewer, "Monitors");
+        let mut none = monitors_frame(0);
+        none.extend_from_slice(&two[entry_at(0)..entry_at(1)]);
+        assert_malformed(&none, "Monitors");
+    }
+
+    /// Rule: n ≤ 16. Seventeen well-formed entries, or a count of 255, are
+    /// malformed; sixteen are not.
+    #[test]
+    fn more_than_16_monitors_is_malformed() {
+        assert!(Msg::decode(&monitors_frame(16)).is_ok());
+        let mut seventeen = monitors_frame(16);
+        seventeen[6] = 17;
+        let mut extra = seventeen[entry_at(15)..entry_at(16)].to_vec();
+        extra[0] = 17;
+        extra[4..8].copy_from_slice(&(16 * 1920_i32).to_be_bytes());
+        seventeen.extend_from_slice(&extra);
+        assert_malformed(&seventeen, "Monitors");
+        let mut count = monitors_frame(2);
+        count[6] = 255;
+        assert_malformed(&count, "Monitors");
+    }
+
+    /// Rule: entry i has id i + 1.
+    #[test]
+    fn an_id_out_of_its_place_is_malformed() {
+        for (entry, id) in [(0, 0), (0, 2), (1, 1), (1, 3), (1, 255)] {
+            let mut frame = monitors_frame(2);
+            frame[entry_at(entry)] = id;
+            assert_malformed(&frame, "Monitors");
+        }
+    }
+
+    /// Rule: reserved bytes and bits are 0, in the message's flags, in each
+    /// entry's flags and in each entry's reserved `u16`.
+    #[test]
+    fn a_reserved_byte_or_bit_set_is_malformed() {
+        for bit in 2..8 {
+            let mut frame = monitors_frame(2);
+            frame[5] |= 1 << bit;
+            assert_malformed(&frame, "Monitors");
+        }
+        for bit in 1..8 {
+            let mut frame = monitors_frame(2);
+            frame[entry_at(1) + 1] |= 1 << bit;
+            assert_malformed(&frame, "Monitors");
+        }
+        for at in [2, 3] {
+            let mut frame = monitors_frame(2);
+            frame[entry_at(0) + at] = 1;
+            assert_malformed(&frame, "Monitors");
+        }
+    }
+
+    /// Rule: at most one primary.
+    #[test]
+    fn two_primaries_are_malformed() {
+        let mut frame = monitors_frame(3);
+        frame[entry_at(2) + 1] = ENTRY_PRIMARY;
+        assert_malformed(&frame, "Monitors");
+        // None, or one that is not the first, is fine.
+        let mut frame = monitors_frame(3);
+        frame[entry_at(0) + 1] = 0;
+        assert!(Msg::decode(&frame).is_ok());
+        frame[entry_at(2) + 1] = ENTRY_PRIMARY;
+        assert!(Msg::decode(&frame).is_ok());
+    }
+
+    /// Rule: x and y are in `-32768..=32767`.
+    #[test]
+    fn a_coordinate_out_of_range_is_malformed() {
+        for at in [4, 8] {
+            for v in [32_768, -32_769, i32::MAX, i32::MIN] {
+                let mut frame = monitors_frame(2);
+                frame[entry_at(1) + at..][..4].copy_from_slice(&v.to_be_bytes());
+                assert_malformed(&frame, "Monitors");
+            }
+            for v in [32_767_i32, -32_768, 0] {
+                let mut frame = monitors_frame(2);
+                frame[entry_at(1) + at..][..4].copy_from_slice(&v.to_be_bytes());
+                assert!(Msg::decode(&frame).is_ok(), "{at} {v}");
+            }
+        }
+    }
+
+    /// Rule: width and height are each in `1..=32768`, or both 0.
+    #[test]
+    fn a_size_out_of_range_is_malformed() {
+        for (width, height) in [
+            (32_769, 1080),
+            (1920, 32_769),
+            (u32::MAX, u32::MAX),
+            (0, 1080),
+            (1920, 0),
+        ] {
+            let mut frame = monitors_frame(2);
+            frame[entry_at(0) + 12..][..4].copy_from_slice(&u32::to_be_bytes(width));
+            frame[entry_at(0) + 16..][..4].copy_from_slice(&u32::to_be_bytes(height));
+            assert_malformed(&frame, "Monitors");
+        }
+        for (width, height) in [(32_768, 32_768), (1, 1), (0, 0)] {
+            let mut frame = monitors_frame(2);
+            frame[entry_at(0) + 12..][..4].copy_from_slice(&u32::to_be_bytes(width));
+            frame[entry_at(0) + 16..][..4].copy_from_slice(&u32::to_be_bytes(height));
+            assert!(Msg::decode(&frame).is_ok(), "{width}x{height}");
+        }
+    }
+
+    /// Rule: `shown` is an id of the list, or 0 (all) only with ALL or with
+    /// no monitors.
+    #[test]
+    fn shown_out_of_step_with_all_and_the_list_is_malformed() {
+        let mut past = monitors_frame(2);
+        past[4] = 3;
+        assert_malformed(&past, "Monitors");
+        let mut all_not_offered = monitors_frame(2);
+        all_not_offered[4] = ALL_MONITORS;
+        all_not_offered[5] = 0;
+        assert_malformed(&all_not_offered, "Monitors");
+        let mut one = monitors_frame(1);
+        one[4] = ALL_MONITORS;
+        assert_malformed(&one, "Monitors");
+        let mut none = monitors_frame(0);
+        none[4] = 1;
+        assert_malformed(&none, "Monitors");
+        // All with ALL, and the last id, are fine.
+        let mut all = monitors_frame(2);
+        all[4] = ALL_MONITORS;
+        assert!(Msg::decode(&all).is_ok());
+        all[4] = 2;
+        assert!(Msg::decode(&all).is_ok());
+    }
+
+    /// Rule: ALL only with two or more monitors.
+    #[test]
+    fn all_with_fewer_than_two_monitors_is_malformed() {
+        for n in [0, 1] {
+            let mut frame = monitors_frame(n);
+            frame[5] = monitor_flags::ALL;
+            assert_malformed(&frame, "Monitors");
+        }
+    }
+
+    /// Rule: REMAPPED only with status OK and at least one monitor.
+    #[test]
+    fn remapped_without_ok_or_a_monitor_is_malformed() {
+        for status in [
+            monitor_status::UNKNOWN,
+            monitor_status::FAILED,
+            monitor_status::BUSY,
+        ] {
+            let mut frame = monitors_frame(2);
+            frame[1..3].copy_from_slice(&5u16.to_be_bytes());
+            frame[3] = status;
+            assert!(Msg::decode(&frame).is_ok(), "{status} without REMAPPED");
+            frame[5] |= monitor_flags::REMAPPED;
+            assert_malformed(&frame, "Monitors");
+        }
+        let mut none = monitors_frame(0);
+        none[5] = monitor_flags::REMAPPED;
+        assert_malformed(&none, "Monitors");
+        let mut one = monitors_frame(1);
+        one[5] = monitor_flags::REMAPPED;
+        assert!(Msg::decode(&one).is_ok());
+    }
+
+    /// Rule: the host's own news (request 0) is status OK.
+    #[test]
+    fn news_that_is_not_ok_is_malformed() {
+        for status in [
+            monitor_status::UNKNOWN,
+            monitor_status::FAILED,
+            monitor_status::BUSY,
+        ] {
+            let mut frame = monitors_frame(2);
+            frame[3] = status;
+            assert_malformed(&frame, "Monitors");
+        }
+    }
+
+    /// Rule: status ≤ 3.
+    #[test]
+    fn an_unknown_status_is_malformed() {
+        for status in [4, 0x80, u8::MAX] {
+            let mut frame = monitors_frame(2);
+            frame[1..3].copy_from_slice(&5u16.to_be_bytes());
+            frame[3] = status;
+            assert_malformed(&frame, "Monitors");
+        }
+    }
+
+    /// Rules of `SelectMonitor`: exactly 5 bytes, request ≠ 0, monitor ≤ 16.
+    #[test]
+    fn a_select_monitor_breaking_its_rules_is_malformed() {
+        let frame = |request: u16, monitor: u8| {
+            let mut f = vec![ty::SELECT_MONITOR];
+            f.extend_from_slice(&request.to_be_bytes());
+            f.extend_from_slice(&3u16.to_be_bytes());
+            f.push(monitor);
+            f
+        };
+        assert_malformed(&frame(0, 1), "SelectMonitor");
+        for monitor in [17, 0x80, u8::MAX] {
+            assert_malformed(&frame(1, monitor), "SelectMonitor");
+        }
+        let good = frame(u16::MAX, 16);
+        assert!(Msg::decode(&good).is_ok());
+        assert_malformed(&good[..good.len() - 1], "SelectMonitor");
+        assert_malformed(&[good.as_slice(), &[0]].concat(), "SelectMonitor");
+        assert_malformed(&good[..1], "SelectMonitor");
+    }
+
+    /// `saturating` keeps every field in its wire range: corners clamped,
+    /// a side of 0 or above 32768 makes the size unknown (0×0).
+    #[test]
+    fn saturating_entries_stay_in_range() {
+        let entry = MonitorEntry::saturating;
+        assert_eq!(
+            entry(true, -1920, 0, 1920, 1080),
+            MonitorEntry {
+                primary: true,
+                x: -1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }
+        );
+        let clamped = entry(false, -40_000, 50_000, 32_768, 1);
+        assert_eq!((clamped.x, clamped.y), (-32_768, 32_767));
+        assert_eq!((clamped.width, clamped.height), (32_768, 1));
+        let extremes = entry(false, i64::MIN, i64::MAX, u64::MAX, 1080);
+        assert_eq!((extremes.x, extremes.y), (-32_768, 32_767));
+        for (width, height) in [(32_769, 1080), (1920, 32_769), (0, 1080), (1920, 0)] {
+            let e = entry(false, 0, 0, width, height);
+            assert_eq!((e.width, e.height), (0, 0), "{width}x{height}");
+        }
+        // 2^32 + 1920 does not wrap to 1920.
+        let wide = entry(false, 0, 0, (1 << 32) + 1920, 1080);
+        assert_eq!((wide.width, wide.height), (0, 0));
+    }
+
+    /// `seq_reached` counts forward up to 2³¹ − 1 past the target, across
+    /// the wrap.
+    #[test]
+    fn seq_reached_holds_across_the_wrap() {
+        for target in [0, 41, u32::MAX - 2, u32::MAX, 1 << 31] {
+            assert!(seq_reached(target, target));
+            assert!(seq_reached(target.wrapping_add(1), target));
+            assert!(seq_reached(target.wrapping_add((1 << 31) - 1), target));
+            assert!(!seq_reached(target.wrapping_add(1 << 31), target));
+            assert!(!seq_reached(target.wrapping_sub(1), target));
+        }
+        // An ack after the wrap reaches a seq just before it, not the other way.
+        assert!(seq_reached(2, u32::MAX - 1));
+        assert!(!seq_reached(u32::MAX - 1, 2));
+    }
+
     /// The committed seeds of the `media` fuzz target (`fuzz/seeds/media/`):
     /// one whole frame of each message, length prefix included, each the
     /// encoding of the message its name says.
@@ -1211,7 +2103,7 @@ mod tests {
     fn the_fuzz_seeds_are_one_frame_of_each_message() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fuzz/seeds/media");
         let samples = samples();
-        let expected: [(&str, &Msg); 13] = [
+        let expected: [(&str, &Msg); 15] = [
             ("bind.bin", &samples[0]),
             ("bind-ok.bin", &samples[1]),
             ("bind-refused.bin", &samples[2]),
@@ -1225,6 +2117,8 @@ mod tests {
             ("quality.bin", &samples[11]),
             ("stats.bin", &samples[12]),
             ("close.bin", &samples[15]),
+            ("select-monitor.bin", &samples[16]),
+            ("monitors.bin", &samples[17]),
         ];
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
@@ -1317,7 +2211,70 @@ mod tests {
                 })
             }),
             any::<u16>().prop_map(|reason| Msg::Close { reason }),
+            (1u16.., any::<u16>(), 0u8..=16).prop_map(|(request, list, monitor)| {
+                Msg::SelectMonitor {
+                    request,
+                    list,
+                    monitor,
+                }
+            }),
+            valid_monitors(),
         ]
+    }
+
+    /// Any monitor entry decoding accepts (not primary).
+    fn valid_entry() -> impl Strategy<Value = MonitorEntry> {
+        let coord = MonitorEntry::MIN_COORD..=MonitorEntry::MAX_COORD;
+        let side = 1..=MonitorEntry::MAX_SIDE;
+        (
+            coord.clone(),
+            coord,
+            prop_oneof![Just((0, 0)), (side.clone(), side)],
+        )
+            .prop_map(|(x, y, (width, height))| MonitorEntry {
+                primary: false,
+                x,
+                y,
+                width,
+                height,
+            })
+    }
+
+    /// Any `Monitors` decoding accepts: up to 16 entries, at most one
+    /// primary, `all` only with two or more, `shown` in step with both,
+    /// a refusal only in answer to a request, `remapped` only with OK and a
+    /// monitor.
+    fn valid_monitors() -> impl Strategy<Value = Msg> {
+        (
+            proptest::collection::vec(valid_entry(), 0..=MAX_MONITORS),
+            any::<u16>(),
+            any::<u16>(),
+            any::<u32>(),
+            any::<[u8; 6]>(),
+        )
+            .prop_map(|(mut monitors, request, list, seq, pick)| {
+                let n = monitors.len();
+                if n > 0 && pick[0] % 2 == 0 {
+                    monitors[usize::from(pick[1]) % n].primary = true;
+                }
+                let all = n >= 2 && pick[2] % 2 == 0;
+                let status = if request == 0 { 0 } else { pick[3] % 4 };
+                let shown = match usize::from(pick[4]) % (n + 1) {
+                    0 if all || n == 0 => ALL_MONITORS,
+                    0 => 1,
+                    id => u8::try_from(id).unwrap(),
+                };
+                Msg::Monitors {
+                    request,
+                    status,
+                    shown,
+                    all,
+                    remapped: status == monitor_status::OK && n > 0 && pick[5] % 2 == 0,
+                    list,
+                    seq,
+                    monitors,
+                }
+            })
     }
 
     proptest! {
@@ -1367,6 +2324,69 @@ mod tests {
             if body.len() != len {
                 prop_assert!(matches!(Msg::decode(&frame), Err(ProtoError::Malformed(_))));
             }
+        }
+    }
+
+    proptest! {
+        /// Every list a host can build from what it measured
+        /// ([`MonitorEntry::saturating`], at most one primary) encodes into a
+        /// `Monitors` that decodes back to it.
+        #[test]
+        fn saturating_entries_make_a_frame_that_decodes(
+            raw in proptest::collection::vec(
+                (
+                    prop_oneof![any::<i64>(), -40_000i64..=40_000],
+                    prop_oneof![any::<i64>(), -40_000i64..=40_000],
+                    prop_oneof![any::<u64>(), 0u64..=40_000],
+                    prop_oneof![any::<u64>(), 0u64..=40_000],
+                ),
+                0..=MAX_MONITORS,
+            ),
+            primary in any::<Option<proptest::sample::Index>>(),
+            seq in any::<u32>(),
+        ) {
+            let primary = primary.filter(|_| !raw.is_empty()).map(|i| i.index(raw.len()));
+            let monitors: Vec<MonitorEntry> = raw
+                .iter()
+                .enumerate()
+                .map(|(i, &(x, y, w, h))| MonitorEntry::saturating(primary == Some(i), x, y, w, h))
+                .collect();
+            let n = monitors.len();
+            let msg = Msg::Monitors {
+                request: 0,
+                status: monitor_status::OK,
+                shown: u8::from(n > 0),
+                all: n >= 2,
+                remapped: n > 0,
+                list: 0,
+                seq,
+                monitors,
+            };
+            prop_assert_eq!(Msg::decode(&msg.encode()[4..]).unwrap(), msg);
+        }
+
+        /// A frame whose type is a monitor message decodes only at its exact
+        /// length (5 bytes; 12 + 20·n), whatever its bytes.
+        #[test]
+        fn monitor_frames_decode_only_at_their_length(
+            t in prop_oneof![Just(ty::SELECT_MONITOR), Just(ty::MONITORS)],
+            body in proptest::collection::vec(any::<u8>(), 0..=400),
+        ) {
+            let len = match t {
+                ty::SELECT_MONITOR => Some(5),
+                _ => body.get(5).map(|&n| 12 + 20 * usize::from(n)),
+            };
+            let mut frame = vec![t];
+            frame.extend_from_slice(&body);
+            if len != Some(body.len()) {
+                prop_assert!(matches!(Msg::decode(&frame), Err(ProtoError::Malformed(_))));
+            }
+        }
+
+        /// `seq_reached(target + d, target)` exactly when d < 2³¹.
+        #[test]
+        fn seq_reached_is_the_forward_half(target in any::<u32>(), d in any::<u32>()) {
+            prop_assert_eq!(seq_reached(target.wrapping_add(d), target), d < 1 << 31);
         }
     }
 

@@ -1,7 +1,10 @@
 //! The Tor media stream's frames (`tornect_proto`, decision M1-39; the quality
-//! design's §4 messages) fed arbitrary bytes: `Msg::decode` and the stream reader
+//! design's §4 messages; the monitors design's §3 `SelectMonitor` and `Monitors`,
+//! decision M1-75) fed arbitrary bytes: `Msg::decode` and the stream reader
 //! `read_msg_max` at both caps return cleanly, in bounded allocation, and whatever
-//! they accept encodes back to exactly the bytes it was read from.
+//! they accept encodes back to exactly the bytes it was read from (the byte-level
+//! canonical form: a monitor message's every rule is checked when decoding, so an
+//! accepted one also passes the encoder's own check).
 //!
 //! ```text
 //! cargo +nightly fuzz run media target/fuzz-corpus/media fuzz/seeds/media -- -max_total_time=600

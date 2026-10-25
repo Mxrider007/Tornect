@@ -595,6 +595,8 @@ fn kind(msg: &Msg) -> &'static str {
         Msg::SetQuality { .. } => "SetQuality",
         Msg::Quality { .. } => "Quality",
         Msg::Stats(_) => "Stats",
+        Msg::SelectMonitor { .. } => "SelectMonitor",
+        Msg::Monitors { .. } => "Monitors",
         Msg::Close { .. } => "Close",
     }
 }

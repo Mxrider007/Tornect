@@ -4035,6 +4035,54 @@ async fn a_viewers_quality_or_stats_is_a_protocol_error() {
     }
 }
 
+/// The monitors design's H6: a `Monitors` from the viewer, the host's own
+/// message, and a malformed `SelectMonitor` (request 0, a monitor past 16, a
+/// body a byte short) end the stream as a protocol error, in control and
+/// view-only sessions alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_viewers_monitors_or_a_malformed_select_monitor_is_a_protocol_error() {
+    let rig = rig(MediaLimits::default());
+    let monitors = Msg::Monitors {
+        request: 0,
+        status: tornect_proto::monitor_status::OK,
+        shown: 1,
+        all: false,
+        remapped: false,
+        list: 0,
+        seq: 0,
+        monitors: vec![tornect_proto::MonitorEntry::saturating(
+            true, 0, 0, 1280, 720,
+        )],
+    }
+    .encode();
+    // Type 0x53, then request, list and monitor.
+    let frames: [&[u8]; 4] = [
+        &monitors,
+        &[0, 0, 0, 6, 0x53, 0, 0, 0, 0, 1],
+        &[0, 0, 0, 6, 0x53, 0, 7, 0, 0, 17],
+        &[0, 0, 0, 5, 0x53, 0, 7, 0, 0],
+    ];
+    for (seed, (frame, mode)) in (49..).zip(frames.into_iter().zip([
+        SessionMode::Control,
+        SessionMode::ViewOnly,
+        SessionMode::Control,
+        SessionMode::ViewOnly,
+    ])) {
+        let (_, binding) = start(&rig.host, seed, mode);
+        let (mut client, served) = connect(&rig.host);
+        bind_raw(&mut client, &binding).await;
+        client.write_all(frame).await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), served)
+            .await
+            .unwrap_or_else(|_| panic!("{frame:02x?} did not end the stream"));
+        let MediaOutcome::Served { end, .. } = outcome.unwrap() else {
+            panic!("not served");
+        };
+        assert_eq!(end, MediaEnd::Protocol, "{frame:02x?}");
+        assert_eq!(until_close(&mut client).await, Some(reason::PROTOCOL));
+    }
+}
+
 /// Capture that cannot start refuses the bind, says why, and starts nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_capture_that_cannot_start_refuses_the_bind() {
