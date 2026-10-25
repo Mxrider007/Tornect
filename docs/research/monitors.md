@@ -66,6 +66,35 @@ token issued under `multiple = false`) is **not** here: it needs the GNOME sessi
   per-monitor v2 before it builds its sink (design step 5). The corner clicks on a mixed-DPI rig (150 % and
   100 %, the second monitor left of the primary, so with negative x), through the host's own sink and through
   the helper, stay NEEDS-DEVICE(windows) (design §8, Windows item 4).
+- **How Windows turns a coordinate into a pixel (added 2026-10-25, at the review of steps 4 and 5).** Not
+  documented, but two Windows-side encoders agree on it. Microsoft's own UI Automation proxies
+  (`UIAutomationClientSideProviders/MS/Internal/AutomationProxies/Input.cs`, `Input.SendMouseInput`, read on
+  [source.dot.net](https://source.dot.net/UIAutomationClientSideProviders/MS/Internal/AutomationProxies/Input.cs.html))
+  read the four `SM_*VIRTUALSCREEN` metrics and send `(x − left) · 65536 / width + 65536 / (2 · width)`: "because
+  int math is used, this can end up being rounded into the wrong pixel", so they add half a pixel's worth to land
+  in the middle of it. Chromium (`ui/base/win/event_creation_utils.cc`, `SendMouseEvent`,
+  [googlesource](https://chromium.googlesource.com/chromium/src/+/main/ui/base/win/event_creation_utils.cc))
+  sends `max(1, ceil((x − left) · 65536 / width))` with `kNormalizedScreenSize = 65536.0`, and notes that "as of
+  Windows 10 Fall Creators Update, moving to an absolute position of zero" does not work. Both encode for
+  `pixel = floor(d · width / 65536)`: a cell of `65536 / width` per pixel, and (65535, 65535) is still the last
+  pixel, as the page says. The chain's `0..=65535` scale (`denormalize` rounds `d · (width − 1) / 65535`) is a
+  different scale: sent to Windows as it is, a pixel near the left or top lands one short under that rule, at
+  every pixel below about `width² / (2 · (65536 − width))`. Brute force here over every pixel of every width up
+  to 65 536: 589 545 943 such pixels in all; the last one off is 148 at 4480 wide, 437 at 7680, 1287 at 12 400,
+  2029 at 15 360, 2775 at 17 408, 5927 at 23 040; on 1280 + 3440 + 7680 pixel 1280, Screen 2's first column,
+  lands on 1279, Screen 1's last, and on 1024 + 1024 + 7680 + 7680 pixels 1024 and 2048 land on 1023 and 2047.
+  The Windows sink therefore sends the centre of the pixel's cell, `((2 · pos + 1) · 32768 + (width − 1) / 2) /
+  width`, as UI Automation does but rounded in integers so that the rule gives the pixel back: the same brute
+  force finds no miss at any width up to 65 535, and at 65 536 only pixel 0 (coordinate 1 lands on pixel 1,
+  and coordinate 0 does not move the pointer). The rule itself is the two encoders' reading, not Microsoft's
+  documentation, so the seams stay part of the `rcMonitor` NEEDS-DEVICE(windows) run.
+- **Wine 10.0 and the awareness (observed here).** Under Wine a process starts per-monitor **v1** aware
+  (`GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext())` is 2) and
+  `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` fails with error 87; Wine also lacks
+  `GetDpiAwarenessContextForProcess` (a call aborts the process). v1 and v2 are both
+  `DPI_AWARENESS_PER_MONITOR_AWARE`, unvirtualized; they differ only in how Windows scales windows, which neither
+  the capture nor the injector uses. `become_dpi_aware` therefore asks for v2 and reports whether the thread is
+  per-monitor aware, which a v1 manifest also satisfies.
 
 ## 3. Xvfb and RandR 1.5 `SetMonitor` (probe run here)
 
@@ -150,16 +179,19 @@ and `render`, through winit (`cargo tree -p tornect -e features -i x11rb`), so t
 2. **The X11 test** (design step 14) gives its first RandR monitor the root's output, deletes before it sets a
    name again, and tolerates `BadValue` when it cleans up (§3).
 3. **The administrator helper** becomes per-monitor v2 before it reads the virtual desktop or injects (design
-   step 5; §1 and §2).
+   step 5; §1 and §2), and ends before it says it is ready when it is not per-monitor aware (the review of steps
+   4 and 5).
 4. **The indicator** compares rectangles in physical virtual-screen coordinates on Windows and root coordinates on
    X11 (§4).
 5. **The codec part** (design §5.1, steps 2 and 3) is the quality feature's scaler, which landed first (design
    §10: "whichever spec lands first owns them"): see decision M1-75.
+6. **`SendInput` takes the centre of each pixel's cell**, not the chain's `0..=65535` scale (§2, the review of
+   steps 4 and 5).
 
 ## 6. Still open
 
 | What | Where |
 |---|---|
-| `rcMonitor` at 150 % and 100 % with a monitor at negative x; the corner clicks through `SendInput` and through the helper | NEEDS-DEVICE(windows), design §8 |
+| `rcMonitor` at 150 % and 100 % with a monitor at negative x; the corner clicks through `SendInput` and through the helper; the columns on both sides of every seam and pixel (0, 0) of a virtual desktop at least 12 000 px wide, which tests Windows' conversion rule (§2) | NEEDS-DEVICE(windows), design §8 |
 | `GetMonitors` on a real Xorg with two outputs and a primary set; `xrandr --output X --off` during a session | NEEDS-DEVICE(x11), design §8 |
 | Part 2's portal and PipeWire questions (design step 21) | NEEDS-DEVICE(linux dev VM, GNOME) |
