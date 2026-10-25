@@ -577,6 +577,14 @@ impl MediaBackend for AdminBackend {
         self.helpers.end(session_id);
         self.inner.session_ended(session_id);
     }
+
+    /// The host's own clipboard, at every level: the clipboard is the
+    /// desktop user's, which the administrator helper does not reach. The
+    /// trait's default would share none, and drop the Wayland portal's
+    /// clipboard the inner backend keeps (the services design §6.4).
+    fn open_clipboard(&self, session_id: &str) -> Option<tornect_input::clipboard::ClipboardLink> {
+        self.inner.open_clipboard(session_id)
+    }
 }
 
 #[cfg(windows)]
@@ -912,8 +920,9 @@ mod tests {
         }
     }
 
-    /// The host's own injector, told apart from the helper's.
-    struct Inner(Recording);
+    /// The host's own injector, told apart from the helper's, and the
+    /// sessions it was asked to share its clipboard with.
+    struct Inner(Recording, Arc<Mutex<Vec<String>>>);
 
     impl MediaBackend for Inner {
         /// Refuses, naming the rate it was asked for.
@@ -930,6 +939,14 @@ mod tests {
 
         fn open_injector(&self) -> Option<Box<dyn InputSink>> {
             Some(Box::new(self.0.clone()))
+        }
+
+        fn open_clipboard(
+            &self,
+            session_id: &str,
+        ) -> Option<tornect_input::clipboard::ClipboardLink> {
+            self.1.lock().unwrap().push(session_id.to_owned());
+            Some(tornect_input::clipboard::ClipboardLink::pair().0)
         }
     }
 
@@ -953,6 +970,8 @@ mod tests {
         helpers: Arc<AdminHelpers>,
         backend: AdminBackend,
         own: Recording,
+        /// The sessions the inner backend shared its clipboard with.
+        clipboards: Arc<Mutex<Vec<String>>>,
         kill: KillSwitch,
         audit: Arc<Audit>,
     }
@@ -963,12 +982,17 @@ mod tests {
         let (kill, audit) = (KillSwitch::new(), Arc::new(Audit::default()));
         helpers.wire(kill.clone(), audit.clone(), installed());
         let own = Recording::default();
-        let backend = AdminBackend::new(Arc::new(Inner(own.clone())), Arc::clone(&helpers));
+        let clipboards = Arc::new(Mutex::new(Vec::new()));
+        let backend = AdminBackend::new(
+            Arc::new(Inner(own.clone(), Arc::clone(&clipboards))),
+            Arc::clone(&helpers),
+        );
         Rig {
             launcher,
             helpers,
             backend,
             own,
+            clipboards,
             kill,
             audit,
         }
@@ -1003,6 +1027,24 @@ mod tests {
             .err()
             .expect("the inner backend refuses");
         assert_eq!(refused.to_string(), "capture unavailable: test at 17 fps");
+    }
+
+    /// The services design's test 16: the session services' clipboard is the
+    /// inner backend's, asked for the same session, at the administrator
+    /// level too (where the helper injects); the trait's default would share
+    /// none.
+    #[tokio::test]
+    async fn the_clipboard_is_the_inner_backends() {
+        let rig = rig();
+        assert!(rig.backend.open_clipboard("s5").is_some());
+        attached(&rig, "s6").await;
+        assert!(
+            rig.backend
+                .open_session_injector("s6", Elevation::Admin)
+                .is_some()
+        );
+        assert!(rig.backend.open_clipboard("s6").is_some());
+        assert_eq!(*rig.clipboards.lock().unwrap(), ["s5", "s6"]);
     }
 
     /// The fake pipe end to end: an attached helper becomes the injector of

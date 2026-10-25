@@ -7307,3 +7307,347 @@ fn a_flooding_host_does_not_starve_what_the_viewer_is_joined_with() {
         .expect("the viewer never let the other branch run");
     assert_eq!(ended, "Ok(Stopped)");
 }
+
+/// What the services stream of the session [`start`] registers with `seed`
+/// binds with (the services design §3.3).
+fn services_mac(seed: u8) -> [u8; 32] {
+    tornect_proto::services::services_bind_mac(&[seed; 32], &[!seed; 32])
+}
+
+/// A `Bind` on the media port for the session [`start`] registers with
+/// `seed`, carrying `mac`.
+fn media_bind_with(seed: u8, mac: [u8; 32]) -> Msg {
+    Msg::Bind {
+        session_id: SessionToken::new([seed; 32]).session_id(),
+        mac,
+        quality: quality::BALANCED,
+    }
+}
+
+/// The services design §3.3 and §6.2: a services stream binds once per
+/// session, under the services MAC alone, with nothing waited for. An
+/// unknown session, the media MAC, a MAC over another transcript and a
+/// second bind are refused, and none of them burns the session's services
+/// or its media stream; the services MAC on the media port is refused too,
+/// and burns neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_services_stream_binds_once_under_its_own_mac() {
+    let rig = rig(MediaLimits::default());
+    let (id, binding) = start(&rig.host, 81, SessionMode::Control);
+    let (token, th_final) = ([81; 32], [!81; 32]);
+
+    // Never registered: refused at once, nothing waits for it.
+    let unknown = SessionToken::new([82; 32]).session_id();
+    assert!(
+        rig.host
+            .claim_services(&unknown, &services_mac(82))
+            .is_none()
+    );
+    // The media MAC, and the services MAC over another transcript.
+    let media = tornect_proto::bind_mac(&token, &th_final);
+    assert!(rig.host.claim_services(&id, &media).is_none());
+    let forged = tornect_proto::services::services_bind_mac(&token, &[0; 32]);
+    assert!(rig.host.claim_services(&id, &forged).is_none());
+
+    // The services MAC on the media port: refused, nothing captured.
+    let (mut client, served) = connect(&rig.host);
+    write_msg(&mut client, &media_bind_with(81, services_mac(81)))
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_msg(&mut client).await.unwrap(),
+        Some(Msg::BindRefused { reason: r }) if r == reason::BAD_BIND
+    ));
+    assert_eq!(served.await.unwrap(), MediaOutcome::NotBound);
+    assert_eq!(rig.backend.sources.load(Ordering::SeqCst), 0);
+
+    // None of that burned the services: the right MAC binds, with the
+    // session's signed mode and label, before capture is live.
+    let claim = rig
+        .host
+        .claim_services(&id, &services_mac(81))
+        .expect("the services stream binds");
+    assert_eq!(claim.mode, SessionMode::Control);
+    assert_eq!(claim.label, "Laptop");
+    assert_eq!(*claim.end.borrow(), None);
+    assert_eq!(*claim.capture.borrow(), CaptureState::Pending);
+    // Once only.
+    assert!(rig.host.claim_services(&id, &services_mac(81)).is_none());
+
+    // Nor did the services bind take the media stream's.
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    next_video(&mut client).await;
+    assert!(rig.host.claim_services(&id, &services_mac(81)).is_none());
+    drop(client);
+    assert!(matches!(served.await.unwrap(), MediaOutcome::Served { .. }));
+    assert_eq!(*claim.capture.borrow(), CaptureState::Stopped);
+}
+
+/// A killed session binds no services stream before the FSM ends it, and
+/// an ended one none at all; a services stream bound before hears the end
+/// (`end` set), and with no media stream bound its capture channel closes,
+/// which the services host reads as `Stopped` (the services design §6.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_killed_or_ended_session_binds_no_services_stream() {
+    let rig = rig(MediaLimits::default());
+    let kill = tornect_signal::fsm::host::KillSwitch::new();
+    let watcher = rig.host.watch_kill(kill.clone());
+    let (killed, _) = start(&rig.host, 83, SessionMode::Control);
+    let (ended, _) = start(&rig.host, 84, SessionMode::ViewOnly);
+    let mut before = rig.host.claim_services(&ended, &services_mac(84)).unwrap();
+    assert_eq!(before.mode, SessionMode::ViewOnly);
+
+    kill.kill(bye::PANIC);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while before.end.borrow().is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the kill was not heard"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(*before.end.borrow_and_update(), Some(reason::ENDED_BY_HOST));
+    assert_eq!(rig.host.live(), 2, "the FSM has not ended either yet");
+    assert!(
+        rig.host
+            .claim_services(&killed, &services_mac(83))
+            .is_none()
+    );
+
+    rig.host
+        .on_end(&ended, Some(&SessionEnd::Killed(bye::PANIC)));
+    rig.host.on_end(&killed, None);
+    assert!(
+        rig.host
+            .claim_services(&killed, &services_mac(83))
+            .is_none()
+    );
+    assert!(
+        before.capture.has_changed().is_err(),
+        "the capture channel of an ended session closes"
+    );
+    assert_eq!(
+        *before.capture.borrow(),
+        CaptureState::Pending,
+        "never live"
+    );
+    watcher.abort();
+}
+
+/// Records the capture state its session's services stream would read as
+/// the indicator hears capture start and stop.
+#[derive(Default)]
+struct CaptureAt {
+    capture: Mutex<Option<tokio::sync::watch::Receiver<CaptureState>>>,
+    saw: Mutex<Vec<String>>,
+}
+
+impl CaptureAt {
+    fn note(&self, what: &str) {
+        let state = self.capture.lock().unwrap().as_ref().map(|c| *c.borrow());
+        self.saw.lock().unwrap().push(format!("{what} {state:?}"));
+    }
+}
+
+impl MediaObserver for CaptureAt {
+    fn capture_started(&self, _: &CaptureStarted<'_>) {
+        self.note("started");
+    }
+
+    fn capture_stopped(&self, _: &str, _: &MediaReport, _: &MediaEnd) {
+        self.note("stopped");
+    }
+}
+
+/// The media half of the services design's test 3 (§2.2, §6.2): a session
+/// is `Pending` until its first picture, `Live` before the indicator hears
+/// capture start, and `Stopped` before it hears capture stop, which the
+/// services host turns into `Close{CAPTURE_STOPPED}`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_is_live_from_the_first_picture_and_stopped_before_the_indicator_hears() {
+    let backend = Arc::new(TestBackend::default());
+    let observer = Arc::new(CaptureAt::default());
+    let host = Arc::new(MediaHost::new(
+        backend,
+        observer.clone(),
+        MediaLimits::default(),
+    ));
+    let (id, binding) = start(&host, 85, SessionMode::Control);
+    let claim = host.claim_services(&id, &services_mac(85)).unwrap();
+    *observer.capture.lock().unwrap() = Some(claim.capture.clone());
+    assert_eq!(*claim.capture.borrow(), CaptureState::Pending);
+
+    let (mut client, served) = connect(&host);
+    bind_raw(&mut client, &binding).await;
+    next_video(&mut client).await;
+    assert_eq!(*claim.capture.borrow(), CaptureState::Live { input: true });
+    drop(client);
+    served.await.unwrap();
+    assert_eq!(*claim.capture.borrow(), CaptureState::Stopped);
+    assert_eq!(
+        *observer.saw.lock().unwrap(),
+        [
+            "started Some(Live { input: true })",
+            "stopped Some(Stopped)"
+        ]
+    );
+    // Final: the session is still registered, and nothing makes it live
+    // again (its media stream is single-use).
+    assert_eq!(host.live(), 1);
+    let (late, served) = connect(&host);
+    assert!(MediaViewer::bind(late, &binding, WAIT).await.is_err());
+    assert_eq!(served.await.unwrap(), MediaOutcome::NotBound);
+    assert_eq!(*claim.capture.borrow(), CaptureState::Stopped);
+}
+
+/// `Live { input }` is the media layer's own fact (the services design
+/// §2.1): an injector was built for the session. A view-only session and a
+/// control session with nothing to inject into are live without input; a
+/// control session whose injector cannot follow the picture loses it
+/// (`INPUT_LOST`) and never gets it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_says_whether_the_viewers_input_reaches_the_desktop() {
+    async fn live_of(rig: &Rig, seed: u8, mode: SessionMode) -> CaptureState {
+        let (id, binding) = start(&rig.host, seed, mode);
+        let claim = rig.host.claim_services(&id, &services_mac(seed)).unwrap();
+        let (mut client, served) = connect(&rig.host);
+        bind_raw(&mut client, &binding).await;
+        next_video(&mut client).await;
+        let live = *claim.capture.borrow();
+        drop(client);
+        served.await.unwrap();
+        assert_eq!(*claim.capture.borrow(), CaptureState::Stopped);
+        live
+    }
+    let rig = rig(MediaLimits::default());
+    assert_eq!(
+        live_of(&rig, 86, SessionMode::ViewOnly).await,
+        CaptureState::Live { input: false }
+    );
+    assert_eq!(
+        live_of(&rig, 87, SessionMode::Control).await,
+        CaptureState::Live { input: true }
+    );
+    let rig = rig_with(
+        TestBackend {
+            no_injector: true,
+            ..TestBackend::default()
+        },
+        MediaLimits::default(),
+    );
+    assert_eq!(
+        live_of(&rig, 88, SessionMode::Control).await,
+        CaptureState::Live { input: false }
+    );
+
+    // INPUT_LOST mid-session.
+    let (rig, layout) = shifting_rig(two_screens(Selection::Monitor(1)));
+    let (id, binding) = start(&rig.host, 89, SessionMode::Control);
+    let claim = rig.host.claim_services(&id, &services_mac(89)).unwrap();
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    next_monitors(&mut client).await;
+    assert_eq!(*claim.capture.borrow(), CaptureState::Live { input: true });
+    rig.backend.recorder.refuses.store(true, Ordering::SeqCst);
+    *layout.lock().unwrap() = two_screens(Selection::Monitor(2));
+    next_monitors(&mut client).await;
+    assert_eq!(*claim.capture.borrow(), CaptureState::Live { input: false });
+    // Back on the first screen, with an injector that would follow again:
+    // the input stays lost.
+    rig.backend.recorder.refuses.store(false, Ordering::SeqCst);
+    *layout.lock().unwrap() = two_screens(Selection::Monitor(1));
+    next_monitors(&mut client).await;
+    sync(&mut client, 1).await;
+    assert_eq!(*claim.capture.borrow(), CaptureState::Live { input: false });
+    drop(client);
+    served.await.unwrap();
+    assert_eq!(*claim.capture.borrow(), CaptureState::Stopped);
+}
+
+/// Capture that never starts ends `Pending` as `Stopped`, never `Live`:
+/// a source that fails to open, and a session that ends while its source
+/// opens (the media stream returns before its first picture).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_that_never_starts_is_stopped_without_being_live() {
+    let rig = rig_with(
+        TestBackend {
+            fail: true,
+            ..TestBackend::default()
+        },
+        MediaLimits::default(),
+    );
+    let (id, binding) = start(&rig.host, 90, SessionMode::Control);
+    let claim = rig.host.claim_services(&id, &services_mac(90)).unwrap();
+    let (mut client, served) = connect(&rig.host);
+    write_msg(&mut client, &binding.msg()).await.unwrap();
+    assert!(matches!(served.await.unwrap(), MediaOutcome::NotStarted(_)));
+    assert_eq!(*claim.capture.borrow(), CaptureState::Stopped);
+    assert!(
+        rig.seen.lines().is_empty(),
+        "no capture started or stopped: {:?}",
+        rig.seen.lines()
+    );
+
+    let rig = rig_with(
+        TestBackend {
+            open_waits: true,
+            ..TestBackend::default()
+        },
+        MediaLimits::default(),
+    );
+    let (id, binding) = start(&rig.host, 91, SessionMode::Control);
+    let claim = rig.host.claim_services(&id, &services_mac(91)).unwrap();
+    let (mut client, served) = connect(&rig.host);
+    write_msg(&mut client, &binding.msg()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while rig.backend.sources.load(Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "no open started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(*claim.capture.borrow(), CaptureState::Pending);
+    rig.host.on_end(&id, None);
+    assert!(matches!(
+        tokio::time::timeout(WAIT, served).await.unwrap().unwrap(),
+        MediaOutcome::NotStarted(_)
+    ));
+    assert_eq!(*claim.capture.borrow(), CaptureState::Stopped);
+    assert_eq!(*claim.end.borrow(), Some(reason::SESSION_OVER));
+}
+
+/// The drop guard (the services design §6.2): a media stream that panics,
+/// or whose task is dropped, still says `Stopped`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_media_stream_that_panics_or_is_dropped_says_stopped() {
+    /// An indicator that fails at capture start.
+    struct Panics;
+    impl MediaObserver for Panics {
+        fn capture_started(&self, _: &CaptureStarted<'_>) {
+            panic!("the indicator failed");
+        }
+        fn capture_stopped(&self, _: &str, _: &MediaReport, _: &MediaEnd) {}
+    }
+    let host = Arc::new(MediaHost::new(
+        Arc::new(TestBackend::default()),
+        Arc::new(Panics),
+        MediaLimits::default(),
+    ));
+    let (id, binding) = start(&host, 92, SessionMode::Control);
+    let claim = host.claim_services(&id, &services_mac(92)).unwrap();
+    let (mut client, served) = connect(&host);
+    write_msg(&mut client, &binding.msg()).await.unwrap();
+    let panicked = tokio::time::timeout(WAIT, served).await.unwrap();
+    assert!(panicked.unwrap_err().is_panic());
+    assert_eq!(*claim.capture.borrow(), CaptureState::Stopped);
+
+    let rig = rig(MediaLimits::default());
+    let (id, binding) = start(&rig.host, 93, SessionMode::Control);
+    let claim = rig.host.claim_services(&id, &services_mac(93)).unwrap();
+    let (mut client, served) = connect(&rig.host);
+    bind_raw(&mut client, &binding).await;
+    next_video(&mut client).await;
+    assert_eq!(*claim.capture.borrow(), CaptureState::Live { input: true });
+    served.abort();
+    assert!(served.await.unwrap_err().is_cancelled());
+    assert_eq!(*claim.capture.borrow(), CaptureState::Stopped);
+}

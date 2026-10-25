@@ -68,6 +68,7 @@ use tornect_codec::scale::Scaler;
 use tornect_core::config::{Media, QualityPreset};
 use tornect_core::levels::Elevation;
 use tornect_core::session_log::SessionMode;
+use tornect_input::clipboard::ClipboardLink;
 use tornect_input::{InputEvent, InputSink, Tracked, Viewport};
 use tornect_proto::{
     ALL_MONITORS, BIND_TYPE, MAX_CLIENT_FRAME, MAX_FRAME, MAX_MONITORS, MonitorEntry, Msg,
@@ -283,6 +284,18 @@ pub trait MediaBackend: Send + Sync {
     fn session_ended(&self, session_id: &str) {
         let _ = session_id;
     }
+
+    /// The link to this computer's clipboard for the control session
+    /// `session_id`, whose injector was built (the services design §6.4);
+    /// `None` when this host cannot share its clipboard there. It may block
+    /// (the services host calls it on a blocking thread, bounded by 5 s) and
+    /// is asked at most once per session, only after the session's capture is
+    /// [`CaptureState::Live`] with its input. The default shares nothing; a
+    /// backend that wraps another forwards it.
+    fn open_clipboard(&self, session_id: &str) -> Option<ClipboardLink> {
+        let _ = session_id;
+        None
+    }
 }
 
 /// Where the host reports capture starting and stopping. This is the source
@@ -446,6 +459,90 @@ pub enum MediaOutcome {
     },
 }
 
+/// Where a session's capture is, as its services stream follows it (the
+/// services design §2.2, §6.2): services answer nothing before capture is
+/// live, offer files and the clipboard only while the viewer's input reaches
+/// the desktop, and end when capture stops.
+///
+/// A session starts `Pending`. Its media stream makes it `Live` right
+/// before the observer hears `capture_started`, with whether an injector
+/// was built for it; once that injector cannot follow a change of the
+/// screen shown and is dropped ([`notice::INPUT_LOST`]), `Live { input:
+/// true }` becomes `Live { input: false }`, never back. `Stopped` comes on
+/// every exit of the media stream, before the observer hears
+/// `capture_stopped` (a drop guard: the end of the loop, each return before
+/// the first picture, a panic, the stream's task dropped), and it is final.
+/// A session whose media stream never bound reads as `Stopped` once it
+/// ends: its channel closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureState {
+    /// No picture has gone out yet.
+    Pending,
+    /// Pictures go out; `input`: the viewer's input reaches this desktop.
+    Live {
+        /// An injector serves the session's input.
+        input: bool,
+    },
+    /// Capture stopped, or never started.
+    Stopped,
+}
+
+/// A session's capture state, which the media stream publishes and the
+/// services stream follows. Dropping it says `Stopped`, so every way out of
+/// the media stream, a panic included, says it.
+struct CaptureMark(Arc<watch::Sender<CaptureState>>);
+
+impl CaptureMark {
+    /// Pictures go out, with the viewer's input reaching the desktop or not.
+    fn live(&self, input: bool) {
+        self.0.send_replace(CaptureState::Live { input });
+    }
+
+    /// The session's injector was dropped: its input ends for good.
+    fn input_lost(&self) {
+        self.0.send_if_modified(|state| {
+            let lost = matches!(state, CaptureState::Live { input: true });
+            if lost {
+                *state = CaptureState::Live { input: false };
+            }
+            lost
+        });
+    }
+}
+
+impl Drop for CaptureMark {
+    fn drop(&mut self) {
+        self.0.send_replace(CaptureState::Stopped);
+    }
+}
+
+/// Which of a session's bound streams a bind is for: each binds once, under
+/// its own MAC (the services design §3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    /// `MEDIA_PORT`: [`tornect_proto::bind_mac`].
+    Media,
+    /// `SERVICES_PORT`: [`tornect_proto::services::services_bind_mac`].
+    // The services host (the design's step 12) binds with it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Services,
+}
+
+/// A services stream's successful bind ([`MediaHost::claim_services`]).
+// The services host (the design's step 12) is its caller.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ServicesClaim {
+    /// Control or view-only, as signed in the accept.
+    pub(crate) mode: SessionMode,
+    /// The viewer's pinned label.
+    pub(crate) label: String,
+    /// Set to the `Close` reason when the session ends, as the media
+    /// stream's.
+    pub(crate) end: watch::Receiver<Option<u16>>,
+    /// The session's capture state; a closed channel reads as `Stopped`.
+    pub(crate) capture: watch::Receiver<CaptureState>,
+}
+
 /// A session the FSM accepted, as the media layer keeps it.
 struct Registered {
     token: SessionToken,
@@ -455,6 +552,10 @@ struct Registered {
     elevation: Elevation,
     label: String,
     bound: bool,
+    /// Its services stream is bound: one per session, never again.
+    services_bound: bool,
+    /// Its capture state, published by its media stream ([`CaptureMark`]).
+    capture: Arc<watch::Sender<CaptureState>>,
     /// A control session whose stream is served with no injector: its
     /// viewer's input reaches nothing here.
     no_input: bool,
@@ -471,6 +572,7 @@ struct Claimed {
     elevation: Elevation,
     label: String,
     end: watch::Receiver<Option<u16>>,
+    capture: Arc<watch::Sender<CaptureState>>,
 }
 
 enum Lookup {
@@ -645,7 +747,7 @@ impl MediaHost {
                 return MediaOutcome::NotBound;
             }
         };
-        let claimed = match self.try_claim(&session_id, &mac) {
+        let claimed = match self.try_claim(&session_id, &mac, StreamKind::Media) {
             Lookup::Bound(claimed) => Some(claimed),
             Lookup::Refused => None,
             // Its session may simply not be registered yet. Only `max_waiting`
@@ -689,7 +791,7 @@ impl MediaHost {
             tokio::pin!(registered);
             // Armed before the look-up, so an `on_start` in between still wakes us.
             registered.as_mut().enable();
-            match self.try_claim(session_id, mac) {
+            match self.try_claim(session_id, mac, StreamKind::Media) {
                 Lookup::Bound(claimed) => return Some(claimed),
                 Lookup::Refused => return None,
                 Lookup::Unknown => registered.await,
@@ -697,28 +799,65 @@ impl MediaHost {
         }
     }
 
-    fn try_claim(&self, session_id: &str, mac: &[u8; 32]) -> Lookup {
+    fn try_claim(&self, session_id: &str, mac: &[u8; 32], kind: StreamKind) -> Lookup {
         let mut sessions = self.lock();
         let Some(session) = sessions.get_mut(session_id) else {
             return Lookup::Unknown;
         };
-        // One media stream per session (SLICE-A1 G3, A2-3), and none for a
-        // session already ended by a kill whose `on_end` has not come yet.
-        if session.bound || session.end.borrow().is_some() {
+        let bound = match kind {
+            StreamKind::Media => session.bound,
+            StreamKind::Services => session.services_bound,
+        };
+        // One stream of each kind per session (SLICE-A1 G3, A2-3; the
+        // services design §3.3), and none for a session already ended by a
+        // kill whose `on_end` has not come yet.
+        if bound || session.end.borrow().is_some() {
             return Lookup::Refused;
         }
         // A wrong MAC leaves the session unbound: a peer that knows a session
-        // id but not its token cannot lock the real viewer out.
-        if !tornect_proto::bind_mac_ok(session.token.bytes(), &session.th_final, mac) {
+        // id but not its token cannot lock the real viewer out. Each kind
+        // has its own MAC, so one stream's bind never binds the other.
+        let (token, th_final) = (session.token.bytes(), &session.th_final);
+        let verified = match kind {
+            StreamKind::Media => tornect_proto::bind_mac_ok(token, th_final, mac),
+            StreamKind::Services => {
+                tornect_proto::services::services_bind_mac_ok(token, th_final, mac)
+            }
+        };
+        if !verified {
             return Lookup::Refused;
         }
-        session.bound = true;
+        match kind {
+            StreamKind::Media => session.bound = true,
+            StreamKind::Services => session.services_bound = true,
+        }
         Lookup::Bound(Claimed {
             mode: session.mode,
             elevation: session.elevation,
             label: session.label.clone(),
             end: session.end.subscribe(),
+            capture: Arc::clone(&session.capture),
         })
+    }
+
+    /// Bind a services stream to `session_id` with `mac` (the services
+    /// design §3.3, §6.2): only a session registered and not ended, whose
+    /// services stream is not bound yet, under the services MAC. Nothing
+    /// waits: the viewer opens its services stream only after its media
+    /// stream's `BindOk`, so an unknown session is refused at once. A wrong
+    /// MAC leaves the session's services unbound.
+    // The services host (the design's step 12) is its caller.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn claim_services(&self, session_id: &str, mac: &[u8; 32]) -> Option<ServicesClaim> {
+        match self.try_claim(session_id, mac, StreamKind::Services) {
+            Lookup::Bound(claimed) => Some(ServicesClaim {
+                mode: claimed.mode,
+                label: claimed.label,
+                end: claimed.end,
+                capture: claimed.capture.subscribe(),
+            }),
+            Lookup::Refused | Lookup::Unknown => None,
+        }
     }
 
     /// A bound stream: capture, serve, tear down.
@@ -739,8 +878,12 @@ impl MediaHost {
             elevation,
             label,
             mut end,
+            capture,
         } = claimed;
         let Stream { route, preset } = stream;
+        // `Stopped` on every way out of here, a panic included (the services
+        // design §2.2).
+        let mark = CaptureMark(capture);
 
         // Capture starts here, after a verified bind (§B.6, decision M1-39).
         // The open's cancel is made before the open, and belongs to it alone:
@@ -856,6 +999,7 @@ impl MediaHost {
                 session.no_input = true;
             }
         }
+        mark.live(injector.is_some());
         self.observer.capture_started(&CaptureStarted {
             session_id: &session_id,
             label: &label,
@@ -893,6 +1037,7 @@ impl MediaHost {
             pong_owed: None,
             session_id: &session_id,
             screens: Screens::new(&self.limits, epoch),
+            capture: &mark,
         };
         let mut seq: u32 = 0;
         let mut pending = Some(first);
@@ -1065,11 +1210,13 @@ impl MediaHost {
             }
         };
 
-        // Release what the viewer holds first, then stop capture: both before
-        // anything is said about the end.
+        // The services stream hears it first (they close at once), then what
+        // the viewer holds is released and capture stops: all before anything
+        // is said about the end.
         let Served {
             injector, report, ..
         } = served;
+        drop(mark);
         drop(injector);
         pipeline.stop().await;
         reader.abort();
@@ -1146,6 +1293,7 @@ impl MediaHost {
             if let Some(session) = self.lock().get_mut(served.session_id) {
                 session.input_lost = true;
             }
+            served.capture.input_lost();
         }
         let screens = &mut served.screens;
         if remapped {
@@ -1206,6 +1354,7 @@ impl MediaHost {
 impl SessionSink for MediaHost {
     fn on_start(&self, session: &LiveSession<'_>) {
         let (end, _) = watch::channel(None);
+        let (capture, _) = watch::channel(CaptureState::Pending);
         self.lock().insert(
             session.session_id.to_owned(),
             Registered {
@@ -1215,6 +1364,8 @@ impl SessionSink for MediaHost {
                 elevation: session.elevation,
                 label: session.label.to_owned(),
                 bound: false,
+                services_bound: false,
+                capture: Arc::new(capture),
                 no_input: false,
                 input_lost: false,
                 end,
@@ -1569,6 +1720,10 @@ struct Served<'a> {
     session_id: &'a str,
     /// What the pictures show, and the remap barrier.
     screens: Screens,
+    /// The session's capture state, told when the injector is dropped
+    /// (`Live { input: false }`, which stops the session services' input
+    /// lane).
+    capture: &'a CaptureMark,
 }
 
 /// A control session's injector: the backend's sink behind a [`Viewport`]
@@ -3372,6 +3527,7 @@ mod tests {
         let (_frames, mut inbound) = mpsc::channel(1);
         let (_heard, heard) = watch::channel(tokio::time::Instant::now());
         let t0 = Instant::now();
+        let mark = CaptureMark(Arc::new(watch::channel(CaptureState::Pending).0));
         let mut served = Served {
             injector: None,
             quiet: Quiet::new(Duration::from_secs(3), heard),
@@ -3393,6 +3549,7 @@ mod tests {
             pong_owed: None,
             session_id: "s",
             screens: Screens::new(&MediaLimits::default(), t0),
+            capture: &mark,
         };
         let fast = tornect_proto::quality::BEST_PERFORMANCE;
         served.quality.gate.request(fast);
@@ -3435,6 +3592,7 @@ mod tests {
         let (_heard, heard) = watch::channel(tokio::time::Instant::now());
         let t0 = Instant::now();
         let at = |d: Duration| tokio::time::Instant::from_std(t0 + d);
+        let mark = CaptureMark(Arc::new(watch::channel(CaptureState::Pending).0));
         let mut served = Served {
             injector: None,
             quiet: Quiet::new(Duration::from_secs(3), heard),
@@ -3456,6 +3614,7 @@ mod tests {
             pong_owed: None,
             session_id: "s",
             screens: Screens::new(&MediaLimits::default(), t0),
+            capture: &mark,
         };
         let code = tornect_proto::quality::BEST_PERFORMANCE;
 

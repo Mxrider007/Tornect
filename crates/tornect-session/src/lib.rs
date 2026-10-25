@@ -33,6 +33,8 @@
 //! | a host of another version is said to be one (the quality design §4.7) | [`ViewerError::Version`] |
 //! | input made against an earlier picture never lands on a remapped screen (the monitors design's H5) | the `VideoAck` barrier in [`MediaHost`]; an injector that cannot follow the picture ends the session's input (`notice::INPUT_LOST`) |
 //! | a viewer's choice of screen costs the host one switch at a time, and the viewer never waits on it for good (the monitors design's H2, V1, V3) | the host's budget and `switch_answer`; [`MediaViewer::run_with`] sends one request at a time and gives it up after [`SWITCH_WAIT`] |
+//! | a session's services follow its capture: nothing before its first picture, files and the clipboard only while the viewer's input reaches the desktop, nothing once capture stops, however it stops (the services design §2.2, §6.2) | [`CaptureState`], which [`MediaHost`] publishes from the media stream (`Stopped` by a drop guard on every exit, a panic included) |
+//! | one services stream per session, bound with its own MAC, never with the media stream's (the services design §3.3) | [`MediaHost`]'s registry |
 //!
 //! Consent gating is structural. A media stream is served only for a session
 //! the FSM accepted, and only to a peer that holds that session's token.
@@ -48,8 +50,8 @@ pub mod viewer;
 
 pub use backend::{DesktopBackend, Source, SystemBackend, TEST_SCREENS};
 pub use host::{
-    CaptureChanged, CaptureStarted, MediaBackend, MediaEnd, MediaHost, MediaLimits, MediaObserver,
-    MediaOutcome, MediaReport, NoObserver, SourceRequest,
+    CaptureChanged, CaptureStarted, CaptureState, MediaBackend, MediaEnd, MediaHost, MediaLimits,
+    MediaObserver, MediaOutcome, MediaReport, NoObserver, SourceRequest,
 };
 pub use viewer::{
     Binding, BoundStream, FrameSink, MediaViewer, SWITCH_WAIT, Screens, ScreensNews,

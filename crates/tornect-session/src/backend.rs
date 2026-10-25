@@ -10,6 +10,7 @@ use std::sync::{Mutex, PoisonError};
 use tokio::sync::watch;
 use tornect_capture::{CaptureError, TestCard, TestScreens, VideoSource};
 use tornect_input::InputSink;
+use tornect_input::clipboard::ClipboardLink;
 
 use crate::host::{MediaBackend, SourceRequest};
 
@@ -69,7 +70,56 @@ pub struct SystemBackend {
     /// closes; it is dropped when the injector is built, when the session
     /// turns out view-only, and when the session ends.
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-    wayland_input: Mutex<Option<tornect_capture::wayland::WaylandInput>>,
+    wayland_input: Mutex<Option<Box<dyn PortalInput>>>,
+    /// The desktop's clipboard on the last Wayland source's portal session,
+    /// taken from its input handle when the injector is built, and only when
+    /// it is: the clipboard goes with the viewer's input the desktop granted,
+    /// never to a session without it (the services design §2.1, §6.4). It
+    /// holds the session weakly, as the input handle does. `open_clipboard`
+    /// takes it; it is dropped when the session turns out view-only, when it
+    /// ends, and when another source opens.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    portal_clipboard: Mutex<Option<Box<dyn PortalClipboard>>>,
+}
+
+/// What the backend keeps of a portal session between its open and its
+/// injector: [`tornect_capture::wayland::WaylandInput`] (a fake in tests).
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+trait PortalInput: Send + std::fmt::Debug {
+    /// The injector into the session; refused when the desktop did not
+    /// grant the viewer's input or the session is over.
+    fn sink(&self) -> Result<Box<dyn InputSink>, CaptureError>;
+
+    /// The session's clipboard, when it was asked for and the desktop
+    /// shares it.
+    fn clip(&self) -> Option<Box<dyn PortalClipboard>>;
+}
+
+/// A portal session's clipboard:
+/// [`tornect_capture::wayland::WaylandClipboard`] (a fake in tests).
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+trait PortalClipboard: Send + std::fmt::Debug {
+    /// The link to it, once per portal session.
+    fn link(self: Box<Self>) -> Result<ClipboardLink, CaptureError>;
+}
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+impl PortalInput for tornect_capture::wayland::WaylandInput {
+    fn sink(&self) -> Result<Box<dyn InputSink>, CaptureError> {
+        Ok(Box::new(self.injector()?))
+    }
+
+    fn clip(&self) -> Option<Box<dyn PortalClipboard>> {
+        self.clipboard()
+            .map(|clipboard| Box::new(clipboard) as Box<dyn PortalClipboard>)
+    }
+}
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+impl PortalClipboard for tornect_capture::wayland::WaylandClipboard {
+    fn link(self: Box<Self>) -> Result<ClipboardLink, CaptureError> {
+        tornect_capture::wayland::WaylandClipboard::link(*self)
+    }
 }
 
 impl SystemBackend {
@@ -83,6 +133,8 @@ impl SystemBackend {
             wayland_clipboard: false,
             #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
             wayland_input: Mutex::new(None),
+            #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+            portal_clipboard: Mutex::new(None),
         }
     }
 
@@ -149,21 +201,57 @@ impl MediaBackend for SystemBackend {
 
     /// Drops the Wayland input handle a session that never got its injector
     /// left behind (its viewer left, or the session ended, between the open
-    /// and the injector): nothing is kept for a session that is over. One
-    /// session is served at a time, so the handle kept is that session's.
+    /// and the injector), and the portal clipboard its services never took:
+    /// nothing is kept for a session that is over. One session is served at
+    /// a time, so what is kept is that session's.
     fn session_ended(&self, _session_id: &str) {
         self.forget_input();
+    }
+
+    /// The test card and screens share no clipboard. The desktop's is the
+    /// portal's on Wayland, and only for a session whose injector was built
+    /// there; it is arboard's on an X11 session under the X11 injector's own
+    /// gate (this machine's own display), and on Windows (the services
+    /// design §6.4). One session is served at a time, so what is kept is
+    /// that session's.
+    fn open_clipboard(&self, _session_id: &str) -> Option<ClipboardLink> {
+        match self.source {
+            Source::TestCard | Source::TestScreens => None,
+            Source::Desktop => self.desktop_clipboard(),
+        }
     }
 }
 
 impl SystemBackend {
-    /// Let go of the last Wayland source's input handle, if it is still kept.
+    /// Let go of the last Wayland source's input handle and portal
+    /// clipboard, if they are still kept.
     fn forget_input(&self) {
         #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-        self.wayland_input
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        {
+            self.wayland_input
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            self.portal_clipboard
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+        }
+    }
+}
+
+/// The link of the X11 and Windows clipboard backend, or `None` and why
+/// (said at WARN, which carries no clipboard text).
+#[cfg(any(target_os = "linux", windows))]
+fn arboard_or_none(
+    arboard: impl FnOnce() -> Result<ClipboardLink, tornect_input::clipboard::ClipboardError>,
+) -> Option<ClipboardLink> {
+    match arboard() {
+        Ok(link) => Some(link),
+        Err(e) => {
+            tracing::warn!(error = %e, "this computer's clipboard is not shared");
+            None
+        }
     }
 }
 
@@ -228,6 +316,44 @@ impl SystemBackend {
             Desktop::X11 => None,
         }
     }
+
+    fn desktop_clipboard(&self) -> Option<ClipboardLink> {
+        self.clipboard_on(
+            session_type().as_deref(),
+            std::env::var("DISPLAY").ok().as_deref(),
+            tornect_input::clipboard::arboard_link,
+        )
+    }
+
+    /// The clipboard on a session of type `session` whose `DISPLAY` is
+    /// `display`, with `arboard` the X11 backend's link.
+    fn clipboard_on(
+        &self,
+        session: Option<&str>,
+        display: Option<&str>,
+        arboard: impl FnOnce() -> Result<ClipboardLink, tornect_input::clipboard::ClipboardError>,
+    ) -> Option<ClipboardLink> {
+        match desktop_for(session) {
+            // The portal's clipboard or none: under GNOME Wayland `DISPLAY`
+            // names Xwayland, whose clipboard mirrors the desktop's without
+            // the portal's grant (the services design §4.2), so the X11
+            // backend is never tried here, whether or not the portal shares
+            // its clipboard or `[services] wayland_clipboard` asked for it.
+            Desktop::Wayland => self.wayland_clipboard_link(),
+            // The X11 injector's gate (SLICE-C3 C3-3): a real X11 session,
+            // on this machine's own display, never another machine's.
+            Desktop::X11 if session == Some("x11") => {
+                if !tornect_capture::x11::display_is_local(display) {
+                    tracing::warn!(
+                        "DISPLAY is not this machine's own display: the clipboard is not shared"
+                    );
+                    return None;
+                }
+                arboard_or_none(arboard)
+            }
+            Desktop::X11 => None,
+        }
+    }
 }
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
@@ -244,15 +370,25 @@ impl SystemBackend {
     ) -> Result<Box<dyn VideoSource>, CaptureError> {
         let options = self.wayland_options(request, cancel.clone());
         let (source, input) = tornect_capture::wayland::WaylandSource::open(&options)?;
-        // A session that ended while the open finished gets nothing kept: its
-        // source is dropped unread, and `session_ended` may have run already.
-        if !*cancel.borrow() {
+        self.keep_portal(Box::new(input), *cancel.borrow());
+        Ok(Box::new(source))
+    }
+
+    /// What is kept of the portal session just opened: its input handle,
+    /// unless its session ended while the open finished (`cancelled`: its
+    /// source is dropped unread, and `session_ended` may have run already);
+    /// never an earlier portal session's clipboard.
+    fn keep_portal(&self, input: Box<dyn PortalInput>, cancelled: bool) {
+        self.portal_clipboard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if !cancelled {
             *self
                 .wayland_input
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some(input);
         }
-        Ok(Box::new(source))
     }
 
     /// What a portal session is opened with.
@@ -270,17 +406,40 @@ impl SystemBackend {
 
     /// The injector into the session `wayland_source` opened, mapping the
     /// viewer's pointer over the part of the stream the picture shows
-    /// (SLICE-C1 C1-2, decision M1-74).
+    /// (SLICE-C1 C1-2, decision M1-74). The session's clipboard is kept
+    /// for `open_clipboard` when the injector is built, and only then: the
+    /// input handle it comes from is dropped here.
     fn wayland_injector(&self) -> Option<Box<dyn InputSink>> {
         let input = self
             .wayland_input
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()?;
-        match input.injector() {
-            Ok(injector) => Some(Box::new(injector)),
+        let (injector, clipboard) = match input.sink() {
+            Ok(injector) => (Some(injector), input.clip()),
             Err(e) => {
                 tracing::warn!(error = %e, "the viewer's input is dropped");
+                (None, None)
+            }
+        };
+        *self
+            .portal_clipboard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = clipboard;
+        injector
+    }
+
+    /// The link to the clipboard `wayland_injector` kept, once.
+    fn wayland_clipboard_link(&self) -> Option<ClipboardLink> {
+        let clipboard = self
+            .portal_clipboard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()?;
+        match clipboard.link() {
+            Ok(link) => Some(link),
+            Err(e) => {
+                tracing::warn!(error = %e, "the desktop's clipboard is not shared");
                 None
             }
         }
@@ -302,6 +461,10 @@ impl SystemBackend {
     fn wayland_injector(&self) -> Option<Box<dyn InputSink>> {
         None
     }
+
+    fn wayland_clipboard_link(&self) -> Option<ClipboardLink> {
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -319,6 +482,10 @@ impl SystemBackend {
     fn desktop_injector(&self) -> Option<Box<dyn InputSink>> {
         Some(Box::new(tornect_input::windows::SendInputSink::new()))
     }
+
+    fn desktop_clipboard(&self) -> Option<ClipboardLink> {
+        arboard_or_none(tornect_input::clipboard::arboard_link)
+    }
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -334,6 +501,10 @@ impl SystemBackend {
     }
 
     fn desktop_injector(&self) -> Option<Box<dyn InputSink>> {
+        None
+    }
+
+    fn desktop_clipboard(&self) -> Option<ClipboardLink> {
         None
     }
 }
@@ -610,8 +781,9 @@ mod tests {
     }
 
     /// SLICE-C3 C3-3 at its call sites: on an X11 session whose `DISPLAY` has
-    /// a host part, the desktop backend neither captures nor injects, and
-    /// never connects to that display. A child run of this test gets that
+    /// a host part, the desktop backend neither captures nor injects, nor
+    /// shares that display's clipboard (the services design §6.4), and never
+    /// connects to that display. A child run of this test gets that
     /// environment; here a listener plays the other machine's X server, and
     /// nothing may reach it.
     #[cfg(target_os = "linux")]
@@ -631,6 +803,7 @@ mod tests {
                 "{refused}"
             );
             assert!(backend.open_injector().is_none());
+            assert!(backend.open_clipboard("s").is_none());
             return;
         }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -675,5 +848,249 @@ mod tests {
             "the child run: {said}{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// A test source has no desktop behind it, and so no clipboard.
+    #[test]
+    fn the_test_sources_share_no_clipboard() {
+        for source in [Source::TestCard, Source::TestScreens] {
+            assert!(SystemBackend::new(source).open_clipboard("s").is_none());
+        }
+    }
+
+    /// A portal session as the backend keeps it: whether the desktop granted
+    /// the viewer's input, whether it shares its clipboard, and whether the
+    /// session is over; it counts the links its clipboard made.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[derive(Debug, Clone, Default)]
+    struct FakePortal {
+        granted: bool,
+        clipboard: bool,
+        over: bool,
+        links: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    impl FakePortal {
+        fn granted(clipboard: bool) -> Self {
+            Self {
+                granted: true,
+                clipboard,
+                ..Self::default()
+            }
+        }
+
+        fn links(&self) -> usize {
+            self.links.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    impl PortalInput for FakePortal {
+        fn sink(&self) -> Result<Box<dyn InputSink>, CaptureError> {
+            if self.over || !self.granted {
+                return Err(CaptureError::Unavailable("no remote interaction".into()));
+            }
+            Ok(Box::new(NoSink))
+        }
+
+        fn clip(&self) -> Option<Box<dyn PortalClipboard>> {
+            self.clipboard
+                .then(|| Box::new(self.clone()) as Box<dyn PortalClipboard>)
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    impl PortalClipboard for FakePortal {
+        fn link(self: Box<Self>) -> Result<ClipboardLink, CaptureError> {
+            if self.over {
+                return Err(CaptureError::Unavailable("the session has ended".into()));
+            }
+            self.links.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ClipboardLink::pair().0)
+        }
+    }
+
+    /// Injects nothing.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    struct NoSink;
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    impl InputSink for NoSink {
+        fn inject(
+            &mut self,
+            _: &tornect_input::InputEvent,
+        ) -> Result<(), tornect_input::InputError> {
+            Ok(())
+        }
+    }
+
+    /// The X11 backend's link, which a Wayland host must never open.
+    #[cfg(target_os = "linux")]
+    fn no_arboard() -> Result<ClipboardLink, tornect_input::clipboard::ClipboardError> {
+        panic!("arboard_link was opened")
+    }
+
+    /// The clipboard a Wayland session of this backend shares.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    fn wayland_clipboard(backend: &SystemBackend) -> Option<ClipboardLink> {
+        backend.clipboard_on(Some("wayland"), Some(":0"), no_arboard)
+    }
+
+    /// The services design §6.4 and its test 16: the portal's clipboard goes
+    /// with the viewer's input and only with it. It is kept when the
+    /// injector is built, before its input handle is dropped, and never when
+    /// the desktop left remote interaction off; it links once; a view-only
+    /// session, the session's end and the next portal session drop it.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn the_portal_clipboard_goes_with_the_viewers_input_only() {
+        let backend = SystemBackend::new(Source::Desktop);
+        let portal = FakePortal::granted(true);
+        backend.keep_portal(Box::new(portal.clone()), false);
+        assert!(wayland_clipboard(&backend).is_none(), "before the injector");
+        assert!(backend.wayland_injector().is_some());
+        assert!(wayland_clipboard(&backend).is_some());
+        assert!(wayland_clipboard(&backend).is_none(), "once");
+        assert_eq!(portal.links(), 1);
+
+        // Remote interaction off: no injector, and so no clipboard.
+        let portal = FakePortal {
+            clipboard: true,
+            ..FakePortal::default()
+        };
+        backend.keep_portal(Box::new(portal.clone()), false);
+        assert!(backend.wayland_injector().is_none());
+        assert!(wayland_clipboard(&backend).is_none());
+        assert_eq!(portal.links(), 0);
+
+        // The clipboard not asked for (`[services] wayland_clipboard` off),
+        // or not shared by the desktop: input, and no clipboard.
+        backend.keep_portal(Box::new(FakePortal::granted(false)), false);
+        assert!(backend.wayland_injector().is_some());
+        assert!(wayland_clipboard(&backend).is_none());
+
+        // View-only: neither.
+        let portal = FakePortal::granted(true);
+        backend.keep_portal(Box::new(portal.clone()), false);
+        backend.view_only();
+        assert!(backend.wayland_injector().is_none());
+        assert!(wayland_clipboard(&backend).is_none());
+
+        // The session ends before its services take the clipboard.
+        backend.keep_portal(Box::new(portal.clone()), false);
+        assert!(backend.wayland_injector().is_some());
+        backend.session_ended("s");
+        assert!(wayland_clipboard(&backend).is_none());
+
+        // The next portal session opens: the last one's clipboard is not
+        // its. One that ended while it opened keeps nothing.
+        backend.keep_portal(Box::new(portal.clone()), false);
+        assert!(backend.wayland_injector().is_some());
+        let next = FakePortal::granted(true);
+        backend.keep_portal(Box::new(next.clone()), true);
+        assert!(wayland_clipboard(&backend).is_none());
+        assert!(backend.wayland_injector().is_none());
+        assert_eq!((portal.links(), next.links()), (0, 0));
+
+        // A portal session over by the time its clipboard is asked for.
+        let over = FakePortal {
+            over: true,
+            ..FakePortal::granted(true)
+        };
+        backend.keep_portal(Box::new(FakePortal::granted(true)), false);
+        assert!(backend.wayland_injector().is_some());
+        *backend.portal_clipboard.lock().unwrap() = over.clip();
+        assert!(wayland_clipboard(&backend).is_none());
+    }
+
+    /// A Wayland host never opens the X11 clipboard backend, whatever its
+    /// `DISPLAY` (GNOME's names Xwayland) and whether or not the portal
+    /// shares its clipboard or `[services] wayland_clipboard` asked for it
+    /// (the services design §4.2): `no_arboard` would panic.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn a_wayland_host_never_opens_the_x11_clipboard() {
+        let paths = tornect_core::Paths::from_home(PathBuf::from("/nonexistent/tornect-home"));
+        for switch in [false, true] {
+            let backend = SystemBackend::new(Source::Desktop).with_portal(&paths, switch);
+            for display in [Some(":0"), Some(":1"), Some("localhost:10.0"), None] {
+                let on = |backend: &SystemBackend| {
+                    backend.clipboard_on(Some("wayland"), display, no_arboard)
+                };
+                assert!(on(&backend).is_none(), "no portal session");
+                backend.keep_portal(Box::new(FakePortal::granted(false)), false);
+                assert!(backend.wayland_injector().is_some());
+                assert!(on(&backend).is_none(), "the portal shares none");
+                backend.keep_portal(Box::new(FakePortal::granted(true)), false);
+                assert!(backend.wayland_injector().is_some());
+                assert!(on(&backend).is_some(), "the portal's");
+            }
+        }
+    }
+
+    /// The X11 clipboard opens under the X11 injector's gate and nowhere
+    /// else: an X11 session on this machine's own display, never another
+    /// machine's, never a session that is neither X11 nor Wayland; a backend
+    /// that does not open shares nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_x11_clipboard_opens_only_where_the_x11_injector_would() {
+        let calls = std::cell::Cell::new(0);
+        let arboard = || {
+            calls.set(calls.get() + 1);
+            Ok(ClipboardLink::pair().0)
+        };
+        let backend = SystemBackend::new(Source::Desktop);
+        assert!(
+            backend
+                .clipboard_on(Some("x11"), Some(":0"), arboard)
+                .is_some()
+        );
+        assert_eq!(calls.get(), 1);
+        for (session, display) in [
+            (Some("x11"), Some("localhost:10.0")),
+            (Some("x11"), Some("otherhost:0")),
+            (Some("x11"), None),
+            (Some("tty"), Some(":0")),
+            (Some(""), Some(":0")),
+            (None, Some(":0")),
+        ] {
+            assert!(
+                backend.clipboard_on(session, display, arboard).is_none(),
+                "{session:?} {display:?}"
+            );
+        }
+        assert_eq!(calls.get(), 1, "opened outside the gate");
+        let refused = || {
+            Err(tornect_input::clipboard::ClipboardError::Unavailable(
+                "no X display",
+            ))
+        };
+        assert!(
+            backend
+                .clipboard_on(Some("x11"), Some(":0"), refused)
+                .is_none()
+        );
+    }
+
+    /// The wiring to the real X11 backend: on an X11 session on this
+    /// machine's own display, the desktop's clipboard is arboard's link, new
+    /// and inactive. Under an X server: `xvfb-run -a env XDG_SESSION_TYPE=x11
+    /// cargo test -p tornect-session --lib backend::tests::on_an_x11 --
+    /// --ignored`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs an X server (Xvfb)"]
+    fn on_an_x11_session_the_desktop_clipboard_is_arboards() {
+        assert_eq!(
+            std::env::var("XDG_SESSION_TYPE").as_deref(),
+            Ok("x11"),
+            "run under `env XDG_SESSION_TYPE=x11`"
+        );
+        let link = SystemBackend::new(Source::Desktop)
+            .open_clipboard("s")
+            .expect("arboard's link on this display");
+        assert!(!*link.active.borrow(), "a new link is inactive");
     }
 }
