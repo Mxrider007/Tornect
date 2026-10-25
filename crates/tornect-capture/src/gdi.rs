@@ -122,7 +122,7 @@ fn desktop_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> {
 
 /// The desktop's monitors as Windows lists them, keyed by device name, in
 /// the order of the enumeration (the chooser sorts them), at most
-/// [`MAX_FOUND`]. None when the enumeration fails: the virtual desktop is
+/// [`MAX_FOUND`]. Empty when the enumeration fails: the virtual desktop is
 /// then the one monitor.
 fn monitors() -> Vec<Found<Device>> {
     let mut found: Vec<Found<Device>> = Vec::with_capacity(MAX_FOUND);
