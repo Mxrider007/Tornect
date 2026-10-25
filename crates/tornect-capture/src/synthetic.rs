@@ -1,14 +1,17 @@
 //! A synthetic test card: the capture source every machine has, for the
-//! pipeline tests and for sessions on hosts without a capture backend.
+//! pipeline tests and for sessions on hosts without a capture backend; and
+//! [`TestScreens`], synthetic monitors side by side to switch between.
 //!
 //! The card carries its own frame index in a strip of 32 black-or-white
 //! blocks along the bottom edge, large enough to survive H.264 and a scale
 //! down to a third, so a viewer can check order and loss end to end
 //! ([`TestCard::read_index`], [`TestCard::read_index_scaled`]).
 
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use crate::{CaptureError, Frame, VideoSource};
+use crate::monitors::{Chooser, Found, Resolved};
+use crate::{CaptureError, Frame, Layout, Rect, Selection, VideoSource};
 
 /// Smallest card: the index strip needs 32 blocks of at least 8 pixels.
 pub const MIN_WIDTH: u32 = 256;
@@ -39,7 +42,7 @@ fn strip(height: u32) -> u32 {
 }
 
 /// Where the parts of picture `index` of a `width`×`height` card lie.
-struct Layout {
+struct Parts {
     w: usize,
     h: usize,
     bars_end: usize,
@@ -51,7 +54,7 @@ struct Layout {
     index: u32,
 }
 
-impl Layout {
+impl Parts {
     fn new(width: u32, height: u32, index: u32) -> Self {
         let (w, h) = (width as usize, height as usize);
         let bars_end = h * 2 / 3;
@@ -79,12 +82,47 @@ impl Layout {
     }
 }
 
+/// A fixed picture rate.
+#[derive(Debug)]
+struct Pace {
+    interval: Duration,
+    next_at: Option<Instant>,
+}
+
+impl Pace {
+    /// `fps` pictures per second, at least 1.
+    fn new(fps: u32) -> Self {
+        Self {
+            interval: Duration::from_secs(1) / fps.max(1),
+            next_at: None,
+        }
+    }
+
+    /// Waits until the next picture is due, at most `timeout`: `true` when
+    /// it is due, `false` when the wait ran out first.
+    fn wait(&mut self, timeout: Duration) -> bool {
+        let now = Instant::now();
+        let due = self.next_at.unwrap_or(now);
+        if due > now {
+            let wait = due - now;
+            if wait > timeout {
+                std::thread::sleep(timeout);
+                return false;
+            }
+            std::thread::sleep(wait);
+        }
+        // A late consumer gets the next picture one interval after this one,
+        // never a burst of catch-up pictures.
+        self.next_at = Some(due.max(now) + self.interval);
+        true
+    }
+}
+
 /// Colour bars, a moving square and the frame index, at a fixed rate.
 pub struct TestCard {
     width: u32,
     height: u32,
-    interval: Duration,
-    next_at: Option<Instant>,
+    pace: Pace,
     index: u32,
     /// The bars and the background, rendered once: every picture is this
     /// with its square and strip painted over ([`paint`]). Empty until the
@@ -100,7 +138,7 @@ impl std::fmt::Debug for TestCard {
         f.debug_struct("TestCard")
             .field("width", &self.width)
             .field("height", &self.height)
-            .field("interval", &self.interval)
+            .field("interval", &self.pace.interval)
             .field("index", &self.index)
             .finish_non_exhaustive()
     }
@@ -129,7 +167,7 @@ fn base(width: u32, height: u32) -> Vec<u8> {
 /// the square and the strip painted, which gives [`TestCard::render`]'s
 /// bytes without drawing every pixel again.
 fn paint(base: &[u8], width: u32, height: u32, index: u32, out: &mut Vec<u8>) {
-    let l = Layout::new(width, height, index);
+    let l = Parts::new(width, height, index);
     out.clear();
     out.extend_from_slice(base);
     let row = l.w * 4;
@@ -160,8 +198,7 @@ impl TestCard {
         Self {
             width: width.max(MIN_WIDTH),
             height: height.max(MIN_HEIGHT),
-            interval: Duration::from_secs(1) / fps.max(1),
-            next_at: None,
+            pace: Pace::new(fps),
             index: 0,
             base: Vec::new(),
             spare: Vec::new(),
@@ -171,7 +208,7 @@ impl TestCard {
     /// Picture number `index` of a `width`×`height` card, tightly packed BGRx.
     #[must_use]
     pub fn render(width: u32, height: u32, index: u32) -> Vec<u8> {
-        let l = Layout::new(width, height, index);
+        let l = Parts::new(width, height, index);
         let (w, h) = (l.w, l.h);
         let mut px = vec![0u8; w * h * 4];
         for y in 0..h {
@@ -244,15 +281,8 @@ impl VideoSource for TestCard {
     }
 
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
-        let now = Instant::now();
-        let due = self.next_at.unwrap_or(now);
-        if due > now {
-            let wait = due - now;
-            if wait > timeout {
-                std::thread::sleep(timeout);
-                return Ok(None);
-            }
-            std::thread::sleep(wait);
+        if !self.pace.wait(timeout) {
+            return Ok(None);
         }
         let started = Instant::now();
         if self.base.is_empty() {
@@ -268,9 +298,6 @@ impl VideoSource for TestCard {
             grab: started.elapsed(),
         };
         self.index = self.index.wrapping_add(1);
-        // A late consumer gets the next picture one interval after this one,
-        // never a burst of catch-up pictures.
-        self.next_at = Some(due.max(now) + self.interval);
         Ok(Some(frame))
     }
 
@@ -279,6 +306,145 @@ impl VideoSource for TestCard {
         if bgrx.capacity() > self.spare.capacity() {
             self.spare = bgrx;
         }
+    }
+}
+
+/// Synthetic monitors side by side, left to right, the first primary: a
+/// source to switch between without a desktop (decision M1-75, the monitors
+/// design §5.4.4). Each picture is a test card the size of what it shows
+/// (one screen, or all of them as one card of their union), so its index is
+/// read back across switches and counts on from one picture to the next
+/// whatever the screen. Viewer input goes nowhere: there is no desktop.
+pub struct TestScreens {
+    /// The screens' rectangles, in the order given; a screen's key is its
+    /// index here.
+    screens: Vec<Rect>,
+    /// Their union.
+    space: Rect,
+    chooser: Chooser<usize>,
+    /// The latest resolve: what a selection is taken against.
+    resolved: Resolved<usize>,
+    /// What the picture returned last shows; `None` before the first.
+    layout: Option<Layout>,
+    pace: Pace,
+    index: u32,
+    /// The bars and the background at the size last shown ([`base`]).
+    base: Vec<u8>,
+    base_size: (u32, u32),
+    /// A buffer given back ([`VideoSource::recycle`]).
+    spare: Vec<u8>,
+}
+
+impl std::fmt::Debug for TestScreens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestScreens")
+            .field("screens", &self.screens)
+            .field("shown", &self.resolved.shown)
+            .field("interval", &self.pace.interval)
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TestScreens {
+    /// Screens of `sizes` (each raised to [`MIN_WIDTH`]×[`MIN_HEIGHT`], at
+    /// least one), placed left to right from (0, 0) with their tops aligned,
+    /// the first primary, at `fps` pictures per second (at least 1). The
+    /// primary is shown first.
+    #[must_use]
+    pub fn new(sizes: &[(u32, u32)], fps: u32) -> Self {
+        let mut screens = Vec::with_capacity(sizes.len().max(1));
+        let mut x = 0i32;
+        for &(width, height) in sizes.iter().take(crate::MAX_MONITORS) {
+            let (width, height) = (width.max(MIN_WIDTH), height.max(MIN_HEIGHT));
+            screens.push(Rect::new(x, 0, width, height));
+            x = x.saturating_add(i32::try_from(width).unwrap_or(i32::MAX));
+        }
+        if screens.is_empty() {
+            screens.push(Rect::new(0, 0, MIN_WIDTH, MIN_HEIGHT));
+        }
+        let width = screens
+            .iter()
+            .map(|r| u64::from(r.width))
+            .sum::<u64>()
+            .min(u64::from(i32::MAX.unsigned_abs()));
+        let height = screens.iter().map(|r| r.height).max().unwrap_or(MIN_HEIGHT);
+        let space = Rect::new(0, 0, u32::try_from(width).unwrap_or(u32::MAX), height);
+        let mut chooser = Chooser::default();
+        let resolved = chooser.resolve(found(&screens), space);
+        Self {
+            screens,
+            space,
+            chooser,
+            resolved,
+            layout: None,
+            pace: Pace::new(fps),
+            index: 0,
+            base: Vec::new(),
+            base_size: (0, 0),
+            spare: Vec::new(),
+        }
+    }
+}
+
+/// The screens as a backend finds them: keyed by index, the first primary.
+fn found(screens: &[Rect]) -> Vec<Found<usize>> {
+    screens
+        .iter()
+        .enumerate()
+        .map(|(key, &rect)| Found {
+            key,
+            rect,
+            primary: key == 0,
+        })
+        .collect()
+}
+
+impl VideoSource for TestScreens {
+    fn name(&self) -> &'static str {
+        "synthetic screens"
+    }
+
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+        if !self.pace.wait(timeout) {
+            return Ok(None);
+        }
+        let started = Instant::now();
+        let resolved = self.chooser.resolve(found(&self.screens), self.space);
+        let (width, height) = (resolved.grab.width, resolved.grab.height);
+        if self.base_size != (width, height) {
+            self.base = base(width, height);
+            self.base_size = (width, height);
+        }
+        let mut bgrx = std::mem::take(&mut self.spare);
+        paint(&self.base, width, height, self.index, &mut bgrx);
+        let frame = Frame {
+            width,
+            height,
+            bgrx,
+            captured_at: Instant::now(),
+            grab: started.elapsed(),
+        };
+        self.layout = Some(resolved.layout());
+        self.resolved = resolved;
+        self.index = self.index.wrapping_add(1);
+        Ok(Some(frame))
+    }
+
+    /// Keeps the largest buffer given back, to paint the next picture into.
+    fn recycle(&mut self, bgrx: Vec<u8>) {
+        if bgrx.capacity() > self.spare.capacity() {
+            self.spare = bgrx;
+        }
+    }
+
+    fn layout(&self) -> Option<Layout> {
+        self.layout.clone()
+    }
+
+    /// Instant: the next picture shows `selection`.
+    fn select(&mut self, selection: Selection, _stop: &AtomicBool) -> Result<(), CaptureError> {
+        self.chooser.select(selection, &self.resolved)
     }
 }
 
@@ -455,6 +621,170 @@ mod tests {
         assert_eq!(
             TestCard::read_index_scaled(&big, 512, 192, 256, 96),
             Some(9)
+        );
+    }
+
+    /// The design's two test screens: 1280×720 (main) and 1024×768 right of
+    /// it.
+    const TWO: [(u32, u32); 2] = [(1280, 720), (1024, 768)];
+
+    fn next(source: &mut TestScreens) -> Frame {
+        source
+            .next_frame(Duration::from_secs(1))
+            .unwrap()
+            .expect("a picture")
+    }
+
+    fn view(shown: Rect) -> crate::View {
+        crate::View::Rect {
+            shown,
+            space: Rect::new(0, 0, 2304, 768),
+        }
+    }
+
+    /// The screens lie side by side from (0, 0), the first primary and shown
+    /// first; there is no layout before the first picture.
+    #[test]
+    fn test_screens_lie_side_by_side_and_open_on_the_first() {
+        let mut screens = TestScreens::new(&TWO, 1000);
+        assert_eq!(screens.layout(), None);
+        assert_eq!(screens.name(), "synthetic screens");
+        let frame = next(&mut screens);
+        assert_eq!((frame.width, frame.height), (1280, 720));
+        let layout = screens.layout().unwrap();
+        assert_eq!(
+            layout.monitors,
+            [
+                crate::Monitor {
+                    id: 1,
+                    primary: true,
+                    rect: Rect::new(0, 0, 1280, 720),
+                },
+                crate::Monitor {
+                    id: 2,
+                    primary: false,
+                    rect: Rect::new(1280, 0, 1024, 768),
+                },
+            ]
+        );
+        assert!(layout.all);
+        assert_eq!(layout.shown, Selection::Monitor(1));
+        assert_eq!(layout.view, view(Rect::new(0, 0, 1280, 720)));
+    }
+
+    /// Each selection is instant and shows from the next picture on, at its
+    /// own size and view: screen 2 at 1024×768, all as one 2304×768 card.
+    /// The index counts on across every switch, and each picture is the
+    /// card of its size, painted over a base kept per size.
+    #[test]
+    fn each_selection_has_its_size_and_view_and_the_index_counts_on() {
+        let mut screens = TestScreens::new(&TWO, 1000);
+        let stop = AtomicBool::new(false);
+        let mut index = 0;
+        let mut check = |screens: &mut TestScreens, size: (u32, u32), shown: Selection, rect| {
+            let frame = next(screens);
+            assert_eq!((frame.width, frame.height), size, "{shown:?}");
+            assert!(
+                frame.bgrx == TestCard::render(size.0, size.1, index),
+                "{shown:?} #{index}"
+            );
+            assert_eq!(
+                TestCard::read_index(&frame.bgrx, size.0, size.1),
+                Some(index)
+            );
+            let layout = screens.layout().unwrap();
+            assert_eq!((layout.shown, layout.view), (shown, view(rect)));
+            screens.recycle(frame.bgrx);
+            index += 1;
+        };
+        let first = Rect::new(0, 0, 1280, 720);
+        let second = Rect::new(1280, 0, 1024, 768);
+        let all = Rect::new(0, 0, 2304, 768);
+        check(&mut screens, (1280, 720), Selection::Monitor(1), first);
+        let started = Instant::now();
+        screens.select(Selection::Monitor(2), &stop).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(50));
+        // What the last picture shows does not change before the next.
+        assert_eq!(screens.layout().unwrap().shown, Selection::Monitor(1));
+        check(&mut screens, (1024, 768), Selection::Monitor(2), second);
+        check(&mut screens, (1024, 768), Selection::Monitor(2), second);
+        screens.select(Selection::All, &stop).unwrap();
+        check(&mut screens, (2304, 768), Selection::All, all);
+        screens.select(Selection::Monitor(1), &stop).unwrap();
+        check(&mut screens, (1280, 720), Selection::Monitor(1), first);
+        screens.select(Selection::All, &stop).unwrap();
+        check(&mut screens, (2304, 768), Selection::All, all);
+    }
+
+    /// A screen it does not have, or all of one screen, is `NoMonitor`, and
+    /// the view stays.
+    #[test]
+    fn test_screens_refuse_what_they_do_not_have() {
+        let stop = AtomicBool::new(true);
+        let mut screens = TestScreens::new(&TWO, 1000);
+        next(&mut screens);
+        for id in [0, 3, 16] {
+            assert!(matches!(
+                screens.select(Selection::Monitor(id), &stop),
+                Err(CaptureError::NoMonitor(n)) if n == id
+            ));
+        }
+        assert_eq!(next(&mut screens).width, 1280, "still screen 1");
+        let mut one = TestScreens::new(&[(640, 360)], 1000);
+        next(&mut one);
+        assert!(!one.layout().unwrap().all);
+        assert!(matches!(
+            one.select(Selection::All, &stop),
+            Err(CaptureError::NoMonitor(0))
+        ));
+        assert_eq!(
+            one.layout().unwrap().view,
+            crate::View::Rect {
+                shown: Rect::new(0, 0, 640, 360),
+                space: Rect::new(0, 0, 640, 360),
+            }
+        );
+    }
+
+    /// Every screen is at least a card's floor, an odd one is shown over its
+    /// even part, and no sizes at all is one screen of the floor.
+    #[test]
+    fn test_screens_keep_the_cards_floor_and_an_even_picture() {
+        let mut screens = TestScreens::new(&[(10, 10), (1281, 721)], 1000);
+        let stop = AtomicBool::new(false);
+        let frame = next(&mut screens);
+        assert_eq!((frame.width, frame.height), (MIN_WIDTH, MIN_HEIGHT));
+        screens.select(Selection::Monitor(2), &stop).unwrap();
+        let frame = next(&mut screens);
+        assert_eq!((frame.width, frame.height), (1280, 720));
+        let layout = screens.layout().unwrap();
+        assert_eq!(layout.monitors[1].rect, Rect::new(256, 0, 1281, 721));
+        assert_eq!(
+            layout.view,
+            crate::View::Rect {
+                shown: Rect::new(256, 0, 1280, 720),
+                space: Rect::new(0, 0, 1537, 721),
+            }
+        );
+        let mut none = TestScreens::new(&[], 1000);
+        let frame = next(&mut none);
+        assert_eq!((frame.width, frame.height), (MIN_WIDTH, MIN_HEIGHT));
+        assert_eq!(none.layout().unwrap().monitors.len(), 1);
+    }
+
+    /// The screens pace themselves as the card does (small ones, so that
+    /// painting takes no part of the interval).
+    #[test]
+    fn test_screens_pace_themselves() {
+        let mut screens = TestScreens::new(&[(256, 96), (256, 96)], 20);
+        let first = next(&mut screens);
+        let second = next(&mut screens);
+        assert!(second.captured_at - first.captured_at >= Duration::from_millis(49));
+        assert!(
+            screens
+                .next_frame(Duration::from_millis(5))
+                .unwrap()
+                .is_none()
         );
     }
 

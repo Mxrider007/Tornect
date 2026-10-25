@@ -132,6 +132,13 @@ fn describe_source(source: Source, desktop: &DesktopBackend) -> String {
         (Source::TestCard, _) => {
             "sharing: a synthetic test card (no desktop; viewers' input goes nowhere)".to_owned()
         }
+        (Source::TestScreens, _) => {
+            let [(w1, h1), (w2, h2)] = tornect_session::TEST_SCREENS;
+            format!(
+                "sharing: two synthetic test screens side by side, {w1}x{h1} (main) and \
+                 {w2}x{h2} (no desktop; viewers' input goes nowhere)"
+            )
+        }
         (Source::Desktop, DesktopBackend::Wayland) => {
             "sharing: this desktop, through the desktop's screen-sharing portal. When a viewer's \
              picture starts, the desktop asks whether to share the screen and allow remote \
@@ -2483,6 +2490,12 @@ mod tests {
         assert!(describe_source(Source::Desktop, &DesktopBackend::Wayland).contains("portal"));
         let card = describe_source(Source::TestCard, &DesktopBackend::Unavailable(why.into()));
         assert!(card.contains("test card"), "{card}");
+        let screens = describe_source(Source::TestScreens, &DesktopBackend::X11);
+        assert_eq!(
+            screens,
+            "sharing: two synthetic test screens side by side, 1280x720 (main) and 1024x768 \
+             (no desktop; viewers' input goes nowhere)"
+        );
     }
 
     /// SLICE-C3 C3-5 and the Wayland grant's revocation: `doctor` names the

@@ -25,9 +25,7 @@ use std::time::{Duration, Instant};
 mod cursor;
 #[cfg(windows)]
 pub mod gdi;
-// Which monitor a desktop source shows; pure logic, tested on every system.
-// Unused outside its tests until a source chooses a monitor with it.
-#[cfg_attr(not(test), allow(dead_code))]
+// Which monitor a source shows; pure logic, on every system.
 mod monitors;
 // GDI's way through a secure Windows screen; tested on every system.
 #[cfg(any(windows, test))]
@@ -39,7 +37,7 @@ pub mod wayland;
 #[cfg(target_os = "linux")]
 pub mod x11;
 
-pub use synthetic::TestCard;
+pub use synthetic::{TestCard, TestScreens};
 pub use tornect_input::{Ratio, Rect, View};
 
 /// The most monitors a [`Layout`] lists (the media stream's

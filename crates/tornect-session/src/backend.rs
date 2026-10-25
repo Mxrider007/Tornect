@@ -1,14 +1,14 @@
 //! What this build captures and injects with, per OS (decision M3-1): the
 //! RemoteDesktop portal and PipeWire on a Wayland session, X11 on an X11
-//! session, GDI and `SendInput` on Windows, and the synthetic test card
-//! everywhere.
+//! session, GDI and `SendInput` on Windows, and the synthetic test card and
+//! test screens everywhere.
 
 use std::path::PathBuf;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 use std::sync::{Mutex, PoisonError};
 
 use tokio::sync::watch;
-use tornect_capture::{CaptureError, TestCard, VideoSource};
+use tornect_capture::{CaptureError, TestCard, TestScreens, VideoSource};
 use tornect_input::InputSink;
 
 use crate::host::{MediaBackend, SourceRequest};
@@ -17,6 +17,10 @@ use crate::host::{MediaBackend, SourceRequest};
 /// survive the encoder, small enough for a Tor circuit. The rate is held to
 /// the request's ([`card_fps`]).
 const CARD: (u32, u32, u32) = (1280, 720, 15);
+
+/// The sizes of the synthetic test screens, side by side from the left, the
+/// first primary (the monitors design §5.5); they run at the card's rate.
+pub const TEST_SCREENS: [(u32, u32); 2] = [(1280, 720), (1024, 768)];
 
 /// The test card's rate for `request`: its own, never above the request's,
 /// at least 1.
@@ -33,6 +37,10 @@ pub enum Source {
     /// The synthetic test card. No desktop is shared, and the viewer's input
     /// goes nowhere: there is nothing behind the card to control.
     TestCard,
+    /// Two synthetic screens side by side ([`TEST_SCREENS`]) the viewer can
+    /// switch between, or see at once. No desktop is shared, and the
+    /// viewer's input goes nowhere, as with the card.
+    TestScreens,
 }
 
 /// The backends this build has.
@@ -99,13 +107,14 @@ impl MediaBackend for SystemBackend {
                 let (width, height, _) = CARD;
                 Ok(Box::new(TestCard::new(width, height, card_fps(request))))
             }
+            Source::TestScreens => Ok(Box::new(TestScreens::new(&TEST_SCREENS, card_fps(request)))),
             Source::Desktop => self.desktop_source(request, cancel),
         }
     }
 
     fn open_injector(&self) -> Option<Box<dyn InputSink>> {
         match self.source {
-            Source::TestCard => None,
+            Source::TestCard | Source::TestScreens => None,
             Source::Desktop => self.desktop_injector(),
         }
     }
@@ -392,6 +401,59 @@ mod tests {
         let frame = source.next_frame(Duration::from_secs(1)).unwrap().unwrap();
         assert_eq!((frame.width, frame.height), (CARD.0, CARD.1));
         assert!(backend.open_injector().is_none());
+    }
+
+    /// The test screens are what `--capture test-screens` shares: 1280×720
+    /// (main) and 1024×768 side by side, opening on the first, switchable,
+    /// at the card's rate, and they never offer an injector.
+    #[test]
+    fn the_test_screens_share_two_screens_and_inject_nothing() {
+        use std::sync::atomic::AtomicBool;
+        use tornect_capture::{Rect, Selection, View};
+        let backend = SystemBackend::new(Source::TestScreens);
+        let mut source = backend
+            .open_source(SourceRequest::new(20), watch::channel(false).1)
+            .unwrap();
+        assert_eq!(source.name(), "synthetic screens");
+        let frame = source.next_frame(Duration::from_secs(1)).unwrap().unwrap();
+        assert_eq!((frame.width, frame.height), TEST_SCREENS[0]);
+        let layout = source.layout().unwrap();
+        let rects: Vec<(u8, bool, Rect)> = layout
+            .monitors
+            .iter()
+            .map(|m| (m.id, m.primary, m.rect))
+            .collect();
+        assert_eq!(
+            rects,
+            [
+                (1, true, Rect::new(0, 0, 1280, 720)),
+                (2, false, Rect::new(1280, 0, 1024, 768)),
+            ]
+        );
+        assert!(layout.all);
+        source
+            .select(Selection::Monitor(2), &AtomicBool::new(false))
+            .unwrap();
+        let frame = source.next_frame(Duration::from_secs(1)).unwrap().unwrap();
+        assert_eq!((frame.width, frame.height), TEST_SCREENS[1]);
+        assert_eq!(
+            source.layout().unwrap().view,
+            View::Rect {
+                shown: Rect::new(1280, 0, 1024, 768),
+                space: Rect::new(0, 0, 2304, 768),
+            }
+        );
+        assert!(backend.open_injector().is_none());
+        // At most at the request's rate, as the card.
+        let mut slow = backend
+            .open_source(SourceRequest::new(2), watch::channel(false).1)
+            .unwrap();
+        assert!(slow.next_frame(Duration::from_secs(1)).unwrap().is_some());
+        assert!(
+            slow.next_frame(Duration::from_millis(100))
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The card runs at its own 15 fps under the host's capture rate (20 on

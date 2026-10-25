@@ -44,7 +44,7 @@ pub mod host;
 pub mod quality;
 pub mod viewer;
 
-pub use backend::{DesktopBackend, Source, SystemBackend};
+pub use backend::{DesktopBackend, Source, SystemBackend, TEST_SCREENS};
 pub use host::{
     CaptureStarted, MediaBackend, MediaEnd, MediaHost, MediaLimits, MediaObserver, MediaOutcome,
     MediaReport, NoObserver, SourceRequest,
