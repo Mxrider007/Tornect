@@ -2673,6 +2673,7 @@ mod tests {
             toolbar_hides: ToolbarHides::Never,
             show_badge: false,
             quality: QualityPreset::BestPerformance,
+            clipboard_sync: true,
         });
         assert!(w.viewer.one_to_one && w.viewer.fullscreen);
         for at in [0, 3_000, 10_000, 60_000] {

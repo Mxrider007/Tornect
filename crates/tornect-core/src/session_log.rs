@@ -139,6 +139,68 @@ pub enum SessionEvent {
     /// `tornect uninstall` (§B.1.1; `by`): logged by the guard before the first
     /// file is removed.
     Uninstalled,
+    /// Host side: a file the other computer sent was verified and put in
+    /// place (design `services` §2.5): `path` holds the name it was stored
+    /// under (sanitised, no folder), `detail` its size ([`SessionRecord::bytes`]).
+    /// The Sessions page does not show it.
+    FileReceived,
+    /// Host side: the other computer copied a file of this computer: `path`
+    /// holds this computer's own path of it, `detail` its size. The Sessions
+    /// page does not show it.
+    FileSent,
+    /// Host side: this computer's user turned services off for one session
+    /// (one way): `op` holds what was turned off, the `[services]` key names
+    /// `clipboard`, `receive_files` and `browse_files` joined by commas.
+    ServicesTurnedOff,
+    /// Host side: a session's services ended: `detail` holds the counts
+    /// ([`ServicesCounts::detail`]), `reason` the services stream's closing
+    /// reason; never a name or any text.
+    ServicesSummary,
+}
+
+/// What a session's services carried, for its `services_summary` line:
+/// counts and byte totals only, never a file name or any text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServicesCounts {
+    /// Clipboard texts this computer received.
+    pub clip_in: u32,
+    /// Clipboard texts this computer sent.
+    pub clip_out: u32,
+    /// Files received.
+    pub files_in: u32,
+    /// Bytes of the files received.
+    pub bytes_in: u64,
+    /// Files sent.
+    pub files_out: u32,
+    /// Bytes of the files sent.
+    pub bytes_out: u64,
+    /// Chat messages received.
+    pub chat_in: u32,
+    /// Chat messages sent.
+    pub chat_out: u32,
+}
+
+impl ServicesCounts {
+    /// The counts as one `detail` value, every count named, in a fixed
+    /// order: `clip_in=0 clip_out=0 files_in=0 bytes_in=0 files_out=0
+    /// bytes_out=0 chat_in=0 chat_out=0`.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        let Self {
+            clip_in,
+            clip_out,
+            files_in,
+            bytes_in,
+            files_out,
+            bytes_out,
+            chat_in,
+            chat_out,
+        } = self;
+        format!(
+            "clip_in={clip_in} clip_out={clip_out} files_in={files_in} bytes_in={bytes_in} \
+             files_out={files_out} bytes_out={bytes_out} chat_in={chat_in} chat_out={chat_out}"
+        )
+    }
 }
 
 /// What the client may do.
@@ -559,6 +621,14 @@ impl SessionRecord {
     #[must_use]
     pub fn path(mut self, p: impl Into<String>) -> Self {
         self.path = Some(p.into());
+        self
+    }
+
+    /// Attach a size as `detail`: `"<n> bytes"` (`file_received`,
+    /// `file_sent`).
+    #[must_use]
+    pub fn bytes(mut self, n: u64) -> Self {
+        self.detail = Some(format!("{n} bytes"));
         self
     }
 }
@@ -1482,6 +1552,82 @@ mod tests {
             let line = serde_json::to_string(&SessionRecord::at(0, event).reason("late")).unwrap();
             assert!(line.contains(&format!(r#""event":"{name}""#)), "{line}");
         }
+    }
+
+    /// Design `services` §8: the four services events have their names; a
+    /// received file's line holds its stored name and size, a sent file's
+    /// line this computer's path and size, the turn-off line what was
+    /// turned off, and the summary line counts alone; each reads back as
+    /// written. The Sessions page's rows and the admin-command count pass
+    /// over them.
+    #[test]
+    fn the_services_events_reach_the_log() {
+        for (event, name) in [
+            (SessionEvent::FileReceived, "file_received"),
+            (SessionEvent::FileSent, "file_sent"),
+            (SessionEvent::ServicesTurnedOff, "services_turned_off"),
+            (SessionEvent::ServicesSummary, "services_summary"),
+        ] {
+            let line = serde_json::to_string(&SessionRecord::at(0, event)).unwrap();
+            assert!(line.contains(&format!(r#""event":"{name}""#)), "{line}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = SessionLog::new(dir.path().join("sessions.log"));
+        let dev = DeviceId::from_bytes([3u8; 32]);
+        let received = SessionRecord::at(1_700_000_000, SessionEvent::FileReceived)
+            .peer(dev, "Laptop")
+            .session("abcd")
+            .path("report (2).pdf")
+            .bytes(12_345);
+        let sent = SessionRecord::at(1_700_000_001, SessionEvent::FileSent)
+            .peer(dev, "Laptop")
+            .session("abcd")
+            .path("/home/u/Documents/plan.odt")
+            .bytes(0);
+        let off = SessionRecord::at(1_700_000_002, SessionEvent::ServicesTurnedOff)
+            .session("abcd")
+            .op("clipboard,receive_files,browse_files");
+        let counts = ServicesCounts {
+            clip_in: 1,
+            clip_out: 2,
+            files_in: 3,
+            bytes_in: 4_294_967_296,
+            files_out: 5,
+            bytes_out: 6,
+            chat_in: 7,
+            chat_out: 8,
+        };
+        let summary = SessionRecord::at(1_700_000_003, SessionEvent::ServicesSummary)
+            .session("abcd")
+            .reason("session_over")
+            .detail(counts.detail());
+        for record in [&received, &sent, &off, &summary] {
+            log.append(record).unwrap();
+        }
+        let lines = log.read_lines().unwrap();
+        assert!(
+            lines[0].contains(r#""detail":"12345 bytes""#)
+                && lines[0].contains(r#""path":"report (2).pdf""#),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].contains(r#""detail":"0 bytes""#), "{}", lines[1]);
+        assert!(
+            lines[3].contains(
+                r#""detail":"clip_in=1 clip_out=2 files_in=3 bytes_in=4294967296 files_out=5 bytes_out=6 chat_in=7 chat_out=8""#
+            ),
+            "{}",
+            lines[3]
+        );
+        assert_eq!(
+            ServicesCounts::default().detail(),
+            "clip_in=0 clip_out=0 files_in=0 bytes_in=0 files_out=0 bytes_out=0 chat_in=0 \
+             chat_out=0"
+        );
+        let all = log.read_all().unwrap();
+        assert_eq!(all, [received, sent, off, summary]);
+        assert_eq!(admin_commands_that_ran_nothing(&all, &dev), 0);
+        assert_eq!(log.verify_links().unwrap().status, ChainStatus::MissingHead);
     }
 
     #[test]

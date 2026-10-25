@@ -287,6 +287,51 @@ mod tests {
         );
     }
 
+    /// Design `services` §8: the services lines (a received and a sent
+    /// file, a turn-off, the summary) add no row, and so their stored name
+    /// and this computer's path never reach the page.
+    #[test]
+    fn the_services_lines_add_no_row() {
+        let dev = DeviceId::from_bytes([1; 32]);
+        let started = SessionRecord::now(SessionEvent::SessionStarted)
+            .peer(dev, "Office laptop")
+            .session("s1");
+        let services = [
+            SessionRecord::now(SessionEvent::FileReceived)
+                .peer(dev, "Office laptop")
+                .session("s1")
+                .path("report.pdf")
+                .bytes(10),
+            SessionRecord::now(SessionEvent::FileSent)
+                .peer(dev, "Office laptop")
+                .session("s1")
+                .path("/home/someone/plan.odt")
+                .bytes(20),
+            SessionRecord::now(SessionEvent::ServicesTurnedOff)
+                .session("s1")
+                .op("clipboard"),
+            SessionRecord::now(SessionEvent::ServicesSummary)
+                .session("s1")
+                .detail(tornect_core::session_log::ServicesCounts::default().detail()),
+        ];
+        assert!(rows(&services).is_empty());
+        let mut records = vec![started];
+        records.extend(services);
+        let rows = rows(&records);
+        assert_eq!(rows.len(), 1);
+        let model = Model {
+            sessions: Some(rows),
+            ..Model::default()
+        };
+        let said = texts(&model);
+        assert!(
+            !said
+                .iter()
+                .any(|t| t.contains("report.pdf") || t.contains("plan.odt") || t.contains("bytes")),
+            "{said:?}"
+        );
+    }
+
     /// Every text the page draws over `model`, not shared, after two passes.
     fn texts(model: &Model) -> Vec<String> {
         let ctx = egui::Context::default();

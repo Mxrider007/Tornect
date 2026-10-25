@@ -18,6 +18,17 @@ pub const CONFIG_VERSION: u32 = 1;
 /// The most `[media] encoder_threads` may ask for: OpenH264 runs at most 4.
 pub const MAX_ENCODER_THREADS: u8 = 4;
 
+/// Bytes in a MiB, the unit of the `[services]` limits.
+pub const MIB: u64 = 1 << 20;
+
+/// The largest `[services] max_file_mib`: 1 TiB, the largest file the
+/// services stream announces (`tornect_proto::services::MAX_FILE`).
+pub const MAX_FILE_MIB: u64 = 1 << 20;
+
+/// The largest `[services] session_quota_mib` and `keep_free_mib`: the most
+/// MiB whose byte count a `u64` still holds exactly.
+pub const MAX_LIMIT_MIB: u64 = u64::MAX / MIB;
+
 /// Top-level configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -36,6 +47,9 @@ pub struct Config {
     pub security: Security,
     /// The stream window's defaults when a session opens.
     pub viewer: Viewer,
+    /// What someone connected to this computer may use beside the picture
+    /// and input: chat, the clipboard and files (design `services` §2.6).
+    pub services: Services,
 }
 
 /// Naming and startup.
@@ -79,6 +93,66 @@ pub struct Viewer {
     /// The picture quality a session opens with; the stream window's
     /// Quality menu changes it during a session.
     pub quality: QualityPreset,
+    /// The stream window's Clipboard switch starts on: text copied here
+    /// during a session is offered to the other computer when its window is
+    /// used again, and its text comes here (design `services` §4.3).
+    pub clipboard_sync: bool,
+}
+
+/// What someone connected to this computer may use beside the picture and
+/// input (`[services]`, design `services` §2.6). Chat is offered in every
+/// session; the clipboard and files only in a Control session whose input
+/// reaches this desktop, and they pause while this computer is locked.
+/// Changes apply to later sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Services {
+    /// They can write to this computer's user, and the user to them.
+    pub chat: bool,
+    /// Text copied on either computer during the session can be pasted on
+    /// the other.
+    pub clipboard: bool,
+    /// They can send files into `Tornect` in this computer's Downloads
+    /// folder.
+    pub receive_files: bool,
+    /// They can see and copy any file this computer's user can open, except
+    /// Tornect's own folders.
+    pub browse_files: bool,
+    /// The largest file, either way, in MiB (1 to [`MAX_FILE_MIB`]).
+    pub max_file_mib: u64,
+    /// The most this computer receives in one session, in MiB (at least
+    /// `max_file_mib`).
+    pub session_quota_mib: u64,
+    /// Receiving stops before the disk has less than this free, in MiB.
+    pub keep_free_mib: u64,
+    /// Ask the Wayland screen-sharing portal for its clipboard as well (the
+    /// design's §4.2). Off by default until gates G1 and G2 pass on a GNOME
+    /// desktop: while it is off the portal request, the restore-token file
+    /// and everything the desktop shows are what they were before services
+    /// existed, and a Wayland host offers no clipboard. Turning it on makes
+    /// the desktop ask once more (its grant is kept in a file of its own,
+    /// [`crate::Paths::portal_restore_token_for`]).
+    pub wayland_clipboard: bool,
+}
+
+impl Services {
+    /// `max_file_mib` in bytes.
+    #[must_use]
+    pub const fn max_file_bytes(&self) -> u64 {
+        self.max_file_mib.saturating_mul(MIB)
+    }
+
+    /// `session_quota_mib` in bytes.
+    #[must_use]
+    pub const fn session_quota_bytes(&self) -> u64 {
+        self.session_quota_mib.saturating_mul(MIB)
+    }
+
+    /// `keep_free_mib` in bytes.
+    #[must_use]
+    pub const fn keep_free_bytes(&self) -> u64 {
+        self.keep_free_mib.saturating_mul(MIB)
+    }
 }
 
 /// The picture quality the viewer asks for (`[viewer] quality = "…"`): the
@@ -312,6 +386,22 @@ impl Default for Config {
             media: Media::default(),
             security: Security::default(),
             viewer: Viewer::default(),
+            services: Services::default(),
+        }
+    }
+}
+
+impl Default for Services {
+    fn default() -> Self {
+        Self {
+            chat: true,
+            clipboard: true,
+            receive_files: true,
+            browse_files: true,
+            max_file_mib: 2048,
+            session_quota_mib: 8192,
+            keep_free_mib: 1024,
+            wayland_clipboard: false,
         }
     }
 }
@@ -334,6 +424,7 @@ impl Default for Viewer {
             toolbar_hides: ToolbarHides::After2_5s,
             show_badge: true,
             quality: QualityPreset::Balanced,
+            clipboard_sync: true,
         }
     }
 }
@@ -515,6 +606,32 @@ impl Config {
             return Err(CoreError::ConfigInvalid(
                 "general.device_name must be 1..=64 characters".to_owned(),
             ));
+        }
+        self.services.validate()
+    }
+}
+
+impl Services {
+    /// Check the `[services]` ranges.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=MAX_FILE_MIB).contains(&self.max_file_mib) {
+            return Err(CoreError::ConfigInvalid(format!(
+                "services.max_file_mib ({}) must be between 1 and {MAX_FILE_MIB}",
+                self.max_file_mib
+            )));
+        }
+        if !(self.max_file_mib..=MAX_LIMIT_MIB).contains(&self.session_quota_mib) {
+            return Err(CoreError::ConfigInvalid(format!(
+                "services.session_quota_mib ({}) must be between services.max_file_mib ({}) \
+                 and {MAX_LIMIT_MIB}",
+                self.session_quota_mib, self.max_file_mib
+            )));
+        }
+        if self.keep_free_mib > MAX_LIMIT_MIB {
+            return Err(CoreError::ConfigInvalid(format!(
+                "services.keep_free_mib ({}) must be at most {MAX_LIMIT_MIB}",
+                self.keep_free_mib
+            )));
         }
         Ok(())
     }
@@ -725,6 +842,7 @@ panic_key = "Ctrl+Alt+End"
             toolbar_hides: ToolbarHides::After2_5s,
             show_badge: true,
             quality: QualityPreset::Balanced,
+            clipboard_sync: true,
         };
         for cfg in [
             Config::default(),
@@ -758,6 +876,7 @@ panic_key = "Ctrl+Alt+End"
                 toolbar_hides: ToolbarHides::Never,
                 show_badge: false,
                 quality: QualityPreset::Balanced,
+                clipboard_sync: true,
             }
         );
         let text = toml::to_string_pretty(&chosen).unwrap();
@@ -854,5 +973,150 @@ panic_key = "Ctrl+Alt+End"
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back, cfg);
+    }
+
+    /// The design's §2.6: a config written before services loads them all
+    /// on, 2 GiB per file, 8 GiB a session, 1 GiB kept free, the viewer's
+    /// clipboard switch on, and the Wayland portal clipboard off; a file
+    /// that names some keys keeps them and fills the rest; every key
+    /// round-trips.
+    #[test]
+    fn the_services_defaults_are_the_designs() {
+        let want = Services {
+            chat: true,
+            clipboard: true,
+            receive_files: true,
+            browse_files: true,
+            max_file_mib: 2048,
+            session_quota_mib: 8192,
+            keep_free_mib: 1024,
+            wayland_clipboard: false,
+        };
+        let old: Config =
+            toml::from_str("[general]\ndevice_name = \"Desk\"\n\n[viewer]\nshow_badge = false\n")
+                .unwrap();
+        old.validate().unwrap();
+        for cfg in [
+            Config::default(),
+            old,
+            toml::from_str("[services]\n").unwrap(),
+        ] {
+            assert_eq!(cfg.services, want);
+            assert!(cfg.viewer.clipboard_sync);
+            assert!(!cfg.services.wayland_clipboard);
+        }
+        assert_eq!(want.max_file_bytes(), 2 << 30);
+        assert_eq!(want.session_quota_bytes(), 8 << 30);
+        assert_eq!(want.keep_free_bytes(), 1 << 30);
+
+        let chosen: Config = toml::from_str(
+            "[services]\nchat = false\nbrowse_files = false\nmax_file_mib = 10\n\
+             session_quota_mib = 10\nkeep_free_mib = 0\nwayland_clipboard = true\n\
+             future_key = 1\n\n[viewer]\nclipboard_sync = false\n",
+        )
+        .unwrap();
+        chosen.validate().unwrap();
+        assert_eq!(
+            chosen.services,
+            Services {
+                chat: false,
+                browse_files: false,
+                max_file_mib: 10,
+                session_quota_mib: 10,
+                keep_free_mib: 0,
+                wayland_clipboard: true,
+                ..want
+            }
+        );
+        assert!(!chosen.viewer.clipboard_sync);
+        let text = toml::to_string_pretty(&chosen).unwrap();
+        assert!(text.contains("[services]"), "{text}");
+        assert!(text.contains("wayland_clipboard = true"), "{text}");
+        assert!(text.contains("clipboard_sync = false"), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back, chosen);
+
+        // Saved and loaded as a file, the largest limits included.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut largest = Config::default();
+        largest.services.max_file_mib = MAX_FILE_MIB;
+        largest.services.session_quota_mib = MAX_LIMIT_MIB;
+        largest.services.keep_free_mib = MAX_LIMIT_MIB;
+        largest.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), largest);
+        assert_eq!(largest.services.max_file_bytes(), 1 << 40);
+        assert_eq!(largest.services.session_quota_bytes(), MAX_LIMIT_MIB * MIB);
+    }
+
+    /// The design's §2.6 ranges: a file of 1 MiB to 1 TiB, a session quota
+    /// of at least one file, and limits whose byte counts a `u64` holds;
+    /// out of range, `validate` (and so `load` and `save`) refuses with the
+    /// key's name.
+    #[test]
+    fn the_services_ranges_are_checked() {
+        let check = |change: &dyn Fn(&mut Services)| {
+            let mut cfg = Config::default();
+            change(&mut cfg.services);
+            cfg.validate().map_err(|e| e.to_string())
+        };
+        for good in [
+            &(|s: &mut Services| s.max_file_mib = 1) as &dyn Fn(&mut Services),
+            &|s| s.max_file_mib = 8192,
+            &|s| {
+                s.max_file_mib = MAX_FILE_MIB;
+                s.session_quota_mib = MAX_FILE_MIB;
+            },
+            &|s| s.session_quota_mib = s.max_file_mib,
+            &|s| s.session_quota_mib = MAX_LIMIT_MIB,
+            &|s| s.keep_free_mib = 0,
+            &|s| s.keep_free_mib = MAX_LIMIT_MIB,
+            &|s| {
+                s.chat = false;
+                s.clipboard = false;
+                s.receive_files = false;
+                s.browse_files = false;
+            },
+        ] {
+            check(good).unwrap();
+        }
+        for (bad, key) in [
+            (
+                &(|s: &mut Services| s.max_file_mib = 0) as &dyn Fn(&mut Services),
+                "services.max_file_mib (0) must be between 1 and 1048576",
+            ),
+            (
+                &|s| {
+                    s.max_file_mib = MAX_FILE_MIB + 1;
+                    s.session_quota_mib = MAX_LIMIT_MIB;
+                },
+                "services.max_file_mib (1048577)",
+            ),
+            (
+                &|s| s.session_quota_mib = 2047,
+                "services.session_quota_mib (2047) must be between services.max_file_mib (2048)",
+            ),
+            (
+                &|s| s.session_quota_mib = MAX_LIMIT_MIB + 1,
+                "services.session_quota_mib",
+            ),
+            (
+                &|s| s.keep_free_mib = MAX_LIMIT_MIB + 1,
+                "services.keep_free_mib",
+            ),
+        ] {
+            let err = check(bad).unwrap_err();
+            assert!(err.contains(key), "{err}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[services]\nmax_file_mib = 0\n").unwrap();
+        assert!(matches!(
+            Config::load(&path),
+            Err(CoreError::ConfigInvalid(_))
+        ));
+        let mut cfg = Config::default();
+        cfg.services.session_quota_mib = 1;
+        assert!(cfg.save(&path).is_err());
     }
 }
