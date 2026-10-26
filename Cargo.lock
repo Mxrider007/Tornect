@@ -7604,8 +7604,11 @@ name = "tornect-net"
 version = "0.1.0"
 dependencies = [
  "netdev",
+ "proptest",
  "quinn",
  "socket2",
+ "thiserror 2.0.20",
+ "tokio",
  "tornect-core",
 ]
 

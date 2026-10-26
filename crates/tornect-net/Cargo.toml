@@ -10,11 +10,18 @@ publish.workspace = true
 
 [dependencies]
 tornect-core.workspace = true
-# Direct connections, Phase A (design `direct` §10, decision M1-81): the code
-# that uses them lands in the following steps; docs/DEPENDENCIES.md has the rows.
+# Direct connections, Phase A (design `direct` §10, decision M1-81;
+# docs/DEPENDENCIES.md has the rows): netdev reads the interface list and
+# socket2 the route sources (step A7); quinn and the session socket follow
+# (steps A8, A9).
 quinn.workspace = true
 netdev.workspace = true
 socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true
