@@ -182,7 +182,7 @@ pub fn indicator_chat(sharing: &[Sharing]) -> Option<(String, String)> {
 /// The session sheet's line under the answers that give control (the
 /// services design §7.4): what control also gives under `policy`, in fixed
 /// order, "see and copy any file you can open on this computer", "send files
-/// into <inbox words>" (only where this computer has an inbox) and "copy text
+/// into `<inbox words>`" (only where this computer has an inbox) and "copy text
 /// to and from this computer's clipboard", joined with ", " and " and ";
 /// `None` when none of them is on. Chat is not access, and is not named.
 #[must_use]
