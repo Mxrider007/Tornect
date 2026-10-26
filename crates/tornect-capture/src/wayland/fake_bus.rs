@@ -3,10 +3,14 @@
 //! which calls a portal session makes in which order, and the clipboard's
 //! signals and pipes end to end. It answers `RemoteDesktop`, `ScreenCast`,
 //! `Session` and (unless told not to) `Clipboard`, and records every method
-//! call. The tests using it are `#[ignore]`d, since they need `dbus-daemon`:
+//! call. The tests using it run with every `cargo test` (and so with `cargo
+//! xtask verify`) wherever `dbus-daemon` is on the `PATH`, and pass without
+//! checking anything where it is not ([`FakeBus::start`] gives `None`);
+//! with `TORNECT_FAKE_BUS=1` set, a missing `dbus-daemon` fails them
+//! instead, so a run that must prove them cannot skip them:
 //!
 //! ```text
-//! cargo test -p tornect-capture -- --ignored fake_bus
+//! TORNECT_FAKE_BUS=1 cargo test -p tornect-capture fake_bus
 //! ```
 
 use std::collections::HashMap;
@@ -81,17 +85,29 @@ pub(super) struct FakeBus {
 }
 
 impl FakeBus {
-    /// Start a `dbus-daemon` and the fake portal on it.
-    pub(super) fn start(script: Script) -> Self {
+    /// Start a `dbus-daemon` and the fake portal on it; `None` where no
+    /// `dbus-daemon` is on the `PATH` (the caller's test then checks
+    /// nothing), unless `TORNECT_FAKE_BUS` is set, which makes that a
+    /// failure.
+    pub(super) fn start(script: Script) -> Option<Self> {
         let dir = tempfile::tempdir().unwrap();
         let listen = format!("unix:path={}", dir.path().join("bus").display());
-        let mut daemon = Command::new("dbus-daemon")
+        let spawned = Command::new("dbus-daemon")
             .args(["--session", "--nofork", "--print-address=1"])
             .arg(format!("--address={listen}"))
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .spawn()
-            .expect("dbus-daemon runs (the fake portal's tests need it on the PATH)");
+            .spawn();
+        let mut daemon = match spawned {
+            Ok(daemon) => daemon,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && std::env::var_os("TORNECT_FAKE_BUS").is_none() =>
+            {
+                return None;
+            }
+            Err(e) => panic!("dbus-daemon runs (the fake portal's tests need it on the PATH): {e}"),
+        };
         let mut line = String::new();
         BufReader::new(daemon.stdout.take().unwrap())
             .read_line(&mut line)
@@ -132,14 +148,14 @@ impl FakeBus {
                 builder.build().await
             })
             .unwrap();
-        Self {
+        Some(Self {
             address,
             shared,
             connection,
             runtime: Some(runtime),
             daemon,
             _dir: dir,
-        }
+        })
     }
 
     /// The method calls so far.

@@ -1330,9 +1330,10 @@ mod tests {
     /// one, with the same token file: no `Clipboard` proxy, no
     /// `RequestClipboard`, no link.
     #[test]
-    #[ignore = "starts a dbus-daemon: cargo test -p tornect-capture -- --ignored fake_bus"]
     fn fake_bus_without_the_switch_no_clipboard_call_is_made() {
-        let bus = FakeBus::start(Script::default());
+        let Some(bus) = FakeBus::start(Script::default()) else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("portal-restore-token");
         remember_token(&token, Some("old-token"));
@@ -1360,9 +1361,10 @@ mod tests {
     /// before `Start`, the only moment the portal takes it, and the link is
     /// handed out once.
     #[test]
-    #[ignore = "starts a dbus-daemon: cargo test -p tornect-capture -- --ignored fake_bus"]
     fn fake_bus_the_clipboard_is_asked_for_between_select_sources_and_start() {
-        let bus = FakeBus::start(Script::default());
+        let Some(bus) = FakeBus::start(Script::default()) else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("portal-restore-token-2");
         let (portal, opened) = Portal::open(bus_setup(&bus, Some(&token), true)).unwrap();
@@ -1398,7 +1400,6 @@ mod tests {
     /// shares none, and one without the clipboard's portal is not asked; the
     /// screen is shared either way.
     #[test]
-    #[ignore = "starts a dbus-daemon: cargo test -p tornect-capture -- --ignored fake_bus"]
     fn fake_bus_a_desktop_that_shares_no_clipboard_still_shares_the_screen() {
         for (script, asked) in [
             (
@@ -1416,7 +1417,9 @@ mod tests {
                 false,
             ),
         ] {
-            let bus = FakeBus::start(script.clone());
+            let Some(bus) = FakeBus::start(script.clone()) else {
+                return;
+            };
             let (portal, opened) = Portal::open(bus_setup(&bus, None, true)).unwrap();
             assert!(!opened.clipboard, "{script:?}");
             assert!(portal.take_clip_link().is_none(), "{script:?}");
@@ -1444,10 +1447,11 @@ mod tests {
     /// desktop's own end of the session is seen. Nothing is read from the
     /// clipboard once the link is gone.
     #[test]
-    #[ignore = "starts a dbus-daemon: cargo test -p tornect-capture -- --ignored fake_bus"]
     fn fake_bus_a_dropped_clipboard_link_leaves_the_session_working() {
         for desktop_ends in [false, true] {
-            let bus = FakeBus::start(Script::default());
+            let Some(bus) = FakeBus::start(Script::default()) else {
+                return;
+            };
             let (portal, opened) = Portal::open(bus_setup(&bus, None, true)).unwrap();
             assert!(opened.clipboard);
             let session = bus.session();

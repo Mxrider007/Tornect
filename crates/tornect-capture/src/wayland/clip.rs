@@ -1503,12 +1503,13 @@ mod tests {
     /// the hint and served to a paste through the portal's pipe, and it is
     /// cleared before the session closes.
     #[test]
-    #[ignore = "starts a dbus-daemon: cargo test -p tornect-capture -- --ignored fake_bus"]
     fn fake_bus_the_clipboard_end_to_end() {
         use super::super::fake_bus::{FakeBus, Script};
         use super::super::portal::{Bus, Portal, Setup};
 
-        let bus = FakeBus::start(Script::default());
+        let Some(bus) = FakeBus::start(Script::default()) else {
+            return;
+        };
         bus.select("copied before the session");
         let (portal, opened) = Portal::open(Setup {
             bus: Bus::Address(bus.address.clone()),
