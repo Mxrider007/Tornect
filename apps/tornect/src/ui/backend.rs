@@ -6826,6 +6826,77 @@ mod tests {
         });
     }
 
+    /// Decision M1-76 (cv): a save reloads `config.toml`, but what the
+    /// window says of the clipboard follows the running portal request (the
+    /// switch as read at this window's start), not the file: a hand edit
+    /// turning `[services] wayland_clipboard` off while the window runs
+    /// leaves the session sheet naming the clipboard the sessions still get,
+    /// and Settings, Sharing not saying the desktop does not share it; a
+    /// hand edit turning it on promises nothing the portal does not do.
+    #[test]
+    fn a_save_never_changes_what_the_running_portal_asks_for() {
+        use super::super::model::{ServicesSettings, Setup};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().join("home"));
+        let path = paths.config_file();
+        let mut on_disk = Config::default();
+        on_disk.services.wayland_clipboard = true;
+        on_disk.save(&path).unwrap();
+        let wayland = Setup {
+            token_file: std::path::PathBuf::from("token"),
+            granted: true,
+            busy: false,
+            note: None,
+        };
+        let shared = Shared::new(
+            Model {
+                settings: Settings::of(&on_disk),
+                setup: Some(wayland.clone()),
+                portal_clipboard: true,
+                ..Model::default()
+            },
+            Arc::new(|_| {}),
+        );
+        // What the session sheet and the block window say control also
+        // gives (`strip::sheet_services_line` of it names the clipboard
+        // exactly when this is true).
+        let clipboard = |m: &Model| m.services_offered().clipboard;
+        assert!(shared.read(clipboard));
+        // config.toml edited by hand while the window runs, then any switch.
+        on_disk.services.wayland_clipboard = false;
+        on_disk.save(&path).unwrap();
+        let switches = ServicesSettings {
+            browse_files: false,
+            ..ServicesSettings::of(&on_disk.services)
+        };
+        save_settings(&paths, &shared, &SettingsChange::Services(switches));
+        shared.read(|m| {
+            assert!(!m.settings.services.wayland_clipboard, "the file reloaded");
+            assert!(m.portal_clipboard);
+            assert!(clipboard(m), "the sessions still get it");
+            assert!(!m.clipboard_not_shared());
+        });
+
+        // The other way: started without it, turned on by hand since.
+        let shared = Shared::new(
+            Model {
+                settings: Settings::of(&on_disk),
+                setup: Some(wayland),
+                ..Model::default()
+            },
+            Arc::new(|_| {}),
+        );
+        on_disk.services.wayland_clipboard = true;
+        on_disk.save(&path).unwrap();
+        save_settings(&paths, &shared, &SettingsChange::Services(switches));
+        shared.read(|m| {
+            assert!(m.settings.services.wayland_clipboard, "the file reloaded");
+            assert!(!clipboard(m), "the running portal does not ask for it");
+            assert!(m.clipboard_not_shared());
+        });
+    }
+
     /// Settings, Connection: the way to Tor, the private bridge lines and the
     /// proof-of-work defence reach `config.toml`, and the model then holds
     /// them; the lines are never printed.

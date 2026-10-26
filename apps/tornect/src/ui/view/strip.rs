@@ -217,8 +217,9 @@ pub fn services_line(policy: &ServicesPolicy, inbox_words: Option<&str>) -> Opti
 /// The session sheet's services line as this computer's saved settings
 /// give it ([`services_line`] of [`Model::services_offered`]): the
 /// clipboard not named on a Wayland desktop whose portal is not asked for
-/// its clipboard (`[services] wayland_clipboard` off: no session there can
-/// have it), files received not named without a Downloads folder.
+/// its clipboard (`[services] wayland_clipboard` off when this window
+/// started, `Model::portal_clipboard`: no session there can have it), files
+/// received not named without a Downloads folder.
 #[must_use]
 pub fn sheet_services_line(model: &Model) -> Option<String> {
     services_line(&model.services_offered(), Some(INBOX_WORDS))
@@ -774,7 +775,17 @@ mod tests {
             ),
             "a Wayland desktop with the switch off offers no clipboard"
         );
+        // The running portal request asks for it (the switch as read at
+        // this window's start), not the switch a later save reloads.
         model.settings.services.wayland_clipboard = true;
+        assert!(
+            !sheet_services_line(&model)
+                .unwrap_or_default()
+                .contains("clipboard"),
+            "saved on, not asked for"
+        );
+        model.portal_clipboard = true;
+        model.settings.services.wayland_clipboard = false;
         assert!(
             sheet_services_line(&model)
                 .unwrap_or_default()

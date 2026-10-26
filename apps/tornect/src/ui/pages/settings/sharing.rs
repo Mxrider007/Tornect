@@ -60,8 +60,8 @@ pub(in super::super) const NO_DOWNLOADS: &str =
     "This computer has no Downloads folder, so it cannot receive files.";
 
 /// On a Wayland desktop whose clipboard no session can have yet: the
-/// portal is not asked for it (`[services] wayland_clipboard` off), or it
-/// refused a session (§4.2).
+/// portal is not asked for it (`[services] wayland_clipboard` off when this
+/// window started), or it refused a session (§4.2).
 pub(in super::super) const NOT_SHARED_YET: &str =
     "This desktop does not share its clipboard with Tornect yet.";
 
@@ -103,13 +103,6 @@ fn count_text(n: u64) -> String {
     out
 }
 
-/// Whether this desktop gives no session its clipboard: a Wayland desktop
-/// this machine shares (`setup`) while the portal is not asked for it, or
-/// once it refused a session that could have had it.
-fn clipboard_not_shared(model: &Model) -> bool {
-    model.setup.is_some() && (!model.settings.services.wayland_clipboard || model.clipboard_refused)
-}
-
 /// The Sharing section.
 pub(super) fn section(ui: &mut Ui, model: &Model, shared: bool, actions: &mut Vec<Action>) {
     let t = theme::tokens(ui.ctx());
@@ -135,7 +128,7 @@ pub(super) fn section(ui: &mut Ui, model: &Model, shared: bool, actions: &mut Ve
     if model.no_downloads {
         line(ui, NO_DOWNLOADS, t.text_secondary);
     }
-    if clipboard_not_shared(model) {
+    if model.clipboard_not_shared() {
         line(ui, NOT_SHARED_YET, t.text_secondary);
     }
     ui.add_space(20.0);

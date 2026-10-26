@@ -196,6 +196,8 @@ fn start(paths: &Paths, opts: &GuiOpts) -> anyhow::Result<Start> {
         hosting: first_hosting(opts.host, opts.link),
         setup,
         no_downloads: tornect_core::files::downloads_dir().is_none(),
+        // What the host's portal request asks for, from this start's file.
+        portal_clipboard: cfg.services.wayland_clipboard,
         ..Model::default()
     };
     Ok(Start {

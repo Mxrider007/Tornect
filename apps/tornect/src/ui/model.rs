@@ -280,26 +280,45 @@ pub struct Model {
     /// `clipboard_refused`): on a Wayland desktop, Settings, Sharing says
     /// that the desktop does not share its clipboard yet.
     pub clipboard_refused: bool,
+    /// This window's host asks the desktop's portal for its clipboard with
+    /// the screen: `[services] wayland_clipboard` as read when the window
+    /// started, which the portal request and its restore-token file keep
+    /// until the next start. Never [`Settings`]' copy: a save reloads
+    /// `config.toml`, and a hand edit made since would otherwise make the
+    /// window say what the running portal does not do (decision M1-76
+    /// (cv)).
+    pub portal_clipboard: bool,
 }
 
 impl Model {
     /// What a control session here would get beside the picture and input
     /// under the saved settings (the services design §7.4): `[services]` as
     /// saved, but no clipboard on a Wayland desktop this machine shares
-    /// while its portal is not asked for one (`wayland_clipboard` off) and
-    /// no files received where this computer has no Downloads folder. What
-    /// the session sheet and the block window say control also gives.
+    /// while its running portal request does not ask for one
+    /// ([`Self::portal_clipboard`]) and no files received where this
+    /// computer has no Downloads folder. What the session sheet and the
+    /// block window say control also gives.
     #[must_use]
     pub fn services_offered(&self) -> tornect_session::services::ServicesPolicy {
         let services = &self.settings.services;
         let mut policy = tornect_session::services::ServicesPolicy::from_config(services);
-        if self.setup.is_some() && !services.wayland_clipboard {
+        if self.setup.is_some() && !self.portal_clipboard {
             policy.clipboard = false;
         }
         if self.no_downloads {
             policy.receive_files = false;
         }
         policy
+    }
+
+    /// Whether this desktop gives no session its clipboard (Settings,
+    /// Sharing says so): a Wayland desktop this machine shares while the
+    /// running portal request does not ask for it
+    /// ([`Self::portal_clipboard`]), or once it refused a session that could
+    /// have had it.
+    #[must_use]
+    pub fn clipboard_not_shared(&self) -> bool {
+        self.setup.is_some() && (!self.portal_clipboard || self.clipboard_refused)
     }
 
     /// This computer's own ID, read from [`Model::id`]'s groups; `None`
@@ -1871,7 +1890,17 @@ mod tests {
             "the portal is not asked"
         );
         model.settings.services.wayland_clipboard = true;
+        assert!(
+            !model.services_offered().clipboard,
+            "a saved switch the running portal did not start with"
+        );
+        model.portal_clipboard = true;
         assert!(model.services_offered().clipboard);
+        model.settings.services.wayland_clipboard = false;
+        assert!(
+            model.services_offered().clipboard,
+            "the running portal asks for it, whatever config.toml says now"
+        );
         model.no_downloads = true;
         assert!(!model.services_offered().receive_files);
         model.settings.services.max_file_mib = 16;

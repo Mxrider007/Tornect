@@ -4689,7 +4689,17 @@ mod tests {
         model.setup = Some(wayland.clone());
         assert!(shows(model.clone(), sharing::NOT_SHARED_YET), "switch off");
         model.settings.services.wayland_clipboard = true;
+        assert!(
+            shows(model.clone(), sharing::NOT_SHARED_YET),
+            "saved on, but not asked for by the running portal"
+        );
+        model.portal_clipboard = true;
         assert!(!shows(model.clone(), sharing::NOT_SHARED_YET), "asked for");
+        model.settings.services.wayland_clipboard = false;
+        assert!(
+            !shows(model.clone(), sharing::NOT_SHARED_YET),
+            "asked for, whatever config.toml says now"
+        );
         model.clipboard_refused = true;
         assert!(shows(model, sharing::NOT_SHARED_YET), "refused");
         let mut model = at_rest();
