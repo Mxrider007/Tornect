@@ -897,13 +897,13 @@ scancode for games, keysym for typing (per-app heuristic toggle in HUD).
   formats on the host and on a Windows viewer, `x-kde-passwordManagerHint` on a Wayland host); on Windows received text
   is set out of the clipboard history and the cloud clipboard, and the host clears it at the end while it is still ours;
   received text loses every control character but TAB, LF and CR; the host's strip lists each text sent or received
-  by its length, never its content; a viewer window never reads its clipboard while that computer shares its own
-  screen. A GNOME Wayland host shares no clipboard until gates G1 and G2 pass: `[services] wayland_clipboard`, off by
+  by its length, never its content; a viewer window never reads its clipboard while its own computer is
+  shared. A GNOME Wayland host shares no clipboard until gates G1 and G2 pass: `[services] wayland_clipboard`, off by
   default, keeps the portal request, its restore-token file and what the desktop asks exactly as before; on, the
   request also asks for the clipboard and keeps its grant in `state/portal-restore-token-2`. **The cross-feature rule
-  above holds:** the viewer's Clipboard switch starts off (`[viewer] clipboard_sync`, off by default; even on, never
-  in the first session with a computer paired in that connection), a file goes only when the viewer sends it, and
-  nothing received is opened. **Files:** a received file lands only in `<Downloads>/Tornect`, under a sanitised name
+  above holds:** the viewer's Clipboard switch starts off unless the viewer turned `[viewer] clipboard_sync` on (off
+  by default), and off in the first session with a computer paired in that connection either way; a file goes only
+  when the viewer sends it, and nothing received is opened. **Files:** a received file lands only in `<Downloads>/Tornect`, under a sanitised name
   reserved before its first byte, and is put in place only after its SHA-256 matched. The viewer never sends a path:
   it names handles the host gave out in its listings, and every `List` and `Get` takes the canonical path through a
   place allowlist (`/` and the user's folders; on Windows the fixed drives only, so no shadow copy, share, mapped drive
