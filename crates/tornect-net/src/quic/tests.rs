@@ -563,8 +563,10 @@ fn device_key_signatures_verify_with_ring() {
     assert!(verify(message, flipped).is_err());
 }
 
-/// The verifier takes exactly the pinned key, alone, in both roles; it
-/// refuses TLS 1.2 and any scheme but Ed25519, and requires a client key.
+/// The verifier takes exactly the pinned key, alone, in both roles, and
+/// only with a `CertificateVerify` signature that key made over the
+/// transcript; it refuses TLS 1.2 and any scheme but Ed25519, and requires
+/// a client key.
 #[test]
 fn the_pinned_verifier_accepts_only_its_key() {
     let verifier = PinnedVerifier::new(&pk(VIEWER));
@@ -614,6 +616,36 @@ fn the_pinned_verifier_accepts_only_its_key() {
         ServerCertVerifier::verify_tls13_signature(&verifier, message, &other, &signed).is_err(),
         "a signature is checked against the pinned key only"
     );
+    // Possession: the pinned key is public (it travels in `PAIR_ACCEPT` and
+    // `SESSION_ACCEPT.quic_spki`), so presenting it proves nothing without
+    // a signature only its private key makes.
+    let by_stranger = DeviceKeySigner::new(device(STRANGER))
+        .sign(message)
+        .expect("a signature");
+    let over_another = signer.sign(b"another transcript").expect("a signature");
+    let flipped = |at: usize| {
+        let mut bytes = signature.clone();
+        bytes[at] ^= 1;
+        bytes
+    };
+    for (what, forged) in [
+        ("signed by another key", by_stranger),
+        ("signed over another message", over_another),
+        ("a bit flipped in R", flipped(0)),
+        ("a bit flipped in S", flipped(32)),
+    ] {
+        let forged = dss(SignatureScheme::ED25519, &forged);
+        assert!(
+            ServerCertVerifier::verify_tls13_signature(&verifier, message, &pinned, &forged)
+                .is_err(),
+            "server verifier: {what}"
+        );
+        assert!(
+            ClientCertVerifier::verify_tls13_signature(&verifier, message, &pinned, &forged)
+                .is_err(),
+            "client verifier: {what}"
+        );
+    }
     let ecdsa = dss(SignatureScheme::ECDSA_NISTP256_SHA256, &signature);
     assert!(
         ServerCertVerifier::verify_tls13_signature(&verifier, message, &pinned, &ecdsa).is_err()
@@ -1037,6 +1069,102 @@ async fn a_dialler_without_the_pinned_key_is_refused_with_an_alert() {
     assert_eq!(
         *exporter(&accepted, &TOKEN).expect("keying material"),
         *exporter(&conn, &TOKEN).expect("keying material")
+    );
+}
+
+/// A QUIC identity that presents the device key `presented` but signs with
+/// the device key of `signs`: it holds the public key (which is no secret)
+/// and not the private one.
+fn forged(presented: u8, signs: u8) -> QuicIdentity {
+    QuicIdentity::with_key(Arc::new(DeviceKeySigner::new(device(signs))), pk(presented))
+}
+
+/// A dialler that presents the pinned viewer key without holding it (its
+/// `CertificateVerify` is signed by another device key) is refused with a
+/// TLS alert (design §6.5: the signature is checked against the pinned key
+/// itself). The host's accept yields nothing, no stream byte crosses, and
+/// the genuine viewer is accepted afterwards.
+#[tokio::test(start_paused = true)]
+async fn a_dialler_presenting_the_pinned_key_without_holding_it_is_refused() {
+    let hub = Hub::new();
+    let (host, viewer) = fresh(&hub, 50250, (false, false));
+    let impostor = Side::with_identity(
+        &hub,
+        "192.168.1.31:50252",
+        false,
+        VIEWER,
+        forged(VIEWER, STRANGER),
+    );
+    host.validate(&impostor);
+    impostor.validate(&host);
+    let server = host.server(&viewer, TornectRole::Host);
+    let mut accepting = host.accept_task(&server, &viewer);
+
+    let client = impostor.client();
+    let crypto = match impostor.dial(&client, &host, TornectRole::Viewer).await {
+        Err(QuicError::Handshake { crypto }) => crypto,
+        Err(other) => panic!("{other:?}"),
+        // TLS 1.3 lets the client finish before the server checks its key.
+        Ok(conn) => {
+            let mut send = conn.open_bi().await.map(|(send, _)| send).ok();
+            if let Some(send) = send.as_mut() {
+                let _ = send.write_all(b"bind").await;
+            }
+            is_crypto_close(&within(5, conn.closed()).await)
+        }
+    };
+    assert!(crypto, "the refusal is a TLS alert");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), &mut accepting)
+            .await
+            .is_err(),
+        "the forged viewer was accepted"
+    );
+
+    let viewer_client = viewer.client();
+    let conn = viewer
+        .dial(&viewer_client, &host, TornectRole::Viewer)
+        .await
+        .expect("the pinned dial");
+    let accepted = within(5, accepting)
+        .await
+        .expect("the accept task")
+        .expect("the accepted connection");
+    assert_eq!(accepted.remote_address(), viewer.addr);
+    assert_eq!(
+        *exporter(&accepted, &TOKEN).expect("keying material"),
+        *exporter(&conn, &TOKEN).expect("keying material")
+    );
+}
+
+/// A controlled side that presents the pinned host key without holding it
+/// is refused by the dialler's own verifier: the dial fails with a TLS
+/// alert before any stream exists, and the forged side's accept yields
+/// nothing.
+#[tokio::test(start_paused = true)]
+async fn a_host_presenting_the_pinned_key_without_holding_it_is_refused() {
+    let hub = Hub::new();
+    let host = Side::with_identity(
+        &hub,
+        "192.168.1.20:50260",
+        false,
+        HOST,
+        forged(HOST, STRANGER),
+    );
+    let viewer = Side::new(&hub, "192.168.1.30:50261", false, VIEWER);
+    host.validate(&viewer);
+    viewer.validate(&host);
+    let server = host.server(&viewer, TornectRole::Host);
+    let mut accepting = host.accept_task(&server, &viewer);
+
+    let client = viewer.client();
+    let dialled = viewer.dial(&client, &host, TornectRole::Viewer).await;
+    assert_eq!(dialled.err(), Some(QuicError::Handshake { crypto: true }));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), &mut accepting)
+            .await
+            .is_err(),
+        "the forged host completed a handshake"
     );
 }
 
