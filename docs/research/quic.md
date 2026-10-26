@@ -6,6 +6,57 @@ below was checked against the crate sources extracted into `/tmp/crates-src/`
 **compiled and run on this VM** (Rust 1.96, no sudo, no cmake/nasm/libclang
 needed). Line references are into the extracted sources.
 
+### Pin refresh (2026-10-26, design `direct` step A1; decision M1-81)
+
+The pins below replace §0 and §1.2 where they differ; the rest of this note was written
+against the 2026-08-28 versions and its line numbers point there unless a line says
+otherwise. Re-read in the registry sources
+(`~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`) on 2026-10-26.
+
+| crate | pinned / locked | note |
+|---|---|---|
+| quinn | `=0.11.12` (2026-09-14, rust-version 1.85), `default-features = false`, features `["rustls-ring", "runtime-tokio"]` | **no `log`** (its `log` feature only forwards `tracing` events to the `log` crate) and no `rustls-log`; the defaults `platform-verifier` (OS trust stores) and `bloom` stay off. In the workspace `Cargo.toml`; only `tornect-net` names it |
+| quinn-proto | 0.11.19 (2026-09-30), locked | quinn 0.11.12 requires `^0.11.18` |
+| quinn-udp | 0.5.16 (2026-09-30), locked, feature `tracing` (quinn sets it) | 0.6.3 exists; quinn 0.11 stays on `^0.5` |
+| rustls | `=0.23.46` (existing pin, decision M1-3), `ring` + `std` | in the app graph it also has `logging` and `tls12` through Arti's `futures-rustls` |
+| rustls-webpki / rustls-pki-types / ring | 0.103.16 / 1.15.1 / 0.17.14, locked | unchanged by quinn |
+| socket2 | `=0.6.5` | already in the lock through tokio; now a direct dependency of `tornect-net` |
+| rcgen | not added | the design takes the raw-public-key option (§3.3) |
+
+References re-checked in the new versions (used by the design's steps):
+`quinn-0.11.12/src/endpoint.rs` `new_with_abstract_socket` :133, `connect_with` :208,
+`set_server_config` :275, `ensure_ipv6` :631 (called at :222), the receive loop
+:798–799, `ConnectionReset` ignored :845; `src/connection.rs` `peer_identity` :589,
+`export_keying_material` :625; `src/runtime.rs` (`AsyncUdpSocket`, `UdpPoller`) and
+`src/runtime/tokio.rs` ≈ :51–102. `quinn-proto-0.11.19/src/crypto/rustls.rs`
+`configured_provider` :582 (ring when `rustls-ring` is the only provider feature),
+`QuicServerConfig` `TryFrom` :492/:500; `src/config/mod.rs` `grease_quic_bit` :132,
+`migration` :292, `max_incoming` :324, `incoming_buffer_size` :340; the fixed-bit check
+`src/packet.rs:585`; packets from an unexpected remote dropped in
+`src/connection/mod.rs` :1131 and :2294. `quinn-udp-0.5.16/src/lib.rs` `Transmit` :135
+(`src_ip` :146), `log_sendmsg_error` :158 (compiled with the `tracing` feature, so always
+here); `src/unix.rs` `try_send` :223 and `IPV6_PKTINFO` :671; `src/windows.rs`
+`try_send` :168 and `IPV6_PKTINFO` :371. `rustls-0.23.46/src/server/handy.rs:187`
+`AlwaysResolvesServerRawPublicKeys`, `src/client/handy.rs:235`
+`AlwaysResolvesClientRawPublicKeys`, `src/webpki/verify.rs:213`
+`verify_tls13_signature_with_raw_key` (re-exported from `crypto`, `src/crypto/mod.rs:15`),
+`src/crypto/signer.rs` `SigningKey` :59 / `Signer` :77.
+
+What logs addresses or keys (input to design DIRECT-6, decision M1-83, step A7):
+- `quinn_udp::log_sendmsg_error` writes the destination and source addresses of a failed
+  send at `warn` (target `quinn_udp`), at most once a minute; quinn-proto logs connection
+  IDs and remote addresses at `debug`/`trace` (target `quinn_proto`; for example
+  "discarding packet from unrecognized peer {remote}", `src/connection/mod.rs:1132`, and
+  `initial_dcid`, `src/endpoint.rs:356`).
+- rustls logs through the `log` crate when its `logging` feature is on (it is, in the
+  app): at `trace` the client logs the server's certificate chain
+  (`src/client/tls13.rs:1178`) and the server the certificate it sends
+  (`src/server/tls13.rs:799`). With raw public keys that is an Ed25519
+  SubjectPublicKeyInfo, a device key. The app's `tracing-subscriber` has its `tracing-log`
+  feature on (through the existing graph), so such records can reach Tornect's layers.
+- Step A7's filter drops these targets before any layer formats them; nothing in A1 runs
+  quinn, so nothing is logged yet.
+
 ---
 
 ## 0. TL;DR for implementers

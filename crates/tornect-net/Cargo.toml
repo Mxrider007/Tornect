@@ -10,6 +10,11 @@ publish.workspace = true
 
 [dependencies]
 tornect-core.workspace = true
+# Direct connections, Phase A (design `direct` §10, decision M1-81): the code
+# that uses them lands in the following steps; docs/DEPENDENCIES.md has the rows.
+quinn.workspace = true
+netdev.workspace = true
+socket2.workspace = true
 
 [lints]
 workspace = true

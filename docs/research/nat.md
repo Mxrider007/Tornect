@@ -324,6 +324,10 @@ let decoded = MessageDecoder::<Attribute>::new().decode_from_bytes(&bytes)?.map_
 
 ### 2.4 if-addrs 0.15.0
 
+> **Superseded (2026-10-26):** host candidates read the interface list with netdev 0.46.3
+> (design `direct` §7.1, decision M1-81), which has the IPv6 address flags, the interface
+> type and the adapter description that if-addrs lacks: `docs/research/nat-traversal.md` §1.
+
 ```rust
 pub fn get_if_addrs() -> io::Result<Vec<Interface>>;             // src/lib.rs:360 (posix) / :512 (windows)
 pub struct Interface { pub name: String, pub addr: IfAddr, pub index: Option<u32>, pub oper_status: IfOperStatus,

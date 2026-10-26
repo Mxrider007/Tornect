@@ -136,6 +136,21 @@ zbus = { version = "=5.19.0", default-features = false, features = ["tokio"] }
 # new crate and keeps `apps/tornect` free of `libc` and of `unsafe`.
 rustix = { version = "=1.1.4", default-features = false, features = ["std", "termios", "stdio"] }
 
+# Milestone 2 — direct connections, Phase A (design `direct` §10; decisions
+# M1-78 and M1-81). `tornect-net` is the only crate that names them.
+# quinn carries a direct session over one QUIC connection with both device keys
+# pinned as raw public keys (docs/research/quic.md); `rustls-ring` keeps ring the
+# only rustls provider (M1-3), and the defaults `log`, `platform-verifier` (OS
+# trust stores) and `bloom` stay off. quinn-proto 0.11.19 and quinn-udp 0.5.16
+# come with it. netdev reads the interface list (docs/research/nat-traversal.md
+# §1); without default features, and its `gateway` feature stays off in Phase A
+# and always on Windows, where it may send ARP. socket2 binds the session's one
+# UDP socket (dual stack where the OS has IPv6); it was already in the lock at this
+# version (tokio, quinn-udp).
+quinn = { version = "=0.11.12", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+netdev = { version = "=0.46.3", default-features = false }
+socket2 = "=0.6.5"
+
 # Fuzzing helpers (fuzz/ crate is workspace-excluded; `arbitrary` derives shared with it).
 arbitrary = { version = "=1.4.2", features = ["derive"] }
 
