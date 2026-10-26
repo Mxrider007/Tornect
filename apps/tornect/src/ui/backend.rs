@@ -614,12 +614,37 @@ fn save_settings(paths: &Paths, shared: &Shared, change: &SettingsChange) -> Opt
     }
 }
 
-/// The services' policy as `saved` holds it, for the sessions that start
-/// from now on (design `services` §2.5: settings apply to later sessions;
-/// each live one keeps the snapshot it took at its start). Whether it
-/// changed.
-fn republish(policy: &watch::Sender<ServicesPolicy>, saved: &Config) -> bool {
-    let now = ServicesPolicy::from_config(&saved.services);
+/// The services' policy the window host publishes for `services`: as they
+/// say, but without the clipboard where the running portal request does not
+/// ask the desktop for it (`portal_lacks_clipboard`,
+/// `Model::portal_lacks_clipboard`: a Wayland desktop with `[services]
+/// wayland_clipboard` off at this start). No session is then eligible for
+/// it, so the desktop is never asked and no session is told the desktop
+/// refused it: the strip never says "This desktop did not allow clipboard
+/// sharing" of a clipboard Tornect never asked for, and what the host serves
+/// is what the sheet, the wizard and the block window say
+/// (`Model::services_offered`).
+fn host_policy(
+    services: &tornect_core::config::Services,
+    portal_lacks_clipboard: bool,
+) -> ServicesPolicy {
+    let mut policy = ServicesPolicy::from_config(services);
+    if portal_lacks_clipboard {
+        policy.clipboard = false;
+    }
+    policy
+}
+
+/// The services' policy as `saved` holds it ([`host_policy`]), for the
+/// sessions that start from now on (design `services` §2.5: settings apply
+/// to later sessions; each live one keeps the snapshot it took at its
+/// start). Whether it changed.
+fn republish(
+    policy: &watch::Sender<ServicesPolicy>,
+    saved: &Config,
+    portal_lacks_clipboard: bool,
+) -> bool {
+    let now = host_policy(&saved.services, portal_lacks_clipboard);
     policy.send_if_modified(|held| {
         let changed = *held != now;
         *held = now;
@@ -2117,8 +2142,10 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
     };
     // What Settings, Sharing last saved, which a save before hosting
     // started did not publish (there was no watch yet).
-    let saved = b.shared.read(|m| m.settings.services);
-    let (policy, policy_rx) = watch::channel(ServicesPolicy::from_config(&saved));
+    let (saved, lacks_clipboard) = b
+        .shared
+        .read(|m| (m.settings.services, m.portal_lacks_clipboard()));
+    let (policy, policy_rx) = watch::channel(host_policy(&saved, lacks_clipboard));
     let observer = Arc::new(GuiServices::new(
         Arc::clone(&b.shared),
         Arc::clone(audit.log()),
@@ -3132,7 +3159,8 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     Command::SaveSettings(change) => {
                         let saved = save_settings(&b.paths, &b.shared, &change);
                         if let (Some(saved), Some(hosted)) = (saved, &hosted) {
-                            republish(&hosted.policy, &saved);
+                            let lacks = b.shared.read(|m| m.portal_lacks_clipboard());
+                            republish(&hosted.policy, &saved, lacks);
                         }
                     }
                     Command::Manager(ManagerOp::RotateId) => {
@@ -9830,12 +9858,65 @@ mod tests {
         let (policy, _rx) = watch::channel(ServicesPolicy::from_config(&saved.services));
         let started = policy.borrow().clone();
         saved.general.device_name = "Desk".to_owned();
-        assert!(!republish(&policy, &saved), "nothing of [services] changed");
+        assert!(
+            !republish(&policy, &saved, false),
+            "nothing of [services] changed"
+        );
         saved.services.browse_files = false;
-        assert!(republish(&policy, &saved));
+        assert!(republish(&policy, &saved, false));
         assert!(!policy.borrow().browse_files);
         assert!(started.browse_files, "a running session keeps its snapshot");
-        assert!(!republish(&policy, &saved), "published once");
+        assert!(!republish(&policy, &saved, false), "published once");
+    }
+
+    /// The final review's strip finding: on a Wayland desktop whose running
+    /// portal request does not ask for the clipboard (`[services]
+    /// wayland_clipboard` off, the default), the window host publishes no
+    /// clipboard, at its start and at each save, so a Control session with
+    /// input is not eligible for one: the desktop is never asked, and no
+    /// session is told it refused (no CLIPBOARD_REFUSED line on the strip).
+    /// With the switch on, or off a Wayland desktop, the clipboard follows
+    /// `[services] clipboard` as before.
+    #[test]
+    fn a_wayland_host_without_the_portal_clipboard_offers_none() {
+        use tornect_proto::services::caps;
+        use tornect_session::services::eligible;
+
+        let mut m = Model {
+            setup: Some(super::super::model::Setup {
+                token_file: std::path::PathBuf::from("token"),
+                granted: false,
+                busy: false,
+                note: None,
+            }),
+            ..Model::default()
+        };
+        assert!(!m.portal_clipboard);
+        assert!(m.portal_lacks_clipboard());
+        let saved = Config::default();
+        assert!(saved.services.clipboard, "on by default");
+        let policy = host_policy(&saved.services, m.portal_lacks_clipboard());
+        assert!(!policy.clipboard);
+        assert_eq!(policy, m.services_offered(), "what the sheet says");
+        assert_eq!(
+            eligible(&policy, SessionMode::Control, true) & caps::CLIP,
+            0
+        );
+        let (held, _rx) = watch::channel(ServicesPolicy::from_config(&saved.services));
+        assert!(republish(&held, &saved, m.portal_lacks_clipboard()));
+        assert!(!held.borrow().clipboard, "nor after a save");
+
+        m.portal_clipboard = true;
+        assert!(!m.portal_lacks_clipboard());
+        assert!(host_policy(&saved.services, m.portal_lacks_clipboard()).clipboard);
+        m.portal_clipboard = false;
+        m.setup = None;
+        assert!(!m.portal_lacks_clipboard(), "not a Wayland desktop shared");
+        let policy = host_policy(&saved.services, m.portal_lacks_clipboard());
+        assert_ne!(
+            eligible(&policy, SessionMode::Control, true) & caps::CLIP,
+            0
+        );
     }
 
     /// Wait until `done` holds of the model.

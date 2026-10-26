@@ -302,7 +302,7 @@ impl Model {
     pub fn services_offered(&self) -> tornect_session::services::ServicesPolicy {
         let services = &self.settings.services;
         let mut policy = tornect_session::services::ServicesPolicy::from_config(services);
-        if self.setup.is_some() && !self.portal_clipboard {
+        if self.portal_lacks_clipboard() {
             policy.clipboard = false;
         }
         if self.no_downloads {
@@ -318,7 +318,17 @@ impl Model {
     /// have had it.
     #[must_use]
     pub fn clipboard_not_shared(&self) -> bool {
-        self.setup.is_some() && (!self.portal_clipboard || self.clipboard_refused)
+        self.portal_lacks_clipboard() || (self.setup.is_some() && self.clipboard_refused)
+    }
+
+    /// This machine shares a Wayland desktop whose running portal request
+    /// does not ask for its clipboard ([`Self::portal_clipboard`] off): no
+    /// session here can have the clipboard, so the host offers none and
+    /// never asks the desktop for one (what the window host publishes,
+    /// `backend::host_policy`, and what [`Self::services_offered`] says).
+    #[must_use]
+    pub fn portal_lacks_clipboard(&self) -> bool {
+        self.setup.is_some() && !self.portal_clipboard
     }
 
     /// This computer's own ID, read from [`Model::id`]'s groups; `None`

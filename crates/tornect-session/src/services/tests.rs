@@ -935,6 +935,43 @@ async fn with_chat_off_a_session_without_input_is_offered_nothing() {
     assert_eq!(rig.desk.opens(), 0);
 }
 
+/// The final review's strip finding, the session side: a host whose policy
+/// has the clipboard off (the window host on a Wayland desktop whose portal
+/// request does not ask for it) never asks the desktop for one, and tells
+/// no session the desktop refused it, though the desktop has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clipboard_the_host_does_not_offer_is_never_refused() {
+    let mut rig = rig_with(Build {
+        desk: Desk {
+            no_clipboard: true,
+            ..Desk::default()
+        },
+        policy: ServicesPolicy {
+            clipboard: false,
+            ..ServicesPolicy::default()
+        },
+        ..Build::default()
+    });
+    let session = start(&rig, 93, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    assert_eq!(
+        welcome(&mut client, &session).await.caps,
+        caps::CHAT | caps::UPLOAD | caps::BROWSE
+    );
+    assert_eq!(
+        rig.event(&session.id).await,
+        HostEvent::Opened {
+            caps: caps::CHAT | caps::UPLOAD | caps::BROWSE,
+            input: true,
+            clipboard_refused: false
+        }
+    );
+    assert_eq!(rig.desk.opens(), 0, "the desktop was never asked");
+    drop(client);
+    served(task).await;
+}
+
 /// A Control session whose input reaches the desktop gets what the host
 /// allows, within the wire's bounds: the clipboard only when the desktop
 /// gives a link, uploads only with an inbox (made `0700`), the inbox's
