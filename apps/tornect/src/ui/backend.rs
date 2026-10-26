@@ -3308,12 +3308,11 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                         }
                     }
                     Command::Revoke => {
+                        // Both requests' grants: one made while the
+                        // clipboard switch stood the other way would
+                        // otherwise come back when it is turned again.
                         let token = crate::host::portal_token(&b.paths, &b.cfg);
-                        let removed = match std::fs::remove_file(&token) {
-                            Ok(()) => Ok(()),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                            Err(e) => Err(e),
-                        };
+                        let removed = crate::host::revoke_portal_grants(&b.paths);
                         b.shared.update(|m| {
                             if let Some(setup) = &mut m.setup {
                                 setup.granted = token.exists();

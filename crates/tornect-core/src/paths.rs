@@ -199,6 +199,18 @@ impl Paths {
         }
     }
 
+    /// The restore token files of both portal requests, the one without the
+    /// clipboard first: what revoking the desktop's grant deletes, whichever
+    /// request runs now, so that turning `[services] wayland_clipboard` on
+    /// (or off) again later never restores a grant the user revoked.
+    #[must_use]
+    pub fn portal_restore_tokens(&self) -> [PathBuf; 2] {
+        [
+            self.portal_restore_token_for(false),
+            self.portal_restore_token_for(true),
+        ]
+    }
+
     /// Restore tokens the request this host makes never restores, deleted at
     /// host start so no unused grant stays on disk: with the clipboard, the
     /// token of the request without it; without the clipboard, none, so a
@@ -309,6 +321,10 @@ mod tests {
         let with_clipboard = p.portal_restore_token_for(true);
         assert_ne!(with_clipboard, today);
         assert_eq!(with_clipboard.parent(), today.parent());
+        assert_eq!(
+            p.portal_restore_tokens(),
+            [today.clone(), with_clipboard.clone()]
+        );
         assert_eq!(p.retired_portal_tokens(true), [today]);
         assert!(!p.retired_portal_tokens(true).contains(&with_clipboard));
     }

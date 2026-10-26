@@ -391,6 +391,28 @@ pub fn portal_token(paths: &Paths, cfg: &Config) -> std::path::PathBuf {
     paths.portal_restore_token_for(cfg.services.wayland_clipboard)
 }
 
+/// Revoke the desktop's remembered screen-sharing grants: delete the restore
+/// token of both portal requests (`Paths::portal_restore_tokens`), not only
+/// the one the request with `[services] wayland_clipboard` as it is now
+/// would restore, so that a grant made while the switch stood the other way
+/// is never restored after the user revoked. A file already gone is no
+/// error; every file is tried, and the first other error is returned.
+pub fn revoke_portal_grants(paths: &Paths) -> std::io::Result<()> {
+    let mut first = Ok(());
+    for token in paths.portal_restore_tokens() {
+        match std::fs::remove_file(&token) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                if first.is_ok() {
+                    first = Err(e);
+                }
+            }
+        }
+    }
+    first
+}
+
 /// Delete the screen-sharing grants the portal request of a host with `cfg`
 /// never restores (with `[services] wayland_clipboard` on, the one made
 /// without the clipboard), so no unused bearer grant stays on disk; the
@@ -1891,6 +1913,28 @@ mod tests {
         assert!(with.exists());
         assert!(!PORTAL_CLIPBOARD.load(Ordering::SeqCst));
         drop(wiring);
+    }
+
+    /// The final review's revoke finding: revoking deletes the grant of both
+    /// portal requests, with the clipboard switch off or on, so that a grant
+    /// made while the switch was on is not restored when it is turned on
+    /// again; a file already gone is no error.
+    #[test]
+    fn revoking_deletes_the_grant_of_either_request() {
+        for switch in [false, true] {
+            let env = env();
+            let mut cfg = Config::default();
+            cfg.services.wayland_clipboard = switch;
+            std::fs::create_dir_all(&env.paths.state_dir).unwrap();
+            let [without, with] = env.paths.portal_restore_tokens();
+            std::fs::write(&without, "a grant without the clipboard").unwrap();
+            std::fs::write(&with, "a grant with the clipboard").unwrap();
+            assert!(portal_token(&env.paths, &cfg).exists());
+            revoke_portal_grants(&env.paths).unwrap();
+            assert!(!without.exists(), "switch {switch}");
+            assert!(!with.exists(), "switch {switch}");
+            revoke_portal_grants(&env.paths).unwrap();
+        }
     }
 
     /// The FSM audits into the host's `sessions.log`, and a host whose store

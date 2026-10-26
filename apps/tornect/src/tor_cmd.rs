@@ -187,6 +187,21 @@ pub(crate) fn capture_lines(paths: &Paths, cfg: &Config, desktop: &DesktopBacken
                     .to_owned(),
             );
         }
+        // A grant the other request made (the switch stood the other way)
+        // is restored again once the switch is turned back.
+        let other = paths.portal_restore_token_for(!cfg.services.wayland_clipboard);
+        if other.exists() {
+            lines.push(format!(
+                "  other desktop grant: {} [present], made {} the clipboard; delete it too to \
+                 revoke every remembered grant",
+                other.display(),
+                if cfg.services.wayland_clipboard {
+                    "without"
+                } else {
+                    "with"
+                }
+            ));
+        }
     }
     lines
 }
@@ -3385,6 +3400,41 @@ mod tests {
         assert_eq!(
             crate::host::portal_token(&paths, &cfg),
             paths.portal_restore_token_for(true)
+        );
+    }
+
+    /// The final review's revoke finding: a grant the other request made is
+    /// named too, so that it is not left on disk unseen; with none, the
+    /// lines are what they were.
+    #[test]
+    fn doctor_names_a_grant_the_other_request_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        let mut cfg = Config::default();
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let with = paths.portal_restore_token_for(true);
+        std::fs::write(&with, "made with the clipboard").unwrap();
+        let off = capture_lines(&paths, &cfg, &DesktopBackend::Wayland);
+        assert_eq!(off.len(), 3, "{off:?}");
+        assert_eq!(
+            off[2],
+            format!(
+                "  other desktop grant: {} [present], made with the clipboard; delete it too to \
+                 revoke every remembered grant",
+                with.display()
+            )
+        );
+        std::fs::remove_file(&with).unwrap();
+        assert_eq!(
+            capture_lines(&paths, &cfg, &DesktopBackend::Wayland).len(),
+            2
+        );
+        cfg.services.wayland_clipboard = true;
+        std::fs::write(paths.portal_restore_token(), "made without").unwrap();
+        let on = capture_lines(&paths, &cfg, &DesktopBackend::Wayland);
+        assert!(
+            on.last().unwrap().contains("made without the clipboard"),
+            "{on:?}"
         );
     }
 
