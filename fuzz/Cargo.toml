@@ -16,6 +16,8 @@ tornect-signal = { path = "../crates/tornect-signal", default-features = false }
 tornect-core = { path = "../crates/tornect-core" }
 # The media stream's frames (`media` target); pure Rust, no codec.
 tornect-proto = { path = "../crates/tornect-proto" }
+# The punch probe and the checklist of the direct path (`probe` target).
+tornect-net = { path = "../crates/tornect-net" }
 tokio = { version = "1.53.1", features = ["rt", "io-util", "test-util", "time"] }
 # Structure-aware inputs for the F3 store / limiter loaders (pinned in the workspace table too).
 arbitrary = "=1.4.2"
@@ -92,6 +94,16 @@ bench = false
 [[bin]]
 name = "services"
 path = "fuzz_targets/services.rs"
+test = false
+doc = false
+bench = false
+
+# The punch probe and the checklist (design `direct` §6.2, §7.6, §7.7, decision
+# M1-80): `ProbeKey::decode` and `seal`, and a scripted `Checklist` checked
+# against the §7.7 budgets after every step; seeds in `seeds/probe/`.
+[[bin]]
+name = "probe"
+path = "fuzz_targets/probe.rs"
 test = false
 doc = false
 bench = false
