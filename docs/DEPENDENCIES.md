@@ -10,9 +10,12 @@ with a "Logs addresses or keys?" column saying what the crate writes to a log on
 crate that touches the network (sockets, router protocols, interface lists, TLS) adds its log
 targets to `QUIET_TARGETS` in `crates/tornect-core/src/telemetry.rs` in the change that pins
 it, and `telemetry::tests::quiet_targets_are_the_crates_and_their_modules` names them. The
-tables written before that date keep their seven columns; none of their crates reads an
-address from the network on Tornect's behalf except Arti, whose own `WARN` lines are the
-user's bootstrap diagnostics (design S3) and are redacted as before.
+tables written before that date keep their seven columns. Of their crates, two write
+network detail on their own: rustls writes certificates at `trace` (its target has been in
+`QUIET_TARGETS` since step A7, which covers Arti's Tor channels too), and Arti and the
+`tor-*` crates write relay and circuit detail through their `safelog` redaction (on by default; Tornect never turns it off), at `warn`
+under the default filter; those `WARN` lines are the user's bootstrap and bridge
+diagnostics (design S3) and stay.
 
 Version note: the plan cites "Arti 2.0" — that is the Arti *project/CLI* version.
 The library crates (`arti-client`, `tor-hsservice`, …) use their own 0.x numbering
