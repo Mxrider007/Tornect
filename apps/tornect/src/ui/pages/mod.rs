@@ -2000,6 +2000,7 @@ mod tests {
             pictures: 0,
             size: (0, 0),
             stream: StreamInfo::default(),
+            services: None,
             screens: None,
         });
         model.ua_live = Some(UaLive {
@@ -2191,6 +2192,7 @@ mod tests {
                 control: false,
                 unattended: false,
                 since: Instant::now(),
+                services: None,
                 capture: None,
             }];
             for page in [Page::Home, Page::AddressBook] {
@@ -2323,6 +2325,7 @@ mod tests {
             control: true,
             unattended: false,
             since: Instant::now(),
+            services: None,
             capture: None,
         }];
         model.popups = vec![session_question(9, "Tablet")];
@@ -2414,6 +2417,7 @@ mod tests {
             control: false,
             unattended: false,
             since: Instant::now(),
+            services: None,
             capture: None,
         };
         type Set = Box<dyn Fn(&mut Model)>;
@@ -2563,6 +2567,7 @@ mod tests {
             pictures: 1,
             size: (1280, 720),
             stream: StreamInfo::default(),
+            services: None,
             screens: None,
         });
         live.dial = dial(None);
@@ -2605,6 +2610,7 @@ mod tests {
                 control: false,
                 unattended: false,
                 since: Instant::now(),
+                services: None,
                 capture: None,
             }];
             let window = Window::new(model, Page::Home, egui::Theme::Dark, WIDE);
@@ -2618,6 +2624,7 @@ mod tests {
             control: false,
             unattended: false,
             since: Instant::now(),
+            services: None,
             capture: None,
         }];
         let window = Window::new(live, Page::Home, egui::Theme::Dark, WIDE);
@@ -3112,6 +3119,7 @@ mod tests {
             control: true,
             unattended: false,
             since: Instant::now(),
+            services: None,
             capture: None,
         }];
         sharing.manager = Some(manager_on());
@@ -3358,6 +3366,7 @@ mod tests {
             control: true,
             unattended: false,
             since: Instant::now(),
+            services: None,
             capture: None,
         }];
         let mut elsewhere = model.clone();
@@ -4875,6 +4884,7 @@ mod tests {
                 control: false,
                 unattended: false,
                 since: Instant::now(),
+                services: None,
                 capture: None,
             }];
         }

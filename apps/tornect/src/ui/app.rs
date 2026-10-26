@@ -3349,6 +3349,7 @@ mod tests {
                         control,
                         administrator,
                         unattended,
+                        services: None,
                         screens: Some(listed(1)),
                         ..w.viewing.clone()
                     };
@@ -3520,6 +3521,7 @@ mod tests {
         for control in [false, true] {
             let viewing = Viewing {
                 control,
+                services: None,
                 screens: Some(listed(1)),
                 ..w.viewing.clone()
             };
@@ -3550,6 +3552,7 @@ mod tests {
                     assert!(!state.screens_menu, "a choice closes the menu");
                 }
                 let unlisted = Viewing {
+                    services: None,
                     screens: None,
                     ..viewing.clone()
                 };

@@ -266,6 +266,7 @@ mod tests {
             control,
             unattended: false,
             since: Instant::now(),
+            services: None,
             capture: None,
         }
     }

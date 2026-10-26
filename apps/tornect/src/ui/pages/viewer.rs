@@ -1808,6 +1808,7 @@ pub(crate) mod testing {
                     pictures: 1,
                     size: (1600, 900),
                     stream: StreamInfo::default(),
+                    services: None,
                     screens: None,
                 },
                 viewer: ViewerState::default(),

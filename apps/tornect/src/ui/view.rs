@@ -2548,6 +2548,7 @@ mod tests {
                 control: true,
                 unattended: false,
                 since: t0,
+                services: None,
                 capture: None,
             }],
             ..with_popups(Vec::new())
@@ -2641,6 +2642,7 @@ mod tests {
                 control: true,
                 unattended: false,
                 since: t0,
+                services: None,
                 capture: None,
             }],
             ..model.clone()
@@ -2861,6 +2863,7 @@ mod tests {
             control: true,
             unattended: true,
             since: now,
+            services: None,
             capture: Some(CaptureNote {
                 source: "wayland",
                 width: 1920,
@@ -2888,6 +2891,7 @@ mod tests {
                 pictures: 3,
                 size: (640, 480),
                 stream: StreamInfo::default(),
+                services: None,
                 screens: None,
             }),
             ClientStage::Ended("SESSION ENDED by the host".to_owned()),
@@ -2917,6 +2921,7 @@ mod tests {
             pictures: 1,
             size: (1600, 900),
             stream: StreamInfo::default(),
+            services: None,
             screens: None,
         };
         let mut actions = Vec::new();
@@ -3171,6 +3176,7 @@ mod tests {
                 pictures: 1,
                 size: (1600, 900),
                 stream: StreamInfo::default(),
+                services: None,
                 screens: None,
             };
             let mut nodes = Vec::new();
@@ -3246,6 +3252,7 @@ mod tests {
             pictures: 1,
             size: (1600, 900),
             stream: StreamInfo::default(),
+            services: None,
             screens: None,
         };
         for shared in [false, true] {
@@ -3572,6 +3579,7 @@ mod tests {
                     control: true,
                     unattended: false,
                     since: t0,
+                    services: None,
                     capture: None,
                 }],
                 ..with_popups(Vec::new())
@@ -3644,6 +3652,7 @@ mod tests {
                     control,
                     unattended: false,
                     since: t0,
+                    services: None,
                     capture: Some(CaptureNote {
                         source: "gdi",
                         width: 1920,

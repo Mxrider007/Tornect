@@ -1144,6 +1144,7 @@ mod tests {
                 pictures: 0,
                 size: (0, 0),
                 stream: StreamInfo::default(),
+                services: None,
                 screens: None,
             }),
             ..Model::default()
@@ -1258,6 +1259,7 @@ mod tests {
                 pictures: 0,
                 size: (0, 0),
                 stream: StreamInfo::default(),
+                services: None,
                 screens: None,
             }),
             ..Model::default()

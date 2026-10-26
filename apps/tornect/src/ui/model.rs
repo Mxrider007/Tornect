@@ -21,6 +21,7 @@ use tornect_input::Rect;
 use tornect_proto::{HostStats, MonitorEntry, QualityInfo};
 
 use super::backend::Secret;
+pub use super::services::{HostServices, ViewerServices};
 use crate::ua_client::AdminAction;
 use tornect_core::words::{Identicon, Words};
 
@@ -681,6 +682,9 @@ pub struct Sharing {
     pub since: Instant,
     /// What capture reported once the first picture went out.
     pub capture: Option<CaptureNote>,
+    /// The session's services (chat, the clipboard, files; design
+    /// `services` §7.2), once their stream opened.
+    pub services: Option<HostServices>,
 }
 
 /// What capture reported for a shared session.
@@ -875,6 +879,10 @@ pub struct Viewing {
     /// window's request for another (the monitors design §2); `None` until
     /// the host lists them, and for a host with nothing to choose.
     pub screens: Option<ScreensView>,
+    /// The session's services (chat, the clipboard, files; design
+    /// `services` §7.1): `None` when the host's signed `HELLO_ACK` does not
+    /// offer them. Boxed: the stage's other variants are small.
+    pub services: Option<Box<ViewerServices>>,
 }
 
 /// The host's monitors as the stream window shows them (the monitors
@@ -1675,6 +1683,7 @@ mod tests {
             pictures: 0,
             size: (0, 0),
             stream: StreamInfo::default(),
+            services: None,
             screens: None,
         };
         let mut model = Model {

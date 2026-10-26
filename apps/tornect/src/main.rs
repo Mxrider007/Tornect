@@ -34,6 +34,7 @@ mod install_cmd;
 mod prompt;
 mod rotate;
 mod secure_screen;
+mod services;
 mod term_block;
 #[cfg(test)]
 mod test_support;

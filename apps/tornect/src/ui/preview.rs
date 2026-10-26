@@ -260,6 +260,7 @@ fn viewed(now: Instant) -> Viewing {
         pictures: 0,
         size: (0, 0),
         stream: sample_stream(),
+        services: None,
         screens: Some(sample_screens()),
     }
 }
@@ -513,6 +514,7 @@ fn unattended(m: &mut Model, sheet: Sheet) -> bool {
                     pictures: 1,
                     size: (1920, 1080),
                     stream: StreamInfo::default(),
+                    services: None,
                     screens: None,
                 })
             };
@@ -618,6 +620,7 @@ fn stage(m: &mut Model, sheet: Sheet) -> bool {
             pictures: 1,
             size: (1920, 1080),
             stream: StreamInfo::default(),
+            services: None,
             screens: None,
         }),
         Sheet::StageUnreachable => ClientStage::Ended(
@@ -791,6 +794,7 @@ fn fill(m: &mut Model) {
         control: true,
         unattended: false,
         since: now,
+        services: None,
         capture: Some(CaptureNote {
             source: "wayland",
             width: 1920,

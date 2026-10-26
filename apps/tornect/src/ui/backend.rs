@@ -15,6 +15,10 @@ use tornect_core::levels::Elevation;
 use tornect_core::session_log::SessionMode;
 use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
 use tornect_input::InputEvent;
+use tornect_input::clipboard::ClipText;
+use tornect_session::services::{
+    ChatText, ServicesBinding, ServicesHost, ServicesLimits, ServicesPolicy, ViewerClip, ViewerOp,
+};
 use tornect_session::{
     CaptureChanged, CaptureStarted, MediaEnd, MediaHost, MediaLimits, MediaObserver, MediaReport,
     Source, SystemBackend, ViewerRequest,
@@ -32,7 +36,7 @@ use tornect_signal::pairing::AutoDeny;
 #[cfg(test)]
 use tornect_signal::pairing::KnownHostStore;
 use tornect_signal::tor::{Ladder, LadderEvent, OnionListener};
-use tornect_signal::{Isolation, MEDIA_PORT, SIGNALING_PORT, TorNode};
+use tornect_signal::{Isolation, MEDIA_PORT, SERVICES_PORT, SIGNALING_PORT, TorNode};
 
 use super::block::GuiBlockWindow;
 use super::book::{self, Change};
@@ -41,9 +45,11 @@ use super::model::{
     Candidate, CaptureNote, Check, ClientStage, DeviceCard, Dial, Failure, GrantLevel,
     GrantRequest, GrantRow, HostSetting, Hosting, Manager, ManagerOp, NewPassword, PauseEnd,
     PolicyInputs, RotateFailed, Settings, SettingsChange, Shared, Sharing, StreamInfo, TorState,
-    UnattendedBanner, ViewOnly, Viewing, Wake, WizardAnswer, WizardChoice, WizardView,
+    UnattendedBanner, ViewOnly, ViewerServices, Viewing, Wake, WizardAnswer, WizardChoice,
+    WizardView,
 };
 use super::recognize::Lookalike;
+use super::services::GuiServices;
 use super::stream::{FrameSlot, SlotSink};
 use crate::host::{
     ControlChannel, HostLock, HostWiring, PolkitRevocation, describe_end, describe_media, note,
@@ -134,8 +140,42 @@ pub enum Command {
     /// control and view-only sessions alike, unless a request waits for its
     /// answer (the monitors design §2, V1).
     ShowScreen(u8),
+    /// The host's person acts on a shared session's services (design
+    /// `services` §7.2): writes in its chat, stops one of its transfers, or
+    /// turns its clipboard and files off for the rest of the session.
+    #[expect(
+        dead_code,
+        reason = "sent by the sharing indicator's services rows (the design's step 23)"
+    )]
+    HostServices {
+        /// The shared session (`sessions.log`'s id).
+        session_id: String,
+        /// What to do.
+        op: HostServicesOp,
+    },
+    /// The viewer's person acts on the viewed session's services (design
+    /// §7.1): chat, the Clipboard switch, the files panels.
+    #[expect(
+        dead_code,
+        reason = "sent by the stream window's chat and files panels (the design's step 22)"
+    )]
+    Services(ViewerOp),
     /// Shut down.
     Quit,
+}
+
+/// What the host's person does with a shared session's services.
+// Made by the sharing indicator's services rows (the design's step 23).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostServicesOp {
+    /// Write to the viewer.
+    Chat(ChatText),
+    /// Stop the transfer whose row has this id (`Cancel{BY_HOST}`).
+    Cancel(u32),
+    /// Turn these caps (`tornect_proto::services::caps`) off for the rest
+    /// of the session: one way, never back (`ServicesHost::turn_off`).
+    TurnOff(u16),
 }
 
 /// A password on its way from the prompt to the attempt: wiped on drop,
@@ -180,6 +220,40 @@ pub struct StreamLink {
     /// control and view-only sessions alike: a new channel for every
     /// session, as for the picks.
     requests: Mutex<Option<mpsc::Sender<ViewerRequest>>>,
+    /// The services requests of the session being viewed
+    /// (`ServicesViewer::run` reads them; design `services` §6.1): a new
+    /// channel for every session, as for the picks.
+    services: Mutex<Option<mpsc::Sender<ViewerOp>>>,
+    /// The window's clipboard for the session's services (design §4.3).
+    clip: ClipSlot,
+}
+
+/// Services requests queued for the stream: the window sends one per click
+/// or key, and one beyond that is dropped.
+const SERVICES_REQUESTS: usize = 32;
+
+/// The stream window's clipboard as the viewed session's services stream
+/// sees it (design `services` §4.3, §7.1): what the window read of its
+/// clipboard goes out through `outbound`, what the host sent waits in
+/// `inbound` for the window to put it on this computer's clipboard.
+#[derive(Debug, Default)]
+struct ClipSlot {
+    /// The window reads and sets its clipboard for a session's services
+    /// (from the design's step 24, which says so): until it does, no
+    /// session shares a clipboard and the host is never asked to, so no
+    /// text of the host's leaves it for a window that would not use it.
+    window: std::sync::atomic::AtomicBool,
+    /// The session's ends, while its services run.
+    ends: Mutex<Option<WindowClip>>,
+}
+
+/// The window's ends of a session's clipboard channels.
+#[derive(Debug)]
+struct WindowClip {
+    /// Text the window read (newest wins).
+    outbound: watch::Sender<Option<ClipText>>,
+    /// Text the host sent (newest wins).
+    inbound: watch::Receiver<Option<ClipText>>,
 }
 
 /// The way to the host for input, while a control session runs.
@@ -221,6 +295,106 @@ impl StreamLink {
     /// The channel of the session's screen requests; `None` at its end.
     fn set_requests(&self, tx: Option<mpsc::Sender<ViewerRequest>>) {
         *self.requests.lock().unwrap_or_else(PoisonError::into_inner) = tx;
+    }
+
+    /// A session's services start: a fresh channel for their requests, whose
+    /// receiver goes to its stream.
+    fn start_services(&self) -> mpsc::Receiver<ViewerOp> {
+        let (tx, rx) = mpsc::channel(SERVICES_REQUESTS);
+        self.set_services(Some(tx));
+        rx
+    }
+
+    /// The channel of the session's services requests; `None` at its end.
+    fn set_services(&self, tx: Option<mpsc::Sender<ViewerOp>>) {
+        *self.services.lock().unwrap_or_else(PoisonError::into_inner) = tx;
+    }
+
+    /// Queue `op` for the viewed session's services stream; whether it was
+    /// queued (never blocks the UI thread). `false` with no services stream,
+    /// or with the queue full.
+    pub fn services(&self, op: ViewerOp) -> bool {
+        self.services
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|tx| tx.try_send(op).is_ok())
+    }
+
+    /// The window says whether it reads and sets its clipboard for the
+    /// sessions' services (design `services` §4.3; the stream window's
+    /// clipboard, step 24): sessions that start afterwards follow it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_window_clipboard(&self, on: bool) {
+        self.clip.window.store(on, Ordering::SeqCst);
+    }
+
+    /// A session's services start with the window's switch at `on`: a fresh
+    /// pair of clipboard channels, whose far ends go to its stream; `None`
+    /// when the window shares no clipboard (the host is then never asked
+    /// to share one).
+    fn start_clip(&self, on: bool) -> Option<ViewerClip> {
+        let mut ends = self
+            .clip
+            .ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *ends = None;
+        if !self.clip.window.load(Ordering::SeqCst) {
+            return None;
+        }
+        let (outbound, outbound_rx) = watch::channel(None);
+        let (inbound_tx, inbound) = watch::channel(None);
+        *ends = Some(WindowClip { outbound, inbound });
+        Some(ViewerClip {
+            outbound: outbound_rx,
+            inbound: inbound_tx,
+            on,
+        })
+    }
+
+    /// The session's clipboard channels go with its services.
+    fn end_clip(&self) {
+        *self
+            .clip
+            .ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// The window read `text` from this computer's clipboard (after it got
+    /// the keyboard focus, never while this computer shares its screen, and
+    /// never the text that was there when the session went live): it goes
+    /// to the host if the session's services share the clipboard, newest
+    /// wins. Whether a session's services took it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn offer_clip(&self, text: ClipText) -> bool {
+        self.clip
+            .ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|ends| {
+                ends.outbound.send_replace(Some(text));
+                true
+            })
+    }
+
+    /// The text the host sent that the window has not put on this
+    /// computer's clipboard yet (the newest), taken: each text is handed out
+    /// once.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn take_clip(&self) -> Option<ClipText> {
+        let mut ends = self
+            .clip
+            .ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let inbound = &mut ends.as_mut()?.inbound;
+        if !inbound.has_changed().unwrap_or(false) {
+            return None;
+        }
+        inbound.borrow_and_update().clone()
     }
 
     /// Ask the host of the session being viewed to show screen `id` (0: all
@@ -383,12 +557,13 @@ const NOT_SAVED_SHARED: &str = "Not saved: this screen is shared.";
 const NOT_SAVED_FILE: &str = "Not saved: the settings file could not be read or written.";
 
 /// Save one settings change: `config.toml` as it is now, with the change,
-/// checked and written back; the model then holds what was saved. Nothing is
-/// saved while this screen may be in a picture that leaves it.
-fn save_settings(paths: &Paths, shared: &Shared, change: &SettingsChange) {
+/// checked and written back; the model then holds what was saved, which is
+/// returned. Nothing is saved while this screen may be in a picture that
+/// leaves it.
+fn save_settings(paths: &Paths, shared: &Shared, change: &SettingsChange) -> Option<Config> {
     if shared.read(|m| m.screen_shared(Instant::now())) {
         shared.update(|m| m.settings.problem = Some(NOT_SAVED_SHARED));
-        return;
+        return None;
     }
     let path = paths.config_file();
     let saved = Config::load(&path).and_then(|mut cfg| {
@@ -396,13 +571,30 @@ fn save_settings(paths: &Paths, shared: &Shared, change: &SettingsChange) {
         cfg.save(&path).map(|()| cfg)
     });
     match saved {
-        Ok(cfg) => shared.update(|m| m.settings = Settings::of(&cfg)),
+        Ok(cfg) => {
+            shared.update(|m| m.settings = Settings::of(&cfg));
+            Some(cfg)
+        }
         // No error text: it may name the path, which names the account.
         Err(_) => {
             tracing::warn!("the settings were not saved");
             shared.update(|m| m.settings.problem = Some(NOT_SAVED_FILE));
+            None
         }
     }
+}
+
+/// The services' policy as `saved` holds it, for the sessions that start
+/// from now on (design `services` §2.5: settings apply to later sessions;
+/// each live one keeps the snapshot it took at its start). Whether it
+/// changed.
+fn republish(policy: &watch::Sender<ServicesPolicy>, saved: &Config) -> bool {
+    let now = ServicesPolicy::from_config(&saved.services);
+    policy.send_if_modified(|held| {
+        let changed = *held != now;
+        *held = now;
+        changed
+    })
 }
 
 /// How often a window that is not the host looks whether another Tornect
@@ -1578,6 +1770,15 @@ struct Hosted {
     /// unattended store).
     manager: Option<Arc<ManagerWatch>>,
     media: Arc<MediaHost>,
+    /// The services streams' host (design `services` §6).
+    services: Arc<ServicesHost>,
+    /// What the services report into: the model and `sessions.log`.
+    observer: Arc<GuiServices>,
+    /// The policy each session takes at its start (`[services]`),
+    /// republished whenever the settings are saved.
+    policy: watch::Sender<ServicesPolicy>,
+    /// Reads the lock while a services stream is open (design §2.3).
+    lock_watch: JoinHandle<()>,
     live: Arc<LiveSessions>,
     audit: Arc<HostAudit>,
     ipc: Option<JoinHandle<()>>,
@@ -1593,6 +1794,12 @@ struct GuiSessions {
     /// polkit's remembered approvals, revoked during Control sessions.
     polkit: Arc<PolkitRevocation>,
     media: Arc<MediaHost>,
+    /// The sessions' services (design `services` §6): each session takes
+    /// its policy at its start, before its media starts.
+    services: Arc<ServicesHost>,
+    /// Where the services report: it keeps each session's peer for the
+    /// `sessions.log` lines of its files.
+    observer: Arc<GuiServices>,
     shared: Arc<Shared>,
     started: watch::Sender<u64>,
 }
@@ -1612,6 +1819,7 @@ impl SessionSink for GuiSessions {
             control,
             unattended: session.unattended,
             since: Instant::now(),
+            services: None,
             capture: None,
         };
         self.shared.update(|m| {
@@ -1625,6 +1833,14 @@ impl SessionSink for GuiSessions {
             }
             m.sharing.push(sharing);
         });
+        // The services' policy snapshot comes first (design `services`
+        // §2.5): settings saved from now on apply to later sessions.
+        self.observer.started(crate::services::Peer {
+            session_id: session.session_id.to_owned(),
+            device: session.device,
+            label: session.label.to_owned(),
+        });
+        self.services.on_start(session);
         // The media starts only now: the window counts this screen as shared
         // (and hides what sharing hides) before a frame can leave it.
         self.media.on_start(session);
@@ -1666,8 +1882,10 @@ impl SessionSink for GuiSessions {
     }
 
     fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
-        // Media first: that is what stops capture.
+        // Media first: that is what stops capture, and the services stream
+        // with it (`Close{SESSION_OVER}`).
         self.media.on_end(session_id, end);
+        self.services.on_end(session_id);
         self.live.on_end(session_id, end);
         self.polkit.on_end(session_id);
         let why = end.map_or_else(|| "protocol error".to_owned(), describe_end);
@@ -1858,12 +2076,44 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
     deps.block_window = Arc::new(GuiBlockWindow::new(Arc::clone(&b.popups)));
     // Each unattended session's length goes on its grant (the reconnect
     // cooldown, §B.8.6.4), as on the terminal host.
+    // The services: their places and inbox are read off the command loop
+    // (canonicalising touches the disk), and they report into the model and
+    // the host's one handle on `sessions.log`.
+    let env = {
+        let paths = b.paths.clone();
+        tokio::task::spawn_blocking(move || crate::services::host_env(&paths))
+            .await
+            .map_err(|e| format!("preparing the session services: {e}"))?
+    };
+    let (policy, policy_rx) = watch::channel(ServicesPolicy::from_config(&b.cfg.services));
+    let observer = Arc::new(GuiServices::new(
+        Arc::clone(&b.shared),
+        Arc::clone(audit.log()),
+    ));
+    let services = Arc::new(ServicesHost::new(
+        Arc::clone(&media),
+        Arc::clone(&observer) as Arc<dyn tornect_session::services::ServicesObserver>,
+        policy_rx,
+        env,
+        ServicesLimits::default(),
+    ));
+    let lock_watch = {
+        let (open, set) = (Arc::clone(&services), Arc::clone(&services));
+        tokio::spawn(crate::services::watch_lock(
+            crate::services::SystemLock::default(),
+            move || open.open_streams(),
+            move |locked| set.set_locked(locked),
+            crate::services::LOCK_EVERY,
+        ))
+    };
     deps.sessions = crate::host::UnattendedUse::wrap(
         &ctx,
         Arc::new(GuiSessions {
             live: Arc::clone(&live),
             polkit: Arc::clone(&polkit),
             media: Arc::clone(&media),
+            services: Arc::clone(&services),
+            observer: Arc::clone(&observer),
             shared: Arc::clone(&b.shared),
             started: started_tx,
         }),
@@ -1945,6 +2195,10 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         banner,
         manager,
         media,
+        services,
+        observer,
+        policy,
+        lock_watch,
         live,
         audit,
         ipc,
@@ -1952,6 +2206,91 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         pins,
         _lock: lock,
     })
+}
+
+/// The host's person acts on shared session `session_id`'s services (design
+/// `services` §7.2): a message that went out shows on its card at once; a
+/// turn-off of the clipboard and files the session still has (chat is not
+/// turned off this way) is written to `sessions.log` here, where it is
+/// asked for: the stream raises no event of its own for it, and its `Caps`
+/// follow.
+fn host_services(
+    services: &ServicesHost,
+    observer: &GuiServices,
+    shared: &Shared,
+    session_id: &str,
+    op: HostServicesOp,
+) {
+    use tornect_proto::services::caps;
+    match op {
+        HostServicesOp::Chat(text) => {
+            if services.send_chat(session_id, text.clone()) {
+                shared.update(|m| {
+                    if let Some(card) = m
+                        .sharing
+                        .iter_mut()
+                        .find(|s| s.session_id == session_id)
+                        .and_then(|s| s.services.as_mut())
+                    {
+                        card.said(text);
+                    }
+                });
+            }
+        }
+        HostServicesOp::Cancel(xfer) => {
+            services.cancel(session_id, xfer);
+        }
+        HostServicesOp::TurnOff(off) => {
+            // Only what the card says the session still has: the line then
+            // names what was taken away, never a service it never had.
+            let left = shared.read(|m| {
+                m.sharing
+                    .iter()
+                    .find(|s| s.session_id == session_id)
+                    .and_then(|s| s.services.as_ref())
+                    .map_or(0, |card| card.caps)
+            });
+            let off = off & left & (caps::CLIP | caps::UPLOAD | caps::BROWSE);
+            if off == 0 || !services.turn_off(session_id, off) {
+                return;
+            }
+            let peer = observer.peer(session_id);
+            let record = crate::services::turned_off_record(session_id, peer.as_ref(), off);
+            if let Err(e) = observer.log().append(&record) {
+                tracing::warn!(error = %e, "could not append to sessions.log");
+            }
+        }
+    }
+}
+
+/// The viewer's person acts on the viewed session's services (design
+/// `services` §7.1): the request goes to its stream (never blocking), and a
+/// message or a switch that went shows in the window at once. Nothing
+/// happens without a services stream.
+fn viewer_services(shared: &Shared, link: &StreamLink, op: ViewerOp) {
+    let said = match &op {
+        ViewerOp::Chat(text) => Some(text.clone()),
+        _ => None,
+    };
+    let switch = match &op {
+        ViewerOp::ClipSwitch(on) => Some(*on),
+        _ => None,
+    };
+    if !link.services(op) {
+        return;
+    }
+    shared.update(|m| {
+        if let ClientStage::Live(viewing) = &mut m.client
+            && let Some(services) = &mut viewing.services
+        {
+            if let Some(text) = said {
+                services.said(text);
+            }
+            if let Some(on) = switch {
+                services.clipboard = on;
+            }
+        }
+    });
 }
 
 /// The wait before the first automatic try after Tor, or the publishing of
@@ -2319,11 +2658,13 @@ async fn ask_the_name(b: &mut Backend, commands: &mut mpsc::UnboundedReceiver<Co
         match commands.recv().await {
             Some(Command::FirstRunName(name)) => {
                 if let Some(name) = name {
-                    save_settings(&b.paths, &b.shared, &SettingsChange::DeviceName(name));
+                    let _ = save_settings(&b.paths, &b.shared, &SettingsChange::DeviceName(name));
                 }
                 break;
             }
-            Some(Command::SaveSettings(change)) => save_settings(&b.paths, &b.shared, &change),
+            Some(Command::SaveSettings(change)) => {
+                let _ = save_settings(&b.paths, &b.shared, &change);
+            }
             Some(Command::SetHistory(on)) => change_book(b, &Change::History(on)),
             Some(Command::ClearHistory) => change_book(b, &Change::Clear),
             Some(Command::Quit) | None => return false,
@@ -2496,6 +2837,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
     let mut granting: Option<JoinHandle<Result<(bool, bool), String>>> = None;
     let slots = Arc::new(Semaphore::new(tornect_signal::tor::MAX_LIVE_CIRCUITS));
     let mut media_streams = JoinSet::new();
+    let mut services_streams = JoinSet::new();
     // Rotate ID was asked for: it runs once the sessions, the host role and
     // Tor have stopped, and the window closes after it.
     let mut rotating: Option<Arc<ManagerWatch>> = None;
@@ -2567,6 +2909,7 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     continue;
                 };
                 while media_streams.try_join_next().is_some() {}
+                while services_streams.try_join_next().is_some() {}
                 if stream.port() == MEDIA_PORT {
                     let media = Arc::clone(&hosted.media);
                     media_streams.spawn(async move {
@@ -2577,9 +2920,19 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     });
                     continue;
                 }
-                // SERVICES_PORT, which the listener also admits, is not
-                // answered yet (design `services` step 20): dropping the stream
-                // closes it and leaves the circuit.
+                // The session's services (design `services` §6.3): each stream
+                // bounds itself (the bind deadline, its session's end), and the
+                // listener's cap of 4 streams per circuit bounds how many.
+                if stream.port() == SERVICES_PORT {
+                    let services = Arc::clone(&hosted.services);
+                    services_streams.spawn(async move {
+                        let outcome = services.serve(stream).await;
+                        if let Some(line) = crate::services::describe_outcome(&outcome) {
+                            note(format_args!("{line}"));
+                        }
+                    });
+                    continue;
+                }
                 if stream.port() != SIGNALING_PORT {
                     continue;
                 }
@@ -2673,6 +3026,18 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                         b.link.request_quality(preset);
                     }
                     Command::ShowScreen(id) => show_screen(&b.shared, &b.link, id),
+                    Command::HostServices { session_id, op } => {
+                        if let Some(hosted) = &hosted {
+                            host_services(
+                                &hosted.services,
+                                &hosted.observer,
+                                &b.shared,
+                                &session_id,
+                                op,
+                            );
+                        }
+                    }
+                    Command::Services(op) => viewer_services(&b.shared, &b.link, op),
                     Command::StopSharing => {
                         if let Some(hosted) = &hosted {
                             stop_sharing(&hosted.serving.1.kill, &b.shared);
@@ -2731,7 +3096,12 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
                     }
                     Command::ClearHistory => change_book(&b, &Change::Clear),
                     Command::SetHistory(on) => change_book(&b, &Change::History(on)),
-                    Command::SaveSettings(change) => save_settings(&b.paths, &b.shared, &change),
+                    Command::SaveSettings(change) => {
+                        let saved = save_settings(&b.paths, &b.shared, &change);
+                        if let (Some(saved), Some(hosted)) = (saved, &hosted) {
+                            republish(&hosted.policy, &saved);
+                        }
+                    }
                     Command::Manager(ManagerOp::RotateId) => {
                         // Not while another operation waits at its password
                         // dialog: the wipe would come between its dialog and
@@ -2942,8 +3312,10 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
             // A session that goes live during the grace ends too (P2-I4).
             hosted.serving.1.kill.kill(bye::USER);
             while media_streams.try_join_next().is_some() {}
+            while services_streams.try_join_next().is_some() {}
             let busy = hosted.serving.1.stats.streams.load(Ordering::SeqCst) > 0
-                || !media_streams.is_empty();
+                || !media_streams.is_empty()
+                || !services_streams.is_empty();
             if !busy || tokio::time::Instant::now() >= grace {
                 break;
             }
@@ -2956,7 +3328,9 @@ pub async fn run(mut b: Backend, mut commands: mpsc::UnboundedReceiver<Command>)
             ));
         }
         media_streams.abort_all();
+        services_streams.abort_all();
         hosted.kill_watch.abort();
+        hosted.lock_watch.abort();
         if let Some(ipc) = &hosted.ipc {
             ipc.abort();
         }
@@ -3456,6 +3830,8 @@ async fn view_session(
     b.link.set_input(None);
     b.link.set_quality(None);
     b.link.set_requests(None);
+    b.link.set_services(None);
+    b.link.end_clip();
     let message = match ended {
         Ok(message) => message,
         Err(e) => format!("{e:#}"),
@@ -3474,6 +3850,54 @@ async fn view_session(
         m.ua_live = None;
         m.note(message);
     });
+}
+
+/// The viewed session's services stream (design `services` §6.1, §7.1): its
+/// binding, what it works with on this computer (made off this task: the
+/// places are canonicalised), a fresh channel for the person's requests,
+/// the window's clipboard when the window shares one, its switch from
+/// `[viewer] clipboard_sync`, and its news into the model. Also the switch.
+async fn services_start(
+    b: &Backend,
+    binding: ServicesBinding,
+) -> (crate::tor_cmd::ServicesStart, bool) {
+    let on = b.shared.read(|m| m.settings.viewer.clipboard_sync);
+    let clip = b.link.start_clip(on);
+    let (paths, cfg) = (b.paths.clone(), b.cfg.services);
+    // A failed preparation leaves nothing to send and nowhere to download
+    // to: chat still works.
+    let local =
+        tokio::task::spawn_blocking(move || crate::services::viewer_local(&paths, &cfg, clip))
+            .await
+            .unwrap_or_default();
+    let shared = Arc::clone(&b.shared);
+    let report: crate::tor_cmd::ServicesReport =
+        Arc::new(move |news| shared.update(|m| services_news(m, news)));
+    let start = crate::tor_cmd::ServicesStart {
+        binding,
+        local,
+        ops: b.link.start_services(),
+        report,
+    };
+    (start, on)
+}
+
+/// What the viewed session's services stream said, into the model: only
+/// while that session is live and offers services.
+fn services_news(m: &mut super::model::Model, news: crate::tor_cmd::ServicesNews) {
+    use crate::tor_cmd::ServicesNews;
+    let ClientStage::Live(viewing) = &mut m.client else {
+        return;
+    };
+    let Some(services) = &mut viewing.services else {
+        return;
+    };
+    match news {
+        ServicesNews::Opened(welcome) => services.opened(&welcome),
+        ServicesNews::NotOpened(refused) => services.not_opened(refused),
+        ServicesNews::Event(event) => services.apply(event),
+        ServicesNews::Ended(end) => services.finished(end),
+    }
 }
 
 /// View `id` until the session ends; `live` gets the session's id once it
@@ -3688,6 +4112,19 @@ async fn viewed(
     // Its own channel for screen requests too, in either mode: choosing a
     // screen is a viewing choice (the monitors design §4).
     let requests = b.link.start_requests();
+    // The services stream, only when the host's signed HELLO_ACK offers it:
+    // a host of an earlier version destroys the circuit on its port (design
+    // `services` §0).
+    let services = if session.host_has(tornect_signal::messages::feats::SVC1) {
+        let binding = ServicesBinding::new(session.session_token(), &session.th());
+        Some(services_start(b, binding).await)
+    } else {
+        None
+    };
+    let card = services
+        .as_ref()
+        .map(|(_, on)| Box::new(ViewerServices::opening(*on)));
+    let services = services.map(|(start, _)| start);
     b.shared.update(|m| {
         m.go_live(Viewing {
             host: host.clone(),
@@ -3698,6 +4135,7 @@ async fn viewed(
             pictures: 0,
             size: (0, 0),
             stream: StreamInfo::default(),
+            services: card,
             screens: None,
         });
     });
@@ -3736,6 +4174,7 @@ async fn viewed(
         forward: Some(&mut sink),
         quality,
         quality_rx: Some(picks),
+        services,
         ..crate::tor_cmd::WatchOptions::default()
     };
     let end = crate::tor_cmd::watch(node, &id, &isolation, &mut session, stop, watching).await;
@@ -3746,6 +4185,8 @@ async fn viewed(
     b.link.set_input(None);
     b.link.set_quality(None);
     b.link.set_requests(None);
+    b.link.set_services(None);
+    b.link.end_clip();
     Ok(match end? {
         End::You => {
             if let Err(e) = session.bye(bye::USER).await {
@@ -3940,6 +4381,28 @@ mod tests {
     use super::super::indicator::{Change, Indicator};
     use super::super::model::{Model, PopupKind};
     use super::*;
+
+    /// The window host's services over `media`, as `host_role` builds them,
+    /// with no places, no inbox and the default policy; their
+    /// `sessions.log` lines go to `log`.
+    fn test_services(
+        media: &Arc<MediaHost>,
+        shared: &Arc<Shared>,
+        log: &std::path::Path,
+    ) -> (Arc<ServicesHost>, Arc<GuiServices>) {
+        let observer = Arc::new(GuiServices::new(
+            Arc::clone(shared),
+            Arc::new(tornect_core::session_log::SessionLog::new(log)),
+        ));
+        let services = Arc::new(ServicesHost::new(
+            Arc::clone(media),
+            Arc::clone(&observer) as Arc<dyn tornect_session::services::ServicesObserver>,
+            watch::channel(ServicesPolicy::default()).1,
+            tornect_session::services::ServicesEnv::default(),
+            ServicesLimits::default(),
+        ));
+        (services, observer)
+    }
 
     /// Decision M1-75 (3), the final review: the session sheet of a host
     /// sharing the test screens asks for both of them, the test card's for
@@ -5968,6 +6431,7 @@ mod tests {
                 pictures: 0,
                 size: (0, 0),
                 stream: StreamInfo::default(),
+                services: None,
                 screens: None,
             });
         });
@@ -6000,10 +6464,13 @@ mod tests {
                 live: Arc::new(move || activity.session_live()),
             },
         ));
+        let (services, observer) = test_services(&media, &shared, &paths.sessions_log());
         wiring.deps.sessions = Arc::new(GuiSessions {
             live: Arc::clone(&wiring.live),
             polkit: Arc::clone(&wiring.polkit),
             media,
+            services,
+            observer,
             shared: Arc::clone(&shared),
             started: started_tx,
         });
@@ -6100,10 +6567,14 @@ mod tests {
             MediaLimits::default(),
         ));
         let (started, _seen) = watch::channel(0u64);
+        let tmp = tempfile::tempdir().unwrap();
+        let (services, observer) = test_services(&media, &shared, &tmp.path().join("sessions.log"));
         let sessions = GuiSessions {
             live: Arc::new(LiveSessions::new()),
             polkit: Arc::new(PolkitRevocation::for_this_host()),
             media,
+            services,
+            observer,
             shared: Arc::clone(&shared),
             started,
         };
@@ -6148,10 +6619,14 @@ mod tests {
             MediaLimits::default(),
         ));
         let (started, _seen) = watch::channel(0u64);
+        let tmp = tempfile::tempdir().unwrap();
+        let (services, observer) = test_services(&media, &shared, &tmp.path().join("sessions.log"));
         let sessions = GuiSessions {
             live: Arc::new(LiveSessions::new()),
             polkit: Arc::new(PolkitRevocation::for_this_host()),
             media,
+            services,
+            observer,
             shared: Arc::clone(&shared),
             started,
         };
@@ -8836,6 +9311,7 @@ mod tests {
                 pictures: 0,
                 size: (0, 0),
                 stream: StreamInfo::default(),
+                services: None,
                 screens,
             })
         };
@@ -8885,6 +9361,7 @@ mod tests {
             control: true,
             unattended: false,
             since: Instant::now(),
+            services: None,
             capture: None,
         };
         shared.update(|m| m.sharing = vec![sharing("s-1"), sharing("s-2")]);
@@ -8956,5 +9433,333 @@ mod tests {
             input: false,
         });
         assert_eq!(note("s-1"), first);
+    }
+
+    /// A session's services get the window's clipboard only once the window
+    /// says it reads and sets its clipboard (design `services` §4.3; until
+    /// then the host is never asked to share one). The text the window read
+    /// goes out newest-wins, the host's text is taken once, and both ends go
+    /// with the session's services.
+    #[test]
+    fn the_services_get_the_windows_clipboard_only_when_it_handles_one() {
+        let text = |t: &str| ClipText::new(t.to_owned()).unwrap();
+        let link = StreamLink::default();
+        assert!(
+            link.start_clip(true).is_none(),
+            "the window shares none yet"
+        );
+        assert!(!link.offer_clip(text("early")));
+        assert!(link.take_clip().is_none());
+
+        link.set_window_clipboard(true);
+        let mut clip = link.start_clip(false).expect("the window shares one now");
+        assert!(!clip.on, "the switch as the settings hold it");
+        assert!(link.offer_clip(text("first")));
+        assert!(link.offer_clip(text("second")));
+        assert_eq!(
+            clip.outbound
+                .borrow_and_update()
+                .as_ref()
+                .map(ClipText::as_str),
+            Some("second"),
+            "newest wins"
+        );
+        assert!(link.take_clip().is_none(), "the host sent nothing yet");
+        clip.inbound.send_replace(Some(text("from the host")));
+        assert_eq!(
+            link.take_clip().as_ref().map(ClipText::as_str),
+            Some("from the host")
+        );
+        assert!(link.take_clip().is_none(), "taken once");
+
+        link.end_clip();
+        assert!(!link.offer_clip(text("late")));
+        clip.inbound.send_replace(Some(text("after the end")));
+        assert!(link.take_clip().is_none());
+    }
+
+    /// The viewer's services requests go to the session's stream only while
+    /// it runs; one that went shows in the window at once (its message, its
+    /// switch), one that could not go changes nothing.
+    #[test]
+    fn the_viewers_services_requests_go_only_while_a_stream_runs() {
+        use super::super::services::ServicesState;
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        shared.update(|m| {
+            m.client = ClientStage::Live(Viewing {
+                host: "Desk".to_owned(),
+                control: false,
+                administrator: false,
+                unattended: false,
+                since: Instant::now(),
+                pictures: 0,
+                size: (0, 0),
+                stream: StreamInfo::default(),
+                services: Some(Box::new(ViewerServices::opening(true))),
+                screens: None,
+            });
+        });
+        let card = |shared: &Shared| {
+            shared.read(|m| match &m.client {
+                ClientStage::Live(v) => v.services.as_deref().cloned(),
+                _ => None,
+            })
+        };
+        let hello = tornect_session::services::sanitize_peer_text("hello").unwrap();
+        let link = StreamLink::default();
+        viewer_services(&shared, &link, ViewerOp::Chat(hello.clone()));
+        viewer_services(&shared, &link, ViewerOp::ClipSwitch(false));
+        let held = card(&shared).unwrap();
+        assert!(held.chat.is_empty() && held.clipboard, "nothing went");
+
+        let mut ops = link.start_services();
+        viewer_services(&shared, &link, ViewerOp::Chat(hello.clone()));
+        viewer_services(&shared, &link, ViewerOp::ClipSwitch(false));
+        assert_eq!(ops.try_recv().unwrap(), ViewerOp::Chat(hello.clone()));
+        assert_eq!(ops.try_recv().unwrap(), ViewerOp::ClipSwitch(false));
+        let held = card(&shared).unwrap();
+        assert_eq!(held.state, ServicesState::Opening);
+        assert!(!held.clipboard);
+        assert_eq!(held.chat.len(), 1);
+        assert!(!held.chat[0].theirs);
+        assert_eq!(held.chat[0].text, hello);
+
+        link.set_services(None);
+        assert!(!link.services(ViewerOp::ClipSwitch(true)));
+    }
+
+    /// Design `services` §2.5: a saved change of `[services]` is published
+    /// for the sessions that start afterwards, and a save that changes
+    /// nothing of it publishes nothing; a session's own snapshot stays.
+    #[test]
+    fn a_saved_services_change_reaches_later_sessions_only() {
+        let mut saved = Config::default();
+        let (policy, _rx) = watch::channel(ServicesPolicy::from_config(&saved.services));
+        let started = policy.borrow().clone();
+        saved.general.device_name = "Desk".to_owned();
+        assert!(!republish(&policy, &saved), "nothing of [services] changed");
+        saved.services.browse_files = false;
+        assert!(republish(&policy, &saved));
+        assert!(!policy.borrow().browse_files);
+        assert!(started.browse_files, "a running session keeps its snapshot");
+        assert!(!republish(&policy, &saved), "published once");
+    }
+
+    /// Wait until `done` holds of the model.
+    async fn until(shared: &Shared, what: &str, done: impl Fn(&Model) -> bool) {
+        for _ in 0..1500 {
+            if shared.read(&done) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{what} did not happen in time");
+    }
+
+    /// Steps 20 and 21 of the services design over in-memory streams: the
+    /// window host's sessions sink starts a session's services with its
+    /// media; the viewer's services stream opens once the media stream is
+    /// bound and capture is live; chat goes both ways into both cards; a
+    /// turn-off of a service the session does not have writes nothing; the
+    /// session's end closes the stream (`SESSION_OVER`), ends the viewer's
+    /// card and writes the summary line, which holds counts and no text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_window_hosts_services_carry_chat_both_ways() {
+        use tornect_proto::services::{caps, reason};
+        use tornect_session::services::{ServicesOutcome, ViewerLocal, sanitize_peer_text};
+
+        use super::super::services::ServicesState;
+        use crate::tor_cmd::{ServicesReport, ServicesStart, services_over};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("sessions.log");
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let media = Arc::new(MediaHost::new(
+            Arc::new(SystemBackend::new(Source::TestCard)),
+            Arc::new(GuiMedia {
+                shared: Arc::clone(&shared),
+            }),
+            MediaLimits::default(),
+        ));
+        let (services, observer) = test_services(&media, &shared, &log_path);
+        let (started, _seen) = watch::channel(0u64);
+        let sessions = GuiSessions {
+            live: Arc::new(LiveSessions::new()),
+            polkit: Arc::new(PolkitRevocation::for_this_host()),
+            media: Arc::clone(&media),
+            services: Arc::clone(&services),
+            observer: Arc::clone(&observer),
+            shared: Arc::clone(&shared),
+            started,
+        };
+        let token = tornect_signal::consent::SessionToken::new([0x24; 32]);
+        let session_id = token.session_id();
+        let th_final = [3; 32];
+        sessions.on_start(&LiveSession {
+            device: DeviceIdentity::from_seed(&[9; 32]).id(),
+            label: "Laptop",
+            session_id: &session_id,
+            token: &token,
+            th_final,
+            mode: SessionMode::ViewOnly,
+            elevation: Elevation::None,
+            unattended: false,
+        });
+
+        // The media stream, bound: capture goes live with its first picture.
+        let (media_client, media_server) = tokio::io::duplex(1 << 22);
+        let media_served = tokio::spawn({
+            let media = Arc::clone(&media);
+            async move { media.serve(media_server).await }
+        });
+        let _viewer = tornect_session::MediaViewer::bind(
+            media_client,
+            &tornect_session::Binding::new(&token, &th_final),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("the media stream binds");
+
+        // This window also views the session: the model holds both ends.
+        shared.update(|m| {
+            m.client = ClientStage::Live(Viewing {
+                host: "Desk".to_owned(),
+                control: false,
+                administrator: false,
+                unattended: false,
+                since: Instant::now(),
+                pictures: 0,
+                size: (0, 0),
+                stream: StreamInfo::default(),
+                services: Some(Box::new(ViewerServices::opening(false))),
+                screens: None,
+            });
+        });
+        let link = StreamLink::default();
+        let report: ServicesReport = {
+            let shared = Arc::clone(&shared);
+            Arc::new(move |news| shared.update(|m| services_news(m, news)))
+        };
+        let start = ServicesStart {
+            binding: ServicesBinding::new(&token, &th_final),
+            local: ViewerLocal::default(),
+            ops: link.start_services(),
+            report,
+        };
+        let (svc_client, svc_server) = tokio::io::duplex(1 << 20);
+        let served = tokio::spawn({
+            let services = Arc::clone(&services);
+            async move { services.serve(svc_server).await }
+        });
+        let viewer = tokio::spawn(services_over(
+            async { Ok(svc_client) },
+            start,
+            std::future::pending(),
+        ));
+        let viewer_card = |m: &Model| match &m.client {
+            ClientStage::Live(v) => v.services.as_deref().cloned(),
+            _ => None,
+        };
+        let host_card = |m: &Model| {
+            m.sharing
+                .iter()
+                .find(|s| s.session_id == session_id)
+                .and_then(|s| s.services.clone())
+        };
+        until(&shared, "both cards open", |m| {
+            viewer_card(m).is_some_and(|c| c.state == ServicesState::Open) && host_card(m).is_some()
+        })
+        .await;
+        let (viewer_now, host_now) = shared.read(|m| (viewer_card(m), host_card(m)));
+        assert_eq!(viewer_now.unwrap().caps, caps::CHAT, "view only: chat only");
+        assert_eq!(host_now.unwrap().caps, caps::CHAT);
+
+        let to_host = sanitize_peer_text("hello host").unwrap();
+        let to_viewer = sanitize_peer_text("hello viewer").unwrap();
+        viewer_services(&shared, &link, ViewerOp::Chat(to_host.clone()));
+        host_services(
+            &services,
+            &observer,
+            &shared,
+            &session_id,
+            HostServicesOp::Chat(to_viewer.clone()),
+        );
+        until(&shared, "each card shows both lines", |m| {
+            let lines = |chat: &[super::super::services::ChatLine]| {
+                chat.iter()
+                    .map(|l| (l.theirs, l.text.as_str().to_owned()))
+                    .collect::<Vec<_>>()
+            };
+            let viewer = viewer_card(m).map(|c| lines(&c.chat)).unwrap_or_default();
+            let host = host_card(m).map(|c| lines(&c.chat)).unwrap_or_default();
+            viewer.contains(&(false, "hello host".to_owned()))
+                && viewer.contains(&(true, "hello viewer".to_owned()))
+                && host.contains(&(true, "hello host".to_owned()))
+                && host.contains(&(false, "hello viewer".to_owned()))
+        })
+        .await;
+        // No transfer has this id: nothing changes.
+        host_services(
+            &services,
+            &observer,
+            &shared,
+            &session_id,
+            HostServicesOp::Cancel(99),
+        );
+        // The session has no clipboard: nothing to turn off, nothing logged.
+        host_services(
+            &services,
+            &observer,
+            &shared,
+            &session_id,
+            HostServicesOp::TurnOff(caps::CLIP),
+        );
+
+        sessions.on_end(&session_id, None);
+        let outcome = tokio::time::timeout(Duration::from_secs(20), served)
+            .await
+            .expect("the host's stream ends with the session")
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                ServicesOutcome::Served {
+                    reason: reason::SESSION_OVER,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(20), viewer)
+            .await
+            .expect("the viewer's stream ends with the host's")
+            .unwrap();
+        assert_eq!(
+            shared.read(|m| viewer_card(m).map(|c| c.state)),
+            Some(ServicesState::Ended(reason::SESSION_OVER))
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(20), media_served).await;
+
+        let records = tornect_core::session_log::SessionLog::new(&log_path)
+            .read_all()
+            .unwrap();
+        let ours: Vec<_> = records
+            .iter()
+            .filter(|r| r.session_id.as_deref() == Some(session_id.as_str()))
+            .map(|r| r.event)
+            .collect();
+        assert_eq!(
+            ours,
+            [tornect_core::session_log::SessionEvent::ServicesSummary],
+            "one summary line and no turn-off line"
+        );
+        let summary = records
+            .iter()
+            .find(|r| r.event == tornect_core::session_log::SessionEvent::ServicesSummary)
+            .unwrap();
+        assert_eq!(summary.peer_name.as_deref(), Some("Laptop"));
+        assert_eq!(summary.reason.as_deref(), Some("session_over"));
+        let written = std::fs::read_to_string(&log_path).unwrap();
+        assert!(!written.contains("hello"), "no chat text in sessions.log");
     }
 }

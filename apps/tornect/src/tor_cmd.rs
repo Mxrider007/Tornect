@@ -20,7 +20,12 @@ use tornect_core::keystore::{
 };
 use tornect_core::session_log::SessionMode;
 use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
+use tornect_proto::services::Welcome;
 use tornect_proto::{ALL_MONITORS, HostStats, ProtoError, QualityInfo, monitor_status};
+use tornect_session::services::{
+    ServicesBindError, ServicesBinding, ServicesViewer, ViewerEvent, ViewerLocal, ViewerOp,
+    ViewerServicesEnd,
+};
 use tornect_session::{
     Binding, DesktopBackend, FrameSink, MediaHost, MediaLimits, MediaViewer, Screens, ScreensNews,
     Source, SystemBackend, ViewerChannels, ViewerEnd, ViewerError, ViewerRequest, ViewerStats,
@@ -36,8 +41,8 @@ use tornect_signal::pairing::KnownHostStore;
 use tornect_signal::ping::NONCE_LEN;
 use tornect_signal::tor::Admission;
 use tornect_signal::{
-    HostSigner, Isolation, Ladder, LadderEvent, MEDIA_PORT, OnionStatus, SIGNALING_PORT,
-    SignalError, TorNode, install_crypto_provider, ping, shutdown_runtime,
+    HostSigner, Isolation, Ladder, LadderEvent, MEDIA_PORT, OnionStatus, SERVICES_PORT,
+    SIGNALING_PORT, SignalError, TorNode, install_crypto_provider, ping, shutdown_runtime,
 };
 
 use crate::host::{CliMedia, ControlChannel, HostLock, HostWiring, Served};
@@ -450,11 +455,15 @@ async fn run_host(
                     });
                     continue;
                 }
-                // The listener admits one more port, SERVICES_PORT, which this
-                // host does not answer yet (design `services` step 20): dropping
-                // the stream closes it, and the circuit with the session's media
-                // stays. Nothing advertises `svc1` before then, so no Tornect
-                // viewer opens it.
+                // The services stream (design `services` §8): this host
+                // advertises `svc1` like the window host, and answers every
+                // such stream `Refused{NOT_OFFERED}` without reading it: the
+                // terminal host offers no chat, clipboard or files. The
+                // session goes on without them.
+                if stream.port() == SERVICES_PORT {
+                    media_streams.spawn(tornect_session::services::refuse(stream));
+                    continue;
+                }
                 if stream.port() != SIGNALING_PORT {
                     continue;
                 }
@@ -1257,6 +1266,120 @@ pub(crate) struct WatchOptions<'a> {
     pub quality: QualityPreset,
     /// The viewer's picks during the session, each sent as a `SetQuality`.
     pub quality_rx: Option<watch::Receiver<QualityPreset>>,
+    /// The session's services stream, opened once the media stream is
+    /// bound (the window's viewer, when the host's signed `HELLO_ACK` offers
+    /// it; the terminal viewer opens none).
+    pub services: Option<ServicesStart>,
+}
+
+/// How long the viewer waits for the host's answer on its services stream:
+/// the host answers once the session's capture is live (it waits up to
+/// 10 s) and the desktop's clipboard opened (up to 5 s), over Tor.
+const SERVICES_BIND_WAIT: Duration = Duration::from_secs(45);
+
+/// Events of the services stream queued between its run and the window.
+const SERVICES_EVENTS: usize = 64;
+
+/// What the viewer's services stream says (design `services` §6.1).
+#[derive(Debug)]
+pub(crate) enum ServicesNews {
+    /// The host granted these services.
+    Opened(Welcome),
+    /// The stream did not open: the host refused it (with this reason) or
+    /// it failed. The session goes on without services.
+    NotOpened(Option<u16>),
+    /// Something happened on it.
+    Event(ViewerEvent),
+    /// Its run returned.
+    Ended(ViewerServicesEnd),
+}
+
+/// Where the services stream's news go (the window's model).
+pub(crate) type ServicesReport = Arc<dyn Fn(ServicesNews) + Send + Sync>;
+
+/// What the viewer opens its services stream with (design `services` §6.1).
+pub(crate) struct ServicesStart {
+    /// The session's services binding.
+    pub binding: ServicesBinding,
+    /// What the stream works with on this computer.
+    pub local: ViewerLocal,
+    /// The person's requests.
+    pub ops: mpsc::Receiver<ViewerOp>,
+    /// Where its news go.
+    pub report: ServicesReport,
+}
+
+/// Open the session's services stream beside its bound media stream, on the
+/// same circuit (`isolation`), and serve it until `stop` resolves (the
+/// session is over: `Close{SESSION_OVER}` goes out), the host closes it, or
+/// it fails. Its end never ends the session.
+async fn run_services<F>(
+    node: &TorNode,
+    id: &TornectId,
+    isolation: &Isolation,
+    start: ServicesStart,
+    stop: F,
+) where
+    F: Future<Output = ()>,
+{
+    let opened = async {
+        node.connect_on(id, SERVICES_PORT, isolation)
+            .await
+            .map_err(|e| ServicesBindError::Io(std::io::Error::other(e.to_string())))
+    };
+    services_over(opened, start, stop).await;
+}
+
+/// The services stream `opened` gives, bound with `start`'s binding and
+/// served until `stop` resolves, the host closes it, or it fails; each step
+/// reported. Nothing is reported when `stop` comes before the stream is
+/// bound (the session is over and nothing shows it).
+pub(crate) async fn services_over<S, O, F>(opened: O, start: ServicesStart, stop: F)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    O: Future<Output = Result<S, ServicesBindError>>,
+    F: Future<Output = ()>,
+{
+    let ServicesStart {
+        binding,
+        local,
+        ops,
+        report,
+    } = start;
+    let mut stop = pin!(stop);
+    let opened = async {
+        let stream = opened.await?;
+        ServicesViewer::bind(stream, &binding, SERVICES_BIND_WAIT).await
+    };
+    let bound = tokio::select! {
+        biased;
+        () = &mut stop => return,
+        bound = opened => bound,
+    };
+    let viewer = match bound {
+        Ok((viewer, welcome)) => {
+            report(ServicesNews::Opened(welcome));
+            viewer
+        }
+        Err(e) => {
+            // The error's words only: no address, no path.
+            tracing::info!(error = %e, "the services stream did not open");
+            let refused = match e {
+                ServicesBindError::Refused(code) => Some(code),
+                _ => None,
+            };
+            report(ServicesNews::NotOpened(refused));
+            return;
+        }
+    };
+    let (events, mut heard) = mpsc::channel(SERVICES_EVENTS);
+    let forward = async {
+        while let Some(event) = heard.recv().await {
+            report(ServicesNews::Event(event));
+        }
+    };
+    let (end, ()) = tokio::join!(viewer.run(ops, events, local, &mut stop), forward);
+    report(ServicesNews::Ended(end));
 }
 
 /// Open the session's media stream beside the signaling stream and receive
@@ -1281,6 +1404,7 @@ where
         forward,
         quality,
         quality_rx,
+        services,
     } = options;
     let binding = Binding::new(session.session_token(), &session.th()).with_quality(quality);
     let opened = async {
@@ -1312,16 +1436,33 @@ where
 
     let mut pictures = CliPictures::new(forward);
     let mut stats = ViewerStats::default();
-    let (viewed, end) = view(
-        viewer,
-        session,
-        pings,
-        interrupted,
-        &mut pictures,
-        &mut stats,
-        channels,
-    )
-    .await;
+    // The services stream opens only now, after the media stream's `BindOk`
+    // (the host refuses a services bind for a session media has not bound),
+    // and stops when the session does.
+    let (services_stop, stopped) = oneshot::channel::<()>();
+    let viewing = async {
+        let viewed = view(
+            viewer,
+            session,
+            pings,
+            interrupted,
+            &mut pictures,
+            &mut stats,
+            channels,
+        )
+        .await;
+        let _ = services_stop.send(());
+        viewed
+    };
+    let services = async {
+        if let Some(start) = services {
+            let stop = async {
+                let _ = stopped.await;
+            };
+            run_services(node, id, isolation, start, stop).await;
+        }
+    };
+    let ((viewed, end), ()) = tokio::join!(viewing, services);
     pictures.report(&stats);
     let end = end?;
     println!("{}", media_end(&viewed, &end));
@@ -3280,5 +3421,76 @@ mod tests {
             ),
             "{outcome:?}"
         );
+    }
+
+    /// A viewer's services start whose news are kept, for [`services_over`].
+    #[allow(clippy::type_complexity)] // a test's kept news
+    fn kept_services(
+        token: &tornect_signal::consent::SessionToken,
+    ) -> (
+        ServicesStart,
+        Arc<std::sync::Mutex<Vec<ServicesNews>>>,
+        mpsc::Sender<ViewerOp>,
+    ) {
+        let news = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (ops_tx, ops) = mpsc::channel(4);
+        let report: ServicesReport = {
+            let news = Arc::clone(&news);
+            Arc::new(move |n| news.lock().unwrap().push(n))
+        };
+        let start = ServicesStart {
+            binding: ServicesBinding::new(token, &[7; 32]),
+            local: ViewerLocal::default(),
+            ops,
+            report,
+        };
+        (start, news, ops_tx)
+    }
+
+    /// Design `services` §0, §6.1: the terminal host answers a services
+    /// stream with `Refused{NOT_OFFERED}` (`tornect host` has no services),
+    /// and the viewer reports it once, as a stream that did not open with
+    /// that code, and nothing else: the session goes on. A stream that could
+    /// not be reached is reported the same way with no code; a session that
+    /// ends before its stream is bound reports nothing.
+    #[tokio::test]
+    async fn the_terminal_hosts_refusal_leaves_the_session_without_services() {
+        use tornect_proto::services::reason;
+        let token = tornect_signal::consent::SessionToken::new([0x51; 32]);
+
+        let (start, news, _ops) = kept_services(&token);
+        let (client, server) = duplex(64 * 1024);
+        let refused = tokio::spawn(tornect_session::services::refuse(server));
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            services_over(async { Ok(client) }, start, std::future::pending()),
+        )
+        .await
+        .expect("the refusal is read at once");
+        refused.await.unwrap();
+        let heard = std::mem::take(&mut *news.lock().unwrap());
+        assert!(
+            matches!(
+                heard.as_slice(),
+                [ServicesNews::NotOpened(Some(reason::NOT_OFFERED))]
+            ),
+            "{heard:?}"
+        );
+
+        let (start, news, _ops) = kept_services(&token);
+        let unreachable = async {
+            Err::<DuplexStream, _>(ServicesBindError::Io(std::io::Error::other("no circuit")))
+        };
+        services_over(unreachable, start, std::future::pending()).await;
+        let heard = std::mem::take(&mut *news.lock().unwrap());
+        assert!(
+            matches!(heard.as_slice(), [ServicesNews::NotOpened(None)]),
+            "{heard:?}"
+        );
+
+        let (start, news, _ops) = kept_services(&token);
+        let never = std::future::pending::<Result<DuplexStream, ServicesBindError>>();
+        services_over(never, start, async {}).await;
+        assert!(news.lock().unwrap().is_empty());
     }
 }

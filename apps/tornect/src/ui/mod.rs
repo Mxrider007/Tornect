@@ -32,6 +32,7 @@ mod pages;
 pub(crate) mod preview;
 pub(crate) mod recognize;
 mod screenshot;
+pub(crate) mod services;
 mod stream;
 mod theme;
 mod view;

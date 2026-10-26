@@ -730,6 +730,14 @@ pub fn wire_window(
         deps.unattended = Arc::new(auth);
         host_cfg.feats = vec![messages::feats::UA1.to_owned()];
     }
+    // The services stream (design `services` §0): pushed after the
+    // unattended suite so that nothing overwrites it, and offered with or
+    // without a store. The window host serves it; the terminal host
+    // advertises it too and refuses every services stream, so the token does
+    // not tell one kind of host from the other before pairing (decision
+    // M1-76). A host with nothing to show a session on clears it with the
+    // rest ([`HostWiring::without_unattended`]).
+    host_cfg.feats.push(messages::feats::SVC1.to_owned());
 
     Ok(HostWiring {
         cfg: host_cfg,
@@ -1908,8 +1916,11 @@ mod tests {
         assert!(wiring.deps.kill.fired().is_none());
         assert_eq!(
             wiring.cfg.feats,
-            vec![messages::feats::UA1.to_owned()],
-            "a host with a store offers the unattended suite"
+            vec![
+                messages::feats::UA1.to_owned(),
+                messages::feats::SVC1.to_owned()
+            ],
+            "a host with a store offers the unattended suite and the services stream"
         );
     }
 
@@ -1954,7 +1965,13 @@ mod tests {
             ControlChannel::default(),
         )
         .unwrap();
-        assert_eq!(terminal.cfg.feats, vec![messages::feats::UA1.to_owned()]);
+        assert_eq!(
+            terminal.cfg.feats,
+            vec![
+                messages::feats::UA1.to_owned(),
+                messages::feats::SVC1.to_owned()
+            ]
+        );
     }
 
     /// FR2R-L1 (P-L4, the host's file): the host's start writes
@@ -2877,7 +2894,10 @@ mod tests {
                 ControlChannel::default(),
             )
             .unwrap();
-            assert_eq!(wiring.cfg.feats, vec![messages::feats::UA1.to_owned()]);
+            assert_eq!(
+                wiring.cfg.feats,
+                [messages::feats::UA1, messages::feats::SVC1]
+            );
             let (client_end, host_end) = duplex(64 * 1024);
             let (cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
             let host_task =
@@ -3013,7 +3033,10 @@ mod tests {
         let setup = unattended_setup();
         let shown = IndicatorShown::default();
         let wiring = setup.window(Some(shown.clone()));
-        assert_eq!(wiring.cfg.feats, vec![messages::feats::UA1.to_owned()]);
+        assert_eq!(
+            wiring.cfg.feats,
+            [messages::feats::UA1, messages::feats::SVC1]
+        );
         let ctx = wiring.ctx.as_ref().unwrap();
         let pending = Probe::Warn(tornect_platform::readiness::INDICATOR_NOT_SHOWN.to_owned());
         assert_eq!(ctx.readiness.get().consent_indicator, pending, "as probed");
@@ -3952,6 +3975,11 @@ mod tests {
         )
         .unwrap();
         assert!(ctx.is_err(), "the store is held elsewhere");
+        assert_eq!(
+            cfg.feats,
+            [messages::feats::SVC1],
+            "without a store the host offers no unattended suite, and still the services stream"
+        );
         let ipc = start_control_channel(&env.paths, ctx, deps.kill.clone(), control.clone())
             .await
             .unwrap()
@@ -3971,6 +3999,10 @@ mod tests {
             ClientOutcome::Session(s) => s,
             other => panic!("expected a session, got {other:?}"),
         };
+        assert!(
+            session.host_has(messages::feats::SVC1),
+            "the client reads the services stream's token from the signed HELLO_ACK"
+        );
         session.send_tor_fallback().await.unwrap();
         session.ping().await.unwrap();
         assert_eq!(live.count(), 1);
