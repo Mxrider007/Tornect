@@ -34,7 +34,7 @@ use super::{
 };
 use crate::consent::{
     AcceptHostInfo, AlwaysDeny, BlockWindow, ChosenCaps, ConsentProof, FreshToken, LocalAllow,
-    PopupChoice, TimerOnlyWindow, TransportPolicy, mode_from_code,
+    PopupChoice, TimerOnlyWindow, TransportKnob, TransportPolicy, mode_from_code,
 };
 use crate::envelope::{Kind, codes};
 use crate::framing::FrameError;
@@ -63,8 +63,10 @@ pub struct HostConfig {
     pub feats: Vec<String>,
     /// What this host can stream.
     pub caps: Caps,
-    /// The privacy mode as a transport policy (attended sessions).
-    pub transport_policy: TransportPolicy,
+    /// The host's transport policy, the bridge rule included (decision
+    /// M1-86): read at each attended accept ([`TransportKnob::get`]); shared
+    /// with whatever changes it, so a clone of this config sees the change.
+    pub transport: TransportKnob,
     /// `BYE{ORPHANED}` when no `CANDIDATES` / `CANDIDATES_DONE` /
     /// `TOR_FALLBACK` arrives within this after the accept (§B.8.4.5, 15 s).
     /// `PING`s do not count: a Tor-only exchange such as the M1 `tornect ping`
@@ -82,9 +84,9 @@ pub struct HostConfig {
 }
 
 impl HostConfig {
-    /// Defaults: no feats, empty caps, `Any` transport, the §B.8.4.5 orphan
-    /// timer, 90 s idle, the Linux row of the availability table (no
-    /// administrator level).
+    /// Defaults: no feats, empty caps, an unbridged `Any` transport knob,
+    /// the §B.8.4.5 orphan timer, 90 s idle, the Linux row of the
+    /// availability table (no administrator level).
     #[must_use]
     pub fn new(host_name: impl Into<String>, host_device_pk: [u8; 32]) -> Self {
         Self {
@@ -92,7 +94,7 @@ impl HostConfig {
             host_device_pk,
             feats: Vec::new(),
             caps: Caps::default(),
-            transport_policy: TransportPolicy::Any,
+            transport: TransportKnob::default(),
             orphan_timeout: Some(timeouts::ORPHAN),
             idle_timeout: timeouts::ESTABLISHED_IDLE,
             levels: Availability::default(),
@@ -567,12 +569,16 @@ struct EndGuard<'a> {
 impl Drop for EndGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
+            // Before `on_end`, which ends the media the outcome describes.
+            let outcome = self.deps.paths.outcome(self.session_id);
             self.deps.sessions.on_end(self.session_id, None);
             self.deps.audit.record(AuditEvent::SessionEnded {
                 device: self.device,
                 label: self.label.to_owned(),
                 session_id: self.session_id.to_owned(),
                 detail: "aborted".to_owned(),
+                transport: outcome.transport,
+                path: outcome.path,
             });
         }
     }
@@ -1245,10 +1251,6 @@ where
         unattended,
     });
 
-    let host_info = AcceptHostInfo {
-        quic_spki: ed25519_spki(&cfg.host_device_pk),
-        transport_policy: cfg.transport_policy,
-    };
     let (proof, caps, helper) = if unattended {
         let th_after_request = chan.th();
         let verdict = deps
@@ -1552,6 +1554,14 @@ where
         ConsentProof::Unattended { policy, .. } => policy.grant_reach(),
         _ => None,
     };
+    // The knob is read here, at the accept, not at the request: a switch or a
+    // Tor bridge that changed while the popup was open is what is signed
+    // (design `direct` §8.2, decision M1-86). Unattended accepts sign their
+    // receipt's policy instead, which read the knob at its own request.
+    let host_info = AcceptHostInfo {
+        quic_spki: ed25519_spki(&cfg.host_device_pk),
+        transport_policy: cfg.transport.get(),
+    };
     let (accept, token) = SessionAccept::build(proof, caps, &host_info, grant_reach);
     #[cfg(test)]
     let accept = {
@@ -1658,6 +1668,9 @@ where
     // to the peer: a peer that stopped reading must not hold the end back
     // (SLICE-B1 B1-2, SLICE-B2 B2-1). Taken before the `?` below, so a session
     // that ended in a protocol error still releases what the sink acquired.
+    // The media's route is read first: `on_end` ends the media it describes
+    // (design `direct` §8.2).
+    let outcome = deps.paths.outcome(&session_id);
     deps.sessions.on_end(&session_id, end.as_ref().ok());
     // Logged before any error propagates: a peer that hangs up mid-frame or
     // sends an illegal kind must not erase its own session-end line (§B.6,
@@ -1670,6 +1683,8 @@ where
             Ok(end) => format!("{end:?}"),
             Err(err) => end_detail(err),
         },
+        transport: outcome.transport,
+        path: outcome.path,
     });
     // Best effort, bounded: the peer may never take it.
     match goodbye {

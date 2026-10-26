@@ -26,8 +26,8 @@ use super::host::{
 use super::vectors::host_device_pk;
 use super::*;
 use crate::consent::{
-    BlockOutcome, ChosenCaps, ConsentProof, DerivedToken, PolicyReceipt, TransportPolicy,
-    WindowPassed, mode_code,
+    BlockOutcome, ChosenCaps, ConsentProof, DerivedToken, PolicyReceipt, TransportKnob,
+    TransportPolicy, WindowPassed, mode_code,
 };
 use crate::envelope::{Envelope, Kind, codes};
 use crate::framing::{FrameError, write_frame};
@@ -2946,7 +2946,8 @@ struct Opened {
 /// A [`PathExchange`] that records each `open` and keeps the test's ends of
 /// the session's two channels (design `direct` §8.2): an inbox of `inbox`
 /// frames (none for `None`), never drained by the probe itself, and an outbox
-/// already holding `preload` (none for `None`), kept open by the probe.
+/// already holding `preload` (none for `None`), kept open by the probe. Its
+/// `outcome` answers `record`; both calls are noted in `order`.
 struct PathsProbe {
     inbox: Option<usize>,
     preload: Option<Vec<PathFrame>>,
@@ -2955,6 +2956,8 @@ struct PathsProbe {
     opened: Mutex<Vec<Opened>>,
     inboxes: Mutex<Vec<mpsc::Receiver<PathFrame>>>,
     outboxes: Mutex<Vec<mpsc::Sender<PathFrame>>>,
+    record: Mutex<PathRecord>,
+    order: Arc<Mutex<Vec<&'static str>>>,
 }
 
 impl PathsProbe {
@@ -2974,9 +2977,15 @@ impl PathsProbe {
             opened: Mutex::default(),
             inboxes: Mutex::default(),
             outboxes: Mutex::default(),
+            record: Mutex::default(),
+            order: Arc::default(),
         });
         host.deps.paths = probe.clone();
         probe
+    }
+
+    fn order(&self) -> Vec<&'static str> {
+        self.order.lock().unwrap().clone()
     }
 
     fn opened(&self) -> Vec<Opened> {
@@ -3001,6 +3010,7 @@ impl PathsProbe {
 
 impl PathExchange for PathsProbe {
     fn open(&self, session: &LiveSession<'_>) -> PathPort {
+        self.order.lock().unwrap().push("open");
         self.opened.lock().unwrap().push(Opened {
             session_id: session.session_id.to_owned(),
             transport: session.transport,
@@ -3024,6 +3034,37 @@ impl PathExchange for PathsProbe {
             rx
         });
         PathPort { outbox, inbox }
+    }
+
+    fn outcome(&self, session_id: &str) -> PathRecord {
+        self.order.lock().unwrap().push("outcome");
+        assert!(
+            self.opened().iter().all(|o| o.session_id == session_id),
+            "the outcome of the session served"
+        );
+        self.record.lock().unwrap().clone()
+    }
+}
+
+/// A tracker that notes its `on_start` and `on_end` in a [`PathsProbe`]'s
+/// order, so a test sees which of the two the path calls came between.
+struct OrderedSink {
+    live: Arc<LiveSessions>,
+    order: Arc<Mutex<Vec<&'static str>>>,
+    /// Panic inside `on_start`, after the tracker took the session.
+    panic_at_start: bool,
+}
+
+impl SessionSink for OrderedSink {
+    fn on_start(&self, session: &LiveSession<'_>) {
+        self.order.lock().unwrap().push("on_start");
+        self.live.on_start(session);
+        assert!(!self.panic_at_start, "the sink failed");
+    }
+
+    fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
+        self.order.lock().unwrap().push("on_end");
+        self.live.on_end(session_id, end);
     }
 }
 
@@ -3276,6 +3317,13 @@ fn audit_events_land_in_the_session_log_without_secrets_or_declared_names() {
         label: "n".into(),
         session_id: session_id.clone(),
         detail: "PeerBye".into(),
+        transport: Some(TransportKind::Lan),
+        path: Some(PathSummary {
+            outcome: "direct".into(),
+            winner: Some("host".into()),
+            ipv6: false,
+            ms: 412,
+        }),
     });
     audit.record(AuditEvent::PopupSuppressed {
         device,
@@ -3292,6 +3340,21 @@ fn audit_events_land_in_the_session_log_without_secrets_or_declared_names() {
     assert_eq!(records[1].detail.as_deref(), Some("DENIED"));
     assert_eq!(records[2].session_id.as_deref(), Some(session_id.as_str()));
     assert_eq!(records[2].peer_name.as_deref(), Some("n"));
+    // Design `direct` §8.2: the end carries the media's route and the path
+    // summary the path exchange gave; the start carries neither.
+    assert_eq!(records[3].event, LogEvent::SessionEnded);
+    assert_eq!(records[3].transport, Some(TransportKind::Lan));
+    assert_eq!(
+        records[3]
+            .path_summary
+            .as_ref()
+            .map(|p| (p.outcome.as_str(), p.ms)),
+        Some(("direct", 412))
+    );
+    assert_eq!(
+        (records[2].transport, &records[2].path_summary),
+        (None, &None)
+    );
     assert_eq!(records[4].event, LogEvent::PopupSuppressedRemoteSession);
     assert_eq!(records[4].detail.as_deref(), Some("pairing"));
     assert_eq!(records[4].during_remote_session, Some(true));
@@ -11273,7 +11336,7 @@ async fn the_session_transport_is_the_policy_of_the_accept_as_written() {
     for (name, setting, edit, code, expected) in cases {
         let tmp = tempfile::tempdir().unwrap();
         let (mut host, _live, probe) = path_host(tmp.path(), None, None);
-        host.cfg.transport_policy = setting;
+        host.cfg.transport = TransportKnob::fixed(setting);
         host.deps.edit_accept = edit;
         let (a, b) = pipe();
         let task = spawn_host(a, &host);
@@ -11308,7 +11371,7 @@ async fn an_unattended_grant_that_requires_tor_reaches_the_path_as_tor_only() {
             unattended_pair_edited(tmp.path(), PW, Arc::new(FixedFacts::linux()), |g| {
                 g.require_tor_only = require_tor_only;
             });
-        assert_eq!(host.cfg.transport_policy, TransportPolicy::Any);
+        assert_eq!(host.cfg.transport.get(), TransportPolicy::Any);
         let probe = PathsProbe::install(
             &mut host,
             Arc::new(LiveSessions::new()),
@@ -11387,6 +11450,357 @@ async fn the_viewers_dir1_reaches_the_path_from_its_signed_hello() {
         task.await.unwrap().unwrap();
         assert_eq!(probe.opened()[0].viewer_dir1, expected, "{feats:?}");
     }
+}
+
+/// The path record the probes of the end tests answer with: a LAN route and
+/// a direct summary (names, a flag and a time).
+fn lan_record() -> PathRecord {
+    PathRecord {
+        transport: Some(TransportKind::Lan),
+        path: Some(PathSummary {
+            outcome: "direct".into(),
+            winner: Some("host".into()),
+            ipv6: false,
+            ms: 412,
+        }),
+    }
+}
+
+/// [`path_host`] whose sink notes its calls in the probe's order and whose
+/// probe answers [`lan_record`], with a recording audit.
+fn ordered_path_host(
+    tmp: &std::path::Path,
+    panic_at_start: bool,
+) -> (
+    HostSide,
+    Arc<LiveSessions>,
+    Arc<PathsProbe>,
+    Arc<RecordingAudit>,
+) {
+    let (mut host, live, probe) = path_host(tmp, Some(PATH_INBOX), Some(Vec::new()));
+    *probe.record.lock().unwrap() = lan_record();
+    host.deps.sessions = Arc::new(OrderedSink {
+        live: live.clone(),
+        order: probe.order.clone(),
+        panic_at_start,
+    });
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    (host, live, probe, audit)
+}
+
+/// The `SessionEnded` the audit heard, as (detail, transport, path).
+fn ended_with(
+    audit: &RecordingAudit,
+) -> Option<(String, Option<TransportKind>, Option<PathSummary>)> {
+    audit.0.lock().unwrap().iter().find_map(|e| match e {
+        AuditEvent::SessionEnded {
+            detail,
+            transport,
+            path,
+            ..
+        } => Some((detail.clone(), *transport, path.clone())),
+        _ => None,
+    })
+}
+
+/// Design `direct` §8.2: the FSM reads the path exchange's outcome after the
+/// session is over and before `on_end` (which ends the media it describes),
+/// and the session's end line carries its route and summary.
+#[tokio::test(start_paused = true)]
+async fn the_path_outcome_is_read_before_on_end_and_recorded_with_the_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, live, probe, audit) = ordered_path_host(tmp.path(), false);
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+    ping_through(&mut raw, 1).await;
+    assert_eq!(probe.order(), ["on_start", "open"]);
+    raw.chan
+        .send(
+            &messages::Bye {
+                reason: bye::USER,
+                detail: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    match task.await.unwrap().unwrap() {
+        HostOutcome::Session { end, .. } => assert_eq!(end, SessionEnd::PeerBye(bye::USER)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(probe.order(), ["on_start", "open", "outcome", "on_end"]);
+    assert_eq!(live.count(), 0);
+    let record = lan_record();
+    assert_eq!(
+        ended_with(&audit),
+        Some((
+            format!("{:?}", SessionEnd::PeerBye(bye::USER)),
+            record.transport,
+            record.path
+        ))
+    );
+}
+
+/// Design `direct` §8.2, SLICE-B1 B1-4: a session task that is cancelled, or
+/// whose sink panics in `on_start`, still reads the outcome before `on_end`
+/// through its end guard, and its `aborted` line carries what the outcome
+/// said. A sink that panics in `on_start` never gets a path opened.
+#[tokio::test(start_paused = true)]
+async fn an_unwound_session_reads_the_outcome_before_on_end() {
+    // Cancelled while established.
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, live, probe, audit) = ordered_path_host(tmp.path(), false);
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+    ping_through(&mut raw, 1).await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(probe.order(), ["on_start", "open", "outcome", "on_end"]);
+    assert_eq!(live.count(), 0);
+    let record = lan_record();
+    assert_eq!(
+        ended_with(&audit),
+        Some(("aborted".to_owned(), record.transport, record.path))
+    );
+    drop(raw);
+
+    // The sink panics in `on_start`.
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, live, probe, audit) = ordered_path_host(tmp.path(), true);
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+    assert!(task.await.unwrap_err().is_panic());
+    assert_eq!(probe.order(), ["on_start", "outcome", "on_end"]);
+    assert!(
+        probe.opened().is_empty(),
+        "no path for a session that never started"
+    );
+    assert_eq!(live.count(), 0);
+    let record = lan_record();
+    assert_eq!(
+        ended_with(&audit),
+        Some(("aborted".to_owned(), record.transport, record.path))
+    );
+}
+
+/// Design `direct` §5.2 rule 1 (attended): no path is opened, and no
+/// outcome read, for a session the person denied or whose popup timed out;
+/// the viewer's frames after the refusal reach nothing.
+#[tokio::test(start_paused = true)]
+async fn no_path_is_opened_for_a_denied_or_timed_out_session() {
+    for (name, script, reason) in [
+        (
+            "denied",
+            SessionScript::Decide(SessionDecision::Deny),
+            reject::DENIED,
+        ),
+        ("popup timeout", SessionScript::Hang, reject::POPUP_TIMEOUT),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut host = host_side(tmp.path(), HOST_SEED);
+        let live = Arc::new(LiveSessions::new());
+        host.deps.sessions = live.clone();
+        host.deps.activity = live.clone();
+        let probe =
+            PathsProbe::install(&mut host, live.clone(), Some(PATH_INBOX), Some(Vec::new()));
+        host.trusted
+            .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+            .unwrap();
+        host.consent.push_session(script);
+        let client = client_side(tmp.path(), host.identity.id(), CLIENT_SEED);
+        client
+            .known
+            .pin(host.identity.id(), "Desk of Bob", host_device_pk())
+            .unwrap();
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let err = connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            Intent::Session,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == reason),
+            "{name}: {err}"
+        );
+        assert!(
+            matches!(
+                task.await.unwrap().unwrap(),
+                HostOutcome::SessionRejected { reason: r, .. } if r == reason
+            ),
+            "{name}"
+        );
+        assert!(probe.opened().is_empty(), "{name}: a path was opened");
+        assert!(probe.order().is_empty(), "{name}: {:?}", probe.order());
+        assert_eq!(live.count(), 0, "{name}");
+    }
+}
+
+/// Design `direct` §5.2 rule 1 (unattended): no path is opened for a request
+/// whose password failed or that the person at the host blocked in the
+/// block window; one is, once, for the request that is accepted.
+#[tokio::test]
+async fn no_path_is_opened_for_a_failed_or_blocked_unattended_request() {
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    struct Blocks;
+    impl crate::consent::BlockWindow for Blocks {
+        fn run<'a>(
+            &'a self,
+            _: u8,
+            _: &'a crate::consent::GrantId,
+            _: &'a str,
+        ) -> BoxFuture<'a, BlockOutcome> {
+            Box::pin(async { BlockOutcome::Blocked })
+        }
+    }
+    // The wrong password.
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client) = unattended_pair(tmp.path(), PW);
+    let probe = PathsProbe::install(
+        &mut host,
+        Arc::new(LiveSessions::new()),
+        Some(PATH_INBOX),
+        Some(Vec::new()),
+    );
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent("not the password at all", messages::mode::CONTROL, false),
+    )
+    .await
+    .expect_err("a wrong password");
+    assert!(matches!(err, HandshakeError::PasswordRefused), "{err}");
+    assert!(task.await.unwrap().is_err());
+    assert!(probe.opened().is_empty(), "a path after a failed password");
+    assert!(probe.order().is_empty());
+
+    // The right password, then the person at the host blocks.
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, _guard) = unattended_pair_edited(
+        tmp.path(),
+        PW,
+        Arc::new(tornect_core::levels::FixedFacts::linux()),
+        |_| {},
+    );
+    host.deps.block_window = Arc::new(Blocks);
+    let probe = PathsProbe::install(
+        &mut host,
+        Arc::new(LiveSessions::new()),
+        Some(PATH_INBOX),
+        Some(Vec::new()),
+    );
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let err = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .expect_err("blocked");
+    assert!(
+        matches!(&err, HandshakeError::SessionRejected { reject } if reject.reason == reject::BLOCKED_BY_LOCAL_USER),
+        "{err}"
+    );
+    task.await.unwrap().unwrap();
+    assert!(probe.opened().is_empty(), "a path after a Block");
+    assert!(probe.order().is_empty());
+
+    // The control: the same pair, not blocked, opens exactly one path.
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, _guard) = unattended_pair_edited(
+        tmp.path(),
+        PW,
+        Arc::new(tornect_core::levels::FixedFacts::linux()),
+        |_| {},
+    );
+    let probe = PathsProbe::install(
+        &mut host,
+        Arc::new(LiveSessions::new()),
+        Some(PATH_INBOX),
+        Some(Vec::new()),
+    );
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let outcome = connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await
+    .unwrap();
+    let ClientOutcome::Session(session) = outcome else {
+        panic!("no session");
+    };
+    session.bye(bye::USER).await.unwrap();
+    task.await.unwrap().unwrap();
+    assert_eq!(probe.opened().len(), 1);
+    assert!(probe.opened()[0].unattended);
+    assert_eq!(probe.order(), ["open", "outcome"]);
+}
+
+/// Design `direct` §8.2, decision M1-86: the attended accept signs the knob
+/// as it stands when the accept is built, so a bridge that Tor took while
+/// the popup was open is signed `tor_only`, and the session's path sees it.
+#[tokio::test(start_paused = true)]
+async fn the_attended_accept_signs_the_knob_as_it_stands_at_the_accept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, _live, probe) = path_host(tmp.path(), None, None);
+    let knob = TransportKnob::new(&tornect_core::config::Network::default());
+    host.cfg.transport = knob.clone();
+    let popup = Arc::new(tokio::sync::Notify::new());
+    let answer = Arc::new(tokio::sync::Notify::new());
+    host.deps.consent = Arc::new(HeldPopup {
+        opened: popup.clone(),
+        answer: answer.clone(),
+    });
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    let request = SessionRequest {
+        caps: Caps::default(),
+        unattended: None,
+    };
+    raw.chan.send(&request, Some(&raw.identity)).await.unwrap();
+    popup.notified().await;
+    assert_eq!(knob.get(), TransportPolicy::Any, "as the request found it");
+    knob.set_bridged(true);
+    answer.notify_one();
+    let accept = raw.recv().await.unwrap();
+    assert_eq!(accept.env.kind, Kind::SessionAccept);
+    let written = decode_body::<messages::SessionAccept>(&accept.env.body).unwrap();
+    assert_eq!(
+        written.transport_policy(),
+        TransportPolicy::TorOnly.code(),
+        "the bridge rule, read at the accept"
+    );
+    ping_through(&mut raw, 1).await;
+    assert_eq!(probe.opened()[0].transport, TransportPolicy::TorOnly);
+    drop(raw);
+    task.await.unwrap().unwrap();
 }
 
 /// Design `direct` §6.1, §8.2: the host's path frames reach the viewer as

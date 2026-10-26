@@ -32,7 +32,7 @@ use tornect_platform::ipc::{Endpoint, IpcError};
 use tornect_session::{
     CaptureChanged, CaptureStarted, MediaEnd, MediaHost, MediaObserver, MediaOutcome, MediaReport,
 };
-use tornect_signal::consent::TransportPolicy;
+use tornect_signal::consent::TransportKnob;
 use tornect_signal::dispatch::{FIRST_FRAME_DEADLINE, FirstFrame, first_frame};
 use tornect_signal::envelope::codes;
 use tornect_signal::fsm::HostAudit;
@@ -711,8 +711,11 @@ pub fn wire_window(
     deps.kill = kill.clone();
 
     let mut host_cfg = HostConfig::new(cfg.general.device_name.clone(), device_pk);
-    host_cfg.transport_policy =
-        TransportPolicy::from_privacy(cfg.network.paranoid, cfg.network.lan_only);
+    // One knob for both kinds of accept (design `direct` §8.2): attended
+    // accepts read it at the accept, unattended receipts at the request. Its
+    // bridge state is set after the Tor bootstrap once the direct host lands
+    // (step A18); until then it is never bridged, and no direct path exists.
+    host_cfg.transport = TransportKnob::new(&cfg.network);
     host_cfg.levels = levels;
 
     if let Ok(ctx) = &ctx {
@@ -742,7 +745,9 @@ pub fn wire_window(
             // terminal host each have a block window with Block (`wire_cli`
             // gives the terminal's); "Ask before starting" is the window's
             // sheet, and denied on the terminal.
-            .with_block_guard(Arc::clone(&ctx.guard));
+            .with_block_guard(Arc::clone(&ctx.guard))
+            // The same knob the attended accepts read, at each request.
+            .with_transport_knob(host_cfg.transport.clone());
         // §B.1.1 (MUST): in background mode, no unattended session before
         // the indicator was shown; the rows' causes still go first.
         let auth = match background {
@@ -1762,6 +1767,7 @@ mod tests {
     use tornect_core::unattended::guard::RemoteSessionActivity;
     use tornect_core::unattended::ipc::{IpcOp, IpcRequest, codes as codes_ipc};
     use tornect_signal::HostSigner;
+    use tornect_signal::consent::TransportPolicy;
     use tornect_signal::fsm::client::{
         ClientConfig, ClientDeps, ClientOutcome, Intent, ScriptedClientUi, connect,
     };

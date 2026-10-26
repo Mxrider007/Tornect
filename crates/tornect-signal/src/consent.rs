@@ -21,14 +21,17 @@
 //! [`LocalAllow`] — live here with their headless M1 defaults
 //! ([`TimerOnlyWindow`], [`AlwaysDeny`]).
 
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 use tokio::time::Instant;
+use tornect_core::config::Network;
 use tornect_core::levels::{Elevation, Level};
 use tornect_core::session_log::SessionMode;
 use tornect_core::unattended::ReadinessSnapshot;
+use tornect_core::unattended::limiter::HostTransport;
 use zeroize::Zeroizing;
 
 use crate::messages::{self, Caps, FailSummary, Resolution, SPKI_LEN, SessionAccept};
@@ -213,6 +216,124 @@ impl TransportPolicy {
             messages::transport::LAN_ONLY => Some(Self::LanOnly),
             _ => None,
         }
+    }
+}
+
+/// The host's transport policy as it stands now, shared by the settings
+/// that change it and every accept that signs it (design `direct` §8.2):
+/// attended accepts read [`TransportKnob::get`], unattended ones
+/// [`TransportKnob::host_transport`], each at the request, so a changed
+/// switch or a Tor bridge reaches the next session without a restart.
+///
+/// The bridge rule (decision M1-86): while Tor reaches the network through a
+/// bridge ([`TransportKnob::set_bridged`]) and `network.direct_with_bridges`
+/// is off, an `any` policy is signed `tor_only`: a direct path would show a
+/// network where Tor is hidden that Tornect is in use. `lan_only` is left
+/// alone (same-site traffic does not leave the network), and so is
+/// `tor_only`.
+#[derive(Clone, Default)]
+pub struct TransportKnob(std::sync::Arc<KnobInner>);
+
+#[derive(Default)]
+struct KnobInner {
+    /// The configured policy's wire code (`any` for the default).
+    policy: AtomicU8,
+    bridged: AtomicBool,
+    direct_with_bridges: AtomicBool,
+}
+
+impl TransportKnob {
+    /// A knob set from `net` ([`TransportKnob::set_from`]), not bridged.
+    #[must_use]
+    pub fn new(net: &Network) -> Self {
+        let knob = Self::default();
+        knob.set_from(net);
+        knob
+    }
+
+    /// A knob whose configured policy is `policy`, not bridged, with no
+    /// bridge override: for a host that has no [`Network`] settings.
+    #[must_use]
+    pub fn fixed(policy: TransportPolicy) -> Self {
+        let knob = Self::default();
+        knob.0.policy.store(policy.code(), Ordering::SeqCst);
+        knob
+    }
+
+    /// Take the privacy switches ([`TransportPolicy::from_privacy`]) and
+    /// `direct_with_bridges` from `net`; the bridge state is kept.
+    pub fn set_from(&self, net: &Network) {
+        let policy = TransportPolicy::from_privacy(net.paranoid, net.lan_only);
+        self.0
+            .direct_with_bridges
+            .store(net.direct_with_bridges, Ordering::SeqCst);
+        self.0.policy.store(policy.code(), Ordering::SeqCst);
+    }
+
+    /// Whether Tor now reaches the network through a bridge (after every
+    /// bootstrap).
+    pub fn set_bridged(&self, bridged: bool) {
+        self.0.bridged.store(bridged, Ordering::SeqCst);
+    }
+
+    /// The configured policy, before the bridge rule; an unknown code (none
+    /// is ever stored) reads as `tor_only`.
+    fn configured(&self) -> TransportPolicy {
+        TransportPolicy::from_code(self.0.policy.load(Ordering::SeqCst))
+            .unwrap_or(TransportPolicy::TorOnly)
+    }
+
+    /// The effective policy: the configured one, with `any` signed as
+    /// `tor_only` while the bridge rule holds ([`TransportKnob::off_by_bridge`]).
+    #[must_use]
+    pub fn get(&self) -> TransportPolicy {
+        if self.off_by_bridge() {
+            TransportPolicy::TorOnly
+        } else {
+            self.configured()
+        }
+    }
+
+    /// Whether the bridge rule alone turns direct paths off now: the
+    /// configured policy is `any`, Tor uses a bridge, and
+    /// `direct_with_bridges` is off. The reason a viewer is told is `bridge`.
+    #[must_use]
+    pub fn off_by_bridge(&self) -> bool {
+        self.configured() == TransportPolicy::Any
+            && self.0.bridged.load(Ordering::SeqCst)
+            && !self.0.direct_with_bridges.load(Ordering::SeqCst)
+    }
+
+    /// The effective policy as the unattended path takes it (§B.8.11):
+    /// `tor_only` is the host's paranoid mode, `lan_only` its LAN-only mode,
+    /// so the bridge rule reaches a grant's receipt too.
+    #[must_use]
+    pub fn host_transport(&self) -> HostTransport {
+        match self.get() {
+            TransportPolicy::Any => HostTransport::default(),
+            TransportPolicy::TorOnly => HostTransport {
+                paranoid: true,
+                lan_only: false,
+            },
+            TransportPolicy::LanOnly => HostTransport {
+                paranoid: false,
+                lan_only: true,
+            },
+        }
+    }
+}
+
+impl core::fmt::Debug for TransportKnob {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TransportKnob")
+            .field("configured", &self.configured())
+            .field("bridged", &self.0.bridged.load(Ordering::SeqCst))
+            .field(
+                "direct_with_bridges",
+                &self.0.direct_with_bridges.load(Ordering::SeqCst),
+            )
+            .field("effective", &self.get())
+            .finish()
     }
 }
 
@@ -996,5 +1117,107 @@ mod tests {
         let printed = format!("{token:?}");
         assert!(!printed.contains("abab"), "{printed}");
         assert!(printed.contains(&id), "{printed}");
+    }
+
+    fn network(paranoid: bool, lan_only: bool, direct_with_bridges: bool) -> Network {
+        Network {
+            paranoid,
+            lan_only,
+            direct_with_bridges,
+            ..Network::default()
+        }
+    }
+
+    /// Decision M1-86, design `direct` §12 "Bridge rule": a bridged knob signs
+    /// `tor_only` and gives the unattended path the paranoid host transport;
+    /// `direct_with_bridges` restores `any`; `lan_only` and `tor_only` are left
+    /// alone; leaving the bridge restores `any`.
+    #[test]
+    fn the_bridge_rule_turns_any_into_tor_only() {
+        let knob = TransportKnob::new(&network(false, false, false));
+        assert_eq!(knob.get(), TransportPolicy::Any);
+        assert_eq!(knob.host_transport(), HostTransport::default());
+        assert!(!knob.off_by_bridge());
+
+        knob.set_bridged(true);
+        assert_eq!(knob.get(), TransportPolicy::TorOnly);
+        assert!(knob.off_by_bridge());
+        assert_eq!(
+            knob.host_transport(),
+            HostTransport {
+                paranoid: true,
+                lan_only: false
+            }
+        );
+        knob.set_bridged(false);
+        assert_eq!(knob.get(), TransportPolicy::Any);
+        assert!(!knob.off_by_bridge());
+
+        let allowed = TransportKnob::new(&network(false, false, true));
+        allowed.set_bridged(true);
+        assert_eq!(allowed.get(), TransportPolicy::Any);
+        assert!(!allowed.off_by_bridge());
+        assert_eq!(allowed.host_transport(), HostTransport::default());
+
+        let lan = TransportKnob::new(&network(false, true, false));
+        lan.set_bridged(true);
+        assert_eq!(lan.get(), TransportPolicy::LanOnly);
+        assert!(!lan.off_by_bridge(), "same-site traffic stays on the LAN");
+        assert_eq!(
+            lan.host_transport(),
+            HostTransport {
+                paranoid: false,
+                lan_only: true
+            }
+        );
+
+        let tor = TransportKnob::new(&network(true, false, true));
+        tor.set_bridged(true);
+        assert_eq!(tor.get(), TransportPolicy::TorOnly);
+        assert!(!tor.off_by_bridge(), "paranoid, not the bridge");
+        assert_eq!(
+            tor.host_transport(),
+            HostTransport {
+                paranoid: true,
+                lan_only: false
+            }
+        );
+    }
+
+    /// Design `direct` §8.2: `set_from` takes the switches and the override
+    /// and keeps the bridge state, every clone sees the change, and the
+    /// default and `fixed` knobs are unbridged.
+    #[test]
+    fn a_knob_is_shared_and_set_from_keeps_the_bridge_state() {
+        assert_eq!(TransportKnob::default().get(), TransportPolicy::Any);
+        for p in [
+            TransportPolicy::Any,
+            TransportPolicy::TorOnly,
+            TransportPolicy::LanOnly,
+        ] {
+            assert_eq!(TransportKnob::fixed(p).get(), p);
+        }
+        let knob = TransportKnob::new(&network(false, false, false));
+        let seen = knob.clone();
+        knob.set_bridged(true);
+        assert_eq!(seen.get(), TransportPolicy::TorOnly);
+        knob.set_from(&network(false, false, true));
+        assert_eq!(
+            seen.get(),
+            TransportPolicy::Any,
+            "the override, still bridged"
+        );
+        knob.set_from(&network(false, false, false));
+        assert_eq!(seen.get(), TransportPolicy::TorOnly, "still bridged");
+        knob.set_from(&network(false, true, false));
+        assert_eq!(seen.get(), TransportPolicy::LanOnly);
+        knob.set_from(&network(true, true, false));
+        assert_eq!(seen.get(), TransportPolicy::TorOnly, "paranoid wins");
+        knob.set_bridged(false);
+        knob.set_from(&Network::default());
+        assert_eq!(seen.get(), TransportPolicy::Any);
+        let shown = format!("{seen:?}");
+        assert!(shown.contains("bridged: false"), "{shown}");
+        assert!(shown.contains("effective: Any"), "{shown}");
     }
 }

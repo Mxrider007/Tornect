@@ -346,6 +346,10 @@ pub enum AuditEvent {
         session_id: String,
         /// How (fixed text, never peer-controlled).
         detail: String,
+        /// The route the media took ([`PathExchange::outcome`]), when it bound.
+        transport: Option<TransportKind>,
+        /// What the direct-path phase came to ([`PathExchange::outcome`]).
+        path: Option<PathSummary>,
     },
     /// The requester left (its stream closed or broken) while its request
     /// waited for this host: a pairing or session card, the block window, or
@@ -635,10 +639,21 @@ impl HandshakeAudit for HostAudit {
                 label,
                 session_id,
                 detail,
-            } => SessionRecord::now(SessionEvent::SessionEnded)
-                .peer(device, label)
-                .session(session_id)
-                .detail(detail),
+                transport,
+                path,
+            } => {
+                let mut record = SessionRecord::now(SessionEvent::SessionEnded)
+                    .peer(device, label)
+                    .session(session_id)
+                    .detail(detail);
+                if let Some(t) = transport {
+                    record = record.transport(t);
+                }
+                if let Some(p) = path {
+                    record = record.path_summary(p);
+                }
+                record
+            }
             AuditEvent::RequesterLeft {
                 device,
                 label,
@@ -715,7 +730,7 @@ impl core::fmt::Debug for PathFrame {
 
 /// The capacity of a [`PathPort`] inbox (design `direct` §8.2): the FSM
 /// never waits on it, and a frame that finds it full is dropped and counted
-/// ([`HandshakeStats::path_frames_dropped`]).
+/// ([`host::HandshakeStats::path_frames_dropped`]).
 pub const PATH_INBOX: usize = 8;
 
 /// The two channels between the host FSM and a session's direct path,

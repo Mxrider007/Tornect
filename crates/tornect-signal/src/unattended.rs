@@ -37,7 +37,8 @@ use tornect_core::unattended::store::GrantStore;
 
 use crate::auth;
 use crate::consent::{
-    BlockOutcome, ChosenCaps, ConsentProof, DerivedToken, PolicyReceipt, TransportPolicy,
+    BlockOutcome, ChosenCaps, ConsentProof, DerivedToken, PolicyReceipt, TransportKnob,
+    TransportPolicy,
 };
 use crate::fsm::host::{
     KillSwitch, StopTokenCheck, UnattendedContext, UnattendedHook, UnattendedVerdict,
@@ -468,7 +469,11 @@ pub struct UnattendedAuth {
     limiter: AttemptLimiter,
     budgets: Arc<Mutex<Budgets>>,
     tz: Arc<dyn LocalTz>,
+    /// The host transport given at construction, used when no knob is set.
     host_transport: HostTransport,
+    /// The host's transport knob of [`Self::with_transport_knob`], read at
+    /// each request in place of `host_transport`.
+    transport_knob: Option<TransportKnob>,
     /// M1: the all-unknown stub (§B.8.14), unless [`Self::readiness_feed`] is set.
     readiness: ReadinessSnapshot,
     /// The host's readiness as last probed (at its start and every 10 min),
@@ -501,6 +506,7 @@ impl UnattendedAuth {
             budgets: Arc::new(Mutex::new(Budgets::default())),
             tz,
             host_transport,
+            transport_knob: None,
             readiness: ReadinessSnapshot::unknown(),
             readiness_feed: None,
             ready_gate: None,
@@ -530,6 +536,23 @@ impl UnattendedAuth {
         self.readiness_feed
             .as_ref()
             .map_or_else(|| self.readiness.clone(), SharedReadiness::get)
+    }
+
+    /// Take the host transport from `knob` at each request (design `direct`
+    /// §8.2) instead of the value given to [`Self::new`]: a privacy switch
+    /// changed since the start, and the bridge rule (decision M1-86), reach
+    /// the next grant's receipt, and so its signed policy.
+    #[must_use]
+    pub fn with_transport_knob(mut self, knob: TransportKnob) -> Self {
+        self.transport_knob = Some(knob);
+        self
+    }
+
+    /// The host transport as of this request.
+    fn host_transport_now(&self) -> HostTransport {
+        self.transport_knob
+            .as_ref()
+            .map_or(self.host_transport, TransportKnob::host_transport)
     }
 
     /// Refuse every unattended session while `gate` answers `false`, checked
@@ -1044,7 +1067,7 @@ impl UnattendedAuth {
 
         let post = match self
             .limiter
-            .post_f2(&device, &*self.tz, self.host_transport)
+            .post_f2(&device, &*self.tz, self.host_transport_now())
         {
             Ok(ok) => ok,
             Err(r) => return Ok(UnattendedVerdict::Reject(post_f2_reject(r))),
@@ -2758,5 +2781,51 @@ mod tests {
             panic!("expected Reject");
         };
         assert_eq!(r.reason, reject::UNSUPPORTED_SUITE);
+    }
+
+    /// Design `direct` §8.2, decision M1-86: with a transport knob the grant's
+    /// receipt takes the host transport at each request, never the value given
+    /// at construction: `any`, then `tor_only` once Tor uses a bridge (the
+    /// bridge rule), `any` again with `direct_with_bridges`, and `lan_only`
+    /// from the LAN-only switch however the bridge stands.
+    #[tokio::test]
+    async fn the_transport_knob_is_read_at_each_request() {
+        use tornect_core::config::Network;
+        fn signed(verdict: Result<UnattendedVerdict, HandshakeError>) -> TransportPolicy {
+            let UnattendedVerdict::Accept { proof, .. } = verdict.unwrap() else {
+                panic!("expected Accept");
+            };
+            let ConsentProof::Unattended { policy, .. } = &proof else {
+                panic!("expected an unattended proof");
+            };
+            policy.transport()
+        }
+        let mut env = env(PW);
+        let knob = TransportKnob::new(&Network::default());
+        env.auth = env.auth.with_transport_knob(knob.clone());
+        let (verdict, _) = run(&env, PW, &TimerOnlyWindow, &DenyAll).await;
+        assert_eq!(signed(verdict), TransportPolicy::Any, "as configured");
+
+        knob.set_bridged(true);
+        let (verdict, _) = run(&env, PW, &TimerOnlyWindow, &DenyAll).await;
+        assert_eq!(signed(verdict), TransportPolicy::TorOnly, "bridged");
+
+        knob.set_from(&Network {
+            direct_with_bridges: true,
+            ..Network::default()
+        });
+        let (verdict, _) = run(&env, PW, &TimerOnlyWindow, &DenyAll).await;
+        assert_eq!(signed(verdict), TransportPolicy::Any, "direct_with_bridges");
+
+        knob.set_from(&Network {
+            lan_only: true,
+            ..Network::default()
+        });
+        let (verdict, _) = run(&env, PW, &TimerOnlyWindow, &DenyAll).await;
+        assert_eq!(
+            signed(verdict),
+            TransportPolicy::LanOnly,
+            "lan_only, bridged"
+        );
     }
 }

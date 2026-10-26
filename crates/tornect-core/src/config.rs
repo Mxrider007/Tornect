@@ -271,6 +271,11 @@ pub struct Network {
     pub punch_timeout_ms: u32,
     /// Fixed UDP port for direct connections (`None` = ephemeral).
     pub direct_port: Option<u16>,
+    /// Allow direct connections while Tor reaches the network through a
+    /// bridge (decision M1-86). Off by default: a direct path would show the
+    /// network that hides Tor use that Tornect is in use. Config only; `lan_only`
+    /// is unaffected by the bridge rule either way.
+    pub direct_with_bridges: bool,
 }
 
 /// Tor / onion-service options.
@@ -450,6 +455,7 @@ impl Default for Network {
             paranoid: false,
             punch_timeout_ms: 4000,
             direct_port: None,
+            direct_with_bridges: false,
         }
     }
 }
@@ -703,6 +709,23 @@ future_key = "ignored"
         assert!(cfg.network.stun_servers.is_empty());
         assert!(cfg.network.upnp);
         assert_eq!(cfg.security.panic_key, "Ctrl+Alt+End");
+    }
+
+    /// Decision M1-86: `network.direct_with_bridges` is off unless a file
+    /// sets it, an older file without the key reads as off, and the key
+    /// round-trips.
+    #[test]
+    fn direct_with_bridges_is_off_unless_the_file_sets_it() {
+        assert!(!Config::default().network.direct_with_bridges);
+        let old: Config = toml::from_str("[network]\nlan_only = false\n").unwrap();
+        assert!(!old.network.direct_with_bridges);
+        let set: Config = toml::from_str("[network]\ndirect_with_bridges = true\n").unwrap();
+        assert!(set.network.direct_with_bridges);
+        set.validate().unwrap();
+        let text = toml::to_string_pretty(&set).unwrap();
+        assert!(text.contains("direct_with_bridges = true"), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back, set);
     }
 
     /// A8 (§B.8.15): policy never lives in `config.toml` — an `[unattended]` table is

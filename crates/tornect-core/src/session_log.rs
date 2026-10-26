@@ -427,6 +427,11 @@ pub struct SessionRecord {
     /// File path (`backup_exported`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// What a session's direct-path phase came to (`session_ended`; design
+    /// `direct` §8.1, which names it `path`: that key already holds
+    /// `backup_exported`'s file path, so this one is `path_summary`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_summary: Option<PathSummary>,
 }
 
 impl SessionRecord {
@@ -478,6 +483,7 @@ impl SessionRecord {
             op: None,
             ok: None,
             path: None,
+            path_summary: None,
         }
     }
 
@@ -641,6 +647,13 @@ impl SessionRecord {
     #[must_use]
     pub fn path(mut self, p: impl Into<String>) -> Self {
         self.path = Some(p.into());
+        self
+    }
+
+    /// Attach the direct-path summary of a session's end.
+    #[must_use]
+    pub fn path_summary(mut self, p: PathSummary) -> Self {
+        self.path_summary = Some(p);
         self
     }
 
@@ -1572,6 +1585,67 @@ mod tests {
             let line = serde_json::to_string(&SessionRecord::at(0, event).reason("late")).unwrap();
             assert!(line.contains(&format!(r#""event":"{name}""#)), "{line}");
         }
+    }
+
+    /// Design `direct` §8.1: a `session_ended` line carries the media route
+    /// and the direct-path summary when they are known and reads back as
+    /// written; without them it is the line it always was, and such a line
+    /// reads back with neither. A summary has names, a flag and a time only.
+    #[test]
+    fn a_session_end_carries_its_route_and_path_summary() {
+        let dev = DeviceId::from_bytes([1u8; 32]);
+        let ended = SessionRecord::at(1_700_000_000, SessionEvent::SessionEnded)
+            .peer(dev, "Laptop")
+            .session("abcd")
+            .detail("PeerBye(1)");
+        let plain = serde_json::to_string(&ended).unwrap();
+        assert!(
+            !plain.contains("transport") && !plain.contains("path_summary"),
+            "{plain}"
+        );
+        let summary = PathSummary {
+            outcome: "direct".into(),
+            winner: Some("host".into()),
+            ipv6: false,
+            ms: 412,
+        };
+        let full = ended
+            .clone()
+            .transport(TransportKind::Lan)
+            .path_summary(summary);
+        let line = serde_json::to_string(&full).unwrap();
+        assert!(line.contains(r#""transport":"lan""#), "{line}");
+        assert!(
+            line.contains(
+                r#""path_summary":{"outcome":"direct","winner":"host","ipv6":false,"ms":412}"#
+            ),
+            "{line}"
+        );
+        let back: SessionRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, full);
+        let old: SessionRecord = serde_json::from_str(&plain).unwrap();
+        assert_eq!((old.transport, old.path_summary), (None, None));
+
+        let fallback = PathSummary {
+            outcome: "NO_PATH".into(),
+            winner: None,
+            ipv6: false,
+            ms: 4000,
+        };
+        assert_eq!(
+            serde_json::to_string(&fallback).unwrap(),
+            r#"{"outcome":"NO_PATH","ipv6":false,"ms":4000}"#
+        );
+        let minimal: PathSummary = serde_json::from_str(r#"{"outcome":"old-viewer"}"#).unwrap();
+        assert_eq!(
+            minimal,
+            PathSummary {
+                outcome: "old-viewer".into(),
+                winner: None,
+                ipv6: false,
+                ms: 0,
+            }
+        );
     }
 
     /// Design `services` §8: the four services events have their names; a
