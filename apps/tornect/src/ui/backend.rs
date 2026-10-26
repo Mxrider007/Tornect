@@ -2115,7 +2115,10 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
             .await
             .map_err(|e| format!("preparing the session services: {e}"))?
     };
-    let (policy, policy_rx) = watch::channel(ServicesPolicy::from_config(&b.cfg.services));
+    // What Settings, Sharing last saved, which a save before hosting
+    // started did not publish (there was no watch yet).
+    let saved = b.shared.read(|m| m.settings.services);
+    let (policy, policy_rx) = watch::channel(ServicesPolicy::from_config(&saved));
     let observer = Arc::new(GuiServices::new(
         Arc::clone(&b.shared),
         Arc::clone(audit.log()),
@@ -3903,7 +3906,9 @@ async fn services_start(
             }
         });
     }
-    let (paths, cfg) = (b.paths.clone(), b.cfg.services);
+    // The limits as last saved (Settings writes `config.toml` again, with
+    // what it holds now): not the start's copy.
+    let (paths, cfg) = (b.paths.clone(), b.shared.read(|m| m.settings.services));
     // A failed preparation leaves nothing to send and nowhere to download
     // to: chat still works.
     let local =
@@ -5941,6 +5946,66 @@ mod tests {
         };
         assert!(popups.answer_block(request), "the window's Block");
         assert_eq!(running.await.unwrap(), BlockOutcome::Blocked);
+        if let Some(ipc) = &hosted.ipc {
+            ipc.abort();
+        }
+    }
+
+    /// Design `services` §7.5: what Settings, Sharing last saved (the model's
+    /// settings), not the copy of `config.toml` read at the start, sets the
+    /// policy the host starts with and this computer's own download limits
+    /// at each viewed session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_saved_services_settings_set_the_policy_and_the_download_limits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let popups = Popups::new(Arc::clone(&shared));
+        let identity = Arc::new(HostIdentity::from_seed(&[0x21; 32]));
+        let device = DeviceIdentity::from_seed(&[0x22; 32]);
+        let device_pk = HostSigner::public_key(&device);
+        let words = Arc::new(super::super::recognize::Recognizer::new(
+            paths.clone(),
+            super::super::recognize::Me {
+                name: "Linux PC".to_owned(),
+                onion: identity.id(),
+                device: tornect_core::DeviceId::from_bytes(device_pk),
+            },
+        ));
+        let b = Backend {
+            paths: paths.clone(),
+            cfg: Config::default(),
+            shared: Arc::clone(&shared),
+            popups: Arc::clone(&popups),
+            link: Arc::new(StreamLink::default()),
+            source: Source::TestCard,
+            host: true,
+            identity,
+            device: Arc::new(device),
+            device_pk,
+            words,
+            background: None,
+            hosted_store: std::sync::OnceLock::new(),
+        };
+        shared.update(|m| {
+            let services = &mut m.settings.services;
+            services.browse_files = false;
+            services.max_file_mib = 16;
+            services.keep_free_mib = 64;
+        });
+        assert!(b.cfg.services.browse_files, "the start's copy differs");
+        let hosted = host_role(&b).await.expect("the window host is wired");
+        {
+            let policy = hosted.policy.borrow();
+            assert!(!policy.browse_files);
+            assert!(policy.chat && policy.clipboard && policy.receive_files);
+            assert_eq!(policy.max_file, 16 << 20);
+        }
+        let token = tornect_signal::consent::SessionToken::new([5; 32]);
+        let (start, _) = services_start(&b, ServicesBinding::new(&token, &[7; 32])).await;
+        assert_eq!(start.local.max_file, 16 << 20);
+        assert_eq!(start.local.keep_free, 64 << 20);
         if let Some(ipc) = &hosted.ipc {
             ipc.abort();
         }

@@ -75,6 +75,13 @@ pub(in super::super) const LIMITS_WINDOWS: [&str; 2] = [
      are out of its reach.",
 ];
 
+/// What control also gives beside the picture and input (the services
+/// design §7.4), at ① after this system's limits and at ⑤ when Control is
+/// chosen.
+pub(in super::super) const SERVICES: &str = "With control, that device can also see and copy any \
+    file you can open on this computer, send files into Downloads › Tornect and use this \
+    computer's clipboard. Settings, Sharing turns each of these off.";
+
 /// What is kept and who learns what (§B.8.7.1 ①, as the operator approved
 /// them).
 pub(in super::super) const DISCLOSURES: [&str; 6] = [
@@ -861,6 +868,7 @@ fn before(ui: &mut Ui, t: &Tokens, w: &mut Wizard, close: &mut bool) {
     for limit in limits {
         line(ui, limit, t.text_secondary);
     }
+    line(ui, SERVICES, t.text_secondary);
     ui.add_space(8.0);
     for disclosure in DISCLOSURES {
         line(ui, disclosure, t.text_secondary);
@@ -1637,6 +1645,9 @@ fn options(
     widgets::section_header(ui, "Mode");
     ui.radio_value(&mut o.mode, SessionMode::Control, "Control");
     ui.radio_value(&mut o.mode, SessionMode::ViewOnly, "View only");
+    if o.mode == SessionMode::Control {
+        line(ui, SERVICES, t.text_secondary);
+    }
     ui.add_space(8.0);
     widgets::section_header(ui, "Ends");
     let lasts = match (d.expiry_span_s, d.auto_renew) {
@@ -3099,6 +3110,46 @@ mod tests {
             assert_eq!(window.step(), Some(Step::Device), "{size:?}");
             assert!(window.has_text(Step::Device.title()), "{size:?}");
         }
+    }
+
+    /// The services design §7.4: what control also gives beside the
+    /// picture and input, in fixed words, at ① after this system's limits
+    /// and before the disclosures, and at ⑤ only while Control is chosen.
+    #[test]
+    fn the_services_line_shows_at_the_start_and_with_control() {
+        assert_eq!(
+            SERVICES,
+            "With control, that device can also see and copy any file you can open on this \
+             computer, send files into Downloads › Tornect and use this computer's clipboard. \
+             Settings, Sharing turns each of these off."
+        );
+        let limits = if cfg!(windows) {
+            LIMITS_WINDOWS
+        } else {
+            LIMITS_LINUX
+        };
+        for size in [WIDE, NARROW] {
+            let mut window = Window::new(model(true), size);
+            open(&mut window);
+            let top = |text: &str| {
+                window
+                    .nodes
+                    .iter()
+                    .find(|n| n.value().is_some_and(|v| v.contains(text)))
+                    .and_then(Node::bounds)
+                    .unwrap_or_else(|| panic!("{size:?}: no \"{text}\""))
+                    .y0
+            };
+            assert!(top(limits[1]) < top(SERVICES), "{size:?}");
+            assert!(top(SERVICES) < top(DISCLOSURES[0]), "{size:?}");
+        }
+        let mut window = at_options("My machines", false);
+        assert_eq!(options_mut(&mut window).mode, SessionMode::Control);
+        assert!(window.has_text(SERVICES));
+        assert!(window.click("View only").is_empty());
+        assert!(!window.has_text(SERVICES), "view only gives none of it");
+        assert!(window.click("Control").is_empty());
+        assert!(window.has_text(SERVICES));
     }
 
     /// M-UI-3's "no keyboard path to an accept" on the wizard's trust steps

@@ -276,6 +276,17 @@ impl ServicesObserver for GuiServices {
         // (design §7.2); the ones after it only change the card.
         let mut nudge = false;
         self.shared.update(|m| {
+            // Settings, Sharing says when this desktop kept its clipboard
+            // from a session that could have had it.
+            if matches!(
+                event,
+                HostEvent::Opened {
+                    clipboard_refused: true,
+                    ..
+                }
+            ) {
+                m.clipboard_refused = true;
+            }
             let Some(sharing) = m.sharing.iter_mut().find(|s| s.session_id == session_id) else {
                 return;
             };
@@ -641,6 +652,46 @@ mod tests {
         // A session this window does not show: nothing.
         observer.event("0022", HostEvent::Chat(text("elsewhere")));
         assert_eq!(nudges(), 2);
+    }
+
+    /// Settings, Sharing (the services design §7.5): once a session that
+    /// could have had the clipboard opened without it, the model says so
+    /// for the rest of the window's life; a session that had it, or did not
+    /// ask, says nothing.
+    #[test]
+    fn a_refused_clipboard_is_remembered_for_settings() {
+        use std::time::Instant;
+
+        use super::super::model::{Model, Sharing};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let model = Model {
+            sharing: vec![Sharing {
+                session_id: "0011".to_owned(),
+                label: "Laptop".to_owned(),
+                control: true,
+                unattended: false,
+                since: Instant::now(),
+                capture: None,
+                services: None,
+            }],
+            ..Model::default()
+        };
+        let shared = Shared::new(model, Arc::new(|_| {}));
+        let log = Arc::new(SessionLog::new(tmp.path().join("sessions.log")));
+        let observer = GuiServices::new(Arc::clone(&shared), log);
+        let opened = |clipboard_refused| HostEvent::Opened {
+            caps: caps::CHAT,
+            input: true,
+            clipboard_refused,
+        };
+        observer.event("0011", opened(false));
+        assert!(!shared.read(|m| m.clipboard_refused));
+        observer.event("0011", opened(true));
+        assert!(shared.read(|m| m.clipboard_refused));
+        assert!(shared.read(|m| m.sharing[0].services.as_ref().unwrap().clipboard_refused));
+        observer.event("0011", opened(false));
+        assert!(shared.read(|m| m.clipboard_refused), "kept");
     }
 
     /// Running rows stay, and only the newest ended ones are kept.

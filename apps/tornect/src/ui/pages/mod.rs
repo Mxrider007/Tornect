@@ -2943,6 +2943,7 @@ mod tests {
                 "General",
                 "Connection",
                 "Security",
+                "Sharing",
                 "Display and quality",
                 "Privacy",
                 "About"
@@ -4546,6 +4547,187 @@ mod tests {
             ] {
                 assert!(!has_text(&window, gone), "{gone}");
             }
+        }
+    }
+
+    /// Settings, Sharing (the services design §7.5): the host's four switches
+    /// and the viewer's clipboard switch, each with what it does in the
+    /// design's words, the limits from `[services]`, the lock's pause and
+    /// where downloads go; each switch sends its one change, the others as
+    /// saved (the limits and the Wayland switch are never among them).
+    #[test]
+    fn the_sharing_section_saves_each_switch() {
+        use super::super::model::{ServicesSettings, SettingsChange};
+        use settings::sharing;
+        use tornect_core::config::Services;
+
+        let stored = ServicesSettings::of(&Services::default());
+        for size in [WIDE, NARROW, TALL] {
+            let mut window = Window::new(at_rest(), Page::Settings, egui::Theme::Dark, size);
+            let at = window.center("Sharing");
+            assert!(
+                window.click(at).is_empty(),
+                "{size:?}: opening it asks nothing"
+            );
+            assert!(window.pass(Vec::new()).is_empty(), "{size:?}");
+            let limits = "Each file up to 2 GiB, up to 8 GiB and 1,000 files in a session; 1 \
+                          GiB of the disk is always kept free.";
+            for text in [
+                sharing::HOST_HEADER,
+                sharing::CHAT.1,
+                sharing::CLIPBOARD.1,
+                sharing::RECEIVE.1,
+                sharing::BROWSE.1,
+                limits,
+                sharing::LOCKED,
+                sharing::VIEWER_HEADER,
+                sharing::SHARE_CLIPBOARD.1,
+                sharing::DOWNLOADS,
+            ] {
+                assert!(has_text(&window, text), "{size:?}: {text}");
+            }
+            for text in [sharing::NO_DOWNLOADS, sharing::NOT_SHARED_YET] {
+                assert!(!has_text(&window, text), "{size:?}: {text}");
+            }
+            for (name, _) in [
+                sharing::CHAT,
+                sharing::CLIPBOARD,
+                sharing::RECEIVE,
+                sharing::BROWSE,
+                sharing::SHARE_CLIPBOARD,
+            ] {
+                assert!(
+                    window.controls().iter().any(|c| c == name),
+                    "{size:?}: {name}"
+                );
+            }
+        }
+        let mut window = Window::new(at_rest(), Page::Settings, egui::Theme::Dark, TALL);
+        window.form.settings.section = settings::Section::Sharing;
+        window.pass(Vec::new());
+        let save = |switches| vec![Action::SaveSettings(SettingsChange::Services(switches))];
+        for (name, want) in [
+            (
+                sharing::CHAT.0,
+                ServicesSettings {
+                    chat: false,
+                    ..stored
+                },
+            ),
+            (
+                sharing::CLIPBOARD.0,
+                ServicesSettings {
+                    clipboard: false,
+                    ..stored
+                },
+            ),
+            (
+                sharing::RECEIVE.0,
+                ServicesSettings {
+                    receive_files: false,
+                    ..stored
+                },
+            ),
+            (
+                sharing::BROWSE.0,
+                ServicesSettings {
+                    browse_files: false,
+                    ..stored
+                },
+            ),
+        ] {
+            let at = window.center(name);
+            assert_eq!(window.click(at), save(want), "{name}");
+        }
+        let at = window.center(sharing::SHARE_CLIPBOARD.0);
+        assert_eq!(
+            window.click(at),
+            vec![Action::SaveSettings(SettingsChange::ViewerClipboard(false))]
+        );
+        // As saved: a switch that is off turns on.
+        let mut model = at_rest();
+        model.settings.services.browse_files = false;
+        model.settings.viewer.clipboard_sync = false;
+        let mut window = Window::new(model, Page::Settings, egui::Theme::Dark, TALL);
+        window.form.settings.section = settings::Section::Sharing;
+        window.pass(Vec::new());
+        let at = window.center(sharing::BROWSE.0);
+        assert_eq!(window.click(at), save(stored));
+        let at = window.center(sharing::SHARE_CLIPBOARD.0);
+        assert_eq!(
+            window.click(at),
+            vec![Action::SaveSettings(SettingsChange::ViewerClipboard(true))]
+        );
+    }
+
+    /// Settings, Sharing says what this computer cannot give: no Downloads
+    /// folder, so no files received; a Wayland desktop whose clipboard no
+    /// session has (the portal not asked for it while `[services]
+    /// wayland_clipboard` is off, or a session refused it); the limits as
+    /// `config.toml` sets them. While this screen is shared the switches give
+    /// way to the hidden card and what the section says stays.
+    #[test]
+    fn the_sharing_section_says_what_this_computer_cannot_give() {
+        use settings::sharing;
+
+        let shows = |model: Model, text: &str| {
+            let mut window = Window::new(model, Page::Settings, egui::Theme::Dark, WIDE);
+            window.form.settings.section = settings::Section::Sharing;
+            window.pass(Vec::new());
+            has_text(&window, text)
+        };
+        let mut model = at_rest();
+        model.no_downloads = true;
+        assert!(shows(model, sharing::NO_DOWNLOADS));
+        let wayland = Setup {
+            token_file: std::path::PathBuf::from("token"),
+            granted: true,
+            busy: false,
+            note: None,
+        };
+        let mut model = at_rest();
+        model.setup = Some(wayland.clone());
+        assert!(shows(model.clone(), sharing::NOT_SHARED_YET), "switch off");
+        model.settings.services.wayland_clipboard = true;
+        assert!(!shows(model.clone(), sharing::NOT_SHARED_YET), "asked for");
+        model.clipboard_refused = true;
+        assert!(shows(model, sharing::NOT_SHARED_YET), "refused");
+        let mut model = at_rest();
+        model.clipboard_refused = true;
+        assert!(!shows(model, sharing::NOT_SHARED_YET), "not a Wayland host");
+        let mut model = at_rest();
+        model.settings.services.max_file_mib = 512;
+        model.settings.services.session_quota_mib = 1536;
+        model.settings.services.keep_free_mib = 256;
+        assert!(shows(
+            model,
+            "Each file up to 512 MiB, up to 1.5 GiB and 1,000 files in a session; 256 MiB of \
+             the disk is always kept free."
+        ));
+
+        let mut model = at_rest();
+        model.hosted_elsewhere = true;
+        model.no_downloads = true;
+        let mut window = Window::new(model, Page::Settings, egui::Theme::Dark, WIDE);
+        window.form.settings.section = settings::Section::Sharing;
+        window.pass(Vec::new());
+        assert!(has_text(&window, HIDDEN_WHILE_SHARED));
+        for (name, _) in [
+            sharing::CHAT,
+            sharing::CLIPBOARD,
+            sharing::RECEIVE,
+            sharing::BROWSE,
+            sharing::SHARE_CLIPBOARD,
+        ] {
+            assert!(!window.controls().iter().any(|c| c == name), "{name}");
+        }
+        for text in [
+            sharing::LOCKED,
+            sharing::NO_DOWNLOADS,
+            sharing::DOWNLOADS,
+            "1,000 files in a session",
+        ] {
+            assert!(has_text(&window, text), "{text}");
         }
     }
 

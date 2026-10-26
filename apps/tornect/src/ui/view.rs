@@ -1449,6 +1449,10 @@ pub fn indicator_pill(
     ui.ctx().request_repaint_after(Duration::from_millis(500));
 }
 
+/// The block window's line where the session may be control and the saved
+/// settings give the clipboard or files (the services design §7.4).
+pub const BLOCK_SERVICES: &str = "With control it can also copy files and use the clipboard.";
+
 /// Whether `code` holds a whole code: six digits (a space allowed).
 /// A block window (§B.8.6.3, `block`): who is about to connect without asking,
 /// the seconds left, and the window's one control, Block, which a click or the
@@ -1488,6 +1492,14 @@ pub fn block_window(
                 .wrap()
                 .selectable(false),
             );
+            if block.services {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(RichText::new(BLOCK_SERVICES).color(t.text_secondary))
+                        .wrap()
+                        .selectable(false),
+                );
+            }
             ui.add_space(10.0);
             let block_button = egui::Button::new(
                 RichText::new("Block")
@@ -3892,6 +3904,7 @@ mod tests {
             id: 9,
             label: "Laptop".to_owned(),
             ends_at: t0 + Duration::from_secs(10),
+            services: false,
         };
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -3951,6 +3964,66 @@ mod tests {
         let mut actions = pass(t0, vec![egui::Event::PointerMoved(at), press(true)]).0;
         actions.extend(pass(t0 + Duration::from_millis(50), vec![press(false)]).0);
         assert_eq!(actions, vec![Action::Block { id: 9 }]);
+    }
+
+    /// The services design §7.4: where the session may be control and the
+    /// settings give the clipboard or files, the block window says so in one
+    /// fixed line, between the countdown and Block, and everything still
+    /// fits the window (`block::size`, 460 × 232) for a label of the most
+    /// characters a label may have; otherwise no such line.
+    #[test]
+    fn the_block_window_says_what_control_also_gives() {
+        let t0 = Instant::now();
+        let window = super::super::block::size();
+        assert_eq!((window.width, window.height), (460.0, 232.0));
+        for services in [true, false] {
+            let block = BlockRequest {
+                id: 9,
+                label: "x".repeat(64),
+                ends_at: t0 + Duration::from_secs(10),
+                services,
+            };
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut nodes = Vec::new();
+            for _ in 0..2 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(window.width as f32, window.height as f32),
+                    )),
+                    ..egui::RawInput::default()
+                };
+                let out = ctx.run_ui(raw, |ui| block_window(ui, &block, t0, &mut Vec::new()));
+                if let Some(update) = &out.platform_output.accesskit_update {
+                    nodes = update.nodes.iter().map(|(_, n)| n.clone()).collect();
+                }
+                out.drop_without_applying_deltas();
+            }
+            let line = nodes.iter().find(|n| n.value() == Some(BLOCK_SERVICES));
+            assert_eq!(line.is_some(), services, "{services}");
+            let block_button = nodes
+                .iter()
+                .find(|n| n.role() == egui::accesskit::Role::Button)
+                .and_then(egui::accesskit::Node::bounds)
+                .expect("Block");
+            // Block whole, and the frame's bottom margin (14) under it.
+            assert!(
+                block_button.y1 + 14.0 <= window.height,
+                "{services}: Block at {block_button:?}"
+            );
+            if let Some(line) = line.and_then(egui::accesskit::Node::bounds) {
+                let countdown = nodes
+                    .iter()
+                    .find(|n| {
+                        n.value()
+                            .is_some_and(|v| v.starts_with("The session starts"))
+                    })
+                    .and_then(egui::accesskit::Node::bounds)
+                    .expect("the countdown");
+                assert!(countdown.y1 <= line.y0 && line.y1 <= block_button.y0);
+            }
+        }
     }
 
     /// A sheet strips from a quoted name every quotation mark and middle

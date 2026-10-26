@@ -207,18 +207,13 @@ pub fn services_line(policy: &ServicesPolicy, inbox_words: Option<&str>) -> Opti
 }
 
 /// The session sheet's services line as this computer's saved settings
-/// give it ([`services_line`]): the clipboard not named on a Wayland
-/// desktop whose portal is not asked for its clipboard (`[services]
-/// wayland_clipboard` off: no session there can have it), files received
-/// not named without a Downloads folder.
+/// give it ([`services_line`] of [`Model::services_offered`]): the
+/// clipboard not named on a Wayland desktop whose portal is not asked for
+/// its clipboard (`[services] wayland_clipboard` off: no session there can
+/// have it), files received not named without a Downloads folder.
 #[must_use]
 pub fn sheet_services_line(model: &Model) -> Option<String> {
-    let services = &model.settings.services;
-    let mut policy = ServicesPolicy::from_config(services);
-    if model.setup.is_some() && !services.wayland_clipboard {
-        policy.clipboard = false;
-    }
-    services_line(&policy, (!model.no_downloads).then_some(INBOX_WORDS))
+    services_line(&model.services_offered(), Some(INBOX_WORDS))
 }
 
 /// Whether a transfer in `state` can still be stopped.

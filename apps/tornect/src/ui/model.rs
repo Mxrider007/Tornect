@@ -275,9 +275,33 @@ pub struct Model {
     /// here (design `services` §2.6): the session sheet does not offer it
     /// and Settings, Sharing says so.
     pub no_downloads: bool,
+    /// A session shared since this window started could have had the
+    /// clipboard and this desktop gave it none (`HostEvent::Opened`'s
+    /// `clipboard_refused`): on a Wayland desktop, Settings, Sharing says
+    /// that the desktop does not share its clipboard yet.
+    pub clipboard_refused: bool,
 }
 
 impl Model {
+    /// What a control session here would get beside the picture and input
+    /// under the saved settings (the services design §7.4): `[services]` as
+    /// saved, but no clipboard on a Wayland desktop this machine shares
+    /// while its portal is not asked for one (`wayland_clipboard` off) and
+    /// no files received where this computer has no Downloads folder. What
+    /// the session sheet and the block window say control also gives.
+    #[must_use]
+    pub fn services_offered(&self) -> tornect_session::services::ServicesPolicy {
+        let services = &self.settings.services;
+        let mut policy = tornect_session::services::ServicesPolicy::from_config(services);
+        if self.setup.is_some() && !services.wayland_clipboard {
+            policy.clipboard = false;
+        }
+        if self.no_downloads {
+            policy.receive_files = false;
+        }
+        policy
+    }
+
     /// This computer's own ID, read from [`Model::id`]'s groups; `None`
     /// before it is known. The ID fields refuse it (B26) and Copy
     /// invitation copies it.
@@ -563,6 +587,11 @@ pub struct BlockRequest {
     pub label: String,
     /// When the window ends and the session starts unless blocked.
     pub ends_at: Instant,
+    /// The session may be control and the saved settings give it the
+    /// clipboard or files ([`Model::services_offered`]): the window says
+    /// "With control it can also copy files and use the clipboard." (the
+    /// services design §7.4).
+    pub services: bool,
 }
 
 /// This computer's two sets of device words (§B.6.1 item 5).
@@ -1642,6 +1671,41 @@ pub enum SettingsChange {
     Viewer(Viewer),
     /// How Tornect reaches the Tor network (from the next start).
     Tor(TorChoice),
+    /// What someone connected to this computer may use (Settings, Sharing;
+    /// from the next session on, design `services` §2.5).
+    Services(ServicesSettings),
+    /// The stream window's Clipboard switch at a session's start
+    /// (`[viewer] clipboard_sync`; from the next session on).
+    ViewerClipboard(bool),
+}
+
+/// The switches of `[services]` that Settings, Sharing changes (design
+/// `services` §7.5). The limits and the Wayland clipboard switch are not
+/// among them: a save keeps what `config.toml` holds of those.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServicesSettings {
+    /// They can write to this computer's user, and the user to them.
+    pub chat: bool,
+    /// Text copied on either computer during a control session can be
+    /// pasted on the other.
+    pub clipboard: bool,
+    /// They can send files into Downloads › Tornect.
+    pub receive_files: bool,
+    /// They can see and copy any file this computer's user can open.
+    pub browse_files: bool,
+}
+
+impl ServicesSettings {
+    /// The switches `services` holds.
+    #[must_use]
+    pub fn of(services: &Services) -> Self {
+        Self {
+            chat: services.chat,
+            clipboard: services.clipboard,
+            receive_files: services.receive_files,
+            browse_files: services.browse_files,
+        }
+    }
 }
 
 /// How Tornect reaches the Tor network, as `config.toml` holds it.
@@ -1678,6 +1742,13 @@ impl SettingsChange {
                 cfg.tor.bridge_lines.clone_from(&tor.bridge_lines.0);
                 cfg.tor.pow_defense = tor.pow_defense;
             }
+            Self::Services(switches) => {
+                cfg.services.chat = switches.chat;
+                cfg.services.clipboard = switches.clipboard;
+                cfg.services.receive_files = switches.receive_files;
+                cfg.services.browse_files = switches.browse_files;
+            }
+            Self::ViewerClipboard(on) => cfg.viewer.clipboard_sync = *on,
         }
     }
 }
@@ -1730,5 +1801,80 @@ mod tests {
         assert_eq!(model.own_id(), Some(id));
         model.id = Some("not created yet".to_owned());
         assert_eq!(model.own_id(), None);
+    }
+
+    /// Settings, Sharing (the services design §7.5): its change sets the four
+    /// switches of `[services]` and nothing else, the limits and the Wayland
+    /// clipboard switch (only `config.toml` sets them) kept as they are; the
+    /// viewer's clipboard switch sets `[viewer] clipboard_sync` alone.
+    #[test]
+    fn a_sharing_change_keeps_the_limits_and_the_wayland_switch() {
+        let mut cfg = tornect_core::Config::default();
+        cfg.services.max_file_mib = 64;
+        cfg.services.session_quota_mib = 128;
+        cfg.services.keep_free_mib = 32;
+        cfg.services.wayland_clipboard = true;
+        let before = cfg.clone();
+        let switches = ServicesSettings {
+            chat: false,
+            clipboard: false,
+            receive_files: true,
+            browse_files: false,
+        };
+        SettingsChange::Services(switches).apply(&mut cfg);
+        assert_eq!(ServicesSettings::of(&cfg.services), switches);
+        assert_eq!(
+            Services {
+                chat: false,
+                clipboard: false,
+                browse_files: false,
+                ..before.services
+            },
+            cfg.services
+        );
+        assert!(cfg.services.wayland_clipboard, "only config.toml sets it");
+        assert_eq!(cfg.viewer, before.viewer);
+        assert_eq!(cfg.general, before.general);
+
+        let mut cfg = before.clone();
+        SettingsChange::ViewerClipboard(false).apply(&mut cfg);
+        assert!(!cfg.viewer.clipboard_sync);
+        assert_eq!(
+            Viewer {
+                clipboard_sync: true,
+                ..cfg.viewer
+            },
+            before.viewer
+        );
+        assert_eq!(cfg.services, before.services);
+        // What the window holds after the save is what was saved.
+        assert_eq!(Settings::of(&cfg).services, cfg.services);
+    }
+
+    /// What control also gives (the services design §7.4) follows the saved
+    /// switches, without the clipboard on a Wayland desktop whose portal is
+    /// not asked for one and without received files where there is no
+    /// Downloads folder; the limits as saved.
+    #[test]
+    fn what_control_also_gives_follows_the_saved_settings_and_this_desktop() {
+        let mut model = Model::default();
+        let all = model.services_offered();
+        assert!(all.chat && all.clipboard && all.receive_files && all.browse_files);
+        model.setup = Some(Setup {
+            token_file: PathBuf::from("token"),
+            granted: false,
+            busy: false,
+            note: None,
+        });
+        assert!(
+            !model.services_offered().clipboard,
+            "the portal is not asked"
+        );
+        model.settings.services.wayland_clipboard = true;
+        assert!(model.services_offered().clipboard);
+        model.no_downloads = true;
+        assert!(!model.services_offered().receive_files);
+        model.settings.services.max_file_mib = 16;
+        assert_eq!(model.services_offered().max_file, 16 << 20);
     }
 }

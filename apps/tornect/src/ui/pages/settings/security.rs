@@ -902,6 +902,7 @@ mod tests {
             id: 1,
             label: "Office laptop".to_owned(),
             ends_at: Instant::now() + Duration::from_secs(5),
+            services: true,
         });
         assert!(
             !texts(&model).iter().any(|t| t.contains(code)),

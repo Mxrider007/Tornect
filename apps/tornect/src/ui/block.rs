@@ -23,6 +23,10 @@
 //! (`BlockOutcome::NotShown`: `HOST_NOT_READY` without a cause, the grant left
 //! as it was): nobody could have pressed Block.
 //!
+//! Where the session may be control (the grant's mode, lowered by the
+//! request) and the saved settings give it the clipboard or files, the
+//! window says so in one fixed line (the services design §7.4).
+//!
 //! The terminal host (`tornect host`) has no such window: it keeps the headless
 //! seams, so nobody can press Block there and every "Ask before starting" is
 //! denied (the minimal shell of M4 is not built in M-FEAT-5).
@@ -31,6 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
+use tornect_core::session_log::SessionMode;
 use tornect_signal::consent::{BlockOutcome, BlockWindow, GrantId, WindowPassed};
 use tornect_signal::pairing::BoxFuture;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -45,8 +50,10 @@ pub const TITLE: &str = "Tornect: unattended session starting";
 pub const REASSERT: Duration = Duration::from_millis(500);
 /// Width, in logical pixels.
 const WIDTH: f64 = 460.0;
-/// Height, in logical pixels.
-const HEIGHT: f64 = 190.0;
+/// Height, in logical pixels: room for the line of what control also gives
+/// (the services design §7.4) under the countdown of a label of the most
+/// characters a label may have, with Block and the bottom margin whole.
+const HEIGHT: f64 = 232.0;
 
 /// The window's size, in logical pixels (fixed: the user cannot resize it).
 #[must_use]
@@ -145,7 +152,24 @@ impl GuiBlockWindow {
 }
 
 impl BlockWindow for GuiBlockWindow {
-    fn run<'a>(&'a self, secs: u8, _: &'a GrantId, label: &'a str) -> BoxFuture<'a, BlockOutcome> {
+    /// Without the session's mode the window names no service (the state
+    /// machine always says the mode, through [`BlockWindow::run_for`]).
+    fn run<'a>(
+        &'a self,
+        secs: u8,
+        who: &'a GrantId,
+        label: &'a str,
+    ) -> BoxFuture<'a, BlockOutcome> {
+        self.run_for(secs, who, label, SessionMode::ViewOnly)
+    }
+
+    fn run_for<'a>(
+        &'a self,
+        secs: u8,
+        _: &'a GrantId,
+        label: &'a str,
+        mode: SessionMode,
+    ) -> BoxFuture<'a, BlockOutcome> {
         Box::pin(async move {
             if secs == 0 {
                 // `block_window_s = 0`: no window at all (an explicit choice of
@@ -155,7 +179,11 @@ impl BlockWindow for GuiBlockWindow {
             let length = Duration::from_secs(u64::from(secs));
             // Exactly `secs`, counted from when the window is put up.
             let deadline = tokio::time::Instant::now() + length;
-            let (shown, clicked, surfaces) = self.popups.open_block(label, Instant::now() + length);
+            let (shown, clicked, surfaces) = self.popups.open_block(
+                label,
+                Instant::now() + length,
+                mode == SessionMode::Control,
+            );
             let (notice, notice_now) = watch::channel(if self.notify {
                 Notice::Pending
             } else {
@@ -385,6 +413,76 @@ mod tests {
         assert!(!popups.answer_block(id), "nothing left to block");
     }
 
+    /// The services design §7.4: the window says what control also gives
+    /// only where the session may be control (the mode the state machine
+    /// gives `run_for`; `run` gives none) and the saved settings give this
+    /// computer's clipboard or files; on a Wayland desktop whose portal is
+    /// not asked for its clipboard, the clipboard alone does not count.
+    #[tokio::test(start_paused = true)]
+    async fn the_window_says_what_control_also_gives_only_where_it_may() {
+        use super::super::model::Setup;
+        use tornect_core::config::Services;
+
+        let off = Services {
+            clipboard: false,
+            receive_files: false,
+            browse_files: false,
+            ..Services::default()
+        };
+        let clipboard_only = Services {
+            clipboard: true,
+            ..off
+        };
+        let wayland = Some(Setup {
+            token_file: std::path::PathBuf::from("token"),
+            granted: true,
+            busy: false,
+            note: None,
+        });
+        for (mode, services, setup, said) in [
+            (Some(SessionMode::Control), Services::default(), None, true),
+            (
+                Some(SessionMode::ViewOnly),
+                Services::default(),
+                None,
+                false,
+            ),
+            (None, Services::default(), None, false),
+            (Some(SessionMode::Control), off, None, false),
+            (Some(SessionMode::Control), clipboard_only, None, true),
+            (
+                Some(SessionMode::Control),
+                clipboard_only,
+                wayland.clone(),
+                false,
+            ),
+            (
+                Some(SessionMode::Control),
+                Services::default(),
+                wayland.clone(),
+                true,
+            ),
+        ] {
+            let (popups, block) = window();
+            popups.shared().update(|m| {
+                m.settings.services = services;
+                m.setup.clone_from(&setup);
+            });
+            let run = tokio::spawn(async move {
+                match mode {
+                    Some(mode) => block.run_for(10, &[7; 8], "Laptop", mode).await,
+                    None => block.run(10, &[7; 8], "Laptop").await,
+                }
+            });
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let told = popups.shared().read(|m| m.blocks[0].services);
+            assert_eq!(told, said, "{mode:?} {services:?} {:?}", setup.is_some());
+            let id = popups.shared().read(|m| m.blocks[0].id);
+            assert!(popups.answer_block(id));
+            assert_eq!(run.await.unwrap(), BlockOutcome::Blocked);
+        }
+    }
+
     /// Each window sits on top, undecorated (no close button), at a fixed size,
     /// centred on its monitor; only on Wayland does it ask for the focus.
     #[test]
@@ -404,7 +502,7 @@ mod tests {
                 1.0,
                 size()
             ),
-            PhysicalPosition::new(1920 + 730, 445)
+            PhysicalPosition::new(1920 + 730, 424)
         );
         // A monitor smaller than the window: never off its top-left corner.
         assert_eq!(

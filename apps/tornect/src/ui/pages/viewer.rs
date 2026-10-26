@@ -36,7 +36,7 @@ use tornect_proto::{ALL_MONITORS, HostStats, MonitorEntry, QualityInfo, monitor_
 use tornect_signal::messages::notice;
 
 pub use self::clip::{Board, Ends};
-pub use self::panels::{FileOp, FilesTab, cut as cut_name, percent, size_text};
+pub use self::panels::{FileOp, FilesTab, cut as cut_name, limit_text, percent, size_text};
 
 use super::super::model::{Ewma, ScreenNote, ScreensView, ViewerServices, Viewing};
 use super::super::screenshot;

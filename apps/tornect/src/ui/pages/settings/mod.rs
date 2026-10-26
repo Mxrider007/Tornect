@@ -13,6 +13,7 @@ pub(super) mod display;
 pub(super) mod general;
 pub(super) mod privacy;
 pub(super) mod security;
+pub(super) mod sharing;
 pub(super) mod wizard;
 
 use egui::{RichText, Ui};
@@ -32,6 +33,9 @@ pub(super) enum Section {
     Connection,
     /// Unattended access: its state, the devices, the readiness rows.
     Security,
+    /// What someone connected here may use beside the picture and input,
+    /// and whether this computer offers its clipboard when it views.
+    Sharing,
     /// How the stream window opens.
     Display,
     /// What others learn, what is kept here, the history switch.
@@ -43,10 +47,11 @@ pub(super) enum Section {
 impl Section {
     /// The sections the page lists, in the redesign's order: only those
     /// built.
-    pub const LISTED: [Self; 6] = [
+    pub const LISTED: [Self; 7] = [
         Self::General,
         Self::Connection,
         Self::Security,
+        Self::Sharing,
         Self::Display,
         Self::Privacy,
         Self::About,
@@ -69,6 +74,7 @@ impl Section {
             Self::General => "General",
             Self::Connection => "Connection",
             Self::Security => "Security",
+            Self::Sharing => "Sharing",
             Self::Display => "Display and quality",
             Self::Privacy => "Privacy",
             Self::About => "About",
@@ -210,6 +216,7 @@ pub(super) fn page(
         Section::Security => {
             security::section(ui, model, &mut form.settings, shared, actions);
         }
+        Section::Sharing => sharing::section(ui, model, shared, actions),
         Section::Display => display::section(ui, model, shared, actions),
         Section::Privacy => privacy::section(ui, model, form, shared, actions),
         Section::About => about::section(ui, model, actions),

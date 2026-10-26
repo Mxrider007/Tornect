@@ -264,11 +264,13 @@ impl Popups {
     /// Show the block window of `label`'s request until `ends_at`: the window is
     /// up while the returned guard lives, the first receiver resolves on Block,
     /// and the second carries what the app reports of the request's windows
-    /// ([`Popups::block_drew`], [`Popups::block_failed`]).
+    /// ([`Popups::block_drew`], [`Popups::block_failed`]). Where the session
+    /// may be `control`, the window says what control also gives here.
     pub(super) fn open_block(
         &self,
         label: &str,
         ends_at: Instant,
+        control: bool,
     ) -> (
         OnScreen<'_>,
         oneshot::Receiver<()>,
@@ -291,7 +293,16 @@ impl Popups {
                     .insert(id, reports);
             },
             |id, m| {
-                m.blocks.push(BlockRequest { id, label, ends_at });
+                // What control also gives, from the settings saved now.
+                let offered = m.services_offered();
+                let services =
+                    control && (offered.clipboard || offered.receive_files || offered.browse_files);
+                m.blocks.push(BlockRequest {
+                    id,
+                    label,
+                    ends_at,
+                    services,
+                });
             },
         );
         (shown, rx, surfaces)
