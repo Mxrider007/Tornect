@@ -1288,6 +1288,10 @@ fn stop_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     )
 }
 
+/// The indicator's second line in an administrator session: the level the
+/// host signed, before what the viewer's input does (§B.2.1).
+const AS_ADMINISTRATOR: &str = "as administrator · ";
+
 /// The indicator's first word: an unattended session says so (§B.8.7.3).
 fn headline(sharing: &Sharing) -> &'static str {
     if sharing.unattended {
@@ -1320,7 +1324,9 @@ pub fn indicator(ui: &mut egui::Ui, sharing: &[Sharing], now: Instant, actions: 
 /// Drawn as a pill with rounded ends when `rounded` (the window is
 /// see-through where the desktop composites it), with a white dot before
 /// the rows. The headline, the mode and the clock come first on each row and
-/// are never cut; only the label, last, is shortened.
+/// are never cut; only the label, last, is shortened. On the second line the
+/// administrator level is never cut either; only what the viewer's input
+/// does, after it, is. A file moving adds a third line.
 pub fn indicator_pill(
     ui: &mut egui::Ui,
     sharing: &[Sharing],
@@ -1404,42 +1410,41 @@ pub fn indicator_pill(
                                     input_effect(s.control, c.input)
                                 });
                             // The level the host signed, first on the second
-                            // line: it cannot push the mode off the first.
-                            let detail = if s.control && admin.contains(&s.session_id) {
-                                format!("as administrator · {detail}")
-                            } else {
-                                detail.to_owned()
-                            };
-                            // A file moving (the services design §7.3): the
-                            // suffix is laid out first, whole, and only the
-                            // line before it is shortened.
-                            let moving = s
-                                .services
-                                .as_ref()
-                                .and_then(super::services::HostServices::moving);
+                            // line and a label of its own, never shortened:
+                            // only what the viewer's input does, after it, is.
                             // Top-aligned, not `horizontal`: the line keeps
                             // its text's height, and the rows fit the window.
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                            let level = s.control && admin.contains(&s.session_id);
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
-                                if let Some((dir, percent)) = moving {
+                                if level {
                                     ui.add(egui::Label::new(
-                                        RichText::new(strip::indicator_suffix(dir, percent))
-                                            .small()
-                                            .color(t.on_sharing),
+                                        RichText::new(AS_ADMINISTRATOR).small().color(t.on_sharing),
                                     ));
                                 }
-                                ui.with_layout(
-                                    egui::Layout::left_to_right(egui::Align::Min),
-                                    |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(detail).small().color(t.on_sharing),
-                                            )
-                                            .truncate(),
-                                        );
-                                    },
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(detail).small().color(t.on_sharing),
+                                    )
+                                    .truncate(),
                                 );
                             });
+                            // A file moving (the services design §7.3): fixed
+                            // words on a line of their own under the two, so
+                            // neither the level nor the input's effect gives
+                            // way to them (the window is a line taller while
+                            // it moves, `indicator::size`).
+                            if let Some((dir, percent)) = s
+                                .services
+                                .as_ref()
+                                .and_then(super::services::HostServices::moving)
+                            {
+                                ui.add(egui::Label::new(
+                                    RichText::new(strip::indicator_transfer(dir, percent))
+                                        .small()
+                                        .color(t.on_sharing),
+                                ));
+                            }
                         }
                     });
                 });

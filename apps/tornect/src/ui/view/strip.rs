@@ -74,6 +74,12 @@ const CHAT_WIDTH: f32 = 520.0;
 /// The indicator's chat button with no unread line.
 pub const CHAT: &str = "Chat";
 
+/// The most unread lines the indicator's chat button counts: past it, the
+/// button says `Chat (9+)`, its widest. The count is the peer's to raise,
+/// and the button takes its width from the rows, whose headline, mode and
+/// clock must stay whole (SLICE-E E1-2).
+const CHAT_COUNTED: usize = 9;
+
 /// What control also gives, said under the session sheet's answers that
 /// give control (the services design §7.4), before the parts.
 const SERVICES_LEAD: &str = "With control they can also ";
@@ -145,21 +151,23 @@ pub fn clip_line(note: ClipNote) -> String {
     }
 }
 
-/// The indicator's second-line suffix while a file moves (the services
-/// design §7.3): ` · receiving a file 45%` or ` · they are copying a file
-/// 45%`, in fixed words: never the file's name.
+/// The indicator's line while a file moves (the services design §7.3, on a
+/// line of its own under the session's two, decision M1-76 (cu)): `receiving
+/// a file 45%` or `they are copying a file 45%`, in fixed words: never the
+/// file's name.
 #[must_use]
-pub fn indicator_suffix(dir: Direction, percent: u64) -> String {
+pub fn indicator_transfer(dir: Direction, percent: u64) -> String {
     match dir {
-        Direction::ToHost => format!(" · receiving a file {percent}%"),
-        Direction::FromHost => format!(" · they are copying a file {percent}%"),
+        Direction::ToHost => format!("receiving a file {percent}%"),
+        Direction::FromHost => format!("they are copying a file {percent}%"),
     }
 }
 
 /// The indicator's chat button over the sessions shared (the services
 /// design §7.3): `Chat`, or `Chat (2)` with the viewers' lines not yet
-/// seen, while any session has a chat card; with the session whose card it
-/// shows, the first with unread lines, else the newest.
+/// seen, `Chat (9+)` past nine, while any session has a chat card; with the
+/// session whose card it shows, the first with unread lines, else the
+/// newest.
 #[must_use]
 pub fn indicator_chat(sharing: &[Sharing]) -> Option<(String, String)> {
     let chats = || {
@@ -167,14 +175,14 @@ pub fn indicator_chat(sharing: &[Sharing]) -> Option<(String, String)> {
             .iter()
             .filter_map(|s| s.services.as_ref().filter(|c| c.has_chat()).map(|c| (s, c)))
     };
-    let unread: usize = chats().map(|(_, c)| c.unread).sum();
+    let unread = chats().fold(0_usize, |sum, (_, c)| sum.saturating_add(c.unread));
     let (session, _) = chats()
         .find(|(_, c)| c.unread > 0)
         .or_else(|| chats().next_back())?;
-    let text = if unread == 0 {
-        CHAT.to_owned()
-    } else {
-        format!("{CHAT} ({unread})")
+    let text = match unread {
+        0 => CHAT.to_owned(),
+        1..=CHAT_COUNTED => format!("{CHAT} ({unread})"),
+        _ => format!("{CHAT} ({CHAT_COUNTED}+)"),
     };
     Some((text, session.session_id.clone()))
 }
@@ -590,21 +598,21 @@ mod tests {
         );
     }
 
-    /// The services design §7.3: the indicator's suffix in fixed words and
-    /// a percent, never a name.
+    /// The services design §7.3: the indicator's transfer line in fixed
+    /// words and a percent, never a name.
     #[test]
-    fn the_indicator_suffix_says_which_way_a_file_goes() {
+    fn the_indicator_transfer_says_which_way_a_file_goes() {
         assert_eq!(
-            indicator_suffix(Direction::ToHost, 45),
-            " · receiving a file 45%"
+            indicator_transfer(Direction::ToHost, 45),
+            "receiving a file 45%"
         );
         assert_eq!(
-            indicator_suffix(Direction::FromHost, 45),
-            " · they are copying a file 45%"
+            indicator_transfer(Direction::FromHost, 45),
+            "they are copying a file 45%"
         );
         assert_eq!(
-            indicator_suffix(Direction::ToHost, 100),
-            " · receiving a file 100%"
+            indicator_transfer(Direction::ToHost, 100),
+            "receiving a file 100%"
         );
     }
 
@@ -649,6 +657,25 @@ mod tests {
             ]),
             Some(("Chat (5)".to_owned(), "b".to_owned())),
             "the first with lines waiting, the lines of all"
+        );
+        // The count stops at nine: the button's widest is `Chat (9+)`,
+        // however many lines the peer sends.
+        for (unread, text) in [
+            (9, "Chat (9)"),
+            (10, "Chat (9+)"),
+            (250, "Chat (9+)"),
+            (usize::MAX, "Chat (9+)"),
+        ] {
+            assert_eq!(
+                indicator_chat(&[shared("a", chat(unread))]),
+                Some((text.to_owned(), "a".to_owned())),
+                "{unread}"
+            );
+        }
+        assert_eq!(
+            indicator_chat(&[shared("a", chat(usize::MAX)), shared("b", chat(1))]),
+            Some(("Chat (9+)".to_owned(), "a".to_owned())),
+            "a sum past the largest count"
         );
         // A chat that ended keeps its card, and its button.
         let mut ended = HostServices::opened(caps::CHAT, true, false);

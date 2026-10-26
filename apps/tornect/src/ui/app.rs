@@ -1180,18 +1180,21 @@ impl App {
         indicator::place(&sharing, &monitors, primary, rows)
     }
 
-    /// A new indicator window for `rows` sessions, and where it was put.
+    /// A new indicator window for `rows` sessions, `window` large, and
+    /// where it was put.
     fn open_indicator(
         &mut self,
         el: &ActiveEventLoop,
         rows: usize,
+        window: LogicalSize<f64>,
     ) -> anyhow::Result<(Surface, Option<PhysicalPosition<i32>>)> {
         let position = self.indicator_position(el, rows);
         let setup = self.main_device(el);
         // A pill where the desktop composites transparent windows, a square
         // elsewhere.
         self.indicator_rounded = indicator::rounded_here(wayland(el));
-        let attrs = indicator::attributes(rows, position).with_transparent(self.indicator_rounded);
+        let attrs =
+            indicator::attributes(window, position).with_transparent(self.indicator_rounded);
         Surface::new(el, attrs, setup, self.theme, self.indicator_rounded)
             .map(|surface| (surface, position))
     }
@@ -1206,7 +1209,7 @@ impl App {
         if self.background.is_none() || self.probe.is_some() {
             return;
         }
-        match self.open_indicator(el, 1) {
+        match self.open_indicator(el, 1, indicator::size(1, 0)) {
             Ok((surface, _)) => {
                 let state = ProbeState::opened(surface.window.id(), Instant::now());
                 self.probe = Some((surface, state));
@@ -1289,32 +1292,32 @@ impl App {
         let sharing = self.shared.read(|m| m.sharing.clone());
         match self.shown.sync(&sharing) {
             Change::Keep => {}
-            Change::Open => match self.open_indicator(el, self.shown.rows()) {
-                Ok((surface, at)) => {
-                    self.indicator = Some(surface);
-                    self.indicator_at = at;
-                }
-                Err(e) => {
-                    // The banner in the main window still shows the session
-                    // (brought up first in background mode); the next session
-                    // tries again.
-                    let line = format!("the sharing indicator did not open: {e:#}");
-                    tracing::warn!("{line}");
-                    self.shared.update(|m| m.note(line));
-                    if let Some(main) = &self.main {
-                        on_indicator_failed(
-                            &*main.window,
-                            self.background.is_some(),
-                            &mut self.form,
-                        );
+            Change::Open => {
+                match self.open_indicator(el, self.shown.rows(), self.shown.window_size()) {
+                    Ok((surface, at)) => {
+                        self.indicator = Some(surface);
+                        self.indicator_at = at;
+                    }
+                    Err(e) => {
+                        // The banner in the main window still shows the session
+                        // (brought up first in background mode); the next session
+                        // tries again.
+                        let line = format!("the sharing indicator did not open: {e:#}");
+                        tracing::warn!("{line}");
+                        self.shared.update(|m| m.note(line));
+                        if let Some(main) = &self.main {
+                            on_indicator_failed(
+                                &*main.window,
+                                self.background.is_some(),
+                                &mut self.form,
+                            );
+                        }
                     }
                 }
-            },
+            }
             Change::Redraw => {
                 if let Some(surface) = &self.indicator {
-                    let _ = surface
-                        .window
-                        .request_inner_size(indicator::size(self.shown.rows()));
+                    let _ = surface.window.request_inner_size(self.shown.window_size());
                     surface.window.request_redraw();
                 }
             }

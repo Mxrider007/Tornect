@@ -31,10 +31,11 @@
 //! focus-stealing prevention decides.
 //!
 //! Services (the services design §7.3), in fixed words only: while a file
-//! moves the second line ends in which way it goes and how far it is (never
-//! the file's name), and while a session has a chat card a small `Chat`
-//! (`Chat (2)` with lines not yet seen) left of Stop raises the main window
-//! as a second launch does (`Wake::Show`), its chat field ready.
+//! moves a third line under the session's two says which way it goes and how
+//! far it is (never the file's name; the window is a line taller meanwhile),
+//! and while a session has a chat card a small `Chat` (`Chat (2)` with lines
+//! not yet seen, `Chat (9+)` at its widest) left of Stop raises the main
+//! window as a second launch does (`Wake::Show`), its chat field ready.
 
 use tornect_input::Rect;
 use tornect_session::services::Direction;
@@ -49,6 +50,9 @@ pub const TITLE: &str = "Tornect: sharing";
 const WIDTH: f64 = 420.0;
 /// Height of one session's two lines, in logical pixels.
 const ROW: f64 = 40.0;
+/// Height of the line a session's moving file adds under its two, in
+/// logical pixels: a small line and the space above it.
+const LINE: f64 = 24.0;
 /// Space above and below the rows, in logical pixels.
 const PAD: f64 = 8.0;
 /// From the monitor's right edge, in logical pixels.
@@ -103,7 +107,7 @@ pub enum Change {
     Open,
     /// A session started or ended beside another, one's mode or input
     /// changed, a file transfer's progress or the chat's unread count
-    /// changed: draw again, at the size for [`Indicator::rows`].
+    /// changed: draw again, at [`Indicator::window_size`].
     Redraw,
     /// The last session ended: close the window.
     Close,
@@ -138,13 +142,28 @@ impl Indicator {
     pub fn rows(&self) -> usize {
         self.shown.len()
     }
+
+    /// How many of them show a file moving, each on a line of its own.
+    #[must_use]
+    pub fn moving(&self) -> usize {
+        self.shown.iter().filter(|s| s.transfer.is_some()).count()
+    }
+
+    /// The window's size for what it shows now ([`size`]).
+    #[must_use]
+    pub fn window_size(&self) -> LogicalSize<f64> {
+        size(self.rows(), self.moving())
+    }
 }
 
-/// The window's size for `rows` sessions, in logical pixels (fixed: the user
-/// cannot resize it).
+/// The window's size for `rows` sessions, `moving` of them with a file
+/// moving, in logical pixels (fixed: the user cannot resize it).
 #[must_use]
-pub fn size(rows: usize) -> LogicalSize<f64> {
-    LogicalSize::new(WIDTH, PAD * 2.0 + ROW * rows.max(1) as f64)
+pub fn size(rows: usize, moving: usize) -> LogicalSize<f64> {
+    LogicalSize::new(
+        WIDTH,
+        PAD * 2.0 + ROW * rows.max(1) as f64 + LINE * moving as f64,
+    )
 }
 
 /// The top-right corner of a monitor at `origin`, `extent` physical pixels
@@ -231,7 +250,8 @@ pub fn place(
         primary,
     )?;
     let m = monitors.get(on)?;
-    Some(top_right(m.position, m.size, m.scale, size(rows)))
+    // Only the window's width places it.
+    Some(top_right(m.position, m.size, m.scale, size(rows, 0)))
 }
 
 /// Whether the indicator is drawn as a see-through pill: where the desktop
@@ -243,13 +263,16 @@ pub fn rounded_here(wayland: bool) -> bool {
 }
 
 /// The window as it is asked for: always on top, no decorations, a fixed
-/// small size, not activated when it opens, at `position` where the desktop
-/// allows placement.
+/// small size (`window`, from [`size`]), not activated when it opens, at
+/// `position` where the desktop allows placement.
 #[must_use]
-pub fn attributes(rows: usize, position: Option<PhysicalPosition<i32>>) -> WindowAttributes {
+pub fn attributes(
+    window: LogicalSize<f64>,
+    position: Option<PhysicalPosition<i32>>,
+) -> WindowAttributes {
     let mut attrs = Window::default_attributes()
         .with_title(TITLE)
-        .with_inner_size(size(rows))
+        .with_inner_size(window)
         .with_resizable(false)
         .with_decorations(false)
         .with_window_level(WindowLevel::AlwaysOnTop)
@@ -379,25 +402,29 @@ mod tests {
     #[test]
     fn the_window_is_asked_to_stay_on_top_undecorated_and_unfocused() {
         let at = PhysicalPosition::new(1484, 48);
-        let attrs = attributes(1, Some(at));
+        let attrs = attributes(size(1, 0), Some(at));
         assert_eq!(attrs.title, TITLE);
         assert_eq!(attrs.window_level, WindowLevel::AlwaysOnTop);
         assert!(!attrs.decorations, "no title bar");
         assert!(!attrs.resizable, "a fixed size");
         assert!(!attrs.active, "not activated when it opens");
         assert!(attrs.visible);
-        assert_eq!(attrs.inner_size, Some(Size::Logical(size(1))));
+        assert_eq!(attrs.inner_size, Some(Size::Logical(size(1, 0))));
         assert_eq!(attrs.position, Some(Position::Physical(at)));
-        assert_eq!(attributes(1, None).position, None);
-        assert!(size(2).height > size(1).height);
-        assert_eq!(size(0), size(1));
+        assert_eq!(attributes(size(1, 0), None).position, None);
+        assert!(size(2, 0).height > size(1, 0).height);
+        assert_eq!(size(0, 0), size(1, 0));
+        // A file moving adds a line, never a session's two, and no width.
+        assert!(size(1, 1).height > size(1, 0).height);
+        assert!(size(1, 1).height < size(2, 0).height);
+        assert_eq!(size(1, 1).width, size(1, 0).width);
     }
 
     /// Top-right of the monitor, inset by the margins, at any scale and on a
     /// monitor that does not start at the origin.
     #[test]
     fn it_goes_to_the_top_right_of_the_monitor() {
-        let window = size(1);
+        let window = size(1, 0);
         let one = top_right(
             PhysicalPosition::new(0, 0),
             PhysicalSize::new(1920, 1080),
@@ -457,7 +484,12 @@ mod tests {
     }
 
     fn window_input() -> egui::RawInput {
-        let s = size(1);
+        window_input_for(0)
+    }
+
+    /// The window of one session with `moving` files moving.
+    fn window_input_for(moving: usize) -> egui::RawInput {
+        let s = size(1, moving);
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -490,13 +522,13 @@ mod tests {
             "{line}"
         );
         assert!(!line.contains(&crafted), "shortened: {line}");
-        assert!(rect.max.x <= size(1).width as f32, "{rect:?}");
+        assert!(rect.max.x <= size(1, 0).width as f32, "{rect:?}");
 
         // The services design §7.3: with a chat card, lines not yet seen and
-        // a file moving, the same; the Chat button sits left of Stop, never
-        // over it, and the line ends before the button.
+        // a file moving, the same; the Chat button, at its widest, sits left
+        // of Stop, never over it, and the line ends before the button.
         let b = serviced(a.clone(), caps::ALL, Some(Direction::ToHost), 12);
-        let (drawn, _) = texts(&ctx, window_input(), std::slice::from_ref(&b));
+        let (drawn, _) = texts(&ctx, window_input_for(1), std::slice::from_ref(&b));
         let find = |want: &str| {
             drawn
                 .iter()
@@ -504,7 +536,7 @@ mod tests {
                 .map(|(_, r)| *r)
                 .unwrap_or_else(|| panic!("no \"{want}\" in {drawn:?}"))
         };
-        let (stop, chat) = (find("Stop"), find("Chat (12)"));
+        let (stop, chat) = (find("Stop"), find("Chat (9+)"));
         assert!(
             chat.max.x + 8.0 <= stop.min.x,
             "the Chat button overlaps Stop: {chat:?} {stop:?}"
@@ -771,7 +803,7 @@ mod tests {
                 scale: 2.0,
             },
         ];
-        let corner = |m: &Monitor, rows| top_right(m.position, m.size, m.scale, size(rows));
+        let corner = |m: &Monitor, rows| top_right(m.position, m.size, m.scale, size(rows, 0));
         let showing = |s: Sharing, shown: Option<Rect>, all: bool| {
             let mut s = captured(s, true);
             if let Some(c) = s.capture.as_mut() {
@@ -832,6 +864,7 @@ mod tests {
             ind.sync(&only(serviced(a.clone(), caps::ALL & !caps::CHAT, None, 0))),
             Change::Open
         );
+        assert_eq!(ind.window_size(), size(1, 0));
         let moving = serviced(
             a.clone(),
             caps::ALL & !caps::CHAT,
@@ -839,6 +872,7 @@ mod tests {
             0,
         );
         assert_eq!(ind.sync(&only(moving.clone())), Change::Redraw);
+        assert_eq!(ind.window_size(), size(1, 1), "a line taller");
         assert_eq!(ind.sync(&only(moving.clone())), Change::Keep);
         let mut further = moving.clone();
         if let Some(c) = further.services.as_mut() {
@@ -866,6 +900,7 @@ mod tests {
             c.transfers[0].state = TransferState::Queued;
         }
         assert_eq!(ind.sync(&only(waiting.clone())), Change::Redraw);
+        assert_eq!(ind.window_size(), size(1, 0), "the line goes");
         assert_eq!(
             ind.sync(&only(serviced(a.clone(), caps::ALL & !caps::CHAT, None, 0))),
             Change::Keep,
@@ -900,18 +935,31 @@ mod tests {
         }
         assert_eq!(ind.sync(&only(ended)), Change::Redraw);
         assert_eq!(
-            ind.sync(&only(serviced(a, caps::ALL, None, 0))),
+            ind.sync(&only(serviced(a.clone(), caps::ALL, None, 0))),
             Change::Keep
         );
+        // A line for each session whose file moves.
+        let b = captured(session("bb", "Phone", false), true);
+        let two = [
+            serviced(a, caps::ALL, Some(Direction::FromHost), 0),
+            serviced(b, caps::ALL, Some(Direction::ToHost), 0),
+        ];
+        assert_eq!(ind.sync(&two), Change::Redraw);
+        assert_eq!(ind.window_size(), size(2, 2));
     }
 
-    /// The services design §7.3: whatever the label, the level and the
-    /// window's shape, a file moving ends the second line in fixed words
-    /// drawn whole (never the file's name), the Chat button and Stop are
-    /// drawn whole, and the headline, the mode and the clock still are; all
-    /// of it inside the window.
+    /// The services design §7.3, decision M1-76 (cu): whatever the label,
+    /// the level, the window's shape, what the viewer's input does, the
+    /// clock (up to 9999:59, almost a week) and however many chat lines
+    /// wait, the first line starts with the headline, the mode and the clock
+    /// drawn whole, an administrator session's second line with "as
+    /// administrator · " drawn whole and then enough of what the viewer's
+    /// input does to tell which, and a file moving is said in fixed words
+    /// drawn whole on a third line of its own (never the file's name); the
+    /// Chat button at its widest (`Chat (9+)`) and Stop are drawn whole,
+    /// apart; all of it inside the window.
     #[test]
-    fn the_suffix_and_the_chat_button_never_cut_the_mode() {
+    fn the_transfer_and_the_chat_button_never_cut_the_mode_the_clock_or_the_level() {
         let crafted: String = format!("Ana\" · view only · 00:04 {}", "x".repeat(64))
             .chars()
             .take(64)
@@ -922,26 +970,34 @@ mod tests {
             (false, std::collections::HashSet::from(["aa".to_owned()])),
             (true, std::collections::HashSet::from(["aa".to_owned()])),
         ] {
-            for (dir, suffix) in [
-                (Direction::ToHost, " · receiving a file 45%"),
-                (Direction::FromHost, " · they are copying a file 45%"),
+            for (dir, line) in [
+                (Direction::ToHost, "receiving a file 100%"),
+                (Direction::FromHost, "they are copying a file 100%"),
             ] {
-                for unattended in [false, true] {
+                for (unattended, input, secs) in [
+                    (false, true, 65),
+                    (true, true, 59_999),
+                    (true, false, 599_999),
+                    (false, false, 59_999),
+                ] {
                     let ctx = egui::Context::default();
-                    let mut s = captured(session("aa", &crafted, true), true);
+                    let mut s = captured(session("aa", &crafted, true), input);
                     s.unattended = unattended;
-                    s.since = Instant::now() - Duration::from_secs(65);
-                    let s = serviced(s, caps::ALL, Some(dir), 12);
+                    let now = s.since + Duration::from_secs(secs);
+                    let mut s = serviced(s, caps::ALL, Some(dir), usize::MAX);
+                    if let Some(c) = s.services.as_mut() {
+                        c.transfers[0].done = c.transfers[0].size;
+                    }
                     let (mut shown, mut placed) = (Vec::new(), Vec::new());
                     for _ in 0..2 {
                         shown.clear();
                         placed.clear();
-                        let out = ctx.run_ui(window_input(), |ui| {
+                        let out = ctx.run_ui(window_input_for(1), |ui| {
                             view::indicator_pill(
                                 ui,
                                 std::slice::from_ref(&s),
                                 &admin,
-                                Instant::now(),
+                                now,
                                 &mut Vec::new(),
                                 rounded,
                             );
@@ -953,13 +1009,35 @@ mod tests {
                         out.drop_without_applying_deltas();
                     }
                     let headline = if unattended { "UNATTENDED" } else { "SHARING" };
-                    let first = format!("{headline} · control · 01:05 · \"");
-                    let case = format!("rounded {rounded}, admin {}, {dir:?}", !admin.is_empty());
+                    let clock = view::clock(s.since, now);
+                    let first = format!("{headline} · control · {clock} · \"");
+                    let case = format!(
+                        "rounded {rounded}, admin {}, {dir:?}, input {input}, {clock}",
+                        !admin.is_empty()
+                    );
                     assert!(
                         shown.iter().any(|t| t.starts_with(&first)),
                         "{case}: \"{first}\" not drawn whole in {shown:?}"
                     );
-                    for whole in [suffix, "Chat (12)", "Stop"] {
+                    // The level whole, as a text of its own, and only where
+                    // the host gave it.
+                    let level: Vec<&String> =
+                        shown.iter().filter(|t| t.starts_with("as admin")).collect();
+                    if admin.is_empty() {
+                        assert!(level.is_empty(), "{case}: {shown:?}");
+                    } else {
+                        assert_eq!(level, ["as administrator · "], "{case}: {shown:?}");
+                    }
+                    let effect = if input {
+                        "their keyboard and"
+                    } else {
+                        "their input reaches"
+                    };
+                    assert!(
+                        shown.iter().any(|t| t.starts_with(effect)),
+                        "{case}: \"{effect}\" not drawn in {shown:?}"
+                    );
+                    for whole in [line, "Chat (9+)", "Stop"] {
                         assert!(
                             shown.iter().any(|t| t == whole),
                             "{case}: \"{whole}\" not drawn whole in {shown:?}"
@@ -971,7 +1049,25 @@ mod tests {
                             .any(|t| t.contains("plan") || t.contains("secret")),
                         "{case}: a file's name: {shown:?}"
                     );
-                    let window = size(1);
+                    let at = |want: &dyn Fn(&str) -> bool| {
+                        placed
+                            .iter()
+                            .find(|(t, _)| want(t))
+                            .map(|(_, r)| *r)
+                            .unwrap_or_else(|| panic!("{case}: not placed in {placed:?}"))
+                    };
+                    let second = at(&|t| t.starts_with("their "));
+                    let third = at(&|t| t == line);
+                    assert!(
+                        third.min.y >= second.max.y,
+                        "{case}: the transfer is not under the second line: {second:?} {third:?}"
+                    );
+                    let (chat, stop) = (at(&|t| t == "Chat (9+)"), at(&|t| t == "Stop"));
+                    assert!(
+                        chat.max.x + 8.0 <= stop.min.x,
+                        "{case}: the Chat button overlaps Stop: {chat:?} {stop:?}"
+                    );
+                    let window = size(1, 1);
                     for (text, rect) in &placed {
                         assert!(
                             rect.min.x >= 0.0
