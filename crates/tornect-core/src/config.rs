@@ -95,7 +95,12 @@ pub struct Viewer {
     pub quality: QualityPreset,
     /// The stream window's Clipboard switch starts on: text copied here
     /// during a session is offered to the other computer when its window is
-    /// used again, and its text comes here (design `services` §4.3).
+    /// used again, and its text comes here (design `services` §4.3). Off
+    /// unless the person turns it on (`docs/PLAN.md` §B.6, the cross-feature
+    /// rule of decision M1-73; decision M1-76): nothing of this computer's
+    /// goes to a host the person did not choose it for. Even on, the switch
+    /// starts off in the first session with a computer paired in that
+    /// connection (the app's `clipboard_starts_on`).
     pub clipboard_sync: bool,
 }
 
@@ -424,7 +429,7 @@ impl Default for Viewer {
             toolbar_hides: ToolbarHides::After2_5s,
             show_badge: true,
             quality: QualityPreset::Balanced,
-            clipboard_sync: true,
+            clipboard_sync: false,
         }
     }
 }
@@ -842,7 +847,7 @@ panic_key = "Ctrl+Alt+End"
             toolbar_hides: ToolbarHides::After2_5s,
             show_badge: true,
             quality: QualityPreset::Balanced,
-            clipboard_sync: true,
+            clipboard_sync: false,
         };
         for cfg in [
             Config::default(),
@@ -876,7 +881,7 @@ panic_key = "Ctrl+Alt+End"
                 toolbar_hides: ToolbarHides::Never,
                 show_badge: false,
                 quality: QualityPreset::Balanced,
-                clipboard_sync: true,
+                clipboard_sync: false,
             }
         );
         let text = toml::to_string_pretty(&chosen).unwrap();
@@ -976,9 +981,10 @@ panic_key = "Ctrl+Alt+End"
     }
 
     /// The design's §2.6: a config written before services loads them all
-    /// on, 2 GiB per file, 8 GiB a session, 1 GiB kept free, the viewer's
-    /// clipboard switch on, and the Wayland portal clipboard off; a file
-    /// that names some keys keeps them and fills the rest; every key
+    /// on, 2 GiB per file, 8 GiB a session, 1 GiB kept free, and the Wayland
+    /// portal clipboard off; the viewer's clipboard switch off (the plan's
+    /// cross-feature rule, decision M1-76, where the design had it on); a
+    /// file that names some keys keeps them and fills the rest; every key
     /// round-trips.
     #[test]
     fn the_services_defaults_are_the_designs() {
@@ -1002,7 +1008,7 @@ panic_key = "Ctrl+Alt+End"
             toml::from_str("[services]\n").unwrap(),
         ] {
             assert_eq!(cfg.services, want);
-            assert!(cfg.viewer.clipboard_sync);
+            assert!(!cfg.viewer.clipboard_sync);
             assert!(!cfg.services.wayland_clipboard);
         }
         assert_eq!(want.max_file_bytes(), 2 << 30);
@@ -1012,7 +1018,7 @@ panic_key = "Ctrl+Alt+End"
         let chosen: Config = toml::from_str(
             "[services]\nchat = false\nbrowse_files = false\nmax_file_mib = 10\n\
              session_quota_mib = 10\nkeep_free_mib = 0\nwayland_clipboard = true\n\
-             future_key = 1\n\n[viewer]\nclipboard_sync = false\n",
+             future_key = 1\n\n[viewer]\nclipboard_sync = true\n",
         )
         .unwrap();
         chosen.validate().unwrap();
@@ -1028,11 +1034,11 @@ panic_key = "Ctrl+Alt+End"
                 ..want
             }
         );
-        assert!(!chosen.viewer.clipboard_sync);
+        assert!(chosen.viewer.clipboard_sync);
         let text = toml::to_string_pretty(&chosen).unwrap();
         assert!(text.contains("[services]"), "{text}");
         assert!(text.contains("wayland_clipboard = true"), "{text}");
-        assert!(text.contains("clipboard_sync = false"), "{text}");
+        assert!(text.contains("clipboard_sync = true"), "{text}");
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back, chosen);
 

@@ -69,7 +69,8 @@ pub(in super::super) const NOT_SHARED_YET: &str =
 pub(in super::super) const SHARE_CLIPBOARD: (&str, &str) = (
     "Share my clipboard",
     "Text you copy here during a session is offered to the other computer when you return to \
-     its window.",
+     its window. Not in the first session with a computer you just paired with: there, the \
+     window's Clipboard switch turns it on.",
 );
 
 /// Where downloads go.

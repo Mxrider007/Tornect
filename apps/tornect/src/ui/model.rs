@@ -1861,11 +1861,11 @@ mod tests {
         assert_eq!(cfg.general, before.general);
 
         let mut cfg = before.clone();
-        SettingsChange::ViewerClipboard(false).apply(&mut cfg);
-        assert!(!cfg.viewer.clipboard_sync);
+        SettingsChange::ViewerClipboard(true).apply(&mut cfg);
+        assert!(cfg.viewer.clipboard_sync);
         assert_eq!(
             Viewer {
-                clipboard_sync: true,
+                clipboard_sync: false,
                 ..cfg.viewer
             },
             before.viewer

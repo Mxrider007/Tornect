@@ -4639,15 +4639,16 @@ mod tests {
             let at = window.center(name);
             assert_eq!(window.click(at), save(want), "{name}");
         }
+        // The viewer's clipboard switch starts off (decision M1-76) and turns on.
         let at = window.center(sharing::SHARE_CLIPBOARD.0);
         assert_eq!(
             window.click(at),
-            vec![Action::SaveSettings(SettingsChange::ViewerClipboard(false))]
+            vec![Action::SaveSettings(SettingsChange::ViewerClipboard(true))]
         );
-        // As saved: a switch that is off turns on.
+        // As saved: a switch that is off turns on, one that is on turns off.
         let mut model = at_rest();
         model.settings.services.browse_files = false;
-        model.settings.viewer.clipboard_sync = false;
+        model.settings.viewer.clipboard_sync = true;
         let mut window = Window::new(model, Page::Settings, egui::Theme::Dark, TALL);
         window.form.settings.section = settings::Section::Sharing;
         window.pass(Vec::new());
@@ -4656,7 +4657,7 @@ mod tests {
         let at = window.center(sharing::SHARE_CLIPBOARD.0);
         assert_eq!(
             window.click(at),
-            vec![Action::SaveSettings(SettingsChange::ViewerClipboard(true))]
+            vec![Action::SaveSettings(SettingsChange::ViewerClipboard(false))]
         );
     }
 

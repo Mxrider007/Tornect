@@ -3885,16 +3885,31 @@ async fn view_session(
     });
 }
 
+/// Whether the stream window's Clipboard switch starts on: when `[viewer]
+/// clipboard_sync` says so and the host was paired before this connection.
+/// The plan's cross-feature rule (§B.6, decision M1-73; decision M1-76):
+/// nothing of this computer's goes to a host unless the person chose it for
+/// that host, and never by default in the first session with a computer
+/// paired in that connection, where only the toolbar's switch turns it on.
+fn clipboard_starts_on(clipboard_sync: bool, paired_before: bool) -> bool {
+    clipboard_sync && paired_before
+}
+
 /// The viewed session's services stream (design `services` §6.1, §7.1): its
 /// binding, what it works with on this computer (made off this task: the
 /// places are canonicalised), a fresh channel for the person's requests,
 /// the window's clipboard when the window shares one, its switch from
-/// `[viewer] clipboard_sync`, and its news into the model. Also the switch.
+/// `[viewer] clipboard_sync` ([`clipboard_starts_on`]: off with a host
+/// paired in this connection), and its news into the model. Also the switch.
 async fn services_start(
     b: &Backend,
     binding: ServicesBinding,
+    paired_before: bool,
 ) -> (crate::tor_cmd::ServicesStart, bool) {
-    let on = b.shared.read(|m| m.settings.viewer.clipboard_sync);
+    let on = clipboard_starts_on(
+        b.shared.read(|m| m.settings.viewer.clipboard_sync),
+        paired_before,
+    );
     let clip = b.link.start_clip(on);
     // The host's text wakes the stream window; the task ends with the
     // session's stream, which holds the sending end.
@@ -3974,6 +3989,9 @@ async fn viewed(
     crate::history::coarsen_pins(&b.paths);
     let pins =
         crate::history::Pins::open(&b.paths, id).inspect_err(|_| failed(b, Failure::Other))?;
+    // Read before the handshake, which may pin the host: the clipboard's
+    // switch starts off with a computer paired in this connection.
+    let paired_before = pins.known();
     // Unattended access is a paired computer's (§B.8 hard rule 2).
     let known = match (&ua, pins.store().get(&id)) {
         (Some(_), None) => {
@@ -4162,7 +4180,7 @@ async fn viewed(
     // `services` §0).
     let services = if session.host_has(tornect_signal::messages::feats::SVC1) {
         let binding = ServicesBinding::new(session.session_token(), &session.th());
-        Some(services_start(b, binding).await)
+        Some(services_start(b, binding, paired_before).await)
     } else {
         None
     };
@@ -5951,10 +5969,27 @@ mod tests {
         }
     }
 
+    /// The plan's cross-feature rule (§B.6, decision M1-73; decision M1-76):
+    /// the stream window's Clipboard switch starts on only when `[viewer]
+    /// clipboard_sync` is on and the host was paired before this connection;
+    /// never in the first session with a computer paired in it.
+    #[test]
+    fn the_clipboard_starts_off_with_a_host_paired_in_this_connection() {
+        for (sync, before, on) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            assert_eq!(clipboard_starts_on(sync, before), on, "{sync} {before}");
+        }
+    }
+
     /// Design `services` §7.5: what Settings, Sharing last saved (the model's
     /// settings), not the copy of `config.toml` read at the start, sets the
     /// policy the host starts with and this computer's own download limits
-    /// at each viewed session.
+    /// at each viewed session; the saved clipboard switch counts only with a
+    /// host paired before the connection.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_saved_services_settings_set_the_policy_and_the_download_limits() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6003,9 +6038,17 @@ mod tests {
             assert_eq!(policy.max_file, 16 << 20);
         }
         let token = tornect_signal::consent::SessionToken::new([5; 32]);
-        let (start, _) = services_start(&b, ServicesBinding::new(&token, &[7; 32])).await;
+        let (start, on) = services_start(&b, ServicesBinding::new(&token, &[7; 32]), true).await;
         assert_eq!(start.local.max_file, 16 << 20);
         assert_eq!(start.local.keep_free, 64 << 20);
+        assert!(!on, "the clipboard's switch is off unless turned on");
+        // The cross-feature rule (decision M1-76): the saved switch counts
+        // only with a host paired before this connection.
+        shared.update(|m| m.settings.viewer.clipboard_sync = true);
+        let (_, on) = services_start(&b, ServicesBinding::new(&token, &[7; 32]), true).await;
+        assert!(on, "a host paired before");
+        let (_, on) = services_start(&b, ServicesBinding::new(&token, &[7; 32]), false).await;
+        assert!(!on, "a host paired in this connection");
         if let Some(ipc) = &hosted.ipc {
             ipc.abort();
         }
