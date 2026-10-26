@@ -253,6 +253,17 @@ struct WindowClip {
     inbound: watch::Receiver<Option<ClipText>>,
 }
 
+/// The window's ends of the session's clipboard (design `services` §4.3).
+impl super::pages::viewer::Ends for StreamLink {
+    fn offer(&self, text: ClipText) -> bool {
+        self.offer_clip(text)
+    }
+
+    fn take(&self) -> Option<ClipText> {
+        self.take_clip()
+    }
+}
+
 /// The way to the host for input, while a control session runs.
 #[derive(Debug, Default)]
 struct Input {
@@ -319,18 +330,35 @@ impl StreamLink {
     }
 
     /// The window says whether it reads and sets its clipboard for the
-    /// sessions' services (design `services` §4.3; the stream window's
-    /// clipboard, step 24): sessions that start afterwards follow it.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn set_window_clipboard(&self, on: bool) {
+    /// sessions' services (design `services` §4.3): sessions whose services
+    /// start afterwards follow it. Turned off, the clipboard ends of the
+    /// session whose services run go at once; whether a session's ends are
+    /// held after the change (`true` only when turned on, for a session
+    /// whose services started with the window's clipboard).
+    pub fn set_window_clipboard(&self, on: bool) -> bool {
+        let mut ends = self
+            .clip
+            .ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         self.clip.window.store(on, Ordering::SeqCst);
+        if !on {
+            *ends = None;
+        }
+        ends.is_some()
+    }
+
+    /// Whether the window said it reads and sets its clipboard.
+    #[cfg(test)]
+    pub(crate) fn window_clipboard(&self) -> bool {
+        self.clip.window.load(Ordering::SeqCst)
     }
 
     /// A session's services start with the window's switch at `on`: a fresh
     /// pair of clipboard channels, whose far ends go to its stream; `None`
     /// when the window shares no clipboard (the host is then never asked
     /// to share one).
-    fn start_clip(&self, on: bool) -> Option<ViewerClip> {
+    pub(super) fn start_clip(&self, on: bool) -> Option<ViewerClip> {
         let mut ends = self
             .clip
             .ends
@@ -364,7 +392,6 @@ impl StreamLink {
     /// never the text that was there when the session went live): it goes
     /// to the host if the session's services share the clipboard, newest
     /// wins. Whether a session's services took it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn offer_clip(&self, text: ClipText) -> bool {
         self.clip
             .ends
@@ -380,7 +407,6 @@ impl StreamLink {
     /// The text the host sent that the window has not put on this
     /// computer's clipboard yet (the newest), taken: each text is handed out
     /// once.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn take_clip(&self) -> Option<ClipText> {
         let mut ends = self
             .clip
@@ -392,6 +418,19 @@ impl StreamLink {
             return None;
         }
         inbound.borrow_and_update().clone()
+    }
+
+    /// The session's clipboard text from the host, for the window's own
+    /// clipboard: each change wakes the stream window, so that text sent
+    /// while no picture comes is put on the clipboard without waiting for
+    /// one. `None` without the session's clipboard ends.
+    fn clip_arrivals(&self) -> Option<watch::Receiver<Option<ClipText>>> {
+        self.clip
+            .ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|ends| ends.inbound.clone())
     }
 
     /// Ask the host of the session being viewed to show screen `id` (0: all
@@ -3860,6 +3899,16 @@ async fn services_start(
 ) -> (crate::tor_cmd::ServicesStart, bool) {
     let on = b.shared.read(|m| m.settings.viewer.clipboard_sync);
     let clip = b.link.start_clip(on);
+    // The host's text wakes the stream window; the task ends with the
+    // session's stream, which holds the sending end.
+    if let Some(mut arrivals) = b.link.clip_arrivals() {
+        let shared = Arc::clone(&b.shared);
+        tokio::spawn(async move {
+            while arrivals.changed().await.is_ok() {
+                shared.wake(Wake::Frame);
+            }
+        });
+    }
     let (paths, cfg) = (b.paths.clone(), b.cfg.services);
     // A failed preparation leaves nothing to send and nowhere to download
     // to: chat still works.
@@ -9478,6 +9527,76 @@ mod tests {
         assert!(!link.offer_clip(text("late")));
         clip.inbound.send_replace(Some(text("after the end")));
         assert!(link.take_clip().is_none());
+
+        // Turned off while a session's services run: its ends go at once,
+        // and later sessions share none.
+        let clip = link.start_clip(true).expect("shared");
+        assert!(
+            link.set_window_clipboard(true),
+            "the session holds its ends"
+        );
+        assert!(!link.set_window_clipboard(false));
+        assert!(!link.offer_clip(text("after the switch")));
+        clip.inbound.send_replace(Some(text("from the host")));
+        assert!(link.take_clip().is_none());
+        assert!(link.start_clip(true).is_none());
+        assert!(!link.set_window_clipboard(true), "no session's ends");
+    }
+
+    /// The stream window's clipboard through the session's real ends (design
+    /// `services` §4.3): what the window read goes to the stream, the
+    /// stream's text comes to this computer's clipboard; each change of the
+    /// host's text can be waited for (it wakes the window).
+    #[test]
+    fn the_windows_clipboard_carries_both_ways_through_the_link() {
+        use super::super::pages::viewer::Board;
+        use super::super::pages::viewer::clip::{Sharing, WindowClip};
+        struct Fake(Option<String>, Vec<String>);
+        impl Board for Fake {
+            fn read(&mut self) -> Option<String> {
+                self.0.clone()
+            }
+            fn set(&mut self, text: &ClipText) {
+                self.0 = Some(text.as_str().to_owned());
+                self.1.push(text.as_str().to_owned());
+            }
+        }
+        let on = Sharing {
+            on: true,
+            clip_max: 262_144,
+            may_read: true,
+        };
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let link = StreamLink::default();
+        assert!(link.clip_arrivals().is_none());
+        link.set_window_clipboard(true);
+        let mut stream = link.start_clip(true).unwrap();
+        let arrivals = link.clip_arrivals().expect("while the session runs");
+        let mut board = Fake(Some("base".into()), Vec::new());
+        let mut w = WindowClip::default();
+        w.focus(true, t0);
+        w.sync(t0, on, &mut board, &link);
+        w.sync(t0 + ms(200), on, &mut board, &link);
+        assert!(!arrivals.has_changed().unwrap());
+        stream
+            .inbound
+            .send_replace(Some(ClipText::new("from the host".into()).unwrap()));
+        assert!(arrivals.has_changed().unwrap(), "the window is woken");
+        w.sync(t0 + ms(300), on, &mut board, &link);
+        assert_eq!(board.1, ["from the host"]);
+        board.0 = Some("mine".into());
+        w.focus(false, t0 + ms(400));
+        w.focus(true, t0 + ms(500));
+        w.sync(t0 + ms(700), on, &mut board, &link);
+        assert_eq!(
+            stream
+                .outbound
+                .borrow_and_update()
+                .as_ref()
+                .map(ClipText::as_str),
+            Some("mine")
+        );
     }
 
     /// The viewer's services requests go to the session's stream only while

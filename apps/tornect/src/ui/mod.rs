@@ -327,13 +327,16 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
 /// A real window's `App` (not the preview's), as `run` opens it: the link it
 /// was opened for in its connect field (design `invite` §2.4: at most an ID
 /// there, which Connect dials only once its row has been seen, still, for a
-/// second, and only on a click), screenshots offered, background mode's
+/// second, and only on a click), screenshots offered, the clipboard shared
+/// with the viewed sessions' services (design `services` §4.3; before any
+/// session can start, so that each starts with it), background mode's
 /// probe, and the connect-only title when it does not host.
 fn real_window(mut app: App, opts: &GuiOpts, probe: Option<crate::host::IndicatorShown>) -> App {
     if let Some(shown) = opts.link {
         app.link_arrived(shown);
     }
     app.screenshots = true;
+    app.share_clipboard(true);
     app.background = probe;
     if !opts.host {
         app.title = "Tornect (connect only)";
@@ -483,15 +486,13 @@ mod tests {
             let before = shared.read(|m| format!("{m:?}"));
             let popups = Popups::new(Arc::clone(&shared));
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let app = App::new(
-                Arc::clone(&shared),
-                popups,
-                Arc::new(StreamLink::default()),
-                tx,
-            );
+            let stream_link = Arc::new(StreamLink::default());
+            let app = App::new(Arc::clone(&shared), popups, Arc::clone(&stream_link), tx);
+            assert!(!stream_link.window_clipboard(), "{case}");
             let mut app = super::real_window(app, &opts(host, link), None);
             assert_eq!(app.title, title, "{case}");
             assert!(app.screenshots, "{case}");
+            assert!(stream_link.window_clipboard(), "{case}");
             assert!(app.background.is_none(), "{case}");
             let form = app.form_mut();
             assert_eq!(form.connect_to, field, "{case}");

@@ -19,6 +19,7 @@
 //! nothing pressed on them reaches the host, and the chat field takes the
 //! keyboard from the host the way the chord does.
 
+pub(crate) mod clip;
 mod panels;
 
 use std::collections::VecDeque;
@@ -34,10 +35,12 @@ use tornect_proto::services::caps;
 use tornect_proto::{ALL_MONITORS, HostStats, MonitorEntry, QualityInfo, monitor_status};
 use tornect_signal::messages::notice;
 
+pub use self::clip::{Board, Ends};
 pub use self::panels::{FileOp, FilesTab};
 
 use super::super::model::{Ewma, ScreenNote, ScreensView, ViewerServices, Viewing};
 use super::super::screenshot;
+use super::super::services::ServicesState;
 use super::super::theme::{self, Face, Tokens};
 use super::super::view::{Action, clock};
 use super::super::widgets;
@@ -135,6 +138,32 @@ const CLIPBOARD: &str = "Clipboard";
 /// The Clipboard switch's name, for the accessibility tree.
 const SHARE_CLIPBOARD: &str = "Share the clipboard";
 
+/// The help line's second line while the window shares its clipboard (the
+/// stale-first-paste race of the services design §4.3).
+pub const CLIPBOARD_HELP: &str =
+    "If the first paste after switching to this window shows older text, paste again.";
+
+/// The toast of a services stream that did not open, or ended for a reason
+/// of its own (the session goes on).
+pub const SERVICES_UNAVAILABLE: &str = "Chat and files are not available in this session.";
+
+/// The toast of a services stream that ended because the host's capture
+/// stopped (`CAPTURE_STOPPED`).
+pub const SERVICES_STOPPED: &str = "Chat and files stopped because screen sharing stopped.";
+
+/// The toast of the host's person turning the clipboard off.
+pub const CLIPBOARD_TURNED_OFF: &str =
+    "The other computer turned off the clipboard for this session.";
+
+/// The toast of the host's person turning file transfer off.
+pub const FILES_TURNED_OFF: &str = "The other computer turned off file transfer for this session.";
+
+/// How long the window waits, once the host took the clipboard or files
+/// away, for the host's notice that the session's input ended (which says
+/// it, `INPUT_LOST`) before it says the host turned them off: the notice
+/// comes over the session's other stream.
+const TURNED_OFF_GRACE: Duration = Duration::from_secs(2);
+
 /// A preset's name: in the Quality menu, the badge, the details, the toast
 /// and Settings, Display and quality.
 #[must_use]
@@ -177,11 +206,15 @@ enum Toast {
     Quality(QualityPreset),
     /// What the host said of its screens ([`screen_toast`]).
     Screens(String),
+    /// What became of the session's services ([`ViewerState::follow_services`])
+    /// or of a text read from this computer's clipboard.
+    Services(String),
 }
 
 impl Toast {
     fn text(&self) -> &str {
         match self {
+            Self::Services(text) => text,
             Self::Saved(text) => text,
             Self::NotSaved => screenshot::NOT_SAVED,
             Self::SecureScreenGone => crate::secure_screen::NOTICE_GONE,
@@ -408,6 +441,27 @@ pub struct ViewerState {
     /// on X11 and Windows; winit has none on Wayland): "Send files" says
     /// so.
     pub drops: bool,
+    /// This window's own clipboard for the session's services (the app
+    /// syncs it; [`ViewerState::follow_clipboard`]).
+    pub clip: clip::WindowClip,
+    /// What the window last saw of the session's services, for their
+    /// toasts.
+    services_seen: ServicesSeen,
+}
+
+/// What the stream window last saw of the session's services
+/// ([`ViewerState::follow_services`]).
+#[derive(Debug, Default)]
+struct ServicesSeen {
+    /// The stream's state.
+    state: Option<ServicesState>,
+    /// The clipboard and files the window offered while the stream was
+    /// open (the clipboard only where it shares its clipboard).
+    offered: u16,
+    /// What the host took away of them while input still reached it, and
+    /// since when: said once [`TURNED_OFF_GRACE`] passed without the host's
+    /// notice that input ended.
+    lost: Option<(u16, Instant)>,
 }
 
 /// What the chat field holds: its `Debug` prints its length only (chat
@@ -609,6 +663,129 @@ impl ViewerState {
         self.input_lost_shown = input_lost;
     }
 
+    /// Take what became of the session's services since the last frame
+    /// (the services design §7.1), saying it once:
+    /// - a stream that did not open, or that ended for a reason of its own
+    ///   (an error, input that never reached the host, …): "Chat and files
+    ///   are not available in this session.";
+    /// - one that ended because the host's capture stopped: "Chat and files
+    ///   stopped because screen sharing stopped.";
+    /// - the clipboard (where this window shares its clipboard) or files
+    ///   taken away by the host's person: "The other computer turned off
+    ///   …", each sentence for what went, after [`TURNED_OFF_GRACE`] and
+    ///   only when input still reaches the host: input that ended has its
+    ///   own line, and takes them away too.
+    ///
+    /// A stream that ends with its session (`SESSION_OVER`,
+    /// `ENDED_BY_HOST`) says nothing: the window says the session ended.
+    /// While a turn-off waits for its grace, when to look again.
+    fn follow_services(&mut self, v: Option<&Viewing>, now: Instant) -> Option<Instant> {
+        use tornect_proto::services::reason;
+        let Some((v, services)) = v.and_then(|v| Some((v, v.services.as_deref()?))) else {
+            self.services_seen = ServicesSeen::default();
+            return None;
+        };
+        let input_gone = self.no_input(v) || self.input_lost(v);
+        let mut offered = services.left() & (caps::UPLOAD | caps::BROWSE);
+        if services.shares_clipboard {
+            offered |= services.left() & caps::CLIP;
+        }
+        if !v.control || input_gone {
+            offered = 0;
+        }
+        let seen = &mut self.services_seen;
+        let mut toast = None;
+        if seen.state != Some(services.state) {
+            seen.state = Some(services.state);
+            match services.state {
+                ServicesState::Opening | ServicesState::Open => {}
+                ServicesState::Unavailable(_) => {
+                    toast = Some(SERVICES_UNAVAILABLE.to_owned());
+                }
+                ServicesState::Ended(reason::CAPTURE_STOPPED) => {
+                    toast = Some(SERVICES_STOPPED.to_owned());
+                }
+                ServicesState::Ended(reason::SESSION_OVER | reason::ENDED_BY_HOST) => {}
+                ServicesState::Ended(reason::TURNED_OFF) => {
+                    let gone = seen.offered | seen.lost.map_or(0, |(lost, _)| lost);
+                    toast = turned_off_text(gone);
+                }
+                // Lost input takes them away with a line of its own.
+                ServicesState::Ended(reason::NOT_OFFERED) if input_gone => {}
+                ServicesState::Ended(_) => toast = Some(SERVICES_UNAVAILABLE.to_owned()),
+            }
+            if !matches!(services.state, ServicesState::Open) {
+                seen.lost = None;
+            }
+        }
+        let mut due = None;
+        if services.state == ServicesState::Open {
+            let lost = seen.offered & !offered;
+            if lost != 0 && !input_gone {
+                let (held, _) = seen.lost.get_or_insert((0, now));
+                *held |= lost;
+            }
+            if input_gone {
+                seen.lost = None;
+            }
+            if let Some((lost, since)) = seen.lost {
+                if now >= since + TURNED_OFF_GRACE {
+                    seen.lost = None;
+                    toast = turned_off_text(lost);
+                } else {
+                    due = Some(since + TURNED_OFF_GRACE);
+                }
+            }
+        }
+        seen.offered = if services.state == ServicesState::Open {
+            offered
+        } else {
+            0
+        };
+        if let Some(text) = toast {
+            self.toast = Some((Toast::Services(text), now));
+        }
+        due
+    }
+
+    /// What the window may do with its clipboard now: share it only where
+    /// it shares one with the session (`ViewerServices::shares_clipboard`),
+    /// the window [`offered`] the clipboard (a control session whose input
+    /// reaches the host, the clipboard left), the host did not pause it and
+    /// the switch is on; read it only while this computer's screen is not
+    /// shared (nor shown in a picture that leaves it).
+    #[must_use]
+    pub fn clipboard_sharing(&self, v: Option<&Viewing>) -> clip::Sharing {
+        let Some((v, services)) = v.and_then(|v| Some((v, v.services.as_deref()?))) else {
+            return clip::Sharing::default();
+        };
+        clip::Sharing {
+            on: services.shares_clipboard
+                && services.clipboard
+                && offered(v, self) & caps::CLIP != 0
+                && services.effective() & caps::CLIP != 0,
+            clip_max: services.clip_max,
+            may_read: !self.shared && !self.sharing,
+        }
+    }
+
+    /// Sync this window's clipboard with the session's services at `now`
+    /// (the app does, before each frame and at a key routed to the host):
+    /// through `board`, this computer's clipboard, and `ends`, the
+    /// session's. Text too large to share is said.
+    pub fn follow_clipboard(
+        &mut self,
+        v: Option<&Viewing>,
+        board: &mut dyn Board,
+        ends: &dyn Ends,
+        now: Instant,
+    ) {
+        let sharing = self.clipboard_sharing(v);
+        if let clip::Said::TooLarge(cap) = self.clip.sync(now, sharing, board, ends) {
+            self.toast = Some((Toast::Services(clip::too_large_text(cap)), now));
+        }
+    }
+
     /// Where a screenshot's thread says how it went: the window takes it at
     /// its next frame.
     pub fn screenshot_done(&mut self) -> mpsc::Sender<Saved> {
@@ -770,6 +947,21 @@ pub fn pause_note(v: &Viewing, viewer: &ViewerState) -> String {
         "Your input is paused: keyboard and mouse stay on this computer. {whom} still shows its \
          screen."
     )
+}
+
+/// The toast of the clipboard and files the host's person turned off (`gone`,
+/// `tornect_proto::services::caps`): a sentence for the clipboard, one for
+/// file transfer, both when both went.
+#[must_use]
+pub fn turned_off_text(gone: u16) -> Option<String> {
+    let lines: Vec<&str> = [
+        (gone & caps::CLIP != 0, CLIPBOARD_TURNED_OFF),
+        (gone & (caps::UPLOAD | caps::BROWSE) != 0, FILES_TURNED_OFF),
+    ]
+    .into_iter()
+    .filter_map(|(went, line)| went.then_some(line))
+    .collect();
+    (!lines.is_empty()).then(|| lines.join(" "))
 }
 
 /// The help line under the toolbar of a control session: where the keyboard
@@ -1063,6 +1255,15 @@ pub fn stream_window(
     viewer.follow_notice(viewing.is_some_and(|v| v.control), now);
     viewer.follow_fullscreen(now);
     viewer.follow_screens(viewing.and_then(|v| v.screens.as_ref()), now);
+    if let Some(at) = viewer.follow_services(viewing, now) {
+        ui.ctx()
+            .request_repaint_after(at.saturating_duration_since(now));
+    }
+    // A clipboard read due, or the host's text waiting for its turn.
+    if let Some(at) = viewer.clip.due() {
+        ui.ctx()
+            .request_repaint_after(at.saturating_duration_since(now));
+    }
     let applied = viewing.and_then(|v| v.stream.applied_preset());
     if let Some(left) = viewer.follow_quality(applied, now) {
         // "Changing…" goes after its time with no picture coming either.
@@ -1434,6 +1635,13 @@ fn toolbar(
                             help_line(v, viewer)
                         };
                         ui.label(RichText::new(line).small().color(t.text_secondary));
+                        if viewer.clipboard_sharing(Some(v)).on {
+                            ui.label(
+                                RichText::new(CLIPBOARD_HELP)
+                                    .small()
+                                    .color(t.text_secondary),
+                            );
+                        }
                     });
             });
         viewer.areas.push(help.response.rect);
@@ -2235,7 +2443,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    use super::testing::Window;
+    use super::testing::{Window, granted};
     use super::*;
 
     fn ms(ms: u64) -> Duration {
@@ -3740,5 +3948,268 @@ mod tests {
                 assert!(w.has("Screen") && w.has(line), "{control}: {:?}", w.texts());
             }
         }
+    }
+
+    /// The services' toasts (the services design §7.1), each said once: a
+    /// stream that did not open, one whose end came from the host's capture
+    /// stopping, one that ended for a reason of its own; none for one that
+    /// ends with its session.
+    #[test]
+    fn the_services_toasts_say_what_became_of_the_stream() {
+        use tornect_proto::services::reason;
+        use tornect_session::services::ViewerServicesEnd;
+        type Change<'a> = &'a dyn Fn(&mut ViewerServices);
+        let cases: [(Change<'_>, Option<&str>); 6] = [
+            (
+                &|s: &mut ViewerServices| s.not_opened(Some(reason::NOT_OFFERED)),
+                Some(SERVICES_UNAVAILABLE),
+            ),
+            (
+                &|s: &mut ViewerServices| s.not_opened(None),
+                Some(SERVICES_UNAVAILABLE),
+            ),
+            (
+                &|s: &mut ViewerServices| {
+                    s.finished(ViewerServicesEnd::Closed(reason::CAPTURE_STOPPED));
+                },
+                Some(SERVICES_STOPPED),
+            ),
+            (
+                &|s: &mut ViewerServices| s.finished(ViewerServicesEnd::Io),
+                Some(SERVICES_UNAVAILABLE),
+            ),
+            (
+                &|s: &mut ViewerServices| {
+                    s.finished(ViewerServicesEnd::Closed(reason::SESSION_OVER));
+                },
+                None,
+            ),
+            (
+                &|s: &mut ViewerServices| {
+                    s.finished(ViewerServicesEnd::Closed(reason::ENDED_BY_HOST));
+                },
+                None,
+            ),
+        ];
+        for (n, (change, toast)) in cases.into_iter().enumerate() {
+            let mut w = Window::new(true);
+            w.viewing.services = Some(granted(caps::CHAT));
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(0), Vec::new());
+            change(w.viewing.services.as_deref_mut().unwrap());
+            w.pass(ms(100), Vec::new());
+            w.pass(ms(100), Vec::new());
+            let all = [SERVICES_UNAVAILABLE, SERVICES_STOPPED];
+            for line in all {
+                assert_eq!(w.has(line), toast == Some(line), "{n}: {:?}", w.texts());
+            }
+            // Said once.
+            w.pass(ms(4000), Vec::new());
+            w.pass(ms(4100), Vec::new());
+            assert!(!all.iter().any(|line| w.has(line)), "{n}");
+        }
+    }
+
+    /// The host's person turns the clipboard and files off (one `Caps`):
+    /// after the grace, one toast with both sentences; the clipboard counts
+    /// only where the window shares its clipboard; input that ended in the
+    /// grace says it with its own line and no toast; a view-only session
+    /// never says it; a stream that ends `TURNED_OFF` says it at once.
+    #[test]
+    fn a_turn_off_by_the_host_is_said_once_input_loss_is_not() {
+        use tornect_proto::services::reason;
+        use tornect_session::services::{ViewerEvent, ViewerServicesEnd};
+        let both = format!("{CLIPBOARD_TURNED_OFF} {FILES_TURNED_OFF}");
+        assert_eq!(
+            turned_off_text(caps::CLIP | caps::UPLOAD).as_deref(),
+            Some(both.as_str())
+        );
+        assert_eq!(
+            turned_off_text(caps::BROWSE).as_deref(),
+            Some(FILES_TURNED_OFF)
+        );
+        assert_eq!(turned_off_text(caps::CHAT), None);
+        let turn_off = |w: &mut Window| {
+            w.viewing
+                .services
+                .as_deref_mut()
+                .unwrap()
+                .apply(ViewerEvent::Caps {
+                    caps: caps::CHAT,
+                    paused: 0,
+                });
+        };
+        for (shares, said) in [(true, both.as_str()), (false, FILES_TURNED_OFF)] {
+            let mut w = Window::new(true);
+            let mut services = granted(caps::ALL);
+            services.shares_clipboard = shares;
+            w.viewing.services = Some(services);
+            w.pass(ms(0), Vec::new());
+            turn_off(&mut w);
+            w.pass(ms(100), Vec::new());
+            w.pass(ms(1900), Vec::new());
+            assert!(!w.has(said), "within the grace");
+            w.pass(ms(2200), Vec::new());
+            w.pass(ms(2200), Vec::new());
+            assert!(w.has(said), "{shares}: {:?}", w.texts());
+            w.pass(ms(6000), Vec::new());
+            w.pass(ms(6100), Vec::new());
+            assert!(!w.has(said), "once");
+        }
+        // The input-lost notice within the grace.
+        let mut w = Window::new(true);
+        w.viewing.services = Some(granted(caps::ALL));
+        w.pass(ms(0), Vec::new());
+        turn_off(&mut w);
+        w.pass(ms(100), Vec::new());
+        w.viewer.host_notice = Some(notice::INPUT_LOST);
+        w.pass(ms(1000), Vec::new());
+        w.pass(ms(3000), Vec::new());
+        w.pass(ms(3000), Vec::new());
+        assert!(w.has(INPUT_LOST_LINE));
+        assert!(
+            !w.texts().iter().any(|t| t.contains("turned off")),
+            "{:?}",
+            w.texts()
+        );
+        // A view-only session never had them to lose.
+        let mut w = Window::new(false);
+        w.viewing.services = Some(granted(caps::CHAT));
+        w.pass(ms(0), Vec::new());
+        turn_off(&mut w);
+        w.pass(ms(3000), Vec::new());
+        w.pass(ms(3000), Vec::new());
+        assert!(!w.texts().iter().any(|t| t.contains("turned off")));
+        // Everything turned off ends the stream: said at once.
+        let mut w = Window::new(true);
+        w.viewing.services = Some(granted(caps::CLIP | caps::UPLOAD));
+        w.viewing.services.as_deref_mut().unwrap().shares_clipboard = true;
+        w.pass(ms(0), Vec::new());
+        w.viewing
+            .services
+            .as_deref_mut()
+            .unwrap()
+            .finished(ViewerServicesEnd::Closed(reason::TURNED_OFF));
+        w.pass(ms(100), Vec::new());
+        w.pass(ms(100), Vec::new());
+        assert!(w.has(&both), "{:?}", w.texts());
+        assert!(!w.has(SERVICES_UNAVAILABLE));
+    }
+
+    /// The window shares its clipboard (and the help line says how a stale
+    /// first paste is fixed) only in a control session whose input reaches
+    /// the host, with the clipboard granted, left and not paused, the
+    /// switch on and the window sharing one; it reads only while this
+    /// computer's screen is not shared.
+    #[test]
+    fn the_window_shares_its_clipboard_only_where_everything_allows_it() {
+        use tornect_session::services::ViewerEvent;
+        let sharing = |w: &mut Window| {
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(0), Vec::new());
+            let on = w.viewer.clipboard_sharing(Some(&w.viewing)).on;
+            assert_eq!(w.has(CLIPBOARD_HELP), on, "{:?}", w.texts());
+            on
+        };
+        let window = |control: bool, granted_caps: u16| {
+            let mut w = Window::new(control);
+            let mut services = granted(granted_caps);
+            services.shares_clipboard = true;
+            w.viewing.services = Some(services);
+            w
+        };
+        let mut w = window(true, caps::ALL);
+        assert!(sharing(&mut w));
+        let s = w.viewer.clipboard_sharing(Some(&w.viewing));
+        assert_eq!((s.clip_max, s.may_read), (262_144, true));
+        w.viewer.shared = true;
+        assert!(!w.viewer.clipboard_sharing(Some(&w.viewing)).may_read);
+        w.viewer.shared = false;
+        w.viewer.sharing = true;
+        assert!(!w.viewer.clipboard_sharing(Some(&w.viewing)).may_read);
+        assert!(!sharing(&mut window(false, caps::CHAT)), "view only");
+        assert!(!sharing(&mut window(true, caps::CHAT)), "not granted");
+        let mut off = window(true, caps::ALL);
+        off.viewing.services.as_deref_mut().unwrap().clipboard = false;
+        assert!(!sharing(&mut off), "the switch off");
+        let mut not_shared = window(true, caps::ALL);
+        not_shared
+            .viewing
+            .services
+            .as_deref_mut()
+            .unwrap()
+            .shares_clipboard = false;
+        assert!(!sharing(&mut not_shared), "the window shares none");
+        let mut paused = window(true, caps::ALL);
+        paused
+            .viewing
+            .services
+            .as_deref_mut()
+            .unwrap()
+            .apply(ViewerEvent::Caps {
+                caps: caps::ALL,
+                paused: caps::CLIP | caps::UPLOAD | caps::BROWSE,
+            });
+        assert!(!sharing(&mut paused), "the host is locked");
+        for code in [notice::NO_INPUT, notice::INPUT_LOST] {
+            let mut lost = window(true, caps::ALL);
+            lost.viewer.host_notice = Some(code);
+            assert!(!sharing(&mut lost), "{code:#x}");
+        }
+    }
+
+    /// The app's sync through a real window state: a clipboard read is due
+    /// only after a focus-in, the frame asks to be drawn when it is due,
+    /// and text over the host's cap is said as a toast.
+    #[test]
+    fn the_windows_clipboard_reads_after_the_focus_and_says_text_over_the_cap() {
+        use std::cell::{Cell, RefCell};
+        use tornect_input::clipboard::ClipText;
+        struct Board1(Cell<usize>, String);
+        impl Board for Board1 {
+            fn read(&mut self) -> Option<String> {
+                self.0.set(self.0.get() + 1);
+                Some(self.1.clone())
+            }
+            fn set(&mut self, _: &ClipText) {}
+        }
+        #[derive(Default)]
+        struct Ends1(RefCell<Vec<usize>>);
+        impl Ends for Ends1 {
+            fn offer(&self, text: ClipText) -> bool {
+                self.0.borrow_mut().push(text.byte_len());
+                true
+            }
+            fn take(&self) -> Option<ClipText> {
+                None
+            }
+        }
+        let mut w = Window::new(true);
+        let mut services = granted(caps::ALL);
+        services.shares_clipboard = true;
+        services.clip_max = 10;
+        w.viewing.services = Some(services);
+        let (mut board, ends) = (Board1(Cell::new(0), "before".into()), Ends1::default());
+        let now = w.start;
+        w.viewer
+            .follow_clipboard(Some(&w.viewing), &mut board, &ends, now);
+        w.viewer.clip.focus(true, now);
+        assert_eq!(w.viewer.clip.due(), Some(now + ms(200)));
+        w.viewer
+            .follow_clipboard(Some(&w.viewing), &mut board, &ends, now + ms(200));
+        assert_eq!(board.0.get(), 1, "the baseline's read");
+        board.1 = "more than ten bytes".into();
+        w.viewer.clip.focus(false, now + ms(500));
+        w.viewer.clip.focus(true, now + ms(500));
+        w.viewer
+            .follow_clipboard(Some(&w.viewing), &mut board, &ends, now + ms(700));
+        assert!(ends.0.borrow().is_empty());
+        w.pass(ms(700), Vec::new());
+        w.pass(ms(700), Vec::new());
+        assert!(
+            w.has("Clipboard text over 10 bytes was not shared."),
+            "{:?}",
+            w.texts()
+        );
     }
 }

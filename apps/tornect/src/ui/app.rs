@@ -404,6 +404,26 @@ impl Surface {
     }
 }
 
+/// This computer's clipboard as the stream window reaches it (design
+/// `services` §4.3): egui-winit's, smithay-clipboard on Wayland and arboard
+/// on X11 and Windows. On Windows the host's text is set kept out of the
+/// clipboard history and the cloud clipboard; one that cannot be set so is
+/// not set at all.
+impl super::pages::viewer::Board for egui_winit::State {
+    fn read(&mut self) -> Option<String> {
+        self.clipboard_text()
+    }
+
+    fn set(&mut self, text: &tornect_input::clipboard::ClipText) {
+        #[cfg(windows)]
+        if let Err(e) = tornect_input::clipboard::set_private(text) {
+            tracing::debug!(error = %e, "the host's clipboard text was not set");
+        }
+        #[cfg(not(windows))]
+        self.set_clipboard_text(text.as_str().to_owned());
+    }
+}
+
 /// One block window (§B.8.6.3): request `request`'s, on one monitor.
 struct BlockSurface {
     request: u64,
@@ -448,8 +468,20 @@ struct StreamView {
     hold: Option<u32>,
 }
 
+/// Where one key of the stream window went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyTo {
+    /// To the window's own controls.
+    Window,
+    /// To the host, pressed (`true`) or let go of.
+    Host(bool),
+    /// Nowhere (the chord's own, or a session that sends no input).
+    Nowhere,
+}
+
 /// One key of the stream window at `now`, through the chord first (decision
 /// M1-70). `true` when it goes to the window's own controls.
+#[cfg(test)]
 fn on_key(
     chord: &mut keys::Chord,
     forwarder: &mut Forwarder,
@@ -457,12 +489,27 @@ fn on_key(
     key: keys::KeyInput,
     now: Instant,
 ) -> bool {
+    route_key(chord, forwarder, viewer, key, now) == KeyTo::Window
+}
+
+/// One key of the stream window at `now`, through the chord first (decision
+/// M1-70): where it went.
+fn route_key(
+    chord: &mut keys::Chord,
+    forwarder: &mut Forwarder,
+    viewer: &mut ViewerState,
+    key: keys::KeyInput,
+    now: Instant,
+) -> KeyTo {
     // While paused, keys go to the window's controls, as in a view-only
     // session; the chord does not resume.
     let sends = forwarder.is_open() && !forwarder.is_paused();
     match keys::key_route(chord, viewer.keyboard_local, sends, key) {
-        keys::Route::Host { usb, pressed } => forwarder.key(usb, pressed),
-        keys::Route::Window => return true,
+        keys::Route::Host { usb, pressed } => {
+            forwarder.key(usb, pressed);
+            return KeyTo::Host(pressed);
+        }
+        keys::Route::Window => return KeyTo::Window,
         keys::Route::Nowhere => {}
         keys::Route::TakeBack => {
             // The modifiers pressed before the M already went to the host:
@@ -475,7 +522,7 @@ fn on_key(
         }
         keys::Route::GiveBack => viewer.keyboard_local = false,
     }
-    false
+    KeyTo::Nowhere
 }
 
 /// Whether a close request of a window with Alt held is the desktop's
@@ -802,6 +849,9 @@ pub struct App {
     /// off unless set, so the preview, which writes nothing on this
     /// computer, never offers them.
     pub screenshots: bool,
+    /// The stream window reads and sets this computer's clipboard for the
+    /// sessions' services ([`App::share_clipboard`]): off unless set.
+    clipboard: bool,
     /// The preview's `--sheet viewer-…`: what the stream window opens with
     /// (its Quality menu with a pick on its way, or its details).
     pub stream_sheet: Option<super::preview::StreamSheet>,
@@ -846,6 +896,7 @@ impl App {
             height: 760.0,
             background: None,
             screenshots: false,
+            clipboard: false,
             stream_sheet: None,
             error: None,
         }
@@ -1415,6 +1466,8 @@ impl App {
         view.viewer.input_paused = view.forwarder.is_paused();
         view.viewer.screenshots = self.screenshots;
         view.viewer.host_notice = self.shared.read(Model::viewer_notice);
+        self.sync_clipboard(viewing.as_ref(), Instant::now());
+        let Some(view) = &mut self.stream else { return };
         let picture = view.video.id().zip(view.video.size());
         let mut actions = Vec::new();
         let mut drawn = None;
@@ -1646,6 +1699,55 @@ impl App {
         }
     }
 
+    /// The stream window reads and sets this computer's clipboard for the
+    /// viewed sessions' services (`on`; the design `services` §4.3), or not:
+    /// off unless set, so the preview and the tests touch no clipboard.
+    /// Sessions whose services start afterwards follow it. A session
+    /// already viewed keeps the clipboard its services started with, except
+    /// that turning it off takes it away at once: the window stops reading
+    /// and setting, its switch goes, and the host hears the switch off.
+    pub fn share_clipboard(&mut self, on: bool) {
+        self.clipboard = on;
+        if self.link.set_window_clipboard(on) || on {
+            return;
+        }
+        let mut told = false;
+        self.shared.update(|m| {
+            if let ClientStage::Live(viewing) = &mut m.client
+                && let Some(services) = &mut viewing.services
+                && std::mem::take(&mut services.shares_clipboard)
+            {
+                told = services.clipboard;
+            }
+        });
+        if told {
+            self.command(Command::Services(ViewerOp::ClipSwitch(false)));
+        }
+    }
+
+    /// Sync the stream window's clipboard with the viewed session's services
+    /// at `now` (`viewing`: the session as this frame draws it, read from
+    /// the model when `None`). Only where the window shares its clipboard.
+    fn sync_clipboard(&mut self, viewing: Option<&Viewing>, now: Instant) {
+        if !self.clipboard {
+            return;
+        }
+        let Some(view) = &mut self.stream else { return };
+        let read;
+        let viewing = match viewing {
+            Some(v) => Some(v),
+            None => {
+                read = self.shared.read(|m| match &m.client {
+                    ClientStage::Live(v) => Some(v.clone()),
+                    _ => None,
+                });
+                read.as_ref()
+            }
+        };
+        view.viewer
+            .follow_clipboard(viewing, &mut view.surface.state, &*self.link, now);
+    }
+
     /// Save the stream window's last picture in the Pictures folder, on a
     /// thread of its own, never this one; the window says how it went at its
     /// next frame. No log line names the folder, the path or the file.
@@ -1740,14 +1842,22 @@ impl App {
                     synthetic: *is_synthetic,
                     is_m: keys::is_m(key),
                 };
-                if on_key(
+                let now = Instant::now();
+                match route_key(
                     &mut view.chord,
                     &mut view.forwarder,
                     &mut view.viewer,
                     input,
-                    Instant::now(),
+                    now,
                 ) {
-                    view.surface.on_event(&event);
+                    KeyTo::Window => view.surface.on_event(&event),
+                    // The first key to the host after a focus-in read that
+                    // found nothing reads again, before the key goes out.
+                    KeyTo::Host(true) => {
+                        view.viewer.clip.key_to_host(now);
+                        self.sync_clipboard(None, now);
+                    }
+                    KeyTo::Host(false) | KeyTo::Nowhere => {}
                 }
             }
             WindowEvent::ModifiersChanged(_) if control && !view.viewer.keyboard_local => {}
@@ -1783,7 +1893,15 @@ impl App {
             }
             WindowEvent::Focused(false) => {
                 on_focus_lost(&mut view.chord, &mut view.forwarder);
+                view.viewer.clip.focus(false, Instant::now());
                 view.surface.on_event(&event);
+            }
+            // The clipboard is read a while after the focus came, and the
+            // host's text put on it then (design `services` §4.3).
+            WindowEvent::Focused(true) => {
+                view.viewer.clip.focus(true, Instant::now());
+                view.surface.on_event(&event);
+                view.surface.window.request_redraw();
             }
             WindowEvent::DroppedFile(path) => {
                 let viewing = self.shared.read(|m| match &m.client {
@@ -4642,5 +4760,77 @@ mod tests {
             assert_eq!(dropped_file(&mut state, viewing, path.clone(), now), None);
             assert!(!state.files);
         }
+    }
+
+    /// The window shares its clipboard only once told (a real window is,
+    /// before any session can start). Turned off while a session's services
+    /// hold the window's clipboard, it goes from that session at once: the
+    /// window's ends close, the toolbar's switch goes and the host hears the
+    /// switch off. Turned on again, that session keeps none.
+    #[test]
+    fn turning_the_windows_clipboard_off_takes_it_from_the_session_viewed() {
+        let (mut app, mut rx) = app();
+        assert!(!app.clipboard);
+        app.share_clipboard(true);
+        assert!(app.clipboard);
+        assert!(rx.try_recv().is_err(), "nothing to tell before a session");
+        let _stream = app.link.start_clip(true).expect("the window shares one");
+        let mut w = Window::new(true);
+        let mut services = granted(caps::ALL);
+        services.shares_clipboard = true;
+        w.viewing.services = Some(services);
+        app.shared
+            .update(|m| m.client = ClientStage::Live(w.viewing.clone()));
+        let shares = |app: &App| {
+            app.shared.read(|m| match &m.client {
+                ClientStage::Live(v) => v.services.as_ref().unwrap().shares_clipboard,
+                _ => unreachable!(),
+            })
+        };
+        app.share_clipboard(false);
+        assert!(!app.clipboard);
+        assert!(!shares(&app), "the switch goes");
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(Command::Services(ViewerOp::ClipSwitch(false)))
+        );
+        assert!(
+            !app.link
+                .offer_clip(tornect_input::clipboard::ClipText::new("x".into()).unwrap())
+        );
+        app.share_clipboard(true);
+        assert!(!shares(&app), "the session started without it");
+        assert!(rx.try_recv().is_err());
+        // A switch already off is not told again.
+        app.share_clipboard(false);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A key goes to the host only as the route says, and only a press to
+    /// the host counts as "a key routed to the host" for the clipboard's
+    /// retry (design `services` §4.3).
+    #[test]
+    fn only_a_press_to_the_host_counts_as_a_key_to_the_host() {
+        let (mut chord, mut forwarder, mut state) = viewer(true);
+        let now = Instant::now();
+        assert_eq!(
+            route_key(&mut chord, &mut forwarder, &mut state, press(KEY_A), now),
+            KeyTo::Host(true)
+        );
+        assert_eq!(
+            route_key(&mut chord, &mut forwarder, &mut state, release(KEY_A), now),
+            KeyTo::Host(false)
+        );
+        state.keyboard_local = true;
+        assert_eq!(
+            route_key(&mut chord, &mut forwarder, &mut state, press(KEY_A), now),
+            KeyTo::Window
+        );
+        let (mut chord, mut forwarder, mut state) = viewer(false);
+        assert_ne!(
+            route_key(&mut chord, &mut forwarder, &mut state, press(KEY_A), now),
+            KeyTo::Host(true),
+            "a view-only session sends no key"
+        );
     }
 }
