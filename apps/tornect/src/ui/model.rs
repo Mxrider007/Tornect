@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use tornect_core::address_book::{Day, mixes_scripts};
-use tornect_core::config::{BridgeMode, QualityPreset, Theme, Viewer};
+use tornect_core::config::{BridgeMode, QualityPreset, Services, Theme, Viewer};
 use tornect_core::levels::{Answers, Availability};
 use tornect_core::session_log::{Actor, SessionMode};
 use tornect_core::unattended::credentials::RememberOffer;
@@ -271,6 +271,10 @@ pub struct Model {
     /// The grant wizard of Settings, Security (§B.8.7.1) as the tokio side
     /// last answered it.
     pub wizard: WizardView,
+    /// This computer has no Downloads folder, so a viewer cannot send files
+    /// here (design `services` §2.6): the session sheet does not offer it
+    /// and Settings, Sharing says so.
+    pub no_downloads: bool,
 }
 
 impl Model {
@@ -1590,6 +1594,12 @@ pub struct Settings {
     pub viewer: Viewer,
     /// How Tornect reaches the Tor network (from the next start).
     pub tor: TorChoice,
+    /// What someone connected to this computer may use beside the picture
+    /// and input (`[services]`, design `services` §2.6): the switches
+    /// Settings, Sharing changes, the limits and the Wayland clipboard
+    /// switch only `config.toml` sets. The session sheet's services line and
+    /// the viewer's own download limits follow it.
+    pub services: Services,
     /// Why the last save from the window was not made, in plain words;
     /// `None` once one was.
     pub problem: Option<&'static str>,
@@ -1614,6 +1624,7 @@ impl Settings {
                 bridge_lines: BridgeLines(cfg.tor.bridge_lines.clone()),
                 pow_defense: cfg.tor.pow_defense,
             },
+            services: cfg.services,
             problem: None,
         }
     }

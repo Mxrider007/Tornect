@@ -10,14 +10,20 @@
 //! banner's mode and clock line (SLICE-E E1-2). No line names a path of this
 //! computer: a received file is said by its stored name and the inbox's
 //! words, a copied one by its name.
+//!
+//! Also here, in fixed words: what the sharing indicator says of the
+//! services (a file moving, the chat button; design §7.3) and the session
+//! sheet's line of what control also gives (§7.4).
 
 use std::collections::HashMap;
 
 use egui::RichText;
 use tornect_proto::services::{MAX_CHAT_CHARS, caps, reason};
-use tornect_session::services::{Direction, TransferRow, TransferState, sanitize_peer_text};
+use tornect_session::services::{
+    Direction, ServicesPolicy, TransferRow, TransferState, sanitize_peer_text,
+};
 
-use super::super::model::Sharing;
+use super::super::model::{Model, Sharing};
 use super::super::pages::viewer::{cut_name, percent, size_text};
 use super::super::services::{ChatLine, ClipNote, HostServices};
 use super::super::theme::{self, Face};
@@ -50,7 +56,7 @@ pub const SEND: &str = "Send";
 pub const NOT_SAVED: &str = "Not saved. It ends with the session.";
 
 /// Where this computer keeps what it receives, in words: never a path.
-const INBOX_WORDS: &str = "Downloads › Tornect";
+pub const INBOX_WORDS: &str = "Downloads › Tornect";
 
 /// What the turn-off takes away: the clipboard and files (chat stays).
 const CLIP_AND_FILES: u16 = caps::CLIP | caps::UPLOAD | caps::BROWSE;
@@ -64,6 +70,17 @@ const HISTORY_HEIGHT: f32 = 120.0;
 
 /// The chat card's widest, in points.
 const CHAT_WIDTH: f32 = 520.0;
+
+/// The indicator's chat button with no unread line.
+pub const CHAT: &str = "Chat";
+
+/// What control also gives, said under the session sheet's answers that
+/// give control (the services design §7.4), before the parts.
+const SERVICES_LEAD: &str = "With control they can also ";
+
+/// The session sheet's parts, in their fixed order.
+const SEE_FILES: &str = "see and copy any file you can open on this computer";
+const COPY_TEXT: &str = "copy text to and from this computer's clipboard";
 
 /// What the host's person does on the strip or the chat card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +143,82 @@ pub fn clip_line(note: ClipNote) -> String {
             format!("They put text on this computer's clipboard ({chars} characters)")
         }
     }
+}
+
+/// The indicator's second-line suffix while a file moves (the services
+/// design §7.3): ` · receiving a file 45%` or ` · they are copying a file
+/// 45%`, in fixed words: never the file's name.
+#[must_use]
+pub fn indicator_suffix(dir: Direction, percent: u64) -> String {
+    match dir {
+        Direction::ToHost => format!(" · receiving a file {percent}%"),
+        Direction::FromHost => format!(" · they are copying a file {percent}%"),
+    }
+}
+
+/// The indicator's chat button over the sessions shared (the services
+/// design §7.3): `Chat`, or `Chat (2)` with the viewers' lines not yet
+/// seen, while any session has a chat card; with the session whose card it
+/// shows, the first with unread lines, else the newest.
+#[must_use]
+pub fn indicator_chat(sharing: &[Sharing]) -> Option<(String, String)> {
+    let chats = || {
+        sharing
+            .iter()
+            .filter_map(|s| s.services.as_ref().filter(|c| c.has_chat()).map(|c| (s, c)))
+    };
+    let unread: usize = chats().map(|(_, c)| c.unread).sum();
+    let (session, _) = chats()
+        .find(|(_, c)| c.unread > 0)
+        .or_else(|| chats().next_back())?;
+    let text = if unread == 0 {
+        CHAT.to_owned()
+    } else {
+        format!("{CHAT} ({unread})")
+    };
+    Some((text, session.session_id.clone()))
+}
+
+/// The session sheet's line under the answers that give control (the
+/// services design §7.4): what control also gives under `policy`, in fixed
+/// order, "see and copy any file you can open on this computer", "send files
+/// into <inbox words>" (only where this computer has an inbox) and "copy text
+/// to and from this computer's clipboard", joined with ", " and " and ";
+/// `None` when none of them is on. Chat is not access, and is not named.
+#[must_use]
+pub fn services_line(policy: &ServicesPolicy, inbox_words: Option<&str>) -> Option<String> {
+    let send = inbox_words
+        .filter(|_| policy.receive_files)
+        .map(|words| format!("send files into {words}"));
+    let parts: Vec<String> = [
+        policy.browse_files.then(|| SEE_FILES.to_owned()),
+        send,
+        policy.clipboard.then(|| COPY_TEXT.to_owned()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let joined = match parts.as_slice() {
+        [] => return None,
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    Some(format!("{SERVICES_LEAD}{joined}."))
+}
+
+/// The session sheet's services line as this computer's saved settings
+/// give it ([`services_line`]): the clipboard not named on a Wayland
+/// desktop whose portal is not asked for its clipboard (`[services]
+/// wayland_clipboard` off: no session there can have it), files received
+/// not named without a Downloads folder.
+#[must_use]
+pub fn sheet_services_line(model: &Model) -> Option<String> {
+    let services = &model.settings.services;
+    let mut policy = ServicesPolicy::from_config(services);
+    if model.setup.is_some() && !services.wayland_clipboard {
+        policy.clipboard = false;
+    }
+    services_line(&policy, (!model.no_downloads).then_some(INBOX_WORDS))
 }
 
 /// Whether a transfer in `state` can still be stopped.
@@ -289,11 +382,13 @@ fn chat_of(sharing: &Sharing) -> Option<&HostServices> {
 /// The chat card of a shared session whose chat was granted, under its
 /// strip: its history, and while chat is on, the field (`drafts` holds what
 /// is typed, by session) and Send (Enter also sends). Shown in a window with
-/// the focus, its lines count as read.
+/// the focus, its lines count as read. The field takes the keyboard once
+/// when `focus` names this session (the indicator's Chat).
 pub(super) fn chat_card(
     ui: &mut egui::Ui,
     sharing: &Sharing,
     drafts: &mut HashMap<String, String>,
+    focus: &mut Option<String>,
     actions: &mut Vec<Action>,
 ) {
     let Some(services) = chat_of(sharing) else {
@@ -305,6 +400,12 @@ pub(super) fn chat_card(
         session_id: id.clone(),
         op,
     };
+    // Taken at this pass whether or not the field shows (a chat that ended
+    // has none).
+    let wanted = focus.as_ref() == Some(id);
+    if wanted {
+        *focus = None;
+    }
     ui.add_space(6.0);
     ui.push_id(("host-chat", id), |ui| {
         widgets::card_frame(t, 10, egui::Margin::symmetric(14, 10)).show(ui, |ui| {
@@ -337,6 +438,9 @@ pub(super) fn chat_card(
                             .char_limit(MAX_CHAT_CHARS)
                             .desired_width((ui.available_width() - 72.0).max(80.0)),
                     );
+                    if wanted {
+                        field.request_focus();
+                    }
                     let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button(SEND).clicked() || enter {
                         actions.push(act(HostServicesAction::Send));
@@ -489,5 +593,182 @@ mod tests {
             clip_line(ClipNote::Received { chars: 3 }),
             "They put text on this computer's clipboard (3 characters)"
         );
+    }
+
+    /// The services design §7.3: the indicator's suffix in fixed words and
+    /// a percent, never a name.
+    #[test]
+    fn the_indicator_suffix_says_which_way_a_file_goes() {
+        assert_eq!(
+            indicator_suffix(Direction::ToHost, 45),
+            " · receiving a file 45%"
+        );
+        assert_eq!(
+            indicator_suffix(Direction::FromHost, 45),
+            " · they are copying a file 45%"
+        );
+        assert_eq!(
+            indicator_suffix(Direction::ToHost, 100),
+            " · receiving a file 100%"
+        );
+    }
+
+    /// The indicator's Chat: only while a session has a chat card, with
+    /// the lines of every session not yet seen, on the first session with
+    /// lines waiting, else the newest.
+    #[test]
+    fn the_indicator_chat_names_the_session_with_lines_waiting() {
+        let shared = |id: &str, services: Option<HostServices>| Sharing {
+            session_id: id.to_owned(),
+            label: "Laptop".to_owned(),
+            control: true,
+            unattended: false,
+            since: std::time::Instant::now(),
+            capture: None,
+            services,
+        };
+        let chat = |unread: usize| {
+            let mut s = HostServices::opened(caps::CHAT, true, false);
+            s.unread = unread;
+            Some(s)
+        };
+        assert_eq!(indicator_chat(&[]), None);
+        assert_eq!(indicator_chat(&[shared("a", None)]), None);
+        let no_chat = Some(HostServices::opened(caps::ALL & !caps::CHAT, true, false));
+        assert_eq!(indicator_chat(&[shared("a", no_chat.clone())]), None);
+        assert_eq!(
+            indicator_chat(&[shared("a", chat(0))]),
+            Some(("Chat".to_owned(), "a".to_owned()))
+        );
+        assert_eq!(
+            indicator_chat(&[shared("a", chat(0)), shared("b", chat(0))]),
+            Some(("Chat".to_owned(), "b".to_owned())),
+            "the newest"
+        );
+        assert_eq!(
+            indicator_chat(&[
+                shared("a", chat(0)),
+                shared("b", chat(2)),
+                shared("c", chat(3)),
+                shared("d", no_chat),
+            ]),
+            Some(("Chat (5)".to_owned(), "b".to_owned())),
+            "the first with lines waiting, the lines of all"
+        );
+        // A chat that ended keeps its card, and its button.
+        let mut ended = HostServices::opened(caps::CHAT, true, false);
+        ended.ended = Some(reason::SESSION_OVER);
+        assert_eq!(
+            indicator_chat(&[shared("a", Some(ended))]),
+            Some(("Chat".to_owned(), "a".to_owned()))
+        );
+    }
+
+    /// The services design §7.4: the parts in their fixed order, joined
+    /// with ", " and " and "; chat is never named; none on, no line; no
+    /// inbox, no files received.
+    #[test]
+    fn the_services_line_names_what_control_also_gives() {
+        let policy = |clipboard, receive_files, browse_files| ServicesPolicy {
+            chat: true,
+            clipboard,
+            receive_files,
+            browse_files,
+            ..ServicesPolicy::from_config(&tornect_core::config::Services::default())
+        };
+        let line = |p: &ServicesPolicy| services_line(p, Some(INBOX_WORDS));
+        assert_eq!(
+            line(&policy(true, true, true)).as_deref(),
+            Some(
+                "With control they can also see and copy any file you can open on this \
+                 computer, send files into Downloads › Tornect and copy text to and from this \
+                 computer's clipboard."
+            )
+        );
+        assert_eq!(
+            line(&policy(true, false, true)).as_deref(),
+            Some(
+                "With control they can also see and copy any file you can open on this \
+                 computer and copy text to and from this computer's clipboard."
+            )
+        );
+        assert_eq!(
+            line(&policy(false, true, false)).as_deref(),
+            Some("With control they can also send files into Downloads › Tornect.")
+        );
+        assert_eq!(
+            line(&policy(true, false, false)).as_deref(),
+            Some("With control they can also copy text to and from this computer's clipboard.")
+        );
+        assert_eq!(
+            line(&policy(false, true, true)).as_deref(),
+            Some(
+                "With control they can also see and copy any file you can open on this \
+                 computer and send files into Downloads › Tornect."
+            )
+        );
+        assert_eq!(line(&policy(false, false, false)), None);
+        let mut chat_only = policy(false, false, false);
+        chat_only.chat = true;
+        assert_eq!(line(&chat_only), None, "chat is not access");
+        assert_eq!(services_line(&policy(false, true, false), None), None);
+        assert_eq!(
+            services_line(&policy(true, true, false), None).as_deref(),
+            Some("With control they can also copy text to and from this computer's clipboard.")
+        );
+        for p in [policy(true, true, true), policy(false, true, true)] {
+            let said = line(&p).unwrap_or_default();
+            assert!(!said.to_lowercase().contains("chat"), "{said}");
+        }
+    }
+
+    /// The sheet's line follows the saved settings: the clipboard is not
+    /// named on a Wayland desktop while its portal is not asked for one,
+    /// files received are not named without a Downloads folder.
+    #[test]
+    fn the_sheet_line_follows_the_saved_settings_and_this_desktop() {
+        use super::super::super::model::Setup;
+
+        let mut model = Model::default();
+        assert_eq!(
+            sheet_services_line(&model).as_deref(),
+            Some(
+                "With control they can also see and copy any file you can open on this \
+                 computer, send files into Downloads › Tornect and copy text to and from this \
+                 computer's clipboard."
+            )
+        );
+        model.setup = Some(Setup {
+            token_file: std::path::PathBuf::from("token"),
+            granted: true,
+            busy: false,
+            note: None,
+        });
+        assert_eq!(
+            sheet_services_line(&model).as_deref(),
+            Some(
+                "With control they can also see and copy any file you can open on this \
+                 computer and send files into Downloads › Tornect."
+            ),
+            "a Wayland desktop with the switch off offers no clipboard"
+        );
+        model.settings.services.wayland_clipboard = true;
+        assert!(
+            sheet_services_line(&model)
+                .unwrap_or_default()
+                .ends_with("copy text to and from this computer's clipboard.")
+        );
+        model.no_downloads = true;
+        assert_eq!(
+            sheet_services_line(&model).as_deref(),
+            Some(
+                "With control they can also see and copy any file you can open on this \
+                 computer and copy text to and from this computer's clipboard."
+            )
+        );
+        let services = &mut model.settings.services;
+        services.browse_files = false;
+        services.clipboard = false;
+        assert_eq!(sheet_services_line(&model), None);
     }
 }

@@ -100,6 +100,13 @@ pub enum Action {
     /// Start moving the indicator window with the pointer (it has no title
     /// bar).
     MoveIndicator,
+    /// The indicator's Chat: raise the main window as a second launch does
+    /// (`Wake::Show`), its chat field of `session_id` ready to type into
+    /// (the services design §7.3).
+    ShowChat {
+        /// The shared session whose chat card is wanted.
+        session_id: String,
+    },
     /// End the session this machine views, or stop asking for one.
     EndViewing,
     /// One of the stream window's own controls.
@@ -356,6 +363,10 @@ pub struct Form {
     /// What is typed into each shared session's chat card, by the
     /// session's id; it goes with the session.
     pub chats: HashMap<String, String>,
+    /// The shared session whose chat field takes the keyboard at its card's
+    /// next pass: the indicator's Chat asked for it (the services design
+    /// §7.3). Dropped once taken, or with the session.
+    pub chat_focus: Option<String>,
     /// What the request sheet last kept in view: its viewport's size, its
     /// newest card, how many cards it held and how tall they were. When any
     /// of them changes the newest card's answers are brought into view again.
@@ -616,7 +627,7 @@ pub fn main_window(
                     strip::services_strip(ui, sharing, actions);
                     // In the banner, not above the page: the page's widgets
                     // keep their ids whether a chat card shows or not.
-                    strip::chat_card(ui, sharing, &mut form.chats, actions);
+                    strip::chat_card(ui, sharing, &mut form.chats, &mut form.chat_focus, actions);
                 }
                 if let Some(warning) = &model.polkit_warning {
                     ui.add(
@@ -634,6 +645,13 @@ pub fn main_window(
         .retain(|id, _| model.popups.iter().any(|p| p.id == *id));
     form.chats
         .retain(|id, _| model.sharing.iter().any(|s| s.session_id == *id));
+    if form
+        .chat_focus
+        .as_ref()
+        .is_some_and(|id| !model.sharing.iter().any(|s| s.session_id == *id))
+    {
+        form.chat_focus = None;
+    }
     form.cards.retain(|id, _| {
         model.popups.iter().any(|p| {
             p.id == *id || (model.admin_confirm.contains(&p.id) && confirmation_card(p.id) == *id)
@@ -1012,6 +1030,7 @@ fn request_sheet(
                         question(ui, |ui| confirm_popup(ui, confirm, shared, form, now, actions));
                     Some((confirm.id, card))
                 } else if let Some(popup) = oldest {
+                    let services = strip::sheet_services_line(model);
                     let sheet = Sheet {
                         seen: model.recognition.get(&popup.id),
                         levels: model.levels.get(&popup.id),
@@ -1019,6 +1038,7 @@ fn request_sheet(
                         admin_not_given: model.admin_not_given.contains(&popup.id),
                         paired_recently: model.paired_recently.contains(&popup.id),
                         screens: model.sheet_screens.get(&popup.id).copied().unwrap_or(1),
+                        services: services.as_deref(),
                     };
                     let card = question(ui, |ui| host_popup(ui, popup, sheet, form, now, actions));
                     Some((popup.id, card))
@@ -1130,6 +1150,17 @@ fn answer_line(ui: &mut egui::Ui, answer: &str, line: &str) {
             );
         });
     });
+}
+
+/// The session sheet's line of what control also gives (the services
+/// design §7.4), in the style of an answer's line.
+fn services_answer_line(ui: &mut egui::Ui, line: &str) {
+    let t = theme::tokens(ui.ctx());
+    ui.add(
+        egui::Label::new(RichText::new(line).small().color(t.text_secondary))
+            .wrap()
+            .selectable(false),
+    );
 }
 
 /// The scam line beside the administrator answer of a device paired
@@ -1329,6 +1360,22 @@ pub fn indicator_pill(
                 if stop_button(ui, "Stop").clicked() {
                     actions.push(Action::StopSharing);
                 }
+                // Left of Stop, laid out after it: it can never cover Stop
+                // (the services design §7.3). It raises the main window,
+                // where the chat cards are.
+                if let Some((text, session_id)) = strip::indicator_chat(sharing)
+                    && ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(text).small().strong().color(t.on_sharing),
+                            )
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::new(1.0, t.on_sharing)),
+                        )
+                        .clicked()
+                {
+                    actions.push(Action::ShowChat { session_id });
+                }
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.spacing_mut().indent = 12.0;
                     ui.indent("rows", |ui| {
@@ -1363,10 +1410,36 @@ pub fn indicator_pill(
                             } else {
                                 detail.to_owned()
                             };
-                            ui.add(
-                                egui::Label::new(RichText::new(detail).small().color(t.on_sharing))
-                                    .truncate(),
-                            );
+                            // A file moving (the services design §7.3): the
+                            // suffix is laid out first, whole, and only the
+                            // line before it is shortened.
+                            let moving = s
+                                .services
+                                .as_ref()
+                                .and_then(super::services::HostServices::moving);
+                            // Top-aligned, not `horizontal`: the line keeps
+                            // its text's height, and the rows fit the window.
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                if let Some((dir, percent)) = moving {
+                                    ui.add(egui::Label::new(
+                                        RichText::new(strip::indicator_suffix(dir, percent))
+                                            .small()
+                                            .color(t.on_sharing),
+                                    ));
+                                }
+                                ui.with_layout(
+                                    egui::Layout::left_to_right(egui::Align::Min),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(detail).small().color(t.on_sharing),
+                                            )
+                                            .truncate(),
+                                        );
+                                    },
+                                );
+                            });
                         }
                     });
                 });
@@ -1460,6 +1533,9 @@ struct Sheet<'a> {
     paired_recently: bool,
     /// How many screens the session could show (decision M1-75 (3)).
     screens: usize,
+    /// What control also gives here, from the saved settings (the services
+    /// design §7.4): said once under the answers when one gives control.
+    services: Option<&'a str>,
 }
 
 /// The arming card of session sheet `id`'s administrator confirmation: its
@@ -1686,6 +1762,9 @@ fn host_popup(
             });
             if sheet.confirming && confirmable {
                 admin_confirmation(ui, popup.id, label, form, now, actions, left);
+                if let Some(line) = sheet.services {
+                    services_answer_line(ui, line);
+                }
                 if sheet.paired_recently {
                     scam_line(ui);
                 }
@@ -1810,6 +1889,12 @@ fn host_popup(
                 if sheet.paired_recently {
                     scam_line(ui);
                 }
+            }
+            // Once, after every answer's line, where an answer gives control
+            // (plain or as administrator): what control also gives here. No
+            // button, arming or order changes; View only's line stays.
+            if let (true, Some(line)) = (answers.allow || admin.is_some(), sheet.services) {
+                services_answer_line(ui, line);
             }
             if let Some(levels) = sheet.levels {
                 // The sentence under the buttons: why a level is absent, or
@@ -4127,5 +4212,143 @@ mod tests {
         window.pass(t0, Vec::new());
         assert!(window.form.chats.is_empty(), "the draft goes with the row");
         assert!(!window.texts().iter().any(|t| t.starts_with("Chat with")));
+    }
+
+    /// The rectangle (x0, y0, x1, y1) of the label whose text starts with
+    /// `start` in `window`'s last pass.
+    fn text_bounds(window: &Harness, start: &str) -> (f64, f64, f64, f64) {
+        let b = window
+            .nodes
+            .iter()
+            .find(|n| n.value().is_some_and(|v| v.starts_with(start)))
+            .and_then(egui::accesskit::Node::bounds)
+            .unwrap_or_else(|| panic!("no text starting with \"{start}\""));
+        (b.x0, b.y0, b.x1, b.y1)
+    }
+
+    /// The services design §7.4: once, after every answer's line, where an
+    /// answer gives control (plain, or as administrator) and the saved
+    /// settings give more than chat, the session sheet says what control
+    /// also gives, in fixed words; not on a sheet that offers View only
+    /// alone, not with every switch off, and again in the administrator
+    /// answer's confirmation. No button moves before it.
+    #[test]
+    fn the_session_sheet_says_what_control_also_gives() {
+        use tornect_core::config::Services;
+        use tornect_core::levels::Availability;
+
+        const ALL: &str = "With control they can also see and copy any file you can open on \
+                           this computer, send files into Downloads › Tornect and copy text to \
+                           and from this computer's clipboard.";
+        let t0 = Instant::now();
+        let sheet = |levels: SheetLevels, services: Services| {
+            let mut model = with_popups(vec![session_popup(7, t0)]);
+            model.levels.insert(7, levels);
+            model.settings.services = services;
+            Harness::new(model, t0)
+        };
+        let said = |window: &Harness| {
+            window
+                .texts()
+                .into_iter()
+                .filter(|t| t.starts_with("With control"))
+                .collect::<Vec<_>>()
+        };
+        // Linux: under View only's and Allow control's lines, once.
+        let linux_levels = SheetLevels::of(&Availability::LINUX);
+        let linux = sheet(linux_levels, Services::default());
+        assert_eq!(said(&linux), vec![ALL.to_owned()]);
+        let line = text_bounds(&linux, "With control");
+        let allow = linux.bounds("Allow control");
+        assert!(line.1 >= allow.3, "under the buttons: {line:?} {allow:?}");
+        for answer_line in [LINE_VIEW_ONLY, linux_levels.allow_line] {
+            let above = text_bounds(&linux, answer_line);
+            assert!(line.1 >= above.3, "{answer_line}: {line:?} {above:?}");
+        }
+        assert!(
+            linux.bounds("Deny").0 < linux.bounds("View only").0,
+            "Deny first"
+        );
+        // Administrator only (UAC off): under its row.
+        let admin = sheet(always_admin(), Services::default());
+        assert_eq!(said(&admin), vec![ALL.to_owned()]);
+        let line = text_bounds(&admin, "With control");
+        let row = admin.bounds("Allow as administrator");
+        assert!(line.1 >= row.3, "{line:?} {row:?}");
+        // View only alone: nothing control gives is offered.
+        let view_only = SheetLevels {
+            answers: Answers {
+                view_only: true,
+                allow: false,
+                admin: None,
+            },
+            ..linux_levels
+        };
+        let window = sheet(view_only, Services::default());
+        assert!(window.has("View only") && !window.has("Allow control"));
+        assert!(said(&window).is_empty(), "{:?}", said(&window));
+        // Every switch off (chat on): no line.
+        let off = Services {
+            clipboard: false,
+            receive_files: false,
+            browse_files: false,
+            ..Services::default()
+        };
+        let window = sheet(linux_levels, off);
+        assert!(said(&window).is_empty(), "{:?}", said(&window));
+        // One switch: its part alone.
+        let window = sheet(
+            linux_levels,
+            Services {
+                receive_files: true,
+                ..off
+            },
+        );
+        assert_eq!(
+            said(&window),
+            vec!["With control they can also send files into Downloads › Tornect.".to_owned()]
+        );
+        // The administrator answer's confirmation says it too.
+        let mut window = sheet(always_admin(), Services::default());
+        window.model.admin_confirm.insert(7);
+        let t1 = t0 + Duration::from_secs(2);
+        window.pass(t1, Vec::new());
+        window.pass(t1, Vec::new());
+        assert!(window.has("Allow as administrator") && !window.has("View only"));
+        assert_eq!(said(&window), vec![ALL.to_owned()]);
+    }
+
+    /// The services design §7.3: the indicator's Chat asks for the session's
+    /// chat field, which takes the keyboard at its card's next pass, once;
+    /// a request for a session gone is dropped.
+    #[test]
+    fn the_indicators_chat_readies_the_chat_field_once() {
+        use tornect_proto::services::caps;
+
+        use super::super::services::HostServices;
+
+        let t0 = Instant::now();
+        let typed = |text: &str| vec![egui::Event::Text(text.to_owned())];
+        let services = HostServices::opened(caps::ALL, true, false);
+        let mut window = Harness::new(serviced(true, true, services, t0), t0);
+        // Without the request, typing reaches no field.
+        window.pass(t0, typed("x"));
+        assert!(
+            window.form.chats.get("0011").is_none_or(String::is_empty),
+            "{:?}",
+            window.form.chats
+        );
+        window.form.chat_focus = Some("0011".to_owned());
+        window.pass(t0, Vec::new());
+        assert_eq!(window.form.chat_focus, None, "taken once");
+        window.pass(t0, typed("on my way"));
+        assert_eq!(
+            window.form.chats.get("0011").map(String::as_str),
+            Some("on my way")
+        );
+        // A request for a session that ended is dropped with it.
+        window.form.chat_focus = Some("0099".to_owned());
+        window.pass(t0, Vec::new());
+        assert_eq!(window.form.chat_focus, None);
     }
 }

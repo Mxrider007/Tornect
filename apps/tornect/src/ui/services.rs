@@ -11,11 +11,12 @@ use std::sync::Arc;
 use tornect_core::session_log::SessionLog;
 use tornect_proto::services::{Welcome, caps, reason};
 use tornect_session::services::{
-    ChatText, HostEvent, ListingView, ServicesObserver, TransferRow, TransferState, Untrusted,
-    ViewerEvent, ViewerServicesEnd,
+    ChatText, Direction, HostEvent, ListingView, ServicesObserver, TransferRow, TransferState,
+    Untrusted, ViewerEvent, ViewerServicesEnd,
 };
 
 use super::model::{Shared, Wake};
+use super::pages::viewer::percent;
 use crate::host::say;
 use crate::services::{Peer, Peers, log_record, reason_name};
 
@@ -150,6 +151,33 @@ impl HostServices {
             text,
         });
         keep_last(&mut self.chat, CHAT_KEPT);
+    }
+
+    /// Whether the session has a chat card: its chat was granted (the card
+    /// keeps its history once the chat ended).
+    #[must_use]
+    pub fn has_chat(&self) -> bool {
+        self.granted & caps::CHAT != 0
+    }
+
+    /// The transfer the sharing indicator names while the stream is open
+    /// (design §7.3), its way and how far it is, in percent: the oldest file
+    /// being copied off this computer, else the oldest being received; only
+    /// one whose bytes move (not one waiting for its turn or held by the
+    /// lock).
+    #[must_use]
+    pub fn moving(&self) -> Option<(Direction, u64)> {
+        if self.ended.is_some() {
+            return None;
+        }
+        let running = |dir: Direction| {
+            self.transfers
+                .iter()
+                .find(|r| r.dir == dir && r.state == TransferState::Running)
+        };
+        running(Direction::FromHost)
+            .or_else(|| running(Direction::ToHost))
+            .map(|r| (r.dir, percent(r.done, r.size)))
     }
 
     /// What `event` changes. `Opened` starts over; `FileSent` changes

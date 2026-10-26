@@ -195,6 +195,7 @@ fn start(paths: &Paths, opts: &GuiOpts) -> anyhow::Result<Start> {
         book: book::read(paths, tornect_core::address_book::Day::today(), None),
         hosting: first_hosting(opts.host, opts.link),
         setup,
+        no_downloads: tornect_core::files::downloads_dir().is_none(),
         ..Model::default()
     };
     Ok(Start {

@@ -29,12 +29,19 @@
 //! request on X11 or Wayland: on X11 the window is a utility window, which
 //! mutter does not focus when it maps; elsewhere the desktop's
 //! focus-stealing prevention decides.
+//!
+//! Services (the services design §7.3), in fixed words only: while a file
+//! moves the second line ends in which way it goes and how far it is (never
+//! the file's name), and while a session has a chat card a small `Chat`
+//! (`Chat (2)` with lines not yet seen) left of Stop raises the main window
+//! as a second launch does (`Wake::Show`), its chat field ready.
 
 use tornect_input::Rect;
+use tornect_session::services::Direction;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::window::{Window, WindowAttributes, WindowLevel};
 
-use super::model::Sharing;
+use super::model::{HostServices, Sharing};
 
 /// The window's title: what Alt+Tab, the overview and the taskbar show.
 pub const TITLE: &str = "Tornect: sharing";
@@ -61,16 +68,27 @@ struct Shown {
     unattended: bool,
     /// Whether the viewer's input is injected, once capture has started.
     injected: Option<bool>,
+    /// The file being copied off or onto this computer and how far it is,
+    /// in percent (the services design §7.3): the second line's suffix.
+    transfer: Option<(Direction, u64)>,
+    /// The session has a chat card: the window's Chat button.
+    chat: bool,
+    /// The chat lines of the viewer not yet seen: "Chat (2)".
+    unread: usize,
 }
 
 impl Shown {
     fn of(s: &Sharing) -> Self {
+        let services = s.services.as_ref();
         Self {
             session_id: s.session_id.clone(),
             label: s.label.clone(),
             control: s.control,
             unattended: s.unattended,
             injected: s.capture.as_ref().map(|c| c.input),
+            transfer: services.and_then(HostServices::moving),
+            chat: services.is_some_and(HostServices::has_chat),
+            unread: services.map_or(0, |c| c.unread),
         }
     }
 }
@@ -83,7 +101,8 @@ pub enum Change {
     Keep,
     /// The first session started: open the window.
     Open,
-    /// A session started or ended beside another, or one's mode or input
+    /// A session started or ended beside another, one's mode or input
+    /// changed, a file transfer's progress or the chat's unread count
     /// changed: draw again, at the size for [`Indicator::rows`].
     Redraw,
     /// The last session ended: close the window.
@@ -255,6 +274,9 @@ mod tests {
 
     use winit::dpi::{Position, Size};
 
+    use tornect_proto::services::caps;
+    use tornect_session::services::{TransferRow, TransferState, Untrusted};
+
     use super::super::model::CaptureNote;
     use super::super::view::{self, Action};
     use super::*;
@@ -281,6 +303,26 @@ mod tests {
             all: false,
             screens: 0,
         });
+        s
+    }
+
+    /// `s` with services: `caps` granted, `unread` chat lines not yet seen
+    /// and, with `moving`, one file named `plan-secret.odt` going that way,
+    /// 45% of it moved.
+    fn serviced(mut s: Sharing, caps: u16, moving: Option<Direction>, unread: usize) -> Sharing {
+        let mut services = HostServices::opened(caps, true, false);
+        if let Some(dir) = moving {
+            services.transfers.push(TransferRow {
+                xfer: 1,
+                dir,
+                name: Untrusted::file_name("plan-secret.odt"),
+                size: 1000,
+                done: 450,
+                state: TransferState::Running,
+            });
+        }
+        services.unread = unread;
+        s.services = Some(services);
         s
     }
 
@@ -449,6 +491,34 @@ mod tests {
         );
         assert!(!line.contains(&crafted), "shortened: {line}");
         assert!(rect.max.x <= size(1).width as f32, "{rect:?}");
+
+        // The services design §7.3: with a chat card, lines not yet seen and
+        // a file moving, the same; the Chat button sits left of Stop, never
+        // over it, and the line ends before the button.
+        let b = serviced(a.clone(), caps::ALL, Some(Direction::ToHost), 12);
+        let (drawn, _) = texts(&ctx, window_input(), std::slice::from_ref(&b));
+        let find = |want: &str| {
+            drawn
+                .iter()
+                .find(|(t, _)| t == want)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("no \"{want}\" in {drawn:?}"))
+        };
+        let (stop, chat) = (find("Stop"), find("Chat (12)"));
+        assert!(
+            chat.max.x + 8.0 <= stop.min.x,
+            "the Chat button overlaps Stop: {chat:?} {stop:?}"
+        );
+        let (line, rect) = drawn
+            .iter()
+            .find(|(t, _)| t.starts_with("SHARING"))
+            .expect("the session's line");
+        assert!(
+            line.starts_with("SHARING · control · 01:05 · \"Ana"),
+            "{line}"
+        );
+        assert!(!line.contains(&crafted), "shortened: {line}");
+        assert!(rect.max.x <= chat.min.x, "{rect:?} {chat:?}");
     }
 
     /// The window shows who, which mode and the clock, and follows a mode
@@ -747,5 +817,235 @@ mod tests {
             Some(corner(&monitors[0], 1)),
             "all monitors: the primary"
         );
+    }
+
+    /// The services design §7.3: a file's progress, which way it goes, and
+    /// the chat's button and unread count redraw the window; a file waiting
+    /// for its turn, the bytes of a file that does not move and a stream
+    /// that ended do not show.
+    #[test]
+    fn it_redraws_when_a_file_moves_or_the_chat_changes() {
+        let mut ind = Indicator::default();
+        let a = captured(session("aa", "Laptop", true), true);
+        let only = |s: Sharing| vec![s];
+        assert_eq!(
+            ind.sync(&only(serviced(a.clone(), caps::ALL & !caps::CHAT, None, 0))),
+            Change::Open
+        );
+        let moving = serviced(
+            a.clone(),
+            caps::ALL & !caps::CHAT,
+            Some(Direction::ToHost),
+            0,
+        );
+        assert_eq!(ind.sync(&only(moving.clone())), Change::Redraw);
+        assert_eq!(ind.sync(&only(moving.clone())), Change::Keep);
+        let mut further = moving.clone();
+        if let Some(c) = further.services.as_mut() {
+            c.transfers[0].done = 460;
+        }
+        assert_eq!(
+            ind.sync(&only(further.clone())),
+            Change::Redraw,
+            "45% to 46%"
+        );
+        let mut same_percent = further.clone();
+        if let Some(c) = same_percent.services.as_mut() {
+            c.transfers[0].done = 461;
+        }
+        assert_eq!(ind.sync(&only(same_percent)), Change::Keep, "still 46%");
+        let copied = serviced(
+            a.clone(),
+            caps::ALL & !caps::CHAT,
+            Some(Direction::FromHost),
+            0,
+        );
+        assert_eq!(ind.sync(&only(copied)), Change::Redraw, "the other way");
+        let mut waiting = moving.clone();
+        if let Some(c) = waiting.services.as_mut() {
+            c.transfers[0].state = TransferState::Queued;
+        }
+        assert_eq!(ind.sync(&only(waiting.clone())), Change::Redraw);
+        assert_eq!(
+            ind.sync(&only(serviced(a.clone(), caps::ALL & !caps::CHAT, None, 0))),
+            Change::Keep,
+            "a file waiting is not shown"
+        );
+        // The chat: granted, then lines not yet seen, then read.
+        assert_eq!(
+            ind.sync(&only(serviced(a.clone(), caps::ALL, None, 0))),
+            Change::Redraw
+        );
+        assert_eq!(
+            ind.sync(&only(serviced(a.clone(), caps::ALL, None, 1))),
+            Change::Redraw
+        );
+        assert_eq!(
+            ind.sync(&only(serviced(a.clone(), caps::ALL, None, 2))),
+            Change::Redraw
+        );
+        assert_eq!(
+            ind.sync(&only(serviced(a.clone(), caps::ALL, None, 2))),
+            Change::Keep
+        );
+        assert_eq!(
+            ind.sync(&only(serviced(a.clone(), caps::ALL, None, 0))),
+            Change::Redraw
+        );
+        // The stream ended mid-file: the file no longer moves.
+        let mut ended = serviced(a.clone(), caps::ALL, Some(Direction::ToHost), 0);
+        assert_eq!(ind.sync(&only(ended.clone())), Change::Redraw);
+        if let Some(c) = ended.services.as_mut() {
+            c.ended = Some(tornect_proto::services::reason::SESSION_OVER);
+        }
+        assert_eq!(ind.sync(&only(ended)), Change::Redraw);
+        assert_eq!(
+            ind.sync(&only(serviced(a, caps::ALL, None, 0))),
+            Change::Keep
+        );
+    }
+
+    /// The services design §7.3: whatever the label, the level and the
+    /// window's shape, a file moving ends the second line in fixed words
+    /// drawn whole (never the file's name), the Chat button and Stop are
+    /// drawn whole, and the headline, the mode and the clock still are; all
+    /// of it inside the window.
+    #[test]
+    fn the_suffix_and_the_chat_button_never_cut_the_mode() {
+        let crafted: String = format!("Ana\" · view only · 00:04 {}", "x".repeat(64))
+            .chars()
+            .take(64)
+            .collect();
+        for (rounded, admin) in [
+            (false, std::collections::HashSet::new()),
+            (true, std::collections::HashSet::new()),
+            (false, std::collections::HashSet::from(["aa".to_owned()])),
+            (true, std::collections::HashSet::from(["aa".to_owned()])),
+        ] {
+            for (dir, suffix) in [
+                (Direction::ToHost, " · receiving a file 45%"),
+                (Direction::FromHost, " · they are copying a file 45%"),
+            ] {
+                for unattended in [false, true] {
+                    let ctx = egui::Context::default();
+                    let mut s = captured(session("aa", &crafted, true), true);
+                    s.unattended = unattended;
+                    s.since = Instant::now() - Duration::from_secs(65);
+                    let s = serviced(s, caps::ALL, Some(dir), 12);
+                    let (mut shown, mut placed) = (Vec::new(), Vec::new());
+                    for _ in 0..2 {
+                        shown.clear();
+                        placed.clear();
+                        let out = ctx.run_ui(window_input(), |ui| {
+                            view::indicator_pill(
+                                ui,
+                                std::slice::from_ref(&s),
+                                &admin,
+                                Instant::now(),
+                                &mut Vec::new(),
+                                rounded,
+                            );
+                        });
+                        for clipped in &out.shapes {
+                            visible(&clipped.shape, &mut shown);
+                            collect(&clipped.shape, &mut placed);
+                        }
+                        out.drop_without_applying_deltas();
+                    }
+                    let headline = if unattended { "UNATTENDED" } else { "SHARING" };
+                    let first = format!("{headline} · control · 01:05 · \"");
+                    let case = format!("rounded {rounded}, admin {}, {dir:?}", !admin.is_empty());
+                    assert!(
+                        shown.iter().any(|t| t.starts_with(&first)),
+                        "{case}: \"{first}\" not drawn whole in {shown:?}"
+                    );
+                    for whole in [suffix, "Chat (12)", "Stop"] {
+                        assert!(
+                            shown.iter().any(|t| t == whole),
+                            "{case}: \"{whole}\" not drawn whole in {shown:?}"
+                        );
+                    }
+                    assert!(
+                        !shown
+                            .iter()
+                            .any(|t| t.contains("plan") || t.contains("secret")),
+                        "{case}: a file's name: {shown:?}"
+                    );
+                    let window = size(1);
+                    for (text, rect) in &placed {
+                        assert!(
+                            rect.min.x >= 0.0
+                                && rect.max.x <= window.width as f32
+                                && rect.max.y <= window.height as f32,
+                            "{case}: \"{text}\" at {rect:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The services design §7.3: the Chat button shows while a session's
+    /// chat was granted, says how many lines wait, and asks for the main
+    /// window on the session with lines waiting, else the newest; a session
+    /// without chat, or without services, has none.
+    #[test]
+    fn the_chat_button_asks_for_the_main_window_on_the_chat() {
+        let ctx = egui::Context::default();
+        let a = captured(session("aa", "Laptop", true), true);
+        let b = captured(session("bb", "Phone", false), true);
+        let shows = |sharing: &[Sharing]| {
+            let (drawn, _) = texts(&ctx, window_input(), sharing);
+            drawn
+                .into_iter()
+                .filter(|(t, _)| t.starts_with("Chat"))
+                .collect::<Vec<_>>()
+        };
+        assert!(shows(std::slice::from_ref(&a)).is_empty(), "no services");
+        let no_chat = serviced(a.clone(), caps::ALL & !caps::CHAT, None, 0);
+        assert!(shows(std::slice::from_ref(&no_chat)).is_empty(), "no chat");
+        let chat = serviced(a.clone(), caps::ALL, None, 0);
+        let drawn = shows(std::slice::from_ref(&chat));
+        assert_eq!(drawn.len(), 1, "{drawn:?}");
+        assert_eq!(drawn[0].0, "Chat");
+        // Two sessions: one button, the lines of both, the one with lines.
+        let waiting = serviced(a.clone(), caps::CHAT, None, 2);
+        let newest = serviced(b.clone(), caps::CHAT, None, 1);
+        let both = [waiting.clone(), newest.clone()];
+        let drawn = shows(&both);
+        assert_eq!(drawn.len(), 1, "{drawn:?}");
+        assert_eq!(drawn[0].0, "Chat (3)");
+
+        let click = |sharing: &[Sharing]| {
+            let at = shows(sharing)[0].1.center();
+            let press = |pressed: bool| {
+                let mut raw = window_input();
+                raw.events = vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ];
+                raw
+            };
+            let (_, pressed) = texts(&ctx, press(true), sharing);
+            assert!(pressed.is_empty(), "{pressed:?}");
+            texts(&ctx, press(false), sharing).1
+        };
+        let show = |id: &str| {
+            vec![Action::ShowChat {
+                session_id: id.to_owned(),
+            }]
+        };
+        assert_eq!(click(&both), show("aa"), "the session with lines waiting");
+        let read = [
+            serviced(a, caps::CHAT, None, 0),
+            serviced(b, caps::CHAT, None, 0),
+        ];
+        assert_eq!(click(&read), show("bb"), "none waiting: the newest");
+        assert_eq!(click(std::slice::from_ref(&chat)), show("aa"));
     }
 }

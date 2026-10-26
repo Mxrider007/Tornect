@@ -1617,6 +1617,13 @@ impl App {
                 }
             }
             Action::StopSharing => self.command(Command::StopSharing),
+            Action::ShowChat { session_id } => {
+                // The indicator's Chat (the services design §7.3): the raise
+                // of a second launch (`Wake::Show`: never the focus, every
+                // card armed again), and the session's chat field ready.
+                self.form.chat_focus = Some(session_id);
+                self.show(None);
+            }
             Action::MoveIndicator => {
                 if let Some(surface) = &self.indicator
                     && let Err(e) = surface.window.drag_window()
@@ -3038,6 +3045,33 @@ mod tests {
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
         app.act(Action::MoveIndicator, None);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// The services design §7.3: the indicator's Chat readies the session's
+    /// chat field and raises the main window as a second launch does
+    /// (`Wake::Show`, [`on_show`]); it sends nothing to the tokio side and
+    /// changes nothing in the model.
+    #[test]
+    fn the_indicators_chat_readies_the_chat_without_a_command() {
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let before = shared.read(|m| format!("{m:?}"));
+        let popups = Popups::new(Arc::clone(&shared));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(
+            Arc::clone(&shared),
+            popups,
+            Arc::new(StreamLink::default()),
+            tx,
+        );
+        app.act(
+            Action::ShowChat {
+                session_id: "0011".to_owned(),
+            },
+            None,
+        );
+        assert_eq!(app.form.chat_focus.as_deref(), Some("0011"));
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(shared.read(|m| format!("{m:?}")), before);
     }
 
     /// The services design §7.2: a new chat line asks for attention only
