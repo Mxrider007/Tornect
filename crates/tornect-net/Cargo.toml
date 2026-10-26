@@ -19,6 +19,10 @@ netdev.workspace = true
 socket2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+# The pinned QUIC (step A9): constant-time pin comparisons, the exported
+# binding secret wiped on drop.
+subtle.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

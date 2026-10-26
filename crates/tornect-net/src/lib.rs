@@ -1,9 +1,9 @@
 //! Tornect connectivity for direct connections (`docs/PLAN.md` §A.3 D5–D7,
 //! §B.2; design `direct` revision 4, decisions M1-78 to M1-86): this
 //! computer's addresses and the filters every remote address passes, the
-//! session's one UDP socket with its source gates, then (in the following
-//! steps) hole punching, STUN, router port mapping and quinn QUIC with both
-//! device keys pinned.
+//! session's one UDP socket with its source gates, quinn QUIC with both
+//! device keys pinned, then (in the following steps) hole punching, STUN
+//! and router port mapping.
 //!
 //! Nothing outside this crate may touch sockets or quinn. It never names
 //! `tornect-signal`: the wire forms of candidates are converted in
@@ -19,6 +19,7 @@ use std::pin::Pin;
 pub mod addr;
 pub mod env;
 pub mod local;
+pub mod quic;
 pub mod socket;
 pub mod udp;
 
@@ -28,10 +29,25 @@ pub use addr::{
 };
 pub use env::{NetEnv, RealNet};
 pub use local::{IfaceAddr, IfaceKind, RouteSources};
+pub use quic::{
+    DeviceKeySigner, PeerRefusal, PinnedVerifier, QuicError, QuicIdentity, check_peer,
+    endpoint_config, exporter, is_crypto_close, transport,
+};
 pub use socket::{BoundSocket, QuietUdp, SendErrors, bind_media_socket};
 pub use udp::{
     BoundUdp, ProbeGate, PunchCounters, PunchSocket, RawSend, TeedProbe, TeedStun, Tees, V6Sources,
 };
+
+/// Which end of a session this side is: the viewer asked for the session
+/// and opens its streams, the host shares its screen. Either may be the
+/// side that dials the direct connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TornectRole {
+    /// The side that asked for the session and shows the picture.
+    Viewer,
+    /// The side that accepted the session and shares its screen.
+    Host,
+}
 
 /// A boxed, sendable future: the return type of the [`NetEnv`] calls that
 /// wait.

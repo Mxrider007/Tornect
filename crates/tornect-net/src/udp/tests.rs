@@ -279,64 +279,36 @@ async fn settle() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
-/// quinn's endpoint with the QUIC bit never greased, as the session's
-/// endpoint will be (design §6.3: every QUIC packet has `0x40` set).
-fn endpoint_config() -> quinn::EndpointConfig {
-    let mut config = quinn::EndpointConfig::default();
-    config.grease_quic_bit(false);
-    config
+/// The session's pinned QUIC identities (step A9): the host serves, the
+/// viewer dials. The gate tests need only real Initials and quinn's
+/// answers; no handshake here has a peer to complete it.
+fn quic_identity(seed: u8) -> crate::quic::QuicIdentity {
+    crate::quic::QuicIdentity::new(Arc::new(tornect_core::DeviceIdentity::from_seed(
+        &[seed; 32],
+    )))
 }
 
-/// A server that never completes a handshake (it has no certificate):
-/// enough for quinn to answer unknown versions and to queue an incoming
-/// connection, which is all the gate tests need. The session's pinned
-/// configurations are step A9's.
-fn server_config() -> quinn::ServerConfig {
-    #[derive(Debug)]
-    struct NoCertificate;
-
-    impl quinn::rustls::server::ResolvesServerCert for NoCertificate {
-        fn resolve(
-            &self,
-            _: quinn::rustls::server::ClientHello<'_>,
-        ) -> Option<Arc<quinn::rustls::sign::CertifiedKey>> {
-            None
-        }
-    }
-
-    let provider = Arc::new(quinn::rustls::crypto::ring::default_provider());
-    let tls = quinn::rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&quinn::rustls::version::TLS13])
-        .expect("TLS 1.3")
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(NoCertificate));
-    let crypto =
-        quinn::crypto::rustls::QuicServerConfig::try_from(tls).expect("a QUIC server config");
-    quinn::ServerConfig::with_crypto(Arc::new(crypto))
+fn public_key(seed: u8) -> [u8; 32] {
+    quic_identity(seed).public_key()
 }
 
-/// A client that trusts nobody: its Initial is real, its handshake never
-/// completes.
+/// The viewer's pinned configuration, dialling the host.
 fn client_config() -> quinn::ClientConfig {
-    let provider = Arc::new(quinn::rustls::crypto::ring::default_provider());
-    let tls = quinn::rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&quinn::rustls::version::TLS13])
-        .expect("TLS 1.3")
-        .with_root_certificates(quinn::rustls::RootCertStore::empty())
-        .with_no_client_auth();
-    let crypto =
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("a QUIC client config");
-    quinn::ClientConfig::new(Arc::new(crypto))
+    quic_identity(2)
+        .client_config(&public_key(1), crate::TornectRole::Viewer)
+        .expect("a client config")
 }
 
+/// quinn's endpoint on the session socket, as the session builds it
+/// (`quic::endpoint`: the QUIC bit never greased, design §6.3); with the
+/// host's pinned server configuration when `server`.
 fn endpoint(socket: &Arc<PunchSocket>, server: bool) -> quinn::Endpoint {
-    quinn::Endpoint::new_with_abstract_socket(
-        endpoint_config(),
-        server.then(server_config),
-        Arc::clone(socket) as Arc<dyn AsyncUdpSocket>,
-        Arc::new(quinn::TokioRuntime),
-    )
-    .expect("an endpoint")
+    let config = server.then(|| {
+        quic_identity(1)
+            .server_config(&public_key(2), crate::TornectRole::Host)
+            .expect("a server config")
+    });
+    crate::quic::endpoint(socket, config).expect("an endpoint")
 }
 
 #[test]
