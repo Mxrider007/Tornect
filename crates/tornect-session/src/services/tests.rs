@@ -1184,6 +1184,21 @@ async fn a_stream_left_with_nothing_ends() {
 
 // --- Close paths ------------------------------------------------------------
 
+/// Capture seen stopped once the session's end is set is the session's end,
+/// not `CAPTURE_STOPPED`: the end stops capture, and a poll that found no
+/// end can see capture stopped by it (under load, the window app's test
+/// `the_window_hosts_services_carry_chat_both_ways` closed
+/// `CAPTURE_STOPPED` while its media stream had ended `SessionOver`).
+#[test]
+fn capture_stopped_by_the_sessions_end_is_its_end() {
+    let (tx, rx) = watch::channel(None);
+    assert_eq!(host::capture_stopped(&rx), reason::CAPTURE_STOPPED);
+    tx.send_replace(Some(tornect_proto::reason::SESSION_OVER));
+    assert_eq!(host::capture_stopped(&rx), reason::SESSION_OVER);
+    tx.send_replace(Some(tornect_proto::reason::ENDED_BY_HOST));
+    assert_eq!(host::capture_stopped(&rx), reason::ENDED_BY_HOST);
+}
+
 /// Services end when capture stops (`Close{CAPTURE_STOPPED}`), when the
 /// session ends (`SESSION_OVER`) or is killed (`ENDED_BY_HOST`), on a frame
 /// this version does not know (`PROTOCOL`), and when the viewer leaves

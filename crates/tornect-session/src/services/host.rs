@@ -448,7 +448,7 @@ impl ServicesHost {
                 input = false;
                 eligible = super::eligible(&policy, mode, false);
             }
-            CaptureState::Pending | CaptureState::Stopped => return Err(reason::CAPTURE_STOPPED),
+            CaptureState::Pending | CaptureState::Stopped => return Err(capture_stopped(&end)),
         }
         if eligible & caps::CLIP == 0 {
             link = None;
@@ -667,7 +667,7 @@ impl ServicesHost {
                         }
                         Ok(CaptureState::Live { .. }) => {}
                         Ok(CaptureState::Pending | CaptureState::Stopped) | Err(_) => {
-                            break (reason::CAPTURE_STOPPED, true);
+                            break (capture_stopped(&end), true);
                         }
                     }
                 }
@@ -1177,6 +1177,19 @@ fn services_reason(media: Option<u16>) -> u16 {
     match media {
         Some(tornect_proto::reason::ENDED_BY_HOST) => reason::ENDED_BY_HOST,
         _ => reason::SESSION_OVER,
+    }
+}
+
+/// The `Close` (or `Refused`) reason when capture is seen stopped:
+/// `CAPTURE_STOPPED`, unless the session's end is set by then. Its end stops
+/// capture too, and both can change between the moment a poll found no end
+/// and the moment it looks at capture (the loop's `biased` select reads the
+/// end first, but in one poll only); the end it is then.
+pub(super) fn capture_stopped(end: &watch::Receiver<Option<u16>>) -> u16 {
+    if end.borrow().is_some() {
+        end_reason(end)
+    } else {
+        reason::CAPTURE_STOPPED
     }
 }
 
