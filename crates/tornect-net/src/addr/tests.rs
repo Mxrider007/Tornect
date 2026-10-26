@@ -486,6 +486,35 @@ fn on_site_is_on_link_private_or_own_ula48_never_the_class_alone() {
     assert!(!public_lan.on_site(v4("8.8.8.9")));
 }
 
+/// The loopback test machine (`mem::LoopbackNet`, step A12) presents
+/// `127.0.0.0/8` as its LAN: where the environment admits loopback, a
+/// loopback address inside an on-link prefix is on the site, so a loopback
+/// pair is ranked and labelled as a same-site pair. Without the admission,
+/// and outside the on-link prefixes, it never is.
+#[test]
+fn loopback_is_on_site_only_in_a_loopback_test_environment() {
+    let lo = RemoteFilter {
+        on_link: vec![net("127.0.0.0/8")],
+        admit_loopback: true,
+        ..same_site()
+    };
+    assert!(lo.on_site(v4("127.0.0.3")));
+    assert!(lo.on_link_v4("127.0.0.3".parse().unwrap()));
+    assert!(lo.on_site(v6("::ffff:127.0.0.3")));
+    assert!(!lo.on_site(v6("::1")));
+    let elsewhere = RemoteFilter {
+        on_link: vec![net("192.168.77.0/24")],
+        ..lo.clone()
+    };
+    assert!(!elsewhere.on_site(v4("127.0.0.3")));
+    let real = RemoteFilter {
+        admit_loopback: false,
+        ..lo
+    };
+    assert!(!real.on_site(v4("127.0.0.3")));
+    assert!(!real.on_link_v4("127.0.0.3".parse().unwrap()));
+}
+
 /// Design §5.3: global IPv4 with any port but 0 (`:443` and `:3478` both
 /// pass), never a private, own or loopback address (unless the test
 /// environment admits loopback), never IPv6.

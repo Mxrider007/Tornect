@@ -393,10 +393,17 @@ impl RemoteFilter {
     }
 
     /// Whether `ip` is a private IPv4 address inside one of our on-link
-    /// prefixes.
+    /// prefixes. Where the environment admits loopback (test environments
+    /// only), a loopback address inside an on-link prefix counts too: the
+    /// loopback test machine presents `127.0.0.0/8` as its LAN.
     #[must_use]
     pub fn on_link_v4(&self, ip: Ipv4Addr) -> bool {
-        class_v4(ip) == AddrClass::Private
+        let class_ok = match class_v4(ip) {
+            AddrClass::Private => true,
+            AddrClass::Loopback => self.admit_loopback,
+            _ => false,
+        };
+        class_ok
             && self.on_link.iter().any(|net| match net {
                 IpNet::V4(net) => net.contains(&ip),
                 IpNet::V6(_) => false,

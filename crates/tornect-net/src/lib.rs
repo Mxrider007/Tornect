@@ -3,8 +3,8 @@
 //! computer's addresses and the filters every remote address passes, the
 //! session's one UDP socket with its source gates, quinn QUIC with both
 //! device keys pinned, the authenticated punch probes and the checklist
-//! that validates paths with them, then (in the following steps) STUN and
-//! router port mapping.
+//! that validates paths with them, and the direct link that wires them
+//! together; then (in the following steps) STUN and router port mapping.
 //!
 //! Nothing outside this crate may touch sockets or quinn. It never names
 //! `tornect-signal`: the wire forms of candidates are converted in
@@ -20,7 +20,10 @@ use std::pin::Pin;
 pub mod addr;
 pub mod checklist;
 pub mod env;
+pub mod link;
 pub mod local;
+#[cfg(any(test, feature = "test-support"))]
+pub mod mem;
 pub mod probe;
 pub mod quic;
 pub mod socket;
@@ -32,6 +35,10 @@ pub use addr::{
 };
 pub use checklist::{Action, Checklist, PunchRole, PunchStats, Rank};
 pub use env::{NetEnv, RealNet};
+pub use link::{
+    DialFailure, DirectFail, DirectLink, DirectParams, Established, LinkStats, LocalBatch,
+    QuicStream, Route,
+};
 pub use local::{IfaceAddr, IfaceKind, RouteSources};
 pub use probe::{Probe, ProbeDrop, ProbeKey, Txid};
 pub use quic::{

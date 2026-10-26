@@ -30,6 +30,12 @@ hkdf.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 
+[features]
+# The in-memory and loopback test environments (`mem`) for other crates'
+# tests: only dev-dependencies enable it, and `cargo xtask dist` refuses a
+# release graph that carries it (design `direct` §8.8).
+test-support = []
+
 [dev-dependencies]
 proptest.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
