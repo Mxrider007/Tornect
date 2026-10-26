@@ -1082,13 +1082,23 @@ impl UnattendedAuth {
         } else {
             Elevation::None
         };
+        // `want_mode` is clamped host-side toward view-only, never a reject.
+        let wanted = if req.want_mode == mode::VIEW_ONLY {
+            SessionMode::ViewOnly
+        } else {
+            SessionMode::Control
+        };
+        // The most the session can be (it is only ever lowered from here):
+        // the popup and the block window say what control also gives
+        // (services §7.4).
+        let at_most = SessionMode::most_restrictive(grant.mode, wanted);
         // Both raced against the requester leaving (B04): the card or the block
         // window goes at once, and nothing is accepted into a dead stream.
         if grant.ask_before_start {
             let allowed = tokio::select! {
                 biased;
                 gone = ctx.exchange.departed() => return Err(requester_left(&ctx, gone)),
-                allowed = ctx.local_allow.ask_at(&grant.id, label, asked_level, Duration::from_secs(60)) => allowed,
+                allowed = ctx.local_allow.ask_for(&grant.id, label, asked_level, at_most, Duration::from_secs(60)) => allowed,
             };
             if !allowed {
                 return Ok(UnattendedVerdict::Reject(SessionReject::new(
@@ -1097,15 +1107,6 @@ impl UnattendedAuth {
             }
         }
 
-        // `want_mode` is clamped host-side toward view-only, never a reject.
-        let wanted = if req.want_mode == mode::VIEW_ONLY {
-            SessionMode::ViewOnly
-        } else {
-            SessionMode::Control
-        };
-        // The most the session can be (it is only ever lowered from here):
-        // the block window says what control also gives (services §7.4).
-        let at_most = SessionMode::most_restrictive(grant.mode, wanted);
         let outcome = tokio::select! {
             biased;
             gone = ctx.exchange.departed() => return Err(requester_left(&ctx, gone)),

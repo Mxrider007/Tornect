@@ -7024,6 +7024,109 @@ async fn the_block_window_is_told_the_most_the_session_can_be() {
     );
 }
 
+/// The services design §7.4 (decision M1-76 (cw)): "Ask before starting" is told the
+/// most the session can be, the grant's mode lowered by the request, as the block
+/// window is, so that it says what control also gives only where control may follow;
+/// with `block_window_s = 0` it is the only surface at session time. A popup that does
+/// not take the mode is asked as before (`ask_for`'s default).
+#[tokio::test]
+async fn the_ask_is_told_the_most_the_session_can_be() {
+    use tornect_core::levels::Elevation;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    /// Keeps the mode each popup was told (`None` through `ask_at` alone), and
+    /// allows.
+    #[derive(Default)]
+    struct ModeAllow(Mutex<Vec<Option<SessionMode>>>);
+    impl crate::consent::LocalAllow for ModeAllow {
+        fn ask_at<'a>(
+            &'a self,
+            _: &'a crate::consent::GrantId,
+            _: &'a str,
+            _: Elevation,
+            _: Duration,
+        ) -> BoxFuture<'a, bool> {
+            self.0.lock().unwrap().push(None);
+            Box::pin(async { true })
+        }
+
+        fn ask_for<'a>(
+            &'a self,
+            _: &'a crate::consent::GrantId,
+            _: &'a str,
+            _: Elevation,
+            mode: SessionMode,
+            _: Duration,
+        ) -> BoxFuture<'a, bool> {
+            self.0.lock().unwrap().push(Some(mode));
+            Box::pin(async { true })
+        }
+    }
+    for (grant, want, told) in [
+        (
+            SessionMode::Control,
+            messages::mode::CONTROL,
+            SessionMode::Control,
+        ),
+        (
+            SessionMode::Control,
+            messages::mode::VIEW_ONLY,
+            SessionMode::ViewOnly,
+        ),
+        (
+            SessionMode::ViewOnly,
+            messages::mode::CONTROL,
+            SessionMode::ViewOnly,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut host, client, _guard) = unattended_pair_edited(
+            tmp.path(),
+            PW,
+            Arc::new(tornect_core::levels::FixedFacts::linux()),
+            |g| {
+                g.mode = grant;
+                g.ask_before_start = true;
+                g.block_window_s = 0;
+            },
+        );
+        let allow = Arc::new(ModeAllow::default());
+        host.deps.local_allow = allow.clone();
+        let (mode, _, _) = signed(&host, &client, unattended_intent(PW, want, false)).await;
+        let served = if told == SessionMode::Control {
+            messages::mode::CONTROL
+        } else {
+            messages::mode::VIEW_ONLY
+        };
+        assert_eq!(mode, served, "{grant:?} {want}");
+        assert_eq!(
+            *allow.0.lock().unwrap(),
+            vec![Some(told)],
+            "{grant:?} {want}"
+        );
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, _guard) = unattended_pair_edited(
+        tmp.path(),
+        PW,
+        Arc::new(tornect_core::levels::FixedFacts::linux()),
+        |g| g.ask_before_start = true,
+    );
+    let allow = Arc::new(CountingAllow::default());
+    host.deps.local_allow = allow.clone();
+    let (mode, _, _) = signed(
+        &host,
+        &client,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await;
+    assert_eq!(mode, messages::mode::CONTROL);
+    assert_eq!(
+        allow.0.load(Ordering::SeqCst),
+        1,
+        "ask_at, through the default"
+    );
+}
+
 /// An "Ask before starting" popup that counts how often it was asked, and allows.
 #[derive(Default)]
 struct CountingAllow(std::sync::atomic::AtomicUsize);

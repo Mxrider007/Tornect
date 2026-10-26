@@ -88,6 +88,24 @@ pub trait LocalAllow: Send + Sync {
     ) -> BoxFuture<'a, bool> {
         self.ask_at(who, label, Elevation::None, timeout)
     }
+
+    /// [`Self::ask_at`] for a session of at most `mode`: the grant's mode,
+    /// lowered by the request (the session can only be lowered further),
+    /// which a popup that says what control also gives needs (the services
+    /// design §7.4; with no block window after it, the popup is the only
+    /// surface at session time). The state machine calls this one; by
+    /// default the mode goes unsaid.
+    fn ask_for<'a>(
+        &'a self,
+        who: &'a GrantId,
+        label: &'a str,
+        level: Elevation,
+        mode: SessionMode,
+        timeout: Duration,
+    ) -> BoxFuture<'a, bool> {
+        let _ = mode;
+        self.ask_at(who, label, level, timeout)
+    }
 }
 
 /// Headless M1 default: a timer, nobody can click Block.
