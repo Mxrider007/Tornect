@@ -103,7 +103,9 @@ impl fmt::Debug for Untrusted {
 pub struct HostPath(PathBuf);
 
 impl HostPath {
-    pub(crate) fn new(path: PathBuf) -> Self {
+    /// `path`, a path of this computer.
+    #[must_use]
+    pub fn new(path: PathBuf) -> Self {
         Self(path)
     }
 

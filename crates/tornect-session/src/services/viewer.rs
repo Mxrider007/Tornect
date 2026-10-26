@@ -182,7 +182,7 @@ pub enum ServicesBindError {
 }
 
 /// What the viewer's user asks of the services stream.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewerOp {
     /// Write to the host's user.
     Chat(ChatText),
