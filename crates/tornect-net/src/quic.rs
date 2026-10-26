@@ -15,10 +15,13 @@
 //!   authentication is mandatory, TLS 1.2 is refused.
 //! - **Who accepts.** The controlled side [`accept`]s only a connection
 //!   attempt whose source a probe round trip validated and the remote filter
-//!   admits, keeps accepting until one passes [`check_peer`], and only then
-//!   turns its server configuration off: an off-path spoofer racing an
-//!   Initial from the validated address cannot lock the real dialler out.
-//!   The controlling side [`dial`]s once.
+//!   admits, and starts a handshake only for an attempt that also proved,
+//!   through a QUIC Retry, that it receives at that source; it keeps
+//!   accepting until one passes [`check_peer`], and only then turns its
+//!   server configuration off. An off-path spoofer forging the validated
+//!   address never sees the Retry, so its Initials, sent before, during or
+//!   after the real dialler's, take no handshake slot and cannot lock the
+//!   real dialler out. The controlling side [`dial`]s once.
 //! - **Binding.** [`exporter`] derives the keying material the media `Bind`
 //!   and `BindProof` MACs cover (design §6.6), so a connection is bound to
 //!   the Tor-borne session token.
@@ -38,7 +41,6 @@
 //! writes addresses; both targets are in `QUIET_TARGETS` (decision M1-83).
 //! No `Debug` here prints a key or an address, and no error carries one.
 
-use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -116,8 +118,8 @@ pub const MAX_INCOMING: usize = 4;
 /// The bytes quinn buffers for one connection attempt not yet accepted.
 pub const INCOMING_BUFFER: u64 = 64 << 10;
 
-/// How many accepted handshakes [`accept`] runs at once; a further one
-/// replaces the oldest.
+/// How many handshakes [`accept`] runs at once. A further attempt is
+/// ignored while they run; none is ever dropped for a newer one.
 pub const MAX_PENDING_HANDSHAKES: usize = 4;
 
 /// The bidirectional streams a viewer may open to the host: the media
@@ -654,15 +656,29 @@ pub async fn dial(
     Ok(conn)
 }
 
-/// The controlled side's accept (design §6.5): a connection attempt is
-/// taken only if its source is `validated` (a probe round trip) and passes
-/// `filter`; anything else is ignored, which sends nothing. Handshakes run
-/// concurrently (at most [`MAX_PENDING_HANDSHAKES`]; a further one
-/// replaces the oldest) until one passes [`check_peer`]; only then is the
-/// endpoint's server configuration turned off and every other handshake
-/// dropped. So an off-path spoofer that races an Initial from the validated
-/// address cannot lock out the real dialler: its handshake never completes,
-/// because the replies go to the real peer.
+/// The controlled side's accept (design §6.5). A connection attempt is
+/// taken in three gates:
+///
+/// 1. its source is `validated` (a probe round trip) and passes `filter`;
+///    anything else is ignored, which sends nothing;
+/// 2. it proved it receives at that source: an attempt without a Retry
+///    token is answered with a QUIC Retry (RFC 9000 §8.1.2; a datagram
+///    smaller than the Initial that drew it, to the validated source only),
+///    and only the dialler's next Initial, which carries the token, goes on;
+/// 3. fewer than [`MAX_PENDING_HANDSHAKES`] handshakes are running;
+///    otherwise it is ignored, and the dialler's retransmission tries again.
+///
+/// Handshakes run concurrently until one passes [`check_peer`]; only then
+/// is the endpoint's server configuration turned off and every other
+/// handshake dropped. A handshake that fails or stalls leaves its slot at
+/// the latest after the idle timeout; none is replaced by a newer attempt.
+///
+/// So an off-path spoofer that forges Initials from the validated address
+/// cannot lock out the real dialler, whether it sends them before, during
+/// or after the real handshake: the Retry and every reply go to the real
+/// peer, so a spoofed attempt never gets past gate 2 and never takes a
+/// slot. Only a sender that receives at a validated address (the peer, or
+/// an on-path attacker, who can block the path anyway) can fill the slots.
 ///
 /// Cancel safe: dropping the future drops the handshakes in progress and
 /// loses no connection attempt quinn still holds.
@@ -676,7 +692,7 @@ pub async fn accept(
     peer_pk: &[u8; 32],
     filter: &RemoteFilter,
 ) -> Result<quinn::Connection, QuicError> {
-    let mut pending: VecDeque<Pin<Box<quinn::Connecting>>> = VecDeque::new();
+    let mut pending: Vec<Pin<Box<quinn::Connecting>>> = Vec::new();
     loop {
         tokio::select! {
             incoming = endpoint.accept() => {
@@ -688,11 +704,20 @@ pub async fn accept(
                     incoming.ignore();
                     continue;
                 }
-                if let Ok(connecting) = incoming.accept() {
-                    if pending.len() >= MAX_PENDING_HANDSHAKES {
-                        pending.pop_front();
+                if !incoming.remote_address_validated() {
+                    // quinn guarantees `may_retry()` for an attempt that is
+                    // not validated; were the Retry refused, it is ignored.
+                    if let Err(refused) = incoming.retry() {
+                        refused.into_incoming().ignore();
                     }
-                    pending.push_back(Box::pin(connecting));
+                    continue;
+                }
+                if pending.len() >= MAX_PENDING_HANDSHAKES {
+                    incoming.ignore();
+                    continue;
+                }
+                if let Ok(connecting) = incoming.accept() {
+                    pending.push(Box::pin(connecting));
                 }
             }
             done = first_handshake(&mut pending), if !pending.is_empty() => {
@@ -709,7 +734,7 @@ pub async fn accept(
 
 /// The first of `pending` to finish, removed from it.
 async fn first_handshake(
-    pending: &mut VecDeque<Pin<Box<quinn::Connecting>>>,
+    pending: &mut Vec<Pin<Box<quinn::Connecting>>>,
 ) -> Result<quinn::Connection, ConnectionError> {
     std::future::poll_fn(|cx| {
         for i in 0..pending.len() {

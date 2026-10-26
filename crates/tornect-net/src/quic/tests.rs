@@ -116,20 +116,35 @@ impl Hub {
         if let Some(target) = target
             && !target.deaf.load(Ordering::SeqCst)
         {
-            target
-                .inbox
-                .lock()
-                .expect("the inbox")
-                .push_back((from, bytes));
-            if let Some(waker) = target.waker.lock().expect("the waker").take() {
-                waker.wake();
-            }
+            target.arrive(from, bytes);
         }
     }
 
     fn wire(&self) -> Vec<Datagram> {
         self.wire.lock().expect("the wire").clone()
     }
+}
+
+/// Whether a datagram is a QUIC Retry packet (RFC 9000 §17.2.5: a long
+/// header of type 3; the type bits are never header-protected).
+fn is_retry(bytes: &[u8]) -> bool {
+    bytes.first().is_some_and(|b| b & 0xb0 == 0xb0)
+}
+
+/// What a [`Mem`] holds back (in flight, delayed) until [`Mem::release`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// Nothing.
+    Nothing,
+    /// Every arriving datagram but a Retry: the peer's replies are in
+    /// flight.
+    Arriving,
+    /// Nothing until a datagram other than a Retry arrives (the server's
+    /// first flight), then every datagram this socket sends: its answer
+    /// (the client's `Finished`) is in flight.
+    SentOnceAnswered,
+    /// Every datagram this socket sends.
+    Sent,
 }
 
 /// An in-memory session socket (one segment per datagram). A dual-stack
@@ -142,6 +157,9 @@ struct Mem {
     dual_stack: bool,
     spoof: Mutex<Option<SocketAddr>>,
     deaf: AtomicBool,
+    hold: Mutex<Hold>,
+    held_in: Mutex<Vec<(SocketAddr, Vec<u8>)>>,
+    held_out: Mutex<Vec<Datagram>>,
     inbox: Mutex<VecDeque<(SocketAddr, Vec<u8>)>>,
     waker: Mutex<Option<Waker>>,
     refused: AtomicUsize,
@@ -155,6 +173,9 @@ impl Mem {
             dual_stack,
             spoof: Mutex::new(None),
             deaf: AtomicBool::new(false),
+            hold: Mutex::new(Hold::Nothing),
+            held_in: Mutex::default(),
+            held_out: Mutex::default(),
             inbox: Mutex::default(),
             waker: Mutex::default(),
             refused: AtomicUsize::new(0),
@@ -172,6 +193,56 @@ impl Mem {
             dual_stack: self.dual_stack,
             errors: Arc::default(),
         }
+    }
+
+    fn hold(&self, hold: Hold) {
+        *self.hold.lock().expect("the hold") = hold;
+    }
+
+    /// A datagram from the wire, unless it is held back.
+    fn arrive(&self, from: SocketAddr, bytes: Vec<u8>) {
+        {
+            let mut hold = self.hold.lock().expect("the hold");
+            if !is_retry(&bytes) {
+                match *hold {
+                    Hold::Arriving => {
+                        self.held_in.lock().expect("held").push((from, bytes));
+                        return;
+                    }
+                    Hold::SentOnceAnswered => *hold = Hold::Sent,
+                    Hold::Nothing | Hold::Sent => {}
+                }
+            }
+        }
+        self.inbox
+            .lock()
+            .expect("the inbox")
+            .push_back((from, bytes));
+        if let Some(waker) = self.waker.lock().expect("the waker").take() {
+            waker.wake();
+        }
+    }
+
+    /// Ends the hold: what arrived is received and what was sent leaves, in
+    /// their order.
+    fn release(&self) {
+        self.hold(Hold::Nothing);
+        let arrived = std::mem::take(&mut *self.held_in.lock().expect("held"));
+        for (from, bytes) in arrived {
+            self.arrive(from, bytes);
+        }
+        let sent = std::mem::take(&mut *self.held_out.lock().expect("held"));
+        for datagram in sent {
+            self.hub.deliver(datagram.from, datagram.to, datagram.bytes);
+        }
+    }
+
+    /// How many datagrams are held back, (arrived, sent).
+    fn held(&self) -> (usize, usize) {
+        (
+            self.held_in.lock().expect("held").len(),
+            self.held_out.lock().expect("held").len(),
+        )
     }
 }
 
@@ -206,8 +277,17 @@ impl AsyncUdpSocket for Mem {
             .segment_size
             .unwrap_or(transmit.contents.len())
             .max(1);
+        let held = *self.hold.lock().expect("the hold") == Hold::Sent;
         for segment in transmit.contents.chunks(size) {
-            self.hub.deliver(from, to, segment.to_vec());
+            if held {
+                self.held_out.lock().expect("held").push(Datagram {
+                    from,
+                    to,
+                    bytes: segment.to_vec(),
+                });
+            } else {
+                self.hub.deliver(from, to, segment.to_vec());
+            }
         }
         Ok(())
     }
@@ -1106,11 +1186,13 @@ async fn no_ticket_is_issued_so_no_dial_resumes_or_sends_early_data() {
 }
 
 /// An off-path spoofer racing Initials from the viewer's validated address
-/// cannot lock the viewer out (design §6.5): the host keeps accepting
-/// until a handshake passes `check_peer`; the spoofed handshakes never
-/// complete, since the host's replies go to the address the spoofer
-/// forged; once the viewer's connection passes, the server configuration
-/// is off and a further Initial starts nothing.
+/// before the viewer dials cannot lock the viewer out (design §6.5): the
+/// host answers each with a Retry only, to the address the spoofer forged,
+/// so no spoofed attempt starts a handshake or takes a slot; the host
+/// keeps accepting until a handshake passes `check_peer`; once the
+/// viewer's connection passes, the server configuration is off and a
+/// further Initial starts nothing. (Spoofs during and after the viewer's
+/// handshake: the two tests that follow.)
 #[tokio::test(start_paused = true)]
 async fn a_spoofed_initial_cannot_lock_the_viewer_out() {
     let hub = Hub::new();
@@ -1136,6 +1218,13 @@ async fn a_spoofed_initial_cannot_lock_the_viewer_out() {
     assert!(
         sent(&hub, host.addr, viewer.addr) > 0,
         "the host answered the spoofed Initials, to the forged address"
+    );
+    // quinn itself ignores the Initials of a burst beyond `MAX_INCOMING`.
+    let (retries, flights) = retries_and_others(&hub, host.addr, viewer.addr);
+    assert_eq!(retries.len(), MAX_INCOMING);
+    assert_eq!(
+        flights, 0,
+        "the host answered with Retries only and started no handshake"
     );
 
     let client = viewer.client();
@@ -1167,6 +1256,278 @@ async fn a_spoofed_initial_cannot_lock_the_viewer_out() {
         );
     }
     assert_eq!(sent(&hub, host.addr, spoofer.addr), 0);
+}
+
+/// The Retry datagrams `from` sent to `to` (their sizes), and how many
+/// other datagrams it sent there.
+fn retries_and_others(hub: &Hub, from: SocketAddr, to: SocketAddr) -> (Vec<usize>, usize) {
+    let mut retries = Vec::new();
+    let mut others = 0;
+    for datagram in hub.wire().iter().filter(|d| d.from == from && d.to == to) {
+        if is_retry(&datagram.bytes) {
+            retries.push(datagram.bytes.len());
+        } else {
+            others += 1;
+        }
+    }
+    (retries, others)
+}
+
+/// An off-path spoofer at `at` whose datagrams claim to come from `forged`,
+/// with the endpoint it dials the host from (its own stranger key).
+fn spoofer(hub: &Arc<Hub>, at: &str, forged: SocketAddr, host: &Side) -> (Side, quinn::Endpoint) {
+    let spoofer = Side::new(hub, at, false, STRANGER);
+    spoofer.validate(host);
+    *spoofer.mem.spoof.lock().expect("the spoof") = Some(forged);
+    let endpoint = spoofer.client();
+    (spoofer, endpoint)
+}
+
+/// A dial from `side`'s `endpoint` to the host, with `side`'s own key: its
+/// Initial and their retransmissions.
+fn attempt(side: &Side, endpoint: &quinn::Endpoint, host: &Side) -> quinn::Connecting {
+    let config = side
+        .quic
+        .client_config(&pk(host.seed), TornectRole::Viewer)
+        .expect("a client config");
+    endpoint
+        .connect_with(config, host.addr, SERVER_NAME)
+        .expect("a spoofed dial")
+}
+
+/// `n` dials from the spoofer, a millisecond apart, so that each Initial
+/// reaches [`accept`] (quinn ignores the Initials of one burst beyond
+/// [`MAX_INCOMING`]).
+async fn spoof_each(
+    n: usize,
+    spoofer: &Side,
+    endpoint: &quinn::Endpoint,
+    host: &Side,
+) -> Vec<quinn::Connecting> {
+    let mut attempts = Vec::new();
+    for _ in 0..n {
+        attempts.push(attempt(spoofer, endpoint, host));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    attempts
+}
+
+/// Twice the handshake cap of spoofed Initials, from the viewer's
+/// validated address, while the viewer's own handshake is in flight (the
+/// host's replies to it not yet arrived), cannot evict it (design §6.5,
+/// critique S8(b)): each spoofed Initial draws only a Retry, smaller than
+/// the Initial and sent to the forged address, so none takes a handshake
+/// slot; the viewer's handshake then completes and is the one accepted.
+#[tokio::test(start_paused = true)]
+async fn spoofed_initials_during_the_viewers_handshake_cannot_evict_it() {
+    let hub = Hub::new();
+    let (host, viewer) = fresh(&hub, 50410, (false, false));
+    let (spoofer, spoofing) = spoofer(&hub, "192.168.1.66:50476", viewer.addr, &host);
+    let server = host.server(&viewer, TornectRole::Host);
+    let accepting = host.accept_task(&server, &viewer);
+
+    viewer.mem.hold(Hold::Arriving);
+    let client = viewer.client();
+    let dial = viewer.dial(&client, &host, TornectRole::Viewer);
+    tokio::pin!(dial);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut dial)
+            .await
+            .is_err(),
+        "the dial completed while the host's replies were in flight"
+    );
+    let (retries, flight) = retries_and_others(&hub, host.addr, viewer.addr);
+    assert_eq!(retries.len(), 1, "the viewer's first Initial drew a Retry");
+    assert!(flight > 0, "the host started the viewer's handshake");
+    assert!(viewer.mem.held().0 > 0);
+
+    let attempts = spoof_each(2 * MAX_PENDING_HANDSHAKES, &spoofer, &spoofing, &host).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (retries, _) = retries_and_others(&hub, host.addr, viewer.addr);
+    assert_eq!(
+        retries.len(),
+        1 + 2 * MAX_PENDING_HANDSHAKES,
+        "each spoofed Initial drew a Retry, to the forged address"
+    );
+    let smallest_initial = hub
+        .wire()
+        .iter()
+        .filter(|d| d.from == viewer.addr && d.to == host.addr)
+        .map(|d| d.bytes.len())
+        .min()
+        .expect("Initials");
+    assert!(smallest_initial >= 1200);
+    assert!(
+        retries.iter().all(|&len| len < smallest_initial),
+        "a Retry is smaller than the Initial that drew it: {retries:?}"
+    );
+
+    viewer.mem.release();
+    let conn = within(5, &mut dial).await.expect("the viewer's dial");
+    let accepted = within(5, accepting)
+        .await
+        .expect("the accept task")
+        .expect("the viewer's connection");
+    assert_eq!(accepted.remote_address(), viewer.addr);
+    assert_eq!(check_peer(&accepted, &pk(VIEWER), &host.filter()), Ok(()));
+    assert_eq!(
+        *exporter(&accepted, &TOKEN).expect("keying material"),
+        *exporter(&conn, &TOKEN).expect("keying material")
+    );
+    for attempt in attempts {
+        assert!(
+            within(30, attempt).await.is_err(),
+            "a spoofed handshake completed"
+        );
+    }
+    assert_eq!(sent(&hub, host.addr, spoofer.addr), 0);
+}
+
+/// Spoofed Initials after the viewer completed its side of the handshake
+/// (TLS 1.3 lets the client finish first) and while its `Finished` is still
+/// on its way to the host cannot close the viewer's connection: a viewer
+/// that had already written its `Bind` would otherwise end the session
+/// instead of falling back (decision M1-79). The viewer's connection
+/// survives, is the one accepted, and carries the media stream.
+#[tokio::test(start_paused = true)]
+async fn spoofed_initials_after_the_viewer_finished_cannot_close_it() {
+    let hub = Hub::new();
+    let (host, viewer) = fresh(&hub, 50420, (false, false));
+    let (spoofer, spoofing) = spoofer(&hub, "192.168.1.66:50486", viewer.addr, &host);
+    let server = host.server(&viewer, TornectRole::Host);
+    let mut accepting = host.accept_task(&server, &viewer);
+
+    viewer.mem.hold(Hold::SentOnceAnswered);
+    let client = viewer.client();
+    let conn = within(5, viewer.dial(&client, &host, TornectRole::Viewer))
+        .await
+        .expect("the viewer's side completes first");
+    assert!(
+        viewer.mem.held().1 > 0,
+        "the viewer's Finished is in flight"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut accepting)
+            .await
+            .is_err(),
+        "the host completed without the viewer's Finished"
+    );
+
+    let attempts = spoof_each(2 * MAX_PENDING_HANDSHAKES, &spoofer, &spoofing, &host).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        retries_and_others(&hub, host.addr, viewer.addr).0.len(),
+        1 + 2 * MAX_PENDING_HANDSHAKES,
+        "each spoofed Initial drew a Retry"
+    );
+    assert_eq!(
+        conn.close_reason(),
+        None,
+        "a spoofed Initial closed the viewer's connection"
+    );
+
+    viewer.mem.release();
+    let accepted = within(5, accepting)
+        .await
+        .expect("the accept task")
+        .expect("the viewer's connection");
+    assert_eq!(accepted.remote_address(), viewer.addr);
+    assert_eq!(
+        *exporter(&accepted, &TOKEN).expect("keying material"),
+        *exporter(&conn, &TOKEN).expect("keying material")
+    );
+    let (mut send, _recv) = conn.open_bi().await.expect("the media stream");
+    send.write_all(b"bind").await.expect("a write");
+    let (_host_send, mut host_recv) = within(5, accepted.accept_bi())
+        .await
+        .expect("the media stream");
+    let mut got = [0; 4];
+    within(5, host_recv.read_exact(&mut got))
+        .await
+        .expect("the bytes");
+    assert_eq!(&got, b"bind");
+    assert_eq!(conn.close_reason(), None);
+    for attempt in attempts {
+        assert!(
+            within(30, attempt).await.is_err(),
+            "a spoofed handshake completed"
+        );
+    }
+    assert_eq!(sent(&hub, host.addr, spoofer.addr), 0);
+}
+
+/// At most [`MAX_PENDING_HANDSHAKES`] handshakes run at once, and none is
+/// dropped for a newer attempt (design §6.5): with the viewer's handshake
+/// and three more from validated addresses stalled (the host's replies in
+/// flight), two further diallers at validated addresses get their Retry
+/// and then no handshake at all; the viewer's handshake, the oldest, then
+/// completes and is the one accepted.
+#[tokio::test(start_paused = true)]
+async fn the_handshake_cap_ignores_further_attempts_and_evicts_none() {
+    let hub = Hub::new();
+    let (host, viewer) = fresh(&hub, 50430, (false, false));
+    let server = host.server(&viewer, TornectRole::Host);
+    let accepting = host.accept_task(&server, &viewer);
+
+    viewer.mem.hold(Hold::Arriving);
+    let client = viewer.client();
+    let dial = viewer.dial(&client, &host, TornectRole::Viewer);
+    tokio::pin!(dial);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut dial)
+            .await
+            .is_err()
+    );
+
+    let others: Vec<Side> = (0..MAX_PENDING_HANDSHAKES + 1)
+        .map(|i| {
+            let other = Side::new(
+                &hub,
+                &format!("192.168.1.{}:50440", 40 + i),
+                false,
+                STRANGER,
+            );
+            host.validate(&other);
+            other.validate(&host);
+            other.mem.hold(Hold::Arriving);
+            other
+        })
+        .collect();
+    let mut attempts = Vec::new();
+    for other in &others {
+        let endpoint = other.client();
+        attempts.push((attempt(other, &endpoint, &host), endpoint));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (stalled, beyond) = others.split_at(MAX_PENDING_HANDSHAKES - 1);
+    for other in stalled {
+        let (retries, flight) = retries_and_others(&hub, host.addr, other.addr);
+        assert_eq!(retries.len(), 1);
+        assert!(flight > 0, "a handshake within the cap did not start");
+    }
+    for other in beyond {
+        let (retries, flight) = retries_and_others(&hub, host.addr, other.addr);
+        assert_eq!(retries.len(), 1, "the dialler proved its address");
+        assert_eq!(flight, 0, "a handshake beyond the cap started");
+        assert!(
+            sent(&hub, other.addr, host.addr) >= 2,
+            "the Initial with the Retry token reached the host"
+        );
+    }
+
+    viewer.mem.release();
+    let conn = within(5, &mut dial).await.expect("the viewer's dial");
+    let accepted = within(5, accepting)
+        .await
+        .expect("the accept task")
+        .expect("the viewer's connection");
+    assert_eq!(accepted.remote_address(), viewer.addr);
+    assert_eq!(
+        *exporter(&accepted, &TOKEN).expect("keying material"),
+        *exporter(&conn, &TOKEN).expect("keying material")
+    );
+    drop(attempts);
 }
 
 /// The controlled side takes a connection attempt only from a source a
