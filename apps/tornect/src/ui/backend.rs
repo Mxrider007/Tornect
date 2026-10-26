@@ -4239,9 +4239,10 @@ async fn viewed(
         Ok(false) => {}
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "the visit was not recorded"),
     }
-    // Tor is the transport in the slice; saying so stops the host's orphan timer.
+    // Tor is the transport in the slice; saying so stops the host's orphan
+    // timer. `TOR_FALLBACK{}`, M1's bytes, until step A19 of design `direct`.
     session
-        .send_tor_fallback()
+        .send_tor_fallback(None)
         .await
         .map_err(explain_handshake)?;
     let input = control.then(|| {
@@ -6695,7 +6696,7 @@ mod tests {
         let Ok(ClientOutcome::Session(mut session)) = outcome else {
             panic!("no session: {outcome:?}");
         };
-        session.send_tor_fallback().await.unwrap();
+        session.send_tor_fallback(None).await.unwrap();
 
         // Live: the indicator opens and shows the session.
         let sharing = shared.read(|m| m.sharing.clone());

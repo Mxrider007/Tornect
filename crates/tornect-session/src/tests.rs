@@ -6976,7 +6976,7 @@ async fn an_accepted_session_streams_until_the_panic_key() {
     else {
         panic!("no session");
     };
-    session.send_tor_fallback().await.unwrap();
+    session.send_tor_fallback(None).await.unwrap();
 
     let binding = Binding::new(session.session_token(), &session.th());
     let (media, served) = connect(&rig.host);
@@ -7077,7 +7077,7 @@ async fn the_viewer_of_a_control_session_with_no_injector_hears_it_at_its_next_p
     else {
         panic!("no session");
     };
-    session.send_tor_fallback().await.unwrap();
+    session.send_tor_fallback(None).await.unwrap();
     let notices = session.notices();
     session.ping().await.unwrap();
     assert_eq!(*notices.borrow(), Some(0), "before the media stream");

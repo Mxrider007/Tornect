@@ -2090,9 +2090,9 @@ where
                 deps.candidates.on_candidates_done();
             }
             Kind::TorFallback => {
-                let _: messages::TorFallback = checked_body(&rx)?;
+                let fallback: messages::TorFallback = checked_body(&rx)?;
                 have_path = true;
-                deps.candidates.on_tor_fallback();
+                deps.candidates.on_tor_fallback(fallback.reason);
             }
             Kind::Bye => {
                 let reason = decode_reason::<Bye>(&rx, |b| b.reason);

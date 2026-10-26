@@ -38,10 +38,13 @@ pub const MAX_DETAIL_CHARS: usize = 120;
 pub const MAX_CODECS: usize = 8;
 /// Longest codec name, in characters.
 pub const MAX_CODEC_CHARS: usize = 16;
-/// Most entries in the M2 placeholder [`Candidates::candidates`].
-pub const MAX_CANDIDATES: usize = 32;
-/// Longest placeholder candidate string, in characters.
-pub const MAX_CANDIDATE_CHARS: usize = 64;
+/// Most entries in one `CANDIDATES` frame ([`Candidates::candidates`],
+/// design `direct` §6.1).
+pub const MAX_CANDIDATES_PER_FRAME: usize = 8;
+/// Most remote candidates a receiver keeps across one session's
+/// `CANDIDATES` frames. The receiver enforces it (`tornect-net`'s
+/// checklist); a frame never carries more than [`MAX_CANDIDATES_PER_FRAME`].
+pub const MAX_REMOTE_CANDIDATES: usize = 16;
 /// Length of an Ed25519 `SubjectPublicKeyInfo` DER (RFC 8410).
 pub const SPKI_LEN: usize = 44;
 
@@ -67,6 +70,15 @@ pub mod feats {
     /// advertises it and refuses the stream, so the token does not tell one
     /// kind of host from another before pairing.
     pub const SVC1: &str = "svc1";
+    /// Either side (`HELLO.feats`, `HELLO_ACK.feats`): this build takes part
+    /// in the direct-path exchange after `SESSION_ACCEPT` (`CANDIDATES`,
+    /// `CANDIDATES_DONE`, `TOR_FALLBACK` with a reason; design `direct` §6.1,
+    /// decision M1-80). A viewer sends `CANDIDATES` only to a host whose
+    /// signed `HELLO_ACK` carries it
+    /// ([`crate::fsm::client::ClientSession::host_has`]); to any other host
+    /// it sends `TOR_FALLBACK{}` and reveals nothing. A stranger learns from
+    /// it only that the build supports direct connections.
+    pub const DIR1: &str = "dir1";
 }
 
 /// Session modes on the wire (`SESSION_ACCEPT.mode`, `want_mode`).
@@ -129,6 +141,81 @@ pub mod transport {
     pub const TOR_ONLY: u8 = 1;
     /// LAN only.
     pub const LAN_ONLY: u8 = 2;
+}
+
+/// `CANDIDATES` entry kinds ([`Candidate::kind`], design `direct` §6.1).
+/// Values are `u32` on the wire; a receiver drops a candidate whose kind it
+/// does not know rather than refusing the frame.
+pub mod candidate_kind {
+    /// An address of one of the sender's own interfaces.
+    pub const HOST: u32 = 0;
+    /// Server-reflexive: the sender's public address as a STUN server saw it.
+    pub const SRFLX: u32 = 1;
+    /// Mapped: a port the sender's router opened for it (PCP, NAT-PMP, UPnP).
+    pub const MAPPED: u32 = 2;
+
+    /// The kind's name in logs and summaries; `"unknown"` for any other value.
+    #[must_use]
+    pub const fn name(kind: u32) -> &'static str {
+        match kind {
+            HOST => "host",
+            SRFLX => "srflx",
+            MAPPED => "mapped",
+            _ => "unknown",
+        }
+    }
+}
+
+/// `CANDIDATES.scope` ([`Candidates::scope`], design `direct` §4, §6.1).
+/// Absent on the wire reads as [`scope::SAME_SITE`], and so does any value this
+/// build does not know: the conservative scope.
+pub mod scope {
+    /// Same-site addresses only: inside the sender's on-link private IPv4
+    /// prefixes or its unique-local IPv6 /48.
+    pub const SAME_SITE: u32 = 0;
+    /// Internet addresses too: public IPv4, global IPv6, server-reflexive and
+    /// mapped.
+    pub const INTERNET: u32 = 1;
+}
+
+/// `TOR_FALLBACK.reason` codes ([`TorFallback::reason`], design `direct`
+/// §6.1). Values are `u32` on the wire; an unknown one is not an error.
+pub mod fallback {
+    /// The sender's policy, setting, bridge rule or same-device rule forbids
+    /// a direct path.
+    pub const OFF: u32 = 1;
+    /// The sender has no usable address in scope.
+    pub const NO_ADDRESSES: u32 = 2;
+    /// The sender could not bind a UDP socket.
+    pub const SOCKET: u32 = 3;
+    /// Viewer: no address was validated (early fail or deadline).
+    pub const NO_PATH: u32 = 4;
+    /// Viewer: an address validated, then QUIC, the peer check or the TLS
+    /// pin failed.
+    pub const QUIC: u32 = 5;
+    /// Viewer: nothing came from the host in time.
+    pub const PEER_SILENT: u32 = 6;
+    /// Viewer: the host signed `tor_only`, or said [`OFF`].
+    pub const PEER_OFF: u32 = 7;
+    /// Viewer: this session carries no media.
+    pub const NO_MEDIA: u32 = 8;
+
+    /// The reason's name in logs, `sessions.log` and summaries; `"unknown"`
+    /// for any other value.
+    #[must_use]
+    pub const fn name(code: u32) -> &'static str {
+        match code {
+            OFF => "off",
+            NO_ADDRESSES => "no-addresses",
+            SOCKET => "socket",
+            NO_PATH => "no-path",
+            QUIC => "quic",
+            PEER_SILENT => "peer-silent",
+            PEER_OFF => "peer-off",
+            NO_MEDIA => "no-media",
+            _ => "unknown",
+        }
+    }
 }
 
 /// `SESSION_REQUEST.unattended.intent`.
@@ -1225,33 +1312,141 @@ impl Body for AdminResult {
     }
 }
 
-/// `CANDIDATES` — M2 placeholder: opaque candidate strings (`docs/PLAN.md` §B.2).
+/// One address a side offers in `CANDIDATES` (design `direct` §6.1):
+/// `{ 0: kind uint, 1: ip bstr (4 or 16 bytes), 2: port uint (1..=65535) }`.
 ///
-/// M2 defines the real candidate encoding (`tornect-net`); until then this
-/// body only proves the post-accept path and is handed to a callback unparsed.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Encode, Decode)]
+/// [`Body::validate`] of [`Candidates`] checks only the shape (the length of
+/// `ip`, a non-zero `port`, no v4-mapped IPv6); which addresses a receiver
+/// may probe is `tornect-net`'s `RemoteFilter`, never this crate. `Debug`
+/// prints the kind and the address family only: an address is never logged
+/// (decision M1-83).
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct Candidate {
+    /// key 0 — a [`candidate_kind`] code; any `u32` decodes, and a receiver
+    /// drops a candidate whose kind it does not know.
+    #[n(0)]
+    pub kind: u32,
+    /// key 1 — the IP address in network order: 4 bytes (IPv4) or 16
+    /// (IPv6, never `::ffff:0:0/96`).
+    #[n(1)]
+    #[cbor(with = "minicbor::bytes")]
+    pub ip: Vec<u8>,
+    /// key 2 — the UDP port, never 0.
+    #[n(2)]
+    pub port: u16,
+}
+
+impl Candidate {
+    /// The address family the shape claims: `"v4"`, `"v6"` or `"?"` (a
+    /// length [`Body::validate`] refuses).
+    #[must_use]
+    pub fn family(&self) -> &'static str {
+        match self.ip.len() {
+            4 => "v4",
+            16 => "v6",
+            _ => "?",
+        }
+    }
+}
+
+impl core::fmt::Debug for Candidate {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Candidate")
+            .field("kind", &candidate_kind::name(self.kind))
+            .field("family", &self.family())
+            .finish_non_exhaustive()
+    }
+}
+
+/// `CANDIDATES` (either side, after `SESSION_ACCEPT`; design `direct` §6.1):
+/// `{ 0: [1*8 Candidate], ? 1: scope uint }`.
+///
+/// The viewer sends its first; the host binds and reveals nothing before it
+/// (decision M1-80). The first frame of a direction fixes its scope and the
+/// host echoes the scope it applied; enforcing that, and the per-session
+/// frame limits, is the session state's job, not this body's. `Debug` prints
+/// the count, the kinds and the scope only (decision M1-83).
+#[derive(Clone, PartialEq, Eq, Default, Encode, Decode)]
 #[cbor(map)]
 pub struct Candidates {
-    /// key 0 — candidates (≤ [`MAX_CANDIDATES`] × [`MAX_CANDIDATE_CHARS`]).
+    /// key 0 — 1 to [`MAX_CANDIDATES_PER_FRAME`] candidates.
     #[n(0)]
-    pub candidates: Vec<String>,
+    pub candidates: Vec<Candidate>,
+    /// key 1 — a [`scope`] code; absent reads as [`scope::SAME_SITE`], and so
+    /// does any value this build does not know ([`Candidates::internet`]).
+    #[n(1)]
+    pub scope: Option<u32>,
 }
+
+impl Candidates {
+    /// The scope code as the wire has it, absent read as
+    /// [`scope::SAME_SITE`]: what the first frame fixes and a later frame
+    /// must repeat.
+    #[must_use]
+    pub fn scope_code(&self) -> u32 {
+        self.scope.unwrap_or(scope::SAME_SITE)
+    }
+
+    /// Whether the frame asks for the internet scope. Only
+    /// [`scope::INTERNET`] does: an absent or unknown scope is the
+    /// conservative same-site scope.
+    #[must_use]
+    pub fn internet(&self) -> bool {
+        self.scope == Some(scope::INTERNET)
+    }
+}
+
+impl core::fmt::Debug for Candidates {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Candidates")
+            .field("count", &self.candidates.len())
+            .field("candidates", &self.candidates)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+/// The prefix of a v4-mapped IPv6 address (`::ffff:0:0/96`, RFC 4291 §2.5.5.2).
+const V4_MAPPED_PREFIX: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
 
 impl Body for Candidates {
     const KIND: Kind = Kind::Candidates;
 
     fn validate(&self) -> Result<(), BodyError> {
-        check_list(
-            Self::KIND,
-            "candidates",
-            &self.candidates,
-            MAX_CANDIDATES,
-            MAX_CANDIDATE_CHARS,
-        )
+        let inconsistent = |detail| BodyError::Inconsistent {
+            kind: Self::KIND,
+            field: "candidates",
+            detail,
+        };
+        if self.candidates.is_empty() {
+            return Err(inconsistent("no candidate"));
+        }
+        if self.candidates.len() > MAX_CANDIDATES_PER_FRAME {
+            return Err(BodyError::TooLong {
+                kind: Self::KIND,
+                field: "candidates",
+            });
+        }
+        for c in &self.candidates {
+            match c.ip.len() {
+                4 => {}
+                16 if c.ip.starts_with(&V4_MAPPED_PREFIX) => {
+                    return Err(inconsistent("v4-mapped ip (IPv4 is sent as 4 bytes)"));
+                }
+                16 => {}
+                _ => return Err(inconsistent("ip is neither 4 nor 16 bytes")),
+            }
+            if c.port == 0 {
+                return Err(inconsistent("port 0"));
+            }
+        }
+        Ok(())
     }
 }
 
-/// `CANDIDATES_DONE` — M2 placeholder, empty map.
+/// `CANDIDATES_DONE` (either side): this side has sent every candidate it
+/// will send. An empty map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Encode, Decode)]
 #[cbor(map)]
 pub struct CandidatesDone {}
@@ -1260,10 +1455,20 @@ impl Body for CandidatesDone {
     const KIND: Kind = Kind::CandidatesDone;
 }
 
-/// `TOR_FALLBACK` — M2 placeholder, empty map.
+/// `TOR_FALLBACK` (either side; design `direct` §6.1): `{ ? 0: reason uint }`.
+///
+/// The media goes over the onion media stream instead of a direct path.
+/// `TOR_FALLBACK{}` (no reason, the bytes `A0`) is what an M1 viewer sends
+/// right after the accept, and what a viewer sends a host that did not
+/// announce [`feats::DIR1`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Encode, Decode)]
 #[cbor(map)]
-pub struct TorFallback {}
+pub struct TorFallback {
+    /// key 0 — a [`fallback`] code; any `u32` decodes, and an unknown one
+    /// reads as [`fallback::name`]'s `"unknown"`.
+    #[n(0)]
+    pub reason: Option<u32>,
+}
 
 impl Body for TorFallback {
     const KIND: Kind = Kind::TorFallback;
@@ -1581,10 +1786,18 @@ mod tests {
             grant_reach: None,
         });
         roundtrip(&Candidates {
-            candidates: vec!["192.0.2.1:4000".to_owned()],
+            candidates: vec![lan_candidate()],
+            scope: None,
+        });
+        roundtrip(&Candidates {
+            candidates: vec![lan_candidate(), v6_candidate()],
+            scope: Some(scope::INTERNET),
         });
         roundtrip(&CandidatesDone {});
-        roundtrip(&TorFallback {});
+        roundtrip(&TorFallback { reason: None });
+        roundtrip(&TorFallback {
+            reason: Some(fallback::NO_PATH),
+        });
         roundtrip(&Ping { nonce: u64::MAX });
         roundtrip(&Pong { nonce: 0 });
         roundtrip(&Bye {
@@ -1658,9 +1871,15 @@ mod tests {
                     grant_reach: None,
                 }),
             ),
-            (Kind::Candidates, encode_body(&Candidates::default())),
+            (
+                Kind::Candidates,
+                encode_body(&Candidates {
+                    candidates: vec![lan_candidate()],
+                    scope: None,
+                }),
+            ),
             (Kind::CandidatesDone, encode_body(&CandidatesDone {})),
-            (Kind::TorFallback, encode_body(&TorFallback {})),
+            (Kind::TorFallback, encode_body(&TorFallback::default())),
             (Kind::Ping, encode_body(&Ping { nonce: 1 })),
             (Kind::Pong, encode_body(&Pong { nonce: 1 })),
             (
@@ -2083,13 +2302,12 @@ mod tests {
                 decode_body::<Hello>(&encode_body(&feat)).is_err(),
                 "{bad:?}"
             );
-            let c = Candidates {
-                candidates: vec![bad.to_owned()],
-            };
-            assert!(
-                decode_body::<Candidates>(&encode_body(&c)).is_err(),
-                "{bad:?}"
-            );
+            // The placeholder `CANDIDATES` of M1 carried strings; a body of
+            // that shape is refused whatever the text (`{0: [tstr]}`).
+            let mut e = minicbor::Encoder::new(Vec::new());
+            e.map(1).unwrap().u8(0).unwrap().array(1).unwrap();
+            e.str(bad).unwrap();
+            assert!(decode_body::<Candidates>(e.writer()).is_err(), "{bad:?}");
             let e = Error {
                 code: 1,
                 detail: Some(bad.to_owned()),
@@ -2117,7 +2335,7 @@ mod tests {
 
     #[test]
     fn every_feature_token_fits_the_wire_and_survives_the_clamp() {
-        let all = [feats::UA1, feats::UA2, feats::SVC1];
+        let all = [feats::UA1, feats::UA2, feats::SVC1, feats::DIR1];
         for (i, token) in all.iter().enumerate() {
             assert!(!token.is_empty() && token.chars().count() <= MAX_FEAT_CHARS);
             assert!(!all[..i].contains(token), "{token} is listed twice");
@@ -2132,6 +2350,21 @@ mod tests {
             feats: vec![feats::UA1.to_owned(), feats::SVC1.to_owned()],
         };
         assert_eq!(roundtrip(&ack).feats, ["ua1", "svc1"]);
+        // Both sides announce the direct exchange (design `direct` §6.1).
+        let ack = HelloAck {
+            feats: vec![
+                feats::UA1.to_owned(),
+                feats::SVC1.to_owned(),
+                feats::DIR1.to_owned(),
+            ],
+            ..ack
+        };
+        assert_eq!(roundtrip(&ack).feats, ["ua1", "svc1", "dir1"]);
+        let hello = Hello {
+            feats: vec![feats::UA1.to_owned(), feats::DIR1.to_owned()],
+            ..hello()
+        };
+        assert_eq!(roundtrip(&hello).feats, ["ua1", "dir1"]);
     }
 
     #[test]
@@ -2474,5 +2707,536 @@ mod tests {
         );
         let decoded: SessionAccept = decode_body(&encode_body(&none)).unwrap();
         assert_eq!(decoded.elevation(), Elevation::None);
+    }
+
+    /// A host candidate on a private LAN: the §6.1 golden address
+    /// 192.168.1.20:50000.
+    fn lan_candidate() -> Candidate {
+        Candidate {
+            kind: candidate_kind::HOST,
+            ip: vec![192, 168, 1, 20],
+            port: 50_000,
+        }
+    }
+
+    /// A unique-local IPv6 host candidate, `[fd12:3456::1]:50001`.
+    fn v6_candidate() -> Candidate {
+        let mut ip = vec![0u8; 16];
+        ip[..4].copy_from_slice(&[0xfd, 0x12, 0x34, 0x56]);
+        ip[15] = 1;
+        Candidate {
+            kind: candidate_kind::HOST,
+            ip,
+            port: 50_001,
+        }
+    }
+
+    /// Design `direct` §6.1: the golden bytes of the path frames, both ways.
+    #[test]
+    fn direct_bodies_match_the_golden_bytes() {
+        let host = Candidates {
+            candidates: vec![lan_candidate()],
+            scope: None,
+        };
+        let host_bytes = [
+            0xA1, 0x00, 0x81, 0xA3, 0x00, 0x00, 0x01, 0x44, 0xC0, 0xA8, 0x01, 0x14, 0x02, 0x19,
+            0xC3, 0x50,
+        ];
+        assert_eq!(encode_body(&host), host_bytes);
+        assert_eq!(decode_body::<Candidates>(&host_bytes).unwrap(), host);
+
+        let srflx = Candidates {
+            candidates: vec![Candidate {
+                kind: candidate_kind::SRFLX,
+                ip: vec![203, 0, 113, 7],
+                port: 61_000,
+            }],
+            scope: Some(scope::INTERNET),
+        };
+        let srflx_bytes = [
+            0xA2, 0x00, 0x81, 0xA3, 0x00, 0x01, 0x01, 0x44, 0xCB, 0x00, 0x71, 0x07, 0x02, 0x19,
+            0xEE, 0x48, 0x01, 0x01,
+        ];
+        assert_eq!(encode_body(&srflx), srflx_bytes);
+        assert_eq!(decode_body::<Candidates>(&srflx_bytes).unwrap(), srflx);
+
+        let no_path = TorFallback {
+            reason: Some(fallback::NO_PATH),
+        };
+        assert_eq!(encode_body(&no_path), [0xA1, 0x00, 0x04]);
+        assert_eq!(
+            decode_body::<TorFallback>(&[0xA1, 0x00, 0x04]).unwrap(),
+            no_path
+        );
+        // `TOR_FALLBACK{}`: M1's bytes, and what an old host is sent.
+        assert_eq!(encode_body(&TorFallback::default()), [0xA0]);
+        assert_eq!(
+            decode_body::<TorFallback>(&[0xA0]).unwrap(),
+            TorFallback { reason: None }
+        );
+        assert_eq!(encode_body(&CandidatesDone {}), [0xA0]);
+        assert_eq!(
+            decode_body::<CandidatesDone>(&[0xA0]).unwrap(),
+            CandidatesDone {}
+        );
+    }
+
+    /// The `inconsistent` field a `CANDIDATES` body fails with, or `None`
+    /// when it decodes.
+    fn candidates_fault(c: &Candidates) -> Option<BodyError> {
+        decode_body::<Candidates>(&encode_body(c)).err()
+    }
+
+    /// Design `direct` §6.1 `Body::validate`: 1 to 8 entries, a 4- or
+    /// 16-byte ip that is not v4-mapped, a non-zero port. Each failure is a
+    /// body fault (⇒ `E_BAD_LEN`); the address class is not checked here.
+    #[test]
+    fn candidates_refuse_every_bad_shape() {
+        let with = |candidates: Vec<Candidate>| Candidates {
+            candidates,
+            scope: None,
+        };
+        let inconsistent = |detail| {
+            Some(BodyError::Inconsistent {
+                kind: Kind::Candidates,
+                field: "candidates",
+                detail,
+            })
+        };
+        assert_eq!(
+            candidates_fault(&with(vec![])),
+            inconsistent("no candidate")
+        );
+        assert_eq!(
+            candidates_fault(&Candidates::default()),
+            inconsistent("no candidate")
+        );
+        assert_eq!(
+            candidates_fault(&with(vec![lan_candidate(); MAX_CANDIDATES_PER_FRAME + 1])),
+            Some(BodyError::TooLong {
+                kind: Kind::Candidates,
+                field: "candidates"
+            })
+        );
+        assert_eq!(MAX_CANDIDATES_PER_FRAME, 8);
+        assert_eq!(MAX_REMOTE_CANDIDATES, 16);
+        roundtrip(&with(vec![lan_candidate(); MAX_CANDIDATES_PER_FRAME]));
+        for len in [0usize, 1, 3, 5, 6, 15, 17, 32] {
+            let c = Candidate {
+                ip: vec![10; len],
+                ..lan_candidate()
+            };
+            assert_eq!(
+                candidates_fault(&with(vec![c])),
+                inconsistent("ip is neither 4 nor 16 bytes"),
+                "{len}"
+            );
+        }
+        // A bad entry anywhere in the list refuses the frame.
+        let short = Candidate {
+            ip: vec![10, 0, 0, 1, 2],
+            ..lan_candidate()
+        };
+        assert!(candidates_fault(&with(vec![lan_candidate(), v6_candidate(), short])).is_some());
+        let zero = Candidate {
+            port: 0,
+            ..lan_candidate()
+        };
+        assert_eq!(candidates_fault(&with(vec![zero])), inconsistent("port 0"));
+        let mut mapped = vec![0u8; 16];
+        mapped[10..12].copy_from_slice(&[0xff, 0xff]);
+        mapped[12..].copy_from_slice(&[192, 168, 1, 20]);
+        let mapped = Candidate {
+            ip: mapped,
+            ..lan_candidate()
+        };
+        assert_eq!(
+            candidates_fault(&with(vec![mapped])),
+            inconsistent("v4-mapped ip (IPv4 is sent as 4 bytes)")
+        );
+        // Shapes next to the v4-mapped block are not this crate's business
+        // (`::fffe:…` and the IPv4-compatible `::a.b.c.d` reach the filter).
+        for prefix in [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe], [0; 12]] {
+            let mut ip = prefix.to_vec();
+            ip.extend_from_slice(&[192, 168, 1, 20]);
+            roundtrip(&with(vec![Candidate {
+                ip,
+                ..lan_candidate()
+            }]));
+        }
+        // Every entry is checked, and the body fault reaches the FSM as `E_BAD_LEN`.
+        let mut v6_zero = v6_candidate();
+        v6_zero.port = 0;
+        assert!(candidates_fault(&with(vec![v6_candidate(), v6_zero])).is_some());
+    }
+
+    /// Hand-encoded `CANDIDATES` bodies the derive would never write: the
+    /// wrong CBOR types, missing keys, a port above 65535, kinds and scopes
+    /// above a byte (which decode), and unknown keys (ignored).
+    #[test]
+    fn candidates_decode_only_their_cbor_shape() {
+        // {0: [{0: kind, 1: ip, 2: port, extra...}], scope...}
+        let body = |kind: u64, ip: &[u8], port: u64, extra: &[(u8, u64)], scope: Option<u64>| {
+            let mut e = minicbor::Encoder::new(Vec::new());
+            e.map(1 + u64::from(scope.is_some()))
+                .unwrap()
+                .u8(0)
+                .unwrap();
+            e.array(1).unwrap();
+            e.map(3 + extra.len() as u64).unwrap();
+            e.u8(0).unwrap().u64(kind).unwrap();
+            e.u8(1).unwrap().bytes(ip).unwrap();
+            e.u8(2).unwrap().u64(port).unwrap();
+            for (k, v) in extra {
+                e.u8(*k).unwrap().u64(*v).unwrap();
+            }
+            if let Some(scope) = scope {
+                e.u8(1).unwrap().u64(scope).unwrap();
+            }
+            e.into_writer()
+        };
+        let lan = [192u8, 168, 1, 20];
+        let ok: Candidates = decode_body(&body(0, &lan, 50_000, &[], None)).unwrap();
+        assert_eq!(ok.candidates, [lan_candidate()]);
+        // Values above a byte are not errors (§6.1 "unknown values").
+        for big in [256u64, 0x1_0000, u64::from(u32::MAX)] {
+            let c: Candidates = decode_body(&body(big, &lan, 50_000, &[], Some(big))).unwrap();
+            assert_eq!(u64::from(c.candidates[0].kind), big);
+            assert_eq!(candidate_kind::name(c.candidates[0].kind), "unknown");
+            assert_eq!(u64::from(c.scope_code()), big);
+            assert!(!c.internet(), "an unknown scope is same-site");
+        }
+        // Past u32 (kind, scope) or u16 (port) the CBOR does not fit the field.
+        let past = u64::from(u32::MAX) + 1;
+        assert!(decode_body::<Candidates>(&body(past, &lan, 50_000, &[], None)).is_err());
+        assert!(decode_body::<Candidates>(&body(0, &lan, 50_000, &[], Some(past))).is_err());
+        assert!(decode_body::<Candidates>(&body(0, &lan, 65_536, &[], None)).is_err());
+        let top: Candidates = decode_body(&body(0, &lan, 65_535, &[], None)).unwrap();
+        assert_eq!(top.candidates[0].port, u16::MAX);
+        // A later version's keys are ignored.
+        let later: Candidates =
+            decode_body(&body(1, &lan, 50_000, &[(3, 7), (9, 1)], None)).unwrap();
+        assert_eq!(later.candidates[0].kind, candidate_kind::SRFLX);
+        // The ip as a CBOR array, or a missing required key, is malformed.
+        let mut e = minicbor::Encoder::new(Vec::new());
+        e.map(1).unwrap().u8(0).unwrap().array(1).unwrap();
+        e.map(3).unwrap();
+        e.u8(0).unwrap().u8(0).unwrap();
+        e.u8(1).unwrap().array(4).unwrap();
+        for b in lan {
+            e.u8(b).unwrap();
+        }
+        e.u8(2).unwrap().u16(50_000).unwrap();
+        assert!(matches!(
+            decode_body::<Candidates>(e.writer()),
+            Err(BodyError::Malformed { .. })
+        ));
+        for missing in 0u8..3 {
+            let mut e = minicbor::Encoder::new(Vec::new());
+            e.map(1).unwrap().u8(0).unwrap().array(1).unwrap();
+            e.map(2).unwrap();
+            if missing != 0 {
+                e.u8(0).unwrap().u8(0).unwrap();
+            }
+            if missing != 1 {
+                e.u8(1).unwrap().bytes(&lan).unwrap();
+            }
+            if missing != 2 {
+                e.u8(2).unwrap().u16(50_000).unwrap();
+            }
+            assert!(
+                matches!(
+                    decode_body::<Candidates>(e.writer()),
+                    Err(BodyError::Malformed { .. })
+                ),
+                "key {missing} missing"
+            );
+        }
+        // A `CANDIDATES` without its list, or not a map.
+        assert!(decode_body::<Candidates>(&[0xA0]).is_err());
+        assert!(decode_body::<Candidates>(&[0x80]).is_err());
+        // Scope: only INTERNET is the internet scope; absent and 0 are same-site.
+        let internet = Candidates {
+            candidates: vec![lan_candidate()],
+            scope: Some(scope::INTERNET),
+        };
+        assert!(internet.internet());
+        assert_eq!(internet.scope_code(), scope::INTERNET);
+        for s in [None, Some(scope::SAME_SITE)] {
+            let c = Candidates {
+                scope: s,
+                ..internet.clone()
+            };
+            assert!(!c.internet());
+            assert_eq!(c.scope_code(), scope::SAME_SITE);
+        }
+    }
+
+    /// `TOR_FALLBACK.reason`: any `u32` decodes, an unknown one reads as
+    /// "unknown"; past `u32` the CBOR does not fit; later keys are ignored.
+    #[test]
+    fn tor_fallback_reasons_decode_and_name() {
+        let named = [
+            (fallback::OFF, 1, "off"),
+            (fallback::NO_ADDRESSES, 2, "no-addresses"),
+            (fallback::SOCKET, 3, "socket"),
+            (fallback::NO_PATH, 4, "no-path"),
+            (fallback::QUIC, 5, "quic"),
+            (fallback::PEER_SILENT, 6, "peer-silent"),
+            (fallback::PEER_OFF, 7, "peer-off"),
+            (fallback::NO_MEDIA, 8, "no-media"),
+        ];
+        for (code, value, name) in named {
+            assert_eq!(code, value);
+            assert_eq!(fallback::name(code), name);
+            let back = roundtrip(&TorFallback { reason: Some(code) });
+            assert_eq!(back.reason, Some(value));
+        }
+        for unknown in [0u32, 9, 255, 256, 0x1_0000, u32::MAX] {
+            assert_eq!(fallback::name(unknown), "unknown");
+            roundtrip(&TorFallback {
+                reason: Some(unknown),
+            });
+        }
+        let reason = |v: u64, extra: bool| {
+            let mut e = minicbor::Encoder::new(Vec::new());
+            e.map(1 + u64::from(extra))
+                .unwrap()
+                .u8(0)
+                .unwrap()
+                .u64(v)
+                .unwrap();
+            if extra {
+                e.u8(5).unwrap().str("later").unwrap();
+            }
+            e.into_writer()
+        };
+        assert_eq!(
+            decode_body::<TorFallback>(&reason(300, true))
+                .unwrap()
+                .reason,
+            Some(300)
+        );
+        assert!(decode_body::<TorFallback>(&reason(u64::from(u32::MAX) + 1, false)).is_err());
+        // Null reads as absent, as for every optional key.
+        assert_eq!(
+            decode_body::<TorFallback>(&[0xA1, 0x00, 0xF6]).unwrap(),
+            TorFallback::default()
+        );
+        assert_eq!(candidate_kind::name(candidate_kind::HOST), "host");
+        assert_eq!(candidate_kind::name(candidate_kind::SRFLX), "srflx");
+        assert_eq!(candidate_kind::name(candidate_kind::MAPPED), "mapped");
+        assert_eq!(scope::SAME_SITE, 0);
+        assert_eq!(scope::INTERNET, 1);
+    }
+
+    /// Decision M1-83 (design `direct` §5.5): no `Debug` of a candidate, of
+    /// the frame or of the message and event that carry it shows the
+    /// address or the port, in decimal or in hex.
+    #[test]
+    fn candidate_debug_shows_no_address() {
+        let v4 = Candidate {
+            kind: candidate_kind::SRFLX,
+            ip: vec![203, 0, 113, 77],
+            port: 61_234,
+        };
+        let v6 = Candidate {
+            kind: candidate_kind::HOST,
+            ip: vec![
+                0x20, 0x01, 0x0d, 0xb8, 0xab, 0xcd, 0, 0, 0, 0, 0, 0, 0, 0, 0x99, 0x88,
+            ],
+            port: 59_876,
+        };
+        let frame = Candidates {
+            candidates: vec![v4.clone(), v6.clone()],
+            scope: Some(scope::INTERNET),
+        };
+        let texts = [
+            format!("{v4:?}"),
+            format!("{v6:?}"),
+            format!("{frame:?}"),
+            format!("{frame:#?}"),
+            format!("{:?}", Message::Candidates(frame.clone())),
+            format!(
+                "{:?}",
+                crate::fsm::client::SessionEvent::Candidates(frame.clone())
+            ),
+        ];
+        for text in &texts {
+            for needle in [
+                "203", "113", "77", "61234", "cb", "CB", "4d", "4D", "ef32", "EF32", "2001", "db8",
+                "abcd", "ABCD", "9988", "59876", "e9e4", "E9E4", "153", "136", "171", "205",
+            ] {
+                assert!(!text.contains(needle), "{needle:?} in {text}");
+            }
+        }
+        assert!(
+            texts[0].contains("srflx") && texts[0].contains("v4"),
+            "{}",
+            texts[0]
+        );
+        assert!(
+            texts[1].contains("host") && texts[1].contains("v6"),
+            "{}",
+            texts[1]
+        );
+        assert!(texts[2].contains("count: 2"), "{}", texts[2]);
+        let odd = Candidate {
+            ip: vec![1, 2, 3],
+            ..v4
+        };
+        assert!(format!("{odd:?}").contains("\"?\""));
+    }
+
+    /// Corpus policy (decision M1-36): `fuzz/seeds/candidates/` holds the
+    /// `candidates` target's seeds, the §6.1 golden bodies and a full frame
+    /// (eight candidates of every kind, v4 and v6, one of a kind this build
+    /// does not know, the internet scope), and nothing else.
+    #[test]
+    fn the_fuzz_seeds_are_the_golden_path_bodies() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fuzz/seeds/candidates");
+        let v4 = |kind, ip: [u8; 4], port| Candidate {
+            kind,
+            ip: ip.to_vec(),
+            port,
+        };
+        let ula = |last: u8, port| {
+            let mut ip = v6_candidate().ip;
+            ip[15] = last;
+            Candidate {
+                kind: candidate_kind::HOST,
+                ip,
+                port,
+            }
+        };
+        let full = Candidates {
+            candidates: vec![
+                lan_candidate(),
+                v6_candidate(),
+                v4(candidate_kind::SRFLX, [203, 0, 113, 7], 61_000),
+                v4(candidate_kind::MAPPED, [198, 51, 100, 9], 40_000),
+                v4(candidate_kind::HOST, [10, 0, 0, 5], 50_003),
+                v4(candidate_kind::HOST, [172, 16, 4, 2], 50_004),
+                v4(7, [192, 168, 1, 21], 50_005),
+                ula(2, 50_006),
+            ],
+            scope: Some(scope::INTERNET),
+        };
+        let expected: [(&str, Vec<u8>); 5] = [
+            (
+                "host.bin",
+                encode_body(&Candidates {
+                    candidates: vec![lan_candidate()],
+                    scope: None,
+                }),
+            ),
+            (
+                "srflx-internet.bin",
+                encode_body(&Candidates {
+                    candidates: vec![v4(candidate_kind::SRFLX, [203, 0, 113, 7], 61_000)],
+                    scope: Some(scope::INTERNET),
+                }),
+            ),
+            ("full-frame.bin", encode_body(&full)),
+            (
+                "tor-fallback-no-path.bin",
+                encode_body(&TorFallback {
+                    reason: Some(fallback::NO_PATH),
+                }),
+            ),
+            ("empty.bin", encode_body(&TorFallback::default())),
+        ];
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort_unstable();
+        let mut want: Vec<&str> = expected.iter().map(|(n, _)| *n).collect();
+        want.sort_unstable();
+        assert_eq!(names, want);
+        for (name, bytes) in &expected {
+            let seed = std::fs::read(format!("{dir}/{name}")).unwrap();
+            assert_eq!(&seed, bytes, "{name}");
+        }
+        assert_eq!(decode_body::<Candidates>(&expected[2].1).unwrap(), full);
+        assert_eq!(full.candidates.len(), MAX_CANDIDATES_PER_FRAME);
+        assert_eq!(expected[4].1, encode_body(&CandidatesDone {}));
+    }
+
+    /// A candidate of the shape [`Body::validate`] accepts: any kind, a 4- or
+    /// 16-byte ip that is not v4-mapped, a non-zero port.
+    fn valid_candidate() -> impl Strategy<Value = Candidate> {
+        let ip = prop_oneof![
+            proptest::collection::vec(any::<u8>(), 4),
+            proptest::collection::vec(any::<u8>(), 16),
+        ];
+        (any::<u32>(), ip, 1u16..).prop_map(|(kind, mut ip, port)| {
+            if ip.starts_with(&V4_MAPPED_PREFIX) {
+                ip[10] = 0xfe;
+            }
+            Candidate { kind, ip, port }
+        })
+    }
+
+    /// Any candidate: lengths around and at 4 and 16, a port that may be 0,
+    /// and a 16-byte ip that may be forced into the v4-mapped block.
+    fn any_candidate() -> impl Strategy<Value = Candidate> {
+        let len = prop_oneof![3 => Just(4usize), 3 => Just(16usize), 1 => 0usize..=18];
+        let ip = len.prop_flat_map(|n| proptest::collection::vec(any::<u8>(), n));
+        let port = prop_oneof![1 => Just(0u16), 6 => any::<u16>()];
+        (any::<u32>(), ip, port, any::<bool>()).prop_map(|(kind, mut ip, port, mapped)| {
+            if mapped && ip.len() == 16 {
+                ip[..12].copy_from_slice(&V4_MAPPED_PREFIX);
+            }
+            Candidate { kind, ip, port }
+        })
+    }
+
+    proptest! {
+        /// Every frame of a valid shape survives the wire unchanged, its
+        /// scope included (absent stays absent).
+        #[test]
+        fn valid_candidates_roundtrip(
+            candidates in proptest::collection::vec(valid_candidate(), 1..=MAX_CANDIDATES_PER_FRAME),
+            scope in proptest::option::of(any::<u32>()),
+        ) {
+            let frame = Candidates { candidates, scope };
+            let back: Candidates = decode_body(&encode_body(&frame)).unwrap();
+            prop_assert_eq!(back.scope_code(), scope.unwrap_or(0));
+            prop_assert_eq!(back.internet(), scope == Some(scope::INTERNET));
+            prop_assert_eq!(back, frame);
+        }
+
+        /// The receiver's verdict is exactly the §6.1 rule, for any frame.
+        #[test]
+        fn candidates_decode_iff_their_shape_is_valid(
+            candidates in proptest::collection::vec(any_candidate(), 0..=MAX_CANDIDATES_PER_FRAME + 2),
+            scope in proptest::option::of(any::<u32>()),
+        ) {
+            let shape_ok = |c: &Candidate| {
+                c.port != 0
+                    && (c.ip.len() == 4
+                        || (c.ip.len() == 16 && !c.ip.starts_with(&V4_MAPPED_PREFIX)))
+            };
+            let expected = (1..=MAX_CANDIDATES_PER_FRAME).contains(&candidates.len())
+                && candidates.iter().all(shape_ok);
+            let frame = Candidates { candidates, scope };
+            let decoded = decode_body::<Candidates>(&encode_body(&frame));
+            prop_assert_eq!(decoded.is_ok(), expected, "{:?}", decoded);
+            if let Ok(back) = decoded {
+                prop_assert_eq!(back, frame);
+            }
+        }
+
+        /// Any reason survives the wire; only the eight codes have a name.
+        #[test]
+        fn tor_fallback_reasons_roundtrip(reason in proptest::option::of(any::<u32>())) {
+            let fb = TorFallback { reason };
+            let back: TorFallback = decode_body(&encode_body(&fb)).unwrap();
+            prop_assert_eq!(back, fb);
+            if let Some(code) = reason {
+                prop_assert_eq!(fallback::name(code) == "unknown", !(1..=8).contains(&code));
+            }
+        }
     }
 }

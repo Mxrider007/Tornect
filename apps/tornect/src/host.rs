@@ -3176,7 +3176,7 @@ mod tests {
             ClientOutcome::Session(s) => s,
             other => panic!("expected a session, got {other:?}"),
         };
-        session.send_tor_fallback().await.unwrap();
+        session.send_tor_fallback(None).await.unwrap();
         session.ping().await.unwrap();
         assert_eq!(wiring.live.count(), 1);
         assert!(
@@ -3266,7 +3266,7 @@ mod tests {
             Ok(ClientOutcome::Session(s)) => s,
             other => panic!("no unattended session: {other:?}"),
         };
-        session.send_tor_fallback().await.unwrap();
+        session.send_tor_fallback(None).await.unwrap();
         session.ping().await.unwrap();
         let state = ctx.guard.store().grant(&device).unwrap().state;
         assert_eq!(state, GrantState::Active);
@@ -3369,7 +3369,7 @@ mod tests {
             Ok(ClientOutcome::Session(s)) => s,
             other => panic!("no unattended session: {other:?}"),
         };
-        session.send_tor_fallback().await.unwrap();
+        session.send_tor_fallback(None).await.unwrap();
         session.ping().await.unwrap();
         tokio::time::sleep(Duration::from_millis(1_500)).await;
         session.bye(bye::USER).await.unwrap();
@@ -4047,7 +4047,7 @@ mod tests {
             session.host_has(messages::feats::SVC1),
             "the client reads the services stream's token from the signed HELLO_ACK"
         );
-        session.send_tor_fallback().await.unwrap();
+        session.send_tor_fallback(None).await.unwrap();
         session.ping().await.unwrap();
         assert_eq!(live.count(), 1);
 
@@ -4598,7 +4598,7 @@ mod tests {
             ClientOutcome::Session(s) => s,
             other => panic!("expected a session, got {other:?}"),
         };
-        session.send_tor_fallback().await.unwrap();
+        session.send_tor_fallback(None).await.unwrap();
         session.ping().await.unwrap();
         assert_eq!(wiring.live.count(), 1);
 

@@ -405,6 +405,9 @@ async fn unattended_session_end_to_end_over_a_duplex_pipe() {
     assert!(session.host_has(messages::feats::SVC1));
     assert!(session.host_has(messages::feats::UA1));
     assert!(!session.host_has(messages::feats::UA2));
+    assert!(!session.host_has(messages::feats::DIR1), "not configured");
+    // The device key the unattended accept's SPKI was checked against.
+    assert_eq!(session.host_device_pk(), host_device_pk());
 
     // The host reached Established with the *same* derived token, and no popup
     // ran on either side (that is the whole point of an unattended session).
@@ -474,6 +477,13 @@ async fn pairing_then_attended_session_ping_bye() {
     assert_eq!(accept.caps().max_res.width, 1920);
     assert!(!accept.caps().hdr);
     assert_eq!(accept.quic_spki(), &ed25519_spki(&host_device_pk()));
+    // The key the direct path pins (design `direct` §4, §6.5): the pinned
+    // device key, never the onion key.
+    assert_eq!(session.host_device_pk(), host_device_pk());
+    assert_ne!(
+        session.host_device_pk(),
+        HostSigner::public_key(&*host.identity)
+    );
     assert_ne!(
         accept.quic_spki(),
         &ed25519_spki(&HostSigner::public_key(&*host.identity)),
@@ -2072,6 +2082,19 @@ fn genuine_accept() -> messages::SessionAccept {
     }
 }
 
+/// A host's `CANDIDATES` frame: one same-site host candidate, the scope
+/// echoed (design `direct` §6.1).
+fn host_candidates() -> messages::Candidates {
+    messages::Candidates {
+        candidates: vec![messages::Candidate {
+            kind: messages::candidate_kind::HOST,
+            ip: vec![192, 168, 1, 30],
+            port: 50_002,
+        }],
+        scope: Some(messages::scope::SAME_SITE),
+    }
+}
+
 /// [`genuine_accept`] with one field changed (`SessionAccept` zeroizes on
 /// drop, so struct update syntax cannot move out of it).
 fn accept_with(change: impl FnOnce(&mut messages::SessionAccept)) -> messages::SessionAccept {
@@ -2602,7 +2625,7 @@ async fn host_timeouts_are_the_plan_values() {
         ClientOutcome::Session(s) => s,
         ClientOutcome::Paired { .. } => panic!(),
     };
-    session.send_tor_fallback().await.unwrap();
+    session.send_tor_fallback(None).await.unwrap();
     let started = tokio::time::Instant::now();
     match task.await.unwrap().unwrap() {
         HostOutcome::Session { end, .. } => assert_eq!(end, SessionEnd::Idle),
@@ -2912,13 +2935,17 @@ async fn candidates_reach_the_sink_and_busy_hosts_reject() {
     struct Sink(Mutex<Vec<String>>);
     impl CandidateSink for Sink {
         fn on_candidates(&self, c: messages::Candidates) {
-            self.0.lock().unwrap().extend(c.candidates);
+            let scope = c.scope_code();
+            self.0.lock().unwrap().extend(c.candidates.iter().map(|c| {
+                let kind = messages::candidate_kind::name(c.kind);
+                format!("{kind} {:?}:{} scope {scope}", c.ip, c.port)
+            }));
         }
         fn on_candidates_done(&self) {
             self.0.lock().unwrap().push("done".into());
         }
-        fn on_tor_fallback(&self) {
-            self.0.lock().unwrap().push("tor".into());
+        fn on_tor_fallback(&self, reason: Option<u32>) {
+            self.0.lock().unwrap().push(format!("tor {reason:?}"));
         }
     }
     struct Live;
@@ -2959,15 +2986,27 @@ async fn candidates_reach_the_sink_and_busy_hosts_reject() {
     };
     session
         .send_candidates(&messages::Candidates {
-            candidates: vec!["192.0.2.1:4000".into()],
+            candidates: vec![messages::Candidate {
+                kind: messages::candidate_kind::HOST,
+                ip: vec![192, 0, 2, 1],
+                port: 4000,
+            }],
+            scope: Some(messages::scope::INTERNET),
         })
         .await
         .unwrap();
     session.ping().await.unwrap();
-    session.send_tor_fallback().await.unwrap();
+    session.send_candidates_done().await.unwrap();
+    session
+        .send_tor_fallback(Some(messages::fallback::NO_PATH))
+        .await
+        .unwrap();
     session.bye(bye::USER).await.unwrap();
     task.await.unwrap().unwrap();
-    assert_eq!(sink.0.lock().unwrap().as_slice(), ["192.0.2.1:4000", "tor"]);
+    assert_eq!(
+        sink.0.lock().unwrap().as_slice(),
+        ["host [192, 0, 2, 1]:4000 scope 1", "done", "tor Some(4)"]
+    );
 
     // A live remote session suppresses popups: BUSY for sessions and pairing.
     host.deps.activity = Arc::new(Live);
@@ -4003,15 +4042,7 @@ async fn client_ping_answers_a_host_ping_and_queues_m2_frames() {
             let nonce = decode_body::<Ping>(&ping.env.body).unwrap().nonce;
             // The host's own heartbeat and an M2 frame, then the answer.
             h.chan.send(&Ping { nonce: 42 }, None).await.unwrap();
-            h.chan
-                .send(
-                    &messages::Candidates {
-                        candidates: vec!["c".into()],
-                    },
-                    None,
-                )
-                .await
-                .unwrap();
+            h.chan.send(&host_candidates(), None).await.unwrap();
             let answer = Pong {
                 nonce: if wrong_nonce { nonce ^ 1 } else { nonce },
             };
@@ -4069,9 +4100,7 @@ async fn client_ping_answers_a_host_ping_and_queues_m2_frames() {
         result.unwrap();
         assert_eq!(
             session.next_event(Duration::from_secs(5)).await.unwrap(),
-            Some(SessionEvent::Candidates(messages::Candidates {
-                candidates: vec!["c".into()]
-            })),
+            Some(SessionEvent::Candidates(host_candidates())),
             "the M2 frame that arrived during ping is delivered first"
         );
         assert_eq!(
@@ -10435,4 +10464,207 @@ async fn a_session_accept_that_cannot_be_written_starts_nothing_and_is_logged() 
             .any(|e| matches!(e, AuditEvent::SessionStarted { .. })),
         "{events:?}"
     );
+}
+
+/// `CANDIDATES` bodies of a bad shape (design `direct` §6.1
+/// `Body::validate`) and the `what` of the `E_BAD_LEN` each must draw.
+fn bad_candidates() -> Vec<(&'static str, Vec<u8>, &'static str)> {
+    let one = |ip: Vec<u8>, port: u16| {
+        encode_body(&messages::Candidates {
+            candidates: vec![messages::Candidate {
+                kind: messages::candidate_kind::HOST,
+                ip,
+                port,
+            }],
+            scope: None,
+        })
+    };
+    let mut mapped = vec![0u8; 16];
+    mapped[10..12].copy_from_slice(&[0xff, 0xff]);
+    mapped[12..].copy_from_slice(&[192, 168, 1, 20]);
+    vec![
+        (
+            "no candidate",
+            encode_body(&messages::Candidates::default()),
+            "field",
+        ),
+        (
+            "nine candidates",
+            encode_body(&messages::Candidates {
+                candidates: vec![host_candidates().candidates[0].clone(); 9],
+                scope: None,
+            }),
+            "bound",
+        ),
+        (
+            "a five-byte ip",
+            one(vec![192, 168, 1, 20, 1], 50_000),
+            "field",
+        ),
+        ("port 0", one(vec![192, 168, 1, 20], 0), "field"),
+        ("a v4-mapped ip", one(mapped, 50_000), "field"),
+        // M1's placeholder shape: a list of strings.
+        (
+            "a string candidate",
+            vec![0xA1, 0x00, 0x81, 0x61, 0x63],
+            "body",
+        ),
+    ]
+}
+
+/// Design `direct` §6.1: a viewer's `CANDIDATES` of a bad shape, and a
+/// `TOR_FALLBACK` whose reason does not fit a `u32`, end the session with
+/// `E_BAD_LEN` through the body-fault path; nothing reaches the sink, and the
+/// end is recorded with the code's name.
+#[tokio::test(start_paused = true)]
+async fn the_host_refuses_path_frames_of_a_bad_shape_with_e_bad_len() {
+    #[derive(Default)]
+    struct Count(std::sync::atomic::AtomicUsize);
+    impl CandidateSink for Count {
+        fn on_candidates(&self, _: messages::Candidates) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_candidates_done(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_tor_fallback(&self, _: Option<u32>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let mut cases: Vec<(&str, Kind, Vec<u8>, &str)> = bad_candidates()
+        .into_iter()
+        .map(|(name, body, what)| (name, Kind::Candidates, body, what))
+        .collect();
+    // {0: 2^32}: a reason past u32.
+    cases.push((
+        "a reason past u32",
+        Kind::TorFallback,
+        vec![0xA1, 0x00, 0x1B, 0, 0, 0, 1, 0, 0, 0, 0],
+        "body",
+    ));
+    for (name, kind, body, what) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut host = host_side(tmp.path(), HOST_SEED);
+        host.cfg.orphan_timeout = None;
+        let sink = Arc::new(Count::default());
+        host.deps.candidates = sink.clone();
+        let audit = Arc::new(RecordingAudit::default());
+        host.deps.audit = audit.clone();
+        host.trusted
+            .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+            .unwrap();
+        host.consent
+            .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+        raw.hello_ack().await;
+        assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+        let msg_id = raw.chan.next_tx_id();
+        let mut client = raw.chan.into_stream();
+        let env = Envelope::new(1, msg_id, kind, body);
+        write_frame(&mut client, &env.encode()).await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the host ends at the fault")
+            .unwrap();
+        match outcome {
+            Err(HandshakeError::Violation { code, what: w }) => {
+                assert_eq!((code, w), (codes::E_BAD_LEN, what), "{name}");
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+        assert_eq!(sink.0.load(Ordering::SeqCst), 0, "{name} reached the sink");
+        let ended = audit.0.lock().unwrap().iter().find_map(|e| match e {
+            AuditEvent::SessionEnded { detail, .. } => Some(detail.clone()),
+            _ => None,
+        });
+        assert_eq!(ended.as_deref(), Some("E_BAD_LEN"), "{name}");
+        drop(client);
+    }
+}
+
+/// Design `direct` §6.1, §8.2: the host's path frames reach the viewer as
+/// events, `TOR_FALLBACK` with its reason (any `u32`; absent is `None`);
+/// the viewer's frames leave as the golden bytes (`TOR_FALLBACK{}` = `A0`,
+/// `TOR_FALLBACK{NO_PATH}` = `A1 00 04`, `CANDIDATES_DONE` = `A0`).
+#[tokio::test(start_paused = true)]
+async fn path_frames_reach_the_viewer_with_their_reasons_and_leave_as_golden_bytes() {
+    let (mut session, mut host, _frozen, writes) = raw_client_session().await;
+    assert_eq!(session.host_device_pk(), host_device_pk());
+    assert!(!session.host_has(messages::feats::DIR1));
+    host.send(&host_candidates(), None).await.unwrap();
+    host.send(&messages::CandidatesDone {}, None).await.unwrap();
+    for reason in [Some(messages::fallback::OFF), Some(300), None] {
+        host.send(&messages::TorFallback { reason }, None)
+            .await
+            .unwrap();
+    }
+    let before = writes.load(Ordering::SeqCst);
+    let mut events = Vec::new();
+    while events.len() < 5 {
+        session.event_ready().await.unwrap();
+        if let Some(event) = session.take_event().unwrap() {
+            events.push(event);
+        }
+    }
+    assert_eq!(
+        events,
+        [
+            SessionEvent::Candidates(host_candidates()),
+            SessionEvent::CandidatesDone,
+            SessionEvent::TorFallback(Some(messages::fallback::OFF)),
+            SessionEvent::TorFallback(Some(300)),
+            SessionEvent::TorFallback(None),
+        ]
+    );
+    assert_eq!(writes.load(Ordering::SeqCst), before, "taking them wrote");
+    assert!(!session.owes());
+
+    session.send_tor_fallback(None).await.unwrap();
+    session
+        .send_tor_fallback(Some(messages::fallback::NO_PATH))
+        .await
+        .unwrap();
+    session.send_candidates_done().await.unwrap();
+    session.send_candidates(&host_candidates()).await.unwrap();
+    let expected = [
+        (Kind::TorFallback, vec![0xA0]),
+        (Kind::TorFallback, vec![0xA1, 0x00, 0x04]),
+        (Kind::CandidatesDone, vec![0xA0]),
+        (Kind::Candidates, encode_body(&host_candidates())),
+    ];
+    for (kind, body) in expected {
+        let rx = host
+            .recv(Duration::from_secs(5), "a path frame")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rx.env.kind, kind);
+        assert_eq!(rx.env.body, body, "{kind}");
+        assert!(rx.env.sig.is_none(), "path frames are unsigned");
+    }
+}
+
+/// A host `CANDIDATES` of a bad shape is, on the viewer too, the unanswered
+/// `E_BAD_LEN` body fault `take_event` returns without writing.
+#[tokio::test(start_paused = true)]
+async fn a_bad_candidates_shape_from_the_host_is_an_unanswered_body_fault() {
+    for (name, body, what) in bad_candidates() {
+        let (mut session, host, _frozen, writes) = raw_client_session().await;
+        let msg_id = host.next_tx_id();
+        let mut stream = host.into_stream();
+        let env = Envelope::new(1, msg_id, Kind::Candidates, body);
+        write_frame(&mut stream, &env.encode()).await.unwrap();
+        let before = writes.load(Ordering::SeqCst);
+        session.event_ready().await.unwrap();
+        match session.take_event() {
+            Err(HandshakeError::Violation { code, what: w }) => {
+                assert_eq!((code, w), (codes::E_BAD_LEN, what), "{name}");
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+        assert_eq!(writes.load(Ordering::SeqCst), before, "{name}: answered");
+        drop(stream);
+    }
 }

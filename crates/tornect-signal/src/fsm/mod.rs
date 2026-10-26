@@ -673,15 +673,17 @@ impl HandshakeAudit for HostAudit {
     }
 }
 
-/// Sink for the post-accept frames M2 consumes (`CANDIDATES`,
-/// `CANDIDATES_DONE`, `TOR_FALLBACK`); M1 only proves they arrive.
+/// Sink for the post-accept frames the direct path consumes (`CANDIDATES`,
+/// `CANDIDATES_DONE`, `TOR_FALLBACK`), each a checked body; M1 only proves
+/// they arrive.
 pub trait CandidateSink: Send + Sync {
     /// A `CANDIDATES` frame.
     fn on_candidates(&self, candidates: messages::Candidates);
     /// A `CANDIDATES_DONE` frame.
     fn on_candidates_done(&self);
-    /// A `TOR_FALLBACK` frame.
-    fn on_tor_fallback(&self);
+    /// A `TOR_FALLBACK` frame with its [`messages::fallback`] code (`None`
+    /// for `TOR_FALLBACK{}`).
+    fn on_tor_fallback(&self, reason: Option<u32>);
 }
 
 /// Drops everything (M1 default).
@@ -691,7 +693,7 @@ pub struct IgnoreCandidates;
 impl CandidateSink for IgnoreCandidates {
     fn on_candidates(&self, _: messages::Candidates) {}
     fn on_candidates_done(&self) {}
-    fn on_tor_fallback(&self) {}
+    fn on_tor_fallback(&self, _: Option<u32>) {}
 }
 
 /// A frame received and checked at the envelope level (not yet at the

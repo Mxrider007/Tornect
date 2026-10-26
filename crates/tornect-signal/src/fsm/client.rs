@@ -353,6 +353,19 @@ where
         self.host_feats.iter().any(|f| f == feat)
     }
 
+    /// The host's device public key: the key of the signed accept's
+    /// `quic_spki`, which [`connect`] compared in constant time with the
+    /// SPKI of the `host_device_pk` pinned at pairing before this session
+    /// existed (§B.6, decision M1-31). The direct path pins the host's QUIC
+    /// key to it, and a viewer whose own device key equals it is connecting
+    /// to itself (design `direct` §4, rule 3).
+    #[must_use]
+    pub fn host_device_pk(&self) -> [u8; 32] {
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&self.accept.quic_spki()[messages::SPKI_PREFIX.len()..]);
+        pk
+    }
+
     /// Whether the session is unattended (the signed accept's `session_type`).
     #[must_use]
     pub fn unattended(&self) -> bool {
@@ -451,18 +464,37 @@ where
         }
     }
 
-    /// Send a `CANDIDATES` frame (M2 placeholder).
+    /// Send a `CANDIDATES` frame (design `direct` §6.1). Only to a host that
+    /// announced [`messages::feats::DIR1`] ([`ClientSession::host_has`]),
+    /// since an older host has nothing to do with this side's addresses.
+    ///
+    /// Like every send, it writes: a caller that must be able to stop races
+    /// it against its stop future.
     pub async fn send_candidates(&mut self, candidates: &Candidates) -> Result<(), HandshakeError> {
         self.chan.send(candidates, None).await.map(|_| ())
     }
 
-    /// Send `TOR_FALLBACK{}`: what stops the host's 15 s orphan timer
-    /// (§B.8.4.5, `HostConfig::orphan_timeout`) when the Tor circuit is the
-    /// only transport — the M1 `tornect ping` flow sends it right after the
-    /// accept; M2 replaces it with `CANDIDATES` and the real fallback decision.
-    pub async fn send_tor_fallback(&mut self) -> Result<(), HandshakeError> {
+    /// Send `CANDIDATES_DONE`: this side has sent every `CANDIDATES` frame it
+    /// will send. A write, raced by the caller as
+    /// [`ClientSession::send_candidates`] is.
+    pub async fn send_candidates_done(&mut self) -> Result<(), HandshakeError> {
         self.chan
-            .send(&messages::TorFallback {}, None)
+            .send(&messages::CandidatesDone {}, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Send `TOR_FALLBACK{reason}`, a [`messages::fallback`] code: the
+    /// session's media goes over the onion media stream. It also stops the
+    /// host's 15 s orphan timer (§B.8.4.5, `HostConfig::orphan_timeout`).
+    ///
+    /// `None` sends `TOR_FALLBACK{}`, the bytes M1 sent right after the
+    /// accept and what a host without [`messages::feats::DIR1`] is sent
+    /// (design `direct` §4, rule 2). A write, raced by the caller as
+    /// [`ClientSession::send_candidates`] is.
+    pub async fn send_tor_fallback(&mut self, reason: Option<u32>) -> Result<(), HandshakeError> {
+        self.chan
+            .send(&messages::TorFallback { reason }, None)
             .await
             .map(|_| ())
     }
@@ -650,8 +682,8 @@ where
                 SessionEvent::CandidatesDone
             }
             Kind::TorFallback => {
-                let _: messages::TorFallback = checked_body(rx)?;
-                SessionEvent::TorFallback
+                let fallback: messages::TorFallback = checked_body(rx)?;
+                SessionEvent::TorFallback(fallback.reason)
             }
             _ => {
                 return Err(HandshakeError::Violation {
@@ -715,12 +747,14 @@ pub enum SessionEvent {
         /// Untrusted free text.
         detail: Option<String>,
     },
-    /// M2: the host's candidates.
+    /// The host's `CANDIDATES` (design `direct` §6.1; `Debug` shows kinds
+    /// and counts, never an address).
     Candidates(Candidates),
-    /// M2: the host finished gathering.
+    /// The host sent every candidate it will send (`CANDIDATES_DONE`).
     CandidatesDone,
-    /// M2: the host asks for the Tor fallback.
-    TorFallback,
+    /// The host takes no direct path (`TOR_FALLBACK`), with its
+    /// [`messages::fallback`] code; `None` for `TOR_FALLBACK{}`.
+    TorFallback(Option<u32>),
 }
 
 /// How [`connect`] ended.

@@ -76,6 +76,16 @@ test = false
 doc = false
 bench = false
 
+# The direct-path signaling bodies (design `direct` §6.1, decision M1-80):
+# `CANDIDATES`, `TOR_FALLBACK` and `CANDIDATES_DONE` through `decode_body`;
+# seeds in `seeds/candidates/`.
+[[bin]]
+name = "candidates"
+path = "fuzz_targets/candidates.rs"
+test = false
+doc = false
+bench = false
+
 # The session services stream (decision M1-76, the services design §3):
 # `tornect_proto::services` decode, the gated reader of both sides and the
 # fixed-size bind read; seeds in `seeds/services/`.

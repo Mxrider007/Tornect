@@ -1172,10 +1172,11 @@ async fn connect_session(
     if let Err(e) = pins.visited() {
         tracing::warn!(error = %format!("{e:#}"), "the visit was not recorded");
     }
-    // M1 has no direct path: the Tor circuit is the transport, and saying so
-    // stops the host's 15 s orphan timer (§B.8.4.5).
+    // No direct path yet (design `direct`, step A19 decides it): the Tor
+    // circuit is the transport, and saying so stops the host's 15 s orphan
+    // timer (§B.8.4.5). `TOR_FALLBACK{}`, M1's bytes, without a reason.
     session
-        .send_tor_fallback()
+        .send_tor_fallback(None)
         .await
         .map_err(explain_handshake)?;
     eprintln!(
@@ -2414,7 +2415,7 @@ mod tests {
                 ClientOutcome::Session(s) => *s,
                 other => panic!("expected a session, got {other:?}"),
             };
-        session.send_tor_fallback().await.unwrap();
+        session.send_tor_fallback(None).await.unwrap();
         Live {
             _tmp: tmp,
             session,
