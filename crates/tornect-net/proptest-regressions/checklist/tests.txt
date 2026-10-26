@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9bdadbea280eda1af4ea4629e7c8eb12f2495f69fdcdbbf94f3f129d6961daf4 # shrinks to ops = [Request(0, 0), Request(4, 0), Request(4, 0), Request(0, 0), Request(0, 0), Request(0, 0), Request(0, 0), Request(0, 0), Request(0, 0), Add(0, 0), Add(0, 0), Add(0, 0), Add(0, 0), Add(0, 0), Add(0, 0), Add(0, 0), Add(0, 0), Add(0, 0), Add(0, 0), Add(0, 0), Add(0, 0), Add(0, 0), Add(0, 0), Add(0, 0), Request(0, 0), Add(0, 0), Add(0, 0), Request(0, 0), Request(0, 2), Replay(2272371050075202121, 3, 4), Request(2, 6), Request(7, 4), Request(10, 6), Replay(4844339827880635025, 4, 3), Request(4, 3)], controlling = true, host_side = true, internet = true
+cc 2588d42376708c8dbf0d1046485ba78006f60ecafc558cf57ab5fb0fc17cb2bd # shrinks to ops = [Request(0, 0), Request(4, 0), Respond(3026740382237487980, Some(4))], controlling = false, host_side = false, internet = true
