@@ -216,6 +216,8 @@ struct Build {
     limits: ServicesLimits,
     media: MediaLimits,
     inbox: bool,
+    /// A lock watcher feeds the host (`ServicesHost::with_lock_watcher`).
+    lock_watcher: bool,
 }
 
 impl Default for Build {
@@ -226,6 +228,7 @@ impl Default for Build {
             limits: ServicesLimits::default(),
             media: MediaLimits::default(),
             inbox: true,
+            lock_watcher: false,
         }
     }
 }
@@ -241,6 +244,7 @@ fn rig_with(build: Build) -> Rig {
         limits,
         media,
         inbox,
+        lock_watcher,
     } = build;
     let desk = Arc::new(desk);
     let media = Arc::new(MediaHost::new(
@@ -248,7 +252,7 @@ fn rig_with(build: Build) -> Rig {
         Arc::new(NoObserver),
         media,
     ));
-    rig_on(media, desk, policy, limits, inbox)
+    rig_on(media, desk, policy, limits, inbox, lock_watcher)
 }
 
 /// The services of `media`, whose desktop is `desk`.
@@ -258,6 +262,7 @@ fn rig_on(
     policy: ServicesPolicy,
     limits: ServicesLimits,
     inbox: bool,
+    lock_watcher: bool,
 ) -> Rig {
     let home = tempfile::tempdir().unwrap();
     let (tx, heard) = mpsc::unbounded_channel();
@@ -315,13 +320,18 @@ fn rig_on(
         list_hook: Some(list_hook),
         open_hook: Some(holding(&open_hold, &open_held)),
     };
-    let services = Arc::new(ServicesHost::new(
+    let services = ServicesHost::new(
         Arc::clone(&media),
         Arc::new(Heard(tx)),
         policy_rx,
         env,
         limits,
-    ));
+    );
+    let services = Arc::new(if lock_watcher {
+        services.with_lock_watcher()
+    } else {
+        services
+    });
     Rig {
         media,
         services,
@@ -855,6 +865,7 @@ async fn the_input_gate_follows_the_media_streams_injector() {
         ServicesPolicy::default(),
         ServicesLimits::default(),
         true,
+        false,
     );
     let session = start(&rig, 70, SessionMode::Control);
     let _media = media_live(&rig.media, &session).await;
@@ -5838,6 +5849,171 @@ async fn a_stream_opened_while_locked_starts_paused() {
     );
     let (_, _, frames) = served(task).await;
     assert_eq!(frames.skipped, 3, "the switch, the Offer and the List");
+}
+
+/// A lock watcher that reads only when a stream asks
+/// (`ServicesHost::lock_asked`), the desktop's lock being `locked`, each
+/// reading taking `takes` (logind's `Properties.Get` over the system bus):
+/// each is counted in `asked`, handed to `set_locked`, then told
+/// (`lock_read`). Its ticks are left out: they read only while a stream is
+/// open, so they never refresh the state for a stream about to open.
+fn asked_watcher(
+    services: &Arc<ServicesHost>,
+    locked: &Arc<AtomicBool>,
+    asked: &Arc<AtomicUsize>,
+    takes: Duration,
+) -> JoinHandle<()> {
+    let (services, locked, asked) = (Arc::clone(services), Arc::clone(locked), Arc::clone(asked));
+    tokio::spawn(async move {
+        loop {
+            services.lock_asked().await;
+            tokio::time::sleep(takes).await;
+            asked.fetch_add(1, Ordering::SeqCst);
+            services.set_locked(locked.load(Ordering::SeqCst));
+            services.lock_read();
+        }
+    })
+}
+
+/// The final review's lock finding (§2.3, §12): a host whose watcher reads
+/// the lock only while a services stream is open, and that locked while
+/// none was (the state last given says unlocked), starts the next stream
+/// paused, not unpaused until the watcher's next tick: the stream asks for
+/// a reading as it binds and waits for it before `Welcome`, so a `List`, a
+/// `Get` and an `Offer` sent right after `Welcome` are skipped unread, and
+/// nothing is listed, sent or accepted, though the reading takes longer than
+/// the rest of the stream's opening. The unlock resumes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_locked_while_no_stream_was_open_starts_the_next_one_paused() {
+    let mut rig = rig_with(Build {
+        lock_watcher: true,
+        ..Build::default()
+    });
+    std::fs::write(rig.files.path().join("a.txt"), b"secret").unwrap();
+    let locked = Arc::new(AtomicBool::new(true));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let watcher = asked_watcher(&rig.services, &locked, &asked, Duration::from_millis(500));
+    let session = start(&rig, 224, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    assert_eq!(welcome(&mut client, &session).await.caps, caps::ALL);
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "read once, as it bound");
+    write_msg(&mut client, &list(1, 0, 0)).await.unwrap();
+    write_msg(&mut client, &get(2, 1)).await.unwrap();
+    write_msg(&mut client, &offer(3, "a.txt", 3)).await.unwrap();
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Caps(Caps {
+            caps: caps::ALL,
+            paused: caps::PAUSABLE
+        }))
+    );
+    assert!(
+        quiet(&mut client).await,
+        "no Listing, no Sending or Data, no Accepted"
+    );
+    assert!(matches!(
+        rig.event(&session.id).await,
+        HostEvent::Opened { .. }
+    ));
+    assert_eq!(
+        rig.event(&session.id).await,
+        HostEvent::Caps {
+            caps: caps::ALL,
+            paused: caps::PAUSABLE
+        }
+    );
+
+    locked.store(false, Ordering::SeqCst);
+    rig.services.set_locked(false);
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Caps(Caps {
+            caps: caps::ALL,
+            paused: 0
+        }))
+    );
+    write_msg(&mut client, &list(4, 0, 0)).await.unwrap();
+    assert_eq!(listed(&page_of(&mut client).await), ["Files"]);
+
+    rig.media.on_end(&session.id, None);
+    assert_eq!(
+        next(&mut client).await,
+        Some(SvcMsg::Close {
+            reason: reason::SESSION_OVER
+        })
+    );
+    let (_, summary, frames) = served(task).await;
+    assert_eq!(frames.skipped, 3, "the List, the Get and the Offer");
+    assert_eq!((summary.files_in, summary.files_out), (0, 0));
+    watcher.abort();
+}
+
+/// The wait for a fresh lock reading is bounded and asked only of what it
+/// guards: a watcher that never answers holds a stream with the clipboard
+/// and files back for `lock_wait`, then the last state (unlocked) holds;
+/// a chat-only stream is never held back; and a host without a watcher
+/// never waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_wait_for_a_lock_reading_is_bounded_and_only_for_the_clipboard_and_files() {
+    let wait = Duration::from_millis(400);
+    let mut rig = rig_with(Build {
+        lock_watcher: true,
+        limits: ServicesLimits {
+            lock_wait: wait,
+            ..ServicesLimits::default()
+        },
+        ..Build::default()
+    });
+    let session = start(&rig, 225, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    let began = tokio::time::Instant::now();
+    assert_eq!(welcome(&mut client, &session).await.caps, caps::ALL);
+    assert!(began.elapsed() >= wait, "held back for the reading");
+    write_msg(&mut client, &list(1, 0, 0)).await.unwrap();
+    assert_eq!(
+        listed(&page_of(&mut client).await),
+        ["Files"],
+        "unpaused: the last state holds"
+    );
+    drop(client);
+    served(task).await;
+    assert!(matches!(
+        rig.event(&session.id).await,
+        HostEvent::Opened { .. }
+    ));
+
+    // A view-only session gets chat alone: no wait, however long it is.
+    let rig = rig_with(Build {
+        lock_watcher: true,
+        limits: ServicesLimits {
+            lock_wait: Duration::from_secs(3600),
+            ..ServicesLimits::default()
+        },
+        ..Build::default()
+    });
+    let session = start(&rig, 226, SessionMode::ViewOnly);
+    session.live(false);
+    let (mut client, task) = open(&rig.services);
+    assert_eq!(welcome(&mut client, &session).await.caps, caps::CHAT);
+    drop(client);
+    served(task).await;
+
+    // Without a watcher the stream never waits.
+    let rig = rig_with(Build {
+        limits: ServicesLimits {
+            lock_wait: Duration::from_secs(3600),
+            ..ServicesLimits::default()
+        },
+        ..Build::default()
+    });
+    let session = start(&rig, 227, SessionMode::Control);
+    session.live(true);
+    let (mut client, task) = open(&rig.services);
+    assert_eq!(welcome(&mut client, &session).await.caps, caps::ALL);
+    drop(client);
+    served(task).await;
 }
 
 /// Test 14 on the viewer, against a raw host: at `Caps` with `paused` it

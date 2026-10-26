@@ -148,39 +148,86 @@ const FIND_AGAIN: Duration = Duration::from_secs(30);
 /// Where the host reads whether it is locked: `None` when that could not
 /// be read this time (it then changes nothing).
 pub(crate) trait LockSource: Send {
+    /// Find what is read, once, as the host starts (not a reading), so that
+    /// the first reading a stream waits for is quick.
+    fn prepare(&mut self) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+
     /// One reading.
     fn read(&mut self) -> impl Future<Output = Option<bool>> + Send;
 }
 
-/// Read `source` every `every` while `open()` says a services stream is
-/// open, and hand each change to `set` (`ServicesHost::set_locked`): a host
-/// starts unlocked, and a reading that could not be taken changes nothing
-/// (`tornect_platform::lock::LockWatch`). Nothing is read while no stream
-/// is open. Runs until dropped.
-pub(crate) async fn watch_lock<L, O, S>(mut source: L, open: O, set: S, every: Duration)
+/// What the lock watcher feeds: the window host's
+/// [`tornect_session::services::ServicesHost`], built
+/// `with_lock_watcher`.
+pub(crate) trait LockSink: Send + Sync {
+    /// Services streams open now.
+    fn open(&self) -> usize;
+    /// Resolves when a stream that bound wants a reading now.
+    fn asked(&self) -> impl Future<Output = ()> + Send;
+    /// The lock changed (`ServicesHost::set_locked`).
+    fn set(&self, locked: bool);
+    /// A reading was taken, whatever it said.
+    fn read(&self);
+}
+
+impl LockSink for tornect_session::services::ServicesHost {
+    fn open(&self) -> usize {
+        self.open_streams()
+    }
+
+    fn asked(&self) -> impl Future<Output = ()> + Send {
+        self.lock_asked()
+    }
+
+    fn set(&self, locked: bool) {
+        self.set_locked(locked);
+    }
+
+    fn read(&self) {
+        self.lock_read();
+    }
+}
+
+/// Prepare `source` (logind's `LockedHint` is found as the host starts, not
+/// when the first stream opens), then read it every `every` while `sink`
+/// has a services stream open, and at once whenever a stream that bound
+/// asks: each change goes to `sink.set` (a host starts unlocked, and a
+/// reading that could not be taken changes nothing:
+/// `tornect_platform::lock::LockWatch`), and every reading, changed or not,
+/// is told to `sink.read`, which the stream asking waits for before its
+/// `Welcome` (§2.3). Nothing is read while no stream is open and none
+/// asks. Runs until dropped.
+pub(crate) async fn watch_lock<L, K>(mut source: L, sink: Arc<K>, every: Duration)
 where
     L: LockSource,
-    O: Fn() -> usize,
-    S: Fn(bool),
+    K: LockSink,
 {
+    source.prepare().await;
     let mut watch = tornect_platform::lock::LockWatch::new();
     let mut tick = tokio::time::interval(every);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tick.tick().await;
-        if open() == 0 {
-            continue;
+        tokio::select! {
+            _ = tick.tick() => {
+                if sink.open() == 0 {
+                    continue;
+                }
+            }
+            () = sink.asked() => {}
         }
         if let Some(locked) = watch.read(source.read().await) {
             tracing::info!(locked, "the services follow the host's lock");
-            set(locked);
+            sink.set(locked);
         }
+        sink.read();
     }
 }
 
-/// This computer's lock: logind's `LockedHint` on Linux (found once, looked
-/// for again every [`FIND_AGAIN`] while it cannot be had), the secure
-/// desktop on Windows, nothing elsewhere.
+/// This computer's lock: logind's `LockedHint` on Linux (found as the host
+/// starts, looked for again every [`FIND_AGAIN`] while it cannot be had),
+/// the secure desktop on Windows, nothing elsewhere.
 #[derive(Default)]
 pub(crate) struct SystemLock {
     #[cfg(target_os = "linux")]
@@ -190,6 +237,14 @@ pub(crate) struct SystemLock {
 }
 
 impl LockSource for SystemLock {
+    async fn prepare(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            self.looked = Some(tokio::time::Instant::now());
+            self.hint = tornect_platform::lock::LockedHint::connect().await;
+        }
+    }
+
     async fn read(&mut self) -> Option<bool> {
         #[cfg(target_os = "linux")]
         {
@@ -386,16 +441,77 @@ mod tests {
 
     use super::*;
 
-    /// Readings from a script; each one counted.
+    /// Readings from a script; each one counted, and whether the source
+    /// had been prepared before it.
     struct Scripted {
         readings: VecDeque<Option<bool>>,
         read: Arc<AtomicUsize>,
+        prepared: Arc<AtomicUsize>,
+        unprepared_reads: Arc<AtomicUsize>,
+    }
+
+    impl Scripted {
+        fn new(readings: impl Into<VecDeque<Option<bool>>>, read: &Arc<AtomicUsize>) -> Self {
+            Self {
+                readings: readings.into(),
+                read: Arc::clone(read),
+                prepared: Arc::default(),
+                unprepared_reads: Arc::default(),
+            }
+        }
     }
 
     impl LockSource for Scripted {
+        async fn prepare(&mut self) {
+            self.prepared.fetch_add(1, Ordering::SeqCst);
+        }
+
         async fn read(&mut self) -> Option<bool> {
             self.read.fetch_add(1, Ordering::SeqCst);
+            if self.prepared.load(Ordering::SeqCst) == 0 {
+                self.unprepared_reads.fetch_add(1, Ordering::SeqCst);
+            }
             self.readings.pop_front().flatten()
+        }
+    }
+
+    /// A host as its lock watcher sees it: the streams open, the changes
+    /// handed on, the readings told, and the asks of streams that bound.
+    #[derive(Default)]
+    struct Sink {
+        open: AtomicUsize,
+        set: Mutex<Vec<bool>>,
+        reads: AtomicUsize,
+        ask: tokio::sync::Notify,
+    }
+
+    impl Sink {
+        fn with_open(open: usize) -> Arc<Self> {
+            let sink = Arc::new(Self::default());
+            sink.open.store(open, Ordering::SeqCst);
+            sink
+        }
+
+        fn set(&self) -> Vec<bool> {
+            self.set.lock().unwrap().clone()
+        }
+    }
+
+    impl LockSink for Sink {
+        fn open(&self) -> usize {
+            self.open.load(Ordering::SeqCst)
+        }
+
+        async fn asked(&self) {
+            self.ask.notified().await;
+        }
+
+        fn set(&self, locked: bool) {
+            self.set.lock().unwrap().push(locked);
+        }
+
+        fn read(&self) {
+            self.reads.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -406,8 +522,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_lock_watcher_hands_on_changes_of_real_readings_only() {
         let read = Arc::new(AtomicUsize::new(0));
-        let source = Scripted {
-            readings: [
+        let source = Scripted::new(
+            [
                 None,
                 Some(false),
                 Some(true),
@@ -417,22 +533,20 @@ mod tests {
                 None,
                 Some(false),
                 Some(true),
-            ]
-            .into(),
-            read: Arc::clone(&read),
-        };
-        let set = Arc::new(Mutex::new(Vec::new()));
-        let seen = Arc::clone(&set);
-        let task = tokio::spawn(watch_lock(
-            source,
-            || 1,
-            move |locked| seen.lock().unwrap().push(locked),
-            LOCK_EVERY,
-        ));
+            ],
+            &read,
+        );
+        let sink = Sink::with_open(1);
+        let task = tokio::spawn(watch_lock(source, Arc::clone(&sink), LOCK_EVERY));
         tokio::time::sleep(LOCK_EVERY * 12).await;
         task.abort();
-        assert_eq!(*set.lock().unwrap(), [true, false, true]);
+        assert_eq!(sink.set(), [true, false, true]);
         assert!(read.load(Ordering::SeqCst) >= 9, "one reading a second");
+        assert_eq!(
+            sink.reads.load(Ordering::SeqCst),
+            read.load(Ordering::SeqCst),
+            "every reading told, unreadable and unchanged ones included"
+        );
     }
 
     /// Nothing is read while no services stream is open, and reading starts
@@ -440,27 +554,56 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_lock_is_read_only_while_a_stream_is_open() {
         let read = Arc::new(AtomicUsize::new(0));
-        let open = Arc::new(AtomicUsize::new(0));
-        let source = Scripted {
-            readings: [Some(true); 64].into(),
-            read: Arc::clone(&read),
-        };
-        let set = Arc::new(Mutex::new(Vec::new()));
-        let (seen, streams) = (Arc::clone(&set), Arc::clone(&open));
-        let task = tokio::spawn(watch_lock(
-            source,
-            move || streams.load(Ordering::SeqCst),
-            move |locked| seen.lock().unwrap().push(locked),
-            LOCK_EVERY,
-        ));
+        let source = Scripted::new([Some(true); 64], &read);
+        let sink = Sink::with_open(0);
+        let task = tokio::spawn(watch_lock(source, Arc::clone(&sink), LOCK_EVERY));
         tokio::time::sleep(LOCK_EVERY * 5).await;
         assert_eq!(read.load(Ordering::SeqCst), 0, "no stream, no reading");
-        assert!(set.lock().unwrap().is_empty());
-        open.store(1, Ordering::SeqCst);
+        assert!(sink.set().is_empty());
+        sink.open.store(1, Ordering::SeqCst);
         tokio::time::sleep(LOCK_EVERY * 3).await;
         task.abort();
         assert!(read.load(Ordering::SeqCst) >= 2);
-        assert_eq!(*set.lock().unwrap(), [true]);
+        assert_eq!(sink.set(), [true]);
+    }
+
+    /// The final review's lock finding (§2.3): the source is prepared once,
+    /// as the host starts and before any reading (logind is found then, not
+    /// at a stream's first reading), and a stream that binds while none was
+    /// open is answered at once, not at the next tick: one reading, handed
+    /// on and told, then nothing more until a stream is open or asks again.
+    /// A reading that cannot be taken is told too (the stream waiting for
+    /// it goes on with the last state) and changes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_binds_is_answered_with_a_reading_at_once() {
+        let read = Arc::new(AtomicUsize::new(0));
+        let source = Scripted::new([Some(true), None], &read);
+        let (prepared, unprepared) = (
+            Arc::clone(&source.prepared),
+            Arc::clone(&source.unprepared_reads),
+        );
+        let sink = Sink::with_open(0);
+        let task = tokio::spawn(watch_lock(source, Arc::clone(&sink), LOCK_EVERY));
+        tokio::time::sleep(LOCK_EVERY * 3).await;
+        assert_eq!(prepared.load(Ordering::SeqCst), 1, "prepared at the start");
+        assert_eq!(read.load(Ordering::SeqCst), 0);
+
+        sink.ask.notify_one();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(read.load(Ordering::SeqCst), 1, "read at once");
+        assert_eq!(sink.reads.load(Ordering::SeqCst), 1, "and told");
+        assert_eq!(sink.set(), [true]);
+        tokio::time::sleep(LOCK_EVERY * 3).await;
+        assert_eq!(read.load(Ordering::SeqCst), 1, "no stream open, no ask");
+
+        sink.ask.notify_one();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        task.abort();
+        assert_eq!(read.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.reads.load(Ordering::SeqCst), 2, "unreadable, told");
+        assert_eq!(sink.set(), [true], "and nothing changed");
+        assert_eq!(prepared.load(Ordering::SeqCst), 1, "prepared once");
+        assert_eq!(unprepared.load(Ordering::SeqCst), 0);
     }
 
     fn peer() -> Peer {

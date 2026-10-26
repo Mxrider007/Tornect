@@ -2150,22 +2150,21 @@ async fn host_role(b: &Backend) -> Result<Hosted, String> {
         Arc::clone(&b.shared),
         Arc::clone(audit.log()),
     ));
-    let services = Arc::new(ServicesHost::new(
-        Arc::clone(&media),
-        Arc::clone(&observer) as Arc<dyn tornect_session::services::ServicesObserver>,
-        policy_rx,
-        env,
-        ServicesLimits::default(),
+    let services = Arc::new(
+        ServicesHost::new(
+            Arc::clone(&media),
+            Arc::clone(&observer) as Arc<dyn tornect_session::services::ServicesObserver>,
+            policy_rx,
+            env,
+            ServicesLimits::default(),
+        )
+        .with_lock_watcher(),
+    );
+    let lock_watch = tokio::spawn(crate::services::watch_lock(
+        crate::services::SystemLock::default(),
+        Arc::clone(&services),
+        crate::services::LOCK_EVERY,
     ));
-    let lock_watch = {
-        let (open, set) = (Arc::clone(&services), Arc::clone(&services));
-        tokio::spawn(crate::services::watch_lock(
-            crate::services::SystemLock::default(),
-            move || open.open_streams(),
-            move |locked| set.set_locked(locked),
-            crate::services::LOCK_EVERY,
-        ))
-    };
     deps.sessions = crate::host::UnattendedUse::wrap(
         &ctx,
         Arc::new(GuiSessions {

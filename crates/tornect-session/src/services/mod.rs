@@ -212,6 +212,11 @@ pub struct ServicesLimits {
     /// Bytes of a received file written between two readings of the disk's
     /// free space.
     pub recheck_free_every: u64,
+    /// How long a stream waits, before its `Welcome`, for a lock reading
+    /// taken after it opened, when a lock watcher feeds the host
+    /// ([`ServicesHost::with_lock_watcher`]) and the clipboard or files
+    /// would be granted (§2.3); the last reading holds past it.
+    pub lock_wait: Duration,
     /// How long a stream's end waits for its upload workers (each deletes
     /// what it wrote, or puts a file it had verified in place) before
     /// `serve` returns.
@@ -234,6 +239,7 @@ impl Default for ServicesLimits {
             session_files: 1000,
             min_file_charge: 4096,
             recheck_free_every: RECHECK_FREE_EVERY,
+            lock_wait: Duration::from_secs(2),
             workers_wait: Duration::from_secs(5),
         }
     }

@@ -18,7 +18,12 @@
 //!    desktop's clipboard is opened (on a blocking thread, within
 //!    [`ServicesLimits::clipboard_wait`]) only when the clipboard is
 //!    eligible, and the inbox checked only when uploads are; [`granted`]
-//!    gives the caps. The capture state is read once more after those waits:
+//!    gives the caps. With a lock watcher
+//!    ([`ServicesHost::with_lock_watcher`]), caps that hold the clipboard or
+//!    files wait first, up to [`ServicesLimits::lock_wait`], for a lock
+//!    reading taken since the stream bound, so that a host locked while no
+//!    stream was open starts it paused (§2.3). The capture state is read
+//!    once more after those waits:
 //!    input lost meanwhile (`INPUT_LOST`) takes the clipboard and files back
 //!    and drops a link opened then, and capture stopped meanwhile is
 //!    `Refused{CAPTURE_STOPPED}`. No caps is `Refused{NOT_OFFERED}`; else
@@ -58,6 +63,7 @@
 //!
 //! [`ServicesLimits::live_wait`]: super::ServicesLimits::live_wait
 //! [`ServicesLimits::clipboard_wait`]: super::ServicesLimits::clipboard_wait
+//! [`ServicesLimits::lock_wait`]: super::ServicesLimits::lock_wait
 //! [`ServicesLimits::workers_wait`]: super::ServicesLimits::workers_wait
 
 use std::collections::HashMap;
@@ -66,7 +72,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tornect_input::clipboard::ClipboardLink;
 use tornect_proto::services::{
     CHUNK, CLIP_CHUNK_HEAD, Caps, Chat, ClipSwitch, MAX_BULK_WINDOW, MAX_CHAT_BYTES, MAX_CLIP,
@@ -158,6 +164,13 @@ pub struct ServicesHost {
     /// The host is locked or shows a secure screen (§2.3): every stream
     /// reads it.
     locked: watch::Sender<bool>,
+    /// A lock watcher feeds [`Self::locked`] ([`Self::with_lock_watcher`]).
+    lock_watched: bool,
+    /// Lock readings the watcher took, whatever they said
+    /// ([`Self::lock_read`]).
+    lock_reads: watch::Sender<u64>,
+    /// A stream that bound asks the watcher for a reading now.
+    lock_asked: Notify,
     /// Streams bound and not yet ended.
     open: Arc<AtomicUsize>,
     /// The lines streams without a bound session can cause.
@@ -223,9 +236,32 @@ impl ServicesHost {
             limits,
             controls: Mutex::new(HashMap::new()),
             locked: watch::Sender::new(false),
+            lock_watched: false,
+            lock_reads: watch::Sender::new(0),
+            lock_asked: Notify::new(),
             open: Arc::new(AtomicUsize::new(0)),
             pre_bind: Mutex::new(LineBudget::new(PRE_BIND_WINDOW, PRE_BIND_LINES)),
         }
+    }
+
+    /// A lock watcher feeds this host (§2.3): the caller runs one that
+    /// reads the lock every second while [`Self::open_streams`] is not
+    /// zero, and at once whenever [`Self::lock_asked`] resolves, hands each
+    /// change to [`Self::set_locked`] and then calls [`Self::lock_read`]
+    /// after every reading, one that could not be taken included. Each
+    /// stream then asks the watcher for a reading as it binds, and one that
+    /// would be granted the clipboard or files waits, before its `Welcome`,
+    /// up to [`ServicesLimits::lock_wait`] for a reading taken since: the
+    /// watcher reads nothing while no stream is open, so the state it last
+    /// gave may predate the stream, and a host that locked meanwhile starts
+    /// it paused. Past the wait, the last state holds. Without a watcher,
+    /// the state [`Self::set_locked`] last gave holds.
+    ///
+    /// [`ServicesLimits::lock_wait`]: super::ServicesLimits::lock_wait
+    #[must_use]
+    pub fn with_lock_watcher(mut self) -> Self {
+        self.lock_watched = true;
+        self
     }
 
     /// The services of a host that offers none, over `media`: the terminal
@@ -314,6 +350,22 @@ impl ServicesHost {
         });
     }
 
+    /// Resolves when a stream that bound asks the lock watcher for a
+    /// reading now ([`Self::with_lock_watcher`]). One reading answers every
+    /// stream that asked before it.
+    pub async fn lock_asked(&self) {
+        self.lock_asked.notified().await;
+    }
+
+    /// The lock watcher took a reading, whatever it said: call it after
+    /// [`Self::set_locked`] for a reading that changed the state, and after
+    /// one that changed nothing or could not be taken too
+    /// ([`Self::with_lock_watcher`]).
+    pub fn lock_read(&self) {
+        self.lock_reads
+            .send_modify(|reads| *reads = reads.wrapping_add(1));
+    }
+
     fn op(&self, session_id: &str, op: HostOp) -> bool {
         lock(&self.controls)
             .get(session_id)
@@ -379,6 +431,13 @@ impl ServicesHost {
             mut end,
             mut capture,
         } = claim;
+        // A reading taken from now on is fresh: the watcher is asked for one
+        // at once, and capture's wait gives it time.
+        let mut lock_reads = self.lock_watched.then(|| {
+            let reads = self.lock_reads.subscribe();
+            self.lock_asked.notify_one();
+            reads
+        });
         // Nothing before the first picture (§2.2): capture follows the accept
         // and the unattended block window, so services never come before
         // consent.
@@ -428,6 +487,25 @@ impl ServicesHost {
             };
         }
         let inbox_usable = eligible & caps::UPLOAD != 0 && self.inbox_ready(session_id).await;
+        if granted(eligible, link.is_some(), inbox_usable) & caps::PAUSABLE != 0
+            && let Some(reads) = lock_reads.as_mut()
+        {
+            // The clipboard or files would be granted: not on a lock state
+            // older than this stream (§2.3). `run` reads the state this
+            // reading left.
+            tokio::select! {
+                biased;
+                code = ended(&mut end) => return Err(code),
+                read = tokio::time::timeout(self.limits.lock_wait, reads.changed()) => {
+                    if read.is_err() {
+                        tracing::info!(
+                            session = %session_id,
+                            "no lock reading in time: the last one holds"
+                        );
+                    }
+                }
+            }
+        }
 
         // What happened during those waits (the step 8–9 obligation): input
         // lost meanwhile takes the clipboard and files back, and a link that
