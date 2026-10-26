@@ -104,6 +104,55 @@ What logs addresses or keys (input to design DIRECT-6, decision M1-83, step A7):
   datagram that caused it: after `set_server_config(None)` a further Initial starts no
   `Incoming`, and the real viewer's endpoint answers the host's replies to spoofed Initials
   this way, which the tests show harms neither connection.
+- **Review fixes (2026-10-26; `a96b703c`, `4dcb9d90`, `6e2768e6`).**
+  - **The accept race, corrected.** `be894c1f` capped the handshakes in flight at four and
+    dropped the oldest for a fifth, and its commit message and the `accept` doc said a
+    spoofed Initial raced from the validated address "cannot lock the real dialler out".
+    That held only for Initials raced *before* the real one: dropping a `Connecting` closes
+    it (`quinn-0.11.12/src/connection.rs:946`), so four spoofed Initials sent while the real
+    handshake was in flight evicted it (the dial failed `Handshake { crypto: false }`), and
+    four sent after the viewer had completed its side, with its `Finished` still on the
+    way, closed the viewer's connection with `ConnectionClosed(APPLICATION_ERROR)`, which
+    is not a crypto close, so under M1-79 a viewer that had written its `Bind` would end
+    the session instead of falling back. `accept` now answers every attempt whose address
+    quinn has not validated with a QUIC Retry (RFC 9000 §8.1.2) and starts a handshake
+    only for the dialler's next Initial, which carries the token; at the cap a further
+    validated attempt is ignored, and none is evicted. An off-path spoofer never sees the
+    Retry, so its attempts take no slot before, during or after the real handshake; each
+    draws one Retry (108 bytes in the tests, IPv4, against a 1200-byte Initial) to the forged,
+    validated address instead of the full server flight. Cost: one more round trip per
+    direct dial, inside the viewer's 4 s punch timeout (a deviation from design §6.5,
+    which accepts the first Initial). Residual: quinn ignores an Initial while
+    `max_incoming` (4) attempts await `accept`'s decision
+    (`quinn-proto-0.11.19/src/endpoint.rs:458–464`), so a burst beyond four is cut before
+    `accept` sees it, and a volumetric flood from a validated address can delay the
+    handshake (as any flood can block a UDP path); it cannot take a slot. For step C1's
+    threat-model text (design §9.3, "Off-path spoofer"): the lock-out mitigation is the
+    Retry before a handshake slot, with the server configuration kept on until
+    `check_peer` passes.
+  - **Retry facts (quinn-proto 0.11.19).** `Incoming::remote_address_validated()` is true
+    only for an Initial carrying a valid token: a Retry token, or a NEW_TOKEN token, which
+    `sent(0)` and `NoneTokenLog` rule out here (`token.rs:116–189`). `Incoming::retry()`
+    refuses only an Initial that already carries a Retry token (`may_retry`,
+    `endpoint.rs:1220`), which is then validated. A Retry token is sealed under the server
+    configuration's random `token_key` (`ServerConfig::with_crypto`,
+    `config/mod.rs:396–409`), bound to the remote address and port (`token.rs:152`) and
+    valid for `retry_token_lifetime` = 15 s by the system clock (`config/mod.rs:242`). An
+    Initial with an invalid Retry token draws a small `INVALID_TOKEN` close
+    (`endpoint.rs:513`); a Retry reaching an endpoint for a connection it does not know is
+    dropped (`endpoint.rs:255`), so the real viewer ignores the Retries its address draws
+    for spoofed Initials. The client keeps the Retry token for its retransmissions, so an
+    attempt ignored at the cap retries with it.
+  - **Possession of the pinned key.** The pinned key is public (`PAIR_ACCEPT`,
+    `SESSION_ACCEPT.quic_spki`), so the `CertificateVerify` check is what keeps a peer
+    that only knows it out. At `be894c1f` no test guarded it (every impostor presented its
+    own key and was refused by the SPKI comparison first). Now a signature by another key,
+    over another message, or with a flipped bit fails in both verifier impls, and a viewer
+    or host built with `QuicIdentity::with_key` that presents the pinned key but signs
+    with another device key ends in a TLS alert in a real handshake.
+  - **A dropped refusal.** `refuse` closes the connection from a drop guard, so a caller
+    that races it against the kill (design §9.1 invariant 10) and drops it still closes
+    with the reason code at once; the viewer may then see the close without the frame.
 
 ---
 
