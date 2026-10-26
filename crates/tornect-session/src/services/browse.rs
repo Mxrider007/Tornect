@@ -22,7 +22,10 @@
 //! 4. the deny-list (`DENIED`): never under Tornect's own folders (both the
 //!    `TORNECT_HOME` ones and the platform's, [`tornect_denied`]) nor, on
 //!    Linux, `/proc`, `/sys`, `/dev` and `$XDG_RUNTIME_DIR`
-//!    ([`system_denied`]);
+//!    ([`system_denied`]); a denied folder that does not exist yet is held
+//!    in the canonical form it will have (its nearest existing folder
+//!    canonicalised, the rest appended), so that it matches once it is made
+//!    (a link made there to elsewhere is caught by step 5's marker);
 //! 5. the marker: no folder from the path up to its place's root holds
 //!    `tornect_core::files::PRIVATE_MARKER`, so any Tornect home, another
 //!    `TORNECT_HOME` included, is `DENIED`;
@@ -99,14 +102,20 @@ impl Access {
     /// folders, and `/` on Linux or each fixed drive's root on Windows),
     /// never under `denied` ([`tornect_denied`], [`system_denied`]). Each
     /// place and each denied folder is canonicalised now; a place that does
-    /// not resolve, or does not have the platform's form, is left out, and a
-    /// denied folder that does not resolve is kept as given. Blocking: it
-    /// reads the file system.
+    /// not resolve, or does not have the platform's form, is left out. A
+    /// denied folder that does not resolve yet is kept in the canonical form
+    /// it will have once it is made (its nearest existing folder
+    /// canonicalised, the rest appended: on Windows the verbatim `\\?\C:\…`
+    /// form, past a linked folder above it the link's target), and as given
+    /// too. Blocking: it reads the file system.
     #[must_use]
     pub fn new(places: Vec<(String, PathBuf)>, denied: Vec<PathBuf>) -> Self {
         let mut deny: Vec<PathBuf> = Vec::new();
         for dir in denied {
-            if let Ok(canonical) = fs::canonicalize(&dir)
+            let canonical = fs::canonicalize(&dir)
+                .ok()
+                .or_else(|| canonical_to_be(&dir));
+            if let Some(canonical) = canonical
                 && !deny.contains(&canonical)
             {
                 deny.push(canonical);
@@ -243,6 +252,39 @@ impl Access {
             })
             .collect()
     }
+}
+
+/// The canonical path `dir`, absolute and not there yet, will have once it is
+/// made: its nearest existing folder canonicalised, the names below it
+/// appended as they are. `None` for a relative `dir`, one with a `.` or `..`
+/// in it (Windows would resolve those without looking, Unix not), or one no
+/// folder of which resolves.
+fn canonical_to_be(dir: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    if !dir.is_absolute()
+        || dir
+            .components()
+            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+    {
+        return None;
+    }
+    let mut below = Vec::new();
+    for ancestor in dir.ancestors() {
+        if let Ok(base) = fs::canonicalize(ancestor) {
+            return Some(
+                below
+                    .iter()
+                    .rev()
+                    .fold(base, |path: PathBuf, name| path.join(name)),
+            );
+        }
+        match ancestor.components().next_back() {
+            Some(Component::Normal(name)) => below.push(name.to_owned()),
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Whether a canonical path has the platform's form: on Windows a verbatim
@@ -1023,6 +1065,59 @@ mod tests {
         assert_eq!(access.check(&tree.docs), Err(reason::DENIED));
         assert_eq!(Access::none().check(&tree.home), Err(reason::DENIED));
         assert_eq!(format!("{access:?}"), "Access { places: 1, denied: 1 }");
+    }
+
+    /// The final review's deny-list finding: a denied folder that does not
+    /// exist when the rules are made, named through a path that is not
+    /// canonical (on Windows every given path, which is not verbatim; on
+    /// Unix, here, through a linked folder, as `/home` is a link on Fedora
+    /// Atomic), denies what is made there later by the deny-list alone,
+    /// without the marker.
+    #[test]
+    fn a_denied_folder_made_later_is_denied_without_its_marker() {
+        let top = tempfile::tempdir().unwrap();
+        let real = fs::canonicalize(top.path()).unwrap().join("real");
+        fs::create_dir_all(&real).unwrap();
+        #[cfg(unix)]
+        let named = {
+            let link = top.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            link.join("later").join("tornect")
+        };
+        #[cfg(not(unix))]
+        let named = top.path().join("real").join("later").join("tornect");
+        let access = Access::new(vec![("Top".into(), real.clone())], vec![named]);
+        let made = real.join("later").join("tornect");
+        fs::create_dir_all(&made).unwrap();
+        fs::write(made.join("device.key"), b"secret").unwrap();
+        assert!(!made.join(PRIVATE_MARKER).exists());
+        assert_eq!(access.check(&made), Err(reason::DENIED));
+        assert_eq!(access.check(&made.join("device.key")), Err(reason::DENIED));
+        let cancel = AtomicBool::new(false);
+        let folder = read_folder(&access, Some(&real.join("later")), 100, &cancel).unwrap();
+        assert!(folder.entries.is_empty(), "the denied folder is omitted");
+        // What is next to it is not.
+        fs::write(real.join("later").join("notes.txt"), b"hi").unwrap();
+        assert!(access.check(&real.join("later").join("notes.txt")).is_ok());
+    }
+
+    /// The canonical form a missing folder will have: its existing part
+    /// canonicalised, the rest appended; nothing for a relative path or one
+    /// with `..` in it.
+    #[test]
+    fn a_missing_folder_takes_the_canonical_form_it_will_have() {
+        let top = tempfile::tempdir().unwrap();
+        let canonical = fs::canonicalize(top.path()).unwrap();
+        assert_eq!(
+            canonical_to_be(&top.path().join("a").join("b")),
+            Some(canonical.join("a").join("b"))
+        );
+        assert_eq!(canonical_to_be(Path::new("relative/dir")), None);
+        assert_eq!(
+            canonical_to_be(&top.path().join("a").join("..").join("b")),
+            None
+        );
+        assert_eq!(canonical_to_be(&top.path().join("..").join("b")), None);
     }
 
     /// A link is followed before the rules apply: a link into the state
