@@ -143,10 +143,6 @@ pub enum Command {
     /// The host's person acts on a shared session's services (design
     /// `services` §7.2): writes in its chat, stops one of its transfers, or
     /// turns its clipboard and files off for the rest of the session.
-    #[expect(
-        dead_code,
-        reason = "sent by the host window's services strip and chat card (the design's step 25)"
-    )]
     HostServices {
         /// The shared session (`sessions.log`'s id).
         session_id: String,
@@ -162,8 +158,6 @@ pub enum Command {
 }
 
 /// What the host's person does with a shared session's services.
-// Made by the host window's services strip and chat card (the design's step 25).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostServicesOp {
     /// Write to the viewer.
@@ -9950,6 +9944,10 @@ mod tests {
             .await
             .expect("the host's stream ends with the session")
             .unwrap();
+        // How the media stream ended, said beside a wrong services outcome:
+        // capture that stopped before `on_end` ends the services stream
+        // `CAPTURE_STOPPED`.
+        let media = tokio::time::timeout(Duration::from_secs(20), media_served).await;
         assert!(
             matches!(
                 outcome,
@@ -9958,7 +9956,7 @@ mod tests {
                     ..
                 }
             ),
-            "{outcome:?}"
+            "{outcome:?}; the media stream: {media:?}"
         );
         tokio::time::timeout(Duration::from_secs(20), viewer)
             .await
@@ -9968,7 +9966,6 @@ mod tests {
             shared.read(|m| viewer_card(m).map(|c| c.state)),
             Some(ServicesState::Ended(reason::SESSION_OVER))
         );
-        let _ = tokio::time::timeout(Duration::from_secs(20), media_served).await;
 
         let records = tornect_core::session_log::SessionLog::new(&log_path)
             .read_all()

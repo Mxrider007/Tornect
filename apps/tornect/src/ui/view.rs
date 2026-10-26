@@ -31,6 +31,10 @@ use super::theme::{self, Face};
 use super::widgets;
 use crate::ua_client::AdminAction;
 
+mod strip;
+
+pub use self::strip::HostServicesAction;
+
 /// The SAS display size (§7: "SAS display 44 mono").
 pub const SAS_SIZE: f32 = 44.0;
 
@@ -218,6 +222,14 @@ pub enum Action {
     CloseWindow,
     /// Try Tor, or publishing this computer's ID, again now (B02).
     RetryTor,
+    /// The host's person acts on a shared session's services, from its
+    /// strip or its chat card (the services design §7.2).
+    HostServices {
+        /// The shared session (`sessions.log`'s id).
+        session_id: String,
+        /// What to do.
+        op: HostServicesAction,
+    },
 }
 
 /// The main window's one card when Rotate ID did not finish, with Close.
@@ -341,6 +353,9 @@ pub struct Form {
     pub ua: UaForm,
     /// The Sessions page shows the session log's folder.
     pub log_folder_shown: bool,
+    /// What is typed into each shared session's chat card, by the
+    /// session's id; it goes with the session.
+    pub chats: HashMap<String, String>,
     /// What the request sheet last kept in view: its viewport's size, its
     /// newest card, how many cards it held and how tall they were. When any
     /// of them changes the newest card's answers are brought into view again.
@@ -565,10 +580,11 @@ pub(super) fn clock(since: Instant, now: Instant) -> String {
     format!("{:02}:{:02}", secs / 60, secs % 60)
 }
 
-/// The main window: the sharing banner, the open questions, the page and the
-/// sidebar. The keyboard reaches them in that order: the banner's Stop, the
-/// questions (a refusal first in each), the page, and last the navigation,
-/// whose room is reserved first and filled after the page.
+/// The main window: the sharing banner (with each session's services strip
+/// and chat card), the open questions, the page and the sidebar. The
+/// keyboard reaches them in that order: the banner's Stop, the strip and the
+/// chat, the questions (a refusal first in each), the page, and last the
+/// navigation, whose room is reserved first and filled after the page.
 pub fn main_window(
     ui: &mut egui::Ui,
     model: &Model,
@@ -597,6 +613,10 @@ pub fn main_window(
                 for sharing in &model.sharing {
                     let admin = model.admin_sessions.contains(&sharing.session_id);
                     sharing_banner(ui, sharing, admin, now, actions);
+                    strip::services_strip(ui, sharing, actions);
+                    // In the banner, not above the page: the page's widgets
+                    // keep their ids whether a chat card shows or not.
+                    strip::chat_card(ui, sharing, &mut form.chats, actions);
                 }
                 if let Some(warning) = &model.polkit_warning {
                     ui.add(
@@ -612,6 +632,8 @@ pub fn main_window(
         .retain(|id, _| model.popups.iter().any(|p| p.id == *id));
     form.codes
         .retain(|id, _| model.popups.iter().any(|p| p.id == *id));
+    form.chats
+        .retain(|id, _| model.sharing.iter().any(|s| s.session_id == *id));
     form.cards.retain(|id, _| {
         model.popups.iter().any(|p| {
             p.id == *id || (model.admin_confirm.contains(&p.id) && confirmation_card(p.id) == *id)
@@ -2117,6 +2139,15 @@ mod tests {
         /// Whether a widget labelled `label` was on screen in the last pass.
         fn has(&self, label: &str) -> bool {
             self.nodes.iter().any(|n| n.label() == Some(label))
+        }
+
+        /// The text of every label in the last pass.
+        fn texts(&self) -> Vec<String> {
+            self.nodes
+                .iter()
+                .filter_map(|n| n.value())
+                .map(str::to_owned)
+                .collect()
         }
 
         /// Whether the button labelled `label` was disabled in the last pass.
@@ -3855,5 +3886,246 @@ mod tests {
         }
         assert_eq!(QUOTATION_MARKS.len() + MIDDLE_DOTS.len(), 11);
         assert_eq!(quoted_free("Desk of Bob"), "Desk of Bob");
+    }
+
+    /// A shared session "0011" with "Laptop", in control or view only, whose
+    /// services are `services`.
+    fn serviced(
+        control: bool,
+        input: bool,
+        services: super::super::services::HostServices,
+        t0: Instant,
+    ) -> Model {
+        Model {
+            sharing: vec![Sharing {
+                session_id: "0011".to_owned(),
+                label: "Laptop".to_owned(),
+                control,
+                unattended: false,
+                since: t0,
+                capture: Some(CaptureNote {
+                    source: "test card",
+                    width: 640,
+                    height: 360,
+                    input,
+                    shown: None,
+                    all: false,
+                    screens: 0,
+                }),
+                services: Some(services),
+            }],
+            ..with_popups(Vec::new())
+        }
+    }
+
+    fn host_action(op: HostServicesAction) -> Action {
+        Action::HostServices {
+            session_id: "0011".to_owned(),
+            op,
+        }
+    }
+
+    /// The services design §7.2: under the banner, the strip says in fixed
+    /// words what the viewer may do, each transfer (Cancel while it runs)
+    /// and the clipboard's last events, and its buttons ask for what they
+    /// say. No line names a path of this computer, and no file's name is
+    /// on the banner's mode and clock line.
+    #[test]
+    fn the_services_strip_says_what_the_viewer_may_do() {
+        use tornect_proto::services::caps;
+        use tornect_session::services::{Direction, TransferRow, TransferState, Untrusted};
+
+        use super::super::services::{ClipNote, HostServices};
+
+        let t0 = Instant::now();
+        let row = |xfer, dir, state| TransferRow {
+            xfer,
+            dir,
+            name: Untrusted::file_name("plan.odt"),
+            size: 12_000_000,
+            done: 5_400_000,
+            state,
+        };
+        let mut services = HostServices::opened(caps::ALL, true, false);
+        services.transfers = vec![
+            row(7, Direction::ToHost, TransferState::Running),
+            row(
+                8,
+                Direction::ToHost,
+                TransferState::Done {
+                    stored: Untrusted::file_name("plan (2).odt"),
+                },
+            ),
+            row(
+                9,
+                Direction::FromHost,
+                TransferState::Done {
+                    stored: Untrusted::file_name("plan.odt"),
+                },
+            ),
+        ];
+        services.clips = vec![
+            ClipNote::Sent { chars: 12 },
+            ClipNote::Received { chars: 3 },
+        ];
+        let mut window = Harness::new(serviced(true, true, services, t0), t0);
+        assert_eq!(
+            window.text("Chat on"),
+            "Chat on · Clipboard shared both ways · They can send files and see and copy your \
+             files"
+        );
+        assert_eq!(window.text("Receiving"), "Receiving \"plan.odt\" · 45%");
+        assert_eq!(
+            window.text("Received"),
+            "Received \"plan (2).odt\" (12 MB) in Downloads › Tornect"
+        );
+        assert_eq!(
+            window.text("They copied"),
+            "They copied \"plan.odt\" (12 MB)"
+        );
+        assert_eq!(
+            window.text("Copied text"),
+            "Copied text was sent to them (12 characters)"
+        );
+        assert_eq!(
+            window.text("They put"),
+            "They put text on this computer's clipboard (3 characters)"
+        );
+        let texts = window.texts();
+        for line in [strip::NO_INPUT, strip::PAUSED, strip::CLIPBOARD_REFUSED] {
+            assert!(!texts.iter().any(|t| t == line), "{line}");
+        }
+        for text in texts
+            .iter()
+            .filter(|t| t.contains("plan") || t.contains("characters"))
+        {
+            assert!(!text.contains('/') && !text.contains('\\'), "{text}");
+        }
+        let line = window.text("SHARING");
+        assert!(!line.contains("plan"), "{line}");
+
+        let at = window.button(strip::CANCEL);
+        let actions = window.click(t0 + Duration::from_secs(2), at);
+        assert_eq!(actions, vec![host_action(HostServicesAction::Cancel(7))]);
+        let at = window.button(strip::TURN_OFF);
+        let actions = window.click(t0 + Duration::from_secs(3), at);
+        assert_eq!(actions, vec![host_action(HostServicesAction::TurnOff)]);
+    }
+
+    /// The strip's other lines: no input in a control session (at the
+    /// stream's start or since), the clipboard the desktop refused, the
+    /// pause while this computer is locked; a view-only session gets none
+    /// of the no-input line, a session with only chat no turn-off, and a
+    /// stream that ended no strip.
+    #[test]
+    fn the_strip_says_when_files_and_the_clipboard_are_off_or_paused() {
+        use tornect_proto::services::{caps, reason};
+
+        use super::super::services::HostServices;
+
+        let t0 = Instant::now();
+        let shows = |model: Model| {
+            let window = Harness::new(model, t0);
+            (window.texts(), window.has(strip::TURN_OFF))
+        };
+
+        let (texts, turn_off) = shows(serviced(
+            true,
+            false,
+            HostServices::opened(caps::CHAT, false, true),
+            t0,
+        ));
+        assert!(texts.iter().any(|t| t == strip::NO_INPUT));
+        assert!(texts.iter().any(|t| t == strip::CLIPBOARD_REFUSED));
+        assert!(texts.iter().any(|t| t == "Chat on"));
+        assert!(!turn_off, "nothing to turn off");
+
+        // Input that stopped reaching this desktop after the stream opened.
+        let (texts, _) = shows(serviced(
+            true,
+            false,
+            HostServices::opened(caps::CHAT, true, false),
+            t0,
+        ));
+        assert!(texts.iter().any(|t| t == strip::NO_INPUT));
+
+        let mut paused = HostServices::opened(caps::ALL, true, false);
+        paused.paused = caps::CLIP | caps::UPLOAD | caps::BROWSE;
+        let (texts, turn_off) = shows(serviced(true, true, paused, t0));
+        assert!(texts.iter().any(|t| t == strip::PAUSED));
+        assert!(texts.iter().any(|t| t == "Chat on"), "{texts:?}");
+        assert!(turn_off, "what is paused can still be turned off");
+        assert!(!texts.iter().any(|t| t == strip::NO_INPUT));
+
+        let (texts, turn_off) = shows(serviced(
+            false,
+            false,
+            HostServices::opened(caps::CHAT, false, false),
+            t0,
+        ));
+        assert!(
+            !texts.iter().any(|t| t == strip::NO_INPUT),
+            "view only says so already"
+        );
+        assert!(texts.iter().any(|t| t == "Chat on"));
+        assert!(!turn_off);
+
+        let mut ended = HostServices::opened(caps::ALL, true, false);
+        ended.ended = Some(reason::CAPTURE_STOPPED);
+        let (texts, turn_off) = shows(serviced(true, true, ended, t0));
+        assert!(!texts.iter().any(|t| t.starts_with("Chat on")));
+        assert!(!turn_off);
+    }
+
+    /// The chat card (§7.2): `Chat with "<label>"`, the viewer's lines under
+    /// their label and this computer's as `You`, the field and Send while
+    /// chat is on, the footer; shown in a focused window, its lines count
+    /// as read. A stream that ended keeps the history without the field,
+    /// and what was typed goes with the session's row.
+    #[test]
+    fn the_chat_card_shows_both_sides_and_sends_what_is_typed() {
+        use tornect_proto::services::{caps, reason};
+        use tornect_session::services::{HostEvent, sanitize_peer_text};
+
+        use super::super::services::HostServices;
+
+        let t0 = Instant::now();
+        let mut services = HostServices::opened(caps::CHAT, false, false);
+        services.apply(&HostEvent::Chat(sanitize_peer_text("hello there").unwrap()));
+        services.said(sanitize_peer_text("hi").unwrap());
+        let mut window = Harness::new(serviced(false, false, services.clone(), t0), t0);
+        assert_eq!(window.text("Chat with"), "Chat with \"Laptop\"");
+        assert_eq!(window.text("\"Laptop\":"), "\"Laptop\": hello there");
+        assert_eq!(window.text("You:"), "You: hi");
+        assert_eq!(window.text("Not saved"), strip::NOT_SAVED);
+        let actions = window.pass(t0 + Duration::from_secs(1), Vec::new());
+        assert_eq!(actions, vec![host_action(HostServicesAction::Read)]);
+
+        window
+            .form
+            .chats
+            .insert("0011".to_owned(), "on my way".to_owned());
+        let at = window.button(strip::SEND);
+        let actions = window.click(t0 + Duration::from_secs(2), at);
+        assert!(
+            actions.contains(&host_action(HostServicesAction::Send)),
+            "{actions:?}"
+        );
+
+        services.unread = 0;
+        services.ended = Some(reason::SESSION_OVER);
+        let mut window = Harness::new(serviced(false, false, services, t0), t0);
+        assert!(!window.has(strip::SEND), "no field once the stream ended");
+        assert_eq!(window.text("You:"), "You: hi");
+        assert!(window.pass(t0, Vec::new()).is_empty(), "nothing unread");
+
+        window
+            .form
+            .chats
+            .insert("0011".to_owned(), "late".to_owned());
+        window.model.sharing.clear();
+        window.pass(t0, Vec::new());
+        assert!(window.form.chats.is_empty(), "the draft goes with the row");
+        assert!(!window.texts().iter().any(|t| t.starts_with("Chat with")));
     }
 }

@@ -30,7 +30,7 @@ use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{UserAttentionType, Window, WindowAttributes, WindowId};
 
-use super::backend::{Command, StreamLink};
+use super::backend::{Command, HostServicesOp, StreamLink};
 use super::block;
 use super::consent::Popups;
 use super::indicator::{self, Change, Indicator};
@@ -39,7 +39,7 @@ use super::model::{ClientStage, Model, Shared, Viewing, Wake};
 use super::nav::Page;
 use super::pages::viewer::{Combo, FileOp, FilesTab, ViewerAction, ViewerState, offered};
 use super::stream::{Forwarder, Picture, PictureRect, VideoTexture, button};
-use super::view::{self, Action, Form};
+use super::view::{self, Action, Form, HostServicesAction};
 
 /// How long closing the window waits for the goodbyes before it quits anyway.
 const QUIT_WAIT: Duration = Duration::from_secs(10);
@@ -139,6 +139,72 @@ fn ask_attention(window: &impl Attention) -> bool {
     }
     window.request_user_attention(Some(UserAttentionType::Critical));
     restore
+}
+
+/// A shared session's viewer wrote while nothing of theirs was unread
+/// (`Wake::Nudge`, the services design §7.2): an informational request for
+/// attention and nothing else. Unlike [`ask_attention`] it never brings a
+/// minimized window back (on X11 that is an activation), takes the focus or
+/// arms a card again: a chat line is no question to answer.
+fn nudge(window: &impl Attention) {
+    window.request_user_attention(Some(UserAttentionType::Informational));
+}
+
+/// What the host's person did on a shared session's services strip or chat
+/// card, as the tokio side takes it (`Command::HostServices`): what the chat
+/// field held, sanitised as the viewer will show it, while that session's
+/// chat is on (nothing when it is empty); a Cancel; the turn-off of the
+/// clipboard and files. `Read` only marks the card's lines seen. The draft
+/// goes with a Send, whether or not anything is sent.
+fn host_services_action(
+    shared: &Shared,
+    form: &mut Form,
+    session_id: String,
+    op: HostServicesAction,
+) -> Option<Command> {
+    let op = match op {
+        HostServicesAction::Send => {
+            let text = form.chats.remove(&session_id).unwrap_or_default();
+            let open = shared.read(|m| {
+                m.sharing
+                    .iter()
+                    .find(|s| s.session_id == session_id)
+                    .and_then(|s| s.services.as_ref())
+                    .is_some_and(|c| c.ended.is_none() && c.caps & caps::CHAT != 0)
+            });
+            if !open || text.trim().is_empty() {
+                return None;
+            }
+            HostServicesOp::Chat(sanitize_peer_text(&text)?)
+        }
+        HostServicesAction::Cancel(xfer) => HostServicesOp::Cancel(xfer),
+        HostServicesAction::TurnOff => {
+            HostServicesOp::TurnOff(caps::CLIP | caps::UPLOAD | caps::BROWSE)
+        }
+        HostServicesAction::Read => {
+            let unread = |m: &Model| {
+                m.sharing
+                    .iter()
+                    .find(|s| s.session_id == session_id)
+                    .and_then(|s| s.services.as_ref())
+                    .map_or(0, |c| c.unread)
+            };
+            if shared.read(unread) > 0 {
+                shared.update(|m| {
+                    if let Some(card) = m
+                        .sharing
+                        .iter_mut()
+                        .find(|s| s.session_id == session_id)
+                        .and_then(|s| s.services.as_mut())
+                    {
+                        card.unread = 0;
+                    }
+                });
+            }
+            return None;
+        }
+    };
+    Some(Command::HostServices { session_id, op })
 }
 
 /// Background mode (§B.1.1): the main window is minimised right after it is
@@ -957,8 +1023,9 @@ impl App {
     }
 
     /// The wakes taken without the event loop: a new picture for the stream
-    /// window, and `Show` (its raise, then its link: [`Self::show`]). Any
-    /// other is given back for `user_event` to take with the loop.
+    /// window, `Show` (its raise, then its link: [`Self::show`]) and
+    /// `Nudge` ([`nudge`]). Any other is given back for `user_event` to take
+    /// with the loop.
     fn wake_window(&mut self, why: Wake) -> Option<Wake> {
         match why {
             Wake::Frame => {
@@ -969,6 +1036,12 @@ impl App {
             }
             Wake::Show(link) => {
                 self.show(link);
+                None
+            }
+            Wake::Nudge => {
+                if let Some(main) = &self.main {
+                    nudge(&*main.window);
+                }
                 None
             }
             Wake::Model | Wake::Attention | Wake::Quit => Some(why),
@@ -1696,6 +1769,13 @@ impl App {
             Action::CloseWindow => self.leave = true,
             Action::DeviceWords(key) => self.command(Command::DeviceWords(key)),
             Action::RetryTor => self.command(Command::RetryTor),
+            Action::HostServices { session_id, op } => {
+                if let Some(command) =
+                    host_services_action(&self.shared, &mut self.form, session_id, op)
+                {
+                    self.command(command);
+                }
+            }
         }
     }
 
@@ -1964,7 +2044,7 @@ impl ApplicationHandler<UserEvent> for App {
         };
         match why {
             // Taken by `wake_window`.
-            Wake::Frame | Wake::Show(_) => {}
+            Wake::Frame | Wake::Show(_) | Wake::Nudge => {}
             Wake::Quit => {
                 tracing::info!("asked to quit by a signal: ending every session");
                 self.quit(el);
@@ -2958,6 +3038,127 @@ mod tests {
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
         app.act(Action::MoveIndicator, None);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// The services design §7.2: a new chat line asks for attention only
+    /// informationally, whatever the window's state: no window is brought
+    /// back (an activation on X11), and with no main window up nothing
+    /// happens and nothing goes to the tokio side.
+    #[test]
+    fn a_chat_nudge_only_asks_for_attention() {
+        for minimized in [Some(true), Some(false), None] {
+            let window = Recorder {
+                minimized,
+                calls: RefCell::default(),
+            };
+            nudge(&window);
+            assert_eq!(
+                window.calls.into_inner(),
+                vec![Call::Attention(Some(UserAttentionType::Informational))],
+                "{minimized:?}"
+            );
+        }
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let popups = Popups::new(Arc::clone(&shared));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(shared, popups, Arc::new(StreamLink::default()), tx);
+        assert_eq!(app.wake_window(Wake::Nudge), None);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// The host's strip and chat card reach the tokio side as
+    /// `Command::HostServices` (§7.2): the chat field's text, sanitised,
+    /// only while the session's chat is on and when it holds something
+    /// (the draft goes either way); a Cancel; the one-way turn-off of the
+    /// clipboard and files, never of chat. `Read` sends nothing and clears
+    /// the card's unread count.
+    #[test]
+    fn the_host_strip_and_chat_card_ask_the_tokio_side() {
+        use tornect_session::services::HostEvent;
+
+        use super::super::model::Sharing;
+        use super::super::services::HostServices;
+
+        let mut card = HostServices::opened(caps::ALL, true, false);
+        card.apply(&HostEvent::Chat(sanitize_peer_text("hi").unwrap()));
+        card.apply(&HostEvent::Chat(sanitize_peer_text("there").unwrap()));
+        assert_eq!(card.unread, 2);
+        let model = Model {
+            sharing: vec![Sharing {
+                session_id: "0011".to_owned(),
+                label: "Laptop".to_owned(),
+                control: true,
+                unattended: false,
+                since: Instant::now(),
+                capture: None,
+                services: Some(card),
+            }],
+            ..Model::default()
+        };
+        let shared = Shared::new(model, Arc::new(|_| {}));
+        let popups = Popups::new(Arc::clone(&shared));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(
+            Arc::clone(&shared),
+            popups,
+            Arc::new(StreamLink::default()),
+            tx,
+        );
+        let act = |app: &mut App, op| {
+            app.act(
+                Action::HostServices {
+                    session_id: "0011".to_owned(),
+                    op,
+                },
+                None,
+            );
+        };
+        let sent = |op| {
+            Ok(Command::HostServices {
+                session_id: "0011".to_owned(),
+                op,
+            })
+        };
+
+        app.form
+            .chats
+            .insert("0011".to_owned(), "on my way".to_owned());
+        act(&mut app, HostServicesAction::Send);
+        assert_eq!(
+            rx.try_recv(),
+            sent(HostServicesOp::Chat(
+                sanitize_peer_text("on my way").unwrap()
+            ))
+        );
+        assert!(app.form.chats.is_empty(), "the field is emptied");
+        app.form.chats.insert("0011".to_owned(), "   ".to_owned());
+        act(&mut app, HostServicesAction::Send);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty), "nothing typed");
+
+        act(&mut app, HostServicesAction::Cancel(5));
+        assert_eq!(rx.try_recv(), sent(HostServicesOp::Cancel(5)));
+        act(&mut app, HostServicesAction::TurnOff);
+        assert_eq!(
+            rx.try_recv(),
+            sent(HostServicesOp::TurnOff(
+                caps::CLIP | caps::UPLOAD | caps::BROWSE
+            ))
+        );
+
+        act(&mut app, HostServicesAction::Read);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            shared.read(|m| m.sharing[0].services.as_ref().unwrap().unread),
+            0
+        );
+
+        // Chat that went (turned off by policy or the stream's end): what
+        // is typed is not sent.
+        shared.update(|m| m.sharing[0].services.as_mut().unwrap().caps = caps::CLIP);
+        app.form.chats.insert("0011".to_owned(), "late".to_owned());
+        act(&mut app, HostServicesAction::Send);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        assert!(app.form.chats.is_empty());
     }
 
     const CTRL: u32 = 0x07_00e0;

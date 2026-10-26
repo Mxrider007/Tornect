@@ -15,7 +15,7 @@ use tornect_session::services::{
     ViewerEvent, ViewerServicesEnd,
 };
 
-use super::model::Shared;
+use super::model::{Shared, Wake};
 use crate::host::say;
 use crate::services::{Peer, Peers, log_record, reason_name};
 
@@ -138,8 +138,6 @@ impl HostServices {
     }
 
     /// The caps in effect now: granted, not turned off, not paused.
-    // Read by the host window's services strip (the design's step 25).
-    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn effective(&self) -> u16 {
         self.caps & !self.paused
@@ -246,6 +244,9 @@ impl ServicesObserver for GuiServices {
         if matches!(event, HostEvent::FileSent { .. }) {
             return;
         }
+        // Only the first line nobody has seen yet asks for attention, once
+        // (design §7.2); the ones after it only change the card.
+        let mut nudge = false;
         self.shared.update(|m| {
             let Some(sharing) = m.sharing.iter_mut().find(|s| s.session_id == session_id) else {
                 return;
@@ -261,10 +262,17 @@ impl ServicesObserver for GuiServices {
                 ) => {
                     *services = Some(HostServices::opened(*caps, *input, *clipboard_refused));
                 }
-                (Some(services), event) => services.apply(event),
+                (Some(services), event) => {
+                    let unread = services.unread;
+                    services.apply(event);
+                    nudge = unread == 0 && services.unread == 1;
+                }
                 (None, _) => {}
             }
         });
+        if nudge {
+            self.shared.wake(Wake::Nudge);
+        }
     }
 }
 
@@ -544,6 +552,67 @@ mod tests {
     /// A path of this computer, as a download's `FileSent` names it.
     fn test_path() -> tornect_session::services::HostPath {
         tornect_session::services::HostPath::new(std::path::PathBuf::from("/home/u/plan.odt"))
+    }
+
+    /// The services design §7.2: every event changes the card and wakes the
+    /// window (`Wake::Model`); only the line that makes the unread count go
+    /// from 0 to 1 also asks for attention (`Wake::Nudge`), once.
+    #[test]
+    fn only_the_first_unread_line_asks_for_attention() {
+        use std::sync::Mutex;
+        use std::time::Instant;
+
+        use super::super::model::{Model, Sharing};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let woken = Arc::new(Mutex::new(Vec::new()));
+        let model = Model {
+            sharing: vec![Sharing {
+                session_id: "0011".to_owned(),
+                label: "Laptop".to_owned(),
+                control: false,
+                unattended: false,
+                since: Instant::now(),
+                capture: None,
+                services: None,
+            }],
+            ..Model::default()
+        };
+        let shared = Shared::new(model, {
+            let woken = Arc::clone(&woken);
+            Arc::new(move |why| woken.lock().unwrap().push(why))
+        });
+        let log = Arc::new(SessionLog::new(tmp.path().join("sessions.log")));
+        let observer = GuiServices::new(Arc::clone(&shared), log);
+        let nudges = || {
+            woken
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|w| **w == Wake::Nudge)
+                .count()
+        };
+        observer.event(
+            "0011",
+            HostEvent::Opened {
+                caps: caps::CHAT,
+                input: false,
+                clipboard_refused: false,
+            },
+        );
+        assert_eq!(nudges(), 0);
+        observer.event("0011", HostEvent::Chat(text("one")));
+        assert_eq!(nudges(), 1);
+        observer.event("0011", HostEvent::Chat(text("two")));
+        observer.event("0011", HostEvent::ClipIn { chars: 3 });
+        assert_eq!(nudges(), 1, "the second unread line only changes the card");
+        assert!(woken.lock().unwrap().contains(&Wake::Model));
+        shared.update(|m| m.sharing[0].services.as_mut().unwrap().unread = 0);
+        observer.event("0011", HostEvent::Chat(text("three")));
+        assert_eq!(nudges(), 2, "read, then a new line: asked again");
+        // A session this window does not show: nothing.
+        observer.event("0022", HostEvent::Chat(text("elsewhere")));
+        assert_eq!(nudges(), 2);
     }
 
     /// Running rows stay, and only the newest ended ones are kept.

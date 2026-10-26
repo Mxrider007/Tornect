@@ -566,7 +566,8 @@ fn runs(state: &TransferState) -> bool {
 }
 
 /// `name` cut to [`NAME_CHARS`] characters, with "…" when it was longer.
-fn cut(name: &str) -> String {
+#[must_use]
+pub fn cut(name: &str) -> String {
     let mut chars = name.chars();
     let kept: String = chars.by_ref().take(NAME_CHARS).collect();
     if chars.next().is_some() {

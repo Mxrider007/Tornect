@@ -43,6 +43,11 @@ pub enum Wake {
     /// on Windows): close as the window's close button does, ending every
     /// session with a goodbye.
     Quit,
+    /// A shared session's viewer wrote while nothing of theirs was unread
+    /// (design `services` §7.2): ask, informationally, for the user's
+    /// attention on the main window. It never brings the window back, takes
+    /// the focus or arms a card again.
+    Nudge,
 }
 
 /// Wakes the UI thread (a winit event-loop proxy); a no-op in tests.
