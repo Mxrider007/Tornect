@@ -46,6 +46,22 @@ pub trait BlockWindow: Send + Sync {
     /// Run the window for `secs` seconds on behalf of grant `who` / `label`.
     fn run<'a>(&'a self, secs: u8, who: &'a GrantId, label: &'a str)
     -> BoxFuture<'a, BlockOutcome>;
+
+    /// [`Self::run`] for a session of at most `mode`: the grant's mode,
+    /// lowered by the request (the session can only be lowered further),
+    /// which a window that says what control also gives needs (the services
+    /// design §7.4). The state machine calls this one; by default the mode
+    /// goes unsaid.
+    fn run_for<'a>(
+        &'a self,
+        secs: u8,
+        who: &'a GrantId,
+        label: &'a str,
+        mode: SessionMode,
+    ) -> BoxFuture<'a, BlockOutcome> {
+        let _ = mode;
+        self.run(secs, who, label)
+    }
 }
 
 /// The `ask_before_start` popup (§B.8.4.5 `AwaitLocalAllow`). M4 supplies

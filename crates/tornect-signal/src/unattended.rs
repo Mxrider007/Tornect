@@ -1097,10 +1097,19 @@ impl UnattendedAuth {
             }
         }
 
+        // `want_mode` is clamped host-side toward view-only, never a reject.
+        let wanted = if req.want_mode == mode::VIEW_ONLY {
+            SessionMode::ViewOnly
+        } else {
+            SessionMode::Control
+        };
+        // The most the session can be (it is only ever lowered from here):
+        // the block window says what control also gives (services §7.4).
+        let at_most = SessionMode::most_restrictive(grant.mode, wanted);
         let outcome = tokio::select! {
             biased;
             gone = ctx.exchange.departed() => return Err(requester_left(&ctx, gone)),
-            outcome = ctx.block_window.run(grant.block_window_s, &grant.id, label) => outcome,
+            outcome = ctx.block_window.run_for(grant.block_window_s, &grant.id, label, at_most) => outcome,
         };
         let block = match outcome {
             BlockOutcome::Passed(w) => w,
@@ -1130,12 +1139,6 @@ impl UnattendedAuth {
         let confirm = auth::token_confirm(&ck, &th_after_response);
         let proof_fp = auth::proof_fp(&session_key);
 
-        // `want_mode` is clamped host-side toward view-only, never a reject.
-        let wanted = if req.want_mode == mode::VIEW_ONLY {
-            SessionMode::ViewOnly
-        } else {
-            SessionMode::Control
-        };
         // `want_elevation` the same way (r7, §B.8.4.1, D2): the most restrictive
         // of the grant's level, the request and what this host delivers. The
         // grant's level is the clone's (store key 24), none while its password is

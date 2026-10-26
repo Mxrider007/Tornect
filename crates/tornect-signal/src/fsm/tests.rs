@@ -6927,6 +6927,103 @@ impl crate::consent::BlockWindow for CountingWindow {
     }
 }
 
+/// A block window that keeps the mode each opening was told, and lets the session
+/// through; one opened without a mode is kept as `None`.
+#[derive(Default)]
+struct ModeWindow(Mutex<Vec<Option<SessionMode>>>);
+
+impl crate::consent::BlockWindow for ModeWindow {
+    fn run<'a>(
+        &'a self,
+        _: u8,
+        _: &'a tornect_core::unattended::grant::GrantId,
+        _: &'a str,
+    ) -> BoxFuture<'a, BlockOutcome> {
+        self.0.lock().unwrap().push(None);
+        Box::pin(async { BlockOutcome::Passed(WindowPassed::Elapsed) })
+    }
+
+    fn run_for<'a>(
+        &'a self,
+        _: u8,
+        _: &'a tornect_core::unattended::grant::GrantId,
+        _: &'a str,
+        mode: SessionMode,
+    ) -> BoxFuture<'a, BlockOutcome> {
+        self.0.lock().unwrap().push(Some(mode));
+        Box::pin(async { BlockOutcome::Passed(WindowPassed::Elapsed) })
+    }
+}
+
+/// The services design §7.4: the block window is told the most the session can be,
+/// the grant's mode lowered by the request, so that it says what control also gives
+/// only where control may follow; a view-only grant or request is never told control.
+/// A window that does not take the mode opens as before (`run_for`'s default).
+#[tokio::test]
+async fn the_block_window_is_told_the_most_the_session_can_be() {
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    for (grant, want, told) in [
+        (
+            SessionMode::Control,
+            messages::mode::CONTROL,
+            SessionMode::Control,
+        ),
+        (
+            SessionMode::Control,
+            messages::mode::VIEW_ONLY,
+            SessionMode::ViewOnly,
+        ),
+        (
+            SessionMode::ViewOnly,
+            messages::mode::CONTROL,
+            SessionMode::ViewOnly,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut host, client, _guard) = unattended_pair_edited(
+            tmp.path(),
+            PW,
+            Arc::new(tornect_core::levels::FixedFacts::linux()),
+            |g| g.mode = grant,
+        );
+        let window = Arc::new(ModeWindow::default());
+        host.deps.block_window = window.clone();
+        let (mode, _, _) = signed(&host, &client, unattended_intent(PW, want, false)).await;
+        let served = if told == SessionMode::Control {
+            messages::mode::CONTROL
+        } else {
+            messages::mode::VIEW_ONLY
+        };
+        assert_eq!(mode, served, "{grant:?} {want}");
+        assert_eq!(
+            *window.0.lock().unwrap(),
+            vec![Some(told)],
+            "{grant:?} {want}"
+        );
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, client, _guard) = unattended_pair_edited(
+        tmp.path(),
+        PW,
+        Arc::new(tornect_core::levels::FixedFacts::linux()),
+        |_| {},
+    );
+    let window = Arc::new(CountingWindow::default());
+    host.deps.block_window = window.clone();
+    let (mode, _, _) = signed(
+        &host,
+        &client,
+        unattended_intent(PW, messages::mode::CONTROL, false),
+    )
+    .await;
+    assert_eq!(mode, messages::mode::CONTROL);
+    assert_eq!(
+        window.0.load(Ordering::SeqCst),
+        1,
+        "run, through the default"
+    );
+}
+
 /// An "Ask before starting" popup that counts how often it was asked, and allows.
 #[derive(Default)]
 struct CountingAllow(std::sync::atomic::AtomicUsize);
