@@ -1610,6 +1610,9 @@ pub(crate) fn describe_end(end: &SessionEnd) -> String {
         SessionEnd::Killed(reason) => format!("ended here ({})", bye::name(*reason)),
         SessionEnd::Orphaned => "the client chose no transport in time".to_owned(),
         SessionEnd::Idle => "no traffic for the idle timeout".to_owned(),
+        SessionEnd::Transport(reason) => {
+            format!("no media route the session allows ({})", bye::name(*reason))
+        }
         other => format!("{other:?}"),
     }
 }
@@ -3462,6 +3465,8 @@ mod tests {
             mode: SessionMode::Control,
             elevation: tornect_core::levels::Elevation::None,
             unattended,
+            transport: TransportPolicy::Any,
+            viewer_dir1: false,
         };
         let advance = |secs: u64| clock.advance(Duration::from_secs(secs));
         let last = || store.grant(&device).unwrap().last_used.unwrap();
@@ -3900,6 +3905,8 @@ mod tests {
                 mode: SessionMode::ViewOnly,
                 elevation: tornect_core::levels::Elevation::None,
                 unattended: true,
+                transport: TransportPolicy::Any,
+                viewer_dir1: false,
             });
             // Cut at the first wall reading of its end.
             to((ends_at - BASE) * 1000 + cut);
@@ -3936,6 +3943,8 @@ mod tests {
             mode: SessionMode::ViewOnly,
             elevation: tornect_core::levels::Elevation::None,
             unattended: true,
+            transport: TransportPolicy::Any,
+            viewer_dir1: false,
         });
         clock.set_wall(clock.wall() - 3600);
         clock.advance_mono(Duration::from_secs(u64::from(max) - 10));
@@ -4234,6 +4243,8 @@ mod tests {
             mode,
             elevation: tornect_core::levels::Elevation::None,
             unattended: false,
+            transport: TransportPolicy::Any,
+            viewer_dir1: false,
         };
         revocation.on_start(&session("v1", SessionMode::ViewOnly));
         settle().await;
@@ -4383,6 +4394,8 @@ mod tests {
             mode: SessionMode::Control,
             elevation: tornect_core::levels::Elevation::None,
             unattended: false,
+            transport: TransportPolicy::Any,
+            viewer_dir1: false,
         });
         for _ in 0..100 {
             if !told.lock().unwrap().is_empty() {
@@ -4718,6 +4731,8 @@ mod tests {
                 mode,
                 elevation: tornect_core::levels::Elevation::None,
                 unattended: false,
+                transport: TransportPolicy::Any,
+                viewer_dir1: false,
             });
             assert_eq!(sessions.notice(id), want, "{id}");
             sessions.on_end(id, None);

@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tornect_core::DeviceId;
 use tornect_core::levels::{AdminPath, Answers, Availability, Elevation, Level};
@@ -28,9 +28,9 @@ use tornect_core::unattended::guard::{AdminEffect, EndReason, EndScope, RemoteSe
 use zeroize::Zeroizing;
 
 use super::{
-    AuditEvent, AuthExchange, CandidateSink, Channel, HandshakeAudit, HandshakeError, HelperEvent,
-    IgnoreCandidates, NoAudit, OsRandom, Randomness, Received, SessionToken, SuppressedPopup,
-    Taken, checked_body, timeouts,
+    AuditEvent, AuthExchange, Channel, HandshakeAudit, HandshakeError, HelperEvent, NoAudit,
+    NoPaths, OsRandom, PathExchange, PathFrame, PathPort, Randomness, Received, SessionToken,
+    SuppressedPopup, Taken, checked_body, timeouts,
 };
 use crate::consent::{
     AcceptHostInfo, AlwaysDeny, BlockWindow, ChosenCaps, ConsentProof, FreshToken, LocalAllow,
@@ -637,6 +637,10 @@ pub struct HandshakeStats {
     pub established: AtomicUsize,
     /// `SESSION_ACCEPT`s ever sent.
     pub accepted_total: AtomicU64,
+    /// Direct-path frames of a viewer that were dropped, never answered: past
+    /// the path rules (design `direct` §4), or with no room in the session's
+    /// [`PathPort`] inbox. Counts only, never their contents.
+    pub path_frames_dropped: AtomicU64,
 }
 
 struct Counted<'a>(&'a AtomicUsize);
@@ -704,6 +708,15 @@ pub struct LiveSession<'a> {
     pub elevation: Elevation,
     /// Whether this was an unattended session (§B.8).
     pub unattended: bool,
+    /// The transport policy of the `SESSION_ACCEPT` as written (design
+    /// `direct` §8.2, §9.2): the knob's for an attended session, the grant's
+    /// receipt (its `require_tor_only` included) for an unattended one; an
+    /// unknown code reads as [`TransportPolicy::TorOnly`]. The only source
+    /// the direct path and the media layer take the session's policy from.
+    pub transport: TransportPolicy,
+    /// Whether the viewer's signed `HELLO` announced
+    /// [`messages::feats::DIR1`]: it takes part in the direct-path exchange.
+    pub viewer_dir1: bool,
 }
 
 /// The administrator helper of §B.8.7.5 (r7, M-FEAT-3): started for an
@@ -954,8 +967,10 @@ pub struct HostDeps {
     pub activity: Arc<dyn SessionActivity>,
     /// `sessions.log`.
     pub audit: Arc<dyn HandshakeAudit>,
-    /// Post-accept frames for M2.
-    pub candidates: Arc<dyn CandidateSink>,
+    /// The direct-path exchange of each accepted session (design `direct`
+    /// §8.2): opened after the accept, read for the media route before the
+    /// session's end is recorded.
+    pub paths: Arc<dyn PathExchange>,
     /// The layer that runs an established session (M4 `tornect-session`).
     pub sessions: Arc<dyn SessionSink>,
     /// The administrator helper (§B.8.7.5): started between an administrator
@@ -975,7 +990,7 @@ pub struct HostDeps {
 
 impl HostDeps {
     /// Headless defaults: `AutoDeny`, no stop token, `NotGranted`, no live
-    /// session, no audit, candidates ignored, no session sink, OS randomness,
+    /// session, no audit, no direct path ([`NoPaths`]), no session sink, OS randomness,
     /// default limits, a timer-only block window and `AlwaysDeny` for
     /// `ask_before_start`.
     #[must_use]
@@ -992,7 +1007,7 @@ impl HostDeps {
             unattended: Arc::new(NotGranted),
             activity: Arc::new(NoSession),
             audit: Arc::new(NoAudit),
-            candidates: Arc::new(IgnoreCandidates),
+            paths: Arc::new(NoPaths),
             sessions: Arc::new(NoSessionSink),
             admin_helper: Arc::new(NoAdminHelper),
             random: Arc::new(OsRandom),
@@ -1020,6 +1035,10 @@ pub enum SessionEnd {
     Orphaned,
     /// No frame for the idle timeout; `BYE{ORPHANED}` was sent.
     Idle,
+    /// The direct path ended the session ([`PathFrame::End`]);
+    /// `BYE{reason}` was sent: a `lan_only` session with no direct path ends
+    /// `BYE{NO_LAN_PATH}` (decision M1-85).
+    Transport(u16),
 }
 
 /// How [`serve_host`] ended without a protocol error.
@@ -1123,6 +1142,7 @@ where
         deps.stop_token.observe(token).await;
     }
     let device = DeviceId::from_bytes(hello.device_pk);
+    let viewer_dir1 = hello.feats.iter().any(|f| f == messages::feats::DIR1);
     let declared_name = normalize_label(&hello.name);
     let pinned = deps.trusted.get(&device).map(|rec| rec.label);
     let hello_verified = Counted::new(&deps.stats.hello_verified);
@@ -1543,6 +1563,12 @@ where
     };
     let session_id = token.session_id();
     let mode = mode_from_code(accept.mode()).unwrap_or(SessionMode::ViewOnly);
+    // The policy the accept signs, and nothing else, is the session's policy
+    // (design `direct` §8.2): an unattended grant's `require_tor_only` reaches
+    // the direct path and the media layer through this value only, and a code
+    // this build does not know fails closed.
+    let transport =
+        TransportPolicy::from_code(accept.transport_policy()).unwrap_or(TransportPolicy::TorOnly);
     // The level the accept signs, and nothing else, is the session's level.
     let elevation = Level::new(mode, accept.elevation()).elevation();
     // At the level, a lowering of the grant since the reservation ends it too (D6).
@@ -1593,7 +1619,7 @@ where
         session_id: &session_id,
         armed: true,
     };
-    deps.sessions.on_start(&LiveSession {
+    let live = LiveSession {
         device,
         label: &label,
         session_id: &session_id,
@@ -1602,12 +1628,19 @@ where
         mode,
         elevation,
         unattended,
-    });
+        transport,
+        viewer_dir1,
+    };
+    deps.sessions.on_start(&live);
     drop(reserved);
+    // Only now, with the accept written and the session registered, does the
+    // direct path learn of the session (design `direct` §5.2 rule 1).
+    let mut port = deps.paths.open(&live);
     let ended = {
         let _established = Counted::new(&deps.stats.established);
-        established(&mut chan, cfg, deps, &mut kill, &session_id).await
+        established(&mut chan, cfg, deps, &mut kill, &session_id, &mut port).await
     };
+    drop(port);
     let (end, goodbye) = match ended {
         Ok((end, goodbye)) => (Ok(end), goodbye),
         // Its `ERROR` goes out as the goodbye, after the end is recorded: a
@@ -1990,23 +2023,178 @@ where
     Ok(())
 }
 
-/// `Established`: answer `PING`, hand M2 frames to the sink, end on `BYE`,
-/// the kill switch, the orphan timer or the idle timer. It returns as soon as
-/// the session is over, with what is still to be written: the caller releases
-/// the session first and says goodbye after. A violation found here (an
-/// envelope fault, a body that does not decode, a kind out of place) is
-/// returned unanswered, and its `ERROR` is that goodbye (SLICE-C3 C3-2).
+/// Most `CANDIDATES` frames a viewer's session takes (design `direct` §4):
+/// more are dropped and counted, never answered.
+pub const MAX_PATH_CANDIDATES: usize = 6;
+
+/// The host's rules for a viewer's path frames once their bodies checked out
+/// (design `direct` §4, §8.2): at most [`MAX_PATH_CANDIDATES`] `CANDIDATES`
+/// and one `CANDIDATES_DONE`, nothing after the viewer's `TOR_FALLBACK`, and
+/// one scope for the whole session, fixed by the first `CANDIDATES` (an
+/// absent scope counts as 0, `same_site`).
+#[derive(Debug, Default)]
+struct PathRules {
+    candidates: usize,
+    done: bool,
+    scope: Option<u32>,
+    fallback: bool,
+}
+
+impl PathRules {
+    /// `Ok(true)` hands `frame` on, `Ok(false)` drops it; a scope that differs
+    /// from the first frame's is the `E_BAD_LEN` body fault, unanswered here.
+    fn admit(&mut self, frame: &PathFrame) -> Result<bool, HandshakeError> {
+        if self.fallback {
+            return Ok(false);
+        }
+        match frame {
+            PathFrame::Candidates(c) => {
+                if self.candidates >= MAX_PATH_CANDIDATES {
+                    return Ok(false);
+                }
+                let scope = c.scope_code();
+                if self.scope.is_some_and(|first| first != scope) {
+                    return Err(HandshakeError::Violation {
+                        code: codes::E_BAD_LEN,
+                        what: "field",
+                    });
+                }
+                self.scope = Some(scope);
+                self.candidates += 1;
+            }
+            PathFrame::Done => {
+                if self.done {
+                    return Ok(false);
+                }
+                self.done = true;
+            }
+            PathFrame::TorFallback(_) => self.fallback = true,
+            // Outbox only: a viewer cannot send one.
+            PathFrame::End(_) => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+/// A viewer's checked path frame: through the rules, then into the session's
+/// inbox without waiting. A frame the rules drop, or that finds the inbox
+/// full or absent, is counted and goes no further.
+fn pass_on(
+    deps: &HostDeps,
+    rules: &mut PathRules,
+    port: &PathPort,
+    frame: PathFrame,
+) -> Result<(), HandshakeError> {
+    let delivered = rules.admit(&frame)?
+        && port
+            .inbox
+            .as_ref()
+            .is_some_and(|inbox| inbox.try_send(frame).is_ok());
+    if !delivered {
+        deps.stats
+            .path_frames_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// What woke [`established`].
+enum Woke {
+    /// The kill switch fired, with its reason.
+    Killed(u16),
+    /// The channel has something for [`Channel::take_frame`].
+    Frame,
+    /// The outbox: a frame to write, or `None` once it closed.
+    Out(Option<PathFrame>),
+    /// The orphan or idle timer.
+    Timer,
+}
+
+/// Write `body` raced against the kill alone: `Ok(Some(reason))` when the kill
+/// won. A peer that stops reading stalls the write for as long as it withholds
+/// credit, and the kill must not wait behind it (SLICE-B2 B2-1). The write is
+/// polled first, so one that can finish does; a kill that cuts one short leaves
+/// a torn frame, after which nothing more is written.
+async fn raced_send<S, B>(
+    chan: &mut Channel<S>,
+    kill: &mut KillGuard,
+    body: &B,
+) -> Result<Option<u16>, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    B: messages::Body,
+{
+    tokio::select! {
+        biased;
+        sent = chan.send(body, None) => sent.map(|_| None),
+        reason = kill.killed() => Ok(Some(reason)),
+    }
+}
+
+/// One outbox frame of the direct path: written raced against the kill, or,
+/// for [`PathFrame::End`], the end of the session. `Some` when the session is
+/// over. A `CANDIDATES` the viewer would have to refuse is dropped and
+/// counted instead of written.
+async fn send_path_frame<S>(
+    chan: &mut Channel<S>,
+    deps: &HostDeps,
+    kill: &mut KillGuard,
+    frame: PathFrame,
+) -> Result<Option<(SessionEnd, Goodbye)>, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let killed = match frame {
+        PathFrame::End(reason) => {
+            return Ok(Some((SessionEnd::Transport(reason), Goodbye::Bye(reason))));
+        }
+        PathFrame::Candidates(c) => {
+            if messages::Body::validate(&c).is_err() {
+                deps.stats
+                    .path_frames_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!("an outgoing CANDIDATES of a bad shape was dropped");
+                return Ok(None);
+            }
+            raced_send(chan, kill, &c).await?
+        }
+        PathFrame::Done => raced_send(chan, kill, &messages::CandidatesDone {}).await?,
+        PathFrame::TorFallback(reason) => {
+            raced_send(chan, kill, &messages::TorFallback { reason }).await?
+        }
+    };
+    Ok(killed.map(|reason| (SessionEnd::Killed(reason), Goodbye::Nothing)))
+}
+
+/// Receive from the outbox; never resolves without one.
+async fn recv_opt(outbox: &mut Option<mpsc::Receiver<PathFrame>>) -> Option<PathFrame> {
+    match outbox {
+        Some(outbox) => outbox.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// `Established`: answer `PING`, exchange the direct-path frames through
+/// `port`, end on `BYE`, the kill switch, the outbox's end, the orphan timer
+/// or the idle timer. It returns as soon as the session is over, with what is
+/// still to be written: the caller releases the session first and says
+/// goodbye after. A violation found here (an envelope fault, a body that does
+/// not decode, a kind out of place, a changed path scope) is returned
+/// unanswered, and its `ERROR` is that goodbye (SLICE-C3 C3-2).
 ///
-/// The wait races only cancel-safe futures: the kill, the channel's
-/// read-only [`Channel::frame_ready`] and the timer. Frames are then handled
-/// with [`Channel::take_frame`], which never writes; the one write here, the
-/// `PONG`, is raced against the kill alone (design `direct` §4).
+/// The wait races only cancel-safe futures (design `direct` §4): the kill,
+/// the channel's read-only [`Channel::frame_ready`], the outbox's receive and
+/// the timer. Frames are then handled with [`Channel::take_frame`], which
+/// never writes, and the viewer's path frames go to the inbox without
+/// waiting. The writes here, a `PONG` and an outbox frame, are each raced
+/// against the kill alone.
 async fn established<S>(
     chan: &mut Channel<S>,
     cfg: &HostConfig,
     deps: &HostDeps,
     kill: &mut KillGuard,
     session_id: &str,
+    port: &mut PathPort,
 ) -> Result<(SessionEnd, Goodbye), HandshakeError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -2021,28 +2209,54 @@ where
         .orphan_timeout
         .and_then(|d| Instant::now().checked_add(d));
     let mut have_path = false;
+    let mut rules = PathRules::default();
+    // The idle timer restarts after each turn the viewer's bytes woke (once
+    // that turn's writes are done), never after an outbox write: the host's
+    // own path frames do not keep a silent session open.
+    let mut heard = Instant::now();
+    let mut viewer_turn = false;
     loop {
-        let now = Instant::now();
-        let idle_at = now.checked_add(cfg.idle_timeout);
+        if std::mem::take(&mut viewer_turn) {
+            heard = Instant::now();
+        }
+        let idle_at = heard.checked_add(cfg.idle_timeout);
         let (deadline, orphan_first) = match (orphan_at, idle_at) {
             (Some(o), idle) if !have_path && idle.is_none_or(|i| o < i) => (Some(o), true),
             (_, idle) => (idle, false),
         };
-        let frame = tokio::select! {
+        let woke = tokio::select! {
             biased;
-            reason = kill.killed() => {
+            reason = kill.killed() => Woke::Killed(reason),
+            ready = chan.frame_ready() => {
+                ready?;
+                Woke::Frame
+            }
+            frame = recv_opt(&mut port.outbox), if port.outbox.is_some() => Woke::Out(frame),
+            () = sleep_until_opt(deadline) => Woke::Timer,
+        };
+        match woke {
+            Woke::Killed(reason) => {
                 return Ok((SessionEnd::Killed(reason), Goodbye::Bye(reason)));
             }
-            ready = chan.frame_ready() => ready.map(|()| true),
-            () = sleep_until_opt(deadline) => Ok(false),
-        };
-        if !frame? {
-            let end = if orphan_first {
-                SessionEnd::Orphaned
-            } else {
-                SessionEnd::Idle
-            };
-            return Ok((end, Goodbye::Bye(messages::bye::ORPHANED)));
+            Woke::Timer => {
+                let end = if orphan_first {
+                    SessionEnd::Orphaned
+                } else {
+                    SessionEnd::Idle
+                };
+                return Ok((end, Goodbye::Bye(messages::bye::ORPHANED)));
+            }
+            Woke::Out(None) => {
+                port.outbox = None;
+                continue;
+            }
+            Woke::Out(Some(frame)) => {
+                if let Some(end) = send_path_frame(chan, deps, kill, frame).await? {
+                    return Ok(end);
+                }
+                continue;
+            }
+            Woke::Frame => viewer_turn = true,
         }
         let rx: Received = match chan.take_frame() {
             Taken::Frame(rx) => rx,
@@ -2055,11 +2269,6 @@ where
         match rx.env.kind {
             Kind::Ping => {
                 let ping: Ping = checked_body(&rx)?;
-                // A peer that stops reading stalls this write for as long as
-                // it withholds credit; the kill must not wait behind it
-                // (SLICE-B2 B2-1). The write goes first, so one that can
-                // finish does; a kill that cuts one short leaves a torn frame,
-                // after which nothing more is written.
                 let notice = deps
                     .sessions
                     .notice(session_id)
@@ -2069,30 +2278,29 @@ where
                     nonce: ping.nonce,
                     notice,
                 };
-                tokio::select! {
-                    biased;
-                    sent = chan.send(&pong, None) => {
-                        sent?;
-                    }
-                    reason = kill.killed() => {
-                        return Ok((SessionEnd::Killed(reason), Goodbye::Nothing));
-                    }
+                if let Some(reason) = raced_send(chan, kill, &pong).await? {
+                    return Ok((SessionEnd::Killed(reason), Goodbye::Nothing));
                 }
             }
             Kind::Candidates => {
                 let c: messages::Candidates = checked_body(&rx)?;
                 have_path = true;
-                deps.candidates.on_candidates(c);
+                pass_on(deps, &mut rules, port, PathFrame::Candidates(c))?;
             }
             Kind::CandidatesDone => {
                 let _: messages::CandidatesDone = checked_body(&rx)?;
                 have_path = true;
-                deps.candidates.on_candidates_done();
+                pass_on(deps, &mut rules, port, PathFrame::Done)?;
             }
             Kind::TorFallback => {
                 let fallback: messages::TorFallback = checked_body(&rx)?;
                 have_path = true;
-                deps.candidates.on_tor_fallback(fallback.reason);
+                pass_on(
+                    deps,
+                    &mut rules,
+                    port,
+                    PathFrame::TorFallback(fallback.reason),
+                )?;
             }
             Kind::Bye => {
                 let reason = decode_reason::<Bye>(&rx, |b| b.reason);

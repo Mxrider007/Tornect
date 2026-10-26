@@ -221,6 +221,8 @@ mod tests {
             mode,
             elevation,
             unattended: false,
+            transport: tornect_signal::consent::TransportPolicy::Any,
+            viewer_dir1: false,
         };
         live.on_start(&session);
         f(&live, &session);
@@ -335,6 +337,8 @@ mod tests {
             mode: SessionMode::Control,
             elevation: Elevation::None,
             unattended: false,
+            transport: tornect_signal::consent::TransportPolicy::Any,
+            viewer_dir1: false,
         });
         live.set_notice(
             &id,

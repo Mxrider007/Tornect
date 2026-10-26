@@ -2929,25 +2929,132 @@ async fn the_session_sink_sees_one_start_and_one_end() {
     assert_eq!(sink.started.lock().unwrap().len(), 1, "started only once");
 }
 
-#[tokio::test]
-async fn candidates_reach_the_sink_and_busy_hosts_reject() {
-    #[derive(Default)]
-    struct Sink(Mutex<Vec<String>>);
-    impl CandidateSink for Sink {
-        fn on_candidates(&self, c: messages::Candidates) {
-            let scope = c.scope_code();
-            self.0.lock().unwrap().extend(c.candidates.iter().map(|c| {
-                let kind = messages::candidate_kind::name(c.kind);
-                format!("{kind} {:?}:{} scope {scope}", c.ip, c.port)
-            }));
-        }
-        fn on_candidates_done(&self) {
-            self.0.lock().unwrap().push("done".into());
-        }
-        fn on_tor_fallback(&self, reason: Option<u32>) {
-            self.0.lock().unwrap().push(format!("tor {reason:?}"));
-        }
+/// What a [`PathsProbe`] saw of one [`PathExchange::open`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Opened {
+    session_id: String,
+    transport: TransportPolicy,
+    viewer_dir1: bool,
+    unattended: bool,
+    mode: SessionMode,
+    /// `SESSION_ACCEPT`s the host had sent when `open` ran.
+    accepted_total: u64,
+    /// Sessions the probe's tracker had live when `open` ran.
+    live: usize,
+}
+
+/// A [`PathExchange`] that records each `open` and keeps the test's ends of
+/// the session's two channels (design `direct` §8.2): an inbox of `inbox`
+/// frames (none for `None`), never drained by the probe itself, and an outbox
+/// already holding `preload` (none for `None`), kept open by the probe.
+struct PathsProbe {
+    inbox: Option<usize>,
+    preload: Option<Vec<PathFrame>>,
+    stats: Arc<host::HandshakeStats>,
+    live: Arc<LiveSessions>,
+    opened: Mutex<Vec<Opened>>,
+    inboxes: Mutex<Vec<mpsc::Receiver<PathFrame>>>,
+    outboxes: Mutex<Vec<mpsc::Sender<PathFrame>>>,
+}
+
+impl PathsProbe {
+    /// A probe as `host`'s path exchange; `live` is the tracker whose count
+    /// each `open` records (the host's own sink when the test installs it).
+    fn install(
+        host: &mut HostSide,
+        live: Arc<LiveSessions>,
+        inbox: Option<usize>,
+        preload: Option<Vec<PathFrame>>,
+    ) -> Arc<Self> {
+        let probe = Arc::new(Self {
+            inbox,
+            preload,
+            stats: host.deps.stats.clone(),
+            live,
+            opened: Mutex::default(),
+            inboxes: Mutex::default(),
+            outboxes: Mutex::default(),
+        });
+        host.deps.paths = probe.clone();
+        probe
     }
+
+    fn opened(&self) -> Vec<Opened> {
+        self.opened.lock().unwrap().clone()
+    }
+
+    /// What the inbox of the `n`th opened session holds, in order (taken).
+    fn received(&self, n: usize) -> Vec<PathFrame> {
+        let mut inboxes = self.inboxes.lock().unwrap();
+        let mut frames = Vec::new();
+        while let Ok(frame) = inboxes[n].try_recv() {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    /// The outbox of the `n`th opened session.
+    fn outbox(&self, n: usize) -> mpsc::Sender<PathFrame> {
+        self.outboxes.lock().unwrap()[n].clone()
+    }
+}
+
+impl PathExchange for PathsProbe {
+    fn open(&self, session: &LiveSession<'_>) -> PathPort {
+        self.opened.lock().unwrap().push(Opened {
+            session_id: session.session_id.to_owned(),
+            transport: session.transport,
+            viewer_dir1: session.viewer_dir1,
+            unattended: session.unattended,
+            mode: session.mode,
+            accepted_total: self.stats.accepted_total.load(Ordering::SeqCst),
+            live: self.live.count(),
+        });
+        let inbox = self.inbox.map(|capacity| {
+            let (tx, rx) = mpsc::channel(capacity);
+            self.inboxes.lock().unwrap().push(rx);
+            tx
+        });
+        let outbox = self.preload.as_ref().map(|frames| {
+            let (tx, rx) = mpsc::channel(16);
+            for frame in frames {
+                tx.try_send(frame.clone()).unwrap();
+            }
+            self.outboxes.lock().unwrap().push(tx);
+            rx
+        });
+        PathPort { outbox, inbox }
+    }
+}
+
+/// The viewer's path frames as the old candidate sink's test spelled them.
+fn spelled(frames: Vec<PathFrame>) -> Vec<String> {
+    frames
+        .into_iter()
+        .flat_map(|frame| match frame {
+            PathFrame::Candidates(c) => {
+                let scope = c.scope_code();
+                c.candidates
+                    .iter()
+                    .map(|c| {
+                        let kind = messages::candidate_kind::name(c.kind);
+                        format!("{kind} {:?}:{} scope {scope}", c.ip, c.port)
+                    })
+                    .collect()
+            }
+            PathFrame::Done => vec!["done".to_owned()],
+            PathFrame::TorFallback(reason) => vec![format!("tor {reason:?}")],
+            PathFrame::End(reason) => vec![format!("end {reason}")],
+        })
+        .collect()
+}
+
+/// Design `direct` §8.2 (was the M1 candidate sink's test): the viewer's
+/// checked path frames reach the session's inbox in order, with their scope
+/// and reason, around a `PING`; a busy host still rejects, and opens no path
+/// for the sessions it rejects (§5.2 rule 1).
+#[tokio::test]
+async fn candidates_reach_the_path_inbox_and_busy_hosts_reject() {
     struct Live;
     impl SessionActivity for Live {
         fn session_live(&self) -> bool {
@@ -2957,8 +3064,12 @@ async fn candidates_reach_the_sink_and_busy_hosts_reject() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut host = host_side(tmp.path(), HOST_SEED);
-    let sink = Arc::new(Sink::default());
-    host.deps.candidates = sink.clone();
+    let probe = PathsProbe::install(
+        &mut host,
+        Arc::new(LiveSessions::new()),
+        Some(PATH_INBOX),
+        None,
+    );
     host.trusted
         .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
         .unwrap();
@@ -3004,8 +3115,13 @@ async fn candidates_reach_the_sink_and_busy_hosts_reject() {
     session.bye(bye::USER).await.unwrap();
     task.await.unwrap().unwrap();
     assert_eq!(
-        sink.0.lock().unwrap().as_slice(),
+        spelled(probe.received(0)),
         ["host [192, 0, 2, 1]:4000 scope 1", "done", "tor Some(4)"]
+    );
+    assert_eq!(
+        host.deps.stats.path_frames_dropped.load(Ordering::SeqCst),
+        0,
+        "nothing past the rules"
     );
 
     // A live remote session suppresses popups: BUSY for sessions and pairing.
@@ -3055,6 +3171,7 @@ async fn candidates_reach_the_sink_and_busy_hosts_reject() {
     ));
     assert_eq!(host.consent.session_popups(), 1);
     assert_eq!(host.consent.sas_shown().len(), 0);
+    assert_eq!(probe.opened().len(), 1, "no path for a rejected session");
 }
 
 #[tokio::test]
@@ -4906,6 +5023,8 @@ async fn a_session_that_went_live_during_the_popup_blocks_the_accept() {
         mode: SessionMode::Control,
         elevation: tornect_core::levels::Elevation::None,
         unattended: false,
+        transport: TransportPolicy::Any,
+        viewer_dir1: false,
     });
     answer.notify_one();
     assert_eq!(asked.await.unwrap().env.kind, Kind::SessionReject);
@@ -5090,6 +5209,8 @@ async fn an_unattended_request_while_a_session_is_live_is_session_active() {
         mode: SessionMode::ViewOnly,
         elevation: tornect_core::levels::Elevation::None,
         unattended: false,
+        transport: TransportPolicy::Any,
+        viewer_dir1: false,
     });
 
     let (a, b) = pipe();
@@ -9638,6 +9759,8 @@ fn the_notice_is_forgotten_when_the_session_ends() {
         mode: SessionMode::Control,
         elevation: tornect_core::levels::Elevation::None,
         unattended: false,
+        transport: TransportPolicy::Any,
+        viewer_dir1: false,
     });
     assert_eq!(live.notice(&id), None, "nothing said yet");
     live.set_notice_bits(&id, messages::notice::SECURE_SCREEN, true);
@@ -10514,23 +10637,10 @@ fn bad_candidates() -> Vec<(&'static str, Vec<u8>, &'static str)> {
 
 /// Design `direct` §6.1: a viewer's `CANDIDATES` of a bad shape, and a
 /// `TOR_FALLBACK` whose reason does not fit a `u32`, end the session with
-/// `E_BAD_LEN` through the body-fault path; nothing reaches the sink, and the
-/// end is recorded with the code's name.
+/// `E_BAD_LEN` through the body-fault path; nothing reaches the session's
+/// path inbox, and the end is recorded with the code's name.
 #[tokio::test(start_paused = true)]
 async fn the_host_refuses_path_frames_of_a_bad_shape_with_e_bad_len() {
-    #[derive(Default)]
-    struct Count(std::sync::atomic::AtomicUsize);
-    impl CandidateSink for Count {
-        fn on_candidates(&self, _: messages::Candidates) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-        fn on_candidates_done(&self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-        fn on_tor_fallback(&self, _: Option<u32>) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
     let mut cases: Vec<(&str, Kind, Vec<u8>, &str)> = bad_candidates()
         .into_iter()
         .map(|(name, body, what)| (name, Kind::Candidates, body, what))
@@ -10546,8 +10656,12 @@ async fn the_host_refuses_path_frames_of_a_bad_shape_with_e_bad_len() {
         let tmp = tempfile::tempdir().unwrap();
         let mut host = host_side(tmp.path(), HOST_SEED);
         host.cfg.orphan_timeout = None;
-        let sink = Arc::new(Count::default());
-        host.deps.candidates = sink.clone();
+        let probe = PathsProbe::install(
+            &mut host,
+            Arc::new(LiveSessions::new()),
+            Some(PATH_INBOX),
+            None,
+        );
         let audit = Arc::new(RecordingAudit::default());
         host.deps.audit = audit.clone();
         host.trusted
@@ -10574,13 +10688,704 @@ async fn the_host_refuses_path_frames_of_a_bad_shape_with_e_bad_len() {
             }
             other => panic!("{name}: {other:?}"),
         }
-        assert_eq!(sink.0.load(Ordering::SeqCst), 0, "{name} reached the sink");
+        assert_eq!(probe.opened().len(), 1, "{name}");
+        assert!(probe.received(0).is_empty(), "{name} reached the inbox");
+        assert_eq!(
+            host.deps.stats.path_frames_dropped.load(Ordering::SeqCst),
+            0,
+            "{name}: a body fault, never a drop"
+        );
         let ended = audit.0.lock().unwrap().iter().find_map(|e| match e {
             AuditEvent::SessionEnded { detail, .. } => Some(detail.clone()),
             _ => None,
         });
         assert_eq!(ended.as_deref(), Some("E_BAD_LEN"), "{name}");
         drop(client);
+    }
+}
+
+/// A host whose paired client is `CLIENT_SEED` and whose popup allows once,
+/// with a tracker as its sink and activity, and a [`PathsProbe`] on it.
+fn path_host(
+    tmp: &std::path::Path,
+    inbox: Option<usize>,
+    preload: Option<Vec<PathFrame>>,
+) -> (HostSide, Arc<LiveSessions>, Arc<PathsProbe>) {
+    let mut host = host_side(tmp, HOST_SEED);
+    host.cfg.orphan_timeout = None;
+    let live = Arc::new(LiveSessions::new());
+    host.deps.sessions = live.clone();
+    host.deps.activity = live.clone();
+    let probe = PathsProbe::install(&mut host, live.clone(), inbox, preload);
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+    host.consent
+        .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+    (host, live, probe)
+}
+
+/// A viewer's `CANDIDATES` of one same-site host candidate with `scope`.
+fn viewer_candidates(scope: Option<u32>) -> messages::Candidates {
+    messages::Candidates {
+        candidates: host_candidates().candidates,
+        scope,
+    }
+}
+
+/// The raw client's `PING`, and the host's `PONG` to it: every frame sent
+/// before it was handled when this returns.
+async fn ping_through(raw: &mut RawClient, nonce: u64) {
+    raw.chan.send(&Ping { nonce }, None).await.unwrap();
+    let rx = raw.recv().await.unwrap();
+    assert_eq!(rx.env.kind, Kind::Pong);
+    assert_eq!(decode_body::<Pong>(&rx.env.body).unwrap().nonce, nonce);
+}
+
+/// Design `direct` §5.2 rule 1, §8.2: a session's path port opens once, after
+/// its `SESSION_ACCEPT` was sent and the sink heard of the start, never for the
+/// handshake before it; the outbox's frames then reach the viewer in order,
+/// unsigned, as the bodies they are (`TOR_FALLBACK` with and without a reason).
+#[tokio::test(start_paused = true)]
+async fn the_path_port_opens_after_the_accept_and_its_outbox_reaches_the_viewer_in_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, live, probe) = path_host(
+        tmp.path(),
+        Some(PATH_INBOX),
+        Some(vec![
+            PathFrame::Candidates(host_candidates()),
+            PathFrame::Done,
+            PathFrame::TorFallback(Some(messages::fallback::OFF)),
+            PathFrame::TorFallback(None),
+        ]),
+    );
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    assert!(
+        probe.opened().is_empty(),
+        "nothing opened before the request"
+    );
+    assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+    let mut got = Vec::new();
+    for _ in 0..4 {
+        let rx = raw.recv().await.unwrap();
+        assert!(rx.env.sig.is_none(), "path frames go unsigned");
+        got.push(match rx.env.kind {
+            Kind::Candidates => {
+                PathFrame::Candidates(decode_body::<messages::Candidates>(&rx.env.body).unwrap())
+            }
+            Kind::CandidatesDone => {
+                decode_body::<messages::CandidatesDone>(&rx.env.body).unwrap();
+                PathFrame::Done
+            }
+            Kind::TorFallback => PathFrame::TorFallback(
+                decode_body::<messages::TorFallback>(&rx.env.body)
+                    .unwrap()
+                    .reason,
+            ),
+            other => panic!("{other:?}"),
+        });
+    }
+    assert_eq!(
+        got,
+        [
+            PathFrame::Candidates(host_candidates()),
+            PathFrame::Done,
+            PathFrame::TorFallback(Some(messages::fallback::OFF)),
+            PathFrame::TorFallback(None),
+        ]
+    );
+    let opened = probe.opened();
+    assert_eq!(opened.len(), 1, "once per session");
+    let opened = &opened[0];
+    assert_eq!(opened.accepted_total, 1, "after the accept was sent");
+    assert_eq!(opened.live, 1, "after the sink heard of the start");
+    assert!(!opened.session_id.is_empty());
+    assert_eq!(opened.transport, TransportPolicy::Any, "the host's default");
+    assert!(!opened.viewer_dir1, "the raw viewer announced nothing");
+    assert!(!opened.unattended);
+    assert_eq!(opened.mode, SessionMode::Control);
+
+    raw.chan
+        .send(
+            &messages::Bye {
+                reason: bye::USER,
+                detail: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    match task.await.unwrap().unwrap() {
+        HostOutcome::Session { end, .. } => assert_eq!(end, SessionEnd::PeerBye(bye::USER)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(live.count(), 0);
+    assert_eq!(probe.opened().len(), 1);
+}
+
+/// Design `direct` §4, §8.2: of a viewer's well-formed path frames the host
+/// takes six `CANDIDATES` and one `CANDIDATES_DONE`, and nothing after its
+/// `TOR_FALLBACK` (a changed scope included); an absent scope is the same as
+/// `same_site` (0). The rest are dropped and counted, never answered, and the
+/// session goes on.
+#[tokio::test(start_paused = true)]
+async fn the_path_rules_cap_a_viewers_frames_and_count_what_they_drop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, live, probe) = path_host(tmp.path(), Some(32), None);
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+    assert_eq!(host::MAX_PATH_CANDIDATES, 6);
+    for n in 0..7u32 {
+        let scope = (n % 2 == 1).then_some(messages::scope::SAME_SITE);
+        raw.chan
+            .send(&viewer_candidates(scope), None)
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 {
+        raw.chan
+            .send(&messages::CandidatesDone {}, None)
+            .await
+            .unwrap();
+    }
+    raw.chan
+        .send(
+            &messages::TorFallback {
+                reason: Some(messages::fallback::NO_PATH),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    // After the viewer's fallback: nothing, a changed scope included.
+    raw.chan
+        .send(&viewer_candidates(Some(messages::scope::INTERNET)), None)
+        .await
+        .unwrap();
+    raw.chan
+        .send(&messages::CandidatesDone {}, None)
+        .await
+        .unwrap();
+    raw.chan
+        .send(&messages::TorFallback { reason: None }, None)
+        .await
+        .unwrap();
+    ping_through(&mut raw, 7).await;
+
+    let frames = probe.received(0);
+    let mut expected: Vec<PathFrame> = (0..6u32)
+        .map(|n| {
+            PathFrame::Candidates(viewer_candidates(
+                (n % 2 == 1).then_some(messages::scope::SAME_SITE),
+            ))
+        })
+        .collect();
+    expected.push(PathFrame::Done);
+    expected.push(PathFrame::TorFallback(Some(messages::fallback::NO_PATH)));
+    assert_eq!(frames, expected);
+    assert_eq!(
+        host.deps.stats.path_frames_dropped.load(Ordering::SeqCst),
+        5,
+        "the seventh CANDIDATES, the second DONE and the three after the fallback"
+    );
+    assert_eq!(live.count(), 1, "none of them ended the session");
+
+    raw.chan
+        .send(
+            &messages::Bye {
+                reason: bye::USER,
+                detail: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    match task.await.unwrap().unwrap() {
+        HostOutcome::Session { end, .. } => assert_eq!(end, SessionEnd::PeerBye(bye::USER)),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Design `direct` §4, §12.1 kill liveness: a second `CANDIDATES` whose scope
+/// differs from the first's is the `E_BAD_LEN` body fault ("field"). From a
+/// viewer that stopped reading, the session still ends before any write is
+/// tried, the `ERROR` goodbye times out at `GOODBYE`, and only the first frame
+/// reached the inbox.
+#[tokio::test(start_paused = true)]
+async fn a_changed_path_scope_ends_the_session_with_e_bad_len_before_any_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, live, probe) = path_host(tmp.path(), Some(PATH_INBOX), None);
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sink = Arc::new(EndBeforeWrites {
+        live: live.clone(),
+        writes: writes.clone(),
+        at_end: Mutex::new(None),
+    });
+    host.deps.sessions = sink.clone();
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+
+    let (a, b) = duplex(64);
+    let frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stream = FrozenWrites {
+        inner: a,
+        frozen: frozen.clone(),
+        writes: writes.clone(),
+    };
+    let (cfg, deps) = (host.cfg.clone(), host.deps.clone());
+    let task = tokio::spawn(async move { serve_host(stream, &cfg, &deps).await });
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+    // No scope: `same_site`.
+    raw.chan.send(&viewer_candidates(None), None).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(live.count(), 1);
+
+    frozen.store(true, Ordering::SeqCst);
+    let before = writes.load(Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    raw.chan
+        .send(&viewer_candidates(Some(messages::scope::INTERNET)), None)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(live.count(), 0, "the session ends at the changed scope");
+    assert_eq!(
+        *sink.at_end.lock().unwrap(),
+        Some(before),
+        "on_end ran before any write was tried"
+    );
+    let ended = audit.0.lock().unwrap().iter().find_map(|e| match e {
+        AuditEvent::SessionEnded { detail, .. } => Some(detail.clone()),
+        _ => None,
+    });
+    assert_eq!(ended.as_deref(), Some("E_BAD_LEN"));
+
+    let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("the goodbye is bounded")
+        .unwrap();
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_secs(1) && took < Duration::from_millis(1010),
+        "the ERROR goodbye times out at GOODBYE, took {took:?}"
+    );
+    match outcome {
+        Err(HandshakeError::Violation { code, what }) => {
+            assert_eq!((code, what), (codes::E_BAD_LEN, "field"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        probe.received(0),
+        [PathFrame::Candidates(viewer_candidates(None))],
+        "the changed scope never reached the inbox"
+    );
+    assert_eq!(
+        host.deps.stats.path_frames_dropped.load(Ordering::SeqCst),
+        0
+    );
+    drop(raw);
+}
+
+/// Design `direct` §8.2: the host never waits on a session's path inbox. A
+/// frame that finds it full, or finds none ([`NoPaths`], the headless
+/// default), is dropped and counted, and the `PING` behind it is answered.
+#[tokio::test(start_paused = true)]
+async fn a_full_or_absent_path_inbox_drops_and_counts_and_never_holds_the_host() {
+    // A one-frame inbox nobody drains.
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, live, probe) = path_host(tmp.path(), Some(1), None);
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+    for _ in 0..3 {
+        raw.chan
+            .send(&viewer_candidates(Some(messages::scope::SAME_SITE)), None)
+            .await
+            .unwrap();
+    }
+    raw.chan
+        .send(&messages::CandidatesDone {}, None)
+        .await
+        .unwrap();
+    ping_through(&mut raw, 1).await;
+    assert_eq!(
+        probe.received(0),
+        [PathFrame::Candidates(viewer_candidates(Some(
+            messages::scope::SAME_SITE
+        )))]
+    );
+    assert_eq!(
+        host.deps.stats.path_frames_dropped.load(Ordering::SeqCst),
+        3
+    );
+    assert_eq!(live.count(), 1);
+    drop(raw);
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        HostOutcome::Session {
+            end: SessionEnd::PeerClosed,
+            ..
+        }
+    ));
+
+    // No path exchange at all.
+    let tmp = tempfile::tempdir().unwrap();
+    let host = host_side(tmp.path(), HOST_SEED);
+    host.trusted
+        .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+        .unwrap();
+    host.consent
+        .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+    raw.chan.send(&viewer_candidates(None), None).await.unwrap();
+    raw.chan
+        .send(&messages::CandidatesDone {}, None)
+        .await
+        .unwrap();
+    raw.chan
+        .send(&messages::TorFallback { reason: None }, None)
+        .await
+        .unwrap();
+    ping_through(&mut raw, 2).await;
+    assert_eq!(
+        host.deps.stats.path_frames_dropped.load(Ordering::SeqCst),
+        3
+    );
+    drop(raw);
+    task.await.unwrap().unwrap();
+}
+
+/// Design `direct` §8.2, decision M1-85: [`PathFrame::End`] from the outbox
+/// ends the session as [`SessionEnd::Transport`], after the frames before it
+/// were written, with `BYE{reason}` as the goodbye (`NO_LAN_PATH` for a
+/// `lan_only` session with no direct path); the end is recorded first.
+#[tokio::test(start_paused = true)]
+async fn an_end_from_the_path_outbox_ends_the_session_with_its_bye() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, live, _probe) = path_host(
+        tmp.path(),
+        Some(PATH_INBOX),
+        Some(vec![PathFrame::Done, PathFrame::End(bye::NO_LAN_PATH)]),
+    );
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+    assert_eq!(raw.recv().await.unwrap().env.kind, Kind::CandidatesDone);
+    let rx = raw.recv().await.unwrap();
+    assert_eq!(rx.env.kind, Kind::Bye);
+    assert_eq!(
+        decode_body::<messages::Bye>(&rx.env.body).unwrap().reason,
+        bye::NO_LAN_PATH
+    );
+    match task.await.unwrap().unwrap() {
+        HostOutcome::Session { end, .. } => {
+            assert_eq!(end, SessionEnd::Transport(bye::NO_LAN_PATH));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(live.count(), 0);
+    let ended = audit.0.lock().unwrap().iter().find_map(|e| match e {
+        AuditEvent::SessionEnded { detail, .. } => Some(detail.clone()),
+        _ => None,
+    });
+    assert_eq!(ended.as_deref(), Some("Transport(9)"));
+}
+
+/// Design `direct` §4, §12.1 kill liveness (the outbox stall): an outbox frame
+/// whose write a viewer never takes does not hold the kill back. The write is
+/// raced against the kill alone, so the session ends at the kill as
+/// `Killed(PANIC)` with no time passing (no goodbye is waited for after a
+/// torn frame), its sink and log first.
+#[tokio::test(start_paused = true)]
+async fn a_kill_ends_the_session_while_an_outbox_write_is_stuck() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, live, probe) = path_host(tmp.path(), Some(PATH_INBOX), Some(Vec::new()));
+    let kill = KillSwitch::new();
+    host.deps.kill = kill.clone();
+    let audit = Arc::new(RecordingAudit::default());
+    host.deps.audit = audit.clone();
+
+    let (a, b) = duplex(64);
+    let frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stream = FrozenWrites {
+        inner: a,
+        frozen: frozen.clone(),
+        writes: writes.clone(),
+    };
+    let (cfg, deps) = (host.cfg.clone(), host.deps.clone());
+    let task = tokio::spawn(async move { serve_host(stream, &cfg, &deps).await });
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(live.count(), 1);
+
+    frozen.store(true, Ordering::SeqCst);
+    let before = writes.load(Ordering::SeqCst);
+    probe
+        .outbox(0)
+        .send(PathFrame::Candidates(host_candidates()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        writes.load(Ordering::SeqCst) > before,
+        "the host is inside the outbox write"
+    );
+    assert_eq!(live.count(), 1, "nothing ended it yet");
+
+    let at_kill = writes.load(Ordering::SeqCst);
+    let killed = tokio::time::Instant::now();
+    kill.kill(bye::PANIC);
+    let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the kill must not wait for the viewer")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        killed.elapsed(),
+        Duration::ZERO,
+        "ended at the kill, no goodbye waited for"
+    );
+    assert!(
+        matches!(
+            outcome,
+            HostOutcome::Session {
+                end: SessionEnd::Killed(bye::PANIC),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(live.count(), 0);
+    assert!(
+        writes.load(Ordering::SeqCst) <= at_kill + 1,
+        "only the torn write's last poll (the race tries the write first), no goodbye"
+    );
+    let ended = audit.0.lock().unwrap().iter().find_map(|e| match e {
+        AuditEvent::SessionEnded { detail, .. } => Some(detail.clone()),
+        _ => None,
+    });
+    assert_eq!(ended.as_deref(), Some("Killed(8)"));
+    drop(raw);
+}
+
+/// Design `direct` §8.2: the idle timer counts the viewer's silence. The
+/// host's own outbox writes, one every 10 s, do not restart it: a viewer that
+/// says nothing for the idle timeout is still `Idle` at exactly that time.
+#[tokio::test(start_paused = true)]
+async fn outbox_writes_do_not_keep_a_silent_session_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut host, live, probe) = path_host(tmp.path(), Some(PATH_INBOX), Some(Vec::new()));
+    host.cfg.idle_timeout = Duration::from_secs(30);
+    let (a, b) = pipe();
+    let task = spawn_host(a, &host);
+    let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+    raw.hello_ack().await;
+    assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+    let started = tokio::time::Instant::now();
+    let outbox = probe.outbox(0);
+    let feeder = tokio::spawn(async move {
+        let mut sent = 0u32;
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            if outbox.send(PathFrame::Done).await.is_err() {
+                return sent;
+            }
+            sent += 1;
+        }
+    });
+    let mut done = 0;
+    let bye = loop {
+        let rx = raw
+            .chan
+            .recv(Duration::from_secs(60), "frame")
+            .await
+            .unwrap()
+            .unwrap();
+        match rx.env.kind {
+            Kind::CandidatesDone => done += 1,
+            Kind::Bye => break decode_body::<messages::Bye>(&rx.env.body).unwrap(),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(bye.reason, bye::ORPHANED);
+    assert_eq!(started.elapsed(), Duration::from_secs(30));
+    assert!(done >= 2, "the outbox frames went out meanwhile: {done}");
+    match task.await.unwrap().unwrap() {
+        HostOutcome::Session { end, .. } => assert_eq!(end, SessionEnd::Idle),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(live.count(), 0);
+    assert!(feeder.await.unwrap() >= 2);
+}
+
+/// Design `direct` §8.2: [`LiveSession::transport`] is the policy of the
+/// `SESSION_ACCEPT` as written, after every edit of it, never the host's
+/// setting read again; a code this build does not know is `tor_only`.
+#[tokio::test(start_paused = true)]
+async fn the_session_transport_is_the_policy_of_the_accept_as_written() {
+    type Edit = Option<fn(&mut messages::SessionAccept)>;
+    let cases: [(&str, TransportPolicy, Edit, u8, TransportPolicy); 4] = [
+        ("any", TransportPolicy::Any, None, 0, TransportPolicy::Any),
+        (
+            "tor_only",
+            TransportPolicy::TorOnly,
+            None,
+            1,
+            TransportPolicy::TorOnly,
+        ),
+        (
+            "rewritten lan_only",
+            TransportPolicy::Any,
+            Some(|a| a.transport_policy = TransportPolicy::LanOnly.code()),
+            2,
+            TransportPolicy::LanOnly,
+        ),
+        (
+            "an unknown code",
+            TransportPolicy::Any,
+            Some(|a| a.transport_policy = 0xEE),
+            0xEE,
+            TransportPolicy::TorOnly,
+        ),
+    ];
+    for (name, setting, edit, code, expected) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut host, _live, probe) = path_host(tmp.path(), None, None);
+        host.cfg.transport_policy = setting;
+        host.deps.edit_accept = edit;
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+        raw.hello_ack().await;
+        let accept = raw.request_session().await;
+        assert_eq!(accept.env.kind, Kind::SessionAccept, "{name}");
+        let written = decode_body::<messages::SessionAccept>(&accept.env.body).unwrap();
+        assert_eq!(written.transport_policy(), code, "{name}");
+        ping_through(&mut raw, 1).await;
+        assert_eq!(probe.opened()[0].transport, expected, "{name}");
+        drop(raw);
+        task.await.unwrap().unwrap();
+    }
+}
+
+/// Design `direct` §8.2, §9.2 (the policy-source test, FSM half): an
+/// unattended grant with `require_tor_only` on a host that allows direct
+/// paths reaches the path exchange as `tor_only`, through the signed accept
+/// alone; the same grant without it is `any`. The viewer's frames are still
+/// handed on: refusing them is the direct host's part.
+#[tokio::test]
+async fn an_unattended_grant_that_requires_tor_reaches_the_path_as_tor_only() {
+    use tornect_core::levels::FixedFacts;
+    const PW: &str = "quiet verdant otter lantern zephyr";
+    for (require_tor_only, expected) in [
+        (true, TransportPolicy::TorOnly),
+        (false, TransportPolicy::Any),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut host, client, _guard) =
+            unattended_pair_edited(tmp.path(), PW, Arc::new(FixedFacts::linux()), |g| {
+                g.require_tor_only = require_tor_only;
+            });
+        assert_eq!(host.cfg.transport_policy, TransportPolicy::Any);
+        let probe = PathsProbe::install(
+            &mut host,
+            Arc::new(LiveSessions::new()),
+            Some(PATH_INBOX),
+            None,
+        );
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let outcome = connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            unattended_intent(PW, messages::mode::CONTROL, false),
+        )
+        .await
+        .unwrap();
+        let ClientOutcome::Session(mut session) = outcome else {
+            panic!("{require_tor_only}: no session");
+        };
+        assert_eq!(session.transport_policy(), expected, "{require_tor_only}");
+        session
+            .send_candidates(&viewer_candidates(Some(messages::scope::SAME_SITE)))
+            .await
+            .unwrap();
+        session.ping().await.unwrap();
+        session.bye(bye::USER).await.unwrap();
+        task.await.unwrap().unwrap();
+        let opened = probe.opened();
+        assert_eq!(opened.len(), 1, "{require_tor_only}");
+        assert!(opened[0].unattended, "{require_tor_only}");
+        assert_eq!(opened[0].transport, expected, "{require_tor_only}");
+        assert_eq!(
+            probe.received(0),
+            [PathFrame::Candidates(viewer_candidates(Some(
+                messages::scope::SAME_SITE
+            )))],
+            "{require_tor_only}"
+        );
+    }
+}
+
+/// Design `direct` §8.2: [`LiveSession::viewer_dir1`] says whether the
+/// viewer's signed `HELLO` announced `dir1`, compared exactly.
+#[tokio::test]
+async fn the_viewers_dir1_reaches_the_path_from_its_signed_hello() {
+    for (feats, expected) in [
+        (vec![], false),
+        (vec![messages::feats::DIR1], true),
+        (vec![messages::feats::UA1, "dir10", "DIR1"], false),
+        (vec![messages::feats::UA1, messages::feats::DIR1], true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, _live, probe) = path_host(tmp.path(), None, None);
+        let mut client = client_side(tmp.path(), host.identity.id(), CLIENT_SEED);
+        client
+            .known
+            .pin(host.identity.id(), "Desk of Bob", host_device_pk())
+            .unwrap();
+        client.cfg.feats = feats.iter().map(|f| (*f).to_owned()).collect();
+        let (a, b) = pipe();
+        let task = spawn_host(a, &host);
+        let outcome = connect(
+            b,
+            &client.cfg,
+            &client.identity,
+            &client.deps,
+            Intent::Session,
+        )
+        .await
+        .unwrap();
+        let ClientOutcome::Session(session) = outcome else {
+            panic!("{feats:?}: no session");
+        };
+        session.bye(bye::USER).await.unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(probe.opened()[0].viewer_dir1, expected, "{feats:?}");
     }
 }
 

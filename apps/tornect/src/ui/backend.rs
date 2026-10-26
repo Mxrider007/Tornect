@@ -5191,6 +5191,8 @@ mod tests {
             mode: SessionMode::Control,
             elevation: Elevation::None,
             unattended: false,
+            transport: tornect_signal::consent::TransportPolicy::Any,
+            viewer_dir1: false,
         });
         let shared = Shared::new(Model::default(), Arc::new(|_| {}));
         let unpaired = || {
@@ -5282,6 +5284,8 @@ mod tests {
             mode: SessionMode::ViewOnly,
             elevation: Elevation::None,
             unattended: false,
+            transport: tornect_signal::consent::TransportPolicy::Any,
+            viewer_dir1: false,
         });
         let shared = Shared::new(Model::default(), Arc::new(|_| {}));
         assert!(!watch.run(ManagerOp::Remove(laptop), &shared));
@@ -6256,6 +6260,8 @@ mod tests {
             mode: SessionMode::ViewOnly,
             elevation: Elevation::None,
             unattended: false,
+            transport: tornect_signal::consent::TransportPolicy::Any,
+            viewer_dir1: false,
         };
         wiring.live.on_start(&session);
         met.push(request(0x54, "Hall", None).await);
@@ -6769,6 +6775,8 @@ mod tests {
                 mode: SessionMode::Control,
                 elevation,
                 unattended: false,
+                transport: tornect_signal::consent::TransportPolicy::Any,
+                viewer_dir1: false,
             });
             assert_eq!(
                 shared.read(|m| m.admin_sessions.contains(id)),
@@ -6825,6 +6833,8 @@ mod tests {
                 mode,
                 elevation: Elevation::None,
                 unattended: false,
+                transport: tornect_signal::consent::TransportPolicy::Any,
+                viewer_dir1: false,
             });
             assert_eq!(sessions.notice(id), want, "{id}");
             sessions.on_end(id, None);
@@ -9976,6 +9986,8 @@ mod tests {
             mode: SessionMode::Control,
             elevation: Elevation::None,
             unattended: false,
+            transport: tornect_signal::consent::TransportPolicy::Any,
+            viewer_dir1: false,
         });
         let bind = |session_id: String| {
             SvcMsg::Bind(Bind {
@@ -10087,6 +10099,8 @@ mod tests {
             mode: SessionMode::ViewOnly,
             elevation: Elevation::None,
             unattended: false,
+            transport: tornect_signal::consent::TransportPolicy::Any,
+            viewer_dir1: false,
         });
 
         // The media stream, bound: capture goes live with its first picture.

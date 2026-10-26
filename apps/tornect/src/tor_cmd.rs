@@ -3116,6 +3116,8 @@ mod tests {
                 mode: SessionMode::ViewOnly,
                 elevation: Elevation::None,
                 unattended: false,
+                transport: tornect_signal::consent::TransportPolicy::Any,
+                viewer_dir1: false,
             });
             let binding = Binding::new(&token, &th_final).with_quality(preset);
             let (client, server) = duplex(1 << 22);
@@ -3884,6 +3886,8 @@ mod tests {
             mode: SessionMode::Control,
             elevation: Elevation::None,
             unattended: false,
+            transport: tornect_signal::consent::TransportPolicy::Any,
+            viewer_dir1: false,
         });
         let mut streams = JoinSet::new();
         let (media_client, media_server) = duplex(1 << 22);

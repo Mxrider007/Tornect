@@ -286,6 +286,26 @@ pub enum TransportKind {
     TorRelay,
 }
 
+/// What a session's direct-path phase came to, as the host records it (design
+/// `direct` §3.6 and §8.1, decision M1-82: the measured punch success). Names,
+/// a kind and a time only: no address or port is ever in it (decision M1-83).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PathSummary {
+    /// `direct`, the name of the viewer's `TOR_FALLBACK` reason, `old-viewer`,
+    /// `pin-refused` or `bind-refused` (fixed words, never peer text).
+    pub outcome: String,
+    /// The kind of the remote candidate that won (`host`, `srflx`, `mapped`,
+    /// `prflx`); none when the session did not go direct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winner: Option<String>,
+    /// Whether the direct route is IPv6.
+    #[serde(default)]
+    pub ipv6: bool,
+    /// Milliseconds from the accept to the direct claim or to `TOR_FALLBACK`.
+    #[serde(default)]
+    pub ms: u32,
+}
+
 /// Who performed a local change (§B.8.9 `created_by`, §B.8.13 `by`).
 #[derive(
     Debug,

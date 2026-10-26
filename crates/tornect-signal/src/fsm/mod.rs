@@ -29,9 +29,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
+use tokio::sync::mpsc;
 use tornect_core::DeviceId;
 use tornect_core::session_log::{
-    AggregatedReject, RejectAggregator, SessionEvent, SessionLog, SessionMode, SessionRecord,
+    AggregatedReject, PathSummary, RejectAggregator, SessionEvent, SessionLog, SessionMode,
+    SessionRecord, TransportKind,
 };
 use tornect_core::trusted;
 use zeroize::{Zeroize as _, Zeroizing};
@@ -673,27 +675,102 @@ impl HandshakeAudit for HostAudit {
     }
 }
 
-/// Sink for the post-accept frames the direct path consumes (`CANDIDATES`,
-/// `CANDIDATES_DONE`, `TOR_FALLBACK`), each a checked body; M1 only proves
-/// they arrive.
-pub trait CandidateSink: Send + Sync {
-    /// A `CANDIDATES` frame.
-    fn on_candidates(&self, candidates: messages::Candidates);
-    /// A `CANDIDATES_DONE` frame.
-    fn on_candidates_done(&self);
-    /// A `TOR_FALLBACK` frame with its [`messages::fallback`] code (`None`
-    /// for `TOR_FALLBACK{}`).
-    fn on_tor_fallback(&self, reason: Option<u32>);
+/// One frame of a session's direct-path exchange on the signaling stream
+/// (design `direct` §4 and §8.2), between the host FSM and the layer that
+/// runs the direct path ([`PathExchange`]).
+#[derive(Clone, PartialEq, Eq)]
+pub enum PathFrame {
+    /// `CANDIDATES`: in the inbox a checked body of the viewer's; in the
+    /// outbox one the host sends (the scope it applied echoed).
+    Candidates(messages::Candidates),
+    /// `CANDIDATES_DONE`.
+    Done,
+    /// `TOR_FALLBACK` with its [`messages::fallback`] code (`None` for
+    /// `TOR_FALLBACK{}`).
+    TorFallback(Option<u32>),
+    /// Outbox only: end the session with `BYE{reason}` (a `lan_only`
+    /// session with no direct path ends `BYE{NO_LAN_PATH}`, decision M1-85).
+    /// The FSM records it as [`host::SessionEnd::Transport`].
+    End(u16),
 }
 
-/// Drops everything (M1 default).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct IgnoreCandidates;
+/// By hand: kinds, counts and codes only, never an address or a port
+/// (decision M1-83). [`messages::Candidates`] prints that way itself.
+impl core::fmt::Debug for PathFrame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Candidates(c) => f.debug_tuple("Candidates").field(c).finish(),
+            Self::Done => f.write_str("Done"),
+            Self::TorFallback(reason) => f
+                .debug_tuple("TorFallback")
+                .field(&reason.map(messages::fallback::name))
+                .finish(),
+            Self::End(reason) => f
+                .debug_tuple("End")
+                .field(&messages::bye::name(*reason))
+                .finish(),
+        }
+    }
+}
 
-impl CandidateSink for IgnoreCandidates {
-    fn on_candidates(&self, _: messages::Candidates) {}
-    fn on_candidates_done(&self) {}
-    fn on_tor_fallback(&self, _: Option<u32>) {}
+/// The capacity of a [`PathPort`] inbox (design `direct` §8.2): the FSM
+/// never waits on it, and a frame that finds it full is dropped and counted
+/// ([`HandshakeStats::path_frames_dropped`]).
+pub const PATH_INBOX: usize = 8;
+
+/// The two channels between the host FSM and a session's direct path,
+/// opened once per accepted session by [`PathExchange::open`]. Either may be
+/// absent: [`PathPort::default`] is the M1 behaviour (the viewer's path
+/// frames are dropped, nothing is sent).
+#[derive(Debug, Default)]
+pub struct PathPort {
+    /// Frames the FSM writes to the viewer, each raced against the kill
+    /// switch alone; [`PathFrame::End`] ends the session. A closed outbox is
+    /// simply no longer read.
+    pub outbox: Option<mpsc::Receiver<PathFrame>>,
+    /// The viewer's path frames, checked and passed through the path rules
+    /// ([`PATH_INBOX`]); never [`PathFrame::End`].
+    pub inbox: Option<mpsc::Sender<PathFrame>>,
+}
+
+/// How a session's media went, as the host's `sessions.log` line of its end
+/// records it ([`AuditEvent::SessionEnded`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathRecord {
+    /// The route the media bound on; none when no media bound.
+    pub transport: Option<TransportKind>,
+    /// What the direct-path phase came to.
+    pub path: Option<PathSummary>,
+}
+
+/// The seam through which the host FSM hands an accepted session's
+/// direct-path exchange to the layer that runs it (`tornect-session`'s
+/// direct host; design `direct` §8.2). Replaces M1's candidate sink.
+pub trait PathExchange: Send + Sync {
+    /// Once per accepted session, after its `SESSION_ACCEPT` was written and
+    /// [`host::SessionSink::on_start`] ran; never for a session that was
+    /// not accepted (§5.2 rule 1). Must not block: it runs on the stream's
+    /// task.
+    fn open(&self, session: &host::LiveSession<'_>) -> PathPort;
+
+    /// The media route and path summary of session `session_id`, read by the
+    /// FSM before [`host::SessionSink::on_end`] (which ends the media), also
+    /// when the session's task unwinds. Must not block.
+    fn outcome(&self, session_id: &str) -> PathRecord {
+        let _ = session_id;
+        PathRecord::default()
+    }
+}
+
+/// No direct path: [`PathPort::default`] for every session (M1 behaviour,
+/// the headless default).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoPaths;
+
+impl PathExchange for NoPaths {
+    fn open(&self, _: &host::LiveSession<'_>) -> PathPort {
+        PathPort::default()
+    }
 }
 
 /// A frame received and checked at the envelope level (not yet at the

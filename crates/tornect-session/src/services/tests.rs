@@ -397,6 +397,8 @@ fn start_as(rig: &Rig, seed: u8, mode: SessionMode, elevation: Elevation) -> Ses
         mode,
         elevation,
         unattended: false,
+        transport: tornect_signal::consent::TransportPolicy::Any,
+        viewer_dir1: false,
     };
     rig.services.on_start(&live);
     rig.media.on_start(&live);
