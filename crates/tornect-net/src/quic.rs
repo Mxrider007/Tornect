@@ -785,12 +785,20 @@ pub fn is_crypto_close(error: &ConnectionError) -> bool {
 /// [`REFUSAL_FLUSH`] for the viewer to acknowledge it or the connection to
 /// close, then closes the connection with `code` (a `tornect_proto::reason`
 /// code), so the viewer reads the reason before the close.
+///
+/// Bounded by [`REFUSAL_FLUSH`], and the close does not depend on the
+/// future finishing: a caller may race it against the kill or stop future
+/// (design §9.1 invariant 10, kill liveness) and drop it, and dropping it
+/// mid-flush closes the connection with `code` at once. The flush is then
+/// cut short, so the viewer may see the close without the frame; it still
+/// ends with `code`.
 pub async fn refuse(
     conn: &quinn::Connection,
     mut send: quinn::SendStream,
     frame: &[u8],
     code: u16,
 ) {
+    let _close = CloseOnDrop { conn, code };
     let flush = async {
         if send.write_all(frame).await.is_err() || send.finish().is_err() {
             return;
@@ -801,7 +809,19 @@ pub async fn refuse(
         }
     };
     let _ = tokio::time::timeout(REFUSAL_FLUSH, flush).await;
-    conn.close(VarInt::from(code), b"");
+}
+
+/// Closes `conn` with `code` when dropped: at the end of [`refuse`], or
+/// when its future is dropped before then.
+struct CloseOnDrop<'a> {
+    conn: &'a quinn::Connection,
+    code: u16,
+}
+
+impl Drop for CloseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.conn.close(VarInt::from(self.code), b"");
+    }
 }
 
 #[cfg(test)]

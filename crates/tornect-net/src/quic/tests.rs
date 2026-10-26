@@ -1814,6 +1814,40 @@ async fn a_deaf_viewer_holds_a_refusal_no_longer_than_the_flush() {
     );
 }
 
+/// A refusal whose future is dropped mid-flush (its caller raced it
+/// against the kill, design §9.1 invariant 10) closes the connection with the
+/// refusal's reason at the drop, not after the flush; the viewer, whose
+/// acknowledgement was in flight, then sees that close.
+#[tokio::test(start_paused = true)]
+async fn a_refusal_dropped_mid_flush_still_closes_with_its_reason() {
+    let hub = Hub::new();
+    let (host, viewer) = fresh(&hub, 50720, (false, false));
+    let (_server, host_conn, host_send, _host_recv, _client, viewer_conn, _recv) =
+        with_stream(&host, &viewer).await;
+    viewer.mem.hold(Hold::Arriving);
+    let started = tokio::time::Instant::now();
+    let kill = Duration::from_millis(100);
+    tokio::select! {
+        () = refuse(&host_conn, host_send, b"refused: version", 8) => {
+            panic!("the flush ended without an acknowledgement");
+        }
+        () = tokio::time::sleep(kill) => {}
+    }
+    assert!(started.elapsed() < REFUSAL_FLUSH);
+    assert_eq!(
+        host_conn.close_reason(),
+        Some(ConnectionError::LocallyClosed),
+        "the dropped refusal left the connection open"
+    );
+    viewer.mem.release();
+    match within(5, viewer_conn.closed()).await {
+        ConnectionError::ApplicationClosed(close) => {
+            assert_eq!(close.error_code, VarInt::from_u32(8));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 /// Zero `InvalidInput` refusals over whole sessions on sockets that
 /// refuse the wrong family (design §6.3 family rule, §12.1 "family"):
 /// dual-stack on both sides, on either side, each role dialling; every
