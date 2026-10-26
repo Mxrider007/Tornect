@@ -299,12 +299,22 @@ impl fmt::Debug for TeedStun {
 
 /// The receiving ends of a [`PunchSocket`]'s side channels. They fill only
 /// while quinn's endpoint driver polls the socket.
-#[derive(Debug)]
 pub struct Tees {
     /// Probe-shaped datagrams, at most [`PROBE_TEE`] waiting.
     pub probes: mpsc::Receiver<TeedProbe>,
     /// STUN-shaped datagrams, at most [`STUN_TEE`] waiting.
     pub stun: mpsc::Receiver<TeedStun>,
+}
+
+impl fmt::Debug for Tees {
+    /// The queue lengths only: tokio's own `Debug` of a receiver prints
+    /// heap addresses.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Tees")
+            .field("probes_waiting", &self.probes.len())
+            .field("stun_waiting", &self.stun.len())
+            .finish()
+    }
 }
 
 /// What became of a [`PunchSocket::send_raw`].

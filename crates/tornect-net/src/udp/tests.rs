@@ -882,6 +882,8 @@ fn no_debug_prints_an_address() {
     ] {
         assert!(!printed.contains(piece), "{piece} in {printed}");
     }
+    // A heap address would make the check above depend on the run.
+    assert!(!printed.contains("0x"), "a heap address in {printed}");
     assert!(printed.contains("v4 private"));
     assert!(printed.contains("dual_stack"));
 }
