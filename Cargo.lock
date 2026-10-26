@@ -7610,6 +7610,8 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tornect-core",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
