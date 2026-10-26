@@ -9637,6 +9637,7 @@ mod tests {
             height: 1080,
             mode: SessionMode::Control,
             input: true,
+            route: tornect_core::session_log::TransportKind::TorRelay,
         };
         media.capture_started(&started("s-1"));
         media.capture_started(&started("s-2"));

@@ -41,6 +41,8 @@ use tornect_signal::pairing::{
 use crate::viewer::BoundStream;
 use crate::*;
 
+mod direct_bind;
+
 const WAIT: Duration = Duration::from_secs(10);
 const KEY_A: u32 = 0x07_0004;
 /// What a host applies to a stream bound with Balanced, the preset a

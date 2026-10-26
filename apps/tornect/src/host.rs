@@ -1497,7 +1497,10 @@ pub fn describe_media(outcome: &MediaOutcome) -> Option<String> {
         MediaOutcome::NotStarted(end) => {
             format!("screen sharing did not start: {}", describe_media_end(*end))
         }
-        MediaOutcome::Served { .. } => return None,
+        // Served: the observer reported it. Abandoned: a viewer's unused
+        // onion pre-open, closed once its direct path won (the direct design
+        // §8.5), which is nothing to report.
+        MediaOutcome::Served { .. } | MediaOutcome::Abandoned => return None,
     })
 }
 

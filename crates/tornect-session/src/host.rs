@@ -53,6 +53,20 @@
 //! source could not switch or gave no picture within
 //! [`MediaLimits::switch_answer`]. One switch at a time, at most one per
 //! [`MediaLimits::switch_interval`].
+//!
+//! **The direct path** (the direct design §6.6, decision M1-79). A stream on
+//! a session's direct QUIC connection is served by
+//! [`MediaHost::serve_direct`]: the same `Bind` frame, read the same way, but
+//! checked against the link it came on (its session, its pinned peer key)
+//! and under the direct MAC, which also covers the connection's exporter
+//! output. A valid one is answered with `BindProof` before the source opens,
+//! so the viewer knows this host holds the session token before it decodes
+//! anything. A session's media binds once, on whichever path claims it
+//! first; the claim is published ([`MediaHost::claimed`]) so that the
+//! direct path's owner can close a link the onion path won. The session's
+//! signed transport policy decides which paths may claim it: `tor_only`
+//! never a direct one, `lan_only` only a same-site one
+//! ([`tornect_proto::reason::TRANSPORT`] otherwise).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -65,20 +79,23 @@ use tokio::sync::{Notify, Semaphore, mpsc, watch};
 use tornect_capture::{CaptureError, Frame, Layout, Monitor, Rect, Selection, VideoSource, View};
 use tornect_codec::H264Encoder;
 use tornect_codec::scale::Scaler;
+use tornect_core::DeviceId;
 use tornect_core::config::{Media, QualityPreset};
 use tornect_core::levels::Elevation;
-use tornect_core::session_log::SessionMode;
+use tornect_core::session_log::{SessionMode, TransportKind};
 use tornect_input::clipboard::ClipboardLink;
 use tornect_input::{InputEvent, InputSink, Tracked, Viewport};
 use tornect_proto::{
-    ALL_MONITORS, BIND_TYPE, MAX_CLIENT_FRAME, MAX_FRAME, MAX_MONITORS, MonitorEntry, Msg,
-    ProtoError, SESSION_ID_LEN, codec, monitor_status, read_msg_max, reason, seq_reached,
+    ALL_MONITORS, BIND_TYPE, BindSide, MAX_CLIENT_FRAME, MAX_FRAME, MAX_MONITORS, MonitorEntry,
+    Msg, ProtoError, SESSION_ID_LEN, codec, monitor_status, read_msg_max, reason, seq_reached,
     video_flags, write_msg,
 };
-use tornect_signal::consent::{SessionToken, mode_code};
+use tornect_signal::consent::{SessionToken, TransportPolicy, mode_code};
 use tornect_signal::fsm::host::{KillSwitch, LiveSession, SessionEnd, SessionSink};
 use tornect_signal::messages::notice;
+use zeroize::Zeroizing;
 
+use crate::direct::DirectStream;
 use crate::flow::{
     AckWindow, KeyframeLimiter, LineBudget, QualityGate, StageTimes, StatsWindow, TokenBucket,
 };
@@ -344,6 +361,9 @@ pub struct CaptureStarted<'a> {
     pub mode: SessionMode,
     /// Whether the viewer's input reaches this machine.
     pub input: bool,
+    /// The path the media stream was claimed on: [`TransportKind::TorRelay`]
+    /// for an onion stream, `Lan` or `Direct` for a direct one.
+    pub route: TransportKind,
 }
 
 /// What [`MediaObserver::capture_changed`] is told.
@@ -445,6 +465,10 @@ pub enum MediaOutcome {
     Busy,
     /// No valid `Bind` in time. A `BindRefused` was sent if a frame arrived.
     NotBound,
+    /// The stream closed before sending a byte: a viewer's unused onion
+    /// pre-open, given up once its direct path won (the direct design
+    /// §8.5). Nothing to report.
+    Abandoned,
     /// Bound, but no picture went out (capture failed, or the session ended
     /// first); `BindRefused` was sent.
     NotStarted(MediaEnd),
@@ -545,6 +569,17 @@ pub(crate) struct ServicesClaim {
 struct Registered {
     token: SessionToken,
     th_final: [u8; 32],
+    /// The viewer's device key, signed in the accept: a direct stream's QUIC
+    /// peer must hold it (the direct design §6.6, check 5).
+    device: DeviceId,
+    /// The transport policy of the accept as written
+    /// (`LiveSession::transport`, never the host's current knob): which
+    /// paths may claim the session's media.
+    transport: TransportPolicy,
+    /// The path the session's media stream was claimed on, published once:
+    /// `None` until then. Its receivers ([`MediaHost::claimed`]) see the
+    /// channel close when the session ends.
+    claimed: watch::Sender<Option<TransportKind>>,
     mode: SessionMode,
     /// The level signed in the accept.
     elevation: Elevation,
@@ -571,12 +606,56 @@ struct Claimed {
     label: String,
     end: watch::Receiver<Option<u16>>,
     capture: Arc<watch::Sender<CaptureState>>,
+    /// The `BindProof` MAC a direct bind is answered with
+    /// ([`tornect_proto::bind_mac_direct`], [`BindSide::Server`]); `None`
+    /// on the onion path.
+    proof: Option<[u8; 32]>,
 }
 
 enum Lookup {
     Bound(Claimed),
-    Refused,
+    /// Refused with this [`reason`] code; the session stays as it was.
+    Refused(u16),
     Unknown,
+}
+
+/// What a `Bind` proves, by the path it came on (the direct design §6.6).
+#[derive(Clone, Copy)]
+enum Proof<'a> {
+    /// An onion stream's: its kind's MAC over `th_final`.
+    Onion { mac: &'a [u8; 32] },
+    /// A direct connection's media stream: the client MAC over `th_final ‖
+    /// ekm`, from the QUIC peer `peer` (the key its TLS proved), on `path`
+    /// (`Lan` or `Direct`).
+    Direct {
+        mac: &'a [u8; 32],
+        ekm: &'a [u8; 32],
+        peer: &'a DeviceId,
+        path: TransportKind,
+    },
+}
+
+impl Proof<'_> {
+    /// The path a claim with this proof is published as.
+    fn path(&self) -> TransportKind {
+        match self {
+            Self::Onion { .. } => TransportKind::TorRelay,
+            Self::Direct { path, .. } => *path,
+        }
+    }
+
+    /// Whether the session's signed `policy` lets this path carry it
+    /// (§6.6 check 4, §9.2): `tor_only` never a direct one, `lan_only`
+    /// only a same-site one and never Tor; a direct proof on no direct
+    /// path is a caller's error and refused as one.
+    fn allowed_by(&self, policy: TransportPolicy) -> bool {
+        match (self, policy) {
+            (Self::Onion { .. }, policy) => policy != TransportPolicy::LanOnly,
+            (Self::Direct { .. }, TransportPolicy::TorOnly) => false,
+            (Self::Direct { path, .. }, TransportPolicy::LanOnly) => *path == TransportKind::Lan,
+            (Self::Direct { path, .. }, TransportPolicy::Any) => *path != TransportKind::TorRelay,
+        }
+    }
 }
 
 /// The host half of the media layer.
@@ -720,7 +799,17 @@ impl MediaHost {
         )
         .await
         {
-            Ok(Ok(bind)) => bind,
+            Ok(Ok(Some(bind))) => bind,
+            // Closed unused, as a viewer's onion pre-open is once its direct
+            // path won (the direct design §8.5): an outcome of its own, which
+            // the host's own lines leave out; the debug line stays within
+            // the budget of every stream that binds nothing.
+            Ok(Ok(None)) => {
+                if let Some(left_out) = line(pre_bind) {
+                    tracing::debug!(left_out, "media stream closed before its bind");
+                }
+                return MediaOutcome::Abandoned;
+            }
             Ok(Err(ProtoError::Io(e))) => {
                 if let Some(left_out) = line(pre_bind) {
                     tracing::debug!(error = %e, left_out, "media stream closed before its bind");
@@ -745,9 +834,10 @@ impl MediaHost {
                 return MediaOutcome::NotBound;
             }
         };
-        let claimed = match self.try_claim(&session_id, &mac, StreamKind::Media) {
-            Lookup::Bound(claimed) => Some(claimed),
-            Lookup::Refused => None,
+        let proof = Proof::Onion { mac: &mac };
+        let claimed = match self.try_claim(&session_id, proof, StreamKind::Media) {
+            Lookup::Bound(claimed) => Ok(claimed),
+            Lookup::Refused(code) => Err(code),
             // Its session may simply not be registered yet. Only `max_waiting`
             // binds wait for that at once, and the slot is let go before any
             // refusal is written.
@@ -765,39 +855,186 @@ impl MediaHost {
                 };
                 tokio::time::timeout_at(deadline, self.claim(&session_id, &mac))
                     .await
-                    .ok()
-                    .flatten()
+                    .unwrap_or(Err(reason::BAD_BIND))
             }
         };
-        let Some(claimed) = claimed else {
-            if let Some(left_out) = line(pre_bind) {
-                tracing::info!(session = %session_id, left_out, "media bind refused");
+        let claimed = match claimed {
+            Ok(claimed) => claimed,
+            Err(code) => {
+                if let Some(left_out) = line(pre_bind) {
+                    tracing::info!(session = %session_id, code, left_out, "media bind refused");
+                }
+                refuse(&mut wr, code).await;
+                return MediaOutcome::NotBound;
             }
-            refuse(&mut wr, reason::BAD_BIND).await;
-            return MediaOutcome::NotBound;
         };
-        self.run(session_id, claimed, Stream { route, preset }, rd, wr)
-            .await
+        let stream = Stream {
+            route,
+            preset,
+            path: TransportKind::TorRelay,
+        };
+        self.run(session_id, claimed, stream, rd, wr).await
+    }
+
+    /// Serve the media stream of a session's direct connection (the direct
+    /// design §6.6), from its `Bind` to its end. `expected_session` is the
+    /// session the link was made for, `peer` the device key the connection's
+    /// TLS proved, `ekm` its exporter output
+    /// (`tornect_net::Established::binding_secret`) and `route` its path:
+    /// [`TransportKind::Lan`] or [`TransportKind::Direct`], said by the link,
+    /// never by the viewer.
+    ///
+    /// The `Bind` is read as on the onion path, then checked in the design's
+    /// order: its session is the link's; that session is registered (nothing
+    /// waits: the link exists only for a session the FSM registered); it is
+    /// neither bound nor ended; its signed policy allows `route`
+    /// ([`reason::TRANSPORT`] otherwise); `peer` is its viewer's device; the
+    /// direct client MAC verifies. Only then is the session bound, the claim
+    /// published ([`Self::claimed`]) and `BindProof` written, all before the
+    /// source opens. A refusal is written with [`DirectStream::refuse`], so
+    /// the viewer reads its reason before the connection closes (§6.5).
+    ///
+    /// Until step B10 adds the direct row of the quality table, a direct
+    /// stream runs the Tor row (decision M1-84).
+    pub async fn serve_direct<S: DirectStream>(
+        &self,
+        mut stream: S,
+        expected_session: &str,
+        peer: DeviceId,
+        ekm: Zeroizing<[u8; 32]>,
+        route: TransportKind,
+    ) -> MediaOutcome {
+        let deadline = tokio::time::Instant::now() + self.limits.bind_deadline;
+        let pre_bind = &self.pre_bind;
+        let (session_id, mac, preset) =
+            match tokio::time::timeout_at(deadline, read_bind(&mut stream, pre_bind)).await {
+                Ok(Ok(Some(bind))) => bind,
+                Ok(Ok(None)) => {
+                    if let Some(left_out) = line(pre_bind) {
+                        tracing::debug!(left_out, "direct media stream closed before its bind");
+                    }
+                    return MediaOutcome::Abandoned;
+                }
+                Ok(Err(ProtoError::Io(e))) => {
+                    if let Some(left_out) = line(pre_bind) {
+                        tracing::debug!(
+                            error = %e,
+                            left_out,
+                            "direct media stream closed before its bind"
+                        );
+                    }
+                    return MediaOutcome::NotBound;
+                }
+                Ok(Err(e)) => {
+                    if let Some(left_out) = line(pre_bind) {
+                        tracing::debug!(
+                            error = %e,
+                            left_out,
+                            "direct media stream opened with something other than a bind"
+                        );
+                    }
+                    let refusal = Msg::BindRefused {
+                        reason: reason::PROTOCOL,
+                    };
+                    stream.refuse(refusal.encode(), reason::PROTOCOL).await;
+                    return MediaOutcome::NotBound;
+                }
+                Err(_) => {
+                    if let Some(left_out) = line(pre_bind) {
+                        tracing::debug!(left_out, "direct media stream sent no bind in time");
+                    }
+                    return MediaOutcome::NotBound;
+                }
+            };
+        // Check 1: the link's own session, before the registry is looked at.
+        let lookup = if session_id == expected_session {
+            let proof = Proof::Direct {
+                mac: &mac,
+                ekm: &ekm,
+                peer: &peer,
+                path: route,
+            };
+            self.try_claim(&session_id, proof, StreamKind::Media)
+        } else {
+            Lookup::Refused(reason::BAD_BIND)
+        };
+        drop(ekm);
+        let claimed = match lookup {
+            Lookup::Bound(claimed) => claimed,
+            Lookup::Refused(code) => {
+                return self.refuse_direct(stream, expected_session, code).await;
+            }
+            Lookup::Unknown => {
+                return self
+                    .refuse_direct(stream, expected_session, reason::BAD_BIND)
+                    .await;
+            }
+        };
+        let (rd, wr) = tokio::io::split(stream);
+        let stream = Stream {
+            route: quality_route(route),
+            preset,
+            path: route,
+        };
+        self.run(session_id, claimed, stream, rd, wr).await
+    }
+
+    /// A direct `Bind` refused with `code`: said to the viewer before the
+    /// connection closes with it (§6.5).
+    async fn refuse_direct<S: DirectStream>(
+        &self,
+        stream: S,
+        session: &str,
+        code: u16,
+    ) -> MediaOutcome {
+        if let Some(left_out) = line(&self.pre_bind) {
+            tracing::info!(session = %session, code, left_out, "direct media bind refused");
+        }
+        let refusal = Msg::BindRefused { reason: code };
+        stream.refuse(refusal.encode(), code).await;
+        MediaOutcome::NotBound
+    }
+
+    /// The path session `session_id`'s media stream was claimed on: `None`
+    /// while it is unclaimed, and once the session ended.
+    #[must_use]
+    pub fn route(&self, session_id: &str) -> Option<TransportKind> {
+        self.lock()
+            .get(session_id)
+            .and_then(|session| *session.claimed.borrow())
+    }
+
+    /// Follows the claim of session `session_id`'s media stream: `None`
+    /// until a path claims it, then that path, once; the channel closes when
+    /// the session ends. `None` for a session not registered. The direct
+    /// path's owner closes its link as soon as this says the onion path won
+    /// (the direct design §8.5).
+    #[must_use]
+    pub fn claimed(&self, session_id: &str) -> Option<watch::Receiver<Option<TransportKind>>> {
+        self.lock()
+            .get(session_id)
+            .map(|session| session.claimed.subscribe())
     }
 
     /// Bind `session_id` with `mac`. A session the FSM has not registered yet
     /// is waited for: it registers just after sending `SESSION_ACCEPT`, and a
-    /// fast viewer can bind in between. The caller bounds the wait.
-    async fn claim(&self, session_id: &str, mac: &[u8; 32]) -> Option<Claimed> {
+    /// fast viewer can bind in between. The caller bounds the wait. A refusal
+    /// is its [`reason`] code.
+    async fn claim(&self, session_id: &str, mac: &[u8; 32]) -> Result<Claimed, u16> {
         loop {
             let registered = self.registered.notified();
             tokio::pin!(registered);
             // Armed before the look-up, so an `on_start` in between still wakes us.
             registered.as_mut().enable();
-            match self.try_claim(session_id, mac, StreamKind::Media) {
-                Lookup::Bound(claimed) => return Some(claimed),
-                Lookup::Refused => return None,
+            match self.try_claim(session_id, Proof::Onion { mac }, StreamKind::Media) {
+                Lookup::Bound(claimed) => return Ok(claimed),
+                Lookup::Refused(code) => return Err(code),
                 Lookup::Unknown => registered.await,
             }
         }
     }
 
-    fn try_claim(&self, session_id: &str, mac: &[u8; 32], kind: StreamKind) -> Lookup {
+    fn try_claim(&self, session_id: &str, proof: Proof<'_>, kind: StreamKind) -> Lookup {
         let mut sessions = self.lock();
         let Some(session) = sessions.get_mut(session_id) else {
             return Lookup::Unknown;
@@ -807,26 +1044,61 @@ impl MediaHost {
             StreamKind::Services => session.services_bound,
         };
         // One stream of each kind per session (SLICE-A1 G3, A2-3; the
-        // services design §3.3), and none for a session already ended by a
+        // services design §3.3), on whichever path binds it first (the
+        // direct design §6.6), and none for a session already ended by a
         // kill whose `on_end` has not come yet.
         if bound || session.end.borrow().is_some() {
-            return Lookup::Refused;
+            return Lookup::Refused(reason::BAD_BIND);
+        }
+        // The signed policy, before the proof is looked at: a refusal for
+        // the path says so (the direct design §6.6, check 4).
+        if !proof.allowed_by(session.transport) {
+            return Lookup::Refused(reason::TRANSPORT);
         }
         // A wrong MAC leaves the session unbound: a peer that knows a session
         // id but not its token cannot lock the real viewer out. Each kind
-        // has its own MAC, so one stream's bind never binds the other.
+        // and each path has its own MAC, so one stream's bind never binds
+        // another.
         let (token, th_final) = (session.token.bytes(), &session.th_final);
-        let verified = match kind {
-            StreamKind::Media => tornect_proto::bind_mac_ok(token, th_final, mac),
-            StreamKind::Services => {
+        let verified = match (proof, kind) {
+            (Proof::Onion { mac }, StreamKind::Media) => {
+                tornect_proto::bind_mac_ok(token, th_final, mac)
+            }
+            (Proof::Onion { mac }, StreamKind::Services) => {
                 tornect_proto::services::services_bind_mac_ok(token, th_final, mac)
             }
+            // Checks 5 and 6: the connection's pinned peer is this session's
+            // viewer, and the MAC covers this connection's exporter output.
+            (Proof::Direct { mac, ekm, peer, .. }, StreamKind::Media) => {
+                *peer == session.device
+                    && tornect_proto::bind_mac_direct_ok(
+                        token,
+                        th_final,
+                        ekm,
+                        BindSide::Client,
+                        mac,
+                    )
+            }
+            // A direct services stream is bound by its own host (§6.7).
+            (Proof::Direct { .. }, StreamKind::Services) => false,
         };
         if !verified {
-            return Lookup::Refused;
+            return Lookup::Refused(reason::BAD_BIND);
         }
+        let proof_mac = match proof {
+            Proof::Direct { ekm, .. } => Some(tornect_proto::bind_mac_direct(
+                token,
+                th_final,
+                ekm,
+                BindSide::Server,
+            )),
+            Proof::Onion { .. } => None,
+        };
         match kind {
-            StreamKind::Media => session.bound = true,
+            StreamKind::Media => {
+                session.bound = true;
+                session.claimed.send_replace(Some(proof.path()));
+            }
             StreamKind::Services => session.services_bound = true,
         }
         Lookup::Bound(Claimed {
@@ -835,6 +1107,7 @@ impl MediaHost {
             label: session.label.clone(),
             end: session.end.subscribe(),
             capture: Arc::clone(&session.capture),
+            proof: proof_mac,
         })
     }
 
@@ -845,14 +1118,14 @@ impl MediaHost {
     /// stream's `BindOk`, so an unknown session is refused at once. A wrong
     /// MAC leaves the session's services unbound.
     pub(crate) fn claim_services(&self, session_id: &str, mac: &[u8; 32]) -> Option<ServicesClaim> {
-        match self.try_claim(session_id, mac, StreamKind::Services) {
+        match self.try_claim(session_id, Proof::Onion { mac }, StreamKind::Services) {
             Lookup::Bound(claimed) => Some(ServicesClaim {
                 mode: claimed.mode,
                 label: claimed.label,
                 end: claimed.end,
                 capture: claimed.capture.subscribe(),
             }),
-            Lookup::Refused | Lookup::Unknown => None,
+            Lookup::Refused(_) | Lookup::Unknown => None,
         }
     }
 
@@ -896,11 +1169,25 @@ impl MediaHost {
             label,
             mut end,
             capture,
+            proof,
         } = claimed;
-        let Stream { route, preset } = stream;
+        let Stream {
+            route,
+            preset,
+            path,
+        } = stream;
         // `Stopped` on every way out of here, a panic included (the services
         // design §2.2).
         let mark = CaptureMark(capture);
+
+        // A direct bind is answered with the host's proof before anything
+        // opens (the direct design §6.6): the viewer reads it before
+        // `BindOk`, so it never waits on the desktop's dialog for it.
+        if let Some(mac) = proof
+            && let Err(stop) = send(&mut wr, &Msg::BindProof { mac }, &mut end, None).await
+        {
+            return MediaOutcome::NotStarted(stop.end);
+        }
 
         // Capture starts here, after a verified bind (§B.6, decision M1-39).
         // The open's cancel is made before the open, and belongs to it alone:
@@ -1025,6 +1312,7 @@ impl MediaHost {
             height: first.height,
             mode,
             input: injector.is_some(),
+            route: path,
         });
 
         let (inbound_tx, mut inbound) = mpsc::channel(INBOUND_DEPTH);
@@ -1377,6 +1665,9 @@ impl SessionSink for MediaHost {
             Registered {
                 token: session.token.clone(),
                 th_final: session.th_final,
+                device: session.device,
+                transport: session.transport,
+                claimed: watch::channel(None).0,
                 mode: session.mode,
                 elevation: session.elevation,
                 label: session.label.to_owned(),
@@ -1406,27 +1697,42 @@ impl SessionSink for MediaHost {
 /// What a `Bind` carries: the session id, the MAC and the viewer's preset.
 type Bound = (String, [u8; 32], QualityPreset);
 
-/// How a bound stream is served: the route its listener says, and the preset
-/// its `Bind` names.
+/// How a bound stream is served: the quality route its listener says, the
+/// preset its `Bind` names, and the path it was claimed on.
 #[derive(Debug, Clone, Copy)]
 struct Stream {
     route: Route,
     preset: QualityPreset,
+    path: TransportKind,
+}
+
+/// The quality table's row for a stream claimed on `path`. A direct or LAN
+/// stream runs the Tor row until step B10 adds the direct one (decision
+/// M1-84); this is the one place that changes then.
+fn quality_route(path: TransportKind) -> Route {
+    match path {
+        TransportKind::TorRelay | TransportKind::Lan | TransportKind::Direct => Route::Tor,
+    }
 }
 
 /// The first frame of a media stream, read without trusting its length prefix:
 /// a `Bind` is exactly [`BIND_LEN`] bytes, so that is all an unbound peer can
 /// make the host read. Returns the session id, the MAC and the viewer's
-/// preset (a code `tornect_proto::quality` does not know is malformed).
+/// preset (a code `tornect_proto::quality` does not know is malformed), or
+/// `None` when the stream closed before its first byte (an unused pre-open).
 ///
 /// Its own line, the one a viewer of another version causes, is let through
 /// by `lines`, as every line before a session is bound.
 async fn read_bind<R: AsyncRead + Unpin>(
     r: &mut R,
     lines: &Mutex<LineBudget>,
-) -> Result<Bound, ProtoError> {
+) -> Result<Option<Bound>, ProtoError> {
     let mut len = [0u8; 4];
-    r.read_exact(&mut len).await?;
+    let first = r.read(&mut len).await?;
+    if first == 0 {
+        return Ok(None);
+    }
+    r.read_exact(&mut len[first..]).await?;
     let len = u32::from_be_bytes(len) as usize;
     if len != BIND_LEN {
         // A viewer of another Tornect version sends a `Bind` of another
@@ -1456,7 +1762,7 @@ async fn read_bind<R: AsyncRead + Unpin>(
             mac,
             quality,
         } => quality::preset(quality)
-            .map(|preset| (session_id, mac, preset))
+            .map(|preset| Some((session_id, mac, preset)))
             .ok_or(ProtoError::Malformed("Bind")),
         _ => Err(ProtoError::Malformed("Bind")),
     }
@@ -2902,7 +3208,7 @@ mod tests {
     }
 
     /// `read_bind` over `bytes`, with what it logged and how many bytes it read.
-    fn read_bind_of(bytes: &[u8]) -> (Result<Bound, ProtoError>, Vec<String>, u64) {
+    fn read_bind_of(bytes: &[u8]) -> (Result<Option<Bound>, ProtoError>, Vec<String>, u64) {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -2961,11 +3267,13 @@ mod tests {
         tracing::subscriber::with_default(lines, || {
             runtime.block_on(async {
                 // Closed at once: no time passes, so all 50 fall in one window.
+                // Closed before their first byte, they are abandoned
+                // pre-opens (the direct design §8.5), within the same budget.
                 for _ in 0..50 {
                     let (client, server) = tokio::io::duplex(64);
                     drop(client);
                     let outcome = host.serve(server).await;
-                    assert!(matches!(outcome, MediaOutcome::NotBound), "{outcome:?}");
+                    assert!(matches!(outcome, MediaOutcome::Abandoned), "{outcome:?}");
                 }
                 tokio::time::advance(PRE_BIND_WINDOW).await;
                 let ping = Msg::Ping { nonce: 1 }.encode();
@@ -3008,6 +3316,45 @@ mod tests {
         }
     }
 
+    /// The direct design §8.5: a stream that closes before its first byte is
+    /// an unused pre-open (`None`), one that closes inside its length
+    /// prefix or its frame is not.
+    #[test]
+    fn only_a_stream_closed_before_any_byte_is_abandoned() {
+        let (read, lines, at) = read_bind_of(&[]);
+        assert!(matches!(read, Ok(None)), "{read:?}");
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(at, 0);
+        let frame = bind(tornect_proto::quality::BALANCED).encode();
+        for cut in [1, 3, 4, 5, frame.len() - 1] {
+            let (read, _, _) = read_bind_of(&frame[..cut]);
+            assert!(matches!(read, Err(ProtoError::Io(_))), "{cut}: {read:?}");
+        }
+    }
+
+    /// A `Bind` that arrives a byte at a time is read whole: the first read
+    /// may return part of the length prefix.
+    #[tokio::test]
+    async fn a_bind_arriving_a_byte_at_a_time_is_read_whole() {
+        let frame = bind(tornect_proto::quality::BEST_QUALITY).encode();
+        let (mut client, mut server) = tokio::io::duplex(1);
+        let writer = tokio::spawn(async move {
+            client.write_all(&frame).await.unwrap();
+            client
+        });
+        let budget = Mutex::new(LineBudget::new(PRE_BIND_WINDOW, PRE_BIND_LINES));
+        let read = read_bind(&mut server, &budget).await.unwrap();
+        assert_eq!(
+            read,
+            Some((
+                "0123456789abcdef".to_owned(),
+                [7; 32],
+                QualityPreset::BestQuality
+            ))
+        );
+        drop(writer.await.unwrap());
+    }
+
     /// The quality design §4.1: a `Bind` is 50 bytes and carries the
     /// viewer's preset, which `read_bind` returns; an unknown code is a
     /// malformed bind, refused like any other before a look-up.
@@ -3029,7 +3376,7 @@ mod tests {
             let (read, lines, at) = read_bind_of(&frame);
             assert_eq!(
                 read.unwrap(),
-                ("0123456789abcdef".to_owned(), [7; 32], preset)
+                Some(("0123456789abcdef".to_owned(), [7; 32], preset))
             );
             assert!(lines.is_empty(), "{lines:?}");
             assert_eq!(at, frame.len() as u64);
