@@ -23,6 +23,12 @@ tokio.workspace = true
 # binding secret wiped on drop.
 subtle.workspace = true
 zeroize.workspace = true
+# The punch probe (step A10): the probe key derived from the session token
+# (HKDF-SHA256), the HMAC-SHA256 tag, random txids, leads and padding.
+getrandom.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

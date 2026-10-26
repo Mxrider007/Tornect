@@ -2,8 +2,8 @@
 //! §B.2; design `direct` revision 4, decisions M1-78 to M1-86): this
 //! computer's addresses and the filters every remote address passes, the
 //! session's one UDP socket with its source gates, quinn QUIC with both
-//! device keys pinned, then (in the following steps) hole punching, STUN
-//! and router port mapping.
+//! device keys pinned, the authenticated punch probes, then (in the
+//! following steps) the checklist, STUN and router port mapping.
 //!
 //! Nothing outside this crate may touch sockets or quinn. It never names
 //! `tornect-signal`: the wire forms of candidates are converted in
@@ -19,6 +19,7 @@ use std::pin::Pin;
 pub mod addr;
 pub mod env;
 pub mod local;
+pub mod probe;
 pub mod quic;
 pub mod socket;
 pub mod udp;
@@ -29,6 +30,7 @@ pub use addr::{
 };
 pub use env::{NetEnv, RealNet};
 pub use local::{IfaceAddr, IfaceKind, RouteSources};
+pub use probe::{Probe, ProbeDrop, ProbeKey, Txid};
 pub use quic::{
     DeviceKeySigner, PeerRefusal, PinnedVerifier, QuicError, QuicIdentity, check_peer,
     endpoint_config, exporter, is_crypto_close, transport,
