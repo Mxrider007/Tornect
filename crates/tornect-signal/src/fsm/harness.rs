@@ -34,15 +34,16 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, DuplexStream, ReadBuf, duplex};
 use tornect_core::trusted::{KnownHosts, TrustedDevices};
 
-use super::client::{ClientDeps, ClientOutcome, Intent, ScriptedClientUi, connect};
+use super::client::{ClientDeps, ClientOutcome, ClientSession, Intent, ScriptedClientUi, connect};
 use super::host::{HostDeps, HostOutcome, serve_host};
 use super::vectors::{
     self, client_config, client_identity, client_random, host_config, host_device_pk,
     host_identity, host_random,
 };
 use super::{Channel, HandshakeError, Taken};
-use crate::envelope::Envelope;
+use crate::envelope::{Envelope, Kind};
 use crate::framing::{MAX_FRAME_LEN, read_frame_max, write_frame};
+use crate::messages::{Caps, HelloAck, SessionAccept, ed25519_spki};
 use crate::pairing::{
     KnownHostStore, PairDecision, PairScript, ScriptedConsent, SessionDecision, SessionScript,
     TrustedDeviceStore,
@@ -310,6 +311,89 @@ async fn feed(
     }
     let _ = drain(stream, peer).await;
     let _ = stream.shutdown().await;
+}
+
+/// An attended session the client FSM established with a host played by
+/// hand: the [`ClientSession`] over `client_end`, and the host's
+/// [`Channel`] over `host_end`, just past its genuinely signed
+/// `SESSION_ACCEPT` (the vectors' identities, the host already known to the
+/// client, no pairing). For tests of code that drives a session, such as the
+/// app's keep-alive loop: the host side can send what the host FSM never
+/// sends on its own (`PING`s, M2 frames, faults), or nothing at all.
+///
+/// # Panics
+///
+/// If the handshake does not complete within 5 s (virtual time under
+/// `tokio::time::pause`).
+pub async fn raw_session<S>(
+    client_end: S,
+    host_end: DuplexStream,
+) -> (ClientSession<S>, Channel<DuplexStream>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    const STEP: Duration = Duration::from_secs(5);
+    let host = host_identity();
+    let device = client_identity();
+    let mut known = KnownHosts::default();
+    known.pin(host.id(), vectors::HOST_NAME, host_device_pk(), 1);
+    let mut deps = ClientDeps::headless(Arc::new(KnownHostStore::ephemeral(known)));
+    deps.ui = Arc::new(ScriptedClientUi::new(true));
+    let cfg = client_config(host.id());
+    let mut chan = Channel::new(host_end, &HostSigner::public_key(&host));
+    let play_host = async {
+        let hello = chan
+            .recv(STEP, "HELLO")
+            .await
+            .expect("HELLO")
+            .expect("HELLO");
+        assert_eq!(hello.env.kind, Kind::Hello);
+        chan.absorb(&hello);
+        let ack = HelloAck {
+            v: 1,
+            host_nonce: vectors::HOST_NONCE,
+            feats: vec![],
+        };
+        chan.send(&ack, Some(&host)).await.expect("HELLO_ACK");
+        chan.set_version(1);
+        let request = chan
+            .recv(STEP, "SESSION_REQUEST")
+            .await
+            .expect("SESSION_REQUEST")
+            .expect("SESSION_REQUEST");
+        assert_eq!(request.env.kind, Kind::SessionRequest);
+        chan.absorb(&request);
+        let accept = SessionAccept {
+            caps: Caps::default(),
+            quic_spki: ed25519_spki(&host_device_pk()),
+            session_type: 0,
+            mode: 0,
+            transport_policy: 0,
+            session_token: Some(vectors::SESSION_TOKEN),
+            token_confirm: None,
+            block_window_s: 0,
+            ask_before_start: false,
+            ends_at: None,
+            fail_summary: None,
+            elevation: None,
+            grant_reach: None,
+        };
+        chan.send(&accept, Some(&host))
+            .await
+            .expect("SESSION_ACCEPT");
+    };
+    let (outcome, ()) = tokio::time::timeout(STEP, async {
+        tokio::join!(
+            connect(client_end, &cfg, &device, &deps, Intent::Session),
+            play_host
+        )
+    })
+    .await
+    .expect("the handshake completes");
+    match outcome.expect("a session") {
+        ClientOutcome::Session(session) => (*session, chan),
+        ClientOutcome::Paired { .. } => panic!("expected a session"),
+    }
 }
 
 /// One result of [`Channel::take_frame`] in [`channel_takes`], comparable

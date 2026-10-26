@@ -1174,6 +1174,14 @@ where
         result
     }
 
+    /// Mark this side closing, with no frame and no shutdown: what a frame
+    /// handler that must not write does on the peer's `BYE` or `ERROR`. Reads
+    /// and writes are refused from then on; the stream closes when it is
+    /// dropped.
+    pub(crate) fn mark_closing(&mut self) {
+        self.closing = true;
+    }
+
     /// Close without a frame.
     pub async fn close(&mut self) {
         self.closing = true;

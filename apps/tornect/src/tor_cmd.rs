@@ -1995,18 +1995,27 @@ impl FrameSink for CliPictures<'_> {
 
 /// Keep `session` alive with a `PING` every `every` (the first at once) until
 /// `stop` resolves, `pings` pings have been answered, or the host ends it.
+///
+/// `stop` is heard at once, whatever the host does (design `direct` §4).
+/// Every wait races it, and only cancel-safe futures: between pings the loop
+/// waits on [`ClientSession::event_ready`] and the ping timer, then
+/// [`ClientSession::take_event`] handles one frame without writing. A host
+/// `PING` leaves its `PONG` owed, and [`ClientSession::flush_owed`] writes it
+/// next, raced against `stop` alone; so are the ping itself and the `ERROR`
+/// that answers a fault ([`ClientSession::fail_bounded`], bounded too). A
+/// host that stops reading can stall those writes, never the stop.
+///
 /// Pings run to a deadline that frames from the host do not move, so a host
 /// that keeps sending cannot keep `--pings N` from ending (SLICE-B2 B2-8):
-/// M2 frames come back here and wait for the same `next_ping`, and a host
-/// `PING` is answered inside `next_event`, whose one deadline it does not move
-/// either (SLICE-D D2).
+/// its M2 frames are taken as they come and the timer stays where it was,
+/// and a host `PING` is answered without moving it either (SLICE-D D2).
 ///
-/// Between pings it waits on the stream, not on a timer, so a host `BYE` is
-/// reported the moment it arrives. Over Tor the host's circuit is often gone
-/// by the next ping, whose write would then fail first and turn a deliberate
-/// end (`tornect panic`) into "connection lost". Cutting that wait short
-/// cannot drop part of a frame: after the accept an honest host sends nothing
-/// unprompted except `BYE`, which ends the session anyway.
+/// Between pings it waits on the stream, not on the timer alone, so a host
+/// `BYE` is reported the moment it arrives. Over Tor the host's circuit is
+/// often gone by the next ping, whose write would then fail first and turn a
+/// deliberate end (`tornect panic`) into "connection lost". Cutting that wait
+/// short for the ping loses nothing: the channel keeps a partial frame for
+/// the next read.
 async fn keep_alive<S, F>(
     session: &mut ClientSession<S>,
     pings: Option<u32>,
@@ -2024,30 +2033,61 @@ where
         if pings.is_some_and(|max| sent >= max) {
             break End::You;
         }
-        let wait = next_ping.saturating_duration_since(tokio::time::Instant::now());
-        if !wait.is_zero() {
-            let event = tokio::select! {
+        if session.owes() {
+            let flushed = tokio::select! {
+                biased;
                 result = &mut stop => {
                     result.context("waiting for Ctrl-C")?;
                     break End::You;
                 }
-                event = session.next_event(wait) => event,
+                flushed = session.flush_owed() => flushed,
             };
-            match event {
-                // Nothing from the host in `wait`: time for the next ping.
-                Err(HandshakeError::Timeout(_)) => {}
+            if let Err(e) = flushed {
+                break End::Lost(e);
+            }
+            continue;
+        }
+        if tokio::time::Instant::now() < next_ping {
+            let ready = tokio::select! {
+                biased;
+                result = &mut stop => {
+                    result.context("waiting for Ctrl-C")?;
+                    break End::You;
+                }
+                ready = session.event_ready() => ready,
+                // Nothing whole from the host by then: time for the next ping.
+                () = tokio::time::sleep_until(next_ping) => continue,
+            };
+            if let Err(e) = ready {
+                break End::Lost(e);
+            }
+            match session.take_event() {
+                // A host `PING` (its `PONG` is now owed), or nothing yet.
+                Ok(None) => {}
                 Ok(Some(SessionEvent::Bye { reason, .. })) => break End::Host(reason),
                 Ok(Some(SessionEvent::Error { code, detail })) => {
                     break End::Lost(HandshakeError::PeerError { code, detail });
                 }
                 // The M2 frames: nothing uses them before M2, and they do not
                 // move the next ping.
-                Ok(Some(_)) => continue,
-                Ok(None) => break End::Lost(HandshakeError::Closed),
+                Ok(Some(_)) => {}
+                Err(e @ HandshakeError::Violation { .. }) => {
+                    let e = tokio::select! {
+                        biased;
+                        result = &mut stop => {
+                            result.context("waiting for Ctrl-C")?;
+                            break End::You;
+                        }
+                        e = session.fail_bounded(e) => e,
+                    };
+                    break End::Lost(e);
+                }
                 Err(e) => break End::Lost(e),
             }
+            continue;
         }
         let pinged = tokio::select! {
+            biased;
             result = &mut stop => {
                 result.context("waiting for Ctrl-C")?;
                 break End::You;
@@ -2202,8 +2242,11 @@ mod tests {
 
     use tokio::io::{DuplexStream, ReadBuf, duplex};
     use tornect_core::trusted::{KnownHosts, TrustedDevices};
+    use tornect_signal::envelope::{Envelope, Kind, codes};
+    use tornect_signal::framing::{HEADER_LEN, read_frame};
     use tornect_signal::fsm::client::ScriptedClientUi;
     use tornect_signal::fsm::host::{HostConfig, HostDeps, KillSwitch, serve_host};
+    use tornect_signal::messages::{self, decode_body, encode_body};
     use tornect_signal::pairing::{
         PairDecision, PairScript, ScriptedConsent, SessionDecision, SessionScript,
         TrustedDeviceStore,
@@ -2412,6 +2455,204 @@ mod tests {
             "{end:?}"
         );
         host.await.unwrap().unwrap();
+    }
+
+    /// A live session whose host is played by hand
+    /// ([`tornect_signal::fsm::harness::raw_session`]), so it can send what
+    /// the host FSM never sends unprompted: the session, its write switch, the
+    /// host's end of the stream and the next `msg_id` the host sends.
+    async fn raw_live() -> (ClientSession<Freezable>, Arc<AtomicBool>, DuplexStream, u64) {
+        let (client_end, host_end) = duplex(64 * 1024);
+        let frozen = Arc::new(AtomicBool::new(false));
+        let stream = Freezable {
+            inner: client_end,
+            frozen: Arc::clone(&frozen),
+        };
+        let (session, host) = tornect_signal::fsm::harness::raw_session(stream, host_end).await;
+        let msg_id = host.next_tx_id();
+        (session, frozen, host.into_stream(), msg_id)
+    }
+
+    /// A host frame of `kind`, length prefix included.
+    fn host_frame(msg_id: u64, kind: Kind, body: Vec<u8>) -> Vec<u8> {
+        let payload = Envelope::new(1, msg_id, kind, body).encode();
+        let mut out = u32::try_from(payload.len()).unwrap().to_be_bytes().to_vec();
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    /// The client's next frame, as the host reads it.
+    async fn client_frame(stream: &mut DuplexStream) -> Envelope {
+        let payload = read_frame(stream).await.unwrap().expect("a frame");
+        Envelope::decode(&payload).unwrap()
+    }
+
+    /// Answer the client's `PING` that `ping` is.
+    fn pong_for(msg_id: u64, ping: &Envelope) -> Vec<u8> {
+        assert_eq!(ping.kind, Kind::Ping);
+        let nonce = decode_body::<messages::Ping>(&ping.body).unwrap().nonce;
+        host_frame(msg_id, Kind::Pong, encode_body(&messages::Pong { nonce }))
+    }
+
+    /// Design `direct` §4 (step A3): frames from the host between two pings
+    /// do not move the next one, and a frame the ping time cuts in two is not
+    /// lost. A host that sends `CANDIDATES_DONE` every second still gets the
+    /// second ping 10 s after the first, and the frame whose second half
+    /// comes after the ping time is read whole when it arrives, inside the
+    /// ping. The wait used to be a timed read: cut there, it lost the half it
+    /// had read, and the ping misread the rest as a frame of its own.
+    #[tokio::test(start_paused = true)]
+    async fn host_frames_between_pings_keep_the_deadline_and_a_cut_frame_is_kept() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut session, _frozen, mut host, mut msg_id) = raw_live().await;
+        let t0 = tokio::time::Instant::now();
+        let done = || encode_body(&messages::CandidatesDone {});
+        let play = async move {
+            let ping = client_frame(&mut host).await;
+            host.write_all(&pong_for(msg_id, &ping)).await.unwrap();
+            msg_id += 1;
+            for second in 1..=9 {
+                tokio::time::sleep_until(t0 + Duration::from_secs(second)).await;
+                let frame = host_frame(msg_id, Kind::CandidatesDone, done());
+                host.write_all(&frame).await.unwrap();
+                msg_id += 1;
+            }
+            let cut = host_frame(msg_id, Kind::CandidatesDone, done());
+            msg_id += 1;
+            tokio::time::sleep_until(t0 + Duration::from_millis(9_500)).await;
+            host.write_all(&cut[..HEADER_LEN + 2]).await.unwrap();
+            tokio::time::sleep_until(t0 + Duration::from_millis(10_500)).await;
+            host.write_all(&cut[HEADER_LEN + 2..]).await.unwrap();
+            let ping = client_frame(&mut host).await;
+            host.write_all(&pong_for(msg_id, &ping)).await.unwrap();
+            host
+        };
+        let (end, host) = tokio::join!(
+            keep_alive(
+                &mut session,
+                Some(2),
+                Duration::from_secs(10),
+                std::future::pending(),
+            ),
+            play
+        );
+        let end = end.unwrap();
+        assert!(matches!(end, End::You), "{end:?}");
+        assert_eq!(
+            t0.elapsed(),
+            Duration::from_millis(10_500),
+            "the second ping went out at 10 s and its PONG came after the cut frame"
+        );
+        assert_eq!(
+            session.take_event().unwrap(),
+            Some(SessionEvent::CandidatesDone),
+            "the cut frame, whole, queued by the ping"
+        );
+        drop(host);
+    }
+
+    /// Design `direct` §12.1 kill liveness, the viewer's keep-alive (step
+    /// A3): a host `PING` that comes while this side's writes are stuck
+    /// leaves its `PONG` owed, and a Ctrl-C ends the session the moment it
+    /// comes, with the `PONG` still unwritten. Leaving returns at once too:
+    /// the write cut short is the channel's last, so no `BYE` is tried on the
+    /// stuck stream.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_while_a_pong_is_owed_to_a_host_that_stops_reading_ends_at_once() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut session, frozen, mut host, msg_id) = raw_live().await;
+        let t0 = tokio::time::Instant::now();
+        let play = async {
+            let ping = client_frame(&mut host).await;
+            host.write_all(&pong_for(msg_id, &ping)).await.unwrap();
+            frozen.store(true, Ordering::SeqCst);
+            tokio::time::sleep_until(t0 + Duration::from_secs(2)).await;
+            let ping = host_frame(
+                msg_id + 1,
+                Kind::Ping,
+                encode_body(&messages::Ping { nonce: 5 }),
+            );
+            host.write_all(&ping).await.unwrap();
+        };
+        let stop = async {
+            tokio::time::sleep_until(t0 + Duration::from_secs(3)).await;
+            Ok(())
+        };
+        let (end, ()) = tokio::join!(
+            keep_alive(&mut session, None, Duration::from_secs(10), stop),
+            play
+        );
+        let end = end.unwrap();
+        assert!(matches!(end, End::You), "{end:?}");
+        assert_eq!(t0.elapsed(), Duration::from_secs(3), "the stop waited");
+        assert!(session.owes(), "the PONG was written to a stuck stream");
+        let left = session.bye(bye::USER).await;
+        assert!(matches!(left, Err(HandshakeError::Aborted(_))), "{left:?}");
+        assert_eq!(
+            t0.elapsed(),
+            Duration::from_secs(3),
+            "leaving waited on the stuck stream"
+        );
+        drop(host);
+    }
+
+    /// Design `direct` §4 (step A3): a fault from the host ends the session
+    /// with the violation, its `ERROR` written raced against the stop and
+    /// bounded by `timeouts::BYE`: at once to a host that reads, after
+    /// exactly that bound to one that stops reading. Here a frame whose
+    /// `msg_id` skips one.
+    #[tokio::test(start_paused = true)]
+    async fn a_fault_from_the_host_ends_the_keep_alive_in_bounded_time() {
+        use tokio::io::AsyncWriteExt as _;
+        for host_reads in [true, false] {
+            let (mut session, frozen, mut host, msg_id) = raw_live().await;
+            let t0 = tokio::time::Instant::now();
+            let play = async {
+                let ping = client_frame(&mut host).await;
+                host.write_all(&pong_for(msg_id, &ping)).await.unwrap();
+                frozen.store(!host_reads, Ordering::SeqCst);
+                tokio::time::sleep_until(t0 + Duration::from_secs(2)).await;
+                let skipped = host_frame(
+                    msg_id + 2,
+                    Kind::CandidatesDone,
+                    encode_body(&messages::CandidatesDone {}),
+                );
+                host.write_all(&skipped).await.unwrap();
+                if host_reads {
+                    let answer = client_frame(&mut host).await;
+                    assert_eq!(answer.kind, Kind::Error);
+                    let e: messages::Error = decode_body(&answer.body).unwrap();
+                    assert_eq!(e.code, codes::E_BAD_MSG_ID);
+                    assert!(
+                        read_frame(&mut host).await.unwrap().is_none(),
+                        "then closed"
+                    );
+                }
+            };
+            let (end, ()) = tokio::join!(
+                keep_alive(
+                    &mut session,
+                    None,
+                    Duration::from_secs(10),
+                    std::future::pending(),
+                ),
+                play
+            );
+            match end.unwrap() {
+                End::Lost(e) => assert_eq!(e.violation_code(), Some(codes::E_BAD_MSG_ID), "{e}"),
+                other => panic!("host reads {host_reads}: {other:?}"),
+            }
+            let bound = if host_reads {
+                Duration::ZERO
+            } else {
+                tornect_signal::fsm::timeouts::BYE
+            };
+            assert_eq!(
+                t0.elapsed(),
+                Duration::from_secs(2) + bound,
+                "host reads {host_reads}"
+            );
+        }
     }
 
     /// The quality design §3.5: the `MEDIA` lines of the presets, as the

@@ -25,7 +25,10 @@ use tornect_core::unattended::hosts::PinCheck;
 use tornect_core::{DeviceIdentity, TornectId};
 use zeroize::Zeroizing;
 
-use super::{Channel, HandshakeError, OsRandom, Randomness, Received, SessionToken, timeouts};
+use super::{
+    Channel, HandshakeError, OsRandom, Randomness, Received, SessionToken, Taken, checked_body,
+    timeouts,
+};
 use crate::auth;
 use crate::consent::{TransportPolicy, mode_from_code};
 use crate::envelope::{Kind, codes};
@@ -50,6 +53,30 @@ fn time_left(deadline: Option<Instant>, what: &'static str) -> Result<Duration, 
     }
     Ok(left)
 }
+
+/// Wait for [`Channel::frame_ready`] until `deadline` (`None` is no
+/// deadline): `Timeout(what)` once it has passed.
+async fn frame_by<S>(
+    chan: &mut Channel<S>,
+    deadline: Option<Instant>,
+    what: &'static str,
+) -> Result<(), HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    time_left(deadline, what)?;
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, chan.frame_ready())
+            .await
+            .map_err(|_| HandshakeError::Timeout(what))?,
+        None => chan.frame_ready().await,
+    }
+}
+
+/// Most `PONG`s owed at once ([`ClientSession::owes`]): a host that sends
+/// `PING`s faster than this side can answer loses the oldest answers, not
+/// this side's memory.
+pub const MAX_OWED: usize = 4;
 
 /// What the client sends in `HELLO` and `SESSION_REQUEST`.
 #[derive(Debug, Clone)]
@@ -278,8 +305,13 @@ pub struct ClientSession<S> {
     asked_elevation: Elevation,
     random: Arc<dyn Randomness>,
     /// M2 frames that arrived while [`ClientSession::ping`] waited for its
-    /// `PONG`; [`ClientSession::next_event`] hands them out first.
+    /// `PONG`; [`ClientSession::take_event`] hands them out first.
     pending: VecDeque<SessionEvent>,
+    /// The nonces of host `PING`s not answered yet, oldest first, at most
+    /// [`MAX_OWED`]: [`ClientSession::flush_owed`] writes their `PONG`s.
+    owed: VecDeque<u64>,
+    /// Owed `PONG`s dropped for [`MAX_OWED`].
+    owed_dropped: u64,
     /// The host's last notice code (decision M1-70): `None` until a `PONG`
     /// that answers this side's `PING` carries one.
     notices: watch::Sender<Option<u8>>,
@@ -359,40 +391,62 @@ where
     /// Send `PING` and wait [`timeouts::PONG`] for the matching `PONG`;
     /// returns the round trip. The Tor circuit is a heartbeat channel in both
     /// directions (§B.2), so a `PING` from the host that arrives meanwhile is
-    /// answered in place, M2 frames are queued for [`ClientSession::next_event`],
-    /// and only a `PONG` with the wrong nonce or an out-of-place kind is
-    /// `E_BAD_STATE`.
+    /// answered at once (its `PONG` goes out before the next frame is read),
+    /// M2 frames are queued for [`ClientSession::take_event`], and only a
+    /// `PONG` with the wrong nonce or an out-of-place kind is `E_BAD_STATE`.
+    ///
+    /// It writes (the `PING`, owed `PONG`s, an `ERROR`), so a caller that
+    /// must be able to stop races the whole call against its stop future.
+    /// The reads and the owed `PONG`s are bounded by the one deadline and an
+    /// `ERROR` by [`timeouts::BYE`]; the `PING`'s own write is not bounded.
     pub async fn ping(&mut self) -> Result<Duration, HandshakeError> {
         let mut nonce = [0u8; 8];
         self.random.fill(&mut nonce)?;
         let nonce = u64::from_be_bytes(nonce);
         let start = Instant::now();
-        self.chan.send(&Ping { nonce }, None).await?;
         let deadline = start.checked_add(timeouts::PONG);
+        self.flush_by(deadline, "PONG").await?;
+        self.chan.send(&Ping { nonce }, None).await?;
         loop {
-            let wait = time_left(deadline, "PONG")?;
-            let Some(rx) = self.chan.recv(wait, "PONG").await? else {
-                return Err(HandshakeError::Closed);
+            frame_by(&mut self.chan, deadline, "PONG").await?;
+            let rx = match self.chan.take_frame() {
+                Taken::Frame(rx) => rx,
+                Taken::Pending => continue,
+                Taken::Eof => return Err(HandshakeError::Closed),
+                Taken::Fault { code, what } => {
+                    return Err(self
+                        .fail_bounded(HandshakeError::Violation { code, what })
+                        .await);
+                }
             };
             if rx.env.kind == Kind::Pong {
-                let pong: messages::HostPong = self.chan.body(&rx).await?;
+                let pong: messages::HostPong = match checked_body(&rx) {
+                    Ok(pong) => pong,
+                    Err(e) => return Err(self.fail_bounded(e).await),
+                };
                 if pong.nonce != nonce {
-                    return Err(self.chan.fail(codes::E_BAD_STATE, "pong nonce").await);
+                    let e = HandshakeError::Violation {
+                        code: codes::E_BAD_STATE,
+                        what: "pong nonce",
+                    };
+                    return Err(self.fail_bounded(e).await);
                 }
                 if let Some(code) = pong.notice {
                     self.notices.send_replace(Some(code));
                 }
                 return Ok(start.elapsed());
             }
-            match self.classify(&rx).await? {
-                None => {}
-                Some(SessionEvent::Bye { reason, detail }) => {
+            match self.classify(&rx) {
+                // A host `PING`: answered before anything else is read.
+                Ok(None) => self.flush_by(deadline, "PONG").await?,
+                Ok(Some(SessionEvent::Bye { reason, detail })) => {
                     return Err(HandshakeError::PeerBye { reason, detail });
                 }
-                Some(SessionEvent::Error { code, detail }) => {
+                Ok(Some(SessionEvent::Error { code, detail })) => {
                     return Err(HandshakeError::PeerError { code, detail });
                 }
-                Some(event) => self.pending.push_back(event),
+                Ok(Some(event)) => self.pending.push_back(event),
+                Err(e) => return Err(self.fail_bounded(e).await),
             }
         }
     }
@@ -415,67 +469,196 @@ where
 
     /// Wait up to `timeout` for the next frame from the host (a `BYE`, an
     /// `ERROR`, or one of the M2 frames), after anything queued by
-    /// [`ClientSession::ping`]; a `PING` from the host is answered in place
-    /// and not reported. `Ok(None)` when the host closed the stream.
+    /// [`ClientSession::ping`]; a `PING` from the host is answered on the
+    /// way and not reported. `Ok(None)` when the host closed the stream.
     ///
-    /// `timeout` is one deadline for the whole call: the host's `PING`s,
-    /// answered on the way, do not move it (SLICE-D D2), so a host that keeps
-    /// pinging cannot keep the caller waiting.
+    /// `timeout` is one deadline for the whole call, the owed `PONG`s it
+    /// writes included: the host's `PING`s do not move it (SLICE-D D2), so a
+    /// host that keeps pinging, or stops reading, cannot keep the caller
+    /// waiting. Built on [`ClientSession::event_ready`],
+    /// [`ClientSession::take_event`] and [`ClientSession::flush_owed`]; a
+    /// fault is answered with [`ClientSession::fail_bounded`].
     pub async fn next_event(
         &mut self,
         timeout: Duration,
     ) -> Result<Option<SessionEvent>, HandshakeError> {
         let deadline = Instant::now().checked_add(timeout);
         loop {
-            if let Some(event) = self.pending.pop_front() {
-                return Ok(Some(event));
+            self.flush_by(deadline, "session frame").await?;
+            if self.pending.is_empty() {
+                frame_by(&mut self.chan, deadline, "session frame").await?;
             }
-            let wait = time_left(deadline, "session frame")?;
-            let Some(rx) = self.chan.recv(wait, "session frame").await? else {
-                return Ok(None);
-            };
-            if let Some(event) = self.classify(&rx).await? {
-                return Ok(Some(event));
+            match self.take_event() {
+                Ok(Some(event)) => return Ok(Some(event)),
+                Ok(None) => {}
+                Err(HandshakeError::Closed) => return Ok(None),
+                Err(e @ HandshakeError::Violation { .. }) => {
+                    return Err(self.fail_bounded(e).await);
+                }
+                Err(e) => return Err(e),
             }
         }
     }
 
-    /// One post-accept frame: a `PING` is answered in place (`Ok(None)`),
-    /// `BYE` / `ERROR` close the channel, the M2 frames become events, and
-    /// anything else — an unsolicited `PONG` included — is `E_BAD_STATE`.
-    async fn classify(&mut self, rx: &Received) -> Result<Option<SessionEvent>, HandshakeError> {
+    /// Resolves once [`ClientSession::take_event`] has something to hand
+    /// out: at once while events are queued, otherwise when the channel has
+    /// a whole frame, the end of the stream or a fault
+    /// ([`Channel::frame_ready`]). `Err` when the stream broke or ended
+    /// inside a frame, and `Aborted` once the session is closing (after the
+    /// host's `BYE` or `ERROR`).
+    ///
+    /// Cancel safe and read-only (design `direct` §4): it can be raced in a
+    /// `select!` against a stop future and timers, and a partial frame it
+    /// read stays buffered for the next call.
+    pub async fn event_ready(&mut self) -> Result<(), HandshakeError> {
+        if self.pending.is_empty() {
+            self.chan.frame_ready().await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Hand out one queued event or process the one buffered frame, without
+    /// awaiting and **without writing**:
+    ///
+    /// * `Ok(Some(event))`: a `BYE` or `ERROR` from the host (the session is
+    ///   closing from then on) or an M2 frame;
+    /// * `Ok(None)`: a host `PING`, whose `PONG` is now owed
+    ///   ([`ClientSession::owes`]), or no whole frame yet;
+    /// * `Err(Closed)`: the host closed the stream;
+    /// * `Err(Violation)`: an envelope or body fault, or a kind out of place
+    ///   (an unsolicited `PONG` included). Nothing was answered: the caller
+    ///   sends the `ERROR` with [`ClientSession::fail_bounded`], raced
+    ///   against its stop future.
+    pub fn take_event(&mut self) -> Result<Option<SessionEvent>, HandshakeError> {
+        if let Some(event) = self.pending.pop_front() {
+            return Ok(Some(event));
+        }
+        match self.chan.take_frame() {
+            Taken::Frame(rx) => self.classify(&rx),
+            Taken::Pending => Ok(None),
+            Taken::Eof => Err(HandshakeError::Closed),
+            Taken::Fault { code, what } => Err(HandshakeError::Violation { code, what }),
+        }
+    }
+
+    /// Whether host `PING`s wait for their `PONG`
+    /// ([`ClientSession::flush_owed`]).
+    #[must_use]
+    pub fn owes(&self) -> bool {
+        !self.owed.is_empty()
+    }
+
+    /// Owed `PONG`s dropped because more than [`MAX_OWED`] were waiting.
+    #[must_use]
+    pub fn owed_dropped(&self) -> u64 {
+        self.owed_dropped
+    }
+
+    /// Write the owed `PONG`s, oldest first: the one write of the event API.
+    /// A peer that stops reading stalls it, so callers race it against their
+    /// stop future, as in `select! { biased; () = &mut stop => …, r =
+    /// session.flush_owed() => r? }`. Dropped there, the `PONG`s not written
+    /// stay owed; one cut short is the channel's last write (the channel
+    /// refuses later ones).
+    pub async fn flush_owed(&mut self) -> Result<(), HandshakeError> {
+        while let Some(&nonce) = self.owed.front() {
+            self.chan.send(&Pong { nonce }, None).await?;
+            self.owed.pop_front();
+        }
+        Ok(())
+    }
+
+    /// [`ClientSession::flush_owed`] until `deadline`: `Timeout(what)` once
+    /// it has passed.
+    async fn flush_by(
+        &mut self,
+        deadline: Option<Instant>,
+        what: &'static str,
+    ) -> Result<(), HandshakeError> {
+        if !self.owes() {
+            return Ok(());
+        }
+        time_left(deadline, what)?;
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, self.flush_owed())
+                .await
+                .map_err(|_| HandshakeError::Timeout(what))?,
+            None => self.flush_owed().await,
+        }
+    }
+
+    /// Answer a fault [`ClientSession::take_event`] returned: `ERROR{code}`
+    /// and the close, within [`timeouts::BYE`], so a host that stops reading
+    /// cannot keep this side from leaving. Returns the error to report (any
+    /// other error comes back as it was, unanswered). Callers race it against
+    /// their stop future too.
+    pub async fn fail_bounded(&mut self, err: HandshakeError) -> HandshakeError {
+        let HandshakeError::Violation { code, what } = err else {
+            return err;
+        };
+        match tokio::time::timeout(timeouts::BYE, self.chan.fail(code, what)).await {
+            Ok(err) => err,
+            Err(_) => {
+                self.chan.mark_closing();
+                HandshakeError::Violation { code, what }
+            }
+        }
+    }
+
+    /// Queue the `PONG` for a host `PING`, dropping the oldest past
+    /// [`MAX_OWED`].
+    fn owe(&mut self, nonce: u64) {
+        if self.owed.len() >= MAX_OWED {
+            self.owed.pop_front();
+            self.owed_dropped = self.owed_dropped.saturating_add(1);
+            tracing::debug!(dropped = self.owed_dropped, "owed PONG dropped");
+        }
+        self.owed.push_back(nonce);
+    }
+
+    /// One post-accept frame, checked without writing: a `PING` leaves its
+    /// `PONG` owed (`Ok(None)`), `BYE` / `ERROR` mark the channel closing,
+    /// the M2 frames become events, and anything else — an unsolicited
+    /// `PONG` included — is the unanswered `E_BAD_STATE` violation.
+    fn classify(&mut self, rx: &Received) -> Result<Option<SessionEvent>, HandshakeError> {
         let event = match rx.env.kind {
             Kind::Bye => {
-                let b: messages::Bye = self.chan.body(rx).await?;
-                self.chan.close().await;
+                let b: messages::Bye = checked_body(rx)?;
+                self.chan.mark_closing();
                 SessionEvent::Bye {
                     reason: b.reason,
                     detail: b.detail,
                 }
             }
             Kind::Error => {
-                let e: messages::Error = self.chan.body(rx).await?;
-                self.chan.close().await;
+                let e: messages::Error = checked_body(rx)?;
+                self.chan.mark_closing();
                 SessionEvent::Error {
                     code: e.code,
                     detail: e.detail,
                 }
             }
             Kind::Ping => {
-                let p: Ping = self.chan.body(rx).await?;
-                self.chan.send(&Pong { nonce: p.nonce }, None).await?;
+                let p: Ping = checked_body(rx)?;
+                self.owe(p.nonce);
                 return Ok(None);
             }
-            Kind::Candidates => SessionEvent::Candidates(self.chan.body(rx).await?),
+            Kind::Candidates => SessionEvent::Candidates(checked_body(rx)?),
             Kind::CandidatesDone => {
-                let _: messages::CandidatesDone = self.chan.body(rx).await?;
+                let _: messages::CandidatesDone = checked_body(rx)?;
                 SessionEvent::CandidatesDone
             }
             Kind::TorFallback => {
-                let _: messages::TorFallback = self.chan.body(rx).await?;
+                let _: messages::TorFallback = checked_body(rx)?;
                 SessionEvent::TorFallback
             }
-            _ => return Err(self.chan.fail(codes::E_BAD_STATE, "kind").await),
+            _ => {
+                return Err(HandshakeError::Violation {
+                    code: codes::E_BAD_STATE,
+                    what: "kind",
+                });
+            }
         };
         Ok(Some(event))
     }
@@ -814,6 +997,8 @@ where
         asked_elevation: Elevation::None,
         random: Arc::clone(&deps.random),
         pending: VecDeque::new(),
+        owed: VecDeque::new(),
+        owed_dropped: 0,
         notices: watch::Sender::new(None),
         host_feats,
     })))
@@ -1179,6 +1364,8 @@ where
         asked_elevation: ua.want_elevation,
         random: Arc::clone(&deps.random),
         pending: VecDeque::new(),
+        owed: VecDeque::new(),
+        owed_dropped: 0,
         notices: watch::Sender::new(None),
         host_feats,
     })))

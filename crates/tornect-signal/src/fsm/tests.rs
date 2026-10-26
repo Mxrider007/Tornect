@@ -4154,6 +4154,191 @@ async fn host_pings_do_not_move_the_next_event_deadline() {
     );
 }
 
+/// A client end whose writes are counted and can be frozen (a host that
+/// withholds credit), with the raw host of an established session
+/// ([`harness::raw_session`]).
+async fn raw_client_session() -> (
+    client::ClientSession<FrozenWrites>,
+    Channel<DuplexStream>,
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (a, b) = pipe();
+    let frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stream = FrozenWrites {
+        inner: a,
+        frozen: frozen.clone(),
+        writes: writes.clone(),
+    };
+    let (session, host) = harness::raw_session(stream, b).await;
+    (session, host, frozen, writes)
+}
+
+/// Design `direct` §8.2: `take_event` handles one frame and never writes.
+/// Host `PING`s leave their `PONG`s owed, at most `MAX_OWED` (the oldest are
+/// dropped and counted), M2 frames are events, and `flush_owed` alone writes
+/// the answers, oldest first. After the host's `BYE` the session is closing.
+#[tokio::test(start_paused = true)]
+async fn take_event_never_writes_and_leaves_the_pongs_owed() {
+    let (mut session, mut host, _frozen, writes) = raw_client_session().await;
+    for nonce in 0..6u64 {
+        host.send(&Ping { nonce }, None).await.unwrap();
+    }
+    host.send(&messages::CandidatesDone {}, None).await.unwrap();
+    let before = writes.load(Ordering::SeqCst);
+    let event = loop {
+        session.event_ready().await.unwrap();
+        if let Some(event) = session.take_event().unwrap() {
+            break event;
+        }
+    };
+    assert_eq!(event, SessionEvent::CandidatesDone);
+    assert_eq!(writes.load(Ordering::SeqCst), before, "take_event wrote");
+    assert!(session.owes());
+    assert_eq!(session.owed_dropped(), 2, "six PINGs, four PONGs owed");
+    assert_eq!(client::MAX_OWED, 4);
+    session.flush_owed().await.unwrap();
+    assert!(!session.owes());
+    for nonce in 2..6u64 {
+        let rx = host
+            .recv(Duration::from_secs(1), "pong")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rx.env.kind, Kind::Pong);
+        assert_eq!(decode_body::<Pong>(&rx.env.body).unwrap().nonce, nonce);
+    }
+    host.bye(bye::USER).await.unwrap();
+    session.event_ready().await.unwrap();
+    assert_eq!(
+        session.take_event().unwrap(),
+        Some(SessionEvent::Bye {
+            reason: bye::USER,
+            detail: None
+        })
+    );
+    assert!(
+        matches!(session.event_ready().await, Err(HandshakeError::Aborted(_))),
+        "closing after the host's BYE"
+    );
+}
+
+/// Design `direct` §8.2: a fault after the accept comes back from
+/// `take_event` unanswered, with nothing written; `fail_bounded` then
+/// answers it with `ERROR{code}` and the close, and gives up at exactly
+/// `timeouts::BYE` on a host that stops reading.
+#[tokio::test(start_paused = true)]
+async fn take_event_returns_faults_unanswered_and_fail_bounded_is_bounded() {
+    let cases: [(&str, u16); 4] = [
+        ("msg_id", codes::E_BAD_MSG_ID),
+        ("unsolicited PONG", codes::E_BAD_STATE),
+        ("malformed CANDIDATES", codes::E_BAD_LEN),
+        ("too large", codes::E_TOO_LARGE),
+    ];
+    for (case, code) in cases {
+        for host_reads in [true, false] {
+            let (mut session, host, frozen, writes) = raw_client_session().await;
+            let msg_id = host.next_tx_id();
+            let mut stream = host.into_stream();
+            let ping = encode_body(&Ping { nonce: 1 });
+            match case {
+                "msg_id" => {
+                    let env = Envelope::new(1, msg_id + 1, Kind::Ping, ping);
+                    write_frame(&mut stream, &env.encode()).await.unwrap();
+                }
+                "unsolicited PONG" => {
+                    let env = Envelope::new(1, msg_id, Kind::Pong, encode_body(&Pong { nonce: 7 }));
+                    write_frame(&mut stream, &env.encode()).await.unwrap();
+                }
+                "malformed CANDIDATES" => {
+                    let env = Envelope::new(1, msg_id, Kind::Candidates, vec![0xff]);
+                    write_frame(&mut stream, &env.encode()).await.unwrap();
+                }
+                _ => {
+                    let len = u32::try_from(MAX_FRAME_LEN + 1).unwrap();
+                    stream.write_all(&len.to_be_bytes()).await.unwrap();
+                }
+            }
+            let before = writes.load(Ordering::SeqCst);
+            session.event_ready().await.unwrap();
+            let err = session.take_event().unwrap_err();
+            assert_eq!(err.violation_code(), Some(code), "{case}: {err}");
+            assert_eq!(
+                writes.load(Ordering::SeqCst),
+                before,
+                "{case}: answered in place"
+            );
+            frozen.store(!host_reads, Ordering::SeqCst);
+            let started = tokio::time::Instant::now();
+            let err = session.fail_bounded(err).await;
+            assert_eq!(err.violation_code(), Some(code), "{case}: {err}");
+            if host_reads {
+                let answer = crate::framing::read_frame(&mut stream)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let env = Envelope::decode(&answer).unwrap();
+                assert_eq!(env.kind, Kind::Error, "{case}");
+                let e: messages::Error = decode_body(&env.body).unwrap();
+                assert_eq!(e.code, code, "{case}");
+                assert!(
+                    crate::framing::read_frame(&mut stream)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{case}: then closed"
+                );
+            } else {
+                assert_eq!(
+                    started.elapsed(),
+                    timeouts::BYE,
+                    "{case}: fail_bounded gave up after something other than timeouts::BYE"
+                );
+            }
+        }
+    }
+}
+
+/// Design `direct` §12.1 kill liveness, viewer side, at the session API (the
+/// path chooser that will race it arrives with step A17): a host `PING` that
+/// arrives while this side's window is full leaves a `PONG` owed, and the
+/// caller's stop future beats the stalled `flush_owed` the moment it fires.
+/// The `PONG` is not awaited after either: the write cut short is the
+/// channel's last, so `bye` returns at once instead of waiting
+/// `timeouts::BYE` on the stuck stream, and the host sees nothing but the
+/// close.
+#[tokio::test(start_paused = true)]
+async fn a_stop_beats_an_owed_pong_to_a_host_that_stops_reading() {
+    let (mut session, mut host, frozen, _writes) = raw_client_session().await;
+    frozen.store(true, Ordering::SeqCst);
+    host.send(&Ping { nonce: 9 }, None).await.unwrap();
+    session.event_ready().await.unwrap();
+    assert_eq!(session.take_event().unwrap(), None, "a PING is no event");
+    assert!(session.owes());
+    let started = tokio::time::Instant::now();
+    let stop = tokio::time::sleep(Duration::from_millis(100));
+    let stopped = tokio::select! {
+        biased;
+        () = stop => true,
+        flushed = session.flush_owed() => {
+            flushed.unwrap();
+            false
+        }
+    };
+    assert!(stopped, "the PONG went out to a host that reads nothing");
+    assert_eq!(started.elapsed(), Duration::from_millis(100));
+    let left = session.bye(bye::USER).await;
+    assert!(matches!(left, Err(HandshakeError::Aborted(_))), "{left:?}");
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_millis(100),
+        "bye waited on the stuck stream"
+    );
+    let seen = host.recv(Duration::from_secs(1), "close").await.unwrap();
+    assert!(seen.is_none(), "the host saw a frame: {seen:?}");
+}
+
 /// The attended session popup has the pairing popup's budget: one popup in
 /// flight per paired device (`SESSION_REJECT{BUSY}` for a second stream while
 /// it is open, no second popup), another device still gets its own popup,
@@ -4955,9 +5140,9 @@ async fn a_kill_ends_the_session_while_a_write_to_the_peer_is_stuck() {
     drop(raw);
 }
 
-/// The host's end of a pipe whose writes can be frozen, as a peer that
-/// withholds Tor credit freezes them; reads go on. `writes` counts every
-/// write attempt, frozen or not.
+/// One end of a pipe whose writes can be frozen, as a peer that withholds
+/// Tor credit freezes them; reads go on. `writes` counts every write
+/// attempt, frozen or not.
 struct FrozenWrites {
     inner: DuplexStream,
     frozen: Arc<std::sync::atomic::AtomicBool>,
