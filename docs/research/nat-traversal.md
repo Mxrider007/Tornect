@@ -237,7 +237,8 @@ on either. B1 re-reads these paths before turning it on.
   (`os/linux/mtu.rs` 11, 25, 41, on an MTU ioctl failure or a name over `IFNAMSIZ`) and an
   interface index (`os/windows/flags.rs:40`). Names and indexes are not addresses, but
   they are local configuration; step A7 records this as a residual (the GUI has no
-  console on Windows; the CLI's stderr is the user's own terminal).
+  console on Windows; the CLI's stderr is the user's own terminal): docs/VERIFICATION.md,
+  "Step A7: netdev's own stderr lines".
 
 ### 1.8 Not used, and why
 
