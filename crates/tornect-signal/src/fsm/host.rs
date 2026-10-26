@@ -30,7 +30,7 @@ use zeroize::Zeroizing;
 use super::{
     AuditEvent, AuthExchange, CandidateSink, Channel, HandshakeAudit, HandshakeError, HelperEvent,
     IgnoreCandidates, NoAudit, OsRandom, Randomness, Received, SessionToken, SuppressedPopup,
-    checked_body, timeouts,
+    Taken, checked_body, timeouts,
 };
 use crate::consent::{
     AcceptHostInfo, AlwaysDeny, BlockWindow, ChosenCaps, ConsentProof, FreshToken, LocalAllow,
@@ -1993,10 +1993,14 @@ where
 /// `Established`: answer `PING`, hand M2 frames to the sink, end on `BYE`,
 /// the kill switch, the orphan timer or the idle timer. It returns as soon as
 /// the session is over, with what is still to be written: the caller releases
-/// the session first and says goodbye after. A violation found here (a body
-/// that does not decode, a kind out of place) is returned unanswered, and its
-/// `ERROR` is that goodbye (SLICE-C3 C3-2); only `recv`'s own checks answer in
-/// place, inside the `select!` that the kill can win.
+/// the session first and says goodbye after. A violation found here (an
+/// envelope fault, a body that does not decode, a kind out of place) is
+/// returned unanswered, and its `ERROR` is that goodbye (SLICE-C3 C3-2).
+///
+/// The wait races only cancel-safe futures: the kill, the channel's
+/// read-only [`Channel::frame_ready`] and the timer. Frames are then handled
+/// with [`Channel::take_frame`], which never writes; the one write here, the
+/// `PONG`, is raced against the kill alone (design `direct` §4).
 async fn established<S>(
     chan: &mut Channel<S>,
     cfg: &HostConfig,
@@ -2024,26 +2028,29 @@ where
             (Some(o), idle) if !have_path && idle.is_none_or(|i| o < i) => (Some(o), true),
             (_, idle) => (idle, false),
         };
-        let wait = deadline.map_or(Duration::MAX, |d| d.saturating_duration_since(now));
-        let received = tokio::select! {
+        let frame = tokio::select! {
             biased;
             reason = kill.killed() => {
                 return Ok((SessionEnd::Killed(reason), Goodbye::Bye(reason)));
             }
-            rx = chan.recv(wait, "frame") => rx,
+            ready = chan.frame_ready() => ready.map(|()| true),
+            () = sleep_until_opt(deadline) => Ok(false),
         };
-        let rx: Received = match received {
-            Ok(Some(rx)) => rx,
-            Ok(None) => return Ok((SessionEnd::PeerClosed, Goodbye::Nothing)),
-            Err(HandshakeError::Timeout(_)) => {
-                let end = if orphan_first {
-                    SessionEnd::Orphaned
-                } else {
-                    SessionEnd::Idle
-                };
-                return Ok((end, Goodbye::Bye(messages::bye::ORPHANED)));
+        if !frame? {
+            let end = if orphan_first {
+                SessionEnd::Orphaned
+            } else {
+                SessionEnd::Idle
+            };
+            return Ok((end, Goodbye::Bye(messages::bye::ORPHANED)));
+        }
+        let rx: Received = match chan.take_frame() {
+            Taken::Frame(rx) => rx,
+            Taken::Eof => return Ok((SessionEnd::PeerClosed, Goodbye::Nothing)),
+            Taken::Fault { code, what } => {
+                return Err(HandshakeError::Violation { code, what });
             }
-            Err(e) => return Err(e),
+            Taken::Pending => continue,
         };
         match rx.env.kind {
             Kind::Ping => {
@@ -2102,6 +2109,14 @@ where
                 });
             }
         }
+    }
+}
+
+/// Sleep until `deadline`; never without one.
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 

@@ -4956,10 +4956,12 @@ async fn a_kill_ends_the_session_while_a_write_to_the_peer_is_stuck() {
 }
 
 /// The host's end of a pipe whose writes can be frozen, as a peer that
-/// withholds Tor credit freezes them; reads go on.
+/// withholds Tor credit freezes them; reads go on. `writes` counts every
+/// write attempt, frozen or not.
 struct FrozenWrites {
     inner: DuplexStream,
     frozen: Arc<std::sync::atomic::AtomicBool>,
+    writes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl AsyncRead for FrozenWrites {
@@ -4978,6 +4980,7 @@ impl AsyncWrite for FrozenWrites {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
         if self.frozen.load(Ordering::SeqCst) {
             return std::task::Poll::Pending;
         }
@@ -5035,6 +5038,7 @@ async fn a_violation_ends_the_session_before_its_error_is_written() {
         let stream = FrozenWrites {
             inner: a,
             frozen: frozen.clone(),
+            writes: Arc::default(),
         };
         let (cfg, deps) = (host.cfg.clone(), host.deps.clone());
         let task = tokio::spawn(async move { serve_host(stream, &cfg, &deps).await });
@@ -5077,6 +5081,139 @@ async fn a_violation_ends_the_session_before_its_error_is_written() {
             _ => None,
         });
         assert_eq!(ended.as_deref(), Some(codes::name(code)));
+        drop(client);
+    }
+}
+
+/// Records how many write attempts its stream had seen when the session
+/// ended, so a test can tell the end came before any write.
+struct EndBeforeWrites {
+    live: Arc<LiveSessions>,
+    writes: Arc<std::sync::atomic::AtomicUsize>,
+    at_end: Mutex<Option<usize>>,
+}
+
+impl SessionSink for EndBeforeWrites {
+    fn on_start(&self, session: &LiveSession<'_>) {
+        self.live.on_start(session);
+    }
+
+    fn on_end(&self, session_id: &str, end: Option<&SessionEnd>) {
+        *self.at_end.lock().unwrap() = Some(self.writes.load(Ordering::SeqCst));
+        self.live.on_end(session_id, end);
+    }
+}
+
+/// Design `direct` §12.1 kill liveness, host side: inside a live session an
+/// envelope fault, or a malformed `CANDIDATES`, from a peer that never reads
+/// ends the session before any write is awaited. `on_end` and
+/// `SessionEnded` come within 10 ms of virtual time with no write attempted
+/// since the fault, and the `ERROR` goodbye then times out at `GOODBYE`
+/// (1 s), with no kill needed. Envelope faults used to be answered in place,
+/// inside the read the kill raced, so a peer that withheld credit kept the
+/// session live, and capture running, until a kill.
+#[tokio::test(start_paused = true)]
+async fn a_fault_from_a_peer_that_never_reads_ends_the_session_before_any_write() {
+    // (case, the frame bytes after the length prefix or the prefix alone, code)
+    let cases: [(&str, u16); 6] = [
+        ("too large", codes::E_TOO_LARGE),
+        ("not an envelope", codes::E_BAD_LEN),
+        ("unknown kind", codes::E_UNKNOWN_KIND),
+        ("msg_id", codes::E_BAD_MSG_ID),
+        ("version", codes::E_VERSION),
+        ("malformed CANDIDATES", codes::E_BAD_LEN),
+    ];
+    for (case, code) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut host = host_side(tmp.path(), HOST_SEED);
+        host.cfg.orphan_timeout = None;
+        let live = Arc::new(LiveSessions::new());
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = Arc::new(EndBeforeWrites {
+            live: live.clone(),
+            writes: writes.clone(),
+            at_end: Mutex::new(None),
+        });
+        host.deps.sessions = sink.clone();
+        host.deps.activity = live.clone();
+        let audit = Arc::new(RecordingAudit::default());
+        host.deps.audit = audit.clone();
+        host.trusted
+            .pin(DeviceIdentity::from_seed(&CLIENT_SEED).id(), "Paired")
+            .unwrap();
+        host.consent
+            .push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+
+        // A 64-byte window: what the host writes from here on stays unread.
+        let (a, b) = duplex(64);
+        let frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream = FrozenWrites {
+            inner: a,
+            frozen: frozen.clone(),
+            writes: writes.clone(),
+        };
+        let (cfg, deps) = (host.cfg.clone(), host.deps.clone());
+        let task = tokio::spawn(async move { serve_host(stream, &cfg, &deps).await });
+        let mut raw = RawClient::new(b, &host.identity, CLIENT_SEED);
+        raw.hello_ack().await;
+        assert_eq!(raw.request_session().await.env.kind, Kind::SessionAccept);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(live.count(), 1, "{case}");
+
+        // The peer stops granting credit, then misbehaves.
+        frozen.store(true, Ordering::SeqCst);
+        let before = writes.load(Ordering::SeqCst);
+        let msg_id = raw.chan.next_tx_id();
+        let mut client = raw.chan.into_stream();
+        let ping = encode_body(&Ping { nonce: 1 });
+        let payload = match case {
+            "too large" => None,
+            "not an envelope" => Some(vec![0xff, 0xff]),
+            "unknown kind" => {
+                // [v, msg_id, kind 99, body, sig]: one byte per small item.
+                let id = u8::try_from(msg_id).ok().filter(|id| *id < 24).unwrap();
+                Some(vec![0x85, 1, id, 0x18, 0x63, 0x40, 0xf6])
+            }
+            "msg_id" => Some(Envelope::new(1, msg_id + 1, Kind::Ping, ping).encode()),
+            "version" => Some(Envelope::new(2, msg_id, Kind::Ping, ping).encode()),
+            _ => Some(Envelope::new(1, msg_id, Kind::Candidates, vec![0xff]).encode()),
+        };
+        let started = tokio::time::Instant::now();
+        match payload {
+            Some(payload) => write_frame(&mut client, &payload).await.unwrap(),
+            None => {
+                let len = u32::try_from(MAX_FRAME_LEN + 1).unwrap();
+                client.write_all(&len.to_be_bytes()).await.unwrap();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(live.count(), 0, "{case}: the session ends at the fault");
+        assert_eq!(
+            *sink.at_end.lock().unwrap(),
+            Some(before),
+            "{case}: on_end ran before any write was tried"
+        );
+        let ended = audit.0.lock().unwrap().iter().find_map(|e| match e {
+            AuditEvent::SessionEnded { detail, .. } => Some(detail.clone()),
+            _ => None,
+        });
+        assert_eq!(ended.as_deref(), Some(codes::name(code)), "{case}");
+
+        // No kill: the goodbye alone ends the task, at `GOODBYE`.
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the goodbye is bounded")
+            .unwrap();
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_secs(1) && took < Duration::from_millis(1010),
+            "{case}: the ERROR goodbye times out at GOODBYE, took {took:?}"
+        );
+        assert!(
+            writes.load(Ordering::SeqCst) > before,
+            "{case}: the goodbye was tried"
+        );
+        assert_eq!(outcome.unwrap_err().violation_code(), Some(code), "{case}");
         drop(client);
     }
 }

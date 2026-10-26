@@ -9,8 +9,9 @@
 //!   [`client::ClientPairingUi`], `SESSION_REQUEST`, verify `SESSION_ACCEPT`.
 //! * [`Channel`] — one framed stream with per-direction `msg_id`s, the
 //!   negotiated version, the transcript, the strict-alternation window and
-//!   the `ERROR` / close discipline. Every network wait is bounded by a
-//!   [`timeouts`] constant.
+//!   the `ERROR` / close discipline. Its reads are cancel safe and its frame
+//!   handling never writes ([`Channel::frame_ready`], [`Channel::take_frame`]).
+//!   Every network wait is bounded by a [`timeouts`] constant.
 //! * [`vectors`] and [`harness`] — the fixed inputs of the golden vectors and
 //!   the F1 harness that feeds either FSM arbitrary frames (the fuzz target
 //!   and its committed seeds are built on them).
@@ -21,12 +22,13 @@
 pub mod client;
 pub mod harness;
 pub mod host;
+mod rx;
 pub mod vectors;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tornect_core::DeviceId;
 use tornect_core::session_log::{
     AggregatedReject, RejectAggregator, SessionEvent, SessionLog, SessionMode, SessionRecord,
@@ -36,10 +38,11 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 pub use crate::consent::SessionToken;
 use crate::envelope::{Envelope, EnvelopeError, Kind, codes};
-use crate::framing::{FrameError, HEADER_LEN, MAX_FRAME_LEN, read_frame_max, write_frame};
+use crate::framing::{FrameError, HEADER_LEN, MAX_FRAME_LEN, write_frame};
 use crate::messages::{self, Body, BodyError, decode_body, encode_body};
 use crate::pairing::{BoxFuture, lock};
-use crate::transcript::{HostSigner, Transcript, sign_envelope, wire_bytes};
+use crate::transcript::{HostSigner, Transcript, sign_envelope};
+use rx::{Filled, RxBuf, RxFault};
 
 /// Every timer of §B.8.4.5, plus the ones the plan leaves to M1 (decision M1-13).
 pub mod timeouts {
@@ -717,13 +720,53 @@ impl Drop for Received {
     }
 }
 
+/// What [`Channel::take_frame`] found.
+#[derive(Debug)]
+pub enum Taken {
+    /// A whole frame that passed the envelope-level checks.
+    Frame(Received),
+    /// The peer closed the stream at a frame boundary.
+    Eof,
+    /// The frame failed an envelope-level check: `E_TOO_LARGE`, `E_BAD_LEN`,
+    /// `E_UNKNOWN_KIND`, `E_BAD_MSG_ID` or `E_VERSION`. Nothing was written:
+    /// the caller ends the exchange and answers `ERROR{code}` itself, as its
+    /// goodbye. The channel reports the same fault from then on and reads no
+    /// further.
+    Fault {
+        /// The `ERROR` code to answer with.
+        code: u16,
+        /// Which check failed (fixed text, never peer-controlled).
+        what: &'static str,
+    },
+    /// No whole frame yet: [`Channel::frame_ready`] has not resolved since the
+    /// last take.
+    Pending,
+}
+
 /// One direction-aware framed stream: `msg_id`s, version, transcript,
 /// strict-alternation phase and the close discipline.
+///
+/// **Reads are cancel safe; frame handling never writes** (design `direct`
+/// §4 and §8.2). [`Channel::frame_ready`] only reads, keeps every byte it read
+/// in the channel, and may be dropped at any point, so it can be raced in a
+/// `select!` against a kill switch, a stop future, timers and channel
+/// receives. [`Channel::take_frame`] then hands out the buffered frame without
+/// awaiting and without writing: an envelope fault comes back as a value.
+/// After the accept, frame handling uses only these two. A write there runs
+/// either raced against the kill or stop future alone, or as the bounded
+/// goodbye after the end of the session is recorded (`ERROR` included), so a
+/// peer that stops reading can never hold the end of a session back.
+/// [`Channel::recv`] puts the two together for the handshake phases, which
+/// answer a fault in place.
+///
+/// A write cut short (its future dropped mid-frame, or failed) leaves the
+/// stream with a partial frame in it, so nothing more is written after one.
 #[derive(Debug)]
 pub struct Channel<S> {
     stream: S,
-    /// What the peer sent while [`Channel::departure`] watched; read first.
-    early: Early,
+    /// The frame being received: what a dropped read already took from the
+    /// stream, and what [`Channel::departure`] read while it watched.
+    rx: RxBuf,
     tx_next: u64,
     rx_next: u64,
     version: u8,
@@ -731,6 +774,8 @@ pub struct Channel<S> {
     th: Transcript,
     in_window: bool,
     closing: bool,
+    /// A write started and did not finish.
+    torn: bool,
     frame_cap: usize,
 }
 
@@ -742,7 +787,7 @@ where
     pub fn new(stream: S, host_onion_pk: &[u8; 32]) -> Self {
         Self {
             stream,
-            early: Early::default(),
+            rx: RxBuf::default(),
             tx_next: 1,
             rx_next: 1,
             version: tornect_core::PROTOCOL_VERSION,
@@ -750,6 +795,7 @@ where
             th: Transcript::new(host_onion_pk),
             in_window: true,
             closing: false,
+            torn: false,
             frame_cap: HANDSHAKE_FRAME_CAP,
         }
     }
@@ -784,12 +830,16 @@ where
         self.closing
     }
 
-    /// Take the stream back (after the handshake, for the session layer). Bytes
-    /// [`Channel::departure`] read and no read took since go with the channel;
-    /// only the host's handshake watches, and it reads again before it hands
+    /// Take the stream back (after the handshake, for the session layer).
+    /// Bytes buffered for a frame not yet taken go with the channel and are
+    /// wiped: what a dropped [`Channel::frame_ready`] read of a frame still
+    /// incomplete, or what [`Channel::departure`] read while it watched. Only
+    /// the host's handshake watches, and it reads again before it hands
     /// anything on.
     pub fn into_stream(self) -> S {
-        self.stream
+        let Self { stream, rx, .. } = self;
+        drop(rx);
+        stream
     }
 
     /// Next `msg_id` this side will send.
@@ -802,6 +852,12 @@ where
     #[must_use]
     pub fn next_rx_id(&self) -> u64 {
         self.rx_next
+    }
+
+    /// The payload cap in force: [`HANDSHAKE_FRAME_CAP`] inside the window,
+    /// the §B.3 limit after it.
+    fn cap(&self) -> usize {
+        self.frame_cap.min(MAX_FRAME_LEN)
     }
 
     /// Build the envelope for `body` with the next `msg_id`, sign it if a
@@ -826,12 +882,17 @@ where
         if self.closing {
             return Err(HandshakeError::Aborted("channel is closing"));
         }
+        if self.torn {
+            return Err(HandshakeError::Aborted("an earlier frame was cut short"));
+        }
         let mut env = Envelope::new(self.version, self.tx_next, kind, body);
         if let Some(signer) = signer {
             sign_envelope(signer, &self.th.current(), &mut env);
         }
         let payload = Zeroizing::new(env.encode());
+        self.torn = true;
         write_frame(&mut self.stream, &payload).await?;
+        self.torn = false;
         self.tx_next = self.tx_next.saturating_add(1);
         self.note_handshake_frame(kind, &payload);
         Ok(payload)
@@ -860,44 +921,63 @@ where
         }
     }
 
-    /// Read one frame within `timeout` and check it at the envelope level:
-    /// size (`E_TOO_LARGE`), shape (`E_BAD_LEN` / `E_UNKNOWN_KIND`), `msg_id`
-    /// (`E_BAD_MSG_ID`) and version (`E_VERSION`). A violation is answered
-    /// with `ERROR` and the stream closed; `Ok(None)` is a clean EOF.
-    pub async fn recv(
-        &mut self,
-        timeout: Duration,
-        what: &'static str,
-    ) -> Result<Option<Received>, HandshakeError> {
+    /// Resolves once [`Channel::take_frame`] has something to hand out: a whole
+    /// frame, the end of the stream, or a fault (a length over the cap, or a
+    /// fault already reported). `Err` when the stream ended inside a frame
+    /// ([`FrameError::Truncated`]) or broke, and `Aborted` once this side is
+    /// closing.
+    ///
+    /// Cancel safe and read-only: it reads only what the current frame still
+    /// needs, keeps every byte it read in the channel before its next await,
+    /// and writes nothing. Dropped in a `select!`, it loses nothing; the next
+    /// call carries on.
+    pub async fn frame_ready(&mut self) -> Result<(), HandshakeError> {
         if self.closing {
             return Err(HandshakeError::Aborted("channel is closing"));
         }
-        let mut reader = EarlyFirst {
-            early: &mut self.early,
-            stream: &mut self.stream,
+        if matches!(self.rx.fault(), Some(RxFault::Envelope { .. })) {
+            return Ok(());
+        }
+        let cap = self.cap();
+        match self.rx.fill(&mut self.stream, cap).await {
+            Ok(Filled::Frame | Filled::Eof) | Err(FrameError::TooLarge { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Hand out the buffered frame, checked at the envelope level: size
+    /// (`E_TOO_LARGE`), shape (`E_BAD_LEN` / `E_UNKNOWN_KIND`), `msg_id`
+    /// (`E_BAD_MSG_ID`) and version (`E_VERSION`). Never awaits and never
+    /// writes: a fault is [`Taken::Fault`], which the caller answers.
+    /// [`Taken::Pending`] until [`Channel::frame_ready`] resolved.
+    pub fn take_frame(&mut self) -> Taken {
+        match self.rx.fault() {
+            Some(RxFault::Eof) => return Taken::Eof,
+            Some(RxFault::Envelope { code, what }) => return Taken::Fault { code, what },
+            None => {}
+        }
+        let Some(len) = self.rx.announced() else {
+            return Taken::Pending;
         };
-        let read = tokio::time::timeout(timeout, read_frame_max(&mut reader, self.frame_cap)).await;
-        let payload = match read {
-            Err(_) => return Err(HandshakeError::Timeout(what)),
-            Ok(Ok(Some(p))) => Zeroizing::new(p),
-            Ok(Ok(None)) => return Ok(None),
-            Ok(Err(FrameError::TooLarge { .. })) => {
-                return Err(self.fail(codes::E_TOO_LARGE, "frame").await);
-            }
-            Ok(Err(e)) => return Err(e.into()),
-        };
-        let env = match Envelope::decode(&payload) {
+        if len > self.cap() {
+            return self.fault(codes::E_TOO_LARGE, "frame");
+        }
+        if !self.rx.complete() {
+            return Taken::Pending;
+        }
+        let mut wire = self.rx.take_wire();
+        let env = match Envelope::decode(&wire[HEADER_LEN..]) {
             Ok(env) => env,
             Err(e) => {
                 let what = match e {
                     EnvelopeError::UnknownKind(_) => "kind",
                     _ => "envelope",
                 };
-                return Err(self.fail(e.code(), what).await);
+                return self.fault(e.code(), what);
             }
         };
         if env.msg_id != self.rx_next {
-            return Err(self.fail(codes::E_BAD_MSG_ID, "msg_id").await);
+            return self.fault(codes::E_BAD_MSG_ID, "msg_id");
         }
         self.rx_next = self.rx_next.saturating_add(1);
         // Before negotiation a `HELLO` must carry v = 1 and a `HELLO_ACK` may
@@ -909,12 +989,53 @@ where
             _ => Some(self.version),
         };
         if expected_v.is_some_and(|v| env.v != v) {
-            return Err(self.fail(codes::E_VERSION, "version").await);
+            return self.fault(codes::E_VERSION, "version");
         }
-        Ok(Some(Received {
-            wire: wire_bytes(&payload),
+        Taken::Frame(Received {
+            // Moved, not copied: `Received` wipes it on drop.
+            wire: std::mem::take(&mut *wire),
             env,
-        }))
+        })
+    }
+
+    /// Record an envelope fault, sticky, and report it.
+    fn fault(&mut self, code: u16, what: &'static str) -> Taken {
+        self.rx.set_fault(RxFault::Envelope { code, what });
+        Taken::Fault { code, what }
+    }
+
+    /// Read one frame within `timeout` and check it at the envelope level
+    /// ([`Channel::take_frame`]). A violation is answered with `ERROR` and the
+    /// stream closed; `Ok(None)` is a clean EOF. For the handshake phases:
+    /// after the accept, frames are read with [`Channel::frame_ready`] and
+    /// [`Channel::take_frame`] (see [`Channel`]). A timeout keeps a partial
+    /// frame for the next read.
+    pub async fn recv(
+        &mut self,
+        timeout: Duration,
+        what: &'static str,
+    ) -> Result<Option<Received>, HandshakeError> {
+        if self.closing {
+            return Err(HandshakeError::Aborted("channel is closing"));
+        }
+        // `checked_add`: a timeout near `Duration::MAX` means "never".
+        let deadline = tokio::time::Instant::now().checked_add(timeout);
+        loop {
+            let ready = match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, self.frame_ready()).await,
+                None => Ok(self.frame_ready().await),
+            };
+            match ready {
+                Err(_) => return Err(HandshakeError::Timeout(what)),
+                Ok(ready) => ready?,
+            }
+            match self.take_frame() {
+                Taken::Frame(rx) => return Ok(Some(rx)),
+                Taken::Eof => return Ok(None),
+                Taken::Fault { code, what } => return Err(self.fail(code, what).await),
+                Taken::Pending => {}
+            }
+        }
     }
 
     /// [`Channel::recv`] restricted to `allowed` kinds: `ERROR` / `BYE`
@@ -977,16 +1098,23 @@ where
 
     /// Send `ERROR{code}` (fixed detail per code, so a pinned and an unpinned
     /// peer see byte-identical answers), close, and return the matching error.
+    /// After a write that was cut short, only the close.
     pub async fn fail(&mut self, code: u16, what: &'static str) -> HandshakeError {
         if !self.closing {
-            let body = messages::Error {
-                code,
-                detail: Some(codes::name(code).to_owned()),
-            };
-            let env = Envelope::new(self.version, self.tx_next, Kind::Error, encode_body(&body));
-            self.tx_next = self.tx_next.saturating_add(1);
-            // Best effort: the peer may already be gone.
-            let _ = write_frame(&mut self.stream, &env.encode()).await;
+            if !self.torn {
+                let body = messages::Error {
+                    code,
+                    detail: Some(codes::name(code).to_owned()),
+                };
+                let env =
+                    Envelope::new(self.version, self.tx_next, Kind::Error, encode_body(&body));
+                self.tx_next = self.tx_next.saturating_add(1);
+                self.torn = true;
+                // Best effort: the peer may already be gone.
+                if write_frame(&mut self.stream, &env.encode()).await.is_ok() {
+                    self.torn = false;
+                }
+            }
             self.closing = true;
             let _ = self.stream.shutdown().await;
         }
@@ -1016,22 +1144,18 @@ where
         if self.closing {
             return HandshakeError::Aborted("channel is closing");
         }
-        let cap = HEADER_LEN + self.frame_cap;
-        // Reserved while empty, so growing it never leaves a copy behind.
-        if self.early.0.is_empty() {
-            self.early.0.reserve_exact(cap);
-        }
-        let mut chunk = Zeroizing::new([0u8; 1024]);
-        while self.early.0.len() < cap {
-            let room = (cap - self.early.0.len()).min(chunk.len());
-            match self.stream.read(&mut chunk[..room]).await {
-                Ok(0) => return HandshakeError::Closed,
-                // Kept before the next await: a drop of this future cannot lose them.
-                Ok(n) => self.early.0.extend_from_slice(&chunk[..n]),
-                Err(e) => return HandshakeError::Io(e),
+        if self.rx.fault().is_none() {
+            let cap = self.cap();
+            match self.rx.fill(&mut self.stream, cap).await {
+                Ok(Filled::Eof) | Err(FrameError::Truncated) => return HandshakeError::Closed,
+                Err(FrameError::Io(e)) => return HandshakeError::Io(e),
+                // A whole frame, or a length over the cap, came early: the
+                // next read judges it.
+                Ok(Filled::Frame) | Err(FrameError::TooLarge { .. }) => {}
             }
+        } else if self.rx.fault() == Some(RxFault::Eof) {
+            return HandshakeError::Closed;
         }
-        // A whole frame came early: the next read judges it.
         std::future::pending().await
     }
 
@@ -1054,47 +1178,6 @@ where
     pub async fn close(&mut self) {
         self.closing = true;
         let _ = self.stream.shutdown().await;
-    }
-}
-
-/// Bytes the peer sent while [`Channel::departure`] watched: wiped once read
-/// and on drop, never printed (a client frame of the handshake may carry KE3).
-#[derive(Default)]
-struct Early(Zeroizing<Vec<u8>>);
-
-impl core::fmt::Debug for Early {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "<{} early bytes>", self.0.len())
-    }
-}
-
-/// The channel's stream with the bytes read early in front of it.
-struct EarlyFirst<'a, S> {
-    early: &'a mut Early,
-    stream: &'a mut S,
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for EarlyFirst<'_, S> {
-    // Qualified paths: importing these here would reach `fsm::tests` through
-    // its glob import.
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        let early = &mut this.early.0;
-        if early.is_empty() {
-            return std::pin::Pin::new(&mut *this.stream).poll_read(cx, buf);
-        }
-        let n = early.len().min(buf.remaining());
-        buf.put_slice(&early[..n]);
-        early.drain(..n);
-        if early.is_empty() {
-            // Wipes the spare capacity the drained bytes were left in.
-            early.zeroize();
-        }
-        std::task::Poll::Ready(Ok(()))
     }
 }
 
@@ -1165,6 +1248,8 @@ where
     }
 }
 
+#[cfg(test)]
+mod channel_tests;
 #[cfg(test)]
 mod golden;
 #[cfg(test)]

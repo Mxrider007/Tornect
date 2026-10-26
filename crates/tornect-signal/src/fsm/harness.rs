@@ -25,19 +25,22 @@
 //! the FSM task is re-raised by [`run`], so it reaches the fuzzer (and the
 //! tests) instead of vanishing into a `JoinError`.
 
+use std::future::Future as _;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::{AsyncWriteExt as _, DuplexStream, duplex};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, DuplexStream, ReadBuf, duplex};
 use tornect_core::trusted::{KnownHosts, TrustedDevices};
 
-use super::HandshakeError;
 use super::client::{ClientDeps, ClientOutcome, Intent, ScriptedClientUi, connect};
 use super::host::{HostDeps, HostOutcome, serve_host};
 use super::vectors::{
     self, client_config, client_identity, client_random, host_config, host_device_pk,
     host_identity, host_random,
 };
+use super::{Channel, HandshakeError, Taken};
 use crate::envelope::Envelope;
 use crate::framing::{MAX_FRAME_LEN, read_frame_max, write_frame};
 use crate::pairing::{
@@ -307,6 +310,156 @@ async fn feed(
     }
     let _ = drain(stream, peer).await;
     let _ = stream.shutdown().await;
+}
+
+/// One result of [`Channel::take_frame`] in [`channel_takes`], comparable
+/// across runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Took {
+    /// A frame: its `msg_id` and its bytes as they were on the wire.
+    Frame {
+        /// The envelope's `msg_id`.
+        msg_id: u64,
+        /// Length prefix and payload.
+        wire: Vec<u8>,
+    },
+    /// The stream ended at a frame boundary.
+    Eof,
+    /// An envelope-level fault, with its `ERROR` code.
+    Fault(u16),
+    /// The stream ended inside a frame.
+    Truncated,
+}
+
+/// Feed `stream` to a fresh [`Channel`] (in the handshake window, or with the
+/// window closed as after the accept) and collect what
+/// [`Channel::take_frame`] hands out, until the end of the stream or a fault.
+///
+/// The reader gives out at most `cuts[i]` bytes per read (cycled; 0 counts
+/// as 1) and between two reads is not ready once; at each such point the
+/// pending [`Channel::frame_ready`] is dropped, as a `select!` drops it when
+/// another branch wins. With `cuts` empty the stream comes in one read and is
+/// never cut. The futures are polled by hand, with no runtime.
+///
+/// The property the cancel proptest (`fsm::channel_tests`) and the `framing`
+/// fuzz target check: the result is the same for every `cuts`. It also
+/// panics if the channel wrote anything (`take_frame` never writes) or held
+/// more than one frame.
+#[must_use]
+pub fn channel_takes(stream: &[u8], cuts: &[u8], after_accept: bool) -> Vec<Took> {
+    let mut chan = Channel::new(
+        CutStream {
+            data: stream,
+            pos: 0,
+            cuts,
+            next_cut: 0,
+            stalled: false,
+            writes: 0,
+        },
+        &[0u8; 32],
+    );
+    if after_accept {
+        chan.frame_cap = MAX_FRAME_LEN;
+    }
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    let mut out = Vec::new();
+    loop {
+        let polled = {
+            let mut ready = std::pin::pin!(chan.frame_ready());
+            ready.as_mut().poll(&mut cx)
+        };
+        assert!(
+            chan.rx.buffered() <= crate::framing::HEADER_LEN + MAX_FRAME_LEN,
+            "the channel held more than one frame"
+        );
+        match polled {
+            // Dropped while pending: the cancellation under test.
+            Poll::Pending => continue,
+            Poll::Ready(Err(_)) => {
+                out.push(Took::Truncated);
+                break;
+            }
+            Poll::Ready(Ok(())) => {}
+        }
+        match chan.take_frame() {
+            Taken::Frame(rx) => out.push(Took::Frame {
+                msg_id: rx.env.msg_id,
+                wire: rx.wire.clone(),
+            }),
+            Taken::Eof => {
+                out.push(Took::Eof);
+                break;
+            }
+            Taken::Fault { code, .. } => {
+                out.push(Took::Fault(code));
+                break;
+            }
+            Taken::Pending => panic!("frame_ready resolved with nothing to take"),
+        }
+    }
+    assert_eq!(chan.stream.writes, 0, "frame handling wrote to the stream");
+    out
+}
+
+/// The reader of [`channel_takes`]: hands `data` out in cuts, stalls once
+/// between two of them, and counts the writes it is asked for.
+struct CutStream<'a> {
+    data: &'a [u8],
+    pos: usize,
+    cuts: &'a [u8],
+    next_cut: usize,
+    stalled: bool,
+    writes: usize,
+}
+
+impl AsyncRead for CutStream<'_> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let rest = &this.data[this.pos..];
+        if rest.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+        let mut n = rest.len().min(buf.remaining());
+        if !this.cuts.is_empty() {
+            if !this.stalled {
+                // Polled by hand: no waker to register.
+                this.stalled = true;
+                return Poll::Pending;
+            }
+            this.stalled = false;
+            let cut = this.cuts[this.next_cut % this.cuts.len()].max(1);
+            this.next_cut = this.next_cut.wrapping_add(1);
+            n = n.min(usize::from(cut));
+        }
+        buf.put_slice(&rest[..n]);
+        this.pos += n;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for CutStream<'_> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        this.writes += 1;
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.get_mut().writes += 1;
+        Poll::Ready(Ok(()))
+    }
 }
 
 #[cfg(test)]

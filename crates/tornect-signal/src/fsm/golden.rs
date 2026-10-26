@@ -33,7 +33,7 @@ use crate::pairing::{
     PairDecision, PairScript, Sas, ScriptedConsent, SessionDecision, SessionScript,
     TrustedDeviceStore,
 };
-use crate::transcript::{HostSigner, digest};
+use crate::transcript::{HostSigner, digest, wire_bytes};
 
 /// Vector 1: `(label, hex)` pairs in the order the note lists them.
 const EXPECTED_PAIRED: &[(&str, &str)] = &[
