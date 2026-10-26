@@ -2,8 +2,8 @@
 
 The design's research items before its steps: **R1 (GNOME clipboard portal, before step 8)**, **R2 (Windows
 APIs, before step 7)**, R3 (logind `LockedHint`, before step 10) and R4 (Arti flow control on onion-service
-circuits, before step 29). R4 is not here yet; it lands with its step. Decision: M1-76 (the design calls it
-M1-73; that number and the two after it were taken by earlier features).
+circuits, before step 29). Decision: M1-76 (the design calls it M1-73; that number and the two after it were
+taken by earlier features).
 
 ## R1. The GNOME clipboard portal (for design steps 8 and 9)
 
@@ -405,3 +405,74 @@ Details that matter:
   the desktop and from the systemd user unit.
 - GNOME on Xorg (GNOME ≤ 49) and KDE Plasma (X11 and Wayland): the same readings.
 - xscreensaver on X11: the hint stays false while locked (the residual).
+
+## R4. Arti's flow control on onion-service circuits (for design step 29)
+
+Question (design §3.4, §9 R4): do the rendezvous circuits of Arti 0.45 onion services run congestion control
+(Vegas, prop 324) or the fixed SENDME windows, and what does that say about the services stream's 256 KiB bulk
+window? Read from the sources this build compiles (`Cargo.lock`: arti-client, tor-proto, tor-circmgr,
+tor-hsservice, tor-hsclient, tor-cell all 0.45.0) and the features `cargo tree -p tornect-signal -e features`
+lists (2026-10-26). Not measured on the network (no Tor egress here); the live row of step 29 measures it.
+
+### R4.1 What the build enables
+
+- The workspace turns on arti-client `flowctl-cc` (`Cargo.toml`), which reaches `tor-proto/flowctl-cc` and
+  `tor-circmgr/flowctl-cc`: Vegas can run on the circuits whose hops support `FlowCtrl=2`.
+- It does **not** turn on `hsc-negotiate-extensions` or `hss-negotiate-extensions` (arti-client 0.45.0
+  `Cargo.toml`: both only under `experimental`, each marked `__is_experimental`), so `tor-hsclient` and
+  `tor-hsservice` build without `negotiate-extensions` (`cargo tree` lists neither crate with it).
+
+### R4.2 What that gives an onion-service circuit
+
+- The end-to-end ("virtual") hop between the viewer and the host is added by `ClientCirc::extend_virtual`
+  (`tor-proto-0.45.0/src/client/circuit.rs` 692–720) with `HopNegotiationType::HsV3` and the capabilities
+  both sides agreed on. Its settings come from `HopSettings::from_params_and_caps` (`src/circuit/circhop.rs`
+  129–146): the parameters ask for Vegas (`onion_circparams_from_netparams`, `tor-circmgr-0.45.0/src/build.rs`
+  646–666, when the consensus' `cc_alg` is 2), but **without `FLOWCTRL_CC` in the agreed capabilities it calls
+  `use_fallback_alg()`**, which is `Algorithm::FixedWindow` (`src/congestion/params.rs` 286–288).
+- Without `negotiate-extensions` those capabilities are empty on both sides: the client's
+  `PeerCaps::shared_protos()` returns `Protocols::new()` and its `cc_sendme_inc()` `None`, and it adds no
+  `CcRequest` to `INTRODUCE1` (`tor-hsclient-0.45.0/src/caps.rs` 112–135, the `not(negotiate-extensions)`
+  impl); the service's `negotiated_capabilities()` returns `Protocols::new()` (`tor-hsservice-0.45.0/src/caps.rs`
+  140–148) and is what its `extend_virtual` receives (`src/rend_handshake.rs` 274, 363–369).
+- tor-proto says the same of itself: with fixed windows a hop uses stream SENDMEs, and its comment on the Vegas
+  branch reads "we don't support connecting to onion services while using congestion control"
+  (`src/circuit/circhop.rs` 766–795, `SEND_WINDOW_INIT` at 779).
+
+**Answer: FixedWindow.** On a session's rendezvous circuit, in both directions:
+
+| Window | Size | Data it holds | Source |
+|---|---|---|---|
+| Circuit (all streams of the circuit) | 1000 cells, a SENDME per 100 | ≈ 486 KiB | `src/congestion/sendme.rs` 58–72; consensus `circwindow` 100–1000, default 1000 |
+| Each stream (signaling, media, services) | 500 cells, a SENDME per 50 | ≈ 243 KiB | `sendme.rs` 74–88; `SEND_WINDOW_INIT` |
+
+A cell carries at most 498 bytes of stream data (`RELAY_DATA`, relay cell format V0: `CELL_DATA_LEN` 509 − 11,
+`tor-cell-0.45.0/src/relaycell/msg.rs` 326). The stream's ready cells are sent round-robin with the circuit's
+other streams, one relay message at a time (design §0, `streammap.rs` ~508–538).
+
+### R4.3 Consequences for the services stream (decision M1-76)
+
+- **One Tor stream window bounds a transfer, not the bulk window.** 256 KiB (262 144 bytes) is about 527 cells
+  of data, a little over the stream's 500 cells (249 000 bytes): Tor's own stream window stops the services
+  writer first, and the services window only bounds what the host or viewer has queued in Arti's buffers
+  beyond it. A larger `bulk_window` gains nothing on Tor; a smaller one would leave the stream window unused.
+  **The 256 KiB default stays** for the Tor path; the LAN/QUIC path still sets its own (design §3.4).
+- **Media keeps its own window.** Each stream's 500 cells are its own, and the circuit's 1000 hold two full
+  streams: a services transfer at its window leaves the media stream its whole stream window (and signaling's
+  traffic is a few cells). What a transfer takes from video is the relays' bandwidth, shared round-robin while
+  both have data, and the queueing delay it adds to the circuit; that is what the live check measures (video
+  keeps at least 50 % of its idle frame rate, design §10).
+- **Throughput bound.** A transfer moves at most one stream window per round trip: ≈ 243 KiB per RTT, about
+  200 KB/s at a 1.2 s RTT, as the design's §12 estimated from the window.
+- **When this changes.** If a later Arti makes `negotiate-extensions` non-experimental, or the workspace turns
+  on `hsc-negotiate-extensions` / `hss-negotiate-extensions` (both experimental: not without a decision), onion
+  circuits whose relays and peer support `FlowCtrl=2` would run Vegas with XON/XOFF stream flow control: no
+  500-cell stream window, so the services bulk window would become the bound on what one transfer keeps in
+  flight. Re-read this note and re-run the live check then.
+
+### R4.4 Needs the network
+
+- The live row of step 29 (`docs/VERIFICATION.md`): the transfer rate of a 20 MiB upload and download, and the
+  `MEDIA` frame rate idle and during each, between the dev VM and a second machine over Tor. Expected from R4.2:
+  a transfer rate near one stream window per RTT (`MEDIA` lines print the RTT), and media's frame rate falling
+  by the share of relay bandwidth the transfer takes, not stalling.
