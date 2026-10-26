@@ -57,6 +57,54 @@ What logs addresses or keys (input to design DIRECT-6, decision M1-83, step A7):
 - Step A7's filter drops these targets before any layer formats them; nothing in A1 runs
   quinn, so nothing is logged yet.
 
+### Step A9 results (2026-10-26, design `direct` step A9; `crates/tornect-net/src/quic.rs`)
+
+- **The raw-public-key gate holds.** The pinned RPK handshake of §3.3 completes on
+  rustls 0.23.46 and quinn 0.11.12 with the device key signing through
+  `DeviceKeySigner` (no PKCS#8, ring never holds the private key): in memory under paused
+  time with either side dialling, and on real IPv4 loopback session sockets
+  (`quic::tests::the_pinned_handshake_runs_on_real_loopback_sockets`). The X.509 fallback
+  of §3.4 is not used, so rcgen stays out of the lock.
+- **How each pin failure looks to the dialler** (observed in
+  `a_dialler_without_the_pinned_key_is_refused_with_an_alert` and
+  `a_server_key_that_is_not_the_pin_fails_with_an_alert`):
+  - the dialler pinned another server key: its own verifier refuses, the dial fails with a
+    locally raised `TransportError` `crypto(0x31)` (access_denied, from
+    `CertificateError::ApplicationVerificationFailure`);
+  - the server pinned another client key: the client's handshake **completes** (gotcha 3
+    in §12), then a `ConnectionClosed` `crypto(0x31)` arrives whose reason phrase is
+    `invalid peer certificate: ApplicationVerificationFailure` (rustls's error text: the
+    kind only, no key); the server never yields the connection, so no stream byte is read;
+  - a client with no key at all, and a client with the pinned key that offers an ALPN
+    (`server/hs.rs:122–138`: in QUIC an offered ALPN the server cannot match is refused
+    with `no_application_protocol`), fail their dials with a crypto close.
+  All of these are `is_crypto_close`.
+- **No tickets.** With `send_tls13_tickets = 0` and `NoServerSessionStorage` a client that
+  keeps tickets and enables early data receives none (a counting `ClientSessionStore`), so
+  `Connecting::into_0rtt` fails on every dial. The control: the same store under a server
+  with `send_tls13_tickets = 2` and a `ServerSessionMemoryCache` records tickets.
+- **Debug forms the tests read** (they are not API; a version bump may change them):
+  `Resumption { store: NoClientSessionStorage, tls12_resumption: Disabled }`;
+  `TransportConfig { max_concurrent_bidi_streams: 1, max_concurrent_uni_streams: 0,
+  max_idle_timeout: Some(10000), stream_receive_window: 4194304, receive_window: 16777216,
+  send_window: 16777216, …, initial_rtt: 100ms, …, keep_alive_interval: Some(2s), …,
+  allow_spin: false, datagram_receive_buffer_size: None, … }`; `ServerConfig { …,
+  validation_token: ServerValidationTokenConfig { lifetime: 1209600s, sent: 0, .. },
+  migration: false, …, max_incoming: 4, incoming_buffer_size: 65536,
+  incoming_buffer_size_total: 262144, .. }`; `EndpointConfig { …, grease_quic_bit: false,
+  .. }`.
+- **API facts met on the way.** `rustls::DigitallySignedStruct::new` is `pub(crate)`; the
+  tests build one from wire bytes through the hidden
+  `rustls::internal::msgs::codec::Codec::read_bytes` (tests only; rustls is pinned
+  exactly). quinn does not re-export quinn-proto's `TransportError`; `From<TransportErrorCode>`
+  builds one. `quinn::Endpoint::accept` pops an `Incoming` only when it returns it, so
+  dropping it in a `select!` loses no attempt. An endpoint without a server configuration
+  answers an Initial for an unknown connection with a stateless reset
+  (`quinn-proto-0.11.19/src/endpoint.rs:445–448`), rate-limited and smaller than the
+  datagram that caused it: after `set_server_config(None)` a further Initial starts no
+  `Incoming`, and the real viewer's endpoint answers the host's replies to spoofed Initials
+  this way, which the tests show harms neither connection.
+
 ---
 
 ## 0. TL;DR for implementers
@@ -278,6 +326,26 @@ fn spki_of_cert(cert: &CertificateDer<'_>) -> Result<SubjectPublicKeyInfoDer<'st
 Server/client config then use `.with_single_cert(vec![cert_der], key)` /
 `.with_client_auth_cert(vec![cert_der], key)` (`rustls-0.23.43/src/server/builder.rs:65`,
 `src/client/builder.rs:146`).
+
+### 3.5 One device key, two kinds of signed message (design `direct` §9.4; step A9)
+
+The ed25519 device key signs two kinds of message, and no signature made in one context
+verifies as a signature of the other:
+
+- **Tornect envelopes**: `"tornect/v1/sig/" ‖ KIND_NAME ‖ 0x00 ‖ th_prev ‖ digest`
+  (`tornect-signal/src/transcript.rs:7`, `SIG_PREFIX` :27). That is the only Tornect
+  signing call site.
+- **TLS 1.3 `CertificateVerify`** (the direct link's QUIC, `DeviceKeySigner`):
+  `0x20 × 64 ‖ "TLS 1.3, server CertificateVerify" | "TLS 1.3, client CertificateVerify" ‖
+  0x00 ‖ transcript hash` (RFC 8446 §4.4.3).
+
+The first byte differs (`t` = 0x74 against 0x20), so neither message can be the other, and
+Ed25519 (PureEdDSA, RFC 8032) signs the message itself, not a hash an attacker could
+steer. `quic::tests::tls_signatures_cannot_be_taken_for_envelope_signatures` records what
+the device key signs through rustls in both roles: each message starts with 64 spaces and
+its role's context string, followed by one SHA-256 or SHA-384 transcript hash. **Any new
+signing context must keep a prefix distinct from both.** The same note belongs in the C1
+threat-model text.
 
 ---
 
