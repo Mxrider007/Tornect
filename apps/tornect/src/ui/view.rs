@@ -1551,7 +1551,9 @@ struct Sheet<'a> {
     /// How many screens the session could show (decision M1-75 (3)).
     screens: usize,
     /// What control also gives here, from the saved settings (the services
-    /// design §7.4): said once under the answers when one gives control.
+    /// design §7.4): said once under the answers when one gives control, and
+    /// under an "Ask before starting" sheet's when the session may be
+    /// control.
     services: Option<&'a str>,
 }
 
@@ -1953,6 +1955,7 @@ fn host_popup(
         PopupKind::Ask {
             label,
             administrator,
+            control,
         } => {
             // §B.8.6.3: the grant's level, never a choice of one (r7): Deny or
             // Allow only.
@@ -1994,6 +1997,12 @@ fn host_popup(
                     });
                 }
             });
+            // Where the session may be control, what control also gives here,
+            // as under the session sheet's answers: with no block window after
+            // it, this sheet is the only one at session time.
+            if let (true, Some(line)) = (*control, sheet.services) {
+                services_answer_line(ui, line);
+            }
             ui.label(
                 RichText::new(format!(
                     "Denied automatically in {left} s · only a mouse click can allow"
@@ -2313,11 +2322,16 @@ mod tests {
     }
 
     fn ask_popup(id: u64, now: Instant, administrator: bool) -> Popup {
+        ask_popup_for(id, now, administrator, true)
+    }
+
+    fn ask_popup_for(id: u64, now: Instant, administrator: bool, control: bool) -> Popup {
         Popup {
             id,
             kind: PopupKind::Ask {
                 label: "Laptop".to_owned(),
                 administrator,
+                control,
             },
             deadline: now + Duration::from_secs(60),
         }
@@ -3897,6 +3911,70 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::Ask { allow: true, .. })),
             "{actions:?}"
+        );
+    }
+
+    /// The services design §7.4, decision M1-76 (cw): an "Ask before starting" sheet
+    /// whose session may be control says once, under Deny and Allow, what control also
+    /// gives here, from the saved settings and this desktop, as the session sheet does
+    /// (with no block window after it, it is the only sheet at session time); one whose
+    /// session can only be view only, or with nothing control gives, says nothing.
+    #[test]
+    fn the_ask_sheet_says_what_control_also_gives() {
+        use tornect_core::config::Services;
+
+        const ALL: &str = "With control they can also see and copy any file you can open on \
+                           this computer, send files into Downloads › Tornect and copy text to \
+                           and from this computer's clipboard.";
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(2);
+        let ask = |administrator: bool, control: bool, services: Services| {
+            let mut model = with_popups(vec![ask_popup_for(5, t0, administrator, control)]);
+            model.settings.services = services;
+            let mut window = Harness::new(model, t0);
+            window.pass(later, Vec::new());
+            window
+        };
+        let said = |window: &Harness| {
+            window
+                .texts()
+                .into_iter()
+                .filter(|t| t.starts_with("With control"))
+                .collect::<Vec<_>>()
+        };
+        for administrator in [false, true] {
+            let window = ask(administrator, true, Services::default());
+            assert_eq!(said(&window), vec![ALL.to_owned()], "{administrator}");
+            let line = text_bounds(&window, "With control");
+            let allow = window.bounds("Allow");
+            assert!(line.1 >= allow.3, "under the buttons: {line:?} {allow:?}");
+            let window = ask(administrator, false, Services::default());
+            assert!(said(&window).is_empty(), "view only: {:?}", said(&window));
+        }
+        let off = Services {
+            clipboard: false,
+            receive_files: false,
+            browse_files: false,
+            ..Services::default()
+        };
+        assert!(said(&ask(false, true, off)).is_empty(), "nothing given");
+        // A Wayland desktop whose portal is not asked for its clipboard.
+        let mut model = with_popups(vec![ask_popup_for(5, t0, false, true)]);
+        model.setup = Some(Setup {
+            token_file: PathBuf::from("token"),
+            granted: true,
+            busy: false,
+            note: None,
+        });
+        let mut window = Harness::new(model, t0);
+        window.pass(later, Vec::new());
+        assert_eq!(
+            said(&window),
+            vec![
+                "With control they can also see and copy any file you can open on this \
+                 computer and send files into Downloads › Tornect."
+                    .to_owned()
+            ]
         );
     }
 

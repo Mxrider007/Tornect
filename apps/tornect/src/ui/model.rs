@@ -296,8 +296,8 @@ impl Model {
     /// saved, but no clipboard on a Wayland desktop this machine shares
     /// while its running portal request does not ask for one
     /// ([`Self::portal_clipboard`]) and no files received where this
-    /// computer has no Downloads folder. What the session sheet and the
-    /// block window say control also gives.
+    /// computer has no Downloads folder. What the session sheet, the "Ask
+    /// before starting" sheet and the block window say control also gives.
     #[must_use]
     pub fn services_offered(&self) -> tornect_session::services::ServicesPolicy {
         let services = &self.settings.services;
@@ -525,6 +525,11 @@ pub enum PopupKind {
         /// The grant holds the administrator level: the sheet says that the
         /// device wants to connect as administrator.
         administrator: bool,
+        /// The session may be control (the grant's mode lowered by the
+        /// request): the sheet says what control also gives here, as the
+        /// session sheet does (the services design §7.4; decision M1-76
+        /// (cw)).
+        control: bool,
     },
 }
 

@@ -264,6 +264,7 @@ mod tests {
             PopupKind::Ask {
                 label: "Laptop-of-Ana".to_owned(),
                 administrator: true,
+                control: true,
             },
         ];
         let mut said = Vec::new();

@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
 use tornect_core::TornectId;
 use tornect_core::levels::{Availability, Elevation};
+use tornect_core::session_log::SessionMode;
 use tornect_signal::consent::{GrantId, LocalAllow};
 use tornect_signal::fsm::client::ClientPairingUi;
 use tornect_signal::fsm::host::KillSwitch;
@@ -599,15 +600,29 @@ impl Consent for GuiConsent {
 }
 
 /// "Ask before starting" (§B.8.6.3, `AwaitLocalAllow`): a sheet with Deny and
-/// Allow only, naming administrator access for an admin grant (r7); taken
-/// down, as a refusal, when `timeout` ends or it is withdrawn (a kill, or a
-/// session going live).
+/// Allow only, naming administrator access for an admin grant (r7) and, where
+/// the session may be control, what control also gives (the services design
+/// §7.4); taken down, as a refusal, when `timeout` ends or it is withdrawn (a
+/// kill, or a session going live).
 impl LocalAllow for GuiConsent {
+    /// Without the session's mode the sheet names no service (the state
+    /// machine always says the mode, through [`LocalAllow::ask_for`]).
     fn ask_at<'a>(
+        &'a self,
+        who: &'a GrantId,
+        label: &'a str,
+        level: Elevation,
+        timeout: Duration,
+    ) -> BoxFuture<'a, bool> {
+        self.ask_for(who, label, level, SessionMode::ViewOnly, timeout)
+    }
+
+    fn ask_for<'a>(
         &'a self,
         _: &'a GrantId,
         label: &'a str,
         level: Elevation,
+        mode: SessionMode,
         timeout: Duration,
     ) -> BoxFuture<'a, bool> {
         let withdrawn = self.withdraw.armed();
@@ -617,6 +632,7 @@ impl LocalAllow for GuiConsent {
             let kind = PopupKind::Ask {
                 label: label.to_owned(),
                 administrator: level == Elevation::Admin,
+                control: mode == SessionMode::Control,
             };
             let _on_screen = self.popups.open(Answer::Ask(tx), |id, m| {
                 m.popups.push(Popup { id, kind, deadline });
@@ -859,15 +875,29 @@ mod tests {
         let kill = KillSwitch::new();
         let (_started_tx, started) = watch::channel(0);
         let consent = GuiConsent::new(Arc::clone(&popups), withdraw(&kill, started));
-        for (level, administrator) in [(Elevation::Admin, true), (Elevation::None, false)] {
-            let asking = consent.ask_at(&[1; 8], "Laptop", level, Duration::from_secs(60));
+        // The mode the state machine says: the sheet says what control
+        // also gives only for a session that may be control; without a mode
+        // (`ask_at`) it names no service.
+        for (level, administrator, mode, control) in [
+            (Elevation::Admin, true, Some(SessionMode::Control), true),
+            (Elevation::None, false, Some(SessionMode::Control), true),
+            (Elevation::None, false, Some(SessionMode::ViewOnly), false),
+            (Elevation::Admin, true, None, false),
+            (Elevation::None, false, None, false),
+        ] {
+            let timeout = Duration::from_secs(60);
+            let asking = match mode {
+                Some(mode) => consent.ask_for(&[1; 8], "Laptop", level, mode, timeout),
+                None => consent.ask_at(&[1; 8], "Laptop", level, timeout),
+            };
             tokio::pin!(asking);
             tokio::select! {
                 _ = &mut asking => panic!("answered before anyone clicked"),
                 open = shown(&popups, 1) => {
                     assert_eq!(
                         open[0].kind,
-                        PopupKind::Ask { label: "Laptop".to_owned(), administrator }
+                        PopupKind::Ask { label: "Laptop".to_owned(), administrator, control },
+                        "{mode:?}"
                     );
                     assert!(popups.answer_ask(open[0].id, true));
                 }
