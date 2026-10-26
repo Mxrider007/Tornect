@@ -32,8 +32,9 @@ sha2.workspace = true
 
 [features]
 # The in-memory and loopback test environments (`mem`) for other crates'
-# tests: only dev-dependencies enable it, and `cargo xtask dist` refuses a
-# release graph that carries it (design `direct` §8.8).
+# tests: only dev-dependencies enable it. `cargo xtask dist` is to refuse a
+# release graph that carries it (design `direct` §8.8; the check lands at
+# step A22).
 test-support = []
 
 [dev-dependencies]
