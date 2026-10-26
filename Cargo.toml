@@ -49,6 +49,10 @@ toml = "1.1.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 tracing-appender = "0.2.5"
+# The `log` bridge tracing-subscriber's default `tracing-log` feature already
+# installs (`try_init`); named only by tornect-core's tests, which feed `log`
+# records through it (decision M1-83). Locked through tracing-subscriber.
+tracing-log = { version = "0.2.0", default-features = false, features = ["log-tracer", "std"] }
 directories = "6.0.0"
 ed25519-dalek = { version = "3.0.0", features = ["zeroize"] }
 sha2 = "0.11.0"

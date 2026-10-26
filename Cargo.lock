@@ -7576,6 +7576,7 @@ dependencies = [
  "toml 1.1.4+spec-1.1.0",
  "tracing",
  "tracing-appender",
+ "tracing-log",
  "tracing-subscriber",
  "unicode-normalization",
  "windows-native-keyring-store",

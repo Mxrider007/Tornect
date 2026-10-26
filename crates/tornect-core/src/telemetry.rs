@@ -49,6 +49,60 @@ pub const SENSITIVE_FIELDS: [&str; 12] = [
 /// `1`, as `--log-identifiers` does (U3-L3).
 pub const IDENTIFIERS_ENV: &str = "TORNECT_LOG_IDENTIFIERS";
 
+/// The log targets of the third-party network crates, whose own lines carry
+/// IP addresses, ports, connection IDs or certificates (decision M1-83,
+/// design `direct` DIRECT-6): quinn-udp writes a failed send's destination
+/// and source at `WARN`; quinn-proto remote addresses and connection IDs at
+/// `DEBUG`/`TRACE`; rustls both certificates at `TRACE`, which with raw public
+/// keys are the two device keys; the netlink crates, igd-next, crab_nat, the
+/// HTTP stack and the XML parsers of the router protocols the same kind of
+/// detail. Without the identifier opt-in every layer drops their events,
+/// whatever the filter (`--log trace` included); fields cannot be redacted
+/// inside a message text, so the events go whole.
+///
+/// `log`-crate events (rustls, the netlink crates, igd-next) reach tracing
+/// through the `tracing-log` bridge that `init` installs, under their own
+/// target, so the same rule drops them. A crate that touches the network
+/// joins this list in the change that pins it (`docs/DEPENDENCIES.md`, the
+/// "Logs addresses or keys?" column).
+pub const QUIET_TARGETS: [&str; 13] = [
+    "quinn",
+    "quinn_proto",
+    "quinn_udp",
+    "rustls",
+    "netdev",
+    "netlink_",
+    "igd_next",
+    "crab_nat",
+    "hyper",
+    "hyper_util",
+    "h2",
+    "xmltree",
+    "xml",
+];
+
+/// Whether `target` belongs to one of [`QUIET_TARGETS`]: the target itself,
+/// a module below it (`rustls::client::tls13`), or, for the one entry that
+/// ends in `_`, any target that starts with it (`netlink_sys`,
+/// `netlink_packet_route`). `rustlsx` or `h2o` are not quiet.
+#[must_use]
+pub fn is_quiet_target(target: &str) -> bool {
+    QUIET_TARGETS.iter().any(|quiet| {
+        if quiet.ends_with('_') {
+            target.starts_with(quiet)
+        } else {
+            target
+                .strip_prefix(quiet)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+        }
+    })
+}
+
+/// [`is_quiet_target`] of an event's or a span's target.
+fn quiet(meta: &tracing::Metadata<'_>) -> bool {
+    is_quiet_target(meta.target())
+}
+
 /// How the log writes an event's fields without the identifier opt-in: as
 /// the default formatter does, but with the value of every field of
 /// [`SENSITIVE_FIELDS`] replaced by `<redacted>`.
@@ -121,7 +175,9 @@ pub fn init(opts: LogOptions) -> Result<LogGuard> {
 /// `RUST_LOG`, else [`LogOptions::filter`], else [`DEFAULT_FILTER`]; an
 /// invalid one counts as unset) decides which events are written, never
 /// whether they name anyone: that takes [`LogOptions::identifiers`] or
-/// [`IDENTIFIERS_ENV`] = `1` (U3-L3).
+/// [`IDENTIFIERS_ENV`] = `1` (U3-L3). Without it, every stderr layer also
+/// drops the events and spans of [`QUIET_TARGETS`]; the file layer, which
+/// redacts its fields even with the opt-in, always drops them.
 fn subscriber<W>(
     opts: LogOptions,
     env: &dyn Fn(&str) -> Option<String>,
@@ -150,6 +206,7 @@ where
             .with_writer(stderr.clone())
             .with_ansi(ansi)
             .with_target(true)
+            .with_filter(tracing_subscriber::filter::filter_fn(|meta| !quiet(meta)))
     });
     let json_layer = opts.json.then(|| {
         tracing_subscriber::fmt::layer()
@@ -157,7 +214,7 @@ where
             .with_writer(stderr)
             .with_target(true)
             .with_filter(tracing_subscriber::filter::filter_fn(move |meta| {
-                !redact || names_nobody(meta)
+                !redact || (names_nobody(meta) && !quiet(meta))
             }))
     });
 
@@ -174,7 +231,8 @@ where
                     .with_writer(writer)
                     .with_ansi(false)
                     .with_target(true)
-                    .with_filter(EnvFilter::new(DEFAULT_FILTER)),
+                    .with_filter(EnvFilter::new(DEFAULT_FILTER))
+                    .with_filter(tracing_subscriber::filter::filter_fn(|meta| !quiet(meta))),
             )
         }
         None => None,
@@ -503,6 +561,226 @@ mod tests {
                     "{opts:?} {env:?}: \"{said}\" missing:\n{text}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn quiet_targets_are_the_crates_and_their_modules() {
+        for target in [
+            "quinn",
+            "quinn::endpoint",
+            "quinn_proto::connection",
+            "quinn_udp",
+            "rustls::client::tls13",
+            "rustls::server::tls13",
+            "netdev",
+            "netlink_sys",
+            "netlink_packet_route::link",
+            "netlink_packet_core",
+            "igd_next::search",
+            "crab_nat",
+            "hyper::proto::h1",
+            "hyper_util::client::legacy",
+            "h2::codec",
+            "xmltree",
+            "xml::reader",
+        ] {
+            assert!(is_quiet_target(target), "{target} must be quiet");
+        }
+        for target in [
+            "tornect_net::link",
+            "tornect_signal::tor::node",
+            "rustlsx",
+            "quinnx::a",
+            "h2o",
+            "xmlsec",
+            "netlink",
+            "tor_proto::channel",
+            "arti_client",
+            "log",
+            "",
+        ] {
+            assert!(!is_quiet_target(target), "{target} must not be quiet");
+        }
+    }
+
+    /// Decision M1-83 (design `direct` §12.1 "Telemetry"): under `--log
+    /// trace` and every other filter, without the identifier opt-in, the
+    /// stderr layers (text and JSON) drop every event of [`QUIET_TARGETS`],
+    /// `log`-crate records of rustls and igd-next sent through the
+    /// `tracing-log` bridge included; Tornect's own lines still pass. With
+    /// the opt-in they are kept.
+    #[test]
+    fn third_party_network_lines_are_dropped_without_the_opt_in() {
+        use std::sync::{Arc, Mutex};
+        use tracing_log::log::{self, Log as _};
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        const PEER: &str = "203.0.113.77:50417";
+        const KEY: &str = "3f2a91c077de0b14";
+        let logged = |opts: LogOptions, env: &[(&str, &str)]| -> String {
+            let buffer = Buffer::default();
+            let writer = buffer.clone();
+            let lookup = |name: &str| {
+                env.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| (*v).to_owned())
+            };
+            let (subscriber, _guard) =
+                subscriber(opts, &lookup, move || writer.clone(), false).unwrap();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::callsite::rebuild_interest_cache();
+                tracing::warn!(target: "quinn_udp", "sendmsg error: Transmit: {{ destination: {PEER} }}");
+                tracing::trace!(target: "quinn_proto::connection", "remote {PEER} cid {KEY}");
+                tracing::debug!(target: "quinn::endpoint", "incoming from {PEER}");
+                tracing::warn!(target: "netlink_packet_route::link", "unknown attribute of {PEER}");
+                tracing::info!(target: "h2::codec", "frame from {PEER}");
+                tracing::info!(target: "xml::reader", "element {PEER}");
+                // The span's own fields never reach a line of ours either.
+                let span = tracing::info_span!(target: "quinn", "connection", remote = %PEER);
+                span.in_scope(|| tracing::info!(target: "tornect_net::link", "ours inside"));
+                let bridge = tracing_log::LogTracer::new();
+                for target in ["rustls::client::tls13", "igd_next::search"] {
+                    bridge.log(
+                        &log::Record::builder()
+                            .target(target)
+                            .level(log::Level::Trace)
+                            .args(format_args!("certificate {KEY} from {PEER}"))
+                            .build(),
+                    );
+                }
+                bridge.log(
+                    &log::Record::builder()
+                        .target("tornect_net::bridged")
+                        .level(log::Level::Info)
+                        .args(format_args!("a bridged line of ours"))
+                        .build(),
+                );
+                tracing::info!(target: "tornect_net::link", "direct path ready");
+            });
+            String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap()
+        };
+        let filter = |f: &str| LogOptions {
+            filter: Some(f.to_owned()),
+            ..LogOptions::default()
+        };
+        for (opts, env) in [
+            (filter("trace"), vec![]),
+            (LogOptions::default(), vec![("RUST_LOG", "trace")]),
+            (
+                LogOptions::default(),
+                vec![("TORNECT_LOG", "quinn=trace,rustls=trace,trace")],
+            ),
+            (filter("trace"), vec![(IDENTIFIERS_ENV, "0")]),
+            (LogOptions::default(), vec![]),
+            (
+                LogOptions {
+                    json: true,
+                    ..filter("trace")
+                },
+                vec![],
+            ),
+        ] {
+            let text = logged(opts.clone(), &env);
+            for said in ["direct path ready", "ours inside", "a bridged line of ours"] {
+                assert!(
+                    text.contains(said),
+                    "{opts:?} {env:?}: \"{said}\" missing:\n{text}"
+                );
+            }
+            for secret in ["203.0.113.77", "50417", KEY, "certificate", "sendmsg"] {
+                assert!(
+                    !text.contains(secret),
+                    "{opts:?} {env:?}: \"{secret}\" in:\n{text}"
+                );
+            }
+        }
+        for (opts, env) in [
+            (
+                LogOptions {
+                    identifiers: true,
+                    ..filter("trace")
+                },
+                vec![],
+            ),
+            (filter("trace"), vec![(IDENTIFIERS_ENV, "1")]),
+            (
+                LogOptions {
+                    identifiers: true,
+                    json: true,
+                    ..filter("trace")
+                },
+                vec![],
+            ),
+        ] {
+            let text = logged(opts.clone(), &env);
+            for said in [
+                "sendmsg error",
+                "cid 3f2a91c077de0b14",
+                "incoming from",
+                "unknown attribute",
+                "frame from",
+                "element",
+                "direct path ready",
+            ] {
+                assert!(
+                    text.contains(said),
+                    "{opts:?} {env:?}: \"{said}\" missing:\n{text}"
+                );
+            }
+            assert_eq!(
+                text.matches("certificate 3f2a91c077de0b14 from").count(),
+                2,
+                "{opts:?} {env:?}: both bridged records kept:\n{text}"
+            );
+        }
+    }
+
+    /// The file log redacts its fields even with the identifier opt-in, so
+    /// it drops the [`QUIET_TARGETS`] lines with and without it: a `WARN` of
+    /// `quinn_udp` passes its `info` filter and would otherwise name the
+    /// peer in the message text.
+    #[test]
+    fn the_file_log_never_keeps_third_party_network_lines() {
+        for identifiers in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let logs = dir.path().join("logs");
+            let (subscriber, guard) = subscriber(
+                LogOptions {
+                    filter: Some("trace".to_owned()),
+                    file_dir: Some(logs.clone()),
+                    json: false,
+                    identifiers,
+                },
+                &|_| None,
+                std::io::sink,
+                false,
+            )
+            .unwrap();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::callsite::rebuild_interest_cache();
+                tracing::warn!(target: "quinn_udp", "sendmsg error to 203.0.113.77:50417");
+                tracing::warn!(target: "netlink_sys", "socket error near 203.0.113.77");
+                tracing::warn!(target: "tornect_net::link", "a warning of ours");
+            });
+            drop(guard);
+            let mut text = String::new();
+            for entry in std::fs::read_dir(&logs).unwrap() {
+                text.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
+            }
+            assert!(text.contains("a warning of ours"), "{identifiers}: {text}");
+            assert!(!text.contains("203.0.113.77"), "{identifiers}: {text}");
         }
     }
 }
