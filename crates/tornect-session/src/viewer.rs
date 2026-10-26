@@ -860,6 +860,7 @@ fn kind(msg: &Msg) -> &'static str {
         Msg::Bind { .. } => "Bind",
         Msg::BindOk { .. } => "BindOk",
         Msg::BindRefused { .. } => "BindRefused",
+        Msg::BindProof { .. } => "BindProof",
         Msg::Video { .. } => "Video",
         Msg::VideoAck { .. } => "VideoAck",
         Msg::Input(_) => "Input",

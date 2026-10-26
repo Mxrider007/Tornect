@@ -2026,6 +2026,7 @@ impl Served<'_> {
             Msg::Bind { .. }
             | Msg::BindOk { .. }
             | Msg::BindRefused { .. }
+            | Msg::BindProof { .. }
             | Msg::Video { .. }
             | Msg::Quality { .. }
             | Msg::Stats(_)

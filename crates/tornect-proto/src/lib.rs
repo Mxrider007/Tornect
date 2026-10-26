@@ -16,7 +16,8 @@
 //! client → host   Bind            session_id (16 ASCII hex) · mac[32] · quality u8
 //! host → client   BindOk          width u32 · height u32 · codec u8 · mode u8 · QualityInfo
 //! host → client   BindRefused     reason u16
-//! host → client   Video           seq u32 · flags u8 · ts_ms u32 · Annex-B access unit
+//! host → client   BindProof       mac[32] (direct path)
+//! host → client   Video         seq u32 · flags u8 · ts_ms u32 · Annex-B access unit
 //! client → host   VideoAck        seq u32
 //! client → host   Input           16-byte event (tornect-input)
 //! client → host   KeyframeRequest —
@@ -63,6 +64,15 @@
 //! ([`bind_mac`], decision M1-41); the host answers only after checking it in
 //! constant time against a session it accepted on the signaling stream.
 //! Nothing is captured before that (§B.6).
+//!
+//! **The direct path** (decision M1-79, the direct design §6.6). On a
+//! session's direct QUIC connection the same `Bind` frame carries
+//! [`bind_mac_direct`]`(…, BindSide::Client)`, which also covers the
+//! connection's TLS exporter (`ekm`), under a key of its own
+//! ([`DIRECT_BIND_KEY_INFO`]). The host answers a valid one with `BindProof`
+//! (`BindSide::Server`) before `BindOk`, so the viewer knows the host holds
+//! the session token before it decodes a picture or sends input. An onion
+//! stream never carries `BindProof`.
 //!
 //! **Services** ([`services`], decision M1-76, the services design §0, §3).
 //! Chat, clipboard text and files ride a session's third stream in their own
@@ -130,6 +140,10 @@ pub mod reason {
     pub const PROTOCOL: u16 = 6;
     /// The video pipeline failed on the host (encoder error).
     pub const ENCODER_FAILED: u16 = 7;
+    /// The session's signed transport policy forbids the path this `Bind`
+    /// came on: a direct `Bind` for a `tor_only` session, an onion one for
+    /// a `lan_only` session (the direct design §6.6).
+    pub const TRANSPORT: u16 = 8;
 }
 
 /// The quality presets a viewer names in [`Msg::Bind`] and
@@ -194,6 +208,8 @@ mod ty {
     pub const BIND: u8 = 0x01;
     pub const BIND_OK: u8 = 0x02;
     pub const BIND_REFUSED: u8 = 0x03;
+    // The host's proof on the direct path (the direct design §6.6).
+    pub const BIND_PROOF: u8 = 0x04;
     pub const VIDEO: u8 = 0x10;
     pub const VIDEO_ACK: u8 = 0x11;
     pub const INPUT: u8 = 0x20;
@@ -495,6 +511,12 @@ pub enum Msg {
         /// A [`reason`] code.
         reason: u16,
     },
+    /// The host's answer to a valid direct `Bind`, written before `BindOk`
+    /// and on the direct path only (the direct design §6.6).
+    BindProof {
+        /// [`bind_mac_direct`] with [`BindSide::Server`].
+        mac: [u8; 32],
+    },
     /// One encoded access unit.
     Video {
         /// Increments by one per access unit, wrapping.
@@ -638,6 +660,10 @@ impl Msg {
             Self::BindRefused { reason } => {
                 body.extend_from_slice(&reason.to_be_bytes());
                 ty::BIND_REFUSED
+            }
+            Self::BindProof { mac } => {
+                body.extend_from_slice(mac);
+                ty::BIND_PROOF
             }
             Self::Video {
                 seq,
@@ -792,6 +818,14 @@ impl Msg {
                 fixed("BindRefused", 2)?;
                 Self::BindRefused {
                     reason: be_u16(body),
+                }
+            }
+            ty::BIND_PROOF => {
+                fixed("BindProof", 32)?;
+                Self::BindProof {
+                    mac: body
+                        .try_into()
+                        .map_err(|_| ProtoError::Malformed("BindProof"))?,
                 }
             }
             ty::VIDEO => {
@@ -990,21 +1024,28 @@ fn derived_key(session_token: &[u8; 32], info: &[u8]) -> Zeroizing<[u8; 32]> {
     key
 }
 
-/// `HMAC-SHA256(derived_key(session_token, info), label ‖ th_final)`: the
-/// bind MAC of one kind of stream. Each kind has its own `info` and `label`
-/// (the media stream's [`BIND_KEY_INFO`] and [`BIND_LABEL`], the services
-/// stream's in [`services`]), so a MAC made for one is refused by the other.
+/// `HMAC-SHA256(derived_key(session_token, info), label ‖ th_final ‖
+/// covered…)`: the bind MAC of one kind of stream on one path. Each kind has
+/// its own `info` and `label` (the media stream's [`BIND_KEY_INFO`] and
+/// [`BIND_LABEL`], the services stream's in [`services`], the direct path's
+/// [`DIRECT_BIND_KEY_INFO`] and labels), so a MAC made for one is refused by
+/// every other. `covered` is empty on the onion path and the connection's
+/// exporter output on the direct path.
 fn derived_mac(
     info: &[u8],
     label: &[u8],
     session_token: &[u8; 32],
     th_final: &[u8; 32],
+    covered: &[&[u8]],
 ) -> [u8; 32] {
     let key = derived_key(session_token, info);
     let mut mac = Hmac::<Sha256>::new_from_slice(key.as_slice())
         .unwrap_or_else(|_| unreachable!("HMAC-SHA256 takes a key of any length"));
     mac.update(label);
     mac.update(th_final);
+    for part in covered {
+        mac.update(part);
+    }
     mac.finalize().into_bytes().into()
 }
 
@@ -1013,13 +1054,80 @@ fn derived_mac(
 /// produced `th_final`.
 #[must_use]
 pub fn bind_mac(session_token: &[u8; 32], th_final: &[u8; 32]) -> [u8; 32] {
-    derived_mac(BIND_KEY_INFO, BIND_LABEL, session_token, th_final)
+    derived_mac(BIND_KEY_INFO, BIND_LABEL, session_token, th_final, &[])
 }
 
 /// Constant-time check of a received bind MAC.
 #[must_use]
 pub fn bind_mac_ok(session_token: &[u8; 32], th_final: &[u8; 32], received: &[u8; 32]) -> bool {
     bool::from(bind_mac(session_token, th_final).ct_eq(received))
+}
+
+/// HKDF-SHA256 `info` that derives the direct path's bind key `k_db` from
+/// the session token (the direct design §6.6): one key for both directions
+/// and both streams, which the labels below separate.
+pub const DIRECT_BIND_KEY_INFO: &[u8] = b"tornect/v1/quic-bind-key";
+
+/// Domain separator of the viewer's direct media `Bind` MAC.
+pub const DIRECT_MEDIA_BIND_LABEL_CLIENT: &[u8] = b"tornect/v1/quic-media-bind/client\0";
+
+/// Domain separator of the host's [`Msg::BindProof`] MAC.
+pub const DIRECT_MEDIA_BIND_LABEL_SERVER: &[u8] = b"tornect/v1/quic-media-bind/server\0";
+
+/// Domain separator of the viewer's direct services `Bind` MAC
+/// ([`services::services_bind_mac_direct`]).
+pub const DIRECT_SERVICES_BIND_LABEL: &[u8] = b"tornect/v1/quic-services-bind/client\0";
+
+/// Which end of a direct connection a media bind MAC speaks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindSide {
+    /// The viewer's `Bind` ([`DIRECT_MEDIA_BIND_LABEL_CLIENT`]).
+    Client,
+    /// The host's `BindProof` ([`DIRECT_MEDIA_BIND_LABEL_SERVER`]).
+    Server,
+}
+
+impl BindSide {
+    const fn label(self) -> &'static [u8] {
+        match self {
+            Self::Client => DIRECT_MEDIA_BIND_LABEL_CLIENT,
+            Self::Server => DIRECT_MEDIA_BIND_LABEL_SERVER,
+        }
+    }
+}
+
+/// `HMAC-SHA256(k_db, label(side) ‖ th_final ‖ ekm)` with `k_db =
+/// HKDF-SHA256(session_token, DIRECT_BIND_KEY_INFO)` (the direct design
+/// §6.6): the direct path's media bind MAC. `ekm` is the connection's TLS
+/// exporter output (`tornect_net::Established::binding_secret`), so the MAC
+/// binds this QUIC connection as well as the Tor handshake: a MAC made on
+/// another connection, on the onion path, or by the other side is refused.
+#[must_use]
+pub fn bind_mac_direct(
+    session_token: &[u8; 32],
+    th_final: &[u8; 32],
+    ekm: &[u8; 32],
+    side: BindSide,
+) -> [u8; 32] {
+    derived_mac(
+        DIRECT_BIND_KEY_INFO,
+        side.label(),
+        session_token,
+        th_final,
+        &[ekm],
+    )
+}
+
+/// Constant-time check of a received [`bind_mac_direct`].
+#[must_use]
+pub fn bind_mac_direct_ok(
+    session_token: &[u8; 32],
+    th_final: &[u8; 32],
+    ekm: &[u8; 32],
+    side: BindSide,
+    received: &[u8; 32],
+) -> bool {
+    bool::from(bind_mac_direct(session_token, th_final, ekm, side).ct_eq(received))
 }
 
 #[cfg(test)]
@@ -1150,6 +1258,7 @@ mod tests {
                 monitor: 2,
             },
             two_screens(),
+            Msg::BindProof { mac: [0x5a; 32] },
         ]
     }
 
@@ -1285,6 +1394,8 @@ mod tests {
             vec![ty::SET_QUALITY],
             vec![ty::QUALITY, 0, 0, 5, 0],
             vec![ty::STATS, 0],
+            vec![ty::BIND_PROOF],
+            vec![ty::BIND_PROOF, 1, 2],
             vec![0x99],
             vec![0x53],
             vec![0x55],
@@ -2124,7 +2235,7 @@ mod tests {
     fn the_fuzz_seeds_are_one_frame_of_each_message() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fuzz/seeds/media");
         let samples = samples();
-        let expected: [(&str, &Msg); 15] = [
+        let expected: [(&str, &Msg); 16] = [
             ("bind.bin", &samples[0]),
             ("bind-ok.bin", &samples[1]),
             ("bind-refused.bin", &samples[2]),
@@ -2140,6 +2251,7 @@ mod tests {
             ("close.bin", &samples[15]),
             ("select-monitor.bin", &samples[16]),
             ("monitors.bin", &samples[17]),
+            ("bind-proof.bin", &samples[18]),
         ];
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
@@ -2191,6 +2303,7 @@ mod tests {
                     quality,
                 }),
             any::<u16>().prop_map(|reason| Msg::BindRefused { reason }),
+            any::<[u8; 32]>().prop_map(|mac| Msg::BindProof { mac }),
             (
                 any::<u32>(),
                 any::<u8>(),
@@ -2422,5 +2535,132 @@ mod tests {
         let mut flipped = mac;
         flipped[0] ^= 1;
         assert!(!bind_mac_ok(&token, &th, &flipped));
+    }
+
+    /// The direct design's §6.6 MACs, computed independently (Python
+    /// `hmac`/`hashlib`: RFC 5869 HKDF-SHA256 with an empty salt and
+    /// `info = "tornect/v1/quic-bind-key"`, then HMAC-SHA256 over label ‖
+    /// th_final ‖ ekm) for token 0x11…, th_final 0x22… and ekm 0x33….
+    #[test]
+    fn the_direct_bind_macs_match_their_known_answers() {
+        let (token, th, ekm) = ([0x11; 32], [0x22; 32], [0x33; 32]);
+        let client = hex("cd3d66a3fd7a3e5b387abd2bc6f0b8f9b7249d0deaabaadee6fd25bc4ae6a372");
+        let server = hex("5f657d7cea7f4e86718d07a0fb00dc14512f1ebd55c3bf81309887323f18d1b5");
+        assert_eq!(
+            bind_mac_direct(&token, &th, &ekm, BindSide::Client).to_vec(),
+            client
+        );
+        assert_eq!(
+            bind_mac_direct(&token, &th, &ekm, BindSide::Server).to_vec(),
+            server
+        );
+        let client: [u8; 32] = client.try_into().unwrap();
+        let server: [u8; 32] = server.try_into().unwrap();
+        assert!(bind_mac_direct_ok(
+            &token,
+            &th,
+            &ekm,
+            BindSide::Client,
+            &client
+        ));
+        assert!(bind_mac_direct_ok(
+            &token,
+            &th,
+            &ekm,
+            BindSide::Server,
+            &server
+        ));
+        // Each side's MAC is refused as the other's.
+        assert!(!bind_mac_direct_ok(
+            &token,
+            &th,
+            &ekm,
+            BindSide::Server,
+            &client
+        ));
+        assert!(!bind_mac_direct_ok(
+            &token,
+            &th,
+            &ekm,
+            BindSide::Client,
+            &server
+        ));
+        assert_eq!(DIRECT_BIND_KEY_INFO, b"tornect/v1/quic-bind-key");
+        assert_eq!(
+            DIRECT_MEDIA_BIND_LABEL_CLIENT,
+            b"tornect/v1/quic-media-bind/client\0"
+        );
+        assert_eq!(
+            DIRECT_MEDIA_BIND_LABEL_SERVER,
+            b"tornect/v1/quic-media-bind/server\0"
+        );
+        assert_eq!(
+            DIRECT_SERVICES_BIND_LABEL,
+            b"tornect/v1/quic-services-bind/client\0"
+        );
+    }
+
+    /// `BindProof` is type 0x04 and the 32-byte MAC (the direct design §6.6:
+    /// 33 bytes behind the length prefix), and decodes at that length only.
+    #[test]
+    fn bind_proof_matches_its_golden_bytes() {
+        let mac: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let msg = Msg::BindProof { mac };
+        let mut want = hex("00000021 04");
+        want.extend_from_slice(&mac);
+        assert_eq!(msg.encode(), want);
+        assert_eq!(Msg::decode(&want[4..]).unwrap(), msg);
+        assert_eq!(reason::TRANSPORT, 8);
+        for len in [0, 1, 31, 33, 64] {
+            let mut frame = vec![ty::BIND_PROOF];
+            frame.resize(1 + len, 0xab);
+            assert!(
+                matches!(Msg::decode(&frame), Err(ProtoError::Malformed("BindProof"))),
+                "{len}"
+            );
+        }
+        // A host-to-client frame, yet within the client cap too: a host that
+        // reads one from a viewer refuses it as unexpected, not as oversized.
+        assert!(want.len() - 4 <= MAX_CLIENT_FRAME);
+    }
+
+    proptest! {
+        /// For any token, transcript and exporter output, the viewer's and the
+        /// host's direct MACs differ from each other, from the onion media
+        /// MAC, and from both services MACs; and a direct MAC is refused under
+        /// another exporter output, token or transcript (the direct design
+        /// §8.4).
+        #[test]
+        fn the_direct_macs_are_domain_separated(
+            token in any::<[u8; 32]>(),
+            th in any::<[u8; 32]>(),
+            ekm in any::<[u8; 32]>(),
+            other in any::<[u8; 32]>(),
+        ) {
+            let client = bind_mac_direct(&token, &th, &ekm, BindSide::Client);
+            let server = bind_mac_direct(&token, &th, &ekm, BindSide::Server);
+            let onion = bind_mac(&token, &th);
+            let services_direct = services::services_bind_mac_direct(&token, &th, &ekm);
+            let services_onion = services::services_bind_mac(&token, &th);
+            let all = [client, server, onion, services_direct, services_onion];
+            for (i, a) in all.iter().enumerate() {
+                for b in &all[i + 1..] {
+                    prop_assert_ne!(a, b);
+                }
+            }
+            prop_assert!(!bind_mac_ok(&token, &th, &client));
+            prop_assert!(!services::services_bind_mac_direct_ok(&token, &th, &ekm, &client));
+            prop_assert!(services::services_bind_mac_direct_ok(
+                &token, &th, &ekm, &services_direct
+            ));
+            prop_assume!(other != ekm && other != token && other != th);
+            for side in [BindSide::Client, BindSide::Server] {
+                let mac = bind_mac_direct(&token, &th, &ekm, side);
+                prop_assert!(bind_mac_direct_ok(&token, &th, &ekm, side, &mac));
+                prop_assert!(!bind_mac_direct_ok(&token, &th, &other, side, &mac));
+                prop_assert!(!bind_mac_direct_ok(&other, &th, &ekm, side, &mac));
+                prop_assert!(!bind_mac_direct_ok(&token, &other, &ekm, side, &mac));
+            }
+        }
     }
 }

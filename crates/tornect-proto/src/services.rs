@@ -88,6 +88,7 @@ pub fn services_bind_mac(session_token: &[u8; 32], th_final: &[u8; 32]) -> [u8; 
         SERVICES_BIND_LABEL,
         session_token,
         th_final,
+        &[],
     )
 }
 
@@ -99,6 +100,38 @@ pub fn services_bind_mac_ok(
     received: &[u8; 32],
 ) -> bool {
     bool::from(services_bind_mac(session_token, th_final).ct_eq(received))
+}
+
+/// `HMAC-SHA256(k_db, DIRECT_SERVICES_BIND_LABEL ‖ th_final ‖ ekm)` with
+/// `k_db = HKDF-SHA256(session_token, DIRECT_BIND_KEY_INFO)` (the direct
+/// design §6.7): the services `Bind` MAC on a session's direct connection.
+/// The media stream's direct key, its own label, and the connection's
+/// exporter output `ekm`, so neither the onion services MAC nor a direct
+/// media MAC binds this stream, nor this MAC either of those.
+#[must_use]
+pub fn services_bind_mac_direct(
+    session_token: &[u8; 32],
+    th_final: &[u8; 32],
+    ekm: &[u8; 32],
+) -> [u8; 32] {
+    crate::derived_mac(
+        crate::DIRECT_BIND_KEY_INFO,
+        crate::DIRECT_SERVICES_BIND_LABEL,
+        session_token,
+        th_final,
+        &[ekm],
+    )
+}
+
+/// Constant-time check of a received [`services_bind_mac_direct`].
+#[must_use]
+pub fn services_bind_mac_direct_ok(
+    session_token: &[u8; 32],
+    th_final: &[u8; 32],
+    ekm: &[u8; 32],
+    received: &[u8; 32],
+) -> bool {
+    bool::from(services_bind_mac_direct(session_token, th_final, ekm).ct_eq(received))
 }
 
 /// Longest chat message, in characters.
@@ -2954,14 +2987,41 @@ mod tests {
             assert!(crate::bind_mac_ok(&token, &th, &media));
             assert!(services_bind_mac_ok(&token, &th, &services));
             let mixed = [
-                crate::derived_mac(SERVICES_BIND_KEY_INFO, crate::BIND_LABEL, &token, &th),
-                crate::derived_mac(crate::BIND_KEY_INFO, SERVICES_BIND_LABEL, &token, &th),
+                crate::derived_mac(SERVICES_BIND_KEY_INFO, crate::BIND_LABEL, &token, &th, &[]),
+                crate::derived_mac(crate::BIND_KEY_INFO, SERVICES_BIND_LABEL, &token, &th, &[]),
             ];
             for other in mixed {
                 assert_ne!(other, media);
                 assert_ne!(other, services);
             }
         }
+    }
+
+    /// The direct path's services MAC (the direct design §6.7), computed
+    /// independently with the script that reproduces the direct media MACs'
+    /// known answers (`tornect_proto`'s
+    /// `the_direct_bind_macs_match_their_known_answers`): token 0x11…,
+    /// th_final 0x22…, ekm 0x33….
+    #[test]
+    fn the_direct_services_bind_mac_matches_its_known_answer() {
+        let (token, th, ekm) = ([0x11; 32], [0x22; 32], [0x33; 32]);
+        let mac = services_bind_mac_direct(&token, &th, &ekm);
+        let expected: [u8; 32] = [
+            0x76, 0x6d, 0x80, 0x8d, 0x08, 0xe7, 0x13, 0x53, 0xb2, 0x0f, 0x1b, 0x43, 0x3e, 0xc9,
+            0xc0, 0x87, 0xa5, 0x72, 0x99, 0xa1, 0x6d, 0xb2, 0xdf, 0x5a, 0x9f, 0x7a, 0xe8, 0xe7,
+            0x1b, 0xa0, 0x3b, 0xa3,
+        ];
+        assert_eq!(mac, expected);
+        assert!(services_bind_mac_direct_ok(&token, &th, &ekm, &mac));
+        assert!(!services_bind_mac_direct_ok(&token, &th, &[0x34; 32], &mac));
+        assert!(!services_bind_mac_ok(&token, &th, &mac));
+        assert!(!crate::bind_mac_direct_ok(
+            &token,
+            &th,
+            &ekm,
+            crate::BindSide::Client,
+            &mac
+        ));
     }
 
     #[test]
