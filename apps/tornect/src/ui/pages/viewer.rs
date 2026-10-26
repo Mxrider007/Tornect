@@ -11,7 +11,15 @@
 //! sessions alike; the badge and the details say what the host applies and
 //! how long each stage takes (§3.3), all of it display only. The Screens
 //! menu (the monitors design §2) asks the host for another of its monitors,
-//! in either mode too, once the host listed two or more.
+//! in either mode too, once the host listed two or more. The session's
+//! services (the services design §7.1) add Chat, Files and the Clipboard
+//! switch for what the host granted: chat in any session; files and the
+//! clipboard only in a control session whose input still reaches the host
+//! ([`offered`]). Their panels ([`panels`]) are the window's own areas, so
+//! nothing pressed on them reaches the host, and the chat field takes the
+//! keyboard from the host the way the chord does.
+
+mod panels;
 
 use std::collections::VecDeque;
 use std::io;
@@ -22,10 +30,13 @@ use std::time::{Duration, Instant};
 use egui::{Color32, CornerRadius, RichText, Stroke, vec2};
 
 use tornect_core::config::{Picture, QualityPreset, ToolbarHides, Viewer};
+use tornect_proto::services::caps;
 use tornect_proto::{ALL_MONITORS, HostStats, MonitorEntry, QualityInfo, monitor_status};
 use tornect_signal::messages::notice;
 
-use super::super::model::{Ewma, ScreenNote, ScreensView, Viewing};
+pub use self::panels::{FileOp, FilesTab};
+
+use super::super::model::{Ewma, ScreenNote, ScreensView, ViewerServices, Viewing};
 use super::super::screenshot;
 use super::super::theme::{self, Face, Tokens};
 use super::super::view::{Action, clock};
@@ -108,6 +119,21 @@ const CHANGING_FOR: Duration = Duration::from_secs(10);
 /// A timing line before the host's first means (or this computer's first
 /// picture).
 const MEASURING: &str = "Measuring…";
+
+/// The Chat button's words (with the unread count: `Chat · 2`).
+const CHAT: &str = "Chat";
+
+/// The Chat button's name, for the accessibility tree.
+const CHAT_NAME: &str = "Chat with them";
+
+/// The Files button's words.
+const FILES: &str = "Files";
+
+/// The words beside the Clipboard switch.
+const CLIPBOARD: &str = "Clipboard";
+
+/// The Clipboard switch's name, for the accessibility tree.
+const SHARE_CLIPBOARD: &str = "Share the clipboard";
 
 /// A preset's name: in the Quality menu, the badge, the details, the toast
 /// and Settings, Display and quality.
@@ -199,6 +225,22 @@ pub enum ViewerAction {
     /// Ask the host to show this monitor of its list (0: all of them): in
     /// control and view-only sessions alike, a viewing choice.
     ShowScreen(u8),
+    /// The Chat panel: open it (`true`), which takes the keyboard from the
+    /// host for its field, or close it.
+    Chat(bool),
+    /// The chat field took the focus: the keyboard comes to this window.
+    ChatField,
+    /// Send what the chat field holds.
+    SendChat,
+    /// The Files panel: open it (`true`) or close it.
+    Files(bool),
+    /// Show this tab of the Files panel.
+    FilesTab(FilesTab),
+    /// The Clipboard switch: share this computer's clipboard (`true`) or
+    /// not, both ways.
+    Clipboard(bool),
+    /// A request of the Files panel for the session's services stream.
+    File(FileOp),
 }
 
 /// A key combination the Send keys menu sends, in a control session only.
@@ -344,6 +386,39 @@ pub struct ViewerState {
     /// How long writing a picture into the texture takes, in milliseconds
     /// (the details' "upload"): `draw_stream` times each.
     pub upload_ms: Ewma,
+    /// The Chat panel is open.
+    pub chat: bool,
+    /// What the chat field holds, not sent yet.
+    chat_draft: Draft,
+    /// The chat field takes the focus at the next frame: the panel opened,
+    /// or a message went.
+    chat_focus: bool,
+    /// How many of the host's chat lines (`ViewerServices::unread`) the
+    /// chat panel showed: the Chat button counts the ones after.
+    chat_seen: usize,
+    /// The Files panel is open.
+    pub files: bool,
+    /// The Files panel's tab.
+    pub files_tab: FilesTab,
+    /// The first listing of each tab was asked for (`[their files, send
+    /// files]`), while the panel is open: asked again when it opens anew,
+    /// or once the host is no longer locked.
+    files_asked: [bool; 2],
+    /// Files dropped on this window reach it (`WindowEvent::DroppedFile`:
+    /// on X11 and Windows; winit has none on Wayland): "Send files" says
+    /// so.
+    pub drops: bool,
+}
+
+/// What the chat field holds: its `Debug` prints its length only (chat
+/// text never reaches a log).
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Draft(String);
+
+impl std::fmt::Debug for Draft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Draft(<{} chars>)", self.0.chars().count())
+    }
 }
 
 impl ViewerState {
@@ -573,7 +648,14 @@ impl ViewerState {
         if self.hidden {
             return None;
         }
-        if self.pinned || self.details || self.keys_menu || self.quality_menu || self.screens_menu {
+        if self.pinned
+            || self.details
+            || self.keys_menu
+            || self.quality_menu
+            || self.screens_menu
+            || self.chat
+            || self.files
+        {
             self.active_at = Some(now);
             return None;
         }
@@ -583,6 +665,65 @@ impl ViewerState {
             None
         } else {
             Some(until - now)
+        }
+    }
+
+    /// The Chat button's count: the host's chat lines the panel has not
+    /// shown; none while it shows them.
+    fn unread(&self, services: &ViewerServices) -> usize {
+        if self.chat && !self.shared {
+            0
+        } else {
+            services.unread.saturating_sub(self.chat_seen)
+        }
+    }
+
+    /// Take the keyboard from the host for this window's own field (the
+    /// chat's): whatever the host holds down is let go first, as the chord
+    /// does. Nothing changes in a session that sends no input.
+    pub fn take_keyboard(&mut self, forwarder: &mut crate::ui::stream::Forwarder) {
+        forwarder.release_all();
+        if forwarder.is_open() {
+            self.keyboard_local = true;
+        }
+    }
+
+    /// Open the Chat panel (`true`), or close it: the Files panel closes,
+    /// the field takes the focus at the next frame and the keyboard comes
+    /// to this window.
+    pub fn open_chat(&mut self, open: bool, forwarder: &mut crate::ui::stream::Forwarder) {
+        self.chat = open;
+        if open {
+            self.files = false;
+            self.chat_focus = true;
+            self.take_keyboard(forwarder);
+        }
+    }
+
+    /// Take what the chat field holds, to send; it is left empty, its focus
+    /// kept for the next message.
+    pub fn take_chat(&mut self) -> String {
+        self.chat_focus = true;
+        std::mem::take(&mut self.chat_draft.0)
+    }
+
+    /// Put `text` in the chat field, as typing it would.
+    #[cfg(test)]
+    pub(crate) fn write_chat(&mut self, text: &str) {
+        text.clone_into(&mut self.chat_draft.0);
+    }
+
+    /// Open the Files panel (`true`) on its tab among those `offered`
+    /// (`tornect_proto::services::caps`), or close it. Each opening asks
+    /// for its tab's first listing anew.
+    pub fn open_files(&mut self, open: bool, offered: u16) {
+        self.files = open;
+        self.files_asked = [false; 2];
+        if open {
+            self.chat = false;
+            if let Some(tab) = FilesTab::shown(self.files_tab, offered) {
+                self.files_tab = tab;
+            }
         }
     }
 
@@ -870,6 +1011,26 @@ fn duration_text(us: u64) -> String {
     crate::host::duration_text(us)
 }
 
+/// The services the window offers now (`tornect_proto::services::caps`):
+/// what the host's stream has left, paused or not (the panels say so), and
+/// the clipboard and files only in a control session whose input still
+/// reaches the host: none once the host said its input reaches nothing
+/// there or ended (`NO_INPUT`, `INPUT_LOST`), even before the host's `Caps`
+/// takes them away. Nothing before the host's `Welcome` or once the stream
+/// ended, and nothing from a host that offers no services.
+#[must_use]
+pub fn offered(v: &Viewing, viewer: &ViewerState) -> u16 {
+    let Some(services) = v.services.as_deref() else {
+        return 0;
+    };
+    let left = services.left();
+    if v.control && !viewer.no_input(v) && !viewer.input_lost(v) {
+        left
+    } else {
+        left & caps::CHAT
+    }
+}
+
 /// The level chip's colour, from the same signed level.
 fn chip_color(v: &Viewing, t: &Tokens) -> Color32 {
     if v.control && v.administrator {
@@ -1097,6 +1258,16 @@ fn toolbar(
     viewer: &mut ViewerState,
 ) {
     viewer.sample(v.pictures, now);
+    // The session's services, for what the host granted; a panel whose
+    // service went closes.
+    let services = v.services.as_deref();
+    let offer = offered(v, viewer);
+    if offer & caps::CHAT == 0 {
+        viewer.chat = false;
+    }
+    if offer & (caps::UPLOAD | caps::BROWSE) == 0 {
+        viewer.files = false;
+    }
     let pointer = ctx.input(|i| i.pointer.latest_pos());
     let top = ctx.content_rect().top();
     if let Some(left) = viewer.follow(pointer, top, now) {
@@ -1208,6 +1379,9 @@ fn toolbar(
                             }
                             keys_at = Some(send.rect.left());
                         }
+                        if let Some(services) = services {
+                            services_entries(ui, services, offer, actions, viewer);
+                        }
                         if viewer.screenshots && camera(ui).clicked() {
                             actions.push(Action::Viewer(ViewerAction::Screenshot));
                         }
@@ -1291,6 +1465,25 @@ fn toolbar(
         viewer.areas.push(line);
         below = line.bottom() + 4.0;
     }
+    // The services' panels sit at the right under these lines, beside
+    // whatever opens below the toolbar.
+    if let Some(services) = services {
+        let panel = if viewer.chat {
+            Some(panels::chat(ctx, v, services, below - top, actions, viewer))
+        } else if viewer.files {
+            Some(panels::files(
+                ctx,
+                services,
+                offer,
+                below - top,
+                actions,
+                viewer,
+            ))
+        } else {
+            None
+        };
+        viewer.areas.extend(panel);
+    }
     if viewer.details {
         let at = egui::pos2(pill.left(), below);
         let lines = ModeLines {
@@ -1338,6 +1531,55 @@ fn toolbar(
         if menu.response.clicked_elsewhere() && !screens_clicked {
             actions.push(Action::Viewer(ViewerAction::ScreensMenu(false)));
         }
+    }
+}
+
+/// The toolbar's entries for the session's services, each for what is
+/// `offer`ed: Chat (with the count of the host's lines not shown yet),
+/// Files, and the Clipboard switch where this window shares its clipboard.
+fn services_entries(
+    ui: &mut egui::Ui,
+    services: &ViewerServices,
+    offer: u16,
+    actions: &mut Vec<Action>,
+    viewer: &ViewerState,
+) {
+    if offer & caps::CHAT != 0 {
+        let text = chat_label(viewer.unread(services));
+        let chat = ui.add(egui::Button::new(text.as_str()).selected(viewer.chat));
+        chat.widget_info(|| {
+            let mut info = egui::WidgetInfo::labeled(egui::WidgetType::Button, true, CHAT_NAME);
+            info.current_text_value = Some(text.clone());
+            info
+        });
+        if chat.clicked() {
+            actions.push(Action::Viewer(ViewerAction::Chat(!viewer.chat)));
+        }
+    }
+    if offer & (caps::UPLOAD | caps::BROWSE) != 0
+        && ui
+            .add(egui::Button::new(FILES).selected(viewer.files))
+            .clicked()
+    {
+        actions.push(Action::Viewer(ViewerAction::Files(!viewer.files)));
+    }
+    if offer & caps::CLIP != 0 && services.shares_clipboard {
+        ui.label(RichText::new(CLIPBOARD).small());
+        let mut on = services.clipboard;
+        if widgets::toggle(ui, &mut on, SHARE_CLIPBOARD).changed() {
+            actions.push(Action::Viewer(ViewerAction::Clipboard(on)));
+        }
+    }
+}
+
+/// The Chat button's words: `Chat`, or `Chat · 2` with lines of the host's
+/// not shown yet.
+#[must_use]
+pub fn chat_label(unread: usize) -> String {
+    if unread == 0 {
+        CHAT.to_owned()
+    } else {
+        format!("{CHAT} · {unread}")
     }
 }
 
@@ -1775,8 +2017,25 @@ pub(crate) mod testing {
     use std::time::{Duration, Instant};
 
     use super::{ViewerState, stream_window};
-    use crate::ui::model::{StreamInfo, Viewing};
+    use crate::ui::model::{StreamInfo, ViewerServices, Viewing};
     use crate::ui::view::Action;
+
+    /// The services of a host that granted `caps`, with a host's default
+    /// limits.
+    pub(crate) fn granted(caps: u16) -> Box<ViewerServices> {
+        let mut services = ViewerServices::opening(true);
+        services.opened(&tornect_proto::services::Welcome {
+            caps,
+            clip_max: 262_144,
+            file_max: 2048 << 20,
+            session_quota: 8192 << 20,
+            session_files: 1000,
+            chat_max: 8000,
+            bulk_window: 256 * 1024,
+            inbox: "Downloads › Tornect".into(),
+        });
+        Box::new(services)
+    }
 
     /// One stream window.
     pub(crate) struct Window {
@@ -1869,6 +2128,42 @@ pub(crate) mod testing {
             self.nodes
                 .iter()
                 .any(|n| n.label() == Some(text) || n.value() == Some(text))
+        }
+
+        /// The centre of the text field whose hint is `hint`.
+        pub(crate) fn field(&self, hint: &str) -> egui::Pos2 {
+            let b = self
+                .nodes
+                .iter()
+                .find(|n| n.placeholder() == Some(hint))
+                .and_then(egui::accesskit::Node::bounds)
+                .unwrap_or_else(|| panic!("no field \"{hint}\" on screen"));
+            egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32)
+        }
+
+        /// A key pressed and let go, in one pass.
+        pub(crate) fn key(&mut self, at: Duration, key: egui::Key) -> Vec<Action> {
+            let event = |pressed| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            self.pass(at, vec![event(true), event(false)])
+        }
+
+        /// A click at `at` at `pos`, in two passes.
+        pub(crate) fn click_at(&mut self, at: Duration, pos: egui::Pos2) -> Vec<Action> {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let mut actions = self.pass(at, vec![egui::Event::PointerMoved(pos), button(true)]);
+            actions.extend(self.pass(at, vec![button(false)]));
+            actions
         }
 
         /// Whether the widget named `text` was shown as on (a toggle's

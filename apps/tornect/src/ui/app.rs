@@ -22,6 +22,8 @@ use tokio::sync::mpsc;
 use tornect_core::levels::AdminPath;
 use tornect_core::unattended::ipc::ShownLink;
 use tornect_input::Button;
+use tornect_proto::services::caps;
+use tornect_session::services::{ViewerOp, sanitize_peer_text};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
@@ -35,7 +37,7 @@ use super::indicator::{self, Change, Indicator};
 use super::keys;
 use super::model::{ClientStage, Model, Shared, Viewing, Wake};
 use super::nav::Page;
-use super::pages::viewer::{Combo, ViewerAction, ViewerState};
+use super::pages::viewer::{Combo, FileOp, FilesTab, ViewerAction, ViewerState, offered};
 use super::stream::{Forwarder, Picture, PictureRect, VideoTexture, button};
 use super::view::{self, Action, Form};
 
@@ -531,9 +533,13 @@ fn on_button(forwarder: &mut Forwarder, viewer: &mut ViewerState, button: Button
 /// controls change only the window's own state; End session, a pick in the
 /// Quality menu (a preset for the host) and a choice in the Screens menu (a
 /// monitor for the host), both in control and view-only sessions alike,
-/// are the ones that ask the tokio side for anything. `viewing`, the signed
-/// level, is only read: no action raises the level or opens a closed
-/// forwarder, and neither a pick nor a choice touches the forwarder.
+/// and the services' panels (a message, the Clipboard switch, a request of
+/// the Files panel, each only for what the window [`offered`]) are the ones
+/// that ask the tokio side for anything. `viewing`, the signed level, is
+/// only read: no action raises the level or opens a closed forwarder, and
+/// neither a pick nor a choice touches the forwarder. Opening the chat, or
+/// its field taking the focus, takes the keyboard from the host as the
+/// chord does: everything held there is let go first.
 fn apply_viewer_action(
     forwarder: &mut Forwarder,
     viewer: &mut ViewerState,
@@ -614,8 +620,88 @@ fn apply_viewer_action(
         }
         // The window saves the picture it has; nothing goes to the host.
         Action::Viewer(ViewerAction::Screenshot) => None,
+        Action::Viewer(ViewerAction::Chat(open)) => {
+            viewer.open_chat(*open, forwarder);
+            None
+        }
+        Action::Viewer(ViewerAction::ChatField) => {
+            viewer.take_keyboard(forwarder);
+            None
+        }
+        // What the field holds, sanitised as the host will show it; nothing
+        // when it is empty or chat went.
+        Action::Viewer(ViewerAction::SendChat) => {
+            let offer = viewing.map_or(0, |v| offered(v, viewer));
+            if offer & caps::CHAT == 0 {
+                return None;
+            }
+            let text = viewer.take_chat();
+            if text.trim().is_empty() {
+                return None;
+            }
+            sanitize_peer_text(&text).map(|text| Command::Services(ViewerOp::Chat(text)))
+        }
+        // It opens only on a tab offered.
+        Action::Viewer(ViewerAction::Files(open)) => {
+            let offer = viewing.map_or(0, |v| offered(v, viewer));
+            viewer.open_files(*open && offer & (caps::UPLOAD | caps::BROWSE) != 0, offer);
+            None
+        }
+        Action::Viewer(ViewerAction::FilesTab(tab)) => {
+            let offer = viewing.map_or(0, |v| offered(v, viewer));
+            if offer & tab.cap() != 0 {
+                viewer.files_tab = *tab;
+            }
+            None
+        }
+        // Only for a window that shares its clipboard, where the host
+        // grants it.
+        Action::Viewer(ViewerAction::Clipboard(on)) => {
+            let v = viewing?;
+            let shares = v.services.as_ref().is_some_and(|s| s.shares_clipboard);
+            (shares && offered(v, viewer) & caps::CLIP != 0)
+                .then_some(Command::Services(ViewerOp::ClipSwitch(*on)))
+        }
+        Action::Viewer(ViewerAction::File(op)) => {
+            let offer = viewing.map_or(0, |v| offered(v, viewer));
+            (offer & op.needs() != 0).then(|| Command::Services(file_op(*op)))
+        }
         _ => None,
     }
+}
+
+/// A request of the Files panel as the services stream takes it: handles
+/// only, never a path.
+fn file_op(op: FileOp) -> ViewerOp {
+    match op {
+        FileOp::OpenRemote(handle) => ViewerOp::OpenRemote(handle),
+        FileOp::Download(handle) => ViewerOp::Download(handle),
+        FileOp::OpenLocal(handle) => ViewerOp::OpenLocal(handle),
+        FileOp::Send(handle) => ViewerOp::UploadLocal(handle),
+        FileOp::Cancel(xfer) => ViewerOp::Cancel(xfer),
+    }
+}
+
+/// A file dropped on the stream window at `now` (X11, Windows): it goes to
+/// the host only where the window offers sending files, and the Files panel
+/// opens on "Send files" with the toolbar, so that its transfer shows. The
+/// services stream judges the path by this computer's own rules before
+/// anything is offered (a Tornect folder, a folder, a missing file: its row
+/// fails and nothing is sent). Its path is never logged.
+fn dropped_file(
+    viewer: &mut ViewerState,
+    viewing: Option<&Viewing>,
+    path: std::path::PathBuf,
+    now: Instant,
+) -> Option<Command> {
+    let offer = offered(viewing?, viewer);
+    if offer & caps::UPLOAD == 0 {
+        return None;
+    }
+    viewer.open_files(true, offer);
+    viewer.files_tab = FilesTab::Mine;
+    viewer.show_toolbar(now);
+    Some(Command::Services(ViewerOp::UploadPath(path)))
 }
 
 /// Hand the forwarder the host's hold (`hold`, the seq of a `REMAPPED`
@@ -895,6 +981,9 @@ impl App {
                     Ok(surface) => {
                         let max = surface.painter.max_texture_side().unwrap_or(8192);
                         let mut viewer = ViewerState::opened(&stored);
+                        // winit hands dropped files over on X11 and Windows,
+                        // never on Wayland.
+                        viewer.drops = !wayland(el);
                         if let Some(sheet) = self.stream_sheet {
                             super::preview::open_stream(sheet, &mut viewer, Instant::now());
                         }
@@ -1696,6 +1785,22 @@ impl App {
                 on_focus_lost(&mut view.chord, &mut view.forwarder);
                 view.surface.on_event(&event);
             }
+            WindowEvent::DroppedFile(path) => {
+                let viewing = self.shared.read(|m| match &m.client {
+                    ClientStage::Live(v) => Some(v.clone()),
+                    _ => None,
+                });
+                let command = dropped_file(
+                    &mut view.viewer,
+                    viewing.as_ref(),
+                    path.clone(),
+                    Instant::now(),
+                );
+                view.surface.window.request_redraw();
+                if let Some(command) = command {
+                    self.command(command);
+                }
+            }
             _ => view.surface.on_event(&event),
         }
         self.send_input();
@@ -1917,7 +2022,7 @@ mod tests {
     use tokio::sync::mpsc::error::TryRecvError;
 
     use super::super::model::Model;
-    use super::super::pages::viewer::testing::Window;
+    use super::super::pages::viewer::testing::{Window, granted};
     use super::*;
 
     /// §B.8.12: the window gives the tokio side 10 s to close, but waits for
@@ -3309,7 +3414,8 @@ mod tests {
     /// sends nothing, and the only commands any of them gives are End and,
     /// for a pick in the Quality menu, that preset, and for a choice in the
     /// Screens menu once the host listed its monitors, that screen (at
-    /// every level alike).
+    /// every level alike); the services' actions ask for nothing without a
+    /// services stream.
     #[test]
     fn no_toolbar_action_raises_the_level_or_opens_input() {
         use tornect_core::config::QualityPreset;
@@ -3340,6 +3446,19 @@ mod tests {
             Action::Viewer(ViewerAction::ShowScreen(0)),
             Action::Viewer(ViewerAction::ShowScreen(1)),
             Action::Viewer(ViewerAction::ShowScreen(2)),
+            Action::Viewer(ViewerAction::Chat(true)),
+            Action::Viewer(ViewerAction::Chat(false)),
+            Action::Viewer(ViewerAction::ChatField),
+            Action::Viewer(ViewerAction::SendChat),
+            Action::Viewer(ViewerAction::Files(true)),
+            Action::Viewer(ViewerAction::Files(false)),
+            Action::Viewer(ViewerAction::FilesTab(FilesTab::Mine)),
+            Action::Viewer(ViewerAction::Clipboard(true)),
+            Action::Viewer(ViewerAction::File(FileOp::OpenRemote(0))),
+            Action::Viewer(ViewerAction::File(FileOp::Download(1))),
+            Action::Viewer(ViewerAction::File(FileOp::OpenLocal(0))),
+            Action::Viewer(ViewerAction::File(FileOp::Send(1))),
+            Action::Viewer(ViewerAction::File(FileOp::Cancel(1))),
         ];
         let w = Window::new(true);
         for open in [false, true] {
@@ -4201,5 +4320,327 @@ mod tests {
         let (mut app, mut commands) = app();
         app.act(Action::Viewer(ViewerAction::Fullscreen(true)), None);
         assert_eq!(commands.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// The services design §7.1: opening the chat takes the keyboard from
+    /// the host for its field, as the chord does (everything held there let
+    /// go first): keys then stay in the window, a press on the panel reaches
+    /// nothing there, and a press on the picture gives the keyboard back
+    /// with the panel still open; the field taking the focus takes it
+    /// again. A view-only session sends nothing either way.
+    #[test]
+    fn opening_the_chat_takes_the_keyboard_and_a_press_on_the_picture_gives_it_back() {
+        use tornect_input::InputEvent;
+        let mut w = Window::new(true);
+        w.viewing.services = Some(granted(caps::ALL));
+        w.pass(ms(0), Vec::new());
+        w.pass(ms(0), Vec::new());
+        let viewing = w.viewing.clone();
+        let mut chord = keys::Chord::default();
+        let mut forwarder = Forwarder::new(true);
+        hand_areas(&w, &mut forwarder);
+        forwarder.moved((300.0, 400.0));
+        let now = Instant::now();
+        assert!(!on_key(
+            &mut chord,
+            &mut forwarder,
+            &mut w.viewer,
+            press(KEY_A),
+            now
+        ));
+        let open = Action::Viewer(ViewerAction::Chat(true));
+        assert_eq!(
+            apply_viewer_action(&mut forwarder, &mut w.viewer, Some(&viewing), &open),
+            None
+        );
+        assert!(w.viewer.chat && w.viewer.keyboard_local);
+        forwarder.flush();
+        let sent = forwarder.drain();
+        assert!(sent.contains(&key(KEY_A, true)), "{sent:?}");
+        assert_eq!(sent.last(), Some(&InputEvent::ReleaseAll), "{sent:?}");
+        for k in [release(KEY_A), press(KEY_A), release(KEY_A)] {
+            assert!(on_key(&mut chord, &mut forwarder, &mut w.viewer, k, now));
+        }
+        forwarder.flush();
+        assert!(forwarder.drain().is_empty(), "typed in the window");
+        w.pass(ms(100), Vec::new());
+        w.pass(ms(100), Vec::new());
+        assert!(w.has("Not saved. It ends with the session."));
+        hand_areas(&w, &mut forwarder);
+        let panel = w.centre("Not saved.");
+        forwarder.moved((f64::from(panel.x), f64::from(panel.y)));
+        on_button(&mut forwarder, &mut w.viewer, Button::Left, true);
+        on_button(&mut forwarder, &mut w.viewer, Button::Left, false);
+        assert!(w.viewer.keyboard_local, "a press on the panel");
+        forwarder.flush();
+        assert!(forwarder.drain().is_empty());
+        forwarder.moved((300.0, 400.0));
+        on_button(&mut forwarder, &mut w.viewer, Button::Left, true);
+        on_button(&mut forwarder, &mut w.viewer, Button::Left, false);
+        assert!(
+            !w.viewer.keyboard_local && w.viewer.chat,
+            "a press on the picture"
+        );
+        assert!(!on_key(
+            &mut chord,
+            &mut forwarder,
+            &mut w.viewer,
+            press(KEY_A),
+            now
+        ));
+        forwarder.flush();
+        assert!(forwarder.drain().contains(&key(KEY_A, true)));
+        let field = Action::Viewer(ViewerAction::ChatField);
+        assert_eq!(
+            apply_viewer_action(&mut forwarder, &mut w.viewer, Some(&viewing), &field),
+            None
+        );
+        assert!(w.viewer.keyboard_local);
+        forwarder.flush();
+        assert_eq!(forwarder.drain(), vec![InputEvent::ReleaseAll]);
+        let view_only = Viewing {
+            control: false,
+            ..viewing.clone()
+        };
+        let mut forwarder = Forwarder::new(false);
+        let mut state = ViewerState::default();
+        for action in [open, field] {
+            assert_eq!(
+                apply_viewer_action(&mut forwarder, &mut state, Some(&view_only), &action),
+                None
+            );
+        }
+        assert!(state.chat && !state.keyboard_local);
+        forwarder.flush();
+        assert!(forwarder.drain().is_empty());
+    }
+
+    /// The services' actions ask the tokio side for what the window offers
+    /// and nothing else: a message (sanitised, the field emptied; nothing
+    /// for a blank one), the Clipboard switch only for a window that shares
+    /// its clipboard, the Files panel's requests by handle only for the cap
+    /// each needs. A view-only session, and a control session whose input
+    /// reaches nothing on the host or no longer does, chat only; before the
+    /// host's `Welcome` and once the stream ended, nothing.
+    #[test]
+    fn the_services_actions_ask_only_for_what_the_window_offers() {
+        use tornect_proto::services::reason;
+        use tornect_session::services::ViewerServicesEnd;
+        use tornect_signal::messages::notice;
+        let w = Window::new(true);
+        let mut all = granted(caps::ALL);
+        all.shares_clipboard = true;
+        let control = Viewing {
+            services: Some(all),
+            ..w.viewing.clone()
+        };
+        let act = |viewing: &Viewing, state: &mut ViewerState, action: ViewerAction| {
+            let mut forwarder = Forwarder::new(viewing.control);
+            apply_viewer_action(
+                &mut forwarder,
+                state,
+                Some(viewing),
+                &Action::Viewer(action),
+            )
+        };
+        let chat = |text: &str| {
+            Some(Command::Services(ViewerOp::Chat(
+                sanitize_peer_text(text).unwrap(),
+            )))
+        };
+        let ops = [
+            (FileOp::OpenRemote(0), ViewerOp::OpenRemote(0)),
+            (FileOp::Download(7), ViewerOp::Download(7)),
+            (FileOp::OpenLocal(3), ViewerOp::OpenLocal(3)),
+            (FileOp::Send(5), ViewerOp::UploadLocal(5)),
+            (FileOp::Cancel(9), ViewerOp::Cancel(9)),
+        ];
+        let mut state = ViewerState::default();
+        state.write_chat("see\u{202e} you");
+        assert_eq!(
+            act(&control, &mut state, ViewerAction::SendChat),
+            chat("see you")
+        );
+        assert_eq!(state.take_chat(), "", "the field emptied");
+        for blank in ["", "   ", "\u{200b}"] {
+            state.write_chat(blank);
+            assert_eq!(act(&control, &mut state, ViewerAction::SendChat), None);
+        }
+        for (op, asks) in ops.clone() {
+            assert_eq!(
+                act(&control, &mut state, ViewerAction::File(op)),
+                Some(Command::Services(asks))
+            );
+        }
+        for on in [false, true] {
+            assert_eq!(
+                act(&control, &mut state, ViewerAction::Clipboard(on)),
+                Some(Command::Services(ViewerOp::ClipSwitch(on)))
+            );
+        }
+        state.chat = true;
+        assert_eq!(act(&control, &mut state, ViewerAction::Files(true)), None);
+        assert!(state.files && !state.chat && state.files_tab == FilesTab::Theirs);
+        act(&control, &mut state, ViewerAction::FilesTab(FilesTab::Mine));
+        assert_eq!(state.files_tab, FilesTab::Mine);
+        act(&control, &mut state, ViewerAction::Chat(true));
+        assert!(state.chat && !state.files, "one panel at a time");
+        let mut own = control.clone();
+        own.services.as_mut().unwrap().shares_clipboard = false;
+        assert_eq!(act(&own, &mut state, ViewerAction::Clipboard(true)), None);
+        // Browsing only: sending, the switch and the chat ask for nothing.
+        let browse = Viewing {
+            services: Some(granted(caps::BROWSE)),
+            ..control.clone()
+        };
+        let mut state = ViewerState::default();
+        for (op, asks) in ops.clone() {
+            let browsing = op.needs() & caps::BROWSE != 0;
+            assert_eq!(
+                act(&browse, &mut state, ViewerAction::File(op)),
+                browsing.then_some(Command::Services(asks)),
+                "{op:?}"
+            );
+        }
+        assert_eq!(
+            act(&browse, &mut state, ViewerAction::Clipboard(true)),
+            None
+        );
+        state.write_chat("hi");
+        assert_eq!(act(&browse, &mut state, ViewerAction::SendChat), None);
+        assert_eq!(state.take_chat(), "hi", "kept");
+        act(&browse, &mut state, ViewerAction::FilesTab(FilesTab::Mine));
+        assert_eq!(state.files_tab, FilesTab::Theirs, "not offered");
+        // Chat only.
+        let view_only = Viewing {
+            control: false,
+            ..control.clone()
+        };
+        for (viewing, code) in [
+            (&view_only, None),
+            (&control, Some(notice::NO_INPUT)),
+            (&control, Some(notice::INPUT_LOST)),
+        ] {
+            let mut state = ViewerState::default();
+            state.host_notice = code;
+            for (op, _) in ops.clone() {
+                assert_eq!(act(viewing, &mut state, ViewerAction::File(op)), None);
+            }
+            assert_eq!(
+                act(viewing, &mut state, ViewerAction::Clipboard(true)),
+                None
+            );
+            assert_eq!(act(viewing, &mut state, ViewerAction::Files(true)), None);
+            assert!(!state.files, "{code:?}");
+            state.write_chat("hi");
+            assert_eq!(act(viewing, &mut state, ViewerAction::SendChat), chat("hi"));
+        }
+        // Nothing yet, or nothing any more.
+        let mut ended = control.clone();
+        ended
+            .services
+            .as_mut()
+            .unwrap()
+            .finished(ViewerServicesEnd::Closed(reason::ENDED_BY_HOST));
+        let opening = Viewing {
+            services: Some(Box::new(super::super::model::ViewerServices::opening(true))),
+            ..control.clone()
+        };
+        let none = Viewing {
+            services: None,
+            ..control.clone()
+        };
+        for viewing in [&ended, &opening, &none] {
+            let mut state = ViewerState::default();
+            state.write_chat("hi");
+            assert_eq!(act(viewing, &mut state, ViewerAction::SendChat), None);
+            assert_eq!(
+                act(viewing, &mut state, ViewerAction::Clipboard(true)),
+                None
+            );
+            for (op, _) in ops.clone() {
+                assert_eq!(act(viewing, &mut state, ViewerAction::File(op)), None);
+            }
+        }
+    }
+
+    /// A file dropped on the stream window (X11, Windows) goes to the host
+    /// as its path only where the window offers sending files, a locked
+    /// host's included (the stream holds it until it is unlocked): the
+    /// Files panel opens on "Send files" with the toolbar, so that its row
+    /// shows. Elsewhere nothing goes and nothing opens. The services
+    /// stream judges the path by this computer's own rules before anything
+    /// is offered (`ServicesViewer`'s test 17).
+    #[test]
+    fn a_dropped_file_goes_to_the_host_only_where_sending_files_is_offered() {
+        use tornect_proto::services::reason;
+        use tornect_session::services::{ViewerEvent, ViewerServicesEnd};
+        use tornect_signal::messages::notice;
+        let w = Window::new(true);
+        let path = std::path::PathBuf::from("/home/desk/report.pdf");
+        let now = Instant::now();
+        let control = Viewing {
+            services: Some(granted(caps::ALL)),
+            ..w.viewing.clone()
+        };
+        let mut locked = control.clone();
+        locked.services.as_mut().unwrap().apply(ViewerEvent::Caps {
+            caps: caps::ALL,
+            paused: caps::CLIP | caps::UPLOAD | caps::BROWSE,
+        });
+        for viewing in [&control, &locked] {
+            let mut w = Window::new(true);
+            w.viewing = viewing.clone();
+            w.pass(ms(0), Vec::new());
+            w.pass(ms(3000), Vec::new());
+            assert!(!w.viewer.toolbar_shown());
+            w.viewer.chat = true;
+            assert_eq!(
+                dropped_file(
+                    &mut w.viewer,
+                    Some(viewing),
+                    path.clone(),
+                    w.start + ms(3000)
+                ),
+                Some(Command::Services(ViewerOp::UploadPath(path.clone())))
+            );
+            assert!(w.viewer.files && !w.viewer.chat);
+            assert_eq!(w.viewer.files_tab, FilesTab::Mine);
+            w.pass(ms(3100), Vec::new());
+            w.pass(ms(3100), Vec::new());
+            assert!(w.has("End session") && w.has("Send files"));
+        }
+        let browse = Viewing {
+            services: Some(granted(caps::CHAT | caps::BROWSE)),
+            ..control.clone()
+        };
+        let view_only = Viewing {
+            control: false,
+            ..control.clone()
+        };
+        let none = Viewing {
+            services: None,
+            ..control.clone()
+        };
+        let mut ended = control.clone();
+        ended
+            .services
+            .as_mut()
+            .unwrap()
+            .finished(ViewerServicesEnd::Closed(reason::SESSION_OVER));
+        for (viewing, code) in [
+            (Some(&browse), None),
+            (Some(&view_only), None),
+            (Some(&none), None),
+            (Some(&ended), None),
+            (None, None),
+            (Some(&control), Some(notice::NO_INPUT)),
+            (Some(&control), Some(notice::INPUT_LOST)),
+        ] {
+            let mut state = ViewerState::default();
+            state.host_notice = code;
+            assert_eq!(dropped_file(&mut state, viewing, path.clone(), now), None);
+            assert!(!state.files);
+        }
     }
 }

@@ -138,7 +138,7 @@ impl HostServices {
     }
 
     /// The caps in effect now: granted, not turned off, not paused.
-    // Read by the sharing indicator's services rows (the design's step 23).
+    // Read by the host window's services strip (the design's step 25).
     #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn effective(&self) -> u16 {
@@ -310,9 +310,14 @@ pub struct ViewerServices {
     pub inbox: String,
     /// The toolbar's "Clipboard" switch (from `[viewer] clipboard_sync`).
     pub clipboard: bool,
+    /// The stream window reads and sets this computer's clipboard for the
+    /// session (`StreamLink::set_window_clipboard`, the design's step 24):
+    /// only then does the toolbar offer the switch.
+    pub shares_clipboard: bool,
     /// The chat, oldest first, at most [`CHAT_KEPT`] lines.
     pub chat: Vec<ChatLine>,
-    /// Lines from the host not yet seen (the chat panel clears it).
+    /// Lines from the host so far: the stream window counts the ones its
+    /// chat panel showed, and the toolbar's "Chat · 2" the ones after.
     pub unread: usize,
     /// The transfers, in the order they were asked for.
     pub transfers: Vec<TransferRow>,
@@ -337,12 +342,18 @@ impl ViewerServices {
     }
 
     /// The caps in effect now: granted, not taken away, not paused.
-    // Read by the stream window's toolbar entries (the design's step 22).
-    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn effective(&self) -> u16 {
+        self.left() & !self.paused
+    }
+
+    /// The caps left while the stream is open: granted and not taken away,
+    /// paused or not (`tornect_proto::services::caps`); 0 before the
+    /// `Welcome` and once the stream ended.
+    #[must_use]
+    pub fn left(&self) -> u16 {
         if self.state == ServicesState::Open {
-            self.caps & !self.paused
+            self.caps
         } else {
             0
         }

@@ -145,7 +145,7 @@ pub enum Command {
     /// turns its clipboard and files off for the rest of the session.
     #[expect(
         dead_code,
-        reason = "sent by the sharing indicator's services rows (the design's step 23)"
+        reason = "sent by the host window's services strip and chat card (the design's step 25)"
     )]
     HostServices {
         /// The shared session (`sessions.log`'s id).
@@ -154,18 +154,15 @@ pub enum Command {
         op: HostServicesOp,
     },
     /// The viewer's person acts on the viewed session's services (design
-    /// §7.1): chat, the Clipboard switch, the files panels.
-    #[expect(
-        dead_code,
-        reason = "sent by the stream window's chat and files panels (the design's step 22)"
-    )]
+    /// §7.1): chat, the Clipboard switch, the files panel, a file dropped on
+    /// the stream window.
     Services(ViewerOp),
     /// Shut down.
     Quit,
 }
 
 /// What the host's person does with a shared session's services.
-// Made by the sharing indicator's services rows (the design's step 23).
+// Made by the host window's services strip and chat card (the design's step 25).
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostServicesOp {
@@ -4121,9 +4118,14 @@ async fn viewed(
     } else {
         None
     };
-    let card = services
-        .as_ref()
-        .map(|(_, on)| Box::new(ViewerServices::opening(*on)));
+    let card = services.as_ref().map(|(start, on)| {
+        Box::new(ViewerServices {
+            // The toolbar offers the Clipboard switch only for a window that
+            // shares its clipboard.
+            shares_clipboard: start.local.clip.is_some(),
+            ..ViewerServices::opening(*on)
+        })
+    });
     let services = services.map(|(start, _)| start);
     b.shared.update(|m| {
         m.go_live(Viewing {
