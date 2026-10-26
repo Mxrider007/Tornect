@@ -111,7 +111,7 @@ pub use browse::{
 };
 pub use chat::{CHAT_BURST, CHAT_RATE, ChatText, sanitize_peer_text};
 pub use clip::{CLIP_BURST, CLIP_EVERY, CLIP_RATE, ViewerClip};
-pub use host::{ServicesHost, ServicesOutcome, refuse};
+pub use host::{ServicesHost, ServicesOutcome};
 pub use listing::LIST_RATE;
 pub use reader::ReaderCounts;
 pub use store::{FreeSpaceFn, RECHECK_FREE_EVERY};
@@ -155,6 +155,20 @@ impl ServicesPolicy {
             max_file: services.max_file_bytes(),
             session_quota: services.session_quota_bytes(),
             keep_free: services.keep_free_bytes(),
+        }
+    }
+
+    /// Every service off: chat, the clipboard, receiving and browsing files
+    /// (the sizes as `[services]`' defaults). A session under it is offered
+    /// nothing: `Refused{NOT_OFFERED}` once its capture is live.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            chat: false,
+            clipboard: false,
+            receive_files: false,
+            browse_files: false,
+            ..Self::default()
         }
     }
 }

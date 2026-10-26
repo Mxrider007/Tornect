@@ -86,8 +86,8 @@ use super::upload::HostUploads;
 use super::window::{CLIPBOARD, Window};
 use super::writer::{LAST_WRITE, Outbox, spawn_writer};
 use super::{
-    HostEvent, ServicesEnv, ServicesLimits, ServicesObserver, ServicesPolicy, ServicesSummary,
-    eligible, granted,
+    HostEvent, NoServicesObserver, ServicesEnv, ServicesLimits, ServicesObserver, ServicesPolicy,
+    ServicesSummary, eligible, granted,
 };
 use crate::flow::LineBudget;
 use crate::host::{CaptureState, MediaHost, ServicesClaim};
@@ -226,6 +226,32 @@ impl ServicesHost {
             open: Arc::new(AtomicUsize::new(0)),
             pre_bind: Mutex::new(LineBudget::new(PRE_BIND_WINDOW, PRE_BIND_LINES)),
         }
+    }
+
+    /// The services of a host that offers none, over `media`: the terminal
+    /// host (`tornect host`, §0), which advertises `svc1` like the window
+    /// host. Every switch is off ([`ServicesPolicy::none`]), nothing is
+    /// observed, there is no inbox and nothing to list, and the limits are
+    /// the defaults. Each stream is answered exactly as a window host whose
+    /// switches are all off answers it: one silent past the bind deadline is
+    /// dropped unanswered, a first frame that is no `Bind` gets
+    /// `Refused{PROTOCOL}`, a refused claim `Refused{BAD_BIND}`, and a bound
+    /// one waits for its session's capture like any other, then gets
+    /// `Refused{NOT_OFFERED}` (or the live wait's own refusal). So a peer
+    /// that knows only this host's ID cannot tell the two hosts apart by
+    /// their services port, and the desktop's clipboard and the inbox are
+    /// never touched. Its policy never changes, so [`Self::on_start`] and
+    /// [`Self::on_end`] are not needed.
+    #[must_use]
+    pub fn offering_nothing(media: Arc<MediaHost>) -> Self {
+        let (_, policy) = watch::channel(ServicesPolicy::none());
+        Self::new(
+            media,
+            Arc::new(NoServicesObserver),
+            policy,
+            ServicesEnv::default(),
+            ServicesLimits::default(),
+        )
     }
 
     /// Session `session` is live: take its policy as the host's settings
@@ -1133,14 +1159,6 @@ impl Served<'_> {
         }
         self.caps(left, self.state.paused() & left)
     }
-}
-
-/// Answer a services stream with `Refused{NOT_OFFERED}` and close it: the
-/// terminal host (`tornect host`) has no services, and advertises `svc1` all
-/// the same so that a viewer's choice of port does not tell the two hosts
-/// apart (§0).
-pub async fn refuse<S: AsyncWrite + Unpin>(mut stream: S) {
-    refuse_with(&mut stream, reason::NOT_OFFERED).await;
 }
 
 /// Write `Refused{code}` and shut down, each within [`LAST_WRITE`].

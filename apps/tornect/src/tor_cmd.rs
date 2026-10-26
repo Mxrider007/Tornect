@@ -23,8 +23,8 @@ use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
 use tornect_proto::services::Welcome;
 use tornect_proto::{ALL_MONITORS, HostStats, ProtoError, QualityInfo, monitor_status};
 use tornect_session::services::{
-    ServicesBindError, ServicesBinding, ServicesViewer, ViewerEvent, ViewerLocal, ViewerOp,
-    ViewerServicesEnd,
+    ServicesBindError, ServicesBinding, ServicesHost, ServicesViewer, ViewerEvent, ViewerLocal,
+    ViewerOp, ViewerServicesEnd,
 };
 use tornect_session::{
     Binding, DesktopBackend, FrameSink, MediaHost, MediaLimits, MediaViewer, Screens, ScreensNews,
@@ -366,6 +366,7 @@ async fn run_host(
     )?;
     helpers.wire(deps.kill.clone(), audit.clone(), host_cfg.levels);
     deps.admin_helper = helpers;
+    let services = terminal_services(&media);
     // A kill ends every session's media at once, without waiting for the FSM's
     // `BYE` to a peer that may not be reading (SLICE-B1 B1-2).
     let kill_watch = media.watch_kill(deps.kill.clone());
@@ -426,10 +427,11 @@ async fn run_host(
     let (served_tx, mut served_rx) = watch::channel(0u64);
     let slots = Arc::new(Semaphore::new(MAX_SIGNALING_STREAMS));
     let serving = Arc::new((host_cfg, deps.clone()));
-    // Media streams: each bounds itself (the bind deadline, the cap on binds
-    // waiting for an unregistered session, the session's end). Streams still
-    // reading their `Bind` hold no slot (SLICE-C1 C1-1); the listener's cap of 4
-    // streams per circuit and 64 circuits is what bounds them.
+    // Media and services streams: each bounds itself (the bind deadline, the
+    // cap on binds waiting for an unregistered session, the session's end).
+    // Streams still reading their `Bind` hold no slot (SLICE-C1 C1-1); the
+    // listener's cap of 4 streams per circuit and 64 circuits is what bounds
+    // them.
     let mut media_streams = JoinSet::new();
     let mut ctrl_c = pin!(tokio::signal::ctrl_c());
     loop {
@@ -445,28 +447,11 @@ async fn run_host(
                     break;
                 };
                 while media_streams.try_join_next().is_some() {}
-                if stream.port() == MEDIA_PORT {
-                    let media = Arc::clone(&media);
-                    media_streams.spawn(async move {
-                        let outcome = media.serve(stream).await;
-                        if let Some(line) = crate::host::describe_media(&outcome) {
-                            eprintln!("{line}");
-                        }
-                    });
+                let port = stream.port();
+                let Some(stream) = dispatch(stream, port, &media, &services, &mut media_streams)
+                else {
                     continue;
-                }
-                // The services stream (design `services` §8): this host
-                // advertises `svc1` like the window host, and answers every
-                // such stream `Refused{NOT_OFFERED}` without reading it: the
-                // terminal host offers no chat, clipboard or files. The
-                // session goes on without them.
-                if stream.port() == SERVICES_PORT {
-                    media_streams.spawn(tornect_session::services::refuse(stream));
-                    continue;
-                }
-                if stream.port() != SIGNALING_PORT {
-                    continue;
-                }
+                };
                 // Dropping the stream closes it; the peer sees EOF.
                 let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
                     eprintln!(
@@ -528,6 +513,56 @@ async fn run_host(
     drop(listener);
     node.shutdown().await;
     Ok(())
+}
+
+/// The terminal host's services over its `media` (design `services` §0,
+/// decision M1-76 (bk)): it advertises `svc1` like the window host and
+/// serves the stream the way a window host whose `[services]` switches are
+/// all off does ([`ServicesHost::offering_nothing`]), so that its services
+/// port does not tell the two hosts apart before pairing. A session here is
+/// never offered a service.
+pub(crate) fn terminal_services(media: &Arc<MediaHost>) -> Arc<ServicesHost> {
+    Arc::new(ServicesHost::offering_nothing(Arc::clone(media)))
+}
+
+/// Put `stream`, accepted on `port`, where the terminal host serves it: a
+/// media stream to `media` and a services stream to `services`, each on a
+/// task of `streams` (each bounds itself: its bind deadline, its session's
+/// end); a signaling stream is given back, to be served in a slot of its
+/// own; a stream on any other port is closed (dropped: the peer sees EOF).
+/// A services stream's outcome is not told: a session here is never offered
+/// a service, and a stream that binds nothing can come from any peer.
+pub(crate) fn dispatch<S>(
+    stream: S,
+    port: u16,
+    media: &Arc<MediaHost>,
+    services: &Arc<ServicesHost>,
+    streams: &mut JoinSet<()>,
+) -> Option<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match port {
+        MEDIA_PORT => {
+            let media = Arc::clone(media);
+            streams.spawn(async move {
+                let outcome = media.serve(stream).await;
+                if let Some(line) = crate::host::describe_media(&outcome) {
+                    eprintln!("{line}");
+                }
+            });
+            None
+        }
+        SERVICES_PORT => {
+            let services = Arc::clone(services);
+            streams.spawn(async move {
+                services.serve(stream).await;
+            });
+            None
+        }
+        SIGNALING_PORT => Some(stream),
+        _ => None,
+    }
 }
 
 /// The host a command names (design `invite` §2.5): a bare Tornect ID, its
@@ -3447,27 +3482,137 @@ mod tests {
         (start, news, ops_tx)
     }
 
-    /// Design `services` §0, §6.1: the terminal host answers a services
-    /// stream with `Refused{NOT_OFFERED}` (`tornect host` has no services),
-    /// and the viewer reports it once, as a stream that did not open with
-    /// that code, and nothing else: the session goes on. A stream that could
-    /// not be reached is reported the same way with no code; a session that
-    /// ends before its stream is bound reports nothing.
-    #[tokio::test]
-    async fn the_terminal_hosts_refusal_leaves_the_session_without_services() {
+    /// Everything a stream shows of the host behind it: the bytes written
+    /// back until it closed (or 30 s passed), and how long that took.
+    async fn answer_of(mut client: DuplexStream, bytes: &[u8]) -> (Vec<u8>, Duration) {
+        use tokio::io::AsyncReadExt as _;
+        let started = tokio::time::Instant::now();
+        client.write_all(bytes).await.unwrap();
+        let mut answer = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), client.read_to_end(&mut answer))
+            .await
+            .expect("the host closes the stream")
+            .unwrap();
+        (answer, started.elapsed())
+    }
+
+    /// A media host on the test card, as the terminal host's.
+    fn test_card_host() -> Arc<MediaHost> {
+        Arc::new(MediaHost::new(
+            Arc::new(SystemBackend::new(Source::TestCard)),
+            Arc::new(tornect_session::NoObserver),
+            MediaLimits::default(),
+        ))
+    }
+
+    /// The review of steps 20–21: the terminal host's accept loop puts each
+    /// stream where `dispatch` says: a media stream to its media host
+    /// (junk: the media `BindRefused{PROTOCOL}`), a services stream to its
+    /// services (junk: `Refused{PROTOCOL}`; a silent one is dropped
+    /// unanswered at the bind deadline); a signaling stream comes back to the
+    /// loop, and a stream on any other port is closed at once.
+    #[tokio::test(start_paused = true)]
+    async fn the_terminal_host_serves_each_port_with_its_host() {
+        use tornect_proto::services::{SvcMsg, reason};
+        let media = test_card_host();
+        let services = terminal_services(&media);
+        let mut streams = JoinSet::new();
+        let mut open = |port: u16| {
+            let (client, server) = duplex(1 << 16);
+            let back = dispatch(server, port, &media, &services, &mut streams);
+            (client, back)
+        };
+
+        let (_client, back) = open(SIGNALING_PORT);
+        assert!(back.is_some(), "a signaling stream goes back to the loop");
+        let (client, back) = open(4242);
+        assert!(back.is_none());
+        let (answer, took) = answer_of(client, &[]).await;
+        assert!(
+            answer.is_empty() && took.is_zero(),
+            "{answer:?} after {took:?}"
+        );
+
+        let junk = [0x5a; 53];
+        let (client, back) = open(MEDIA_PORT);
+        assert!(back.is_none());
+        let (answer, _) = answer_of(client, &junk).await;
+        let refused = tornect_proto::Msg::BindRefused {
+            reason: tornect_proto::reason::PROTOCOL,
+        };
+        let mut media_refusal = Vec::new();
+        tornect_proto::write_msg(&mut media_refusal, &refused)
+            .await
+            .unwrap();
+        assert_eq!(answer, media_refusal, "the media host answered");
+
+        let (client, back) = open(SERVICES_PORT);
+        assert!(back.is_none());
+        let (answer, _) = answer_of(client, &junk).await;
+        let services_refusal = SvcMsg::Refused {
+            reason: reason::PROTOCOL,
+        }
+        .encode();
+        assert_eq!(answer, services_refusal, "the services host answered");
+        let (client, _) = open(SERVICES_PORT);
+        let (answer, took) = answer_of(client, &[]).await;
+        assert!(answer.is_empty(), "{answer:?}");
+        assert!(
+            took >= MediaLimits::default().bind_deadline,
+            "dropped after {took:?}"
+        );
+        while streams.join_next().await.is_some() {}
+    }
+
+    /// Design `services` §0, §6.1, and the review of steps 20–21: the
+    /// terminal host serves a bound session's services stream as a window
+    /// host whose `[services]` switches are all off would: once the session's
+    /// capture is live, `Refused{NOT_OFFERED}`. The viewer reports that once,
+    /// as a stream that did not open with that code, and nothing else, and
+    /// the session goes on. A stream that could not be reached is
+    /// reported the same way with no code; a session that ends before its
+    /// stream is bound reports nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_terminal_hosts_services_leave_the_session_without_them() {
+        use tornect_core::DeviceId;
+        use tornect_core::levels::Elevation;
         use tornect_proto::services::reason;
+        use tornect_signal::fsm::host::{LiveSession, SessionSink as _};
         let token = tornect_signal::consent::SessionToken::new([0x51; 32]);
+        let session_id = token.session_id();
+
+        let media = test_card_host();
+        let services = terminal_services(&media);
+        media.on_start(&LiveSession {
+            device: DeviceId::from_bytes([5; 32]),
+            label: "Laptop",
+            session_id: &session_id,
+            token: &token,
+            th_final: [7; 32],
+            mode: SessionMode::Control,
+            elevation: Elevation::None,
+            unattended: false,
+        });
+        let mut streams = JoinSet::new();
+        let (media_client, media_server) = duplex(1 << 22);
+        assert!(dispatch(media_server, MEDIA_PORT, &media, &services, &mut streams).is_none());
+        let viewer = MediaViewer::bind(
+            media_client,
+            &Binding::new(&token, &[7; 32]),
+            MEDIA_BIND_WAIT,
+        )
+        .await
+        .expect("the media stream binds");
 
         let (start, news, _ops) = kept_services(&token);
         let (client, server) = duplex(64 * 1024);
-        let refused = tokio::spawn(tornect_session::services::refuse(server));
+        assert!(dispatch(server, SERVICES_PORT, &media, &services, &mut streams).is_none());
         tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(20),
             services_over(async { Ok(client) }, start, std::future::pending()),
         )
         .await
-        .expect("the refusal is read at once");
-        refused.await.unwrap();
+        .expect("the refusal comes once capture is live");
         let heard = std::mem::take(&mut *news.lock().unwrap());
         assert!(
             matches!(
@@ -3476,6 +3621,11 @@ mod tests {
             ),
             "{heard:?}"
         );
+        assert_eq!(media.live(), 1, "the session goes on");
+        assert_eq!(services.open_streams(), 0);
+        drop(viewer);
+        media.on_end(&session_id, None);
+        while streams.join_next().await.is_some() {}
 
         let (start, news, _ops) = kept_services(&token);
         let unreachable = async {

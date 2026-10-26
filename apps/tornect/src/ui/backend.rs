@@ -9556,6 +9556,115 @@ mod tests {
         panic!("{what} did not happen in time");
     }
 
+    /// The review of steps 20–21: before a session is bound, the terminal
+    /// host's services port (`tor_cmd::dispatch` to `terminal_services`)
+    /// answers byte for byte as the window host's (`host_role`'s services,
+    /// the default switches on), so that a peer that has only the host's ID
+    /// cannot tell the two apart: a silent stream is dropped unanswered at
+    /// the bind deadline, 53 bytes of junk get `Refused{PROTOCOL}`, a `Bind`
+    /// of no session or with a wrong MAC `Refused{BAD_BIND}`.
+    #[tokio::test(start_paused = true)]
+    async fn both_hosts_answer_an_unbound_services_stream_alike() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tornect_proto::services::{Bind, SvcMsg, reason};
+
+        async fn answer_of(
+            mut client: tokio::io::DuplexStream,
+            bytes: &[u8],
+        ) -> (Vec<u8>, Duration) {
+            let started = tokio::time::Instant::now();
+            client.write_all(bytes).await.unwrap();
+            let mut answer = Vec::new();
+            tokio::time::timeout(Duration::from_secs(30), client.read_to_end(&mut answer))
+                .await
+                .expect("the host closes the stream")
+                .unwrap();
+            (answer, started.elapsed())
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = Shared::new(Model::default(), Arc::new(|_| {}));
+        let media = Arc::new(MediaHost::new(
+            Arc::new(SystemBackend::new(Source::TestCard)),
+            Arc::new(tornect_session::NoObserver),
+            MediaLimits::default(),
+        ));
+        let (window, _observer) = test_services(&media, &shared, &tmp.path().join("sessions.log"));
+        let terminal = crate::tor_cmd::terminal_services(&media);
+        let token = tornect_signal::consent::SessionToken::new([0x25; 32]);
+        let session_id = token.session_id();
+        media.on_start(&LiveSession {
+            device: DeviceIdentity::from_seed(&[9; 32]).id(),
+            label: "Laptop",
+            session_id: &session_id,
+            token: &token,
+            th_final: [3; 32],
+            mode: SessionMode::Control,
+            elevation: Elevation::None,
+            unattended: false,
+        });
+        let bind = |session_id: String| {
+            SvcMsg::Bind(Bind {
+                session_id,
+                mac: [7; 32],
+            })
+            .encode()
+        };
+        let probes = [
+            ("silent", Vec::new(), Vec::new()),
+            (
+                "53 bytes of junk",
+                vec![0x5a; 53],
+                SvcMsg::Refused {
+                    reason: reason::PROTOCOL,
+                }
+                .encode(),
+            ),
+            (
+                "a bind of no session",
+                bind(tornect_signal::consent::SessionToken::new([0x26; 32]).session_id()),
+                SvcMsg::Refused {
+                    reason: reason::BAD_BIND,
+                }
+                .encode(),
+            ),
+            (
+                "a bind with a wrong MAC",
+                bind(session_id.clone()),
+                SvcMsg::Refused {
+                    reason: reason::BAD_BIND,
+                }
+                .encode(),
+            ),
+        ];
+        let mut streams = JoinSet::new();
+        for (what, bytes, expected) in probes {
+            let (client, server) = tokio::io::duplex(1 << 16);
+            let served = tokio::spawn({
+                let window = Arc::clone(&window);
+                async move { window.serve(server).await }
+            });
+            let (from_window, window_took) = answer_of(client, &bytes).await;
+            assert_eq!(
+                served.await.unwrap(),
+                tornect_session::services::ServicesOutcome::NotBound,
+                "{what}"
+            );
+            let (client, server) = tokio::io::duplex(1 << 16);
+            let back =
+                crate::tor_cmd::dispatch(server, SERVICES_PORT, &media, &terminal, &mut streams);
+            assert!(back.is_none(), "{what}");
+            let (from_terminal, terminal_took) = answer_of(client, &bytes).await;
+            assert_eq!(from_terminal, from_window, "{what}: the bytes differ");
+            assert_eq!(from_window, expected, "{what}");
+            assert_eq!(terminal_took, window_took, "{what}: the timing differs");
+            if bytes.is_empty() {
+                assert_eq!(window_took, MediaLimits::default().bind_deadline, "{what}");
+            }
+        }
+        while streams.join_next().await.is_some() {}
+    }
+
     /// Steps 20 and 21 of the services design over in-memory streams: the
     /// window host's sessions sink starts a session's services with its
     /// media; the viewer's services stream opens once the media stream is

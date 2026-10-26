@@ -3,8 +3,10 @@
 //! downloads folder, the lock watcher that pauses the services while the
 //! host is locked (§2.3), and the `sessions.log` lines of what they did
 //! (§2.5). The window host serves the services stream
-//! ([`tornect_session::services::ServicesHost`]); the terminal host refuses
-//! it, and the terminal viewer never opens it (§1).
+//! ([`tornect_session::services::ServicesHost`]); the terminal host serves it
+//! offering nothing (`ServicesHost::offering_nothing`: every stream answered
+//! as a window host with every switch off answers it, so the port does not
+//! tell the two apart), and the terminal viewer never opens it (§1).
 //!
 //! Nothing here logs a file name, a path or any text through `tracing`: only
 //! kinds, counts and reason codes. `sessions.log` records the stored name of

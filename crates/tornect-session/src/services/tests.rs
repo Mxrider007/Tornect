@@ -1270,18 +1270,166 @@ async fn services_end_with_capture_the_session_a_bad_frame_or_the_viewer() {
     assert_eq!(rig.media.live(), 2);
 }
 
-/// The terminal host answers every services stream `Refused{NOT_OFFERED}`.
-#[tokio::test]
-async fn the_terminal_hosts_refusal() {
-    let (mut client, server) = duplex(1024);
-    refuse(server).await;
-    assert_eq!(
-        next(&mut client).await,
-        Some(SvcMsg::Refused {
-            reason: reason::NOT_OFFERED
-        })
-    );
-    assert_eq!(next(&mut client).await, None);
+/// The terminal host's services ([`ServicesHost::offering_nothing`], §0):
+/// a bound stream waits for its session's capture like any other, then gets
+/// `Refused{NOT_OFFERED}`, whatever the session's mode and input; the
+/// desktop's clipboard is never opened and no inbox is made. The viewer
+/// hears `Refused(NOT_OFFERED)`. The terminal host never calls `on_start`:
+/// its policy is all off whenever the stream comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_terminal_hosts_services_offer_nothing() {
+    let rig = rig();
+    let terminal = Arc::new(ServicesHost::offering_nothing(Arc::clone(&rig.media)));
+    for (seed, mode, input) in [
+        (135, SessionMode::Control, true),
+        (136, SessionMode::Control, false),
+        (137, SessionMode::ViewOnly, false),
+    ] {
+        let session = start(&rig, seed, mode);
+        let (mut client, task) = open(&terminal);
+        write_msg(&mut client, &session.binding.msg())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), read_header(&mut client))
+                .await
+                .is_err(),
+            "an answer before capture went live"
+        );
+        session.live(input);
+        assert_eq!(
+            next(&mut client).await,
+            Some(SvcMsg::Refused {
+                reason: reason::NOT_OFFERED
+            })
+        );
+        assert_eq!(next(&mut client).await, None, "closed after the refusal");
+        assert_eq!(
+            task.await.unwrap(),
+            ServicesOutcome::Refused {
+                session_id: session.id.clone(),
+                reason: reason::NOT_OFFERED
+            }
+        );
+    }
+    let session = start(&rig, 138, SessionMode::Control);
+    session.live(true);
+    let (client, task) = open(&terminal);
+    assert!(matches!(
+        ServicesViewer::bind(client, &session.binding, WAIT).await,
+        Err(ServicesBindError::Refused(reason::NOT_OFFERED))
+    ));
+    assert!(matches!(
+        task.await.unwrap(),
+        ServicesOutcome::Refused {
+            reason: reason::NOT_OFFERED,
+            ..
+        }
+    ));
+    assert_eq!(rig.desk.opens(), 0, "the clipboard was never opened");
+    assert!(!rig.inbox().exists(), "no inbox was made");
+    assert_eq!(terminal.open_streams(), 0);
+}
+
+/// Everything a stream's bytes and end show of a services host: the bytes
+/// it wrote back until it closed (or [`WAIT`] passed), how long that took,
+/// and its outcome.
+async fn answer_to(
+    services: &Arc<ServicesHost>,
+    bytes: &[u8],
+) -> (Vec<u8>, Duration, ServicesOutcome) {
+    let started = tokio::time::Instant::now();
+    let (mut client, task) = open(services);
+    client.write_all(bytes).await.unwrap();
+    let mut answer = Vec::new();
+    tokio::time::timeout(
+        WAIT,
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut answer),
+    )
+    .await
+    .expect("the host closes the stream")
+    .unwrap();
+    let took = started.elapsed();
+    (answer, took, task.await.unwrap())
+}
+
+/// The review of steps 20–21: before a session is bound, the terminal
+/// host's services ([`ServicesHost::offering_nothing`]) answer exactly as a
+/// window host's, whose switches are on: a silent stream is dropped at the
+/// bind deadline with nothing written, 53 bytes of junk get
+/// `Refused{PROTOCOL}`, a `Bind` with a wrong MAC (for a session that exists
+/// or one that does not) `Refused{BAD_BIND}`. A peer that has only the
+/// host's ID learns nothing of which host it is from its services port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_terminal_hosts_services_answer_unbound_streams_as_the_windows() {
+    let deadline = Duration::from_millis(300);
+    let rig = rig_with(Build {
+        media: MediaLimits {
+            bind_deadline: deadline,
+            ..MediaLimits::default()
+        },
+        ..Build::default()
+    });
+    let window = Arc::clone(&rig.services);
+    let terminal = Arc::new(ServicesHost::offering_nothing(Arc::clone(&rig.media)));
+    let session = start(&rig, 139, SessionMode::Control);
+    session.live(true);
+    let unknown = SessionToken::new([140; 32]).session_id();
+    let mut bind_sized = vec![0, 0, 0, 49, ty::BIND];
+    bind_sized.extend_from_slice(&[0xa5; 48]);
+    let probes: [(&str, Vec<u8>, Option<SvcMsg>); 5] = [
+        ("silent", Vec::new(), None),
+        (
+            "53 bytes of junk",
+            vec![0x5a; 53],
+            Some(SvcMsg::Refused {
+                reason: reason::PROTOCOL,
+            }),
+        ),
+        (
+            "a bind-sized frame of junk",
+            bind_sized,
+            Some(SvcMsg::Refused {
+                reason: reason::PROTOCOL,
+            }),
+        ),
+        (
+            "a bind of no session",
+            raw_bind(&unknown, [7; 32]).encode(),
+            Some(SvcMsg::Refused {
+                reason: reason::BAD_BIND,
+            }),
+        ),
+        (
+            "a bind with a wrong MAC",
+            raw_bind(&session.id, [7; 32]).encode(),
+            Some(SvcMsg::Refused {
+                reason: reason::BAD_BIND,
+            }),
+        ),
+    ];
+    for (what, bytes, expected) in probes {
+        let (from_window, window_took, window_end) = answer_to(&window, &bytes).await;
+        let (from_terminal, terminal_took, terminal_end) = answer_to(&terminal, &bytes).await;
+        assert_eq!(from_terminal, from_window, "{what}: the bytes differ");
+        assert_eq!(terminal_end, window_end, "{what}");
+        assert_eq!(window_end, ServicesOutcome::NotBound, "{what}");
+        let expected = expected.map_or_else(Vec::new, |msg| msg.encode());
+        assert_eq!(from_window, expected, "{what}");
+        if bytes.is_empty() {
+            for took in [window_took, terminal_took] {
+                assert!(
+                    took >= deadline && took < WAIT,
+                    "{what}: closed after {took:?}"
+                );
+            }
+        }
+    }
+    // Neither probe burned the session: its own viewer still binds.
+    let (mut client, task) = open(&window);
+    assert_eq!(welcome(&mut client, &session).await.caps, caps::ALL);
+    drop(client);
+    served(task).await;
 }
 
 // --- Test 10: chat ----------------------------------------------------------
@@ -1569,9 +1717,21 @@ async fn the_viewer_binds_or_hears_why_not() {
     .await;
     assert!(matches!(bound, Err(ServicesBindError::Protocol)));
 
-    // The terminal host.
-    let (client, server) = duplex(1024);
-    tokio::spawn(refuse(server));
+    // A host that refuses and closes without reading the `Bind`: the viewer
+    // still hears its answer (`ef489fa5`). The terminal host's own answer
+    // is `the_terminal_hosts_services_offer_nothing`'s.
+    let (client, mut server) = duplex(1024);
+    tokio::spawn(async move {
+        write_msg(
+            &mut server,
+            &SvcMsg::Refused {
+                reason: reason::NOT_OFFERED,
+            },
+        )
+        .await
+        .unwrap();
+        server.shutdown().await.unwrap();
+    });
     let binding = ServicesBinding::new(&SessionToken::new([171; 32]), &[2; 32]);
     assert!(matches!(
         ServicesViewer::bind(client, &binding, WAIT).await,
