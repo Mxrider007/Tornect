@@ -3,6 +3,7 @@
 
 use std::time::{Duration, Instant};
 
+use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, watch};
 use tornect_codec::{DecodedFrame, H264Decoder};
@@ -10,10 +11,11 @@ use tornect_core::config::QualityPreset;
 use tornect_core::session_log::SessionMode;
 use tornect_input::InputEvent;
 use tornect_proto::{
-    HostStats, MAX_MONITORS, MonitorEntry, Msg, ProtoError, QualityInfo, bind_mac, codec,
-    monitor_status, read_msg, reason, video_flags, write_msg,
+    BindSide, HostStats, MAX_MONITORS, MonitorEntry, Msg, ProtoError, QualityInfo, bind_mac,
+    bind_mac_direct, codec, monitor_status, read_msg, reason, video_flags, write_msg,
 };
 use tornect_signal::consent::{SessionToken, mode_from_code};
+use zeroize::Zeroizing;
 
 use crate::flow::KeyframeLimiter;
 use crate::quality;
@@ -40,11 +42,15 @@ pub const SWITCH_WAIT: Duration = Duration::from_secs(25);
 
 /// What proves a media stream belongs to a session: the session id and the
 /// bind MAC (decisions M1-39, M1-41). Both come from the handshake; the token
-/// itself never leaves this process.
+/// itself never leaves this process. On the direct path it also holds the
+/// proof the host must answer with (the direct design §6.6).
 #[derive(Clone)]
 pub struct Binding {
     session_id: String,
-    mac: [u8; 32],
+    mac: Zeroizing<[u8; 32]>,
+    /// The `BindProof` MAC a direct host must send before anything else;
+    /// `None` on the onion path, which has no proof.
+    expect_proof: Option<Zeroizing<[u8; 32]>>,
     quality: QualityPreset,
 }
 
@@ -55,9 +61,36 @@ impl Binding {
     pub fn new(token: &SessionToken, th_final: &[u8; 32]) -> Self {
         Self {
             session_id: token.session_id(),
-            mac: bind_mac(token.bytes(), th_final),
+            mac: Zeroizing::new(bind_mac(token.bytes(), th_final)),
+            expect_proof: None,
             quality: QualityPreset::default(),
         }
+    }
+
+    /// The binding of the same session's media stream on its direct
+    /// connection, whose exporter output is `ekm`
+    /// (`tornect_net::Established::binding_secret`; the direct design
+    /// §6.6): the client MAC over `th_final ‖ ekm`, and the server MAC the
+    /// host must prove itself with in its `BindProof`, before
+    /// [`MediaViewer::bind`] reads `BindOk`, decodes a picture or sends
+    /// input.
+    #[must_use]
+    pub fn direct(token: &SessionToken, th_final: &[u8; 32], ekm: &[u8; 32]) -> Self {
+        let mac = bind_mac_direct(token.bytes(), th_final, ekm, BindSide::Client);
+        let proof = bind_mac_direct(token.bytes(), th_final, ekm, BindSide::Server);
+        Self {
+            session_id: token.session_id(),
+            mac: Zeroizing::new(mac),
+            expect_proof: Some(Zeroizing::new(proof)),
+            quality: QualityPreset::default(),
+        }
+    }
+
+    /// Whether this binds a direct connection's stream, which the host
+    /// answers with a proof first.
+    #[must_use]
+    pub fn is_direct(&self) -> bool {
+        self.expect_proof.is_some()
     }
 
     /// Ask for `preset` in the `Bind` (Balanced by default). The host maps it
@@ -86,7 +119,7 @@ impl Binding {
     pub(crate) fn msg(&self) -> Msg {
         Msg::Bind {
             session_id: self.session_id.clone(),
-            mac: self.mac,
+            mac: *self.mac,
             quality: quality::code(self.quality),
         }
     }
@@ -96,6 +129,7 @@ impl std::fmt::Debug for Binding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Binding")
             .field("session_id", &self.session_id)
+            .field("direct", &self.is_direct())
             .field("quality", &self.quality)
             .finish_non_exhaustive()
     }
@@ -303,6 +337,12 @@ pub enum ViewerError {
     /// `BindOk` is not this version's (the quality design §4.7).
     #[error("the other computer runs a different version of Tornect; use the same version on both")]
     Version,
+    /// On the direct path, the host's first frame was not the `BindProof`
+    /// its session's token makes for this connection (the direct design
+    /// §6.6): it did not prove itself, so nothing it sends is decoded and
+    /// no input goes to it.
+    #[error("the host did not prove it holds this session on the direct connection")]
+    HostProof,
 }
 
 /// A bound media stream.
@@ -333,10 +373,43 @@ where
     /// A host of another version refuses this version's `Bind` as malformed,
     /// or answers with a `BindOk` this version cannot read: both are
     /// [`ViewerError::Version`], which says what to do about it.
+    ///
+    /// On the direct path ([`Binding::direct`]) the host's first frame must
+    /// be the `BindProof` the binding expects; a wrong or missing proof is
+    /// [`ViewerError::HostProof`], before `BindOk` is read. When the bind
+    /// fails there, [`after_bind_close`](crate::direct::after_bind_close)
+    /// says whether the session may still fall back to the onion path.
     pub async fn bind(stream: S, binding: &Binding, wait: Duration) -> Result<Self, ViewerError> {
         let (mut rd, mut wr) = tokio::io::split(stream);
         write_msg(&mut wr, &binding.msg()).await?;
-        let answer = match tokio::time::timeout(wait, read_msg(&mut rd)).await {
+        // One deadline for the whole answer: the proof and `BindOk` on the
+        // direct path (the direct design §4: the caller's bind wait covers
+        // both, never the punch window).
+        let deadline = tokio::time::Instant::now() + wait;
+        if let Some(expected) = &binding.expect_proof {
+            let first = match tokio::time::timeout_at(deadline, read_msg(&mut rd)).await {
+                Err(_) => return Err(ViewerError::Timeout(wait)),
+                Ok(Err(ProtoError::Malformed(_))) => return Err(ViewerError::HostProof),
+                Ok(first) => first?,
+            };
+            match first {
+                // Compared in constant time, before anything else is read.
+                Some(Msg::BindProof { mac }) if bool::from(mac.ct_eq(&**expected)) => {}
+                // A refusal comes instead of the proof (§6.5): its reason
+                // ends the session, as on the onion path.
+                Some(Msg::BindRefused {
+                    reason: reason::PROTOCOL,
+                }) => return Err(ViewerError::Version),
+                Some(Msg::BindRefused { reason } | Msg::Close { reason }) => {
+                    return Err(ViewerError::Refused(reason));
+                }
+                None => return Err(ViewerError::Closed),
+                // A wrong proof, `BindOk` first, or anything else: the host
+                // did not prove itself.
+                Some(_) => return Err(ViewerError::HostProof),
+            }
+        }
+        let answer = match tokio::time::timeout_at(deadline, read_msg(&mut rd)).await {
             Err(_) => return Err(ViewerError::Timeout(wait)),
             Ok(Err(ProtoError::Malformed("BindOk"))) => return Err(ViewerError::Version),
             Ok(answer) => answer?,

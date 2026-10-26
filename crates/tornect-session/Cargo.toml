@@ -18,6 +18,9 @@ tornect-codec.workspace = true
 tornect-audio.workspace = true
 tornect-input.workspace = true
 sha2.workspace = true
+# The viewer compares the direct path's `BindProof` in constant time (design
+# `direct` §6.6, step A15).
+subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -28,6 +31,9 @@ proptest.workspace = true
 tempfile.workspace = true
 # `start_paused` for the bind-deadline tests.
 tokio = { workspace = true, features = ["test-util"] }
+# MemNet direct links for the direct bind's crypto-close test (design
+# `direct` §12.1, step A15).
+tornect-net = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

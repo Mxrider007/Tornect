@@ -1,6 +1,9 @@
 //! The direct path's media bind (the direct design §6.6, §8.5, §12.1 "proto
-//! and session bind"), host side: `MediaHost::serve_direct` over a pipe that
-//! stands for a direct connection's stream, beside the onion `serve`.
+//! and session bind"). Host side (step A14): `MediaHost::serve_direct` over
+//! a pipe that stands for a direct connection's stream, beside the onion
+//! `serve`. Viewer side (step A15): `Binding::direct` and the `BindProof`
+//! check in `MediaViewer::bind`, against the host and against scripted
+//! hosts, and `after_bind_close` on in-memory QUIC links (`MemNet`).
 
 use std::io;
 use std::pin::Pin;
@@ -9,7 +12,9 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tornect_core::levels::Elevation;
 use tornect_core::session_log::TransportKind;
-use tornect_proto::{BindSide, bind_mac, bind_mac_direct};
+use tornect_net::mem::{LinkSpec, MachineSpec, MemNet};
+use tornect_net::{DirectLink, DirectParams, LocalBatch, NetEnv, Scope, TornectRole};
+use tornect_proto::{BindSide, ProtoError, bind_mac, bind_mac_direct};
 use tornect_signal::consent::TransportPolicy;
 use zeroize::Zeroizing;
 
@@ -149,10 +154,19 @@ impl Viewer {
 /// Register session `seed` (device, token and transcript from it) under the
 /// signed `transport` policy.
 fn start_direct(host: &MediaHost, seed: u8, transport: TransportPolicy) -> Viewer {
+    start_direct_for(host, seed, transport, DeviceId::from_bytes([seed; 32]))
+}
+
+/// [`start_direct`] for the paired `device`.
+fn start_direct_for(
+    host: &MediaHost,
+    seed: u8,
+    transport: TransportPolicy,
+    device: DeviceId,
+) -> Viewer {
     let token = SessionToken::new([seed; 32]);
     let th_final = [!seed; 32];
     let id = token.session_id();
-    let device = DeviceId::from_bytes([seed; 32]);
     host.on_start(&LiveSession {
         device,
         label: "Laptop",
@@ -637,4 +651,486 @@ async fn the_claim_channel_closes_when_the_session_ends() {
     assert_eq!(*claimed.borrow(), None);
     assert!(rig.host.claimed(&viewer.id).is_none());
     assert_eq!(rig.host.route(&viewer.id), None);
+}
+
+// The viewer's side (step A15).
+
+/// The viewer's direct binding of `viewer`'s session on a connection whose
+/// exporter output is `ekm`.
+fn direct_binding(viewer: &Viewer, ekm: &[u8; 32]) -> Binding {
+    Binding::direct(&viewer.token, &viewer.th_final, ekm)
+}
+
+/// `msg` as it travels.
+async fn frame(msg: &Msg) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    write_msg(&mut bytes, msg).await.unwrap();
+    bytes
+}
+
+/// A valid `BindOk`.
+fn bind_ok() -> Msg {
+    Msg::BindOk {
+        width: 1280,
+        height: 720,
+        codec: codec::H264,
+        mode: 0,
+        quality: APPLIED,
+    }
+}
+
+/// `MediaViewer::bind` with `binding` against a scripted host that reads
+/// the `Bind` (it must be `binding`'s), then writes `first` followed by a
+/// valid `BindOk` and holds the stream open; `None` closes the stream
+/// instead.
+async fn bind_scripted(
+    binding: &Binding,
+    first: Option<Vec<u8>>,
+) -> Result<MediaViewer<DuplexStream>, ViewerError> {
+    let (client, mut host) = duplex(1 << 16);
+    let expected = binding.msg();
+    tokio::spawn(async move {
+        assert_eq!(read_msg(&mut host).await.unwrap(), Some(expected));
+        let Some(first) = first else { return };
+        host.write_all(&first).await.unwrap();
+        // A viewer that refused the proof never reads this.
+        let _ = write_msg(&mut host, &bind_ok()).await;
+        while let Ok(Some(_)) = read_msg(&mut host).await {}
+    });
+    MediaViewer::bind(client, binding, WAIT).await
+}
+
+/// The direct design §6.6: the direct binding sends the client MAC over
+/// the connection's `ekm`, reads the host's `BindProof`, then `BindOk`; the
+/// host claims the session as `Direct`. Its `Debug` names the path and no
+/// MAC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_viewer_binds_once_the_host_proves_itself() {
+    let rig = direct_rig(TestBackend::default());
+    let viewer = start_direct(&rig.host, 80, TransportPolicy::Any);
+    let binding = direct_binding(&viewer, &EKM);
+    assert!(binding.is_direct());
+    assert!(!viewer.onion().is_direct());
+    assert_eq!(binding.msg(), viewer.bind(&EKM), "the client MAC over ekm");
+    let shown = format!("{binding:?}");
+    assert!(shown.contains("direct: true"), "{shown}");
+    assert!(!shown.contains("mac"), "{shown}");
+
+    let conn = connect_direct(&rig.host, &viewer, EKM, TransportKind::Direct);
+    let bound = MediaViewer::bind(conn.client, &binding, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(bound.bound().mode, SessionMode::Control);
+    assert_eq!(rig.host.route(&viewer.id), Some(TransportKind::Direct));
+    assert_eq!(rig.sources(), 1);
+    drop(bound);
+    assert!(matches!(
+        conn.served.await.unwrap(),
+        MediaOutcome::Served { .. }
+    ));
+}
+
+/// The direct design §6.6 (`HostProof` before `BindOk`): a host whose
+/// first frame is not the expected `BindProof` (one over another
+/// connection's `ekm` or another transcript, the viewer's own MAC
+/// reflected, `BindOk` with no proof, anything else, or a proof that does
+/// not parse) has not proved itself; the `BindOk` that follows is never
+/// read. A refusal in the proof's place is the host's reason, and a host
+/// that closes is `Closed`. The expected proof binds.
+#[tokio::test]
+async fn a_host_that_does_not_prove_itself_is_refused_before_bind_ok() {
+    let viewer = Viewer {
+        id: SessionToken::new([81; 32]).session_id(),
+        token: SessionToken::new([81; 32]),
+        th_final: [!81; 32],
+        device: DeviceId::from_bytes([81; 32]),
+    };
+    let binding = direct_binding(&viewer, &EKM);
+    let token = viewer.token.bytes();
+    let th = &viewer.th_final;
+    let mut malformed = vec![0, 0, 0, 32, 0x04];
+    malformed.extend_from_slice(&[0x5a; 31]);
+    let not_proven: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "a proof over another ekm",
+            frame(&viewer.proof(&[0x34; 32])).await,
+        ),
+        (
+            "a proof over another transcript",
+            frame(&Msg::BindProof {
+                mac: bind_mac_direct(token, &[0; 32], &EKM, BindSide::Server),
+            })
+            .await,
+        ),
+        (
+            "the viewer's own MAC reflected",
+            frame(&Msg::BindProof {
+                mac: bind_mac_direct(token, th, &EKM, BindSide::Client),
+            })
+            .await,
+        ),
+        (
+            "the onion MAC",
+            frame(&Msg::BindProof {
+                mac: bind_mac(token, th),
+            })
+            .await,
+        ),
+        ("BindOk with no proof", frame(&bind_ok()).await),
+        ("a ping", frame(&Msg::Ping { nonce: 7 }).await),
+        ("a proof that does not parse", malformed),
+    ];
+    for (what, first) in not_proven {
+        let failed = bind_scripted(&binding, Some(first)).await.unwrap_err();
+        assert!(
+            matches!(failed, ViewerError::HostProof),
+            "{what}: {failed:?}"
+        );
+    }
+
+    let refused = frame(&Msg::BindRefused {
+        reason: reason::TRANSPORT,
+    })
+    .await;
+    let failed = bind_scripted(&binding, Some(refused)).await.unwrap_err();
+    assert!(
+        matches!(failed, ViewerError::Refused(r) if r == reason::TRANSPORT),
+        "{failed:?}"
+    );
+    let protocol = frame(&Msg::BindRefused {
+        reason: reason::PROTOCOL,
+    })
+    .await;
+    let failed = bind_scripted(&binding, Some(protocol)).await.unwrap_err();
+    assert!(matches!(failed, ViewerError::Version), "{failed:?}");
+    let failed = bind_scripted(&binding, None).await.unwrap_err();
+    assert!(matches!(failed, ViewerError::Closed), "{failed:?}");
+
+    let proven = bind_scripted(&binding, Some(frame(&viewer.proof(&EKM)).await))
+        .await
+        .unwrap();
+    assert_eq!(proven.bound().quality, APPLIED);
+
+    // The onion binding expects no proof: one is an unexpected frame there.
+    let failed = bind_scripted(&viewer.onion(), Some(frame(&viewer.proof(&EKM)).await))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(failed, ViewerError::Unexpected("BindProof")),
+        "{failed:?}"
+    );
+}
+
+/// The direct design §4: one bind wait covers the proof and `BindOk`; a
+/// proof that comes late leaves only what is left of it for `BindOk`.
+#[tokio::test(start_paused = true)]
+async fn one_bind_wait_covers_the_proof_and_bind_ok() {
+    let token = SessionToken::new([82; 32]);
+    let th_final = [!82; 32];
+    let binding = Binding::direct(&token, &th_final, &EKM);
+    let proof = Msg::BindProof {
+        mac: bind_mac_direct(token.bytes(), &th_final, &EKM, BindSide::Server),
+    };
+    let (client, mut host) = duplex(1 << 16);
+    tokio::spawn(async move {
+        read_msg(&mut host).await.unwrap();
+        tokio::time::sleep(WAIT * 6 / 10).await;
+        write_msg(&mut host, &proof).await.unwrap();
+        tokio::time::sleep(WAIT).await;
+        drop(host);
+    });
+    let started = tokio::time::Instant::now();
+    let failed = MediaViewer::bind(client, &binding, WAIT).await.unwrap_err();
+    assert!(
+        matches!(failed, ViewerError::Timeout(w) if w == WAIT),
+        "{failed:?}"
+    );
+    assert_eq!(started.elapsed(), WAIT);
+}
+
+/// The direct design §12.1 "refused before capture", through the viewer: a
+/// direct binding over another connection's `ekm`, the onion binding on a
+/// direct stream, and a `tor_only` session's direct binding are refused in
+/// the proof's place (`BAD_BIND`, `BAD_BIND`, `TRANSPORT`); the viewer
+/// reports the reason, the connection is closed with it, nothing opens and
+/// nothing is claimed. The right binding then binds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_direct_viewer_opens_nothing_on_the_host() {
+    let rig = direct_rig(TestBackend::default());
+    let viewer = start_direct(&rig.host, 83, TransportPolicy::Any);
+    let tor_only = start_direct(&rig.host, 84, TransportPolicy::TorOnly);
+    let cases = [
+        (
+            &viewer,
+            direct_binding(&viewer, &[0x34; 32]),
+            reason::BAD_BIND,
+        ),
+        (&viewer, viewer.onion(), reason::BAD_BIND),
+        (
+            &tor_only,
+            direct_binding(&tor_only, &EKM),
+            reason::TRANSPORT,
+        ),
+    ];
+    for (session, binding, code) in cases {
+        let conn = connect_direct(&rig.host, session, EKM, TransportKind::Direct);
+        let failed = MediaViewer::bind(conn.client, &binding, WAIT)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(failed, ViewerError::Refused(r) if r == code),
+            "{binding:?}: {failed:?}"
+        );
+        assert_eq!(conn.served.await.unwrap(), MediaOutcome::NotBound);
+        assert_eq!(*conn.closed_with.lock().unwrap(), Some(code));
+        assert_eq!(rig.sources(), 0, "{binding:?}: nothing opened");
+        assert_eq!(rig.host.route(&session.id), None);
+    }
+
+    let conn = connect_direct(&rig.host, &viewer, EKM, TransportKind::Direct);
+    let bound = MediaViewer::bind(conn.client, &direct_binding(&viewer, &EKM), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(rig.sources(), 1);
+    drop(bound);
+    conn.served.await.unwrap();
+}
+
+/// Revision 1 blocker 1 (the direct design §4, §12.1): the viewer's bind
+/// wait, never the 4 s punch window, covers the host's source open, so a
+/// 5 s open (a dialog the user takes time to answer) on the direct path
+/// still binds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_five_second_open_on_the_direct_path_still_binds() {
+    let rig = direct_rig(TestBackend {
+        open_for: Some(Duration::from_secs(5)),
+        ..TestBackend::default()
+    });
+    let viewer = start_direct(&rig.host, 85, TransportPolicy::Any);
+    let conn = connect_direct(&rig.host, &viewer, EKM, TransportKind::Direct);
+    let started = tokio::time::Instant::now();
+    let bound = MediaViewer::bind(conn.client, &direct_binding(&viewer, &EKM), WAIT)
+        .await
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(5));
+    assert_eq!(rig.host.route(&viewer.id), Some(TransportKind::Direct));
+    assert_eq!(rig.sources(), 1);
+    drop(bound);
+    conn.served.await.unwrap();
+}
+
+/// Three device-key seeds, lowest public key first: the lower key of a
+/// pair dials the direct connection, the higher accepts
+/// (`tornect_net::PunchRole::of`).
+fn seeds_by_key() -> [u8; 3] {
+    let mut seeds = [91, 92, 93];
+    seeds.sort_by_key(|seed| device_key(*seed).verifying_key().to_bytes());
+    seeds
+}
+
+fn device_key(seed: u8) -> Arc<DeviceIdentity> {
+    Arc::new(DeviceIdentity::from_seed(&[seed; 32]))
+}
+
+/// Both ends of a session's direct link on one in-memory LAN.
+struct Links {
+    viewer: DirectLink,
+    host: DirectLink,
+    _net: MemNet,
+}
+
+impl Links {
+    async fn close(self) {
+        self.viewer.close().await;
+        self.host.close().await;
+    }
+}
+
+/// The viewer's link with device key `viewer`, pinned to `host`, and the
+/// host's with key `host`, pinned to `pinned` (the viewer's, or another
+/// device's for a pin the host's TLS refuses), for the session `token`,
+/// on a LAN with 50 ms each way. Each side has the other's candidates.
+async fn links_on_a_lan(token: &[u8; 32], viewer: u8, host: u8, pinned: u8) -> Links {
+    let net = MemNet::new(1);
+    let lan = net.segment(LinkSpec {
+        latency: Duration::from_millis(50),
+        loss: 0.0,
+    });
+    let viewer_env: Arc<dyn NetEnv> =
+        Arc::new(net.machine(MachineSpec::on(lan, "192.168.1.10/24")));
+    let host_env: Arc<dyn NetEnv> = Arc::new(net.machine(MachineSpec::on(lan, "192.168.1.20/24")));
+    let params = |me, mine: u8, peer: u8| DirectParams {
+        me,
+        identity: device_key(mine),
+        peer_pk: device_key(peer).verifying_key().to_bytes(),
+        session_token: Zeroizing::new(*token),
+        direct_port: None,
+        scope: Scope::SameSite,
+    };
+    let (mut viewer_link, viewer_offered) =
+        DirectLink::start(params(TornectRole::Viewer, viewer, host), viewer_env)
+            .await
+            .expect("the viewer's link");
+    let (mut host_link, host_offered) =
+        DirectLink::start(params(TornectRole::Host, host, pinned), host_env)
+            .await
+            .expect("the host's link");
+    host_link.add_remote(viewer_offered, Scope::SameSite);
+    assert_eq!(viewer_link.next_local().await, LocalBatch::Done);
+    host_link.remote_done();
+    viewer_link.add_remote(host_offered, Scope::SameSite);
+    assert_eq!(host_link.next_local().await, LocalBatch::Done);
+    viewer_link.remote_done();
+    Links {
+        viewer: viewer_link,
+        host: host_link,
+        _net: net,
+    }
+}
+
+/// The host's side of a direct connection, as step A16 wires it: the
+/// viewer's stream, served with the pinned peer's device and the
+/// connection's own exporter output.
+fn serve_link(
+    host: &Arc<MediaHost>,
+    link: &tornect_net::Established,
+    viewer: &Viewer,
+    route: TransportKind,
+) -> JoinHandle<MediaOutcome> {
+    let (host, link) = (Arc::clone(host), link.clone());
+    let (session, token) = (viewer.id.clone(), *viewer.token.bytes());
+    tokio::spawn(async move {
+        let stream = link.accept_stream().await.expect("the media stream");
+        let peer = DeviceId::from_bytes(link.peer_key());
+        let ekm = link.binding_secret(&token).expect("the exporter");
+        host.serve_direct(stream, &session, peer, ekm, route).await
+    })
+}
+
+/// The bind over in-memory QUIC: both ends export the same secret, the
+/// host serves the link's `QuicStream` with the pinned peer's device, and
+/// the viewer binds after the proof. A bind that failed after a host byte
+/// would never fall back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_bind_over_a_quic_link_binds() {
+    let [viewer_key, _, host_key] = seeds_by_key();
+    let rig = direct_rig(TestBackend::default());
+    let device = device_key(viewer_key).id();
+    let viewer = start_direct_for(&rig.host, 86, TransportPolicy::Any, device);
+    let mut links = links_on_a_lan(viewer.token.bytes(), viewer_key, host_key, viewer_key).await;
+    let (v, h) = tokio::time::timeout(WAIT, async {
+        tokio::join!(links.viewer.established(), links.host.established())
+    })
+    .await
+    .expect("in time");
+    let (v, h) = (v.expect("the viewer's connection"), h.expect("the host's"));
+    assert_eq!(DeviceId::from_bytes(h.peer_key()), device);
+    let served = serve_link(&rig.host, &h, &viewer, TransportKind::Lan);
+
+    let ekm = v.binding_secret(viewer.token.bytes()).unwrap();
+    let stream = v.open_stream(1).await.unwrap();
+    let bound = MediaViewer::bind(stream, &direct_binding(&viewer, &ekm), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(rig.host.route(&viewer.id), Some(TransportKind::Lan));
+    assert!(v.stream_bytes_received() > 0);
+    assert_eq!(after_bind_close(&v), AfterBind::End);
+    drop(bound);
+    assert!(matches!(
+        tokio::time::timeout(WAIT, served).await.unwrap().unwrap(),
+        MediaOutcome::Served { .. }
+    ));
+    links.close().await;
+}
+
+/// A refusal over a QUIC link (the direct design §6.5) ends the media
+/// without a fallback: the viewer read `BindRefused{TRANSPORT}` (a host
+/// byte), and the host's close carries the reason, not a TLS alert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_over_a_quic_link_ends_without_fallback() {
+    let [viewer_key, _, host_key] = seeds_by_key();
+    let rig = direct_rig(TestBackend::default());
+    let device = device_key(viewer_key).id();
+    let viewer = start_direct_for(&rig.host, 87, TransportPolicy::TorOnly, device);
+    let mut links = links_on_a_lan(viewer.token.bytes(), viewer_key, host_key, viewer_key).await;
+    let (v, h) = tokio::time::timeout(WAIT, async {
+        tokio::join!(links.viewer.established(), links.host.established())
+    })
+    .await
+    .expect("in time");
+    let (v, h) = (v.expect("the viewer's connection"), h.expect("the host's"));
+    let served = serve_link(&rig.host, &h, &viewer, TransportKind::Lan);
+
+    let ekm = v.binding_secret(viewer.token.bytes()).unwrap();
+    let stream = v.open_stream(1).await.unwrap();
+    let failed = MediaViewer::bind(stream, &direct_binding(&viewer, &ekm), WAIT)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(failed, ViewerError::Refused(r) if r == reason::TRANSPORT),
+        "{failed:?}"
+    );
+    assert_eq!(
+        tokio::time::timeout(WAIT, served).await.unwrap().unwrap(),
+        MediaOutcome::NotBound
+    );
+    tokio::time::timeout(WAIT, v.closed())
+        .await
+        .expect("closed");
+    assert!(!v.closed_by_crypto());
+    assert!(v.stream_bytes_received() > 0);
+    assert_eq!(after_bind_close(&v), AfterBind::End);
+    assert_eq!(rig.sources(), 0);
+    links.close().await;
+}
+
+/// DIRECT-2's one exception (the direct design §6.5 "Pin refused by the
+/// host's TLS", §12.1): the host's link is pinned to another device, so its
+/// TLS refuses the viewer's key after the viewer's own handshake completed.
+/// The viewer's `Bind` never reaches the host: the bind fails with no host
+/// byte, `after_bind_close` says `Fallback`, nothing was claimed or opened,
+/// and the onion `Bind` is then accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crypto_close_before_any_host_byte_falls_back_to_the_onion_path() {
+    let [viewer_key, other_key, host_key] = seeds_by_key();
+    let rig = direct_rig(TestBackend::default());
+    let viewer = start_direct_for(
+        &rig.host,
+        88,
+        TransportPolicy::Any,
+        device_key(viewer_key).id(),
+    );
+    let mut links = links_on_a_lan(viewer.token.bytes(), viewer_key, host_key, other_key).await;
+    let v = tokio::time::timeout(WAIT, links.viewer.established())
+        .await
+        .expect("in time")
+        .expect("the viewer's handshake completes before the host checks its key");
+    let ekm = v.binding_secret(viewer.token.bytes()).unwrap();
+    let stream = v.open_stream(1).await.unwrap();
+    let failed = MediaViewer::bind(stream, &direct_binding(&viewer, &ekm), WAIT)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            failed,
+            ViewerError::Closed | ViewerError::Proto(ProtoError::Io(_))
+        ),
+        "{failed:?}"
+    );
+    assert!(v.closed_by_crypto());
+    assert_eq!(v.stream_bytes_received(), 0);
+    assert_eq!(after_bind_close(&v), AfterBind::Fallback);
+    assert!(!links.host.stats().established);
+    assert_eq!(rig.host.route(&viewer.id), None, "nothing claimed");
+    assert_eq!(rig.sources(), 0, "nothing opened");
+
+    let (client, served) = connect(&rig.host);
+    let onion = MediaViewer::bind(client, &viewer.onion(), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(rig.host.route(&viewer.id), Some(TransportKind::TorRelay));
+    assert_eq!(rig.sources(), 1);
+    drop(onion);
+    served.await.unwrap();
+    links.close().await;
 }

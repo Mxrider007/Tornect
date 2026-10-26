@@ -22,6 +22,7 @@
 //! | a `Bind` deadline; no unbound stream holds a circuit open for long | [`MediaLimits::bind_deadline`], [`MediaLimits::max_waiting`] |
 //! | a single-use `Bind`: one media stream per session | [`MediaHost`]'s registry |
 //! | on a direct connection, a `Bind` binds only the link's own session, from its pinned peer, under a MAC over the connection's exporter; the host proves itself with `BindProof` before capture opens; one claim per session across both paths, published; the signed transport policy decides which paths may claim (the direct design §6.6) | [`MediaHost::serve_direct`], [`MediaHost::claimed`] |
+//! | on a direct connection, the viewer reads nothing from the host, decodes no picture and sends no input before the host's `BindProof` checks in constant time; after its `Bind` it falls back to the onion path only when a TLS alert closed the connection before any host byte (the direct design §6.6, DIRECT-2) | [`Binding::direct`], [`MediaViewer::bind`], [`direct::after_bind_close`] |
 //! | view-only input is never decoded or injected | a view-only session has no injector |
 //! | an input rate cap | [`flow::TokenBucket`] |
 //! | bounded reads, and a bounded window of unacknowledged video | `tornect_proto::MAX_CLIENT_FRAME`, [`flow::AckWindow`] |
@@ -60,7 +61,7 @@ pub mod services;
 pub mod viewer;
 
 pub use backend::{DesktopBackend, Source, SystemBackend, TEST_SCREENS};
-pub use direct::DirectStream;
+pub use direct::{AfterBind, DirectStream, after_bind_close};
 pub use host::{
     CaptureChanged, CaptureStarted, CaptureState, MediaBackend, MediaEnd, MediaHost, MediaLimits,
     MediaObserver, MediaOutcome, MediaReport, NoObserver, SourceRequest,

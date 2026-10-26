@@ -163,6 +163,8 @@ struct TestBackend {
     /// Opening waits, as the desktop's dialog does, until its cancel turns
     /// `true` or 10 s.
     open_waits: bool,
+    /// Opening takes this long, as a slow dialog the user answers does.
+    open_for: Option<Duration>,
     /// An open ended because its cancel turned `true`.
     cancelled: AtomicBool,
     /// Holds the source's pictures back while set ([`Card::stalled`]).
@@ -208,6 +210,9 @@ impl MediaBackend for TestBackend {
         if self.open_waits && dialog(&cancel) {
             self.cancelled.store(true, Ordering::SeqCst);
             return Err(CaptureError::Unavailable("the session ended".into()));
+        }
+        if let Some(answered) = self.open_for {
+            std::thread::sleep(answered);
         }
         if !self.no_injector {
             *self.input.lock().unwrap() = Some(self.recorder.clone());
