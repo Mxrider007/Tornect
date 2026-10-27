@@ -11,8 +11,8 @@ use std::sync::Arc;
 use tornect_core::config::{self, BridgeMode, Network};
 use tornect_core::session_log::TransportKind;
 use tornect_core::{Config, DeviceIdentity};
-use tornect_net::{AddrClass, IfaceAddr, IfaceKind, NetEnv, RealNet, RouteSources};
-use tornect_session::{DirectSettings, INTERNET_DIRECT};
+use tornect_net::{AddrClass, CandidateKind, IfaceAddr, IfaceKind, NetEnv, RealNet, RouteSources};
+use tornect_session::{DirectSettings, INTERNET_DIRECT, Mine, PathEnd, ViewerDirect};
 use tornect_signal::consent::{TransportKnob, TransportPolicy};
 use tornect_signal::tor::Rung;
 
@@ -92,6 +92,29 @@ impl DirectWiring {
         self.device.verifying_key().to_bytes()
     }
 
+    /// What one viewer session's path phase runs with (design `direct`
+    /// §8.6 `DirectCtx`): the viewer's half for this device, the knobs'
+    /// direct settings read now, and this computer's policy now
+    /// ([`Mine::from_knob`], the bridge rule included), or `tor_only` for
+    /// `connect --tor-only`. Built after the Tor bootstrap, once per
+    /// session.
+    #[must_use]
+    pub fn ctx(&self, tor_only: bool) -> DirectCtx {
+        DirectCtx {
+            viewer: ViewerDirect::new(
+                Arc::clone(&self.device),
+                self.knobs.direct.clone(),
+                Arc::clone(&self.net),
+            ),
+            mine: if tor_only {
+                Mine::of(TransportPolicy::TorOnly)
+            } else {
+                Mine::from_knob(&self.knobs.transport)
+            },
+            device_pk: self.device_pk(),
+        }
+    }
+
     /// Parts for a test: the device of `seed`, the default knobs, and a
     /// network with no interface at all, so that nothing a test does goes
     /// direct unless it says so.
@@ -114,6 +137,27 @@ pub fn no_network() -> Arc<dyn NetEnv> {
     Arc::new(tornect_net::mem::MemNet::new(1).machine(tornect_net::mem::MachineSpec::default()))
 }
 
+/// One viewer session's direct path (design `direct` §8.6; the window's
+/// `on_route` callback joins at step A20 with the route it shows).
+pub struct DirectCtx {
+    /// The viewer's half of the path.
+    pub viewer: ViewerDirect,
+    /// This computer's policy for the session.
+    pub mine: Mine,
+    /// This device's public key: a host with the same key is this computer
+    /// (the decision's `same_key`).
+    pub device_pk: [u8; 32],
+}
+
+impl std::fmt::Debug for DirectCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectCtx")
+            .field("mine", &self.mine)
+            .field("viewer", &self.viewer.stats())
+            .finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for DirectWiring {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DirectWiring")
@@ -132,6 +176,25 @@ pub fn session_route_line(session_id: &str, route: TransportKind) -> String {
         TransportKind::TorRelay => "tor",
     };
     format!("SESSION ROUTE {session_id} {route}")
+}
+
+/// The viewer's `ROUTE` line (design `direct` §3.5): `ROUTE direct lan`,
+/// `ROUTE tor <reason>`, `ROUTE none`, `ROUTE none no-lan-path`, ...
+#[must_use]
+pub fn route_line(end: &PathEnd) -> String {
+    format!("ROUTE {}", end.route_words())
+}
+
+/// The viewer's `PATH` line (design `direct` §3.5): the kind of the host
+/// candidate that won (`-` on Tor) and the time from the accept to the open
+/// direct stream or to `TOR_FALLBACK`, in whole milliseconds.
+#[must_use]
+pub fn path_line(winner: Option<CandidateKind>, elapsed: std::time::Duration) -> String {
+    format!(
+        "PATH {} {} ms",
+        winner.map_or("-", CandidateKind::name),
+        elapsed.as_millis()
+    )
 }
 
 /// `doctor`'s `direct connections:` line (design `direct` §3.5), for the
@@ -237,6 +300,9 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
 
+    use tornect_net::Route;
+    use tornect_session::{FallbackWhy, TorWhy};
+
     use super::*;
 
     fn tor(bridges: BridgeMode, lines: usize) -> config::Tor {
@@ -323,6 +389,41 @@ mod tests {
         assert_eq!(
             session_route_line("ab12", TransportKind::TorRelay),
             "SESSION ROUTE ab12 tor"
+        );
+    }
+
+    /// Design `direct` §3.5: the `ROUTE` and `PATH` lines as the design
+    /// words them.
+    #[test]
+    fn the_route_and_path_lines_say_the_route_the_winner_and_the_time() {
+        let lan = Route {
+            same_site: true,
+            ipv6: false,
+        };
+        let lan6 = Route {
+            same_site: true,
+            ipv6: true,
+        };
+        for (end, line) in [
+            (PathEnd::Direct(lan), "ROUTE direct lan"),
+            (PathEnd::Direct(lan6), "ROUTE direct lan ipv6"),
+            (PathEnd::Tor(TorWhy::OldHost), "ROUTE tor old-host"),
+            (
+                PathEnd::Tor(TorWhy::Fallback(FallbackWhy::NoPath { heard: true })),
+                "ROUTE tor no-path-firewall",
+            ),
+            (PathEnd::NoMedia, "ROUTE none"),
+            (PathEnd::LanRefused, "ROUTE none no-lan-path"),
+        ] {
+            assert_eq!(route_line(&end), line);
+        }
+        assert_eq!(
+            path_line(Some(CandidateKind::Host), Duration::from_micros(412_900)),
+            "PATH host 412 ms"
+        );
+        assert_eq!(
+            path_line(None, Duration::from_millis(4000)),
+            "PATH - 4000 ms"
         );
     }
 

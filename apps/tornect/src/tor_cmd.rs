@@ -20,6 +20,7 @@ use tornect_core::keystore::{
 };
 use tornect_core::session_log::SessionMode;
 use tornect_core::{Config, DeviceIdentity, HostIdentity, Paths, TornectId};
+use tornect_net::CandidateKind;
 use tornect_proto::services::Welcome;
 use tornect_proto::{ALL_MONITORS, HostStats, ProtoError, QualityInfo, monitor_status};
 use tornect_session::services::{
@@ -27,8 +28,10 @@ use tornect_session::services::{
     ViewerOp, ViewerServicesEnd,
 };
 use tornect_session::{
-    Binding, DesktopBackend, FrameSink, MediaHost, MediaLimits, MediaViewer, Screens, ScreensNews,
-    Source, SystemBackend, ViewerChannels, ViewerEnd, ViewerError, ViewerRequest, ViewerStats,
+    AfterBind, Binding, Decision, DesktopBackend, DirectBindFailed, FallbackWhy, FrameSink,
+    MediaHost, MediaLimits, MediaViewer, PathChoice, PathEnd, QuicStream, Screens, ScreensNews,
+    Source, SystemBackend, TorWhy, ViewerChannels, ViewerEnd, ViewerError, ViewerRequest,
+    ViewerStats, decide,
 };
 use tornect_signal::framing::FrameError;
 use tornect_signal::fsm::client::{
@@ -36,7 +39,7 @@ use tornect_signal::fsm::client::{
     SessionEvent,
 };
 use tornect_signal::fsm::{HandshakeError, OsRandom, Randomness as _};
-use tornect_signal::messages::{bye, pair_reject, reject};
+use tornect_signal::messages::{bye, fallback, feats, pair_reject, reject};
 use tornect_signal::pairing::KnownHostStore;
 use tornect_signal::ping::NONCE_LEN;
 use tornect_signal::tor::Admission;
@@ -45,7 +48,7 @@ use tornect_signal::{
     SignalError, TorNode, install_crypto_provider, ping, shutdown_runtime,
 };
 
-use crate::direct::{DirectKnobs, DirectWiring};
+use crate::direct::{DirectCtx, DirectKnobs, DirectWiring};
 use crate::host::{CliMedia, ControlChannel, HostLock, HostWiring, Served};
 use crate::prompt::{CliPairingUi, Prompter};
 
@@ -67,8 +70,16 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 const SESSION_PING_EVERY: Duration = Duration::from_secs(10);
 
 /// How long `tornect connect` waits for the host to answer its media bind: the
-/// host's own first-picture deadline (10 s) plus a Tor round trip or two.
+/// host's own first-picture deadline (10 s) plus a Tor round trip or two. A
+/// direct bind waits as long, never only the punch window: the host's source
+/// can take a desktop dialog's time to open (design `direct` §4, revision 1
+/// blocker 1).
 const MEDIA_BIND_WAIT: Duration = Duration::from_secs(30);
+
+/// How long an onion media stream opened beside the path phase stays
+/// usable (design `direct` §4 `ONION_PREOPEN_MAX`): an older one is
+/// dropped and a fresh one opened.
+const ONION_PREOPEN_MAX: Duration = Duration::from_secs(8);
 
 /// When the host closes the media stream, how long `tornect connect` waits for
 /// the host's `BYE` on the signaling stream, so the end is reported as the
@@ -682,6 +693,9 @@ pub struct ConnectOpts {
     pub screen: Option<u8>,
     /// Connect without asking, on this device's unattended grant.
     pub unattended: Option<UnattendedOpts>,
+    /// This session's policy is `tor_only` (design `direct` §3.5): its media
+    /// is relayed through Tor whatever the settings say.
+    pub tor_only: bool,
 }
 
 /// `tornect admin <id> <action>`: one admin command on this device's grant at
@@ -979,6 +993,7 @@ pub fn connect(
     paths.ensure().context("creating Tornect directories")?;
     let store = FileSecretStore::open(paths.keys_dir()).context("opening keystore")?;
     let (device, _) = load_or_create_device_identity(&store)?;
+    let device = Arc::new(device);
     if opts.forget {
         let known = KnownHostStore::open(tornect_core::trusted::known_hosts_file(paths))
             .context("opening known-hosts.toml")?;
@@ -1000,21 +1015,25 @@ pub fn connect(
         Some(ua) => Some(prepare_unattended(paths, id, &device, &pins, ua)?),
         None => None,
     };
-    block_on(run_connect(paths, &cfg, id, &device, &pins, opts, prepared))
+    let direct = DirectWiring::real(device, DirectKnobs::new(&cfg));
+    block_on(run_connect(paths, &cfg, id, &direct, &pins, opts, prepared))
 }
 
 async fn run_connect(
     paths: &Paths,
     cfg: &Config,
     id: TornectId,
-    device: &DeviceIdentity,
+    direct: &DirectWiring,
     pins: &crate::history::Pins,
     opts: ConnectOpts,
     prepared: Option<Prepared>,
 ) -> anyhow::Result<()> {
     eprintln!("bootstrapping Tor (~30 s cold, a few seconds with a warm cache)...");
     let node = start_tor(paths, cfg).await?;
-    let result = connect_session(&node, cfg, paths, id, device, pins, opts, prepared).await;
+    // The bridge rule from the way Tor went in (decision M1-86), before the
+    // session decides its path.
+    direct.knobs.bootstrapped(node.rung(), &cfg.tor);
+    let result = connect_session(&node, cfg, paths, id, direct, pins, opts, prepared).await;
     node.shutdown().await;
     result
 }
@@ -1025,7 +1044,7 @@ async fn connect_session(
     cfg: &Config,
     paths: &Paths,
     id: TornectId,
-    device: &DeviceIdentity,
+    direct: &DirectWiring,
     pins: &crate::history::Pins,
     opts: ConnectOpts,
     prepared: Option<Prepared>,
@@ -1053,7 +1072,7 @@ async fn connect_session(
     eprintln!("connected in {:.1} s", started.elapsed().as_secs_f64());
 
     let pairing = !pins.known();
-    let ccfg = ClientConfig::new(id, cfg.general.device_name.clone());
+    let ccfg = viewer_config(id, cfg.general.device_name.clone());
     let deps = ClientDeps {
         known_hosts: pins.store(),
         ui: Arc::new(CliPairingUi::new(Prompter::stdin())),
@@ -1082,7 +1101,7 @@ async fn connect_session(
             eprintln!("asking for a session; the host's user has to accept it (up to 110 s)...");
         }
     }
-    let outcome = client::connect(stream, &ccfg, device, &deps, intent).await;
+    let outcome = client::connect(stream, &ccfg, &direct.device, &deps, intent).await;
     // A pin the handshake made is kept however it ended.
     if let Err(e) = pins.settle() {
         eprintln!("the pairing could not be saved: {e:#}");
@@ -1179,13 +1198,10 @@ async fn connect_session(
     if let Err(e) = pins.visited() {
         tracing::warn!(error = %format!("{e:#}"), "the visit was not recorded");
     }
-    // No direct path yet (design `direct`, step A19 decides it): the Tor
-    // circuit is the transport, and saying so stops the host's 15 s orphan
-    // timer (§B.8.4.5). `TOR_FALLBACK{}`, M1's bytes, without a reason.
-    session
-        .send_tor_fallback(None)
-        .await
-        .map_err(explain_handshake)?;
+    // The path phase starts at once after the accept (design `direct` §4):
+    // `watch` runs it for the picture, `no_media` without one. Either answer
+    // stops the host's 15 s orphan timer (§B.8.4.5).
+    let direct = direct.ctx(opts.tor_only);
     eprintln!(
         "the session stays alive with a ping every {} s; Ctrl-C ends it",
         SESSION_PING_EVERY.as_secs()
@@ -1208,38 +1224,68 @@ async fn connect_session(
             &isolation,
             &mut session,
             &interrupts.pressed,
+            &direct,
             watching,
         )
         .await?
     } else {
-        let stop = pressed(interrupts.pressed.clone());
-        keep_alive(&mut session, opts.pings, SESSION_PING_EVERY, async {
-            stop.await;
-            Ok(())
-        })
-        .await?
-    };
-    match end {
-        End::You => {
-            if let Err(e) = session.bye(bye::USER).await {
-                tracing::debug!(error = %e, "sending BYE");
+        match no_media(&mut session, &direct, &interrupts.pressed).await {
+            Ok(()) => {
+                println!("{}", crate::direct::route_line(&PathEnd::NoMedia));
+                let stop = pressed(interrupts.pressed.clone());
+                keep_alive(&mut session, opts.pings, SESSION_PING_EVERY, async {
+                    stop.await;
+                    Ok(())
+                })
+                .await?
             }
-            println!("SESSION ENDED (by you)");
+            Err(end) => end,
         }
+    };
+    if let Some(code) = end.bye()
+        && let Err(e) = session.bye(code).await
+    {
+        tracing::debug!(error = %e, "sending BYE");
+    }
+    match end {
+        End::You => println!("SESSION ENDED (by you)"),
         End::Host(reason) => println!("SESSION ENDED by the host ({})", bye::name(reason)),
         End::Lost(e) => {
             println!("SESSION ENDED (connection lost)");
             return Err(explain_handshake(e));
         }
         End::NoPicture(e) => {
-            if let Err(e) = session.bye(bye::USER).await {
-                tracing::debug!(error = %e, "sending BYE");
-            }
             println!("SESSION ENDED (no picture)");
             return Err(e);
         }
+        End::Refused(code) => {
+            println!("SESSION ENDED ({})", bye::name(code));
+            anyhow::bail!("{}", refused_why(code));
+        }
     }
     Ok(())
+}
+
+/// What this side says when it ended the session with `BYE{code}` before
+/// any media: only `NO_LAN_PATH` for now (decision M1-85).
+pub(crate) fn refused_why(code: u16) -> String {
+    match code {
+        bye::NO_LAN_PATH => "no direct connection on this local network, and network.lan_only \
+                             relays nothing through Tor"
+            .to_owned(),
+        other => format!("the session was ended ({})", bye::name(other)),
+    }
+}
+
+/// What a viewer announces in `HELLO` for a session: `dir1`, the direct
+/// path's exchange (design `direct` §8.2), so that the host takes part in
+/// it. A viewer that left it out would still try the path against a host
+/// that ignores its candidates, and fall back after the whole punch window
+/// in every session.
+pub(crate) fn viewer_config(host: TornectId, name: String) -> ClientConfig {
+    let mut cfg = ClientConfig::new(host, name);
+    cfg.feats.push(feats::DIR1.to_owned());
+    cfg
 }
 
 /// `connect --screen`'s request, already waiting in a channel of its own:
@@ -1304,6 +1350,23 @@ pub(crate) enum End {
     Lost(HandshakeError),
     /// The media stream could not be opened or bound, or it broke.
     NoPicture(anyhow::Error),
+    /// The path phase ended the session: this side owes the host
+    /// `BYE{code}` (`NO_LAN_PATH`: a `lan_only` session with no same-site
+    /// path, decision M1-85).
+    Refused(u16),
+}
+
+impl End {
+    /// The `BYE` this side owes the host for this end: `USER` when this
+    /// side ended it or its picture failed, the path phase's own code when
+    /// that ended it, none when the host ended it or it broke.
+    pub(crate) fn bye(&self) -> Option<u16> {
+        match self {
+            Self::You | Self::NoPicture(_) => Some(bye::USER),
+            Self::Refused(code) => Some(*code),
+            Self::Host(_) | Self::Lost(_) => None,
+        }
+    }
 }
 
 /// How [`watch()`] receives the screen.
@@ -1440,53 +1503,381 @@ where
     report(ServicesNews::Ended(end));
 }
 
-/// Open the session's media stream beside the signaling stream and receive
-/// the screen, while the signaling stream keeps the session alive. Whichever
-/// side ends first ends the other. `interrupted` turning `true` is the user's
-/// own end (Ctrl-C, or the window's Stop). `options` say what else goes
-/// where.
+/// The session's bound media stream, on the path the path phase chose.
+pub(crate) enum MediaPath<O> {
+    /// The direct connection's stream.
+    Direct(MediaViewer<QuicStream>),
+    /// The onion media stream (`MEDIA_PORT`).
+    Onion(MediaViewer<O>),
+}
+
+impl<O> MediaPath<O>
+where
+    O: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    /// What the host answered the bind with.
+    fn bound(&self) -> tornect_session::BoundStream {
+        match self {
+            Self::Direct(viewer) => *viewer.bound(),
+            Self::Onion(viewer) => *viewer.bound(),
+        }
+    }
+}
+
+/// A session's media, bound ([`bind_media`]).
+pub(crate) struct BoundMedia<O> {
+    /// The bound stream.
+    pub media: MediaPath<O>,
+    /// How the path phase ended (the `ROUTE` line, the window's route).
+    pub end: PathEnd,
+    /// The kind of the host candidate the direct connection runs to; `None`
+    /// on Tor (the `PATH` line).
+    pub winner: Option<CandidateKind>,
+    /// From the accept to the open direct stream or to `TOR_FALLBACK` (the
+    /// `PATH` line).
+    pub elapsed: Duration,
+    /// Whether the services stream may go over the onion service: not for a
+    /// `lan_only` session, which the host refuses it (decision M1-85). The
+    /// direct services stream is step B10's.
+    pub onion_services: bool,
+}
+
+impl<O> std::fmt::Debug for BoundMedia<O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundMedia")
+            .field(
+                "media",
+                &match self.media {
+                    MediaPath::Direct(_) => "direct",
+                    MediaPath::Onion(_) => "onion",
+                },
+            )
+            .field("end", &self.end)
+            .field("winner", &self.winner)
+            .field("elapsed", &self.elapsed)
+            .field("onion_services", &self.onion_services)
+            .finish()
+    }
+}
+
+/// The onion media stream opened beside the path phase (design `direct`
+/// §4, DIRECT-2), only when the path is tried with a Tor fallback: the
+/// fallback then finds its stream open, one round trip on the session's
+/// circuit sooner.
+enum Preopen<F: Future> {
+    /// Nothing opened beside the path phase.
+    None,
+    /// Opening.
+    Opening(std::pin::Pin<Box<F>>),
+    /// Opened (or failed) at that instant.
+    Opened(F::Output, tokio::time::Instant),
+}
+
+impl<O, F> Preopen<F>
+where
+    F: Future<Output = anyhow::Result<O>>,
+{
+    /// `work`, while the open goes on beside it; the open's result is kept.
+    async fn beside<W: Future>(&mut self, work: W) -> W::Output {
+        let mut work = pin!(work);
+        loop {
+            let Self::Opening(opening) = self else {
+                return work.await;
+            };
+            let opened = tokio::select! {
+                biased;
+                out = &mut work => return out,
+                opened = opening.as_mut() => opened,
+            };
+            *self = Self::Opened(opened, tokio::time::Instant::now());
+        }
+    }
+
+    /// The onion stream for the Tor path: the one opened beside the path
+    /// phase while it is younger than [`ONION_PREOPEN_MAX`] (still opening
+    /// counts), else a fresh one from `fresh`, which is also tried once
+    /// when the early open failed.
+    async fn take(self, fresh: impl FnOnce() -> F) -> anyhow::Result<O> {
+        let early = match self {
+            Self::Opening(opening) => opening.await,
+            Self::Opened(opened, at) if at.elapsed() < ONION_PREOPEN_MAX => opened,
+            Self::Opened(..) | Self::None => return fresh().await,
+        };
+        match early {
+            Ok(stream) => Ok(stream),
+            Err(e) => {
+                tracing::debug!(error = %format!("{e:#}"), "the early onion media stream failed");
+                fresh().await
+            }
+        }
+    }
+}
+
+/// The session's end when its path phase ended it; the path otherwise.
+fn into_path(choice: PathChoice) -> Result<PathChoice, End> {
+    match choice {
+        PathChoice::End(code) => Err(End::Refused(code)),
+        PathChoice::HostEnded(SessionEvent::Bye { reason, .. }) => Err(End::Host(reason)),
+        PathChoice::HostEnded(SessionEvent::Error { code, detail }) => {
+            Err(End::Lost(HandshakeError::PeerError { code, detail }))
+        }
+        PathChoice::HostEnded(_) => Err(End::Lost(HandshakeError::Closed)),
+        PathChoice::Broken(e) => Err(End::Lost(e)),
+        PathChoice::Interrupted => Err(End::You),
+        path @ (PathChoice::Direct(_) | PathChoice::Tor { .. } | PathChoice::NoMedia) => Ok(path),
+    }
+}
+
+/// The session's path phase and its media bind (design `direct` §4, §8.6),
+/// called at once after the accept: [`ViewerDirect::choose_path`] with
+/// `direct`'s policy, the onion media stream opened beside it
+/// (`open_onion`, only for a try that may fall back), then the bind on the
+/// path chosen, each wait raced against `interrupted`:
+///
+/// - direct: the onion stream is dropped and the `Bind` written on the
+///   direct stream, waiting up to [`MEDIA_BIND_WAIT`] (never the punch
+///   window); a connection closed by a TLS alert before any host byte
+///   ([`AfterBind::Fallback`]) sends `TOR_FALLBACK{QUIC}` and binds a
+///   fresh onion stream, unless the session is `lan_only`, which ends it
+///   (`BYE{NO_LAN_PATH}`); any other failure is the session's;
+/// - Tor: the onion stream opened beside the path phase (or a fresh one)
+///   is bound with `onion`, the session's onion binding;
+/// - the path phase ended the session ([`End::Refused`] when this side
+///   owes the host `BYE{NO_LAN_PATH}`), or the host ended it, or it broke.
+///
+/// [`ViewerDirect::choose_path`]: tornect_session::ViewerDirect::choose_path
+pub(crate) async fn bind_media<S, O, F, Fut>(
+    session: &mut ClientSession<S>,
+    direct: &DirectCtx,
+    onion: &Binding,
+    open_onion: F,
+    interrupted: &watch::Receiver<bool>,
+) -> Result<BoundMedia<O>, End>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    O: AsyncRead + AsyncWrite + Unpin + Send,
+    F: Fn() -> Fut,
+    Fut: Future<Output = anyhow::Result<O>>,
+{
+    let accepted = tokio::time::Instant::now();
+    // `choose_path` decides the same way from the same facts; the decision
+    // is read here only for the onion stream opened beside it.
+    let decision = decide(
+        session.transport_policy(),
+        direct.mine,
+        true,
+        session.host_has(feats::DIR1),
+        session.host_device_pk() == direct.device_pk,
+    );
+    let lan_only = matches!(decision, Decision::Try { lan_only: true, .. });
+    let mut preopen = match decision {
+        Decision::Try {
+            lan_only: false, ..
+        } => Preopen::Opening(Box::pin(open_onion())),
+        _ => Preopen::None,
+    };
+    let stop = pressed(interrupted.clone());
+    let choice = preopen
+        .beside(direct.viewer.choose_path(session, direct.mine, true, stop))
+        .await;
+    let (why, elapsed) = match into_path(choice)? {
+        PathChoice::Direct(media) => {
+            preopen = Preopen::None;
+            let (route, winner, elapsed) = (media.route, media.winner, media.elapsed);
+            match unless_interrupted(media.bind(MEDIA_BIND_WAIT), interrupted).await {
+                None => return Err(End::You),
+                Some(Ok(viewer)) => {
+                    return Ok(BoundMedia {
+                        media: MediaPath::Direct(viewer),
+                        end: PathEnd::Direct(route),
+                        winner: Some(winner),
+                        elapsed,
+                        onion_services: !lan_only,
+                    });
+                }
+                // A `lan_only` session never falls back: it ends as one
+                // with no same-site path does (decision M1-85).
+                Some(Err(DirectBindFailed {
+                    error,
+                    after: AfterBind::Fallback,
+                })) if lan_only => {
+                    tracing::info!(
+                        error = %error,
+                        "the direct connection failed before its bind; lan_only ends the session"
+                    );
+                    return Err(End::Refused(bye::NO_LAN_PATH));
+                }
+                Some(Err(DirectBindFailed {
+                    error,
+                    after: AfterBind::Fallback,
+                })) => {
+                    // The words only: no address, no port.
+                    tracing::info!(
+                        error = %error,
+                        "the direct connection failed before its bind; media goes through Tor"
+                    );
+                    let fell_back = session.send_tor_fallback(Some(fallback::QUIC));
+                    match unless_interrupted(fell_back, interrupted).await {
+                        None => return Err(End::You),
+                        Some(Err(e)) => return Err(End::Lost(e)),
+                        Some(Ok(())) => {}
+                    }
+                    (TorWhy::Fallback(FallbackWhy::Quic), accepted.elapsed())
+                }
+                Some(Err(DirectBindFailed {
+                    error,
+                    after: AfterBind::End,
+                })) => return Err(End::NoPicture(bind_failed(error))),
+            }
+        }
+        PathChoice::Tor { why, elapsed } => (why, elapsed),
+        // `decide`'s first rule: a session with media is never `NoMedia`.
+        _ => {
+            return Err(End::NoPicture(anyhow::anyhow!(
+                "the path phase chose no media for a session with media"
+            )));
+        }
+    };
+    let opened = async {
+        let stream = preopen.take(&open_onion).await?;
+        MediaViewer::bind(stream, onion, MEDIA_BIND_WAIT)
+            .await
+            .map_err(bind_failed)
+    };
+    match unless_interrupted(opened, interrupted).await {
+        None => Err(End::You),
+        Some(Ok(viewer)) => Ok(BoundMedia {
+            media: MediaPath::Onion(viewer),
+            end: PathEnd::Tor(why),
+            winner: None,
+            elapsed,
+            onion_services: true,
+        }),
+        Some(Err(e)) => Err(End::NoPicture(e)),
+    }
+}
+
+/// The path phase of a session without media (`connect --no-video`, design
+/// `direct` §3.5): `TOR_FALLBACK{NO_MEDIA}`, with no network interface
+/// read; the session's end when the host ended it, it broke, or
+/// `interrupted` came first.
+pub(crate) async fn no_media<S>(
+    session: &mut ClientSession<S>,
+    direct: &DirectCtx,
+    interrupted: &watch::Receiver<bool>,
+) -> Result<(), End>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let stop = pressed(interrupted.clone());
+    // `decide`'s first rule: a session without media is never tried, so
+    // no other path comes back (one would be dropped, its link shut).
+    into_path(
+        direct
+            .viewer
+            .choose_path(session, direct.mine, false, stop)
+            .await,
+    )
+    .map(drop)
+}
+
+/// The line `watch` prints when the session ended before its media was
+/// bound.
+fn unbound_line(end: &End) -> String {
+    match end {
+        End::You => "MEDIA ENDED (by you, before the first picture)".to_owned(),
+        End::NoPicture(e) => format!("MEDIA FAILED: {e:#}"),
+        End::Refused(bye::NO_LAN_PATH) => crate::direct::route_line(&PathEnd::LanRefused),
+        End::Refused(_) => crate::direct::route_line(&PathEnd::NoMedia),
+        End::Host(_) | End::Lost(_) => {
+            "MEDIA ENDED (the session ended before the first picture)".to_owned()
+        }
+    }
+}
+
+/// Choose the session's media path and bind it ([`bind_media`]: the direct
+/// path, else the onion media stream beside the signaling stream), then
+/// receive the screen while the signaling stream keeps the session alive.
+/// Whichever side ends first ends the other. `interrupted` turning `true` is
+/// the user's own end (Ctrl-C, or the window's Stop). `options` say what
+/// else goes where.
+#[allow(clippy::too_many_arguments)] // the session's context, one argument each
 pub(crate) async fn watch<S>(
     node: &TorNode,
     id: &TornectId,
     isolation: &Isolation,
     session: &mut ClientSession<S>,
     interrupted: &watch::Receiver<bool>,
+    direct: &DirectCtx,
     options: WatchOptions<'_>,
 ) -> anyhow::Result<End>
 where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let binding =
+        Binding::new(session.session_token(), &session.th()).with_quality(options.quality);
+    let open_onion = || async {
+        node.connect_on(id, MEDIA_PORT, isolation)
+            .await
+            .map_err(explain)
+    };
+    let bound = match bind_media(session, direct, &binding, open_onion, interrupted).await {
+        Ok(bound) => bound,
+        Err(end) => {
+            println!("{}", unbound_line(&end));
+            return Ok(end);
+        }
+    };
+    println!("{}", bound_line(&bound.media.bound()));
+    println!("{}", crate::direct::route_line(&bound.end));
+    println!("{}", crate::direct::path_line(bound.winner, bound.elapsed));
+    let services = Services {
+        node,
+        id,
+        isolation,
+        onion: bound.onion_services,
+    };
+    match bound.media {
+        MediaPath::Direct(viewer) => {
+            watch_bound(viewer, session, interrupted, services, options).await
+        }
+        MediaPath::Onion(viewer) => {
+            watch_bound(viewer, session, interrupted, services, options).await
+        }
+    }
+}
+
+/// Where a session's services stream opens.
+struct Services<'a> {
+    node: &'a TorNode,
+    id: &'a TornectId,
+    isolation: &'a Isolation,
+    /// Over the onion service (on the session's circuit); `false`: not at
+    /// all (a `lan_only` session's, until the direct services stream).
+    onion: bool,
+}
+
+/// Receive the screen on the bound `viewer` while `session` keeps the
+/// session alive, the services stream beside it.
+async fn watch_bound<M, S>(
+    viewer: MediaViewer<M>,
+    session: &mut ClientSession<S>,
+    interrupted: &watch::Receiver<bool>,
+    at: Services<'_>,
+    options: WatchOptions<'_>,
+) -> anyhow::Result<End>
+where
+    M: AsyncRead + AsyncWrite + Unpin + Send,
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let WatchOptions {
         pings,
         channels,
         forward,
-        quality,
+        quality: _,
         quality_rx,
         services,
     } = options;
-    let binding = Binding::new(session.session_token(), &session.th()).with_quality(quality);
-    let opened = async {
-        let stream = node
-            .connect_on(id, MEDIA_PORT, isolation)
-            .await
-            .map_err(explain)?;
-        MediaViewer::bind(stream, &binding, MEDIA_BIND_WAIT)
-            .await
-            .map_err(bind_failed)
-    };
-    let viewer = match unless_interrupted(opened, interrupted).await {
-        None => {
-            println!("MEDIA ENDED (by you, before the first picture)");
-            return Ok(End::You);
-        }
-        Some(Ok(viewer)) => viewer,
-        Some(Err(e)) => {
-            println!("MEDIA FAILED: {e:#}");
-            return Ok(End::NoPicture(e));
-        }
-    };
-    let bound = *viewer.bound();
-    println!("{}", bound_line(&bound));
     let viewer = match quality_rx {
         Some(picks) => viewer.with_quality(picks),
         None => viewer,
@@ -1513,11 +1904,15 @@ where
         viewed
     };
     let services = async {
-        if let Some(start) = services {
-            let stop = async {
-                let _ = stopped.await;
-            };
-            run_services(node, id, isolation, start, stop).await;
+        match services {
+            Some(start) if at.onion => {
+                let stop = async {
+                    let _ = stopped.await;
+                };
+                run_services(at.node, at.id, at.isolation, start, stop).await;
+            }
+            Some(start) => (start.report)(ServicesNews::NotOpened(None)),
+            None => {}
         }
     };
     let ((viewed, end), ()) = tokio::join!(viewing, services);
@@ -2015,8 +2410,9 @@ impl FrameSink for CliPictures<'_> {
 ///
 /// Pings run to a deadline that frames from the host do not move, so a host
 /// that keeps sending cannot keep `--pings N` from ending (SLICE-B2 B2-8):
-/// its M2 frames are taken as they come and the timer stays where it was,
-/// and a host `PING` is answered without moving it either (SLICE-D D2).
+/// its path frames, late once the path phase has chosen, are taken as they
+/// come and ignored, the timer staying where it was, and a host `PING` is
+/// answered without moving it either (SLICE-D D2).
 ///
 /// Between pings it waits on the stream, not on the timer alone, so a host
 /// `BYE` is reported the moment it arrives. Over Tor the host's circuit is
@@ -2076,7 +2472,10 @@ where
                 Ok(Some(SessionEvent::Error { code, detail })) => {
                     break End::Lost(HandshakeError::PeerError { code, detail });
                 }
-                // The M2 frames: nothing uses them before M2, and they do not
+                // The path frames (`CANDIDATES`, `CANDIDATES_DONE`,
+                // `TOR_FALLBACK`), late once the path phase has chosen
+                // (design `direct` §4): the path is fixed for the session,
+                // so they are neither a fault nor acted on, and they do not
                 // move the next ping.
                 Ok(Some(_)) => {}
                 Err(e @ HandshakeError::Violation { .. }) => {
@@ -2245,11 +2644,14 @@ pub(crate) fn explain_handshake(err: HandshakeError) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::task::{Context, Poll};
 
     use tokio::io::{DuplexStream, ReadBuf, duplex};
+    use tornect_core::session_log::TransportKind;
     use tornect_core::trusted::{KnownHosts, TrustedDevices};
+    use tornect_net::mem::{CountingEnv, LinkSpec, MachineSpec, MemHost, MemNet};
+    use tornect_session::MediaOutcome;
     use tornect_signal::envelope::{Envelope, Kind, codes};
     use tornect_signal::framing::{HEADER_LEN, read_frame};
     use tornect_signal::fsm::client::ScriptedClientUi;
@@ -3945,5 +4347,623 @@ mod tests {
         let never = std::future::pending::<Result<DuplexStream, ServicesBindError>>();
         services_over(never, start, async {}).await;
         assert!(news.lock().unwrap().is_empty());
+    }
+
+    // Step A19 of design `direct`: the viewer's path phase in the app.
+
+    /// The viewer's device in the sessions below.
+    fn viewer_device() -> DeviceIdentity {
+        DeviceIdentity::from_seed(&[0x22; 32])
+    }
+
+    /// A viewer's path context: the device of `seed`, `cfg`'s knobs, the
+    /// machine `net`, and `--tor-only` or not.
+    fn viewer_ctx(
+        cfg: &Config,
+        net: Arc<dyn tornect_net::NetEnv>,
+        seed: u8,
+        tor_only: bool,
+    ) -> DirectCtx {
+        DirectWiring {
+            device: Arc::new(DeviceIdentity::from_seed(&[seed; 32])),
+            knobs: DirectKnobs::new(cfg),
+            net,
+        }
+        .ctx(tor_only)
+    }
+
+    /// One LAN segment: the viewer's machine at `.10` and the host's at
+    /// `.20`.
+    fn lan_pair(seed: u64) -> (MemHost, Arc<dyn tornect_net::NetEnv>) {
+        let net = MemNet::new(seed);
+        let lan = net.segment(LinkSpec::LAN);
+        let viewer = net.machine(MachineSpec::on(lan, "192.168.1.10/24"));
+        let host = net.machine(MachineSpec::on(lan, "192.168.1.20/24"));
+        (viewer, Arc::new(host))
+    }
+
+    /// A session whose host is played by hand and signed `host_feats` and
+    /// the transport policy `policy` ([`harness::raw_session_with`]): the
+    /// session, its write switch and the host's end of the stream.
+    ///
+    /// [`harness::raw_session_with`]: tornect_signal::fsm::harness::raw_session_with
+    async fn raw_direct(
+        host_feats: &[&str],
+        policy: u8,
+    ) -> (ClientSession<Freezable>, Arc<AtomicBool>, DuplexStream) {
+        let (client_end, host_end) = duplex(64 * 1024);
+        let frozen = Arc::new(AtomicBool::new(false));
+        let stream = Freezable {
+            inner: client_end,
+            frozen: Arc::clone(&frozen),
+        };
+        let (session, host) =
+            tornect_signal::fsm::harness::raw_session_with(stream, host_end, host_feats, policy)
+                .await;
+        (session, frozen, host.into_stream())
+    }
+
+    /// An onion opener that counts its calls and never opens.
+    fn never_opens(
+        opens: &Arc<AtomicUsize>,
+    ) -> impl Fn() -> std::future::Pending<anyhow::Result<DuplexStream>> {
+        let opens = Arc::clone(opens);
+        move || {
+            opens.fetch_add(1, Ordering::SeqCst);
+            std::future::pending()
+        }
+    }
+
+    type Opening = std::pin::Pin<Box<dyn Future<Output = anyhow::Result<DuplexStream>> + Send>>;
+
+    /// The onion media streams a test opened, and how the host's media
+    /// port served each.
+    #[derive(Clone, Default)]
+    struct OnionLog {
+        opens: Arc<AtomicUsize>,
+        outcomes: Arc<std::sync::Mutex<Vec<MediaOutcome>>>,
+    }
+
+    impl OnionLog {
+        /// The outcomes, once there are `n` of them (5 s at most).
+        async fn outcomes(&self, n: usize) -> Vec<MediaOutcome> {
+            for _ in 0..500 {
+                if self.outcomes.lock().unwrap().len() >= n {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            self.outcomes.lock().unwrap().clone()
+        }
+    }
+
+    /// An onion opener whose streams `media` serves as `tornect host`'s
+    /// `MEDIA_PORT` listener does ([`MediaHost::serve`]), logged in `log`.
+    fn onion_to(media: &Arc<MediaHost>, log: &OnionLog) -> impl Fn() -> Opening + use<> {
+        let (media, log) = (Arc::clone(media), log.clone());
+        move || {
+            log.opens.fetch_add(1, Ordering::SeqCst);
+            let (media, outcomes) = (Arc::clone(&media), Arc::clone(&log.outcomes));
+            Box::pin(async move {
+                let (viewer_end, host_end) = duplex(1 << 20);
+                tokio::spawn(async move {
+                    let outcome = media.serve(host_end).await;
+                    outcomes.lock().unwrap().push(outcome);
+                });
+                Ok(viewer_end)
+            })
+        }
+    }
+
+    /// The test card, served as `tornect host --capture test-card` serves it.
+    fn test_card() -> Arc<MediaHost> {
+        Arc::new(MediaHost::new(
+            Arc::new(SystemBackend::new(Source::TestCard)),
+            Arc::new(tornect_session::NoObserver),
+            MediaLimits::default(),
+        ))
+    }
+
+    /// A host wired as `tornect host` wires it ([`crate::host::wire`]: the
+    /// real FSM, its `DirectHost` with the knobs of `cfg`, the media host
+    /// `media`) on the machine `net`, and the session the viewer
+    /// ([`viewer_device`]) opened with it over a pipe, announcing what
+    /// [`viewer_config`] announces.
+    struct Rig {
+        _tmp: tempfile::TempDir,
+        _wiring: HostWiring,
+        session: ClientSession<DuplexStream>,
+    }
+
+    async fn rig(cfg: &Config, net: Arc<dyn tornect_net::NetEnv>, media: Arc<MediaHost>) -> Rig {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path());
+        paths.ensure().unwrap();
+        let identity = Arc::new(HostIdentity::from_seed(&[0x11; 32]));
+        let consent = Arc::new(ScriptedConsent::new());
+        consent.push_pairing(PairScript::Decide(PairDecision::Accept { label: None }));
+        consent.push_session(SessionScript::Decide(SessionDecision::AllowOnce));
+        let direct = DirectWiring {
+            device: Arc::new(DeviceIdentity::from_seed(&[0x44; 32])),
+            knobs: DirectKnobs::new(cfg),
+            net,
+        };
+        let wiring = crate::host::wire(
+            &paths,
+            cfg,
+            Arc::clone(&identity),
+            direct,
+            consent,
+            media,
+            ControlChannel::default(),
+        )
+        .unwrap();
+        let (client_end, host_end) = duplex(64 * 1024);
+        let (host_cfg, deps) = (wiring.cfg.clone(), wiring.deps.clone());
+        tokio::spawn(async move {
+            crate::host::serve_signaling(host_end, &host_cfg, &deps, |_| {}).await
+        });
+        let known = Arc::new(KnownHostStore::with(
+            tmp.path().join("viewer-known-hosts.toml"),
+            KnownHosts::default(),
+        ));
+        let mut client_deps = ClientDeps::headless(known);
+        client_deps.ui = Arc::new(ScriptedClientUi::new(true));
+        let ccfg = viewer_config(identity.id(), "Laptop".to_owned());
+        let session = match client::connect(
+            client_end,
+            &ccfg,
+            &viewer_device(),
+            &client_deps,
+            Intent::Session,
+        )
+        .await
+        .unwrap()
+        {
+            ClientOutcome::Session(session) => *session,
+            ClientOutcome::Paired { .. } => panic!("expected a session"),
+        };
+        Rig {
+            _tmp: tmp,
+            _wiring: wiring,
+            session,
+        }
+    }
+
+    /// Design `direct` §8.2 and the step A19 caller obligation (c): a
+    /// viewer announces `dir1` in its `HELLO`, the one token the host's
+    /// direct half waits for (the sessions below show the host taking part
+    /// because of it).
+    #[test]
+    fn a_viewer_announces_the_direct_exchange() {
+        let id = HostIdentity::from_seed(&[0x11; 32]).id();
+        let cfg = viewer_config(id, "Laptop".to_owned());
+        assert_eq!(cfg.feats, vec![feats::DIR1.to_owned()]);
+        assert_eq!(cfg.name, "Laptop");
+    }
+
+    /// Design `direct` §4 and §3.5 through the caller, with the host wired
+    /// as `tornect host` wires it, both on one LAN: the host takes part (the
+    /// viewer's `dir1`), the media goes direct within the punch window, and
+    /// the lines read `ROUTE direct lan` and `PATH host <ms> ms`; the onion
+    /// stream opened beside the path phase is dropped unused (the host's
+    /// `Abandoned`), and the host's route is `lan`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_viewer_on_the_hosts_lan_goes_direct_and_says_so() {
+        let (viewer_net, host_net) = lan_pair(5);
+        let media = test_card();
+        let mut rig = rig(&Config::default(), host_net, Arc::clone(&media)).await;
+        let session = &mut rig.session;
+        assert!(session.host_has(feats::DIR1));
+        let sid = session.session_token().session_id();
+        let ctx = viewer_ctx(&Config::default(), Arc::new(viewer_net), 0x22, false);
+        let log = OnionLog::default();
+        let binding = Binding::new(session.session_token(), &session.th());
+        let (_stop, stopped) = watch::channel(false);
+        let bound = bind_media(session, &ctx, &binding, onion_to(&media, &log), &stopped)
+            .await
+            .unwrap_or_else(|end| panic!("not bound: {end:?}"));
+        assert!(matches!(bound.media, MediaPath::Direct(_)));
+        assert_eq!(crate::direct::route_line(&bound.end), "ROUTE direct lan");
+        assert_eq!(bound.winner, Some(CandidateKind::Host));
+        assert!(
+            bound.elapsed < Duration::from_secs(4),
+            "{:?}",
+            bound.elapsed
+        );
+        let path = crate::direct::path_line(bound.winner, bound.elapsed);
+        assert!(
+            path.starts_with("PATH host ") && path.ends_with(" ms"),
+            "{path}"
+        );
+        assert!(
+            bound.onion_services,
+            "an `any` session's services stay on Tor until B10"
+        );
+        assert_eq!(media.route(&sid), Some(TransportKind::Lan));
+        assert_eq!(log.opens.load(Ordering::SeqCst), 1, "opened beside the try");
+        assert_eq!(log.outcomes(1).await, vec![MediaOutcome::Abandoned]);
+    }
+
+    /// DIRECT-2's one exception through the caller: a link whose key is
+    /// not the session's device key is refused by the host's TLS before any
+    /// stream byte, so the bind fails with [`AfterBind::Fallback`]; the
+    /// viewer sends `TOR_FALLBACK{QUIC}` and binds a fresh onion stream:
+    /// `ROUTE tor quic`, `PATH - <ms> ms`, the host's route `tor`. The
+    /// stream opened beside the path phase was dropped at the direct choice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_direct_connection_the_host_refuses_falls_back_to_a_fresh_onion_stream() {
+        let (viewer_net, host_net) = lan_pair(6);
+        let media = test_card();
+        let mut rig = rig(&Config::default(), host_net, Arc::clone(&media)).await;
+        let session = &mut rig.session;
+        let sid = session.session_token().session_id();
+        // The link presents device 0x23's key; the session is 0x22's.
+        let ctx = viewer_ctx(&Config::default(), Arc::new(viewer_net), 0x23, false);
+        let log = OnionLog::default();
+        let binding = Binding::new(session.session_token(), &session.th());
+        let (_stop, stopped) = watch::channel(false);
+        let bound = bind_media(session, &ctx, &binding, onion_to(&media, &log), &stopped)
+            .await
+            .unwrap_or_else(|end| panic!("not bound: {end:?}"));
+        assert!(matches!(bound.media, MediaPath::Onion(_)));
+        assert_eq!(crate::direct::route_line(&bound.end), "ROUTE tor quic");
+        assert_eq!(bound.winner, None);
+        assert!(crate::direct::path_line(bound.winner, bound.elapsed).starts_with("PATH - "));
+        assert_eq!(media.route(&sid), Some(TransportKind::TorRelay));
+        assert_eq!(
+            log.opens.load(Ordering::SeqCst),
+            2,
+            "the early one and a fresh one"
+        );
+        assert_eq!(log.outcomes(1).await[0], MediaOutcome::Abandoned);
+    }
+
+    /// Decision M1-85 at DIRECT-2's exception: a `lan_only` viewer whose
+    /// direct connection the host's TLS refused does not fall back; the
+    /// session ends `BYE{NO_LAN_PATH}` and no onion stream is ever opened.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lan_only_viewer_whose_connection_is_refused_does_not_fall_back() {
+        let (viewer_net, host_net) = lan_pair(12);
+        let media = test_card();
+        let mut rig = rig(&Config::default(), host_net, Arc::clone(&media)).await;
+        let session = &mut rig.session;
+        let mut lan_only = Config::default();
+        lan_only.network.lan_only = true;
+        let ctx = viewer_ctx(&lan_only, Arc::new(viewer_net), 0x23, false);
+        let log = OnionLog::default();
+        let binding = Binding::new(session.session_token(), &session.th());
+        let (_stop, stopped) = watch::channel(false);
+        let end = bind_media(session, &ctx, &binding, onion_to(&media, &log), &stopped)
+            .await
+            .expect_err("the session ends");
+        assert!(matches!(end, End::Refused(bye::NO_LAN_PATH)), "{end:?}");
+        assert_eq!(unbound_line(&end), "ROUTE none no-lan-path");
+        assert_eq!(log.opens.load(Ordering::SeqCst), 0);
+    }
+
+    /// Design `direct` §3.5 and §4, the policy rows of the live recipe:
+    /// `--tor-only` reads `ROUTE tor here-off`, a paranoid host
+    /// `ROUTE tor policy`; neither reads an interface nor opens an onion
+    /// stream beside the path phase, one is opened after it, and the host's
+    /// route is `tor`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tor_decision_reads_no_interface_and_binds_the_onion_stream() {
+        for (seed, paranoid_host, tor_only, route) in [
+            (7, false, true, "ROUTE tor here-off"),
+            (8, true, false, "ROUTE tor policy"),
+        ] {
+            let (viewer_net, host_net) = lan_pair(seed);
+            let mut host_cfg = Config::default();
+            host_cfg.network.paranoid = paranoid_host;
+            let media = test_card();
+            let mut rig = rig(&host_cfg, host_net, Arc::clone(&media)).await;
+            let session = &mut rig.session;
+            let sid = session.session_token().session_id();
+            let counting = CountingEnv::new(viewer_net);
+            let ctx = viewer_ctx(&Config::default(), counting.clone(), 0x22, tor_only);
+            let log = OnionLog::default();
+            let binding = Binding::new(session.session_token(), &session.th());
+            let (_stop, stopped) = watch::channel(false);
+            let bound = bind_media(session, &ctx, &binding, onion_to(&media, &log), &stopped)
+                .await
+                .unwrap_or_else(|end| panic!("{route}: not bound: {end:?}"));
+            assert_eq!(crate::direct::route_line(&bound.end), route);
+            assert!(
+                crate::direct::path_line(bound.winner, bound.elapsed).starts_with("PATH - "),
+                "{route}"
+            );
+            assert!(matches!(bound.media, MediaPath::Onion(_)), "{route}");
+            assert_eq!(counting.calls().total(), 0, "{route}");
+            assert_eq!(log.opens.load(Ordering::SeqCst), 1, "{route}");
+            assert_eq!(media.route(&sid), Some(TransportKind::TorRelay), "{route}");
+        }
+    }
+
+    /// The step A19 caller obligation (a): the stop is wired for the whole
+    /// path phase. A host that announced `dir1` and never answers is cut
+    /// short by the stop at 1 s, well inside the 4 s punch window; a host
+    /// that stops reading stalls the viewer's `CANDIDATES` write past the
+    /// window, and the stop still ends it when it comes (6 s). Each time
+    /// the onion stream was being opened beside the try.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_ends_the_path_phase_whatever_the_host_does() {
+        for (stalled, at) in [(false, 1), (true, 6)] {
+            let (mut session, frozen, _host) =
+                raw_direct(&[feats::DIR1], messages::transport::ANY).await;
+            frozen.store(stalled, Ordering::SeqCst);
+            let (viewer_net, _) = lan_pair(9);
+            let ctx = viewer_ctx(&Config::default(), Arc::new(viewer_net), 0x22, false);
+            let (stop, stopped) = watch::channel(false);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(at)).await;
+                let _ = stop.send(true);
+            });
+            let opens = Arc::new(AtomicUsize::new(0));
+            let binding = Binding::new(session.session_token(), &session.th());
+            let t0 = tokio::time::Instant::now();
+            let end = bind_media(&mut session, &ctx, &binding, never_opens(&opens), &stopped).await;
+            assert!(matches!(end, Err(End::You)), "stalled {stalled}: {end:?}");
+            let took = t0.elapsed();
+            assert!(
+                took >= Duration::from_secs(at)
+                    && took < Duration::from_secs(at) + Duration::from_millis(100),
+                "stalled {stalled}: {took:?}"
+            );
+            assert_eq!(opens.load(Ordering::SeqCst), 1, "stalled {stalled}");
+        }
+    }
+
+    /// A desktop whose dialog nobody answers: `open_source` waits until its
+    /// session is cancelled (20 s at most), saying when it was asked and
+    /// whether the cancel came.
+    struct Unanswered {
+        asked: watch::Sender<bool>,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl tornect_session::MediaBackend for Unanswered {
+        fn open_source(
+            &self,
+            _: tornect_session::SourceRequest,
+            cancel: watch::Receiver<bool>,
+        ) -> Result<Box<dyn tornect_capture::VideoSource>, tornect_capture::CaptureError> {
+            self.asked.send_replace(true);
+            let since = Instant::now();
+            while !*cancel.borrow() && since.elapsed() < Duration::from_secs(20) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            self.cancelled.store(*cancel.borrow(), Ordering::SeqCst);
+            Err(tornect_capture::CaptureError::Unavailable(
+                "nobody answered".to_owned(),
+            ))
+        }
+
+        fn open_injector(&self) -> Option<Box<dyn tornect_input::InputSink>> {
+            None
+        }
+    }
+
+    /// The step A19 caller obligations (b) and the bind wait: the direct
+    /// bind is raced against the stop, and it waits the media bind wait,
+    /// never the punch window. The host's source waits on a dialog nobody
+    /// answers; 5 s after the host was asked (past the 4 s punch window,
+    /// where a bind given the punch window would have timed out) the stop
+    /// comes and the bind ends at once as the user's. The caller's `BYE`
+    /// then ends the session and the host's open is cancelled: nothing was
+    /// captured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stop_ends_a_direct_bind_the_host_has_not_answered() {
+        let (viewer_net, host_net) = lan_pair(10);
+        let (asked_tx, mut asked) = watch::channel(false);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let media = Arc::new(MediaHost::new(
+            Arc::new(Unanswered {
+                asked: asked_tx,
+                cancelled: Arc::clone(&cancelled),
+            }),
+            Arc::new(tornect_session::NoObserver),
+            MediaLimits::default(),
+        ));
+        let Rig {
+            _tmp,
+            _wiring,
+            mut session,
+        } = rig(&Config::default(), host_net, Arc::clone(&media)).await;
+        let ctx = viewer_ctx(&Config::default(), Arc::new(viewer_net), 0x22, false);
+        let (stop, stopped) = watch::channel(false);
+        let stopper = tokio::spawn(async move {
+            let _ = asked.wait_for(|asked| *asked).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let _ = stop.send(true);
+            Instant::now()
+        });
+        let log = OnionLog::default();
+        let binding = Binding::new(session.session_token(), &session.th());
+        let end = tokio::time::timeout(
+            Duration::from_secs(25),
+            bind_media(
+                &mut session,
+                &ctx,
+                &binding,
+                onion_to(&media, &log),
+                &stopped,
+            ),
+        )
+        .await
+        .expect("the stop ends the bind before its own 30 s wait");
+        let stopped_at = stopper.await.unwrap();
+        assert!(matches!(end, Err(End::You)), "{end:?}");
+        assert!(
+            stopped_at.elapsed() < Duration::from_secs(1),
+            "ended at the stop"
+        );
+        session.bye(bye::USER).await.unwrap();
+        for _ in 0..1000 {
+            if cancelled.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the host's open was cancelled"
+        );
+    }
+
+    /// Decision M1-85 (DIRECT-8) through the caller: a `lan_only` viewer
+    /// with no same-site path (here, no address at all) ends the session:
+    /// `ROUTE none no-lan-path`, no `TOR_FALLBACK`, no onion stream, and the
+    /// caller's `BYE{NO_LAN_PATH}` is the host's next frame; `connect` then
+    /// fails, which is exit status 1.
+    #[tokio::test(start_paused = true)]
+    async fn a_lan_only_viewer_with_no_path_ends_the_session() {
+        let (mut session, _frozen, mut host) =
+            raw_direct(&[feats::DIR1], messages::transport::ANY).await;
+        let mut cfg = Config::default();
+        cfg.network.lan_only = true;
+        let ctx = viewer_ctx(&cfg, crate::direct::no_network(), 0x22, false);
+        let opens = Arc::new(AtomicUsize::new(0));
+        let binding = Binding::new(session.session_token(), &session.th());
+        let (_stop, stopped) = watch::channel(false);
+        let end = bind_media(&mut session, &ctx, &binding, never_opens(&opens), &stopped)
+            .await
+            .expect_err("the session ends");
+        assert!(matches!(end, End::Refused(bye::NO_LAN_PATH)), "{end:?}");
+        assert_eq!(unbound_line(&end), "ROUTE none no-lan-path");
+        assert_eq!(end.bye(), Some(bye::NO_LAN_PATH));
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert!(refused_why(bye::NO_LAN_PATH).contains("network.lan_only"));
+        let code = end.bye().unwrap();
+        let (byed, frame) = tokio::join!(session.bye(code), client_frame(&mut host));
+        drop(byed);
+        assert_eq!(frame.kind, Kind::Bye, "the first frame after the accept");
+        let said: messages::Bye = decode_body(&frame.body).unwrap();
+        assert_eq!(said.reason, bye::NO_LAN_PATH);
+    }
+
+    /// Design `direct` §3.5: `connect --no-video` answers
+    /// `TOR_FALLBACK{NO_MEDIA}` at once, reads no interface and binds
+    /// nothing; its route line is `ROUTE none`.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_without_media_answers_no_media_and_reads_no_interface() {
+        let (mut session, _frozen, mut host) =
+            raw_direct(&[feats::DIR1], messages::transport::ANY).await;
+        let (viewer_net, _) = lan_pair(11);
+        let counting = CountingEnv::new(viewer_net);
+        let ctx = viewer_ctx(&Config::default(), counting.clone(), 0x22, false);
+        let (_stop, stopped) = watch::channel(false);
+        no_media(&mut session, &ctx, &stopped).await.unwrap();
+        let frame = client_frame(&mut host).await;
+        assert_eq!(frame.kind, Kind::TorFallback);
+        let said: messages::TorFallback = decode_body(&frame.body).unwrap();
+        assert_eq!(said.reason, Some(fallback::NO_MEDIA));
+        assert_eq!(counting.calls().total(), 0);
+        assert_eq!(crate::direct::route_line(&PathEnd::NoMedia), "ROUTE none");
+    }
+
+    /// The step A19 caller obligation (d): path frames that come after the
+    /// path phase chose (a host's `CANDIDATES`, `CANDIDATES_DONE` and
+    /// `TOR_FALLBACK` between two pings) are neither a fault nor acted on:
+    /// the keep-alive pings on and ends as asked, and writes nothing but its
+    /// pings.
+    #[tokio::test(start_paused = true)]
+    async fn late_path_frames_are_neither_a_fault_nor_acted_on() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut session, _frozen, mut host, mut msg_id) = raw_live().await;
+        let candidates = messages::Candidates {
+            candidates: vec![messages::Candidate {
+                kind: messages::candidate_kind::HOST,
+                ip: vec![192, 168, 1, 20],
+                port: 40_000,
+            }],
+            scope: Some(messages::scope::SAME_SITE),
+        };
+        let play = async move {
+            let ping = client_frame(&mut host).await;
+            host.write_all(&pong_for(msg_id, &ping)).await.unwrap();
+            msg_id += 1;
+            for (kind, body) in [
+                (Kind::Candidates, encode_body(&candidates)),
+                (
+                    Kind::CandidatesDone,
+                    encode_body(&messages::CandidatesDone {}),
+                ),
+                (
+                    Kind::TorFallback,
+                    encode_body(&messages::TorFallback {
+                        reason: Some(fallback::NO_PATH),
+                    }),
+                ),
+            ] {
+                host.write_all(&host_frame(msg_id, kind, body))
+                    .await
+                    .unwrap();
+                msg_id += 1;
+            }
+            let ping = client_frame(&mut host).await;
+            host.write_all(&pong_for(msg_id, &ping)).await.unwrap();
+            host
+        };
+        let (end, mut host) = tokio::join!(
+            keep_alive(
+                &mut session,
+                Some(2),
+                Duration::from_secs(10),
+                std::future::pending()
+            ),
+            play
+        );
+        assert!(matches!(end.unwrap(), End::You));
+        let more = tokio::time::timeout(Duration::from_secs(30), client_frame(&mut host)).await;
+        assert!(more.is_err(), "nothing more was written: {more:?}");
+    }
+
+    /// How each end of the path phase reaches the session's end, and the
+    /// `BYE` each end owes the host.
+    #[test]
+    fn the_path_phase_ends_are_the_sessions() {
+        let bye_end = into_path(PathChoice::HostEnded(SessionEvent::Bye {
+            reason: bye::PANIC,
+            detail: None,
+        }));
+        assert!(matches!(bye_end, Err(End::Host(bye::PANIC))));
+        let error_end = into_path(PathChoice::HostEnded(SessionEvent::Error {
+            code: codes::E_BAD_STATE,
+            detail: None,
+        }));
+        assert!(matches!(
+            error_end,
+            Err(End::Lost(HandshakeError::PeerError {
+                code: codes::E_BAD_STATE,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            into_path(PathChoice::Broken(HandshakeError::Closed)),
+            Err(End::Lost(HandshakeError::Closed))
+        ));
+        assert!(matches!(into_path(PathChoice::Interrupted), Err(End::You)));
+        assert!(matches!(
+            into_path(PathChoice::End(bye::NO_LAN_PATH)),
+            Err(End::Refused(bye::NO_LAN_PATH))
+        ));
+        assert!(matches!(
+            into_path(PathChoice::NoMedia),
+            Ok(PathChoice::NoMedia)
+        ));
+        assert_eq!(End::You.bye(), Some(bye::USER));
+        assert_eq!(End::NoPicture(anyhow::anyhow!("x")).bye(), Some(bye::USER));
+        assert_eq!(End::Refused(bye::NO_LAN_PATH).bye(), Some(bye::NO_LAN_PATH));
+        assert_eq!(End::Host(bye::PANIC).bye(), None);
+        assert_eq!(End::Lost(HandshakeError::Closed).bye(), None);
+        assert_eq!(
+            unbound_line(&End::Host(bye::PANIC)),
+            "MEDIA ENDED (the session ended before the first picture)"
+        );
+        assert_eq!(
+            unbound_line(&End::You),
+            "MEDIA ENDED (by you, before the first picture)"
+        );
     }
 }

@@ -275,9 +275,14 @@ enum Command {
         /// End the session after this many pings instead of at Ctrl-C.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         pings: Option<u32>,
-        /// Keep only the signaling session: open no media stream.
+        /// Keep only the signaling session: open no media stream (and no
+        /// direct connection; the route line reads `ROUTE none`).
         #[arg(long)]
         no_video: bool,
+        /// Relay this session's picture through Tor even where a direct
+        /// connection is allowed (this session's policy is tor_only).
+        #[arg(long, conflicts_with = "pair_only")]
+        tor_only: bool,
         /// The picture quality to ask for: best-quality, balanced or
         /// best-performance (default: the viewer's quality in config.toml,
         /// itself balanced). The host fits it to its own limits.
@@ -800,6 +805,7 @@ fn main() -> anyhow::Result<()> {
             forget,
             pings,
             no_video,
+            tor_only,
             quality,
             screen,
             unattended,
@@ -824,6 +830,7 @@ fn main() -> anyhow::Result<()> {
                         remember,
                         administrator,
                     }),
+                    tor_only,
                 },
                 cli.bridges,
             )

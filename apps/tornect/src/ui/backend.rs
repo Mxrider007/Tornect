@@ -4065,7 +4065,7 @@ async fn viewed(
     } else if pins.known() {
         b.shared.update(|m| m.client = ClientStage::Asking);
     }
-    let ccfg = ClientConfig::new(id, b.cfg.general.device_name.clone());
+    let ccfg = crate::tor_cmd::viewer_config(id, b.cfg.general.device_name.clone());
     let pairing = Arc::new(GuiPairingUi::new(Arc::clone(&b.popups)));
     let deps = ClientDeps {
         known_hosts: pins.store(),
@@ -4257,12 +4257,10 @@ async fn viewed(
         Ok(false) => {}
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "the visit was not recorded"),
     }
-    // Tor is the transport in the slice; saying so stops the host's orphan
-    // timer. `TOR_FALLBACK{}`, M1's bytes, until step A19 of design `direct`.
-    session
-        .send_tor_fallback(None)
-        .await
-        .map_err(explain_handshake)?;
+    // The path phase runs first in `watch`, at once (design `direct` §4): its
+    // answer stops the host's orphan timer. The policy is read now, after
+    // the last bootstrap set the bridge state.
+    let direct = b.direct().ctx(false);
     let input = control.then(|| {
         let (tx, rx) = mpsc::channel(INPUT_QUEUE);
         b.link.set_input(Some(tx));
@@ -4290,7 +4288,8 @@ async fn viewed(
         services,
         ..crate::tor_cmd::WatchOptions::default()
     };
-    let end = crate::tor_cmd::watch(node, &id, &isolation, &mut session, stop, watching).await;
+    let end =
+        crate::tor_cmd::watch(node, &id, &isolation, &mut session, stop, &direct, watching).await;
     notices_task.abort();
     // Awaited, so that no code the task held lands after the clear.
     let _ = notices_task.await;
@@ -4300,13 +4299,14 @@ async fn viewed(
     b.link.set_requests(None);
     b.link.set_services(None);
     b.link.end_clip();
-    Ok(match end? {
-        End::You => {
-            if let Err(e) = session.bye(bye::USER).await {
-                tracing::debug!(error = %e, "sending BYE");
-            }
-            format!("Session with \"{host}\" ended (by you).")
-        }
+    let end = end?;
+    if let Some(code) = end.bye()
+        && let Err(e) = session.bye(code).await
+    {
+        tracing::debug!(error = %e, "sending BYE");
+    }
+    Ok(match end {
+        End::You => format!("Session with \"{host}\" ended (by you)."),
         End::Host(reason) => {
             format!("\"{host}\" ended the session ({}).", bye::name(reason))
         }
@@ -4314,12 +4314,11 @@ async fn viewed(
             "The session with \"{host}\" was lost: {:#}",
             explain_handshake(e)
         ),
-        End::NoPicture(e) => {
-            if let Err(e) = session.bye(bye::USER).await {
-                tracing::debug!(error = %e, "sending BYE");
-            }
-            format!("No picture from \"{host}\": {e:#}")
-        }
+        End::NoPicture(e) => format!("No picture from \"{host}\": {e:#}"),
+        End::Refused(code) => format!(
+            "The session with \"{host}\" ended: {}.",
+            crate::tor_cmd::refused_why(code)
+        ),
     })
 }
 
