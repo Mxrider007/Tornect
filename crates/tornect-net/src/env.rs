@@ -8,19 +8,23 @@
 //! session socket (step A8) are here, and since step B1 the two that STUN
 //! and router mapping need: [`NetEnv::resolve`] (the STUN servers' names,
 //! answered from the [`StunDns`] cache that [`RealNet::prefetch`] keeps
-//! filled, step B3) and [`NetEnv::mapper`] (the real router protocols are
-//! steps B4 and B5).
+//! filled, step B3) and [`NetEnv::mapper`] (the router protocols of
+//! [`RealNet::with_router`], steps B4 and B5).
 
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::gather::{PREFETCH_TIMEOUT, Resolver, StunDns};
 use crate::local::{self, IfaceAddr, RouteSources};
-use crate::mapping::{NoMapper, PortMapper};
+use crate::mapping::{
+    MapEvents, MappingLedger, NoMapper, PortMapper, RealMapper, ReleaseTracker, Router, SWEEP_CAP,
+    SweepReport,
+};
 use crate::socket::bind_media_socket;
 use crate::udp::BoundUdp;
 use crate::{BoxFuture, NetError};
@@ -97,6 +101,9 @@ pub type GatewayLookup = Arc<dyn Fn(u32) -> Option<Ipv4Addr> + Send + Sync>;
 pub struct RealNet {
     gateway: Option<GatewayLookup>,
     mapper: Arc<dyn PortMapper>,
+    /// The router protocols, once [`RealNet::with_router`] gave a ledger.
+    router: Option<RealMapper>,
+    releases: ReleaseTracker,
     dns: StunDns,
     /// [`system_lookup`]; a table in this crate's tests.
     lookup: Resolver,
@@ -108,6 +115,8 @@ impl Default for RealNet {
         Self {
             gateway: None,
             mapper: Arc::new(NoMapper),
+            router: None,
+            releases: ReleaseTracker::new(),
             dns: StunDns::new(),
             lookup: Arc::new(system_lookup),
             prefetch: Mutex::new(None),
@@ -129,7 +138,8 @@ fn system_lookup(host: &str, port: u16) -> BoxFuture<'static, io::Result<Vec<Soc
 impl RealNet {
     /// The machine this process runs on. Every value shares one interface
     /// read in flight ([`local::read_interfaces`]). Its mapper is
-    /// [`NoMapper`] until the router protocols land (steps B4 and B5).
+    /// [`NoMapper`] until [`with_router`](Self::with_router) gives it a
+    /// ledger.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -149,6 +159,55 @@ impl RealNet {
     ) -> Self {
         self.gateway = Some(Arc::new(lookup));
         self
+    }
+
+    /// The machine with the router protocols ([`RealMapper`], design §7.4):
+    /// the ledger of its requests in `dir`
+    /// (`tornect_core::Paths::router_ports_dir`), every mapping that opens
+    /// or closes reported to `events` (the session log's `router_port`
+    /// lines), mappings dropped unreleased released through
+    /// [`releases`](Self::releases).
+    #[must_use]
+    pub fn with_router(mut self, dir: impl Into<PathBuf>, events: Arc<dyn MapEvents>) -> Self {
+        let router = RealMapper::new(MappingLedger::new(dir), events, self.releases.clone());
+        self.mapper = Arc::new(router.clone());
+        self.router = Some(router);
+        self
+    }
+
+    /// The releases of dropped mappings still running: the app's shutdown
+    /// waits for them, at most
+    /// [`SHUTDOWN_RELEASE_WAIT`](crate::SHUTDOWN_RELEASE_WAIT).
+    #[must_use]
+    pub fn releases(&self) -> ReleaseTracker {
+        self.releases.clone()
+    }
+
+    /// Starts the removal of the router mappings an earlier run left
+    /// ([`RealMapper::sweep`]) on the current tokio runtime, bounded by
+    /// [`SWEEP_CAP`]; the app calls it at start (GUI, `host`, `connect`),
+    /// whatever the direct-path policy, since it only removes exposure.
+    /// Nothing is read beyond the ledger's directory, and nothing is sent,
+    /// unless an earlier run left mappings; only the router in use now is
+    /// contacted. `None` without a router ledger or outside a runtime.
+    pub fn sweep_leftovers(&self) -> Option<JoinHandle<SweepReport>> {
+        let router = self.router.clone()?;
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let interfaces = self.interfaces();
+        Some(runtime.spawn(async move {
+            let here = async move {
+                let client = local::route_sources().v4?;
+                let addrs = interfaces.await.ok()?;
+                let gateway = addrs
+                    .iter()
+                    .find(|a| a.ip == IpAddr::V4(client))?
+                    .gateway_v4?;
+                Some(Router { gateway, client })
+            };
+            tokio::time::timeout(SWEEP_CAP, router.sweep(here))
+                .await
+                .unwrap_or_default()
+        }))
     }
 
     /// The cache [`NetEnv::resolve`] answers from.
@@ -210,6 +269,7 @@ impl fmt::Debug for RealNet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RealNet")
             .field("gateway_lookup", &self.gateway.is_some())
+            .field("router", &self.router)
             .field("dns", &self.dns)
             .finish_non_exhaustive()
     }
@@ -358,7 +418,7 @@ mod tests {
     }
 
     /// A literal resolves without a query; the real machine's mapper asks
-    /// no router before step B4.
+    /// no router until it is given a ledger.
     #[tokio::test]
     async fn the_real_machine_resolves_literals_and_maps_nothing_yet() {
         let env: Arc<dyn NetEnv> = Arc::new(RealNet::new());
@@ -385,6 +445,54 @@ mod tests {
                 .expect_err("no router protocol yet"),
             crate::MapFail::NoGateway
         );
+    }
+
+    /// With a router ledger the machine maps through [`RealMapper`] (which
+    /// still asks nothing outside its preconditions), and the start-up
+    /// sweep of an empty ledger contacts nothing and leaves nothing behind;
+    /// without one there is no sweep, and outside a runtime none starts.
+    #[test]
+    fn the_router_ledger_gives_a_mapper_and_a_sweep() {
+        struct Quiet;
+        impl MapEvents for Quiet {
+            fn on_event(&self, ev: crate::MapEvent) {
+                panic!("no event expected: {ev:?}");
+            }
+        }
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let dir = home.path().join("router-ports");
+        let net = RealNet::new().with_router(&dir, Arc::new(Quiet));
+        assert!(net.sweep_leftovers().is_none(), "no runtime, no sweep");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        rt.block_on(async {
+            assert!(RealNet::new().sweep_leftovers().is_none(), "no ledger");
+            let report = net
+                .sweep_leftovers()
+                .expect("a sweep starts")
+                .await
+                .expect("it ends");
+            assert_eq!(report, SweepReport::default());
+            let request = crate::MapRequest {
+                gateway: Ipv4Addr::new(198, 51, 100, 1),
+                client: Ipv4Addr::new(192, 168, 1, 20),
+                internal_port: std::num::NonZeroU16::new(50_000).unwrap(),
+                lease: crate::MAP_LEASE,
+                protocols: crate::MapProtocols::ALL,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            };
+            assert_eq!(
+                net.mapper()
+                    .map(request)
+                    .await
+                    .expect_err("not a LAN gateway"),
+                crate::MapFail::NoGateway
+            );
+            assert!(net.releases().wait(std::time::Duration::ZERO).await);
+        });
+        assert!(!dir.exists(), "nothing was written");
     }
 
     /// Design §5.3: a name the cache holds is answered from it, in any case

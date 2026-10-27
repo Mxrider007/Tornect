@@ -2,7 +2,7 @@
 //! decision M1-81): a record of every mapping this process asked a router
 //! for, written **before** the request, so that a process that ends without
 //! releasing its mappings (a crash, a kill, a power cut) leaves enough for
-//! the next start to remove them.
+//! the next start to remove them ([`super::RealMapper::sweep`]).
 //!
 //! **Layout** ([`tornect_core::Paths::router_ports_dir`]): one directory,
 //! `0700`; per process that has asked a router for anything, a lock file
@@ -13,10 +13,10 @@
 //! process ends, however it ends, so a list whose lock can be taken is a
 //! leftover (the lock file is locked before it takes its name, so a running
 //! owner's never shows unlocked), and one whose lock is held belongs to a
-//! running process (a GUI
-//! and a `tornect connect` on one `TORNECT_HOME`), whose mappings a sweep
-//! never touches. The design's single `router-ports.cbor` would let one
-//! process's start-up sweep remove the live mappings of another.
+//! running process (a GUI and a `tornect connect` on one `TORNECT_HOME`),
+//! whose mappings a sweep never touches. The design's single
+//! `router-ports.cbor` would let one process's start-up sweep remove the
+//! live mappings of another.
 //!
 //! **The list** is a CBOR array of entries (`LedgerEntry` on the wire):
 //!
@@ -487,6 +487,14 @@ impl MappingLedger {
             return Ok(());
         }
         state.persist()
+    }
+
+    /// Lets go of the lock and keeps the list, as a process that dies does:
+    /// a crash, for this crate's tests (a leaked mapping keeps the ledger
+    /// alive in memory, where a real crash would not).
+    #[cfg(test)]
+    pub(crate) fn abandon(&self) {
+        lock(&self.state).lock = None;
     }
 
     /// The entries listed now, oldest first.

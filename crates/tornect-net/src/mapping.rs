@@ -9,8 +9,10 @@
 //! `router_port` line. No type here prints an address or a port, and no
 //! failure carries a third-party error value: routers return free text.
 //!
-//! A real mapper records every request in the [`MappingLedger`] before
-//! sending it, so that the next start removes what a crash left, and a
+//! [`RealMapper`] speaks PCP and NAT-PMP through crab_nat and UPnP-IGD
+//! through igd-next (docs/research/nat-traversal.md §3 and §4). It records
+//! every request in the [`MappingLedger`] before sending it, so that the
+//! next start removes what a crash left ([`RealMapper::sweep`]), and a
 //! mapping dropped without [`Mapping::release`] is released on the runtime
 //! it was made on through the [`ReleaseTracker`]. [`NoMapper`] asks no
 //! router; the in-memory router follows at step B8.
@@ -27,13 +29,19 @@ use tornect_core::session_log::{PortChange, PortVia, RouterPort};
 use crate::BoxFuture;
 use crate::addr::{Redacted, RedactedIp};
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod fake;
 mod ledger;
+mod nat;
+mod real;
 mod release;
+mod upnp;
 
 pub use ledger::{
     EntryId, LEDGER_MAX_AGE, LedgerEntry, Leftover, MAX_LEDGER_BYTES, MAX_LEDGER_ENTRIES,
     MAX_LEDGER_OWNERS, MappingLedger, decode_list, encode_list, unix_now,
 };
+pub use real::{RealMapper, Router, SWEEP_CAP, SweepReport};
 pub use release::{MAP_RELEASE_CAP, ReleaseTracker, SHUTDOWN_RELEASE_WAIT};
 
 /// The lease every mapping asks for (design §7.4 "Leases", decision M1-81):
@@ -185,10 +193,9 @@ pub trait MappingHandle: Send {
 
 /// A port the router opened for this session.
 ///
-/// A mapping given [`release_on_drop`](Self::release_on_drop) releases
-/// itself when dropped without [`release`](Self::release): on the runtime
-/// it was made on (or, made outside one, the runtime current at the drop),
-/// through its
+/// A mapping made by [`RealMapper`] releases itself when dropped without
+/// [`release`](Self::release): on the runtime it was made on (or, made
+/// outside one, the runtime current at the drop), through its
 /// [`ReleaseTracker`], capped at [`MAP_RELEASE_CAP`] and never awaited by
 /// the dropper. With no runtime at all, nothing is spawned and the router's
 /// lease ends the mapping.
@@ -348,7 +355,10 @@ pub trait PortMapper: Send + Sync {
 /// A mapper with no router behind it: every request is
 /// [`MapFail::NoGateway`] at once, and nothing is sent. The in-memory and
 /// loopback machines use it until step B8 gives the in-memory network
-/// routers, and the real machine until the real mapper replaces it.
+/// routers, and the real machine until [`RealNet::with_router`] gives it a
+/// ledger.
+///
+/// [`RealNet::with_router`]: crate::RealNet::with_router
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoMapper;
 
