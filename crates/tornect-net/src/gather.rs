@@ -32,8 +32,12 @@
 //!   host candidate means there is no NAT, and no srflx candidate.
 //! - **DNS** (§5.3): names are resolved in the background, at start and
 //!   every [`DNS_REFRESH`] ± [`DNS_JITTER`] ([`StunDns::run`]); a session
-//!   reads them through [`NetEnv::resolve`], which answers from the cache,
-//!   and waits [`DNS_TIMEOUT`] at most for a name the cache does not hold.
+//!   reads them through [`NetEnv::resolve`], which on the real machine
+//!   answers from the cache. Once a refresh round has completed
+//!   ([`StunDns::refreshed`]) a name the cache lacks is an error at once,
+//!   so the resolver never learns when a session starts; only a cold cache
+//!   (no round completed yet, as for the one-shot `connect`) is looked up
+//!   at session time, and the session waits [`DNS_TIMEOUT`] at most.
 //! - **Logs**: none here; the report is counts and a redacted candidate
 //!   (decision M1-83).
 
@@ -77,8 +81,9 @@ const SENDS_PER_SERVER: u8 = 2;
 /// The most STUN requests one side sends in one session (design §7.3).
 pub const STUN_REQUESTS_PER_SESSION: usize = STUN_SERVERS_PER_SESSION * SENDS_PER_SERVER as usize;
 
-/// The longest a session waits for a STUN server's name the cache does not
-/// hold (design §4, §7.3).
+/// The longest a session waits for a STUN server's name, which it looks up
+/// only while the cache is cold (design §4: "used only when the cache is
+/// empty"; §7.3).
 pub const DNS_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The background refresh of the STUN servers' names (design §4, §5.3):
@@ -88,8 +93,9 @@ pub const DNS_REFRESH: Duration = Duration::from_secs(600);
 /// The jitter of [`DNS_REFRESH`], drawn uniformly each round.
 pub const DNS_JITTER: Duration = Duration::from_secs(60);
 
-/// The longest the background refresh waits for one name: no session waits
-/// on it, but a resolver that never answers must not stop the refresh.
+/// The longest the background refresh, or a cold cache's lookup, waits for
+/// one name: no session waits on it, but a resolver that never answers
+/// must not stop the refresh or hold a task forever.
 pub const PREFETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -109,8 +115,8 @@ pub fn server_name(entry: &str) -> Option<(&str, u16)> {
     (!host.is_empty()).then_some((host, port))
 }
 
-/// A name lookup the background refresh makes: the system resolver for
-/// [`RealNet`](crate::RealNet), a table in tests.
+/// A name lookup the background refresh (and a cold cache) makes: the
+/// system resolver for [`RealNet`](crate::RealNet), a table in tests.
 pub type Resolver =
     Arc<dyn Fn(&str, u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> + Send + Sync>;
 
@@ -122,15 +128,25 @@ fn key(host: &str, port: u16) -> Key {
 
 /// The addresses of the STUN servers' names (design §5.3, §8.3 `StunDns`),
 /// filled by the background refresh so that a session never waits on DNS
-/// and the resolver never sees a lookup at session time. Clones share the
-/// cache. Its `Debug` prints the number of names only.
+/// and the resolver never sees a lookup at session time: once a round has
+/// completed ([`StunDns::refreshed`]), a session reads this cache only.
+/// Clones share the cache. Its `Debug` prints the number of names and
+/// whether a round has completed, never a name or an address.
 #[derive(Clone, Default)]
 pub struct StunDns {
-    names: Arc<Mutex<HashMap<Key, Vec<SocketAddr>>>>,
+    cache: Arc<Mutex<Cache>>,
+}
+
+#[derive(Default)]
+struct Cache {
+    names: HashMap<Key, Vec<SocketAddr>>,
+    /// A refresh round has completed since the cache was made or last
+    /// cleared.
+    refreshed: bool,
 }
 
 impl StunDns {
-    /// An empty cache.
+    /// An empty, cold cache.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -140,20 +156,20 @@ impl StunDns {
     /// dot) at `port`.
     #[must_use]
     pub fn get(&self, host: &str, port: u16) -> Option<Vec<SocketAddr>> {
-        lock(&self.names).get(&key(host, port)).cloned()
+        lock(&self.cache).names.get(&key(host, port)).cloned()
     }
 
     /// Caches `addrs` as `host`'s at `port`; an empty answer changes nothing.
     pub fn put(&self, host: &str, port: u16, addrs: Vec<SocketAddr>) {
         if !addrs.is_empty() {
-            lock(&self.names).insert(key(host, port), addrs);
+            lock(&self.cache).names.insert(key(host, port), addrs);
         }
     }
 
     /// How many names are cached.
     #[must_use]
     pub fn len(&self) -> usize {
-        lock(&self.names).len()
+        lock(&self.cache).names.len()
     }
 
     /// Whether no name is cached.
@@ -162,9 +178,23 @@ impl StunDns {
         self.len() == 0
     }
 
-    /// Forgets every name.
+    /// Whether a refresh round has completed since the cache was made or
+    /// last [cleared](Self::clear) (design §5.3). From then on a session
+    /// never triggers a lookup: a name the cache lacks (it failed in the
+    /// round, or was listed after it) waits for the next round. Before,
+    /// the cache is cold, and a session may look a name up (the one-shot
+    /// `connect`, whose session can start before the first round ends).
+    #[must_use]
+    pub fn refreshed(&self) -> bool {
+        lock(&self.cache).refreshed
+    }
+
+    /// Forgets every name, and that a round completed: the cache is cold
+    /// again, as when it was made.
     pub fn clear(&self) {
-        lock(&self.names).clear();
+        let mut cache = lock(&self.cache);
+        cache.names.clear();
+        cache.refreshed = false;
     }
 
     /// One refresh round over `entries` (`host:port`): each name is looked
@@ -172,7 +202,9 @@ impl StunDns {
     /// at most; an answer replaces the cached addresses, a failure keeps
     /// them (a resolver that is down for a moment does not empty the cache).
     /// Names no longer listed are forgotten. IP literals and entries without
-    /// a valid port are not looked up. Returns how many names answered.
+    /// a valid port are not looked up. Once the round is over the cache is
+    /// [refreshed](Self::refreshed), whatever answered. Returns how many
+    /// names answered.
     pub async fn refresh(&self, entries: &[String], lookup: &Resolver) -> usize {
         let mut listed = Vec::new();
         let mut answered = 0;
@@ -192,15 +224,18 @@ impl StunDns {
                 answered += 1;
             }
         }
-        lock(&self.names).retain(|k, _| listed.contains(k));
+        let mut cache = lock(&self.cache);
+        cache.names.retain(|k, _| listed.contains(k));
+        cache.refreshed = true;
         answered
     }
 
     /// The background refresh (design §5.3): a round over `entries()` at
     /// once, then one every [`refresh_delay`]. `entries` is read at each
     /// round, so it can follow the settings: an empty list (STUN off, the
-    /// internet direct path off, a bridge in use) asks nothing and empties
-    /// the cache. Runs until its task is aborted.
+    /// internet direct path off, a bridge in use) asks nothing and
+    /// [clears](Self::clear) the cache, which is then cold until the next
+    /// round with a list. Runs until its task is aborted.
     pub async fn run(self, entries: impl Fn() -> Vec<String> + Send + Sync, lookup: Resolver) {
         loop {
             let list = entries();
@@ -216,8 +251,10 @@ impl StunDns {
 
 impl fmt::Debug for StunDns {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cache = lock(&self.cache);
         f.debug_struct("StunDns")
-            .field("names", &self.len())
+            .field("names", &cache.names.len())
+            .field("refreshed", &cache.refreshed)
             .finish()
     }
 }
@@ -365,7 +402,8 @@ pub struct StunStats {
     /// [`NetEnv::resolve`] calls (an IP literal needs none).
     pub resolves: u8,
     /// Entries that gave no address the filter admits (a malformed entry, a
-    /// failed or slow lookup, or only refused addresses).
+    /// name the refreshed cache lacks, a failed or slow lookup, or only
+    /// refused addresses).
     pub unresolved: u8,
     /// Error responses.
     pub errors: u8,
@@ -538,8 +576,9 @@ enum Woke {
 /// servers of `ask.servers` from `socket` and reads their answers from
 /// `replies` (the socket's STUN tee, which fills only while quinn's
 /// endpoint driver polls the socket). A name is resolved through `env`
-/// (which answers from [`StunDns`] where it has one), waiting
-/// [`DNS_TIMEOUT`] at most; an IP literal is never resolved. Returns at the
+/// (the real machine answers from [`StunDns`], and looks a name up only
+/// while that cache is cold), waiting [`DNS_TIMEOUT`] at most; an IP
+/// literal is never resolved. Returns at the
 /// first acceptable answer, at the deadline, or once every server asked has
 /// answered and no other may be.
 pub async fn ask_stun(

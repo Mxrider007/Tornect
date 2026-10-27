@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::task::AbortHandle;
 
-use crate::gather::{Resolver, StunDns};
+use crate::gather::{PREFETCH_TIMEOUT, Resolver, StunDns};
 use crate::local::{self, IfaceAddr, RouteSources};
 use crate::mapping::{NoMapper, PortMapper};
 use crate::socket::bind_media_socket;
@@ -50,15 +50,18 @@ pub trait NetEnv: Send + Sync {
     fn bind(&self, port: Option<u16>) -> io::Result<BoundUdp>;
 
     /// The addresses of `host` (a STUN server's name from the user's list)
-    /// with `port` (design §7.3). Cache-first: the real machine answers from
-    /// the [`StunDns`] its background refresh fills, and asks the resolver
-    /// only for a name the cache does not hold. The caller bounds the wait
+    /// with `port` (design §7.3). The real machine answers from the
+    /// [`StunDns`] its background refresh fills and never asks the resolver
+    /// per session, except while that cache is cold (no refresh round has
+    /// completed since it was made or emptied: the one-shot `connect`,
+    /// design §5.3). The caller bounds the wait
     /// ([`DNS_TIMEOUT`](crate::gather::DNS_TIMEOUT)).
     ///
     /// # Errors
     ///
-    /// The name does not resolve, or the environment resolves no names. The
-    /// error's text is the resolver's and is never shown or logged.
+    /// The name does not resolve, the refreshed cache lacks it, or the
+    /// environment resolves no names. The error's text is the resolver's
+    /// and is never shown or logged.
     fn resolve(&self, host: &str, port: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>>;
 
     /// The router mapper of this machine (design §7.4).
@@ -80,6 +83,8 @@ pub struct RealNet {
     gateway: Option<GatewayLookup>,
     mapper: Arc<dyn PortMapper>,
     dns: StunDns,
+    /// [`system_lookup`]; a table in this crate's tests.
+    lookup: Resolver,
     prefetch: Mutex<Option<AbortHandle>>,
 }
 
@@ -89,6 +94,7 @@ impl Default for RealNet {
             gateway: None,
             mapper: Arc::new(NoMapper),
             dns: StunDns::new(),
+            lookup: Arc::new(system_lookup),
             prefetch: Mutex::new(None),
         }
     }
@@ -136,6 +142,16 @@ impl RealNet {
         &self.dns
     }
 
+    /// The machine with `lookup` in place of the system resolver, for the
+    /// refresh and a cold cache alike: the seam this crate's tests count
+    /// lookups through.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_resolver(mut self, lookup: Resolver) -> Self {
+        self.lookup = lookup;
+        self
+    }
+
     /// Starts the background refresh of the STUN servers' names on the
     /// current tokio runtime (design §5.3; [`StunDns::run`]): a round now,
     /// then one every 10 min ± 1 min, through the system resolver. `entries`
@@ -149,8 +165,7 @@ impl RealNet {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return false;
         };
-        let lookup: Resolver = Arc::new(system_lookup);
-        let task = runtime.spawn(self.dns.clone().run(entries, lookup));
+        let task = runtime.spawn(self.dns.clone().run(entries, Arc::clone(&self.lookup)));
         let previous = self
             .prefetch
             .lock()
@@ -210,11 +225,16 @@ impl NetEnv for RealNet {
         BoundUdp::quiet(bind_media_socket(port)?)
     }
 
-    /// A literal address without a query; a cached name from the cache;
-    /// any other name through the OS resolver (`getaddrinfo` on tokio's
-    /// blocking pool), its answer cached. Only a session that starts before
-    /// the first refresh round has answered (the one-shot `connect`) waits
-    /// on DNS.
+    /// A literal address without a query; a cached name from the cache.
+    /// Once a refresh round has completed ([`StunDns::refreshed`]), any
+    /// other name is `NotFound` at once, without a query: a session never
+    /// tells the resolver when it starts (design §5.3, §9.3), and a name
+    /// that failed in the round waits for the next one. Only a cold cache
+    /// (a session that starts before the first round has completed, as the
+    /// one-shot `connect` may, or while the refresh has emptied the cache)
+    /// asks the OS resolver (`getaddrinfo` on tokio's blocking pool), on a
+    /// task of its own so that the answer is cached even when the session
+    /// has stopped waiting.
     fn resolve(&self, host: &str, port: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             let addr = SocketAddr::new(ip, port);
@@ -223,12 +243,22 @@ impl NetEnv for RealNet {
         if let Some(cached) = self.dns.get(host, port) {
             return Box::pin(async move { Ok(cached) });
         }
+        if self.dns.refreshed() {
+            return Box::pin(async { Err(io::ErrorKind::NotFound.into()) });
+        }
         let dns = self.dns.clone();
+        let lookup = Arc::clone(&self.lookup);
         let host = host.to_owned();
         Box::pin(async move {
-            let addrs = system_lookup(&host, port).await?;
-            dns.put(&host, port, addrs.clone());
-            Ok(addrs)
+            let task = tokio::spawn(async move {
+                let addrs = tokio::time::timeout(PREFETCH_TIMEOUT, lookup(&host, port))
+                    .await
+                    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+                dns.put(&host, port, addrs.clone());
+                Ok(addrs)
+            });
+            task.await
+                .map_err(|_| io::Error::from(io::ErrorKind::Interrupted))?
         })
     }
 
@@ -334,6 +364,104 @@ mod tests {
         env.resolve("64.0.0.11", 3478).await.expect("a literal");
         assert_eq!(env.stun_dns().len(), 1);
         assert!(format!("{env:?}").contains("names: 1"), "{env:?}");
+    }
+
+    /// A resolver that notes every lookup: `ok.example` answers at once,
+    /// `slow.example` after a second, any other name fails.
+    fn noting(calls: &Arc<Mutex<Vec<String>>>) -> Resolver {
+        let calls = Arc::clone(calls);
+        Arc::new(move |host: &str, port: u16| {
+            calls.lock().unwrap().push(host.to_owned());
+            let host = host.to_owned();
+            Box::pin(async move {
+                match host.as_str() {
+                    "ok.example" => Ok(vec![SocketAddr::new([64, 0, 0, 20].into(), port)]),
+                    "slow.example" => {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        Ok(vec![SocketAddr::new([64, 0, 0, 21].into(), port)])
+                    }
+                    _ => Err(io::ErrorKind::NotFound.into()),
+                }
+            })
+        })
+    }
+
+    /// The answer of `lookup` if it is ready at its first poll: it waits on
+    /// nothing, no resolver and no timer.
+    fn at_once<T>(mut lookup: BoxFuture<'static, T>) -> Option<T> {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match lookup.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(answer) => Some(answer),
+            std::task::Poll::Pending => None,
+        }
+    }
+
+    /// Design §5.3 ("a session uses the cache and never triggers a lookup
+    /// unless the cache is empty"), §4 (`DNS_TIMEOUT` is used only then) and
+    /// §9.3 (the resolver operator cannot time sessions): after a refresh
+    /// round, a name that failed in it and a name it never listed are
+    /// `NotFound` at once, and the resolver is asked nothing; a cached name
+    /// is answered at once. Emptied, the cache is cold again.
+    #[tokio::test(start_paused = true)]
+    async fn after_a_refresh_round_a_session_asks_no_resolver() {
+        let calls = Arc::default();
+        let env = RealNet::new().with_resolver(noting(&calls));
+        assert!(env.prefetch(|| vec!["ok.example:3478".into(), "down.example:3478".into()]));
+        for _ in 0..100 {
+            if env.stun_dns().refreshed() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(env.stun_dns().refreshed(), "{env:?}");
+        assert_eq!(*calls.lock().unwrap(), ["ok.example", "down.example"]);
+        for name in ["down.example", "Down.Example.", "unlisted.example"] {
+            let answer = at_once(env.resolve(name, 3478)).expect("answered at once");
+            assert_eq!(
+                answer.expect_err("not cached").kind(),
+                io::ErrorKind::NotFound,
+                "{name}"
+            );
+        }
+        let cached = at_once(env.resolve("ok.example", 3478)).expect("answered at once");
+        assert_eq!(cached.expect("cached"), ["64.0.0.20:3478".parse().unwrap()]);
+        assert_eq!(calls.lock().unwrap().len(), 2, "no lookup at session time");
+
+        env.stun_dns().clear();
+        assert!(!env.stun_dns().refreshed());
+        env.resolve("down.example", 3478)
+            .await
+            .expect_err("it fails");
+        assert_eq!(calls.lock().unwrap().len(), 3, "a cold cache looks up");
+    }
+
+    /// Design §5.3: a cold cache (no round has completed: the one-shot
+    /// `connect`) looks a name up once and keeps the answer, so the next
+    /// session reads the cache; the answer is kept even when the session
+    /// stopped waiting for it (`DNS_TIMEOUT`).
+    #[tokio::test(start_paused = true)]
+    async fn a_cold_cache_looks_a_name_up_once_and_keeps_the_answer() {
+        use crate::gather::DNS_TIMEOUT;
+        let calls = Arc::default();
+        let env = RealNet::new().with_resolver(noting(&calls));
+        assert!(!env.stun_dns().refreshed());
+        let ok: SocketAddr = "64.0.0.20:3478".parse().unwrap();
+        assert_eq!(env.resolve("ok.example", 3478).await.expect("found"), [ok]);
+        assert_eq!(calls.lock().unwrap().len(), 1, "exactly one lookup");
+        let again = at_once(env.resolve("ok.example", 3478)).expect("answered at once");
+        assert_eq!(again.expect("cached"), [ok]);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+
+        let given_up = tokio::time::timeout(DNS_TIMEOUT, env.resolve("slow.example", 3478)).await;
+        assert!(given_up.is_err(), "the session stops waiting");
+        assert_eq!(env.stun_dns().get("slow.example", 3478), None);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert_eq!(
+            env.stun_dns().get("slow.example", 3478),
+            Some(vec!["64.0.0.21:3478".parse().unwrap()])
+        );
+        assert_eq!(*calls.lock().unwrap(), ["ok.example", "slow.example"]);
+        assert!(!env.stun_dns().refreshed(), "a lookup is not a round");
     }
 
     /// The background refresh needs a runtime to start on.

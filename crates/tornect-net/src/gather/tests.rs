@@ -1101,12 +1101,14 @@ fn entries_name_a_host_and_a_port() {
 fn the_cache_keys_names_by_case_and_port() {
     let dns = StunDns::new();
     assert!(dns.is_empty());
+    assert!(!dns.refreshed(), "a new cache is cold");
     let a = vec![at("64.0.0.10:3478")];
     dns.put("Stun.Example.ORG.", 3478, a.clone());
     assert_eq!(dns.get("stun.example.org", 3478), Some(a.clone()));
     assert_eq!(dns.get("stun.example.org", 3479), None);
     dns.put("stun.example.org", 3478, Vec::new());
     assert_eq!(dns.get("STUN.example.org", 3478), Some(a));
+    assert!(!dns.refreshed(), "a name put is not a round");
     let shared = dns.clone();
     shared.clear();
     assert!(dns.is_empty(), "clones share the cache");
@@ -1144,6 +1146,7 @@ async fn a_refresh_round_replaces_keeps_and_forgets() {
     dns.put("gone.example", 3478, vec![at("64.0.0.40:3478")]);
     let calls = Calls::default();
     let t0 = Instant::now();
+    assert!(!dns.refreshed());
     let answered = dns
         .refresh(
             &strings(&[
@@ -1174,6 +1177,7 @@ async fn a_refresh_round_replaces_keeps_and_forgets() {
     assert_eq!(dns.get("hung.example", 3478), None);
     assert_eq!(dns.get("gone.example", 3478), None);
     assert_eq!(dns.len(), 2);
+    assert!(dns.refreshed(), "a round completed, whatever answered");
 }
 
 /// Design §4: the next round is 10 minutes ± 1 minute away, to the
@@ -1214,11 +1218,95 @@ async fn the_refresh_runs_rounds_and_follows_its_list() {
     tokio::time::sleep(ms(1)).await;
     assert_eq!(lock(&calls).len(), 1);
     assert_eq!(dns.len(), 1);
+    assert!(dns.refreshed());
     tokio::time::sleep(Duration::from_secs(9 * 60) - ms(2)).await;
     assert_eq!(lock(&calls).len(), 1, "not before nine minutes");
     allowed.store(false, std::sync::atomic::Ordering::SeqCst);
     tokio::time::sleep(Duration::from_secs(2 * 60) + ms(2)).await;
     assert_eq!(lock(&calls).len(), 1, "an empty list asks nothing");
     assert!(dns.is_empty(), "and empties the cache");
+    assert!(!dns.refreshed(), "which is cold again");
     task.abort();
+}
+
+/// A machine whose names are resolved as the real machine resolves them
+/// ([`RealNet`]'s `NetEnv::resolve`, its resolver a table); every other
+/// call is the wrapped machine's.
+struct RealNames<E> {
+    inner: E,
+    real: crate::RealNet,
+}
+
+impl<E: NetEnv> NetEnv for RealNames<E> {
+    fn interfaces(&self) -> BoxFuture<'static, Result<Vec<IfaceAddr>, NetError>> {
+        self.inner.interfaces()
+    }
+
+    fn route_sources(&self) -> RouteSources {
+        self.inner.route_sources()
+    }
+
+    fn bind(&self, port: Option<u16>) -> io::Result<BoundUdp> {
+        self.inner.bind(port)
+    }
+
+    fn resolve(&self, host: &str, port: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+        self.real.resolve(host, port)
+    }
+
+    fn mapper(&self) -> Arc<dyn PortMapper> {
+        self.inner.mapper()
+    }
+
+    fn admit_loopback(&self) -> bool {
+        self.inner.admit_loopback()
+    }
+}
+
+/// Design §5.3 ("a session uses the cache and never triggers a lookup
+/// unless the cache is empty"), §4 and §9.3 (the resolver operator cannot
+/// time sessions), through the client: after a round in which two names
+/// failed, a session walks past them and a name the round never listed
+/// without one lookup or one millisecond of DNS wait, and asks the cached
+/// server at once.
+#[tokio::test(start_paused = true)]
+async fn after_a_refresh_round_a_session_looks_no_name_up() {
+    let world = World::new();
+    let s1 = world.server("64.0.0.20/24", Answer::Fixed(at(NAT)));
+    let calls = Calls::default();
+    let real = crate::RealNet::new().with_resolver(table(&calls));
+    let dns = real.stun_dns().clone();
+    let listed = strings(&["down.example:3478", "hung.example:3478", "ok.example:3478"]);
+    assert_eq!(dns.refresh(&listed, &table(&calls)).await, 1);
+    assert!(dns.refreshed());
+    let looked_up = lock(&calls).len();
+    assert_eq!(looked_up, 3);
+
+    let env = CountingEnv::new(RealNames {
+        inner: world
+            .net
+            .machine(MachineSpec::on(world.home, "192.168.1.20/24")),
+        real,
+    });
+    let mut asker = Asker::new(&*env).await;
+    let t0 = Instant::now();
+    let report = asker
+        .ask(
+            &*env,
+            &strings(&[
+                "down.example:3478",
+                "hung.example:3478",
+                "new.example:3478",
+                "ok.example:3478",
+            ]),
+        )
+        .await;
+    assert_eq!(report.outcome, srflx(NAT));
+    assert_eq!(
+        world.requests(ip("192.168.1.20"), t0),
+        vec![(Duration::ZERO, s1.addr)]
+    );
+    assert_eq!((report.stats.resolves, report.stats.unresolved), (4, 3));
+    assert_eq!(env.calls().resolves, 4);
+    assert_eq!(lock(&calls).len(), looked_up, "no lookup at session time");
 }
