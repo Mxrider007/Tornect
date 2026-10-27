@@ -43,6 +43,7 @@ use crate::*;
 
 mod direct_bind;
 mod direct_host;
+mod direct_loopback;
 mod direct_path;
 
 const WAIT: Duration = Duration::from_secs(10);

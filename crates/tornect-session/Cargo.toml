@@ -34,6 +34,10 @@ tokio = { workspace = true, features = ["test-util"] }
 # MemNet direct links for the direct bind's crypto-close test (design
 # `direct` §12.1, step A15).
 tornect-net = { workspace = true, features = ["test-support"] }
+# The redaction e2e forces quinn-udp's own `sendmsg` warning through a raw
+# `UdpSocketState::send`, which Tornect's sockets never call (design
+# `direct` §12.4, step A22); tests only.
+quinn.workspace = true
 
 [lints]
 workspace = true
