@@ -10,23 +10,23 @@
 //! viewer's one fallback after its direct `Bind` ([`after_bind_close`]).
 
 use std::future::Future;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tornect_core::config::Network;
-use tornect_net::{BoxFuture, Candidate, CandidateKind, Established, QuicStream, Scope, canon_ip};
-use tornect_signal::messages::{self, MAX_CANDIDATES_PER_FRAME, candidate_kind};
+use tornect_net::{BoxFuture, Established, QuicStream};
 use zeroize::Zeroizing;
 
 mod decide;
 mod host;
 mod viewer;
+mod wire;
 
 pub use decide::{Decision, FallbackWhy, Mine, PathEnd, TorWhy, decide};
 pub use host::{DirectHost, DirectHostStats, OnMedia};
 pub use viewer::{DirectBindFailed, DirectMedia, PathChoice, ViewerDirect, ViewerDirectStats};
+pub use wire::{from_wire, to_wire};
 
 /// Whether a session may reach beyond the same site (the direct design
 /// §4): public addresses, server-reflexive and mapped candidates. Off in
@@ -49,16 +49,21 @@ pub const HOST_DIRECT_LINGER: Duration = Duration::from_secs(20);
 pub const DIRECT_DRAIN: Duration = Duration::from_secs(2);
 
 /// The least `network.punch_timeout_ms` the direct path uses (the direct
-/// design §4); a configured value below it is raised to it.
-pub const PUNCH_TIMEOUT_MIN_MS: u32 = 1000;
+/// design §4): `Config::validate` refuses a file below it, and options built
+/// any other way are raised to it.
+pub const PUNCH_TIMEOUT_MIN_MS: u32 = tornect_core::config::PUNCH_TIMEOUT_MIN_MS;
 
 /// The most `network.punch_timeout_ms` the direct path uses, under the
-/// host's [`HOST_DIRECT_LINGER`]; a configured value above it is lowered to
-/// it.
-pub const PUNCH_TIMEOUT_MAX_MS: u32 = 10_000;
+/// host's [`HOST_DIRECT_LINGER`]: `Config::validate` refuses a file above
+/// it, and options built any other way are lowered to it.
+pub const PUNCH_TIMEOUT_MAX_MS: u32 = tornect_core::config::PUNCH_TIMEOUT_MAX_MS;
 
 // The linger outlasts the longest punch by 10 s (the direct design §4).
 const _: () = assert!(HOST_DIRECT_LINGER.as_secs() >= PUNCH_TIMEOUT_MAX_MS as u64 / 1000 + 10);
+
+// A fixed `network.direct_port` that `Config::validate` lets through is one
+// the peer's `RemoteFilter` admits.
+const _: () = assert!(tornect_core::config::MIN_DIRECT_PORT == tornect_net::addr::MIN_REMOTE_PORT);
 
 /// What the direct path is run with, from `[network]` (the direct design
 /// §8.5 `DirectOptions`). Phase B adds the STUN partitions and the router
@@ -147,85 +152,6 @@ pub trait SecondStream: Send + Sync {
     ) -> BoxFuture<'static, ()>;
 }
 
-/// `batch` as the `CANDIDATES` frames that carry it, at most
-/// [`MAX_CANDIDATES_PER_FRAME`] candidates each, every frame with `scope`
-/// (the direct design §4, §6.1): IPv4 as 4 bytes (never v4-mapped), IPv6 as
-/// 16. A peer-reflexive candidate is local only and never sent, nor is a
-/// candidate without a port.
-#[must_use]
-pub fn to_wire(batch: &[Candidate], scope: Scope) -> Vec<messages::Candidates> {
-    let code = match scope {
-        Scope::SameSite => messages::scope::SAME_SITE,
-        Scope::Internet => messages::scope::INTERNET,
-    };
-    let wire: Vec<messages::Candidate> = batch
-        .iter()
-        .filter_map(|c| {
-            let kind = match c.kind {
-                CandidateKind::Host => candidate_kind::HOST,
-                CandidateKind::Srflx => candidate_kind::SRFLX,
-                CandidateKind::Mapped => candidate_kind::MAPPED,
-                CandidateKind::Prflx => return None,
-            };
-            let ip = match canon_ip(c.addr.ip()) {
-                IpAddr::V4(v4) => v4.octets().to_vec(),
-                IpAddr::V6(v6) => v6.octets().to_vec(),
-            };
-            (c.addr.port() != 0).then(|| messages::Candidate {
-                kind,
-                ip,
-                port: c.addr.port(),
-            })
-        })
-        .collect();
-    wire.chunks(MAX_CANDIDATES_PER_FRAME)
-        .map(|chunk| messages::Candidates {
-            candidates: chunk.to_vec(),
-            scope: Some(code),
-        })
-        .collect()
-}
-
-/// A peer's `CANDIDATES` frame as the direct link takes it: its candidates
-/// and its scope (the direct design §4, §6.1). A candidate of a kind this
-/// build does not know, a v4-mapped IPv6 address, an address of another
-/// length or port 0 is dropped; an absent or unknown scope is
-/// [`Scope::SameSite`].
-#[must_use]
-pub fn from_wire(frame: &messages::Candidates) -> (Vec<Candidate>, Scope) {
-    let scope = if frame.internet() {
-        Scope::Internet
-    } else {
-        Scope::SameSite
-    };
-    let batch = frame
-        .candidates
-        .iter()
-        .filter_map(|c| {
-            let kind = match c.kind {
-                candidate_kind::HOST => CandidateKind::Host,
-                candidate_kind::SRFLX => CandidateKind::Srflx,
-                candidate_kind::MAPPED => CandidateKind::Mapped,
-                _ => return None,
-            };
-            let ip = if let Ok(v4) = <[u8; 4]>::try_from(c.ip.as_slice()) {
-                IpAddr::from(v4)
-            } else {
-                let v6 = Ipv6Addr::from(<[u8; 16]>::try_from(c.ip.as_slice()).ok()?);
-                if v6.to_ipv4_mapped().is_some() {
-                    return None;
-                }
-                IpAddr::V6(v6)
-            };
-            (c.port != 0).then(|| Candidate {
-                kind,
-                addr: SocketAddr::new(ip, c.port),
-            })
-        })
-        .collect();
-    (batch, scope)
-}
-
 /// A bidirectional stream of a session's direct connection, as the media
 /// host serves it: [`tornect_net::QuicStream`] in production, a pipe in
 /// tests.
@@ -285,8 +211,9 @@ fn after_close(closed_by_crypto: bool, host_bytes: u64) -> AfterBind {
 mod tests {
     use super::*;
 
+    use tornect_net::{Candidate, CandidateKind, Scope};
     use tornect_signal::messages::Body as _;
-    use tornect_signal::messages::scope;
+    use tornect_signal::messages::{self, candidate_kind, scope};
 
     fn candidate(kind: CandidateKind, addr: &str) -> Candidate {
         Candidate {
