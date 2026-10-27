@@ -298,11 +298,15 @@ pub struct Network {
     /// tell a side its public address on the internet direct path (design
     /// `direct` §5.3). The list is split by operator (the registrable domain)
     /// between the two roles: the viewer asks the operators at even places
-    /// in the order they first appear, the host those at odd places, so no
-    /// operator sees both ends of a session. Each side asks one server per
-    /// session, and a second of its own part only when the first stays
-    /// silent. A list of one operator is used by both sides, and that
-    /// operator then sees both. May be emptied (no STUN).
+    /// in the order they first appear, the host those at odd places. When
+    /// both computers use the same list, as with the default, no operator
+    /// sees both ends of a session. Each computer splits its own list, so a
+    /// list edited on one computer only (an entry added, removed or moved)
+    /// can put an operator in both computers' parts, and that operator may
+    /// then see both ends. Each side asks one server per session, and a
+    /// second of its own part only when the first stays silent. A list of
+    /// one operator is used by both sides, and that operator then sees
+    /// both. May be emptied (no STUN).
     pub stun_servers: Vec<String>,
     /// Whether to ask a STUN server at all (the Settings STUN switch). Off:
     /// no server is asked and no name is resolved; only router mapping and

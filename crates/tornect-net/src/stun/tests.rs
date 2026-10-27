@@ -596,6 +596,42 @@ fn no_operator_is_in_both_parts() {
     );
 }
 
+/// The residual of design §5.3's split (the review of steps B2 and B3):
+/// each computer splits its own list, so the parts are disjoint only when
+/// both computers use the same list. A viewer whose list has one entry
+/// put before the default shifts every operator's place, and shares Google
+/// and Nextcloud with a host on the default list: the config, module and
+/// partition docs state the condition.
+#[test]
+fn only_the_same_list_on_both_computers_keeps_the_parts_apart() {
+    let default = tornect_core::config::Network::default().stun_servers;
+    let mut edited = strings(&["stun.example.org:3478"]);
+    edited.extend(default.iter().cloned());
+    let viewer = partition(&edited, TornectRole::Viewer);
+    assert_eq!(
+        viewer,
+        strings(&[
+            "stun.example.org:3478",
+            "stun.l.google.com:19302",
+            "stun.nextcloud.com:443",
+        ])
+    );
+    let host = partition(&default, TornectRole::Host);
+    let shared: Vec<&String> = viewer.iter().filter(|v| host.contains(v)).collect();
+    assert_eq!(
+        shared,
+        ["stun.l.google.com:19302", "stun.nextcloud.com:443"],
+        "an operator in both computers' parts"
+    );
+    let host = partition(&edited, TornectRole::Host);
+    assert!(
+        !viewer
+            .iter()
+            .any(|v| host.iter().any(|h| operator(h) == operator(v))),
+        "the same list on both sides: {viewer:?} {host:?}"
+    );
+}
+
 fn any_addr() -> impl Strategy<Value = SocketAddr> {
     prop_oneof![
         (any::<[u8; 4]>(), any::<u16>())

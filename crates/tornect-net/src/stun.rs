@@ -16,9 +16,11 @@
 //! Tornect never answers STUN, so there is no response encoder here.
 //!
 //! [`partition`] splits the user's server list between the two roles by
-//! operator (§5.3), so that one operator never sees both ends of a
-//! session; the client that asks the servers is
-//! [`gather`](crate::gather)'s.
+//! operator (§5.3), so that, when both computers use the same list (the
+//! default does), one operator never sees both ends of a session. Each
+//! computer splits its own list: lists that differ (one edited on one
+//! computer only) can put an operator in both computers' parts. The client
+//! that asks the servers is [`gather`](crate::gather)'s.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -265,9 +267,11 @@ pub fn operator(entry: &str) -> String {
 /// This side's part of the `stun_servers` list (design §5.3): the entries
 /// grouped by [`operator`], the groups in the order their operator first
 /// appears; the viewer takes the groups at even places (0, 2, …) and the
-/// host those at odd places, so no operator is in both parts, whatever the
-/// list. A list of one operator is both sides' part. The entries keep their
-/// order within a group, and an entry listed twice is kept once.
+/// host those at odd places, so no operator is in both parts of one list,
+/// whatever the list. The two computers of a session each split their own
+/// list: only when the lists are the same are their parts disjoint. A list
+/// of one operator is both sides' part. The entries keep their order within
+/// a group, and an entry listed twice is kept once.
 #[must_use]
 pub fn partition(list: &[String], role: TornectRole) -> Vec<String> {
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
