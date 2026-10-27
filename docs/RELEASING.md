@@ -54,7 +54,10 @@ release is a GitHub **pre-release** with two zips, `SHA256SUMS` and release note
    must then say so); it prints the database's age. It refuses to run with a
    `CARGO_PROFILE_RELEASE_*` variable set: `BUILD-INFO.txt`'s profile line is read from
    `Cargo.toml`'s `[profile.release]`, and such a variable would change the build behind it (audit
-   finding B30).
+   finding B30). It refuses a release graph that enables `tornect-net`'s `test-support` feature
+   (the in-memory and loopback test environments, which admit loopback addresses; decision M1-82):
+   for each platform, `cargo tree -p tornect --target <triple> -e normal,build,features -i
+   tornect-net` must not list it.
    Per platform it:
    - fetches or re-checks lyrebird (`cargo xtask pt-fetch`, `packaging/pt/SOURCES.md`);
    - runs `cargo build --locked --release --target <triple> -p tornect` into `target/dist/cargo/`

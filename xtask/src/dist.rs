@@ -141,6 +141,11 @@ pub fn dist(root: &Path, args: &[String]) -> anyhow::Result<()> {
              (audit finding B30). Move it to Cargo.toml"
         );
     }
+    // The direct design §8.8 (decision M1-82): no release graph carries a
+    // test-only feature; checked before anything is fetched or built.
+    for platform in &platforms {
+        no_test_support(root, platform.triple)?;
+    }
     let version = env!("CARGO_PKG_VERSION");
     let git = Git::read(root)?;
     if git.dirty {
@@ -209,6 +214,65 @@ pub fn dist(root: &Path, args: &[String]) -> anyhow::Result<()> {
             i.id, i.reason
         );
     }
+    Ok(())
+}
+
+/// The feature node of `tornect-net`'s test environments (`mem`: the
+/// in-memory network and the loopback machine, which admit loopback
+/// addresses) as `cargo tree -e features --prefix none` prints it. Only
+/// dev-dependencies may enable it (the direct design §8.8, decision M1-82).
+const TEST_SUPPORT: &str = "tornect-net feature \"test-support\"";
+
+/// Refuses a release graph of `tornect` for `triple` that enables
+/// `tornect-net`'s `test-support` feature: `cargo tree -p tornect --target
+/// <triple> -e normal,build,features -i tornect-net` (the edges `cargo build
+/// --release -p tornect` follows) must not list it (the direct design §8.8).
+fn no_test_support(root: &Path, triple: &str) -> anyhow::Result<()> {
+    let out = crate::cargo()
+        .args([
+            "tree",
+            "--locked",
+            "-p",
+            "tornect",
+            "--target",
+            triple,
+            "-e",
+            "normal,build,features",
+            "-i",
+            "tornect-net",
+            "--prefix",
+            "none",
+        ])
+        .current_dir(root)
+        .output()
+        .context("spawning `cargo tree -i tornect-net`")?;
+    ensure!(
+        out.status.success(),
+        "`cargo tree --target {triple} -e normal,build,features -i tornect-net` failed ({}): {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    test_support_check(&String::from_utf8_lossy(&out.stdout), triple)?;
+    println!("dist: {triple}: the release graph enables no test-only feature of tornect-net");
+    Ok(())
+}
+
+/// [`no_test_support`]'s reading of the inverted feature tree `tree`: it
+/// must be `tornect-net`'s, and no line may be [`TEST_SUPPORT`] (a repeated
+/// node ends in ` (*)`).
+fn test_support_check(tree: &str, triple: &str) -> anyhow::Result<()> {
+    let mut lines = tree.lines().map(str::trim).filter(|l| !l.is_empty());
+    ensure!(
+        lines.next().is_some_and(|l| l.starts_with("tornect-net v")),
+        "`cargo tree -i tornect-net` for {triple} did not print tornect-net's tree"
+    );
+    ensure!(
+        !lines.any(|l| l.strip_suffix(" (*)").unwrap_or(l) == TEST_SUPPORT),
+        "{triple}: the release graph of tornect enables tornect-net's `test-support` feature \
+         (the test environments, which admit loopback addresses): only dev-dependencies may \
+         enable it. `cargo tree -p tornect --target {triple} -e normal,build,features -i \
+         tornect-net` shows who does"
+    );
     Ok(())
 }
 
@@ -1214,6 +1278,57 @@ fn capture(cmd: &mut Command) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The inverted feature tree of the release graph as `cargo tree` printed
+    /// it on 2026-10-27 (`-e normal,build,features -i tornect-net --prefix
+    /// none`, `x86_64-unknown-linux-gnu`; the paths shortened).
+    const RELEASE_TREE: &str = "tornect-net v0.1.0 (/w/crates/tornect-net)
+tornect-net feature \"default\"
+tornect v0.1.0 (/w/apps/tornect)
+tornect feature \"default\" (command-line)
+tornect-session v0.1.0 (/w/crates/tornect-session)
+tornect-session feature \"default\"
+tornect v0.1.0 (/w/apps/tornect) (*)
+";
+
+    /// The direct design §8.8 and §12.1: the dist feature check passes the
+    /// release graph and refuses a fixture graph in which a normal
+    /// dependency enables `tornect-net`'s `test-support` (as a first and as
+    /// a repeated node), and a tree that is not tornect-net's; a feature
+    /// that only starts with the same name is not it.
+    #[test]
+    fn the_feature_check_refuses_a_graph_with_test_support() {
+        let triple = "x86_64-unknown-linux-gnu";
+        test_support_check(RELEASE_TREE, triple).unwrap();
+        let enabled = format!(
+            "{RELEASE_TREE}tornect-net feature \"test-support\"\ntornect v0.1.0 \
+             (/w/apps/tornect) (*)\n"
+        );
+        let err = test_support_check(&enabled, triple)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(triple), "{err}");
+        assert!(err.contains("`test-support`"), "{err}");
+        let repeated = format!("{RELEASE_TREE}tornect-net feature \"test-support\" (*)\n");
+        assert!(test_support_check(&repeated, triple).is_err());
+        let indented = format!("{RELEASE_TREE}    tornect-net feature \"test-support\"\n");
+        assert!(test_support_check(&indented, triple).is_err());
+        let other = format!("{RELEASE_TREE}tornect-net feature \"test-support-docs\"\n");
+        test_support_check(&other, triple).unwrap();
+        assert!(test_support_check("", triple).is_err());
+        assert!(test_support_check("tornect v0.1.0 (/w/apps/tornect)\n", triple).is_err());
+    }
+
+    /// The check on the workspace as it is: neither graph that ships
+    /// enables the test environments (the app and the session crate enable
+    /// them for their own tests only).
+    #[test]
+    fn neither_release_graph_enables_test_support() {
+        let root = crate::workspace_root().unwrap();
+        for triple in [LINUX.triple, WINDOWS.triple] {
+            no_test_support(&root, triple).unwrap();
+        }
+    }
 
     #[test]
     fn utc_dates() {
