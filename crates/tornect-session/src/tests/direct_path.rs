@@ -302,6 +302,22 @@ impl Fx {
         self.fsm.await.unwrap().unwrap();
         line
     }
+
+    /// The host ended the session with `BYE{reason}`; its end line.
+    async fn host_ended(mut self, reason: u16) -> (Option<TransportKind>, Option<PathSummary>) {
+        let event = self.session.next_event(WAIT).await.unwrap();
+        assert_eq!(
+            event,
+            Some(SessionEvent::Bye {
+                reason,
+                detail: None
+            })
+        );
+        let line = self.ends.line().await;
+        drop(self.session);
+        self.fsm.await.unwrap().unwrap();
+        line
+    }
 }
 
 fn direct(choice: PathChoice) -> Box<DirectMedia> {
@@ -754,6 +770,20 @@ async fn each_decision_cell_writes_its_frame_and_touches_no_network() {
             PathEnd::LanRefused,
             vec![],
         ),
+        // A host that signed `lan_only` refuses Tor media as a `lan_only`
+        // viewer does (decision M1-85): its old build or this same device
+        // ends the session with nothing written, not with an onion `Bind`
+        // the host would refuse.
+        (
+            cell(LAN, Mine::of(ANY), true, true, false),
+            PathEnd::LanRefused,
+            vec![],
+        ),
+        (
+            cell(LAN, Mine::of(ANY), true, false, true),
+            PathEnd::LanRefused,
+            vec![],
+        ),
     ];
     for (
         Cell {
@@ -791,7 +821,12 @@ async fn each_decision_cell_writes_its_frame_and_touches_no_network() {
             bye::USER
         };
         assert_eq!(fx.viewer.stats(), ViewerDirectStats::default(), "{cell}");
-        let (transport, _) = fx.end(reason).await;
+        // A `lan_only` host ends its own device's session itself (step A16).
+        let (transport, _) = if host_policy == LAN && same_device {
+            fx.host_ended(bye::NO_LAN_PATH).await
+        } else {
+            fx.end(reason).await
+        };
         assert_eq!(transport, None, "{cell}");
     }
 }

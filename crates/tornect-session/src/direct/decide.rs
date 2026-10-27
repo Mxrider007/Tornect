@@ -245,9 +245,9 @@ pub enum Decision {
 ///
 /// 1. no media → [`Decision::NoMedia`], whatever the policies;
 /// 2. an old host → `TOR_FALLBACK{}` ([`TorWhy::OldHost`]), or
-///    [`Decision::LanRefused`] when this side is `lan_only`;
+///    [`Decision::LanRefused`] when either side is `lan_only`;
 /// 3. the same device → `TOR_FALLBACK{OFF}` ([`TorWhy::SameDevice`]), or
-///    [`Decision::LanRefused`] when this side is `lan_only`;
+///    [`Decision::LanRefused`] when either side is `lan_only`;
 /// 4. the policy table: a `tor_only` side and a `lan_only` side have no
 ///    path in common ([`Decision::LanRefused`]); a host's `tor_only` is
 ///    [`TorWhy::HostPolicy`] (`PEER_OFF`, or `OFF` when this side is
@@ -255,6 +255,13 @@ pub enum Decision {
 ///    or [`TorWhy::Bridge`] (`OFF`); otherwise the path is tried, within
 ///    the same site when either side is `lan_only` or the build has no
 ///    internet scope ([`INTERNET_DIRECT`]).
+///
+/// In rules 2 and 3 a host that signed `lan_only` refuses Tor media just
+/// as this side's own `lan_only` does (decision M1-85): neither an old
+/// host nor this same device can have a same-site path, so the session
+/// ends with nothing revealed instead of binding an onion stream the host
+/// promised not to serve. The design's text names only this side's policy
+/// there.
 #[must_use]
 pub fn decide(
     p_h: TransportPolicy,
@@ -277,12 +284,12 @@ pub(crate) fn decide_with(
     same_key: bool,
 ) -> Decision {
     use TransportPolicy::{Any, LanOnly, TorOnly};
-    let here_lan_only = mine.policy == LanOnly;
+    let lan_only = mine.policy == LanOnly || p_h == LanOnly;
     if !media {
         return Decision::NoMedia;
     }
     if !host_dir1 {
-        return if here_lan_only {
+        return if lan_only {
             Decision::LanRefused
         } else {
             Decision::Tor {
@@ -292,7 +299,7 @@ pub(crate) fn decide_with(
         };
     }
     if same_key {
-        return if here_lan_only {
+        return if lan_only {
             Decision::LanRefused
         } else {
             Decision::Tor {
@@ -394,8 +401,9 @@ mod tests {
     /// Rules 1–3 come before the table (the direct design §4): no media is
     /// `NO_MEDIA` whatever the policies; an old host is sent
     /// `TOR_FALLBACK{}` and the same device `TOR_FALLBACK{OFF}`, except
-    /// that a `lan_only` viewer ends the session instead; the bridge rule
-    /// gives its own reason.
+    /// that the session ends instead when either side is `lan_only` (a
+    /// `lan_only` host's signed policy refuses Tor media as the viewer's
+    /// own does, decision M1-85); the bridge rule gives its own reason.
     #[test]
     fn media_the_old_host_and_the_same_device_come_first() {
         for p_h in [ANY, TOR, LAN] {
@@ -405,9 +413,9 @@ mod tests {
                 assert_eq!(decide(p_h, m, false, false, true), Decision::NoMedia);
                 let old = decide(p_h, m, true, false, true);
                 let same = decide(p_h, m, true, true, true);
-                if mine == LAN {
-                    assert_eq!(old, Decision::LanRefused);
-                    assert_eq!(same, Decision::LanRefused);
+                if mine == LAN || p_h == LAN {
+                    assert_eq!(old, Decision::LanRefused, "host {p_h:?}, viewer {mine:?}");
+                    assert_eq!(same, Decision::LanRefused, "host {p_h:?}, viewer {mine:?}");
                 } else {
                     assert_eq!(old, tor(None, TorWhy::OldHost));
                     assert_eq!(same, tor(Some(fallback::OFF), TorWhy::SameDevice));
