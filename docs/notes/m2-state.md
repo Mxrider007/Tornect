@@ -62,6 +62,20 @@ Checkpoint A22 (this session, base `6a4bc7c9`):
 The security review of the Phase A diff found no defect (ledger row "Checkpoint A22: the security
 review of the Phase A diff" lists what was judged).
 
+The final security and correctness reviews of the whole Phase A diff (fixes after `d6adb5a4`;
+ledger rows "Final review: …"):
+
+- `8e15f2d4` fix(session): an onion `Bind` is told `TRANSPORT` only after its MAC verified.
+- `3f68da92` fix(session): a kill lets live direct media end through its teardown (within
+  `DIRECT_DRAIN`) before the link closes.
+- `83df7047` fix(signal): `departure` reads one byte past an early frame, so B04 holds again for a
+  requester that sent one frame and left.
+- `6c96c327` fix(signal): the viewer's `ping` queues at most a session's worth of host path frames.
+- `82b539a0` docs(net): the session socket's port is not exclusive on Windows or macOS
+  (`SO_EXCLUSIVEADDRUSE` not set; device check added to §13 rows 12 and 13).
+- `dd76eadf` docs: decisions cited by their M1 rows.
+- the docs commit: ledger rows, the B04 and A2 residual, decision notes on M1-79 and M1-80.
+
 ## Before `m2a` (all [VM] or device; recipes in the ledger)
 
 1. The live Phase A demo on the dev VM (design §12.5): `ROUTE direct lan`, `PATH host`, `MEDIA`,
@@ -82,7 +96,8 @@ Then tag `m2a` at the commit the evidence was taken on.
 Row 1 (a Windows host and a Linux viewer on one LAN: the firewall prompt, Allow/Cancel, a standard
 account, `kill` of the host), row 2 (dual-stack IPv4 on Windows and macOS, read through the new
 debug counters), row 12 (macOS firewall and `ROUTE direct lan`), row 13 (Windows: a dead candidate
-and `WSAECONNRESET`, `doctor`, the 1 s interface read), row 14 (roaming), the two-machine run of
+and `WSAECONNRESET`, `doctor`, the 1 s interface read, a same-account `SO_REUSEADDR` bind of the
+fixed port; row 12 has the macOS one), row 14 (roaming), the two-machine run of
 the row "Step A15: the direct bind between two real machines", `LoopbackNet` and the loopback link
 tests on macOS and Windows, msvc and darwin builds of the crates above ring (only `tornect-core`
 and the crates below ring check here).
