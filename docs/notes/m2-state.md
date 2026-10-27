@@ -126,6 +126,19 @@ and the crates below ring check here).
   `DirectParams`/`DirectOptions` STUN fields, and the second ULA design gap. Left for B11/B12: the
   app's `RealNet::prefetch` call, with a list that is empty whenever STUN may not run (design
   §5.3: `INTERNET_DIRECT`, policy `Any`, `enable_stun`, not bridged).
+- B2/B3 review fixes (2026-10-27, `d59f0c15`, `25e4161f`, `f8e7bea3`, `d7fa045c`; ledger rows
+  "Review of steps B2 and B3", decision M1-81's review note): `RealNet::resolve` looks a name up
+  at session time only while `StunDns::refreshed()` is false (no round since the cache was made or
+  cleared); after a round a miss is `NotFound` at once. The operator split is only disjoint when
+  both computers use the same list (docs and a residual test). In VPN mode `ask_stun` asks a server
+  only when `NetEnv::route_source_to(server)` is the tunnel's source (`StunAsk::tunnel`).
+  `fuzz/Cargo.lock` is complete again. Owed by later steps: B6 passes
+  `tunnel: vpn.then_some(base)`; B11 restarts `prefetch` on every settings save and every change of
+  the bridge state (a cleared cache stays cold, and a newly listed name is answered only after the
+  next round), words `STUN_LINE` with "when both computers use the same list" (and may add a doctor
+  note when the list is not the default); C1 puts the same-list condition into M1-81's final text
+  and the plan's threat model, and §13 rows 10/11 (B13) include the split-tunnel case whose recipe
+  is in the ledger.
 - B4/B5: router mapping (UPnP, PCP, NAT-PMP) as `RealMapper` in place of `NoMapper`, the `router_port` ledger sweep.
 - B7/B8: the internet-scope ranks in `MemNet`; `NatBox`, `MemStun`, `MemMapper`.
 - B9: the NAT matrix on `MemNet`; the redaction e2e with `FakeIgd` and `FakePcp`.
