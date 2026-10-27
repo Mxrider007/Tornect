@@ -104,10 +104,16 @@ and the crates below ring check here).
 
 ## OPEN, owned by Phase B steps
 
-- B1/B2: the research and pins of the internet half (igd-next, crab_nat, netdev `gateway`, the
-  Windows route lookup) and the STUN codec (`stun.rs`, RFC 5769 vectors, the `stun` fuzz target).
+- B1 (done 2026-10-27; `docs/VERIFICATION.md`, Phase B): the pins (igd-next, crab_nat, netdev
+  `gateway` off Windows, the windows-sys IpHelper features), `nat-traversal.md` §2 to §7, the
+  Windows route lookup (`tornect_platform::route::default_gateway_v4`, handed to `RealNet` by
+  `direct::real_net`), `NetEnv::resolve` and `NetEnv::mapper` with `mapping.rs`'s types and
+  `NoMapper` everywhere. Left from it: the Windows `GetBestRoute2` run, the netdev gateway on a
+  desktop and on macOS, the live STUN check (NEEDS-DEVICE rows) and the owner's call on the Google
+  and Nextcloud terms (OPEN until B12).
+- B2: the STUN codec (`stun.rs`, RFC 5769 vectors, the `stun` fuzz target).
 - B3/B6: server-reflexive candidates (a CGNAT-only computer), the second ULA design gap (B6).
-- B4/B5: router mapping (UPnP, PCP, NAT-PMP), `default_gateway_v4`, the `router_port` ledger sweep.
+- B4/B5: router mapping (UPnP, PCP, NAT-PMP) as `RealMapper` in place of `NoMapper`, the `router_port` ledger sweep.
 - B7/B8: the internet-scope ranks in `MemNet`; `NatBox`, `MemStun`, `MemMapper`.
 - B9: the NAT matrix on `MemNet`; the redaction e2e with `FakeIgd` and `FakePcp`.
 - B10: `MediaLimits::encoder_direct` (a direct session still encodes with the Tor preset's table:
