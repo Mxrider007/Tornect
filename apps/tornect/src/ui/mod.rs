@@ -313,7 +313,7 @@ pub fn run(paths: &Paths, opts: GuiOpts, background: bool) -> anyhow::Result<()>
             identity: Arc::new(real.identity),
             device: Arc::new(real.device),
             knobs,
-            net: Arc::new(tornect_net::RealNet::new()),
+            net: Arc::new(crate::direct::real_net()),
             background: gate_fact,
             hosted_store: std::sync::OnceLock::new(),
         },

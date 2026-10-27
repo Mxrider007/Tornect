@@ -84,6 +84,23 @@ pub struct DirectWiring {
     pub net: Arc<dyn NetEnv>,
 }
 
+/// This machine's network for direct links. On Windows it reads each
+/// interface's IPv4 gateway with `tornect-platform`'s `GetBestRoute2`
+/// lookup, which sends nothing: netdev's own Windows gateway read may send
+/// ARP and is never compiled (design `direct` §7.1, §8.6). Linux and macOS
+/// read it through netdev.
+#[must_use]
+pub fn real_net() -> RealNet {
+    #[cfg(windows)]
+    {
+        RealNet::new().with_gateway_lookup(tornect_platform::route::default_gateway_v4)
+    }
+    #[cfg(not(windows))]
+    {
+        RealNet::new()
+    }
+}
+
 impl DirectWiring {
     /// The parts for `device` on this machine, with `knobs`.
     #[must_use]
@@ -91,7 +108,7 @@ impl DirectWiring {
         Self {
             device,
             knobs,
-            net: Arc::new(RealNet::new()),
+            net: Arc::new(real_net()),
         }
     }
 
