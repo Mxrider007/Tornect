@@ -147,6 +147,18 @@ pub(in super::super) const AGAIN: &str = "Type it again";
 pub(in super::super) const DIFFER: &str = "The two entries differ.";
 
 /// The hard lock off (`hard_lock_after` 0), as §B.8.7.1 ⑤ warns of it.
+/// The help line under "Pictures and input through Tor only" (design
+/// `direct` §3.6; Phase A: the local address, the internet address once
+/// internet direct connections exist). The operator-approved disclosures
+/// are not edited.
+pub(in super::super) const TOR_ONLY_HELP: &str = if tornect_session::INTERNET_DIRECT {
+    "Without this, sessions from this device may connect directly, and that device learns this \
+     computer's internet address."
+} else {
+    "Without this, sessions from this device may connect directly, and that device learns this \
+     computer's local address."
+};
+
 pub(in super::super) const HARD_LOCK_OFF: &str = "With 0 the hard lock is off: guessing is then \
     limited only by the lifetime budget, at most 60 failed attempts until it is unlocked here or \
     from one of your devices with control under My machines, plus about 52 a year, at most 24 a \
@@ -1709,6 +1721,7 @@ fn options(
         &mut o.require_tor_only,
         "Pictures and input through Tor only",
     );
+    line(ui, TOR_ONLY_HELP, t.text_muted);
     // "Only while nobody is using this computer" and "Lock this computer
     // when a session ends" are not offered: nothing carries them out yet
     // (OPEN in docs/VERIFICATION.md, as the operator ruled).
@@ -2927,6 +2940,24 @@ mod tests {
                 assert!(state(&window, id).is_none(), "{leave}: {id}");
             }
         }
+    }
+
+    /// Design `direct` §3.6: the grant's Tor-only box says what leaving it
+    /// unticked lets that device learn (Phase A: the local address), ticked
+    /// or not.
+    #[test]
+    fn the_tor_only_box_says_what_a_direct_session_discloses() {
+        assert_eq!(
+            TOR_ONLY_HELP,
+            "Without this, sessions from this device may connect directly, and that device \
+             learns this computer's local address."
+        );
+        let mut window = at_options("My machines", false);
+        assert!(window.has_control("Pictures and input through Tor only"));
+        assert!(window.has_text(TOR_ONLY_HELP));
+        options_mut(&mut window).require_tor_only = true;
+        window.pass(Vec::new());
+        assert!(window.has_text(TOR_ONLY_HELP));
     }
 
     /// §B.8.7.1 ⑤, §B.8.6.1: each option keeps its rule, and every option

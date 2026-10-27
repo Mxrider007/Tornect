@@ -17,6 +17,8 @@ use tornect_core::levels::{
     ADMIN_LINE, ADMIN_LINE_NO_PROMPT, AdminPath, Answers, Availability, LINE_VIEW_ONLY,
     SENTENCE_ADMIN_NOT_GIVEN, SENTENCE_SECURE_DESKTOP_OFF,
 };
+use tornect_session::INTERNET_DIRECT;
+use tornect_signal::consent::{TransportKnob, TransportPolicy};
 use tornect_signal::fsm::client::ClientPairingUi;
 use tornect_signal::pairing::{
     BoxFuture, Consent, PairDecision, PairingPeer, SessionDecision, SessionRequestSummary,
@@ -338,15 +340,20 @@ pub struct CliConsent {
     /// The device words and the look-alike alarm (§B.6.1); without them the
     /// pairing question shows the device fingerprint as before.
     words: Option<Arc<Recognizer>>,
+    /// The policy the host signs at the accept (design `direct` §3.6): read
+    /// at each session question, which then says what an accept discloses
+    /// on a direct path.
+    transport: TransportKnob,
 }
 
 impl CliConsent {
-    /// Ask through `prompter`.
+    /// Ask through `prompter`, for a host whose sessions read `transport`.
     #[must_use]
-    pub fn new(prompter: Arc<Prompter>) -> Self {
+    pub fn new(prompter: Arc<Prompter>, transport: TransportKnob) -> Self {
         Self {
             prompter,
             words: None,
+            transport,
         }
     }
 
@@ -410,7 +417,10 @@ impl Consent for CliConsent {
         Box::pin(async move {
             match self
                 .prompter
-                .ask_about(&session_question(peer), &closed_line(&peer.label))
+                .ask_about(
+                    &session_question(peer, self.transport.get()),
+                    &closed_line(&peer.label),
+                )
                 .await
             {
                 Some(answer) => parse_session(&answer),
@@ -429,7 +439,7 @@ impl Consent for CliConsent {
             match self
                 .prompter
                 .ask_about(
-                    &session_question_at(peer, levels),
+                    &session_question_at(peer, levels, self.transport.get()),
                     &closed_line(&peer.label),
                 )
                 .await
@@ -451,7 +461,7 @@ impl Consent for CliConsent {
             let question = format!(
                 "\n{}{}",
                 SENTENCE_ADMIN_NOT_GIVEN, ": the other answers are still open.",
-            ) + &session_question_at(peer, levels);
+            ) + &session_question_at(peer, levels, self.transport.get());
             match self
                 .prompter
                 .ask_about(&question, &closed_line(&peer.label))
@@ -473,10 +483,37 @@ fn closed_line(who: &str) -> String {
     )
 }
 
+/// The note under a session question while an accept may let the session
+/// connect directly (design `direct` §3.6, \[SEC\]; Phase A: the local
+/// address): what `label` then learns, and, while it is the switch's doing,
+/// how to relay every session instead. `lan_only` has no Tor to relay
+/// through, so its note names no switch; Tor only has no note.
+fn direct_note(label: &str, policy: TransportPolicy) -> Option<String> {
+    let what = if INTERNET_DIRECT {
+        "internet address"
+    } else {
+        "local address"
+    };
+    let note = format!("  note: accepting also lets \"{label}\" learn this computer's {what}");
+    match policy {
+        TransportPolicy::Any => Some(format!(
+            "{note} (network.paranoid = true relays through Tor)"
+        )),
+        TransportPolicy::LanOnly => Some(note),
+        TransportPolicy::TorOnly => None,
+    }
+}
+
 /// The session question of a host in the row `levels` (§B.2.1): only the
 /// answers the row offers in this build, what each does, and the row's
-/// sentence. The administrator answer is the whole word, typed.
-fn session_question_at(peer: &TrustedPeer, levels: &Availability) -> String {
+/// sentence. The administrator answer is the whole word, typed. Under the
+/// answers, what an accept discloses while `direct` lets the session
+/// connect directly ([`direct_note`]).
+fn session_question_at(
+    peer: &TrustedPeer,
+    levels: &Availability,
+    direct: TransportPolicy,
+) -> String {
     let answers = levels.offered();
     let mut lines = vec![format!(
         "\nSESSION REQUEST: \"{}\" wants to connect to this computer",
@@ -507,6 +544,7 @@ fn session_question_at(peer: &TrustedPeer, levels: &Availability) -> String {
     if levels.prompts_on_shared_screen {
         lines.push(format!("  {SENTENCE_SECURE_DESKTOP_OFF}"));
     }
+    lines.extend(direct_note(&peer.label, direct));
     lines.push("Anything else refuses (60 s):".to_owned());
     lines.join("\n")
 }
@@ -594,9 +632,12 @@ fn parse_typed(answer: &str, sas: &str) -> PairDecision {
     }
 }
 
-fn session_question(peer: &TrustedPeer) -> String {
+fn session_question(peer: &TrustedPeer, direct: TransportPolicy) -> String {
+    let note = direct_note(&peer.label, direct)
+        .map(|note| format!("{note}\n"))
+        .unwrap_or_default();
     format!(
-        "\nSESSION REQUEST from \"{}\" (fingerprint {})\n\
+        "\nSESSION REQUEST from \"{}\" (fingerprint {})\n{note}\
          Allow once with control (`a`), allow once view-only (`v`), anything else refuses (60 s):",
         peer.label,
         peer.device.fingerprint()
@@ -896,7 +937,7 @@ mod tests {
     #[tokio::test]
     async fn consent_denies_when_the_terminal_is_gone() {
         let (prompter, tx) = Prompter::scripted();
-        let consent = CliConsent::new(prompter);
+        let consent = CliConsent::new(prompter, TransportKnob::fixed(TransportPolicy::Any));
         let peer = TrustedPeer {
             device: tornect_core::DeviceIdentity::from_seed(&[7; 32]).id(),
             label: "Laptop".to_owned(),
@@ -919,7 +960,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_question_withdrawn_by_its_requester_never_takes_the_next_answer() {
         let (prompter, tx) = Prompter::scripted();
-        let consent = Arc::new(CliConsent::new(Arc::clone(&prompter)));
+        let consent = Arc::new(CliConsent::new(
+            Arc::clone(&prompter),
+            TransportKnob::fixed(TransportPolicy::Any),
+        ));
         let ask = |label: &str, seed: u8| {
             let consent = Arc::clone(&consent);
             let peer = TrustedPeer {
@@ -978,7 +1022,7 @@ mod tests {
             label: "Laptop".to_owned(),
         };
         let linux = Availability::LINUX;
-        let asked = session_question_at(&peer, &linux);
+        let asked = session_question_at(&peer, &linux, TransportPolicy::TorOnly);
         assert!(
             asked.contains("\"Laptop\" wants to connect to this computer"),
             "{asked}"
@@ -1010,7 +1054,7 @@ mod tests {
             enable_lua: Some(0),
             ..WindowsFacts::default()
         }));
-        let asked = session_question_at(&peer, &always);
+        let asked = session_question_at(&peer, &always, TransportPolicy::TorOnly);
         assert!(!asked.contains("`a`"), "{asked}");
         assert!(asked.contains(SENTENCE_ALWAYS_ADMINISTRATOR), "{asked}");
         assert_eq!(
@@ -1032,7 +1076,7 @@ mod tests {
             administrator: true,
             ..WindowsFacts::default()
         }));
-        let asked = session_question_at(&peer, &installed);
+        let asked = session_question_at(&peer, &installed, TransportPolicy::TorOnly);
         assert!(asked.contains(LINE_ALLOW_WINDOWS), "{asked}");
         if !tornect_core::levels::ADMIN_HELPER {
             assert!(
@@ -1040,5 +1084,75 @@ mod tests {
                 "{asked}"
             );
         }
+    }
+
+    /// Design `direct` §3.6 [SEC]: while an accept may let the session
+    /// connect directly, the terminal's session question says what the
+    /// asking device then learns (Phase A: the local address) and how to
+    /// relay every session through Tor; under `lan_only` it names no switch;
+    /// with every session relayed it says nothing of it. The question reads
+    /// the knob when it is asked, so a changed policy reaches the next
+    /// question.
+    #[tokio::test(start_paused = true)]
+    async fn the_session_question_says_what_an_accept_discloses_on_a_direct_path() {
+        let peer = TrustedPeer {
+            device: tornect_core::DeviceIdentity::from_seed(&[7; 32]).id(),
+            label: "Laptop".to_owned(),
+        };
+        const ANY: &str = "  note: accepting also lets \"Laptop\" learn this computer's local \
+                           address (network.paranoid = true relays through Tor)";
+        const LAN: &str = "  note: accepting also lets \"Laptop\" learn this computer's local \
+                           address";
+        let linux = Availability::LINUX;
+        for (policy, note) in [
+            (TransportPolicy::Any, Some(ANY)),
+            (TransportPolicy::LanOnly, Some(LAN)),
+            (TransportPolicy::TorOnly, None),
+        ] {
+            for asked in [
+                session_question_at(&peer, &linux, policy),
+                session_question(&peer, policy),
+            ] {
+                let lines: Vec<&str> = asked.lines().collect();
+                let noted: Vec<&&str> = lines.iter().filter(|l| l.contains("note:")).collect();
+                match note {
+                    Some(note) => assert_eq!(noted, vec![&note], "{policy:?}: {asked}"),
+                    None => assert!(noted.is_empty(), "{policy:?}: {asked}"),
+                }
+                assert!(
+                    lines.last().is_some_and(|l| l.contains("refuses (60 s):")),
+                    "{asked}"
+                );
+            }
+        }
+        // Through the consent seam: the knob as it is at the question.
+        let knob = TransportKnob::fixed(TransportPolicy::TorOnly);
+        let (prompter, tx) = Prompter::scripted();
+        let consent = CliConsent::new(Arc::clone(&prompter), knob.clone());
+        let summary = SessionRequestSummary {
+            caps: tornect_signal::messages::Caps::default(),
+        };
+        let answer = async {
+            tokio::time::sleep(ARM_AFTER + Duration::from_millis(20)).await;
+            tx.send("v".to_owned()).await.unwrap();
+        };
+        let (decided, ()) = tokio::join!(consent.session_at(&peer, &summary, &linux), answer);
+        assert_eq!(decided, SessionDecision::AllowOnceViewOnly);
+        // Direct connections on (config.toml's default) before the next one.
+        knob.set_from(&tornect_core::config::Network::default());
+        let answer = async {
+            tokio::time::sleep(ARM_AFTER + Duration::from_millis(20)).await;
+            tx.send("v".to_owned()).await.unwrap();
+        };
+        let (decided, ()) = tokio::join!(consent.session_at(&peer, &summary, &linux), answer);
+        assert_eq!(decided, SessionDecision::AllowOnceViewOnly);
+        let shown = prompter.shown();
+        let questions: Vec<&String> = shown
+            .iter()
+            .filter(|s| s.contains("SESSION REQUEST"))
+            .collect();
+        assert_eq!(questions.len(), 2, "{shown:?}");
+        assert!(!questions[0].contains("note:"), "{}", questions[0]);
+        assert!(questions[1].contains(ANY), "{}", questions[1]);
     }
 }

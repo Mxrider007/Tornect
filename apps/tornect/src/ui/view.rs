@@ -13,6 +13,8 @@ use tornect_core::levels::{
 };
 use tornect_core::unattended::ipc::ShownLink;
 use tornect_core::words::{Identicon, label_refusal};
+use tornect_session::INTERNET_DIRECT;
+use tornect_signal::consent::TransportPolicy;
 use tornect_signal::fsm::timeouts;
 use tornect_signal::pairing::{PairDecision, SessionDecision};
 
@@ -1039,6 +1041,7 @@ fn request_sheet(
                         paired_recently: model.paired_recently.contains(&popup.id),
                         screens: model.sheet_screens.get(&popup.id).copied().unwrap_or(1),
                         services: services.as_deref(),
+                        direct: model.settings.direct_policy() != TransportPolicy::TorOnly,
                     };
                     let card = question(ui, |ui| host_popup(ui, popup, sheet, form, now, actions));
                     Some((popup.id, card))
@@ -1154,6 +1157,33 @@ fn answer_line(ui: &mut egui::Ui, answer: &str, line: &str) {
 
 /// The session sheet's line of what control also gives (the services
 /// design §7.4), in the style of an answer's line.
+/// The session sheet's line while an accept may let the session connect
+/// directly (design `direct` §3.6, \[SEC\]; Phase A: the local address,
+/// the internet address once internet direct connections exist): what
+/// `label` then learns, and where to turn it off.
+#[must_use]
+pub fn direct_consent_line(label: &str) -> String {
+    let what = if INTERNET_DIRECT {
+        "internet address"
+    } else {
+        "local address"
+    };
+    format!("Accepting also lets \"{label}\" learn this computer's {what} (Settings > Connection).")
+}
+
+fn direct_line(ui: &mut egui::Ui, label: &str) {
+    let t = theme::tokens(ui.ctx());
+    ui.add(
+        egui::Label::new(
+            RichText::new(direct_consent_line(label))
+                .small()
+                .color(t.text_muted),
+        )
+        .wrap()
+        .selectable(false),
+    );
+}
+
 fn services_answer_line(ui: &mut egui::Ui, line: &str) {
     let t = theme::tokens(ui.ctx());
     ui.add(
@@ -1555,6 +1585,10 @@ struct Sheet<'a> {
     /// under an "Ask before starting" sheet's when the session may be
     /// control.
     services: Option<&'a str>,
+    /// An accept may let the session connect directly (design `direct`
+    /// §3.6: the policy the host signs is not Tor only): the sheet says what
+    /// the other computer then learns.
+    direct: bool,
 }
 
 /// The arming card of session sheet `id`'s administrator confirmation: its
@@ -1781,6 +1815,9 @@ fn host_popup(
             });
             if sheet.confirming && confirmable {
                 admin_confirmation(ui, popup.id, label, form, now, actions, left);
+                if sheet.direct {
+                    direct_line(ui, label);
+                }
                 if let Some(line) = sheet.services {
                     services_answer_line(ui, line);
                 }
@@ -1810,6 +1847,9 @@ fn host_popup(
                 .wrap()
                 .selectable(false),
             );
+            if sheet.direct {
+                direct_line(ui, label);
+            }
             // Without levels (a sheet from before them): the three answers.
             let answers = sheet.levels.map_or(
                 Answers {
@@ -3772,6 +3812,53 @@ mod tests {
                 line.starts_with(&format!("\"Laptop\" wants to see {asked} Whatever")),
                 "{count:?}: {line}"
             );
+        }
+    }
+
+    /// Design `direct` §3.6 [SEC]: while an accept may let the session
+    /// connect directly (this computer's policy is not Tor only: direct
+    /// connections on, or `lan_only`), the session sheet says that the
+    /// asking device then learns this computer's local address (Phase A),
+    /// under the request and again under the administrator confirmation;
+    /// with direct connections off, or a bridge in use, it says nothing of
+    /// it.
+    #[test]
+    fn the_session_sheet_says_what_an_accept_discloses_on_a_direct_path() {
+        let t0 = Instant::now();
+        let line = direct_consent_line("Laptop");
+        assert_eq!(
+            line,
+            "Accepting also lets \"Laptop\" learn this computer's local address (Settings > \
+             Connection)."
+        );
+        // A name, the settings, whether the line is said.
+        type Case = (&'static str, fn(&mut Model), bool);
+        let cases: [Case; 4] = [
+            ("direct on", |_| {}, true),
+            ("lan_only", |m| m.settings.lan_only = true, true),
+            ("direct off", |m| m.settings.direct = false, false),
+            ("a bridge in use", |m| m.settings.bridged_off = true, false),
+        ];
+        for (case, set, said) in cases {
+            let mut model = with_popups(vec![session_popup(7, t0)]);
+            set(&mut model);
+            let window = Harness::new(model, t0);
+            assert!(
+                window
+                    .texts()
+                    .iter()
+                    .any(|t| t.starts_with("\"Laptop\" wants to see ")),
+                "{case}"
+            );
+            assert_eq!(window.texts().contains(&line), said, "{case}");
+            // Under the administrator confirmation too.
+            let mut model = with_popups(vec![session_popup(7, t0)]);
+            set(&mut model);
+            model.levels.insert(7, always_admin());
+            model.admin_confirm.insert(7);
+            let window = Harness::new(model, t0);
+            assert!(window.has("Allow as administrator"), "{case}");
+            assert_eq!(window.texts().contains(&line), said, "{case}: confirming");
         }
     }
 

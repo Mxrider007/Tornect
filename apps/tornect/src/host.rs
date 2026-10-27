@@ -853,12 +853,18 @@ pub fn wire_cli(
                     device: tornect_core::DeviceId::from_bytes(direct.device_pk()),
                 },
             );
+            // The session question says what an accept discloses on a
+            // direct path, read from the knob the accept signs (design
+            // `direct` §3.6).
+            let transport = direct.knobs.transport.clone();
             let mut wiring = wire(
                 paths,
                 cfg,
                 identity,
                 direct,
-                Arc::new(CliConsent::new(Arc::clone(&prompter)).with_words(Arc::new(words))),
+                Arc::new(
+                    CliConsent::new(Arc::clone(&prompter), transport).with_words(Arc::new(words)),
+                ),
                 media,
                 control,
             )?;
