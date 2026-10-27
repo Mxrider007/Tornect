@@ -25,6 +25,7 @@ use tornect_core::unattended::hosts::PinCheck;
 use tornect_core::{DeviceIdentity, TornectId};
 use zeroize::Zeroizing;
 
+use super::host::MAX_PATH_CANDIDATES;
 use super::{
     Channel, HandshakeError, OsRandom, Randomness, Received, SessionToken, Taken, checked_body,
     timeouts,
@@ -77,6 +78,14 @@ where
 /// `PING`s faster than this side can answer loses the oldest answers, not
 /// this side's memory.
 pub const MAX_OWED: usize = 4;
+
+/// Most host path frames [`ClientSession::ping`] queues while it waits for
+/// its `PONG`: as many as a host sends in a whole session (design `direct`
+/// §4), [`MAX_PATH_CANDIDATES`] `CANDIDATES`, one `CANDIDATES_DONE` and one
+/// `TOR_FALLBACK`, each kind within its own share so a flood of one never
+/// pushes another out. A host that sends more loses the excess, dropped and
+/// counted ([`ClientSession::pending_dropped`]), not this side's memory.
+pub const MAX_PENDING: usize = MAX_PATH_CANDIDATES + 2;
 
 /// What the client sends in `HELLO` and `SESSION_REQUEST`.
 #[derive(Debug, Clone)]
@@ -305,8 +314,11 @@ pub struct ClientSession<S> {
     asked_elevation: Elevation,
     random: Arc<dyn Randomness>,
     /// M2 frames that arrived while [`ClientSession::ping`] waited for its
-    /// `PONG`; [`ClientSession::take_event`] hands them out first.
+    /// `PONG`, at most [`MAX_PENDING`]; [`ClientSession::take_event`] hands
+    /// them out first.
     pending: VecDeque<SessionEvent>,
+    /// Host path frames [`ClientSession::ping`] dropped for [`MAX_PENDING`].
+    pending_dropped: u64,
     /// The nonces of host `PING`s not answered yet, oldest first, at most
     /// [`MAX_OWED`]: [`ClientSession::flush_owed`] writes their `PONG`s.
     owed: VecDeque<u64>,
@@ -405,7 +417,8 @@ where
     /// returns the round trip. The Tor circuit is a heartbeat channel in both
     /// directions (§B.2), so a `PING` from the host that arrives meanwhile is
     /// answered at once (its `PONG` goes out before the next frame is read),
-    /// M2 frames are queued for [`ClientSession::take_event`], and only a
+    /// M2 frames are queued for [`ClientSession::take_event`] (at most
+    /// [`MAX_PENDING`]; the excess is dropped and counted), and only a
     /// `PONG` with the wrong nonce or an out-of-place kind is `E_BAD_STATE`.
     ///
     /// It writes (the `PING`, owed `PONG`s, an `ERROR`), so a caller that
@@ -458,7 +471,7 @@ where
                 Ok(Some(SessionEvent::Error { code, detail })) => {
                     return Err(HandshakeError::PeerError { code, detail });
                 }
-                Ok(Some(event)) => self.pending.push_back(event),
+                Ok(Some(event)) => self.queue(event),
                 Err(e) => return Err(self.fail_bounded(e).await),
             }
         }
@@ -587,6 +600,13 @@ where
         self.owed_dropped
     }
 
+    /// Host path frames dropped because [`ClientSession::ping`] already held
+    /// [`MAX_PENDING`]'s share of their kind.
+    #[must_use]
+    pub fn pending_dropped(&self) -> u64 {
+        self.pending_dropped
+    }
+
     /// Write the owed `PONG`s, oldest first: the one write of the event API.
     /// A peer that stops reading stalls it, so callers race it against their
     /// stop future, as in `select! { biased; () = &mut stop => …, r =
@@ -636,6 +656,30 @@ where
                 HandshakeError::Violation { code, what }
             }
         }
+    }
+
+    /// Queue an M2 frame that came while [`ClientSession::ping`] waited,
+    /// within its kind's share of [`MAX_PENDING`]; past it the frame is
+    /// dropped and counted. `BYE` and `ERROR` are never queued: `ping`
+    /// returns on them.
+    fn queue(&mut self, event: SessionEvent) {
+        let kind = std::mem::discriminant(&event);
+        let queued = self
+            .pending
+            .iter()
+            .filter(|queued| std::mem::discriminant(*queued) == kind)
+            .count();
+        let share = match event {
+            SessionEvent::Candidates(_) => MAX_PATH_CANDIDATES,
+            _ => 1,
+        };
+        if queued >= share {
+            self.pending_dropped = self.pending_dropped.saturating_add(1);
+            tracing::debug!(dropped = self.pending_dropped, "queued host frame dropped");
+            return;
+        }
+        self.pending.push_back(event);
+        debug_assert!(self.pending.len() <= MAX_PENDING);
     }
 
     /// Queue the `PONG` for a host `PING`, dropping the oldest past
@@ -1031,6 +1075,7 @@ where
         asked_elevation: Elevation::None,
         random: Arc::clone(&deps.random),
         pending: VecDeque::new(),
+        pending_dropped: 0,
         owed: VecDeque::new(),
         owed_dropped: 0,
         notices: watch::Sender::new(None),
@@ -1398,6 +1443,7 @@ where
         asked_elevation: ua.want_elevation,
         random: Arc::clone(&deps.random),
         pending: VecDeque::new(),
+        pending_dropped: 0,
         owed: VecDeque::new(),
         owed_dropped: 0,
         notices: watch::Sender::new(None),

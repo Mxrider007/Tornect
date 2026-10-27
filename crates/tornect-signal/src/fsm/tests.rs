@@ -4294,6 +4294,95 @@ async fn client_ping_answers_a_host_ping_and_queues_m2_frames() {
     }
 }
 
+/// The final review's queue cap: a paired host that floods path frames while
+/// the viewer's `ping` waits for its `PONG` cannot grow the viewer's memory.
+/// The queue keeps what a host sends in a whole session, each kind within
+/// its share (`MAX_PATH_CANDIDATES` `CANDIDATES`, one `CANDIDATES_DONE`, one
+/// `TOR_FALLBACK`), in arrival order, so the flood of `CANDIDATES` does not
+/// push the `TOR_FALLBACK` behind it out; the rest is dropped and counted,
+/// never answered, and the session goes on.
+#[tokio::test]
+async fn a_host_flooding_path_frames_during_a_ping_is_capped() {
+    const FLOOD: usize = 500;
+    let tmp = tempfile::tempdir().unwrap();
+    let real = HostIdentity::from_seed(&HOST_SEED);
+    let real_pk = HostSigner::public_key(&real);
+    let client = client_side(tmp.path(), real.id(), CLIENT_SEED);
+    client
+        .known
+        .pin(real.id(), "Desk of Bob", host_device_pk())
+        .unwrap();
+    let (a, b) = pipe();
+    let signer = HostIdentity::from_seed(&HOST_SEED);
+    let host = tokio::spawn(async move {
+        let mut h = RawHost::new(a, &real_pk);
+        h.take_hello().await;
+        h.ack(&signer).await;
+        h.take(Kind::SessionRequest).await;
+        h.chan.send(&genuine_accept(), Some(&signer)).await.unwrap();
+        let ping = h
+            .chan
+            .recv(Duration::from_secs(5), "ping")
+            .await
+            .unwrap()
+            .unwrap();
+        let nonce = decode_body::<Ping>(&ping.env.body).unwrap().nonce;
+        for _ in 0..FLOOD {
+            h.chan.send(&host_candidates(), None).await.unwrap();
+        }
+        for _ in 0..3 {
+            h.chan
+                .send(&messages::CandidatesDone {}, None)
+                .await
+                .unwrap();
+        }
+        for reason in [Some(messages::fallback::QUIC), None] {
+            h.chan
+                .send(&messages::TorFallback { reason }, None)
+                .await
+                .unwrap();
+        }
+        h.chan.send(&Pong { nonce }, None).await.unwrap();
+        h.chan.bye(bye::USER).await.unwrap();
+    });
+    let mut session = match connect(
+        b,
+        &client.cfg,
+        &client.identity,
+        &client.deps,
+        Intent::Session,
+    )
+    .await
+    .unwrap()
+    {
+        ClientOutcome::Session(s) => s,
+        ClientOutcome::Paired { .. } => panic!("expected a session"),
+    };
+    session.ping().await.unwrap();
+    let dropped = u64::try_from(FLOOD - host::MAX_PATH_CANDIDATES + 2 + 1).unwrap();
+    assert_eq!(session.pending_dropped(), dropped);
+    let mut expected = vec![SessionEvent::Candidates(host_candidates()); host::MAX_PATH_CANDIDATES];
+    expected.push(SessionEvent::CandidatesDone);
+    expected.push(SessionEvent::TorFallback(Some(messages::fallback::QUIC)));
+    assert_eq!(expected.len(), client::MAX_PENDING);
+    for want in expected {
+        assert_eq!(
+            session.next_event(Duration::from_secs(5)).await.unwrap(),
+            Some(want)
+        );
+    }
+    assert_eq!(
+        session.next_event(Duration::from_secs(5)).await.unwrap(),
+        Some(SessionEvent::Bye {
+            reason: bye::USER,
+            detail: None
+        }),
+        "the session went on: nothing was answered"
+    );
+    assert_eq!(session.pending_dropped(), dropped);
+    host.await.unwrap();
+}
+
 /// SLICE-D D2 (the `PING` half of SLICE-B2 B2-8): a host `PING` is answered
 /// inside `next_event` without moving its deadline. A host that pings every
 /// 5 s must not keep a 10 s wait, and with it `tornect connect --pings N`,
