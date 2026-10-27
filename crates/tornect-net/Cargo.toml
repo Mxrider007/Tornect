@@ -29,6 +29,20 @@ getrandom.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+# Router port mapping, Phase B (design `direct` §7.4, steps B4 and B5;
+# docs/research/nat-traversal.md §3 and §4): PCP and NAT-PMP through crab_nat,
+# UPnP-IGD through igd-next (`aio_tokio` only).
+crab_nat.workspace = true
+igd-next.workspace = true
+
+# The default gateway of the route-source interface (design `direct` §7.1):
+# netdev's `gateway` feature reads it from the kernel's tables on Linux
+# (netlink) and macOS (a routing sysctl) and sends nothing. On Windows the same
+# feature may call `SendARP`, so it is never compiled there: the app hands
+# `tornect_platform::route::default_gateway_v4` (`GetBestRoute2`) to `RealNet`
+# instead. docs/research/nat-traversal.md §1.6 and §5.
+[target.'cfg(not(windows))'.dependencies]
+netdev = { workspace = true, features = ["gateway"] }
 
 [features]
 # The in-memory and loopback test environments (`mem`) for other crates'
