@@ -353,8 +353,16 @@ SOFTWARE "test vector "; MESSAGE-INTEGRITY keyed with the short-term password
 - §2.1 (sample request, header `00 01 00 58`, 108 bytes) and §2.4 (request with long-term
   authentication, header `00 01 00 60`, transaction ID `78 ad 34 33 c6 ad 72 c0 29 da 41
   2e`) are Binding **requests**: `parse_response` refuses them on the class, before any
-  attribute is read, so their headers are enough for that test. Copy the full dumps from
-  the RFC text if a test wants them byte-exact; they were not transcribed here.
+  attribute is read.
+- **Step B2 (2026-10-27): all four dumps are transcribed whole** in
+  `crates/tornect-net/src/stun/tests.rs` (`rfc_request`, `rfc_response_v4`,
+  `rfc_response_v6`, `rfc_request_long_term`) and are four of the five fuzz seeds in `fuzz/seeds/stun/`.
+  The same kind of script, run with `python3 -I` on the test file, recomputed them: §2.1
+  MESSAGE-INTEGRITY (short-term password above) and FINGERPRINT `e57a3bcf` match; §2.2 and
+  §2.3 as above; §2.4 (no FINGERPRINT) MESSAGE-INTEGRITY with the long-term key
+  `MD5(username ":" "example.org" ":" "TheMatrIX")`, the username being the six katakana
+  `e3 83 9e e3 83 88 e3 83 aa e3 83 83 e3 82 af e3 82 b9` and the password the RFC's after
+  SASLprep, matches. So the request dumps are byte-exact too.
 - Port `0xa147 ^ 0x2112 = 0x8055 = 32853`; IPv4 `e112a643 ^ 2112a442 = c0000201`.
 
 ### 2.6 No SOFTWARE, no FINGERPRINT (deviation from `docs/research/nat.md` §3)

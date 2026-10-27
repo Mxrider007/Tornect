@@ -5,7 +5,7 @@ with Tor kept as the fallback, is implemented: steps A1 to A21 and the in-contai
 checkpoint A22. **`m2a` is not tagged.** It waits for evidence that only the dev VM and real
 machines can give (the list below); the ledger rows for it are in `docs/VERIFICATION.md` under
 "Direct connections, Phase A", each with its recipe. Phase B (internet direct, steps B1 to B13)
-has not started.
+is under way: B1 to B3 are done (2026-10-27; "OPEN, owned by Phase B steps" below).
 
 ## What Phase A does
 
@@ -111,8 +111,21 @@ and the crates below ring check here).
   `NoMapper` everywhere. Left from it: the Windows `GetBestRoute2` run, the netdev gateway on a
   desktop and on macOS, the live STUN check (NEEDS-DEVICE rows) and the owner's call on the Google
   and Nextcloud terms (OPEN until B12).
-- B2: the STUN codec (`stun.rs`, RFC 5769 vectors, the `stun` fuzz target).
-- B3/B6: server-reflexive candidates (a CGNAT-only computer), the second ULA design gap (B6).
+- B2 (done 2026-10-27, `322fda87`): the Binding codec (`tornect_net::stun`, the bare 20-byte
+  request, `parse_response` with the RFC 8489 §6.3.3 discard rule), all four RFC 5769 vectors
+  transcribed and recomputed, the `stun` fuzz target with its seeds. Left from it: the 10-minute
+  campaign on the dev VM (NEEDS-DEVICE row, recipe in the ledger and in the target's header).
+- B3 (done 2026-10-27, `a6cf881f`, `9f04aae2`, `b88a7048`): the four-operator default list, its
+  migration and its bounds (`tornect-core` config), `stun::partition`, `gather::ask_stun` (random
+  first server, a second at 750 ms of another operator where there is one, RTO 500 ms, at most 2
+  servers and 4 requests in the 1500 ms budget, replies only from the address asked under its
+  transaction ID), `gather::stun_base` (a CGNAT base asks), `StunDns` with `RealNet::resolve`
+  cache-first and `RealNet::prefetch`, fake STUN servers on loopback. Nothing calls them yet. Left
+  for B6: the link's gathering task reading `tees.stun` and calling `ask_stun` with this role's
+  part, `stun_base` combined with the scope, `enable_stun` and the mapping's head start, the
+  `DirectParams`/`DirectOptions` STUN fields, and the second ULA design gap. Left for B11/B12: the
+  app's `RealNet::prefetch` call, with a list that is empty whenever STUN may not run (design
+  §5.3: `INTERNET_DIRECT`, policy `Any`, `enable_stun`, not bridged).
 - B4/B5: router mapping (UPnP, PCP, NAT-PMP) as `RealMapper` in place of `NoMapper`, the `router_port` ledger sweep.
 - B7/B8: the internet-scope ranks in `MemNet`; `NatBox`, `MemStun`, `MemMapper`.
 - B9: the NAT matrix on `MemNet`; the redaction e2e with `FakeIgd` and `FakePcp`.
