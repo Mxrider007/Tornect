@@ -1608,3 +1608,132 @@ proptest! {
         check_budgets(&ledger, &list, &gate)?;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Ranks in internet scope over arbitrary public addresses (step B7).
+
+/// Remote addresses for the rank property: on-link private, off-link
+/// private, a ULA in and outside our /48, public IPv4 (some of which may be
+/// ours), a global IPv6.
+const RANK_POOL: [&str; 10] = [
+    "192.168.1.20:50000",
+    "192.168.1.21:50001",
+    "10.1.2.3:50000",
+    "172.16.5.5:50000",
+    "[fd12:3456:789a:2::5]:50000",
+    "[fd99:1::5]:50000",
+    "93.184.216.34:50000",
+    "93.184.216.35:40000",
+    "81.2.3.4:40001",
+    "[2a01:4f8:9:9::5]:50000",
+];
+
+/// Public addresses this side may have learned (a private one is ignored).
+const PUBLICS: [&str; 5] = [
+    "93.184.216.34",
+    "93.184.216.35",
+    "81.2.3.4",
+    "81.2.3.99",
+    "192.168.1.1",
+];
+
+const SIGNALLED: [CandidateKind; 3] = [
+    CandidateKind::Host,
+    CandidateKind::Srflx,
+    CandidateKind::Mapped,
+];
+
+/// The design table (§7.6) restated for `addr` of `kind`, given whether it
+/// is on our site, whether the two sides share a public IPv4 and whether
+/// both know public addresses that differ: the rank, and whether the
+/// target is on our site (the route label, §3.1).
+fn table_rank(
+    addr: SocketAddr,
+    kind: CandidateKind,
+    on_site: bool,
+    same_nat: bool,
+    differ: bool,
+) -> (Rank, bool) {
+    if on_site {
+        return if differ {
+            (Rank::OtherPrivate, false)
+        } else {
+            (Rank::SameSite, true)
+        };
+    }
+    let ip = addr.ip();
+    match (class(ip), ip.is_ipv4(), kind) {
+        (AddrClass::Global, false, CandidateKind::Host) => (Rank::GlobalV6Host, false),
+        (AddrClass::Global, true, CandidateKind::Host) => (Rank::PublicV4Host, false),
+        (AddrClass::Private, true, _) if same_nat => (Rank::PublicV4Host, true),
+        (_, _, CandidateKind::Mapped) => (Rank::Mapped, false),
+        (_, _, CandidateKind::Srflx | CandidateKind::Prflx) => (Rank::Reflexive, false),
+        (_, _, CandidateKind::Host) => (Rank::OtherPrivate, false),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Design §7.6 in internet scope, whatever the peer signals and
+    /// whatever public addresses this side learned: every target's rank and
+    /// same-site label follow the table (same-site demotion when both
+    /// sides' public addresses differ, same-NAT promotion when they share
+    /// one, never same-site for a global address); targets start in rank
+    /// order; a same-site target checks on the same-site schedule and every
+    /// other on the internet one.
+    #[test]
+    fn ranks_and_schedules_follow_the_public_addresses(
+        adds in proptest::collection::vec((0..RANK_POOL.len(), 0..SIGNALLED.len()), 1..16),
+        publics in proptest::collection::vec(0..PUBLICS.len(), 0..3),
+        controlling in any::<bool>(),
+    ) {
+        let t0 = Instant::now();
+        let punch = if controlling { PunchRole::Controlling } else { PunchRole::Controlled };
+        let (mut list, _) = checklist(punch, TornectRole::Viewer, Scope::Internet);
+        let mine: Vec<IpAddr> = publics.iter().map(|i| ip(PUBLICS[*i])).collect();
+        list.set_local_public(&mine);
+        for (a, k) in adds {
+            list.add_remote(Candidate { kind: SIGNALLED[k], addr: addr(RANK_POOL[a]) });
+        }
+        let local: Vec<IpAddr> = mine
+            .iter()
+            .copied()
+            .filter(|ip| ip.is_ipv4() && class(*ip) == AddrClass::Global)
+            .collect();
+        let remote: Vec<IpAddr> = list
+            .targets
+            .iter()
+            .map(|t| t.addr.ip())
+            .filter(|ip| ip.is_ipv4() && class(*ip) == AddrClass::Global)
+            .collect();
+        let same_nat = remote.iter().any(|ip| local.contains(ip));
+        let differ = !local.is_empty() && !remote.is_empty() && !same_nat;
+        let mut expected = Vec::new();
+        for t in &list.targets {
+            let on_site = list.filter.on_site(t.addr.ip());
+            let (rank, same_site) = table_rank(t.addr, t.kind, on_site, same_nat, differ);
+            prop_assert_eq!(list.rank(t.addr, t.kind), rank, "{:?}", t.kind);
+            prop_assert_eq!(list.same_site(t.addr), same_site);
+            if class(t.addr.ip()) == AddrClass::Global {
+                prop_assert!(!same_site);
+            }
+            expected.push((t.addr, rank, t.seq, same_site));
+        }
+
+        let log = drive(&mut list, t0, t0 + ms(20_000));
+        let mut starts: Vec<(Duration, Rank, usize)> = Vec::new();
+        for (a, rank, seq, same_site) in expected {
+            let times = send_times(&log, a, t0);
+            prop_assert_eq!(times.len(), MAX_REQUESTS_PER_TARGET);
+            let start = times[0];
+            let schedule = if same_site { SAME_SITE_SCHEDULE } else { INTERNET_SCHEDULE };
+            prop_assert_eq!(times, schedule.sends.map(|d| d + start).to_vec());
+            starts.push((start, rank, seq));
+        }
+        starts.sort_unstable();
+        for pair in starts.windows(2) {
+            prop_assert!((pair[0].1, pair[0].2) < (pair[1].1, pair[1].2), "started out of rank order");
+        }
+    }
+}
