@@ -77,8 +77,14 @@ const SESSION_PING_EVERY: Duration = Duration::from_secs(10);
 const MEDIA_BIND_WAIT: Duration = Duration::from_secs(30);
 
 /// How long an onion media stream opened beside the path phase stays
-/// usable (design `direct` §4 `ONION_PREOPEN_MAX`): an older one is
-/// dropped and a fresh one opened.
+/// usable (design `direct` §4 `ONION_PREOPEN_MAX`), counted from the start
+/// of its open: an older one is dropped and a fresh one opened. The host's
+/// bind deadline (`MediaLimits::bind_deadline`, 10 s) runs from its accept
+/// of the stream, which comes after the open started by at least the open's
+/// trip to the host; the `Bind` takes the same trip on the same circuit. So
+/// a `Bind` written before this age reaches the host within this age of its
+/// accept, whatever the circuit's delay, and this must stay below the
+/// host's deadline (a test holds the margin).
 const ONION_PREOPEN_MAX: Duration = Duration::from_secs(8);
 
 /// When the host closes the media stream, how long `tornect connect` waits for
@@ -1567,9 +1573,9 @@ impl<O> std::fmt::Debug for BoundMedia<O> {
 enum Preopen<F: Future> {
     /// Nothing opened beside the path phase.
     None,
-    /// Opening.
-    Opening(std::pin::Pin<Box<F>>),
-    /// Opened (or failed) at that instant.
+    /// Opening since that instant.
+    Opening(std::pin::Pin<Box<F>>, tokio::time::Instant),
+    /// Opened (or failed); the open started at that instant.
     Opened(F::Output, tokio::time::Instant),
 }
 
@@ -1577,30 +1583,37 @@ impl<O, F> Preopen<F>
 where
     F: Future<Output = anyhow::Result<O>>,
 {
+    /// The open `opening`, starting now.
+    fn start(opening: F) -> Self {
+        Self::Opening(Box::pin(opening), tokio::time::Instant::now())
+    }
+
     /// `work`, while the open goes on beside it; the open's result is kept.
     async fn beside<W: Future>(&mut self, work: W) -> W::Output {
         let mut work = pin!(work);
         loop {
-            let Self::Opening(opening) = self else {
+            let Self::Opening(opening, started) = self else {
                 return work.await;
             };
+            let started = *started;
             let opened = tokio::select! {
                 biased;
                 out = &mut work => return out,
                 opened = opening.as_mut() => opened,
             };
-            *self = Self::Opened(opened, tokio::time::Instant::now());
+            *self = Self::Opened(opened, started);
         }
     }
 
     /// The onion stream for the Tor path: the one opened beside the path
-    /// phase while it is younger than [`ONION_PREOPEN_MAX`] (still opening
-    /// counts), else a fresh one from `fresh`, which is also tried once
+    /// phase while its open started less than [`ONION_PREOPEN_MAX`] ago
+    /// (still opening counts: its `Bind` follows the host's accept by a
+    /// round trip), else a fresh one from `fresh`, which is also tried once
     /// when the early open failed.
     async fn take(self, fresh: impl FnOnce() -> F) -> anyhow::Result<O> {
         let early = match self {
-            Self::Opening(opening) => opening.await,
-            Self::Opened(opened, at) if at.elapsed() < ONION_PREOPEN_MAX => opened,
+            Self::Opening(opening, _) => opening.await,
+            Self::Opened(opened, started) if started.elapsed() < ONION_PREOPEN_MAX => opened,
             Self::Opened(..) | Self::None => return fresh().await,
         };
         match early {
@@ -1673,7 +1686,7 @@ where
     let mut preopen = match decision {
         Decision::Try {
             lan_only: false, ..
-        } => Preopen::Opening(Box::pin(open_onion())),
+        } => Preopen::start(open_onion()),
         _ => Preopen::None,
     };
     let stop = pressed(interrupted.clone());
@@ -4703,7 +4716,7 @@ mod tests {
             } else {
                 Err(anyhow::anyhow!("refused"))
             };
-            Preopen::Opening(Box::pin(std::future::ready(opened)))
+            Preopen::start(std::future::ready(opened))
         };
         let fresh = || -> Open { std::future::ready(Ok(2)) };
         for (mut preopen, took, bound) in [
@@ -4713,15 +4726,53 @@ mod tests {
             (Preopen::None, Duration::from_secs(1), 2),
         ] {
             preopen.beside(tokio::time::sleep(took)).await;
-            assert!(!matches!(preopen, Preopen::Opening(_)), "{took:?}");
+            assert!(!matches!(preopen, Preopen::Opening(..)), "{took:?}");
             assert_eq!(preopen.take(fresh).await.unwrap(), bound, "{took:?}");
         }
         // A path phase that ended before the open is still waited for.
         let mut opening = early(true);
         opening.beside(std::future::ready(())).await;
-        assert!(matches!(opening, Preopen::Opening(_)));
+        assert!(matches!(opening, Preopen::Opening(..)));
         let unused = || -> Open { unreachable!("the early stream is used") };
         assert_eq!(opening.take(unused).await.unwrap(), 1);
+    }
+
+    /// The pre-open's age counts from the start of its open, not its end:
+    /// the host's bind deadline runs from its accept, which comes before the
+    /// open ends here. An open that took 3 s is replaced when the path
+    /// phase fails 10 s after it started (it would be 7 s old counted from
+    /// its end), and used when the phase fails at 7.5 s.
+    #[tokio::test(start_paused = true)]
+    async fn the_early_onion_streams_age_counts_from_its_open() {
+        type Open = std::pin::Pin<Box<dyn Future<Output = anyhow::Result<u8>> + Send>>;
+        let slow_open = || -> Open {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Ok(1)
+            })
+        };
+        let fresh = || -> Open { Box::pin(std::future::ready(Ok(2))) };
+        for (failed_at, bound) in [
+            (Duration::from_secs(10), 2),
+            (Duration::from_millis(7_500), 1),
+        ] {
+            let mut preopen = Preopen::start(slow_open());
+            preopen.beside(tokio::time::sleep(failed_at)).await;
+            assert!(matches!(preopen, Preopen::Opened(..)), "{failed_at:?}");
+            assert_eq!(preopen.take(fresh).await.unwrap(), bound, "{failed_at:?}");
+        }
+    }
+
+    /// The margin [`ONION_PREOPEN_MAX`] keeps below the host's bind
+    /// deadline: a `Bind` written on a pre-open just under the maximum age
+    /// still has 2 s at the host for the write and the host's read.
+    #[test]
+    fn the_preopen_age_stays_below_the_hosts_bind_deadline() {
+        let deadline = MediaLimits::default().bind_deadline;
+        assert!(
+            ONION_PREOPEN_MAX + Duration::from_secs(2) <= deadline,
+            "{ONION_PREOPEN_MAX:?} against {deadline:?}"
+        );
     }
 
     /// Decision M1-85 at DIRECT-2's exception: a `lan_only` viewer whose
