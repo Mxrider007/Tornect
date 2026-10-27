@@ -28,6 +28,7 @@ pub mod mem;
 pub mod probe;
 pub mod quic;
 pub mod socket;
+pub mod stun;
 pub mod udp;
 
 pub use addr::{
@@ -51,6 +52,7 @@ pub use quic::{
     endpoint_config, exporter, is_crypto_close, transport,
 };
 pub use socket::{BoundSocket, QuietUdp, SendErrors, bind_media_socket};
+pub use stun::{StunReply, StunTxid, binding_request, parse_response};
 pub use udp::{
     BoundUdp, ProbeGate, PunchCounters, PunchSocket, RawSend, TeedProbe, TeedStun, Tees, V6Sources,
 };

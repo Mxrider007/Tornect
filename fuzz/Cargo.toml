@@ -108,5 +108,15 @@ test = false
 doc = false
 bench = false
 
+# The STUN Binding codec of the server-reflexive candidate (design `direct`
+# §6.4, decision M1-81): `parse_response` with the RFC 5769 transaction ID and
+# with each input's own; seeds in `seeds/stun/`.
+[[bin]]
+name = "stun"
+path = "fuzz_targets/stun.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
