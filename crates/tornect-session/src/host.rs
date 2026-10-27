@@ -1008,12 +1008,23 @@ impl MediaHost {
     /// until a path claims it, then that path, once; the channel closes when
     /// the session ends. `None` for a session not registered. The direct
     /// path's owner closes its link as soon as this says the onion path won
-    /// (the direct design §8.5).
+    /// (the direct design §8.5, §9.1 invariant 3).
+    ///
+    /// A claim made before the call is news to the receiver too: its first
+    /// `changed()` returns at once, so an owner that only awaits `changed()`
+    /// never misses a path that won before it subscribed.
     #[must_use]
     pub fn claimed(&self, session_id: &str) -> Option<watch::Receiver<Option<TransportKind>>> {
-        self.lock()
-            .get(session_id)
-            .map(|session| session.claimed.subscribe())
+        // Under the registry's lock, as every claim is published: a claim
+        // lands either before the subscription (marked here) or after it
+        // (a change the receiver sees).
+        self.lock().get(session_id).map(|session| {
+            let mut claimed = session.claimed.subscribe();
+            if claimed.borrow().is_some() {
+                claimed.mark_changed();
+            }
+            claimed
+        })
     }
 
     /// Bind `session_id` with `mac`. A session the FSM has not registered yet

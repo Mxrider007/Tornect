@@ -645,6 +645,39 @@ async fn a_stream_closed_before_any_byte_is_abandoned() {
     served.await.unwrap();
 }
 
+/// The direct design §9.1 invariant 3, §8.5: the owner of a direct link
+/// that subscribes after the onion path claimed the session still hears of
+/// it from `changed()` alone, once; one that subscribed before hears of it
+/// as it happens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claim_before_the_subscription_still_changes_once() {
+    let rig = direct_rig(TestBackend::default());
+    let viewer = start_direct(&rig.host, 74, TransportPolicy::Any);
+    let mut early = rig.host.claimed(&viewer.id).unwrap();
+    assert!(!early.has_changed().unwrap(), "nothing claimed yet");
+    let (client, served) = connect(&rig.host);
+    let onion = MediaViewer::bind(client, &viewer.onion(), WAIT)
+        .await
+        .unwrap();
+
+    let mut late = rig.host.claimed(&viewer.id).unwrap();
+    tokio::time::timeout(WAIT, late.changed())
+        .await
+        .expect("a claim made before the subscription is news")
+        .unwrap();
+    assert_eq!(*late.borrow_and_update(), Some(TransportKind::TorRelay));
+    assert!(!late.has_changed().unwrap(), "once");
+    tokio::time::timeout(WAIT, early.changed())
+        .await
+        .expect("the claim as it happened")
+        .unwrap();
+    assert_eq!(*early.borrow_and_update(), Some(TransportKind::TorRelay));
+    assert!(!early.has_changed().unwrap(), "once");
+
+    drop(onion);
+    served.await.unwrap();
+}
+
 /// A `lan_only` session refuses its onion services stream as it refuses
 /// its onion media (`Proof::allowed_by` applies to both kinds): until step
 /// B10 adds the direct services stream, a `lan_only` session has no chat,
