@@ -34,6 +34,8 @@ sha2.workspace = true
 # UPnP-IGD through igd-next (`aio_tokio` only).
 crab_nat.workspace = true
 igd-next.workspace = true
+# The ledger of router mappings (step B4): a CBOR list under `TORNECT_HOME`.
+minicbor.workspace = true
 
 # The default gateway of the route-source interface (design `direct` §7.1):
 # netdev's `gateway` feature reads it from the kernel's tables on Linux
@@ -53,6 +55,8 @@ test-support = []
 
 [dev-dependencies]
 proptest.workspace = true
+# The mapping ledger's tests keep it in a temporary directory.
+tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 # The quiet socket's tests capture every event its sends could emit.
 tracing.workspace = true

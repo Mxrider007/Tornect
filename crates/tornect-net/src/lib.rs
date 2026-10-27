@@ -5,8 +5,8 @@
 //! device keys pinned, the authenticated punch probes and the checklist
 //! that validates paths with them, and the direct link that wires them
 //! together; the STUN codec and client with the cache of the servers'
-//! names (Phase B); then (in the following steps) router port mapping and
-//! the internet gathering plan.
+//! names, and the ledger of router port mappings (Phase B); then (in the
+//! following steps) router port mapping and the internet gathering plan.
 //!
 //! Nothing outside this crate may touch sockets or quinn. It never names
 //! `tornect-signal`: the wire forms of candidates are converted in
@@ -49,8 +49,9 @@ pub use link::{
 };
 pub use local::{IfaceAddr, IfaceKind, RouteSources};
 pub use mapping::{
-    MAP_LEASE, MapEvent, MapEvents, MapFail, MapProtocols, MapRequest, MapVia, Mapping,
-    MappingHandle, NoMapper, PortMapper,
+    LedgerEntry, MAP_LEASE, MAP_RELEASE_CAP, MapEvent, MapEvents, MapFail, MapProtocols,
+    MapRequest, MapVia, Mapping, MappingHandle, MappingLedger, NoMapper, PortMapper,
+    ReleaseTracker, SHUTDOWN_RELEASE_WAIT, renewal_delay,
 };
 pub use probe::{Probe, ProbeDrop, ProbeKey, Txid};
 pub use quic::{

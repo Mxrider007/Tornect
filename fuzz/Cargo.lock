@@ -5703,6 +5703,7 @@ dependencies = [
  "hkdf 0.13.0",
  "hmac 0.13.0",
  "igd-next",
+ "minicbor",
  "netdev",
  "quinn",
  "sha2 0.11.0",

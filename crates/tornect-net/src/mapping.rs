@@ -9,27 +9,53 @@
 //! `router_port` line. No type here prints an address or a port, and no
 //! failure carries a third-party error value: routers return free text.
 //!
-//! Step B1 holds the types and [`NoMapper`]. The router protocols
-//! (`RealMapper`: PCP and NAT-PMP through crab_nat, UPnP-IGD through
-//! igd-next; docs/research/nat-traversal.md §3 and §4), the ledger of
-//! mappings to remove after a crash and the release tracker follow at steps
-//! B4 and B5, the in-memory router at step B8.
+//! A real mapper records every request in the [`MappingLedger`] before
+//! sending it, so that the next start removes what a crash left, and a
+//! mapping dropped without [`Mapping::release`] is released on the runtime
+//! it was made on through the [`ReleaseTracker`]. [`NoMapper`] asks no
+//! router; the in-memory router follows at step B8.
 
+use std::convert::Infallible;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroU16;
 use std::time::{Duration, Instant};
 
+use tokio::runtime::Handle;
 use tornect_core::session_log::{PortChange, PortVia, RouterPort};
 
 use crate::BoxFuture;
 use crate::addr::{Redacted, RedactedIp};
+
+mod ledger;
+mod release;
+
+pub use ledger::{
+    EntryId, LEDGER_MAX_AGE, LedgerEntry, Leftover, MAX_LEDGER_BYTES, MAX_LEDGER_ENTRIES,
+    MAX_LEDGER_OWNERS, MappingLedger, decode_list, encode_list, unix_now,
+};
+pub use release::{MAP_RELEASE_CAP, ReleaseTracker, SHUTDOWN_RELEASE_WAIT};
 
 /// The lease every mapping asks for (design §7.4 "Leases", decision M1-81):
 /// short enough that a crashed Tornect's port closes on its own soon, long
 /// enough that a session renews it rarely. Never 0, which some routers read
 /// as "permanent".
 pub const MAP_LEASE: Duration = Duration::from_secs(600);
+
+/// The longest a mapping waits before its next renewal (design §7.4
+/// "Renewal").
+pub const RENEW_AT_MOST: Duration = Duration::from_secs(300);
+
+/// The shortest a mapping waits before its next renewal, and the wait
+/// before a renewal that failed is tried again.
+pub const RENEW_AT_LEAST: Duration = Duration::from_secs(30);
+
+/// When the next renewal of a mapping granted `granted` fires:
+/// `min(300 s, granted / 2)`, never sooner than 30 s.
+#[must_use]
+pub fn renewal_delay(granted: Duration) -> Duration {
+    (granted / 2).clamp(RENEW_AT_LEAST, RENEW_AT_MOST)
+}
 
 /// What a direct link asks of the router: one UDP port on `gateway` that
 /// forwards to `client:internal_port`.
@@ -158,6 +184,14 @@ pub trait MappingHandle: Send {
 }
 
 /// A port the router opened for this session.
+///
+/// A mapping given [`release_on_drop`](Self::release_on_drop) releases
+/// itself when dropped without [`release`](Self::release): on the runtime
+/// it was made on (or, made outside one, the runtime current at the drop),
+/// through its
+/// [`ReleaseTracker`], capped at [`MAP_RELEASE_CAP`] and never awaited by
+/// the dropper. With no runtime at all, nothing is spawned and the router's
+/// lease ends the mapping.
 pub struct Mapping {
     /// The router's external address and port: the `Mapped` candidate.
     pub external: SocketAddrV4,
@@ -165,12 +199,21 @@ pub struct Mapping {
     pub via: MapVia,
     /// The lease the router granted.
     pub granted: Duration,
-    handle: Box<dyn MappingHandle>,
+    handle: Option<Box<dyn MappingHandle>>,
+    on_drop: Option<DropRelease>,
+}
+
+/// Where a dropped mapping's release runs.
+struct DropRelease {
+    rt: Option<Handle>,
+    releases: ReleaseTracker,
 }
 
 impl Mapping {
     /// A mapping at `external` made with `via` for `granted`, renewed and
-    /// released through `handle`.
+    /// released through `handle`. Dropped without
+    /// [`release`](Self::release), it releases nothing until
+    /// [`release_on_drop`](Self::release_on_drop) says where.
     #[must_use]
     pub fn new(
         external: SocketAddrV4,
@@ -182,8 +225,18 @@ impl Mapping {
             external,
             via,
             granted,
-            handle,
+            handle: Some(handle),
+            on_drop: None,
         }
+    }
+
+    /// The mapping, released when dropped: on `rt` (the runtime it was made
+    /// on), or without one on the runtime current at the drop, through
+    /// `releases`.
+    #[must_use]
+    pub fn release_on_drop(mut self, rt: Option<Handle>, releases: ReleaseTracker) -> Self {
+        self.on_drop = Some(DropRelease { rt, releases });
+        self
     }
 
     /// Renews the lease; the router's new grant replaces
@@ -193,15 +246,50 @@ impl Mapping {
     ///
     /// The router's refusal or silence ([`MapFail`]); `granted` is kept.
     pub async fn renew(&mut self) -> Result<Duration, MapFail> {
-        let granted = self.handle.renew().await?;
+        let Some(handle) = self.handle.as_mut() else {
+            return Err(MapFail::Io);
+        };
+        let granted = handle.renew().await?;
         self.granted = granted;
         Ok(granted)
     }
 
-    /// Releases the mapping. The returned future is independent of `self`.
+    /// Renews the mapping for as long as the returned future is polled: the
+    /// next renewal after [`renewal_delay`] of the last grant, each one
+    /// asking for [`MAP_LEASE`] again, and after a failed one a retry
+    /// after [`RENEW_AT_LEAST`]. The holder runs it beside the session and
+    /// drops it with the mapping.
+    pub async fn keep_renewed(&mut self) -> Infallible {
+        let mut wait = renewal_delay(self.granted);
+        loop {
+            tokio::time::sleep(wait).await;
+            wait = match self.renew().await {
+                Ok(granted) => renewal_delay(granted),
+                Err(_) => RENEW_AT_LEAST,
+            };
+        }
+    }
+
+    /// Releases the mapping. The returned future is independent of `self`;
+    /// the mapping no longer releases itself on drop.
     #[must_use = "the mapping is released only when the returned future runs"]
-    pub fn release(self) -> BoxFuture<'static, ()> {
-        self.handle.release()
+    pub fn release(mut self) -> BoxFuture<'static, ()> {
+        match self.handle.take() {
+            Some(handle) => handle.release(),
+            None => Box::pin(async {}),
+        }
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        let (Some(handle), Some(on_drop)) = (self.handle.take(), self.on_drop.take()) else {
+            return;
+        };
+        let rt = on_drop.rt.or_else(|| Handle::try_current().ok());
+        if let Some(rt) = rt {
+            on_drop.releases.spawn(&rt, handle.release());
+        }
     }
 }
 
@@ -260,7 +348,7 @@ pub trait PortMapper: Send + Sync {
 /// A mapper with no router behind it: every request is
 /// [`MapFail::NoGateway`] at once, and nothing is sent. The in-memory and
 /// loopback machines use it until step B8 gives the in-memory network
-/// routers, and the real machine until step B4.
+/// routers, and the real machine until the real mapper replaces it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoMapper;
 
@@ -271,135 +359,4 @@ impl PortMapper for NoMapper {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::*;
-
-    fn request() -> MapRequest {
-        MapRequest {
-            gateway: Ipv4Addr::new(192, 168, 77, 1),
-            client: Ipv4Addr::new(192, 168, 77, 203),
-            internal_port: NonZeroU16::new(50_417).unwrap(),
-            lease: MAP_LEASE,
-            protocols: MapProtocols::ALL,
-            deadline: Instant::now() + Duration::from_millis(1500),
-        }
-    }
-
-    /// A handle that grants `grants` in turn and counts its releases.
-    struct Scripted {
-        grants: Vec<Result<Duration, MapFail>>,
-        released: Arc<AtomicUsize>,
-    }
-
-    impl MappingHandle for Scripted {
-        fn renew(&mut self) -> BoxFuture<'_, Result<Duration, MapFail>> {
-            let next = self.grants.remove(0);
-            Box::pin(async move { next })
-        }
-
-        fn release(self: Box<Self>) -> BoxFuture<'static, ()> {
-            let released = Arc::clone(&self.released);
-            Box::pin(async move {
-                released.fetch_add(1, Ordering::SeqCst);
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn no_mapper_answers_no_gateway() {
-        let mapper: Arc<dyn PortMapper> = Arc::new(NoMapper);
-        assert_eq!(
-            mapper.map(request()).await.expect_err("no router"),
-            MapFail::NoGateway
-        );
-    }
-
-    /// A renewal's grant replaces the last one; a failed renewal keeps it;
-    /// the release runs only when its future does, after the mapping is
-    /// gone.
-    #[tokio::test]
-    async fn a_mapping_renews_through_its_handle_and_releases_once() {
-        let released = Arc::new(AtomicUsize::new(0));
-        let mut mapping = Mapping::new(
-            SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 50_417),
-            MapVia::Pcp,
-            Duration::from_secs(120),
-            Box::new(Scripted {
-                grants: vec![Ok(MAP_LEASE), Err(MapFail::Timeout)],
-                released: Arc::clone(&released),
-            }),
-        );
-        assert_eq!(mapping.renew().await, Ok(MAP_LEASE));
-        assert_eq!(mapping.granted, MAP_LEASE);
-        assert_eq!(mapping.renew().await, Err(MapFail::Timeout));
-        assert_eq!(mapping.granted, MAP_LEASE);
-        let release = mapping.release();
-        assert_eq!(released.load(Ordering::SeqCst), 0);
-        release.await;
-        assert_eq!(released.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn events_become_router_port_lines_with_the_protocol_only() {
-        for (event, line) in [
-            (MapEvent::Opened(MapVia::Pcp), "opened pcp"),
-            (MapEvent::Closed(MapVia::NatPmp), "closed nat-pmp"),
-            (MapEvent::CloseFailed(MapVia::Upnp), "close-failed upnp"),
-            (
-                MapEvent::LeftoverRemoved(MapVia::Pcp),
-                "leftover-removed pcp",
-            ),
-        ] {
-            assert_eq!(event.router_port().detail(), line);
-        }
-    }
-
-    #[test]
-    fn protocols_any() {
-        assert!(!MapProtocols::NONE.any());
-        assert!(MapProtocols::ALL.any());
-        assert!(
-            MapProtocols {
-                nat_pmp: true,
-                ..MapProtocols::NONE
-            }
-            .any()
-        );
-        assert_eq!(MapProtocols::default(), MapProtocols::NONE);
-    }
-
-    /// Decision M1-83: neither a request nor a mapping prints an address
-    /// or a port, and no failure names one.
-    #[test]
-    fn no_debug_or_message_prints_an_address_or_a_port() {
-        let mapping = Mapping::new(
-            SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 50_417),
-            MapVia::Upnp,
-            MAP_LEASE,
-            Box::new(Scripted {
-                grants: Vec::new(),
-                released: Arc::default(),
-            }),
-        );
-        let mut text = format!("{:?} {:#?} {mapping:?} {mapping:#?}", request(), request());
-        for fail in [
-            MapFail::NoGateway,
-            MapFail::Timeout,
-            MapFail::Refused,
-            MapFail::PermanentOnly,
-            MapFail::NotGlobal,
-            MapFail::Io,
-        ] {
-            text.push_str(&format!(" {fail} {fail:?}"));
-        }
-        for piece in ["192", "168", "77", "203", "113", "50417", "50_417"] {
-            assert!(!text.contains(piece), "\"{piece}\" in {text}");
-        }
-        for said in ["v4 private", "v4 unusable", "Upnp", "600s"] {
-            assert!(text.contains(said), "\"{said}\" missing in {text}");
-        }
-    }
-}
+mod tests;
