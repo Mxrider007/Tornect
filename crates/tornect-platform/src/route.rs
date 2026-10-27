@@ -4,8 +4,9 @@
 //! On Windows it comes from `GetBestRoute2`, a lookup in the IP routing
 //! table. netdev's own Windows gateway read may send ARP through `SendARP`
 //! (`netdev-0.46.3/src/os/windows/interface.rs`), so `tornect-net` never
-//! compiles it there and the app hands [`default_gateway_v4`] to its
-//! `RealNet` instead. On Linux and macOS `tornect-net` reads the gateway
+//! compiles it there and the app hands `default_gateway_v4` (Windows only,
+//! so not linked from the documentation built elsewhere) to its `RealNet`
+//! instead. On Linux and macOS `tornect-net` reads the gateway
 //! through netdev, which takes it from the kernel's tables; only the rule
 //! of [`usable_gateway`] is shared. docs/research/nat-traversal.md §1.6
 //! and §5.
