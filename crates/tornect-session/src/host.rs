@@ -743,6 +743,24 @@ impl MediaHost {
         })
     }
 
+    /// Ends session `session_id`'s media as a kill does
+    /// ([`Self::watch_kill`]): its stream, on whichever path, ends with
+    /// `ENDED_BY_HOST` from its next turn, unless an end was set before. The
+    /// direct host calls it on a kill, whichever task hears the kill first,
+    /// and on an end of the session's device, which the host-wide watch
+    /// does not hear.
+    pub(crate) fn end_by_host(&self, session_id: &str) {
+        if let Some(session) = self.lock().get(session_id) {
+            session.end.send_if_modified(|end| {
+                let unset = end.is_none();
+                if unset {
+                    *end = Some(reason::ENDED_BY_HOST);
+                }
+                unset
+            });
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Registered>> {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
     }

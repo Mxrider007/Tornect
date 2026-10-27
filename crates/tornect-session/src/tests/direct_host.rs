@@ -846,6 +846,109 @@ async fn a_kill_closes_the_link_at_once() {
     fx.fsm.await.unwrap().unwrap();
 }
 
+/// A kill while direct media is live (the direct design §9.1 invariants 2
+/// and 10): the media's own teardown runs, as on the onion path. Capture
+/// stops well within the kill's bounded goodbye ([`DIRECT_DRAIN`]), the
+/// observer hears `capture_stopped`, the outcome is handed on with
+/// `ENDED_BY_HOST`, the viewer reads `Close{ENDED_BY_HOST}`, the link
+/// closes and the session ends `BYE{PANIC}`. The same with the media host's
+/// kill watch running and without it: the direct host ends the session's
+/// media itself, whichever task hears the kill first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_ends_live_direct_media_through_its_teardown() {
+    for watched in [true, false] {
+        let [viewer, _, host] = keys_by_order();
+        let mut fx = fixture(&Opts::new(TransportPolicy::Any, viewer, host)).await;
+        let watcher = watched.then(|| fx.host.rig.host.watch_kill(fx.host.kill.clone()));
+        let machine = fx.viewer_machine();
+        let (mut link, offered) = fx.viewer_link(key(viewer), &machine).await;
+        let (conn, _) = tokio::time::timeout(WAIT, exchange(&mut fx.session, &mut link, &offered))
+            .await
+            .expect("connected in time");
+        let ekm = conn
+            .binding_secret(fx.session.session_token().bytes())
+            .unwrap();
+        let stream = conn.open_stream(1).await.unwrap();
+        let viewer_media = MediaViewer::bind(stream, &fx.binding(&ekm), WAIT)
+            .await
+            .unwrap();
+        assert_eq!(
+            fx.host.rig.host.route(&fx.session_id),
+            Some(TransportKind::Lan)
+        );
+
+        let (mut pictures, enough) = Pictures::wanting(3);
+        let kill = fx.host.kill.clone();
+        let backend = Arc::clone(&fx.host.rig.backend);
+        let killer = tokio::spawn(async move {
+            let _ = enough.await;
+            let live = !backend.closed.load(Ordering::SeqCst);
+            kill.kill(bye::PANIC);
+            (live, tokio::time::Instant::now())
+        });
+        let mut stats = ViewerStats::default();
+        let end = viewer_media
+            .run(&mut pictures, &mut stats, pending())
+            .await
+            .unwrap();
+        let (live, t0) = killer.await.unwrap();
+        assert!(live, "watched {watched}: capture was live at the kill");
+        assert_eq!(
+            end,
+            ViewerEnd::Host(reason::ENDED_BY_HOST),
+            "watched {watched}"
+        );
+        assert!(fx.host.rig.backend.closed.load(Ordering::SeqCst));
+        assert!(
+            t0.elapsed() < DIRECT_DRAIN,
+            "watched {watched}: {:?}",
+            t0.elapsed()
+        );
+        let stopped = format!("stopped {:?}", MediaEnd::SessionOver(reason::ENDED_BY_HOST));
+        assert_eq!(
+            fx.host
+                .rig
+                .seen
+                .lines()
+                .iter()
+                .filter(|line| line.starts_with("stopped"))
+                .collect::<Vec<_>>(),
+            [&stopped],
+            "watched {watched}"
+        );
+        until("the media outcome", || !fx.host.media_seen().is_empty()).await;
+        assert!(
+            matches!(
+                fx.host.media_seen()[..],
+                [MediaOutcome::Served {
+                    end: MediaEnd::SessionOver(r),
+                    ..
+                }] if r == reason::ENDED_BY_HOST
+            ),
+            "watched {watched}: {:?}",
+            fx.host.media_seen()
+        );
+        // The viewer read the `Close` and lets go: the link closes at once.
+        drop((conn, link));
+        until("the link closed", || fx.host.links_open() == 0).await;
+        assert_eq!(
+            fx.event(WAIT).await,
+            Some(SessionEvent::Bye {
+                reason: bye::PANIC,
+                detail: None
+            }),
+            "watched {watched}"
+        );
+        let (transport, path) = fx.host.ends.line().await;
+        assert_eq!(transport, Some(TransportKind::Lan));
+        assert_eq!(path.expect("a path summary").outcome, "direct");
+        fx.fsm.await.unwrap().unwrap();
+        if let Some(watcher) = watcher {
+            watcher.abort();
+        }
+    }
+}
+
 /// A refused direct `Bind` closes the link (the direct design §4, §6.5):
 /// the viewer reads `BindRefused{BAD_BIND}`, nothing opens, the outcome is
 /// handed on, no link stays open, and the end line says `bind-refused`.

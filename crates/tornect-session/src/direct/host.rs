@@ -14,7 +14,9 @@
 //! - one link per session, never bound again once closed;
 //! - the link closes on the viewer's `TOR_FALLBACK` before a claim, on the
 //!   onion path's claim (whether or not a `TOR_FALLBACK` came), on a kill or
-//!   an end of the viewer's device (at once), on a refused direct `Bind`, on
+//!   an end of the viewer's device (at once; a media stream live on the link
+//!   first ends through its own teardown, as on the onion path, within
+//!   [`DIRECT_DRAIN`]), on a refused direct `Bind`, on
 //!   the [`HOST_DIRECT_LINGER`] without a direct claim, and at the session's
 //!   end (after the media stream's last frames, bounded by [`DIRECT_DRAIN`]);
 //! - a `TOR_FALLBACK` after a direct claim is ignored (counted);
@@ -447,6 +449,7 @@ impl Task {
             };
             match woke {
                 Woke::Killed => {
+                    self.media_goodbye().await;
                     self.close_link().await;
                     return;
                 }
@@ -717,6 +720,53 @@ impl Task {
             self.media.route(&self.id),
             Some(TransportKind::Lan | TransportKind::Direct)
         )
+    }
+
+    /// Whether the session's media was bound on this link: a claim seen,
+    /// or one the watch holds and has not told yet. The watch keeps the
+    /// claim after the session ended, when [`Self::claimed_here`] no longer
+    /// finds it.
+    fn media_on_link(&self) -> bool {
+        self.direct_claim
+            || matches!(
+                *self.claimed.borrow(),
+                Some(TransportKind::Lan | TransportKind::Direct)
+            )
+    }
+
+    /// A kill, or an end of the viewer's device, while the session's media
+    /// streams on this link (the direct design §9.1 invariants 2 and 10).
+    /// The session's media end is set here first (the media host's kill
+    /// watch may not have run yet, and it never hears a device's end), so
+    /// [`MediaHost::serve_direct`] returns through its own teardown, as on
+    /// the onion path: capture stops, the observer hears `capture_stopped`,
+    /// the outcome is handed on, and the viewer is told
+    /// `Close{ENDED_BY_HOST}`. That goodbye is bounded: the stream's end and
+    /// then the viewer's close of the connection are waited for until
+    /// [`DIRECT_DRAIN`] after the kill, and the link then closes whatever
+    /// is left (a stream still running is dropped, which stops its capture
+    /// too). A stream not bound on this link (still before its `Bind`, or
+    /// flushing a refusal) and the drain after a stream's end are not waited
+    /// for: the link closes at once.
+    async fn media_goodbye(&mut self) {
+        if !self.media_on_link() {
+            return;
+        }
+        let Some(open) = self.link.as_mut() else {
+            return;
+        };
+        let Some(serving) = open.serving.take() else {
+            return;
+        };
+        self.media.end_by_host(&self.id);
+        let deadline = Instant::now() + DIRECT_DRAIN;
+        let Ok(Some(outcome)) = tokio::time::timeout_at(deadline, serving).await else {
+            return;
+        };
+        (self.on_media)(&outcome);
+        if let Some(conn) = &open.conn {
+            let _ = tokio::time::timeout_at(deadline, conn.closed()).await;
+        }
     }
 
     async fn on_linger(&mut self) {
