@@ -12,8 +12,23 @@
 //! - the path phase ends with exactly one of: a direct stream for the
 //!   caller's `Bind`, this side's `TOR_FALLBACK{reason}` (its link closed
 //!   first), or the session's end;
-//! - `punch_timeout` from the accept is a hard cap on everything up to an
-//!   open stream; the reason then says what was heard ([`FallbackWhy`]);
+//! - `punch_timeout` from the accept caps every wait of an attempt up to
+//!   an open stream (the host's frames, the link's news, `open_stream`),
+//!   and it is checked before each wait, so host frames already buffered
+//!   cannot postpone it; the reason then says what was heard by then
+//!   ([`FallbackWhy`]). The link's start before it is raced against the
+//!   caller's `interrupted` only; its interface read is bounded on its own
+//!   (`tornect_net::local::IFACE_READ_TIMEOUT`, 1 s, on the real network).
+//!   The cap does not bound the Tor writes on the way (this side's
+//!   `CANDIDATES` and `CANDIDATES_DONE`, an owed `PONG`, the
+//!   `TOR_FALLBACK`): those are bounded only by the caller's `interrupted`
+//!   (the design's §4 write rule (a)), and the link's close before the
+//!   `TOR_FALLBACK` by [`CLOSE_WAIT`]. A host that stops reading its Tor
+//!   stream therefore holds the call past the cap until the caller stops
+//!   it, and the fallback can leave up to [`CLOSE_WAIT`] after the cap;
+//! - the link is shut before the `TOR_FALLBACK` is written, so no QUIC
+//!   connection can complete after the host has read it
+//!   ([`ViewerDirectStats::links_open`] is 0 by then);
 //! - at most [`MAX_PATH_CANDIDATES`] `CANDIDATES` and one `CANDIDATES_DONE`
 //!   are taken from the host, and a frame whose scope is above this side's
 //!   is dropped; both are counted, never answered;
@@ -21,6 +36,8 @@
 //!   raced against the caller's `interrupted`, and a host `PING` is
 //!   answered on the way ([`ClientSession::flush_owed`]): `interrupted`
 //!   always ends the call within one poll.
+//!
+//! [`CLOSE_WAIT`]: tornect_net::link::CLOSE_WAIT
 
 use std::fmt;
 use std::future::Future;
@@ -67,11 +84,18 @@ pub struct ViewerDirect {
 pub struct ViewerDirectStats {
     /// Links started (one per session at most).
     pub links_started: u64,
+    /// Links of path phases still running: started, and neither shut yet
+    /// (closed, or dropped, which shuts the endpoint) nor handed over with
+    /// an open media stream ([`PathChoice::Direct`]). The count drops only
+    /// after the link is shut.
+    pub links_open: u64,
     /// Sessions whose link could not start (no address, no socket).
     pub start_failed: u64,
     /// The host's path frames dropped: `CANDIDATES` beyond
-    /// [`MAX_PATH_CANDIDATES`], a second `CANDIDATES_DONE`, a kind this
-    /// build does not know.
+    /// [`MAX_PATH_CANDIDATES`], a second `CANDIDATES_DONE`, and a session
+    /// event this build does not know (a future [`SessionEvent`] variant).
+    /// An envelope kind with no place after the accept is not dropped: it
+    /// is a fault, answered `ERROR` ([`PathChoice::Broken`]).
     pub frames_dropped: u64,
     /// The host's `CANDIDATES` frames dropped because their scope is above
     /// this side's (the direct design §4).
@@ -81,6 +105,7 @@ pub struct ViewerDirectStats {
 #[derive(Default)]
 struct Counters {
     links_started: AtomicU64,
+    links_open: AtomicU64,
     start_failed: AtomicU64,
     frames_dropped: AtomicU64,
     frames_out_of_scope: AtomicU64,
@@ -89,6 +114,46 @@ struct Counters {
 impl Counters {
     fn count(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The session's link while its path phase holds it, counted in
+/// [`ViewerDirectStats::links_open`]. The fields drop in order: the link
+/// first (a drop shuts it when nothing else holds it), then the count.
+struct Live {
+    link: DirectLink,
+    _open: OpenCount,
+}
+
+/// One in [`ViewerDirectStats::links_open`], given back on drop.
+struct OpenCount(Arc<Counters>);
+
+impl Drop for OpenCount {
+    fn drop(&mut self) {
+        self.0.links_open.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Live {
+    fn new(link: DirectLink, counters: &Arc<Counters>) -> Self {
+        Counters::count(&counters.links_started);
+        Counters::count(&counters.links_open);
+        Self {
+            link,
+            _open: OpenCount(Arc::clone(counters)),
+        }
+    }
+
+    /// [`DirectLink::close`]: shut at once, then at most [`CLOSE_WAIT`]
+    /// for the endpoint to drain; the count drops after both. Dropped
+    /// early (the caller's stop), it has shut the link already, or its
+    /// drop does.
+    ///
+    /// [`CLOSE_WAIT`]: tornect_net::link::CLOSE_WAIT
+    async fn close(self) {
+        let Self { link, _open: open } = self;
+        link.close().await;
+        drop(open);
     }
 }
 
@@ -271,6 +336,7 @@ impl ViewerDirect {
         let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
         ViewerDirectStats {
             links_started: get(&c.links_started),
+            links_open: get(&c.links_open),
             start_failed: get(&c.start_failed),
             frames_dropped: get(&c.frames_dropped),
             frames_out_of_scope: get(&c.frames_out_of_scope),
@@ -380,7 +446,7 @@ impl ViewerDirect {
         else {
             return PathChoice::Interrupted;
         };
-        let (mut link, offered) = match started {
+        let (link, offered) = match started {
             Ok(started) => started,
             Err(fail) => {
                 Counters::count(&self.counters.start_failed);
@@ -392,26 +458,34 @@ impl ViewerDirect {
                 return give_up(session, stop, None, &at, why).await;
             }
         };
-        Counters::count(&self.counters.links_started);
+        let mut link = Live::new(link, &self.counters);
         if let Err(choice) = send_batch(session, stop, &mut at, &offered).await {
             return end(link, choice);
         }
         loop {
-            let wake = tokio::select! {
-                biased;
-                () = stop.as_mut() => Wake::Stop,
-                ready = session.event_ready() => Wake::Event(ready),
-                news = link.next_news() => Wake::News(Box::new(news)),
-                () = tokio::time::sleep_until(at.deadline) => Wake::Deadline,
+            // The cap is checked before every wait: the select below polls
+            // the host's frames before the deadline, so frames already
+            // buffered (or a write that outlasted the cap) must not keep
+            // the attempt going.
+            let wake = if Instant::now() >= at.deadline {
+                Wake::Deadline
+            } else {
+                tokio::select! {
+                    biased;
+                    () = stop.as_mut() => Wake::Stop,
+                    ready = session.event_ready() => Wake::Event(ready),
+                    news = link.link.next_news() => Wake::News(Box::new(news)),
+                    () = tokio::time::sleep_until(at.deadline) => Wake::Deadline,
+                }
             };
             let step = match wake {
                 Wake::Stop => Step::Done(PathChoice::Interrupted),
                 Wake::Deadline => Step::GiveUp(TorWhy::Fallback(timeout_reason(
                     at.heard_frame,
-                    &link.stats(),
+                    &link.link.stats(),
                 ))),
                 Wake::Event(Err(e)) => Step::Done(PathChoice::Broken(e)),
-                Wake::Event(Ok(())) => match self.host_frame(session, &link, &mut at) {
+                Wake::Event(Ok(())) => match self.host_frame(session, &link.link, &mut at) {
                     Step::Go if session.owes() => match race(stop, session.flush_owed()).await {
                         None => Step::Done(PathChoice::Interrupted),
                         Some(Err(e)) => Step::Done(PathChoice::Broken(e)),
@@ -419,7 +493,7 @@ impl ViewerDirect {
                     },
                     step => step,
                 },
-                Wake::News(news) => link_news(session, stop, &mut at, &link, *news).await,
+                Wake::News(news) => link_news(session, stop, &mut at, &link.link, *news).await,
             };
             match step {
                 Step::Go => {}
@@ -617,11 +691,13 @@ fn timeout_reason(heard_frame: bool, stats: &LinkStats) -> FallbackWhy {
 }
 
 /// The attempt failed: close the link (when there is one), then
-/// `TOR_FALLBACK{reason}`, or `End(NO_LAN_PATH)` under `lan_only`.
+/// `TOR_FALLBACK{reason}`, or `End(NO_LAN_PATH)` under `lan_only`. The
+/// order is the design's (§4 "Who does what"): no QUIC connection can
+/// complete after the host has read the fallback.
 async fn give_up<S, F>(
     session: &mut ClientSession<S>,
     stop: &mut Pin<&mut F>,
-    link: Option<DirectLink>,
+    link: Option<Live>,
     at: &Attempt,
     why: TorWhy,
 ) -> PathChoice
@@ -630,7 +706,7 @@ where
     F: Future<Output = ()>,
 {
     if let Some(link) = link {
-        tracing::debug!(stats = ?link.stats(), reason = why.cli_name(), "direct path failed");
+        tracing::debug!(stats = ?link.link.stats(), reason = why.cli_name(), "direct path failed");
         // Dropped on a stop, the close has shut the link already.
         if race(stop, link.close()).await.is_none() {
             return PathChoice::Interrupted;
@@ -646,7 +722,7 @@ where
 /// The session ended, broke or the caller stopped during the attempt: the
 /// link is shut at once (no endpoint drain to wait for, since nothing more
 /// is sent on the session), then `choice` is handed back.
-fn end(link: DirectLink, choice: PathChoice) -> PathChoice {
+fn end(link: Live, choice: PathChoice) -> PathChoice {
     drop(link);
     choice
 }

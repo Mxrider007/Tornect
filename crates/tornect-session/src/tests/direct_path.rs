@@ -9,24 +9,26 @@
 use std::future::pending;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::OnceLock;
+use std::task::{Context, Poll, Waker};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tornect_core::session_log::{PathSummary, TransportKind};
+use tornect_net::link::CLOSE_WAIT;
 use tornect_net::mem::{
     CountingEnv, EnvCalls, Fate, InboundRule, LinkSpec, MachineSpec, MemHost, MemNet, Segment,
 };
 use tornect_net::{Candidate, CandidateKind, Route, Scope};
 use tornect_signal::HandshakeError;
-use tornect_signal::Kind;
 use tornect_signal::consent::{TransportKnob, TransportPolicy};
 use tornect_signal::fsm::client::ClientSession;
 use tornect_signal::fsm::{
     Channel, NoPaths, PATH_INBOX, PathExchange, PathFrame, PathPort, PathRecord, harness,
 };
 use tornect_signal::messages::{self, decode_body, encode_body, fallback, feats, scope, transport};
+use tornect_signal::{Envelope, Kind};
 
 use super::direct_host::{Ends, key, keys_by_order, until};
 use super::*;
@@ -135,11 +137,81 @@ fn on_the_lan(host: MachineSpec) -> Machines {
     })
 }
 
+/// The viewer's end of the pipe: for every frame the viewer writes once
+/// its [`ViewerDirect`] exists, it notes the frame's kind and the viewer's
+/// [`ViewerDirectStats::links_open`] at that moment, so a test sees whether
+/// the link was already shut when a frame left (the direct design §4: the
+/// link is closed before `TOR_FALLBACK` is written).
+struct Watched {
+    inner: DuplexStream,
+    log: Arc<WriteLog>,
+}
+
+#[derive(Default)]
+struct WriteLog {
+    viewer: OnceLock<ViewerDirect>,
+    writes: Mutex<Vec<(Kind, u64)>>,
+}
+
+impl WriteLog {
+    /// Notes `buf` when it is one whole frame (the signalling writes a
+    /// frame's header and payload in one write).
+    fn note(&self, buf: &[u8]) {
+        let Some(viewer) = self.viewer.get() else {
+            return;
+        };
+        let Some((len, payload)) = buf.split_first_chunk::<4>() else {
+            return;
+        };
+        if u32::from_be_bytes(*len) as usize != payload.len() {
+            return;
+        }
+        if let Ok(env) = Envelope::decode(payload) {
+            let open = viewer.stats().links_open;
+            self.writes.lock().unwrap().push((env.kind, open));
+        }
+    }
+}
+
+impl AsyncRead for Watched {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Watched {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let out = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &out
+            && *n > 0
+        {
+            self.log.note(buf);
+        }
+        out
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// One accepted session through the real FSMs over a pipe, the host's half
 /// of its path behind a [`Tap`], the viewer's [`ViewerDirect`] on the same
 /// `MemNet`.
 struct Fx {
-    session: ClientSession<DuplexStream>,
+    session: ClientSession<Watched>,
     session_id: String,
     viewer: ViewerDirect,
     viewer_env: Arc<CountingEnv<MemHost>>,
@@ -148,6 +220,9 @@ struct Fx {
     direct: Option<Arc<DirectHost>>,
     rig: Rig,
     frames: Arc<Mutex<Vec<PathFrame>>>,
+    /// The viewer's frames since the accept, with `links_open` as each
+    /// left.
+    log: Arc<WriteLog>,
     ends: Arc<Ends>,
     fsm: JoinHandle<Result<(), HandshakeError>>,
     net: MemNet,
@@ -204,6 +279,11 @@ async fn fixture(opts: &Opts) -> Fx {
         cfg.feats.push(feats::DIR1.to_owned());
     }
     let (client_end, host_end) = duplex(64 * 1024);
+    let log = Arc::new(WriteLog::default());
+    let client_end = Watched {
+        inner: client_end,
+        log: Arc::clone(&log),
+    };
     let fsm = tokio::spawn(async move { serve_host(host_end, &cfg, &deps).await.map(|_| ()) });
 
     let known = Arc::new(KnownHostStore::with(
@@ -233,6 +313,7 @@ async fn fixture(opts: &Opts) -> Fx {
         settings,
         viewer_env.clone(),
     );
+    assert!(log.viewer.set(viewer.clone()).is_ok());
     Fx {
         session,
         session_id,
@@ -242,6 +323,7 @@ async fn fixture(opts: &Opts) -> Fx {
         direct,
         rig,
         frames,
+        log,
         ends,
         fsm,
         net,
@@ -288,6 +370,29 @@ impl Fx {
                 "{c:?}"
             );
         }
+    }
+
+    /// The viewer wrote its `CANDIDATES` and `CANDIDATES_DONE` while its
+    /// link was open, and its one `TOR_FALLBACK` only once the link was
+    /// shut (`links_open` 0 as the frame left).
+    fn shut_before_fallback(&self) {
+        let writes = self.log.writes.lock().unwrap().clone();
+        let at_fallback: Vec<u64> = writes
+            .iter()
+            .filter(|(kind, _)| *kind == Kind::TorFallback)
+            .map(|(_, open)| *open)
+            .collect();
+        assert_eq!(at_fallback, [0], "shut before TOR_FALLBACK: {writes:?}");
+        let exchange: Vec<u64> = writes
+            .iter()
+            .filter(|(kind, _)| matches!(kind, Kind::Candidates | Kind::CandidatesDone))
+            .map(|(_, open)| *open)
+            .collect();
+        assert!(
+            !exchange.is_empty() && exchange.iter().all(|open| *open == 1),
+            "the exchange ran with the link open: {writes:?}"
+        );
+        assert_eq!(self.viewer.stats().links_open, 0);
     }
 
     /// The datagrams the viewer's machine sent so far.
@@ -486,6 +591,7 @@ async fn different_segments_fall_back_early_with_no_path() {
         &fx.frames(3).await,
         &[PathFrame::TorFallback(Some(fallback::NO_PATH))],
     );
+    fx.shut_before_fallback();
     let sent = fx.viewer_sent();
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(fx.viewer_sent(), sent, "the link was closed");
@@ -518,6 +624,39 @@ async fn a_blocked_host_is_heard_and_named_a_firewall() {
     fx.end(bye::USER).await;
 }
 
+/// The direct design §4 "Who does what": the viewer closes its link
+/// **before** it writes `TOR_FALLBACK`, so no QUIC connection can complete
+/// after the host has read it. Observed as the frame leaves: the viewer's
+/// `links_open` is 0 when its `TOR_FALLBACK` is written, and was 1 for
+/// each `CANDIDATES` and `CANDIDATES_DONE`. Against a host behind a
+/// blocking firewall, with the viewer as the side that accepts (the higher
+/// key: its endpoint waits for the host's dial when the attempt ends) and
+/// as the side that dials; no datagram leaves the viewer afterwards.
+#[tokio::test(start_paused = true)]
+async fn the_link_is_shut_before_the_fallback_is_written() {
+    let [low, _, high] = keys_by_order();
+    for (viewer, host) in [(high, low), (low, high)] {
+        let mut opts = Opts::new(viewer, host);
+        opts.machines = on_the_lan(MachineSpec {
+            inbound: InboundRule::Blocked,
+            ..MachineSpec::default()
+        });
+        let mut fx = fixture(&opts).await;
+        let choice = fx.choose(Mine::of(ANY), true).await;
+        let (why, _) = tor(&choice);
+        assert_eq!(why, fell_back(FallbackWhy::NoPath { heard: true }));
+        exchanged_then(
+            &fx.frames(3).await,
+            &[PathFrame::TorFallback(Some(fallback::NO_PATH))],
+        );
+        fx.shut_before_fallback();
+        let sent = fx.viewer_sent();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(fx.viewer_sent(), sent, "the link was closed");
+        fx.end(bye::USER).await;
+    }
+}
+
 /// §12.3 "host silent → `Tor(HostSilent)` at T0+4 s": a host that
 /// announced `dir1` and never answers, neither a frame nor a probe. The
 /// fallback comes exactly at the punch timeout from the accept, with the
@@ -538,6 +677,7 @@ async fn a_silent_host_falls_back_at_the_punch_timeout() {
             &fx.frames(3).await,
             &[PathFrame::TorFallback(Some(fallback::PEER_SILENT))],
         );
+        fx.shut_before_fallback();
         assert_eq!(fx.host_env.calls(), EnvCalls::default());
         fx.end(bye::USER).await;
     }
@@ -589,6 +729,7 @@ async fn a_host_that_cannot_take_part_is_named() {
                     &fx.frames(3).await,
                     &[PathFrame::TorFallback(Some(fallback::PEER_OFF))],
                 );
+                fx.shut_before_fallback();
                 fx.end(bye::USER).await;
             }
         }
@@ -942,10 +1083,40 @@ async fn bind_through(
     (bound, t0.elapsed())
 }
 
-/// A client end whose writes can be frozen (a host that withholds credit).
+/// A client end whose writes can be frozen (a host that withholds credit)
+/// and thawed.
 struct Freezable {
     inner: DuplexStream,
-    frozen: Arc<AtomicBool>,
+    gate: Arc<Freeze>,
+}
+
+#[derive(Default)]
+struct Freeze {
+    frozen: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl Freeze {
+    fn freeze(&self) {
+        self.frozen.store(true, Ordering::SeqCst);
+    }
+
+    /// Lets writes through again and wakes the one waiting.
+    fn thaw(&self) {
+        self.frozen.store(false, Ordering::SeqCst);
+        if let Some(waker) = self.waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+
+    /// Whether a write must wait (woken by [`Freeze::thaw`]).
+    fn holds(&self, cx: &Context<'_>) -> bool {
+        if !self.frozen.load(Ordering::SeqCst) {
+            return false;
+        }
+        *self.waker.lock().unwrap() = Some(cx.waker().clone());
+        self.frozen.load(Ordering::SeqCst)
+    }
 }
 
 impl AsyncRead for Freezable {
@@ -964,21 +1135,21 @@ impl AsyncWrite for Freezable {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        if self.frozen.load(Ordering::SeqCst) {
+        if self.gate.holds(cx) {
             return Poll::Pending;
         }
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        if self.frozen.load(Ordering::SeqCst) {
+        if self.gate.holds(cx) {
             return Poll::Pending;
         }
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        if self.frozen.load(Ordering::SeqCst) {
+        if self.gate.holds(cx) {
             return Poll::Pending;
         }
         Pin::new(&mut self.inner).poll_shutdown(cx)
@@ -1114,6 +1285,7 @@ async fn the_hosts_frames_are_limited_and_scoped() {
         fx.viewer.stats(),
         ViewerDirectStats {
             links_started: 1,
+            links_open: 0,
             start_failed: 0,
             frames_dropped: 2,
             frames_out_of_scope: 1,
@@ -1225,10 +1397,10 @@ async fn a_host_ping_is_answered_while_punching() {
 #[tokio::test(start_paused = true)]
 async fn a_stop_beats_a_pong_owed_while_punching() {
     let (client_end, host_end) = duplex(64 * 1024);
-    let frozen = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(Freeze::default());
     let stream = Freezable {
         inner: client_end,
-        frozen: Arc::clone(&frozen),
+        gate: Arc::clone(&gate),
     };
     let mut fx = raw(stream, host_end, &[feats::DIR1], transport::ANY).await;
     let (stop, stopped) = oneshot::channel::<()>();
@@ -1236,7 +1408,7 @@ async fn a_stop_beats_a_pong_owed_while_punching() {
     let script = async {
         assert_eq!(viewer_frame(host).await.0, Kind::Candidates);
         assert_eq!(viewer_frame(host).await.0, Kind::CandidatesDone);
-        frozen.store(true, Ordering::SeqCst);
+        gate.freeze();
         host.send(&messages::Ping { nonce: 9 }, None).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let at = Instant::now();
@@ -1264,4 +1436,69 @@ async fn a_stop_beats_a_pong_owed_while_punching() {
     drop(fx.session);
     let seen = fx.host.recv(Duration::from_secs(1), "the close").await;
     assert!(matches!(seen, Ok(None)), "the host saw a frame: {seen:?}");
+}
+
+/// The hard cap and the Tor writes (the direct design §4 write rule (a)):
+/// `punch_timeout` caps the attempt's waits, not its writes. A host that
+/// stops reading while a `PONG` is owed holds `choose_path` past the cap —
+/// only the caller's stop ends a stalled write. Once the write goes
+/// through, the cap ends the attempt at once: the host's frames still
+/// unread (two `CANDIDATES_DONE` that arrived during the stall) are not
+/// taken, so they neither postpone the fallback nor change its reason
+/// (nothing was heard before the cap: `PEER_SILENT`). The fallback leaves
+/// within `CLOSE_WAIT` of the write.
+#[tokio::test(start_paused = true)]
+async fn a_write_stalled_past_the_cap_falls_back_at_once() {
+    let (client_end, host_end) = duplex(64 * 1024);
+    let gate = Arc::new(Freeze::default());
+    let stream = Freezable {
+        inner: client_end,
+        gate: Arc::clone(&gate),
+    };
+    let mut fx = raw(stream, host_end, &[feats::DIR1], transport::ANY).await;
+    let t0 = Instant::now();
+    let thaw_at = t0 + PUNCH + Duration::from_secs(2);
+    let host = &mut fx.host;
+    let script = async {
+        assert_eq!(viewer_frame(host).await.0, Kind::Candidates);
+        assert_eq!(viewer_frame(host).await.0, Kind::CandidatesDone);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        gate.freeze();
+        host.send(&messages::Ping { nonce: 3 }, None).await.unwrap();
+        // The viewer takes the `PING` and stalls writing its `PONG`.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        for _ in 0..2 {
+            host.send(&messages::CandidatesDone {}, None).await.unwrap();
+        }
+        tokio::time::sleep_until(thaw_at).await;
+        gate.thaw();
+        let (kind, body) = viewer_frame(host).await;
+        assert_eq!(kind, Kind::Pong);
+        assert_eq!(decode_body::<messages::Pong>(&body).unwrap().nonce, 3);
+        let (kind, body) = viewer_frame(host).await;
+        assert_eq!(kind, Kind::TorFallback);
+        decode_body::<messages::TorFallback>(&body).unwrap().reason
+    };
+    let (choice, reason) = tokio::join!(
+        fx.viewer
+            .choose_path(&mut fx.session, Mine::of(ANY), true, pending()),
+        script
+    );
+    let (why, elapsed) = tor(&choice);
+    assert_eq!(why, TorWhy::Fallback(FallbackWhy::HostSilent));
+    assert_eq!(reason, Some(fallback::PEER_SILENT));
+    let held = thaw_at - t0;
+    assert!(
+        elapsed >= held && elapsed <= held + CLOSE_WAIT,
+        "{elapsed:?}"
+    );
+    assert_eq!(
+        fx.viewer.stats(),
+        ViewerDirectStats {
+            links_started: 1,
+            ..ViewerDirectStats::default()
+        },
+        "the frames left unread were not taken"
+    );
+    assert!(!fx.session.owes());
 }
