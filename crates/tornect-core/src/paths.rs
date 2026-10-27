@@ -224,6 +224,17 @@ impl Paths {
         }
     }
 
+    /// The ledger of router port mappings (design `direct` §7.4, decision
+    /// M1-81): a `0700` directory holding, for each running process that
+    /// asked a router for a port, a lock file it holds for its life and a
+    /// `0600` CBOR list of its mappings, each written before its request. A
+    /// list whose lock nobody holds was left by a process that ended without
+    /// releasing them, and the next start removes them from the router.
+    #[must_use]
+    pub fn router_ports_dir(&self) -> PathBuf {
+        self.state_dir.join("router-ports")
+    }
+
     /// Append-only local audit log of session events.
     #[must_use]
     pub fn sessions_log(&self) -> PathBuf {
@@ -292,6 +303,10 @@ mod tests {
         assert_eq!(
             p.sessions_log(),
             PathBuf::from("/tmp/tornect-test/logs/sessions.log")
+        );
+        assert_eq!(
+            p.router_ports_dir(),
+            PathBuf::from("/tmp/tornect-test/state/router-ports")
         );
         assert_eq!(
             p.portal_restore_token(),
