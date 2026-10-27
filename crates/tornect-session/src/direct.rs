@@ -30,7 +30,8 @@ pub use wire::{from_wire, to_wire};
 
 /// Whether a session may reach beyond the same site (the direct design
 /// §4): public addresses, server-reflexive and mapped candidates. Off in
-/// Phase A, so both sides' scope is always [`Scope::SameSite`]; Phase B
+/// Phase A, so both sides' scope is always
+/// [`Scope::SameSite`](tornect_net::Scope::SameSite); Phase B
 /// turns it on once its gathering and its tests land.
 pub const INTERNET_DIRECT: bool = false;
 
