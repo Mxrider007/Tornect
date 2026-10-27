@@ -114,7 +114,9 @@ async fn a_fake_server_on_loopback_answers_through_the_tee() {
 /// and one from another port are never taken.
 #[tokio::test]
 async fn lying_failing_and_silent_fake_servers_give_nothing() {
-    let short = ms(700);
+    // One server, so the second send at 500 ms is the last; the budget
+    // leaves it 500 ms of real time to leave and arrive.
+    let short = ms(1000);
     let (report, heard, _) =
         ask_loopback(5, Answer::Fixed(at("192.168.0.1:3478")), true, short).await;
     assert_eq!(report.outcome, StunOutcome::Nothing);
@@ -140,11 +142,10 @@ async fn lying_failing_and_silent_fake_servers_give_nothing() {
         };
         assert_eq!(report.stats.ignored, ignored, "{answer:?}");
         // Real time: the retransmission leaves the RTO after the first
-        // request; the server's reading of it may lag either one a little.
-        assert!(
-            heard[1].at - heard[0].at >= STUN_RTO - ms(100),
-            "{answer:?}"
-        );
+        // request (the exact schedule is checked on MemNet in paused time);
+        // here it only has to be clearly later, since the server's reading
+        // of either may lag on a loaded machine.
+        assert!(heard[1].at - heard[0].at >= STUN_RTO / 2, "{answer:?}");
     }
 }
 
